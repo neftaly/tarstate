@@ -1,23 +1,23 @@
 # Tarstate
 
-Tarstate is being prepared as a standalone monorepo. This repository is intentionally scaffold-only for now; package code will move here after the Royal-side package boundaries are clean.
+Tarstate is a standalone generic TypeScript library, currently represented by a clean pnpm monorepo shell.
 
-## Planned Layout
+The repository is intentionally empty of package APIs for now. Migrate implementation code when the generic library boundary is ready rather than carrying placeholder stubs.
 
-- `packages/tarstate-core`: generic Tarstate schema, sources, query, evaluation, and write APIs.
-- `apps/tarstate-demo`: small demo app once the package is extracted.
+Royal-specific adapters live outside Tarstate.
 
-Royal-specific integration, including `@royal/tarstate-lens`, stays in the Royal repository unless it becomes generic.
+## Layout
 
-## Extraction Criteria
+- `packages/` for library packages when they are extracted.
+- `apps/` for demos or fixtures when they prove a package API.
+- Root TypeScript, Vite, Vitest, and CI config stay shared until a package needs its own override.
 
-Before moving code here:
+## Commands
 
-- `@tarstate/core` has no `@royal/*`, renderer, or app dependencies.
-- Royal consumes Tarstate through package exports, not source paths.
-- The public API and compatibility story are documented.
-- Tests and typecheck pass in both repositories during the transition.
-
-## Current State
-
-Scaffold only. No Tarstate package code has been copied into this repository yet.
+```bash
+pnpm install
+pnpm typecheck
+pnpm lint
+pnpm test
+pnpm build
+```

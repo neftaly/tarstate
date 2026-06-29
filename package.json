@@ -1,11 +1,25 @@
 {
-  "name": "@tarstate/monorepo",
+  "name": "tarstate",
   "private": true,
+  "version": "0.0.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=24.12.0"
+  },
   "scripts": {
-    "build": "pnpm --filter ./packages/* --if-present build",
-    "test": "pnpm --filter ./packages/* --if-present test && pnpm --filter ./apps/* --if-present test",
-    "typecheck": "pnpm --filter ./packages/* --if-present typecheck && pnpm --filter ./apps/* --if-present typecheck"
+    "build": "tsc",
+    "lint": "oxlint . --deny-warnings --type-aware",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "oxlint": "catalog:",
+    "oxlint-tsgolint": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
   }
 }
