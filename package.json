@@ -9,10 +9,10 @@
     "node": ">=24.12.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "pnpm -r --if-present build",
     "lint": "oxlint . --deny-warnings --type-aware",
-    "test": "vitest run --passWithNoTests",
-    "typecheck": "tsc"
+    "test": "vitest run tests/*.test.ts --passWithNoTests && pnpm --filter './apps/*' --if-present test && pnpm --filter './packages/*' --if-present test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "catalog:",
