@@ -1,0 +1,26 @@
+{
+  "name": "@tarstate/core",
+  "private": true,
+  "version": "0.0.0",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./diagnostics": "./src/diagnostics.ts",
+    "./evaluate": "./src/evaluate.ts",
+    "./query": "./src/query.ts",
+    "./schema": "./src/schema.ts",
+    "./source": "./src/source.ts",
+    "./write": "./src/write.ts"
+  },
+  "scripts": {
+    "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
+    "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

@@ -11,7 +11,7 @@
   "scripts": {
     "build": "pnpm -r --if-present build",
     "lint": "oxlint . --deny-warnings --type-aware",
-    "test": "vitest run tests/*.test.ts --passWithNoTests && pnpm --filter './apps/*' --if-present test && pnpm --filter './packages/*' --if-present test",
+    "test": "vitest run tests/*.test.ts --passWithNoTests && pnpm --filter './packages/*' --if-present test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

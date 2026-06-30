@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { defineConfig, type UserConfig } from 'vite';
 
 type PackageConfig = {
@@ -11,20 +12,35 @@ type PackageConfig = {
 };
 
 const buildConfigsByPackageName: Record<string, PackageConfig> = {
-  '@tarstate/dummy-package': {
+  '@tarstate/core': {
     lib: {
-      entry: 'src/index.ts',
+      entry: {
+        index: 'src/index.ts',
+        diagnostics: 'src/diagnostics.ts',
+        evaluate: 'src/evaluate.ts',
+        query: 'src/query.ts',
+        schema: 'src/schema.ts',
+        source: 'src/source.ts',
+        write: 'src/write.ts'
+      },
       formats: ['es'],
-      fileName: 'index'
+      fileName: (_format, entryName) => entryName + '.js'
     }
   }
 };
 
-const appPackageNames = new Set(['@tarstate/dummy-app']);
 const manifest = JSON.parse(readFileSync('package.json', 'utf8')) as { readonly name?: string };
 const packageConfig = manifest.name ? buildConfigsByPackageName[manifest.name] : undefined;
-const isAppPackage = manifest.name === undefined ? false : appPackageNames.has(manifest.name);
-const appBase = process.env.BASE_PATH ?? '/';
+const repoRoot = path.dirname(new URL(import.meta.url).pathname);
+const sourceAliases = [
+  { find: '@tarstate/core/diagnostics', replacement: path.join(repoRoot, 'packages/core/src/diagnostics.ts') },
+  { find: '@tarstate/core/evaluate', replacement: path.join(repoRoot, 'packages/core/src/evaluate.ts') },
+  { find: '@tarstate/core/query', replacement: path.join(repoRoot, 'packages/core/src/query.ts') },
+  { find: '@tarstate/core/schema', replacement: path.join(repoRoot, 'packages/core/src/schema.ts') },
+  { find: '@tarstate/core/source', replacement: path.join(repoRoot, 'packages/core/src/source.ts') },
+  { find: '@tarstate/core/write', replacement: path.join(repoRoot, 'packages/core/src/write.ts') },
+  { find: '@tarstate/core', replacement: path.join(repoRoot, 'packages/core/src/index.ts') }
+];
 
 const failOnRollupWarning = (warning: string | { readonly message?: string }): never => {
   const message = typeof warning === 'string' ? warning : warning.message ?? JSON.stringify(warning);
@@ -34,12 +50,8 @@ const failOnRollupWarning = (warning: string | { readonly message?: string }): n
 const sharedBuildOptions = { target: 'safari17', sourcemap: true, rollupOptions: { onwarn: failOnRollupWarning } } satisfies NonNullable<UserConfig['build']>;
 
 export default defineConfig(({ command }): UserConfig => {
-  if (isAppPackage) {
-    return { base: appBase, clearScreen: false, build: sharedBuildOptions };
-  }
-
   if (packageConfig === undefined) {
-    if (command !== 'build') return { clearScreen: false };
+    if (command !== 'build') return { clearScreen: false, resolve: { alias: sourceAliases } };
     throw new Error('No shared Vite config for package: ' + (manifest.name ?? '<unknown>'));
   }
 
@@ -49,6 +61,7 @@ export default defineConfig(({ command }): UserConfig => {
       ...sharedBuildOptions,
       lib: packageConfig.lib,
       rollupOptions: { ...sharedBuildOptions.rollupOptions, ...(packageConfig.external === undefined ? {} : { external: packageConfig.external }) }
-    }
+    },
+    resolve: { alias: sourceAliases }
   };
 });
