@@ -25,8 +25,11 @@ import {
   and,
   any,
   as,
+  asc,
+  avg,
   call,
   count,
+  desc,
   eq,
   env,
   extend,
@@ -38,6 +41,7 @@ import {
   join,
   keyBy,
   leftJoin,
+  limit,
   lt,
   lte,
   max,
@@ -51,6 +55,8 @@ import {
   queryKey,
   qualify,
   rename,
+  sort,
+  sortLimit,
   sum,
   tuple,
   value,
@@ -58,7 +64,7 @@ import {
   without
 } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
-import { booleanField, defineSchema, idField, numberField, relation, stringField } from '@tarstate/core/schema';
+import { booleanField, defineSchema, idField, nullable, numberField, relation, stringField } from '@tarstate/core/schema';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
 import { write, type WritePatch } from '@tarstate/core/write';
 
@@ -1418,6 +1424,195 @@ describe('tarstate materialization', () => {
     expect(materializedRowsFor(transaction.db, 'todo-a-label')).toEqual([
       { view: { label: 'Alpha' } }
     ]);
+  });
+
+  it('incrementally maintains final sorted single-relation rows through insert/delete/update movement', async () => {
+    const rootPriority = field<string>('', 'priority');
+    const sortedOpenTasks = pipe(
+      from(task),
+      where(eq(task.status, 'open')),
+      project({
+        id: task.id,
+        priority: task.priority,
+        label: task.text
+      }),
+      sort(asc(rootPriority), desc(rootLabel))
+    );
+    const db = createDb({ tasks: baseTaskRows });
+
+    await materializeSnapshot(db, sortedOpenTasks, { id: 'sorted-open-tasks', mode: 'incremental' });
+    expect(materializationForQuery(db, sortedOpenTasks)).toMatchObject({
+      id: 'sorted-open-tasks',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      diagnostics: []
+    });
+    expect(materializedRowsFor(db, 'sorted-open-tasks')).toEqual([
+      { id: 'task-a', priority: 'high', label: 'Alpha' },
+      { id: 'task-c', priority: 'low', label: 'Gamma' }
+    ]);
+
+    const transaction = tryTransact(db, [
+      tasks.insert({ id: 'task-d', status: 'open', priority: 'high', text: 'Delta', note: 'fourth' }),
+      tasks.delete('task-c'),
+      tasks.update('task-a', { text: 'Echo' })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, sortedOpenTasks)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 1,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data,
+      changes: [{ update: 'recomputed', maintenance: 'incremental', diagnostics: [] }]
+    });
+    expect(materializedRowsFor(transaction.db, 'sorted-open-tasks')).toEqual(fullRows);
+    expect(materializedRowsFor(transaction.db, 'sorted-open-tasks')).toEqual([
+      { id: 'task-a', priority: 'high', label: 'Echo' },
+      { id: 'task-d', priority: 'high', label: 'Delta' }
+    ]);
+  });
+
+  it('incrementally preserves final sort null placement and tie order from source rows', async () => {
+    type NullableNoteTask = {
+      readonly id: string;
+      readonly status: string;
+      readonly priority: string;
+      readonly text: string;
+      readonly note: string | null;
+    };
+
+    const nullableSchema = defineSchema({
+      tasksWithNullableNotes: relation<NullableNoteTask>({
+        key: 'id',
+        fields: {
+          id: idField('task'),
+          status: stringField(),
+          priority: stringField(),
+          text: stringField(),
+          note: nullable(stringField())
+        }
+      })
+    });
+    const nullableTask = as(nullableSchema.tasksWithNullableNotes, 'task');
+    const nullableTasks = write(nullableSchema.tasksWithNullableNotes);
+    const rootNote = field<string | null>('', 'note');
+    const sortedNotes = pipe(
+      from(nullableTask),
+      project({
+        id: nullableTask.id,
+        note: nullableTask.note
+      }),
+      sort(asc(rootNote, 'first'))
+    );
+    const db = createDb({
+      tasksWithNullableNotes: [
+        { id: 'task-a', status: 'open', priority: 'high', text: 'Alpha', note: null },
+        { id: 'task-b', status: 'open', priority: 'high', text: 'Beta', note: 'middle' },
+        { id: 'task-c', status: 'open', priority: 'low', text: 'Gamma', note: null },
+        { id: 'task-d', status: 'open', priority: 'low', text: 'Delta', note: 'z' }
+      ]
+    });
+
+    await materializeSnapshot(db, sortedNotes, { id: 'sorted-task-notes', mode: 'incremental' });
+    expect(materializedRowsFor(db, 'sorted-task-notes')).toEqual([
+      { id: 'task-a', note: null },
+      { id: 'task-c', note: null },
+      { id: 'task-b', note: 'middle' },
+      { id: 'task-d', note: 'z' }
+    ]);
+
+    const transaction = tryTransact(db, [
+      nullableTasks.update('task-b', { note: null }),
+      nullableTasks.insert({ id: 'task-e', status: 'open', priority: 'low', text: 'Echo', note: null })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, sortedNotes)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 1,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data,
+      changes: [{ update: 'recomputed', maintenance: 'incremental', diagnostics: [] }]
+    });
+    expect(materializedRowsFor(transaction.db, 'sorted-task-notes')).toEqual(fullRows);
+    expect(materializedRowsFor(transaction.db, 'sorted-task-notes')).toEqual([
+      { id: 'task-a', note: null },
+      { id: 'task-b', note: null },
+      { id: 'task-c', note: null },
+      { id: 'task-e', note: null },
+      { id: 'task-d', note: 'z' }
+    ]);
+  });
+
+  it('keeps non-final sort and limit operators diagnostic-backed for incremental materialization', async () => {
+    const unsupportedCases: readonly {
+      readonly id: string;
+      readonly query: Query;
+    }[] = [
+      {
+        id: 'open-task-non-final-sort',
+        query: pipe(openTaskLabels, sort(asc(rootLabel)), limit(1))
+      },
+      {
+        id: 'open-task-limit',
+        query: pipe(openTaskLabels, limit(1))
+      },
+      {
+        id: 'open-task-sort-limit',
+        query: pipe(openTaskLabels, sortLimit(1, asc(rootLabel)))
+      }
+    ];
+
+    for (const testCase of unsupportedCases) {
+      const db = createDb({ tasks: baseTaskRows });
+
+      await materializeSnapshot(db, testCase.query, { id: testCase.id, mode: 'incremental' });
+      expect(materializationForQuery(db, testCase.query)).toMatchObject({
+        id: testCase.id,
+        requestedMode: 'incremental',
+        maintenance: 'snapshot',
+        diagnostics: [
+          {
+            code: 'materialization_unsupported',
+            surface: 'materialization',
+            detail: {
+              mode: 'incremental',
+              queryKey: queryKey(testCase.query),
+              reason: expect.any(String)
+            }
+          }
+        ]
+      });
+
+      const transaction = tryTransact(db, [
+        tasks.update('task-a', { text: 'Alpha updated' })
+      ]);
+      expect(transaction.diagnostics).toEqual([]);
+
+      const fullRows = (await q(transaction.db, testCase.query)).rows;
+      const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+      expect(result).toMatchObject({
+        kind: 'materializationMaintenance',
+        maintained: 1,
+        recomputed: 1,
+        carried: 0,
+        diagnostics: [{ code: 'materialization_unsupported', surface: 'materialization' }],
+        sourceVersion: transaction.db.data
+      });
+      expect(materializedRowsFor(transaction.db, testCase.id)).toEqual(fullRows);
+    }
   });
 
   it('classifies simple inner equality joins as incremental materializations', async () => {
@@ -2895,6 +3090,109 @@ describe('tarstate materialization', () => {
     expect(materializedRowsFor(transaction.db, 'work-bucket-units')).toEqual(fullRows);
   });
 
+  it('incrementally maintains avg aggregates with visible sum/count state from relation deltas', async () => {
+    const db = createDb({ workItems: baseWorkItemRows });
+    const averages = pipe(
+      from(workItem),
+      where(eq(workItem.status, 'open')),
+      aggregate({
+        aggregates: {
+          total: count(),
+          unitCount: count(workItem.units),
+          totalUnits: sum(workItem.units),
+          averageUnits: avg(workItem.units)
+        }
+      })
+    );
+
+    await materializeSnapshot(db, averages, { id: 'open-work-averages', mode: 'incremental' });
+
+    expect(materializedRowsFor(db, 'open-work-averages')).toEqual([
+      { total: 2, unitCount: 2, totalUnits: 7, averageUnits: 3.5 }
+    ]);
+    expect(materializationForQuery(db, averages)).toMatchObject({
+      id: 'open-work-averages',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      diagnostics: []
+    });
+
+    const transaction = tryTransact(db, [
+      workItems.insert({ id: 'work-d', status: 'open', bucket: 'gamma', units: 4, bonus: 1 }),
+      workItems.update('work-b', { status: 'open', units: 8 }),
+      workItems.update('work-c', { units: 6 }),
+      workItems.delete('work-a')
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, averages)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'open-work-averages')).toEqual(fullRows);
+    expect(materializedRowsFor(transaction.db, 'open-work-averages')).toEqual([
+      { total: 3, unitCount: 3, totalUnits: 18, averageUnits: 6 }
+    ]);
+  });
+
+  it('keeps avg-only aggregates diagnostic-backed without incremental maintenance', async () => {
+    const db = createDb({ workItems: baseWorkItemRows });
+    const averages = pipe(
+      from(workItem),
+      where(eq(workItem.status, 'open')),
+      aggregate({
+        aggregates: {
+          averageUnits: avg(workItem.units)
+        }
+      })
+    );
+
+    await materializeSnapshot(db, averages, { id: 'open-work-avg-only', mode: 'incremental' });
+
+    expect(materializedRowsFor(db, 'open-work-avg-only')).toEqual([{ averageUnits: 3.5 }]);
+    expect(materializationForQuery(db, averages)).toMatchObject({
+      id: 'open-work-avg-only',
+      requestedMode: 'incremental',
+      maintenance: 'snapshot',
+      diagnostics: [
+        {
+          code: 'materialization_unsupported',
+          surface: 'materialization',
+          detail: {
+            mode: 'incremental',
+            reason: 'aggregate maintenance is limited to count(), count(expr), sum/min/max(expr), any/notAny(expr), and avg(expr) with matching sum(expr)/count(expr) over a non-null numeric base field or numeric literal, all without options',
+            queryKey: queryKey(averages)
+          }
+        }
+      ]
+    });
+
+    const transaction = tryTransact(db, [
+      workItems.update('work-c', { units: 6 })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, averages)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 1,
+      carried: 0,
+      diagnostics: [{ code: 'materialization_unsupported', surface: 'materialization' }],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'open-work-avg-only')).toEqual(fullRows);
+  });
+
   it('incrementally maintains ungrouped min/max aggregates from relation deltas', async () => {
     const db = createDb({ workItems: baseWorkItemRows });
     const extrema = pipe(
@@ -3116,7 +3414,7 @@ describe('tarstate materialization', () => {
           surface: 'materialization',
           detail: {
             mode: 'incremental',
-            reason: 'aggregate maintenance is limited to count(), count(expr), sum/min/max(expr), and any/notAny(expr) without options',
+            reason: 'aggregate maintenance is limited to count(), count(expr), sum/min/max(expr), any/notAny(expr), and avg(expr) with matching sum(expr)/count(expr) over a non-null numeric base field or numeric literal, all without options',
             queryKey: queryKey(totals)
           }
         }

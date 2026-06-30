@@ -20,7 +20,8 @@ import {
   type PredicateData,
   type ProjectionData,
   type Query,
-  type QueryData
+  type QueryData,
+  type SortData
 } from './query.js';
 import type { RelationRef } from './schema.js';
 import { asRelationSource, tryRelationSource } from './source-input.js';
@@ -264,6 +265,9 @@ type SnapshotMaintenanceSupport = {
 type IncrementalPlanResult =
   | { readonly kind: 'supported'; readonly plan: IncrementalMaterializationPlan }
   | { readonly kind: 'unsupported'; readonly reason: string };
+type IncrementalAggregateFieldsResult =
+  | { readonly kind: 'supported'; readonly fields: readonly IncrementalAggregateField[] }
+  | { readonly kind: 'unsupported'; readonly reason: string };
 type IncrementalBaseMaterializationPlan = {
   readonly relation: RelationRef;
   readonly relationName: string;
@@ -277,6 +281,7 @@ type IncrementalMaterializationPlan =
 type IncrementalRowMaterializationPlan = IncrementalBaseMaterializationPlan & {
   readonly kind: 'rows';
   readonly transforms: readonly IncrementalTransform[];
+  readonly sort?: readonly SortData[];
 };
 type IncrementalAggregateMaterializationPlan = IncrementalBaseMaterializationPlan & {
   readonly kind: 'aggregate';
@@ -301,6 +306,7 @@ type IncrementalJoinMaterializationPlan = {
 type IncrementalAggregateField =
   | { readonly op: 'count'; readonly fieldName: string; readonly expr?: ExprData }
   | { readonly op: 'sum'; readonly fieldName: string; readonly expr: ExprData }
+  | { readonly op: 'avg'; readonly fieldName: string; readonly expr: ExprData }
   | { readonly op: 'min'; readonly fieldName: string; readonly expr: ExprData }
   | { readonly op: 'max'; readonly fieldName: string; readonly expr: ExprData }
   | { readonly op: 'any'; readonly fieldName: string; readonly expr: ExprData }
@@ -366,7 +372,11 @@ type IncrementalAggregateGroupStateResult =
   }
   | { readonly kind: 'fallback'; readonly reason: string };
 type IncrementalSnapshotRowsResult =
-  | { readonly kind: 'maintained'; readonly rows: readonly unknown[] }
+  | {
+      readonly kind: 'maintained';
+      readonly update: Extract<MaterializationMaintenanceChangeKind, 'incremental' | 'recomputed'>;
+      readonly rows: readonly unknown[];
+    }
   | { readonly kind: 'fallback'; readonly reason: string }
   | { readonly kind: 'unavailable' };
 type IncrementalDeltaRowsResult =
@@ -417,6 +427,9 @@ const metadataByTarget = new WeakMap<object, readonly MaterializationMetadata[]>
 const snapshotRowsByTarget = new WeakMap<object, ReadonlyMap<string, SnapshotEntry>>();
 const runtimeInputsByTarget = new WeakMap<object, ReadonlyMap<string, MaterializationRuntimeInputs>>();
 let nextMaterializationNumber = 1;
+
+const incrementalAggregateSubsetReason =
+  'aggregate maintenance is limited to count(), count(expr), sum/min/max(expr), any/notAny(expr), and avg(expr) with matching sum(expr)/count(expr) over a non-null numeric base field or numeric literal, all without options';
 
 /**
  * Evaluate a query once and cache its snapshot rows.
@@ -627,6 +640,7 @@ export async function maintainMaterializationSnapshots<Next extends SnapshotMate
         : { kind: 'fallback', reason: runtimeFallbackReason } as const;
 
     if (incrementalRows.kind === 'maintained') {
+      const update = incrementalRows.update;
       const nextItem = snapshotMetadata(
         metadata,
         [...metadata.diagnostics, ...versionDiagnostics],
@@ -643,13 +657,16 @@ export async function maintainMaterializationSnapshots<Next extends SnapshotMate
       changes.push(
         materializationMaintenanceChange(
           nextItem,
-          'incremental',
+          update,
           previousSnapshot,
           incrementalRows.rows,
           []
         )
       );
       maintained += 1;
+      if (update === 'recomputed') {
+        recomputed += 1;
+      }
       continue;
     }
 
@@ -1508,7 +1525,11 @@ async function maintainIncrementalSnapshotRows(
   const rows = await applyIncrementalDeltas(previousSnapshot.rows, incremental.plan, deltas, options.env, source);
 
   return rows.kind === 'applied'
-    ? { kind: 'maintained', rows: rows.rows }
+      ? {
+        kind: 'maintained',
+        update: incremental.plan.kind === 'rows' && incremental.plan.sort !== undefined ? 'recomputed' : 'incremental',
+        rows: rows.rows
+      }
     : rows;
 }
 
@@ -1822,6 +1843,16 @@ function incrementalRowPlanFor(
   relation: RelationRef,
   operations: readonly QueryData[]
 ): IncrementalPlanResult {
+  const finalSort = operations[0]?.op === 'sort' ? operations[0] : undefined;
+
+  if (operations.some((operation, index) => operation.op === 'sort' && index !== 0)) {
+    return { kind: 'unsupported', reason: 'sort is only supported as the final incremental row operator' };
+  }
+
+  if (finalSort !== undefined && !isSupportedSort(finalSort.order)) {
+    return { kind: 'unsupported', reason: 'sort is limited to field, literal, and tuple expressions' };
+  }
+
   let phase: 'source' | 'filter' | 'output' = 'source';
   let hasHash = false;
   let hasProject = false;
@@ -1832,6 +1863,7 @@ function incrementalRowPlanFor(
   };
   const transforms: IncrementalTransform[] = [];
   let filters: readonly IncrementalPredicate[] | undefined;
+  let sort: readonly SortData[] | undefined;
 
   for (const operation of [...operations].reverse()) {
     switch (operation.op) {
@@ -1899,6 +1931,10 @@ function incrementalRowPlanFor(
         phase = 'output';
         transforms.push({ op: 'qualify', alias: operation.alias });
         continue;
+      case 'sort':
+        phase = 'output';
+        sort = operation.order;
+        continue;
       default:
         return { kind: 'unsupported', reason: `operator ${operation.op} is outside the incremental subset` };
     }
@@ -1910,7 +1946,8 @@ function incrementalRowPlanFor(
       ...plan,
       kind: 'rows',
       ...(filters === undefined ? {} : { filters }),
-      transforms
+      transforms,
+      ...(sort === undefined ? {} : { sort })
     }
   };
 }
@@ -1925,12 +1962,12 @@ function incrementalAggregatePlanFor(
     return { kind: 'unsupported', reason: 'aggregate groupBy is limited to field, literal, and tuple expressions' };
   }
 
-  const aggregateFields = incrementalAggregateFieldsFor(aggregate.aggregates);
+  const aggregateFields = incrementalAggregateFieldsFor(aggregate.aggregates, relation, base.alias);
 
-  if (aggregateFields === undefined) {
+  if (aggregateFields.kind === 'unsupported') {
     return {
       kind: 'unsupported',
-      reason: 'aggregate maintenance is limited to count(), count(expr), sum/min/max(expr), and any/notAny(expr) without options'
+      reason: aggregateFields.reason
     };
   }
 
@@ -1988,7 +2025,7 @@ function incrementalAggregatePlanFor(
       alias: base.alias,
       ...(filters === undefined ? {} : { filters }),
       groupBy: aggregate.groupBy,
-      aggregateFields
+      aggregateFields: aggregateFields.fields
     }
   };
 }
@@ -2115,11 +2152,19 @@ function isSupportedProjection(projection: ProjectionData): boolean {
   return Object.values(projection).every((expr) => isSupportedIncrementalExpr(projectionExpr(expr)));
 }
 
-function incrementalAggregateFieldsFor(projection: ProjectionData): readonly IncrementalAggregateField[] | undefined {
+function isSupportedSort(order: readonly SortData[]): boolean {
+  return order.every((item) => isSupportedIncrementalExpr(item.expr));
+}
+
+function incrementalAggregateFieldsFor(
+  projection: ProjectionData,
+  relation: RelationRef,
+  alias: string
+): IncrementalAggregateFieldsResult {
   const entries = Object.entries(projection);
 
   if (entries.length === 0) {
-    return undefined;
+    return { kind: 'unsupported', reason: incrementalAggregateSubsetReason };
   }
 
   const fields: IncrementalAggregateField[] = [];
@@ -2128,7 +2173,7 @@ function incrementalAggregateFieldsFor(projection: ProjectionData): readonly Inc
     const expr = projectionExpr(input);
 
     if (expr.op !== 'aggregateCall' || expr.distinct || expr.count !== undefined) {
-      return undefined;
+      return { kind: 'unsupported', reason: incrementalAggregateSubsetReason };
     }
 
     if (expr.name === 'count' && (expr.expr === undefined || isSupportedIncrementalExpr(expr.expr))) {
@@ -2143,6 +2188,19 @@ function incrementalAggregateFieldsFor(projection: ProjectionData): readonly Inc
       continue;
     }
 
+    if (expr.name === 'avg' && expr.expr !== undefined && isSupportedIncrementalExpr(expr.expr)) {
+      if (
+        isSupportedIncrementalAverageExpr(expr.expr, relation, alias) &&
+        hasMatchingAggregateCall(entries, 'sum', expr.expr) &&
+        hasMatchingAggregateCall(entries, 'count', expr.expr)
+      ) {
+        fields.push({ op: 'avg', fieldName, expr: expr.expr });
+        continue;
+      }
+
+      return { kind: 'unsupported', reason: incrementalAggregateSubsetReason };
+    }
+
     if ((expr.name === 'min' || expr.name === 'max') && expr.expr !== undefined && isSupportedIncrementalExpr(expr.expr)) {
       fields.push({ op: expr.name, fieldName, expr: expr.expr });
       continue;
@@ -2153,10 +2211,48 @@ function incrementalAggregateFieldsFor(projection: ProjectionData): readonly Inc
       continue;
     }
 
-    return undefined;
+    return { kind: 'unsupported', reason: incrementalAggregateSubsetReason };
   }
 
-  return fields;
+  return { kind: 'supported', fields };
+}
+
+function hasMatchingAggregateCall(
+  entries: readonly (readonly [string, ExprData | OptionalProjection])[],
+  name: 'count' | 'sum',
+  expr: ExprData
+): boolean {
+  const key = stableRowKey(expr);
+
+  for (const [, input] of entries) {
+    const aggregate = projectionExpr(input);
+
+    if (
+      aggregate.op === 'aggregateCall' &&
+      aggregate.name === name &&
+      !aggregate.distinct &&
+      aggregate.count === undefined &&
+      aggregate.expr !== undefined &&
+      stableRowKey(aggregate.expr) === key
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isSupportedIncrementalAverageExpr(expr: ExprData, relation: RelationRef, alias: string): boolean {
+  if (expr.op === 'value') {
+    return typeof expr.value === 'number';
+  }
+
+  if (expr.op !== 'field' || expr.alias !== alias) {
+    return false;
+  }
+
+  const spec = relation.fields[expr.field];
+  return spec?.valueKind === 'number' && !spec.optional && !spec.nullable;
 }
 
 function projectionFieldsOverlap(left: ProjectionData, right: ProjectionData): boolean {
@@ -2193,16 +2289,17 @@ async function applyIncrementalDeltas(
     case 'join':
       return applyIncrementalJoinDeltas(previousRows, plan, deltas, source, env);
     case 'rows':
-      return applyIncrementalRowDeltas(previousRows, plan, deltas, env);
+      return applyIncrementalRowDeltas(previousRows, plan, deltas, env, source);
   }
 }
 
-function applyIncrementalRowDeltas(
+async function applyIncrementalRowDeltas(
   previousRows: readonly unknown[],
   plan: IncrementalRowMaterializationPlan,
   deltas: readonly RelationDelta[],
-  env: EvaluateOptions['env']
-): IncrementalDeltaRowsResult {
+  env: EvaluateOptions['env'],
+  source: RelationSource
+): Promise<IncrementalDeltaRowsResult> {
   const removedChanges = new Map<string, IncrementalDeltaChange>();
   const addedChanges = new Map<string, IncrementalDeltaChange>();
 
@@ -2226,6 +2323,10 @@ function applyIncrementalRowDeltas(
 
   if (removedChanges.size === 0 && addedChanges.size === 0) {
     return { kind: 'applied', rows: Object.freeze([...previousRows]) };
+  }
+
+  if (plan.sort !== undefined) {
+    return recomputeSortedIncrementalRowRows(plan, plan.sort, source, env);
   }
 
   let hasUnpairedRemoved = false;
@@ -2274,6 +2375,45 @@ function applyIncrementalRowDeltas(
   }
 
   return { kind: 'applied', rows: Object.freeze(rows) };
+}
+
+async function recomputeSortedIncrementalRowRows(
+  plan: IncrementalRowMaterializationPlan,
+  sort: readonly SortData[],
+  source: RelationSource,
+  env: EvaluateOptions['env']
+): Promise<IncrementalDeltaRowsResult> {
+  let sourceRows: readonly unknown[];
+
+  try {
+    sourceRows = Array.from(await source.rows(plan.relation));
+  } catch {
+    return { kind: 'fallback', reason: `current ${plan.relationName} rows could not be read` };
+  }
+
+  const rows: Record<string, unknown>[] = [];
+
+  for (const [index, row] of sourceRows.entries()) {
+    if (!isRecord(row)) {
+      return { kind: 'fallback', reason: `current ${plan.relationName} row ${index} is not an object` };
+    }
+
+    const mapped = incrementalOutputForRelationRow(plan, row, env);
+
+    if (mapped === undefined) {
+      return { kind: 'fallback', reason: `current ${plan.relationName} row ${index} cannot be mapped through the incremental query` };
+    }
+
+    if (mapped.included) {
+      rows.push(mapped.row);
+    }
+  }
+
+  const sortedRows = sortIncrementalRows(rows, sort);
+
+  return sortedRows.kind === 'fallback'
+    ? sortedRows
+    : { kind: 'applied', rows: Object.freeze(sortedRows.rows) };
 }
 
 function applyIncrementalAggregateDeltas(
@@ -3039,7 +3179,7 @@ function aggregateValuesForSnapshotAggregateRow(
     values[field.fieldName] = field.op === 'notAny' ? !value : value;
   }
 
-  return values;
+  return hasConsistentAverageAggregateValues(values, aggregateFields) ? values : undefined;
 }
 
 function isValidAggregateSnapshotValue(field: IncrementalAggregateField, value: unknown): boolean {
@@ -3048,6 +3188,8 @@ function isValidAggregateSnapshotValue(field: IncrementalAggregateField, value: 
       return typeof value === 'number' && Number.isInteger(value) && value >= 0;
     case 'sum':
       return typeof value === 'number';
+    case 'avg':
+      return typeof value === 'number' || value === undefined;
     case 'min':
     case 'max':
       return value !== null;
@@ -3061,6 +3203,87 @@ function aggregateAccumulatorKey(field: IncrementalAggregateField): string {
   return field.op === 'count'
     ? field.expr === undefined ? 'count' : `count:${stableRowKey(field.expr)}`
     : `${field.op}:${stableRowKey(field.expr)}`;
+}
+
+function hasConsistentAverageAggregateValues(
+  values: IncrementalAggregateValues,
+  aggregateFields: readonly IncrementalAggregateField[]
+): boolean {
+  for (const field of aggregateFields) {
+    if (field.op !== 'avg') {
+      continue;
+    }
+
+    const accumulators = averageAccumulatorFields(field, aggregateFields);
+
+    if (accumulators === undefined) {
+      return false;
+    }
+
+    const count = aggregateNumberValue(values[accumulators.count.fieldName]);
+    const sum = aggregateNumberValue(values[accumulators.sum.fieldName]);
+    const expected = count === 0 ? undefined : sum / count;
+
+    if (!Object.is(values[field.fieldName], expected)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function refreshAverageAggregateValues(
+  target: IncrementalAggregateValues,
+  aggregateFields: readonly IncrementalAggregateField[]
+): string | undefined {
+  for (const field of aggregateFields) {
+    if (field.op !== 'avg') {
+      continue;
+    }
+
+    const accumulators = averageAccumulatorFields(field, aggregateFields);
+
+    if (accumulators === undefined) {
+      return `avg aggregate ${field.fieldName} is missing matching sum/count accumulator fields`;
+    }
+
+    const count = aggregateNumberValue(target[accumulators.count.fieldName]);
+    const sum = aggregateNumberValue(target[accumulators.sum.fieldName]);
+    target[field.fieldName] = count === 0 ? undefined : sum / count;
+  }
+
+  return undefined;
+}
+
+function averageAccumulatorFields(
+  field: Extract<IncrementalAggregateField, { readonly op: 'avg' }>,
+  aggregateFields: readonly IncrementalAggregateField[]
+): {
+  readonly sum: Extract<IncrementalAggregateField, { readonly op: 'sum' }>;
+  readonly count: Extract<IncrementalAggregateField, { readonly op: 'count' }>;
+} | undefined {
+  const key = stableRowKey(field.expr);
+  let sumField: Extract<IncrementalAggregateField, { readonly op: 'sum' }> | undefined;
+  let countField: Extract<IncrementalAggregateField, { readonly op: 'count' }> | undefined;
+
+  for (const candidate of aggregateFields) {
+    if (candidate.expr === undefined || stableRowKey(candidate.expr) !== key) {
+      continue;
+    }
+
+    if (candidate.op === 'sum') {
+      sumField = candidate;
+      continue;
+    }
+
+    if (candidate.op === 'count') {
+      countField = candidate;
+    }
+  }
+
+  return sumField === undefined || countField === undefined
+    ? undefined
+    : { sum: sumField, count: countField };
 }
 
 function evaluateIncrementalAggregateValues(
@@ -3077,6 +3300,9 @@ function evaluateIncrementalAggregateValues(
           : evaluateIncrementalExpr(context, field.expr) == null ? 0 : 1;
         break;
       case 'sum':
+        values[field.fieldName] = numericAggregateValue(evaluateIncrementalExpr(context, field.expr));
+        break;
+      case 'avg':
         values[field.fieldName] = numericAggregateValue(evaluateIncrementalExpr(context, field.expr));
         break;
       case 'min':
@@ -3114,6 +3340,8 @@ function applyAggregateContribution(
       case 'sum':
         target[field.fieldName] = aggregateNumberValue(target[field.fieldName]) +
           sign * aggregateNumberValue(contribution[field.fieldName]);
+        continue;
+      case 'avg':
         continue;
       case 'min':
       case 'max':
@@ -3154,7 +3382,7 @@ function applyAggregateContribution(
     }
   }
 
-  return undefined;
+  return refreshAverageAggregateValues(target, aggregateFields);
 }
 
 function applyAggregateReplacement(
@@ -3170,6 +3398,8 @@ function applyAggregateReplacement(
         target[field.fieldName] = aggregateNumberValue(target[field.fieldName]) -
           aggregateNumberValue(removed[field.fieldName]) +
           aggregateNumberValue(added[field.fieldName]);
+        continue;
+      case 'avg':
         continue;
       case 'min':
       case 'max': {
@@ -3202,7 +3432,7 @@ function applyAggregateReplacement(
     }
   }
 
-  return undefined;
+  return refreshAverageAggregateValues(target, aggregateFields);
 }
 
 function applyExtremumReplacement(
@@ -3431,7 +3661,13 @@ function recordIncrementalAggregateDeltaRows(
     }
 
     changes.set(key, mapped.included
-      ? { key, included: true, group: mapped.group, groupKey: mapped.groupKey, values: mapped.values }
+      ? {
+          key,
+          included: true,
+          group: mapped.group,
+          groupKey: mapped.groupKey,
+          values: mapped.values
+        }
       : { key, included: false });
   }
 
@@ -3453,6 +3689,11 @@ function incrementalAggregateGroupForRelationRow(
 
   const context = { [plan.alias]: row };
   const group = evaluateIncrementalProjection(context, plan.groupBy);
+
+  if (!hasValidAverageAggregateInputs(context, plan.aggregateFields)) {
+    return undefined;
+  }
+
   const values = evaluateIncrementalAggregateValues(context, plan.aggregateFields);
 
   return {
@@ -3461,6 +3702,19 @@ function incrementalAggregateGroupForRelationRow(
     groupKey: stableRowKey(group),
     values
   };
+}
+
+function hasValidAverageAggregateInputs(
+  context: Record<string, unknown>,
+  aggregateFields: readonly IncrementalAggregateField[]
+): boolean {
+  for (const field of aggregateFields) {
+    if (field.op === 'avg' && typeof evaluateIncrementalExpr(context, field.expr) !== 'number') {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function sameIncludedAggregateGroup(
@@ -3478,7 +3732,7 @@ function aggregateOutputRow(
   const row: Record<string, unknown> = { ...group };
 
   for (const field of aggregateFields) {
-    if (field.op === 'min' || field.op === 'max' || field.op === 'any') {
+    if (field.op === 'min' || field.op === 'max' || field.op === 'any' || field.op === 'avg') {
       row[field.fieldName] = values[field.fieldName];
       continue;
     }
@@ -3609,6 +3863,65 @@ function rowKeyCount(rows: readonly unknown[], key: string): number {
   }
 
   return count;
+}
+
+function sortIncrementalRows(
+  rows: readonly unknown[],
+  order: readonly SortData[]
+): IncrementalRowUpdateResult {
+  const keyedRows: {
+    readonly row: unknown;
+    readonly keys: readonly unknown[];
+  }[] = [];
+
+  for (const [index, row] of rows.entries()) {
+    if (!isRecord(row)) {
+      return { kind: 'fallback', reason: `cached sort row ${index} is not an object` };
+    }
+
+    keyedRows.push({
+      row,
+      keys: order.map((item) => evaluateIncrementalExpr(row, item.expr))
+    });
+  }
+
+  return {
+    kind: 'updated',
+    rows: keyedRows.sort((left, right) => {
+      for (let index = 0; index < order.length; index += 1) {
+        const item = order[index] as SortData;
+        const comparison = compareIncrementalSortValues(
+          left.keys[index],
+          right.keys[index],
+          item
+        );
+
+        if (comparison !== 0) {
+          return comparison;
+        }
+      }
+
+      return 0;
+    }).map((item) => item.row)
+  };
+}
+
+function compareIncrementalSortValues(left: unknown, right: unknown, sort: SortData): number {
+  const leftNull = left == null;
+  const rightNull = right == null;
+
+  if (leftNull || rightNull) {
+    if (leftNull && rightNull) {
+      return 0;
+    }
+
+    const nulls = sort.nulls ?? 'last';
+    const nullComparison = leftNull ? -1 : 1;
+    return nulls === 'first' ? nullComparison : -nullComparison;
+  }
+
+  const comparison = compareIncrementalValues(left, right);
+  return sort.direction === 'asc' ? comparison : -comparison;
 }
 
 function incrementalOutputForRelationRow(

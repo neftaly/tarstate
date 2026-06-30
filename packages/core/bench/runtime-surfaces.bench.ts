@@ -15,7 +15,28 @@ import {
   materializeSnapshot,
   refreshMaterializationSnapshot
 } from '@tarstate/core/materialization';
-import { aggregate, as, count, eq, from, gt, join, keyBy, max, min, pipe, project, sum, where } from '@tarstate/core/query';
+import {
+  aggregate,
+  any,
+  as,
+  asc,
+  avg,
+  count,
+  desc,
+  eq,
+  from,
+  gt,
+  join,
+  keyBy,
+  max,
+  min,
+  notAny,
+  pipe,
+  project,
+  sort,
+  sum,
+  where
+} from '@tarstate/core/query';
 import { trackTransact } from '@tarstate/core/runtime';
 import { defineSchema, idField, numberField, refField, relation, stringField } from '@tarstate/core/schema';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
@@ -89,6 +110,10 @@ const highRankTodos = pipe(
   })
 );
 const keyedHighRankTodos = pipe(highRankTodos, keyBy('id'));
+const sortedTodos = pipe(
+  from(todo),
+  sort(desc(todo.rank), asc(todo.id))
+);
 const todoAssignments = join(from(assignment), eq(todo.id, assignment.todoId))(from(todo));
 const highRankSummary = pipe(
   from(todo),
@@ -96,9 +121,14 @@ const highRankSummary = pipe(
   aggregate({
     aggregates: {
       total: count(),
+      textTotal: count(todo.text),
+      rankCount: count(todo.rank),
       rankSum: sum(todo.rank),
+      averageRank: avg(todo.rank),
       minRank: min(todo.rank),
-      maxRank: max(todo.rank)
+      maxRank: max(todo.rank),
+      hasText: any(todo.text),
+      noText: notAny(todo.text)
     }
   })
 );
@@ -115,8 +145,16 @@ const todoWriter = write(schema.todos);
 const assignmentWriter = write(schema.assignments);
 const isolatedEqualityJoinMaintenanceIterations = 50;
 const isolatedEqualityJoinMaintenanceWarmupIterations = 5;
+const isolatedSortedQueryMaintenanceIterations = 50;
+const isolatedSortedQueryMaintenanceWarmupIterations = 5;
 
 type EqualityJoinMaintenanceState = {
+  readonly previous: Db;
+  readonly next: Db;
+  readonly options: MaterializationMaintenanceOptions;
+};
+
+type SortedQueryMaintenanceState = {
   readonly previous: Db;
   readonly next: Db;
   readonly options: MaterializationMaintenanceOptions;
@@ -151,6 +189,35 @@ async function prepareEqualityJoinMaintenanceStates(count: number): Promise<read
   return states;
 }
 
+async function prepareSortedQueryMaintenanceState(): Promise<SortedQueryMaintenanceState> {
+  const previous = createDb({ todos, assignments });
+
+  await materializeSnapshot(previous, sortedTodos, { id: 'sorted-todos', mode: 'incremental' });
+  const transaction = tryTransact(previous, [
+    todoWriter.update('todo-250', { rank: 1_250 })
+  ]);
+
+  if (transaction.diagnostics.length > 0) {
+    throw new Error(`sorted query maintenance transaction produced ${transaction.diagnostics.length} diagnostic(s)`);
+  }
+
+  return {
+    previous,
+    next: transaction.db,
+    options: { deltas: transaction.deltas }
+  };
+}
+
+async function prepareSortedQueryMaintenanceStates(count: number): Promise<readonly SortedQueryMaintenanceState[]> {
+  const states: SortedQueryMaintenanceState[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    states.push(await prepareSortedQueryMaintenanceState());
+  }
+
+  return states;
+}
+
 function assertIncrementalEqualityJoinMaintenanceResults(
   results: readonly MaterializationMaintenanceResult[]
 ): void {
@@ -162,6 +229,70 @@ function assertIncrementalEqualityJoinMaintenanceResults(
         `${result.diagnostics.length} diagnostic(s)`
       );
     }
+  }
+}
+
+function assertIncrementalSortedQueryMaintenanceResults(
+  results: readonly MaterializationMaintenanceResult[]
+): void {
+  if (results.length === 0) {
+    return;
+  }
+
+  const summary = results.reduce(
+    (accumulator, result) => {
+      accumulator.maintained += result.maintained;
+      accumulator.recomputed += result.recomputed;
+      accumulator.carried += result.carried;
+
+      for (const change of result.changes) {
+        if (change.update === 'incremental') {
+          accumulator.incrementalChanges += 1;
+        } else if (change.update === 'recomputed') {
+          accumulator.recomputedChanges += 1;
+        } else if (change.update === 'carried') {
+          accumulator.carriedChanges += 1;
+        }
+
+        for (const diagnostic of change.diagnostics) {
+          if (diagnostic.code === 'materialization_incremental_fallback') {
+            accumulator.fallbackDiagnostics += 1;
+          } else if (diagnostic.code === 'materialization_unsupported') {
+            accumulator.unsupportedDiagnostics += 1;
+          }
+        }
+      }
+
+      return accumulator;
+    },
+    {
+      maintained: 0,
+      recomputed: 0,
+      carried: 0,
+      incrementalChanges: 0,
+      recomputedChanges: 0,
+      carriedChanges: 0,
+      fallbackDiagnostics: 0,
+      unsupportedDiagnostics: 0
+    }
+  );
+
+  console.info(
+    '[runtime-surfaces] sorted query materialization maintenance after setup over 1k rows: ' +
+    `${results.length} sample(s), ${summary.incrementalChanges} incremental change(s), ` +
+    `${summary.recomputedChanges} recomputed change(s), ${summary.carriedChanges} carried change(s), ` +
+    `${summary.fallbackDiagnostics} fallback diagnostic(s), ` +
+    `${summary.unsupportedDiagnostics} unsupported diagnostic(s), ` +
+    `${summary.maintained} maintained, ${summary.recomputed} recomputed, ${summary.carried} carried`
+  );
+
+  if (summary.recomputedChanges > 0 || summary.fallbackDiagnostics > 0 || summary.unsupportedDiagnostics > 0) {
+    throw new Error(
+      'expected sorted query maintenance benchmark samples to stay incremental after setup, ' +
+      `got ${summary.recomputedChanges} recompute(s), ` +
+      `${summary.fallbackDiagnostics} fallback diagnostic(s), and ` +
+      `${summary.unsupportedDiagnostics} unsupported diagnostic(s)`
+    );
   }
 }
 
@@ -197,7 +328,7 @@ describe('runtime surfaces', () => {
     await refreshMaterializationSnapshot(refreshSource, 'high-rank');
   });
 
-  bench('incremental aggregate maintenance for count/sum/min/max over 1k rows', async () => {
+  bench('incremental aggregate maintenance for count/count(expr)/sum/avg/min/max/any/notAny over 1k rows', async () => {
     const db = createDb({ todos, assignments });
 
     await materializeSnapshot(db, highRankSummary, { id: 'high-rank-summary', mode: 'incremental' });
@@ -249,6 +380,41 @@ describe('runtime surfaces', () => {
       },
       teardown: () => {
         assertIncrementalEqualityJoinMaintenanceResults(results);
+      }
+    });
+  }
+
+  {
+    let stateIndex = 0;
+    let states: readonly SortedQueryMaintenanceState[] = [];
+    let results: MaterializationMaintenanceResult[] = [];
+
+    bench('incremental sorted query materialization maintenance after setup over 1k rows', async () => {
+      const state = states[stateIndex];
+
+      stateIndex += 1;
+      if (state === undefined) {
+        throw new Error('missing prepared sorted query maintenance state');
+      }
+
+      results.push(await maintainMaterializationSnapshots(state.previous, state.next, state.options));
+    }, {
+      iterations: isolatedSortedQueryMaintenanceIterations,
+      time: 0,
+      warmupIterations: isolatedSortedQueryMaintenanceWarmupIterations,
+      warmupTime: 0,
+      setup: async (_task, mode) => {
+        const iterations = mode === 'run'
+          ? isolatedSortedQueryMaintenanceIterations
+          : isolatedSortedQueryMaintenanceWarmupIterations;
+
+        stateIndex = 0;
+        results = [];
+        // Tinybench probes the task once before collecting samples to detect async functions.
+        states = await prepareSortedQueryMaintenanceStates(iterations + 1);
+      },
+      teardown: () => {
+        assertIncrementalSortedQueryMaintenanceResults(results);
       }
     });
   }
