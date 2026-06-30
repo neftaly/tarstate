@@ -9,9 +9,10 @@
     "node": ">=24.12.0"
   },
   "scripts": {
+    "bench": "pnpm --filter @tarstate/core bench",
     "build": "pnpm -r --if-present build",
     "lint": "oxlint . --deny-warnings --type-aware",
-    "test": "vitest run tests/*.test.ts --passWithNoTests && pnpm --filter './packages/*' --filter './apps/*' --if-present test",
+    "test": "pnpm --filter './packages/*' --filter './apps/*' --if-present test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

@@ -1,0 +1,30 @@
+{
+  "name": "@tarstate/react",
+  "private": true,
+  "version": "0.0.0",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
+    "test": "vitest run --config ../../vite.config.ts tests/*.test.tsx",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "react": ">=18.2.0"
+  },
+  "dependencies": {
+    "@tarstate/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/react": "catalog:",
+    "@types/react-test-renderer": "catalog:",
+    "react": "catalog:",
+    "react-test-renderer": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

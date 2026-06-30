@@ -19,14 +19,38 @@
       "@tarstate/core": [
         "./packages/core/src/index.ts"
       ],
+      "@tarstate/core/adapter": [
+        "./packages/core/src/adapter.ts"
+      ],
+      "@tarstate/core/constraints": [
+        "./packages/core/src/constraints.ts"
+      ],
+      "@tarstate/core/db": [
+        "./packages/core/src/db.ts"
+      ],
+      "@tarstate/core/delta": [
+        "./packages/core/src/delta.ts"
+      ],
+      "@tarstate/core/diff": [
+        "./packages/core/src/diff.ts"
+      ],
       "@tarstate/core/diagnostics": [
         "./packages/core/src/diagnostics.ts"
       ],
       "@tarstate/core/evaluate": [
         "./packages/core/src/evaluate.ts"
       ],
+      "@tarstate/core/identity": [
+        "./packages/core/src/identity.ts"
+      ],
+      "@tarstate/core/materialization": [
+        "./packages/core/src/materialization.ts"
+      ],
       "@tarstate/core/query": [
         "./packages/core/src/query.ts"
+      ],
+      "@tarstate/core/runtime": [
+        "./packages/core/src/runtime.ts"
       ],
       "@tarstate/core/schema": [
         "./packages/core/src/schema.ts"
@@ -34,8 +58,20 @@
       "@tarstate/core/source": [
         "./packages/core/src/source.ts"
       ],
+      "@tarstate/core/watch": [
+        "./packages/core/src/watch.ts"
+      ],
+      "@tarstate/core/write-apply": [
+        "./packages/core/src/write-apply.ts"
+      ],
       "@tarstate/core/write": [
         "./packages/core/src/write.ts"
+      ],
+      "@tarstate/automerge": [
+        "./packages/automerge/src/index.ts"
+      ],
+      "@tarstate/react": [
+        "./packages/react/src/index.ts"
       ]
     },
     "moduleDetection": "force",
@@ -50,6 +86,7 @@
   },
   "include": [
     "apps/*/src",
+    "packages/*/bench",
     "packages/*/src",
     "packages/*/tests",
     "scripts/*.ts",

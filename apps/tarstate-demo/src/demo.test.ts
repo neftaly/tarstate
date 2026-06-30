@@ -11,12 +11,13 @@ describe('tarstate demo data', () => {
       { id: 'todo-b', text: 'Evaluate a query over object rows', done: false, writer: undefined },
       { id: 'todo-c', text: 'Apply writer patches', done: false, writer: 'Jules' }
     ]);
-    expect(snapshot.writeResult).toEqual({ patches: 4, applied: 4, diagnostics: [] });
+    expect(snapshot.writeResult).toMatchObject({ patches: 4, applied: 4, diagnostics: [] });
+    expect(snapshot.writeResult.deltas.map((delta) => delta.relation.name)).toEqual(['todos', 'todoWriters']);
     expect(snapshot.nextRows.todos).toEqual([
       { id: 'todo-a', text: 'Sketch relation schema', done: true },
       { id: 'todo-b', text: 'Evaluate a query over object rows', done: true },
       { id: 'todo-c', text: 'Apply writer patches', done: false },
-      { id: 'todo-d', text: 'Keep Automerge as a planned adapter', done: false }
+      { id: 'todo-d', text: 'Benchmark the Automerge adapter', done: false }
     ]);
     expect(snapshot.nextRows.todoWriters).toEqual([
       { todoId: 'todo-a', writerId: 'writer-mina' },
@@ -27,7 +28,7 @@ describe('tarstate demo data', () => {
       { id: 'todo-a', text: 'Sketch relation schema', done: true, writer: 'Mina' },
       { id: 'todo-b', text: 'Evaluate a query over object rows', done: true, writer: undefined },
       { id: 'todo-c', text: 'Apply writer patches', done: false, writer: undefined },
-      { id: 'todo-d', text: 'Keep Automerge as a planned adapter', done: false, writer: 'Mina' }
+      { id: 'todo-d', text: 'Benchmark the Automerge adapter', done: false, writer: 'Mina' }
     ]);
     expect(snapshot.patchLog.map((entry) => entry.op)).toEqual(['update', 'insert', 'upsert', 'delete']);
   });
@@ -38,7 +39,7 @@ describe('tarstate demo data', () => {
     expect(scenario.actions.map((action) => action.patch.op)).toEqual(['update', 'insert', 'upsert', 'delete']);
     expect(scenario.actions.map((action) => action.intent)).toEqual([
       'Mark the object-backed query work complete.',
-      'Add a follow-up todo for the next adapter boundary.',
+      'Add a follow-up todo for adapter benchmarking.',
       'Assign the new todo to an existing writer.',
       'Remove the stale writer assignment from the patching task.'
     ]);

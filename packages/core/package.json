@@ -6,14 +6,25 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./adapter": "./src/adapter.ts",
+    "./constraints": "./src/constraints.ts",
+    "./db": "./src/db.ts",
+    "./delta": "./src/delta.ts",
+    "./diff": "./src/diff.ts",
     "./diagnostics": "./src/diagnostics.ts",
     "./evaluate": "./src/evaluate.ts",
+    "./identity": "./src/identity.ts",
+    "./materialization": "./src/materialization.ts",
     "./query": "./src/query.ts",
+    "./runtime": "./src/runtime.ts",
     "./schema": "./src/schema.ts",
     "./source": "./src/source.ts",
+    "./watch": "./src/watch.ts",
+    "./write-apply": "./src/write-apply.ts",
     "./write": "./src/write.ts"
   },
   "scripts": {
+    "bench": "vitest bench --config ../../vite.config.ts bench/*.bench.ts --run",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"

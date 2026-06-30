@@ -7,6 +7,7 @@ export type TarstateDiagnostic = {
     | 'unreadable_ref'
     | 'stale_presence'
     | 'source_error'
+    | 'unsupported_expression'
     | 'unsupported_lookup';
   readonly message: string;
   readonly relation?: string;

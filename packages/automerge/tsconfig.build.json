@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.build.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "tsBuildInfoFile": "dist/.tsbuildinfo",
+    "paths": {
+      "@tarstate/core": ["../core/dist/index.d.ts"],
+      "@tarstate/core/adapter": ["../core/dist/adapter.d.ts"],
+      "@tarstate/core/schema": ["../core/dist/schema.d.ts"],
+      "@tarstate/core/source": ["../core/dist/source.d.ts"],
+      "@tarstate/core/write": ["../core/dist/write.d.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["src/*.test.ts"]
+}

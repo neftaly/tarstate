@@ -1,4 +1,7 @@
-type PrimitiveFieldKind = 'string' | 'number' | 'boolean' | 'id' | 'ref' | 'anchoredPath';
+type PrimitiveFieldKind = 'string' | 'number' | 'boolean' | 'id' | 'ref' | 'anchoredPath' | 'json';
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
 /** Field metadata used for validation and future planning. */
 export type FieldSpec = {
@@ -55,6 +58,11 @@ export function anchoredPathField(): FieldSpec {
   return field('anchoredPath');
 }
 
+/** JSON-compatible value field for opaque application payloads. */
+export function jsonField(): FieldSpec {
+  return field('json');
+}
+
 /** Allow null for a field while still requiring the key to exist. */
 export function nullable(spec: FieldSpec): FieldSpec {
   return { ...spec, nullable: true };
@@ -96,4 +104,42 @@ export function defineSchema<const Schema extends Record<string, RelationRef>>(s
 
 function field(valueKind: PrimitiveFieldKind): FieldSpec {
   return { kind: 'field', valueKind, optional: false, nullable: false };
+}
+
+export function isJsonValue(value: unknown): value is JsonValue {
+  return isJsonValueInternal(value, new Set());
+}
+
+function isJsonValueInternal(value: unknown, seen: Set<object>): value is JsonValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return true;
+  }
+
+  if (typeof value === 'number') {
+    return Number.isFinite(value);
+  }
+
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return false;
+    }
+
+    seen.add(value);
+    const valid = value.every((item) => isJsonValueInternal(item, seen));
+    seen.delete(value);
+    return valid;
+  }
+
+  if (typeof value !== 'object' || Object.prototype.toString.call(value) !== '[object Object]') {
+    return false;
+  }
+
+  if (seen.has(value)) {
+    return false;
+  }
+
+  seen.add(value);
+  const valid = Object.values(value as Record<string, unknown>).every((item) => isJsonValueInternal(item, seen));
+  seen.delete(value);
+  return valid;
 }

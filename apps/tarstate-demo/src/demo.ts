@@ -1,27 +1,32 @@
+import { evaluate, type QueryResult } from '@tarstate/core/evaluate';
 import {
-  applyWrites,
   as,
-  booleanField,
-  defineSchema,
   eq,
-  evaluate,
   from,
-  fromObjectSource,
-  idField,
   leftJoin,
   maybe,
   pipe,
   project,
+  type Query
+} from '@tarstate/core/query';
+import {
+  booleanField,
+  defineSchema,
+  idField,
   refField,
   relation,
-  stringField,
+  stringField
+} from '@tarstate/core/schema';
+import { fromObjectSource } from '@tarstate/core/source';
+import {
+  applyWrites,
   type MutableObjectSourceData,
-  type Query,
-  type QueryResult,
+  type WriteApplyResult
+} from '@tarstate/core/write-apply';
+import {
   write,
-  type WriteApplyResult,
   type WritePatch
-} from '@tarstate/core';
+} from '@tarstate/core/write';
 
 export type TodoRow = {
   readonly id: string;
@@ -156,8 +161,8 @@ export function buildWriterActionScenario(): WriterActionScenario {
         patch: todos.update('todo-b', { done: true })
       },
       {
-        intent: 'Add a follow-up todo for the next adapter boundary.',
-        patch: todos.insert({ id: 'todo-d', text: 'Keep Automerge as a planned adapter', done: false })
+        intent: 'Add a follow-up todo for adapter benchmarking.',
+        patch: todos.insert({ id: 'todo-d', text: 'Benchmark the Automerge adapter', done: false })
       },
       {
         intent: 'Assign the new todo to an existing writer.',
@@ -216,5 +221,9 @@ function describePatch(patch: WritePatch, intent: string, index: number): PatchL
       return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `upsert ${JSON.stringify(patch.row)}` };
     case 'delete':
       return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete ${JSON.stringify(patch.key)}` };
+    case 'deleteExact':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete exact ${JSON.stringify(patch.row)}` };
+    case 'replaceAll':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `replace all with ${JSON.stringify(patch.rows)}` };
   }
 }

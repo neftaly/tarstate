@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.build.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "tsBuildInfoFile": "dist/.tsbuildinfo",
+    "paths": {
+      "@tarstate/core": ["../core/dist/index.d.ts"],
+      "@tarstate/core/db": ["../core/dist/db.d.ts"],
+      "@tarstate/core/evaluate": ["../core/dist/evaluate.d.ts"],
+      "@tarstate/core/query": ["../core/dist/query.d.ts"],
+      "@tarstate/core/write": ["../core/dist/write.d.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["src/*.test.ts", "src/*.test.tsx"]
+}
