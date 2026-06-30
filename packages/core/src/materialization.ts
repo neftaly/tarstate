@@ -2246,12 +2246,6 @@ async function applyIncrementalJoinDeltas(
     return { kind: 'applied', rows: Object.freeze([...previousRows]) };
   }
 
-  const snapshotState = incrementalJoinSnapshotStateFor(previousRows, plan);
-
-  if (snapshotState.kind === 'fallback') {
-    return snapshotState;
-  }
-
   const currentState = await incrementalJoinCurrentStateFor(source, plan);
 
   if (currentState.kind === 'fallback') {
@@ -2263,6 +2257,12 @@ async function applyIncrementalJoinDeltas(
       kind: 'applied',
       rows: Object.freeze(incrementalJoinOutputRows(currentState, plan))
     };
+  }
+
+  const snapshotState = incrementalJoinSnapshotStateFor(previousRows, plan);
+
+  if (snapshotState.kind === 'fallback') {
+    return snapshotState;
   }
 
   const affectedPairKeys = new Set<string>();
