@@ -260,6 +260,67 @@ describe('@tarstate/automerge', () => {
     }
   });
 
+  it('partially applies composed writes when durable Automerge accepts and remote presence rejects', async () => {
+    const doc = Automerge.from<TodoDocument>({
+      todos: {
+        'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
+        'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
+      }
+    });
+    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const handle = new FakeDocHandle();
+    const presenceRuntime = automergePresenceRuntime({
+      handle: handle.asHandle(),
+      relation: schema.presence,
+      localPeerId: 'peer-local',
+      initialState: { targetTodoId: 'todo-a' },
+      heartbeatMs: 60_000
+    });
+    const runtime = composeRelationRuntimes(adapter, presenceRuntime);
+
+    try {
+      const beforeDoc = adapter.doc;
+      const initialBroadcasts = [...handle.broadcasts];
+
+      const result = await tryApplyRelationPatches(runtime, [
+        todos.update('todo-a', { done: true }),
+        presenceRows.upsert({ peerId: 'peer-remote', channel: 'targetTodoId', value: 'todo-b' })
+      ]);
+
+      expect(result).toMatchObject({
+        status: 'partial',
+        accepted: false,
+        patches: 2,
+        applied: 1,
+        diagnostics: [
+          {
+            code: 'invalid_row',
+            relation: 'presence',
+            field: 'peerId',
+            detail: 'peer-remote'
+          }
+        ]
+      });
+      expect(result.version).toEqual([
+        Automerge.getHeads(adapter.doc),
+        { revision: 0, localPeerId: 'peer-local' }
+      ]);
+      expect(result.deltas).toEqual([
+        {
+          relation: schema.todos,
+          added: [{ id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 }],
+          removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]
+        }
+      ]);
+      expect(adapter.doc).not.toBe(beforeDoc);
+      expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
+      expect(presenceRuntime.getLocalState()).toMatchObject({ targetTodoId: 'todo-a' });
+      expect(handle.broadcasts).toEqual(initialBroadcasts);
+    } finally {
+      presenceRuntime.stop();
+    }
+  });
+
   it('composes durable, presence, and memory runtimes through one query and write path', async () => {
     const doc = Automerge.from<TodoDocument>({
       todos: {
