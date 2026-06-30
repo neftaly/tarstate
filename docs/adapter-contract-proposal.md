@@ -33,6 +33,37 @@ that relation in `relationNames`.
 const runtime = composeRelationRuntimes(durableRuntime, presenceRuntime)
 ```
 
+A composed runtime is still one data source to queries and React stores. Durable
+document rows and ephemeral presence rows can participate in the same query, and
+writes still use ordinary relation-scoped patches:
+
+```ts
+const object = as(schema.objects, 'object')
+const cursor = as(schema.presence, 'cursor')
+
+const focusedObjects = pipe(
+  from(object),
+  leftJoin(from(cursor), eq(object.id, cursor.targetObjectId)),
+  project({
+    id: object.id,
+    title: object.title,
+    focusedBy: maybe(cursor.peerId),
+  }),
+  keyBy('id')
+)
+
+const rows = await evaluate(runtime.source, focusedObjects)
+
+await tryApplyRelationPatches(runtime, [
+  write(schema.objects).upsert({ id: 'object-a', title: 'Proposal' }),
+  write(schema.presence).upsert({
+    peerId: 'peer-a',
+    channel: 'selection',
+    targetObjectId: 'object-a',
+  }),
+])
+```
+
 If ownership is ambiguous, the composed target rejects the batch before applying
 anything. If a single target has unknown `relationNames`, it owns all writes.
 After routing succeeds, each child target owns its own atomicity policy; a
