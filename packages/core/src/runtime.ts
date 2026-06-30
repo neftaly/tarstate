@@ -65,11 +65,9 @@ export type TrackTransactResult<Db extends WatchDb = WatchDb> = {
   readonly label?: string;
 };
 export type TrackRuntimeCommitStatus = 'accepted' | 'partial' | 'rejected';
-export type TrackRuntimeCommitResult<Version = unknown> = {
+type TrackRuntimeCommitResultBase<Version = unknown> = {
   readonly kind: 'trackRuntimeCommit';
   readonly runtime: RelationRuntime<Version>;
-  readonly source: AdapterSource<Version>;
-  readonly supported: boolean;
   readonly status: TrackRuntimeCommitStatus;
   readonly accepted: boolean;
   readonly patches: number;
@@ -82,9 +80,30 @@ export type TrackRuntimeCommitResult<Version = unknown> = {
   readonly durability?: RelationApplyDurability;
   readonly label?: string;
 };
+export type TrackRuntimeCommitSupportedResult<Version = unknown> = TrackRuntimeCommitResultBase<Version> & {
+  readonly source: AdapterSource<Version>;
+  readonly supported: true;
+};
+export type TrackRuntimeCommitUnsupportedResult<Version = unknown> = Omit<
+  TrackRuntimeCommitResultBase<Version>,
+  'runtime' | 'status' | 'accepted' | 'applied' | 'changes' | 'deltas'
+> & {
+  readonly runtime: unknown;
+  readonly source?: AdapterSource<Version> | undefined;
+  readonly supported: false;
+  readonly status: 'rejected';
+  readonly accepted: false;
+  readonly applied: 0;
+  readonly changes: readonly [];
+  readonly deltas: readonly [];
+};
+export type TrackRuntimeCommitResult<Version = unknown> =
+  | TrackRuntimeCommitSupportedResult<Version>
+  | TrackRuntimeCommitUnsupportedResult<Version>;
 
 type TrackTransactEnvelope<Db extends WatchDb> = {
   readonly db: Db;
+  readonly committed?: boolean;
   readonly deltas?: readonly RelationDelta[];
   readonly diagnostics?: readonly TrackTransactDiagnostic[];
 };
@@ -98,7 +117,7 @@ type ConstraintEnforcementResult =
     readonly diagnostics: readonly TarstateDiagnostic[];
   };
 type RuntimeCommitReport<Version> = Pick<
-  TrackRuntimeCommitResult<Version>,
+  TrackRuntimeCommitSupportedResult<Version>,
   'status' | 'accepted' | 'patches' | 'applied' | 'deltas' | 'diagnostics' | 'source' | 'version' | 'durability'
 >;
 type RuntimePatchAttempt<Version> = {
@@ -199,8 +218,23 @@ export async function trackTransact<Db extends WatchDb, Result extends TrackTran
  * @remarks Relation deltas are used for tracking only when the runtime/adapter actually reports a `deltas`
  * property. Missing deltas are treated as unknown and force recompute-backed tracking.
  */
+export function trackRuntimeCommit<Version = unknown>(
+  runtime: RelationAdapter<Version>,
+  patches: Iterable<WritePatch>,
+  options?: TrackRuntimeCommitOptions
+): Promise<TrackRuntimeCommitSupportedResult<Version>>;
+export function trackRuntimeCommit<Version = unknown>(
+  runtime: RelationRuntime<Version>,
+  patches: Iterable<WritePatch>,
+  options?: TrackRuntimeCommitOptions
+): Promise<TrackRuntimeCommitSupportedResult<Version>>;
+export function trackRuntimeCommit(
+  runtime: unknown,
+  patches: Iterable<WritePatch>,
+  options?: TrackRuntimeCommitOptions
+): Promise<TrackRuntimeCommitResult>;
 export async function trackRuntimeCommit<Version = unknown>(
-  runtime: RelationRuntime<Version> | RelationAdapter<Version>,
+  runtime: unknown,
   patches: Iterable<WritePatch>,
   options: TrackRuntimeCommitOptions = {}
 ): Promise<TrackRuntimeCommitResult<Version>> {
@@ -210,14 +244,15 @@ export async function trackRuntimeCommit<Version = unknown>(
     return unsupportedTrackRuntimeCommitResult(runtime, patchList.length, options);
   }
 
-  const snapshotBefore = runtimeSnapshot(runtime);
-  const attempt = await applyRuntimePatches(runtime, patchList, options);
+  const trackedRuntime = runtime as RelationRuntime<Version> | RelationAdapter<Version>;
+  const snapshotBefore = runtimeSnapshot(trackedRuntime);
+  const attempt = await applyRuntimePatches(trackedRuntime, patchList, options);
   const report = attempt.report;
 
   if (report.status === 'rejected') {
     return {
       kind: 'trackRuntimeCommit',
-      runtime,
+      runtime: trackedRuntime,
       source: report.source,
       supported: true,
       status: report.status,
@@ -236,13 +271,13 @@ export async function trackRuntimeCommit<Version = unknown>(
     };
   }
 
-  const snapshotAfter = runtimeSnapshot(runtime);
+  const snapshotAfter = runtimeSnapshot(trackedRuntime);
   const materializationMaintenance = await maintainMaterializationSnapshots(
-    runtime.source,
-    runtime.source as SnapshotMaterializationTarget
+    trackedRuntime.source,
+    trackedRuntime.source as SnapshotMaterializationTarget
   );
   const changes = await trackWatchedChanges(
-    runtime.source,
+    trackedRuntime.source,
     snapshotBefore.source,
     snapshotAfter.source,
     trackedChangeSet(attempt.deltas),
@@ -258,7 +293,7 @@ export async function trackRuntimeCommit<Version = unknown>(
 
   return {
     kind: 'trackRuntimeCommit',
-    runtime,
+    runtime: trackedRuntime,
     source: report.source,
     supported: true,
     status: report.status,
@@ -372,10 +407,10 @@ function runtimeSnapshot<Version>(
 }
 
 function unsupportedTrackRuntimeCommitResult<Version>(
-  runtime: RelationRuntime<Version> | RelationAdapter<Version>,
+  runtime: unknown,
   patches: number,
   options: TrackRuntimeCommitOptions
-): TrackRuntimeCommitResult<Version> {
+): TrackRuntimeCommitUnsupportedResult<Version> {
   const diagnostic = unsupportedRuntimeCommitDiagnostic();
 
   if (options.throwOnUnsupported === true) {
@@ -384,7 +419,7 @@ function unsupportedTrackRuntimeCommitResult<Version>(
 
   return {
     kind: 'trackRuntimeCommit',
-    runtime: runtime as RelationRuntime<Version>,
+    runtime,
     source: (runtime as RelationRuntime<Version>).source,
     supported: false,
     status: 'rejected',

@@ -975,6 +975,36 @@ describe('tarstate runtime orchestration', () => {
     });
   });
 
+  it('returns unsupported commit result without source for invalid runtime-like input', async () => {
+    const invalidRuntime = {
+      target: {
+        apply: () => {
+          throw new Error('invalid runtime target should not be called');
+        }
+      }
+    };
+    const todos = write(schema.todos);
+
+    const result = await trackRuntimeCommit(invalidRuntime, [
+      todos.update('todo-a', { done: true })
+    ], { label: 'invalid-runtime' });
+
+    expect(result).toMatchObject({
+      kind: 'trackRuntimeCommit',
+      runtime: invalidRuntime,
+      supported: false,
+      status: 'rejected',
+      accepted: false,
+      patches: 1,
+      applied: 0,
+      changes: [],
+      deltas: [],
+      diagnostics: [{ code: 'change_tracking_unsupported' }],
+      label: 'invalid-runtime'
+    });
+    expect(result.source).toBeUndefined();
+  });
+
   it('tracks partial generic runtime patch commits with only reported deltas', async () => {
     const runtime = new MutableRuntime({
       todos: [
@@ -1130,6 +1160,9 @@ describe('tarstate runtime orchestration', () => {
       deltas: [],
       diagnostics: [{ code: 'source_error', message: 'runtime rejected patches' }]
     });
+    if (!result.supported) {
+      throw new Error('expected supported runtime commit result');
+    }
     expect(result.materializations).toBeUndefined();
     expect(events).toEqual([]);
     expect(runtime.snapshotSources).toHaveLength(1);
@@ -1168,6 +1201,9 @@ describe('tarstate runtime orchestration', () => {
       deltas: [],
       diagnostics: []
     });
+    if (!result.supported) {
+      throw new Error('expected supported runtime commit result');
+    }
     expect(result.materializations).toMatchObject({
       maintained: 1,
       recomputed: 1,
