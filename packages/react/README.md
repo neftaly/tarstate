@@ -14,17 +14,18 @@ layer with explicit writes, not general bidirectional lens/view putback:
   outside the narrow incremental subset. Committed writes also return optional
   core-sourced `changes`; rejected writes do not.
 - `createSourceStore` for external state exposed as a `RelationSource`, plus an
-  optional patch target. Reflected commits maintain existing materializations
-  only when the previous snapshot carries metadata; source-backed paths should
-  recompute conservatively unless source order semantics are explicit.
+  optional patch target. Reflected commits, manual refresh, and host
+  invalidations maintain existing materializations when the previous snapshot
+  carries metadata; source-backed paths recompute conservatively unless real
+  relation deltas are reported.
 - `createRuntimeStore` for generic `RelationRuntime` integrations such as
   composed durable documents plus ephemeral presence. Runtime stores follow the
   same materialization rules as source stores.
 - `createAdapterStore` for write-capable integrations that implement
   `RelationAdapter`, preferably with read-consistent `snapshot()` support.
   Adapter commits follow the reflected-commit maintenance path; host
-  `refresh`/`subscribe` invalidations only refresh snapshots unless a store path
-  explicitly maintains materializations.
+  `refresh`/`subscribe` invalidations preserve materializations through the same
+  conservative source refresh path.
 - `TarstateProvider`, `useTarstateQuery`, `useTarstateQueries`,
   `useTarstateCommit`, and `useTarstateSnapshot` for components. The shorter
   `useQuery`, `useQueries`, and `useCommit` aliases are also exported. Query

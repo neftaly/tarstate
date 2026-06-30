@@ -30,11 +30,11 @@ document sync. Those belong in adapters and consumers.
 | `@tarstate/core/write-apply` | Functional object runtime support | Object-backed `applyWrites` and `applyWritesAtomic` helpers for runtimes and adapters that explicitly stage mutable relation arrays. |
 | `@tarstate/core/db` | Functional object runtime | `createDb`, `q`, `qMany`, `row`, `exists`, `whatIf`, `tryTransact`, and `transact` for prototypes, tests, and small object-backed runtimes. `q` and `whatIf` accept a single query or a named query batch. `q`, `qMany`, and `whatIf` can apply post-evaluation `mapRows` result shaping while preserving diagnostics; this is not a query planner, transducer, or collection protocol. Transactions are all-or-nothing and committed results include relation deltas. |
 | `@tarstate/core/constraints` | Experimental validation/enforcement | `check`, `req`, `fk`, `unique`, and `constrain` build descriptors. `validateConstraints` can scan a source for `req`, `unique`, `fk`, and query-bound `check`; `tryTransactConstrained` and `transactConstrained` can reject object-backed writes; unbound `check` remains explicitly unsupported. |
-| `@tarstate/core/materialization` | Experimental snapshot surface | `mat` is the async snapshot materialization shorthand for `materializeSnapshot`; both cache one-shot rows readable by id or query key. `readMaterializedQuery` reads cached rows for an exact structural query key only when the source version can be verified current; misses, stale versions, and metadata without rows return explicit diagnostics instead of recomputing. `demat` removes metadata and cached snapshot rows. `materializedSourceFor` exposes cached rows as one read-only `RelationSource` relation; `snapshotIndex` can expose only cached snapshot rows as a set index, `snapshotHashIndex` can build read-only hash lookup maps derived from cached snapshot rows, and none of these helpers is an operator-maintained index or view putback surface. `refreshMaterializationSnapshot` can recompute an existing snapshot, and `maintainMaterializationSnapshots` can carry snapshots onto a new DB/source object, skipping unaffected snapshots when relation deltas are supplied. Opt-in incremental maintenance is limited to single-relation pure-filter/project/extend-style queries, simple base-relation inner equality joins with optional output transforms, and a narrow aggregate subset with plain `count()`, `sum(expr)`, `min(expr)`, and `max(expr)`; unsupported shapes/options, transformed join inputs, and unsafe extrema or join removals keep explicit diagnostics and recompute fallback. |
+| `@tarstate/core/materialization` | Experimental snapshot surface | `mat` is the async snapshot materialization shorthand for `materializeSnapshot`; both cache one-shot rows readable by id or query key. `readMaterializedQuery` reads cached rows for an exact structural query key only when the source version can be verified current; misses, stale versions, and metadata without rows return explicit diagnostics instead of recomputing. `demat` removes metadata and cached snapshot rows. `materializedSourceFor` exposes cached rows as one read-only `RelationSource` relation; `snapshotIndex` can expose only cached snapshot rows as a set index, `snapshotHashIndex` can build read-only hash lookup maps derived from cached snapshot rows, and none of these helpers is an operator-maintained index or view putback surface. `refreshMaterializationSnapshot` can recompute an existing snapshot, and `maintainMaterializationSnapshots` can carry snapshots onto a new DB/source object, skipping unaffected snapshots when relation deltas are supplied. Opt-in incremental maintenance is limited to single-relation pure-filter/project/extend-style queries, simple inner/left equality joins over base relations with optional side `hash`/`where` filters and output transforms, and a narrow aggregate subset with `count()`, `count(expr)`, `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`, and `notAny(expr)`; unsupported shapes/options, join-side output transforms, and unsafe aggregate or join removals keep explicit diagnostics and recompute fallback. |
 | `@tarstate/core/memory-runtime` | Functional local runtime | `createMemoryRelationRuntime` exposes object-backed rows through the same `RelationRuntime` source/target contract used by durable and presence adapters. It is for tests, local state, and adapter prototyping; accepted row-changing writes report `durability: 'memory'` and increment a numeric source version. |
 | `@tarstate/core/watch` | Experimental diff surface | `diffQuery` can compute a one-shot before/after query result diff with query key and source version identity. `watch` is a manual refresh/recompute handle, not an async stream; each refresh can deliver full-row diffs plus experimental keyed `rowChanges`, using query-owned `keyBy` fields when present. `subscribeWatch` adds callback fan-out to an existing watch, direct relation targets can derive tracked `rowChanges` from validated real relation deltas, and `watchRuntime` bridges `RelationRuntime.subscribe` host invalidations into normal watch refreshes without synthesizing deltas. |
 | `@tarstate/core/runtime` | Experimental orchestration surface | `trackTransact` can run readable DB/source transactions, maintain snapshot materializations, and return recompute-backed changes for watched targets without making watch registration own transaction semantics. `trackRuntimeCommit` applies patches through a `RelationRuntime`/`RelationAdapter`, then maintains materializations and delivers watched changes from reported commit/apply results without inventing deltas. |
-| `@tarstate/react` | Experimental React entrypoint | Idiomatic React package with `TarstateProvider`, revisioned external-store snapshots, prefixed hooks (`useTarstateQuery`, `useTarstateQueries`, `useTarstateCommit`) plus short aliases, and store constructors for object-backed DBs, read-only sources, runtimes, and write-capable adapters. `createDbStore(input, { constraints })` can attach object-backed constraints before the initial snapshot; DB store commits enforce attached object-backed constraints, use delta-backed maintenance for object-backed materializations, and include optional core-sourced `changes` for committed writes. `useTarstateQuery`/`useTarstateQueries` attempt exact materialized-query read-through for cache-safe queries, then fall back to captured-source evaluation. Source/runtime/adapter stores maintain existing materializations only after reflected commits and should recompute unless source order semantics are explicit; host refresh/subscribe invalidations only refresh snapshots unless a store path explicitly maintains materializations. |
+| `@tarstate/react` | Experimental React entrypoint | Idiomatic React package with `TarstateProvider`, revisioned external-store snapshots, prefixed hooks (`useTarstateQuery`, `useTarstateQueries`, `useTarstateCommit`) plus short aliases, and store constructors for object-backed DBs, read-only sources, runtimes, and write-capable adapters. `createDbStore(input, { constraints })` can attach object-backed constraints before the initial snapshot; DB store commits enforce attached object-backed constraints, use delta-backed maintenance for object-backed materializations, and include optional core-sourced `changes` for committed writes. `useTarstateQuery`/`useTarstateQueries` attempt exact materialized-query read-through for cache-safe queries, then fall back to captured-source evaluation. Source/runtime/adapter store commits expose core-sourced `changes` when snapshots can be compared, and reflected commits, manual refresh, and host refresh/subscribe invalidations preserve materializations with conservative recompute unless real relation deltas are reported. |
 | `@tarstate/automerge` | Experimental API-surface consumer example | Automerge-backed consumer used to pressure-test `RelationSource`, `RelationAdapter`, write patches, version identity, and relation deltas. Treat it as an example integration for now, not the central product direction. |
 
 Examples and onboarding should import from taxonomy subpaths such as
@@ -47,9 +47,10 @@ the default teaching path.
 Functional but intentionally simple:
 
 - `aggregate` evaluation is currently in-memory. Incremental materialization can
-  maintain a narrow terminal aggregate subset with plain `count()`, `sum(expr)`,
-  `min(expr)`, and `max(expr)`; unsupported aggregate options and unsafe extrema
-  removals fall back to recompute with diagnostics.
+  maintain a narrow terminal aggregate subset with `count()`, `count(expr)`,
+  `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`, and `notAny(expr)`;
+  unsupported aggregate options and unsafe aggregate removals fall back to
+  recompute with diagnostics.
 - `hash` and `btree` are query-level index declarations. A single-field
   `hash(from(...))` can help the one-shot evaluator plan simple equality
   filters and joins against `RelationSource.lookup`; a single-field
@@ -62,11 +63,12 @@ Functional but intentionally simple:
   (`eq`/`neq`/`lt`/`lte`/`gt`/`gte` against literal/env/tuple values, composed
   with `and`/`or`/`not`), and simple
   `project`/`extend`/`without`/`rename`/`qualify` transforms, plus terminal
-  plain `count()`, `sum(expr)`, `min(expr)`, and `max(expr)` aggregates over the
-  same subset. It also accepts simple inner equality joins of two base
-  relations with optional simple post-join
-  `project`/`extend`/`without`/`rename`/`qualify` output transforms; left joins,
-  non-equality joins, self joins, and transformed join inputs remain
+  `count()`, `count(expr)`, `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`,
+  and `notAny(expr)` aggregates over the same subset. It also accepts simple
+  inner/left equality joins of two base relations with optional side-local
+  `hash`/`where` filters and simple post-join
+  `project`/`extend`/`without`/`rename`/`qualify` output transforms;
+  non-equality joins, self joins, and join-side output transforms remain
   diagnostic-backed.
 - Set operations use stable JSON row keys.
 - Expression calls use named runtime functions, not arbitrary closures in query
@@ -181,15 +183,17 @@ What this gives today:
 - DB store enforcement for attached object-backed constraints.
 - DB store delta-backed maintenance for existing object-backed snapshot
   materializations.
-- Source/runtime/adapter store maintenance only after reflected commits, with
-  conservative recompute unless source order semantics are explicit.
+- Source/runtime/adapter store maintenance after reflected commits, manual
+  refresh, and host invalidation, with conservative recompute unless real
+  relation deltas are reported.
 - Host-driven runtime watch refresh through `watchRuntime`.
 - Runtime/adapter patch commit tracking through `trackRuntimeCommit`.
 - One-shot derived reads through hooks.
 - Narrow experimental incremental snapshot maintenance for simple
-  single-relation pure predicates/transforms plus plain `count()`, `sum(expr)`,
-  `min(expr)`, and `max(expr)` aggregates, plus simple base-relation inner
-  equality joins with optional output transforms.
+  single-relation pure predicates/transforms plus `count()`, `count(expr)`,
+  `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`, and `notAny(expr)`
+  aggregates, plus simple inner/left equality joins over base relations with
+  optional side filters and output transforms.
 
 What it does not give yet:
 

@@ -36,8 +36,8 @@ The core API is moving toward a Relic-shaped split:
 - `constraints`, `materialization`, `watch`, and `runtime` expose the next API
   surfaces with baseline validation, explicit object-backed constraint
   enforcement, committed relation deltas, snapshot maintenance with a narrow
-  exact materialized-query read path, a narrow single-relation incremental subset, simple base-relation inner equality
-  join maintenance with optional output transforms, supported `count()`, `sum(expr)`, `min(expr)`, and `max(expr)`
+  exact materialized-query read path, a narrow single-relation incremental subset, simple inner/left equality
+  join maintenance with optional side filters and output transforms, supported `count()`, `count(expr)`, `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`, and `notAny(expr)`
   aggregate maintenance, manual/recompute-backed watch refresh with callback
   fan-out from real refresh/tracked-change events,
   host-driven `watchRuntime` refresh for `RelationRuntime.subscribe`, generic
@@ -47,9 +47,8 @@ The core API is moving toward a Relic-shaped split:
   schema-attached or adapter-backed enforcement, general operator-maintained
   views/indexes, adapter-fed relation deltas for host invalidations, and async
   watch streams are outside the current public guarantees. Host-driven
-  refresh/subscribe invalidations do not automatically maintain
-  materializations; source-like integrations should recompute unless their
-  ordering semantics are explicit.
+  refresh/subscribe invalidations preserve materializations through conservative
+  source refresh, but they do not receive adapter-fed relation deltas yet.
 
 See [developer-onboarding.md](../../docs/developer-onboarding.md) for current
 API status, onboarding flows, and package direction.

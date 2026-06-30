@@ -284,12 +284,14 @@ Current state:
   literal/env/tuple values, composed with `and`/`or`/`not`), and simple
   `project`/`extend`/`without`/`rename`/`qualify` transforms. A terminal
   `aggregate` over the same base/filter subset can also be maintained when every
-  aggregate is plain `count()`, `sum(expr)`, `min(expr)`, or `max(expr)` and
-  grouped keys are simple field/literal/tuple projections.
-- Simple inner equality joins of two base relations can also be maintained
-  incrementally. Raw joined rows reuse cached relation-key pair identity; joined
-  queries with simple output transforms rebuild the transformed joined rows from
-  validated current source rows.
+  aggregate is `count()`, `count(expr)`, `sum(expr)`, `min(expr)`, `max(expr)`,
+  `any(expr)`, or `notAny(expr)` and grouped keys are simple field/literal/tuple
+  projections.
+- Simple inner/left equality joins over base relations can also be maintained
+  incrementally, including optional side-local `hash`/`where` filters. Raw inner
+  joined rows reuse cached relation-key pair identity; filtered sides, left
+  joins, and joined queries with simple output transforms rebuild joined rows
+  from validated current source rows.
 - `@tarstate/react` `createDbStore` uses delta-backed snapshot maintenance after
   committed object-backed DB writes.
 - React query hooks can read exact current materialized query rows before
@@ -298,12 +300,10 @@ Current state:
 - React object-backed DB store commits expose optional tracked `changes` for
   committed writes using the same core `trackTransact` path that maintains
   materializations and delivers watch events.
-- React source/runtime/adapter stores maintain existing materializations only
-  after reflected commits. They should recompute conservatively unless source
-  order semantics are explicit.
-- Host-driven refresh/subscribe invalidations refresh snapshots and revisions;
-  they do not automatically maintain materializations unless the store path
-  explicitly does so.
+- React source/runtime/adapter stores expose core-sourced commit `changes` when
+  snapshots can be compared. Reflected commits, manual refresh, and host
+  refresh/subscribe invalidations preserve materializations with conservative
+  recompute unless real relation deltas are reported.
 - Materialization metadata records a structural `queryKey`.
 - Snapshot rows are read by materialization id or structural query key; display
   names are metadata only.
@@ -311,7 +311,7 @@ Current state:
   `hash(from(...))` can participate in simple equality lookup planning, but
   `btree(from(...))` can participate in simple literal range filter planning
   when a source exposes `RelationSource.rangeLookup`.
-- Left/non-equality/self joins, transformed join inputs,
+- Non-equality/self joins, join-side output transforms,
   field-to-field predicates outside the raw join slice, subqueries, unsupported
   aggregate shapes/options, ordering, limits, custom calls, and unsupported btree
   shapes still fall back to recompute with explicit unsupported incremental

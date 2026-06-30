@@ -288,18 +288,23 @@ type IncrementalJoinSidePlan = {
   readonly relationName: string;
   readonly alias: string;
   readonly field: string;
+  readonly filters?: readonly IncrementalPredicate[];
 };
+type IncrementalJoinSideBasePlan = Omit<IncrementalJoinSidePlan, 'field'>;
 type IncrementalJoinMaterializationPlan = {
   readonly kind: 'join';
+  readonly joinKind: 'inner' | 'left';
   readonly left: IncrementalJoinSidePlan;
   readonly right: IncrementalJoinSidePlan;
   readonly transforms: readonly IncrementalTransform[];
 };
 type IncrementalAggregateField =
-  | { readonly op: 'count'; readonly fieldName: string }
+  | { readonly op: 'count'; readonly fieldName: string; readonly expr?: ExprData }
   | { readonly op: 'sum'; readonly fieldName: string; readonly expr: ExprData }
   | { readonly op: 'min'; readonly fieldName: string; readonly expr: ExprData }
-  | { readonly op: 'max'; readonly fieldName: string; readonly expr: ExprData };
+  | { readonly op: 'max'; readonly fieldName: string; readonly expr: ExprData }
+  | { readonly op: 'any'; readonly fieldName: string; readonly expr: ExprData }
+  | { readonly op: 'notAny'; readonly fieldName: string; readonly expr: ExprData };
 type IncrementalAggregateValues = Record<string, unknown>;
 type IncrementalPredicate =
   | {
@@ -1550,7 +1555,12 @@ function incrementalRuntimeFallbackReason(
 }
 
 function incrementalPlanUsesEnv(plan: IncrementalMaterializationPlan): boolean {
-  return plan.kind === 'join' ? false : plan.filters?.some(incrementalPredicateUsesEnv) ?? false;
+  return plan.kind === 'join'
+    ? [
+        ...(plan.left.filters ?? []),
+        ...(plan.right.filters ?? [])
+      ].some(incrementalPredicateUsesEnv)
+    : plan.filters?.some(incrementalPredicateUsesEnv) ?? false;
 }
 
 function incrementalPredicateUsesEnv(predicate: IncrementalPredicate): boolean {
@@ -1622,37 +1632,27 @@ function incrementalJoinPlanFor(
   join: Extract<QueryData, { readonly op: 'join' }>,
   operations: readonly QueryData[]
 ): IncrementalPlanResult {
-  if (join.kind !== 'inner') {
-    return { kind: 'unsupported', reason: 'incremental join support is limited to inner joins' };
+  const leftSide = incrementalJoinSidePlanFor(query, join.left, 'left');
+
+  if (leftSide.kind === 'unsupported') {
+    return leftSide;
   }
 
-  if (join.left.op !== 'from' || join.right.op !== 'from') {
-    return {
-      kind: 'unsupported',
-      reason: 'incremental join support is limited to from(...).join(from(...), eq(left.field, right.field))'
-    };
+  const rightSide = incrementalJoinSidePlanFor(query, join.right, 'right');
+
+  if (rightSide.kind === 'unsupported') {
+    return rightSide;
   }
 
-  if (join.left.relation === join.right.relation) {
+  if (leftSide.plan.relationName === rightSide.plan.relationName) {
     return { kind: 'unsupported', reason: 'incremental join support does not yet include same-relation self joins' };
   }
 
-  if (join.left.alias === join.right.alias) {
+  if (leftSide.plan.alias === rightSide.plan.alias) {
     return { kind: 'unsupported', reason: 'incremental join support requires distinct left and right aliases' };
   }
 
-  const leftRelation = query.relations[join.left.relation];
-  const rightRelation = query.relations[join.right.relation];
-
-  if (leftRelation === undefined) {
-    return { kind: 'unsupported', reason: `unknown relation ${join.left.relation}` };
-  }
-
-  if (rightRelation === undefined) {
-    return { kind: 'unsupported', reason: `unknown relation ${join.right.relation}` };
-  }
-
-  const equality = incrementalJoinEqualityFor(join.on, join.left.alias, join.right.alias);
+  const equality = incrementalJoinEqualityFor(join.on, leftSide.plan.alias, rightSide.plan.alias);
 
   if (equality === undefined) {
     return {
@@ -1671,19 +1671,100 @@ function incrementalJoinPlanFor(
     kind: 'supported',
     plan: {
       kind: 'join',
+      joinKind: join.kind,
       left: {
-        relation: leftRelation,
-        relationName: join.left.relation,
-        alias: join.left.alias,
+        ...leftSide.plan,
         field: equality.leftField
       },
       right: {
-        relation: rightRelation,
-        relationName: join.right.relation,
-        alias: join.right.alias,
+        ...rightSide.plan,
         field: equality.rightField
       },
       transforms: transforms.transforms
+    }
+  };
+}
+
+function incrementalJoinSidePlanFor(
+  query: Query,
+  input: QueryData,
+  side: 'left' | 'right'
+): {
+  readonly kind: 'supported';
+  readonly plan: IncrementalJoinSideBasePlan;
+} | {
+  readonly kind: 'unsupported';
+  readonly reason: string;
+} {
+  const operations: QueryData[] = [];
+  let current = input;
+
+  while (hasUnaryInput(current)) {
+    if (current.op !== 'keyBy') {
+      operations.push(current);
+    }
+    current = current.input;
+  }
+
+  if (current.op !== 'from') {
+    return {
+      kind: 'unsupported',
+      reason: `incremental join ${side} input is limited to from(...) with optional hash/where filters`
+    };
+  }
+
+  const relation = query.relations[current.relation];
+
+  if (relation === undefined) {
+    return { kind: 'unsupported', reason: `unknown relation ${current.relation}` };
+  }
+
+  let hasHash = false;
+  let filters: readonly IncrementalPredicate[] | undefined;
+
+  for (const operation of [...operations].reverse()) {
+    switch (operation.op) {
+      case 'hash':
+        if (hasHash) {
+          return { kind: 'unsupported', reason: `incremental join ${side} input supports only one hash declaration` };
+        }
+
+        if (!isSupportedHash(operation, current.alias)) {
+          return { kind: 'unsupported', reason: `incremental join ${side} hash support is limited to one field on the base alias` };
+        }
+
+        hasHash = true;
+        continue;
+      case 'where': {
+        const predicate = incrementalPredicateFor(operation.predicate, current.alias);
+
+        if (predicate === undefined) {
+          return {
+            kind: 'unsupported',
+            reason: `incremental join ${side} where is limited to base-field comparisons against literal/env values with and/or/not composition`
+          };
+        }
+
+        filters = filters === undefined
+          ? [predicate]
+          : [...filters, predicate];
+        continue;
+      }
+      default:
+        return {
+          kind: 'unsupported',
+          reason: `operator ${operation.op} is outside the incremental join ${side} input subset`
+        };
+    }
+  }
+
+  return {
+    kind: 'supported',
+    plan: {
+      relation,
+      relationName: current.relation,
+      alias: current.alias,
+      ...(filters === undefined ? {} : { filters })
     }
   };
 }
@@ -1849,7 +1930,7 @@ function incrementalAggregatePlanFor(
   if (aggregateFields === undefined) {
     return {
       kind: 'unsupported',
-      reason: 'aggregate maintenance is limited to count() without inputs/options and sum/min/max(field-or-supported-expr) without options'
+      reason: 'aggregate maintenance is limited to count(), count(expr), sum/min/max(expr), and any/notAny(expr) without options'
     };
   }
 
@@ -2050,8 +2131,10 @@ function incrementalAggregateFieldsFor(projection: ProjectionData): readonly Inc
       return undefined;
     }
 
-    if (expr.name === 'count' && expr.expr === undefined) {
-      fields.push({ op: 'count', fieldName });
+    if (expr.name === 'count' && (expr.expr === undefined || isSupportedIncrementalExpr(expr.expr))) {
+      fields.push(expr.expr === undefined
+        ? { op: 'count', fieldName }
+        : { op: 'count', fieldName, expr: expr.expr });
       continue;
     }
 
@@ -2061,6 +2144,11 @@ function incrementalAggregateFieldsFor(projection: ProjectionData): readonly Inc
     }
 
     if ((expr.name === 'min' || expr.name === 'max') && expr.expr !== undefined && isSupportedIncrementalExpr(expr.expr)) {
+      fields.push({ op: expr.name, fieldName, expr: expr.expr });
+      continue;
+    }
+
+    if ((expr.name === 'any' || expr.name === 'notAny') && expr.expr !== undefined && isSupportedIncrementalExpr(expr.expr)) {
       fields.push({ op: expr.name, fieldName, expr: expr.expr });
       continue;
     }
@@ -2103,7 +2191,7 @@ async function applyIncrementalDeltas(
     case 'aggregate':
       return applyIncrementalAggregateDeltas(previousRows, plan, deltas, env);
     case 'join':
-      return applyIncrementalJoinDeltas(previousRows, plan, deltas, source);
+      return applyIncrementalJoinDeltas(previousRows, plan, deltas, source, env);
     case 'rows':
       return applyIncrementalRowDeltas(previousRows, plan, deltas, env);
   }
@@ -2234,7 +2322,8 @@ async function applyIncrementalJoinDeltas(
   previousRows: readonly unknown[],
   plan: IncrementalJoinMaterializationPlan,
   deltas: readonly RelationDelta[],
-  source: RelationSource
+  source: RelationSource,
+  env: EvaluateOptions['env']
 ): Promise<IncrementalDeltaRowsResult> {
   const deltaState = incrementalJoinDeltaStateFor(plan, deltas);
 
@@ -2246,13 +2335,13 @@ async function applyIncrementalJoinDeltas(
     return { kind: 'applied', rows: Object.freeze([...previousRows]) };
   }
 
-  const currentState = await incrementalJoinCurrentStateFor(source, plan);
+  const currentState = await incrementalJoinCurrentStateFor(source, plan, env);
 
   if (currentState.kind === 'fallback') {
     return currentState;
   }
 
-  if (plan.transforms.length > 0) {
+  if (plan.joinKind === 'left' || plan.transforms.length > 0) {
     return {
       kind: 'applied',
       rows: Object.freeze(incrementalJoinOutputRows(currentState, plan))
@@ -2457,15 +2546,16 @@ function incrementalJoinSnapshotStateFor(
 
 async function incrementalJoinCurrentStateFor(
   source: RelationSource,
-  plan: IncrementalJoinMaterializationPlan
+  plan: IncrementalJoinMaterializationPlan,
+  env: EvaluateOptions['env']
 ): Promise<IncrementalJoinCurrentState> {
-  const leftRows = await incrementalJoinCurrentRowsForSide(source, plan.left);
+  const leftRows = await incrementalJoinCurrentRowsForSide(source, plan.left, env);
 
   if (leftRows.kind === 'fallback') {
     return leftRows;
   }
 
-  const rightRows = await incrementalJoinCurrentRowsForSide(source, plan.right);
+  const rightRows = await incrementalJoinCurrentRowsForSide(source, plan.right, env);
 
   if (rightRows.kind === 'fallback') {
     return rightRows;
@@ -2497,7 +2587,8 @@ async function incrementalJoinCurrentStateFor(
 
 async function incrementalJoinCurrentRowsForSide(
   source: RelationSource,
-  side: IncrementalJoinSidePlan
+  side: IncrementalJoinSidePlan,
+  env: EvaluateOptions['env']
 ): Promise<
   | { readonly kind: 'rows'; readonly rows: readonly IncrementalJoinRowState[] }
   | { readonly kind: 'fallback'; readonly reason: string }
@@ -2516,6 +2607,10 @@ async function incrementalJoinCurrentRowsForSide(
   for (const [index, row] of sourceRows.entries()) {
     if (!isRecord(row)) {
       return { kind: 'fallback', reason: `current ${side.relationName} row ${index} is not an object` };
+    }
+
+    if (side.filters !== undefined && !matchesIncrementalFilters(row, side.filters, env)) {
+      continue;
     }
 
     const key = relationRowKey(side.relation, row);
@@ -2592,7 +2687,17 @@ function incrementalJoinOutputRows(
   const rows: unknown[] = [];
 
   for (const left of state.leftRows) {
-    for (const right of state.rightByJoin.get(left.joinValue) ?? []) {
+    const rightRows = state.rightByJoin.get(left.joinValue) ?? [];
+
+    if (rightRows.length === 0 && plan.joinKind === 'left') {
+      rows.push(applyIncrementalJoinTransforms(
+        incrementalJoinOutputRow(plan, left.row, null),
+        plan.transforms
+      ));
+      continue;
+    }
+
+    for (const right of rightRows) {
       rows.push(applyIncrementalJoinTransforms(
         incrementalJoinOutputRow(plan, left.row, right.row),
         plan.transforms
@@ -2664,7 +2769,7 @@ function addIncrementalJoinPairKey(
 function incrementalJoinOutputRow(
   plan: IncrementalJoinMaterializationPlan,
   leftRow: Record<string, unknown>,
-  rightRow: Record<string, unknown>
+  rightRow: Record<string, unknown> | null
 ): Record<string, unknown> {
   return {
     [plan.left.alias]: leftRow,
@@ -2931,7 +3036,7 @@ function aggregateValuesForSnapshotAggregateRow(
     }
 
     valueByAccumulator.set(accumulatorKey, value);
-    values[field.fieldName] = value;
+    values[field.fieldName] = field.op === 'notAny' ? !value : value;
   }
 
   return values;
@@ -2946,12 +3051,15 @@ function isValidAggregateSnapshotValue(field: IncrementalAggregateField, value: 
     case 'min':
     case 'max':
       return value !== null;
+    case 'any':
+    case 'notAny':
+      return typeof value === 'boolean';
   }
 }
 
 function aggregateAccumulatorKey(field: IncrementalAggregateField): string {
   return field.op === 'count'
-    ? 'count'
+    ? field.expr === undefined ? 'count' : `count:${stableRowKey(field.expr)}`
     : `${field.op}:${stableRowKey(field.expr)}`;
 }
 
@@ -2964,7 +3072,9 @@ function evaluateIncrementalAggregateValues(
   for (const field of aggregateFields) {
     switch (field.op) {
       case 'count':
-        values[field.fieldName] = 1;
+        values[field.fieldName] = field.expr === undefined
+          ? 1
+          : evaluateIncrementalExpr(context, field.expr) == null ? 0 : 1;
         break;
       case 'sum':
         values[field.fieldName] = numericAggregateValue(evaluateIncrementalExpr(context, field.expr));
@@ -2972,6 +3082,10 @@ function evaluateIncrementalAggregateValues(
       case 'min':
       case 'max':
         values[field.fieldName] = extremumAggregateInputValue(evaluateIncrementalExpr(context, field.expr));
+        break;
+      case 'any':
+      case 'notAny':
+        values[field.fieldName] = Boolean(evaluateIncrementalExpr(context, field.expr));
         break;
     }
   }
@@ -3019,6 +3133,24 @@ function applyAggregateContribution(
           return removedExtremumFallbackReason(field);
         }
         continue;
+      case 'any':
+      case 'notAny':
+        if (sign === 1) {
+          target[field.fieldName] = Boolean(target[field.fieldName]) || Boolean(contribution[field.fieldName]);
+          continue;
+        }
+
+        if (
+          options.skipExtremumFallback !== true &&
+          booleanRemovalNeedsFallback(Boolean(target[field.fieldName]), Boolean(contribution[field.fieldName]))
+        ) {
+          return removedBooleanAggregateFallbackReason(field);
+        }
+
+        if (options.skipExtremumFallback === true && Boolean(contribution[field.fieldName])) {
+          target[field.fieldName] = false;
+        }
+        continue;
     }
   }
 
@@ -3051,6 +3183,21 @@ function applyAggregateReplacement(
         if (fallbackReason !== undefined) {
           return fallbackReason;
         }
+        continue;
+      }
+      case 'any':
+      case 'notAny': {
+        const fallbackReason = applyBooleanReplacement(
+          target,
+          field,
+          Boolean(removed[field.fieldName]),
+          Boolean(added[field.fieldName])
+        );
+
+        if (fallbackReason !== undefined) {
+          return fallbackReason;
+        }
+        continue;
       }
     }
   }
@@ -3123,6 +3270,34 @@ function extremumRemovalNeedsFallback(current: unknown, removed: unknown): boole
 
 function removedExtremumFallbackReason(field: { readonly op: 'min' | 'max'; readonly fieldName: string }): string {
   return `removed ${field.op} aggregate value may have determined the cached ${field.op} for ${field.fieldName}`;
+}
+
+function applyBooleanReplacement(
+  target: IncrementalAggregateValues,
+  field: { readonly op: 'any' | 'notAny'; readonly fieldName: string },
+  removed: boolean,
+  added: boolean
+): string | undefined {
+  if (!removed && added) {
+    target[field.fieldName] = true;
+    return undefined;
+  }
+
+  if (removed && !added && Boolean(target[field.fieldName])) {
+    return removedBooleanAggregateFallbackReason(field);
+  }
+
+  return undefined;
+}
+
+function booleanRemovalNeedsFallback(current: boolean, removed: boolean): boolean {
+  return removed && current;
+}
+
+function removedBooleanAggregateFallbackReason(
+  field: { readonly op: 'any' | 'notAny'; readonly fieldName: string }
+): string {
+  return `removed ${field.op} aggregate value may have determined the cached ${field.fieldName}`;
 }
 
 function aggregateNumberValue(value: unknown): number {
@@ -3206,7 +3381,7 @@ function hasInvalidCountAggregateValue(
 }
 
 function hasCountAggregateField(aggregateFields: readonly IncrementalAggregateField[]): boolean {
-  return aggregateFields.some((field) => field.op === 'count');
+  return aggregateFields.some((field) => field.op === 'count' && field.expr === undefined);
 }
 
 function isEmptyAggregateGroup(
@@ -3214,7 +3389,7 @@ function isEmptyAggregateGroup(
   aggregateFields: readonly IncrementalAggregateField[]
 ): boolean {
   for (const field of aggregateFields) {
-    if (field.op === 'count') {
+    if (field.op === 'count' && field.expr === undefined) {
       return values[field.fieldName] === 0;
     }
   }
@@ -3303,9 +3478,17 @@ function aggregateOutputRow(
   const row: Record<string, unknown> = { ...group };
 
   for (const field of aggregateFields) {
-    row[field.fieldName] = field.op === 'min' || field.op === 'max'
-      ? values[field.fieldName]
-      : aggregateNumberValue(values[field.fieldName]);
+    if (field.op === 'min' || field.op === 'max' || field.op === 'any') {
+      row[field.fieldName] = values[field.fieldName];
+      continue;
+    }
+
+    if (field.op === 'notAny') {
+      row[field.fieldName] = !values[field.fieldName];
+      continue;
+    }
+
+    row[field.fieldName] = aggregateNumberValue(values[field.fieldName]);
   }
 
   return row;
