@@ -138,6 +138,47 @@ describe('Automerge Repo Presence runtime', () => {
     }
   });
 
+  it('notifies subscribers for local applies while keeping snapshots read-consistent', async () => {
+    const handle = new FakeDocHandle();
+    const runtime = automergePresenceRuntime({
+      handle: handle.asHandle(),
+      relation: schema.presence,
+      localPeerId: 'peer-local',
+      initialState: { color: 'blue' },
+      heartbeatMs: 60_000
+    });
+    let notifications = 0;
+    const unsubscribe = runtime.subscribe(() => {
+      notifications += 1;
+    });
+    const before = runtime.snapshot?.();
+
+    if (before === undefined) {
+      throw new Error('expected presence runtime snapshot');
+    }
+
+    try {
+      const result = await runtime.target.apply([
+        presenceRows.upsert({ peerId: 'peer-local', channel: 'color', value: 'green' })
+      ]);
+
+      expect(result.status).toBe('accepted');
+      expect(notifications).toBe(1);
+      expect(before.version).toEqual({ revision: 0, localPeerId: 'peer-local' });
+      await expect(evaluate(before.source, colorPresence)).resolves.toMatchObject({
+        rows: [{ peerId: 'peer-local', value: 'blue', local: true }],
+        diagnostics: []
+      });
+      await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
+        rows: [{ peerId: 'peer-local', value: 'green', local: true }],
+        diagnostics: []
+      });
+    } finally {
+      unsubscribe();
+      runtime.stop();
+    }
+  });
+
   it('clears local presence channels through delete patches', async () => {
     const handle = new FakeDocHandle();
     const runtime = automergePresenceRuntime({

@@ -3,6 +3,7 @@ import type { DocHandle, PeerId } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { composeRelationRuntimes, tryApplyRelationPatches, tryCommitAdapter } from '@tarstate/core/adapter';
 import { evaluate } from '@tarstate/core/evaluate';
+import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { as, eq, from, join, pipe, project, where } from '@tarstate/core/query';
 import {
   booleanField,
@@ -44,6 +45,12 @@ type PresenceRow = {
   readonly local?: boolean;
 };
 
+type NoteRow = {
+  readonly id: string;
+  readonly todoId: string;
+  readonly body: string;
+};
+
 const schema = defineSchema({
   todos: relation<TodoRow>({
     key: 'id',
@@ -65,13 +72,23 @@ const schema = defineSchema({
       lastSeenAt: optional(numberField()),
       local: optional(booleanField())
     }
+  }),
+  notes: relation<NoteRow>({
+    key: 'id',
+    fields: {
+      id: idField('note'),
+      todoId: stringField(),
+      body: stringField()
+    }
   })
 });
 
 const todos = write(schema.todos);
 const presenceRows = write(schema.presence);
+const notes = write(schema.notes);
 const todo = as(schema.todos, 'todo');
 const presence = as(schema.presence, 'presence');
+const note = as(schema.notes, 'note');
 const todoRows = pipe(
   from(todo),
   project({
@@ -94,6 +111,23 @@ const focusedTodos = pipe(
     todoId: todo.id,
     text: todo.text,
     peerId: presence.peerId
+  })
+);
+const focusedTodoNotes = pipe(
+  from(todo),
+  join(
+    pipe(
+      from(presence),
+      where(eq(presence.channel, 'targetTodoId'))
+    ),
+    eq(todo.id, presence.value)
+  ),
+  join(from(note), eq(todo.id, note.todoId)),
+  project({
+    todoId: todo.id,
+    text: todo.text,
+    peerId: presence.peerId,
+    note: note.body
   })
 );
 const todoRelations = [{ relation: schema.todos, path: ['todos'] }] as const;
@@ -219,6 +253,80 @@ describe('@tarstate/automerge', () => {
       });
       await expect(evaluate(runtime.source, focusedTodos)).resolves.toEqual({
         rows: [{ todoId: 'todo-b', text: 'Water basil', peerId: 'peer-local' }],
+        diagnostics: []
+      });
+    } finally {
+      presenceRuntime.stop();
+    }
+  });
+
+  it('composes durable, presence, and memory runtimes through one query and write path', async () => {
+    const doc = Automerge.from<TodoDocument>({
+      todos: {
+        'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
+        'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
+      }
+    });
+    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const handle = new FakeDocHandle();
+    const presenceRuntime = automergePresenceRuntime({
+      handle: handle.asHandle(),
+      relation: schema.presence,
+      localPeerId: 'peer-local',
+      initialState: { targetTodoId: 'todo-a' },
+      heartbeatMs: 60_000
+    });
+    const memoryRuntime = createMemoryRelationRuntime({
+      notes: [{ id: 'note-a', todoId: 'todo-a', body: 'Initial note' }]
+    }, { relationNames: ['notes'] });
+    const runtime = composeRelationRuntimes(adapter, presenceRuntime, memoryRuntime);
+
+    try {
+      expect(runtime.source.relationNames).toEqual(['todos', 'presence', 'notes']);
+      await expect(evaluate(runtime.source, focusedTodoNotes)).resolves.toEqual({
+        rows: [
+          {
+            todoId: 'todo-a',
+            text: 'Buy oat milk',
+            peerId: 'peer-local',
+            note: 'Initial note'
+          }
+        ],
+        diagnostics: []
+      });
+
+      const result = await tryApplyRelationPatches(runtime, [
+        todos.update('todo-b', { rank: 3 }),
+        presenceRows.upsert({ peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' }),
+        notes.insert({ id: 'note-b', todoId: 'todo-b', body: 'Presence moved here' })
+      ]);
+
+      expect(result).toMatchObject({
+        status: 'accepted',
+        accepted: true,
+        patches: 3,
+        applied: 3,
+        diagnostics: []
+      });
+      expect(result.version).toEqual([
+        Automerge.getHeads(adapter.doc),
+        { revision: 1, localPeerId: 'peer-local' },
+        1
+      ]);
+      expect(result.deltas.map((delta) => delta.relation.name)).toEqual(['todos', 'presence', 'notes']);
+      expect(adapter.doc.todos['todo-b']).toEqual({ text: 'Water basil', done: false, rank: 3 });
+      expect(handle.broadcasts.at(-1)).toEqual({
+        __presence: { type: 'update', channel: 'targetTodoId', value: 'todo-b' }
+      });
+      await expect(evaluate(runtime.source, focusedTodoNotes)).resolves.toEqual({
+        rows: [
+          {
+            todoId: 'todo-b',
+            text: 'Water basil',
+            peerId: 'peer-local',
+            note: 'Presence moved here'
+          }
+        ],
         diagnostics: []
       });
     } finally {
