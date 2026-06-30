@@ -101,6 +101,74 @@ describe('Automerge Repo Presence runtime', () => {
     }
   });
 
+  it('drops invalid remote presence rows from reads and reports diagnostics', async () => {
+    const handle = new FakeDocHandle();
+    const invalidValue = new Date('2026-01-01T00:00:00.000Z');
+    const runtime = automergePresenceRuntime({
+      handle: handle.asHandle(),
+      relation: schema.presence,
+      localPeerId: 'peer-local',
+      initialState: { color: 'blue' },
+      heartbeatMs: 60_000
+    });
+
+    try {
+      handle.receive('peer-remote', {
+        __presence: {
+          type: 'snapshot',
+          state: {
+            color: invalidValue,
+            cursor: { x: 10, y: 20 }
+          }
+        }
+      });
+
+      expect(await runtime.source.rows(schema.presence)).toEqual([
+        expect.objectContaining({ peerId: 'peer-local', channel: 'color', value: 'blue', local: true }),
+        expect.objectContaining({ peerId: 'peer-remote', channel: 'cursor', value: { x: 10, y: 20 }, local: false })
+      ]);
+      expect(await runtime.source.lookup?.({ relation: schema.presence, field: 'channel', value: 'color' })).toEqual([
+        expect.objectContaining({ peerId: 'peer-local', channel: 'color', value: 'blue', local: true })
+      ]);
+      await expect(evaluate(runtime.source, colorPresence)).resolves.toEqual({
+        rows: [{ peerId: 'peer-local', value: 'blue', local: true }],
+        diagnostics: [
+          {
+            code: 'invalid_row',
+            message: 'invalid field value in relation presence',
+            relation: 'presence',
+            field: 'value',
+            key: 'peer-remote:color',
+            detail: invalidValue
+          }
+        ]
+      });
+
+      const snapshot = runtime.snapshot?.();
+
+      if (snapshot === undefined) {
+        throw new Error('expected presence runtime snapshot');
+      }
+
+      expect(await snapshot.source.rows(schema.presence)).toEqual([
+        expect.objectContaining({ peerId: 'peer-local', channel: 'color', value: 'blue', local: true }),
+        expect.objectContaining({ peerId: 'peer-remote', channel: 'cursor', value: { x: 10, y: 20 }, local: false })
+      ]);
+      expect(await snapshot.source.diagnostics?.()).toEqual([
+        {
+          code: 'invalid_row',
+          message: 'invalid field value in relation presence',
+          relation: 'presence',
+          field: 'value',
+          key: 'peer-remote:color',
+          detail: invalidValue
+        }
+      ]);
+    } finally {
+      runtime.stop();
+    }
+  });
+
   it('applies local presence patches and broadcasts changed channels', async () => {
     const handle = new FakeDocHandle();
     const runtime = automergePresenceRuntime({

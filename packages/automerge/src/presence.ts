@@ -8,7 +8,7 @@ import type {
   TarstateDiagnostic
 } from '@tarstate/core/adapter';
 import type { RelationRangeLookup } from '@tarstate/core/source';
-import type { RelationRef } from '@tarstate/core/schema';
+import { isJsonValue, type FieldSpec, type RelationRef } from '@tarstate/core/schema';
 import { applyWritesAtomic, type MutableObjectSourceData } from '@tarstate/core/write-apply';
 import type { WritePatch } from '@tarstate/core/write';
 
@@ -321,26 +321,143 @@ class AutomergePresenceRuntimeImpl<
 }
 
 function presenceSource(options: PresenceSourceOptions): AdapterSource<AutomergePresenceVersion> {
+  const sourceRows = (): readonly PresenceRow[] => validPresenceRows(options.relation, options.getRows()).rows;
+
   return {
     relationNames: [options.relation.name],
-    rows: (relationRef) => relationRef.name === options.relation.name ? options.getRows() : [],
+    rows: (relationRef) => relationRef.name === options.relation.name ? sourceRows() : [],
     lookup: (lookup) => {
       if (lookup.relation.name !== options.relation.name) {
         return undefined;
       }
 
-      return options.getRows().filter((row) => sameLookupValue(row[lookup.field], lookup.value));
+      return sourceRows().filter((row) => sameLookupValue(row[lookup.field], lookup.value));
     },
     rangeLookup: (lookup) => {
       if (lookup.relation.name !== options.relation.name) {
         return undefined;
       }
 
-      return rangeLookupRows(options.getRows(), lookup);
+      return rangeLookupRows(sourceRows(), lookup);
     },
     version: options.getVersion,
-    diagnostics: options.getDiagnostics
+    diagnostics: () => [
+      ...options.getDiagnostics(),
+      ...validPresenceRows(options.relation, options.getRows()).diagnostics
+    ]
   };
+}
+
+function validPresenceRows(
+  relationRef: RelationRef,
+  rows: readonly PresenceRow[]
+): {
+  readonly rows: readonly PresenceRow[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
+} {
+  const validRows: PresenceRow[] = [];
+  const diagnostics: TarstateDiagnostic[] = [];
+
+  for (const row of rows) {
+    const rowDiagnostics = presenceRowDiagnostics(relationRef, row);
+
+    if (rowDiagnostics.length > 0) {
+      diagnostics.push(...rowDiagnostics);
+    } else {
+      validRows.push(row);
+    }
+  }
+
+  return { rows: validRows, diagnostics };
+}
+
+function presenceRowDiagnostics(relationRef: RelationRef, row: unknown): readonly TarstateDiagnostic[] {
+  const diagnostics: TarstateDiagnostic[] = [];
+  const relationName = relationRef.name;
+
+  if (!isRecord(row)) {
+    diagnostics.push({
+      code: 'invalid_row',
+      message: `row for relation ${relationName} is not an object`,
+      relation: relationName,
+      detail: row
+    });
+    return diagnostics;
+  }
+
+  const key = diagnosticKeyForRow(relationRef, row);
+
+  for (const [fieldName, spec] of Object.entries(relationRef.fields)) {
+    const hasField = Object.hasOwn(row, fieldName);
+    const value = row[fieldName];
+
+    if (!hasField || value === undefined) {
+      if (!spec.optional) {
+        diagnostics.push({
+          code: 'invalid_row',
+          message: `missing required field ${fieldName} in relation ${relationName}`,
+          relation: relationName,
+          field: fieldName,
+          ...(key === undefined ? {} : { key })
+        });
+      }
+      continue;
+    }
+
+    if (value === null) {
+      if (!spec.nullable) {
+        diagnostics.push({
+          code: 'invalid_row',
+          message: `null field ${fieldName} is not nullable in relation ${relationName}`,
+          relation: relationName,
+          field: fieldName,
+          ...(key === undefined ? {} : { key })
+        });
+      }
+      continue;
+    }
+
+    if (!fieldValueMatches(spec, value)) {
+      diagnostics.push({
+        code: 'invalid_row',
+        message: `invalid field ${fieldName} in relation ${relationName}`,
+        relation: relationName,
+        field: fieldName,
+        ...(key === undefined ? {} : { key }),
+        detail: value
+      });
+    }
+  }
+
+  return diagnostics;
+}
+
+function diagnosticKeyForRow(relationRef: RelationRef, row: Record<string, unknown>): string | undefined {
+  const keyFields = Array.isArray(relationRef.key) ? relationRef.key : [relationRef.key];
+  const keyParts = keyFields.map((fieldName) => row[fieldName]);
+
+  if (keyParts.every((part) => part === undefined)) {
+    return undefined;
+  }
+
+  return keyParts.map((part) => String(part)).join(':');
+}
+
+function fieldValueMatches(spec: FieldSpec, value: unknown): boolean {
+  switch (spec.valueKind) {
+    case 'string':
+    case 'id':
+    case 'ref':
+      return typeof value === 'string';
+    case 'number':
+      return typeof value === 'number';
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'anchoredPath':
+      return Array.isArray(value);
+    case 'json':
+      return isJsonValue(value);
+  }
 }
 
 function rowsForPeerState<State extends PresenceState>(
