@@ -25,6 +25,8 @@ import {
   btree,
   hash,
   intersection,
+  join,
+  keyBy,
   leftJoin,
   limit,
   lookup,
@@ -39,6 +41,7 @@ import {
   project,
   qualify,
   queryKey,
+  queryRowKeyFields,
   rename,
   relationDependencies,
   select,
@@ -112,6 +115,11 @@ describe('tarstate query DSL', () => {
         focusedBy: maybe(presence.peerId)
       })
     );
+
+    const keyedJoined = keyBy('object', 'presence')(
+      join(from(presence), eq(object.id, presence.targetObjectId))(from(object))
+    );
+    expect(keyedJoined.data).toMatchObject({ op: 'keyBy', fields: ['object', 'presence'] });
 
     expect(focusedObjects.data).toEqual({
       op: 'select',
@@ -200,6 +208,54 @@ describe('tarstate query DSL', () => {
     expect(queryKey(first)).toBe(
       'query:{"op":"constRows","rows":[{"a":1,"b":2,"missing":{"$tarstate":"undefined"}}]}'
     );
+  });
+
+  it('lowers query-owned row identity metadata without changing row shape', () => {
+    const keyedObjects = pipe(
+      from(object),
+      project({
+        id: object.id,
+        title: object.title
+      }),
+      keyBy('id')
+    );
+
+    expect(keyedObjects.data).toEqual({
+      op: 'keyBy',
+      fields: ['id'],
+      input: {
+        op: 'select',
+        input: { op: 'from', relation: 'objects', alias: 'object' },
+        projection: {
+          id: { op: 'field', alias: 'object', field: 'id' },
+          title: { op: 'field', alias: 'object', field: 'title' }
+        }
+      }
+    });
+    expect(queryRowKeyFields(keyedObjects)).toEqual(['id']);
+    expect(queryRowKeyFields(keyedObjects.data)).toEqual(['id']);
+  });
+
+  it('carries query-owned row identity only through compatible final row shapes', () => {
+    const keyedObjects = pipe(
+      from(object),
+      project({
+        id: object.id,
+        title: object.title
+      }),
+      keyBy('id')
+    );
+
+    expect(queryRowKeyFields(pipe(
+      keyedObjects,
+      where(eq(value(true), true)),
+      sort(value(1)),
+      limit(10)
+    ))).toEqual(['id']);
+    expect(queryRowKeyFields(pipe(keyedObjects, project({ title: value('Title') })))).toBeUndefined();
+    expect(queryRowKeyFields(pipe(keyedObjects, without('id')))).toBeUndefined();
+    expect(queryRowKeyFields(pipe(keyedObjects, rename({ id: 'objectId' })))).toEqual(['objectId']);
+    expect(queryRowKeyFields(pipe(keyedObjects, qualify('object')))).toBeUndefined();
   });
 
   it('builds comparison and expression constructor data for Relic alignment', () => {

@@ -46,10 +46,12 @@ describe('tarstate core public exports', () => {
     expect(materialization).toHaveProperty('materializedRowsFor');
     expect(materialization).toHaveProperty('materializedRowsForQuery');
     expect(materialization).toHaveProperty('materializedSourceFor');
+    expect(materialization).toHaveProperty('readMaterializedQuery');
     expect(materialization).toHaveProperty('snapshotIndex');
     expect(materialization).toHaveProperty('snapshotHashIndex');
     expect(core).toHaveProperty('materializedRowsFor');
     expect(core).toHaveProperty('materializedSourceFor');
+    expect(core).toHaveProperty('readMaterializedQuery');
     expect(core).toHaveProperty('snapshotHashIndex');
     expect(core).toHaveProperty('createMemoryRelationRuntime');
     expect(memoryRuntime).toHaveProperty('createMemoryRelationRuntime');
@@ -58,6 +60,8 @@ describe('tarstate core public exports', () => {
     expect(core).not.toHaveProperty('index');
     expect(core).not.toHaveProperty('materializationIndex');
     expect(query).toHaveProperty('from');
+    expect(query).toHaveProperty('keyBy');
+    expect(core).toHaveProperty('keyBy');
     expect(query).toHaveProperty('setConcat');
     expect(runtime).toHaveProperty('trackTransact');
     expect(runtime).toHaveProperty('trackRuntimeCommit');

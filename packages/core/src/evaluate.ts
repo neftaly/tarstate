@@ -127,6 +127,8 @@ async function evaluateData(
       return data.rows.map((row) => ({ ...row }));
     case 'where':
       return evaluateWhere(source, relations, data, diagnostics, runtime, scope);
+    case 'keyBy':
+      return evaluateData(source, relations, data.input, diagnostics, runtime, scope);
     case 'hash':
     case 'btree':
       return evaluateData(source, relations, data.input, diagnostics, runtime, scope);
@@ -997,6 +999,7 @@ function lookupSourceForField(
     case 'hash':
       return hashLookupSourceForField(relations, data, field);
     case 'btree':
+    case 'keyBy':
       return lookupSourceForField(relations, data.input, field);
     default:
       return undefined;
@@ -1039,6 +1042,7 @@ function rangeLookupSourceForField(
     case 'btree':
       return btreeRangeLookupSourceForField(relations, data, field);
     case 'hash':
+    case 'keyBy':
       return rangeLookupSourceForField(relations, data.input, field);
     default:
       return undefined;
@@ -1078,6 +1082,7 @@ function indexBaseFrom(data: QueryData): Extract<QueryData, { op: 'from' }> | un
       return data;
     case 'hash':
     case 'btree':
+    case 'keyBy':
       return indexBaseFrom(data.input);
     default:
       return undefined;
@@ -1094,6 +1099,7 @@ function aliasesFor(data: QueryData): string[] {
     case 'where':
     case 'hash':
     case 'btree':
+    case 'keyBy':
     case 'select':
     case 'extend':
     case 'sort':

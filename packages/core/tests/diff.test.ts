@@ -110,6 +110,51 @@ describe('tarstate row diffs', () => {
     });
   });
 
+  it('falls back instead of pairing rows when a row key selector returns undefined', () => {
+    const before = { id: 'todo-a', title: 'Alpha' };
+    const after = { id: 'todo-a', title: 'Beta' };
+
+    expect(diffRows([before], [after], { rowKey: () => undefined })).toEqual({
+      addedRows: [after],
+      removedRows: [before],
+      unchangedRows: [],
+      rowChanges: [
+        {
+          op: 'insert',
+          key: stableRowKey(after),
+          after
+        },
+        {
+          op: 'delete',
+          key: stableRowKey(before),
+          before
+        }
+      ],
+      rowChangeDiagnostics: [
+        {
+          code: 'row_key_missing',
+          message: 'before row change key is undefined',
+          surface: 'diff',
+          side: 'before',
+          detail: {
+            row: before,
+            reason: 'undefined_key'
+          }
+        },
+        {
+          code: 'row_key_missing',
+          message: 'after row change key is undefined',
+          surface: 'diff',
+          side: 'after',
+          detail: {
+            row: after,
+            reason: 'undefined_key'
+          }
+        }
+      ]
+    });
+  });
+
   it('falls back for duplicate keyed rows while preserving unique keyed updates', () => {
     const beforeUnique = { id: 'todo-a', title: 'Alpha' };
     const afterUnique = { id: 'todo-a', title: 'Alpha updated' };

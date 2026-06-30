@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { RelationRuntime } from '@tarstate/core/adapter';
 import { createDb, tryTransact } from '@tarstate/core/db';
 import { stableRowKey } from '@tarstate/core/diff';
-import { as, call, eq, from, pipe, project, queryKey, where } from '@tarstate/core/query';
+import { as, call, eq, from, keyBy, pipe, project, queryKey, where } from '@tarstate/core/query';
 import { trackTransact } from '@tarstate/core/runtime';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
@@ -45,6 +45,7 @@ const openTodos = pipe(
     title: todo.title
   })
 );
+const keyedOpenTodos = pipe(openTodos, keyBy('id'));
 
 function requireRuntimeNotify(notify: (() => void) | undefined): () => void {
   if (notify === undefined) {
@@ -52,6 +53,24 @@ function requireRuntimeNotify(notify: (() => void) | undefined): () => void {
   }
 
   return notify;
+}
+
+function countedSource(data: Readonly<Record<string, readonly unknown[]>>): {
+  readonly source: RelationSource;
+  readonly rowsCalls: (relationName: string) => number;
+} {
+  const calls = new Map<string, number>();
+
+  return {
+    source: {
+      rows: (relationRef) => {
+        calls.set(relationRef.name, (calls.get(relationRef.name) ?? 0) + 1);
+        return data[relationRef.name] ?? [];
+      },
+      version: () => data
+    },
+    rowsCalls: (relationName) => calls.get(relationName) ?? 0
+  };
 }
 
 describe('tarstate watch/change helpers', () => {
@@ -152,6 +171,82 @@ describe('tarstate watch/change helpers', () => {
         op: 'delete',
         key: stableRowKey({ id: 'todo-a', title: 'Alpha' }),
         before: { id: 'todo-a', title: 'Alpha' }
+      }
+    ]);
+  });
+
+  it('uses query-owned row keys for projected query diffs', async () => {
+    const diff = await diffQuery(
+      fromObjectSource({ todos: [{ id: 'todo-a', title: 'Alpha', done: false }] }),
+      fromObjectSource({ todos: [{ id: 'todo-a', title: 'Beta', done: false }] }),
+      keyedOpenTodos
+    );
+
+    expect(diff.addedRows).toEqual([{ id: 'todo-a', title: 'Beta' }]);
+    expect(diff.removedRows).toEqual([{ id: 'todo-a', title: 'Alpha' }]);
+    expect(diff.rowChanges).toEqual([
+      {
+        op: 'update',
+        key: stableRowKey('todo-a'),
+        before: { id: 'todo-a', title: 'Alpha' },
+        after: { id: 'todo-a', title: 'Beta' }
+      }
+    ]);
+    expect(diff.diagnostics).toEqual([]);
+  });
+
+  it('falls back with diagnostics when a query-owned row key cannot be evaluated', async () => {
+    const unstableKeyTodos = pipe(
+      from(todo),
+      project({
+        id: call('missingId', todo.id),
+        title: todo.title
+      }),
+      keyBy('id')
+    );
+    const diff = await diffQuery(
+      fromObjectSource({ todos: [{ id: 'todo-a', title: 'Alpha', done: false }] }),
+      fromObjectSource({ todos: [{ id: 'todo-a', title: 'Beta', done: false }] }),
+      unstableKeyTodos,
+      {
+        functions: {
+          missingId: () => undefined
+        }
+      }
+    );
+
+    expect(diff.rowChanges).toEqual([
+      {
+        op: 'insert',
+        key: stableRowKey({ id: undefined, title: 'Beta' }),
+        after: { id: undefined, title: 'Beta' }
+      },
+      {
+        op: 'delete',
+        key: stableRowKey({ id: undefined, title: 'Alpha' }),
+        before: { id: undefined, title: 'Alpha' }
+      }
+    ]);
+    expect(diff.diagnostics).toMatchObject([
+      {
+        code: 'row_key_missing',
+        surface: 'diff',
+        side: 'before',
+        field: 'id',
+        detail: {
+          reason: 'undefined',
+          keyFields: ['id']
+        }
+      },
+      {
+        code: 'row_key_missing',
+        surface: 'diff',
+        side: 'after',
+        field: 'id',
+        detail: {
+          reason: 'undefined',
+          keyFields: ['id']
+        }
       }
     ]);
   });
@@ -710,6 +805,216 @@ describe('tarstate watch/change helpers', () => {
     });
   });
 
+  it('derives direct relation watch row changes from transaction deltas', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const beta = { id: 'todo-b', title: 'Beta', done: false };
+    const closed = { id: 'todo-c', title: 'Closed', done: true };
+    const alphaUpdated = { id: 'todo-a', title: 'Alpha updated', done: false };
+    const delta = { id: 'todo-d', title: 'Delta', done: false };
+    const db = createDb({
+      todos: [alpha, beta, closed]
+    });
+    const todos = write(schema.todos);
+    const events: unknown[] = [];
+    const handle = watch(db, schema.todos, (event) => {
+      events.push(event);
+    });
+
+    const result = await trackTransact(db, (current) =>
+      tryTransact(current, [
+        todos.update('todo-a', { title: 'Alpha updated' }),
+        todos.delete('todo-b'),
+        todos.insert(delta)
+      ])
+    );
+
+    expect(result.deltas).toEqual([
+      {
+        relation: schema.todos,
+        added: [alphaUpdated, delta],
+        removed: [alpha, beta]
+      }
+    ]);
+    expect(result.changes).toMatchObject([
+      {
+        kind: 'trackedChange',
+        id: handle.id,
+        target: schema.todos,
+        changed: true,
+        previousRows: [alpha, beta, closed],
+        rows: [alphaUpdated, closed, delta],
+        addedRows: [alphaUpdated, delta],
+        removedRows: [alpha, beta],
+        unchangedRows: [closed],
+        rowChanges: [
+          {
+            op: 'update',
+            key: stableRowKey('todo-a'),
+            before: alpha,
+            after: alphaUpdated
+          },
+          {
+            op: 'insert',
+            key: stableRowKey('todo-d'),
+            after: delta
+          },
+          {
+            op: 'delete',
+            key: stableRowKey('todo-b'),
+            before: beta
+          }
+        ],
+        diagnostics: []
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      target: schema.todos,
+      changes: { deltas: result.deltas },
+      rowChanges: [
+        {
+          op: 'update',
+          key: stableRowKey('todo-a'),
+          before: alpha,
+          after: alphaUpdated
+        },
+        {
+          op: 'insert',
+          key: stableRowKey('todo-d'),
+          after: delta
+        },
+        {
+          op: 'delete',
+          key: stableRowKey('todo-b'),
+          before: beta
+        }
+      ],
+      diagnostics: []
+    });
+  });
+
+  it('does not read the after relation snapshot for order-safe direct relation deltas', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const beta = { id: 'todo-b', title: 'Beta', done: false };
+    const closed = { id: 'todo-c', title: 'Closed', done: true };
+    const alphaUpdated = { id: 'todo-a', title: 'Alpha updated', done: false };
+    const beforeDb = createDb({
+      todos: [alpha, beta, closed]
+    });
+    const todos = write(schema.todos);
+    const transaction = tryTransact(beforeDb, [
+      todos.update('todo-a', { title: 'Alpha updated' }),
+      todos.delete('todo-b')
+    ]);
+    const before = countedSource(beforeDb.data);
+    const after = countedSource(transaction.db.data);
+    const handle = watch(before.source, schema.todos, () => undefined);
+
+    const result = await trackTransact(before.source, () => ({
+      db: after.source,
+      deltas: transaction.deltas
+    }));
+
+    expect(result.changes).toMatchObject([
+      {
+        id: handle.id,
+        previousRows: [alpha, beta, closed],
+        rows: [alphaUpdated, closed],
+        addedRows: [alphaUpdated],
+        removedRows: [alpha, beta],
+        unchangedRows: [closed],
+        rowChanges: [
+          {
+            op: 'update',
+            key: stableRowKey('todo-a'),
+            before: alpha,
+            after: alphaUpdated
+          },
+          {
+            op: 'delete',
+            key: stableRowKey('todo-b'),
+            before: beta
+          }
+        ],
+        diagnostics: []
+      }
+    ]);
+    expect(before.rowsCalls('todos')).toBe(1);
+    expect(after.rowsCalls('todos')).toBe(0);
+  });
+
+  it('does not deliver direct relation watches for unrelated relation deltas', async () => {
+    const db = createDb({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }],
+      assignments: []
+    });
+    const assignments = write(schema.assignments);
+    const events: unknown[] = [];
+
+    watch(db, schema.todos, (event) => {
+      events.push(event);
+    });
+
+    const result = await trackTransact(db, (current) =>
+      tryTransact(current, [
+        assignments.insert({ todoId: 'todo-a', assignee: 'ada', role: 'owner' })
+      ])
+    );
+
+    expect(result.deltas).toEqual([
+      {
+        relation: schema.assignments,
+        added: [{ todoId: 'todo-a', assignee: 'ada', role: 'owner' }],
+        removed: []
+      }
+    ]);
+    expect(result.changes).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it('falls back to recomputing direct relation watches when transaction deltas are missing', async () => {
+    const beforeRow = { id: 'todo-a', title: 'Alpha', done: false };
+    const afterRow = { id: 'todo-a', title: 'Beta', done: false };
+    const before = countedSource({
+      todos: [beforeRow]
+    });
+    const after = countedSource({
+      todos: [afterRow]
+    });
+    const events: unknown[] = [];
+    const handle = watch(before.source, schema.todos, (event) => {
+      events.push(event);
+    });
+
+    const result = await trackTransact(before.source, () => after.source);
+
+    expect(result.deltas).toEqual([]);
+    expect(result.changes).toMatchObject([
+      {
+        id: handle.id,
+        previousRows: [beforeRow],
+        rows: [afterRow],
+        addedRows: [afterRow],
+        removedRows: [beforeRow],
+        unchangedRows: [],
+        rowChanges: [
+          {
+            op: 'update',
+            key: stableRowKey('todo-a'),
+            before: beforeRow,
+            after: afterRow
+          }
+        ],
+        diagnostics: []
+      }
+    ]);
+    expect(before.rowsCalls('todos')).toBe(1);
+    expect(after.rowsCalls('todos')).toBe(1);
+    expect(events).toHaveLength(1);
+    expect(Object.hasOwn((events[0] as { readonly changes: object }).changes, 'deltas')).toBe(false);
+  });
+
   it('uses explicit query watch key options for row changes', async () => {
     const before = createDb({
       todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
@@ -735,6 +1040,35 @@ describe('tarstate watch/change helpers', () => {
           after: { id: 'todo-a', title: 'Beta' }
         }
       ]
+    });
+  });
+
+  it('uses query-owned row keys for manual watch refresh row changes', async () => {
+    const before = createDb({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+    });
+    const after = createDb({
+      todos: [{ id: 'todo-a', title: 'Beta', done: false }]
+    });
+    const handle = watch(before, keyedOpenTodos, () => undefined);
+
+    await handle.refresh();
+
+    await expect(handle.refresh(after)).resolves.toMatchObject({
+      delivered: true,
+      changed: true,
+      addedRows: [{ id: 'todo-a', title: 'Beta' }],
+      removedRows: [{ id: 'todo-a', title: 'Alpha' }],
+      unchangedRows: [],
+      rowChanges: [
+        {
+          op: 'update',
+          key: stableRowKey('todo-a'),
+          before: { id: 'todo-a', title: 'Alpha' },
+          after: { id: 'todo-a', title: 'Beta' }
+        }
+      ],
+      diagnostics: []
     });
   });
 

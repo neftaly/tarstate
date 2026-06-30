@@ -3,7 +3,7 @@ import type { RelationRuntime } from './adapter.js';
 import type { RelationDelta } from './delta.js';
 import { diffRows, type RowChange, type RowDiff, type RowDiffDiagnostic, type RowDiffOptions } from './diff.js';
 import { evaluate, type EvaluateOptions } from './evaluate.js';
-import { queryKey, type Query } from './query.js';
+import { queryKey, queryRowKeyFields, type Query } from './query.js';
 import type { RelationRef } from './schema.js';
 import { tryRelationSource } from './source-input.js';
 import type { RelationSource } from './source.js';
@@ -133,6 +133,7 @@ export type TrackedChange<Row = unknown> = {
 };
 
 export type QueryDiffOptions<Row = unknown> = EvaluateOptions & RowDiffOptions<Row>;
+export type QueryDiffDiagnostic<Row = unknown> = TarstateDiagnostic | RowDiffDiagnostic<Row>;
 
 export type QueryDiff<Row = unknown> = {
   readonly kind: 'queryDiff';
@@ -146,7 +147,7 @@ export type QueryDiff<Row = unknown> = {
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
-  readonly diagnostics: readonly TarstateDiagnostic[];
+  readonly diagnostics: readonly QueryDiffDiagnostic<Row>[];
 };
 
 /**
@@ -357,7 +358,7 @@ export async function diffQuery<Row>(
     readSourceVersion(sourceAfter, 'after', versionDiagnostics)
   ]);
 
-  const rowDiff = diffRows(before.rows, after.rows, options);
+  const rowDiff = diffRows(before.rows, after.rows, diffOptionsForTarget(query, options));
 
   return {
     kind: 'queryDiff',
@@ -368,7 +369,7 @@ export async function diffQuery<Row>(
     beforeRows: before.rows,
     afterRows: after.rows,
     ...visibleRowDiff(rowDiff),
-    diagnostics: [...before.diagnostics, ...after.diagnostics, ...versionDiagnostics]
+    diagnostics: [...before.diagnostics, ...after.diagnostics, ...versionDiagnostics, ...rowChangeDiagnostics(rowDiff)]
   };
 }
 
@@ -378,6 +379,14 @@ export function diffOptionsForTarget<Row>(
 ): RowDiffOptions<Row> {
   if (isRelationTarget(target)) {
     return { keyFields: relationKeyFields(target) };
+  }
+
+  if (options.rowKey === undefined && options.keyFields === undefined) {
+    const keyFields = queryRowKeyFields(target);
+
+    if (keyFields !== undefined) {
+      return { keyFields };
+    }
   }
 
   return {

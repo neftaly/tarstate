@@ -23,7 +23,12 @@ import {
   type RelationPatchTarget,
   type RelationRuntime
 } from '@tarstate/core/adapter';
-import { hasAttachedConstraints, tryTransactConstrained } from '@tarstate/core/constraints';
+import {
+  attachConstraints,
+  hasAttachedConstraints,
+  tryTransactConstrained,
+  type ConstraintAttachmentInput
+} from '@tarstate/core/constraints';
 import type { TarstateDiagnostic } from '@tarstate/core/diagnostics';
 import type { RelationDelta } from '@tarstate/core/delta';
 import { createDb, dbSource, tryTransact, type Db, type DbInputData } from '@tarstate/core/db';
@@ -31,18 +36,29 @@ import { evaluate, type EvaluateOptions, type QueryResult } from '@tarstate/core
 import {
   materializationsFor,
   maintainMaterializationSnapshots,
+  readMaterializedQuery,
   type MaterializationDiagnostic,
   type MaterializationMaintenanceResult
 } from '@tarstate/core/materialization';
 import { queryKey, type Query } from '@tarstate/core/query';
+import { trackTransact } from '@tarstate/core/runtime';
 import type { MaybePromise, RelationSource } from '@tarstate/core/source';
+import type { TrackedChange, WatchRuntimeDiagnostic } from '@tarstate/core/watch';
 import type { WritePatch } from '@tarstate/core/write';
 
-export type TarstateReactDiagnostic = TarstateDiagnostic | MaterializationDiagnostic;
+export type TarstateReactDiagnostic = MaterializationDiagnostic | WatchRuntimeDiagnostic;
 
 export type QueryBatch = Record<string, Query>;
 export type QueryBatchResult<Queries extends QueryBatch> = {
   readonly [Key in keyof Queries]: QueryResult<Queries[Key] extends Query<infer Row> ? Row : never>;
+};
+type SnapshotQueryEvaluation<Row> = {
+  readonly result: QueryResult<Row>;
+  readonly diagnostics: readonly TarstateReactDiagnostic[];
+};
+type SnapshotQueryBatchEvaluation<Queries extends QueryBatch> = {
+  readonly results: QueryBatchResult<Queries>;
+  readonly diagnostics: readonly TarstateReactDiagnostic[];
 };
 
 export type TarstateSnapshot<Version = unknown> = {
@@ -67,6 +83,7 @@ export type TarstateCommitResult<Snapshot extends TarstateSnapshot = TarstateSna
   readonly patches: number;
   readonly applied: number;
   readonly deltas: readonly RelationDelta[];
+  readonly changes?: readonly TrackedChange[];
   readonly durability?: RelationApplyDurability;
   readonly materializations?: MaterializationMaintenanceResult;
   readonly diagnostics: readonly TarstateReactDiagnostic[];
@@ -78,6 +95,11 @@ export type TarstateStore<Snapshot extends TarstateSnapshot = TarstateSnapshot> 
   readonly subscribe: (listener: () => void) => () => void;
   readonly commit: (patches: Iterable<WritePatch>) => Promise<TarstateCommitResult<Snapshot>>;
   readonly refresh: () => Promise<void>;
+};
+
+export type DbStoreOptions = {
+  /** Attach constraints to the object-backed Db used by this store. */
+  readonly constraints?: ConstraintAttachmentInput;
 };
 
 export type SourceStoreSnapshot<Version = unknown> = {
@@ -114,7 +136,7 @@ export type QueryHookState<Row, Selected = readonly Row[]> = {
   readonly status: 'loading' | 'ready' | 'error';
   readonly rows: readonly Row[];
   readonly data: Selected | undefined;
-  readonly diagnostics: readonly TarstateDiagnostic[];
+  readonly diagnostics: readonly TarstateReactDiagnostic[];
   readonly queryKey: string;
   readonly revision: number;
   readonly refresh: () => void;
@@ -125,7 +147,7 @@ export type QueryHookState<Row, Selected = readonly Row[]> = {
 export type QueriesHookState<Queries extends QueryBatch> = {
   readonly status: 'loading' | 'ready' | 'error';
   readonly results: QueryBatchResult<Queries> | undefined;
-  readonly diagnostics: readonly TarstateDiagnostic[];
+  readonly diagnostics: readonly TarstateReactDiagnostic[];
   readonly revision: number;
   readonly refresh: () => void;
   readonly error?: unknown;
@@ -136,8 +158,15 @@ const emptyRows = Object.freeze([]) as readonly never[];
 const emptyDiagnostics = Object.freeze([]) as readonly never[];
 type QueryRelation = Query['relations'][string];
 
-export function createDbStore(input: Db | DbInputData = createDb()): TarstateStore<TarstateDbSnapshot> {
+export function createDbStore(
+  input: Db | DbInputData = createDb(),
+  options: DbStoreOptions = {}
+): TarstateStore<TarstateDbSnapshot> {
   let db = isDb(input) ? input : createDb(input);
+  if (options.constraints !== undefined) {
+    db = attachConstraints(db, options.constraints);
+  }
+
   let revision = 0;
   let snapshot = dbSnapshot(db, revision, []);
   const listeners = new Set<() => void>();
@@ -169,26 +198,38 @@ export function createDbStore(input: Db | DbInputData = createDb()): TarstateSto
       const result = hasAttachedConstraints(db)
         ? await tryTransactConstrained(db, patchList)
         : tryTransact(db, patchList);
-      const maintenance = result.committed
-        ? await maintainMaterializationSnapshots(db, result.db, { deltas: result.deltas })
-        : undefined;
-      const diagnostics = maintenance === undefined
-        ? result.diagnostics
-        : [...result.diagnostics, ...maintenance.diagnostics];
-      const nextSnapshot = result.committed ? setDb(result.db, diagnostics) : snapshot;
+
+      if (!result.committed) {
+        return {
+          kind: 'tarstateCommit',
+          status: 'rejected',
+          reflected: false,
+          fullyCommitted: false,
+          committed: false,
+          patches: result.patches,
+          applied: result.applied,
+          deltas: result.deltas,
+          diagnostics: result.diagnostics,
+          snapshot
+        };
+      }
+
+      const tracked = await trackTransact(db, () => result);
+      const nextSnapshot = setDb(tracked.db, tracked.diagnostics);
       const reflected = commitReflected(result.deltas);
 
       return {
         kind: 'tarstateCommit',
-        status: result.committed ? 'committed' : 'rejected',
+        status: 'committed',
         reflected,
-        fullyCommitted: result.committed,
-        committed: result.committed,
+        fullyCommitted: true,
+        committed: true,
         patches: result.patches,
         applied: result.applied,
-        deltas: result.deltas,
-        ...(maintenance === undefined ? {} : { materializations: maintenance }),
-        diagnostics,
+        deltas: tracked.deltas,
+        changes: tracked.changes,
+        ...(tracked.materializations === undefined ? {} : { materializations: tracked.materializations }),
+        diagnostics: tracked.diagnostics,
         snapshot: nextSnapshot
       };
     },
@@ -439,17 +480,19 @@ export function useTarstateQuery<Row, Selected = readonly Row[]>(
 
     setState(loadingQueryState(key, snapshot.revision, refresh));
 
-    void evaluateSnapshotQuery(snapshot.source, query, snapshotEvaluateOptions).then(
-      (result) => {
+    void evaluateSnapshotQuery(snapshot, query, snapshotEvaluateOptions).then(
+      (evaluation) => {
         if (!active || requestId.current !== id) {
           return;
         }
+
+        const result = evaluation.result;
 
         setState({
           status: 'ready',
           rows: result.rows,
           data: select === undefined ? (result.rows as Selected) : select(result.rows, result),
-          diagnostics: result.diagnostics,
+          diagnostics: evaluation.diagnostics,
           result,
           queryKey: key,
           revision: snapshot.revision,
@@ -515,13 +558,13 @@ export function useTarstateQueries<const Queries extends QueryBatch>(
       refresh
     });
 
-    void evaluateBatch(snapshot.source, queries, snapshotEvaluateOptions).then(
-      (results) => {
+    void evaluateBatch(snapshot, queries, snapshotEvaluateOptions).then(
+      (evaluation) => {
         if (active && requestId.current === id) {
           setState({
             status: 'ready',
-            results,
-            diagnostics: batchDiagnostics(results),
+            results: evaluation.results,
+            diagnostics: evaluation.diagnostics,
             revision: snapshot.revision,
             refresh
           });
@@ -741,20 +784,53 @@ function loadingQueryState<Row, Selected>(
 }
 
 async function evaluateBatch<const Queries extends QueryBatch>(
-  source: RelationSource,
+  snapshot: TarstateSnapshot,
   queries: Queries,
   options: EvaluateOptions
-): Promise<QueryBatchResult<Queries>> {
-  const capturedSource = await captureQuerySource(source, Object.values(queries));
+): Promise<SnapshotQueryBatchEvaluation<Queries>> {
   const entries = await Promise.all(
-    Object.entries(queries).map(async ([name, query]) => [name, await evaluate(capturedSource, query, options)] as const)
+    Object.entries(queries).map(async ([name, query]) => {
+      const materialized = await readSnapshotMaterializedQuery(snapshot, query);
+
+      return {
+        name,
+        query,
+        diagnostics: materialized === undefined ? emptyDiagnostics : materialized.diagnostics,
+        result: materialized?.materialized === true
+          ? { rows: materialized.rows, diagnostics: [] }
+          : undefined
+      };
+    })
   );
+  const misses = entries.filter((entry) => entry.result === undefined);
+  const capturedSource = misses.length === 0
+    ? undefined
+    : await captureQuerySource(snapshot.source, misses.map((entry) => entry.query));
+  const evaluated = await Promise.all(
+    misses.map(async (entry) => ({
+      name: entry.name,
+      result: await evaluate(capturedSource as RelationSource, entry.query, options)
+    }))
+  );
+  const evaluatedByName = new Map(evaluated.map((entry) => [entry.name, entry.result]));
+  const resultEntries = entries.map((entry) => {
+    const result = entry.result ?? evaluatedByName.get(entry.name);
 
-  return Object.fromEntries(entries) as QueryBatchResult<Queries>;
-}
+    if (result === undefined) {
+      throw new Error(`missing query batch result for ${entry.name}`);
+    }
 
-function batchDiagnostics(results: QueryBatchResult<QueryBatch>): readonly TarstateDiagnostic[] {
-  return Object.values(results).flatMap((result) => result.diagnostics);
+    return [entry.name, result] as const;
+  });
+  const diagnostics = entries.flatMap((entry) => [
+    ...entry.diagnostics,
+    ...(entry.result === undefined ? evaluatedByName.get(entry.name)?.diagnostics ?? [] : [])
+  ]);
+
+  return {
+    results: Object.fromEntries(resultEntries) as QueryBatchResult<Queries>,
+    diagnostics
+  };
 }
 
 function queryBatchKey(queries: QueryBatch): string {
@@ -768,11 +844,68 @@ function isDb(input: Db | DbInputData): input is Db {
 }
 
 async function evaluateSnapshotQuery<Row>(
-  source: RelationSource,
+  snapshot: TarstateSnapshot,
   query: Query<Row>,
   options: EvaluateOptions
-): Promise<QueryResult<Row>> {
-  return evaluate(await captureQuerySource(source, [query]), query, options);
+): Promise<SnapshotQueryEvaluation<Row>> {
+  const materialized = await readSnapshotMaterializedQuery(snapshot, query);
+
+  if (materialized?.materialized === true) {
+    return {
+      result: { rows: materialized.rows, diagnostics: [] },
+      diagnostics: materialized.diagnostics
+    };
+  }
+
+  const result = await evaluate(await captureQuerySource(snapshot.source, [query]), query, options);
+
+  return {
+    result,
+    diagnostics: [
+      ...(materialized?.diagnostics ?? []),
+      ...result.diagnostics
+    ]
+  };
+}
+
+async function readSnapshotMaterializedQuery<Row>(
+  snapshot: TarstateSnapshot,
+  query: Query<Row>
+): Promise<Awaited<ReturnType<typeof readMaterializedQuery<Row>>> | undefined> {
+  if (!canReadMaterializedQuery(query)) {
+    return undefined;
+  }
+
+  const result = await readMaterializedQuery(materializationInputForSnapshot(snapshot), query);
+  return result.materialized || result.id !== undefined ? result : undefined;
+}
+
+function materializationInputForSnapshot(snapshot: TarstateSnapshot): unknown {
+  return isTarstateDbSnapshot(snapshot) ? snapshot.db : snapshot.source;
+}
+
+function canReadMaterializedQuery(query: Query): boolean {
+  return !queryUsesRuntimeInputs(query);
+}
+
+function queryUsesRuntimeInputs(query: Query): boolean {
+  return queryPartUsesRuntimeInputs(query.data);
+}
+
+function queryPartUsesRuntimeInputs(input: unknown): boolean {
+  if (Array.isArray(input)) {
+    return input.some(queryPartUsesRuntimeInputs);
+  }
+
+  if (!isRecord(input)) {
+    return false;
+  }
+
+  if (input.op === 'env' || input.op === 'call') {
+    return true;
+  }
+
+  return Object.values(input).some(queryPartUsesRuntimeInputs);
 }
 
 async function captureQuerySource(source: RelationSource, queries: readonly Query[]): Promise<RelationSource> {
@@ -844,4 +977,8 @@ function isTarstateDbSnapshot(snapshot: TarstateSnapshot): snapshot is TarstateD
 
 function commitReflected(deltas: readonly RelationDelta[]): boolean {
   return deltas.some((delta) => delta.added.length > 0 || delta.removed.length > 0);
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

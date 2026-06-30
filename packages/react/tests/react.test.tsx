@@ -10,6 +10,7 @@ import {
   hasAttachedConstraints
 } from '@tarstate/core/constraints';
 import { createDb } from '@tarstate/core/db';
+import { stableRowKey } from '@tarstate/core/diff';
 import { evaluate } from '@tarstate/core/evaluate';
 import {
   materializationsFor,
@@ -20,6 +21,7 @@ import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { as, env, eq, from, join, pipe, project, where } from '@tarstate/core/query';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import type { RelationSource } from '@tarstate/core/source';
+import { watch } from '@tarstate/core/watch';
 import { write, type WritePatch } from '@tarstate/core/write';
 import {
   createAdapterStore,
@@ -94,6 +96,7 @@ const matchingTodoPairs = pipe(
 describe('@tarstate/react', () => {
   it('exports a revisioned external-store surface', () => {
     expectTypeOf(createDbStore()).toMatchTypeOf<TarstateStore<TarstateDbSnapshot>>();
+    expectTypeOf(createDbStore(undefined, { constraints: [] })).toMatchTypeOf<TarstateStore<TarstateDbSnapshot>>();
     expectTypeOf(useTarstateStore).returns.toMatchTypeOf<TarstateStore>();
     expectTypeOf(useTarstateSnapshot<TarstateDbSnapshot>).returns.toMatchTypeOf<TarstateDbSnapshot>();
     expectTypeOf(useCommit).returns.toMatchTypeOf<(patches: Iterable<WritePatch>) => Promise<unknown>>();
@@ -139,6 +142,83 @@ describe('@tarstate/react', () => {
       { id: 'todo-a', title: 'Alpha', done: false },
       { id: 'todo-b', title: 'Beta', done: false }
     ]);
+    unsubscribe();
+  });
+
+  it('rejects db store commits that violate constraints supplied at creation', async () => {
+    const constraints = constrain(
+      check(from(todo), eq(todo.done, false), { name: 'todos-stay-open' })
+    );
+    const store = createDbStore({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+    }, { constraints });
+    const revisions: number[] = [];
+    const unsubscribe = store.subscribe(() => {
+      revisions.push(store.getSnapshot().revision);
+    });
+
+    const rejected = await store.commit([
+      todos.update('todo-a', { done: true })
+    ]);
+
+    expect(rejected.status).toBe('rejected');
+    expect(rejected.reflected).toBe(false);
+    expect(rejected.fullyCommitted).toBe(false);
+    expect(rejected.committed).toBe(false);
+    expect(rejected.applied).toBe(0);
+    expect(rejected.deltas).toEqual([]);
+    expect(rejected.snapshot.revision).toBe(0);
+    expect(revisions).toEqual([]);
+    expect(rejected.diagnostics).toMatchObject([
+      {
+        code: 'invalid_row',
+        message: 'check constraint failed',
+        detail: {
+          op: 'check',
+          name: 'todos-stay-open',
+          row: {
+            todo: { id: 'todo-a', title: 'Alpha', done: true }
+          }
+        }
+      }
+    ]);
+    expect(store.getSnapshot().db.data.todos).toEqual([
+      { id: 'todo-a', title: 'Alpha', done: false }
+    ]);
+    expect(hasAttachedConstraints(store.getSnapshot().db)).toBe(true);
+    expect(attachedConstraintsFor(store.getSnapshot().db)).toEqual(constraints.constraints);
+    unsubscribe();
+  });
+
+  it('carries constraints supplied at creation through valid db store commits', async () => {
+    const constraints = constrain(
+      check(from(todo), eq(todo.done, false), { name: 'todos-stay-open' })
+    );
+    const store = createDbStore({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+    }, { constraints });
+    const revisions: number[] = [];
+    const unsubscribe = store.subscribe(() => {
+      revisions.push(store.getSnapshot().revision);
+    });
+
+    const committed = await store.commit([
+      todos.insert({ id: 'todo-b', title: 'Beta', done: false })
+    ]);
+
+    expect(committed.status).toBe('committed');
+    expect(committed.reflected).toBe(true);
+    expect(committed.fullyCommitted).toBe(true);
+    expect(committed.committed).toBe(true);
+    expect(committed.snapshot.revision).toBe(1);
+    expect(revisions).toEqual([1]);
+    expect(committed.diagnostics).toEqual([]);
+    expect(committed.snapshot.db.data.todos).toEqual([
+      { id: 'todo-a', title: 'Alpha', done: false },
+      { id: 'todo-b', title: 'Beta', done: false }
+    ]);
+    expect(hasAttachedConstraints(committed.snapshot.db)).toBe(true);
+    expect(attachedConstraintsFor(committed.snapshot.db)).toEqual(constraints.constraints);
     unsubscribe();
   });
 
@@ -265,6 +345,120 @@ describe('@tarstate/react', () => {
     expect(ignored.deltas).toEqual([]);
   });
 
+  it('includes direct relation watch changes for committed db store writes', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const beta = { id: 'todo-b', title: 'Beta', done: false };
+    const closed = { id: 'todo-c', title: 'Closed', done: true };
+    const alphaUpdated = { id: 'todo-a', title: 'Alpha updated', done: false };
+    const store = createDbStore({
+      todos: [alpha, beta, closed]
+    });
+    const events: unknown[] = [];
+    const handle = watch(store.getSnapshot().db, schema.todos, (event) => {
+      events.push(event);
+    });
+
+    const result = await store.commit([
+      todos.update('todo-a', { title: 'Alpha updated' }),
+      todos.delete('todo-b')
+    ]);
+
+    expect(result.status).toBe('committed');
+    expect(result.changes).toMatchObject([
+      {
+        kind: 'trackedChange',
+        id: handle.id,
+        target: schema.todos,
+        changed: true,
+        previousRows: [alpha, beta, closed],
+        rows: [alphaUpdated, closed],
+        addedRows: [alphaUpdated],
+        removedRows: [alpha, beta],
+        unchangedRows: [closed],
+        rowChanges: [
+          {
+            op: 'update',
+            key: stableRowKey('todo-a'),
+            before: alpha,
+            after: alphaUpdated
+          },
+          {
+            op: 'delete',
+            key: stableRowKey('todo-b'),
+            before: beta
+          }
+        ],
+        diagnostics: []
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      target: schema.todos,
+      changes: { deltas: result.deltas },
+      rowChanges: [
+        {
+          op: 'update',
+          key: stableRowKey('todo-a'),
+          before: alpha,
+          after: alphaUpdated
+        },
+        {
+          op: 'delete',
+          key: stableRowKey('todo-b'),
+          before: beta
+        }
+      ]
+    });
+
+    const second = await store.commit([
+      todos.insert({ id: 'todo-d', title: 'Delta', done: false })
+    ]);
+
+    expect(second.changes).toMatchObject([
+      {
+        id: handle.id,
+        previousRows: [alphaUpdated, closed],
+        rows: [
+          alphaUpdated,
+          closed,
+          { id: 'todo-d', title: 'Delta', done: false }
+        ],
+        addedRows: [{ id: 'todo-d', title: 'Delta', done: false }],
+        removedRows: [],
+        rowChanges: [
+          {
+            op: 'insert',
+            key: stableRowKey('todo-d'),
+            after: { id: 'todo-d', title: 'Delta', done: false }
+          }
+        ]
+      }
+    ]);
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
+  it('omits db store changes for rejected watched commits', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const store = createDbStore({
+      todos: [alpha]
+    });
+    const events: unknown[] = [];
+    const handle = watch(store.getSnapshot().db, schema.todos, (event) => {
+      events.push(event);
+    });
+
+    const rejected = await store.commit([
+      todos.insert({ id: 'todo-a', title: 'Duplicate', done: false })
+    ]);
+
+    expect(rejected.status).toBe('rejected');
+    expect(rejected.changes).toBeUndefined();
+    expect(events).toEqual([]);
+    expect(store.getSnapshot().db.data.todos).toEqual([alpha]);
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
   it('maintains materialized db snapshots after committed store writes', async () => {
     const db = createDb({
       todos: [
@@ -318,6 +512,62 @@ describe('@tarstate/react', () => {
         maintenance: 'incremental'
       }
     ]);
+  });
+
+  it('includes materialized query watch changes without duplicating maintenance', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const closed = { id: 'todo-b', title: 'Beta', done: true };
+    const gamma = { id: 'todo-c', title: 'Gamma', done: false };
+    const db = createDb({
+      todos: [alpha, closed]
+    });
+
+    await materializeSnapshot(db, openTodos, { id: 'open-todos', mode: 'incremental' });
+
+    const store = createDbStore(db);
+    const events: unknown[] = [];
+    const handle = watch(store.getSnapshot().db, openTodos, (event) => {
+      events.push(event);
+    });
+    const result = await store.commit([todos.insert(gamma)]);
+
+    expect(result.status).toBe('committed');
+    expect(result.materializations).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: []
+    });
+    expect(result.materializations?.changes).toHaveLength(1);
+    expect(result.changes).toMatchObject([
+      {
+        kind: 'trackedChange',
+        id: handle.id,
+        target: openTodos,
+        changed: true,
+        previousRows: [{ id: 'todo-a', title: 'Alpha' }],
+        rows: [
+          { id: 'todo-a', title: 'Alpha' },
+          { id: 'todo-c', title: 'Gamma' }
+        ],
+        addedRows: [{ id: 'todo-c', title: 'Gamma' }],
+        removedRows: [],
+        diagnostics: []
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      target: openTodos,
+      changes: { deltas: result.deltas },
+      addedRows: [{ id: 'todo-c', title: 'Gamma' }]
+    });
+    expect(materializedRowsFor(result.snapshot.db, 'open-todos')).toEqual([
+      { id: 'todo-a', title: 'Alpha' },
+      { id: 'todo-c', title: 'Gamma' }
+    ]);
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
   });
 
   it('evaluates db store queries with db env and hook env overrides', async () => {
@@ -1080,6 +1330,148 @@ describe('@tarstate/react', () => {
     expect(rows).toEqual([{ leftTitle: 'Alpha', rightTitle: 'Alpha' }]);
   });
 
+  it('reads exact useQuery results from current materialized source rows', async () => {
+    const counted = countedTodoSource([
+      { id: 'todo-a', title: 'Alpha', done: false },
+      { id: 'todo-b', title: 'Beta', done: true }
+    ]);
+
+    await materializeSnapshot(counted.source, openTodos, { id: 'open-todos' });
+    counted.resetRowsCalls();
+
+    const store = createSourceStore({ getSource: () => counted.source });
+    let rows: readonly unknown[] = [];
+    let diagnostics: readonly unknown[] = [];
+    let revision = -1;
+
+    function Probe() {
+      const result = useQuery(openTodos);
+      rows = result.rows;
+      diagnostics = result.diagnostics;
+      revision = result.revision;
+      return null;
+    }
+
+    await act(async () => {
+      create(React.createElement(TarstateProvider, { store }, React.createElement(Probe)));
+      await flushEffects();
+    });
+
+    expect(revision).toBe(0);
+    expect(rows).toEqual([{ id: 'todo-a', title: 'Alpha' }]);
+    expect(diagnostics).toEqual([]);
+    expect(counted.rowsCalls()).toBe(0);
+  });
+
+  it('reads exact useQueries results from current materialized source rows', async () => {
+    const counted = countedTodoSource([
+      { id: 'todo-a', title: 'Alpha', done: false },
+      { id: 'todo-b', title: 'Beta', done: true }
+    ]);
+
+    await materializeSnapshot(counted.source, openTodos, { id: 'open-todos' });
+    await materializeSnapshot(counted.source, todoTitles, { id: 'todo-titles' });
+    counted.resetRowsCalls();
+
+    const store = createSourceStore({ getSource: () => counted.source });
+    let open: readonly unknown[] = [];
+    let titles: readonly unknown[] = [];
+    let diagnostics: readonly unknown[] = [];
+    let revision = -1;
+
+    function Probe() {
+      const result = useQueries({ open: openTodos, titles: todoTitles });
+      open = result.results?.open.rows ?? [];
+      titles = result.results?.titles.rows ?? [];
+      diagnostics = result.diagnostics;
+      revision = result.revision;
+      return null;
+    }
+
+    await act(async () => {
+      create(React.createElement(TarstateProvider, { store }, React.createElement(Probe)));
+      await flushEffects();
+    });
+
+    expect(revision).toBe(0);
+    expect(open).toEqual([{ id: 'todo-a', title: 'Alpha' }]);
+    expect(titles).toEqual([{ title: 'Alpha' }, { title: 'Beta' }]);
+    expect(diagnostics).toEqual([]);
+    expect(counted.rowsCalls()).toBe(0);
+  });
+
+  it('falls back to source evaluation and reports diagnostics for stale materialized source rows', async () => {
+    const counted = countedTodoSource([
+      { id: 'todo-a', title: 'Alpha', done: false }
+    ]);
+
+    await materializeSnapshot(counted.source, openTodos, { id: 'open-todos' });
+    counted.setRows([{ id: 'todo-b', title: 'Beta', done: false }]);
+    counted.setVersion('v2');
+    counted.resetRowsCalls();
+
+    const store = createSourceStore({ getSource: () => counted.source });
+    let rows: readonly unknown[] = [];
+    let diagnostics: readonly unknown[] = [];
+
+    function Probe() {
+      const result = useQuery(openTodos);
+      rows = result.rows;
+      diagnostics = result.diagnostics;
+      return null;
+    }
+
+    await act(async () => {
+      create(React.createElement(TarstateProvider, { store }, React.createElement(Probe)));
+      await flushEffects();
+    });
+
+    expect(rows).toEqual([{ id: 'todo-b', title: 'Beta' }]);
+    expect(diagnostics).toMatchObject([
+      {
+        code: 'materialization_stale',
+        surface: 'materialization',
+        detail: {
+          id: 'open-todos',
+          queryKey: expect.any(String),
+          sourceVersion: 'v2',
+          metadataSourceVersion: 'v1'
+        }
+      }
+    ]);
+    expect(counted.rowsCalls()).toBe(1);
+  });
+
+  it('does not use materialized rows for queries with runtime env inputs', async () => {
+    const db = createDb(
+      {
+        todos: [
+          { id: 'todo-a', title: 'Alpha', done: false },
+          { id: 'todo-b', title: 'Beta', done: false }
+        ]
+      },
+      { title: 'Alpha' }
+    );
+
+    await materializeSnapshot(db, todosByEnvTitle, { id: 'todos-by-env-title' });
+
+    const store = createDbStore(db);
+    let rows: readonly unknown[] = [];
+
+    function Probe() {
+      const result = useQuery(todosByEnvTitle, { env: { title: 'Beta' }, deps: ['Beta'] });
+      rows = result.rows;
+      return null;
+    }
+
+    await act(async () => {
+      create(React.createElement(TarstateProvider, { store }, React.createElement(Probe)));
+      await flushEffects();
+    });
+
+    expect(rows).toEqual([{ id: 'todo-b', title: 'Beta' }]);
+  });
+
   it('evaluates useQueries against the captured snapshot source', async () => {
     const store = mutatingRowsStore(
       [{ id: 'todo-a', title: 'Alpha', done: false }],
@@ -1153,6 +1545,43 @@ function mutatingRowsStore(initialRows: readonly Todo[], latestRows: readonly To
       snapshot
     }),
     refresh: async () => {}
+  };
+}
+
+function countedTodoSource(initialRows: readonly Todo[]): {
+  readonly source: RelationSource;
+  readonly rowsCalls: () => number;
+  readonly resetRowsCalls: () => void;
+  readonly setRows: (rows: readonly Todo[]) => void;
+  readonly setVersion: (version: string) => void;
+} {
+  let rows = initialRows;
+  let calls = 0;
+  let version = 'v1';
+
+  return {
+    source: {
+      relationNames: ['todos'],
+      rows: (relationRef) => {
+        if (relationRef.name !== 'todos') {
+          return [];
+        }
+
+        calls += 1;
+        return rows;
+      },
+      version: () => version
+    },
+    rowsCalls: () => calls,
+    resetRowsCalls: () => {
+      calls = 0;
+    },
+    setRows: (nextRows) => {
+      rows = nextRows;
+    },
+    setVersion: (nextVersion) => {
+      version = nextVersion;
+    }
   };
 }
 

@@ -23,7 +23,7 @@ import {
   type QueryData
 } from './query.js';
 import type { RelationRef } from './schema.js';
-import { asRelationSource } from './source-input.js';
+import { asRelationSource, tryRelationSource } from './source-input.js';
 import type { RelationSource } from './source.js';
 
 declare const materializedDb: unique symbol;
@@ -70,11 +70,46 @@ export type IncrementalFallbackMaterializationDiagnostic = {
     readonly reason: string;
   };
 };
+export type MissingMaterializationRowsDiagnostic = {
+  readonly code: 'materialization_rows_missing';
+  readonly message: string;
+  readonly surface: 'materialization';
+  readonly detail: {
+    readonly id: string;
+    readonly queryKey: string;
+  };
+};
+export type StaleMaterializationDiagnostic = {
+  readonly code: 'materialization_stale';
+  readonly message: string;
+  readonly surface: 'materialization';
+  readonly detail: {
+    readonly id: string;
+    readonly queryKey: string;
+    readonly sourceVersion: unknown;
+    readonly metadataSourceVersion: unknown;
+  };
+};
+export type UnknownMaterializationVersionDiagnostic = {
+  readonly code: 'materialization_version_unknown';
+  readonly message: string;
+  readonly surface: 'materialization';
+  readonly detail: {
+    readonly id: string;
+    readonly queryKey: string;
+    readonly reason: string;
+    readonly sourceVersion?: unknown;
+    readonly metadataSourceVersion?: unknown;
+  };
+};
 export type MaterializationDiagnostic =
   | UnsupportedMaterializationDiagnostic
   | MissingMaterializationDiagnostic
   | UnsupportedMaterializationIndexDiagnostic
   | IncrementalFallbackMaterializationDiagnostic
+  | MissingMaterializationRowsDiagnostic
+  | StaleMaterializationDiagnostic
+  | UnknownMaterializationVersionDiagnostic
   | TarstateDiagnostic;
 
 export type MaterializationMode = 'snapshot' | 'incremental';
@@ -186,9 +221,30 @@ export type MaterializationHashIndexResult<Row = unknown, Value = unknown> = {
   readonly index?: MaterializationHashIndex<Row, Value>;
 };
 
+/** Result for reading cached snapshot rows for an exact structural query match. */
+export type MaterializedQueryResult<Row = unknown> = {
+  readonly kind: 'materializedQueryResult';
+  readonly materialized: boolean;
+  readonly rows: readonly Row[];
+  readonly diagnostics: readonly MaterializationDiagnostic[];
+  readonly queryKey: string;
+  readonly id?: string;
+  readonly sourceVersion?: unknown;
+};
+
 type SnapshotEntry<Row = unknown> = {
   readonly rows: readonly Row[];
 };
+type CurrentMaterializationSourceVersion =
+  | {
+    readonly available: true;
+    readonly sourceVersion: unknown;
+    readonly diagnostics: readonly TarstateDiagnostic[];
+  }
+  | {
+    readonly available: false;
+    readonly diagnostics: readonly TarstateDiagnostic[];
+  };
 type MaterializationRuntimeInputs = {
   readonly envKey?: string;
 };
@@ -216,7 +272,8 @@ type IncrementalBaseMaterializationPlan = {
 };
 type IncrementalMaterializationPlan =
   | IncrementalRowMaterializationPlan
-  | IncrementalAggregateMaterializationPlan;
+  | IncrementalAggregateMaterializationPlan
+  | IncrementalJoinMaterializationPlan;
 type IncrementalRowMaterializationPlan = IncrementalBaseMaterializationPlan & {
   readonly kind: 'rows';
   readonly transforms: readonly IncrementalTransform[];
@@ -225,6 +282,18 @@ type IncrementalAggregateMaterializationPlan = IncrementalBaseMaterializationPla
   readonly kind: 'aggregate';
   readonly groupBy: ProjectionData;
   readonly aggregateFields: readonly IncrementalAggregateField[];
+};
+type IncrementalJoinSidePlan = {
+  readonly relation: RelationRef;
+  readonly relationName: string;
+  readonly alias: string;
+  readonly field: string;
+};
+type IncrementalJoinMaterializationPlan = {
+  readonly kind: 'join';
+  readonly left: IncrementalJoinSidePlan;
+  readonly right: IncrementalJoinSidePlan;
+  readonly transforms: readonly IncrementalTransform[];
 };
 type IncrementalAggregateField =
   | { readonly op: 'count'; readonly fieldName: string }
@@ -303,6 +372,40 @@ type IncrementalDeltaRecordResult =
   | { readonly kind: 'fallback'; readonly reason: string };
 type IncrementalRowUpdateResult =
   | { readonly kind: 'updated'; readonly rows: unknown[] }
+  | { readonly kind: 'fallback'; readonly reason: string };
+type IncrementalJoinDeltaSet = {
+  readonly removed: ReadonlyMap<string, unknown>;
+  readonly added: ReadonlyMap<string, unknown>;
+};
+type IncrementalJoinDeltaState = {
+  readonly kind: 'state';
+  readonly left: IncrementalJoinDeltaSet;
+  readonly right: IncrementalJoinDeltaSet;
+};
+type IncrementalJoinRowState = {
+  readonly key: string;
+  readonly row: Record<string, unknown>;
+  readonly joinValue: unknown;
+};
+type IncrementalJoinCurrentState =
+  | {
+    readonly kind: 'state';
+    readonly leftRows: readonly IncrementalJoinRowState[];
+    readonly rightRows: readonly IncrementalJoinRowState[];
+    readonly leftByKey: ReadonlyMap<string, IncrementalJoinRowState>;
+    readonly rightByKey: ReadonlyMap<string, IncrementalJoinRowState>;
+    readonly leftByJoin: ReadonlyMap<unknown, readonly IncrementalJoinRowState[]>;
+    readonly rightByJoin: ReadonlyMap<unknown, readonly IncrementalJoinRowState[]>;
+    readonly order: readonly string[];
+  }
+  | { readonly kind: 'fallback'; readonly reason: string };
+type IncrementalJoinSnapshotState =
+  | {
+    readonly kind: 'state';
+    readonly rowsByPairKey: ReadonlyMap<string, Record<string, unknown>>;
+    readonly pairKeysByLeftKey: ReadonlyMap<string, ReadonlySet<string>>;
+    readonly pairKeysByRightKey: ReadonlyMap<string, ReadonlySet<string>>;
+  }
   | { readonly kind: 'fallback'; readonly reason: string };
 
 const metadataByTarget = new WeakMap<object, readonly MaterializationMetadata[]>();
@@ -515,7 +618,7 @@ export async function maintainMaterializationSnapshots<Next extends SnapshotMate
     const incrementalRows = previousSnapshot === undefined || metadata.maintenance !== 'incremental'
       ? { kind: 'unavailable' } as const
       : runtimeFallbackReason === undefined
-        ? maintainIncrementalSnapshotRows(metadata, previousSnapshot, options.deltas, options)
+        ? await maintainIncrementalSnapshotRows(metadata, previousSnapshot, source, options.deltas, options)
         : { kind: 'fallback', reason: runtimeFallbackReason } as const;
 
     if (incrementalRows.kind === 'maintained') {
@@ -659,6 +762,57 @@ export function materializedRowsForQuery<Row = unknown>(
 ): readonly Row[] | undefined {
   const metadata = materializationForQuery(input, query);
   return metadata === undefined ? undefined : materializedRowsFor<Row>(input, metadata.id);
+}
+
+/** Read cached snapshot rows for an exact structural query match without evaluating the query. */
+export async function readMaterializedQuery<Row = unknown>(
+  input: unknown,
+  query: Query<Row>
+): Promise<MaterializedQueryResult<Row>> {
+  const key = queryKey(query);
+
+  if (typeof input !== 'object' || input === null) {
+    return missingMaterializedQueryResult(query, key);
+  }
+
+  const metadata = latestMaterializationMetadata(input, (item) => item.queryKey === key) as
+    | MaterializationMetadata<Row>
+    | undefined;
+
+  if (metadata === undefined) {
+    return missingMaterializedQueryResult(query, key);
+  }
+
+  const baseResult = materializedQueryResultBase<Row>(metadata);
+  const entry = snapshotEntryFor(input, metadata.id);
+
+  if (entry === undefined) {
+    return {
+      ...baseResult,
+      materialized: false,
+      rows: [],
+      diagnostics: [...metadata.diagnostics, missingMaterializationRowsDiagnostic(metadata)]
+    };
+  }
+
+  const version = await currentMaterializationSourceVersion(input);
+  const versionDiagnostics = materializedQueryVersionDiagnostics(metadata, version);
+
+  if (versionDiagnostics.length > 0) {
+    return {
+      ...baseResult,
+      materialized: false,
+      rows: [],
+      diagnostics: [...metadata.diagnostics, ...versionDiagnostics]
+    };
+  }
+
+  return {
+    ...baseResult,
+    materialized: true,
+    rows: entry.rows as readonly Row[],
+    diagnostics: metadata.diagnostics
+  };
 }
 
 /** Expose cached snapshot rows as a read-only relation source. */
@@ -1062,6 +1216,83 @@ function runtimeInputEntriesFor(input: object): ReadonlyMap<string, Materializat
   return runtimeInputsByTarget.get(input) ?? new Map();
 }
 
+async function currentMaterializationSourceVersion(input: object): Promise<CurrentMaterializationSourceVersion> {
+  const source = tryRelationSource(input);
+
+  if (source?.version === undefined) {
+    return { available: false, diagnostics: [] };
+  }
+
+  const diagnostics: TarstateDiagnostic[] = [];
+  const sourceVersion = await readSourceVersion(source, diagnostics);
+
+  return sourceVersion === undefined
+    ? { available: false, diagnostics }
+    : { available: true, sourceVersion, diagnostics };
+}
+
+function materializedQueryVersionDiagnostics(
+  metadata: MaterializationMetadata,
+  current: CurrentMaterializationSourceVersion
+): readonly MaterializationDiagnostic[] {
+  const diagnostics: MaterializationDiagnostic[] = [...current.diagnostics];
+
+  if (current.diagnostics.length > 0) {
+    diagnostics.push(unknownMaterializationVersionDiagnostic(
+      metadata,
+      'current source version could not be read'
+    ));
+    return diagnostics;
+  }
+
+  if (!current.available) {
+    return [
+      unknownMaterializationVersionDiagnostic(
+        metadata,
+        'current source version is unavailable'
+      )
+    ];
+  }
+
+  if (metadata.sourceVersion === undefined) {
+    return [
+      unknownMaterializationVersionDiagnostic(
+        metadata,
+        'materialization metadata has no source version',
+        current.sourceVersion
+      )
+    ];
+  }
+
+  return Object.is(current.sourceVersion, metadata.sourceVersion)
+    ? []
+    : [staleMaterializationDiagnostic(metadata, current.sourceVersion, metadata.sourceVersion)];
+}
+
+function materializedQueryResultBase<Row>(
+  metadata: MaterializationMetadata<Row>
+): Pick<MaterializedQueryResult<Row>, 'kind' | 'id' | 'queryKey' | 'sourceVersion'> {
+  return {
+    kind: 'materializedQueryResult',
+    id: metadata.id,
+    queryKey: metadata.queryKey,
+    ...(metadata.sourceVersion === undefined ? {} : { sourceVersion: metadata.sourceVersion })
+  };
+}
+
+function missingMaterializedQueryResult<Row>(
+  query: Query<Row>,
+  key: string
+): MaterializedQueryResult<Row> {
+  return {
+    kind: 'materializedQueryResult',
+    queryKey: key,
+    materialized: false,
+    rows: [],
+    diagnostics: [missingMaterializationDiagnostic(query)]
+  };
+}
+
 function cachedSnapshotHashIndex<Row, Value>(
   metadata: MaterializationMetadata,
   entry: SnapshotEntry,
@@ -1252,12 +1483,13 @@ function snapshotMaintenanceSupport(
   };
 }
 
-function maintainIncrementalSnapshotRows(
+async function maintainIncrementalSnapshotRows(
   metadata: MaterializationMetadata,
   previousSnapshot: SnapshotEntry,
+  source: RelationSource,
   deltas: readonly RelationDelta[] | undefined,
   options: EvaluateOptions
-): IncrementalSnapshotRowsResult {
+): Promise<IncrementalSnapshotRowsResult> {
   if (deltas === undefined) {
     return { kind: 'unavailable' };
   }
@@ -1268,7 +1500,7 @@ function maintainIncrementalSnapshotRows(
     return { kind: 'unavailable' };
   }
 
-  const rows = applyIncrementalDeltas(previousSnapshot.rows, incremental.plan, deltas, options.env);
+  const rows = await applyIncrementalDeltas(previousSnapshot.rows, incremental.plan, deltas, options.env, source);
 
   return rows.kind === 'applied'
     ? { kind: 'maintained', rows: rows.rows }
@@ -1318,7 +1550,7 @@ function incrementalRuntimeFallbackReason(
 }
 
 function incrementalPlanUsesEnv(plan: IncrementalMaterializationPlan): boolean {
-  return plan.filters?.some(incrementalPredicateUsesEnv) ?? false;
+  return plan.kind === 'join' ? false : plan.filters?.some(incrementalPredicateUsesEnv) ?? false;
 }
 
 function incrementalPredicateUsesEnv(predicate: IncrementalPredicate): boolean {
@@ -1354,8 +1586,14 @@ function incrementalPlanFor(query: Query): IncrementalPlanResult {
   let current = query.data;
 
   while (hasUnaryInput(current)) {
-    operations.push(current);
+    if (current.op !== 'keyBy') {
+      operations.push(current);
+    }
     current = current.input;
+  }
+
+  if (current.op === 'join') {
+    return incrementalJoinPlanFor(query, current, operations);
   }
 
   if (current.op !== 'from') {
@@ -1377,6 +1615,125 @@ function incrementalPlanFor(query: Query): IncrementalPlanResult {
   }
 
   return incrementalRowPlanFor(current, relation, operations);
+}
+
+function incrementalJoinPlanFor(
+  query: Query,
+  join: Extract<QueryData, { readonly op: 'join' }>,
+  operations: readonly QueryData[]
+): IncrementalPlanResult {
+  if (join.kind !== 'inner') {
+    return { kind: 'unsupported', reason: 'incremental join support is limited to inner joins' };
+  }
+
+  if (join.left.op !== 'from' || join.right.op !== 'from') {
+    return {
+      kind: 'unsupported',
+      reason: 'incremental join support is limited to from(...).join(from(...), eq(left.field, right.field))'
+    };
+  }
+
+  if (join.left.relation === join.right.relation) {
+    return { kind: 'unsupported', reason: 'incremental join support does not yet include same-relation self joins' };
+  }
+
+  if (join.left.alias === join.right.alias) {
+    return { kind: 'unsupported', reason: 'incremental join support requires distinct left and right aliases' };
+  }
+
+  const leftRelation = query.relations[join.left.relation];
+  const rightRelation = query.relations[join.right.relation];
+
+  if (leftRelation === undefined) {
+    return { kind: 'unsupported', reason: `unknown relation ${join.left.relation}` };
+  }
+
+  if (rightRelation === undefined) {
+    return { kind: 'unsupported', reason: `unknown relation ${join.right.relation}` };
+  }
+
+  const equality = incrementalJoinEqualityFor(join.on, join.left.alias, join.right.alias);
+
+  if (equality === undefined) {
+    return {
+      kind: 'unsupported',
+      reason: 'incremental join support is limited to equality between one left base field and one right base field'
+    };
+  }
+
+  const transforms = incrementalJoinTransformsFor(operations);
+
+  if (transforms.kind === 'unsupported') {
+    return transforms;
+  }
+
+  return {
+    kind: 'supported',
+    plan: {
+      kind: 'join',
+      left: {
+        relation: leftRelation,
+        relationName: join.left.relation,
+        alias: join.left.alias,
+        field: equality.leftField
+      },
+      right: {
+        relation: rightRelation,
+        relationName: join.right.relation,
+        alias: join.right.alias,
+        field: equality.rightField
+      },
+      transforms: transforms.transforms
+    }
+  };
+}
+
+function incrementalJoinTransformsFor(operations: readonly QueryData[]): {
+  readonly kind: 'supported';
+  readonly transforms: readonly IncrementalTransform[];
+} | {
+  readonly kind: 'unsupported';
+  readonly reason: string;
+} {
+  const transforms: IncrementalTransform[] = [];
+  let hasProject = false;
+
+  for (const operation of [...operations].reverse()) {
+    switch (operation.op) {
+      case 'select':
+        if (hasProject) {
+          return { kind: 'unsupported', reason: 'only one post-join project/select step is supported' };
+        }
+
+        if (!isSupportedProjection(operation.projection)) {
+          return { kind: 'unsupported', reason: 'post-join project is limited to field, literal, and tuple expressions' };
+        }
+
+        hasProject = true;
+        transforms.push({ op: 'select', projection: operation.projection });
+        continue;
+      case 'extend':
+        if (!isSupportedProjection(operation.projection)) {
+          return { kind: 'unsupported', reason: 'post-join extend is limited to field, literal, and tuple expressions' };
+        }
+
+        transforms.push({ op: 'extend', projection: operation.projection });
+        continue;
+      case 'without':
+        transforms.push({ op: 'without', fields: operation.fields });
+        continue;
+      case 'rename':
+        transforms.push({ op: 'rename', fields: operation.fields });
+        continue;
+      case 'qualify':
+        transforms.push({ op: 'qualify', alias: operation.alias });
+        continue;
+      default:
+        return { kind: 'unsupported', reason: `operator ${operation.op} is outside the incremental join output subset` };
+    }
+  }
+
+  return { kind: 'supported', transforms };
 }
 
 function incrementalRowPlanFor(
@@ -1568,6 +1925,26 @@ function isSupportedHash(data: Extract<QueryData, { readonly op: 'hash' }>, alia
     expression.alias === alias;
 }
 
+function incrementalJoinEqualityFor(
+  predicate: PredicateData,
+  leftAlias: string,
+  rightAlias: string
+): { readonly leftField: string; readonly rightField: string } | undefined {
+  if (predicate.op !== 'eq' || predicate.left.op !== 'field' || predicate.right.op !== 'field') {
+    return undefined;
+  }
+
+  if (predicate.left.alias === leftAlias && predicate.right.alias === rightAlias) {
+    return { leftField: predicate.left.field, rightField: predicate.right.field };
+  }
+
+  if (predicate.left.alias === rightAlias && predicate.right.alias === leftAlias) {
+    return { leftField: predicate.right.field, rightField: predicate.left.field };
+  }
+
+  return undefined;
+}
+
 function incrementalPredicateFor(predicate: PredicateData, alias: string): IncrementalPredicate | undefined {
   switch (predicate.op) {
     case 'eq':
@@ -1715,15 +2092,21 @@ function isSupportedIncrementalExpr(expr: ExprData): boolean {
   }
 }
 
-function applyIncrementalDeltas(
+async function applyIncrementalDeltas(
   previousRows: readonly unknown[],
   plan: IncrementalMaterializationPlan,
   deltas: readonly RelationDelta[],
-  env: EvaluateOptions['env']
-): IncrementalDeltaRowsResult {
-  return plan.kind === 'aggregate'
-    ? applyIncrementalAggregateDeltas(previousRows, plan, deltas, env)
-    : applyIncrementalRowDeltas(previousRows, plan, deltas, env);
+  env: EvaluateOptions['env'],
+  source: RelationSource
+): Promise<IncrementalDeltaRowsResult> {
+  switch (plan.kind) {
+    case 'aggregate':
+      return applyIncrementalAggregateDeltas(previousRows, plan, deltas, env);
+    case 'join':
+      return applyIncrementalJoinDeltas(previousRows, plan, deltas, source);
+    case 'rows':
+      return applyIncrementalRowDeltas(previousRows, plan, deltas, env);
+  }
 }
 
 function applyIncrementalRowDeltas(
@@ -1845,6 +2228,452 @@ function applyIncrementalAggregateDeltas(
   return Object.keys(plan.groupBy).length === 0
     ? applyUngroupedAggregateDeltas(previousGroups.groups, plan, removedChanges, addedChanges)
     : applyGroupedAggregateDeltas(previousGroups, plan, removedChanges, addedChanges);
+}
+
+async function applyIncrementalJoinDeltas(
+  previousRows: readonly unknown[],
+  plan: IncrementalJoinMaterializationPlan,
+  deltas: readonly RelationDelta[],
+  source: RelationSource
+): Promise<IncrementalDeltaRowsResult> {
+  const deltaState = incrementalJoinDeltaStateFor(plan, deltas);
+
+  if (deltaState.kind === 'fallback') {
+    return deltaState;
+  }
+
+  if (!incrementalJoinDeltaStateHasChanges(deltaState)) {
+    return { kind: 'applied', rows: Object.freeze([...previousRows]) };
+  }
+
+  const snapshotState = incrementalJoinSnapshotStateFor(previousRows, plan);
+
+  if (snapshotState.kind === 'fallback') {
+    return snapshotState;
+  }
+
+  const currentState = await incrementalJoinCurrentStateFor(source, plan);
+
+  if (currentState.kind === 'fallback') {
+    return currentState;
+  }
+
+  if (plan.transforms.length > 0) {
+    return {
+      kind: 'applied',
+      rows: Object.freeze(incrementalJoinOutputRows(currentState, plan))
+    };
+  }
+
+  const affectedPairKeys = new Set<string>();
+  const currentAffectedRows = new Map<string, Record<string, unknown>>();
+
+  for (const key of incrementalJoinChangedKeys(deltaState.left)) {
+    addIncrementalJoinSnapshotPairKeys(affectedPairKeys, snapshotState.pairKeysByLeftKey, key);
+    addCurrentIncrementalJoinRowsForLeftKey(currentAffectedRows, currentState, plan, key);
+  }
+
+  for (const key of incrementalJoinChangedKeys(deltaState.right)) {
+    addIncrementalJoinSnapshotPairKeys(affectedPairKeys, snapshotState.pairKeysByRightKey, key);
+    addCurrentIncrementalJoinRowsForRightKey(currentAffectedRows, currentState, plan, key);
+  }
+
+  const rowsByPairKey = new Map(snapshotState.rowsByPairKey);
+
+  for (const pairKey of affectedPairKeys) {
+    rowsByPairKey.delete(pairKey);
+  }
+
+  for (const [pairKey, row] of currentAffectedRows) {
+    rowsByPairKey.set(pairKey, row);
+  }
+
+  const currentOrder = new Set(currentState.order);
+  const rows: unknown[] = [];
+
+  for (const pairKey of currentState.order) {
+    const row = rowsByPairKey.get(pairKey);
+
+    if (row === undefined) {
+      return {
+        kind: 'fallback',
+        reason: 'cached join snapshot is missing an unaffected joined row'
+      };
+    }
+
+    rows.push(row);
+  }
+
+  for (const pairKey of rowsByPairKey.keys()) {
+    if (!currentOrder.has(pairKey)) {
+      return {
+        kind: 'fallback',
+        reason: 'cached join snapshot contains a joined row that is not present in the current source rows'
+      };
+    }
+  }
+
+  return { kind: 'applied', rows: Object.freeze(rows) };
+}
+
+type IncrementalJoinDeltaStateResult =
+  | IncrementalJoinDeltaState
+  | { readonly kind: 'fallback'; readonly reason: string };
+
+function incrementalJoinDeltaStateFor(
+  plan: IncrementalJoinMaterializationPlan,
+  deltas: readonly RelationDelta[]
+): IncrementalJoinDeltaStateResult {
+  const state = {
+    kind: 'state' as const,
+    left: { removed: new Map<string, unknown>(), added: new Map<string, unknown>() },
+    right: { removed: new Map<string, unknown>(), added: new Map<string, unknown>() }
+  };
+
+  for (const delta of deltas) {
+    if (delta.relation.name === plan.left.relationName) {
+      const recorded = recordIncrementalJoinSideDeltaRows(state.left, plan.left, delta);
+
+      if (recorded.kind === 'fallback') {
+        return recorded;
+      }
+      continue;
+    }
+
+    if (delta.relation.name === plan.right.relationName) {
+      const recorded = recordIncrementalJoinSideDeltaRows(state.right, plan.right, delta);
+
+      if (recorded.kind === 'fallback') {
+        return recorded;
+      }
+    }
+  }
+
+  return state;
+}
+
+function recordIncrementalJoinSideDeltaRows(
+  state: { readonly removed: Map<string, unknown>; readonly added: Map<string, unknown> },
+  side: IncrementalJoinSidePlan,
+  delta: RelationDelta
+): IncrementalDeltaRecordResult {
+  const removed = recordIncrementalJoinDeltaRows(state.removed, side, delta.removed, 'removed');
+
+  if (removed.kind === 'fallback') {
+    return removed;
+  }
+
+  return recordIncrementalJoinDeltaRows(state.added, side, delta.added, 'added');
+}
+
+function recordIncrementalJoinDeltaRows(
+  changes: Map<string, unknown>,
+  side: IncrementalJoinSidePlan,
+  rows: readonly unknown[],
+  change: 'added' | 'removed'
+): IncrementalDeltaRecordResult {
+  for (const row of rows) {
+    const key = relationRowKey(side.relation, row);
+
+    if (key === undefined) {
+      return {
+        kind: 'fallback',
+        reason: `${change} delta row is missing a usable ${side.relationName} key`
+      };
+    }
+
+    if (changes.has(key)) {
+      return {
+        kind: 'fallback',
+        reason: `delta batch contains multiple ${change} rows for the same ${side.relationName} key`
+      };
+    }
+
+    changes.set(key, row);
+  }
+
+  return { kind: 'recorded' };
+}
+
+function incrementalJoinDeltaStateHasChanges(state: IncrementalJoinDeltaState): boolean {
+  return state.left.removed.size > 0 ||
+    state.left.added.size > 0 ||
+    state.right.removed.size > 0 ||
+    state.right.added.size > 0;
+}
+
+function incrementalJoinChangedKeys(state: IncrementalJoinDeltaSet): ReadonlySet<string> {
+  return new Set([...state.removed.keys(), ...state.added.keys()]);
+}
+
+function incrementalJoinSnapshotStateFor(
+  rows: readonly unknown[],
+  plan: IncrementalJoinMaterializationPlan
+): IncrementalJoinSnapshotState {
+  const rowsByPairKey = new Map<string, Record<string, unknown>>();
+  const pairKeysByLeftKey = new Map<string, Set<string>>();
+  const pairKeysByRightKey = new Map<string, Set<string>>();
+
+  for (const [index, row] of rows.entries()) {
+    if (!isRecord(row)) {
+      return { kind: 'fallback', reason: `cached join row ${index} is not an object` };
+    }
+
+    const leftRow = row[plan.left.alias];
+    const rightRow = row[plan.right.alias];
+
+    if (!isRecord(leftRow) || !isRecord(rightRow)) {
+      return {
+        kind: 'fallback',
+        reason: `cached join row ${index} does not contain raw ${plan.left.alias}/${plan.right.alias} relation rows`
+      };
+    }
+
+    const leftKey = relationRowKey(plan.left.relation, leftRow);
+    const rightKey = relationRowKey(plan.right.relation, rightRow);
+
+    if (leftKey === undefined || rightKey === undefined) {
+      return { kind: 'fallback', reason: `cached join row ${index} is missing a usable relation key` };
+    }
+
+    const pairKey = incrementalJoinPairKey(leftKey, rightKey);
+
+    if (rowsByPairKey.has(pairKey)) {
+      return { kind: 'fallback', reason: 'cached join snapshot contains duplicate relation-key pairs' };
+    }
+
+    rowsByPairKey.set(pairKey, row);
+    addIncrementalJoinPairKey(pairKeysByLeftKey, leftKey, pairKey);
+    addIncrementalJoinPairKey(pairKeysByRightKey, rightKey, pairKey);
+  }
+
+  return {
+    kind: 'state',
+    rowsByPairKey,
+    pairKeysByLeftKey,
+    pairKeysByRightKey
+  };
+}
+
+async function incrementalJoinCurrentStateFor(
+  source: RelationSource,
+  plan: IncrementalJoinMaterializationPlan
+): Promise<IncrementalJoinCurrentState> {
+  const leftRows = await incrementalJoinCurrentRowsForSide(source, plan.left);
+
+  if (leftRows.kind === 'fallback') {
+    return leftRows;
+  }
+
+  const rightRows = await incrementalJoinCurrentRowsForSide(source, plan.right);
+
+  if (rightRows.kind === 'fallback') {
+    return rightRows;
+  }
+
+  const leftByKey = incrementalJoinRowsByKey(leftRows.rows);
+  const rightByKey = incrementalJoinRowsByKey(rightRows.rows);
+  const leftByJoin = incrementalJoinRowsByJoin(leftRows.rows);
+  const rightByJoin = incrementalJoinRowsByJoin(rightRows.rows);
+  const order: string[] = [];
+
+  for (const left of leftRows.rows) {
+    for (const right of rightByJoin.get(left.joinValue) ?? []) {
+      order.push(incrementalJoinPairKey(left.key, right.key));
+    }
+  }
+
+  return {
+    kind: 'state',
+    leftRows: leftRows.rows,
+    rightRows: rightRows.rows,
+    leftByKey,
+    rightByKey,
+    leftByJoin,
+    rightByJoin,
+    order
+  };
+}
+
+async function incrementalJoinCurrentRowsForSide(
+  source: RelationSource,
+  side: IncrementalJoinSidePlan
+): Promise<
+  | { readonly kind: 'rows'; readonly rows: readonly IncrementalJoinRowState[] }
+  | { readonly kind: 'fallback'; readonly reason: string }
+> {
+  let sourceRows: readonly unknown[];
+
+  try {
+    sourceRows = Array.from(await source.rows(side.relation));
+  } catch {
+    return { kind: 'fallback', reason: `current ${side.relationName} rows could not be read` };
+  }
+
+  const rows: IncrementalJoinRowState[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const [index, row] of sourceRows.entries()) {
+    if (!isRecord(row)) {
+      return { kind: 'fallback', reason: `current ${side.relationName} row ${index} is not an object` };
+    }
+
+    const key = relationRowKey(side.relation, row);
+
+    if (key === undefined) {
+      return { kind: 'fallback', reason: `current ${side.relationName} row ${index} is missing a usable key` };
+    }
+
+    if (seenKeys.has(key)) {
+      return { kind: 'fallback', reason: `current ${side.relationName} rows contain duplicate relation keys` };
+    }
+
+    seenKeys.add(key);
+    rows.push({ key, row, joinValue: row[side.field] });
+  }
+
+  return { kind: 'rows', rows };
+}
+
+function incrementalJoinRowsByKey(
+  rows: readonly IncrementalJoinRowState[]
+): ReadonlyMap<string, IncrementalJoinRowState> {
+  const byKey = new Map<string, IncrementalJoinRowState>();
+
+  for (const row of rows) {
+    byKey.set(row.key, row);
+  }
+
+  return byKey;
+}
+
+function incrementalJoinRowsByJoin(
+  rows: readonly IncrementalJoinRowState[]
+): ReadonlyMap<unknown, readonly IncrementalJoinRowState[]> {
+  const byJoin = new Map<unknown, IncrementalJoinRowState[]>();
+
+  for (const row of rows) {
+    const bucket = byJoin.get(row.joinValue);
+
+    if (bucket === undefined) {
+      byJoin.set(row.joinValue, [row]);
+    } else {
+      bucket.push(row);
+    }
+  }
+
+  return byJoin;
+}
+
+function addCurrentIncrementalJoinRowsForLeftKey(
+  rowsByPairKey: Map<string, Record<string, unknown>>,
+  state: Extract<IncrementalJoinCurrentState, { readonly kind: 'state' }>,
+  plan: IncrementalJoinMaterializationPlan,
+  leftKey: string
+): void {
+  const left = state.leftByKey.get(leftKey);
+
+  if (left === undefined) {
+    return;
+  }
+
+  for (const right of state.rightByJoin.get(left.joinValue) ?? []) {
+    rowsByPairKey.set(
+      incrementalJoinPairKey(left.key, right.key),
+      incrementalJoinOutputRow(plan, left.row, right.row)
+    );
+  }
+}
+
+function incrementalJoinOutputRows(
+  state: Extract<IncrementalJoinCurrentState, { readonly kind: 'state' }>,
+  plan: IncrementalJoinMaterializationPlan
+): unknown[] {
+  const rows: unknown[] = [];
+
+  for (const left of state.leftRows) {
+    for (const right of state.rightByJoin.get(left.joinValue) ?? []) {
+      rows.push(applyIncrementalJoinTransforms(
+        incrementalJoinOutputRow(plan, left.row, right.row),
+        plan.transforms
+      ));
+    }
+  }
+
+  return rows;
+}
+
+function applyIncrementalJoinTransforms(
+  row: Record<string, unknown>,
+  transforms: readonly IncrementalTransform[]
+): Record<string, unknown> {
+  let output = row;
+
+  for (const transform of transforms) {
+    output = applyIncrementalTransform(output, transform);
+  }
+
+  return output;
+}
+
+function addCurrentIncrementalJoinRowsForRightKey(
+  rowsByPairKey: Map<string, Record<string, unknown>>,
+  state: Extract<IncrementalJoinCurrentState, { readonly kind: 'state' }>,
+  plan: IncrementalJoinMaterializationPlan,
+  rightKey: string
+): void {
+  const right = state.rightByKey.get(rightKey);
+
+  if (right === undefined) {
+    return;
+  }
+
+  for (const left of state.leftByJoin.get(right.joinValue) ?? []) {
+    rowsByPairKey.set(
+      incrementalJoinPairKey(left.key, right.key),
+      incrementalJoinOutputRow(plan, left.row, right.row)
+    );
+  }
+}
+
+function addIncrementalJoinSnapshotPairKeys(
+  target: Set<string>,
+  pairKeysByRelationKey: ReadonlyMap<string, ReadonlySet<string>>,
+  relationKey: string
+): void {
+  for (const pairKey of pairKeysByRelationKey.get(relationKey) ?? []) {
+    target.add(pairKey);
+  }
+}
+
+function addIncrementalJoinPairKey(
+  target: Map<string, Set<string>>,
+  relationKey: string,
+  pairKey: string
+): void {
+  const existing = target.get(relationKey);
+
+  if (existing === undefined) {
+    target.set(relationKey, new Set([pairKey]));
+    return;
+  }
+
+  existing.add(pairKey);
+}
+
+function incrementalJoinOutputRow(
+  plan: IncrementalJoinMaterializationPlan,
+  leftRow: Record<string, unknown>,
+  rightRow: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    [plan.left.alias]: leftRow,
+    [plan.right.alias]: rightRow
+  };
+}
+
+function incrementalJoinPairKey(leftKey: string, rightKey: string): string {
+  return stableRowKey([leftKey, rightKey]);
 }
 
 function applyUngroupedAggregateDeltas(
@@ -2913,6 +3742,52 @@ function incrementalFallbackMaterializationDiagnostic(
       id: metadata.id,
       queryKey: metadata.queryKey,
       reason
+    }
+  };
+}
+
+function missingMaterializationRowsDiagnostic(metadata: MaterializationMetadata): MaterializationDiagnostic {
+  return {
+    code: 'materialization_rows_missing',
+    message: 'materialization metadata exists but cached snapshot rows are unavailable',
+    surface: 'materialization',
+    detail: { id: metadata.id, queryKey: metadata.queryKey }
+  };
+}
+
+function staleMaterializationDiagnostic(
+  metadata: MaterializationMetadata,
+  sourceVersion: unknown,
+  metadataSourceVersion: unknown
+): MaterializationDiagnostic {
+  return {
+    code: 'materialization_stale',
+    message: 'cached materialization source version does not match the current source version',
+    surface: 'materialization',
+    detail: {
+      id: metadata.id,
+      queryKey: metadata.queryKey,
+      sourceVersion,
+      metadataSourceVersion
+    }
+  };
+}
+
+function unknownMaterializationVersionDiagnostic(
+  metadata: MaterializationMetadata,
+  reason: string,
+  sourceVersion?: unknown
+): MaterializationDiagnostic {
+  return {
+    code: 'materialization_version_unknown',
+    message: `materialization source version could not be verified: ${reason}`,
+    surface: 'materialization',
+    detail: {
+      id: metadata.id,
+      queryKey: metadata.queryKey,
+      reason,
+      ...(sourceVersion === undefined ? {} : { sourceVersion }),
+      ...(metadata.sourceVersion === undefined ? {} : { metadataSourceVersion: metadata.sourceVersion })
     }
   };
 }

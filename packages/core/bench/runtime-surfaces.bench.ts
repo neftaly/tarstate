@@ -7,13 +7,15 @@ import {
   tryTransactConstrained,
   unique
 } from '@tarstate/core/constraints';
-import { createDb, tryTransact } from '@tarstate/core/db';
+import { createDb, tryTransact, type Db } from '@tarstate/core/db';
 import {
   maintainMaterializationSnapshots,
+  type MaterializationMaintenanceOptions,
+  type MaterializationMaintenanceResult,
   materializeSnapshot,
   refreshMaterializationSnapshot
 } from '@tarstate/core/materialization';
-import { aggregate, as, count, from, gt, max, min, pipe, project, sum, where } from '@tarstate/core/query';
+import { aggregate, as, count, eq, from, gt, join, keyBy, max, min, pipe, project, sum, where } from '@tarstate/core/query';
 import { trackTransact } from '@tarstate/core/runtime';
 import { defineSchema, idField, numberField, refField, relation, stringField } from '@tarstate/core/schema';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
@@ -76,6 +78,7 @@ const changedTodos = [
 ];
 
 const todo = as(schema.todos, 'todo');
+const assignment = as(schema.assignments, 'assignment');
 const highRankTodos = pipe(
   from(todo),
   where(gt(todo.rank, 500)),
@@ -85,6 +88,8 @@ const highRankTodos = pipe(
     rank: todo.rank
   })
 );
+const keyedHighRankTodos = pipe(highRankTodos, keyBy('id'));
+const todoAssignments = join(from(assignment), eq(todo.id, assignment.todoId))(from(todo));
 const highRankSummary = pipe(
   from(todo),
   where(gt(todo.rank, 500)),
@@ -108,6 +113,57 @@ const constraints = [
 const checkConstraints = [check(from(todo), gt(todo.rank, -1))];
 const todoWriter = write(schema.todos);
 const assignmentWriter = write(schema.assignments);
+const isolatedEqualityJoinMaintenanceIterations = 50;
+const isolatedEqualityJoinMaintenanceWarmupIterations = 5;
+
+type EqualityJoinMaintenanceState = {
+  readonly previous: Db;
+  readonly next: Db;
+  readonly options: MaterializationMaintenanceOptions;
+};
+
+async function prepareEqualityJoinMaintenanceState(): Promise<EqualityJoinMaintenanceState> {
+  const previous = createDb({ todos, assignments });
+
+  await materializeSnapshot(previous, todoAssignments, { id: 'todo-assignments', mode: 'incremental' });
+  const transaction = tryTransact(previous, [
+    assignmentWriter.update('assignment-750', { assignee: 'Ari' })
+  ]);
+
+  if (transaction.diagnostics.length > 0) {
+    throw new Error(`equality join maintenance transaction produced ${transaction.diagnostics.length} diagnostic(s)`);
+  }
+
+  return {
+    previous,
+    next: transaction.db,
+    options: { deltas: transaction.deltas }
+  };
+}
+
+async function prepareEqualityJoinMaintenanceStates(count: number): Promise<readonly EqualityJoinMaintenanceState[]> {
+  const states: EqualityJoinMaintenanceState[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    states.push(await prepareEqualityJoinMaintenanceState());
+  }
+
+  return states;
+}
+
+function assertIncrementalEqualityJoinMaintenanceResults(
+  results: readonly MaterializationMaintenanceResult[]
+): void {
+  for (const [index, result] of results.entries()) {
+    if (result.maintained !== 1 || result.recomputed !== 0 || result.diagnostics.length > 0) {
+      throw new Error(
+        `equality join maintenance sample ${index} did not stay incremental: ` +
+        `${result.maintained} maintained, ${result.recomputed} recomputed, ` +
+        `${result.diagnostics.length} diagnostic(s)`
+      );
+    }
+  }
+}
 
 describe('runtime surfaces', () => {
   bench('validate req + unique + fk over 1k rows', async () => {
@@ -152,8 +208,57 @@ describe('runtime surfaces', () => {
     await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
   });
 
+  bench('incremental equality join materialize + maintain over 1k rows', async () => {
+    const db = createDb({ todos, assignments });
+
+    await materializeSnapshot(db, todoAssignments, { id: 'todo-assignments', mode: 'incremental' });
+    const transaction = tryTransact(db, [
+      assignmentWriter.update('assignment-750', { assignee: 'Ari' })
+    ]);
+    await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+  });
+
+  {
+    let stateIndex = 0;
+    let states: readonly EqualityJoinMaintenanceState[] = [];
+    let results: MaterializationMaintenanceResult[] = [];
+
+    bench('incremental equality join maintenance after setup over 1k rows', async () => {
+      const state = states[stateIndex];
+
+      stateIndex += 1;
+      if (state === undefined) {
+        throw new Error('missing prepared equality join maintenance state');
+      }
+
+      results.push(await maintainMaterializationSnapshots(state.previous, state.next, state.options));
+    }, {
+      iterations: isolatedEqualityJoinMaintenanceIterations,
+      time: 0,
+      warmupIterations: isolatedEqualityJoinMaintenanceWarmupIterations,
+      warmupTime: 0,
+      setup: async (_task, mode) => {
+        const iterations = mode === 'run'
+          ? isolatedEqualityJoinMaintenanceIterations
+          : isolatedEqualityJoinMaintenanceWarmupIterations;
+
+        stateIndex = 0;
+        results = [];
+        // Tinybench probes the task once before collecting samples to detect async functions.
+        states = await prepareEqualityJoinMaintenanceStates(iterations + 1);
+      },
+      teardown: () => {
+        assertIncrementalEqualityJoinMaintenanceResults(results);
+      }
+    });
+  }
+
   bench('query diff over changed 1k rows', async () => {
     await diffQuery(source, changedSource, highRankTodos);
+  });
+
+  bench('keyed query diff over changed 1k rows', async () => {
+    await diffQuery(source, changedSource, keyedHighRankTodos);
   });
 
   bench('manual watch refresh over changed 1k rows', async () => {
@@ -194,6 +299,19 @@ describe('runtime surfaces', () => {
 
     await trackTransact(db, (current) =>
       tryTransact(current, [todoWriter.insert({ id: 'todo-extra', text: 'Extra todo', rank: 1_001 })])
+    );
+    handle.unwatch();
+  });
+
+  bench('track direct relation transaction using deltas over 1k rows', async () => {
+    const db = createDb({ todos, assignments });
+    const handle = watch(db, schema.todos, () => undefined);
+
+    await trackTransact(db, (current) =>
+      tryTransact(current, [
+        todoWriter.update('todo-750', { text: 'Todo 750 updated' }),
+        todoWriter.delete('todo-751')
+      ])
     );
     handle.unwatch();
   });

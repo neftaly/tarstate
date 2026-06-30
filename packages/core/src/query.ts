@@ -94,6 +94,7 @@ export type QueryData =
   | { readonly op: 'where'; readonly input: QueryData; readonly predicate: PredicateData }
   | { readonly op: 'hash'; readonly input: QueryData; readonly expressions: readonly ExprData[] }
   | { readonly op: 'btree'; readonly input: QueryData; readonly expressions: readonly ExprData[] }
+  | { readonly op: 'keyBy'; readonly input: QueryData; readonly fields: readonly string[] }
   | {
       readonly op: 'join';
       readonly kind: 'inner' | 'left';
@@ -223,6 +224,12 @@ export function relationDependencies(input: QueryKeyInput): readonly string[] {
 /** Alias for `relationDependencies`, matching Relic-style naming. */
 export const dependencies = relationDependencies;
 
+/** Return declared output row key fields, when a query owns result-row identity metadata. */
+export function queryRowKeyFields(input: QueryKeyInput): readonly string[] | undefined {
+  const data = isQuery(input) ? input.data : input;
+  return rowKeyFieldsForData(data);
+}
+
 /** Alias a relation and expose typed field refs. */
 export function as<Row extends Record<string, unknown>, Alias extends string>(
   relationRef: RelationRef<Row>,
@@ -290,20 +297,33 @@ export function btree(...expressions: readonly ExprInput[]): <Ctx>(query: Query<
   return indexDeclaration('btree', expressions);
 }
 
+/** Declare stable output row identity using one or more fields from the final row. */
+export function keyBy<Field extends string, const Rest extends readonly string[]>(
+  field: Field,
+  ...rest: Rest
+): <Ctx extends Record<Field | Rest[number], unknown>>(query: Query<Ctx>) => Query<Ctx> {
+  const fields = [field, ...rest];
+
+  return (query) => ({
+    ...query,
+    data: { op: 'keyBy', input: query.data, fields }
+  });
+}
+
 /** Inner join another query by predicate. */
-export function join<Left, Right>(
+export function join<Right>(
   right: Query<Right>,
   predicate: PredicateData
-): (left: Query<Left>) => Query<Left & Right> {
+): <Left>(left: Query<Left>) => Query<Left & Right> {
   return joinQuery('inner', right, predicate);
 }
 
 /** Left join another query, preserving unmatched left rows. */
-export function leftJoin<Left, Right>(
+export function leftJoin<Right>(
   right: Query<Right>,
   predicate: PredicateData
-): (left: Query<Left>) => Query<Left & Partial<Right>> {
-  return joinQuery('left', right, predicate) as (left: Query<Left>) => Query<Left & Partial<Right>>;
+): <Left>(left: Query<Left>) => Query<Left & Partial<Right>> {
+  return joinQuery('left', right, predicate) as <Left>(left: Query<Left>) => Query<Left & Partial<Right>>;
 }
 
 /** Select result fields from expressions. */
@@ -687,6 +707,9 @@ function collectDependencies(data: QueryData, names: Set<string>): void {
       collectDependencies(data.input, names);
       collectPredicateDependencies(data.predicate, names);
       return;
+    case 'keyBy':
+      collectDependencies(data.input, names);
+      return;
     case 'hash':
     case 'btree':
       collectDependencies(data.input, names);
@@ -737,6 +760,54 @@ function collectDependencies(data: QueryData, names: Set<string>): void {
       collectDependencies(data.right, names);
       return;
   }
+}
+
+function rowKeyFieldsForData(data: QueryData): readonly string[] | undefined {
+  switch (data.op) {
+    case 'keyBy':
+      return data.fields;
+    case 'where':
+    case 'hash':
+    case 'btree':
+    case 'extend':
+    case 'expand':
+    case 'sort':
+    case 'limit':
+    case 'sortLimit':
+      return rowKeyFieldsForData(data.input);
+    case 'select':
+      return projectedRowKeyFields(rowKeyFieldsForData(data.input), data.projection);
+    case 'without':
+      return retainedRowKeyFields(rowKeyFieldsForData(data.input), data.fields);
+    case 'rename':
+      return renamedRowKeyFields(rowKeyFieldsForData(data.input), data.fields);
+    case 'qualify':
+    case 'aggregate':
+      return undefined;
+    default:
+      return undefined;
+  }
+}
+
+function projectedRowKeyFields(
+  fields: readonly string[] | undefined,
+  projection: ProjectionData
+): readonly string[] | undefined {
+  return fields !== undefined && fields.every((field) => Object.hasOwn(projection, field)) ? fields : undefined;
+}
+
+function retainedRowKeyFields(
+  fields: readonly string[] | undefined,
+  omittedFields: readonly string[]
+): readonly string[] | undefined {
+  return fields !== undefined && fields.every((field) => !omittedFields.includes(field)) ? fields : undefined;
+}
+
+function renamedRowKeyFields(
+  fields: readonly string[] | undefined,
+  renames: Record<string, string>
+): readonly string[] | undefined {
+  return fields?.map((field) => renames[field] ?? field);
 }
 
 function collectPredicateDependencies(predicate: PredicateData, names: Set<string>): void {

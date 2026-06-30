@@ -28,7 +28,7 @@ The core API is moving toward a Relic-shaped split:
 - `write` defines the typed mutation vocabulary, including `deleteExact` and
   `replaceAll` alongside insert/update/upsert/delete patches.
 - `delta` and `diff` are the change primitives: relation-level change batches
-  and structural row diffs.
+  and structural/keyed row diffs.
 - `db` gives those programs a small object-backed `q`/`qMany`/`transact`
   runtime for examples, tests, and local state.
 - `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
@@ -36,12 +36,14 @@ The core API is moving toward a Relic-shaped split:
 - `constraints`, `materialization`, `watch`, and `runtime` expose the next API
   surfaces with baseline validation, explicit object-backed constraint
   enforcement, committed relation deltas, snapshot maintenance with a narrow
-  single-relation incremental subset, supported `count()`, `sum(expr)`,
-  `min(expr)`, and `max(expr)` aggregate maintenance, manual/recompute-backed
-  watch refresh with callback fan-out from real refresh/tracked-change events,
+  exact materialized-query read path, a narrow single-relation incremental subset, simple raw inner equality join
+  maintenance, supported `count()`, `sum(expr)`, `min(expr)`, and `max(expr)`
+  aggregate maintenance, manual/recompute-backed watch refresh with callback
+  fan-out from real refresh/tracked-change events,
   host-driven `watchRuntime` refresh for `RelationRuntime.subscribe`, generic
   `trackRuntimeCommit` orchestration for patch targets, coarse
-  dependency-filtered recomputation, and explicit fallback diagnostics;
+  dependency-filtered recomputation, delta-backed direct relation watch
+  `rowChanges`, and explicit fallback diagnostics;
   schema-attached or adapter-backed enforcement, general operator-maintained
   views/indexes, adapter-fed relation deltas for host invalidations, and async
   watch streams are outside the current public guarantees. Host-driven

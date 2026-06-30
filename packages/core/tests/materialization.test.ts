@@ -14,6 +14,7 @@ import {
   materializedRowsForQuery,
   materializedSourceFor,
   materializeSnapshot,
+  readMaterializedQuery,
   refreshMaterializationSnapshot,
   snapshotHashIndex,
   snapshotIndex
@@ -33,6 +34,9 @@ import {
   gt,
   gte,
   hash,
+  join,
+  keyBy,
+  leftJoin,
   lt,
   lte,
   max,
@@ -80,6 +84,18 @@ type WorkItem = {
   readonly bucket: string;
   readonly units: number;
   readonly bonus: number;
+};
+
+type TaskWorkItemJoinRow = {
+  readonly task: Task;
+  readonly workItem: WorkItem;
+};
+
+type TaskWorkItemSummaryRow = {
+  readonly taskId: string;
+  readonly workItemId: string;
+  readonly units: number;
+  readonly statusPair: readonly [string, string];
 };
 
 const schema = defineSchema({
@@ -213,6 +229,20 @@ const openTaskExtendedLabels = pipe(
     label: rootLabel,
     statusLabel: rootStatusLabel,
     summary: rootSummary
+  })
+);
+const taskWorkItemStatusRows: Query<TaskWorkItemJoinRow> = join(
+  from(workItem),
+  eq(task.status, workItem.status)
+)(from(task));
+const keyedTaskWorkItemStatusRows = keyBy('task', 'workItem')(taskWorkItemStatusRows);
+const taskWorkItemSummaryRows: Query<TaskWorkItemSummaryRow> = pipe(
+  taskWorkItemStatusRows,
+  project({
+    taskId: task.id,
+    workItemId: workItem.id,
+    units: workItem.units,
+    statusPair: tuple(task.status, workItem.status)
   })
 );
 const baseTaskRows: readonly Task[] = [
@@ -699,6 +729,166 @@ describe('tarstate materialization', () => {
     expect(materializedRowsForQuery(db, todoRows)).toBeUndefined();
   });
 
+  it('reads exact materialized query results from cached snapshot rows', async () => {
+    const db = createDb({
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk' },
+        { id: 'todo-b', text: 'Water basil' }
+      ]
+    });
+
+    await materializeSnapshot(db, todoRows, { id: 'todos-view' });
+
+    const result = await readMaterializedQuery<TodoRow>(db, todoRows);
+
+    expect(result).toEqual({
+      kind: 'materializedQueryResult',
+      id: 'todos-view',
+      queryKey: queryKey(todoRows),
+      sourceVersion: db.data,
+      materialized: true,
+      rows: [
+        { id: 'todo-a', text: 'Buy oat milk' },
+        { id: 'todo-b', text: 'Water basil' }
+      ],
+      diagnostics: []
+    });
+    expect(result.rows).toBe(materializedRowsFor<TodoRow>(db, 'todos-view'));
+  });
+
+  it('returns a miss envelope for exact query keys without materialization', async () => {
+    const db = createDb({
+      todos: [{ id: 'todo-a', text: 'Buy oat milk' }]
+    });
+
+    const result = await readMaterializedQuery<TodoRow>(db, todoRows);
+
+    expect(result).toMatchObject({
+      kind: 'materializedQueryResult',
+      queryKey: queryKey(todoRows),
+      materialized: false,
+      rows: [],
+      diagnostics: [
+        {
+          code: 'materialization_missing',
+          surface: 'materialization'
+        }
+      ]
+    });
+    expect(result).not.toHaveProperty('id');
+    expect(result).not.toHaveProperty('sourceVersion');
+  });
+
+  it('diagnoses materialization metadata without cached rows', async () => {
+    const db = createDb({
+      todos: [{ id: 'todo-a', text: 'Buy oat milk' }]
+    });
+
+    await materializeSnapshot(db, todoRows, { id: 'todos-view' });
+    const metadata = materializationForQuery(db, todoRows);
+
+    if (metadata === undefined) {
+      throw new Error('expected snapshot metadata');
+    }
+
+    (metadata as { id: string }).id = 'todos-view-missing-cache';
+
+    const result = await readMaterializedQuery<TodoRow>(db, todoRows);
+
+    expect(result).toMatchObject({
+      kind: 'materializedQueryResult',
+      id: 'todos-view-missing-cache',
+      queryKey: queryKey(todoRows),
+      materialized: false,
+      rows: [],
+      diagnostics: [
+        {
+          code: 'materialization_rows_missing',
+          surface: 'materialization',
+          detail: { id: 'todos-view-missing-cache', queryKey: queryKey(todoRows) }
+        }
+      ]
+    });
+    expect(result.sourceVersion).toBe(db.data);
+  });
+
+  it('diagnoses stale materialized query source versions', async () => {
+    const rows: readonly Todo[] = [{ id: 'todo-a', text: 'Buy oat milk' }];
+    let version = 'v1';
+    const source: RelationSource = {
+      rows: (relationRef) => relationRef.name === 'todos' ? rows : [],
+      version: () => version
+    };
+
+    await materializeSnapshot(source, todoRows, { id: 'todos-source-view' });
+    version = 'v2';
+
+    const result = await readMaterializedQuery<TodoRow>(source, todoRows);
+
+    expect(result).toMatchObject({
+      kind: 'materializedQueryResult',
+      id: 'todos-source-view',
+      queryKey: queryKey(todoRows),
+      sourceVersion: 'v1',
+      materialized: false,
+      rows: [],
+      diagnostics: [
+        {
+          code: 'materialization_stale',
+          surface: 'materialization',
+          detail: {
+            id: 'todos-source-view',
+            queryKey: queryKey(todoRows),
+            sourceVersion: 'v2',
+            metadataSourceVersion: 'v1'
+          }
+        }
+      ]
+    });
+  });
+
+  it('matches keyBy-wrapped materialized queries only by exact structural query key', async () => {
+    const db = createDb({
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk' },
+        { id: 'todo-b', text: 'Water basil' }
+      ]
+    });
+    const keyedTodoRows = keyBy('id')(todoRows);
+
+    expect(queryKey(keyedTodoRows)).not.toBe(queryKey(todoRows));
+
+    await materializeSnapshot(db, keyedTodoRows, { id: 'keyed-todos-view' });
+
+    await expect(readMaterializedQuery<TodoRow>(db, keyedTodoRows)).resolves.toMatchObject({
+      kind: 'materializedQueryResult',
+      id: 'keyed-todos-view',
+      queryKey: queryKey(keyedTodoRows),
+      materialized: true,
+      rows: [
+        { id: 'todo-a', text: 'Buy oat milk' },
+        { id: 'todo-b', text: 'Water basil' }
+      ],
+      diagnostics: []
+    });
+
+    const unkeyedResult = await readMaterializedQuery<TodoRow>(db, todoRows);
+
+    expect(unkeyedResult).toMatchObject({
+      kind: 'materializedQueryResult',
+      queryKey: queryKey(todoRows),
+      materialized: false,
+      rows: [],
+      diagnostics: [
+        {
+          code: 'materialization_missing',
+          surface: 'materialization'
+        }
+      ]
+    });
+    expect(unkeyedResult).not.toHaveProperty('id');
+  });
+
   it('exposes cached snapshot rows as a read-only relation source', async () => {
     const db = createDb({
       todos: [
@@ -1169,6 +1359,312 @@ describe('tarstate materialization', () => {
     expect(materializedRowsFor(transaction.db, 'todo-a-label')).toEqual([
       { view: { label: 'Alpha' } }
     ]);
+  });
+
+  it('classifies simple inner equality joins as incremental materializations', async () => {
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, taskWorkItemStatusRows, { id: 'task-work-status', mode: 'incremental' });
+
+    expect(materializationForQuery(db, taskWorkItemStatusRows)).toMatchObject({
+      id: 'task-work-status',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      diagnostics: []
+    });
+    expect(materializedRowsFor(db, 'task-work-status')).toEqual((await q(db, taskWorkItemStatusRows)).rows);
+  });
+
+  it('keeps query-owned row identity metadata transparent to incremental materializations', async () => {
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, keyedTaskWorkItemStatusRows, { id: 'keyed-task-work-status', mode: 'incremental' });
+
+    expect(materializationForQuery(db, keyedTaskWorkItemStatusRows)).toMatchObject({
+      id: 'keyed-task-work-status',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      diagnostics: []
+    });
+
+    const transaction = tryTransact(db, [
+      workItems.update('work-a', { units: 9, bonus: 5 })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, keyedTaskWorkItemStatusRows)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'keyed-task-work-status')).toEqual(fullRows);
+  });
+
+  it('incrementally maintains projected equality join outputs', async () => {
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, taskWorkItemSummaryRows, { id: 'task-work-summary', mode: 'incremental' });
+
+    expect(materializationForQuery(db, taskWorkItemSummaryRows)).toMatchObject({
+      id: 'task-work-summary',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      diagnostics: []
+    });
+
+    const transaction = tryTransact(db, [
+      workItems.update('work-a', { units: 9, bonus: 5 })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, taskWorkItemSummaryRows)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'task-work-summary')).toEqual(fullRows);
+    expect(materializedRowsFor<Record<string, unknown>>(transaction.db, 'task-work-summary')).toEqual([
+      { taskId: 'task-a', workItemId: 'work-a', units: 9, statusPair: ['open', 'open'] },
+      { taskId: 'task-a', workItemId: 'work-c', units: 5, statusPair: ['open', 'open'] },
+      { taskId: 'task-b', workItemId: 'work-b', units: 7, statusPair: ['closed', 'closed'] },
+      { taskId: 'task-c', workItemId: 'work-a', units: 9, statusPair: ['open', 'open'] },
+      { taskId: 'task-c', workItemId: 'work-c', units: 5, statusPair: ['open', 'open'] }
+    ]);
+    expect(
+      materializedRowsFor<Record<string, unknown>>(transaction.db, 'task-work-summary')?.some(
+        (row) => Object.hasOwn(row, 'task') || Object.hasOwn(row, 'workItem')
+      )
+    ).toBe(false);
+  });
+
+  it('incrementally maintains simple equality joins when the left side inserts matching rows', async () => {
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, taskWorkItemStatusRows, { id: 'task-work-status', mode: 'incremental' });
+    const transaction = tryTransact(db, [
+      tasks.insert({ id: 'task-d', status: 'closed', priority: 'low', text: 'Delta', note: 'fourth' })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, taskWorkItemStatusRows)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'task-work-status')).toEqual(fullRows);
+    expect(materializationForQuery(transaction.db, taskWorkItemStatusRows)).toMatchObject({
+      id: 'task-work-status',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      diagnostics: []
+    });
+  });
+
+  it('incrementally maintains simple equality joins when the right side changes joined rows', async () => {
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, taskWorkItemStatusRows, { id: 'task-work-status', mode: 'incremental' });
+    const transaction = tryTransact(db, [
+      workItems.update('work-a', { units: 9, bonus: 5 })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, taskWorkItemStatusRows)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'task-work-status')).toEqual(fullRows);
+    const joinedRows = materializedRowsFor<TaskWorkItemJoinRow>(
+      transaction.db,
+      'task-work-status'
+    ) ?? [];
+
+    expect(joinedRows.filter((row) => row.workItem.id === 'work-a').map((row) => row.workItem)).toEqual([
+      expect.objectContaining({ units: 9, bonus: 5 }),
+      expect.objectContaining({ units: 9, bonus: 5 })
+    ]);
+  });
+
+  it('does not emit fake joined rows for non-matching join-side inserts', async () => {
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, taskWorkItemStatusRows, { id: 'task-work-status', mode: 'incremental' });
+    const transaction = tryTransact(db, [
+      workItems.insert({ id: 'work-d', status: 'blocked', bucket: 'gamma', units: 1, bonus: 0 })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, taskWorkItemStatusRows)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'task-work-status')).toEqual(fullRows);
+    const joinedRows = materializedRowsFor<TaskWorkItemJoinRow>(
+      transaction.db,
+      'task-work-status'
+    ) ?? [];
+
+    expect(joinedRows.some((row) => row.workItem.id === 'work-d')).toBe(false);
+  });
+
+  it('falls back with diagnostics when join row removals cannot be proven from cached rows', async () => {
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, taskWorkItemStatusRows, { id: 'task-work-status', mode: 'incremental' });
+    const cachedRows = materializedRowsFor<Record<string, unknown>>(db, 'task-work-status');
+
+    if (cachedRows === undefined || cachedRows[0] === undefined) {
+      throw new Error('expected cached join rows');
+    }
+
+    delete (cachedRows[0] as Record<string, unknown>).workItem;
+
+    const transaction = tryTransact(db, [
+      tasks.delete('task-a')
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, taskWorkItemStatusRows)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 1,
+      carried: 0,
+      diagnostics: [
+        {
+          code: 'materialization_incremental_fallback',
+          surface: 'materialization',
+          detail: {
+            mode: 'incremental',
+            fallback: 'recompute',
+            id: 'task-work-status',
+            queryKey: queryKey(taskWorkItemStatusRows),
+            reason: 'cached join row 0 does not contain raw task/workItem relation rows'
+          }
+        }
+      ],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'task-work-status')).toEqual(fullRows);
+  });
+
+  it('keeps unsupported incremental left and non-equality joins diagnostic-backed', async () => {
+    const unsupportedCases = [
+      {
+        id: 'task-work-left-status',
+        query: pipe(
+          from(task),
+          leftJoin(from(workItem), eq(task.status, workItem.status))
+        ),
+        reason: 'incremental join support is limited to inner joins'
+      },
+      {
+        id: 'task-work-non-eq-status',
+        query: pipe(
+          from(task),
+          join(from(workItem), gt(task.status, workItem.status))
+        ),
+        reason: 'incremental join support is limited to equality between one left base field and one right base field'
+      }
+    ] as const;
+
+    for (const testCase of unsupportedCases) {
+      const db = createDb({
+        tasks: baseTaskRows,
+        workItems: baseWorkItemRows
+      });
+
+      await materializeSnapshot(db, testCase.query, { id: testCase.id, mode: 'incremental' });
+      expect(materializationForQuery(db, testCase.query)).toMatchObject({
+        id: testCase.id,
+        requestedMode: 'incremental',
+        maintenance: 'snapshot',
+        diagnostics: [
+          {
+            code: 'materialization_unsupported',
+            surface: 'materialization',
+            detail: {
+              mode: 'incremental',
+              queryKey: queryKey(testCase.query),
+              reason: testCase.reason
+            }
+          }
+        ]
+      });
+
+      const transaction = tryTransact(db, [
+        tasks.insert({ id: 'task-d', status: 'open', priority: 'low', text: 'Delta', note: 'fourth' })
+      ]);
+      expect(transaction.diagnostics).toEqual([]);
+
+      const fullRows = (await q(transaction.db, testCase.query)).rows;
+      const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+      expect(result).toMatchObject({
+        kind: 'materializationMaintenance',
+        maintained: 1,
+        recomputed: 1,
+        carried: 0,
+        diagnostics: [{ code: 'materialization_unsupported', surface: 'materialization' }],
+        sourceVersion: transaction.db.data
+      });
+      expect(materializedRowsFor(transaction.db, testCase.id)).toEqual(fullRows);
+    }
   });
 
   for (const testCase of incrementalParityCases) {

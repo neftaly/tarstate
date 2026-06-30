@@ -219,6 +219,10 @@ Current state:
   added/removed/unchanged diffs plus experimental keyed `rowChanges`.
   `subscribeWatch` adds callback fan-out to an existing watch, but callbacks
   fire only when `refresh()` or a real tracked-change path emits an event.
+- Query results can declare top-level output row identity with `keyBy(...)`.
+  Diffs and watch refreshes use that metadata only when explicit row-key options
+  are not supplied; missing or duplicate keys surface diagnostics and fall back
+  structurally.
 - `watchRuntime` bridges a `RelationRuntime.subscribe` host invalidation into a
   normal watch refresh against `runtime.snapshot?.().source ?? runtime.source`.
   It does not synthesize relation deltas or expose an async stream.
@@ -229,12 +233,16 @@ Current state:
   `RelationAdapter`, then maintains materializations and reports watched
   changes from the real apply/commit result. Rejected commits do not maintain or
   emit changes, and missing deltas force recompute rather than fake deltas.
+- Direct relation watch targets can derive tracked `rowChanges` from one
+  matching validated `RelationDelta`; ambiguous, invalid, or inconsistent
+  deltas fall back to recompute.
 - When relation deltas are available, tracked transactions use query
   dependencies to skip watches that cannot be affected before recomputing rows.
 
 Open questions:
 
-- What is row identity for query results?
+- How far should query-owned row identity go beyond top-level `keyBy(...)`
+  fields?
 - Should diffs report added/deleted rows, row keys, patch-like deltas, or
   relation/query-specific change records?
 - Should current refresh/tracked-change/runtime callback delivery grow into
@@ -256,6 +264,10 @@ Current state:
 - `mat` is the async shorthand for `materializeSnapshot`.
 - `materializeSnapshot` can cache one-shot rows readable by materialization id or
   query key.
+- `readMaterializedQuery` can read cached rows for an exact structural query key
+  when the cached source version matches the current source version; it reports
+  explicit miss, stale, missing-row, or unknown-version diagnostics and does not
+  recompute.
 - `snapshotIndex` can expose cached snapshot rows as a set index and reports
   explicit diagnostics when a materialization is missing.
 - `snapshotHashIndex` can build read-only hash lookup maps derived from cached
@@ -274,8 +286,16 @@ Current state:
   `aggregate` over the same base/filter subset can also be maintained when every
   aggregate is plain `count()`, `sum(expr)`, `min(expr)`, or `max(expr)` and
   grouped keys are simple field/literal/tuple projections.
+- Raw simple inner equality joins of two base relations can also be maintained
+  incrementally when relation keys and cached pair identity stay usable.
 - `@tarstate/react` `createDbStore` uses delta-backed snapshot maintenance after
   committed object-backed DB writes.
+- React query hooks can read exact current materialized query rows before
+  falling back to captured-source evaluation, but skip runtime env/function
+  queries to avoid unsafe cache hits.
+- React object-backed DB store commits expose optional tracked `changes` for
+  committed writes using the same core `trackTransact` path that maintains
+  materializations and delivers watch events.
 - React source/runtime/adapter stores maintain existing materializations only
   after reflected commits. They should recompute conservatively unless source
   order semantics are explicit.
@@ -289,11 +309,13 @@ Current state:
   `hash(from(...))` can participate in simple equality lookup planning, but
   `btree(from(...))` can participate in simple literal range filter planning
   when a source exposes `RelationSource.rangeLookup`.
-- Joins, field-to-field predicates, subqueries, unsupported aggregate
-  shapes/options, ordering, limits, custom calls, and unsupported btree shapes
-  still fall back to recompute with explicit unsupported incremental
-  diagnostics. Unsafe extrema removals and other ambiguous supported delta
-  batches fall back to recompute with advisory fallback diagnostics.
+- Left/non-equality/self joins, transformed join inputs, post-join transforms,
+  field-to-field predicates outside the raw join slice, subqueries, unsupported
+  aggregate shapes/options, ordering, limits, custom calls, and unsupported btree
+  shapes still fall back to recompute with explicit unsupported incremental
+  diagnostics. Unsafe extrema removals, unsafe join removals, and other
+  ambiguous supported delta batches fall back to recompute with advisory fallback
+  diagnostics.
 
 Open questions:
 
