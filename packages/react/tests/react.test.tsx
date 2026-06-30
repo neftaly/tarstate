@@ -16,6 +16,7 @@ import {
   materializedRowsFor,
   materializeSnapshot
 } from '@tarstate/core/materialization';
+import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { as, env, eq, from, join, pipe, project, where } from '@tarstate/core/query';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import type { RelationSource } from '@tarstate/core/source';
@@ -23,6 +24,7 @@ import { write, type WritePatch } from '@tarstate/core/write';
 import {
   createAdapterStore,
   createDbStore,
+  createRuntimeStore,
   createSourceStore,
   TarstateProvider,
   useCommit,
@@ -390,6 +392,120 @@ describe('@tarstate/react', () => {
       { id: 'todo-c', title: 'Gamma' }
     ]);
     expect(latestData).toBe('Alpha,Gamma');
+  });
+
+  it('renders and commits through a real memory relation runtime store', async () => {
+    const runtime = createMemoryRelationRuntime({
+      todos: [
+        { id: 'todo-a', title: 'Alpha', done: false },
+        { id: 'todo-b', title: 'Beta', done: true }
+      ]
+    });
+    const store = createRuntimeStore(runtime);
+    const revisions: number[] = [];
+    let latestRows: readonly unknown[] = [];
+    let latestRevision = -1;
+    let latestVersion: unknown;
+    let commit: ReturnType<typeof useCommit> | undefined;
+
+    const unsubscribe = store.subscribe(() => {
+      revisions.push(store.getSnapshot().revision);
+    });
+
+    function Probe() {
+      const result = useQuery(openTodos);
+      const snapshot = useTarstateSnapshot();
+      commit = useCommit();
+      latestRows = result.rows;
+      latestRevision = result.revision;
+      latestVersion = snapshot.version;
+      return null;
+    }
+
+    await act(async () => {
+      create(React.createElement(TarstateProvider, { store }, React.createElement(Probe)));
+      await flushEffects();
+    });
+
+    expect(latestRevision).toBe(0);
+    expect(latestVersion).toBe(0);
+    expect(latestRows).toEqual([{ id: 'todo-a', title: 'Alpha' }]);
+
+    if (commit === undefined) {
+      throw new Error('expected commit hook');
+    }
+
+    const commitRows = commit;
+    let commitResult: Awaited<ReturnType<TarstateStore['commit']>> | undefined;
+    await act(async () => {
+      commitResult = await commitRows([
+        todos.insert({ id: 'todo-c', title: 'Gamma', done: false })
+      ]);
+      await flushEffects();
+    });
+
+    expect(commitResult).toMatchObject({
+      status: 'committed',
+      reflected: true,
+      fullyCommitted: true,
+      committed: true,
+      durability: 'memory',
+      snapshot: {
+        revision: 1,
+        version: 1
+      }
+    });
+    expect(revisions).toEqual([1]);
+    expect(latestRevision).toBe(1);
+    expect(latestVersion).toBe(1);
+    expect(latestRows).toEqual([
+      { id: 'todo-a', title: 'Alpha' },
+      { id: 'todo-c', title: 'Gamma' }
+    ]);
+
+    unsubscribe();
+  });
+
+  it('refreshes runtime stores from memory runtime host notifications', async () => {
+    const runtime = createMemoryRelationRuntime({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+    });
+    const store = createRuntimeStore(runtime);
+    let latestRows: readonly unknown[] = [];
+    let latestRevision = -1;
+    let latestVersion: unknown;
+
+    function Probe() {
+      const result = useQuery(openTodos);
+      const snapshot = useTarstateSnapshot();
+      latestRows = result.rows;
+      latestRevision = result.revision;
+      latestVersion = snapshot.version;
+      return null;
+    }
+
+    await act(async () => {
+      create(React.createElement(TarstateProvider, { store }, React.createElement(Probe)));
+      await flushEffects();
+    });
+
+    expect(latestRows).toEqual([{ id: 'todo-a', title: 'Alpha' }]);
+    expect(latestRevision).toBe(0);
+    expect(latestVersion).toBe(0);
+
+    await act(async () => {
+      await runtime.target?.apply([
+        todos.insert({ id: 'todo-b', title: 'Beta', done: false })
+      ]);
+      await flushEffects();
+    });
+
+    expect(latestRevision).toBe(1);
+    expect(latestVersion).toBe(1);
+    expect(latestRows).toEqual([
+      { id: 'todo-a', title: 'Alpha' },
+      { id: 'todo-b', title: 'Beta' }
+    ]);
   });
 
   it('evaluates query batches against the same revision', async () => {

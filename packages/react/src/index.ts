@@ -242,6 +242,8 @@ export function createSourceStore<Version = unknown>(
   );
   const listeners = new Set<() => void>();
   let unsubscribeHost: (() => void) | undefined;
+  let commitDepth = 0;
+  let hostRefreshQueued = false;
 
   const notify = (): void => {
     for (const listener of listeners) {
@@ -284,6 +286,11 @@ export function createSourceStore<Version = unknown>(
 
       if (listeners.size === 1 && options.subscribe !== undefined) {
         unsubscribeHost = options.subscribe(() => {
+          if (commitDepth > 0) {
+            hostRefreshQueued = true;
+            return;
+          }
+
           void refresh();
         });
       }
@@ -323,22 +330,30 @@ export function createSourceStore<Version = unknown>(
         };
       }
 
-      const result = target === undefined
-        ? await tryCommitAdapter<Version>(
-            { source: adapterSource(options.getSource(), options.getVersion), commit: options.commit as NonNullable<SourceStoreOptions<Version>['commit']> },
-            patchList,
-            { readVersion: false }
-          )
-        : await tryApplyRelationPatches<Version>(
-            { source: adapterSource(options.getSource(), options.getVersion), target },
-            patchList,
-            { readVersion: false }
-          );
+      commitDepth += 1;
+      const result = await (async () => {
+        try {
+          return target === undefined
+            ? await tryCommitAdapter<Version>(
+                { source: adapterSource(options.getSource(), options.getVersion), commit: options.commit as NonNullable<SourceStoreOptions<Version>['commit']> },
+                patchList,
+                { readVersion: false }
+              )
+            : await tryApplyRelationPatches<Version>(
+                { source: adapterSource(options.getSource(), options.getVersion), target },
+                patchList,
+                { readVersion: false }
+              );
+        } finally {
+          commitDepth -= 1;
+        }
+      })();
 
       let maintenance: MaterializationMaintenanceResult | undefined;
       let diagnostics: readonly TarstateReactDiagnostic[] = result.diagnostics;
 
       if (result.status !== 'rejected') {
+        hostRefreshQueued = false;
         const refreshedSnapshot = await readSnapshot(revision + 1, result.diagnostics, result.version);
         const maintainedSnapshot = await maintainSourceSnapshotMaterializations(
           previousSnapshot.source,
@@ -351,6 +366,9 @@ export function createSourceStore<Version = unknown>(
         snapshot = maintainedSnapshot.snapshot;
         revision = snapshot.revision;
         notify();
+      } else if (hostRefreshQueued) {
+        hostRefreshQueued = false;
+        await refresh();
       }
 
       return {
