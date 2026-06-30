@@ -49,6 +49,7 @@
     ]
   },
   "include": [
+    "apps/*/src",
     "packages/*/src",
     "packages/*/tests",
     "scripts/*.ts",

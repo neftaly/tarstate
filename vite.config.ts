@@ -3,29 +3,37 @@ import path from 'node:path';
 import { defineConfig, type UserConfig } from 'vite';
 
 type PackageConfig = {
-  readonly external?: string[];
-  readonly lib: {
-    readonly entry: string | Record<string, string>;
-    readonly formats: ['es'];
-    readonly fileName: string | ((_format: string, entryName: string) => string);
-  };
+  readonly build: NonNullable<UserConfig['build']>;
 };
+
+const failOnRollupWarning = (warning: string | { readonly message?: string }): never => {
+  const message = typeof warning === 'string' ? warning : warning.message ?? JSON.stringify(warning);
+  throw new Error('Rollup warning treated as error: ' + message);
+};
+
+const sharedBuildOptions = { target: 'safari17', sourcemap: true, rollupOptions: { onwarn: failOnRollupWarning } } satisfies NonNullable<UserConfig['build']>;
 
 const buildConfigsByPackageName: Record<string, PackageConfig> = {
   '@tarstate/core': {
-    lib: {
-      entry: {
-        index: 'src/index.ts',
-        diagnostics: 'src/diagnostics.ts',
-        evaluate: 'src/evaluate.ts',
-        query: 'src/query.ts',
-        schema: 'src/schema.ts',
-        source: 'src/source.ts',
-        write: 'src/write.ts'
+    build: {
+      ...sharedBuildOptions,
+      lib: {
+        entry: {
+          index: 'src/index.ts',
+          diagnostics: 'src/diagnostics.ts',
+          evaluate: 'src/evaluate.ts',
+          query: 'src/query.ts',
+          schema: 'src/schema.ts',
+          source: 'src/source.ts',
+          write: 'src/write.ts'
+        },
+        formats: ['es'],
+        fileName: (_format, entryName) => entryName + '.js'
       },
-      formats: ['es'],
-      fileName: (_format, entryName) => entryName + '.js'
     }
+  },
+  '@tarstate/demo': {
+    build: sharedBuildOptions
   }
 };
 
@@ -42,26 +50,16 @@ const sourceAliases = [
   { find: '@tarstate/core', replacement: path.join(repoRoot, 'packages/core/src/index.ts') }
 ];
 
-const failOnRollupWarning = (warning: string | { readonly message?: string }): never => {
-  const message = typeof warning === 'string' ? warning : warning.message ?? JSON.stringify(warning);
-  throw new Error('Rollup warning treated as error: ' + message);
-};
-
-const sharedBuildOptions = { target: 'safari17', sourcemap: true, rollupOptions: { onwarn: failOnRollupWarning } } satisfies NonNullable<UserConfig['build']>;
-
 export default defineConfig(({ command }): UserConfig => {
+  const baseConfig = { clearScreen: false, resolve: { alias: sourceAliases } } satisfies UserConfig;
+
   if (packageConfig === undefined) {
-    if (command !== 'build') return { clearScreen: false, resolve: { alias: sourceAliases } };
+    if (command !== 'build') return baseConfig;
     throw new Error('No shared Vite config for package: ' + (manifest.name ?? '<unknown>'));
   }
 
   return {
-    clearScreen: false,
-    build: {
-      ...sharedBuildOptions,
-      lib: packageConfig.lib,
-      rollupOptions: { ...sharedBuildOptions.rollupOptions, ...(packageConfig.external === undefined ? {} : { external: packageConfig.external }) }
-    },
-    resolve: { alias: sourceAliases }
+    ...baseConfig,
+    build: packageConfig.build
   };
 });

@@ -1,0 +1,162 @@
+:root {
+  color: #172022;
+  background: #f5f7f7;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.page {
+  width: min(1120px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 40px 0 56px;
+}
+
+.hero {
+  padding: 36px 0 28px;
+  border-bottom: 1px solid #cad4d1;
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  color: #52655d;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  max-width: 720px;
+  margin-bottom: 14px;
+  color: #111817;
+  font-size: clamp(2.25rem, 6vw, 4.7rem);
+  line-height: 0.96;
+  letter-spacing: 0;
+}
+
+h2 {
+  margin-bottom: 18px;
+  color: #1c2b29;
+  font-size: 1.08rem;
+  letter-spacing: 0;
+}
+
+h3 {
+  margin-bottom: 8px;
+  color: #30443f;
+  font-size: 0.92rem;
+  letter-spacing: 0;
+}
+
+.dek {
+  max-width: 680px;
+  margin-bottom: 0;
+  color: #52655d;
+  font-size: 1.05rem;
+  line-height: 1.6;
+}
+
+.panel {
+  padding: 28px 0;
+  border-bottom: 1px solid #d7dfdd;
+}
+
+.section-dek {
+  max-width: 760px;
+  margin-bottom: 18px;
+  color: #52655d;
+  line-height: 1.55;
+}
+
+.relation-group {
+  margin-top: 18px;
+}
+
+.relation-group:first-of-type {
+  margin-top: 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow-wrap: anywhere;
+}
+
+th,
+td {
+  padding: 12px 10px;
+  border-bottom: 1px solid #d7dfdd;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  color: #52655d;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+pre {
+  max-height: 420px;
+  margin: 0;
+  padding: 16px;
+  overflow: auto;
+  border: 1px solid #c7d2cc;
+  border-radius: 8px;
+  background: #10201d;
+  color: #eef7f0;
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+
+.status {
+  display: inline-block;
+  margin: 16px 0 0;
+  padding: 8px 10px;
+  border: 1px solid #84a598;
+  border-radius: 8px;
+  color: #15362f;
+  background: #dce9e1;
+  font-weight: 700;
+}
+
+ul {
+  margin: 0;
+  padding-left: 20px;
+  color: #33443f;
+  line-height: 1.7;
+}
+
+@media (max-width: 720px) {
+  .page {
+    width: min(100vw - 24px, 1120px);
+    padding-top: 20px;
+  }
+
+  .hero,
+  .panel {
+    padding: 22px 0;
+  }
+
+  th,
+  td {
+    padding: 10px 6px;
+  }
+}
