@@ -75,6 +75,12 @@ type PresenceSourceOptions = {
   readonly getVersion: () => AutomergePresenceVersion;
   readonly getDiagnostics: () => readonly TarstateDiagnostic[];
 };
+type OrderedRangeKind = 'string' | 'number';
+type OrderedRangeValue = string | number;
+type NormalizedRangeBound = {
+  readonly value: OrderedRangeValue;
+  readonly inclusive: boolean;
+};
 
 const defaultPresenceFields: AutomergePresenceFieldNames = {
   peerId: 'peerId',
@@ -436,11 +442,11 @@ function diagnosticKeyForRow(relationRef: RelationRef, row: Record<string, unkno
   const keyFields = Array.isArray(relationRef.key) ? relationRef.key : [relationRef.key];
   const keyParts = keyFields.map((fieldName) => row[fieldName]);
 
-  if (keyParts.every((part) => part === undefined)) {
+  if (keyParts.some((part) => part === undefined)) {
     return undefined;
   }
 
-  return keyParts.map((part) => String(part)).join(':');
+  return JSON.stringify(keyParts);
 }
 
 function fieldValueMatches(spec: FieldSpec, value: unknown): boolean {
@@ -606,18 +612,29 @@ function rangeLookupRows(
     return undefined;
   }
 
+  const rangeKind = orderedRangeKindFor(lookup.relation.fields[lookup.field]?.valueKind);
+
+  if (rangeKind === undefined) {
+    return undefined;
+  }
+
+  const lower = normalizeRangeBound(lookup.lower, rangeKind);
+  const upper = normalizeRangeBound(lookup.upper, rangeKind);
+
+  if ((lookup.lower !== undefined && lower === undefined) || (lookup.upper !== undefined && upper === undefined)) {
+    return undefined;
+  }
+
   const output: PresenceRow[] = [];
 
   for (const row of rows) {
-    const value = row[lookup.field];
+    const value = orderedRangeValue(row[lookup.field], rangeKind);
 
-    if (!orderedValue(value) ||
-      (lookup.lower !== undefined && !orderedValue(lookup.lower.value)) ||
-      (lookup.upper !== undefined && !orderedValue(lookup.upper.value))) {
+    if (value === undefined) {
       return undefined;
     }
 
-    if (valueWithinRange(value, lookup.lower, lookup.upper)) {
+    if (valueWithinRange(value, lower, upper)) {
       output.push(row);
     }
   }
@@ -626,12 +643,12 @@ function rangeLookupRows(
 }
 
 function valueWithinRange(
-  value: string | number,
-  lower: RelationRangeLookup['lower'],
-  upper: RelationRangeLookup['upper']
+  value: OrderedRangeValue,
+  lower: NormalizedRangeBound | undefined,
+  upper: NormalizedRangeBound | undefined
 ): boolean {
   if (lower !== undefined) {
-    const comparison = compareOrderedValues(value, lower.value as string | number);
+    const comparison = compareOrderedValues(value, lower.value);
 
     if (comparison < 0 || (!lower.inclusive && comparison === 0)) {
       return false;
@@ -639,7 +656,7 @@ function valueWithinRange(
   }
 
   if (upper !== undefined) {
-    const comparison = compareOrderedValues(value, upper.value as string | number);
+    const comparison = compareOrderedValues(value, upper.value);
 
     if (comparison > 0 || (!upper.inclusive && comparison === 0)) {
       return false;
@@ -649,11 +666,42 @@ function valueWithinRange(
   return true;
 }
 
-function orderedValue(value: unknown): value is string | number {
-  return typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value));
+function orderedRangeKindFor(valueKind: string | undefined): OrderedRangeKind | undefined {
+  switch (valueKind) {
+    case 'number':
+      return 'number';
+    case 'id':
+    case 'ref':
+    case 'string':
+      return 'string';
+    default:
+      return undefined;
+  }
 }
 
-function compareOrderedValues(left: string | number, right: string | number): number {
+function normalizeRangeBound(
+  bound: RelationRangeLookup['lower'] | undefined,
+  rangeKind: OrderedRangeKind
+): NormalizedRangeBound | undefined {
+  if (bound === undefined) {
+    return undefined;
+  }
+
+  const value = orderedRangeValue(bound.value, rangeKind);
+
+  return value === undefined ? undefined : { value, inclusive: bound.inclusive };
+}
+
+function orderedRangeValue(value: unknown, rangeKind: OrderedRangeKind): OrderedRangeValue | undefined {
+  switch (rangeKind) {
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+    case 'string':
+      return typeof value === 'string' ? value : undefined;
+  }
+}
+
+function compareOrderedValues(left: OrderedRangeValue, right: OrderedRangeValue): number {
   if (left === right) {
     return 0;
   }

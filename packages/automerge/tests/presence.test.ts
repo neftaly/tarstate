@@ -138,7 +138,7 @@ describe('Automerge Repo Presence runtime', () => {
             message: 'invalid field value in relation presence',
             relation: 'presence',
             field: 'value',
-            key: 'peer-remote:color',
+            key: '["peer-remote","color"]',
             detail: invalidValue
           }
         ]
@@ -160,10 +160,39 @@ describe('Automerge Repo Presence runtime', () => {
           message: 'invalid field value in relation presence',
           relation: 'presence',
           field: 'value',
-          key: 'peer-remote:color',
+          key: '["peer-remote","color"]',
           detail: invalidValue
         }
       ]);
+    } finally {
+      runtime.stop();
+    }
+  });
+
+  it('answers presence range lookups only for schema-supported ordered fields', async () => {
+    const handle = new FakeDocHandle();
+    const runtime = automergePresenceRuntime({
+      handle: handle.asHandle(),
+      relation: schema.presence,
+      localPeerId: 'peer-local',
+      initialState: { color: 'blue' },
+      heartbeatMs: 60_000
+    });
+
+    try {
+      expect(await runtime.source.rangeLookup?.({
+        relation: schema.presence,
+        field: 'lastSeenAt',
+        lower: { value: 0, inclusive: true }
+      })).toEqual([
+        expect.objectContaining({ peerId: 'peer-local', channel: 'color', value: 'blue', local: true })
+      ]);
+      expect(await runtime.source.rangeLookup?.({
+        relation: schema.presence,
+        field: 'value',
+        lower: { value: 'a', inclusive: true },
+        upper: { value: 'z', inclusive: true }
+      })).toBeUndefined();
     } finally {
       runtime.stop();
     }
