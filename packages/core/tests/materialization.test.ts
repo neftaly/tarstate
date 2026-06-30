@@ -1458,6 +1458,56 @@ describe('tarstate materialization', () => {
     ).toBe(false);
   });
 
+  it('incrementally maintains transformed equality join outputs', async () => {
+    const joined = pipe(
+      taskWorkItemStatusRows,
+      extend({
+        units: workItem.units
+      }),
+      without('workItem'),
+      rename({ task: 'taskRow' }),
+      qualify('joined')
+    );
+    const db = createDb({
+      tasks: baseTaskRows,
+      workItems: baseWorkItemRows
+    });
+
+    await materializeSnapshot(db, joined, { id: 'task-work-transformed', mode: 'incremental' });
+
+    expect(materializationForQuery(db, joined)).toMatchObject({
+      id: 'task-work-transformed',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      diagnostics: []
+    });
+
+    const transaction = tryTransact(db, [
+      workItems.update('work-a', { units: 9, bonus: 5 })
+    ]);
+    expect(transaction.diagnostics).toEqual([]);
+
+    const fullRows = (await q(transaction.db, joined)).rows;
+    const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+    expect(result).toMatchObject({
+      kind: 'materializationMaintenance',
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: [],
+      sourceVersion: transaction.db.data
+    });
+    expect(materializedRowsFor(transaction.db, 'task-work-transformed')).toEqual(fullRows);
+    expect(materializedRowsFor(transaction.db, 'task-work-transformed')).toEqual([
+      { joined: { taskRow: baseTaskRows[0], units: 9 } },
+      { joined: { taskRow: baseTaskRows[0], units: 5 } },
+      { joined: { taskRow: baseTaskRows[1], units: 7 } },
+      { joined: { taskRow: baseTaskRows[2], units: 9 } },
+      { joined: { taskRow: baseTaskRows[2], units: 5 } }
+    ]);
+  });
+
   it('incrementally maintains simple equality joins when the left side inserts matching rows', async () => {
     const db = createDb({
       tasks: baseTaskRows,

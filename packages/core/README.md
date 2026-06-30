@@ -36,8 +36,8 @@ The core API is moving toward a Relic-shaped split:
 - `constraints`, `materialization`, `watch`, and `runtime` expose the next API
   surfaces with baseline validation, explicit object-backed constraint
   enforcement, committed relation deltas, snapshot maintenance with a narrow
-  exact materialized-query read path, a narrow single-relation incremental subset, simple raw inner equality join
-  maintenance, supported `count()`, `sum(expr)`, `min(expr)`, and `max(expr)`
+  exact materialized-query read path, a narrow single-relation incremental subset, simple base-relation inner equality
+  join maintenance with optional output transforms, supported `count()`, `sum(expr)`, `min(expr)`, and `max(expr)`
   aggregate maintenance, manual/recompute-backed watch refresh with callback
   fan-out from real refresh/tracked-change events,
   host-driven `watchRuntime` refresh for `RelationRuntime.subscribe`, generic

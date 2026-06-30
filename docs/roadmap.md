@@ -286,8 +286,10 @@ Current state:
   `aggregate` over the same base/filter subset can also be maintained when every
   aggregate is plain `count()`, `sum(expr)`, `min(expr)`, or `max(expr)` and
   grouped keys are simple field/literal/tuple projections.
-- Raw simple inner equality joins of two base relations can also be maintained
-  incrementally when relation keys and cached pair identity stay usable.
+- Simple inner equality joins of two base relations can also be maintained
+  incrementally. Raw joined rows reuse cached relation-key pair identity; joined
+  queries with simple output transforms rebuild the transformed joined rows from
+  validated current source rows.
 - `@tarstate/react` `createDbStore` uses delta-backed snapshot maintenance after
   committed object-backed DB writes.
 - React query hooks can read exact current materialized query rows before
@@ -309,7 +311,7 @@ Current state:
   `hash(from(...))` can participate in simple equality lookup planning, but
   `btree(from(...))` can participate in simple literal range filter planning
   when a source exposes `RelationSource.rangeLookup`.
-- Left/non-equality/self joins, transformed join inputs, post-join transforms,
+- Left/non-equality/self joins, transformed join inputs,
   field-to-field predicates outside the raw join slice, subqueries, unsupported
   aggregate shapes/options, ordering, limits, custom calls, and unsupported btree
   shapes still fall back to recompute with explicit unsupported incremental
