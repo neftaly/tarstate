@@ -42,6 +42,8 @@ import {
   useTarstateQuery,
   useTarstateSnapshot,
   useTarstateStore,
+  type QueriesHookState,
+  type QueryHookState,
   type TarstateDbSnapshot,
   type TarstateSnapshot,
   type TarstateStore
@@ -116,6 +118,35 @@ describe('@tarstate/react', () => {
     expectTypeOf(useTarstateCommit).returns.toMatchTypeOf<
       (patches: Iterable<WritePatch>) => Promise<unknown>
     >();
+  });
+
+  it('keeps the public React barrel consumable with core subpath queries and writes', () => {
+    const store = createDbStore({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+    });
+
+    function ConsumerProbe() {
+      const open = useQuery(openTodos);
+      const selected = useQuery(openTodos, {
+        select: (rows) => rows.map((row) => row.id)
+      });
+      const batch = useQueries({ open: openTodos, titles: todoTitles });
+      const commit = useCommit<TarstateDbSnapshot>();
+
+      expectTypeOf(open).toMatchTypeOf<QueryHookState<{ readonly id: string; readonly title: string }>>();
+      expectTypeOf(selected).toMatchTypeOf<
+        QueryHookState<{ readonly id: string; readonly title: string }, readonly string[]>
+      >();
+      expectTypeOf(batch).toMatchTypeOf<QueriesHookState<{ open: typeof openTodos; titles: typeof todoTitles }>>();
+      expectTypeOf(commit).toMatchTypeOf<TarstateStore<TarstateDbSnapshot>['commit']>();
+
+      return null;
+    }
+
+    const element = React.createElement(TarstateProvider, { store }, React.createElement(ConsumerProbe));
+
+    expect(React.isValidElement(element)).toBe(true);
+    expect(store.getSnapshot().revision).toBe(0);
   });
 
   it('updates subscribers only after committed transactions', async () => {

@@ -13,6 +13,11 @@ Tarstate is currently a relational query and derivation layer for JSON-shaped
 application state. `@tarstate/react` is the idiomatic React entrypoint; Automerge
 is an API-surface consumer example for now.
 
+The near-term stabilization path is schema, query, write, source, adapter, DB,
+and React consumption APIs. Constraints, materialization, watch, and runtime
+orchestration remain experimental until their diagnostics, lifecycle, and
+fallback semantics are proven.
+
 That framing should hold until the runtime contracts are proven. In particular,
 avoid claiming that Tarstate is a complete state management system, reactive
 database, constraint engine, or materialized-view engine until those semantics
@@ -26,6 +31,8 @@ Use these labels when discussing public APIs:
   intentionally unsupported.
 - **Naive**: runtime behavior works for the documented contract, but may scan,
   recompute, or use simple in-memory structures.
+- **Stabilizing**: intended public path; changes should be conservative and
+  documented, but release evidence is still being gathered.
 - **Stable**: API contract is documented, tested, and suitable for external
   consumers.
 - **Optimized**: stable behavior has benchmark coverage and targeted planner,
@@ -40,6 +47,8 @@ These are signals that Tarstate is approaching a first serious release. They are
 not an ordered checklist.
 
 - Public package paths have documented status and no accidental internals.
+- The stabilizing API path is clear: schema, query, write, source, adapter, DB,
+  and React consumption.
 - Stable APIs do not silently no-op or hide unsupported behavior.
 - Transaction semantics are explicit and tested.
 - Constraint behavior is either enforced or clearly scoped as advisory.
@@ -128,6 +137,8 @@ Current state:
 - Object-backed constrained transactions can enforce explicit constraint sets.
 - Unbound `check` validation is explicitly unsupported until checks carry enough
   relation/query context.
+- This remains an experimental, diagnostic-backed surface; adapter enforcement,
+  attachment, and lifecycle are not stable contracts yet.
 
 Open questions:
 
@@ -261,6 +272,9 @@ Evidence to gather:
 
 Current state:
 
+- Materialization is an experimental snapshot cache. Partial incremental view
+  maintenance (IVM) is an opportunistic optimization behind those snapshots, not
+  a general public IVM API or product identity.
 - `mat` is the async shorthand for `materializeSnapshot`.
 - `materializeSnapshot` can cache one-shot rows readable by materialization id or
   query key.
@@ -281,12 +295,16 @@ Current state:
 - Opt-in incremental maintenance can update cached rows from `RelationDelta` for
   a narrow single-relation subset: `from`, optional single-field `hash`,
   optional pure base-field predicates (`eq`/`neq`/`lt`/`lte`/`gt`/`gte` against
-  literal/env/tuple values, composed with `and`/`or`/`not`), and simple
-  `project`/`extend`/`without`/`rename`/`qualify` transforms. A terminal
-  `aggregate` over the same base/filter subset can also be maintained when every
-  aggregate is `count()`, `count(expr)`, `sum(expr)`, `min(expr)`, `max(expr)`,
-  `any(expr)`, or `notAny(expr)` and grouped keys are simple field/literal/tuple
-  projections.
+  literal/env/tuple values, composed with `and`/`or`/`not`), simple
+  `project`/`extend`/`without`/`rename`/`qualify` transforms, and optional final
+  field/literal/tuple `sort(...)`. Affected sorted snapshots rebuild from
+  current source rows inside the incremental maintenance path rather than using
+  row-splice ordering. A terminal `aggregate` over the same base/filter
+  subset can also be maintained when every aggregate is `count()`, `count(expr)`,
+  `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`, `notAny(expr)`, or
+  `avg(expr)` with matching visible `sum(expr)`/`count(expr)` fields over a
+  non-null numeric base field or numeric literal, and grouped keys are simple
+  field/literal/tuple projections.
 - Simple inner/left equality joins over base relations can also be maintained
   incrementally, including optional side-local `hash`/`where` filters. Raw inner
   joined rows reuse cached relation-key pair identity; filtered sides, left
@@ -313,9 +331,10 @@ Current state:
   when a source exposes `RelationSource.rangeLookup`.
 - Non-equality/self joins, join-side output transforms,
   field-to-field predicates outside the raw join slice, subqueries, unsupported
-  aggregate shapes/options, ordering, limits, custom calls, and unsupported btree
-  shapes still fall back to recompute with explicit unsupported incremental
-  diagnostics. Unsafe extrema removals, unsafe join removals, and other
+  aggregate shapes/options, non-final ordering, limits, custom calls, and
+  unsupported btree shapes still fall back to recompute with explicit
+  unsupported incremental diagnostics. Unsafe extrema removals, unsafe join
+  removals, and other
   ambiguous supported delta batches fall back to recompute with advisory fallback
   diagnostics.
 

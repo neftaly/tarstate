@@ -8,7 +8,7 @@ Use `@tarstate/react` as the idiomatic React entrypoint. Use `@tarstate/core`
 directly when code needs to combine stored records, assignments, visibility, or
 other structured data outside a renderer package.
 
-The core API is moving toward a Relic-shaped split:
+The core API is stabilizing around a Relic-shaped split:
 
 - `query` describes relational row programs as data, including joins,
   explicit lookup, hash-declared equality lookup planning, btree-declared range
@@ -33,22 +33,20 @@ The core API is moving toward a Relic-shaped split:
   runtime for examples, tests, and local state.
 - `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
   rows for tests, local state, and adapter prototyping.
-- `constraints`, `materialization`, `watch`, and `runtime` expose the next API
-  surfaces with baseline validation, explicit object-backed constraint
-  enforcement, committed relation deltas, snapshot maintenance with a narrow
-  exact materialized-query read path, a narrow single-relation incremental subset, simple inner/left equality
-  join maintenance with optional side filters and output transforms, supported `count()`, `count(expr)`, `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`, and `notAny(expr)`
-  aggregate maintenance, manual/recompute-backed watch refresh with callback
-  fan-out from real refresh/tracked-change events,
-  host-driven `watchRuntime` refresh for `RelationRuntime.subscribe`, generic
-  `trackRuntimeCommit` orchestration for patch targets, coarse
-  dependency-filtered recomputation, delta-backed direct relation watch
-  `rowChanges`, and explicit fallback diagnostics;
-  schema-attached or adapter-backed enforcement, general operator-maintained
-  views/indexes, adapter-fed relation deltas for host invalidations, and async
-  watch streams are outside the current public guarantees. Host-driven
-  refresh/subscribe invalidations preserve materializations through conservative
-  source refresh, but they do not receive adapter-fed relation deltas yet.
+- `constraints`, `materialization`, `watch`, and `runtime` are experimental,
+  diagnostic-backed surfaces. They provide baseline validation, explicit
+  object-backed constraint enforcement, committed relation deltas, snapshot
+  caches with exact materialized-query read-through, manual/recompute-backed
+  watch refresh, and patch-target commit tracking. Partial incremental view
+  maintenance is only an opportunistic optimization behind materialized
+  snapshots; some supported shapes rebuild from source rows inside that path,
+  and unsupported shapes keep explicit diagnostics and recompute/refresh fallback.
+  Incremental aggregate maintenance supports a narrow subset; `avg(expr)` is
+  incremental only when matching visible `sum(expr)`/`count(expr)` fields are
+  present over a non-null numeric base field or numeric literal.
+  General constraints, operator-maintained views/indexes, adapter-fed deltas for
+  host invalidations, async watch streams, and public IVM APIs are outside the
+  current guarantees.
 
 See [developer-onboarding.md](../../docs/developer-onboarding.md) for current
 API status, onboarding flows, and package direction.
@@ -116,10 +114,10 @@ const todos = (await evaluate(source, todoRows)).rows
 `snapshotIndex(db, target)` remains the compatibility helper for reading cached
 snapshot rows as a set. `snapshotHashIndex(db, target, field)` builds a small
 read-only lookup map from the same cached snapshot rows, grouped by an own field
-on each cached row. These helpers do not expose Relic-style operator-maintained
-indexes: missing materializations, metadata-only declarations, and rows that
-cannot be keyed by the requested field return explicit materialization
-diagnostics instead.
+on each cached row. These helpers expose snapshot cache indexes, not Relic-style
+operator-maintained indexes or a public IVM API: missing materializations,
+metadata-only declarations, and rows that cannot be keyed by the requested field
+return explicit materialization diagnostics instead.
 
 ## Package Boundary
 
