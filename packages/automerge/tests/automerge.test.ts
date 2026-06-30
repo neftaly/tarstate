@@ -19,8 +19,12 @@ import {
 } from '@tarstate/core/schema';
 import { write } from '@tarstate/core/write';
 import {
+  automergeMapAdapter,
+  automergeMapSource,
   automergePresenceRuntime,
+  createAutomergePresenceRuntime,
   createAutomergeRelationAdapter,
+  createAutomergeRelationSource,
   rowsFromAutomergeMapPath,
   type AutomergeMapAdapter
 } from '@tarstate/automerge';
@@ -133,7 +137,15 @@ const focusedTodoNotes = pipe(
 const todoRelations = [{ relation: schema.todos, path: ['todos'] }] as const;
 
 describe('@tarstate/automerge', () => {
-  it('exports the public package adapter surface', () => {
+  it('exports the public package adapter surface', async () => {
+    const doc = Automerge.from<TodoDocument>({ todos: {} });
+
+    expect(automergeMapAdapter).toBe(createAutomergeRelationAdapter);
+    expect(automergeMapSource).toBe(createAutomergeRelationSource);
+    expect(automergePresenceRuntime).toBe(createAutomergePresenceRuntime);
+    expect(Array.from(await automergeMapSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
+    expect(Array.from(await createAutomergeRelationSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
+    expectTypeOf(automergeMapAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
     expectTypeOf(createAutomergeRelationAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
     expectTypeOf(rowsFromAutomergeMapPath<TodoDocument>).returns.toEqualTypeOf<readonly unknown[]>();
   });
