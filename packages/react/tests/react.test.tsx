@@ -1,7 +1,12 @@
 import * as React from 'react';
 import { act, create } from 'react-test-renderer';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import type { AdapterCommitResult, AdapterSource, RelationAdapter } from '@tarstate/core/adapter';
+import type {
+  AdapterCommitResult,
+  AdapterSource,
+  RelationAdapter,
+  RelationApplyResult
+} from '@tarstate/core/adapter';
 import {
   attachConstraints,
   attachedConstraintsFor,
@@ -653,6 +658,10 @@ describe('@tarstate/react', () => {
     });
     const store = createRuntimeStore(runtime);
     const revisions: number[] = [];
+    const events: unknown[] = [];
+    const handle = watch(store.getSnapshot().source, openTodos, (event) => {
+      events.push(event);
+    }, { keyFields: ['id'] });
     let latestRows: readonly unknown[] = [];
     let latestRevision = -1;
     let latestVersion: unknown;
@@ -705,6 +714,37 @@ describe('@tarstate/react', () => {
         version: 1
       }
     });
+    expect(commitResult?.changes).toMatchObject([
+      {
+        id: handle.id,
+        target: openTodos,
+        changed: true,
+        previousRows: [{ id: 'todo-a', title: 'Alpha' }],
+        rows: [
+          { id: 'todo-a', title: 'Alpha' },
+          { id: 'todo-c', title: 'Gamma' }
+        ],
+        addedRows: [{ id: 'todo-c', title: 'Gamma' }],
+        removedRows: [],
+        unchangedRows: [{ id: 'todo-a', title: 'Alpha' }],
+        rowChanges: [
+          {
+            op: 'insert',
+            key: stableRowKey('todo-c'),
+            after: { id: 'todo-c', title: 'Gamma' }
+          }
+        ],
+        diagnostics: []
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      target: openTodos,
+      changed: true,
+      changes: { deltas: commitResult?.deltas },
+      addedRows: [{ id: 'todo-c', title: 'Gamma' }]
+    });
     expect(revisions).toEqual([1]);
     expect(latestRevision).toBe(1);
     expect(latestVersion).toBe(1);
@@ -713,6 +753,7 @@ describe('@tarstate/react', () => {
       { id: 'todo-c', title: 'Gamma' }
     ]);
 
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
     unsubscribe();
   });
 
@@ -1163,6 +1204,168 @@ describe('@tarstate/react', () => {
     });
   });
 
+  it('reports source-store watch changes without fake deltas when apply commits omit deltas', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const alphaUpdated = { id: 'todo-a', title: 'Alpha updated', done: false };
+    let latestRows: readonly Todo[] = [alpha];
+    let snapshotSource = todoSource(latestRows, 'v1');
+    const store = createSourceStore<string>({
+      getSource: () => snapshotSource,
+      getSnapshot: () => ({
+        source: snapshotSource
+      }),
+      apply: (patches) => {
+        latestRows = [alphaUpdated];
+        snapshotSource = todoSource(latestRows, 'v2');
+
+        return {
+          status: 'accepted',
+          accepted: true,
+          patches: patches.length,
+          applied: patches.length,
+          diagnostics: [],
+          version: 'v2'
+        } as unknown as RelationApplyResult<string>;
+      }
+    });
+    const events: unknown[] = [];
+    const handle = watch(store.getSnapshot().source, openTodos, (event) => {
+      events.push(event);
+    }, { keyFields: ['id'] });
+
+    const result = await store.commit([
+      todos.update('todo-a', { title: 'Alpha updated' })
+    ]);
+
+    expect(result.status).toBe('committed');
+    expect(result.deltas).toEqual([]);
+    expect(result.changes).toMatchObject([
+      {
+        id: handle.id,
+        target: openTodos,
+        changed: true,
+        previousRows: [{ id: 'todo-a', title: 'Alpha' }],
+        rows: [{ id: 'todo-a', title: 'Alpha updated' }],
+        addedRows: [{ id: 'todo-a', title: 'Alpha updated' }],
+        removedRows: [{ id: 'todo-a', title: 'Alpha' }],
+        rowChanges: [
+          {
+            op: 'update',
+            key: stableRowKey('todo-a'),
+            before: { id: 'todo-a', title: 'Alpha' },
+            after: { id: 'todo-a', title: 'Alpha updated' }
+          }
+        ],
+        diagnostics: []
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      target: openTodos,
+      changed: true,
+      changes: { diagnostics: [] },
+      rowChanges: [
+        {
+          op: 'update',
+          key: stableRowKey('todo-a'),
+          before: { id: 'todo-a', title: 'Alpha' },
+          after: { id: 'todo-a', title: 'Alpha updated' }
+        }
+      ]
+    });
+    expect(Object.hasOwn((events[0] as { readonly changes: object }).changes, 'deltas')).toBe(false);
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
+  it('includes direct relation watch changes for source store commits with reported deltas', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const beta = { id: 'todo-b', title: 'Beta', done: false };
+    const alphaUpdated = { id: 'todo-a', title: 'Alpha updated', done: false };
+    let version = 'v1';
+    let latestRows: readonly Todo[] = [alpha, beta];
+    let snapshotSource = todoSource(latestRows, version);
+    const store = createSourceStore<string>({
+      getSource: () => snapshotSource,
+      getSnapshot: () => ({
+        source: snapshotSource,
+        version
+      }),
+      apply: (patches) => {
+        latestRows = [alphaUpdated];
+        version = 'v2';
+        snapshotSource = todoSource(latestRows, version);
+
+        return {
+          status: 'accepted',
+          accepted: true,
+          patches: patches.length,
+          applied: patches.length,
+          deltas: [{ relation: schema.todos, added: [alphaUpdated], removed: [alpha, beta] }],
+          diagnostics: [],
+          version
+        };
+      }
+    });
+    const events: unknown[] = [];
+    const handle = watch(store.getSnapshot().source, schema.todos, (event) => {
+      events.push(event);
+    });
+
+    const result = await store.commit([
+      todos.update('todo-a', { title: 'Alpha updated' }),
+      todos.delete('todo-b')
+    ]);
+
+    expect(result.status).toBe('committed');
+    expect(result.changes).toMatchObject([
+      {
+        kind: 'trackedChange',
+        id: handle.id,
+        target: schema.todos,
+        changed: true,
+        previousRows: [alpha, beta],
+        rows: [alphaUpdated],
+        addedRows: [alphaUpdated],
+        removedRows: [alpha, beta],
+        rowChanges: [
+          {
+            op: 'update',
+            key: stableRowKey('todo-a'),
+            before: alpha,
+            after: alphaUpdated
+          },
+          {
+            op: 'delete',
+            key: stableRowKey('todo-b'),
+            before: beta
+          }
+        ],
+        diagnostics: []
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      target: schema.todos,
+      changes: { deltas: result.deltas },
+      rowChanges: [
+        {
+          op: 'update',
+          key: stableRowKey('todo-a'),
+          before: alpha,
+          after: alphaUpdated
+        },
+        {
+          op: 'delete',
+          key: stableRowKey('todo-b'),
+          before: beta
+        }
+      ]
+    });
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
   it('recomputes materialized source snapshots in refreshed source order after accepted apply commits', async () => {
     const alpha = { id: 'todo-a', title: 'Alpha', done: false };
     const beta = { id: 'todo-b', title: 'Beta', done: false };
@@ -1248,6 +1451,75 @@ describe('@tarstate/react', () => {
         maintenance: 'incremental'
       }
     ]);
+  });
+
+  it('maintains materialized source snapshots across manual refresh and host invalidation', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const beta = { id: 'todo-b', title: 'Beta', done: false };
+    const gamma = { id: 'todo-c', title: 'Gamma', done: false };
+    let version = 'v1';
+    let snapshotSource = todoSource([alpha], version);
+    let hostInvalidate: (() => void) | undefined;
+
+    await materializeSnapshot(snapshotSource, openTodos, { id: 'refresh-open-todos', mode: 'incremental' });
+
+    const store = createSourceStore<string>({
+      getSource: () => snapshotSource,
+      getSnapshot: () => ({
+        source: snapshotSource,
+        version
+      }),
+      subscribe: (listener) => {
+        hostInvalidate = listener;
+        return () => {
+          hostInvalidate = undefined;
+        };
+      }
+    });
+
+    version = 'v2';
+    snapshotSource = todoSource([beta, alpha], version);
+    await store.refresh();
+
+    expect(store.getSnapshot().revision).toBe(1);
+    expect(store.getSnapshot().version).toBe('v2');
+    expect(materializedRowsFor(store.getSnapshot().source, 'refresh-open-todos')).toEqual([
+      { id: 'todo-b', title: 'Beta' },
+      { id: 'todo-a', title: 'Alpha' }
+    ]);
+    expect(materializationsFor(store.getSnapshot().source)).toMatchObject([
+      {
+        id: 'refresh-open-todos',
+        requestedMode: 'incremental',
+        maintenance: 'incremental'
+      }
+    ]);
+
+    let unsubscribe: () => void = () => undefined;
+    const notified = new Promise<void>((resolve) => {
+      unsubscribe = store.subscribe(resolve);
+    });
+
+    version = 'v3';
+    snapshotSource = todoSource([gamma, beta, alpha], version);
+    hostInvalidate?.();
+    await notified;
+
+    expect(store.getSnapshot().revision).toBe(2);
+    expect(store.getSnapshot().version).toBe('v3');
+    expect(materializedRowsFor(store.getSnapshot().source, 'refresh-open-todos')).toEqual([
+      { id: 'todo-c', title: 'Gamma' },
+      { id: 'todo-b', title: 'Beta' },
+      { id: 'todo-a', title: 'Alpha' }
+    ]);
+    expect(materializationsFor(store.getSnapshot().source)).toMatchObject([
+      {
+        id: 'refresh-open-todos',
+        requestedMode: 'incremental',
+        maintenance: 'incremental'
+      }
+    ]);
+    unsubscribe();
   });
 
   it('omits materialization maintenance for unmaterialized source store commits', async () => {

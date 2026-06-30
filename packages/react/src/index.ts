@@ -10,7 +10,6 @@ import {
   type ReactNode
 } from 'react';
 import {
-  relationApplyResultFromAdapterCommit,
   tryCommitAdapter,
   tryApplyRelationPatches,
   type AdapterCommitResult,
@@ -246,16 +245,11 @@ export function createDbStore(
 export function createAdapterStore<Version>(
   adapter: RelationAdapter<Version>
 ): TarstateStore<TarstateSnapshot<Version>> {
-  const target = adapter.target ?? {
-    apply: async (patches: readonly WritePatch[]) =>
-      relationApplyResultFromAdapterCommit(await tryCommitAdapter(adapter, patches, { readVersion: false }))
-  };
-
-  return createRuntimeStore({
-    source: adapter.source,
-    target,
-    ...(adapter.snapshot === undefined ? {} : { snapshot: adapter.snapshot }),
-    ...(adapter.subscribe === undefined ? {} : { subscribe: adapter.subscribe })
+  return createSourceStore({
+    getSource: () => adapter.source,
+    getSnapshot: () => adapter.snapshot?.() ?? adapter.source,
+    ...(adapter.subscribe === undefined ? {} : { subscribe: adapter.subscribe }),
+    ...(adapter.target === undefined ? { commit: adapter.commit } : { target: adapter.target })
   });
 }
 
@@ -315,7 +309,12 @@ export function createSourceStore<Version = unknown>(
   };
 
   const refresh = async (): Promise<void> => {
-    snapshot = await readSnapshot(revision + 1);
+    const refreshedSnapshot = await readSnapshot(revision + 1);
+    const maintainedSnapshot = await maintainSourceSnapshotMaterializations(
+      snapshot.source,
+      refreshedSnapshot
+    );
+    snapshot = maintainedSnapshot.snapshot;
     revision = snapshot.revision;
     notify();
   };
@@ -372,16 +371,35 @@ export function createSourceStore<Version = unknown>(
       }
 
       commitDepth += 1;
+      let reportedDeltas: readonly RelationDelta[] | undefined;
       const result = await (async () => {
         try {
           return target === undefined
             ? await tryCommitAdapter<Version>(
-                { source: adapterSource(options.getSource(), options.getVersion), commit: options.commit as NonNullable<SourceStoreOptions<Version>['commit']> },
+                {
+                  source: adapterSource(options.getSource(), options.getVersion),
+                  commit: async (nextPatches) => {
+                    const commitResult = await (
+                      options.commit as NonNullable<SourceStoreOptions<Version>['commit']>
+                    )(nextPatches);
+                    reportedDeltas = ownRelationDeltas(commitResult);
+                    return commitResult;
+                  }
+                },
                 patchList,
                 { readVersion: false }
               )
             : await tryApplyRelationPatches<Version>(
-                { source: adapterSource(options.getSource(), options.getVersion), target },
+                {
+                  source: adapterSource(options.getSource(), options.getVersion),
+                  target: {
+                    apply: async (nextPatches) => {
+                      const applyResult = await target.apply(nextPatches);
+                      reportedDeltas = ownRelationDeltas(applyResult);
+                      return applyResult;
+                    }
+                  }
+                },
                 patchList,
                 { readVersion: false }
               );
@@ -391,20 +409,21 @@ export function createSourceStore<Version = unknown>(
       })();
 
       let maintenance: MaterializationMaintenanceResult | undefined;
+      let changes: readonly TrackedChange[] | undefined;
       let diagnostics: readonly TarstateReactDiagnostic[] = result.diagnostics;
 
       if (result.status !== 'rejected') {
         hostRefreshQueued = false;
         const refreshedSnapshot = await readSnapshot(revision + 1, result.diagnostics, result.version);
-        const maintainedSnapshot = await maintainSourceSnapshotMaterializations(
+        const trackedSnapshot = await trackSourceSnapshotCommit(
           previousSnapshot.source,
-          refreshedSnapshot
+          refreshedSnapshot,
+          reportedDeltas === undefined ? undefined : result.deltas
         );
-        maintenance = maintainedSnapshot.materializations;
-        diagnostics = maintenance === undefined
-          ? result.diagnostics
-          : [...result.diagnostics, ...maintenance.diagnostics];
-        snapshot = maintainedSnapshot.snapshot;
+        maintenance = trackedSnapshot.materializations;
+        changes = trackedSnapshot.changes;
+        diagnostics = [...result.diagnostics, ...trackedSnapshot.diagnostics];
+        snapshot = trackedSnapshot.snapshot;
         revision = snapshot.revision;
         notify();
       } else if (hostRefreshQueued) {
@@ -421,6 +440,7 @@ export function createSourceStore<Version = unknown>(
         patches: result.patches,
         applied: result.applied,
         deltas: result.deltas,
+        ...(changes === undefined ? {} : { changes }),
         ...tarstateDurability(result),
         ...(maintenance === undefined ? {} : { materializations: maintenance }),
         diagnostics,
@@ -645,6 +665,40 @@ async function maintainSourceSnapshotMaterializations<Version>(
       nextSnapshot.version
     ),
     materializations
+  };
+}
+
+async function trackSourceSnapshotCommit<Version>(
+  previousSource: RelationSource,
+  nextSnapshot: TarstateSnapshot<Version>,
+  deltas: readonly RelationDelta[] | undefined
+): Promise<{
+  readonly snapshot: TarstateSnapshot<Version>;
+  readonly changes: readonly TrackedChange[];
+  readonly materializations?: MaterializationMaintenanceResult;
+  readonly diagnostics: readonly TarstateReactDiagnostic[];
+}> {
+  const hadMaterializations = materializationsFor(previousSource).length > 0;
+  // Source replacement does not guarantee that relation deltas carry enough ordering information
+  // to keep materialized query rows in refreshed source order.
+  const trackingDeltas = hadMaterializations ? undefined : deltas;
+  const tracked = await trackTransact(previousSource, () => ({
+    db: nextSnapshot.source,
+    ...(trackingDeltas === undefined ? {} : { deltas: trackingDeltas })
+  }));
+
+  return {
+    snapshot: sourceSnapshot(
+      tracked.db,
+      nextSnapshot.revision,
+      [...nextSnapshot.diagnostics, ...tracked.diagnostics],
+      nextSnapshot.version
+    ),
+    changes: tracked.changes,
+    ...(hadMaterializations && tracked.materializations !== undefined
+      ? { materializations: tracked.materializations }
+      : {}),
+    diagnostics: tracked.diagnostics
   };
 }
 
@@ -977,6 +1031,14 @@ function isTarstateDbSnapshot(snapshot: TarstateSnapshot): snapshot is TarstateD
 
 function commitReflected(deltas: readonly RelationDelta[]): boolean {
   return deltas.some((delta) => delta.added.length > 0 || delta.removed.length > 0);
+}
+
+function ownRelationDeltas(input: unknown): readonly RelationDelta[] | undefined {
+  if (!isRecord(input) || !Object.hasOwn(input, 'deltas')) {
+    return undefined;
+  }
+
+  return Array.isArray(input.deltas) ? input.deltas as readonly RelationDelta[] : undefined;
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {
