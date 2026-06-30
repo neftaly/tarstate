@@ -15,6 +15,7 @@
     "./evaluate": "./src/evaluate.ts",
     "./identity": "./src/identity.ts",
     "./materialization": "./src/materialization.ts",
+    "./memory-runtime": "./src/memory-runtime.ts",
     "./query": "./src/query.ts",
     "./runtime": "./src/runtime.ts",
     "./schema": "./src/schema.ts",

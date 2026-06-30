@@ -1,15 +1,23 @@
 import { describe, expect, it } from 'vitest';
+import type {
+  AdapterCommitResult,
+  AdapterSnapshot,
+  AdapterSource,
+  RelationAdapter,
+  RelationApplyResult,
+  RelationRuntime
+} from '@tarstate/core/adapter';
 import { attachConstraints, check, constrain } from '@tarstate/core/constraints';
-import { createDb, tryTransact } from '@tarstate/core/db';
+import { createDb, dbSource, tryTransact, type Db } from '@tarstate/core/db';
 import type { TarstateDiagnostic } from '@tarstate/core/diagnostics';
 import { stableRowKey } from '@tarstate/core/diff';
 import { materializationForQuery, materializedRowsFor, materializeSnapshot } from '@tarstate/core/materialization';
 import { as, eq, field, from, pipe, project, where } from '@tarstate/core/query';
-import { trackTransact } from '@tarstate/core/runtime';
+import { trackRuntimeCommit, trackTransact } from '@tarstate/core/runtime';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import type { RelationSource } from '@tarstate/core/source';
 import { watch } from '@tarstate/core/watch';
-import { write } from '@tarstate/core/write';
+import { write, type WritePatch } from '@tarstate/core/write';
 
 const schema = defineSchema({
   todos: relation<{
@@ -74,6 +82,20 @@ type CountedSource = {
   readonly rowsCalls: () => number;
   readonly diagnosticsCalls: () => number;
 };
+type RuntimeMode = 'accepted' | 'partialFirst' | 'rejected' | 'acceptedWithoutDeltas';
+type RuntimeSeed = {
+  readonly todos?: readonly TodoRow[];
+  readonly logs?: readonly LogRow[];
+};
+type TodoRow = {
+  readonly id: string;
+  readonly title: string;
+  readonly done: boolean;
+};
+type LogRow = {
+  readonly id: string;
+  readonly message: string;
+};
 
 function countedSource(
   data: Record<string, readonly unknown[]>,
@@ -103,6 +125,169 @@ function countedSource(
     rowsCalls: () => rowsCalls,
     diagnosticsCalls: () => diagnosticsCalls
   };
+}
+
+class MutableRuntime implements RelationRuntime<number> {
+  private db: Db;
+  private versionId = 0;
+
+  readonly snapshotSources: RelationSource[] = [];
+  readonly source: AdapterSource<number> = {
+    relationNames: [schema.todos.name, schema.logs.name],
+    rows: (relationRef) => this.db.data[relationRef.name] ?? [],
+    version: () => this.versionId
+  };
+  readonly target = {
+    apply: (patches: readonly WritePatch[]) => this.apply(patches)
+  };
+
+  constructor(
+    seed: RuntimeSeed,
+    private readonly mode: RuntimeMode = 'accepted'
+  ) {
+    this.db = createDb({
+      todos: seed.todos ?? [],
+      logs: seed.logs ?? []
+    });
+  }
+
+  snapshot = (): AdapterSnapshot<number> => {
+    const version = this.versionId;
+    const source = {
+      ...dbSource(this.db),
+      version: () => version
+    };
+
+    this.snapshotSources.push(source);
+    return { source, version };
+  };
+
+  commitAdapter = (patches: readonly WritePatch[]): AdapterCommitResult<number> => this.commitAll(patches);
+
+  private apply(patches: readonly WritePatch[]): RelationApplyResult<number> {
+    switch (this.mode) {
+      case 'accepted':
+        return relationApplyResultFromCommit(this.commitAll(patches));
+      case 'partialFirst':
+        return this.applyFirstPatch(patches);
+      case 'rejected':
+        return {
+          status: 'rejected',
+          accepted: false,
+          patches: patches.length,
+          applied: 0,
+          deltas: [],
+          diagnostics: [runtimeDiagnostic('runtime rejected patches')],
+          version: this.versionId
+        };
+      case 'acceptedWithoutDeltas':
+        return this.applyWithoutDeltas(patches);
+    }
+  }
+
+  private applyFirstPatch(patches: readonly WritePatch[]): RelationApplyResult<number> {
+    const firstPatch = patches[0];
+    const result = this.commitAll(firstPatch === undefined ? [] : [firstPatch]);
+
+    return {
+      status: 'partial',
+      accepted: false,
+      patches: patches.length,
+      applied: result.applied,
+      deltas: result.deltas,
+      diagnostics: [runtimeDiagnostic('runtime applied only the first patch')],
+      version: this.versionId
+    };
+  }
+
+  private applyWithoutDeltas(patches: readonly WritePatch[]): RelationApplyResult<number> {
+    const result = this.commitAll(patches);
+
+    return {
+      status: 'accepted',
+      accepted: true,
+      patches: result.patches,
+      applied: result.applied,
+      diagnostics: result.diagnostics,
+      version: this.versionId
+    } as unknown as RelationApplyResult<number>;
+  }
+
+  private commitAll(patches: readonly WritePatch[]): AdapterCommitResult<number> {
+    const transaction = tryTransact(this.db, patches);
+
+    if (!transaction.committed) {
+      return {
+        status: 'rejected',
+        committed: false,
+        patches: transaction.patches,
+        applied: 0,
+        deltas: [],
+        diagnostics: transaction.diagnostics,
+        version: this.versionId
+      };
+    }
+
+    this.db = transaction.db;
+    this.versionId += 1;
+
+    return {
+      status: 'committed',
+      committed: true,
+      patches: transaction.patches,
+      applied: transaction.applied,
+      deltas: transaction.deltas,
+      diagnostics: [],
+      version: this.versionId
+    };
+  }
+}
+
+function runtimeDiagnostic(message: string): TarstateDiagnostic {
+  return {
+    code: 'source_error',
+    message
+  };
+}
+
+function relationApplyResultFromCommit(result: AdapterCommitResult<number>): RelationApplyResult<number> {
+  if (result.status === 'rejected') {
+    return {
+      status: 'rejected',
+      accepted: false,
+      patches: result.patches,
+      applied: 0,
+      deltas: [],
+      diagnostics: result.diagnostics,
+      ...testVersionProperty(result.version)
+    };
+  }
+
+  if (result.status === 'committed') {
+    return {
+      status: 'accepted',
+      accepted: true,
+      patches: result.patches,
+      applied: result.applied,
+      deltas: result.deltas,
+      diagnostics: result.diagnostics,
+      ...testVersionProperty(result.version)
+    };
+  }
+
+  return {
+    status: 'partial',
+    accepted: false,
+    patches: result.patches,
+    applied: result.applied,
+    deltas: result.deltas,
+    diagnostics: result.diagnostics,
+    ...testVersionProperty(result.version)
+  };
+}
+
+function testVersionProperty(version: number | undefined): { readonly version?: number } {
+  return version === undefined ? {} : { version };
 }
 
 describe('tarstate runtime orchestration', () => {
@@ -693,5 +878,333 @@ describe('tarstate runtime orchestration', () => {
     expect(result.changes).toEqual([]);
     expect(events).toEqual([]);
     expect(materializedRowsFor(result.db, 'open-todos')).toEqual([{ id: 'todo-a', title: 'Alpha' }]);
+  });
+
+  it('tracks accepted adapter-like runtime patch commits through materializations and watched queries', async () => {
+    const runtime = new MutableRuntime({
+      todos: [
+        { id: 'todo-a', title: 'Alpha', done: false },
+        { id: 'todo-b', title: 'Beta', done: false }
+      ]
+    });
+    const adapter: RelationAdapter<number> = {
+      source: runtime.source,
+      snapshot: runtime.snapshot,
+      target: {
+        apply: () => {
+          throw new Error('target apply should not be called for adapter-like commits');
+        }
+      },
+      commit: runtime.commitAdapter
+    };
+    const todos = write(schema.todos);
+    const events: unknown[] = [];
+
+    await materializeSnapshot(adapter.source, openTodos, { id: 'runtime-open' });
+    const handle = watch(adapter.source, openTodos, (event) => {
+      events.push(event);
+    }, { keyFields: ['id'] });
+
+    const result = await trackRuntimeCommit(adapter, [
+      todos.update('todo-a', { done: true }),
+      todos.insert({ id: 'todo-c', title: 'Gamma', done: false })
+    ], { label: 'adapter-commit' });
+
+    expect(result).toMatchObject({
+      kind: 'trackRuntimeCommit',
+      runtime: adapter,
+      source: adapter.source,
+      supported: true,
+      status: 'accepted',
+      accepted: true,
+      patches: 2,
+      applied: 2,
+      version: 1,
+      label: 'adapter-commit',
+      diagnostics: []
+    });
+    expect(result.deltas).toEqual([
+      {
+        relation: schema.todos,
+        added: [
+          { id: 'todo-a', title: 'Alpha', done: true },
+          { id: 'todo-c', title: 'Gamma', done: false }
+        ],
+        removed: [{ id: 'todo-a', title: 'Alpha', done: false }]
+      }
+    ]);
+    expect(runtime.snapshotSources).toHaveLength(2);
+    expect(runtime.snapshotSources[0]).not.toBe(runtime.snapshotSources[1]);
+    expect(result.materializations).toMatchObject({
+      maintained: 1,
+      recomputed: 1,
+      carried: 0,
+      changes: [{ id: 'runtime-open', update: 'recomputed' }],
+      sourceVersion: 1
+    });
+    expect(materializedRowsFor(adapter.source, 'runtime-open')).toEqual([
+      { id: 'todo-b', title: 'Beta' },
+      { id: 'todo-c', title: 'Gamma' }
+    ]);
+    expect(result.changes).toMatchObject([
+      {
+        id: handle.id,
+        changed: true,
+        addedRows: [{ id: 'todo-c', title: 'Gamma' }],
+        removedRows: [{ id: 'todo-a', title: 'Alpha' }],
+        unchangedRows: [{ id: 'todo-b', title: 'Beta' }],
+        rowChanges: [
+          {
+            op: 'insert',
+            key: stableRowKey('todo-c'),
+            after: { id: 'todo-c', title: 'Gamma' }
+          },
+          {
+            op: 'delete',
+            key: stableRowKey('todo-a'),
+            before: { id: 'todo-a', title: 'Alpha' }
+          }
+        ]
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      changed: true,
+      changes: { deltas: result.deltas, diagnostics: [] }
+    });
+  });
+
+  it('tracks partial generic runtime patch commits with only reported deltas', async () => {
+    const runtime = new MutableRuntime({
+      todos: [
+        { id: 'todo-a', title: 'Alpha', done: false },
+        { id: 'todo-b', title: 'Beta', done: false }
+      ]
+    }, 'partialFirst');
+    const todos = write(schema.todos);
+    const events: unknown[] = [];
+    const handle = watch(runtime.source, openTodos, (event) => {
+      events.push(event);
+    }, { keyFields: ['id'] });
+
+    const result = await trackRuntimeCommit(runtime, [
+      todos.update('todo-a', { done: true }),
+      todos.update('todo-b', { done: true })
+    ]);
+
+    expect(result).toMatchObject({
+      kind: 'trackRuntimeCommit',
+      runtime,
+      source: runtime.source,
+      supported: true,
+      status: 'partial',
+      accepted: false,
+      patches: 2,
+      applied: 1,
+      version: 1,
+      diagnostics: [{ code: 'source_error', message: 'runtime applied only the first patch' }]
+    });
+    expect(result.deltas).toEqual([
+      {
+        relation: schema.todos,
+        added: [{ id: 'todo-a', title: 'Alpha', done: true }],
+        removed: [{ id: 'todo-a', title: 'Alpha', done: false }]
+      }
+    ]);
+    expect(runtime.snapshotSources).toHaveLength(2);
+    expect(result.changes).toMatchObject([
+      {
+        id: handle.id,
+        changed: true,
+        addedRows: [],
+        removedRows: [{ id: 'todo-a', title: 'Alpha' }],
+        unchangedRows: [{ id: 'todo-b', title: 'Beta' }],
+        rowChanges: [
+          {
+            op: 'delete',
+            key: stableRowKey('todo-a'),
+            before: { id: 'todo-a', title: 'Alpha' }
+          }
+        ]
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      changed: true,
+      changes: { deltas: result.deltas, diagnostics: [] }
+    });
+  });
+
+  it('recomputes runtime materializations in source order when commits report deltas', async () => {
+    const alpha = { id: 'todo-a', title: 'Alpha', done: false };
+    const beta = { id: 'todo-b', title: 'Beta', done: false };
+    let rows = [alpha];
+    let version = 0;
+    const source: AdapterSource<number> = {
+      relationNames: ['todos'],
+      rows: (relationRef) => relationRef.name === 'todos' ? rows : [],
+      version: () => version
+    };
+    const runtime: RelationRuntime<number> = {
+      source,
+      snapshot: () => ({ source, version }),
+      target: {
+        apply: (patches) => {
+          rows = [beta, ...rows];
+          version += 1;
+
+          return {
+            status: 'accepted',
+            accepted: true,
+            patches: patches.length,
+            applied: patches.length,
+            deltas: [{ relation: schema.todos, added: [beta], removed: [] }],
+            diagnostics: [],
+            version
+          };
+        }
+      }
+    };
+    const todos = write(schema.todos);
+
+    await materializeSnapshot(runtime.source, openTodos, { id: 'runtime-ordered-open', mode: 'incremental' });
+
+    const result = await trackRuntimeCommit(runtime, [
+      todos.insert(beta)
+    ]);
+
+    expect(result.deltas).toEqual([
+      { relation: schema.todos, added: [beta], removed: [] }
+    ]);
+    expect(result.materializations).toMatchObject({
+      maintained: 1,
+      recomputed: 1,
+      carried: 0,
+      changes: [
+        {
+          id: 'runtime-ordered-open',
+          update: 'recomputed',
+          rows: [
+            { id: 'todo-b', title: 'Beta' },
+            { id: 'todo-a', title: 'Alpha' }
+          ],
+          addedRows: [{ id: 'todo-b', title: 'Beta' }],
+          removedRows: []
+        }
+      ]
+    });
+    expect(materializedRowsFor(runtime.source, 'runtime-ordered-open')).toEqual([
+      { id: 'todo-b', title: 'Beta' },
+      { id: 'todo-a', title: 'Alpha' }
+    ]);
+  });
+
+  it('does not maintain materializations or emit watched changes for rejected runtime patch commits', async () => {
+    const runtime = new MutableRuntime({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+    }, 'rejected');
+    const todos = write(schema.todos);
+    const events: unknown[] = [];
+
+    await materializeSnapshot(runtime.source, openTodos, { id: 'runtime-rejected-open' });
+    watch(runtime.source, openTodos, (event) => {
+      events.push(event);
+    });
+
+    const result = await trackRuntimeCommit(runtime, [
+      todos.update('todo-a', { done: true })
+    ]);
+
+    expect(result).toMatchObject({
+      kind: 'trackRuntimeCommit',
+      runtime,
+      source: runtime.source,
+      supported: true,
+      status: 'rejected',
+      accepted: false,
+      patches: 1,
+      applied: 0,
+      changes: [],
+      deltas: [],
+      diagnostics: [{ code: 'source_error', message: 'runtime rejected patches' }]
+    });
+    expect(result.materializations).toBeUndefined();
+    expect(events).toEqual([]);
+    expect(runtime.snapshotSources).toHaveLength(1);
+    expect(materializedRowsFor(runtime.source, 'runtime-rejected-open')).toEqual([
+      { id: 'todo-a', title: 'Alpha' }
+    ]);
+  });
+
+  it('recomputes tracking without fake row changes when a runtime commit omits deltas', async () => {
+    const runtime = new MutableRuntime({
+      todos: [{ id: 'todo-a', title: 'Alpha', done: false }],
+      logs: []
+    }, 'acceptedWithoutDeltas');
+    const logs = write(schema.logs);
+    const events: unknown[] = [];
+    const handle = watch(runtime.source, openTodos, (event) => {
+      events.push(event);
+    }, { keyFields: ['id'] });
+
+    await materializeSnapshot(runtime.source, openTodos, { id: 'runtime-no-deltas-open' });
+
+    const result = await trackRuntimeCommit(runtime, [
+      logs.insert({ id: 'log-a', message: 'unreported relation delta' })
+    ]);
+
+    expect(result).toMatchObject({
+      kind: 'trackRuntimeCommit',
+      runtime,
+      source: runtime.source,
+      supported: true,
+      status: 'accepted',
+      accepted: true,
+      patches: 1,
+      applied: 1,
+      version: 1,
+      deltas: [],
+      diagnostics: []
+    });
+    expect(result.materializations).toMatchObject({
+      maintained: 1,
+      recomputed: 1,
+      carried: 0,
+      changes: [
+        {
+          id: 'runtime-no-deltas-open',
+          update: 'recomputed',
+          previousRowsAvailable: true,
+          previousRows: [{ id: 'todo-a', title: 'Alpha' }],
+          rows: [{ id: 'todo-a', title: 'Alpha' }],
+          addedRows: [],
+          removedRows: []
+        }
+      ],
+      sourceVersion: 1
+    });
+    expect(result.changes).toMatchObject([
+      {
+        id: handle.id,
+        changed: false,
+        addedRows: [],
+        removedRows: [],
+        unchangedRows: [{ id: 'todo-a', title: 'Alpha' }],
+        rowChanges: [],
+        diagnostics: []
+      }
+    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      id: handle.id,
+      changed: false,
+      addedRows: [],
+      removedRows: [],
+      rowChanges: [],
+      changes: { diagnostics: [] }
+    });
+    expect(Object.hasOwn((events[0] as { readonly changes: object }).changes, 'deltas')).toBe(false);
   });
 });

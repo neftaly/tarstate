@@ -158,7 +158,9 @@ Current state:
   optional invalidation `subscribe()`.
 - `RelationAdapter` remains the durable compatibility shape: a runtime plus
   `commit(patches)` returning commit status, committed/applied counts, relation
-  deltas, diagnostics, and optional post-commit version identity.
+  deltas, diagnostics, and optional post-commit version identity. Adapters may
+  additionally expose `target.apply` when the same durable commit path can be
+  used through generic runtime composition.
 - Apply/commit `status` is the authoritative outcome: rejected attempts have no
   reflected patch effects, while partial attempts report only reflected
   deltas/version and diagnostics for rejected effects.
@@ -167,6 +169,8 @@ Current state:
   missing version fallback; they do not validate adapter-owned business
   semantics.
 - Object-backed DB/write helpers exist for local use and tests.
+- `createMemoryRelationRuntime` provides a non-durable object-backed
+  `RelationRuntime` for local state and adapter contract tests.
 - `@tarstate/core/delta` is the change boundary for adapters that can translate
   host changes into relation added/removed rows.
 
@@ -215,9 +219,16 @@ Current state:
   added/removed/unchanged diffs plus experimental keyed `rowChanges`.
   `subscribeWatch` adds callback fan-out to an existing watch, but callbacks
   fire only when `refresh()` or a real tracked-change path emits an event.
+- `watchRuntime` bridges a `RelationRuntime.subscribe` host invalidation into a
+  normal watch refresh against `runtime.snapshot?.().source ?? runtime.source`.
+  It does not synthesize relation deltas or expose an async stream.
 - `trackTransact` lives in `@tarstate/core/runtime`, composes readable
   DB/source transactions with watch refresh and materialization maintenance, and
   returns recompute-backed changes for watched query/relation targets.
+- `trackRuntimeCommit` applies patches through a `RelationRuntime` or
+  `RelationAdapter`, then maintains materializations and reports watched
+  changes from the real apply/commit result. Rejected commits do not maintain or
+  emit changes, and missing deltas force recompute rather than fake deltas.
 - When relation deltas are available, tracked transactions use query
   dependencies to skip watches that cannot be affected before recomputing rows.
 
@@ -226,9 +237,9 @@ Open questions:
 - What is row identity for query results?
 - Should diffs report added/deleted rows, row keys, patch-like deltas, or
   relation/query-specific change records?
-- Should current refresh/tracked-change callback delivery grow into async
-  streams, adapter-fed source observation, or a separate host integration
-  contract?
+- Should current refresh/tracked-change/runtime callback delivery grow into
+  async streams, adapter-fed relation-delta observation, or a separate host
+  integration contract?
 - How should recompute-backed `trackTransact` promote to incremental
   maintenance without changing its public result shape?
 

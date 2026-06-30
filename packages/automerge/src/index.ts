@@ -3,9 +3,12 @@ import type {
   AdapterCommitResult,
   AdapterSnapshot,
   AdapterSource,
+  RelationApplyResult,
   RelationAdapter,
+  RelationPatchTarget,
   TarstateDiagnostic
 } from '@tarstate/core/adapter';
+import { relationApplyResultFromAdapterCommit } from '@tarstate/core/adapter';
 import { isJsonValue, type FieldSpec, type RelationRef } from '@tarstate/core/schema';
 import type { RelationLookup, RelationRangeLookup } from '@tarstate/core/source';
 import { applyWritesAtomic, type MutableObjectSourceData } from '@tarstate/core/write-apply';
@@ -45,6 +48,7 @@ export type AutomergeMapAdapter<
   readonly doc: Automerge.Doc<DocumentShape>;
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
   readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
+  readonly target: RelationPatchTarget<Automerge.Heads>;
 };
 
 type RelationPlan = {
@@ -144,6 +148,9 @@ class AutomergeMapRelationAdapter<
 > implements AutomergeMapAdapter<DocumentShape> {
   readonly relations: readonly AutomergeMapRelation[];
   readonly source: AdapterSource<Automerge.Heads>;
+  readonly target: RelationPatchTarget<Automerge.Heads> = {
+    apply: (patches) => this.apply(patches)
+  };
 
   private currentDoc: Automerge.Doc<DocumentShape>;
   private readonly plans: ReadonlyMap<string, RelationPlan>;
@@ -230,6 +237,13 @@ class AutomergeMapRelationAdapter<
 
     return rejectedResult(patchList.length, touchedPlans.diagnostics, this.version());
   };
+
+  private apply(patches: readonly WritePatch[]): RelationApplyResult<Automerge.Heads> {
+    return {
+      ...relationApplyResultFromAdapterCommit(this.commit(patches)),
+      durability: 'durable'
+    };
+  }
 
   private version(): Automerge.Heads {
     return Automerge.getHeads(this.currentDoc);

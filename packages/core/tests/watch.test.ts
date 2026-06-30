@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import type { RelationRuntime } from '@tarstate/core/adapter';
 import { createDb, tryTransact } from '@tarstate/core/db';
 import { stableRowKey } from '@tarstate/core/diff';
 import { as, call, eq, from, pipe, project, queryKey, where } from '@tarstate/core/query';
 import { trackTransact } from '@tarstate/core/runtime';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
-import { diffQuery, subscribeWatch, unwatch, watch } from '@tarstate/core/watch';
+import { diffQuery, subscribeWatch, unwatch, watch, watchRuntime } from '@tarstate/core/watch';
 import { write } from '@tarstate/core/write';
 
 const schema = defineSchema({
@@ -44,6 +45,14 @@ const openTodos = pipe(
     title: todo.title
   })
 );
+
+function requireRuntimeNotify(notify: (() => void) | undefined): () => void {
+  if (notify === undefined) {
+    throw new Error('runtime watch was not subscribed');
+  }
+
+  return notify;
+}
 
 describe('tarstate watch/change helpers', () => {
   it('diffs added and removed query result rows without registering a watch', async () => {
@@ -253,7 +262,7 @@ describe('tarstate watch/change helpers', () => {
       rowChanges: []
     });
 
-    expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', id: handle.id, closed: true, diagnostics: [] });
+    expect(unwatch(handle)).toMatchObject({ kind: 'unwatch', id: handle.id, closed: true, diagnostics: [] });
     await expect(handle.refresh(db1)).resolves.toMatchObject({
       kind: 'watchRefresh',
       id: handle.id,
@@ -293,6 +302,188 @@ describe('tarstate watch/change helpers', () => {
       changed: true,
       previousRows: [],
       rows: [{ id: 'todo-b', title: 'Beta' }]
+    });
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
+  it('does not deliver runtime watch events before host notification', async () => {
+    let notifyRuntime: (() => void) | undefined;
+    const runtime: RelationRuntime = {
+      source: fromObjectSource({
+        todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+      }),
+      subscribe: (listener) => {
+        notifyRuntime = listener;
+        return () => {
+          notifyRuntime = undefined;
+        };
+      }
+    };
+    const events: unknown[] = [];
+    let resolveNextEvent: (event: unknown) => void = () => undefined;
+    const nextEvent = new Promise<unknown>((resolve) => {
+      resolveNextEvent = resolve;
+    });
+    const handle = watchRuntime(runtime, openTodos, (event) => {
+      events.push(event);
+      resolveNextEvent(event);
+    });
+
+    expect(events).toEqual([]);
+
+    requireRuntimeNotify(notifyRuntime)();
+
+    await expect(nextEvent).resolves.toMatchObject({
+      kind: 'watchEvent',
+      changed: true,
+      previousRows: [],
+      rows: [{ id: 'todo-a', title: 'Alpha' }],
+      addedRows: [{ id: 'todo-a', title: 'Alpha' }]
+    });
+    expect(events).toHaveLength(1);
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
+  it('refreshes runtime watches with a fresh snapshot source when the host notifies', async () => {
+    let notifyRuntime: (() => void) | undefined;
+    let snapshotCalls = 0;
+    let snapshotRows = [{ id: 'todo-a', title: 'Alpha', done: false }];
+    const runtime: RelationRuntime = {
+      source: fromObjectSource({
+        todos: [{ id: 'todo-source', title: 'Runtime source', done: false }]
+      }),
+      snapshot: () => {
+        snapshotCalls += 1;
+        return {
+          source: fromObjectSource({ todos: snapshotRows }),
+          version: snapshotCalls
+        };
+      },
+      subscribe: (listener) => {
+        notifyRuntime = listener;
+        return () => {
+          notifyRuntime = undefined;
+        };
+      }
+    };
+    let resolveNextEvent: (event: unknown) => void = () => undefined;
+    const nextEvent = new Promise<unknown>((resolve) => {
+      resolveNextEvent = resolve;
+    });
+    const handle = watchRuntime(runtime, openTodos, resolveNextEvent);
+
+    expect(snapshotCalls).toBe(1);
+
+    snapshotRows = [{ id: 'todo-b', title: 'Beta', done: false }];
+    requireRuntimeNotify(notifyRuntime)();
+
+    await expect(nextEvent).resolves.toMatchObject({
+      changed: true,
+      rows: [{ id: 'todo-b', title: 'Beta' }],
+      addedRows: [{ id: 'todo-b', title: 'Beta' }]
+    });
+    expect(snapshotCalls).toBe(2);
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
+  it('stops runtime host refreshes when the watch is unwatched', async () => {
+    const hostListeners = new Set<() => void>();
+    let snapshotCalls = 0;
+    let snapshotRows = [{ id: 'todo-a', title: 'Alpha', done: false }];
+    const runtime: RelationRuntime = {
+      source: fromObjectSource({ todos: [] }),
+      snapshot: () => {
+        snapshotCalls += 1;
+        return {
+          source: fromObjectSource({ todos: snapshotRows }),
+          version: snapshotCalls
+        };
+      },
+      subscribe: (listener) => {
+        hostListeners.add(listener);
+        return () => {
+          hostListeners.delete(listener);
+        };
+      }
+    };
+    const events: unknown[] = [];
+    const handle = watchRuntime(runtime, openTodos, (event) => {
+      events.push(event);
+    });
+
+    expect(hostListeners.size).toBe(1);
+    expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', id: handle.id, closed: true, diagnostics: [] });
+    expect(hostListeners.size).toBe(0);
+
+    snapshotRows = [{ id: 'todo-b', title: 'Beta', done: false }];
+    for (const listener of hostListeners) {
+      listener();
+    }
+    await Promise.resolve();
+
+    expect(events).toEqual([]);
+    expect(snapshotCalls).toBe(1);
+    await expect(handle.refresh()).resolves.toMatchObject({
+      kind: 'watchRefresh',
+      id: handle.id,
+      delivered: false,
+      changed: false,
+      diagnostics: [{ code: 'watch_already_closed', surface: 'watch' }]
+    });
+  });
+
+  it('keeps runtime watches without host subscribe as manual watches', async () => {
+    let sourceRows = [{ id: 'todo-a', title: 'Alpha', done: false }];
+    const runtime: RelationRuntime = {
+      source: {
+        rows: (relationRef) => relationRef.name === 'todos' ? sourceRows : [],
+        version: () => sourceRows
+      }
+    };
+    const events: unknown[] = [];
+    const handle = watchRuntime(runtime, openTodos, (event) => {
+      events.push(event);
+    }, { label: 'runtime open todos' });
+
+    expect(handle).toMatchObject({
+      kind: 'watch',
+      target: openTodos,
+      supported: true,
+      mode: 'manual',
+      label: 'runtime open todos',
+      diagnostics: []
+    });
+    expect(events).toEqual([]);
+
+    sourceRows = [{ id: 'todo-b', title: 'Beta', done: false }];
+    await expect(handle.refresh()).resolves.toMatchObject({
+      delivered: true,
+      changed: true,
+      previousRows: [],
+      rows: [{ id: 'todo-b', title: 'Beta' }],
+      addedRows: [{ id: 'todo-b', title: 'Beta' }]
+    });
+    expect(events).toHaveLength(1);
+    expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
+  });
+
+  it('reports runtime watch listener errors through awaited refresh diagnostics', async () => {
+    const runtime: RelationRuntime = {
+      source: fromObjectSource({
+        todos: [{ id: 'todo-a', title: 'Alpha', done: false }]
+      })
+    };
+    const handle = watchRuntime(runtime, openTodos, () => {
+      throw new Error('runtime listener failed');
+    });
+
+    await expect(handle.refresh()).resolves.toMatchObject({
+      delivered: false,
+      changed: true,
+      previousRows: [],
+      rows: [{ id: 'todo-a', title: 'Alpha' }],
+      addedRows: [{ id: 'todo-a', title: 'Alpha' }],
+      diagnostics: [{ code: 'watch_listener_error', surface: 'watch' }]
     });
     expect(handle.unwatch()).toMatchObject({ closed: true, diagnostics: [] });
   });

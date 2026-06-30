@@ -22,25 +22,32 @@ The core API is moving toward a Relic-shaped split:
   subscription. Durable `RelationAdapter.commit(patches)` remains the
   compatibility shape for storage adapters, with
   `relationApplyResultFromAdapterCommit` bridging that durable commit result
-  into generic relation-target apply semantics.
+  into generic relation-target apply semantics. The root convenience barrel also
+  exports `createMemoryRelationRuntime` for small non-durable examples and
+  tests.
 - `write` defines the typed mutation vocabulary, including `deleteExact` and
   `replaceAll` alongside insert/update/upsert/delete patches.
 - `delta` and `diff` are the change primitives: relation-level change batches
   and structural row diffs.
 - `db` gives those programs a small object-backed `q`/`qMany`/`transact`
   runtime for examples, tests, and local state.
+- `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
+  rows for tests, local state, and adapter prototyping.
 - `constraints`, `materialization`, `watch`, and `runtime` expose the next API
   surfaces with baseline validation, explicit object-backed constraint
   enforcement, committed relation deltas, snapshot maintenance with a narrow
   single-relation incremental subset, supported `count()`, `sum(expr)`,
   `min(expr)`, and `max(expr)` aggregate maintenance, manual/recompute-backed
   watch refresh with callback fan-out from real refresh/tracked-change events,
-  coarse dependency-filtered recomputation, and explicit fallback diagnostics;
+  host-driven `watchRuntime` refresh for `RelationRuntime.subscribe`, generic
+  `trackRuntimeCommit` orchestration for patch targets, coarse
+  dependency-filtered recomputation, and explicit fallback diagnostics;
   schema-attached or adapter-backed enforcement, general operator-maintained
-  views/indexes, host-driven source observation, and async watch streams are
-  outside the current public guarantees. Host-driven refresh/subscribe
-  invalidations do not automatically maintain materializations; source-like
-  integrations should recompute unless their ordering semantics are explicit.
+  views/indexes, adapter-fed relation deltas for host invalidations, and async
+  watch streams are outside the current public guarantees. Host-driven
+  refresh/subscribe invalidations do not automatically maintain
+  materializations; source-like integrations should recompute unless their
+  ordering semantics are explicit.
 
 See [developer-onboarding.md](../../docs/developer-onboarding.md) for current
 API status, onboarding flows, and package direction.

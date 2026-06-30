@@ -10,7 +10,8 @@ Immer-backed state as relation runtimes. The shared boundary stays host-agnostic
 - `RelationRuntime` combines a `source`, optional `target`, optional
   read-consistent `snapshot()`, and optional invalidation `subscribe()`.
 - `RelationAdapter` remains the durable compatibility shape: a runtime with
-  legacy `commit(WritePatch[])` semantics.
+  legacy `commit(WritePatch[])` semantics. Durable adapters may also expose
+  `target.apply` as the generic runtime facade over the same commit path.
 
 This keeps the data shape generic. Automerge documents, Automerge Repo
 Presence, and Immer stores do not need special query concepts; they expose rows,
@@ -63,11 +64,25 @@ Native presence commands can be added later if needed, but the first adapter can
 stay on Tarstate `WritePatch[]` so docs, presence, and local runtimes share the
 same write path.
 
+## Memory Runtime
+
+`createMemoryRelationRuntime` in `@tarstate/core/memory-runtime` is a small
+non-durable runtime for tests, local state, and adapter prototyping.
+
+- It uses the same `RelationRuntime` shape as durable and presence adapters.
+- It applies normal `WritePatch[]` batches with object-backed write validation.
+- It reports `durability: 'memory'` and increments its numeric version only
+  when accepted writes change relation rows.
+- If created with known relation names, it rejects writes for relations it does
+  not own. If created empty without declared names, it remains dynamic.
+
 ## Automerge Map Adapter
 
 The current map adapter stays durable and compatibility-oriented:
 
 - It exposes `RelationAdapter<Automerge.Heads>`.
+- It exposes `target.apply` by bridging its durable `commit` result into
+  relation-runtime apply semantics, with `durability: 'durable'`.
 - Its `source` filters invalid stored rows from reads and reports diagnostics.
 - Its `commit` rejects writes touching relations that already contain invalid
   stored rows.

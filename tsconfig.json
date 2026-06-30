@@ -46,6 +46,9 @@
       "@tarstate/core/materialization": [
         "./packages/core/src/materialization.ts"
       ],
+      "@tarstate/core/memory-runtime": [
+        "./packages/core/src/memory-runtime.ts"
+      ],
       "@tarstate/core/query": [
         "./packages/core/src/query.ts"
       ],

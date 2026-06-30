@@ -22,7 +22,7 @@ document sync. Those belong in adapters and consumers.
 | `@tarstate/core/query` | Functional | Builds inspectable relational programs, including explicit lookup, hash/btree index declarations, joins, projection, nested collection expansion, sort/limit, set ops, expression calls, literal rows, relation dependency analysis, query keys, and basic aggregates including distinct count, boolean reducers, set collection, and top/bottom reducers. |
 | `@tarstate/core/evaluate` | Functional but naive | One-shot in-memory evaluation. Uses arrays recursively; explicit lookups and simple equality filters/joins can route through `RelationSource.lookup`, and simple btree-declared range filters can route through `RelationSource.rangeLookup`, otherwise evaluation scans. |
 | `@tarstate/core/source` | Functional read-only adapter boundary | Read-only relation contract: `rows`, optional equality `lookup`, optional range `rangeLookup`, optional opaque `version`, optional diagnostics, plus helpers for object row maps and composed sources. Runtime surfaces adapt object-backed DB shapes internally rather than making that part of the source contract. |
-| `@tarstate/core/adapter` | Functional write-capable runtime boundary | Generic runtime contract: `source`, optional patch `target`, optional read-consistent `snapshot()`, optional `subscribe`, apply/commit status, applied counts, relation deltas, diagnostics, and optional version identity. `RelationAdapter.commit(patches)` remains the durable compatibility shape; `tryApplyRelationPatches`, `tryCommitAdapter`, `relationApplyResultFromAdapterCommit`, and `composeRelationRuntimes` are the normalization and composition helpers. |
+| `@tarstate/core/adapter` | Functional write-capable runtime boundary | Generic runtime contract: `source`, optional patch `target`, optional read-consistent `snapshot()`, optional `subscribe`, apply/commit status, applied counts, relation deltas, diagnostics, and optional version identity. `RelationAdapter.commit(patches)` remains the durable compatibility shape; `tryApplyRelationPatches`, `tryCommitAdapter`, `relationApplyResultFromAdapterCommit`, and `composeRelationRuntimes` are the normalization and composition helpers. The root convenience barrel also exports `createMemoryRelationRuntime` for small non-durable examples and tests. |
 | `@tarstate/core/delta` | Functional adapter boundary | Immutable relation-delta types and helpers for adapter-produced added/removed row batches; mutable write accumulators stay internal to the object-backed apply engine. |
 | `@tarstate/core/identity` | Functional identity primitive | Stable structural value canonicalization used by query keys, set operations, distinct aggregates, and row diffs. |
 | `@tarstate/core/diff` | Functional change primitive | Structural row-keying and row-diff helpers shared by query diffing, manual watch refresh, and tracked transactions, including experimental keyed `rowChanges`. |
@@ -31,8 +31,9 @@ document sync. Those belong in adapters and consumers.
 | `@tarstate/core/db` | Functional object runtime | `createDb`, `q`, `qMany`, `row`, `exists`, `whatIf`, `tryTransact`, and `transact` for prototypes, tests, and small object-backed runtimes. `q` and `whatIf` accept a single query or a named query batch. `q`, `qMany`, and `whatIf` can apply post-evaluation `mapRows` result shaping while preserving diagnostics; this is not a query planner, transducer, or collection protocol. Transactions are all-or-nothing and committed results include relation deltas. |
 | `@tarstate/core/constraints` | Experimental validation/enforcement | `check`, `req`, `fk`, `unique`, and `constrain` build descriptors. `validateConstraints` can scan a source for `req`, `unique`, `fk`, and query-bound `check`; `tryTransactConstrained` and `transactConstrained` can reject object-backed writes; unbound `check` remains explicitly unsupported. |
 | `@tarstate/core/materialization` | Experimental snapshot surface | `mat` is the async snapshot materialization shorthand for `materializeSnapshot`; both cache one-shot rows readable by id or query key. `demat` removes metadata and cached snapshot rows. `materializedSourceFor` exposes cached rows as one read-only `RelationSource` relation; `snapshotIndex` can expose only cached snapshot rows as a set index, `snapshotHashIndex` can build read-only hash lookup maps derived from cached snapshot rows, and none of these helpers is an operator-maintained index or view putback surface. `refreshMaterializationSnapshot` can recompute an existing snapshot, and `maintainMaterializationSnapshots` can carry snapshots onto a new DB/source object, skipping unaffected snapshots when relation deltas are supplied. Opt-in incremental maintenance is limited to single-relation pure-filter/project/extend-style queries and a narrow aggregate subset with plain `count()`, `sum(expr)`, `min(expr)`, and `max(expr)`; unsupported shapes/options and unsafe extrema removals keep explicit diagnostics and recompute fallback. |
-| `@tarstate/core/watch` | Experimental diff surface | `diffQuery` can compute a one-shot before/after query result diff with query key and source version identity. `watch` is a manual refresh/recompute handle, not automatic source observation or an async stream; each refresh can deliver full-row diffs plus experimental keyed `rowChanges`. `subscribeWatch` adds callback fan-out to an existing watch, and tracked watch events can carry relation deltas when a runtime supplies them. |
-| `@tarstate/core/runtime` | Experimental orchestration surface | `trackTransact` can run readable DB/source transactions, maintain snapshot materializations, and return recompute-backed changes for watched targets without making watch registration own transaction semantics. |
+| `@tarstate/core/memory-runtime` | Functional local runtime | `createMemoryRelationRuntime` exposes object-backed rows through the same `RelationRuntime` source/target contract used by durable and presence adapters. It is for tests, local state, and adapter prototyping; accepted row-changing writes report `durability: 'memory'` and increment a numeric source version. |
+| `@tarstate/core/watch` | Experimental diff surface | `diffQuery` can compute a one-shot before/after query result diff with query key and source version identity. `watch` is a manual refresh/recompute handle, not an async stream; each refresh can deliver full-row diffs plus experimental keyed `rowChanges`. `subscribeWatch` adds callback fan-out to an existing watch, and `watchRuntime` bridges `RelationRuntime.subscribe` host invalidations into normal watch refreshes without synthesizing deltas. |
+| `@tarstate/core/runtime` | Experimental orchestration surface | `trackTransact` can run readable DB/source transactions, maintain snapshot materializations, and return recompute-backed changes for watched targets without making watch registration own transaction semantics. `trackRuntimeCommit` applies patches through a `RelationRuntime`/`RelationAdapter`, then maintains materializations and delivers watched changes from reported commit/apply results without inventing deltas. |
 | `@tarstate/react` | Experimental React entrypoint | Idiomatic React package with `TarstateProvider`, revisioned external-store snapshots, prefixed hooks (`useTarstateQuery`, `useTarstateQueries`, `useTarstateCommit`) plus short aliases, and store constructors for object-backed DBs, read-only sources, runtimes, and write-capable adapters. DB store commits enforce attached object-backed constraints and use delta-backed maintenance for object-backed materializations. Source/runtime/adapter stores maintain existing materializations only after reflected commits and should recompute unless source order semantics are explicit; host refresh/subscribe invalidations only refresh snapshots unless a store path explicitly maintains materializations. |
 | `@tarstate/automerge` | Experimental API-surface consumer example | Automerge-backed consumer used to pressure-test `RelationSource`, `RelationAdapter`, write patches, version identity, and relation deltas. Treat it as an example integration for now, not the central product direction. |
 
@@ -82,18 +83,19 @@ API blockers to resolve before stronger product claims:
   explicit constraint sets after staged writes and roll back on constraint
   diagnostics; schema/DB attachment remains open.
 - Change tracking contract: one-shot query diffs, manual watch refreshes,
-  `subscribeWatch` callback fan-out, and recompute-backed `trackTransact`
-  report full rows, keyed `rowChanges`, and query/source identity without
-  automatic source-observation semantics; keyed change encoding and patch-like
-  or relation/query-specific semantics still need decisions before true
-  incremental delivery exists.
+  `subscribeWatch` callback fan-out, host-driven `watchRuntime` refreshes, and
+  recompute-backed `trackTransact`/`trackRuntimeCommit` report full rows, keyed
+  `rowChanges`, and query/source identity without async stream semantics; keyed
+  change encoding and patch-like or relation/query-specific semantics still need
+  decisions before true incremental delivery exists.
 - Materialization identity: `queryKey` gives query-structure identity, and
   `RelationSource.version` gives adapters an optional opaque snapshot identity.
 - Adapter ownership: `RelationSource` is read-only, while `RelationRuntime`
   defines the source plus optional patch target shape for stores that accept
-  writes. `RelationAdapter` is the durable `commit` compatibility layer. Indexed
-  lookup policy, write atomicity, and snapshot/version identity remain
-  integration-specific.
+  writes. `RelationAdapter` is the durable `commit` compatibility layer, and a
+  durable adapter can expose `target.apply` when it can bridge that commit path
+  into generic runtime semantics. Indexed lookup policy, write atomicity, and
+  snapshot/version identity remain integration-specific.
 
 ## Open API Decisions
 
@@ -121,9 +123,9 @@ Watch/change tracking:
 - Diff shape: experimental keyed `rowChanges` exist; final key encoding,
   patch-like deltas, and relation/query-specific changes remain open.
 - Timing: synchronous transaction result, refresh/tracked-change callback,
-  async stream, or all three. Current `watch` callbacks are
-  manual refresh/recompute-backed and do not imply host-driven source
-  observation or materialization maintenance.
+  runtime host invalidation callback, async stream, or all three. Current
+  `watch` callbacks are refresh/recompute-backed and do not imply async streams
+  or automatic materialization maintenance.
 - Adapter role: an adapter may provide source changes, but Tarstate should own
   derived-query diffs if it claims watch semantics.
 
@@ -173,6 +175,8 @@ What this gives today:
   materializations.
 - Source/runtime/adapter store maintenance only after reflected commits, with
   conservative recompute unless source order semantics are explicit.
+- Host-driven runtime watch refresh through `watchRuntime`.
+- Runtime/adapter patch commit tracking through `trackRuntimeCommit`.
 - One-shot derived reads through hooks.
 - Narrow experimental incremental snapshot maintenance for simple
   single-relation pure predicates/transforms plus plain `count()`, `sum(expr)`,
@@ -180,7 +184,7 @@ What this gives today:
 
 What it does not give yet:
 
-- Host-driven non-React source subscriptions or async streams.
+- General async streams or adapter-fed relation-delta subscriptions.
 - Stable/general/operator-maintained materialized views.
 - Schema-attached or adapter-backed relational constraints.
 - Storage persistence.

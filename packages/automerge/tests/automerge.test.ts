@@ -1,11 +1,24 @@
 import * as Automerge from '@automerge/automerge';
+import type { DocHandle, PeerId } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { tryCommitAdapter } from '@tarstate/core/adapter';
+import { composeRelationRuntimes, tryApplyRelationPatches, tryCommitAdapter } from '@tarstate/core/adapter';
 import { evaluate } from '@tarstate/core/evaluate';
-import { as, from, pipe, project } from '@tarstate/core/query';
-import { booleanField, defineSchema, idField, numberField, relation, stringField } from '@tarstate/core/schema';
+import { as, eq, from, join, pipe, project, where } from '@tarstate/core/query';
+import {
+  booleanField,
+  defineSchema,
+  idField,
+  jsonField,
+  nullable,
+  numberField,
+  optional,
+  relation,
+  stringField,
+  type JsonValue
+} from '@tarstate/core/schema';
 import { write } from '@tarstate/core/write';
 import {
+  automergePresenceRuntime,
   createAutomergeRelationAdapter,
   rowsFromAutomergeMapPath,
   type AutomergeMapAdapter
@@ -22,6 +35,15 @@ type TodoDocument = {
   readonly todos: Record<string, TodoRow>;
 };
 
+type PresenceRow = {
+  readonly peerId: string;
+  readonly channel: string;
+  readonly value?: JsonValue;
+  readonly lastActiveAt?: number;
+  readonly lastSeenAt?: number;
+  readonly local?: boolean;
+};
+
 const schema = defineSchema({
   todos: relation<TodoRow>({
     key: 'id',
@@ -31,11 +53,25 @@ const schema = defineSchema({
       done: booleanField(),
       rank: numberField()
     }
+  }),
+  presence: relation<PresenceRow>({
+    ephemeral: true,
+    key: ['peerId', 'channel'],
+    fields: {
+      peerId: idField('peer'),
+      channel: stringField(),
+      value: optional(nullable(jsonField())),
+      lastActiveAt: optional(numberField()),
+      lastSeenAt: optional(numberField()),
+      local: optional(booleanField())
+    }
   })
 });
 
 const todos = write(schema.todos);
+const presenceRows = write(schema.presence);
 const todo = as(schema.todos, 'todo');
+const presence = as(schema.presence, 'presence');
 const todoRows = pipe(
   from(todo),
   project({
@@ -43,6 +79,21 @@ const todoRows = pipe(
     text: todo.text,
     done: todo.done,
     rank: todo.rank
+  })
+);
+const focusedTodos = pipe(
+  from(todo),
+  join(
+    pipe(
+      from(presence),
+      where(eq(presence.channel, 'targetTodoId'))
+    ),
+    eq(todo.id, presence.value)
+  ),
+  project({
+    todoId: todo.id,
+    text: todo.text,
+    peerId: presence.peerId
   })
 );
 const todoRelations = [{ relation: schema.todos, path: ['todos'] }] as const;
@@ -119,6 +170,60 @@ describe('@tarstate/automerge', () => {
         removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]
       }
     ]);
+  });
+
+  it('composes durable Automerge rows and Repo Presence rows as one runtime', async () => {
+    const doc = Automerge.from<TodoDocument>({
+      todos: {
+        'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
+        'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
+      }
+    });
+    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const handle = new FakeDocHandle();
+    const presenceRuntime = automergePresenceRuntime({
+      handle: handle.asHandle(),
+      relation: schema.presence,
+      localPeerId: 'peer-local',
+      initialState: { targetTodoId: 'todo-a' },
+      heartbeatMs: 60_000
+    });
+    const runtime = composeRelationRuntimes(adapter, presenceRuntime);
+
+    try {
+      expect(runtime.source.relationNames).toEqual(['todos', 'presence']);
+      await expect(evaluate(runtime.source, focusedTodos)).resolves.toEqual({
+        rows: [{ todoId: 'todo-a', text: 'Buy oat milk', peerId: 'peer-local' }],
+        diagnostics: []
+      });
+
+      const result = await tryApplyRelationPatches(runtime, [
+        todos.update('todo-a', { done: true }),
+        presenceRows.upsert({ peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' })
+      ]);
+
+      expect(result).toMatchObject({
+        status: 'accepted',
+        accepted: true,
+        patches: 2,
+        applied: 2,
+        diagnostics: []
+      });
+      expect(result.version).toEqual([
+        Automerge.getHeads(adapter.doc),
+        { revision: 1, localPeerId: 'peer-local' }
+      ]);
+      expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
+      expect(handle.broadcasts.at(-1)).toEqual({
+        __presence: { type: 'update', channel: 'targetTodoId', value: 'todo-b' }
+      });
+      await expect(evaluate(runtime.source, focusedTodos)).resolves.toEqual({
+        rows: [{ todoId: 'todo-b', text: 'Water basil', peerId: 'peer-local' }],
+        diagnostics: []
+      });
+    } finally {
+      presenceRuntime.stop();
+    }
   });
 
   it('rejects deleteExact when the keyed row does not match and commits matching exact deletes', async () => {
@@ -432,3 +537,44 @@ describe('@tarstate/automerge', () => {
     ]);
   });
 });
+
+class FakeDocHandle {
+  readonly broadcasts: unknown[] = [];
+  private readonly listeners = new Map<string, Set<(payload: unknown) => void>>();
+
+  asHandle(): DocHandle<unknown> {
+    return this as unknown as DocHandle<unknown>;
+  }
+
+  on(eventName: string, listener: (payload: unknown) => void): void {
+    const listeners = this.listeners.get(eventName);
+
+    if (listeners === undefined) {
+      this.listeners.set(eventName, new Set([listener]));
+    } else {
+      listeners.add(listener);
+    }
+  }
+
+  off(eventName: string, listener: (payload: unknown) => void): void {
+    this.listeners.get(eventName)?.delete(listener);
+  }
+
+  broadcast(message: unknown): void {
+    this.broadcasts.push(message);
+  }
+
+  receive(senderId: string, message: unknown): void {
+    this.emit('ephemeral-message', {
+      handle: this,
+      senderId: senderId as PeerId,
+      message
+    });
+  }
+
+  private emit(eventName: string, payload: unknown): void {
+    for (const listener of this.listeners.get(eventName) ?? []) {
+      listener(payload);
+    }
+  }
+}

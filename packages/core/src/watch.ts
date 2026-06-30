@@ -1,4 +1,5 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
+import type { RelationRuntime } from './adapter.js';
 import type { RelationDelta } from './delta.js';
 import { diffRows, type RowChange, type RowDiff, type RowDiffDiagnostic, type RowDiffOptions } from './diff.js';
 import { evaluate, type EvaluateOptions } from './evaluate.js';
@@ -106,6 +107,8 @@ export type WatchHandle<Db extends WatchDb = WatchDb, Row = unknown> = {
   readonly unwatch: () => UnwatchResult;
   readonly label?: string;
 };
+
+export type RuntimeWatchHandle<Row = unknown> = WatchHandle<RelationSource, Row>;
 
 export type UnwatchResult = {
   readonly kind: 'unwatch';
@@ -234,7 +237,7 @@ export function watch<Db extends WatchDb, Row>(
     mode: supported ? 'manual' : 'unsupported',
     diagnostics,
     refresh,
-    unwatch: () => closeWatch(id),
+    unwatch: () => closeWatchHandle(id),
     ...(options.label === undefined ? {} : { label: options.label })
   };
 
@@ -255,9 +258,44 @@ export function watch<Db extends WatchDb, Row>(
   return handle;
 }
 
+/**
+ * Bridge a host-driven relation runtime invalidation callback into a normal manual watch.
+ *
+ * @remarks This does not synthesize relation deltas or create an async event stream. Host
+ * invalidation only calls `refresh` against `runtime.snapshot?.().source ?? runtime.source`.
+ */
+export function watchRuntime<Version, Row>(
+  runtime: RelationRuntime<Version>,
+  target: WatchTarget<Row>,
+  listener: WatchListener<Row>,
+  options: WatchOptions<Row> = {}
+): RuntimeWatchHandle<Row> {
+  const handle = watch(runtimeWatchSource(runtime), target, listener, options);
+
+  if (handle.supported && runtime.subscribe !== undefined) {
+    registerRuntimeHostSubscription(handle.id, runtime.subscribe(() => {
+      if (!isWatchClosed(handle.id)) {
+        void handle.refresh(runtimeWatchSource(runtime)).catch(() => undefined);
+      }
+    }));
+  }
+
+  return {
+    ...handle,
+    refresh: (nextSource?: RelationSource) => {
+      if (nextSource === undefined && isWatchClosed(handle.id)) {
+        return handle.refresh();
+      }
+
+      return handle.refresh(nextSource ?? runtimeWatchSource(runtime));
+    },
+    unwatch: () => closeWatchHandle(handle.id)
+  };
+}
+
 /** Close a watch handle created by `watch`. */
 export function unwatch(handle: Pick<WatchHandle, 'id'>): UnwatchResult {
-  return closeWatch(handle.id);
+  return closeWatchHandle(handle.id);
 }
 
 /**
@@ -350,6 +388,24 @@ export function diffOptionsForTarget<Row>(
 
 function sourceForWatch(input: WatchDb | RelationSource): RelationSource | undefined {
   return tryRelationSource(input);
+}
+
+const runtimeHostUnsubscribers = new Map<string, () => void>();
+
+function runtimeWatchSource<Version>(runtime: RelationRuntime<Version>): RelationSource {
+  return runtime.snapshot?.().source ?? runtime.source;
+}
+
+function registerRuntimeHostSubscription(id: string, unsubscribe: () => void): void {
+  runtimeHostUnsubscribers.set(id, unsubscribe);
+}
+
+function closeWatchHandle(id: string): UnwatchResult {
+  const unsubscribeRuntimeHost = runtimeHostUnsubscribers.get(id);
+  runtimeHostUnsubscribers.delete(id);
+  unsubscribeRuntimeHost?.();
+
+  return closeWatch(id);
 }
 
 function unsupportedWatchRefreshResult<Row>(

@@ -7,6 +7,7 @@ export * from './diagnostics.js';
 export * from './evaluate.js';
 export * from './identity.js';
 export * from './materialization.js';
+export * from './memory-runtime.js';
 export * from './query.js';
 export * from './runtime.js';
 export * from './schema.js';
