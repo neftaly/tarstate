@@ -206,6 +206,79 @@ describe('@tarstate/automerge', () => {
     ]);
   });
 
+  it('applies durable relation patches through the generic runtime target', async () => {
+    const doc = Automerge.from<TodoDocument>({
+      todos: {
+        'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
+      }
+    });
+    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const beforeDoc = adapter.doc;
+
+    const result = await tryApplyRelationPatches(
+      adapter,
+      [todos.update('todo-a', { done: true })],
+      { readVersion: false }
+    );
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      accepted: true,
+      patches: 1,
+      applied: 1,
+      diagnostics: [],
+      durability: 'durable',
+      version: Automerge.getHeads(adapter.doc)
+    });
+    expect('committed' in result).toBe(false);
+    expect(result.deltas).toEqual([
+      {
+        relation: schema.todos,
+        added: [{ id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 }],
+        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]
+      }
+    ]);
+    expect(adapter.doc).not.toBe(beforeDoc);
+    expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
+  });
+
+  it('rejects invalid durable runtime target patches without leaking commit fields', async () => {
+    const doc = Automerge.from<TodoDocument>({
+      todos: {
+        'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
+      }
+    });
+    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const beforeDoc = adapter.doc;
+    const beforeHeads = Automerge.getHeads(beforeDoc);
+
+    const result = await tryApplyRelationPatches(
+      adapter,
+      [todos.insert({ id: 'todo-b', text: 'Missing done', rank: 2 } as unknown as TodoRow)],
+      { readVersion: false }
+    );
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      accepted: false,
+      patches: 1,
+      applied: 0,
+      deltas: [],
+      diagnostics: [
+        {
+          code: 'invalid_row',
+          relation: 'todos',
+          field: 'done'
+        }
+      ],
+      durability: 'durable',
+      version: beforeHeads
+    });
+    expect('committed' in result).toBe(false);
+    expect(adapter.doc).toBe(beforeDoc);
+    expect(adapter.doc.todos).not.toHaveProperty('todo-b');
+  });
+
   it('composes durable Automerge rows and Repo Presence rows as one runtime', async () => {
     const doc = Automerge.from<TodoDocument>({
       todos: {
