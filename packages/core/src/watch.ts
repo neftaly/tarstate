@@ -2,12 +2,14 @@ import type { TarstateDiagnostic } from './diagnostics.js';
 import type { RelationRuntime } from './adapter.js';
 import type { RelationDelta } from './delta.js';
 import { diffRows, type RowChange, type RowDiffDiagnostic, type RowDiffOptions } from './diff.js';
+import { evaluate } from './evaluate.js';
 import type { EvaluateOptions } from './evaluate.js';
-import { queryKey, queryRowKeyFields, type ExprData, type OptionalProjection, type PredicateData, type ProjectionData, type Query, type QueryData } from './query.js';
+import { queryKey, queryRowKeyFields, type Query } from './query.js';
 import type { RelationRef } from './schema.js';
-import type { RelationSource } from './source.js';
+import { type RelationSource } from './source.js';
+import { asRelationSource, tryRelationSource, type RelationSourceInput } from './source-input.js';
 
-export type WatchDb = object;
+export type WatchDb = RelationSourceInput;
 
 export type WatchDiagnostic = {
   readonly code:
@@ -89,7 +91,7 @@ export type WatchHandle<Db extends WatchDb = WatchDb, Row = unknown> = {
   readonly db: Db;
   readonly target: WatchTarget<Row>;
   readonly supported: boolean;
-  readonly mode: 'manual' | 'unsupported';
+  readonly mode: 'db';
   readonly diagnostics: readonly WatchDiagnostic[];
   readonly refresh: (nextDb?: Db | RelationSource) => Promise<WatchRefreshResult<Row>>;
   readonly unwatch: () => UnwatchResult;
@@ -145,55 +147,40 @@ export type QueryDiff<Row = unknown> = {
   readonly diagnostics: readonly QueryDiffDiagnostic<Row>[];
 };
 
+type WatchRecord<Db extends WatchDb = WatchDb, Row = unknown> = {
+  db: Db;
+  readonly id: string;
+  readonly target: WatchTarget<Row>;
+  readonly listener: WatchListener<Row>;
+  readonly options: WatchOptions<Row>;
+  active: boolean;
+  handle?: WatchHandle<Db, Row>;
+};
+
 let nextId = 0;
+type AnyWatchRecord = WatchRecord<any, any>;
+const watchStore = new WeakMap<object, Set<AnyWatchRecord>>();
+const allWatchRecords = new Map<string, AnyWatchRecord>();
 
 export function watch<Db extends WatchDb, Row>(
   db: Db,
   target: WatchTarget<Row>,
-  listener: WatchListener<Row>,
+  listener?: WatchListener<Row>,
   options: WatchOptions<Row> = {}
 ): WatchHandle<Db, Row> {
-  const id = `watch-${nextId += 1}`;
-  let previousRows: readonly Row[] = [];
-  let closed = false;
-  const handle: WatchHandle<Db, Row> = {
-    kind: 'watch',
-    id,
+  const record: WatchRecord<Db, Row> = {
     db,
+    id: `watch-${nextId += 1}`,
     target,
-    supported: true,
-    mode: 'manual',
-    diagnostics: [],
-    refresh: async (nextDb = db) => {
-      if (closed) {
-        return {
-          ...emptyWatchRefresh(id, target),
-          diagnostics: [{ code: 'watch_already_closed', message: 'watch is already closed', surface: 'watch' }]
-        };
-      }
-
-      const rows = await readTargetRows(nextDb, target);
-      const event = buildWatchEvent(id, target, previousRows, rows, options, { diagnostics: [] });
-      previousRows = rows;
-
-      try {
-        await listener(event);
-        return { ...event, kind: 'watchRefresh', delivered: true };
-      } catch (error) {
-        return {
-          ...event,
-          kind: 'watchRefresh',
-          delivered: false,
-          diagnostics: [...event.diagnostics, listenerDiagnostic(error)]
-        };
-      }
-    },
-    unwatch: () => {
-      closed = true;
-      return unwatch(handle);
-    },
-    ...(options.label === undefined ? {} : { label: options.label })
+    listener: listener ?? (() => undefined),
+    options,
+    active: true
   };
+  const handle = watchHandle(record);
+  record.handle = handle;
+  const storedRecord = record as AnyWatchRecord;
+  addRecord(db, storedRecord);
+  allWatchRecords.set(record.id, storedRecord);
 
   if (options.immediate === true) {
     void handle.refresh(db);
@@ -207,14 +194,14 @@ export function watchTarget<Db extends WatchDb, Row>(
   target: WatchTarget<Row>,
   options: WatchOptions<Row> = {}
 ): WatchTargetRegistration<Db, Row> {
-  const handle = watch(db, target, () => undefined, options);
+  const handle = watch(db, target, undefined, options);
   return {
     kind: 'watchTarget',
     db,
     target,
     handle,
     supported: true,
-    diagnostics: handle.diagnostics,
+    diagnostics: [],
     unwatch: handle.unwatch,
     ...(options.label === undefined ? {} : { label: options.label })
   };
@@ -255,11 +242,20 @@ export function watchRuntime<Version, Row>(
 }
 
 export function unwatch(handle: Pick<WatchHandle, 'id'>): UnwatchResult {
+  const record = findRecord(handle.id);
+  if (record !== undefined) {
+    record.active = false;
+    removeRecord(record.db, record);
+    allWatchRecords.delete(record.id);
+  }
+
   return {
     kind: 'unwatch',
     id: handle.id,
-    closed: true,
-    diagnostics: []
+    closed: record !== undefined,
+    diagnostics: record === undefined
+      ? [{ code: 'watch_already_closed', message: 'watch is already closed', surface: 'watch' }]
+      : []
   };
 }
 
@@ -282,30 +278,29 @@ export function subscribeWatch<Row>(
 }
 
 export async function diffQuery<Row>(
-  before: RelationSource,
-  after: RelationSource,
+  before: RelationSourceInput,
+  after: RelationSourceInput,
   target: Query<Row>,
   options: QueryDiffOptions<Row> = {}
 ): Promise<QueryDiff<Row>> {
-  const beforeRows = await evaluateQuery(before, target);
-  const afterRows = await evaluateQuery(after, target);
+  const beforeSource = asRelationSource(before);
+  const afterSource = asRelationSource(after);
+  const beforeRows = await readTargetRows(beforeSource, target, options);
+  const afterRows = await readTargetRows(afterSource, target, options);
   const diff = diffRows(beforeRows, afterRows, diffOptionsForTarget(target, options));
-  const addedRows = diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
-  const removedRows = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
-  const updatedBefore = new Set(diff.changes.flatMap((change) => change.kind === 'updated' ? [change.key] : []));
-  const unchangedRows = afterRows.filter((row) => !updatedBefore.has(rowKey(row, diffOptionsForTarget(target, options))));
+  const changedKeys = new Set(diff.changes.map((change) => change.key));
 
   return {
     kind: 'queryDiff',
     target,
     queryKey: queryKey(target),
-    ...await versions(before, after),
+    ...await versions(beforeSource, afterSource),
     beforeRows,
     afterRows,
     changed: diff.changes.length > 0,
-    addedRows,
-    removedRows,
-    unchangedRows,
+    addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    unchangedRows: afterRows.filter((row) => !changedKeys.has(rowKey(row, diffOptionsForTarget(target, options)))),
     rowChanges: diff.changes,
     diagnostics: diff.diagnostics
   };
@@ -324,6 +319,145 @@ export function diffOptionsForTarget<Row>(
   return { ...options, keyBy: fields };
 }
 
+export function transferWatches(previous: unknown, next: unknown): void {
+  if (!isObject(previous) || !isObject(next)) {
+    return;
+  }
+
+  const records = watchStore.get(previous);
+  if (records === undefined) {
+    return;
+  }
+
+  const active = Array.from(records).filter((record) => record.active);
+  for (const record of active) {
+    record.db = next as WatchDb;
+    addRecord(next, record);
+  }
+}
+
+export async function trackedChangesForDbTransition(
+  before: WatchDb,
+  after: WatchDb,
+  deltas: readonly RelationDelta[] = []
+): Promise<{
+  readonly changes: readonly TrackedChange[];
+  readonly diagnostics: readonly WatchRuntimeDiagnostic[];
+}> {
+  const records = activeRecordsFor(before);
+  const changes: TrackedChange[] = [];
+  const diagnostics: WatchRuntimeDiagnostic[] = [];
+
+  for (const record of records) {
+    const previousRows = await readTargetRows(before, record.target, record.options);
+    const rows = await readTargetRows(after, record.target, record.options);
+    const event = buildWatchEvent(record.id, record.target, previousRows, rows, record.options, {
+      deltas,
+      diagnostics: []
+    });
+    changes.push({
+      kind: 'trackedChange',
+      id: event.id,
+      target: event.target,
+      changed: event.changed,
+      previousRows: event.previousRows,
+      rows: event.rows,
+      addedRows: event.addedRows,
+      removedRows: event.removedRows,
+      unchangedRows: event.unchangedRows,
+      rowChanges: event.rowChanges,
+      diagnostics: event.diagnostics
+    });
+    diagnostics.push(...event.diagnostics);
+
+    try {
+      await record.listener(event);
+    } catch (error) {
+      const diagnostic = listenerDiagnostic(error);
+      diagnostics.push(diagnostic);
+    }
+  }
+
+  return { changes, diagnostics };
+}
+
+function watchHandle<Db extends WatchDb, Row>(record: WatchRecord<Db, Row>): WatchHandle<Db, Row> {
+  return {
+    kind: 'watch',
+    id: record.id,
+    get db() {
+      return record.db;
+    },
+    target: record.target,
+    supported: true,
+    mode: 'db',
+    diagnostics: [],
+    refresh: async (nextDb = record.db) => {
+      if (!record.active) {
+        return {
+          ...emptyWatchRefresh(record.id, record.target),
+          diagnostics: [{ code: 'watch_already_closed', message: 'watch is already closed', surface: 'watch' }]
+        };
+      }
+
+      const previousRows = await readTargetRows(record.db, record.target, record.options);
+      const rows = await readTargetRows(nextDb, record.target, record.options);
+      const event = buildWatchEvent(record.id, record.target, previousRows, rows, record.options, { diagnostics: [] });
+      try {
+        await record.listener(event);
+        return { ...event, kind: 'watchRefresh', delivered: true };
+      } catch (error) {
+        return {
+          ...event,
+          kind: 'watchRefresh',
+          delivered: false,
+          diagnostics: [...event.diagnostics, listenerDiagnostic(error)]
+        };
+      }
+    },
+    unwatch: () => unwatch(record),
+    ...(record.options.label === undefined ? {} : { label: record.options.label })
+  };
+}
+
+function buildWatchEvent<Row>(
+  id: string,
+  target: WatchTarget<Row>,
+  previousRows: readonly Row[],
+  rows: readonly Row[],
+  options: WatchOptions<Row>,
+  changes: ChangeSet
+): WatchEvent<Row> {
+  const diffOptions = diffOptionsForTarget(target, options);
+  const diff = diffRows(previousRows, rows, diffOptions);
+  const changedKeys = new Set(diff.changes.map((change) => change.key));
+  return {
+    kind: 'watchEvent',
+    id,
+    target,
+    changed: diff.changes.length > 0,
+    previousRows,
+    rows,
+    addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    unchangedRows: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
+    rowChanges: diff.changes,
+    changes,
+    diagnostics: diff.diagnostics
+  };
+}
+
+async function readTargetRows<Row>(
+  db: WatchDb | RelationSource,
+  target: WatchTarget<Row>,
+  options: EvaluateOptions = {}
+): Promise<readonly Row[]> {
+  const source = tryRelationSource(db) ?? emptySource();
+  return isQuery(target)
+    ? (await evaluate(source, target, options)).rows
+    : await source.rows(target) as readonly Row[];
+}
+
 function emptyWatchRefresh<Row>(id: string, target: WatchTarget<Row>): WatchRefreshResult<Row> {
   return {
     kind: 'watchRefresh',
@@ -337,124 +471,44 @@ function emptyWatchRefresh<Row>(id: string, target: WatchTarget<Row>): WatchRefr
     removedRows: [],
     unchangedRows: [],
     rowChanges: [],
-    diagnostics: [unsupportedWatchDiagnostic(target)]
+    diagnostics: []
   };
 }
 
-function unsupportedWatchDiagnostic(target: WatchTarget): WatchDiagnostic {
-  return {
-    code: 'watch_unsupported',
-    message: 'watch implementation has been removed; regenerate this API implementation',
-    surface: 'watch',
-    detail: target
-  };
-}
-
-function buildWatchEvent<Row>(
-  id: string,
-  target: WatchTarget<Row>,
-  previousRows: readonly Row[],
-  rows: readonly Row[],
-  options: WatchOptions<Row>,
-  changes: ChangeSet
-): WatchEvent<Row> {
-  const diff = diffRows(previousRows, rows, diffOptionsForTarget(target, options));
-  return {
-    kind: 'watchEvent',
-    id,
-    target,
-    changed: diff.changes.length > 0,
-    previousRows,
-    rows,
-    addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
-    removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
-    unchangedRows: rows.filter((row) => !new Set(diff.changes.map((change) => change.key)).has(rowKey(row, diffOptionsForTarget(target, options)))),
-    rowChanges: diff.changes,
-    changes,
-    diagnostics: diff.diagnostics
-  };
-}
-
-async function readTargetRows<Row>(db: WatchDb | RelationSource, target: WatchTarget<Row>): Promise<readonly Row[]> {
-  const source = relationSourceFor(db);
-  return isQuery(target) ? evaluateQuery(source, target) : await source.rows(target) as readonly Row[];
-}
-
-function relationSourceFor(input: WatchDb | RelationSource): RelationSource {
-  if ('rows' in input && typeof input.rows === 'function') return input;
-  if ('data' in input && isRecord(input.data)) {
-    const data = input.data;
-    return {
-      relationNames: Object.keys(data),
-      rows: (relation) => Array.isArray(data[relation.name]) ? data[relation.name] as readonly unknown[] : []
-    };
+function addRecord(input: unknown, record: AnyWatchRecord): void {
+  if (!isObject(input)) {
+    return;
   }
-  return { rows: () => [] };
+
+  const records = watchStore.get(input) ?? new Set<AnyWatchRecord>();
+  records.add(record);
+  watchStore.set(input, records);
 }
 
-async function evaluateQuery<Row>(source: RelationSource, query: Query<Row>): Promise<readonly Row[]> {
-  return await evaluateData(source, query.data, query) as readonly Row[];
-}
+function removeRecord(input: unknown, record: AnyWatchRecord): void {
+  if (!isObject(input)) {
+    return;
+  }
 
-async function evaluateData(source: RelationSource, data: QueryData, query: Query): Promise<readonly unknown[]> {
-  switch (data.op) {
-    case 'from': {
-      const relation = query.relations[data.relation];
-      if (relation === undefined) return [];
-      return (await source.rows(relation)).map((row) => ({ [data.alias]: row }));
-    }
-    case 'where':
-      return (await evaluateData(source, data.input, query)).filter((row) => matchesPredicate(row, data.predicate));
-    case 'select':
-      return (await evaluateData(source, data.input, query)).map((row) => projectRow(row, data.projection));
-    case 'keyBy':
-    case 'hash':
-    case 'btree':
-      return evaluateData(source, data.input, query);
-    case 'constRows':
-      return data.rows;
-    default:
-      return [];
+  const records = watchStore.get(input);
+  if (records === undefined) {
+    return;
+  }
+
+  records.delete(record);
+  if (records.size === 0) {
+    watchStore.delete(input);
   }
 }
 
-function projectRow(row: unknown, projection: ProjectionData): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(projection).map(([field, expr]) => [
-    field,
-    exprValue(row, projectionExpr(expr))
-  ]));
+function activeRecordsFor(input: unknown): readonly AnyWatchRecord[] {
+  return isObject(input)
+    ? Array.from(watchStore.get(input) ?? []).filter((record) => record.active)
+    : [];
 }
 
-function matchesPredicate(row: unknown, predicate: PredicateData): boolean {
-  switch (predicate.op) {
-    case 'eq':
-      return exprValue(row, predicate.left) === exprValue(row, predicate.right);
-    case 'neq':
-      return exprValue(row, predicate.left) !== exprValue(row, predicate.right);
-    case 'and':
-      return predicate.predicates.every((item) => matchesPredicate(row, item));
-    case 'or':
-      return predicate.predicates.some((item) => matchesPredicate(row, item));
-    case 'not':
-      return !matchesPredicate(row, predicate.predicate);
-    default:
-      return false;
-  }
-}
-
-function exprValue(row: unknown, expr: ExprData): unknown {
-  switch (expr.op) {
-    case 'value':
-      return expr.value;
-    case 'field': {
-      const aliased = isRecord(row) ? row[expr.alias] : undefined;
-      return isRecord(aliased) ? aliased[expr.field] : isRecord(row) ? row[expr.field] : undefined;
-    }
-    case 'tuple':
-      return expr.items.map((item) => exprValue(row, item));
-    default:
-      return undefined;
-  }
+function findRecord(id: string): AnyWatchRecord | undefined {
+  return allWatchRecords.get(id);
 }
 
 async function versions(before: RelationSource, after: RelationSource): Promise<{
@@ -480,18 +534,14 @@ function listenerDiagnostic(detail: unknown): WatchDiagnostic {
   };
 }
 
+function emptySource(): RelationSource {
+  return { rows: () => [] };
+}
+
 function isQuery(input: unknown): input is Query {
-  return typeof input === 'object' && input !== null && 'data' in input && 'relations' in input;
+  return isObject(input) && 'data' in input && 'relations' in input;
 }
 
-function isRecord(input: unknown): input is Record<string, unknown> {
+function isObject(input: unknown): input is object {
   return typeof input === 'object' && input !== null;
-}
-
-function projectionExpr(input: ProjectionData[string]): ExprData {
-  return isOptionalProjection(input) ? input.expr : input;
-}
-
-function isOptionalProjection(input: ProjectionData[string]): input is OptionalProjection {
-  return 'kind' in input && input.kind === 'optionalProjection';
 }

@@ -9,7 +9,8 @@ import type {
   ConstraintValidationInput,
   ConstraintValidationOptions
 } from './constraints-validation.js';
-import { isConstraintAttachmentInput } from './constraints-attachment.js';
+import { validateConstraints } from './constraints-validation.js';
+import { attachedConstraintsFor, isConstraintAttachmentInput } from './constraints-attachment.js';
 
 export class DbConstraintTransactionError extends DbTransactionError {
   constructor(result: DbTransactionResult) {
@@ -32,10 +33,30 @@ export function tryTransactConstrained(
 export async function tryTransactConstrained(
   db: Db,
   patches: Iterable<WritePatch>,
-  _constraintsOrOptions?: ConstraintValidationInput | ConstraintValidationOptions,
-  _options: ConstraintValidationOptions = {}
+  constraintsOrOptions?: ConstraintValidationInput | ConstraintValidationOptions,
+  options: ConstraintValidationOptions = {}
 ): Promise<DbTransactionResult> {
-  return tryTransact(db, patches);
+  const result = tryTransact(db, patches);
+  if (!result.committed) {
+    return result;
+  }
+
+  const explicitConstraints = constraintsOrOptions !== undefined && isConstraintAttachmentInput(constraintsOrOptions)
+    ? constraintsOrOptions
+    : attachedConstraintsFor(db);
+  const validationOptions = constraintsOrOptions !== undefined && !isConstraintAttachmentInput(constraintsOrOptions)
+    ? constraintsOrOptions
+    : options;
+  const validation = await validateConstraints(result.db, explicitConstraints, validationOptions);
+
+  return validation.valid
+    ? result
+    : {
+        ...result,
+        db,
+        committed: false,
+        diagnostics: [...result.diagnostics, ...validation.diagnostics]
+      };
 }
 
 export function transactConstrained(

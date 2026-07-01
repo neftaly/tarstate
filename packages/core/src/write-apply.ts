@@ -41,6 +41,17 @@ type ApplyState = {
   readonly diagnostics: TarstateDiagnostic[];
   applied: number;
 };
+type ComputedChanges = Record<string, unknown> | ((row: Readonly<Record<string, unknown>>) => Record<string, unknown>);
+type ComputedMerge = RelationMergeInput | ((
+  existing: Readonly<Record<string, unknown>>,
+  incoming: Readonly<Record<string, unknown>>
+) => Record<string, unknown>);
+type ComputedUpsertUpdate =
+  | ComputedChanges
+  | ((
+      existing: Readonly<Record<string, unknown>>,
+      incoming: Readonly<Record<string, unknown>>
+    ) => Record<string, unknown>);
 
 export function applyWrites(data: MutableObjectSourceData, patches: WriteInput): WriteApplyResult {
   const patchList = Array.from(writeInputPatches(patches));
@@ -91,16 +102,16 @@ function applyPatch(state: ApplyState, patch: WritePatch): void {
       insertRow(state, patch.relation, patch.row, 'replace');
       return;
     case 'updateByKey':
-      updateByKey(state, patch);
+      updateByKey(state, patch as UpdateByKeyPatch & { readonly changes: ComputedChanges });
       return;
     case 'update':
-      updateWhere(state, patch);
+      updateWhere(state, patch as UpdatePatch & { readonly changes: ComputedChanges });
       return;
     case 'insertOrMerge':
-      insertOrMerge(state, patch.relation, patch.row, patch.merge);
+      insertOrMerge(state, patch.relation, patch.row, patch.merge as ComputedMerge);
       return;
     case 'insertOrUpdate':
-      insertOrUpdate(state, patch.relation, patch.row, patch.update);
+      insertOrUpdate(state, patch.relation, patch.row, patch.update as ComputedUpsertUpdate);
       return;
     case 'deleteByKey':
       deleteByKey(state, patch.relation, patch.key);
@@ -163,7 +174,7 @@ function insertRow(
   recordDelta(state, relation, undefined, row);
 }
 
-function updateByKey(state: ApplyState, patch: UpdateByKeyPatch): void {
+function updateByKey(state: ApplyState, patch: UpdateByKeyPatch & { readonly changes: ComputedChanges }): void {
   const rows = relationRows(state.data, patch.relation);
   const index = indexByKey(rows, patch.relation, keyFromInput(patch.key));
   if (index === -1) {
@@ -173,7 +184,7 @@ function updateByKey(state: ApplyState, patch: UpdateByKeyPatch): void {
   updateRowAt(state, patch.relation, rows, index, patch.changes);
 }
 
-function updateWhere(state: ApplyState, patch: UpdatePatch): void {
+function updateWhere(state: ApplyState, patch: UpdatePatch & { readonly changes: ComputedChanges }): void {
   const rows = relationRows(state.data, patch.relation);
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
@@ -188,14 +199,15 @@ function updateRowAt(
   relation: RelationRef,
   rows: unknown[],
   index: number,
-  changes: Record<string, unknown>
+  changes: ComputedChanges
 ): void {
   const before = rows[index];
   if (!isRecord(before)) {
     return;
   }
 
-  const after = { ...before, ...changes };
+  const resolvedChanges = resolveChanges(changes, before);
+  const after = { ...before, ...resolvedChanges };
   const diagnostics = validateCandidateRow(state, relation, after);
   if (diagnostics.length > 0) {
     state.diagnostics.push(...diagnostics);
@@ -211,7 +223,7 @@ function insertOrMerge(
   state: ApplyState,
   relation: RelationRef,
   row: Record<string, unknown>,
-  merge: RelationMergeInput
+  merge: ComputedMerge
 ): void {
   const key = keyFromRow(relation, row);
   const rows = relationRows(state.data, relation);
@@ -227,7 +239,7 @@ function insertOrMerge(
     return;
   }
 
-  const changes = mergeChanges(row, merge);
+  const changes = mergeChanges(before, row, merge);
   updateRowAt(state, relation, rows, index, changes);
 }
 
@@ -235,7 +247,7 @@ function insertOrUpdate(
   state: ApplyState,
   relation: RelationRef,
   row: Record<string, unknown>,
-  update: Record<string, unknown>
+  update: ComputedUpsertUpdate
 ): void {
   const rows = relationRows(state.data, relation);
   const index = indexByKey(rows, relation, keyFromRow(relation, row));
@@ -243,7 +255,10 @@ function insertOrUpdate(
   if (index === -1) {
     insertRow(state, relation, row, 'error');
   } else {
-    updateRowAt(state, relation, rows, index, update);
+    const before = rows[index];
+    updateRowAt(state, relation, rows, index, isRecord(before) && isTwoArgFunction(update)
+      ? update(before, row)
+      : update as ComputedChanges);
   }
 }
 
@@ -420,7 +435,15 @@ function keyFromInput(key: RelationKeyInput): string {
   return Array.isArray(key) ? stableKey(key) : String(key);
 }
 
-function mergeChanges(row: Record<string, unknown>, merge: RelationMergeInput): Record<string, unknown> {
+function mergeChanges(
+  existing: Record<string, unknown>,
+  row: Record<string, unknown>,
+  merge: ComputedMerge
+): Record<string, unknown> {
+  if (typeof merge === 'function') {
+    return merge(existing, row) as Record<string, unknown>;
+  }
+
   if (merge === 'all') {
     return row;
   }
@@ -430,6 +453,17 @@ function mergeChanges(row: Record<string, unknown>, merge: RelationMergeInput): 
   }
 
   return Object.fromEntries(merge.map((field) => [field, row[field]]));
+}
+
+function resolveChanges(changes: ComputedChanges, row: Record<string, unknown>): Record<string, unknown> {
+  return typeof changes === 'function' ? changes(row) : changes;
+}
+
+function isTwoArgFunction(input: ComputedUpsertUpdate): input is (
+  existing: Readonly<Record<string, unknown>>,
+  incoming: Readonly<Record<string, unknown>>
+) => Record<string, unknown> {
+  return typeof input === 'function' && input.length >= 2;
 }
 
 function recordDelta(state: ApplyState, relation: RelationRef, removed: unknown, added: unknown): void {

@@ -31,6 +31,7 @@ export type { TarstateDiagnostic } from './diagnostics.js';
 export {
   DbTransactionError,
   createDb,
+  db,
   dbDeleteWhere,
   dbSource,
   dbUpdateWhere,
@@ -54,7 +55,10 @@ export type {
   DbEnv,
   DbInputData,
   DbInputEnv,
+  DbOptions,
   DbQueryOptions,
+  DbTransactionBuilder,
+  DbTransactionContext,
   DbTransactionInput,
   DbTransactionInputs,
   DbTransactionResult,
@@ -69,8 +73,10 @@ export type {
 } from './db.js';
 export { evaluate } from './evaluate.js';
 export type { EvaluateEnv, EvaluateFunction, EvaluateFunctions, EvaluateOptions, QueryResult } from './evaluate.js';
+export * from './constraints.js';
 export { createMemoryRelationRuntime } from './memory-runtime.js';
 export type { MemoryRelationRuntimeOptions } from './memory-runtime.js';
+export * from './materialization.js';
 export {
   aggregate,
   and,
@@ -191,6 +197,8 @@ export type {
   StoreView,
   StoreViewReadOptions
 } from './store.js';
+export * from './runtime.js';
+export * from './watch.js';
 export {
   deleteExact,
   deleteByKey,
@@ -224,6 +232,7 @@ export type {
   RelationMergeInput,
   RelationRow,
   RelationRowUpdate,
+  RelationRowUpdateInput,
   RelationWriter,
   ReplaceAllPatch,
   UpdateByKeyPatch,

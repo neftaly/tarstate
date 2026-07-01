@@ -1,6 +1,8 @@
-import type { DocHandle, PeerId } from '@automerge/automerge-repo';
+import * as Automerge from '@automerge/automerge';
+import type { PeerId } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { isRelationAdapter, isRelationRuntime } from '@tarstate/core/adapter';
+import { as, eq, from, pipe, project, where } from '@tarstate/core/query';
 import {
   booleanField,
   defineSchema,
@@ -14,6 +16,7 @@ import {
   type JsonValue
 } from '@tarstate/core/schema';
 import { write } from '@tarstate/core/write';
+import { automergeDb } from '@tarstate/automerge';
 import {
   automergePresenceRuntime,
   defaultAutomergePresenceClearedValue,
@@ -131,6 +134,42 @@ describe('automerge presence runtime contract', () => {
       expect(runtime.snapshot().version).toEqual(await runtime.source.version?.());
     } finally {
       unsubscribe();
+      runtime.stop();
+    }
+  });
+
+  it('composes presence as an optional relation source for automergeDb q and transactions', async () => {
+    const runtime = presenceRuntime({ color: 'blue' });
+    const presence = as(schema.presence, 'presence');
+    const query = pipe(
+      from(presence),
+      where(eq(presence.topic, 'color')),
+      project({ peer: presence.peer, payload: presence.payload, isLocal: presence.isLocal })
+    );
+    const relic = automergeDb(Automerge.from<Record<string, unknown>>({}), {
+      relations: [],
+      runtimes: [runtime]
+    });
+
+    try {
+      await expect(relic.q(query)).resolves.toMatchObject({
+        rows: [{ peer: 'peer-local', payload: 'blue', isLocal: true }],
+        diagnostics: []
+      });
+
+      await expect(relic.tryTransact(presenceRows.insertOrUpdate(
+        { peer: 'peer-local', topic: 'color', payload: 'green' },
+        { update: { payload: 'green' } }
+      ))).resolves.toMatchObject({
+        committed: true,
+        applied: 1,
+        diagnostics: []
+      });
+      await expect(relic.q(query)).resolves.toMatchObject({
+        rows: [{ peer: 'peer-local', payload: 'green', isLocal: true }],
+        diagnostics: []
+      });
+    } finally {
       runtime.stop();
     }
   });
@@ -288,8 +327,12 @@ function presenceRuntime(
 class FakeDocHandle {
   private readonly listeners = new Map<string, Set<(payload: unknown) => void>>();
 
-  asHandle(): DocHandle<unknown> {
-    return this as unknown as DocHandle<unknown>;
+  asHandle() {
+    return {
+      on: this.on.bind(this),
+      off: this.off.bind(this),
+      broadcast: this.broadcast.bind(this)
+    };
   }
 
   on(eventName: string, listener: (payload: unknown) => void): void {

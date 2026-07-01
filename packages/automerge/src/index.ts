@@ -1,17 +1,37 @@
 import * as Automerge from '@automerge/automerge';
+import { type QueryResult } from '@tarstate/core/evaluate';
+import {
+  createDb,
+  q,
+  type Db as CoreDb,
+  type DbData,
+  type DbEnv,
+  type DbInputData,
+  type DbInputEnv,
+  type DbQueryOptions,
+  type MappedQueryBatchResult,
+  type QueryBatch,
+  type QueryBatchResult
+} from '@tarstate/core/db';
 import type {
   AdapterCommitResult,
   AdapterSnapshot,
   AdapterSource,
+  RelationApplyReport,
   RelationAdapter,
   RelationDelta,
   RelationPatchTarget,
+  RelationRuntime,
   TarstateDiagnostic
 } from '@tarstate/core/adapter';
+import {
+  composeRelationRuntimes,
+  tryApplyRelationPatches
+} from '@tarstate/core/adapter';
 import { isJsonValue, type FieldSpec, type RelationRef } from '@tarstate/core/schema';
-import type { PredicateData } from '@tarstate/core/query';
-import type { RelationRangeBound } from '@tarstate/core/source';
-import type { RelationKeyInput, WritePatch } from '@tarstate/core/write';
+import { queryKey, type PredicateData, type Query } from '@tarstate/core/query';
+import { type RelationRangeBound } from '@tarstate/core/source';
+import { writeInputPatches, type RelationKeyInput, type WriteInput, type WritePatch } from '@tarstate/core/write';
 
 export type AutomergeMapPath = readonly string[];
 
@@ -53,6 +73,127 @@ export type AutomergeMapAdapter<
   readonly subscribe: (listener: () => void) => () => void;
 };
 
+export type AutomergeDbRelationRuntime<Version = unknown> = RelationRuntime<Version> & {
+  readonly relation?: RelationRef;
+  readonly relations?: readonly RelationRef[] | readonly AutomergeMapRelation[];
+};
+
+export type AutomergeDbOptions<
+  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+> = Omit<AutomergeMapAdapterOptions<DocumentShape>, 'doc'> & {
+  readonly env?: AutomergeDbInputEnv;
+  readonly runtimes?: readonly AutomergeDbRelationRuntime[];
+};
+
+export type AutomergeDbInputData = DbInputData;
+export type AutomergeDbData = DbData;
+export type AutomergeDbEnv = DbEnv;
+export type AutomergeDbInputEnv = DbInputEnv;
+export type Db = CoreDb;
+
+export type AutomergeDbSnapshot = {
+  readonly db: Db;
+  readonly source: AdapterSource;
+  readonly version?: unknown;
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+
+export type AutomergeDbTransactionInput = WriteInput | ((_db: Db) => WriteInput);
+
+export type AutomergeDbTransactionResult = {
+  readonly kind: 'automergeDbTransaction';
+  readonly db: Db;
+  readonly committed: boolean;
+  readonly report: RelationApplyReport;
+  readonly patches: number;
+  readonly applied: number;
+  readonly deltas: readonly RelationDelta[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
+  readonly version?: unknown;
+};
+
+type AutomergeDbQuery = {
+  <Row, MappedRow>(
+    query: Query<Row>,
+    options: DbQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
+  ): Promise<QueryResult<MappedRow>>;
+  <Row>(query: Query<Row>, options?: DbQueryOptions<Row>): Promise<QueryResult<Row>>;
+  <const Queries extends QueryBatch, MappedRow>(
+    queries: Queries,
+    options: DbQueryOptions<unknown, MappedRow> & { readonly mapRows: (rows: readonly unknown[]) => readonly MappedRow[] }
+  ): Promise<MappedQueryBatchResult<Queries, MappedRow>>;
+  <const Queries extends QueryBatch>(
+    queries: Queries,
+    options?: DbQueryOptions
+  ): Promise<QueryBatchResult<Queries>>;
+};
+
+export type AutomergeDbMaterialization<Row = unknown> = {
+  readonly kind: 'automergeDbMaterialization';
+  readonly id: string;
+  readonly queryKey: string;
+  readonly query: Query<Row>;
+  readonly db: Db;
+  readonly rows: readonly Row[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+
+export type AutomergeDbWatchTarget<Row = unknown> = Query<Row> | RelationRef;
+export type AutomergeDbWatchOptions<Row = unknown> = {
+  readonly label?: string;
+  readonly immediate?: boolean;
+  readonly keyBy?: readonly string[] | ((row: Row) => string);
+};
+export type AutomergeDbWatchEvent<Row = unknown> = {
+  readonly kind: 'automergeDbWatchEvent';
+  readonly id: string;
+  readonly target: AutomergeDbWatchTarget<Row>;
+  readonly changed: boolean;
+  readonly previousRows: readonly Row[];
+  readonly rows: readonly Row[];
+  readonly addedRows: readonly Row[];
+  readonly removedRows: readonly Row[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
+  readonly label?: string;
+};
+export type AutomergeDbWatchListener<Row = unknown> = (
+  event: AutomergeDbWatchEvent<Row>
+) => void | Promise<void>;
+export type AutomergeDbWatchHandle<Row = unknown> = {
+  readonly kind: 'automergeDbWatch';
+  readonly id: string;
+  readonly target: AutomergeDbWatchTarget<Row>;
+  readonly refresh: () => Promise<AutomergeDbWatchEvent<Row>>;
+  readonly unwatch: () => void;
+  readonly label?: string;
+};
+
+export type AutomergeDb<
+  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+> = {
+  readonly kind: 'automergeDb';
+  readonly adapter: AutomergeMapAdapter<DocumentShape>;
+  readonly source: AdapterSource;
+  readonly relations: readonly RelationRef[];
+  readonly getDoc: () => Automerge.Doc<DocumentShape>;
+  readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
+  readonly db: () => Promise<Db>;
+  readonly getSnapshot: () => Promise<AutomergeDbSnapshot>;
+  readonly q: AutomergeDbQuery;
+  readonly tryTransact: (...inputs: readonly AutomergeDbTransactionInput[]) => Promise<AutomergeDbTransactionResult>;
+  readonly transact: (...inputs: readonly AutomergeDbTransactionInput[]) => Promise<Db>;
+  readonly mat: <Row>(
+    query: Query<Row>,
+    options?: { readonly id?: string; readonly name?: string }
+  ) => Promise<AutomergeDbMaterialization<Row>>;
+  readonly watch: <Row>(
+    target: AutomergeDbWatchTarget<Row>,
+    listener: AutomergeDbWatchListener<Row>,
+    options?: AutomergeDbWatchOptions<Row>
+  ) => AutomergeDbWatchHandle<Row>;
+  readonly subscribe: (listener: () => void) => () => void;
+};
+
 type RelationRows = {
   readonly rows: readonly Record<string, unknown>[];
   readonly diagnostics: readonly TarstateDiagnostic[];
@@ -73,6 +214,258 @@ type MutableDelta = {
   readonly added: unknown[];
   readonly removed: unknown[];
 };
+
+let nextAutomergeDbWatchId = 0;
+
+export class AutomergeDbTransactionError extends Error {
+  readonly result: AutomergeDbTransactionResult;
+
+  constructor(result: AutomergeDbTransactionResult) {
+    super(`transaction produced ${result.diagnostics.length} diagnostic(s)`);
+    this.name = 'AutomergeDbTransactionError';
+    this.result = result;
+  }
+
+  get db(): Db {
+    return this.result.db;
+  }
+
+  get diagnostics(): readonly TarstateDiagnostic[] {
+    return this.result.diagnostics;
+  }
+}
+
+async function queryAutomergeDb<Row, MappedRow>(
+  db: Db,
+  query: Query<Row>,
+  options?: DbQueryOptions<Row, MappedRow>
+): Promise<QueryResult<Row> | QueryResult<MappedRow>>;
+async function queryAutomergeDb<const Queries extends QueryBatch, MappedRow>(
+  db: Db,
+  queries: Queries,
+  options?: DbQueryOptions<unknown, MappedRow>
+): Promise<QueryBatchResult<Queries> | MappedQueryBatchResult<Queries, MappedRow>>;
+async function queryAutomergeDb(
+  db: Db,
+  queryOrQueries: Query | QueryBatch,
+  options: DbQueryOptions = {}
+): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>> {
+  return q(db, queryOrQueries as never, options as never) as Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>>;
+}
+
+export function automergeDb<
+  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+>(
+  doc: Automerge.Doc<DocumentShape>,
+  options: AutomergeDbOptions<DocumentShape>
+): AutomergeDb<DocumentShape> {
+  const adapter = automergeMapAdapter<DocumentShape>({ ...options, doc });
+  const runtimes = [adapter, ...options.runtimes ?? []];
+  const runtime = runtimes.length === 1 ? adapter : composeRelationRuntimes(...runtimes);
+  const relations = uniqueRelations([
+    ...adapter.relations.map((mapping) => mapping.relation),
+    ...options.runtimes?.flatMap(runtimeRelations) ?? []
+  ]);
+
+  const getSnapshot = async (): Promise<AutomergeDbSnapshot> => {
+    const data = Object.fromEntries(await Promise.all(relations.map(async (relation) => [
+      relation.name,
+      await runtime.source.rows(relation)
+    ])));
+    const version = await runtime.source.version?.();
+    const diagnostics = await runtime.source.diagnostics?.() ?? [];
+
+    return {
+      db: createDb(data as DbInputData, { env: options.env }),
+      source: runtime.source,
+      ...(version === undefined ? {} : { version }),
+      diagnostics
+    };
+  };
+  const db = async () => (await getSnapshot()).db;
+  const query = (async (
+    queryOrQueries: Query | QueryBatch,
+    queryOptions?: DbQueryOptions
+  ) => (queryAutomergeDb as (
+    db: Db,
+    queryOrQueries: Query | QueryBatch,
+    options?: DbQueryOptions
+  ) => Promise<unknown>)(await db(), queryOrQueries, queryOptions)) as AutomergeDbQuery;
+  const tryTransact = async (
+    ...inputs: readonly AutomergeDbTransactionInput[]
+  ): Promise<AutomergeDbTransactionResult> => {
+    const before = await db();
+    const patches = inputs.flatMap((input) =>
+      Array.from(writeInputPatches(typeof input === 'function' ? input(before) : input))
+    );
+    const report = await tryApplyRelationPatches(runtime, patches, { readVersion: true });
+    const snapshot = await getSnapshot();
+    const committed = report.status === 'accepted' || report.status === 'partial';
+
+    return {
+      kind: 'automergeDbTransaction',
+      db: snapshot.db,
+      committed,
+      report,
+      patches: report.patches,
+      applied: report.applied,
+      deltas: report.deltas,
+      diagnostics: report.diagnostics,
+      ...(report.version === undefined ? {} : { version: report.version })
+    };
+  };
+
+  return {
+    kind: 'automergeDb',
+    adapter,
+    source: runtime.source,
+    relations,
+    getDoc: adapter.getDoc,
+    setDoc: adapter.setDoc,
+    db,
+    getSnapshot,
+    q: query,
+    tryTransact,
+    transact: async (...inputs) => {
+      const result = await tryTransact(...inputs);
+
+      if (!result.committed) {
+        throw new AutomergeDbTransactionError(result);
+      }
+
+      return result.db;
+    },
+    mat: async (queryValue, matOptions) => {
+      const snapshot = await db();
+      const result = await queryAutomergeDb(snapshot, queryValue) as QueryResult<unknown>;
+      const key = queryKey(queryValue);
+
+      return {
+        kind: 'automergeDbMaterialization',
+        id: matOptions?.id ?? matOptions?.name ?? key,
+        queryKey: key,
+        query: queryValue,
+        db: snapshot,
+        rows: result.rows as readonly never[],
+        diagnostics: result.diagnostics
+      };
+    },
+    watch: (target, listener, watchOptions) =>
+      createAutomergeDbWatch(runtime.source, target, listener, watchOptions),
+    subscribe: runtime.subscribe ?? adapter.subscribe
+  };
+}
+
+function createAutomergeDbWatch<Row>(
+  source: AdapterSource,
+  target: AutomergeDbWatchTarget<Row>,
+  listener: AutomergeDbWatchListener<Row>,
+  options: AutomergeDbWatchOptions<Row> = {}
+): AutomergeDbWatchHandle<Row> {
+  const id = `automerge-watch-${nextAutomergeDbWatchId += 1}`;
+  let previousRows: readonly Row[] = [];
+  let closed = false;
+  const handle: AutomergeDbWatchHandle<Row> = {
+    kind: 'automergeDbWatch',
+    id,
+    target,
+    refresh: async () => {
+      if (closed) {
+        return watchEvent(id, target, previousRows, previousRows, [], [], [], options);
+      }
+
+      const rows = await readWatchRows(source, target);
+      const { addedRows, removedRows, changedRows } = diffWatchRows(previousRows, rows, options);
+      const event = watchEvent(id, target, previousRows, rows, addedRows, removedRows, changedRows, options);
+      previousRows = rows;
+      await listener(event);
+      return event;
+    },
+    unwatch: () => {
+      closed = true;
+    },
+    ...(options.label === undefined ? {} : { label: options.label })
+  };
+
+  if (options.immediate === true) {
+    void handle.refresh();
+  }
+
+  return handle;
+}
+
+async function readWatchRows<Row>(
+  source: AdapterSource,
+  target: AutomergeDbWatchTarget<Row>
+): Promise<readonly Row[]> {
+  if (!isQuery(target)) {
+    return await source.rows(target) as readonly Row[];
+  }
+
+  const relations = uniqueRelations(Object.values(target.relations));
+  const data = Object.fromEntries(await Promise.all(relations.map(async (relation) => [
+    relation.name,
+    await source.rows(relation)
+  ])));
+  return (await queryAutomergeDb(createDb(data), target) as QueryResult<Row>).rows;
+}
+
+function diffWatchRows<Row>(
+  previousRows: readonly Row[],
+  rows: readonly Row[],
+  options: AutomergeDbWatchOptions<Row>
+): {
+  readonly addedRows: readonly Row[];
+  readonly removedRows: readonly Row[];
+  readonly changedRows: readonly Row[];
+} {
+  const previous = new Map(previousRows.map((row) => [watchRowKey(row, options), row]));
+  const next = new Map(rows.map((row) => [watchRowKey(row, options), row]));
+  const addedRows = rows.filter((row) => !previous.has(watchRowKey(row, options)));
+  const removedRows = previousRows.filter((row) => !next.has(watchRowKey(row, options)));
+  const changedRows = rows.filter((row) => {
+    const before = previous.get(watchRowKey(row, options));
+    return before !== undefined && JSON.stringify(before) !== JSON.stringify(row);
+  });
+
+  return { addedRows, removedRows, changedRows };
+}
+
+function watchEvent<Row>(
+  id: string,
+  target: AutomergeDbWatchTarget<Row>,
+  previousRows: readonly Row[],
+  rows: readonly Row[],
+  addedRows: readonly Row[],
+  removedRows: readonly Row[],
+  changedRows: readonly Row[],
+  options: AutomergeDbWatchOptions<Row>
+): AutomergeDbWatchEvent<Row> {
+  return {
+    kind: 'automergeDbWatchEvent',
+    id,
+    target,
+    changed: addedRows.length > 0 || removedRows.length > 0 || changedRows.length > 0,
+    previousRows,
+    rows,
+    addedRows,
+    removedRows,
+    diagnostics: [],
+    ...(options.label === undefined ? {} : { label: options.label })
+  };
+}
+
+function watchRowKey<Row>(row: Row, options: AutomergeDbWatchOptions<Row>): string {
+  if (typeof options.keyBy === 'function') {
+    return options.keyBy(row);
+  }
+
+  if (Array.isArray(options.keyBy)) {
+    return JSON.stringify(options.keyBy.map((field) => isRecord(row) ? row[field] : undefined));
+  }
+
+  return JSON.stringify(row);
+}
 
 export function automergeMapAdapter<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
@@ -171,6 +564,32 @@ export function automergeMapSource<
       materializeMapping(getDoc(), relation).diagnostics
     )
   };
+}
+
+function uniqueRelations(relations: readonly RelationRef[]): readonly RelationRef[] {
+  return Array.from(new Map(relations.map((relation) => [relation.name, relation])).values());
+}
+
+function runtimeRelations(runtime: AutomergeDbRelationRuntime): readonly RelationRef[] {
+  if (runtime.relation !== undefined) {
+    return [runtime.relation];
+  }
+
+  if (runtime.relations === undefined) {
+    return [];
+  }
+
+  return runtime.relations.flatMap((relationOrMapping) =>
+    isAutomergeMapRelation(relationOrMapping) ? [relationOrMapping.relation] : [relationOrMapping]
+  );
+}
+
+function isAutomergeMapRelation(input: RelationRef | AutomergeMapRelation): input is AutomergeMapRelation {
+  return isRecord(input) && 'relation' in input && 'path' in input;
+}
+
+function isQuery(input: unknown): input is Query {
+  return isRecord(input) && 'data' in input && 'relations' in input;
 }
 
 function assertMapCodec(codec: AutomergeMapStorageCodec | undefined): void {

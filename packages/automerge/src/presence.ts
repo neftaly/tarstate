@@ -33,11 +33,17 @@ export type AutomergePresenceRelationOptions<Relation extends RelationRef = Rela
 
 export type AutomergePresenceClearedValue = (value: unknown) => boolean;
 
+export type AutomergePresenceHandle<_DocType = unknown> = {
+  readonly on?: (eventName: string, listener: (payload: unknown) => void) => void;
+  readonly off?: (eventName: string, listener: (payload: unknown) => void) => void;
+  readonly broadcast?: (message: unknown) => void;
+};
+
 export type AutomergePresenceRuntimeOptions<
   State extends PresenceState = PresenceState,
   DocType = unknown
 > = AutomergePresenceRelationOptions & {
-  readonly handle: DocHandle<DocType>;
+  readonly handle: AutomergePresenceHandle<DocType>;
   readonly initialState: State;
   readonly localPeerId?: string;
   readonly includeLocalRows?: boolean;
@@ -82,12 +88,6 @@ const defaultPresenceFields: AutomergePresenceFieldNames = {
   local: 'local'
 };
 
-type HandleWithEvents<DocType> = DocHandle<DocType> & {
-  readonly on?: (eventName: string, listener: (payload: unknown) => void) => void;
-  readonly off?: (eventName: string, listener: (payload: unknown) => void) => void;
-  readonly broadcast?: (message: unknown) => void;
-};
-
 type RuntimeState<State extends PresenceState> = {
   localState: State;
   localLastActiveAt: number;
@@ -121,7 +121,7 @@ export function automergePresenceRuntime<
 >(options: AutomergePresenceRuntimeOptions<State, DocType>): AutomergePresenceRuntime<State> {
   const fields = { ...defaultPresenceFields, ...options.fields };
   const isClearedValue = options.isClearedValue ?? defaultAutomergePresenceClearedValue;
-  const presence = new Presence<State, DocType>({ handle: options.handle });
+  const presence = new Presence<State, DocType>({ handle: options.handle as DocHandle<DocType> });
   const listeners = new Set<() => void>();
   const state: RuntimeState<State> = {
     localState: compactPresenceState(options.initialState, isClearedValue) as State,
@@ -131,7 +131,7 @@ export function automergePresenceRuntime<
     revision: 0,
     running: false
   };
-  const handle = options.handle as HandleWithEvents<DocType>;
+  const handle = options.handle;
   const version = (): AutomergePresenceVersion => ({
     revision: state.revision,
     ...(options.localPeerId === undefined ? {} : { localPeerId: options.localPeerId })
@@ -227,7 +227,7 @@ function presenceTarget<State extends PresenceState, DocType>(
   isClearedValue: AutomergePresenceClearedValue,
   version: () => AutomergePresenceVersion,
   notify: () => void,
-  handle: HandleWithEvents<DocType>
+  handle: AutomergePresenceHandle<DocType>
 ): RelationPatchTarget<AutomergePresenceVersion> {
   const apply = (patches: readonly WritePatch[]): RelationApplyResult<AutomergePresenceVersion> => {
     const planned = planPresencePatches(relation, fields, state.localState, localPeerId, isClearedValue, patches);

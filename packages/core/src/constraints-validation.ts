@@ -1,5 +1,7 @@
+import type { Db } from './db.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
-import type { EvaluateOptions } from './evaluate.js';
+import { evaluate, type EvaluateOptions } from './evaluate.js';
+import type { ExprData, PredicateData, Query } from './query.js';
 import type { RelationSource } from './source.js';
 import type { RelationSourceInput } from './source-input.js';
 import type { ConstraintData, ConstraintSet } from './constraints.js';
@@ -18,15 +20,16 @@ export type ConstraintValidationResult = {
 export type ConstraintValidationOptions = EvaluateOptions;
 
 export async function validateConstraints(
-  source: RelationSource,
+  source: RelationSourceInput,
   input: ConstraintValidationInput,
-  _options: ConstraintValidationOptions = {}
+  options: ConstraintValidationOptions = {}
 ): Promise<ConstraintValidationResult> {
   const constraints = constraintDataList(input);
   const diagnostics: TarstateDiagnostic[] = [];
+  const relationSource = asRelationSource(source);
 
   for (const constraint of constraints) {
-    diagnostics.push(...await validateConstraint(source, constraint));
+    diagnostics.push(...await validateConstraint(relationSource, constraint, options));
   }
 
   return { kind: 'constraintValidation', valid: diagnostics.length === 0, diagnostics };
@@ -40,19 +43,33 @@ export async function validateAttachedConstraints(
   return validateConstraints(asRelationSource(input), constraints, options);
 }
 
+export function validateAttachedConstraintsSync(db: Db): ConstraintValidationResult {
+  return validateConstraintsSync(db, attachedConstraintsFor(db));
+}
+
+export function validateConstraintsSync(
+  db: Db,
+  input: ConstraintValidationInput
+): ConstraintValidationResult {
+  const constraints = constraintDataList(input);
+  const diagnostics = constraints.flatMap((constraint) => validateConstraintSync(db, constraint));
+  return { kind: 'constraintValidation', valid: diagnostics.length === 0, diagnostics };
+}
+
 async function validateConstraint(
   source: RelationSource,
-  constraint: ConstraintData
+  constraint: ConstraintData,
+  options: ConstraintValidationOptions
 ): Promise<readonly TarstateDiagnostic[]> {
   switch (constraint.op) {
     case 'req':
       return 'relation' in constraint
         ? validateRequired(await rowsFor(source, constraint.relation), constraint.relation.name, constraint.field)
-        : [];
+        : validateRequired(await queryRowsFor(source, constraint.query, options), 'query', constraint.field);
     case 'unique':
       return 'relation' in constraint
         ? validateUnique(await rowsFor(source, constraint.relation), constraint.relation.name, constraint.fields)
-        : [];
+        : validateUnique(await queryRowsFor(source, constraint.query, options), 'query', constraint.fields);
     case 'fk':
       return 'relation' in constraint && !('data' in constraint.target)
         ? validateForeignKey(
@@ -63,10 +80,62 @@ async function validateConstraint(
             constraint.targetFields,
             constraint.optional
           )
+        : validateQueryForeignKey(source, constraint, options);
+    case 'check':
+      return constraint.query === undefined
+        ? []
+        : validateCheck(await queryRowsFor(source, constraint.query, options), constraint.predicate);
+  }
+}
+
+function validateConstraintSync(db: Db, constraint: ConstraintData): readonly TarstateDiagnostic[] {
+  switch (constraint.op) {
+    case 'req':
+      return 'relation' in constraint
+        ? validateRequired(db.data[constraint.relation.name] ?? [], constraint.relation.name, constraint.field)
+        : [];
+    case 'unique':
+      return 'relation' in constraint
+        ? validateUnique(db.data[constraint.relation.name] ?? [], constraint.relation.name, constraint.fields)
+        : [];
+    case 'fk':
+      return 'relation' in constraint && !('data' in constraint.target)
+        ? validateForeignKey(
+            db.data[constraint.relation.name] ?? [],
+            db.data[constraint.target.name] ?? [],
+            constraint.relation.name,
+            constraint.fields,
+            constraint.targetFields,
+            constraint.optional
+          )
         : [];
     case 'check':
       return [];
   }
+}
+
+async function queryRowsFor<Row>(
+  source: RelationSource,
+  query: Query<Row>,
+  options: ConstraintValidationOptions
+): Promise<readonly Row[]> {
+  return (await evaluate(source, query, options)).rows;
+}
+
+async function validateQueryForeignKey(
+  source: RelationSource,
+  constraint: Extract<ConstraintData, { readonly op: 'fk' }>,
+  options: ConstraintValidationOptions
+): Promise<readonly TarstateDiagnostic[]> {
+  if (!('query' in constraint)) {
+    return [];
+  }
+
+  const sourceRows = await queryRowsFor(source, constraint.query, options);
+  const targetRows = 'data' in constraint.target
+    ? await queryRowsFor(source, constraint.target, options)
+    : await rowsFor(source, constraint.target);
+  return validateForeignKey(sourceRows, targetRows, 'query', constraint.fields, constraint.targetFields, constraint.optional);
 }
 
 async function rowsFor(source: RelationSource, relation: { readonly name: string }): Promise<readonly unknown[]> {
@@ -170,6 +239,60 @@ function validateForeignKey(
   }
 
   return diagnostics;
+}
+
+function validateCheck(
+  rows: readonly unknown[],
+  predicate: PredicateData
+): readonly TarstateDiagnostic[] {
+  return rows.flatMap((row) => evaluatePredicate(row, predicate)
+    ? []
+    : [constraintDiagnostic('constraint_check', 'check constraint failed', 'query', '', rowKey(row))]);
+}
+
+function evaluatePredicate(row: unknown, predicate: PredicateData): boolean {
+  switch (predicate.op) {
+    case 'eq':
+      return Object.is(exprValue(row, predicate.left), exprValue(row, predicate.right));
+    case 'neq':
+      return !Object.is(exprValue(row, predicate.left), exprValue(row, predicate.right));
+    case 'lt':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) < 0;
+    case 'lte':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) <= 0;
+    case 'gt':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) > 0;
+    case 'gte':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) >= 0;
+    case 'and':
+      return predicate.predicates.every((item) => evaluatePredicate(row, item));
+    case 'or':
+      return predicate.predicates.some((item) => evaluatePredicate(row, item));
+    case 'not':
+      return !evaluatePredicate(row, predicate.predicate);
+  }
+}
+
+function exprValue(row: unknown, expr: ExprData): unknown {
+  switch (expr.op) {
+    case 'value':
+      return expr.value;
+    case 'field': {
+      const aliased = isRecord(row) ? row[expr.alias] : undefined;
+      return isRecord(aliased) ? aliased[expr.field] : isRecord(row) ? row[expr.field] : undefined;
+    }
+    case 'tuple':
+      return expr.items.map((item) => exprValue(row, item));
+    default:
+      return undefined;
+  }
+}
+
+function compareValues(left: unknown, right: unknown): number {
+  if (left === right) return 0;
+  if (left === undefined || left === null) return -1;
+  if (right === undefined || right === null) return 1;
+  return left < right ? -1 : 1;
 }
 
 function valuesFor(row: unknown, fields: readonly string[]): readonly unknown[] {

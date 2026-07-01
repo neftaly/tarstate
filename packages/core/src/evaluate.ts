@@ -53,35 +53,41 @@ export async function evaluate<Row>(
   };
 }
 
-async function evaluateData(data: QueryData, state: EvalState): Promise<readonly EvalContext[]> {
+async function evaluateData(
+  data: QueryData,
+  state: EvalState,
+  outerRow: EvalContext = {}
+): Promise<readonly EvalContext[]> {
   switch (data.op) {
     case 'from':
-      return relationRows(data.relation, data.alias, state);
+      return relationRows(data.relation, data.alias, state, outerRow);
     case 'lookup':
-      return lookupRows(data, state);
+      return lookupRows(data, state, outerRow);
     case 'constRows':
-      return data.rows;
+      return data.rows.map((row) => ({ ...outerRow, ...row }));
     case 'where': {
-      const input = await evaluateData(data.input, state);
-      return input.filter((row) => evaluatePredicate(data.predicate, row, state));
+      const input = await evaluateData(data.input, state, outerRow);
+      return filterAsync(input, (row) => evaluatePredicate(data.predicate, row, state));
     }
     case 'hash':
     case 'btree':
     case 'keyBy':
-      return evaluateData(data.input, state);
+      return evaluateData(data.input, state, outerRow);
     case 'join':
-      return joinRows(data.kind, data.left, data.right, data.on, state);
+      return joinRows(data.kind, data.left, data.right, data.on, state, outerRow);
     case 'select':
-      return (await evaluateData(data.input, state)).map((row) => projectRow(data.projection, row, state));
+      return Promise.all((await evaluateData(data.input, state, outerRow)).map((row) =>
+        projectRow(data.projection, row, state)
+      ));
     case 'extend':
-      return (await evaluateData(data.input, state)).map((row) => ({
+      return Promise.all((await evaluateData(data.input, state, outerRow)).map(async (row) => ({
         ...row,
-        ...projectRow(data.projection, row, state)
-      }));
+        ...await projectRow(data.projection, row, state)
+      })));
     case 'expand':
-      return expandRows(data.input, data.collection, data.alias, data.fields, state);
+      return expandRows(data.input, data.collection, data.alias, data.fields, state, outerRow);
     case 'without':
-      return (await evaluateData(data.input, state)).map((row) => {
+      return (await evaluateData(data.input, state, outerRow)).map((row) => {
         const output = { ...row };
         for (const field of data.fields) {
           delete output[field];
@@ -89,29 +95,34 @@ async function evaluateData(data: QueryData, state: EvalState): Promise<readonly
         return output;
       });
     case 'sort':
-      return sortRows(await evaluateData(data.input, state), data.order, state);
+      return sortRows(await evaluateData(data.input, state, outerRow), data.order, state);
     case 'limit': {
       const offset = data.offset ?? 0;
-      return (await evaluateData(data.input, state)).slice(offset, offset + data.count);
+      return (await evaluateData(data.input, state, outerRow)).slice(offset, offset + data.count);
     }
     case 'sortLimit':
-      return sortRows(await evaluateData(data.input, state), data.order, state).slice(0, data.count);
+      return (await sortRows(await evaluateData(data.input, state, outerRow), data.order, state)).slice(0, data.count);
     case 'union':
-      return setUnion(await Promise.all(data.inputs.map((input) => evaluateData(input, state))));
+      return setUnion(await Promise.all(data.inputs.map((input) => evaluateData(input, state, outerRow))));
     case 'intersection':
-      return setIntersection(await Promise.all(data.inputs.map((input) => evaluateData(input, state))));
+      return setIntersection(await Promise.all(data.inputs.map((input) => evaluateData(input, state, outerRow))));
     case 'difference':
-      return setDifference(await evaluateData(data.left, state), await evaluateData(data.right, state));
+      return setDifference(await evaluateData(data.left, state, outerRow), await evaluateData(data.right, state, outerRow));
     case 'rename':
-      return (await evaluateData(data.input, state)).map((row) => renameRow(row, data.fields));
+      return (await evaluateData(data.input, state, outerRow)).map((row) => renameRow(row, data.fields));
     case 'qualify':
-      return (await evaluateData(data.input, state)).map((row) => ({ [data.alias]: row }));
+      return (await evaluateData(data.input, state, outerRow)).map((row) => ({ [data.alias]: row }));
     case 'aggregate':
-      return aggregateRows(await evaluateData(data.input, state), data.groupBy, data.aggregates, state);
+      return aggregateRows(await evaluateData(data.input, state, outerRow), data.groupBy, data.aggregates, state);
   }
 }
 
-async function relationRows(relationName: string, alias: string, state: EvalState): Promise<readonly EvalContext[]> {
+async function relationRows(
+  relationName: string,
+  alias: string,
+  state: EvalState,
+  outerRow: EvalContext
+): Promise<readonly EvalContext[]> {
   const relation = state.relations[relationName];
   if (relation === undefined) {
     state.diagnostics.push({
@@ -123,19 +134,20 @@ async function relationRows(relationName: string, alias: string, state: EvalStat
   }
 
   const rows = await readRows(state, relation);
-  return validRelationRows(relation, rows, state).map((row) => ({ [alias]: row }));
+  return validRelationRows(relation, rows, state).map((row) => ({ ...outerRow, [alias]: row }));
 }
 
 async function lookupRows(
   data: Extract<QueryData, { readonly op: 'lookup' }>,
-  state: EvalState
+  state: EvalState,
+  outerRow: EvalContext
 ): Promise<readonly EvalContext[]> {
   const relation = state.relations[data.relation];
   if (relation === undefined) {
     return [];
   }
 
-  const value = evaluateExpr(data.value, {}, state);
+  const value = await evaluateExpr(data.value, outerRow, state);
   let rows: readonly unknown[] | undefined;
 
   if (state.source.lookup !== undefined) {
@@ -157,7 +169,7 @@ async function lookupRows(
     );
   }
 
-  return validRelationRows(relation, rows, state).map((row) => ({ [data.alias]: row }));
+  return validRelationRows(relation, rows, state).map((row) => ({ ...outerRow, [data.alias]: row }));
 }
 
 async function readRows(state: EvalState, relation: RelationRef): Promise<readonly unknown[]> {
@@ -178,10 +190,11 @@ async function joinRows(
   leftData: QueryData,
   rightData: QueryData,
   on: PredicateData,
-  state: EvalState
+  state: EvalState,
+  outerRow: EvalContext
 ): Promise<readonly EvalContext[]> {
-  const left = await evaluateData(leftData, state);
-  const right = await evaluateData(rightData, state);
+  const left = await evaluateData(leftData, state, outerRow);
+  const right = await evaluateData(rightData, state, outerRow);
   const output: EvalContext[] = [];
 
   for (const leftRow of left) {
@@ -189,7 +202,7 @@ async function joinRows(
 
     for (const rightRow of right) {
       const merged = { ...leftRow, ...rightRow };
-      if (evaluatePredicate(on, merged, state)) {
+      if (await evaluatePredicate(on, merged, state)) {
         matched = true;
         output.push(merged);
       }
@@ -208,13 +221,14 @@ async function expandRows(
   collection: ExprData,
   alias: string | undefined,
   fields: readonly string[] | undefined,
-  state: EvalState
+  state: EvalState,
+  outerRow: EvalContext
 ): Promise<readonly EvalContext[]> {
-  const input = await evaluateData(inputData, state);
+  const input = await evaluateData(inputData, state, outerRow);
   const output: EvalContext[] = [];
 
   for (const row of input) {
-    const value = evaluateExpr(collection, row, state);
+    const value = await evaluateExpr(collection, row, state);
     if (value === null || value === undefined || !isIterable(value)) {
       continue;
     }
@@ -231,26 +245,26 @@ async function expandRows(
   return output;
 }
 
-function projectRow(projection: ProjectionData, row: EvalContext, state: EvalState): EvalContext {
+async function projectRow(projection: ProjectionData, row: EvalContext, state: EvalState): Promise<EvalContext> {
   const output: Record<string, unknown> = {};
 
   for (const [name, item] of Object.entries(projection)) {
-    output[name] = evaluateExpr(projectionExpr(item), row, state);
+    output[name] = await evaluateExpr(projectionExpr(item), row, state);
   }
 
   return output;
 }
 
-function aggregateRows(
+async function aggregateRows(
   rows: readonly EvalContext[],
   groupBy: ProjectionData,
   aggregates: ProjectionData,
   state: EvalState
-): readonly EvalContext[] {
+): Promise<readonly EvalContext[]> {
   const groups = new Map<string, { readonly group: EvalContext; readonly rows: EvalContext[] }>();
 
   for (const row of rows) {
-    const group = projectRow(groupBy, row, state);
+    const group = await projectRow(groupBy, row, state);
     const key = stableKey(group);
     const existing = groups.get(key);
     if (existing === undefined) {
@@ -264,21 +278,23 @@ function aggregateRows(
     groups.set(stableKey({}), { group: {}, rows: [] });
   }
 
-  return Array.from(groups.values()).map(({ group, rows: groupRows }) => {
+  return Promise.all(Array.from(groups.values()).map(async ({ group, rows: groupRows }) => {
     const output: Record<string, unknown> = { ...group };
     for (const [name, item] of Object.entries(aggregates)) {
-      output[name] = evaluateAggregate(projectionExpr(item), groupRows, state);
+      output[name] = await evaluateAggregate(projectionExpr(item), groupRows, state);
     }
     return output;
-  });
+  }));
 }
 
-function evaluateAggregate(expr: ExprData, rows: readonly EvalContext[], state: EvalState): unknown {
+async function evaluateAggregate(expr: ExprData, rows: readonly EvalContext[], state: EvalState): Promise<unknown> {
   if (expr.op !== 'aggregateCall') {
     return evaluateExpr(expr, rows[0] ?? {}, state);
   }
 
-  const values = expr.expr === undefined ? rows : rows.map((row) => evaluateExpr(expr.expr as ExprData, row, state));
+  const values = expr.expr === undefined
+    ? rows
+    : await Promise.all(rows.map((row) => evaluateExpr(expr.expr as ExprData, row, state)));
   const aggregateValues = expr.distinct ? distinctValues(values) : values;
 
   switch (expr.name) {
@@ -309,36 +325,36 @@ function evaluateAggregate(expr: ExprData, rows: readonly EvalContext[], state: 
     case 'bottom':
       return orderedValues(aggregateValues).slice(0, expr.count ?? 0);
     case 'topBy':
-      return rowsByAggregate(rows, expr.expr, state, 'desc').slice(0, expr.count ?? 0);
+      return (await rowsByAggregate(rows, expr.expr, state, 'desc')).slice(0, expr.count ?? 0);
     case 'bottomBy':
-      return rowsByAggregate(rows, expr.expr, state, 'asc').slice(0, expr.count ?? 0);
+      return (await rowsByAggregate(rows, expr.expr, state, 'asc')).slice(0, expr.count ?? 0);
   }
 }
 
-function evaluatePredicate(predicate: PredicateData, row: EvalContext, state: EvalState): boolean {
+async function evaluatePredicate(predicate: PredicateData, row: EvalContext, state: EvalState): Promise<boolean> {
   switch (predicate.op) {
     case 'eq':
-      return Object.is(evaluateExpr(predicate.left, row, state), evaluateExpr(predicate.right, row, state));
+      return Object.is(await evaluateExpr(predicate.left, row, state), await evaluateExpr(predicate.right, row, state));
     case 'neq':
-      return !Object.is(evaluateExpr(predicate.left, row, state), evaluateExpr(predicate.right, row, state));
+      return !Object.is(await evaluateExpr(predicate.left, row, state), await evaluateExpr(predicate.right, row, state));
     case 'lt':
-      return compareValues(evaluateExpr(predicate.left, row, state), evaluateExpr(predicate.right, row, state)) < 0;
+      return compareValues(await evaluateExpr(predicate.left, row, state), await evaluateExpr(predicate.right, row, state)) < 0;
     case 'lte':
-      return compareValues(evaluateExpr(predicate.left, row, state), evaluateExpr(predicate.right, row, state)) <= 0;
+      return compareValues(await evaluateExpr(predicate.left, row, state), await evaluateExpr(predicate.right, row, state)) <= 0;
     case 'gt':
-      return compareValues(evaluateExpr(predicate.left, row, state), evaluateExpr(predicate.right, row, state)) > 0;
+      return compareValues(await evaluateExpr(predicate.left, row, state), await evaluateExpr(predicate.right, row, state)) > 0;
     case 'gte':
-      return compareValues(evaluateExpr(predicate.left, row, state), evaluateExpr(predicate.right, row, state)) >= 0;
+      return compareValues(await evaluateExpr(predicate.left, row, state), await evaluateExpr(predicate.right, row, state)) >= 0;
     case 'and':
-      return predicate.predicates.every((item) => evaluatePredicate(item, row, state));
+      return everyAsync(predicate.predicates, (item) => evaluatePredicate(item, row, state));
     case 'or':
-      return predicate.predicates.some((item) => evaluatePredicate(item, row, state));
+      return someAsync(predicate.predicates, (item) => evaluatePredicate(item, row, state));
     case 'not':
-      return !evaluatePredicate(predicate.predicate, row, state);
+      return !await evaluatePredicate(predicate.predicate, row, state);
   }
 }
 
-function evaluateExpr(expr: ExprData, row: EvalContext, state: EvalState): unknown {
+async function evaluateExpr(expr: ExprData, row: EvalContext, state: EvalState): Promise<unknown> {
   switch (expr.op) {
     case 'field':
       return readField(row, expr.alias, expr.field);
@@ -355,18 +371,14 @@ function evaluateExpr(expr: ExprData, row: EvalContext, state: EvalState): unkno
         });
         return undefined;
       }
-      return fn(...expr.args.map((arg) => evaluateExpr(arg, row, state)));
+      return fn(...await Promise.all(expr.args.map((arg) => evaluateExpr(arg, row, state))));
     }
     case 'tuple':
-      return expr.items.map((item) => evaluateExpr(item, row, state));
+      return Promise.all(expr.items.map((item) => evaluateExpr(item, row, state)));
     case 'aggregateCall':
       return evaluateAggregate(expr, [row], state);
     case 'subquery':
-      state.diagnostics.push({
-        code: 'unsupported_expression',
-        message: 'subquery expressions are not supported by this evaluator'
-      });
-      return expr.mode === 'many' ? [] : undefined;
+      return evaluateSubqueryExpr(expr, row, state);
   }
 }
 
@@ -384,12 +396,22 @@ function readField(row: EvalContext, alias: string, field: string): unknown {
   return row[field];
 }
 
-function sortRows(rows: readonly EvalContext[], order: readonly SortData[], state: EvalState): readonly EvalContext[] {
-  return [...rows].sort((left, right) => {
-    for (const item of order) {
+async function sortRows(
+  rows: readonly EvalContext[],
+  order: readonly SortData[],
+  state: EvalState
+): Promise<readonly EvalContext[]> {
+  const keyedRows = await Promise.all(rows.map(async (row) => ({
+    row,
+    values: await Promise.all(order.map((item) => evaluateExpr(item.expr, row, state)))
+  })));
+
+  return keyedRows.sort((left, right) => {
+    for (let index = 0; index < order.length; index += 1) {
+      const item = order[index] as SortData;
       const comparison = compareSortValues(
-        evaluateExpr(item.expr, left, state),
-        evaluateExpr(item.expr, right, state),
+        left.values[index],
+        right.values[index],
         item.direction,
         item.nulls
       );
@@ -400,7 +422,7 @@ function sortRows(rows: readonly EvalContext[], order: readonly SortData[], stat
     }
 
     return 0;
-  });
+  }).map((item) => item.row);
 }
 
 function compareSortValues(
@@ -549,19 +571,65 @@ function orderedValues(values: readonly unknown[]): readonly unknown[] {
     .sort(compareValues);
 }
 
-function rowsByAggregate(
+async function rowsByAggregate(
   rows: readonly EvalContext[],
   expr: ExprData | undefined,
   state: EvalState,
   direction: 'asc' | 'desc'
-): readonly EvalContext[] {
+): Promise<readonly EvalContext[]> {
   if (expr === undefined) {
     return [...rows];
   }
 
-  return [...rows].sort((left, right) =>
-    compareSortValues(evaluateExpr(expr, left, state), evaluateExpr(expr, right, state), direction, 'last')
-  );
+  const keyedRows = await Promise.all(rows.map(async (row) => ({
+    row,
+    value: await evaluateExpr(expr, row, state)
+  })));
+
+  return keyedRows.sort((left, right) =>
+    compareSortValues(left.value, right.value, direction, 'last')
+  ).map((item) => item.row);
+}
+
+async function evaluateSubqueryExpr(
+  expr: Extract<ExprData, { readonly op: 'subquery' }>,
+  row: EvalContext,
+  state: EvalState
+): Promise<unknown> {
+  const rows = await evaluateData(expr.query, state, row);
+  return expr.mode === 'many' ? rows : rows[0];
+}
+
+async function filterAsync<T>(
+  items: readonly T[],
+  predicate: (item: T) => Promise<boolean>
+): Promise<readonly T[]> {
+  const decisions = await Promise.all(items.map(predicate));
+  return items.filter((_, index) => decisions[index]);
+}
+
+async function everyAsync<T>(
+  items: readonly T[],
+  predicate: (item: T) => Promise<boolean>
+): Promise<boolean> {
+  for (const item of items) {
+    if (!await predicate(item)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function someAsync<T>(
+  items: readonly T[],
+  predicate: (item: T) => Promise<boolean>
+): Promise<boolean> {
+  for (const item of items) {
+    if (await predicate(item)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function setUnion(inputs: readonly (readonly EvalContext[])[]): readonly EvalContext[] {

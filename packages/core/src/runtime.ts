@@ -1,4 +1,5 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
+import { tryTransact, type Db, type DbTransactionInput, type DbTransactionInputs, type DbTransactionResult } from './db.js';
 import type { RelationDelta } from './delta.js';
 import {
   isRelationAdapter,
@@ -19,6 +20,7 @@ import type {
   WatchDiagnostic,
   WatchRuntimeDiagnostic
 } from './watch.js';
+import { trackWatchedChanges } from './watch-tracking.js';
 import type { WritePatch } from './write.js';
 
 export type TrackTransactDiagnostic = WatchRuntimeDiagnostic | MaterializationDiagnostic | TarstateDiagnostic;
@@ -36,6 +38,7 @@ export type TrackRuntimeCommitOptions = TrackTransactOptions & {
 export type TrackTransactResult<Db extends WatchDb = WatchDb> = {
   readonly kind: 'trackTransact';
   readonly db: Db;
+  readonly result?: DbTransactionResult;
   readonly supported: boolean;
   readonly changes: readonly TrackedChange[];
   readonly deltas: readonly RelationDelta[];
@@ -96,21 +99,72 @@ export class UnsupportedChangeTrackingError extends Error {
   }
 }
 
-export async function trackTransact<Db extends WatchDb, Result extends TrackTransactOutput<Db>>(
+export function trackTransact<Db extends WatchDb, Result extends TrackTransactOutput<Db>>(
   db: Db,
   transact: TrackTransactCallback<Db, Result>,
-  options: TrackTransactOptions = {}
-): Promise<TrackTransactResult<Db>> {
-  const output: TrackTransactOutput<Db> = await transact(db);
+  options?: TrackTransactOptions
+): Promise<TrackTransactResult<Db>>;
+export function trackTransact(
+  db: Db,
+  ...inputs: DbTransactionInputs
+): Promise<TrackTransactResult<Db>>;
+export async function trackTransact(
+  db: WatchDb,
+  transactOrInput?: unknown,
+  ...rest: readonly unknown[]
+): Promise<TrackTransactResult<WatchDb>> {
+  const typedRest = rest as readonly (DbTransactionInput | TrackTransactOptions)[];
+  if (transactOrInput === undefined || typeof transactOrInput !== 'function' || isWriteTransactionInput(typedRest)) {
+    const args = (transactOrInput === undefined ? rest : [transactOrInput, ...rest]) as readonly (
+      DbTransactionInput | TrackTransactOptions
+    )[];
+    const inputs = args.filter((input): input is DbTransactionInput => !isTrackTransactOptions(input));
+    const options = args.find(isTrackTransactOptions);
+    if (!isDb(db)) {
+      const diagnostic = unsupportedDiagnostic();
+      if (options?.throwOnUnsupported === true) {
+        throw new UnsupportedChangeTrackingError(diagnostic);
+      }
+      return {
+        kind: 'trackTransact',
+        db,
+        supported: false,
+        changes: [],
+        deltas: [],
+        diagnostics: [diagnostic],
+        ...(options?.label === undefined ? {} : { label: options.label })
+      };
+    }
+
+    const result = tryTransact(db, ...inputs);
+    const tracked = result.committed
+      ? await trackWatchedChanges(db, result.db, result.deltas)
+      : { changes: [], diagnostics: [] };
+
+    return {
+      kind: 'trackTransact',
+      db: result.db,
+      result,
+      supported: true,
+      changes: tracked.changes,
+      deltas: result.deltas,
+      diagnostics: [...result.diagnostics, ...tracked.diagnostics]
+    };
+  }
+
+  const options = (typedRest[0] ?? {}) as TrackTransactOptions;
+  const transact = transactOrInput as TrackTransactCallback<WatchDb, TrackTransactOutput<WatchDb>>;
+  const output: TrackTransactOutput<WatchDb> = await transact(db);
   const envelope = isTrackEnvelope(output);
   const nextDb = envelope ? output.db : output;
+  const tracked = await trackWatchedChanges(db, nextDb, envelope ? output.deltas ?? [] : []);
   return {
     kind: 'trackTransact',
     db: nextDb,
     supported: true,
-    changes: deltasToChanges(envelope ? output.deltas ?? [] : []),
+    changes: tracked.changes.length > 0 ? tracked.changes : deltasToChanges(envelope ? output.deltas ?? [] : []),
     deltas: envelope ? output.deltas ?? [] : [],
-    diagnostics: envelope ? output.diagnostics ?? [] : [],
+    diagnostics: [...(envelope ? output.diagnostics ?? [] : []), ...tracked.diagnostics],
     ...(options.label === undefined ? {} : { label: options.label })
   };
 }
@@ -193,6 +247,22 @@ export async function trackRuntimeCommit<Version = unknown>(
 
 function isTrackEnvelope<Db extends WatchDb>(input: TrackTransactOutput<Db>): input is TrackTransactEnvelope<Db> {
   return typeof input === 'object' && input !== null && 'db' in input;
+}
+
+function isDb(input: WatchDb): input is Db {
+  return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
+}
+
+function isWriteTransactionInput(inputs: readonly (DbTransactionInput | TrackTransactOptions)[]): boolean {
+  return inputs.some((input) => !isTrackTransactOptions(input));
+}
+
+function isTrackTransactOptions(input: DbTransactionInput | TrackTransactOptions): input is TrackTransactOptions {
+  return typeof input === 'object' &&
+    input !== null &&
+    !('op' in input) &&
+    !(Symbol.iterator in input) &&
+    ('label' in input || 'throwOnUnsupported' in input);
 }
 
 function unsupportedDiagnostic(): WatchDiagnostic {
