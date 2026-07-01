@@ -19,7 +19,7 @@ export type WatchDiagnostic = {
   readonly surface: 'watch' | 'changeTracking';
   readonly detail?: unknown;
 };
-export type WatchRuntimeDiagnostic = WatchDiagnostic | TarstateDiagnostic | RowDiffDiagnostic;
+export type WatchRuntimeDiagnostic<Row = unknown> = WatchDiagnostic | TarstateDiagnostic | RowDiffDiagnostic<Row>;
 
 export type ChangeSet = {
   readonly deltas?: readonly RelationDelta[];
@@ -39,7 +39,7 @@ export type WatchEvent<Row = unknown> = {
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
   readonly changes: ChangeSet;
-  readonly diagnostics: readonly WatchRuntimeDiagnostic[];
+  readonly diagnostics: readonly WatchRuntimeDiagnostic<Row>[];
 };
 export type WatchListener<Row = unknown> = (event: WatchEvent<Row>) => void | Promise<void>;
 export type WatchOptions<Row = unknown> = EvaluateOptions & RowDiffOptions<Row> & {
@@ -58,7 +58,7 @@ export type WatchRefreshResult<Row = unknown> = {
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
-  readonly diagnostics: readonly WatchRuntimeDiagnostic[];
+  readonly diagnostics: readonly WatchRuntimeDiagnostic<Row>[];
 };
 export type WatchUnsubscribeResult = {
   readonly kind: 'watchUnsubscribe';

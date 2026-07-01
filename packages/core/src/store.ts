@@ -146,8 +146,8 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
     kind: 'store',
     getSnapshot: () => snapshot,
     subscribe,
-    query: (async (queryValue: Query, options?: StoreQueryOptions) => q(snapshot.db, queryValue, options)) as StoreQuery,
-    queries: (async (queries: QueryBatch, options?: StoreQueryOptions) => qMany(snapshot.db, queries, options)) as StoreQueries,
+    query: queryStore,
+    queries: queryStores,
     view: <Row>(queryValue: Query<Row>) => createStoreView(queryValue, store),
     commit: async (patches) => {
       const result = tryTransact(snapshot.db, patches);
@@ -172,22 +172,68 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
   };
 
   return store;
+
+  function queryStore<Row, MappedRow>(
+    queryValue: Query<Row>,
+    options: StoreQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
+  ): Promise<StoreQueryResult<MappedRow>>;
+  function queryStore<Row>(queryValue: Query<Row>, options?: StoreQueryOptions<Row>): Promise<StoreQueryResult<Row>>;
+  function queryStore(queryValue: Query, options?: StoreQueryOptions): Promise<StoreQueryResult> {
+    return q(snapshot.db, queryValue, options);
+  }
+
+  function queryStores<const Queries extends QueryBatch, MappedRow>(
+    queries: Queries,
+    options: StoreQueryOptions<QueryBatchRow<Queries>, MappedRow> & {
+      readonly mapRows: (rows: readonly QueryBatchRow<Queries>[]) => readonly MappedRow[];
+    }
+  ): Promise<StoreMappedQueryBatchResult<Queries, MappedRow>>;
+  function queryStores<const Queries extends QueryBatch>(
+    queries: Queries,
+    options?: StoreQueryOptions<QueryBatchRow<Queries>>
+  ): Promise<StoreQueryBatchResult<Queries>>;
+  function queryStores(queries: QueryBatch, options?: StoreQueryOptions): Promise<StoreQueryBatchResult<QueryBatch>> {
+    return qMany(snapshot.db, queries, options);
+  }
 }
 
 function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
-  const read = (async (options?: StoreViewReadOptions<Row>) => store.query(query, options)) as StoreView<Row>['read'];
-  const rows = (async (options?: StoreViewReadOptions<Row>) => (await read(options as never)).rows) as StoreView<Row>['rows'];
-
   return {
     kind: 'view',
     query,
     queryKey: queryKey(query),
     getSnapshot: store.getSnapshot,
     subscribe: store.subscribe,
-    read,
-    rows,
+    read: readView,
+    rows: readRows,
     refresh: async (options = {}) => store.query(query, options)
   };
+
+  function readView<MappedRow>(
+    options: StoreViewReadOptions<Row, MappedRow> & {
+      readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[];
+    }
+  ): Promise<StoreQueryResult<MappedRow>>;
+  function readView(options?: StoreViewReadOptions<Row>): Promise<StoreQueryResult<Row>>;
+  function readView<MappedRow>(
+    options?: StoreViewReadOptions<Row, MappedRow>
+  ): Promise<StoreQueryResult<Row> | StoreQueryResult<MappedRow>> {
+    void options;
+    return Promise.resolve({ rows: [], diagnostics: [] });
+  }
+
+  function readRows<MappedRow>(
+    options: StoreViewReadOptions<Row, MappedRow> & {
+      readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[];
+    }
+  ): Promise<readonly MappedRow[]>;
+  function readRows(options?: StoreViewReadOptions<Row>): Promise<readonly Row[]>;
+  async function readRows<MappedRow>(
+    options?: StoreViewReadOptions<Row, MappedRow>
+  ): Promise<readonly Row[] | readonly MappedRow[]> {
+    void options;
+    return [];
+  }
 }
 
 function storeSnapshot(db: Db, revision: number, diagnostics: readonly StoreDiagnostic[]): StoreSnapshot {

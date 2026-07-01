@@ -95,6 +95,10 @@ export type UseQueryOptions<Row, Selected> = EvaluateOptions & {
   readonly deps?: readonly unknown[];
   readonly select?: (rows: readonly Row[], result: QueryResult<Row>) => Selected;
 };
+type UseQuerySelectedOptions<Row, Selected> = EvaluateOptions & {
+  readonly deps?: readonly unknown[];
+  readonly select: (rows: readonly Row[], result: QueryResult<Row>) => Selected;
+};
 
 export type QueryHookState<Row, Selected = readonly Row[]> = {
   readonly status: 'loading' | 'ready' | 'error';
@@ -118,7 +122,7 @@ export type QueriesHookState<Queries extends QueryBatch> = {
 };
 
 const TarstateContext = createContext<TarstateStore | undefined>(undefined);
-const emptyDiagnostics = Object.freeze([]) as readonly never[];
+const emptyDiagnostics: readonly TarstateReactDiagnostic[] = Object.freeze([]);
 
 export function createDbStore(
   input: Db | DbInputData = createDb()
@@ -178,17 +182,25 @@ export function useTarstateSnapshot<Snapshot extends TarstateSnapshot = Tarstate
   return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 }
 
-export function useTarstateQuery<Row, Selected = readonly Row[]>(
+export function useTarstateQuery<Row>(
+  query: Query<Row>,
+  options?: Omit<UseQueryOptions<Row, readonly Row[]>, 'select'>
+): QueryHookState<Row>;
+export function useTarstateQuery<Row, Selected>(
+  query: Query<Row>,
+  options: UseQuerySelectedOptions<Row, Selected>
+): QueryHookState<Row, Selected>;
+export function useTarstateQuery<Row, Selected>(
   query: Query<Row>,
   options: UseQueryOptions<Row, Selected> = {}
-): QueryHookState<Row, Selected> {
+): QueryHookState<Row, readonly Row[] | Selected> {
   const snapshot = useTarstateSnapshot();
   const result = useMemo<QueryResult<Row>>(() => ({ rows: [], diagnostics: [] }), [snapshot.revision]);
   const refresh = useCallback(() => undefined, []);
   return {
     status: 'ready',
     rows: result.rows,
-    data: options.select === undefined ? result.rows as Selected : options.select(result.rows, result),
+    data: options.select === undefined ? result.rows : options.select(result.rows, result),
     diagnostics: emptyDiagnostics,
     result,
     queryKey: queryKey(query),
@@ -198,14 +210,14 @@ export function useTarstateQuery<Row, Selected = readonly Row[]>(
 }
 
 export function useTarstateQueries<const Queries extends QueryBatch>(
-  _queries: Queries,
+  queries: Queries,
   _options: EvaluateOptions & { readonly deps?: readonly unknown[] } = {}
 ): QueriesHookState<Queries> {
   const snapshot = useTarstateSnapshot();
   const refresh = useCallback(() => undefined, []);
   return {
     status: 'ready',
-    results: {} as QueryBatchResult<Queries>,
+    results: emptyBatchResults(queries),
     diagnostics: emptyDiagnostics,
     revision: snapshot.revision,
     refresh
@@ -404,6 +416,22 @@ function sourceStoreDiagnostic(
     message,
     ...(detail === undefined ? {} : { detail })
   };
+}
+
+function emptyBatchResults<const Queries extends QueryBatch>(queries: Queries): QueryBatchResult<Queries> {
+  const results: {
+    -readonly [Key in keyof Queries]?: QueryBatchResult<Queries>[Key];
+  } = {};
+
+  for (const key of objectKeys(queries)) {
+    results[key] = { rows: [], diagnostics: [] };
+  }
+
+  return results as QueryBatchResult<Queries>;
+}
+
+function objectKeys<ObjectValue extends object>(input: ObjectValue): (keyof ObjectValue)[] {
+  return Object.keys(input) as (keyof ObjectValue)[];
 }
 
 function isDb(input: unknown): input is Db {

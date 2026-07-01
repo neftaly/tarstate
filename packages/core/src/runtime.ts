@@ -6,7 +6,6 @@ import {
   tryApplyRelationPatches,
   tryCommitAdapter,
   type AdapterSource,
-  type RelationAdapter,
   type RelationApplyDurability,
   type RelationRuntime
 } from './adapter.js';
@@ -68,7 +67,7 @@ export type TrackRuntimeCommitUnsupportedResult<Version = unknown> = Omit<
   'runtime' | 'status' | 'applied' | 'changes' | 'deltas'
 > & {
   readonly runtime: unknown;
-  readonly source?: AdapterSource<Version> | undefined;
+  readonly source?: AdapterSource<Version>;
   readonly supported: false;
   readonly status: 'rejected';
   readonly applied: 0;
@@ -102,14 +101,15 @@ export async function trackTransact<Db extends WatchDb, Result extends TrackTran
   transact: TrackTransactCallback<Db, Result>,
   options: TrackTransactOptions = {}
 ): Promise<TrackTransactResult<Db>> {
-  const output = await transact(db);
-  const nextDb = (isTrackEnvelope(output) ? output.db : output) as Db;
+  const output: TrackTransactOutput<Db> = await transact(db);
+  const envelope = isTrackEnvelope(output);
+  const nextDb = envelope ? output.db : output;
   return {
     kind: 'trackTransact',
     db: nextDb,
     supported: false,
     changes: [],
-    deltas: isTrackEnvelope(output) ? output.deltas ?? [] : [],
+    deltas: envelope ? output.deltas ?? [] : [],
     diagnostics: [unsupportedDiagnostic()],
     ...(options.label === undefined ? {} : { label: options.label })
   };
@@ -127,11 +127,11 @@ export function trackRuntimeCommit<Version = unknown>(
   patches: Iterable<WritePatch>,
   options?: TrackRuntimeCommitOptions
 ): Promise<TrackRuntimeCommitResult<Version>>;
-export function trackRuntimeCommit<Version = unknown>(
+export function trackRuntimeCommit(
   runtime: unknown,
   patches: Iterable<WritePatch>,
   options?: TrackRuntimeCommitOptions
-): Promise<TrackRuntimeCommitResult<Version>>;
+): Promise<TrackRuntimeCommitResult<unknown>>;
 export async function trackRuntimeCommit<Version = unknown>(
   runtime: unknown,
   patches: Iterable<WritePatch>,
@@ -139,13 +139,12 @@ export async function trackRuntimeCommit<Version = unknown>(
 ): Promise<TrackRuntimeCommitResult<Version>> {
   const patchList = Array.from(patches);
 
-  if (isRelationAdapter(runtime)) {
-    const typedRuntime = runtime as RelationAdapter<Version>;
-    const report = await tryCommitAdapter(typedRuntime, patchList, options);
+  if (isRelationAdapter<Version>(runtime)) {
+    const report = await tryCommitAdapter(runtime, patchList, options);
     return {
       kind: 'trackRuntimeCommit',
-      runtime: typedRuntime,
-      source: report.source as AdapterSource<Version>,
+      runtime,
+      source: report.source,
       supported: true,
       status: report.status,
       patches: report.patches,
@@ -159,13 +158,12 @@ export async function trackRuntimeCommit<Version = unknown>(
     };
   }
 
-  if (isRelationRuntime(runtime)) {
-    const typedRuntime = runtime as RelationRuntime<Version>;
-    const report = await tryApplyRelationPatches(typedRuntime, patchList, options);
+  if (isRelationRuntime<Version>(runtime)) {
+    const report = await tryApplyRelationPatches(runtime, patchList, options);
     return {
       kind: 'trackRuntimeCommit',
-      runtime: typedRuntime,
-      source: report.source as AdapterSource<Version>,
+      runtime,
+      source: report.source,
       supported: true,
       status: report.status,
       patches: report.patches,

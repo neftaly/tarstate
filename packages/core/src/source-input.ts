@@ -8,7 +8,7 @@ export function asRelationSource(input: RelationSourceInput): RelationSource {
 }
 
 export function tryRelationSource(input: unknown): RelationSource | undefined {
-  return isRelationSource(input) ? input : isDbLike(input) ? dbSource(input as Db) : undefined;
+  return isRelationSource(input) ? input : isDbLike(input) ? dbSource(input) : undefined;
 }
 
 function isDbLike(input: unknown): input is Db {

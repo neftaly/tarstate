@@ -8,12 +8,12 @@ import type {
   WatchUnsubscribeResult
 } from './watch.js';
 
-export type WatchRegistration = {
+export type WatchRegistration<Row = unknown> = {
   readonly id: string;
-  readonly target: WatchTarget;
-  readonly listener: WatchListener;
-  readonly options: WatchOptions;
-  readonly setPreviousRows: (rows: readonly unknown[]) => void;
+  readonly target: WatchTarget<Row>;
+  readonly listener: WatchListener<Row>;
+  readonly options: WatchOptions<Row>;
+  readonly setPreviousRows: (rows: readonly Row[]) => void;
 };
 
 let nextIdValue = 0;
@@ -27,7 +27,7 @@ export function isWatchClosed(_id: string): boolean {
   return true;
 }
 
-export function registerWatch(_owner: object, _registration: WatchRegistration): void {}
+export function registerWatch<Row>(_owner: object, _registration: WatchRegistration<Row>): void {}
 
 export function activeWatchRegistrations(_owner: WatchDb): readonly WatchRegistration[] {
   return [];

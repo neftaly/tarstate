@@ -3,7 +3,7 @@ import type { ConstraintData, ConstraintSet } from './constraints.js';
 declare const constrainedDb: unique symbol;
 
 export type ConstrainedDb = {
-  readonly [constrainedDb]?: true;
+  readonly [constrainedDb]: true;
 };
 
 export type ConstraintAttachmentInput = ConstraintData | ConstraintSet | readonly ConstraintData[];
@@ -13,32 +13,53 @@ export type ConstraintAttachment = {
   readonly constraints: readonly ConstraintData[];
 };
 
+const constrainedDbs = new WeakSet<object>();
+const constraintAttachments = new WeakMap<object, readonly ConstraintAttachment[]>();
+
 export function attachConstraints<Db extends object>(
   db: Db,
-  _input: ConstraintAttachmentInput
+  input: ConstraintAttachmentInput
 ): Db & ConstrainedDb {
+  const nextAttachment: ConstraintAttachment = {
+    kind: 'constraintAttachment',
+    constraints: constraintDataList(input)
+  };
+  constrainedDbs.add(db);
+  constraintAttachments.set(db, [...constraintAttachmentsFor(db), nextAttachment]);
   return db as Db & ConstrainedDb;
 }
 
 export function detachConstraints<Db extends object>(db: Db): Db {
+  constrainedDbs.delete(db);
+  constraintAttachments.delete(db);
   return db;
 }
 
-export function hasAttachedConstraints(_input: unknown): _input is ConstrainedDb {
-  return false;
+export function hasAttachedConstraints(input: unknown): input is ConstrainedDb {
+  return isObject(input) && constrainedDbs.has(input);
 }
 
-export function constraintAttachmentsFor(_input: unknown): readonly ConstraintAttachment[] {
-  return [];
+export function constraintAttachmentsFor(input: unknown): readonly ConstraintAttachment[] {
+  return isObject(input) ? constraintAttachments.get(input) ?? [] : [];
 }
 
-export function attachedConstraintsFor(_input: unknown): readonly ConstraintData[] {
-  return [];
+export function attachedConstraintsFor(input: unknown): readonly ConstraintData[] {
+  return constraintAttachmentsFor(input).flatMap((attachment) => attachment.constraints);
 }
 
-export function transferConstraintAttachments(_previous: object, _next: object): void {}
+export function transferConstraintAttachments(previous: object, next: object): void {
+  const attachments = constraintAttachments.get(previous);
+  if (attachments === undefined) {
+    return;
+  }
+  constrainedDbs.add(next);
+  constraintAttachments.set(next, attachments);
+}
 
-export function clearConstraintAttachments(_input: object): void {}
+export function clearConstraintAttachments(input: object): void {
+  constrainedDbs.delete(input);
+  constraintAttachments.delete(input);
+}
 
 export function isConstraintAttachmentInput(input: unknown): input is ConstraintAttachmentInput {
   return isConstraintData(input) ||
@@ -64,4 +85,8 @@ function isConstraintSet(input: unknown): input is ConstraintSet {
 
 function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
+}
+
+function isObject(input: unknown): input is object {
+  return typeof input === 'object' && input !== null;
 }

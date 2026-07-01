@@ -1,4 +1,4 @@
-import type { Presence, DocHandle, PeerState, PresenceState } from '@automerge/automerge-repo';
+import { Presence, type DocHandle, type PeerState, type PresenceState } from '@automerge/automerge-repo';
 import type {
   AdapterSnapshot,
   AdapterSource,
@@ -110,9 +110,10 @@ export function automergePresenceRuntime<
     diagnostics: () => [stubDiagnostic()]
   };
   const target = options.localPeerId === undefined ? undefined : presenceTarget(options.relation, version);
+  const presence = new Presence<State, DocType>({ handle: options.handle });
 
   return {
-    presence: undefined as unknown as Presence<State>,
+    presence,
     relation: options.relation,
     fields,
     source,

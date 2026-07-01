@@ -160,11 +160,11 @@ export async function tryCommitAdapter<Version = unknown>(
   };
 }
 
-export function isRelationAdapter(input: unknown): input is RelationAdapter {
+export function isRelationAdapter<Version = unknown>(input: unknown): input is RelationAdapter<Version> {
   return isRecord(input) && isRelationSource(input.source) && typeof input.commit === 'function';
 }
 
-export function isRelationRuntime(input: unknown): input is RelationRuntime {
+export function isRelationRuntime<Version = unknown>(input: unknown): input is RelationRuntime<Version> {
   return isRecord(input) &&
     isRelationSource(input.source) &&
     (input.target === undefined || isRelationPatchTarget(input.target));

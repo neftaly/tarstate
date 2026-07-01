@@ -1,4 +1,5 @@
 import type { RelationDelta } from './adapter.js';
+import type { TarstateDiagnostic } from './diagnostics.js';
 import { stubDiagnostic } from './stub.js';
 import { writeInputPatches, type WriteInput } from './write.js';
 
@@ -8,7 +9,7 @@ export type WriteApplyResult = {
   readonly patches: number;
   readonly applied: number;
   readonly deltas: readonly RelationDelta[];
-  readonly diagnostics: readonly ReturnType<typeof stubDiagnostic>[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
 };
 
 export type AtomicWriteApplyResult = WriteApplyResult & {

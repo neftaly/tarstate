@@ -9,6 +9,7 @@ import type {
   ConstraintValidationInput,
   ConstraintValidationOptions
 } from './constraints-validation.js';
+import { isConstraintAttachmentInput } from './constraints-attachment.js';
 
 export class DbConstraintTransactionError extends DbTransactionError {
   constructor(result: DbTransactionResult) {
@@ -54,7 +55,9 @@ export async function transactConstrained(
   constraintsOrOptions?: ConstraintValidationInput | ConstraintValidationOptions,
   options?: ConstraintValidationOptions
 ): Promise<Db> {
-  const result = await tryTransactConstrained(db, patches, constraintsOrOptions as ConstraintValidationInput, options);
+  const result = constraintsOrOptions === undefined || !isConstraintAttachmentInput(constraintsOrOptions)
+    ? await tryTransactConstrained(db, patches, constraintsOrOptions)
+    : await tryTransactConstrained(db, patches, constraintsOrOptions, options);
 
   if (result.diagnostics.length > 0) {
     throw new DbConstraintTransactionError(result);

@@ -3,6 +3,10 @@ import type { RelationDelta } from './delta.js';
 import type { EvaluateOptions } from './evaluate.js';
 import { queryKey, type Query } from './query.js';
 import type { RelationSource } from './source.js';
+import {
+  attachConstraints,
+  type ConstraintAttachmentInput
+} from './constraints-attachment.js';
 
 declare const materializedDb: unique symbol;
 
@@ -13,8 +17,10 @@ export type ObjectBackedMaterializableDb = {
 export type SnapshotMaterializationTarget = ObjectBackedMaterializableDb | RelationSource;
 
 export type MaterializedDb = {
-  readonly [materializedDb]?: true;
+  readonly [materializedDb]: true;
 };
+
+const materializedDbs = new WeakSet<object>();
 
 export type UnsupportedMaterializationDiagnostic = {
   readonly code: 'materialization_unsupported';
@@ -240,7 +246,7 @@ export type MaterializationIndexOptions<Field extends string = string> =
 
 export function mat<Db extends object>(
   db: Db,
-  constraints: import('./constraints.js').ConstraintAttachmentInput
+  constraints: ConstraintAttachmentInput
 ): Db & import('./constraints-attachment.js').ConstrainedDb;
 export function mat<Db extends SnapshotMaterializationTarget, Row>(
   db: Db,
@@ -249,10 +255,10 @@ export function mat<Db extends SnapshotMaterializationTarget, Row>(
 ): Promise<Db & MaterializedDb>;
 export function mat<Db extends object, Row>(
   db: Db,
-  queryOrConstraints: Query<Row> | import('./constraints.js').ConstraintAttachmentInput,
+  queryOrConstraints: Query<Row> | ConstraintAttachmentInput,
   _options: SnapshotMaterializationOptions = {}
 ): Db | Promise<Db & MaterializedDb> {
-  return isQuery(queryOrConstraints) ? Promise.resolve(db as Db & MaterializedDb) : db;
+  return isQuery(queryOrConstraints) ? Promise.resolve(markMaterialized(db)) : attachConstraints(db, queryOrConstraints);
 }
 
 export async function materializeSnapshot<Db extends SnapshotMaterializationTarget, Row>(
@@ -260,7 +266,7 @@ export async function materializeSnapshot<Db extends SnapshotMaterializationTarg
   _query: Query<Row>,
   _options: SnapshotMaterializationOptions = {}
 ): Promise<Db & MaterializedDb> {
-  return db as Db & MaterializedDb;
+  return markMaterialized(db);
 }
 
 export function explainMaterialization<Row>(
@@ -299,15 +305,16 @@ export async function maintainMaterializationSnapshots<Next extends SnapshotMate
   next: Next,
   _options: MaterializationMaintenanceOptions = {}
 ): Promise<Next & MaterializedDb & { readonly materializations?: MaterializationMaintenanceResult }> {
-  return next as Next & MaterializedDb & { readonly materializations?: MaterializationMaintenanceResult };
+  return markMaintainedMaterialized(next);
 }
 
 export function demat<Db extends MaterializableDb>(db: Db, _target?: string | Query | MaterializationMetadata): Db {
+  materializedDbs.delete(db);
   return db;
 }
 
-export function isMaterialized(_input: unknown): _input is MaterializedDb {
-  return false;
+export function isMaterialized(input: unknown): input is MaterializedDb {
+  return isObject(input) && materializedDbs.has(input);
 }
 
 export function materializationsFor(_input: unknown): readonly MaterializationMetadata[] {
@@ -440,6 +447,22 @@ function materializationHashIndexResult<Row, Value>(
 
 function isQuery(input: unknown): input is Query {
   return typeof input === 'object' && input !== null && 'data' in input && 'relations' in input;
+}
+
+function markMaterialized<Db extends object>(db: Db): Db & MaterializedDb {
+  materializedDbs.add(db);
+  return db as Db & MaterializedDb;
+}
+
+function markMaintainedMaterialized<Db extends object>(
+  db: Db
+): Db & MaterializedDb & { readonly materializations?: MaterializationMaintenanceResult } {
+  materializedDbs.add(db);
+  return db as Db & MaterializedDb & { readonly materializations?: MaterializationMaintenanceResult };
+}
+
+function isObject(input: unknown): input is object {
+  return typeof input === 'object' && input !== null;
 }
 
 function unsupportedDiagnostic(): UnsupportedMaterializationDiagnostic {

@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig, type UserConfig } from 'vite';
 
 type PackageConfig = {
@@ -42,7 +43,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       },
       rollupOptions: {
         ...sharedBuildOptions.rollupOptions,
-        external: [/^@tarstate\/core(?:\/.*)?$/, '@automerge/automerge']
+        external: [/^@tarstate\/core(?:\/.*)?$/, '@automerge/automerge', '@automerge/automerge-repo']
       }
     }
   },
@@ -84,7 +85,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
 
 const manifest = JSON.parse(readFileSync('package.json', 'utf8')) as { readonly name?: string };
 const packageConfig = manifest.name ? buildConfigsByPackageName[manifest.name] : undefined;
-const repoRoot = path.dirname(new URL(import.meta.url).pathname);
+const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 const sourceAliases = [
   { find: '@tarstate/core/adapter', replacement: path.join(repoRoot, 'packages/core/src/adapter.ts') },
   { find: '@tarstate/core/db', replacement: path.join(repoRoot, 'packages/core/src/db.ts') },
