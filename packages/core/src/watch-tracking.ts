@@ -5,7 +5,12 @@ import {
   type MaterializationMaintenanceResult
 } from './materialization.js';
 import type { RelationSource } from './source.js';
-import { diffOptionsForTarget, trackedChangesForDbTransition, watchTargetKey } from './watch.js';
+import {
+  diffOptionsForTarget,
+  isWatchMaterialization,
+  trackedChangesForDbTransition,
+  watchTargetKey
+} from './watch.js';
 import type { TrackedChange, WatchDb, WatchRuntimeDiagnostic } from './watch.js';
 import { diffRows, rowDiffKey, type RowDiffOptions } from './diff.js';
 
@@ -18,10 +23,10 @@ export async function trackWatchedChanges(
   readonly changes: readonly TrackedChange[];
   readonly diagnostics: readonly WatchRuntimeDiagnostic[];
 }> {
-  const watched = await trackedChangesForDbTransition(dbBefore, dbAfter, deltas ?? []);
+  const watched = await trackedChangesForDbTransition(dbBefore, dbAfter, deltas ?? [], materializations?.changes ?? []);
   const materialized = materializations === undefined
     ? materializedChangesForTransition(dbBefore, dbAfter)
-    : materializedChangesFromMaintenance(materializations);
+    : materializedChangesFromMaintenance(dbBefore, dbAfter, materializations);
 
   return {
     changes: [...watched.changes, ...materialized.changes],
@@ -30,13 +35,17 @@ export async function trackWatchedChanges(
 }
 
 function materializedChangesFromMaintenance(
+  before: WatchDb | RelationSource,
+  after: WatchDb | RelationSource,
   materializations: MaterializationMaintenanceResult
 ): {
   readonly changes: readonly TrackedChange[];
   readonly diagnostics: readonly WatchRuntimeDiagnostic[];
 } {
   return {
-    changes: materializations.changes.map((change) => ({
+    changes: materializations.changes.filter((change) =>
+      !isWatchMaterialization(before, change.query) && !isWatchMaterialization(after, change.query)
+    ).map((change) => ({
       kind: 'trackedChange',
       id: change.id,
       targetKey: watchTargetKey(change.query),
@@ -68,6 +77,10 @@ function materializedChangesForTransition(
   const diagnostics: WatchRuntimeDiagnostic[] = [];
 
   for (const metadata of materializationsFor(before)) {
+    if (isWatchMaterialization(before, metadata.query) || isWatchMaterialization(after, metadata.query)) {
+      continue;
+    }
+
     const previousRows = materializedRowsFor(before, metadata.id) ?? [];
     const rows = materializedRowsFor(after, metadata.id) ?? [];
     const diff = diffRows(previousRows, rows, diffOptionsForTarget(metadata.query, {}));

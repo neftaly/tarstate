@@ -4,17 +4,21 @@ import {
   and,
   as,
   avg,
+  btree,
   call,
   count,
   countDistinct,
   createDb,
+  deleteByKey,
   desc,
   eq,
   env,
   from,
   gt,
+  hash,
   any as anyAggregate,
   insert,
+  index,
   join,
   keyBy,
   leftJoin,
@@ -35,10 +39,13 @@ import {
   trackTransact,
   transact,
   topBy,
+  uniqueIndex,
+  updateWhere,
   value,
+  watch,
   where
 } from '@tarstate/core';
-import type { MaterializationMaintenanceResult, Query, RelationDelta } from '@tarstate/core';
+import type { MaterializationMaintenanceResult, Query, RelationDelta, WatchEvent } from '@tarstate/core';
 import {
   adaUser,
   beaUser,
@@ -338,6 +345,65 @@ function expectIncrementalFallback(diagnostics: readonly { readonly code: string
   expect(diagnostics).toEqual(expect.arrayContaining([
     expect.objectContaining({ code: 'materialization_incremental_fallback' })
   ]));
+}
+
+function expectIncrementalMaintenance(
+  result: MaterializationMaintenanceResult | undefined,
+  id: string
+) {
+  if (result === undefined) {
+    throw new Error(`missing materialization maintenance result for ${id}`);
+  }
+
+  const change = singleMaterializationChange(result, id);
+  expect(change).toMatchObject({
+    update: 'incremental',
+    maintenance: 'incremental',
+    recomputed: false
+  });
+  expectNoIncrementalFallback([...result.diagnostics, ...change.diagnostics]);
+  return change;
+}
+
+function activeIndexedUsersQuery(): Query<UserRow> {
+  const user = as(coreSchema.users, 'user');
+  return pipe(
+    from(user),
+    where(eq(user.active, true)),
+    hash(user.teamId),
+    uniqueIndex(user.id),
+    btree(user.age),
+    project({
+      id: user.id,
+      teamId: user.teamId,
+      name: user.name,
+      active: user.active,
+      age: user.age,
+      tags: user.tags
+    }),
+    keyBy('id')
+  ) as Query<UserRow>;
+}
+
+function uniqueUsersByTeamQuery(): Query<UserRow> {
+  const user = as(coreSchema.users, 'user');
+  return pipe(
+    from(user),
+    uniqueIndex(user.teamId),
+    project({
+      id: user.id,
+      teamId: user.teamId,
+      name: user.name,
+      active: user.active,
+      age: user.age,
+      tags: user.tags
+    }),
+    keyBy('id')
+  ) as Query<UserRow>;
+}
+
+function ids(rows: readonly { readonly id: string }[] | undefined): readonly string[] {
+  return (rows ?? []).map((row) => row.id);
 }
 
 describe('incremental materialization', () => {
@@ -1529,6 +1595,69 @@ describe('incremental materialization', () => {
     expect(materializedRowsForQuery(next, taskOwnerTeams)).toEqual(change.rows);
   });
 
+  it('delivers delta-first rowChanges for large watched two-join queries', async () => {
+    const data = largeCoreData();
+    const taskOwnerTeams = taskOwnerTeamQuery();
+    const owner = data.users[37]!;
+    const updatedOwner = { ...owner, name: 'Watched Owner' };
+    const team = requiredRow(data.teams, (row) => row.id === owner.teamId, owner.teamId);
+    const ownerTasks = data.tasks.filter((task) => task.ownerId === owner.id);
+    const state = mat(createDb(data), taskOwnerTeams, {
+      id: 'large-task-owner-teams',
+      mode: 'incremental'
+    });
+    const next = createDb({
+      ...data,
+      users: data.users.map((user) => user.id === owner.id ? updatedOwner : user)
+    });
+    const delta = usersDelta([updatedOwner], [owner]);
+    const materializedNext = next as typeof state;
+    const materializations = maintainMaterializations(state, materializedNext, { deltas: [delta] });
+    const materializedChange = singleMaterializationChange(materializations, 'large-task-owner-teams') as
+      MaterializationMaintenanceResult<TaskOwnerTeamRow>['changes'][number];
+    const events: Array<WatchEvent<TaskOwnerTeamRow>> = [];
+    const handle = watch(state, taskOwnerTeams, (event) => {
+      events.push(event);
+    });
+
+    const tracked = await trackTransact(state, () => ({
+      db: materializedNext,
+      deltas: [delta],
+      materializations
+    }));
+
+    expect(ownerTasks.length).toBeGreaterThan(1);
+    expect(ownerTasks.length).toBeLessThan(data.tasks.length);
+    expect(tracked.materializations).toBe(materializations);
+    expect(materializedChange).toMatchObject({
+      update: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      addedRows: [],
+      removedRows: []
+    });
+    expectNoIncrementalFallback(tracked.diagnostics);
+    expectNoIncrementalFallback(materializedChange.diagnostics);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      changed: true,
+      addedRows: [],
+      removedRows: []
+    });
+    expectNoIncrementalFallback(events[0]?.diagnostics ?? []);
+    expect(events[0]?.rowChanges).toHaveLength(ownerTasks.length);
+    expect(events[0]?.rowChanges.length).toBeLessThan(events[0]?.rows.length ?? 0);
+    expect(events[0]?.rowChanges).toEqual(expect.arrayContaining([...materializedChange.rowChanges]));
+    expect(events[0]?.rowChanges).toEqual(expect.arrayContaining(
+      ownerTasks.slice(0, 3).map((task) => expect.objectContaining({
+        kind: 'updated',
+        before: taskOwnerTeamRow(task, owner, team),
+        after: taskOwnerTeamRow(task, updatedOwner, team)
+      }))
+    ));
+    expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
+  });
+
   it('incrementally maintains inner joins with residual and(eq(...), gt(...)) predicates', () => {
     const residualTaskOwners = residualTaskOwnersQuery();
     const state = mat(createDb(sourceData), residualTaskOwners, { id: 'residual-task-owners', mode: 'incremental' });
@@ -1595,6 +1724,121 @@ describe('incremental materialization', () => {
       { id: 'bea', name: 'Bea', team: 'Design' },
       { id: 'cal', name: 'Cal', team: undefined }
     ]);
+  });
+
+  it('keeps declared hash and btree facades correct after incremental insert, key move, and delete', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeIndexedUsers = activeIndexedUsersQuery();
+    const state = mat(createDb(sourceData), activeIndexedUsers, {
+      id: 'active-indexed-users',
+      mode: 'incremental'
+    });
+
+    expect(materializationForQuery(state, activeIndexedUsers)).toMatchObject({
+      id: 'active-indexed-users',
+      maintenance: 'incremental',
+      indexSpecs: expect.arrayContaining([
+        expect.objectContaining({ kind: 'hash', field: 'teamId' }),
+        expect.objectContaining({ kind: 'unique', field: 'id' }),
+        expect.objectContaining({ kind: 'btree', field: 'age' })
+      ])
+    });
+    expect(index<UserRow, string>(state, activeIndexedUsers, { kind: 'hash', field: 'teamId' }).index?.get('eng')).toEqual([
+      adaUser
+    ]);
+    expect(index<UserRow, number>(state, activeIndexedUsers, { kind: 'btree', field: 'age' }).index?.ordered).toEqual([
+      29,
+      37
+    ]);
+
+    const inserted = await trackTransact(state, insert(coreSchema.users, diaUser));
+    expectIncrementalMaintenance(inserted.result?.materializations, 'active-indexed-users');
+
+    expect(ids(index<UserRow, string>(inserted.db, activeIndexedUsers, { kind: 'hash', field: 'teamId' }).index?.get('eng'))).toEqual([
+      'ada',
+      'dia'
+    ]);
+    expect(index<UserRow, number>(inserted.db, activeIndexedUsers, { kind: 'btree', field: 'age' }).index?.ordered).toEqual([
+      24,
+      29,
+      37
+    ]);
+
+    const movedDia = await trackTransact(
+      inserted.db,
+      updateWhere(coreSchema.users, eq(user.id, 'dia'), { teamId: 'design', age: 35 })
+    );
+    expectIncrementalMaintenance(movedDia.result?.materializations, 'active-indexed-users');
+
+    const movedHash = index<UserRow, string>(movedDia.db, activeIndexedUsers, { kind: 'hash', field: 'teamId' });
+    const movedBtree = index<UserRow, number>(movedDia.db, activeIndexedUsers, { kind: 'btree', field: 'age' });
+    expect(ids(movedHash.index?.get('eng'))).toEqual(['ada']);
+    expect(ids(movedHash.index?.get('design'))).toEqual(['bea', 'dia']);
+    expect(movedBtree.index?.ordered).toEqual([29, 35, 37]);
+    expect(ids(movedBtree.index?.range({ lower: 30, upper: 40 }))).toEqual(['dia', 'ada']);
+
+    const deleted = await trackTransact(movedDia.db, deleteByKey(coreSchema.users, 'dia'));
+    expectIncrementalMaintenance(deleted.result?.materializations, 'active-indexed-users');
+
+    const deletedHash = index<UserRow, string>(deleted.db, activeIndexedUsers, { kind: 'hash', field: 'teamId' });
+    const deletedBtree = index<UserRow, number>(deleted.db, activeIndexedUsers, { kind: 'btree', field: 'age' });
+    expect(ids(deletedHash.index?.get('eng'))).toEqual(['ada']);
+    expect(ids(deletedHash.index?.get('design'))).toEqual(['bea']);
+    expect(deletedBtree.index?.ordered).toEqual([29, 37]);
+    expect(ids(deletedBtree.index?.range({ lower: 30, upper: 40 }))).toEqual(['ada']);
+    await expect(qRows(deleted.db, activeIndexedUsers)).resolves.toEqual([
+      adaUser,
+      beaUser
+    ]);
+  });
+
+  it('reports materialized unique index duplicates and recovers lookup behavior after key moves', async () => {
+    const user = as(coreSchema.users, 'user');
+    const usersByUniqueTeam = uniqueUsersByTeamQuery();
+    const state = mat(createDb(sourceData), usersByUniqueTeam, {
+      id: 'users-by-unique-team',
+      mode: 'incremental'
+    });
+
+    const initialUnique = index<UserRow, string>(state, usersByUniqueTeam, { kind: 'unique', field: 'teamId' });
+    expect(initialUnique.indexed).toBe(true);
+    expect(initialUnique.index?.get('eng')).toEqual(adaUser);
+    expect(initialUnique.index?.get('design')).toEqual(beaUser);
+
+    const duplicate = await trackTransact(state, insert(coreSchema.users, diaUser));
+    expectIncrementalMaintenance(duplicate.result?.materializations, 'users-by-unique-team');
+
+    const duplicateUnique = index<UserRow, string>(duplicate.db, usersByUniqueTeam, { kind: 'unique', field: 'teamId' });
+    expect(duplicateUnique.indexed).toBe(false);
+    expect(duplicateUnique.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'materialization_index_unsupported',
+        detail: { fields: ['teamId'], key: 'eng' }
+      })
+    ]));
+    expect(duplicateUnique.index?.get('eng')).toEqual(adaUser);
+    expect(duplicateUnique.index?.has('eng')).toBe(true);
+
+    const moved = await trackTransact(
+      duplicate.db,
+      insert(coreSchema.teams, operationsTeam),
+      updateWhere(coreSchema.users, eq(user.id, 'dia'), { teamId: 'ops' })
+    );
+    expectIncrementalMaintenance(moved.result?.materializations, 'users-by-unique-team');
+
+    const movedUnique = index<UserRow, string>(moved.db, usersByUniqueTeam, { kind: 'unique', field: 'teamId' });
+    expect(movedUnique.indexed).toBe(true);
+    expect(movedUnique.index?.get('eng')).toEqual(adaUser);
+    expect(movedUnique.index?.get('ops')).toEqual({ ...diaUser, teamId: 'ops' });
+    expect(movedUnique.index?.has('missing')).toBe(true);
+
+    const deleted = await trackTransact(moved.db, deleteByKey(coreSchema.users, 'dia'));
+    expectIncrementalMaintenance(deleted.result?.materializations, 'users-by-unique-team');
+
+    const deletedUnique = index<UserRow, string>(deleted.db, usersByUniqueTeam, { kind: 'unique', field: 'teamId' });
+    expect(deletedUnique.indexed).toBe(true);
+    expect(deletedUnique.index?.get('ops')).toBeUndefined();
+    expect(deletedUnique.index?.get('eng')).toEqual(adaUser);
   });
 
   it('uses provided materialization maintenance output in trackTransact', async () => {

@@ -22,7 +22,7 @@ import type {
   WatchDiagnostic,
   WatchRuntimeDiagnostic
 } from './watch.js';
-import { watchChangeKeyMap, watchChangeMap, watchTargetKey } from './watch.js';
+import { transferWatches, watchChangeKeyMap, watchChangeMap, watchTargetKey } from './watch.js';
 import { trackWatchedChanges } from './watch-tracking.js';
 import type { WritePatch } from './write.js';
 
@@ -226,7 +226,12 @@ export async function trackRuntimeCommit<Version = unknown>(
   const patchList = Array.from(patches);
 
   if (isRelationAdapter<Version>(runtime)) {
+    const beforeSource = runtime.snapshot?.().source ?? runtime.source;
     const report = await tryCommitAdapter(runtime, patchList, options);
+    const watched = report.status === 'rejected'
+      ? { changes: [], diagnostics: [] }
+      : await trackRuntimeWatchedChanges(beforeSource, runtime.snapshot?.().source ?? report.source, report.deltas);
+    const changes = watched.changes.length > 0 ? watched.changes : deltasToChanges(report.deltas);
     return {
       kind: 'trackRuntimeCommit',
       runtime,
@@ -235,12 +240,12 @@ export async function trackRuntimeCommit<Version = unknown>(
       status: report.status,
       patches: report.patches,
       applied: report.applied,
-      changes: deltasToChanges(report.deltas),
-      changeMap: watchChangeMap(deltasToChanges(report.deltas)),
-      changesByTarget: watchChangeMap(deltasToChanges(report.deltas)),
-      changesByTargetKey: watchChangeKeyMap(deltasToChanges(report.deltas)),
+      changes,
+      changeMap: watchChangeMap(changes),
+      changesByTarget: watchChangeMap(changes),
+      changesByTargetKey: watchChangeKeyMap(changes),
       deltas: report.deltas,
-      diagnostics: report.diagnostics,
+      diagnostics: uniqueDiagnostics([...report.diagnostics, ...watched.diagnostics]),
       ...(report.version === undefined ? {} : { version: report.version }),
       ...(report.durability === undefined ? {} : { durability: report.durability }),
       ...(options.label === undefined ? {} : { label: options.label })
@@ -248,7 +253,12 @@ export async function trackRuntimeCommit<Version = unknown>(
   }
 
   if (isRelationRuntime<Version>(runtime)) {
+    const beforeSource = runtime.snapshot?.().source ?? runtime.source;
     const report = await tryApplyRelationPatches(runtime, patchList, options);
+    const watched = report.status === 'rejected'
+      ? { changes: [], diagnostics: [] }
+      : await trackRuntimeWatchedChanges(beforeSource, runtime.snapshot?.().source ?? report.source, report.deltas);
+    const changes = watched.changes.length > 0 ? watched.changes : deltasToChanges(report.deltas);
     return {
       kind: 'trackRuntimeCommit',
       runtime,
@@ -257,12 +267,12 @@ export async function trackRuntimeCommit<Version = unknown>(
       status: report.status,
       patches: report.patches,
       applied: report.applied,
-      changes: deltasToChanges(report.deltas),
-      changeMap: watchChangeMap(deltasToChanges(report.deltas)),
-      changesByTarget: watchChangeMap(deltasToChanges(report.deltas)),
-      changesByTargetKey: watchChangeKeyMap(deltasToChanges(report.deltas)),
+      changes,
+      changeMap: watchChangeMap(changes),
+      changesByTarget: watchChangeMap(changes),
+      changesByTargetKey: watchChangeKeyMap(changes),
       deltas: report.deltas,
-      diagnostics: report.diagnostics,
+      diagnostics: uniqueDiagnostics([...report.diagnostics, ...watched.diagnostics]),
       ...(report.version === undefined ? {} : { version: report.version }),
       ...(report.durability === undefined ? {} : { durability: report.durability }),
       ...(options.label === undefined ? {} : { label: options.label })
@@ -312,6 +322,21 @@ function unsupportedDiagnostic(): WatchDiagnostic {
     message: 'runtime tracking implementation has been removed; regenerate this API implementation',
     surface: 'changeTracking'
   };
+}
+
+async function trackRuntimeWatchedChanges(
+  before: AdapterSource,
+  after: AdapterSource,
+  deltas: readonly RelationDelta[]
+): Promise<{
+  readonly changes: readonly TrackedChange[];
+  readonly diagnostics: readonly WatchRuntimeDiagnostic[];
+}> {
+  if (before !== after) {
+    transferWatches(before, after);
+  }
+
+  return trackWatchedChanges(before, after, deltas);
 }
 
 function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChange[] {

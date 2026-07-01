@@ -5,6 +5,14 @@ import { diffRows, type RowChange, type RowDiffDiagnostic, type RowDiffOptions }
 import { evaluate } from './evaluate.js';
 import type { EvaluateOptions } from './evaluate.js';
 import { forkDb, type Db } from './db.js';
+import {
+  demat,
+  mat,
+  materializationForQuery,
+  queryRowsFromMaterialization,
+  type MaterializationMaintenanceChange,
+  type SnapshotMaterializationTarget
+} from './materialization.js';
 import { queryKey, queryRowKeyFields, type Query } from './query.js';
 import type { RelationRef } from './schema.js';
 import { type RelationSource } from './source.js';
@@ -170,17 +178,24 @@ type WatchRecord<Db extends WatchDb = WatchDb, Row = unknown> = {
   db: Db;
   readonly id: string;
   readonly target: WatchTarget<Row>;
-  readonly listener: WatchListener<Row>;
+  readonly listeners: Set<WatchListener<Row>>;
   readonly options: WatchOptions<Row>;
   readonly dbTracked: boolean;
   active: boolean;
   handle?: WatchHandle<Db, Row>;
+};
+type WatchMaterializationState<Row = unknown> = {
+  readonly query: Query<Row>;
+  readonly targetKey: string;
+  readonly owners: Set<string>;
+  readonly owned: boolean;
 };
 
 let nextId = 0;
 type AnyWatchRecord = WatchRecord<any, any>;
 const watchStore = new WeakMap<object, Set<AnyWatchRecord>>();
 const allWatchRecords = new Map<string, AnyWatchRecord>();
+const watchMaterializationStore = new WeakMap<object, Map<string, WatchMaterializationState>>();
 
 export function watch<DbValue extends Db>(
   db: DbValue,
@@ -219,7 +234,7 @@ function createWatchHandle<DbValue extends WatchDb, Row>(
     db,
     id: `watch-${nextId += 1}`,
     target,
-    listener: listener ?? (() => undefined),
+    listeners: listener === undefined ? new Set() : new Set([listener]),
     options,
     dbTracked: false,
     active: true
@@ -228,6 +243,7 @@ function createWatchHandle<DbValue extends WatchDb, Row>(
   record.handle = handle;
   const storedRecord = record as AnyWatchRecord;
   addRecord(db, storedRecord);
+  ensureWatchMaterialization(db, target, record.id);
   allWatchRecords.set(record.id, storedRecord);
 
   if (options.immediate === true) {
@@ -287,6 +303,14 @@ export function watchChangeKeyMap<Row>(changes: Iterable<TrackedChange<Row>>): W
 
 export function watchTargetKey(target: WatchTarget): string {
   return watchTargetIdentity(target);
+}
+
+export function isWatchMaterialization(input: unknown, target: WatchTarget): boolean {
+  if (!isQuery(target) || !isObject(input)) {
+    return false;
+  }
+
+  return watchMaterializationStore.get(input)?.get(watchTargetIdentity(target))?.owned === true;
 }
 
 function watchTargetChange<Row>(change: TrackedChange<Row>): WatchTargetChange<Row> {
@@ -357,6 +381,8 @@ export function unwatch(
   const record = findRecord(handle.id);
   if (record !== undefined) {
     record.active = false;
+    record.listeners.clear();
+    releaseWatchMaterialization(record.db, record.target, record.id);
     removeRecord(record.db, record);
     allWatchRecords.delete(record.id);
   }
@@ -373,19 +399,47 @@ export function unwatch(
 
 export function subscribeWatch<Row>(
   handle: Pick<WatchHandle<WatchDb, Row>, 'id' | 'supported' | 'target'>,
-  _listener: WatchListener<Row>
+  listener: WatchListener<Row>
 ): WatchSubscription {
+  const record = findRecord(handle.id) as WatchRecord<WatchDb, Row> | undefined;
+  if (!handle.supported || record === undefined || !record.active) {
+    const diagnostics: readonly WatchDiagnostic[] = [
+      { code: 'watch_already_closed', message: 'watch is already closed', surface: 'watch' }
+    ];
+    return {
+      kind: 'watchSubscription',
+      id: handle.id,
+      active: false,
+      diagnostics,
+      unsubscribe: () => ({
+        kind: 'watchUnsubscribe',
+        id: handle.id,
+        unsubscribed: false,
+        diagnostics
+      })
+    };
+  }
+
+  let subscribed = true;
+  record.listeners.add(listener);
   return {
     kind: 'watchSubscription',
     id: handle.id,
-    active: handle.supported,
+    active: true,
     diagnostics: [],
-    unsubscribe: () => ({
-      kind: 'watchUnsubscribe',
-      id: handle.id,
-      unsubscribed: true,
-      diagnostics: []
-    })
+    unsubscribe: () => {
+      const unsubscribed = unsubscribeWatchListener(record, listener, () => subscribed, (value) => {
+        subscribed = value;
+      });
+      return {
+        kind: 'watchUnsubscribe',
+        id: handle.id,
+        unsubscribed,
+        diagnostics: unsubscribed || record.active
+          ? []
+          : [{ code: 'watch_already_closed', message: 'watch is already closed', surface: 'watch' }]
+      };
+    }
   };
 }
 
@@ -444,30 +498,54 @@ export function transferWatches(previous: unknown, next: unknown): void {
 
   const active = Array.from(records).filter((record) => record.active);
   for (const record of active) {
+    transferWatchMaterialization(previous, next, record);
     record.db = next as WatchDb;
     addRecord(next, record);
+    removeRecord(previous, record);
   }
 }
 
 export async function trackedChangesForDbTransition(
   before: WatchDb,
   after: WatchDb,
-  deltas: readonly RelationDelta[] = []
+  deltas: readonly RelationDelta[] = [],
+  materializationChanges: readonly MaterializationMaintenanceChange[] = []
 ): Promise<{
   readonly changes: readonly TrackedChange[];
   readonly diagnostics: readonly WatchRuntimeDiagnostic[];
 }> {
-  const records = activeRecordsFor(before);
+  const records = activeRecordsForTransition(before, after);
+  const materializedChanges = materializationChangesByTarget(materializationChanges);
   const changes: TrackedChange[] = [];
   const diagnostics: WatchRuntimeDiagnostic[] = [];
 
   for (const record of records) {
-    const previousRows = await readTargetRows(before, record.target, record.options);
-    const rows = await readTargetRows(after, record.target, record.options);
-    const event = buildWatchEvent(record.id, record.target, previousRows, rows, record.options, {
-      deltas,
-      diagnostics: []
-    });
+    const materializedChange = isQuery(record.target)
+      ? materializedChanges.get(watchTargetIdentity(record.target)) as MaterializationMaintenanceChange | undefined
+      : undefined;
+    const event = materializedChange === undefined
+      ? buildWatchEvent(
+        record.id,
+        record.target,
+        await readTargetRows(before, record.target, record.options),
+        await readTargetRows(after, record.target, record.options),
+        record.options,
+        { deltas, diagnostics: [] }
+      )
+      : buildWatchEventFromRows(
+        record.id,
+        record.target,
+        materializedChange.previousRows ?? [],
+        materializedChange.rows,
+        materializedChange.rowChanges,
+        record.options,
+        { deltas, diagnostics: [] },
+        materializedChange.diagnostics
+      );
+    if (!event.changed) {
+      continue;
+    }
+
     changes.push({
       kind: 'trackedChange',
       id: event.id,
@@ -487,12 +565,7 @@ export async function trackedChangesForDbTransition(
     });
     diagnostics.push(...event.diagnostics);
 
-    try {
-      await record.listener(event);
-    } catch (error) {
-      const diagnostic = listenerDiagnostic(error);
-      diagnostics.push(diagnostic);
-    }
+    diagnostics.push(...await deliverWatchEvent(record, event));
   }
 
   return { changes, diagnostics };
@@ -520,17 +593,17 @@ function watchHandle<Db extends WatchDb, Row>(record: WatchRecord<Db, Row>): Wat
       const previousRows = await readTargetRows(record.db, record.target, record.options);
       const rows = await readTargetRows(nextDb, record.target, record.options);
       const event = buildWatchEvent(record.id, record.target, previousRows, rows, record.options, { diagnostics: [] });
-      try {
-        await record.listener(event);
+      const deliveryDiagnostics = await deliverWatchEvent(record, event);
+      if (deliveryDiagnostics.length === 0) {
         return { ...event, kind: 'watchRefresh', delivered: true };
-      } catch (error) {
-        return {
-          ...event,
-          kind: 'watchRefresh',
-          delivered: false,
-          diagnostics: [...event.diagnostics, listenerDiagnostic(error)]
-        };
       }
+
+      return {
+        ...event,
+        kind: 'watchRefresh',
+        delivered: false,
+        diagnostics: [...event.diagnostics, ...deliveryDiagnostics]
+      };
     },
     unwatch: () => unwatch(record),
     ...(record.options.label === undefined ? {} : { label: record.options.label })
@@ -570,6 +643,40 @@ function buildWatchEvent<Row>(
   };
 }
 
+function buildWatchEventFromRows<Row>(
+  id: string,
+  target: WatchTarget<Row>,
+  previousRows: readonly Row[],
+  rows: readonly Row[],
+  rowChanges: readonly RowChange<Row>[],
+  options: WatchOptions<Row>,
+  changes: ChangeSet,
+  diagnostics: readonly WatchRuntimeDiagnostic<Row>[]
+): WatchEvent<Row> {
+  const diffOptions = diffOptionsForTarget(target, options);
+  const changedKeys = new Set(rowChanges.map((change) => change.key));
+  const added = addedAliasRows(rowChanges, target);
+  const deleted = deletedAliasRows(rowChanges, target);
+  return {
+    kind: 'watchEvent',
+    id,
+    targetKey: watchTargetIdentity(target),
+    target,
+    changed: rowChanges.length > 0,
+    previousRows,
+    rows,
+    added,
+    deleted,
+    addedRows: added,
+    deletedRows: deleted,
+    removedRows: deleted,
+    unchangedRows: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
+    rowChanges,
+    changes,
+    diagnostics
+  };
+}
+
 function addedAliasRows<Row>(
   changes: readonly RowChange<Row>[],
   target: WatchTarget<Row>
@@ -598,9 +705,12 @@ async function readTargetRows<Row>(
   options: EvaluateOptions = {}
 ): Promise<readonly Row[]> {
   const source = tryRelationSource(db) ?? emptySource();
-  return isQuery(target)
-    ? (await evaluate(source, target, options)).rows
-    : await source.rows(target) as readonly Row[];
+  if (!isQuery(target)) {
+    return await source.rows(target) as readonly Row[];
+  }
+
+  const materializedRows = queryRowsFromMaterialization(db, target);
+  return materializedRows ?? (await evaluate(source, target, options)).rows;
 }
 
 function emptyWatchRefresh<Row>(id: string, target: WatchTarget<Row>): WatchRefreshResult<Row> {
@@ -644,11 +754,120 @@ function addDbTrackedWatch<Row>(db: WatchDb, target: WatchTarget<Row>): void {
     db,
     id,
     target,
-    listener: () => undefined,
+    listeners: new Set(),
     options: {},
     dbTracked: true,
     active: true
   });
+  ensureWatchMaterialization(db, target, id);
+}
+
+function ensureWatchMaterialization<Row>(
+  db: WatchDb,
+  target: WatchTarget<Row>,
+  ownerId: string
+): void {
+  if (!isQuery(target) || !isObject(db)) {
+    return;
+  }
+
+  const targetKey = watchTargetIdentity(target);
+  const states = watchMaterializationStore.get(db) ?? new Map<string, WatchMaterializationState>();
+  let state = states.get(targetKey) as WatchMaterializationState<Row> | undefined;
+  if (state === undefined) {
+    const owned = materializationForQuery(db, target) === undefined;
+    if (owned) {
+      mat(db as SnapshotMaterializationTarget, target, { id: targetKey, mode: 'incremental' });
+    }
+
+    state = {
+      query: target,
+      targetKey,
+      owners: new Set<string>(),
+      owned
+    };
+    states.set(targetKey, state);
+    watchMaterializationStore.set(db, states);
+  }
+
+  state.owners.add(ownerId);
+}
+
+function releaseWatchMaterialization<Row>(
+  db: WatchDb,
+  target: WatchTarget<Row>,
+  ownerId: string
+): void {
+  if (!isQuery(target) || !isObject(db)) {
+    return;
+  }
+
+  const states = watchMaterializationStore.get(db);
+  const targetKey = watchTargetIdentity(target);
+  const state = states?.get(targetKey);
+  if (states === undefined || state === undefined) {
+    return;
+  }
+
+  state.owners.delete(ownerId);
+  if (state.owners.size > 0) {
+    return;
+  }
+
+  states.delete(targetKey);
+  if (state.owned) {
+    demat(db, target);
+  }
+  if (states.size === 0) {
+    watchMaterializationStore.delete(db);
+  }
+}
+
+function transferWatchMaterialization(
+  previous: object,
+  next: object,
+  record: AnyWatchRecord
+): void {
+  if (!isQuery(record.target)) {
+    return;
+  }
+
+  const targetKey = watchTargetIdentity(record.target);
+  const previousStates = watchMaterializationStore.get(previous);
+  const previousState = previousStates?.get(targetKey);
+  if (previousStates === undefined || previousState === undefined || !previousState.owners.has(record.id)) {
+    return;
+  }
+
+  previousState.owners.delete(record.id);
+  if (previousState.owners.size === 0) {
+    previousStates.delete(targetKey);
+    if (previousState.owned) {
+      demat(previous, record.target);
+    }
+    if (previousStates.size === 0) {
+      watchMaterializationStore.delete(previous);
+    }
+  }
+
+  const nextStates = watchMaterializationStore.get(next) ?? new Map<string, WatchMaterializationState>();
+  let nextState = nextStates.get(targetKey);
+  if (nextState === undefined) {
+    if (previousState.owned && materializationForQuery(next, record.target) === undefined) {
+      mat(next as SnapshotMaterializationTarget, record.target, { id: targetKey, mode: 'incremental' });
+    }
+
+    nextState = {
+      query: record.target,
+      targetKey,
+      owners: new Set<string>(),
+      owned: previousState.owned
+    };
+    nextStates.set(targetKey, nextState);
+    watchMaterializationStore.set(next, nextStates);
+  }
+
+  nextState.owners.add(record.id);
 }
 
 function removeRecord(input: unknown, record: AnyWatchRecord): void {
@@ -681,6 +900,8 @@ function removeDbTrackedWatches(db: WatchDb, targets: readonly WatchTarget[]): v
   for (const record of Array.from(records)) {
     if (ids.has(record.id)) {
       records.delete(record);
+      record.active = false;
+      releaseWatchMaterialization(db, record.target, record.id);
     }
   }
 
@@ -691,8 +912,59 @@ function removeDbTrackedWatches(db: WatchDb, targets: readonly WatchTarget[]): v
 
 function activeRecordsFor(input: unknown): readonly AnyWatchRecord[] {
   return isObject(input)
-    ? Array.from(watchStore.get(input) ?? []).filter((record) => record.active)
+    ? Array.from(watchStore.get(input) ?? []).filter((record) => record.active && record.db === input)
     : [];
+}
+
+function activeRecordsForTransition(before: WatchDb, after: WatchDb): readonly AnyWatchRecord[] {
+  const byId = new Map<string, AnyWatchRecord>();
+  for (const record of activeRecordsFor(before)) {
+    byId.set(record.id, record);
+  }
+  for (const record of activeRecordsFor(after)) {
+    byId.set(record.id, record);
+  }
+  return Array.from(byId.values());
+}
+
+function materializationChangesByTarget(
+  changes: readonly MaterializationMaintenanceChange[]
+): ReadonlyMap<string, MaterializationMaintenanceChange> {
+  const byTarget = new Map<string, MaterializationMaintenanceChange>();
+  for (const change of changes) {
+    byTarget.set(watchTargetIdentity(change.query), change);
+  }
+  return byTarget;
+}
+
+async function deliverWatchEvent<Db extends WatchDb, Row>(
+  record: WatchRecord<Db, Row>,
+  event: WatchEvent<Row>
+): Promise<readonly WatchDiagnostic[]> {
+  const diagnostics: WatchDiagnostic[] = [];
+  for (const listener of record.listeners) {
+    try {
+      await listener(event);
+    } catch (error) {
+      diagnostics.push(listenerDiagnostic(error));
+    }
+  }
+  return diagnostics;
+}
+
+function unsubscribeWatchListener<Db extends WatchDb, Row>(
+  record: WatchRecord<Db, Row>,
+  listener: WatchListener<Row>,
+  isSubscribed: () => boolean,
+  setSubscribed: (value: boolean) => void
+): boolean {
+  if (!isSubscribed() || !record.active) {
+    setSubscribed(false);
+    return false;
+  }
+
+  setSubscribed(false);
+  return record.listeners.delete(listener);
 }
 
 function findRecord(id: string): AnyWatchRecord | undefined {

@@ -18,6 +18,7 @@ import {
   difference,
   env,
   eq,
+  evaluate,
   exists,
   extend,
   fk,
@@ -58,6 +59,7 @@ import {
   setConcat,
   sort,
   stripMeta,
+  subscribeWatch,
   sum,
   top,
   topBy,
@@ -80,7 +82,8 @@ import {
   req,
   unique
 } from '@tarstate/core';
-import type { Db, DbTransactionContext, RelationDelta } from '@tarstate/core';
+import type { Db, DbTransactionContext, RelationDelta, RelationSource, WatchEvent } from '@tarstate/core';
+import type { Query } from '@tarstate/core/query';
 import { diffRows } from '@tarstate/core/experimental/diff';
 import { stableKey } from '@tarstate/core/experimental/identity';
 import {
@@ -96,6 +99,10 @@ import {
   teams,
   users
 } from './fixtures';
+
+function expectNoMaterializationFallback(diagnostics: readonly { readonly code: string }[]): void {
+  expect(diagnostics.map((diagnostic) => diagnostic.code)).not.toContain('materialization_incremental_fallback');
+}
 
 describe('TypeScript Relic core acceptance', () => {
   it('creates immutable database values and reads tables or queries', async () => {
@@ -550,7 +557,7 @@ describe('TypeScript Relic core acceptance', () => {
       where(eq(user.active, true)),
       project({ id: user.id, name: user.name }),
       keyBy('id')
-    );
+    ) as Query<{ readonly id: string; readonly name: string }>;
     const openTasks = pipe(
       from(task),
       where(eq(task.done, false)),
@@ -975,6 +982,76 @@ describe('TypeScript Relic core acceptance', () => {
     await expect(qRows(dematerialized, activeUsers)).resolves.toEqual(materializedResult);
   });
 
+  it('evaluates lookup queries through a maintained materialized hash source when available', async () => {
+    const user = as(coreSchema.users, 'user');
+    const usersByTeam = pipe(
+      from(user),
+      hash(user.teamId),
+      project({
+        id: user.id,
+        teamId: user.teamId,
+        name: user.name,
+        active: user.active,
+        age: user.age,
+        tags: user.tags
+      }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), usersByTeam, {
+      id: 'users-by-team',
+      mode: 'incremental'
+    });
+    const tracked = await trackTransact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      })
+    );
+
+    if (tracked.result?.materializations === undefined) {
+      throw new Error('missing materialization maintenance report');
+    }
+    expect(tracked.result.materializations).toMatchObject({ recomputed: 0 });
+    expectNoMaterializationFallback(tracked.result.materializations.diagnostics);
+
+    let rowsCalls = 0;
+    let lookupCalls = 0;
+    const indexedMaterializedSource: RelationSource = {
+      relationNames: [coreSchema.users.name],
+      rows: () => {
+        rowsCalls += 1;
+        return materializedRowsForQuery(tracked.db, usersByTeam) ?? [];
+      },
+      lookup: ({ relation, field, value }) => {
+        lookupCalls += 1;
+        if (relation.name !== coreSchema.users.name || field !== 'teamId') {
+          return undefined;
+        }
+
+        return index(tracked.db, usersByTeam, { kind: 'hash', field: 'teamId' }).index?.get(value) ?? [];
+      }
+    };
+    const engineeringUsers = pipe(
+      lookup(user, 'teamId', 'eng'),
+      project({ id: user.id, name: user.name, teamId: user.teamId }),
+      keyBy('id')
+    );
+
+    await expect(evaluate(indexedMaterializedSource, engineeringUsers)).resolves.toEqual({
+      rows: [
+        { id: 'ada', name: 'Ada', teamId: 'eng' },
+        { id: 'dia', name: 'Dia', teamId: 'eng' }
+      ],
+      diagnostics: []
+    });
+    expect({ rowsCalls, lookupCalls }).toEqual({ rowsCalls: 0, lookupCalls: 1 });
+  });
+
   it('tracks DB-centered watch and materialization diffs through trackTransact', async () => {
     const user = as(coreSchema.users, 'user');
     const activeUsers = pipe(
@@ -982,7 +1059,7 @@ describe('TypeScript Relic core acceptance', () => {
       where(eq(user.active, true)),
       project({ id: user.id, name: user.name }),
       keyBy('id')
-    );
+    ) as Query<{ readonly id: string; readonly name: string }>;
     const state = mat(createDb(sourceData), activeUsers, { id: 'active-users' });
     const events: unknown[] = [];
 
@@ -1022,6 +1099,227 @@ describe('TypeScript Relic core acceptance', () => {
       { id: 'bea', name: 'Bea' },
       { id: 'dia', name: 'Dia' }
     ]);
+  });
+
+  it('delivers query watch events from incremental materialization changes', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) as Query<{ readonly id: string; readonly name: string }>;
+    const dia = {
+      id: 'dia',
+      teamId: 'eng',
+      name: 'Dia',
+      active: true,
+      age: 24,
+      tags: []
+    };
+    const eli = {
+      id: 'eli',
+      teamId: 'eng',
+      name: 'Eli',
+      active: true,
+      age: 31,
+      tags: []
+    };
+    const state = mat(createDb(sourceData), activeUsers, { id: 'active-users', mode: 'incremental' });
+    const events: Array<WatchEvent<{ readonly id: string; readonly name: string }>> = [];
+    const handle = watch(state, activeUsers, (event) => {
+      events.push(event);
+    });
+
+    const tracked = await trackTransact(state, insert(coreSchema.users, dia));
+    const materializedChange = tracked.materializations?.changes.find((change) => change.id === 'active-users');
+
+    expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
+    expect(materializedChange).toMatchObject({
+      update: 'incremental',
+      recomputed: false,
+      addedRows: [{ id: 'dia', name: 'Dia' }],
+      removedRows: []
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      changed: true,
+      addedRows: [{ id: 'dia', name: 'Dia' }],
+      removedRows: [],
+      rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'dia', name: 'Dia' } })]
+    });
+    expect(events[0]?.rowChanges).toEqual(materializedChange?.rowChanges);
+    expect(events[0]?.rowChanges).toHaveLength(1);
+    expect(events[0]?.rowChanges.length).toBeLessThan(events[0]?.rows.length ?? 0);
+    expectNoMaterializationFallback(tracked.diagnostics);
+    expectNoMaterializationFallback(events[0]?.diagnostics ?? []);
+
+    const transacted = transact(tracked.db, insert(coreSchema.users, eli));
+
+    expect(events).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({
+      changed: true,
+      addedRows: [{ id: 'eli', name: 'Eli' }],
+      removedRows: [],
+      rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'eli', name: 'Eli' } })]
+    });
+    expectNoMaterializationFallback(events.at(-1)?.diagnostics ?? []);
+    await expect(qRows(transacted, activeUsers)).resolves.toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' },
+      { id: 'dia', name: 'Dia' },
+      { id: 'eli', name: 'Eli' }
+    ]);
+    expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
+  });
+
+  it('allows secondary watch subscribers to unsubscribe without closing the original watch', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) as Query<{ readonly id: string; readonly name: string }>;
+    const state = createDb(sourceData);
+    const primaryEvents: Array<WatchEvent<{ readonly id: string; readonly name: string }>> = [];
+    const secondaryEvents: Array<WatchEvent<{ readonly id: string; readonly name: string }>> = [];
+    const handle = watch(state, activeUsers, (event) => {
+      primaryEvents.push(event);
+    });
+    const secondary = subscribeWatch(handle, (event) => {
+      secondaryEvents.push(event);
+    });
+
+    const first = await trackTransact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      })
+    );
+
+    expect(secondary).toMatchObject({ kind: 'watchSubscription', id: handle.id, active: true });
+    expect(primaryEvents).toHaveLength(1);
+    expect(secondaryEvents).toHaveLength(1);
+    expect(primaryEvents[0]).toMatchObject({
+      addedRows: [{ id: 'dia', name: 'Dia' }]
+    });
+    expect(secondaryEvents[0]).toMatchObject(primaryEvents[0] ?? {});
+
+    expect(secondary.unsubscribe()).toMatchObject({
+      kind: 'watchUnsubscribe',
+      id: handle.id,
+      unsubscribed: true
+    });
+
+    await trackTransact(
+      first.db,
+      insert(coreSchema.users, {
+        id: 'eli',
+        teamId: 'eng',
+        name: 'Eli',
+        active: true,
+        age: 31,
+        tags: []
+      })
+    );
+
+    expect(primaryEvents).toHaveLength(2);
+    expect(secondaryEvents).toHaveLength(1);
+    expect(primaryEvents.at(-1)).toMatchObject({
+      addedRows: [{ id: 'eli', name: 'Eli' }]
+    });
+    expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
+  });
+
+  it('stops handle callbacks and target changes after unwatch(handle)', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) as Query<{ readonly id: string; readonly name: string }>;
+    const state = createDb(sourceData);
+    const events: Array<WatchEvent<{ readonly id: string; readonly name: string }>> = [];
+    const handle = watch(state, activeUsers, (event) => {
+      events.push(event);
+    });
+
+    const tracked = await trackTransact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      })
+    );
+
+    expect(events).toHaveLength(1);
+    expect(unwatch(handle)).toMatchObject({ kind: 'unwatch', id: handle.id, closed: true });
+
+    const afterUnwatch = await trackTransact(
+      tracked.db,
+      insert(coreSchema.users, {
+        id: 'eli',
+        teamId: 'eng',
+        name: 'Eli',
+        active: true,
+        age: 31,
+        tags: []
+      })
+    );
+
+    expect(afterUnwatch.result).toMatchObject({ committed: true, applied: 1 });
+    expect(events).toHaveLength(1);
+    expect(afterUnwatch.changes).toEqual([]);
+    expect(afterUnwatch.changesByTargetKey.get(queryKey(activeUsers))).toBeUndefined();
+    expect(unwatch(handle)).toMatchObject({
+      kind: 'unwatch',
+      id: handle.id,
+      closed: false,
+      diagnostics: [expect.objectContaining({ code: 'watch_already_closed' })]
+    });
+  });
+
+  it('skips watched query callbacks when transaction deltas leave dependencies untouched', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) as Query<{ readonly id: string; readonly name: string }>;
+    const state = createDb(sourceData);
+    const events: Array<WatchEvent<{ readonly id: string; readonly name: string }>> = [];
+    const handle = watch(state, activeUsers, (event) => {
+      events.push(event);
+    });
+
+    const tracked = await trackTransact(
+      state,
+      insert(coreSchema.tasks, {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Document watch skipping',
+        done: false,
+        points: 1
+      })
+    );
+
+    expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
+    expect(events).toEqual([]);
+    expect(tracked.changes).toEqual([]);
+    expect(tracked.changesByTargetKey.get(queryKey(activeUsers))).toBeUndefined();
+    expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
   });
 
   it('registers Relic-style watched queries on returned DB values', async () => {

@@ -13,6 +13,7 @@ import type { ConstraintValidationInput } from './constraints-validation.js';
 import { attachedConstraintsFor, constraintDataList, transferConstraintAttachments } from './constraints-attachment.js';
 import { validateAttachedConstraintsSync } from './constraints-validation.js';
 import { transferWatches } from './watch.js';
+import { trackWatchedChanges } from './watch-tracking.js';
 import { applyWrites, type MutableObjectSourceData } from './write-apply.js';
 import type { ConstraintData } from './constraints.js';
 import {
@@ -516,6 +517,7 @@ export function transact(db: Db, ...inputs: DbTransactionInputs): Db {
     throw new DbTransactionError(result);
   }
 
+  void trackWatchedChanges(db, result.db, result.deltas, result.materializations);
   return result.db;
 }
 

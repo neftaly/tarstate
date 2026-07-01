@@ -196,6 +196,56 @@ describe('@tarstate/react DB-first hooks', () => {
     });
   });
 
+  it('updates watch listeners on transactions and cleans up after unmount', async () => {
+    const store = createDbStore({
+      items: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+    const listenerEvents: Array<NonNullable<WatchHookState<ItemProjection>['event']>> = [];
+    let current: WatchHookState<ItemProjection> | undefined;
+    let renderer: ReactTestRenderer | undefined;
+
+    function Probe() {
+      current = useWatch(itemQuery, (event) => {
+        listenerEvents.push(event);
+      }, { keyBy: ['id'] });
+      return null;
+    }
+
+    await act(async () => {
+      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+
+    await waitFor(() => listenerEvents.length === 1 && current?.events.length === 1);
+    expect(listenerEvents[0]).toMatchObject({
+      changed: true,
+      addedRows: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+
+    await act(async () => {
+      await store.transact(insert(schema.items, { id: 'item-b', label: 'Beta', done: false }));
+    });
+    await waitFor(() => listenerEvents.length === 2 && current?.events.length === 2);
+
+    expect(listenerEvents.at(-1)).toMatchObject({
+      changed: true,
+      addedRows: [{ id: 'item-b', label: 'Beta', done: false }],
+      removedRows: []
+    });
+
+    assertDefined(renderer);
+    const mountedRenderer = renderer;
+    await act(async () => {
+      mountedRenderer.unmount();
+    });
+    await act(async () => {
+      await store.transact(insert(schema.items, { id: 'item-c', label: 'Gamma', done: false }));
+      await Promise.resolve();
+    });
+
+    expect(store.getSnapshot().revision).toBe(2);
+    expect(listenerEvents).toHaveLength(2);
+  });
+
   it('replaces provider-owned DBs without reusing stale query rows', async () => {
     const firstDb = {
       items: [{ id: 'item-a', label: 'Alpha', done: false }]

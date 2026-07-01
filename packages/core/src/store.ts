@@ -13,6 +13,7 @@ import {
 } from './db.js';
 import { queryKey, type Query } from './query.js';
 import type { RelationSource } from './source.js';
+import { trackWatchedChanges } from './watch-tracking.js';
 import type { WriteInput } from './write.js';
 
 type QueryRow<QueryValue> = QueryValue extends Query<infer Row> ? Row : never;
@@ -150,11 +151,13 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
     queries: queryStores,
     view: <Row>(queryValue: Query<Row>) => createStoreView(queryValue, store),
     commit: async (patches) => {
-      const result = tryTransact(snapshot.db, patches);
+      const previousDb = snapshot.db;
+      const result = tryTransact(previousDb, patches);
       const reflected = result.committed;
 
       if (reflected) {
         snapshot = storeSnapshot(result.db, snapshot.revision + 1, result.diagnostics);
+        void trackWatchedChanges(previousDb, result.db, result.deltas, result.materializations);
         for (const listener of listeners) listener();
       }
 
