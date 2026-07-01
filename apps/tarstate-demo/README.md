@@ -1,25 +1,25 @@
-# Tarstate React Walkthrough
+# Tarstate Real Estate Demo
 
-This package is a guided React tutorial for Tarstate. It is not an app template.
+This package is a compact React walkthrough for Relic-style Tarstate queries.
 
-The walkthrough starts with the problem Tarstate solves: nested React state can
-duplicate the same data in many places. It then uses one tiny normalized model
-for the rest of the page: `projects`, `people`, and `tasks`.
+The demo uses one normalized real-estate sales dataset:
 
-Sections cover:
+- `agents`
+- `buyers`
+- `properties`
+- `rooms`
+- `offers`
+- `decisions`
+- `commissionRates`
 
-- why normalized relational state helps;
-- schema and seed rows;
-- invalid row diagnostics while valid rows still query cleanly;
-- query values that can be inspected, run, reused, materialized, watched, and
-  passed to different backing stores;
-- immutable transactions through `useTransact`;
-- materialized aggregate views through `useMaterialized`;
-- concrete `Set` and `Map` index shapes;
-- readable constraint diagnostics for rejected writes;
-- `useWatch` added/deleted aliases;
-- the same query over an `automergeDb` snapshot.
+It shows query values for property info, current offers, accepted sales, unsold
+listings, open offers, and commission due by agent. The page keeps the focus on
+controls, query snippets, result tables, materialized reads, transactions,
+diagnostics, watch events, and running the same listing query over an
+`automergeDb` snapshot.
 
-The tutorial intentionally avoids product UI workflows, adapter/runtime
-internals, memory runtime details, exhaustive operators, and full Automerge
-presence or sync behavior.
+Run locally:
+
+```sh
+pnpm --filter @tarstate/demo dev
+```

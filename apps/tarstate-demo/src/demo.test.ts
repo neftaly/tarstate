@@ -1,222 +1,266 @@
 import { createElement, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
-import {
-  TutorialApp,
-  TutorialWalkthrough,
-  buildInvalidDataExample,
-  constraintTaskRowsQuery,
-  createAutomergeTutorialBacking,
-  createTutorialModel,
-  createTutorialStore,
-  openTaskCardsQuery,
-  projectSummaryQuery,
-  readableDiagnostics,
-  runAutomergeQuery,
-  runBoostGuideTransaction,
-  runInvalidTutorialTransaction,
-  seedTutorialData,
-  tutorialIndexViewsForDb,
-  tutorialSchema,
-  type TutorialModel
-} from './demo.js';
+import { qRows } from '@tarstate/core';
 import { TarstateProvider, type TarstateDbStore } from '@tarstate/react';
+import {
+  RealEstateApp,
+  RealEstateWalkthrough,
+  acceptedSalesQuery,
+  areaCode,
+  commissionDueQuery,
+  createAutomergeRealEstateBacking,
+  createRealEstateDb,
+  createRealEstateModel,
+  createRealEstateStore,
+  currentOffersQuery,
+  listingRowsQuery,
+  openOffersQuery,
+  priceBand,
+  propertyInfoQuery,
+  readableDiagnostics,
+  realEstateSchema,
+  runAcceptHarbourOfferTransaction,
+  runAddMillOfferTransaction,
+  runAutomergeListingRows,
+  runInvalidOfferAfterAcceptedTransaction,
+  runPlaygroundQuery,
+  runRejectGardenLatestTransaction,
+  saleSpeed,
+  seedRealEstateData,
+  type RealEstateModel
+} from './demo.js';
 
-describe('Tarstate React walkthrough', () => {
-  it('builds the tiny normalized schema and seed rows as plain TypeScript data', () => {
-    expect(Object.keys(tutorialSchema)).toEqual(['projects', 'people', 'tasks']);
-    expect(seedTutorialData()).toMatchObject({
-      projects: [
-        { id: 'project-launch', name: 'Launch' },
-        { id: 'project-docs', name: 'Docs' }
+describe('Relic-style real-estate demo', () => {
+  it('exports the fixed real-estate schema, seed data, and helper semantics', () => {
+    expect(Object.keys(realEstateSchema)).toEqual([
+      'agents',
+      'buyers',
+      'properties',
+      'rooms',
+      'offers',
+      'decisions',
+      'commissionRates'
+    ]);
+    expect(seedRealEstateData()).toMatchObject({
+      agents: [
+        { id: 'agent-rose', name: 'Rose Patel' },
+        { id: 'agent-bob', name: 'Bob Stone' },
+        { id: 'agent-uma', name: 'Uma Reid' }
       ],
-      people: [
-        { id: 'person-ada', name: 'Ada', active: true },
-        { id: 'person-bea', name: 'Bea', active: true },
-        { id: 'person-cy', name: 'Cy', active: false }
+      properties: [
+        { id: 'property-elm', address: '12 Elm Street 55', price: 344000, areaCode: '55', priceBand: 'med' },
+        { id: 'property-harbour', address: '7 Harbour View 42', price: 920000, areaCode: '42', priceBand: 'high' },
+        { id: 'property-mill', address: '3 Mill Lane 17', price: 1690000, areaCode: '17', priceBand: 'premium' },
+        { id: 'property-garden', address: '18 Garden Road 55', price: 610000, areaCode: '55', priceBand: 'med' }
       ],
-      tasks: [
-        { id: 'task-api', title: 'Ship query API', status: 'doing', points: 5 },
-        { id: 'task-guide', title: 'Write React guide', status: 'todo', points: 3 },
-        { id: 'task-release', title: 'Run release checklist', status: 'done', points: 2 },
-        { id: 'task-triage', title: 'Triage feedback', status: 'todo', points: 1 }
+      offers: [
+        { id: 'offer-elm-alice-1', amount: 330000 },
+        { id: 'offer-elm-alice-2', amount: 343000 },
+        { id: 'offer-harbour-mia-1', amount: 900000 },
+        { id: 'offer-garden-nico-1', amount: 595000 },
+        { id: 'offer-garden-nico-2', amount: 612000 }
+      ]
+    });
+    expect(priceBand(300000)).toBe('low');
+    expect(priceBand(344000)).toBe('med');
+    expect(priceBand(920000)).toBe('high');
+    expect(priceBand(1690000)).toBe('premium');
+    expect(areaCode('42 Wonderland 42')).toBe('42');
+    expect(saleSpeed('2021-10-11', '2021-11-05')).toBe('medium');
+  });
+
+  it('runs exported real-estate query values over the object DB', async () => {
+    const state = createRealEstateDb();
+
+    await expect(qRows(state, propertyInfoQuery)).resolves.toMatchObject([
+      { id: 'property-elm', agentName: 'Rose Patel', roomCount: 2, squareFeet: 156, priceBand: 'med', areaCode: '55' },
+      { id: 'property-garden', agentName: 'Uma Reid', roomCount: 3, squareFeet: 355, priceBand: 'med', areaCode: '55' },
+      { id: 'property-harbour', agentName: 'Bob Stone', roomCount: 3, squareFeet: 384, priceBand: 'high', areaCode: '42' },
+      { id: 'property-mill', agentName: 'Bob Stone', roomCount: 3, squareFeet: 860, priceBand: 'premium', areaCode: '17' }
+    ]);
+    await expect(qRows(state, currentOffersQuery)).resolves.toMatchObject([
+      { id: 'offer-elm-alice-2', buyerName: 'Alice Hart', amount: 343000, decisionId: 'decision-elm-accepted' },
+      { id: 'offer-garden-nico-2', buyerName: 'Nico Ford', amount: 612000, decisionId: undefined },
+      { id: 'offer-harbour-mia-1', buyerName: 'Mia Chen', amount: 900000, decisionId: undefined }
+    ]);
+    await expect(qRows(state, acceptedSalesQuery)).resolves.toEqual([
+      expect.objectContaining({
+        id: 'decision-elm-accepted',
+        propertyId: 'property-elm',
+        buyerName: 'Alice Hart',
+        agentName: 'Rose Patel',
+        amount: 343000,
+        priceBand: 'med',
+        saleSpeed: 'very-fast',
+        listingState: 'sold'
+      })
+    ]);
+    await expect(qRows(state, listingRowsQuery)).resolves.toMatchObject([
+      { id: 'property-garden', listingState: 'listed' },
+      { id: 'property-harbour', listingState: 'listed' },
+      { id: 'property-mill', listingState: 'listed' }
+    ]);
+    await expect(qRows(state, openOffersQuery)).resolves.toMatchObject([
+      { id: 'offer-garden-nico-2', decisionStatus: 'open' },
+      { id: 'offer-harbour-mia-1', decisionStatus: 'open' }
+    ]);
+    await expect(qRows(state, commissionDueQuery)).resolves.toEqual([
+      { id: 'agent-rose', agentId: 'agent-rose', agentName: 'Rose Patel', sales: 1, saleVolume: 343000, commissionDue: 2000 }
+    ]);
+  });
+
+  it('applies query playground filters through env-backed query values', async () => {
+    const state = createRealEstateDb();
+
+    expect(ids(await runPlaygroundQuery(state, 'propertyInfo', { agentId: 'agent-bob' }))).toEqual([
+      'property-harbour',
+      'property-mill'
+    ]);
+    expect(ids(await runPlaygroundQuery(state, 'propertyInfo', { areaCode: '55' }))).toEqual([
+      'property-elm',
+      'property-garden'
+    ]);
+    expect(ids(await runPlaygroundQuery(state, 'propertyInfo', { priceBand: 'med' }))).toEqual([
+      'property-elm',
+      'property-garden'
+    ]);
+    expect(ids(await runPlaygroundQuery(state, 'currentOffers', { buyerId: 'buyer-mia' }))).toEqual([
+      'offer-harbour-mia-1'
+    ]);
+    expect(ids(await runPlaygroundQuery(state, 'listingRows', { minPrice: 600000, maxPrice: 1000000 }))).toEqual([
+      'property-garden',
+      'property-harbour'
+    ]);
+    expect(ids(await runPlaygroundQuery(state, 'acceptedSales', { listingState: 'listed' }))).toEqual([]);
+    expect(ids(await runPlaygroundQuery(state, 'acceptedSales', { listingState: 'sold' }))).toEqual([
+      'decision-elm-accepted'
+    ]);
+  });
+
+  it('materializes listing rows and commission due', async () => {
+    const store = await createRealEstateStore();
+
+    await expect(store.readMaterialized(listingRowsQuery)).resolves.toMatchObject({
+      materialized: true,
+      rows: [
+        expect.objectContaining({ id: 'property-garden' }),
+        expect.objectContaining({ id: 'property-harbour' }),
+        expect.objectContaining({ id: 'property-mill' })
+      ]
+    });
+    await expect(store.readMaterialized(commissionDueQuery)).resolves.toMatchObject({
+      materialized: true,
+      rows: [
+        { id: 'agent-rose', agentId: 'agent-rose', agentName: 'Rose Patel', sales: 1, saleVolume: 343000, commissionDue: 2000 }
       ]
     });
   });
 
-  it('keeps query values inspectable and reusable', async () => {
-    const store = await createTutorialStore();
+  it('commits real-estate transactions and rejects invalid writes with diagnostics', async () => {
+    const store = await createRealEstateStore();
 
-    expect(openTaskCardsQuery.data.op).toBe('keyBy');
-    expect(projectSummaryQuery.data.op).toBe('keyBy');
-    expect(constraintTaskRowsQuery.data.op).toBe('keyBy');
-    await expect(store.rows(openTaskCardsQuery)).resolves.toMatchObject([
-      { id: 'task-api', project: 'Launch', owner: 'Ada', points: 5 },
-      { id: 'task-guide', project: 'Docs', owner: 'Bea', points: 3 },
-      { id: 'task-triage', project: 'Docs', owner: 'Cy', points: 1 }
-    ]);
-  });
-
-  it('shows invalid data diagnostics while returning valid query rows', async () => {
-    const example = await buildInvalidDataExample();
-
-    expect(example.invalidRow).toMatchObject({
-      id: 'task-broken',
-      points: 'many'
-    });
-    expect(example.rows.map((row) => row.id)).toEqual(['task-api', 'task-guide', 'task-triage']);
-    expect(example.diagnostics).toContainEqual(expect.objectContaining({
-      code: 'invalid_row',
-      label: 'Invalid row',
-      relation: 'tasks',
-      field: 'points'
-    }));
-  });
-
-  it('runs functional transactions as immutable DB changes', async () => {
-    const store = await createTutorialStore();
-    const beforeDb = store.getSnapshot().db;
-    const beforeRevision = store.getSnapshot().revision;
-    const result = await runBoostGuideTransaction(store);
-
-    expect(result.committed).toBe(true);
-    expect(result.previousDb).toBe(beforeDb);
-    expect(result.db).not.toBe(beforeDb);
-    expect(result.revision).toBe(beforeRevision + 1);
-    await expect(store.rows(openTaskCardsQuery)).resolves.toContainEqual(expect.objectContaining({
-      id: 'task-guide',
-      status: 'doing',
-      points: 5
-    }));
-  });
-
-  it('materializes aggregate output and exposes concrete raw index shapes', async () => {
-    const store = await createTutorialStore();
-    const summary = await store.readMaterialized(projectSummaryQuery);
-    const views = tutorialIndexViewsForDb(store.getSnapshot().db);
-
-    expect(summary.materialized).toBe(true);
-    expect(summary.rows).toEqual([
-      { projectId: 'project-launch', openTasks: 1, points: 5, averagePoints: 5 },
-      { projectId: 'project-docs', openTasks: 2, points: 4, averagePoints: 2 }
-    ]);
-    expect(views).toMatchObject({
-      setRawKind: 'Set',
-      setTitles: ['Ship query API', 'Write React guide', 'Triage feedback'],
-      statusRawKind: 'Map',
-      todoTitles: ['Write React guide', 'Triage feedback'],
-      projectRawKind: 'Map',
-      launchTitles: ['Ship query API'],
-      pointsRawKind: 'Map',
-      pointsOrdered: [1, 3, 5],
-      pointsRangeTitles: ['Write React guide', 'Ship query API'],
-      uniqueRawKind: 'Map',
-      uniqueDocsOwner: 'Bea'
-    });
-  });
-
-  it('returns readable constraint diagnostics for a rejected write', async () => {
-    const store = await createTutorialStore();
-    const result = await runInvalidTutorialTransaction(store);
-    const readable = readableDiagnostics(result.diagnostics);
-
-    expect(result.committed).toBe(false);
-    expect(readable.map((diagnostic) => diagnostic.code)).toEqual(expect.arrayContaining([
-      'constraint_req',
-      'constraint_unique',
-      'constraint_fk',
-      'constraint_check'
+    await expect(runAddMillOfferTransaction(store)).resolves.toMatchObject({ committed: true });
+    await expect(store.rows(openOffersQuery)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'offer-mill-mia-1' })
     ]));
-    expect(readable).toContainEqual(expect.objectContaining({
-      code: 'constraint_req',
-      label: 'Missing required field',
-      field: 'title'
+
+    await expect(runRejectGardenLatestTransaction(store)).resolves.toMatchObject({ committed: true });
+    await expect(store.rows(openOffersQuery)).resolves.not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'offer-garden-nico-2' })
+    ]));
+
+    await expect(runAcceptHarbourOfferTransaction(store)).resolves.toMatchObject({ committed: true });
+    await expect(store.rows(listingRowsQuery)).resolves.toMatchObject([
+      { id: 'property-garden' },
+      { id: 'property-mill' }
+    ]);
+    await expect(store.rows(commissionDueQuery)).resolves.toEqual(expect.arrayContaining([
+      { id: 'agent-bob', agentId: 'agent-bob', agentName: 'Bob Stone', sales: 1, saleVolume: 900000, commissionDue: 4500 }
+    ]));
+
+    const invalid = await runInvalidOfferAfterAcceptedTransaction(store);
+    expect(invalid.committed).toBe(false);
+    expect(readableDiagnostics(invalid.diagnostics)).toContainEqual(expect.objectContaining({
+      code: 'constraint_check',
+      field: 'amount'
     }));
-    await expect(store.rows(openTaskCardsQuery)).resolves.toHaveLength(3);
   });
 
-  it('runs the same query shape over an Automerge-backed snapshot', async () => {
-    const backing = createAutomergeTutorialBacking();
+  it('runs listing rows over an Automerge-backed snapshot', async () => {
+    const backing = createAutomergeRealEstateBacking();
 
-    await expect(runAutomergeQuery(backing)).resolves.toEqual([
-      expect.objectContaining({ id: 'task-api', title: 'Ship query API' }),
-      expect.objectContaining({ id: 'task-guide', title: 'Write React guide' })
+    await expect(runAutomergeListingRows(backing)).resolves.toMatchObject([
+      { id: 'property-garden' },
+      { id: 'property-harbour' },
+      { id: 'property-mill' }
     ]);
   });
 
-  it('renders ordered beginner-first tutorial sections', async () => {
-    const model = await createTutorialModel();
+  it('renders controls, live transactions, diagnostics, watch output, and Automerge output', async () => {
+    const model = await createRealEstateModel();
     const renderer = await renderApp(model);
 
     await waitFor(() => {
-      expect(sectionTitles(renderer)).toEqual([
-        'Why normalized relational state',
-        'Tiny schema and seed rows',
-        'Invalid rows become diagnostics',
-        'Query as data',
-        'Transactions are immutable changes',
-        'Derived and materialized views',
-        'Indexes over materialized rows',
-        'Constraints reject bad writes',
-        'Watch and track changes',
-        'Pluggable backing'
+      expect(sectionIds(renderer)).toEqual([
+        'facts',
+        'playground',
+        'materialized',
+        'transactions',
+        'diagnostics',
+        'watch',
+        'automerge'
       ]);
-      expect(metric(renderer, 'Open output')).toBe('3 rows / 9 points');
-      expect(metric(renderer, 'Diagnostics')).toBe('invalid_row/tasks/points');
-      expect(rowIds(renderer)).toEqual(['task-api', 'task-guide', 'task-triage']);
-      expect(metric(renderer, 'Set raw')).toContain('Set(');
-    });
-  });
-
-  it('renders live transaction, constraints, watch, and Automerge outputs', async () => {
-    const model = await createTutorialModel();
-    const renderer = await renderApp(model);
-
-    await waitFor(() => {
-      expect(metric(renderer, 'task-guide row')).toBe('todo / 3 points');
+      expect(tableRowIds(renderer, 'playground')).toEqual([
+        'property-elm',
+        'property-garden',
+        'property-harbour',
+        'property-mill'
+      ]);
     });
 
-    await click(renderer, 'boost-guide');
+    await changeControl(renderer, 'agent', 'agent-bob');
     await waitFor(() => {
-      expect(metric(renderer, 'task-guide row')).toBe('doing / 5 points');
-      expect(metric(renderer, 'Last transaction')).toContain('3 -> 5');
+      expect(tableRowIds(renderer, 'playground')).toEqual(['property-harbour', 'property-mill']);
     });
 
-    await click(renderer, 'invalid-write');
+    await changeControl(renderer, 'query', 'listingRows');
     await waitFor(() => {
-      expect(diagnosticCodes(renderer)).toEqual(expect.arrayContaining([
-        'constraint_req',
-        'constraint_unique',
-        'constraint_fk',
-        'constraint_check'
-      ]));
+      expect(tableRowIds(renderer, 'playground')).toEqual(['property-harbour', 'property-mill']);
     });
 
-    await click(renderer, 'complete-guide');
+    await click(renderer, 'accept-harbour');
     await waitFor(() => {
-      expect(metric(renderer, 'Last deleted')).toBe('Write React guide');
+      expect(tableRowIds(renderer, 'playground')).toEqual(['property-mill']);
+      expect(tableRowIds(renderer, 'materialized-listings')).toEqual(['property-garden', 'property-mill']);
+      expect(metric(renderer, 'Watch deleted')).toBe('property-harbour');
+    });
+
+    await click(renderer, 'invalid-offer');
+    await waitFor(() => {
+      expect(diagnosticCodes(renderer)).toContain('constraint_check');
     });
 
     await click(renderer, 'run-automerge');
     await waitFor(() => {
-      expect(metric(renderer, 'Rows from Automerge')).toBe('Ship query API, Write React guide');
+      expect(metric(renderer, 'Automerge rows')).toBe('3: property-garden, property-harbour, property-mill');
     });
   });
 
-  it('exports one provider-scoped TutorialApp for the browser entry', async () => {
-    const model = await createTutorialModel();
+  it('exports one provider-scoped app for the browser entry', async () => {
+    const model = await createRealEstateModel();
     let renderer: ReactTestRenderer | undefined;
 
     await act(async () => {
-      renderer = create(createElement(TutorialApp, { model }));
+      renderer = create(createElement(RealEstateApp, { model }));
     });
 
-    expect(renderer?.root.findAllByProps({ 'data-tutorial': 'TarstateWalkthrough' })).toHaveLength(1);
+    expect(renderer?.root.findAllByProps({ 'data-demo': 'RealEstateWalkthrough' })).toHaveLength(1);
   });
 });
 
-async function renderApp(model: TutorialModel): Promise<ReactTestRenderer> {
-  return renderWithProvider(model.store, createElement(TutorialWalkthrough, { automerge: model.automerge }));
+async function renderApp(model: RealEstateModel): Promise<ReactTestRenderer> {
+  return renderWithProvider(model.store, createElement(RealEstateWalkthrough, { automerge: model.automerge }));
 }
 
 async function renderWithProvider(
@@ -233,6 +277,13 @@ async function renderWithProvider(
   return renderer;
 }
 
+async function changeControl(renderer: ReactTestRenderer, control: string, value: string): Promise<void> {
+  const node = renderer.root.findByProps({ 'data-control': control });
+  await act(async () => {
+    node.props.onChange({ target: { value } });
+  });
+}
+
 async function click(renderer: ReactTestRenderer, action: string): Promise<void> {
   const button = renderer.root.findByProps({ 'data-action': action });
   await act(async () => {
@@ -240,21 +291,26 @@ async function click(renderer: ReactTestRenderer, action: string): Promise<void>
   });
 }
 
-function sectionTitles(renderer: ReactTestRenderer): readonly string[] {
+function ids(rows: readonly { readonly id: string }[]): readonly string[] {
+  return rows.map((row) => row.id);
+}
+
+function sectionIds(renderer: ReactTestRenderer): readonly string[] {
   return renderer.root
     .findAll((node) => typeof node.props['data-section'] === 'string')
     .map((node) => String(node.props['data-section']));
 }
 
+function tableRowIds(renderer: ReactTestRenderer, table: string): readonly string[] {
+  const tableNode = renderer.root.findByProps({ 'data-table': table });
+  return tableNode
+    .findAll((node) => typeof node.props['data-row-id'] === 'string')
+    .map((node) => String(node.props['data-row-id']));
+}
+
 function metric(renderer: ReactTestRenderer, label: string): string {
   const node = renderer.root.findByProps({ 'data-metric': label });
   return textContentDeep(node.findByType('strong'));
-}
-
-function rowIds(renderer: ReactTestRenderer): readonly string[] {
-  return renderer.root
-    .findAll((node) => typeof node.props['data-row-id'] === 'string')
-    .map((node) => String(node.props['data-row-id']));
 }
 
 function diagnosticCodes(renderer: ReactTestRenderer): readonly string[] {
@@ -277,7 +333,7 @@ function isRendererNode(input: unknown): input is { readonly children: readonly 
 
 async function waitFor(assertion: () => void): Promise<void> {
   let lastError: unknown;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       assertion();
       return;

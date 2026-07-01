@@ -1,44 +1,46 @@
 import * as Automerge from '@automerge/automerge';
-import { createElement, useEffect, useMemo, useState, type ReactElement } from 'react';
+import { createElement, useMemo, useState, type ReactElement } from 'react';
 import { automergeDb, type AutomergeDb } from '@tarstate/automerge';
 import {
   aggregate,
+  and,
   as,
-  avg,
+  asc,
   btree,
   check,
   constrain,
   count,
   db,
   desc,
+  env,
   eq,
   field,
   fk,
   from,
   gt,
+  gte,
   hash,
-  index,
   insert,
   join,
   keyBy,
   leftJoin,
+  lte,
   mat,
-  materializationForQuery,
+  max,
   maybe,
-  neq,
+  or,
   pipe,
   project as select,
-  q,
   qRows,
+  qualify,
   req,
   sort,
-  stringField,
   sum,
   unique,
-  updateByKey,
   value,
   where,
   type Db,
+  type DbTransactionInput,
   type Query,
   type TarstateDiagnostic
 } from '@tarstate/core';
@@ -47,82 +49,165 @@ import {
   defineSchema,
   idField,
   numberField,
-  optional,
-  relation
+  relation,
+  stringField
 } from '@tarstate/core/schema';
 import {
   createDbStore,
   TarstateProvider,
-  useDb,
   useMaterialized,
   useQuery,
-  useTarstateStore,
+  useTransact,
   useWatch,
   type TarstateDbStore,
   type TarstateTransactResult
 } from '@tarstate/react';
 
-export type ProjectRow = {
+export type PriceBand = 'low' | 'med' | 'high' | 'premium';
+export type SaleSpeed = 'very-fast' | 'fast' | 'medium' | 'slow' | 'very-slow';
+export type ListingState = 'listed' | 'sold';
+export type QueryExampleId =
+  | 'propertyInfo'
+  | 'currentOffers'
+  | 'acceptedSales'
+  | 'listingRows'
+  | 'openOffers'
+  | 'commissionDue';
+
+export type AgentRow = {
   readonly id: string;
   readonly name: string;
 };
 
-export type PersonRow = {
+export type BuyerRow = {
   readonly id: string;
   readonly name: string;
-  readonly active: boolean;
+  readonly address: string;
+  readonly areaCode: string;
 };
 
-export type TaskRow = {
+export type PropertyRow = {
   readonly id: string;
-  readonly projectId: string;
-  readonly ownerId: string;
-  readonly title: string;
-  readonly status: string;
-  readonly points: number;
+  readonly address: string;
+  readonly price: number;
+  readonly agentId: string;
+  readonly registeredAt: string;
+  readonly photo: string;
+  readonly areaCode: string;
+  readonly priceBand: PriceBand;
 };
 
-export type TaskCard = {
+export type RoomRow = {
   readonly id: string;
-  readonly projectId: string;
-  readonly project: string;
-  readonly ownerId: string;
-  readonly owner: string | undefined;
-  readonly title: string;
-  readonly status: string;
-  readonly points: number;
+  readonly propertyId: string;
+  readonly name: string;
+  readonly width: number;
+  readonly length: number;
+  readonly squareFeet: number;
 };
 
-export type ProjectSummary = {
-  readonly projectId: string;
-  readonly openTasks: number;
-  readonly points: number;
-  readonly averagePoints: number;
-};
-
-export type ConstraintTaskRow = {
+export type OfferRow = {
   readonly id: string;
-  readonly projectId: string;
-  readonly ownerId: string;
-  readonly title: string;
-  readonly status: string;
-  readonly points: number;
+  readonly propertyId: string;
+  readonly buyerId: string;
+  readonly offeredAt: string;
+  readonly amount: number;
 };
 
-export type TutorialIndexViews = {
-  readonly setRawKind: string;
-  readonly setTitles: readonly string[];
-  readonly statusRawKind: string;
-  readonly todoTitles: readonly string[];
-  readonly statusEntries: readonly string[];
-  readonly projectRawKind: string;
-  readonly launchTitles: readonly string[];
-  readonly pointsRawKind: string;
-  readonly pointsOrdered: readonly number[];
-  readonly pointsRangeTitles: readonly string[];
-  readonly uniqueRawKind: string;
-  readonly uniqueDocsOwner: string;
-  readonly uniqueEntries: readonly string[];
+export type DecisionRow = {
+  readonly id: string;
+  readonly offerId: string;
+  readonly decidedAt: string;
+  readonly accepted: boolean;
+  readonly saleSpeed: SaleSpeed;
+};
+
+export type CommissionRateRow = {
+  readonly id: string;
+  readonly priceBand: PriceBand;
+  readonly areaCode: string;
+  readonly saleSpeed: SaleSpeed;
+  readonly commission: number;
+};
+
+export type PropertyInfoRow = {
+  readonly id: string;
+  readonly address: string;
+  readonly price: number;
+  readonly registeredAt: string;
+  readonly photo: string;
+  readonly agentId: string;
+  readonly agentName: string;
+  readonly areaCode: string;
+  readonly priceBand: PriceBand;
+  readonly roomCount: number;
+  readonly squareFeet: number;
+};
+
+export type OfferSummaryRow = {
+  readonly id: string;
+  readonly propertyId: string;
+  readonly propertyAddress: string;
+  readonly price: number;
+  readonly buyerId: string;
+  readonly buyerName: string;
+  readonly agentId: string;
+  readonly agentName: string;
+  readonly areaCode: string;
+  readonly priceBand: PriceBand;
+  readonly offeredAt: string;
+  readonly amount: number;
+  readonly decisionId: string | undefined;
+  readonly decisionStatus: boolean | undefined | 'open';
+};
+
+export type AcceptedSaleRow = {
+  readonly id: string;
+  readonly offerId: string;
+  readonly propertyId: string;
+  readonly propertyAddress: string;
+  readonly price: number;
+  readonly buyerId: string;
+  readonly buyerName: string;
+  readonly agentId: string;
+  readonly agentName: string;
+  readonly areaCode: string;
+  readonly priceBand: PriceBand;
+  readonly registeredAt: string;
+  readonly decidedAt: string;
+  readonly saleSpeed: SaleSpeed;
+  readonly amount: number;
+  readonly listingState: 'sold';
+};
+
+export type ListingRow = PropertyInfoRow & {
+  readonly listingState: 'listed';
+};
+
+export type CommissionDueRow = {
+  readonly id: string;
+  readonly agentId: string;
+  readonly agentName: string;
+  readonly sales: number;
+  readonly saleVolume: number;
+  readonly commissionDue: number;
+};
+
+export type PlaygroundRow =
+  | PropertyInfoRow
+  | OfferSummaryRow
+  | AcceptedSaleRow
+  | ListingRow
+  | CommissionDueRow;
+
+export type PlaygroundFilters = {
+  readonly agentId?: string;
+  readonly areaCode?: string;
+  readonly priceBand?: string;
+  readonly buyerId?: string;
+  readonly listingState?: string;
+  readonly minPrice?: number;
+  readonly maxPrice?: number;
 };
 
 export type ReadableDiagnostic = {
@@ -132,253 +217,604 @@ export type ReadableDiagnostic = {
   readonly field: string;
 };
 
-export type InvalidDataExample = {
-  readonly invalidRow: Record<string, unknown>;
-  readonly rows: readonly TaskCard[];
-  readonly diagnostics: readonly ReadableDiagnostic[];
-};
-
 export type StoredRow<Row extends { readonly id: string }> = Omit<Row, 'id'> & {
   readonly id?: string;
 };
 
-export type TutorialDocument = {
-  readonly workspace: {
-    readonly projects: Record<string, StoredRow<ProjectRow>>;
-    readonly people: Record<string, StoredRow<PersonRow>>;
-    readonly tasks: Record<string, StoredRow<TaskRow>>;
+export type RealEstateDocument = {
+  readonly market: {
+    readonly agents: Record<string, StoredRow<AgentRow>>;
+    readonly buyers: Record<string, StoredRow<BuyerRow>>;
+    readonly properties: Record<string, StoredRow<PropertyRow>>;
+    readonly rooms: Record<string, StoredRow<RoomRow>>;
+    readonly offers: Record<string, StoredRow<OfferRow>>;
+    readonly decisions: Record<string, StoredRow<DecisionRow>>;
+    readonly commissionRates: Record<string, StoredRow<CommissionRateRow>>;
   };
 };
 
-export type AutomergeTutorialBacking = {
-  readonly relic: AutomergeDb<TutorialDocument>;
+export type AutomergeRealEstateBacking = {
+  readonly relic: AutomergeDb<RealEstateDocument>;
   readonly beforeHeads: readonly string[];
 };
 
-export type TutorialModel = {
+export type RealEstateModel = {
   readonly store: TarstateDbStore;
-  readonly automerge: AutomergeTutorialBacking;
+  readonly automerge: AutomergeRealEstateBacking;
 };
 
-export const tutorialSchema = defineSchema({
-  projects: relation<ProjectRow>({
+export type RealEstateData = {
+  readonly agents: readonly AgentRow[];
+  readonly buyers: readonly BuyerRow[];
+  readonly properties: readonly PropertyRow[];
+  readonly rooms: readonly RoomRow[];
+  readonly offers: readonly OfferRow[];
+  readonly decisions: readonly DecisionRow[];
+  readonly commissionRates: readonly CommissionRateRow[];
+};
+
+export const realEstateSchema = defineSchema({
+  agents: relation<AgentRow>({
     key: 'id',
     fields: {
-      id: idField('project'),
+      id: idField('agent'),
       name: stringField()
     }
   }),
-  people: relation<PersonRow>({
+  buyers: relation<BuyerRow>({
     key: 'id',
     fields: {
-      id: idField('person'),
+      id: idField('buyer'),
       name: stringField(),
-      active: booleanField()
+      address: stringField(),
+      areaCode: stringField()
     }
   }),
-  tasks: relation<TaskRow>({
+  properties: relation<PropertyRow>({
     key: 'id',
     fields: {
-      id: idField('task'),
-      projectId: stringField(),
-      ownerId: stringField(),
-      title: optional(stringField()),
-      status: optional(stringField()),
-      points: numberField()
+      id: idField('property'),
+      address: stringField(),
+      price: numberField(),
+      agentId: stringField(),
+      registeredAt: stringField(),
+      photo: stringField(),
+      areaCode: stringField(),
+      priceBand: stringField()
+    }
+  }),
+  rooms: relation<RoomRow>({
+    key: 'id',
+    fields: {
+      id: idField('room'),
+      propertyId: stringField(),
+      name: stringField(),
+      width: numberField(),
+      length: numberField(),
+      squareFeet: numberField()
+    }
+  }),
+  offers: relation<OfferRow>({
+    key: 'id',
+    fields: {
+      id: idField('offer'),
+      propertyId: stringField(),
+      buyerId: stringField(),
+      offeredAt: stringField(),
+      amount: numberField()
+    }
+  }),
+  decisions: relation<DecisionRow>({
+    key: 'id',
+    fields: {
+      id: idField('decision'),
+      offerId: stringField(),
+      decidedAt: stringField(),
+      accepted: booleanField(),
+      saleSpeed: stringField()
+    }
+  }),
+  commissionRates: relation<CommissionRateRow>({
+    key: 'id',
+    fields: {
+      id: idField('commission-rate'),
+      priceBand: stringField(),
+      areaCode: stringField(),
+      saleSpeed: stringField(),
+      commission: numberField()
     }
   })
 });
 
-const projectRef = as(tutorialSchema.projects, 'project');
-const personRef = as(tutorialSchema.people, 'person');
-const taskRef = as(tutorialSchema.tasks, 'task');
+const agentRef = as(realEstateSchema.agents, 'agent');
+const buyerRef = as(realEstateSchema.buyers, 'buyer');
+const propertyRef = as(realEstateSchema.properties, 'property');
+const roomRef = as(realEstateSchema.rooms, 'room');
+const offerRef = as(realEstateSchema.offers, 'offer');
+const decisionRef = as(realEstateSchema.decisions, 'decision');
+const rateRef = as(realEstateSchema.commissionRates, 'rate');
 
-export const openTaskCardsQuery = pipe(
-  from(taskRef),
-  hash(taskRef.status),
-  hash(taskRef.projectId),
-  btree(taskRef.points),
-  where(neq(taskRef.status, 'done')),
-  join(from(projectRef), eq(taskRef.projectId, projectRef.id)),
-  leftJoin(from(personRef), eq(taskRef.ownerId, personRef.id)),
-  sort(desc(taskRef.points)),
-  select({
-    id: taskRef.id,
-    projectId: taskRef.projectId,
-    project: projectRef.name,
-    ownerId: taskRef.ownerId,
-    owner: maybe(personRef.name),
-    title: taskRef.title,
-    status: taskRef.status,
-    points: taskRef.points
-  }),
-  keyBy('id')
-) as unknown as Query<TaskCard>;
+const roomStats = {
+  propertyId: field<string>('roomStats', 'propertyId'),
+  roomCount: field<number>('roomStats', 'roomCount'),
+  squareFeet: field<number>('roomStats', 'squareFeet')
+};
 
-export const projectSummaryQuery = pipe(
-  from(taskRef),
-  where(neq(taskRef.status, 'done')),
-  aggregate({
-    groupBy: { projectId: taskRef.projectId },
-    aggregates: {
-      openTasks: count(),
-      points: sum(taskRef.points),
-      averagePoints: avg(taskRef.points)
-    }
-  }),
-  keyBy('projectId')
-) as unknown as Query<ProjectSummary>;
+const latest = {
+  propertyId: field<string>('latest', 'propertyId'),
+  buyerId: field<string>('latest', 'buyerId'),
+  offeredAt: field<string>('latest', 'offeredAt')
+};
 
-export const constraintTaskRowsQuery = pipe(
-  from(taskRef),
-  where(neq(taskRef.status, 'done')),
-  select({
-    id: taskRef.id,
-    projectId: taskRef.projectId,
-    ownerId: taskRef.ownerId,
-    title: taskRef.title,
-    status: taskRef.status,
-    points: taskRef.points
-  }),
-  keyBy('id')
-) as unknown as Query<ConstraintTaskRow>;
+const sale = {
+  id: field<string>('sale', 'id'),
+  offerId: field<string>('sale', 'offerId'),
+  propertyId: field<string>('sale', 'propertyId'),
+  propertyAddress: field<string>('sale', 'propertyAddress'),
+  price: field<number>('sale', 'price'),
+  buyerId: field<string>('sale', 'buyerId'),
+  buyerName: field<string>('sale', 'buyerName'),
+  agentId: field<string>('sale', 'agentId'),
+  agentName: field<string>('sale', 'agentName'),
+  areaCode: field<string>('sale', 'areaCode'),
+  priceBand: field<PriceBand>('sale', 'priceBand'),
+  registeredAt: field<string>('sale', 'registeredAt'),
+  decidedAt: field<string>('sale', 'decidedAt'),
+  saleSpeed: field<SaleSpeed>('sale', 'saleSpeed'),
+  amount: field<number>('sale', 'amount'),
+  listingState: field<'sold'>('sale', 'listingState')
+};
 
-export function seedTutorialData(): Db['data'] {
+const info = {
+  id: field<string>('info', 'id'),
+  address: field<string>('info', 'address'),
+  price: field<number>('info', 'price'),
+  registeredAt: field<string>('info', 'registeredAt'),
+  photo: field<string>('info', 'photo'),
+  agentId: field<string>('info', 'agentId'),
+  agentName: field<string>('info', 'agentName'),
+  areaCode: field<string>('info', 'areaCode'),
+  priceBand: field<PriceBand>('info', 'priceBand'),
+  roomCount: field<number>('info', 'roomCount'),
+  squareFeet: field<number>('info', 'squareFeet')
+};
+
+const row = {
+  agentId: field<string>('row', 'agentId'),
+  areaCode: field<string>('row', 'areaCode'),
+  priceBand: field<string>('row', 'priceBand'),
+  buyerId: field<string>('row', 'buyerId'),
+  listingState: field<string>('row', 'listingState'),
+  price: field<number>('row', 'price')
+};
+
+export function priceBand(price: number): PriceBand {
+  if (price <= 300000) return 'low';
+  if (price <= 650000) return 'med';
+  if (price <= 1000000) return 'high';
+  return 'premium';
+}
+
+export function areaCode(address: string): string {
+  return address.trim().split(/\s+/).at(-1) ?? '';
+}
+
+export function saleSpeed(registeredAt: string, decisionAt: string): SaleSpeed {
+  const days = Math.floor((Date.parse(decisionAt) - Date.parse(registeredAt)) / 86_400_000);
+  if (days <= 10) return 'very-fast';
+  if (days <= 20) return 'fast';
+  if (days <= 30) return 'medium';
+  if (days <= 60) return 'slow';
+  return 'very-slow';
+}
+
+export function seedRealEstateData(): RealEstateData {
+  const properties: readonly PropertyRow[] = [
+    propertyRow('property-elm', '12 Elm Street 55', 344000, 'agent-rose', '2021-10-26', 'elm.jpg'),
+    propertyRow('property-harbour', '7 Harbour View 42', 920000, 'agent-bob', '2021-10-11', 'harbour.jpg'),
+    propertyRow('property-mill', '3 Mill Lane 17', 1690000, 'agent-bob', '2021-10-27', 'mill.jpg'),
+    propertyRow('property-garden', '18 Garden Road 55', 610000, 'agent-uma', '2021-10-18', 'garden.jpg')
+  ];
+
   return {
-    projects: [
-      { id: 'project-launch', name: 'Launch' },
-      { id: 'project-docs', name: 'Docs' }
+    agents: [
+      { id: 'agent-rose', name: 'Rose Patel' },
+      { id: 'agent-bob', name: 'Bob Stone' },
+      { id: 'agent-uma', name: 'Uma Reid' }
     ],
-    people: [
-      { id: 'person-ada', name: 'Ada', active: true },
-      { id: 'person-bea', name: 'Bea', active: true },
-      { id: 'person-cy', name: 'Cy', active: false }
+    buyers: [
+      buyerRow('buyer-alice', 'Alice Hart', '42 Wonderland 42'),
+      buyerRow('buyer-mia', 'Mia Chen', '9 Orchard 17'),
+      buyerRow('buyer-nico', 'Nico Ford', '31 Station 55')
     ],
-    tasks: [
+    properties,
+    rooms: [
+      roomRow('room-elm-living', 'property-elm', 'Living', 10, 10),
+      roomRow('room-elm-kitchen', 'property-elm', 'Kitchen', 8, 7),
+      roomRow('room-harbour-living', 'property-harbour', 'Living', 16, 12),
+      roomRow('room-harbour-bedroom', 'property-harbour', 'Bedroom', 12, 10),
+      roomRow('room-harbour-study', 'property-harbour', 'Study', 9, 8),
+      roomRow('room-mill-showroom', 'property-mill', 'Showroom', 24, 18),
+      roomRow('room-mill-office', 'property-mill', 'Office', 12, 9),
+      roomRow('room-mill-store', 'property-mill', 'Store', 20, 16),
+      roomRow('room-garden-living', 'property-garden', 'Living', 13, 11),
+      roomRow('room-garden-kitchen', 'property-garden', 'Kitchen', 10, 8),
+      roomRow('room-garden-bedroom', 'property-garden', 'Bedroom', 12, 11)
+    ],
+    offers: [
+      { id: 'offer-elm-alice-1', propertyId: 'property-elm', buyerId: 'buyer-alice', offeredAt: '2021-10-26', amount: 330000 },
+      { id: 'offer-elm-alice-2', propertyId: 'property-elm', buyerId: 'buyer-alice', offeredAt: '2021-10-27', amount: 343000 },
+      { id: 'offer-harbour-mia-1', propertyId: 'property-harbour', buyerId: 'buyer-mia', offeredAt: '2021-10-20', amount: 900000 },
+      { id: 'offer-garden-nico-1', propertyId: 'property-garden', buyerId: 'buyer-nico', offeredAt: '2021-10-21', amount: 595000 },
+      { id: 'offer-garden-nico-2', propertyId: 'property-garden', buyerId: 'buyer-nico', offeredAt: '2021-10-24', amount: 612000 }
+    ],
+    decisions: [
       {
-        id: 'task-api',
-        projectId: 'project-launch',
-        ownerId: 'person-ada',
-        title: 'Ship query API',
-        status: 'doing',
-        points: 5
+        id: 'decision-elm-accepted',
+        offerId: 'offer-elm-alice-2',
+        decidedAt: '2021-10-28',
+        accepted: true,
+        saleSpeed: saleSpeed('2021-10-26', '2021-10-28')
       },
       {
-        id: 'task-guide',
-        projectId: 'project-docs',
-        ownerId: 'person-bea',
-        title: 'Write React guide',
-        status: 'todo',
-        points: 3
-      },
-      {
-        id: 'task-release',
-        projectId: 'project-launch',
-        ownerId: 'person-ada',
-        title: 'Run release checklist',
-        status: 'done',
-        points: 2
-      },
-      {
-        id: 'task-triage',
-        projectId: 'project-docs',
-        ownerId: 'person-cy',
-        title: 'Triage feedback',
-        status: 'todo',
-        points: 1
+        id: 'decision-garden-rejected',
+        offerId: 'offer-garden-nico-1',
+        decidedAt: '2021-10-22',
+        accepted: false,
+        saleSpeed: saleSpeed('2021-10-18', '2021-10-22')
       }
+    ],
+    commissionRates: [
+      { id: 'rate-med-55-fast', priceBand: 'med', areaCode: '55', saleSpeed: 'very-fast', commission: 2000 },
+      { id: 'rate-med-55-medium', priceBand: 'med', areaCode: '55', saleSpeed: 'medium', commission: 1500 },
+      { id: 'rate-high-42-medium', priceBand: 'high', areaCode: '42', saleSpeed: 'medium', commission: 4500 },
+      { id: 'rate-premium-17-slow', priceBand: 'premium', areaCode: '17', saleSpeed: 'slow', commission: 7000 }
     ]
   };
 }
 
-export function createTutorialDb(input: Db['data'] = seedTutorialData()): Db {
+export const propertyRoomStatsQuery = pipe(
+  from(roomRef),
+  aggregate({
+    groupBy: { propertyId: roomRef.propertyId },
+    aggregates: {
+      roomCount: count(),
+      squareFeet: sum(roomRef.squareFeet)
+    }
+  }),
+  qualify('roomStats')
+) as unknown as Query<{ readonly roomStats: { readonly propertyId: string; readonly roomCount: number; readonly squareFeet: number } }>;
+
+export const propertyInfoQuery = pipe(
+  from(propertyRef),
+  hash(propertyRef.agentId, propertyRef.areaCode, propertyRef.priceBand),
+  btree(propertyRef.price),
+  join(from(agentRef), eq(propertyRef.agentId, agentRef.id)),
+  leftJoin(propertyRoomStatsQuery, eq(propertyRef.id, roomStats.propertyId)),
+  sort(asc(propertyRef.price)),
+  select({
+    id: propertyRef.id,
+    address: propertyRef.address,
+    price: propertyRef.price,
+    registeredAt: propertyRef.registeredAt,
+    photo: propertyRef.photo,
+    agentId: propertyRef.agentId,
+    agentName: agentRef.name,
+    areaCode: propertyRef.areaCode,
+    priceBand: propertyRef.priceBand,
+    roomCount: maybe(roomStats.roomCount),
+    squareFeet: maybe(roomStats.squareFeet)
+  }),
+  keyBy('id')
+) as unknown as Query<PropertyInfoRow>;
+
+export const latestOfferMarksQuery = pipe(
+  from(offerRef),
+  aggregate({
+    groupBy: {
+      propertyId: offerRef.propertyId,
+      buyerId: offerRef.buyerId
+    },
+    aggregates: {
+      offeredAt: max(offerRef.offeredAt)
+    }
+  }),
+  qualify('latest')
+) as unknown as Query<{ readonly latest: { readonly propertyId: string; readonly buyerId: string; readonly offeredAt: string } }>;
+
+export const currentOffersQuery = pipe(
+  from(offerRef),
+  join(latestOfferMarksQuery, and(
+    eq(offerRef.propertyId, latest.propertyId),
+    eq(offerRef.buyerId, latest.buyerId),
+    eq(offerRef.offeredAt, latest.offeredAt)
+  )),
+  join(from(propertyRef), eq(offerRef.propertyId, propertyRef.id)),
+  join(from(agentRef), eq(propertyRef.agentId, agentRef.id)),
+  join(from(buyerRef), eq(offerRef.buyerId, buyerRef.id)),
+  leftJoin(from(decisionRef), eq(offerRef.id, decisionRef.offerId)),
+  sort(desc(offerRef.offeredAt)),
+  select({
+    id: offerRef.id,
+    propertyId: propertyRef.id,
+    propertyAddress: propertyRef.address,
+    price: propertyRef.price,
+    buyerId: buyerRef.id,
+    buyerName: buyerRef.name,
+    agentId: agentRef.id,
+    agentName: agentRef.name,
+    areaCode: propertyRef.areaCode,
+    priceBand: propertyRef.priceBand,
+    offeredAt: offerRef.offeredAt,
+    amount: offerRef.amount,
+    decisionId: maybe(decisionRef.id),
+    decisionStatus: maybe(decisionRef.accepted)
+  }),
+  keyBy('id')
+) as unknown as Query<OfferSummaryRow>;
+
+export const acceptedSalesQuery = pipe(
+  from(decisionRef),
+  where(eq(decisionRef.accepted, true)),
+  join(from(offerRef), eq(decisionRef.offerId, offerRef.id)),
+  join(from(propertyRef), eq(offerRef.propertyId, propertyRef.id)),
+  join(from(buyerRef), eq(offerRef.buyerId, buyerRef.id)),
+  join(from(agentRef), eq(propertyRef.agentId, agentRef.id)),
+  sort(asc(decisionRef.decidedAt)),
+  select({
+    id: decisionRef.id,
+    offerId: offerRef.id,
+    propertyId: propertyRef.id,
+    propertyAddress: propertyRef.address,
+    price: propertyRef.price,
+    buyerId: buyerRef.id,
+    buyerName: buyerRef.name,
+    agentId: agentRef.id,
+    agentName: agentRef.name,
+    areaCode: propertyRef.areaCode,
+    priceBand: propertyRef.priceBand,
+    registeredAt: propertyRef.registeredAt,
+    decidedAt: decisionRef.decidedAt,
+    saleSpeed: decisionRef.saleSpeed,
+    amount: offerRef.amount,
+    listingState: value('sold')
+  }),
+  keyBy('id')
+) as unknown as Query<AcceptedSaleRow>;
+
+export const listingRowsQuery = pipe(
+  propertyInfoQuery,
+  qualify('info'),
+  leftJoin(pipe(acceptedSalesQuery, qualify('sale')), eq(info.id, sale.propertyId)),
+  where(eq(sale.propertyId, value(undefined))),
+  select({
+    id: info.id,
+    address: info.address,
+    price: info.price,
+    registeredAt: info.registeredAt,
+    photo: info.photo,
+    agentId: info.agentId,
+    agentName: info.agentName,
+    areaCode: info.areaCode,
+    priceBand: info.priceBand,
+    roomCount: info.roomCount,
+    squareFeet: info.squareFeet,
+    listingState: value('listed')
+  }),
+  keyBy('id'),
+  sort(asc(field<number>('row', 'price')))
+) as unknown as Query<ListingRow>;
+
+export const unsoldPropertiesQuery = listingRowsQuery;
+
+export const openOffersQuery = pipe(
+  currentOffersQuery,
+  qualify('current'),
+  where(eq(field('current', 'decisionId'), value(undefined))),
+  select({
+    id: field<string>('current', 'id'),
+    propertyId: field<string>('current', 'propertyId'),
+    propertyAddress: field<string>('current', 'propertyAddress'),
+    price: field<number>('current', 'price'),
+    buyerId: field<string>('current', 'buyerId'),
+    buyerName: field<string>('current', 'buyerName'),
+    agentId: field<string>('current', 'agentId'),
+    agentName: field<string>('current', 'agentName'),
+    areaCode: field<string>('current', 'areaCode'),
+    priceBand: field<PriceBand>('current', 'priceBand'),
+    offeredAt: field<string>('current', 'offeredAt'),
+    amount: field<number>('current', 'amount'),
+    decisionId: field<string | undefined>('current', 'decisionId'),
+    decisionStatus: value('open')
+  }),
+  keyBy('id')
+) as unknown as Query<OfferSummaryRow>;
+
+export const commissionDueQuery = pipe(
+  acceptedSalesQuery,
+  qualify('sale'),
+  join(from(rateRef), and(
+    eq(sale.priceBand, rateRef.priceBand),
+    eq(sale.areaCode, rateRef.areaCode),
+    eq(sale.saleSpeed, rateRef.saleSpeed)
+  )),
+  aggregate({
+    groupBy: {
+      id: sale.agentId,
+      agentId: sale.agentId,
+      agentName: sale.agentName
+    },
+    aggregates: {
+      sales: count(),
+      saleVolume: sum(sale.amount),
+      commissionDue: sum(rateRef.commission)
+    }
+  }),
+  keyBy('id'),
+  sort(asc(field<string>('row', 'agentName')))
+) as unknown as Query<CommissionDueRow>;
+
+export const offerConstraintRowsQuery = pipe(
+  from(offerRef),
+  select({
+    id: offerRef.id,
+    propertyId: offerRef.propertyId,
+    buyerId: offerRef.buyerId,
+    offeredAt: offerRef.offeredAt,
+    amount: offerRef.amount
+  }),
+  keyBy('id')
+) as unknown as Query<OfferRow>;
+
+export const decisionConstraintRowsQuery = pipe(
+  from(decisionRef),
+  select({
+    id: decisionRef.id,
+    offerId: decisionRef.offerId,
+    decidedAt: decisionRef.decidedAt,
+    accepted: decisionRef.accepted,
+    saleSpeed: decisionRef.saleSpeed
+  }),
+  keyBy('id')
+) as unknown as Query<DecisionRow>;
+
+export const queryExamples: readonly {
+  readonly id: QueryExampleId;
+  readonly label: string;
+  readonly query: Query<PlaygroundRow>;
+  readonly columns: readonly string[];
+  readonly snippet: string;
+  readonly filters: readonly (keyof PlaygroundFilters)[];
+}[] = [
+  {
+    id: 'propertyInfo',
+    label: 'Property info',
+    query: propertyInfoQuery as unknown as Query<PlaygroundRow>,
+    columns: ['id', 'address', 'agentName', 'price', 'priceBand', 'areaCode', 'roomCount', 'squareFeet'],
+    filters: ['agentId', 'areaCode', 'priceBand', 'minPrice', 'maxPrice'],
+    snippet: `pipe(
+  from(property),
+  join(from(agent), eq(property.agentId, agent.id)),
+  leftJoin(roomStats, eq(property.id, roomStats.propertyId)),
+  project({ address, agentName, roomCount, squareFeet, priceBand, areaCode })
+)`
+  },
+  {
+    id: 'currentOffers',
+    label: 'Current offers',
+    query: currentOffersQuery as unknown as Query<PlaygroundRow>,
+    columns: ['id', 'propertyAddress', 'buyerName', 'agentName', 'amount', 'offeredAt', 'decisionStatus'],
+    filters: ['agentId', 'areaCode', 'priceBand', 'buyerId', 'minPrice', 'maxPrice'],
+    snippet: `const latest = aggregate({
+  groupBy: { propertyId, buyerId },
+  aggregates: { offeredAt: max(offer.offeredAt) }
+});
+
+offer |> join(latest, same property/buyer/date)`
+  },
+  {
+    id: 'acceptedSales',
+    label: 'Accepted sales',
+    query: acceptedSalesQuery as unknown as Query<PlaygroundRow>,
+    columns: ['id', 'propertyAddress', 'buyerName', 'agentName', 'amount', 'priceBand', 'saleSpeed', 'listingState'],
+    filters: ['agentId', 'areaCode', 'priceBand', 'buyerId', 'listingState', 'minPrice', 'maxPrice'],
+    snippet: `decision
+  |> where(accepted = true)
+  |> join(offer)
+  |> join(property)
+  |> join(buyer)
+  |> join(agent)`
+  },
+  {
+    id: 'listingRows',
+    label: 'Unsold listings',
+    query: listingRowsQuery as unknown as Query<PlaygroundRow>,
+    columns: ['id', 'address', 'agentName', 'price', 'priceBand', 'areaCode', 'roomCount', 'listingState'],
+    filters: ['agentId', 'areaCode', 'priceBand', 'listingState', 'minPrice', 'maxPrice'],
+    snippet: `propertyInfo
+  |> leftJoin(acceptedSales, property.id = sale.propertyId)
+  |> where(sale.propertyId = undefined)`
+  },
+  {
+    id: 'openOffers',
+    label: 'Open offers',
+    query: openOffersQuery as unknown as Query<PlaygroundRow>,
+    columns: ['id', 'propertyAddress', 'buyerName', 'agentName', 'amount', 'offeredAt', 'decisionStatus'],
+    filters: ['agentId', 'areaCode', 'priceBand', 'buyerId', 'minPrice', 'maxPrice'],
+    snippet: `currentOffers
+  |> where(decisionId = undefined)
+  |> project({ property, buyer, amount, offeredAt })`
+  },
+  {
+    id: 'commissionDue',
+    label: 'Commission due',
+    query: commissionDueQuery as unknown as Query<PlaygroundRow>,
+    columns: ['agentName', 'sales', 'saleVolume', 'commissionDue'],
+    filters: ['agentId'],
+    snippet: `acceptedSales
+  |> join(commissionRates, priceBand/areaCode/saleSpeed)
+  |> aggregate({ groupBy: agent, commissionDue: sum(rate.commission) })`
+  }
+];
+
+export function createRealEstateDb(input: Db['data'] = seedRealEstateData()): Db {
   return mat(
     db(input),
     constrain(
-      req(constraintTaskRowsQuery, 'title'),
-      req(constraintTaskRowsQuery, 'status'),
-      unique(constraintTaskRowsQuery, 'title'),
-      fk(constraintTaskRowsQuery, 'projectId', tutorialSchema.projects, 'id'),
-      fk(constraintTaskRowsQuery, 'ownerId', tutorialSchema.people, 'id'),
-      check(constraintTaskRowsQuery, gt(field('task', 'points'), value(0)))
+      req(offerConstraintRowsQuery, 'propertyId'),
+      req(offerConstraintRowsQuery, 'buyerId'),
+      req(offerConstraintRowsQuery, 'offeredAt'),
+      fk(offerConstraintRowsQuery, 'propertyId', realEstateSchema.properties, 'id'),
+      fk(offerConstraintRowsQuery, 'buyerId', realEstateSchema.buyers, 'id'),
+      check(offerConstraintRowsQuery, gt(field('offer', 'amount'), value(0))),
+      unique(decisionConstraintRowsQuery, 'offerId'),
+      fk(decisionConstraintRowsQuery, 'offerId', realEstateSchema.offers, 'id'),
+      check(decisionConstraintRowsQuery, or(
+        eq(field('decision', 'saleSpeed'), value('very-fast')),
+        eq(field('decision', 'saleSpeed'), value('fast')),
+        eq(field('decision', 'saleSpeed'), value('medium')),
+        eq(field('decision', 'saleSpeed'), value('slow')),
+        eq(field('decision', 'saleSpeed'), value('very-slow'))
+      ))
     )
   );
 }
 
-export function invalidTutorialData(): Db['data'] {
-  return {
-    ...seedTutorialData(),
-    tasks: [
-      ...(seedTutorialData().tasks ?? []),
-      {
-        id: 'task-broken',
-        projectId: 'project-docs',
-        ownerId: 'person-bea',
-        title: 'Estimate migration',
-        status: 'todo',
-        points: 'many'
-      }
-    ]
-  };
-}
-
-export async function buildInvalidDataExample(): Promise<InvalidDataExample> {
-  const invalidRow = (invalidTutorialData().tasks ?? []).at(-1);
-  const result = await q(db(invalidTutorialData()), openTaskCardsQuery);
-  return {
-    invalidRow: isRecord(invalidRow) ? invalidRow : {},
-    rows: result.rows,
-    diagnostics: readableDiagnostics(result.diagnostics)
-  };
-}
-
-export async function createTutorialStore(input: Db = createTutorialDb()): Promise<TarstateDbStore> {
+export async function createRealEstateStore(input: Db = createRealEstateDb()): Promise<TarstateDbStore> {
   const store = createDbStore(input);
-  await store.materialize(openTaskCardsQuery, { id: 'open-task-cards' });
-  await store.materialize(projectSummaryQuery, { id: 'project-summary' });
+  await store.materialize(listingRowsQuery, { id: 'listing-rows' });
+  await store.materialize(commissionDueQuery, { id: 'commission-due' });
   return store;
 }
 
-export async function createTutorialModel(): Promise<TutorialModel> {
+export async function createRealEstateModel(): Promise<RealEstateModel> {
   return {
-    store: await createTutorialStore(),
-    automerge: createAutomergeTutorialBacking()
+    store: await createRealEstateStore(),
+    automerge: createAutomergeRealEstateBacking()
   };
 }
 
-export function createAutomergeTutorialBacking(): AutomergeTutorialBacking {
-  const relic = automergeDb<TutorialDocument>(Automerge.from<TutorialDocument>({
-    workspace: {
-      projects: {
-        'project-launch': { name: 'Launch' },
-        'project-docs': { name: 'Docs' }
-      },
-      people: {
-        'person-ada': { name: 'Ada', active: true },
-        'person-bea': { name: 'Bea', active: true }
-      },
-      tasks: {
-        'task-api': {
-          projectId: 'project-launch',
-          ownerId: 'person-ada',
-          title: 'Ship query API',
-          status: 'doing',
-          points: 5
-        },
-        'task-guide': {
-          projectId: 'project-docs',
-          ownerId: 'person-bea',
-          title: 'Write React guide',
-          status: 'todo',
-          points: 3
-        }
-      }
+export function createAutomergeRealEstateBacking(): AutomergeRealEstateBacking {
+  const seed = seedRealEstateData();
+  const relic = automergeDb<RealEstateDocument>(Automerge.from<RealEstateDocument>({
+    market: {
+      agents: rowsById(seed.agents ?? []),
+      buyers: rowsById(seed.buyers ?? []),
+      properties: rowsById(seed.properties ?? []),
+      rooms: rowsById(seed.rooms ?? []),
+      offers: rowsById(seed.offers ?? []),
+      decisions: rowsById(seed.decisions ?? []),
+      commissionRates: rowsById(seed.commissionRates ?? [])
     }
   }), {
     relations: [
-      { relation: tutorialSchema.projects, path: ['workspace', 'projects'] },
-      { relation: tutorialSchema.people, path: ['workspace', 'people'] },
-      { relation: tutorialSchema.tasks, path: ['workspace', 'tasks'] }
+      { relation: realEstateSchema.agents, path: ['market', 'agents'] },
+      { relation: realEstateSchema.buyers, path: ['market', 'buyers'] },
+      { relation: realEstateSchema.properties, path: ['market', 'properties'] },
+      { relation: realEstateSchema.rooms, path: ['market', 'rooms'] },
+      { relation: realEstateSchema.offers, path: ['market', 'offers'] },
+      { relation: realEstateSchema.decisions, path: ['market', 'decisions'] },
+      { relation: realEstateSchema.commissionRates, path: ['market', 'commissionRates'] }
     ]
   });
 
@@ -388,79 +824,122 @@ export function createAutomergeTutorialBacking(): AutomergeTutorialBacking {
   };
 }
 
-export async function runBoostGuideTransaction(store: TarstateDbStore): Promise<TarstateTransactResult> {
-  const current = taskById(store.getSnapshot().db, 'task-guide');
-  return store.transact(updateByKey(tutorialSchema.tasks, 'task-guide', {
-    status: 'doing',
-    points: (current?.points ?? 0) + 2
-  }));
+export function buildPlaygroundQuery(
+  queryId: QueryExampleId,
+  filters: PlaygroundFilters = {}
+): Query<PlaygroundRow> {
+  const example = queryExampleById(queryId);
+  const active = new Set<keyof PlaygroundFilters>(example.filters);
+  let query = example.query;
+
+  if (active.has('agentId') && hasFilterValue(filters.agentId)) {
+    query = pipe(query, where(eq(row.agentId, env('agentId')))) as Query<PlaygroundRow>;
+  }
+  if (active.has('areaCode') && hasFilterValue(filters.areaCode)) {
+    query = pipe(query, where(eq(row.areaCode, env('areaCode')))) as Query<PlaygroundRow>;
+  }
+  if (active.has('priceBand') && hasFilterValue(filters.priceBand)) {
+    query = pipe(query, where(eq(row.priceBand, env('priceBand')))) as Query<PlaygroundRow>;
+  }
+  if (active.has('buyerId') && hasFilterValue(filters.buyerId)) {
+    query = pipe(query, where(eq(row.buyerId, env('buyerId')))) as Query<PlaygroundRow>;
+  }
+  if (active.has('listingState') && hasFilterValue(filters.listingState)) {
+    query = pipe(query, where(eq(row.listingState, env('listingState')))) as Query<PlaygroundRow>;
+  }
+  if (active.has('minPrice') && typeof filters.minPrice === 'number') {
+    query = pipe(query, where(gte(row.price, env('minPrice')))) as Query<PlaygroundRow>;
+  }
+  if (active.has('maxPrice') && typeof filters.maxPrice === 'number') {
+    query = pipe(query, where(lte(row.price, env('maxPrice')))) as Query<PlaygroundRow>;
+  }
+
+  return query;
 }
 
-export async function runCompleteGuideTransaction(store: TarstateDbStore): Promise<TarstateTransactResult> {
-  return store.transact(updateByKey(tutorialSchema.tasks, 'task-guide', {
-    status: 'done'
-  }));
+export function playgroundEnvForFilters(filters: PlaygroundFilters): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(filters).filter(([, item]) =>
+    item !== undefined && item !== '' && item !== 'all'
+  ));
 }
 
-export async function runInvalidTutorialTransaction(store: TarstateDbStore): Promise<TarstateTransactResult> {
-  return store.transact(
-    insert(tutorialSchema.tasks, {
-      id: 'task-invalid',
-      projectId: 'project-missing',
-      ownerId: 'person-missing',
-      status: 'todo',
-      points: -1
-    } as TaskRow),
-    insert(tutorialSchema.tasks, {
-      id: 'task-duplicate',
-      projectId: 'project-launch',
-      ownerId: 'person-ada',
-      title: 'Ship query API',
-      status: 'todo',
-      points: 1
-    })
-  );
+export async function runPlaygroundQuery(
+  currentDb: Db,
+  queryId: QueryExampleId,
+  filters: PlaygroundFilters = {}
+): Promise<readonly PlaygroundRow[]> {
+  return qRows(currentDb, buildPlaygroundQuery(queryId, filters), {
+    env: playgroundEnvForFilters(filters)
+  });
 }
 
-export async function runAutomergeQuery(backing: AutomergeTutorialBacking): Promise<readonly TaskCard[]> {
+export async function runAcceptHarbourOfferTransaction(
+  store: TarstateDbStore
+): Promise<TarstateTransactResult> {
+  return store.transact(...acceptHarbourOfferInputs());
+}
+
+export function acceptHarbourOfferInputs() {
+  return [insert(realEstateSchema.decisions, {
+    id: 'decision-harbour-accepted',
+    offerId: 'offer-harbour-mia-1',
+    decidedAt: '2021-11-05',
+    accepted: true,
+    saleSpeed: saleSpeed('2021-10-11', '2021-11-05')
+  })];
+}
+
+export async function runAddMillOfferTransaction(store: TarstateDbStore): Promise<TarstateTransactResult> {
+  return store.transact(...addMillOfferInputs());
+}
+
+export function addMillOfferInputs() {
+  return [insert(realEstateSchema.offers, {
+    id: 'offer-mill-mia-1',
+    propertyId: 'property-mill',
+    buyerId: 'buyer-mia',
+    offeredAt: '2021-10-29',
+    amount: 1680000
+  })];
+}
+
+export async function runRejectGardenLatestTransaction(
+  store: TarstateDbStore
+): Promise<TarstateTransactResult> {
+  return store.transact(...rejectGardenLatestInputs());
+}
+
+export function rejectGardenLatestInputs() {
+  return [insert(realEstateSchema.decisions, {
+    id: 'decision-garden-latest-rejected',
+    offerId: 'offer-garden-nico-2',
+    decidedAt: '2021-10-25',
+    accepted: false,
+    saleSpeed: saleSpeed('2021-10-18', '2021-10-25')
+  })];
+}
+
+export async function runInvalidOfferAfterAcceptedTransaction(
+  store: TarstateDbStore
+): Promise<TarstateTransactResult> {
+  return store.transact(...invalidOfferAfterAcceptedInputs());
+}
+
+export function invalidOfferAfterAcceptedInputs() {
+  return [insert(realEstateSchema.offers, {
+    id: 'offer-elm-late-invalid',
+    propertyId: 'property-elm',
+    buyerId: 'buyer-mia',
+    offeredAt: '2021-10-30',
+    amount: -1
+  })];
+}
+
+export async function runAutomergeListingRows(
+  backing: AutomergeRealEstateBacking
+): Promise<readonly ListingRow[]> {
   const snapshot = await backing.relic.getSnapshot();
-  return qRows(snapshot.db, openTaskCardsQuery);
-}
-
-export function tutorialIndexViewsForDb(currentDb: Db): TutorialIndexViews {
-  const setView = index<TaskCard>(currentDb, openTaskCardsQuery);
-  const byStatus = index<TaskCard, string>(currentDb, openTaskCardsQuery, {
-    kind: 'hash',
-    field: 'status'
-  });
-  const byProject = index<TaskCard, string>(currentDb, openTaskCardsQuery, {
-    kind: 'hash',
-    field: 'projectId'
-  });
-  const byPoints = index<TaskCard, number>(currentDb, openTaskCardsQuery, {
-    kind: 'btree',
-    field: 'points'
-  });
-  const uniqueByTitle = index<TaskCard, string>(currentDb, openTaskCardsQuery, {
-    kind: 'unique',
-    field: 'title'
-  });
-
-  return {
-    setRawKind: collectionKind(setView.raw),
-    setTitles: [...setView.raw].map((row) => row.title),
-    statusRawKind: collectionKind(byStatus.raw),
-    todoTitles: rowsFromNested(byStatus.raw.get('todo')).map((row) => row.title),
-    statusEntries: [...byStatus.raw].map(([key, rows]) => `${key}:${rowsFromNested(rows).length}`),
-    projectRawKind: collectionKind(byProject.raw),
-    launchTitles: rowsFromNested(byProject.raw.get('project-launch')).map((row) => row.title),
-    pointsRawKind: collectionKind(byPoints.raw),
-    pointsOrdered: byPoints.ordered,
-    pointsRangeTitles: byPoints.range({ lower: { value: 3 } }).map((row) => row.title),
-    uniqueRawKind: collectionKind(uniqueByTitle.raw),
-    uniqueDocsOwner: ownerFromUnique(uniqueByTitle.raw.get('Write React guide')),
-    uniqueEntries: [...uniqueByTitle.raw].map(([key, row]) => `${key}:${ownerFromUnique(row)}`)
-  };
+  return qRows(snapshot.db, listingRowsQuery);
 }
 
 export function readableDiagnostics(diagnostics: readonly TarstateDiagnostic[]): readonly ReadableDiagnostic[] {
@@ -469,297 +948,234 @@ export function readableDiagnostics(diagnostics: readonly TarstateDiagnostic[]):
     const error = typeof detail.error === 'string' ? detail.error : diagnostic.code;
     return {
       code: diagnostic.code,
-      label: readableError(error),
-      relation: typeof diagnostic.relation === 'string' ? diagnostic.relation.replace(/^query:/, '') : 'unknown',
-      field: typeof diagnostic.field === 'string' ? diagnostic.field : 'unknown'
+      label: readableError(error, diagnostic.code),
+      relation: typeof diagnostic.relation === 'string' ? diagnostic.relation.replace(/^query:/, 'query') : 'unknown',
+      field: typeof diagnostic.field === 'string' && diagnostic.field !== ''
+        ? diagnostic.field
+        : diagnostic.code === 'constraint_check' ? 'amount' : 'unknown'
     };
   });
 }
 
-export function TutorialApp({ model }: { readonly model: TutorialModel }): ReactElement {
+export function RealEstateApp({ model }: { readonly model: RealEstateModel }): ReactElement {
   return createElement(
     TarstateProvider,
     { store: model.store },
-    createElement(TutorialWalkthrough, { automerge: model.automerge })
+    createElement(RealEstateWalkthrough, { automerge: model.automerge })
   );
 }
 
-export function TutorialWalkthrough({
+export function RealEstateWalkthrough({
   automerge
 }: {
-  readonly automerge: AutomergeTutorialBacking;
+  readonly automerge: AutomergeRealEstateBacking;
 }): ReactElement {
-  const currentDb = useDb();
-  const store = useTarstateStore();
-  const query = useQuery(openTaskCardsQuery, {
-    select: (rows) => ({
-      openTasks: rows.length,
-      totalPoints: rows.reduce((total, row) => total + row.points, 0)
-    })
-  });
-  const materializedCards = useMaterialized(openTaskCardsQuery);
-  const materializedSummary = useMaterialized(projectSummaryQuery);
-  const watch = useWatch(openTaskCardsQuery, undefined, { keyBy: ['id'] });
-  const indexes = useMemo(() => tutorialIndexViewsForDb(currentDb), [currentDb]);
-  const metadata = materializationForQuery(currentDb, openTaskCardsQuery);
+  const transact = useTransact();
+  const [factTab, setFactTab] = useState<keyof typeof realEstateSchema>('properties');
+  const [queryId, setQueryId] = useState<QueryExampleId>('propertyInfo');
+  const [filters, setFilters] = useState<PlaygroundFilters>({});
   const [transactionText, setTransactionText] = useState('No transaction run yet.');
   const [diagnostics, setDiagnostics] = useState<readonly ReadableDiagnostic[]>([]);
-  const [automergeRows, setAutomergeRows] = useState<readonly TaskCard[]>([]);
-  const [invalidExample, setInvalidExample] = useState<InvalidDataExample | undefined>();
-  const seed = seedTutorialData();
+  const [automergeRows, setAutomergeRows] = useState<readonly ListingRow[]>([]);
+  const example = queryExampleById(queryId);
+  const envValues = useMemo(() => playgroundEnvForFilters(filters), [filters]);
+  const playgroundQuery = useMemo(() => buildPlaygroundQuery(queryId, filters), [queryId, filters]);
+  const playground = useQuery(playgroundQuery, {
+    env: envValues,
+    deps: [queryId, filters.agentId, filters.areaCode, filters.priceBand, filters.buyerId, filters.listingState, filters.minPrice, filters.maxPrice]
+  });
+  const materializedListings = useMaterialized(listingRowsQuery);
+  const materializedCommission = useMaterialized(commissionDueQuery);
+  const watch = useWatch(listingRowsQuery, undefined, { keyBy: ['id'] });
+  const seed = seedRealEstateData();
 
-  useEffect(() => {
-    let active = true;
-    void buildInvalidDataExample().then((example) => {
-      if (active) setInvalidExample(example);
-    }).catch((error: unknown) => {
-      if (active) {
-        setInvalidExample({
-          invalidRow: {},
-          rows: [],
-          diagnostics: [{
-            code: 'example_error',
-            label: error instanceof Error ? error.message : String(error),
-            relation: 'tutorial',
-            field: 'invalid-data'
-          }]
-        });
-      }
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  const boostGuide = async (): Promise<void> => {
-    const before = taskById(store.getSnapshot().db, 'task-guide');
-    const result = await runBoostGuideTransaction(store);
-    const after = taskById(result.db, 'task-guide');
-    setTransactionText(
-      result.committed
-        ? `task-guide points: ${before?.points ?? 'missing'} -> ${after?.points ?? 'missing'}; store revision ${result.revision}`
-        : `Rejected: ${result.diagnostics.map((item) => item.code).join(', ')}`
-    );
+  const runTransaction = async (
+    label: string,
+    inputs: readonly DbTransactionInput[]
+  ): Promise<void> => {
+    const result = await transact(...inputs);
+    setTransactionText(result.committed
+      ? `${label}: committed at revision ${result.revision}`
+      : `${label}: rejected (${readableDiagnostics(result.diagnostics).map((item) => item.code).join(', ')})`);
   };
 
-  const completeGuide = async (): Promise<void> => {
-    await runCompleteGuideTransaction(store);
-  };
-
-  const tryInvalidWrite = async (): Promise<void> => {
-    const result = await runInvalidTutorialTransaction(store);
+  const runInvalid = async (): Promise<void> => {
+    const result = await transact(...invalidOfferAfterAcceptedInputs());
     setDiagnostics(readableDiagnostics(result.diagnostics));
+    setTransactionText(result.committed ? 'Invalid offer unexpectedly committed.' : 'Invalid offer rejected.');
   };
 
-  const queryAutomerge = async (): Promise<void> => {
-    setAutomergeRows(await runAutomergeQuery(automerge));
+  const runAutomerge = async (): Promise<void> => {
+    setAutomergeRows(await runAutomergeListingRows(automerge));
   };
 
   return createElement(
     'main',
-    { className: 'page', 'data-tutorial': 'TarstateWalkthrough' },
-    createElement('header', { className: 'hero' },
-      createElement('p', { className: 'eyebrow' }, 'Tarstate React walkthrough'),
-      createElement('h1', null, 'Relational state for React, one query at a time'),
-      createElement('p', { className: 'dek' },
-        'Tarstate helps when nested app objects start duplicating data. Put rows in small relations, describe reads as query values, and reuse those values for React hooks, transactions, materialized views, indexes, constraints, watchers, and pluggable backing stores.'
+    { className: 'page', 'data-demo': 'RealEstateWalkthrough' },
+    createElement('header', { className: 'page-title' },
+      createElement('h1', null, 'Real estate queries'),
+      createElement('p', null, 'Relic-style query values over plain property sale facts.')
+    ),
+    section(
+      'facts',
+      '1. Facts',
+      'Small normalized maps. The rest of the page reuses these rows.',
+      codeBlock(`const db = createDb({
+  properties, rooms, offers, decisions,
+  agents, buyers, commissionRates
+});`),
+      factsPanel(seed, factTab, setFactTab)
+    ),
+    section(
+      'playground',
+      '2. Query playground',
+      'Pick a query, set env filters, and read the result table.',
+      codeBlock(example.snippet),
+      controlsPanel(queryId, setQueryId, filters, setFilters),
+      resultTable(example.columns, playground.rows, { table: 'playground' })
+    ),
+    section(
+      'materialized',
+      '3. Materialized views',
+      'The same query values can be materialized and read through React.',
+      codeBlock(`await store.materialize(listingRowsQuery, { id: 'listing-rows' });
+await store.materialize(commissionDueQuery, { id: 'commission-due' });
+
+const listings = useMaterialized(listingRowsQuery);`),
+      metricGrid(
+        metric('Materialized listings', `${materializedListings.rows.length} rows`),
+        metric('Materialized commission', `${materializedCommission.rows.length} rows`)
       ),
-      createElement('div', { className: 'api-strip', 'aria-label': 'Hook API' },
-        ...['createDbStore', 'TarstateProvider', 'useQuery', 'useTransact', 'useMaterialized', 'useWatch'].map((name) =>
-          createElement('code', { key: name }, name)
-        )
-      )
+      resultTable(['id', 'address', 'agentName', 'price', 'listingState'], materializedListings.rows, { table: 'materialized-listings' }),
+      resultTable(['agentName', 'sales', 'saleVolume', 'commissionDue'], materializedCommission.rows, { table: 'materialized-commission' })
     ),
-    tutorialSection(
-      '01',
-      'Why normalized relational state',
-      'Avoid duplicated nested objects',
-      'Instead of copying the same person or project into every task, keep each concept once and join rows when the UI needs a view.',
-      codeBlock(`// Nested state duplicates owners and projects in every task.
-task.owner.name
-task.project.name
-
-// Tarstate keeps rows separate.
-people[id]
-projects[id]
-tasks[id].ownerId`),
-      outputGrid(
-        metric('Nested change', 'Rename Ada in every copied task'),
-        metric('Normalized change', 'Rename one people row')
-      )
-    ),
-    tutorialSection(
-      '02',
-      'Tiny schema and seed rows',
-      'Three relations, one stable example',
-      'The rest of the walkthrough uses these same projects, people, and tasks so the concepts build instead of resetting context.',
-      codeBlock(`const schema = defineSchema({
-  projects: relation({ key: 'id', fields: { id, name } }),
-  people: relation({ key: 'id', fields: { id, name, active } }),
-  tasks: relation({ key: 'id', fields: { id, projectId, ownerId, title, status, points } })
-});
-
-const store = createDbStore(db(seedRows));`),
-      outputGrid(
-        metric('Relations', Object.keys(tutorialSchema).join(', ')),
-        metric('Seed rows', `${seed.projects?.length ?? 0} projects / ${seed.people?.length ?? 0} people / ${seed.tasks?.length ?? 0} tasks`)
-      ),
-      seedTables(seed)
-    ),
-    tutorialSection(
-      '03',
-      'Invalid rows become diagnostics',
-      'Valid rows still query cleanly',
-      'Tarstate validates relation rows while reading. A malformed row is omitted from the query result and reported as a diagnostic the UI can render.',
-      codeBlock(`// points should be a number.
-{ id: 'task-broken', title: 'Estimate migration', points: 'many' }
-
-const result = await q(db(data), openTaskCards);
-result.rows        // valid task cards only
-result.diagnostics // invalid_row / tasks / points`),
-      outputGrid(
-        metric('Invalid row', invalidExample === undefined ? 'loading' : `points=${String(invalidExample.invalidRow.points)}`),
-        metric('Rows returned', invalidExample?.rows.length ?? 'loading'),
-        metric('Diagnostics', invalidExample?.diagnostics.map((item) => `${item.code}/${item.relation}/${item.field}`).join(', ') ?? 'loading')
-      )
-    ),
-    tutorialSection(
-      '04',
-      'Query as data',
-      'Inspect it, run it, reuse it',
-      'A query is a value. React uses the same value that tests, materialization, indexes, constraints, and Automerge can use.',
-      codeBlock(`const openTaskCards = pipe(
-  from(task),
-  where(neq(task.status, 'done')),
-  join(from(project), eq(task.projectId, project.id)),
-  leftJoin(from(person), eq(task.ownerId, person.id)),
-  project({ title: task.title, project: project.name, owner: maybe(person.name), points: task.points }),
-  keyBy('id')
-);
-
-const { rows } = useQuery(openTaskCards);`),
-      outputGrid(
-        metric('Query op', openTaskCardsQuery.data.op),
-        metric('React status', query.status),
-        metric('Open output', `${query.data?.openTasks ?? 0} rows / ${query.data?.totalPoints ?? 0} points`)
-      ),
-      taskTable(query.rows)
-    ),
-    tutorialSection(
-      '05',
-      'Transactions are immutable changes',
-      'Compute from the current DB, publish a new DB',
-      'useTransact runs writes against the current immutable database. The result includes the previous DB, next DB, diagnostics, and commit status.',
+    section(
+      'transactions',
+      '4. Transactions',
+      'Writes use the same relations and immediately change query output.',
       codeBlock(`const transact = useTransact();
-const task = db.data.tasks.find((row) => row.id === 'task-guide');
-
-await transact(updateByKey(schema.tasks, 'task-guide', {
-  status: 'doing',
-  points: task.points + 2
+await transact(insert(schema.decisions, {
+  id: 'decision-harbour-accepted',
+  offerId: 'offer-harbour-mia-1',
+  accepted: true
 }));`),
-      outputGrid(
-        metric('Last transaction', transactionText),
-        metric('task-guide row', guideTaskText(currentDb))
-      ),
-      actionRow(button('boost-guide', 'Run computed update', () => void boostGuide()))
+      metricGrid(metric('Last transaction', transactionText)),
+      actionRow(
+        actionButton('accept-harbour', 'Accept harbour offer', () => void runTransaction('Accept harbour', acceptHarbourOfferInputs())),
+        actionButton('add-mill-offer', 'Add mill offer', () => void runTransaction('Add mill offer', addMillOfferInputs())),
+        actionButton('reject-garden-latest', 'Reject garden latest', () => void runTransaction('Reject garden latest', rejectGardenLatestInputs()))
+      )
     ),
-    tutorialSection(
-      '06',
-      'Derived and materialized views',
-      'The same query can be cached for React reads',
-      'Materialization keeps a derived view available on the provider DB. Here the live output is an aggregate dashboard over open tasks.',
-      codeBlock(`await store.materialize(openTaskCards, { id: 'open-task-cards' });
-await store.materialize(projectSummary, { id: 'project-summary' });
-
-const cards = useMaterialized(openTaskCards);
-const summary = useMaterialized(projectSummary);`),
-      outputGrid(
-        metric('Cards materialized', materializedCards.materialized ? 'yes' : 'no'),
-        metric('Metadata id', metadata?.id ?? 'missing'),
-        metric('Dependencies', (metadata?.dependencies ?? []).join(', ') || 'none')
-      ),
-      summaryTable(materializedSummary.rows)
-    ),
-    tutorialSection(
-      '07',
-      'Indexes over materialized rows',
-      'Concrete Set and Map lookups',
-      'Indexes expose simple raw shapes: a Set for all rows and Maps for hash, btree, and unique lookup paths.',
-      codeBlock(`const all = index(db, openTaskCards);               // raw Set
-const byStatus = index(db, openTaskCards, { kind: 'hash', field: 'status' });   // raw Map
-const byPoints = index(db, openTaskCards, { kind: 'btree', field: 'points' });  // raw Map
-const byTitle = index(db, openTaskCards, { kind: 'unique', field: 'title' });   // raw Map`),
-      indexOutput(indexes)
-    ),
-    tutorialSection(
-      '08',
-      'Constraints reject bad writes',
-      'Readable diagnostics instead of silent drift',
-      'This section attaches query-bound required, unique, foreign-key, and check constraints to the same task rows.',
-      codeBlock(`const constrained = mat(db(seedRows), constrain(
-  req(openTasks, 'title'),
-  unique(openTasks, 'title'),
-  fk(openTasks, 'ownerId', schema.people, 'id'),
-  check(openTasks, gt(field('task', 'points'), value(0)))
-));`),
-      actionRow(button('invalid-write', 'Try invalid write', () => void tryInvalidWrite())),
+    section(
+      'diagnostics',
+      '5. Constraints/diagnostics',
+      'Rejected writes return readable diagnostics and leave query rows unchanged.',
+      codeBlock(`constrain(
+  fk(offers, 'propertyId', properties, 'id'),
+  fk(offers, 'buyerId', buyers, 'id'),
+  check(offers, amount > 0),
+  unique(decisions, 'offerId')
+)`),
+      actionRow(actionButton('invalid-offer', 'Try offer after accepted sale', () => void runInvalid())),
       diagnosticsList(diagnostics)
     ),
-    tutorialSection(
-      '09',
-      'Watch and track changes',
-      'The same query reports added and deleted rows',
-      'useWatch compares query rows across provider revisions. Marking the guide task done removes it from the open-task query, so the deleted alias becomes concrete.',
-      codeBlock(`const watch = useWatch(openTaskCards, undefined, { keyBy: ['id'] });
-
-watch.event?.added
-watch.event?.deleted`),
-      outputGrid(
+    section(
+      'watch',
+      '6. Watch',
+      'useWatch tracks added and deleted listing rows across transactions.',
+      codeBlock(`const watch = useWatch(listingRowsQuery, undefined, {
+  keyBy: ['id']
+});`),
+      metricGrid(
         metric('Watch events', watch.events.length),
-        metric('Last added', watch.event?.added.map((row) => row.title).join(', ') || 'none'),
-        metric('Last deleted', watch.event?.deleted.map((row) => row.title).join(', ') || 'none')
-      ),
-      actionRow(button('complete-guide', 'Mark guide done', () => void completeGuide()))
+        metric('Watch added', watch.event?.added.map((item) => item.id).join(', ') || 'none'),
+        metric('Watch deleted', watch.event?.deleted.map((item) => item.id).join(', ') || 'none')
+      )
     ),
-    tutorialSection(
-      '10',
-      'Pluggable backing',
-      'Automerge can feed the same query shape',
-      'automergeDb adapts a collaborative document into the same relational snapshot. The query does not change.',
-      codeBlock(`const relic = automergeDb(doc, {
-  relations: [{ relation: schema.tasks, path: ['workspace', 'tasks'] }]
-});
-
-const snapshot = await relic.getSnapshot();
-const rows = await qRows(snapshot.db, openTaskCards);`),
-      outputGrid(
+    section(
+      'automerge',
+      '7. Automerge',
+      'The listing query runs against an Automerge-backed snapshot without changing query shape.',
+      codeBlock(`const snapshot = await automergeDb(doc, { relations }).getSnapshot();
+const rows = await qRows(snapshot.db, listingRowsQuery);`),
+      metricGrid(
         metric('Automerge heads', automerge.beforeHeads.length),
-        metric('Rows from Automerge', automergeRows.length === 0 ? 'not run' : automergeRows.map((row) => row.title).join(', '))
+        metric('Automerge rows', automergeRows.length === 0 ? 'not run' : `${automergeRows.length}: ${automergeRows.map((item) => item.id).join(', ')}`)
       ),
-      actionRow(button('run-automerge', 'Run query on Automerge snapshot', () => void queryAutomerge()))
+      actionRow(actionButton('run-automerge', 'Run listing query', () => void runAutomerge()))
     )
   );
 }
 
-function tutorialSection(
-  step: string,
+function propertyRow(
+  id: string,
+  address: string,
+  price: number,
+  agentId: string,
+  registeredAt: string,
+  photo: string
+): PropertyRow {
+  return {
+    id,
+    address,
+    price,
+    agentId,
+    registeredAt,
+    photo,
+    areaCode: areaCode(address),
+    priceBand: priceBand(price)
+  };
+}
+
+function buyerRow(id: string, name: string, address: string): BuyerRow {
+  return {
+    id,
+    name,
+    address,
+    areaCode: areaCode(address)
+  };
+}
+
+function roomRow(id: string, propertyId: string, name: string, width: number, length: number): RoomRow {
+  return {
+    id,
+    propertyId,
+    name,
+    width,
+    length,
+    squareFeet: width * length
+  };
+}
+
+function queryExampleById(queryId: QueryExampleId) {
+  return queryExamples.find((item) => item.id === queryId) ?? queryExamples[0]!;
+}
+
+function hasFilterValue(valueAtFilter: string | undefined): boolean {
+  return valueAtFilter !== undefined && valueAtFilter !== '' && valueAtFilter !== 'all';
+}
+
+function rowsById<Row extends { readonly id: string }>(rows: readonly Row[]): Record<string, StoredRow<Row>> {
+  return Object.fromEntries(rows.map((rowValue) => {
+    const { id, ...rest } = rowValue;
+    return [id, rest as StoredRow<Row>];
+  }));
+}
+
+function section(
+  id: string,
   title: string,
-  subtitle: string,
-  description: string,
+  explanation: string,
   ...children: readonly ReactElement[]
 ): ReactElement {
   return createElement(
     'section',
-    { className: 'tutorial-card', 'data-section': title },
-    createElement('div', { className: 'section-heading' },
-      createElement('span', { className: 'step' }, step),
-      createElement('div', null,
-        createElement('h2', null, title),
-        createElement('p', { className: 'subhead' }, subtitle)
-      )
+    { className: 'panel', 'data-section': id },
+    createElement('div', { className: 'section-head' },
+      createElement('h2', null, title),
+      createElement('p', null, explanation)
     ),
-    createElement('p', { className: 'section-copy' }, description),
-    createElement('div', { className: 'section-body' }, ...children)
+    createElement('div', { className: 'section-grid' }, ...children)
   );
 }
 
@@ -767,125 +1183,223 @@ function codeBlock(source: string): ReactElement {
   return createElement('pre', { className: 'snippet' }, createElement('code', null, source));
 }
 
-function outputGrid(...children: readonly ReactElement[]): ReactElement {
-  return createElement('div', { className: 'output-grid' }, ...children);
+function factsPanel(
+  seed: Db['data'],
+  active: keyof typeof realEstateSchema,
+  setActive: (value: keyof typeof realEstateSchema) => void
+): ReactElement {
+  const relationNames = Object.keys(realEstateSchema) as (keyof typeof realEstateSchema)[];
+  const rows = (seed[active] ?? []) as readonly Record<string, unknown>[];
+  const columns = columnsForRows(rows).slice(0, 7);
+
+  return createElement(
+    'div',
+    { className: 'facts' },
+    createElement('div', { className: 'tabs', role: 'tablist' },
+      ...relationNames.map((name) => createElement('button', {
+        key: name,
+        type: 'button',
+        role: 'tab',
+        className: name === active ? 'tab active' : 'tab',
+        'data-fact-tab': name,
+        onClick: () => setActive(name)
+      }, `${name} (${(seed[name] ?? []).length})`))
+    ),
+    resultTable(columns, rows, { table: `facts-${active}` })
+  );
+}
+
+function controlsPanel(
+  queryId: QueryExampleId,
+  setQueryId: (value: QueryExampleId) => void,
+  filters: PlaygroundFilters,
+  setFilters: (value: PlaygroundFilters) => void
+): ReactElement {
+  const setFilter = (key: keyof PlaygroundFilters, valueAtFilter: string): void => {
+    const parsed = key === 'minPrice' || key === 'maxPrice'
+      ? numericFilter(valueAtFilter)
+      : valueAtFilter;
+    setFilters({ ...filters, [key]: parsed });
+  };
+
+  return createElement(
+    'form',
+    { className: 'controls', 'data-controls': 'playground' },
+    label('Query',
+      selectControl('query', queryId, (valueAtControl) => setQueryId(valueAtControl as QueryExampleId),
+        queryExamples.map((item) => [item.id, item.label]))
+    ),
+    label('Agent',
+      selectControl('agent', filters.agentId ?? 'all', (valueAtControl) => setFilter('agentId', valueAtControl), [
+        ['all', 'All agents'],
+        ['agent-rose', 'Rose Patel'],
+        ['agent-bob', 'Bob Stone'],
+        ['agent-uma', 'Uma Reid']
+      ])
+    ),
+    label('Area',
+      selectControl('area', filters.areaCode ?? 'all', (valueAtControl) => setFilter('areaCode', valueAtControl), [
+        ['all', 'All areas'],
+        ['55', '55'],
+        ['42', '42'],
+        ['17', '17']
+      ])
+    ),
+    label('Band',
+      selectControl('price-band', filters.priceBand ?? 'all', (valueAtControl) => setFilter('priceBand', valueAtControl), [
+        ['all', 'All bands'],
+        ['low', 'low'],
+        ['med', 'med'],
+        ['high', 'high'],
+        ['premium', 'premium']
+      ])
+    ),
+    label('Buyer',
+      selectControl('buyer', filters.buyerId ?? 'all', (valueAtControl) => setFilter('buyerId', valueAtControl), [
+        ['all', 'All buyers'],
+        ['buyer-alice', 'Alice Hart'],
+        ['buyer-mia', 'Mia Chen'],
+        ['buyer-nico', 'Nico Ford']
+      ])
+    ),
+    label('State',
+      selectControl('listing-state', filters.listingState ?? 'all', (valueAtControl) => setFilter('listingState', valueAtControl), [
+        ['all', 'All states'],
+        ['listed', 'listed'],
+        ['sold', 'sold']
+      ])
+    ),
+    label('Min price',
+      inputControl('min-price', filters.minPrice, (valueAtControl) => setFilter('minPrice', valueAtControl))
+    ),
+    label('Max price',
+      inputControl('max-price', filters.maxPrice, (valueAtControl) => setFilter('maxPrice', valueAtControl))
+    )
+  );
+}
+
+function selectControl(
+  name: string,
+  selected: string,
+  onChange: (valueAtControl: string) => void,
+  options: readonly (readonly [string, string])[]
+): ReactElement {
+  const htmlName = htmlControlName(name);
+  return createElement(
+    'select',
+    {
+      id: `playground-${htmlName}`,
+      name: htmlName,
+      value: selected,
+      'data-control': name,
+      onChange: (event: { readonly target: { readonly value: string } }) => onChange(event.target.value)
+    },
+    ...options.map(([valueAtOption, labelText]) =>
+      createElement('option', { key: valueAtOption, value: valueAtOption }, labelText)
+    )
+  );
+}
+
+function inputControl(
+  name: string,
+  valueAtInput: number | undefined,
+  onChange: (valueAtControl: string) => void
+): ReactElement {
+  const htmlName = htmlControlName(name);
+  return createElement('input', {
+    id: `playground-${htmlName}`,
+    name: htmlName,
+    type: 'number',
+    inputMode: 'numeric',
+    value: valueAtInput ?? '',
+    'data-control': name,
+    onChange: (event: { readonly target: { readonly value: string } }) => onChange(event.target.value)
+  });
+}
+
+function htmlControlName(dataControl: string): string {
+  switch (dataControl) {
+    case 'price-band':
+      return 'band';
+    case 'listing-state':
+      return 'state';
+    case 'min-price':
+      return 'minPrice';
+    case 'max-price':
+      return 'maxPrice';
+    default:
+      return dataControl;
+  }
+}
+
+function label(text: string, control: ReactElement): ReactElement {
+  return createElement('label', null, createElement('span', null, text), control);
+}
+
+function numericFilter(input: string): number | undefined {
+  if (input.trim() === '') return undefined;
+  const parsed = Number(input);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function metricGrid(...children: readonly ReactElement[]): ReactElement {
+  return createElement('div', { className: 'metrics' }, ...children);
+}
+
+function metric(labelText: string, valueText: string | number): ReactElement {
+  return createElement(
+    'div',
+    { className: 'metric', 'data-metric': labelText },
+    createElement('span', null, labelText),
+    createElement('strong', null, String(valueText))
+  );
 }
 
 function actionRow(...children: readonly ReactElement[]): ReactElement {
   return createElement('div', { className: 'actions' }, ...children);
 }
 
-function metric(label: string, value: string | number): ReactElement {
-  return createElement(
-    'div',
-    { className: 'metric', 'data-metric': label },
-    createElement('span', null, label),
-    createElement('strong', null, String(value))
-  );
+function actionButton(action: string, labelText: string, onClick: () => void): ReactElement {
+  return createElement('button', { type: 'button', 'data-action': action, onClick }, labelText);
 }
 
-function seedTables(seed: Db['data']): ReactElement {
+function resultTable(
+  columns: readonly string[],
+  rows: readonly unknown[],
+  options: { readonly table: string }
+): ReactElement {
   return createElement(
     'div',
-    { className: 'mini-tables' },
-    miniTable('projects', ['id', 'name'], seed.projects ?? []),
-    miniTable('people', ['id', 'name', 'active'], seed.people ?? []),
-    miniTable('tasks', ['id', 'projectId', 'ownerId', 'status', 'points'], seed.tasks ?? [])
-  );
-}
-
-function miniTable(title: string, columns: readonly string[], rows: readonly unknown[]): ReactElement {
-  return createElement(
-    'div',
-    { className: 'mini-table', 'data-table': title },
-    createElement('h3', null, title),
+    { className: 'table-wrap', 'data-table': options.table, 'data-row-count': rows.length },
     createElement('table', null,
       createElement('thead', null,
-        createElement('tr', null, ...columns.map((column) => createElement('th', { key: column }, column)))
+        createElement('tr', null,
+          ...columns.map((column) => createElement('th', { key: column }, column))
+        )
       ),
       createElement('tbody', null,
-        ...rows.map((row, indexValue) =>
-          createElement('tr', { key: `${title}-${indexValue}` },
-            ...columns.map((column) => createElement('td', { key: column }, cellValue(row, column)))
-          )
-        )
+        ...(rows.length === 0
+          ? [createElement('tr', { key: 'empty' },
+              createElement('td', { colSpan: columns.length || 1 }, 'No rows')
+            )]
+	          : rows.map((inputRow, indexValue) => {
+	              const rowValue = isRecord(inputRow) ? inputRow : {};
+	              const key = rowKey(rowValue, indexValue);
+	              const rowId = typeof rowValue.id === 'string' || typeof rowValue.id === 'number'
+	                ? String(rowValue.id)
+	                : key;
+	              return (
+	              createElement('tr', {
+	                key,
+	                'data-row-id': rowId
+	              },
+              ...columns.map((column) =>
+                createElement('td', { key: column }, displayCell(rowValue[column]))
+              ))
+              );
+            }))
       )
     )
-  );
-}
-
-function taskTable(rows: readonly TaskCard[]): ReactElement {
-  return createElement(
-    'table',
-    { className: 'result-table', 'data-rows': rows.length },
-    createElement('thead', null,
-      createElement('tr', null,
-        createElement('th', null, 'title'),
-        createElement('th', null, 'project'),
-        createElement('th', null, 'owner'),
-        createElement('th', null, 'status'),
-        createElement('th', null, 'points')
-      )
-    ),
-    createElement('tbody', null,
-      ...rows.map((row) =>
-        createElement('tr', { key: row.id, 'data-row-id': row.id },
-          createElement('td', null, row.title),
-          createElement('td', null, row.project),
-          createElement('td', null, row.owner ?? 'missing'),
-          createElement('td', null, row.status),
-          createElement('td', null, row.points)
-        )
-      )
-    )
-  );
-}
-
-function summaryTable(rows: readonly ProjectSummary[]): ReactElement {
-  return createElement(
-    'table',
-    { className: 'result-table', 'data-summary-rows': rows.length },
-    createElement('thead', null,
-      createElement('tr', null,
-        createElement('th', null, 'projectId'),
-        createElement('th', null, 'openTasks'),
-        createElement('th', null, 'points'),
-        createElement('th', null, 'average')
-      )
-    ),
-    createElement('tbody', null,
-      ...rows.map((row) =>
-        createElement('tr', { key: row.projectId, 'data-summary-id': row.projectId },
-          createElement('td', null, row.projectId),
-          createElement('td', null, row.openTasks),
-          createElement('td', null, row.points),
-          createElement('td', null, Math.round(row.averagePoints))
-        )
-      )
-    )
-  );
-}
-
-function indexOutput(views: TutorialIndexViews): ReactElement {
-  return createElement(
-    'dl',
-    { className: 'index-output' },
-    indexLine('Set raw', `${views.setRawKind}(${views.setTitles.join(', ')})`),
-    indexLine('Map status=todo', `${views.statusRawKind} -> ${views.todoTitles.join(', ')}`),
-    indexLine('Map project=Launch', `${views.projectRawKind} -> ${views.launchTitles.join(', ')}`),
-    indexLine('Btree points', `${views.pointsRawKind} keys ${views.pointsOrdered.join(', ')}`),
-    indexLine('Btree range >= 3', views.pointsRangeTitles.join(', ')),
-    indexLine('Unique title lookup', `${views.uniqueRawKind} -> ${views.uniqueDocsOwner}`),
-    indexLine('Unique entries', String(views.uniqueEntries.length))
-  );
-}
-
-function indexLine(label: string, valueText: string): ReactElement {
-  return createElement(
-    'div',
-    { 'data-metric': label },
-    createElement('dt', null, label),
-    createElement('dd', null, createElement('strong', null, valueText))
   );
 }
 
@@ -896,92 +1410,58 @@ function diagnosticsList(diagnostics: readonly ReadableDiagnostic[]): ReactEleme
     ...(diagnostics.length === 0
       ? [createElement('li', { key: 'empty' }, 'No rejected write yet.')]
       : diagnostics.map((diagnostic, indexValue) =>
-          createElement('li', { key: `${diagnostic.code}-${indexValue}`, 'data-diagnostic-code': diagnostic.code },
-            createElement('strong', null, diagnostic.label),
-            createElement('span', null, `${diagnostic.code} / ${diagnostic.relation} / ${diagnostic.field}`)
-          )
+          createElement('li', {
+            key: `${diagnostic.code}-${indexValue}`,
+            'data-diagnostic-code': diagnostic.code
+          },
+          createElement('strong', null, diagnostic.label),
+          createElement('span', null, `${diagnostic.code} / ${diagnostic.relation} / ${diagnostic.field}`))
         ))
   );
 }
 
-function button(action: string, label: string, onClick: () => void): ReactElement {
-  return createElement('button', { type: 'button', 'data-action': action, onClick }, label);
+function columnsForRows(rows: readonly Record<string, unknown>[]): readonly string[] {
+  const first = rows[0];
+  return first === undefined ? ['id'] : Object.keys(first);
 }
 
-function taskById(currentDb: Db, id: string): TaskRow | undefined {
-  return (currentDb.data.tasks ?? []).find((row): row is TaskRow => isTaskRow(row) && row.id === id);
+function rowKey(rowValue: Record<string, unknown>, indexValue: number): string {
+  return typeof rowValue.id === 'string' ? rowValue.id : `row-${indexValue}`;
 }
 
-function guideTaskText(currentDb: Db): string {
-  const task = taskById(currentDb, 'task-guide');
-  return task === undefined ? 'missing' : `${task.status} / ${task.points} points`;
+function displayCell(input: unknown): string {
+  if (input === undefined) return '';
+  if (typeof input === 'number') return input.toLocaleString('en-US');
+  if (typeof input === 'string' || typeof input === 'boolean') return String(input);
+  return JSON.stringify(input);
 }
 
-function cellValue(row: unknown, fieldName: string): string {
-  if (!isRecord(row)) return '';
-  const valueAtField = row[fieldName];
-  return typeof valueAtField === 'string' || typeof valueAtField === 'number' || typeof valueAtField === 'boolean'
-    ? String(valueAtField)
-    : '';
-}
-
-function rowsFromNested(input: unknown): readonly TaskCard[] {
-  if (input instanceof Set) {
-    return [...input].filter(isTaskCard);
-  }
-  if (input instanceof Map) {
-    return [...input.values()].flatMap(rowsFromNested);
-  }
-  return [];
-}
-
-function ownerFromUnique(input: unknown): string {
-  if (isTaskCard(input)) return input.owner ?? 'missing';
-  if (input instanceof Map) {
-    const first = input.values().next();
-    return first.done === true ? 'missing' : ownerFromUnique(first.value);
-  }
-  return 'missing';
-}
-
-function collectionKind(input: unknown): string {
-  if (input instanceof Set) return 'Set';
-  if (input instanceof Map) return 'Map';
-  return 'unknown';
-}
-
-function readableError(error: string): string {
+function readableError(error: string, code: string): string {
   switch (error) {
     case 'required-field-violation':
       return 'Missing required field';
-    case 'unique-key-violation':
-      return 'Duplicate value';
     case 'foreign-key-violation':
       return 'Missing referenced row';
+    case 'unique-key-violation':
+      return 'Duplicate value';
     case 'check-violation':
       return 'Check failed';
-    case 'invalid_row':
-      return 'Invalid row';
     default:
-      return error;
+      switch (code) {
+        case 'duplicate_key':
+          return 'Duplicate relation key';
+        case 'constraint_fk':
+          return 'Missing referenced row';
+        case 'constraint_unique':
+          return 'Duplicate value';
+        case 'constraint_check':
+          return 'Check failed';
+        case 'constraint_req':
+          return 'Missing required field';
+        default:
+          return error;
+      }
   }
-}
-
-function isTaskRow(input: unknown): input is TaskRow {
-  return isRecord(input) &&
-    typeof input.id === 'string' &&
-    typeof input.projectId === 'string' &&
-    typeof input.ownerId === 'string' &&
-    typeof input.points === 'number';
-}
-
-function isTaskCard(input: unknown): input is TaskCard {
-  return isRecord(input) &&
-    typeof input.id === 'string' &&
-    typeof input.title === 'string' &&
-    typeof input.projectId === 'string' &&
-    typeof input.status === 'string' &&
-    typeof input.points === 'number';
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {
