@@ -1,4 +1,4 @@
-import type { PredicateData, Query } from './query.js';
+import type { ExprData, PredicateData, Query } from './query.js';
 import type { RelationRef } from './schema.js';
 
 /** Row type carried by a relation reference. */
@@ -75,6 +75,14 @@ export type QueryUniqueConstraintData<
   readonly fields: Fields;
 };
 
+export type QueryUniqueExpressionConstraintData<
+  Row = unknown,
+  Expressions extends readonly ExprData[] = readonly ExprData[]
+> = ConstraintBase<'unique'> & {
+  readonly query: Query<Row>;
+  readonly expressions: Expressions;
+};
+
 export type UniqueConstraintData<
   Relation extends RelationRef = RelationRef,
   Fields extends readonly ConstraintRelationField<Relation>[] = readonly ConstraintRelationField<Relation>[]
@@ -90,6 +98,7 @@ export type ConstraintData =
   | RequiredConstraintData
   | QueryForeignKeyConstraintData
   | ForeignKeyConstraintData
+  | QueryUniqueExpressionConstraintData
   | QueryUniqueConstraintData
   | UniqueConstraintData;
 
@@ -310,6 +319,22 @@ export function unique<Row extends Record<string, unknown>, Field extends keyof 
   options?: ConstraintOptions
 ): QueryUniqueConstraintData<Row, readonly [Field]>;
 export function unique<
+  Row,
+  Expression extends ExprData
+>(
+  query: Query<Row>,
+  expression: Expression,
+  options?: ConstraintOptions
+): QueryUniqueExpressionConstraintData<Row, readonly [Expression]>;
+export function unique<
+  Row,
+  const Expressions extends readonly ExprData[]
+>(
+  query: Query<Row>,
+  expressions: Expressions,
+  options?: ConstraintOptions
+): QueryUniqueExpressionConstraintData<Row, Expressions>;
+export function unique<
   Row extends Record<string, unknown>,
   const Fields extends readonly (keyof Row & string)[]
 >(
@@ -333,24 +358,40 @@ export function unique<
 /** Declare a uniqueness descriptor. */
 export function unique(
   relationOrQuery: RelationRef | Query,
-  fields: ConstraintRelationFields<RelationRef> | string | readonly string[],
+  fields: ConstraintRelationFields<RelationRef> | string | readonly string[] | ExprData | readonly ExprData[],
   options: ConstraintOptions = {}
-): UniqueConstraintData | QueryUniqueConstraintData {
+): UniqueConstraintData | QueryUniqueConstraintData | QueryUniqueExpressionConstraintData {
   if (isQuery(relationOrQuery)) {
+    if (isExprTupleInput(fields)) {
+      return {
+        kind: 'constraint',
+        op: 'unique',
+        query: relationOrQuery,
+        expressions: exprTuple(fields),
+        ...constraintOptions(options)
+      };
+    }
+
     return {
       kind: 'constraint',
       op: 'unique',
       query: relationOrQuery as Query<Record<string, unknown>>,
-      fields: fieldTuple(fields),
+      fields: fieldTuple(fields as ConstraintRelationFields<RelationRef> | string | readonly string[]),
       ...constraintOptions(options)
     };
+  }
+
+  if (isExprTupleInput(fields)) {
+    throw new TypeError(
+      'unique(relation, expression) is not supported; project the expression into a query field or use unique(query, expression)'
+    );
   }
 
   return {
     kind: 'constraint',
     op: 'unique',
     relation: relationOrQuery,
-    fields: fieldTuple(fields),
+    fields: fieldTuple(fields as ConstraintRelationFields<RelationRef> | string | readonly string[]),
     ...constraintOptions(options)
   };
 }
@@ -371,7 +412,7 @@ export function constrain(
     return {
       kind: 'constraintSet',
       query: first,
-      constraints: rest
+      constraints: rest.map((constraint) => bindConstraintToQuery(first, constraint))
     };
   }
 
@@ -385,6 +426,10 @@ function fieldTuple(fields: ConstraintRelationFields<RelationRef> | string | rea
   return typeof fields === 'string' ? [fields] : fields;
 }
 
+function exprTuple(expressions: ExprData | readonly ExprData[]): readonly ExprData[] {
+  return isExprData(expressions) ? [expressions] : expressions;
+}
+
 function constraintOptions(options: ConstraintOptions): ConstraintOptions {
   return {
     ...(options.name === undefined ? {} : { name: options.name }),
@@ -392,6 +437,24 @@ function constraintOptions(options: ConstraintOptions): ConstraintOptions {
   };
 }
 
+function bindConstraintToQuery(query: Query, constraint: ConstraintData): ConstraintData {
+  if ('query' in constraint || 'relation' in constraint) {
+    return constraint;
+  }
+
+  return constraint.op === 'check'
+    ? { ...constraint, query }
+    : constraint;
+}
+
 function isQuery(input: unknown): input is Query {
   return typeof input === 'object' && input !== null && 'data' in input && 'relations' in input;
+}
+
+function isExprData(input: unknown): input is ExprData {
+  return typeof input === 'object' && input !== null && 'op' in input;
+}
+
+function isExprTupleInput(input: unknown): input is ExprData | readonly ExprData[] {
+  return isExprData(input) || (Array.isArray(input) && input.length > 0 && input.every(isExprData));
 }

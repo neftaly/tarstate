@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  aggregate,
+  and,
   as,
+  call,
   check,
   constrain,
+  count,
   createDb,
   deleteByKey,
   eq,
@@ -13,14 +17,18 @@ import {
   insert,
   insertOrMerge,
   insertOrReplace,
+  join,
+  lte,
   mat,
   pipe,
   project,
   qRows,
   req,
+  sum,
   transact,
   tryTransact,
   tryTransactConstrained,
+  tuple,
   unique,
   value,
   where
@@ -29,6 +37,7 @@ import {
   booleanField,
   defineSchema,
   numberField,
+  optional,
   relation,
   stringField
 } from '@tarstate/core/schema';
@@ -42,6 +51,7 @@ type MemberRow = {
   readonly id: string;
   readonly teamId: string;
   readonly email: string;
+  readonly nickname?: string;
   readonly active: boolean;
   readonly age: number;
 };
@@ -60,6 +70,7 @@ const schema = defineSchema({
       id: stringField(),
       teamId: stringField(),
       email: stringField(),
+      nickname: optional(stringField()),
       active: booleanField(),
       age: numberField()
     }
@@ -73,6 +84,7 @@ const bob: MemberRow = { id: 'bob', teamId: 'a', email: 'bob@example.test', acti
 const cy: MemberRow = { id: 'cy', teamId: 'b', email: 'cy@example.test', active: false, age: 17 };
 
 const member = as(schema.members, 'member');
+const team = as(schema.teams, 'team');
 const activeMembers = pipe(
   from(member),
   where(eq(member.active, true)),
@@ -81,6 +93,28 @@ const activeMembers = pipe(
     teamId: member.teamId,
     email: member.email,
     age: member.age
+  })
+);
+const activeMemberTeams = pipe(
+  from(member),
+  where(eq(member.active, true)),
+  join(from(team), eq(member.teamId, team.id)),
+  project({
+    id: member.id,
+    teamId: member.teamId,
+    email: member.email,
+    teamName: team.name
+  })
+);
+const activeMemberTotals = pipe(
+  from(member),
+  where(eq(member.active, true)),
+  aggregate({
+    groupBy: { teamId: member.teamId },
+    aggregates: {
+      activeCount: count(),
+      totalAge: sum(member.age)
+    }
   })
 );
 
@@ -354,6 +388,348 @@ describe('Relic-style constraints', () => {
         field: 'email',
         key: 'ann'
       })]));
+  });
+
+  it('rejects invalid relationship rows through an attached inner-join check and rolls back', async () => {
+    const constrained = mat(baseDb(), constrain(
+      check(activeMemberTeams, eq(field('relationship', 'teamName'), value('Alpha')))
+    ));
+    const insertedFirst: MemberRow = {
+      id: 'dee',
+      teamId: 'a',
+      email: 'dee@example.test',
+      active: true,
+      age: 28
+    };
+    const invalidRelationship: MemberRow = {
+      id: 'eli',
+      teamId: 'b',
+      email: 'eli@example.test',
+      active: true,
+      age: 26
+    };
+
+    const result = tryTransact(constrained, [
+      insert(schema.members, insertedFirst),
+      insert(schema.members, invalidRelationship)
+    ]);
+
+    expect(result).toMatchObject({
+      committed: false,
+      db: constrained,
+      applied: 0,
+      deltas: [],
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_check',
+        relation: expect.stringContaining('query:'),
+        detail: expect.objectContaining({
+          error: 'check-violation',
+          row: expect.objectContaining({
+            id: 'eli',
+            teamId: 'b',
+            teamName: 'Beta'
+          }),
+          clause: expect.objectContaining({ op: 'eq' })
+        })
+      })]
+    });
+    await expect(qRows(result.db, schema.members)).resolves.toEqual([ann, bob, cy]);
+  });
+
+  it('rejects invalid grouped totals through an attached aggregate check and rolls back', async () => {
+    const constrained = mat(baseDb(), constrain(
+      check(activeMemberTotals, and(
+        lte(field('summary', 'activeCount'), value(2)),
+        lte(field('summary', 'totalAge'), value(80))
+      ))
+    ));
+    const insertedFirst: MemberRow = {
+      id: 'dee',
+      teamId: 'b',
+      email: 'dee@example.test',
+      active: true,
+      age: 30
+    };
+    const invalidTotal: MemberRow = {
+      id: 'eli',
+      teamId: 'a',
+      email: 'eli@example.test',
+      active: true,
+      age: 40
+    };
+
+    const result = tryTransact(constrained, [
+      insert(schema.members, insertedFirst),
+      insert(schema.members, invalidTotal)
+    ]);
+
+    expect(result).toMatchObject({
+      committed: false,
+      db: constrained,
+      applied: 0,
+      deltas: [],
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_check',
+        relation: expect.stringContaining('query:'),
+        detail: expect.objectContaining({
+          error: 'check-violation',
+          row: expect.objectContaining({
+            teamId: 'a',
+            activeCount: 3,
+            totalAge: 95
+          }),
+          clause: expect.objectContaining({ op: 'and' })
+        })
+      })]
+    });
+    await expect(qRows(result.db, schema.members)).resolves.toEqual([ann, bob, cy]);
+  });
+
+  it('keeps direct req, fk, and unique constraints working when mixed with query checks', async () => {
+    const namedAnn: MemberRow = { ...ann, nickname: 'ann' };
+    const namedBob: MemberRow = { ...bob, nickname: 'bob' };
+    const namedCy: MemberRow = { ...cy, nickname: 'cy' };
+    const constrained = mat(createDb({
+      teams: [teamA, teamB],
+      members: [namedAnn, namedBob, namedCy]
+    }), constrain(
+      req(schema.members, 'nickname'),
+      fk(schema.members, 'teamId', schema.teams, 'id'),
+      unique(schema.members, 'email'),
+      check(activeMembers, gt(field('member', 'age'), value(17)))
+    ));
+    const valid: MemberRow = {
+      id: 'dee',
+      teamId: 'b',
+      email: 'dee@example.test',
+      nickname: 'dee',
+      active: true,
+      age: 28
+    };
+
+    const passed = tryTransact(constrained, insert(schema.members, valid));
+    expect(passed).toMatchObject({
+      committed: true,
+      applied: 1,
+      diagnostics: []
+    });
+    await expect(qRows(passed.db, schema.members)).resolves.toEqual([
+      namedAnn,
+      namedBob,
+      namedCy,
+      valid
+    ]);
+
+    expect(tryTransact(passed.db, insert(schema.members, {
+      id: 'missing-nickname',
+      teamId: 'a',
+      email: 'missing-nickname@example.test',
+      active: false,
+      age: 33
+    }))).toMatchObject({
+      committed: false,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_req',
+        relation: 'members',
+        field: 'nickname'
+      })]
+    });
+
+    expect(tryTransact(passed.db, insert(schema.members, {
+      id: 'duplicate-email',
+      teamId: 'a',
+      email: 'ann@example.test',
+      nickname: 'duplicate',
+      active: false,
+      age: 33
+    }))).toMatchObject({
+      committed: false,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_unique',
+        relation: 'members',
+        field: 'email'
+      })]
+    });
+
+    expect(tryTransact(passed.db, insert(schema.members, {
+      id: 'orphan',
+      teamId: 'missing',
+      email: 'orphan@example.test',
+      nickname: 'orphan',
+      active: false,
+      age: 33
+    }))).toMatchObject({
+      committed: false,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_fk',
+        relation: 'members',
+        field: 'teamId'
+      })]
+    });
+
+    expect(tryTransact(passed.db, insert(schema.members, {
+      id: 'active-underage',
+      teamId: 'a',
+      email: 'young@example.test',
+      nickname: 'young',
+      active: true,
+      age: 16
+    }))).toMatchObject({
+      committed: false,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_check',
+        relation: expect.stringContaining('query:')
+      })]
+    });
+  });
+
+  it('attaches bare check constraints to the current query with constrain(query, ...)', () => {
+    const explicit = constrain(check(activeMembers, gt(field('member', 'age'), value(17))));
+    const sugar = constrain(activeMembers, check(gt(field('member', 'age'), value(17))));
+
+    expect(sugar).toMatchObject({
+      kind: 'constraintSet',
+      query: activeMembers,
+      constraints: explicit.constraints
+    });
+
+    const constrained = mat(baseDb(), sugar);
+    expect(tryTransact(constrained, insert(schema.members, {
+      id: 'too-young',
+      teamId: 'a',
+      email: 'young@example.test',
+      active: true,
+      age: 16
+    }))).toMatchObject({
+      committed: false,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_check',
+        relation: expect.stringContaining('query:')
+      })]
+    });
+  });
+
+  it('enforces query expression uniqueness and rejects unsupported direct expression uniques', async () => {
+    const compositeIdentity = tuple(member.teamId, member.email);
+    const constrained = mat(baseDb(), constrain(unique(activeMembers, compositeIdentity)));
+    const inactiveDuplicateComposite: MemberRow = {
+      id: 'ann-copy',
+      teamId: 'a',
+      email: 'ann@example.test',
+      active: false,
+      age: 42
+    };
+
+    const inactiveResult = tryTransact(constrained, insert(schema.members, inactiveDuplicateComposite));
+    expect(inactiveResult).toMatchObject({
+      committed: true,
+      applied: 1,
+      diagnostics: []
+    });
+    await expect(qRows(inactiveResult.db, schema.members)).resolves.toEqual([
+      ann,
+      bob,
+      cy,
+      inactiveDuplicateComposite
+    ]);
+
+    const activeDuplicateComposite: MemberRow = {
+      id: 'ann-active-copy',
+      teamId: 'a',
+      email: 'ann@example.test',
+      active: true,
+      age: 42
+    };
+
+    const result = tryTransact(inactiveResult.db, insert(schema.members, activeDuplicateComposite));
+    expect(result).toMatchObject({
+      committed: false,
+      db: inactiveResult.db,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_unique',
+        relation: expect.stringContaining('query:'),
+        field: expect.stringContaining('tuple'),
+        detail: expect.objectContaining({
+          error: 'unique-key-violation',
+          expressions: [expect.objectContaining({ op: 'tuple' })],
+          oldRow: expect.objectContaining({ id: 'ann' }),
+          newRow: expect.objectContaining({ id: 'ann-active-copy' })
+        })
+      })]
+    });
+    await expect(qRows(result.db, schema.members)).resolves.toEqual([
+      ann,
+      bob,
+      cy,
+      inactiveDuplicateComposite
+    ]);
+
+    expect(() => unique(schema.members, compositeIdentity as never))
+      .toThrow(/expression|unsupported|unique|project/i);
+  });
+
+  it('rejects function-shaped query constraints explicitly instead of silently passing', async () => {
+    const namedFunctionProjection = pipe(
+      from(member),
+      project({
+        id: member.id,
+        normalizedEmail: call<string>('normalizeEmail', member.email)
+      })
+    );
+    const namedFunctionDb = mat(baseDb(), constrain(unique(namedFunctionProjection, 'normalizedEmail')));
+
+    const namedResult = tryTransact(namedFunctionDb, insert(schema.members, {
+      id: 'dee',
+      teamId: 'a',
+      email: 'DEE@example.test',
+      active: true,
+      age: 28
+    }));
+
+    expect(namedResult).toMatchObject({
+      committed: false,
+      db: namedFunctionDb,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'unsupported_expression',
+        message: expect.stringMatching(/function normalizeEmail/i)
+      })]
+    });
+    await expect(qRows(namedResult.db, schema.members)).resolves.toEqual([ann, bob, cy]);
+
+    const hostFunctionProjection = pipe(
+      from(member),
+      project({
+        id: member.id,
+        normalizedEmail: call((email: string) => email.toLowerCase(), member.email)
+      })
+    );
+    const hostFunctionDb = mat(baseDb(), constrain(unique(hostFunctionProjection, 'normalizedEmail')));
+
+    const hostResult = tryTransact(hostFunctionDb, insert(schema.members, {
+      id: 'dee',
+      teamId: 'a',
+      email: 'DEE@example.test',
+      active: true,
+      age: 28
+    }));
+
+    expect(hostResult).toMatchObject({
+      committed: false,
+      db: hostFunctionDb,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'unsupported_expression',
+        message: expect.stringMatching(/host function/i)
+      })]
+    });
+    await expect(qRows(hostResult.db, schema.members)).resolves.toEqual([ann, bob, cy]);
   });
 
   it('cascades direct relation foreign-key deletes and rejects unsupported cascade modes', async () => {

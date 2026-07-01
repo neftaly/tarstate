@@ -1,9 +1,10 @@
 import type { Db } from './db.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
-import { evaluate, type EvaluateOptions } from './evaluate.js';
+import { evaluate, validateRelationRow, type EvaluateOptions } from './evaluate.js';
 import {
   queryKey,
   type ExprData,
+  type NullSortOrder,
   type OptionalProjection,
   type PredicateData,
   type ProjectionData,
@@ -11,6 +12,7 @@ import {
   type QueryData,
   type SortData
 } from './query.js';
+import type { RelationRef } from './schema.js';
 import type { RelationSource } from './source.js';
 import type { RelationSourceInput } from './source-input.js';
 import type { ConstraintData, ConstraintSet } from './constraints.js';
@@ -36,9 +38,10 @@ export async function validateConstraints(
   const constraints = constraintDataList(input);
   const diagnostics: TarstateDiagnostic[] = [];
   const relationSource = asRelationSource(source);
+  const validationOptions = isDbInput(source) ? syncEvaluateOptions(source, options) : options;
 
   for (const constraint of constraints) {
-    diagnostics.push(...await validateConstraint(relationSource, constraint, options));
+    diagnostics.push(...await validateConstraint(relationSource, constraint, validationOptions));
   }
 
   return { kind: 'constraintValidation', valid: diagnostics.length === 0, diagnostics };
@@ -49,19 +52,23 @@ export async function validateAttachedConstraints(
   options: ConstraintValidationOptions = {}
 ): Promise<ConstraintValidationResult> {
   const constraints = attachedConstraintsFor(input);
-  return validateConstraints(asRelationSource(input), constraints, options);
+  return validateConstraints(input, constraints, options);
 }
 
-export function validateAttachedConstraintsSync(db: Db): ConstraintValidationResult {
-  return validateConstraintsSync(db, attachedConstraintsFor(db));
+export function validateAttachedConstraintsSync(
+  db: Db,
+  options: ConstraintValidationOptions = {}
+): ConstraintValidationResult {
+  return validateConstraintsSync(db, attachedConstraintsFor(db), options);
 }
 
 export function validateConstraintsSync(
   db: Db,
-  input: ConstraintValidationInput
+  input: ConstraintValidationInput,
+  options: ConstraintValidationOptions = {}
 ): ConstraintValidationResult {
   const constraints = constraintDataList(input);
-  const diagnostics = constraints.flatMap((constraint) => validateConstraintSync(db, constraint));
+  const diagnostics = constraints.flatMap((constraint) => validateConstraintSync(db, constraint, options));
   return { kind: 'constraintValidation', valid: diagnostics.length === 0, diagnostics };
 }
 
@@ -83,7 +90,14 @@ async function validateConstraint(
     case 'unique':
       return 'relation' in constraint
         ? validateUnique(await rowsFor(source, constraint.relation), constraint.relation.name, constraint.fields)
-        : validateUnique(await queryRowsFor(source, constraint.query, options), queryRelationName(constraint.query), constraint.fields);
+        : 'expressions' in constraint
+          ? validateUniqueExpressions(
+              await queryRowsFor(source, constraint.query, options),
+              queryRelationName(constraint.query),
+              constraint.expressions,
+              options
+            )
+          : validateUnique(await queryRowsFor(source, constraint.query, options), queryRelationName(constraint.query), constraint.fields);
     case 'fk':
       return 'relation' in constraint && !('data' in constraint.target)
         ? validateForeignKey(
@@ -98,11 +112,15 @@ async function validateConstraint(
     case 'check':
       return constraint.query === undefined
         ? []
-        : validateCheck(await queryRowsFor(source, constraint.query, options), constraint.predicate, queryRelationName(constraint.query));
+        : validateCheck(await queryRowsFor(source, constraint.query, options), constraint.predicate, queryRelationName(constraint.query), options);
   }
 }
 
-function validateConstraintSync(db: Db, constraint: ConstraintData): readonly TarstateDiagnostic[] {
+function validateConstraintSync(
+  db: Db,
+  constraint: ConstraintData,
+  options: ConstraintValidationOptions
+): readonly TarstateDiagnostic[] {
   const cascadeDiagnostics = validateCascadeSupport(constraint);
   if (cascadeDiagnostics.length > 0) {
     return cascadeDiagnostics;
@@ -112,11 +130,18 @@ function validateConstraintSync(db: Db, constraint: ConstraintData): readonly Ta
     case 'req':
       return 'relation' in constraint
         ? validateRequired(db.data[constraint.relation.name] ?? [], constraint.relation.name, constraint.field)
-        : validateRequired(queryRowsForSync(db, constraint.query), queryRelationName(constraint.query), constraint.field);
+        : validateRequired(queryRowsForSync(db, constraint.query, options), queryRelationName(constraint.query), constraint.field);
     case 'unique':
       return 'relation' in constraint
         ? validateUnique(db.data[constraint.relation.name] ?? [], constraint.relation.name, constraint.fields)
-        : validateUnique(queryRowsForSync(db, constraint.query), queryRelationName(constraint.query), constraint.fields);
+        : 'expressions' in constraint
+          ? validateUniqueExpressions(
+              queryRowsForSync(db, constraint.query, options),
+              queryRelationName(constraint.query),
+              constraint.expressions,
+              syncEvaluateOptions(db, options)
+            )
+          : validateUnique(queryRowsForSync(db, constraint.query, options), queryRelationName(constraint.query), constraint.fields);
     case 'fk':
       return 'relation' in constraint && !('data' in constraint.target)
         ? validateForeignKey(
@@ -127,11 +152,16 @@ function validateConstraintSync(db: Db, constraint: ConstraintData): readonly Ta
             constraint.targetFields,
             constraint.optional
           )
-        : validateQueryForeignKeySync(db, constraint);
+        : validateQueryForeignKeySync(db, constraint, options);
     case 'check':
       return constraint.query === undefined
         ? []
-        : validateCheck(queryRowsForSync(db, constraint.query), constraint.predicate, queryRelationName(constraint.query));
+        : validateCheck(
+            queryRowsForSync(db, constraint.query, options),
+            constraint.predicate,
+            queryRelationName(constraint.query),
+            syncEvaluateOptions(db, options)
+          );
   }
 }
 
@@ -171,15 +201,16 @@ async function validateQueryForeignKey(
 
 function validateQueryForeignKeySync(
   db: Db,
-  constraint: Extract<ConstraintData, { readonly op: 'fk' }>
+  constraint: Extract<ConstraintData, { readonly op: 'fk' }>,
+  options: ConstraintValidationOptions
 ): readonly TarstateDiagnostic[] {
   if (!('query' in constraint)) {
     return [];
   }
 
-  const sourceRows = queryRowsForSync(db, constraint.query);
+  const sourceRows = queryRowsForSync(db, constraint.query, options);
   const targetRows = 'data' in constraint.target
-    ? queryRowsForSync(db, constraint.target)
+    ? queryRowsForSync(db, constraint.target, options)
     : db.data[constraint.target.name] ?? [];
   return validateForeignKey(
     sourceRows,
@@ -273,6 +304,68 @@ function validateUnique(
   return diagnostics;
 }
 
+function validateUniqueExpressions(
+  rows: readonly unknown[],
+  relation: string,
+  expressions: readonly ExprData[],
+  options: ConstraintValidationOptions
+): readonly TarstateDiagnostic[] {
+  const seen = new Map<string, unknown>();
+  const diagnostics: TarstateDiagnostic[] = [];
+  const expressionLabel = displayExpressions(expressions);
+
+  for (const row of rows) {
+    if (diagnosticRow(row)) {
+      diagnostics.push(row.__tarstateDiagnostic);
+      continue;
+    }
+
+    const expressionDiagnostics: TarstateDiagnostic[] = [];
+    const values = expressions.map((expression) =>
+      exprValue(row, expression, {
+        options,
+        diagnostics: expressionDiagnostics,
+        relation
+      })
+    );
+
+    if (expressionDiagnostics.length > 0) {
+      diagnostics.push(...expressionDiagnostics);
+      continue;
+    }
+
+    if (values.some((value) => value === undefined || value === null)) {
+      continue;
+    }
+
+    const key = stableKeyValue(values);
+    if (seen.has(key)) {
+      const previous = seen.get(key);
+      diagnostics.push(constraintDiagnostic(
+        'constraint_unique',
+        `unique constraint failed for ${expressionLabel}`,
+        relation,
+        expressionLabel,
+        displayKey(values),
+        {
+          error: 'unique-key-violation',
+          relvar: relation,
+          expressions,
+          values,
+          oldRow: previous,
+          newRow: row,
+          rows: [previous, row],
+          clause: { op: 'unique', expressions }
+        }
+      ));
+    } else {
+      seen.set(key, row);
+    }
+  }
+
+  return diagnostics;
+}
+
 function validateForeignKey(
   sourceRows: readonly unknown[],
   targetRows: readonly unknown[],
@@ -324,11 +417,23 @@ function validateForeignKey(
 function validateCheck(
   rows: readonly unknown[],
   predicate: PredicateData,
-  relation = 'query'
+  relation = 'query',
+  options: ConstraintValidationOptions = {}
 ): readonly TarstateDiagnostic[] {
   return rows.flatMap((row) => {
     if (diagnosticRow(row)) return [row.__tarstateDiagnostic];
-    return evaluatePredicate(row, predicate)
+    const expressionDiagnostics: TarstateDiagnostic[] = [];
+    const passed = evaluatePredicate(row, predicate, {
+      options,
+      diagnostics: expressionDiagnostics,
+      relation
+    });
+
+    if (expressionDiagnostics.length > 0) {
+      return expressionDiagnostics;
+    }
+
+    return passed
       ? []
       : [constraintDiagnostic('constraint_check', 'check constraint failed', relation, '', rowKey(row), {
           error: 'check-violation',
@@ -369,138 +474,389 @@ function validateCascadeSupport(constraint: ConstraintData): readonly TarstateDi
   )];
 }
 
-function evaluatePredicate(row: unknown, predicate: PredicateData): boolean {
+type ConstraintExpressionState = {
+  readonly options: ConstraintValidationOptions;
+  readonly diagnostics: TarstateDiagnostic[];
+  readonly relation: string;
+  readonly evaluateSubquery?: (expr: Extract<ExprData, { readonly op: 'subquery' }>, row: Record<string, unknown>) => unknown;
+  readonly evaluateAggregate?: (expr: Extract<ExprData, { readonly op: 'aggregateCall' }>, row: Record<string, unknown>) => unknown;
+};
+
+function evaluatePredicate(
+  row: unknown,
+  predicate: PredicateData,
+  state: ConstraintExpressionState
+): boolean {
   switch (predicate.op) {
     case 'eq':
-      return Object.is(exprValue(row, predicate.left), exprValue(row, predicate.right));
+      return Object.is(exprValue(row, predicate.left, state), exprValue(row, predicate.right, state));
     case 'neq':
-      return !Object.is(exprValue(row, predicate.left), exprValue(row, predicate.right));
+      return !Object.is(exprValue(row, predicate.left, state), exprValue(row, predicate.right, state));
     case 'lt':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) < 0;
+      return compareValues(exprValue(row, predicate.left, state), exprValue(row, predicate.right, state)) < 0;
     case 'lte':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) <= 0;
+      return compareValues(exprValue(row, predicate.left, state), exprValue(row, predicate.right, state)) <= 0;
     case 'gt':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) > 0;
+      return compareValues(exprValue(row, predicate.left, state), exprValue(row, predicate.right, state)) > 0;
     case 'gte':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) >= 0;
+      return compareValues(exprValue(row, predicate.left, state), exprValue(row, predicate.right, state)) >= 0;
     case 'and':
-      return predicate.predicates.every((item) => evaluatePredicate(row, item));
+      return predicate.predicates.every((item) => evaluatePredicate(row, item, state));
     case 'or':
-      return predicate.predicates.some((item) => evaluatePredicate(row, item));
+      return predicate.predicates.some((item) => evaluatePredicate(row, item, state));
     case 'not':
-      return !evaluatePredicate(row, predicate.predicate);
+      return !evaluatePredicate(row, predicate.predicate, state);
   }
 }
 
-function exprValue(row: unknown, expr: ExprData): unknown {
+function exprValue(row: unknown, expr: ExprData, state: ConstraintExpressionState): unknown {
   switch (expr.op) {
     case 'value':
       return expr.value;
+    case 'env':
+      return state.options.env?.[expr.name];
+    case 'call': {
+      const fn = state.options.functions?.[expr.name];
+      if (fn === undefined) {
+        pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+          `function ${expr.name} is not available for constraint validation`,
+          state.relation,
+          expr
+        ));
+        return undefined;
+      }
+
+      const args = expr.args.map((arg) => exprValue(row, arg, state));
+      const value = fn(...args);
+      if (isPromiseLike(value)) {
+        pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+          `function ${expr.name} returned a Promise and cannot be validated synchronously`,
+          state.relation,
+          expr
+        ));
+        return undefined;
+      }
+
+      return value;
+    }
+    case 'hostCall':
+      pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+        `host function ${expr.name} cannot be validated synchronously in constraints`,
+        state.relation,
+        expr
+      ));
+      return undefined;
     case 'field': {
-      const aliased = isRecord(row) ? row[expr.alias] : undefined;
-      return isRecord(aliased) ? aliased[expr.field] : isRecord(row) ? row[expr.field] : undefined;
+      return readField(asRecord(row), expr.alias, expr.field);
     }
     case 'tuple':
-      return expr.items.map((item) => exprValue(row, item));
-    default:
+      return expr.items.map((item) => exprValue(row, item, state));
+    case 'subquery':
+      if (state.evaluateSubquery !== undefined) {
+        return state.evaluateSubquery(expr, asRecord(row));
+      }
+      pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+        'subquery expressions are only supported inside query validation',
+        state.relation,
+        expr
+      ));
+      return undefined;
+    case 'aggregateCall':
+      if (state.evaluateAggregate !== undefined) {
+        return state.evaluateAggregate(expr, asRecord(row));
+      }
+      pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+        'aggregate expressions are only supported inside aggregate query validation',
+        state.relation,
+        expr
+      ));
       return undefined;
   }
 }
 
 function compareValues(left: unknown, right: unknown): number {
-  if (left === right) return 0;
+  if (Object.is(left, right)) return 0;
   if (left === undefined || left === null) return -1;
   if (right === undefined || right === null) return 1;
-  return left < right ? -1 : 1;
+  if ((typeof left === 'number' && typeof right === 'number') || (typeof left === 'string' && typeof right === 'string')) {
+    return left < right ? -1 : 1;
+  }
+  return stableKey(left) < stableKey(right) ? -1 : 1;
 }
 
 function valuesFor(row: unknown, fields: readonly string[]): readonly unknown[] {
   return fields.map((field) => isRecord(row) ? row[field] : undefined);
 }
 
-function queryRowsForSync<Row>(db: Db, query: Query<Row>): readonly Row[] {
-  return evaluateQueryDataSync(db, query.data, query) as readonly Row[];
+function compareSortValues(
+  left: unknown,
+  right: unknown,
+  direction: 'asc' | 'desc',
+  nulls: NullSortOrder | undefined
+): number {
+  const leftNull = left === null || left === undefined;
+  const rightNull = right === null || right === undefined;
+  if (leftNull || rightNull) {
+    if (leftNull && rightNull) return 0;
+    const nullOrder = nulls ?? 'last';
+    return leftNull === (nullOrder === 'first') ? -1 : 1;
+  }
+
+  const comparison = compareValues(left, right);
+  return direction === 'asc' ? comparison : -comparison;
 }
 
-function evaluateQueryDataSync(db: Db, data: QueryData, query: Query): readonly unknown[] {
+function syncEvaluateOptions(db: Db, options: ConstraintValidationOptions): ConstraintValidationOptions {
+  return {
+    ...options,
+    env: { ...db.env, ...options.env }
+  };
+}
+
+function expressionState(state: SyncQueryState): ConstraintExpressionState {
+  return {
+    options: state.options,
+    diagnostics: state.diagnostics,
+    relation: state.relation,
+    evaluateSubquery: (expr, row) => {
+      const rows = evaluateQueryDataSync(expr.query, state, row);
+      return expr.mode === 'many' ? rows : rows[0];
+    },
+    evaluateAggregate: (expr, row) => evaluateAggregateSync(expr, [row], state)
+  };
+}
+
+type SyncEvalContext = Record<string, unknown>;
+type SyncQueryState = {
+  readonly db: Db;
+  readonly relations: Record<string, RelationRef>;
+  readonly options: ConstraintValidationOptions;
+  readonly diagnostics: TarstateDiagnostic[];
+  readonly relation: string;
+};
+
+function queryRowsForSync<Row>(
+  db: Db,
+  query: Query<Row>,
+  options: ConstraintValidationOptions = {}
+): readonly Row[] {
+  const state: SyncQueryState = {
+    db,
+    relations: query.relations,
+    options: syncEvaluateOptions(db, options),
+    diagnostics: [],
+    relation: queryRelationName(query)
+  };
+  const rows = evaluateQueryDataSync(query.data, state);
+  return state.diagnostics.length === 0
+    ? rows as readonly Row[]
+    : [...diagnosticRows(state.diagnostics), ...rows] as readonly Row[];
+}
+
+function evaluateQueryDataSync(
+  data: QueryData,
+  state: SyncQueryState,
+  outerRow: SyncEvalContext = {}
+): readonly SyncEvalContext[] {
   switch (data.op) {
-    case 'from': {
-      const relation = query.relations[data.relation];
-      return relation === undefined
-        ? []
-        : (db.data[relation.name] ?? []).filter(isRecord).map((row) => ({ [data.alias]: row }));
-    }
-    case 'lookup': {
-      const relation = query.relations[data.relation];
-      if (relation === undefined) return [];
-      const value = exprValue({}, data.value);
-      return (db.data[relation.name] ?? [])
-        .filter((row) => isRecord(row) && Object.is(row[data.field], value))
-        .map((row) => ({ [data.alias]: row }));
-    }
+    case 'from':
+      return relationRowsSync(data.relation, data.alias, state, outerRow);
+    case 'lookup':
+      return lookupRowsSync(data, state, outerRow);
     case 'constRows':
-      return data.rows;
-    case 'where': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : rows.filter((row) => evaluatePredicate(row, data.predicate));
-    }
+      return data.rows.map((row) => ({ ...outerRow, ...row }));
+    case 'where':
+      return evaluateQueryDataSync(data.input, state, outerRow)
+        .filter((row) => evaluatePredicate(row, data.predicate, expressionState(state)));
     case 'hash':
     case 'btree':
     case 'keyBy':
-      return evaluateQueryDataSync(db, data.input, query);
-    case 'select': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : rows.map((row) => projectRow(row, data.projection));
-    }
-    case 'extend': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : rows.map((row) => ({ ...asRecord(row), ...projectRow(row, data.projection) }));
-    }
-    case 'without': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : rows.map((row) => {
-        const output = { ...asRecord(row) };
+      return evaluateQueryDataSync(data.input, state, outerRow);
+    case 'join':
+      return joinRowsSync(data.kind, data.left, data.right, data.on, state, outerRow);
+    case 'select':
+      return evaluateQueryDataSync(data.input, state, outerRow)
+        .map((row) => projectRowSync(row, data.projection, state));
+    case 'extend':
+      return evaluateQueryDataSync(data.input, state, outerRow)
+        .map((row) => ({ ...row, ...projectRowSync(row, data.projection, state) }));
+    case 'expand':
+      return expandRowsSync(data.input, data.collection, data.alias, data.fields, state, outerRow);
+    case 'without':
+      return evaluateQueryDataSync(data.input, state, outerRow).map((row) => {
+        const output = { ...row };
         for (const field of data.fields) {
           delete output[field];
         }
         return output;
       });
-    }
-    case 'sort': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : sortRows(rows, data.order);
-    }
+    case 'sort':
+      return sortRowsSync(evaluateQueryDataSync(data.input, state, outerRow), data.order, state);
     case 'limit': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : rows.slice(data.offset ?? 0, (data.offset ?? 0) + data.count);
+      const offset = data.offset ?? 0;
+      return evaluateQueryDataSync(data.input, state, outerRow).slice(offset, offset + data.count);
     }
-    case 'sortLimit': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : sortRows(rows, data.order).slice(0, data.count);
-    }
-    case 'rename': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : rows.map((row) => renameRow(row, data.fields));
-    }
-    case 'qualify': {
-      const rows = evaluateQueryDataSync(db, data.input, query);
-      return hasDiagnosticRows(rows) ? rows : rows.map((row) => ({ [data.alias]: row }));
-    }
-    default:
-      return [diagnosticRowFor({
-        code: 'constraint_query_sync_unsupported',
-        message: `query op ${(data as { readonly op: string }).op} cannot be validated synchronously`,
-        relation: queryRelationName(query),
-        detail: { op: (data as { readonly op: string }).op }
-      })];
+    case 'sortLimit':
+      return sortRowsSync(evaluateQueryDataSync(data.input, state, outerRow), data.order, state).slice(0, data.count);
+    case 'union':
+      return setUnionSync(data.inputs.map((input) => evaluateQueryDataSync(input, state, outerRow)));
+    case 'intersection':
+      return setIntersectionSync(data.inputs.map((input) => evaluateQueryDataSync(input, state, outerRow)));
+    case 'difference':
+      return setDifferenceSync(
+        evaluateQueryDataSync(data.left, state, outerRow),
+        evaluateQueryDataSync(data.right, state, outerRow)
+      );
+    case 'rename':
+      return evaluateQueryDataSync(data.input, state, outerRow).map((row) => renameRow(row, data.fields));
+    case 'qualify':
+      return evaluateQueryDataSync(data.input, state, outerRow).map((row) => ({ [data.alias]: row }));
+    case 'aggregate':
+      return aggregateRowsSync(
+        evaluateQueryDataSync(data.input, state, outerRow),
+        data.groupBy,
+        data.aggregates,
+        state
+      );
   }
 }
 
-function projectRow(row: unknown, projection: ProjectionData): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(projection).map(([field, item]) => [
-    field,
-    exprValue(row, projectionExpr(item))
-  ]));
+function relationRowsSync(
+  relationName: string,
+  alias: string,
+  state: SyncQueryState,
+  outerRow: SyncEvalContext
+): readonly SyncEvalContext[] {
+  const relation = state.relations[relationName];
+  if (relation === undefined) {
+    state.diagnostics.push({
+      code: 'unsupported_lookup',
+      message: `relation ${relationName} is not available`,
+      relation: relationName
+    });
+    return [];
+  }
+
+  return validRelationRowsSync(relation, state.db.data[relation.name] ?? [], state)
+    .map((row) => ({ ...outerRow, [alias]: row }));
+}
+
+function lookupRowsSync(
+  data: Extract<QueryData, { readonly op: 'lookup' }>,
+  state: SyncQueryState,
+  outerRow: SyncEvalContext
+): readonly SyncEvalContext[] {
+  const relation = state.relations[data.relation];
+  if (relation === undefined) {
+    return [];
+  }
+
+  const value = exprValue(outerRow, data.value, expressionState(state));
+  return validRelationRowsSync(relation, state.db.data[relation.name] ?? [], state)
+    .filter((row) => Object.is(row[data.field], value))
+    .map((row) => ({ ...outerRow, [data.alias]: row }));
+}
+
+function validRelationRowsSync(
+  relation: RelationRef,
+  rows: readonly unknown[],
+  state: SyncQueryState
+): readonly SyncEvalContext[] {
+  const output: SyncEvalContext[] = [];
+
+  for (const row of rows) {
+    if (!isRecord(row)) {
+      state.diagnostics.push({
+        code: 'invalid_row',
+        message: 'row is not an object',
+        relation: relation.name
+      });
+      continue;
+    }
+
+    const diagnostics = validateRelationRow(relation, row);
+    if (diagnostics.length === 0) {
+      output.push(row);
+    } else {
+      state.diagnostics.push(...diagnostics);
+    }
+  }
+
+  return output;
+}
+
+function joinRowsSync(
+  kind: 'inner' | 'left',
+  leftData: QueryData,
+  rightData: QueryData,
+  on: PredicateData,
+  state: SyncQueryState,
+  outerRow: SyncEvalContext
+): readonly SyncEvalContext[] {
+  const left = evaluateQueryDataSync(leftData, state, outerRow);
+  const right = evaluateQueryDataSync(rightData, state, outerRow);
+  const output: SyncEvalContext[] = [];
+
+  for (const leftRow of left) {
+    let matched = false;
+
+    for (const rightRow of right) {
+      const merged = { ...leftRow, ...rightRow };
+      if (evaluatePredicate(merged, on, expressionState(state))) {
+        matched = true;
+        output.push(merged);
+      }
+    }
+
+    if (!matched && kind === 'left') {
+      output.push(leftRow);
+    }
+  }
+
+  return output;
+}
+
+function expandRowsSync(
+  inputData: QueryData,
+  collection: ExprData,
+  alias: string | undefined,
+  fields: readonly string[] | undefined,
+  state: SyncQueryState,
+  outerRow: SyncEvalContext
+): readonly SyncEvalContext[] {
+  const input = evaluateQueryDataSync(inputData, state, outerRow);
+  const output: SyncEvalContext[] = [];
+
+  for (const row of input) {
+    const value = exprValue(row, collection, expressionState(state));
+    if (value === null || value === undefined || !isIterable(value)) {
+      continue;
+    }
+
+    for (const item of value) {
+      if (alias !== undefined) {
+        output.push({ ...row, [alias]: item });
+      } else if (isRecord(item)) {
+        output.push({ ...row, ...pickFields(item, fields) });
+      }
+    }
+  }
+
+  return output;
+}
+
+function projectRowSync(
+  row: SyncEvalContext,
+  projection: ProjectionData,
+  state: SyncQueryState
+): SyncEvalContext {
+  const output: Record<string, unknown> = {};
+
+  for (const [field, item] of Object.entries(projection)) {
+    output[field] = exprValue(row, projectionExpr(item), expressionState(state));
+  }
+
+  return output;
 }
 
 function projectionExpr(input: ProjectionData[string]): ExprData {
@@ -520,16 +876,206 @@ function renameRow(row: unknown, fields: Record<string, string>): Record<string,
   return output;
 }
 
-function sortRows(rows: readonly unknown[], order: readonly SortData[]): readonly unknown[] {
-  return [...rows].sort((left, right) => {
-    for (const item of order) {
-      const compared = compareValues(exprValue(left, item.expr), exprValue(right, item.expr));
-      if (compared !== 0) {
-        return item.direction === 'desc' ? -compared : compared;
+function sortRowsSync(
+  rows: readonly SyncEvalContext[],
+  order: readonly SortData[],
+  state: SyncQueryState
+): readonly SyncEvalContext[] {
+  const keyedRows = rows.map((row) => ({
+    row,
+    values: order.map((item) => exprValue(row, item.expr, expressionState(state)))
+  }));
+
+  return keyedRows.sort((left, right) => {
+    for (let index = 0; index < order.length; index += 1) {
+      const item = order[index] as SortData;
+      const comparison = compareSortValues(
+        left.values[index],
+        right.values[index],
+        item.direction,
+        item.nulls
+      );
+
+      if (comparison !== 0) {
+        return comparison;
       }
     }
+
     return 0;
+  }).map((item) => item.row);
+}
+
+function aggregateRowsSync(
+  rows: readonly SyncEvalContext[],
+  groupBy: ProjectionData,
+  aggregates: ProjectionData,
+  state: SyncQueryState
+): readonly SyncEvalContext[] {
+  const groups = new Map<string, { readonly group: SyncEvalContext; readonly rows: SyncEvalContext[] }>();
+
+  for (const row of rows) {
+    const group = projectRowSync(row, groupBy, state);
+    const key = stableKey(group);
+    const existing = groups.get(key);
+    if (existing === undefined) {
+      groups.set(key, { group, rows: [row] });
+    } else {
+      existing.rows.push(row);
+    }
+  }
+
+  if (groups.size === 0 && Object.keys(groupBy).length === 0) {
+    groups.set(stableKey({}), { group: {}, rows: [] });
+  }
+
+  return Array.from(groups.values()).map(({ group, rows: groupRows }) => {
+    const output: Record<string, unknown> = { ...group };
+    for (const [name, item] of Object.entries(aggregates)) {
+      output[name] = evaluateAggregateSync(projectionExpr(item), groupRows, state);
+    }
+    return output;
   });
+}
+
+function evaluateAggregateSync(
+  expr: ExprData,
+  rows: readonly SyncEvalContext[],
+  state: SyncQueryState
+): unknown {
+  if (expr.op !== 'aggregateCall') {
+    return exprValue(rows[0] ?? {}, expr, expressionState(state));
+  }
+
+  const values = expr.expr === undefined
+    ? rows
+    : rows.map((row) => exprValue(row, expr.expr as ExprData, expressionState(state)));
+  const aggregateValues = expr.distinct ? distinctValues(values) : values;
+
+  switch (expr.name) {
+    case 'count':
+      return expr.expr === undefined
+        ? rows.length
+        : aggregateValues.filter((value) => value !== null && value !== undefined).length;
+    case 'sum':
+      return aggregateValues.reduce<number>((total, value) => total + (typeof value === 'number' ? value : 0), 0);
+    case 'avg': {
+      const numbers = aggregateValues.filter((value): value is number => typeof value === 'number');
+      return numbers.length === 0 ? undefined : numbers.reduce((total, value) => total + value, 0) / numbers.length;
+    }
+    case 'min':
+      return orderedValues(aggregateValues).at(0);
+    case 'max':
+      return orderedValues(aggregateValues).at(-1);
+    case 'any':
+      return aggregateValues.some(Boolean);
+    case 'notAny':
+      return !aggregateValues.some(Boolean);
+    case 'setConcat':
+      return new Set(aggregateValues.flatMap((value) => {
+        if (value instanceof Set) return Array.from(value);
+        if (Array.isArray(value)) return value;
+        return [value];
+      }));
+    case 'top':
+      return [...orderedValues(aggregateValues)].reverse().slice(0, expr.count ?? 0);
+    case 'bottom':
+      return orderedValues(aggregateValues).slice(0, expr.count ?? 0);
+    case 'topBy':
+      return rowsByAggregateSync(rows, expr.expr, state, 'desc').slice(0, expr.count ?? 0);
+    case 'bottomBy':
+      return rowsByAggregateSync(rows, expr.expr, state, 'asc').slice(0, expr.count ?? 0);
+  }
+}
+
+function rowsByAggregateSync(
+  rows: readonly SyncEvalContext[],
+  expr: ExprData | undefined,
+  state: SyncQueryState,
+  direction: 'asc' | 'desc'
+): readonly SyncEvalContext[] {
+  if (expr === undefined) {
+    return [...rows];
+  }
+
+  return rows.map((row) => ({
+    row,
+    value: exprValue(row, expr, expressionState(state))
+  })).sort((left, right) =>
+    compareSortValues(left.value, right.value, direction, 'last')
+  ).map((item) => item.row);
+}
+
+function setUnionSync(inputs: readonly (readonly SyncEvalContext[])[]): readonly SyncEvalContext[] {
+  const seen = new Set<string>();
+  const output: SyncEvalContext[] = [];
+
+  for (const rows of inputs) {
+    for (const row of rows) {
+      const key = stableKey(row);
+      if (!seen.has(key)) {
+        seen.add(key);
+        output.push(row);
+      }
+    }
+  }
+
+  return output;
+}
+
+function setIntersectionSync(inputs: readonly (readonly SyncEvalContext[])[]): readonly SyncEvalContext[] {
+  if (inputs.length === 0) {
+    return [];
+  }
+
+  const rightKeys = inputs.slice(1).map((rows) => new Set(rows.map(stableKey)));
+  const emitted = new Set<string>();
+  const firstInput = inputs[0] ?? [];
+  return firstInput.filter((row) => {
+    const key = stableKey(row);
+    if (emitted.has(key) || rightKeys.some((keys) => !keys.has(key))) {
+      return false;
+    }
+    emitted.add(key);
+    return true;
+  });
+}
+
+function setDifferenceSync(
+  left: readonly SyncEvalContext[],
+  right: readonly SyncEvalContext[]
+): readonly SyncEvalContext[] {
+  const rightKeys = new Set(right.map(stableKey));
+  const emitted = new Set<string>();
+
+  return left.filter((row) => {
+    const key = stableKey(row);
+    if (emitted.has(key) || rightKeys.has(key)) {
+      return false;
+    }
+    emitted.add(key);
+    return true;
+  });
+}
+
+function distinctValues(values: readonly unknown[]): readonly unknown[] {
+  const seen = new Set<string>();
+  const output: unknown[] = [];
+
+  for (const value of values) {
+    const key = stableKey(value);
+    if (!seen.has(key)) {
+      seen.add(key);
+      output.push(value);
+    }
+  }
+
+  return output;
+}
+
+function orderedValues(values: readonly unknown[]): readonly unknown[] {
+  return [...values]
+    .filter((value) => value !== null && value !== undefined)
+    .sort(compareValues);
 }
 
 function stableKeyValue(values: readonly unknown[]): string {
@@ -538,6 +1084,32 @@ function stableKeyValue(values: readonly unknown[]): string {
 
 function displayKey(values: readonly unknown[]): string {
   return values.length === 1 ? String(values[0]) : JSON.stringify(values);
+}
+
+function displayExpressions(expressions: readonly ExprData[]): string {
+  return expressions.length === 1
+    ? expressionDescription(expressions[0] as ExprData)
+    : expressions.map((expression) => expressionDescription(expression)).join(',');
+}
+
+function expressionDescription(expression: ExprData): string {
+  switch (expression.op) {
+    case 'field':
+      return `${expression.alias}.${expression.field}`;
+    case 'env':
+      return `env.${expression.name}`;
+    case 'call':
+    case 'hostCall':
+      return `${expression.name}(...)`;
+    case 'tuple':
+      return `tuple(${expression.items.map((item) => expressionDescription(item)).join(',')})`;
+    case 'aggregateCall':
+      return `${expression.name}(...)`;
+    case 'subquery':
+      return `subquery:${expression.mode}`;
+    case 'value':
+      return 'value';
+  }
 }
 
 function rowKey(row: unknown): string | undefined {
@@ -572,6 +1144,39 @@ function diagnosticRowFor(diagnostic: TarstateDiagnostic): { readonly __tarstate
   return { __tarstateDiagnostic: diagnostic };
 }
 
+function unsupportedExpressionDiagnostic(
+  message: string,
+  relation: string,
+  expression: ExprData
+): TarstateDiagnostic {
+  return constraintDiagnostic(
+    'unsupported_expression',
+    message,
+    relation,
+    expressionDescription(expression),
+    undefined,
+    {
+      error: 'constraint-expression-sync-unsupported',
+      expression
+    }
+  );
+}
+
+function pushUnsupportedExpressionDiagnostic(
+  state: ConstraintExpressionState,
+  diagnostic: TarstateDiagnostic
+): void {
+  const duplicate = state.diagnostics.some((item) =>
+    item.code === diagnostic.code &&
+    item.message === diagnostic.message &&
+    item.relation === diagnostic.relation &&
+    item.field === diagnostic.field
+  );
+  if (!duplicate) {
+    state.diagnostics.push(diagnostic);
+  }
+}
+
 function queryRelationName(query: Query): string {
   return queryKey(query);
 }
@@ -590,14 +1195,46 @@ function asRecord(input: unknown): Record<string, unknown> {
   return isRecord(input) ? input : {};
 }
 
+function readField(row: Record<string, unknown>, alias: string, field: string): unknown {
+  const aliased = row[alias];
+
+  if (isRecord(aliased)) {
+    return aliased[field];
+  }
+
+  if (aliased !== undefined && field === 'value') {
+    return aliased;
+  }
+
+  return row[field];
+}
+
+function pickFields(row: Record<string, unknown>, fields: readonly string[] | undefined): Record<string, unknown> {
+  if (fields === undefined) {
+    return row;
+  }
+
+  return Object.fromEntries(fields.map((field) => [field, row[field]]));
+}
+
 function diagnosticRow(input: unknown): input is { readonly __tarstateDiagnostic: TarstateDiagnostic } {
   return isRecord(input) && '__tarstateDiagnostic' in input;
 }
 
-function hasDiagnosticRows(rows: readonly unknown[]): boolean {
-  return rows.some(diagnosticRow);
+function isPromiseLike(input: unknown): input is PromiseLike<unknown> {
+  return isRecord(input) && typeof input.then === 'function';
+}
+
+function isIterable(input: unknown): input is Iterable<unknown> {
+  return typeof input === 'object' &&
+    input !== null &&
+    typeof (input as { readonly [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function';
+}
+
+function isDbInput(input: unknown): input is Db {
+  return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null;
+  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
