@@ -13,7 +13,7 @@ import {
 } from './db.js';
 import { queryKey, type Query } from './query.js';
 import type { RelationSource } from './source.js';
-import { writeInputPatches, type WriteInput } from './write.js';
+import type { WriteInput } from './write.js';
 
 type QueryRow<QueryValue> = QueryValue extends Query<infer Row> ? Row : never;
 type QueryBatchRow<Queries extends QueryBatch> = QueryRow<Queries[keyof Queries]>;
@@ -65,7 +65,6 @@ export type StoreCommitResult<
 > = {
   readonly kind: 'tarstateCommit';
   readonly status: AdapterCommitStatus;
-  /** True when any patch effects were reflected in the backing store. */
   readonly reflected: boolean;
   readonly effects: StoreCommitEffects;
   readonly diagnostics: readonly Diagnostic[];
@@ -132,145 +131,74 @@ export type Store = {
   readonly refresh: () => Promise<StoreSnapshot>;
 };
 
-/** Create the small renderer-independent Tarstate store facade over an object-backed `Db`. */
 export function createStore(input: Db | DbInputData = createDb()): Store {
-  let db = isDb(input) ? input : createDb(input);
-
-  let revision = 0;
-  let snapshot = storeSnapshot(db, revision, []);
+  const db = isDb(input) ? input : createDb(input);
+  let snapshot = storeSnapshot(db, 0, []);
   const listeners = new Set<() => void>();
-
-  const notify = (): void => {
-    for (const listener of listeners) {
-      listener();
-    }
-  };
-
-  const setDb = (nextDb: Db, diagnostics: readonly StoreDiagnostic[] = []): StoreSnapshot => {
-    db = nextDb;
-    revision += 1;
-    snapshot = storeSnapshot(db, revision, diagnostics);
-    notify();
-    return snapshot;
+  const subscribe = (listener: () => void): (() => void) => {
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
   };
 
   const store: Store = {
     kind: 'store',
     getSnapshot: () => snapshot,
-    subscribe: (listener) => {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    query: (async (query: Query, queryOptions?: StoreQueryOptions) =>
-      q(db, query, queryOptions)) as StoreQuery,
-    queries: (async (queries: QueryBatch, queryOptions?: StoreQueryOptions) =>
-      qMany(db, queries, queryOptions)) as StoreQueries,
-    view: <Row>(query: Query<Row>) =>
-      createStoreView(query, store),
+    subscribe,
+    query: (async (queryValue: Query, options?: StoreQueryOptions) => q(snapshot.db, queryValue, options)) as StoreQuery,
+    queries: (async (queries: QueryBatch, options?: StoreQueryOptions) => qMany(snapshot.db, queries, options)) as StoreQueries,
+    view: <Row>(queryValue: Query<Row>) => createStoreView(queryValue, store),
     commit: async (patches) => {
-      const patchList = Array.from(writeInputPatches(patches));
-      const result = tryTransact(db, patchList);
-
-      if (!result.committed) {
-        return {
-          kind: 'tarstateCommit',
-          status: 'rejected',
-          reflected: false,
-          effects: {
-            patches: result.patches,
-            applied: result.applied,
-            deltas: result.deltas
-          },
-          diagnostics: result.diagnostics,
-          snapshot
-        };
-      }
-
-      const nextSnapshot = setDb(result.db, result.diagnostics);
-      const reflected = commitReflected(result.deltas);
-
+      const result = tryTransact(snapshot.db, patches);
       return {
         kind: 'tarstateCommit',
-          status: 'accepted',
-          reflected,
-          effects: {
-            patches: result.patches,
-            applied: result.applied,
-            deltas: result.deltas
-          },
-          diagnostics: result.diagnostics,
-          snapshot: nextSnapshot
-        };
+        status: result.committed ? 'accepted' : 'rejected',
+        reflected: false,
+        effects: {
+          patches: result.patches,
+          applied: result.applied,
+          deltas: result.deltas
+        },
+        diagnostics: result.diagnostics,
+        snapshot
+      };
     },
-    refresh: async () => setDb(db)
+    refresh: async () => {
+      snapshot = storeSnapshot(snapshot.db, snapshot.revision + 1, []);
+      for (const listener of listeners) listener();
+      return snapshot;
+    }
   };
 
   return store;
 }
 
-function createStoreView<Row>(
-  query: Query<Row>,
-  store: Store
-): StoreView<Row> {
-  const viewKey = queryKey(query);
-  const read = (async (readOptions?: StoreViewReadOptions<Row>) =>
-    readView(store.getSnapshot().db, query, readOptions)) as StoreView<Row>['read'];
-  const rows = (async (readOptions?: StoreViewReadOptions<Row>) =>
-    (await read(readOptions as never)).rows) as StoreView<Row>['rows'];
+function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
+  const read = (async (options?: StoreViewReadOptions<Row>) => store.query(query, options)) as StoreView<Row>['read'];
+  const rows = (async (options?: StoreViewReadOptions<Row>) => (await read(options as never)).rows) as StoreView<Row>['rows'];
 
   return {
     kind: 'view',
     query,
-    queryKey: viewKey,
+    queryKey: queryKey(query),
     getSnapshot: store.getSnapshot,
     subscribe: store.subscribe,
     read,
     rows,
-    refresh: async (refreshOptions = {}) => store.query(query, refreshOptions)
+    refresh: async (options = {}) => store.query(query, options)
   };
 }
 
-async function readView<Row, MappedRow = Row>(
-  db: Db,
-  query: Query<Row>,
-  readOptions: StoreViewReadOptions<Row, MappedRow> = {}
-): Promise<StoreQueryResult<Row> | StoreQueryResult<MappedRow>> {
-  return queryDb(db, query, readOptions);
-}
-
-function queryDb<Row, MappedRow = Row>(
-  db: Db,
-  query: Query<Row>,
-  options?: StoreQueryOptions<Row, MappedRow>
-): Promise<StoreQueryResult<Row> | StoreQueryResult<MappedRow>> {
-  const run = q as unknown as (
-    db: Db,
-    query: Query<Row>,
-    options?: StoreQueryOptions<Row, MappedRow>
-  ) => Promise<StoreQueryResult<Row> | StoreQueryResult<MappedRow>>;
-
-  return run(db, query, options);
-}
-
-function storeSnapshot(
-  db: Db,
-  revision: number,
-  diagnostics: readonly StoreDiagnostic[]
-): StoreSnapshot {
+function storeSnapshot(db: Db, revision: number, diagnostics: readonly StoreDiagnostic[]): StoreSnapshot {
   return {
+    db,
     source: dbSource(db),
     revision,
-    diagnostics,
-    db
+    diagnostics
   };
 }
 
-function commitReflected(deltas: readonly RelationDelta[]): boolean {
-  return deltas.some((delta) => delta.added.length > 0 || delta.removed.length > 0);
-}
-
-function isDb(input: Db | DbInputData): input is Db {
+function isDb(input: unknown): input is Db {
   return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
 }

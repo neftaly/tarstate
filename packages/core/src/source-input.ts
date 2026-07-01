@@ -1,32 +1,16 @@
-import { fromObjectSource, isRelationSource, type RelationSource } from './source.js';
+import { dbSource, type Db } from './db.js';
+import { isRelationSource, type RelationSource } from './source.js';
 
-export type ObjectBackedRelationData = {
-  readonly data: Record<string, readonly unknown[]>;
-};
-
-export type RelationSourceInput = RelationSource | ObjectBackedRelationData;
+export type RelationSourceInput = RelationSource | Db;
 
 export function asRelationSource(input: RelationSourceInput): RelationSource {
-  return isRelationSource(input) ? input : fromObjectSource(input.data);
+  return isRelationSource(input) ? input : dbSource(input);
 }
 
 export function tryRelationSource(input: unknown): RelationSource | undefined {
-  if (isRelationSource(input)) {
-    return input;
-  }
-
-  if (isObjectBackedRelationData(input)) {
-    return fromObjectSource(input.data);
-  }
-
-  return undefined;
+  return isRelationSource(input) ? input : isDbLike(input) ? dbSource(input as Db) : undefined;
 }
 
-export function isObjectBackedRelationData(input: unknown): input is ObjectBackedRelationData {
-  const candidate = input as { readonly data?: unknown };
-  return isRecord(input) && isRecord(candidate.data);
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
+function isDbLike(input: unknown): input is Db {
+  return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
 }

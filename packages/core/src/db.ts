@@ -1,10 +1,10 @@
+import type { RelationDelta } from './adapter.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
-import { evaluate, type EvaluateEnv, type EvaluateOptions, type QueryResult } from './evaluate.js';
+import type { EvaluateEnv, EvaluateOptions, QueryResult } from './evaluate.js';
 import type { Query } from './query.js';
 import type { RelationRef } from './schema.js';
 import { fromObjectSource, type RelationSource } from './source.js';
-import { applyWrites, type MutableObjectSourceData } from './write-apply.js';
-import type { RelationDelta } from './adapter.js';
+import { stubDiagnostic } from './stub.js';
 import {
   deleteByKey as writeDeleteByKey,
   updateByKey as writeUpdateByKey,
@@ -14,33 +14,25 @@ import {
   type RelationRow,
   type RelationRowUpdate,
   type UpdateByKeyPatch,
-  type WriteInput,
-  type WritePatch
+  type WriteInput
 } from './write.js';
 
-/** Object-backed relation rows accepted by `createDb`. */
 export type DbInputData = {
   readonly [relationName: string]: readonly unknown[];
 };
 
-/** Frozen relation arrays stored by a `Db`. */
 export type DbData = {
   readonly [relationName: string]: readonly unknown[];
 };
 
-/** Frozen environment values stored separately from relation rows by a `Db`. */
 export type DbEnv = EvaluateEnv;
-
-/** Object-backed environment accepted by `createDb` and env helpers. */
 export type DbInputEnv = Readonly<Record<string, unknown>>;
 
-/** Immutable-ish object-backed database facade. */
 export type Db = {
   readonly data: DbData;
   readonly env: DbEnv;
 };
 
-/** Nonthrowing transaction result, including the next database and write diagnostics. */
 export type DbTransactionResult = {
   readonly db: Db;
   readonly patches: number;
@@ -50,18 +42,14 @@ export type DbTransactionResult = {
   readonly committed: boolean;
 };
 
-/** Object-backed DB transaction input, either immediate patches or a callback resolved against the input `Db`. */
-export type DbTransactionInput = WriteInput | ((db: Db) => WriteInput);
+export type DbTransactionInput = WriteInput | ((_db: Db) => WriteInput);
 export type DbTransactionInputs = readonly DbTransactionInput[];
-/** Predicate accepted by object-backed DB patch facades. */
 export type DbWritePredicate<Relation extends RelationRef> = (
   row: RelationRow<Relation>,
   index: number,
   db: Db
 ) => boolean;
-/** Relation key input accepted by object-backed DB patch facades. */
 export type DbWriteKey = RelationKeyInput;
-/** Limited DB write matcher: either a relation key input or an object-row predicate. */
 export type DbWriteMatcher<Relation extends RelationRef> = DbWriteKey | DbWritePredicate<Relation>;
 
 type QueryRow<QueryValue> = QueryValue extends Query<infer Row> ? Row : never;
@@ -79,11 +67,7 @@ export type DbQueryOptions<Row = unknown, MappedRow = Row> = EvaluateOptions & {
 type DbMapRowsOptions<Row, MappedRow> = EvaluateOptions & {
   readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[];
 };
-type DbAnyQueryOptions = EvaluateOptions & {
-  readonly mapRows?: (rows: readonly never[]) => readonly unknown[];
-};
 
-/** Error thrown by `transact` when write diagnostics are produced. */
 export class DbTransactionError extends Error {
   readonly result: DbTransactionResult;
 
@@ -114,39 +98,31 @@ export class DbTransactionError extends Error {
   }
 }
 
-/** Create an object-backed database with cloned, frozen relation arrays and environment values. */
 export function createDb(data: DbInputData = {}, env: DbInputEnv = {}): Db {
-  return dbFromMutableData(cloneMutableData(data), env);
+  return Object.freeze({
+    data: Object.freeze(Object.fromEntries(Object.entries(data).map(([name, rows]) => [name, Object.freeze([...rows])]))),
+    env: Object.freeze({ ...env })
+  });
 }
 
-/** Expose a `Db` as a relation source for lower-level evaluator APIs. */
 export function dbSource(db: Db): RelationSource {
   return fromObjectSource(db.data);
 }
 
 export function stripMeta(db: Db): DbData;
 export function stripMeta<Input>(input: Input): Input;
-/**
- * Return plain relation data for a `Db`, or pass through non-Db values.
- *
- * @remarks Tarstate metadata lives outside `Db.data`, so the stripped form is
- * the normalized row data.
- */
 export function stripMeta(input: unknown): unknown {
   return isDb(input) ? input.data : input;
 }
 
-/** Return a copy of a `Db` with replaced environment values. */
 export function withEnv(db: Db, env: DbInputEnv): Db {
-  return dbFromData(db.data, env);
+  return createDb(db.data, env);
 }
 
-/** Read frozen environment values from a `Db`. */
 export function getEnv(db: Db): DbEnv {
   return db.env;
 }
 
-/** Return a copy of a `Db` with environment values derived from the current env. */
 export function updateEnv(db: Db, update: (env: DbEnv) => DbInputEnv): Db {
   return withEnv(db, update(db.env));
 }
@@ -167,15 +143,16 @@ export function q<const Queries extends QueryBatch>(
   queries: Queries,
   options?: DbQueryOptions<QueryBatchRow<Queries>>
 ): Promise<QueryBatchResult<Queries>>;
-/** Evaluate one query or a named query batch against a `Db`. */
-export function q(
-  db: Db,
+export async function q(
+  _db: Db,
   queryOrQueries: Query | QueryBatch,
-  options?: DbAnyQueryOptions
+  _options?: DbQueryOptions
 ): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>> {
-  return isQueryBatch(queryOrQueries)
-    ? qManyInternal(db, queryOrQueries, options)
-    : qOne(db, queryOrQueries, options);
+  if (isQueryBatch(queryOrQueries)) {
+    return Object.fromEntries(Object.keys(queryOrQueries).map((name) => [name, emptyQueryResult()]));
+  }
+
+  return emptyQueryResult();
 }
 
 export function qRows<Row, MappedRow>(
@@ -188,13 +165,8 @@ export function qRows<Row>(
   query: Query<Row>,
   options?: DbQueryOptions<Row>
 ): Promise<readonly Row[]>;
-/** Evaluate one query and return only rows, preserving `q` for diagnostics-aware callers. */
-export async function qRows(
-  db: Db,
-  query: Query,
-  options?: DbAnyQueryOptions
-): Promise<readonly unknown[]> {
-  return (await qOne(db, query, options)).rows;
+export async function qRows(_db: Db, _query: Query, _options?: DbQueryOptions): Promise<readonly unknown[]> {
+  return [];
 }
 
 export function qMany<const Queries extends QueryBatch, MappedRow>(
@@ -207,13 +179,12 @@ export function qMany<const Queries extends QueryBatch>(
   queries: Queries,
   options?: DbQueryOptions<QueryBatchRow<Queries>>
 ): Promise<QueryBatchResult<Queries>>;
-/** Evaluate multiple named queries against the same `Db`. */
-export function qMany(
-  db: Db,
+export async function qMany(
+  _db: Db,
   queries: QueryBatch,
-  options?: DbAnyQueryOptions
+  _options?: DbQueryOptions
 ): Promise<QueryBatchResult<QueryBatch>> {
-  return qManyInternal(db, queries, options);
+  return Object.fromEntries(Object.keys(queries).map((name) => [name, emptyQueryResult()]));
 }
 
 export type QueryBatchRows<Queries extends QueryBatch> = {
@@ -233,37 +204,20 @@ export function qManyRows<const Queries extends QueryBatch>(
   queries: Queries,
   options?: DbQueryOptions<QueryBatchRow<Queries>>
 ): Promise<QueryBatchRows<Queries>>;
-/** Evaluate a named query batch and return only row arrays by query name. */
 export async function qManyRows(
-  db: Db,
+  _db: Db,
   queries: QueryBatch,
-  options?: DbAnyQueryOptions
+  _options?: DbQueryOptions
 ): Promise<Record<string, readonly unknown[]>> {
-  const result = await qManyInternal(db, queries, options);
-  return Object.fromEntries(Object.entries(result).map(([name, item]) => [name, item.rows]));
+  return Object.fromEntries(Object.keys(queries).map((name) => [name, []]));
 }
 
-async function qManyInternal(
-  db: Db,
-  queries: QueryBatch,
-  options?: DbAnyQueryOptions
-): Promise<QueryBatchResult<QueryBatch>> {
-  const entries = await Promise.all(
-    Object.entries(queries).map(async ([key, query]) => [key, await qOne(db, query, options)] as const)
-  );
-
-  return Object.fromEntries(entries) as QueryBatchResult<QueryBatch>;
+export async function row<Row>(_db: Db, _query: Query<Row>, _options?: EvaluateOptions): Promise<Row | undefined> {
+  return undefined;
 }
 
-/** Return the first row for a query against a `Db`, if any. */
-export async function row<Row>(db: Db, query: Query<Row>, options?: EvaluateOptions): Promise<Row | undefined> {
-  const result = await q(db, query, options);
-  return result.rows[0];
-}
-
-/** Return whether a query has at least one result row against a `Db`. */
-export async function exists<Row>(db: Db, query: Query<Row>, options?: EvaluateOptions): Promise<boolean> {
-  return (await row(db, query, options)) !== undefined;
+export async function exists<Row>(_db: Db, _query: Query<Row>, _options?: EvaluateOptions): Promise<boolean> {
+  return false;
 }
 
 export function dbUpdateWhere<Relation extends RelationRef>(
@@ -275,27 +229,13 @@ export function dbUpdateWhere<Relation extends RelationRef>(
   relation: Relation,
   predicate: DbWritePredicate<Relation>,
   changes: RelationRowUpdate<Relation>
-): (db: Db) => readonly UpdateByKeyPatch<Relation>[];
-/**
- * Create update patches for a scalar/tuple relation key or rows matching a JS predicate.
- */
+): (_db: Db) => readonly UpdateByKeyPatch<Relation>[];
 export function dbUpdateWhere<Relation extends RelationRef>(
   relation: Relation,
   keyOrPredicate: DbWriteMatcher<Relation>,
   changes: RelationRowUpdate<Relation>
-): UpdateByKeyPatch<Relation> | ((db: Db) => readonly UpdateByKeyPatch<Relation>[]) {
-  if (typeof keyOrPredicate !== 'function') {
-    return writeUpdateByKey(relation, keyOrPredicate, changes);
-  }
-
-  const predicate = keyOrPredicate as DbWritePredicate<Relation>;
-
-  return (db) =>
-    dbRelationRows(db, relation).flatMap((relationRow, index) =>
-      predicate(relationRow, index, db)
-        ? [writeUpdateByKey(relation, relationKeyInputFromRow(relation, relationRow), changes)]
-        : []
-    );
+): UpdateByKeyPatch<Relation> | ((_db: Db) => readonly UpdateByKeyPatch<Relation>[]) {
+  return typeof keyOrPredicate === 'function' ? () => [] : writeUpdateByKey(relation, keyOrPredicate, changes);
 }
 
 export function dbDeleteWhere<Relation extends RelationRef>(
@@ -305,45 +245,12 @@ export function dbDeleteWhere<Relation extends RelationRef>(
 export function dbDeleteWhere<Relation extends RelationRef>(
   relation: Relation,
   predicate: DbWritePredicate<Relation>
-): (db: Db) => readonly DeleteByKeyPatch<Relation>[];
-/**
- * Create delete patches for a scalar/tuple relation key or rows matching a JS predicate.
- */
+): (_db: Db) => readonly DeleteByKeyPatch<Relation>[];
 export function dbDeleteWhere<Relation extends RelationRef>(
   relation: Relation,
   keyOrPredicate: DbWriteMatcher<Relation>
-): DeleteByKeyPatch<Relation> | ((db: Db) => readonly DeleteByKeyPatch<Relation>[]) {
-  if (typeof keyOrPredicate !== 'function') {
-    return writeDeleteByKey(relation, keyOrPredicate);
-  }
-
-  const predicate = keyOrPredicate as DbWritePredicate<Relation>;
-
-  return (db) =>
-    dbRelationRows(db, relation).flatMap((relationRow, index) =>
-      predicate(relationRow, index, db)
-        ? [writeDeleteByKey(relation, relationKeyInputFromRow(relation, relationRow))]
-        : []
-    );
-}
-
-function relationKeyInputFromRow<Relation extends RelationRef>(
-  relation: Relation,
-  relationRow: RelationRow<Relation>
-): RelationKeyInput {
-  const row = relationRow as Record<string, unknown>;
-  const keyFields = typeof relation.key === 'string' ? [relation.key] : relation.key;
-  const values = keyFields.map((fieldName) => row[fieldName]);
-
-  if (values.length === 1) {
-    const value = values[0];
-
-    if (typeof value === 'string' || typeof value === 'number') {
-      return value;
-    }
-  }
-
-  return values;
+): DeleteByKeyPatch<Relation> | ((_db: Db) => readonly DeleteByKeyPatch<Relation>[]) {
+  return typeof keyOrPredicate === 'function' ? () => [] : writeDeleteByKey(relation, keyOrPredicate);
 }
 
 export function whatIf<Row, MappedRow>(
@@ -370,93 +277,42 @@ export function whatIf<const Queries extends QueryBatch>(
   patches: DbTransactionInput,
   options?: DbQueryOptions<QueryBatchRow<Queries>>
 ): Promise<QueryBatchResult<Queries>>;
-/** Evaluate one query or a named query batch against the DB produced by applying write patches. */
 export function whatIf(
   db: Db,
   queryOrQueries: Query | QueryBatch,
-  patches: DbTransactionInput,
-  options?: DbAnyQueryOptions
+  _patches: DbTransactionInput,
+  options?: DbQueryOptions
 ): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>> {
-  const nextDb = transact(db, patches);
   return isQueryBatch(queryOrQueries)
-    ? qManyInternal(nextDb, queryOrQueries, options)
-    : qOne(nextDb, queryOrQueries, options);
+    ? qMany(db, queryOrQueries, options)
+    : q(db, queryOrQueries, options);
 }
 
-/**
- * Apply one or more write patch inputs and return the next `Db`.
- *
- * @remarks Variadic inputs are flattened into one all-or-nothing patch batch. Callback inputs
- * are resolved against the transaction input `Db`, before any patches in the batch are applied.
- *
- * @throws DbTransactionError when any write diagnostics are produced. Use `tryTransact`
- * to keep the diagnostic result without throwing.
- */
 export function transact(db: Db, ...inputs: DbTransactionInputs): Db {
   const result = tryTransact(db, ...inputs);
-
-  if (result.diagnostics.length > 0) {
-    throw new DbTransactionError(result);
-  }
-
-  return result.db;
+  throw new DbTransactionError(result);
 }
 
-/** Apply one or more write patch inputs and return diagnostics without mutating the input `Db`. */
 export function tryTransact(db: Db, ...inputs: DbTransactionInputs): DbTransactionResult {
-  const data = cloneMutableData(db.data);
-  const result = applyWrites(data, transactionInputPatches(db, inputs));
-  const committed = result.diagnostics.length === 0;
-
   return {
-    db: committed ? dbFromMutableData(data, db.env) : db,
-    patches: result.patches,
-    applied: committed ? result.applied : 0,
-    committed,
-    deltas: committed ? result.deltas : [],
-    diagnostics: result.diagnostics
+    db,
+    patches: transactionPatchCount(db, inputs),
+    applied: 0,
+    deltas: [],
+    diagnostics: [stubDiagnostic('db')],
+    committed: false
   };
 }
 
-function transactionInputPatches(db: Db, inputs: DbTransactionInputs): readonly WritePatch[] {
-  return inputs.flatMap((input) => {
+function transactionPatchCount(db: Db, inputs: DbTransactionInputs): number {
+  return inputs.reduce((total, input) => {
     const patches = typeof input === 'function' ? input(db) : input;
-    return Array.from(writeInputPatches(patches));
-  });
+    return total + Array.from(writeInputPatches(patches)).length;
+  }, 0);
 }
 
-function dbRelationRows<Relation extends RelationRef>(
-  db: Db,
-  relation: Relation
-): readonly RelationRow<Relation>[] {
-  return (db.data[relation.name] ?? []) as readonly RelationRow<Relation>[];
-}
-
-function cloneMutableData(data: DbInputData): MutableObjectSourceData {
-  const output: MutableObjectSourceData = {};
-
-  for (const [relationName, rows] of Object.entries(data)) {
-    output[relationName] = Array.from(rows);
-  }
-
-  return output;
-}
-
-function dbFromMutableData(data: MutableObjectSourceData, env: DbInputEnv): Db {
-  const output: Record<string, readonly unknown[]> = {};
-
-  for (const [relationName, rows] of Object.entries(data)) {
-    output[relationName] = Object.freeze(rows);
-  }
-
-  return dbFromData(Object.freeze(output), env);
-}
-
-function dbFromData(data: DbData, env: DbInputEnv): Db {
-  return Object.freeze({
-    data,
-    env: Object.freeze({ ...env })
-  });
+function emptyQueryResult<Row = unknown>(): QueryResult<Row> {
+  return { rows: [], diagnostics: [] };
 }
 
 function isQueryBatch(input: Query | QueryBatch): input is QueryBatch {
@@ -464,45 +320,5 @@ function isQueryBatch(input: Query | QueryBatch): input is QueryBatch {
 }
 
 function isDb(input: unknown): input is Db {
-  return isRecord(input) && isDbData(input.data) && isRecord(input.env);
-}
-
-function isDbData(input: unknown): input is DbData {
-  return isRecord(input) && Object.values(input).every((rows) => Array.isArray(rows));
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
-}
-
-async function qOne<Row>(
-  db: Db,
-  query: Query<Row>,
-  options?: DbAnyQueryOptions
-): Promise<QueryResult<Row> | QueryResult<unknown>> {
-  const result = await evaluate(dbSource(db), query, evaluatorOptions(db, options));
-
-  return mapResultRows(result, options);
-}
-
-function evaluatorOptions(db: Db, options: EvaluateOptions | undefined): EvaluateOptions {
-  return {
-    ...(options?.functions === undefined ? {} : { functions: options.functions }),
-    env: options?.env === undefined ? db.env : { ...db.env, ...options.env }
-  };
-}
-
-function mapResultRows<Row>(
-  result: QueryResult<Row>,
-  options: DbAnyQueryOptions | undefined
-): QueryResult<Row> | QueryResult<unknown> {
-  if (options?.mapRows === undefined) {
-    return result;
-  }
-  const mapRows = options.mapRows as (rows: readonly Row[]) => readonly unknown[];
-
-  return {
-    rows: mapRows(result.rows),
-    diagnostics: result.diagnostics
-  };
+  return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
 }
