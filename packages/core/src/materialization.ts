@@ -22,6 +22,7 @@ import {
   type ConstraintAttachmentInput
 } from './constraints-attachment.js';
 import { stableKey } from './identity.js';
+import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
 
 declare const materializedDb: unique symbol;
 
@@ -948,6 +949,11 @@ function joinRows(
 ): readonly unknown[] {
   const left = evaluateData(target, leftData, outerRow);
   const right = evaluateData(target, rightData, outerRow);
+  const indexed = equalityJoinRows(target, kind, left, right, on);
+  if (indexed !== undefined) {
+    return indexed;
+  }
+
   const output: unknown[] = [];
 
   for (const leftRow of left) {
@@ -967,6 +973,82 @@ function joinRows(
   }
 
   return output;
+}
+
+function equalityJoinRows(
+  target: MaterializationEvalTarget,
+  kind: 'inner' | 'left',
+  left: readonly unknown[],
+  right: readonly unknown[],
+  on: PredicateData
+): readonly unknown[] | undefined {
+  const equality = equalityJoinPlan(on, (expr) => expressionSide(expr, left, right));
+  if (equality === undefined) {
+    return undefined;
+  }
+
+  if (right.length === 0) {
+    return kind === 'left' ? left : [];
+  }
+
+  const rightIndex = new Map<string, { readonly row: unknown; readonly value: unknown }[]>();
+  for (const rightRow of right) {
+    const value = exprValue(rightRow, equality.right, target);
+    const key = stableKey(value);
+    const rows = rightIndex.get(key);
+    if (rows === undefined) {
+      rightIndex.set(key, [{ row: rightRow, value }]);
+    } else {
+      rows.push({ row: rightRow, value });
+    }
+  }
+
+  const output: unknown[] = [];
+  for (const leftRow of left) {
+    const leftValue = exprValue(leftRow, equality.left, target);
+    const candidates = rightIndex.get(stableKey(leftValue)) ?? [];
+    let matched = false;
+
+    for (const candidate of candidates) {
+      if (!Object.is(leftValue, candidate.value)) {
+        continue;
+      }
+
+      const merged = { ...asRecord(leftRow), ...asRecord(candidate.row) };
+      if (!equality.needsPredicateCheck || matchesPredicate(merged, on, target)) {
+        matched = true;
+        output.push(merged);
+      }
+    }
+
+    if (!matched && kind === 'left') {
+      output.push(leftRow);
+    }
+  }
+
+  return output;
+}
+
+function expressionSide(
+  expr: FieldExpression,
+  left: readonly unknown[],
+  right: readonly unknown[]
+): 'left' | 'right' | undefined {
+  const inLeft = rowsHaveField(left, expr);
+  const inRight = rowsHaveField(right, expr);
+
+  if (inLeft === inRight) {
+    return undefined;
+  }
+
+  return inLeft ? 'left' : 'right';
+}
+
+function rowsHaveField(rows: readonly unknown[], expr: FieldExpression): boolean {
+  return rows.some((row) => {
+    const record = asRecord(row);
+    return Object.hasOwn(record, expr.alias) || Object.hasOwn(record, expr.field);
+  });
 }
 
 function expandRows(

@@ -11,6 +11,7 @@ import type {
 } from './query.js';
 import { isJsonValue, type FieldSpec, type RelationRef } from './schema.js';
 import type { RelationSource } from './source.js';
+import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
 
 export type QueryResult<Row> = {
   readonly rows: readonly Row[];
@@ -195,6 +196,11 @@ async function joinRows(
 ): Promise<readonly EvalContext[]> {
   const left = await evaluateData(leftData, state, outerRow);
   const right = await evaluateData(rightData, state, outerRow);
+  const indexed = await equalityJoinRows(kind, left, right, on, state);
+  if (indexed !== undefined) {
+    return indexed;
+  }
+
   const output: EvalContext[] = [];
 
   for (const leftRow of left) {
@@ -214,6 +220,79 @@ async function joinRows(
   }
 
   return output;
+}
+
+async function equalityJoinRows(
+  kind: 'inner' | 'left',
+  left: readonly EvalContext[],
+  right: readonly EvalContext[],
+  on: PredicateData,
+  state: EvalState
+): Promise<readonly EvalContext[] | undefined> {
+  const equality = equalityJoinPlan(on, (expr) => expressionSide(expr, left, right));
+  if (equality === undefined) {
+    return undefined;
+  }
+
+  if (right.length === 0) {
+    return kind === 'left' ? left : [];
+  }
+
+  const rightIndex = new Map<string, { readonly row: EvalContext; readonly value: unknown }[]>();
+  for (const rightRow of right) {
+    const value = await evaluateExpr(equality.right, rightRow, state);
+    const key = stableKey(value);
+    const rows = rightIndex.get(key);
+    if (rows === undefined) {
+      rightIndex.set(key, [{ row: rightRow, value }]);
+    } else {
+      rows.push({ row: rightRow, value });
+    }
+  }
+
+  const output: EvalContext[] = [];
+  for (const leftRow of left) {
+    const leftValue = await evaluateExpr(equality.left, leftRow, state);
+    const candidates = rightIndex.get(stableKey(leftValue)) ?? [];
+    let matched = false;
+
+    for (const candidate of candidates) {
+      if (!Object.is(leftValue, candidate.value)) {
+        continue;
+      }
+
+      const merged = { ...leftRow, ...candidate.row };
+      if (!equality.needsPredicateCheck || await evaluatePredicate(on, merged, state)) {
+        matched = true;
+        output.push(merged);
+      }
+    }
+
+    if (!matched && kind === 'left') {
+      output.push(leftRow);
+    }
+  }
+
+  return output;
+}
+
+function expressionSide(
+  expr: FieldExpression,
+  left: readonly EvalContext[],
+  right: readonly EvalContext[]
+): 'left' | 'right' | undefined {
+  const inLeft = rowsHaveField(left, expr);
+  const inRight = rowsHaveField(right, expr);
+
+  if (inLeft === inRight) {
+    return undefined;
+  }
+
+  return inLeft ? 'left' : 'right';
+}
+
+function rowsHaveField(rows: readonly EvalContext[], expr: FieldExpression): boolean {
+  return rows.some((row) => Object.hasOwn(row, expr.alias) || Object.hasOwn(row, expr.field));
 }
 
 async function expandRows(
@@ -249,7 +328,10 @@ async function projectRow(projection: ProjectionData, row: EvalContext, state: E
   const output: Record<string, unknown> = {};
 
   for (const [name, item] of Object.entries(projection)) {
-    output[name] = await evaluateExpr(projectionExpr(item), row, state);
+    const expr = projectionExpr(item);
+    output[name] = expr.op === 'field'
+      ? readField(row, expr.alias, expr.field)
+      : await evaluateExpr(expr, row, state);
   }
 
   return output;

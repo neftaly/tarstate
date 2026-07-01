@@ -24,8 +24,16 @@ describe('core query benchmarks', () => {
     consumeBenchResult(await qRows(medium.db, medium.queries.taskProjectOwnerJoin));
   }, options);
 
+  bench('join large: tasks to projects and owners', async () => {
+    consumeBenchResult(await qRows(large.db, large.queries.taskProjectOwnerJoin));
+  }, options);
+
   bench('leftJoin: reviewer lookup miss-heavy path', async () => {
     consumeBenchResult(await qRows(medium.db, medium.queries.reviewerLeftJoinMissHeavy));
+  }, options);
+
+  bench('leftJoin large: reviewer lookup miss-heavy path', async () => {
+    consumeBenchResult(await qRows(large.db, large.queries.reviewerLeftJoinMissHeavy));
   }, options);
 
   bench('sortLimit: top priority tasks', async () => {

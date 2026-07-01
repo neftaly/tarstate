@@ -37,6 +37,7 @@ const options = {
 };
 
 const medium = createBenchFixture('medium');
+const large = createBenchFixture('large');
 const singlePersonInsert = insert(benchSchema.people, extraPerson(0));
 const batchTaskInserts = extraTasks(medium.data, 24).map((row) => insert(benchSchema.tasks, row));
 const predicateTaskUpdate = updateWhere(benchSchema.tasks, gte(taskRef.points, 8), { priority: 5 });
@@ -49,6 +50,10 @@ const materialized = mat(createDb(medium.data), {
   projectTaskAggregates: medium.queries.projectTaskAggregates
 });
 const materializedTaskInsert = insert(benchSchema.tasks, extraTask(medium.data, 100));
+const largeMaterializedJoin = mat(createDb(large.data), {
+  taskProjectOwnerJoin: large.queries.taskProjectOwnerJoin
+});
+const largeMaterializedJoinTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 200));
 const watchBase = createDb(medium.data);
 const watchNext = transact(watchBase, insert(benchSchema.people, extraPerson(200)));
 const watchHandle = watch(watchBase, medium.queries.activePeople, () => undefined);
@@ -98,6 +103,10 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized transact: maintain affected task queries', () => {
     consumeBenchResult(transact(materialized, materializedTaskInsert));
+  }, options);
+
+  bench('materialized transact large: maintain joined task query', () => {
+    consumeBenchResult(transact(largeMaterializedJoin, largeMaterializedJoinTaskInsert));
   }, options);
 
   bench('materialized index: set rows', () => {

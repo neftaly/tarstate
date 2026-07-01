@@ -231,7 +231,8 @@ export function createBenchQueries(data: BenchData) {
       owner: personRef.name,
       role: personRef.role,
       points: taskRef.points
-    })
+    }),
+    keyBy('id')
   );
   const reviewerLeftJoinMissHeavy = pipe(
     from(taskRef),
@@ -240,7 +241,8 @@ export function createBenchQueries(data: BenchData) {
       id: taskRef.id,
       reviewer: maybe(personRef.name),
       points: taskRef.points
-    })
+    }),
+    keyBy('id')
   );
   const topPriorityTasks = pipe(
     from(taskRef),

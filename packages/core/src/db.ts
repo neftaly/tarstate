@@ -266,7 +266,7 @@ export function withEnv(db: Db, env: DbInputEnv): Db {
 export function forkDb(db: Db): Db {
   const nextDb = dbFromEngine(dbEngineFor(db), db.env);
   transferConstraintAttachments(db, nextDb);
-  maintainMaterializations(db, nextDb);
+  maintainMaterializations(db, nextDb, { deltas: [] });
   transferWatches(db, nextDb);
   return nextDb;
 }

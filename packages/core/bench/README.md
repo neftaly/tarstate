@@ -17,7 +17,7 @@ scales:
 
 - Direct relation scans through `qRows`.
 - Filter/project queries.
-- Inner joins and miss-heavy `leftJoin`.
+- Inner joins and miss-heavy `leftJoin`, including larger-scale join cases.
 - `sortLimit`.
 - Aggregates.
 - `expand` over task labels.
@@ -32,6 +32,7 @@ scales:
 - Predicate update and delete patches.
 - Rejected writes through an attached unique constraint.
 - Materialized `qRows` reads and materialized transaction maintenance.
+- Larger materialized joined-query maintenance.
 - Materialization set/hash/btree/unique index facades.
 - Watch refresh, `trackTransact`, and `diffQuery`.
 

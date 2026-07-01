@@ -20,9 +20,11 @@ import {
   insert,
   join,
   keyBy,
+  leftJoin,
   lookup,
   mat,
   materializedRowsForQuery,
+  maybe,
   numberField,
   pipe,
   project,
@@ -38,6 +40,7 @@ import {
   trackTransact,
   tryTransact,
   unique,
+  unwatch,
   updateByKey,
   updateWhere,
   value,
@@ -289,6 +292,22 @@ describe('deterministic core properties', () => {
     expect(materializedRowsForQuery(dematerialized, visibleItems)).toBeUndefined();
     await expect(qRows(dematerialized, visibleItems)).resolves.toEqual(afterRows);
   });
+
+  it('carries materialized rows across metadata-only watch forks', () => {
+    const state = mat(createDb({
+      items: [
+        { id: 'a', bucket: 'alpha', value: 1, active: true },
+        { id: 'b', bucket: 'beta', value: 2, active: false }
+      ]
+    }), visibleItems, { id: 'visible-items' });
+    const rows = materializedRowsForQuery(state, visibleItems);
+
+    const watched = watch(state, visibleItems, itemSchema.items) as Db;
+    expect(materializedRowsForQuery(watched, visibleItems)).toBe(rows);
+
+    const unwatched = unwatch(watched, visibleItems, itemSchema.items) as Db;
+    expect(materializedRowsForQuery(unwatched, visibleItems)).toBe(rows);
+  });
 });
 
 const operations = ['insert', 'updateByKey', 'updateWhere', 'deleteByKey', 'deleteWhere'] as const;
@@ -296,6 +315,7 @@ type Operation = (typeof operations)[number];
 
 function fixtureQueries() {
   const user = as(coreSchema.users, 'user');
+  const team = as(coreSchema.teams, 'team');
   const task = as(coreSchema.tasks, 'task');
 
   return {
@@ -321,6 +341,28 @@ function fixtureQueries() {
         id: task.id,
         owner: user.name,
         title: task.title,
+        points: task.points
+      }),
+      keyBy('id')
+    ),
+    userTeamsLeft: pipe(
+      from(user),
+      leftJoin(from(team), eq(user.teamId, team.id)),
+      sort(user.id),
+      project({
+        id: user.id,
+        name: user.name,
+        team: maybe(team.name)
+      }),
+      keyBy('id')
+    ),
+    residualTaskOwners: pipe(
+      from(task),
+      join(from(user), and(eq(task.ownerId, user.id), gt(task.points, value(4)))),
+      sort(task.id),
+      project({
+        id: task.id,
+        owner: user.name,
         points: task.points
       }),
       keyBy('id')
