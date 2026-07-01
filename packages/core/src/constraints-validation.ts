@@ -1,7 +1,16 @@
 import type { Db } from './db.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
 import { evaluate, type EvaluateOptions } from './evaluate.js';
-import type { ExprData, PredicateData, Query } from './query.js';
+import {
+  queryKey,
+  type ExprData,
+  type OptionalProjection,
+  type PredicateData,
+  type ProjectionData,
+  type Query,
+  type QueryData,
+  type SortData
+} from './query.js';
 import type { RelationSource } from './source.js';
 import type { RelationSourceInput } from './source-input.js';
 import type { ConstraintData, ConstraintSet } from './constraints.js';
@@ -61,15 +70,20 @@ async function validateConstraint(
   constraint: ConstraintData,
   options: ConstraintValidationOptions
 ): Promise<readonly TarstateDiagnostic[]> {
+  const cascadeDiagnostics = validateCascadeSupport(constraint);
+  if (cascadeDiagnostics.length > 0) {
+    return cascadeDiagnostics;
+  }
+
   switch (constraint.op) {
     case 'req':
       return 'relation' in constraint
         ? validateRequired(await rowsFor(source, constraint.relation), constraint.relation.name, constraint.field)
-        : validateRequired(await queryRowsFor(source, constraint.query, options), 'query', constraint.field);
+        : validateRequired(await queryRowsFor(source, constraint.query, options), queryRelationName(constraint.query), constraint.field);
     case 'unique':
       return 'relation' in constraint
         ? validateUnique(await rowsFor(source, constraint.relation), constraint.relation.name, constraint.fields)
-        : validateUnique(await queryRowsFor(source, constraint.query, options), 'query', constraint.fields);
+        : validateUnique(await queryRowsFor(source, constraint.query, options), queryRelationName(constraint.query), constraint.fields);
     case 'fk':
       return 'relation' in constraint && !('data' in constraint.target)
         ? validateForeignKey(
@@ -84,20 +98,25 @@ async function validateConstraint(
     case 'check':
       return constraint.query === undefined
         ? []
-        : validateCheck(await queryRowsFor(source, constraint.query, options), constraint.predicate);
+        : validateCheck(await queryRowsFor(source, constraint.query, options), constraint.predicate, queryRelationName(constraint.query));
   }
 }
 
 function validateConstraintSync(db: Db, constraint: ConstraintData): readonly TarstateDiagnostic[] {
+  const cascadeDiagnostics = validateCascadeSupport(constraint);
+  if (cascadeDiagnostics.length > 0) {
+    return cascadeDiagnostics;
+  }
+
   switch (constraint.op) {
     case 'req':
       return 'relation' in constraint
         ? validateRequired(db.data[constraint.relation.name] ?? [], constraint.relation.name, constraint.field)
-        : [];
+        : validateRequired(queryRowsForSync(db, constraint.query), queryRelationName(constraint.query), constraint.field);
     case 'unique':
       return 'relation' in constraint
         ? validateUnique(db.data[constraint.relation.name] ?? [], constraint.relation.name, constraint.fields)
-        : [];
+        : validateUnique(queryRowsForSync(db, constraint.query), queryRelationName(constraint.query), constraint.fields);
     case 'fk':
       return 'relation' in constraint && !('data' in constraint.target)
         ? validateForeignKey(
@@ -108,9 +127,11 @@ function validateConstraintSync(db: Db, constraint: ConstraintData): readonly Ta
             constraint.targetFields,
             constraint.optional
           )
-        : [];
+        : validateQueryForeignKeySync(db, constraint);
     case 'check':
-      return [];
+      return constraint.query === undefined
+        ? []
+        : validateCheck(queryRowsForSync(db, constraint.query), constraint.predicate, queryRelationName(constraint.query));
   }
 }
 
@@ -119,7 +140,10 @@ async function queryRowsFor<Row>(
   query: Query<Row>,
   options: ConstraintValidationOptions
 ): Promise<readonly Row[]> {
-  return (await evaluate(source, query, options)).rows;
+  const result = await evaluate(source, query, options);
+  return result.diagnostics.length === 0
+    ? result.rows
+    : [...diagnosticRows(result.diagnostics), ...result.rows] as readonly Row[];
 }
 
 async function validateQueryForeignKey(
@@ -135,7 +159,36 @@ async function validateQueryForeignKey(
   const targetRows = 'data' in constraint.target
     ? await queryRowsFor(source, constraint.target, options)
     : await rowsFor(source, constraint.target);
-  return validateForeignKey(sourceRows, targetRows, 'query', constraint.fields, constraint.targetFields, constraint.optional);
+  return validateForeignKey(
+    sourceRows,
+    targetRows,
+    queryRelationName(constraint.query),
+    constraint.fields,
+    constraint.targetFields,
+    constraint.optional
+  );
+}
+
+function validateQueryForeignKeySync(
+  db: Db,
+  constraint: Extract<ConstraintData, { readonly op: 'fk' }>
+): readonly TarstateDiagnostic[] {
+  if (!('query' in constraint)) {
+    return [];
+  }
+
+  const sourceRows = queryRowsForSync(db, constraint.query);
+  const targetRows = 'data' in constraint.target
+    ? queryRowsForSync(db, constraint.target)
+    : db.data[constraint.target.name] ?? [];
+  return validateForeignKey(
+    sourceRows,
+    targetRows,
+    queryRelationName(constraint.query),
+    constraint.fields,
+    constraint.targetFields,
+    constraint.optional
+  );
 }
 
 async function rowsFor(source: RelationSource, relation: { readonly name: string }): Promise<readonly unknown[]> {
@@ -243,11 +296,45 @@ function validateForeignKey(
 
 function validateCheck(
   rows: readonly unknown[],
-  predicate: PredicateData
+  predicate: PredicateData,
+  relation = 'query'
 ): readonly TarstateDiagnostic[] {
-  return rows.flatMap((row) => evaluatePredicate(row, predicate)
-    ? []
-    : [constraintDiagnostic('constraint_check', 'check constraint failed', 'query', '', rowKey(row))]);
+  return rows.flatMap((row) => {
+    if (diagnosticRow(row)) return [row.__tarstateDiagnostic];
+    return evaluatePredicate(row, predicate)
+      ? []
+      : [constraintDiagnostic('constraint_check', 'check constraint failed', relation, '', rowKey(row))];
+  });
+}
+
+function validateCascadeSupport(constraint: ConstraintData): readonly TarstateDiagnostic[] {
+  if (constraint.op !== 'fk' || constraint.cascade === undefined || constraint.cascade === false) {
+    return [];
+  }
+
+  const supportedMode = constraint.cascade === true || constraint.cascade === 'delete';
+  const directRelationFk = 'relation' in constraint && !('data' in constraint.target);
+  if (supportedMode && directRelationFk) {
+    return [];
+  }
+
+  return [constraintDiagnostic(
+    'constraint_fk_cascade_unsupported',
+    supportedMode
+      ? 'foreign key cascade is only supported for direct relation foreign keys'
+      : `unsupported foreign key cascade mode ${String(constraint.cascade)}`,
+    constraintRelationName(constraint),
+    constraint.op === 'fk' ? constraint.fields.join(',') : '',
+    undefined,
+    {
+      kind: constraint.op,
+      relation: constraintRelationName(constraint),
+      target: constraint.op === 'fk' ? constraintTargetName(constraint) : undefined,
+      fields: constraint.op === 'fk' ? constraint.fields : undefined,
+      targetFields: constraint.op === 'fk' ? constraint.targetFields : undefined,
+      cascade: constraint.op === 'fk' ? constraint.cascade : undefined
+    }
+  )];
 }
 
 function evaluatePredicate(row: unknown, predicate: PredicateData): boolean {
@@ -299,6 +386,120 @@ function valuesFor(row: unknown, fields: readonly string[]): readonly unknown[] 
   return fields.map((field) => isRecord(row) ? row[field] : undefined);
 }
 
+function queryRowsForSync<Row>(db: Db, query: Query<Row>): readonly Row[] {
+  return evaluateQueryDataSync(db, query.data, query) as readonly Row[];
+}
+
+function evaluateQueryDataSync(db: Db, data: QueryData, query: Query): readonly unknown[] {
+  switch (data.op) {
+    case 'from': {
+      const relation = query.relations[data.relation];
+      return relation === undefined
+        ? []
+        : (db.data[relation.name] ?? []).filter(isRecord).map((row) => ({ [data.alias]: row }));
+    }
+    case 'lookup': {
+      const relation = query.relations[data.relation];
+      if (relation === undefined) return [];
+      const value = exprValue({}, data.value);
+      return (db.data[relation.name] ?? [])
+        .filter((row) => isRecord(row) && Object.is(row[data.field], value))
+        .map((row) => ({ [data.alias]: row }));
+    }
+    case 'constRows':
+      return data.rows;
+    case 'where': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : rows.filter((row) => evaluatePredicate(row, data.predicate));
+    }
+    case 'hash':
+    case 'btree':
+    case 'keyBy':
+      return evaluateQueryDataSync(db, data.input, query);
+    case 'select': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : rows.map((row) => projectRow(row, data.projection));
+    }
+    case 'extend': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : rows.map((row) => ({ ...asRecord(row), ...projectRow(row, data.projection) }));
+    }
+    case 'without': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : rows.map((row) => {
+        const output = { ...asRecord(row) };
+        for (const field of data.fields) {
+          delete output[field];
+        }
+        return output;
+      });
+    }
+    case 'sort': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : sortRows(rows, data.order);
+    }
+    case 'limit': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : rows.slice(data.offset ?? 0, (data.offset ?? 0) + data.count);
+    }
+    case 'sortLimit': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : sortRows(rows, data.order).slice(0, data.count);
+    }
+    case 'rename': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : rows.map((row) => renameRow(row, data.fields));
+    }
+    case 'qualify': {
+      const rows = evaluateQueryDataSync(db, data.input, query);
+      return hasDiagnosticRows(rows) ? rows : rows.map((row) => ({ [data.alias]: row }));
+    }
+    default:
+      return [diagnosticRowFor({
+        code: 'constraint_query_sync_unsupported',
+        message: `query op ${(data as { readonly op: string }).op} cannot be validated synchronously`,
+        relation: queryRelationName(query),
+        detail: { op: (data as { readonly op: string }).op }
+      })];
+  }
+}
+
+function projectRow(row: unknown, projection: ProjectionData): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(projection).map(([field, item]) => [
+    field,
+    exprValue(row, projectionExpr(item))
+  ]));
+}
+
+function projectionExpr(input: ProjectionData[string]): ExprData {
+  return isOptionalProjection(input) ? input.expr : input;
+}
+
+function isOptionalProjection(input: ProjectionData[string]): input is OptionalProjection {
+  return isRecord(input) && 'kind' in input && input.kind === 'optionalProjection';
+}
+
+function renameRow(row: unknown, fields: Record<string, string>): Record<string, unknown> {
+  const output = { ...asRecord(row) };
+  for (const [from, to] of Object.entries(fields)) {
+    output[to] = output[from];
+    delete output[from];
+  }
+  return output;
+}
+
+function sortRows(rows: readonly unknown[], order: readonly SortData[]): readonly unknown[] {
+  return [...rows].sort((left, right) => {
+    for (const item of order) {
+      const compared = compareValues(exprValue(left, item.expr), exprValue(right, item.expr));
+      if (compared !== 0) {
+        return item.direction === 'desc' ? -compared : compared;
+      }
+    }
+    return 0;
+  });
+}
+
 function stableKeyValue(values: readonly unknown[]): string {
   return stableKey(values.length === 1 ? values[0] : values);
 }
@@ -318,19 +519,51 @@ function constraintDiagnostic(
   message: string,
   relation: string,
   field: string,
-  key: string | undefined
+  key: string | undefined,
+  detail?: unknown
 ): TarstateDiagnostic {
   return {
     code,
     message,
     relation,
     field,
-    ...(key === undefined ? {} : { key })
-  } as TarstateDiagnostic;
+    ...(key === undefined ? {} : { key }),
+    ...(detail === undefined ? {} : { detail })
+  } satisfies TarstateDiagnostic;
+}
+
+function diagnosticRows(diagnostics: readonly TarstateDiagnostic[]): readonly { readonly __tarstateDiagnostic: TarstateDiagnostic }[] {
+  return diagnostics.map(diagnosticRowFor);
+}
+
+function diagnosticRowFor(diagnostic: TarstateDiagnostic): { readonly __tarstateDiagnostic: TarstateDiagnostic } {
+  return { __tarstateDiagnostic: diagnostic };
+}
+
+function queryRelationName(query: Query): string {
+  return queryKey(query);
+}
+
+function constraintRelationName(constraint: ConstraintData): string {
+  if ('relation' in constraint) return constraint.relation.name;
+  if ('query' in constraint) return queryRelationName(constraint.query);
+  return 'query';
+}
+
+function constraintTargetName(constraint: Extract<ConstraintData, { readonly op: 'fk' }>): string {
+  return 'data' in constraint.target ? queryRelationName(constraint.target) : constraint.target.name;
+}
+
+function asRecord(input: unknown): Record<string, unknown> {
+  return isRecord(input) ? input : {};
 }
 
 function diagnosticRow(input: unknown): input is { readonly __tarstateDiagnostic: TarstateDiagnostic } {
   return isRecord(input) && '__tarstateDiagnostic' in input;
+}
+
+function hasDiagnosticRows(rows: readonly unknown[]): boolean {
+  return rows.some(diagnosticRow);
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {

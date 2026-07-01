@@ -11,12 +11,14 @@ import {
   db,
   deleteByKey,
   desc,
+  demat,
   difference,
   env,
   eq,
   exists,
   extend,
   fk,
+  field,
   from,
   getEnv,
   gt,
@@ -32,6 +34,7 @@ import {
   limit,
   lookup,
   mat,
+  materializationsFor,
   materializedRowsForQuery,
   maybe,
   pipe,
@@ -41,6 +44,7 @@ import {
   qManyRows,
   qRows,
   qualify,
+  queryKey,
   rename,
   row,
   sel,
@@ -53,6 +57,7 @@ import {
   tryTransactConstrained,
   tryTransact,
   union,
+  unwatch,
   updateEnv,
   updateWhere,
   value,
@@ -172,6 +177,119 @@ describe('TypeScript Relic core acceptance', () => {
       lookup: { rows: [{ id: 'ada', name: 'Ada' }] },
       qualified: { rows: [{ item: { id: 'x' } }] }
     });
+  });
+
+  it('supports in-memory host function expressions without replacing named calls', async () => {
+    const state = createDb(sourceData);
+    const user = as(coreSchema.users, 'user');
+    const ageBand = (age: number) => age >= 30 ? 'senior' : 'junior';
+    const initials = (name: string, teamId: string) => `${name[0]}:${teamId}`;
+    const query = pipe(
+      from(user),
+      project({
+        id: user.id,
+        band: call(ageBand, user.age),
+        initials: call(initials, user.name, user.teamId)
+      }),
+      sort(user.id)
+    );
+    const sameFunctionQuery = pipe(
+      from(user),
+      project({ id: user.id, band: call(ageBand, user.age) })
+    );
+    const sameFunctionQueryAgain = pipe(
+      from(user),
+      project({ id: user.id, band: call(ageBand, user.age) })
+    );
+
+    await expect(qRows(state, query)).resolves.toEqual([
+      { id: 'ada', band: 'senior', initials: 'A:eng' },
+      { id: 'bea', band: 'junior', initials: 'B:design' },
+      { id: 'cal', band: 'senior', initials: 'C:missing' }
+    ]);
+    expect(queryKey(sameFunctionQuery)).toBe(queryKey(sameFunctionQueryAgain));
+    expect(JSON.stringify(query.data)).not.toContain('fn');
+
+    const serialized = {
+      ...query,
+      data: JSON.parse(JSON.stringify(query.data))
+    };
+    await expect(q(state, serialized)).resolves.toMatchObject({
+      diagnostics: [
+        expect.objectContaining({
+          code: 'unsupported_expression',
+          message: expect.stringContaining('host function')
+        }),
+        expect.objectContaining({
+          code: 'unsupported_expression',
+          message: expect.stringContaining('host function')
+        }),
+        expect.objectContaining({
+          code: 'unsupported_expression',
+          message: expect.stringContaining('host function')
+        }),
+        expect.objectContaining({
+          code: 'unsupported_expression',
+          message: expect.stringContaining('host function')
+        }),
+        expect.objectContaining({
+          code: 'unsupported_expression',
+          message: expect.stringContaining('host function')
+        }),
+        expect.objectContaining({
+          code: 'unsupported_expression',
+          message: expect.stringContaining('host function')
+        })
+      ]
+    });
+  });
+
+  it('applies q output options and per-entry batch query specs', async () => {
+    const state = createDb(sourceData);
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, age: user.age, name: user.name })
+    );
+
+    await expect(qRows(state, coreSchema.users, {
+      sort: 'age',
+      mapRows: (rows) => rows.map((row) => row.name)
+    })).resolves.toEqual(['Bea', 'Ada', 'Cal']);
+
+    const idSet = await q(state, activeUsers, {
+      rsort: (row) => row.age,
+      mapRows: (rows) => rows.map((row) => row.id),
+      into: (rows) => new Set(rows)
+    });
+    expect(idSet.rows).toEqual(new Set(['ada', 'bea']));
+
+    await expect(qManyRows(state, {
+      activeIds: {
+        q: activeUsers,
+        rsort: 'age',
+        mapRows: (rows) => rows.map((row) => row.id)
+      },
+      teamNames: {
+        q: coreSchema.teams,
+        sort: 'name',
+        mapRows: (rows) => rows.map((row) => row.name)
+      }
+    })).resolves.toEqual({
+      activeIds: ['ada', 'bea'],
+      teamNames: ['Design', 'Engineering']
+    });
+  });
+
+  it('accepts extra where predicates on row and exists reads', async () => {
+    const state = createDb(sourceData);
+    const user = as(coreSchema.users, 'user');
+
+    await expect(row(state, from(user), eq(user.id, 'bea'))).resolves.toMatchObject({ id: 'bea' });
+    await expect(row(state, coreSchema.users, eq(field('users', 'id'), 'ada'))).resolves.toMatchObject({ id: 'ada' });
+    await expect(exists(state, from(user), eq(user.id, 'bea'), eq(user.active, true))).resolves.toBe(true);
+    await expect(exists(state, from(user), eq(user.id, 'cal'), eq(user.active, true))).resolves.toBe(false);
   });
 
   it('evaluates correlated sel and sel1 expressions', async () => {
@@ -300,6 +418,93 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
   });
 
+  it('maintains multiple materialized queries independently across transactions', async () => {
+    const user = as(coreSchema.users, 'user');
+    const task = as(coreSchema.tasks, 'task');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name, teamId: user.teamId }),
+      keyBy('id')
+    );
+    const openTasks = pipe(
+      from(task),
+      where(eq(task.done, false)),
+      project({ id: task.id, ownerId: task.ownerId, points: task.points }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), { activeUsers, openTasks });
+
+    expect(materializationsFor(state).map((entry) => entry.id).sort()).toEqual(['activeUsers', 'openTasks']);
+
+    const next = transact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      }),
+      insert(coreSchema.tasks, {
+        id: 't4',
+        ownerId: 'dia',
+        title: 'Wire materialization',
+        done: false,
+        points: 2
+      }),
+      updateWhere(coreSchema.users, eq(user.id, 'bea'), { active: false })
+    );
+
+    await expect(qRows(next, activeUsers)).resolves.toEqual([
+      { id: 'ada', name: 'Ada', teamId: 'eng' },
+      { id: 'dia', name: 'Dia', teamId: 'eng' }
+    ]);
+    await expect(qRows(next, openTasks)).resolves.toEqual([
+      { id: 't1', ownerId: 'ada', points: 5 },
+      { id: 't3', ownerId: 'bea', points: 3 },
+      { id: 't4', ownerId: 'dia', points: 2 }
+    ]);
+    expect(materializedRowsForQuery(next, activeUsers)).toEqual([
+      { id: 'ada', name: 'Ada', teamId: 'eng' },
+      { id: 'dia', name: 'Dia', teamId: 'eng' }
+    ]);
+    expect(materializedRowsForQuery(next, openTasks)).toEqual([
+      { id: 't1', ownerId: 'ada', points: 5 },
+      { id: 't3', ownerId: 'bea', points: 3 },
+      { id: 't4', ownerId: 'dia', points: 2 }
+    ]);
+  });
+
+  it('materializes and maintains joined query rows through snapshot recompute', () => {
+    const user = as(coreSchema.users, 'user');
+    const team = as(coreSchema.teams, 'team');
+    const activeUserTeams = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      join(from(team), eq(user.teamId, team.id)),
+      project({ id: user.id, name: user.name, team: team.name, rank: team.rank }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), activeUserTeams, { id: 'active-user-teams' });
+
+    expect(materializedRowsForQuery(state, activeUserTeams)).toEqual([
+      { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+      { id: 'bea', name: 'Bea', team: 'Design', rank: 2 }
+    ]);
+
+    const next = transact(
+      state,
+      updateWhere(coreSchema.teams, eq(team.id, 'eng'), { rank: 3 }),
+      updateWhere(coreSchema.users, eq(user.id, 'bea'), { active: false })
+    );
+
+    expect(materializedRowsForQuery(next, activeUserTeams)).toEqual([
+      { id: 'ada', name: 'Ada', team: 'Engineering', rank: 3 }
+    ]);
+  });
+
   it('builds set, hash, unique, and btree facades over materialized rows', () => {
     const user = as(coreSchema.users, 'user');
     const activeUsers = pipe(
@@ -321,6 +526,55 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
     expect(uniqueIndex.index?.lookup.get('bea')).toEqual({ id: 'bea', name: 'Bea', age: 29, teamId: 'design' });
     expect(btreeIndex.index?.ordered).toEqual([29, 37]);
+    expect(hashIndex.index?.get('eng')).toEqual([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
+    ]);
+    expect(hashIndex.index?.has('ops')).toBe(false);
+    expect(uniqueIndex.index?.get('ada')).toEqual({ id: 'ada', name: 'Ada', age: 37, teamId: 'eng' });
+    expect(btreeIndex.index?.range({ lower: 30 })).toEqual([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
+    ]);
+  });
+
+  it('refreshes materialized index facades after transact and removes them with demat', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name, age: user.age, teamId: user.teamId }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), activeUsers, { id: 'active-users' });
+    const next = transact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      }),
+      updateWhere(coreSchema.users, eq(user.id, 'bea'), { active: false })
+    );
+
+    const hashIndex = index(next, 'active-users', { kind: 'hash', field: 'teamId' });
+    const btreeIndex = index(next, 'active-users', { kind: 'btree', field: 'age' });
+
+    expect(hashIndex.index?.get('eng')).toEqual([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' },
+      { id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }
+    ]);
+    expect(btreeIndex.index?.range({ lower: { value: 25, inclusive: true }, upper: 40 })).toEqual([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
+    ]);
+
+    const materializedResult = await qRows(next, activeUsers);
+    const dematerialized = demat(next, activeUsers);
+
+    expect(materializedRowsForQuery(dematerialized, activeUsers)).toBeUndefined();
+    expect(index(dematerialized, 'active-users').indexed).toBe(false);
+    await expect(qRows(dematerialized, activeUsers)).resolves.toEqual(materializedResult);
   });
 
   it('tracks DB-centered watch and materialization diffs through trackTransact', async () => {
@@ -362,6 +616,98 @@ describe('TypeScript Relic core acceptance', () => {
       { id: 'ada', name: 'Ada' },
       { id: 'bea', name: 'Bea' },
       { id: 'dia', name: 'Dia' }
+    ]);
+  });
+
+  it('registers Relic-style watched queries on returned DB values', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    );
+    const state = createDb(sourceData);
+    const watched = watch(state, activeUsers);
+
+    expect(watched).not.toBe(state);
+    await expect(trackTransact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      })
+    )).resolves.toMatchObject({ changes: [] });
+
+    const tracked = await trackTransact(
+      watched,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      })
+    );
+    const activeUsersChange = tracked.changes.find((change) => change.id === queryKey(activeUsers));
+
+    expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
+    expect(activeUsersChange).toMatchObject({
+      changed: true,
+      addedRows: [{ id: 'dia', name: 'Dia' }],
+      removedRows: [],
+      rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'dia', name: 'Dia' } })]
+    });
+
+    const removed = await trackTransact(tracked.db, deleteByKey(coreSchema.users, 'bea'));
+    expect(removed.changes.find((change) => change.id === queryKey(activeUsers))).toMatchObject({
+      changed: true,
+      addedRows: [],
+      deletedRows: [{ id: 'bea', name: 'Bea' }],
+      removedRows: [{ id: 'bea', name: 'Bea' }],
+      rowChanges: [expect.objectContaining({ kind: 'removed', row: { id: 'bea', name: 'Bea' } })]
+    });
+
+    const unwatched = unwatch(removed.db, activeUsers);
+    const afterUnwatch = await trackTransact(
+      unwatched,
+      insert(coreSchema.users, {
+        id: 'eli',
+        teamId: 'eng',
+        name: 'Eli',
+        active: true,
+        age: 31,
+        tags: []
+      })
+    );
+    expect(afterUnwatch.result).toMatchObject({ committed: true, applied: 1 });
+    expect(afterUnwatch.changes).toEqual([]);
+  });
+
+  it('does not publish watched changes for rejected transactions', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    );
+    const watched = watch(createDb(sourceData), activeUsers);
+    const failed = await trackTransact(watched, insert(coreSchema.users, adaUser));
+
+    expect(failed.result).toMatchObject({ committed: false, applied: 0 });
+    expect(failed.changes).toEqual([]);
+    expect(failed.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'duplicate_key' })
+    ]));
+    await expect(qRows(failed.db, activeUsers)).resolves.toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
     ]);
   });
 

@@ -2,13 +2,15 @@ import type { RelationDelta } from './adapter.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
 import { evaluate, validateRelationRow, type EvaluateEnv, type EvaluateOptions, type QueryResult } from './evaluate.js';
 import { maintainMaterializations, queryRowsFromMaterialization } from './materialization.js';
-import type { PredicateData, Query } from './query.js';
+import { constRows, where, type PredicateData, type Query } from './query.js';
 import type { RelationRef } from './schema.js';
 import { fromObjectSource, type RelationSource } from './source.js';
-import { transferConstraintAttachments } from './constraints-attachment.js';
+import type { ConstraintValidationInput } from './constraints-validation.js';
+import { attachedConstraintsFor, constraintDataList, transferConstraintAttachments } from './constraints-attachment.js';
 import { validateAttachedConstraintsSync } from './constraints-validation.js';
 import { transferWatches } from './watch.js';
 import { applyWrites, type MutableObjectSourceData } from './write-apply.js';
+import type { ConstraintData } from './constraints.js';
 import {
   deleteByKey as writeDeleteByKey,
   updateByKey as writeUpdateByKey,
@@ -69,8 +71,12 @@ type DbEngineTransactionResult = {
 type DbEngine = {
   readonly kind: string;
   read(): DbData;
-  transact(patches: readonly WritePatch[]): DbEngineTransactionResult;
+  transact(patches: readonly WritePatch[], options?: DbEngineTransactionOptions): DbEngineTransactionResult;
   version(): unknown;
+};
+
+type DbEngineTransactionOptions = {
+  readonly constraints?: readonly ConstraintData[];
 };
 
 const dbEngineSymbol: unique symbol = Symbol('tarstate.dbEngine');
@@ -165,24 +171,46 @@ export type DbWriteMatcher<Relation extends RelationRef> = DbWriteKey | DbWriteP
 
 type RelationQueryRow<QueryValue> = QueryValue extends Query<infer Row>
   ? Row
+  : QueryValue extends QueryBatchItemSpec<infer Target>
+    ? RelationQueryRow<Target>
   : QueryValue extends RelationRef<infer Row>
     ? Row
     : unknown;
 type QueryOrRelation<Row = unknown> = Query<Row> | RelationRef | string;
+type QueryBatchItemSpec<QueryValue extends QueryOrRelation = QueryOrRelation> =
+  DbRuntimeQueryOptions<any, any> & {
+    readonly q: QueryValue;
+  };
+type QueryBatchItem = QueryOrRelation | QueryBatchItemSpec;
 type QueryBatchRow<Queries extends QueryBatch> = RelationQueryRow<Queries[keyof Queries]>;
-export type QueryBatch = Record<string, QueryOrRelation>;
+export type QueryBatch = Record<string, QueryBatchItem>;
 export type QueryBatchResult<Queries extends QueryBatch> = {
   readonly [Key in keyof Queries]: QueryResult<RelationQueryRow<Queries[Key]>>;
 };
 export type MappedQueryBatchResult<Queries extends QueryBatch, MappedRow> = {
   readonly [Key in keyof Queries]: QueryResult<MappedRow>;
 };
-export type DbQueryOptions<Row = unknown, MappedRow = Row> = EvaluateOptions & {
+export type DbQueryIntoResult<Row, Rows> = Omit<QueryResult<Row>, 'rows'> & {
+  readonly rows: Rows;
+};
+export type DbQueryOptions<Row = any, MappedRow = Row> = EvaluateOptions & {
+  readonly sort?: DbQuerySort<Row>;
+  readonly rsort?: DbQuerySort<Row>;
   readonly mapRows?: (rows: readonly Row[]) => readonly MappedRow[];
 };
 type DbMapRowsOptions<Row, MappedRow> = EvaluateOptions & {
+  readonly sort?: DbQuerySort<Row>;
+  readonly rsort?: DbQuerySort<Row>;
   readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[];
 };
+type DbRuntimeQueryOptions<Row = any, MappedRow = Row> = DbQueryOptions<Row, MappedRow> & {
+  readonly into?: (rows: readonly MappedRow[]) => unknown;
+};
+type DbRowsQueryOptions<Row = any, MappedRow = Row> = Omit<DbQueryOptions<Row, MappedRow>, 'into'>;
+type DbRowsMapOptions<Row, MappedRow> = Omit<DbMapRowsOptions<Row, MappedRow>, 'into'>;
+export type DbQuerySort<Row = any> = DbQuerySortKey<Row> | readonly DbQuerySortKey<Row>[];
+export type DbQuerySortKey<Row = any> = string | DbQuerySortSelector<Row>;
+type DbQuerySortSelector<Row> = { bivarianceHack(row: Row): unknown }['bivarianceHack'];
 
 export class DbTransactionError extends Error {
   readonly result: DbTransactionResult;
@@ -235,6 +263,14 @@ export function withEnv(db: Db, env: DbInputEnv): Db {
   return dbFromEngine(dbEngineFor(db), env);
 }
 
+export function forkDb(db: Db): Db {
+  const nextDb = dbFromEngine(dbEngineFor(db), db.env);
+  transferConstraintAttachments(db, nextDb);
+  maintainMaterializations(db, nextDb);
+  transferWatches(db, nextDb);
+  return nextDb;
+}
+
 export function getEnv(db: Db): DbEnv {
   return db.env;
 }
@@ -243,12 +279,27 @@ export function updateEnv(db: Db, update: (env: DbEnv) => DbInputEnv): Db {
   return withEnv(db, update(db.env));
 }
 
+export function q<Row, MappedRow, Rows>(
+  db: Db,
+  query: QueryOrRelation<Row>,
+  options: DbMapRowsOptions<Row, MappedRow> & { readonly into: (rows: readonly MappedRow[]) => Rows }
+): Promise<DbQueryIntoResult<MappedRow, Rows>>;
 export function q<Row, MappedRow>(
   db: Db,
   query: QueryOrRelation<Row>,
   options: DbMapRowsOptions<Row, MappedRow>
 ): Promise<QueryResult<MappedRow>>;
+export function q<Row, Rows>(
+  db: Db,
+  query: Query<Row>,
+  options: DbQueryOptions<Row> & { readonly into: (rows: readonly Row[]) => Rows }
+): Promise<DbQueryIntoResult<Row, Rows>>;
 export function q<Row>(db: Db, query: Query<Row>, options?: DbQueryOptions<Row>): Promise<QueryResult<Row>>;
+export function q<Relation extends RelationRef, Rows>(
+  db: Db,
+  relation: Relation,
+  options: DbQueryOptions<RelationRow<Relation>> & { readonly into: (rows: readonly RelationRow<Relation>[]) => Rows }
+): Promise<DbQueryIntoResult<RelationRow<Relation>, Rows>>;
 export function q<Relation extends RelationRef>(
   db: Db,
   relation: Relation,
@@ -267,7 +318,7 @@ export function q<const Queries extends QueryBatch>(
 ): Promise<QueryBatchResult<Queries>>;
 export function q(
   db: Db,
-  queryOrQueries: Query | QueryBatch,
+  queryOrQueries: QueryOrRelation | QueryBatch,
   options?: DbQueryOptions
 ): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>>;
 export async function q(
@@ -291,17 +342,27 @@ export async function q(
   return mappedResult(await evaluate(dbSource(db), queryOrQueries, evaluateOptions(db, options)), options);
 }
 
+export function qRows<Relation extends RelationRef, MappedRow>(
+  db: Db,
+  relation: Relation,
+  options: DbRowsMapOptions<RelationRow<Relation>, MappedRow>
+): Promise<readonly MappedRow[]>;
+export function qRows<Relation extends RelationRef>(
+  db: Db,
+  relation: Relation,
+  options?: DbRowsQueryOptions<RelationRow<Relation>>
+): Promise<readonly RelationRow<Relation>[]>;
 export function qRows<Row, MappedRow>(
   db: Db,
   query: QueryOrRelation<Row>,
-  options: DbMapRowsOptions<Row, MappedRow>
+  options: DbRowsMapOptions<Row, MappedRow>
 ): Promise<readonly MappedRow[]>;
 export function qRows<Row>(
   db: Db,
   query: QueryOrRelation<Row>,
-  options?: DbQueryOptions<Row>
+  options?: DbRowsQueryOptions<Row>
 ): Promise<readonly Row[]>;
-export async function qRows(db: Db, query: QueryOrRelation, options?: DbQueryOptions): Promise<readonly unknown[]> {
+export async function qRows(db: Db, query: QueryOrRelation, options?: any): Promise<any> {
   return (await q(db, query as never, options as never)).rows;
 }
 
@@ -322,9 +383,9 @@ export async function qMany(
 ): Promise<QueryBatchResult<QueryBatch>> {
   const entries = await Promise.all(Object.entries(queries).map(async ([name, query]) => [
     name,
-    await q(db, query as never, options as never)
+    await q(db, queryTarget(query), queryOptions(options, query) as never)
   ] as const));
-  return Object.fromEntries(entries);
+  return Object.fromEntries(entries) as QueryBatchResult<QueryBatch>;
 }
 
 export type QueryBatchRows<Queries extends QueryBatch> = {
@@ -349,16 +410,25 @@ export async function qManyRows(
   queries: QueryBatch,
   options?: DbQueryOptions
 ): Promise<Record<string, readonly unknown[]>> {
-  const result = await qMany(db, queries, options);
+  const result = await qMany(db, queries, options as never);
   return Object.fromEntries(Object.entries(result).map(([name, queryResult]) => [name, queryResult.rows]));
 }
 
-export async function row<Row>(db: Db, query: QueryOrRelation<Row>, options?: EvaluateOptions): Promise<Row | undefined> {
-  return unwrapSingletonAlias((await qRows(db, query, options)).at(0)) as Row | undefined;
+export async function row<Row>(
+  db: Db,
+  query: QueryOrRelation<Row>,
+  ...whereClausesOrOptions: readonly (PredicateData | EvaluateOptions)[]
+): Promise<Row | undefined> {
+  const { predicates, options } = splitReadArgs(whereClausesOrOptions);
+  return unwrapSingletonAlias((await qRows(db, withPredicates(db, query, predicates), options)).at(0)) as Row | undefined;
 }
 
-export async function exists<Row>(db: Db, query: QueryOrRelation<Row>, options?: EvaluateOptions): Promise<boolean> {
-  return (await row(db, query, options)) !== undefined;
+export async function exists<Row>(
+  db: Db,
+  query: QueryOrRelation<Row>,
+  ...whereClausesOrOptions: readonly (PredicateData | EvaluateOptions)[]
+): Promise<boolean> {
+  return (await row(db, query, ...whereClausesOrOptions)) !== undefined;
 }
 
 export function dbUpdateWhere<Relation extends RelationRef>(
@@ -425,13 +495,13 @@ export function whatIf<const Queries extends QueryBatch>(
 export function whatIf(
   db: Db,
   queryOrQueries: QueryOrRelation | QueryBatch,
-  ...args: readonly (DbTransactionInput | DbQueryOptions)[]
+  ...args: readonly any[]
 ): Promise<any> {
   const { inputs, options } = splitWhatIfArgs(args);
   const result = tryTransact(db, ...inputs);
   const readDb = result.committed ? result.db : db;
   return isQueryBatch(queryOrQueries)
-    ? qMany(readDb, queryOrQueries, options)
+    ? qMany(readDb, queryOrQueries, options as never)
     : q(readDb, queryOrQueries as never, options as never);
 }
 
@@ -445,8 +515,17 @@ export function transact(db: Db, ...inputs: DbTransactionInputs): Db {
 }
 
 export function tryTransact(db: Db, ...inputs: DbTransactionInputs): DbTransactionResult {
+  return tryTransactWithConstraints(db, attachedConstraintsFor(db), ...inputs);
+}
+
+export function tryTransactWithConstraints(
+  db: Db,
+  constraints: ConstraintValidationInput,
+  ...inputs: DbTransactionInputs
+): DbTransactionResult {
   const patches = transactionPatches(db, inputs);
-  const result = dbEngineFor(db).transact(patches);
+  const constraintData = constraintDataList(constraints);
+  const result = dbEngineFor(db).transact(patches, { constraints: constraintData });
   if (!result.committed) {
     return {
       db,
@@ -534,9 +613,14 @@ function relationQueryResult(db: Db, relationOrName: RelationRef | string): Quer
 
 function mappedResult<Row, MappedRow>(
   result: QueryResult<Row>,
-  options: DbQueryOptions<Row, MappedRow>
+  options: DbRuntimeQueryOptions<Row, MappedRow>
 ): QueryResult<Row> | QueryResult<MappedRow> {
-  return options.mapRows === undefined ? result : { ...result, rows: options.mapRows(result.rows) };
+  const rows = sortOutputRows(result.rows, options);
+  const mappedRows = (options.mapRows === undefined ? rows : options.mapRows(rows)) as readonly MappedRow[];
+  return {
+    ...result,
+    rows: options.into === undefined ? mappedRows : options.into(mappedRows)
+  } as QueryResult<Row> | QueryResult<MappedRow>;
 }
 
 function rowsMatching<Relation extends RelationRef>(
@@ -601,11 +685,128 @@ function splitWhatIfArgs(
 function isQueryOptions(input: DbTransactionInput | DbQueryOptions): input is DbQueryOptions {
   return isRecord(input) &&
     !isWritePatchLike(input) &&
-    ('env' in input || 'functions' in input || 'mapRows' in input);
+    ('env' in input || 'functions' in input || 'mapRows' in input || 'sort' in input || 'rsort' in input || 'into' in input);
+}
+
+function splitReadArgs(
+  args: readonly (PredicateData | EvaluateOptions)[]
+): { readonly predicates: readonly PredicateData[]; readonly options: EvaluateOptions } {
+  const last = args.at(-1);
+  const hasOptions = last !== undefined && !isPredicateData(last);
+  return {
+    predicates: (hasOptions ? args.slice(0, -1) : args) as readonly PredicateData[],
+    options: hasOptions ? last as EvaluateOptions : {}
+  };
+}
+
+function withPredicates<Row>(
+  db: Db,
+  target: QueryOrRelation<Row>,
+  predicates: readonly PredicateData[]
+): QueryOrRelation<Row> {
+  if (predicates.length === 0) return target;
+
+  const query = queryForPredicates(db, target);
+  return predicates.reduce<Query>((current, predicate) => where(predicate)(current), query) as Query<Row>;
+}
+
+function queryForPredicates<Row>(db: Db, target: QueryOrRelation<Row>): Query {
+  if (isQuery(target)) return target;
+  if (isRelationRef(target)) {
+    return {
+      data: { op: 'from', relation: target.name, alias: target.name },
+      relations: { [target.name]: target }
+    };
+  }
+
+  const rows = dbEngineFor(db).read()[target] ?? [];
+  return constRows(rows.filter(isRecord));
+}
+
+function isPredicateData(input: PredicateData | EvaluateOptions): input is PredicateData {
+  return isRecord(input) && 'op' in input && typeof input.op === 'string';
+}
+
+function queryTarget(item: QueryBatchItem): QueryOrRelation {
+  return isQuerySpec(item) ? item.q : item;
+}
+
+function queryOptions(globalOptions: DbQueryOptions, item: QueryBatchItem): DbRuntimeQueryOptions {
+  if (!isQuerySpec(item)) return globalOptions;
+  const { q: _q, ...localOptions } = item;
+
+  return {
+    ...globalOptions,
+    ...localOptions,
+    env: { ...globalOptions.env, ...localOptions.env },
+    functions: { ...globalOptions.functions, ...localOptions.functions }
+  } as DbQueryOptions;
+}
+
+function isQuerySpec(input: QueryBatchItem): input is QueryBatchItemSpec {
+  return isRecord(input) && 'q' in input;
+}
+
+function sortOutputRows<Row, MappedRow>(
+  rows: readonly Row[],
+  options: DbQueryOptions<Row, MappedRow>
+): readonly Row[] {
+  const order = [
+    ...sortKeys(options.sort).map((key) => ({ key, direction: 'asc' as const })),
+    ...sortKeys(options.rsort).map((key) => ({ key, direction: 'desc' as const }))
+  ];
+
+  if (order.length === 0) return rows;
+
+  return [...rows].sort((left, right) => {
+    for (const item of order) {
+      const comparison = compareOutputValues(outputSortValue(left, item.key), outputSortValue(right, item.key));
+      if (comparison !== 0) {
+        return item.direction === 'asc' ? comparison : -comparison;
+      }
+    }
+
+    return 0;
+  });
+}
+
+function sortKeys<Row>(input: DbQuerySort<Row> | undefined): readonly DbQuerySortKey<Row>[] {
+  if (input === undefined) return [];
+  return isReadonlyArray(input) ? input : [input];
+}
+
+function outputSortValue<Row>(row: Row, key: DbQuerySortKey<Row>): unknown {
+  if (typeof key === 'function') return key(row);
+  return isRecord(row) ? row[key] : undefined;
+}
+
+function compareOutputValues(left: unknown, right: unknown): number {
+  if (Object.is(left, right)) return 0;
+  if (left === null || left === undefined) return 1;
+  if (right === null || right === undefined) return -1;
+  if ((typeof left === 'number' && typeof right === 'number') || (typeof left === 'string' && typeof right === 'string')) {
+    return left < right ? -1 : 1;
+  }
+  return sortToken(left).localeCompare(sortToken(right)) < 0 ? -1 : 1;
+}
+
+function sortToken(value: unknown): string {
+  if (typeof value === 'function') return value.name;
+  if (typeof value === 'bigint' || typeof value === 'symbol') return value.toString();
+
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
 }
 
 function isWritePatchLike(input: unknown): input is WritePatch {
   return isRecord(input) && typeof input.op === 'string' && 'relation' in input;
+}
+
+function isQuery(input: unknown): input is Query {
+  return isRecord(input) && 'data' in input && 'relations' in input;
 }
 
 function isQueryBatch(input: QueryOrRelation | QueryBatch): input is QueryBatch {
@@ -624,6 +825,10 @@ function isRelationRef(input: unknown): input is RelationRef {
 
 function isDb(input: unknown): input is Db {
   return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
+}
+
+function isReadonlyArray(input: unknown): input is readonly unknown[] {
+  return Array.isArray(input);
 }
 
 function dbFromEngine(engine: DbEngine, env: DbInputEnv): Db {
@@ -649,9 +854,9 @@ function createObjectDbEngine(data: DbData, version = 0): DbEngine {
     kind: 'object',
     read: () => data,
     version: () => version,
-    transact(patches) {
+    transact(patches, options = {}) {
       const draft = mutableData(data);
-      const result = applyWrites(draft, patches);
+      const result = applyWrites(draft, patches, { constraints: options.constraints ?? [] });
       if (result.diagnostics.length > 0) {
         return {
           ...result,

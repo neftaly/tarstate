@@ -149,10 +149,7 @@ Current state:
 
 - `check`, `req`, `fk`, `unique`, and `constrain` are descriptors.
 - `validateConstraints` can scan a source for relation-bound `req`, `unique`,
-  `fk`, and query-bound `check`.
-- Query-bound `req`, `unique`, and `fk` constraints are descriptor-only stubs
-  that return unsupported diagnostics until query/materialized constraint
-  enforcement is implemented.
+  and `fk`, plus query-bound `req`, `unique`, `fk`, and `check`.
 - Object-backed constrained transactions can enforce explicit constraint sets.
 - Unbound `check` validation is explicitly unsupported until checks carry enough
   relation/query context.
@@ -326,11 +323,12 @@ Current state:
   explicit miss, stale, missing-row, or unknown-version diagnostics and does not
   recompute.
 - `index` exposes cached snapshot rows through a Relic-shaped compatibility
-  facade: set rows by default, or a read-only hash lookup with
-  `{ kind: 'hash', field }`. Requests for `{ kind: 'btree' }` or
-  `{ kind: 'unique' }` return explicit unsupported result families. The shape is
-  for compatibility with Relic-style call sites; it does not provide Relic
-  operator-maintained `hash`, `btree`, or `unique` semantics.
+  facade: set rows by default, read-only hash lookup with
+  `{ kind: 'hash', field }`, read-only btree-style range lookup with
+  `{ kind: 'btree', field }`, or read-only unique lookup with
+  `{ kind: 'unique', field }`. The shape is for compatibility with Relic-style
+  call sites; it does not provide Relic operator-maintained `hash`, `btree`, or
+  `unique` semantics.
 - `snapshotIndex` and `snapshotHashIndex` remain available as explicit helper
   names; these lookup maps are not operator-maintained indexes.
 - `refreshMaterializationSnapshot` can recompute an existing snapshot by id,
@@ -403,13 +401,12 @@ details instead of public contracts:
 - Object-backed write tests that assert private patch expansion details instead
   of `WritePatch`, `Db` transaction, or adapter apply/commit results.
 - Materialization tests coupled to private incremental planner branches rather
-  than public diagnostics, cached rows, and set/hash/unsupported index result
-  families.
+  than public diagnostics, cached rows, and snapshot index result families.
 - Watch/runtime tests that inspect registry internals instead of
   `watchTarget`, `unwatchTarget`, `watchChangeMap`, `trackTransact`, or
   `trackTransactPatches` outputs.
-- Constraint tests that expect query-bound `req`/`unique`/`fk` enforcement
-  before those descriptors graduate from unsupported stubs.
+- Constraint tests that inspect private validation helpers instead of public
+  diagnostics, transaction outcomes, and attached/explicit constraint behavior.
 
 ## Benchmarking Principle
 

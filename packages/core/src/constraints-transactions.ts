@@ -1,6 +1,7 @@
 import {
   DbTransactionError,
   tryTransact,
+  tryTransactWithConstraints,
   type Db,
   type DbTransactionResult
 } from './db.js';
@@ -36,17 +37,19 @@ export async function tryTransactConstrained(
   constraintsOrOptions?: ConstraintValidationInput | ConstraintValidationOptions,
   options: ConstraintValidationOptions = {}
 ): Promise<DbTransactionResult> {
-  const result = tryTransact(db, patches);
-  if (!result.committed) {
-    return result;
-  }
-
   const explicitConstraints = constraintsOrOptions !== undefined && isConstraintAttachmentInput(constraintsOrOptions)
     ? constraintsOrOptions
     : attachedConstraintsFor(db);
   const validationOptions = constraintsOrOptions !== undefined && !isConstraintAttachmentInput(constraintsOrOptions)
     ? constraintsOrOptions
     : options;
+  const result = constraintsOrOptions !== undefined && isConstraintAttachmentInput(constraintsOrOptions)
+    ? tryTransactWithConstraints(db, explicitConstraints, patches)
+    : tryTransact(db, patches);
+  if (!result.committed) {
+    return result;
+  }
+
   const validation = await validateConstraints(result.db, explicitConstraints, validationOptions);
 
   return validation.valid

@@ -4,6 +4,7 @@ import type { RelationDelta } from './delta.js';
 import { diffRows, type RowChange, type RowDiffDiagnostic, type RowDiffOptions } from './diff.js';
 import { evaluate } from './evaluate.js';
 import type { EvaluateOptions } from './evaluate.js';
+import { forkDb, type Db } from './db.js';
 import { queryKey, queryRowKeyFields, type Query } from './query.js';
 import type { RelationRef } from './schema.js';
 import { type RelationSource } from './source.js';
@@ -37,6 +38,7 @@ export type WatchEvent<Row = unknown> = {
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
@@ -57,6 +59,7 @@ export type WatchRefreshResult<Row = unknown> = {
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
@@ -112,6 +115,7 @@ export type TrackedChange<Row = unknown> = {
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
@@ -123,6 +127,7 @@ export type WatchTargetChange<Row = unknown> = {
   readonly target: WatchTarget<Row>;
   readonly changed: boolean;
   readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
@@ -141,6 +146,7 @@ export type QueryDiff<Row = unknown> = {
   readonly afterRows: readonly Row[];
   readonly changed: boolean;
   readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
@@ -153,6 +159,7 @@ type WatchRecord<Db extends WatchDb = WatchDb, Row = unknown> = {
   readonly target: WatchTarget<Row>;
   readonly listener: WatchListener<Row>;
   readonly options: WatchOptions<Row>;
+  readonly dbTracked: boolean;
   active: boolean;
   handle?: WatchHandle<Db, Row>;
 };
@@ -162,18 +169,46 @@ type AnyWatchRecord = WatchRecord<any, any>;
 const watchStore = new WeakMap<object, Set<AnyWatchRecord>>();
 const allWatchRecords = new Map<string, AnyWatchRecord>();
 
-export function watch<Db extends WatchDb, Row>(
-  db: Db,
+export function watch<DbValue extends Db>(
+  db: DbValue,
+  ...targets: readonly WatchTarget[]
+): DbValue;
+export function watch<DbValue extends WatchDb, Row>(
+  db: DbValue,
+  target: WatchTarget<Row>,
+  listener: WatchListener<Row> | undefined,
+  options?: WatchOptions<Row>
+): WatchHandle<DbValue, Row>;
+export function watch(
+  db: WatchDb,
+  target: WatchTarget,
+  ...rest: readonly (WatchTarget | WatchListener | WatchOptions | undefined)[]
+): WatchDb | WatchHandle {
+  if (isListenerWatchArgs(rest)) {
+    return createWatchHandle(db, target, rest[0] as WatchListener | undefined, rest[1] as WatchOptions | undefined);
+  }
+
+  const nextDb = isDb(db) ? forkDb(db) : db;
+  const targets = [target, ...rest.filter(isWatchTarget)];
+  for (const nextTarget of targets) {
+    addDbTrackedWatch(nextDb, nextTarget);
+  }
+  return nextDb;
+}
+
+function createWatchHandle<DbValue extends WatchDb, Row>(
+  db: DbValue,
   target: WatchTarget<Row>,
   listener?: WatchListener<Row>,
   options: WatchOptions<Row> = {}
-): WatchHandle<Db, Row> {
-  const record: WatchRecord<Db, Row> = {
+): WatchHandle<DbValue, Row> {
+  const record: WatchRecord<DbValue, Row> = {
     db,
     id: `watch-${nextId += 1}`,
     target,
     listener: listener ?? (() => undefined),
     options,
+    dbTracked: false,
     active: true
   };
   const handle = watchHandle(record);
@@ -222,6 +257,7 @@ export function watchChangeMap<Row>(changes: Iterable<TrackedChange<Row>>): Watc
       target: change.target,
       changed: change.changed,
       addedRows: change.addedRows,
+      deletedRows: change.deletedRows,
       removedRows: change.removedRows,
       unchangedRows: change.unchangedRows,
       rowChanges: change.rowChanges,
@@ -241,7 +277,22 @@ export function watchRuntime<Version, Row>(
   return watch(source, target, listener, options);
 }
 
-export function unwatch(handle: Pick<WatchHandle, 'id'>): UnwatchResult {
+export function unwatch<DbValue extends Db>(
+  db: DbValue,
+  ...targets: readonly WatchTarget[]
+): DbValue;
+export function unwatch(handle: Pick<WatchHandle, 'id'>): UnwatchResult;
+export function unwatch(
+  handleOrDb: Db | Pick<WatchHandle, 'id'>,
+  ...targets: readonly WatchTarget[]
+): Db | UnwatchResult {
+  if (isDb(handleOrDb) && targets.length > 0) {
+    const nextDb = forkDb(handleOrDb);
+    removeDbTrackedWatches(nextDb, targets);
+    return nextDb;
+  }
+
+  const handle = handleOrDb as Pick<WatchHandle, 'id'>;
   const record = findRecord(handle.id);
   if (record !== undefined) {
     record.active = false;
@@ -299,6 +350,7 @@ export async function diffQuery<Row>(
     afterRows,
     changed: diff.changes.length > 0,
     addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    deletedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
     removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
     unchangedRows: afterRows.filter((row) => !changedKeys.has(rowKey(row, diffOptionsForTarget(target, options)))),
     rowChanges: diff.changes,
@@ -363,6 +415,7 @@ export async function trackedChangesForDbTransition(
       previousRows: event.previousRows,
       rows: event.rows,
       addedRows: event.addedRows,
+      deletedRows: event.deletedRows,
       removedRows: event.removedRows,
       unchangedRows: event.unchangedRows,
       rowChanges: event.rowChanges,
@@ -439,6 +492,7 @@ function buildWatchEvent<Row>(
     previousRows,
     rows,
     addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    deletedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
     removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
     unchangedRows: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
     rowChanges: diff.changes,
@@ -468,6 +522,7 @@ function emptyWatchRefresh<Row>(id: string, target: WatchTarget<Row>): WatchRefr
     previousRows: [],
     rows: [],
     addedRows: [],
+    deletedRows: [],
     removedRows: [],
     unchangedRows: [],
     rowChanges: [],
@@ -485,6 +540,23 @@ function addRecord(input: unknown, record: AnyWatchRecord): void {
   watchStore.set(input, records);
 }
 
+function addDbTrackedWatch<Row>(db: WatchDb, target: WatchTarget<Row>): void {
+  const id = watchTargetIdentity(target);
+  if (activeRecordsFor(db).some((record) => record.dbTracked && record.id === id)) {
+    return;
+  }
+
+  addRecord(db, {
+    db,
+    id,
+    target,
+    listener: () => undefined,
+    options: {},
+    dbTracked: true,
+    active: true
+  });
+}
+
 function removeRecord(input: unknown, record: AnyWatchRecord): void {
   if (!isObject(input)) {
     return;
@@ -498,6 +570,28 @@ function removeRecord(input: unknown, record: AnyWatchRecord): void {
   records.delete(record);
   if (records.size === 0) {
     watchStore.delete(input);
+  }
+}
+
+function removeDbTrackedWatches(db: WatchDb, targets: readonly WatchTarget[]): void {
+  if (!isObject(db)) {
+    return;
+  }
+
+  const records = watchStore.get(db);
+  if (records === undefined) {
+    return;
+  }
+
+  const ids = new Set(targets.map(watchTargetIdentity));
+  for (const record of Array.from(records)) {
+    if (ids.has(record.id)) {
+      records.delete(record);
+    }
+  }
+
+  if (records.size === 0) {
+    watchStore.delete(db);
   }
 }
 
@@ -538,10 +632,39 @@ function emptySource(): RelationSource {
   return { rows: () => [] };
 }
 
+function isListenerWatchArgs(
+  args: readonly (WatchTarget | WatchListener | WatchOptions | undefined)[]
+): boolean {
+  return args.length > 0 && (typeof args[0] === 'function' || args[0] === undefined);
+}
+
 function isQuery(input: unknown): input is Query {
   return isObject(input) && 'data' in input && 'relations' in input;
 }
 
+function isWatchTarget(input: WatchTarget | WatchListener | WatchOptions | undefined): input is WatchTarget {
+  return isQuery(input) || isRelationRef(input);
+}
+
+function isRelationRef(input: unknown): input is RelationRef {
+  return isObject(input) &&
+    (input as { readonly kind?: unknown }).kind === 'relation' &&
+    typeof (input as { readonly name?: unknown }).name === 'string' &&
+    isObject((input as { readonly fields?: unknown }).fields);
+}
+
+function isDb(input: unknown): input is Db {
+  return isObject(input) && 'data' in input && 'env' in input;
+}
+
 function isObject(input: unknown): input is object {
   return typeof input === 'object' && input !== null;
+}
+
+function watchTargetIdentity(target: WatchTarget): string {
+  if (isQuery(target)) {
+    return queryKey(target);
+  }
+
+  return `relation:${target.name}:${JSON.stringify(target.key)}`;
 }

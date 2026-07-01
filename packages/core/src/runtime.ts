@@ -157,12 +157,15 @@ export async function trackTransact(
   const output: TrackTransactOutput<WatchDb> = await transact(db);
   const envelope = isTrackEnvelope(output);
   const nextDb = envelope ? output.db : output;
-  const tracked = await trackWatchedChanges(db, nextDb, envelope ? output.deltas ?? [] : []);
+  const committed = envelope ? output.committed !== false : true;
+  const tracked = committed
+    ? await trackWatchedChanges(db, nextDb, envelope ? output.deltas ?? [] : [])
+    : { changes: [], diagnostics: [] };
   return {
     kind: 'trackTransact',
     db: nextDb,
     supported: true,
-    changes: tracked.changes.length > 0 ? tracked.changes : deltasToChanges(envelope ? output.deltas ?? [] : []),
+    changes: committed ? tracked.changes.length > 0 ? tracked.changes : deltasToChanges(envelope ? output.deltas ?? [] : []) : [],
     deltas: envelope ? output.deltas ?? [] : [],
     diagnostics: [...(envelope ? output.diagnostics ?? [] : []), ...tracked.diagnostics],
     ...(options.label === undefined ? {} : { label: options.label })
@@ -282,6 +285,7 @@ function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChan
     previousRows: delta.removed,
     rows: delta.added,
     addedRows: delta.added,
+    deletedRows: delta.removed,
     removedRows: delta.removed,
     unchangedRows: [],
     rowChanges: [

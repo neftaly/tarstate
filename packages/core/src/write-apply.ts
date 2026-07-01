@@ -3,6 +3,7 @@ import type { TarstateDiagnostic } from './diagnostics.js';
 import { stableKey } from './identity.js';
 import type { ExprData, PredicateData } from './query.js';
 import type { RelationRef } from './schema.js';
+import type { ConstraintData } from './constraints.js';
 import { rowKey, validateRelationRow } from './evaluate.js';
 import {
   writeInputPatches,
@@ -29,6 +30,10 @@ export type AtomicWriteApplyResult = WriteApplyResult & {
   readonly committed: boolean;
 };
 
+export type WriteApplyOptions = {
+  readonly constraints?: readonly ConstraintData[];
+};
+
 type MutableDelta = {
   readonly relation: RelationRef;
   readonly added: unknown[];
@@ -39,6 +44,7 @@ type ApplyState = {
   readonly data: MutableObjectSourceData;
   readonly deltas: Map<string, MutableDelta>;
   readonly diagnostics: TarstateDiagnostic[];
+  readonly constraints: readonly ConstraintData[];
   applied: number;
 };
 type ComputedChanges = Record<string, unknown> | ((row: Readonly<Record<string, unknown>>) => Record<string, unknown>);
@@ -53,12 +59,18 @@ type ComputedUpsertUpdate =
       incoming: Readonly<Record<string, unknown>>
     ) => Record<string, unknown>);
 
-export function applyWrites(data: MutableObjectSourceData, patches: WriteInput): WriteApplyResult {
-  const patchList = Array.from(writeInputPatches(patches));
+export function applyWrites(
+  data: MutableObjectSourceData,
+  patches: WriteInput,
+  options: WriteApplyOptions = {}
+): WriteApplyResult {
+  const expanded = expandCascadingDeletes(data, Array.from(writeInputPatches(patches)), options.constraints ?? []);
+  const patchList = expanded.patches;
   const state: ApplyState = {
     data,
     deltas: new Map(),
-    diagnostics: [],
+    diagnostics: [...expanded.diagnostics],
+    constraints: options.constraints ?? [],
     applied: 0
   };
 
@@ -74,10 +86,14 @@ export function applyWrites(data: MutableObjectSourceData, patches: WriteInput):
   };
 }
 
-export function applyWritesAtomic(data: MutableObjectSourceData, patches: WriteInput): AtomicWriteApplyResult {
+export function applyWritesAtomic(
+  data: MutableObjectSourceData,
+  patches: WriteInput,
+  options: WriteApplyOptions = {}
+): AtomicWriteApplyResult {
   const patchList = Array.from(writeInputPatches(patches));
   const draft = cloneData(data);
-  const result = applyWrites(draft, patchList);
+  const result = applyWrites(draft, patchList, options);
 
   if (result.diagnostics.length > 0) {
     return { ...result, committed: false, applied: 0, deltas: [] };
@@ -128,6 +144,159 @@ function applyPatch(state: ApplyState, patch: WritePatch): void {
   }
 }
 
+function expandCascadingDeletes(
+  data: MutableObjectSourceData,
+  patches: readonly WritePatch[],
+  constraints: readonly ConstraintData[]
+): { readonly patches: readonly WritePatch[]; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  if (constraints.length === 0) {
+    return { patches, diagnostics: [] };
+  }
+
+  const working = cloneData(data);
+  const expanded: WritePatch[] = [];
+  const diagnostics: TarstateDiagnostic[] = [...unsupportedCascadeDiagnostics(constraints)];
+
+  for (const patch of patches) {
+    expanded.push(patch);
+    const removedRows = removeRowsForPatch(working, patch);
+    if (removedRows.length === 0) {
+      continue;
+    }
+
+    const cascaded = cascadeDeletesForRows(working, patch.relation, removedRows, constraints);
+    expanded.push(...cascaded.patches);
+    diagnostics.push(...cascaded.diagnostics);
+  }
+
+  return { patches: expanded, diagnostics };
+}
+
+function cascadeDeletesForRows(
+  data: MutableObjectSourceData,
+  relation: RelationRef,
+  removedRows: readonly unknown[],
+  constraints: readonly ConstraintData[]
+): { readonly patches: readonly WritePatch[]; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  const patches: WritePatch[] = [];
+  const diagnostics: TarstateDiagnostic[] = [];
+  const queue: { readonly relation: RelationRef; readonly rows: readonly unknown[] }[] = [{ relation, rows: removedRows }];
+
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const item = queue[cursor] as { readonly relation: RelationRef; readonly rows: readonly unknown[] };
+    for (const constraint of constraints) {
+      if (!isSupportedCascadeConstraint(constraint) || constraint.target.name !== item.relation.name) {
+        continue;
+      }
+
+      const sourceRows = relationRows(data, constraint.relation);
+      const removedChildren = spliceRowsMatchingForeignKeys(sourceRows, item.rows, constraint.fields, constraint.targetFields);
+      for (const child of removedChildren) {
+        patches.push({ op: 'deleteExact', relation: constraint.relation, row: child as never });
+      }
+      if (removedChildren.length > 0) {
+        queue.push({ relation: constraint.relation, rows: removedChildren });
+      }
+    }
+  }
+
+  return { patches, diagnostics };
+}
+
+function removeRowsForPatch(data: MutableObjectSourceData, patch: WritePatch): readonly unknown[] {
+  switch (patch.op) {
+    case 'deleteByKey':
+      return removeRowsByPredicate(data, patch.relation, (row) =>
+        keyFromRow(patch.relation, row) === keyFromInput(patch.key)
+      );
+    case 'delete':
+      return removeRowsByPredicate(data, patch.relation, (row) => evaluateWritePredicate(patch.predicate, row));
+    case 'deleteExact':
+      return removeRowsByPredicate(data, patch.relation, (row) => isExactMatch(row, patch.row));
+    case 'replaceAll': {
+      const replacementKeys = new Set(patch.rows.filter(isRecord).map((row) => keyFromRow(patch.relation, row)));
+      return removeRowsByPredicate(data, patch.relation, (row) => !replacementKeys.has(keyFromRow(patch.relation, row)));
+    }
+    default:
+      return [];
+  }
+}
+
+function removeRowsByPredicate(
+  data: MutableObjectSourceData,
+  relation: RelationRef,
+  predicate: (row: Record<string, unknown>) => boolean
+): readonly unknown[] {
+  const rows = relationRows(data, relation);
+  const removed: unknown[] = [];
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (isRecord(row) && predicate(row)) {
+      removed.push(...rows.splice(index, 1));
+    }
+  }
+  return removed;
+}
+
+function spliceRowsMatchingForeignKeys(
+  rows: unknown[],
+  targetRows: readonly unknown[],
+  fields: readonly string[],
+  targetFields: readonly string[]
+): readonly unknown[] {
+  const removed: unknown[] = [];
+  const targetKeys = new Set(targetRows.map((row) => stableKeyValue(valuesFor(row, targetFields))));
+
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (targetKeys.has(stableKeyValue(valuesFor(row, fields)))) {
+      removed.push(...rows.splice(index, 1));
+    }
+  }
+
+  return removed;
+}
+
+function unsupportedCascadeDiagnostics(constraints: readonly ConstraintData[]): readonly TarstateDiagnostic[] {
+  return constraints.flatMap((constraint) => {
+    if (constraint.op !== 'fk' || constraint.cascade === undefined || constraint.cascade === false) {
+      return [];
+    }
+
+    if (isSupportedCascadeConstraint(constraint)) {
+      return [];
+    }
+
+    return [{
+      code: 'constraint_fk_cascade_unsupported',
+      message: constraint.cascade === true || constraint.cascade === 'delete'
+        ? 'foreign key cascade is only supported for direct relation foreign keys'
+        : `unsupported foreign key cascade mode ${String(constraint.cascade)}`,
+      relation: cascadeDiagnosticRelation(constraint),
+      field: constraint.fields.join(','),
+      detail: {
+        kind: 'fk',
+        cascade: constraint.cascade,
+        fields: constraint.fields,
+        targetFields: constraint.targetFields
+      }
+    } satisfies TarstateDiagnostic];
+  });
+}
+
+function isSupportedCascadeConstraint(
+  constraint: ConstraintData
+): constraint is Extract<ConstraintData, { readonly op: 'fk' }> & { readonly relation: RelationRef; readonly target: RelationRef } {
+  return constraint.op === 'fk' &&
+    'relation' in constraint &&
+    !('data' in constraint.target) &&
+    (constraint.cascade === true || constraint.cascade === 'delete');
+}
+
+function cascadeDiagnosticRelation(constraint: Extract<ConstraintData, { readonly op: 'fk' }>): string {
+  return 'relation' in constraint ? constraint.relation.name : 'query';
+}
+
 function insertRow(
   state: ApplyState,
   relation: RelationRef,
@@ -146,7 +315,9 @@ function insertRow(
   }
 
   const rows = relationRows(state.data, relation);
-  const existingIndex = indexByKey(rows, relation, keyFromRow(relation, row));
+  const existingIndex = conflict === 'replace'
+    ? conflictIndex(state, rows, relation, row)
+    : indexByKey(rows, relation, keyFromRow(relation, row));
   if (existingIndex !== -1) {
     if (conflict === 'ignore') {
       return;
@@ -227,7 +398,7 @@ function insertOrMerge(
 ): void {
   const key = keyFromRow(relation, row);
   const rows = relationRows(state.data, relation);
-  const index = indexByKey(rows, relation, key);
+  const index = conflictIndex(state, rows, relation, row, key);
 
   if (index === -1) {
     insertRow(state, relation, row, 'error');
@@ -422,6 +593,49 @@ function cloneData(data: MutableObjectSourceData): MutableObjectSourceData {
   return Object.fromEntries(Object.entries(data).map(([name, rows]) => [name, [...rows]]));
 }
 
+function conflictIndex(
+  state: ApplyState,
+  rows: readonly unknown[],
+  relation: RelationRef,
+  row: Record<string, unknown>,
+  key = keyFromRow(relation, row)
+): number {
+  const keyIndex = indexByKey(rows, relation, key);
+  if (keyIndex !== -1) {
+    return keyIndex;
+  }
+
+  return uniqueConflictIndex(state.constraints, rows, relation, row);
+}
+
+function uniqueConflictIndex(
+  constraints: readonly ConstraintData[],
+  rows: readonly unknown[],
+  relation: RelationRef,
+  row: Record<string, unknown>
+): number {
+  for (const constraint of constraints) {
+    if (constraint.op !== 'unique' || !('relation' in constraint) || constraint.relation.name !== relation.name) {
+      continue;
+    }
+
+    const values = constraint.fields.map((field) => row[field]);
+    if (values.some((value) => value === undefined || value === null)) {
+      continue;
+    }
+
+    const index = rows.findIndex((candidate) =>
+      isRecord(candidate) &&
+      values.every((value, valueIndex) => Object.is(candidate[constraint.fields[valueIndex] as string], value))
+    );
+    if (index !== -1) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
 function indexByKey(rows: readonly unknown[], relation: RelationRef, key: string): number {
   return rows.findIndex((row) => isRecord(row) && keyFromRow(relation, row) === key);
 }
@@ -457,6 +671,14 @@ function mergeChanges(
 
 function resolveChanges(changes: ComputedChanges, row: Record<string, unknown>): Record<string, unknown> {
   return typeof changes === 'function' ? changes(row) : changes;
+}
+
+function valuesFor(row: unknown, fields: readonly string[]): readonly unknown[] {
+  return fields.map((field) => isRecord(row) ? row[field] : undefined);
+}
+
+function stableKeyValue(values: readonly unknown[]): string {
+  return stableKey(values.length === 1 ? values[0] : values);
 }
 
 function isTwoArgFunction(input: ComputedUpsertUpdate): input is (

@@ -14,7 +14,12 @@ import {
 } from './query.js';
 import type { RelationRef } from './schema.js';
 import { isRelationSource, type RelationSource } from './source.js';
-import { attachConstraints, type ConstraintAttachmentInput } from './constraints-attachment.js';
+import {
+  attachConstraints,
+  isConstraintAttachmentInput,
+  type ConstraintAttachmentInput
+} from './constraints-attachment.js';
+import { stableKey } from './identity.js';
 
 declare const materializedDb: unique symbol;
 
@@ -110,6 +115,7 @@ export type MaterializationOptions = {
   readonly mode?: MaterializationMode;
 };
 export type SnapshotMaterializationOptions = MaterializationOptions;
+export type MaterializationQueryBatch<Row = unknown> = Record<string, Query<Row>>;
 export type MaterializationMaintenanceOptions = {
   readonly deltas?: readonly unknown[];
 };
@@ -179,12 +185,28 @@ export type MaterializationMaintenanceResult<Row = unknown> = {
 export type MaterializationIndex<Row = unknown> = {
   readonly kind: 'set';
   readonly rows: ReadonlySet<Row>;
+  readonly has: (row: Row) => boolean;
+  readonly values: () => IterableIterator<Row>;
 };
 
 export type MaterializationHashIndex<Row = unknown, Value = unknown> = {
   readonly kind: 'hash';
   readonly field: string;
   readonly lookup: ReadonlyMap<Value, readonly Row[]>;
+  readonly get: (value: Value) => readonly Row[];
+  readonly has: (value: Value) => boolean;
+};
+
+export type MaterializationRangeBound<Value = unknown> =
+  | Value
+  | {
+      readonly value: Value;
+      readonly inclusive?: boolean;
+    };
+
+export type MaterializationRange<Value = unknown> = {
+  readonly lower?: MaterializationRangeBound<Value>;
+  readonly upper?: MaterializationRangeBound<Value>;
 };
 
 export type MaterializationBtreeIndex<Row = unknown, Value = unknown> = {
@@ -192,12 +214,16 @@ export type MaterializationBtreeIndex<Row = unknown, Value = unknown> = {
   readonly field: string;
   readonly lookup: ReadonlyMap<Value, readonly Row[]>;
   readonly ordered: readonly Value[];
+  readonly get: (value: Value) => readonly Row[];
+  readonly range: (bounds?: MaterializationRange<Value>) => readonly Row[];
 };
 
 export type MaterializationUniqueIndex<Row = unknown, Value = unknown> = {
   readonly kind: 'unique';
   readonly field: string;
   readonly lookup: ReadonlyMap<Value, Row>;
+  readonly get: (value: Value) => Row | undefined;
+  readonly has: (value: Value) => boolean;
 };
 
 export type MaterializationIndexResult<Row = unknown> = {
@@ -255,6 +281,11 @@ type StoredMaterialization<Row = unknown> = {
   readonly metadata: MaterializationMetadata<Row>;
   readonly rows: readonly Row[];
 };
+type MaterializationEvalTarget = {
+  readonly source: RelationSource;
+  readonly query: Query;
+  readonly env: Readonly<Record<string, unknown>>;
+};
 
 const materializedDbs = new WeakSet<object>();
 const materializationStore = new WeakMap<object, Map<string, StoredMaterialization>>();
@@ -268,16 +299,29 @@ export function mat<Db extends SnapshotMaterializationTarget, Row>(
   query: Query<Row>,
   options?: SnapshotMaterializationOptions
 ): Db & MaterializedDb;
+export function mat<Db extends SnapshotMaterializationTarget>(
+  db: Db,
+  queries: MaterializationQueryBatch,
+  options?: SnapshotMaterializationOptions
+): Db & MaterializedDb;
 export function mat<Db extends object, Row>(
   db: Db,
-  queryOrConstraints: Query<Row> | ConstraintAttachmentInput,
+  queryOrConstraints: Query<Row> | MaterializationQueryBatch | ConstraintAttachmentInput,
   options: SnapshotMaterializationOptions = {}
 ): Db {
-  if (!isQuery(queryOrConstraints)) {
+  if (isConstraintAttachmentInput(queryOrConstraints)) {
     return attachConstraints(db, queryOrConstraints);
   }
 
-  return materializeDbSnapshot(db as Db & SnapshotMaterializationTarget, queryOrConstraints, options);
+  if (isQuery(queryOrConstraints)) {
+    return materializeDbSnapshot(db as Db & SnapshotMaterializationTarget, queryOrConstraints, options);
+  }
+
+  if (isQueryBatch(queryOrConstraints)) {
+    return materializeDbSnapshots(db as Db & SnapshotMaterializationTarget, queryOrConstraints, options);
+  }
+
+  return attachConstraints(db, queryOrConstraints as ConstraintAttachmentInput);
 }
 
 export function materializeSnapshot<Db extends SnapshotMaterializationTarget, Row>(
@@ -540,7 +584,7 @@ export function index<Row = unknown, Value = unknown>(
         kind: 'materializationHashIndex',
         indexed: true,
         diagnostics: [],
-        index: { kind: 'hash', field: options.field, lookup: groupRowsByField(stored.rows as readonly Row[], options.field) }
+        index: hashIndex(stored.rows as readonly Row[], options.field)
       });
     case 'btree':
       return withTarget(stored, {
@@ -556,7 +600,7 @@ export function index<Row = unknown, Value = unknown>(
         kind: 'materializationIndex',
         indexed: true,
         diagnostics: [],
-        index: { kind: 'set', rows: new Set(stored.rows as readonly Row[]) }
+        index: setIndex(stored.rows as readonly Row[])
       });
   }
 }
@@ -618,39 +662,65 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
   return markMaterialized(db);
 }
 
-function evaluateTargetRows<Row>(target: SnapshotMaterializationTarget, query: Query<Row>): readonly Row[] {
-  const source = sourceFor(target);
-  return evaluateData(source, query.data, query) as readonly Row[];
+function materializeDbSnapshots<Db extends SnapshotMaterializationTarget>(
+  db: Db,
+  queries: MaterializationQueryBatch,
+  options: SnapshotMaterializationOptions
+): Db & MaterializedDb {
+  for (const [name, query] of Object.entries(queries)) {
+    materializeDbSnapshot(db, query, materializationOptionsForBatchItem(name, options));
+  }
+  return markMaterialized(db);
 }
 
-function evaluateData(source: RelationSource, data: QueryData, query: Query): readonly unknown[] {
+function materializationOptionsForBatchItem(
+  name: string,
+  options: SnapshotMaterializationOptions
+): SnapshotMaterializationOptions {
+  const baseId = options.id ?? options.name;
+  return {
+    ...options,
+    id: baseId === undefined ? name : `${baseId}:${name}`,
+    name: baseId === undefined ? name : `${baseId}:${name}`
+  };
+}
+
+function evaluateTargetRows<Row>(target: SnapshotMaterializationTarget, query: Query<Row>): readonly Row[] {
+  return evaluateData({ source: sourceFor(target), query, env: envFor(target) }, query.data) as readonly Row[];
+}
+
+function evaluateData(target: MaterializationEvalTarget, data: QueryData, outerRow: Record<string, unknown> = {}): readonly unknown[] {
   switch (data.op) {
     case 'from': {
-      const relation = query.relations[data.relation];
-      return relation === undefined ? [] : readRows(source, relation).map((row) => ({ [data.alias]: row }));
+      const relation = target.query.relations[data.relation];
+      return relation === undefined ? [] : readRows(target.source, relation).map((row) => ({ ...outerRow, [data.alias]: row }));
     }
     case 'lookup': {
-      const relation = query.relations[data.relation];
+      const relation = target.query.relations[data.relation];
       if (relation === undefined) return [];
-      const value = exprValue({}, data.value);
-      return readRows(source, relation)
+      const value = exprValue(outerRow, data.value, target);
+      return readRows(target.source, relation)
         .filter((row) => isRecord(row) && Object.is(row[data.field], value))
-        .map((row) => ({ [data.alias]: row }));
+        .map((row) => ({ ...outerRow, [data.alias]: row }));
     }
     case 'constRows':
-      return data.rows;
+      return data.rows.map((row) => ({ ...outerRow, ...row }));
     case 'where':
-      return evaluateData(source, data.input, query).filter((row) => matchesPredicate(row, data.predicate));
+      return evaluateData(target, data.input, outerRow).filter((row) => matchesPredicate(row, data.predicate, target));
     case 'hash':
     case 'btree':
     case 'keyBy':
-      return evaluateData(source, data.input, query);
+      return evaluateData(target, data.input, outerRow);
+    case 'join':
+      return joinRows(target, data.kind, data.left, data.right, data.on, outerRow);
     case 'select':
-      return evaluateData(source, data.input, query).map((row) => projectRow(row, data.projection));
+      return evaluateData(target, data.input, outerRow).map((row) => projectRow(row, data.projection, target));
     case 'extend':
-      return evaluateData(source, data.input, query).map((row) => ({ ...asRecord(row), ...projectRow(row, data.projection) }));
+      return evaluateData(target, data.input, outerRow).map((row) => ({ ...asRecord(row), ...projectRow(row, data.projection, target) }));
+    case 'expand':
+      return expandRows(target, data.input, data.collection, data.alias, data.fields, outerRow);
     case 'without':
-      return evaluateData(source, data.input, query).map((row) => {
+      return evaluateData(target, data.input, outerRow).map((row) => {
         const output = { ...asRecord(row) };
         for (const field of data.fields) {
           delete output[field];
@@ -658,17 +728,28 @@ function evaluateData(source: RelationSource, data: QueryData, query: Query): re
         return output;
       });
     case 'sort':
-      return sortRows(evaluateData(source, data.input, query), data.order);
+      return sortRows(evaluateData(target, data.input, outerRow), data.order, target);
     case 'limit':
-      return evaluateData(source, data.input, query).slice(data.offset ?? 0, (data.offset ?? 0) + data.count);
+      return evaluateData(target, data.input, outerRow).slice(data.offset ?? 0, (data.offset ?? 0) + data.count);
     case 'sortLimit':
-      return sortRows(evaluateData(source, data.input, query), data.order).slice(0, data.count);
+      return sortRows(evaluateData(target, data.input, outerRow), data.order, target).slice(0, data.count);
+    case 'union':
+      return setUnion(data.inputs.map((input) => evaluateData(target, input, outerRow)));
+    case 'intersection':
+      return setIntersection(data.inputs.map((input) => evaluateData(target, input, outerRow)));
+    case 'difference':
+      return setDifference(evaluateData(target, data.left, outerRow), evaluateData(target, data.right, outerRow));
     case 'rename':
-      return evaluateData(source, data.input, query).map((row) => renameRow(row, data.fields));
+      return evaluateData(target, data.input, outerRow).map((row) => renameRow(row, data.fields));
     case 'qualify':
-      return evaluateData(source, data.input, query).map((row) => ({ [data.alias]: row }));
-    default:
-      return [];
+      return evaluateData(target, data.input, outerRow).map((row) => ({ [data.alias]: row }));
+    case 'aggregate':
+      return aggregateRows(
+        evaluateData(target, data.input, outerRow),
+        data.groupBy,
+        data.aggregates,
+        target
+      );
   }
 }
 
@@ -677,11 +758,74 @@ function readRows(source: RelationSource, relation: RelationRef): readonly unkno
   return Array.isArray(rows) ? rows : [];
 }
 
-function projectRow(row: unknown, projection: ProjectionData): Record<string, unknown> {
+function projectRow(
+  row: unknown,
+  projection: ProjectionData,
+  target: MaterializationEvalTarget
+): Record<string, unknown> {
   return Object.fromEntries(Object.entries(projection).map(([field, item]) => [
     field,
-    exprValue(row, projectionExpr(item))
+    exprValue(row, projectionExpr(item), target)
   ]));
+}
+
+function joinRows(
+  target: MaterializationEvalTarget,
+  kind: 'inner' | 'left',
+  leftData: QueryData,
+  rightData: QueryData,
+  on: PredicateData,
+  outerRow: Record<string, unknown>
+): readonly unknown[] {
+  const left = evaluateData(target, leftData, outerRow);
+  const right = evaluateData(target, rightData, outerRow);
+  const output: unknown[] = [];
+
+  for (const leftRow of left) {
+    let matched = false;
+
+    for (const rightRow of right) {
+      const merged = { ...asRecord(leftRow), ...asRecord(rightRow) };
+      if (matchesPredicate(merged, on, target)) {
+        matched = true;
+        output.push(merged);
+      }
+    }
+
+    if (!matched && kind === 'left') {
+      output.push(leftRow);
+    }
+  }
+
+  return output;
+}
+
+function expandRows(
+  target: MaterializationEvalTarget,
+  inputData: QueryData,
+  collection: ExprData,
+  alias: string | undefined,
+  fields: readonly string[] | undefined,
+  outerRow: Record<string, unknown>
+): readonly unknown[] {
+  const output: unknown[] = [];
+
+  for (const row of evaluateData(target, inputData, outerRow)) {
+    const value = exprValue(row, collection, target);
+    if (value === null || value === undefined || !isIterable(value)) {
+      continue;
+    }
+
+    for (const item of value) {
+      if (alias !== undefined) {
+        output.push({ ...asRecord(row), [alias]: item });
+      } else if (isRecord(item)) {
+        output.push({ ...asRecord(row), ...pickFields(item, fields) });
+      }
+    }
+  }
+
+  return output;
 }
 
 function renameRow(row: unknown, fields: Record<string, string>): Record<string, unknown> {
@@ -693,48 +837,212 @@ function renameRow(row: unknown, fields: Record<string, string>): Record<string,
   return output;
 }
 
-function matchesPredicate(row: unknown, predicate: PredicateData): boolean {
-  switch (predicate.op) {
-    case 'eq':
-      return Object.is(exprValue(row, predicate.left), exprValue(row, predicate.right));
-    case 'neq':
-      return !Object.is(exprValue(row, predicate.left), exprValue(row, predicate.right));
-    case 'lt':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) < 0;
-    case 'lte':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) <= 0;
-    case 'gt':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) > 0;
-    case 'gte':
-      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) >= 0;
-    case 'and':
-      return predicate.predicates.every((item) => matchesPredicate(row, item));
-    case 'or':
-      return predicate.predicates.some((item) => matchesPredicate(row, item));
-    case 'not':
-      return !matchesPredicate(row, predicate.predicate);
+function aggregateRows(
+  rows: readonly unknown[],
+  groupBy: ProjectionData,
+  aggregates: ProjectionData,
+  target: MaterializationEvalTarget
+): readonly unknown[] {
+  const groups = new Map<string, { readonly group: Record<string, unknown>; readonly rows: unknown[] }>();
+
+  for (const row of rows) {
+    const group = projectRow(row, groupBy, target);
+    const key = stableKey(group);
+    const existing = groups.get(key);
+    if (existing === undefined) {
+      groups.set(key, { group, rows: [row] });
+    } else {
+      existing.rows.push(row);
+    }
+  }
+
+  if (groups.size === 0 && Object.keys(groupBy).length === 0) {
+    groups.set(stableKey({}), { group: {}, rows: [] });
+  }
+
+  return Array.from(groups.values()).map(({ group, rows: groupRows }) => {
+    const output: Record<string, unknown> = { ...group };
+    for (const [name, item] of Object.entries(aggregates)) {
+      output[name] = evaluateAggregate(projectionExpr(item), groupRows, target);
+    }
+    return output;
+  });
+}
+
+function evaluateAggregate(
+  expr: ExprData,
+  rows: readonly unknown[],
+  target: MaterializationEvalTarget
+): unknown {
+  if (expr.op !== 'aggregateCall') {
+    return exprValue(rows[0] ?? {}, expr, target);
+  }
+
+  const values = expr.expr === undefined
+    ? rows
+    : rows.map((row) => exprValue(row, expr.expr as ExprData, target));
+  const aggregateValues = expr.distinct ? distinctValues(values) : values;
+
+  switch (expr.name) {
+    case 'count':
+      return expr.expr === undefined
+        ? rows.length
+        : aggregateValues.filter((value) => value !== null && value !== undefined).length;
+    case 'sum':
+      return aggregateValues.reduce<number>((total, value) => total + (typeof value === 'number' ? value : 0), 0);
+    case 'avg': {
+      const numbers = aggregateValues.filter((value): value is number => typeof value === 'number');
+      return numbers.length === 0 ? undefined : numbers.reduce((total, value) => total + value, 0) / numbers.length;
+    }
+    case 'min':
+      return orderedValues(aggregateValues).at(0);
+    case 'max':
+      return orderedValues(aggregateValues).at(-1);
+    case 'any':
+      return aggregateValues.some(Boolean);
+    case 'notAny':
+      return !aggregateValues.some(Boolean);
+    case 'setConcat':
+      return new Set(aggregateValues.flatMap((value) => {
+        if (value instanceof Set) return Array.from(value);
+        if (Array.isArray(value)) return value;
+        return [value];
+      }));
+    case 'top':
+      return [...orderedValues(aggregateValues)].reverse().slice(0, expr.count ?? 0);
+    case 'bottom':
+      return orderedValues(aggregateValues).slice(0, expr.count ?? 0);
+    case 'topBy':
+      return rowsByAggregate(rows, expr.expr, target, 'desc').slice(0, expr.count ?? 0);
+    case 'bottomBy':
+      return rowsByAggregate(rows, expr.expr, target, 'asc').slice(0, expr.count ?? 0);
   }
 }
 
-function exprValue(row: unknown, expr: ExprData): unknown {
+function rowsByAggregate(
+  rows: readonly unknown[],
+  expr: ExprData | undefined,
+  target: MaterializationEvalTarget,
+  direction: 'asc' | 'desc'
+): readonly unknown[] {
+  if (expr === undefined) {
+    return rows;
+  }
+
+  return rows.map((row) => ({ row, value: exprValue(row, expr, target) }))
+    .sort((left, right) => direction === 'asc'
+      ? compareValues(left.value, right.value)
+      : -compareValues(left.value, right.value))
+    .map((item) => item.row);
+}
+
+function distinctValues(values: readonly unknown[]): readonly unknown[] {
+  const seen = new Set<string>();
+  const output: unknown[] = [];
+
+  for (const value of values) {
+    const key = stableKey(value);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(value);
+  }
+
+  return output;
+}
+
+function orderedValues(values: readonly unknown[]): readonly unknown[] {
+  return [...values].sort(compareValues);
+}
+
+function setUnion(inputs: readonly (readonly unknown[])[]): readonly unknown[] {
+  const seen = new Set<string>();
+  const output: unknown[] = [];
+
+  for (const rows of inputs) {
+    for (const row of rows) {
+      const key = stableKey(row);
+      if (!seen.has(key)) {
+        seen.add(key);
+        output.push(row);
+      }
+    }
+  }
+
+  return output;
+}
+
+function setIntersection(inputs: readonly (readonly unknown[])[]): readonly unknown[] {
+  const [first = [], ...rest] = inputs;
+  return first.filter((row) => rest.every((rows) => rows.some((candidate) => stableKey(candidate) === stableKey(row))));
+}
+
+function setDifference(left: readonly unknown[], right: readonly unknown[]): readonly unknown[] {
+  const rightKeys = new Set(right.map((row) => stableKey(row)));
+  return left.filter((row) => !rightKeys.has(stableKey(row)));
+}
+
+function matchesPredicate(
+  row: unknown,
+  predicate: PredicateData,
+  target: MaterializationEvalTarget
+): boolean {
+  switch (predicate.op) {
+    case 'eq':
+      return Object.is(exprValue(row, predicate.left, target), exprValue(row, predicate.right, target));
+    case 'neq':
+      return !Object.is(exprValue(row, predicate.left, target), exprValue(row, predicate.right, target));
+    case 'lt':
+      return compareValues(exprValue(row, predicate.left, target), exprValue(row, predicate.right, target)) < 0;
+    case 'lte':
+      return compareValues(exprValue(row, predicate.left, target), exprValue(row, predicate.right, target)) <= 0;
+    case 'gt':
+      return compareValues(exprValue(row, predicate.left, target), exprValue(row, predicate.right, target)) > 0;
+    case 'gte':
+      return compareValues(exprValue(row, predicate.left, target), exprValue(row, predicate.right, target)) >= 0;
+    case 'and':
+      return predicate.predicates.every((item) => matchesPredicate(row, item, target));
+    case 'or':
+      return predicate.predicates.some((item) => matchesPredicate(row, item, target));
+    case 'not':
+      return !matchesPredicate(row, predicate.predicate, target);
+  }
+}
+
+function exprValue(row: unknown, expr: ExprData, target: MaterializationEvalTarget): unknown {
   switch (expr.op) {
     case 'value':
       return expr.value;
+    case 'env':
+      return target.env[expr.name];
+    case 'call':
+      return undefined;
     case 'field': {
       const aliased = isRecord(row) ? row[expr.alias] : undefined;
       return isRecord(aliased) ? aliased[expr.field] : isRecord(row) ? row[expr.field] : undefined;
     }
     case 'tuple':
-      return expr.items.map((item) => exprValue(row, item));
+      return expr.items.map((item) => exprValue(row, item, target));
+    case 'aggregateCall':
+      return evaluateAggregate(expr, [row], target);
+    case 'subquery': {
+      const rows = evaluateData(target, expr.query, asRecord(row));
+      return expr.mode === 'one' ? rows.at(0) : rows;
+    }
     default:
       return undefined;
   }
 }
 
-function sortRows(rows: readonly unknown[], order: readonly SortData[]): readonly unknown[] {
+function sortRows(
+  rows: readonly unknown[],
+  order: readonly SortData[],
+  target: MaterializationEvalTarget
+): readonly unknown[] {
   return [...rows].sort((left, right) => {
     for (const item of order) {
-      const compared = compareValues(exprValue(left, item.expr), exprValue(right, item.expr));
+      const compared = compareValues(exprValue(left, item.expr, target), exprValue(right, item.expr, target));
       if (compared !== 0) {
         return item.direction === 'desc' ? -compared : compared;
       }
@@ -756,6 +1064,11 @@ function sourceFor(target: SnapshotMaterializationTarget): RelationSource {
     relationNames: Object.keys(target.data),
     rows: (relation) => target.data[relation.name] ?? []
   };
+}
+
+function envFor(target: SnapshotMaterializationTarget): Readonly<Record<string, unknown>> {
+  const candidate = target as { readonly env?: unknown };
+  return isRecord(candidate.env) ? candidate.env : {};
 }
 
 function storeMaterialization<Row>(db: object, entry: StoredMaterialization<Row>): void {
@@ -799,10 +1112,41 @@ function groupRowsByField<Row, Value>(rows: readonly Row[], field: string): Read
   return lookup;
 }
 
+function setIndex<Row>(rows: readonly Row[]): MaterializationIndex<Row> {
+  const rowSet = new Set(rows);
+  return {
+    kind: 'set',
+    rows: rowSet,
+    has: (row) => rowSet.has(row),
+    values: () => rowSet.values()
+  };
+}
+
+function hashIndex<Row, Value>(rows: readonly Row[], field: string): MaterializationHashIndex<Row, Value> {
+  const lookup = groupRowsByField<Row, Value>(rows, field);
+  return {
+    kind: 'hash',
+    field,
+    lookup,
+    get: (value) => lookup.get(value) ?? [],
+    has: (value) => lookup.has(value)
+  };
+}
+
 function btreeIndex<Row, Value>(rows: readonly Row[], field: string): MaterializationBtreeIndex<Row, Value> {
   const lookup = groupRowsByField<Row, Value>(rows, field);
   const ordered = Array.from(lookup.keys()).sort(compareValues) as Value[];
-  return { kind: 'btree', field, lookup: new Map(ordered.map((key) => [key, lookup.get(key) ?? []])), ordered };
+  const orderedLookup = new Map(ordered.map((key) => [key, lookup.get(key) ?? []]));
+  return {
+    kind: 'btree',
+    field,
+    lookup: orderedLookup,
+    ordered,
+    get: (value) => orderedLookup.get(value) ?? [],
+    range: (bounds = {}) => ordered
+      .filter((value) => inRange(value, bounds))
+      .flatMap((value) => orderedLookup.get(value) ?? [])
+  };
 }
 
 function uniqueIndexResult<Row, Value>(
@@ -830,8 +1174,53 @@ function uniqueIndexResult<Row, Value>(
     kind: 'materializationUniqueIndex',
     indexed: diagnostics.length === 0,
     diagnostics,
-    index: { kind: 'unique', field, lookup }
+    index: {
+      kind: 'unique',
+      field,
+      lookup,
+      get: (value) => lookup.get(value),
+      has: (value) => lookup.has(value)
+    }
   });
+}
+
+function inRange<Value>(value: Value, bounds: MaterializationRange<Value>): boolean {
+  const lower = normalizeRangeBound(bounds.lower, true);
+  const upper = normalizeRangeBound(bounds.upper, true);
+
+  if (lower !== undefined) {
+    const comparison = compareValues(value, lower.value);
+    if (comparison < 0 || (comparison === 0 && !lower.inclusive)) {
+      return false;
+    }
+  }
+
+  if (upper !== undefined) {
+    const comparison = compareValues(value, upper.value);
+    if (comparison > 0 || (comparison === 0 && !upper.inclusive)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function normalizeRangeBound<Value>(
+  bound: MaterializationRangeBound<Value> | undefined,
+  defaultInclusive: boolean
+): { readonly value: Value; readonly inclusive: boolean } | undefined {
+  if (bound === undefined) {
+    return undefined;
+  }
+
+  if (isRecord(bound) && 'value' in bound) {
+    return {
+      value: bound.value as Value,
+      inclusive: typeof bound.inclusive === 'boolean' ? bound.inclusive : defaultInclusive
+    };
+  }
+
+  return { value: bound as Value, inclusive: defaultInclusive };
 }
 
 function fieldValue(row: unknown, field: string): unknown {
@@ -924,8 +1313,26 @@ function isQuery(input: unknown): input is Query {
   return isRecord(input) && 'data' in input && 'relations' in input;
 }
 
+function isQueryBatch(input: unknown): input is MaterializationQueryBatch {
+  return isRecord(input) && Object.values(input).every(isQuery);
+}
+
 function asRecord(input: unknown): Record<string, unknown> {
   return isRecord(input) ? input : {};
+}
+
+function pickFields(input: Record<string, unknown>, fields: readonly string[] | undefined): Record<string, unknown> {
+  if (fields === undefined) {
+    return input;
+  }
+
+  return Object.fromEntries(fields.map((field) => [field, input[field]]));
+}
+
+function isIterable(input: unknown): input is Iterable<unknown> {
+  return typeof input === 'object' &&
+    input !== null &&
+    Symbol.iterator in input;
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {

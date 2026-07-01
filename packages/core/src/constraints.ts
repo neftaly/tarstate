@@ -50,6 +50,7 @@ export type QueryForeignKeyConstraintData<
   readonly target: Target;
   readonly targetFields: TargetFields;
   readonly optional: boolean;
+  readonly cascade?: ForeignKeyCascade;
 };
 
 export type ForeignKeyConstraintData<
@@ -63,6 +64,7 @@ export type ForeignKeyConstraintData<
   readonly target: Target;
   readonly targetFields: TargetFields;
   readonly optional: boolean;
+  readonly cascade?: ForeignKeyCascade;
 };
 
 export type QueryUniqueConstraintData<
@@ -133,7 +135,11 @@ type ConstraintBase<Op extends string> = ConstraintOptions & {
 type ForeignKeyOptions = ConstraintOptions & {
   /** Allow null or undefined source key fields without reporting a missing reference. */
   readonly optional?: boolean;
+  /** Delete source rows when a referenced target row is deleted. */
+  readonly cascade?: ForeignKeyCascade;
 };
+
+export type ForeignKeyCascade = boolean | string;
 
 export function check(predicate: PredicateData, options?: ConstraintOptions): CheckConstraintData;
 export function check<Row>(query: Query<Row>, predicate: PredicateData, options?: ConstraintOptions): CheckConstraintData<Row>;
@@ -280,6 +286,7 @@ export function fk(
       target,
       targetFields: fieldTuple(targetFields),
       optional: options.optional ?? false,
+      ...(options.cascade === undefined ? {} : { cascade: options.cascade }),
       ...constraintOptions(options)
     };
   }
@@ -292,6 +299,7 @@ export function fk(
     target: target as RelationRef,
     targetFields: fieldTuple(targetFields),
     optional: options.optional ?? false,
+    ...(options.cascade === undefined ? {} : { cascade: options.cascade }),
     ...constraintOptions(options)
   };
 }

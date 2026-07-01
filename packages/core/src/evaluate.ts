@@ -373,6 +373,27 @@ async function evaluateExpr(expr: ExprData, row: EvalContext, state: EvalState):
       }
       return fn(...await Promise.all(expr.args.map((arg) => evaluateExpr(arg, row, state))));
     }
+    case 'hostCall': {
+      if (expr.fn === undefined) {
+        state.diagnostics.push({
+          code: 'unsupported_expression',
+          message: `host function ${expr.name} is not available; function expressions only work in memory`
+        });
+        return undefined;
+      }
+
+      const args = await Promise.all(expr.args.map((arg) => evaluateExpr(arg, row, state)));
+      try {
+        return expr.fn(...args);
+      } catch (error) {
+        state.diagnostics.push({
+          code: 'unsupported_expression',
+          message: `host function ${expr.name} failed`,
+          detail: error
+        });
+        return undefined;
+      }
+    }
     case 'tuple':
       return Promise.all(expr.items.map((item) => evaluateExpr(item, row, state)));
     case 'aggregateCall':

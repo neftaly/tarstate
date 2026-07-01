@@ -4,6 +4,9 @@ import type { RelationRef } from './schema.js';
 // Phantom value type; keeps field refs typed without adding runtime data.
 declare const fieldValue: unique symbol;
 const subqueryRelations: unique symbol = Symbol('tarstate.subqueryRelations');
+const hostFunctionId: unique symbol = Symbol('tarstate.hostFunctionId');
+
+export type HostExpressionFunction<Value = unknown> = (...args: readonly unknown[]) => Value;
 
 /** Canonical expression data produced by query constructors. */
 export type ExprData<Value = unknown> =
@@ -11,6 +14,14 @@ export type ExprData<Value = unknown> =
   | { readonly op: 'value'; readonly value: Value; readonly [fieldValue]?: Value }
   | { readonly op: 'env'; readonly name: string; readonly [fieldValue]?: Value }
   | { readonly op: 'call'; readonly name: string; readonly args: readonly ExprData[]; readonly [fieldValue]?: Value }
+  | {
+      readonly op: 'hostCall';
+      readonly id: string;
+      readonly name: string;
+      readonly args: readonly ExprData[];
+      readonly fn?: HostExpressionFunction<Value>;
+      readonly [fieldValue]?: Value;
+    }
   | { readonly op: 'tuple'; readonly items: readonly ExprData[]; readonly [fieldValue]?: Value }
   | {
       readonly op: 'subquery';
@@ -568,8 +579,18 @@ export function env<Value = unknown>(name: string): ExprData<Value> {
 }
 
 /** Build a named expression call. */
-export function call<Value = unknown>(name: string, ...args: readonly ExprInput[]): ExprData<Value> {
-  return { op: 'call', name, args: args.map(expr) };
+export function call<Value = unknown>(name: string, ...args: readonly ExprInput[]): ExprData<Value>;
+export function call<const Args extends readonly ExprInput[], Value>(
+  fn: (...args: TupleValues<Args>) => Value,
+  ...args: Args
+): ExprData<Value>;
+export function call<Value = unknown>(
+  nameOrFn: string | HostExpressionFunction<Value>,
+  ...args: readonly ExprInput[]
+): ExprData<Value> {
+  return typeof nameOrFn === 'function'
+    ? hostCall(nameOrFn, args)
+    : { op: 'call', name: nameOrFn, args: args.map(expr) };
 }
 
 /** Build a tuple expression. */
@@ -872,6 +893,7 @@ function collectExprDependencies(exprData: ExprData, names: Set<string>): void {
     case 'value':
       return;
     case 'call':
+    case 'hostCall':
       for (const arg of exprData.args) {
         collectExprDependencies(arg, names);
       }
@@ -1060,6 +1082,7 @@ function relationsForExpr(exprData: ExprData): Record<string, RelationRef> {
     case 'value':
       return {};
     case 'call':
+    case 'hostCall':
       return relationsForExprs(exprData.args);
     case 'tuple':
       return relationsForExprs(exprData.items);
@@ -1072,4 +1095,37 @@ function relationsForExpr(exprData: ExprData): Record<string, RelationRef> {
 
 function isOptionalProjection(input: ExprData | OptionalProjection): input is OptionalProjection {
   return 'kind' in input && input.kind === 'optionalProjection';
+}
+
+const hostFunctionIds = new WeakMap<HostExpressionFunction, string>();
+let nextHostFunctionId = 0;
+
+function hostCall<Value>(fn: HostExpressionFunction<Value>, args: readonly ExprInput[]): ExprData<Value> {
+  const output = {
+    op: 'hostCall',
+    id: stableHostFunctionId(fn),
+    name: fn.name === '' ? 'anonymous' : fn.name,
+    args: args.map(expr)
+  } as ExprData<Value>;
+
+  Object.defineProperty(output, 'fn', {
+    value: fn,
+    enumerable: false
+  });
+
+  return output;
+}
+
+function stableHostFunctionId(fn: HostExpressionFunction): string {
+  const existing = hostFunctionIds.get(fn);
+  if (existing !== undefined) return existing;
+  nextHostFunctionId += 1;
+  const id = `host:${nextHostFunctionId}:${fn.name === '' ? 'anonymous' : fn.name}`;
+  hostFunctionIds.set(fn, id);
+  Object.defineProperty(fn, hostFunctionId, {
+    value: id,
+    enumerable: false,
+    configurable: true
+  });
+  return id;
 }
