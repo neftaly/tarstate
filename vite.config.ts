@@ -113,7 +113,13 @@ const sourceAliases = [
 ];
 
 export default defineConfig(({ command }): UserConfig => {
-  const baseConfig = { clearScreen: false, resolve: { alias: sourceAliases } } satisfies UserConfig;
+  const baseConfig = {
+    clearScreen: false,
+    optimizeDeps: {
+      exclude: ['@automerge/automerge']
+    },
+    resolve: { alias: sourceAliases }
+  } satisfies UserConfig;
 
   if (packageConfig === undefined) {
     if (command !== 'build') return baseConfig;

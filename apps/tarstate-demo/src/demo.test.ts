@@ -1,219 +1,223 @@
 import { createElement, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
-import { TarstateProvider } from '@tarstate/react';
 import {
-  AutomergeCollaborationExample,
-  BasicTodoQueryExample,
-  ConstraintsWatchExample,
-  DerivedDashboardExample,
-  IndexedViewsExample,
-  ReactExampleSuite,
-  activePeopleQuery,
-  createAutomergeExampleModel,
-  createConstrainedDemoStore,
-  createDemoStore,
-  createIndexedDemoStore,
-  createMaterializedDemoStore,
-  indexedViewsForDb,
-  openTodoCardsQuery,
-  plannedOpenTodosQuery,
+  TutorialApp,
+  TutorialWalkthrough,
+  buildInvalidDataExample,
+  constraintTaskRowsQuery,
+  createAutomergeTutorialBacking,
+  createTutorialModel,
+  createTutorialStore,
+  openTaskCardsQuery,
   projectSummaryQuery,
-  seedData,
-  todoSchema,
-  type AutomergeExampleModel
+  readableDiagnostics,
+  runAutomergeQuery,
+  runBoostGuideTransaction,
+  runInvalidTutorialTransaction,
+  seedTutorialData,
+  tutorialIndexViewsForDb,
+  tutorialSchema,
+  type TutorialModel
 } from './demo.js';
-import type { TarstateDbStore } from '@tarstate/react';
+import { TarstateProvider, type TarstateDbStore } from '@tarstate/react';
 
-describe('React Tarstate example suite', () => {
-  it('keeps schema, seed data, and queries as shared plain TypeScript modules', () => {
-    expect(Object.keys(todoSchema)).toEqual(['projects', 'people', 'todos']);
-    expect(seedData()).toEqual({
+describe('Tarstate React walkthrough', () => {
+  it('builds the tiny normalized schema and seed rows as plain TypeScript data', () => {
+    expect(Object.keys(tutorialSchema)).toEqual(['projects', 'people', 'tasks']);
+    expect(seedTutorialData()).toMatchObject({
       projects: [
-        { id: 'project-launch', name: 'Launch board', status: 'active' },
-        { id: 'project-ops', name: 'Operations', status: 'active' }
+        { id: 'project-launch', name: 'Launch' },
+        { id: 'project-docs', name: 'Docs' }
       ],
       people: [
-        { id: 'person-ada', name: 'Ada', role: 'engineer', active: true },
-        { id: 'person-bea', name: 'Bea', role: 'designer', active: true },
-        { id: 'person-cy', name: 'Cy', role: 'ops', active: false }
+        { id: 'person-ada', name: 'Ada', active: true },
+        { id: 'person-bea', name: 'Bea', active: true },
+        { id: 'person-cy', name: 'Cy', active: false }
       ],
-      todos: [
-        {
-          id: 'todo-core',
-          projectId: 'project-launch',
-          ownerId: 'person-ada',
-          title: 'Ship core API',
-          status: 'doing',
-          points: 5
-        },
-        {
-          id: 'todo-docs',
-          projectId: 'project-launch',
-          ownerId: 'person-bea',
-          title: 'Write customer docs',
-          status: 'todo',
-          points: 3
-        },
-        {
-          id: 'todo-release',
-          projectId: 'project-ops',
-          ownerId: 'person-ada',
-          title: 'Run release checklist',
-          status: 'done',
-          points: 2
-        },
-        {
-          id: 'todo-feedback',
-          projectId: 'project-ops',
-          ownerId: 'person-cy',
-          title: 'Triage feedback',
-          status: 'todo',
-          points: 1
-        }
+      tasks: [
+        { id: 'task-api', title: 'Ship query API', status: 'doing', points: 5 },
+        { id: 'task-guide', title: 'Write React guide', status: 'todo', points: 3 },
+        { id: 'task-release', title: 'Run release checklist', status: 'done', points: 2 },
+        { id: 'task-triage', title: 'Triage feedback', status: 'todo', points: 1 }
       ]
     });
-    expect(openTodoCardsQuery.data.op).toBe('keyBy');
-    expect(projectSummaryQuery.data.op).toBe('keyBy');
-    expect(activePeopleQuery.data.op).toBe('keyBy');
-    expect(plannedOpenTodosQuery.data.op).toBe('keyBy');
   });
 
-  it('renders BasicTodoQueryExample with useDb, useQuery, and a computed useTransact update', async () => {
-    const store = createDemoStore();
-    const renderer = await renderWithProvider(store, createElement(BasicTodoQueryExample));
+  it('keeps query values inspectable and reusable', async () => {
+    const store = await createTutorialStore();
 
-    await waitFor(() => {
-      expect(status(renderer)).toBe('ready');
-      expect(rowIds(renderer)).toEqual(['todo-core', 'todo-docs', 'todo-feedback']);
-    });
-    expect(metric(renderer, 'Open')).toBe('3');
-    expect(metric(renderer, 'Points')).toBe('9');
+    expect(openTaskCardsQuery.data.op).toBe('keyBy');
+    expect(projectSummaryQuery.data.op).toBe('keyBy');
+    expect(constraintTaskRowsQuery.data.op).toBe('keyBy');
+    await expect(store.rows(openTaskCardsQuery)).resolves.toMatchObject([
+      { id: 'task-api', project: 'Launch', owner: 'Ada', points: 5 },
+      { id: 'task-guide', project: 'Docs', owner: 'Bea', points: 3 },
+      { id: 'task-triage', project: 'Docs', owner: 'Cy', points: 1 }
+    ]);
+  });
 
-    await click(renderer, 'compute-docs');
-    await waitFor(() => {
-      expect(rowText(renderer, 'todo-docs')).toContain('doing / 5');
+  it('shows invalid data diagnostics while returning valid query rows', async () => {
+    const example = await buildInvalidDataExample();
+
+    expect(example.invalidRow).toMatchObject({
+      id: 'task-broken',
+      points: 'many'
     });
-    expect(store.getSnapshot().db.data.todos).toContainEqual(expect.objectContaining({
-      id: 'todo-docs',
+    expect(example.rows.map((row) => row.id)).toEqual(['task-api', 'task-guide', 'task-triage']);
+    expect(example.diagnostics).toContainEqual(expect.objectContaining({
+      code: 'invalid_row',
+      label: 'Invalid row',
+      relation: 'tasks',
+      field: 'points'
+    }));
+  });
+
+  it('runs functional transactions as immutable DB changes', async () => {
+    const store = await createTutorialStore();
+    const beforeDb = store.getSnapshot().db;
+    const beforeRevision = store.getSnapshot().revision;
+    const result = await runBoostGuideTransaction(store);
+
+    expect(result.committed).toBe(true);
+    expect(result.previousDb).toBe(beforeDb);
+    expect(result.db).not.toBe(beforeDb);
+    expect(result.revision).toBe(beforeRevision + 1);
+    await expect(store.rows(openTaskCardsQuery)).resolves.toContainEqual(expect.objectContaining({
+      id: 'task-guide',
       status: 'doing',
       points: 5
     }));
   });
 
-  it('renders DerivedDashboardExample with joined materialized rows and aggregate summaries', async () => {
-    const store = await createMaterializedDemoStore();
-    const renderer = await renderWithProvider(store, createElement(DerivedDashboardExample));
+  it('materializes aggregate output and exposes concrete raw index shapes', async () => {
+    const store = await createTutorialStore();
+    const summary = await store.readMaterialized(projectSummaryQuery);
+    const views = tutorialIndexViewsForDb(store.getSnapshot().db);
 
-    await waitFor(() => {
-      expect(status(renderer)).toBe('ready');
-      expect(metric(renderer, 'Materialized')).toBe('yes');
-    });
-    expect(metric(renderer, 'Metadata')).toBe('open-todos');
-    expect(metric(renderer, 'Maintenance')).toBe('snapshot');
-    expect(metric(renderer, 'Dependencies')).toBe('todos,projects,people');
-    expect(metric(renderer, 'Summary rows')).toBe('2');
-    expect(rowIds(renderer)).toEqual(['todo-core', 'todo-docs', 'todo-feedback']);
-    expect(summaryIds(renderer)).toEqual(['project-launch', 'project-ops']);
-  });
-
-  it('renders IndexedViewsExample using final raw Set and Map materialized index shapes', async () => {
-    const store = await createIndexedDemoStore();
-    const views = indexedViewsForDb(store.getSnapshot().db);
-
+    expect(summary.materialized).toBe(true);
+    expect(summary.rows).toEqual([
+      { projectId: 'project-launch', openTasks: 1, points: 5, averagePoints: 5 },
+      { projectId: 'project-docs', openTasks: 2, points: 4, averagePoints: 2 }
+    ]);
     expect(views).toMatchObject({
       setRawKind: 'Set',
-      setIds: ['todo-core', 'todo-docs', 'todo-feedback'],
-      hashRawKind: 'Map',
-      hashProjectIds: ['todo-core', 'todo-docs'],
-      hashEntries: ['project-launch:2', 'project-ops:1'],
-      btreeRawKind: 'Map',
-      btreeOrdered: [1, 3, 5],
-      btreeRangeIds: ['todo-docs', 'todo-core'],
+      setTitles: ['Ship query API', 'Write React guide', 'Triage feedback'],
+      statusRawKind: 'Map',
+      todoTitles: ['Write React guide', 'Triage feedback'],
+      projectRawKind: 'Map',
+      launchTitles: ['Ship query API'],
+      pointsRawKind: 'Map',
+      pointsOrdered: [1, 3, 5],
+      pointsRangeTitles: ['Write React guide', 'Ship query API'],
       uniqueRawKind: 'Map',
-      uniqueCoreTitle: 'Ship core API'
-    });
-
-    const renderer = await renderWithProvider(store, createElement(IndexedViewsExample));
-    await waitFor(() => {
-      expect(status(renderer)).toBe('ready');
-      expect(metric(renderer, 'Set raw')).toBe('Set:3');
-    });
-    expect(metric(renderer, 'Hash raw')).toBe('Map:project-launch:2|project-ops:1');
-    expect(metric(renderer, 'Hash lookup')).toBe('todo-core,todo-docs');
-    expect(metric(renderer, 'Btree raw')).toBe('Map:1,3,5');
-    expect(metric(renderer, 'Btree range')).toBe('todo-docs,todo-core');
-    expect(metric(renderer, 'Unique raw')).toBe('Map:Ship core API');
-    expect(metric(renderer, 'Unique iterable')).toBe('3');
-  });
-
-  it('renders ConstraintsWatchExample with query-bound diagnostics and watch aliases', async () => {
-    const store = createConstrainedDemoStore();
-    const renderer = await renderWithProvider(store, createElement(ConstraintsWatchExample));
-
-    await waitFor(() => {
-      expect(status(renderer)).toBe('ready');
-      expect(metric(renderer, 'Watch events')).toBe('1');
-      expect(metric(renderer, 'Watch aliases')).toBe('+3/-0');
-    });
-
-    await click(renderer, 'insert-invalid');
-    await waitFor(() => {
-      expect(metric(renderer, 'Last committed')).toBe('no');
-      expect(metric(renderer, 'Diagnostics')).toContain('constraint_unique');
-    });
-    expect(metric(renderer, 'Detail')).toBe('unique-key-violation/query/name');
-    expect(rowIds(renderer)).toEqual(['todo-core', 'todo-docs', 'todo-feedback']);
-    expect(store.getSnapshot().db.data.people).not.toContainEqual(expect.objectContaining({ id: 'person-duplicate' }));
-  });
-
-  it('renders AutomergeCollaborationExample through the same provider/query surface', async () => {
-    const model = await createAutomergeExampleModel();
-    const renderer = await renderAutomerge(model);
-
-    await waitFor(() => {
-      expect(status(renderer)).toBe('ready');
-      expect(rowIds(renderer)).toEqual(['todo-core']);
-    });
-
-    await click(renderer, 'automerge-commit');
-    await waitFor(() => {
-      expect(metric(renderer, 'Heads changed')).toBe('yes');
-      expect(rowIds(renderer)).toEqual(['todo-docs']);
-    });
-    expect(model.relic.getDoc().workspace.todos).toEqual({
-      'todo-core': {
-        projectId: 'project-launch',
-        ownerId: 'person-ada',
-        title: 'Ship core API',
-        status: 'done',
-        points: 5
-      },
-      'todo-docs': {
-        projectId: 'project-launch',
-        ownerId: 'person-bea',
-        title: 'Write customer docs',
-        status: 'todo',
-        points: 3
-      }
+      uniqueDocsOwner: 'Bea'
     });
   });
 
-  it('exports a ReactExampleSuite composed from provider-scoped examples', async () => {
-    const model = await createAutomergeExampleModel();
+  it('returns readable constraint diagnostics for a rejected write', async () => {
+    const store = await createTutorialStore();
+    const result = await runInvalidTutorialTransaction(store);
+    const readable = readableDiagnostics(result.diagnostics);
+
+    expect(result.committed).toBe(false);
+    expect(readable.map((diagnostic) => diagnostic.code)).toEqual(expect.arrayContaining([
+      'constraint_req',
+      'constraint_unique',
+      'constraint_fk',
+      'constraint_check'
+    ]));
+    expect(readable).toContainEqual(expect.objectContaining({
+      code: 'constraint_req',
+      label: 'Missing required field',
+      field: 'title'
+    }));
+    await expect(store.rows(openTaskCardsQuery)).resolves.toHaveLength(3);
+  });
+
+  it('runs the same query shape over an Automerge-backed snapshot', async () => {
+    const backing = createAutomergeTutorialBacking();
+
+    await expect(runAutomergeQuery(backing)).resolves.toEqual([
+      expect.objectContaining({ id: 'task-api', title: 'Ship query API' }),
+      expect.objectContaining({ id: 'task-guide', title: 'Write React guide' })
+    ]);
+  });
+
+  it('renders ordered beginner-first tutorial sections', async () => {
+    const model = await createTutorialModel();
+    const renderer = await renderApp(model);
+
+    await waitFor(() => {
+      expect(sectionTitles(renderer)).toEqual([
+        'Why normalized relational state',
+        'Tiny schema and seed rows',
+        'Invalid rows become diagnostics',
+        'Query as data',
+        'Transactions are immutable changes',
+        'Derived and materialized views',
+        'Indexes over materialized rows',
+        'Constraints reject bad writes',
+        'Watch and track changes',
+        'Pluggable backing'
+      ]);
+      expect(metric(renderer, 'Open output')).toBe('3 rows / 9 points');
+      expect(metric(renderer, 'Diagnostics')).toBe('invalid_row/tasks/points');
+      expect(rowIds(renderer)).toEqual(['task-api', 'task-guide', 'task-triage']);
+      expect(metric(renderer, 'Set raw')).toContain('Set(');
+    });
+  });
+
+  it('renders live transaction, constraints, watch, and Automerge outputs', async () => {
+    const model = await createTutorialModel();
+    const renderer = await renderApp(model);
+
+    await waitFor(() => {
+      expect(metric(renderer, 'task-guide row')).toBe('todo / 3 points');
+    });
+
+    await click(renderer, 'boost-guide');
+    await waitFor(() => {
+      expect(metric(renderer, 'task-guide row')).toBe('doing / 5 points');
+      expect(metric(renderer, 'Last transaction')).toContain('3 -> 5');
+    });
+
+    await click(renderer, 'invalid-write');
+    await waitFor(() => {
+      expect(diagnosticCodes(renderer)).toEqual(expect.arrayContaining([
+        'constraint_req',
+        'constraint_unique',
+        'constraint_fk',
+        'constraint_check'
+      ]));
+    });
+
+    await click(renderer, 'complete-guide');
+    await waitFor(() => {
+      expect(metric(renderer, 'Last deleted')).toBe('Write React guide');
+    });
+
+    await click(renderer, 'run-automerge');
+    await waitFor(() => {
+      expect(metric(renderer, 'Rows from Automerge')).toBe('Ship query API, Write React guide');
+    });
+  });
+
+  it('exports one provider-scoped TutorialApp for the browser entry', async () => {
+    const model = await createTutorialModel();
     let renderer: ReactTestRenderer | undefined;
 
     await act(async () => {
-      renderer = create(createElement(ReactExampleSuite, { automerge: model }));
+      renderer = create(createElement(TutorialApp, { model }));
     });
 
-    expect(renderer?.root.findAllByProps({ 'data-example': 'BasicTodoQueryExample' })).toHaveLength(1);
-    expect(renderer?.root.findAllByProps({ 'data-example': 'DerivedDashboardExample' })).toHaveLength(1);
-    expect(renderer?.root.findAllByProps({ 'data-example': 'IndexedViewsExample' })).toHaveLength(1);
-    expect(renderer?.root.findAllByProps({ 'data-example': 'ConstraintsWatchExample' })).toHaveLength(1);
-    expect(renderer?.root.findAllByProps({ 'data-example': 'AutomergeCollaborationExample' })).toHaveLength(1);
+    expect(renderer?.root.findAllByProps({ 'data-tutorial': 'TarstateWalkthrough' })).toHaveLength(1);
   });
 });
+
+async function renderApp(model: TutorialModel): Promise<ReactTestRenderer> {
+  return renderWithProvider(model.store, createElement(TutorialWalkthrough, { automerge: model.automerge }));
+}
 
 async function renderWithProvider(
   store: TarstateDbStore,
@@ -229,13 +233,6 @@ async function renderWithProvider(
   return renderer;
 }
 
-function renderAutomerge(model: AutomergeExampleModel): Promise<ReactTestRenderer> {
-  return renderWithProvider(
-    model.store,
-    createElement(AutomergeCollaborationExample, { model })
-  );
-}
-
 async function click(renderer: ReactTestRenderer, action: string): Promise<void> {
   const button = renderer.root.findByProps({ 'data-action': action });
   await act(async () => {
@@ -243,13 +240,15 @@ async function click(renderer: ReactTestRenderer, action: string): Promise<void>
   });
 }
 
-function status(renderer: ReactTestRenderer): string {
-  return String(renderer.root.findAllByProps({ className: 'status' }).at(0)?.props['data-status']);
+function sectionTitles(renderer: ReactTestRenderer): readonly string[] {
+  return renderer.root
+    .findAll((node) => typeof node.props['data-section'] === 'string')
+    .map((node) => String(node.props['data-section']));
 }
 
 function metric(renderer: ReactTestRenderer, label: string): string {
   const node = renderer.root.findByProps({ 'data-metric': label });
-  return textContent(node.findByType('strong').children);
+  return textContentDeep(node.findByType('strong'));
 }
 
 function rowIds(renderer: ReactTestRenderer): readonly string[] {
@@ -258,21 +257,22 @@ function rowIds(renderer: ReactTestRenderer): readonly string[] {
     .map((node) => String(node.props['data-row-id']));
 }
 
-function summaryIds(renderer: ReactTestRenderer): readonly string[] {
+function diagnosticCodes(renderer: ReactTestRenderer): readonly string[] {
   return renderer.root
-    .findAll((node) => typeof node.props['data-summary-id'] === 'string')
-    .map((node) => String(node.props['data-summary-id']));
+    .findAll((node) => typeof node.props['data-diagnostic-code'] === 'string')
+    .map((node) => String(node.props['data-diagnostic-code']));
 }
 
-function rowText(renderer: ReactTestRenderer, id: string): string {
-  return textContent(renderer.root.findByProps({ 'data-row-id': id }).children);
+function textContentDeep(node: { readonly children: readonly unknown[] }): string {
+  return node.children.map((child) => {
+    if (typeof child === 'string' || typeof child === 'number') return String(child);
+    if (isRendererNode(child)) return textContentDeep(child);
+    return '';
+  }).join('');
 }
 
-function textContent(children: readonly unknown[]): string {
-  return children
-    .filter((child): child is string | number => typeof child === 'string' || typeof child === 'number')
-    .map((child) => `${child}`)
-    .join('');
+function isRendererNode(input: unknown): input is { readonly children: readonly unknown[] } {
+  return typeof input === 'object' && input !== null && Array.isArray((input as { readonly children?: unknown }).children);
 }
 
 async function waitFor(assertion: () => void): Promise<void> {

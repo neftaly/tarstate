@@ -1,6 +1,6 @@
 import { createElement } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ReactExampleSuite, createAutomergeExampleModel } from './demo.js';
+import { TutorialApp, createTutorialModel } from './demo.js';
 import './style.css';
 
 const app = document.querySelector<HTMLElement>('#app');
@@ -10,18 +10,18 @@ if (app === null) {
 }
 
 const root = createRoot(app);
-root.render(createElement('main', { className: 'page' }, createElement('p', { className: 'status' }, 'Loading Tarstate React examples...')));
+root.render(createElement('main', { className: 'page' }, createElement('p', { className: 'status' }, 'Loading Tarstate walkthrough...')));
 
-createAutomergeExampleModel()
-  .then((automerge) => {
-    root.render(createElement(ReactExampleSuite, { automerge }));
+createTutorialModel()
+  .then((model) => {
+    root.render(createElement(TutorialApp, { model }));
   })
   .catch((error: unknown) => {
     root.render(createElement(
       'main',
       { className: 'page' },
-      createElement('section', { className: 'panel' },
-        createElement('h2', null, 'Demo failed'),
+      createElement('section', { className: 'tutorial-card' },
+        createElement('h2', null, 'Walkthrough failed'),
         createElement('pre', null, error instanceof Error ? error.message : String(error))
       )
     ));
