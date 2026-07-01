@@ -42,8 +42,8 @@ The core API is stabilizing around a Relic-shaped split:
   maintenance is only an opportunistic optimization behind materialized
   snapshots; some supported shapes rebuild from source rows inside that path,
   and unsupported shapes keep explicit diagnostics and recompute/refresh fallback.
-  Final row `sort(...)` maintenance rebuilds affected sorted snapshots from
-  source rows; `limit(...)` and `sortLimit(...)` remain diagnostic-backed.
+  Final row `sort(...)`, `limit(...)`, and `sortLimit(...)` materializations
+  rebuild affected ordered/windowed snapshots from source rows.
   Incremental aggregate maintenance supports a narrow subset; `avg(expr)` is
   incremental only when matching visible `sum(expr)`/`count(expr)` fields are
   present over a non-null numeric base field or numeric literal.

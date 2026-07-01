@@ -1589,26 +1589,79 @@ describe('tarstate materialization', () => {
     ]);
   });
 
-  it('keeps final limit and sortLimit operators diagnostic-backed for incremental materialization', async () => {
+  it('maintains final limit and sortLimit operators through recompute-backed incremental materialization', async () => {
+    const windowCases: readonly {
+      readonly id: string;
+      readonly query: Query;
+      readonly expected: readonly { readonly label: string }[];
+    }[] = [
+      {
+        id: 'open-task-sorted-limit',
+        query: pipe(openTaskLabels, sort(asc(rootLabel)), limit(1)),
+        expected: [{ label: 'Gamma' }]
+      },
+      {
+        id: 'open-task-limit',
+        query: pipe(openTaskLabels, limit(1)),
+        expected: [{ label: 'Omega' }]
+      },
+      {
+        id: 'open-task-sort-limit',
+        query: pipe(openTaskLabels, sortLimit(1, asc(rootLabel))),
+        expected: [{ label: 'Gamma' }]
+      },
+      {
+        id: 'open-task-offset-limit',
+        query: pipe(openTaskLabels, limit(1, 1)),
+        expected: [{ label: 'Gamma' }]
+      }
+    ];
+
+    for (const testCase of windowCases) {
+      const db = createDb({ tasks: baseTaskRows });
+
+      await materializeSnapshot(db, testCase.query, { id: testCase.id, mode: 'incremental' });
+      expect(materializationForQuery(db, testCase.query)).toMatchObject({
+        id: testCase.id,
+        requestedMode: 'incremental',
+        maintenance: 'incremental',
+        diagnostics: []
+      });
+
+      const transaction = tryTransact(db, [
+        tasks.update('task-a', { text: 'Omega' })
+      ]);
+      expect(transaction.diagnostics).toEqual([]);
+
+      const fullRows = (await q(transaction.db, testCase.query)).rows;
+      const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
+
+      expect(result).toMatchObject({
+        kind: 'materializationMaintenance',
+        maintained: 1,
+        recomputed: 1,
+        carried: 0,
+        diagnostics: [],
+        sourceVersion: transaction.db.data,
+        changes: [{ update: 'recomputed', maintenance: 'incremental', diagnostics: [] }]
+      });
+      expect(materializedRowsFor(transaction.db, testCase.id)).toEqual(fullRows);
+      expect(materializedRowsFor(transaction.db, testCase.id)).toEqual(testCase.expected);
+    }
+  });
+
+  it('keeps non-final window operators diagnostic-backed for incremental materialization', async () => {
     const unsupportedCases: readonly {
       readonly id: string;
       readonly query: Query;
     }[] = [
       {
-        id: 'open-task-sorted-limit',
-        query: pipe(openTaskLabels, sort(asc(rootLabel)), limit(1))
+        id: 'open-task-non-final-limit',
+        query: pipe(openTaskLabels, limit(1), where(eq(rootLabel, 'Alpha')))
       },
       {
-        id: 'open-task-limit',
-        query: pipe(openTaskLabels, limit(1))
-      },
-      {
-        id: 'open-task-sort-limit',
-        query: pipe(openTaskLabels, sortLimit(1, asc(rootLabel)))
-      },
-      {
-        id: 'open-task-offset-limit',
-        query: pipe(openTaskLabels, limit(1, 1))
+        id: 'open-task-non-final-sort-limit',
+        query: pipe(openTaskLabels, sortLimit(1, asc(rootLabel)), where(eq(rootLabel, 'Alpha')))
       }
     ];
 
@@ -1616,6 +1669,7 @@ describe('tarstate materialization', () => {
       const db = createDb({ tasks: baseTaskRows });
 
       await materializeSnapshot(db, testCase.query, { id: testCase.id, mode: 'incremental' });
+
       expect(materializationForQuery(db, testCase.query)).toMatchObject({
         id: testCase.id,
         requestedMode: 'incremental',
@@ -1633,30 +1687,6 @@ describe('tarstate materialization', () => {
         ]
       });
     }
-  });
-
-  it('keeps non-final limit operators diagnostic-backed for incremental materialization', async () => {
-    const nonFinalLimit = pipe(openTaskLabels, limit(1), where(eq(rootLabel, 'Alpha')));
-    const db = createDb({ tasks: baseTaskRows });
-
-    await materializeSnapshot(db, nonFinalLimit, { id: 'open-task-non-final-limit', mode: 'incremental' });
-
-    expect(materializationForQuery(db, nonFinalLimit)).toMatchObject({
-      id: 'open-task-non-final-limit',
-      requestedMode: 'incremental',
-      maintenance: 'snapshot',
-      diagnostics: [
-        {
-          code: 'materialization_unsupported',
-          surface: 'materialization',
-          detail: {
-            mode: 'incremental',
-            queryKey: queryKey(nonFinalLimit),
-            reason: expect.any(String)
-          }
-        }
-      ]
-    });
   });
 
   it('classifies simple inner equality joins as incremental materializations', async () => {

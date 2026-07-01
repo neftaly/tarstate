@@ -282,6 +282,11 @@ type IncrementalRowMaterializationPlan = IncrementalBaseMaterializationPlan & {
   readonly kind: 'rows';
   readonly transforms: readonly IncrementalTransform[];
   readonly sort?: readonly SortData[];
+  readonly limit?: IncrementalLimit;
+};
+type IncrementalLimit = {
+  readonly count: number;
+  readonly offset: number;
 };
 type IncrementalAggregateMaterializationPlan = IncrementalBaseMaterializationPlan & {
   readonly kind: 'aggregate';
@@ -1539,7 +1544,7 @@ async function maintainIncrementalSnapshotRows(
   return rows.kind === 'applied'
       ? {
         kind: 'maintained',
-        update: incremental.plan.kind === 'rows' && incremental.plan.sort !== undefined
+        update: incremental.plan.kind === 'rows' && (incremental.plan.sort !== undefined || incremental.plan.limit !== undefined)
           ? 'recomputed'
           : 'incremental',
         rows: rows.rows
@@ -1858,13 +1863,36 @@ function incrementalRowPlanFor(
   operations: readonly QueryData[]
 ): IncrementalPlanResult {
   const finalSort = operations[0]?.op === 'sort' ? operations[0] : undefined;
+  const finalLimit = operations[0]?.op === 'limit' ? operations[0] : undefined;
+  const finalSortLimit = operations[0]?.op === 'sortLimit' ? operations[0] : undefined;
+  const finalLimitSort = finalLimit !== undefined && operations[1]?.op === 'sort'
+    ? operations[1]
+    : undefined;
+  const supportedFinalSort = finalSort ?? finalLimitSort;
 
-  if (operations.some((operation, index) => operation.op === 'sort' && index !== 0)) {
+  if (operations.some((operation) => operation.op === 'sort' && operation !== supportedFinalSort)) {
     return { kind: 'unsupported', reason: 'sort is only supported as the final incremental row operator' };
   }
 
-  if (finalSort !== undefined && !isSupportedSort(finalSort.order)) {
+  if (operations.some((operation) => operation.op === 'limit' && operation !== finalLimit)) {
+    return { kind: 'unsupported', reason: 'limit is only supported as the final incremental row operator' };
+  }
+
+  if (operations.some((operation) => operation.op === 'sortLimit' && operation !== finalSortLimit)) {
+    return { kind: 'unsupported', reason: 'sortLimit is only supported as the final incremental row operator' };
+  }
+
+  const sortOrder = finalSortLimit?.order ?? supportedFinalSort?.order;
+
+  if (sortOrder !== undefined && !isSupportedSort(sortOrder)) {
     return { kind: 'unsupported', reason: 'sort is limited to field, literal, and tuple expressions' };
+  }
+
+  const finalLimitData = finalSortLimit ?? finalLimit;
+  const limitResult = finalLimitData === undefined ? undefined : incrementalLimitFor(finalLimitData);
+
+  if (limitResult?.kind === 'unsupported') {
+    return limitResult;
   }
 
   let phase: 'source' | 'filter' | 'output' = 'source';
@@ -1878,6 +1906,7 @@ function incrementalRowPlanFor(
   const transforms: IncrementalTransform[] = [];
   let filters: readonly IncrementalPredicate[] | undefined;
   let sort: readonly SortData[] | undefined;
+  let limit: IncrementalLimit | undefined;
 
   for (const operation of [...operations].reverse()) {
     switch (operation.op) {
@@ -1946,12 +1975,30 @@ function incrementalRowPlanFor(
         transforms.push({ op: 'qualify', alias: operation.alias });
         continue;
       case 'sort':
+        if (operation !== supportedFinalSort) {
+          return { kind: 'unsupported', reason: 'sort is only supported as the final incremental row operator' };
+        }
+
         phase = 'output';
         sort = operation.order;
         continue;
-      case 'limit':
       case 'sortLimit':
-        return { kind: 'unsupported', reason: 'limit and sortLimit are outside the incremental row subset' };
+        if (operation !== finalSortLimit || limitResult === undefined) {
+          return { kind: 'unsupported', reason: 'sortLimit is only supported as the final incremental row operator' };
+        }
+
+        phase = 'output';
+        sort = operation.order;
+        limit = limitResult.limit;
+        continue;
+      case 'limit':
+        if (operation !== finalLimit || limitResult === undefined) {
+          return { kind: 'unsupported', reason: 'limit is only supported as the final incremental row operator' };
+        }
+
+        phase = 'output';
+        limit = limitResult.limit;
+        continue;
       default:
         return { kind: 'unsupported', reason: `operator ${operation.op} is outside the incremental subset` };
     }
@@ -1964,7 +2011,8 @@ function incrementalRowPlanFor(
       kind: 'rows',
       ...(filters === undefined ? {} : { filters }),
       transforms,
-      ...(sort === undefined ? {} : { sort })
+      ...(sort === undefined ? {} : { sort }),
+      ...(limit === undefined ? {} : { limit })
     }
   };
 }
@@ -2173,6 +2221,34 @@ function isSupportedSort(order: readonly SortData[]): boolean {
   return order.every((item) => isSupportedIncrementalExpr(item.expr));
 }
 
+function incrementalLimitFor(
+  data: Extract<QueryData, { readonly op: 'limit' | 'sortLimit' }>
+): {
+  readonly kind: 'supported';
+  readonly limit: IncrementalLimit;
+} | {
+  readonly kind: 'unsupported';
+  readonly reason: string;
+} {
+  const offset = data.op === 'limit' ? data.offset ?? 0 : 0;
+
+  if (!Number.isSafeInteger(data.count) || data.count < 0) {
+    return { kind: 'unsupported', reason: `${data.op} count must be a non-negative safe integer` };
+  }
+
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    return { kind: 'unsupported', reason: 'limit offset must be a non-negative safe integer' };
+  }
+
+  return {
+    kind: 'supported',
+    limit: {
+      count: data.count,
+      offset
+    }
+  };
+}
+
 function incrementalAggregateFieldsFor(
   projection: ProjectionData,
   relation: RelationRef,
@@ -2317,9 +2393,9 @@ async function applyIncrementalRowDeltas(
   env: EvaluateOptions['env'],
   source: RelationSource
 ): Promise<IncrementalDeltaRowsResult> {
-  if (plan.sort !== undefined) {
+  if (plan.sort !== undefined || plan.limit !== undefined) {
     return relationDeltasAffectPlan(plan, deltas)
-      ? recomputeSortedIncrementalRowRows(plan, plan.sort, source, env)
+      ? recomputeOrderedIncrementalRowRows(plan, source, env)
       : { kind: 'applied', rows: Object.freeze([...previousRows]) };
   }
 
@@ -2405,9 +2481,8 @@ function relationDeltasAffectPlan(
   );
 }
 
-async function recomputeSortedIncrementalRowRows(
+async function recomputeOrderedIncrementalRowRows(
   plan: IncrementalRowMaterializationPlan,
-  sort: readonly SortData[],
   source: RelationSource,
   env: EvaluateOptions['env']
 ): Promise<IncrementalDeltaRowsResult> {
@@ -2431,15 +2506,22 @@ async function recomputeSortedIncrementalRowRows(
   } catch (error) {
     return {
       kind: 'fallback',
-      reason: `source rows failed while rebuilding sorted incremental rows for ${plan.relationName}: ${String(error)}`
+      reason: `source rows failed while rebuilding ordered incremental rows for ${plan.relationName}: ${String(error)}`
     };
   }
 
-  const sorted = sortIncrementalRows(rows, sort);
+  const sorted = plan.sort === undefined
+    ? { kind: 'updated' as const, rows }
+    : sortIncrementalRows(rows, plan.sort);
 
   return sorted.kind === 'fallback'
     ? sorted
-    : { kind: 'applied', rows: Object.freeze(sorted.rows) };
+    : {
+        kind: 'applied',
+        rows: Object.freeze(plan.limit === undefined
+          ? sorted.rows
+          : sorted.rows.slice(plan.limit.offset, plan.limit.offset + plan.limit.count))
+      };
 }
 
 function applyIncrementalAggregateDeltas(

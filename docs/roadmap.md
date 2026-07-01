@@ -297,7 +297,8 @@ Current state:
   optional pure base-field predicates (`eq`/`neq`/`lt`/`lte`/`gt`/`gte` against
   literal/env/tuple values, composed with `and`/`or`/`not`), simple
   `project`/`extend`/`without`/`rename`/`qualify` transforms, and optional final
-  field/literal/tuple `sort(...)`. Affected sorted snapshots rebuild from
+  field/literal/tuple `sort(...)`, terminal `limit(...)`, or terminal
+  `sortLimit(...)`. Affected final ordered/windowed snapshots rebuild from
   current source rows inside the incremental maintenance path rather than using
   row-splice ordering. A terminal `aggregate` over the same base/filter
   subset can also be maintained when every aggregate is `count()`, `count(expr)`,
@@ -331,7 +332,7 @@ Current state:
   when a source exposes `RelationSource.rangeLookup`.
 - Non-equality/self joins, join-side output transforms,
   field-to-field predicates outside the raw join slice, subqueries, unsupported
-  aggregate shapes/options, non-final ordering, limits, custom calls, and
+  aggregate shapes/options, non-final ordering/windows, custom calls, and
   unsupported btree shapes still fall back to recompute with explicit
   unsupported incremental diagnostics. Unsafe extrema removals, unsafe join
   removals, and other
