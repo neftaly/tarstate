@@ -38,6 +38,7 @@ scales:
 - Requested incremental materialization maintenance for simple, joined, and aggregate deltas, including root inserts, updates, and deletes.
 - Larger materialized joined-query maintenance.
 - Large `trackTransact` reporting for requested incremental joined-query deltas.
+- Large requested incremental versus snapshot maintenance for aggregate-over-join root and right-side deltas.
 - Large requested incremental versus snapshot materialization maintenance for miss-heavy `leftJoin`.
 - Requested incremental versus snapshot materialization maintenance for grouped `topBy`/`bottomBy` aggregate winners.
 - Requested incremental versus snapshot materialization maintenance for structural `expand` and `qualify` queries.

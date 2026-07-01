@@ -977,9 +977,6 @@ function collectSingleRootPlan(
       if (hasAggregateStep(addedSteps)) {
         return 'nested aggregate is not supported for incremental maintenance';
       }
-      if (addedSteps.some((step) => step.kind === 'join')) {
-        return 'joins under aggregate are not supported for incremental maintenance';
-      }
 
       const groupReason = simpleProjectionReason(data.groupBy) ?? projectionShapeReason(data.groupBy, root.shape);
       if (groupReason !== undefined) {

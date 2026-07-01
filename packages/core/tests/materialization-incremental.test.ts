@@ -147,6 +147,38 @@ type TaskOwnerTeamRow = {
   readonly points: number;
 };
 
+type JoinedTaskOwnerTeamRollupRow = {
+  readonly teamId: string;
+  readonly tasks: number;
+  readonly points: number;
+  readonly averagePoints: number;
+};
+
+type LeftJoinedUserTeamRollupRow = {
+  readonly teamId: string;
+  readonly users: number;
+  readonly matchedTeams: number;
+};
+
+type JoinedTaskOwnerRow = {
+  readonly task: TaskRow;
+  readonly owner: UserRow;
+};
+
+type JoinedTaskOwnerWinnerRow = {
+  readonly teamId: string;
+  readonly maxTask: JoinedTaskOwnerRow | undefined;
+  readonly topTask: readonly JoinedTaskOwnerRow[];
+};
+
+type JoinedTaskOwnerWinnerSummary = {
+  readonly teamId: string;
+  readonly maxTask: string | undefined;
+  readonly maxOwner: string | undefined;
+  readonly topTask: readonly string[];
+  readonly topOwner: readonly string[];
+};
+
 type LargeCoreData = {
   readonly teams: readonly TeamRow[];
   readonly users: readonly UserRow[];
@@ -316,6 +348,58 @@ function taskOwnerTeamQuery(): Query<TaskOwnerTeamRow> {
     }),
     keyBy('id')
   ) as Query<TaskOwnerTeamRow>;
+}
+
+function joinedTaskOwnerTeamRollupsQuery(): Query<JoinedTaskOwnerTeamRollupRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const owner = as(coreSchema.users, 'owner');
+  return pipe(
+    from(task),
+    join(from(owner), eq(task.ownerId, owner.id)),
+    aggregate({
+      groupBy: { teamId: owner.teamId },
+      aggregates: {
+        tasks: count(),
+        points: sum(task.points),
+        averagePoints: avg(task.points)
+      }
+    }),
+    keyBy('teamId')
+  ) as Query<JoinedTaskOwnerTeamRollupRow>;
+}
+
+function leftJoinedUserTeamRollupsQuery(): Query<LeftJoinedUserTeamRollupRow> {
+  const user = as(coreSchema.users, 'user');
+  const team = as(coreSchema.teams, 'team');
+  return pipe(
+    from(user),
+    leftJoin(from(team), eq(user.teamId, team.id)),
+    aggregate({
+      groupBy: { teamId: user.teamId },
+      aggregates: {
+        users: count(),
+        matchedTeams: count(team.id)
+      }
+    }),
+    keyBy('teamId')
+  ) as Query<LeftJoinedUserTeamRollupRow>;
+}
+
+function joinedTaskOwnerWinnersQuery(): Query<JoinedTaskOwnerWinnerRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const owner = as(coreSchema.users, 'owner');
+  return pipe(
+    from(task),
+    join(from(owner), eq(task.ownerId, owner.id)),
+    aggregate({
+      groupBy: { teamId: owner.teamId },
+      aggregates: {
+        maxTask: maxBy<JoinedTaskOwnerRow>(task.points),
+        topTask: topBy<JoinedTaskOwnerRow>(1, task.points)
+      }
+    }),
+    keyBy('teamId')
+  ) as Query<JoinedTaskOwnerWinnerRow>;
 }
 
 function largeCoreData(): LargeCoreData {
@@ -498,6 +582,18 @@ function expectSingleUpdatedTaskProjectRanking(
   }
   expectTaskProjectRankingSummaries([rowChange.before], before);
   expectTaskProjectRankingSummaries([rowChange.after], after);
+}
+
+function joinedTaskOwnerWinnerSummaries(
+  rows: readonly JoinedTaskOwnerWinnerRow[]
+): readonly JoinedTaskOwnerWinnerSummary[] {
+  return rows.map((row) => ({
+    teamId: row.teamId,
+    maxTask: row.maxTask?.task.id,
+    maxOwner: row.maxTask?.owner.id,
+    topTask: row.topTask.map((item) => item.task.id),
+    topOwner: row.topTask.map((item) => item.owner.id)
+  }));
 }
 
 describe('incremental materialization', () => {
@@ -1305,6 +1401,458 @@ describe('incremental materialization', () => {
         [movedAda, movedBea]
       );
       expect(materializedRowsForQuery(next, taskProjectRankings)).toEqual(change.rows);
+    });
+
+    describe('aggregate over join queries', () => {
+      it('marks aggregate over inner equality join as incrementally maintained without fallback', () => {
+        const joinedRollups = joinedTaskOwnerTeamRollupsQuery();
+        const state = mat(createDb(sourceData), joinedRollups, {
+          id: 'joined-task-owner-team-rollups',
+          mode: 'incremental'
+        });
+        const metadata = materializationForQuery(state, joinedRollups);
+
+        expect(metadata).toMatchObject({
+          id: 'joined-task-owner-team-rollups',
+          requestedMode: 'incremental',
+          maintenance: 'incremental'
+        });
+        expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users']));
+        expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+        expect(materializedRowsForQuery(state, joinedRollups)).toEqual([
+          { teamId: 'eng', tasks: 2, points: 13, averagePoints: 6.5 },
+          { teamId: 'design', tasks: 1, points: 3, averagePoints: 3 }
+        ]);
+      });
+
+      it('incrementally maintains root inserts, updates, and deletes with only affected joined aggregate groups', () => {
+        const joinedRollups = joinedTaskOwnerTeamRollupsQuery();
+        const state = mat(createDb(sourceData), joinedRollups, {
+          id: 'joined-task-owner-team-rollups',
+          mode: 'incremental'
+        });
+        const extraReviewTask: TaskRow = {
+          id: 't4',
+          ownerId: 'bea',
+          title: 'Review joined aggregates',
+          done: false,
+          points: 7
+        };
+        const withInserted = createDb({
+          ...sourceData,
+          tasks: [...sourceData.tasks, extraReviewTask]
+        });
+
+        const inserted = maintainMaterializations(state, withInserted, {
+          deltas: [tasksDelta([extraReviewTask], [])]
+        });
+        const insertedChange = singleMaterializationChange(inserted, 'joined-task-owner-team-rollups');
+
+        expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(insertedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['tasks'],
+          rows: [
+            { teamId: 'eng', tasks: 2, points: 13, averagePoints: 6.5 },
+            { teamId: 'design', tasks: 2, points: 10, averagePoints: 5 }
+          ],
+          addedRows: [],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+        expect(insertedChange.rowChanges).toEqual([
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'design', tasks: 1, points: 3, averagePoints: 3 },
+            after: { teamId: 'design', tasks: 2, points: 10, averagePoints: 5 }
+          })
+        ]);
+        expect(materializedRowsForQuery(withInserted, joinedRollups)).toEqual(insertedChange.rows);
+
+        const updatedDraftEvaluatorTask = { ...draftEvaluatorTask, points: 6 };
+        const withUpdated = createDb({
+          ...sourceData,
+          tasks: [updatedDraftEvaluatorTask, shipRuntimeTask, reviewFixturesTask, extraReviewTask]
+        });
+        const updated = maintainMaterializations(withInserted, withUpdated, {
+          deltas: [tasksDelta([updatedDraftEvaluatorTask], [draftEvaluatorTask])]
+        });
+        const updatedChange = singleMaterializationChange(updated, 'joined-task-owner-team-rollups');
+
+        expect(updated).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(updatedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['tasks'],
+          rows: [
+            { teamId: 'eng', tasks: 2, points: 14, averagePoints: 7 },
+            { teamId: 'design', tasks: 2, points: 10, averagePoints: 5 }
+          ],
+          addedRows: [],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...updated.diagnostics, ...updatedChange.diagnostics]);
+        expect(updatedChange.rowChanges).toEqual([
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'eng', tasks: 2, points: 13, averagePoints: 6.5 },
+            after: { teamId: 'eng', tasks: 2, points: 14, averagePoints: 7 }
+          })
+        ]);
+        expect(materializedRowsForQuery(withUpdated, joinedRollups)).toEqual(updatedChange.rows);
+
+        const withDeleted = createDb({
+          ...sourceData,
+          tasks: [updatedDraftEvaluatorTask, shipRuntimeTask, reviewFixturesTask]
+        });
+        const deleted = maintainMaterializations(withUpdated, withDeleted, {
+          deltas: [tasksDelta([], [extraReviewTask])]
+        });
+        const deletedChange = singleMaterializationChange(deleted, 'joined-task-owner-team-rollups');
+
+        expect(deleted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(deletedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['tasks'],
+          rows: [
+            { teamId: 'eng', tasks: 2, points: 14, averagePoints: 7 },
+            { teamId: 'design', tasks: 1, points: 3, averagePoints: 3 }
+          ],
+          addedRows: [],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...deleted.diagnostics, ...deletedChange.diagnostics]);
+        expect(deletedChange.rowChanges).toEqual([
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'design', tasks: 2, points: 10, averagePoints: 5 },
+            after: { teamId: 'design', tasks: 1, points: 3, averagePoints: 3 }
+          })
+        ]);
+        expect(materializedRowsForQuery(withDeleted, joinedRollups)).toEqual(deletedChange.rows);
+      });
+
+      it('incrementally maintains right relation inserts, updates, and deletes with only affected joined aggregate groups', () => {
+        const joinedRollups = joinedTaskOwnerTeamRollupsQuery();
+        const orphanOpsTask: TaskRow = {
+          id: 't-flo',
+          ownerId: 'flo',
+          title: 'Ops follow-up',
+          done: false,
+          points: 6
+        };
+        const initial = createDb({
+          ...sourceData,
+          tasks: [...sourceData.tasks, orphanOpsTask]
+        });
+        const state = mat(initial, joinedRollups, {
+          id: 'joined-task-owner-team-rollups',
+          mode: 'incremental'
+        });
+        const withInsertedOwner = createDb({
+          ...sourceData,
+          users: [...sourceData.users, floUser],
+          tasks: [...sourceData.tasks, orphanOpsTask]
+        });
+
+        const inserted = maintainMaterializations(state, withInsertedOwner, {
+          deltas: [usersDelta([floUser], [])]
+        });
+        const insertedChange = singleMaterializationChange(inserted, 'joined-task-owner-team-rollups');
+
+        expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(insertedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['users'],
+          rows: [
+            { teamId: 'eng', tasks: 2, points: 13, averagePoints: 6.5 },
+            { teamId: 'design', tasks: 1, points: 3, averagePoints: 3 },
+            { teamId: 'ops', tasks: 1, points: 6, averagePoints: 6 }
+          ],
+          addedRows: [{ teamId: 'ops', tasks: 1, points: 6, averagePoints: 6 }],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+        expect(insertedChange.rowChanges).toEqual([
+          expect.objectContaining({
+            kind: 'added',
+            row: { teamId: 'ops', tasks: 1, points: 6, averagePoints: 6 }
+          })
+        ]);
+        expect(materializedRowsForQuery(withInsertedOwner, joinedRollups)).toEqual(insertedChange.rows);
+
+        const movedAdaUser = { ...adaUser, teamId: 'design' };
+        const withMovedOwner = createDb({
+          ...sourceData,
+          users: [movedAdaUser, beaUser, calUser, floUser],
+          tasks: [...sourceData.tasks, orphanOpsTask]
+        });
+        const moved = maintainMaterializations(withInsertedOwner, withMovedOwner, {
+          deltas: [usersDelta([movedAdaUser], [adaUser])]
+        });
+        const movedChange = singleMaterializationChange(moved, 'joined-task-owner-team-rollups');
+
+        expect(moved).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(movedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['users'],
+          rows: [
+            { teamId: 'design', tasks: 3, points: 16, averagePoints: 16 / 3 },
+            { teamId: 'ops', tasks: 1, points: 6, averagePoints: 6 }
+          ],
+          addedRows: [],
+          removedRows: [{ teamId: 'eng', tasks: 2, points: 13, averagePoints: 6.5 }]
+        });
+        expectNoIncrementalFallback([...moved.diagnostics, ...movedChange.diagnostics]);
+        expect(movedChange.rowChanges).toHaveLength(2);
+        expect(movedChange.rowChanges).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            kind: 'removed',
+            row: { teamId: 'eng', tasks: 2, points: 13, averagePoints: 6.5 }
+          }),
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'design', tasks: 1, points: 3, averagePoints: 3 },
+            after: { teamId: 'design', tasks: 3, points: 16, averagePoints: 16 / 3 }
+          })
+        ]));
+        expect(materializedRowsForQuery(withMovedOwner, joinedRollups)).toEqual(movedChange.rows);
+
+        const withoutOpsOwner = createDb({
+          ...sourceData,
+          users: [movedAdaUser, beaUser, calUser],
+          tasks: [...sourceData.tasks, orphanOpsTask]
+        });
+        const deleted = maintainMaterializations(withMovedOwner, withoutOpsOwner, {
+          deltas: [usersDelta([], [floUser])]
+        });
+        const deletedChange = singleMaterializationChange(deleted, 'joined-task-owner-team-rollups');
+
+        expect(deleted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(deletedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['users'],
+          rows: [
+            { teamId: 'design', tasks: 3, points: 16, averagePoints: 16 / 3 }
+          ],
+          addedRows: [],
+          removedRows: [{ teamId: 'ops', tasks: 1, points: 6, averagePoints: 6 }]
+        });
+        expectNoIncrementalFallback([...deleted.diagnostics, ...deletedChange.diagnostics]);
+        expect(deletedChange.rowChanges).toEqual([
+          expect.objectContaining({
+            kind: 'removed',
+            row: { teamId: 'ops', tasks: 1, points: 6, averagePoints: 6 }
+          })
+        ]);
+        expect(materializedRowsForQuery(withoutOpsOwner, joinedRollups)).toEqual(deletedChange.rows);
+      });
+
+      it('incrementally maintains aggregate over leftJoin unmatched and matched right-row transitions', () => {
+        const leftJoinedRollups = leftJoinedUserTeamRollupsQuery();
+        const state = mat(createDb(sourceData), leftJoinedRollups, {
+          id: 'left-joined-user-team-rollups',
+          mode: 'incremental'
+        });
+        const supportTeam: TeamRow = { id: 'missing', name: 'Support', rank: 5 };
+        const withSupport = createDb({
+          ...sourceData,
+          teams: [...sourceData.teams, supportTeam]
+        });
+
+        const inserted = maintainMaterializations(state, withSupport, {
+          deltas: [teamsDelta([supportTeam], [])]
+        });
+        const insertedChange = singleMaterializationChange(inserted, 'left-joined-user-team-rollups');
+
+        expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(insertedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['teams'],
+          rows: [
+            { teamId: 'eng', users: 1, matchedTeams: 1 },
+            { teamId: 'design', users: 1, matchedTeams: 1 },
+            { teamId: 'missing', users: 1, matchedTeams: 1 }
+          ],
+          addedRows: [],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+        expect(insertedChange.rowChanges).toEqual([
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'missing', users: 1, matchedTeams: 0 },
+            after: { teamId: 'missing', users: 1, matchedTeams: 1 }
+          })
+        ]);
+        expect(materializedRowsForQuery(withSupport, leftJoinedRollups)).toEqual(insertedChange.rows);
+
+        const withoutDesign = createDb({
+          ...sourceData,
+          teams: [engineeringTeam, supportTeam]
+        });
+        const deleted = maintainMaterializations(withSupport, withoutDesign, {
+          deltas: [teamsDelta([], [designTeam])]
+        });
+        const deletedChange = singleMaterializationChange(deleted, 'left-joined-user-team-rollups');
+
+        expect(deleted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(deletedChange).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['teams'],
+          rows: [
+            { teamId: 'eng', users: 1, matchedTeams: 1 },
+            { teamId: 'design', users: 1, matchedTeams: 0 },
+            { teamId: 'missing', users: 1, matchedTeams: 1 }
+          ],
+          addedRows: [],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...deleted.diagnostics, ...deletedChange.diagnostics]);
+        expect(deletedChange.rowChanges).toEqual([
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'design', users: 1, matchedTeams: 1 },
+            after: { teamId: 'design', users: 1, matchedTeams: 0 }
+          })
+        ]);
+        expect(materializedRowsForQuery(withoutDesign, leftJoinedRollups)).toEqual(deletedChange.rows);
+      });
+
+      it('updates both old and new aggregate groups when a joined root row moves group', () => {
+        const joinedRollups = joinedTaskOwnerTeamRollupsQuery();
+        const state = mat(createDb(sourceData), joinedRollups, {
+          id: 'joined-task-owner-team-rollups',
+          mode: 'incremental'
+        });
+        const movedShipRuntimeTask = { ...shipRuntimeTask, ownerId: 'bea', points: 4 };
+        const next = createDb({
+          ...sourceData,
+          tasks: [draftEvaluatorTask, movedShipRuntimeTask, reviewFixturesTask]
+        });
+
+        const maintained = maintainMaterializations(state, next, {
+          deltas: [tasksDelta([movedShipRuntimeTask], [shipRuntimeTask])]
+        });
+        const change = singleMaterializationChange(maintained, 'joined-task-owner-team-rollups');
+
+        expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(change).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['tasks'],
+          rows: [
+            { teamId: 'eng', tasks: 1, points: 5, averagePoints: 5 },
+            { teamId: 'design', tasks: 2, points: 7, averagePoints: 3.5 }
+          ],
+          addedRows: [],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+        expect(change.rowChanges).toHaveLength(2);
+        expect(change.rowChanges).toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'eng', tasks: 2, points: 13, averagePoints: 6.5 },
+            after: { teamId: 'eng', tasks: 1, points: 5, averagePoints: 5 }
+          }),
+          expect.objectContaining({
+            kind: 'updated',
+            before: { teamId: 'design', tasks: 1, points: 3, averagePoints: 3 },
+            after: { teamId: 'design', tasks: 2, points: 7, averagePoints: 3.5 }
+          })
+        ]));
+        expect(materializedRowsForQuery(next, joinedRollups)).toEqual(change.rows);
+      });
+
+      it('incrementally maintains row-winner aggregates over joined rows', () => {
+        const joinedWinners = joinedTaskOwnerWinnersQuery();
+        const state = mat(createDb(sourceData), joinedWinners, {
+          id: 'joined-task-owner-winners',
+          mode: 'incremental'
+        });
+        const metadata = materializationForQuery(state, joinedWinners);
+        const initialSummaries: readonly JoinedTaskOwnerWinnerSummary[] = [
+          {
+            teamId: 'eng',
+            maxTask: 't2',
+            maxOwner: 'ada',
+            topTask: ['t2'],
+            topOwner: ['ada']
+          },
+          {
+            teamId: 'design',
+            maxTask: 't3',
+            maxOwner: 'bea',
+            topTask: ['t3'],
+            topOwner: ['bea']
+          }
+        ];
+        const insertedWinnerTask: TaskRow = {
+          id: 't4',
+          ownerId: 'bea',
+          title: 'Win joined aggregate',
+          done: false,
+          points: 9
+        };
+        const withInsertedWinner = createDb({
+          ...sourceData,
+          tasks: [...sourceData.tasks, insertedWinnerTask]
+        });
+        const updatedSummaries: readonly JoinedTaskOwnerWinnerSummary[] = [
+          initialSummaries[0]!,
+          {
+            teamId: 'design',
+            maxTask: 't4',
+            maxOwner: 'bea',
+            topTask: ['t4'],
+            topOwner: ['bea']
+          }
+        ];
+
+        expect(metadata).toMatchObject({
+          id: 'joined-task-owner-winners',
+          requestedMode: 'incremental',
+          maintenance: 'incremental'
+        });
+        expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+        expect(joinedTaskOwnerWinnerSummaries(materializedRowsForQuery(state, joinedWinners) ?? [])).toEqual(
+          initialSummaries
+        );
+
+        const maintained = maintainMaterializations(state, withInsertedWinner, {
+          deltas: [tasksDelta([insertedWinnerTask], [])]
+        });
+        const change = singleMaterializationChange(maintained, 'joined-task-owner-winners') as
+          MaterializationMaintenanceResult<JoinedTaskOwnerWinnerRow>['changes'][number];
+
+        expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+        expect(change).toMatchObject({
+          maintenance: 'incremental',
+          recomputed: false,
+          touchedDependencies: ['tasks'],
+          addedRows: [],
+          removedRows: []
+        });
+        expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+        expect(joinedTaskOwnerWinnerSummaries(change.rows)).toEqual(updatedSummaries);
+        expect(change.rowChanges).toHaveLength(1);
+
+        const rowChange = change.rowChanges[0];
+        if (rowChange?.kind !== 'updated') {
+          throw new Error('expected a single updated joined winner aggregate row change');
+        }
+        expect(joinedTaskOwnerWinnerSummaries([rowChange.before])).toEqual([initialSummaries[1]]);
+        expect(joinedTaskOwnerWinnerSummaries([rowChange.after])).toEqual([updatedSummaries[1]]);
+        expect(materializedRowsForQuery(withInsertedWinner, joinedWinners)).toEqual(change.rows);
+      });
     });
   });
 

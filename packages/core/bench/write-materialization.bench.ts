@@ -19,6 +19,7 @@ import {
   hash,
   index,
   insert,
+  join,
   keyBy,
   mat,
   pipe,
@@ -197,6 +198,25 @@ const largeSnapshotMaterializedAggregate = mat(createDb(large.data), {
 const largeIncrementalMaterializedAggregate = mat(createDb(large.data), {
   projectTaskRollups: largeProjectTaskRollups
 }, { mode: 'incremental' });
+const largeJoinedTaskOwnerRollups = pipe(
+  from(taskRef),
+  join(from(personRef), eq(taskRef.ownerId, personRef.id)),
+  aggregate({
+    groupBy: { region: personRef.region },
+    aggregates: {
+      tasks: count(),
+      totalPoints: sum(taskRef.points),
+      averagePoints: avg(taskRef.points)
+    }
+  }),
+  keyBy('region')
+);
+const largeSnapshotMaterializedJoinedAggregate = mat(createDb(large.data), {
+  joinedTaskOwnerRollups: largeJoinedTaskOwnerRollups
+});
+const largeIncrementalMaterializedJoinedAggregate = mat(createDb(large.data), {
+  joinedTaskOwnerRollups: largeJoinedTaskOwnerRollups
+}, { mode: 'incremental' });
 const largeProjectTaskRankings = pipe(
   from(taskRef),
   aggregate({
@@ -234,6 +254,21 @@ const largeAggregateTaskProjectUpdate = updateWhere(
 );
 const largeAggregateDeleteTaskId = large.data.tasks[Math.floor(large.data.tasks.length / 2)]?.id ?? '';
 const largeAggregateTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.id, largeAggregateDeleteTaskId));
+const largeJoinedAggregateOwner = large.data.people.find((person) => (
+  large.data.tasks.some((task) => task.ownerId === person.id)
+)) ?? large.data.people[0];
+const largeJoinedAggregateOwnerTargetRegion = large.data.people.find((person) => (
+  person.region !== largeJoinedAggregateOwner?.region
+))?.region ?? 'remote';
+const largeJoinedAggregateTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 600, {
+  ownerId: largeJoinedAggregateOwner?.id ?? large.data.people[0]?.id ?? '',
+  points: 12
+}));
+const largeJoinedAggregateOwnerRegionUpdate = updateWhere(
+  benchSchema.people,
+  eq(personRef.id, largeJoinedAggregateOwner?.id ?? ''),
+  { region: largeJoinedAggregateOwnerTargetRegion }
+);
 const largeRankingInsertProjectId = large.data.projects[0]?.id ?? '';
 const largeRankingTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 500, {
   projectId: largeRankingInsertProjectId,
@@ -417,6 +452,22 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized transact large aggregate requested incremental: task delete', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedAggregate, largeAggregateTaskDelete));
+  }, options);
+
+  bench('materialized transact large joined aggregate snapshot: task insert', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedJoinedAggregate, largeJoinedAggregateTaskInsert));
+  }, options);
+
+  bench('materialized transact large joined aggregate requested incremental: task insert', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedJoinedAggregate, largeJoinedAggregateTaskInsert));
+  }, options);
+
+  bench('materialized transact large joined aggregate snapshot: owner region update', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedJoinedAggregate, largeJoinedAggregateOwnerRegionUpdate));
+  }, options);
+
+  bench('materialized transact large joined aggregate requested incremental: owner region update', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedJoinedAggregate, largeJoinedAggregateOwnerRegionUpdate));
   }, options);
 
   bench('materialized transact large topBy/bottomBy aggregate snapshot: task insert', () => {
