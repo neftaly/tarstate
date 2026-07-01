@@ -137,6 +137,63 @@ pre {
   font-weight: 700;
 }
 
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+
+.metric {
+  min-height: 72px;
+  padding: 12px;
+  border: 1px solid #d0dad6;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.metric span {
+  display: block;
+  margin-bottom: 6px;
+  color: #52655d;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.metric strong {
+  display: block;
+  color: #14211e;
+  font-size: 1rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.todo-list,
+.summary-list {
+  grid-column: 1 / -1;
+  margin: 4px 0 0;
+  padding-left: 22px;
+  color: #263b36;
+  line-height: 1.7;
+}
+
+button {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid #315b50;
+  border-radius: 8px;
+  background: #234b42;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #173c34;
+}
+
 ul {
   margin: 0;
   padding-left: 20px;

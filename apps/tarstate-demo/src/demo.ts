@@ -1,5 +1,6 @@
 import * as Automerge from '@automerge/automerge';
 import { createElement, useMemo, useState, type ReactElement } from 'react';
+import { automergeDb, type AutomergeDb } from '@tarstate/automerge';
 import {
   aggregate,
   as,
@@ -35,9 +36,9 @@ import {
   value,
   where,
   type Db,
-  type Query
+  type Query,
+  type TarstateDiagnostic
 } from '@tarstate/core';
-import { automergeDb, type AutomergeDb } from '@tarstate/automerge';
 import {
   booleanField,
   defineSchema,
@@ -93,6 +94,25 @@ export type ProjectSummary = {
   readonly todos: number;
   readonly points: number;
   readonly averagePoints: number;
+};
+
+export type ActivePerson = {
+  readonly id: string;
+  readonly name: string;
+};
+
+export type IndexedViews = {
+  readonly setRawKind: string;
+  readonly setIds: readonly string[];
+  readonly hashRawKind: string;
+  readonly hashProjectIds: readonly string[];
+  readonly hashEntries: readonly string[];
+  readonly btreeRawKind: string;
+  readonly btreeOrdered: readonly number[];
+  readonly btreeRangeIds: readonly string[];
+  readonly uniqueRawKind: string;
+  readonly uniqueCoreTitle: string;
+  readonly uniqueEntries: readonly string[];
 };
 
 export type StoredRow<Row extends { readonly id: string }> = Omit<Row, 'id'> & {
@@ -180,6 +200,16 @@ export const projectSummaryQuery = pipe(
   keyBy('projectId')
 ) as unknown as Query<ProjectSummary>;
 
+export const activePeopleQuery = pipe(
+  from(personRef),
+  where(eq(personRef.active, true)),
+  select({
+    id: personRef.id,
+    name: personRef.name
+  }),
+  keyBy('id')
+) as unknown as Query<ActivePerson>;
+
 export const plannedOpenTodosQuery = pipe(
   from(todoRef),
   hash(todoRef.projectId),
@@ -248,12 +278,16 @@ export async function createMaterializedDemoStore(): Promise<TarstateDbStore> {
   return store;
 }
 
+export async function createIndexedDemoStore(): Promise<TarstateDbStore> {
+  return createMaterializedDemoStore();
+}
+
 export function createConstrainedDemoStore(): TarstateDbStore {
   return createDemoStore(mat(
     db(seedData(), { env: { minimumPoints: 1 } }),
     constrain(
-      req(todoSchema.todos, 'title'),
-      unique(todoSchema.people, 'name'),
+      req(openTodoCardsQuery, 'title'),
+      unique(activePeopleQuery, 'name'),
       fk(todoSchema.todos, 'ownerId', todoSchema.people, 'id'),
       fk(todoSchema.todos, 'projectId', todoSchema.projects, 'id', { cascade: 'delete' })
     )
@@ -298,6 +332,36 @@ export async function createAutomergeExampleModel(): Promise<AutomergeExampleMod
   };
 }
 
+export function indexedViewsForDb(currentDb: Db): IndexedViews {
+  const setView = index<TodoCard>(currentDb, openTodoCardsQuery);
+  const hashByProject = index<TodoCard, string>(currentDb, openTodoCardsQuery, {
+    kind: 'hash',
+    field: 'projectId'
+  });
+  const btreeByPoints = index<TodoCard, number>(currentDb, openTodoCardsQuery, {
+    kind: 'btree',
+    field: 'points'
+  });
+  const uniqueById = index<TodoCard, string>(currentDb, 'open-todos', {
+    kind: 'unique',
+    field: 'id'
+  });
+
+  return {
+    setRawKind: collectionKind(setView.raw),
+    setIds: [...setView.raw].map((row) => row.id),
+    hashRawKind: collectionKind(hashByProject.raw),
+    hashProjectIds: rowsFromNested(hashByProject.raw.get('project-launch')).map((row) => row.id),
+    hashEntries: [...hashByProject.raw].map(([key, rows]) => `${key}:${rowsFromNested(rows).length}`),
+    btreeRawKind: collectionKind(btreeByPoints.raw),
+    btreeOrdered: btreeByPoints.ordered,
+    btreeRangeIds: btreeByPoints.range({ lower: { value: 3 } }).map((row) => row.id),
+    uniqueRawKind: collectionKind(uniqueById.raw),
+    uniqueCoreTitle: titleFromUnique(uniqueById.raw.get('todo-core')),
+    uniqueEntries: [...uniqueById.raw].map(([key, row]) => `${key}:${titleFromUnique(row)}`)
+  };
+}
+
 export function BasicTodoQueryExample(): ReactElement {
   const currentDb = useDb();
   const query = useQuery(openTodoCardsQuery, {
@@ -310,7 +374,7 @@ export function BasicTodoQueryExample(): ReactElement {
 
   return examplePanel(
     'BasicTodoQueryExample',
-    'useDb + useQuery + useTransact',
+    'Schema, model, useQuery, useTransact, and a computed update from the current DB.',
     statusLine(query.status, query.diagnostics.length),
     metric('Open', query.data?.openCount ?? 0),
     metric('Points', query.data?.totalPoints ?? 0),
@@ -327,7 +391,7 @@ export function BasicTodoQueryExample(): ReactElement {
   );
 }
 
-export function DashboardMaterializationExample(): ReactElement {
+export function DerivedDashboardExample(): ReactElement {
   const currentDb = useDb();
   const materialized = useMaterialized(openTodoCardsQuery);
   const summaries = useQuery(projectSummaryQuery);
@@ -336,26 +400,37 @@ export function DashboardMaterializationExample(): ReactElement {
     mode: 'incremental'
   }), []);
   const metadata = materializationForQuery(currentDb, openTodoCardsQuery);
-  const byProject = index<TodoCard, string>(currentDb, openTodoCardsQuery, {
-    kind: 'hash',
-    field: 'projectId'
-  });
-  const uniqueTodo = index<TodoCard, string>(currentDb, 'open-todos', {
-    kind: 'unique',
-    field: 'id'
-  });
 
   return examplePanel(
-    'DashboardMaterializationExample',
-    'useMaterialized + useQuery with materialization metadata',
-    statusLine(materialized.status, materialized.diagnostics.length),
+    'DerivedDashboardExample',
+    'Joined todo cards, aggregate project summaries, and materialization maintenance metadata.',
+    statusLine(materialized.status, materialized.diagnostics.length + summaries.diagnostics.length),
     metric('Materialized', materialized.materialized ? 'yes' : 'no'),
     metric('Metadata', metadata?.id ?? 'missing'),
-    metric('Planning', explanation.maintenance),
-    metric('Project rows', byProject.index?.get('project-launch').length ?? 0),
-    metric('Unique lookup', uniqueTodo.index?.get('todo-core')?.title ?? 'missing'),
+    metric('Maintenance', metadata?.maintenance ?? explanation.maintenance),
+    metric('Dependencies', (metadata?.dependencies ?? explanation.dependencies).join(',')),
+    metric('Summary rows', summaries.rows.length),
     todoList(materialized.rows),
     summaryList(summaries.rows)
+  );
+}
+
+export function IndexedViewsExample(): ReactElement {
+  const currentDb = useDb();
+  const materialized = useMaterialized(openTodoCardsQuery);
+  const views = indexedViewsForDb(currentDb);
+
+  return examplePanel(
+    'IndexedViewsExample',
+    'Materialized query indexes expose raw Relic-like Set/Map values and iterable facades.',
+    statusLine(materialized.status, materialized.diagnostics.length),
+    metric('Set raw', `${views.setRawKind}:${views.setIds.length}`),
+    metric('Hash raw', `${views.hashRawKind}:${views.hashEntries.join('|')}`),
+    metric('Hash lookup', views.hashProjectIds.join(',')),
+    metric('Btree raw', `${views.btreeRawKind}:${views.btreeOrdered.join(',')}`),
+    metric('Btree range', views.btreeRangeIds.join(',')),
+    metric('Unique raw', `${views.uniqueRawKind}:${views.uniqueCoreTitle}`),
+    metric('Unique iterable', views.uniqueEntries.length)
   );
 }
 
@@ -364,17 +439,21 @@ export function ConstraintsWatchExample(): ReactElement {
   const watchState = useWatch(openTodoCardsQuery, undefined, { keyBy: ['id'] });
   const transact = useTransact();
   const [rejectedCodes, setRejectedCodes] = useState<readonly string[]>([]);
+  const [rejectedDetail, setRejectedDetail] = useState('none');
   const [committed, setCommitted] = useState<boolean | undefined>();
+  const event = watchState.event;
 
   return examplePanel(
     'ConstraintsWatchExample',
-    'useQuery + useWatch + constrained useTransact',
-    statusLine(query.status, query.diagnostics.length),
+    'Query-bound constraints, rejected diagnostics, and the useWatch change feed.',
+    statusLine(query.status, query.diagnostics.length + watchState.diagnostics.length),
     metric('Watch events', watchState.events.length),
+    metric('Watch aliases', event === undefined ? 'none' : `+${event.added.length}/-${event.deleted.length}`),
     metric('Last committed', committed === undefined ? 'none' : committed ? 'yes' : 'no'),
     metric('Diagnostics', rejectedCodes.join(',') || 'none'),
+    metric('Detail', rejectedDetail),
     todoList(query.rows),
-    button('insert-invalid', 'Insert invalid', async () => {
+    button('insert-invalid', 'Insert duplicate active person', async () => {
       const result = await transact(insert(todoSchema.people, {
         id: 'person-duplicate',
         name: 'Ada',
@@ -383,6 +462,9 @@ export function ConstraintsWatchExample(): ReactElement {
       }));
       setCommitted(result.committed);
       setRejectedCodes(result.diagnostics.map((diagnostic) => diagnostic.code));
+      setRejectedDetail(diagnosticSummary(
+        result.diagnostics.find((diagnostic) => diagnostic.code === 'constraint_unique') ?? result.diagnostics[0]
+      ));
     })
   );
 }
@@ -394,7 +476,7 @@ export function AutomergeCollaborationExample({ model }: { readonly model: Autom
 
   return examplePanel(
     'AutomergeCollaborationExample',
-    'automergeDb snapshots through TarstateProvider + useQuery',
+    'An automergeDb-backed snapshot uses the same provider, query, and transaction path.',
     statusLine(query.status, query.diagnostics.length),
     metric('Rows', query.rows.length),
     metric('Heads changed', headsChanged ? 'yes' : 'no'),
@@ -419,13 +501,18 @@ export function AutomergeCollaborationExample({ model }: { readonly model: Autom
 }
 
 export function ReactExampleSuite({ automerge }: { readonly automerge: AutomergeExampleModel }): ReactElement {
-  const materializedStore = useMemo(() => createDemoStore(mat(
+  const basicStore = useMemo(() => createDemoStore(), []);
+  const dashboardStore = useMemo(() => createDemoStore(mat(
+    db(seedData(), { env: { minimumPoints: 1 } }),
+    openTodoCardsQuery,
+    { id: 'open-todos' }
+  )), []);
+  const indexedStore = useMemo(() => createDemoStore(mat(
     db(seedData(), { env: { minimumPoints: 1 } }),
     openTodoCardsQuery,
     { id: 'open-todos' }
   )), []);
   const constrainedStore = useMemo(() => createConstrainedDemoStore(), []);
-  const basicStore = useMemo(() => createDemoStore(), []);
 
   return createElement(
     'main',
@@ -433,10 +520,11 @@ export function ReactExampleSuite({ automerge }: { readonly automerge: Automerge
     createElement('header', { className: 'hero' },
       createElement('p', { className: 'eyebrow' }, 'Tarstate React examples'),
       createElement('h1', null, 'DB-first hooks over Relic state'),
-      createElement('p', { className: 'dek' }, 'A small React suite built around provider setup, queries, transactions, materialization, constraints, watch changes, and Automerge-backed DB snapshots.')
+      createElement('p', { className: 'dek' }, 'A small React suite for provider setup, queries, transactions, materialized views, raw indexes, constraints, watch changes, and Automerge-backed DB snapshots.')
     ),
     createElement(TarstateProvider, { store: basicStore }, createElement(BasicTodoQueryExample)),
-    createElement(TarstateProvider, { store: materializedStore }, createElement(DashboardMaterializationExample)),
+    createElement(TarstateProvider, { store: dashboardStore }, createElement(DerivedDashboardExample)),
+    createElement(TarstateProvider, { store: indexedStore }, createElement(IndexedViewsExample)),
     createElement(TarstateProvider, { store: constrainedStore }, createElement(ConstraintsWatchExample)),
     createElement(TarstateProvider, { store: automerge.store },
       createElement(AutomergeCollaborationExample, { model: automerge })
@@ -486,10 +574,10 @@ function todoList(rows: readonly TodoCard[]): ReactElement {
 function summaryList(rows: readonly ProjectSummary[]): ReactElement {
   return createElement(
     'ol',
-    { className: 'todo-list', 'data-summary-rows': rows.length },
+    { className: 'summary-list', 'data-summary-rows': rows.length },
     ...rows.map((row) =>
-      createElement('li', { key: row.projectId },
-        `${row.projectId}: ${row.todos} todos, ${row.points} points`
+      createElement('li', { key: row.projectId, 'data-summary-id': row.projectId },
+        `${row.projectId}: ${row.todos} todos, ${row.points} points, avg ${row.averagePoints}`
       )
     )
   );
@@ -499,10 +587,58 @@ function button(action: string, label: string, onClick: () => void | Promise<voi
   return createElement('button', { type: 'button', 'data-action': action, onClick }, label);
 }
 
+function rowsFromNested(input: unknown): readonly TodoCard[] {
+  if (input instanceof Set) {
+    return [...input].filter(isTodoCard);
+  }
+  if (input instanceof Map) {
+    return [...input.values()].flatMap(rowsFromNested);
+  }
+  return [];
+}
+
+function titleFromUnique(input: unknown): string {
+  if (isTodoCard(input)) return input.title;
+  if (input instanceof Map) {
+    const first = input.values().next();
+    return first.done === true ? 'missing' : titleFromUnique(first.value);
+  }
+  return 'missing';
+}
+
+function collectionKind(input: unknown): string {
+  if (input instanceof Set) return 'Set';
+  if (input instanceof Map) return 'Map';
+  return 'unknown';
+}
+
+function diagnosticSummary(diagnostic: TarstateDiagnostic | undefined): string {
+  if (diagnostic === undefined) return 'none';
+  const detail = isRecord(diagnostic.detail) ? diagnostic.detail : {};
+  const error = typeof detail.error === 'string' ? detail.error : diagnostic.code;
+  const relation = typeof diagnostic.relation === 'string' && diagnostic.relation.startsWith('query:')
+    ? 'query'
+    : diagnostic.relation;
+  const field = typeof diagnostic.field === 'string' ? diagnostic.field : 'unknown';
+  return `${error}/${relation ?? 'unknown'}/${field}`;
+}
+
 function isTodoRow(input: unknown): input is TodoRow {
-  return typeof input === 'object' &&
-    input !== null &&
-    !Array.isArray(input) &&
-    typeof (input as { readonly id?: unknown }).id === 'string' &&
-    typeof (input as { readonly title?: unknown }).title === 'string';
+  return isRecord(input) &&
+    typeof input.id === 'string' &&
+    typeof input.title === 'string';
+}
+
+function isTodoCard(input: unknown): input is TodoCard {
+  return isRecord(input) &&
+    typeof input.id === 'string' &&
+    typeof input.title === 'string' &&
+    typeof input.projectId === 'string' &&
+    typeof input.project === 'string' &&
+    typeof input.status === 'string' &&
+    typeof input.points === 'number';
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

@@ -28,10 +28,12 @@ adapter normalization, write-apply, or memory runtime concepts.
 
 - `BasicTodoQueryExample` uses `useDb`, `useQuery`, and `useTransact` for an
   open-todo query plus a computed update.
-- `DashboardMaterializationExample` uses `useMaterialized` with materialization
-  metadata and index facades.
-- `ConstraintsWatchExample` uses a constrained DB store, rejected transaction
-  diagnostics, and `useWatch`.
+- `DerivedDashboardExample` uses joined materialized todo cards, aggregate
+  project summaries, and dependency maintenance metadata.
+- `IndexedViewsExample` uses materialized query indexes with raw Set/Map shapes
+  for set, hash, btree, and unique lookups.
+- `ConstraintsWatchExample` uses query-bound constraints, rejected transaction
+  diagnostics, and `useWatch` added/deleted aliases.
 - `AutomergeCollaborationExample` shows an `automergeDb` snapshot feeding the
   same `TarstateProvider`/`useQuery` path.
 - `ReactExampleSuite` composes the examples with provider-scoped stores.

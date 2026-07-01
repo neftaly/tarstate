@@ -5,7 +5,7 @@ import {
   type MaterializationMaintenanceResult
 } from './materialization.js';
 import type { RelationSource } from './source.js';
-import { diffOptionsForTarget, trackedChangesForDbTransition } from './watch.js';
+import { diffOptionsForTarget, trackedChangesForDbTransition, watchTargetKey } from './watch.js';
 import type { TrackedChange, WatchDb, WatchRuntimeDiagnostic } from './watch.js';
 import { diffRows } from './diff.js';
 
@@ -39,10 +39,13 @@ function materializedChangesFromMaintenance(
     changes: materializations.changes.map((change) => ({
       kind: 'trackedChange',
       id: change.id,
+      targetKey: watchTargetKey(change.query),
       target: change.query,
       changed: change.rowChanges.length > 0,
       previousRows: change.previousRows ?? [],
       rows: change.rows,
+      added: change.addedRows,
+      deleted: change.removedRows,
       addedRows: change.addedRows,
       deletedRows: change.removedRows,
       removedRows: change.removedRows,
@@ -69,16 +72,21 @@ function materializedChangesForTransition(
     const rows = materializedRowsFor(after, metadata.id) ?? [];
     const diff = diffRows(previousRows, rows, diffOptionsForTarget(metadata.query, {}));
     diagnostics.push(...diff.diagnostics);
+    const added = diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
+    const deleted = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
     changes.push({
       kind: 'trackedChange',
       id: metadata.id,
+      targetKey: watchTargetKey(metadata.query),
       target: metadata.query,
       changed: diff.changes.length > 0,
       previousRows,
       rows,
-      addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
-      deletedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
-      removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+      added,
+      deleted,
+      addedRows: added,
+      deletedRows: deleted,
+      removedRows: deleted,
       unchangedRows: unchangedRows(rows, diff.changes),
       rowChanges: diff.changes,
       diagnostics: diff.diagnostics

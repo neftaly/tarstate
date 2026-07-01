@@ -16,10 +16,13 @@ import type {
 } from './materialization.js';
 import type {
   TrackedChange,
+  WatchChangeKeyMap,
+  WatchChangeMap,
   WatchDb,
   WatchDiagnostic,
   WatchRuntimeDiagnostic
 } from './watch.js';
+import { watchChangeKeyMap, watchChangeMap, watchTargetKey } from './watch.js';
 import { trackWatchedChanges } from './watch-tracking.js';
 import type { WritePatch } from './write.js';
 
@@ -41,6 +44,9 @@ export type TrackTransactResult<Db extends WatchDb = WatchDb> = {
   readonly result?: DbTransactionResult;
   readonly supported: boolean;
   readonly changes: readonly TrackedChange[];
+  readonly changeMap: WatchChangeMap;
+  readonly changesByTarget: WatchChangeMap;
+  readonly changesByTargetKey: WatchChangeKeyMap;
   readonly deltas: readonly RelationDelta[];
   readonly materializations?: MaterializationMaintenanceResult;
   readonly diagnostics: readonly TrackTransactDiagnostic[];
@@ -54,6 +60,9 @@ type TrackRuntimeCommitResultBase<Version = unknown> = {
   readonly patches: number;
   readonly applied: number;
   readonly changes: readonly TrackedChange[];
+  readonly changeMap: WatchChangeMap;
+  readonly changesByTarget: WatchChangeMap;
+  readonly changesByTargetKey: WatchChangeKeyMap;
   readonly deltas: readonly RelationDelta[];
   readonly materializations?: MaterializationMaintenanceResult;
   readonly diagnostics: readonly TrackRuntimeCommitDiagnostic[];
@@ -130,6 +139,9 @@ export async function trackTransact(
         db,
         supported: false,
         changes: [],
+        changeMap: watchChangeMap([]),
+        changesByTarget: watchChangeMap([]),
+        changesByTargetKey: watchChangeKeyMap([]),
         deltas: [],
         diagnostics: [diagnostic],
         ...(options?.label === undefined ? {} : { label: options.label })
@@ -147,6 +159,9 @@ export async function trackTransact(
       result,
       supported: true,
       changes: tracked.changes,
+      changeMap: watchChangeMap(tracked.changes),
+      changesByTarget: watchChangeMap(tracked.changes),
+      changesByTargetKey: watchChangeKeyMap(tracked.changes),
       deltas: result.deltas,
       diagnostics: [...result.diagnostics, ...tracked.diagnostics]
     };
@@ -161,11 +176,17 @@ export async function trackTransact(
   const tracked = committed
     ? await trackWatchedChanges(db, nextDb, envelope ? output.deltas ?? [] : [])
     : { changes: [], diagnostics: [] };
+  const changes = committed
+    ? tracked.changes.length > 0 ? tracked.changes : deltasToChanges(envelope ? output.deltas ?? [] : [])
+    : [];
   return {
     kind: 'trackTransact',
     db: nextDb,
     supported: true,
-    changes: committed ? tracked.changes.length > 0 ? tracked.changes : deltasToChanges(envelope ? output.deltas ?? [] : []) : [],
+    changes,
+    changeMap: watchChangeMap(changes),
+    changesByTarget: watchChangeMap(changes),
+    changesByTargetKey: watchChangeKeyMap(changes),
     deltas: envelope ? output.deltas ?? [] : [],
     diagnostics: [...(envelope ? output.diagnostics ?? [] : []), ...tracked.diagnostics],
     ...(options.label === undefined ? {} : { label: options.label })
@@ -207,6 +228,9 @@ export async function trackRuntimeCommit<Version = unknown>(
       patches: report.patches,
       applied: report.applied,
       changes: deltasToChanges(report.deltas),
+      changeMap: watchChangeMap(deltasToChanges(report.deltas)),
+      changesByTarget: watchChangeMap(deltasToChanges(report.deltas)),
+      changesByTargetKey: watchChangeKeyMap(deltasToChanges(report.deltas)),
       deltas: report.deltas,
       diagnostics: report.diagnostics,
       ...(report.version === undefined ? {} : { version: report.version }),
@@ -226,6 +250,9 @@ export async function trackRuntimeCommit<Version = unknown>(
       patches: report.patches,
       applied: report.applied,
       changes: deltasToChanges(report.deltas),
+      changeMap: watchChangeMap(deltasToChanges(report.deltas)),
+      changesByTarget: watchChangeMap(deltasToChanges(report.deltas)),
+      changesByTargetKey: watchChangeKeyMap(deltasToChanges(report.deltas)),
       deltas: report.deltas,
       diagnostics: report.diagnostics,
       ...(report.version === undefined ? {} : { version: report.version }),
@@ -242,6 +269,9 @@ export async function trackRuntimeCommit<Version = unknown>(
     patches: patchList.length,
     applied: 0,
     changes: [],
+    changeMap: watchChangeMap([]),
+    changesByTarget: watchChangeMap([]),
+    changesByTargetKey: watchChangeKeyMap([]),
     deltas: [],
     diagnostics: [unsupportedDiagnostic()],
     ...(options.label === undefined ? {} : { label: options.label })
@@ -280,10 +310,13 @@ function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChan
   return deltas.map((delta, index) => ({
     kind: 'trackedChange',
     id: `delta-${index + 1}`,
+    targetKey: watchTargetKey(delta.relation),
     target: delta.relation,
     changed: delta.added.length > 0 || delta.removed.length > 0,
     previousRows: delta.removed,
     rows: delta.added,
+    added: delta.added,
+    deleted: delta.removed,
     addedRows: delta.added,
     deletedRows: delta.removed,
     removedRows: delta.removed,

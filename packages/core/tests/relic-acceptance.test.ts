@@ -3,10 +3,13 @@ import {
   aggregate,
   as,
   avg,
+  bottom,
+  bottomBy,
   btree,
   call,
   constRows,
   count,
+  countDistinct,
   createDb,
   db,
   deleteByKey,
@@ -38,6 +41,8 @@ import {
   materializationsFor,
   materializedRowsForQuery,
   maybe,
+  max,
+  min,
   pipe,
   project,
   q,
@@ -50,9 +55,12 @@ import {
   row,
   sel,
   sel1,
+  setConcat,
   sort,
   stripMeta,
   sum,
+  top,
+  topBy,
   trackTransact,
   transact,
   tryTransactConstrained,
@@ -61,16 +69,18 @@ import {
   unwatch,
   updateEnv,
   updateWhere,
+  uniqueIndex,
   value,
   whatIf,
   where,
   withEnv,
   watch,
+  watchTargetKey,
   constrain,
   req,
   unique
 } from '@tarstate/core';
-import type { DbTransactionContext } from '@tarstate/core';
+import type { Db, DbTransactionContext, RelationDelta } from '@tarstate/core';
 import { diffRows } from '@tarstate/core/experimental/diff';
 import { stableKey } from '@tarstate/core/experimental/identity';
 import {
@@ -597,6 +607,229 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
   });
 
+  it('maintains materialized min and max aggregates when extrema are removed or updated', async () => {
+    const task = as(coreSchema.tasks, 'task');
+    const pointRanges = pipe(
+      from(task),
+      aggregate({
+        groupBy: { ownerId: task.ownerId },
+        aggregates: {
+          tasks: count(),
+          minPoints: min(task.points),
+          maxPoints: max(task.points)
+        }
+      }),
+      sort(task.ownerId)
+    );
+    const state = mat(createDb(sourceData), pointRanges, { id: 'point-ranges' });
+
+    await expect(qRows(state, pointRanges)).resolves.toEqual([
+      { ownerId: 'ada', tasks: 2, minPoints: 5, maxPoints: 8 },
+      { ownerId: 'bea', tasks: 1, minPoints: 3, maxPoints: 3 }
+    ]);
+
+    const removedMin = transact(state, deleteByKey(coreSchema.tasks, 't1'));
+
+    await expect(qRows(removedMin, pointRanges)).resolves.toEqual([
+      { ownerId: 'ada', tasks: 1, minPoints: 8, maxPoints: 8 },
+      { ownerId: 'bea', tasks: 1, minPoints: 3, maxPoints: 3 }
+    ]);
+    expect(materializedRowsForQuery(removedMin, pointRanges)).toEqual([
+      { ownerId: 'ada', tasks: 1, minPoints: 8, maxPoints: 8 },
+      { ownerId: 'bea', tasks: 1, minPoints: 3, maxPoints: 3 }
+    ]);
+
+    const updatedExtremum = transact(
+      removedMin,
+      updateWhere(coreSchema.tasks, eq(task.id, 't2'), { points: 2 })
+    );
+
+    await expect(qRows(updatedExtremum, pointRanges)).resolves.toEqual([
+      { ownerId: 'ada', tasks: 1, minPoints: 2, maxPoints: 2 },
+      { ownerId: 'bea', tasks: 1, minPoints: 3, maxPoints: 3 }
+    ]);
+    expect(materializedRowsForQuery(updatedExtremum, pointRanges)).toEqual([
+      { ownerId: 'ada', tasks: 1, minPoints: 2, maxPoints: 2 },
+      { ownerId: 'bea', tasks: 1, minPoints: 3, maxPoints: 3 }
+    ]);
+  });
+
+  it('maintains materialized top and bottom aggregates across inserted, removed, and updated rows', async () => {
+    const task = as(coreSchema.tasks, 'task');
+    const pointExtremes = pipe(
+      from(task),
+      aggregate({
+        aggregates: {
+          topPoints: top(2, task.points),
+          bottomPoints: bottom(2, task.points)
+        }
+      })
+    );
+    const state = mat(createDb(sourceData), pointExtremes, { id: 'point-extremes' });
+
+    await expect(qRows(state, pointExtremes)).resolves.toEqual([
+      { topPoints: [8, 5], bottomPoints: [3, 5] }
+    ]);
+
+    const insertedTop = transact(
+      state,
+      insert(coreSchema.tasks, {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Spike aggregate maintenance',
+        done: false,
+        points: 10
+      })
+    );
+
+    await expect(qRows(insertedTop, pointExtremes)).resolves.toEqual([
+      { topPoints: [10, 8], bottomPoints: [3, 5] }
+    ]);
+
+    const updatedIntoBottom = transact(
+      insertedTop,
+      updateWhere(coreSchema.tasks, eq(task.id, 't4'), { points: 1 })
+    );
+
+    await expect(qRows(updatedIntoBottom, pointExtremes)).resolves.toEqual([
+      { topPoints: [8, 5], bottomPoints: [1, 3] }
+    ]);
+
+    const removedBottom = transact(updatedIntoBottom, deleteByKey(coreSchema.tasks, 't4'));
+
+    await expect(qRows(removedBottom, pointExtremes)).resolves.toEqual([
+      { topPoints: [8, 5], bottomPoints: [3, 5] }
+    ]);
+    expect(materializedRowsForQuery(removedBottom, pointExtremes)).toEqual([
+      { topPoints: [8, 5], bottomPoints: [3, 5] }
+    ]);
+  });
+
+  it('maintains materialized topBy and bottomBy aggregates across inserted, removed, and updated rows', async () => {
+    type TaskRankingRow = {
+      readonly topTasks: readonly { readonly task: { readonly id: string } }[];
+      readonly bottomTasks: readonly { readonly task: { readonly id: string } }[];
+    };
+    const task = as(coreSchema.tasks, 'task');
+    const taskRankings = pipe(
+      from(task),
+      aggregate({
+        aggregates: {
+          topTasks: topBy(2, task.points),
+          bottomTasks: bottomBy(2, task.points)
+        }
+      })
+    );
+    const taskRankIds = async (input: Db): Promise<{ readonly top: readonly string[]; readonly bottom: readonly string[] }> => {
+      const [ranking] = await qRows(input, taskRankings) as readonly TaskRankingRow[];
+      return {
+        top: ranking?.topTasks.map((entry) => entry.task.id) ?? [],
+        bottom: ranking?.bottomTasks.map((entry) => entry.task.id) ?? []
+      };
+    };
+    const state = mat(createDb(sourceData), taskRankings, { id: 'task-rankings' });
+
+    await expect(taskRankIds(state)).resolves.toEqual({ top: ['t2', 't1'], bottom: ['t3', 't1'] });
+
+    const insertedTop = transact(
+      state,
+      insert(coreSchema.tasks, {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Spike aggregate maintenance',
+        done: false,
+        points: 10
+      })
+    );
+
+    await expect(taskRankIds(insertedTop)).resolves.toEqual({ top: ['t4', 't2'], bottom: ['t3', 't1'] });
+
+    const updatedIntoBottom = transact(
+      insertedTop,
+      updateWhere(coreSchema.tasks, eq(task.id, 't4'), { points: 1 })
+    );
+
+    await expect(taskRankIds(updatedIntoBottom)).resolves.toEqual({ top: ['t2', 't1'], bottom: ['t4', 't3'] });
+
+    const removedBottom = transact(updatedIntoBottom, deleteByKey(coreSchema.tasks, 't4'));
+
+    await expect(taskRankIds(removedBottom)).resolves.toEqual({ top: ['t2', 't1'], bottom: ['t3', 't1'] });
+    expect(materializedRowsForQuery(removedBottom, taskRankings)?.at(0)).toMatchObject({
+      topTasks: [{ task: { id: 't2' } }, { task: { id: 't1' } }],
+      bottomTasks: [{ task: { id: 't3' } }, { task: { id: 't1' } }]
+    });
+  });
+
+  it('maintains materialized countDistinct and setConcat aggregates with added and removed distinct values', async () => {
+    const user = as(coreSchema.users, 'user');
+    const userFacets = pipe(
+      from(user),
+      aggregate({
+        aggregates: {
+          distinctTeams: countDistinct(user.teamId),
+          tags: setConcat(user.tags)
+        }
+      })
+    );
+    const state = mat(createDb(sourceData), userFacets, { id: 'user-facets' });
+
+    await expect(qRows(state, userFacets)).resolves.toEqual([
+      { distinctTeams: 3, tags: new Set(['compiler', 'runtime', 'research']) }
+    ]);
+
+    const withDuplicateTeamAndTag = transact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: ['runtime', 'ui']
+      })
+    );
+
+    await expect(qRows(withDuplicateTeamAndTag, userFacets)).resolves.toEqual([
+      { distinctTeams: 3, tags: new Set(['compiler', 'runtime', 'research', 'ui']) }
+    ]);
+
+    const withoutOriginalDuplicate = transact(withDuplicateTeamAndTag, deleteByKey(coreSchema.users, 'ada'));
+
+    await expect(qRows(withoutOriginalDuplicate, userFacets)).resolves.toEqual([
+      { distinctTeams: 3, tags: new Set(['research', 'runtime', 'ui']) }
+    ]);
+
+    const withNewDistinctTeam = transact(
+      withoutOriginalDuplicate,
+      insert(coreSchema.teams, {
+        id: 'qa',
+        name: 'QA',
+        rank: 3
+      }),
+      insert(coreSchema.users, {
+        id: 'eli',
+        teamId: 'qa',
+        name: 'Eli',
+        active: true,
+        age: 31,
+        tags: ['qa']
+      })
+    );
+
+    await expect(qRows(withNewDistinctTeam, userFacets)).resolves.toEqual([
+      { distinctTeams: 4, tags: new Set(['research', 'runtime', 'ui', 'qa']) }
+    ]);
+
+    const withoutNewDistinctTeam = transact(withNewDistinctTeam, deleteByKey(coreSchema.users, 'eli'));
+
+    await expect(qRows(withoutNewDistinctTeam, userFacets)).resolves.toEqual([
+      { distinctTeams: 3, tags: new Set(['research', 'runtime', 'ui']) }
+    ]);
+    expect(materializedRowsForQuery(withoutNewDistinctTeam, userFacets)).toEqual([
+      { distinctTeams: 3, tags: new Set(['research', 'runtime', 'ui']) }
+    ]);
+  });
+
   it('builds set, hash, unique, and btree facades over materialized rows', () => {
     const user = as(coreSchema.users, 'user');
     const activeUsers = pipe(
@@ -625,22 +858,80 @@ describe('TypeScript Relic core acceptance', () => {
         { kind: 'btree', field: 'age' }
       ]
     });
-    expect(setIndex.index?.rows.size).toBe(2);
-    expect(hashIndex.index?.lookup.get('eng')).toEqual([
-      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
+    expect(setIndex.rows.size).toBe(2);
+    expect([...setIndex]).toEqual([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' },
+      { id: 'bea', name: 'Bea', age: 29, teamId: 'design' }
     ]);
+    expect(hashIndex.lookup.get('eng')).toEqual(new Set([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
+    ]));
     expect(uniqueIndex.index?.lookup.get('bea')).toEqual({ id: 'bea', name: 'Bea', age: 29, teamId: 'design' });
+    expect(btreeIndex.lookup.get(37)).toEqual(new Set([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
+    ]));
     expect(btreeIndex.index?.ordered).toEqual([29, 37]);
+    expect(hashIndex.get('eng')).toEqual(new Set([
+      { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
+    ]));
     expect(hashIndex.index?.get('eng')).toEqual([
       { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
     ]);
     expect(hashIndex.index?.has('ops')).toBe(false);
-    expect(uniqueIndex.index?.get('ada')).toEqual({ id: 'ada', name: 'Ada', age: 37, teamId: 'eng' });
-    expect(uniqueIndex.index?.has('ada')).toBe(true);
-    expect(btreeIndex.index?.has(37)).toBe(true);
-    expect(btreeIndex.index?.range({ lower: 30 })).toEqual([
+    expect(uniqueIndex.get('ada')).toEqual({ id: 'ada', name: 'Ada', age: 37, teamId: 'eng' });
+    expect(uniqueIndex.has('ada')).toBe(true);
+    expect(btreeIndex.has(37)).toBe(true);
+    expect(btreeIndex.range({ lower: 30 })).toEqual([
       { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
     ]);
+  });
+
+  it('builds nested raw maps for multi-key hash, btree, and unique indexes', () => {
+    const user = as(coreSchema.users, 'user');
+    const userRows = pipe(
+      from(user),
+      hash(user.teamId, user.active),
+      btree(user.active, user.age),
+      uniqueIndex(user.teamId, user.id),
+      project({ id: user.id, name: user.name, active: user.active, age: user.age, teamId: user.teamId }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), userRows, { id: 'users-by-compound-keys' });
+
+    const hashByTeamActive = index(state, userRows, { kind: 'hash', fields: ['teamId', 'active'] });
+    const btreeByActiveAge = index(state, userRows, { kind: 'btree', fields: ['active', 'age'] });
+    const uniqueByTeamId = index(state, userRows, { kind: 'unique', fields: ['teamId', 'id'] });
+
+    const engByActive = hashByTeamActive.get('eng') as ReadonlyMap<boolean, ReadonlySet<unknown>>;
+    expect(engByActive).toBeInstanceOf(Map);
+    expect(engByActive.get(true)).toEqual(new Set([
+      { id: 'ada', name: 'Ada', active: true, age: 37, teamId: 'eng' }
+    ]));
+    expect(hashByTeamActive.index?.rowsFor('missing', false)).toEqual([
+      { id: 'cal', name: 'Cal', active: false, age: 41, teamId: 'missing' }
+    ]);
+
+    const activeAges = btreeByActiveAge.get(true) as ReadonlyMap<number, ReadonlySet<unknown>>;
+    expect([...btreeByActiveAge.keys()]).toEqual([false, true]);
+    expect([...activeAges.keys()]).toEqual([29, 37]);
+    expect(activeAges.get(29)).toEqual(new Set([
+      { id: 'bea', name: 'Bea', active: true, age: 29, teamId: 'design' }
+    ]));
+    expect(btreeByActiveAge.range({ lower: true })).toEqual([
+      { id: 'bea', name: 'Bea', active: true, age: 29, teamId: 'design' },
+      { id: 'ada', name: 'Ada', active: true, age: 37, teamId: 'eng' }
+    ]);
+
+    const engById = uniqueByTeamId.get('eng') as ReadonlyMap<string, unknown>;
+    expect(engById).toBeInstanceOf(Map);
+    expect(engById.get('ada')).toEqual({ id: 'ada', name: 'Ada', active: true, age: 37, teamId: 'eng' });
+    expect(uniqueByTeamId.index?.rowFor('design', 'bea')).toEqual({
+      id: 'bea',
+      name: 'Bea',
+      active: true,
+      age: 29,
+      teamId: 'design'
+    });
   });
 
   it('refreshes materialized index facades after transact and removes them with demat', async () => {
@@ -735,7 +1026,7 @@ describe('TypeScript Relic core acceptance', () => {
       keyBy('id')
     );
     const state = createDb(sourceData);
-    const watched = watch(state, activeUsers);
+    const watched = watch(state, activeUsers, coreSchema.users);
 
     expect(watched).not.toBe(state);
     await expect(trackTransact(
@@ -762,10 +1053,41 @@ describe('TypeScript Relic core acceptance', () => {
       })
     );
     const activeUsersChange = tracked.changes.find((change) => change.id === queryKey(activeUsers));
+    const activeUsersMapChange = tracked.changesByTarget.get(activeUsers);
+    const relationMapChange = tracked.changesByTarget.get(coreSchema.users);
 
     expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
+    expect(tracked.changeMap.get(activeUsers)).toMatchObject({
+      targetKey: queryKey(activeUsers),
+      added: [{ id: 'dia', name: 'Dia' }],
+      deleted: []
+    });
+    expect(activeUsersMapChange).toMatchObject({
+      targetKey: queryKey(activeUsers),
+      added: [{ id: 'dia', name: 'Dia' }],
+      deleted: [],
+      addedRows: [{ id: 'dia', name: 'Dia' }]
+    });
+    expect(tracked.changesByTargetKey.get(queryKey(activeUsers))).toMatchObject({
+      target: activeUsers,
+      added: [{ id: 'dia', name: 'Dia' }]
+    });
+    expect(relationMapChange).toMatchObject({
+      targetKey: watchTargetKey(coreSchema.users),
+      added: [{
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      }],
+      deleted: []
+    });
     expect(activeUsersChange).toMatchObject({
       changed: true,
+      added: [{ id: 'dia', name: 'Dia' }],
+      deleted: [],
       addedRows: [{ id: 'dia', name: 'Dia' }],
       removedRows: [],
       rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'dia', name: 'Dia' } })]
@@ -774,13 +1096,33 @@ describe('TypeScript Relic core acceptance', () => {
     const removed = await trackTransact(tracked.db, deleteByKey(coreSchema.users, 'bea'));
     expect(removed.changes.find((change) => change.id === queryKey(activeUsers))).toMatchObject({
       changed: true,
+      added: [],
+      deleted: [{ id: 'bea', name: 'Bea' }],
       addedRows: [],
       deletedRows: [{ id: 'bea', name: 'Bea' }],
       removedRows: [{ id: 'bea', name: 'Bea' }],
       rowChanges: [expect.objectContaining({ kind: 'removed', row: { id: 'bea', name: 'Bea' } })]
     });
+    expect(removed.changesByTarget.get(coreSchema.users)).toMatchObject({
+      deleted: [beaUser],
+      deletedRows: [beaUser]
+    });
 
-    const unwatched = unwatch(removed.db, activeUsers);
+    const updated = await trackTransact(
+      removed.db,
+      updateWhere(coreSchema.users, eq(user.id, 'ada'), { age: 38 })
+    );
+    expect(updated.changesByTarget.get(coreSchema.users)).toMatchObject({
+      added: [{ ...adaUser, age: 38 }],
+      deleted: [adaUser],
+      rowChanges: [expect.objectContaining({
+        kind: 'updated',
+        before: adaUser,
+        after: { ...adaUser, age: 38 }
+      })]
+    });
+
+    const unwatched = unwatch(updated.db, activeUsers, coreSchema.users);
     const afterUnwatch = await trackTransact(
       unwatched,
       insert(coreSchema.users, {
@@ -816,6 +1158,47 @@ describe('TypeScript Relic core acceptance', () => {
       { id: 'ada', name: 'Ada' },
       { id: 'bea', name: 'Bea' }
     ]);
+  });
+
+  it('aggregates fallback delta changes by target in trackTransact maps', async () => {
+    const inserted = {
+      id: 'dia',
+      teamId: 'eng',
+      name: 'Dia',
+      active: true,
+      age: 24,
+      tags: []
+    };
+    const deltas = [
+      { relation: coreSchema.users, added: [inserted], removed: [] },
+      { relation: coreSchema.users, added: [], removed: [beaUser] }
+    ] satisfies readonly RelationDelta[];
+    const state = createDb(sourceData);
+
+    const tracked = await trackTransact(state, (current) => ({
+      db: current,
+      committed: true,
+      deltas,
+      diagnostics: []
+    }));
+
+    expect(tracked.changes).toHaveLength(2);
+    expect(tracked.changeMap.get(coreSchema.users)).toMatchObject({
+      targetKey: watchTargetKey(coreSchema.users),
+      added: [inserted],
+      deleted: [beaUser],
+      addedRows: [inserted],
+      deletedRows: [beaUser]
+    });
+    expect(tracked.changesByTarget.get(coreSchema.users)).toMatchObject({
+      added: [inserted],
+      deleted: [beaUser]
+    });
+    expect(tracked.changesByTargetKey.get(watchTargetKey(coreSchema.users))).toMatchObject({
+      target: coreSchema.users,
+      added: [inserted],
+      deleted: [beaUser]
+    });
   });
 
   it('enforces attached and explicit constraints as transaction participants', async () => {

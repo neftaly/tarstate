@@ -6,12 +6,16 @@ import {
   AutomergeCollaborationExample,
   BasicTodoQueryExample,
   ConstraintsWatchExample,
-  DashboardMaterializationExample,
+  DerivedDashboardExample,
+  IndexedViewsExample,
   ReactExampleSuite,
+  activePeopleQuery,
   createAutomergeExampleModel,
   createConstrainedDemoStore,
   createDemoStore,
+  createIndexedDemoStore,
   createMaterializedDemoStore,
+  indexedViewsForDb,
   openTodoCardsQuery,
   plannedOpenTodosQuery,
   projectSummaryQuery,
@@ -21,7 +25,7 @@ import {
 } from './demo.js';
 import type { TarstateDbStore } from '@tarstate/react';
 
-describe('React-first Tarstate examples', () => {
+describe('React Tarstate example suite', () => {
   it('keeps schema, seed data, and queries as shared plain TypeScript modules', () => {
     expect(Object.keys(todoSchema)).toEqual(['projects', 'people', 'todos']);
     expect(seedData()).toEqual({
@@ -71,6 +75,7 @@ describe('React-first Tarstate examples', () => {
     });
     expect(openTodoCardsQuery.data.op).toBe('keyBy');
     expect(projectSummaryQuery.data.op).toBe('keyBy');
+    expect(activePeopleQuery.data.op).toBe('keyBy');
     expect(plannedOpenTodosQuery.data.op).toBe('keyBy');
   });
 
@@ -96,40 +101,73 @@ describe('React-first Tarstate examples', () => {
     }));
   });
 
-  it('renders DashboardMaterializationExample from a materialized DB store', async () => {
+  it('renders DerivedDashboardExample with joined materialized rows and aggregate summaries', async () => {
     const store = await createMaterializedDemoStore();
-    const renderer = await renderWithProvider(store, createElement(DashboardMaterializationExample));
+    const renderer = await renderWithProvider(store, createElement(DerivedDashboardExample));
 
     await waitFor(() => {
       expect(status(renderer)).toBe('ready');
       expect(metric(renderer, 'Materialized')).toBe('yes');
     });
     expect(metric(renderer, 'Metadata')).toBe('open-todos');
-    expect(metric(renderer, 'Planning')).toBe('snapshot');
-    expect(metric(renderer, 'Project rows')).toBe('2');
-    expect(metric(renderer, 'Unique lookup')).toBe('Ship core API');
+    expect(metric(renderer, 'Maintenance')).toBe('snapshot');
+    expect(metric(renderer, 'Dependencies')).toBe('todos,projects,people');
+    expect(metric(renderer, 'Summary rows')).toBe('2');
     expect(rowIds(renderer)).toEqual(['todo-core', 'todo-docs', 'todo-feedback']);
+    expect(summaryIds(renderer)).toEqual(['project-launch', 'project-ops']);
   });
 
-  it('renders ConstraintsWatchExample with rejected diagnostics and watch events', async () => {
+  it('renders IndexedViewsExample using final raw Set and Map materialized index shapes', async () => {
+    const store = await createIndexedDemoStore();
+    const views = indexedViewsForDb(store.getSnapshot().db);
+
+    expect(views).toMatchObject({
+      setRawKind: 'Set',
+      setIds: ['todo-core', 'todo-docs', 'todo-feedback'],
+      hashRawKind: 'Map',
+      hashProjectIds: ['todo-core', 'todo-docs'],
+      hashEntries: ['project-launch:2', 'project-ops:1'],
+      btreeRawKind: 'Map',
+      btreeOrdered: [1, 3, 5],
+      btreeRangeIds: ['todo-docs', 'todo-core'],
+      uniqueRawKind: 'Map',
+      uniqueCoreTitle: 'Ship core API'
+    });
+
+    const renderer = await renderWithProvider(store, createElement(IndexedViewsExample));
+    await waitFor(() => {
+      expect(status(renderer)).toBe('ready');
+      expect(metric(renderer, 'Set raw')).toBe('Set:3');
+    });
+    expect(metric(renderer, 'Hash raw')).toBe('Map:project-launch:2|project-ops:1');
+    expect(metric(renderer, 'Hash lookup')).toBe('todo-core,todo-docs');
+    expect(metric(renderer, 'Btree raw')).toBe('Map:1,3,5');
+    expect(metric(renderer, 'Btree range')).toBe('todo-docs,todo-core');
+    expect(metric(renderer, 'Unique raw')).toBe('Map:Ship core API');
+    expect(metric(renderer, 'Unique iterable')).toBe('3');
+  });
+
+  it('renders ConstraintsWatchExample with query-bound diagnostics and watch aliases', async () => {
     const store = createConstrainedDemoStore();
     const renderer = await renderWithProvider(store, createElement(ConstraintsWatchExample));
 
     await waitFor(() => {
       expect(status(renderer)).toBe('ready');
-      expect(Number(metric(renderer, 'Watch events'))).toBeGreaterThanOrEqual(1);
+      expect(metric(renderer, 'Watch events')).toBe('1');
+      expect(metric(renderer, 'Watch aliases')).toBe('+3/-0');
     });
 
     await click(renderer, 'insert-invalid');
     await waitFor(() => {
       expect(metric(renderer, 'Last committed')).toBe('no');
-      expect(metric(renderer, 'Diagnostics')).toBe('constraint_unique');
+      expect(metric(renderer, 'Diagnostics')).toContain('constraint_unique');
     });
+    expect(metric(renderer, 'Detail')).toBe('unique-key-violation/query/name');
     expect(rowIds(renderer)).toEqual(['todo-core', 'todo-docs', 'todo-feedback']);
     expect(store.getSnapshot().db.data.people).not.toContainEqual(expect.objectContaining({ id: 'person-duplicate' }));
   });
 
-  it('renders AutomergeCollaborationExample through the same provider/query hooks', async () => {
+  it('renders AutomergeCollaborationExample through the same provider/query surface', async () => {
     const model = await createAutomergeExampleModel();
     const renderer = await renderAutomerge(model);
 
@@ -170,7 +208,8 @@ describe('React-first Tarstate examples', () => {
     });
 
     expect(renderer?.root.findAllByProps({ 'data-example': 'BasicTodoQueryExample' })).toHaveLength(1);
-    expect(renderer?.root.findAllByProps({ 'data-example': 'DashboardMaterializationExample' })).toHaveLength(1);
+    expect(renderer?.root.findAllByProps({ 'data-example': 'DerivedDashboardExample' })).toHaveLength(1);
+    expect(renderer?.root.findAllByProps({ 'data-example': 'IndexedViewsExample' })).toHaveLength(1);
     expect(renderer?.root.findAllByProps({ 'data-example': 'ConstraintsWatchExample' })).toHaveLength(1);
     expect(renderer?.root.findAllByProps({ 'data-example': 'AutomergeCollaborationExample' })).toHaveLength(1);
   });
@@ -217,6 +256,12 @@ function rowIds(renderer: ReactTestRenderer): readonly string[] {
   return renderer.root
     .findAll((node) => typeof node.props['data-row-id'] === 'string')
     .map((node) => String(node.props['data-row-id']));
+}
+
+function summaryIds(renderer: ReactTestRenderer): readonly string[] {
+  return renderer.root
+    .findAll((node) => typeof node.props['data-summary-id'] === 'string')
+    .map((node) => String(node.props['data-summary-id']));
 }
 
 function rowText(renderer: ReactTestRenderer, id: string): string {

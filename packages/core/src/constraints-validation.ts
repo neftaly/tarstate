@@ -215,7 +215,13 @@ function validateRequired(
     if (diagnosticRow(row)) return [row.__tarstateDiagnostic];
     const value = isRecord(row) ? row[field] : undefined;
     return value === undefined
-      ? [constraintDiagnostic('constraint_req', `required field ${field} is missing`, relation, field, rowKey(row))]
+      ? [constraintDiagnostic('constraint_req', `required field ${field} is missing`, relation, field, rowKey(row), {
+          error: 'required-field-violation',
+          relvar: relation,
+          field,
+          row,
+          clause: { op: 'req', field }
+        })]
       : [];
   });
 }
@@ -241,12 +247,23 @@ function validateUnique(
 
     const key = stableKeyValue(values);
     if (seen.has(key)) {
+      const previous = seen.get(key);
       diagnostics.push(constraintDiagnostic(
         'constraint_unique',
         `unique constraint failed for ${fields.join(',')}`,
         relation,
         fields.join(','),
-        displayKey(values)
+        displayKey(values),
+        {
+          error: 'unique-key-violation',
+          relvar: relation,
+          fields,
+          values,
+          oldRow: previous,
+          newRow: row,
+          rows: [previous, row],
+          clause: { op: 'unique', fields }
+        }
       ));
     } else {
       seen.set(key, row);
@@ -286,7 +303,17 @@ function validateForeignKey(
         `foreign key target is missing for ${fields.join(',')}`,
         relation,
         fields.join(','),
-        optional && fields.length === 1 ? rowKey(row) : displayKey(values)
+        optional && fields.length === 1 ? rowKey(row) : displayKey(values),
+        {
+          error: 'foreign-key-violation',
+          relvar: relation,
+          fields,
+          targetFields,
+          values,
+          row,
+          rows: targetRows,
+          clause: { op: 'fk', fields, targetFields, optional }
+        }
       ));
     }
   }
@@ -303,7 +330,12 @@ function validateCheck(
     if (diagnosticRow(row)) return [row.__tarstateDiagnostic];
     return evaluatePredicate(row, predicate)
       ? []
-      : [constraintDiagnostic('constraint_check', 'check constraint failed', relation, '', rowKey(row))];
+      : [constraintDiagnostic('constraint_check', 'check constraint failed', relation, '', rowKey(row), {
+          error: 'check-violation',
+          relvar: relation,
+          row,
+          clause: predicate
+        })];
   });
 }
 

@@ -137,7 +137,10 @@ export type WatchEvent<Row = unknown> = {
   readonly changed: boolean;
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
   readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly unknown[];
@@ -159,7 +162,10 @@ export type TrackedChange<Row = unknown> = {
   readonly changed: boolean;
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
   readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
   readonly rowChanges: readonly unknown[];
@@ -427,7 +433,10 @@ export function useWatch<Row>(
         changed: rowDiff.addedRows.length > 0 || rowDiff.removedRows.length > 0,
         previousRows,
         rows: result.rows,
+        added: rowDiff.addedRows,
+        deleted: rowDiff.removedRows,
         addedRows: rowDiff.addedRows,
+        deletedRows: rowDiff.removedRows,
         removedRows: rowDiff.removedRows,
         unchangedRows: rowDiff.unchangedRows,
         rowChanges: rowDiff.rowChanges,
@@ -695,7 +704,10 @@ function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChan
     changed: delta.added.length > 0 || delta.removed.length > 0,
     previousRows: delta.removed,
     rows: delta.added,
+    added: delta.added,
+    deleted: delta.removed,
     addedRows: delta.added,
+    deletedRows: delta.removed,
     removedRows: delta.removed,
     unchangedRows: [],
     rowChanges: [

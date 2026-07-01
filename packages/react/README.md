@@ -13,7 +13,8 @@ Primary API:
 - `useTransact()` applies explicit core write patches with `tryTransact`.
 - `useMaterialized(query)` reads core materialized query rows after
   `store.materialize(query)`.
-- `useWatch(query)` delivers core watch events as the provider DB changes.
+- `useWatch(query)` delivers core watch events as the provider DB changes,
+  including `added`/`deleted` aliases and `addedRows`/`removedRows` fields.
 
 Materialization and watch helpers retain their core shapes. React keeps these
 thin: materialization rows, transaction deltas, and diagnostics pass through as

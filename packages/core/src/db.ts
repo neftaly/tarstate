@@ -544,8 +544,8 @@ export function tryTransactWithConstraints(
     return {
       db,
       patches: result.patches,
-      applied: result.applied,
-      deltas: result.deltas,
+      applied: 0,
+      deltas: [],
       diagnostics: [...result.diagnostics, ...validation.diagnostics],
       committed: false
     };

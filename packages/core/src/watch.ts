@@ -33,10 +33,13 @@ export type WatchTarget<Row = unknown> = Query<Row> | RelationRef;
 export type WatchEvent<Row = unknown> = {
   readonly kind: 'watchEvent';
   readonly id: string;
+  readonly targetKey: string;
   readonly target: WatchTarget<Row>;
   readonly changed: boolean;
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
   readonly addedRows: readonly Row[];
   readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
@@ -53,11 +56,14 @@ export type WatchOptions<Row = unknown> = EvaluateOptions & RowDiffOptions<Row> 
 export type WatchRefreshResult<Row = unknown> = {
   readonly kind: 'watchRefresh';
   readonly id: string;
+  readonly targetKey: string;
   readonly target: WatchTarget<Row>;
   readonly delivered: boolean;
   readonly changed: boolean;
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
   readonly addedRows: readonly Row[];
   readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
@@ -110,10 +116,13 @@ export type UnwatchResult = {
 export type TrackedChange<Row = unknown> = {
   readonly kind: 'trackedChange';
   readonly id: string;
+  readonly targetKey: string;
   readonly target: WatchTarget<Row>;
   readonly changed: boolean;
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
   readonly addedRows: readonly Row[];
   readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
@@ -124,8 +133,11 @@ export type TrackedChange<Row = unknown> = {
 export type WatchTargetChange<Row = unknown> = {
   readonly kind: 'watchTargetChange';
   readonly id: string;
+  readonly targetKey: string;
   readonly target: WatchTarget<Row>;
   readonly changed: boolean;
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
   readonly addedRows: readonly Row[];
   readonly deletedRows: readonly Row[];
   readonly removedRows: readonly Row[];
@@ -134,6 +146,7 @@ export type WatchTargetChange<Row = unknown> = {
   readonly diagnostics: readonly WatchRuntimeDiagnostic[];
 };
 export type WatchChangeMap<Row = unknown> = ReadonlyMap<WatchTarget<Row>, WatchTargetChange<Row>>;
+export type WatchChangeKeyMap<Row = unknown> = ReadonlyMap<string, WatchTargetChange<Row>>;
 export type QueryDiffOptions<Row = unknown> = EvaluateOptions & RowDiffOptions<Row>;
 export type QueryDiffDiagnostic<Row = unknown> = TarstateDiagnostic | RowDiffDiagnostic<Row>;
 export type QueryDiff<Row = unknown> = {
@@ -251,20 +264,68 @@ export function unwatchTarget<Db extends WatchDb, Row>(
 export function watchChangeMap<Row>(changes: Iterable<TrackedChange<Row>>): WatchChangeMap<Row> {
   const byTarget = new Map<WatchTarget<Row>, WatchTargetChange<Row>>();
   for (const change of changes) {
-    byTarget.set(change.target, {
-      kind: 'watchTargetChange',
-      id: change.id,
-      target: change.target,
-      changed: change.changed,
-      addedRows: change.addedRows,
-      deletedRows: change.deletedRows,
-      removedRows: change.removedRows,
-      unchangedRows: change.unchangedRows,
-      rowChanges: change.rowChanges,
-      diagnostics: change.diagnostics
-    });
+    const targetChange = watchTargetChange(change);
+    const existing = byTarget.get(change.target);
+    byTarget.set(change.target, existing === undefined
+      ? targetChange
+      : mergeWatchTargetChanges(existing, targetChange));
   }
   return byTarget;
+}
+
+export function watchChangeKeyMap<Row>(changes: Iterable<TrackedChange<Row>>): WatchChangeKeyMap<Row> {
+  const byTargetKey = new Map<string, WatchTargetChange<Row>>();
+  for (const change of changes) {
+    const targetChange = watchTargetChange(change);
+    const existing = byTargetKey.get(change.targetKey);
+    byTargetKey.set(change.targetKey, existing === undefined
+      ? targetChange
+      : mergeWatchTargetChanges(existing, targetChange));
+  }
+  return byTargetKey;
+}
+
+export function watchTargetKey(target: WatchTarget): string {
+  return watchTargetIdentity(target);
+}
+
+function watchTargetChange<Row>(change: TrackedChange<Row>): WatchTargetChange<Row> {
+  return {
+    kind: 'watchTargetChange',
+    id: change.id,
+    targetKey: change.targetKey,
+    target: change.target,
+    changed: change.changed,
+    added: change.added,
+    deleted: change.deleted,
+    addedRows: change.addedRows,
+    deletedRows: change.deletedRows,
+    removedRows: change.removedRows,
+    unchangedRows: change.unchangedRows,
+    rowChanges: change.rowChanges,
+    diagnostics: change.diagnostics
+  };
+}
+
+function mergeWatchTargetChanges<Row>(
+  left: WatchTargetChange<Row>,
+  right: WatchTargetChange<Row>
+): WatchTargetChange<Row> {
+  return {
+    kind: 'watchTargetChange',
+    id: left.id,
+    targetKey: left.targetKey,
+    target: left.target,
+    changed: left.changed || right.changed,
+    added: [...left.added, ...right.added],
+    deleted: [...left.deleted, ...right.deleted],
+    addedRows: [...left.addedRows, ...right.addedRows],
+    deletedRows: [...left.deletedRows, ...right.deletedRows],
+    removedRows: [...left.removedRows, ...right.removedRows],
+    unchangedRows: [...left.unchangedRows, ...right.unchangedRows],
+    rowChanges: [...left.rowChanges, ...right.rowChanges],
+    diagnostics: [...left.diagnostics, ...right.diagnostics]
+  };
 }
 
 export function watchRuntime<Version, Row>(
@@ -410,10 +471,13 @@ export async function trackedChangesForDbTransition(
     changes.push({
       kind: 'trackedChange',
       id: event.id,
+      targetKey: event.targetKey,
       target: event.target,
       changed: event.changed,
       previousRows: event.previousRows,
       rows: event.rows,
+      added: event.added,
+      deleted: event.deleted,
       addedRows: event.addedRows,
       deletedRows: event.deletedRows,
       removedRows: event.removedRows,
@@ -484,21 +548,48 @@ function buildWatchEvent<Row>(
   const diffOptions = diffOptionsForTarget(target, options);
   const diff = diffRows(previousRows, rows, diffOptions);
   const changedKeys = new Set(diff.changes.map((change) => change.key));
+  const added = addedAliasRows(diff.changes, target);
+  const deleted = deletedAliasRows(diff.changes, target);
   return {
     kind: 'watchEvent',
     id,
+    targetKey: watchTargetIdentity(target),
     target,
     changed: diff.changes.length > 0,
     previousRows,
     rows,
-    addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
-    deletedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
-    removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    added,
+    deleted,
+    addedRows: added,
+    deletedRows: deleted,
+    removedRows: deleted,
     unchangedRows: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
     rowChanges: diff.changes,
     changes,
     diagnostics: diff.diagnostics
   };
+}
+
+function addedAliasRows<Row>(
+  changes: readonly RowChange<Row>[],
+  target: WatchTarget<Row>
+): readonly Row[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'added') return [change.row];
+    if (change.kind === 'updated' && isRelationRef(target)) return [change.after];
+    return [];
+  });
+}
+
+function deletedAliasRows<Row>(
+  changes: readonly RowChange<Row>[],
+  target: WatchTarget<Row>
+): readonly Row[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'removed') return [change.row];
+    if (change.kind === 'updated' && isRelationRef(target)) return [change.before];
+    return [];
+  });
 }
 
 async function readTargetRows<Row>(
@@ -516,11 +607,14 @@ function emptyWatchRefresh<Row>(id: string, target: WatchTarget<Row>): WatchRefr
   return {
     kind: 'watchRefresh',
     id,
+    targetKey: watchTargetIdentity(target),
     target,
     delivered: false,
     changed: false,
     previousRows: [],
     rows: [],
+    added: [],
+    deleted: [],
     addedRows: [],
     deletedRows: [],
     removedRows: [],

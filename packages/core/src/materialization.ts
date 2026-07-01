@@ -6,6 +6,7 @@ import {
   queryRowKeyFields,
   relationDependencies,
   type ExprData,
+  type NullSortOrder,
   type OptionalProjection,
   type PredicateData,
   type ProjectionData,
@@ -203,15 +204,54 @@ export type MaterializationMaintenanceResult<Row = unknown> = {
 export type MaterializationIndex<Row = unknown> = {
   readonly kind: 'set';
   readonly rows: ReadonlySet<Row>;
+  readonly raw: ReadonlySet<Row>;
   readonly has: (row: Row) => boolean;
   readonly values: () => IterableIterator<Row>;
 };
 
+export type MaterializationNestedRows<Row = unknown> =
+  | ReadonlySet<Row>
+  | ReadonlyMap<unknown, MaterializationNestedRows<Row>>;
+
+export type MaterializationNestedUniqueRows<Row = unknown> =
+  | Row
+  | ReadonlyMap<unknown, MaterializationNestedUniqueRows<Row>>;
+
+export type MaterializationSetLike<Row = unknown> = {
+  readonly size: number;
+  readonly has: (row: Row) => boolean;
+  readonly values: () => IterableIterator<Row>;
+  readonly keys: () => IterableIterator<Row>;
+  readonly entries: () => IterableIterator<[Row, Row]>;
+  readonly forEach: (
+    callbackfn: (value: Row, key: Row, set: ReadonlySet<Row>) => void,
+    thisArg?: unknown
+  ) => void;
+  readonly [Symbol.iterator]: () => IterableIterator<Row>;
+};
+
+export type MaterializationMapLike<Key = unknown, Value = unknown> = {
+  readonly size: number;
+  readonly get: (key: Key) => Value | undefined;
+  readonly has: (key: Key) => boolean;
+  readonly keys: () => IterableIterator<Key>;
+  readonly values: () => IterableIterator<Value>;
+  readonly entries: () => IterableIterator<[Key, Value]>;
+  readonly forEach: (
+    callbackfn: (value: Value, key: Key, map: ReadonlyMap<Key, Value>) => void,
+    thisArg?: unknown
+  ) => void;
+  readonly [Symbol.iterator]: () => IterableIterator<[Key, Value]>;
+};
+
 export type MaterializationHashIndex<Row = unknown, Value = unknown> = {
   readonly kind: 'hash';
-  readonly field: string;
-  readonly lookup: ReadonlyMap<Value, readonly Row[]>;
+  readonly field?: string;
+  readonly fields: readonly string[];
+  readonly lookup: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  readonly raw: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
   readonly get: (value: Value) => readonly Row[];
+  readonly rowsFor: (...values: readonly unknown[]) => readonly Row[];
   readonly has: (value: Value) => boolean;
 };
 
@@ -229,55 +269,80 @@ export type MaterializationRange<Value = unknown> = {
 
 export type MaterializationBtreeIndex<Row = unknown, Value = unknown> = {
   readonly kind: 'btree';
-  readonly field: string;
-  readonly lookup: ReadonlyMap<Value, readonly Row[]>;
+  readonly field?: string;
+  readonly fields: readonly string[];
+  readonly lookup: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  readonly raw: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
   readonly ordered: readonly Value[];
   readonly get: (value: Value) => readonly Row[];
+  readonly rowsFor: (...values: readonly unknown[]) => readonly Row[];
   readonly has: (value: Value) => boolean;
   readonly range: (bounds?: MaterializationRange<Value>) => readonly Row[];
 };
 
 export type MaterializationUniqueIndex<Row = unknown, Value = unknown> = {
   readonly kind: 'unique';
-  readonly field: string;
-  readonly lookup: ReadonlyMap<Value, Row>;
+  readonly field?: string;
+  readonly fields: readonly string[];
+  readonly lookup: ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>>;
+  readonly raw: ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>>;
   readonly get: (value: Value) => Row | undefined;
+  readonly rowFor: (...values: readonly unknown[]) => Row | undefined;
   readonly has: (value: Value) => boolean;
 };
 
-export type MaterializationIndexResult<Row = unknown> = {
+export type MaterializationIndexResult<Row = unknown> = MaterializationSetLike<Row> & {
   readonly kind: 'materializationIndex';
   readonly indexed: boolean;
   readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly id?: string;
   readonly queryKey?: string;
+  readonly rows: ReadonlySet<Row>;
+  readonly raw: ReadonlySet<Row>;
   readonly index?: MaterializationIndex<Row>;
 };
 
-export type MaterializationHashIndexResult<Row = unknown, Value = unknown> = {
+export type MaterializationHashIndexResult<Row = unknown, Value = unknown> =
+  MaterializationMapLike<Value, MaterializationNestedRows<Row>> & {
   readonly kind: 'materializationHashIndex';
   readonly indexed: boolean;
   readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly id?: string;
   readonly queryKey?: string;
+  readonly field?: string;
+  readonly fields: readonly string[];
+  readonly lookup: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  readonly raw: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
   readonly index?: MaterializationHashIndex<Row, Value>;
 };
 
-export type MaterializationBtreeIndexResult<Row = unknown, Value = unknown> = {
+export type MaterializationBtreeIndexResult<Row = unknown, Value = unknown> =
+  MaterializationMapLike<Value, MaterializationNestedRows<Row>> & {
   readonly kind: 'materializationBtreeIndex';
   readonly indexed: boolean;
   readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly id?: string;
   readonly queryKey?: string;
+  readonly field?: string;
+  readonly fields: readonly string[];
+  readonly lookup: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  readonly raw: ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  readonly ordered: readonly Value[];
+  readonly range: (bounds?: MaterializationRange<Value>) => readonly Row[];
   readonly index?: MaterializationBtreeIndex<Row, Value>;
 };
 
-export type MaterializationUniqueIndexResult<Row = unknown, Value = unknown> = {
+export type MaterializationUniqueIndexResult<Row = unknown, Value = unknown> =
+  MaterializationMapLike<Value, MaterializationNestedUniqueRows<Row>> & {
   readonly kind: 'materializationUniqueIndex';
   readonly indexed: boolean;
   readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly id?: string;
   readonly queryKey?: string;
+  readonly field?: string;
+  readonly fields: readonly string[];
+  readonly lookup: ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>>;
+  readonly raw: ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>>;
   readonly index?: MaterializationUniqueIndex<Row, Value>;
 };
 
@@ -290,11 +355,15 @@ export type MaterializedQueryResult<Row = unknown> = {
   readonly id?: string;
 };
 
+type MaterializationIndexFieldOptions<Field extends string = string> =
+  | { readonly field: Field; readonly fields?: never }
+  | { readonly field?: never; readonly fields: readonly [Field, ...Field[]] };
+
 export type MaterializationIndexOptions<Field extends string = string> =
   | { readonly kind?: 'set' }
-  | { readonly kind: 'hash'; readonly field: Field }
-  | { readonly kind: 'btree'; readonly field: Field }
-  | { readonly kind: 'unique'; readonly field: Field };
+  | ({ readonly kind: 'hash' } & MaterializationIndexFieldOptions<Field>)
+  | ({ readonly kind: 'btree' } & MaterializationIndexFieldOptions<Field>)
+  | ({ readonly kind: 'unique' } & MaterializationIndexFieldOptions<Field>);
 
 type StoredMaterialization<Row = unknown> = {
   readonly metadata: MaterializationMetadata<Row>;
@@ -614,17 +683,17 @@ export function index<Row = unknown>(
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
-  options: { readonly kind: 'hash'; readonly field: string }
+  options: { readonly kind: 'hash'; readonly field: string } | { readonly kind: 'hash'; readonly fields: readonly [string, ...string[]] }
 ): MaterializationHashIndexResult<Row, Value>;
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
-  options: { readonly kind: 'btree'; readonly field: string }
+  options: { readonly kind: 'btree'; readonly field: string } | { readonly kind: 'btree'; readonly fields: readonly [string, ...string[]] }
 ): MaterializationBtreeIndexResult<Row, Value>;
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
-  options: { readonly kind: 'unique'; readonly field: string }
+  options: { readonly kind: 'unique'; readonly field: string } | { readonly kind: 'unique'; readonly fields: readonly [string, ...string[]] }
 ): MaterializationUniqueIndexResult<Row, Value>;
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
@@ -642,29 +711,64 @@ export function index<Row = unknown, Value = unknown>(
 
   switch (options.kind) {
     case 'hash':
-      return withTarget(stored, {
+      return hashIndexResult<Row, Value>(stored, indexFields(options));
+    case 'btree':
+      return btreeIndexResult<Row, Value>(stored, indexFields(options));
+    case 'unique':
+      return uniqueIndexResult<Row, Value>(stored, indexFields(options));
+    default:
+      return setIndexResult(stored);
+  }
+}
+
+function setIndexResult<Row>(stored: StoredMaterialization<Row>): MaterializationIndexResult<Row> {
+  const rows = new Set(stored.rows as readonly Row[]);
+  return withSetLike(rows, withTarget(stored, {
+    kind: 'materializationIndex',
+    indexed: true,
+    diagnostics: [],
+    rows,
+    raw: rows,
+    index: setIndex(rows)
+  }));
+}
+
+function hashIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  fields: readonly string[]
+): MaterializationHashIndexResult<Row, Value> {
+  const lookup = groupRowsByFields<Row, Value>(stored.rows as readonly Row[], fields);
+  const facade = hashIndex<Row, Value>(lookup, fields);
+  return withMapLike(lookup, withTarget(stored, {
         kind: 'materializationHashIndex',
         indexed: true,
         diagnostics: [],
-        index: hashIndex(stored.rows as readonly Row[], options.field)
-      });
-    case 'btree':
-      return withTarget(stored, {
-        kind: 'materializationBtreeIndex',
-        indexed: true,
-        diagnostics: [],
-        index: btreeIndex(stored.rows as readonly Row[], options.field)
-      });
-    case 'unique':
-      return uniqueIndexResult<Row, Value>(stored, options.field);
-    default:
-      return withTarget(stored, {
-        kind: 'materializationIndex',
-        indexed: true,
-        diagnostics: [],
-        index: setIndex(stored.rows as readonly Row[])
-      });
-  }
+        ...indexFieldShape(fields),
+        fields,
+        lookup,
+        raw: lookup,
+        index: facade
+      }));
+}
+
+function btreeIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  fields: readonly string[]
+): MaterializationBtreeIndexResult<Row, Value> {
+  const lookup = sortNestedLookup(groupRowsByFields<Row, Value>(stored.rows as readonly Row[], fields)) as ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  const facade = btreeIndex<Row, Value>(lookup, fields);
+  return withMapLike(lookup, withTarget(stored, {
+    kind: 'materializationBtreeIndex',
+    indexed: true,
+    diagnostics: [],
+    ...indexFieldShape(fields),
+    fields,
+    lookup,
+    raw: lookup,
+    ordered: facade.ordered,
+    range: facade.range,
+    index: facade
+  }));
 }
 
 export function snapshotIndex<Row = unknown>(
@@ -995,9 +1099,7 @@ function rowsByAggregate(
   }
 
   return rows.map((row) => ({ row, value: exprValue(row, expr, target) }))
-    .sort((left, right) => direction === 'asc'
-      ? compareValues(left.value, right.value)
-      : -compareValues(left.value, right.value))
+    .sort((left, right) => compareSortValues(left.value, right.value, direction, 'last'))
     .map((item) => item.row);
 }
 
@@ -1018,7 +1120,9 @@ function distinctValues(values: readonly unknown[]): readonly unknown[] {
 }
 
 function orderedValues(values: readonly unknown[]): readonly unknown[] {
-  return [...values].sort(compareValues);
+  return [...values]
+    .filter((value) => value !== null && value !== undefined)
+    .sort(compareValues);
 }
 
 function setUnion(inputs: readonly (readonly unknown[])[]): readonly unknown[] {
@@ -1121,6 +1225,24 @@ function compareValues(left: unknown, right: unknown): number {
   if (left === undefined || left === null) return -1;
   if (right === undefined || right === null) return 1;
   return left < right ? -1 : 1;
+}
+
+function compareSortValues(
+  left: unknown,
+  right: unknown,
+  direction: 'asc' | 'desc',
+  nulls: NullSortOrder | undefined
+): number {
+  const leftNull = left === null || left === undefined;
+  const rightNull = right === null || right === undefined;
+  if (leftNull || rightNull) {
+    if (leftNull && rightNull) return 0;
+    const nullOrder = nulls ?? 'last';
+    return leftNull === (nullOrder === 'first') ? -1 : 1;
+  }
+
+  const comparison = compareValues(left, right);
+  return direction === 'asc' ? comparison : -comparison;
 }
 
 function sourceFor(target: SnapshotMaterializationTarget): RelationSource {
@@ -1242,85 +1364,280 @@ function indexFieldForExpression(expression: ExprData): { readonly field?: strin
   return expression.op === 'field' ? { field: expression.field } : {};
 }
 
-function groupRowsByField<Row, Value>(rows: readonly Row[], field: string): ReadonlyMap<Value, readonly Row[]> {
-  const lookup = new Map<Value, Row[]>();
-  for (const row of rows) {
-    const key = fieldValue(row, field) as Value;
-    lookup.set(key, [...lookup.get(key) ?? [], row]);
+function indexFields(options: MaterializationIndexOptions): readonly string[] {
+  if ('fields' in options && options.fields !== undefined) {
+    return options.fields;
   }
-  return lookup;
+  if ('field' in options && options.field !== undefined) {
+    return [options.field];
+  }
+  return [];
 }
 
-function setIndex<Row>(rows: readonly Row[]): MaterializationIndex<Row> {
-  const rowSet = new Set(rows);
+function indexFieldShape(fields: readonly string[]): { readonly field?: string } {
+  const field = fields[0];
+  return fields.length === 1 && field !== undefined ? { field } : {};
+}
+
+function groupRowsByFields<Row, Value>(
+  rows: readonly Row[],
+  fields: readonly string[]
+): ReadonlyMap<Value, MaterializationNestedRows<Row>> {
+  const lookup = new Map<unknown, MaterializationNestedRows<Row>>();
+  for (const row of rows) {
+    addRowToNestedLookup(lookup, fields, row);
+  }
+  return lookup as ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+}
+
+function addRowToNestedLookup<Row>(
+  lookup: Map<unknown, MaterializationNestedRows<Row>>,
+  fields: readonly string[],
+  row: Row
+): void {
+  if (fields.length === 0) {
+    return;
+  }
+
+  let cursor = lookup;
+  for (let index = 0; index < fields.length; index += 1) {
+    const key = fieldValue(row, fields[index] as string);
+    if (index === fields.length - 1) {
+      const existing = cursor.get(key);
+      const rows = existing instanceof Set ? existing : new Set<Row>();
+      rows.add(row);
+      cursor.set(key, rows);
+      return;
+    }
+
+    const existing = cursor.get(key);
+    const next = existing instanceof Map ? existing : new Map<unknown, MaterializationNestedRows<Row>>();
+    cursor.set(key, next);
+    cursor = next;
+  }
+}
+
+function groupUniqueRowsByFields<Row, Value>(
+  rows: readonly Row[],
+  fields: readonly string[],
+  diagnostics: MaterializationDiagnostic[]
+): ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>> {
+  const lookup = new Map<unknown, MaterializationNestedUniqueRows<Row>>();
+  for (const row of rows) {
+    addRowToNestedUniqueLookup(lookup, fields, row, diagnostics);
+  }
+  return lookup as ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>>;
+}
+
+function addRowToNestedUniqueLookup<Row>(
+  lookup: Map<unknown, MaterializationNestedUniqueRows<Row>>,
+  fields: readonly string[],
+  row: Row,
+  diagnostics: MaterializationDiagnostic[]
+): void {
+  if (fields.length === 0) {
+    return;
+  }
+
+  let cursor = lookup;
+  for (let index = 0; index < fields.length; index += 1) {
+    const key = fieldValue(row, fields[index] as string);
+    if (index === fields.length - 1) {
+      if (cursor.has(key)) {
+        diagnostics.push({
+          code: 'materialization_index_unsupported',
+          message: `unique materialization index has duplicate value for ${fields.join(',')}`,
+          surface: 'materialization',
+          detail: { fields, key }
+        });
+        return;
+      }
+      cursor.set(key, row);
+      return;
+    }
+
+    const existing = cursor.get(key);
+    const next = existing instanceof Map ? existing : new Map<unknown, MaterializationNestedUniqueRows<Row>>();
+    cursor.set(key, next);
+    cursor = next;
+  }
+}
+
+function setIndex<Row>(rows: ReadonlySet<Row>): MaterializationIndex<Row> {
   return {
     kind: 'set',
-    rows: rowSet,
-    has: (row) => rowSet.has(row),
-    values: () => rowSet.values()
+    rows,
+    raw: rows,
+    has: (row) => rows.has(row),
+    values: () => rows.values()
   };
 }
 
-function hashIndex<Row, Value>(rows: readonly Row[], field: string): MaterializationHashIndex<Row, Value> {
-  const lookup = groupRowsByField<Row, Value>(rows, field);
-  return {
+function hashIndex<Row, Value>(
+  lookup: ReadonlyMap<Value, MaterializationNestedRows<Row>>,
+  fields: readonly string[]
+): MaterializationHashIndex<Row, Value> {
+  return optionalField({
     kind: 'hash',
-    field,
+    fields,
     lookup,
-    get: (value) => lookup.get(value) ?? [],
+    raw: lookup,
+    get: (value) => rowsFromNestedLookup(lookup.get(value)),
+    rowsFor: (...values) => rowsFromLookupPath(lookup, values),
     has: (value) => lookup.has(value)
-  };
+  }, fields);
 }
 
-function btreeIndex<Row, Value>(rows: readonly Row[], field: string): MaterializationBtreeIndex<Row, Value> {
-  const lookup = groupRowsByField<Row, Value>(rows, field);
+function btreeIndex<Row, Value>(
+  lookup: ReadonlyMap<Value, MaterializationNestedRows<Row>>,
+  fields: readonly string[]
+): MaterializationBtreeIndex<Row, Value> {
   const ordered = Array.from(lookup.keys()).sort(compareValues) as Value[];
-  const orderedLookup = new Map(ordered.map((key) => [key, lookup.get(key) ?? []]));
-  return {
+  return optionalField({
     kind: 'btree',
-    field,
-    lookup: orderedLookup,
+    fields,
+    lookup,
+    raw: lookup,
     ordered,
-    get: (value) => orderedLookup.get(value) ?? [],
-    has: (value) => orderedLookup.has(value),
+    get: (value) => rowsFromNestedLookup(lookup.get(value)),
+    rowsFor: (...values) => rowsFromLookupPath(lookup, values),
+    has: (value) => lookup.has(value),
     range: (bounds = {}) => ordered
       .filter((value) => inRange(value, bounds))
-      .flatMap((value) => orderedLookup.get(value) ?? [])
-  };
+      .flatMap((value) => rowsFromNestedLookup(lookup.get(value)))
+  }, fields);
 }
 
 function uniqueIndexResult<Row, Value>(
   stored: StoredMaterialization<Row>,
-  field: string
+  fields: readonly string[]
 ): MaterializationUniqueIndexResult<Row, Value> {
-  const lookup = new Map<Value, Row>();
   const diagnostics: MaterializationDiagnostic[] = [];
+  const lookup = groupUniqueRowsByFields<Row, Value>(stored.rows as readonly Row[], fields, diagnostics);
+  const facade = uniqueIndex<Row, Value>(lookup, fields);
 
-  for (const row of stored.rows as readonly Row[]) {
-    const key = fieldValue(row, field) as Value;
-    if (lookup.has(key)) {
-      diagnostics.push({
-        code: 'materialization_index_unsupported',
-        message: `unique materialization index has duplicate value for ${field}`,
-        surface: 'materialization',
-        detail: { field, key }
-      });
-      continue;
-    }
-    lookup.set(key, row);
-  }
-
-  return withTarget(stored, {
+  return withMapLike(lookup, withTarget(stored, {
     kind: 'materializationUniqueIndex',
     indexed: diagnostics.length === 0,
     diagnostics,
-    index: {
-      kind: 'unique',
-      field,
-      lookup,
-      get: (value) => lookup.get(value),
-      has: (value) => lookup.has(value)
+    ...indexFieldShape(fields),
+    fields,
+    lookup,
+    raw: lookup,
+    index: facade
+  }));
+}
+
+function uniqueIndex<Row, Value>(
+  lookup: ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>>,
+  fields: readonly string[]
+): MaterializationUniqueIndex<Row, Value> {
+  return optionalField({
+    kind: 'unique',
+    fields,
+    lookup,
+    raw: lookup,
+    get: (value) => fields.length === 1 ? rowFromUniqueLookupPath(lookup, [value]) : undefined,
+    rowFor: (...values) => values.length === fields.length ? rowFromUniqueLookupPath(lookup, values) : undefined,
+    has: (value) => lookup.has(value)
+  }, fields);
+}
+
+function optionalField<T extends object>(shape: T, fields: readonly string[]): T & { readonly field?: string } {
+  const field = fields[0];
+  return fields.length === 1 && field !== undefined ? { ...shape, field } : shape;
+}
+
+function rowsFromLookupPath<Row>(
+  lookup: ReadonlyMap<unknown, MaterializationNestedRows<Row>>,
+  values: readonly unknown[]
+): readonly Row[] {
+  return rowsFromNestedLookup(nestedRowsAtPath(lookup, values));
+}
+
+function nestedRowsAtPath<Row>(
+  lookup: ReadonlyMap<unknown, MaterializationNestedRows<Row>>,
+  values: readonly unknown[]
+): MaterializationNestedRows<Row> | undefined {
+  let current: MaterializationNestedRows<Row> | undefined = lookup;
+  for (const value of values) {
+    if (!(current instanceof Map)) {
+      return undefined;
     }
+    current = current.get(value);
+  }
+  return current;
+}
+
+function rowsFromNestedLookup<Row>(value: MaterializationNestedRows<Row> | undefined): readonly Row[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (value instanceof Map) {
+    return Array.from(value.values()).flatMap((item) => rowsFromNestedLookup(item));
+  }
+  return Array.from(value as ReadonlySet<Row>);
+}
+
+function rowFromUniqueLookupPath<Row>(
+  lookup: ReadonlyMap<unknown, MaterializationNestedUniqueRows<Row>>,
+  values: readonly unknown[]
+): Row | undefined {
+  let current: MaterializationNestedUniqueRows<Row> | ReadonlyMap<unknown, MaterializationNestedUniqueRows<Row>> | undefined = lookup;
+  for (const value of values) {
+    if (!(current instanceof Map)) {
+      return undefined;
+    }
+    current = current.get(value);
+  }
+  return current === undefined ? undefined : current as Row;
+}
+
+function sortNestedLookup<Row>(lookup: ReadonlyMap<unknown, MaterializationNestedRows<Row>>): ReadonlyMap<unknown, MaterializationNestedRows<Row>> {
+  return new Map(
+    Array.from(lookup.entries())
+      .sort(([left], [right]) => compareValues(left, right))
+      .map(([key, value]) => [
+        key,
+        value instanceof Map ? sortNestedLookup(value) : value
+      ])
+  );
+}
+
+function withSetLike<Row, Result extends object>(
+  rows: ReadonlySet<Row>,
+  result: Result
+): Result & MaterializationSetLike<Row> {
+  return Object.assign(result, {
+    size: rows.size,
+    has: (row: Row) => rows.has(row),
+    values: () => rows.values(),
+    keys: () => rows.keys(),
+    entries: () => rows.entries(),
+    forEach: (
+      callbackfn: (value: Row, key: Row, set: ReadonlySet<Row>) => void,
+      thisArg?: unknown
+    ) => rows.forEach((value, key) => callbackfn.call(thisArg, value, key, rows)),
+    [Symbol.iterator]: () => rows[Symbol.iterator]()
+  });
+}
+
+function withMapLike<Key, Value, Result extends object>(
+  lookup: ReadonlyMap<Key, Value>,
+  result: Result
+): Result & MaterializationMapLike<Key, Value> {
+  return Object.assign(result, {
+    size: lookup.size,
+    get: (key: Key) => lookup.get(key),
+    has: (key: Key) => lookup.has(key),
+    keys: () => lookup.keys(),
+    values: () => lookup.values(),
+    entries: () => lookup.entries(),
+    forEach: (
+      callbackfn: (value: Value, key: Key, map: ReadonlyMap<Key, Value>) => void,
+      thisArg?: unknown
+    ) => lookup.forEach((value, key) => callbackfn.call(thisArg, value, key, lookup)),
+    [Symbol.iterator]: () => lookup[Symbol.iterator]()
   });
 }
 
@@ -1374,14 +1691,51 @@ function missingIndexResult<Row, Value>(kind: MaterializationIndexOptions['kind'
   | MaterializationUniqueIndexResult<Row, Value> {
   const diagnostics = [missingDiagnostic()];
   switch (kind) {
-    case 'hash':
-      return { kind: 'materializationHashIndex', indexed: false, diagnostics };
-    case 'btree':
-      return { kind: 'materializationBtreeIndex', indexed: false, diagnostics };
-    case 'unique':
-      return { kind: 'materializationUniqueIndex', indexed: false, diagnostics };
-    default:
-      return { kind: 'materializationIndex', indexed: false, diagnostics };
+    case 'hash': {
+      const lookup = new Map<Value, MaterializationNestedRows<Row>>();
+      return withMapLike(lookup, {
+        kind: 'materializationHashIndex',
+        indexed: false,
+        diagnostics,
+        fields: [],
+        lookup,
+        raw: lookup
+      });
+    }
+    case 'btree': {
+      const lookup = new Map<Value, MaterializationNestedRows<Row>>();
+      return withMapLike(lookup, {
+        kind: 'materializationBtreeIndex',
+        indexed: false,
+        diagnostics,
+        fields: [],
+        lookup,
+        raw: lookup,
+        ordered: [],
+        range: () => []
+      });
+    }
+    case 'unique': {
+      const lookup = new Map<Value, MaterializationNestedUniqueRows<Row>>();
+      return withMapLike(lookup, {
+        kind: 'materializationUniqueIndex',
+        indexed: false,
+        diagnostics,
+        fields: [],
+        lookup,
+        raw: lookup
+      });
+    }
+    default: {
+      const rows = new Set<Row>();
+      return withSetLike(rows, {
+        kind: 'materializationIndex',
+        indexed: false,
+        diagnostics,
+        rows,
+        raw: rows
+      });
+    }
   }
 }
 

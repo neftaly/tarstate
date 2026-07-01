@@ -57,6 +57,8 @@ export async function tryTransactConstrained(
     : {
         ...result,
         db,
+        applied: 0,
+        deltas: [],
         committed: false,
         diagnostics: [...result.diagnostics, ...validation.diagnostics]
       };
