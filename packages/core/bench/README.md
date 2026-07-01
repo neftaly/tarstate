@@ -32,7 +32,7 @@ scales:
 - Predicate update and delete patches.
 - Rejected writes through an attached unique constraint.
 - Materialized `qRows` reads and materialized transaction maintenance.
-- Requested incremental materialization maintenance for simple and joined deltas.
+- Requested incremental materialization maintenance for simple and joined deltas, including left/root inserts and right-side updates.
 - Larger materialized joined-query maintenance.
 - Materialization set/hash/btree/unique index facades.
 - Watch refresh, `trackTransact`, and `diffQuery`.

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  and,
   as,
   call,
   createDb,
@@ -9,17 +10,21 @@ import {
   from,
   gt,
   insert,
+  join,
   keyBy,
+  leftJoin,
   maintainMaterializations,
   mat,
   materializationForQuery,
   materializedRowsForQuery,
+  maybe,
   pipe,
   project,
   qRows,
   sortLimit,
   trackTransact,
   transact,
+  value,
   where
 } from '@tarstate/core';
 import type { MaterializationMaintenanceResult, Query, RelationDelta } from '@tarstate/core';
@@ -28,7 +33,14 @@ import {
   beaUser,
   calUser,
   coreSchema,
+  designTeam,
+  draftEvaluatorTask,
+  engineeringTeam,
+  reviewFixturesTask,
+  shipRuntimeTask,
   sourceData,
+  type TaskRow,
+  type TeamRow,
   type UserRow
 } from './fixtures';
 
@@ -37,6 +49,26 @@ type ActiveUserRow = {
   readonly name: string;
   readonly age: number;
   readonly teamId: string;
+};
+
+type UserTeamRow = {
+  readonly id: string;
+  readonly name: string;
+  readonly team: string;
+  readonly rank: number;
+};
+
+type MaybeUserTeamRow = {
+  readonly id: string;
+  readonly name: string;
+  readonly team: string | undefined;
+};
+
+type TaskOwnerRow = {
+  readonly id: string;
+  readonly title: string;
+  readonly owner: string;
+  readonly points: number;
 };
 
 const diaUser: UserRow = {
@@ -48,6 +80,27 @@ const diaUser: UserRow = {
   tags: []
 };
 
+const floUser: UserRow = {
+  id: 'flo',
+  teamId: 'ops',
+  name: 'Flo',
+  active: true,
+  age: 31,
+  tags: []
+};
+
+const piaUser: UserRow = {
+  id: 'pia',
+  teamId: 'platform',
+  name: 'Pia',
+  active: true,
+  age: 34,
+  tags: []
+};
+
+const operationsTeam: TeamRow = { id: 'ops', name: 'Operations', rank: 4 };
+const platformTeam: TeamRow = { id: 'platform', name: 'Engineering', rank: 1 };
+
 function activeUsersQuery(): Query<ActiveUserRow> {
   const user = as(coreSchema.users, 'user');
   return pipe(
@@ -58,8 +111,50 @@ function activeUsersQuery(): Query<ActiveUserRow> {
   ) as Query<ActiveUserRow>;
 }
 
+function activeUserTeamsQuery(): Query<UserTeamRow> {
+  const user = as(coreSchema.users, 'user');
+  const team = as(coreSchema.teams, 'team');
+  return pipe(
+    from(user),
+    where(eq(user.active, true)),
+    join(from(team), eq(user.teamId, team.id)),
+    project({ id: user.id, name: user.name, team: team.name, rank: team.rank }),
+    keyBy('id')
+  ) as Query<UserTeamRow>;
+}
+
+function leftUserTeamsQuery(): Query<MaybeUserTeamRow> {
+  const user = as(coreSchema.users, 'user');
+  const team = as(coreSchema.teams, 'team');
+  return pipe(
+    from(user),
+    leftJoin(from(team), eq(user.teamId, team.id)),
+    project({ id: user.id, name: user.name, team: maybe(team.name) }),
+    keyBy('id')
+  ) as Query<MaybeUserTeamRow>;
+}
+
+function residualTaskOwnersQuery(): Query<TaskOwnerRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const user = as(coreSchema.users, 'user');
+  return pipe(
+    from(task),
+    join(from(user), and(eq(task.ownerId, user.id), gt(task.points, value(4)))),
+    project({ id: task.id, title: task.title, owner: user.name, points: task.points }),
+    keyBy('id')
+  ) as Query<TaskOwnerRow>;
+}
+
 function usersDelta(added: readonly UserRow[], removed: readonly UserRow[]): RelationDelta<typeof coreSchema.users> {
   return { relation: coreSchema.users, added, removed };
+}
+
+function teamsDelta(added: readonly TeamRow[], removed: readonly TeamRow[]): RelationDelta<typeof coreSchema.teams> {
+  return { relation: coreSchema.teams, added, removed };
+}
+
+function tasksDelta(added: readonly TaskRow[], removed: readonly TaskRow[]): RelationDelta<typeof coreSchema.tasks> {
+  return { relation: coreSchema.tasks, added, removed };
 }
 
 function singleMaterializationChange(result: MaterializationMaintenanceResult, id: string) {
@@ -334,16 +429,279 @@ describe('incremental materialization', () => {
     ]);
   });
 
-  // Expected left-delta join semantics: for users joined to teams on user.teamId = team.id,
-  // inserting active Dia in eng adds { id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 },
-  // updating Ada's projected fields emits updated for key ada, and deleting Bea removes key bea.
-  // The maintenance result should keep recomputed at 0 and the change should have maintenance 'incremental'.
-  it.todo('incrementally maintains inner equality joins for left relation deltas without recompute');
+  it('marks initial inner equality joins as incrementally maintained', () => {
+    const activeUserTeams = activeUserTeamsQuery();
+    const state = mat(createDb(sourceData), activeUserTeams, { id: 'active-user-teams', mode: 'incremental' });
+    const metadata = materializationForQuery(state, activeUserTeams);
 
-  // Expected right-delta join semantics: updating Engineering's projected fields emits updated joined rows
-  // for matching users, deleting Design removes Bea's joined row, and an unrelated team delta carries rows
-  // with no rowChanges. The maintenance result should keep recomputed at 0.
-  it.todo('incrementally maintains inner equality joins for right relation deltas without recompute');
+    expect(metadata).toMatchObject({
+      id: 'active-user-teams',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['users', 'teams']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, activeUserTeams)).toEqual([
+      { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+      { id: 'bea', name: 'Bea', team: 'Design', rank: 2 }
+    ]);
+  });
+
+  it('incrementally maintains inner equality joins for left relation inserts, updates, and deletes', () => {
+    const activeUserTeams = activeUserTeamsQuery();
+    const state = mat(createDb(sourceData), activeUserTeams, { id: 'active-user-teams', mode: 'incremental' });
+    const updatedAda = { ...adaUser, name: 'Ada Lovelace' };
+    const next = createDb({
+      ...sourceData,
+      users: [updatedAda, calUser, diaUser]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([updatedAda, diaUser], [adaUser, beaUser])]
+    });
+    const change = singleMaterializationChange(maintained, 'active-user-teams');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { id: 'ada', name: 'Ada Lovelace', team: 'Engineering', rank: 1 },
+        { id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 }
+      ],
+      addedRows: [{ id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 }],
+      removedRows: [{ id: 'bea', name: 'Bea', team: 'Design', rank: 2 }]
+    });
+    expect(change.rowChanges).toHaveLength(3);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+        after: { id: 'ada', name: 'Ada Lovelace', team: 'Engineering', rank: 1 }
+      }),
+      expect.objectContaining({
+        kind: 'removed',
+        row: { id: 'bea', name: 'Bea', team: 'Design', rank: 2 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 }
+      })
+    ]));
+    expect(materializedRowsForQuery(next, activeUserTeams)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains inner equality joins for right relation updates, deletes, and inserts', () => {
+    const activeUserTeams = activeUserTeamsQuery();
+    const initial = createDb({
+      ...sourceData,
+      users: [...sourceData.users, floUser]
+    });
+    const state = mat(initial, activeUserTeams, { id: 'active-user-teams', mode: 'incremental' });
+    const updatedEngineeringTeam = { ...engineeringTeam, name: 'Engineering Platform', rank: 3 };
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, floUser],
+      teams: [updatedEngineeringTeam, operationsTeam]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [teamsDelta([updatedEngineeringTeam, operationsTeam], [engineeringTeam, designTeam])]
+    });
+    const change = singleMaterializationChange(maintained, 'active-user-teams');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['teams'],
+      rows: [
+        { id: 'ada', name: 'Ada', team: 'Engineering Platform', rank: 3 },
+        { id: 'flo', name: 'Flo', team: 'Operations', rank: 4 }
+      ],
+      addedRows: [{ id: 'flo', name: 'Flo', team: 'Operations', rank: 4 }],
+      removedRows: [{ id: 'bea', name: 'Bea', team: 'Design', rank: 2 }]
+    });
+    expect(change.rowChanges).toHaveLength(3);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+        after: { id: 'ada', name: 'Ada', team: 'Engineering Platform', rank: 3 }
+      }),
+      expect.objectContaining({
+        kind: 'removed',
+        row: { id: 'bea', name: 'Bea', team: 'Design', rank: 2 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { id: 'flo', name: 'Flo', team: 'Operations', rank: 4 }
+      })
+    ]));
+    expect(materializedRowsForQuery(next, activeUserTeams)).toEqual(change.rows);
+  });
+
+  it('updates many left rows matching one right row when the right row changes', () => {
+    const activeUserTeams = activeUserTeamsQuery();
+    const initial = createDb({
+      ...sourceData,
+      users: [...sourceData.users, diaUser]
+    });
+    const state = mat(initial, activeUserTeams, { id: 'active-user-teams', mode: 'incremental' });
+    const updatedEngineeringTeam = { ...engineeringTeam, name: 'Engineering Platform', rank: 3 };
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, diaUser],
+      teams: [designTeam, updatedEngineeringTeam]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [teamsDelta([updatedEngineeringTeam], [engineeringTeam])]
+    });
+    const change = singleMaterializationChange(maintained, 'active-user-teams');
+
+    expect(maintained).toMatchObject({ recomputed: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'ada', name: 'Ada', team: 'Engineering Platform', rank: 3 },
+        { id: 'bea', name: 'Bea', team: 'Design', rank: 2 },
+        { id: 'dia', name: 'Dia', team: 'Engineering Platform', rank: 3 }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expect(change.rowChanges).toHaveLength(2);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+        after: { id: 'ada', name: 'Ada', team: 'Engineering Platform', rank: 3 }
+      }),
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 },
+        after: { id: 'dia', name: 'Dia', team: 'Engineering Platform', rank: 3 }
+      })
+    ]));
+    expect(materializedRowsForQuery(next, activeUserTeams)).toEqual(change.rows);
+  });
+
+  it('moves affected rows when a right relation join key changes', () => {
+    const activeUserTeams = activeUserTeamsQuery();
+    const initial = createDb({
+      ...sourceData,
+      users: [...sourceData.users, piaUser]
+    });
+    const state = mat(initial, activeUserTeams, { id: 'active-user-teams', mode: 'incremental' });
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, piaUser],
+      teams: [designTeam, platformTeam]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [teamsDelta([platformTeam], [engineeringTeam])]
+    });
+    const change = singleMaterializationChange(maintained, 'active-user-teams');
+
+    expect(maintained).toMatchObject({ recomputed: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'bea', name: 'Bea', team: 'Design', rank: 2 },
+        { id: 'pia', name: 'Pia', team: 'Engineering', rank: 1 }
+      ],
+      addedRows: [{ id: 'pia', name: 'Pia', team: 'Engineering', rank: 1 }],
+      removedRows: [{ id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 }]
+    });
+    expect(change.rowChanges).toHaveLength(2);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'removed',
+        row: { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { id: 'pia', name: 'Pia', team: 'Engineering', rank: 1 }
+      })
+    ]));
+    expect(change.rowChanges).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'updated' })
+    ]));
+    expect(materializedRowsForQuery(next, activeUserTeams)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains inner joins with residual and(eq(...), gt(...)) predicates', () => {
+    const residualTaskOwners = residualTaskOwnersQuery();
+    const state = mat(createDb(sourceData), residualTaskOwners, { id: 'residual-task-owners', mode: 'incremental' });
+    const updatedDraftEvaluatorTask = { ...draftEvaluatorTask, points: 4 };
+    const updatedReviewFixturesTask = { ...reviewFixturesTask, points: 6 };
+    const next = createDb({
+      ...sourceData,
+      tasks: [updatedDraftEvaluatorTask, shipRuntimeTask, updatedReviewFixturesTask]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [tasksDelta(
+        [updatedDraftEvaluatorTask, updatedReviewFixturesTask],
+        [draftEvaluatorTask, reviewFixturesTask]
+      )]
+    });
+    const change = singleMaterializationChange(maintained, 'residual-task-owners');
+
+    expect(maintained).toMatchObject({ recomputed: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 't2', title: 'Ship runtime', owner: 'Ada', points: 8 },
+        { id: 't3', title: 'Review fixtures', owner: 'Bea', points: 6 }
+      ],
+      addedRows: [{ id: 't3', title: 'Review fixtures', owner: 'Bea', points: 6 }],
+      removedRows: [{ id: 't1', title: 'Draft evaluator', owner: 'Ada', points: 5 }]
+    });
+    expect(change.rowChanges).toHaveLength(2);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'removed',
+        row: { id: 't1', title: 'Draft evaluator', owner: 'Ada', points: 5 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { id: 't3', title: 'Review fixtures', owner: 'Bea', points: 6 }
+      })
+    ]));
+    expect(materializedRowsForQuery(next, residualTaskOwners)).toEqual(change.rows);
+  });
+
+  it('falls back to snapshot maintenance for unsupported left joins with an explicit diagnostic', () => {
+    const leftUserTeams = leftUserTeamsQuery();
+    const state = mat(createDb(sourceData), leftUserTeams, { id: 'left-user-teams', mode: 'incremental' });
+    const metadata = materializationForQuery(state, leftUserTeams);
+
+    expect(metadata).toMatchObject({
+      requestedMode: 'incremental',
+      maintenance: 'snapshot'
+    });
+    expect(metadata?.maintenanceReason).toContain('left join');
+    expect(metadata?.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'materialization_incremental_fallback',
+        detail: expect.objectContaining({
+          reason: expect.stringContaining('left join')
+        })
+      })
+    ]));
+    expect(materializedRowsForQuery(state, leftUserTeams)).toEqual([
+      { id: 'ada', name: 'Ada', team: 'Engineering' },
+      { id: 'bea', name: 'Bea', team: 'Design' },
+      { id: 'cal', name: 'Cal', team: undefined }
+    ]);
+  });
 
   it('uses provided materialization maintenance output in trackTransact', async () => {
     const activeUsers = activeUsersQuery();

@@ -953,11 +953,15 @@ function materializationEntryFor<Row>(
   if (plan !== undefined) {
     const relation = metadata.query.relations[plan.rootRelation];
     if (relation !== undefined) {
+      const source = sourceFor(target);
+      const relationSnapshots = incrementalRelationSnapshots(source, metadata.query.relations);
+      const rootRows = relationSnapshots.get(relation.name)?.rows ?? readRows(source, relation);
       const built = buildIncrementalMaterialization<Row>(
         plan,
         relation,
-        readRows(sourceFor(target), relation),
-        envFor(target)
+        rootRows,
+        envFor(target),
+        relationSnapshots
       );
       if (!built.supported) {
         return {
@@ -978,6 +982,16 @@ function materializationEntryFor<Row>(
   }
 
   return { metadata, rows: evaluateTargetRows(target, metadata.query) };
+}
+
+function incrementalRelationSnapshots(
+  source: RelationSource,
+  relations: Readonly<Record<string, RelationRef>>
+): ReadonlyMap<string, { readonly relation: RelationRef; readonly rows: readonly unknown[] }> {
+  return new Map(Object.values(relations).map((relation) => [
+    relation.name,
+    { relation, rows: readRows(source, relation) }
+  ]));
 }
 
 function metadataWithIncrementalFallback<Row>(
