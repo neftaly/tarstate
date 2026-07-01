@@ -20,7 +20,8 @@ import {
   where
 } from '@tarstate/core/query';
 import { defineSchema, idField, numberField, relation, stringField } from '@tarstate/core/schema';
-import { fromIndexedObjectSource, fromObjectSource } from '@tarstate/core/source';
+import { fromIndexedObjectSource } from '@tarstate/core/experimental/indexed-source';
+import { fromObjectSource } from '@tarstate/core/source';
 
 type ObjectRow = {
   readonly id: string;

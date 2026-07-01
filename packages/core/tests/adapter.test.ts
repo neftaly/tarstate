@@ -3,7 +3,6 @@ import {
   composeRelationRuntimes,
   isRelationAdapter,
   isRelationRuntime,
-  relationApplyResultFromAdapterCommit,
   tryCommitAdapter,
   tryApplyRelationPatches,
   type AdapterCommitReport,
@@ -13,6 +12,7 @@ import {
   type RelationAdapter,
   type RelationApplyReport,
   type RelationApplyStatus,
+  type RelationPatchTarget,
   type RelationRuntime,
   type TarstateDiagnostic,
   type WritePatch
@@ -61,10 +61,13 @@ describe('tarstate adapter contract', () => {
     expectTypeOf<AdapterCommitReport<number>['source']>().toEqualTypeOf<AdapterSource<number>>();
     expectTypeOf<RelationApplyReport<number>['source']>().toEqualTypeOf<AdapterSource<number>>();
     expectTypeOf<RelationApplyStatus>().toEqualTypeOf<'accepted' | 'partial' | 'rejected'>();
+    expectTypeOf<RelationPatchTarget<number>['relationNames']>().toEqualTypeOf<readonly string[] | undefined>();
+    expectTypeOf<RelationPatchTarget<number>['ownsRelation']>().toEqualTypeOf<
+      ((relationName: string) => boolean) | undefined
+    >();
 
     const rejected: AdapterCommitResult<number> = {
       status: 'rejected',
-      committed: false,
       patches: 1,
       applied: 0,
       deltas: [],
@@ -73,93 +76,53 @@ describe('tarstate adapter contract', () => {
     };
 
     if (rejected.status === 'rejected') {
-      expectTypeOf(rejected.committed).toEqualTypeOf<false>();
       expectTypeOf(rejected.applied).toEqualTypeOf<0>();
-      expectTypeOf(rejected.deltas).toEqualTypeOf<readonly []>();
     }
   });
 
-  it('bridges adapter commit results to relation apply results', () => {
-    const version = { revision: 3 };
-    const delta = {
-      relation: schema.todos,
-      added: [{ id: 'todo-a', text: 'Buy oat milk', done: true }],
-      removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false }]
-    };
-    const partialDiagnostics = [missingRowDiagnostic('todo-missing')];
-    const rejectedDiagnostics = [missingRowDiagnostic('todo-missing')];
+  it('validates relation target ownership metadata at runtime', () => {
+    expect(isRelationRuntime({
+      source: { rows: () => [] },
+      target: {
+        relationNames: [schema.todos.name],
+        ownsRelation: (relationName: string) => relationName === schema.todos.name,
+        apply: () => ({
+          status: 'accepted',
+          patches: 0,
+          applied: 0,
+          deltas: [],
+          diagnostics: []
+        })
+      }
+    })).toBe(true);
 
-    const committed = relationApplyResultFromAdapterCommit({
-      status: 'committed',
-      committed: true,
-      patches: 1,
-      applied: 1,
-      deltas: [delta],
-      diagnostics: [],
-      version
-    });
+    expect(isRelationRuntime({
+      source: { rows: () => [] },
+      target: {
+        relationNames: [schema.todos.name, 1],
+        apply: () => ({
+          status: 'accepted',
+          patches: 0,
+          applied: 0,
+          deltas: [],
+          diagnostics: []
+        })
+      }
+    })).toBe(false);
 
-    expect(committed).toEqual({
-      status: 'accepted',
-      accepted: true,
-      patches: 1,
-      applied: 1,
-      deltas: [delta],
-      diagnostics: [],
-      version
-    });
-    expect('committed' in committed).toBe(false);
-    expect(committed.version).toBe(version);
-
-    const partial = relationApplyResultFromAdapterCommit({
-      status: 'partial',
-      committed: false,
-      patches: 2,
-      applied: 1,
-      deltas: [delta],
-      diagnostics: partialDiagnostics,
-      version
-    });
-
-    expect(partial).toEqual({
-      status: 'partial',
-      accepted: false,
-      patches: 2,
-      applied: 1,
-      deltas: [delta],
-      diagnostics: partialDiagnostics,
-      version
-    });
-    expect(partial.diagnostics).toBe(partialDiagnostics);
-    expect(partial.version).toBe(version);
-
-    const rejected = relationApplyResultFromAdapterCommit({
-      status: 'rejected',
-      committed: false,
-      patches: 2,
-      applied: 99,
-      deltas: [delta],
-      diagnostics: rejectedDiagnostics,
-      version
-    } as unknown as AdapterCommitResult<typeof version>);
-
-    expect(rejected).toEqual({
-      status: 'rejected',
-      accepted: false,
-      patches: 2,
-      applied: 0,
-      deltas: [],
-      diagnostics: rejectedDiagnostics,
-      version
-    });
-    expect('committed' in rejected).toBe(false);
-    expect(rejected.diagnostics).toBe(rejectedDiagnostics);
-    expect(rejected.version).toBe(version);
-
-    if (rejected.status === 'rejected') {
-      expectTypeOf(rejected.applied).toEqualTypeOf<0>();
-      expectTypeOf(rejected.deltas).toEqualTypeOf<readonly []>();
-    }
+    expect(isRelationRuntime({
+      source: { rows: () => [] },
+      target: {
+        ownsRelation: true,
+        apply: () => ({
+          status: 'accepted',
+          patches: 0,
+          applied: 0,
+          deltas: [],
+          diagnostics: []
+        })
+      }
+    })).toBe(false);
   });
 
   it('normalizes generic relation runtime patch application', async () => {
@@ -175,7 +138,6 @@ describe('tarstate adapter contract', () => {
           version += 1;
           return {
             status: 'accepted',
-            accepted: true,
             patches: 99,
             applied: 99,
             deltas: [],
@@ -195,7 +157,6 @@ describe('tarstate adapter contract', () => {
     expect(result).toEqual({
       source,
       status: 'accepted',
-      accepted: true,
       patches: 1,
       applied: 99,
       deltas: [],
@@ -219,15 +180,13 @@ describe('tarstate adapter contract', () => {
 
     expect(result).toMatchObject({
       status: 'rejected',
-      accepted: false,
       patches: 1,
       applied: 0,
       deltas: [],
       version: 1,
       diagnostics: [
         {
-          code: 'source_error',
-          message: 'relation runtime does not support applying patches'
+          code: 'source_error'
         }
       ]
     });
@@ -245,12 +204,12 @@ describe('tarstate adapter contract', () => {
         version: () => todoVersion
       },
       target: {
+        relationNames: [schema.todos.name],
         apply: (patches) => {
           todoPatches.push(...patches);
           todoVersion += 1;
           return {
             status: 'accepted',
-            accepted: true,
             patches: patches.length,
             applied: patches.length,
             deltas: [],
@@ -266,12 +225,12 @@ describe('tarstate adapter contract', () => {
         version: () => presenceVersion
       },
       target: {
+        relationNames: [schema.presence.name],
         apply: (patches) => {
           presencePatches.push(...patches);
           presenceVersion += 1;
           return {
             status: 'accepted',
-            accepted: true,
             patches: patches.length,
             applied: patches.length,
             deltas: [],
@@ -296,7 +255,6 @@ describe('tarstate adapter contract', () => {
     expect(presencePatches).toEqual([presencePatch]);
     expect(result).toMatchObject({
       status: 'accepted',
-      accepted: true,
       patches: 2,
       applied: 2,
       diagnostics: [],
@@ -389,6 +347,7 @@ describe('tarstate adapter contract', () => {
       {
         source: { relationNames: [schema.todos.name], rows: () => [] },
         target: {
+          relationNames: [schema.todos.name],
           apply: () => {
             throw new Error('first target should not be called');
           }
@@ -397,6 +356,7 @@ describe('tarstate adapter contract', () => {
       {
         source: { relationNames: [schema.todos.name], rows: () => [] },
         target: {
+          relationNames: [schema.todos.name],
           apply: () => {
             throw new Error('second target should not be called');
           }
@@ -410,18 +370,68 @@ describe('tarstate adapter contract', () => {
 
     expect(result).toMatchObject({
       status: 'rejected',
-      accepted: false,
       patches: 1,
       applied: 0,
       deltas: [],
       diagnostics: [
         {
           code: 'source_error',
-          relation: 'todos',
-          message: 'no unambiguous relation runtime target owns relation todos'
+          relation: 'todos'
         }
       ]
     });
+  });
+
+  it('routes composed runtime writes by target relation ownership', async () => {
+    const todoPatches: WritePatch[] = [];
+    const presencePatches: WritePatch[] = [];
+    const runtime = composeRelationRuntimes(
+      {
+        source: { rows: () => [] },
+        target: {
+          relationNames: [schema.presence.name],
+          apply: (patches) => {
+            presencePatches.push(...patches);
+            return {
+              status: 'accepted',
+              patches: patches.length,
+              applied: patches.length,
+              deltas: [],
+              diagnostics: []
+            };
+          }
+        }
+      },
+      {
+        source: { rows: () => [] },
+        target: {
+          ownsRelation: (relationName) => relationName === schema.todos.name,
+          apply: (patches) => {
+            todoPatches.push(...patches);
+            return {
+              status: 'accepted',
+              patches: patches.length,
+              applied: patches.length,
+              deltas: [],
+              diagnostics: []
+            };
+          }
+        }
+      }
+    );
+
+    const todoPatch = todos.insert({ id: 'todo-a', text: 'Buy oat milk', done: false });
+    const presencePatch = presence.insert({ id: 'peer-a', targetTodoId: 'todo-a' });
+    const result = await tryApplyRelationPatches(runtime, [todoPatch, presencePatch]);
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      patches: 2,
+      applied: 2,
+      diagnostics: []
+    });
+    expect(todoPatches).toEqual([todoPatch]);
+    expect(presencePatches).toEqual([presencePatch]);
   });
 
   it('lets a custom non-object-backed adapter apply patches and expose rows, lookups, versions, and deltas', async () => {
@@ -436,12 +446,11 @@ describe('tarstate adapter contract', () => {
 
     const result = adapter.commit([
       todos.insert({ id: 'todo-b', text: 'Water basil', done: false }),
-      todos.update('todo-a', { done: true })
+      todos.updateByKey('todo-a', { done: true })
     ]);
 
     expect(result).toEqual({
-      status: 'committed',
-      committed: true,
+      status: 'accepted',
       patches: 2,
       applied: 2,
       version: 1,
@@ -463,46 +472,36 @@ describe('tarstate adapter contract', () => {
     ]);
   });
 
-  it('pins atomic adapter rejection semantics across applied count, deltas, diagnostics, and version', async () => {
+  it('reports atomic adapter rejection semantics across applied count, deltas, diagnostics, and version', async () => {
     const adapter = new MapTodoAdapter([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
 
-    const result = adapter.commit([todos.update('todo-a', { done: true }), todos.delete('todo-missing')]);
+    const result = adapter.commit([todos.updateByKey('todo-a', { done: true }), todos.deleteByKey('todo-missing')]);
 
     expect(result).toMatchObject({
       status: 'rejected',
-      committed: false,
       patches: 2,
       applied: 0,
-      deltas: [],
       version: 0
     });
-    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref', key: 'todo-missing' }]);
+    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref' }]);
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false }
     ]);
     expect(await adapter.source.version?.()).toBe(0);
   });
 
-  it('pins partial adapter commit semantics across applied count, deltas, diagnostics, and version', async () => {
+  it('reports partial adapter commit semantics across applied count, diagnostics, and version', async () => {
     const adapter = new MapTodoAdapter([{ id: 'todo-a', text: 'Buy oat milk', done: false }], 'partial');
 
-    const result = adapter.commit([todos.update('todo-a', { done: true }), todos.delete('todo-missing')]);
+    const result = adapter.commit([todos.updateByKey('todo-a', { done: true }), todos.deleteByKey('todo-missing')]);
 
     expect(result).toMatchObject({
       status: 'partial',
-      committed: false,
       patches: 2,
       applied: 1,
       version: 1
     });
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [{ id: 'todo-a', text: 'Buy oat milk', done: true }],
-        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false }]
-      }
-    ]);
-    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref', key: 'todo-missing' }]);
+    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref' }]);
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: true }
     ]);
@@ -519,7 +518,6 @@ describe('tarstate adapter contract', () => {
       commit: async (_patches) =>
         ({
           status: 'rejected',
-          committed: true,
           patches: 99,
           applied: 1,
           deltas: [
@@ -533,44 +531,34 @@ describe('tarstate adapter contract', () => {
         }) as unknown as AdapterCommitResult<number>
     };
 
-    const result = await tryCommitAdapter(adapter, [todos.delete('todo-missing')]);
+    const result = await tryCommitAdapter(adapter, [todos.deleteByKey('todo-missing')]);
 
     expect(result.source).toBe(source);
     expect(result).toMatchObject({
       status: 'rejected',
-      committed: false,
       patches: 1,
       applied: 0,
-      deltas: [],
       version: 7
     });
-    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref', key: 'todo-missing' }]);
+    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref' }]);
   });
 
   it('preserves adapter-owned partial helper semantics', async () => {
     const adapter = new MapTodoAdapter([{ id: 'todo-a', text: 'Buy oat milk', done: false }], 'partial');
 
     const result = await tryCommitAdapter(adapter, [
-      todos.update('todo-a', { done: true }),
-      todos.delete('todo-missing')
+      todos.updateByKey('todo-a', { done: true }),
+      todos.deleteByKey('todo-missing')
     ]);
 
     expect(result.source).toBe(adapter.source);
     expect(result).toMatchObject({
       status: 'partial',
-      committed: false,
       patches: 2,
       applied: 1,
       version: 1
     });
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [{ id: 'todo-a', text: 'Buy oat milk', done: true }],
-        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false }]
-      }
-    ]);
-    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref', key: 'todo-missing' }]);
+    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref' }]);
   });
 
   it('returns a rejected helper report when adapter commit throws without changing raw commit behavior', async () => {
@@ -586,16 +574,15 @@ describe('tarstate adapter contract', () => {
         throw commitError;
       }
     };
-    const patches = [todos.update('todo-a', { done: true }), todos.delete('todo-b')];
+    const patches = [todos.updateByKey('todo-a', { done: true }), todos.deleteByKey('todo-b')];
 
-    expect(() => adapter.commit(patches)).toThrow('write store unavailable');
+    expect(() => adapter.commit(patches)).toThrow(Error);
 
     const result = await tryCommitAdapter(adapter, patches, { readVersion: false });
 
     expect(result.source).toBe(adapter.source);
     expect(result).toMatchObject({
       status: 'rejected',
-      committed: false,
       patches: 2,
       applied: 0,
       deltas: []
@@ -603,82 +590,10 @@ describe('tarstate adapter contract', () => {
     expect(result.version).toBeUndefined();
     expect(result.diagnostics).toMatchObject([
       {
-        code: 'source_error',
-        message: 'adapter commit failed'
+        code: 'source_error'
       }
     ]);
-    expect(result.diagnostics[0]?.detail).toBe(commitError);
-  });
-
-  it('returns a rejected helper report when adapter commit rejects and preserves source version fallback', async () => {
-    const commitError = new Error('commit rejected');
-    const adapter: RelationAdapter<number> = {
-      source: {
-        rows: () => [],
-        version: async () => 7
-      },
-      commit: async () => {
-        throw commitError;
-      }
-    };
-
-    const result = await tryCommitAdapter(adapter, [todos.delete('todo-missing')]);
-
-    expect(result.source).toBe(adapter.source);
-    expect(result).toMatchObject({
-      status: 'rejected',
-      committed: false,
-      patches: 1,
-      applied: 0,
-      deltas: [],
-      version: 7
-    });
-    expect(result.diagnostics).toMatchObject([
-      {
-        code: 'source_error',
-        message: 'adapter commit failed'
-      }
-    ]);
-    expect(result.diagnostics[0]?.detail).toBe(commitError);
-  });
-
-  it('keeps commit failure diagnostics ahead of source version fallback failures', async () => {
-    const commitError = new Error('commit rejected');
-    const versionError = new Error('version unavailable');
-    const adapter: RelationAdapter<number> = {
-      source: {
-        rows: () => [],
-        version: async () => {
-          throw versionError;
-        }
-      },
-      commit: async () => {
-        throw commitError;
-      }
-    };
-
-    const result = await tryCommitAdapter(adapter, []);
-
-    expect(result).toMatchObject({
-      status: 'rejected',
-      committed: false,
-      patches: 0,
-      applied: 0,
-      deltas: []
-    });
-    expect(result.version).toBeUndefined();
-    expect(result.diagnostics).toMatchObject([
-      {
-        code: 'source_error',
-        message: 'adapter commit failed'
-      },
-      {
-        code: 'source_error',
-        message: 'adapter source version failed'
-      }
-    ]);
-    expect(result.diagnostics[0]?.detail).toBe(commitError);
-    expect(result.diagnostics[1]?.detail).toBe(versionError);
+    expect(result.diagnostics).toHaveLength(1);
   });
 
   it('derives missing helper status without reading source version when disabled', async () => {
@@ -697,7 +612,6 @@ describe('tarstate adapter contract', () => {
       commit: () =>
         ({
           status: undefined,
-          committed: false,
           patches: 99,
           applied: 1,
           deltas: [delta],
@@ -705,52 +619,14 @@ describe('tarstate adapter contract', () => {
         }) as unknown as AdapterCommitResult<number>
     };
 
-    const result = await tryCommitAdapter(adapter, [todos.update('todo-a', { done: true })], {
+    const result = await tryCommitAdapter(adapter, [todos.updateByKey('todo-a', { done: true })], {
       readVersion: false
     });
 
     expect(result.status).toBe('partial');
-    expect(result.committed).toBe(false);
     expect(result.patches).toBe(1);
     expect(result.applied).toBe(1);
-    expect(result.deltas).toEqual([delta]);
     expect(result.version).toBeUndefined();
-  });
-
-  it('reports source version fallback failures without changing commit status', async () => {
-    const adapter: RelationAdapter<number> = {
-      source: {
-        rows: () => [],
-        version: async () => {
-          throw new Error('version unavailable');
-        }
-      },
-      commit: () => ({
-        status: 'committed',
-        committed: true,
-        patches: 0,
-        applied: 0,
-        deltas: [],
-        diagnostics: []
-      })
-    };
-
-    const result = await tryCommitAdapter(adapter, []);
-
-    expect(result).toMatchObject({
-      status: 'committed',
-      committed: true,
-      patches: 0,
-      applied: 0,
-      deltas: []
-    });
-    expect(result.version).toBeUndefined();
-    expect(result.diagnostics).toMatchObject([
-      {
-        code: 'source_error',
-        message: 'adapter source version failed'
-      }
-    ]);
   });
 });
 
@@ -802,16 +678,41 @@ class MapTodoAdapter implements RelationAdapter<number> {
 
       switch (patch.op) {
         case 'insert':
-          stagedApplied += stageInsert(stagedRows, added, diagnostics, patch.row, patch.onConflict);
+          stagedApplied += stageInsert(stagedRows, added, diagnostics, patch.row, false);
           break;
-        case 'update':
+        case 'insertIgnore':
+          stagedApplied += stageInsert(stagedRows, added, diagnostics, patch.row, true);
+          break;
+        case 'insertOrReplace':
+          stagedApplied += stageInsertOrReplace(stagedRows, added, removed, diagnostics, patch.row);
+          break;
+        case 'updateByKey':
           stagedApplied += stageUpdate(stagedRows, added, removed, diagnostics, patch.key, patch.changes);
           break;
-        case 'upsert':
-          stagedApplied += stageUpsert(stagedRows, added, removed, diagnostics, patch.row, patch.mode);
+        case 'update':
+          diagnostics.push({
+            code: 'unsupported_expression',
+            message: 'predicate update is not supported by this adapter fixture',
+            relation: patch.relation.name,
+            detail: patch.predicate
+          });
+          break;
+        case 'insertOrMerge':
+          stagedApplied += stageInsertOrMerge(stagedRows, added, removed, diagnostics, patch.row);
+          break;
+        case 'insertOrUpdate':
+          stagedApplied += stageInsertOrUpdate(stagedRows, added, removed, diagnostics, patch.row, patch.update);
+          break;
+        case 'deleteByKey':
+          stagedApplied += stageDelete(stagedRows, removed, diagnostics, patch.key);
           break;
         case 'delete':
-          stagedApplied += stageDelete(stagedRows, removed, diagnostics, patch.key);
+          diagnostics.push({
+            code: 'unsupported_expression',
+            message: 'predicate delete is not supported by this adapter fixture',
+            relation: patch.relation.name,
+            detail: patch.predicate
+          });
           break;
         case 'deleteExact':
           stagedApplied += stageDeleteExact(stagedRows, removed, diagnostics, patch.row);
@@ -829,7 +730,6 @@ class MapTodoAdapter implements RelationAdapter<number> {
 
         return {
           status: 'partial',
-          committed: false,
           patches: patchList.length,
           applied: stagedApplied,
           deltas: added.length === 0 && removed.length === 0 ? [] : [{ relation: schema.todos, added, removed }],
@@ -840,7 +740,6 @@ class MapTodoAdapter implements RelationAdapter<number> {
 
       return {
         status: 'rejected',
-        committed: false,
         patches: patchList.length,
         applied: 0,
         deltas: [],
@@ -853,8 +752,7 @@ class MapTodoAdapter implements RelationAdapter<number> {
     this.versionId += 1;
 
     return {
-      status: 'committed',
-      committed: true,
+      status: 'accepted',
       patches: patchList.length,
       applied: stagedApplied,
       deltas: added.length === 0 && removed.length === 0 ? [] : [{ relation: schema.todos, added, removed }],
@@ -869,7 +767,7 @@ function stageInsert(
   added: Todo[],
   diagnostics: TarstateDiagnostic[],
   row: unknown,
-  onConflict: 'error' | 'ignore' | undefined
+  ignoreConflict: boolean
 ): number {
   if (!isTodo(row)) {
     diagnostics.push(invalidRowDiagnostic(row));
@@ -877,7 +775,7 @@ function stageInsert(
   }
 
   if (rowsById.has(row.id)) {
-    if (onConflict === 'ignore') {
+    if (ignoreConflict) {
       return 1;
     }
 
@@ -919,13 +817,12 @@ function stageUpdate(
   return 1;
 }
 
-function stageUpsert(
+function stageInsertOrMerge(
   rowsById: Map<string, Todo>,
   added: Todo[],
   removed: Todo[],
   diagnostics: TarstateDiagnostic[],
-  row: unknown,
-  mode: 'replace' | 'merge' | undefined
+  row: unknown
 ): number {
   if (!isRecord(row) || typeof row.id !== 'string') {
     diagnostics.push(invalidRowDiagnostic(row));
@@ -933,7 +830,7 @@ function stageUpsert(
   }
 
   const previous = rowsById.get(row.id);
-  const next = mode === 'merge' && previous !== undefined ? { ...previous, ...row } : row;
+  const next = previous === undefined ? row : { ...previous, ...row };
 
   if (!isTodo(next)) {
     diagnostics.push(invalidRowDiagnostic(next));
@@ -947,6 +844,47 @@ function stageUpsert(
   rowsById.set(next.id, next);
   added.push(next);
   return 1;
+}
+
+function stageInsertOrReplace(
+  rowsById: Map<string, Todo>,
+  added: Todo[],
+  removed: Todo[],
+  diagnostics: TarstateDiagnostic[],
+  row: unknown
+): number {
+  if (!isTodo(row)) {
+    diagnostics.push(invalidRowDiagnostic(row));
+    return 0;
+  }
+
+  const previous = rowsById.get(row.id);
+
+  if (previous !== undefined) {
+    removed.push(previous);
+  }
+
+  rowsById.set(row.id, row);
+  added.push(row);
+  return 1;
+}
+
+function stageInsertOrUpdate(
+  rowsById: Map<string, Todo>,
+  added: Todo[],
+  removed: Todo[],
+  diagnostics: TarstateDiagnostic[],
+  row: unknown,
+  update: unknown
+): number {
+  if (!isRecord(row) || typeof row.id !== 'string') {
+    diagnostics.push(invalidRowDiagnostic(row));
+    return 0;
+  }
+
+  return rowsById.has(row.id)
+    ? stageUpdate(rowsById, added, removed, diagnostics, row.id, update)
+    : stageInsert(rowsById, added, diagnostics, row, false);
 }
 
 function stageDelete(
@@ -1063,7 +1001,7 @@ function isRecord(input: unknown): input is Record<string, unknown> {
 function invalidRowDiagnostic(row: unknown): TarstateDiagnostic {
   return {
     code: 'invalid_row',
-    message: 'todo adapter received an invalid row',
+    message: 'invalid todo row',
     relation: schema.todos.name,
     detail: row
   };

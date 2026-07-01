@@ -1,3 +1,4 @@
+import type { PredicateData } from './query.js';
 import type { RelationRef } from './schema.js';
 
 /** Row type carried by a relation reference. */
@@ -7,53 +8,83 @@ export type RelationRow<Relation extends RelationRef> = Relation extends Relatio
 export type RelationRowUpdate<Relation extends RelationRef> = Partial<RelationRow<Relation>>;
 
 /** Key input accepted by update and delete patches. */
-export type RelationKeyInput<Row extends Record<string, unknown>> =
-  | Row[keyof Row & string]
-  | readonly unknown[]
-  | Partial<Row>;
+export type RelationKeyInput = string | number | readonly unknown[];
+
+/** Fields selected for insert-or-merge conflict handling. */
+export type RelationMergeInput<Relation extends RelationRef = RelationRef> =
+  | 'provided'
+  | 'all'
+  | readonly (keyof RelationRow<Relation> & string)[];
 
 export type InsertPatch<Relation extends RelationRef = RelationRef> = {
   readonly op: 'insert';
   readonly relation: Relation;
   readonly row: RelationRow<Relation>;
-  readonly onConflict?: 'error' | 'ignore';
 };
 
-export type InsertIgnorePatch<Relation extends RelationRef = RelationRef> = InsertPatch<Relation> & {
-  readonly onConflict: 'ignore';
+export type InsertIgnorePatch<Relation extends RelationRef = RelationRef> = {
+  readonly op: 'insertIgnore';
+  readonly relation: Relation;
+  readonly row: RelationRow<Relation>;
+};
+
+export type InsertOrReplacePatch<Relation extends RelationRef = RelationRef> = {
+  readonly op: 'insertOrReplace';
+  readonly relation: Relation;
+  readonly row: RelationRow<Relation>;
+};
+
+export type UpdateByKeyPatch<Relation extends RelationRef = RelationRef> = {
+  readonly op: 'updateByKey';
+  readonly relation: Relation;
+  readonly key: RelationKeyInput;
+  readonly changes: RelationRowUpdate<Relation>;
 };
 
 export type UpdatePatch<Relation extends RelationRef = RelationRef> = {
   readonly op: 'update';
   readonly relation: Relation;
-  readonly key: RelationKeyInput<RelationRow<Relation>>;
+  readonly predicate: PredicateData;
   readonly changes: RelationRowUpdate<Relation>;
 };
 
-export type UpsertPatch<Relation extends RelationRef = RelationRef> = {
-  readonly op: 'upsert';
-  readonly relation: Relation;
-  readonly row: RelationRow<Relation>;
-  readonly mode?: 'replace';
-};
-
-export type InsertOrReplacePatch<Relation extends RelationRef = RelationRef> = UpsertPatch<Relation>;
+export type UpdateWherePatch<Relation extends RelationRef = RelationRef> = UpdatePatch<Relation>;
 
 export type InsertOrMergePatch<Relation extends RelationRef = RelationRef> = {
-  readonly op: 'upsert';
+  readonly op: 'insertOrMerge';
   readonly relation: Relation;
   readonly row: RelationRowUpdate<Relation>;
-  readonly mode: 'merge';
+  readonly merge: RelationMergeInput<Relation>;
 };
 
-/** Alias patch type for insert-or-merge's merge-mode upsert shape. */
-export type InsertOrUpdatePatch<Relation extends RelationRef = RelationRef> = InsertOrMergePatch<Relation>;
+export type InsertOrMergeOptions<Relation extends RelationRef = RelationRef> = {
+  readonly merge?: RelationMergeInput<Relation>;
+};
+
+export type InsertOrUpdateOptions<Relation extends RelationRef = RelationRef> = {
+  readonly update: RelationRowUpdate<Relation>;
+};
+
+export type InsertOrUpdatePatch<Relation extends RelationRef = RelationRef> = {
+  readonly op: 'insertOrUpdate';
+  readonly relation: Relation;
+  readonly row: RelationRow<Relation>;
+  readonly update: RelationRowUpdate<Relation>;
+};
+
+export type DeleteByKeyPatch<Relation extends RelationRef = RelationRef> = {
+  readonly op: 'deleteByKey';
+  readonly relation: Relation;
+  readonly key: RelationKeyInput;
+};
 
 export type DeletePatch<Relation extends RelationRef = RelationRef> = {
   readonly op: 'delete';
   readonly relation: Relation;
-  readonly key: RelationKeyInput<RelationRow<Relation>>;
+  readonly predicate: PredicateData;
 };
+
+export type DeleteWherePatch<Relation extends RelationRef = RelationRef> = DeletePatch<Relation>;
 
 export type DeleteExactPatch<Relation extends RelationRef = RelationRef> = {
   readonly op: 'deleteExact';
@@ -70,10 +101,16 @@ export type ReplaceAllPatch<Relation extends RelationRef = RelationRef> = {
 /** Canonical mutation patch produced by writer constructors. */
 export type WritePatch<Relation extends RelationRef = RelationRef> =
   | InsertPatch<Relation>
+  | InsertIgnorePatch<Relation>
+  | InsertOrReplacePatch<Relation>
+  | UpdateByKeyPatch<Relation>
   | UpdatePatch<Relation>
-  | UpsertPatch<Relation>
+  | UpdateWherePatch<Relation>
   | InsertOrMergePatch<Relation>
+  | InsertOrUpdatePatch<Relation>
+  | DeleteByKeyPatch<Relation>
   | DeletePatch<Relation>
+  | DeleteWherePatch<Relation>
   | DeleteExactPatch<Relation>
   | ReplaceAllPatch<Relation>;
 
@@ -86,15 +123,30 @@ export type WriteInput<Relation extends RelationRef = RelationRef> =
 export type RelationWriter<Relation extends RelationRef> = {
   readonly insert: (row: RelationRow<Relation>) => InsertPatch<Relation>;
   readonly insertIgnore: (row: RelationRow<Relation>) => InsertIgnorePatch<Relation>;
+  readonly insertOrReplace: (row: RelationRow<Relation>) => InsertOrReplacePatch<Relation>;
+  readonly updateByKey: (
+    key: RelationKeyInput,
+    changes: RelationRowUpdate<Relation>
+  ) => UpdateByKeyPatch<Relation>;
   readonly update: (
-    key: RelationKeyInput<RelationRow<Relation>>,
+    predicate: PredicateData,
     changes: RelationRowUpdate<Relation>
   ) => UpdatePatch<Relation>;
-  readonly upsert: (row: RelationRow<Relation>) => UpsertPatch<Relation>;
-  readonly insertOrReplace: (row: RelationRow<Relation>) => InsertOrReplacePatch<Relation>;
-  readonly insertOrMerge: (row: RelationRowUpdate<Relation>) => InsertOrMergePatch<Relation>;
-  readonly insertOrUpdate: (row: RelationRowUpdate<Relation>) => InsertOrUpdatePatch<Relation>;
-  readonly delete: (key: RelationKeyInput<RelationRow<Relation>>) => DeletePatch<Relation>;
+  readonly updateWhere: (
+    predicate: PredicateData,
+    changes: RelationRowUpdate<Relation>
+  ) => UpdateWherePatch<Relation>;
+  readonly insertOrMerge: (
+    row: RelationRowUpdate<Relation>,
+    options?: InsertOrMergeOptions<Relation>
+  ) => InsertOrMergePatch<Relation>;
+  readonly insertOrUpdate: (
+    row: RelationRow<Relation>,
+    options: InsertOrUpdateOptions<Relation>
+  ) => InsertOrUpdatePatch<Relation>;
+  readonly deleteByKey: (key: RelationKeyInput) => DeleteByKeyPatch<Relation>;
+  readonly delete: (predicate: PredicateData) => DeletePatch<Relation>;
+  readonly deleteWhere: (predicate: PredicateData) => DeleteWherePatch<Relation>;
   readonly deleteExact: (row: RelationRow<Relation>) => DeleteExactPatch<Relation>;
   readonly replaceAll: (rows: readonly RelationRow<Relation>[]) => ReplaceAllPatch<Relation>;
 };
@@ -104,12 +156,15 @@ export function write<Relation extends RelationRef>(relation: Relation): Relatio
   return {
     insert: (row) => insert(relation, row),
     insertIgnore: (row) => insertIgnore(relation, row),
-    update: (key, changes) => update(relation, key, changes),
-    upsert: (row) => upsert(relation, row),
     insertOrReplace: (row) => insertOrReplace(relation, row),
-    insertOrMerge: (row) => insertOrMerge(relation, row),
-    insertOrUpdate: (row) => insertOrUpdate(relation, row),
-    delete: (key) => deleteRow(relation, key),
+    updateByKey: (key, changes) => updateByKey(relation, key, changes),
+    update: (predicate, changes) => update(relation, predicate, changes),
+    updateWhere: (predicate, changes) => updateWhere(relation, predicate, changes),
+    insertOrMerge: (row, options) => insertOrMerge(relation, row, options),
+    insertOrUpdate: (row, options) => insertOrUpdate(relation, row, options),
+    deleteByKey: (key) => deleteByKey(relation, key),
+    delete: (predicate) => deleteRows(relation, predicate),
+    deleteWhere: (predicate) => deleteWhere(relation, predicate),
     deleteExact: (row) => deleteExact(relation, row),
     replaceAll: (rows) => replaceAll(relation, rows)
   };
@@ -117,20 +172,13 @@ export function write<Relation extends RelationRef>(relation: Relation): Relatio
 
 /** Create an insert patch. */
 export function insert<Relation extends RelationRef>(
-  relation: Relation
-): (row: RelationRow<Relation>) => InsertPatch<Relation>;
-export function insert<Relation extends RelationRef>(
   relation: Relation,
   row: RelationRow<Relation>
 ): InsertPatch<Relation>;
 export function insert<Relation extends RelationRef>(
   relation: Relation,
-  row?: RelationRow<Relation>
-): InsertPatch<Relation> | ((row: RelationRow<Relation>) => InsertPatch<Relation>) {
-  if (row === undefined) {
-    return (nextRow) => insert(relation, nextRow);
-  }
-
+  row: RelationRow<Relation>
+): InsertPatch<Relation> {
   return { op: 'insert', relation, row };
 }
 
@@ -139,60 +187,105 @@ export function insertIgnore<Relation extends RelationRef>(
   relation: Relation,
   row: RelationRow<Relation>
 ): InsertIgnorePatch<Relation> {
-  return { op: 'insert', relation, row, onConflict: 'ignore' };
+  return { op: 'insertIgnore', relation, row };
 }
 
-/** Create an update patch. */
-export function update<Relation extends RelationRef>(
-  relation: Relation,
-  key: RelationKeyInput<RelationRow<Relation>>,
-  changes: RelationRowUpdate<Relation>
-): UpdatePatch<Relation> {
-  return { op: 'update', relation, key, changes };
-}
-
-/** Create an upsert patch. */
-export function upsert<Relation extends RelationRef>(
-  relation: Relation,
-  row: RelationRow<Relation>
-): UpsertPatch<Relation> {
-  return { op: 'upsert', relation, row };
-}
-
-/** Create an insert-or-replace patch. Alias for upsert. */
+/** Create an insert-or-replace patch. */
 export function insertOrReplace<Relation extends RelationRef>(
   relation: Relation,
   row: RelationRow<Relation>
 ): InsertOrReplacePatch<Relation> {
-  return upsert(relation, row);
+  return { op: 'insertOrReplace', relation, row };
+}
+
+/** Create a key update patch. */
+export function updateByKey<Relation extends RelationRef>(
+  relation: Relation,
+  key: RelationKeyInput,
+  changes: RelationRowUpdate<Relation>
+): UpdateByKeyPatch<Relation> {
+  return { op: 'updateByKey', relation, key, changes };
+}
+
+/**
+ * Create a predicate update patch.
+ *
+ * @remarks Stable write patches are serializable constant set-maps. Computed
+ * update expressions are intentionally left to a future explicit API.
+ */
+export function update<Relation extends RelationRef>(
+  relation: Relation,
+  predicate: PredicateData,
+  changes: RelationRowUpdate<Relation>
+): UpdatePatch<Relation> {
+  return { op: 'update', relation, predicate, changes };
+}
+
+/** Compatibility alias for predicate updates. Prefer `update`. */
+export function updateWhere<Relation extends RelationRef>(
+  relation: Relation,
+  predicate: PredicateData,
+  changes: RelationRowUpdate<Relation>
+): UpdateWherePatch<Relation> {
+  return update(relation, predicate, changes);
 }
 
 /** Create an insert-or-merge patch. */
 export function insertOrMerge<Relation extends RelationRef>(
   relation: Relation,
-  row: RelationRowUpdate<Relation>
+  row: RelationRowUpdate<Relation>,
+  options: InsertOrMergeOptions<Relation> = {}
 ): InsertOrMergePatch<Relation> {
-  return { op: 'upsert', relation, row, mode: 'merge' };
+  return { op: 'insertOrMerge', relation, row, merge: options.merge ?? 'provided' };
 }
 
 /**
  * Create an insert-or-update patch.
  *
- * Alias for insert-or-merge: inserts a full row when missing and merges supplied fields into an existing row.
+ * Inserts the full row when missing and applies the explicit update fields to an existing row.
  */
 export function insertOrUpdate<Relation extends RelationRef>(
   relation: Relation,
-  row: RelationRowUpdate<Relation>
+  row: RelationRow<Relation>,
+  options: InsertOrUpdateOptions<Relation>
+): InsertOrUpdatePatch<Relation>;
+export function insertOrUpdate<Relation extends RelationRef>(
+  relation: Relation,
+  row: RelationRow<Relation>,
+  options?: InsertOrUpdateOptions<Relation>
 ): InsertOrUpdatePatch<Relation> {
-  return insertOrMerge(relation, row);
+  if (options === undefined) {
+    throw new TypeError('insertOrUpdate requires an explicit { update } descriptor; use insertOrMerge for merge writes');
+  }
+
+  return { op: 'insertOrUpdate', relation, row, update: options.update };
 }
 
 /** Create a delete patch. */
-export function deleteRow<Relation extends RelationRef>(
+export function deleteByKey<Relation extends RelationRef>(
   relation: Relation,
-  key: RelationKeyInput<RelationRow<Relation>>
+  key: RelationKeyInput
+): DeleteByKeyPatch<Relation> {
+  return { op: 'deleteByKey', relation, key };
+}
+
+/** Create a predicate delete patch. */
+function deleteRows<Relation extends RelationRef>(
+  relation: Relation,
+  predicate: PredicateData
 ): DeletePatch<Relation> {
-  return { op: 'delete', relation, key };
+  return { op: 'delete', relation, predicate };
+}
+
+/** Create a predicate delete patch. */
+export { deleteRows as delete };
+
+/** Compatibility alias for predicate deletes. Prefer `delete`. */
+export function deleteWhere<Relation extends RelationRef>(
+  relation: Relation,
+  predicate: PredicateData
+): DeleteWherePatch<Relation> {
+  return deleteRows(relation, predicate);
 }
 
 /** Create a delete-exact patch that only removes a row when all supplied values match. */

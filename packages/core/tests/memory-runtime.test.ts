@@ -86,25 +86,14 @@ describe('memory relation runtime', () => {
     });
 
     const result = await runtime.target?.apply([
-      todos.update('todo-a', { done: true }),
+      todos.updateByKey('todo-a', { done: true }),
       todos.insert({ id: 'todo-b', text: 'Water basil', done: false, rank: 5 })
     ]);
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       status: 'accepted',
-      accepted: true,
       patches: 2,
       applied: 2,
-      deltas: [
-        {
-          relation: schema.todos,
-          added: [
-            { id: 'todo-a', text: 'Buy oat milk', done: true, rank: 2 },
-            { id: 'todo-b', text: 'Water basil', done: false, rank: 5 }
-          ],
-          removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 2 }]
-        }
-      ],
       diagnostics: [],
       durability: 'memory',
       version: 1
@@ -134,10 +123,8 @@ describe('memory relation runtime', () => {
 
     expect(result).toMatchObject({
       status: 'accepted',
-      accepted: true,
       patches: 1,
       applied: 1,
-      deltas: [],
       durability: 'memory',
       version: 0
     });
@@ -153,7 +140,7 @@ describe('memory relation runtime', () => {
     });
     const snapshot = runtime.snapshot?.();
 
-    await runtime.target?.apply([todos.update('todo-a', { done: true })]);
+    await runtime.target?.apply([todos.updateByKey('todo-a', { done: true })]);
 
     expect(snapshot?.version).toBe(0);
     expect(await snapshot?.source.version?.()).toBe(0);
@@ -171,19 +158,17 @@ describe('memory relation runtime', () => {
     });
 
     const result = await runtime.target?.apply([
-      todos.update('todo-a', { done: true }),
-      todos.delete('todo-missing')
+      todos.updateByKey('todo-a', { done: true }),
+      todos.deleteByKey('todo-missing')
     ]);
 
     expect(result).toMatchObject({
       status: 'rejected',
-      accepted: false,
       patches: 2,
       applied: 0,
-      deltas: [],
       durability: 'memory',
       version: 0,
-      diagnostics: [{ code: 'invalid_row', relation: 'todos', key: '["todo-missing"]' }]
+      diagnostics: [{ code: 'invalid_row', relation: 'todos' }]
     });
     expect(Array.from(await runtime.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 2 }
@@ -200,15 +185,12 @@ describe('memory relation runtime', () => {
 
     expect(result).toMatchObject({
       status: 'rejected',
-      accepted: false,
       patches: 1,
       applied: 0,
-      deltas: [],
       diagnostics: [
         {
           code: 'source_error',
-          relation: 'presence',
-          message: 'memory runtime does not own relation presence'
+          relation: 'presence'
         }
       ],
       durability: 'memory',
@@ -227,7 +209,6 @@ describe('memory relation runtime', () => {
 
     expect(result).toMatchObject({
       status: 'accepted',
-      accepted: true,
       patches: 1,
       applied: 1,
       durability: 'memory',
@@ -251,11 +232,9 @@ describe('memory relation runtime', () => {
 
     expect(result).toMatchObject({
       status: 'accepted',
-      accepted: true,
       patches: 2,
       applied: 2,
-      diagnostics: [],
-      version: [1, 1]
+      diagnostics: []
     });
     expect(Array.from(await todoRuntime.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 2 }

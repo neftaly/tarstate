@@ -22,7 +22,7 @@ import {
   applyWrites,
   type MutableObjectSourceData,
   type WriteApplyResult
-} from '@tarstate/core/write-apply';
+} from '@tarstate/core/experimental/write-apply';
 import {
   write,
   type WritePatch
@@ -154,11 +154,11 @@ export function buildWriterActionScenario(): WriterActionScenario {
 
   return {
     title: 'Writer batch: finish, add, assign, unassign',
-    description: 'A single ordered batch updates one todo, inserts one todo, upserts its writer link, and deletes one stale writer link.',
+    description: 'A single ordered batch updates one todo, inserts one todo, inserts or updates its writer link, and deletes one stale writer link.',
     actions: [
       {
         intent: 'Mark the object-backed query work complete.',
-        patch: todos.update('todo-b', { done: true })
+        patch: todos.updateByKey('todo-b', { done: true })
       },
       {
         intent: 'Add a follow-up todo for adapter benchmarking.',
@@ -166,11 +166,14 @@ export function buildWriterActionScenario(): WriterActionScenario {
       },
       {
         intent: 'Assign the new todo to an existing writer.',
-        patch: todoWriters.upsert({ todoId: 'todo-d', writerId: 'writer-mina' })
+        patch: todoWriters.insertOrUpdate(
+          { todoId: 'todo-d', writerId: 'writer-mina' },
+          { update: { writerId: 'writer-mina' } }
+        )
       },
       {
         intent: 'Remove the stale writer assignment from the patching task.',
-        patch: todoWriters.delete('todo-c')
+        patch: todoWriters.deleteByKey('todo-c')
       }
     ]
   };
@@ -215,15 +218,27 @@ function describePatch(patch: WritePatch, intent: string, index: number): PatchL
   switch (patch.op) {
     case 'insert':
       return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert ${JSON.stringify(patch.row)}` };
+    case 'updateByKey':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `update key ${JSON.stringify(patch.key)} with ${JSON.stringify(patch.changes)}` };
     case 'update':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `update ${JSON.stringify(patch.key)} with ${JSON.stringify(patch.changes)}` };
-    case 'upsert':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `upsert ${JSON.stringify(patch.row)}` };
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `update where ${JSON.stringify(patch.predicate)} with ${JSON.stringify(patch.changes)}` };
+    case 'insertIgnore':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert ignore ${JSON.stringify(patch.row)}` };
+    case 'insertOrReplace':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert or replace ${JSON.stringify(patch.row)}` };
+    case 'insertOrMerge':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert or merge ${JSON.stringify(patch.row)}` };
+    case 'insertOrUpdate':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert or update ${JSON.stringify(patch.row)} with ${JSON.stringify(patch.update)}` };
+    case 'deleteByKey':
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete key ${JSON.stringify(patch.key)}` };
     case 'delete':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete ${JSON.stringify(patch.key)}` };
+      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete where ${JSON.stringify(patch.predicate)}` };
     case 'deleteExact':
       return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete exact ${JSON.stringify(patch.row)}` };
     case 'replaceAll':
       return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `replace all with ${JSON.stringify(patch.rows)}` };
   }
+
+  throw new Error(`unsupported write patch: ${JSON.stringify(patch)}`);
 }

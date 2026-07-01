@@ -1,17 +1,234 @@
-export * from './adapter.js';
-export * from './constraints.js';
-export * from './db.js';
-export * from './delta.js';
-export * from './diff.js';
-export * from './diagnostics.js';
-export * from './evaluate.js';
-export * from './identity.js';
-export * from './materialization.js';
-export * from './memory-runtime.js';
-export * from './query.js';
-export * from './runtime.js';
-export * from './schema.js';
-export * from './source.js';
-export * from './store.js';
-export * from './watch.js';
-export * from './write.js';
+export {
+  composeRelationRuntimes,
+  isRelationAdapter,
+  isRelationRuntime,
+  tryApplyRelationPatches,
+  tryCommitAdapter
+} from './adapter.js';
+export type {
+  AdapterCommit,
+  AdapterCommitOptions,
+  AdapterCommitReport,
+  AdapterCommitResult,
+  AdapterCommitStatus,
+  AdapterSnapshot,
+  AdapterSource,
+  RelationAdapter,
+  RelationApply,
+  RelationApplyAcceptedResult,
+  RelationApplyDurability,
+  RelationApplyOptions,
+  RelationApplyPartialResult,
+  RelationApplyRejectedResult,
+  RelationApplyReport,
+  RelationApplyResult,
+  RelationApplyStatus,
+  RelationDelta,
+  RelationPatchTarget,
+  RelationRuntime
+} from './adapter.js';
+export type { TarstateDiagnostic } from './diagnostics.js';
+export {
+  DbTransactionError,
+  createDb,
+  dbDeleteWhere,
+  dbSource,
+  dbUpdateWhere,
+  exists,
+  getEnv,
+  q,
+  qMany,
+  qManyRows,
+  qRows,
+  row,
+  stripMeta,
+  transact,
+  tryTransact,
+  updateEnv,
+  whatIf,
+  withEnv
+} from './db.js';
+export type {
+  Db,
+  DbData,
+  DbEnv,
+  DbInputData,
+  DbInputEnv,
+  DbQueryOptions,
+  DbTransactionInput,
+  DbTransactionInputs,
+  DbTransactionResult,
+  DbWriteKey,
+  DbWriteMatcher,
+  DbWritePredicate,
+  MappedQueryBatchResult,
+  MappedQueryBatchRows,
+  QueryBatch,
+  QueryBatchResult,
+  QueryBatchRows
+} from './db.js';
+export { evaluate } from './evaluate.js';
+export type { EvaluateEnv, EvaluateFunction, EvaluateFunctions, EvaluateOptions, QueryResult } from './evaluate.js';
+export { createMemoryRelationRuntime } from './memory-runtime.js';
+export type { MemoryRelationRuntimeOptions } from './memory-runtime.js';
+export {
+  aggregate,
+  and,
+  any,
+  as,
+  asc,
+  avg,
+  bottom,
+  bottomBy,
+  btree,
+  call,
+  constRows,
+  count,
+  countDistinct,
+  dependencies,
+  desc,
+  difference,
+  env,
+  eq,
+  expand,
+  extend,
+  field,
+  from,
+  gt,
+  gte,
+  hash,
+  intersection,
+  join,
+  keyBy,
+  leftJoin,
+  limit,
+  lookup,
+  lt,
+  lte,
+  max,
+  maybe,
+  min,
+  neq,
+  not,
+  notAny,
+  or,
+  pipe,
+  project,
+  qualify,
+  qualifyRow,
+  queryKey,
+  queryRowKeyFields,
+  relationDependencies,
+  rename,
+  rowKeyFields,
+  sel,
+  sel1,
+  select,
+  setConcat,
+  sort,
+  sortLimit,
+  sum,
+  top,
+  topBy,
+  tuple,
+  union,
+  uniqueIndex,
+  value,
+  where,
+  without
+} from './query.js';
+export type {
+  AggregateConfig,
+  AggregateFunction,
+  AliasedRelationRef,
+  ComparisonOp,
+  ExpandOptions,
+  ExprData,
+  ExprInput,
+  NullSortOrder,
+  OptionalProjection,
+  PredicateData,
+  PrimitiveValue,
+  ProjectionData,
+  Query,
+  QueryData,
+  QueryKeyInput,
+  SortData,
+  SortDirection,
+  SortInput
+} from './query.js';
+export {
+  anchoredPathField,
+  booleanField,
+  defineSchema,
+  idField,
+  isJsonValue,
+  jsonField,
+  nullable,
+  numberField,
+  optional,
+  refField,
+  relation,
+  stringField
+} from './schema.js';
+export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
+export { composeSources, fromObjectSource, isRelationSource } from './source.js';
+export type { MaybePromise, RelationLookup, RelationRangeBound, RelationRangeLookup, RelationSource } from './source.js';
+export { createStore } from './store.js';
+export type {
+  Store,
+  StoreCommitInput,
+  StoreCommitResult,
+  StoreCommitSnapshot,
+  StoreDiagnostic,
+  StoreMappedQueryBatchResult,
+  StoreQueries,
+  StoreQuery,
+  StoreQueryBatchResult,
+  StoreQueryOptions,
+  StoreQueryResult,
+  StoreSnapshot,
+  StoreView,
+  StoreViewReadOptions
+} from './store.js';
+export {
+  deleteExact,
+  deleteByKey,
+  delete,
+  deleteWhere,
+  insert,
+  insertIgnore,
+  insertOrMerge,
+  insertOrReplace,
+  insertOrUpdate,
+  isWritePatch,
+  replaceAll,
+  update,
+  updateByKey,
+  updateWhere,
+  write
+} from './write.js';
+export type {
+  DeleteByKeyPatch,
+  DeleteExactPatch,
+  DeletePatch,
+  DeleteWherePatch,
+  InsertIgnorePatch,
+  InsertOrMergeOptions,
+  InsertOrMergePatch,
+  InsertOrUpdateOptions,
+  InsertOrUpdatePatch,
+  InsertOrReplacePatch,
+  InsertPatch,
+  RelationKeyInput,
+  RelationMergeInput,
+  RelationRow,
+  RelationRowUpdate,
+  RelationWriter,
+  ReplaceAllPatch,
+  UpdateByKeyPatch,
+  UpdatePatch,
+  UpdateWherePatch,
+  WriteInput,
+  WritePatch
+} from './write.js';

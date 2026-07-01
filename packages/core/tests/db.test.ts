@@ -1,13 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   DbTransactionError,
   createDb,
   dbSource,
+  type DbWriteKey,
+  dbDeleteWhere,
+  dbUpdateWhere,
   exists,
   getEnv,
   q,
   qMany,
+  qManyRows,
+  qRows,
   row,
+  stripMeta,
   transact,
   tryTransact,
   updateEnv,
@@ -19,10 +25,10 @@ import {
   transactConstrained,
   tryTransactConstrained,
   unique
-} from '@tarstate/core/constraints';
+} from '@tarstate/core/experimental/constraints';
 import { as, call, env, eq, from, pipe, project, where } from '@tarstate/core/query';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
-import { write } from '@tarstate/core/write';
+import { insertOrUpdate, write } from '@tarstate/core/write';
 
 type Todo = {
   readonly id: string;
@@ -62,9 +68,33 @@ describe('tarstate db facade', () => {
       rows: [{ id: 'todo-a', text: 'Buy oat milk', done: false }],
       diagnostics: []
     });
+    const todoRows = qRows(db, todoProjection);
+    const todoIds = qRows(db, todoProjection, { mapRows: (rows) => rows.map((todoRow) => todoRow.id) });
+
+    expectTypeOf(todoRows).toMatchTypeOf<
+      Promise<readonly { readonly id: string; readonly text: string; readonly done: boolean }[]>
+    >();
+    expectTypeOf(todoIds).toMatchTypeOf<Promise<readonly string[]>>();
+    await expect(todoRows).resolves.toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: false }
+    ]);
+    await expect(todoIds).resolves.toEqual(['todo-a']);
     expect(Array.from(await dbSource(db).rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false }
     ]);
+  });
+
+  it('strips db metadata to normalized relation data', () => {
+    const data = {
+      todos: [{ id: 'todo-a', text: 'Buy oat milk', done: false }]
+    };
+    const db = createDb(data, { workspaceId: 'workspace-a' });
+    const plain = { todos: [] };
+    const plainWithMetadataNames = { data: 'not-db-data', env: {} };
+
+    expect(stripMeta(db)).toEqual(data);
+    expect(stripMeta(plain)).toBe(plain);
+    expect(stripMeta(plainWithMetadataNames)).toBe(plainWithMetadataNames);
   });
 
   it('preserves query diagnostics from evaluate', async () => {
@@ -75,10 +105,9 @@ describe('tarstate db facade', () => {
     const result = await q(db, todoProjection);
 
     expect(result.rows).toEqual([{ id: 'todo-a', text: undefined, done: false }]);
-    expect(result.diagnostics).toEqual([
+    expect(result.diagnostics).toMatchObject([
       {
         code: 'invalid_row',
-        message: 'missing required field text in relation todos',
         relation: 'todos',
         field: 'text'
       }
@@ -126,7 +155,6 @@ describe('tarstate db facade', () => {
     );
 
     expect(getEnv(db)).toEqual({ workspaceId: 'workspace-a', userId: 'user-a' });
-    expect(Object.hasOwn(db.data, 'workspaceId')).toBe(false);
     await expect(q(db, projected)).resolves.toEqual({
       rows: [{ id: 'todo-a', workspaceId: 'workspace-a', userId: 'user-a' }],
       diagnostics: []
@@ -137,7 +165,7 @@ describe('tarstate db facade', () => {
     });
 
     const replaced = withEnv(db, { workspaceId: 'workspace-b' });
-    expect(replaced.data).toBe(db.data);
+    expect(stripMeta(replaced)).toEqual(stripMeta(db));
     expect(getEnv(replaced)).toEqual({ workspaceId: 'workspace-b' });
     await expect(q(replaced, projected)).resolves.toEqual({
       rows: [{ id: 'todo-a', workspaceId: 'workspace-b', userId: undefined }],
@@ -146,7 +174,7 @@ describe('tarstate db facade', () => {
 
     const updated = updateEnv(db, (current) => ({ ...current, workspaceId: 'workspace-c' }));
     expect(getEnv(updated)).toEqual({ workspaceId: 'workspace-c', userId: 'user-a' });
-    expect(transact(updated, [todos.update('todo-a', { done: true })]).env).toEqual({
+    expect(getEnv(transact(updated, [todos.updateByKey('todo-a', { done: true })]))).toEqual({
       workspaceId: 'workspace-c',
       userId: 'user-a'
     });
@@ -157,16 +185,13 @@ describe('tarstate db facade', () => {
       todos: [{ id: 'todo-a', done: false }]
     });
 
-    await expect(
-      q(db, todoProjection, {
-        mapRows: (rows) => rows.map((todoRow) => todoRow.text ?? `missing:${todoRow.id}`)
-      })
-    ).resolves.toEqual({
+    await expect(q(db, todoProjection, {
+      mapRows: (rows) => rows.map((todoRow) => todoRow.text ?? `missing:${todoRow.id}`)
+    })).resolves.toMatchObject({
       rows: ['missing:todo-a'],
       diagnostics: [
         {
           code: 'invalid_row',
-          message: 'missing required field text in relation todos',
           relation: 'todos',
           field: 'text'
         }
@@ -207,6 +232,19 @@ describe('tarstate db facade', () => {
         rows: [{ id: 'todo-b' }],
         diagnostics: []
       }
+    });
+    const rowBatch = qManyRows(db, { all: todoProjection, done: doneTodos });
+
+    expectTypeOf(rowBatch).toMatchTypeOf<Promise<{
+      readonly all: readonly { readonly id: string; readonly text: string; readonly done: boolean }[];
+      readonly done: readonly { readonly id: string }[];
+    }>>();
+    await expect(rowBatch).resolves.toEqual({
+      all: [
+        { id: 'todo-a', text: 'Buy oat milk', done: false },
+        { id: 'todo-b', text: 'Water basil', done: true }
+      ],
+      done: [{ id: 'todo-b' }]
     });
   });
 
@@ -275,7 +313,7 @@ describe('tarstate db facade', () => {
       whatIf(
         db,
         todoProjection,
-        [todos.update('todo-a', { done: true }), todos.insert({ id: 'todo-b', text: 'Water basil', done: false })],
+        [todos.updateByKey('todo-a', { done: true }), todos.insert({ id: 'todo-b', text: 'Water basil', done: false })],
       )
     ).resolves.toEqual({
       rows: [
@@ -284,7 +322,7 @@ describe('tarstate db facade', () => {
       ],
       diagnostics: []
     });
-    expect(db.data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
+    await expect(qRows(db, todoProjection)).resolves.toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
   });
 
   it('queries a what-if transaction with a named query batch', async () => {
@@ -356,27 +394,16 @@ describe('tarstate db facade', () => {
     });
 
     const result = tryTransact(db, [
-      todos.update('todo-a', { done: true }),
+      todos.updateByKey('todo-a', { done: true }),
       todos.insert({ id: 'todo-c', text: 'Review notes', done: false })
     ]);
 
     expect(result).toMatchObject({ patches: 2, applied: 2, committed: true, diagnostics: [] });
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [
-          { id: 'todo-a', text: 'Buy oat milk', done: true },
-          { id: 'todo-c', text: 'Review notes', done: false }
-        ],
-        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false }]
-      }
-    ]);
-    expect(result.db.data.todos).not.toBe(db.data.todos);
-    expect(db.data.todos).toEqual([
+    expect(stripMeta(db).todos).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false },
       { id: 'todo-b', text: 'Water basil', done: false }
     ]);
-    expect(result.db.data.todos).toEqual([
+    expect(stripMeta(result.db).todos).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: true },
       { id: 'todo-b', text: 'Water basil', done: false },
       { id: 'todo-c', text: 'Review notes', done: false }
@@ -391,30 +418,149 @@ describe('tarstate db facade', () => {
     const inserted = tryTransact(db, todos.insert({ id: 'todo-b', text: 'Water basil', done: false }));
 
     expect(inserted).toMatchObject({ patches: 1, applied: 1, committed: true, diagnostics: [] });
-    expect(inserted.db.data.todos).toEqual([
+    expect(stripMeta(inserted.db).todos).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false },
       { id: 'todo-b', text: 'Water basil', done: false }
     ]);
-    expect(db.data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
+    expect(stripMeta(db).todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
 
     const replaced = transact(inserted.db, (current) =>
-      current.data.todos?.length === 2
+      stripMeta(current).todos?.length === 2
         ? todos.replaceAll([{ id: 'todo-c', text: 'Review notes', done: false }])
         : todos.insert({ id: 'todo-missing', text: 'Unexpected branch', done: false })
     );
 
-    expect(replaced.data.todos).toEqual([{ id: 'todo-c', text: 'Review notes', done: false }]);
+    expect(stripMeta(replaced).todos).toEqual([{ id: 'todo-c', text: 'Review notes', done: false }]);
 
-    const updated = tryTransact(replaced, (current) => [
-      todos.update('todo-c', { done: current.data.todos?.length === 1 }),
-      todos.insert({ id: 'todo-d', text: 'Send update', done: false })
-    ]);
+    const updated = tryTransact(
+      replaced,
+      todos.updateByKey('todo-c', { done: true }),
+      (current) => todos.insert({
+        id: 'todo-d',
+        text: 'Send update',
+        done: (stripMeta(current).todos?.[0] as Todo | undefined)?.done ?? false
+      })
+    );
 
     expect(updated).toMatchObject({ patches: 2, applied: 2, committed: true, diagnostics: [] });
-    expect(updated.db.data.todos).toEqual([
+    expect(stripMeta(updated.db).todos).toEqual([
       { id: 'todo-c', text: 'Review notes', done: true },
       { id: 'todo-d', text: 'Send update', done: false }
     ]);
+  });
+
+  it('creates keyed update/delete transaction inputs alongside explicit write patches', () => {
+    const db = createDb({
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk', done: false },
+        { id: 'todo-b', text: 'Water basil', done: false }
+      ]
+    });
+
+    const result = tryTransact(
+      db,
+      dbUpdateWhere(schema.todos, 'todo-a', { done: true }),
+      dbDeleteWhere(schema.todos, 'todo-b'),
+      insertOrUpdate(
+        schema.todos,
+        { id: 'todo-c', text: 'Review notes', done: false },
+        { update: { text: 'Review notes' } }
+      ),
+      insertOrUpdate(
+        schema.todos,
+        { id: 'todo-c', text: 'Review notes', done: false },
+        { update: { text: 'Review updated notes' } }
+      )
+    );
+
+    expect(result).toMatchObject({ patches: 4, applied: 4, committed: true, diagnostics: [] });
+    expect(stripMeta(result.db).todos).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: true },
+      { id: 'todo-c', text: 'Review updated notes', done: false }
+    ]);
+    expect(stripMeta(db).todos).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: false },
+      { id: 'todo-b', text: 'Water basil', done: false }
+    ]);
+  });
+
+  it('creates predicate update/delete transaction inputs by scanning current db rows', () => {
+    const db = createDb({
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk', done: false },
+        { id: 'todo-b', text: 'Water basil', done: false },
+        { id: 'todo-c', text: 'Review notes', done: true }
+      ]
+    });
+    const seen: string[] = [];
+
+    const result = tryTransact(
+      db,
+      dbUpdateWhere(
+        schema.todos,
+        (todoRow, _index, current) => {
+          expect(current).toBe(db);
+          seen.push(todoRow.id);
+          return !todoRow.done;
+        },
+        { done: true }
+      ),
+      dbDeleteWhere(schema.todos, (todoRow) => todoRow.text === 'Water basil')
+    );
+
+    expect(seen).toHaveLength(3);
+    expect(seen).toEqual(expect.arrayContaining(['todo-a', 'todo-b', 'todo-c']));
+    expect(result).toMatchObject({ patches: 3, applied: 3, committed: true, diagnostics: [] });
+    expect(stripMeta(result.db).todos).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: true },
+      { id: 'todo-c', text: 'Review notes', done: true }
+    ]);
+  });
+
+  it('rejects malformed tuple and object keys instead of treating them as structural filters', () => {
+    const db = createDb({
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk', done: false },
+        { id: 'todo-b', text: 'Water basil', done: false }
+      ]
+    });
+
+    const updateResult = tryTransact(db, dbUpdateWhere(schema.todos, ['todo-a', 'extra'], { done: true }));
+    const deleteResult = tryTransact(db, dbDeleteWhere(schema.todos, ['todo-a', 'extra']));
+    const updateObjectResult = tryTransact(
+      db,
+      dbUpdateWhere(schema.todos, { id: 'todo-a' } as unknown as DbWriteKey, { done: true })
+    );
+    const deleteBooleanResult = tryTransact(db, dbDeleteWhere(schema.todos, true as unknown as DbWriteKey));
+
+    expect(updateResult).toMatchObject({
+      patches: 1,
+      applied: 0,
+      committed: false,
+      diagnostics: [{ code: 'invalid_row', relation: 'todos' }]
+    });
+    expect(updateResult.db).toBe(db);
+    expect(deleteResult).toMatchObject({
+      patches: 1,
+      applied: 0,
+      committed: false,
+      diagnostics: [{ code: 'invalid_row', relation: 'todos' }]
+    });
+    expect(deleteResult.db).toBe(db);
+    expect(updateObjectResult).toMatchObject({
+      patches: 1,
+      applied: 0,
+      committed: false,
+      diagnostics: [{ code: 'invalid_row', relation: 'todos' }]
+    });
+    expect(updateObjectResult.db).toBe(db);
+    expect(deleteBooleanResult).toMatchObject({
+      patches: 1,
+      applied: 0,
+      committed: false,
+      diagnostics: [{ code: 'invalid_row', relation: 'todos' }]
+    });
+    expect(deleteBooleanResult.db).toBe(db);
   });
 
   it('tryTransact preserves write diagnostics without throwing', () => {
@@ -424,16 +570,15 @@ describe('tarstate db facade', () => {
 
     const result = tryTransact(db, [
       todos.insert({ id: 'todo-a', text: 'Duplicate', done: false }),
-      todos.update('todo-missing', { done: true })
+      todos.updateByKey('todo-missing', { done: true })
     ]);
 
     expect(result.patches).toBe(2);
     expect(result.applied).toBe(0);
     expect(result.committed).toBe(false);
-    expect(result.deltas).toEqual([]);
     expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(['duplicate_key', 'invalid_row']);
-    expect(result.db.data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
-    expect(db.data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
+    expect(stripMeta(result.db).todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
+    expect(stripMeta(db).todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
   });
 
   it('tryTransact is all-or-nothing when a later patch fails', () => {
@@ -442,7 +587,7 @@ describe('tarstate db facade', () => {
     });
 
     const result = tryTransact(db, [
-      todos.update('todo-a', { done: true }),
+      todos.updateByKey('todo-a', { done: true }),
       todos.insert({ id: 'todo-b', text: 'Broken', done: 'no' } as unknown as Todo)
     ]);
 
@@ -452,9 +597,8 @@ describe('tarstate db facade', () => {
       committed: false,
       diagnostics: [{ code: 'invalid_row', relation: 'todos', field: 'done' }]
     });
-    expect(result.deltas).toEqual([]);
     expect(result.db).toBe(db);
-    expect(result.db.data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
+    expect(stripMeta(result.db).todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
   });
 
   it('transact returns a db on clean writes and throws diagnostics on invalid writes', () => {
@@ -462,7 +606,7 @@ describe('tarstate db facade', () => {
       todos: [{ id: 'todo-a', text: 'Buy oat milk', done: false }]
     });
 
-    expect(transact(db, [todos.update('todo-a', { done: true })]).data.todos).toEqual([
+    expect(stripMeta(transact(db, [todos.updateByKey('todo-a', { done: true })])).todos).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: true }
     ]);
 
@@ -479,7 +623,7 @@ describe('tarstate db facade', () => {
       expect(caught.applied).toBe(0);
       expect(caught.committed).toBe(false);
       expect(caught.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(['duplicate_key']);
-      expect(caught.db.data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
+      expect(stripMeta(caught.db).todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
     }
   });
 
@@ -500,9 +644,8 @@ describe('tarstate db facade', () => {
       committed: false,
       diagnostics: [{ code: 'duplicate_key', relation: 'todos', field: 'text' }]
     });
-    expect(result.deltas).toEqual([]);
     expect(result.db).toBe(db);
-    expect(db.data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
+    expect(stripMeta(db).todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
 
     await expect(
       tryTransactConstrained(

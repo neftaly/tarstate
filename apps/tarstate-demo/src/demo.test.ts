@@ -30,13 +30,13 @@ describe('tarstate demo data', () => {
       { id: 'todo-c', text: 'Apply writer patches', done: false, writer: undefined },
       { id: 'todo-d', text: 'Benchmark the Automerge adapter', done: false, writer: 'Mina' }
     ]);
-    expect(snapshot.patchLog.map((entry) => entry.op)).toEqual(['update', 'insert', 'upsert', 'delete']);
+    expect(snapshot.patchLog.map((entry) => entry.op)).toEqual(['update', 'insert', 'insertOrUpdate', 'delete']);
   });
 
   it('builds a writer action scenario with supported patch operations', () => {
     const scenario = buildWriterActionScenario();
 
-    expect(scenario.actions.map((action) => action.patch.op)).toEqual(['update', 'insert', 'upsert', 'delete']);
+    expect(scenario.actions.map((action) => action.patch.op)).toEqual(['update', 'insert', 'insertOrUpdate', 'delete']);
     expect(scenario.actions.map((action) => action.intent)).toEqual([
       'Mark the object-backed query work complete.',
       'Add a follow-up todo for adapter benchmarking.',

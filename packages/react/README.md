@@ -6,42 +6,33 @@ subscription concerns out of `@tarstate/core`.
 
 The React API should stabilize around the provider, store constructors, query
 hooks, and commit hook. Constraint enforcement, materialized-query read-through,
-snapshot maintenance, and core-sourced change reports are experimental,
-diagnostic-backed behavior layered behind that consumption path.
+and watch-change envelopes remain experimental core behavior rather than React
+API shape. Commit `effects.deltas` use the stable core adapter `RelationDelta`
+shape.
 
 Use it when a React app wants Tarstate as a local relational/lens-style state
 layer with explicit writes, not general bidirectional lens/view putback:
 
-- `createDbStore` for object-backed local state. It accepts
-  `createDbStore(input, { constraints })` for creation-time object-backed
-  constraint attachment. Commits enforce attached object-backed constraints and
-  use delta-backed snapshot materialization maintenance, with recompute fallback
-  outside the narrow incremental subset. Some supported materialization shapes
-  may still report source-row rebuilds. Committed writes also return optional
-  core-sourced `changes`; rejected writes do not.
-- `createSourceStore` for external state exposed as a `RelationSource`, plus an
-  optional patch target. Reflected commits, manual refresh, and host
-  invalidations maintain existing materializations when the previous snapshot
-  carries metadata; source-backed paths recompute conservatively unless real
-  relation deltas are reported.
+- `createDbStore` for object-backed local state. Commits apply explicit write
+  patches and publish revisioned snapshots. Constraint attachment and concrete
+  watch-change envelopes remain experimental core behavior, not React
+  constructor options.
+- `createSourceStore` for read-only external state exposed as a `RelationSource`.
+  Manual refresh and host invalidations capture a fresh source snapshot for
+  React consumers.
 - `createRuntimeStore` for generic `RelationRuntime` integrations such as
-  composed durable documents plus ephemeral presence. Runtime stores follow the
-  same materialization rules as source stores.
+  composed durable documents plus ephemeral presence.
 - `createAdapterStore` for write-capable integrations that implement
   `RelationAdapter`, preferably with read-consistent `snapshot()` support.
-  Adapter commits follow the reflected-commit maintenance path; host
-  `refresh`/`subscribe` invalidations preserve materializations through the same
-  conservative source refresh path.
+  Adapter commits and host `refresh`/`subscribe` invalidations publish fresh
+  source snapshots through the same React store contract.
 - `TarstateProvider`, `useTarstateQuery`, `useTarstateQueries`,
   `useTarstateCommit`, and `useTarstateSnapshot` for components. The shorter
   `useQuery`, `useQueries`, and `useCommit` aliases are also exported. Query
-  hooks try exact current materialized-query read-through as a cache
-  optimization before evaluating cache-safe queries against the captured source
-  snapshot.
+  hooks evaluate against the captured source snapshot.
 
 Keep schemas, queries, and write patch builders in plain TypeScript modules so
 they can be tested through `@tarstate/core` without React.
 
-Partial incremental view maintenance may run behind materialized snapshots when
-the core can prove a supported shape. `@tarstate/react` does not expose a
-general IVM API, operator-maintained view API, or async stream contract.
+`@tarstate/react` does not expose a general IVM API, operator-maintained view
+API, materialization cache API, or async stream contract.

@@ -202,6 +202,20 @@ export type MaterializationHashIndex<Row = unknown, Value = unknown> = {
   readonly lookup: ReadonlyMap<Value, readonly Row[]>;
 };
 
+/** Placeholder shape for future operator-maintained btree indexes. */
+export type MaterializationBtreeIndex<Row = unknown, Value = unknown> = {
+  readonly kind: 'btree';
+  readonly field: string;
+  readonly lookup: ReadonlyMap<Value, readonly Row[]>;
+};
+
+/** Placeholder shape for future operator-maintained unique indexes. */
+export type MaterializationUniqueIndex<Row = unknown, Value = unknown> = {
+  readonly kind: 'unique';
+  readonly field: string;
+  readonly lookup: ReadonlyMap<Value, Row>;
+};
+
 /** Result for reading cached snapshot rows as a set index. */
 export type MaterializationIndexResult<Row = unknown> = {
   readonly kind: 'materializationIndex';
@@ -222,6 +236,26 @@ export type MaterializationHashIndexResult<Row = unknown, Value = unknown> = {
   readonly index?: MaterializationHashIndex<Row, Value>;
 };
 
+/** Result for requesting a btree materialization index facade. */
+export type MaterializationBtreeIndexResult<Row = unknown, Value = unknown> = {
+  readonly kind: 'materializationBtreeIndex';
+  readonly indexed: boolean;
+  readonly diagnostics: readonly MaterializationDiagnostic[];
+  readonly id?: string;
+  readonly queryKey?: string;
+  readonly index?: MaterializationBtreeIndex<Row, Value>;
+};
+
+/** Result for requesting a unique materialization index facade. */
+export type MaterializationUniqueIndexResult<Row = unknown, Value = unknown> = {
+  readonly kind: 'materializationUniqueIndex';
+  readonly indexed: boolean;
+  readonly diagnostics: readonly MaterializationDiagnostic[];
+  readonly id?: string;
+  readonly queryKey?: string;
+  readonly index?: MaterializationUniqueIndex<Row, Value>;
+};
+
 /** Result for reading cached snapshot rows for an exact structural query match. */
 export type MaterializedQueryResult<Row = unknown> = {
   readonly kind: 'materializedQueryResult';
@@ -232,6 +266,23 @@ export type MaterializedQueryResult<Row = unknown> = {
   readonly id?: string;
   readonly sourceVersion?: unknown;
 };
+
+export type MaterializationIndexOptions<Field extends string = string> =
+  | {
+      readonly kind?: 'set';
+    }
+  | {
+      readonly kind: 'hash';
+      readonly field: Field;
+    }
+  | {
+      readonly kind: 'btree';
+      readonly field: Field;
+    }
+  | {
+      readonly kind: 'unique';
+      readonly field: Field;
+    };
 
 type SnapshotEntry<Row = unknown> = {
   readonly rows: readonly Row[];
@@ -865,6 +916,80 @@ export function materializedSourceFor<Row = unknown>(
   };
 }
 
+export function index<Row = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options?: Extract<MaterializationIndexOptions, { readonly kind?: 'set' }>
+): MaterializationIndexResult<Row>;
+export function index<
+  Row extends object,
+  Field extends Extract<keyof Row, string> = Extract<keyof Row, string>
+>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options: Extract<MaterializationIndexOptions<Field>, { readonly kind: 'hash' }>
+): MaterializationHashIndexResult<Row, Row[Field]>;
+export function index<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options: Extract<MaterializationIndexOptions, { readonly kind: 'hash' }>
+): MaterializationHashIndexResult<Row, Value>;
+export function index<
+  Row extends object,
+  Field extends Extract<keyof Row, string> = Extract<keyof Row, string>
+>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options: Extract<MaterializationIndexOptions<Field>, { readonly kind: 'btree' }>
+): MaterializationBtreeIndexResult<Row, Row[Field]>;
+export function index<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options: Extract<MaterializationIndexOptions, { readonly kind: 'btree' }>
+): MaterializationBtreeIndexResult<Row, Value>;
+export function index<
+  Row extends object,
+  Field extends Extract<keyof Row, string> = Extract<keyof Row, string>
+>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options: Extract<MaterializationIndexOptions<Field>, { readonly kind: 'unique' }>
+): MaterializationUniqueIndexResult<Row, Row[Field]>;
+export function index<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options: Extract<MaterializationIndexOptions, { readonly kind: 'unique' }>
+): MaterializationUniqueIndexResult<Row, Value>;
+/**
+ * Relic-style raw materialization index facade.
+ *
+ * @remarks This currently exposes cached snapshot rows only. It is not an
+ * operator-maintained `hash`/`btree`/`unique` index yet.
+ */
+export function index<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  options: MaterializationIndexOptions = {}
+):
+  | MaterializationIndexResult<Row>
+  | MaterializationHashIndexResult<Row, Value>
+  | MaterializationBtreeIndexResult<Row, Value>
+  | MaterializationUniqueIndexResult<Row, Value> {
+  switch (options.kind) {
+    case 'hash':
+      return snapshotHashIndex<Row, Value>(input, target, options.field);
+    case 'btree':
+      return unsupportedFacadeIndex<Row, Value>(input, target, 'btree', options.field);
+    case 'unique':
+      return unsupportedFacadeIndex<Row, Value>(input, target, 'unique', options.field);
+    case 'set':
+    case undefined:
+      return snapshotIndex<Row>(input, target);
+  }
+
+  return snapshotIndex<Row>(input, target);
+}
+
 /** Return a raw set index only when snapshot rows are cached for the requested materialization. */
 export function snapshotIndex<Row = unknown>(
   input: unknown,
@@ -996,6 +1121,62 @@ export function snapshotHashIndex<Row = unknown, Value = unknown>(
     index: result.index,
     diagnostics: []
   };
+}
+
+function unsupportedFacadeIndex<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  kind: 'btree',
+  field: string
+): MaterializationBtreeIndexResult<Row, Value>;
+function unsupportedFacadeIndex<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  kind: 'unique',
+  field: string
+): MaterializationUniqueIndexResult<Row, Value>;
+function unsupportedFacadeIndex<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: SnapshotRefreshTarget<Row>,
+  kind: 'btree' | 'unique',
+  field: string
+): MaterializationBtreeIndexResult<Row, Value> | MaterializationUniqueIndexResult<Row, Value> {
+  const missingBase = {
+    ...(typeof target === 'string' ? { id: target } : {}),
+    ...(isQuery(target) ? { queryKey: queryKey(target) } : {}),
+    indexed: false,
+    diagnostics: [missingMaterializationDiagnostic(target)]
+  };
+
+  if (typeof input !== 'object' || input === null) {
+    return kind === 'btree'
+      ? { kind: 'materializationBtreeIndex', ...missingBase }
+      : { kind: 'materializationUniqueIndex', ...missingBase };
+  }
+
+  const metadata = materializationForTarget(input, target);
+
+  if (metadata === undefined) {
+    return kind === 'btree'
+      ? { kind: 'materializationBtreeIndex', ...missingBase }
+      : { kind: 'materializationUniqueIndex', ...missingBase };
+  }
+
+  const unsupportedBase = {
+    id: metadata.id,
+    queryKey: metadata.queryKey,
+    indexed: false,
+    diagnostics: [
+      unsupportedMaterializationIndexDiagnostic(metadata, `${kind} index facade is not implemented`, {
+        indexKind: kind,
+        field
+      })
+    ]
+  };
+
+  return kind === 'btree'
+    ? { kind: 'materializationBtreeIndex', ...unsupportedBase }
+    : { kind: 'materializationUniqueIndex', ...unsupportedBase };
 }
 
 function materializedSourceState<Row>(

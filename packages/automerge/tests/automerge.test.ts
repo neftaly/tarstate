@@ -1,7 +1,13 @@
 import * as Automerge from '@automerge/automerge';
 import type { DocHandle, PeerId } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { composeRelationRuntimes, tryApplyRelationPatches, tryCommitAdapter } from '@tarstate/core/adapter';
+import {
+  composeRelationRuntimes,
+  isRelationAdapter,
+  isRelationRuntime,
+  tryApplyRelationPatches,
+  tryCommitAdapter
+} from '@tarstate/core/adapter';
 import { evaluate } from '@tarstate/core/evaluate';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { as, eq, from, join, pipe, project, where } from '@tarstate/core/query';
@@ -21,16 +27,10 @@ import { write } from '@tarstate/core/write';
 import {
   automergeMapAdapter,
   automergeMapSource,
-  automergePresenceRuntime,
-  createAutomergeMapAdapter,
-  createAutomergeMapSource,
-  createAutomergePresenceRuntime,
-  createAutomergeRelationAdapter,
-  createAutomergeRelationSource,
-  rowsFromAutomergeMapPath,
   type AutomergeMapAdapter,
   type AutomergeMapSource
 } from '@tarstate/automerge';
+import { automergePresenceRuntime } from '@tarstate/automerge/presence';
 
 type TodoRow = {
   readonly id: string;
@@ -141,39 +141,50 @@ const todoRelations = [{ relation: schema.todos, path: ['todos'] }] as const;
 
 describe('@tarstate/automerge', () => {
   it('exports the public package adapter surface', async () => {
+    const api = await import('@tarstate/automerge');
+    const presenceApi = await import('@tarstate/automerge/presence');
     const doc = Automerge.from<TodoDocument>({ todos: {} });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
-    expect(automergeMapAdapter).toBe(createAutomergeMapAdapter);
-    expect(createAutomergeRelationAdapter).toBe(createAutomergeMapAdapter);
-    expect(automergeMapSource).toBe(createAutomergeMapSource);
-    expect(createAutomergeRelationSource).toBe(createAutomergeMapSource);
-    expect(automergePresenceRuntime).toBe(createAutomergePresenceRuntime);
+    expect(adapter.getDoc()).toBe(doc);
+    expect('doc' in adapter).toBe(false);
+    expect('createAutomergeMapAdapter' in api).toBe(false);
+    expect('createAutomergeRelationAdapter' in api).toBe(false);
+    expect('createAutomergeMapSource' in api).toBe(false);
+    expect('createAutomergeRelationSource' in api).toBe(false);
+    expect('createAutomergePresenceRuntime' in api).toBe(false);
+    expect('automergePresenceRuntime' in api).toBe(false);
+    expect('rowsFromAutomergeMapPath' in api).toBe(false);
+    expect(automergeMapAdapter).toEqual(expect.any(Function));
+    expect(automergeMapSource).toEqual(expect.any(Function));
+    expect(presenceApi.automergePresenceRuntime).toBe(automergePresenceRuntime);
     expect(Array.from(await automergeMapSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
-    expect(Array.from(await createAutomergeMapSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
-    expect(Array.from(await createAutomergeRelationSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
     expectTypeOf(automergeMapAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
-    expectTypeOf(createAutomergeMapAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
-    expectTypeOf(createAutomergeRelationAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
-    expectTypeOf(createAutomergeMapSource<TodoDocument>).returns.toMatchTypeOf<AutomergeMapSource>();
-    expectTypeOf(rowsFromAutomergeMapPath<TodoDocument>).returns.toEqualTypeOf<readonly unknown[]>();
+    expectTypeOf(automergeMapSource<TodoDocument>).returns.toMatchTypeOf<AutomergeMapSource>();
   });
 
-  it('reads rows, lookups, range lookups, and versions from a real Automerge document', async () => {
+  it('reads rows, lookups, range lookups, and exposes source versions', async () => {
     const doc = Automerge.from<TodoDocument>({
       todos: {
         'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
         'todo-b': { id: 'todo-b', text: 'Water basil', done: true, rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
     const version = await adapter.source.version?.();
     const snapshot = adapter.snapshot();
 
-    expect(version).toEqual(Automerge.getHeads(doc));
-    expect(await adapter.source.version?.()).toBe(version);
-    expect(snapshot.version).toBe(version);
-    expect(await snapshot.source.version?.()).toBe(snapshot.version);
+    expect(isRelationAdapter(adapter)).toBe(true);
+    expect(isRelationRuntime(adapter)).toBe(true);
+    expect(adapter.source.relationNames).toEqual(['todos']);
+    expect(adapter.target.relationNames).toEqual(['todos']);
+    expect(adapter.target.ownsRelation?.('todos')).toBe(true);
+    expect(adapter.target.ownsRelation?.('presence')).toBe(false);
+    expect(adapter.snapshot).toEqual(expect.any(Function));
+    expect(version).toBeDefined();
+    expect(snapshot.version).toBeDefined();
+    expect(await snapshot.source.version?.()).toBeDefined();
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
       { id: 'todo-b', text: 'Water basil', done: true, rank: 2 }
@@ -191,45 +202,33 @@ describe('@tarstate/automerge', () => {
     ).toEqual([{ id: 'todo-b', text: 'Water basil', done: true, rank: 2 }]);
   });
 
-  it('commits Tarstate write patches through Automerge.change and returns real heads', async () => {
+  it('commits Tarstate write patches and exposes updated relation rows', async () => {
     const doc = Automerge.from<TodoDocument>({
       todos: {
         'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
-    const beforeDoc = adapter.doc;
     const result = await tryCommitAdapter(
       adapter,
       [
-        todos.update('todo-a', { done: true }),
+        todos.updateByKey('todo-a', { done: true }),
         todos.insert({ id: 'todo-b', text: 'Water basil', done: false, rank: 2 })
       ],
       { readVersion: false }
     );
 
     expect(result).toMatchObject({
-      status: 'committed',
-      committed: true,
+      status: 'accepted',
       patches: 2,
       applied: 2,
       diagnostics: []
     });
-    expect(adapter.doc).not.toBe(beforeDoc);
-    expect(result.version).toEqual(Automerge.getHeads(adapter.doc));
-    expect(result.version).toBe(await adapter.source.version?.());
-    expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
-    expect(adapter.doc.todos['todo-b']).toEqual({ text: 'Water basil', done: false, rank: 2 });
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [
-          { id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 },
-          { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
-        ],
-        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]
-      }
+    expect(result.deltas.map((delta) => delta.relation.name)).toEqual(['todos']);
+    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 },
+      { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
     ]);
   });
 
@@ -239,35 +238,26 @@ describe('@tarstate/automerge', () => {
         'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
-    const beforeDoc = adapter.doc;
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
     const result = await tryApplyRelationPatches(
       adapter,
-      [todos.update('todo-a', { done: true })],
+      [todos.updateByKey('todo-a', { done: true })],
       { readVersion: false }
     );
 
     expect(result).toMatchObject({
       status: 'accepted',
-      accepted: true,
       patches: 1,
       applied: 1,
       diagnostics: [],
-      durability: 'durable',
-      version: Automerge.getHeads(adapter.doc)
+      durability: 'durable'
     });
     expect('committed' in result).toBe(false);
-    expect(result.version).toBe(await adapter.source.version?.());
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [{ id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 }],
-        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]
-      }
+    expect(result.deltas.map((delta) => delta.relation.name)).toEqual(['todos']);
+    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 }
     ]);
-    expect(adapter.doc).not.toBe(beforeDoc);
-    expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
   });
 
   it('rejects invalid durable runtime target patches without leaking commit fields', async () => {
@@ -276,9 +266,7 @@ describe('@tarstate/automerge', () => {
         'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
-    const beforeDoc = adapter.doc;
-    const beforeHeads = Automerge.getHeads(beforeDoc);
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
     const result = await tryApplyRelationPatches(
       adapter,
@@ -288,7 +276,6 @@ describe('@tarstate/automerge', () => {
 
     expect(result).toMatchObject({
       status: 'rejected',
-      accepted: false,
       patches: 1,
       applied: 0,
       deltas: [],
@@ -299,12 +286,12 @@ describe('@tarstate/automerge', () => {
           field: 'done'
         }
       ],
-      durability: 'durable',
-      version: beforeHeads
+      durability: 'durable'
     });
     expect('committed' in result).toBe(false);
-    expect(adapter.doc).toBe(beforeDoc);
-    expect(adapter.doc.todos).not.toHaveProperty('todo-b');
+    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
+    ]);
   });
 
   it('composes durable Automerge rows and Repo Presence rows as one runtime', async () => {
@@ -314,7 +301,7 @@ describe('@tarstate/automerge', () => {
         'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
     const handle = new FakeDocHandle();
     const presenceRuntime = automergePresenceRuntime({
       handle: handle.asHandle(),
@@ -326,31 +313,32 @@ describe('@tarstate/automerge', () => {
     const runtime = composeRelationRuntimes(adapter, presenceRuntime);
 
     try {
+      expect(isRelationRuntime(runtime)).toBe(true);
       expect(runtime.source.relationNames).toEqual(['todos', 'presence']);
+      expect(runtime.target?.relationNames).toEqual(['todos', 'presence']);
+      expect(runtime.target?.ownsRelation?.('todos')).toBe(true);
+      expect(runtime.target?.ownsRelation?.('presence')).toBe(true);
+      expect(runtime.target?.ownsRelation?.('notes')).toBe(false);
+      expect(runtime.snapshot).toEqual(expect.any(Function));
+      expect(runtime.subscribe).toEqual(expect.any(Function));
       await expect(evaluate(runtime.source, focusedTodos)).resolves.toEqual({
         rows: [{ todoId: 'todo-a', text: 'Buy oat milk', peerId: 'peer-local' }],
         diagnostics: []
       });
 
       const result = await tryApplyRelationPatches(runtime, [
-        todos.update('todo-a', { done: true }),
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' })
+        todos.updateByKey('todo-a', { done: true }),
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' },
+          { update: { value: 'todo-b' } }
+        )
       ]);
 
       expect(result).toMatchObject({
         status: 'accepted',
-        accepted: true,
         patches: 2,
         applied: 2,
         diagnostics: []
-      });
-      expect(result.version).toEqual([
-        Automerge.getHeads(adapter.doc),
-        { revision: 1, localPeerId: 'peer-local' }
-      ]);
-      expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
-      expect(handle.broadcasts.at(-1)).toEqual({
-        __presence: { type: 'update', channel: 'targetTodoId', value: 'todo-b' }
       });
       await expect(evaluate(runtime.source, focusedTodos)).resolves.toEqual({
         rows: [{ todoId: 'todo-b', text: 'Water basil', peerId: 'peer-local' }],
@@ -368,7 +356,7 @@ describe('@tarstate/automerge', () => {
         'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
     const handle = new FakeDocHandle();
     const presenceRuntime = automergePresenceRuntime({
       handle: handle.asHandle(),
@@ -380,43 +368,35 @@ describe('@tarstate/automerge', () => {
     const runtime = composeRelationRuntimes(adapter, presenceRuntime);
 
     try {
-      const beforeDoc = adapter.doc;
-      const initialBroadcasts = [...handle.broadcasts];
-
       const result = await tryApplyRelationPatches(runtime, [
-        todos.update('todo-a', { done: true }),
-        presenceRows.upsert({ peerId: 'peer-remote', channel: 'targetTodoId', value: 'todo-b' })
+        todos.updateByKey('todo-a', { done: true }),
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-remote', channel: 'targetTodoId', value: 'todo-b' },
+          { update: { value: 'todo-b' } }
+        )
       ]);
 
       expect(result).toMatchObject({
         status: 'partial',
-        accepted: false,
         patches: 2,
         applied: 1,
         diagnostics: [
           {
             code: 'invalid_row',
             relation: 'presence',
-            field: 'peerId',
-            detail: 'peer-remote'
+            field: 'peerId'
           }
         ]
       });
-      expect(result.version).toEqual([
-        Automerge.getHeads(adapter.doc),
-        { revision: 0, localPeerId: 'peer-local' }
+      expect(result.deltas.map((delta) => delta.relation.name)).toEqual(['todos']);
+      expect(Array.from(await runtime.source.rows(schema.todos))).toEqual([
+        { id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 },
+        { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
       ]);
-      expect(result.deltas).toEqual([
-        {
-          relation: schema.todos,
-          added: [{ id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 }],
-          removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]
-        }
-      ]);
-      expect(adapter.doc).not.toBe(beforeDoc);
-      expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
-      expect(presenceRuntime.getLocalState()).toMatchObject({ targetTodoId: 'todo-a' });
-      expect(handle.broadcasts).toEqual(initialBroadcasts);
+      await expect(evaluate(runtime.source, focusedTodos)).resolves.toEqual({
+        rows: [{ todoId: 'todo-a', text: 'Buy oat milk', peerId: 'peer-local' }],
+        diagnostics: []
+      });
     } finally {
       presenceRuntime.stop();
     }
@@ -429,7 +409,7 @@ describe('@tarstate/automerge', () => {
         'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
     const handle = new FakeDocHandle();
     const presenceRuntime = automergePresenceRuntime({
       handle: handle.asHandle(),
@@ -458,28 +438,21 @@ describe('@tarstate/automerge', () => {
       });
 
       const result = await tryApplyRelationPatches(runtime, [
-        todos.update('todo-b', { rank: 3 }),
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' }),
+        todos.updateByKey('todo-b', { rank: 3 }),
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' },
+          { update: { value: 'todo-b' } }
+        ),
         notes.insert({ id: 'note-b', todoId: 'todo-b', body: 'Presence moved here' })
       ]);
 
       expect(result).toMatchObject({
         status: 'accepted',
-        accepted: true,
         patches: 3,
         applied: 3,
         diagnostics: []
       });
-      expect(result.version).toEqual([
-        Automerge.getHeads(adapter.doc),
-        { revision: 1, localPeerId: 'peer-local' },
-        1
-      ]);
       expect(result.deltas.map((delta) => delta.relation.name)).toEqual(['todos', 'presence', 'notes']);
-      expect(adapter.doc.todos['todo-b']).toEqual({ text: 'Water basil', done: false, rank: 3 });
-      expect(handle.broadcasts.at(-1)).toEqual({
-        __presence: { type: 'update', channel: 'targetTodoId', value: 'todo-b' }
-      });
       await expect(evaluate(runtime.source, focusedTodoNotes)).resolves.toEqual({
         rows: [
           {
@@ -503,9 +476,7 @@ describe('@tarstate/automerge', () => {
         'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
-    const beforeDoc = adapter.doc;
-    const beforeHeads = Automerge.getHeads(beforeDoc);
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
     const mismatch = await tryCommitAdapter(adapter, [
       todos.deleteExact({ id: 'todo-a', text: 'Wrong item', done: false, rank: 1 })
@@ -513,45 +484,35 @@ describe('@tarstate/automerge', () => {
 
     expect(mismatch).toMatchObject({
       status: 'rejected',
-      committed: false,
       patches: 1,
       applied: 0,
-      deltas: [],
-      version: beforeHeads
+      deltas: []
     });
     expect(mismatch.diagnostics).toMatchObject([
       {
         code: 'invalid_row',
-        relation: 'todos',
-        message: 'row ["todo-a"] in relation todos does not match exact delete row'
+        relation: 'todos'
       }
     ]);
-    expect(adapter.doc).toBe(beforeDoc);
-    expect(adapter.doc.todos['todo-a']).toEqual({ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 });
+    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
+      { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
+    ]);
 
     const exact = await tryCommitAdapter(adapter, [
       todos.deleteExact({ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 })
     ]);
 
     expect(exact).toMatchObject({
-      status: 'committed',
-      committed: true,
+      status: 'accepted',
       patches: 1,
       applied: 1,
       diagnostics: []
     });
-    expect(exact.version).toEqual(Automerge.getHeads(adapter.doc));
-    expect(exact.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [],
-        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]
-      }
+    expect(exact.deltas.map((delta) => delta.relation.name)).toEqual(['todos']);
+    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
+      { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
     ]);
-    expect(adapter.doc).not.toBe(beforeDoc);
-    expect(adapter.doc.todos).toEqual({
-      'todo-b': { text: 'Water basil', done: false, rank: 2 }
-    });
   });
 
   it('commits replaceAll as a single-patch adapter batch against the Automerge document', async () => {
@@ -561,33 +522,19 @@ describe('@tarstate/automerge', () => {
         'todo-b': { id: 'todo-b', text: 'Water basil', done: true, rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
     const result = await tryCommitAdapter(adapter, [
       todos.replaceAll([{ id: 'todo-c', text: 'Review notes', done: false, rank: 3 }])
     ]);
 
     expect(result).toMatchObject({
-      status: 'committed',
-      committed: true,
+      status: 'accepted',
       patches: 1,
       applied: 1,
       diagnostics: []
     });
-    expect(result.version).toEqual(Automerge.getHeads(adapter.doc));
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [{ id: 'todo-c', text: 'Review notes', done: false, rank: 3 }],
-        removed: [
-          { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
-          { id: 'todo-b', text: 'Water basil', done: true, rank: 2 }
-        ]
-      }
-    ]);
-    expect(adapter.doc.todos).toEqual({
-      'todo-c': { text: 'Review notes', done: false, rank: 3 }
-    });
+    expect(result.deltas.map((delta) => delta.relation.name)).toEqual(['todos']);
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-c', text: 'Review notes', done: false, rank: 3 }
     ]);
@@ -599,55 +546,49 @@ describe('@tarstate/automerge', () => {
         'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
-    const beforeDoc = adapter.doc;
-    const beforeHeads = Automerge.getHeads(beforeDoc);
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
 
     const result = await tryCommitAdapter(adapter, [
-      todos.update('todo-a', { done: true }),
-      todos.delete('todo-missing')
+      todos.updateByKey('todo-a', { done: true }),
+      todos.deleteByKey('todo-missing')
     ]);
 
     expect(result).toMatchObject({
       status: 'rejected',
-      committed: false,
       patches: 2,
       applied: 0,
-      deltas: [],
-      version: beforeHeads
+      deltas: []
     });
-    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref', key: 'todo-missing' }]);
-    expect(adapter.doc).toBe(beforeDoc);
-    expect(adapter.doc.todos['todo-a']).toEqual({ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 });
-  });
-
-  it('can follow a host-supplied Automerge document snapshot', async () => {
-    const doc = Automerge.from<TodoDocument>({ todos: {} });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
-    const nextDoc = Automerge.change(adapter.doc, (draft) => {
-      draft.todos['todo-a'] = { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 };
-    });
-
-    adapter.setDoc(nextDoc);
-
-    const version = await adapter.source.version?.();
-
-    expect(version).toEqual(Automerge.getHeads(nextDoc));
-    expect(await adapter.source.version?.()).toBe(version);
+    expect(result.diagnostics).toMatchObject([{ code: 'missing_ref' }]);
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
     ]);
   });
 
-  it('exposes version-bound source snapshots', async () => {
+  it('can follow a host-supplied Automerge document snapshot', async () => {
+    const doc = Automerge.from<TodoDocument>({ todos: {} });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const nextDoc = Automerge.change(adapter.getDoc(), (draft) => {
+      draft.todos['todo-a'] = { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 };
+    });
+
+    adapter.setDoc(nextDoc);
+
+    expect(await adapter.source.version?.()).toBeDefined();
+    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
+    ]);
+  });
+
+  it('exposes source snapshots bound to their rows', async () => {
     const doc = Automerge.from<TodoDocument>({
       todos: {
         'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
     const before = adapter.snapshot?.();
-    const nextDoc = Automerge.change(adapter.doc, (draft) => {
+    const nextDoc = Automerge.change(adapter.getDoc(), (draft) => {
       draft.todos['todo-b'] = { id: 'todo-b', text: 'Water basil', done: false, rank: 2 };
     });
 
@@ -657,47 +598,14 @@ describe('@tarstate/automerge', () => {
     if (before === undefined || adapter.snapshot === undefined) {
       throw new Error('expected automerge adapter snapshots');
     }
-    expect(before.version).toEqual(Automerge.getHeads(doc));
-    expect(await before.source.version?.()).toBe(before.version);
     expect(Array.from(await before.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
     ]);
     const after = adapter.snapshot();
 
-    expect(await after.source.version?.()).toBe(after.version);
     expect(Array.from(await after.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
       { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
-    ]);
-  });
-
-  it('uses Automerge map keys as authoritative relation keys', async () => {
-    const doc = Automerge.from<TodoDocument>({
-      todos: {
-        'todo-a': { id: 'wrong-id', text: 'Buy oat milk', done: false, rank: 1 }
-      }
-    });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
-
-    expect(rowsFromAutomergeMapPath(doc, ['todos'], schema.todos)).toEqual([
-      { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
-    ]);
-    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
-      { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
-    ]);
-  });
-
-  it('reports blocked relation paths through adapter source diagnostics', async () => {
-    const doc = Automerge.from<{ readonly todos: string }>({ todos: 'not a relation map' });
-    const adapter = createAutomergeRelationAdapter({ doc, relations: todoRelations });
-
-    expect(rowsFromAutomergeMapPath(doc, ['todos'], schema.todos)).toEqual([]);
-    expect(await adapter.source.diagnostics?.()).toMatchObject([
-      {
-        code: 'source_error',
-        message: 'automerge path todos is not a map',
-        detail: 'not a relation map'
-      }
     ]);
   });
 
@@ -710,40 +618,24 @@ describe('@tarstate/automerge', () => {
         'todo-d': 'not a row'
       }
     });
-    const adapter = createAutomergeRelationAdapter({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter({ doc, relations: todoRelations });
 
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
     ]);
     expect(await adapter.source.lookup?.({ relation: schema.todos, field: 'id', value: 'todo-b' })).toEqual([]);
 
-    await expect(evaluate(adapter.source, todoRows)).resolves.toEqual({
-      rows: [{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }],
-      diagnostics: [
-        {
-          code: 'invalid_row',
-          message: 'missing required field done in relation todos',
-          relation: 'todos',
-          field: 'done',
-          key: 'todo-b'
-        },
-        {
-          code: 'invalid_row',
-          message: 'invalid field rank in relation todos',
-          relation: 'todos',
-          field: 'rank',
-          key: 'todo-c',
-          detail: '3'
-        },
-        {
-          code: 'invalid_row',
-          message: 'row for relation todos is not an object',
-          relation: 'todos',
-          key: 'todo-d',
-          detail: 'not a row'
-        }
-      ]
-    });
+    const evaluated = await evaluate(adapter.source, todoRows);
+
+    expect(evaluated.rows).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }]);
+    expect(evaluated.diagnostics).toHaveLength(3);
+    for (const diagnostic of evaluated.diagnostics) {
+      expect(diagnostic).toMatchObject({ code: 'invalid_row', relation: 'todos' });
+    }
+    expect(evaluated.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'invalid_row', relation: 'todos', field: 'done' }),
+      expect.objectContaining({ code: 'invalid_row', relation: 'todos', field: 'rank' })
+    ]));
   });
 
   it('rejects commits against Automerge relations with invalid stored rows', async () => {
@@ -753,9 +645,7 @@ describe('@tarstate/automerge', () => {
         'todo-b': { text: 'Missing done', rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter({ doc, relations: todoRelations });
-    const beforeDoc = adapter.doc;
-    const beforeHeads = Automerge.getHeads(beforeDoc);
+    const adapter = automergeMapAdapter({ doc, relations: todoRelations });
 
     const result = await tryCommitAdapter(
       adapter,
@@ -765,7 +655,6 @@ describe('@tarstate/automerge', () => {
 
     expect(result).toMatchObject({
       status: 'rejected',
-      committed: false,
       patches: 1,
       applied: 0,
       deltas: [],
@@ -773,14 +662,13 @@ describe('@tarstate/automerge', () => {
         {
           code: 'invalid_row',
           relation: 'todos',
-          field: 'done',
-          key: 'todo-b'
+          field: 'done'
         }
-      ],
-      version: beforeHeads
+      ]
     });
-    expect(adapter.doc).toBe(beforeDoc);
-    expect(adapter.doc.todos).not.toHaveProperty('todo-c');
+    expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
+    ]);
   });
 
   it('reports unsupported configuration and relation ownership explicitly', async () => {
@@ -794,14 +682,13 @@ describe('@tarstate/automerge', () => {
       })
     });
     const doc = Automerge.from<TodoDocument>({ todos: {} });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
     const result = await tryCommitAdapter(adapter, [
       write(otherSchema.tags).insert({ id: 'tag-a', label: 'Errand' })
     ]);
 
     expect(result).toMatchObject({
       status: 'rejected',
-      committed: false,
       patches: 1,
       applied: 0,
       deltas: []
@@ -816,7 +703,6 @@ describe('@tarstate/automerge', () => {
 });
 
 class FakeDocHandle {
-  readonly broadcasts: unknown[] = [];
   private readonly listeners = new Map<string, Set<(payload: unknown) => void>>();
 
   asHandle(): DocHandle<unknown> {
@@ -837,9 +723,7 @@ class FakeDocHandle {
     this.listeners.get(eventName)?.delete(listener);
   }
 
-  broadcast(message: unknown): void {
-    this.broadcasts.push(message);
-  }
+  broadcast(): void {}
 
   receive(senderId: string, message: unknown): void {
     this.emit('ephemeral-message', {

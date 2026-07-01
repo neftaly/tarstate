@@ -1,11 +1,7 @@
+import type { RelationDelta } from './adapter.js';
 import type { RelationRef } from './schema.js';
 
-/** Rows added to or removed from one relation by a committed change. */
-export type RelationDelta<Relation extends RelationRef = RelationRef> = {
-  readonly relation: Relation;
-  readonly added: readonly unknown[];
-  readonly removed: readonly unknown[];
-};
+export type { RelationDelta } from './adapter.js';
 
 type RelationDeltaInput<Relation extends RelationRef = RelationRef> =
   | Iterable<RelationDelta<Relation>>

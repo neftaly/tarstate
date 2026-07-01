@@ -26,8 +26,9 @@ const source = composeSources(durable.source, presence.source)
 ```
 
 Write-capable composition uses `composeRelationRuntimes`. It composes sources
-and routes each patch to the single target whose source declares ownership of
-that relation in `relationNames`.
+and routes each patch to the single target whose patch target declares ownership
+with `target.relationNames` or `target.ownsRelation`; read-side
+`source.relationNames` is only a compatibility fallback.
 
 ```ts
 const runtime = composeRelationRuntimes(durableRuntime, presenceRuntime)
@@ -55,12 +56,18 @@ const focusedObjects = pipe(
 const rows = await evaluate(runtime.source, focusedObjects)
 
 await tryApplyRelationPatches(runtime, [
-  write(schema.objects).upsert({ id: 'object-a', title: 'Proposal' }),
-  write(schema.presence).upsert({
-    peerId: 'peer-a',
-    channel: 'selection',
-    targetObjectId: 'object-a',
-  }),
+  write(schema.objects).insertOrUpdate(
+    { id: 'object-a', title: 'Proposal' },
+    { update: { title: 'Proposal' } }
+  ),
+  write(schema.presence).insertOrUpdate(
+    {
+      peerId: 'peer-a',
+      channel: 'selection',
+      targetObjectId: 'object-a',
+    },
+    { update: { targetObjectId: 'object-a' } }
+  ),
 ])
 ```
 
@@ -88,7 +95,7 @@ the durable Automerge map adapter.
 - Presence rows are ordinary relation rows and can join with document rows.
 - The current runtime exposes one row per peer/channel, with configurable field
   names for peer id, channel, value, timestamps, and the local marker.
-- Local presence updates are modeled as `insert`, `upsert`, `delete`, or
+- Local presence updates are modeled as `insert`, `insertOrUpdate`, `delete`, or
   `replaceAll` patches over an ephemeral relation.
 - The Automerge Repo Presence API does not expose a delete-channel command. This
   runtime maps cleared channels to `broadcast(channel, undefined)` by default
@@ -124,10 +131,16 @@ The current map adapter stays durable and compatibility-oriented:
 - It exposes `RelationAdapter<Automerge.Heads>`.
 - It exposes `target.apply` by bridging its durable `commit` result into
   relation-runtime apply semantics, with `durability: 'durable'`.
+- It is a low-level raw-document adapter. Automerge Repo handles should wrap it,
+  call `setDoc` when the host document changes, and rely on `subscribe` for
+  Tarstate store invalidation.
+- It freezes the `map-v1` persisted shape: row keys are Automerge map keys,
+  tuple or non-string keys are JSON strings, and stored row values omit key
+  fields.
 - Its `source` filters invalid stored rows from reads and reports diagnostics.
 - Its `commit` rejects writes touching relations that already contain invalid
   stored rows.
 - It does not import Automerge Repo or Presence APIs.
 
 The Repo Presence runtime lives beside it in
-`packages/automerge/src/presence.ts` and is exported from `index.ts`.
+`@tarstate/automerge/presence`; keep it split from the root map-adapter subpath.

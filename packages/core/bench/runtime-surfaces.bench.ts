@@ -6,7 +6,7 @@ import {
   req,
   tryTransactConstrained,
   unique
-} from '@tarstate/core/constraints';
+} from '@tarstate/core/experimental/constraints';
 import { createDb, tryTransact, type Db } from '@tarstate/core/db';
 import {
   maintainMaterializationSnapshots,
@@ -14,7 +14,7 @@ import {
   type MaterializationMaintenanceResult,
   materializeSnapshot,
   refreshMaterializationSnapshot
-} from '@tarstate/core/materialization';
+} from '@tarstate/core/experimental/materialization';
 import {
   aggregate,
   any,
@@ -37,10 +37,10 @@ import {
   sum,
   where
 } from '@tarstate/core/query';
-import { trackTransact } from '@tarstate/core/runtime';
+import { trackTransact } from '@tarstate/core/experimental/runtime';
 import { defineSchema, idField, numberField, refField, relation, stringField } from '@tarstate/core/schema';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
-import { diffQuery, subscribeWatch, watch } from '@tarstate/core/watch';
+import { diffQuery, subscribeWatch, watch } from '@tarstate/core/experimental/watch';
 import { write } from '@tarstate/core/write';
 
 type Todo = {
@@ -165,7 +165,7 @@ async function prepareEqualityJoinMaintenanceState(): Promise<EqualityJoinMainte
 
   await materializeSnapshot(previous, todoAssignments, { id: 'todo-assignments', mode: 'incremental' });
   const transaction = tryTransact(previous, [
-    assignmentWriter.update('assignment-750', { assignee: 'Ari' })
+    assignmentWriter.updateByKey('assignment-750', { assignee: 'Ari' })
   ]);
 
   if (transaction.diagnostics.length > 0) {
@@ -194,7 +194,7 @@ async function prepareSortedQueryMaintenanceState(): Promise<SortedQueryMaintena
 
   await materializeSnapshot(previous, sortedTodos, { id: 'sorted-todos', mode: 'incremental' });
   const transaction = tryTransact(previous, [
-    todoWriter.update('todo-250', { rank: 1_250 })
+    todoWriter.updateByKey('todo-250', { rank: 1_250 })
   ]);
 
   if (transaction.diagnostics.length > 0) {
@@ -334,7 +334,7 @@ describe('runtime surfaces', () => {
     await materializeSnapshot(db, highRankSummary, { id: 'high-rank-summary', mode: 'incremental' });
     const transaction = tryTransact(db, [
       todoWriter.insert({ id: 'todo-extra', text: 'Extra todo', rank: 1_010 }),
-      todoWriter.update('todo-750', { rank: 760 })
+      todoWriter.updateByKey('todo-750', { rank: 760 })
     ]);
     await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
   });
@@ -344,7 +344,7 @@ describe('runtime surfaces', () => {
 
     await materializeSnapshot(db, todoAssignments, { id: 'todo-assignments', mode: 'incremental' });
     const transaction = tryTransact(db, [
-      assignmentWriter.update('assignment-750', { assignee: 'Ari' })
+      assignmentWriter.updateByKey('assignment-750', { assignee: 'Ari' })
     ]);
     await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
   });
@@ -475,8 +475,8 @@ describe('runtime surfaces', () => {
 
     await trackTransact(db, (current) =>
       tryTransact(current, [
-        todoWriter.update('todo-750', { text: 'Todo 750 updated' }),
-        todoWriter.delete('todo-751')
+        todoWriter.updateByKey('todo-750', { text: 'Todo 750 updated' }),
+        todoWriter.deleteByKey('todo-751')
       ])
     );
     handle.unwatch();

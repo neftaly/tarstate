@@ -9,7 +9,7 @@ import type {
 } from '@tarstate/core/adapter';
 import type { RelationRangeLookup } from '@tarstate/core/source';
 import { isJsonValue, type FieldSpec, type RelationRef } from '@tarstate/core/schema';
-import { applyWritesAtomic, type MutableObjectSourceData } from '@tarstate/core/write-apply';
+import { applyWritesAtomic, type MutableObjectSourceData } from '@tarstate/core/experimental/write-apply';
 import type { WritePatch } from '@tarstate/core/write';
 
 export type AutomergePresenceVersion = {
@@ -47,18 +47,30 @@ export type AutomergePresenceRuntimeOptions<
   readonly isClearedValue?: AutomergePresenceClearedValue;
 };
 
+export type AutomergePresenceWritableRuntimeOptions<
+  State extends PresenceState = PresenceState,
+  DocType = unknown
+> = AutomergePresenceRuntimeOptions<State, DocType> & {
+  readonly localPeerId: string;
+};
+
 export type AutomergePresenceRuntime<State extends PresenceState = PresenceState> =
   RelationRuntime<AutomergePresenceVersion> & {
     readonly presence: Presence<State>;
     readonly relation: RelationRef;
     readonly fields: AutomergePresenceFieldNames;
     readonly snapshot: () => AdapterSnapshot<AutomergePresenceVersion>;
-    readonly target: RelationPatchTarget<AutomergePresenceVersion>;
+    readonly target?: RelationPatchTarget<AutomergePresenceVersion>;
     readonly subscribe: (listener: () => void) => () => void;
     readonly start: () => void;
     readonly stop: () => void;
     readonly getLocalState: () => State;
     readonly getPeerStates: () => readonly PeerState<State>[];
+  };
+
+export type AutomergePresenceWritableRuntime<State extends PresenceState = PresenceState> =
+  AutomergePresenceRuntime<State> & {
+    readonly target: RelationPatchTarget<AutomergePresenceVersion>;
   };
 
 type PresenceRow = Record<string, unknown>;
@@ -99,11 +111,13 @@ export function defaultAutomergePresenceClearedValue(value: unknown): boolean {
 export function automergePresenceRuntime<
   State extends PresenceState = PresenceState,
   DocType = unknown
+>(options: AutomergePresenceWritableRuntimeOptions<State, DocType>): AutomergePresenceWritableRuntime<State>;
+export function automergePresenceRuntime<
+  State extends PresenceState = PresenceState,
+  DocType = unknown
 >(options: AutomergePresenceRuntimeOptions<State, DocType>): AutomergePresenceRuntime<State> {
   return new AutomergePresenceRuntimeImpl(options);
 }
-
-export const createAutomergePresenceRuntime = automergePresenceRuntime;
 
 class AutomergePresenceRuntimeImpl<
   State extends PresenceState,
@@ -113,10 +127,7 @@ class AutomergePresenceRuntimeImpl<
   readonly relation: RelationRef;
   readonly fields: AutomergePresenceFieldNames;
   readonly source: AdapterSource<AutomergePresenceVersion>;
-  readonly target = {
-    apply: (patches: readonly WritePatch[]): RelationApplyResult<AutomergePresenceVersion> =>
-      this.apply(patches)
-  };
+  readonly target?: RelationPatchTarget<AutomergePresenceVersion>;
 
   private localState: State;
   private readonly options: NormalizedPresenceOptions;
@@ -142,6 +153,14 @@ class AutomergePresenceRuntimeImpl<
       isClearedValue: options.isClearedValue ?? defaultAutomergePresenceClearedValue,
       ...(options.localPeerId === undefined ? {} : { localPeerId: options.localPeerId })
     };
+    if (this.options.localPeerId !== undefined) {
+      this.target = {
+        relationNames: [this.relation.name],
+        ownsRelation: (relationName: string) => relationName === this.relation.name,
+        apply: (patches: readonly WritePatch[]): RelationApplyResult<AutomergePresenceVersion> =>
+          this.apply(patches)
+      };
+    }
     this.startOptions = {
       ...(options.heartbeatMs === undefined ? {} : { heartbeatMs: options.heartbeatMs }),
       ...(options.peerTtlMs === undefined ? {} : { peerTtlMs: options.peerTtlMs })
@@ -302,7 +321,6 @@ class AutomergePresenceRuntimeImpl<
 
     return {
       status: 'accepted',
-      accepted: true,
       patches: patches.length,
       applied: applied.applied,
       deltas: applied.deltas,
@@ -745,7 +763,6 @@ function rejectedApplyResult(
 ): RelationApplyResult<AutomergePresenceVersion> {
   return {
     status: 'rejected',
-    accepted: false,
     patches,
     applied: 0,
     deltas: [],

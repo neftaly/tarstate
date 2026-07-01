@@ -1,8 +1,8 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { as, eq, from, pipe, project, where } from '@tarstate/core/query';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
-import { createStore, type Store, type StoreView } from '@tarstate/core/store';
-import { write, type WritePatch } from '@tarstate/core/write';
+import { createStore, type Store, type StoreCommitInput, type StoreView } from '@tarstate/core/store';
+import { write } from '@tarstate/core/write';
 
 type Todo = {
   readonly id: string;
@@ -43,7 +43,7 @@ describe('tarstate store facade', () => {
     });
 
     expectTypeOf(store).toMatchTypeOf<Store>();
-    expectTypeOf(store.commit).parameter(0).toMatchTypeOf<WritePatch | Iterable<WritePatch>>();
+    expectTypeOf(store.commit).parameter(0).toMatchTypeOf<StoreCommitInput>();
     await expect(store.query(openTodos)).resolves.toEqual({
       rows: [{ id: 'todo-a', title: 'Alpha' }],
       diagnostics: []
@@ -55,9 +55,6 @@ describe('tarstate store facade', () => {
       kind: 'tarstateCommit',
       status: 'rejected',
       reflected: false,
-      fullyCommitted: false,
-      committed: false,
-      applied: 0
     });
     expect(revisions).toEqual([]);
     expect(store.getSnapshot().revision).toBe(0);
@@ -68,11 +65,8 @@ describe('tarstate store facade', () => {
 
     expect(committed).toMatchObject({
       kind: 'tarstateCommit',
-      status: 'committed',
+      status: 'accepted',
       reflected: true,
-      fullyCommitted: true,
-      committed: true,
-      applied: 1
     });
     expect(committed.snapshot.revision).toBe(1);
     expect(revisions).toEqual([1]);
@@ -84,43 +78,21 @@ describe('tarstate store facade', () => {
     unsubscribe();
   });
 
-  it('treats materialized views as a cache behind the same read API', async () => {
+  it('reads derived views through one stable view API', async () => {
     const store = createStore({
       todos: [
         { id: 'todo-a', title: 'Alpha', done: false },
         { id: 'todo-b', title: 'Beta', done: true }
       ]
     });
-    const view = store.view(openTodos, { id: 'open-todos', mode: 'incremental' });
+    const view = store.view(openTodos);
 
     expectTypeOf(view).toMatchTypeOf<StoreView<{ readonly id: string; readonly title: string }>>();
     await expect(view.rows()).resolves.toEqual([{ id: 'todo-a', title: 'Alpha' }]);
 
-    const materialized = await view.materialize();
+    await store.commit(todos.updateByKey('todo-a', { done: true }));
 
-    expect(materialized).toMatchObject({
-      kind: 'storeMaterialization',
-      materialized: true,
-      rows: [{ id: 'todo-a', title: 'Alpha' }],
-      metadata: {
-        id: 'open-todos',
-        requestedMode: 'incremental',
-        maintenance: 'incremental'
-      }
-    });
-    expect(view.materialization()).toMatchObject({ id: 'open-todos' });
-
-    const committed = await store.commit(todos.update('todo-a', { done: true }));
-
-    expect(committed.materializations).toMatchObject({
-      maintained: 1,
-      changes: [{ id: 'open-todos', maintenance: 'incremental' }]
-    });
     await expect(view.read()).resolves.toEqual({
-      rows: [],
-      diagnostics: []
-    });
-    await expect(view.read({ cache: 'ignore-cache' })).resolves.toEqual({
       rows: [],
       diagnostics: []
     });

@@ -16,48 +16,31 @@ import {
   type AdapterCommitStatus,
   type AdapterSource,
   type RelationAdapter,
-  type RelationApply,
   type RelationApplyDurability,
+  type RelationDelta,
   type RelationApplyResult,
   type RelationPatchTarget,
   type RelationRuntime
 } from '@tarstate/core/adapter';
-import {
-  attachConstraints,
-  hasAttachedConstraints,
-  tryTransactConstrained,
-  type ConstraintAttachmentInput
-} from '@tarstate/core/constraints';
 import type { TarstateDiagnostic } from '@tarstate/core/diagnostics';
-import type { RelationDelta } from '@tarstate/core/delta';
 import { createDb, dbSource, tryTransact, type Db, type DbInputData } from '@tarstate/core/db';
 import { evaluate, type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
-import {
-  materializationsFor,
-  maintainMaterializationSnapshots,
-  readMaterializedQuery,
-  type MaterializationDiagnostic,
-  type MaterializationMaintenanceResult
-} from '@tarstate/core/materialization';
 import { queryKey, type Query } from '@tarstate/core/query';
-import { trackTransact } from '@tarstate/core/runtime';
 import type { MaybePromise, RelationSource } from '@tarstate/core/source';
-export { createStore } from '@tarstate/core/store';
-export type {
-  Store,
-  StoreCommitResult,
-  StoreDiagnostic,
-  StoreMaterializationResult,
-  StoreOptions,
-  StoreQueryResult,
-  StoreSnapshot,
-  StoreView,
-  StoreViewOptions
+import type {
+  StoreCommitInput as CoreStoreCommitInput,
+  StoreCommitResult as CoreStoreCommitResult
 } from '@tarstate/core/store';
-import type { TrackedChange, WatchRuntimeDiagnostic } from '@tarstate/core/watch';
-import type { WritePatch } from '@tarstate/core/write';
+import { writeInputPatches, type WritePatch } from '@tarstate/core/write';
 
-export type TarstateReactDiagnostic = MaterializationDiagnostic | WatchRuntimeDiagnostic;
+export type TarstateReactDiagnostic = TarstateDiagnostic | {
+  readonly code: string;
+  readonly message: string;
+  readonly relation?: string;
+  readonly field?: string;
+  readonly key?: string;
+  readonly detail?: unknown;
+};
 
 export type QueryBatch = Record<string, Query>;
 export type QueryBatchResult<Queries extends QueryBatch> = {
@@ -83,34 +66,15 @@ export type TarstateDbSnapshot = TarstateSnapshot & {
   readonly db: Db;
 };
 
-export type TarstateCommitResult<Snapshot extends TarstateSnapshot = TarstateSnapshot> = {
-  readonly kind: 'tarstateCommit';
-  readonly status: AdapterCommitStatus;
-  /** True when any patch effects were reflected in the backing store. */
-  readonly reflected: boolean;
-  /** True when the full patch batch was accepted. */
-  readonly fullyCommitted: boolean;
-  readonly committed: boolean;
-  readonly patches: number;
-  readonly applied: number;
-  readonly deltas: readonly RelationDelta[];
-  readonly changes?: readonly TrackedChange[];
-  readonly durability?: RelationApplyDurability;
-  readonly materializations?: MaterializationMaintenanceResult;
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-  readonly snapshot: Snapshot;
-};
+export type TarstateCommitResult<Snapshot extends TarstateSnapshot = TarstateSnapshot> =
+  CoreStoreCommitResult<Snapshot, TarstateReactDiagnostic>;
+export type TarstateCommitInput = CoreStoreCommitInput;
 
 export type TarstateStore<Snapshot extends TarstateSnapshot = TarstateSnapshot> = {
   readonly getSnapshot: () => Snapshot;
   readonly subscribe: (listener: () => void) => () => void;
-  readonly commit: (patches: Iterable<WritePatch>) => Promise<TarstateCommitResult<Snapshot>>;
+  readonly commit: (patches: TarstateCommitInput) => Promise<TarstateCommitResult<Snapshot>>;
   readonly refresh: () => Promise<void>;
-};
-
-export type DbStoreOptions = {
-  /** Attach constraints to the object-backed Db used by this store. */
-  readonly constraints?: ConstraintAttachmentInput;
 };
 
 export type SourceStoreSnapshot<Version = unknown> = {
@@ -128,8 +92,10 @@ export type SourceStoreOptions<Version = unknown> = {
   readonly getSnapshot?: () => SourceStoreSnapshotInput<Version>;
   readonly subscribe?: (listener: () => void) => () => void;
   readonly getVersion?: () => MaybePromise<Version>;
+};
+
+type WritableSourceStoreOptions<Version = unknown> = SourceStoreOptions<Version> & {
   readonly target?: RelationPatchTarget<Version>;
-  readonly apply?: RelationApply<Version>;
   readonly commit?: (patches: readonly WritePatch[]) => MaybePromise<AdapterCommitResult<Version>>;
 };
 
@@ -170,13 +136,9 @@ const emptyDiagnostics = Object.freeze([]) as readonly never[];
 type QueryRelation = Query['relations'][string];
 
 export function createDbStore(
-  input: Db | DbInputData = createDb(),
-  options: DbStoreOptions = {}
+  input: Db | DbInputData = createDb()
 ): TarstateStore<TarstateDbSnapshot> {
   let db = isDb(input) ? input : createDb(input);
-  if (options.constraints !== undefined) {
-    db = attachConstraints(db, options.constraints);
-  }
 
   let revision = 0;
   let snapshot = dbSnapshot(db, revision, []);
@@ -205,42 +167,37 @@ export function createDbStore(
       };
     },
     commit: async (patches) => {
-      const patchList = Array.from(patches);
-      const result = hasAttachedConstraints(db)
-        ? await tryTransactConstrained(db, patchList)
-        : tryTransact(db, patchList);
+      const patchList = Array.from(writeInputPatches(patches));
+      const result = tryTransact(db, patchList);
 
       if (!result.committed) {
         return {
           kind: 'tarstateCommit',
           status: 'rejected',
           reflected: false,
-          fullyCommitted: false,
-          committed: false,
-          patches: result.patches,
-          applied: result.applied,
-          deltas: result.deltas,
+          effects: {
+            patches: result.patches,
+            applied: result.applied,
+            deltas: result.deltas
+          },
           diagnostics: result.diagnostics,
           snapshot
         };
       }
 
-      const tracked = await trackTransact(db, () => result);
-      const nextSnapshot = setDb(tracked.db, tracked.diagnostics);
+      const nextSnapshot = setDb(result.db, result.diagnostics);
       const reflected = commitReflected(result.deltas);
 
       return {
         kind: 'tarstateCommit',
-        status: 'committed',
+        status: 'accepted',
         reflected,
-        fullyCommitted: true,
-        committed: true,
-        patches: result.patches,
-        applied: result.applied,
-        deltas: tracked.deltas,
-        changes: tracked.changes,
-        ...(tracked.materializations === undefined ? {} : { materializations: tracked.materializations }),
-        diagnostics: tracked.diagnostics,
+          effects: {
+            patches: result.patches,
+            applied: result.applied,
+            deltas: result.deltas
+          },
+        diagnostics: result.diagnostics,
         snapshot: nextSnapshot
       };
     },
@@ -257,27 +214,23 @@ export function createDbStore(
 export function createAdapterStore<Version>(
   adapter: RelationAdapter<Version>
 ): TarstateStore<TarstateSnapshot<Version>> {
-  return createSourceStore({
-    getSource: () => adapter.source,
-    getSnapshot: () => adapter.snapshot?.() ?? adapter.source,
-    ...(adapter.subscribe === undefined ? {} : { subscribe: adapter.subscribe }),
-    ...(adapter.target === undefined ? { commit: adapter.commit } : { target: adapter.target })
-  });
+  return createSourceStoreInternal(sourceStoreOptionsForAdapter(adapter));
 }
 
 export function createRuntimeStore<Version>(
   runtime: RelationRuntime<Version>
 ): TarstateStore<TarstateSnapshot<Version>> {
-  return createSourceStore({
-    getSource: () => runtime.source,
-    getSnapshot: () => runtime.snapshot?.() ?? runtime.source,
-    ...(runtime.subscribe === undefined ? {} : { subscribe: runtime.subscribe }),
-    ...(runtime.target === undefined ? {} : { target: runtime.target })
-  });
+  return createSourceStoreInternal(sourceStoreOptionsForRuntime(runtime));
 }
 
 export function createSourceStore<Version = unknown>(
   options: SourceStoreOptions<Version>
+): TarstateStore<TarstateSnapshot<Version>> {
+  return createSourceStoreInternal(options);
+}
+
+function createSourceStoreInternal<Version = unknown>(
+  options: WritableSourceStoreOptions<Version>
 ): TarstateStore<TarstateSnapshot<Version>> {
   let revision = 0;
   const initialSnapshot = sourceSnapshotInput(options);
@@ -322,11 +275,7 @@ export function createSourceStore<Version = unknown>(
 
   const refresh = async (): Promise<void> => {
     const refreshedSnapshot = await readSnapshot(revision + 1);
-    const maintainedSnapshot = await maintainSourceSnapshotMaterializations(
-      snapshot.source,
-      refreshedSnapshot
-    );
-    snapshot = maintainedSnapshot.snapshot;
+    snapshot = refreshedSnapshot;
     revision = snapshot.revision;
     notify();
   };
@@ -357,8 +306,7 @@ export function createSourceStore<Version = unknown>(
       };
     },
     commit: async (patches) => {
-      const patchList = Array.from(patches);
-      const previousSnapshot = snapshot;
+      const patchList = Array.from(writeInputPatches(patches));
 
       const target = relationTargetForOptions(options);
 
@@ -372,18 +320,17 @@ export function createSourceStore<Version = unknown>(
           kind: 'tarstateCommit',
           status: 'rejected',
           reflected: false,
-          fullyCommitted: false,
-          committed: false,
-          patches: patchList.length,
-          applied: 0,
-          deltas: [],
+          effects: {
+            patches: patchList.length,
+            applied: 0,
+            deltas: []
+          },
           diagnostics: [diagnostic],
           snapshot
         };
       }
 
       commitDepth += 1;
-      let reportedDeltas: readonly RelationDelta[] | undefined;
       const result = await (async () => {
         try {
           return target === undefined
@@ -391,11 +338,9 @@ export function createSourceStore<Version = unknown>(
                 {
                   source: adapterSource(options.getSource(), options.getVersion),
                   commit: async (nextPatches) => {
-                    const commitResult = await (
-                      options.commit as NonNullable<SourceStoreOptions<Version>['commit']>
+                    return await (
+                      options.commit as NonNullable<WritableSourceStoreOptions<Version>['commit']>
                     )(nextPatches);
-                    reportedDeltas = ownRelationDeltas(commitResult);
-                    return commitResult;
                   }
                 },
                 patchList,
@@ -406,9 +351,7 @@ export function createSourceStore<Version = unknown>(
                   source: adapterSource(options.getSource(), options.getVersion),
                   target: {
                     apply: async (nextPatches) => {
-                      const applyResult = await target.apply(nextPatches);
-                      reportedDeltas = ownRelationDeltas(applyResult);
-                      return applyResult;
+                      return await target.apply(nextPatches);
                     }
                   }
                 },
@@ -420,22 +363,13 @@ export function createSourceStore<Version = unknown>(
         }
       })();
 
-      let maintenance: MaterializationMaintenanceResult | undefined;
-      let changes: readonly TrackedChange[] | undefined;
       let diagnostics: readonly TarstateReactDiagnostic[] = result.diagnostics;
 
       if (result.status !== 'rejected') {
         hostRefreshQueued = false;
         const refreshedSnapshot = await readSnapshot(revision + 1, result.diagnostics, result.version);
-        const trackedSnapshot = await trackSourceSnapshotCommit(
-          previousSnapshot.source,
-          refreshedSnapshot,
-          reportedDeltas === undefined ? undefined : result.deltas
-        );
-        maintenance = trackedSnapshot.materializations;
-        changes = trackedSnapshot.changes;
-        diagnostics = [...result.diagnostics, ...trackedSnapshot.diagnostics];
-        snapshot = trackedSnapshot.snapshot;
+        diagnostics = refreshedSnapshot.diagnostics;
+        snapshot = refreshedSnapshot;
         revision = snapshot.revision;
         notify();
       } else if (hostRefreshQueued) {
@@ -447,14 +381,12 @@ export function createSourceStore<Version = unknown>(
         kind: 'tarstateCommit',
         status: tarstateStatusForApplyResult(result),
         reflected: commitReflected(result.deltas),
-        fullyCommitted: tarstateFullyCommitted(result),
-        committed: tarstateFullyCommitted(result),
-        patches: result.patches,
-        applied: result.applied,
-        deltas: result.deltas,
-        ...(changes === undefined ? {} : { changes }),
-        ...tarstateDurability(result),
-        ...(maintenance === undefined ? {} : { materializations: maintenance }),
+        effects: {
+          patches: result.patches,
+          applied: result.applied,
+          deltas: result.deltas,
+          ...tarstateDurability(result)
+        },
         diagnostics,
         snapshot
       };
@@ -626,7 +558,7 @@ export function useTarstateQueries<const Queries extends QueryBatch>(
 
 export function useTarstateCommit<Snapshot extends TarstateSnapshot = TarstateSnapshot>(): TarstateStore<Snapshot>['commit'] {
   const store = useTarstateStore<TarstateStore<Snapshot>>();
-  return useCallback((patches) => store.commit(patches), [store]);
+  return useCallback((patches: TarstateCommitInput) => store.commit(patches), [store]);
 }
 
 export const useQuery = useTarstateQuery;
@@ -642,6 +574,38 @@ function dbSnapshot(db: Db, revision: number, diagnostics: readonly TarstateReac
   };
 }
 
+type SourceStoreReadOptions<Version> = Pick<SourceStoreOptions<Version>, 'getSource' | 'getSnapshot' | 'subscribe'>;
+type SourceStoreWriteOptions<Version> = Pick<WritableSourceStoreOptions<Version>, 'target' | 'commit'>;
+
+function sourceStoreOptionsForAdapter<Version>(adapter: RelationAdapter<Version>): WritableSourceStoreOptions<Version> {
+  return {
+    ...sourceStoreReadOptions(adapter),
+    ...sourceStoreWriteOptionsForAdapter(adapter)
+  };
+}
+
+function sourceStoreOptionsForRuntime<Version>(runtime: RelationRuntime<Version>): WritableSourceStoreOptions<Version> {
+  return {
+    ...sourceStoreReadOptions(runtime),
+    ...(runtime.target === undefined ? {} : { target: runtime.target })
+  };
+}
+
+function sourceStoreReadOptions<Version>(runtime: RelationRuntime<Version>): SourceStoreReadOptions<Version> {
+  return {
+    getSource: () => runtime.source,
+    getSnapshot: () => runtime.snapshot?.() ?? runtime.source,
+    ...(runtime.subscribe === undefined ? {} : { subscribe: runtime.subscribe })
+  };
+}
+
+function sourceStoreWriteOptionsForAdapter<Version>(
+  adapter: RelationAdapter<Version>
+): SourceStoreWriteOptions<Version> {
+  // Relation targets use the runtime apply path; adapter commits are retained for legacy adapters.
+  return adapter.target === undefined ? { commit: adapter.commit } : { target: adapter.target };
+}
+
 function sourceSnapshot<Version>(
   source: RelationSource,
   revision: number,
@@ -653,64 +617,6 @@ function sourceSnapshot<Version>(
     revision,
     diagnostics,
     ...(version === undefined ? {} : { version })
-  };
-}
-
-async function maintainSourceSnapshotMaterializations<Version>(
-  previousSource: RelationSource,
-  nextSnapshot: TarstateSnapshot<Version>
-): Promise<{
-  readonly snapshot: TarstateSnapshot<Version>;
-  readonly materializations?: MaterializationMaintenanceResult;
-}> {
-  if (materializationsFor(previousSource).length === 0) {
-    return { snapshot: nextSnapshot };
-  }
-
-  const materializations = await maintainMaterializationSnapshots(previousSource, nextSnapshot.source);
-
-  return {
-    snapshot: sourceSnapshot(
-      nextSnapshot.source,
-      nextSnapshot.revision,
-      [...nextSnapshot.diagnostics, ...materializations.diagnostics],
-      nextSnapshot.version
-    ),
-    materializations
-  };
-}
-
-async function trackSourceSnapshotCommit<Version>(
-  previousSource: RelationSource,
-  nextSnapshot: TarstateSnapshot<Version>,
-  deltas: readonly RelationDelta[] | undefined
-): Promise<{
-  readonly snapshot: TarstateSnapshot<Version>;
-  readonly changes: readonly TrackedChange[];
-  readonly materializations?: MaterializationMaintenanceResult;
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-}> {
-  const hadMaterializations = materializationsFor(previousSource).length > 0;
-  // Source replacement does not guarantee that relation deltas carry enough ordering information
-  // to keep materialized query rows in refreshed source order.
-  const trackingDeltas = hadMaterializations ? undefined : deltas;
-  const tracked = await trackTransact(previousSource, () => ({
-    db: nextSnapshot.source,
-    ...(trackingDeltas === undefined ? {} : { deltas: trackingDeltas })
-  }));
-
-  return {
-    snapshot: sourceSnapshot(
-      tracked.db,
-      nextSnapshot.revision,
-      [...nextSnapshot.diagnostics, ...tracked.diagnostics],
-      nextSnapshot.version
-    ),
-    changes: tracked.changes,
-    ...(hadMaterializations && tracked.materializations !== undefined
-      ? { materializations: tracked.materializations }
-      : {}),
-    diagnostics: tracked.diagnostics
   };
 }
 
@@ -736,37 +642,19 @@ function isSourceStoreSnapshot<Version>(input: SourceStoreSnapshotInput<Version>
 }
 
 function relationTargetForOptions<Version>(
-  options: SourceStoreOptions<Version>
+  options: WritableSourceStoreOptions<Version>
 ): RelationPatchTarget<Version> | undefined {
-  if (options.target !== undefined) {
-    return options.target;
-  }
-
-  return options.apply === undefined ? undefined : { apply: options.apply };
+  return options.target;
 }
 
 function tarstateStatusForApplyResult(result: AdapterCommitResult | RelationApplyResult): AdapterCommitStatus {
   switch (result.status) {
     case 'accepted':
-      return 'committed';
-    case 'committed':
-      return 'committed';
+      return 'accepted';
     case 'partial':
       return 'partial';
     case 'rejected':
       return 'rejected';
-  }
-}
-
-function tarstateFullyCommitted(result: AdapterCommitResult | RelationApplyResult): boolean {
-  switch (result.status) {
-    case 'accepted':
-      return result.accepted;
-    case 'committed':
-      return result.committed;
-    case 'partial':
-    case 'rejected':
-      return false;
   }
 }
 
@@ -854,48 +742,17 @@ async function evaluateBatch<const Queries extends QueryBatch>(
   queries: Queries,
   options: EvaluateOptions
 ): Promise<SnapshotQueryBatchEvaluation<Queries>> {
+  const capturedSource = await captureQuerySource(snapshot.source, Object.values(queries));
   const entries = await Promise.all(
-    Object.entries(queries).map(async ([name, query]) => {
-      const materialized = await readSnapshotMaterializedQuery(snapshot, query);
-
-      return {
-        name,
-        query,
-        diagnostics: materialized === undefined ? emptyDiagnostics : materialized.diagnostics,
-        result: materialized?.materialized === true
-          ? { rows: materialized.rows, diagnostics: [] }
-          : undefined
-      };
-    })
-  );
-  const misses = entries.filter((entry) => entry.result === undefined);
-  const capturedSource = misses.length === 0
-    ? undefined
-    : await captureQuerySource(snapshot.source, misses.map((entry) => entry.query));
-  const evaluated = await Promise.all(
-    misses.map(async (entry) => ({
-      name: entry.name,
-      result: await evaluate(capturedSource as RelationSource, entry.query, options)
+    Object.entries(queries).map(async ([name, query]) => ({
+      name,
+      result: await evaluate(capturedSource, query, options)
     }))
   );
-  const evaluatedByName = new Map(evaluated.map((entry) => [entry.name, entry.result]));
-  const resultEntries = entries.map((entry) => {
-    const result = entry.result ?? evaluatedByName.get(entry.name);
-
-    if (result === undefined) {
-      throw new Error(`missing query batch result for ${entry.name}`);
-    }
-
-    return [entry.name, result] as const;
-  });
-  const diagnostics = entries.flatMap((entry) => [
-    ...entry.diagnostics,
-    ...(entry.result === undefined ? evaluatedByName.get(entry.name)?.diagnostics ?? [] : [])
-  ]);
 
   return {
-    results: Object.fromEntries(resultEntries) as QueryBatchResult<Queries>,
-    diagnostics
+    results: Object.fromEntries(entries.map((entry) => [entry.name, entry.result])) as QueryBatchResult<Queries>,
+    diagnostics: entries.flatMap((entry) => entry.result.diagnostics)
   };
 }
 
@@ -914,64 +771,12 @@ async function evaluateSnapshotQuery<Row>(
   query: Query<Row>,
   options: EvaluateOptions
 ): Promise<SnapshotQueryEvaluation<Row>> {
-  const materialized = await readSnapshotMaterializedQuery(snapshot, query);
-
-  if (materialized?.materialized === true) {
-    return {
-      result: { rows: materialized.rows, diagnostics: [] },
-      diagnostics: materialized.diagnostics
-    };
-  }
-
   const result = await evaluate(await captureQuerySource(snapshot.source, [query]), query, options);
 
   return {
     result,
-    diagnostics: [
-      ...(materialized?.diagnostics ?? []),
-      ...result.diagnostics
-    ]
+    diagnostics: result.diagnostics
   };
-}
-
-async function readSnapshotMaterializedQuery<Row>(
-  snapshot: TarstateSnapshot,
-  query: Query<Row>
-): Promise<Awaited<ReturnType<typeof readMaterializedQuery<Row>>> | undefined> {
-  if (!canReadMaterializedQuery(query)) {
-    return undefined;
-  }
-
-  const result = await readMaterializedQuery(materializationInputForSnapshot(snapshot), query);
-  return result.materialized || result.id !== undefined ? result : undefined;
-}
-
-function materializationInputForSnapshot(snapshot: TarstateSnapshot): unknown {
-  return isTarstateDbSnapshot(snapshot) ? snapshot.db : snapshot.source;
-}
-
-function canReadMaterializedQuery(query: Query): boolean {
-  return !queryUsesRuntimeInputs(query);
-}
-
-function queryUsesRuntimeInputs(query: Query): boolean {
-  return queryPartUsesRuntimeInputs(query.data);
-}
-
-function queryPartUsesRuntimeInputs(input: unknown): boolean {
-  if (Array.isArray(input)) {
-    return input.some(queryPartUsesRuntimeInputs);
-  }
-
-  if (!isRecord(input)) {
-    return false;
-  }
-
-  if (input.op === 'env' || input.op === 'call') {
-    return true;
-  }
-
-  return Object.values(input).some(queryPartUsesRuntimeInputs);
 }
 
 async function captureQuerySource(source: RelationSource, queries: readonly Query[]): Promise<RelationSource> {
@@ -1043,16 +848,4 @@ function isTarstateDbSnapshot(snapshot: TarstateSnapshot): snapshot is TarstateD
 
 function commitReflected(deltas: readonly RelationDelta[]): boolean {
   return deltas.some((delta) => delta.added.length > 0 || delta.removed.length > 0);
-}
-
-function ownRelationDeltas(input: unknown): readonly RelationDelta[] | undefined {
-  if (!isRecord(input) || !Object.hasOwn(input, 'deltas')) {
-    return undefined;
-  }
-
-  return Array.isArray(input.deltas) ? input.deltas as readonly RelationDelta[] : undefined;
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

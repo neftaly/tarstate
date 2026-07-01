@@ -22,16 +22,16 @@
       "@tarstate/core/adapter": [
         "./packages/core/src/adapter.ts"
       ],
-      "@tarstate/core/constraints": [
+      "@tarstate/core/experimental/constraints": [
         "./packages/core/src/constraints.ts"
       ],
       "@tarstate/core/db": [
         "./packages/core/src/db.ts"
       ],
-      "@tarstate/core/delta": [
+      "@tarstate/core/experimental/delta": [
         "./packages/core/src/delta.ts"
       ],
-      "@tarstate/core/diff": [
+      "@tarstate/core/experimental/diff": [
         "./packages/core/src/diff.ts"
       ],
       "@tarstate/core/diagnostics": [
@@ -40,10 +40,13 @@
       "@tarstate/core/evaluate": [
         "./packages/core/src/evaluate.ts"
       ],
-      "@tarstate/core/identity": [
+      "@tarstate/core/experimental/identity": [
         "./packages/core/src/identity.ts"
       ],
-      "@tarstate/core/materialization": [
+      "@tarstate/core/experimental/indexed-source": [
+        "./packages/core/src/indexed-source.ts"
+      ],
+      "@tarstate/core/experimental/materialization": [
         "./packages/core/src/materialization.ts"
       ],
       "@tarstate/core/memory-runtime": [
@@ -52,7 +55,7 @@
       "@tarstate/core/query": [
         "./packages/core/src/query.ts"
       ],
-      "@tarstate/core/runtime": [
+      "@tarstate/core/experimental/runtime": [
         "./packages/core/src/runtime.ts"
       ],
       "@tarstate/core/schema": [
@@ -64,10 +67,10 @@
       "@tarstate/core/store": [
         "./packages/core/src/store.ts"
       ],
-      "@tarstate/core/watch": [
+      "@tarstate/core/experimental/watch": [
         "./packages/core/src/watch.ts"
       ],
-      "@tarstate/core/write-apply": [
+      "@tarstate/core/experimental/write-apply": [
         "./packages/core/src/write-apply.ts"
       ],
       "@tarstate/core/write": [
@@ -75,6 +78,9 @@
       ],
       "@tarstate/automerge": [
         "./packages/automerge/src/index.ts"
+      ],
+      "@tarstate/automerge/presence": [
+        "./packages/automerge/src/presence.ts"
       ],
       "@tarstate/react": [
         "./packages/react/src/index.ts"

@@ -18,6 +18,7 @@ import {
   transferConstraintAttachments
 } from './constraints-attachment.js';
 import { validateConstraints } from './constraints-validation.js';
+import { tryTransact, type Db as ObjectDb, type DbTransactionInput } from './db.js';
 import {
   maintainMaterializationSnapshots,
   type MaterializationDiagnostic,
@@ -69,7 +70,6 @@ type TrackRuntimeCommitResultBase<Version = unknown> = {
   readonly kind: 'trackRuntimeCommit';
   readonly runtime: RelationRuntime<Version>;
   readonly status: TrackRuntimeCommitStatus;
-  readonly accepted: boolean;
   readonly patches: number;
   readonly applied: number;
   readonly changes: readonly TrackedChange[];
@@ -86,13 +86,12 @@ export type TrackRuntimeCommitSupportedResult<Version = unknown> = TrackRuntimeC
 };
 export type TrackRuntimeCommitUnsupportedResult<Version = unknown> = Omit<
   TrackRuntimeCommitResultBase<Version>,
-  'runtime' | 'status' | 'accepted' | 'applied' | 'changes' | 'deltas'
+  'runtime' | 'status' | 'applied' | 'changes' | 'deltas'
 > & {
   readonly runtime: unknown;
   readonly source?: AdapterSource<Version> | undefined;
   readonly supported: false;
   readonly status: 'rejected';
-  readonly accepted: false;
   readonly applied: 0;
   readonly changes: readonly [];
   readonly deltas: readonly [];
@@ -118,7 +117,7 @@ type ConstraintEnforcementResult =
   };
 type RuntimeCommitReport<Version> = Pick<
   TrackRuntimeCommitSupportedResult<Version>,
-  'status' | 'accepted' | 'patches' | 'applied' | 'deltas' | 'diagnostics' | 'source' | 'version' | 'durability'
+  'status' | 'patches' | 'applied' | 'deltas' | 'diagnostics' | 'source' | 'version' | 'durability'
 >;
 type RuntimePatchAttempt<Version> = {
   readonly report: RuntimeCommitReport<Version>;
@@ -213,6 +212,16 @@ export async function trackTransact<Db extends WatchDb, Result extends TrackTran
 }
 
 /**
+ * Apply object-backed transaction inputs and report tracked changes using the `trackTransact` result shape.
+ */
+export function trackTransactPatches(
+  db: ObjectDb,
+  ...inputs: readonly DbTransactionInput[]
+): Promise<TrackTransactResult<ObjectDb>> {
+  return trackTransact(db, (current) => tryTransact(current, ...inputs));
+}
+
+/**
  * Apply relation patches through a runtime/adapter, maintain materialized snapshots, and report watched changes.
  *
  * @remarks Relation deltas are used for tracking only when the runtime/adapter actually reports a `deltas`
@@ -256,7 +265,6 @@ export async function trackRuntimeCommit<Version = unknown>(
       source: report.source,
       supported: true,
       status: report.status,
-      accepted: report.accepted,
       patches: report.patches,
       applied: report.applied,
       changes: [],
@@ -297,7 +305,6 @@ export async function trackRuntimeCommit<Version = unknown>(
     source: report.source,
     supported: true,
     status: report.status,
-    accepted: report.accepted,
     patches: report.patches,
     applied: report.applied,
     changes,
@@ -339,7 +346,6 @@ async function applyAdapterRuntimePatches<Version>(
   return {
     report: {
       status: adapterRuntimeStatus(result),
-      accepted: result.status === 'committed',
       patches: result.patches,
       applied: result.applied,
       deltas: result.deltas,
@@ -376,7 +382,6 @@ async function applyRelationRuntimePatches<Version>(
   return {
     report: {
       status: result.status,
-      accepted: result.accepted,
       patches: result.patches,
       applied: result.applied,
       deltas: result.deltas,
@@ -423,7 +428,6 @@ function unsupportedTrackRuntimeCommitResult<Version>(
     source: (runtime as RelationRuntime<Version>).source,
     supported: false,
     status: 'rejected',
-    accepted: false,
     patches,
     applied: 0,
     changes: [],
@@ -434,7 +438,7 @@ function unsupportedTrackRuntimeCommitResult<Version>(
 }
 
 function adapterRuntimeStatus(result: AdapterCommitResult): TrackRuntimeCommitStatus {
-  return result.status === 'committed' ? 'accepted' : result.status;
+  return result.status;
 }
 
 function ownDeltas(input: unknown): readonly RelationDelta[] | undefined {

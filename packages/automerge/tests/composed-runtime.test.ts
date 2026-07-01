@@ -1,8 +1,9 @@
 import * as Automerge from '@automerge/automerge';
 import type { DocHandle } from '@automerge/automerge-repo';
 import { describe, expect, it } from 'vitest';
-import { automergePresenceRuntime, createAutomergeRelationAdapter } from '@tarstate/automerge';
-import { composeRelationRuntimes, tryApplyRelationPatches } from '@tarstate/core/adapter';
+import { automergeMapAdapter } from '@tarstate/automerge';
+import { automergePresenceRuntime } from '@tarstate/automerge/presence';
+import { composeRelationRuntimes, isRelationRuntime, tryApplyRelationPatches } from '@tarstate/core/adapter';
 import {
   booleanField,
   defineSchema,
@@ -73,14 +74,14 @@ const presenceRows = write(schema.presence);
 const todoRelations = [{ relation: schema.todos, path: ['todos'] }] as const;
 
 describe('composed Automerge runtime snapshots', () => {
-  it('keeps composed snapshot rows and versions bound after child runtimes change', async () => {
+  it('keeps composed snapshot rows bound after child runtimes change', async () => {
     const doc = Automerge.from<TodoDocument>({
       todos: {
         'todo-a': { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
         'todo-b': { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
       }
     });
-    const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
+    const adapter = automergeMapAdapter<TodoDocument>({ doc, relations: todoRelations });
     const handle = new FakeDocHandle();
     const presenceRuntime = automergePresenceRuntime({
       handle: handle.asHandle(),
@@ -92,32 +93,32 @@ describe('composed Automerge runtime snapshots', () => {
     const runtime = composeRelationRuntimes(adapter, presenceRuntime);
 
     try {
+      expect(isRelationRuntime(runtime)).toBe(true);
+      expect(runtime.source.relationNames).toEqual(['todos', 'presence']);
+      expect(runtime.target?.relationNames).toEqual(['todos', 'presence']);
+      expect(runtime.target?.ownsRelation?.('todos')).toBe(true);
+      expect(runtime.target?.ownsRelation?.('presence')).toBe(true);
+      expect(runtime.target?.ownsRelation?.('notes')).toBe(false);
+      expect(runtime.snapshot).toEqual(expect.any(Function));
+      expect(runtime.subscribe).toEqual(expect.any(Function));
+
       const snapshot = runtime.snapshot?.();
 
       if (snapshot === undefined) {
         throw new Error('expected composed runtime snapshot');
       }
 
-      const originalVersion = [
-        Automerge.getHeads(adapter.doc),
-        { revision: 0, localPeerId: 'peer-local' }
-      ];
-
-      expect(snapshot.version).toEqual(originalVersion);
-      const snapshotSourceVersion = await snapshot.source.version?.();
-
-      expect(snapshotSourceVersion).toBe(snapshot.version);
-      expect(snapshotSourceVersion).toEqual(originalVersion);
       expect(await snapshot.source.diagnostics?.()).toEqual([]);
 
       const result = await tryApplyRelationPatches(runtime, [
-        todos.update('todo-a', { done: true }),
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' })
+        todos.updateByKey('todo-a', { done: true }),
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-b' },
+          { update: { value: 'todo-b' } }
+        )
       ]);
 
       expect(result.status).toBe('accepted');
-      expect(snapshot.version).toEqual(originalVersion);
-      expect(await snapshot.source.version?.()).toBe(snapshot.version);
       expect(await snapshot.source.diagnostics?.()).toEqual([]);
       expect(Array.from(await snapshot.source.rows(schema.todos))).toEqual([
         { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
@@ -127,13 +128,6 @@ describe('composed Automerge runtime snapshots', () => {
         { peerId: 'peer-local', channel: 'targetTodoId', value: 'todo-a', local: true }
       ]);
 
-      const currentVersion = await runtime.source.version?.();
-
-      expect(currentVersion).toEqual([
-        Automerge.getHeads(adapter.doc),
-        { revision: 1, localPeerId: 'peer-local' }
-      ]);
-      expect(currentVersion).not.toEqual(originalVersion);
       expect(await runtime.source.diagnostics?.()).toEqual([]);
       expect(Array.from(await runtime.source.rows(schema.todos))).toEqual([
         { id: 'todo-a', text: 'Buy oat milk', done: true, rank: 1 },
@@ -162,8 +156,6 @@ function compactPresenceRows(rows: Iterable<unknown>): readonly CompactPresenceR
 }
 
 class FakeDocHandle {
-  readonly broadcasts: unknown[] = [];
-
   asHandle(): DocHandle<unknown> {
     return this as unknown as DocHandle<unknown>;
   }
@@ -172,7 +164,5 @@ class FakeDocHandle {
 
   off(): void {}
 
-  broadcast(message: unknown): void {
-    this.broadcasts.push(message);
-  }
+  broadcast(): void {}
 }

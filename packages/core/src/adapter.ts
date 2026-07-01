@@ -1,13 +1,19 @@
 import { composeSources, isRelationSource } from './source.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
-import type { RelationDelta } from './delta.js';
+import type { RelationRef } from './schema.js';
 import type { MaybePromise, RelationSource } from './source.js';
 import type { WritePatch } from './write.js';
 
 export type { TarstateDiagnostic } from './diagnostics.js';
-export type { RelationDelta } from './delta.js';
 export type { MaybePromise, RelationLookup, RelationRangeBound, RelationRangeLookup, RelationSource } from './source.js';
 export type { WritePatch } from './write.js';
+
+/** Stable relation-level row changes reflected by a write attempt. */
+export type RelationDelta<Relation extends RelationRef = RelationRef> = {
+  readonly relation: Relation;
+  readonly added: readonly unknown[];
+  readonly removed: readonly unknown[];
+};
 
 /** Relation source exposed by a storage adapter, with typed opaque version identity. */
 export type AdapterSource<Version = unknown> = Omit<RelationSource, 'version'> & {
@@ -23,7 +29,7 @@ export type AdapterSnapshot<Version = unknown> = {
 };
 
 /** How an apply target reflects accepted patches. */
-export type RelationApplyDurability = 'durable' | 'ephemeral' | 'memory' | 'external';
+export type RelationApplyDurability = 'durable' | 'ephemeral' | 'memory';
 
 /** Authoritative outcome returned after a relation patch target attempts to apply a batch. */
 export type RelationApplyStatus = 'accepted' | 'partial' | 'rejected';
@@ -46,15 +52,11 @@ type RelationApplyResultBase<Version = unknown> = {
 /** Result for a fully accepted patch batch. */
 export type RelationApplyAcceptedResult<Version = unknown> = RelationApplyResultBase<Version> & {
   readonly status: 'accepted';
-  /** Whether the full patch batch was accepted. */
-  readonly accepted: true;
 };
 
 /** Result for target-owned partial apply semantics. */
 export type RelationApplyPartialResult<Version = unknown> = RelationApplyResultBase<Version> & {
   readonly status: 'partial';
-  /** The full patch batch was not accepted; `applied` and `deltas` describe reflected effects. */
-  readonly accepted: false;
 };
 
 /** Result for an all-or-nothing rejection with no reflected patch effects. */
@@ -63,7 +65,6 @@ export type RelationApplyRejectedResult<Version = unknown> = Omit<
   'applied' | 'deltas'
 > & {
   readonly status: 'rejected';
-  readonly accepted: false;
   readonly applied: 0;
   readonly deltas: readonly [];
 };
@@ -74,13 +75,23 @@ export type RelationApplyResult<Version = unknown> =
   | RelationApplyPartialResult<Version>
   | RelationApplyRejectedResult<Version>;
 
-/** Generic patch application function for durable, ephemeral, memory, or external targets. */
+/** Generic patch application function for durable, ephemeral, or memory targets. */
 export type RelationApply<Version = unknown> = (
   patches: readonly WritePatch[]
 ) => MaybePromise<RelationApplyResult<Version>>;
 
 /** Generic write-capable patch target. */
 export type RelationPatchTarget<Version = unknown> = {
+  /**
+   * Relation names this target accepts writes for.
+   *
+   * @remarks Prefer this or `ownsRelation` over inferring write ownership from
+   * the read source's `relationNames`; composed sources may be readable without
+   * being writable.
+   */
+  readonly relationNames?: readonly string[];
+  /** Return true when this target accepts writes for a relation name. */
+  readonly ownsRelation?: (relationName: string) => boolean;
   readonly apply: RelationApply<Version>;
 };
 
@@ -92,52 +103,11 @@ export type RelationRuntime<Version = unknown> = {
   readonly subscribe?: (listener: () => void) => () => void;
 };
 
-/** Authoritative outcome returned after an adapter attempts to commit a patch batch. */
-export type AdapterCommitStatus = 'committed' | 'partial' | 'rejected';
-
-type AdapterCommitResultBase<Version = unknown> = {
-  /** Number of patches the adapter received. */
-  readonly patches: number;
-  /** Number of patch effects accepted and reflected in the backing store. */
-  readonly applied: number;
-  /** Relation-level row changes reflected by the commit attempt. Rejected commits leave this empty. */
-  readonly deltas: readonly RelationDelta[];
-  /** Adapter-readable diagnostics. `status` determines whether diagnostics prevented a full commit. */
-  readonly diagnostics: readonly TarstateDiagnostic[];
-  /** Optional adapter snapshot/version after the commit attempt. */
-  readonly version?: Version;
-};
-
-/** Result for a fully accepted patch batch. */
-export type AdapterCommittedResult<Version = unknown> = AdapterCommitResultBase<Version> & {
-  readonly status: 'committed';
-  /** Whether the full patch batch was accepted. */
-  readonly committed: true;
-};
-
-/** Result for adapter-owned partial commit semantics. */
-export type AdapterPartialCommitResult<Version = unknown> = AdapterCommitResultBase<Version> & {
-  readonly status: 'partial';
-  /** The full patch batch was not accepted; `applied` and `deltas` describe reflected effects. */
-  readonly committed: false;
-};
-
-/** Result for an all-or-nothing rejection with no reflected patch effects. */
-export type AdapterRejectedCommitResult<Version = unknown> = Omit<
-  AdapterCommitResultBase<Version>,
-  'applied' | 'deltas'
-> & {
-  readonly status: 'rejected';
-  readonly committed: false;
-  readonly applied: 0;
-  readonly deltas: readonly [];
-};
+/** Adapter commit status uses the same vocabulary as runtime patch application. */
+export type AdapterCommitStatus = RelationApplyStatus;
 
 /** Result returned after an adapter attempts to commit a patch batch. */
-export type AdapterCommitResult<Version = unknown> =
-  | AdapterCommittedResult<Version>
-  | AdapterPartialCommitResult<Version>
-  | AdapterRejectedCommitResult<Version>;
+export type AdapterCommitResult<Version = unknown> = RelationApplyResult<Version>;
 
 /** Adapter commit function for translating write patches into a backing store. */
 export type AdapterCommit<Version = unknown> = (
@@ -158,52 +128,12 @@ export type AdapterCommitOptions = {
 export type RelationApplyOptions = AdapterCommitOptions;
 
 /** Normalized adapter commit result paired with the source that reflects the commit attempt. */
-export type AdapterCommitReport<Version = unknown> = AdapterCommitResult<Version> & {
-  readonly source: AdapterSource<Version>;
-};
+export type AdapterCommitReport<Version = unknown> = RelationApplyReport<Version>;
 
 /** Normalized relation apply result paired with the source that reflects the apply attempt. */
 export type RelationApplyReport<Version = unknown> = RelationApplyResult<Version> & {
   readonly source: AdapterSource<Version>;
 };
-
-/** Convert an adapter commit outcome into the equivalent relation target apply outcome. */
-export function relationApplyResultFromAdapterCommit<Version = unknown>(
-  result: AdapterCommitResult<Version>
-): RelationApplyResult<Version> {
-  const base = {
-    patches: result.patches,
-    diagnostics: result.diagnostics,
-    ...versionProperty(result.version)
-  };
-
-  switch (result.status) {
-    case 'committed':
-      return {
-        ...base,
-        status: 'accepted',
-        accepted: true,
-        applied: result.applied,
-        deltas: result.deltas
-      };
-    case 'partial':
-      return {
-        ...base,
-        status: 'partial',
-        accepted: false,
-        applied: result.applied,
-        deltas: result.deltas
-      };
-    case 'rejected':
-      return {
-        ...base,
-        status: 'rejected',
-        accepted: false,
-        applied: 0,
-        deltas: [] as const
-      };
-  }
-}
 
 /** Apply patches through a generic runtime target and normalize the result envelope. */
 export async function tryApplyRelationPatches<Version = unknown>(
@@ -269,7 +199,13 @@ export function isRelationRuntime(input: unknown): input is RelationRuntime {
   }
 
   const target = input.target;
-  return target === undefined || (isRecord(target) && typeof target.apply === 'function');
+  return (
+    target === undefined ||
+    (isRecord(target) &&
+      typeof target.apply === 'function' &&
+      (target.relationNames === undefined || isStringArray(target.relationNames)) &&
+      (target.ownsRelation === undefined || typeof target.ownsRelation === 'function'))
+  );
 }
 
 function composedRuntimeSnapshot(
@@ -346,9 +282,33 @@ function composedRuntimeSubscribe(
 function composedRelationPatchTarget(
   runtimes: readonly RelationRuntime[]
 ): RelationPatchTarget<readonly unknown[]> {
+  const relationNames = composedRelationPatchTargetRelationNames(runtimes);
+
   return {
+    ...(relationNames === undefined ? {} : { relationNames }),
+    ownsRelation: (relationName) => routeRelationName(runtimes, relationName) !== undefined,
     apply: async (patches) => applyComposedRelationPatches(runtimes, patches)
   };
+}
+
+function composedRelationPatchTargetRelationNames(
+  runtimes: readonly RelationRuntime[]
+): readonly string[] | undefined {
+  const names: string[] = [];
+
+  for (const runtime of runtimes) {
+    if (runtime.target === undefined) {
+      continue;
+    }
+
+    if (runtime.target.relationNames === undefined) {
+      return undefined;
+    }
+
+    names.push(...runtime.target.relationNames);
+  }
+
+  return Array.from(new Set(names));
 }
 
 async function applyComposedRelationPatches(
@@ -360,7 +320,6 @@ async function applyComposedRelationPatches(
   if (routing.diagnostics.length > 0) {
     return {
       status: 'rejected',
-      accepted: false,
       patches: patches.length,
       applied: 0,
       deltas: [],
@@ -413,17 +372,77 @@ function routeRelationPatch(
   targetIndexes: readonly number[],
   patch: WritePatch
 ): number | undefined {
-  if (targetIndexes.length === 1) {
-    const index = targetIndexes[0] as number;
-    const names = runtimes[index]?.source.relationNames;
-    return names === undefined || names.includes(patch.relation.name) ? index : undefined;
+  return routeRelationName(runtimes, patch.relation.name, targetIndexes);
+}
+
+function routeRelationName(
+  runtimes: readonly RelationRuntime[],
+  relationName: string,
+  writableIndexes: readonly number[] = runtimes.flatMap((runtime, index) =>
+    runtime.target === undefined ? [] : [index]
+  )
+): number | undefined {
+  const candidates: RelationRouteCandidate[] = writableIndexes.map((index) => ({
+    index,
+    ownership: targetRelationOwnership(runtimes[index]?.target, relationName),
+    sourceRelationNames: runtimes[index]?.source.relationNames
+  }));
+
+  if (candidates.length === 1) {
+    const candidate = candidates[0];
+    if (candidate === undefined) {
+      return undefined;
+    }
+
+    const ownership = candidate.ownership;
+    if (ownership === 'unowned') {
+      return undefined;
+    }
+    if (ownership === 'owned') {
+      return candidate.index;
+    }
+    const names = candidate.sourceRelationNames;
+    return names === undefined || names.includes(relationName) ? candidate.index : undefined;
   }
 
-  const explicitMatches = targetIndexes.filter((index) =>
-    runtimes[index]?.source.relationNames?.includes(patch.relation.name) === true
+  const targetMatches = candidates.filter((candidate) => candidate.ownership === 'owned');
+
+  if (targetMatches.length > 0) {
+    return targetMatches.length === 1 ? targetMatches[0]?.index : undefined;
+  }
+
+  const sourceMatches = candidates.filter((candidate) =>
+    candidate.ownership !== 'unowned' && candidate.sourceRelationNames?.includes(relationName) === true
   );
 
-  return explicitMatches.length === 1 ? explicitMatches[0] : undefined;
+  return sourceMatches.length === 1 ? sourceMatches[0]?.index : undefined;
+}
+
+type RelationTargetOwnership = 'owned' | 'unowned' | 'unknown';
+
+type RelationRouteCandidate = {
+  readonly index: number;
+  readonly ownership: RelationTargetOwnership;
+  readonly sourceRelationNames: readonly string[] | undefined;
+};
+
+function targetRelationOwnership(
+  target: RelationPatchTarget | undefined,
+  relationName: string
+): RelationTargetOwnership {
+  if (target === undefined) {
+    return 'unowned';
+  }
+
+  if (target.ownsRelation !== undefined) {
+    return target.ownsRelation(relationName) ? 'owned' : 'unowned';
+  }
+
+  if (target.relationNames !== undefined) {
+    return target.relationNames.includes(relationName) ? 'owned' : 'unowned';
+  }
+
+  return 'unknown';
 }
 
 function noRelationPatchTargetDiagnostic(patch: WritePatch): TarstateDiagnostic {
@@ -446,7 +465,6 @@ function composeRelationApplyResults(
   if (allAccepted) {
     return {
       status: 'accepted',
-      accepted: true,
       patches: patchCount,
       applied,
       deltas,
@@ -457,7 +475,6 @@ function composeRelationApplyResults(
   if (applied > 0 || deltas.length > 0 || results.some((result) => result.status === 'partial')) {
     return {
       status: 'partial',
-      accepted: false,
       patches: patchCount,
       applied,
       deltas,
@@ -467,7 +484,6 @@ function composeRelationApplyResults(
 
   return {
     status: 'rejected',
-    accepted: false,
     patches: patchCount,
     applied: 0,
     deltas: [],
@@ -478,7 +494,6 @@ function composeRelationApplyResults(
 function relationTargetUnavailableResult<Version>(patchCount: number): RelationApplyResult<Version> {
   return {
     status: 'rejected',
-    accepted: false,
     patches: patchCount,
     applied: 0,
     deltas: [],
@@ -512,7 +527,6 @@ function rejectedRelationApplyResult<Version>(
 ): RelationApplyResult<Version> {
   return {
     status: 'rejected',
-    accepted: false,
     patches: patchCount,
     applied: 0,
     deltas: [],
@@ -542,7 +556,6 @@ function normalizeRelationApplyResult<Version>(
     return {
       ...base,
       status: 'rejected',
-      accepted: false,
       applied: 0,
       deltas: [] as const
     };
@@ -552,7 +565,6 @@ function normalizeRelationApplyResult<Version>(
     return {
       ...base,
       status: 'accepted',
-      accepted: true,
       applied: relationAppliedCount(result),
       deltas: relationDeltasArray(result)
     };
@@ -561,7 +573,6 @@ function normalizeRelationApplyResult<Version>(
   return {
     ...base,
     status: 'partial',
-    accepted: false,
     applied: relationAppliedCount(result),
     deltas: relationDeltasArray(result)
   };
@@ -572,10 +583,6 @@ function relationApplyStatus(result: RelationApplyResult): RelationApplyStatus {
 
   if (status === 'accepted' || status === 'partial' || status === 'rejected') {
     return status;
-  }
-
-  if (unsafeRelationResultValue(result, 'accepted') === true) {
-    return 'accepted';
   }
 
   return relationAppliedCount(result) > 0 || relationDeltasArray(result).length > 0 ? 'partial' : 'rejected';
@@ -623,7 +630,7 @@ async function commitAdapterSafely<Version>(
   patches: readonly WritePatch[]
 ): Promise<AdapterCommitResult<Version>> {
   try {
-    return normalizeAdapterCommitResult(await adapter.commit(patches), patches.length);
+    return normalizeRelationApplyResult(await adapter.commit(patches), patches.length);
   } catch (error) {
     return rejectedAdapterCommitResult(patches.length, error);
   }
@@ -635,7 +642,6 @@ function rejectedAdapterCommitResult<Version>(
 ): AdapterCommitResult<Version> {
   return {
     status: 'rejected',
-    committed: false,
     patches: patchCount,
     applied: 0,
     deltas: [],
@@ -647,60 +653,6 @@ function rejectedAdapterCommitResult<Version>(
       }
     ]
   };
-}
-
-function normalizeAdapterCommitResult<Version>(
-  result: AdapterCommitResult<Version>,
-  patchCount: number
-): AdapterCommitResult<Version> {
-  const status = adapterCommitStatus(result);
-  const base = {
-    patches: patchCount,
-    diagnostics: diagnosticsArray(result),
-    ...versionProperty(result.version)
-  };
-
-  if (status === 'rejected') {
-    return {
-      ...base,
-      status: 'rejected',
-      committed: false,
-      applied: 0,
-      deltas: [] as const
-    };
-  }
-
-  if (status === 'committed') {
-    return {
-      ...base,
-      status: 'committed',
-      committed: true,
-      applied: appliedCount(result),
-      deltas: deltasArray(result)
-    };
-  }
-
-  return {
-    ...base,
-    status: 'partial',
-    committed: false,
-    applied: appliedCount(result),
-    deltas: deltasArray(result)
-  };
-}
-
-function adapterCommitStatus(result: AdapterCommitResult): AdapterCommitStatus {
-  const status = unsafeResultValue(result, 'status');
-
-  if (status === 'committed' || status === 'partial' || status === 'rejected') {
-    return status;
-  }
-
-  if (unsafeResultValue(result, 'committed') === true) {
-    return 'committed';
-  }
-
-  return appliedCount(result) > 0 || deltasArray(result).length > 0 ? 'partial' : 'rejected';
 }
 
 async function resultWithSourceVersion<Version>(
@@ -769,25 +721,10 @@ function unsafeRelationResultValue(result: RelationApplyResult, key: string): un
   return (result as Record<string, unknown>)[key];
 }
 
-function appliedCount(result: AdapterCommitResult): number {
-  const applied = unsafeResultValue(result, 'applied');
-  return typeof applied === 'number' && Number.isFinite(applied) && applied >= 0 ? applied : 0;
-}
-
-function deltasArray(result: AdapterCommitResult): readonly RelationDelta[] {
-  const deltas = unsafeResultValue(result, 'deltas');
-  return Array.isArray(deltas) ? (deltas as readonly RelationDelta[]) : [];
-}
-
-function diagnosticsArray(result: AdapterCommitResult): readonly TarstateDiagnostic[] {
-  const diagnostics = unsafeResultValue(result, 'diagnostics');
-  return Array.isArray(diagnostics) ? (diagnostics as readonly TarstateDiagnostic[]) : [];
-}
-
-function unsafeResultValue(result: AdapterCommitResult, key: string): unknown {
-  return (result as Record<string, unknown>)[key];
-}
-
 function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
+}
+
+function isStringArray(input: unknown): input is readonly string[] {
+  return Array.isArray(input) && input.every((item) => typeof item === 'string');
 }

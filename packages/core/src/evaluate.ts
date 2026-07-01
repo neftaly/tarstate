@@ -18,15 +18,15 @@ export type QueryResult<Row> = {
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 
-export type RuntimeFunction = (...args: readonly unknown[]) => unknown;
-export type RuntimeFunctions = Readonly<Record<string, RuntimeFunction>>;
+export type EvaluateFunction = (...args: readonly unknown[]) => unknown;
+export type EvaluateFunctions = Readonly<Record<string, EvaluateFunction>>;
 export type EvaluateEnv = Readonly<Record<string, unknown>>;
 export type EvaluateOptions = {
-  readonly functions?: RuntimeFunctions;
+  readonly functions?: EvaluateFunctions;
   readonly env?: EvaluateEnv;
 };
 type EvaluationRuntime = {
-  readonly functions: RuntimeFunctions;
+  readonly functions: EvaluateFunctions;
   readonly env: EvaluateEnv;
 };
 
@@ -104,8 +104,8 @@ async function collectDiagnostics(source: RelationSource): Promise<TarstateDiagn
 function evaluationRuntimeFor(options: EvaluateOptions): EvaluationRuntime {
   return {
     functions: options.functions === undefined
-      ? builtinRuntimeFunctions
-      : { ...builtinRuntimeFunctions, ...options.functions },
+      ? builtinEvaluateFunctions
+      : { ...builtinEvaluateFunctions, ...options.functions },
     env: options.env ?? {}
   };
 }
@@ -1625,7 +1625,7 @@ function scopedContext(context: Context, scope: Context): Context {
   return { ...scope, ...context };
 }
 
-const builtinRuntimeFunctions: RuntimeFunctions = {
+const builtinEvaluateFunctions: EvaluateFunctions = {
   add: (...args) => args.reduce<number>((total, value) => total + numericValue(value), 0),
   sub: (left, right) => numericValue(left) - numericValue(right),
   mul: (...args) => args.reduce<number>((total, value) => total * numericValue(value), 1),

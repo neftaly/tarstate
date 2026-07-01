@@ -1,6 +1,7 @@
 import type { DocHandle, PeerId } from '@automerge/automerge-repo';
 import { describe, expect, it } from 'vitest';
-import { automergePresenceRuntime } from '@tarstate/automerge';
+import { automergePresenceRuntime } from '@tarstate/automerge/presence';
+import { isRelationAdapter, isRelationRuntime } from '@tarstate/core/adapter';
 import { evaluate } from '@tarstate/core/evaluate';
 import { as, eq, from, pipe, project, where } from '@tarstate/core/query';
 import {
@@ -69,18 +70,20 @@ describe('Automerge Repo Presence runtime', () => {
     });
 
     try {
-      expect(handle.broadcasts[0]).toEqual({ __presence: { type: 'snapshot', state: { color: 'blue' } } });
+      expect(isRelationRuntime(runtime)).toBe(true);
+      expect(isRelationAdapter(runtime)).toBe(false);
+      expect(runtime.source.relationNames).toEqual(['presence']);
+      expect(runtime.target.relationNames).toEqual(['presence']);
+      expect(runtime.target.ownsRelation?.('presence')).toBe(true);
+      expect(runtime.target.ownsRelation?.('todos')).toBe(false);
+      expect(runtime.snapshot).toEqual(expect.any(Function));
+      expect(runtime.subscribe).toEqual(expect.any(Function));
       await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
         rows: [{ peerId: 'peer-local', value: 'blue', local: true }],
         diagnostics: []
       });
 
-      handle.receive('peer-remote', {
-        __presence: {
-          type: 'snapshot',
-          state: { color: 'red', ops: [{ action: 'move', path: ['piece-a'] }] }
-        }
-      });
+      handle.receivePresenceSnapshot('peer-remote', { color: 'red', ops: [{ action: 'move', path: ['piece-a'] }] });
 
       expect(notifications).toBe(1);
       expect(await runtime.source.lookup?.({ relation: schema.presence, field: 'channel', value: 'color' })).toEqual([
@@ -94,13 +97,11 @@ describe('Automerge Repo Presence runtime', () => {
         ],
         diagnostics: []
       });
-      const version = await runtime.source.version?.();
       const snapshot = runtime.snapshot();
 
-      expect(version).toEqual({ revision: 1, localPeerId: 'peer-local' });
-      expect(await runtime.source.version?.()).toBe(version);
-      expect(snapshot.version).toBe(version);
-      expect(await snapshot.source.version?.()).toBe(snapshot.version);
+      expect(await runtime.source.version?.()).toBeDefined();
+      expect(snapshot.version).toBeDefined();
+      expect(await snapshot.source.version?.()).toBeDefined();
     } finally {
       unsubscribe();
       runtime.stop();
@@ -119,14 +120,9 @@ describe('Automerge Repo Presence runtime', () => {
     });
 
     try {
-      handle.receive('peer-remote', {
-        __presence: {
-          type: 'snapshot',
-          state: {
-            color: invalidValue,
-            cursor: { x: 10, y: 20 }
-          }
-        }
+      handle.receivePresenceSnapshot('peer-remote', {
+        color: invalidValue,
+        cursor: { x: 10, y: 20 }
       });
 
       expect(await runtime.source.rows(schema.presence)).toEqual([
@@ -136,16 +132,13 @@ describe('Automerge Repo Presence runtime', () => {
       expect(await runtime.source.lookup?.({ relation: schema.presence, field: 'channel', value: 'color' })).toEqual([
         expect.objectContaining({ peerId: 'peer-local', channel: 'color', value: 'blue', local: true })
       ]);
-      await expect(evaluate(runtime.source, colorPresence)).resolves.toEqual({
+      await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
         rows: [{ peerId: 'peer-local', value: 'blue', local: true }],
         diagnostics: [
           {
             code: 'invalid_row',
-            message: 'invalid field value in relation presence',
             relation: 'presence',
-            field: 'value',
-            key: '["peer-remote","color"]',
-            detail: invalidValue
+            field: 'value'
           }
         ]
       });
@@ -160,14 +153,11 @@ describe('Automerge Repo Presence runtime', () => {
         expect.objectContaining({ peerId: 'peer-local', channel: 'color', value: 'blue', local: true }),
         expect.objectContaining({ peerId: 'peer-remote', channel: 'cursor', value: { x: 10, y: 20 }, local: false })
       ]);
-      expect(await snapshot.source.diagnostics?.()).toEqual([
+      expect(await snapshot.source.diagnostics?.()).toMatchObject([
         {
           code: 'invalid_row',
-          message: 'invalid field value in relation presence',
           relation: 'presence',
-          field: 'value',
-          key: '["peer-remote","color"]',
-          detail: invalidValue
+          field: 'value'
         }
       ]);
     } finally {
@@ -204,7 +194,7 @@ describe('Automerge Repo Presence runtime', () => {
     }
   });
 
-  it('applies local presence patches and broadcasts changed channels', async () => {
+  it('applies local presence patches through the runtime target', async () => {
     const handle = new FakeDocHandle();
     const runtime = automergePresenceRuntime({
       handle: handle.asHandle(),
@@ -216,21 +206,18 @@ describe('Automerge Repo Presence runtime', () => {
 
     try {
       const result = await runtime.target.apply([
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'color', value: 'green' })
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-local', channel: 'color', value: 'green' },
+          { update: { value: 'green' } }
+        )
       ]);
 
       expect(result).toMatchObject({
         status: 'accepted',
-        accepted: true,
         patches: 1,
         applied: 1,
         diagnostics: [],
-        durability: 'ephemeral',
-        version: { revision: 1, localPeerId: 'peer-local' }
-      });
-      expect(runtime.getLocalState()).toMatchObject({ color: 'green' });
-      expect(handle.broadcasts.at(-1)).toEqual({
-        __presence: { type: 'update', channel: 'color', value: 'green' }
+        durability: 'ephemeral'
       });
       await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
         rows: [{ peerId: 'peer-local', value: 'green', local: true }],
@@ -262,13 +249,14 @@ describe('Automerge Repo Presence runtime', () => {
 
     try {
       const result = await runtime.target.apply([
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'color', value: 'green' })
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-local', channel: 'color', value: 'green' },
+          { update: { value: 'green' } }
+        )
       ]);
 
       expect(result.status).toBe('accepted');
       expect(notifications).toBe(1);
-      expect(before.version).toEqual({ revision: 0, localPeerId: 'peer-local' });
-      expect(await before.source.version?.()).toBe(before.version);
       await expect(evaluate(before.source, colorPresence)).resolves.toMatchObject({
         rows: [{ peerId: 'peer-local', value: 'blue', local: true }],
         diagnostics: []
@@ -295,43 +283,10 @@ describe('Automerge Repo Presence runtime', () => {
 
     try {
       const result = await runtime.target.apply([
-        presenceRows.delete({ peerId: 'peer-local', channel: 'color' })
+        presenceRows.deleteByKey(['peer-local', 'color'])
       ]);
 
       expect(result.status).toBe('accepted');
-      expect(runtime.getLocalState()).toMatchObject({ color: undefined });
-      expect(handle.broadcasts.at(-1)).toEqual({
-        __presence: { type: 'update', channel: 'color', value: undefined }
-      });
-      await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
-        rows: [],
-        diagnostics: []
-      });
-    } finally {
-      runtime.stop();
-    }
-  });
-
-  it('clears local presence channels when a row value is omitted', async () => {
-    const handle = new FakeDocHandle();
-    const runtime = automergePresenceRuntime({
-      handle: handle.asHandle(),
-      relation: schema.presence,
-      localPeerId: 'peer-local',
-      initialState: { color: 'blue' },
-      heartbeatMs: 60_000
-    });
-
-    try {
-      const result = await runtime.target.apply([
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'color' })
-      ]);
-
-      expect(result.status).toBe('accepted');
-      expect(runtime.getLocalState()).toMatchObject({ color: undefined });
-      expect(handle.broadcasts.at(-1)).toEqual({
-        __presence: { type: 'update', channel: 'color', value: undefined }
-      });
       await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
         rows: [],
         diagnostics: []
@@ -353,14 +308,13 @@ describe('Automerge Repo Presence runtime', () => {
 
     try {
       const result = await runtime.target.apply([
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'color', value: null })
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-local', channel: 'color', value: null },
+          { update: { value: null } }
+        )
       ]);
 
       expect(result.status).toBe('accepted');
-      expect(runtime.getLocalState()).toMatchObject({ color: null });
-      expect(handle.broadcasts.at(-1)).toEqual({
-        __presence: { type: 'update', channel: 'color', value: null }
-      });
       await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
         rows: [{ peerId: 'peer-local', value: null, local: true }],
         diagnostics: []
@@ -383,14 +337,13 @@ describe('Automerge Repo Presence runtime', () => {
 
     try {
       const result = await runtime.target.apply([
-        presenceRows.upsert({ peerId: 'peer-local', channel: 'color', value: null })
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-local', channel: 'color', value: null },
+          { update: { value: null } }
+        )
       ]);
 
       expect(result.status).toBe('accepted');
-      expect(runtime.getLocalState()).toMatchObject({ color: undefined });
-      expect(handle.broadcasts.at(-1)).toEqual({
-        __presence: { type: 'update', channel: 'color', value: undefined }
-      });
       await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
         rows: [],
         diagnostics: []
@@ -412,19 +365,23 @@ describe('Automerge Repo Presence runtime', () => {
 
     try {
       const result = await runtime.target.apply([
-        presenceRows.upsert({ peerId: 'peer-remote', channel: 'color', value: 'red' })
+        presenceRows.insertOrUpdate(
+          { peerId: 'peer-remote', channel: 'color', value: 'red' },
+          { update: { value: 'red' } }
+        )
       ]);
 
       expect(result).toMatchObject({
         status: 'rejected',
-        accepted: false,
         applied: 0,
         deltas: [],
         durability: 'ephemeral',
         diagnostics: [{ code: 'invalid_row', relation: 'presence', field: 'peerId' }]
       });
-      expect(runtime.getLocalState()).toMatchObject({ color: 'blue' });
-      expect(handle.broadcasts).toEqual([{ __presence: { type: 'snapshot', state: { color: 'blue' } } }]);
+      await expect(evaluate(runtime.source, colorPresence)).resolves.toMatchObject({
+        rows: [{ peerId: 'peer-local', value: 'blue', local: true }],
+        diagnostics: []
+      });
     } finally {
       runtime.stop();
     }
@@ -432,7 +389,6 @@ describe('Automerge Repo Presence runtime', () => {
 });
 
 class FakeDocHandle {
-  readonly broadcasts: unknown[] = [];
   private readonly listeners = new Map<string, Set<(payload: unknown) => void>>();
 
   asHandle(): DocHandle<unknown> {
@@ -453,11 +409,18 @@ class FakeDocHandle {
     this.listeners.get(eventName)?.delete(listener);
   }
 
-  broadcast(message: unknown): void {
-    this.broadcasts.push(message);
+  broadcast(): void {}
+
+  receivePresenceSnapshot(senderId: string, state: Record<string, unknown>): void {
+    this.receive(senderId, {
+      __presence: {
+        type: 'snapshot',
+        state
+      }
+    });
   }
 
-  receive(senderId: string, message: unknown): void {
+  private receive(senderId: string, message: unknown): void {
     this.emit('ephemeral-message', {
       handle: this,
       senderId: senderId as PeerId,

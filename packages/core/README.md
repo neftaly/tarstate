@@ -12,11 +12,16 @@ The core API is stabilizing around a Relic-shaped split:
 
 - `store` is the small app-facing facade: `createStore(seedRows)` returns a
   renderer-independent store with `query`, `queries`, `view`, non-throwing
-  `commit`, and subscriptions. A `view(query)` is the stable derived-read API;
-  materialization stays an optional cache behind the same `view.read()` shape.
+  `commit`, and subscriptions. Store commit results use
+  `accepted`/`partial`/`rejected` status plus a separate `reflected` flag for
+  row effects. A `view(query)` is the stable derived-read API; materialization
+  remains an experimental core cache API outside the stable store contract.
 - `query` describes relational row programs as data, including joins,
   explicit lookup, hash-declared equality lookup planning, btree-declared range
-  lookup planning, dependency analysis, projections, aggregates, and nested
+  lookup planning, query-only `uniqueIndex` metadata, dependency analysis
+  through `dependencies`, propagated result identity through `rowKeyFields`,
+  projections, `qualifyRow`, `aggregate({ groupBy, aggregates })`, aggregate
+  helpers such as `countDistinct`/`avg`/`notAny`/`setConcat`, and nested
   collection expansion.
 - `source` describes read-only row sources with `rows`, optional equality
   `lookup`, optional range `rangeLookup`, optional opaque `version`, and
@@ -24,25 +29,41 @@ The core API is stabilizing around a Relic-shaped split:
   means the current source identity is unknown.
 - `adapter` is the write-capable storage boundary: `RelationRuntime` combines a
   `RelationSource`, optional patch target, optional snapshot, and optional host
-  subscription. Durable `RelationAdapter.commit(patches)` remains the
-  compatibility shape for storage adapters, with
-  `relationApplyResultFromAdapterCommit` bridging that durable commit result
-  into generic relation-target apply semantics. The root convenience barrel also
-  exports `createMemoryRelationRuntime` for small non-durable examples and
-  tests.
-- `write` defines the typed mutation vocabulary, including `deleteExact` and
-  `replaceAll` alongside insert/update/upsert/delete patches.
-- `delta` and `diff` are the change primitives: relation-level change batches
-  and structural/keyed row diffs.
-- `db` gives those programs a small object-backed `q`/`qMany`/`transact`
-  runtime for examples, tests, and local state.
+  subscription. Patch targets and durable adapter commits use the same
+  `accepted`/`partial`/`rejected` status vocabulary, with `accepted` indicating
+  whether the full patch batch was accepted. Patch targets can declare writable
+  relation ownership with `target.relationNames` or `target.ownsRelation`;
+  composed runtimes use that target metadata before treating read-side
+  `source.relationNames` as a compatibility fallback. Durable
+  `RelationAdapter.commit(patches)` remains the compatibility shape for storage
+  adapters and returns the same result envelope as generic relation-target apply
+  semantics. The root convenience barrel also exports
+  `createMemoryRelationRuntime` for small non-durable examples and tests.
+- `write` defines the typed mutation vocabulary, including insert/insert-ignore,
+  `insertOrReplace`, key-scoped `updateByKey`/`deleteByKey`, predicate
+  `update`/`delete`, compatibility predicate aliases `updateWhere`/`deleteWhere`,
+  `deleteExact`, `replaceAll`, `insertOrMerge(row, { merge })`, and explicit
+  `insertOrUpdate(row, { update })` constant set-map descriptors. Computed
+  update expressions are left to a future explicit API.
+- `RelationDelta` is the stable adapter change-report type; experimental delta
+  and diff helpers remain lower-level change primitives.
+- `db` gives those programs a small object-backed runtime for examples, tests,
+  and local state: diagnostics-aware `q`/`qMany`, row-only `qRows`/`qManyRows`,
+  `stripMeta` for recovering normalized row data from a `Db`, and variadic
+  all-or-nothing `tryTransact`/`transact` helpers. DB-facing helper names
+  include `dbUpdateWhere` and `dbDeleteWhere`; explicit insert-or-update writes
+  use `insertOrUpdate(row, { update })` from `write`.
 - `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
   rows for tests, local state, and adapter prototyping.
 - `constraints`, `materialization`, `watch`, and `runtime` are experimental,
   diagnostic-backed surfaces. They provide baseline validation, explicit
   object-backed constraint enforcement, committed relation deltas, snapshot
   caches with exact materialized-query read-through, manual/recompute-backed
-  watch refresh, and patch-target commit tracking. Partial incremental view
+  watch refresh, Relic-style `watchTarget`/`unwatchTarget` registration,
+  `watchChangeMap`, and patch-target commit tracking. `trackTransactPatches`
+  exposes planned object-backed tracked-transaction patches without committing
+  them. Query-bound `req`/`unique`/`fk` constraints are descriptor-only stubs
+  until query/materialized constraint enforcement exists. Partial incremental view
   maintenance is only an opportunistic optimization behind materialized
   snapshots; some supported shapes rebuild from source rows inside that path,
   and unsupported shapes keep explicit diagnostics and recompute/refresh fallback.
@@ -51,9 +72,11 @@ The core API is stabilizing around a Relic-shaped split:
   Incremental aggregate maintenance supports a narrow subset; `avg(expr)` is
   incremental only when matching visible `sum(expr)`/`count(expr)` fields are
   present over a non-null numeric base field or numeric literal.
-  General constraints, operator-maintained views/indexes, adapter-fed deltas for
-  host invalidations, async watch streams, and public IVM APIs are outside the
-  current guarantees.
+  Materialization `index` exposes set and hash facades over cached snapshot rows;
+  btree and unique facades return explicit unsupported result families. General
+  constraints, operator-maintained views/indexes, adapter-fed deltas for host
+  invalidations, async watch streams, and public IVM APIs are outside the current
+  guarantees.
 
 See [developer-onboarding.md](../../docs/developer-onboarding.md) for current
 API status, onboarding flows, and package direction.
@@ -116,16 +139,6 @@ const todoRows = pipe(
 const todos = (await evaluate(source, todoRows)).rows
 ```
 
-## Materialization Snapshot Indexes
-
-`snapshotIndex(db, target)` remains the compatibility helper for reading cached
-snapshot rows as a set. `snapshotHashIndex(db, target, field)` builds a small
-read-only lookup map from the same cached snapshot rows, grouped by an own field
-on each cached row. These helpers expose snapshot cache indexes, not Relic-style
-operator-maintained indexes or a public IVM API: missing materializations,
-metadata-only declarations, and rows that cannot be keyed by the requested field
-return explicit materialization diagnostics instead.
-
 ## Package Boundary
 
 `@tarstate/core` is the standalone generic query/data library. Keep package
@@ -134,22 +147,23 @@ code independent from application schemas, renderers, adapters, and wrappers.
 Examples and onboarding should teach taxonomy subpath imports:
 
 - `@tarstate/core/adapter`
-- `@tarstate/core/constraints`
+- `@tarstate/core/experimental/constraints`
 - `@tarstate/core/db`
-- `@tarstate/core/delta`
-- `@tarstate/core/diff`
+- `@tarstate/core/experimental/delta`
+- `@tarstate/core/experimental/diff`
 - `@tarstate/core/diagnostics`
 - `@tarstate/core/evaluate`
-- `@tarstate/core/identity`
-- `@tarstate/core/materialization`
+- `@tarstate/core/experimental/identity`
+- `@tarstate/core/experimental/indexed-source`
+- `@tarstate/core/experimental/materialization`
 - `@tarstate/core/query`
-- `@tarstate/core/runtime`
+- `@tarstate/core/experimental/runtime`
 - `@tarstate/core/schema`
 - `@tarstate/core/source`
 - `@tarstate/core/store`
-- `@tarstate/core/watch`
+- `@tarstate/core/experimental/watch`
 - `@tarstate/core/write`
-- `@tarstate/core/write-apply`
+- `@tarstate/core/experimental/write-apply`
 
 The root barrel `@tarstate/core` remains a public convenience export for small
 consumers and compatibility, but subpaths make API ownership clearer in docs and

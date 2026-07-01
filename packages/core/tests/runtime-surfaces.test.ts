@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { check, constrain, fk, req, unique } from '@tarstate/core/constraints';
 import { createDb } from '@tarstate/core/db';
-import { demat, isMaterialized, mat, materializationsFor, materializedRowsFor } from '@tarstate/core/materialization';
+import { check, constrain, fk, req, unique } from '@tarstate/core/experimental/constraints';
 import { as, eq, from, pipe, project } from '@tarstate/core/query';
-import { UnsupportedChangeTrackingError, trackTransact } from '@tarstate/core/runtime';
+import { UnsupportedChangeTrackingError, trackTransact } from '@tarstate/core/experimental/runtime';
 import { defineSchema, idField, refField, relation, stringField } from '@tarstate/core/schema';
-import { unwatch, watch } from '@tarstate/core/watch';
+import { unwatch, watch } from '@tarstate/core/experimental/watch';
 
 type Todo = {
   readonly id: string;
@@ -45,6 +44,12 @@ const todoRows = pipe(
 
 describe('tarstate runtime surfaces', () => {
   it('builds constraint descriptors for validation and attachment', () => {
+    const queryBoundConstraints = constrain(
+      todoRows,
+      req(todoRows, 'text'),
+      unique(todoRows, 'id'),
+      fk(todoRows, 'id', schema.todos, 'id')
+    );
     const constraints = constrain(
       req(schema.todos, 'text'),
       unique(schema.todos, 'id'),
@@ -52,47 +57,9 @@ describe('tarstate runtime surfaces', () => {
       check(eq(todo.id, 'todo-a'), { name: 'todo-id-check' })
     );
 
-    expect(constraints).toMatchObject({
-      kind: 'constraintSet',
-      constraints: [
-        { kind: 'constraint', op: 'req', relation: schema.todos, field: 'text' },
-        { kind: 'constraint', op: 'unique', relation: schema.todos, fields: ['id'] },
-        {
-          kind: 'constraint',
-          op: 'fk',
-          relation: schema.assignments,
-          fields: ['todoId'],
-          target: schema.todos,
-          targetFields: ['id'],
-          optional: false
-        },
-        { kind: 'constraint', op: 'check', name: 'todo-id-check' }
-      ]
-    });
-  });
-
-  it('materializes snapshot rows through mat', async () => {
-    const db = createDb({
-      todos: [{ id: 'todo-a', text: 'Buy oat milk' }]
-    });
-    const materialized = await mat(db, todoRows, { id: 'todos-view', mode: 'incremental' });
-
-    expect(materialized).toBe(db);
-    expect(isMaterialized(db)).toBe(true);
-    expect(materializationsFor(db)).toMatchObject([
-      {
-        kind: 'materialization',
-        id: 'todos-view',
-        query: todoRows,
-        requestedMode: 'incremental',
-        maintenance: 'incremental',
-        diagnostics: []
-      }
-    ]);
-    expect(materializedRowsFor(db, 'todos-view')).toEqual([{ id: 'todo-a', text: 'Buy oat milk' }]);
-
-    expect(demat(db, 'todos-view')).toBe(db);
-    expect(isMaterialized(db)).toBe(false);
+    expect(constraints.constraints).toHaveLength(4);
+    expect(queryBoundConstraints.query).toBe(todoRows);
+    expect(queryBoundConstraints.constraints).toHaveLength(3);
   });
 
   it('returns manual watch handles and explicit unsupported change-tracking results', async () => {

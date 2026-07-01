@@ -1,4 +1,5 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
+import type { RelationDelta } from './adapter.js';
 import {
   createRelationDeltaAccumulator,
   recordAddedDelta,
@@ -6,19 +7,22 @@ import {
   relationDeltasFromAccumulator,
   type RelationDeltaAccumulator
 } from './delta-accumulator.js';
-import type { RelationDelta } from './delta.js';
 import { stableKey } from './identity.js';
 import { isJsonValue, type FieldSpec, type RelationRef } from './schema.js';
 import { writeInputPatches } from './write.js';
 import type {
   DeleteExactPatch,
+  DeleteByKeyPatch,
   DeletePatch,
+  InsertIgnorePatch,
   InsertOrMergePatch,
+  InsertOrReplacePatch,
+  InsertOrUpdatePatch,
   InsertPatch,
   RelationKeyInput,
   ReplaceAllPatch,
+  UpdateByKeyPatch,
   UpdatePatch,
-  UpsertPatch,
   WriteInput,
   WritePatch
 } from './write.js';
@@ -132,13 +136,23 @@ function applyWrite(context: WriteApplyContext, patch: WritePatch): boolean {
 
   switch (patch.op) {
     case 'insert':
-      return applyInsert(context, plan, patch);
+      return applyInsert(context, plan, patch, false);
+    case 'insertIgnore':
+      return applyInsert(context, plan, patch, true);
+    case 'insertOrReplace':
+      return applyInsertOrReplace(context, plan, patch);
+    case 'updateByKey':
+      return applyUpdateByKey(context, plan, patch);
     case 'update':
-      return applyUpdate(context, plan, patch);
-    case 'upsert':
-      return patch.mode === 'merge' ? applyInsertOrMerge(context, plan, patch) : applyUpsert(context, plan, patch);
+      return applyUnsupportedPredicatePatch(context, patch);
+    case 'insertOrMerge':
+      return applyInsertOrMerge(context, plan, patch);
+    case 'insertOrUpdate':
+      return applyInsertOrUpdate(context, plan, patch);
+    case 'deleteByKey':
+      return applyDeleteByKey(context, plan, patch);
     case 'delete':
-      return applyDelete(context, plan, patch);
+      return applyUnsupportedPredicatePatch(context, patch);
     case 'deleteExact':
       return applyDeleteExact(context, plan, patch);
     case 'replaceAll':
@@ -146,7 +160,12 @@ function applyWrite(context: WriteApplyContext, patch: WritePatch): boolean {
   }
 }
 
-function applyInsert(context: WriteApplyContext, plan: RelationWritePlan, patch: InsertPatch): boolean {
+function applyInsert(
+  context: WriteApplyContext,
+  plan: RelationWritePlan,
+  patch: InsertPatch | InsertIgnorePatch,
+  ignoreConflict: boolean
+): boolean {
   const row = validPatchRow(plan, patch.row, context.diagnostics);
 
   if (row === undefined) {
@@ -163,7 +182,7 @@ function applyInsert(context: WriteApplyContext, plan: RelationWritePlan, patch:
   const state = stateFor(context, plan, true);
 
   if (hasIndexedKey(state, key)) {
-    if (patch.onConflict === 'ignore') {
+    if (ignoreConflict) {
       return true;
     }
 
@@ -177,7 +196,60 @@ function applyInsert(context: WriteApplyContext, plan: RelationWritePlan, patch:
   return true;
 }
 
-function applyUpdate(context: WriteApplyContext, plan: RelationWritePlan, patch: UpdatePatch): boolean {
+function applyInsertOrReplace(
+  context: WriteApplyContext,
+  plan: RelationWritePlan,
+  patch: InsertOrReplacePatch
+): boolean {
+  const row = validPatchRow(plan, patch.row, context.diagnostics);
+
+  if (row === undefined) {
+    return false;
+  }
+
+  const key = rowKey(plan, row);
+
+  if (key === undefined) {
+    context.diagnostics.push(missingKeyDiagnostic(patch.relation));
+    return false;
+  }
+
+  const state = stateFor(context, plan, true);
+
+  if (state.duplicateKeys.has(key.indexKey)) {
+    context.diagnostics.push(duplicateKeyDiagnostic(patch.relation, keyDiagnostic(key)));
+    return false;
+  }
+
+  const existingIndex = state.indexes.get(key.indexKey);
+  const nextRow = copyRow(row);
+
+  if (existingIndex === undefined) {
+    addIndexedRow(state, key, nextRow);
+    recordAddedDelta(context.deltas, plan.relation, nextRow);
+    return true;
+  }
+
+  const current = state.rows[existingIndex];
+
+  if (!isRecord(current)) {
+    context.diagnostics.push({
+      code: 'invalid_row',
+      message: `row for relation ${patch.relation.name} is not an object`,
+      relation: patch.relation.name,
+      detail: current
+    });
+    return false;
+  }
+
+  const previousRow = copyRow(current);
+  replaceIndexedRow(state, existingIndex, key, key, nextRow);
+  recordRemovedDelta(context.deltas, plan.relation, previousRow);
+  recordAddedDelta(context.deltas, plan.relation, copyRow(nextRow));
+  return true;
+}
+
+function applyUpdateByKey(context: WriteApplyContext, plan: RelationWritePlan, patch: UpdateByKeyPatch): boolean {
   if (!isRecord(patch.changes)) {
     context.diagnostics.push({
       code: 'invalid_row',
@@ -240,45 +312,6 @@ function applyUpdate(context: WriteApplyContext, plan: RelationWritePlan, patch:
   return true;
 }
 
-function applyUpsert(context: WriteApplyContext, plan: RelationWritePlan, patch: UpsertPatch): boolean {
-  const row = validPatchRow(plan, patch.row, context.diagnostics);
-
-  if (row === undefined) {
-    return false;
-  }
-
-  const key = rowKey(plan, row);
-
-  if (key === undefined) {
-    context.diagnostics.push(missingKeyDiagnostic(patch.relation));
-    return false;
-  }
-
-  const state = stateFor(context, plan, true);
-
-  if (state.duplicateKeys.has(key.indexKey)) {
-    context.diagnostics.push(duplicateKeyDiagnostic(patch.relation, keyDiagnostic(key)));
-    return false;
-  }
-
-  const existingIndex = state.indexes.get(key.indexKey);
-
-  if (existingIndex === undefined) {
-    const nextRow = copyRow(row);
-    addIndexedRow(state, key, nextRow);
-    recordAddedDelta(context.deltas, plan.relation, nextRow);
-  } else {
-    const previous = state.rows[existingIndex];
-    const nextRow = copyRow(row);
-    state.rows[existingIndex] = nextRow;
-    state.rowKeys[existingIndex] = key;
-    recordRemovedDelta(context.deltas, plan.relation, isRecord(previous) ? copyRow(previous) : previous);
-    recordAddedDelta(context.deltas, plan.relation, nextRow);
-  }
-
-  return true;
-}
-
 function applyInsertOrMerge(
   context: WriteApplyContext,
   plan: RelationWritePlan,
@@ -294,9 +327,10 @@ function applyInsertOrMerge(
     return false;
   }
 
-  const key = keyFromInput(plan, patch.row, context.diagnostics);
+  const key = rowKey(plan, patch.row);
 
   if (key === undefined) {
+    context.diagnostics.push(missingKeyDiagnostic(patch.relation));
     return false;
   }
 
@@ -336,7 +370,7 @@ function applyInsertOrMerge(
   }
 
   const previousRow = copyRow(current);
-  const nextRow = { ...current, ...patch.row };
+  const nextRow = { ...current, ...mergeRowChanges(patch) };
   const rowDiagnostics = validateRow(plan, nextRow);
 
   if (rowDiagnostics.length > 0) {
@@ -362,7 +396,106 @@ function applyInsertOrMerge(
   return true;
 }
 
-function applyDelete(context: WriteApplyContext, plan: RelationWritePlan, patch: DeletePatch): boolean {
+function mergeRowChanges(patch: InsertOrMergePatch): Record<string, unknown> {
+  if (patch.merge === 'provided' || patch.merge === 'all') {
+    return copyRow(patch.row);
+  }
+
+  const changes: Record<string, unknown> = {};
+
+  for (const fieldName of patch.merge) {
+    if (Object.hasOwn(patch.row, fieldName)) {
+      changes[fieldName] = patch.row[fieldName];
+    }
+  }
+
+  return changes;
+}
+
+function applyInsertOrUpdate(
+  context: WriteApplyContext,
+  plan: RelationWritePlan,
+  patch: InsertOrUpdatePatch
+): boolean {
+  const row = validPatchRow(plan, patch.row, context.diagnostics);
+
+  if (row === undefined) {
+    return false;
+  }
+
+  if (!isRecord(patch.update)) {
+    context.diagnostics.push({
+      code: 'invalid_row',
+      message: `update for relation ${patch.relation.name} is not an object`,
+      relation: patch.relation.name,
+      detail: patch.update
+    });
+    return false;
+  }
+
+  const key = rowKey(plan, row);
+
+  if (key === undefined) {
+    context.diagnostics.push(missingKeyDiagnostic(patch.relation));
+    return false;
+  }
+
+  const state = stateFor(context, plan, true);
+
+  if (state.duplicateKeys.has(key.indexKey)) {
+    context.diagnostics.push(duplicateKeyDiagnostic(patch.relation, keyDiagnostic(key)));
+    return false;
+  }
+
+  const existingIndex = state.indexes.get(key.indexKey);
+
+  if (existingIndex === undefined) {
+    const nextRow = copyRow(row);
+    addIndexedRow(state, key, nextRow);
+    recordAddedDelta(context.deltas, plan.relation, nextRow);
+    return true;
+  }
+
+  const current = state.rows[existingIndex];
+
+  if (!isRecord(current)) {
+    context.diagnostics.push({
+      code: 'invalid_row',
+      message: `row for relation ${patch.relation.name} is not an object`,
+      relation: patch.relation.name,
+      detail: current
+    });
+    return false;
+  }
+
+  const previousRow = copyRow(current);
+  const nextRow = { ...current, ...patch.update };
+  const rowDiagnostics = validateRow(plan, nextRow);
+
+  if (rowDiagnostics.length > 0) {
+    context.diagnostics.push(...rowDiagnostics);
+    return false;
+  }
+
+  const nextKey = rowKey(plan, nextRow);
+
+  if (nextKey === undefined) {
+    context.diagnostics.push(missingKeyDiagnostic(patch.relation));
+    return false;
+  }
+
+  if (hasConflictingIndexedKey(state, nextKey, existingIndex)) {
+    context.diagnostics.push(duplicateKeyDiagnostic(patch.relation, keyDiagnostic(nextKey)));
+    return false;
+  }
+
+  replaceIndexedRow(state, existingIndex, key, nextKey, nextRow);
+  recordRemovedDelta(context.deltas, plan.relation, previousRow);
+  recordAddedDelta(context.deltas, plan.relation, copyRow(nextRow));
+  return true;
+}
+
+function applyDeleteByKey(context: WriteApplyContext, plan: RelationWritePlan, patch: DeleteByKeyPatch): boolean {
   const key = keyFromInput(plan, patch.key, context.diagnostics);
 
   if (key === undefined) {
@@ -447,6 +580,19 @@ function applyReplaceAll(
   }
 
   return true;
+}
+
+function applyUnsupportedPredicatePatch(
+  context: WriteApplyContext,
+  patch: UpdatePatch | DeletePatch
+): boolean {
+  context.diagnostics.push({
+    code: 'unsupported_expression',
+    message: `${patch.op} for relation ${patch.relation.name} requires predicate write support`,
+    relation: patch.relation.name,
+    detail: patch.predicate
+  });
+  return false;
 }
 
 function validateReplaceAllRows(
@@ -620,28 +766,50 @@ function planFor(context: WriteApplyContext, relationRef: RelationRef): Relation
 
 function keyFromInput(
   plan: RelationWritePlan,
-  input: RelationKeyInput<Record<string, unknown>>,
+  input: RelationKeyInput,
   diagnostics: TarstateDiagnostic[]
 ): RelationKeyValue | undefined {
   if (plan.singleKeyField !== undefined) {
-    const value = isRecord(input) ? input[plan.singleKeyField] : input;
+    if (Array.isArray(input)) {
+      if (input.length !== 1) {
+        diagnostics.push({
+          code: 'invalid_row',
+          message: `key for relation ${plan.relation.name} requires 1 field value`,
+          relation: plan.relation.name,
+          detail: input
+        });
+        return undefined;
+      }
 
-    if (value === undefined) {
+      if (input[0] === undefined) {
+        diagnostics.push({
+          code: 'invalid_row',
+          message: `missing key field ${plan.singleKeyField} in relation ${plan.relation.name}`,
+          relation: plan.relation.name,
+          field: plan.singleKeyField
+        });
+        return undefined;
+      }
+
+      return keyValueFor(input);
+    }
+
+    if (typeof input !== 'string' && typeof input !== 'number') {
       diagnostics.push({
         code: 'invalid_row',
-        message: `missing key field ${plan.singleKeyField} in relation ${plan.relation.name}`,
+        message: `key for relation ${plan.relation.name} requires a string, number, or one-field tuple`,
         relation: plan.relation.name,
-        field: plan.singleKeyField
+        detail: input
       });
       return undefined;
     }
 
-    return keyValueFor([value]);
+    return keyValueFor([input]);
   }
 
   const keyFields = plan.keyFields;
 
-  if (!isRecord(input) && !Array.isArray(input)) {
+  if (!Array.isArray(input)) {
     diagnostics.push({
       code: 'invalid_row',
       message: `composite key for relation ${plan.relation.name} requires ${keyFields.join(', ')}`,
@@ -651,7 +819,7 @@ function keyFromInput(
     return undefined;
   }
 
-  const values = isRecord(input) ? keyFields.map((fieldName) => input[fieldName]) : input;
+  const values = input;
 
   if (values.length !== keyFields.length) {
     diagnostics.push({

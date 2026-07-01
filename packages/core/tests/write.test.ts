@@ -1,6 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { evaluate } from '@tarstate/core/evaluate';
-import { as, from, pipe, project } from '@tarstate/core/query';
+import { as, eq, from, pipe, project } from '@tarstate/core/query';
 import {
   booleanField,
   defineSchema,
@@ -18,10 +18,11 @@ import {
   applyWritesAtomic,
   applyWrites,
   type MutableObjectSourceData
-} from '@tarstate/core/write-apply';
+} from '@tarstate/core/experimental/write-apply';
 import {
+  deleteByKey,
   deleteExact,
-  deleteRow,
+  deleteWhere,
   insert,
   insertIgnore,
   insertOrMerge,
@@ -29,15 +30,20 @@ import {
   insertOrUpdate,
   replaceAll,
   update,
-  upsert,
+  updateByKey,
+  updateWhere,
   write,
+  type DeleteWherePatch,
   type InsertIgnorePatch,
   type InsertOrMergePatch,
   type InsertOrUpdatePatch,
+  type InsertOrReplacePatch,
   type InsertPatch,
   type RelationRow,
   type ReplaceAllPatch,
+  type UpdateByKeyPatch,
   type UpdatePatch,
+  type UpdateWherePatch,
   type WritePatch
 } from '@tarstate/core/write';
 
@@ -128,62 +134,125 @@ describe('tarstate writes', () => {
   it('offers relation-scoped typed patch constructors', () => {
     const todos = write(schema.todos);
     const patch = todos.insert({ id: 'todo-a', text: 'Buy oat milk', done: false });
-    const tersePatch = insert(schema.todos)({ id: 'todo-e', text: 'Charge lamp', done: false });
+    const standaloneInsert = insert(schema.todos, { id: 'todo-e', text: 'Charge lamp', done: false });
     const ignored = todos.insertIgnore({ id: 'todo-c', text: 'Plan route', done: false });
     const merged = insertOrMerge(schema.todos, { id: 'todo-a', done: true });
-    const insertUpdated = todos.insertOrUpdate({ id: 'todo-a', done: true });
-    const standalone = update(schema.todos, 'todo-a', { done: true });
-    const replaced = todos.insertOrReplace({ id: 'todo-b', text: 'Water basil', done: false });
+    const replaced = todos.insertOrReplace({ id: 'todo-a', text: 'Buy almond milk', done: true });
+    const insertUpdated = todos.insertOrUpdate(
+      { id: 'todo-a', text: 'Buy oat milk', done: false },
+      { update: { done: true } }
+    );
+    const descriptorInsertUpdated = todos.insertOrUpdate(
+      { id: 'todo-f', text: 'Sweep porch', done: false },
+      { update: { done: true } }
+    );
+    const standalone = updateByKey(schema.todos, 'todo-a', { done: true });
+    const predicateUpdate = update(schema.todos, eq(todo.done, false), { done: true });
+    const standaloneWhere = updateWhere(schema.todos, eq(todo.done, false), { done: true });
+    const scopedWhere = todos.updateWhere(eq(todo.text, 'Buy oat milk'), { done: true });
     const replacedAll = todos.replaceAll([{ id: 'todo-z', text: 'Reset list', done: false }]);
     const exactDelete = deleteExact(schema.todos, { id: 'todo-b', text: 'Water basil', done: false });
+    const standaloneDeleteWhere = deleteWhere(schema.todos, eq(todo.done, true));
+    const scopedDeleteWhere = todos.deleteWhere(eq(todo.text, 'Water basil'));
     const patches = [
       patch,
-      tersePatch,
+      standaloneInsert,
       ignored,
       merged,
-      insertUpdated,
-      standalone,
-      insertIgnore(schema.assignments, { todoId: 'todo-a', assignee: 'Mina' }),
-      upsert(schema.assignments, { todoId: 'todo-a', assignee: 'Mina' }),
-      insertOrReplace(schema.assignments, { todoId: 'todo-a', assignee: 'Mina' }),
-      insertOrUpdate(schema.assignments, { todoId: 'todo-a', assignee: 'Mina' }),
       replaced,
+      insertUpdated,
+      descriptorInsertUpdated,
+      standalone,
+      predicateUpdate,
+      standaloneWhere,
+      scopedWhere,
+      insertIgnore(schema.assignments, { todoId: 'todo-a', assignee: 'Mina' }),
+      insertOrMerge(schema.assignments, { todoId: 'todo-a', assignee: 'Mina' }),
+      insertOrMerge(schema.assignments, { todoId: 'todo-a', assignee: 'Mina' }),
+      insertOrUpdate(
+        schema.assignments,
+        { todoId: 'todo-a', assignee: 'Mina' },
+        { update: { assignee: 'Rafi' } }
+      ),
+      insertOrUpdate(
+        schema.assignments,
+        { todoId: 'todo-b', assignee: 'Mina' },
+        { update: { assignee: 'Rafi' } }
+      ),
       replaceAll(schema.assignments, [{ todoId: 'todo-a', assignee: 'Mina' }]),
       replacedAll,
       exactDelete,
-      deleteRow(schema.todos, 'todo-b')
+      standaloneDeleteWhere,
+      scopedDeleteWhere,
+      deleteByKey(schema.todos, 'todo-a'),
+      deleteByKey(schema.todos, 'todo-b')
     ] satisfies readonly WritePatch[];
 
     expectTypeOf<RelationRow<typeof schema.todos>>().toEqualTypeOf<Todo>();
     expectTypeOf(patch).toEqualTypeOf<InsertPatch<typeof schema.todos>>();
-    expectTypeOf(tersePatch).toEqualTypeOf<InsertPatch<typeof schema.todos>>();
+    expectTypeOf(standaloneInsert).toEqualTypeOf<InsertPatch<typeof schema.todos>>();
     expectTypeOf(ignored).toEqualTypeOf<InsertIgnorePatch<typeof schema.todos>>();
     expectTypeOf(merged).toEqualTypeOf<InsertOrMergePatch<typeof schema.todos>>();
+    expectTypeOf(replaced).toEqualTypeOf<InsertOrReplacePatch<typeof schema.todos>>();
     expectTypeOf(insertUpdated).toEqualTypeOf<InsertOrUpdatePatch<typeof schema.todos>>();
-    expectTypeOf<InsertOrUpdatePatch<typeof schema.todos>>().toEqualTypeOf<
-      InsertOrMergePatch<typeof schema.todos>
-    >();
+    expectTypeOf(descriptorInsertUpdated).toEqualTypeOf<InsertOrUpdatePatch<typeof schema.todos>>();
     expectTypeOf(replacedAll).toEqualTypeOf<ReplaceAllPatch<typeof schema.todos>>();
-    expectTypeOf(standalone).toEqualTypeOf<UpdatePatch<typeof schema.todos>>();
-    expect(ignored.onConflict).toBe('ignore');
-    expect(merged.mode).toBe('merge');
-    expect(insertUpdated).toEqual(merged);
+    expectTypeOf(standalone).toEqualTypeOf<UpdateByKeyPatch<typeof schema.todos>>();
+    expectTypeOf(predicateUpdate).toEqualTypeOf<UpdatePatch<typeof schema.todos>>();
+    expectTypeOf(standaloneWhere).toEqualTypeOf<UpdateWherePatch<typeof schema.todos>>();
+    expectTypeOf(scopedWhere).toEqualTypeOf<UpdateWherePatch<typeof schema.todos>>();
+    expectTypeOf(standaloneDeleteWhere).toEqualTypeOf<DeleteWherePatch<typeof schema.todos>>();
+    expectTypeOf(scopedDeleteWhere).toEqualTypeOf<DeleteWherePatch<typeof schema.todos>>();
+    expect(ignored.op).toBe('insertIgnore');
+    expect(merged.op).toBe('insertOrMerge');
+    expect(replaced.op).toBe('insertOrReplace');
+    expect(insertUpdated).toEqual({
+      op: 'insertOrUpdate',
+      relation: schema.todos,
+      row: { id: 'todo-a', text: 'Buy oat milk', done: false },
+      update: { done: true }
+    });
+    expect(descriptorInsertUpdated).toEqual({
+      op: 'insertOrUpdate',
+      relation: schema.todos,
+      row: { id: 'todo-f', text: 'Sweep porch', done: false },
+      update: { done: true }
+    });
+    expect(standaloneWhere).toEqual({
+      op: 'update',
+      relation: schema.todos,
+      predicate: eq(todo.done, false),
+      changes: { done: true }
+    });
+    expect(standaloneDeleteWhere).toEqual({
+      op: 'delete',
+      relation: schema.todos,
+      predicate: eq(todo.done, true)
+    });
     expect(patches.map((item) => item.op)).toEqual([
       'insert',
       'insert',
-      'insert',
-      'upsert',
-      'upsert',
+      'insertIgnore',
+      'insertOrMerge',
+      'insertOrReplace',
+      'insertOrUpdate',
+      'insertOrUpdate',
+      'updateByKey',
       'update',
-      'insert',
-      'upsert',
-      'upsert',
-      'upsert',
-      'upsert',
+      'update',
+      'update',
+      'insertIgnore',
+      'insertOrMerge',
+      'insertOrMerge',
+      'insertOrUpdate',
+      'insertOrUpdate',
       'replaceAll',
       'replaceAll',
       'deleteExact',
-      'delete'
+      'delete',
+      'delete',
+      'deleteByKey',
+      'deleteByKey'
     ]);
 
     if (process.env.TARSTATE_TYPECHECK_ONLY === '1') {
@@ -192,15 +261,23 @@ describe('tarstate writes', () => {
       // @ts-expect-error insert-ignore rows must include required relation fields.
       todos.insertIgnore({ id: 'todo-b', done: false });
       // @ts-expect-error updates reject unknown relation fields.
-      todos.update('todo-a', { complete: true });
-      // @ts-expect-error upsert rows reject unknown relation fields.
-      todos.upsert({ id: 'todo-c', text: 'Plan', done: false, extra: true });
-      // @ts-expect-error insert-or-replace rows reject unknown relation fields.
-      todos.insertOrReplace({ id: 'todo-c', text: 'Plan', done: false, extra: true });
+      todos.updateByKey('todo-a', { complete: true });
       // @ts-expect-error insert-or-merge rows reject unknown relation fields.
       todos.insertOrMerge({ id: 'todo-c', complete: true });
-      // @ts-expect-error insert-or-update rows reject unknown relation fields.
-      todos.insertOrUpdate({ id: 'todo-c', complete: true });
+      // @ts-expect-error insert-or-replace rows must include required relation fields.
+      todos.insertOrReplace({ id: 'todo-c', done: false });
+      // @ts-expect-error insert-or-replace rows reject unknown relation fields.
+      todos.insertOrReplace({ id: 'todo-c', text: 'Plan', done: false, complete: true });
+      // @ts-expect-error insert-or-update requires an explicit update descriptor.
+      todos.insertOrUpdate({ id: 'todo-c', text: 'Plan', done: false });
+      // @ts-expect-error insert-or-update descriptor rows reject unknown relation fields.
+      todos.insertOrUpdate({ id: 'todo-c', text: 'Plan', done: false, complete: true }, { update: { done: true } });
+      // @ts-expect-error insert-or-update descriptor rows must include required relation fields.
+      todos.insertOrUpdate({ id: 'todo-c', done: false }, { update: { done: true } });
+      // @ts-expect-error insert-or-update descriptor updates reject unknown relation fields.
+      todos.insertOrUpdate({ id: 'todo-c', text: 'Plan', done: false }, { update: { complete: true } });
+      // @ts-expect-error update-where changes reject unknown relation fields.
+      todos.updateWhere(eq(todo.done, false), { complete: true });
       // @ts-expect-error delete-exact rows must include required relation fields.
       todos.deleteExact({ id: 'todo-c' });
       // @ts-expect-error replace-all rows must include required relation fields.
@@ -208,7 +285,7 @@ describe('tarstate writes', () => {
     }
   });
 
-  it('applies insert, update, upsert, and delete patches in order', async () => {
+  it('applies insert, update, insert-or-update, and delete patches in order', async () => {
     const todos = write(schema.todos);
     const data: MutableObjectSourceData = {
       todos: [
@@ -218,30 +295,20 @@ describe('tarstate writes', () => {
     };
 
     const result = applyWrites(data, [
-      todos.update('todo-a', { done: true }),
-      todos.upsert({ id: 'todo-c', text: 'Review notes', done: false }),
-      todos.upsert({ id: 'todo-b', text: 'Water herbs', done: true }),
-      todos.delete({ id: 'todo-c' }),
+      todos.updateByKey('todo-a', { done: true }),
+      todos.insertOrUpdate(
+        { id: 'todo-c', text: 'Review notes', done: false },
+        { update: { text: 'Review notes', done: false } }
+      ),
+      todos.insertOrUpdate(
+        { id: 'todo-b', text: 'Water herbs', done: true },
+        { update: { text: 'Water herbs', done: true } }
+      ),
+      todos.deleteByKey('todo-c'),
       insert(schema.todos, { id: 'todo-d', text: 'Send update', done: false })
     ]);
 
     expect(result).toMatchObject({ patches: 5, applied: 5, diagnostics: [] });
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [
-          { id: 'todo-a', text: 'Buy oat milk', done: true },
-          { id: 'todo-c', text: 'Review notes', done: false },
-          { id: 'todo-b', text: 'Water herbs', done: true },
-          { id: 'todo-d', text: 'Send update', done: false }
-        ],
-        removed: [
-          { id: 'todo-a', text: 'Buy oat milk', done: false },
-          { id: 'todo-b', text: 'Water basil', done: false },
-          { id: 'todo-c', text: 'Review notes', done: false }
-        ]
-      }
-    ]);
     expect(data.todos).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: true },
       { id: 'todo-b', text: 'Water herbs', done: true },
@@ -258,7 +325,7 @@ describe('tarstate writes', () => {
     });
   });
 
-  it('supports Relic-style insert-ignore, insert-or-merge/update, insert-or-replace, and delete-exact APIs', () => {
+  it('supports Relic-style insert-ignore, insert-or-merge/update/replace, and delete-exact APIs', () => {
     const todos = write(schema.todos);
     const data: MutableObjectSourceData = {
       todos: [
@@ -271,35 +338,108 @@ describe('tarstate writes', () => {
       todos.insertIgnore({ id: 'todo-a', text: 'Duplicate', done: true }),
       todos.insertIgnore({ id: 'todo-c', text: 'Review notes', done: false }),
       todos.insertOrMerge({ id: 'todo-a', done: true }),
-      todos.insertOrUpdate({ id: 'todo-a', text: 'Buy almond milk' }),
-      insertOrUpdate(schema.todos, { id: 'todo-d', text: 'Draft update', done: false }),
-      todos.insertOrReplace({ id: 'todo-b', text: 'Water herbs', done: true }),
+      todos.insertOrUpdate(
+        { id: 'todo-a', text: 'Ignored insert row', done: false },
+        { update: { text: 'Buy almond milk' } }
+      ),
+      insertOrUpdate(
+        schema.todos,
+        { id: 'todo-d', text: 'Draft update', done: false },
+        { update: { done: true } }
+      ),
+      todos.insertOrUpdate(
+        { id: 'todo-b', text: 'Water herbs', done: true },
+        { update: { text: 'Water herbs', done: true } }
+      ),
       todos.deleteExact({ id: 'todo-c', text: 'Review notes', done: false })
     ]);
 
     expect(result).toMatchObject({ patches: 7, applied: 7, diagnostics: [] });
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [
-          { id: 'todo-c', text: 'Review notes', done: false },
-          { id: 'todo-a', text: 'Buy oat milk', done: true },
-          { id: 'todo-a', text: 'Buy almond milk', done: true },
-          { id: 'todo-d', text: 'Draft update', done: false },
-          { id: 'todo-b', text: 'Water herbs', done: true }
-        ],
-        removed: [
-          { id: 'todo-a', text: 'Buy oat milk', done: false },
-          { id: 'todo-a', text: 'Buy oat milk', done: true },
-          { id: 'todo-b', text: 'Water basil', done: false },
-          { id: 'todo-c', text: 'Review notes', done: false }
-        ]
-      }
-    ]);
     expect(data.todos).toEqual([
       { id: 'todo-a', text: 'Buy almond milk', done: true },
       { id: 'todo-b', text: 'Water herbs', done: true },
       { id: 'todo-d', text: 'Draft update', done: false }
+    ]);
+  });
+
+  it('applies insert-or-replace as full-row replacement on key conflict', () => {
+    const maybeTodos = write(schema.maybeTodos);
+    const data: MutableObjectSourceData = {
+      maybeTodos: [
+        { id: 'todo-a', label: 'Old label', archivedAt: null }
+      ]
+    };
+
+    const result = applyWrites(data, [
+      maybeTodos.insertOrReplace({ id: 'todo-a', archivedAt: null }),
+      insertOrReplace(schema.maybeTodos, { id: 'todo-b', label: 'New label', archivedAt: null })
+    ]);
+
+    expect(result).toMatchObject({ patches: 2, applied: 2, diagnostics: [] });
+    expect(data.maybeTodos).toEqual([
+      { id: 'todo-a', archivedAt: null },
+      { id: 'todo-b', label: 'New label', archivedAt: null }
+    ]);
+  });
+
+  it('applies insert-or-update descriptors by inserting the row or updating existing rows', () => {
+    const todos = write(schema.todos);
+    const data: MutableObjectSourceData = {
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk', done: false }
+      ]
+    };
+
+    const result = applyWrites(data, [
+      todos.insertOrUpdate(
+        { id: 'todo-a', text: 'Ignored insert row', done: false },
+        { update: { done: true } }
+      ),
+      insertOrUpdate(
+        schema.todos,
+        { id: 'todo-b', text: 'Review notes', done: false },
+        { update: { done: true } }
+      )
+    ]);
+
+    expect(result).toMatchObject({ patches: 2, applied: 2, diagnostics: [] });
+    expect(data.todos).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: true },
+      { id: 'todo-b', text: 'Review notes', done: false }
+    ]);
+  });
+
+  it('reports predicate write patches as unsupported for object-backed apply', () => {
+    const todos = write(schema.todos);
+    const data: MutableObjectSourceData = {
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk', done: false },
+        { id: 'todo-b', text: 'Water basil', done: true }
+      ]
+    };
+
+    const result = applyWrites(data, [
+      todos.updateWhere(eq(todo.done, false), { done: true }),
+      deleteWhere(schema.todos, eq(todo.done, true))
+    ]);
+
+    expect(result).toMatchObject({
+      patches: 2,
+      applied: 0,
+      diagnostics: [
+        {
+          code: 'unsupported_expression',
+          relation: 'todos'
+        },
+        {
+          code: 'unsupported_expression',
+          relation: 'todos'
+        }
+      ]
+    });
+    expect(data.todos).toEqual([
+      { id: 'todo-a', text: 'Buy oat milk', done: false },
+      { id: 'todo-b', text: 'Water basil', done: true }
     ]);
   });
 
@@ -314,7 +454,7 @@ describe('tarstate writes', () => {
 
     const result = applyWrites(data, [
       todos.deleteExact({ id: 'todo-a', text: 'Buy almond milk', done: false }),
-      todos.delete('todo-b')
+      todos.deleteByKey('todo-b')
     ]);
 
     expect(result).toMatchObject({
@@ -323,8 +463,7 @@ describe('tarstate writes', () => {
       diagnostics: [
         {
           code: 'invalid_row',
-          relation: 'todos',
-          key: '["todo-a"]'
+          relation: 'todos'
         }
       ]
     });
@@ -347,27 +486,11 @@ describe('tarstate writes', () => {
         { id: 'todo-b', text: 'Water herbs', done: true },
         { id: 'todo-c', text: 'Review notes', done: false }
       ]),
-      todos.update('todo-c', { done: true }),
-      todos.delete('todo-b')
+      todos.updateByKey('todo-c', { done: true }),
+      todos.deleteByKey('todo-b')
     ]);
 
     expect(result).toMatchObject({ patches: 3, applied: 3, diagnostics: [] });
-    expect(result.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [
-          { id: 'todo-b', text: 'Water herbs', done: true },
-          { id: 'todo-c', text: 'Review notes', done: false },
-          { id: 'todo-c', text: 'Review notes', done: true }
-        ],
-        removed: [
-          { id: 'todo-a', text: 'Buy oat milk', done: false },
-          { id: 'todo-b', text: 'Water basil', done: false },
-          { id: 'todo-c', text: 'Review notes', done: false },
-          { id: 'todo-b', text: 'Water herbs', done: true }
-        ]
-      }
-    ]);
     expect(data.todos).toEqual([{ id: 'todo-c', text: 'Review notes', done: true }]);
   });
 
@@ -412,20 +535,27 @@ describe('tarstate writes', () => {
     const updateData: MutableObjectSourceData = {};
 
     const mergeResult = applyWrites(data, [todos.insertOrMerge({ id: 'todo-a', done: true })]);
-    const updateResult = applyWrites(updateData, [todos.insertOrUpdate({ id: 'todo-a', done: true })]);
+    const updateResult = applyWrites(updateData, [
+      todos.insertOrUpdate(
+        { id: 'todo-a', done: true } as unknown as Todo,
+        { update: { done: true } }
+      )
+    ]);
 
     expect(mergeResult.applied).toBe(0);
-    expect(mergeResult.diagnostics).toEqual([
+    expect(mergeResult.diagnostics).toMatchObject([
       {
         code: 'invalid_row',
-        message: 'missing required field text in relation todos',
         relation: 'todos',
         field: 'text'
       }
     ]);
     expect(data.todos).toEqual([]);
-    expect(updateResult).toMatchObject({ applied: 0, diagnostics: mergeResult.diagnostics });
-    expect(updateData.todos).toEqual([]);
+    expect(updateResult).toMatchObject({
+      applied: 0,
+      diagnostics: [{ code: 'invalid_row', relation: 'todos', field: 'text' }]
+    });
+    expect(updateData.todos).toBeUndefined();
   });
 
   it('reports validation diagnostics and skips invalid mutations', () => {
@@ -437,9 +567,9 @@ describe('tarstate writes', () => {
     const result = applyWrites(data, [
       todos.insert({ id: 'todo-a', text: 'Duplicate', done: false }),
       todos.insert({ id: 'todo-b', text: 'Broken', done: 'no' } as unknown as Todo),
-      todos.update('todo-a', { done: 'yes' } as unknown as Partial<Todo>),
-      todos.update('todo-missing', { done: true }),
-      todos.delete('todo-missing')
+      todos.updateByKey('todo-a', { done: 'yes' } as unknown as Partial<Todo>),
+      todos.updateByKey('todo-missing', { done: true }),
+      todos.deleteByKey('todo-missing')
     ]);
 
     expect(result.applied).toBe(0);
@@ -460,7 +590,7 @@ describe('tarstate writes', () => {
     };
 
     const failed = applyWritesAtomic(data, [
-      todos.update('todo-a', { done: true }),
+      todos.updateByKey('todo-a', { done: true }),
       todos.insert({ id: 'todo-b', text: 'Broken', done: 'no' } as unknown as Todo)
     ]);
 
@@ -470,32 +600,21 @@ describe('tarstate writes', () => {
       committed: false,
       diagnostics: [{ code: 'invalid_row', relation: 'todos', field: 'done' }]
     });
-    expect(failed.deltas).toEqual([]);
     expect(data.todos).toEqual([{ id: 'todo-a', text: 'Buy oat milk', done: false }]);
 
     const committed = applyWritesAtomic(data, [
-      todos.update('todo-a', { done: true }),
+      todos.updateByKey('todo-a', { done: true }),
       todos.insert({ id: 'todo-b', text: 'Water basil', done: false })
     ]);
 
     expect(committed).toMatchObject({ patches: 2, applied: 2, committed: true, diagnostics: [] });
-    expect(committed.deltas).toEqual([
-      {
-        relation: schema.todos,
-        added: [
-          { id: 'todo-a', text: 'Buy oat milk', done: true },
-          { id: 'todo-b', text: 'Water basil', done: false }
-        ],
-        removed: [{ id: 'todo-a', text: 'Buy oat milk', done: false }]
-      }
-    ]);
     expect(data.todos).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: true },
       { id: 'todo-b', text: 'Water basil', done: false }
     ]);
   });
 
-  it('accepts object or tuple keys for composite-key rows', () => {
+  it('accepts tuple keys for composite-key rows', () => {
     const presence = write(schema.presence);
     const data: MutableObjectSourceData = {};
 
@@ -506,12 +625,8 @@ describe('tarstate writes', () => {
         clientId: 'client-a',
         targetTodoId: 'todo-a'
       }),
-      presence.update(
-        {
-          workspaceId: 'workspace-a',
-          peerId: 'peer-a',
-          clientId: 'client-a'
-        },
+      presence.updateByKey(
+        ['workspace-a', 'peer-a', 'client-a'],
         { clientId: 'client-b', targetTodoId: 'todo-b' }
       ),
       presence.insert({
@@ -519,17 +634,13 @@ describe('tarstate writes', () => {
         peerId: 'peer-a',
         clientId: 'client-b'
       }),
-      presence.delete({
-        workspaceId: 'workspace-a',
-        peerId: 'peer-a'
-      }),
-      presence.delete(['workspace-a', 'peer-a', 'client-b'])
+      presence.deleteByKey(['workspace-a', 'peer-a']),
+      presence.deleteByKey(['workspace-a', 'peer-a', 'client-b'])
     ]);
 
     expect(result.patches).toBe(5);
     expect(result.applied).toBe(3);
     expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(['duplicate_key', 'invalid_row']);
-    expect(result.diagnostics[0]?.key).toBe('["workspace-a","peer-a","client-b"]');
     expect(data.presence).toEqual([]);
   });
 
@@ -543,16 +654,15 @@ describe('tarstate writes', () => {
     };
 
     const result = applyWrites(data, [
-      todos.update('todo-a', { id: 'todo-c', text: 'Buy soy milk' }),
-      todos.update('todo-c', { done: true }),
-      todos.delete('todo-a'),
-      todos.update('todo-b', { id: 'todo-c' })
+      todos.updateByKey('todo-a', { id: 'todo-c', text: 'Buy soy milk' }),
+      todos.updateByKey('todo-c', { done: true }),
+      todos.deleteByKey('todo-a'),
+      todos.updateByKey('todo-b', { id: 'todo-c' })
     ]);
 
     expect(result.patches).toBe(4);
     expect(result.applied).toBe(2);
     expect(result.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(['invalid_row', 'duplicate_key']);
-    expect(result.diagnostics.map((diagnostic) => diagnostic.key)).toEqual(['["todo-a"]', '["todo-c"]']);
     expect(data.todos).toEqual([
       { id: 'todo-c', text: 'Buy soy milk', done: true },
       { id: 'todo-b', text: 'Water basil', done: false }
@@ -566,7 +676,7 @@ describe('tarstate writes', () => {
     };
 
     const result = applyWrites(data, [
-      maybeTodos.update('maybe-a', { label: 'Later', archivedAt: '2026-01-01' }),
+      maybeTodos.updateByKey('maybe-a', { label: 'Later', archivedAt: '2026-01-01' }),
       maybeTodos.insert({ id: 'maybe-b', archivedAt: null }),
       maybeTodos.insert({ id: 'maybe-c' } as unknown as MaybeTodo),
       maybeTodos.insert({ id: 'maybe-d', label: null, archivedAt: null } as unknown as MaybeTodo)

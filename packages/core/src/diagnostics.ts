@@ -5,7 +5,6 @@ export type TarstateDiagnostic = {
     | 'invalid_row'
     | 'missing_ref'
     | 'unreadable_ref'
-    | 'stale_presence'
     | 'source_error'
     | 'unsupported_expression'
     | 'unsupported_lookup';

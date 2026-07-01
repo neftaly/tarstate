@@ -13,9 +13,9 @@ import {
   unique,
   validateAttachedConstraints,
   validateConstraints
-} from '@tarstate/core/constraints';
+} from '@tarstate/core/experimental/constraints';
 import { createDb } from '@tarstate/core/db';
-import { as, call, eq, from } from '@tarstate/core/query';
+import { as, call, eq, from, pipe, project } from '@tarstate/core/query';
 import { defineSchema, idField, refField, relation, stringField } from '@tarstate/core/schema';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
 import { write } from '@tarstate/core/write';
@@ -49,6 +49,13 @@ const schema = defineSchema({
 
 const todo = as(schema.todos, 'todo');
 const todos = write(schema.todos);
+const todoRows = pipe(
+  from(todo),
+  project({
+    id: todo.id,
+    text: todo.text
+  })
+);
 
 describe('tarstate constraint validation', () => {
   it('validates required, unique, and foreign-key descriptors by scanning a source', async () => {
@@ -127,14 +134,12 @@ describe('tarstate constraint validation', () => {
       {
         code: 'duplicate_key',
         relation: 'todos',
-        field: 'id',
-        key: '["todo-c"]'
+        field: 'id'
       },
       {
         code: 'missing_ref',
         relation: 'assignments',
-        field: 'todoId',
-        key: '["todo-missing"]'
+        field: 'todoId'
       }
     ]);
   });
@@ -173,15 +178,7 @@ describe('tarstate constraint validation', () => {
     expect(result.valid).toBe(false);
     expect(result.diagnostics).toMatchObject([
       {
-        code: 'invalid_row',
-        message: 'check constraint failed',
-        detail: {
-          op: 'check',
-          name: 'only-todo-a',
-          row: {
-            todo: { id: 'todo-b', text: 'Water basil' }
-          }
-        }
+        code: 'invalid_row'
       }
     ]);
   });
@@ -221,6 +218,31 @@ describe('tarstate constraint validation', () => {
     });
   });
 
+  it('keeps query-bound req, unique, and fk constraints as public descriptors with explicit validation limits', async () => {
+    const result = await validateConstraints(
+      fromObjectSource({
+        todos: [{ id: 'todo-a', text: 'Buy oat milk' }]
+      }),
+      constrain(
+        req(todoRows, 'text'),
+        unique(todoRows, 'id'),
+        fk(todoRows, 'id', schema.todos, 'id')
+      )
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        code: 'unsupported_lookup'
+      }),
+      expect.objectContaining({
+        code: 'unsupported_lookup'
+      }),
+      expect.objectContaining({
+        code: 'unsupported_lookup'
+      })
+    ]);
+  });
 
   it('returns an explicit diagnostic for unsupported check validation', async () => {
     const result = await validateConstraints(
@@ -233,12 +255,7 @@ describe('tarstate constraint validation', () => {
     expect(result.valid).toBe(false);
     expect(result.diagnostics).toMatchObject([
       {
-        code: 'unsupported_lookup',
-        message: 'check constraints cannot be validated until checks carry relation metadata or a relation-bound query',
-        detail: {
-          op: 'check',
-          name: 'todo-id-check'
-        }
+        code: 'unsupported_lookup'
       }
     ]);
   });

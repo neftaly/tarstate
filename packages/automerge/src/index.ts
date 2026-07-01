@@ -8,33 +8,39 @@ import type {
   RelationPatchTarget,
   TarstateDiagnostic
 } from '@tarstate/core/adapter';
-import { relationApplyResultFromAdapterCommit } from '@tarstate/core/adapter';
 import { isJsonValue, type FieldSpec, type RelationRef } from '@tarstate/core/schema';
 import type { RelationLookup, RelationRangeLookup } from '@tarstate/core/source';
-import { applyWritesAtomic, type MutableObjectSourceData } from '@tarstate/core/write-apply';
+import { applyWritesAtomic, type MutableObjectSourceData } from '@tarstate/core/experimental/write-apply';
 import type { WritePatch } from '@tarstate/core/write';
 
-export * from './presence.js';
-
-export type AutomergeDocument<DocumentShape extends Record<string, unknown> = Record<string, unknown>> =
-  Automerge.Doc<DocumentShape>;
-
 export type AutomergeMapPath = readonly string[];
-export type AutomergeVersion = Automerge.Heads;
 
 export type AutomergeMapRelation<Relation extends RelationRef = RelationRef> = {
   readonly relation: Relation;
-  /** Path to the Automerge map whose keys are row keys and whose values are stored row objects. */
+  /**
+   * Path to the map-v1 Automerge object for this relation.
+   *
+   * @remarks map-v1 stores row keys as map keys, JSON-stringifies tuple or
+   * non-string keys, and omits key fields from stored row values.
+   */
   readonly path: AutomergeMapPath;
+};
+
+export type AutomergeMapStorageCodec = 'map-v1';
+
+export type AutomergeMapStorageOptions = {
+  readonly codec?: AutomergeMapStorageCodec;
 };
 
 export type AutomergeMapAdapterOptions<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
 > = {
+  /** Raw Automerge document. Repo handles should wrap this adapter and call `setDoc` on host updates. */
   readonly doc: Automerge.Doc<DocumentShape>;
   readonly relations: readonly AutomergeMapRelation[];
   readonly onDocChange?: (doc: Automerge.Doc<DocumentShape>) => void;
   readonly changeMessage?: string | ((patches: readonly WritePatch[]) => string | undefined);
+  readonly storage?: AutomergeMapStorageOptions;
 };
 
 export type AutomergeMapSourceOptions = {
@@ -47,11 +53,11 @@ export type AutomergeMapAdapter<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
 > = RelationAdapter<Automerge.Heads> & {
   readonly relations: readonly AutomergeMapRelation[];
-  readonly doc: Automerge.Doc<DocumentShape>;
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
   readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
   readonly snapshot: () => AdapterSnapshot<Automerge.Heads>;
   readonly target: RelationPatchTarget<Automerge.Heads>;
+  readonly subscribe: (listener: () => void) => () => void;
 };
 
 type RelationPlan = {
@@ -97,12 +103,6 @@ export function automergeMapAdapter<
   return new AutomergeMapRelationAdapter(options);
 }
 
-/** Canonical factory for map-shaped Automerge relation adapters. */
-export const createAutomergeMapAdapter = automergeMapAdapter;
-
-/** Alias for callers that prefer the generic relation-adapter naming convention. */
-export const createAutomergeRelationAdapter = createAutomergeMapAdapter;
-
 /** Create a read-only Tarstate source over map-shaped relations inside an Automerge document. */
 export function automergeMapSource<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
@@ -139,50 +139,33 @@ function automergeMapSourceWithVersion<
   return source;
 }
 
-/** Canonical factory for read-only map-shaped Automerge relation sources. */
-export const createAutomergeMapSource = automergeMapSource;
-
-/** Alias for callers that prefer the generic relation-source naming convention. */
-export const createAutomergeRelationSource = createAutomergeMapSource;
-
-/** Extract rows from an exact Automerge map path, optionally synthesizing relation keys from map keys. */
-export function rowsFromAutomergeMapPath<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
->(
-  doc: Automerge.Doc<DocumentShape>,
-  path: AutomergeMapPath,
-  relation?: RelationRef
-): readonly unknown[] {
-  const state = mapAtPath(doc, path);
-
-  if (state.status !== 'map') {
-    return [];
-  }
-
-  return Object.entries(state.value).map(([storageKey, row]) =>
-    relation === undefined ? cloneAutomergeValue(row) : rowFromStorageEntry(relationPlan(relation, path), storageKey, row)
-  );
-}
-
 class AutomergeMapRelationAdapter<
   DocumentShape extends Record<string, unknown>
 > implements AutomergeMapAdapter<DocumentShape> {
   readonly relations: readonly AutomergeMapRelation[];
   readonly source: AdapterSource<Automerge.Heads>;
-  readonly target: RelationPatchTarget<Automerge.Heads> = {
-    apply: (patches) => this.apply(patches)
-  };
+  readonly target: RelationPatchTarget<Automerge.Heads>;
 
   private currentDoc: Automerge.Doc<DocumentShape>;
   private readonly plans: ReadonlyMap<string, RelationPlan>;
   private readonly onDocChange: ((doc: Automerge.Doc<DocumentShape>) => void) | undefined;
   private readonly changeMessage: string | ((patches: readonly WritePatch[]) => string | undefined) | undefined;
   private readonly readVersion: () => Automerge.Heads;
+  private readonly listeners = new Set<() => void>();
 
   constructor(options: AutomergeMapAdapterOptions<DocumentShape>) {
+    if (options.storage?.codec !== undefined && options.storage.codec !== 'map-v1') {
+      throw new TypeError(`unsupported Automerge map storage codec ${String(options.storage.codec)}`);
+    }
+
     this.currentDoc = options.doc;
     this.relations = options.relations.map((spec) => ({ relation: spec.relation, path: [...spec.path] }));
     this.plans = relationPlans(this.relations);
+    this.target = {
+      relationNames: Array.from(this.plans.keys()),
+      ownsRelation: (relationName: string) => this.plans.has(relationName),
+      apply: (patches) => this.apply(patches)
+    };
     this.onDocChange = options.onDocChange;
     this.changeMessage = options.changeMessage;
     this.readVersion = createAutomergeVersionReader(() => this.currentDoc);
@@ -193,14 +176,11 @@ class AutomergeMapRelationAdapter<
     );
   }
 
-  get doc(): Automerge.Doc<DocumentShape> {
-    return this.currentDoc;
-  }
-
   getDoc = (): Automerge.Doc<DocumentShape> => this.currentDoc;
 
   setDoc = (doc: Automerge.Doc<DocumentShape>): void => {
     this.currentDoc = doc;
+    this.notify();
   };
 
   snapshot = (): AdapterSnapshot<Automerge.Heads> => {
@@ -248,14 +228,14 @@ class AutomergeMapRelationAdapter<
                 );
           this.currentDoc = nextDoc;
           this.onDocChange?.(nextDoc);
+          this.notify();
         } catch (error) {
           return rejectedResult(patchList.length, [changeFailedDiagnostic(error)], this.version());
         }
       }
 
       return {
-        status: 'committed',
-        committed: true,
+        status: 'accepted',
         patches: patchList.length,
         applied: applyResult.applied,
         deltas: applyResult.deltas,
@@ -269,13 +249,27 @@ class AutomergeMapRelationAdapter<
 
   private apply(patches: readonly WritePatch[]): RelationApplyResult<Automerge.Heads> {
     return {
-      ...relationApplyResultFromAdapterCommit(this.commit(patches)),
+      ...this.commit(patches),
       durability: 'durable'
     };
   }
 
   private version(): Automerge.Heads {
     return this.readVersion();
+  }
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
+  private notify(): void {
+    for (const listener of this.listeners) {
+      listener();
+    }
   }
 
   private messageFor(patches: readonly WritePatch[]): string | undefined {
@@ -894,7 +888,6 @@ function rejectedResult(
 ): AdapterCommitResult<Automerge.Heads> {
   return {
     status: 'rejected',
-    committed: false,
     patches,
     applied: 0,
     deltas: [],

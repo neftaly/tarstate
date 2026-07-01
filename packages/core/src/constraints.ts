@@ -23,12 +23,33 @@ export type CheckConstraintData<Row = unknown> = ConstraintBase<'check'> & {
   readonly predicate: PredicateData;
 };
 
+export type QueryRequiredConstraintData<
+  Row extends Record<string, unknown> = Record<string, unknown>,
+  Field extends keyof Row & string = keyof Row & string
+> = ConstraintBase<'req'> & {
+  readonly query: Query<Row>;
+  readonly field: Field;
+};
+
 export type RequiredConstraintData<
   Relation extends RelationRef = RelationRef,
   Field extends ConstraintRelationField<Relation> = ConstraintRelationField<Relation>
 > = ConstraintBase<'req'> & {
   readonly relation: Relation;
   readonly field: Field;
+};
+
+export type QueryForeignKeyConstraintData<
+  Row extends Record<string, unknown> = Record<string, unknown>,
+  Target extends RelationRef | Query = RelationRef | Query,
+  SourceFields extends readonly (keyof Row & string)[] = readonly (keyof Row & string)[],
+  TargetFields extends readonly string[] = readonly string[]
+> = ConstraintBase<'fk'> & {
+  readonly query: Query<Row>;
+  readonly fields: SourceFields;
+  readonly target: Target;
+  readonly targetFields: TargetFields;
+  readonly optional: boolean;
 };
 
 export type ForeignKeyConstraintData<
@@ -44,6 +65,14 @@ export type ForeignKeyConstraintData<
   readonly optional: boolean;
 };
 
+export type QueryUniqueConstraintData<
+  Row extends Record<string, unknown> = Record<string, unknown>,
+  Fields extends readonly (keyof Row & string)[] = readonly (keyof Row & string)[]
+> = ConstraintBase<'unique'> & {
+  readonly query: Query<Row>;
+  readonly fields: Fields;
+};
+
 export type UniqueConstraintData<
   Relation extends RelationRef = RelationRef,
   Fields extends readonly ConstraintRelationField<Relation>[] = readonly ConstraintRelationField<Relation>[]
@@ -55,14 +84,21 @@ export type UniqueConstraintData<
 /** Constraint descriptor understood by planners/evaluators. */
 export type ConstraintData =
   | CheckConstraintData
+  | QueryRequiredConstraintData
   | RequiredConstraintData
+  | QueryForeignKeyConstraintData
   | ForeignKeyConstraintData
+  | QueryUniqueConstraintData
   | UniqueConstraintData;
 
 /** Named group of constraint descriptors. */
-export type ConstraintSet<Constraints extends readonly ConstraintData[] = readonly ConstraintData[]> = {
+export type ConstraintSet<
+  Constraints extends readonly ConstraintData[] = readonly ConstraintData[],
+  Row = unknown
+> = {
   readonly kind: 'constraintSet';
   readonly constraints: Constraints;
+  readonly query?: Query<Row>;
 };
 
 export type {
@@ -121,20 +157,88 @@ export function check<Row>(
 }
 
 /** Declare that a relation field must be present. */
+export function req<Row extends Record<string, unknown>, Field extends keyof Row & string>(
+  query: Query<Row>,
+  field: Field,
+  options?: ConstraintOptions
+): QueryRequiredConstraintData<Row, Field>;
 export function req<Relation extends RelationRef, Field extends ConstraintRelationField<Relation>>(
   relation: Relation,
   field: Field,
+  options?: ConstraintOptions
+): RequiredConstraintData<Relation, Field>;
+export function req(
+  relationOrQuery: RelationRef | Query,
+  field: string,
   options: ConstraintOptions = {}
-): RequiredConstraintData<Relation, Field> {
+): RequiredConstraintData | QueryRequiredConstraintData {
+  if (isQuery(relationOrQuery)) {
+    return {
+      kind: 'constraint',
+      op: 'req',
+      query: relationOrQuery as Query<Record<string, unknown>>,
+      field,
+      ...constraintOptions(options)
+    };
+  }
+
   return {
     kind: 'constraint',
     op: 'req',
-    relation,
+    relation: relationOrQuery,
     field,
     ...constraintOptions(options)
   };
 }
 
+export function fk<
+  Row extends Record<string, unknown>,
+  SourceField extends keyof Row & string,
+  Target extends RelationRef,
+  TargetField extends ConstraintRelationField<Target>
+>(
+  query: Query<Row>,
+  field: SourceField,
+  target: Target,
+  targetField: TargetField,
+  options?: ForeignKeyOptions
+): QueryForeignKeyConstraintData<Row, Target, readonly [SourceField], readonly [TargetField]>;
+export function fk<
+  Row extends Record<string, unknown>,
+  const SourceFields extends readonly (keyof Row & string)[],
+  Target extends RelationRef,
+  const TargetFields extends readonly ConstraintRelationField<Target>[]
+>(
+  query: Query<Row>,
+  fields: SourceFields,
+  target: Target,
+  targetFields: TargetFields,
+  options?: ForeignKeyOptions
+): QueryForeignKeyConstraintData<Row, Target, SourceFields, TargetFields>;
+export function fk<
+  Row extends Record<string, unknown>,
+  SourceField extends keyof Row & string,
+  TargetRow extends Record<string, unknown>,
+  TargetField extends keyof TargetRow & string
+>(
+  query: Query<Row>,
+  field: SourceField,
+  target: Query<TargetRow>,
+  targetField: TargetField,
+  options?: ForeignKeyOptions
+): QueryForeignKeyConstraintData<Row, Query<TargetRow>, readonly [SourceField], readonly [TargetField]>;
+export function fk<
+  Row extends Record<string, unknown>,
+  const SourceFields extends readonly (keyof Row & string)[],
+  TargetRow extends Record<string, unknown>,
+  const TargetFields extends readonly (keyof TargetRow & string)[]
+>(
+  query: Query<Row>,
+  fields: SourceFields,
+  target: Query<TargetRow>,
+  targetFields: TargetFields,
+  options?: ForeignKeyOptions
+): QueryForeignKeyConstraintData<Row, Query<TargetRow>, SourceFields, TargetFields>;
 export function fk<
   Source extends RelationRef,
   SourceField extends ConstraintRelationField<Source>,
@@ -161,24 +265,50 @@ export function fk<
 ): ForeignKeyConstraintData<Source, Target, SourceFields, TargetFields>;
 /** Declare a foreign-key descriptor. */
 export function fk(
-  relation: RelationRef,
-  fields: ConstraintRelationFields<RelationRef>,
-  target: RelationRef,
-  targetFields: ConstraintRelationFields<RelationRef>,
+  relationOrQuery: RelationRef | Query,
+  fields: ConstraintRelationFields<RelationRef> | string | readonly string[],
+  target: RelationRef | Query,
+  targetFields: ConstraintRelationFields<RelationRef> | string | readonly string[],
   options: ForeignKeyOptions = {}
-): ForeignKeyConstraintData {
+): ForeignKeyConstraintData | QueryForeignKeyConstraintData {
+  if (isQuery(relationOrQuery)) {
+    return {
+      kind: 'constraint',
+      op: 'fk',
+      query: relationOrQuery as Query<Record<string, unknown>>,
+      fields: fieldTuple(fields),
+      target,
+      targetFields: fieldTuple(targetFields),
+      optional: options.optional ?? false,
+      ...constraintOptions(options)
+    };
+  }
+
   return {
     kind: 'constraint',
     op: 'fk',
-    relation,
+    relation: relationOrQuery,
     fields: fieldTuple(fields),
-    target,
+    target: target as RelationRef,
     targetFields: fieldTuple(targetFields),
     optional: options.optional ?? false,
     ...constraintOptions(options)
   };
 }
 
+export function unique<Row extends Record<string, unknown>, Field extends keyof Row & string>(
+  query: Query<Row>,
+  field: Field,
+  options?: ConstraintOptions
+): QueryUniqueConstraintData<Row, readonly [Field]>;
+export function unique<
+  Row extends Record<string, unknown>,
+  const Fields extends readonly (keyof Row & string)[]
+>(
+  query: Query<Row>,
+  fields: Fields,
+  options?: ConstraintOptions
+): QueryUniqueConstraintData<Row, Fields>;
 export function unique<Relation extends RelationRef, Field extends ConstraintRelationField<Relation>>(
   relation: Relation,
   field: Field,
@@ -194,30 +324,56 @@ export function unique<
 ): UniqueConstraintData<Relation, Fields>;
 /** Declare a uniqueness descriptor. */
 export function unique(
-  relation: RelationRef,
-  fields: ConstraintRelationFields<RelationRef>,
+  relationOrQuery: RelationRef | Query,
+  fields: ConstraintRelationFields<RelationRef> | string | readonly string[],
   options: ConstraintOptions = {}
-): UniqueConstraintData {
+): UniqueConstraintData | QueryUniqueConstraintData {
+  if (isQuery(relationOrQuery)) {
+    return {
+      kind: 'constraint',
+      op: 'unique',
+      query: relationOrQuery as Query<Record<string, unknown>>,
+      fields: fieldTuple(fields),
+      ...constraintOptions(options)
+    };
+  }
+
   return {
     kind: 'constraint',
     op: 'unique',
-    relation,
+    relation: relationOrQuery,
     fields: fieldTuple(fields),
     ...constraintOptions(options)
   };
 }
 
 /** Group constraints as schema-adjacent data for validation and transaction checks. */
+export function constrain<Row, const Constraints extends readonly ConstraintData[]>(
+  query: Query<Row>,
+  ...constraints: Constraints
+): ConstraintSet<Constraints, Row>;
 export function constrain<const Constraints extends readonly ConstraintData[]>(
   ...constraints: Constraints
-): ConstraintSet<Constraints> {
+): ConstraintSet<Constraints>;
+export function constrain(
+  first: Query | ConstraintData,
+  ...rest: readonly ConstraintData[]
+): ConstraintSet {
+  if (isQuery(first)) {
+    return {
+      kind: 'constraintSet',
+      query: first,
+      constraints: rest
+    };
+  }
+
   return {
     kind: 'constraintSet',
-    constraints
+    constraints: [first, ...rest]
   };
 }
 
-function fieldTuple(fields: ConstraintRelationFields<RelationRef>): readonly string[] {
+function fieldTuple(fields: ConstraintRelationFields<RelationRef> | string | readonly string[]): readonly string[] {
   return typeof fields === 'string' ? [fields] : fields;
 }
 

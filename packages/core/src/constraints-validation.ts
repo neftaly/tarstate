@@ -13,6 +13,9 @@ import type {
   ConstraintData,
   ConstraintSet,
   ForeignKeyConstraintData,
+  QueryForeignKeyConstraintData,
+  QueryRequiredConstraintData,
+  QueryUniqueConstraintData,
   RequiredConstraintData,
   UniqueConstraintData
 } from './constraints.js';
@@ -90,8 +93,13 @@ export async function validateAttachedConstraints(
 
 async function validateRequired(
   context: ConstraintValidationContext,
-  constraint: RequiredConstraintData
+  constraint: RequiredConstraintData | QueryRequiredConstraintData
 ): Promise<void> {
+  if (!hasRelation(constraint)) {
+    context.diagnostics.push(unsupportedQueryConstraintDiagnostic(constraint));
+    return;
+  }
+
   const rows = await readRows(context, constraint.relation);
 
   for (const row of rows) {
@@ -115,8 +123,13 @@ async function validateRequired(
 
 async function validateUnique(
   context: ConstraintValidationContext,
-  constraint: UniqueConstraintData
+  constraint: UniqueConstraintData | QueryUniqueConstraintData
 ): Promise<void> {
+  if (!hasRelation(constraint)) {
+    context.diagnostics.push(unsupportedQueryConstraintDiagnostic(constraint));
+    return;
+  }
+
   const rows = await readRows(context, constraint.relation);
   const seen = new Set<string>();
 
@@ -148,8 +161,13 @@ async function validateUnique(
 
 async function validateForeignKey(
   context: ConstraintValidationContext,
-  constraint: ForeignKeyConstraintData
+  constraint: ForeignKeyConstraintData | QueryForeignKeyConstraintData
 ): Promise<void> {
+  if (!hasRelation(constraint) || !hasRelationTarget(constraint)) {
+    context.diagnostics.push(unsupportedQueryConstraintDiagnostic(constraint));
+    return;
+  }
+
   if (constraint.fields.length !== constraint.targetFields.length) {
     context.diagnostics.push({
       code: 'invalid_row',
@@ -313,6 +331,27 @@ function unsupportedCheckDiagnostic(constraint: CheckConstraintData): TarstateDi
       predicate: constraint.predicate
     }
   };
+}
+
+function unsupportedQueryConstraintDiagnostic(
+  constraint: QueryRequiredConstraintData | QueryUniqueConstraintData | QueryForeignKeyConstraintData
+): TarstateDiagnostic {
+  return {
+    code: 'unsupported_lookup',
+    message: `query-bound ${constraint.op} constraints are descriptor-only until query materialized constraint enforcement is implemented`,
+    detail: {
+      ...constraintDetail(constraint),
+      queryBound: true
+    }
+  };
+}
+
+function hasRelation(constraint: unknown): constraint is { readonly relation: RelationRef } {
+  return isRecord(constraint) && isRecord(constraint.relation) && constraint.relation.kind === 'relation';
+}
+
+function hasRelationTarget(constraint: unknown): constraint is { readonly target: RelationRef } {
+  return isRecord(constraint) && isRecord(constraint.target) && constraint.target.kind === 'relation';
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {

@@ -95,6 +95,17 @@ export type WatchSubscription = {
   readonly unsubscribe: () => WatchUnsubscribeResult;
 };
 
+export type WatchTargetRegistration<Db extends WatchDb = WatchDb, Row = unknown> = {
+  readonly kind: 'watchTarget';
+  readonly db: Db;
+  readonly target: WatchTarget<Row>;
+  readonly handle: WatchHandle<Db, Row>;
+  readonly supported: boolean;
+  readonly diagnostics: readonly WatchDiagnostic[];
+  readonly unwatch: () => UnwatchResult;
+  readonly label?: string;
+};
+
 export type WatchHandle<Db extends WatchDb = WatchDb, Row = unknown> = {
   readonly kind: 'watch';
   readonly id: string;
@@ -132,6 +143,20 @@ export type TrackedChange<Row = unknown> = {
   readonly diagnostics: readonly WatchRuntimeDiagnostic[];
 };
 
+export type WatchTargetChange<Row = unknown> = {
+  readonly kind: 'watchTargetChange';
+  readonly id: string;
+  readonly target: WatchTarget<Row>;
+  readonly changed: boolean;
+  readonly addedRows: readonly Row[];
+  readonly removedRows: readonly Row[];
+  readonly unchangedRows: readonly Row[];
+  readonly rowChanges: readonly RowChange<Row>[];
+  readonly diagnostics: readonly WatchRuntimeDiagnostic[];
+};
+
+export type WatchChangeMap<Row = unknown> = ReadonlyMap<WatchTarget<Row>, WatchTargetChange<Row>>;
+
 export type QueryDiffOptions<Row = unknown> = EvaluateOptions & RowDiffOptions<Row>;
 export type QueryDiffDiagnostic<Row = unknown> = TarstateDiagnostic | RowDiffDiagnostic<Row>;
 
@@ -143,6 +168,7 @@ export type QueryDiff<Row = unknown> = {
   readonly afterVersion?: unknown;
   readonly beforeRows: readonly Row[];
   readonly afterRows: readonly Row[];
+  readonly changed: boolean;
   readonly addedRows: readonly Row[];
   readonly removedRows: readonly Row[];
   readonly unchangedRows: readonly Row[];
@@ -260,6 +286,69 @@ export function watch<Db extends WatchDb, Row>(
 }
 
 /**
+ * Mark a DB/source target for later `trackTransact` change reporting.
+ *
+ * @remarks Relic-style facade over the existing callback watch registry. This
+ * registers an inert listener and returns the original DB plus the underlying
+ * handle; it does not return a new immutable DB value, materialize the target,
+ * or create a new reactive engine.
+ */
+export function watchTarget<Db extends WatchDb, Row>(
+  db: Db,
+  target: WatchTarget<Row>,
+  options: WatchOptions<Row> = {}
+): WatchTargetRegistration<Db, Row> {
+  const handle = watch(db, target, () => undefined, options);
+
+  return {
+    kind: 'watchTarget',
+    db,
+    target,
+    handle,
+    supported: handle.supported,
+    diagnostics: handle.diagnostics,
+    unwatch: handle.unwatch,
+    ...(options.label === undefined ? {} : { label: options.label })
+  };
+}
+
+/** Close a watch target registration created by `watchTarget`. */
+export function unwatchTarget<Db extends WatchDb, Row>(
+  registration: Pick<WatchTargetRegistration<Db, Row>, 'handle'> | Pick<WatchHandle<Db, Row>, 'id'>
+): UnwatchResult {
+  return unwatch('handle' in registration ? registration.handle : registration);
+}
+
+/**
+ * Project tracked watch changes into a Relic-like target keyed change map.
+ *
+ * @remarks The map is keyed by target object identity. If multiple active
+ * watches use the same target identity, the latest entry in the supplied change
+ * sequence wins.
+ */
+export function watchChangeMap<Row>(
+  changes: Iterable<TrackedChange<Row>>
+): WatchChangeMap<Row> {
+  const byTarget = new Map<WatchTarget<Row>, WatchTargetChange<Row>>();
+
+  for (const change of changes) {
+    byTarget.set(change.target, {
+      kind: 'watchTargetChange',
+      id: change.id,
+      target: change.target,
+      changed: change.changed,
+      addedRows: change.addedRows,
+      removedRows: change.removedRows,
+      unchangedRows: change.unchangedRows,
+      rowChanges: change.rowChanges,
+      diagnostics: change.diagnostics
+    });
+  }
+
+  return byTarget;
+}
+
+/**
  * Bridge a host-driven relation runtime invalidation callback into a normal manual watch.
  *
  * @remarks This does not synthesize relation deltas or create an async event stream. Host
@@ -368,6 +457,7 @@ export async function diffQuery<Row>(
     ...(afterVersion === undefined ? {} : { afterVersion }),
     beforeRows: before.rows,
     afterRows: after.rows,
+    changed: rowDiffChanged(rowDiff),
     ...visibleRowDiff(rowDiff),
     diagnostics: [...before.diagnostics, ...after.diagnostics, ...versionDiagnostics, ...rowChangeDiagnostics(rowDiff)]
   };

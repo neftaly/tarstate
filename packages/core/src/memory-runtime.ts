@@ -34,6 +34,12 @@ export function createMemoryRelationRuntime(
   return {
     source,
     target: {
+      ...(ownedRelationNames === undefined
+        ? {}
+        : {
+            relationNames: ownedRelationNames,
+            ownsRelation: (relationName: string) => ownedRelationNames.includes(relationName)
+          }),
       apply: (patches) => {
         const patchList = [...patches];
         const ownershipDiagnostics = ownershipDiagnosticsFor(patchList, ownedRelationNames);
@@ -41,7 +47,6 @@ export function createMemoryRelationRuntime(
         if (ownershipDiagnostics.length > 0) {
           return {
             status: 'rejected',
-            accepted: false,
             patches: patchList.length,
             applied: 0,
             deltas: [],
@@ -56,7 +61,6 @@ export function createMemoryRelationRuntime(
         if (!applied.committed) {
           return {
             status: 'rejected',
-            accepted: false,
             patches: applied.patches,
             applied: 0,
             deltas: [],
@@ -73,7 +77,6 @@ export function createMemoryRelationRuntime(
 
         return {
           status: 'accepted',
-          accepted: true,
           patches: applied.patches,
           applied: applied.applied,
           deltas: applied.deltas,

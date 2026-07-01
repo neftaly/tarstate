@@ -91,8 +91,17 @@ export type QueryData =
   | { readonly op: 'from'; readonly relation: string; readonly alias: string }
   | { readonly op: 'lookup'; readonly relation: string; readonly alias: string; readonly field: string; readonly value: ExprData }
   | { readonly op: 'constRows'; readonly rows: readonly Record<string, unknown>[] }
-  | { readonly op: 'where'; readonly input: QueryData; readonly predicate: PredicateData }
-  | { readonly op: 'hash'; readonly input: QueryData; readonly expressions: readonly ExprData[] }
+  | {
+      readonly op: 'where';
+      readonly input: QueryData;
+      readonly predicate: PredicateData;
+    }
+  | {
+      readonly op: 'hash';
+      readonly input: QueryData;
+      readonly expressions: readonly ExprData[];
+      readonly unique?: boolean;
+    }
   | { readonly op: 'btree'; readonly input: QueryData; readonly expressions: readonly ExprData[] }
   | { readonly op: 'keyBy'; readonly input: QueryData; readonly fields: readonly string[] }
   | {
@@ -230,6 +239,9 @@ export function queryRowKeyFields(input: QueryKeyInput): readonly string[] | und
   return rowKeyFieldsForData(data);
 }
 
+/** Alias for `queryRowKeyFields`, for row-shape metadata call sites. */
+export const rowKeyFields = queryRowKeyFields;
+
 /** Alias a relation and expose typed field refs. */
 export function as<Row extends Record<string, unknown>, Alias extends string>(
   relationRef: RelationRef<Row>,
@@ -290,6 +302,15 @@ export function where<Ctx>(predicate: PredicateData): (query: Query<Ctx>) => Que
 /** Declare hash-index intent for equality lookup planning and future materialized indexes. */
 export function hash(...expressions: readonly ExprInput[]): <Ctx>(query: Query<Ctx>) => Query<Ctx> {
   return indexDeclaration('hash', expressions);
+}
+
+/**
+ * Declare unique hash-index intent without exporting a root-level `unique` name.
+ *
+ * @remarks This is query metadata only; uniqueness validation stays in `@tarstate/core/experimental/constraints`.
+ */
+export function uniqueIndex(...expressions: readonly ExprInput[]): <Ctx>(query: Query<Ctx>) => Query<Ctx> {
+  return indexDeclaration('hash', expressions, { unique: true });
 }
 
 /** Declare btree-index intent for range lookup planning and future materialized indexes. */
@@ -460,6 +481,11 @@ export function qualify<Alias extends string>(alias: Alias): <Ctx>(query: Query<
     data: { op: 'qualify', input: query.data, alias },
     relations: query.relations
   }) as Query<Record<Alias, Ctx>>;
+}
+
+/** Alias for `qualify`, for explicit row-shape qualification call sites. */
+export function qualifyRow<Alias extends string>(alias: Alias): <Ctx>(query: Query<Ctx>) => Query<Record<Alias, Ctx>> {
+  return qualify(alias);
 }
 
 /** Group rows and compute aggregate projections. */
@@ -933,13 +959,19 @@ function joinQuery<Left, Right>(
 
 function indexDeclaration(
   op: 'hash' | 'btree',
-  expressions: readonly ExprInput[]
+  expressions: readonly ExprInput[],
+  options: { readonly unique?: boolean } = {}
 ): <Ctx>(query: Query<Ctx>) => Query<Ctx> {
   const normalizedExpressions = expressions.map(expr);
 
   return (query) => ({
     ...query,
-    data: { op, input: query.data, expressions: normalizedExpressions },
+    data: {
+      op,
+      input: query.data,
+      expressions: normalizedExpressions,
+      ...(options.unique === undefined ? {} : { unique: options.unique })
+    },
     relations: { ...query.relations, ...relationsForExprs(normalizedExpressions) }
   });
 }

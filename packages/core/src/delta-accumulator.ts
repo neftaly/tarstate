@@ -1,5 +1,5 @@
 import { relationDeltas } from './delta.js';
-import type { RelationDelta } from './delta.js';
+import type { RelationDelta } from './adapter.js';
 import type { RelationRef } from './schema.js';
 
 /** Mutable delta accumulator used internally by write before publishing immutable deltas. */

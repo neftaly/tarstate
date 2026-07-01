@@ -75,20 +75,36 @@ Current state:
 - `tryTransact` stages object-backed write patches and commits only when the
   batch has no diagnostics.
 - `transact` wraps `tryTransact` and throws on diagnostics.
-- Public write constructors include `insert`, `insertIgnore`, `update`,
-  `upsert`, `insertOrReplace`, `insertOrMerge`/`insertOrUpdate`, `delete`,
-  `deleteExact`, and `replaceAll`.
-- `q`, `qMany`, `row`, `exists`, and `whatIf` provide Relic-style read
-  conveniences for the object-backed runtime, including named query batches.
-  `q`, `qMany`, and `whatIf` can apply post-evaluation `mapRows` result
-  shaping while preserving diagnostics; this is not a query planner,
-  transducer, or collection protocol.
-- `@tarstate/core/constraints` provides `tryTransactConstrained` and
+- Public write constructors include `insert`, `insertIgnore`, `insertOrReplace`,
+  key-scoped `updateByKey`/`deleteByKey`, predicate `update`/`delete`,
+  compatibility predicate aliases `updateWhere`/`deleteWhere`,
+  `insertOrMerge`, `insertOrUpdate`, `deleteExact`, and `replaceAll`.
+  `insertOrReplace(row)` fully replaces an existing row or inserts when missing,
+  `insertOrMerge(row, { merge })` merges provided, all, or selected row fields
+  into an existing row or inserts when missing, while
+  `insertOrUpdate(row, { update })` emits the explicit insert-or-update
+  constant set-map descriptor. Computed update expressions need a future
+  explicit API instead of overloading stable `WritePatch`.
+- `tryTransact` and `transact` accept one or more patch/callback inputs while
+  keeping the object-backed transaction all-or-nothing.
+- `q`, `qRows`, `qMany`, `qManyRows`, `row`, `exists`, and `whatIf` provide
+  Relic-style read conveniences for the object-backed runtime, including named
+  query batches. `qRows` and `qManyRows` return only rows for callers that do
+  not need the diagnostics envelope. `q`, `qMany`, and `whatIf` can apply
+  post-evaluation `mapRows` result shaping while preserving diagnostics; this is
+  not a query planner, transducer, or collection protocol.
+- `dbUpdateWhere` and `dbDeleteWhere` provide DB-facing keyed/predicate helper
+  names; explicit insert-or-update writes use `insertOrUpdate(row, { update })`
+  from `@tarstate/core/write`.
+- `stripMeta(db)` exposes the normalized row data from a `Db`, and passes
+  through non-`Db` values. It is a plain object-backed helper, not a metadata
+  reconciliation layer for materialization/watch/constraint lifecycle state.
+- `@tarstate/core/experimental/constraints` provides `tryTransactConstrained` and
   `transactConstrained` for committing object-backed writes only when both the
   staged write batch and explicit constraint set validate.
 - Lower-level object-backed `applyWrites` is partial; `applyWritesAtomic` is
   all-or-nothing for mutable object-backed data. These live behind the explicit
-  `@tarstate/core/write-apply` subpath.
+  `@tarstate/core/experimental/write-apply` subpath.
 - Committed write/transaction results include raw relation deltas.
 
 Open questions:
@@ -109,7 +125,7 @@ Current state:
 
 - Query expressions support field refs, literal values, tuples, aggregate calls,
   and named runtime calls.
-- `evaluate` accepts custom named runtime functions through evaluator options.
+- `evaluate` accepts custom named evaluator functions through evaluate options.
 
 Open questions:
 
@@ -132,8 +148,11 @@ Evidence to gather:
 Current state:
 
 - `check`, `req`, `fk`, `unique`, and `constrain` are descriptors.
-- `validateConstraints` can scan a source for `req`, `unique`, `fk`, and
-  query-bound `check`.
+- `validateConstraints` can scan a source for relation-bound `req`, `unique`,
+  `fk`, and query-bound `check`.
+- Query-bound `req`, `unique`, and `fk` constraints are descriptor-only stubs
+  that return unsupported diagnostics until query/materialized constraint
+  enforcement is implemented.
 - Object-backed constrained transactions can enforce explicit constraint sets.
 - Unbound `check` validation is explicitly unsupported until checks carry enough
   relation/query context.
@@ -167,9 +186,15 @@ Current state:
 - `RelationRuntime` in `@tarstate/core/adapter` is the write-capable boundary:
   a source, optional patch target, optional read-consistent `snapshot()`, and
   optional invalidation `subscribe()`.
+- `RelationPatchTarget` can declare writable relation ownership with
+  `relationNames` or `ownsRelation`. `composeRelationRuntimes` routes writes
+  through that target-owned metadata first, and uses read-side
+  `source.relationNames` only as a compatibility fallback when target ownership
+  is unknown.
 - `RelationAdapter` remains the durable compatibility shape: a runtime plus
-  `commit(patches)` returning commit status, committed/applied counts, relation
-  deltas, diagnostics, and optional post-commit version identity. Adapters may
+  `commit(patches)` returning `accepted`/`partial`/`rejected` status,
+  applied counts, relation deltas, diagnostics, and optional post-commit version
+  identity. Adapters may
   additionally expose `target.apply` when the same durable commit path can be
   used through generic runtime composition.
 - Apply/commit `status` is the authoritative outcome: rejected attempts have no
@@ -182,8 +207,9 @@ Current state:
 - Object-backed DB/write helpers exist for local use and tests.
 - `createMemoryRelationRuntime` provides a non-durable object-backed
   `RelationRuntime` for local state and adapter contract tests.
-- `@tarstate/core/delta` is the change boundary for adapters that can translate
-  host changes into relation added/removed rows.
+- `RelationDelta` from `@tarstate/core/adapter` is the stable change-report
+  boundary for adapters that can translate host changes into relation
+  added/removed rows.
 
 Open questions:
 
@@ -207,7 +233,13 @@ Evidence to gather:
   map row extraction, equality/range lookup, adapter commits, `deleteExact`,
   `replaceAll`, relation deltas, and atomic rejection; deeper native change to
   relation-delta translation should happen only where it clarifies generic
-  contracts.
+  contracts. The map adapter is a raw-document `map-v1` surface; Repo handle
+  integration should wrap `setDoc`/`subscribe` instead of merging handle
+  semantics into the map adapter API.
+- Automerge adapter and presence targets declare writable ownership with
+  `ownsRelation`; write routing should not infer Automerge ownership from
+  read-side relation exposure alone. Presence without `localPeerId` is read-only
+  and omits `target`.
 - More benchmarks that compare native adapter extraction cost, indexed lookup
   cost, and Tarstate evaluation cost. Automerge benchmark coverage remains a gap
   until benchmark lanes use `@tarstate/automerge` and real
@@ -222,6 +254,11 @@ Current state:
 - Query data can report relation dependencies, which gives watch and
   materialization a coarse invalidation boundary before narrow incremental
   maintenance is considered.
+- Query aliases now cover the compatibility names expected by the public
+  surface: `dependencies`, `rowKeyFields`, `uniqueIndex`, and `qualifyRow`;
+  aggregate grouping uses `aggregate({ groupBy, aggregates })`, and aggregate
+  helpers use their canonical names (`countDistinct`, `avg`, `notAny`, and
+  `setConcat`).
 - `diffQuery` computes a one-shot before/after query result diff with query key
   and optional before/after source versions.
 - `watch` is a manual refresh/recompute handle, not automatic source
@@ -237,9 +274,15 @@ Current state:
 - `watchRuntime` bridges a `RelationRuntime.subscribe` host invalidation into a
   normal watch refresh against `runtime.snapshot?.().source ?? runtime.source`.
   It does not synthesize relation deltas or expose an async stream.
-- `trackTransact` lives in `@tarstate/core/runtime`, composes readable
+- `watchTarget`/`unwatchTarget` are Relic-style target registration facades over
+  the same watch registry, and `watchChangeMap` projects tracked changes by
+  watched target identity.
+- `trackTransact` lives in `@tarstate/core/experimental/runtime`, composes readable
   DB/source transactions with watch refresh and materialization maintenance, and
   returns recompute-backed changes for watched query/relation targets.
+- `trackTransactPatches` exposes the patch-planning half of object-backed
+  tracked transactions for callers that need planned patches and diagnostics
+  before committing.
 - `trackRuntimeCommit` applies patches through a `RelationRuntime` or
   `RelationAdapter`, then maintains materializations and reports watched
   changes from the real apply/commit result. Rejected commits do not maintain or
@@ -282,10 +325,14 @@ Current state:
   when the cached source version matches the current source version; it reports
   explicit miss, stale, missing-row, or unknown-version diagnostics and does not
   recompute.
-- `snapshotIndex` can expose cached snapshot rows as a set index and reports
-  explicit diagnostics when a materialization is missing.
-- `snapshotHashIndex` can build read-only hash lookup maps derived from cached
-  snapshot rows; these lookup maps are not operator-maintained indexes.
+- `index` exposes cached snapshot rows through a Relic-shaped compatibility
+  facade: set rows by default, or a read-only hash lookup with
+  `{ kind: 'hash', field }`. Requests for `{ kind: 'btree' }` or
+  `{ kind: 'unique' }` return explicit unsupported result families. The shape is
+  for compatibility with Relic-style call sites; it does not provide Relic
+  operator-maintained `hash`, `btree`, or `unique` semantics.
+- `snapshotIndex` and `snapshotHashIndex` remain available as explicit helper
+  names; these lookup maps are not operator-maintained indexes.
 - `refreshMaterializationSnapshot` can recompute an existing snapshot by id,
   metadata, or structural query key.
 - `maintainMaterializationSnapshots` can carry snapshot materializations onto a
@@ -311,18 +358,11 @@ Current state:
   joined rows reuse cached relation-key pair identity; filtered sides, left
   joins, and joined queries with simple output transforms rebuild joined rows
   from validated current source rows.
-- `@tarstate/react` `createDbStore` uses delta-backed snapshot maintenance after
-  committed object-backed DB writes.
-- React query hooks can read exact current materialized query rows before
-  falling back to captured-source evaluation, but skip runtime env/function
-  queries to avoid unsafe cache hits.
-- React object-backed DB store commits expose optional tracked `changes` for
-  committed writes using the same core `trackTransact` path that maintains
-  materializations and delivers watch events.
-- React source/runtime/adapter stores expose core-sourced commit `changes` when
-  snapshots can be compared. Reflected commits, manual refresh, and host
-  refresh/subscribe invalidations preserve materializations with conservative
-  recompute unless real relation deltas are reported.
+- `@tarstate/react` evaluates hooks against captured source snapshots and keeps
+  materialized-query read-through outside the stable React API.
+- React commit results expose stable status/reflected/effects/snapshot fields;
+  watch-change envelopes and materialization maintenance stay in experimental
+  core surfaces.
 - Materialization metadata records a structural `queryKey`.
 - Snapshot rows are read by materialization id or structural query key; display
   names are metadata only.
@@ -354,6 +394,22 @@ Evidence to gather:
 - Benchmarks showing which query shapes need caching or indexes.
 - Watch/change-tracking experiments, because they may share invalidation logic.
 - Adapter examples with explicit snapshot identities.
+
+## Tests To Rip Next
+
+The next cleanup pass should remove or rewrite tests that lock in implementation
+details instead of public contracts:
+
+- Object-backed write tests that assert private patch expansion details instead
+  of `WritePatch`, `Db` transaction, or adapter apply/commit results.
+- Materialization tests coupled to private incremental planner branches rather
+  than public diagnostics, cached rows, and set/hash/unsupported index result
+  families.
+- Watch/runtime tests that inspect registry internals instead of
+  `watchTarget`, `unwatchTarget`, `watchChangeMap`, `trackTransact`, or
+  `trackTransactPatches` outputs.
+- Constraint tests that expect query-bound `req`/`unique`/`fk` enforcement
+  before those descriptors graduate from unsupported stubs.
 
 ## Benchmarking Principle
 
