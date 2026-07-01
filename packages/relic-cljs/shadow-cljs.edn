@@ -1,0 +1,18 @@
+{:deps true
+ :source-paths ["src-cljs"]
+ :builds
+ {:relic-cljs
+  {:target :esm
+   :output-dir "dist/cljs"
+   :runtime :node
+   :modules
+   {:relic
+    {:exports
+     {createDb tarstate.relic-cljs/create-db
+      snapshot tarstate.relic-cljs/snapshot
+      q tarstate.relic-cljs/q
+      transact tarstate.relic-cljs/transact
+      trackTransact tarstate.relic-cljs/track-transact
+      mat tarstate.relic-cljs/mat
+      watch tarstate.relic-cljs/watch
+      unwatch tarstate.relic-cljs/unwatch}}}}}}

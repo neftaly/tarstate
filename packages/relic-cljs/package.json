@@ -1,0 +1,27 @@
+{
+  "name": "@tarstate/relic-cljs",
+  "private": true,
+  "version": "0.0.0",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./react": "./src/react.ts"
+  },
+  "scripts": {
+    "cljs:build": "clojure -M:shadow release relic-cljs",
+    "cljs:smoke": "node scripts/smoke.mjs",
+    "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "react": ">=18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "catalog:",
+    "react": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

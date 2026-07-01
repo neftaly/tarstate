@@ -118,6 +118,8 @@ const sourceAliases = [
   { find: '@tarstate/core/write', replacement: path.join(repoRoot, 'packages/core/src/write.ts') },
   { find: '@tarstate/automerge/presence', replacement: path.join(repoRoot, 'packages/automerge/src/presence.ts') },
   { find: '@tarstate/automerge', replacement: path.join(repoRoot, 'packages/automerge/src/index.ts') },
+  { find: '@tarstate/relic-cljs/react', replacement: path.join(repoRoot, 'packages/relic-cljs/src/react.ts') },
+  { find: '@tarstate/relic-cljs', replacement: path.join(repoRoot, 'packages/relic-cljs/src/index.ts') },
   { find: '@tarstate/react', replacement: path.join(repoRoot, 'packages/react/src/index.ts') },
   { find: '@tarstate/core', replacement: path.join(repoRoot, 'packages/core/src/index.ts') }
 ];

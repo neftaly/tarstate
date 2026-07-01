@@ -82,6 +82,12 @@
       "@tarstate/automerge/presence": [
         "./packages/automerge/src/presence.ts"
       ],
+      "@tarstate/relic-cljs": [
+        "./packages/relic-cljs/src/index.ts"
+      ],
+      "@tarstate/relic-cljs/react": [
+        "./packages/relic-cljs/src/react.ts"
+      ],
       "@tarstate/react": [
         "./packages/react/src/index.ts"
       ]
