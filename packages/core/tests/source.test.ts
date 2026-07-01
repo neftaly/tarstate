@@ -121,6 +121,7 @@ describe('tarstate sources', () => {
     );
 
     expect(source.relationNames).toBeUndefined();
+    expect(source.version).toBeUndefined();
 
     const result = await evaluate(source, focusedObjects);
 
@@ -308,6 +309,28 @@ describe('tarstate sources', () => {
 
     expect(await objectSource.version?.()).toBe(objectData);
     expect(await presenceSource.version?.()).toBe(presenceData);
-    expect(await source.version?.()).toEqual([objectData, presenceData]);
+    const composedVersion = await source.version?.();
+    expect(composedVersion).toEqual([objectData, presenceData]);
+    expect(await source.version?.()).toBe(composedVersion);
+  });
+
+  it('withholds composed source versions when any child version is unknown', async () => {
+    const objectData = {
+      objects: [{ id: 'object-a', kind: 'file', title: 'Alpha' }]
+    };
+    const dynamicPresenceSource: RelationSource = {
+      relationNames: ['presence'],
+      rows: () => [{ workspaceId: 'workspace-a', peerId: 'peer-a', clientId: 'client-a' }]
+    };
+    const unknownVersionSource: RelationSource = {
+      relationNames: ['presence'],
+      rows: () => [],
+      version: () => undefined
+    };
+    const missingVersion = composeSources(fromObjectSource(objectData), dynamicPresenceSource);
+    const unknownVersion = composeSources(fromObjectSource(objectData), unknownVersionSource);
+
+    expect(missingVersion.version).toBeUndefined();
+    expect(await unknownVersion.version?.()).toBeUndefined();
   });
 });

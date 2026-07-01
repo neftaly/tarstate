@@ -70,6 +70,16 @@ After routing succeeds, each child target owns its own atomicity policy; a
 multi-target batch can therefore report `partial` if an earlier target reflects
 effects and a later target rejects.
 
+Composed sources/runtimes expose a composed `version` hook only when every child
+source exposes one. If a child has no hook, the composed source has no hook; if a
+child hook returns `undefined`, the composed hook returns `undefined`. Either
+case means identity is unknown, so materialized reads and snapshot checks do not
+treat a partial identity as authoritative. When all child identities are known,
+the composed tuple remains the same opaque identity while every child identity is
+`Object.is`-equal to its previous value. Composed runtime snapshots reuse the
+same tuple for `snapshot.version` and `snapshot.source.version()` instead of
+minting two equivalent-but-distinct identities.
+
 ## Presence
 
 Automerge Repo Presence is exposed as a separate `RelationRuntime`, not part of

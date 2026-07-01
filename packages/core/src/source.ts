@@ -34,7 +34,7 @@ export type RelationSource = {
   readonly lookup?: (lookup: RelationLookup) => MaybePromise<Iterable<unknown> | undefined>;
   /** Return `undefined` when this range lookup is unsupported; return `[]` for no matches. */
   readonly rangeLookup?: (lookup: RelationRangeLookup) => MaybePromise<Iterable<unknown> | undefined>;
-  /** Optional opaque identity for the current source snapshot. */
+  /** Optional opaque identity for the current source snapshot; `undefined` means the identity is unknown. */
   readonly version?: () => MaybePromise<unknown>;
   readonly diagnostics?: () => MaybePromise<Iterable<TarstateDiagnostic>>;
 };
@@ -145,8 +145,40 @@ export function composeSources(...sources: readonly RelationSource[]): RelationS
       );
       return diagnostics.flat();
     },
-    version: async () => Promise.all(sources.map(async (source) => source.version?.()))
+    ...composedSourceVersion(sources)
   };
+}
+
+function composedSourceVersion(sources: readonly RelationSource[]): { readonly version?: () => Promise<unknown> } {
+  if (sources.some((source) => source.version === undefined)) {
+    return {};
+  }
+
+  const memoize = createComposedVersionMemo();
+
+  return {
+    version: async () => {
+      const versions = await Promise.all(sources.map(async (source) => source.version?.()));
+      return versions.some((version) => version === undefined) ? undefined : memoize(versions);
+    }
+  };
+}
+
+function createComposedVersionMemo(): (versions: readonly unknown[]) => readonly unknown[] {
+  let cached: readonly unknown[] | undefined;
+
+  return (versions) => {
+    if (cached !== undefined && sameVersionTuple(cached, versions)) {
+      return cached;
+    }
+
+    cached = Object.freeze([...versions]);
+    return cached;
+  };
+}
+
+function sameVersionTuple(left: readonly unknown[], right: readonly unknown[]): boolean {
+  return left.length === right.length && left.every((version, index) => Object.is(version, right[index]));
 }
 
 function composedRelationNames(

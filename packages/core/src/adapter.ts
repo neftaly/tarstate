@@ -11,7 +11,8 @@ export type { WritePatch } from './write.js';
 
 /** Relation source exposed by a storage adapter, with typed opaque version identity. */
 export type AdapterSource<Version = unknown> = Omit<RelationSource, 'version'> & {
-  readonly version?: () => MaybePromise<Version>;
+  /** Return `undefined` when the current source identity is unknown. */
+  readonly version?: () => MaybePromise<Version | undefined>;
 };
 
 /** Read-consistent adapter snapshot. The source should close over one backing-state version. */
@@ -224,13 +225,14 @@ export function composeRelationRuntimes(
 ): RelationRuntime<readonly unknown[]> {
   const source = composeAdapterSources(runtimes.map((runtime) => runtime.source));
   const targetRuntimes = runtimes.filter((runtime) => runtime.target !== undefined);
+  const snapshotVersion = createComposedVersionMemo();
 
   return {
     source,
     ...(targetRuntimes.length === 0
       ? {}
       : { target: composedRelationPatchTarget(runtimes) }),
-    snapshot: () => composedRuntimeSnapshot(runtimes),
+    snapshot: () => composedRuntimeSnapshot(runtimes, snapshotVersion),
     ...(runtimes.some((runtime) => runtime.subscribe !== undefined)
       ? { subscribe: composedRuntimeSubscribe(runtimes) }
       : {})
@@ -270,24 +272,58 @@ export function isRelationRuntime(input: unknown): input is RelationRuntime {
   return target === undefined || (isRecord(target) && typeof target.apply === 'function');
 }
 
-function composedRuntimeSnapshot(runtimes: readonly RelationRuntime[]): AdapterSnapshot<readonly unknown[]> {
+function composedRuntimeSnapshot(
+  runtimes: readonly RelationRuntime[],
+  snapshotVersion: (versions: readonly unknown[]) => readonly unknown[]
+): AdapterSnapshot<readonly unknown[]> {
   const snapshots: AdapterSnapshot[] = runtimes.map((runtime) => runtime.snapshot?.() ?? { source: runtime.source });
   const versions = snapshots.map((snapshot) => snapshot.version);
   const allVersionsKnown = versions.every((version) => version !== undefined);
+  const version = allVersionsKnown ? snapshotVersion(versions) : undefined;
   const diagnostics = snapshots.flatMap((snapshot) => snapshot.diagnostics ?? []);
 
   return {
-    source: composeAdapterSources(snapshots.map((snapshot) => snapshot.source)),
-    ...(allVersionsKnown ? { version: versions } : {}),
+    source: composeAdapterSources(
+      snapshots.map((snapshot) => snapshot.source),
+      version === undefined ? false : () => version
+    ),
+    ...(version === undefined ? {} : { version }),
     ...(diagnostics.length === 0 ? {} : { diagnostics })
   };
 }
 
-function composeAdapterSources(sources: readonly AdapterSource[]): AdapterSource<readonly unknown[]> {
+function composeAdapterSources(
+  sources: readonly AdapterSource[],
+  versionHook?: false | (() => MaybePromise<readonly unknown[] | undefined>)
+): AdapterSource<readonly unknown[]> {
+  const source = composeSources(...sources);
+  const version = versionHook === false ? undefined : versionHook ?? source.version;
+
   return {
-    ...composeSources(...sources),
-    version: async () => Promise.all(sources.map(async (source) => source.version?.()))
+    ...(source.relationNames === undefined ? {} : { relationNames: source.relationNames }),
+    rows: source.rows,
+    ...(source.lookup === undefined ? {} : { lookup: source.lookup }),
+    ...(source.rangeLookup === undefined ? {} : { rangeLookup: source.rangeLookup }),
+    ...(source.diagnostics === undefined ? {} : { diagnostics: source.diagnostics }),
+    ...(version === undefined ? {} : { version: async () => (await version()) as readonly unknown[] | undefined })
   };
+}
+
+function createComposedVersionMemo(): (versions: readonly unknown[]) => readonly unknown[] {
+  let cached: readonly unknown[] | undefined;
+
+  return (versions) => {
+    if (cached !== undefined && sameVersionTuple(cached, versions)) {
+      return cached;
+    }
+
+    cached = Object.freeze([...versions]);
+    return cached;
+  };
+}
+
+function sameVersionTuple(left: readonly unknown[], right: readonly unknown[]): boolean {
+  return left.length === right.length && left.every((version, index) => Object.is(version, right[index]));
 }
 
 function composedRuntimeSubscribe(

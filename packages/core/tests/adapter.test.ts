@@ -284,6 +284,9 @@ describe('tarstate adapter contract', () => {
     const runtime = composeRelationRuntimes(todoRuntime, presenceRuntime);
 
     expect(runtime.source.relationNames).toEqual(['todos', 'presence']);
+    const initialVersion = await runtime.source.version?.();
+    expect(initialVersion).toEqual([0, 0]);
+    expect(await runtime.source.version?.()).toBe(initialVersion);
 
     const todoPatch = todos.insert({ id: 'todo-a', text: 'Buy oat milk', done: false });
     const presencePatch = presence.insert({ id: 'peer-a', targetTodoId: 'todo-a' });
@@ -299,6 +302,86 @@ describe('tarstate adapter contract', () => {
       diagnostics: [],
       version: [1, 1]
     });
+    const nextVersion = await runtime.source.version?.();
+    expect(nextVersion).toEqual([1, 1]);
+    expect(nextVersion).not.toBe(initialVersion);
+    expect(result.version).toBe(nextVersion);
+    expect(await runtime.source.version?.()).toBe(nextVersion);
+  });
+
+  it('reuses composed runtime snapshot version identity for its snapshot source', async () => {
+    const todoVersion = { revision: 'todos-1' };
+    const presenceVersion = { revision: 'presence-1' };
+    const runtime = composeRelationRuntimes(
+      {
+        source: {
+          relationNames: [schema.todos.name],
+          rows: () => [],
+          version: () => ({ revision: 'todos-live' })
+        },
+        snapshot: () => ({
+          source: {
+            relationNames: [schema.todos.name],
+            rows: () => [],
+            version: () => todoVersion
+          },
+          version: todoVersion
+        })
+      },
+      {
+        source: {
+          relationNames: [schema.presence.name],
+          rows: () => [],
+          version: () => ({ revision: 'presence-live' })
+        },
+        snapshot: () => ({
+          source: {
+            relationNames: [schema.presence.name],
+            rows: () => [],
+            version: () => presenceVersion
+          },
+          version: presenceVersion
+        })
+      }
+    );
+    const snapshot = runtime.snapshot?.();
+    const snapshotSourceVersion = await snapshot?.source.version?.();
+
+    expect(snapshot?.version).toEqual([todoVersion, presenceVersion]);
+    expect(snapshotSourceVersion).toBe(snapshot?.version);
+    expect(await snapshot?.source.version?.()).toBe(snapshot?.version);
+  });
+
+  it('withholds composed runtime source versions when any child version is unknown', async () => {
+    const versionedRuntime: RelationRuntime<number> = {
+      source: {
+        relationNames: [schema.todos.name],
+        rows: () => [],
+        version: () => 1
+      }
+    };
+    const unversionedRuntime: RelationRuntime = {
+      source: {
+        relationNames: [schema.presence.name],
+        rows: () => []
+      }
+    };
+    const unknownVersionRuntime: RelationRuntime<number> = {
+      source: {
+        relationNames: [schema.presence.name],
+        rows: () => [],
+        version: () => undefined
+      }
+    };
+    const runtime = composeRelationRuntimes(versionedRuntime, unversionedRuntime);
+    const unknownRuntime = composeRelationRuntimes(versionedRuntime, unknownVersionRuntime);
+    const snapshot = runtime.snapshot?.();
+
+    expect(runtime.source.version).toBeUndefined();
+    expect(snapshot?.version).toBeUndefined();
+    expect(snapshot?.source.version).toBeUndefined();
+    expect(await unknownRuntime.source.version?.()).toBeUndefined();
+    expect(unknownRuntime.snapshot?.().source.version).toBeUndefined();
   });
 
   it('rejects composed runtime writes when relation ownership is ambiguous', async () => {
