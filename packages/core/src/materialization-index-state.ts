@@ -8,20 +8,40 @@ import type {
 
 export type MaintainedIndexKind = 'hash' | 'btree' | 'unique';
 
+export type MaintainedIndexValueResult = {
+  readonly value: unknown;
+  readonly diagnostics?: readonly MaterializationDiagnostic[];
+};
+
+export type MaintainedIndexPart = {
+  readonly label: string;
+  readonly identity: string;
+  readonly field?: string;
+  readonly value: (row: unknown) => MaintainedIndexValueResult;
+};
+
 export type MaintainedIndexDefinition = {
   readonly kind: MaintainedIndexKind;
   readonly fields: readonly [string, ...string[]];
+  readonly parts?: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]];
+  readonly diagnostics?: readonly MaterializationDiagnostic[];
 };
 
 export type MaintainedHashIndexState<Row = unknown> = {
   readonly kind: 'hash';
   readonly fields: readonly [string, ...string[]];
+  readonly parts?: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]];
+  readonly definitionDiagnostics: readonly MaterializationDiagnostic[];
+  readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly lookup: ReadonlyMap<unknown, MaterializationNestedRows<Row>>;
 };
 
 export type MaintainedBtreeIndexState<Row = unknown> = {
   readonly kind: 'btree';
   readonly fields: readonly [string, ...string[]];
+  readonly parts?: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]];
+  readonly definitionDiagnostics: readonly MaterializationDiagnostic[];
+  readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly lookup: ReadonlyMap<unknown, MaterializationNestedRows<Row>>;
   readonly ordered: readonly unknown[];
 };
@@ -29,6 +49,8 @@ export type MaintainedBtreeIndexState<Row = unknown> = {
 export type MaintainedUniqueIndexState<Row = unknown> = {
   readonly kind: 'unique';
   readonly fields: readonly [string, ...string[]];
+  readonly parts?: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]];
+  readonly definitionDiagnostics: readonly MaterializationDiagnostic[];
   readonly lookup: ReadonlyMap<unknown, MaterializationNestedUniqueRows<Row>>;
   readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly diagnosticsByTopKey: ReadonlyMap<unknown, readonly MaterializationDiagnostic[]>;
@@ -46,9 +68,20 @@ export type MaintainedIndexes<Row = unknown> = {
 
 export function maintainedIndexKey(
   kind: MaintainedIndexKind,
-  fields: readonly string[]
+  fields: readonly string[],
+  expressionIdentities?: readonly string[]
 ): string {
-  return stableKey({ kind, fields });
+  return expressionIdentities === undefined
+    ? stableKey({ kind, fields })
+    : stableKey({ kind, expressions: expressionIdentities });
+}
+
+function maintainedIndexDefinitionKey(definition: MaintainedIndexDefinition): string {
+  return maintainedIndexKey(
+    definition.kind,
+    definition.fields,
+    definition.parts?.map((part) => part.identity)
+  );
 }
 
 export function buildMaintainedIndexes<Row>(
@@ -58,7 +91,7 @@ export function buildMaintainedIndexes<Row>(
   const byKey = new Map<string, MaintainedIndexState<Row>>();
 
   for (const definition of definitions) {
-    const key = maintainedIndexKey(definition.kind, definition.fields);
+    const key = maintainedIndexDefinitionKey(definition);
     if (byKey.has(key)) {
       continue;
     }
@@ -95,11 +128,20 @@ function buildMaintainedIndex<Row>(
   rows: readonly Row[],
   definition: MaintainedIndexDefinition
 ): MaintainedIndexState<Row> {
+  if (definition.parts !== undefined) {
+    return buildExpressionMaintainedIndex(rows, {
+      ...definition,
+      parts: definition.parts
+    });
+  }
+
   switch (definition.kind) {
     case 'hash':
       return {
         kind: 'hash',
         fields: definition.fields,
+        definitionDiagnostics: definition.diagnostics ?? [],
+        diagnostics: definition.diagnostics ?? [],
         lookup: buildRowsLookup(rows, definition.fields)
       };
     case 'btree': {
@@ -107,6 +149,8 @@ function buildMaintainedIndex<Row>(
       return {
         kind: 'btree',
         fields: definition.fields,
+        definitionDiagnostics: definition.diagnostics ?? [],
+        diagnostics: definition.diagnostics ?? [],
         lookup,
         ordered: Array.from(lookup.keys()).sort(compareValues)
       };
@@ -121,6 +165,15 @@ function patchMaintainedIndex<Row>(
   rows: readonly Row[],
   rowBatches: readonly IncrementalRowBatch<Row>[]
 ): MaintainedIndexState<Row> {
+  if (state.parts !== undefined) {
+    return buildMaintainedIndex(rows, {
+      kind: state.kind,
+      fields: state.fields,
+      parts: state.parts,
+      diagnostics: state.definitionDiagnostics
+    });
+  }
+
   switch (state.kind) {
     case 'hash':
       return patchRowsIndex(state, rows, rowBatches);
@@ -274,10 +327,171 @@ function buildUniqueState<Row>(
   return {
     kind: 'unique',
     fields,
+    definitionDiagnostics: [],
     lookup,
     diagnosticsByTopKey,
     diagnostics: diagnosticsForUniqueLookup(lookup, diagnosticsByTopKey)
   };
+}
+
+function buildExpressionMaintainedIndex<Row>(
+  rows: readonly Row[],
+  definition: MaintainedIndexDefinition & { readonly parts: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]] }
+): MaintainedIndexState<Row> {
+  switch (definition.kind) {
+    case 'hash': {
+      const built = buildExpressionRowsLookup(rows, definition.parts);
+      return {
+        kind: 'hash',
+        fields: definition.fields,
+        parts: definition.parts,
+        definitionDiagnostics: definition.diagnostics ?? [],
+        diagnostics: [...(definition.diagnostics ?? []), ...built.diagnostics],
+        lookup: built.lookup
+      };
+    }
+    case 'btree': {
+      const built = buildExpressionRowsLookup(rows, definition.parts);
+      const lookup = sortRowsLookup(built.lookup);
+      return {
+        kind: 'btree',
+        fields: definition.fields,
+        parts: definition.parts,
+        definitionDiagnostics: definition.diagnostics ?? [],
+        diagnostics: [...(definition.diagnostics ?? []), ...built.diagnostics],
+        lookup,
+        ordered: Array.from(lookup.keys()).sort(compareValues)
+      };
+    }
+    case 'unique': {
+      const built = buildExpressionUniqueLookup(rows, definition.fields, definition.parts);
+      return {
+        kind: 'unique',
+        fields: definition.fields,
+        parts: definition.parts,
+        definitionDiagnostics: definition.diagnostics ?? [],
+        lookup: built.lookup,
+        diagnosticsByTopKey: built.diagnosticsByTopKey,
+        diagnostics: [
+          ...(definition.diagnostics ?? []),
+          ...diagnosticsForUniqueLookup(built.lookup, built.diagnosticsByTopKey)
+        ]
+      };
+    }
+  }
+}
+
+function buildExpressionRowsLookup<Row>(
+  rows: readonly Row[],
+  parts: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]]
+): {
+  readonly lookup: ReadonlyMap<unknown, MaterializationNestedRows<Row>>;
+  readonly diagnostics: readonly MaterializationDiagnostic[];
+} {
+  const lookup = new Map<unknown, MaterializationNestedRows<Row>>();
+  const diagnostics: MaterializationDiagnostic[] = [];
+  for (const row of rows) {
+    const keyed = expressionKeyValues(row, parts);
+    diagnostics.push(...keyed.diagnostics);
+    addRowToRowsLookupByValues(lookup, keyed.values, row);
+  }
+  return { lookup, diagnostics };
+}
+
+function buildExpressionUniqueLookup<Row>(
+  rows: readonly Row[],
+  fields: readonly [string, ...string[]],
+  parts: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]]
+): {
+  readonly lookup: ReadonlyMap<unknown, MaterializationNestedUniqueRows<Row>>;
+  readonly diagnosticsByTopKey: ReadonlyMap<unknown, readonly MaterializationDiagnostic[]>;
+} {
+  const lookup = new Map<unknown, MaterializationNestedUniqueRows<Row>>();
+  const diagnosticsByTopKey = new Map<unknown, MaterializationDiagnostic[]>();
+
+  for (const row of rows) {
+    const keyed = expressionKeyValues(row, parts);
+    if (keyed.diagnostics.length > 0) {
+      const topKey = keyed.values[0];
+      const diagnostics = diagnosticsByTopKey.get(topKey) ?? [];
+      diagnostics.push(...keyed.diagnostics);
+      diagnosticsByTopKey.set(topKey, diagnostics);
+    }
+    addRowToUniqueLookupByValues(lookup, fields, keyed.values, row, diagnosticsByTopKey);
+  }
+
+  return { lookup, diagnosticsByTopKey };
+}
+
+function expressionKeyValues(
+  row: unknown,
+  parts: readonly [MaintainedIndexPart, ...MaintainedIndexPart[]]
+): {
+  readonly values: readonly unknown[];
+  readonly diagnostics: readonly MaterializationDiagnostic[];
+} {
+  const values: unknown[] = [];
+  const diagnostics: MaterializationDiagnostic[] = [];
+
+  for (const part of parts) {
+    const result = part.value(row);
+    values.push(result.value);
+    diagnostics.push(...result.diagnostics ?? []);
+  }
+
+  return { values, diagnostics };
+}
+
+function addRowToRowsLookupByValues<Row>(
+  lookup: Map<unknown, MaterializationNestedRows<Row>>,
+  values: readonly unknown[],
+  row: Row
+): void {
+  let cursor = lookup;
+  for (let index = 0; index < values.length; index += 1) {
+    const key = values[index];
+    if (index === values.length - 1) {
+      const existing = cursor.get(key);
+      const rows = existing instanceof Set ? existing : new Set<Row>();
+      rows.add(row);
+      cursor.set(key, rows);
+      return;
+    }
+
+    const existing = cursor.get(key);
+    const next = existing instanceof Map ? existing : new Map<unknown, MaterializationNestedRows<Row>>();
+    cursor.set(key, next);
+    cursor = next;
+  }
+}
+
+function addRowToUniqueLookupByValues<Row>(
+  lookup: Map<unknown, MaterializationNestedUniqueRows<Row>>,
+  fields: readonly string[],
+  values: readonly unknown[],
+  row: Row,
+  diagnosticsByTopKey: Map<unknown, MaterializationDiagnostic[]>
+): void {
+  let cursor = lookup;
+  for (let index = 0; index < values.length; index += 1) {
+    const key = values[index];
+    if (index === values.length - 1) {
+      if (cursor.has(key)) {
+        const topKey = values[0];
+        const diagnostics = diagnosticsByTopKey.get(topKey) ?? [];
+        diagnostics.push(uniqueDuplicateDiagnostic(fields, key));
+        diagnosticsByTopKey.set(topKey, diagnostics);
+        return;
+      }
+      cursor.set(key, row);
+      return;
+    }
+
+    const existing = cursor.get(key);
+    const next = existing instanceof Map ? existing : new Map<unknown, MaterializationNestedUniqueRows<Row>>();
+    cursor.set(key, next);
+    cursor = next;
+  }
 }
 
 function replaceUniqueBranch<Row>(

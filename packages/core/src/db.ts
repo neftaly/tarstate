@@ -3,6 +3,7 @@ import type { TarstateDiagnostic } from './diagnostics.js';
 import { evaluate, validateRelationRow, type EvaluateEnv, type EvaluateOptions, type QueryResult } from './evaluate.js';
 import {
   maintainMaterializations,
+  materializedLookupRowsFor,
   queryRowsFromMaterialization,
   type MaterializationMaintenanceResult
 } from './materialization.js';
@@ -256,7 +257,12 @@ export function createDb(data: DbInputData = {}, options: DbInputEnv | DbOptions
 export const db = createDb;
 
 export function dbSource(db: Db): RelationSource {
-  return fromObjectSource(dbEngineFor(db).read());
+  const data = dbEngineFor(db).read();
+  const objectSource = fromObjectSource(data);
+  return {
+    ...objectSource,
+    lookup: (lookup) => materializedLookupRowsFor(db, lookup.relation, lookup.field, lookup.value)
+  };
 }
 
 export function stripMeta(db: Db): DbData;

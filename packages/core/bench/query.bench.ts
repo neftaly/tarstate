@@ -16,6 +16,7 @@ import {
   qRows,
   queryKey,
   transact,
+  uniqueIndex,
   type Query,
   type RelationSource
 } from '@tarstate/core';
@@ -34,6 +35,7 @@ const maintainedLookupPerson = extraPerson(700);
 const peopleById = pipe(
   from(personRef),
   hash(personRef.id),
+  uniqueIndex(personRef.email),
   project({
     id: personRef.id,
     name: personRef.name,
@@ -66,6 +68,26 @@ const lookupMaintainedPersonById = pipe(
   }),
   keyBy('id')
 );
+const lookupExistingPersonByEmail = pipe(
+  lookup(personRef, 'email', largeLookupPerson.email),
+  project({
+    id: personRef.id,
+    email: personRef.email,
+    role: personRef.role,
+    capacity: personRef.capacity
+  }),
+  keyBy('id')
+);
+const lookupMaintainedPersonByEmail = pipe(
+  lookup(personRef, 'email', maintainedLookupPerson.email),
+  project({
+    id: personRef.id,
+    email: personRef.email,
+    role: personRef.role,
+    capacity: personRef.capacity
+  }),
+  keyBy('id')
+);
 const materializedPeopleById = mat(createDb(large.data), peopleById, {
   id: 'people-by-id',
   mode: 'incremental'
@@ -76,6 +98,8 @@ const maintainedPeopleById = transact(
 );
 const materializedPeopleLookupSource = materializedHashLookupSource(materializedPeopleById, peopleById, 'id');
 const maintainedPeopleLookupSource = materializedHashLookupSource(maintainedPeopleById, peopleById, 'id');
+const materializedPeopleUniqueLookupSource = materializedUniqueLookupSource(materializedPeopleById, peopleById, 'email');
+const maintainedPeopleUniqueLookupSource = materializedUniqueLookupSource(maintainedPeopleById, peopleById, 'email');
 
 function materializedHashLookupSource<Row>(
   db: object,
@@ -91,6 +115,25 @@ function materializedHashLookupSource<Row>(
       }
 
       return index<Row, unknown>(db, query, { kind: 'hash', field }).index?.get(value) ?? [];
+    }
+  };
+}
+
+function materializedUniqueLookupSource<Row>(
+  db: object,
+  query: Query<Row>,
+  field: string
+): RelationSource {
+  return {
+    relationNames: [benchSchema.people.name],
+    rows: () => materializedRowsForQuery(db, query) ?? [],
+    lookup: ({ relation, field: lookupField, value }) => {
+      if (relation.name !== benchSchema.people.name || lookupField !== field) {
+        return undefined;
+      }
+
+      const row = index<Row, unknown>(db, query, { kind: 'unique', field }).index?.get(value);
+      return row === undefined ? [] : [row];
     }
   };
 }
@@ -148,11 +191,47 @@ describe('core query benchmarks', () => {
     consumeBenchResult(await evaluate(large.indexedSource, large.queries.lookupTasksByOwner));
   }, options);
 
+  bench('object source lookup: person by id scan', async () => {
+    consumeBenchResult(await evaluate(large.objectSource, lookupExistingPersonById));
+  }, options);
+
+  bench('indexed source lookup: person by id index', async () => {
+    consumeBenchResult(await evaluate(large.indexedSource, lookupExistingPersonById));
+  }, options);
+
+  bench('qRows lookup automatic candidate: plain db person by id', async () => {
+    consumeBenchResult(await qRows(large.db, lookupExistingPersonById));
+  }, options);
+
+  bench('qRows lookup automatic candidate: materialized hash before maintained insert', async () => {
+    consumeBenchResult(await qRows(materializedPeopleById, lookupExistingPersonById));
+  }, options);
+
+  bench('qRows lookup automatic candidate: materialized hash after maintained insert', async () => {
+    consumeBenchResult(await qRows(maintainedPeopleById, lookupMaintainedPersonById));
+  }, options);
+
+  bench('qRows lookup automatic candidate: materialized unique before maintained insert', async () => {
+    consumeBenchResult(await qRows(materializedPeopleById, lookupExistingPersonByEmail));
+  }, options);
+
+  bench('qRows lookup automatic candidate: materialized unique after maintained insert', async () => {
+    consumeBenchResult(await qRows(maintainedPeopleById, lookupMaintainedPersonByEmail));
+  }, options);
+
   bench('lookup query path: materialized hash source before maintained insert', async () => {
     consumeBenchResult(await evaluate(materializedPeopleLookupSource, lookupExistingPersonById));
   }, options);
 
   bench('lookup query path: materialized hash source after maintained insert', async () => {
     consumeBenchResult(await evaluate(maintainedPeopleLookupSource, lookupMaintainedPersonById));
+  }, options);
+
+  bench('lookup query path: materialized unique source before maintained insert', async () => {
+    consumeBenchResult(await evaluate(materializedPeopleUniqueLookupSource, lookupExistingPersonByEmail));
+  }, options);
+
+  bench('lookup query path: materialized unique source after maintained insert', async () => {
+    consumeBenchResult(await evaluate(maintainedPeopleUniqueLookupSource, lookupMaintainedPersonByEmail));
   }, options);
 });
