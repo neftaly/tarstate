@@ -1,244 +1,508 @@
-import { evaluate, type QueryResult } from '@tarstate/core/evaluate';
+import * as Automerge from '@automerge/automerge';
+import { createElement, useMemo, useState, type ReactElement } from 'react';
 import {
+  aggregate,
   as,
+  avg,
+  btree,
+  constrain,
+  count,
+  db,
+  env,
   eq,
+  explainMaterialization,
+  fk,
   from,
+  gte,
+  hash,
+  index,
+  insert,
+  join,
+  keyBy,
   leftJoin,
+  mat,
+  materializationForQuery,
   maybe,
+  neq,
+  numberField,
   pipe,
-  project,
+  project as select,
+  req,
+  stringField,
+  sum,
+  updateByKey,
+  unique,
+  value,
+  where,
+  type Db,
   type Query
-} from '@tarstate/core/query';
+} from '@tarstate/core';
+import { automergeDb, type AutomergeDb } from '@tarstate/automerge';
 import {
   booleanField,
   defineSchema,
   idField,
   refField,
-  relation,
-  stringField
+  relation
 } from '@tarstate/core/schema';
-import { fromObjectSource } from '@tarstate/core/source';
 import {
-  applyWrites,
-  type MutableObjectSourceData,
-  type WriteApplyResult
-} from '@tarstate/core/experimental/write-apply';
-import {
-  write,
-  type WritePatch
-} from '@tarstate/core/write';
+  createDbStore,
+  TarstateProvider,
+  useDb,
+  useMaterialized,
+  useQuery,
+  useTransact,
+  useWatch,
+  type TarstateDbStore
+} from '@tarstate/react';
+
+export type ProjectRow = {
+  readonly id: string;
+  readonly name: string;
+  readonly status: string;
+};
+
+export type PersonRow = {
+  readonly id: string;
+  readonly name: string;
+  readonly role: string;
+  readonly active: boolean;
+};
 
 export type TodoRow = {
   readonly id: string;
-  readonly text: string;
-  readonly done: boolean;
-};
-
-export type WriterRow = {
-  readonly id: string;
-  readonly name: string;
-};
-
-export type TodoWriterRow = {
-  readonly todoId: string;
-  readonly writerId: string;
-};
-
-export type TodoDemoRow = {
-  readonly id: string;
-  readonly text: string;
-  readonly done: boolean;
-  readonly writer: string | undefined;
-};
-
-export type PatchLogEntry = {
-  readonly index: number;
-  readonly op: WritePatch['op'];
-  readonly relation: string;
-  readonly intent: string;
-  readonly summary: string;
-};
-
-export type WriterActionScenario = {
+  readonly projectId: string;
+  readonly ownerId: string;
   readonly title: string;
-  readonly description: string;
-  readonly actions: readonly {
-    readonly intent: string;
-    readonly patch: WritePatch;
-  }[];
+  readonly status: string;
+  readonly points: number;
 };
 
-export type TarstateDemoSnapshot = {
-  readonly schema: readonly {
-    readonly name: string;
-    readonly key: string;
-    readonly fields: readonly string[];
-  }[];
-  readonly sourceRows: MutableObjectSourceData;
-  readonly query: Query<TodoDemoRow>;
-  readonly queryResult: QueryResult<TodoDemoRow>;
-  readonly writerScenario: WriterActionScenario;
-  readonly patches: readonly WritePatch[];
-  readonly patchLog: readonly PatchLogEntry[];
-  readonly writeResult: WriteApplyResult;
-  readonly nextRows: MutableObjectSourceData;
-  readonly nextQueryResult: QueryResult<TodoDemoRow>;
+export type TodoCard = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly project: string;
+  readonly owner: string | undefined;
+  readonly title: string;
+  readonly status: string;
+  readonly points: number;
+};
+
+export type ProjectSummary = {
+  readonly projectId: string;
+  readonly todos: number;
+  readonly points: number;
+  readonly averagePoints: number;
+};
+
+export type StoredRow<Row extends { readonly id: string }> = Omit<Row, 'id'> & {
+  readonly id?: string;
+};
+
+export type CollaborationDocument = {
+  readonly workspace: {
+    readonly projects: Record<string, StoredRow<ProjectRow>>;
+    readonly people: Record<string, StoredRow<PersonRow>>;
+    readonly todos: Record<string, StoredRow<TodoRow>>;
+  };
+};
+
+export type AutomergeExampleModel = {
+  readonly relic: AutomergeDb<CollaborationDocument>;
+  readonly store: TarstateDbStore;
+  readonly beforeHeads: readonly string[];
 };
 
 export const todoSchema = defineSchema({
+  projects: relation<ProjectRow>({
+    key: 'id',
+    fields: {
+      id: idField('project'),
+      name: stringField(),
+      status: stringField()
+    }
+  }),
+  people: relation<PersonRow>({
+    key: 'id',
+    fields: {
+      id: idField('person'),
+      name: stringField(),
+      role: stringField(),
+      active: booleanField()
+    }
+  }),
   todos: relation<TodoRow>({
     key: 'id',
     fields: {
       id: idField('todo'),
-      text: stringField(),
-      done: booleanField()
-    }
-  }),
-  writers: relation<WriterRow>({
-    key: 'id',
-    fields: {
-      id: idField('writer'),
-      name: stringField()
-    }
-  }),
-  todoWriters: relation<TodoWriterRow>({
-    key: 'todoId',
-    fields: {
-      todoId: refField('todos.id'),
-      writerId: refField('writers.id')
+      projectId: refField('projects.id'),
+      ownerId: refField('people.id'),
+      title: stringField(),
+      status: stringField(),
+      points: numberField()
     }
   })
 });
 
-const todo = as(todoSchema.todos, 'todo');
-const todoWriter = as(todoSchema.todoWriters, 'todoWriter');
-const writer = as(todoSchema.writers, 'writer');
+const projectRef = as(todoSchema.projects, 'project');
+const personRef = as(todoSchema.people, 'person');
+const todoRef = as(todoSchema.todos, 'todo');
 
-export const todoQuery = pipe(
-  from(todo),
-  leftJoin(from(todoWriter), eq(todo.id, todoWriter.todoId)),
-  leftJoin(from(writer), eq(todoWriter.writerId, writer.id)),
-  project({
-    id: todo.id,
-    text: todo.text,
-    done: todo.done,
-    writer: maybe(writer.name)
-  })
-);
+export const openTodoCardsQuery = pipe(
+  from(todoRef),
+  where(neq(todoRef.status, 'done')),
+  join(from(projectRef), eq(todoRef.projectId, projectRef.id)),
+  leftJoin(from(personRef), eq(todoRef.ownerId, personRef.id)),
+  select({
+    id: todoRef.id,
+    projectId: projectRef.id,
+    project: projectRef.name,
+    owner: maybe(personRef.name),
+    title: todoRef.title,
+    status: todoRef.status,
+    points: todoRef.points
+  }),
+  keyBy('id')
+) as unknown as Query<TodoCard>;
 
-export function seedSourceRows(): MutableObjectSourceData {
+export const projectSummaryQuery = pipe(
+  from(todoRef),
+  where(neq(todoRef.status, 'done')),
+  where(gte(todoRef.points, env<number>('minimumPoints'))),
+  aggregate({
+    groupBy: { projectId: todoRef.projectId },
+    aggregates: {
+      todos: count(),
+      points: sum(todoRef.points),
+      averagePoints: avg(todoRef.points)
+    }
+  }),
+  keyBy('projectId')
+) as unknown as Query<ProjectSummary>;
+
+export const plannedOpenTodosQuery = pipe(
+  from(todoRef),
+  hash(todoRef.projectId),
+  btree(todoRef.points),
+  where(neq(todoRef.status, 'done')),
+  where(gte(todoRef.points, value(3))),
+  select({ id: todoRef.id, title: todoRef.title }),
+  keyBy('id')
+) as unknown as Query<{ readonly id: string; readonly title: string }>;
+
+export function seedData(): Db['data'] {
   return {
+    projects: [
+      { id: 'project-launch', name: 'Launch board', status: 'active' },
+      { id: 'project-ops', name: 'Operations', status: 'active' }
+    ],
+    people: [
+      { id: 'person-ada', name: 'Ada', role: 'engineer', active: true },
+      { id: 'person-bea', name: 'Bea', role: 'designer', active: true },
+      { id: 'person-cy', name: 'Cy', role: 'ops', active: false }
+    ],
     todos: [
-      { id: 'todo-a', text: 'Sketch relation schema', done: true },
-      { id: 'todo-b', text: 'Evaluate a query over object rows', done: false },
-      { id: 'todo-c', text: 'Apply writer patches', done: false }
-    ],
-    todoWriters: [
-      { todoId: 'todo-a', writerId: 'writer-mina' },
-      { todoId: 'todo-c', writerId: 'writer-jules' }
-    ],
-    writers: [
-      { id: 'writer-mina', name: 'Mina' },
-      { id: 'writer-jules', name: 'Jules' }
-    ]
-  };
-}
-
-export function buildDemoPatches(): readonly WritePatch[] {
-  return buildWriterActionScenario().actions.map((action) => action.patch);
-}
-
-export function buildWriterActionScenario(): WriterActionScenario {
-  const todos = write(todoSchema.todos);
-  const todoWriters = write(todoSchema.todoWriters);
-
-  return {
-    title: 'Writer batch: finish, add, assign, unassign',
-    description: 'A single ordered batch updates one todo, inserts one todo, inserts or updates its writer link, and deletes one stale writer link.',
-    actions: [
       {
-        intent: 'Mark the object-backed query work complete.',
-        patch: todos.updateByKey('todo-b', { done: true })
+        id: 'todo-core',
+        projectId: 'project-launch',
+        ownerId: 'person-ada',
+        title: 'Ship core API',
+        status: 'doing',
+        points: 5
       },
       {
-        intent: 'Add a follow-up todo for adapter benchmarking.',
-        patch: todos.insert({ id: 'todo-d', text: 'Benchmark the Automerge adapter', done: false })
+        id: 'todo-docs',
+        projectId: 'project-launch',
+        ownerId: 'person-bea',
+        title: 'Write customer docs',
+        status: 'todo',
+        points: 3
       },
       {
-        intent: 'Assign the new todo to an existing writer.',
-        patch: todoWriters.insertOrUpdate(
-          { todoId: 'todo-d', writerId: 'writer-mina' },
-          { update: { writerId: 'writer-mina' } }
-        )
+        id: 'todo-release',
+        projectId: 'project-ops',
+        ownerId: 'person-ada',
+        title: 'Run release checklist',
+        status: 'done',
+        points: 2
       },
       {
-        intent: 'Remove the stale writer assignment from the patching task.',
-        patch: todoWriters.deleteByKey('todo-c')
+        id: 'todo-feedback',
+        projectId: 'project-ops',
+        ownerId: 'person-cy',
+        title: 'Triage feedback',
+        status: 'todo',
+        points: 1
       }
     ]
   };
 }
 
-export async function createTarstateDemoSnapshot(): Promise<TarstateDemoSnapshot> {
-  const sourceRows = seedSourceRows();
-  const queryResult = await evaluate(fromObjectSource(sourceRows), todoQuery);
-  const writerScenario = buildWriterActionScenario();
-  const patches = writerScenario.actions.map((action) => action.patch);
-  const nextRows = cloneRows(sourceRows);
-  const writeResult = applyWrites(nextRows, patches);
-  const nextQueryResult = await evaluate(fromObjectSource(nextRows), todoQuery);
+export function createDemoStore(input: Db = db(seedData(), { env: { minimumPoints: 1 } })): TarstateDbStore {
+  return createDbStore(input);
+}
+
+export async function createMaterializedDemoStore(): Promise<TarstateDbStore> {
+  const store = createDemoStore();
+  await store.materialize(openTodoCardsQuery, { id: 'open-todos' });
+  return store;
+}
+
+export function createConstrainedDemoStore(): TarstateDbStore {
+  return createDemoStore(mat(
+    db(seedData(), { env: { minimumPoints: 1 } }),
+    constrain(
+      req(todoSchema.todos, 'title'),
+      unique(todoSchema.people, 'name'),
+      fk(todoSchema.todos, 'ownerId', todoSchema.people, 'id'),
+      fk(todoSchema.todos, 'projectId', todoSchema.projects, 'id', { cascade: 'delete' })
+    )
+  ));
+}
+
+export async function createAutomergeExampleModel(): Promise<AutomergeExampleModel> {
+  const relic = automergeDb<CollaborationDocument>(Automerge.from<CollaborationDocument>({
+    workspace: {
+      projects: {
+        'project-launch': { name: 'Launch board', status: 'active' },
+        'project-ops': { name: 'Operations', status: 'active' }
+      },
+      people: {
+        'person-ada': { name: 'Ada', role: 'engineer', active: true },
+        'person-bea': { name: 'Bea', role: 'designer', active: true }
+      },
+      todos: {
+        'todo-core': {
+          projectId: 'project-launch',
+          ownerId: 'person-ada',
+          title: 'Ship core API',
+          status: 'doing',
+          points: 5
+        }
+      }
+    }
+  }), {
+    env: { minimumPoints: 1 },
+    relations: [
+      { relation: todoSchema.projects, path: ['workspace', 'projects'] },
+      { relation: todoSchema.people, path: ['workspace', 'people'] },
+      { relation: todoSchema.todos, path: ['workspace', 'todos'] }
+    ]
+  });
+  const snapshot = await relic.getSnapshot();
 
   return {
-    schema: Object.values(todoSchema).map((relationRef) => ({
-      name: relationRef.name,
-      key: formatRelationKey(relationRef.key),
-      fields: Object.keys(relationRef.fields)
-    })),
-    sourceRows,
-    query: todoQuery,
-    queryResult,
-    writerScenario,
-    patches,
-    patchLog: writerScenario.actions.map((action, index) => describePatch(action.patch, action.intent, index)),
-    writeResult,
-    nextRows,
-    nextQueryResult
+    relic,
+    store: createDemoStore(snapshot.db),
+    beforeHeads: Automerge.getHeads(relic.getDoc())
   };
 }
 
-function formatRelationKey(key: unknown): string {
-  return Array.isArray(key) ? key.join(', ') : String(key);
+export function BasicTodoQueryExample(): ReactElement {
+  const currentDb = useDb();
+  const query = useQuery(openTodoCardsQuery, {
+    select: (rows) => ({
+      openCount: rows.length,
+      totalPoints: rows.reduce((total, row) => total + row.points, 0)
+    })
+  });
+  const transact = useTransact();
+
+  return examplePanel(
+    'BasicTodoQueryExample',
+    'useDb + useQuery + useTransact',
+    statusLine(query.status, query.diagnostics.length),
+    metric('Open', query.data?.openCount ?? 0),
+    metric('Points', query.data?.totalPoints ?? 0),
+    todoList(query.rows),
+    button('compute-docs', 'Start docs', async () => {
+      const docs = (currentDb.data.todos ?? []).find((row): row is TodoRow =>
+        isTodoRow(row) && row.id === 'todo-docs'
+      );
+      await transact(updateByKey(todoSchema.todos, 'todo-docs', {
+        status: 'doing',
+        points: (docs?.points ?? 0) + 2
+      }));
+    })
+  );
 }
 
-function cloneRows(rows: MutableObjectSourceData): MutableObjectSourceData {
-  return Object.fromEntries(Object.entries(rows).map(([name, values]) => [name, values.map((value) => ({ ...(value as Record<string, unknown>) }))]));
+export function DashboardMaterializationExample(): ReactElement {
+  const currentDb = useDb();
+  const materialized = useMaterialized(openTodoCardsQuery);
+  const summaries = useQuery(projectSummaryQuery);
+  const explanation = useMemo(() => explainMaterialization(openTodoCardsQuery, {
+    id: 'open-todos',
+    mode: 'incremental'
+  }), []);
+  const metadata = materializationForQuery(currentDb, openTodoCardsQuery);
+  const byProject = index<TodoCard, string>(currentDb, openTodoCardsQuery, {
+    kind: 'hash',
+    field: 'projectId'
+  });
+  const uniqueTodo = index<TodoCard, string>(currentDb, 'open-todos', {
+    kind: 'unique',
+    field: 'id'
+  });
+
+  return examplePanel(
+    'DashboardMaterializationExample',
+    'useMaterialized + useQuery with materialization metadata',
+    statusLine(materialized.status, materialized.diagnostics.length),
+    metric('Materialized', materialized.materialized ? 'yes' : 'no'),
+    metric('Metadata', metadata?.id ?? 'missing'),
+    metric('Planning', explanation.maintenance),
+    metric('Project rows', byProject.index?.get('project-launch').length ?? 0),
+    metric('Unique lookup', uniqueTodo.index?.get('todo-core')?.title ?? 'missing'),
+    todoList(materialized.rows),
+    summaryList(summaries.rows)
+  );
 }
 
-function describePatch(patch: WritePatch, intent: string, index: number): PatchLogEntry {
-  switch (patch.op) {
-    case 'insert':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert ${JSON.stringify(patch.row)}` };
-    case 'updateByKey':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `update key ${JSON.stringify(patch.key)} with ${JSON.stringify(patch.changes)}` };
-    case 'update':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `update where ${JSON.stringify(patch.predicate)} with ${JSON.stringify(patch.changes)}` };
-    case 'insertIgnore':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert ignore ${JSON.stringify(patch.row)}` };
-    case 'insertOrReplace':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert or replace ${JSON.stringify(patch.row)}` };
-    case 'insertOrMerge':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert or merge ${JSON.stringify(patch.row)}` };
-    case 'insertOrUpdate':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `insert or update ${JSON.stringify(patch.row)} with ${JSON.stringify(patch.update)}` };
-    case 'deleteByKey':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete key ${JSON.stringify(patch.key)}` };
-    case 'delete':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete where ${JSON.stringify(patch.predicate)}` };
-    case 'deleteExact':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `delete exact ${JSON.stringify(patch.row)}` };
-    case 'replaceAll':
-      return { index: index + 1, op: patch.op, relation: patch.relation.name, intent, summary: `replace all with ${JSON.stringify(patch.rows)}` };
-  }
+export function ConstraintsWatchExample(): ReactElement {
+  const query = useQuery(openTodoCardsQuery);
+  const watchState = useWatch(openTodoCardsQuery, undefined, { keyBy: ['id'] });
+  const transact = useTransact();
+  const [rejectedCodes, setRejectedCodes] = useState<readonly string[]>([]);
+  const [committed, setCommitted] = useState<boolean | undefined>();
 
-  throw new Error(`unsupported write patch: ${JSON.stringify(patch)}`);
+  return examplePanel(
+    'ConstraintsWatchExample',
+    'useQuery + useWatch + constrained useTransact',
+    statusLine(query.status, query.diagnostics.length),
+    metric('Watch events', watchState.events.length),
+    metric('Last committed', committed === undefined ? 'none' : committed ? 'yes' : 'no'),
+    metric('Diagnostics', rejectedCodes.join(',') || 'none'),
+    todoList(query.rows),
+    button('insert-invalid', 'Insert invalid', async () => {
+      const result = await transact(insert(todoSchema.people, {
+        id: 'person-duplicate',
+        name: 'Ada',
+        role: 'support',
+        active: true
+      }));
+      setCommitted(result.committed);
+      setRejectedCodes(result.diagnostics.map((diagnostic) => diagnostic.code));
+    })
+  );
+}
+
+export function AutomergeCollaborationExample({ model }: { readonly model: AutomergeExampleModel }): ReactElement {
+  const currentDb = useDb();
+  const query = useQuery(openTodoCardsQuery);
+  const [headsChanged, setHeadsChanged] = useState(false);
+
+  return examplePanel(
+    'AutomergeCollaborationExample',
+    'automergeDb snapshots through TarstateProvider + useQuery',
+    statusLine(query.status, query.diagnostics.length),
+    metric('Rows', query.rows.length),
+    metric('Heads changed', headsChanged ? 'yes' : 'no'),
+    metric('DB todos', (currentDb.data.todos ?? []).length),
+    todoList(query.rows),
+    button('automerge-commit', 'Commit Automerge change', async () => {
+      const nextDb = await model.relic.transact([
+        updateByKey(todoSchema.todos, 'todo-core', { status: 'done' }),
+        insert(todoSchema.todos, {
+          id: 'todo-docs',
+          projectId: 'project-launch',
+          ownerId: 'person-bea',
+          title: 'Write customer docs',
+          status: 'todo',
+          points: 3
+        })
+      ]);
+      await model.store.replaceDb(nextDb);
+      setHeadsChanged(JSON.stringify(model.beforeHeads) !== JSON.stringify(Automerge.getHeads(model.relic.getDoc())));
+    })
+  );
+}
+
+export function ReactExampleSuite({ automerge }: { readonly automerge: AutomergeExampleModel }): ReactElement {
+  const materializedStore = useMemo(() => createDemoStore(mat(
+    db(seedData(), { env: { minimumPoints: 1 } }),
+    openTodoCardsQuery,
+    { id: 'open-todos' }
+  )), []);
+  const constrainedStore = useMemo(() => createConstrainedDemoStore(), []);
+  const basicStore = useMemo(() => createDemoStore(), []);
+
+  return createElement(
+    'main',
+    { className: 'page' },
+    createElement('header', { className: 'hero' },
+      createElement('p', { className: 'eyebrow' }, 'Tarstate React examples'),
+      createElement('h1', null, 'DB-first hooks over Relic state'),
+      createElement('p', { className: 'dek' }, 'A small React suite built around provider setup, queries, transactions, materialization, constraints, watch changes, and Automerge-backed DB snapshots.')
+    ),
+    createElement(TarstateProvider, { store: basicStore }, createElement(BasicTodoQueryExample)),
+    createElement(TarstateProvider, { store: materializedStore }, createElement(DashboardMaterializationExample)),
+    createElement(TarstateProvider, { store: constrainedStore }, createElement(ConstraintsWatchExample)),
+    createElement(TarstateProvider, { store: automerge.store },
+      createElement(AutomergeCollaborationExample, { model: automerge })
+    )
+  );
+}
+
+function examplePanel(title: string, subtitle: string, ...children: readonly ReactElement[]): ReactElement {
+  return createElement(
+    'section',
+    { className: 'panel', 'data-example': title },
+    createElement('h2', null, title),
+    createElement('p', { className: 'section-dek' }, subtitle),
+    createElement('div', { className: 'metrics' }, ...children)
+  );
+}
+
+function statusLine(status: string, diagnostics: number): ReactElement {
+  return createElement(
+    'p',
+    { className: 'status', 'data-status': status, 'data-diagnostics': diagnostics },
+    `${status} / diagnostics ${diagnostics}`
+  );
+}
+
+function metric(label: string, value: string | number): ReactElement {
+  return createElement(
+    'div',
+    { className: 'metric', 'data-metric': label },
+    createElement('span', null, label),
+    createElement('strong', null, String(value))
+  );
+}
+
+function todoList(rows: readonly TodoCard[]): ReactElement {
+  return createElement(
+    'ol',
+    { className: 'todo-list', 'data-rows': rows.length },
+    ...rows.map((row) =>
+      createElement('li', { key: row.id, 'data-row-id': row.id },
+        `${row.title} / ${row.project} / ${row.owner ?? 'unassigned'} / ${row.status} / ${row.points}`
+      )
+    )
+  );
+}
+
+function summaryList(rows: readonly ProjectSummary[]): ReactElement {
+  return createElement(
+    'ol',
+    { className: 'todo-list', 'data-summary-rows': rows.length },
+    ...rows.map((row) =>
+      createElement('li', { key: row.projectId },
+        `${row.projectId}: ${row.todos} todos, ${row.points} points`
+      )
+    )
+  );
+}
+
+function button(action: string, label: string, onClick: () => void | Promise<void>): ReactElement {
+  return createElement('button', { type: 'button', 'data-action': action, onClick }, label);
+}
+
+function isTodoRow(input: unknown): input is TodoRow {
+  return typeof input === 'object' &&
+    input !== null &&
+    !Array.isArray(input) &&
+    typeof (input as { readonly id?: unknown }).id === 'string' &&
+    typeof (input as { readonly title?: unknown }).title === 'string';
 }

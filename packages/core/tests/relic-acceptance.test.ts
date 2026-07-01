@@ -34,6 +34,7 @@ import {
   limit,
   lookup,
   mat,
+  maintainMaterializations,
   materializationsFor,
   materializedRowsForQuery,
   maybe,
@@ -477,6 +478,97 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
   });
 
+  it('skips recomputing materializations whose dependencies are untouched by transaction deltas', () => {
+    const user = as(coreSchema.users, 'user');
+    const task = as(coreSchema.tasks, 'task');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name, teamId: user.teamId }),
+      keyBy('id')
+    );
+    const openTasks = pipe(
+      from(task),
+      where(eq(task.done, false)),
+      project({ id: task.id, ownerId: task.ownerId, points: task.points }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), { activeUsers, openTasks });
+    const previousActiveRows = materializedRowsForQuery(state, activeUsers);
+    const previousTaskRows = materializedRowsForQuery(state, openTasks);
+    const dia = {
+      id: 'dia',
+      teamId: 'eng',
+      name: 'Dia',
+      active: true,
+      age: 24,
+      tags: []
+    };
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, dia]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [{ relation: coreSchema.users, added: [dia], removed: [] }]
+    });
+    const activeChange = maintained.changes.find((change) => change.id === 'activeUsers');
+    const taskChange = maintained.changes.find((change) => change.id === 'openTasks');
+
+    expect(maintained).toMatchObject({ maintained: 2, recomputed: 1, skipped: 1 });
+    expect(activeChange).toMatchObject({
+      update: 'recomputed',
+      recomputed: true,
+      dependencies: ['users'],
+      touchedDependencies: ['users']
+    });
+    expect(taskChange).toMatchObject({
+      update: 'skipped',
+      recomputed: false,
+      dependencies: ['tasks'],
+      touchedDependencies: []
+    });
+    expect(materializedRowsForQuery(next, activeUsers)).not.toBe(previousActiveRows);
+    expect(materializedRowsForQuery(next, openTasks)).toBe(previousTaskRows);
+  });
+
+  it('carries independent materialized rows through transact when unrelated relations change', () => {
+    const user = as(coreSchema.users, 'user');
+    const task = as(coreSchema.tasks, 'task');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    );
+    const openTasks = pipe(
+      from(task),
+      where(eq(task.done, false)),
+      project({ id: task.id, ownerId: task.ownerId }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), { activeUsers, openTasks });
+    const previousTaskRows = materializedRowsForQuery(state, openTasks);
+    const next = transact(
+      state,
+      insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      })
+    );
+
+    expect(materializedRowsForQuery(next, openTasks)).toBe(previousTaskRows);
+    expect(materializedRowsForQuery(next, activeUsers)).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' },
+      { id: 'dia', name: 'Dia' }
+    ]);
+  });
+
   it('materializes and maintains joined query rows through snapshot recompute', () => {
     const user = as(coreSchema.users, 'user');
     const team = as(coreSchema.teams, 'team');
@@ -510,16 +602,29 @@ describe('TypeScript Relic core acceptance', () => {
     const activeUsers = pipe(
       from(user),
       where(eq(user.active, true)),
+      hash(user.teamId),
+      btree(user.age),
       project({ id: user.id, name: user.name, age: user.age, teamId: user.teamId }),
       keyBy('id')
     );
     const state = mat(createDb(sourceData), activeUsers, { id: 'active-users' });
+    const metadata = materializationsFor(state).find((entry) => entry.id === 'active-users');
 
     const setIndex = index(state, 'active-users');
     const hashIndex = index(state, activeUsers, { kind: 'hash', field: 'teamId' });
     const uniqueIndex = index(state, activeUsers, { kind: 'unique', field: 'id' });
     const btreeIndex = index(state, activeUsers, { kind: 'btree', field: 'age' });
 
+    expect(metadata).toMatchObject({
+      dependencies: ['users'],
+      maintenance: 'snapshot',
+      maintenanceReason: expect.stringContaining('dependency-aware'),
+      indexSpecs: [
+        { kind: 'set' },
+        { kind: 'hash', field: 'teamId' },
+        { kind: 'btree', field: 'age' }
+      ]
+    });
     expect(setIndex.index?.rows.size).toBe(2);
     expect(hashIndex.index?.lookup.get('eng')).toEqual([
       { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
@@ -531,6 +636,8 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
     expect(hashIndex.index?.has('ops')).toBe(false);
     expect(uniqueIndex.index?.get('ada')).toEqual({ id: 'ada', name: 'Ada', age: 37, teamId: 'eng' });
+    expect(uniqueIndex.index?.has('ada')).toBe(true);
+    expect(btreeIndex.index?.has(37)).toBe(true);
     expect(btreeIndex.index?.range({ lower: 30 })).toEqual([
       { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' }
     ]);

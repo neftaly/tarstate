@@ -551,7 +551,7 @@ export function tryTransactWithConstraints(
     };
   }
 
-  const materializations = maintainMaterializations(db, nextDb);
+  const materializations = maintainMaterializations(db, nextDb, { deltas: result.deltas });
   transferWatches(db, nextDb);
 
   return {

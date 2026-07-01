@@ -12,9 +12,18 @@
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@tarstate/core": "workspace:*"
+    "@automerge/automerge": "^3.2.6",
+    "@tarstate/automerge": "workspace:*",
+    "@tarstate/core": "workspace:*",
+    "@tarstate/react": "workspace:*",
+    "react": "catalog:",
+    "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@types/react": "catalog:",
+    "@types/react-dom": "^19.2.3",
+    "@types/react-test-renderer": "catalog:",
+    "react-test-renderer": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vitest": "catalog:"

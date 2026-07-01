@@ -1,4 +1,5 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
+import type { RelationDelta } from './adapter.js';
 import { diffRows, type RowChange, type RowDiffDiagnostic } from './diff.js';
 import {
   queryKey,
@@ -108,6 +109,13 @@ export type MaterializationDiagnostic =
 
 export type MaterializationMode = 'snapshot' | 'incremental';
 export type MaterializationMaintenanceKind = 'snapshot' | 'incremental';
+export type MaterializationMaintenanceDecision = 'skipped' | 'carried' | 'recomputed';
+
+export type MaterializationIndexSpec =
+  | { readonly kind: 'set' }
+  | { readonly kind: 'hash'; readonly expression: ExprData; readonly field?: string; readonly unique?: boolean }
+  | { readonly kind: 'unique'; readonly expression: ExprData; readonly field?: string; readonly unique: true }
+  | { readonly kind: 'btree'; readonly expression: ExprData; readonly field?: string };
 
 export type MaterializationOptions = {
   readonly id?: string;
@@ -117,7 +125,7 @@ export type MaterializationOptions = {
 export type SnapshotMaterializationOptions = MaterializationOptions;
 export type MaterializationQueryBatch<Row = unknown> = Record<string, Query<Row>>;
 export type MaterializationMaintenanceOptions = {
-  readonly deltas?: readonly unknown[];
+  readonly deltas?: readonly RelationDelta[];
 };
 export type SnapshotRefreshTarget<Row = unknown> = string | MaterializationMetadata<Row> | Query<Row>;
 export type MaterializedSourceOptions = {
@@ -131,7 +139,9 @@ export type MaterializationMetadata<Row = unknown> = {
   readonly query: Query<Row>;
   readonly requestedMode: MaterializationMode;
   readonly maintenance: MaterializationMaintenanceKind;
+  readonly maintenanceReason: string;
   readonly dependencies: readonly string[];
+  readonly indexSpecs: readonly MaterializationIndexSpec[];
   readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly name?: string;
 };
@@ -142,7 +152,9 @@ export type MaterializationExplanation<Row = unknown> = {
   readonly query: Query<Row>;
   readonly requestedMode: MaterializationMode;
   readonly maintenance: MaterializationMaintenanceKind;
+  readonly maintenanceReason: string;
   readonly dependencies: readonly string[];
+  readonly indexSpecs: readonly MaterializationIndexSpec[];
   readonly diagnostics: readonly MaterializationDiagnostic[];
 };
 
@@ -155,15 +167,20 @@ export type MaterializationRefreshResult<Row = unknown> = {
   readonly diagnostics: readonly MaterializationDiagnostic[];
 };
 
-export type MaterializationMaintenanceChangeKind = 'carried' | 'recomputed';
+export type MaterializationMaintenanceChangeKind = MaterializationMaintenanceDecision;
 
 export type MaterializationMaintenanceChange<Row = unknown> = {
   readonly kind: 'materializationMaintenanceChange';
   readonly update: MaterializationMaintenanceChangeKind;
+  readonly recomputed: boolean;
+  readonly reason: string;
   readonly id: string;
   readonly queryKey: string;
   readonly query: Query<Row>;
   readonly maintenance: MaterializationMaintenanceKind;
+  readonly dependencies: readonly string[];
+  readonly touchedDependencies: readonly string[];
+  readonly indexSpecs: readonly MaterializationIndexSpec[];
   readonly previousRowsAvailable: boolean;
   readonly previousRows: readonly Row[] | undefined;
   readonly rows: readonly Row[];
@@ -178,6 +195,7 @@ export type MaterializationMaintenanceResult<Row = unknown> = {
   readonly maintained: number;
   readonly recomputed: number;
   readonly carried: number;
+  readonly skipped: number;
   readonly changes: readonly MaterializationMaintenanceChange<Row>[];
   readonly diagnostics: readonly MaterializationDiagnostic[];
 };
@@ -215,6 +233,7 @@ export type MaterializationBtreeIndex<Row = unknown, Value = unknown> = {
   readonly lookup: ReadonlyMap<Value, readonly Row[]>;
   readonly ordered: readonly Value[];
   readonly get: (value: Value) => readonly Row[];
+  readonly has: (value: Value) => boolean;
   readonly range: (bounds?: MaterializationRange<Value>) => readonly Row[];
 };
 
@@ -338,13 +357,16 @@ export function explainMaterialization<Row>(
 ): MaterializationExplanation<Row> {
   const key = queryKey(query);
   const requestedMode = options.mode ?? 'snapshot';
+  const maintenance = maintenanceForMode(requestedMode);
   return {
     kind: 'materializationExplanation',
     queryKey: key,
     query,
     requestedMode,
-    maintenance: requestedMode === 'incremental' ? 'snapshot' : 'snapshot',
+    maintenance,
+    maintenanceReason: maintenanceReasonForMode(requestedMode),
     dependencies: relationDependencies(query),
+    indexSpecs: materializationIndexSpecs(query),
     diagnostics: requestedMode === 'incremental'
       ? [incrementalFallbackDiagnostic(options.id ?? options.name ?? key, key)]
       : []
@@ -389,15 +411,16 @@ export function refreshMaterialization<Db extends SnapshotMaterializationTarget,
 export function maintainMaterializationSnapshots<Next extends SnapshotMaterializationTarget>(
   previous: SnapshotMaterializationTarget,
   next: Next,
-  _options: MaterializationMaintenanceOptions = {}
+  options: MaterializationMaintenanceOptions = {}
 ): Promise<Next & MaterializedDb & { readonly materializations?: MaterializationMaintenanceResult }> {
-  maintainMaterializations(previous, next);
+  maintainMaterializations(previous, next, options);
   return Promise.resolve(markMaterialized(next) as Next & MaterializedDb & { readonly materializations?: MaterializationMaintenanceResult });
 }
 
 export function maintainMaterializations<Next extends SnapshotMaterializationTarget>(
   previous: SnapshotMaterializationTarget,
-  next: Next
+  next: Next,
+  options: MaterializationMaintenanceOptions = {}
 ): MaterializationMaintenanceResult {
   if (!isObject(previous) || !isObject(next)) {
     return emptyMaintenance();
@@ -410,17 +433,55 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
 
   const nextStore = new Map<string, StoredMaterialization>();
   const changes: MaterializationMaintenanceChange[] = [];
+  const touchedRelations = options.deltas === undefined ? undefined : new Set(options.deltas.map((delta) => delta.relation.name));
 
   for (const stored of uniqueMaterializations(previousStore)) {
+    const touchedDependencies = touchedRelations === undefined
+      ? stored.metadata.dependencies
+      : stored.metadata.dependencies.filter((dependency) => touchedRelations.has(dependency));
+
+    if (touchedRelations !== undefined && touchedDependencies.length === 0) {
+      const change: MaterializationMaintenanceChange = {
+        kind: 'materializationMaintenanceChange',
+        update: 'skipped',
+        recomputed: false,
+        reason: 'dependencies untouched by transaction',
+        id: stored.metadata.id,
+        queryKey: stored.metadata.queryKey,
+        query: stored.metadata.query,
+        maintenance: stored.metadata.maintenance,
+        dependencies: stored.metadata.dependencies,
+        touchedDependencies,
+        indexSpecs: stored.metadata.indexSpecs,
+        previousRowsAvailable: true,
+        previousRows: stored.rows,
+        rows: stored.rows,
+        addedRows: [],
+        removedRows: [],
+        rowChanges: [],
+        diagnostics: []
+      };
+      changes.push(change);
+      storeMaterializationIn(nextStore, stored);
+      continue;
+    }
+
     const rows = evaluateTargetRows(next, stored.metadata.query);
     const diff = diffRows(stored.rows, rows, materializationDiffOptions(stored.metadata.query));
     const change: MaterializationMaintenanceChange = {
       kind: 'materializationMaintenanceChange',
       update: diff.changes.length === 0 ? 'carried' : 'recomputed',
+      recomputed: true,
+      reason: diff.changes.length === 0
+        ? 'dependencies touched; recomputed rows unchanged'
+        : 'dependencies touched; recomputed rows changed',
       id: stored.metadata.id,
       queryKey: stored.metadata.queryKey,
       query: stored.metadata.query,
       maintenance: stored.metadata.maintenance,
+      dependencies: stored.metadata.dependencies,
+      touchedDependencies,
+      indexSpecs: stored.metadata.indexSpecs,
       previousRowsAvailable: true,
       previousRows: stored.rows,
       rows,
@@ -439,8 +500,9 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
   return {
     kind: 'materializationMaintenance',
     maintained: changes.length,
-    recomputed: changes.filter((change) => change.update === 'recomputed').length,
+    recomputed: changes.filter((change) => change.recomputed).length,
     carried: changes.filter((change) => change.update === 'carried').length,
+    skipped: changes.filter((change) => change.update === 'skipped').length,
     changes,
     diagnostics: changes.flatMap((change) => change.diagnostics)
   };
@@ -645,14 +707,17 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
 ): Db & MaterializedDb {
   const key = queryKey(query);
   const requestedMode = options.mode ?? 'snapshot';
+  const maintenance = maintenanceForMode(requestedMode);
   const metadata: MaterializationMetadata<Row> = {
     kind: 'materialization',
     id: options.id ?? options.name ?? key,
     queryKey: key,
     query,
     requestedMode,
-    maintenance: 'snapshot',
+    maintenance,
+    maintenanceReason: maintenanceReasonForMode(requestedMode),
     dependencies: relationDependencies(query),
+    indexSpecs: materializationIndexSpecs(query),
     diagnostics: requestedMode === 'incremental'
       ? [incrementalFallbackDiagnostic(options.id ?? options.name ?? key, key)]
       : [],
@@ -1103,6 +1168,80 @@ function materializationDiffOptions<Row>(query: Query<Row>): { readonly keyBy?: 
   return keyBy === undefined ? {} : { keyBy };
 }
 
+function maintenanceForMode(mode: MaterializationMode): MaterializationMaintenanceKind {
+  return mode === 'incremental' ? 'snapshot' : 'snapshot';
+}
+
+function maintenanceReasonForMode(mode: MaterializationMode): string {
+  return mode === 'incremental'
+    ? 'incremental maintenance requested; snapshot maintenance with dependency-aware invalidation is used'
+    : 'snapshot maintenance with dependency-aware invalidation';
+}
+
+function materializationIndexSpecs(query: Query): readonly MaterializationIndexSpec[] {
+  const specs: MaterializationIndexSpec[] = [{ kind: 'set' }];
+  collectIndexSpecs(query.data, specs);
+  return specs;
+}
+
+function collectIndexSpecs(data: QueryData, specs: MaterializationIndexSpec[]): void {
+  switch (data.op) {
+    case 'hash':
+      collectIndexSpecs(data.input, specs);
+      for (const expression of data.expressions) {
+        specs.push({
+          kind: data.unique === true ? 'unique' : 'hash',
+          expression,
+          ...indexFieldForExpression(expression),
+          ...(data.unique === true ? { unique: true } : {})
+        });
+      }
+      return;
+    case 'btree':
+      collectIndexSpecs(data.input, specs);
+      for (const expression of data.expressions) {
+        specs.push({ kind: 'btree', expression, ...indexFieldForExpression(expression) });
+      }
+      return;
+    case 'where':
+    case 'keyBy':
+    case 'select':
+    case 'extend':
+    case 'expand':
+    case 'without':
+    case 'sort':
+    case 'limit':
+    case 'sortLimit':
+    case 'rename':
+    case 'qualify':
+    case 'aggregate':
+      collectIndexSpecs(data.input, specs);
+      return;
+    case 'join':
+      collectIndexSpecs(data.left, specs);
+      collectIndexSpecs(data.right, specs);
+      return;
+    case 'union':
+    case 'intersection':
+      for (const input of data.inputs) {
+        collectIndexSpecs(input, specs);
+      }
+      return;
+    case 'difference':
+      collectIndexSpecs(data.left, specs);
+      collectIndexSpecs(data.right, specs);
+      return;
+    case 'from':
+    case 'lookup':
+    case 'constRows':
+      return;
+  }
+}
+
+function indexFieldForExpression(expression: ExprData): { readonly field?: string } {
+  return expression.op === 'field' ? { field: expression.field } : {};
+}
+
 function groupRowsByField<Row, Value>(rows: readonly Row[], field: string): ReadonlyMap<Value, readonly Row[]> {
   const lookup = new Map<Value, Row[]>();
   for (const row of rows) {
@@ -1143,6 +1282,7 @@ function btreeIndex<Row, Value>(rows: readonly Row[], field: string): Materializ
     lookup: orderedLookup,
     ordered,
     get: (value) => orderedLookup.get(value) ?? [],
+    has: (value) => orderedLookup.has(value),
     range: (bounds = {}) => ordered
       .filter((value) => inRange(value, bounds))
       .flatMap((value) => orderedLookup.get(value) ?? [])
@@ -1291,6 +1431,7 @@ function emptyMaintenance(): MaterializationMaintenanceResult {
     maintained: 0,
     recomputed: 0,
     carried: 0,
+    skipped: 0,
     changes: [],
     diagnostics: []
   };
