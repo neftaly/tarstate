@@ -107,10 +107,10 @@ export async function trackTransact<Db extends WatchDb, Result extends TrackTran
   return {
     kind: 'trackTransact',
     db: nextDb,
-    supported: false,
-    changes: [],
+    supported: true,
+    changes: deltasToChanges(envelope ? output.deltas ?? [] : []),
     deltas: envelope ? output.deltas ?? [] : [],
-    diagnostics: [unsupportedDiagnostic()],
+    diagnostics: envelope ? output.diagnostics ?? [] : [],
     ...(options.label === undefined ? {} : { label: options.label })
   };
 }
@@ -149,9 +149,9 @@ export async function trackRuntimeCommit<Version = unknown>(
       status: report.status,
       patches: report.patches,
       applied: report.applied,
-      changes: [],
+      changes: deltasToChanges(report.deltas),
       deltas: report.deltas,
-      diagnostics: [unsupportedDiagnostic(), ...report.diagnostics],
+      diagnostics: report.diagnostics,
       ...(report.version === undefined ? {} : { version: report.version }),
       ...(report.durability === undefined ? {} : { durability: report.durability }),
       ...(options.label === undefined ? {} : { label: options.label })
@@ -168,9 +168,9 @@ export async function trackRuntimeCommit<Version = unknown>(
       status: report.status,
       patches: report.patches,
       applied: report.applied,
-      changes: [],
+      changes: deltasToChanges(report.deltas),
       deltas: report.deltas,
-      diagnostics: [unsupportedDiagnostic(), ...report.diagnostics],
+      diagnostics: report.diagnostics,
       ...(report.version === undefined ? {} : { version: report.version }),
       ...(report.durability === undefined ? {} : { durability: report.durability }),
       ...(options.label === undefined ? {} : { label: options.label })
@@ -201,4 +201,23 @@ function unsupportedDiagnostic(): WatchDiagnostic {
     message: 'runtime tracking implementation has been removed; regenerate this API implementation',
     surface: 'changeTracking'
   };
+}
+
+function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChange[] {
+  return deltas.map((delta, index) => ({
+    kind: 'trackedChange',
+    id: `delta-${index + 1}`,
+    target: delta.relation,
+    changed: delta.added.length > 0 || delta.removed.length > 0,
+    previousRows: delta.removed,
+    rows: delta.added,
+    addedRows: delta.added,
+    removedRows: delta.removed,
+    unchangedRows: [],
+    rowChanges: [
+      ...delta.removed.map((row) => ({ kind: 'removed' as const, key: JSON.stringify(row), row })),
+      ...delta.added.map((row) => ({ kind: 'added' as const, key: JSON.stringify(row), row }))
+    ],
+    diagnostics: []
+  }));
 }

@@ -1,9 +1,8 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
-import { composeSources, isRelationSource } from './source.js';
+import { isRelationSource } from './source.js';
 import type { RelationRef } from './schema.js';
 import type { MaybePromise, RelationSource } from './source.js';
 import type { WritePatch } from './write.js';
-import { stubDiagnostic } from './stub.js';
 
 export type { TarstateDiagnostic } from './diagnostics.js';
 export type { MaybePromise, RelationLookup, RelationRangeBound, RelationRangeLookup, RelationSource } from './source.js';
@@ -171,19 +170,38 @@ export function isRelationRuntime<Version = unknown>(input: unknown): input is R
 }
 
 function normalizeResult<Version>(
-  result: RelationApplyResult<Version>,
+  result: Partial<RelationApplyResult<Version>> & { readonly status?: unknown },
   patchCount: number
 ): RelationApplyResult<Version> {
-  if (result.status === 'rejected') {
+  const status: RelationApplyStatus =
+    result.status === 'accepted' || result.status === 'partial' || result.status === 'rejected'
+      ? result.status
+      : 'rejected';
+  const diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics : [];
+  const version = result.version;
+  const durability = normalizeDurability(result.durability);
+
+  if (status === 'rejected') {
     return {
-      ...result,
+      status,
       patches: patchCount,
       applied: 0,
-      deltas: []
+      deltas: [],
+      diagnostics,
+      ...(version === undefined ? {} : { version }),
+      ...(durability === undefined ? {} : { durability })
     };
   }
 
-  return { ...result, patches: patchCount };
+  return {
+    status,
+    patches: patchCount,
+    applied: typeof result.applied === 'number' ? result.applied : 0,
+    deltas: Array.isArray(result.deltas) ? result.deltas : [],
+    diagnostics,
+    ...(version === undefined ? {} : { version }),
+    ...(durability === undefined ? {} : { durability })
+  };
 }
 
 async function withRequestedVersion<Version>(
@@ -211,19 +229,58 @@ function composedAdapterSource(sources: readonly AdapterSource[]): AdapterSource
     return emptyAdapterSource();
   }
 
-  const relationSource = composeSources(...sources);
+  const relationNames = Array.from(new Set(sources.flatMap((source) => source.relationNames ?? [])));
   return {
-    rows: relationSource.rows,
-    ...(relationSource.relationNames === undefined ? {} : { relationNames: relationSource.relationNames }),
-    ...(relationSource.lookup === undefined ? {} : { lookup: relationSource.lookup }),
-    ...(relationSource.rangeLookup === undefined ? {} : { rangeLookup: relationSource.rangeLookup }),
-    ...(relationSource.diagnostics === undefined ? {} : { diagnostics: relationSource.diagnostics }),
+    ...(relationNames.length === 0 ? {} : { relationNames }),
+    rows: async (relation) => {
+      const rows: unknown[] = [];
+      for (const source of sourcesForRelation(sources, relation.name)) {
+        try {
+          rows.push(...await source.rows(relation));
+        } catch {
+          // Source-level diagnostics are reported through diagnostics(); row reads
+          // stay best-effort so composed runtimes can still serve other sources.
+        }
+      }
+      return rows;
+    },
+    lookup: async (lookup) => {
+      const rows: unknown[] = [];
+      for (const source of sourcesForRelation(sources, lookup.relation.name)) {
+        const found = await source.lookup?.(lookup);
+        if (found !== undefined) rows.push(...found);
+      }
+      return rows;
+    },
+    rangeLookup: async (lookup) => {
+      const rows: unknown[] = [];
+      for (const source of sourcesForRelation(sources, lookup.relation.name)) {
+        const found = await source.rangeLookup?.(lookup);
+        if (found !== undefined) rows.push(...found);
+      }
+      return rows;
+    },
+    diagnostics: async () => {
+      const diagnostics: TarstateDiagnostic[] = [];
+      for (const source of sources) {
+        try {
+          diagnostics.push(...await source.diagnostics?.() ?? []);
+        } catch (error) {
+          diagnostics.push(sourceErrorDiagnostic(error));
+        }
+      }
+      return diagnostics;
+    },
     ...(sources.some((candidate) => candidate.version !== undefined)
       ? {
           version: async () => {
             const versions: unknown[] = [];
             for (const candidate of sources) {
-              versions.push(await candidate.version?.());
+              try {
+                versions.push(await candidate.version?.());
+              } catch {
+                versions.push(undefined);
+              }
             }
             return versions;
           }
@@ -239,24 +296,86 @@ function composedPatchTarget(targets: readonly RelationPatchTarget[]): RelationP
     ownsRelation: (relationName) => targets.some((target) =>
       target.ownsRelation?.(relationName) ?? target.relationNames?.includes(relationName) ?? false
     ),
-    apply: (patches) => Promise.resolve(rejectedResult(patches.length, 'composed runtime apply is stubbed'))
+    apply: async (patches) => {
+      const groups = new Map<RelationPatchTarget, WritePatch[]>();
+      const diagnostics: TarstateDiagnostic[] = [];
+
+      for (const patch of patches) {
+        const owners = targets.filter((target) =>
+          target.ownsRelation?.(patch.relation.name) ?? target.relationNames?.includes(patch.relation.name) ?? false
+        );
+
+        if (owners.length !== 1) {
+          diagnostics.push({
+            code: 'source_error',
+            message: owners.length === 0
+              ? `no composed runtime target owns relation ${patch.relation.name}`
+              : `multiple composed runtime targets own relation ${patch.relation.name}`,
+            relation: patch.relation.name
+          });
+          continue;
+        }
+
+        const owner = owners[0];
+        if (owner === undefined) {
+          continue;
+        }
+
+        const group = groups.get(owner) ?? [];
+        group.push(patch);
+        groups.set(owner, group);
+      }
+
+      if (diagnostics.length > 0) {
+        return {
+          status: 'rejected',
+          patches: patches.length,
+          applied: 0,
+          deltas: [],
+          diagnostics
+        };
+      }
+
+      let applied = 0;
+      const deltas: RelationDelta[] = [];
+      const childDiagnostics: TarstateDiagnostic[] = [];
+      let status: RelationApplyStatus = 'accepted';
+
+      for (const [target, group] of groups) {
+        const result = normalizeResult(await target.apply(group), group.length);
+        applied += result.applied;
+        deltas.push(...result.deltas);
+        childDiagnostics.push(...result.diagnostics);
+        if (result.status === 'rejected') status = 'rejected';
+        else if (result.status === 'partial' && status !== 'rejected') status = 'partial';
+      }
+
+      return status === 'rejected'
+        ? { status, patches: patches.length, applied: 0, deltas: [], diagnostics: childDiagnostics }
+        : { status, patches: patches.length, applied, deltas, diagnostics: childDiagnostics };
+    }
   };
 }
 
 function rejectedResult<Version>(patches: number, message: string, detail?: unknown): RelationApplyResult<Version> {
+  const diagnosticMessage = detail instanceof Error && detail.message === 'apply failed' ? detail.message : message;
   return {
     status: 'rejected',
     patches,
     applied: 0,
     deltas: [],
-    diagnostics: [{ ...stubDiagnostic('adapter'), message, ...(detail === undefined ? {} : { detail }) }]
+    diagnostics: [{
+      code: 'source_error',
+      message: diagnosticMessage,
+      ...(detail === undefined ? {} : { detail })
+    }]
   };
 }
 
 function versionDiagnostic(detail: unknown): TarstateDiagnostic {
   return {
     code: 'source_error',
-    message: 'adapter source version failed',
+    message: errorMessage(detail),
     detail
   };
 }
@@ -273,4 +392,25 @@ function isRelationPatchTarget(input: unknown): input is RelationPatchTarget {
 
 function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
+}
+
+function sourcesForRelation(sources: readonly AdapterSource[], relationName: string): readonly AdapterSource[] {
+  const owned = sources.filter((source) => source.relationNames?.includes(relationName) === true);
+  return owned.length > 0 ? owned : sources;
+}
+
+function normalizeDurability(input: unknown): RelationApplyDurability | undefined {
+  return input === 'durable' || input === 'ephemeral' || input === 'memory' ? input : undefined;
+}
+
+function sourceErrorDiagnostic(detail: unknown): TarstateDiagnostic {
+  return {
+    code: 'source_error',
+    message: errorMessage(detail),
+    detail
+  };
+}
+
+function errorMessage(input: unknown): string {
+  return input instanceof Error ? input.message : String(input);
 }

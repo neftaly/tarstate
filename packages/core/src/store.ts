@@ -151,10 +151,17 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
     view: <Row>(queryValue: Query<Row>) => createStoreView(queryValue, store),
     commit: async (patches) => {
       const result = tryTransact(snapshot.db, patches);
+      const reflected = result.committed;
+
+      if (reflected) {
+        snapshot = storeSnapshot(result.db, snapshot.revision + 1, result.diagnostics);
+        for (const listener of listeners) listener();
+      }
+
       return {
         kind: 'tarstateCommit',
         status: result.committed ? 'accepted' : 'rejected',
-        reflected: false,
+        reflected,
         effects: {
           patches: result.patches,
           applied: result.applied,
@@ -218,8 +225,13 @@ function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
   function readView<MappedRow>(
     options?: StoreViewReadOptions<Row, MappedRow>
   ): Promise<StoreQueryResult<Row> | StoreQueryResult<MappedRow>> {
-    void options;
-    return Promise.resolve({ rows: [], diagnostics: [] });
+    if (options?.mapRows !== undefined) {
+      return store.query(query, options as StoreQueryOptions<Row, MappedRow> & {
+        readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[];
+      });
+    }
+
+    return store.query(query);
   }
 
   function readRows<MappedRow>(
@@ -231,8 +243,13 @@ function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
   async function readRows<MappedRow>(
     options?: StoreViewReadOptions<Row, MappedRow>
   ): Promise<readonly Row[] | readonly MappedRow[]> {
-    void options;
-    return [];
+    if (options?.mapRows !== undefined) {
+      return (await readView(options as StoreViewReadOptions<Row, MappedRow> & {
+        readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[];
+      })).rows;
+    }
+
+    return (await readView()).rows;
   }
 }
 

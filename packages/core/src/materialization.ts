@@ -1,7 +1,7 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
 import type { RelationDelta } from './delta.js';
 import type { EvaluateOptions } from './evaluate.js';
-import { queryKey, type Query } from './query.js';
+import { relationDependencies, queryKey, type ExprData, type OptionalProjection, type PredicateData, type ProjectionData, type Query, type QueryData } from './query.js';
 import type { RelationSource } from './source.js';
 import {
   attachConstraints,
@@ -21,6 +21,12 @@ export type MaterializedDb = {
 };
 
 const materializedDbs = new WeakSet<object>();
+const materializationStore = new WeakMap<object, Map<string, StoredMaterialization>>();
+
+type StoredMaterialization<Row = unknown> = {
+  metadata: MaterializationMetadata<Row>;
+  rows: readonly Row[];
+};
 
 export type UnsupportedMaterializationDiagnostic = {
   readonly code: 'materialization_unsupported';
@@ -256,16 +262,31 @@ export function mat<Db extends SnapshotMaterializationTarget, Row>(
 export function mat<Db extends object, Row>(
   db: Db,
   queryOrConstraints: Query<Row> | ConstraintAttachmentInput,
-  _options: SnapshotMaterializationOptions = {}
+  options: SnapshotMaterializationOptions = {}
 ): Db | Promise<Db & MaterializedDb> {
-  return isQuery(queryOrConstraints) ? Promise.resolve(markMaterialized(db)) : attachConstraints(db, queryOrConstraints);
+  return isQuery(queryOrConstraints) ? materializeSnapshot(db as Db & SnapshotMaterializationTarget, queryOrConstraints, options) : attachConstraints(db, queryOrConstraints);
 }
 
 export async function materializeSnapshot<Db extends SnapshotMaterializationTarget, Row>(
   db: Db,
-  _query: Query<Row>,
-  _options: SnapshotMaterializationOptions = {}
+  query: Query<Row>,
+  options: SnapshotMaterializationOptions = {}
 ): Promise<Db & MaterializedDb> {
+  const rows = await evaluateSnapshot(db, query);
+  const key = queryKey(query);
+  const id = options.id ?? options.name ?? key;
+  const metadata: MaterializationMetadata<Row> = {
+    kind: 'materialization',
+    id,
+    queryKey: key,
+    query,
+    requestedMode: options.mode ?? 'snapshot',
+    maintenance: 'snapshot',
+    diagnostics: [],
+    ...(options.name === undefined ? {} : { name: options.name }),
+    ...await sourceVersionMetadata(db)
+  };
+  storeMaterialization(db, { metadata, rows });
   return markMaterialized(db);
 }
 
@@ -278,25 +299,41 @@ export function explainMaterialization<Row>(
     queryKey: queryKey(query),
     query,
     requestedMode: options.mode ?? 'snapshot',
-    maintenance: 'unsupported',
-    dependencies: [],
-    diagnostics: [unsupportedDiagnostic()]
+    maintenance: options.mode === 'incremental' ? 'snapshot' : 'snapshot',
+    dependencies: relationDependencies(query),
+    diagnostics: options.mode === 'incremental' ? [incrementalFallbackDiagnostic(options.id ?? queryKey(query), queryKey(query))] : []
   };
 }
 
 export async function refreshMaterializationSnapshot<Db extends SnapshotMaterializationTarget, Row>(
-  _db: Db,
+  db: Db,
   target: SnapshotRefreshTarget<Row>,
   _options: EvaluateOptions = {}
 ): Promise<MaterializationRefreshResult<Row>> {
+  const stored = resolveMaterialization(db, target);
+  if (stored === undefined) {
+    return {
+      kind: 'materializationRefresh',
+      ...(typeof target === 'string' ? { id: target } : {}),
+      ...(!isQuery(target) && typeof target !== 'string' ? { id: target.id, queryKey: target.queryKey } : {}),
+      ...(isQuery(target) ? { queryKey: queryKey(target) } : {}),
+      refreshed: false,
+      rows: [],
+      diagnostics: [missingDiagnostic()]
+    };
+  }
+
+  const rows = await evaluateSnapshot(db, stored.metadata.query);
+  const metadata = { ...stored.metadata, ...await sourceVersionMetadata(db), diagnostics: [] };
+  storeMaterialization(db, { metadata, rows });
   return {
     kind: 'materializationRefresh',
-    ...(typeof target === 'string' ? { id: target } : {}),
-    ...(!isQuery(target) && typeof target !== 'string' ? { id: target.id, queryKey: target.queryKey } : {}),
-    ...(isQuery(target) ? { queryKey: queryKey(target) } : {}),
-    refreshed: false,
-    rows: [],
-    diagnostics: [missingDiagnostic()]
+    id: metadata.id,
+    queryKey: metadata.queryKey,
+    refreshed: true,
+    rows,
+    diagnostics: [],
+    ...(metadata.sourceVersion === undefined ? {} : { sourceVersion: metadata.sourceVersion })
   };
 }
 
@@ -310,6 +347,7 @@ export async function maintainMaterializationSnapshots<Next extends SnapshotMate
 
 export function demat<Db extends MaterializableDb>(db: Db, _target?: string | Query | MaterializationMetadata): Db {
   materializedDbs.delete(db);
+  materializationStore.delete(db);
   return db;
 }
 
@@ -317,32 +355,49 @@ export function isMaterialized(input: unknown): input is MaterializedDb {
   return isObject(input) && materializedDbs.has(input);
 }
 
-export function materializationsFor(_input: unknown): readonly MaterializationMetadata[] {
-  return [];
+export function materializationsFor(input: unknown): readonly MaterializationMetadata[] {
+  return isObject(input) ? Array.from(materializationStore.get(input)?.values() ?? [], (entry) => entry.metadata) : [];
 }
 
 export function materializationForQuery<Row = unknown>(
-  _input: unknown,
-  _query: Query<Row>
+  input: unknown,
+  query: Query<Row>
 ): MaterializationMetadata<Row> | undefined {
-  return undefined;
+  return isObject(input)
+    ? Array.from(materializationStore.get(input)?.values() ?? []).find((entry) => entry.metadata.queryKey === queryKey(query))?.metadata as MaterializationMetadata<Row> | undefined
+    : undefined;
 }
 
-export function materializedRowsFor<Row = unknown>(_input: unknown, _id: string): readonly Row[] | undefined {
-  return undefined;
+export function materializedRowsFor<Row = unknown>(input: unknown, id: string): readonly Row[] | undefined {
+  return isObject(input) ? materializationStore.get(input)?.get(id)?.rows as readonly Row[] | undefined : undefined;
 }
 
 export function materializedRowsForQuery<Row = unknown>(
-  _input: unknown,
-  _query: Query<Row>
+  input: unknown,
+  query: Query<Row>
 ): readonly Row[] | undefined {
-  return undefined;
+  if (!isObject(input)) return undefined;
+  const key = queryKey(query);
+  return Array.from(materializationStore.get(input)?.values() ?? []).find((entry) => entry.metadata.queryKey === key)?.rows as readonly Row[] | undefined;
 }
 
 export async function readMaterializedQuery<Row = unknown>(
-  _input: unknown,
+  input: unknown,
   query: Query<Row>
 ): Promise<MaterializedQueryResult<Row>> {
+  const stored = resolveMaterialization(input, query);
+  if (stored !== undefined) {
+    return {
+      kind: 'materializedQueryResult',
+      materialized: true,
+      rows: stored.rows as readonly Row[],
+      diagnostics: [],
+      queryKey: stored.metadata.queryKey,
+      id: stored.metadata.id,
+      ...(stored.metadata.sourceVersion === undefined ? {} : { sourceVersion: stored.metadata.sourceVersion })
+    };
+  }
+
   return {
     kind: 'materializedQueryResult',
     materialized: false,
@@ -353,14 +408,14 @@ export async function readMaterializedQuery<Row = unknown>(
 }
 
 export function materializedSourceFor<Row = unknown>(
-  _input: unknown,
-  _target: string | Query<Row> | MaterializationMetadata<Row>,
+  input: unknown,
+  target: string | Query<Row> | MaterializationMetadata<Row>,
   options: MaterializedSourceOptions = {}
 ): RelationSource {
   const relationName = options.relationName ?? 'materialized';
   return {
     relationNames: [relationName],
-    rows: () => []
+    rows: () => resolveMaterialization(input, target)?.rows ?? []
   };
 }
 
@@ -406,9 +461,21 @@ export function index<Row = unknown, Value = unknown>(
 }
 
 export function snapshotIndex<Row = unknown>(
-  _input: unknown,
-  _target: string | Query<Row> | MaterializationMetadata<Row>
+  input: unknown,
+  target: string | Query<Row> | MaterializationMetadata<Row>
 ): MaterializationIndexResult<Row> {
+  const stored = resolveMaterialization(input, target);
+  if (stored !== undefined) {
+    return {
+      kind: 'materializationIndex',
+      indexed: true,
+      diagnostics: [],
+      id: stored.metadata.id,
+      queryKey: stored.metadata.queryKey,
+      index: { kind: 'set', rows: new Set(stored.rows as readonly Row[]) }
+    };
+  }
+
   return {
     kind: 'materializationIndex',
     indexed: false,
@@ -435,9 +502,22 @@ export function snapshotHashIndex<Row = unknown, Value = unknown>(
 }
 
 function materializationHashIndexResult<Row, Value>(
-  _input: unknown,
-  _target: string | Query<Row> | MaterializationMetadata<Row>
+  input: unknown,
+  target: string | Query<Row> | MaterializationMetadata<Row>
 ): MaterializationHashIndexResult<Row, Value> {
+  const stored = resolveMaterialization(input, target);
+  if (stored !== undefined) {
+    const field = typeof target === 'object' && !isQuery(target) && 'field' in target ? String(target.field) : undefined;
+    return {
+      kind: 'materializationHashIndex',
+      indexed: true,
+      diagnostics: [],
+      id: stored.metadata.id,
+      queryKey: stored.metadata.queryKey,
+      index: { kind: 'hash', field: field ?? '', lookup: new Map() }
+    };
+  }
+
   return {
     kind: 'materializationHashIndex',
     indexed: false,
@@ -461,16 +541,157 @@ function markMaintainedMaterialized<Db extends object>(
   return db as Db & MaterializedDb & { readonly materializations?: MaterializationMaintenanceResult };
 }
 
+function storeMaterialization<Row>(db: object, entry: StoredMaterialization<Row>): void {
+  const store = materializationStore.get(db) ?? new Map<string, StoredMaterialization>();
+  store.set(entry.metadata.id, entry);
+  store.set(entry.metadata.queryKey, entry);
+  materializationStore.set(db, store);
+}
+
+function resolveMaterialization<Row>(
+  input: unknown,
+  target: string | Query<Row> | MaterializationMetadata<Row>
+): StoredMaterialization<Row> | undefined {
+  if (!isObject(input)) return undefined;
+  const store = materializationStore.get(input);
+  if (store === undefined) return undefined;
+  if (typeof target === 'string') return store.get(target) as StoredMaterialization<Row> | undefined;
+  if (isQuery(target)) return store.get(queryKey(target)) as StoredMaterialization<Row> | undefined;
+  return store.get(target.id) as StoredMaterialization<Row> | undefined;
+}
+
+async function evaluateSnapshot<Row>(target: SnapshotMaterializationTarget, query: Query<Row>): Promise<readonly Row[]> {
+  return evaluateQuery(sourceFor(target), query);
+}
+
+function sourceFor(target: SnapshotMaterializationTarget): RelationSource {
+  if (isRelationSourceTarget(target)) return target;
+  return {
+    relationNames: Object.keys(target.data),
+    rows: (relation) => target.data[relation.name] ?? [],
+    version: () => undefined
+  };
+}
+
+async function sourceVersionMetadata(target: SnapshotMaterializationTarget): Promise<{ readonly sourceVersion?: unknown }> {
+  const source = sourceFor(target);
+  if (source.version === undefined) return {};
+  const sourceVersion = await source.version();
+  return sourceVersion === undefined ? {} : { sourceVersion };
+}
+
+async function evaluateQuery<Row>(source: RelationSource, query: Query<Row>): Promise<readonly Row[]> {
+  const rows = await evaluateData(source, query.data, query);
+  return rows as readonly Row[];
+}
+
+async function evaluateData(source: RelationSource, data: QueryData, query: Query): Promise<readonly unknown[]> {
+  switch (data.op) {
+    case 'from': {
+      const relation = query.relations[data.relation];
+      if (relation === undefined) return [];
+      return (await source.rows(relation)).map((row) => ({ [data.alias]: row }));
+    }
+    case 'where':
+      return (await evaluateData(source, data.input, query)).filter((row) => matchesPredicate(row, data.predicate));
+    case 'select':
+      return (await evaluateData(source, data.input, query)).map((row) => projectRow(row, data.projection));
+    case 'sort':
+      return [...await evaluateData(source, data.input, query)].sort((left, right) => compareValues(
+        exprValue(left, data.order[0]?.expr),
+        exprValue(right, data.order[0]?.expr)
+      ) * (data.order[0]?.direction === 'desc' ? -1 : 1));
+    case 'limit':
+      return (await evaluateData(source, data.input, query)).slice(data.offset ?? 0, (data.offset ?? 0) + data.count);
+    case 'keyBy':
+    case 'hash':
+    case 'btree':
+      return evaluateData(source, data.input, query);
+    case 'constRows':
+      return data.rows;
+    default:
+      return [];
+  }
+}
+
+function projectRow(row: unknown, projection: ProjectionData): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(projection).map(([field, expr]) => [
+    field,
+    exprValue(row, projectionExpr(expr))
+  ]));
+}
+
+function matchesPredicate(row: unknown, predicate: PredicateData): boolean {
+  switch (predicate.op) {
+    case 'eq':
+      return exprValue(row, predicate.left) === exprValue(row, predicate.right);
+    case 'neq':
+      return exprValue(row, predicate.left) !== exprValue(row, predicate.right);
+    case 'and':
+      return predicate.predicates.every((item) => matchesPredicate(row, item));
+    case 'or':
+      return predicate.predicates.some((item) => matchesPredicate(row, item));
+    case 'not':
+      return !matchesPredicate(row, predicate.predicate);
+    case 'lt':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) < 0;
+    case 'lte':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) <= 0;
+    case 'gt':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) > 0;
+    case 'gte':
+      return compareValues(exprValue(row, predicate.left), exprValue(row, predicate.right)) >= 0;
+  }
+}
+
+function exprValue(row: unknown, expr: ExprData | undefined): unknown {
+  if (expr === undefined) return undefined;
+  switch (expr.op) {
+    case 'value':
+      return expr.value;
+    case 'field': {
+      const aliased = isRecord(row) ? row[expr.alias] : undefined;
+      return isRecord(aliased) ? aliased[expr.field] : isRecord(row) ? row[expr.field] : undefined;
+    }
+    case 'tuple':
+      return expr.items.map((item) => exprValue(row, item));
+    default:
+      return undefined;
+  }
+}
+
+function compareValues(left: unknown, right: unknown): number {
+  if (left === right) return 0;
+  return String(left) < String(right) ? -1 : 1;
+}
+
 function isObject(input: unknown): input is object {
   return typeof input === 'object' && input !== null;
 }
 
-function unsupportedDiagnostic(): UnsupportedMaterializationDiagnostic {
+function incrementalFallbackDiagnostic(id: string, key: string): IncrementalFallbackMaterializationDiagnostic {
   return {
-    code: 'materialization_unsupported',
-    message: 'materialization implementation has been removed; regenerate this API implementation',
-    surface: 'materialization'
+    code: 'materialization_incremental_fallback',
+    message: 'incremental maintenance falls back to snapshot recompute',
+    surface: 'materialization',
+    detail: { mode: 'incremental', fallback: 'recompute', id, queryKey: key, reason: 'incremental planner unavailable' }
   };
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null;
+}
+
+function projectionExpr(input: ProjectionData[string]): ExprData {
+  return isOptionalProjection(input) ? input.expr : input;
+}
+
+function isRelationSourceTarget(input: SnapshotMaterializationTarget): input is RelationSource {
+  return 'rows' in input && typeof input.rows === 'function';
+}
+
+function isOptionalProjection(input: ProjectionData[string]): input is OptionalProjection {
+  return 'kind' in input && input.kind === 'optionalProjection';
 }
 
 function missingDiagnostic(): MissingMaterializationDiagnostic {
