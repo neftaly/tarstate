@@ -7,7 +7,7 @@ import {
 import type { RelationSource } from './source.js';
 import { diffOptionsForTarget, trackedChangesForDbTransition, watchTargetKey } from './watch.js';
 import type { TrackedChange, WatchDb, WatchRuntimeDiagnostic } from './watch.js';
-import { diffRows } from './diff.js';
+import { diffRows, rowDiffKey, type RowDiffOptions } from './diff.js';
 
 export async function trackWatchedChanges(
   dbBefore: WatchDb | RelationSource,
@@ -49,7 +49,7 @@ function materializedChangesFromMaintenance(
       addedRows: change.addedRows,
       deletedRows: change.removedRows,
       removedRows: change.removedRows,
-      unchangedRows: unchangedRows(change.rows, change.rowChanges),
+      unchangedRows: unchangedRows(change.rows, change.rowChanges, diffOptionsForTarget(change.query, {})),
       rowChanges: change.rowChanges,
       diagnostics: change.diagnostics
     })),
@@ -87,7 +87,7 @@ function materializedChangesForTransition(
       addedRows: added,
       deletedRows: deleted,
       removedRows: deleted,
-      unchangedRows: unchangedRows(rows, diff.changes),
+      unchangedRows: unchangedRows(rows, diff.changes, diffOptionsForTarget(metadata.query, {})),
       rowChanges: diff.changes,
       diagnostics: diff.diagnostics
     });
@@ -96,7 +96,11 @@ function materializedChangesForTransition(
   return { changes, diagnostics };
 }
 
-function unchangedRows<Row>(rows: readonly Row[], changes: readonly { readonly key: string }[]): readonly Row[] {
+function unchangedRows<Row>(
+  rows: readonly Row[],
+  changes: readonly { readonly key: string }[],
+  options: RowDiffOptions<Row>
+): readonly Row[] {
   const changedKeys = new Set(changes.map((change) => change.key));
-  return rows.filter((row) => !changedKeys.has(JSON.stringify(row)));
+  return rows.filter((row) => !changedKeys.has(rowDiffKey(row, options)));
 }

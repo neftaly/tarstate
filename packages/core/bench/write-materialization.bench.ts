@@ -49,10 +49,18 @@ const materialized = mat(createDb(medium.data), {
   openTasks: medium.queries.openTasks,
   projectTaskAggregates: medium.queries.projectTaskAggregates
 });
+const incrementalMaterialized = mat(createDb(medium.data), {
+  activePeople: medium.queries.activePeople,
+  openTasks: medium.queries.openTasks
+}, { mode: 'incremental' });
 const materializedTaskInsert = insert(benchSchema.tasks, extraTask(medium.data, 100));
+const incrementalPeopleInsert = insert(benchSchema.people, extraPerson(101));
 const largeMaterializedJoin = mat(createDb(large.data), {
   taskProjectOwnerJoin: large.queries.taskProjectOwnerJoin
 });
+const largeIncrementalMaterializedJoin = mat(createDb(large.data), {
+  taskProjectOwnerJoin: large.queries.taskProjectOwnerJoin
+}, { mode: 'incremental' });
 const largeMaterializedJoinTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 200));
 const watchBase = createDb(medium.data);
 const watchNext = transact(watchBase, insert(benchSchema.people, extraPerson(200)));
@@ -105,8 +113,16 @@ describe('core write and materialization benchmarks', () => {
     consumeBenchResult(transact(materialized, materializedTaskInsert));
   }, options);
 
+  bench('materialized transact incremental: maintain active people delta', () => {
+    consumeBenchResult(transact(incrementalMaterialized, incrementalPeopleInsert));
+  }, options);
+
   bench('materialized transact large: maintain joined task query', () => {
     consumeBenchResult(transact(largeMaterializedJoin, largeMaterializedJoinTaskInsert));
+  }, options);
+
+  bench('materialized transact large incremental: maintain joined task query', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedJoin, largeMaterializedJoinTaskInsert));
   }, options);
 
   bench('materialized index: set rows', () => {

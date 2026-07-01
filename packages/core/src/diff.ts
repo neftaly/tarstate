@@ -66,6 +66,10 @@ export function diffRows<Row>(
 export { stableValue };
 export const stableRowKey = stableKey;
 
+export function rowDiffKey<Row>(row: Row, options: RowDiffOptions<Row> = {}): string {
+  return rowKeySelector(options)(row);
+}
+
 function rowKeySelector<Row>(options: RowDiffOptions<Row>): (row: Row) => string {
   if (typeof options.keyBy === 'function') {
     const selector = options.keyBy;

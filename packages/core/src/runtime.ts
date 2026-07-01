@@ -94,6 +94,7 @@ type TrackTransactEnvelope<Db extends WatchDb> = {
   readonly db: Db;
   readonly committed?: boolean;
   readonly deltas?: readonly RelationDelta[];
+  readonly materializations?: MaterializationMaintenanceResult;
   readonly diagnostics?: readonly TrackTransactDiagnostic[];
 };
 
@@ -150,7 +151,7 @@ export async function trackTransact(
 
     const result = tryTransact(db, ...inputs);
     const tracked = result.committed
-      ? await trackWatchedChanges(db, result.db, result.deltas)
+      ? await trackWatchedChanges(db, result.db, result.deltas, result.materializations)
       : { changes: [], diagnostics: [] };
 
     return {
@@ -163,7 +164,8 @@ export async function trackTransact(
       changesByTarget: watchChangeMap(tracked.changes),
       changesByTargetKey: watchChangeKeyMap(tracked.changes),
       deltas: result.deltas,
-      diagnostics: [...result.diagnostics, ...tracked.diagnostics]
+      ...(result.materializations === undefined ? {} : { materializations: result.materializations }),
+      diagnostics: uniqueDiagnostics([...result.diagnostics, ...tracked.diagnostics])
     };
   }
 
@@ -174,7 +176,12 @@ export async function trackTransact(
   const nextDb = envelope ? output.db : output;
   const committed = envelope ? output.committed !== false : true;
   const tracked = committed
-    ? await trackWatchedChanges(db, nextDb, envelope ? output.deltas ?? [] : [])
+    ? await trackWatchedChanges(
+      db,
+      nextDb,
+      envelope ? output.deltas ?? [] : [],
+      envelope ? output.materializations : undefined
+    )
     : { changes: [], diagnostics: [] };
   const changes = committed
     ? tracked.changes.length > 0 ? tracked.changes : deltasToChanges(envelope ? output.deltas ?? [] : [])
@@ -188,7 +195,8 @@ export async function trackTransact(
     changesByTarget: watchChangeMap(changes),
     changesByTargetKey: watchChangeKeyMap(changes),
     deltas: envelope ? output.deltas ?? [] : [],
-    diagnostics: [...(envelope ? output.diagnostics ?? [] : []), ...tracked.diagnostics],
+    ...(envelope && output.materializations !== undefined ? { materializations: output.materializations } : {}),
+    diagnostics: uniqueDiagnostics([...(envelope ? output.diagnostics ?? [] : []), ...tracked.diagnostics]),
     ...(options.label === undefined ? {} : { label: options.label })
   };
 }
@@ -327,4 +335,42 @@ function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChan
     ],
     diagnostics: []
   }));
+}
+
+function uniqueDiagnostics<Diagnostic extends TrackTransactDiagnostic>(
+  diagnostics: readonly Diagnostic[]
+): readonly Diagnostic[] {
+  const seen = new Set<string>();
+  const unique: Diagnostic[] = [];
+
+  for (const diagnostic of diagnostics) {
+    const key = diagnosticKey(diagnostic);
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(diagnostic);
+    }
+  }
+
+  return unique;
+}
+
+function diagnosticKey(diagnostic: TrackTransactDiagnostic): string {
+  try {
+    const key = JSON.stringify(diagnostic);
+    if (key !== undefined) {
+      return key;
+    }
+  } catch {
+    // Fall through to stable primitive fields when details are not JSON-safe.
+  }
+
+  return JSON.stringify({
+    code: diagnostic.code,
+    message: diagnostic.message,
+    relation: 'relation' in diagnostic ? diagnostic.relation : undefined,
+    field: 'field' in diagnostic ? diagnostic.field : undefined,
+    key: 'key' in diagnostic ? diagnostic.key : undefined,
+    surface: 'surface' in diagnostic ? diagnostic.surface : undefined,
+    side: 'side' in diagnostic ? diagnostic.side : undefined
+  });
 }

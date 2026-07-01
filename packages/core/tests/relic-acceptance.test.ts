@@ -1003,7 +1003,14 @@ describe('TypeScript Relic core acceptance', () => {
     );
 
     expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
+    expect(tracked.materializations).toBe(tracked.result?.materializations);
+    expect(tracked.result?.materializations).toMatchObject({ maintained: 1, recomputed: 1 });
     expect(events).toHaveLength(1);
+    const materializedChange = tracked.changes.find((change) => change.id === 'active-users');
+    expect(materializedChange?.unchangedRows).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
+    ]);
     expect(tracked.changes).toEqual(expect.arrayContaining([
       expect.objectContaining({
         changed: true,

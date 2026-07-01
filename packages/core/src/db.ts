@@ -1,7 +1,11 @@
 import type { RelationDelta } from './adapter.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
 import { evaluate, validateRelationRow, type EvaluateEnv, type EvaluateOptions, type QueryResult } from './evaluate.js';
-import { maintainMaterializations, queryRowsFromMaterialization } from './materialization.js';
+import {
+  maintainMaterializations,
+  queryRowsFromMaterialization,
+  type MaterializationMaintenanceResult
+} from './materialization.js';
 import { constRows, where, type PredicateData, type Query } from './query.js';
 import type { RelationRef } from './schema.js';
 import { fromObjectSource, type RelationSource } from './source.js';
@@ -92,6 +96,7 @@ export type DbTransactionResult = {
   readonly patches: number;
   readonly applied: number;
   readonly deltas: readonly RelationDelta[];
+  readonly materializations?: MaterializationMaintenanceResult;
   readonly diagnostics: readonly TarstateDiagnostic[];
   readonly committed: boolean;
 };
@@ -559,6 +564,7 @@ export function tryTransactWithConstraints(
     patches: result.patches,
     applied: result.applied,
     deltas: result.deltas,
+    materializations,
     diagnostics: [...result.diagnostics, ...materializations.diagnostics],
     committed: true
   };
