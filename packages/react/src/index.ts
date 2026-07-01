@@ -34,7 +34,7 @@ import {
   type MaterializationDiagnostic,
   type MaterializedQueryResult,
   type SnapshotMaterializationOptions
-} from '@tarstate/core/experimental/materialization';
+} from '@tarstate/core/materialization';
 
 export type TarstateReactDiagnostic =
   | TarstateDiagnostic

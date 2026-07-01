@@ -281,17 +281,17 @@ export function deleteByKey<Relation extends RelationRef>(
 }
 
 /** Create a predicate delete patch. */
-function deleteRows<Relation extends RelationRef>(
+export function deleteRows<Relation extends RelationRef>(
   relation: Relation,
   predicate: PredicateData
 ): DeletePatch<Relation> {
   return { op: 'delete', relation, predicate };
 }
 
-/** Create a predicate delete patch. */
+/** Relic-style predicate delete export. `deleteRows` is easier to import in TypeScript call sites. */
 export { deleteRows as delete };
 
-/** Compatibility alias for predicate deletes. Prefer `delete`. */
+/** Predicate delete alias for query-like call sites. */
 export function deleteWhere<Relation extends RelationRef>(
   relation: Relation,
   predicate: PredicateData

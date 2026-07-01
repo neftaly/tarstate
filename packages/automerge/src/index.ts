@@ -13,6 +13,11 @@ import {
   type QueryBatch,
   type QueryBatchResult
 } from '@tarstate/core/db';
+import {
+  mat as materializeDb,
+  type MaterializedDb,
+  type SnapshotMaterializationOptions
+} from '@tarstate/core/materialization';
 import type {
   AdapterCommitResult,
   AdapterSnapshot,
@@ -31,7 +36,7 @@ import {
 import { isJsonValue, type FieldSpec, type RelationRef } from '@tarstate/core/schema';
 import { queryKey, type PredicateData, type Query } from '@tarstate/core/query';
 import { type RelationRangeBound } from '@tarstate/core/source';
-import { writeInputPatches, type RelationKeyInput, type WriteInput, type WritePatch } from '@tarstate/core/write';
+import { writeInputPatches, type RelationKeyInput, type RelationRow, type WriteInput, type WritePatch } from '@tarstate/core/write';
 
 export type AutomergeMapPath = readonly string[];
 
@@ -112,7 +117,24 @@ export type AutomergeDbTransactionResult = {
   readonly version?: unknown;
 };
 
+type AutomergeDbQueryTarget<Row = unknown> = Query<Row> | RelationRef | string;
+
 type AutomergeDbQuery = {
+  <Relation extends RelationRef, MappedRow>(
+    relation: Relation,
+    options: DbQueryOptions<RelationRow<Relation>, MappedRow> & {
+      readonly mapRows: (rows: readonly RelationRow<Relation>[]) => readonly MappedRow[];
+    }
+  ): Promise<QueryResult<MappedRow>>;
+  <Relation extends RelationRef>(
+    relation: Relation,
+    options?: DbQueryOptions<RelationRow<Relation>>
+  ): Promise<QueryResult<RelationRow<Relation>>>;
+  <MappedRow>(
+    relationName: string,
+    options: DbQueryOptions<unknown, MappedRow> & { readonly mapRows: (rows: readonly unknown[]) => readonly MappedRow[] }
+  ): Promise<QueryResult<MappedRow>>;
+  (relationName: string, options?: DbQueryOptions): Promise<QueryResult<unknown>>;
   <Row, MappedRow>(
     query: Query<Row>,
     options: DbQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
@@ -128,14 +150,14 @@ type AutomergeDbQuery = {
   ): Promise<QueryBatchResult<Queries>>;
 };
 
-export type AutomergeDbMaterialization<Row = unknown> = {
-  readonly kind: 'automergeDbMaterialization';
+export type AutomergeDbQuerySnapshot<Row = unknown> = {
+  readonly kind: 'automergeDbQuerySnapshot';
   readonly id: string;
   readonly queryKey: string;
   readonly query: Query<Row>;
   readonly db: Db;
   readonly rows: readonly Row[];
-  readonly diagnostics: readonly TarstateDiagnostic[];
+  readonly diagnostics: QueryResult<Row>['diagnostics'];
 };
 
 export type AutomergeDbWatchTarget<Row = unknown> = Query<Row> | RelationRef;
@@ -184,8 +206,12 @@ export type AutomergeDb<
   readonly transact: (...inputs: readonly AutomergeDbTransactionInput[]) => Promise<Db>;
   readonly mat: <Row>(
     query: Query<Row>,
+    options?: SnapshotMaterializationOptions
+  ) => Promise<Db & MaterializedDb>;
+  readonly querySnapshot: <Row>(
+    query: Query<Row>,
     options?: { readonly id?: string; readonly name?: string }
-  ) => Promise<AutomergeDbMaterialization<Row>>;
+  ) => Promise<AutomergeDbQuerySnapshot<Row>>;
   readonly watch: <Row>(
     target: AutomergeDbWatchTarget<Row>,
     listener: AutomergeDbWatchListener<Row>,
@@ -237,7 +263,7 @@ export class AutomergeDbTransactionError extends Error {
 
 async function queryAutomergeDb<Row, MappedRow>(
   db: Db,
-  query: Query<Row>,
+  query: AutomergeDbQueryTarget<Row>,
   options?: DbQueryOptions<Row, MappedRow>
 ): Promise<QueryResult<Row> | QueryResult<MappedRow>>;
 async function queryAutomergeDb<const Queries extends QueryBatch, MappedRow>(
@@ -247,7 +273,7 @@ async function queryAutomergeDb<const Queries extends QueryBatch, MappedRow>(
 ): Promise<QueryBatchResult<Queries> | MappedQueryBatchResult<Queries, MappedRow>>;
 async function queryAutomergeDb(
   db: Db,
-  queryOrQueries: Query | QueryBatch,
+  queryOrQueries: AutomergeDbQueryTarget | QueryBatch,
   options: DbQueryOptions = {}
 ): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>> {
   return q(db, queryOrQueries as never, options as never) as Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>>;
@@ -266,6 +292,10 @@ export function automergeDb<
     ...adapter.relations.map((mapping) => mapping.relation),
     ...options.runtimes?.flatMap(runtimeRelations) ?? []
   ]);
+  const materializations = new Map<string, {
+    readonly query: Query;
+    readonly options: SnapshotMaterializationOptions;
+  }>();
 
   const getSnapshot = async (): Promise<AutomergeDbSnapshot> => {
     const data = Object.fromEntries(await Promise.all(relations.map(async (relation) => [
@@ -276,7 +306,7 @@ export function automergeDb<
     const diagnostics = await runtime.source.diagnostics?.() ?? [];
 
     return {
-      db: createDb(data as DbInputData, { env: options.env }),
+      db: materializeRegisteredQueries(createSnapshotDb(data as DbInputData)),
       source: runtime.source,
       ...(version === undefined ? {} : { version }),
       diagnostics
@@ -284,11 +314,11 @@ export function automergeDb<
   };
   const db = async () => (await getSnapshot()).db;
   const query = (async (
-    queryOrQueries: Query | QueryBatch,
+    queryOrQueries: Query | QueryBatch | RelationRef | string,
     queryOptions?: DbQueryOptions
   ) => (queryAutomergeDb as (
     db: Db,
-    queryOrQueries: Query | QueryBatch,
+    queryOrQueries: Query | QueryBatch | RelationRef | string,
     options?: DbQueryOptions
   ) => Promise<unknown>)(await db(), queryOrQueries, queryOptions)) as AutomergeDbQuery;
   const tryTransact = async (
@@ -335,14 +365,19 @@ export function automergeDb<
 
       return result.db;
     },
-    mat: async (queryValue, matOptions) => {
+    mat: async (queryValue, matOptions = {}) => {
+      const key = queryKey(queryValue);
+      materializations.set(key, { query: queryValue, options: matOptions });
+      return await db() as Db & MaterializedDb;
+    },
+    querySnapshot: async (queryValue, snapshotOptions) => {
       const snapshot = await db();
       const result = await queryAutomergeDb(snapshot, queryValue) as QueryResult<unknown>;
       const key = queryKey(queryValue);
 
       return {
-        kind: 'automergeDbMaterialization',
-        id: matOptions?.id ?? matOptions?.name ?? key,
+        kind: 'automergeDbQuerySnapshot',
+        id: snapshotOptions?.id ?? snapshotOptions?.name ?? key,
         queryKey: key,
         query: queryValue,
         db: snapshot,
@@ -354,6 +389,20 @@ export function automergeDb<
       createAutomergeDbWatch(runtime.source, target, listener, watchOptions),
     subscribe: runtime.subscribe ?? adapter.subscribe
   };
+
+  function materializeRegisteredQueries(input: Db): Db {
+    let nextDb = input;
+    for (const entry of materializations.values()) {
+      nextDb = materializeDb(nextDb, entry.query, entry.options);
+    }
+    return nextDb;
+  }
+
+  function createSnapshotDb(data: DbInputData): Db {
+    return options.env === undefined
+      ? createDb(data)
+      : createDb(data, { env: options.env });
+  }
 }
 
 function createAutomergeDbWatch<Row>(

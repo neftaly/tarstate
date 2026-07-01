@@ -318,7 +318,7 @@ export function hash(...expressions: readonly ExprInput[]): <Ctx>(query: Query<C
 /**
  * Declare unique hash-index intent without exporting a root-level `unique` name.
  *
- * @remarks This is query metadata only; uniqueness validation stays in `@tarstate/core/experimental/constraints`.
+ * @remarks This is query metadata only; uniqueness validation stays in `@tarstate/core/constraints`.
  */
 export function uniqueIndex(...expressions: readonly ExprInput[]): <Ctx>(query: Query<Ctx>) => Query<Ctx> {
   return indexDeclaration('hash', expressions, { unique: true });

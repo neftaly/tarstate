@@ -200,6 +200,7 @@ export type {
 export * from './runtime.js';
 export * from './watch.js';
 export {
+  deleteRows,
   deleteExact,
   deleteByKey,
   delete,

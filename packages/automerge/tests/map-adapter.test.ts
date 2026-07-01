@@ -9,6 +9,7 @@ import {
   stringField
 } from '@tarstate/core/schema';
 import { as, eq, from, pipe, project, where } from '@tarstate/core/query';
+import { materializedRowsForQuery } from '@tarstate/core/materialization';
 import { write } from '@tarstate/core/write';
 import {
   automergeDb,
@@ -87,6 +88,30 @@ describe('automerge Relic DB integration', () => {
       rows: [{ id: 'task-a', title: 'Draft contract' }],
       diagnostics: []
     });
+    await expect(relic.q(schema.tasks)).resolves.toMatchObject({
+      rows: [
+        { id: 'task-a', title: 'Draft contract', done: false, rank: 1 },
+        { id: 'task-b', title: 'Ship adapter', done: true, rank: 2 }
+      ],
+      diagnostics: []
+    });
+    await expect(relic.q('tasks', {
+      mapRows: (rows) => rows.map((row) => (row as TaskRow).id)
+    })).resolves.toMatchObject({
+      rows: ['task-a', 'task-b'],
+      diagnostics: []
+    });
+    const batch = await relic.q({
+      open: query,
+      all: schema.tasks,
+      named: 'tasks'
+    });
+    expect(batch.open.rows).toEqual([{ id: 'task-a', title: 'Draft contract' }]);
+    expect(batch.all.rows).toEqual([
+      { id: 'task-a', title: 'Draft contract', done: false, rank: 1 },
+      { id: 'task-b', title: 'Ship adapter', done: true, rank: 2 }
+    ]);
+    expect(batch.named.rows).toEqual(batch.all.rows);
   });
 
   it('transacts through core write inputs, updates Automerge heads and returns the next Db', async () => {
@@ -146,7 +171,30 @@ describe('automerge Relic DB integration', () => {
     });
   });
 
-  it('materializes and watches over the Automerge source', async () => {
+  it('returns one-shot query snapshots without registering materializations', async () => {
+    const task = as(schema.tasks, 'task');
+    const query = pipe(from(task), project({ id: task.id, done: task.done }));
+    const relic = automergeDb<TaskDocument>(taskDoc({
+      'task-a': { title: 'Draft contract', done: false, rank: 1 }
+    }), { relations: taskRelations });
+
+    const snapshot = await relic.querySnapshot(query, { id: 'task-status' });
+
+    expect(snapshot).toMatchObject({
+      kind: 'automergeDbQuerySnapshot',
+      id: 'task-status',
+      rows: [{ id: 'task-a', done: false }],
+      diagnostics: []
+    });
+    expect(snapshot.query).toBe(query);
+    expect(snapshot.db.data.tasks).toEqual([
+      { id: 'task-a', title: 'Draft contract', done: false, rank: 1 }
+    ]);
+    expect(materializedRowsForQuery(snapshot.db, query)).toBeUndefined();
+    expect(materializedRowsForQuery(await relic.db(), query)).toBeUndefined();
+  });
+
+  it('materializes into core Db snapshots and watches over the Automerge source', async () => {
     const task = as(schema.tasks, 'task');
     const query = pipe(from(task), project({ id: task.id, done: task.done }));
     const relic = automergeDb<TaskDocument>(taskDoc({
@@ -158,18 +206,19 @@ describe('automerge Relic DB integration', () => {
     }, { keyBy: ['id'] });
 
     const materialized = await relic.mat(query, { id: 'task-status' });
-    expect(materialized).toMatchObject({
-      kind: 'automergeDbMaterialization',
-      id: 'task-status',
-      rows: [{ id: 'task-a', done: false }],
-      diagnostics: []
-    });
+    expect(materialized.data.tasks).toEqual([
+      { id: 'task-a', title: 'Draft contract', done: false, rank: 1 }
+    ]);
+    expect(materializedRowsForQuery(materialized, query)).toEqual([{ id: 'task-a', done: false }]);
+    expect(materializedRowsForQuery(await relic.db(), query)).toEqual([{ id: 'task-a', done: false }]);
 
     await expect(handle.refresh()).resolves.toMatchObject({
       changed: true,
       rows: [{ id: 'task-a', done: false }]
     });
-    await relic.transact(tasks.updateByKey('task-a', { done: true }));
+    const nextDb = await relic.transact(tasks.updateByKey('task-a', { done: true }));
+    expect(materializedRowsForQuery(nextDb, query)).toEqual([{ id: 'task-a', done: true }]);
+    expect(materializedRowsForQuery(await relic.db(), query)).toEqual([{ id: 'task-a', done: true }]);
     await expect(handle.refresh()).resolves.toMatchObject({
       changed: true,
       previousRows: [{ id: 'task-a', done: false }],
