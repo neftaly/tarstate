@@ -104,7 +104,10 @@ describe('composed Automerge runtime snapshots', () => {
       ];
 
       expect(snapshot.version).toEqual(originalVersion);
-      await expect(snapshot.source.version?.()).resolves.toEqual(originalVersion);
+      const snapshotSourceVersion = await snapshot.source.version?.();
+
+      expect(snapshotSourceVersion).toBe(snapshot.version);
+      expect(snapshotSourceVersion).toEqual(originalVersion);
       expect(await snapshot.source.diagnostics?.()).toEqual([]);
 
       const result = await tryApplyRelationPatches(runtime, [
@@ -114,7 +117,7 @@ describe('composed Automerge runtime snapshots', () => {
 
       expect(result.status).toBe('accepted');
       expect(snapshot.version).toEqual(originalVersion);
-      await expect(snapshot.source.version?.()).resolves.toEqual(originalVersion);
+      expect(await snapshot.source.version?.()).toBe(snapshot.version);
       expect(await snapshot.source.diagnostics?.()).toEqual([]);
       expect(Array.from(await snapshot.source.rows(schema.todos))).toEqual([
         { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },

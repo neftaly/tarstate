@@ -52,6 +52,7 @@ export type AutomergePresenceRuntime<State extends PresenceState = PresenceState
     readonly presence: Presence<State>;
     readonly relation: RelationRef;
     readonly fields: AutomergePresenceFieldNames;
+    readonly snapshot: () => AdapterSnapshot<AutomergePresenceVersion>;
     readonly target: RelationPatchTarget<AutomergePresenceVersion>;
     readonly subscribe: (listener: () => void) => () => void;
     readonly start: () => void;
@@ -124,6 +125,7 @@ class AutomergePresenceRuntimeImpl<
     readonly peerTtlMs?: number;
   };
   private readonly listeners = new Set<() => void>();
+  private readonly readVersion: () => AutomergePresenceVersion;
   private revision = 0;
   private localLastActiveAt = Date.now();
   private localLastSeenAt = this.localLastActiveAt;
@@ -144,6 +146,10 @@ class AutomergePresenceRuntimeImpl<
       ...(options.heartbeatMs === undefined ? {} : { heartbeatMs: options.heartbeatMs }),
       ...(options.peerTtlMs === undefined ? {} : { peerTtlMs: options.peerTtlMs })
     };
+    this.readVersion = createPresenceVersionReader(
+      () => this.revision,
+      () => this.options.localPeerId
+    );
     this.source = presenceSource({
       relation: this.relation,
       fields: this.fields,
@@ -215,10 +221,7 @@ class AutomergePresenceRuntimeImpl<
   }
 
   private version(): AutomergePresenceVersion {
-    return {
-      revision: this.revision,
-      ...(this.options.localPeerId === undefined ? {} : { localPeerId: this.options.localPeerId })
-    };
+    return this.readVersion();
   }
 
   private currentLocalState(): State {
@@ -324,6 +327,32 @@ class AutomergePresenceRuntimeImpl<
 
     return changed;
   }
+}
+
+function createPresenceVersionReader(
+  revision: () => number,
+  localPeerId: () => string | undefined
+): () => AutomergePresenceVersion {
+  let cached: AutomergePresenceVersion | undefined;
+
+  return () => {
+    const nextRevision = revision();
+    const nextLocalPeerId = localPeerId();
+
+    if (
+      cached !== undefined &&
+      cached.revision === nextRevision &&
+      cached.localPeerId === nextLocalPeerId
+    ) {
+      return cached;
+    }
+
+    cached = Object.freeze({
+      revision: nextRevision,
+      ...(nextLocalPeerId === undefined ? {} : { localPeerId: nextLocalPeerId })
+    });
+    return cached;
+  };
 }
 
 function presenceSource(options: PresenceSourceOptions): AdapterSource<AutomergePresenceVersion> {

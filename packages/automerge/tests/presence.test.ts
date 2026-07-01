@@ -94,7 +94,13 @@ describe('Automerge Repo Presence runtime', () => {
         ],
         diagnostics: []
       });
-      expect(await runtime.source.version?.()).toEqual({ revision: 1, localPeerId: 'peer-local' });
+      const version = await runtime.source.version?.();
+      const snapshot = runtime.snapshot();
+
+      expect(version).toEqual({ revision: 1, localPeerId: 'peer-local' });
+      expect(await runtime.source.version?.()).toBe(version);
+      expect(snapshot.version).toBe(version);
+      expect(await snapshot.source.version?.()).toBe(snapshot.version);
     } finally {
       unsubscribe();
       runtime.stop();
@@ -262,6 +268,7 @@ describe('Automerge Repo Presence runtime', () => {
       expect(result.status).toBe('accepted');
       expect(notifications).toBe(1);
       expect(before.version).toEqual({ revision: 0, localPeerId: 'peer-local' });
+      expect(await before.source.version?.()).toBe(before.version);
       await expect(evaluate(before.source, colorPresence)).resolves.toMatchObject({
         rows: [{ peerId: 'peer-local', value: 'blue', local: true }],
         diagnostics: []

@@ -41,6 +41,8 @@ export type AutomergeMapSourceOptions = {
   readonly relations: readonly AutomergeMapRelation[];
 };
 
+export type AutomergeMapSource = AdapterSource<Automerge.Heads>;
+
 export type AutomergeMapAdapter<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
 > = RelationAdapter<Automerge.Heads> & {
@@ -48,6 +50,7 @@ export type AutomergeMapAdapter<
   readonly doc: Automerge.Doc<DocumentShape>;
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
   readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
+  readonly snapshot: () => AdapterSnapshot<Automerge.Heads>;
   readonly target: RelationPatchTarget<Automerge.Heads>;
 };
 
@@ -94,8 +97,11 @@ export function automergeMapAdapter<
   return new AutomergeMapRelationAdapter(options);
 }
 
-/** Alias for callers that prefer the storage-adapter naming convention. */
-export const createAutomergeRelationAdapter = automergeMapAdapter;
+/** Canonical factory for map-shaped Automerge relation adapters. */
+export const createAutomergeMapAdapter = automergeMapAdapter;
+
+/** Alias for callers that prefer the generic relation-adapter naming convention. */
+export const createAutomergeRelationAdapter = createAutomergeMapAdapter;
 
 /** Create a read-only Tarstate source over map-shaped relations inside an Automerge document. */
 export function automergeMapSource<
@@ -103,11 +109,22 @@ export function automergeMapSource<
 >(
   docOrGetDoc: Automerge.Doc<DocumentShape> | (() => Automerge.Doc<DocumentShape>),
   options: AutomergeMapSourceOptions
-): AdapterSource<Automerge.Heads> {
+): AutomergeMapSource {
+  return automergeMapSourceWithVersion(docOrGetDoc, options);
+}
+
+function automergeMapSourceWithVersion<
+  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+>(
+  docOrGetDoc: Automerge.Doc<DocumentShape> | (() => Automerge.Doc<DocumentShape>),
+  options: AutomergeMapSourceOptions,
+  version?: () => Automerge.Heads
+): AutomergeMapSource {
   const getDoc = typeof docOrGetDoc === 'function' ? docOrGetDoc : () => docOrGetDoc;
   const plans = relationPlans(options.relations);
   const relationNames = Array.from(plans.keys());
-  const source: AdapterSource<Automerge.Heads> = {
+  const readVersion = version ?? createAutomergeVersionReader(getDoc);
+  const source: AutomergeMapSource = {
     relationNames,
     rows: (relationRef) => {
       const plan = plans.get(relationRef.name);
@@ -115,14 +132,18 @@ export function automergeMapSource<
     },
     lookup: (lookup) => lookupRows(getDoc, plans, lookup),
     rangeLookup: (lookup) => rangeLookupRows(getDoc, plans, lookup),
-    version: () => Automerge.getHeads(getDoc()),
+    version: readVersion,
     diagnostics: () => sourceDiagnostics(getDoc, plans)
   };
 
   return source;
 }
 
-export const createAutomergeRelationSource = automergeMapSource;
+/** Canonical factory for read-only map-shaped Automerge relation sources. */
+export const createAutomergeMapSource = automergeMapSource;
+
+/** Alias for callers that prefer the generic relation-source naming convention. */
+export const createAutomergeRelationSource = createAutomergeMapSource;
 
 /** Extract rows from an exact Automerge map path, optionally synthesizing relation keys from map keys. */
 export function rowsFromAutomergeMapPath<
@@ -156,6 +177,7 @@ class AutomergeMapRelationAdapter<
   private readonly plans: ReadonlyMap<string, RelationPlan>;
   private readonly onDocChange: ((doc: Automerge.Doc<DocumentShape>) => void) | undefined;
   private readonly changeMessage: string | ((patches: readonly WritePatch[]) => string | undefined) | undefined;
+  private readonly readVersion: () => Automerge.Heads;
 
   constructor(options: AutomergeMapAdapterOptions<DocumentShape>) {
     this.currentDoc = options.doc;
@@ -163,7 +185,12 @@ class AutomergeMapRelationAdapter<
     this.plans = relationPlans(this.relations);
     this.onDocChange = options.onDocChange;
     this.changeMessage = options.changeMessage;
-    this.source = automergeMapSource(() => this.currentDoc, { relations: this.relations });
+    this.readVersion = createAutomergeVersionReader(() => this.currentDoc);
+    this.source = automergeMapSourceWithVersion(
+      () => this.currentDoc,
+      { relations: this.relations },
+      this.readVersion
+    );
   }
 
   get doc(): Automerge.Doc<DocumentShape> {
@@ -178,9 +205,11 @@ class AutomergeMapRelationAdapter<
 
   snapshot = (): AdapterSnapshot<Automerge.Heads> => {
     const doc = this.currentDoc;
+    const version = this.version();
+
     return {
-      source: automergeMapSource(doc, { relations: this.relations }),
-      version: Automerge.getHeads(doc)
+      source: automergeMapSourceWithVersion(doc, { relations: this.relations }, () => version),
+      version
     };
   };
 
@@ -246,12 +275,33 @@ class AutomergeMapRelationAdapter<
   }
 
   private version(): Automerge.Heads {
-    return Automerge.getHeads(this.currentDoc);
+    return this.readVersion();
   }
 
   private messageFor(patches: readonly WritePatch[]): string | undefined {
     return typeof this.changeMessage === 'function' ? this.changeMessage(patches) : this.changeMessage;
   }
+}
+
+function createAutomergeVersionReader<DocumentShape extends Record<string, unknown>>(
+  getDoc: () => Automerge.Doc<DocumentShape>
+): () => Automerge.Heads {
+  let cached: Automerge.Heads | undefined;
+
+  return () => {
+    const heads = Automerge.getHeads(getDoc());
+
+    if (cached !== undefined && sameAutomergeHeads(cached, heads)) {
+      return cached;
+    }
+
+    cached = Object.freeze([...heads]) as Automerge.Heads;
+    return cached;
+  };
+}
+
+function sameAutomergeHeads(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((head, index) => head === right[index]);
 }
 
 function relationPlans(relations: readonly AutomergeMapRelation[]): ReadonlyMap<string, RelationPlan> {

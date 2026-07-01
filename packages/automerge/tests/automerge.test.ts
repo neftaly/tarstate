@@ -22,11 +22,14 @@ import {
   automergeMapAdapter,
   automergeMapSource,
   automergePresenceRuntime,
+  createAutomergeMapAdapter,
+  createAutomergeMapSource,
   createAutomergePresenceRuntime,
   createAutomergeRelationAdapter,
   createAutomergeRelationSource,
   rowsFromAutomergeMapPath,
-  type AutomergeMapAdapter
+  type AutomergeMapAdapter,
+  type AutomergeMapSource
 } from '@tarstate/automerge';
 
 type TodoRow = {
@@ -140,13 +143,18 @@ describe('@tarstate/automerge', () => {
   it('exports the public package adapter surface', async () => {
     const doc = Automerge.from<TodoDocument>({ todos: {} });
 
-    expect(automergeMapAdapter).toBe(createAutomergeRelationAdapter);
-    expect(automergeMapSource).toBe(createAutomergeRelationSource);
+    expect(automergeMapAdapter).toBe(createAutomergeMapAdapter);
+    expect(createAutomergeRelationAdapter).toBe(createAutomergeMapAdapter);
+    expect(automergeMapSource).toBe(createAutomergeMapSource);
+    expect(createAutomergeRelationSource).toBe(createAutomergeMapSource);
     expect(automergePresenceRuntime).toBe(createAutomergePresenceRuntime);
     expect(Array.from(await automergeMapSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
+    expect(Array.from(await createAutomergeMapSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
     expect(Array.from(await createAutomergeRelationSource(doc, { relations: todoRelations }).rows(schema.todos))).toEqual([]);
     expectTypeOf(automergeMapAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
+    expectTypeOf(createAutomergeMapAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
     expectTypeOf(createAutomergeRelationAdapter<TodoDocument>).returns.toMatchTypeOf<AutomergeMapAdapter<TodoDocument>>();
+    expectTypeOf(createAutomergeMapSource<TodoDocument>).returns.toMatchTypeOf<AutomergeMapSource>();
     expectTypeOf(rowsFromAutomergeMapPath<TodoDocument>).returns.toEqualTypeOf<readonly unknown[]>();
   });
 
@@ -159,7 +167,13 @@ describe('@tarstate/automerge', () => {
     });
     const adapter = createAutomergeRelationAdapter<TodoDocument>({ doc, relations: todoRelations });
 
-    expect(await adapter.source.version?.()).toEqual(Automerge.getHeads(doc));
+    const version = await adapter.source.version?.();
+    const snapshot = adapter.snapshot();
+
+    expect(version).toEqual(Automerge.getHeads(doc));
+    expect(await adapter.source.version?.()).toBe(version);
+    expect(snapshot.version).toBe(version);
+    expect(await snapshot.source.version?.()).toBe(snapshot.version);
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
       { id: 'todo-b', text: 'Water basil', done: true, rank: 2 }
@@ -204,6 +218,7 @@ describe('@tarstate/automerge', () => {
     });
     expect(adapter.doc).not.toBe(beforeDoc);
     expect(result.version).toEqual(Automerge.getHeads(adapter.doc));
+    expect(result.version).toBe(await adapter.source.version?.());
     expect(adapter.doc.todos['todo-a']).toEqual({ text: 'Buy oat milk', done: true, rank: 1 });
     expect(adapter.doc.todos['todo-b']).toEqual({ text: 'Water basil', done: false, rank: 2 });
     expect(result.deltas).toEqual([
@@ -243,6 +258,7 @@ describe('@tarstate/automerge', () => {
       version: Automerge.getHeads(adapter.doc)
     });
     expect('committed' in result).toBe(false);
+    expect(result.version).toBe(await adapter.source.version?.());
     expect(result.deltas).toEqual([
       {
         relation: schema.todos,
@@ -614,7 +630,10 @@ describe('@tarstate/automerge', () => {
 
     adapter.setDoc(nextDoc);
 
-    expect(await adapter.source.version?.()).toEqual(Automerge.getHeads(nextDoc));
+    const version = await adapter.source.version?.();
+
+    expect(version).toEqual(Automerge.getHeads(nextDoc));
+    expect(await adapter.source.version?.()).toBe(version);
     expect(Array.from(await adapter.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
     ]);
@@ -639,10 +658,14 @@ describe('@tarstate/automerge', () => {
       throw new Error('expected automerge adapter snapshots');
     }
     expect(before.version).toEqual(Automerge.getHeads(doc));
+    expect(await before.source.version?.()).toBe(before.version);
     expect(Array.from(await before.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 }
     ]);
-    expect(Array.from(await adapter.snapshot().source.rows(schema.todos))).toEqual([
+    const after = adapter.snapshot();
+
+    expect(await after.source.version?.()).toBe(after.version);
+    expect(Array.from(await after.source.rows(schema.todos))).toEqual([
       { id: 'todo-a', text: 'Buy oat milk', done: false, rank: 1 },
       { id: 'todo-b', text: 'Water basil', done: false, rank: 2 }
     ]);
