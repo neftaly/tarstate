@@ -5,6 +5,7 @@ import {
   as,
   booleanField,
   constrain,
+  constRows,
   count,
   createDb,
   defineSchema,
@@ -13,6 +14,7 @@ import {
   demat,
   eq,
   evaluate,
+  field,
   from,
   fromObjectSource,
   gt,
@@ -307,6 +309,31 @@ describe('deterministic core properties', () => {
 
     const unwatched = unwatch(watched, visibleItems, itemSchema.items) as Db;
     expect(materializedRowsForQuery(unwatched, visibleItems)).toBe(rows);
+  });
+
+  it('keeps Object.is equality semantics on optimized joins', async () => {
+    const leftX = field<number>('left', 'x');
+    const rightY = field<number>('right', 'y');
+    const leftLabel = field<string>('left', 'leftLabel');
+    const rightLabel = field<string>('right', 'rightLabel');
+    const joined = pipe(
+      constRows([
+        { x: -0, leftLabel: 'negative-zero' },
+        { x: Number.NaN, leftLabel: 'nan' }
+      ]),
+      join(constRows([
+        { y: 0, rightLabel: 'zero' },
+        { y: Number.NaN, rightLabel: 'nan' }
+      ]), eq(leftX, rightY)),
+      project({
+        left: leftLabel,
+        right: rightLabel
+      })
+    );
+
+    await expect(qRows(createDb(), joined)).resolves.toEqual([
+      { left: 'nan', right: 'nan' }
+    ]);
   });
 });
 

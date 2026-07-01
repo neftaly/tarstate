@@ -238,13 +238,12 @@ async function equalityJoinRows(
     return kind === 'left' ? left : [];
   }
 
-  const rightIndex = new Map<string, { readonly row: EvalContext; readonly value: unknown }[]>();
+  const rightIndex = new Map<unknown, { readonly row: EvalContext; readonly value: unknown }[]>();
   for (const rightRow of right) {
     const value = await evaluateExpr(equality.right, rightRow, state);
-    const key = stableKey(value);
-    const rows = rightIndex.get(key);
+    const rows = rightIndex.get(value);
     if (rows === undefined) {
-      rightIndex.set(key, [{ row: rightRow, value }]);
+      rightIndex.set(value, [{ row: rightRow, value }]);
     } else {
       rows.push({ row: rightRow, value });
     }
@@ -253,7 +252,7 @@ async function equalityJoinRows(
   const output: EvalContext[] = [];
   for (const leftRow of left) {
     const leftValue = await evaluateExpr(equality.left, leftRow, state);
-    const candidates = rightIndex.get(stableKey(leftValue)) ?? [];
+    const candidates = rightIndex.get(leftValue) ?? [];
     let matched = false;
 
     for (const candidate of candidates) {
