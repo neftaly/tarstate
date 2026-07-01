@@ -27,9 +27,18 @@ import {
   buildIncrementalMaterialization,
   maintainIncrementalMaterialization,
   planIncrementalMaterialization,
+  rowsFromIncrementalState,
   type IncrementalMaterialization,
-  type IncrementalMaterializationPlan
+  type IncrementalMaterializationPlan,
+  type IncrementalRowBatch
 } from './materialization-plan.js';
+import {
+  diffMaterializationRows as diffMaterializationRowsByOptions,
+  materializationRowIndex,
+  materializationRowKey,
+  type MaterializationRowDiffOptions,
+  type MaterializationRowIndex
+} from './materialization-row-changes.js';
 
 declare const materializedDb: unique symbol;
 
@@ -376,6 +385,7 @@ export type MaterializationIndexOptions<Field extends string = string> =
 type StoredMaterialization<Row = unknown> = {
   readonly metadata: MaterializationMetadata<Row>;
   readonly rows: readonly Row[];
+  readonly rowIndex: MaterializationRowIndex<Row>;
   readonly incremental?: IncrementalMaterialization<Row>;
 };
 type MaterializationEvalTarget = {
@@ -578,12 +588,16 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             envFor(next)
           );
           if (maintained.updated) {
-            const diff = diffMaterializationRows(stored.rows, maintained.rows, stored.metadata.query);
+            const nextIncremental = {
+              plan: stored.incremental.plan,
+              state: maintained.state
+            };
+            const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
             const change: MaterializationMaintenanceChange = {
               kind: 'materializationMaintenanceChange',
               update: 'incremental',
               recomputed: false,
-              reason: diff.changes.length === 0
+              reason: maintained.rowChanges.length === 0
                 ? 'dependencies touched; incrementally maintained rows unchanged'
                 : maintained.reason,
               id: stored.metadata.id,
@@ -595,21 +609,18 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
               indexSpecs: stored.metadata.indexSpecs,
               previousRowsAvailable: true,
               previousRows: stored.rows,
-              rows: maintained.rows,
-              addedRows: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
-              removedRows: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
-              rowChanges: diff.changes,
-              diagnostics: diff.diagnostics
+              rows: maintainedRows,
+              addedRows: maintained.addedRows,
+              removedRows: maintained.removedRows,
+              rowChanges: maintained.rowChanges,
+              diagnostics: maintained.diagnostics
             };
             changes.push(change);
-            storeMaterializationIn(nextStore, {
-              metadata: stored.metadata,
-              rows: maintained.rows,
-              incremental: {
-                plan: stored.incremental.plan,
-                state: maintained.state
-              }
-            });
+            storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
+              stored,
+              maintainedRows,
+              nextIncremental
+            ));
             continue;
           }
 
@@ -964,24 +975,176 @@ function materializationEntryFor<Row>(
         relationSnapshots
       );
       if (!built.supported) {
-        return {
-          metadata: metadataWithIncrementalFallback(metadata, built.reason),
-          rows: evaluateTargetRows(target, metadata.query)
-        };
+        return materializationEntryWithRows(
+          metadataWithIncrementalFallback(metadata, built.reason),
+          evaluateTargetRows(target, metadata.query)
+        );
       }
 
-      return {
-        metadata,
-        rows: built.rows,
-        incremental: {
-          plan: built.plan,
-          state: built.state
-        }
-      };
+      return materializationEntryWithRows(metadata, built.rows, {
+        plan: built.plan,
+        state: built.state
+      });
     }
   }
 
-  return { metadata, rows: evaluateTargetRows(target, metadata.query) };
+  return materializationEntryWithRows(metadata, evaluateTargetRows(target, metadata.query));
+}
+
+function materializationEntryWithRows<Row>(
+  metadata: MaterializationMetadata<Row>,
+  rows: readonly Row[],
+  incremental?: IncrementalMaterialization<Row>
+): StoredMaterialization<Row> {
+  return {
+    metadata,
+    rows,
+    rowIndex: materializationRowIndex(rows, materializationDiffOptions(metadata.query)),
+    ...(incremental === undefined ? {} : { incremental })
+  };
+}
+
+function materializationEntryWithIncrementalRows<Row>(
+  stored: StoredMaterialization<Row>,
+  rows: readonly Row[],
+  incremental: IncrementalMaterialization<Row>
+): StoredMaterialization<Row> {
+  return {
+    ...stored,
+    rows,
+    rowIndex: materializationRowIndex(rows, materializationDiffOptions(stored.metadata.query)),
+    incremental
+  };
+}
+
+function rowsForMaintainedIncremental<Row>(
+  stored: StoredMaterialization<Row>,
+  rowBatches: readonly IncrementalRowBatch<Row>[],
+  incremental: IncrementalMaterialization<Row>
+): readonly Row[] {
+  if (incremental.state.aggregate !== undefined) {
+    return rowsFromIncrementalState(incremental.state);
+  }
+
+  if (rowBatches.length === 0) {
+    return stored.rows;
+  }
+
+  return patchMaterializationRows(
+    stored.rows,
+    stored.rowIndex,
+    rowBatches,
+    materializationDiffOptions(stored.metadata.query)
+  ) ?? rowsFromIncrementalState(incremental.state);
+}
+
+function patchMaterializationRows<Row>(
+  rows: readonly Row[],
+  rowIndex: MaterializationRowIndex<Row>,
+  rowBatches: readonly IncrementalRowBatch<Row>[],
+  options: MaterializationRowDiffOptions
+): readonly Row[] | undefined {
+  if (rowIndex.duplicates.size > 0) {
+    return undefined;
+  }
+
+  const operations: Array<{
+    readonly start: number;
+    readonly deleteCount: number;
+    readonly rows: readonly Row[];
+    readonly order: number;
+  }> = [];
+
+  for (const [order, batch] of rowBatches.entries()) {
+    if (batch.beforeRows.length > 0) {
+      const positions = rowPositions(batch.beforeRows, rowIndex, options);
+      if (positions === undefined) {
+        return undefined;
+      }
+      const start = positions[0];
+      if (start === undefined || !positionsAreContiguous(positions)) {
+        return undefined;
+      }
+      operations.push({
+        start,
+        deleteCount: batch.beforeRows.length,
+        rows: batch.afterRows,
+        order
+      });
+      continue;
+    }
+
+    if (batch.afterRows.length === 0) {
+      continue;
+    }
+
+    const start = insertionIndex(rows, rowIndex, batch);
+    if (start === undefined) {
+      return undefined;
+    }
+    operations.push({
+      start,
+      deleteCount: 0,
+      rows: batch.afterRows,
+      order
+    });
+  }
+
+  if (operations.length === 0) {
+    return rows;
+  }
+
+  const patched = [...rows];
+  for (const operation of operations.sort((left, right) => (
+    right.start - left.start || left.order - right.order
+  ))) {
+    patched.splice(operation.start, operation.deleteCount, ...operation.rows);
+  }
+
+  return patched;
+}
+
+function rowPositions<Row>(
+  rows: readonly Row[],
+  rowIndex: MaterializationRowIndex<Row>,
+  options: MaterializationRowDiffOptions
+): readonly number[] | undefined {
+  const positions: number[] = [];
+  for (const row of rows) {
+    let key: string;
+    try {
+      key = materializationRowKey(row, options);
+    } catch {
+      return undefined;
+    }
+    const position = rowIndex.indexByKey.get(key);
+    if (position === undefined) {
+      return undefined;
+    }
+    positions.push(position);
+  }
+  return positions.sort((left, right) => left - right);
+}
+
+function positionsAreContiguous(positions: readonly number[]): boolean {
+  return positions.every((position, index) => index === 0 || position === (positions[index - 1] ?? position) + 1);
+}
+
+function insertionIndex<Row>(
+  rows: readonly Row[],
+  rowIndex: MaterializationRowIndex<Row>,
+  batch: IncrementalRowBatch<Row>
+): number | undefined {
+  if (batch.insertAfterKey !== undefined) {
+    const position = rowIndex.indexByKey.get(batch.insertAfterKey);
+    return position === undefined ? undefined : position + 1;
+  }
+
+  if (batch.insertBeforeKey !== undefined) {
+    return rowIndex.indexByKey.get(batch.insertBeforeKey);
+  }
+
+  return rows.length;
 }
 
 function incrementalRelationSnapshots(
@@ -1546,134 +1709,12 @@ function diffMaterializationRows<Row>(
   after: readonly Row[],
   query: Query<Row>
 ): RowDiff<Row> {
-  const keyFor = materializationRowKeySelector(materializationDiffOptions(query));
-  const beforeIndex = indexMaterializationRows(before, 'before', keyFor);
-  const afterIndex = indexMaterializationRows(after, 'after', keyFor);
-  const changes: RowChange<Row>[] = [];
-
-  for (const row of before) {
-    const key = keyFor(row);
-    if (beforeIndex.duplicates.has(key) || !beforeIndex.rows.has(key)) {
-      continue;
-    }
-
-    const afterRow = afterIndex.rows.get(key);
-    if (afterRow === undefined) {
-      changes.push({ kind: 'removed', key, row });
-    } else if (materializationStableKey(row) !== materializationStableKey(afterRow)) {
-      changes.push({ kind: 'updated', key, before: row, after: afterRow });
-    }
-  }
-
-  for (const row of after) {
-    const key = keyFor(row);
-    if (afterIndex.duplicates.has(key) || !afterIndex.rows.has(key) || beforeIndex.rows.has(key)) {
-      continue;
-    }
-
-    changes.push({ kind: 'added', key, row });
-  }
-
-  return {
-    changes,
-    diagnostics: [...beforeIndex.diagnostics, ...afterIndex.diagnostics]
-  };
+  return diffMaterializationRowsByOptions(before, after, materializationDiffOptions(query));
 }
 
-function materializationDiffOptions<Row>(query: Query<Row>): { readonly keyBy?: readonly string[] } {
+function materializationDiffOptions<Row>(query: Query<Row>): MaterializationRowDiffOptions {
   const keyBy = queryRowKeyFields(query);
   return keyBy === undefined ? {} : { keyBy };
-}
-
-function materializationRowKeySelector<Row>(
-  options: { readonly keyBy?: readonly string[] }
-): (row: Row) => string {
-  if (options.keyBy === undefined) {
-    return (row) => materializationStableKey(row);
-  }
-
-  const fields = options.keyBy;
-  return (row) => materializationStableKey(fields.map((field) => isRecord(row) ? row[field] : undefined));
-}
-
-function indexMaterializationRows<Row>(
-  rows: readonly Row[],
-  side: 'before' | 'after',
-  keyFor: (row: Row) => string
-): {
-  readonly rows: ReadonlyMap<string, Row>;
-  readonly duplicates: ReadonlySet<string>;
-  readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
-} {
-  const indexed = new Map<string, Row>();
-  const duplicates = new Set<string>();
-  const diagnostics: RowDiffDiagnostic<Row>[] = [];
-
-  for (const row of rows) {
-    let key: string;
-    try {
-      key = keyFor(row);
-    } catch (error) {
-      diagnostics.push({
-        code: 'invalid_row',
-        message: 'row key selection failed',
-        side,
-        row,
-        ...(error === undefined ? {} : { key: materializationErrorMessage(error) })
-      });
-      continue;
-    }
-
-    if (indexed.has(key)) {
-      duplicates.add(key);
-      indexed.delete(key);
-      diagnostics.push({
-        code: 'duplicate_key',
-        message: `duplicate ${side} row key`,
-        side,
-        key,
-        row
-      });
-      continue;
-    }
-
-    if (!duplicates.has(key)) {
-      indexed.set(key, row);
-    }
-  }
-
-  return { rows: indexed, duplicates, diagnostics };
-}
-
-function materializationStableKey(value: unknown): string {
-  return stableKey(materializationStableValue(value));
-}
-
-function materializationStableValue(value: unknown): unknown {
-  if (value instanceof Set) {
-    return {
-      $tarstate: 'set',
-      values: Array.from(value, materializationStableValue)
-    };
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(materializationStableValue);
-  }
-
-  if (!isRecord(value)) {
-    return value;
-  }
-
-  return Object.fromEntries(Object.keys(value).sort().map((key) => [
-    key,
-    materializationStableValue(value[key])
-  ]));
-}
-
-function materializationErrorMessage(input: unknown): string {
-  if (input instanceof Error) return input.message;
-  return JSON.stringify(input) ?? 'unknown error';
 }
 
 function maintenanceReasonForMode(mode: MaterializationMode): string {

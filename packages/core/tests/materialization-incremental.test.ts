@@ -102,6 +102,22 @@ type TeamUserFacetRow = {
   readonly tags: ReadonlySet<string>;
 };
 
+type TaskOwnerTeamRow = {
+  readonly id: string;
+  readonly title: string;
+  readonly ownerId: string;
+  readonly owner: string;
+  readonly teamId: string;
+  readonly team: string;
+  readonly points: number;
+};
+
+type LargeCoreData = {
+  readonly teams: readonly TeamRow[];
+  readonly users: readonly UserRow[];
+  readonly tasks: readonly TaskRow[];
+};
+
 const diaUser: UserRow = {
   id: 'dia',
   teamId: 'eng',
@@ -225,6 +241,75 @@ function teamUserFacetsQuery(): Query<TeamUserFacetRow> {
     }),
     keyBy('teamId')
   ) as Query<TeamUserFacetRow>;
+}
+
+function taskOwnerTeamQuery(): Query<TaskOwnerTeamRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const owner = as(coreSchema.users, 'owner');
+  const team = as(coreSchema.teams, 'team');
+  return pipe(
+    from(task),
+    join(from(owner), eq(task.ownerId, owner.id)),
+    join(from(team), eq(owner.teamId, team.id)),
+    project({
+      id: task.id,
+      title: task.title,
+      ownerId: owner.id,
+      owner: owner.name,
+      teamId: team.id,
+      team: team.name,
+      points: task.points
+    }),
+    keyBy('id')
+  ) as Query<TaskOwnerTeamRow>;
+}
+
+function largeCoreData(): LargeCoreData {
+  const teamCount = 32;
+  const userCount = 256;
+  const taskCount = 4096;
+  const teams = Array.from({ length: teamCount }, (_, index): TeamRow => ({
+    id: `team-${index}`,
+    name: `Team ${index}`,
+    rank: 1 + index % 8
+  }));
+  const users = Array.from({ length: userCount }, (_, index): UserRow => ({
+    id: `user-${index}`,
+    teamId: teams[index % teams.length]?.id ?? teams[0]!.id,
+    name: `User ${index}`,
+    active: index % 5 !== 0,
+    age: 20 + index % 40,
+    tags: index % 3 === 0 ? ['runtime', `tag-${index % 7}`] : [`tag-${index % 7}`]
+  }));
+  const tasks = Array.from({ length: taskCount }, (_, index): TaskRow => ({
+    id: `task-${index}`,
+    ownerId: users[(index * 17) % users.length]?.id ?? users[0]!.id,
+    title: `Task ${index}`,
+    done: index % 7 === 0,
+    points: 1 + index % 13
+  }));
+
+  return { teams, users, tasks };
+}
+
+function taskOwnerTeamRow(task: TaskRow, owner: UserRow, team: TeamRow): TaskOwnerTeamRow {
+  return {
+    id: task.id,
+    title: task.title,
+    ownerId: owner.id,
+    owner: owner.name,
+    teamId: team.id,
+    team: team.name,
+    points: task.points
+  };
+}
+
+function requiredRow<Row>(rows: readonly Row[], predicate: (row: Row) => boolean, label: string): Row {
+  const row = rows.find(predicate);
+  if (row === undefined) {
+    throw new Error(`missing test fixture row: ${label}`);
+  }
+  return row;
 }
 
 function usersDelta(added: readonly UserRow[], removed: readonly UserRow[]): RelationDelta<typeof coreSchema.users> {
@@ -669,6 +754,153 @@ describe('incremental materialization', () => {
       expect(materializedRowsForQuery(withoutOriginalActive, teamUserFacets)).toEqual(removedOriginalChange.rows);
     });
 
+    it('reports only affected aggregate groups for insert, update, and delete with set aggregates', () => {
+      const teamUserFacets = teamUserFacetsQuery();
+      const state = mat(createDb(sourceData), teamUserFacets, {
+        id: 'team-user-facets-reporting',
+        mode: 'incremental'
+      });
+      const eliUser: UserRow = {
+        id: 'eli',
+        teamId: 'eng',
+        name: 'Eli',
+        active: false,
+        age: 32,
+        tags: ['ops']
+      };
+      const withEli = createDb({
+        ...sourceData,
+        users: [...sourceData.users, eliUser]
+      });
+
+      const inserted = maintainMaterializations(state, withEli, {
+        deltas: [usersDelta([eliUser], [])]
+      });
+      const insertedChange = singleMaterializationChange(inserted, 'team-user-facets-reporting');
+
+      expect(inserted).toMatchObject({ recomputed: 0 });
+      expect(insertedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback(insertedChange.diagnostics);
+      expect(insertedChange.rowChanges).toHaveLength(1);
+      expect(insertedChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: {
+            teamId: 'eng',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 1,
+            tags: new Set(['compiler', 'runtime'])
+          },
+          after: {
+            teamId: 'eng',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 2,
+            tags: new Set(['compiler', 'runtime', 'ops'])
+          }
+        })
+      ]);
+
+      const movedEli = { ...eliUser, teamId: 'design', active: true };
+      const withMovedEli = createDb({
+        ...sourceData,
+        users: [...sourceData.users, movedEli]
+      });
+      const moved = maintainMaterializations(withEli, withMovedEli, {
+        deltas: [usersDelta([movedEli], [eliUser])]
+      });
+      const movedChange = singleMaterializationChange(moved, 'team-user-facets-reporting');
+
+      expect(moved).toMatchObject({ recomputed: 0 });
+      expect(movedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback(movedChange.diagnostics);
+      expect(movedChange.rowChanges).toHaveLength(2);
+      expect(movedChange.rowChanges).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'updated',
+          before: {
+            teamId: 'eng',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 2,
+            tags: new Set(['compiler', 'runtime', 'ops'])
+          },
+          after: {
+            teamId: 'eng',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 1,
+            tags: new Set(['compiler', 'runtime'])
+          }
+        }),
+        expect.objectContaining({
+          kind: 'updated',
+          before: {
+            teamId: 'design',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 1,
+            tags: new Set(['research'])
+          },
+          after: {
+            teamId: 'design',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 2,
+            tags: new Set(['research', 'ops'])
+          }
+        })
+      ]));
+
+      const withoutMissingGroup = createDb({
+        ...sourceData,
+        users: [adaUser, beaUser, movedEli]
+      });
+      const deleted = maintainMaterializations(withMovedEli, withoutMissingGroup, {
+        deltas: [usersDelta([], [calUser])]
+      });
+      const deletedChange = singleMaterializationChange(deleted, 'team-user-facets-reporting');
+
+      expect(deleted).toMatchObject({ recomputed: 0 });
+      expect(deletedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        addedRows: [],
+        removedRows: [{
+          teamId: 'missing',
+          anyActive: false,
+          noneActive: true,
+          distinctNames: 1,
+          tags: new Set()
+        }]
+      });
+      expectNoIncrementalFallback(deletedChange.diagnostics);
+      expect(deletedChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'removed',
+          row: {
+            teamId: 'missing',
+            anyActive: false,
+            noneActive: true,
+            distinctNames: 1,
+            tags: new Set()
+          }
+        })
+      ]);
+      expect(materializedRowsForQuery(withoutMissingGroup, teamUserFacets)).toEqual(deletedChange.rows);
+    });
+
     it('falls back with an explicit diagnostic for unsupported aggregate shapes', () => {
       const task = as(coreSchema.tasks, 'task');
       const taskProjectRankings = pipe(
@@ -841,6 +1073,29 @@ describe('incremental materialization', () => {
       { id: 'bee', name: 'Bea', age: 29, teamId: 'design' },
       { id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }
     ]);
+    expect(materializedRowsForQuery(next, activeUsers)).toEqual(change.rows);
+  });
+
+  it('reports zero row changes for conservative no-net root deltas', () => {
+    const activeUsers = activeUsersQuery();
+    const state = mat(createDb(sourceData), activeUsers, { id: 'active-users', mode: 'incremental' });
+    const next = createDb(sourceData);
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([adaUser], [adaUser])]
+    });
+    const change = singleMaterializationChange(maintained, 'active-users');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 1, skipped: 0 });
+    expect(change).toMatchObject({
+      update: 'carried',
+      maintenance: 'incremental',
+      recomputed: true,
+      addedRows: [],
+      removedRows: [],
+      rowChanges: []
+    });
+    expectIncrementalFallback(change.diagnostics);
     expect(materializedRowsForQuery(next, activeUsers)).toEqual(change.rows);
   });
 
@@ -1166,6 +1421,112 @@ describe('incremental materialization', () => {
       expect.objectContaining({ kind: 'updated' })
     ]));
     expect(materializedRowsForQuery(next, activeUserTeams)).toEqual(change.rows);
+  });
+
+  it('reports a single row change for large two-join root inserts', () => {
+    const data = largeCoreData();
+    const taskOwnerTeams = taskOwnerTeamQuery();
+    const state = mat(createDb(data), taskOwnerTeams, {
+      id: 'large-task-owner-teams',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, taskOwnerTeams);
+    const owner = data.users[13]!;
+    const team = requiredRow(data.teams, (row) => row.id === owner.teamId, owner.teamId);
+    const extraTask: TaskRow = {
+      id: 'task-extra-root-insert',
+      ownerId: owner.id,
+      title: 'Inserted task',
+      done: false,
+      points: 9
+    };
+    const next = createDb({
+      ...data,
+      tasks: [...data.tasks, extraTask]
+    });
+    const expected = taskOwnerTeamRow(extraTask, owner, team);
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [tasksDelta([extraTask], [])]
+    });
+    const change = singleMaterializationChange(maintained, 'large-task-owner-teams') as
+      MaterializationMaintenanceResult<TaskOwnerTeamRow>['changes'][number];
+
+    expect(metadata).toMatchObject({
+      id: 'large-task-owner-teams',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users', 'teams']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expectNoIncrementalFallback(maintained.diagnostics);
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['tasks'],
+      addedRows: [expected],
+      removedRows: []
+    });
+    expectNoIncrementalFallback(change.diagnostics);
+    expect(change.rowChanges).toHaveLength(1);
+    expect(change.rowChanges).toEqual([
+      expect.objectContaining({
+        kind: 'added',
+        row: expected
+      })
+    ]);
+    expect(change.rows).toHaveLength(data.tasks.length + 1);
+    expect(materializedRowsForQuery(next, taskOwnerTeams)).toEqual(change.rows);
+  });
+
+  it('reports only affected rows for large two-join right-side owner updates', () => {
+    const data = largeCoreData();
+    const taskOwnerTeams = taskOwnerTeamQuery();
+    const owner = data.users[37]!;
+    const updatedOwner = { ...owner, name: 'Updated Owner' };
+    const team = requiredRow(data.teams, (row) => row.id === owner.teamId, owner.teamId);
+    const ownerTasks = data.tasks.filter((task) => task.ownerId === owner.id);
+    const state = mat(createDb(data), taskOwnerTeams, {
+      id: 'large-task-owner-teams',
+      mode: 'incremental'
+    });
+    const next = createDb({
+      ...data,
+      users: data.users.map((user) => user.id === owner.id ? updatedOwner : user)
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([updatedOwner], [owner])]
+    });
+    const change = singleMaterializationChange(maintained, 'large-task-owner-teams') as
+      MaterializationMaintenanceResult<TaskOwnerTeamRow>['changes'][number];
+
+    expect(ownerTasks.length).toBeGreaterThan(1);
+    expect(ownerTasks.length).toBeLessThan(data.tasks.length);
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expectNoIncrementalFallback(maintained.diagnostics);
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      addedRows: [],
+      removedRows: []
+    });
+    expectNoIncrementalFallback(change.diagnostics);
+    expect(change.rowChanges).toHaveLength(ownerTasks.length);
+    expect(change.rowChanges.length).toBeLessThan(change.rows.length);
+    expect(change.rowChanges).toEqual(expect.arrayContaining(
+      ownerTasks.slice(0, 3).map((task) => expect.objectContaining({
+        kind: 'updated',
+        before: taskOwnerTeamRow(task, owner, team),
+        after: taskOwnerTeamRow(task, updatedOwner, team)
+      }))
+    ));
+    expect(new Set(change.rowChanges.flatMap((rowChange) => (
+      rowChange.kind === 'updated' ? [rowChange.after.id] : []
+    )))).toEqual(new Set(ownerTasks.map((task) => task.id)));
+    expect(materializedRowsForQuery(next, taskOwnerTeams)).toEqual(change.rows);
   });
 
   it('incrementally maintains inner joins with residual and(eq(...), gt(...)) predicates', () => {

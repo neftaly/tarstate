@@ -34,6 +34,7 @@ scales:
 - Materialized `qRows` reads and materialized transaction maintenance.
 - Requested incremental materialization maintenance for simple, joined, and aggregate deltas, including root inserts, updates, and deletes.
 - Larger materialized joined-query maintenance.
+- Large `trackTransact` reporting for requested incremental joined-query deltas.
 - Materialization set/hash/btree/unique index facades.
 - Watch refresh, `trackTransact`, and `diffQuery`.
 

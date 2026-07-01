@@ -1,7 +1,13 @@
 import type { RelationDelta } from './adapter.js';
+import type { RowChange, RowDiffDiagnostic } from './diff.js';
 import { rowKey } from './evaluate.js';
 import { stableKey } from './identity.js';
 import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
+import {
+  diffMaterializationRows,
+  materializationRowKey,
+  type MaterializationRowDiffOptions
+} from './materialization-row-changes.js';
 import type {
   AggregateFunction,
   ExprData,
@@ -10,6 +16,7 @@ import type {
   Query,
   QueryData
 } from './query.js';
+import { queryRowKeyFields } from './query.js';
 import type { RelationRef } from './schema.js';
 
 export type IncrementalMaterializationPlan = {
@@ -18,12 +25,14 @@ export type IncrementalMaterializationPlan = {
   readonly rootAlias: string;
   readonly root: IncrementalRoot;
   readonly steps: readonly IncrementalStep[];
+  readonly rowKeyFields?: readonly string[];
 };
 
 export type IncrementalMaterializationState<Row = unknown> = {
   readonly kind: 'incrementalMaterializationState';
   readonly rootRelation: string;
   readonly rootKeys: readonly string[];
+  readonly rootIndexByKey: ReadonlyMap<string, number>;
   readonly rootRowsByRootKey: ReadonlyMap<string, unknown>;
   readonly outputsByRootKey: ReadonlyMap<string, readonly unknown[]>;
   readonly joinStates: readonly IncrementalJoinState[];
@@ -64,8 +73,14 @@ export type IncrementalMaintenanceResult<Row = unknown> =
   | {
       readonly updated: true;
       readonly reason: string;
-      readonly rows: readonly Row[];
       readonly state: IncrementalMaterializationState<Row>;
+      readonly rowChanges: readonly RowChange<Row>[];
+      readonly addedRows: readonly Row[];
+      readonly removedRows: readonly Row[];
+      readonly rowBatches: readonly IncrementalRowBatch<Row>[];
+      readonly changedRootKeys: readonly string[];
+      readonly changedGroupKeys: readonly string[];
+      readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
     }
   | {
       readonly updated: false;
@@ -112,6 +127,7 @@ type IncrementalJoinState = {
   readonly id: string;
   readonly relation: string;
   readonly relationKeys: readonly string[];
+  readonly relationIndexByKey: ReadonlyMap<string, number>;
   readonly rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>;
   readonly indexByValue: ReadonlyMap<string, readonly IndexedRightRow[]>;
   readonly rootValuesByKey: ReadonlyMap<string, readonly unknown[]>;
@@ -121,6 +137,7 @@ type IncrementalJoinState = {
 type IncrementalAggregateState<Row = unknown> = {
   readonly groupKeys: readonly string[];
   readonly groupKeysByRootKey: ReadonlyMap<string, readonly string[]>;
+  readonly rootKeysByGroupKey: ReadonlyMap<string, readonly string[]>;
   readonly groupsByKey: ReadonlyMap<string, IncrementalAggregateGroupState<Row>>;
 };
 
@@ -179,6 +196,13 @@ type RootJoinValue = {
   readonly value: unknown;
 };
 
+export type IncrementalRowBatch<Row = unknown> = {
+  readonly beforeRows: readonly Row[];
+  readonly afterRows: readonly Row[];
+  readonly insertAfterKey?: string;
+  readonly insertBeforeKey?: string;
+};
+
 type RootEvaluation<Row> =
   | {
       readonly supported: true;
@@ -189,6 +213,21 @@ type RootEvaluation<Row> =
       readonly supported: false;
       readonly reason: string;
     };
+
+type IncrementalRowReport<Row> = {
+  readonly rowChanges: readonly RowChange<Row>[];
+  readonly addedRows: readonly Row[];
+  readonly removedRows: readonly Row[];
+  readonly rowBatches: readonly IncrementalRowBatch<Row>[];
+  readonly changedRootKeys: readonly string[];
+  readonly changedGroupKeys: readonly string[];
+  readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
+};
+
+type MutableRootJoinIndex = {
+  readonly valuesByRootKey: Map<string, readonly unknown[]>;
+  readonly rootKeysByValue: Map<string, RootJoinValue[]>;
+};
 
 type JoinStateBuildResult =
   | {
@@ -254,7 +293,8 @@ export function planIncrementalMaterialization(query: Query): IncrementalPlanRes
       rootRelation: root.relation,
       rootAlias: root.alias,
       root: root.root,
-      steps
+      steps,
+      ...optionalRowKeyFields(queryRowKeyFields(query))
     },
     reason: 'incremental maintenance for supported single-root relation pipeline'
   };
@@ -327,6 +367,7 @@ export function buildIncrementalMaterialization<Row>(
     kind: 'incrementalMaterializationState',
     rootRelation: plan.rootRelation,
     rootKeys,
+    rootIndexByKey: indexKeys(rootKeys),
     rootRowsByRootKey,
     outputsByRootKey,
     joinStates,
@@ -410,13 +451,19 @@ export function maintainIncrementalMaterialization<Row>(
   }
 
   const rootKeys: (string | undefined)[] = [...materialization.state.rootKeys];
+  const rootIndexByKey = new Map(rootIndexByKeyForState(materialization.state));
+  const vacantRootIndices: number[] = [];
   const rootRowsByRootKey = new Map(materialization.state.rootRowsByRootKey);
   const outputsByRootKey = new Map(materialization.state.outputsByRootKey);
   const rootKeysToEvaluate = new Set<string>();
+  const changedRootKeys = new Set<string>();
   const affectedAggregateGroupKeys = new Set<string>();
   const groupKeysByRootKey = previousAggregateState === undefined
     ? undefined
     : new Map(previousAggregateState.groupKeysByRootKey);
+  const rootKeysByGroupKey = previousAggregateState === undefined
+    ? undefined
+    : mutableRootKeysByGroupKey(previousAggregateState);
   let joinStates = materialization.state.joinStates;
 
   for (const joinStep of joinSteps(materialization.plan)) {
@@ -465,12 +512,15 @@ export function maintainIncrementalMaterialization<Row>(
 
     for (const rootKey of changed.affectedRootKeys) {
       rootKeysToEvaluate.add(rootKey);
+      changedRootKeys.add(rootKey);
     }
     joinStates = joinStates.map((state) => state.id === changed.state.id ? changed.state : state);
   }
 
+  const rootJoinIndexes = mutableRootJoinIndexes(joinStates);
+
   for (const change of rootChanges) {
-    const index = rootKeys.indexOf(change.key);
+    const index = rootIndexByKey.get(change.key) ?? -1;
 
     if (change.after === undefined) {
       if (index === -1) {
@@ -479,12 +529,18 @@ export function maintainIncrementalMaterialization<Row>(
           reason: `root relation delta removed missing key ${change.key}; snapshot recompute is required`
         };
       }
-      recordAggregateGroupKeys(affectedAggregateGroupKeys, groupKeysByRootKey?.get(change.key));
+      const previousGroupKeys = groupKeysByRootKey?.get(change.key);
+      recordAggregateGroupKeys(affectedAggregateGroupKeys, previousGroupKeys);
+      removeRootFromAggregateGroups(rootKeysByGroupKey, change.key, previousGroupKeys);
       groupKeysByRootKey?.delete(change.key);
+      removeRootJoinValues(rootJoinIndexes, change.key);
       rootKeys[index] = undefined;
+      rootIndexByKey.delete(change.key);
+      vacantRootIndices.push(index);
       rootRowsByRootKey.delete(change.key);
       outputsByRootKey.delete(change.key);
       rootKeysToEvaluate.delete(change.key);
+      changedRootKeys.add(change.key);
       continue;
     }
 
@@ -496,11 +552,13 @@ export function maintainIncrementalMaterialization<Row>(
         };
       }
 
-      const vacantIndex = rootKeys.indexOf(undefined);
-      if (vacantIndex === -1) {
+      const vacantIndex = vacantRootIndices.shift();
+      if (vacantIndex === undefined) {
+        rootIndexByKey.set(change.key, rootKeys.length);
         rootKeys.push(change.key);
       } else {
         rootKeys[vacantIndex] = change.key;
+        rootIndexByKey.set(change.key, vacantIndex);
       }
     } else if (change.before === undefined) {
       return {
@@ -510,9 +568,11 @@ export function maintainIncrementalMaterialization<Row>(
     }
     rootRowsByRootKey.set(change.key, change.after);
     rootKeysToEvaluate.add(change.key);
+    changedRootKeys.add(change.key);
   }
 
   const compactRootKeys = rootKeys.filter((key): key is string => key !== undefined);
+  const compactRootIndexByKey = indexKeys(compactRootKeys);
   const duplicateResultReason = duplicateRootKeysReason(compactRootKeys, relation.name);
   if (duplicateResultReason !== undefined) {
     return {
@@ -522,10 +582,6 @@ export function maintainIncrementalMaterialization<Row>(
   }
 
   const joinStateById = joinStateMap(joinStates);
-  const rootValuesByStep = new Map(joinStates.map((state) => [
-    state.id,
-    new Map(state.rootValuesByKey)
-  ]));
 
   for (const rootKey of rootKeysToEvaluate) {
     if (!rootRowsByRootKey.has(rootKey)) {
@@ -533,11 +589,11 @@ export function maintainIncrementalMaterialization<Row>(
     }
 
     const row = rootRowsByRootKey.get(rootKey);
-    recordAggregateGroupKeys(affectedAggregateGroupKeys, groupKeysByRootKey?.get(rootKey));
+    const previousGroupKeys = groupKeysByRootKey?.get(rootKey);
+    recordAggregateGroupKeys(affectedAggregateGroupKeys, previousGroupKeys);
+    removeRootFromAggregateGroups(rootKeysByGroupKey, rootKey, previousGroupKeys);
     groupKeysByRootKey?.delete(rootKey);
-    for (const valuesByRootKey of rootValuesByStep.values()) {
-      valuesByRootKey.delete(rootKey);
-    }
+    removeRootJoinValues(rootJoinIndexes, rootKey);
 
     const evaluated = evaluateRootRow<unknown>(materialization.plan, row, env, joinStateById);
     if (!evaluated.supported) {
@@ -554,21 +610,13 @@ export function maintainIncrementalMaterialization<Row>(
       if (nextGroupKeys.length > 0) {
         groupKeysByRootKey.set(rootKey, nextGroupKeys);
       }
+      addRootToAggregateGroups(rootKeysByGroupKey, rootKey, nextGroupKeys, compactRootIndexByKey);
     }
-    recordRootJoinValues(rootValuesByStep, rootKey, evaluated.joinValuesByStep);
-  }
-
-  for (const rootKey of materialization.state.rootKeys) {
-    if (!rootRowsByRootKey.has(rootKey)) {
-      for (const valuesByRootKey of rootValuesByStep.values()) {
-        valuesByRootKey.delete(rootKey);
-      }
-      groupKeysByRootKey?.delete(rootKey);
-    }
+    addRootJoinValues(rootJoinIndexes, rootKey, evaluated.joinValuesByStep);
   }
 
   const nextJoinStates = joinStates.map((state) =>
-    withRootJoinValues(state, rootValuesByStep.get(state.id) ?? new Map())
+    withRootJoinIndex(state, rootJoinIndexes.get(state.id))
   );
   const nextAggregateState = aggregate === undefined
     ? undefined
@@ -576,8 +624,10 @@ export function maintainIncrementalMaterialization<Row>(
       materialization.plan,
       previousAggregateState as IncrementalAggregateState<Row>,
       compactRootKeys,
+      compactRootIndexByKey,
       outputsByRootKey,
       groupKeysByRootKey ?? new Map(),
+      rootKeysByGroupKey ?? new Map(),
       affectedAggregateGroupKeys,
       env
     );
@@ -592,6 +642,7 @@ export function maintainIncrementalMaterialization<Row>(
     kind: 'incrementalMaterializationState',
     rootRelation: materialization.state.rootRelation,
     rootKeys: compactRootKeys,
+    rootIndexByKey: compactRootIndexByKey,
     rootRowsByRootKey,
     outputsByRootKey,
     joinStates: nextJoinStates,
@@ -602,16 +653,36 @@ export function maintainIncrementalMaterialization<Row>(
     return {
       updated: true,
       reason: 'root relation deltas had no net row changes',
-      rows: rowsFromIncrementalState(materialization.state),
-      state: materialization.state
+      state: materialization.state,
+      rowChanges: [],
+      addedRows: [],
+      removedRows: [],
+      rowBatches: [],
+      changedRootKeys: [],
+      changedGroupKeys: [],
+      diagnostics: []
     };
   }
+
+  const rowReport = incrementalRowReport<Row>(
+    materialization.plan,
+    materialization.state,
+    state,
+    changedRootKeys,
+    affectedAggregateGroupKeys
+  );
 
   return {
     updated: true,
     reason: 'dependencies touched; incrementally maintained rows',
-    rows: rowsFromIncrementalState(state),
-    state
+    state,
+    rowChanges: rowReport.rowChanges,
+    addedRows: rowReport.addedRows,
+    removedRows: rowReport.removedRows,
+    rowBatches: rowReport.rowBatches,
+    changedRootKeys: rowReport.changedRootKeys,
+    changedGroupKeys: rowReport.changedGroupKeys,
+    diagnostics: rowReport.diagnostics
   };
 }
 
@@ -952,6 +1023,194 @@ function recordAggregateGroupKeys(target: Set<string>, keys: readonly string[] |
   }
 }
 
+function incrementalRowReport<Row>(
+  plan: IncrementalMaterializationPlan,
+  previous: IncrementalMaterializationState<Row>,
+  next: IncrementalMaterializationState<Row>,
+  changedRootKeys: ReadonlySet<string>,
+  changedGroupKeys: ReadonlySet<string>
+): IncrementalRowReport<Row> {
+  if (next.aggregate !== undefined || previous.aggregate !== undefined) {
+    return aggregateRowReport(plan, previous.aggregate, next.aggregate, changedGroupKeys);
+  }
+
+  return rootRowReport(plan, previous, next, changedRootKeys);
+}
+
+function rootRowReport<Row>(
+  plan: IncrementalMaterializationPlan,
+  previous: IncrementalMaterializationState<Row>,
+  next: IncrementalMaterializationState<Row>,
+  changedRootKeys: ReadonlySet<string>
+): IncrementalRowReport<Row> {
+  const options = rowDiffOptionsForPlan(plan);
+  const changedKeys = orderedChangedKeys(previous.rootKeys, next.rootKeys, changedRootKeys);
+  const beforeRows = previous.rootKeys
+    .filter((rootKey) => changedRootKeys.has(rootKey))
+    .flatMap((rootKey) => previous.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
+  const afterRows = next.rootKeys
+    .filter((rootKey) => changedRootKeys.has(rootKey))
+    .flatMap((rootKey) => next.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
+  const diff = diffMaterializationRows(beforeRows, afterRows, options);
+
+  return {
+    rowChanges: diff.changes,
+    addedRows: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
+    removedRows: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
+    rowBatches: changedKeys.map((rootKey) => {
+      const before = (previous.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
+      const after = (next.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
+      return {
+        beforeRows: before,
+        afterRows: after,
+        ...insertAnchorsForRoot(next, rootKey, after, options)
+      };
+    }).filter((batch) => batch.beforeRows.length > 0 || batch.afterRows.length > 0),
+    changedRootKeys: changedKeys,
+    changedGroupKeys: [],
+    diagnostics: diff.diagnostics
+  };
+}
+
+function aggregateRowReport<Row>(
+  plan: IncrementalMaterializationPlan,
+  previous: IncrementalAggregateState<Row> | undefined,
+  next: IncrementalAggregateState<Row> | undefined,
+  changedGroupKeys: ReadonlySet<string>
+): IncrementalRowReport<Row> {
+  const options = rowDiffOptionsForPlan(plan);
+  const previousGroupKeys = previous?.groupKeys ?? [];
+  const nextGroupKeys = next?.groupKeys ?? [];
+  const changedKeys = orderedChangedKeys(previousGroupKeys, nextGroupKeys, changedGroupKeys);
+  const beforeRows = previousGroupKeys
+    .filter((groupKey) => changedGroupKeys.has(groupKey))
+    .flatMap((groupKey) => {
+      const group = previous?.groupsByKey.get(groupKey);
+      return group === undefined ? [] : [group.output];
+    });
+  const afterRows = nextGroupKeys
+    .filter((groupKey) => changedGroupKeys.has(groupKey))
+    .flatMap((groupKey) => {
+      const group = next?.groupsByKey.get(groupKey);
+      return group === undefined ? [] : [group.output];
+    });
+  const diff = diffMaterializationRows(beforeRows, afterRows, options);
+
+  return {
+    rowChanges: diff.changes,
+    addedRows: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
+    removedRows: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
+    rowBatches: changedKeys.map((groupKey) => {
+      const beforeGroup = previous?.groupsByKey.get(groupKey);
+      const afterGroup = next?.groupsByKey.get(groupKey);
+      const before = beforeGroup === undefined ? [] : [beforeGroup.output];
+      const after = afterGroup === undefined ? [] : [afterGroup.output];
+      return {
+        beforeRows: before,
+        afterRows: after,
+        ...insertAnchorsForAggregate(next, groupKey, after, options)
+      };
+    }).filter((batch) => batch.beforeRows.length > 0 || batch.afterRows.length > 0),
+    changedRootKeys: [],
+    changedGroupKeys: changedKeys,
+    diagnostics: diff.diagnostics
+  };
+}
+
+function orderedChangedKeys(
+  previousKeys: readonly string[],
+  nextKeys: readonly string[],
+  changedKeys: ReadonlySet<string>
+): readonly string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const key of previousKeys) {
+    if (changedKeys.has(key) && !seen.has(key)) {
+      seen.add(key);
+      ordered.push(key);
+    }
+  }
+  for (const key of nextKeys) {
+    if (changedKeys.has(key) && !seen.has(key)) {
+      seen.add(key);
+      ordered.push(key);
+    }
+  }
+  return ordered;
+}
+
+function insertAnchorsForRoot<Row>(
+  state: IncrementalMaterializationState<Row>,
+  rootKey: string,
+  rows: readonly Row[],
+  options: MaterializationRowDiffOptions
+): Pick<IncrementalRowBatch<Row>, 'insertAfterKey' | 'insertBeforeKey'> {
+  if (rows.length === 0) {
+    return {};
+  }
+
+  const rootIndex = rootIndexByKeyForState(state).get(rootKey);
+  if (rootIndex === undefined) {
+    return {};
+  }
+
+  for (let index = rootIndex - 1; index >= 0; index -= 1) {
+    const previousRootKey = state.rootKeys[index];
+    const previousRows = previousRootKey === undefined
+      ? []
+      : state.outputsByRootKey.get(previousRootKey) ?? [];
+    const row = previousRows.at(-1) as Row | undefined;
+    if (row !== undefined) {
+      return { insertAfterKey: materializationRowKey(row, options) };
+    }
+  }
+
+  for (let index = rootIndex + 1; index < state.rootKeys.length; index += 1) {
+    const nextRootKey = state.rootKeys[index];
+    const nextRows = nextRootKey === undefined
+      ? []
+      : state.outputsByRootKey.get(nextRootKey) ?? [];
+    const row = nextRows[0] as Row | undefined;
+    if (row !== undefined) {
+      return { insertBeforeKey: materializationRowKey(row, options) };
+    }
+  }
+
+  return {};
+}
+
+function insertAnchorsForAggregate<Row>(
+  aggregate: IncrementalAggregateState<Row> | undefined,
+  groupKey: string,
+  rows: readonly Row[],
+  options: MaterializationRowDiffOptions
+): Pick<IncrementalRowBatch<Row>, 'insertAfterKey' | 'insertBeforeKey'> {
+  if (aggregate === undefined || rows.length === 0) {
+    return {};
+  }
+
+  const groupIndex = aggregate.groupKeys.indexOf(groupKey);
+  if (groupIndex === -1) {
+    return {};
+  }
+
+  for (let index = groupIndex - 1; index >= 0; index -= 1) {
+    const group = aggregate.groupsByKey.get(aggregate.groupKeys[index] ?? '');
+    if (group !== undefined) {
+      return { insertAfterKey: materializationRowKey(group.output, options) };
+    }
+  }
+
+  for (let index = groupIndex + 1; index < aggregate.groupKeys.length; index += 1) {
+    const group = aggregate.groupsByKey.get(aggregate.groupKeys[index] ?? '');
+    if (group !== undefined) {
+      return { insertBeforeKey: materializationRowKey(group.output, options) };
+    }
+  }
+
+  return {};
+}
+
 function evaluateRootRow<Row>(
   plan: IncrementalMaterializationPlan,
   relationRow: unknown,
@@ -1109,7 +1368,7 @@ function renameRow(row: Record<string, unknown>, fields: Record<string, string>)
   return output;
 }
 
-function rowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {
+export function rowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {
   if (state.aggregate !== undefined) {
     return state.aggregate.groupKeys.flatMap((key) => {
       const group = state.aggregate?.groupsByKey.get(key);
@@ -1142,10 +1401,17 @@ function buildAggregateState<Row>(
     }
   }
 
-  const groupKeys = aggregateGroupOrder(aggregate, rootKeys, groupKeysByRootKey);
+  const rootKeysByGroupKey = buildRootKeysByGroupKey(rootKeys, groupKeysByRootKey);
+  const groupKeys = aggregateGroupOrder(aggregate, indexKeys(rootKeys), rootKeysByGroupKey);
   const groupsByKey = new Map<string, IncrementalAggregateGroupState<Row>>();
   for (const groupKey of groupKeys) {
-    const group = recomputeAggregateGroup<Row>(plan, groupKey, rootKeys, outputsByRootKey, env);
+    const group = recomputeAggregateGroup<Row>(
+      plan,
+      groupKey,
+      rootKeysByGroupKey.get(groupKey) ?? [],
+      outputsByRootKey,
+      env
+    );
     if (!group.supported) {
       return group;
     }
@@ -1159,6 +1425,7 @@ function buildAggregateState<Row>(
     state: {
       groupKeys,
       groupKeysByRootKey,
+      rootKeysByGroupKey,
       groupsByKey
     }
   };
@@ -1168,8 +1435,10 @@ function maintainAggregateState<Row>(
   plan: IncrementalMaterializationPlan,
   previous: IncrementalAggregateState<Row>,
   rootKeys: readonly string[],
+  rootIndexByKey: ReadonlyMap<string, number>,
   outputsByRootKey: ReadonlyMap<string, readonly unknown[]>,
   groupKeysByRootKey: ReadonlyMap<string, readonly string[]>,
+  rootKeysByGroupKey: ReadonlyMap<string, readonly string[]>,
   affectedGroupKeys: ReadonlySet<string>,
   env: Readonly<Record<string, unknown>>
 ): AggregateStateResult<Row> {
@@ -1181,10 +1450,16 @@ function maintainAggregateState<Row>(
     };
   }
 
-  const groupKeys = aggregateGroupOrder(aggregate, rootKeys, groupKeysByRootKey);
+  const groupKeys = aggregateGroupOrder(aggregate, rootIndexByKey, rootKeysByGroupKey);
   const groupsByKey = new Map(previous.groupsByKey);
   for (const groupKey of affectedGroupKeys) {
-    const group = recomputeAggregateGroup<Row>(plan, groupKey, rootKeys, outputsByRootKey, env);
+    const group = recomputeAggregateGroup<Row>(
+      plan,
+      groupKey,
+      rootKeysByGroupKey.get(groupKey) ?? [],
+      outputsByRootKey,
+      env
+    );
     if (!group.supported) {
       return group;
     }
@@ -1219,6 +1494,7 @@ function maintainAggregateState<Row>(
     state: {
       groupKeys,
       groupKeysByRootKey,
+      rootKeysByGroupKey,
       groupsByKey
     }
   };
@@ -1302,27 +1578,103 @@ function aggregateGroupKeysForRows(
 
 function aggregateGroupOrder(
   aggregate: IncrementalAggregateStep,
-  rootKeys: readonly string[],
-  groupKeysByRootKey: ReadonlyMap<string, readonly string[]>
+  rootIndexByKey: ReadonlyMap<string, number>,
+  rootKeysByGroupKey: ReadonlyMap<string, readonly string[]>
 ): readonly string[] {
-  const seen = new Set<string>();
-  const groupKeys: string[] = [];
-
-  for (const rootKey of rootKeys) {
-    for (const groupKey of groupKeysByRootKey.get(rootKey) ?? []) {
-      if (seen.has(groupKey)) {
-        continue;
-      }
-      seen.add(groupKey);
-      groupKeys.push(groupKey);
-    }
-  }
+  const groupKeys = Array.from(rootKeysByGroupKey.entries())
+    .filter(([, rootKeys]) => rootKeys.length > 0)
+    .sort((left, right) => (
+      (rootIndexByKey.get(left[1][0] ?? '') ?? Number.MAX_SAFE_INTEGER) -
+      (rootIndexByKey.get(right[1][0] ?? '') ?? Number.MAX_SAFE_INTEGER)
+    ))
+    .map(([groupKey]) => groupKey);
 
   if (groupKeys.length === 0 && isUngroupedAggregate(aggregate)) {
     groupKeys.push(emptyGroupKey());
   }
 
   return groupKeys;
+}
+
+function buildRootKeysByGroupKey(
+  rootKeys: readonly string[],
+  groupKeysByRootKey: ReadonlyMap<string, readonly string[]>
+): ReadonlyMap<string, readonly string[]> {
+  const rootKeysByGroupKey = new Map<string, string[]>();
+  for (const rootKey of rootKeys) {
+    for (const groupKey of groupKeysByRootKey.get(rootKey) ?? []) {
+      const rootKeysForGroup = rootKeysByGroupKey.get(groupKey);
+      if (rootKeysForGroup === undefined) {
+        rootKeysByGroupKey.set(groupKey, [rootKey]);
+      } else {
+        rootKeysForGroup.push(rootKey);
+      }
+    }
+  }
+  return rootKeysByGroupKey;
+}
+
+function mutableRootKeysByGroupKey<Row>(
+  state: IncrementalAggregateState<Row>
+): Map<string, readonly string[]> {
+  const source = state.rootKeysByGroupKey ?? buildRootKeysByGroupKey(
+    Array.from(state.groupKeysByRootKey.keys()),
+    state.groupKeysByRootKey
+  );
+  return new Map(Array.from(source, ([groupKey, rootKeys]) => [groupKey, [...rootKeys]]));
+}
+
+function removeRootFromAggregateGroups(
+  rootKeysByGroupKey: Map<string, readonly string[]> | undefined,
+  rootKey: string,
+  groupKeys: readonly string[] | undefined
+): void {
+  if (rootKeysByGroupKey === undefined) {
+    return;
+  }
+
+  for (const groupKey of groupKeys ?? []) {
+    const rootKeys = rootKeysByGroupKey.get(groupKey);
+    if (rootKeys === undefined) {
+      continue;
+    }
+
+    const nextRootKeys = rootKeys.filter((candidate) => candidate !== rootKey);
+    if (nextRootKeys.length === 0) {
+      rootKeysByGroupKey.delete(groupKey);
+    } else {
+      rootKeysByGroupKey.set(groupKey, nextRootKeys);
+    }
+  }
+}
+
+function addRootToAggregateGroups(
+  rootKeysByGroupKey: Map<string, readonly string[]> | undefined,
+  rootKey: string,
+  groupKeys: readonly string[],
+  rootIndexByKey: ReadonlyMap<string, number>
+): void {
+  if (rootKeysByGroupKey === undefined) {
+    return;
+  }
+
+  const rootIndex = rootIndexByKey.get(rootKey) ?? Number.MAX_SAFE_INTEGER;
+  for (const groupKey of groupKeys) {
+    const rootKeys = [...(rootKeysByGroupKey.get(groupKey) ?? [])];
+    if (rootKeys.includes(rootKey)) {
+      continue;
+    }
+
+    const insertIndex = rootKeys.findIndex((candidate) => (
+      (rootIndexByKey.get(candidate) ?? Number.MAX_SAFE_INTEGER) > rootIndex
+    ));
+    if (insertIndex === -1) {
+      rootKeys.push(rootKey);
+    } else {
+      rootKeys.splice(insertIndex, 0, rootKey);
+    }
+    rootKeysByGroupKey.set(groupKey, rootKeys);
+  }
 }
 
 function isUngroupedAggregate(aggregate: IncrementalAggregateStep): boolean {
@@ -1485,6 +1837,7 @@ function buildJoinStates(
       id: step.id,
       relation: step.right.relation,
       relationKeys,
+      relationIndexByKey: indexKeys(relationKeys),
       rowsByRelationKey,
       indexByValue: buildRightIndex(step, relationKeys, rowsByRelationKey, env),
       rootValuesByKey: new Map(),
@@ -1565,6 +1918,91 @@ function buildRootKeysByValue(
   return index;
 }
 
+function mutableRootJoinIndexes(
+  states: readonly IncrementalJoinState[]
+): ReadonlyMap<string, MutableRootJoinIndex> {
+  return new Map(states.map((state) => [
+    state.id,
+    {
+      valuesByRootKey: new Map(state.rootValuesByKey),
+      rootKeysByValue: mutableRootKeysByValue(state.rootKeysByValue)
+    }
+  ]));
+}
+
+function mutableRootKeysByValue(
+  index: ReadonlyMap<string, readonly RootJoinValue[]>
+): Map<string, RootJoinValue[]> {
+  return new Map(Array.from(index, ([key, values]) => [key, [...values]]));
+}
+
+function removeRootJoinValues(
+  indexes: ReadonlyMap<string, MutableRootJoinIndex>,
+  rootKey: string
+): void {
+  for (const index of indexes.values()) {
+    const values = index.valuesByRootKey.get(rootKey);
+    if (values === undefined) {
+      continue;
+    }
+
+    for (const value of values) {
+      const key = stableKey(value);
+      const entries = index.rootKeysByValue.get(key);
+      if (entries === undefined) {
+        continue;
+      }
+      const nextEntries = entries.filter((entry) => (
+        entry.rootKey !== rootKey || !Object.is(entry.value, value)
+      ));
+      if (nextEntries.length === 0) {
+        index.rootKeysByValue.delete(key);
+      } else {
+        index.rootKeysByValue.set(key, nextEntries);
+      }
+    }
+    index.valuesByRootKey.delete(rootKey);
+  }
+}
+
+function addRootJoinValues(
+  indexes: ReadonlyMap<string, MutableRootJoinIndex>,
+  rootKey: string,
+  valuesByStep: ReadonlyMap<string, readonly unknown[]>
+): void {
+  for (const [stepId, values] of valuesByStep) {
+    const index = indexes.get(stepId);
+    if (index === undefined) {
+      continue;
+    }
+    index.valuesByRootKey.set(rootKey, values);
+    for (const value of values) {
+      const key = stableKey(value);
+      const entries = index.rootKeysByValue.get(key);
+      if (entries === undefined) {
+        index.rootKeysByValue.set(key, [{ rootKey, value }]);
+      } else {
+        entries.push({ rootKey, value });
+      }
+    }
+  }
+}
+
+function withRootJoinIndex(
+  state: IncrementalJoinState,
+  index: MutableRootJoinIndex | undefined
+): IncrementalJoinState {
+  if (index === undefined) {
+    return state;
+  }
+
+  return {
+    ...state,
+    rootValuesByKey: index.valuesByRootKey,
+    rootKeysByValue: index.rootKeysByValue
+  };
+}
+
 function applyRightRelationChanges(
   step: IncrementalJoinStep,
   state: IncrementalJoinState,
@@ -1573,11 +2011,14 @@ function applyRightRelationChanges(
   env: Readonly<Record<string, unknown>>
 ): RightChangeResult {
   const relationKeys: (string | undefined)[] = [...state.relationKeys];
+  const relationIndexByKey = new Map(relationIndexByKeyForState(state));
+  const vacantRelationIndices: number[] = [];
   const rowsByRelationKey = new Map(state.rowsByRelationKey);
+  const indexByValue = mutableRightIndex(state.indexByValue);
   const affectedValues: unknown[] = [];
 
   for (const change of changes) {
-    const index = relationKeys.indexOf(change.key);
+    const index = relationIndexByKey.get(change.key) ?? -1;
     const previousRows = rowsByRelationKey.get(change.key);
 
     if (change.after === undefined) {
@@ -1589,7 +2030,10 @@ function applyRightRelationChanges(
       }
 
       affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
+      removeRightIndexRows(step, indexByValue, previousRows, env);
       relationKeys[index] = undefined;
+      relationIndexByKey.delete(change.key);
+      vacantRelationIndices.push(index);
       rowsByRelationKey.delete(change.key);
       continue;
     }
@@ -1602,11 +2046,13 @@ function applyRightRelationChanges(
         };
       }
 
-      const vacantIndex = relationKeys.indexOf(undefined);
-      if (vacantIndex === -1) {
+      const vacantIndex = vacantRelationIndices.shift();
+      if (vacantIndex === undefined) {
+        relationIndexByKey.set(change.key, relationKeys.length);
         relationKeys.push(change.key);
       } else {
         relationKeys[vacantIndex] = change.key;
+        relationIndexByKey.set(change.key, vacantIndex);
       }
     } else if (change.before === undefined) {
       return {
@@ -1622,10 +2068,12 @@ function applyRightRelationChanges(
 
     if (previousRows !== undefined) {
       affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
+      removeRightIndexRows(step, indexByValue, previousRows, env);
     }
 
     const nextRows = evaluateBranchRows(step.right, change.after, env);
     affectedValues.push(...nextRows.map((row) => exprValue(row, step.rightExpr, env)));
+    addRightIndexRows(step, indexByValue, nextRows, env);
     rowsByRelationKey.set(change.key, nextRows);
   }
 
@@ -1643,11 +2091,59 @@ function applyRightRelationChanges(
     state: {
       ...state,
       relationKeys: compactRelationKeys,
+      relationIndexByKey: indexKeys(compactRelationKeys),
       rowsByRelationKey,
-      indexByValue: buildRightIndex(step, compactRelationKeys, rowsByRelationKey, env)
+      indexByValue
     },
     affectedRootKeys: rootKeysMatchingJoinValues(state, affectedValues)
   };
+}
+
+function mutableRightIndex(
+  index: ReadonlyMap<string, readonly IndexedRightRow[]>
+): Map<string, IndexedRightRow[]> {
+  return new Map(Array.from(index, ([key, rows]) => [key, [...rows]]));
+}
+
+function removeRightIndexRows(
+  step: IncrementalJoinStep,
+  index: Map<string, IndexedRightRow[]>,
+  rows: readonly Record<string, unknown>[],
+  env: Readonly<Record<string, unknown>>
+): void {
+  const rowsToRemove = new Set(rows);
+  for (const row of rows) {
+    const value = exprValue(row, step.rightExpr, env);
+    const key = stableKey(value);
+    const entries = index.get(key);
+    if (entries === undefined) {
+      continue;
+    }
+    const nextEntries = entries.filter((entry) => !rowsToRemove.has(entry.row));
+    if (nextEntries.length === 0) {
+      index.delete(key);
+    } else {
+      index.set(key, nextEntries);
+    }
+  }
+}
+
+function addRightIndexRows(
+  step: IncrementalJoinStep,
+  index: Map<string, IndexedRightRow[]>,
+  rows: readonly Record<string, unknown>[],
+  env: Readonly<Record<string, unknown>>
+): void {
+  for (const row of rows) {
+    const value = exprValue(row, step.rightExpr, env);
+    const key = stableKey(value);
+    const entries = index.get(key);
+    if (entries === undefined) {
+      index.set(key, [{ row, value }]);
+    } else {
+      entries.push({ row, value });
+    }
+  }
 }
 
 function rootKeysMatchingJoinValues(
@@ -1664,6 +2160,32 @@ function rootKeysMatchingJoinValues(
     }
   }
   return rootKeys;
+}
+
+function indexKeys(keys: readonly string[]): ReadonlyMap<string, number> {
+  return new Map(keys.map((key, index) => [key, index]));
+}
+
+function rootIndexByKeyForState<Row>(
+  state: IncrementalMaterializationState<Row>
+): ReadonlyMap<string, number> {
+  return state.rootIndexByKey ?? indexKeys(state.rootKeys);
+}
+
+function relationIndexByKeyForState(
+  state: IncrementalJoinState
+): ReadonlyMap<string, number> {
+  return state.relationIndexByKey ?? indexKeys(state.relationKeys);
+}
+
+function optionalRowKeyFields(
+  fields: readonly string[] | undefined
+): { readonly rowKeyFields?: readonly string[] } {
+  return fields === undefined ? {} : { rowKeyFields: fields };
+}
+
+function rowDiffOptionsForPlan(plan: IncrementalMaterializationPlan): MaterializationRowDiffOptions {
+  return plan.rowKeyFields === undefined ? {} : { keyBy: plan.rowKeyFields };
 }
 
 function relationForDeltas(relationName: string, deltas: readonly RelationDelta[]): RelationRef | undefined {

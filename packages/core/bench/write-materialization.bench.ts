@@ -124,6 +124,25 @@ const diffAfter = transact(diffBefore, updateWhere(benchSchema.people, eq(person
   active: false
 }));
 
+async function trackLargeIncrementalJoinTaskInsert(): Promise<unknown> {
+  const tracked = await trackTransact(largeIncrementalMaterializedJoin, largeMaterializedJoinTaskInsert);
+  const change = tracked.materializations?.changes.find((item) => item.id === 'taskProjectOwnerJoin');
+  if (change === undefined) {
+    throw new Error('large joined materialization report is missing');
+  }
+  if (
+    change.maintenance !== 'incremental'
+    || change.recomputed
+    || change.rowChanges.length !== 1
+    || change.addedRows.length !== 1
+    || change.removedRows.length !== 0
+    || tracked.diagnostics.some((diagnostic) => diagnostic.code === 'materialization_incremental_fallback')
+  ) {
+    throw new Error('large joined materialization report expanded beyond the task insert delta');
+  }
+  return tracked;
+}
+
 describe('core write and materialization benchmarks', () => {
   bench('createDb: medium fixture', () => {
     consumeBenchResult(createDb(medium.data));
@@ -175,6 +194,10 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized transact large incremental: maintain joined task query from task insert', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedJoin, largeMaterializedJoinTaskInsert));
+  }, options);
+
+  bench('trackTransact large incremental: joined task query from task insert', async () => {
+    consumeBenchResult(await trackLargeIncrementalJoinTaskInsert());
   }, options);
 
   bench('materialized transact large incremental: maintain joined task query from owner update', () => {
