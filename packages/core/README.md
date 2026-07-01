@@ -16,7 +16,8 @@ The core API is stabilizing around a Relic-shaped split:
   collection expansion.
 - `source` describes read-only row sources with `rows`, optional equality
   `lookup`, optional range `rangeLookup`, optional opaque `version`, and
-  diagnostics.
+  diagnostics. A missing `version` hook or a hook that returns `undefined`
+  means the current source identity is unknown.
 - `adapter` is the write-capable storage boundary: `RelationRuntime` combines a
   `RelationSource`, optional patch target, optional snapshot, and optional host
   subscription. Durable `RelationAdapter.commit(patches)` remains the
@@ -41,6 +42,8 @@ The core API is stabilizing around a Relic-shaped split:
   maintenance is only an opportunistic optimization behind materialized
   snapshots; some supported shapes rebuild from source rows inside that path,
   and unsupported shapes keep explicit diagnostics and recompute/refresh fallback.
+  Final row `sort(...)` maintenance rebuilds affected sorted snapshots from
+  source rows; `limit(...)` and `sortLimit(...)` remain diagnostic-backed.
   Incremental aggregate maintenance supports a narrow subset; `avg(expr)` is
   incremental only when matching visible `sum(expr)`/`count(expr)` fields are
   present over a non-null numeric base field or numeric literal.

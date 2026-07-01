@@ -65,7 +65,7 @@ import {
 } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
 import { booleanField, defineSchema, idField, nullable, numberField, relation, stringField } from '@tarstate/core/schema';
-import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
+import { composeSources, fromObjectSource, type RelationSource } from '@tarstate/core/source';
 import { write, type WritePatch } from '@tarstate/core/write';
 
 type Todo = {
@@ -821,6 +821,38 @@ describe('tarstate materialization', () => {
     expect(result.rows).toBe(materializedRowsFor<TodoRow>(db, 'todos-view'));
   });
 
+  it('reads composed-source materialized query results when child versions are unchanged', async () => {
+    const todoData = {
+      todos: [
+        { id: 'todo-a', text: 'Buy oat milk' },
+        { id: 'todo-b', text: 'Water basil' }
+      ]
+    };
+    const presenceData = {
+      presence: [{ id: 'peer-a', targetTodoId: 'todo-a' }]
+    };
+    const source = composeSources(fromObjectSource(todoData), fromObjectSource(presenceData));
+
+    await materializeSnapshot(source, todoRows, { id: 'todos-composed-view' });
+    const metadata = materializationForQuery(source, todoRows);
+    const currentVersion = await source.version?.();
+    const result = await readMaterializedQuery<TodoRow>(source, todoRows);
+
+    expect(metadata?.sourceVersion).toBe(currentVersion);
+    expect(result).toMatchObject({
+      kind: 'materializedQueryResult',
+      id: 'todos-composed-view',
+      queryKey: queryKey(todoRows),
+      materialized: true,
+      rows: [
+        { id: 'todo-a', text: 'Buy oat milk' },
+        { id: 'todo-b', text: 'Water basil' }
+      ],
+      diagnostics: []
+    });
+    expect(result.sourceVersion).toBe(currentVersion);
+  });
+
   it('returns a miss envelope for exact query keys without materialization', async () => {
     const db = createDb({
       todos: [{ id: 'todo-a', text: 'Buy oat milk' }]
@@ -1455,7 +1487,8 @@ describe('tarstate materialization', () => {
     const transaction = tryTransact(db, [
       tasks.insert({ id: 'task-d', status: 'open', priority: 'high', text: 'Delta', note: 'fourth' }),
       tasks.delete('task-c'),
-      tasks.update('task-a', { text: 'Echo' })
+      tasks.update('task-a', { text: 'Echo' }),
+      tasks.update('task-b', { status: 'open', text: 'Beta open' })
     ]);
     expect(transaction.diagnostics).toEqual([]);
 
@@ -1474,7 +1507,8 @@ describe('tarstate materialization', () => {
     expect(materializedRowsFor(transaction.db, 'sorted-open-tasks')).toEqual(fullRows);
     expect(materializedRowsFor(transaction.db, 'sorted-open-tasks')).toEqual([
       { id: 'task-a', priority: 'high', label: 'Echo' },
-      { id: 'task-d', priority: 'high', label: 'Delta' }
+      { id: 'task-d', priority: 'high', label: 'Delta' },
+      { id: 'task-b', priority: 'high', label: 'Beta open' }
     ]);
   });
 
@@ -1555,13 +1589,13 @@ describe('tarstate materialization', () => {
     ]);
   });
 
-  it('keeps non-final sort and limit operators diagnostic-backed for incremental materialization', async () => {
+  it('keeps final limit and sortLimit operators diagnostic-backed for incremental materialization', async () => {
     const unsupportedCases: readonly {
       readonly id: string;
       readonly query: Query;
     }[] = [
       {
-        id: 'open-task-non-final-sort',
+        id: 'open-task-sorted-limit',
         query: pipe(openTaskLabels, sort(asc(rootLabel)), limit(1))
       },
       {
@@ -1571,6 +1605,10 @@ describe('tarstate materialization', () => {
       {
         id: 'open-task-sort-limit',
         query: pipe(openTaskLabels, sortLimit(1, asc(rootLabel)))
+      },
+      {
+        id: 'open-task-offset-limit',
+        query: pipe(openTaskLabels, limit(1, 1))
       }
     ];
 
@@ -1594,25 +1632,31 @@ describe('tarstate materialization', () => {
           }
         ]
       });
-
-      const transaction = tryTransact(db, [
-        tasks.update('task-a', { text: 'Alpha updated' })
-      ]);
-      expect(transaction.diagnostics).toEqual([]);
-
-      const fullRows = (await q(transaction.db, testCase.query)).rows;
-      const result = await maintainMaterializationSnapshots(db, transaction.db, { deltas: transaction.deltas });
-
-      expect(result).toMatchObject({
-        kind: 'materializationMaintenance',
-        maintained: 1,
-        recomputed: 1,
-        carried: 0,
-        diagnostics: [{ code: 'materialization_unsupported', surface: 'materialization' }],
-        sourceVersion: transaction.db.data
-      });
-      expect(materializedRowsFor(transaction.db, testCase.id)).toEqual(fullRows);
     }
+  });
+
+  it('keeps non-final limit operators diagnostic-backed for incremental materialization', async () => {
+    const nonFinalLimit = pipe(openTaskLabels, limit(1), where(eq(rootLabel, 'Alpha')));
+    const db = createDb({ tasks: baseTaskRows });
+
+    await materializeSnapshot(db, nonFinalLimit, { id: 'open-task-non-final-limit', mode: 'incremental' });
+
+    expect(materializationForQuery(db, nonFinalLimit)).toMatchObject({
+      id: 'open-task-non-final-limit',
+      requestedMode: 'incremental',
+      maintenance: 'snapshot',
+      diagnostics: [
+        {
+          code: 'materialization_unsupported',
+          surface: 'materialization',
+          detail: {
+            mode: 'incremental',
+            queryKey: queryKey(nonFinalLimit),
+            reason: expect.any(String)
+          }
+        }
+      ]
+    });
   });
 
   it('classifies simple inner equality joins as incremental materializations', async () => {

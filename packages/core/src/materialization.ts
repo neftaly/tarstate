@@ -636,7 +636,13 @@ export async function maintainMaterializationSnapshots<Next extends SnapshotMate
     const incrementalRows = previousSnapshot === undefined || metadata.maintenance !== 'incremental'
       ? { kind: 'unavailable' } as const
       : runtimeFallbackReason === undefined
-        ? await maintainIncrementalSnapshotRows(metadata, previousSnapshot, source, options.deltas, options)
+        ? await maintainIncrementalSnapshotRows(
+            metadata,
+            previousSnapshot,
+            source,
+            options.deltas,
+            options
+          )
         : { kind: 'fallback', reason: runtimeFallbackReason } as const;
 
     if (incrementalRows.kind === 'maintained') {
@@ -1522,12 +1528,20 @@ async function maintainIncrementalSnapshotRows(
     return { kind: 'unavailable' };
   }
 
-  const rows = await applyIncrementalDeltas(previousSnapshot.rows, incremental.plan, deltas, options.env, source);
+  const rows = await applyIncrementalDeltas(
+    previousSnapshot.rows,
+    incremental.plan,
+    deltas,
+    options.env,
+    source
+  );
 
   return rows.kind === 'applied'
       ? {
         kind: 'maintained',
-        update: incremental.plan.kind === 'rows' && incremental.plan.sort !== undefined ? 'recomputed' : 'incremental',
+        update: incremental.plan.kind === 'rows' && incremental.plan.sort !== undefined
+          ? 'recomputed'
+          : 'incremental',
         rows: rows.rows
       }
     : rows;
@@ -1935,6 +1949,9 @@ function incrementalRowPlanFor(
         phase = 'output';
         sort = operation.order;
         continue;
+      case 'limit':
+      case 'sortLimit':
+        return { kind: 'unsupported', reason: 'limit and sortLimit are outside the incremental row subset' };
       default:
         return { kind: 'unsupported', reason: `operator ${operation.op} is outside the incremental subset` };
     }
@@ -2300,6 +2317,12 @@ async function applyIncrementalRowDeltas(
   env: EvaluateOptions['env'],
   source: RelationSource
 ): Promise<IncrementalDeltaRowsResult> {
+  if (plan.sort !== undefined) {
+    return relationDeltasAffectPlan(plan, deltas)
+      ? recomputeSortedIncrementalRowRows(plan, plan.sort, source, env)
+      : { kind: 'applied', rows: Object.freeze([...previousRows]) };
+  }
+
   const removedChanges = new Map<string, IncrementalDeltaChange>();
   const addedChanges = new Map<string, IncrementalDeltaChange>();
 
@@ -2323,10 +2346,6 @@ async function applyIncrementalRowDeltas(
 
   if (removedChanges.size === 0 && addedChanges.size === 0) {
     return { kind: 'applied', rows: Object.freeze([...previousRows]) };
-  }
-
-  if (plan.sort !== undefined) {
-    return recomputeSortedIncrementalRowRows(plan, plan.sort, source, env);
   }
 
   let hasUnpairedRemoved = false;
@@ -2377,43 +2396,50 @@ async function applyIncrementalRowDeltas(
   return { kind: 'applied', rows: Object.freeze(rows) };
 }
 
+function relationDeltasAffectPlan(
+  plan: IncrementalRowMaterializationPlan,
+  deltas: readonly RelationDelta[]
+): boolean {
+  return deltas.some(
+    (delta) => delta.relation.name === plan.relationName && (delta.added.length > 0 || delta.removed.length > 0)
+  );
+}
+
 async function recomputeSortedIncrementalRowRows(
   plan: IncrementalRowMaterializationPlan,
   sort: readonly SortData[],
   source: RelationSource,
   env: EvaluateOptions['env']
 ): Promise<IncrementalDeltaRowsResult> {
-  let sourceRows: readonly unknown[];
-
-  try {
-    sourceRows = Array.from(await source.rows(plan.relation));
-  } catch {
-    return { kind: 'fallback', reason: `current ${plan.relationName} rows could not be read` };
-  }
-
   const rows: Record<string, unknown>[] = [];
 
-  for (const [index, row] of sourceRows.entries()) {
-    if (!isRecord(row)) {
-      return { kind: 'fallback', reason: `current ${plan.relationName} row ${index} is not an object` };
-    }
+  try {
+    for (const row of await source.rows(plan.relation)) {
+      const mapped = incrementalOutputForRelationRow(plan, row, env);
 
-    const mapped = incrementalOutputForRelationRow(plan, row, env);
+      if (mapped === undefined) {
+        return {
+          kind: 'fallback',
+          reason: `source row cannot be mapped through the incremental query for ${plan.relationName}`
+        };
+      }
 
-    if (mapped === undefined) {
-      return { kind: 'fallback', reason: `current ${plan.relationName} row ${index} cannot be mapped through the incremental query` };
+      if (mapped.included) {
+        rows.push(mapped.row);
+      }
     }
-
-    if (mapped.included) {
-      rows.push(mapped.row);
-    }
+  } catch (error) {
+    return {
+      kind: 'fallback',
+      reason: `source rows failed while rebuilding sorted incremental rows for ${plan.relationName}: ${String(error)}`
+    };
   }
 
-  const sortedRows = sortIncrementalRows(rows, sort);
+  const sorted = sortIncrementalRows(rows, sort);
 
-  return sortedRows.kind === 'fallback'
-    ? sortedRows
-    : { kind: 'applied', rows: Object.freeze(sortedRows.rows) };
+  return sorted.kind === 'fallback'
+    ? sorted
+    : { kind: 'applied', rows: Object.freeze(sorted.rows) };
 }
 
 function applyIncrementalAggregateDeltas(
