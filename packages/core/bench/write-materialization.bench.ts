@@ -24,6 +24,7 @@ import {
   pipe,
   project,
   qRows,
+  qualify,
   sum,
   trackTransact,
   transact,
@@ -252,6 +253,36 @@ const largeRankingHighestTask = [...large.data.tasks]
   .sort((left, right) => right.points - left.points)
   .at(0) ?? large.data.tasks[0];
 const largeRankingTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.id, largeRankingHighestTask?.id ?? ''));
+const largeSnapshotMaterializedExpand = mat(createDb(large.data), {
+  expandedTaskLabels: large.queries.expandedTaskLabels
+});
+const largeIncrementalMaterializedExpand = mat(createDb(large.data), {
+  expandedTaskLabels: large.queries.expandedTaskLabels
+}, { mode: 'incremental' });
+const largeExpandTask = large.data.tasks.find((task) => task.labels.length > 0) ?? large.data.tasks[0];
+const largeMaterializedExpandTaskLabelUpdate = updateWhere(
+  benchSchema.tasks,
+  eq(taskRef.id, largeExpandTask?.id ?? ''),
+  {
+    labels: [
+      ...(largeExpandTask?.labels ?? []),
+      { name: 'benchmark', weight: 9 }
+    ]
+  }
+);
+const largeQualifiedActivePeople = pipe(large.queries.activePeople, qualify('person'));
+const largeSnapshotMaterializedQualify = mat(createDb(large.data), {
+  qualifiedActivePeople: largeQualifiedActivePeople
+});
+const largeIncrementalMaterializedQualify = mat(createDb(large.data), {
+  qualifiedActivePeople: largeQualifiedActivePeople
+}, { mode: 'incremental' });
+const largeQualifyPersonId = large.data.people.find((person) => person.active)?.id ?? '';
+const largeMaterializedQualifyPersonUpdate = updateWhere(
+  benchSchema.people,
+  eq(personRef.id, largeQualifyPersonId),
+  { name: 'Qualified Person' }
+);
 const watchBase = createDb(medium.data);
 const watchNext = transact(watchBase, insert(benchSchema.people, extraPerson(200)));
 const watchHandle = watch(watchBase, medium.queries.activePeople, () => undefined);
@@ -410,6 +441,22 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized transact large topBy/bottomBy aggregate requested incremental: task delete', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedRankings, largeRankingTaskDelete));
+  }, options);
+
+  bench('materialized transact large expand snapshot: task labels update', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedExpand, largeMaterializedExpandTaskLabelUpdate));
+  }, options);
+
+  bench('materialized transact large expand requested incremental: task labels update', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedExpand, largeMaterializedExpandTaskLabelUpdate));
+  }, options);
+
+  bench('materialized transact large qualify snapshot: active person update', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedQualify, largeMaterializedQualifyPersonUpdate));
+  }, options);
+
+  bench('materialized transact large qualify requested incremental: active person update', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedQualify, largeMaterializedQualifyPersonUpdate));
   }, options);
 
   bench('materialized index: set rows', () => {

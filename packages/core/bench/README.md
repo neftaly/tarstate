@@ -40,6 +40,7 @@ scales:
 - Large `trackTransact` reporting for requested incremental joined-query deltas.
 - Large requested incremental versus snapshot materialization maintenance for miss-heavy `leftJoin`.
 - Requested incremental versus snapshot materialization maintenance for grouped `topBy`/`bottomBy` aggregate winners.
+- Requested incremental versus snapshot materialization maintenance for structural `expand` and `qualify` queries.
 - Materialization set/hash/btree/unique index facades.
 - Materialized hash/unique/btree facade reads before and after an incrementally maintained insert.
 - Compound hash/unique and expression-projected hash/btree facade reads after maintained inserts.

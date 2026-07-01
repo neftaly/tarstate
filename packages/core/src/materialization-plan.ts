@@ -19,7 +19,7 @@ import type {
 import { queryRowKeyFields } from './query.js';
 import type { RelationRef } from './schema.js';
 
-export type IncrementalMaterializationPlan = {
+export type IncrementalSingleRootMaterializationPlan = {
   readonly kind: 'singleRoot';
   readonly rootRelation: string;
   readonly rootAlias: string;
@@ -27,6 +27,16 @@ export type IncrementalMaterializationPlan = {
   readonly steps: readonly IncrementalStep[];
   readonly rowKeyFields?: readonly string[];
 };
+
+export type IncrementalStaticRowsMaterializationPlan = {
+  readonly kind: 'staticRows';
+  readonly data: QueryData;
+  readonly rowKeyFields?: readonly string[];
+};
+
+export type IncrementalMaterializationPlan =
+  | IncrementalSingleRootMaterializationPlan
+  | IncrementalStaticRowsMaterializationPlan;
 
 export type IncrementalMaterializationState<Row = unknown> = {
   readonly kind: 'incrementalMaterializationState';
@@ -95,8 +105,19 @@ type IncrementalPipelineStep =
   | { readonly kind: 'where'; readonly predicate: PredicateData }
   | { readonly kind: 'select'; readonly projection: ProjectionData }
   | { readonly kind: 'extend'; readonly projection: ProjectionData }
+  | { readonly kind: 'expand'; readonly collection: ExprData; readonly alias?: string; readonly fields?: readonly string[] }
   | { readonly kind: 'without'; readonly fields: readonly string[] }
-  | { readonly kind: 'rename'; readonly fields: Record<string, string> };
+  | { readonly kind: 'rename'; readonly fields: Record<string, string> }
+  | { readonly kind: 'qualify'; readonly alias: string }
+  | {
+      readonly kind: 'setFilter';
+      readonly op: 'intersection' | 'difference';
+      readonly rightRows: readonly (readonly Record<string, unknown>[])[];
+    };
+
+type IncrementalBranchStep = Exclude<IncrementalPipelineStep, {
+  readonly kind: 'expand' | 'setFilter';
+}>;
 
 type IncrementalJoinStep = {
   readonly kind: 'join';
@@ -121,7 +142,7 @@ type IncrementalBranchPlan = {
   readonly relation: string;
   readonly alias: string;
   readonly root: IncrementalRoot;
-  readonly steps: readonly IncrementalPipelineStep[];
+  readonly steps: readonly IncrementalBranchStep[];
 };
 
 type IncrementalJoinState = {
@@ -261,6 +282,16 @@ type AggregateStateResult<Row> =
       readonly reason: string;
     };
 
+type StaticRowsEvaluation =
+  | {
+      readonly supported: true;
+      readonly rows: readonly Record<string, unknown>[];
+    }
+  | {
+      readonly supported: false;
+      readonly reason: string;
+    };
+
 const supportedAggregateFunctions: ReadonlySet<AggregateFunction> = new Set([
   'count',
   'sum',
@@ -278,11 +309,29 @@ const supportedAggregateFunctions: ReadonlySet<AggregateFunction> = new Set([
   'minBy'
 ]);
 
+const staticRowsRelationReason = 'query depends on relation rows';
+
 export function planIncrementalMaterialization(query: Query): IncrementalPlanResult {
+  const staticPlan = collectStaticRowsPlan(query.data);
+  if (typeof staticPlan !== 'string') {
+    return {
+      supported: true,
+      plan: {
+        kind: 'staticRows',
+        data: query.data,
+        ...optionalRowKeyFields(queryRowKeyFields(query))
+      },
+      reason: 'incremental maintenance for static constRows query'
+    };
+  }
+
   const steps: IncrementalStep[] = [];
   const root = collectSingleRootPlan(query.data, steps, { joinCount: 0 });
   if (typeof root === 'string') {
-    return { supported: false, reason: root };
+    return {
+      supported: false,
+      reason: staticPlan === staticRowsRelationReason ? root : staticPlan
+    };
   }
 
   for (const relationName of planRelationNames(root, steps)) {
@@ -314,6 +363,10 @@ export function buildIncrementalMaterialization<Row>(
     [relation.name, { relation, rows: rootRows }]
   ])
 ): IncrementalMaterializationBuildResult<Row> {
+  if (plan.kind === 'staticRows') {
+    return buildStaticIncrementalMaterialization(plan, env);
+  }
+
   const duplicateReason = duplicateRelationRowsReason(relation, rootRows);
   if (duplicateReason !== undefined) {
     return {
@@ -388,12 +441,74 @@ export function buildIncrementalMaterialization<Row>(
   };
 }
 
+export function buildStaticIncrementalMaterialization<Row>(
+  plan: IncrementalStaticRowsMaterializationPlan,
+  env: Readonly<Record<string, unknown>>
+): IncrementalMaterializationBuildResult<Row> {
+  const evaluated = evaluateStaticRows(plan.data, env);
+  if (!evaluated.supported) {
+    return {
+      supported: false,
+      reason: evaluated.reason
+    };
+  }
+
+  const rootKeys = evaluated.rows.map((_, index) => `static:${index}`);
+  const rootRowsByRootKey = new Map<string, unknown>();
+  const outputsByRootKey = new Map<string, readonly unknown[]>();
+  for (const [index, row] of evaluated.rows.entries()) {
+    const key = rootKeys[index] as string;
+    rootRowsByRootKey.set(key, row);
+    outputsByRootKey.set(key, [row]);
+  }
+
+  const state = {
+    kind: 'incrementalMaterializationState',
+    rootRelation: '',
+    rootKeys,
+    rootIndexByKey: indexKeys(rootKeys),
+    rootRowsByRootKey,
+    outputsByRootKey,
+    joinStates: []
+  } satisfies IncrementalMaterializationState<Row>;
+
+  return {
+    supported: true,
+    reason: 'incremental materialization state built for static rows',
+    plan,
+    state,
+    rows: evaluated.rows as readonly Row[]
+  };
+}
+
 export function maintainIncrementalMaterialization<Row>(
   materialization: IncrementalMaterialization<Row>,
-  relation: RelationRef,
+  relation: RelationRef | undefined,
   deltas: readonly RelationDelta[],
   env: Readonly<Record<string, unknown>>
 ): IncrementalMaintenanceResult<Row> {
+  if (materialization.plan.kind === 'staticRows') {
+    return {
+      updated: true,
+      reason: 'static constRows query has no relation delta maintenance',
+      state: materialization.state,
+      rowChanges: [],
+      addedRows: [],
+      removedRows: [],
+      rowBatches: [],
+      changedRootKeys: [],
+      changedGroupKeys: [],
+      diagnostics: []
+    };
+  }
+
+  if (relation === undefined) {
+    return {
+      updated: false,
+      reason: `relation ${materialization.plan.rootRelation} is not available for incremental maintenance`
+    };
+  }
+
   if (materialization.plan.rootRelation !== relation.name || materialization.state.rootRelation !== relation.name) {
     return {
       updated: false,
@@ -774,6 +889,30 @@ function collectSingleRootPlan(
       steps.push({ kind: 'rename', fields: data.fields });
       return { ...root, shape: renameShape(root.shape, data.fields) };
     }
+    case 'qualify': {
+      const root = collectSingleRootPlan(data.input, steps, collection);
+      if (typeof root === 'string') return root;
+      steps.push({ kind: 'qualify', alias: data.alias });
+      return { ...root, shape: qualifyShape(root.shape, data.alias) };
+    }
+    case 'expand': {
+      const root = collectSingleRootPlan(data.input, steps, collection);
+      if (typeof root === 'string') return root;
+      if (hasAggregateStep(steps)) {
+        return 'expand after aggregate is not supported for incremental maintenance';
+      }
+      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, root.shape);
+      if (reason !== undefined) {
+        return `expand collection is not supported for incremental maintenance: ${reason}`;
+      }
+      steps.push({
+        kind: 'expand',
+        collection: data.collection,
+        ...(data.alias === undefined ? {} : { alias: data.alias }),
+        ...(data.fields === undefined ? {} : { fields: data.fields })
+      });
+      return { ...root, shape: expandShape(root.shape, data.alias, data.fields) };
+    }
     case 'join': {
       const stepCount = steps.length;
       const left = collectSingleRootPlan(data.left, steps, collection);
@@ -822,18 +961,14 @@ function collectSingleRootPlan(
       return 'limit is not supported for incremental maintenance';
     case 'sortLimit':
       return 'sortLimit is not supported for incremental maintenance';
-    case 'expand':
-      return 'expand is not supported for incremental maintenance';
     case 'union':
       return 'union is not supported for incremental maintenance';
     case 'intersection':
-      return 'intersection is not supported for incremental maintenance';
+      return collectIntersectionPlan(data.inputs, steps, collection);
     case 'difference':
-      return 'difference is not supported for incremental maintenance';
+      return collectDifferencePlan(data.left, data.right, steps, collection);
     case 'constRows':
       return 'constRows is not supported for incremental maintenance';
-    case 'qualify':
-      return 'qualify is not supported for incremental maintenance';
     case 'aggregate': {
       const stepCount = steps.length;
       const root = collectSingleRootPlan(data.input, steps, collection);
@@ -862,14 +997,208 @@ function collectSingleRootPlan(
   }
 }
 
+function collectIntersectionPlan(
+  inputs: readonly QueryData[],
+  steps: IncrementalStep[],
+  collection: PlanCollection
+): RootPlan | string {
+  const [leftInput, ...rightInputs] = inputs;
+  if (leftInput === undefined || rightInputs.length === 0) {
+    return 'intersection incremental maintenance requires one supported root branch and static right branches';
+  }
+
+  const stepCount = steps.length;
+  const root = collectSingleRootPlan(leftInput, steps, collection);
+  if (typeof root === 'string') {
+    return `intersection first branch is not supported for incremental maintenance: ${root}`;
+  }
+  if (hasAggregateStep(steps.slice(stepCount))) {
+    return 'intersection after aggregate is not supported for incremental maintenance';
+  }
+
+  const rightRows = collectStaticSetRows(rightInputs, 'intersection');
+  if (typeof rightRows === 'string') {
+    return rightRows;
+  }
+
+  steps.push({ kind: 'setFilter', op: 'intersection', rightRows });
+  return root;
+}
+
+function collectDifferencePlan(
+  leftInput: QueryData,
+  rightInput: QueryData,
+  steps: IncrementalStep[],
+  collection: PlanCollection
+): RootPlan | string {
+  const stepCount = steps.length;
+  const root = collectSingleRootPlan(leftInput, steps, collection);
+  if (typeof root === 'string') {
+    return `difference left branch is not supported for incremental maintenance: ${root}`;
+  }
+  if (hasAggregateStep(steps.slice(stepCount))) {
+    return 'difference after aggregate is not supported for incremental maintenance';
+  }
+
+  const rightRows = collectStaticSetRows([rightInput], 'difference');
+  if (typeof rightRows === 'string') {
+    return rightRows;
+  }
+
+  steps.push({ kind: 'setFilter', op: 'difference', rightRows });
+  return root;
+}
+
+function collectStaticSetRows(
+  inputs: readonly QueryData[],
+  op: 'intersection' | 'difference'
+): readonly (readonly Record<string, unknown>[])[] | string {
+  const rows: Array<readonly Record<string, unknown>[]> = [];
+  for (const input of inputs) {
+    const planned = collectStaticRowsPlan(input);
+    if (typeof planned === 'string') {
+      return `${op} static branch is not supported for incremental maintenance: ${planned}`;
+    }
+
+    const evaluated = evaluateStaticRows(input, {});
+    if (!evaluated.supported) {
+      return `${op} static branch is not supported for incremental maintenance: ${evaluated.reason}`;
+    }
+    rows.push(evaluated.rows);
+  }
+  return rows;
+}
+
+function collectStaticRowsPlan(data: QueryData): PlanShape | string {
+  switch (data.op) {
+    case 'constRows':
+      return shapeForConstRows(data.rows);
+    case 'where': {
+      const shape = collectStaticRowsPlan(data.input);
+      if (typeof shape === 'string') return shape;
+      const reason = simplePredicateReason(data.predicate) ?? predicateShapeReason(data.predicate, shape);
+      return reason === undefined ? shape : `where predicate is not supported: ${reason}`;
+    }
+    case 'hash':
+    case 'btree': {
+      const shape = collectStaticRowsPlan(data.input);
+      if (typeof shape === 'string') return shape;
+      for (const expression of data.expressions) {
+        const reason = simpleExprReason(expression) ?? exprShapeReason(expression, shape);
+        if (reason !== undefined) {
+          return `${data.op} expression is not supported: ${reason}`;
+        }
+      }
+      return shape;
+    }
+    case 'keyBy':
+      return collectStaticRowsPlan(data.input);
+    case 'select': {
+      const shape = collectStaticRowsPlan(data.input);
+      if (typeof shape === 'string') return shape;
+      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, shape);
+      if (reason !== undefined) {
+        return `select projection is not supported: ${reason}`;
+      }
+      return selectShape(shape, data.projection);
+    }
+    case 'extend': {
+      const shape = collectStaticRowsPlan(data.input);
+      if (typeof shape === 'string') return shape;
+      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, shape);
+      if (reason !== undefined) {
+        return `extend projection is not supported: ${reason}`;
+      }
+      return extendShape(shape, data.projection);
+    }
+    case 'expand': {
+      const shape = collectStaticRowsPlan(data.input);
+      if (typeof shape === 'string') return shape;
+      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, shape);
+      if (reason !== undefined) {
+        return `expand collection is not supported: ${reason}`;
+      }
+      return expandShape(shape, data.alias, data.fields);
+    }
+    case 'without': {
+      const shape = collectStaticRowsPlan(data.input);
+      return typeof shape === 'string' ? shape : withoutShape(shape, data.fields);
+    }
+    case 'rename': {
+      const shape = collectStaticRowsPlan(data.input);
+      return typeof shape === 'string' ? shape : renameShape(shape, data.fields);
+    }
+    case 'qualify': {
+      const shape = collectStaticRowsPlan(data.input);
+      return typeof shape === 'string' ? shape : qualifyShape(shape, data.alias);
+    }
+    case 'union': {
+      const shapes = collectStaticInputShapes(data.inputs);
+      if (typeof shapes === 'string') return shapes;
+      return shapes.reduce<PlanShape>((shape, item) => mergeShapes(shape, item), emptyShape());
+    }
+    case 'intersection': {
+      const shapes = collectStaticInputShapes(data.inputs);
+      if (typeof shapes === 'string') return shapes;
+      return shapes[0] ?? emptyShape();
+    }
+    case 'difference': {
+      const left = collectStaticRowsPlan(data.left);
+      if (typeof left === 'string') return left;
+      const right = collectStaticRowsPlan(data.right);
+      return typeof right === 'string' ? right : left;
+    }
+    case 'from':
+    case 'lookup':
+    case 'join':
+      return staticRowsRelationReason;
+    case 'sort': {
+      const shape = collectStaticRowsPlan(data.input);
+      return shape === staticRowsRelationReason
+        ? shape
+        : 'sort is not supported for static incremental maintenance';
+    }
+    case 'limit': {
+      const shape = collectStaticRowsPlan(data.input);
+      return shape === staticRowsRelationReason
+        ? shape
+        : 'limit is not supported for static incremental maintenance';
+    }
+    case 'sortLimit': {
+      const shape = collectStaticRowsPlan(data.input);
+      return shape === staticRowsRelationReason
+        ? shape
+        : 'sortLimit is not supported for static incremental maintenance';
+    }
+    case 'aggregate': {
+      const shape = collectStaticRowsPlan(data.input);
+      return shape === staticRowsRelationReason
+        ? shape
+        : 'aggregate is not supported for static incremental maintenance';
+    }
+  }
+}
+
+function collectStaticInputShapes(inputs: readonly QueryData[]): readonly PlanShape[] | string {
+  const shapes: PlanShape[] = [];
+  for (const input of inputs) {
+    const shape = collectStaticRowsPlan(input);
+    if (typeof shape === 'string') {
+      return shape;
+    }
+    shapes.push(shape);
+  }
+  return shapes;
+}
+
 function collectRightBranchPlan(data: QueryData): RightBranchPlan | string {
-  const steps: IncrementalPipelineStep[] = [];
+  const steps: IncrementalBranchStep[] = [];
   return collectRightBranchPlanInternal(data, steps);
 }
 
 function collectRightBranchPlanInternal(
   data: QueryData,
-  steps: IncrementalPipelineStep[]
+  steps: IncrementalBranchStep[]
 ): RightBranchPlan | string {
   switch (data.op) {
     case 'from':
@@ -949,6 +1278,12 @@ function collectRightBranchPlanInternal(
       steps.push({ kind: 'rename', fields: data.fields });
       return { ...root, shape: renameShape(root.shape, data.fields) };
     }
+    case 'qualify': {
+      const root = collectRightBranchPlanInternal(data.input, steps);
+      if (typeof root === 'string') return root;
+      steps.push({ kind: 'qualify', alias: data.alias });
+      return { ...root, shape: qualifyShape(root.shape, data.alias) };
+    }
     case 'join':
       return data.kind === 'inner'
         ? 'right branch joins are not supported'
@@ -969,8 +1304,6 @@ function collectRightBranchPlanInternal(
       return 'difference is not supported';
     case 'constRows':
       return 'constRows is not supported';
-    case 'qualify':
-      return 'qualify is not supported';
     case 'aggregate':
       return 'aggregate is not supported';
   }
@@ -996,10 +1329,16 @@ function planRelationNames(root: RootPlan, steps: readonly IncrementalStep[]): r
 }
 
 function joinSteps(plan: IncrementalMaterializationPlan): readonly IncrementalJoinStep[] {
+  if (plan.kind === 'staticRows') {
+    return [];
+  }
   return plan.steps.filter((step): step is IncrementalJoinStep => step.kind === 'join');
 }
 
 function aggregateStep(plan: IncrementalMaterializationPlan): IncrementalAggregateStep | undefined {
+  if (plan.kind === 'staticRows') {
+    return undefined;
+  }
   return plan.steps.find((step): step is IncrementalAggregateStep => step.kind === 'aggregate');
 }
 
@@ -1007,14 +1346,22 @@ function hasAggregateStep(steps: readonly IncrementalStep[]): boolean {
   return steps.some((step) => step.kind === 'aggregate');
 }
 
-function stepsAfterAggregate(plan: IncrementalMaterializationPlan): readonly IncrementalPipelineStep[] {
+function stepsAfterAggregate(
+  plan: IncrementalMaterializationPlan
+): readonly Exclude<IncrementalPipelineStep, { readonly kind: 'expand' }>[] {
+  if (plan.kind === 'staticRows') {
+    return [];
+  }
+
   const aggregateIndex = plan.steps.findIndex((step) => step.kind === 'aggregate');
   if (aggregateIndex === -1) {
     return [];
   }
 
-  return plan.steps.slice(aggregateIndex + 1).filter((step): step is IncrementalPipelineStep =>
-    step.kind !== 'join' && step.kind !== 'aggregate'
+  return plan.steps.slice(aggregateIndex + 1).filter((
+    step
+  ): step is Exclude<IncrementalPipelineStep, { readonly kind: 'expand' }> =>
+    step.kind !== 'join' && step.kind !== 'aggregate' && step.kind !== 'expand'
   );
 }
 
@@ -1213,7 +1560,7 @@ function insertAnchorsForAggregate<Row>(
 }
 
 function evaluateRootRow<Row>(
-  plan: IncrementalMaterializationPlan,
+  plan: IncrementalSingleRootMaterializationPlan,
   relationRow: unknown,
   env: Readonly<Record<string, unknown>>,
   joinStateById: ReadonlyMap<string, IncrementalJoinState>
@@ -1238,6 +1585,15 @@ function evaluateRootRow<Row>(
       }
       joinValuesByStep.set(step.id, rows.map((row) => exprValue(row, step.left, env)));
       rows = evaluateJoinStep(rows, step, joinState, env);
+    } else if (step.kind === 'expand') {
+      const expanded = evaluateExpandStep(rows, step, env);
+      if (!expanded.supported) {
+        return {
+          supported: false,
+          reason: expanded.reason
+        };
+      }
+      rows = expanded.rows;
     } else {
       rows = evaluateStep(rows, step, env);
     }
@@ -1250,7 +1606,7 @@ function evaluateRootRow<Row>(
 }
 
 function rootContext(
-  plan: IncrementalMaterializationPlan,
+  plan: IncrementalSingleRootMaterializationPlan,
   relationRow: unknown,
   env: Readonly<Record<string, unknown>>
 ): Record<string, unknown> | undefined {
@@ -1265,7 +1621,7 @@ function rootContext(
 
 function evaluateStep(
   rows: readonly Record<string, unknown>[],
-  step: IncrementalPipelineStep,
+  step: Exclude<IncrementalPipelineStep, { readonly kind: 'expand' }>,
   env: Readonly<Record<string, unknown>>
 ): readonly Record<string, unknown>[] {
   switch (step.kind) {
@@ -1285,7 +1641,44 @@ function evaluateStep(
       });
     case 'rename':
       return rows.map((row) => renameRow(row, step.fields));
+    case 'qualify':
+      return rows.map((row) => ({ [step.alias]: row }));
+    case 'setFilter':
+      return rows.filter((row) => matchesStaticSetFilter(row, step));
   }
+}
+
+function evaluateExpandStep(
+  rows: readonly Record<string, unknown>[],
+  step: Extract<IncrementalPipelineStep, { readonly kind: 'expand' }>,
+  env: Readonly<Record<string, unknown>>
+):
+  | { readonly supported: true; readonly rows: readonly Record<string, unknown>[] }
+  | { readonly supported: false; readonly reason: string } {
+  const output: Record<string, unknown>[] = [];
+
+  for (const row of rows) {
+    const value = exprValue(row, step.collection, env);
+    if (value === null || value === undefined || !isIterable(value)) {
+      continue;
+    }
+    if (!Array.isArray(value) && !(value instanceof Set)) {
+      return {
+        supported: false,
+        reason: 'expand collection produced a non-array/non-set iterable; snapshot recompute is required'
+      };
+    }
+
+    for (const item of value) {
+      if (step.alias !== undefined) {
+        output.push({ ...row, [step.alias]: item });
+      } else if (isRecord(item)) {
+        output.push({ ...row, ...pickFields(item, step.fields) });
+      }
+    }
+  }
+
+  return { supported: true, rows: output };
 }
 
 function evaluateJoinStep(
@@ -1341,6 +1734,123 @@ function evaluateBranchRows(
   return rows;
 }
 
+function evaluateStaticRows(
+  data: QueryData,
+  env: Readonly<Record<string, unknown>>
+): StaticRowsEvaluation {
+  switch (data.op) {
+    case 'constRows':
+      return { supported: true, rows: data.rows.map((row) => ({ ...row })) };
+    case 'where': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? { supported: true, rows: input.rows.filter((row) => matchesPredicate(row, data.predicate, env)) }
+        : input;
+    }
+    case 'hash':
+    case 'btree':
+    case 'keyBy':
+      return evaluateStaticRows(data.input, env);
+    case 'select': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? { supported: true, rows: input.rows.map((row) => projectRow(row, data.projection, env)) }
+        : input;
+    }
+    case 'extend': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? {
+            supported: true,
+            rows: input.rows.map((row) => ({ ...row, ...projectRow(row, data.projection, env) }))
+          }
+        : input;
+    }
+    case 'expand': {
+      const input = evaluateStaticRows(data.input, env);
+      if (!input.supported) return input;
+      return evaluateExpandStep(input.rows, {
+        kind: 'expand',
+        collection: data.collection,
+        ...(data.alias === undefined ? {} : { alias: data.alias }),
+        ...(data.fields === undefined ? {} : { fields: data.fields })
+      }, env);
+    }
+    case 'without': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? {
+            supported: true,
+            rows: input.rows.map((row) => {
+              const output = { ...row };
+              for (const field of data.fields) {
+                delete output[field];
+              }
+              return output;
+            })
+          }
+        : input;
+    }
+    case 'rename': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? { supported: true, rows: input.rows.map((row) => renameRow(row, data.fields)) }
+        : input;
+    }
+    case 'qualify': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? { supported: true, rows: input.rows.map((row) => ({ [data.alias]: row })) }
+        : input;
+    }
+    case 'union': {
+      const inputs = evaluateStaticInputs(data.inputs, env);
+      return inputs.supported
+        ? { supported: true, rows: setUnionRows(inputs.rows) }
+        : inputs;
+    }
+    case 'intersection': {
+      const inputs = evaluateStaticInputs(data.inputs, env);
+      return inputs.supported
+        ? { supported: true, rows: setIntersectionRows(inputs.rows) }
+        : inputs;
+    }
+    case 'difference': {
+      const left = evaluateStaticRows(data.left, env);
+      if (!left.supported) return left;
+      const right = evaluateStaticRows(data.right, env);
+      if (!right.supported) return right;
+      return { supported: true, rows: setDifferenceRows(left.rows, right.rows) };
+    }
+    case 'from':
+    case 'lookup':
+    case 'join':
+      return { supported: false, reason: staticRowsRelationReason };
+    case 'sort':
+    case 'limit':
+    case 'sortLimit':
+    case 'aggregate':
+      return { supported: false, reason: `${data.op} is not supported for static incremental maintenance` };
+  }
+}
+
+function evaluateStaticInputs(
+  inputs: readonly QueryData[],
+  env: Readonly<Record<string, unknown>>
+):
+  | { readonly supported: true; readonly rows: readonly (readonly Record<string, unknown>[])[] }
+  | { readonly supported: false; readonly reason: string } {
+  const rows: Array<readonly Record<string, unknown>[]> = [];
+  for (const input of inputs) {
+    const evaluated = evaluateStaticRows(input, env);
+    if (!evaluated.supported) {
+      return evaluated;
+    }
+    rows.push(evaluated.rows);
+  }
+  return { supported: true, rows };
+}
+
 function branchRootContext(
   branch: IncrementalBranchPlan,
   relationRow: unknown,
@@ -1373,6 +1883,53 @@ function renameRow(row: Record<string, unknown>, fields: Record<string, string>)
     delete output[from];
   }
   return output;
+}
+
+function matchesStaticSetFilter(
+  row: Record<string, unknown>,
+  step: Extract<IncrementalPipelineStep, { readonly kind: 'setFilter' }>
+): boolean {
+  const key = stableKey(row);
+  if (step.op === 'intersection') {
+    return step.rightRows.every((rows) => rows.some((candidate) => stableKey(candidate) === key));
+  }
+
+  return !step.rightRows.some((rows) => rows.some((candidate) => stableKey(candidate) === key));
+}
+
+function setUnionRows(
+  inputs: readonly (readonly Record<string, unknown>[])[]
+): readonly Record<string, unknown>[] {
+  const seen = new Set<string>();
+  const output: Record<string, unknown>[] = [];
+
+  for (const rows of inputs) {
+    for (const row of rows) {
+      const key = stableKey(row);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      output.push(row);
+    }
+  }
+
+  return output;
+}
+
+function setIntersectionRows(
+  inputs: readonly (readonly Record<string, unknown>[])[]
+): readonly Record<string, unknown>[] {
+  const [first = [], ...rest] = inputs;
+  return first.filter((row) => rest.every((rows) => rows.some((candidate) => stableKey(candidate) === stableKey(row))));
+}
+
+function setDifferenceRows(
+  left: readonly Record<string, unknown>[],
+  right: readonly Record<string, unknown>[]
+): readonly Record<string, unknown>[] {
+  const rightKeys = new Set(right.map((row) => stableKey(row)));
+  return left.filter((row) => !rightKeys.has(stableKey(row)));
 }
 
 export function rowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {
@@ -2406,6 +2963,22 @@ function shapeForRoot(relation: string, alias: string): PlanShape {
   };
 }
 
+function shapeForConstRows(rows: readonly Record<string, unknown>[]): PlanShape {
+  return {
+    aliases: new Set(),
+    fields: new Set(rows.flatMap((row) => Object.keys(row))),
+    relations: new Set()
+  };
+}
+
+function emptyShape(): PlanShape {
+  return {
+    aliases: new Set(),
+    fields: new Set(),
+    relations: new Set()
+  };
+}
+
 function selectShape(shape: PlanShape, projection: ProjectionData): PlanShape {
   return {
     aliases: new Set(),
@@ -2452,6 +3025,26 @@ function renameShape(shape: PlanShape, fields: Record<string, string>): PlanShap
   return {
     aliases,
     fields: outputFields,
+    relations: new Set(shape.relations)
+  };
+}
+
+function qualifyShape(shape: PlanShape, alias: string): PlanShape {
+  return {
+    aliases: new Set([alias]),
+    fields: new Set(),
+    relations: new Set(shape.relations)
+  };
+}
+
+function expandShape(
+  shape: PlanShape,
+  alias: string | undefined,
+  fields: readonly string[] | undefined
+): PlanShape {
+  return {
+    aliases: new Set(alias === undefined ? shape.aliases : [...shape.aliases, alias]),
+    fields: new Set(fields === undefined ? shape.fields : [...shape.fields, ...fields]),
     relations: new Set(shape.relations)
   };
 }
@@ -2777,6 +3370,20 @@ function compareSortValues(
 
 function asRecord(input: unknown): Record<string, unknown> {
   return isRecord(input) ? input : {};
+}
+
+function pickFields(input: Record<string, unknown>, fields: readonly string[] | undefined): Record<string, unknown> {
+  if (fields === undefined) {
+    return input;
+  }
+
+  return Object.fromEntries(fields.map((field) => [field, input[field]]));
+}
+
+function isIterable(input: unknown): input is Iterable<unknown> {
+  return typeof input === 'object' &&
+    input !== null &&
+    typeof (input as { readonly [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function';
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {
