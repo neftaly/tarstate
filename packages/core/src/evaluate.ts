@@ -409,6 +409,10 @@ async function evaluateAggregate(expr: ExprData, rows: readonly EvalContext[], s
       return (await rowsByAggregate(rows, expr.expr, state, 'desc')).slice(0, expr.count ?? 0);
     case 'bottomBy':
       return (await rowsByAggregate(rows, expr.expr, state, 'asc')).slice(0, expr.count ?? 0);
+    case 'maxBy':
+      return (await rowsByAggregate(rows, expr.expr, state, 'desc')).at(0);
+    case 'minBy':
+      return (await rowsByAggregate(rows, expr.expr, state, 'asc')).at(0);
   }
 }
 

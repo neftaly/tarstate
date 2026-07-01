@@ -1591,6 +1591,10 @@ function evaluateAggregate(
       return rowsByAggregate(rows, expr.expr, target, 'desc').slice(0, expr.count ?? 0);
     case 'bottomBy':
       return rowsByAggregate(rows, expr.expr, target, 'asc').slice(0, expr.count ?? 0);
+    case 'maxBy':
+      return rowsByAggregate(rows, expr.expr, target, 'desc').at(0);
+    case 'minBy':
+      return rowsByAggregate(rows, expr.expr, target, 'asc').at(0);
   }
 }
 

@@ -21,8 +21,8 @@ The core API is stabilizing around a Relic-shaped split:
   lookup planning, query-only `uniqueIndex` metadata, dependency analysis
   through `dependencies`, propagated result identity through `rowKeyFields`,
   projections, `qualifyRow`, `aggregate({ groupBy, aggregates })`, aggregate
-  helpers such as `countDistinct`/`avg`/`notAny`/`setConcat`, and nested
-  collection expansion.
+  helpers such as `countDistinct`/`avg`/`notAny`/`setConcat`/`maxBy`/`minBy`,
+  and nested collection expansion.
 - `source` describes read-only row sources with `rows`, optional equality
   `lookup`, optional range `rangeLookup`, optional opaque `version`, and
   diagnostics. A missing `version` hook or a hook that returns `undefined`
@@ -56,27 +56,25 @@ The core API is stabilizing around a Relic-shaped split:
 - `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
   rows for tests, local state, and adapter prototyping.
 - `constraints`, `materialization`, `watch`, and `runtime` are experimental,
-  diagnostic-backed surfaces. They provide baseline validation, explicit
-  object-backed constraint enforcement, committed relation deltas, snapshot
-  caches with exact materialized-query read-through, manual/recompute-backed
-  watch refresh, Relic-style `watchTarget`/`unwatchTarget` registration,
-  `watchChangeMap`, and patch-target commit tracking. `trackTransactPatches`
-  exposes planned object-backed tracked-transaction patches without committing
-  them. Query-bound `req`/`unique`/`fk` constraints are descriptor-only stubs
-  until query/materialized constraint enforcement exists. Partial incremental view
-  maintenance is only an opportunistic optimization behind materialized
-  snapshots; some supported shapes rebuild from source rows inside that path,
-  and unsupported shapes keep explicit diagnostics and recompute/refresh fallback.
-  Final row `sort(...)`, `limit(...)`, and `sortLimit(...)` materializations
-  rebuild affected ordered/windowed snapshots from source rows.
+  diagnostic-backed surfaces. They provide baseline validation, object-backed
+  constraint enforcement, query-shaped `req`/`unique`/`fk` enforcement for
+  deterministic query shapes, committed relation deltas, exact
+  materialized-query read-through, maintained declared materialized
+  set/hash/btree/unique indexes, Relic-style `watchTarget`/`unwatchTarget`
+  registration, `watchChangeMap`, and patch-target commit tracking.
+  `trackTransactPatches` exposes planned object-backed tracked-transaction
+  patches without committing them. Watch delivery uses ephemeral
+  materializations and delta-first row changes where available. Unsupported
+  incremental operator shapes keep explicit diagnostics and recompute/refresh
+  fallback; final row `sort(...)`, `limit(...)`, and `sortLimit(...)`
+  materializations rebuild affected ordered/windowed snapshots from source rows.
   Incremental aggregate maintenance supports a narrow subset; `avg(expr)` is
   incremental only when matching visible `sum(expr)`/`count(expr)` fields are
-  present over a non-null numeric base field or numeric literal.
-  Materialization `index` exposes set and hash facades over cached snapshot rows;
-  btree and unique facades return explicit unsupported result families. General
-  constraints, operator-maintained views/indexes, adapter-fed deltas for host
-  invalidations, async watch streams, and public IVM APIs are outside the current
-  guarantees.
+  present over a non-null numeric base field or numeric literal. Named
+  `call(...)` functions are deterministic evaluate-time expressions;
+  materialized/incremental paths keep diagnostics and fallback unless a function
+  registry exists. Adapter-fed invalidations, async watch streams, and public IVM
+  APIs are outside the current guarantees.
 
 See [developer-onboarding.md](../../docs/developer-onboarding.md) for current
 API status, onboarding flows, and package direction.

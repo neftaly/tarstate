@@ -21,6 +21,8 @@ import {
   from,
   idField,
   insert,
+  maxBy,
+  minBy,
   pipe,
   project,
   relation,
@@ -72,6 +74,8 @@ describe('public Relic-shaped exports', () => {
     expect(req(item, 'label') satisfies ConstraintData).toMatchObject({ op: 'req' });
     expect(diffRows([{ id: 'a' }], [{ id: 'b' }]).changes).toHaveLength(2);
     expect(deleteRows(item, eq(itemRow.id, 'a'))).toMatchObject({ op: 'delete' });
+    expect(typeof maxBy).toBe('function');
+    expect(typeof minBy).toBe('function');
     expect(metadata?.kind).toBe('materialization');
     expect(handle.kind).toBe('watch');
     expect(events).toHaveLength(0);

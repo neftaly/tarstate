@@ -43,7 +43,9 @@ import {
   materializedRowsForQuery,
   maybe,
   max,
+  maxBy,
   min,
+  minBy,
   pipe,
   project,
   q,
@@ -710,6 +712,35 @@ describe('TypeScript Relic core acceptance', () => {
     expect(materializedRowsForQuery(removedBottom, pointExtremes)).toEqual([
       { topPoints: [8, 5], bottomPoints: [3, 5] }
     ]);
+  });
+
+  it('matches maxBy and minBy winners to topBy and bottomBy single-row aggregate semantics', async () => {
+    type RankedTask = { readonly task: { readonly id: string } };
+    type TaskWinnersRow = {
+      readonly maxTask: RankedTask | undefined;
+      readonly minTask: RankedTask | undefined;
+      readonly topTask: readonly RankedTask[];
+      readonly bottomTask: readonly RankedTask[];
+    };
+    const task = as(coreSchema.tasks, 'task');
+    const taskWinners = pipe(
+      from(task),
+      aggregate({
+        aggregates: {
+          maxTask: maxBy<RankedTask>(task.points),
+          minTask: minBy<RankedTask>(task.points),
+          topTask: topBy<RankedTask>(1, task.points),
+          bottomTask: bottomBy<RankedTask>(1, task.points)
+        }
+      })
+    );
+
+    const [ranking] = await qRows(createDb(sourceData), taskWinners) as readonly TaskWinnersRow[];
+
+    expect(ranking?.maxTask).toEqual(ranking?.topTask.at(0));
+    expect(ranking?.minTask).toEqual(ranking?.bottomTask.at(0));
+    expect(ranking?.maxTask?.task.id).toBe('t2');
+    expect(ranking?.minTask?.task.id).toBe('t3');
   });
 
   it('maintains materialized topBy and bottomBy aggregates across inserted, removed, and updated rows', async () => {

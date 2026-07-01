@@ -984,6 +984,10 @@ function evaluateAggregateSync(
       return rowsByAggregateSync(rows, expr.expr, state, 'desc').slice(0, expr.count ?? 0);
     case 'bottomBy':
       return rowsByAggregateSync(rows, expr.expr, state, 'asc').slice(0, expr.count ?? 0);
+    case 'maxBy':
+      return rowsByAggregateSync(rows, expr.expr, state, 'desc').at(0);
+    case 'minBy':
+      return rowsByAggregateSync(rows, expr.expr, state, 'asc').at(0);
   }
 }
 

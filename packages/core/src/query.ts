@@ -55,7 +55,9 @@ export type AggregateFunction =
   | 'top'
   | 'bottom'
   | 'topBy'
-  | 'bottomBy';
+  | 'bottomBy'
+  | 'maxBy'
+  | 'minBy';
 
 /** Canonical predicate data used by filters and joins. */
 export type PredicateData =
@@ -712,6 +714,22 @@ export function bottomBy<Row = unknown>(
   options: { readonly distinct?: boolean } = {}
 ): ExprData<readonly Row[]> {
   return aggregateCall('bottomBy', input, { ...options, count: aggregateLimit('bottomBy', count) });
+}
+
+/** Bind the highest row by aggregate input value. */
+export function maxBy<Row = unknown>(
+  input: ExprInput,
+  options: { readonly distinct?: boolean } = {}
+): ExprData<Row | undefined> {
+  return aggregateCall('maxBy', input, options);
+}
+
+/** Bind the lowest row by aggregate input value. */
+export function minBy<Row = unknown>(
+  input: ExprInput,
+  options: { readonly distinct?: boolean } = {}
+): ExprData<Row | undefined> {
+  return aggregateCall('minBy', input, options);
 }
 
 /**
