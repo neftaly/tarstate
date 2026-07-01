@@ -47,6 +47,7 @@ import {
   type MaintainedHashIndexState,
   type MaintainedIndexDefinition,
   type MaintainedIndexKind,
+  type MaintainedIndexPart,
   type MaintainedIndexes,
   type MaintainedIndexState,
   type MaintainedUniqueIndexState
@@ -143,9 +144,32 @@ export type MaterializationMaintenanceDecision = 'skipped' | 'carried' | 'recomp
 
 export type MaterializationIndexSpec =
   | { readonly kind: 'set' }
-  | { readonly kind: 'hash'; readonly expression: ExprData; readonly field?: string; readonly unique?: boolean }
-  | { readonly kind: 'unique'; readonly expression: ExprData; readonly field?: string; readonly unique: true }
-  | { readonly kind: 'btree'; readonly expression: ExprData; readonly field?: string };
+  | {
+      readonly kind: 'hash';
+      readonly expression: ExprData;
+      readonly expressions?: readonly [ExprData, ...ExprData[]];
+      readonly field?: string;
+      readonly fields?: readonly [string, ...string[]];
+      readonly relation?: string;
+      readonly unique?: boolean;
+    }
+  | {
+      readonly kind: 'unique';
+      readonly expression: ExprData;
+      readonly expressions?: readonly [ExprData, ...ExprData[]];
+      readonly field?: string;
+      readonly fields?: readonly [string, ...string[]];
+      readonly relation?: string;
+      readonly unique: true;
+    }
+  | {
+      readonly kind: 'btree';
+      readonly expression: ExprData;
+      readonly expressions?: readonly [ExprData, ...ExprData[]];
+      readonly field?: string;
+      readonly fields?: readonly [string, ...string[]];
+      readonly relation?: string;
+    };
 
 export type MaterializationOptions = {
   readonly id?: string;
@@ -800,6 +824,35 @@ export function materializedSourceFor<Row = unknown>(
   };
 }
 
+export function materializedLookupRowsFor(
+  input: unknown,
+  relation: RelationRef,
+  field: string,
+  value: unknown
+): readonly unknown[] | undefined {
+  if (!isObject(input)) {
+    return undefined;
+  }
+
+  const store = materializationStore.get(input);
+  if (store === undefined) {
+    return undefined;
+  }
+
+  for (const stored of uniqueMaterializations(store)) {
+    if (!materializationCanServeRelationLookup(stored, relation, field)) {
+      continue;
+    }
+
+    const rows = materializedEqualityRowsForStored(stored, field, value);
+    if (rows !== undefined) {
+      return rows;
+    }
+  }
+
+  return undefined;
+}
+
 function materializedEqualityRowsFor<Row>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
@@ -811,6 +864,14 @@ function materializedEqualityRowsFor<Row>(
     return undefined;
   }
 
+  return materializedEqualityRowsForStored(stored, field, value);
+}
+
+function materializedEqualityRowsForStored<Row>(
+  stored: StoredMaterialization<Row>,
+  field: string,
+  value: unknown
+): readonly Row[] | undefined {
   const fields = [field] as const;
   const unique = maintainedIndexFor(stored, 'unique', fields);
   if (unique !== undefined && unique.diagnostics.length === 0) {
@@ -819,16 +880,27 @@ function materializedEqualityRowsFor<Row>(
   }
 
   const hash = maintainedIndexFor(stored, 'hash', fields);
-  if (hash !== undefined) {
+  if (hash !== undefined && hash.diagnostics.length === 0) {
     return rowsFromNestedLookup(hash.lookup.get(value)) as readonly Row[];
   }
 
   const btree = maintainedIndexFor(stored, 'btree', fields);
-  if (btree !== undefined) {
+  if (btree !== undefined && btree.diagnostics.length === 0) {
     return rowsFromNestedLookup(btree.lookup.get(value)) as readonly Row[];
   }
 
   return undefined;
+}
+
+function materializationCanServeRelationLookup<Row>(
+  stored: StoredMaterialization<Row>,
+  relation: RelationRef,
+  field: string
+): boolean {
+  const shape = relationProjectionShape(stored.metadata.query);
+  return shape?.relation === relation.name &&
+    shape.projected &&
+    indexSpecMatchesRelationField(stored.metadata.indexSpecs, relation.name, field);
 }
 
 function materializedRangeRowsFor<Row>(
@@ -848,7 +920,7 @@ function materializedRangeRowsFor<Row>(
 
   const fields = [field] as const;
   const btree = maintainedIndexFor(stored, 'btree', fields);
-  if (btree === undefined) {
+  if (btree === undefined || btree.diagnostics.length > 0) {
     return undefined;
   }
 
@@ -889,6 +961,15 @@ export function index<Row = unknown, Value = unknown>(
     return missingIndexResult<Row, Value>(options.kind);
   }
 
+  const directExpression = directExpressionIndexExpression(options);
+  if (directExpression !== undefined) {
+    return unsupportedDirectExpressionIndexResult<Row, Value>(
+      stored,
+      options.kind as 'hash' | 'btree' | 'unique',
+      directExpression
+    );
+  }
+
   switch (options.kind) {
     case 'hash':
       return hashIndexResult<Row, Value>(stored, indexFields(options));
@@ -922,11 +1003,12 @@ function hashIndexResult<Row, Value>(
   const maintainedLookup = maintained?.lookup as ReadonlyMap<Value, MaterializationNestedRows<Row>> | undefined;
   const lookup = maintainedLookup ?? groupRowsByFields<Row, Value>(stored.rows as readonly Row[], fields);
   const facade = hashIndex<Row, Value>(lookup, fields);
+  const diagnostics = maintained?.diagnostics ?? [];
   return withMapLike(lookup, withTarget(stored, {
         kind: 'materializationHashIndex',
-        indexed: true,
+        indexed: diagnostics.length === 0,
         maintained: maintained !== undefined,
-        diagnostics: [],
+        diagnostics,
         ...indexFieldShape(fields),
         fields,
         lookup,
@@ -948,11 +1030,12 @@ function btreeIndexResult<Row, Value>(
     fields,
     maintained?.ordered as readonly Value[] | undefined
   );
+  const diagnostics = maintained?.diagnostics ?? [];
   return withMapLike(lookup, withTarget(stored, {
     kind: 'materializationBtreeIndex',
-    indexed: true,
+    indexed: diagnostics.length === 0,
     maintained: maintained !== undefined,
-    diagnostics: [],
+    diagnostics,
     ...indexFieldShape(fields),
     fields,
     lookup,
@@ -1090,11 +1173,15 @@ function materializationEntryWithRows<Row>(
   rows: readonly Row[],
   incremental?: IncrementalMaterialization<Row>
 ): StoredMaterialization<Row> {
+  const maintainedDefinitions = maintainedIndexDefinitions(metadata.indexSpecs);
   return {
-    metadata,
+    metadata: metadataWithIndexDiagnostics(
+      metadata,
+      maintainedDefinitions.flatMap((definition) => definition.diagnostics ?? [])
+    ),
     rows,
     rowIndex: materializationRowIndex(rows, materializationDiffOptions(metadata.query)),
-    indexes: buildMaintainedIndexes(rows, maintainedIndexDefinitions(metadata.indexSpecs)),
+    indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
     ...(incremental === undefined ? {} : { incremental })
   };
 }
@@ -1271,6 +1358,29 @@ function metadataWithIncrementalFallback<Row>(
       incrementalFallbackDiagnostic(metadata.id, metadata.queryKey, reason)
     ]
   };
+}
+
+function metadataWithIndexDiagnostics<Row>(
+  metadata: MaterializationMetadata<Row>,
+  diagnostics: readonly MaterializationDiagnostic[]
+): MaterializationMetadata<Row> {
+  if (diagnostics.length === 0) {
+    return metadata;
+  }
+
+  const existing = new Set(metadata.diagnostics.map((diagnostic) => stableKey(diagnostic)));
+  const nextDiagnostics = diagnostics.filter((diagnostic) => {
+    const key = stableKey(diagnostic);
+    if (existing.has(key)) {
+      return false;
+    }
+    existing.add(key);
+    return true;
+  });
+
+  return nextDiagnostics.length === 0
+    ? metadata
+    : { ...metadata, diagnostics: [...metadata.diagnostics, ...nextDiagnostics] };
 }
 
 function recomputeMaterializationEntry<Row>(
@@ -1826,7 +1936,7 @@ function maintenanceReasonForMode(mode: MaterializationMode): string {
 
 function materializationIndexSpecs(query: Query): readonly MaterializationIndexSpec[] {
   const specs: MaterializationIndexSpec[] = [{ kind: 'set' }];
-  collectIndexSpecs(query.data, specs);
+  collectIndexSpecs(query.data, specs, relationAliases(query.data));
   return specs;
 }
 
@@ -1837,19 +1947,27 @@ function maintainedIndexDefinitions(
   const seen = new Set<string>();
 
   for (const spec of specs) {
-    if (spec.kind === 'set' || spec.field === undefined) {
+    if (spec.kind === 'set') {
       continue;
     }
 
     const kind = maintainedKindForSpec(spec.kind);
-    const fields = [spec.field] as const;
-    const key = maintainedIndexKey(kind, fields);
+    const fields = indexSpecFields(spec);
+    const expressions = indexSpecExpressions(spec);
+    const definition = fields === undefined
+      ? expressionMaintainedIndexDefinition(kind, expressions)
+      : { kind, fields };
+    const key = maintainedIndexKey(
+      kind,
+      definition.fields,
+      definition.parts?.map((part) => part.identity)
+    );
     if (seen.has(key)) {
       continue;
     }
 
     seen.add(key);
-    definitions.push({ kind, fields });
+    definitions.push(definition);
   }
 
   return definitions;
@@ -1859,23 +1977,29 @@ function maintainedKindForSpec(kind: Exclude<MaterializationIndexSpec['kind'], '
   return kind;
 }
 
-function collectIndexSpecs(data: QueryData, specs: MaterializationIndexSpec[]): void {
+function collectIndexSpecs(
+  data: QueryData,
+  specs: MaterializationIndexSpec[],
+  aliases: ReadonlyMap<string, string>
+): void {
   switch (data.op) {
     case 'hash':
-      collectIndexSpecs(data.input, specs);
-      for (const expression of data.expressions) {
-        specs.push({
-          kind: data.unique === true ? 'unique' : 'hash',
-          expression,
-          ...indexFieldForExpression(expression),
-          ...(data.unique === true ? { unique: true } : {})
-        });
+      collectIndexSpecs(data.input, specs, aliases);
+      if (data.expressions.length > 0) {
+        const expressions = data.expressions as readonly [ExprData, ...ExprData[]];
+        specs.push(data.unique === true
+          ? indexSpecForExpressions('unique', expressions, aliases, true)
+          : indexSpecForExpressions('hash', expressions, aliases));
       }
       return;
     case 'btree':
-      collectIndexSpecs(data.input, specs);
-      for (const expression of data.expressions) {
-        specs.push({ kind: 'btree', expression, ...indexFieldForExpression(expression) });
+      collectIndexSpecs(data.input, specs, aliases);
+      if (data.expressions.length > 0) {
+        specs.push(indexSpecForExpressions(
+          'btree',
+          data.expressions as readonly [ExprData, ...ExprData[]],
+          aliases
+        ));
       }
       return;
     case 'where':
@@ -1890,21 +2014,21 @@ function collectIndexSpecs(data: QueryData, specs: MaterializationIndexSpec[]): 
     case 'rename':
     case 'qualify':
     case 'aggregate':
-      collectIndexSpecs(data.input, specs);
+      collectIndexSpecs(data.input, specs, aliases);
       return;
     case 'join':
-      collectIndexSpecs(data.left, specs);
-      collectIndexSpecs(data.right, specs);
+      collectIndexSpecs(data.left, specs, aliases);
+      collectIndexSpecs(data.right, specs, aliases);
       return;
     case 'union':
     case 'intersection':
       for (const input of data.inputs) {
-        collectIndexSpecs(input, specs);
+        collectIndexSpecs(input, specs, aliases);
       }
       return;
     case 'difference':
-      collectIndexSpecs(data.left, specs);
-      collectIndexSpecs(data.right, specs);
+      collectIndexSpecs(data.left, specs, aliases);
+      collectIndexSpecs(data.right, specs, aliases);
       return;
     case 'from':
     case 'lookup':
@@ -1913,8 +2037,365 @@ function collectIndexSpecs(data: QueryData, specs: MaterializationIndexSpec[]): 
   }
 }
 
-function indexFieldForExpression(expression: ExprData): { readonly field?: string } {
-  return expression.op === 'field' ? { field: expression.field } : {};
+function indexSpecForExpressions(
+  kind: 'hash',
+  expressions: readonly [ExprData, ...ExprData[]],
+  aliases: ReadonlyMap<string, string>,
+  unique?: false
+): Extract<MaterializationIndexSpec, { readonly kind: 'hash' }>;
+function indexSpecForExpressions(
+  kind: 'unique',
+  expressions: readonly [ExprData, ...ExprData[]],
+  aliases: ReadonlyMap<string, string>,
+  unique: true
+): Extract<MaterializationIndexSpec, { readonly kind: 'unique' }>;
+function indexSpecForExpressions(
+  kind: 'btree',
+  expressions: readonly [ExprData, ...ExprData[]],
+  aliases: ReadonlyMap<string, string>
+): Extract<MaterializationIndexSpec, { readonly kind: 'btree' }>;
+function indexSpecForExpressions(
+  kind: 'hash' | 'unique' | 'btree',
+  expressions: readonly [ExprData, ...ExprData[]],
+  aliases: ReadonlyMap<string, string>,
+  unique?: boolean
+): Exclude<MaterializationIndexSpec, { readonly kind: 'set' }> {
+  const expression = expressions.length === 1
+    ? expressions[0] as ExprData
+    : { op: 'tuple', items: expressions } as ExprData;
+  const fieldShape = indexFieldShapeForExpressions(expressions, aliases);
+  const expressionShape = expressions.length === 1 ? {} : { expressions };
+
+  return {
+    kind,
+    expression,
+    ...expressionShape,
+    ...fieldShape,
+    ...(unique === true ? { unique: true } : {})
+  } as Exclude<MaterializationIndexSpec, { readonly kind: 'set' }>;
+}
+
+function indexFieldShapeForExpressions(
+  expressions: readonly [ExprData, ...ExprData[]],
+  aliases: ReadonlyMap<string, string>
+): {
+  readonly field?: string;
+  readonly fields?: readonly [string, ...string[]];
+  readonly relation?: string;
+} {
+  if (!expressions.every((expression) => expression.op === 'field')) {
+    return {};
+  }
+
+  const fields = expressions.map((expression) => (expression as Extract<ExprData, { readonly op: 'field' }>).field) as [string, ...string[]];
+  const relations = expressions.map((expression) =>
+    aliases.get((expression as Extract<ExprData, { readonly op: 'field' }>).alias)
+  );
+  const relation = relations.every((candidate) => candidate !== undefined && candidate === relations[0])
+    ? relations[0]
+    : undefined;
+
+  return fields.length === 1
+    ? {
+        field: fields[0],
+        ...(relation === undefined ? {} : { relation })
+      }
+    : {
+        fields,
+        ...(relation === undefined ? {} : { relation })
+      };
+}
+
+function indexSpecFields(
+  spec: Exclude<MaterializationIndexSpec, { readonly kind: 'set' }>
+): readonly [string, ...string[]] | undefined {
+  if (spec.fields !== undefined) {
+    return spec.fields;
+  }
+  return spec.field === undefined ? undefined : [spec.field];
+}
+
+function indexSpecExpressions(
+  spec: Exclude<MaterializationIndexSpec, { readonly kind: 'set' }>
+): readonly [ExprData, ...ExprData[]] {
+  return spec.expressions ?? [spec.expression];
+}
+
+function expressionMaintainedIndexDefinition(
+  kind: MaintainedIndexKind,
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaintainedIndexDefinition {
+  const partsAndDiagnostics = expressions.map(indexPartForExpression);
+  const parts = partsAndDiagnostics.map((item) => item.part) as [MaintainedIndexPart, ...MaintainedIndexPart[]];
+  return {
+    kind,
+    fields: parts.map((part) => part.label) as [string, ...string[]],
+    parts,
+    diagnostics: partsAndDiagnostics.flatMap((item) => item.diagnostics)
+  };
+}
+
+function indexPartForExpression(expression: ExprData): {
+  readonly part: MaintainedIndexPart;
+  readonly diagnostics: readonly MaterializationDiagnostic[];
+} {
+  const diagnostics = deterministicIndexExpressionDiagnostics(expression);
+  return {
+    part: {
+      label: expressionDescription(expression),
+      identity: stableKey(expression),
+      value: diagnostics.length === 0
+        ? (row) => indexExpressionValue(row, expression)
+        : () => ({ value: undefined })
+    },
+    diagnostics
+  };
+}
+
+function deterministicIndexExpressionDiagnostics(expression: ExprData): readonly MaterializationDiagnostic[] {
+  switch (expression.op) {
+    case 'field':
+    case 'value':
+      return [];
+    case 'tuple':
+      return expression.items.flatMap((item) => deterministicIndexExpressionDiagnostics(item));
+    case 'hostCall':
+      return [
+        ...(expression.fn === undefined
+          ? [unsupportedIndexExpressionDiagnostic(expression, 'host function is not available')]
+          : []),
+        ...expression.args.flatMap((arg) => deterministicIndexExpressionDiagnostics(arg))
+      ];
+    case 'env':
+      return [unsupportedIndexExpressionDiagnostic(expression, 'env expressions are not stable row-local values')];
+    case 'call':
+      return [unsupportedIndexExpressionDiagnostic(expression, 'named function expressions require runtime functions')];
+    case 'aggregateCall':
+      return [unsupportedIndexExpressionDiagnostic(expression, 'aggregate expressions are not row-local index values')];
+    case 'subquery':
+      return [unsupportedIndexExpressionDiagnostic(expression, 'subquery expressions are not row-local index values')];
+  }
+}
+
+function indexExpressionValue(row: unknown, expression: ExprData): {
+  readonly value: unknown;
+  readonly diagnostics?: readonly MaterializationDiagnostic[];
+} {
+  switch (expression.op) {
+    case 'field':
+      return { value: indexExpressionFieldValue(row, expression.alias, expression.field) };
+    case 'value':
+      return { value: expression.value };
+    case 'tuple': {
+      const items = expression.items.map((item) => indexExpressionValue(row, item));
+      const diagnostics = items.flatMap((item) => item.diagnostics ?? []);
+      return {
+        value: items.map((item) => item.value),
+        ...(diagnostics.length === 0 ? {} : { diagnostics })
+      };
+    }
+    case 'hostCall': {
+      if (expression.fn === undefined) {
+        return {
+          value: undefined,
+          diagnostics: [unsupportedIndexExpressionDiagnostic(expression, 'host function is not available')]
+        };
+      }
+
+      const args = expression.args.map((arg) => indexExpressionValue(row, arg));
+      const diagnostics = args.flatMap((arg) => arg.diagnostics ?? []);
+      if (diagnostics.length > 0) {
+        return { value: undefined, diagnostics };
+      }
+
+      try {
+        return { value: expression.fn(...args.map((arg) => arg.value)) };
+      } catch (error) {
+        return {
+          value: undefined,
+          diagnostics: [{
+            code: 'materialization_index_unsupported',
+            message: `materialization index expression ${expressionDescription(expression)} failed`,
+            surface: 'materialization',
+            detail: {
+              expression,
+              reason: 'host function threw',
+              error
+            }
+          }]
+        };
+      }
+    }
+    case 'env':
+    case 'call':
+    case 'aggregateCall':
+    case 'subquery':
+      return {
+        value: undefined,
+        diagnostics: deterministicIndexExpressionDiagnostics(expression)
+      };
+  }
+}
+
+function indexExpressionFieldValue(row: unknown, alias: string, field: string): unknown {
+  const aliased = isRecord(row) ? row[alias] : undefined;
+
+  if (isRecord(aliased)) {
+    return aliased[field];
+  }
+
+  if (aliased !== undefined && field === 'value') {
+    return aliased;
+  }
+
+  return isRecord(row) ? row[field] : undefined;
+}
+
+function unsupportedIndexExpressionDiagnostic(
+  expression: ExprData,
+  reason: string
+): UnsupportedMaterializationIndexDiagnostic {
+  return {
+    code: 'materialization_index_unsupported',
+    message: `materialization index expression ${expressionDescription(expression)} is not supported`,
+    surface: 'materialization',
+    detail: {
+      expression,
+      reason
+    }
+  };
+}
+
+function expressionDescription(expression: ExprData): string {
+  switch (expression.op) {
+    case 'field':
+      return `${expression.alias}.${expression.field}`;
+    case 'env':
+      return `env.${expression.name}`;
+    case 'call':
+    case 'hostCall':
+      return `${expression.name}(...)`;
+    case 'tuple':
+      return `tuple(${expression.items.map((item) => expressionDescription(item)).join(',')})`;
+    case 'aggregateCall':
+      return `${expression.name}(...)`;
+    case 'subquery':
+      return `subquery:${expression.mode}`;
+    case 'value':
+      return 'value';
+  }
+}
+
+function relationAliases(data: QueryData): ReadonlyMap<string, string> {
+  const aliases = new Map<string, string>();
+  collectRelationAliases(data, aliases);
+  return aliases;
+}
+
+function collectRelationAliases(data: QueryData, aliases: Map<string, string>): void {
+  switch (data.op) {
+    case 'from':
+    case 'lookup':
+      aliases.set(data.alias, data.relation);
+      return;
+    case 'where':
+    case 'hash':
+    case 'btree':
+    case 'keyBy':
+    case 'select':
+    case 'extend':
+    case 'expand':
+    case 'without':
+    case 'sort':
+    case 'limit':
+    case 'sortLimit':
+    case 'rename':
+    case 'qualify':
+    case 'aggregate':
+      collectRelationAliases(data.input, aliases);
+      return;
+    case 'join':
+      collectRelationAliases(data.left, aliases);
+      collectRelationAliases(data.right, aliases);
+      return;
+    case 'union':
+    case 'intersection':
+      for (const input of data.inputs) {
+        collectRelationAliases(input, aliases);
+      }
+      return;
+    case 'difference':
+      collectRelationAliases(data.left, aliases);
+      collectRelationAliases(data.right, aliases);
+      return;
+    case 'constRows':
+      return;
+  }
+}
+
+function relationProjectionShape(query: Query): {
+  readonly relation: string;
+  readonly alias: string;
+  readonly projected: boolean;
+} | undefined {
+  return relationProjectionShapeForData(query.data, query.relations);
+}
+
+function relationProjectionShapeForData(
+  data: QueryData,
+  relations: Readonly<Record<string, RelationRef>>
+): {
+  readonly relation: string;
+  readonly alias: string;
+  readonly projected: boolean;
+} | undefined {
+  switch (data.op) {
+    case 'from':
+      return { relation: data.relation, alias: data.alias, projected: false };
+    case 'hash':
+    case 'btree':
+    case 'keyBy':
+      return relationProjectionShapeForData(data.input, relations);
+    case 'select': {
+      const input = relationProjectionShapeForData(data.input, relations);
+      const relation = input === undefined ? undefined : relations[input.relation];
+      return input !== undefined &&
+        relation !== undefined &&
+        projectionCoversRelation(data.projection, relation, input.alias)
+        ? { ...input, projected: true }
+        : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function projectionCoversRelation(
+  projection: ProjectionData,
+  relation: RelationRef,
+  alias: string
+): boolean {
+  return Object.keys(relation.fields).every((field) => {
+    const projected = projection[field];
+    if (projected === undefined || isOptionalProjection(projected)) {
+      return false;
+    }
+    return projected.op === 'field' &&
+      projected.alias === alias &&
+      projected.field === field;
+  });
+}
+
+function indexSpecMatchesRelationField(
+  specs: readonly MaterializationIndexSpec[],
+  relation: string,
+  field: string
+): boolean {
+  return specs.some((spec) => spec.kind !== 'set' &&
+    (spec.kind === 'hash' || spec.kind === 'unique') &&
+    spec.field === field &&
+    spec.relation === relation
+  );
 }
 
 function indexFields(options: MaterializationIndexOptions): readonly string[] {
@@ -2326,6 +2807,74 @@ function missingIndexResult<Row, Value>(kind: MaterializationIndexOptions['kind'
         rows,
         raw: rows
       });
+    }
+  }
+}
+
+function directExpressionIndexExpression(options: MaterializationIndexOptions): ExprData | undefined {
+  const candidate = options as { readonly expression?: unknown };
+  return options.kind !== undefined &&
+    options.kind !== 'set' &&
+    candidate.expression !== undefined &&
+    !('field' in options) &&
+    !('fields' in options)
+    ? candidate.expression as ExprData
+    : undefined;
+}
+
+function unsupportedDirectExpressionIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  kind: 'hash' | 'btree' | 'unique',
+  expression: ExprData
+):
+  | MaterializationHashIndexResult<Row, Value>
+  | MaterializationBtreeIndexResult<Row, Value>
+  | MaterializationUniqueIndexResult<Row, Value> {
+  const diagnostics: readonly MaterializationDiagnostic[] = [{
+    code: 'materialization_index_unsupported',
+    message: 'direct expression materialization index facade reads are not supported; project the expression into a field',
+    surface: 'materialization',
+    detail: { kind, expression }
+  }];
+
+  switch (kind) {
+    case 'hash': {
+      const lookup = new Map<Value, MaterializationNestedRows<Row>>();
+      return withMapLike(lookup, withTarget(stored, {
+        kind: 'materializationHashIndex',
+        indexed: false,
+        maintained: false,
+        diagnostics,
+        fields: [],
+        lookup,
+        raw: lookup
+      }));
+    }
+    case 'btree': {
+      const lookup = new Map<Value, MaterializationNestedRows<Row>>();
+      return withMapLike(lookup, withTarget(stored, {
+        kind: 'materializationBtreeIndex',
+        indexed: false,
+        maintained: false,
+        diagnostics,
+        fields: [],
+        lookup,
+        raw: lookup,
+        ordered: [],
+        range: () => []
+      }));
+    }
+    case 'unique': {
+      const lookup = new Map<Value, MaterializationNestedUniqueRows<Row>>();
+      return withMapLike(lookup, withTarget(stored, {
+        kind: 'materializationUniqueIndex',
+        indexed: false,
+        maintained: false,
+        diagnostics,
+        fields: [],
+        lookup,
+        raw: lookup
+      }));
     }
   }
 }

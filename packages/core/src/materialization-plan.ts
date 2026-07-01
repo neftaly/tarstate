@@ -100,6 +100,7 @@ type IncrementalPipelineStep =
 
 type IncrementalJoinStep = {
   readonly kind: 'join';
+  readonly joinKind: 'inner' | 'left';
   readonly id: string;
   readonly right: IncrementalBranchPlan;
   readonly left: ExprData;
@@ -270,7 +271,11 @@ const supportedAggregateFunctions: ReadonlySet<AggregateFunction> = new Set([
   'notAny',
   'setConcat',
   'top',
-  'bottom'
+  'bottom',
+  'topBy',
+  'bottomBy',
+  'maxBy',
+  'minBy'
 ]);
 
 export function planIncrementalMaterialization(query: Query): IncrementalPlanResult {
@@ -452,7 +457,7 @@ export function maintainIncrementalMaterialization<Row>(
 
   const rootKeys: (string | undefined)[] = [...materialization.state.rootKeys];
   const rootIndexByKey = new Map(rootIndexByKeyForState(materialization.state));
-  const vacantRootIndices: number[] = [];
+  const rootInsertIndexByKey = keyChangeInsertIndexes(relation, rootChanges, rootIndexByKey);
   const rootRowsByRootKey = new Map(materialization.state.rootRowsByRootKey);
   const outputsByRootKey = new Map(materialization.state.outputsByRootKey);
   const rootKeysToEvaluate = new Set<string>();
@@ -536,7 +541,6 @@ export function maintainIncrementalMaterialization<Row>(
       removeRootJoinValues(rootJoinIndexes, change.key);
       rootKeys[index] = undefined;
       rootIndexByKey.delete(change.key);
-      vacantRootIndices.push(index);
       rootRowsByRootKey.delete(change.key);
       outputsByRootKey.delete(change.key);
       rootKeysToEvaluate.delete(change.key);
@@ -552,13 +556,13 @@ export function maintainIncrementalMaterialization<Row>(
         };
       }
 
-      const vacantIndex = vacantRootIndices.shift();
-      if (vacantIndex === undefined) {
+      const keyChangeIndex = rootInsertIndexByKey.get(change.key);
+      if (keyChangeIndex !== undefined && rootKeys[keyChangeIndex] === undefined) {
+        rootKeys[keyChangeIndex] = change.key;
+        rootIndexByKey.set(change.key, keyChangeIndex);
+      } else {
         rootIndexByKey.set(change.key, rootKeys.length);
         rootKeys.push(change.key);
-      } else {
-        rootKeys[vacantIndex] = change.key;
-        rootIndexByKey.set(change.key, vacantIndex);
       }
     } else if (change.before === undefined) {
       return {
@@ -772,10 +776,6 @@ function collectSingleRootPlan(
     }
     case 'join': {
       const stepCount = steps.length;
-      if (data.kind !== 'inner') {
-        return 'left join incremental maintenance is not supported';
-      }
-
       const left = collectSingleRootPlan(data.left, steps, collection);
       if (typeof left === 'string') return left;
       if (hasAggregateStep(steps.slice(stepCount))) {
@@ -798,13 +798,14 @@ function collectSingleRootPlan(
 
       const equality = equalityJoinPlan(data.on, (expr) => expressionSideForShapes(expr, left.shape, right.shape));
       if (equality === undefined) {
-        return 'inner join incremental maintenance requires an unambiguous field equality predicate';
+        return `${data.kind} join incremental maintenance requires an unambiguous field equality predicate`;
       }
 
       const id = `join:${collection.joinCount}`;
       collection.joinCount += 1;
       steps.push({
         kind: 'join',
+        joinKind: data.kind,
         id,
         right: branchPlan(right),
         left: equality.left,
@@ -1298,6 +1299,7 @@ function evaluateJoinStep(
   for (const leftRow of rows) {
     const leftValue = exprValue(leftRow, step.left, env);
     const candidates = state.indexByValue.get(stableKey(leftValue)) ?? [];
+    let matched = false;
     for (const candidate of candidates) {
       if (!Object.is(leftValue, candidate.value)) {
         continue;
@@ -1305,8 +1307,13 @@ function evaluateJoinStep(
 
       const merged = { ...leftRow, ...candidate.row };
       if (!step.needsPredicateCheck || matchesPredicate(merged, step.predicate, env)) {
+        matched = true;
         output.push(merged);
       }
+    }
+
+    if (!matched && step.joinKind === 'left') {
+      output.push(leftRow);
     }
   }
 
@@ -1757,6 +1764,10 @@ function evaluateAggregate(
       return rowsByAggregate(rows, expr.expr, env, 'desc').slice(0, expr.count ?? 0);
     case 'bottomBy':
       return rowsByAggregate(rows, expr.expr, env, 'asc').slice(0, expr.count ?? 0);
+    case 'maxBy':
+      return rowsByAggregate(rows, expr.expr, env, 'desc').at(0);
+    case 'minBy':
+      return rowsByAggregate(rows, expr.expr, env, 'asc').at(0);
   }
 }
 
@@ -2012,7 +2023,7 @@ function applyRightRelationChanges(
 ): RightChangeResult {
   const relationKeys: (string | undefined)[] = [...state.relationKeys];
   const relationIndexByKey = new Map(relationIndexByKeyForState(state));
-  const vacantRelationIndices: number[] = [];
+  const relationInsertIndexByKey = keyChangeInsertIndexes(relation, changes, relationIndexByKey);
   const rowsByRelationKey = new Map(state.rowsByRelationKey);
   const indexByValue = mutableRightIndex(state.indexByValue);
   const affectedValues: unknown[] = [];
@@ -2033,7 +2044,6 @@ function applyRightRelationChanges(
       removeRightIndexRows(step, indexByValue, previousRows, env);
       relationKeys[index] = undefined;
       relationIndexByKey.delete(change.key);
-      vacantRelationIndices.push(index);
       rowsByRelationKey.delete(change.key);
       continue;
     }
@@ -2046,13 +2056,13 @@ function applyRightRelationChanges(
         };
       }
 
-      const vacantIndex = vacantRelationIndices.shift();
-      if (vacantIndex === undefined) {
+      const keyChangeIndex = relationInsertIndexByKey.get(change.key);
+      if (keyChangeIndex !== undefined && relationKeys[keyChangeIndex] === undefined) {
+        relationKeys[keyChangeIndex] = change.key;
+        relationIndexByKey.set(change.key, keyChangeIndex);
+      } else {
         relationIndexByKey.set(change.key, relationKeys.length);
         relationKeys.push(change.key);
-      } else {
-        relationKeys[vacantIndex] = change.key;
-        relationIndexByKey.set(change.key, vacantIndex);
       }
     } else if (change.before === undefined) {
       return {
@@ -2292,6 +2302,63 @@ function deltaRowChange(entry: MutableDeltaRows): readonly DeltaRowChange[] {
   }
 
   return [{ key: entry.key, before, after }];
+}
+
+function keyChangeInsertIndexes(
+  relation: RelationRef,
+  changes: readonly DeltaRowChange[],
+  indexByKey: ReadonlyMap<string, number>
+): ReadonlyMap<string, number> {
+  const removed = changes.filter((change) => change.before !== undefined && change.after === undefined);
+  const usedRemoved = new Set<string>();
+  const insertIndexes = new Map<string, number>();
+
+  for (const added of changes) {
+    if (added.before !== undefined || added.after === undefined) {
+      continue;
+    }
+
+    const removedChange = removed.find((candidate) => (
+      !usedRemoved.has(candidate.key) &&
+      candidate.before !== undefined &&
+      rowsMatchExceptRelationKey(relation, candidate.before, added.after)
+    ));
+    if (removedChange === undefined) {
+      continue;
+    }
+
+    const index = indexByKey.get(removedChange.key);
+    if (index === undefined) {
+      continue;
+    }
+
+    usedRemoved.add(removedChange.key);
+    insertIndexes.set(added.key, index);
+  }
+
+  return insertIndexes;
+}
+
+function rowsMatchExceptRelationKey(relation: RelationRef, left: unknown, right: unknown): boolean {
+  if (!isRecord(left) || !isRecord(right)) {
+    return false;
+  }
+
+  return stableKey(rowWithoutRelationKey(relation, left)) === stableKey(rowWithoutRelationKey(relation, right));
+}
+
+function rowWithoutRelationKey(relation: RelationRef, row: Record<string, unknown>): Record<string, unknown> {
+  const output = { ...row };
+  for (const field of relationKeyFields(relation)) {
+    delete output[field];
+  }
+  return output;
+}
+
+function relationKeyFields(relation: RelationRef): readonly string[] {
+  return Array.isArray(relation.key)
+    ? relation.key
+    : [relation.key as string];
 }
 
 function cancelIntermediateRows(

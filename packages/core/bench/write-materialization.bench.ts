@@ -2,6 +2,9 @@ import { bench, describe } from 'vitest';
 import {
   aggregate,
   avg,
+  btree,
+  bottomBy,
+  call,
   constrain,
   count,
   createDb,
@@ -9,19 +12,25 @@ import {
   deleteWhere,
   diffQuery,
   eq,
+  extend,
+  field,
   from,
   gte,
+  hash,
   index,
   insert,
   keyBy,
   mat,
   pipe,
+  project,
   qRows,
   sum,
   trackTransact,
   transact,
   tryTransact,
+  topBy,
   unique,
+  uniqueIndex,
   updateWhere,
   watch
 } from '@tarstate/core';
@@ -43,8 +52,56 @@ const options = {
   iterations: 10
 };
 
+function activeBucket(active: boolean): string {
+  return active ? 'active' : 'inactive';
+}
+
+function capacityBand(capacity: number): number {
+  return Math.floor(capacity / 10) * 10;
+}
+
+function regionEmailSlug(region: string, email: string): string {
+  return `${region}:${email}`;
+}
+
 const medium = createBenchFixture('medium');
 const large = createBenchFixture('large');
+const activeBucketRef = field<string>('computed', 'activeBucket');
+const capacityBandRef = field<number>('computed', 'capacityBand');
+const regionEmailRef = field<string>('computed', 'regionEmail');
+const compoundIndexedPeople = pipe(
+  from(personRef),
+  hash(personRef.role, personRef.region),
+  uniqueIndex(personRef.region, personRef.id),
+  project({
+    id: personRef.id,
+    email: personRef.email,
+    role: personRef.role,
+    region: personRef.region,
+    capacity: personRef.capacity
+  }),
+  keyBy('id')
+);
+const expressionIndexedPeople = pipe(
+  from(personRef),
+  extend({
+    activeBucket: call(activeBucket, personRef.active),
+    capacityBand: call(capacityBand, personRef.capacity),
+    regionEmail: call(regionEmailSlug, personRef.region, personRef.email)
+  }),
+  hash(activeBucketRef),
+  btree(capacityBandRef),
+  uniqueIndex(regionEmailRef),
+  project({
+    id: personRef.id,
+    email: personRef.email,
+    region: personRef.region,
+    activeBucket: activeBucketRef,
+    capacityBand: capacityBandRef,
+    regionEmail: regionEmailRef
+  }),
+  keyBy('id')
+);
 const singlePersonInsert = insert(benchSchema.people, extraPerson(0));
 const batchTaskInserts = extraTasks(medium.data, 24).map((row) => insert(benchSchema.tasks, row));
 const predicateTaskUpdate = updateWhere(benchSchema.tasks, gte(taskRef.points, 8), { priority: 5 });
@@ -59,18 +116,36 @@ const materialized = mat(createDb(medium.data), {
 const materializedIndexedPeople = mat(createDb(medium.data), {
   indexedPeople: medium.queries.indexedPeople
 }, { mode: 'incremental' });
+const materializedCompoundIndexedPeople = mat(createDb(medium.data), {
+  compoundIndexedPeople
+}, { mode: 'incremental' });
+const materializedExpressionIndexedPeople = mat(createDb(medium.data), {
+  expressionIndexedPeople
+});
 const incrementalMaterialized = mat(createDb(medium.data), {
   activePeople: medium.queries.activePeople,
   openTasks: medium.queries.openTasks
 }, { mode: 'incremental' });
 const materializedTaskInsert = insert(benchSchema.tasks, extraTask(medium.data, 100));
 const materializedIndexedPeopleInsert = extraPerson(102);
+const compoundIndexedPeopleInsert = extraPerson(502, { role: 'engineer', region: 'apac' });
+const expressionIndexedPeopleInsert = extraPerson(503, { active: false, capacity: 44, region: 'emea' });
 const maintainedMaterializedIndexedPeople = transact(
   materializedIndexedPeople,
   insert(benchSchema.people, materializedIndexedPeopleInsert)
 );
+const maintainedMaterializedCompoundIndexedPeople = transact(
+  materializedCompoundIndexedPeople,
+  insert(benchSchema.people, compoundIndexedPeopleInsert)
+);
+const maintainedMaterializedExpressionIndexedPeople = transact(
+  materializedExpressionIndexedPeople,
+  insert(benchSchema.people, expressionIndexedPeopleInsert)
+);
 const materializedIndexedPeopleExisting = medium.data.people[Math.floor(medium.data.people.length / 2)]
   ?? medium.data.people[0]!;
+const expressionIndexedPeopleInsertBucket = activeBucket(expressionIndexedPeopleInsert.active);
+const expressionIndexedPeopleInsertCapacityBand = capacityBand(expressionIndexedPeopleInsert.capacity);
 const incrementalPeopleInsert = insert(benchSchema.people, extraPerson(101));
 const largeMaterializedJoin = mat(createDb(large.data), {
   taskProjectOwnerJoin: large.queries.taskProjectOwnerJoin
@@ -86,6 +161,23 @@ const largeMaterializedJoinOwnerUpdate = updateWhere(benchSchema.people, eq(pers
   name: 'Updated Owner',
   role: 'principal'
 });
+const largeSnapshotMaterializedLeftJoin = mat(createDb(large.data), {
+  reviewerLeftJoin: large.queries.reviewerLeftJoinMissHeavy
+});
+const largeIncrementalMaterializedLeftJoin = mat(createDb(large.data), {
+  reviewerLeftJoin: large.queries.reviewerLeftJoinMissHeavy
+}, { mode: 'incremental' });
+const largeLeftJoinReviewerId = large.data.tasks.find((task) => task.reviewerId !== undefined)?.reviewerId
+  ?? large.data.people[0]?.id
+  ?? '';
+const largeMaterializedLeftJoinReviewerUpdate = updateWhere(
+  benchSchema.people,
+  eq(personRef.id, largeLeftJoinReviewerId),
+  {
+    name: 'Updated Reviewer',
+    role: 'review-lead'
+  }
+);
 const largeProjectTaskRollups = pipe(
   from(taskRef),
   aggregate({
@@ -103,6 +195,23 @@ const largeSnapshotMaterializedAggregate = mat(createDb(large.data), {
 });
 const largeIncrementalMaterializedAggregate = mat(createDb(large.data), {
   projectTaskRollups: largeProjectTaskRollups
+}, { mode: 'incremental' });
+const largeProjectTaskRankings = pipe(
+  from(taskRef),
+  aggregate({
+    groupBy: { projectId: taskRef.projectId },
+    aggregates: {
+      topTasks: topBy(5, taskRef.points),
+      bottomTasks: bottomBy(5, taskRef.points)
+    }
+  }),
+  keyBy('projectId')
+);
+const largeSnapshotMaterializedRankings = mat(createDb(large.data), {
+  projectTaskRankings: largeProjectTaskRankings
+});
+const largeIncrementalMaterializedRankings = mat(createDb(large.data), {
+  projectTaskRankings: largeProjectTaskRankings
 }, { mode: 'incremental' });
 const largeAggregateInsertProjectId = large.data.projects[0]?.id ?? '';
 const largeAggregateTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 400, {
@@ -124,6 +233,25 @@ const largeAggregateTaskProjectUpdate = updateWhere(
 );
 const largeAggregateDeleteTaskId = large.data.tasks[Math.floor(large.data.tasks.length / 2)]?.id ?? '';
 const largeAggregateTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.id, largeAggregateDeleteTaskId));
+const largeRankingInsertProjectId = large.data.projects[0]?.id ?? '';
+const largeRankingTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 500, {
+  projectId: largeRankingInsertProjectId,
+  points: 14
+}));
+const largeRankingLowestTask = [...large.data.tasks]
+  .filter((task) => task.projectId === largeRankingInsertProjectId)
+  .sort((left, right) => left.points - right.points)
+  .at(0) ?? large.data.tasks[0];
+const largeRankingTaskUpdate = updateWhere(
+  benchSchema.tasks,
+  eq(taskRef.id, largeRankingLowestTask?.id ?? ''),
+  { points: 15 }
+);
+const largeRankingHighestTask = [...large.data.tasks]
+  .filter((task) => task.projectId === largeRankingInsertProjectId)
+  .sort((left, right) => right.points - left.points)
+  .at(0) ?? large.data.tasks[0];
+const largeRankingTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.id, largeRankingHighestTask?.id ?? ''));
 const watchBase = createDb(medium.data);
 const watchNext = transact(watchBase, insert(benchSchema.people, extraPerson(200)));
 const watchHandle = watch(watchBase, medium.queries.activePeople, () => undefined);
@@ -198,6 +326,20 @@ describe('core write and materialization benchmarks', () => {
     consumeBenchResult(transact(incrementalMaterialized, incrementalPeopleInsert));
   }, options);
 
+  bench('materialized transact incremental: maintain compound people indexes', () => {
+    consumeBenchResult(transact(
+      materializedCompoundIndexedPeople,
+      insert(benchSchema.people, compoundIndexedPeopleInsert)
+    ));
+  }, options);
+
+  bench('materialized transact: maintain expression-projected people indexes', () => {
+    consumeBenchResult(transact(
+      materializedExpressionIndexedPeople,
+      insert(benchSchema.people, expressionIndexedPeopleInsert)
+    ));
+  }, options);
+
   bench('materialized transact large: maintain joined task query', () => {
     consumeBenchResult(transact(largeMaterializedJoin, largeMaterializedJoinTaskInsert));
   }, options);
@@ -212,6 +354,14 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized transact large incremental: maintain joined task query from owner update', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedJoin, largeMaterializedJoinOwnerUpdate));
+  }, options);
+
+  bench('materialized transact large leftJoin snapshot: reviewer update', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedLeftJoin, largeMaterializedLeftJoinReviewerUpdate));
+  }, options);
+
+  bench('materialized transact large leftJoin requested incremental: reviewer update', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedLeftJoin, largeMaterializedLeftJoinReviewerUpdate));
   }, options);
 
   bench('materialized transact large aggregate snapshot: task insert', () => {
@@ -236,6 +386,30 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized transact large aggregate requested incremental: task delete', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedAggregate, largeAggregateTaskDelete));
+  }, options);
+
+  bench('materialized transact large topBy/bottomBy aggregate snapshot: task insert', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedRankings, largeRankingTaskInsert));
+  }, options);
+
+  bench('materialized transact large topBy/bottomBy aggregate requested incremental: task insert', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedRankings, largeRankingTaskInsert));
+  }, options);
+
+  bench('materialized transact large topBy/bottomBy aggregate snapshot: task update', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedRankings, largeRankingTaskUpdate));
+  }, options);
+
+  bench('materialized transact large topBy/bottomBy aggregate requested incremental: task update', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedRankings, largeRankingTaskUpdate));
+  }, options);
+
+  bench('materialized transact large topBy/bottomBy aggregate snapshot: task delete', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedRankings, largeRankingTaskDelete));
+  }, options);
+
+  bench('materialized transact large topBy/bottomBy aggregate requested incremental: task delete', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedRankings, largeRankingTaskDelete));
   }, options);
 
   bench('materialized index: set rows', () => {
@@ -294,6 +468,34 @@ describe('core write and materialization benchmarks', () => {
       kind: 'btree',
       field: 'capacity'
     }).index?.range({ lower: 35, upper: 45 }));
+  }, options);
+
+  bench('materialized compound index facade read after maintained insert: hash role,region', () => {
+    consumeBenchResult(index(maintainedMaterializedCompoundIndexedPeople, 'compoundIndexedPeople', {
+      kind: 'hash',
+      fields: ['role', 'region']
+    }).index?.rowsFor(compoundIndexedPeopleInsert.role, compoundIndexedPeopleInsert.region));
+  }, options);
+
+  bench('materialized compound index facade read after maintained insert: unique region,id', () => {
+    consumeBenchResult(index(maintainedMaterializedCompoundIndexedPeople, 'compoundIndexedPeople', {
+      kind: 'unique',
+      fields: ['region', 'id']
+    }).index?.rowFor(compoundIndexedPeopleInsert.region, compoundIndexedPeopleInsert.id));
+  }, options);
+
+  bench('materialized expression index facade read after maintained insert: hash activeBucket', () => {
+    consumeBenchResult(index(maintainedMaterializedExpressionIndexedPeople, 'expressionIndexedPeople', {
+      kind: 'hash',
+      field: 'activeBucket'
+    }).index?.get(expressionIndexedPeopleInsertBucket));
+  }, options);
+
+  bench('materialized expression index facade read after maintained insert: btree capacityBand', () => {
+    consumeBenchResult(index(maintainedMaterializedExpressionIndexedPeople, 'expressionIndexedPeople', {
+      kind: 'btree',
+      field: 'capacityBand'
+    }).index?.get(expressionIndexedPeopleInsertCapacityBand));
   }, options);
 
   bench('watch refresh: active people diff', async () => {

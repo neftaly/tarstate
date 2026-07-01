@@ -4,6 +4,7 @@ import {
   and,
   as,
   avg,
+  bottomBy,
   btree,
   call,
   count,
@@ -27,8 +28,10 @@ import {
   materializationForQuery,
   materializedRowsForQuery,
   max,
+  maxBy,
   maybe,
   min,
+  minBy,
   notAny,
   pipe,
   project,
@@ -80,6 +83,7 @@ type MaybeUserTeamRow = {
   readonly id: string;
   readonly name: string;
   readonly team: string | undefined;
+  readonly rank: number | undefined;
 };
 
 type TaskOwnerRow = {
@@ -99,6 +103,30 @@ type TaskProjectRollupRow = {
 type TaskProjectStatsRow = TaskProjectRollupRow & {
   readonly minPoints: number;
   readonly maxPoints: number;
+};
+
+type RankedTask = {
+  readonly task: TaskRow;
+};
+
+type TaskProjectRankingRow = {
+  readonly projectId: string;
+  readonly topTasks: readonly RankedTask[];
+  readonly bottomTasks: readonly RankedTask[];
+  readonly maxTask: RankedTask | undefined;
+  readonly minTask: RankedTask | undefined;
+  readonly topTask: readonly RankedTask[];
+  readonly bottomTask: readonly RankedTask[];
+};
+
+type TaskProjectRankingSummary = {
+  readonly projectId: string;
+  readonly top: readonly string[];
+  readonly bottom: readonly string[];
+  readonly max: string | undefined;
+  readonly min: string | undefined;
+  readonly topOne: readonly string[];
+  readonly bottomOne: readonly string[];
 };
 
 type TeamUserFacetRow = {
@@ -183,7 +211,7 @@ function leftUserTeamsQuery(): Query<MaybeUserTeamRow> {
   return pipe(
     from(user),
     leftJoin(from(team), eq(user.teamId, team.id)),
-    project({ id: user.id, name: user.name, team: maybe(team.name) }),
+    project({ id: user.id, name: user.name, team: maybe(team.name), rank: maybe(team.rank) }),
     keyBy('id')
   ) as Query<MaybeUserTeamRow>;
 }
@@ -231,6 +259,25 @@ function taskProjectStatsQuery(): Query<TaskProjectStatsRow> {
     }),
     keyBy('projectId')
   ) as Query<TaskProjectStatsRow>;
+}
+
+function taskProjectRankingsQuery(): Query<TaskProjectRankingRow> {
+  const task = as(coreSchema.tasks, 'task');
+  return pipe(
+    from(task),
+    aggregate({
+      groupBy: { projectId: task.ownerId },
+      aggregates: {
+        topTasks: topBy<RankedTask>(2, task.points),
+        bottomTasks: bottomBy<RankedTask>(2, task.points),
+        maxTask: maxBy<RankedTask>(task.points),
+        minTask: minBy<RankedTask>(task.points),
+        topTask: topBy<RankedTask>(1, task.points),
+        bottomTask: bottomBy<RankedTask>(1, task.points)
+      }
+    }),
+    keyBy('projectId')
+  ) as Query<TaskProjectRankingRow>;
 }
 
 function teamUserFacetsQuery(): Query<TeamUserFacetRow> {
@@ -404,6 +451,53 @@ function uniqueUsersByTeamQuery(): Query<UserRow> {
 
 function ids(rows: readonly { readonly id: string }[] | undefined): readonly string[] {
   return (rows ?? []).map((row) => row.id);
+}
+
+function rankedTaskIds(rows: readonly RankedTask[]): readonly string[] {
+  return rows.map((row) => row.task.id);
+}
+
+function rankedTaskId(row: RankedTask | undefined): string | undefined {
+  return row?.task.id;
+}
+
+function taskProjectRankingSummaries(
+  rows: readonly TaskProjectRankingRow[]
+): readonly TaskProjectRankingSummary[] {
+  return rows.map((row) => ({
+    projectId: row.projectId,
+    top: rankedTaskIds(row.topTasks),
+    bottom: rankedTaskIds(row.bottomTasks),
+    max: rankedTaskId(row.maxTask),
+    min: rankedTaskId(row.minTask),
+    topOne: rankedTaskIds(row.topTask),
+    bottomOne: rankedTaskIds(row.bottomTask)
+  }));
+}
+
+function expectTaskProjectRankingSummaries(
+  rows: readonly TaskProjectRankingRow[],
+  expected: readonly TaskProjectRankingSummary[]
+): void {
+  expect(taskProjectRankingSummaries(rows)).toEqual(expected);
+  for (const row of rows) {
+    expect(row.maxTask).toEqual(row.topTask.at(0));
+    expect(row.minTask).toEqual(row.bottomTask.at(0));
+  }
+}
+
+function expectSingleUpdatedTaskProjectRanking(
+  change: MaterializationMaintenanceResult<TaskProjectRankingRow>['changes'][number],
+  before: readonly TaskProjectRankingSummary[],
+  after: readonly TaskProjectRankingSummary[]
+): void {
+  expect(change.rowChanges).toHaveLength(1);
+  const rowChange = change.rowChanges[0];
+  if (rowChange?.kind !== 'updated') {
+    throw new Error('expected a single updated task ranking row change');
+  }
+  expectTaskProjectRankingSummaries([rowChange.before], before);
+  expectTaskProjectRankingSummaries([rowChange.after], after);
 }
 
 describe('incremental materialization', () => {
@@ -967,41 +1061,250 @@ describe('incremental materialization', () => {
       expect(materializedRowsForQuery(withoutMissingGroup, teamUserFacets)).toEqual(deletedChange.rows);
     });
 
-    it('falls back with an explicit diagnostic for unsupported aggregate shapes', () => {
-      const task = as(coreSchema.tasks, 'task');
-      const taskProjectRankings = pipe(
-        from(task),
-        aggregate({
-          groupBy: { projectId: task.ownerId },
-          aggregates: {
-            topTasks: topBy(2, task.points)
-          }
-        }),
-        keyBy('projectId')
-      );
-
+    it('marks initial by-row aggregate winner materialization as incrementally maintained', () => {
+      const taskProjectRankings = taskProjectRankingsQuery();
       const state = mat(createDb(sourceData), taskProjectRankings, {
         id: 'task-project-rankings',
         mode: 'incremental'
       });
       const metadata = materializationForQuery(state, taskProjectRankings);
-      const fallback = metadata?.diagnostics.find((diagnostic) => (
-        diagnostic.code === 'materialization_incremental_fallback'
-      ));
 
       expect(metadata).toMatchObject({
+        id: 'task-project-rankings',
         requestedMode: 'incremental',
-        maintenance: 'snapshot'
+        maintenance: 'incremental',
+        dependencies: ['tasks']
       });
-      expect(fallback).toEqual(expect.objectContaining({
-        code: 'materialization_incremental_fallback',
-        detail: expect.objectContaining({
-          mode: 'incremental',
-          fallback: 'recompute',
-          id: 'task-project-rankings',
-          reason: expect.stringMatching(/aggregate|topBy|unsupported|not supported/i)
-        })
-      }));
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expectTaskProjectRankingSummaries(materializedRowsForQuery(state, taskProjectRankings) ?? [], [
+        {
+          projectId: 'ada',
+          top: ['t2', 't1'],
+          bottom: ['t1', 't2'],
+          max: 't2',
+          min: 't1',
+          topOne: ['t2'],
+          bottomOne: ['t1']
+        },
+        {
+          projectId: 'bea',
+          top: ['t3'],
+          bottom: ['t3'],
+          max: 't3',
+          min: 't3',
+          topOne: ['t3'],
+          bottomOne: ['t3']
+        }
+      ]);
+    });
+
+    it('incrementally updates by-row aggregate winners across inserts, updates, and deletes', () => {
+      const taskProjectRankings = taskProjectRankingsQuery();
+      const state = mat(createDb(sourceData), taskProjectRankings, {
+        id: 'task-project-rankings',
+        mode: 'incremental'
+      });
+      const initialAda: TaskProjectRankingSummary = {
+        projectId: 'ada',
+        top: ['t2', 't1'],
+        bottom: ['t1', 't2'],
+        max: 't2',
+        min: 't1',
+        topOne: ['t2'],
+        bottomOne: ['t1']
+      };
+      const initialBea: TaskProjectRankingSummary = {
+        projectId: 'bea',
+        top: ['t3'],
+        bottom: ['t3'],
+        max: 't3',
+        min: 't3',
+        topOne: ['t3'],
+        bottomOne: ['t3']
+      };
+      const insertedTopTask: TaskRow = {
+        id: 't4',
+        ownerId: 'ada',
+        title: 'Spike aggregate maintenance',
+        done: false,
+        points: 10
+      };
+      const withInsertedTop = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, insertedTopTask]
+      });
+      const insertedAda: TaskProjectRankingSummary = {
+        projectId: 'ada',
+        top: ['t4', 't2'],
+        bottom: ['t1', 't2'],
+        max: 't4',
+        min: 't1',
+        topOne: ['t4'],
+        bottomOne: ['t1']
+      };
+
+      const inserted = maintainMaterializations(state, withInsertedTop, {
+        deltas: [tasksDelta([insertedTopTask], [])]
+      });
+      const insertedChange = singleMaterializationChange(inserted, 'task-project-rankings') as
+        MaterializationMaintenanceResult<TaskProjectRankingRow>['changes'][number];
+
+      expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(insertedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['tasks'],
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+      expectTaskProjectRankingSummaries(insertedChange.rows, [insertedAda, initialBea]);
+      expectSingleUpdatedTaskProjectRanking(insertedChange, [initialAda], [insertedAda]);
+      expect(materializedRowsForQuery(withInsertedTop, taskProjectRankings)).toEqual(insertedChange.rows);
+
+      const updatedBottomTask = { ...insertedTopTask, points: 1 };
+      const withUpdatedBottom = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, updatedBottomTask]
+      });
+      const updatedAda: TaskProjectRankingSummary = {
+        projectId: 'ada',
+        top: ['t2', 't1'],
+        bottom: ['t4', 't1'],
+        max: 't2',
+        min: 't4',
+        topOne: ['t2'],
+        bottomOne: ['t4']
+      };
+
+      const updated = maintainMaterializations(withInsertedTop, withUpdatedBottom, {
+        deltas: [tasksDelta([updatedBottomTask], [insertedTopTask])]
+      });
+      const updatedChange = singleMaterializationChange(updated, 'task-project-rankings') as
+        MaterializationMaintenanceResult<TaskProjectRankingRow>['changes'][number];
+
+      expect(updated).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(updatedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['tasks'],
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...updated.diagnostics, ...updatedChange.diagnostics]);
+      expectTaskProjectRankingSummaries(updatedChange.rows, [updatedAda, initialBea]);
+      expectSingleUpdatedTaskProjectRanking(updatedChange, [insertedAda], [updatedAda]);
+      expect(materializedRowsForQuery(withUpdatedBottom, taskProjectRankings)).toEqual(updatedChange.rows);
+
+      const withoutInsertedTask = createDb(sourceData);
+      const deleted = maintainMaterializations(withUpdatedBottom, withoutInsertedTask, {
+        deltas: [tasksDelta([], [updatedBottomTask])]
+      });
+      const deletedChange = singleMaterializationChange(deleted, 'task-project-rankings') as
+        MaterializationMaintenanceResult<TaskProjectRankingRow>['changes'][number];
+
+      expect(deleted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(deletedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['tasks'],
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...deleted.diagnostics, ...deletedChange.diagnostics]);
+      expectTaskProjectRankingSummaries(deletedChange.rows, [initialAda, initialBea]);
+      expectSingleUpdatedTaskProjectRanking(deletedChange, [updatedAda], [initialAda]);
+      expect(materializedRowsForQuery(withoutInsertedTask, taskProjectRankings)).toEqual(deletedChange.rows);
+    });
+
+    it('incrementally updates both by-row aggregate groups when a ranked row moves group', () => {
+      const taskProjectRankings = taskProjectRankingsQuery();
+      const extraAdaTask: TaskRow = {
+        id: 't4',
+        ownerId: 'ada',
+        title: 'Move ranked task between groups',
+        done: false,
+        points: 10
+      };
+      const initial = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, extraAdaTask]
+      });
+      const state = mat(initial, taskProjectRankings, {
+        id: 'task-project-rankings',
+        mode: 'incremental'
+      });
+      const movedToBea = { ...extraAdaTask, ownerId: 'bea', points: 9 };
+      const next = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, movedToBea]
+      });
+
+      const maintained = maintainMaterializations(state, next, {
+        deltas: [tasksDelta([movedToBea], [extraAdaTask])]
+      });
+      const change = singleMaterializationChange(maintained, 'task-project-rankings') as
+        MaterializationMaintenanceResult<TaskProjectRankingRow>['changes'][number];
+
+      const initialAda: TaskProjectRankingSummary = {
+        projectId: 'ada',
+        top: ['t4', 't2'],
+        bottom: ['t1', 't2'],
+        max: 't4',
+        min: 't1',
+        topOne: ['t4'],
+        bottomOne: ['t1']
+      };
+      const movedAda: TaskProjectRankingSummary = {
+        projectId: 'ada',
+        top: ['t2', 't1'],
+        bottom: ['t1', 't2'],
+        max: 't2',
+        min: 't1',
+        topOne: ['t2'],
+        bottomOne: ['t1']
+      };
+      const initialBea: TaskProjectRankingSummary = {
+        projectId: 'bea',
+        top: ['t3'],
+        bottom: ['t3'],
+        max: 't3',
+        min: 't3',
+        topOne: ['t3'],
+        bottomOne: ['t3']
+      };
+      const movedBea: TaskProjectRankingSummary = {
+        projectId: 'bea',
+        top: ['t4', 't3'],
+        bottom: ['t3', 't4'],
+        max: 't4',
+        min: 't3',
+        topOne: ['t4'],
+        bottomOne: ['t3']
+      };
+
+      expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(change).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['tasks'],
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+      expectTaskProjectRankingSummaries(change.rows, [movedAda, movedBea]);
+      expect(change.rowChanges).toHaveLength(2);
+      const updatedRows = change.rowChanges.filter((rowChange) => rowChange.kind === 'updated');
+      expect(updatedRows).toHaveLength(2);
+      expectTaskProjectRankingSummaries(
+        updatedRows.map((rowChange) => rowChange.before),
+        [initialAda, initialBea]
+      );
+      expectTaskProjectRankingSummaries(
+        updatedRows.map((rowChange) => rowChange.after),
+        [movedAda, movedBea]
+      );
+      expect(materializedRowsForQuery(next, taskProjectRankings)).toEqual(change.rows);
     });
   });
 
@@ -1233,7 +1536,7 @@ describe('incremental materialization', () => {
     ]);
   });
 
-  it('keeps snapshot fallback diagnostics and correctness for unsupported sortLimit and host-call shapes', async () => {
+  it('keeps snapshot fallback diagnostics and correctness for unsupported sortLimit materialization', async () => {
     const user = as(coreSchema.users, 'user');
     const topUsers = pipe(
       from(user),
@@ -1241,18 +1544,11 @@ describe('incremental materialization', () => {
       project({ id: user.id, name: user.name, age: user.age }),
       keyBy('id')
     );
-    const withAgeBand = pipe(
-      from(user),
-      project({
-        id: user.id,
-        band: call((age: number) => age >= 30 ? 'senior' : 'junior', user.age)
-      }),
-      keyBy('id')
-    );
 
     const sortedState = mat(createDb(sourceData), topUsers, { id: 'top-users', mode: 'incremental' });
     const sortedMetadata = materializationForQuery(sortedState, topUsers);
     expect(sortedMetadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'snapshot' });
+    expect(sortedMetadata?.maintenanceReason).toContain('sortLimit');
     expectIncrementalFallback(sortedMetadata?.diagnostics ?? []);
     await expect(qRows(sortedState, topUsers)).resolves.toEqual([
       { id: 'cal', name: 'Cal', age: 41 },
@@ -1271,6 +1567,18 @@ describe('incremental materialization', () => {
       { id: 'eli', name: 'Eli', age: 45 },
       { id: 'cal', name: 'Cal', age: 41 }
     ]);
+  });
+
+  it('keeps snapshot fallback diagnostics and correctness for unsupported host-call shapes', async () => {
+    const user = as(coreSchema.users, 'user');
+    const withAgeBand = pipe(
+      from(user),
+      project({
+        id: user.id,
+        band: call((age: number) => age >= 30 ? 'senior' : 'junior', user.age)
+      }),
+      keyBy('id')
+    );
 
     const hostState = mat(createDb(sourceData), withAgeBand, { id: 'age-bands', mode: 'incremental' });
     const hostMetadata = materializationForQuery(hostState, withAgeBand);
@@ -1701,29 +2009,202 @@ describe('incremental materialization', () => {
     expect(materializedRowsForQuery(next, residualTaskOwners)).toEqual(change.rows);
   });
 
-  it('falls back to snapshot maintenance for unsupported left joins with an explicit diagnostic', () => {
+  it('marks initial left equality joins as incrementally maintained without fallback', () => {
     const leftUserTeams = leftUserTeamsQuery();
     const state = mat(createDb(sourceData), leftUserTeams, { id: 'left-user-teams', mode: 'incremental' });
     const metadata = materializationForQuery(state, leftUserTeams);
 
     expect(metadata).toMatchObject({
+      id: 'left-user-teams',
       requestedMode: 'incremental',
-      maintenance: 'snapshot'
+      maintenance: 'incremental'
     });
-    expect(metadata?.maintenanceReason).toContain('left join');
-    expect(metadata?.diagnostics).toEqual(expect.arrayContaining([
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['users', 'teams']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, leftUserTeams)).toEqual([
+      { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+      { id: 'bea', name: 'Bea', team: 'Design', rank: 2 },
+      { id: 'cal', name: 'Cal', team: undefined, rank: undefined }
+    ]);
+  });
+
+  it('incrementally maintains left equality joins for left relation inserts, updates, and deletes', () => {
+    const leftUserTeams = leftUserTeamsQuery();
+    const state = mat(createDb(sourceData), leftUserTeams, { id: 'left-user-teams', mode: 'incremental' });
+    const updatedAda = { ...adaUser, name: 'Ada Lovelace' };
+    const updatedCal = { ...calUser, name: 'Cal Unmatched' };
+    const next = createDb({
+      ...sourceData,
+      users: [updatedAda, updatedCal, diaUser]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([updatedAda, updatedCal, diaUser], [adaUser, calUser, beaUser])]
+    });
+    const change = singleMaterializationChange(maintained, 'left-user-teams');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { id: 'ada', name: 'Ada Lovelace', team: 'Engineering', rank: 1 },
+        { id: 'cal', name: 'Cal Unmatched', team: undefined, rank: undefined },
+        { id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 }
+      ],
+      addedRows: [{ id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 }],
+      removedRows: [{ id: 'bea', name: 'Bea', team: 'Design', rank: 2 }]
+    });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change.rowChanges).toHaveLength(4);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        code: 'materialization_incremental_fallback',
-        detail: expect.objectContaining({
-          reason: expect.stringContaining('left join')
-        })
+        kind: 'updated',
+        before: { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+        after: { id: 'ada', name: 'Ada Lovelace', team: 'Engineering', rank: 1 }
+      }),
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'cal', name: 'Cal', team: undefined, rank: undefined },
+        after: { id: 'cal', name: 'Cal Unmatched', team: undefined, rank: undefined }
+      }),
+      expect.objectContaining({
+        kind: 'removed',
+        row: { id: 'bea', name: 'Bea', team: 'Design', rank: 2 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 }
       })
     ]));
-    expect(materializedRowsForQuery(state, leftUserTeams)).toEqual([
-      { id: 'ada', name: 'Ada', team: 'Engineering' },
-      { id: 'bea', name: 'Bea', team: 'Design' },
-      { id: 'cal', name: 'Cal', team: undefined }
+    expect(materializedRowsForQuery(next, leftUserTeams)).toEqual(change.rows);
+  });
+
+  it('updates previously unmatched left rows when a matching right row is inserted', () => {
+    const leftUserTeams = leftUserTeamsQuery();
+    const state = mat(createDb(sourceData), leftUserTeams, { id: 'left-user-teams', mode: 'incremental' });
+    const supportTeam: TeamRow = { id: 'missing', name: 'Support', rank: 5 };
+    const next = createDb({
+      ...sourceData,
+      teams: [...sourceData.teams, supportTeam]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [teamsDelta([supportTeam], [])]
+    });
+    const change = singleMaterializationChange(maintained, 'left-user-teams');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['teams'],
+      rows: [
+        { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+        { id: 'bea', name: 'Bea', team: 'Design', rank: 2 },
+        { id: 'cal', name: 'Cal', team: 'Support', rank: 5 }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change.rowChanges).toEqual([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'cal', name: 'Cal', team: undefined, rank: undefined },
+        after: { id: 'cal', name: 'Cal', team: 'Support', rank: 5 }
+      })
     ]);
+    expect(materializedRowsForQuery(next, leftUserTeams)).toEqual(change.rows);
+  });
+
+  it('turns matched left rows into unmatched rows when a matching right row is deleted', () => {
+    const leftUserTeams = leftUserTeamsQuery();
+    const state = mat(createDb(sourceData), leftUserTeams, { id: 'left-user-teams', mode: 'incremental' });
+    const next = createDb({
+      ...sourceData,
+      teams: [engineeringTeam]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [teamsDelta([], [designTeam])]
+    });
+    const change = singleMaterializationChange(maintained, 'left-user-teams');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['teams'],
+      rows: [
+        { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+        { id: 'bea', name: 'Bea', team: undefined, rank: undefined },
+        { id: 'cal', name: 'Cal', team: undefined, rank: undefined }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change.rowChanges).toEqual([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'bea', name: 'Bea', team: 'Design', rank: 2 },
+        after: { id: 'bea', name: 'Bea', team: undefined, rank: undefined }
+      })
+    ]);
+    expect(materializedRowsForQuery(next, leftUserTeams)).toEqual(change.rows);
+  });
+
+  it('updates many left rows from one right row change without expanding the report to a snapshot diff', () => {
+    const leftUserTeams = leftUserTeamsQuery();
+    const initial = createDb({
+      ...sourceData,
+      users: [...sourceData.users, diaUser]
+    });
+    const state = mat(initial, leftUserTeams, { id: 'left-user-teams', mode: 'incremental' });
+    const updatedEngineeringTeam = { ...engineeringTeam, name: 'Engineering Platform', rank: 3 };
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, diaUser],
+      teams: [designTeam, updatedEngineeringTeam]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [teamsDelta([updatedEngineeringTeam], [engineeringTeam])]
+    });
+    const change = singleMaterializationChange(maintained, 'left-user-teams');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['teams'],
+      rows: [
+        { id: 'ada', name: 'Ada', team: 'Engineering Platform', rank: 3 },
+        { id: 'bea', name: 'Bea', team: 'Design', rank: 2 },
+        { id: 'cal', name: 'Cal', team: undefined, rank: undefined },
+        { id: 'dia', name: 'Dia', team: 'Engineering Platform', rank: 3 }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change.rowChanges).toHaveLength(2);
+    expect(change.rowChanges.length).toBeLessThan(change.rows.length);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
+        after: { id: 'ada', name: 'Ada', team: 'Engineering Platform', rank: 3 }
+      }),
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 'dia', name: 'Dia', team: 'Engineering', rank: 1 },
+        after: { id: 'dia', name: 'Dia', team: 'Engineering Platform', rank: 3 }
+      })
+    ]));
+    expect(materializedRowsForQuery(next, leftUserTeams)).toEqual(change.rows);
   });
 
   it('keeps declared hash and btree facades correct after incremental insert, key move, and delete', async () => {
