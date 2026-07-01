@@ -42,6 +42,18 @@ import {
 import { queryKey, type Query } from '@tarstate/core/query';
 import { trackTransact } from '@tarstate/core/runtime';
 import type { MaybePromise, RelationSource } from '@tarstate/core/source';
+export { createStore } from '@tarstate/core/store';
+export type {
+  Store,
+  StoreCommitResult,
+  StoreDiagnostic,
+  StoreMaterializationResult,
+  StoreOptions,
+  StoreQueryResult,
+  StoreSnapshot,
+  StoreView,
+  StoreViewOptions
+} from '@tarstate/core/store';
 import type { TrackedChange, WatchRuntimeDiagnostic } from '@tarstate/core/watch';
 import type { WritePatch } from '@tarstate/core/write';
 

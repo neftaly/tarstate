@@ -10,6 +10,10 @@ other structured data outside a renderer package.
 
 The core API is stabilizing around a Relic-shaped split:
 
+- `store` is the small app-facing facade: `createStore(seedRows)` returns a
+  renderer-independent store with `query`, `queries`, `view`, non-throwing
+  `commit`, and subscriptions. A `view(query)` is the stable derived-read API;
+  materialization stays an optional cache behind the same `view.read()` shape.
 - `query` describes relational row programs as data, including joins,
   explicit lookup, hash-declared equality lookup planning, btree-declared range
   lookup planning, dependency analysis, projections, aggregates, and nested
@@ -142,6 +146,7 @@ Examples and onboarding should teach taxonomy subpath imports:
 - `@tarstate/core/runtime`
 - `@tarstate/core/schema`
 - `@tarstate/core/source`
+- `@tarstate/core/store`
 - `@tarstate/core/watch`
 - `@tarstate/core/write`
 - `@tarstate/core/write-apply`

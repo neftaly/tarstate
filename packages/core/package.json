@@ -20,6 +20,7 @@
     "./runtime": "./src/runtime.ts",
     "./schema": "./src/schema.ts",
     "./source": "./src/source.ts",
+    "./store": "./src/store.ts",
     "./watch": "./src/watch.ts",
     "./write-apply": "./src/write-apply.ts",
     "./write": "./src/write.ts"

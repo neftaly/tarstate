@@ -10,6 +10,7 @@
       "@tarstate/core/db": ["../core/dist/db.d.ts"],
       "@tarstate/core/evaluate": ["../core/dist/evaluate.d.ts"],
       "@tarstate/core/query": ["../core/dist/query.d.ts"],
+      "@tarstate/core/store": ["../core/dist/store.d.ts"],
       "@tarstate/core/write": ["../core/dist/write.d.ts"]
     }
   },

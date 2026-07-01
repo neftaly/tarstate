@@ -31,6 +31,7 @@ import { write, type WritePatch } from '@tarstate/core/write';
 import {
   createAdapterStore,
   createDbStore,
+  createStore,
   createRuntimeStore,
   createSourceStore,
   TarstateProvider,
@@ -103,6 +104,7 @@ const matchingTodoPairs = pipe(
 describe('@tarstate/react', () => {
   it('exports a revisioned external-store surface', () => {
     expectTypeOf(createDbStore()).toMatchTypeOf<TarstateStore<TarstateDbSnapshot>>();
+    expectTypeOf(createStore()).toHaveProperty('view');
     expectTypeOf(createDbStore(undefined, { constraints: [] })).toMatchTypeOf<TarstateStore<TarstateDbSnapshot>>();
     expectTypeOf(useTarstateStore).returns.toMatchTypeOf<TarstateStore>();
     expectTypeOf(useTarstateSnapshot<TarstateDbSnapshot>).returns.toMatchTypeOf<TarstateDbSnapshot>();

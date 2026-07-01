@@ -66,6 +66,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
           runtime: 'src/runtime.ts',
           schema: 'src/schema.ts',
           source: 'src/source.ts',
+          store: 'src/store.ts',
           watch: 'src/watch.ts',
           'write-apply': 'src/write-apply.ts',
           write: 'src/write.ts'
@@ -98,6 +99,7 @@ const sourceAliases = [
   { find: '@tarstate/core/runtime', replacement: path.join(repoRoot, 'packages/core/src/runtime.ts') },
   { find: '@tarstate/core/schema', replacement: path.join(repoRoot, 'packages/core/src/schema.ts') },
   { find: '@tarstate/core/source', replacement: path.join(repoRoot, 'packages/core/src/source.ts') },
+  { find: '@tarstate/core/store', replacement: path.join(repoRoot, 'packages/core/src/store.ts') },
   { find: '@tarstate/core/watch', replacement: path.join(repoRoot, 'packages/core/src/watch.ts') },
   { find: '@tarstate/core/write-apply', replacement: path.join(repoRoot, 'packages/core/src/write-apply.ts') },
   { find: '@tarstate/core/write', replacement: path.join(repoRoot, 'packages/core/src/write.ts') },

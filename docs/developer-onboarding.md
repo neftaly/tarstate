@@ -15,8 +15,11 @@ patches. Tarstate should not own rendering, storage, networking, scheduling, or
 document sync. Those belong in adapters and consumers.
 
 Near-term API stabilization should center on schema, query, write, source,
-adapter, DB, and React consumption APIs. Constraints, materialization, watch,
-and runtime orchestration remain experimental, diagnostic-backed surfaces.
+adapter, DB, store, and React consumption APIs. The app-facing core path should
+be `createStore(seedRows)`, `store.query(query)`, `store.view(query)`, and
+non-throwing `store.commit(patches)`. Constraints, materialization, watch, and
+runtime orchestration remain experimental, diagnostic-backed surfaces behind
+that facade where possible.
 Incremental view maintenance (IVM) is only an opportunistic optimization behind
 materialized snapshots, not Tarstate's product identity or a general public API.
 
@@ -35,6 +38,7 @@ materialized snapshots, not Tarstate's product identity or a general public API.
 | `@tarstate/core/write` | Stabilizing patch API | Typed `insert`, `insertIgnore`, `update`, `upsert`, `insertOrReplace`, `insertOrMerge`/`insertOrUpdate`, `delete`, `deleteExact`, and `replaceAll` patch constructors. |
 | `@tarstate/core/write-apply` | Functional object runtime support | Object-backed `applyWrites` and `applyWritesAtomic` helpers for runtimes and adapters that explicitly stage mutable relation arrays. |
 | `@tarstate/core/db` | Stabilizing object runtime | `createDb`, `q`, `qMany`, `row`, `exists`, `whatIf`, `tryTransact`, and `transact` for prototypes, tests, and small object-backed runtimes. `q` and `whatIf` accept a single query or a named query batch. `q`, `qMany`, and `whatIf` can apply post-evaluation `mapRows` result shaping while preserving diagnostics; this is not a query planner, transducer, or collection protocol. Transactions are all-or-nothing and committed results include relation deltas. |
+| `@tarstate/core/store` | Stabilizing app facade | `createStore` wraps the object-backed DB runtime with `query`, `queries`, `view`, non-throwing `commit`, revisioned snapshots, and subscriptions. `view(query)` is the preferred derived-state API; materialized snapshots are an optional cache behind `view.read()`/`view.rows()`, not a separate API consumers must build around. |
 | `@tarstate/core/constraints` | Experimental diagnostic-backed validation/enforcement | `check`, `req`, `fk`, `unique`, and `constrain` build descriptors. `validateConstraints` can scan a source for `req`, `unique`, `fk`, and query-bound `check`; `tryTransactConstrained` and `transactConstrained` can reject object-backed writes; unbound `check` remains explicitly unsupported. Attachment, adapter enforcement, and lifecycle are still open. |
 | `@tarstate/core/materialization` | Experimental diagnostic-backed snapshot cache | `mat` is the async snapshot materialization shorthand for `materializeSnapshot`; both cache one-shot rows readable by id or query key. `readMaterializedQuery` reads cached rows for an exact structural query key only when the source version can be verified current; misses, stale versions, and metadata without rows return explicit diagnostics instead of recomputing. `demat` removes metadata and cached snapshot rows. `materializedSourceFor` exposes cached rows as one read-only `RelationSource` relation; `snapshotIndex` can expose only cached snapshot rows as a set index, `snapshotHashIndex` can build read-only hash lookup maps derived from cached snapshot rows, and none of these helpers is an operator-maintained index, view putback surface, or general IVM API. `refreshMaterializationSnapshot` can recompute an existing snapshot, and `maintainMaterializationSnapshots` can carry snapshots onto a new DB/source object, skipping unaffected snapshots when relation deltas are supplied. Opt-in incremental maintenance is limited to single-relation pure-filter/project/extend-style queries with optional final field/literal/tuple `sort(...)`, `limit(...)`, or `sortLimit(...)` maintained by source-row rebuild, simple inner/left equality joins over base relations with optional side `hash`/`where` filters and output transforms, and a narrow aggregate subset with `count()`, `count(expr)`, `sum(expr)`, `min(expr)`, `max(expr)`, `any(expr)`, `notAny(expr)`, and `avg(expr)` only when matching visible `sum(expr)`/`count(expr)` fields are present over a non-null numeric base field or numeric literal; unsupported shapes/options, join-side output transforms, non-final row windows, and unsafe aggregate or join removals keep explicit diagnostics and recompute fallback. |
 | `@tarstate/core/memory-runtime` | Functional local runtime | `createMemoryRelationRuntime` exposes object-backed rows through the same `RelationRuntime` source/target contract used by durable and presence adapters. It is for tests, local state, and adapter prototyping; accepted row-changing writes report `durability: 'memory'` and increment a numeric source version. |
@@ -46,7 +50,7 @@ materialized snapshots, not Tarstate's product identity or a general public API.
 Examples and onboarding should import from taxonomy subpaths such as
 `@tarstate/core/schema`, `@tarstate/core/query`, `@tarstate/core/source`,
 `@tarstate/core/adapter`, `@tarstate/core/write`, and
-`@tarstate/core/write-apply`. The root barrel
+`@tarstate/core/store`. The root barrel
 `@tarstate/core` remains available as a convenience export, but it should not be
 the default teaching path.
 

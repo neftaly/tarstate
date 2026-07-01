@@ -39,6 +39,8 @@ import {
   isRelationSource,
   type RelationSource
 } from '@tarstate/core/source';
+import * as store from '@tarstate/core/store';
+import { createStore, type Store } from '@tarstate/core/store';
 import * as watch from '@tarstate/core/watch';
 import * as writeApply from '@tarstate/core/write-apply';
 import * as write from '@tarstate/core/write';
@@ -130,6 +132,8 @@ describe('tarstate core public exports', () => {
     expect(schema).toHaveProperty('jsonField');
     expect(source).toHaveProperty('fromObjectSource');
     expect(source).not.toHaveProperty('asRelationSource');
+    expect(store).toHaveProperty('createStore');
+    expect(core).toHaveProperty('createStore');
     expect(watch).toHaveProperty('watch');
     expect(watch).toHaveProperty('watchRuntime');
     expect(watch).toHaveProperty('subscribeWatch');
@@ -182,11 +186,16 @@ describe('tarstate core public exports', () => {
     expectTypeOf(nextDb).toMatchTypeOf<Db>();
 
     const result = await q(nextDb, openTodoSummaries);
+    const consumerStore = createStore(nextDb);
 
     expect(result).toEqual({
       rows: [{ id: 'todo-b', title: 'Beta' }],
       diagnostics: []
     });
+    expectTypeOf(consumerStore).toMatchTypeOf<Store>();
+    await expect(consumerStore.view(openTodoSummaries).rows()).resolves.toEqual([
+      { id: 'todo-b', title: 'Beta' }
+    ]);
     expect(queryKey(openTodoSummaries)).toContain('query:');
 
     const dbBackedSource = dbSource(nextDb);

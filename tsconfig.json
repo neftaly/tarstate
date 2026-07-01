@@ -61,6 +61,9 @@
       "@tarstate/core/source": [
         "./packages/core/src/source.ts"
       ],
+      "@tarstate/core/store": [
+        "./packages/core/src/store.ts"
+      ],
       "@tarstate/core/watch": [
         "./packages/core/src/watch.ts"
       ],
