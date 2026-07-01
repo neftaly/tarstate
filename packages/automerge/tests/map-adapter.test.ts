@@ -32,6 +32,12 @@ type TaskDocument = {
   };
 };
 
+type OptionalTaskDocument = {
+  readonly workspace?: {
+    readonly tasks?: Record<string, StoredTaskRow>;
+  };
+};
+
 const schema = defineSchema({
   tasks: relation<TaskRow>({
     key: 'id',
@@ -193,4 +199,152 @@ describe('automerge map adapter contract', () => {
       { id: 'task-a', title: 'Draft contract', done: false, rank: 1 }
     ]);
   });
+
+  it('creates missing nested map paths when inserting into an empty document', async () => {
+    const adapter = automergeMapAdapter<OptionalTaskDocument>({
+      doc: Automerge.from<OptionalTaskDocument>({}),
+      relations: taskRelations
+    });
+    const beforeHeads = Automerge.getHeads(adapter.getDoc());
+
+    const result = await tryCommitAdapter(adapter, [
+      tasks.insert({ id: 'task-a', title: 'Create nested path', done: false, rank: 1 })
+    ], { readVersion: true });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      patches: 1,
+      applied: 1,
+      diagnostics: []
+    });
+    expect(result.version).toEqual(Automerge.getHeads(adapter.getDoc()));
+    expect(result.version).not.toEqual(beforeHeads);
+    expect(adapter.getDoc().workspace?.tasks?.['task-a']).toEqual({
+      title: 'Create nested path',
+      done: false,
+      rank: 1
+    });
+    expect(await adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-a', title: 'Create nested path', done: false, rank: 1 }
+    ]);
+  });
+
+  it('replaceAll removes stale keys, writes replacement rows, and advances heads once', async () => {
+    const adapter = automergeMapAdapter<TaskDocument>({
+      doc: taskDoc({
+        'task-a': { title: 'Remove me', done: false, rank: 1 },
+        'task-b': { title: 'Keep with edits', done: false, rank: 2 }
+      }),
+      relations: taskRelations
+    });
+    const beforeHeads = Automerge.getHeads(adapter.getDoc());
+
+    const result = await tryCommitAdapter(adapter, [
+      tasks.replaceAll([
+        { id: 'task-b', title: 'Kept with edits', done: true, rank: 20 },
+        { id: 'task-c', title: 'Added replacement', done: false, rank: 30 }
+      ])
+    ], { readVersion: true });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      patches: 1,
+      applied: 1,
+      diagnostics: []
+    });
+    expect(result.deltas.map((delta) => delta.relation.name)).toEqual(['tasks']);
+    expect(result.version).toEqual(Automerge.getHeads(adapter.getDoc()));
+    expect(result.version).not.toEqual(beforeHeads);
+    expect(adapter.getDoc().workspace.tasks).toEqual({
+      'task-b': { title: 'Kept with edits', done: true, rank: 20 },
+      'task-c': { title: 'Added replacement', done: false, rank: 30 }
+    });
+  });
+
+  it('reports missing-key deletes as atomic no-ops with preserved heads', async () => {
+    const adapter = automergeMapAdapter<TaskDocument>({
+      doc: taskDoc({ 'task-a': { title: 'Keep me', done: false, rank: 1 } }),
+      relations: taskRelations
+    });
+    const beforeDoc = adapter.getDoc();
+    const beforeHeads = Automerge.getHeads(beforeDoc);
+
+    const result = await tryCommitAdapter(adapter, [
+      tasks.deleteByKey('task-missing')
+    ], { readVersion: true });
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      patches: 1,
+      applied: 0,
+      deltas: [],
+      diagnostics: [expect.objectContaining({ code: 'missing_ref', relation: 'tasks' })],
+      version: beforeHeads
+    });
+    expect(adapter.getDoc()).toBe(beforeDoc);
+    expect(Automerge.getHeads(adapter.getDoc())).toEqual(beforeHeads);
+    expect(await adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-a', title: 'Keep me', done: false, rank: 1 }
+    ]);
+  });
+
+  it('rejects invalid inserted rows without mutating the Automerge document', async () => {
+    const adapter = automergeMapAdapter<TaskDocument>({
+      doc: taskDoc({ 'task-a': { title: 'Keep me', done: false, rank: 1 } }),
+      relations: taskRelations
+    });
+    const beforeDoc = adapter.getDoc();
+    const beforeHeads = Automerge.getHeads(beforeDoc);
+
+    const result = await tryCommitAdapter(adapter, [
+      tasks.insert(taskRow({ id: 'task-b', title: 'Missing required fields' }))
+    ], { readVersion: true });
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      patches: 1,
+      applied: 0,
+      deltas: [],
+      diagnostics: [expect.objectContaining({ code: 'invalid_row', relation: 'tasks' })],
+      version: beforeHeads
+    });
+    expect(adapter.getDoc()).toBe(beforeDoc);
+    expect(Automerge.getHeads(adapter.getDoc())).toEqual(beforeHeads);
+    expect(await adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-a', title: 'Keep me', done: false, rank: 1 }
+    ]);
+  });
+
+  it('treats missing source paths as empty relations without diagnostics', async () => {
+    const source = automergeMapSource(Automerge.from<OptionalTaskDocument>({}), { relations: taskRelations });
+
+    expect(await source.rows(schema.tasks)).toEqual([]);
+    expect(await source.lookup?.({ relation: schema.tasks, field: 'id', value: 'task-a' })).toEqual([]);
+    expect(await source.diagnostics?.()).toEqual([]);
+  });
+
+  it('keeps valid rows readable while reporting malformed map rows', async () => {
+    const doc = Automerge.from<{ readonly workspace: { readonly tasks: Record<string, unknown> } }>({
+      workspace: {
+        tasks: {
+          'task-a': { title: 'Readable row', done: false, rank: 1 },
+          'task-b': { title: { text: 'not a string' }, done: false, rank: 2 },
+          'task-c': ['not', 'a', 'row']
+        }
+      }
+    });
+    const source = automergeMapSource(doc, { relations: taskRelations });
+
+    expect(await source.rows(schema.tasks)).toEqual([
+      { id: 'task-a', title: 'Readable row', done: false, rank: 1 }
+    ]);
+    expect(await source.diagnostics?.()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'invalid_row', relation: 'tasks', field: 'title' }),
+      expect.objectContaining({ code: 'invalid_row', relation: 'tasks' })
+    ]));
+  });
 });
+
+function taskRow(row: unknown): TaskRow {
+  return row as TaskRow;
+}

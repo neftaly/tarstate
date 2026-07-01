@@ -202,6 +202,72 @@ describe('automerge presence runtime contract', () => {
       runtime.stop();
     }
   });
+
+  it('clears local state with custom peer and key fields and stops notifications after unsubscribe', async () => {
+    const handle = new FakeDocHandle();
+    const runtime = presenceRuntime({ color: 'blue', mood: 'focused' }, handle);
+    let notifications = 0;
+    const unsubscribe = runtime.subscribe(() => {
+      notifications += 1;
+    });
+
+    try {
+      const result = await runtime.target.apply([
+        presenceRows.deleteByKey(['peer-local', 'color']),
+        presenceRows.deleteByKey(['peer-local', 'mood'])
+      ]);
+
+      expect(result).toMatchObject({
+        status: 'accepted',
+        patches: 2,
+        applied: 2,
+        diagnostics: [],
+        durability: 'ephemeral'
+      });
+      expect(runtime.getLocalState()).toEqual({});
+      expect(await runtime.source.rows(schema.presence)).toEqual([]);
+      expect(notifications).toBe(1);
+
+      unsubscribe();
+      handle.receivePresenceSnapshot('peer-remote', { color: 'red' });
+
+      expect(notifications).toBe(1);
+    } finally {
+      unsubscribe();
+      runtime.stop();
+    }
+  });
+
+  it('rejects remote deletes and relation rewrites without changing presence state', async () => {
+    const handle = new FakeDocHandle();
+    const runtime = presenceRuntime({ color: 'blue' }, handle);
+
+    try {
+      handle.receivePresenceSnapshot('peer-remote', { color: 'red' });
+      const beforeRows = await runtime.source.rows(schema.presence);
+
+      const result = await runtime.target.apply([
+        presenceRows.deleteByKey(['peer-remote', 'color']),
+        presenceRows.replaceAll([{ peer: 'peer-local', topic: 'color', payload: 'green' }])
+      ]);
+
+      expect(result).toMatchObject({
+        status: 'rejected',
+        patches: 2,
+        applied: 0,
+        deltas: [],
+        durability: 'ephemeral',
+        diagnostics: [expect.objectContaining({ code: 'invalid_row', relation: 'presence', field: 'peer' })]
+      });
+      expect(await runtime.source.rows(schema.presence)).toEqual(beforeRows);
+      expect(runtime.getLocalState()).toEqual({ color: 'blue' });
+      expect(runtime.getPeerStates()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ peerId: 'peer-remote', state: { color: 'red' } })
+      ]));
+    } finally {
+      runtime.stop();
+    }
+  });
 });
 
 function presenceRuntime(
