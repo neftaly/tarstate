@@ -40,6 +40,9 @@ scales:
 - Large `trackTransact` reporting for requested incremental joined-query deltas.
 - Large requested incremental versus snapshot maintenance for aggregate-over-join root and right-side deltas.
 - Large requested incremental versus snapshot materialization maintenance for miss-heavy `leftJoin`.
+- Large requested incremental versus snapshot materialization maintenance for `sortLimit` top-priority windows.
+- Large requested incremental versus snapshot materialization maintenance for aggregate output followed by `sortLimit`.
+- Large requested incremental versus snapshot materialization maintenance for full `sort` queries.
 - Requested incremental versus snapshot materialization maintenance for grouped `topBy`/`bottomBy` aggregate winners.
 - Requested incremental versus snapshot materialization maintenance for structural `expand` and `qualify` queries.
 - Materialization set/hash/btree/unique index facades.
@@ -52,10 +55,8 @@ scales:
 
 This first harness intentionally does not measure browser frame hitching, cold
 Automerge WASM/module import costs, long-running GC pressure, memory retention,
-adapter durability, networked runtimes, requested-incremental `sortLimit`
-materialization while it still reports fallback diagnostics, or fuzz/property
-exploration. Those need separate harnesses with different isolation and
-reporting.
+adapter durability, networked runtimes, or fuzz/property exploration. Those need
+separate harnesses with different isolation and reporting.
 
 ## Commands
 

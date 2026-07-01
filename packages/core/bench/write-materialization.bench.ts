@@ -1,6 +1,7 @@
 import { bench, describe } from 'vitest';
 import {
   aggregate,
+  asc,
   avg,
   btree,
   bottomBy,
@@ -10,6 +11,7 @@ import {
   createDb,
   db,
   deleteWhere,
+  desc,
   diffQuery,
   eq,
   extend,
@@ -26,6 +28,7 @@ import {
   project,
   qRows,
   qualify,
+  sort,
   sum,
   trackTransact,
   transact,
@@ -180,6 +183,41 @@ const largeMaterializedLeftJoinReviewerUpdate = updateWhere(
     role: 'review-lead'
   }
 );
+const largeSnapshotMaterializedTopPriorityTasks = mat(createDb(large.data), {
+  topPriorityTasks: large.queries.topPriorityTasks
+});
+const largeIncrementalMaterializedTopPriorityTasks = mat(createDb(large.data), {
+  topPriorityTasks: large.queries.topPriorityTasks
+}, { mode: 'incremental' });
+const largeTopPriorityTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 700, {
+  priority: 100,
+  points: 100,
+  createdAt: -1
+}));
+const largeSortedTasks = pipe(
+  from(taskRef),
+  sort(desc(taskRef.priority), desc(taskRef.points), asc(taskRef.createdAt)),
+  project({
+    id: taskRef.id,
+    title: taskRef.title,
+    priority: taskRef.priority,
+    points: taskRef.points,
+    createdAt: taskRef.createdAt
+  }),
+  keyBy('id')
+);
+const largeSnapshotMaterializedSortedTasks = mat(createDb(large.data), {
+  sortedTasks: largeSortedTasks
+});
+const largeIncrementalMaterializedSortedTasks = mat(createDb(large.data), {
+  sortedTasks: largeSortedTasks
+}, { mode: 'incremental' });
+const largeSortedTaskUpdateId = large.data.tasks[Math.floor(large.data.tasks.length / 3)]?.id ?? '';
+const largeMaterializedSortedTaskUpdate = updateWhere(
+  benchSchema.tasks,
+  eq(taskRef.id, largeSortedTaskUpdateId),
+  { title: 'Updated sorted benchmark task' }
+);
 const largeProjectTaskRollups = pipe(
   from(taskRef),
   aggregate({
@@ -238,6 +276,16 @@ const largeAggregateInsertProjectId = large.data.projects[0]?.id ?? '';
 const largeAggregateTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 400, {
   projectId: largeAggregateInsertProjectId,
   points: 11
+}));
+const largeSnapshotMaterializedAggregateSortLimit = mat(createDb(large.data), {
+  projectTaskAggregates: large.queries.projectTaskAggregates
+});
+const largeIncrementalMaterializedAggregateSortLimit = mat(createDb(large.data), {
+  projectTaskAggregates: large.queries.projectTaskAggregates
+}, { mode: 'incremental' });
+const largeAggregateSortLimitTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 710, {
+  projectId: largeAggregateInsertProjectId,
+  points: 100
 }));
 const largeAggregateMoveTask = large.data.tasks.find((task) => task.projectId !== largeAggregateInsertProjectId)
   ?? large.data.tasks[0];
@@ -430,12 +478,36 @@ describe('core write and materialization benchmarks', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedLeftJoin, largeMaterializedLeftJoinReviewerUpdate));
   }, options);
 
+  bench('materialized transact large sortLimit snapshot: top priority task insert', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedTopPriorityTasks, largeTopPriorityTaskInsert));
+  }, options);
+
+  bench('materialized transact large sortLimit requested incremental: top priority task insert', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedTopPriorityTasks, largeTopPriorityTaskInsert));
+  }, options);
+
+  bench('materialized transact large full sort snapshot: task title update', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedSortedTasks, largeMaterializedSortedTaskUpdate));
+  }, options);
+
+  bench('materialized transact large full sort requested incremental: task title update', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedSortedTasks, largeMaterializedSortedTaskUpdate));
+  }, options);
+
   bench('materialized transact large aggregate snapshot: task insert', () => {
     consumeBenchResult(transact(largeSnapshotMaterializedAggregate, largeAggregateTaskInsert));
   }, options);
 
   bench('materialized transact large aggregate requested incremental: task insert', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedAggregate, largeAggregateTaskInsert));
+  }, options);
+
+  bench('materialized transact large aggregate sortLimit snapshot: task insert', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedAggregateSortLimit, largeAggregateSortLimitTaskInsert));
+  }, options);
+
+  bench('materialized transact large aggregate sortLimit requested incremental: task insert', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedAggregateSortLimit, largeAggregateSortLimitTaskInsert));
   }, options);
 
   bench('materialized transact large aggregate snapshot: task update moves group and points', () => {

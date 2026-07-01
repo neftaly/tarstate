@@ -5,7 +5,9 @@ import { stableKey } from './identity.js';
 import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
 import {
   diffMaterializationRows,
+  materializationRowIndex,
   materializationRowKey,
+  materializationStableKey,
   type MaterializationRowDiffOptions
 } from './materialization-row-changes.js';
 import type {
@@ -14,7 +16,8 @@ import type {
   PredicateData,
   ProjectionData,
   Query,
-  QueryData
+  QueryData,
+  SortData
 } from './query.js';
 import { queryRowKeyFields } from './query.js';
 import type { RelationRef } from './schema.js';
@@ -25,6 +28,7 @@ export type IncrementalSingleRootMaterializationPlan = {
   readonly rootAlias: string;
   readonly root: IncrementalRoot;
   readonly steps: readonly IncrementalStep[];
+  readonly ordered?: IncrementalOrderedStep;
   readonly rowKeyFields?: readonly string[];
 };
 
@@ -47,6 +51,7 @@ export type IncrementalMaterializationState<Row = unknown> = {
   readonly outputsByRootKey: ReadonlyMap<string, readonly unknown[]>;
   readonly joinStates: readonly IncrementalJoinState[];
   readonly aggregate?: IncrementalAggregateState<Row>;
+  readonly ordered?: IncrementalOrderedState<Row>;
 };
 
 export type IncrementalMaterialization<Row = unknown> = {
@@ -138,6 +143,22 @@ type IncrementalAggregateStep = {
 
 type IncrementalStep = IncrementalPipelineStep | IncrementalJoinStep | IncrementalAggregateStep;
 
+type IncrementalPostOrderStep = Extract<IncrementalPipelineStep, {
+  readonly kind: 'select' | 'extend' | 'without' | 'rename' | 'qualify';
+}>;
+
+type IncrementalWindow = {
+  readonly offset: number;
+  readonly count: number;
+};
+
+type IncrementalOrderedStep = {
+  readonly kind: 'ordered';
+  readonly order: readonly SortData[];
+  readonly window?: IncrementalWindow;
+  readonly postSteps: readonly IncrementalPostOrderStep[];
+};
+
 type IncrementalBranchPlan = {
   readonly relation: string;
   readonly alias: string;
@@ -169,6 +190,23 @@ type IncrementalAggregateGroupState<Row = unknown> = {
   readonly output: Row;
 };
 
+type IncrementalOrderedState<Row = unknown> = {
+  readonly entriesByOwnerKey: ReadonlyMap<string, readonly IncrementalOrderedEntry<Row>[]>;
+  readonly entriesByKey: ReadonlyMap<string, IncrementalOrderedEntry<Row>>;
+  readonly orderedEntryKeys: readonly string[];
+  readonly visibleEntryKeys: readonly string[];
+  readonly rows: readonly Row[];
+};
+
+type IncrementalOrderedEntry<Row = unknown> = {
+  readonly key: string;
+  readonly ownerKey: string;
+  readonly rowIndex: number;
+  readonly sortValues: readonly unknown[];
+  readonly row: Row;
+  readonly rowKey: string;
+};
+
 type IncrementalRelationSnapshot = {
   readonly relation: RelationRef;
   readonly rows: readonly unknown[];
@@ -193,6 +231,14 @@ type PlanShape = {
 
 type PlanCollection = {
   joinCount: number;
+  ordered?: MutableIncrementalOrderedStep;
+};
+
+type MutableIncrementalOrderedStep = {
+  readonly kind: 'ordered';
+  readonly order: readonly SortData[];
+  window?: IncrementalWindow;
+  readonly postSteps: IncrementalPostOrderStep[];
 };
 
 type DeltaRowChange = {
@@ -282,6 +328,16 @@ type AggregateStateResult<Row> =
       readonly reason: string;
     };
 
+type OrderedStateResult<Row> =
+  | {
+      readonly supported: true;
+      readonly state: IncrementalOrderedState<Row>;
+    }
+  | {
+      readonly supported: false;
+      readonly reason: string;
+    };
+
 type StaticRowsEvaluation =
   | {
       readonly supported: true;
@@ -326,7 +382,8 @@ export function planIncrementalMaterialization(query: Query): IncrementalPlanRes
   }
 
   const steps: IncrementalStep[] = [];
-  const root = collectSingleRootPlan(query.data, steps, { joinCount: 0 });
+  const collection: PlanCollection = { joinCount: 0 };
+  const root = collectSingleRootPlan(query.data, steps, collection);
   if (typeof root === 'string') {
     return {
       supported: false,
@@ -348,9 +405,12 @@ export function planIncrementalMaterialization(query: Query): IncrementalPlanRes
       rootAlias: root.alias,
       root: root.root,
       steps,
+      ...optionalOrderedStep(collection.ordered),
       ...optionalRowKeyFields(queryRowKeyFields(query))
     },
-    reason: 'incremental maintenance for supported single-root relation pipeline'
+    reason: collection.ordered === undefined
+      ? 'incremental maintenance for supported single-root relation pipeline'
+      : 'incremental maintenance for supported single-root relation pipeline with final order/window'
   };
 }
 
@@ -421,7 +481,7 @@ export function buildIncrementalMaterialization<Row>(
     };
   }
 
-  const state = {
+  let state: IncrementalMaterializationState<Row> = {
     kind: 'incrementalMaterializationState',
     rootRelation: plan.rootRelation,
     rootKeys,
@@ -430,14 +490,37 @@ export function buildIncrementalMaterialization<Row>(
     outputsByRootKey,
     joinStates,
     ...(aggregateState === undefined ? {} : { aggregate: aggregateState.state })
-  } satisfies IncrementalMaterializationState<Row>;
+  };
+
+  const orderedState = buildOrderedState<Row>(plan, state, env);
+  if (orderedState !== undefined) {
+    if (!orderedState.supported) {
+      return {
+        supported: false,
+        reason: orderedState.reason
+      };
+    }
+    state = {
+      ...state,
+      ordered: orderedState.state
+    };
+  }
+
+  const rows = rowsFromIncrementalState(state);
+  const ambiguousRowsReason = ambiguousFinalRowsReason(plan, rows);
+  if (ambiguousRowsReason !== undefined) {
+    return {
+      supported: false,
+      reason: ambiguousRowsReason
+    };
+  }
 
   return {
     supported: true,
     reason: 'incremental materialization state built for unique root keys',
     plan,
     state,
-    rows: rowsFromIncrementalState(state)
+    rows
   };
 }
 
@@ -472,12 +555,21 @@ export function buildStaticIncrementalMaterialization<Row>(
     joinStates: []
   } satisfies IncrementalMaterializationState<Row>;
 
+  const rows = evaluated.rows as readonly Row[];
+  const ambiguousRowsReason = ambiguousFinalRowsReason(plan, rows);
+  if (ambiguousRowsReason !== undefined) {
+    return {
+      supported: false,
+      reason: ambiguousRowsReason
+    };
+  }
+
   return {
     supported: true,
     reason: 'incremental materialization state built for static rows',
     plan,
     state,
-    rows: evaluated.rows as readonly Row[]
+    rows
   };
 }
 
@@ -549,6 +641,21 @@ export function maintainIncrementalMaterialization<Row>(
     return {
       updated: false,
       reason: 'incremental aggregate state is present for a non-aggregate plan; snapshot recompute is required'
+    };
+  }
+
+  const ordered = orderedStep(materialization.plan);
+  const previousOrderedState = materialization.state.ordered;
+  if (ordered !== undefined && previousOrderedState === undefined) {
+    return {
+      updated: false,
+      reason: 'incremental ordered state is missing; snapshot recompute is required'
+    };
+  }
+  if (ordered === undefined && previousOrderedState !== undefined) {
+    return {
+      updated: false,
+      reason: 'incremental ordered state is present for a non-ordered plan; snapshot recompute is required'
     };
   }
 
@@ -757,7 +864,7 @@ export function maintainIncrementalMaterialization<Row>(
     };
   }
 
-  const state = {
+  let state: IncrementalMaterializationState<Row> = {
     kind: 'incrementalMaterializationState',
     rootRelation: materialization.state.rootRelation,
     rootKeys: compactRootKeys,
@@ -766,7 +873,35 @@ export function maintainIncrementalMaterialization<Row>(
     outputsByRootKey,
     joinStates: nextJoinStates,
     ...(nextAggregateState === undefined ? {} : { aggregate: nextAggregateState.state })
-  } satisfies IncrementalMaterializationState<Row>;
+  };
+
+  if (ordered !== undefined) {
+    const nextOrderedState = maintainOrderedState<Row>(
+      materialization.plan,
+      previousOrderedState as IncrementalOrderedState<Row>,
+      state,
+      nextAggregateState === undefined ? changedRootKeys : affectedAggregateGroupKeys,
+      env
+    );
+    if (!nextOrderedState.supported) {
+      return {
+        updated: false,
+        reason: nextOrderedState.reason
+      };
+    }
+    state = {
+      ...state,
+      ordered: nextOrderedState.state
+    };
+  }
+
+  const ambiguousRowsReason = ambiguousFinalRowsReason(materialization.plan, rowsFromIncrementalState(state));
+  if (ambiguousRowsReason !== undefined) {
+    return {
+      updated: false,
+      reason: ambiguousRowsReason
+    };
+  }
 
   if (rootChanges.length === 0 && rootKeysToEvaluate.size === 0 && joinStates === materialization.state.joinStates) {
     return {
@@ -833,6 +968,9 @@ function collectSingleRootPlan(
     case 'where': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'where after order/window is not supported for incremental maintenance';
+      }
       if (hasAggregateStep(steps)) {
         return 'where after aggregate is not supported for incremental maintenance';
       }
@@ -864,7 +1002,12 @@ function collectSingleRootPlan(
       if (reason !== undefined) {
         return `select projection is not supported for incremental maintenance: ${reason}`;
       }
-      steps.push({ kind: 'select', projection: data.projection });
+      const step = { kind: 'select', projection: data.projection } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
       return { ...root, shape: selectShape(root.shape, data.projection) };
     }
     case 'extend': {
@@ -874,30 +1017,53 @@ function collectSingleRootPlan(
       if (reason !== undefined) {
         return `extend projection is not supported for incremental maintenance: ${reason}`;
       }
-      steps.push({ kind: 'extend', projection: data.projection });
+      const step = { kind: 'extend', projection: data.projection } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
       return { ...root, shape: extendShape(root.shape, data.projection) };
     }
     case 'without': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      steps.push({ kind: 'without', fields: data.fields });
+      const step = { kind: 'without', fields: data.fields } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
       return { ...root, shape: withoutShape(root.shape, data.fields) };
     }
     case 'rename': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      steps.push({ kind: 'rename', fields: data.fields });
+      const step = { kind: 'rename', fields: data.fields } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
       return { ...root, shape: renameShape(root.shape, data.fields) };
     }
     case 'qualify': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      steps.push({ kind: 'qualify', alias: data.alias });
+      const step = { kind: 'qualify', alias: data.alias } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
       return { ...root, shape: qualifyShape(root.shape, data.alias) };
     }
     case 'expand': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'expand after order/window is not supported for incremental maintenance';
+      }
       if (hasAggregateStep(steps)) {
         return 'expand after aggregate is not supported for incremental maintenance';
       }
@@ -917,6 +1083,9 @@ function collectSingleRootPlan(
       const stepCount = steps.length;
       const left = collectSingleRootPlan(data.left, steps, collection);
       if (typeof left === 'string') return left;
+      if (collection.ordered !== undefined) {
+        return `${data.kind} join after order/window is not supported for incremental maintenance`;
+      }
       if (hasAggregateStep(steps.slice(stepCount))) {
         return 'join after aggregate is not supported for incremental maintenance';
       }
@@ -955,12 +1124,64 @@ function collectSingleRootPlan(
 
       return { ...left, shape: mergeShapes(left.shape, right.shape) };
     }
-    case 'sort':
-      return 'sort is not supported for incremental maintenance';
-    case 'limit':
-      return 'limit is not supported for incremental maintenance';
-    case 'sortLimit':
-      return 'sortLimit is not supported for incremental maintenance';
+    case 'sort': {
+      const root = collectSingleRootPlan(data.input, steps, collection);
+      if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'sort after order/window is not supported for incremental maintenance';
+      }
+      const reason = sortOrderReason(data.order, root.shape);
+      if (reason !== undefined) {
+        return `sort order is not supported for incremental maintenance: ${reason}`;
+      }
+      collection.ordered = {
+        kind: 'ordered',
+        order: data.order,
+        postSteps: []
+      };
+      return root;
+    }
+    case 'limit': {
+      const root = collectSingleRootPlan(data.input, steps, collection);
+      if (typeof root === 'string') return root;
+      const window = normalizedWindow(data.count, data.offset ?? 0);
+      if (typeof window === 'string') {
+        return `limit is not supported for incremental maintenance: ${window}`;
+      }
+      if (collection.ordered === undefined) {
+        collection.ordered = {
+          kind: 'ordered',
+          order: [],
+          window,
+          postSteps: []
+        };
+      } else {
+        collection.ordered.window = combineWindows(collection.ordered.window, window);
+      }
+      return root;
+    }
+    case 'sortLimit': {
+      const root = collectSingleRootPlan(data.input, steps, collection);
+      if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'sortLimit after order/window is not supported for incremental maintenance';
+      }
+      const orderReason = sortOrderReason(data.order, root.shape);
+      if (orderReason !== undefined) {
+        return `sortLimit order is not supported for incremental maintenance: ${orderReason}`;
+      }
+      const window = normalizedWindow(data.count, 0);
+      if (typeof window === 'string') {
+        return `sortLimit is not supported for incremental maintenance: ${window}`;
+      }
+      collection.ordered = {
+        kind: 'ordered',
+        order: data.order,
+        window,
+        postSteps: []
+      };
+      return root;
+    }
     case 'union':
       return 'union is not supported for incremental maintenance';
     case 'intersection':
@@ -973,6 +1194,9 @@ function collectSingleRootPlan(
       const stepCount = steps.length;
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'aggregate after order/window is not supported for incremental maintenance';
+      }
       const addedSteps = steps.slice(stepCount);
       if (hasAggregateStep(addedSteps)) {
         return 'nested aggregate is not supported for incremental maintenance';
@@ -994,6 +1218,42 @@ function collectSingleRootPlan(
   }
 }
 
+function sortOrderReason(order: readonly SortData[], shape: PlanShape): string | undefined {
+  for (const item of order) {
+    const reason = simpleExprReason(item.expr) ?? exprShapeReason(item.expr, shape);
+    if (reason !== undefined) {
+      return reason;
+    }
+  }
+  return undefined;
+}
+
+function normalizedWindow(count: number, offset: number): IncrementalWindow | string {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    return 'count must be a non-negative safe integer';
+  }
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    return 'offset must be a non-negative safe integer';
+  }
+  return { count, offset };
+}
+
+function combineWindows(
+  current: IncrementalWindow | undefined,
+  next: IncrementalWindow
+): IncrementalWindow {
+  if (current === undefined) {
+    return next;
+  }
+
+  const skipped = Math.min(current.count, next.offset);
+  const remaining = Math.max(0, current.count - next.offset);
+  return {
+    offset: current.offset + skipped,
+    count: Math.min(remaining, next.count)
+  };
+}
+
 function collectIntersectionPlan(
   inputs: readonly QueryData[],
   steps: IncrementalStep[],
@@ -1008,6 +1268,9 @@ function collectIntersectionPlan(
   const root = collectSingleRootPlan(leftInput, steps, collection);
   if (typeof root === 'string') {
     return `intersection first branch is not supported for incremental maintenance: ${root}`;
+  }
+  if (collection.ordered !== undefined) {
+    return 'intersection after order/window is not supported for incremental maintenance';
   }
   if (hasAggregateStep(steps.slice(stepCount))) {
     return 'intersection after aggregate is not supported for incremental maintenance';
@@ -1032,6 +1295,9 @@ function collectDifferencePlan(
   const root = collectSingleRootPlan(leftInput, steps, collection);
   if (typeof root === 'string') {
     return `difference left branch is not supported for incremental maintenance: ${root}`;
+  }
+  if (collection.ordered !== undefined) {
+    return 'difference after order/window is not supported for incremental maintenance';
   }
   if (hasAggregateStep(steps.slice(stepCount))) {
     return 'difference after aggregate is not supported for incremental maintenance';
@@ -1339,6 +1605,10 @@ function aggregateStep(plan: IncrementalMaterializationPlan): IncrementalAggrega
   return plan.steps.find((step): step is IncrementalAggregateStep => step.kind === 'aggregate');
 }
 
+function orderedStep(plan: IncrementalMaterializationPlan): IncrementalOrderedStep | undefined {
+  return plan.kind === 'staticRows' ? undefined : plan.ordered;
+}
+
 function hasAggregateStep(steps: readonly IncrementalStep[]): boolean {
   return steps.some((step) => step.kind === 'aggregate');
 }
@@ -1375,6 +1645,10 @@ function incrementalRowReport<Row>(
   changedRootKeys: ReadonlySet<string>,
   changedGroupKeys: ReadonlySet<string>
 ): IncrementalRowReport<Row> {
+  if (next.ordered !== undefined || previous.ordered !== undefined) {
+    return orderedRowReport(plan, previous, next, changedRootKeys, changedGroupKeys);
+  }
+
   if (next.aggregate !== undefined || previous.aggregate !== undefined) {
     return aggregateRowReport(plan, previous.aggregate, next.aggregate, changedGroupKeys);
   }
@@ -1460,6 +1734,73 @@ function aggregateRowReport<Row>(
     changedGroupKeys: changedKeys,
     diagnostics: diff.diagnostics
   };
+}
+
+function orderedRowReport<Row>(
+  plan: IncrementalMaterializationPlan,
+  previous: IncrementalMaterializationState<Row>,
+  next: IncrementalMaterializationState<Row>,
+  changedRootKeys: ReadonlySet<string>,
+  changedGroupKeys: ReadonlySet<string>
+): IncrementalRowReport<Row> {
+  const options = rowDiffOptionsForPlan(plan);
+  const beforeRows = previous.ordered?.rows ?? [];
+  const afterRows = next.ordered?.rows ?? [];
+  const diff = diffMaterializationRows(beforeRows, afterRows, options);
+  const rowChanges = [
+    ...diff.changes,
+    ...orderedMoveRowChanges(beforeRows, afterRows, options, diff.changes)
+  ];
+  const rowBatches = materializationStableKey(beforeRows) === materializationStableKey(afterRows)
+    ? []
+    : [{ beforeRows, afterRows }];
+
+  return {
+    rowChanges,
+    addedRows: rowChanges.flatMap((item) => item.kind === 'added' ? [item.row] : []),
+    removedRows: rowChanges.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
+    rowBatches,
+    changedRootKeys: orderedChangedKeys(previous.rootKeys, next.rootKeys, changedRootKeys),
+    changedGroupKeys: orderedChangedKeys(previous.aggregate?.groupKeys ?? [], next.aggregate?.groupKeys ?? [], changedGroupKeys),
+    diagnostics: diff.diagnostics
+  };
+}
+
+function orderedMoveRowChanges<Row>(
+  beforeRows: readonly Row[],
+  afterRows: readonly Row[],
+  options: MaterializationRowDiffOptions,
+  existingChanges: readonly RowChange<Row>[]
+): readonly RowChange<Row>[] {
+  const beforeIndex = materializationRowIndex(beforeRows, options);
+  const afterIndex = materializationRowIndex(afterRows, options);
+  if (
+    beforeIndex.duplicates.size > 0 ||
+    afterIndex.duplicates.size > 0 ||
+    beforeIndex.diagnostics.length > 0 ||
+    afterIndex.diagnostics.length > 0
+  ) {
+    return [];
+  }
+
+  const changedKeys = new Set(existingChanges.map((change) => change.key));
+  const changes: RowChange<Row>[] = [];
+  for (const [key, beforePosition] of beforeIndex.indexByKey) {
+    if (changedKeys.has(key)) {
+      continue;
+    }
+
+    const afterPosition = afterIndex.indexByKey.get(key);
+    if (afterPosition !== undefined && afterPosition !== beforePosition) {
+      changes.push({
+        kind: 'updated',
+        key,
+        before: beforeRows[beforePosition] as Row,
+        after: afterRows[afterPosition] as Row
+      });
+    }
+  }
+  return changes;
 }
 
 function orderedChangedKeys(
@@ -1930,6 +2271,10 @@ function setDifferenceRows(
 }
 
 export function rowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {
+  if (state.ordered !== undefined) {
+    return state.ordered.rows;
+  }
+
   if (state.aggregate !== undefined) {
     return state.aggregate.groupKeys.flatMap((key) => {
       const group = state.aggregate?.groupsByKey.get(key);
@@ -1938,6 +2283,250 @@ export function rowsFromIncrementalState<Row>(state: IncrementalMaterializationS
   }
 
   return state.rootKeys.flatMap((key) => state.outputsByRootKey.get(key) ?? []) as readonly Row[];
+}
+
+function buildOrderedState<Row>(
+  plan: IncrementalMaterializationPlan,
+  state: IncrementalMaterializationState<Row>,
+  env: Readonly<Record<string, unknown>>
+): OrderedStateResult<Row> | undefined {
+  const ordered = orderedStep(plan);
+  if (ordered === undefined) {
+    return undefined;
+  }
+
+  const ownerKeys = orderedOwnerKeys(state);
+  const entriesByOwnerKey = new Map<string, readonly IncrementalOrderedEntry<Row>[]>();
+  for (const ownerKey of ownerKeys) {
+    const entries = orderedEntriesForOwner<Row>(plan, ownerKey, state, env);
+    if (!entries.supported) {
+      return entries;
+    }
+    if (entries.entries.length > 0) {
+      entriesByOwnerKey.set(ownerKey, entries.entries);
+    }
+  }
+
+  return finalizeOrderedState(plan, entriesByOwnerKey, ownerKeys);
+}
+
+function maintainOrderedState<Row>(
+  plan: IncrementalMaterializationPlan,
+  previous: IncrementalOrderedState<Row>,
+  state: IncrementalMaterializationState<Row>,
+  changedOwnerKeys: ReadonlySet<string>,
+  env: Readonly<Record<string, unknown>>
+): OrderedStateResult<Row> {
+  const ownerKeys = orderedOwnerKeys(state);
+  const ownerKeySet = new Set(ownerKeys);
+  const entriesByOwnerKey = new Map(previous.entriesByOwnerKey);
+
+  for (const ownerKey of entriesByOwnerKey.keys()) {
+    if (!ownerKeySet.has(ownerKey)) {
+      entriesByOwnerKey.delete(ownerKey);
+    }
+  }
+
+  for (const ownerKey of changedOwnerKeys) {
+    if (!ownerKeySet.has(ownerKey)) {
+      entriesByOwnerKey.delete(ownerKey);
+      continue;
+    }
+
+    const entries = orderedEntriesForOwner<Row>(plan, ownerKey, state, env);
+    if (!entries.supported) {
+      return entries;
+    }
+    if (entries.entries.length === 0) {
+      entriesByOwnerKey.delete(ownerKey);
+    } else {
+      entriesByOwnerKey.set(ownerKey, entries.entries);
+    }
+  }
+
+  return finalizeOrderedState(plan, entriesByOwnerKey, ownerKeys);
+}
+
+function finalizeOrderedState<Row>(
+  plan: IncrementalMaterializationPlan,
+  entriesByOwnerKey: ReadonlyMap<string, readonly IncrementalOrderedEntry<Row>[]>,
+  ownerKeys: readonly string[]
+): OrderedStateResult<Row> {
+  const ordered = orderedStep(plan);
+  if (ordered === undefined) {
+    return {
+      supported: false,
+      reason: 'ordered step is missing from ordered incremental plan'
+    };
+  }
+
+  const ownerIndexByKey = indexKeys(ownerKeys);
+  const entriesByKey = new Map<string, IncrementalOrderedEntry<Row>>();
+  for (const entries of entriesByOwnerKey.values()) {
+    for (const entry of entries) {
+      entriesByKey.set(entry.key, entry);
+    }
+  }
+
+  const duplicateReason = duplicateOrderedRowKeyReason(entriesByKey.values());
+  if (duplicateReason !== undefined) {
+    return {
+      supported: false,
+      reason: duplicateReason
+    };
+  }
+
+  const orderedEntryKeys = Array.from(entriesByKey.keys()).sort((leftKey, rightKey) => {
+    const left = entriesByKey.get(leftKey);
+    const right = entriesByKey.get(rightKey);
+    if (left === undefined || right === undefined) {
+      return 0;
+    }
+    return compareOrderedEntries(ordered, ownerIndexByKey, left, right);
+  });
+  const visibleEntryKeys = visibleOrderedEntryKeys(ordered, orderedEntryKeys);
+
+  return {
+    supported: true,
+    state: {
+      entriesByOwnerKey,
+      entriesByKey,
+      orderedEntryKeys,
+      visibleEntryKeys,
+      rows: visibleEntryKeys.flatMap((key) => {
+        const entry = entriesByKey.get(key);
+        return entry === undefined ? [] : [entry.row];
+      })
+    }
+  };
+}
+
+function orderedEntriesForOwner<Row>(
+  plan: IncrementalMaterializationPlan,
+  ownerKey: string,
+  state: IncrementalMaterializationState<Row>,
+  env: Readonly<Record<string, unknown>>
+):
+  | { readonly supported: true; readonly entries: readonly IncrementalOrderedEntry<Row>[] }
+  | { readonly supported: false; readonly reason: string } {
+  const ordered = orderedStep(plan);
+  if (ordered === undefined) {
+    return {
+      supported: false,
+      reason: 'ordered step is missing from ordered incremental plan'
+    };
+  }
+
+  const options = rowDiffOptionsForPlan(plan);
+  const entries: IncrementalOrderedEntry<Row>[] = [];
+  for (const [rowIndex, row] of orderedOwnerRows(state, ownerKey).entries()) {
+    const sourceRow = asRecord(row);
+    const postOrderRows = evaluatePostOrderRows(ordered, sourceRow, env);
+    if (postOrderRows.length !== 1) {
+      return {
+        supported: false,
+        reason: 'post-order incremental projection produced an unexpected row count; snapshot recompute is required'
+      };
+    }
+
+    const output = postOrderRows[0] as Row;
+    let rowKeyValue: string;
+    try {
+      rowKeyValue = materializationRowKey(output, options);
+    } catch (error) {
+      return {
+        supported: false,
+        reason: `ordered materialization row key selection failed: ${materializationErrorMessage(error)}`
+      };
+    }
+
+    entries.push({
+      key: stableKey([ownerKey, rowIndex]),
+      ownerKey,
+      rowIndex,
+      sortValues: ordered.order.map((item) => exprValue(sourceRow, item.expr, env)),
+      row: output,
+      rowKey: rowKeyValue
+    });
+  }
+  return { supported: true, entries };
+}
+
+function evaluatePostOrderRows(
+  ordered: IncrementalOrderedStep,
+  row: Record<string, unknown>,
+  env: Readonly<Record<string, unknown>>
+): readonly Record<string, unknown>[] {
+  let rows: readonly Record<string, unknown>[] = [row];
+  for (const step of ordered.postSteps) {
+    rows = evaluateStep(rows, step, env);
+  }
+  return rows;
+}
+
+function orderedOwnerKeys<Row>(state: IncrementalMaterializationState<Row>): readonly string[] {
+  return state.aggregate === undefined ? state.rootKeys : state.aggregate.groupKeys;
+}
+
+function orderedOwnerRows<Row>(
+  state: IncrementalMaterializationState<Row>,
+  ownerKey: string
+): readonly unknown[] {
+  if (state.aggregate !== undefined) {
+    const group = state.aggregate.groupsByKey.get(ownerKey);
+    return group === undefined ? [] : [group.output];
+  }
+
+  return state.outputsByRootKey.get(ownerKey) ?? [];
+}
+
+function duplicateOrderedRowKeyReason<Row>(
+  entries: Iterable<IncrementalOrderedEntry<Row>>
+): string | undefined {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (seen.has(entry.rowKey)) {
+      return `ordered materialization has duplicate final row key ${entry.rowKey}; snapshot recompute is required`;
+    }
+    seen.add(entry.rowKey);
+  }
+  return undefined;
+}
+
+function compareOrderedEntries<Row>(
+  ordered: IncrementalOrderedStep,
+  ownerIndexByKey: ReadonlyMap<string, number>,
+  left: IncrementalOrderedEntry<Row>,
+  right: IncrementalOrderedEntry<Row>
+): number {
+  for (let index = 0; index < ordered.order.length; index += 1) {
+    const item = ordered.order[index] as SortData;
+    const comparison = compareSortValues(
+      left.sortValues[index],
+      right.sortValues[index],
+      item.direction,
+      item.nulls
+    );
+    if (comparison !== 0) {
+      return comparison;
+    }
+  }
+
+  return (
+    (ownerIndexByKey.get(left.ownerKey) ?? Number.MAX_SAFE_INTEGER) -
+    (ownerIndexByKey.get(right.ownerKey) ?? Number.MAX_SAFE_INTEGER)
+  ) || left.rowIndex - right.rowIndex || left.key.localeCompare(right.key);
+}
+
+function visibleOrderedEntryKeys(
+  ordered: IncrementalOrderedStep,
+  orderedEntryKeys: readonly string[]
+): readonly string[] {
+  if (ordered.window === undefined) {
+    return orderedEntryKeys;
+  }
+
+  return orderedEntryKeys.slice(ordered.window.offset, ordered.window.offset + ordered.window.count);
 }
 
 function buildAggregateState<Row>(
@@ -2748,8 +3337,41 @@ function optionalRowKeyFields(
   return fields === undefined ? {} : { rowKeyFields: fields };
 }
 
+function optionalOrderedStep(
+  ordered: MutableIncrementalOrderedStep | undefined
+): { readonly ordered?: IncrementalOrderedStep } {
+  return ordered === undefined
+    ? {}
+    : {
+        ordered: {
+          kind: 'ordered',
+          order: ordered.order,
+          ...(ordered.window === undefined ? {} : { window: ordered.window }),
+          postSteps: [...ordered.postSteps]
+        }
+      };
+}
+
 function rowDiffOptionsForPlan(plan: IncrementalMaterializationPlan): MaterializationRowDiffOptions {
   return plan.rowKeyFields === undefined ? {} : { keyBy: plan.rowKeyFields };
+}
+
+function ambiguousFinalRowsReason<Row>(
+  plan: IncrementalMaterializationPlan,
+  rows: readonly Row[]
+): string | undefined {
+  const index = materializationRowIndex(rows, rowDiffOptionsForPlan(plan));
+  const duplicate = index.duplicates.values().next();
+  if (!duplicate.done) {
+    return `final materialized row key ${duplicate.value} is duplicated; snapshot recompute is required`;
+  }
+
+  const invalid = index.diagnostics.find((diagnostic) => diagnostic.code === 'invalid_row');
+  if (invalid !== undefined) {
+    return 'final materialized row key selection failed; snapshot recompute is required';
+  }
+
+  return undefined;
 }
 
 function relationForDeltas(relationName: string, deltas: readonly RelationDelta[]): RelationRef | undefined {
@@ -3385,4 +4007,13 @@ function isIterable(input: unknown): input is Iterable<unknown> {
 
 function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
+}
+
+function materializationErrorMessage(input: unknown): string {
+  if (input instanceof Error) return input.message;
+  try {
+    return JSON.stringify(input) ?? 'unknown error';
+  } catch {
+    return 'unknown error';
+  }
 }
