@@ -1,6 +1,6 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
 import type { RelationDelta } from './adapter.js';
-import { diffRows, type RowChange, type RowDiffDiagnostic } from './diff.js';
+import type { RowChange, RowDiff, RowDiffDiagnostic } from './diff.js';
 import {
   queryKey,
   queryRowKeyFields,
@@ -578,7 +578,7 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             envFor(next)
           );
           if (maintained.updated) {
-            const diff = diffRows(stored.rows, maintained.rows, materializationDiffOptions(stored.metadata.query));
+            const diff = diffMaterializationRows(stored.rows, maintained.rows, stored.metadata.query);
             const change: MaterializationMaintenanceChange = {
               kind: 'materializationMaintenanceChange',
               update: 'incremental',
@@ -623,7 +623,7 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
     }
 
     const entry = recomputeMaterializationEntry(next, stored);
-    const diff = diffRows(stored.rows, entry.rows, materializationDiffOptions(stored.metadata.query));
+    const diff = diffMaterializationRows(stored.rows, entry.rows, stored.metadata.query);
     const change: MaterializationMaintenanceChange = {
       kind: 'materializationMaintenanceChange',
       update: diff.changes.length === 0 ? 'carried' : 'recomputed',
@@ -1541,9 +1541,139 @@ function uniqueMaterializations(store: Map<string, StoredMaterialization>): read
   return Array.from(new Set(store.values()));
 }
 
+function diffMaterializationRows<Row>(
+  before: readonly Row[],
+  after: readonly Row[],
+  query: Query<Row>
+): RowDiff<Row> {
+  const keyFor = materializationRowKeySelector(materializationDiffOptions(query));
+  const beforeIndex = indexMaterializationRows(before, 'before', keyFor);
+  const afterIndex = indexMaterializationRows(after, 'after', keyFor);
+  const changes: RowChange<Row>[] = [];
+
+  for (const row of before) {
+    const key = keyFor(row);
+    if (beforeIndex.duplicates.has(key) || !beforeIndex.rows.has(key)) {
+      continue;
+    }
+
+    const afterRow = afterIndex.rows.get(key);
+    if (afterRow === undefined) {
+      changes.push({ kind: 'removed', key, row });
+    } else if (materializationStableKey(row) !== materializationStableKey(afterRow)) {
+      changes.push({ kind: 'updated', key, before: row, after: afterRow });
+    }
+  }
+
+  for (const row of after) {
+    const key = keyFor(row);
+    if (afterIndex.duplicates.has(key) || !afterIndex.rows.has(key) || beforeIndex.rows.has(key)) {
+      continue;
+    }
+
+    changes.push({ kind: 'added', key, row });
+  }
+
+  return {
+    changes,
+    diagnostics: [...beforeIndex.diagnostics, ...afterIndex.diagnostics]
+  };
+}
+
 function materializationDiffOptions<Row>(query: Query<Row>): { readonly keyBy?: readonly string[] } {
   const keyBy = queryRowKeyFields(query);
   return keyBy === undefined ? {} : { keyBy };
+}
+
+function materializationRowKeySelector<Row>(
+  options: { readonly keyBy?: readonly string[] }
+): (row: Row) => string {
+  if (options.keyBy === undefined) {
+    return (row) => materializationStableKey(row);
+  }
+
+  const fields = options.keyBy;
+  return (row) => materializationStableKey(fields.map((field) => isRecord(row) ? row[field] : undefined));
+}
+
+function indexMaterializationRows<Row>(
+  rows: readonly Row[],
+  side: 'before' | 'after',
+  keyFor: (row: Row) => string
+): {
+  readonly rows: ReadonlyMap<string, Row>;
+  readonly duplicates: ReadonlySet<string>;
+  readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
+} {
+  const indexed = new Map<string, Row>();
+  const duplicates = new Set<string>();
+  const diagnostics: RowDiffDiagnostic<Row>[] = [];
+
+  for (const row of rows) {
+    let key: string;
+    try {
+      key = keyFor(row);
+    } catch (error) {
+      diagnostics.push({
+        code: 'invalid_row',
+        message: 'row key selection failed',
+        side,
+        row,
+        ...(error === undefined ? {} : { key: materializationErrorMessage(error) })
+      });
+      continue;
+    }
+
+    if (indexed.has(key)) {
+      duplicates.add(key);
+      indexed.delete(key);
+      diagnostics.push({
+        code: 'duplicate_key',
+        message: `duplicate ${side} row key`,
+        side,
+        key,
+        row
+      });
+      continue;
+    }
+
+    if (!duplicates.has(key)) {
+      indexed.set(key, row);
+    }
+  }
+
+  return { rows: indexed, duplicates, diagnostics };
+}
+
+function materializationStableKey(value: unknown): string {
+  return stableKey(materializationStableValue(value));
+}
+
+function materializationStableValue(value: unknown): unknown {
+  if (value instanceof Set) {
+    return {
+      $tarstate: 'set',
+      values: Array.from(value, materializationStableValue)
+    };
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(materializationStableValue);
+  }
+
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [
+    key,
+    materializationStableValue(value[key])
+  ]));
+}
+
+function materializationErrorMessage(input: unknown): string {
+  if (input instanceof Error) return input.message;
+  return JSON.stringify(input) ?? 'unknown error';
 }
 
 function maintenanceReasonForMode(mode: MaterializationMode): string {

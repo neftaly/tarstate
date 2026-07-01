@@ -3,6 +3,7 @@ import { rowKey } from './evaluate.js';
 import { stableKey } from './identity.js';
 import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
 import type {
+  AggregateFunction,
   ExprData,
   PredicateData,
   ProjectionData,
@@ -24,8 +25,9 @@ export type IncrementalMaterializationState<Row = unknown> = {
   readonly rootRelation: string;
   readonly rootKeys: readonly string[];
   readonly rootRowsByRootKey: ReadonlyMap<string, unknown>;
-  readonly outputsByRootKey: ReadonlyMap<string, readonly Row[]>;
+  readonly outputsByRootKey: ReadonlyMap<string, readonly unknown[]>;
   readonly joinStates: readonly IncrementalJoinState[];
+  readonly aggregate?: IncrementalAggregateState<Row>;
 };
 
 export type IncrementalMaterialization<Row = unknown> = {
@@ -91,7 +93,13 @@ type IncrementalJoinStep = {
   readonly needsPredicateCheck: boolean;
 };
 
-type IncrementalStep = IncrementalPipelineStep | IncrementalJoinStep;
+type IncrementalAggregateStep = {
+  readonly kind: 'aggregate';
+  readonly groupBy: ProjectionData;
+  readonly aggregates: ProjectionData;
+};
+
+type IncrementalStep = IncrementalPipelineStep | IncrementalJoinStep | IncrementalAggregateStep;
 
 type IncrementalBranchPlan = {
   readonly relation: string;
@@ -108,6 +116,18 @@ type IncrementalJoinState = {
   readonly indexByValue: ReadonlyMap<string, readonly IndexedRightRow[]>;
   readonly rootValuesByKey: ReadonlyMap<string, readonly unknown[]>;
   readonly rootKeysByValue: ReadonlyMap<string, readonly RootJoinValue[]>;
+};
+
+type IncrementalAggregateState<Row = unknown> = {
+  readonly groupKeys: readonly string[];
+  readonly groupKeysByRootKey: ReadonlyMap<string, readonly string[]>;
+  readonly groupsByKey: ReadonlyMap<string, IncrementalAggregateGroupState<Row>>;
+};
+
+type IncrementalAggregateGroupState<Row = unknown> = {
+  readonly group: Record<string, unknown>;
+  readonly rowCount: number;
+  readonly output: Row;
 };
 
 type IncrementalRelationSnapshot = {
@@ -191,6 +211,29 @@ type RightChangeResult =
       readonly reason: string;
     };
 
+type AggregateStateResult<Row> =
+  | {
+      readonly supported: true;
+      readonly state: IncrementalAggregateState<Row>;
+    }
+  | {
+      readonly supported: false;
+      readonly reason: string;
+    };
+
+const supportedAggregateFunctions: ReadonlySet<AggregateFunction> = new Set([
+  'count',
+  'sum',
+  'avg',
+  'min',
+  'max',
+  'any',
+  'notAny',
+  'setConcat',
+  'top',
+  'bottom'
+]);
+
 export function planIncrementalMaterialization(query: Query): IncrementalPlanResult {
   const steps: IncrementalStep[] = [];
   const root = collectSingleRootPlan(query.data, steps, { joinCount: 0 });
@@ -244,7 +287,7 @@ export function buildIncrementalMaterialization<Row>(
 
   const rootKeys: string[] = [];
   const rootRowsByRootKey = new Map<string, unknown>();
-  const outputsByRootKey = new Map<string, readonly Row[]>();
+  const outputsByRootKey = new Map<string, readonly unknown[]>();
   const rootValuesByStep = new Map<string, Map<string, readonly unknown[]>>();
   const joinStateById = joinStateMap(joinStatesResult.states);
 
@@ -253,7 +296,7 @@ export function buildIncrementalMaterialization<Row>(
     rootKeys.push(key);
     rootRowsByRootKey.set(key, row);
 
-    const evaluated = evaluateRootRow<Row>(plan, row, env, joinStateById);
+    const evaluated = evaluateRootRow<unknown>(plan, row, env, joinStateById);
     if (!evaluated.supported) {
       return {
         supported: false,
@@ -268,13 +311,26 @@ export function buildIncrementalMaterialization<Row>(
   const joinStates = joinStatesResult.states.map((state) =>
     withRootJoinValues(state, rootValuesByStep.get(state.id) ?? new Map())
   );
+
+  const aggregate = aggregateStep(plan);
+  const aggregateState = aggregate === undefined
+    ? undefined
+    : buildAggregateState<Row>(plan, rootKeys, outputsByRootKey, env);
+  if (aggregateState !== undefined && !aggregateState.supported) {
+    return {
+      supported: false,
+      reason: aggregateState.reason
+    };
+  }
+
   const state = {
     kind: 'incrementalMaterializationState',
     rootRelation: plan.rootRelation,
     rootKeys,
     rootRowsByRootKey,
     outputsByRootKey,
-    joinStates
+    joinStates,
+    ...(aggregateState === undefined ? {} : { aggregate: aggregateState.state })
   } satisfies IncrementalMaterializationState<Row>;
 
   return {
@@ -320,6 +376,21 @@ export function maintainIncrementalMaterialization<Row>(
     }
   }
 
+  const aggregate = aggregateStep(materialization.plan);
+  const previousAggregateState = materialization.state.aggregate;
+  if (aggregate !== undefined && previousAggregateState === undefined) {
+    return {
+      updated: false,
+      reason: 'incremental aggregate state is missing; snapshot recompute is required'
+    };
+  }
+  if (aggregate === undefined && previousAggregateState !== undefined) {
+    return {
+      updated: false,
+      reason: 'incremental aggregate state is present for a non-aggregate plan; snapshot recompute is required'
+    };
+  }
+
   const normalized = normalizedRelationChanges(relation, deltas);
   if (!normalized.supported) {
     return {
@@ -342,6 +413,10 @@ export function maintainIncrementalMaterialization<Row>(
   const rootRowsByRootKey = new Map(materialization.state.rootRowsByRootKey);
   const outputsByRootKey = new Map(materialization.state.outputsByRootKey);
   const rootKeysToEvaluate = new Set<string>();
+  const affectedAggregateGroupKeys = new Set<string>();
+  const groupKeysByRootKey = previousAggregateState === undefined
+    ? undefined
+    : new Map(previousAggregateState.groupKeysByRootKey);
   let joinStates = materialization.state.joinStates;
 
   for (const joinStep of joinSteps(materialization.plan)) {
@@ -404,6 +479,8 @@ export function maintainIncrementalMaterialization<Row>(
           reason: `root relation delta removed missing key ${change.key}; snapshot recompute is required`
         };
       }
+      recordAggregateGroupKeys(affectedAggregateGroupKeys, groupKeysByRootKey?.get(change.key));
+      groupKeysByRootKey?.delete(change.key);
       rootKeys[index] = undefined;
       rootRowsByRootKey.delete(change.key);
       outputsByRootKey.delete(change.key);
@@ -456,11 +533,13 @@ export function maintainIncrementalMaterialization<Row>(
     }
 
     const row = rootRowsByRootKey.get(rootKey);
+    recordAggregateGroupKeys(affectedAggregateGroupKeys, groupKeysByRootKey?.get(rootKey));
+    groupKeysByRootKey?.delete(rootKey);
     for (const valuesByRootKey of rootValuesByStep.values()) {
       valuesByRootKey.delete(rootKey);
     }
 
-    const evaluated = evaluateRootRow<Row>(materialization.plan, row, env, joinStateById);
+    const evaluated = evaluateRootRow<unknown>(materialization.plan, row, env, joinStateById);
     if (!evaluated.supported) {
       return {
         updated: false,
@@ -469,6 +548,13 @@ export function maintainIncrementalMaterialization<Row>(
     }
 
     outputsByRootKey.set(rootKey, evaluated.rows);
+    if (aggregate !== undefined && groupKeysByRootKey !== undefined) {
+      const nextGroupKeys = aggregateGroupKeysForRows(aggregate, evaluated.rows, env);
+      recordAggregateGroupKeys(affectedAggregateGroupKeys, nextGroupKeys);
+      if (nextGroupKeys.length > 0) {
+        groupKeysByRootKey.set(rootKey, nextGroupKeys);
+      }
+    }
     recordRootJoinValues(rootValuesByStep, rootKey, evaluated.joinValuesByStep);
   }
 
@@ -477,19 +563,39 @@ export function maintainIncrementalMaterialization<Row>(
       for (const valuesByRootKey of rootValuesByStep.values()) {
         valuesByRootKey.delete(rootKey);
       }
+      groupKeysByRootKey?.delete(rootKey);
     }
   }
 
   const nextJoinStates = joinStates.map((state) =>
     withRootJoinValues(state, rootValuesByStep.get(state.id) ?? new Map())
   );
+  const nextAggregateState = aggregate === undefined
+    ? undefined
+    : maintainAggregateState<Row>(
+      materialization.plan,
+      previousAggregateState as IncrementalAggregateState<Row>,
+      compactRootKeys,
+      outputsByRootKey,
+      groupKeysByRootKey ?? new Map(),
+      affectedAggregateGroupKeys,
+      env
+    );
+  if (nextAggregateState !== undefined && !nextAggregateState.supported) {
+    return {
+      updated: false,
+      reason: nextAggregateState.reason
+    };
+  }
+
   const state = {
     kind: 'incrementalMaterializationState',
     rootRelation: materialization.state.rootRelation,
     rootKeys: compactRootKeys,
     rootRowsByRootKey,
     outputsByRootKey,
-    joinStates: nextJoinStates
+    joinStates: nextJoinStates,
+    ...(nextAggregateState === undefined ? {} : { aggregate: nextAggregateState.state })
   } satisfies IncrementalMaterializationState<Row>;
 
   if (rootChanges.length === 0 && rootKeysToEvaluate.size === 0 && joinStates === materialization.state.joinStates) {
@@ -537,6 +643,9 @@ function collectSingleRootPlan(
     case 'where': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
+      if (hasAggregateStep(steps)) {
+        return 'where after aggregate is not supported for incremental maintenance';
+      }
       const reason = simplePredicateReason(data.predicate);
       if (reason !== undefined) {
         return `where predicate is not supported for incremental maintenance: ${reason}`;
@@ -591,12 +700,16 @@ function collectSingleRootPlan(
       return { ...root, shape: renameShape(root.shape, data.fields) };
     }
     case 'join': {
+      const stepCount = steps.length;
       if (data.kind !== 'inner') {
         return 'left join incremental maintenance is not supported';
       }
 
       const left = collectSingleRootPlan(data.left, steps, collection);
       if (typeof left === 'string') return left;
+      if (hasAggregateStep(steps.slice(stepCount))) {
+        return 'join after aggregate is not supported for incremental maintenance';
+      }
 
       const right = collectRightBranchPlan(data.right);
       if (typeof right === 'string') {
@@ -649,8 +762,31 @@ function collectSingleRootPlan(
       return 'constRows is not supported for incremental maintenance';
     case 'qualify':
       return 'qualify is not supported for incremental maintenance';
-    case 'aggregate':
-      return 'aggregate is not supported for incremental maintenance';
+    case 'aggregate': {
+      const stepCount = steps.length;
+      const root = collectSingleRootPlan(data.input, steps, collection);
+      if (typeof root === 'string') return root;
+      const addedSteps = steps.slice(stepCount);
+      if (hasAggregateStep(addedSteps)) {
+        return 'nested aggregate is not supported for incremental maintenance';
+      }
+      if (addedSteps.some((step) => step.kind === 'join')) {
+        return 'joins under aggregate are not supported for incremental maintenance';
+      }
+
+      const groupReason = simpleProjectionReason(data.groupBy) ?? projectionShapeReason(data.groupBy, root.shape);
+      if (groupReason !== undefined) {
+        return `aggregate groupBy projection is not supported for incremental maintenance: ${groupReason}`;
+      }
+
+      const aggregateReason = aggregateProjectionReason(data.aggregates, root.shape);
+      if (aggregateReason !== undefined) {
+        return `aggregate projection is not supported for incremental maintenance: ${aggregateReason}`;
+      }
+
+      steps.push({ kind: 'aggregate', groupBy: data.groupBy, aggregates: data.aggregates });
+      return { ...root, shape: aggregateShape(root.shape, data.groupBy, data.aggregates) };
+    }
   }
 }
 
@@ -791,6 +927,31 @@ function joinSteps(plan: IncrementalMaterializationPlan): readonly IncrementalJo
   return plan.steps.filter((step): step is IncrementalJoinStep => step.kind === 'join');
 }
 
+function aggregateStep(plan: IncrementalMaterializationPlan): IncrementalAggregateStep | undefined {
+  return plan.steps.find((step): step is IncrementalAggregateStep => step.kind === 'aggregate');
+}
+
+function hasAggregateStep(steps: readonly IncrementalStep[]): boolean {
+  return steps.some((step) => step.kind === 'aggregate');
+}
+
+function stepsAfterAggregate(plan: IncrementalMaterializationPlan): readonly IncrementalPipelineStep[] {
+  const aggregateIndex = plan.steps.findIndex((step) => step.kind === 'aggregate');
+  if (aggregateIndex === -1) {
+    return [];
+  }
+
+  return plan.steps.slice(aggregateIndex + 1).filter((step): step is IncrementalPipelineStep =>
+    step.kind !== 'join' && step.kind !== 'aggregate'
+  );
+}
+
+function recordAggregateGroupKeys(target: Set<string>, keys: readonly string[] | undefined): void {
+  for (const key of keys ?? []) {
+    target.add(key);
+  }
+}
+
 function evaluateRootRow<Row>(
   plan: IncrementalMaterializationPlan,
   relationRow: unknown,
@@ -805,7 +966,9 @@ function evaluateRootRow<Row>(
   let rows: readonly Record<string, unknown>[] = [rootRow];
   const joinValuesByStep = new Map<string, readonly unknown[]>();
   for (const step of plan.steps) {
-    if (step.kind === 'join') {
+    if (step.kind === 'aggregate') {
+      break;
+    } else if (step.kind === 'join') {
       const joinState = joinStateById.get(step.id);
       if (joinState === undefined) {
         return {
@@ -947,7 +1110,339 @@ function renameRow(row: Record<string, unknown>, fields: Record<string, string>)
 }
 
 function rowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {
-  return state.rootKeys.flatMap((key) => state.outputsByRootKey.get(key) ?? []);
+  if (state.aggregate !== undefined) {
+    return state.aggregate.groupKeys.flatMap((key) => {
+      const group = state.aggregate?.groupsByKey.get(key);
+      return group === undefined ? [] : [group.output];
+    });
+  }
+
+  return state.rootKeys.flatMap((key) => state.outputsByRootKey.get(key) ?? []) as readonly Row[];
+}
+
+function buildAggregateState<Row>(
+  plan: IncrementalMaterializationPlan,
+  rootKeys: readonly string[],
+  outputsByRootKey: ReadonlyMap<string, readonly unknown[]>,
+  env: Readonly<Record<string, unknown>>
+): AggregateStateResult<Row> {
+  const aggregate = aggregateStep(plan);
+  if (aggregate === undefined) {
+    return {
+      supported: false,
+      reason: 'aggregate step is missing from aggregate incremental plan'
+    };
+  }
+
+  const groupKeysByRootKey = new Map<string, readonly string[]>();
+  for (const rootKey of rootKeys) {
+    const groupKeys = aggregateGroupKeysForRows(aggregate, outputsByRootKey.get(rootKey) ?? [], env);
+    if (groupKeys.length > 0) {
+      groupKeysByRootKey.set(rootKey, groupKeys);
+    }
+  }
+
+  const groupKeys = aggregateGroupOrder(aggregate, rootKeys, groupKeysByRootKey);
+  const groupsByKey = new Map<string, IncrementalAggregateGroupState<Row>>();
+  for (const groupKey of groupKeys) {
+    const group = recomputeAggregateGroup<Row>(plan, groupKey, rootKeys, outputsByRootKey, env);
+    if (!group.supported) {
+      return group;
+    }
+    if (group.state !== undefined) {
+      groupsByKey.set(groupKey, group.state);
+    }
+  }
+
+  return {
+    supported: true,
+    state: {
+      groupKeys,
+      groupKeysByRootKey,
+      groupsByKey
+    }
+  };
+}
+
+function maintainAggregateState<Row>(
+  plan: IncrementalMaterializationPlan,
+  previous: IncrementalAggregateState<Row>,
+  rootKeys: readonly string[],
+  outputsByRootKey: ReadonlyMap<string, readonly unknown[]>,
+  groupKeysByRootKey: ReadonlyMap<string, readonly string[]>,
+  affectedGroupKeys: ReadonlySet<string>,
+  env: Readonly<Record<string, unknown>>
+): AggregateStateResult<Row> {
+  const aggregate = aggregateStep(plan);
+  if (aggregate === undefined) {
+    return {
+      supported: false,
+      reason: 'aggregate step is missing from aggregate incremental plan'
+    };
+  }
+
+  const groupKeys = aggregateGroupOrder(aggregate, rootKeys, groupKeysByRootKey);
+  const groupsByKey = new Map(previous.groupsByKey);
+  for (const groupKey of affectedGroupKeys) {
+    const group = recomputeAggregateGroup<Row>(plan, groupKey, rootKeys, outputsByRootKey, env);
+    if (!group.supported) {
+      return group;
+    }
+    if (group.state === undefined) {
+      groupsByKey.delete(groupKey);
+    } else {
+      groupsByKey.set(groupKey, group.state);
+    }
+  }
+
+  if (isUngroupedAggregate(aggregate)) {
+    const emptyKey = emptyGroupKey();
+    if (!groupsByKey.has(emptyKey)) {
+      const group = recomputeAggregateGroup<Row>(plan, emptyKey, rootKeys, outputsByRootKey, env);
+      if (!group.supported) {
+        return group;
+      }
+      if (group.state !== undefined) {
+        groupsByKey.set(emptyKey, group.state);
+      }
+    }
+  }
+
+  for (const groupKey of previous.groupKeys) {
+    if (!groupKeys.includes(groupKey)) {
+      groupsByKey.delete(groupKey);
+    }
+  }
+
+  return {
+    supported: true,
+    state: {
+      groupKeys,
+      groupKeysByRootKey,
+      groupsByKey
+    }
+  };
+}
+
+function recomputeAggregateGroup<Row>(
+  plan: IncrementalMaterializationPlan,
+  groupKey: string,
+  rootKeys: readonly string[],
+  outputsByRootKey: ReadonlyMap<string, readonly unknown[]>,
+  env: Readonly<Record<string, unknown>>
+):
+  | { readonly supported: true; readonly state: IncrementalAggregateGroupState<Row> | undefined }
+  | { readonly supported: false; readonly reason: string } {
+  const aggregate = aggregateStep(plan);
+  if (aggregate === undefined) {
+    return {
+      supported: false,
+      reason: 'aggregate step is missing from aggregate incremental plan'
+    };
+  }
+
+  const rows: unknown[] = [];
+  let group: Record<string, unknown> | undefined;
+  for (const rootKey of rootKeys) {
+    for (const row of outputsByRootKey.get(rootKey) ?? []) {
+      const rowGroup = projectRow(asRecord(row), aggregate.groupBy, env);
+      if (stableKey(rowGroup) !== groupKey) {
+        continue;
+      }
+      group ??= rowGroup;
+      rows.push(row);
+    }
+  }
+
+  if (rows.length === 0) {
+    if (!isUngroupedAggregate(aggregate) || groupKey !== emptyGroupKey()) {
+      return { supported: true, state: undefined };
+    }
+    group = {};
+  }
+
+  const aggregateRow = evaluateAggregateRow(aggregate, group ?? {}, rows, env);
+  const postAggregateRows = evaluatePostAggregateRows(plan, aggregateRow, env);
+  if (postAggregateRows.length !== 1) {
+    return {
+      supported: false,
+      reason: 'post-aggregate incremental projection produced an unexpected row count; snapshot recompute is required'
+    };
+  }
+
+  return {
+    supported: true,
+    state: {
+      group: group ?? {},
+      rowCount: rows.length,
+      output: postAggregateRows[0] as Row
+    }
+  };
+}
+
+function aggregateGroupKeysForRows(
+  aggregate: IncrementalAggregateStep,
+  rows: readonly unknown[],
+  env: Readonly<Record<string, unknown>>
+): readonly string[] {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+
+  for (const row of rows) {
+    const key = stableKey(projectRow(asRecord(row), aggregate.groupBy, env));
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    keys.push(key);
+  }
+
+  return keys;
+}
+
+function aggregateGroupOrder(
+  aggregate: IncrementalAggregateStep,
+  rootKeys: readonly string[],
+  groupKeysByRootKey: ReadonlyMap<string, readonly string[]>
+): readonly string[] {
+  const seen = new Set<string>();
+  const groupKeys: string[] = [];
+
+  for (const rootKey of rootKeys) {
+    for (const groupKey of groupKeysByRootKey.get(rootKey) ?? []) {
+      if (seen.has(groupKey)) {
+        continue;
+      }
+      seen.add(groupKey);
+      groupKeys.push(groupKey);
+    }
+  }
+
+  if (groupKeys.length === 0 && isUngroupedAggregate(aggregate)) {
+    groupKeys.push(emptyGroupKey());
+  }
+
+  return groupKeys;
+}
+
+function isUngroupedAggregate(aggregate: IncrementalAggregateStep): boolean {
+  return Object.keys(aggregate.groupBy).length === 0;
+}
+
+function emptyGroupKey(): string {
+  return stableKey({});
+}
+
+function evaluateAggregateRow(
+  aggregate: IncrementalAggregateStep,
+  group: Record<string, unknown>,
+  rows: readonly unknown[],
+  env: Readonly<Record<string, unknown>>
+): Record<string, unknown> {
+  const output: Record<string, unknown> = { ...group };
+  for (const [name, item] of Object.entries(aggregate.aggregates)) {
+    output[name] = evaluateAggregate(projectionExpr(item), rows, env);
+  }
+  return output;
+}
+
+function evaluatePostAggregateRows(
+  plan: IncrementalMaterializationPlan,
+  row: Record<string, unknown>,
+  env: Readonly<Record<string, unknown>>
+): readonly Record<string, unknown>[] {
+  let rows: readonly Record<string, unknown>[] = [row];
+  for (const step of stepsAfterAggregate(plan)) {
+    rows = evaluateStep(rows, step, env);
+  }
+  return rows;
+}
+
+function evaluateAggregate(
+  expr: ExprData,
+  rows: readonly unknown[],
+  env: Readonly<Record<string, unknown>>
+): unknown {
+  if (expr.op !== 'aggregateCall') {
+    return exprValue(asRecord(rows[0] ?? {}), expr, env);
+  }
+
+  const values = expr.expr === undefined
+    ? rows
+    : rows.map((row) => exprValue(asRecord(row), expr.expr as ExprData, env));
+  const aggregateValues = expr.distinct ? distinctValues(values) : values;
+
+  switch (expr.name) {
+    case 'count':
+      return expr.expr === undefined
+        ? rows.length
+        : aggregateValues.filter((value) => value !== null && value !== undefined).length;
+    case 'sum':
+      return aggregateValues.reduce<number>((total, value) => total + (typeof value === 'number' ? value : 0), 0);
+    case 'avg': {
+      const numbers = aggregateValues.filter((value): value is number => typeof value === 'number');
+      return numbers.length === 0 ? undefined : numbers.reduce((total, value) => total + value, 0) / numbers.length;
+    }
+    case 'min':
+      return orderedValues(aggregateValues).at(0);
+    case 'max':
+      return orderedValues(aggregateValues).at(-1);
+    case 'any':
+      return aggregateValues.some(Boolean);
+    case 'notAny':
+      return !aggregateValues.some(Boolean);
+    case 'setConcat':
+      return new Set(aggregateValues.flatMap((value) => {
+        if (value instanceof Set) return Array.from(value);
+        if (Array.isArray(value)) return value;
+        return [value];
+      }));
+    case 'top':
+      return [...orderedValues(aggregateValues)].reverse().slice(0, expr.count ?? 0);
+    case 'bottom':
+      return orderedValues(aggregateValues).slice(0, expr.count ?? 0);
+    case 'topBy':
+      return rowsByAggregate(rows, expr.expr, env, 'desc').slice(0, expr.count ?? 0);
+    case 'bottomBy':
+      return rowsByAggregate(rows, expr.expr, env, 'asc').slice(0, expr.count ?? 0);
+  }
+}
+
+function rowsByAggregate(
+  rows: readonly unknown[],
+  expr: ExprData | undefined,
+  env: Readonly<Record<string, unknown>>,
+  direction: 'asc' | 'desc'
+): readonly unknown[] {
+  if (expr === undefined) {
+    return rows;
+  }
+
+  return rows.map((row) => ({ row, value: exprValue(asRecord(row), expr, env) }))
+    .sort((left, right) => compareSortValues(left.value, right.value, direction, 'last'))
+    .map((item) => item.row);
+}
+
+function distinctValues(values: readonly unknown[]): readonly unknown[] {
+  const seen = new Set<string>();
+  const output: unknown[] = [];
+
+  for (const value of values) {
+    const key = stableKey(value);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(value);
+  }
+
+  return output;
+}
+
+function orderedValues(values: readonly unknown[]): readonly unknown[] {
+  return [...values]
+    .filter((value) => value !== null && value !== undefined)
+    .sort(compareValues);
 }
 
 function buildJoinStates(
@@ -1372,6 +1867,14 @@ function renameShape(shape: PlanShape, fields: Record<string, string>): PlanShap
   };
 }
 
+function aggregateShape(shape: PlanShape, groupBy: ProjectionData, aggregates: ProjectionData): PlanShape {
+  return {
+    aliases: new Set(),
+    fields: new Set([...Object.keys(groupBy), ...Object.keys(aggregates)]),
+    relations: new Set(shape.relations)
+  };
+}
+
 function mergeShapes(left: PlanShape, right: PlanShape): PlanShape {
   return {
     aliases: new Set([...left.aliases, ...right.aliases]),
@@ -1446,6 +1949,38 @@ function predicateShapeReason(predicate: PredicateData, shape: PlanShape): strin
     case 'not':
       return predicateShapeReason(predicate.predicate, shape);
   }
+}
+
+function aggregateProjectionReason(aggregates: ProjectionData, shape: PlanShape): string | undefined {
+  for (const [name, item] of Object.entries(aggregates)) {
+    const expr = projectionExpr(item);
+    if (expr.op !== 'aggregateCall') {
+      return `field ${name} is not an aggregate call`;
+    }
+
+    const reason = aggregateCallReason(expr, shape);
+    if (reason !== undefined) {
+      return `field ${name}: ${reason}`;
+    }
+  }
+  return undefined;
+}
+
+function aggregateCallReason(
+  expr: Extract<ExprData, { readonly op: 'aggregateCall' }>,
+  shape: PlanShape
+): string | undefined {
+  if (!supportedAggregateFunctions.has(expr.name)) {
+    return `${expr.name} aggregate is not supported`;
+  }
+
+  if (expr.expr === undefined) {
+    return expr.name === 'count'
+      ? undefined
+      : `${expr.name} aggregate requires an input expression`;
+  }
+
+  return simpleExprReason(expr.expr) ?? exprShapeReason(expr.expr, shape);
 }
 
 function exprShapeReason(expr: ExprData, shape: PlanShape): string | undefined {
@@ -1631,6 +2166,28 @@ function compareValues(left: unknown, right: unknown): number {
   if (left === undefined || left === null) return -1;
   if (right === undefined || right === null) return 1;
   return left < right ? -1 : 1;
+}
+
+function compareSortValues(
+  left: unknown,
+  right: unknown,
+  direction: 'asc' | 'desc',
+  nulls: 'first' | 'last' | undefined
+): number {
+  const leftNull = left === null || left === undefined;
+  const rightNull = right === null || right === undefined;
+  if (leftNull || rightNull) {
+    if (leftNull && rightNull) return 0;
+    const nullOrder = nulls ?? 'last';
+    return leftNull === (nullOrder === 'first') ? -1 : 1;
+  }
+
+  const comparison = compareValues(left, right);
+  return direction === 'asc' ? comparison : -comparison;
+}
+
+function asRecord(input: unknown): Record<string, unknown> {
+  return isRecord(input) ? input : {};
 }
 
 function isRecord(input: unknown): input is Record<string, unknown> {

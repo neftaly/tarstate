@@ -1,14 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
+  aggregate,
   and,
   as,
+  avg,
   call,
+  count,
+  countDistinct,
   createDb,
   desc,
   eq,
   env,
   from,
   gt,
+  any as anyAggregate,
   insert,
   join,
   keyBy,
@@ -17,13 +22,19 @@ import {
   mat,
   materializationForQuery,
   materializedRowsForQuery,
+  max,
   maybe,
+  min,
+  notAny,
   pipe,
   project,
   qRows,
+  setConcat,
   sortLimit,
+  sum,
   trackTransact,
   transact,
+  topBy,
   value,
   where
 } from '@tarstate/core';
@@ -69,6 +80,26 @@ type TaskOwnerRow = {
   readonly title: string;
   readonly owner: string;
   readonly points: number;
+};
+
+type TaskProjectRollupRow = {
+  readonly projectId: string;
+  readonly tasks: number;
+  readonly points: number;
+  readonly averagePoints: number;
+};
+
+type TaskProjectStatsRow = TaskProjectRollupRow & {
+  readonly minPoints: number;
+  readonly maxPoints: number;
+};
+
+type TeamUserFacetRow = {
+  readonly teamId: string;
+  readonly anyActive: boolean;
+  readonly noneActive: boolean;
+  readonly distinctNames: number;
+  readonly tags: ReadonlySet<string>;
 };
 
 const diaUser: UserRow = {
@@ -145,6 +176,57 @@ function residualTaskOwnersQuery(): Query<TaskOwnerRow> {
   ) as Query<TaskOwnerRow>;
 }
 
+function taskProjectRollupsQuery(): Query<TaskProjectRollupRow> {
+  const task = as(coreSchema.tasks, 'task');
+  return pipe(
+    from(task),
+    aggregate({
+      groupBy: { projectId: task.ownerId },
+      aggregates: {
+        tasks: count(),
+        points: sum(task.points),
+        averagePoints: avg(task.points)
+      }
+    }),
+    keyBy('projectId')
+  ) as Query<TaskProjectRollupRow>;
+}
+
+function taskProjectStatsQuery(): Query<TaskProjectStatsRow> {
+  const task = as(coreSchema.tasks, 'task');
+  return pipe(
+    from(task),
+    aggregate({
+      groupBy: { projectId: task.ownerId },
+      aggregates: {
+        tasks: count(),
+        points: sum(task.points),
+        averagePoints: avg(task.points),
+        minPoints: min(task.points),
+        maxPoints: max(task.points)
+      }
+    }),
+    keyBy('projectId')
+  ) as Query<TaskProjectStatsRow>;
+}
+
+function teamUserFacetsQuery(): Query<TeamUserFacetRow> {
+  const user = as(coreSchema.users, 'user');
+  return pipe(
+    from(user),
+    aggregate({
+      groupBy: { teamId: user.teamId },
+      aggregates: {
+        anyActive: anyAggregate(user.active),
+        noneActive: notAny(user.active),
+        distinctNames: countDistinct(user.name),
+        tags: setConcat(user.tags)
+      }
+    }),
+    keyBy('teamId')
+  ) as Query<TeamUserFacetRow>;
+}
+
 function usersDelta(added: readonly UserRow[], removed: readonly UserRow[]): RelationDelta<typeof coreSchema.users> {
   return { relation: coreSchema.users, added, removed };
 }
@@ -174,6 +256,457 @@ function expectIncrementalFallback(diagnostics: readonly { readonly code: string
 }
 
 describe('incremental materialization', () => {
+  describe('aggregate queries', () => {
+    it('marks initial task aggregate materialization as incrementally maintained', () => {
+      const taskProjectRollups = taskProjectRollupsQuery();
+      const state = mat(createDb(sourceData), taskProjectRollups, {
+        id: 'task-project-rollups',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, taskProjectRollups);
+
+      expect(metadata).toMatchObject({
+        id: 'task-project-rollups',
+        requestedMode: 'incremental',
+        maintenance: 'incremental',
+        dependencies: ['tasks']
+      });
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, taskProjectRollups)).toEqual([
+        { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 },
+        { projectId: 'bea', tasks: 1, points: 3, averagePoints: 3 }
+      ]);
+    });
+
+    it('incrementally updates only the affected aggregate group for a root insert', () => {
+      const taskProjectRollups = taskProjectRollupsQuery();
+      const state = mat(createDb(sourceData), taskProjectRollups, {
+        id: 'task-project-rollups',
+        mode: 'incremental'
+      });
+      const extraReviewTask: TaskRow = {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Review incremental aggregates',
+        done: false,
+        points: 7
+      };
+      const next = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, extraReviewTask]
+      });
+
+      const maintained = maintainMaterializations(state, next, {
+        deltas: [tasksDelta([extraReviewTask], [])]
+      });
+      const change = singleMaterializationChange(maintained, 'task-project-rollups');
+
+      expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(change).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['tasks'],
+        rows: [
+          { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 },
+          { projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expect(change.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { projectId: 'bea', tasks: 1, points: 3, averagePoints: 3 },
+          after: { projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 }
+        })
+      ]);
+      expect(materializedRowsForQuery(next, taskProjectRollups)).toEqual(change.rows);
+
+      const newProjectTask: TaskRow = {
+        id: 't5',
+        ownerId: 'cal',
+        title: 'Open new aggregate group',
+        done: false,
+        points: 2
+      };
+      const withNewProject = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, extraReviewTask, newProjectTask]
+      });
+
+      const addedGroupMaintenance = maintainMaterializations(next, withNewProject, {
+        deltas: [tasksDelta([newProjectTask], [])]
+      });
+      const addedGroupChange = singleMaterializationChange(addedGroupMaintenance, 'task-project-rollups');
+
+      expect(addedGroupMaintenance).toMatchObject({ recomputed: 0 });
+      expect(addedGroupChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 },
+          { projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 },
+          { projectId: 'cal', tasks: 1, points: 2, averagePoints: 2 }
+        ],
+        addedRows: [{ projectId: 'cal', tasks: 1, points: 2, averagePoints: 2 }],
+        removedRows: []
+      });
+      expect(addedGroupChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'added',
+          row: { projectId: 'cal', tasks: 1, points: 2, averagePoints: 2 }
+        })
+      ]);
+      expect(materializedRowsForQuery(withNewProject, taskProjectRollups)).toEqual(addedGroupChange.rows);
+    });
+
+    it('incrementally updates and removes affected aggregate groups for root deletes', () => {
+      const taskProjectRollups = taskProjectRollupsQuery();
+      const state = mat(createDb(sourceData), taskProjectRollups, {
+        id: 'task-project-rollups',
+        mode: 'incremental'
+      });
+      const next = createDb({
+        ...sourceData,
+        tasks: [shipRuntimeTask]
+      });
+
+      const maintained = maintainMaterializations(state, next, {
+        deltas: [tasksDelta([], [draftEvaluatorTask, reviewFixturesTask])]
+      });
+      const change = singleMaterializationChange(maintained, 'task-project-rollups');
+
+      expect(maintained).toMatchObject({ recomputed: 0 });
+      expect(change).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { projectId: 'ada', tasks: 1, points: 8, averagePoints: 8 }
+        ],
+        addedRows: [],
+        removedRows: [{ projectId: 'bea', tasks: 1, points: 3, averagePoints: 3 }]
+      });
+      expect(change.rowChanges).toHaveLength(2);
+      expect(change.rowChanges).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 },
+          after: { projectId: 'ada', tasks: 1, points: 8, averagePoints: 8 }
+        }),
+        expect.objectContaining({
+          kind: 'removed',
+          row: { projectId: 'bea', tasks: 1, points: 3, averagePoints: 3 }
+        })
+      ]));
+      expect(materializedRowsForQuery(next, taskProjectRollups)).toEqual(change.rows);
+    });
+
+    it('incrementally updates both aggregate groups when a root update moves a row', () => {
+      const taskProjectRollups = taskProjectRollupsQuery();
+      const extraReviewTask: TaskRow = {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Review incremental aggregates',
+        done: false,
+        points: 7
+      };
+      const initial = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, extraReviewTask]
+      });
+      const state = mat(initial, taskProjectRollups, {
+        id: 'task-project-rollups',
+        mode: 'incremental'
+      });
+      const movedReviewTask = { ...extraReviewTask, ownerId: 'ada', points: 4 };
+      const next = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, movedReviewTask]
+      });
+
+      const maintained = maintainMaterializations(state, next, {
+        deltas: [tasksDelta([movedReviewTask], [extraReviewTask])]
+      });
+      const change = singleMaterializationChange(maintained, 'task-project-rollups');
+
+      expect(maintained).toMatchObject({ recomputed: 0 });
+      expect(change).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { projectId: 'ada', tasks: 3, points: 17, averagePoints: 17 / 3 },
+          { projectId: 'bea', tasks: 1, points: 3, averagePoints: 3 }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expect(change.rowChanges).toHaveLength(2);
+      expect(change.rowChanges).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 },
+          after: { projectId: 'ada', tasks: 3, points: 17, averagePoints: 17 / 3 }
+        }),
+        expect.objectContaining({
+          kind: 'updated',
+          before: { projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 },
+          after: { projectId: 'bea', tasks: 1, points: 3, averagePoints: 3 }
+        })
+      ]));
+      expect(materializedRowsForQuery(next, taskProjectRollups)).toEqual(change.rows);
+    });
+
+    it('keeps count, sum, avg, min, and max correct when aggregate extrema are removed and updated', () => {
+      const taskProjectStats = taskProjectStatsQuery();
+      const state = mat(createDb(sourceData), taskProjectStats, {
+        id: 'task-project-stats',
+        mode: 'incremental'
+      });
+      const withoutRemovedMin = createDb({
+        ...sourceData,
+        tasks: [shipRuntimeTask, reviewFixturesTask]
+      });
+
+      const removedMinMaintenance = maintainMaterializations(state, withoutRemovedMin, {
+        deltas: [tasksDelta([], [draftEvaluatorTask])]
+      });
+      const removedMinChange = singleMaterializationChange(removedMinMaintenance, 'task-project-stats');
+
+      expect(removedMinMaintenance).toMatchObject({ recomputed: 0 });
+      expect(removedMinChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { projectId: 'ada', tasks: 1, points: 8, averagePoints: 8, minPoints: 8, maxPoints: 8 },
+          { projectId: 'bea', tasks: 1, points: 3, averagePoints: 3, minPoints: 3, maxPoints: 3 }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expect(removedMinChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5, minPoints: 5, maxPoints: 8 },
+          after: { projectId: 'ada', tasks: 1, points: 8, averagePoints: 8, minPoints: 8, maxPoints: 8 }
+        })
+      ]);
+      expect(materializedRowsForQuery(withoutRemovedMin, taskProjectStats)).toEqual(removedMinChange.rows);
+
+      const updatedShipRuntimeTask = { ...shipRuntimeTask, points: 2 };
+      const withUpdatedExtremum = createDb({
+        ...sourceData,
+        tasks: [updatedShipRuntimeTask, reviewFixturesTask]
+      });
+      const updatedExtremumMaintenance = maintainMaterializations(withoutRemovedMin, withUpdatedExtremum, {
+        deltas: [tasksDelta([updatedShipRuntimeTask], [shipRuntimeTask])]
+      });
+      const updatedExtremumChange = singleMaterializationChange(updatedExtremumMaintenance, 'task-project-stats');
+
+      expect(updatedExtremumMaintenance).toMatchObject({ recomputed: 0 });
+      expect(updatedExtremumChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { projectId: 'ada', tasks: 1, points: 2, averagePoints: 2, minPoints: 2, maxPoints: 2 },
+          { projectId: 'bea', tasks: 1, points: 3, averagePoints: 3, minPoints: 3, maxPoints: 3 }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expect(updatedExtremumChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { projectId: 'ada', tasks: 1, points: 8, averagePoints: 8, minPoints: 8, maxPoints: 8 },
+          after: { projectId: 'ada', tasks: 1, points: 2, averagePoints: 2, minPoints: 2, maxPoints: 2 }
+        })
+      ]);
+      expect(materializedRowsForQuery(withUpdatedExtremum, taskProjectStats)).toEqual(updatedExtremumChange.rows);
+    });
+
+    it('keeps any, notAny, countDistinct, and setConcat correct with duplicate and distinct values', () => {
+      const teamUserFacets = teamUserFacetsQuery();
+      const inactiveEngUser: UserRow = {
+        ...diaUser,
+        active: false,
+        tags: ['runtime', 'ui']
+      };
+      const initial = createDb({
+        ...sourceData,
+        users: [adaUser, inactiveEngUser, beaUser, calUser]
+      });
+      const state = mat(initial, teamUserFacets, {
+        id: 'team-user-facets',
+        mode: 'incremental'
+      });
+
+      expect(materializedRowsForQuery(state, teamUserFacets)).toEqual([
+        {
+          teamId: 'eng',
+          anyActive: true,
+          noneActive: false,
+          distinctNames: 2,
+          tags: new Set(['compiler', 'runtime', 'ui'])
+        },
+        {
+          teamId: 'design',
+          anyActive: true,
+          noneActive: false,
+          distinctNames: 1,
+          tags: new Set(['research'])
+        },
+        {
+          teamId: 'missing',
+          anyActive: false,
+          noneActive: true,
+          distinctNames: 1,
+          tags: new Set()
+        }
+      ]);
+
+      const duplicateNameUser: UserRow = {
+        id: 'eli',
+        teamId: 'eng',
+        name: 'Ada',
+        active: false,
+        age: 31,
+        tags: ['ui', 'ops']
+      };
+      const withDuplicateValues = createDb({
+        ...sourceData,
+        users: [adaUser, inactiveEngUser, duplicateNameUser, beaUser, calUser]
+      });
+
+      const insertedDuplicateMaintenance = maintainMaterializations(state, withDuplicateValues, {
+        deltas: [usersDelta([duplicateNameUser], [])]
+      });
+      const insertedDuplicateChange = singleMaterializationChange(insertedDuplicateMaintenance, 'team-user-facets');
+
+      expect(insertedDuplicateMaintenance).toMatchObject({ recomputed: 0 });
+      expect(insertedDuplicateChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        addedRows: [],
+        removedRows: []
+      });
+      expect(insertedDuplicateChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: {
+            teamId: 'eng',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 2,
+            tags: new Set(['compiler', 'runtime', 'ui'])
+          },
+          after: {
+            teamId: 'eng',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 2,
+            tags: new Set(['compiler', 'runtime', 'ui', 'ops'])
+          }
+        })
+      ]);
+
+      const withoutOriginalActive = createDb({
+        ...sourceData,
+        users: [inactiveEngUser, duplicateNameUser, beaUser, calUser]
+      });
+      const removedOriginalMaintenance = maintainMaterializations(withDuplicateValues, withoutOriginalActive, {
+        deltas: [usersDelta([], [adaUser])]
+      });
+      const removedOriginalChange = singleMaterializationChange(removedOriginalMaintenance, 'team-user-facets');
+
+      expect(removedOriginalMaintenance).toMatchObject({ recomputed: 0 });
+      expect(removedOriginalChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          {
+            teamId: 'eng',
+            anyActive: false,
+            noneActive: true,
+            distinctNames: 2,
+            tags: new Set(['runtime', 'ui', 'ops'])
+          },
+          {
+            teamId: 'design',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 1,
+            tags: new Set(['research'])
+          },
+          {
+            teamId: 'missing',
+            anyActive: false,
+            noneActive: true,
+            distinctNames: 1,
+            tags: new Set()
+          }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expect(removedOriginalChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: {
+            teamId: 'eng',
+            anyActive: true,
+            noneActive: false,
+            distinctNames: 2,
+            tags: new Set(['compiler', 'runtime', 'ui', 'ops'])
+          },
+          after: {
+            teamId: 'eng',
+            anyActive: false,
+            noneActive: true,
+            distinctNames: 2,
+            tags: new Set(['runtime', 'ui', 'ops'])
+          }
+        })
+      ]);
+      expect(materializedRowsForQuery(withoutOriginalActive, teamUserFacets)).toEqual(removedOriginalChange.rows);
+    });
+
+    it('falls back with an explicit diagnostic for unsupported aggregate shapes', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const taskProjectRankings = pipe(
+        from(task),
+        aggregate({
+          groupBy: { projectId: task.ownerId },
+          aggregates: {
+            topTasks: topBy(2, task.points)
+          }
+        }),
+        keyBy('projectId')
+      );
+
+      const state = mat(createDb(sourceData), taskProjectRankings, {
+        id: 'task-project-rankings',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, taskProjectRankings);
+      const fallback = metadata?.diagnostics.find((diagnostic) => (
+        diagnostic.code === 'materialization_incremental_fallback'
+      ));
+
+      expect(metadata).toMatchObject({
+        requestedMode: 'incremental',
+        maintenance: 'snapshot'
+      });
+      expect(fallback).toEqual(expect.objectContaining({
+        code: 'materialization_incremental_fallback',
+        detail: expect.objectContaining({
+          mode: 'incremental',
+          fallback: 'recompute',
+          id: 'task-project-rankings',
+          reason: expect.stringMatching(/aggregate|topBy|unsupported|not supported/i)
+        })
+      }));
+    });
+  });
+
   it('marks simple filtered/projected/keyed relations as incrementally maintained', () => {
     const activeUsers = activeUsersQuery();
     const state = mat(createDb(sourceData), activeUsers, { id: 'active-users', mode: 'incremental' });

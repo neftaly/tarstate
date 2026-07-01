@@ -1,16 +1,23 @@
 import { bench, describe } from 'vitest';
 import {
+  aggregate,
+  avg,
   constrain,
+  count,
   createDb,
   db,
   deleteWhere,
   diffQuery,
   eq,
+  from,
   gte,
   index,
   insert,
+  keyBy,
   mat,
+  pipe,
   qRows,
+  sum,
   trackTransact,
   transact,
   tryTransact,
@@ -69,6 +76,44 @@ const largeMaterializedJoinOwnerUpdate = updateWhere(benchSchema.people, eq(pers
   name: 'Updated Owner',
   role: 'principal'
 });
+const largeProjectTaskRollups = pipe(
+  from(taskRef),
+  aggregate({
+    groupBy: { projectId: taskRef.projectId },
+    aggregates: {
+      tasks: count(),
+      totalPoints: sum(taskRef.points),
+      averagePoints: avg(taskRef.points)
+    }
+  }),
+  keyBy('projectId')
+);
+const largeSnapshotMaterializedAggregate = mat(createDb(large.data), {
+  projectTaskRollups: largeProjectTaskRollups
+});
+const largeIncrementalMaterializedAggregate = mat(createDb(large.data), {
+  projectTaskRollups: largeProjectTaskRollups
+}, { mode: 'incremental' });
+const largeAggregateInsertProjectId = large.data.projects[0]?.id ?? '';
+const largeAggregateTaskInsert = insert(benchSchema.tasks, extraTask(large.data, 400, {
+  projectId: largeAggregateInsertProjectId,
+  points: 11
+}));
+const largeAggregateMoveTask = large.data.tasks.find((task) => task.projectId !== largeAggregateInsertProjectId)
+  ?? large.data.tasks[0];
+const largeAggregateMoveTargetProjectId = large.data.projects.find((project) => (
+  project.id !== largeAggregateMoveTask?.projectId
+))?.id ?? largeAggregateInsertProjectId;
+const largeAggregateTaskProjectUpdate = updateWhere(
+  benchSchema.tasks,
+  eq(taskRef.id, largeAggregateMoveTask?.id ?? ''),
+  {
+    projectId: largeAggregateMoveTargetProjectId,
+    points: (largeAggregateMoveTask?.points ?? 0) + 5
+  }
+);
+const largeAggregateDeleteTaskId = large.data.tasks[Math.floor(large.data.tasks.length / 2)]?.id ?? '';
+const largeAggregateTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.id, largeAggregateDeleteTaskId));
 const watchBase = createDb(medium.data);
 const watchNext = transact(watchBase, insert(benchSchema.people, extraPerson(200)));
 const watchHandle = watch(watchBase, medium.queries.activePeople, () => undefined);
@@ -134,6 +179,30 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized transact large incremental: maintain joined task query from owner update', () => {
     consumeBenchResult(transact(largeIncrementalMaterializedJoin, largeMaterializedJoinOwnerUpdate));
+  }, options);
+
+  bench('materialized transact large aggregate snapshot: task insert', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedAggregate, largeAggregateTaskInsert));
+  }, options);
+
+  bench('materialized transact large aggregate requested incremental: task insert', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedAggregate, largeAggregateTaskInsert));
+  }, options);
+
+  bench('materialized transact large aggregate snapshot: task update moves group and points', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedAggregate, largeAggregateTaskProjectUpdate));
+  }, options);
+
+  bench('materialized transact large aggregate requested incremental: task update moves group and points', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedAggregate, largeAggregateTaskProjectUpdate));
+  }, options);
+
+  bench('materialized transact large aggregate snapshot: task delete', () => {
+    consumeBenchResult(transact(largeSnapshotMaterializedAggregate, largeAggregateTaskDelete));
+  }, options);
+
+  bench('materialized transact large aggregate requested incremental: task delete', () => {
+    consumeBenchResult(transact(largeIncrementalMaterializedAggregate, largeAggregateTaskDelete));
   }, options);
 
   bench('materialized index: set rows', () => {
