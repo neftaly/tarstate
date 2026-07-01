@@ -1,6 +1,25 @@
 import { bench, describe } from 'vitest';
-import { evaluate, qMany, qRows, queryKey } from '@tarstate/core';
-import { benchSchema, consumeBenchResult, createBenchFixture } from './fixtures';
+import {
+  createDb,
+  evaluate,
+  from,
+  hash,
+  index,
+  insert,
+  keyBy,
+  lookup,
+  mat,
+  materializedRowsForQuery,
+  pipe,
+  project,
+  qMany,
+  qRows,
+  queryKey,
+  transact,
+  type Query,
+  type RelationSource
+} from '@tarstate/core';
+import { benchSchema, consumeBenchResult, createBenchFixture, extraPerson, personRef } from './fixtures';
 
 const options = {
   time: 200,
@@ -10,6 +29,71 @@ const options = {
 
 const medium = createBenchFixture('medium');
 const large = createBenchFixture('large');
+const largeLookupPerson = large.data.people[Math.floor(large.data.people.length / 2)] ?? large.data.people[0]!;
+const maintainedLookupPerson = extraPerson(700);
+const peopleById = pipe(
+  from(personRef),
+  hash(personRef.id),
+  project({
+    id: personRef.id,
+    name: personRef.name,
+    email: personRef.email,
+    role: personRef.role,
+    region: personRef.region,
+    active: personRef.active,
+    capacity: personRef.capacity,
+    skills: personRef.skills
+  }),
+  keyBy('id')
+);
+const lookupExistingPersonById = pipe(
+  lookup(personRef, 'id', largeLookupPerson.id),
+  project({
+    id: personRef.id,
+    email: personRef.email,
+    role: personRef.role,
+    capacity: personRef.capacity
+  }),
+  keyBy('id')
+);
+const lookupMaintainedPersonById = pipe(
+  lookup(personRef, 'id', maintainedLookupPerson.id),
+  project({
+    id: personRef.id,
+    email: personRef.email,
+    role: personRef.role,
+    capacity: personRef.capacity
+  }),
+  keyBy('id')
+);
+const materializedPeopleById = mat(createDb(large.data), peopleById, {
+  id: 'people-by-id',
+  mode: 'incremental'
+});
+const maintainedPeopleById = transact(
+  materializedPeopleById,
+  insert(benchSchema.people, maintainedLookupPerson)
+);
+const materializedPeopleLookupSource = materializedHashLookupSource(materializedPeopleById, peopleById, 'id');
+const maintainedPeopleLookupSource = materializedHashLookupSource(maintainedPeopleById, peopleById, 'id');
+
+function materializedHashLookupSource<Row>(
+  db: object,
+  query: Query<Row>,
+  field: string
+): RelationSource {
+  return {
+    relationNames: [benchSchema.people.name],
+    rows: () => materializedRowsForQuery(db, query) ?? [],
+    lookup: ({ relation, field: lookupField, value }) => {
+      if (relation.name !== benchSchema.people.name || lookupField !== field) {
+        return undefined;
+      }
+
+      return index<Row, unknown>(db, query, { kind: 'hash', field }).index?.get(value) ?? [];
+    }
+  };
+}
 
 describe('core query benchmarks', () => {
   bench('relation scan: qRows(tasks relation)', async () => {
@@ -62,5 +146,13 @@ describe('core query benchmarks', () => {
 
   bench('indexed source lookup: owner task lookup index', async () => {
     consumeBenchResult(await evaluate(large.indexedSource, large.queries.lookupTasksByOwner));
+  }, options);
+
+  bench('lookup query path: materialized hash source before maintained insert', async () => {
+    consumeBenchResult(await evaluate(materializedPeopleLookupSource, lookupExistingPersonById));
+  }, options);
+
+  bench('lookup query path: materialized hash source after maintained insert', async () => {
+    consumeBenchResult(await evaluate(maintainedPeopleLookupSource, lookupMaintainedPersonById));
   }, options);
 });

@@ -24,6 +24,7 @@ scales:
 - `qMany` batch reads.
 - `queryKey`.
 - Explicit `lookup(...)` evaluated against object and indexed relation sources.
+- Explicit `lookup(...)` evaluated through a materialized hash-backed source before and after incremental maintenance.
 
 `write-materialization.bench.ts` covers the initial write/materialization slice:
 
@@ -36,6 +37,7 @@ scales:
 - Larger materialized joined-query maintenance.
 - Large `trackTransact` reporting for requested incremental joined-query deltas.
 - Materialization set/hash/btree/unique index facades.
+- Materialized hash/unique/btree facade reads before and after an incrementally maintained insert.
 - Watch refresh, `trackTransact`, and `diffQuery`.
 
 ## Not Yet Measured

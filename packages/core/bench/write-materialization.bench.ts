@@ -56,11 +56,21 @@ const materialized = mat(createDb(medium.data), {
   openTasks: medium.queries.openTasks,
   projectTaskAggregates: medium.queries.projectTaskAggregates
 });
+const materializedIndexedPeople = mat(createDb(medium.data), {
+  indexedPeople: medium.queries.indexedPeople
+}, { mode: 'incremental' });
 const incrementalMaterialized = mat(createDb(medium.data), {
   activePeople: medium.queries.activePeople,
   openTasks: medium.queries.openTasks
 }, { mode: 'incremental' });
 const materializedTaskInsert = insert(benchSchema.tasks, extraTask(medium.data, 100));
+const materializedIndexedPeopleInsert = extraPerson(102);
+const maintainedMaterializedIndexedPeople = transact(
+  materializedIndexedPeople,
+  insert(benchSchema.people, materializedIndexedPeopleInsert)
+);
+const materializedIndexedPeopleExisting = medium.data.people[Math.floor(medium.data.people.length / 2)]
+  ?? medium.data.people[0]!;
 const incrementalPeopleInsert = insert(benchSchema.people, extraPerson(101));
 const largeMaterializedJoin = mat(createDb(large.data), {
   taskProjectOwnerJoin: large.queries.taskProjectOwnerJoin
@@ -242,6 +252,48 @@ describe('core write and materialization benchmarks', () => {
 
   bench('materialized index: unique id', () => {
     consumeBenchResult(index(materialized, medium.queries.openTasks, { kind: 'unique', field: 'id' }));
+  }, options);
+
+  bench('materialized index facade read before maintained insert: hash id', () => {
+    consumeBenchResult(index(materializedIndexedPeople, 'indexedPeople', {
+      kind: 'hash',
+      field: 'id'
+    }).index?.get(materializedIndexedPeopleExisting.id));
+  }, options);
+
+  bench('materialized index facade read after maintained insert: hash id', () => {
+    consumeBenchResult(index(maintainedMaterializedIndexedPeople, 'indexedPeople', {
+      kind: 'hash',
+      field: 'id'
+    }).index?.get(materializedIndexedPeopleInsert.id));
+  }, options);
+
+  bench('materialized index facade read before maintained insert: unique email', () => {
+    consumeBenchResult(index(materializedIndexedPeople, 'indexedPeople', {
+      kind: 'unique',
+      field: 'email'
+    }).index?.get(materializedIndexedPeopleExisting.email));
+  }, options);
+
+  bench('materialized index facade read after maintained insert: unique email', () => {
+    consumeBenchResult(index(maintainedMaterializedIndexedPeople, 'indexedPeople', {
+      kind: 'unique',
+      field: 'email'
+    }).index?.get(materializedIndexedPeopleInsert.email));
+  }, options);
+
+  bench('materialized index facade read before maintained insert: btree capacity range', () => {
+    consumeBenchResult(index(materializedIndexedPeople, 'indexedPeople', {
+      kind: 'btree',
+      field: 'capacity'
+    }).index?.range({ lower: 35, upper: 45 }));
+  }, options);
+
+  bench('materialized index facade read after maintained insert: btree capacity range', () => {
+    consumeBenchResult(index(maintainedMaterializedIndexedPeople, 'indexedPeople', {
+      kind: 'btree',
+      field: 'capacity'
+    }).index?.range({ lower: 35, upper: 45 }));
   }, options);
 
   bench('watch refresh: active people diff', async () => {
