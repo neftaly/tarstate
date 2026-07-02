@@ -1,4 +1,4 @@
-import type { AdapterCommitStatus, RelationApplyDurability, RelationDelta } from './adapter.js';
+import type { RelationApplyDurability, RelationDelta } from './adapter.js';
 import type { TarstateDiagnostic } from './diagnostics.js';
 import {
   createDb,
@@ -60,12 +60,14 @@ export type StoreCommitEffects = {
   readonly durability?: RelationApplyDurability;
 };
 
+export type StoreCommitStatus = 'accepted' | 'rejected';
+
 export type StoreCommitResult<
   Snapshot extends StoreCommitSnapshot = StoreSnapshot,
   Diagnostic extends StoreDiagnostic = StoreDiagnostic
 > = {
   readonly kind: 'tarstateCommit';
-  readonly status: AdapterCommitStatus;
+  readonly status: StoreCommitStatus;
   readonly reflected: boolean;
   readonly effects: StoreCommitEffects;
   readonly diagnostics: readonly Diagnostic[];

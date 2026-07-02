@@ -27,7 +27,9 @@ export type {
   RelationPatchTarget,
   RelationRuntime
 } from './adapter.js';
+export { collectDiagnostics, diagnostic, normalizeDiagnostics } from './diagnostics.js';
 export type { TarstateDiagnostic } from './diagnostics.js';
+export { relationDeltaNames, relationDeltas } from './delta.js';
 export {
   DbTransactionError,
   createDb,
@@ -78,8 +80,11 @@ export type {
   QueryBatchRows,
   SetEnvTransaction
 } from './db.js';
+export { diffRows, rowDiffKey } from './diff.js';
+export type { RowChange, RowDiff, RowDiffDiagnostic, RowDiffOptions, RowDiffSide, RowKeySelector } from './diff.js';
 export { evaluate } from './evaluate.js';
 export type { EvaluateEnv, EvaluateFunction, EvaluateFunctions, EvaluateOptions, QueryResult } from './evaluate.js';
+export { fromIndexedObjectSource } from './indexed-source.js';
 export {
   attachConstraints,
   attachedConstraintsFor,
@@ -304,6 +309,7 @@ export type {
   StoreCommitInput,
   StoreCommitResult,
   StoreCommitSnapshot,
+  StoreCommitStatus,
   StoreDiagnostic,
   StoreMappedQueryBatchResult,
   StoreQueries,
@@ -318,7 +324,6 @@ export type {
 export {
   trackRuntimeCommit,
   trackTransact,
-  trackTransactPatches,
   UnsupportedChangeTrackingError
 } from './runtime.js';
 export type {

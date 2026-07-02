@@ -36,7 +36,8 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       ...sharedBuildOptions,
       lib: {
         entry: {
-          index: 'src/index.ts'
+          index: 'src/index.ts',
+          presence: 'src/presence.ts'
         },
         formats: ['es'],
         fileName: (_format, entryName) => entryName + '.js'
@@ -57,6 +58,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
           constraints: 'src/constraints.ts',
           db: 'src/db.ts',
           diagnostics: 'src/diagnostics.ts',
+          delta: 'src/delta.ts',
           diff: 'src/diff.ts',
           evaluate: 'src/evaluate.ts',
           'indexed-source': 'src/indexed-source.ts',
@@ -88,6 +90,7 @@ const sourceAliases = [
   { find: '@tarstate/core/constraints', replacement: path.join(repoRoot, 'packages/core/src/constraints.ts') },
   { find: '@tarstate/core/db', replacement: path.join(repoRoot, 'packages/core/src/db.ts') },
   { find: '@tarstate/core/diagnostics', replacement: path.join(repoRoot, 'packages/core/src/diagnostics.ts') },
+  { find: '@tarstate/core/delta', replacement: path.join(repoRoot, 'packages/core/src/delta.ts') },
   { find: '@tarstate/core/diff', replacement: path.join(repoRoot, 'packages/core/src/diff.ts') },
   { find: '@tarstate/core/evaluate', replacement: path.join(repoRoot, 'packages/core/src/evaluate.ts') },
   { find: '@tarstate/core/indexed-source', replacement: path.join(repoRoot, 'packages/core/src/indexed-source.ts') },

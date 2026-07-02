@@ -1,5 +1,5 @@
 import * as Automerge from '@automerge/automerge';
-import { type QueryResult } from '@tarstate/core/evaluate';
+import type { QueryResult } from '@tarstate/core/evaluate';
 import {
   createDb,
   q,
@@ -66,6 +66,7 @@ export type AutomergeMapSourceOptions = {
 };
 
 export type AutomergeMapSource = AdapterSource<Automerge.Heads>;
+export type AutomergeDbVersion = Automerge.Heads | readonly unknown[];
 
 export type AutomergeMapAdapter<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
@@ -78,10 +79,18 @@ export type AutomergeMapAdapter<
   readonly subscribe: (listener: () => void) => () => void;
 };
 
-export type AutomergeDbRelationRuntime<Version = unknown> = RelationRuntime<Version> & {
-  readonly relation?: RelationRef;
-  readonly relations?: readonly RelationRef[] | readonly AutomergeMapRelation[];
-};
+export type AutomergeDbRelationRuntimeMetadata =
+  | {
+      readonly relation: RelationRef;
+      readonly relations?: never;
+    }
+  | {
+      readonly relation?: never;
+      readonly relations: readonly (RelationRef | AutomergeMapRelation)[];
+    };
+
+export type AutomergeDbRelationRuntime<Version = unknown> =
+  RelationRuntime<Version> & AutomergeDbRelationRuntimeMetadata;
 
 export type AutomergeDbOptions<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
@@ -98,8 +107,8 @@ export type Db = CoreDb;
 
 export type AutomergeDbSnapshot = {
   readonly db: Db;
-  readonly source: AdapterSource;
-  readonly version?: unknown;
+  readonly source: AdapterSource<AutomergeDbVersion>;
+  readonly version?: AutomergeDbVersion;
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 
@@ -109,12 +118,12 @@ export type AutomergeDbTransactionResult = {
   readonly kind: 'automergeDbTransaction';
   readonly db: Db;
   readonly committed: boolean;
-  readonly report: RelationApplyReport;
+  readonly report: RelationApplyReport<AutomergeDbVersion>;
   readonly patches: number;
   readonly applied: number;
   readonly deltas: readonly RelationDelta[];
   readonly diagnostics: readonly TarstateDiagnostic[];
-  readonly version?: unknown;
+  readonly version?: AutomergeDbVersion;
 };
 
 type AutomergeDbQueryTarget<Row = unknown> = Query<Row> | RelationRef | string;
@@ -160,13 +169,13 @@ export type AutomergeDbQuerySnapshot<Row = unknown> = {
   readonly diagnostics: QueryResult<Row>['diagnostics'];
 };
 
-export type AutomergeDbWatchTarget<Row = unknown> = Query<Row> | RelationRef;
-export type AutomergeDbWatchOptions<Row = unknown> = {
+export type AutomergeDbWatchTarget<Row extends Record<string, unknown> = Record<string, unknown>> = Query<Row> | RelationRef<Row>;
+export type AutomergeDbWatchOptions<Row extends Record<string, unknown> = Record<string, unknown>> = {
   readonly label?: string;
   readonly immediate?: boolean;
   readonly keyBy?: readonly string[] | ((row: Row) => string);
 };
-export type AutomergeDbWatchEvent<Row = unknown> = {
+export type AutomergeDbWatchEvent<Row extends Record<string, unknown> = Record<string, unknown>> = {
   readonly kind: 'automergeDbWatchEvent';
   readonly id: string;
   readonly target: AutomergeDbWatchTarget<Row>;
@@ -178,10 +187,10 @@ export type AutomergeDbWatchEvent<Row = unknown> = {
   readonly diagnostics: readonly TarstateDiagnostic[];
   readonly label?: string;
 };
-export type AutomergeDbWatchListener<Row = unknown> = (
+export type AutomergeDbWatchListener<Row extends Record<string, unknown> = Record<string, unknown>> = (
   event: AutomergeDbWatchEvent<Row>
 ) => void | Promise<void>;
-export type AutomergeDbWatchHandle<Row = unknown> = {
+export type AutomergeDbWatchHandle<Row extends Record<string, unknown> = Record<string, unknown>> = {
   readonly kind: 'automergeDbWatch';
   readonly id: string;
   readonly target: AutomergeDbWatchTarget<Row>;
@@ -195,7 +204,7 @@ export type AutomergeDb<
 > = {
   readonly kind: 'automergeDb';
   readonly adapter: AutomergeMapAdapter<DocumentShape>;
-  readonly source: AdapterSource;
+  readonly source: AdapterSource<AutomergeDbVersion>;
   readonly relations: readonly RelationRef[];
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
   readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
@@ -212,7 +221,7 @@ export type AutomergeDb<
     query: Query<Row>,
     options?: { readonly id?: string; readonly name?: string }
   ) => Promise<AutomergeDbQuerySnapshot<Row>>;
-  readonly watch: <Row>(
+  readonly watch: <Row extends Record<string, unknown>>(
     target: AutomergeDbWatchTarget<Row>,
     listener: AutomergeDbWatchListener<Row>,
     options?: AutomergeDbWatchOptions<Row>
@@ -264,19 +273,66 @@ export class AutomergeDbTransactionError extends Error {
 async function queryAutomergeDb<Row, MappedRow>(
   db: Db,
   query: AutomergeDbQueryTarget<Row>,
-  options?: DbQueryOptions<Row, MappedRow>
-): Promise<QueryResult<Row> | QueryResult<MappedRow>>;
+  options: DbQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
+): Promise<QueryResult<MappedRow>>;
+async function queryAutomergeDb<Row>(
+  db: Db,
+  query: AutomergeDbQueryTarget<Row>,
+  options?: DbQueryOptions<Row>
+): Promise<QueryResult<Row>>;
 async function queryAutomergeDb<const Queries extends QueryBatch, MappedRow>(
   db: Db,
   queries: Queries,
-  options?: DbQueryOptions<unknown, MappedRow>
-): Promise<QueryBatchResult<Queries> | MappedQueryBatchResult<Queries, MappedRow>>;
+  options: DbQueryOptions<unknown, MappedRow> & { readonly mapRows: (rows: readonly unknown[]) => readonly MappedRow[] }
+): Promise<MappedQueryBatchResult<Queries, MappedRow>>;
+async function queryAutomergeDb<const Queries extends QueryBatch>(
+  db: Db,
+  queries: Queries,
+  options?: DbQueryOptions
+): Promise<QueryBatchResult<Queries>>;
 async function queryAutomergeDb(
   db: Db,
   queryOrQueries: AutomergeDbQueryTarget | QueryBatch,
   options: DbQueryOptions = {}
 ): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>> {
-  return q(db, queryOrQueries as never, options as never) as Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>>;
+  return q(db, queryOrQueries, options);
+}
+
+export function automergeDbRelationRuntime<Version>(
+  runtime: RelationRuntime<Version>,
+  relation: RelationRef
+): AutomergeDbRelationRuntime<Version>;
+export function automergeDbRelationRuntime<Version>(
+  runtime: RelationRuntime<Version>,
+  relations: readonly (RelationRef | AutomergeMapRelation)[]
+): AutomergeDbRelationRuntime<Version>;
+export function automergeDbRelationRuntime<Version>(
+  runtime: RelationRuntime<Version>,
+  relationOrRelations: RelationRef | readonly (RelationRef | AutomergeMapRelation)[]
+): AutomergeDbRelationRuntime<Version> {
+  const relations = normalizeRuntimeRelationInput(relationOrRelations);
+  const relationRefs = relations.map((relationOrMapping) =>
+    isAutomergeMapRelation(relationOrMapping) ? relationOrMapping.relation : relationOrMapping
+  );
+  const relationNames = uniqueRelationNames(relationRefs);
+
+  return {
+    ...runtime,
+    source: {
+      ...runtime.source,
+      relationNames
+    },
+    ...(runtime.target === undefined
+      ? {}
+      : {
+          target: {
+            ...runtime.target,
+            relationNames,
+            ownsRelation: (relationName: string) => relationNames.includes(relationName)
+          }
+        }),
+    relations
+  };
 }
 
 export function automergeDb<
@@ -286,11 +342,13 @@ export function automergeDb<
   options: AutomergeDbOptions<DocumentShape>
 ): AutomergeDb<DocumentShape> {
   const adapter = automergeMapAdapter<DocumentShape>({ ...options, doc });
-  const runtimes = [adapter, ...options.runtimes ?? []];
-  const runtime = runtimes.length === 1 ? adapter : composeRelationRuntimes(...runtimes);
+  const optionRuntimes = options.runtimes ?? [];
+  const runtime: RelationRuntime<AutomergeDbVersion> = optionRuntimes.length === 0
+    ? adapter
+    : composeRelationRuntimes(adapter, ...optionRuntimes);
   const relations = uniqueRelations([
     ...adapter.relations.map((mapping) => mapping.relation),
-    ...options.runtimes?.flatMap(runtimeRelations) ?? []
+    ...optionRuntimes.flatMap((runtimeValue, index) => runtimeRelations(runtimeValue, index))
   ]);
   const materializations = new Map<string, {
     readonly query: Query;
@@ -298,15 +356,12 @@ export function automergeDb<
   }>();
 
   const getSnapshot = async (): Promise<AutomergeDbSnapshot> => {
-    const data = Object.fromEntries(await Promise.all(relations.map(async (relation) => [
-      relation.name,
-      await runtime.source.rows(relation)
-    ])));
+    const data = await snapshotData(runtime.source, relations);
     const version = await runtime.source.version?.();
     const diagnostics = await runtime.source.diagnostics?.() ?? [];
 
     return {
-      db: materializeRegisteredQueries(createSnapshotDb(data as DbInputData)),
+      db: materializeRegisteredQueries(createSnapshotDb(data)),
       source: runtime.source,
       ...(version === undefined ? {} : { version }),
       diagnostics
@@ -372,7 +427,7 @@ export function automergeDb<
     },
     querySnapshot: async (queryValue, snapshotOptions) => {
       const snapshot = await db();
-      const result = await queryAutomergeDb(snapshot, queryValue) as QueryResult<unknown>;
+      const result = await queryAutomergeDb(snapshot, queryValue);
       const key = queryKey(queryValue);
 
       return {
@@ -381,7 +436,7 @@ export function automergeDb<
         queryKey: key,
         query: queryValue,
         db: snapshot,
-        rows: result.rows as readonly never[],
+        rows: result.rows,
         diagnostics: result.diagnostics
       };
     },
@@ -405,8 +460,8 @@ export function automergeDb<
   }
 }
 
-function createAutomergeDbWatch<Row>(
-  source: AdapterSource,
+function createAutomergeDbWatch<Row extends Record<string, unknown>>(
+  source: AdapterSource<AutomergeDbVersion>,
   target: AutomergeDbWatchTarget<Row>,
   listener: AutomergeDbWatchListener<Row>,
   options: AutomergeDbWatchOptions<Row> = {}
@@ -443,23 +498,28 @@ function createAutomergeDbWatch<Row>(
   return handle;
 }
 
-async function readWatchRows<Row>(
+async function readWatchRows<Row extends Record<string, unknown>>(
   source: AdapterSource,
   target: AutomergeDbWatchTarget<Row>
 ): Promise<readonly Row[]> {
   if (!isQuery(target)) {
-    return await source.rows(target) as readonly Row[];
+    return await readRelationWatchRows(source, target);
   }
 
   const relations = uniqueRelations(Object.values(target.relations));
-  const data = Object.fromEntries(await Promise.all(relations.map(async (relation) => [
-    relation.name,
-    await source.rows(relation)
-  ])));
-  return (await queryAutomergeDb(createDb(data), target) as QueryResult<Row>).rows;
+  const data = await snapshotData(source, relations);
+  return (await queryAutomergeDb(createDb(data), target)).rows;
 }
 
-function diffWatchRows<Row>(
+async function readRelationWatchRows<Row extends Record<string, unknown>>(
+  source: AdapterSource,
+  relation: RelationRef<Row>
+): Promise<readonly Row[]> {
+  const rows = await source.rows(relation);
+  return rows.filter((row): row is Row => isRecord(row) && validateRow(relation, row).length === 0);
+}
+
+function diffWatchRows<Row extends Record<string, unknown>>(
   previousRows: readonly Row[],
   rows: readonly Row[],
   options: AutomergeDbWatchOptions<Row>
@@ -480,7 +540,7 @@ function diffWatchRows<Row>(
   return { addedRows, removedRows, changedRows };
 }
 
-function watchEvent<Row>(
+function watchEvent<Row extends Record<string, unknown>>(
   id: string,
   target: AutomergeDbWatchTarget<Row>,
   previousRows: readonly Row[],
@@ -504,13 +564,13 @@ function watchEvent<Row>(
   };
 }
 
-function watchRowKey<Row>(row: Row, options: AutomergeDbWatchOptions<Row>): string {
+function watchRowKey<Row extends Record<string, unknown>>(row: Row, options: AutomergeDbWatchOptions<Row>): string {
   if (typeof options.keyBy === 'function') {
     return options.keyBy(row);
   }
 
   if (Array.isArray(options.keyBy)) {
-    return JSON.stringify(options.keyBy.map((field) => isRecord(row) ? row[field] : undefined));
+    return JSON.stringify(options.keyBy.map((field) => row[field]));
   }
 
   return JSON.stringify(row);
@@ -619,22 +679,63 @@ function uniqueRelations(relations: readonly RelationRef[]): readonly RelationRe
   return Array.from(new Map(relations.map((relation) => [relation.name, relation])).values());
 }
 
-function runtimeRelations(runtime: AutomergeDbRelationRuntime): readonly RelationRef[] {
-  if (runtime.relation !== undefined) {
+async function snapshotData(
+  source: AdapterSource,
+  relations: readonly RelationRef[]
+): Promise<DbInputData> {
+  const entries = await Promise.all(relations.map(async (relation): Promise<readonly [string, readonly unknown[]]> => [
+    relation.name,
+    await source.rows(relation)
+  ]));
+
+  return Object.fromEntries(entries);
+}
+
+function runtimeRelations(runtime: AutomergeDbRelationRuntime, index: number): readonly RelationRef[] {
+  if (isRelationRef(runtime.relation)) {
     return [runtime.relation];
   }
 
-  if (runtime.relations === undefined) {
-    return [];
+  if (Array.isArray(runtime.relations) && runtime.relations.length > 0) {
+    return runtime.relations.flatMap((relationOrMapping) =>
+      isAutomergeMapRelation(relationOrMapping) ? [relationOrMapping.relation] : [relationOrMapping]
+    );
   }
 
-  return runtime.relations.flatMap((relationOrMapping) =>
-    isAutomergeMapRelation(relationOrMapping) ? [relationOrMapping.relation] : [relationOrMapping]
+  throw new TypeError(
+    `automergeDb runtimes[${index}] must declare relation metadata; ` +
+    'pass a runtime with relation/relations or wrap it with automergeDbRelationRuntime(runtime, relation)'
   );
 }
 
-function isAutomergeMapRelation(input: RelationRef | AutomergeMapRelation): input is AutomergeMapRelation {
+function normalizeRuntimeRelationInput(
+  input: RelationRef | readonly (RelationRef | AutomergeMapRelation)[]
+): readonly (RelationRef | AutomergeMapRelation)[] {
+  const relations = Array.isArray(input) ? input : [input];
+
+  if (relations.length === 0) {
+    throw new TypeError('automergeDbRelationRuntime requires at least one relation');
+  }
+
+  for (const relation of relations) {
+    if (!isRelationRef(relation) && !isAutomergeMapRelation(relation)) {
+      throw new TypeError('automergeDbRelationRuntime relations must be RelationRef or AutomergeMapRelation values');
+    }
+  }
+
+  return relations;
+}
+
+function uniqueRelationNames(relations: readonly RelationRef[]): readonly string[] {
+  return Array.from(new Set(relations.map((relation) => relation.name)));
+}
+
+function isAutomergeMapRelation(input: unknown): input is AutomergeMapRelation {
   return isRecord(input) && 'relation' in input && 'path' in input;
+}
+
+function isRelationRef(input: unknown): input is RelationRef {
+  return isRecord(input) && input.kind === 'relation' && typeof input.name === 'string';
 }
 
 function isQuery(input: unknown): input is Query {

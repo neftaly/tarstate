@@ -1,9 +1,11 @@
 import type { RelationRangeBound, RelationRangeLookup, RelationSource } from './source.js';
 
 /**
- * Build an object source with equality and primitive range lookup support.
+ * Build a relation source from object-backed rows with lookup support.
  *
- * @remarks Fixture/planner helper only; production adapters should own index policy.
+ * @remarks Equality indexes are built lazily per relation field. Primitive range
+ * lookups are supported for number and string-like schema fields when every
+ * scanned row carries a compatible value.
  */
 export function fromIndexedObjectSource(data: Record<string, readonly unknown[]>): RelationSource {
   const indexes = new Map<string, Map<unknown, unknown[]>>();

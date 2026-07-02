@@ -220,13 +220,6 @@ export async function trackTransact(
   };
 }
 
-export function trackTransactPatches(
-  _db: WatchDb,
-  patches: Iterable<WritePatch>
-): readonly WritePatch[] {
-  return Array.from(patches);
-}
-
 export function trackRuntimeCommit<Version = unknown>(
   runtime: RelationRuntime<Version>,
   patches: Iterable<WritePatch>,

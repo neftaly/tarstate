@@ -13,16 +13,24 @@ import { materializedRowsForQuery } from '@tarstate/core/materialization';
 import { write } from '@tarstate/core/write';
 import {
   automergeDb,
+  automergeDbRelationRuntime,
   automergeMapAdapter,
   automergeMapSource,
-  type AutomergeDb
+  type AutomergeDb,
+  type AutomergeDbVersion
 } from '@tarstate/automerge';
+import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 
 type TaskRow = {
   readonly id: string;
   readonly title: string;
   readonly done: boolean;
   readonly rank: number;
+};
+
+type LabelRow = {
+  readonly id: string;
+  readonly name: string;
 };
 
 type StoredTaskRow = Omit<TaskRow, 'id'> & { readonly id?: string };
@@ -42,11 +50,19 @@ const schema = defineSchema({
       done: booleanField(),
       rank: numberField()
     }
+  }),
+  labels: relation<LabelRow>({
+    key: 'id',
+    fields: {
+      id: idField('label'),
+      name: stringField()
+    }
   })
 });
 
 const taskRelations = [{ relation: schema.tasks, path: ['workspace', 'tasks'] }] as const;
 const tasks = write(schema.tasks);
+const labels = write(schema.labels);
 
 function taskDoc(tasksById: Record<string, StoredTaskRow>): Automerge.Doc<TaskDocument> {
   return Automerge.from<TaskDocument>({ workspace: { tasks: tasksById } });
@@ -56,13 +72,16 @@ describe('automerge Relic DB integration', () => {
   it('exposes Automerge-backed DB helpers beside the package-level map runtime', async () => {
     const api = await import('@tarstate/automerge');
     const relic = automergeDb<TaskDocument>(taskDoc({}), { relations: taskRelations });
+    type SnapshotVersion = Awaited<ReturnType<typeof relic.getSnapshot>>['version'];
 
     expect(api.automergeDb).toBe(automergeDb);
+    expect(api.automergeDbRelationRuntime).toBe(automergeDbRelationRuntime);
     expect(api.automergeMapAdapter).toBe(automergeMapAdapter);
     expect(api.automergeMapSource).toBe(automergeMapSource);
     expect(relic.kind).toBe('automergeDb');
     expect(relic.adapter.getDoc()).toBe(relic.getDoc());
     expectTypeOf(automergeDb<TaskDocument>).returns.toMatchTypeOf<AutomergeDb<TaskDocument>>();
+    expectTypeOf<SnapshotVersion>().toMatchTypeOf<AutomergeDbVersion | undefined>();
   });
 
   it('creates a core Db snapshot from map-v1 storage and queries it with q', async () => {
@@ -112,6 +131,51 @@ describe('automerge Relic DB integration', () => {
       { id: 'task-b', title: 'Ship adapter', done: true, rank: 2 }
     ]);
     expect(batch.named.rows).toEqual(batch.all.rows);
+  });
+
+  it('requires relation metadata for composed runtimes so optional sources are not ignored', async () => {
+    expect(() => automergeDb(Automerge.from<Record<string, unknown>>({}), {
+      relations: [],
+      // @ts-expect-error this intentionally exercises the runtime guard for an unannotated runtime.
+      runtimes: [createMemoryRelationRuntime({ labels: [{ id: 'label-a', name: 'Ignored' }] }, { relationNames: ['labels'] })]
+    })).toThrow(/runtimes\[0\].*relation metadata/i);
+  });
+
+  it('composes an explicitly annotated memory relation runtime with Automerge-backed rows', async () => {
+    const memoryRuntime = automergeDbRelationRuntime(
+      createMemoryRelationRuntime({
+        labels: [{ id: 'label-a', name: 'Blocked' }]
+      }, { relationNames: ['labels'] }),
+      schema.labels
+    );
+    const relic = automergeDb<TaskDocument>(taskDoc({
+      'task-a': { title: 'Draft contract', done: false, rank: 1 }
+    }), {
+      relations: taskRelations,
+      runtimes: [memoryRuntime]
+    });
+
+    await expect(relic.q(schema.tasks)).resolves.toMatchObject({
+      rows: [{ id: 'task-a', title: 'Draft contract', done: false, rank: 1 }],
+      diagnostics: []
+    });
+    await expect(relic.q(schema.labels)).resolves.toMatchObject({
+      rows: [{ id: 'label-a', name: 'Blocked' }],
+      diagnostics: []
+    });
+
+    await expect(relic.tryTransact(labels.insert({ id: 'label-b', name: 'Ready' }))).resolves.toMatchObject({
+      committed: true,
+      applied: 1,
+      diagnostics: []
+    });
+    await expect(relic.q(schema.labels)).resolves.toMatchObject({
+      rows: [
+        { id: 'label-a', name: 'Blocked' },
+        { id: 'label-b', name: 'Ready' }
+      ],
+      diagnostics: []
+    });
   });
 
   it('transacts through core write inputs, updates Automerge heads and returns the next Db', async () => {

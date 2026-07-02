@@ -61,10 +61,9 @@ The core API is stabilizing around a Relic-shaped split:
   deterministic query shapes, committed relation deltas, exact
   materialized-query read-through, maintained declared materialized
   set/hash/btree/unique indexes, Relic-style `watchTarget`/`unwatchTarget`
-  registration, `watchChangeMap`, and patch-target commit tracking.
-  `trackTransactPatches` exposes planned object-backed tracked-transaction
-  patches without committing them. Watch delivery uses ephemeral
-  materializations and delta-first row changes where available. Unsupported
+  registration, `watchChangeMap`, `trackTransact`, and patch-target commit
+  tracking. Watch delivery uses ephemeral materializations and delta-first row
+  changes where available. Unsupported
   incremental operator shapes keep explicit diagnostics and recompute/refresh
   fallback; final row `sort(...)`, `limit(...)`, and `sortLimit(...)`
   materializations rebuild affected ordered/windowed snapshots from source rows.
