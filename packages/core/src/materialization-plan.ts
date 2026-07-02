@@ -1708,8 +1708,8 @@ function collectSingleRootPlan(
         return `join right branch is not supported for incremental maintenance: ${right}`;
       }
 
-      if (shapesOverlap(left.shape, right.shape)) {
-        return 'ambiguous or self joins are not supported for incremental maintenance';
+      if (shapesHaveFieldOrAliasOverlap(left.shape, right.shape)) {
+        return 'ambiguous join field or alias shapes are not supported for incremental maintenance';
       }
 
       const predicateReason = simplePredicateReason(data.on);
@@ -2623,8 +2623,8 @@ function collectRightBranchPlanInternal(
         return `nested right branch join right side is not supported: ${right}`;
       }
 
-      if (shapesOverlap(left.shape, right.shape)) {
-        return 'ambiguous or self nested right branch joins are not supported';
+      if (shapesHaveFieldOrAliasOverlap(left.shape, right.shape)) {
+        return 'ambiguous nested right branch join field or alias shapes are not supported';
       }
 
       const predicateReason = simplePredicateReason(data.on);
@@ -5428,11 +5428,11 @@ function mergeShapes(left: PlanShape, right: PlanShape): PlanShape {
   };
 }
 
-function shapesOverlap(left: PlanShape, right: PlanShape): boolean {
-  return intersects(left.relations, right.relations) ||
-    intersects(left.aliases, right.aliases) ||
+function shapesHaveFieldOrAliasOverlap(left: PlanShape, right: PlanShape): boolean {
+  return intersects(left.aliases, right.aliases) ||
     intersects(left.aliases, right.fields) ||
-    intersects(left.fields, right.aliases);
+    intersects(left.fields, right.aliases) ||
+    intersects(left.fields, right.fields);
 }
 
 function expressionSideForShapes(

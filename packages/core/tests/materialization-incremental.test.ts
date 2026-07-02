@@ -95,6 +95,14 @@ type UserTeamRow = {
   readonly rank: number;
 };
 
+type UserTeammateRow = {
+  readonly employeeId: string;
+  readonly teammateId: string;
+  readonly employee: string;
+  readonly teammate: string;
+  readonly teamId: string;
+};
+
 type UserAgeRow = {
   readonly id: string;
   readonly name: string;
@@ -314,6 +322,33 @@ function activeUserTeamsQuery(): Query<UserTeamRow> {
     project({ id: user.id, name: user.name, team: team.name, rank: team.rank }),
     keyBy('id')
   ) as Query<UserTeamRow>;
+}
+
+function userTeammatesByTeamQuery(): Query<UserTeammateRow> {
+  const employee = as(coreSchema.users, 'employee');
+  const teammate = as(coreSchema.users, 'teammate');
+  return pipe(
+    from(employee),
+    join(from(teammate), eq(employee.teamId, teammate.teamId)),
+    project({
+      employeeId: employee.id,
+      teammateId: teammate.id,
+      employee: employee.name,
+      teammate: teammate.name,
+      teamId: employee.teamId
+    }),
+    keyBy('employeeId', 'teammateId')
+  ) as Query<UserTeammateRow>;
+}
+
+function sameAliasUserSelfJoinQuery(): Query<UserNameRow> {
+  const user = as(coreSchema.users, 'user');
+  const sameUser = as(coreSchema.users, 'user');
+  return pipe(
+    from(user),
+    join(from(sameUser), eq(user.teamId, sameUser.teamId)),
+    project({ id: user.id, name: user.name })
+  ) as Query<UserNameRow>;
 }
 
 function leftUserTeamsQuery(): Query<MaybeUserTeamRow> {
@@ -3577,6 +3612,152 @@ describe('incremental materialization', () => {
       { id: 'ada', name: 'Ada', team: 'Engineering', rank: 1 },
       { id: 'bea', name: 'Bea', team: 'Design', rank: 2 }
     ]);
+  });
+
+  it('incrementally maintains aliased self equality joins for inserts, updates, and deletes', () => {
+    const userTeammates = userTeammatesByTeamQuery();
+    const state = mat(createDb(sourceData), userTeammates, { id: 'user-teammates-by-team', mode: 'incremental' });
+    const metadata = materializationForQuery(state, userTeammates);
+
+    expect(metadata).toMatchObject({
+      id: 'user-teammates-by-team',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(['users']);
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, userTeammates)).toEqual([
+      { employeeId: 'ada', teammateId: 'ada', employee: 'Ada', teammate: 'Ada', teamId: 'eng' },
+      { employeeId: 'bea', teammateId: 'bea', employee: 'Bea', teammate: 'Bea', teamId: 'design' },
+      { employeeId: 'cal', teammateId: 'cal', employee: 'Cal', teammate: 'Cal', teamId: 'missing' }
+    ]);
+
+    const withDia = createDb({
+      ...sourceData,
+      users: [...sourceData.users, diaUser]
+    });
+    const inserted = maintainMaterializations(state, withDia, {
+      deltas: [usersDelta([diaUser], [])]
+    });
+    const insertedChange = singleMaterializationChange(inserted, 'user-teammates-by-team');
+
+    expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(insertedChange).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { employeeId: 'ada', teammateId: 'ada', employee: 'Ada', teammate: 'Ada', teamId: 'eng' },
+        { employeeId: 'ada', teammateId: 'dia', employee: 'Ada', teammate: 'Dia', teamId: 'eng' },
+        { employeeId: 'bea', teammateId: 'bea', employee: 'Bea', teammate: 'Bea', teamId: 'design' },
+        { employeeId: 'cal', teammateId: 'cal', employee: 'Cal', teammate: 'Cal', teamId: 'missing' },
+        { employeeId: 'dia', teammateId: 'ada', employee: 'Dia', teammate: 'Ada', teamId: 'eng' },
+        { employeeId: 'dia', teammateId: 'dia', employee: 'Dia', teammate: 'Dia', teamId: 'eng' }
+      ],
+      addedRows: [
+        { employeeId: 'ada', teammateId: 'dia', employee: 'Ada', teammate: 'Dia', teamId: 'eng' },
+        { employeeId: 'dia', teammateId: 'ada', employee: 'Dia', teammate: 'Ada', teamId: 'eng' },
+        { employeeId: 'dia', teammateId: 'dia', employee: 'Dia', teammate: 'Dia', teamId: 'eng' }
+      ],
+      removedRows: []
+    });
+    expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+    expect(materializedRowsForQuery(withDia, userTeammates)).toEqual(insertedChange.rows);
+
+    const movedDia = { ...diaUser, teamId: 'design' };
+    const withMovedDia = createDb({
+      ...sourceData,
+      users: [adaUser, beaUser, calUser, movedDia]
+    });
+    const moved = maintainMaterializations(withDia, withMovedDia, {
+      deltas: [usersDelta([movedDia], [diaUser])]
+    });
+    const movedChange = singleMaterializationChange(moved, 'user-teammates-by-team');
+
+    expect(moved).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(movedChange).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { employeeId: 'ada', teammateId: 'ada', employee: 'Ada', teammate: 'Ada', teamId: 'eng' },
+        { employeeId: 'bea', teammateId: 'bea', employee: 'Bea', teammate: 'Bea', teamId: 'design' },
+        { employeeId: 'bea', teammateId: 'dia', employee: 'Bea', teammate: 'Dia', teamId: 'design' },
+        { employeeId: 'cal', teammateId: 'cal', employee: 'Cal', teammate: 'Cal', teamId: 'missing' },
+        { employeeId: 'dia', teammateId: 'bea', employee: 'Dia', teammate: 'Bea', teamId: 'design' },
+        { employeeId: 'dia', teammateId: 'dia', employee: 'Dia', teammate: 'Dia', teamId: 'design' }
+      ],
+      addedRows: [
+        { employeeId: 'bea', teammateId: 'dia', employee: 'Bea', teammate: 'Dia', teamId: 'design' },
+        { employeeId: 'dia', teammateId: 'bea', employee: 'Dia', teammate: 'Bea', teamId: 'design' }
+      ],
+      removedRows: [
+        { employeeId: 'ada', teammateId: 'dia', employee: 'Ada', teammate: 'Dia', teamId: 'eng' },
+        { employeeId: 'dia', teammateId: 'ada', employee: 'Dia', teammate: 'Ada', teamId: 'eng' }
+      ]
+    });
+    expectNoIncrementalFallback([...moved.diagnostics, ...movedChange.diagnostics]);
+    expect(movedChange.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { employeeId: 'dia', teammateId: 'dia', employee: 'Dia', teammate: 'Dia', teamId: 'eng' },
+        after: { employeeId: 'dia', teammateId: 'dia', employee: 'Dia', teammate: 'Dia', teamId: 'design' }
+      })
+    ]));
+    expect(materializedRowsForQuery(withMovedDia, userTeammates)).toEqual(movedChange.rows);
+
+    const withoutBea = createDb({
+      ...sourceData,
+      users: [adaUser, calUser, movedDia]
+    });
+    const deleted = maintainMaterializations(withMovedDia, withoutBea, {
+      deltas: [usersDelta([], [beaUser])]
+    });
+    const deletedChange = singleMaterializationChange(deleted, 'user-teammates-by-team');
+
+    expect(deleted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(deletedChange).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { employeeId: 'ada', teammateId: 'ada', employee: 'Ada', teammate: 'Ada', teamId: 'eng' },
+        { employeeId: 'cal', teammateId: 'cal', employee: 'Cal', teammate: 'Cal', teamId: 'missing' },
+        { employeeId: 'dia', teammateId: 'dia', employee: 'Dia', teammate: 'Dia', teamId: 'design' }
+      ],
+      addedRows: [],
+      removedRows: [
+        { employeeId: 'bea', teammateId: 'bea', employee: 'Bea', teammate: 'Bea', teamId: 'design' },
+        { employeeId: 'bea', teammateId: 'dia', employee: 'Bea', teammate: 'Dia', teamId: 'design' },
+        { employeeId: 'dia', teammateId: 'bea', employee: 'Dia', teammate: 'Bea', teamId: 'design' }
+      ]
+    });
+    expectNoIncrementalFallback([...deleted.diagnostics, ...deletedChange.diagnostics]);
+    expect(materializedRowsForQuery(withoutBea, userTeammates)).toEqual(deletedChange.rows);
+  });
+
+  it('keeps same-alias self joins on snapshot fallback', () => {
+    const sameAliasSelfJoin = sameAliasUserSelfJoinQuery();
+    const state = mat(createDb(sourceData), sameAliasSelfJoin, {
+      id: 'same-alias-user-self-join',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, sameAliasSelfJoin);
+
+    expect(metadata).toMatchObject({
+      id: 'same-alias-user-self-join',
+      requestedMode: 'incremental',
+      maintenance: 'snapshot'
+    });
+    expectIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(metadata?.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'materialization_incremental_fallback',
+        detail: expect.objectContaining({
+          reason: expect.stringContaining('ambiguous join field or alias shapes')
+        })
+      })
+    ]));
   });
 
   it('incrementally maintains inner equality joins for left relation inserts, updates, and deletes', () => {
