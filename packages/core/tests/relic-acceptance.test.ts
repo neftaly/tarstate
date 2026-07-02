@@ -122,7 +122,7 @@ describe('TypeScript Relic core acceptance', () => {
     );
 
     await expect(qRows(state, coreSchema.users)).resolves.toEqual(users);
-    await expect(qRows(state, 'teams')).resolves.toEqual(teams);
+    await expect(qRows(state, coreSchema.teams)).resolves.toEqual(teams);
     await expect(q(state, activeAdults)).resolves.toMatchObject({
       rows: [{ id: 'ada', name: 'Ada' }],
       diagnostics: []

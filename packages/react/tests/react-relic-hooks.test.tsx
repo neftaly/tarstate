@@ -5,13 +5,11 @@ import {
   TarstateProvider,
   useCommit,
   useDb,
-  useMaterialized,
   useQuery,
   useRow,
   useTarstateSnapshot,
   useView,
   useWatch,
-  type MaterializedHookState,
   type QueryHookState,
   type RowHookState,
   type TarstateDbSnapshot,
@@ -66,14 +64,13 @@ const openItemQuery = pipe(
 );
 
 describe('@tarstate/react DB-first hooks', () => {
-  it('publishes provider, store, query, materialized, watch, and commit APIs', () => {
+  it('publishes provider, store, view, query, row, watch, and commit APIs', () => {
     expect(TarstateProvider).toBeTypeOf('function');
     expect(useCommit).toBeTypeOf('function');
     expect(useDb).toBeTypeOf('function');
     expect(useQuery).toBeTypeOf('function');
     expect(useView).toBeTypeOf('function');
     expect(useRow).toBeTypeOf('function');
-    expect(useMaterialized).toBeTypeOf('function');
     expect(useWatch).toBeTypeOf('function');
   });
 
@@ -194,7 +191,7 @@ describe('@tarstate/react DB-first hooks', () => {
     expect(lateUnsubscribe()).toBeUndefined();
   });
 
-  it('reads and refreshes materialized query rows from core materialization', async () => {
+  it('reads and refreshes materialized query rows through useView', async () => {
     const db = await materializeSnapshot(createDb({
       items: [
         { id: 'item-a', label: 'Alpha', done: false },
@@ -204,11 +201,10 @@ describe('@tarstate/react DB-first hooks', () => {
     const store = createStore(db);
     const probe = await renderMaterializedProbe(store, openItemQuery);
 
-    await waitFor(() => probe.materialized.status === 'ready');
+    await waitFor(() => probe.view.status === 'ready');
 
-    expect(probe.materialized).toMatchObject({
+    expect(probe.view).toMatchObject({
       status: 'ready',
-      materialized: true,
       rows: [{ id: 'item-a', label: 'Alpha' }],
       revision: 0
     });
@@ -216,9 +212,9 @@ describe('@tarstate/react DB-first hooks', () => {
     await act(async () => {
       await store.commit(updateByKey(schema.items, 'item-b', { done: false }));
     });
-    await waitFor(() => probe.materialized.revision === 1 && probe.materialized.status === 'ready');
+    await waitFor(() => probe.view.revision === 1 && probe.view.status === 'ready');
 
-    expect(probe.materialized.rows).toEqual([
+    expect(probe.view.rows).toEqual([
       { id: 'item-a', label: 'Alpha' },
       { id: 'item-b', label: 'Beta' }
     ]);
@@ -246,6 +242,42 @@ describe('@tarstate/react DB-first hooks', () => {
       added: [{ id: 'item-b', label: 'Beta', done: false }],
       previousRows: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
+  });
+
+  it('watches typed relation refs and reports updated rows', async () => {
+    const store = createStore({
+      items: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+    let current: WatchHookState<ItemRow> | undefined;
+    let renderer: ReactTestRenderer | undefined;
+
+    function Probe() {
+      current = useWatch(schema.items, undefined, { keyBy: ['id'] });
+      return null;
+    }
+
+    await act(async () => {
+      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+    await waitFor(() => current?.event !== undefined);
+
+    expect(current?.event).toMatchObject({
+      added: [{ id: 'item-a', label: 'Alpha', done: false }],
+      removed: []
+    });
+
+    await act(async () => {
+      await store.commit(updateByKey(schema.items, 'item-a', { label: 'Alpha updated' }));
+    });
+    await waitFor(() => current?.event?.rowChanges.some((change) => change.kind === 'updated') === true);
+
+    expect(current?.event).toMatchObject({
+      added: [{ id: 'item-a', label: 'Alpha updated', done: false }],
+      removed: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+
+    assertDefined(renderer);
+    renderer.unmount();
   });
 
   it('updates watch listeners on transactions and cleans up after unmount', async () => {
@@ -416,7 +448,7 @@ async function renderRowProbe(store: Store): Promise<RenderedRowProbe> {
 }
 
 type MaterializedProbeState = {
-  readonly materialized: MaterializedHookState<{ readonly id: string; readonly label: string }>;
+  readonly view: ViewHookState<{ readonly id: string; readonly label: string }>;
 };
 
 type RenderedMaterializedProbe = MaterializedProbeState & {
@@ -432,7 +464,7 @@ async function renderMaterializedProbe(
 
   function Probe() {
     current = {
-      materialized: useMaterialized(query)
+      view: useView(query)
     };
     return null;
   }

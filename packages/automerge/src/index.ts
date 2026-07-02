@@ -19,11 +19,10 @@ import {
   type SnapshotMaterializationOptions
 } from '@tarstate/core/materialization';
 import type {
-  AdapterCommitResult,
   AdapterSnapshot,
   AdapterSource,
+  RelationApplyResult,
   RelationApplyReport,
-  RelationAdapter,
   RelationDelta,
   RelationPatchTarget,
   RelationRuntime,
@@ -71,7 +70,7 @@ export type AutomergeDbVersion = Automerge.Heads | readonly unknown[];
 
 export type AutomergeMapAdapter<
   DocumentShape extends Record<string, unknown> = Record<string, unknown>
-> = RelationAdapter<Automerge.Heads> & {
+> = RelationRuntime<Automerge.Heads> & {
   readonly relations: readonly AutomergeMapRelation[];
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
   readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
@@ -127,7 +126,7 @@ export type AutomergeDbTransactionResult = {
   readonly version?: AutomergeDbVersion;
 };
 
-type AutomergeDbQueryTarget<Row = unknown> = Query<Row> | RelationRef | string;
+type AutomergeDbQueryTarget<Row = unknown> = Query<Row> | RelationRef;
 
 type AutomergeDbQuery = {
   <Relation extends RelationRef, MappedRow>(
@@ -140,11 +139,6 @@ type AutomergeDbQuery = {
     relation: Relation,
     options?: DbQueryOptions<RelationRow<Relation>>
   ): Promise<QueryResult<RelationRow<Relation>>>;
-  <MappedRow>(
-    relationName: string,
-    options: DbQueryOptions<unknown, MappedRow> & { readonly mapRows: (rows: readonly unknown[]) => readonly MappedRow[] }
-  ): Promise<QueryResult<MappedRow>>;
-  (relationName: string, options?: DbQueryOptions): Promise<QueryResult<unknown>>;
   <Row, MappedRow>(
     query: Query<Row>,
     options: DbQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
@@ -619,7 +613,7 @@ export function automergeMapAdapter<
   const relationNames = relations.map((relation) => relation.relation.name);
   const source = automergeMapSource(() => currentDoc, { relations });
 
-  const commit = (patches: readonly WritePatch[]): AdapterCommitResult<Automerge.Heads> => {
+  const apply = (patches: readonly WritePatch[]): RelationApplyResult<Automerge.Heads> => {
     const planned = planPatches(currentDoc, relations, patches);
 
     if ('diagnostics' in planned) {
@@ -658,14 +652,13 @@ export function automergeMapAdapter<
   const target: RelationPatchTarget<Automerge.Heads> = {
     relationNames,
     ownsRelation: (relationName) => relationNames.includes(relationName),
-    apply: (patches) => ({ ...commit(patches), durability: 'durable' })
+    apply: (patches) => ({ ...apply(patches), durability: 'durable' })
   };
 
   return {
     relations,
     source,
     target,
-    commit,
     getDoc: () => currentDoc,
     setDoc: (doc) => {
       currentDoc = doc;

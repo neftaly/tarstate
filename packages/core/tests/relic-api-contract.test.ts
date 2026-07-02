@@ -314,14 +314,11 @@ describe('Relic public TypeScript API contract', () => {
     ]);
   });
 
-  it('keeps relation row types distinct from plain relation names', async () => {
+  it('reads typed relation rows through relation refs', async () => {
     const state = createDb(sourceData);
     const typedRows = qRows(state, coreSchema.teams);
-    const namedRows = qRows(state, 'teams');
 
     expectTypeOf(typedRows).toEqualTypeOf<Promise<readonly TeamRow[]>>();
-    expectTypeOf(namedRows).toEqualTypeOf<Promise<readonly unknown[]>>();
     await expect(typedRows).resolves.toEqual(sourceData.teams);
-    await expect(namedRows).resolves.toEqual(sourceData.teams);
   });
 });

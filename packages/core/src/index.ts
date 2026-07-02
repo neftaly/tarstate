@@ -1,19 +1,11 @@
 export {
   composeRelationRuntimes,
-  isRelationAdapter,
   isRelationRuntime,
-  tryApplyRelationPatches,
-  tryCommitAdapter
+  tryApplyRelationPatches
 } from './adapter.js';
 export type {
-  AdapterCommit,
-  AdapterCommitOptions,
-  AdapterCommitReport,
-  AdapterCommitResult,
-  AdapterCommitStatus,
   AdapterSnapshot,
   AdapterSource,
-  RelationAdapter,
   RelationApply,
   RelationApplyAcceptedResult,
   RelationApplyDurability,

@@ -8,7 +8,7 @@ import {
   type MaterializationEnvDelta,
   type MaterializationMaintenanceResult
 } from './materialization.js';
-import { constRows, where, type PredicateData, type Query } from './query.js';
+import { where, type PredicateData, type Query } from './query.js';
 import type { RelationRef } from './schema.js';
 import { fromObjectSource, type RelationSource } from './source.js';
 import type { ConstraintValidationInput } from './constraints-validation.js';
@@ -179,8 +179,8 @@ type RelationQueryRow<QueryValue> = QueryValue extends Query<infer Row>
     ? RelationQueryRow<Target>
   : QueryValue extends RelationRef<infer Row>
     ? Row
-    : unknown;
-type QueryOrRelation<Row = unknown> = Query<Row> | RelationRef | string;
+    : never;
+type QueryOrRelation<Row = unknown> = Query<Row> | RelationRef;
 type QueryBatchItemSpec<QueryValue extends QueryOrRelation = QueryOrRelation> =
   DbRuntimeQueryOptions<any, any> & {
     readonly q: QueryValue;
@@ -325,7 +325,6 @@ export function q<Relation extends RelationRef>(
   relation: Relation,
   options?: DbQueryOptions<RelationRow<Relation>>
 ): Promise<QueryResult<RelationRow<Relation>>>;
-export function q(db: Db, relationName: string, options?: DbQueryOptions): Promise<QueryResult<unknown>>;
 export function q<const Queries extends QueryBatch, MappedRow>(
   db: Db,
   queries: Queries,
@@ -350,7 +349,7 @@ export async function q(
     return qMany(db, queryOrQueries, options);
   }
 
-  if (isRelationRef(queryOrQueries) || typeof queryOrQueries === 'string') {
+  if (isRelationRef(queryOrQueries)) {
     return mappedResult(relationQueryResult(db, queryOrQueries), options);
   }
 
@@ -440,7 +439,7 @@ export async function row<Row>(
   ...whereClausesOrOptions: readonly (PredicateData | EvaluateOptions)[]
 ): Promise<Row | undefined> {
   const { predicates, options } = splitReadArgs(whereClausesOrOptions);
-  return unwrapSingletonAlias((await qRows(db, withPredicates(db, query, predicates), options)).at(0)) as Row | undefined;
+  return unwrapSingletonAlias((await qRows(db, withPredicates(query, predicates), options)).at(0)) as Row | undefined;
 }
 
 export async function exists<Row>(
@@ -614,26 +613,21 @@ function isDbOptions(input: DbInputEnv | DbOptions): input is DbOptions {
   return isRecord(input) && isRecord(input.env);
 }
 
-function relationQueryResult(db: Db, relationOrName: RelationRef | string): QueryResult<unknown> {
-  const relationName = typeof relationOrName === 'string' ? relationOrName : relationOrName.name;
-  const rows = dbEngineFor(db).read()[relationName] ?? [];
-  if (typeof relationOrName === 'string') {
-    return { rows, diagnostics: [] };
-  }
-
+function relationQueryResult(db: Db, relation: RelationRef): QueryResult<unknown> {
+  const rows = dbEngineFor(db).read()[relation.name] ?? [];
   const diagnostics = rows.flatMap((candidate) =>
     isRecord(candidate)
-      ? validateRelationRow(relationOrName, candidate)
+      ? validateRelationRow(relation, candidate)
       : [{
           code: 'invalid_row',
           message: 'row is not an object',
-          relation: relationOrName.name
+          relation: relation.name
         }]
   );
 
   return {
     rows: diagnostics.length === 0 ? rows : rows.filter((candidate) =>
-      isRecord(candidate) && validateRelationRow(relationOrName, candidate).length === 0
+      isRecord(candidate) && validateRelationRow(relation, candidate).length === 0
     ),
     diagnostics
   };
@@ -703,28 +697,19 @@ function splitReadArgs(
   };
 }
 
-function withPredicates<Row>(
-  db: Db,
-  target: QueryOrRelation<Row>,
-  predicates: readonly PredicateData[]
-): QueryOrRelation<Row> {
+function withPredicates<Row>(target: QueryOrRelation<Row>, predicates: readonly PredicateData[]): QueryOrRelation<Row> {
   if (predicates.length === 0) return target;
 
-  const query = queryForPredicates(db, target);
+  const query = queryForPredicates(target);
   return predicates.reduce<Query>((current, predicate) => where(predicate)(current), query) as Query<Row>;
 }
 
-function queryForPredicates<Row>(db: Db, target: QueryOrRelation<Row>): Query {
+function queryForPredicates<Row>(target: QueryOrRelation<Row>): Query {
   if (isQuery(target)) return target;
-  if (isRelationRef(target)) {
-    return {
-      data: { op: 'from', relation: target.name, alias: target.name },
-      relations: { [target.name]: target }
-    };
-  }
-
-  const rows = dbEngineFor(db).read()[target] ?? [];
-  return constRows(rows.filter(isRecord));
+  return {
+    data: { op: 'from', relation: target.name, alias: target.name },
+    relations: { [target.name]: target }
+  };
 }
 
 function isPredicateData(input: PredicateData | EvaluateOptions): input is PredicateData {

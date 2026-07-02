@@ -14,14 +14,11 @@ import {
   type Db,
   type DbInputData
 } from '@tarstate/core/db';
+import { diffRows as diffRowChanges, rowDiffKey, type RowChange, type RowDiffOptions } from '@tarstate/core/diff';
 import type { TarstateDiagnostic } from '@tarstate/core/diagnostics';
-import type { EvaluateOptions } from '@tarstate/core/evaluate';
+import type { EvaluateOptions, QueryResult } from '@tarstate/core/evaluate';
 import { queryKey, type Query } from '@tarstate/core/query';
-import {
-  readMaterializedQuery,
-  type MaterializationDiagnostic,
-  type MaterializedQueryResult
-} from '@tarstate/core/materialization';
+import type { RelationRef } from '@tarstate/core/schema';
 import {
   createStore,
   type Store,
@@ -31,11 +28,11 @@ import {
   type StoreSeedInput,
   type StoreSnapshot
 } from '@tarstate/core/store';
+import { watchTargetKey } from '@tarstate/core/watch';
 
 export type TarstateReactDiagnostic =
   | TarstateDiagnostic
   | StoreDiagnostic
-  | MaterializationDiagnostic
   | {
       readonly code: string;
       readonly message: string;
@@ -99,29 +96,19 @@ export type UseRowKeyOptions<Row, Key> = UseViewOptions & {
   readonly keyBy: (row: Row) => Key;
 };
 
-export type MaterializedHookState<Row> = {
-  readonly status: 'loading' | 'ready' | 'error';
-  readonly materialized: boolean;
-  readonly rows: readonly Row[];
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-  readonly queryKey: string;
-  readonly revision: number;
-  readonly refresh: () => void;
-  readonly result?: MaterializedQueryResult<Row>;
-  readonly error?: unknown;
-};
+export type WatchTarget<Row = unknown> = Query<Row> | RelationRef;
 
 export type WatchEvent<Row = unknown> = {
   readonly kind: 'watchEvent';
   readonly id: string;
-  readonly target: Query<Row>;
+  readonly target: WatchTarget<Row>;
   readonly changed: boolean;
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly added: readonly Row[];
   readonly removed: readonly Row[];
   readonly unchanged: readonly Row[];
-  readonly rowChanges: readonly unknown[];
+  readonly rowChanges: readonly RowChange<Row>[];
   readonly diagnostics: readonly TarstateReactDiagnostic[];
 };
 
@@ -337,57 +324,13 @@ export function useQuery<Row, Selected>(
   return loadingQueryState(key, revision, refresh, lastReady.current);
 }
 
-export function useMaterialized<Row>(
-  query: Query<Row>,
-  options: { readonly deps?: readonly unknown[] } = {}
-): MaterializedHookState<Row> {
-  const store = useTarstateStore();
-  const { revision } = useTarstateSnapshot();
-  const key = queryKey(query);
-  const depsVersion = useDependencyVersion(options.deps ?? emptyDeps);
-  const [refreshVersion, setRefreshVersion] = useState(0);
-  const [state, setState] = useState<MaterializedInternalState<Row>>();
-  const refresh = useCallback(() => {
-    setRefreshVersion((version) => version + 1);
-  }, []);
-  const identity = { store, revision, queryKey: key, depsVersion, refreshVersion };
-
-  useEffect(() => {
-    let active = true;
-    setState((current) => current !== undefined && matches(current, identity)
-      ? current
-      : { ...loadingMaterializedState(key, revision, refresh), ...identity });
-    readMaterializedQuery(store.getSnapshot().db, query).then(
-      (result) => {
-        if (active) {
-          setState({ ...readyMaterializedState(result, key, revision, refresh), ...identity });
-        }
-      },
-      (error: unknown) => {
-        if (active) {
-          setState({ ...errorMaterializedState(key, revision, refresh, error), ...identity });
-        }
-      }
-    );
-    return () => {
-      active = false;
-    };
-  }, [store, revision, key, depsVersion, refreshVersion]);
-
-  if (state !== undefined && matches(state, identity)) {
-    return withMaterializedRefresh(state, refresh);
-  }
-
-  return loadingMaterializedState(key, revision, refresh);
-}
-
 export function useWatch<Row>(
-  target: Query<Row>,
+  target: WatchTarget<Row>,
   listener?: WatchListener<Row>,
   options: WatchOptions<Row> & { readonly deps?: readonly unknown[] } = {}
 ): WatchHookState<Row> {
   const { db, revision } = useTarstateSnapshot();
-  const targetKey = queryKey(target);
+  const targetKey = watchTargetKey(target);
   const depsVersion = useDependencyVersion(options.deps ?? emptyDeps);
   const [event, setEvent] = useState<WatchEvent<Row> | undefined>();
   const [diagnostics, setDiagnostics] = useState<readonly TarstateReactDiagnostic[]>(emptyDiagnostics);
@@ -404,26 +347,29 @@ export function useWatch<Row>(
 
   useEffect(() => {
     let active = true;
-    q(db, target, options).then(async (result) => {
+    readWatchTarget(db, target, options).then(async (result) => {
       if (!active) return;
       const previousRows = previousRowsRef.current;
-      const rowDiff = diffRows(previousRows, result.rows, options.keyBy);
+      const rowDiffOptions = watchRowDiffOptions(options);
+      const rowDiff = diffRowChanges(previousRows, result.rows, rowDiffOptions);
+      const changedKeys = new Set(rowDiff.changes.map((change) => change.key));
+      const diagnostics = [...result.diagnostics, ...rowDiff.diagnostics];
       const event: WatchEvent<Row> = {
         kind: 'watchEvent',
         id: `watch-${targetKey}`,
         target,
-        changed: rowDiff.added.length > 0 || rowDiff.removed.length > 0,
+        changed: rowDiff.changes.length > 0,
         previousRows,
         rows: result.rows,
-        added: rowDiff.added,
-        removed: rowDiff.removed,
-        unchanged: rowDiff.unchanged,
-        rowChanges: rowDiff.rowChanges,
-        diagnostics: result.diagnostics
+        added: addedWatchRows(rowDiff.changes, target),
+        removed: removedWatchRows(rowDiff.changes, target),
+        unchanged: result.rows.filter((row) => !changedKeys.has(rowDiffKey(row, rowDiffOptions))),
+        rowChanges: rowDiff.changes,
+        diagnostics
       };
       previousRowsRef.current = result.rows;
       setEvent(event);
-      setDiagnostics(result.diagnostics);
+      setDiagnostics(diagnostics);
       await listenerRef.current?.(event);
     }, (error: unknown) => {
       if (active) {
@@ -511,65 +457,6 @@ function withQueryRefresh<Row, Selected>(
   return state.refresh === refresh ? state : { ...state, refresh };
 }
 
-function loadingMaterializedState<Row>(
-  queryKeyValue: string,
-  revision: number,
-  refresh: () => void
-): MaterializedHookState<Row> {
-  return {
-    status: 'loading',
-    materialized: false,
-    rows: [],
-    diagnostics: emptyDiagnostics,
-    queryKey: queryKeyValue,
-    revision,
-    refresh
-  };
-}
-
-function readyMaterializedState<Row>(
-  result: MaterializedQueryResult<Row>,
-  queryKeyValue: string,
-  revision: number,
-  refresh: () => void
-): MaterializedHookState<Row> {
-  return {
-    status: 'ready',
-    materialized: result.materialized,
-    rows: result.rows,
-    diagnostics: result.diagnostics,
-    result,
-    queryKey: queryKeyValue,
-    revision,
-    refresh
-  };
-}
-
-function errorMaterializedState<Row>(
-  queryKeyValue: string,
-  revision: number,
-  refresh: () => void,
-  error: unknown
-): MaterializedHookState<Row> {
-  return {
-    status: 'error',
-    materialized: false,
-    rows: [],
-    diagnostics: emptyDiagnostics,
-    queryKey: queryKeyValue,
-    revision,
-    refresh,
-    error
-  };
-}
-
-function withMaterializedRefresh<Row>(
-  state: MaterializedHookState<Row>,
-  refresh: () => void
-): MaterializedHookState<Row> {
-  return state.refresh === refresh ? state : { ...state, refresh };
-}
-
 type Identity = {
   readonly store: Store;
   readonly revision: number;
@@ -579,7 +466,6 @@ type Identity = {
 };
 
 type QueryInternalState<Row, Selected> = QueryHookState<Row, Selected> & Identity;
-type MaterializedInternalState<Row> = MaterializedHookState<Row> & Identity;
 type ViewRefreshState = {
   readonly status: ViewHookState<unknown>['status'];
   readonly queryKey: string;
@@ -616,38 +502,38 @@ function hasKeyBy<Row, Key>(options: UseViewOptions | UseRowKeyOptions<Row, Key>
   return 'keyBy' in options;
 }
 
-function diffRows<Row>(
-  previousRows: readonly Row[],
-  rows: readonly Row[],
-  keyBy: WatchOptions<Row>['keyBy']
-): {
-  readonly added: readonly Row[];
-  readonly removed: readonly Row[];
-  readonly unchanged: readonly Row[];
-  readonly rowChanges: readonly unknown[];
-} {
-  const previousByKey = new Map(previousRows.map((row) => [rowKey(row, keyBy), row]));
-  const nextByKey = new Map(rows.map((row) => [rowKey(row, keyBy), row]));
-  const added = rows.filter((row) => !previousByKey.has(rowKey(row, keyBy)));
-  const removed = previousRows.filter((row) => !nextByKey.has(rowKey(row, keyBy)));
-  const unchanged = rows.filter((row) => previousByKey.has(rowKey(row, keyBy)));
-  return {
-    added,
-    removed,
-    unchanged,
-    rowChanges: [
-      ...removed.map((row) => ({ kind: 'removed', key: rowKey(row, keyBy), row })),
-      ...added.map((row) => ({ kind: 'added', key: rowKey(row, keyBy), row }))
-    ]
-  };
+function addedWatchRows<Row>(changes: readonly RowChange<Row>[], target: WatchTarget<Row>): readonly Row[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'added') return [change.row];
+    if (change.kind === 'updated' && isRelationTarget(target)) return [change.after];
+    return [];
+  });
 }
 
-function rowKey<Row>(row: Row, keyBy: WatchOptions<Row>['keyBy']): string {
-  if (typeof keyBy === 'function') return JSON.stringify(keyBy(row));
-  if (Array.isArray(keyBy) && isRecord(row)) {
-    return JSON.stringify(keyBy.map((field) => row[field]));
-  }
-  return JSON.stringify(row);
+function removedWatchRows<Row>(changes: readonly RowChange<Row>[], target: WatchTarget<Row>): readonly Row[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'removed') return [change.row];
+    if (change.kind === 'updated' && isRelationTarget(target)) return [change.before];
+    return [];
+  });
+}
+
+function isRelationTarget(input: unknown): input is RelationRef {
+  return isRecord(input) && input.kind === 'relation' && typeof input.name === 'string';
+}
+
+function readWatchTarget<Row>(
+  db: Db,
+  target: WatchTarget<Row>,
+  options: WatchOptions<Row>
+): Promise<QueryResult<Row>> {
+  return isRelationTarget(target)
+    ? q(db, target, options as EvaluateOptions) as Promise<QueryResult<Row>>
+    : q(db, target, options);
+}
+
+function watchRowDiffOptions<Row>(options: WatchOptions<Row>): RowDiffOptions<Row> {
+  return options.keyBy === undefined ? {} : { keyBy: options.keyBy };
 }
 
 function reactDiagnostic(message: string, error: unknown): TarstateReactDiagnostic {

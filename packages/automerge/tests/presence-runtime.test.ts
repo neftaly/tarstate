@@ -1,7 +1,7 @@
 import * as Automerge from '@automerge/automerge';
 import type { PeerId } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { isRelationAdapter, isRelationRuntime } from '@tarstate/core/adapter';
+import { isRelationRuntime } from '@tarstate/core/adapter';
 import { as, eq, from, pipe, project, where } from '@tarstate/core/query';
 import {
   booleanField,
@@ -76,7 +76,6 @@ describe('automerge presence runtime contract', () => {
       expect('automergePresenceRuntime' in mapApi).toBe(false);
       expect('createAutomergePresenceRuntime' in presenceApi).toBe(false);
       expect(isRelationRuntime(runtime)).toBe(true);
-      expect(isRelationAdapter(runtime)).toBe(false);
       expectTypeOf(automergePresenceRuntime<PresenceChannels>).returns.toMatchTypeOf<
         AutomergePresenceRuntime<PresenceChannels>
       >();

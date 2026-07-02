@@ -1,6 +1,6 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, it } from 'vitest';
-import { tryApplyRelationPatches, tryCommitAdapter } from '@tarstate/core/adapter';
+import { tryApplyRelationPatches } from '@tarstate/core/adapter';
 import {
   booleanField,
   defineSchema,
@@ -98,7 +98,7 @@ describe('automerge adapter option contracts', () => {
       changeMessage: 'insert task through adapter'
     });
 
-    const result = await tryCommitAdapter(adapter, [
+    const result = await tryApplyRelationPatches(adapter, [
       tasks.insert({ id: 'task-a', title: 'Draft contract', done: false, rank: 1 })
     ], { readVersion: true });
 
@@ -245,7 +245,7 @@ describe('automerge adapter option contracts', () => {
     expect(await adapter.source.version?.()).toEqual(replacementHeads);
     expect(adapter.snapshot().version).toEqual(replacementHeads);
 
-    const result = await tryCommitAdapter(adapter, [
+    const result = await tryApplyRelationPatches(adapter, [
       tasks.updateByKey('task-a', { done: true })
     ], { readVersion: true });
 

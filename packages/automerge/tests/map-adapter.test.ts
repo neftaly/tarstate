@@ -114,8 +114,8 @@ describe('automerge Relic DB integration', () => {
       ],
       diagnostics: []
     });
-    await expect(relic.q('tasks', {
-      mapRows: (rows) => rows.map((row) => (row as TaskRow).id)
+    await expect(relic.q(schema.tasks, {
+      mapRows: (rows) => rows.map((row) => row.id)
     })).resolves.toMatchObject({
       rows: ['task-a', 'task-b'],
       diagnostics: []
@@ -123,14 +123,17 @@ describe('automerge Relic DB integration', () => {
     const batch = await relic.q({
       open: query,
       all: schema.tasks,
-      named: 'tasks'
+      ids: {
+        q: schema.tasks,
+        mapRows: (rows) => rows.map((row) => row.id)
+      }
     });
     expect(batch.open.rows).toEqual([{ id: 'task-a', title: 'Draft contract' }]);
     expect(batch.all.rows).toEqual([
       { id: 'task-a', title: 'Draft contract', done: false, rank: 1 },
       { id: 'task-b', title: 'Ship adapter', done: true, rank: 2 }
     ]);
-    expect(batch.named.rows).toEqual(batch.all.rows);
+    expect(batch.ids.rows).toEqual(['task-a', 'task-b']);
   });
 
   it('requires relation metadata for composed runtimes so optional sources are not ignored', async () => {

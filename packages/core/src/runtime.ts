@@ -2,10 +2,8 @@ import type { TarstateDiagnostic } from './diagnostics.js';
 import { tryTransact, type Db, type DbTransactionInput, type DbTransactionResult } from './db.js';
 import type { RelationDelta } from './delta.js';
 import {
-  isRelationAdapter,
   isRelationRuntime,
   tryApplyRelationPatches,
-  tryCommitAdapter,
   type AdapterSource,
   type RelationApplyDurability,
   type RelationRuntime
@@ -233,33 +231,6 @@ export async function trackRuntimeCommit<Version = unknown>(
   options: TrackRuntimeCommitOptions = {}
 ): Promise<TrackRuntimeCommitResult<Version>> {
   const patchList = Array.from(patches);
-
-  if (isRelationAdapter<Version>(runtime)) {
-    const beforeSource = runtime.snapshot?.().source ?? runtime.source;
-    const report = await tryCommitAdapter(runtime, patchList, options);
-    const watched = report.status === 'rejected'
-      ? { changes: [], diagnostics: [] }
-      : await trackRuntimeWatchedChanges(beforeSource, runtime.snapshot?.().source ?? report.source, report.deltas);
-    const changes = watched.changes.length > 0 ? watched.changes : deltasToChanges(report.deltas);
-    return {
-      kind: 'trackRuntimeCommit',
-      runtime,
-      source: report.source,
-      supported: true,
-      status: report.status,
-      patches: report.patches,
-      applied: report.applied,
-      changes,
-      changeMap: watchChangeMap(changes),
-      changesByTarget: watchChangeMap(changes),
-      changesByTargetKey: watchChangeKeyMap(changes),
-      deltas: report.deltas,
-      diagnostics: uniqueDiagnostics([...report.diagnostics, ...watched.diagnostics]),
-      ...(report.version === undefined ? {} : { version: report.version }),
-      ...(report.durability === undefined ? {} : { durability: report.durability }),
-      ...(options.label === undefined ? {} : { label: options.label })
-    };
-  }
 
   if (isRelationRuntime<Version>(runtime)) {
     const beforeSource = runtime.snapshot?.().source ?? runtime.source;

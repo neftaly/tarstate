@@ -31,16 +31,14 @@ The core API is stabilizing around a Relic-shaped split:
   means the current source identity is unknown.
 - `adapter` is the write-capable storage boundary: `RelationRuntime` combines a
   `RelationSource`, optional patch target, optional snapshot, and optional host
-  subscription. Patch targets and durable adapter commits use the same
-  `accepted`/`partial`/`rejected` status vocabulary, with `accepted` indicating
-  whether the full patch batch was accepted. Patch targets can declare writable
+  subscription. Patch targets use the same `accepted`/`partial`/`rejected`
+  status vocabulary, with `accepted` indicating whether the full patch batch was
+  accepted. Patch targets can declare writable
   relation ownership with `target.relationNames` or `target.ownsRelation`;
   composed runtimes use that target metadata before treating read-side
-  `source.relationNames` as a compatibility fallback. Durable
-  `RelationAdapter.commit(patches)` remains the compatibility shape for storage
-  adapters and returns the same result envelope as generic relation-target apply
-  semantics. The root convenience barrel also exports
-  `createMemoryRelationRuntime` for small non-durable examples and tests.
+  `source.relationNames` as a compatibility fallback. The root convenience
+  barrel also exports `createMemoryRelationRuntime` for small non-durable
+  examples and tests.
 - `write` defines the typed mutation vocabulary, including insert/insert-ignore,
   `insertOrReplace`, key-scoped `updateByKey`/`deleteByKey`, predicate
   `update`/`deleteRows`,

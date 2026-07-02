@@ -75,21 +75,9 @@ export type RelationRuntime<Version = unknown> = {
   readonly subscribe?: (listener: () => void) => () => void;
 };
 
-export type AdapterCommitStatus = RelationApplyStatus;
-export type AdapterCommitResult<Version = unknown> = RelationApplyResult<Version>;
-export type AdapterCommit<Version = unknown> = (
-  patches: readonly WritePatch[]
-) => MaybePromise<AdapterCommitResult<Version>>;
-
-export type RelationAdapter<Version = unknown> = RelationRuntime<Version> & {
-  readonly commit: AdapterCommit<Version>;
-};
-
-export type AdapterCommitOptions = {
+export type RelationApplyOptions = {
   readonly readVersion?: boolean;
 };
-export type RelationApplyOptions = AdapterCommitOptions;
-export type AdapterCommitReport<Version = unknown> = RelationApplyReport<Version>;
 export type RelationApplyReport<Version = unknown> = RelationApplyResult<Version> & {
   readonly source: AdapterSource<Version>;
 };
@@ -139,30 +127,6 @@ export function composeRelationRuntimes(
   };
 }
 
-export async function tryCommitAdapter<Version = unknown>(
-  adapter: RelationAdapter<Version>,
-  patches: Iterable<WritePatch>,
-  options: AdapterCommitOptions = {}
-): Promise<AdapterCommitReport<Version>> {
-  const patchList = Array.from(patches);
-  let result: AdapterCommitResult<Version>;
-
-  try {
-    result = await adapter.commit(patchList);
-  } catch (error) {
-    result = rejectedResult<Version>(patchList.length, 'adapter commit failed', error);
-  }
-
-  return {
-    ...await withRequestedVersion(normalizeResult(result, patchList.length), adapter.source, options),
-    source: adapter.source
-  };
-}
-
-export function isRelationAdapter<Version = unknown>(input: unknown): input is RelationAdapter<Version> {
-  return isRecord(input) && isRelationSource(input.source) && typeof input.commit === 'function';
-}
-
 export function isRelationRuntime<Version = unknown>(input: unknown): input is RelationRuntime<Version> {
   return isRecord(input) &&
     isRelationSource(input.source) &&
@@ -207,7 +171,7 @@ function normalizeResult<Version>(
 async function withRequestedVersion<Version>(
   result: RelationApplyResult<Version>,
   source: AdapterSource<Version>,
-  options: AdapterCommitOptions
+  options: RelationApplyOptions
 ): Promise<RelationApplyResult<Version>> {
   if (!options.readVersion || result.version !== undefined || source.version === undefined) {
     return result;

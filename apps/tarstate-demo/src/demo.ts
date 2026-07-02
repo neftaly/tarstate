@@ -59,8 +59,8 @@ import {
 import {
   TarstateProvider,
   useCommit,
-  useMaterialized,
   useQuery,
+  useView,
   useWatch
 } from '@tarstate/react';
 
@@ -984,8 +984,8 @@ export function RealEstateWalkthrough({
     env: envValues,
     deps: [queryId, filters.agentId, filters.areaCode, filters.priceBand, filters.buyerId, filters.listingState, filters.minPrice, filters.maxPrice]
   });
-  const materializedListings = useMaterialized(listingRowsQuery);
-  const materializedCommission = useMaterialized(commissionDueQuery);
+  const materializedListings = useView(listingRowsQuery);
+  const materializedCommission = useView(commissionDueQuery);
   const watch = useWatch(listingRowsQuery, undefined, { keyBy: ['id'] });
   const seed = seedRealEstateData();
 
@@ -1044,7 +1044,7 @@ export function RealEstateWalkthrough({
 db = await materializeSnapshot(db, commissionDueQuery, { id: 'commission-due' });
 const store = createStore(db);
 
-const listings = useMaterialized(listingRowsQuery);`),
+const listings = useView(listingRowsQuery);`),
       metricGrid(
         metric('Materialized listings', `${materializedListings.rows.length} rows`),
         metric('Materialized commission', `${materializedCommission.rows.length} rows`)
