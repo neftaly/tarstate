@@ -4,6 +4,7 @@ import {
   asc,
   as,
   avg,
+  bottomBy,
   call,
   constrain,
   constRows,
@@ -11,6 +12,7 @@ import {
   createDb,
   desc,
   difference,
+  env,
   eq,
   from,
   gt,
@@ -21,22 +23,31 @@ import {
   leftJoin,
   maintainMaterializations,
   mat,
+  materializationForQuery,
   maybe,
   materializedRowsForQuery,
   max,
+  maxBy,
   min,
+  minBy,
   pipe,
   project,
   qRows,
+  readMaterializedQuery,
+  sel,
+  sel1,
   sortLimit,
   sum,
+  topBy,
   trackTransact,
   tryTransact,
   unique,
   union,
+  updateEnv,
   updateWhere,
   value,
   watch,
+  withEnv,
   where
 } from '@tarstate/core';
 import type { Db, MaterializationMaintenanceResult, Query, RelationDelta, WatchEvent } from '@tarstate/core';
@@ -93,6 +104,29 @@ type UserNameRow = {
 type UserBandRow = {
   readonly id: string;
   readonly band: string;
+};
+
+type EnvUserRow = {
+  readonly id: string;
+  readonly age: number;
+};
+
+type UserSubqueryRow = {
+  readonly id: string;
+  readonly tasks: readonly { readonly title: string }[];
+  readonly team: { readonly name: string } | undefined;
+};
+
+type RankedTaskRow = {
+  readonly task: TaskRow;
+};
+
+type TaskWinnerRow = {
+  readonly ownerId: string;
+  readonly topTasks: readonly RankedTaskRow[];
+  readonly bottomTasks: readonly RankedTaskRow[];
+  readonly maxTask: RankedTaskRow | undefined;
+  readonly minTask: RankedTaskRow | undefined;
 };
 
 const diaUser: UserRow = {
@@ -212,6 +246,55 @@ function userAgeBandsQuery(): Query<UserBandRow> {
   ) as Query<UserBandRow>;
 }
 
+function olderThanEnvQuery(): Query<EnvUserRow> {
+  const user = as(coreSchema.users, 'user');
+  return pipe(
+    from(user),
+    where(gt(user.age, env<number>('minimumAge'))),
+    project({ id: user.id, age: user.age }),
+    keyBy('id')
+  ) as Query<EnvUserRow>;
+}
+
+function userSubqueriesQuery(): Query<UserSubqueryRow> {
+  const user = as(coreSchema.users, 'user');
+  const task = as(coreSchema.tasks, 'task');
+  const team = as(coreSchema.teams, 'team');
+  const taskTitles = pipe(
+    from(task),
+    where(eq(task.ownerId, user.id)),
+    project({ title: task.title })
+  );
+  const currentTeam = pipe(
+    from(team),
+    where(eq(team.id, user.teamId)),
+    project({ name: team.name })
+  );
+
+  return pipe(
+    from(user),
+    project({ id: user.id, tasks: sel(taskTitles), team: sel1(currentTeam) }),
+    keyBy('id')
+  ) as Query<UserSubqueryRow>;
+}
+
+function taskWinnerRowsQuery(): Query<TaskWinnerRow> {
+  const task = as(coreSchema.tasks, 'task');
+  return pipe(
+    from(task),
+    aggregate({
+      groupBy: { ownerId: task.ownerId },
+      aggregates: {
+        topTasks: topBy<RankedTaskRow>(2, task.points),
+        bottomTasks: bottomBy<RankedTaskRow>(2, task.points),
+        maxTask: maxBy<RankedTaskRow>(task.points),
+        minTask: minBy<RankedTaskRow>(task.points)
+      }
+    }),
+    keyBy('ownerId')
+  ) as Query<TaskWinnerRow>;
+}
+
 function ageBand(age: unknown): string {
   return typeof age === 'number' && age >= 40 ? '40s' : '30s';
 }
@@ -245,6 +328,15 @@ async function expectMaterializedRowsMatchQRows<Row>(db: Db, query: Query<Row>):
   expect(materializedRowsForQuery(db, query)).toEqual(await qRows(db, query));
 }
 
+async function expectCleanMaterializedRead<Row>(db: Db, query: Query<Row>, id: string): Promise<void> {
+  await expect(readMaterializedQuery(db, query)).resolves.toMatchObject({
+    materialized: true,
+    id,
+    diagnostics: []
+  });
+  expect(materializationForQuery(db, query)?.diagnostics).toEqual([]);
+}
+
 describe('materialization public behavior', () => {
   it('keeps projected relation materializations in parity with qRows and exposes coherent transaction rows', async () => {
     const activeUsers = activeUsersQuery();
@@ -260,6 +352,73 @@ describe('materialization public behavior', () => {
     expect(change.addedRows).toEqual([{ id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }]);
     expect(change.removedRows).toEqual([]);
     expect(materializedRowsForQuery(tracked.db, activeUsers)).toEqual(change.rows);
+  });
+
+  it('keeps env-dependent materialized rows aligned after withEnv and updateEnv', async () => {
+    const olderThanMinimum = olderThanEnvQuery();
+    const state = mat(createDb(sourceData, { env: { minimumAge: 30 } }), olderThanMinimum, {
+      id: 'older-than-minimum'
+    });
+
+    await expectMaterializedRowsMatchQRows(state, olderThanMinimum);
+    await expectCleanMaterializedRead(state, olderThanMinimum, 'older-than-minimum');
+
+    const raised = withEnv(state, { minimumAge: 38 });
+
+    expect(materializedRowsForQuery(raised, olderThanMinimum)).toEqual([
+      { id: 'cal', age: 41 }
+    ]);
+    await expectMaterializedRowsMatchQRows(raised, olderThanMinimum);
+    await expectCleanMaterializedRead(raised, olderThanMinimum, 'older-than-minimum');
+
+    const lowered = updateEnv(raised, (current) => ({
+      ...current,
+      minimumAge: 20
+    }));
+
+    expect(materializedRowsForQuery(lowered, olderThanMinimum)).toEqual([
+      { id: 'ada', age: 37 },
+      { id: 'bea', age: 29 },
+      { id: 'cal', age: 41 }
+    ]);
+    await expectMaterializedRowsMatchQRows(lowered, olderThanMinimum);
+    await expectCleanMaterializedRead(lowered, olderThanMinimum, 'older-than-minimum');
+  });
+
+  it('keeps equality-correlated sel and sel1 materialized rows coherent across tracked updates', async () => {
+    const userSubqueries = userSubqueriesQuery();
+    const state = mat(createDb(sourceData), userSubqueries, { id: 'user-subqueries' });
+    const team = as(coreSchema.teams, 'team');
+    const task = as(coreSchema.tasks, 'task');
+
+    await expectMaterializedRowsMatchQRows(state, userSubqueries);
+
+    const tracked = await trackTransact(state, [
+      insert(coreSchema.tasks, extraTask),
+      updateWhere(coreSchema.tasks, eq(task.id, 't3'), { title: 'Review materialization' }),
+      updateWhere(coreSchema.teams, eq(team.id, 'design'), { name: 'Product' })
+    ]);
+    const change = singleMaterializationChange<UserSubqueryRow>(tracked.materializations, 'user-subqueries');
+
+    expect(tracked.result).toMatchObject({ committed: true });
+    expect(change.rows).toEqual(await qRows(tracked.db, userSubqueries));
+    expect(change.addedRows).toEqual([]);
+    expect(change.removedRows).toEqual([]);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: expect.objectContaining({ id: 'bea' }),
+        after: {
+          id: 'bea',
+          tasks: [
+            { title: 'Review materialization' },
+            { title: 'Polish materialization tests' }
+          ],
+          team: { name: 'Product' }
+        }
+      })
+    ]));
+    expect(materializedRowsForQuery(tracked.db, userSubqueries)).toEqual(change.rows);
   });
 
   it('keeps aggregate rows correct across inserts, deletes, and value updates', async () => {
@@ -426,6 +585,34 @@ describe('materialization public behavior', () => {
 
     expect(change.rows).toEqual(await qRows(next, bands));
     expect(change.addedRows).toEqual([{ id: 'bea', band: '30s' }]);
+  });
+
+  it('keeps row-winner aggregate materializations aligned across tracked transactions', async () => {
+    const taskWinners = taskWinnerRowsQuery();
+    const state = mat(createDb(sourceData), taskWinners, { id: 'task-winners' });
+    const task = as(coreSchema.tasks, 'task');
+
+    await expectMaterializedRowsMatchQRows(state, taskWinners);
+
+    const tracked = await trackTransact(state, [
+      insert(coreSchema.tasks, extraTask),
+      updateWhere(coreSchema.tasks, eq(task.id, 't1'), { points: 9 })
+    ]);
+    const change = singleMaterializationChange<TaskWinnerRow>(tracked.materializations, 'task-winners');
+    const rows = await qRows(tracked.db, taskWinners);
+    const ada = rows.find((row) => row.ownerId === 'ada');
+    const bea = rows.find((row) => row.ownerId === 'bea');
+
+    expect(change.rows).toEqual(rows);
+    expect(materializedRowsForQuery(tracked.db, taskWinners)).toEqual(rows);
+    expect(ada?.topTasks.map((entry) => entry.task.id)).toEqual(['t1', 't2']);
+    expect(ada?.bottomTasks.map((entry) => entry.task.id)).toEqual(['t2', 't1']);
+    expect(ada?.maxTask?.task.id).toBe('t1');
+    expect(ada?.minTask?.task.id).toBe('t2');
+    expect(bea?.topTasks.map((entry) => entry.task.id)).toEqual(['t4', 't3']);
+    expect(bea?.bottomTasks.map((entry) => entry.task.id)).toEqual(['t3', 't4']);
+    expect(bea?.maxTask?.task.id).toBe('t4');
+    expect(bea?.minTask?.task.id).toBe('t3');
   });
 
   it('delivers watch events from materialized rows and stops after unwatch', async () => {
