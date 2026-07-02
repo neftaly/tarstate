@@ -33,6 +33,7 @@ import {
   composeRelationRuntimes,
   tryApplyRelationPatches
 } from '@tarstate/core/adapter';
+import { diffRows, rowDiffKey, type RowChange } from '@tarstate/core/diff';
 import { isJsonValue, type FieldSpec, type RelationRef } from '@tarstate/core/schema';
 import { queryKey, type PredicateData, type Query } from '@tarstate/core/query';
 import { type RelationRangeBound } from '@tarstate/core/source';
@@ -182,8 +183,10 @@ export type AutomergeDbWatchEvent<Row extends Record<string, unknown> = Record<s
   readonly changed: boolean;
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
+  readonly rowChanges: readonly RowChange<Row>[];
   readonly diagnostics: readonly TarstateDiagnostic[];
   readonly label?: string;
 };
@@ -475,12 +478,23 @@ function createAutomergeDbWatch<Row extends Record<string, unknown>>(
     target,
     refresh: async () => {
       if (closed) {
-        return watchEvent(id, target, previousRows, previousRows, [], [], [], options);
+        return watchEvent(id, target, previousRows, previousRows, {
+          added: [],
+          removed: [],
+          unchanged: previousRows,
+          rowChanges: []
+        }, options);
       }
 
       const rows = await readWatchRows(source, target);
-      const { addedRows, removedRows, changedRows } = diffWatchRows(previousRows, rows, options);
-      const event = watchEvent(id, target, previousRows, rows, addedRows, removedRows, changedRows, options);
+      const event = watchEvent(
+        id,
+        target,
+        previousRows,
+        rows,
+        diffWatchRows(previousRows, rows, target, options),
+        options
+      );
       previousRows = rows;
       await listener(event);
       return event;
@@ -522,22 +536,22 @@ async function readRelationWatchRows<Row extends Record<string, unknown>>(
 function diffWatchRows<Row extends Record<string, unknown>>(
   previousRows: readonly Row[],
   rows: readonly Row[],
+  target: AutomergeDbWatchTarget<Row>,
   options: AutomergeDbWatchOptions<Row>
 ): {
-  readonly addedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly changedRows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
+  readonly rowChanges: readonly RowChange<Row>[];
 } {
-  const previous = new Map(previousRows.map((row) => [watchRowKey(row, options), row]));
-  const next = new Map(rows.map((row) => [watchRowKey(row, options), row]));
-  const addedRows = rows.filter((row) => !previous.has(watchRowKey(row, options)));
-  const removedRows = previousRows.filter((row) => !next.has(watchRowKey(row, options)));
-  const changedRows = rows.filter((row) => {
-    const before = previous.get(watchRowKey(row, options));
-    return before !== undefined && JSON.stringify(before) !== JSON.stringify(row);
-  });
-
-  return { addedRows, removedRows, changedRows };
+  const diff = diffRows(previousRows, rows, options);
+  const changedKeys = new Set(diff.changes.map((change) => change.key));
+  return {
+    added: addedWatchRows(diff.changes, target),
+    removed: removedWatchRows(diff.changes, target),
+    unchanged: rows.filter((row) => !changedKeys.has(rowDiffKey(row, options))),
+    rowChanges: diff.changes
+  };
 }
 
 function watchEvent<Row extends Record<string, unknown>>(
@@ -545,35 +559,50 @@ function watchEvent<Row extends Record<string, unknown>>(
   target: AutomergeDbWatchTarget<Row>,
   previousRows: readonly Row[],
   rows: readonly Row[],
-  addedRows: readonly Row[],
-  removedRows: readonly Row[],
-  changedRows: readonly Row[],
+  diff: {
+    readonly added: readonly Row[];
+    readonly removed: readonly Row[];
+    readonly unchanged: readonly Row[];
+    readonly rowChanges: readonly RowChange<Row>[];
+  },
   options: AutomergeDbWatchOptions<Row>
 ): AutomergeDbWatchEvent<Row> {
   return {
     kind: 'automergeDbWatchEvent',
     id,
     target,
-    changed: addedRows.length > 0 || removedRows.length > 0 || changedRows.length > 0,
+    changed: diff.rowChanges.length > 0,
     previousRows,
     rows,
-    addedRows,
-    removedRows,
+    added: diff.added,
+    removed: diff.removed,
+    unchanged: diff.unchanged,
+    rowChanges: diff.rowChanges,
     diagnostics: [],
     ...(options.label === undefined ? {} : { label: options.label })
   };
 }
 
-function watchRowKey<Row extends Record<string, unknown>>(row: Row, options: AutomergeDbWatchOptions<Row>): string {
-  if (typeof options.keyBy === 'function') {
-    return options.keyBy(row);
-  }
+function addedWatchRows<Row extends Record<string, unknown>>(
+  changes: readonly RowChange<Row>[],
+  target: AutomergeDbWatchTarget<Row>
+): readonly Row[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'added') return [change.row];
+    if (change.kind === 'updated' && !isQuery(target)) return [change.after];
+    return [];
+  });
+}
 
-  if (Array.isArray(options.keyBy)) {
-    return JSON.stringify(options.keyBy.map((field) => row[field]));
-  }
-
-  return JSON.stringify(row);
+function removedWatchRows<Row extends Record<string, unknown>>(
+  changes: readonly RowChange<Row>[],
+  target: AutomergeDbWatchTarget<Row>
+): readonly Row[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'removed') return [change.row];
+    if (change.kind === 'updated' && !isQuery(target)) return [change.before];
+    return [];
+  });
 }
 
 export function automergeMapAdapter<

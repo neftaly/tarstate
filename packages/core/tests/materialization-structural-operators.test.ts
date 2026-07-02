@@ -19,7 +19,6 @@ import {
   project,
   qRows,
   qualify,
-  qualifyRow,
   sum,
   union,
   value,
@@ -118,7 +117,7 @@ function qualifiedActiveUsersQuery(): Query<QualifiedActiveUserRow> {
 }
 
 function qualifiedRowActiveUsersQuery(): Query<QualifiedRowActiveUserRow> {
-  return pipe(activeUserRows(), qualifyRow('item')) as Query<QualifiedRowActiveUserRow>;
+  return pipe(activeUserRows(), qualify('item')) as Query<QualifiedRowActiveUserRow>;
 }
 
 function literalMetricRollupsQuery(): Query<LiteralMetricRollupRow> {
@@ -198,7 +197,7 @@ async function expectMaterializedRowsMatchQRows<Row>(db: Db, query: Query<Row>):
 }
 
 describe('materialized structural operators', () => {
-  it('keeps qualify and qualifyRow materialized rows in parity with qRows', async () => {
+  it('keeps qualify and qualify materialized rows in parity with qRows', async () => {
     const qualified = qualifiedActiveUsersQuery();
     const qualifiedState = mat(createDb(sourceData), qualified, { id: 'qualified-active-users' });
     await expectMaterializedRowsMatchQRows(qualifiedState, qualified);
@@ -248,8 +247,8 @@ describe('materialized structural operators', () => {
     const change = singleMaterializationChange<LiteralMetricRollupRow>(maintained, 'literal-rollups');
 
     expect(change.rows).toEqual(await qRows(next, rollups));
-    expect(change.addedRows).toEqual([]);
-    expect(change.removedRows).toEqual([]);
+    expect(change.added).toEqual([]);
+    expect(change.removed).toEqual([]);
     expect(materializedRowsForQuery(next, rollups)).toEqual(change.rows);
   });
 
@@ -264,12 +263,12 @@ describe('materialized structural operators', () => {
     const change = singleMaterializationChange<UserTagRow>(maintained, 'expanded-user-tags');
 
     expect(change.rows).toEqual(await qRows(next, tags));
-    expect(change.addedRows).toEqual(expect.arrayContaining([
+    expect(change.added).toEqual(expect.arrayContaining([
       { id: 'ada', tag: 'logic' },
       { id: 'dia', tag: 'compiler' },
       { id: 'dia', tag: 'docs' }
     ]));
-    expect(change.removedRows).toEqual(expect.arrayContaining([
+    expect(change.removed).toEqual(expect.arrayContaining([
       { id: 'ada', tag: 'runtime' },
       { id: 'bea', tag: 'research' }
     ]));

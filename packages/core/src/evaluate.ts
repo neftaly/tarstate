@@ -76,7 +76,7 @@ async function evaluateData(
       return evaluateData(data.input, state, outerRow);
     case 'join':
       return joinRows(data.kind, data.left, data.right, data.on, state, outerRow);
-    case 'select':
+    case 'project':
       return Promise.all((await evaluateData(data.input, state, outerRow)).map((row) =>
         projectRow(data.projection, row, state)
       ));

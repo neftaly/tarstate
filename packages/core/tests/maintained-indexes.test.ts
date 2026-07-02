@@ -24,7 +24,7 @@ import {
   transact,
   tryTransact,
   uniqueIndex,
-  updateWhere,
+  update,
   type Db,
   type DbTransactionResult,
   type Query
@@ -261,7 +261,7 @@ describe('maintained materialized indexes', () => {
 
     const movedDia = { ...diaUser, teamId: 'design', active: false, age: 35 };
     const moved = expectCommittedWithMaterializationChange(
-      tryTransact(inserted, updateWhere(coreSchema.users, eq(user.id, 'dia'), {
+      tryTransact(inserted, update(coreSchema.users, eq(user.id, 'dia'), {
         teamId: 'design',
         active: false,
         age: 35
@@ -305,7 +305,7 @@ describe('maintained materialized indexes', () => {
       diaSlug: 'eng:dia'
     });
 
-    const moved = transact(inserted, updateWhere(coreSchema.users, eq(user.id, 'dia'), {
+    const moved = transact(inserted, update(coreSchema.users, eq(user.id, 'dia'), {
       teamId: 'design',
       age: 35
     }));

@@ -30,7 +30,7 @@ import {
   maybe,
   or,
   pipe,
-  project as select,
+  project,
   qRows,
   qualify,
   req,
@@ -493,7 +493,7 @@ export const propertyInfoQuery = pipe(
   join(from(agentRef), eq(propertyRef.agentId, agentRef.id)),
   leftJoin(propertyRoomStatsQuery, eq(propertyRef.id, roomStats.propertyId)),
   sort(asc(propertyRef.price)),
-  select({
+  project({
     id: propertyRef.id,
     address: propertyRef.address,
     price: propertyRef.price,
@@ -535,7 +535,7 @@ export const currentOffersQuery = pipe(
   join(from(buyerRef), eq(offerRef.buyerId, buyerRef.id)),
   leftJoin(from(decisionRef), eq(offerRef.id, decisionRef.offerId)),
   sort(desc(offerRef.offeredAt)),
-  select({
+  project({
     id: offerRef.id,
     propertyId: propertyRef.id,
     propertyAddress: propertyRef.address,
@@ -562,7 +562,7 @@ export const acceptedSalesQuery = pipe(
   join(from(buyerRef), eq(offerRef.buyerId, buyerRef.id)),
   join(from(agentRef), eq(propertyRef.agentId, agentRef.id)),
   sort(asc(decisionRef.decidedAt)),
-  select({
+  project({
     id: decisionRef.id,
     offerId: offerRef.id,
     propertyId: propertyRef.id,
@@ -588,7 +588,7 @@ export const listingRowsQuery = pipe(
   qualify('info'),
   leftJoin(pipe(acceptedSalesQuery, qualify('sale')), eq(info.id, sale.propertyId)),
   where(eq(sale.propertyId, value(undefined))),
-  select({
+  project({
     id: info.id,
     address: info.address,
     price: info.price,
@@ -612,7 +612,7 @@ export const openOffersQuery = pipe(
   currentOffersQuery,
   qualify('current'),
   where(eq(field('current', 'decisionId'), value(undefined))),
-  select({
+  project({
     id: field<string>('current', 'id'),
     propertyId: field<string>('current', 'propertyId'),
     propertyAddress: field<string>('current', 'propertyAddress'),
@@ -657,7 +657,7 @@ export const commissionDueQuery = pipe(
 
 export const offerConstraintRowsQuery = pipe(
   from(offerRef),
-  select({
+  project({
     id: offerRef.id,
     propertyId: offerRef.propertyId,
     buyerId: offerRef.buyerId,
@@ -669,7 +669,7 @@ export const offerConstraintRowsQuery = pipe(
 
 export const decisionConstraintRowsQuery = pipe(
   from(decisionRef),
-  select({
+  project({
     id: decisionRef.id,
     offerId: decisionRef.offerId,
     decidedAt: decisionRef.decidedAt,

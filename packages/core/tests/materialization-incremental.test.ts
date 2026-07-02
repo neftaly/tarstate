@@ -44,7 +44,7 @@ import {
   unique,
   union,
   updateEnv,
-  updateWhere,
+  update,
   value,
   watch,
   withEnv,
@@ -349,8 +349,8 @@ describe('materialization public behavior', () => {
 
     expect(tracked.result).toMatchObject({ committed: true });
     expect(change.rows).toEqual(await qRows(tracked.db, activeUsers));
-    expect(change.addedRows).toEqual([{ id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }]);
-    expect(change.removedRows).toEqual([]);
+    expect(change.added).toEqual([{ id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }]);
+    expect(change.removed).toEqual([]);
     expect(materializedRowsForQuery(tracked.db, activeUsers)).toEqual(change.rows);
   });
 
@@ -395,15 +395,15 @@ describe('materialization public behavior', () => {
 
     const tracked = await trackTransact(state, [
       insert(coreSchema.tasks, extraTask),
-      updateWhere(coreSchema.tasks, eq(task.id, 't3'), { title: 'Review materialization' }),
-      updateWhere(coreSchema.teams, eq(team.id, 'design'), { name: 'Product' })
+      update(coreSchema.tasks, eq(task.id, 't3'), { title: 'Review materialization' }),
+      update(coreSchema.teams, eq(team.id, 'design'), { name: 'Product' })
     ]);
     const change = singleMaterializationChange<UserSubqueryRow>(tracked.materializations, 'user-subqueries');
 
     expect(tracked.result).toMatchObject({ committed: true });
     expect(change.rows).toEqual(await qRows(tracked.db, userSubqueries));
-    expect(change.addedRows).toEqual([]);
-    expect(change.removedRows).toEqual([]);
+    expect(change.added).toEqual([]);
+    expect(change.removed).toEqual([]);
     expect(change.rowChanges).toEqual(expect.arrayContaining([
       expect.objectContaining({
         kind: 'updated',
@@ -437,8 +437,8 @@ describe('materialization public behavior', () => {
     const insertedChange = singleMaterializationChange<TaskProjectStatsRow>(inserted, 'task-project-stats');
 
     expect(insertedChange.rows).toEqual(await qRows(insertedDb, stats));
-    expect(insertedChange.addedRows).toEqual([]);
-    expect(insertedChange.removedRows).toEqual([]);
+    expect(insertedChange.added).toEqual([]);
+    expect(insertedChange.removed).toEqual([]);
     expect(insertedChange.rowChanges).toEqual(expect.arrayContaining([
       expect.objectContaining({
         kind: 'updated',
@@ -550,8 +550,8 @@ describe('materialization public behavior', () => {
     const insertedChange = singleMaterializationChange<ActiveUserRow>(inserted, 'top-users');
 
     expect(insertedChange.rows).toEqual(await qRows(insertedDb, topUsers));
-    expect(insertedChange.addedRows).toContainEqual({ id: 'eli', name: 'Eli', age: 45, teamId: 'eng' });
-    expect(insertedChange.removedRows).toContainEqual({ id: 'ada', name: 'Ada', age: 37, teamId: 'eng' });
+    expect(insertedChange.added).toContainEqual({ id: 'eli', name: 'Eli', age: 45, teamId: 'eng' });
+    expect(insertedChange.removed).toContainEqual({ id: 'ada', name: 'Ada', age: 37, teamId: 'eng' });
 
     const updatedAda = { ...adaUser, age: 46, name: 'Ada Prime' };
     const updatedDb = createDb({ ...sourceData, users: [updatedAda, beaUser, calUser, eliUser] });
@@ -584,7 +584,7 @@ describe('materialization public behavior', () => {
     const change = singleMaterializationChange<UserBandRow>(maintained, 'age-bands');
 
     expect(change.rows).toEqual(await qRows(next, bands));
-    expect(change.addedRows).toEqual([{ id: 'bea', band: '30s' }]);
+    expect(change.added).toEqual([{ id: 'bea', band: '30s' }]);
   });
 
   it('keeps row-winner aggregate materializations aligned across tracked transactions', async () => {
@@ -596,7 +596,7 @@ describe('materialization public behavior', () => {
 
     const tracked = await trackTransact(state, [
       insert(coreSchema.tasks, extraTask),
-      updateWhere(coreSchema.tasks, eq(task.id, 't1'), { points: 9 })
+      update(coreSchema.tasks, eq(task.id, 't1'), { points: 9 })
     ]);
     const change = singleMaterializationChange<TaskWinnerRow>(tracked.materializations, 'task-winners');
     const rows = await qRows(tracked.db, taskWinners);
@@ -628,14 +628,14 @@ describe('materialization public behavior', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }],
-      removedRows: []
+      added: [{ id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }],
+      removed: []
     });
     expect(events[0]?.rows).toEqual(await qRows(tracked.db, activeUsers));
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
 
     const user = as(coreSchema.users, 'user');
-    await trackTransact(tracked.db, updateWhere(coreSchema.users, eq(user.id, 'dia'), {
+    await trackTransact(tracked.db, update(coreSchema.users, eq(user.id, 'dia'), {
       name: 'Dia Updated'
     }));
 

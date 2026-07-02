@@ -22,7 +22,7 @@ The core API is stabilizing around a Relic-shaped split:
   explicit lookup, hash-declared equality lookup planning, btree-declared range
   lookup planning, query-only `uniqueIndex` metadata, dependency analysis
   through `dependencies`, propagated result identity through `rowKeyFields`,
-  projections, `qualifyRow`, `aggregate({ groupBy, aggregates })`, aggregate
+  projections, `qualify`, `aggregate({ groupBy, aggregates })`, aggregate
   helpers such as `countDistinct`/`avg`/`notAny`/`setConcat`/`maxBy`/`minBy`,
   and nested collection expansion.
 - `source` describes read-only row sources with `rows`, optional equality
@@ -43,7 +43,7 @@ The core API is stabilizing around a Relic-shaped split:
   `createMemoryRelationRuntime` for small non-durable examples and tests.
 - `write` defines the typed mutation vocabulary, including insert/insert-ignore,
   `insertOrReplace`, key-scoped `updateByKey`/`deleteByKey`, predicate
-  `update`/`delete`, compatibility predicate aliases `updateWhere`/`deleteWhere`,
+  `update`/`deleteRows`,
   `deleteExact`, `replaceAll`, `insertOrMerge(row, { merge })`, and explicit
   `insertOrUpdate(row, { update })` constant set-map descriptors. Computed
   update expressions are left to a future explicit API.
@@ -52,9 +52,8 @@ The core API is stabilizing around a Relic-shaped split:
 - `db` gives those programs a small object-backed runtime for examples, tests,
   and local state: diagnostics-aware `q`/`qMany`, row-only `qRows`/`qManyRows`,
   `stripMeta` for recovering normalized row data from a `Db`, and variadic
-  all-or-nothing `tryTransact`/`transact` helpers. DB-facing helper names
-  include `dbUpdateWhere` and `dbDeleteWhere`; explicit insert-or-update writes
-  use `insertOrUpdate(row, { update })` from `write`.
+  all-or-nothing `tryTransact`/`transact` helpers. Explicit insert-or-update
+  writes use `insertOrUpdate(row, { update })` from `write`.
 - `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
   rows for tests, local state, and adapter prototyping.
 - `constraints`, `materialization`, `watch`, and `runtime` are diagnostic-backed

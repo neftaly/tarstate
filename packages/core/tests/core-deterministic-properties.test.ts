@@ -10,7 +10,7 @@ import {
   createDb,
   defineSchema,
   deleteByKey,
-  deleteWhere,
+  deleteRows,
   demat,
   eq,
   evaluate,
@@ -44,7 +44,7 @@ import {
   unique,
   unwatch,
   updateByKey,
-  updateWhere,
+  update,
   value,
   watch,
   watchTargetKey,
@@ -170,14 +170,14 @@ describe('deterministic core properties', () => {
             model = nextModel;
             break;
           }
-          case 'updateWhere': {
+          case 'update': {
             const targetBucket = pickExisting(model, rng).bucket;
             const changes = { value: rng.int(100), active: rng.bool() };
             const nextModel = model.map((row) => row.bucket === targetBucket ? { ...row, ...changes } : row);
             state = await commitAccepted(
               state,
               model,
-              updateWhere(itemSchema.items, eq(item.bucket, value(targetBucket)), changes),
+              update(itemSchema.items, eq(item.bucket, value(targetBucket)), changes),
               nextModel
             );
             model = nextModel;
@@ -195,13 +195,13 @@ describe('deterministic core properties', () => {
             model = nextModel;
             break;
           }
-          case 'deleteWhere': {
+          case 'deleteRows': {
             const targetBucket = pickExisting(model, rng).bucket;
             const nextModel = model.filter((row) => row.bucket !== targetBucket);
             state = await commitAccepted(
               state,
               model,
-              deleteWhere(itemSchema.items, eq(item.bucket, value(targetBucket))),
+              deleteRows(itemSchema.items, eq(item.bucket, value(targetBucket))),
               nextModel
             );
             model = nextModel;
@@ -337,7 +337,7 @@ describe('deterministic core properties', () => {
   });
 });
 
-const operations = ['insert', 'updateByKey', 'updateWhere', 'deleteByKey', 'deleteWhere'] as const;
+const operations = ['insert', 'updateByKey', 'update', 'deleteByKey', 'deleteRows'] as const;
 type Operation = (typeof operations)[number];
 
 function fixtureQueries() {

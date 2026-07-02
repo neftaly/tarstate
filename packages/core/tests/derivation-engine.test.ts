@@ -68,13 +68,13 @@ describe('derivation engine', () => {
     });
 
     expect(refresh.changed).toBe(true);
-    expect(refresh.delta.addedRows).toEqual([]);
-    expect(refresh.delta.removedRows).toEqual([{
+    expect(refresh.delta.added).toEqual([]);
+    expect(refresh.delta.removed).toEqual([{
       id: 'bea',
       name: 'Bea',
       teamId: 'design'
     }]);
-    expect(refresh.delta.updatedRows).toEqual([{
+    expect(refresh.delta.updated).toEqual([{
       before: {
         id: 'ada',
         name: 'Ada',

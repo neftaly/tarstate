@@ -12,7 +12,15 @@ Primary API:
 - `useTarstateStore()` returns the active core `Store`.
 - `useTarstateSnapshot()` returns the current core `StoreSnapshot`.
 - `useDb()` reads the current core `Db`.
-- `useQuery(query)` evaluates through `store.query(query, options)`.
+- `useView(query)` is the canonical read hook. It subscribes to
+  `store.view(query)` and returns `{ status, rows, diagnostics, revision,
+  queryKey, refresh, view, snapshot, error }`.
+- `useRow(query, predicate)` returns the first view row matching a type-safe
+  predicate. Use `useRow(query, key, { keyBy })` for keyed lookup, where
+  `keyBy(row)` produces the same key type as `key`.
+- `useQuery(query)` remains available for selected data via
+  `useQuery(query, { select })`; new read-only components should prefer
+  `useView`.
 - `useCommit()` returns the active core `Store.commit` function.
 - `Store.close()` provides idempotent subscription cleanup.
 - `useMaterialized(query)` reads materialized query rows from

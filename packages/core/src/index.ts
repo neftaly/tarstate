@@ -34,9 +34,7 @@ export {
   DbTransactionError,
   createDb,
   db,
-  dbDeleteWhere,
   dbSource,
-  dbUpdateWhere,
   exists,
   getEnv,
   q,
@@ -70,9 +68,6 @@ export type {
   DbTransactionInput,
   DbTransactionInputs,
   DbTransactionResult,
-  DbWriteKey,
-  DbWriteMatcher,
-  DbWritePredicate,
   MappedQueryBatchResult,
   MappedQueryBatchRows,
   QueryBatch,
@@ -197,7 +192,6 @@ export type {
 } from './materialization.js';
 export {
   aggregate,
-  agg,
   and,
   any,
   as,
@@ -243,7 +237,6 @@ export {
   pipe,
   project,
   qualify,
-  qualifyRow,
   queryKey,
   queryRowKeyFields,
   relationDependencies,
@@ -251,7 +244,6 @@ export {
   rowKeyFields,
   sel,
   sel1,
-  select,
   setConcat,
   sort,
   sortLimit,
@@ -322,7 +314,9 @@ export type {
   StoreSeedInput,
   StoreSnapshot,
   StoreView,
-  StoreViewReadOptions
+  StoreViewSnapshot,
+  StoreViewReadOptions,
+  StoreWhatIf
 } from './store.js';
 export {
   trackRuntimeCommit,
@@ -388,8 +382,6 @@ export {
   deleteRows,
   deleteExact,
   deleteByKey,
-  delete,
-  deleteWhere,
   insert,
   insertIgnore,
   insertOrMerge,
@@ -399,14 +391,12 @@ export {
   replaceAll,
   update,
   updateByKey,
-  updateWhere,
   write
 } from './write.js';
 export type {
   DeleteByKeyPatch,
   DeleteExactPatch,
   DeletePatch,
-  DeleteWherePatch,
   InsertIgnorePatch,
   InsertOrMergeOptions,
   InsertOrMergePatch,
@@ -423,7 +413,6 @@ export type {
   ReplaceAllPatch,
   UpdateByKeyPatch,
   UpdatePatch,
-  UpdateWherePatch,
   WriteInput,
   WritePatch
 } from './write.js';

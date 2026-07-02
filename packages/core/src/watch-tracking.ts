@@ -71,7 +71,7 @@ function materializedChangesForTransition(
     const diff = diffRows(previousRows, rows, diffOptionsForTarget(metadata.query, {}));
     diagnostics.push(...diff.diagnostics);
     const added = diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
-    const deleted = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+    const removed = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
     changes.push({
       kind: 'trackedChange',
       id: metadata.id,
@@ -81,11 +81,8 @@ function materializedChangesForTransition(
       previousRows,
       rows,
       added,
-      deleted,
-      addedRows: added,
-      deletedRows: deleted,
-      removedRows: deleted,
-      unchangedRows: unchangedRows(rows, diff.changes, diffOptionsForTarget(metadata.query, {})),
+      removed,
+      unchanged: rowsUnchangedByChanges(rows, diff.changes, diffOptionsForTarget(metadata.query, {})),
       rowChanges: diff.changes,
       diagnostics: diff.diagnostics
     });
@@ -94,7 +91,7 @@ function materializedChangesForTransition(
   return { changes, diagnostics };
 }
 
-function unchangedRows<Row>(
+function rowsUnchangedByChanges<Row>(
   rows: readonly Row[],
   changes: readonly { readonly key: string }[],
   options: RowDiffOptions<Row>

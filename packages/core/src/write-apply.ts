@@ -121,7 +121,7 @@ function applyPatch(state: ApplyState, patch: WritePatch): void {
       updateByKey(state, patch as UpdateByKeyPatch & { readonly changes: ComputedChanges });
       return;
     case 'update':
-      updateWhere(state, patch as UpdatePatch & { readonly changes: ComputedChanges });
+      updateMatchingRows(state, patch as UpdatePatch & { readonly changes: ComputedChanges });
       return;
     case 'insertOrMerge':
       insertOrMerge(state, patch.relation, patch.row, patch.merge as ComputedMerge);
@@ -133,7 +133,7 @@ function applyPatch(state: ApplyState, patch: WritePatch): void {
       deleteByKey(state, patch.relation, patch.key);
       return;
     case 'delete':
-      deleteWhere(state, patch);
+      deleteMatchingRows(state, patch);
       return;
     case 'deleteExact':
       deleteExact(state, patch);
@@ -159,12 +159,12 @@ function expandCascadingDeletes(
 
   for (const patch of patches) {
     expanded.push(patch);
-    const removedRows = removeRowsForPatch(working, patch);
-    if (removedRows.length === 0) {
+    const rowsToDelete = removeRowsForPatch(working, patch);
+    if (rowsToDelete.length === 0) {
       continue;
     }
 
-    const cascaded = cascadeDeletesForRows(working, patch.relation, removedRows, constraints);
+    const cascaded = cascadeDeletesForRows(working, patch.relation, rowsToDelete, constraints);
     expanded.push(...cascaded.patches);
     diagnostics.push(...cascaded.diagnostics);
   }
@@ -175,12 +175,12 @@ function expandCascadingDeletes(
 function cascadeDeletesForRows(
   data: MutableObjectSourceData,
   relation: RelationRef,
-  removedRows: readonly unknown[],
+  rowsToDelete: readonly unknown[],
   constraints: readonly ConstraintData[]
 ): { readonly patches: readonly WritePatch[]; readonly diagnostics: readonly TarstateDiagnostic[] } {
   const patches: WritePatch[] = [];
   const diagnostics: TarstateDiagnostic[] = [];
-  const queue: { readonly relation: RelationRef; readonly rows: readonly unknown[] }[] = [{ relation, rows: removedRows }];
+  const queue: { readonly relation: RelationRef; readonly rows: readonly unknown[] }[] = [{ relation, rows: rowsToDelete }];
 
   for (let cursor = 0; cursor < queue.length; cursor += 1) {
     const item = queue[cursor] as { readonly relation: RelationRef; readonly rows: readonly unknown[] };
@@ -355,7 +355,7 @@ function updateByKey(state: ApplyState, patch: UpdateByKeyPatch & { readonly cha
   updateRowAt(state, patch.relation, rows, index, patch.changes);
 }
 
-function updateWhere(state: ApplyState, patch: UpdatePatch & { readonly changes: ComputedChanges }): void {
+function updateMatchingRows(state: ApplyState, patch: UpdatePatch & { readonly changes: ComputedChanges }): void {
   const rows = relationRows(state.data, patch.relation);
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
@@ -447,7 +447,7 @@ function deleteByKey(state: ApplyState, relation: RelationRef, key: RelationKeyI
   recordDelta(state, relation, removed, undefined);
 }
 
-function deleteWhere(state: ApplyState, patch: Extract<WritePatch, { readonly op: 'delete' }>): void {
+function deleteMatchingRows(state: ApplyState, patch: Extract<WritePatch, { readonly op: 'delete' }>): void {
   const rows = relationRows(state.data, patch.relation);
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const row = rows[index];

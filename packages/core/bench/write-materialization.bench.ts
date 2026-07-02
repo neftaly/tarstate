@@ -10,7 +10,7 @@ import {
   count,
   createDb,
   db,
-  deleteWhere,
+  deleteRows,
   desc,
   diffQuery,
   eq,
@@ -36,7 +36,7 @@ import {
   topBy,
   unique,
   uniqueIndex,
-  updateWhere,
+  update,
   watch
 } from '@tarstate/core';
 import {
@@ -109,8 +109,8 @@ const expressionIndexedPeople = pipe(
 );
 const singlePersonInsert = insert(benchSchema.people, extraPerson(0));
 const batchTaskInserts = extraTasks(medium.data, 24).map((row) => insert(benchSchema.tasks, row));
-const predicateTaskUpdate = updateWhere(benchSchema.tasks, gte(taskRef.points, 8), { priority: 5 });
-const predicateTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.done, true));
+const predicateTaskUpdate = update(benchSchema.tasks, gte(taskRef.points, 8), { priority: 5 });
+const predicateTaskDelete = deleteRows(benchSchema.tasks, eq(taskRef.done, true));
 const constrained = mat(createDb(medium.data), constrain(unique(benchSchema.people, 'email')));
 const duplicateEmailInsert = insert(benchSchema.people, duplicateEmailPerson(medium.data));
 const materialized = mat(createDb(medium.data), {
@@ -162,7 +162,7 @@ const largeMaterializedJoinTaskInsert = insert(benchSchema.tasks, extraTask(larg
 const largeJoinOwnerId = large.data.tasks[Math.floor(large.data.tasks.length / 2)]?.ownerId
   ?? large.data.people[0]?.id
   ?? '';
-const largeMaterializedJoinOwnerUpdate = updateWhere(benchSchema.people, eq(personRef.id, largeJoinOwnerId), {
+const largeMaterializedJoinOwnerUpdate = update(benchSchema.people, eq(personRef.id, largeJoinOwnerId), {
   name: 'Updated Owner',
   role: 'principal'
 });
@@ -175,7 +175,7 @@ const largeIncrementalMaterializedLeftJoin = mat(createDb(large.data), {
 const largeLeftJoinReviewerId = large.data.tasks.find((task) => task.reviewerId !== undefined)?.reviewerId
   ?? large.data.people[0]?.id
   ?? '';
-const largeMaterializedLeftJoinReviewerUpdate = updateWhere(
+const largeMaterializedLeftJoinReviewerUpdate = update(
   benchSchema.people,
   eq(personRef.id, largeLeftJoinReviewerId),
   {
@@ -213,7 +213,7 @@ const largeIncrementalMaterializedSortedTasks = mat(createDb(large.data), {
   sortedTasks: largeSortedTasks
 }, { mode: 'incremental' });
 const largeSortedTaskUpdateId = large.data.tasks[Math.floor(large.data.tasks.length / 3)]?.id ?? '';
-const largeMaterializedSortedTaskUpdate = updateWhere(
+const largeMaterializedSortedTaskUpdate = update(
   benchSchema.tasks,
   eq(taskRef.id, largeSortedTaskUpdateId),
   { title: 'Updated sorted benchmark task' }
@@ -292,7 +292,7 @@ const largeAggregateMoveTask = large.data.tasks.find((task) => task.projectId !=
 const largeAggregateMoveTargetProjectId = large.data.projects.find((project) => (
   project.id !== largeAggregateMoveTask?.projectId
 ))?.id ?? largeAggregateInsertProjectId;
-const largeAggregateTaskProjectUpdate = updateWhere(
+const largeAggregateTaskProjectUpdate = update(
   benchSchema.tasks,
   eq(taskRef.id, largeAggregateMoveTask?.id ?? ''),
   {
@@ -301,7 +301,7 @@ const largeAggregateTaskProjectUpdate = updateWhere(
   }
 );
 const largeAggregateDeleteTaskId = large.data.tasks[Math.floor(large.data.tasks.length / 2)]?.id ?? '';
-const largeAggregateTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.id, largeAggregateDeleteTaskId));
+const largeAggregateTaskDelete = deleteRows(benchSchema.tasks, eq(taskRef.id, largeAggregateDeleteTaskId));
 const largeJoinedAggregateOwner = large.data.people.find((person) => (
   large.data.tasks.some((task) => task.ownerId === person.id)
 )) ?? large.data.people[0];
@@ -312,7 +312,7 @@ const largeJoinedAggregateTaskInsert = insert(benchSchema.tasks, extraTask(large
   ownerId: largeJoinedAggregateOwner?.id ?? large.data.people[0]?.id ?? '',
   points: 12
 }));
-const largeJoinedAggregateOwnerRegionUpdate = updateWhere(
+const largeJoinedAggregateOwnerRegionUpdate = update(
   benchSchema.people,
   eq(personRef.id, largeJoinedAggregateOwner?.id ?? ''),
   { region: largeJoinedAggregateOwnerTargetRegion }
@@ -326,7 +326,7 @@ const largeRankingLowestTask = [...large.data.tasks]
   .filter((task) => task.projectId === largeRankingInsertProjectId)
   .sort((left, right) => left.points - right.points)
   .at(0) ?? large.data.tasks[0];
-const largeRankingTaskUpdate = updateWhere(
+const largeRankingTaskUpdate = update(
   benchSchema.tasks,
   eq(taskRef.id, largeRankingLowestTask?.id ?? ''),
   { points: 15 }
@@ -335,7 +335,7 @@ const largeRankingHighestTask = [...large.data.tasks]
   .filter((task) => task.projectId === largeRankingInsertProjectId)
   .sort((left, right) => right.points - left.points)
   .at(0) ?? large.data.tasks[0];
-const largeRankingTaskDelete = deleteWhere(benchSchema.tasks, eq(taskRef.id, largeRankingHighestTask?.id ?? ''));
+const largeRankingTaskDelete = deleteRows(benchSchema.tasks, eq(taskRef.id, largeRankingHighestTask?.id ?? ''));
 const largeSnapshotMaterializedExpand = mat(createDb(large.data), {
   expandedTaskLabels: large.queries.expandedTaskLabels
 });
@@ -343,7 +343,7 @@ const largeIncrementalMaterializedExpand = mat(createDb(large.data), {
   expandedTaskLabels: large.queries.expandedTaskLabels
 }, { mode: 'incremental' });
 const largeExpandTask = large.data.tasks.find((task) => task.labels.length > 0) ?? large.data.tasks[0];
-const largeMaterializedExpandTaskLabelUpdate = updateWhere(
+const largeMaterializedExpandTaskLabelUpdate = update(
   benchSchema.tasks,
   eq(taskRef.id, largeExpandTask?.id ?? ''),
   {
@@ -361,7 +361,7 @@ const largeIncrementalMaterializedQualify = mat(createDb(large.data), {
   qualifiedActivePeople: largeQualifiedActivePeople
 }, { mode: 'incremental' });
 const largeQualifyPersonId = large.data.people.find((person) => person.active)?.id ?? '';
-const largeMaterializedQualifyPersonUpdate = updateWhere(
+const largeMaterializedQualifyPersonUpdate = update(
   benchSchema.people,
   eq(personRef.id, largeQualifyPersonId),
   { name: 'Qualified Person' }
@@ -372,7 +372,7 @@ const watchHandle = watch(watchBase, medium.queries.activePeople, () => undefine
 const trackedBase = watch(createDb(medium.data), medium.queries.activePeople, benchSchema.people);
 const trackedInsert = insert(benchSchema.people, extraPerson(300));
 const diffBefore = createDb(medium.data);
-const diffAfter = transact(diffBefore, updateWhere(benchSchema.people, eq(personRef.id, medium.data.people[1]?.id ?? ''), {
+const diffAfter = transact(diffBefore, update(benchSchema.people, eq(personRef.id, medium.data.people[1]?.id ?? ''), {
   active: false
 }));
 
@@ -386,8 +386,8 @@ async function trackLargeIncrementalJoinTaskInsert(): Promise<unknown> {
     change.maintenance !== 'incremental'
     || change.recomputed
     || change.rowChanges.length !== 1
-    || change.addedRows.length !== 1
-    || change.removedRows.length !== 0
+    || change.added.length !== 1
+    || change.removed.length !== 0
   ) {
     throw new Error('large joined materialization report expanded beyond the task insert delta');
   }

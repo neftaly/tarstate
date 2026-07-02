@@ -698,7 +698,7 @@ function evaluateQueryDataSync(
       return evaluateQueryDataSync(data.input, state, outerRow);
     case 'join':
       return joinRowsSync(data.kind, data.left, data.right, data.on, state, outerRow);
-    case 'select':
+    case 'project':
       return evaluateQueryDataSync(data.input, state, outerRow)
         .map((row) => projectRowSync(row, data.projection, state));
     case 'extend':

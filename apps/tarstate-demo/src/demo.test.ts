@@ -166,7 +166,8 @@ describe('Relic-style real-estate demo', () => {
       effects: { patches: 1, applied: 1 },
       snapshot: { revision: 1 }
     });
-    await expect(store.view(openOffersQuery).rows()).resolves.toEqual(expect.arrayContaining([
+    await store.view(openOffersQuery).refresh();
+    expect(store.view(openOffersQuery).rows()).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'offer-mill-mia-1' })
     ]));
 
@@ -176,7 +177,8 @@ describe('Relic-style real-estate demo', () => {
       effects: { patches: 1, applied: 1 },
       snapshot: { revision: 2 }
     });
-    await expect(store.view(openOffersQuery).rows()).resolves.not.toEqual(expect.arrayContaining([
+    await store.view(openOffersQuery).refresh();
+    expect(store.view(openOffersQuery).rows()).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'offer-garden-nico-2' })
     ]));
 
@@ -186,7 +188,8 @@ describe('Relic-style real-estate demo', () => {
       effects: { patches: 1, applied: 1 },
       snapshot: { revision: 3 }
     });
-    await expect(store.view(listingRowsQuery).rows()).resolves.toMatchObject([
+    await store.view(listingRowsQuery).refresh();
+    expect(store.view(listingRowsQuery).rows()).toMatchObject([
       { id: 'property-garden' },
       { id: 'property-mill' }
     ]);

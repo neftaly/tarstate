@@ -22,6 +22,8 @@ import {
   createStore,
   type Store,
   type StoreCommitResult,
+  type StoreQueryBatchResult,
+  type StoreQueryResult,
   type StoreRuntimeInput,
   type StoreSeedInput
 } from '@tarstate/core/store';
@@ -65,6 +67,113 @@ function openItemsQuery(): Query<OpenItemRow> {
 }
 
 describe('runtime-backed Store', () => {
+  it('previews accepted transactions against a store snapshot query batch', async () => {
+    const store = createStore({
+      items: [
+        { id: 'item-a', label: 'Alpha', done: false },
+        { id: 'item-b', label: 'Beta', done: true }
+      ]
+    });
+    const openItems = openItemsQuery();
+
+    const result = await store.whatIf({
+      open: openItems,
+      all: schema.items
+    }, [
+      items.updateByKey('item-a', { done: true }),
+      items.insert({ id: 'item-c', label: 'Gamma', done: false })
+    ]);
+
+    expectTypeOf(result).toEqualTypeOf<StoreQueryBatchResult<{
+      readonly open: Query<OpenItemRow>;
+      readonly all: typeof schema.items;
+    }>>();
+    expect(result).toMatchObject({
+      open: {
+        rows: [{ id: 'item-c', label: 'Gamma' }],
+        diagnostics: []
+      },
+      all: {
+        rows: [
+          { id: 'item-a', label: 'Alpha', done: true },
+          { id: 'item-b', label: 'Beta', done: true },
+          { id: 'item-c', label: 'Gamma', done: false }
+        ],
+        diagnostics: []
+      }
+    });
+    const mapped = await store.whatIf(
+      schema.items,
+      items.insert({ id: 'item-c', label: 'Gamma', done: false }),
+      { mapRows: (rows) => rows.map((row) => row.id) }
+    );
+    expectTypeOf(mapped).toEqualTypeOf<StoreQueryResult<string>>();
+    expect(mapped).toMatchObject({
+      rows: ['item-a', 'item-b', 'item-c'],
+      diagnostics: []
+    });
+    await expect(store.query(openItems)).resolves.toMatchObject({
+      rows: [{ id: 'item-a', label: 'Alpha' }],
+      diagnostics: []
+    });
+  });
+
+  it('returns transaction diagnostics when a preview transaction is rejected', async () => {
+    const store = createStore({
+      items: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+
+    const result = await store.whatIf(
+      schema.items,
+      items.insert({ id: 'item-a', label: 'Duplicate', done: true })
+    );
+
+    expectTypeOf(result).toEqualTypeOf<StoreQueryResult<ItemRow>>();
+    expect(result.rows).toEqual([{ id: 'item-a', label: 'Alpha', done: false }]);
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        code: 'duplicate_key',
+        message: 'duplicate relation key',
+        relation: 'items',
+        key: 'item-a'
+      })
+    ]);
+  });
+
+  it('does not publish or advance revision for previews', async () => {
+    const store = createStore({
+      items: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+    const initialSnapshot = store.getSnapshot();
+    const notified: number[] = [];
+    store.subscribe(() => {
+      notified.push(store.getSnapshot().revision);
+    });
+
+    await expect(store.whatIf(
+      schema.items,
+      items.insert({ id: 'item-b', label: 'Beta', done: false })
+    )).resolves.toMatchObject({
+      rows: [
+        { id: 'item-a', label: 'Alpha', done: false },
+        { id: 'item-b', label: 'Beta', done: false }
+      ]
+    });
+    await expect(store.whatIf(
+      schema.items,
+      items.insert({ id: 'item-a', label: 'Duplicate', done: true })
+    )).resolves.toMatchObject({
+      rows: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+
+    expect(store.getSnapshot()).toBe(initialSnapshot);
+    expect(store.getSnapshot().revision).toBe(0);
+    expect(notified).toEqual([]);
+    await expect(store.query(schema.items)).resolves.toMatchObject({
+      rows: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+  });
+
   it('accepts a transaction builder function for object-backed commits', async () => {
     const store = createStore({ items: [] });
 
@@ -119,8 +228,8 @@ describe('runtime-backed Store', () => {
       rows: [{ id: 'item-a', label: 'Alpha' }],
       diagnostics: []
     });
-    await expect(store.query('items', {
-      mapRows: (rows) => rows.map((row) => (row as ItemRow).id)
+    await expect(store.query(schema.items, {
+      mapRows: (rows) => rows.map((row) => row.id)
     })).resolves.toMatchObject({
       rows: ['item-a', 'item-b'],
       diagnostics: []
@@ -128,7 +237,7 @@ describe('runtime-backed Store', () => {
     await expect(store.queries({
       open: openItems,
       all: schema.items,
-      named: 'items'
+      named: schema.items
     })).resolves.toMatchObject({
       open: { rows: [{ id: 'item-a', label: 'Alpha' }] },
       all: {
@@ -144,7 +253,11 @@ describe('runtime-backed Store', () => {
         ]
       }
     });
-    await expect(store.view(openItems).rows()).resolves.toEqual([{ id: 'item-a', label: 'Alpha' }]);
+    const view = store.view(openItems);
+    await expect(view.refresh()).resolves.toMatchObject({
+      rows: [{ id: 'item-a', label: 'Alpha' }]
+    });
+    expect(view.rows()).toEqual([{ id: 'item-a', label: 'Alpha' }]);
 
     const initialSnapshot = store.getSnapshot();
     expect(initialSnapshot).toMatchObject({
@@ -209,12 +322,12 @@ describe('runtime-backed Store', () => {
 
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({
-      addedRows: [{ id: 'item-a', label: 'Alpha' }],
-      removedRows: []
+      added: [{ id: 'item-a', label: 'Alpha' }],
+      removed: []
     });
     expect(events[1]).toMatchObject({
-      addedRows: [],
-      removedRows: [{ id: 'item-a', label: 'Alpha' }]
+      added: [],
+      removed: [{ id: 'item-a', label: 'Alpha' }]
     });
     expect(handle.db).toBe(store.getSnapshot().db);
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });

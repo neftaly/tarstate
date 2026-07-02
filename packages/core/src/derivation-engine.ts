@@ -76,9 +76,9 @@ export type DerivedRowsDelta<Row = unknown> = {
   readonly kind: 'derivedRows';
   readonly inputDeltas: readonly RelationDelta[];
   readonly rowChanges: readonly RowChange<Row>[];
-  readonly addedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly updatedRows: readonly { readonly before: Row; readonly after: Row }[];
+  readonly added: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly updated: readonly { readonly before: Row; readonly after: Row }[];
   readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
 };
 
@@ -180,9 +180,9 @@ function refreshValue<Row>(
     kind: 'derivedRows',
     inputDeltas,
     rowChanges: diff.changes,
-    addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
-    removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
-    updatedRows: diff.changes.flatMap((change) =>
+    added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    updated: diff.changes.flatMap((change) =>
       change.kind === 'updated' ? [{ before: change.before, after: change.after }] : []
     ),
     diagnostics: diff.diagnostics

@@ -124,8 +124,7 @@ describe('public core exports', () => {
     expect(diffExports.diffRows([{ id: 'a' }], [{ id: 'b' }]).changes).toHaveLength(2);
     expect(diffExports.rowDiffKey({ id: 'a' }, { keyBy: ['id'] })).toBe(core.rowDiffKey({ id: 'a' }, { keyBy: ['id'] }));
     expect(writeExports.deleteRows(item, queryExports.eq(itemRow.id, 'a'))).toMatchObject({ op: 'delete' });
-    expect(core.agg).toBe(core.aggregate);
-    expect(core.pipe(core.from(itemRow), core.agg({ aggregates: { total: core.count() } })).data)
+    expect(core.pipe(core.from(itemRow), core.aggregate({ aggregates: { total: core.count() } })).data)
       .toMatchObject({ op: 'aggregate' });
     expect(typeof core.maxBy).toBe('function');
     expect(typeof core.minBy).toBe('function');

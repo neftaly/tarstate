@@ -40,7 +40,26 @@ export type ExprData<Value = unknown> =
     };
 
 export type PrimitiveValue = string | number | boolean | null | undefined;
-export type ExprInput<Value = unknown> = ExprData<Value> | PrimitiveValue;
+type IsUnknown<Value> = unknown extends Value ? ([Value] extends [unknown] ? true : false) : false;
+type ExprLiteralInput<Value> = IsUnknown<Value> extends true
+  ? PrimitiveValue
+  : Value extends PrimitiveValue
+    ? Value
+    : never;
+type WidenPrimitive<Value> = Value extends string
+  ? string
+  : Value extends number
+    ? number
+    : Value extends boolean
+      ? boolean
+      : Value;
+type ExprInputValue<Input> = Input extends ExprData<infer Value>
+  ? WidenPrimitive<Value>
+  : Input extends PrimitiveValue
+    ? WidenPrimitive<Input>
+    : never;
+type ComparableExprInput<Input extends ExprInput> = ExprInput<ExprInputValue<Input>>;
+export type ExprInput<Value = unknown> = ExprData<Value> | ExprLiteralInput<Value>;
 
 export type ComparisonOp = 'eq' | 'neq' | 'lt' | 'lte' | 'gt' | 'gte';
 export type AggregateFunction =
@@ -124,7 +143,7 @@ export type QueryData =
       readonly right: QueryData;
       readonly on: PredicateData;
     }
-  | { readonly op: 'select'; readonly input: QueryData; readonly projection: ProjectionData }
+  | { readonly op: 'project'; readonly input: QueryData; readonly projection: ProjectionData }
   | { readonly op: 'extend'; readonly input: QueryData; readonly projection: ProjectionData }
   | {
       readonly op: 'expand';
@@ -458,21 +477,14 @@ export function leftJoin<Right>(
   return joinQuery('left', right, predicate) as <Left>(left: Query<Left>) => Query<Left & Partial<Right>>;
 }
 
-/** Select result fields from expressions. */
+/** Project result fields from expressions. */
 export function project<Shape extends ProjectionShape>(
   projection: Shape
 ): <Ctx>(query: Query<Ctx>) => Query<ProjectedRow<Shape>> {
   return (query) => ({
-    data: { op: 'select', input: query.data, projection },
+    data: { op: 'project', input: query.data, projection },
     relations: { ...query.relations, ...relationsForProjection(projection) }
   }) as Query<ProjectedRow<Shape>>;
-}
-
-/** Alias for project, matching Relic-style naming. */
-export function select<Shape extends ProjectionShape>(
-  projection: Shape
-): <Ctx>(query: Query<Ctx>) => Query<ProjectedRow<Shape>> {
-  return project(projection);
 }
 
 /** Extend each row with computed fields. */
@@ -594,11 +606,6 @@ export function qualify<Alias extends string>(alias: Alias): <Ctx>(query: Query<
   }) as Query<Record<Alias, Ctx>>;
 }
 
-/** Alias for `qualify`, for explicit row-shape qualification call sites. */
-export function qualifyRow<Alias extends string>(alias: Alias): <Ctx>(query: Query<Ctx>) => Query<Record<Alias, Ctx>> {
-  return qualify(alias);
-}
-
 /** Group rows and compute aggregate projections. */
 export function aggregate<GroupBy extends ProjectionShape, Aggregates extends ProjectionShape>(
   config: AggregateConfig<GroupBy, Aggregates>
@@ -618,36 +625,33 @@ export function aggregate<GroupBy extends ProjectionShape, Aggregates extends Pr
   }) as Query<ProjectedRow<GroupBy> & ProjectedRow<Aggregates>>;
 }
 
-/** Relic-shaped alias for `aggregate`. */
-export const agg = aggregate;
-
 /** Compare expressions or primitive literals with strict equality. */
-export function eq(left: ExprInput, right: ExprInput): PredicateData {
+export function eq<const Left extends ExprInput>(left: Left, right: ComparableExprInput<Left>): PredicateData {
   return comparison('eq', left, right);
 }
 
 /** Compare expressions or primitive literals with strict inequality. */
-export function neq(left: ExprInput, right: ExprInput): PredicateData {
+export function neq<const Left extends ExprInput>(left: Left, right: ComparableExprInput<Left>): PredicateData {
   return comparison('neq', left, right);
 }
 
 /** Compare whether the left expression is less than the right expression. */
-export function lt(left: ExprInput, right: ExprInput): PredicateData {
+export function lt<const Left extends ExprInput>(left: Left, right: ComparableExprInput<Left>): PredicateData {
   return comparison('lt', left, right);
 }
 
 /** Compare whether the left expression is less than or equal to the right expression. */
-export function lte(left: ExprInput, right: ExprInput): PredicateData {
+export function lte<const Left extends ExprInput>(left: Left, right: ComparableExprInput<Left>): PredicateData {
   return comparison('lte', left, right);
 }
 
 /** Compare whether the left expression is greater than the right expression. */
-export function gt(left: ExprInput, right: ExprInput): PredicateData {
+export function gt<const Left extends ExprInput>(left: Left, right: ComparableExprInput<Left>): PredicateData {
   return comparison('gt', left, right);
 }
 
 /** Compare whether the left expression is greater than or equal to the right expression. */
-export function gte(left: ExprInput, right: ExprInput): PredicateData {
+export function gte<const Left extends ExprInput>(left: Left, right: ComparableExprInput<Left>): PredicateData {
   return comparison('gte', left, right);
 }
 
@@ -895,7 +899,7 @@ function collectDependencies(data: QueryData, names: Set<string>): void {
         collectExprDependencies(expression, names);
       }
       return;
-    case 'select':
+    case 'project':
     case 'extend':
       collectDependencies(data.input, names);
       collectProjectionDependencies(data.projection, names);
@@ -953,7 +957,7 @@ function rowKeyFieldsForData(data: QueryData): readonly string[] | undefined {
     case 'limit':
     case 'sortLimit':
       return rowKeyFieldsForData(data.input);
-    case 'select':
+    case 'project':
       return projectedRowKeyFields(rowKeyFieldsForData(data.input), data.projection);
     case 'without':
       return retainedRowKeyFields(rowKeyFieldsForData(data.input), data.fields);

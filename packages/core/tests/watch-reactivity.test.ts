@@ -78,13 +78,13 @@ describe('watch reactivity', () => {
     const watchedChange = tracked.changes.find((change) => change.target === activeUsers);
 
     expect(materializedChange).toMatchObject({
-      addedRows: [{ id: 'dia', name: 'Dia' }],
-      removedRows: [],
+      added: [{ id: 'dia', name: 'Dia' }],
+      removed: [],
       rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'dia', name: 'Dia' } })]
     });
     expect(watchedChange).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'dia', name: 'Dia' }],
+      added: [{ id: 'dia', name: 'Dia' }],
       rowChanges: materializedChange?.rowChanges
     });
     expect(tracked.changes.filter((change) => change.target === activeUsers)).toHaveLength(1);
@@ -125,7 +125,7 @@ describe('watch reactivity', () => {
 
     expect(oldDbResult.changes).toEqual([]);
     expect(second.changes.find((change) => change.id === handle.id)).toMatchObject({
-      addedRows: [{ id: 'fay', name: 'Fay' }]
+      added: [{ id: 'fay', name: 'Fay' }]
     });
     expect(primaryEvents).toHaveLength(2);
     expect(subscriberEvents).toHaveLength(1);
@@ -153,24 +153,56 @@ describe('watch reactivity', () => {
     expect(committed).toMatchObject({ status: 'accepted', reflected: true });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
-      addedRows: [{ id: 'dia', name: 'Dia' }]
+      added: [{ id: 'dia', name: 'Dia' }]
     });
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
   });
 
-  it('passes read options through store views', async () => {
+  it('caches store views and keeps rows stable across unchanged revisions', async () => {
     const store = createStore(createDb({ users: baseUsers }));
     const view = store.view(activeUsers);
+    const notifications: number[] = [];
 
-    await expect(view.rows({ rsort: 'name' })).resolves.toEqual([
-      { id: 'bea', name: 'Bea' },
-      { id: 'ada', name: 'Ada' }
-    ]);
-    await expect(view.refresh({
-      sort: 'name',
-      mapRows: (rows) => rows.map((row) => row.id)
-    })).resolves.toMatchObject({
-      rows: ['ada', 'bea']
+    expect(store.view(activeUsers)).toBe(view);
+
+    const first = await view.refresh();
+    const rows = view.rows();
+    const unsubscribe = view.subscribe(() => {
+      notifications.push(view.getSnapshot().revision);
     });
+
+    expect(view.getSnapshot()).toBe(first);
+    expect(view.read()).toBe(first);
+    expect(rows).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
+    ]);
+    expect(view.rows()).toBe(rows);
+
+    await expect(view.refresh()).resolves.toBe(first);
+    expect(view.rows()).toBe(rows);
+
+    await store.commit(insert(schema.users, { id: 'eli', name: 'Eli', active: false }));
+    await expect(view.refresh()).resolves.toBe(first);
+    expect(view.rows()).toBe(rows);
+    expect(notifications).toEqual([]);
+
+    await store.refresh();
+    await expect(view.refresh()).resolves.toBe(first);
+    expect(view.rows()).toBe(rows);
+    expect(notifications).toEqual([]);
+
+    await store.commit(insert(schema.users, { id: 'dia', name: 'Dia', active: true }));
+    const changed = await view.refresh();
+    expect(changed).not.toBe(first);
+    expect(view.rows()).not.toBe(rows);
+    expect(view.rows()).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' },
+      { id: 'dia', name: 'Dia' }
+    ]);
+    expect(notifications).toEqual([3]);
+
+    unsubscribe();
   });
 });

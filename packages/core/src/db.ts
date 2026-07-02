@@ -22,14 +22,14 @@ import {
   deleteByKey as writeDeleteByKey,
   updateByKey as writeUpdateByKey,
   deleteExact as writeDeleteExact,
-  deleteWhere as writeDeleteWhere,
+  deleteRows as writeDeleteRows,
   insert as writeInsert,
   insertIgnore as writeInsertIgnore,
   insertOrMerge as writeInsertOrMerge,
   insertOrReplace as writeInsertOrReplace,
   insertOrUpdate as writeInsertOrUpdate,
   replaceAll as writeReplaceAll,
-  updateWhere as writeUpdateWhere,
+  update as writeUpdate,
   isWritePatch,
   type DeleteByKeyPatch,
   type DeleteExactPatch,
@@ -127,11 +127,6 @@ export type DbTransactionBuilder = {
     predicate: PredicateData,
     changes: RelationRowUpdateInput<Relation>
   ) => UpdatePatch<Relation>;
-  readonly updateWhere: <Relation extends RelationRef>(
-    relation: Relation,
-    predicate: PredicateData,
-    changes: RelationRowUpdateInput<Relation>
-  ) => UpdatePatch<Relation>;
   readonly insertOrMerge: <Relation extends RelationRef>(
     relation: Relation,
     row: Partial<RelationRow<Relation>>,
@@ -147,10 +142,6 @@ export type DbTransactionBuilder = {
     key: RelationKeyInput
   ) => DeleteByKeyPatch<Relation>;
   readonly delete: <Relation extends RelationRef>(
-    relation: Relation,
-    predicate: PredicateData
-  ) => DeletePatch<Relation>;
-  readonly deleteWhere: <Relation extends RelationRef>(
     relation: Relation,
     predicate: PredicateData
   ) => DeletePatch<Relation>;
@@ -181,13 +172,6 @@ export type DbTransactionPlan = {
   readonly envDeltas: readonly MaterializationEnvDelta[];
   readonly envUpdates: number;
 };
-export type DbWritePredicate<Relation extends RelationRef> = (
-  row: RelationRow<Relation>,
-  index: number,
-  db: Db
-) => boolean;
-export type DbWriteKey = RelationKeyInput;
-export type DbWriteMatcher<Relation extends RelationRef> = DbWriteKey | DbWritePredicate<Relation>;
 
 type RelationQueryRow<QueryValue> = QueryValue extends Query<infer Row>
   ? Row
@@ -467,47 +451,6 @@ export async function exists<Row>(
   return (await row(db, query, ...whereClausesOrOptions)) !== undefined;
 }
 
-export function dbUpdateWhere<Relation extends RelationRef>(
-  relation: Relation,
-  key: DbWriteKey,
-  changes: RelationRowUpdateInput<Relation>
-): UpdateByKeyPatch<Relation>;
-export function dbUpdateWhere<Relation extends RelationRef>(
-  relation: Relation,
-  predicate: DbWritePredicate<Relation>,
-  changes: RelationRowUpdateInput<Relation>
-): (_db: Db) => readonly UpdateByKeyPatch<Relation>[];
-export function dbUpdateWhere<Relation extends RelationRef>(
-  relation: Relation,
-  keyOrPredicate: DbWriteMatcher<Relation>,
-  changes: RelationRowUpdateInput<Relation>
-): UpdateByKeyPatch<Relation> | ((_db: Db) => readonly UpdateByKeyPatch<Relation>[]) {
-  return typeof keyOrPredicate === 'function'
-    ? (db) => rowsMatching(db, relation, keyOrPredicate).map((row) =>
-        writeUpdateByKey(relation, keyForDbWrite(relation, row), changes)
-      )
-    : writeUpdateByKey(relation, keyOrPredicate, changes);
-}
-
-export function dbDeleteWhere<Relation extends RelationRef>(
-  relation: Relation,
-  key: DbWriteKey
-): DeleteByKeyPatch<Relation>;
-export function dbDeleteWhere<Relation extends RelationRef>(
-  relation: Relation,
-  predicate: DbWritePredicate<Relation>
-): (_db: Db) => readonly DeleteByKeyPatch<Relation>[];
-export function dbDeleteWhere<Relation extends RelationRef>(
-  relation: Relation,
-  keyOrPredicate: DbWriteMatcher<Relation>
-): DeleteByKeyPatch<Relation> | ((_db: Db) => readonly DeleteByKeyPatch<Relation>[]) {
-  return typeof keyOrPredicate === 'function'
-    ? (db) => rowsMatching(db, relation, keyOrPredicate).map((row) =>
-        writeDeleteByKey(relation, keyForDbWrite(relation, row))
-      )
-    : writeDeleteByKey(relation, keyOrPredicate);
-}
-
 export function whatIf<Row, MappedRow>(
   db: Db,
   query: QueryOrRelation<Row>,
@@ -708,29 +651,6 @@ function mappedResult<Row, MappedRow>(
   } as QueryResult<Row> | QueryResult<MappedRow>;
 }
 
-function rowsMatching<Relation extends RelationRef>(
-  db: Db,
-  relation: Relation,
-  predicate: DbWritePredicate<Relation>
-): readonly RelationRow<Relation>[] {
-  const rows = dbEngineFor(db).read()[relation.name] ?? [];
-  return rows.filter((row, index) =>
-    isRecord(row) && predicate(row as RelationRow<Relation>, index, db)
-  ) as readonly RelationRow<Relation>[];
-}
-
-function keyForDbWrite<Relation extends RelationRef>(relation: Relation, row: RelationRow<Relation>): DbWriteKey {
-  if (Array.isArray(relation.key)) {
-    return relation.key.map((field) => (row as Record<string, unknown>)[field]);
-  }
-
-  if (typeof relation.key !== 'string') {
-    return '';
-  }
-
-  return (row as Record<string, unknown>)[relation.key] as DbWriteKey;
-}
-
 function transactionContext(db: Db): DbTransactionContext {
   return {
     ...db,
@@ -738,13 +658,11 @@ function transactionContext(db: Db): DbTransactionContext {
     insertIgnore: writeInsertIgnore,
     insertOrReplace: writeInsertOrReplace,
     updateByKey: writeUpdateByKey,
-    update: writeUpdateWhere,
-    updateWhere: writeUpdateWhere,
+    update: writeUpdate,
     insertOrMerge: writeInsertOrMerge,
     insertOrUpdate: writeInsertOrUpdate,
     deleteByKey: writeDeleteByKey,
-    delete: writeDeleteWhere,
-    deleteWhere: writeDeleteWhere,
+    delete: writeDeleteRows,
     deleteExact: writeDeleteExact,
     replaceAll: writeReplaceAll
   };

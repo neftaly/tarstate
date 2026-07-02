@@ -227,8 +227,8 @@ export type MaterializationMaintenanceChange<Row = unknown> = {
   readonly previousRowsAvailable: boolean;
   readonly previousRows: readonly Row[] | undefined;
   readonly rows: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly removed: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
   readonly diagnostics: readonly MaterializationDiagnostic[];
 };
@@ -618,8 +618,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
         previousRowsAvailable: true,
         previousRows: materializationRows(stored),
         rows: materializationRows(stored),
-        addedRows: [],
-        removedRows: [],
+        added: [],
+        removed: [],
         rowChanges: [],
         diagnostics: []
       };
@@ -658,8 +658,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
       previousRowsAvailable: true,
       previousRows: materializationRows(stored),
       rows: refresh.snapshot.rows,
-      addedRows: refresh.delta.addedRows,
-      removedRows: refresh.delta.removedRows,
+      added: refresh.delta.added,
+      removed: refresh.delta.removed,
       rowChanges: refresh.delta.rowChanges,
       diagnostics: refresh.delta.diagnostics
     };
@@ -1447,7 +1447,7 @@ function evaluateData(target: MaterializationEvalTarget, data: QueryData, outerR
       return evaluateData(target, data.input, outerRow);
     case 'join':
       return joinRows(target, data.kind, data.left, data.right, data.on, outerRow);
-    case 'select':
+    case 'project':
       return evaluateData(target, data.input, outerRow).map((row) => projectRow(row, data.projection, target));
     case 'extend':
       return evaluateData(target, data.input, outerRow).map((row) => ({ ...asRecord(row), ...projectRow(row, data.projection, target) }));
@@ -2084,7 +2084,7 @@ function collectExpressions(data: QueryData, expressions: ExprData[]): void {
     case 'qualify':
       collectExpressions(data.input, expressions);
       return;
-    case 'select':
+    case 'project':
     case 'extend':
       collectExpressions(data.input, expressions);
       collectProjectionExpressions(data.projection, expressions);
@@ -2268,7 +2268,7 @@ function collectIndexSpecs(
       return;
     case 'where':
     case 'keyBy':
-    case 'select':
+    case 'project':
     case 'extend':
     case 'expand':
     case 'without':
@@ -2574,7 +2574,7 @@ function collectRelationAliases(data: QueryData, aliases: Map<string, string>): 
     case 'hash':
     case 'btree':
     case 'keyBy':
-    case 'select':
+    case 'project':
     case 'extend':
     case 'expand':
     case 'without':
@@ -2628,7 +2628,7 @@ function relationProjectionShapeForData(
     case 'btree':
     case 'keyBy':
       return relationProjectionShapeForData(data.input, relations);
-    case 'select': {
+    case 'project': {
       const input = relationProjectionShapeForData(data.input, relations);
       const relation = input === undefined ? undefined : relations[input.relation];
       return input !== undefined &&

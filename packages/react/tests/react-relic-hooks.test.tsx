@@ -7,11 +7,15 @@ import {
   useDb,
   useMaterialized,
   useQuery,
+  useRow,
   useTarstateSnapshot,
+  useView,
   useWatch,
   type MaterializedHookState,
   type QueryHookState,
+  type RowHookState,
   type TarstateDbSnapshot,
+  type ViewHookState,
   type WatchHookState
 } from '@tarstate/react';
 import { createStore, type Store, type StoreCommitResult } from '@tarstate/core/store';
@@ -67,18 +71,20 @@ describe('@tarstate/react DB-first hooks', () => {
     expect(useCommit).toBeTypeOf('function');
     expect(useDb).toBeTypeOf('function');
     expect(useQuery).toBeTypeOf('function');
+    expect(useView).toBeTypeOf('function');
+    expect(useRow).toBeTypeOf('function');
     expect(useMaterialized).toBeTypeOf('function');
     expect(useWatch).toBeTypeOf('function');
   });
 
-  it('renders core query rows and commits through the provider Store', async () => {
+  it('renders core view rows and commits through the provider Store', async () => {
     const store = createStore({
       items: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
     await expect(store.query(schema.items)).resolves.toMatchObject({
       rows: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
-    await expect(store.query('items')).resolves.toMatchObject({
+    await expect(store.query(schema.items)).resolves.toMatchObject({
       rows: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
     const probe = await renderProbe(store);
@@ -86,6 +92,12 @@ describe('@tarstate/react DB-first hooks', () => {
     await waitFor(() => probe.query.status === 'ready');
 
     expect(probe.db).toBe(store.getSnapshot().db);
+    expect(probe.view).toMatchObject({
+      status: 'ready',
+      rows: [{ id: 'item-a', label: 'Alpha', done: false }],
+      revision: 0
+    });
+    expect(probe.view.queryKey).toBe(probe.view.view?.queryKey);
     expect(probe.query.rows).toEqual([{ id: 'item-a', label: 'Alpha', done: false }]);
     expect(probe.query.data).toEqual(['Alpha']);
     expect(probe.snapshot.revision).toBe(0);
@@ -112,6 +124,30 @@ describe('@tarstate/react DB-first hooks', () => {
       { id: 'item-a', label: 'Alpha', done: false },
       { id: 'item-b', label: 'Beta', done: true }
     ]);
+    expect(probe.view.rows).toEqual(probe.query.rows);
+  });
+
+  it('selects a single row by predicate or explicit key mapper', async () => {
+    const store = createStore({
+      items: [
+        { id: 'item-a', label: 'Alpha', done: false },
+        { id: 'item-b', label: 'Beta', done: true }
+      ]
+    });
+    const probe = await renderRowProbe(store);
+
+    await waitFor(() => probe.byPredicate.status === 'ready' && probe.byKey.status === 'ready');
+
+    expect(probe.byPredicate.row).toEqual({ id: 'item-a', label: 'Alpha', done: false });
+    expect(probe.byKey.row).toEqual({ id: 'item-b', label: 'Beta', done: true });
+
+    await act(async () => {
+      await store.commit(updateByKey(schema.items, 'item-a', { done: true }));
+    });
+    await waitFor(() => probe.byPredicate.revision === 1 && probe.byPredicate.status === 'ready');
+
+    expect(probe.byPredicate.row).toBeUndefined();
+    expect(probe.byKey.row).toEqual({ id: 'item-b', label: 'Beta', done: true });
   });
 
   it('does not publish rejected commits', async () => {
@@ -315,6 +351,7 @@ describe('@tarstate/react DB-first hooks', () => {
 
 type ProbeState = {
   readonly db: Db;
+  readonly view: ViewHookState<ItemProjection>;
   readonly query: QueryHookState<ItemProjection, readonly string[]>;
   readonly snapshot: TarstateDbSnapshot;
   readonly commit: Store['commit'];
@@ -331,9 +368,40 @@ async function renderProbe(store: Store): Promise<RenderedProbe> {
   function Probe() {
     current = {
       db: useDb(),
+      view: useView(itemQuery),
       query: useQuery(itemQuery, { select: (rows) => rows.map((row) => row.label) }),
       snapshot: useTarstateSnapshot(),
       commit: useCommit()
+    };
+    return null;
+  }
+
+  await act(async () => {
+    renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+  });
+
+  assertDefined(renderer);
+  assertDefined(current);
+  return live(() => current, renderer);
+}
+
+type RowProbeState = {
+  readonly byPredicate: RowHookState<ItemProjection>;
+  readonly byKey: RowHookState<ItemProjection>;
+};
+
+type RenderedRowProbe = RowProbeState & {
+  readonly renderer: ReactTestRenderer;
+};
+
+async function renderRowProbe(store: Store): Promise<RenderedRowProbe> {
+  let current: RowProbeState | undefined;
+  let renderer: ReactTestRenderer | undefined;
+
+  function Probe() {
+    current = {
+      byPredicate: useRow(itemQuery, (row) => !row.done),
+      byKey: useRow(itemQuery, 'item-b', { keyBy: (row) => row.id })
     };
     return null;
   }

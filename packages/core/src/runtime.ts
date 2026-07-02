@@ -40,11 +40,8 @@ export type TrackTransactChangeView<Row = unknown> = {
   readonly targetKey: string;
   readonly target: QueryChangeTarget<Row>;
   readonly added: readonly Row[];
-  readonly deleted: readonly Row[];
   readonly removed: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: TrackedChange<Row>['rowChanges'];
 };
 export type TrackTransactQueryChanges<Row = unknown> = Readonly<Record<string, TrackTransactChangeView<Row>>>;
@@ -370,11 +367,8 @@ function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChan
     previousRows: delta.removed,
     rows: delta.added,
     added: delta.added,
-    deleted: delta.removed,
-    addedRows: delta.added,
-    deletedRows: delta.removed,
-    removedRows: delta.removed,
-    unchangedRows: [],
+    removed: delta.removed,
+    unchanged: [],
     rowChanges: [
       ...delta.removed.map((row) => ({ kind: 'removed' as const, key: JSON.stringify(row), row })),
       ...delta.added.map((row) => ({ kind: 'added' as const, key: JSON.stringify(row), row }))
@@ -390,11 +384,8 @@ function trackChangeViewsByQueryKey(changes: readonly TrackedChange[]): TrackTra
       targetKey: change.targetKey,
       target: change.target,
       added: change.added,
-      deleted: change.deleted,
-      removed: change.removedRows,
-      addedRows: change.addedRows,
-      deletedRows: change.deletedRows,
-      removedRows: change.removedRows,
+      removed: change.removed,
+      unchanged: change.unchanged,
       rowChanges: change.rowChanges
     }]));
 }

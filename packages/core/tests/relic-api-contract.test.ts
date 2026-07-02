@@ -34,7 +34,7 @@ import {
   unique,
   unwatch,
   updateEnv,
-  updateWhere,
+  update,
   value,
   watch,
   where,
@@ -167,7 +167,7 @@ describe('Relic public TypeScript API contract', () => {
       state,
       insert(coreSchema.users, { ...adaUser, id: 'ada-copy' }),
       txBuilder,
-      updateWhere(coreSchema.users, eq(as(coreSchema.users, 'user').id, 'ada'), { age: 38 })
+      update(coreSchema.users, eq(as(coreSchema.users, 'user').id, 'ada'), { age: 38 })
     );
     const rejected = tryTransact(next, insert(coreSchema.users, { ...adaUser, name: 'Duplicate Ada' }));
     const withExplicitEnv = withEnv(next, { minimumAge: 40 });

@@ -51,8 +51,6 @@ export type UpdatePatch<Relation extends RelationRef = RelationRef> = {
   readonly changes: RelationRowUpdate<Relation>;
 };
 
-export type UpdateWherePatch<Relation extends RelationRef = RelationRef> = UpdatePatch<Relation>;
-
 export type InsertOrMergePatch<Relation extends RelationRef = RelationRef> = {
   readonly op: 'insertOrMerge';
   readonly relation: Relation;
@@ -95,8 +93,6 @@ export type DeletePatch<Relation extends RelationRef = RelationRef> = {
   readonly predicate: PredicateData;
 };
 
-export type DeleteWherePatch<Relation extends RelationRef = RelationRef> = DeletePatch<Relation>;
-
 export type DeleteExactPatch<Relation extends RelationRef = RelationRef> = {
   readonly op: 'deleteExact';
   readonly relation: Relation;
@@ -116,12 +112,10 @@ export type WritePatch<Relation extends RelationRef = RelationRef> =
   | InsertOrReplacePatch<Relation>
   | UpdateByKeyPatch<Relation>
   | UpdatePatch<Relation>
-  | UpdateWherePatch<Relation>
   | InsertOrMergePatch<Relation>
   | InsertOrUpdatePatch<Relation>
   | DeleteByKeyPatch<Relation>
   | DeletePatch<Relation>
-  | DeleteWherePatch<Relation>
   | DeleteExactPatch<Relation>
   | ReplaceAllPatch<Relation>;
 
@@ -143,10 +137,6 @@ export type RelationWriter<Relation extends RelationRef> = {
     predicate: PredicateData,
     changes: RelationRowUpdateInput<Relation>
   ) => UpdatePatch<Relation>;
-  readonly updateWhere: (
-    predicate: PredicateData,
-    changes: RelationRowUpdateInput<Relation>
-  ) => UpdateWherePatch<Relation>;
   readonly insertOrMerge: (
     row: RelationRowUpdate<Relation>,
     options?: InsertOrMergeOptions<Relation>
@@ -157,7 +147,6 @@ export type RelationWriter<Relation extends RelationRef> = {
   ) => InsertOrUpdatePatch<Relation>;
   readonly deleteByKey: (key: RelationKeyInput) => DeleteByKeyPatch<Relation>;
   readonly delete: (predicate: PredicateData) => DeletePatch<Relation>;
-  readonly deleteWhere: (predicate: PredicateData) => DeleteWherePatch<Relation>;
   readonly deleteExact: (row: RelationRow<Relation>) => DeleteExactPatch<Relation>;
   readonly replaceAll: (rows: readonly RelationRow<Relation>[]) => ReplaceAllPatch<Relation>;
 };
@@ -170,12 +159,10 @@ export function write<Relation extends RelationRef>(relation: Relation): Relatio
     insertOrReplace: (row) => insertOrReplace(relation, row),
     updateByKey: (key, changes) => updateByKey(relation, key, changes),
     update: (predicate, changes) => update(relation, predicate, changes),
-    updateWhere: (predicate, changes) => updateWhere(relation, predicate, changes),
     insertOrMerge: (row, options) => insertOrMerge(relation, row, options),
     insertOrUpdate: (row, options) => insertOrUpdate(relation, row, options),
     deleteByKey: (key) => deleteByKey(relation, key),
     delete: (predicate) => deleteRows(relation, predicate),
-    deleteWhere: (predicate) => deleteWhere(relation, predicate),
     deleteExact: (row) => deleteExact(relation, row),
     replaceAll: (rows) => replaceAll(relation, rows)
   };
@@ -232,15 +219,6 @@ export function update<Relation extends RelationRef>(
   return { op: 'update', relation, predicate, changes: changes as RelationRowUpdate<Relation> };
 }
 
-/** Compatibility alias for predicate updates. Prefer `update`. */
-export function updateWhere<Relation extends RelationRef>(
-  relation: Relation,
-  predicate: PredicateData,
-  changes: RelationRowUpdateInput<Relation>
-): UpdateWherePatch<Relation> {
-  return update(relation, predicate, changes);
-}
-
 /** Create an insert-or-merge patch. */
 export function insertOrMerge<Relation extends RelationRef>(
   relation: Relation,
@@ -286,17 +264,6 @@ export function deleteRows<Relation extends RelationRef>(
   predicate: PredicateData
 ): DeletePatch<Relation> {
   return { op: 'delete', relation, predicate };
-}
-
-/** Relic-style predicate delete export. `deleteRows` is easier to import in TypeScript call sites. */
-export { deleteRows as delete };
-
-/** Predicate delete alias for query-like call sites. */
-export function deleteWhere<Relation extends RelationRef>(
-  relation: Relation,
-  predicate: PredicateData
-): DeleteWherePatch<Relation> {
-  return deleteRows(relation, predicate);
 }
 
 /** Create a delete-exact patch that only removes a row when all supplied values match. */

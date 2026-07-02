@@ -49,11 +49,8 @@ export type WatchEvent<Row = unknown> = {
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly added: readonly Row[];
-  readonly deleted: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
   readonly changes: ChangeSet;
   readonly diagnostics: readonly WatchRuntimeDiagnostic<Row>[];
@@ -73,11 +70,8 @@ export type WatchRefreshResult<Row = unknown> = {
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly added: readonly Row[];
-  readonly deleted: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
   readonly diagnostics: readonly WatchRuntimeDiagnostic<Row>[];
 };
@@ -132,11 +126,8 @@ export type TrackedChange<Row = unknown> = {
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly added: readonly Row[];
-  readonly deleted: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
   readonly diagnostics: readonly WatchRuntimeDiagnostic[];
 };
@@ -147,11 +138,8 @@ export type WatchTargetChange<Row = unknown> = {
   readonly target: WatchTarget<Row>;
   readonly changed: boolean;
   readonly added: readonly Row[];
-  readonly deleted: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
   readonly diagnostics: readonly WatchRuntimeDiagnostic[];
 };
@@ -168,10 +156,9 @@ export type QueryDiff<Row = unknown> = {
   readonly beforeRows: readonly Row[];
   readonly afterRows: readonly Row[];
   readonly changed: boolean;
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
   readonly diagnostics: readonly QueryDiffDiagnostic<Row>[];
 };
@@ -323,11 +310,8 @@ function watchTargetChange<Row>(change: TrackedChange<Row>): WatchTargetChange<R
     target: change.target,
     changed: change.changed,
     added: change.added,
-    deleted: change.deleted,
-    addedRows: change.addedRows,
-    deletedRows: change.deletedRows,
-    removedRows: change.removedRows,
-    unchangedRows: change.unchangedRows,
+    removed: change.removed,
+    unchanged: change.unchanged,
     rowChanges: change.rowChanges,
     diagnostics: change.diagnostics
   };
@@ -344,11 +328,8 @@ function mergeWatchTargetChanges<Row>(
     target: left.target,
     changed: left.changed || right.changed,
     added: [...left.added, ...right.added],
-    deleted: [...left.deleted, ...right.deleted],
-    addedRows: [...left.addedRows, ...right.addedRows],
-    deletedRows: [...left.deletedRows, ...right.deletedRows],
-    removedRows: [...left.removedRows, ...right.removedRows],
-    unchangedRows: [...left.unchangedRows, ...right.unchangedRows],
+    removed: [...left.removed, ...right.removed],
+    unchanged: [...left.unchanged, ...right.unchanged],
     rowChanges: [...left.rowChanges, ...right.rowChanges],
     diagnostics: [...left.diagnostics, ...right.diagnostics]
   };
@@ -466,10 +447,9 @@ export async function diffQuery<Row>(
     beforeRows,
     afterRows,
     changed: diff.changes.length > 0,
-    addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
-    deletedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
-    removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
-    unchangedRows: afterRows.filter((row) => !changedKeys.has(rowKey(row, diffOptionsForTarget(target, options)))),
+    added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    unchanged: afterRows.filter((row) => !changedKeys.has(rowKey(row, diffOptionsForTarget(target, options)))),
     rowChanges: diff.changes,
     diagnostics: diff.diagnostics
   };
@@ -623,11 +603,8 @@ function trackedChangeFromWatchEvent<Row>(event: WatchEvent<Row>): TrackedChange
     previousRows: event.previousRows,
     rows: event.rows,
     added: event.added,
-    deleted: event.deleted,
-    addedRows: event.addedRows,
-    deletedRows: event.deletedRows,
-    removedRows: event.removedRows,
-    unchangedRows: event.unchangedRows,
+    removed: event.removed,
+    unchanged: event.unchanged,
     rowChanges: event.rowChanges,
     diagnostics: event.diagnostics
   };
@@ -644,8 +621,8 @@ function buildWatchEvent<Row>(
   const diffOptions = diffOptionsForTarget(target, options);
   const diff = diffRows(previousRows, rows, diffOptions);
   const changedKeys = new Set(diff.changes.map((change) => change.key));
-  const added = addedAliasRows(diff.changes, target);
-  const deleted = deletedAliasRows(diff.changes, target);
+  const added = rowsAddedByChanges(diff.changes, target);
+  const removed = rowsRemovedByChanges(diff.changes, target);
   return {
     kind: 'watchEvent',
     id,
@@ -655,11 +632,8 @@ function buildWatchEvent<Row>(
     previousRows,
     rows,
     added,
-    deleted,
-    addedRows: added,
-    deletedRows: deleted,
-    removedRows: deleted,
-    unchangedRows: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
+    removed,
+    unchanged: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
     rowChanges: diff.changes,
     changes,
     diagnostics: diff.diagnostics
@@ -678,8 +652,8 @@ function buildWatchEventFromRows<Row>(
 ): WatchEvent<Row> {
   const diffOptions = diffOptionsForTarget(target, options);
   const changedKeys = new Set(rowChanges.map((change) => change.key));
-  const added = addedAliasRows(rowChanges, target);
-  const deleted = deletedAliasRows(rowChanges, target);
+  const added = rowsAddedByChanges(rowChanges, target);
+  const removed = rowsRemovedByChanges(rowChanges, target);
   return {
     kind: 'watchEvent',
     id,
@@ -689,11 +663,8 @@ function buildWatchEventFromRows<Row>(
     previousRows,
     rows,
     added,
-    deleted,
-    addedRows: added,
-    deletedRows: deleted,
-    removedRows: deleted,
-    unchangedRows: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
+    removed,
+    unchanged: rows.filter((row) => !changedKeys.has(rowKey(row, diffOptions))),
     rowChanges,
     changes,
     diagnostics
@@ -743,7 +714,7 @@ function materializedRefreshEvent<Db extends WatchDb, Row>(
     );
 }
 
-function addedAliasRows<Row>(
+function rowsAddedByChanges<Row>(
   changes: readonly RowChange<Row>[],
   target: WatchTarget<Row>
 ): readonly Row[] {
@@ -754,7 +725,7 @@ function addedAliasRows<Row>(
   });
 }
 
-function deletedAliasRows<Row>(
+function rowsRemovedByChanges<Row>(
   changes: readonly RowChange<Row>[],
   target: WatchTarget<Row>
 ): readonly Row[] {
@@ -790,11 +761,8 @@ function emptyWatchRefresh<Row>(id: string, target: WatchTarget<Row>): WatchRefr
     previousRows: [],
     rows: [],
     added: [],
-    deleted: [],
-    addedRows: [],
-    deletedRows: [],
-    removedRows: [],
-    unchangedRows: [],
+    removed: [],
+    unchanged: [],
     rowChanges: [],
     diagnostics: []
   };

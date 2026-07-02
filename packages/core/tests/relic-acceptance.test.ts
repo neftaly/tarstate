@@ -77,7 +77,7 @@ import {
   union,
   unwatch,
   updateEnv,
-  updateWhere,
+  update,
   uniqueIndex,
   value,
   whatIf,
@@ -391,7 +391,7 @@ describe('TypeScript Relic core acceptance', () => {
     const hypothetical = await whatIf(
       next,
       pipe(from(task), project({ id: task.id, points: task.points }), sort(desc(task.points))),
-      updateWhere(coreSchema.tasks, eq(task.ownerId, 'ada'), (current) => ({ points: current.points * 2 })),
+      update(coreSchema.tasks, eq(task.ownerId, 'ada'), (current) => ({ points: current.points * 2 })),
       deleteByKey(coreSchema.tasks, 't3')
     );
     expect(hypothetical.rows).toEqual([
@@ -438,7 +438,7 @@ describe('TypeScript Relic core acceptance', () => {
         age: 24,
         tags: []
       }),
-      updateWhere(coreSchema.users, eq(user.id, 'bea'), { active: false })
+      update(coreSchema.users, eq(user.id, 'bea'), { active: false })
     );
 
     await expect(qRows(next, activeUsers)).resolves.toEqual([
@@ -571,7 +571,7 @@ describe('TypeScript Relic core acceptance', () => {
         done: false,
         points: 2
       }),
-      updateWhere(coreSchema.users, eq(user.id, 'bea'), { active: false })
+      update(coreSchema.users, eq(user.id, 'bea'), { active: false })
     );
 
     await expect(qRows(next, activeUsers)).resolves.toEqual([
@@ -776,8 +776,8 @@ describe('TypeScript Relic core acceptance', () => {
 
     const next = transact(
       state,
-      updateWhere(coreSchema.teams, eq(team.id, 'eng'), { rank: 3 }),
-      updateWhere(coreSchema.users, eq(user.id, 'bea'), { active: false })
+      update(coreSchema.teams, eq(team.id, 'eng'), { rank: 3 }),
+      update(coreSchema.users, eq(user.id, 'bea'), { active: false })
     );
 
     expect(materializedRowsForQuery(next, activeUserTeams)).toEqual([
@@ -819,7 +819,7 @@ describe('TypeScript Relic core acceptance', () => {
 
     const updatedExtremum = transact(
       removedMin,
-      updateWhere(coreSchema.tasks, eq(task.id, 't2'), { points: 2 })
+      update(coreSchema.tasks, eq(task.id, 't2'), { points: 2 })
     );
 
     await expect(qRows(updatedExtremum, pointRanges)).resolves.toEqual([
@@ -866,7 +866,7 @@ describe('TypeScript Relic core acceptance', () => {
 
     const updatedIntoBottom = transact(
       insertedTop,
-      updateWhere(coreSchema.tasks, eq(task.id, 't4'), { points: 1 })
+      update(coreSchema.tasks, eq(task.id, 't4'), { points: 1 })
     );
 
     await expect(qRows(updatedIntoBottom, pointExtremes)).resolves.toEqual([
@@ -953,7 +953,7 @@ describe('TypeScript Relic core acceptance', () => {
 
     const updatedIntoBottom = transact(
       insertedTop,
-      updateWhere(coreSchema.tasks, eq(task.id, 't4'), { points: 1 })
+      update(coreSchema.tasks, eq(task.id, 't4'), { points: 1 })
     );
 
     await expect(taskRankIds(updatedIntoBottom)).resolves.toEqual({ top: ['t2', 't1'], bottom: ['t4', 't3'] });
@@ -1181,7 +1181,7 @@ describe('TypeScript Relic core acceptance', () => {
         age: 24,
         tags: []
       }),
-      updateWhere(coreSchema.users, eq(user.id, 'bea'), { active: false })
+      update(coreSchema.users, eq(user.id, 'bea'), { active: false })
     );
 
     const hashIndex = index(next, 'active-users', { kind: 'hash', field: 'teamId' });
@@ -1305,19 +1305,18 @@ describe('TypeScript Relic core acceptance', () => {
     expect(tracked.result?.materializations).toMatchObject({ maintained: 1, recomputed: 1 });
     expect(events).toHaveLength(1);
     const materializedChange = tracked.changes.find((change) => change.id === 'active-users');
-    expect(materializedChange?.unchangedRows).toEqual([
+    expect(materializedChange?.unchanged).toEqual([
       { id: 'ada', name: 'Ada' },
       { id: 'bea', name: 'Bea' }
     ]);
     expect(tracked.changes).toEqual(expect.arrayContaining([
       expect.objectContaining({
         changed: true,
-        addedRows: [{ id: 'dia', name: 'Dia' }]
+        added: [{ id: 'dia', name: 'Dia' }]
       })
     ]));
     expect(tracked.changesByQueryKey[queryKey(activeUsers)]).toMatchObject({
       added: [{ id: 'dia', name: 'Dia' }],
-      deleted: [],
       removed: []
     });
     await expect(qRows(tracked.db, activeUsers)).resolves.toEqual([
@@ -1352,15 +1351,15 @@ describe('TypeScript Relic core acceptance', () => {
     expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
     expect(tracked.label).toBe('function-input');
     expect(tracked.changesByTargetKey.get(queryKey(activeUsers))).toMatchObject({
-      addedRows: [{ id: 'dia', name: 'Dia' }],
-      removedRows: []
+      added: [{ id: 'dia', name: 'Dia' }],
+      removed: []
     });
     expect(tracked.changesByQueryKey[queryKey(activeUsers)]).toMatchObject({
-      addedRows: [{ id: 'dia', name: 'Dia' }],
-      removedRows: []
+      added: [{ id: 'dia', name: 'Dia' }],
+      removed: []
     });
     expect(tracked.changesByTargetKey.get(watchTargetKey(coreSchema.users))).toMatchObject({
-      addedRows: [{
+      added: [{
         id: 'dia',
         teamId: 'eng',
         name: 'Dia',
@@ -1408,8 +1407,8 @@ describe('TypeScript Relic core acceptance', () => {
     expect(tracked.result).toMatchObject({ committed: true, patches: 0, applied: 0 });
     expect(getEnv(tracked.db)).toMatchObject({ minimumAge: 30 });
     expect(tracked.materializations?.changes.find((change) => change.id === 'older-than-minimum')).toMatchObject({
-      addedRows: [],
-      removedRows: [{ id: 'bea', age: 29 }]
+      added: [],
+      removed: [{ id: 'bea', age: 29 }]
     });
     await expect(qRows(tracked.db, olderThanMinimum)).resolves.toEqual([
       { id: 'ada', age: 37 },
@@ -1454,14 +1453,14 @@ describe('TypeScript Relic core acceptance', () => {
     expect(materializedChange).toMatchObject({
       update: 'recomputed',
       recomputed: true,
-      addedRows: [{ id: 'dia', name: 'Dia' }],
-      removedRows: []
+      added: [{ id: 'dia', name: 'Dia' }],
+      removed: []
     });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'dia', name: 'Dia' }],
-      removedRows: [],
+      added: [{ id: 'dia', name: 'Dia' }],
+      removed: [],
       rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'dia', name: 'Dia' } })]
     });
     expect(events[0]?.rowChanges).toEqual(materializedChange?.rowChanges);
@@ -1475,8 +1474,8 @@ describe('TypeScript Relic core acceptance', () => {
     expect(events).toHaveLength(2);
     expect(events.at(-1)).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'eli', name: 'Eli' }],
-      removedRows: [],
+      added: [{ id: 'eli', name: 'Eli' }],
+      removed: [],
       rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'eli', name: 'Eli' } })]
     });
     expect(events.at(-1)?.diagnostics ?? []).toEqual([]);
@@ -1523,7 +1522,7 @@ describe('TypeScript Relic core acceptance', () => {
     expect(primaryEvents).toHaveLength(1);
     expect(secondaryEvents).toHaveLength(1);
     expect(primaryEvents[0]).toMatchObject({
-      addedRows: [{ id: 'dia', name: 'Dia' }]
+      added: [{ id: 'dia', name: 'Dia' }]
     });
     expect(secondaryEvents[0]).toMatchObject(primaryEvents[0] ?? {});
 
@@ -1548,7 +1547,7 @@ describe('TypeScript Relic core acceptance', () => {
     expect(primaryEvents).toHaveLength(2);
     expect(secondaryEvents).toHaveLength(1);
     expect(primaryEvents.at(-1)).toMatchObject({
-      addedRows: [{ id: 'eli', name: 'Eli' }]
+      added: [{ id: 'eli', name: 'Eli' }]
     });
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
   });
@@ -1681,13 +1680,12 @@ describe('TypeScript Relic core acceptance', () => {
     expect(tracked.changeMap.get(activeUsers)).toMatchObject({
       targetKey: queryKey(activeUsers),
       added: [{ id: 'dia', name: 'Dia' }],
-      deleted: []
+      removed: []
     });
     expect(activeUsersMapChange).toMatchObject({
       targetKey: queryKey(activeUsers),
       added: [{ id: 'dia', name: 'Dia' }],
-      deleted: [],
-      addedRows: [{ id: 'dia', name: 'Dia' }]
+      removed: []
     });
     expect(tracked.changesByTargetKey.get(queryKey(activeUsers))).toMatchObject({
       target: activeUsers,
@@ -1703,14 +1701,12 @@ describe('TypeScript Relic core acceptance', () => {
         age: 24,
         tags: []
       }],
-      deleted: []
+      removed: []
     });
     expect(activeUsersChange).toMatchObject({
       changed: true,
       added: [{ id: 'dia', name: 'Dia' }],
-      deleted: [],
-      addedRows: [{ id: 'dia', name: 'Dia' }],
-      removedRows: [],
+      removed: [],
       rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'dia', name: 'Dia' } })]
     });
 
@@ -1718,24 +1714,20 @@ describe('TypeScript Relic core acceptance', () => {
     expect(removed.changes.find((change) => change.id === queryKey(activeUsers))).toMatchObject({
       changed: true,
       added: [],
-      deleted: [{ id: 'bea', name: 'Bea' }],
-      addedRows: [],
-      deletedRows: [{ id: 'bea', name: 'Bea' }],
-      removedRows: [{ id: 'bea', name: 'Bea' }],
+      removed: [{ id: 'bea', name: 'Bea' }],
       rowChanges: [expect.objectContaining({ kind: 'removed', row: { id: 'bea', name: 'Bea' } })]
     });
     expect(removed.changesByTarget.get(coreSchema.users)).toMatchObject({
-      deleted: [beaUser],
-      deletedRows: [beaUser]
+      removed: [beaUser]
     });
 
     const updated = await trackTransact(
       removed.db,
-      updateWhere(coreSchema.users, eq(user.id, 'ada'), { age: 38 })
+      update(coreSchema.users, eq(user.id, 'ada'), { age: 38 })
     );
     expect(updated.changesByTarget.get(coreSchema.users)).toMatchObject({
       added: [{ ...adaUser, age: 38 }],
-      deleted: [adaUser],
+      removed: [adaUser],
       rowChanges: [expect.objectContaining({
         kind: 'updated',
         before: adaUser,
@@ -1807,18 +1799,16 @@ describe('TypeScript Relic core acceptance', () => {
     expect(tracked.changeMap.get(coreSchema.users)).toMatchObject({
       targetKey: watchTargetKey(coreSchema.users),
       added: [inserted],
-      deleted: [beaUser],
-      addedRows: [inserted],
-      deletedRows: [beaUser]
+      removed: [beaUser]
     });
     expect(tracked.changesByTarget.get(coreSchema.users)).toMatchObject({
       added: [inserted],
-      deleted: [beaUser]
+      removed: [beaUser]
     });
     expect(tracked.changesByTargetKey.get(watchTargetKey(coreSchema.users))).toMatchObject({
       target: coreSchema.users,
       added: [inserted],
-      deleted: [beaUser]
+      removed: [beaUser]
     });
   });
 

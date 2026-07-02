@@ -20,7 +20,7 @@ import {
   sort,
   sum,
   transact,
-  updateWhere,
+  update,
   where
 } from '@tarstate/core';
 import { coreSchema, sourceData } from './fixtures';
@@ -78,7 +78,7 @@ describe('materialized named function calls', () => {
     await expect(qRows(state, query)).resolves.toEqual(initialRows);
     await expect(qRows(state, query, { functions })).resolves.toEqual(initialRows);
 
-    const next = transact(state, updateWhere(coreSchema.users, eq(user.id, 'bea'), { age: 36 }));
+    const next = transact(state, update(coreSchema.users, eq(user.id, 'bea'), { age: 36 }));
     const nextRows = [
       { id: 'ada', bucket: 'senior' },
       { id: 'bea', bucket: 'senior' },
@@ -118,7 +118,7 @@ describe('materialized named function calls', () => {
       { id: 'cal', label: 'Cal:41', bucket: 'senior' }
     ]);
 
-    const next = transact(state, updateWhere(coreSchema.users, eq(user.id, 'bea'), { age: 36 }));
+    const next = transact(state, update(coreSchema.users, eq(user.id, 'bea'), { age: 36 }));
 
     expect(materializedRowsForQuery(next, query)).toEqual([
       { id: 'ada', label: 'Ada:37', bucket: 'senior' },
@@ -146,7 +146,7 @@ describe('materialized named function calls', () => {
       { id: 'bea', name: 'Bea', age: 29 }
     ]);
 
-    const next = transact(state, updateWhere(coreSchema.users, eq(user.id, 'bea'), { age: 40 }));
+    const next = transact(state, update(coreSchema.users, eq(user.id, 'bea'), { age: 40 }));
 
     expect(materializedRowsForQuery(next, query)).toEqual([
       { id: 'bea', name: 'Bea', age: 40 },
@@ -181,7 +181,7 @@ describe('materialized named function calls', () => {
       { decade: 40, users: 1, activeUsers: 0 }
     ]);
 
-    const next = transact(state, updateWhere(coreSchema.users, eq(user.id, 'bea'), { age: 36 }));
+    const next = transact(state, update(coreSchema.users, eq(user.id, 'bea'), { age: 36 }));
 
     expect(materializedRowsForQuery(next, query)).toEqual([
       { decade: 30, users: 2, activeUsers: 2 },
