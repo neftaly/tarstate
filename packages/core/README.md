@@ -142,7 +142,6 @@ Advanced examples and integration docs should teach explicit subpath imports:
 - `@tarstate/core/delta`
 - `@tarstate/core/diff`
 - `@tarstate/core/evaluate`
-- `@tarstate/core/indexed-source`
 - `@tarstate/core/materialization`
 - `@tarstate/core/memory-runtime`
 - `@tarstate/core/runtime`
@@ -153,7 +152,7 @@ Advanced examples and integration docs should teach explicit subpath imports:
 The root barrel `@tarstate/core` is the stable starter surface: diagnostics,
 schema, the canonical query DSL, db/query helpers, constraints, `createStore`,
 and write patch builders/types. Advanced surfaces are explicit subpaths only:
-adapter, runtime, source, delta, diff, evaluate, indexed-source, memory-runtime,
+adapter, runtime, source, delta, diff, evaluate, memory-runtime,
 materialization, and watch.
 
 Do not import `packages/core/src/*`, `@tarstate/core/src/*`, or any other

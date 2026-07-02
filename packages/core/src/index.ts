@@ -198,7 +198,6 @@ export type {
   QueryForeignKeyConstraintData,
   QueryRequiredConstraintData,
   QueryUniqueConstraintData,
-  QueryUniqueExpressionConstraintData,
   RequiredConstraintData,
   UniqueConstraintData
 } from './constraints.js';

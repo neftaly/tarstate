@@ -13,7 +13,6 @@
     "./delta": "./src/delta.ts",
     "./diff": "./src/diff.ts",
     "./evaluate": "./src/evaluate.ts",
-    "./indexed-source": "./src/indexed-source.ts",
     "./memory-runtime": "./src/memory-runtime.ts",
     "./materialization": "./src/materialization.ts",
     "./query": "./src/query.ts",

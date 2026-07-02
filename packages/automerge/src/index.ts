@@ -24,7 +24,7 @@ export type AutomergeMapStorageOptions = {
 };
 
 export type AutomergeMapAdapterOptions<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+  DocumentShape extends object = Record<string, unknown>
 > = {
   readonly doc: Automerge.Doc<DocumentShape>;
   readonly relations: readonly AutomergeMapRelation[];
@@ -38,10 +38,12 @@ export type AutomergeMapSourceOptions = {
 };
 
 export type AutomergeMapSource = AdapterSource<Automerge.Heads>;
-export type AutomergeRuntimeVersion = Automerge.Heads | readonly unknown[];
+export type AutomergeRuntimeVersion<RuntimeVersion = unknown> =
+  | Automerge.Heads
+  | readonly (Automerge.Heads | RuntimeVersion)[];
 
 export type AutomergeMapAdapter<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+  DocumentShape extends object = Record<string, unknown>
 > = RelationRuntime<Automerge.Heads> & {
   readonly relations: readonly AutomergeMapRelation[];
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
@@ -65,21 +67,23 @@ export type AutomergeRelationRuntime<Version = unknown> =
   RelationRuntime<Version> & AutomergeRelationRuntimeMetadata;
 
 export type AutomergeMapRuntimeOptions<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+  DocumentShape extends object = Record<string, unknown>,
+  RuntimeVersion = unknown
 > = AutomergeMapAdapterOptions<DocumentShape> & {
-  readonly runtimes?: readonly AutomergeRelationRuntime[];
+  readonly runtimes?: readonly AutomergeRelationRuntime<RuntimeVersion>[];
 };
 
 export type AutomergeMapRuntime<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
-> = RelationRuntime<AutomergeRuntimeVersion> & {
+  DocumentShape extends object = Record<string, unknown>,
+  RuntimeVersion = unknown
+> = RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>> & {
   readonly kind: 'automergeMapRuntime';
   readonly adapter: AutomergeMapAdapter<DocumentShape>;
   readonly relations: readonly RelationRef[];
 };
 
 export function automergeMapSource<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+  DocumentShape extends object = Record<string, unknown>
 >(
   doc: Automerge.Doc<DocumentShape>,
   options: AutomergeMapSourceOptions
@@ -98,7 +102,7 @@ export function automergeMapSource<
 }
 
 export function automergeMapAdapter<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+  DocumentShape extends object = Record<string, unknown>
 >(
   options: AutomergeMapAdapterOptions<DocumentShape>
 ): AutomergeMapAdapter<DocumentShape> {
@@ -176,15 +180,16 @@ export function withAutomergeRuntimeRelations<Version>(
 }
 
 export function createAutomergeMapRuntime<
-  DocumentShape extends Record<string, unknown> = Record<string, unknown>
+  DocumentShape extends object = Record<string, unknown>,
+  RuntimeVersion = unknown
 >(
-  options: AutomergeMapRuntimeOptions<DocumentShape>
-): AutomergeMapRuntime<DocumentShape> {
+  options: AutomergeMapRuntimeOptions<DocumentShape, RuntimeVersion>
+): AutomergeMapRuntime<DocumentShape, RuntimeVersion> {
   const adapter = automergeMapAdapter<DocumentShape>(options);
   const runtimes = options.runtimes ?? [];
   const runtime = runtimes.length === 0
-    ? adapter as RelationRuntime<AutomergeRuntimeVersion>
-    : composeRelationRuntimes(adapter, ...runtimes);
+    ? adapter as RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>>
+    : composeRelationRuntimes(adapter, ...runtimes) as RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>>;
   const relations = uniqueRelations([
     ...options.relations.map((mapping) => mapping.relation),
     ...runtimes.flatMap(runtimeRelations)
@@ -203,7 +208,7 @@ function relationNamesFor(relations: readonly AutomergeMapRelation[]): readonly 
   return Array.from(new Set(relations.map((mapping) => mapping.relation.name)));
 }
 
-function runtimeRelations(runtime: AutomergeRelationRuntime): readonly RelationRef[] {
+function runtimeRelations(runtime: AutomergeRelationRuntime<unknown>): readonly RelationRef[] {
   if ('relation' in runtime && runtime.relation !== undefined) {
     return [runtime.relation];
   }

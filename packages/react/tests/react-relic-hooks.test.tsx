@@ -1,4 +1,4 @@
-import { createElement } from 'react';
+import { createElement, type DependencyList } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
@@ -18,6 +18,7 @@ import {
   type TarstateDbSnapshot,
   type TarstateProviderProps,
   type UseQueryOptions,
+  type UseQuerySelectedOptions,
   type UseRowKeyOptions,
   type UseViewOptions,
   type ViewHookState
@@ -75,8 +76,10 @@ describe('@tarstate/react future hook facade contract', () => {
     expectTypeOf<TarstateCommit>().toEqualTypeOf<Store['commit']>();
     expectTypeOf<HookStatus>().toEqualTypeOf<'ready'>();
     expectTypeOf<UseViewOptions>().toMatchTypeOf<{
-      readonly deps?: readonly unknown[];
+      readonly deps?: DependencyList;
     }>();
+    expectTypeOf<UseQuerySelectedOptions<ItemProjection, readonly string[]>>()
+      .toMatchTypeOf<UseQueryOptions<ItemProjection, readonly string[]>>();
     const queryOptions = {
       select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`)
     } satisfies UseQueryOptions<ItemProjection, readonly string[]>;

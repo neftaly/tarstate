@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useSyncExternalStore,
+  type DependencyList,
   type ReactNode
 } from 'react';
 import type { Db, DbInputData } from '@tarstate/core/db';
@@ -44,15 +45,15 @@ export type TarstateProviderProps = {
 };
 
 export type UseViewOptions = {
-  readonly deps?: readonly unknown[];
+  readonly deps?: DependencyList;
 };
 
 export type UseQueryOptions<Row, Selected> = {
-  readonly deps?: readonly unknown[];
+  readonly deps?: DependencyList;
   readonly select?: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
 
-type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
+export type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
   readonly select: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
 
@@ -89,7 +90,7 @@ export type UseRowKeyOptions<Row, Key> = UseViewOptions & {
 };
 
 const TarstateContext = createContext<Store | undefined>(undefined);
-const emptyDeps: readonly unknown[] = Object.freeze([]);
+const emptyDeps: DependencyList = Object.freeze([]);
 
 export function TarstateProvider({ children, db, resetKey, store }: TarstateProviderProps) {
   const ownedStore = useRef<{ readonly resetKey: string | number | undefined; readonly store: Store } | undefined>(undefined);
@@ -230,8 +231,8 @@ export function useQuery<Row, Selected>(
   };
 }
 
-function useDependencyVersion(deps: readonly unknown[]): number {
-  const state = useRef<{ readonly deps: readonly unknown[]; version: number }>({ deps, version: 0 });
+function useDependencyVersion(deps: DependencyList): number {
+  const state = useRef<{ readonly deps: DependencyList; version: number }>({ deps, version: 0 });
   if (!shallowEqualDeps(state.current.deps, deps)) {
     state.current = { deps, version: state.current.version + 1 };
   }
@@ -300,7 +301,7 @@ function shallowEqualDiagnostics(
     });
 }
 
-function shallowEqualDeps(left: readonly unknown[], right: readonly unknown[]): boolean {
+function shallowEqualDeps(left: DependencyList, right: DependencyList): boolean {
   return left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
 }
 

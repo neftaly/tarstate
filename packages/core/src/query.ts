@@ -72,7 +72,6 @@ export type {
   ComparisonOp,
   ExpandOptions,
   ExprData,
-  FieldExprProxy,
   ExprInput,
   HostFunction,
   HostExpressionFunction,

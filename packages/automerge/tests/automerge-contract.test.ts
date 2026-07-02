@@ -1,6 +1,6 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { isRelationRuntime } from '@tarstate/core/adapter';
+import { isRelationRuntime, type RelationRuntime } from '@tarstate/core/adapter';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { createRuntimeStore } from '@tarstate/core/store';
 import { write } from '@tarstate/core/write';
@@ -18,6 +18,12 @@ type TaskRow = {
   readonly id: string;
   readonly title: string;
 };
+
+interface WorkspaceDoc {
+  readonly workspace: {
+    readonly tasks: readonly TaskRow[];
+  };
+}
 
 const schema = defineSchema({
   tasks: relation<TaskRow>({
@@ -66,6 +72,24 @@ describe('automerge public adapter contract', () => {
     expect(runtime.relation).toBe(schema.tasks);
     expect(runtime.source.relationNames).toEqual(['tasks']);
     expect(isRelationRuntime(runtime)).toBe(true);
+  });
+
+  it('accepts interface document shapes and preserves extra runtime versions', () => {
+    const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({ workspace: { tasks: [] as readonly TaskRow[] } });
+    const extraRuntime = withAutomergeRuntimeRelations({
+      source: {
+        relationNames: ['tasks'],
+        version: () => 1,
+        rows: () => []
+      }
+    } satisfies RelationRuntime<number>, schema.tasks);
+    const runtime = createAutomergeMapRuntime({ doc, relations: taskMapping, runtimes: [extraRuntime] });
+
+    expect(runtime.adapter.getDoc()).toBe(doc);
+    expectTypeOf(runtime).toMatchTypeOf<AutomergeMapRuntime<WorkspaceDoc, number>>();
+    expectTypeOf(runtime.source.version).returns.toMatchTypeOf<
+      Automerge.Heads | readonly (Automerge.Heads | number)[] | undefined
+    >();
   });
 
   it('reports map writes as unimplemented without mutating the document', async () => {

@@ -1,4 +1,10 @@
-import { Presence, type DocHandle, type PeerState, type PresenceState } from '@automerge/automerge-repo';
+import {
+  Presence,
+  type DocHandle,
+  type DocHandleEphemeralMessagePayload,
+  type PeerState,
+  type PresenceState
+} from '@automerge/automerge-repo';
 import type {
   AdapterSnapshot,
   AdapterSource,
@@ -30,10 +36,16 @@ export type AutomergePresenceRelationOptions<Relation extends RelationRef = Rela
 
 export type AutomergePresenceClearedValue = (value: unknown) => boolean;
 
-export type AutomergePresenceHandle<_DocType = unknown> = {
-  readonly on?: (eventName: string, listener: (payload: unknown) => void) => void;
-  readonly off?: (eventName: string, listener: (payload: unknown) => void) => void;
-  readonly broadcast?: (message: unknown) => void;
+export type AutomergePresenceHandle<DocType = unknown> = {
+  readonly on: (
+    eventName: 'ephemeral-message',
+    listener: (payload: DocHandleEphemeralMessagePayload<DocType>) => void
+  ) => AutomergePresenceHandle<DocType> | void;
+  readonly off: (
+    eventName: 'ephemeral-message',
+    listener: (payload: DocHandleEphemeralMessagePayload<DocType>) => void
+  ) => AutomergePresenceHandle<DocType> | void;
+  readonly broadcast: DocHandle<DocType>['broadcast'];
 };
 
 export type AutomergePresenceRuntimeOptions<
@@ -103,7 +115,7 @@ export function automergePresenceRuntime<
 >(options: AutomergePresenceRuntimeOptions<State, DocType>): AutomergePresenceRuntime<State> {
   const fields = { ...defaultPresenceFields, ...options.fields };
   const listeners = new Set<() => void>();
-  const presence = new Presence<State, DocType>({ handle: options.handle as DocHandle<DocType> });
+  const presence = new Presence<State, DocType>({ handle: presenceHandleForConstructor(options.handle) });
   const localState = compactState(options.initialState, options.isClearedValue ?? defaultAutomergePresenceClearedValue) as State;
   let revision = 0;
   let running = false;
@@ -186,6 +198,10 @@ export function automergePresenceRuntime<
   }
 
   return runtime;
+}
+
+function presenceHandleForConstructor<DocType>(handle: AutomergePresenceHandle<DocType>): DocHandle<DocType> {
+  return handle as DocHandle<DocType>;
 }
 
 function compactState(

@@ -37,9 +37,6 @@
       "@tarstate/core/evaluate": [
         "./packages/core/src/evaluate.ts"
       ],
-      "@tarstate/core/indexed-source": [
-        "./packages/core/src/indexed-source.ts"
-      ],
       "@tarstate/core/materialization": [
         "./packages/core/src/materialization.ts"
       ],

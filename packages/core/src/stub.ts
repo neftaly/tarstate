@@ -222,11 +222,11 @@ export class QueryKeyError extends Error {
     this.value = value;
   }
 }
-export type FieldExprProxy<Row, Alias extends string> =
+type AliasedFieldAccess<Row, Alias extends string> =
   { readonly alias: Alias } & { readonly [Field in keyof Row & string]: ExprData<Row[Field]> };
 export type AliasedRelationRef<Row extends object, Alias extends string> =
-  RelationRef<Row> & FieldExprProxy<Row, Alias>;
-export type AliasedQuery<Row, Alias extends string> = Query<Row> & FieldExprProxy<Row, Alias>;
+  RelationRef<Row> & AliasedFieldAccess<Row, Alias>;
+export type AliasedQuery<Row, Alias extends string> = Query<Row> & AliasedFieldAccess<Row, Alias>;
 
 type ExprValue<Input> = Input extends ExprData<infer Value> ? Value : Input;
 type ProjectedRow<Shape extends ProjectionData> = {
@@ -521,7 +521,6 @@ export function fromObjectSource(data: Record<string, readonly unknown[]>): Rela
   return { relationNames: Object.keys(data), rows: (relationRef) => data[relationRef.name] ?? [] };
 }
 
-export const fromIndexedObjectSource = fromObjectSource;
 export const isRelationSource = (input: unknown): input is RelationSource => isRecord(input) && typeof input.rows === 'function';
 export const composeSources = (...sources: readonly RelationSource[]): RelationSource => ({
   relationNames: Array.from(new Set(sources.flatMap((source) => source.relationNames ?? []))),
@@ -635,7 +634,7 @@ export type DbTransactionPlan = {
   readonly patches: readonly WritePatch[];
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
-export type DbTransactionBuilder = RelationWriterMap;
+export type DbTransactionBuilder = object;
 export type DbTransactionContext = Db & DbTransactionBuilder;
 export type QueryBatchTarget = Query<unknown> | RelationRef | { readonly q: Query<unknown> | RelationRef };
 export type QueryBatch = Record<string, QueryBatchTarget>;
@@ -750,13 +749,13 @@ export type RelationMergeInput<Relation extends RelationRef = RelationRef> =
 export type InsertPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insert'; readonly relation: Relation; readonly row: RelationRow<Relation> };
 export type InsertIgnorePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertIgnore'; readonly relation: Relation; readonly row: RelationRow<Relation> };
 export type InsertOrReplacePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertOrReplace'; readonly relation: Relation; readonly row: RelationRow<Relation> };
-export type UpdateByKeyPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'updateByKey'; readonly relation: Relation; readonly key: RelationKeyInput; readonly changes: RelationRowUpdateInput<Relation> };
+export type UpdateByKeyPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'updateByKey'; readonly relation: Relation; readonly key: RelationKeyValue<Relation>; readonly changes: RelationRowUpdateInput<Relation> };
 export type UpdatePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'update'; readonly relation: Relation; readonly predicate: PredicateData; readonly changes: RelationRowUpdateInput<Relation> };
 export type InsertOrMergeOptions<Relation extends RelationRef = RelationRef> = { readonly merge?: RelationMergeInput<Relation> };
 export type InsertOrMergePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertOrMerge'; readonly relation: Relation; readonly row: RelationRow<Relation>; readonly merge?: RelationMergeInput<Relation> };
 export type InsertOrUpdateOptions<Relation extends RelationRef = RelationRef> = { readonly update?: RelationRowUpdateInput<Relation> };
 export type InsertOrUpdatePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertOrUpdate'; readonly relation: Relation; readonly row: RelationRow<Relation>; readonly update?: RelationRowUpdateInput<Relation> };
-export type DeleteByKeyPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'deleteByKey'; readonly relation: Relation; readonly key: RelationKeyInput };
+export type DeleteByKeyPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'deleteByKey'; readonly relation: Relation; readonly key: RelationKeyValue<Relation> };
 export type DeletePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'delete'; readonly relation: Relation; readonly predicate: PredicateData };
 export type DeleteExactPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'deleteExact'; readonly relation: Relation; readonly row: Partial<RelationRow<Relation>> };
 export type ReplaceAllPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'replaceAll'; readonly relation: Relation; readonly rows: readonly RelationRow<Relation>[] };
@@ -777,21 +776,19 @@ export type RelationWriter<Relation extends RelationRef> = {
   readonly insert: (row: RelationRow<Relation>) => InsertPatch<Relation>;
   readonly insertIgnore: (row: RelationRow<Relation>) => InsertIgnorePatch<Relation>;
   readonly insertOrReplace: (row: RelationRow<Relation>) => InsertOrReplacePatch<Relation>;
-  readonly updateByKey: (key: RelationKeyInput, changes: RelationRowUpdateInput<Relation>) => UpdateByKeyPatch<Relation>;
+  readonly updateByKey: (key: RelationKeyValue<Relation>, changes: RelationRowUpdateInput<Relation>) => UpdateByKeyPatch<Relation>;
   readonly update: (predicate: PredicateData, changes: RelationRowUpdateInput<Relation>) => UpdatePatch<Relation>;
   readonly insertOrMerge: (row: RelationRow<Relation>, options?: InsertOrMergeOptions<Relation>) => InsertOrMergePatch<Relation>;
   readonly insertOrUpdate: (row: RelationRow<Relation>, options?: InsertOrUpdateOptions<Relation>) => InsertOrUpdatePatch<Relation>;
-  readonly deleteByKey: (key: RelationKeyInput) => DeleteByKeyPatch<Relation>;
+  readonly deleteByKey: (key: RelationKeyValue<Relation>) => DeleteByKeyPatch<Relation>;
   readonly delete: (predicate: PredicateData) => DeletePatch<Relation>;
   readonly deleteExact: (row: Partial<RelationRow<Relation>>) => DeleteExactPatch<Relation>;
   readonly replaceAll: (rows: readonly RelationRow<Relation>[]) => ReplaceAllPatch<Relation>;
 };
-type RelationWriterMap = Record<string, never>;
-
 export const insert = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>): InsertPatch<Relation> => ({ op: 'insert', relation: relationRef, row: rowValue });
 export const insertIgnore = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>): InsertIgnorePatch<Relation> => ({ op: 'insertIgnore', relation: relationRef, row: rowValue });
 export const insertOrReplace = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>): InsertOrReplacePatch<Relation> => ({ op: 'insertOrReplace', relation: relationRef, row: rowValue });
-export const updateByKey = <Relation extends RelationRef>(relationRef: Relation, key: RelationKeyInput, changes: RelationRowUpdateInput<Relation>): UpdateByKeyPatch<Relation> => ({ op: 'updateByKey', relation: relationRef, key, changes });
+export const updateByKey = <Relation extends RelationRef>(relationRef: Relation, key: RelationKeyValue<Relation>, changes: RelationRowUpdateInput<Relation>): UpdateByKeyPatch<Relation> => ({ op: 'updateByKey', relation: relationRef, key, changes });
 export const update = <Relation extends RelationRef>(relationRef: Relation, predicate: PredicateData, changes: RelationRowUpdateInput<Relation>): UpdatePatch<Relation> => ({ op: 'update', relation: relationRef, predicate, changes });
 export const insertOrMerge = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>, options: InsertOrMergeOptions<Relation> = {}): InsertOrMergePatch<Relation> => ({
   op: 'insertOrMerge',
@@ -805,7 +802,7 @@ export const insertOrUpdate = <Relation extends RelationRef>(relationRef: Relati
   row: rowValue,
   ...(options.update === undefined ? {} : { update: options.update })
 });
-export const deleteByKey = <Relation extends RelationRef>(relationRef: Relation, key: RelationKeyInput): DeleteByKeyPatch<Relation> => ({ op: 'deleteByKey', relation: relationRef, key });
+export const deleteByKey = <Relation extends RelationRef>(relationRef: Relation, key: RelationKeyValue<Relation>): DeleteByKeyPatch<Relation> => ({ op: 'deleteByKey', relation: relationRef, key });
 export const deleteRows = <Relation extends RelationRef>(relationRef: Relation, predicate: PredicateData): DeletePatch<Relation> => ({ op: 'delete', relation: relationRef, predicate });
 export const deleteExact = <Relation extends RelationRef>(relationRef: Relation, rowValue: Partial<RelationRow<Relation>>): DeleteExactPatch<Relation> => ({ op: 'deleteExact', relation: relationRef, row: rowValue });
 export const replaceAll = <Relation extends RelationRef>(relationRef: Relation, rows: readonly RelationRow<Relation>[]): ReplaceAllPatch<Relation> => ({ op: 'replaceAll', relation: relationRef, rows });
@@ -836,7 +833,6 @@ export type UniqueConstraintData = { readonly op: 'unique'; readonly query: Quer
 export type QueryRequiredConstraintData = RequiredConstraintData;
 export type QueryForeignKeyConstraintData = ForeignKeyConstraintData;
 export type QueryUniqueConstraintData = UniqueConstraintData;
-export type QueryUniqueExpressionConstraintData = UniqueConstraintData;
 export type ConstraintData = CheckConstraintData | RequiredConstraintData | ForeignKeyConstraintData | UniqueConstraintData;
 export type ConstraintSet = readonly ConstraintData[];
 export type ConstraintOptions = { readonly name?: string };
@@ -887,13 +883,11 @@ export const tryTransactConstrained = (dbValue: Db, ...inputs: DbTransactionInpu
 export const transactConstrained = (dbValue: Db, ...inputs: DbTransactionInputs): Db => transact(dbValue, inputs);
 
 export type MaterializableDb = object;
-export type ObjectBackedMaterializableDb = Db;
 export type SnapshotMaterializationTarget = Db | RelationSource;
 export type MaterializedDb = { readonly materialized?: readonly MaterializationMetadata[] };
 export type MaterializationMode = 'snapshot' | 'incremental';
 export type MaterializationMaintenanceKind = MaterializationMode;
 export type MaterializationMaintenanceDecision = 'skipped' | 'carried' | 'recomputed' | 'incremental';
-export type MaterializationMaintenanceChangeKind = MaterializationMaintenanceDecision;
 export type MaterializationIndexSpec = Readonly<Record<string, unknown>>;
 export type MaterializationOptions = { readonly id?: string; readonly mode?: MaterializationMode };
 export type SnapshotMaterializationOptions = MaterializationOptions;
@@ -917,12 +911,6 @@ export type MaterializationExplanation<Row = unknown> = {
   readonly supported: boolean;
   readonly diagnostics: readonly MaterializationDiagnostic[];
 };
-export type UnsupportedMaterializationDiagnostic = TarstateDiagnostic;
-export type MissingMaterializationDiagnostic = TarstateDiagnostic;
-export type UnsupportedMaterializationIndexDiagnostic = TarstateDiagnostic;
-export type MissingMaterializationRowsDiagnostic = TarstateDiagnostic;
-export type StaleMaterializationDiagnostic = TarstateDiagnostic;
-export type UnknownMaterializationVersionDiagnostic = TarstateDiagnostic;
 export type MaterializationDiagnostic = TarstateDiagnostic;
 export type MaterializationRefreshResult<Row = unknown> = {
   readonly kind: 'materializationRefresh';
@@ -931,7 +919,7 @@ export type MaterializationRefreshResult<Row = unknown> = {
 };
 export type MaterializationMaintenanceChange<Row = unknown> = {
   readonly kind: 'materializationMaintenanceChange';
-  readonly update: MaterializationMaintenanceChangeKind;
+  readonly update: MaterializationMaintenanceDecision;
   readonly recomputed: boolean;
   readonly reason: string;
   readonly id: string;
@@ -966,13 +954,10 @@ export type MaterializationNestedUniqueRows<Row = unknown> = Readonly<Record<str
 export type MaterializationSetLike<Row = unknown> = { readonly values: () => IterableIterator<Row> };
 export type MaterializationMapLike<Key = unknown, Value = unknown> = { readonly get: (key: Key) => Value | undefined };
 export type MaterializationHashIndex<Row = unknown, Value = unknown> = MaterializationMapLike<Value, readonly Row[]>;
-export type MaterializationHashIndexResult<Row = unknown, Value = unknown> = MaterializationHashIndex<Row, Value>;
 export type MaterializationRangeBound<Value = unknown> = RelationRangeBound<Value>;
 export type MaterializationRange<Value = unknown> = { readonly lower?: MaterializationRangeBound<Value>; readonly upper?: MaterializationRangeBound<Value> };
 export type MaterializationBtreeIndex<Row = unknown, Value = unknown> = MaterializationMapLike<Value, readonly Row[]>;
-export type MaterializationBtreeIndexResult<Row = unknown, Value = unknown> = MaterializationBtreeIndex<Row, Value>;
 export type MaterializationUniqueIndex<Row = unknown, Value = unknown> = MaterializationMapLike<Value, Row>;
-export type MaterializationUniqueIndexResult<Row = unknown, Value = unknown> = MaterializationUniqueIndex<Row, Value>;
 export type MaterializationIndexResult<Row = unknown> = MaterializationSetLike<Row>;
 export type MaterializedQueryResult<Row = unknown> = QueryResult<Row> & { readonly materialized: boolean };
 export type MaterializationIndexOptions<Field extends string = string> = { readonly fields?: readonly Field[] };
