@@ -6,6 +6,7 @@ import {
   aggregate,
   asc,
   count,
+  desc,
   eq,
   extend,
   field,
@@ -117,6 +118,16 @@ const supportedVariants: readonly SupportedVariant[] = [
       sort(asc(field<string>('row', 'accountId')))
     ) as Query<unknown>,
     keyBy: pathKey('accountId')
+  },
+  {
+    label: 'top-N sort limit projection',
+    query: pipe(
+      from(entry),
+      sort(desc(entry.amount), asc(entry.id)),
+      limit(3),
+      project({ id: entry.id, amount: entry.amount })
+    ) as Query<unknown>,
+    keyBy: pathKey('id')
   }
 ];
 
@@ -134,8 +145,8 @@ const postedEntryIds = pipe(
 
 const unsupportedVariants: readonly UnsupportedVariant[] = [
   {
-    label: 'limit',
-    query: pipe(from(entry), sort(asc(entry.id)), limit(3)) as Query<unknown>
+    label: 'unsorted limit',
+    query: pipe(from(entry), limit(3)) as Query<unknown>
   },
   {
     label: 'non-final sort',

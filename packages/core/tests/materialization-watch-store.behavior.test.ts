@@ -21,6 +21,7 @@ import {
   call,
   clauses,
   count,
+  desc,
   env,
   eq,
   expand,
@@ -856,6 +857,199 @@ describe('materialization, watch, and store behavior', () => {
     expect(q(result.db, sortedCashEntryProjection)).toEqual(q(demat(result.db, sortedCashEntryProjection), sortedCashEntryProjection));
   });
 
+  it('incrementally maintains sort and limit by admitting the next hidden row after a visible delete', () => {
+    const db = mat(makeDb(), firstTwoEntries);
+    const beforeRows = q(db, firstTwoEntries);
+
+    expect(explainMaterialization(firstTwoEntries)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    const result = tryTransact(db, deleteByKey(schema.entries, 'e1'));
+    const change = result.materializations?.changes[0];
+
+    expect(result.committed).toBe(true);
+    expect(change).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      previousRows: beforeRows,
+      rows: [
+        { id: 'e2', accountId: 'sales', amount: -120, memo: 'invoice paid', posted: true },
+        { id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true }
+      ],
+      added: [{ id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true }],
+      removed: [{ id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true }],
+      diagnostics: []
+    }));
+    expect(change?.rowChanges).toEqual([
+      { kind: 'removed', key: '["e1"]', row: { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true } },
+      { kind: 'added', key: '["e3"]', row: { id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true } }
+    ]);
+    expect(Object.keys(result.materializations ?? {})).toEqual(['maintained', 'recomputed', 'carried', 'skipped', 'changes', 'diagnostics']);
+    expect(q(result.db, firstTwoEntries)).toBe(change?.rows);
+    expect(q(result.db, firstTwoEntries)).toEqual(q(demat(result.db, firstTwoEntries), firstTwoEntries));
+  });
+
+  it('incrementally maintains sortLimit when a hidden row sort-key update enters the top N', () => {
+    const query = pipe(
+      from(entry),
+      sortLimit(2, desc(entry.amount), asc(entry.id))
+    );
+    const db = mat(makeDb(), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'e3', { amount: 150 }));
+    const change = result.materializations?.changes[0];
+
+    expect(result.committed).toBe(true);
+    expect(change).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'e3', accountId: 'fees', amount: 150, memo: null, posted: true },
+        { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true }
+      ],
+      added: [{ id: 'e3', accountId: 'fees', amount: 150, memo: null, posted: true }],
+      removed: [{ id: 'e4', accountId: 'cash', amount: 0, posted: false }],
+      diagnostics: []
+    }));
+    expect(q(result.db, query)).toBe(change?.rows);
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('updates hidden top-N aux rows without visible row changes and later promotes the updated row', () => {
+    const query = pipe(
+      from(entry),
+      sort(desc(entry.amount), asc(entry.id)),
+      limit(2)
+    );
+    const db = mat(makeDb(), query);
+
+    const hiddenUpdate = tryTransact(db, updateByKey(schema.entries, 'e2', { amount: -1 }));
+    const hiddenChange = hiddenUpdate.materializations?.changes[0];
+
+    expect(hiddenUpdate.committed).toBe(true);
+    expect(hiddenChange).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true },
+        { id: 'e4', accountId: 'cash', amount: 0, posted: false }
+      ],
+      added: [],
+      removed: [],
+      rowChanges: [],
+      diagnostics: []
+    }));
+
+    const promoted = tryTransact(hiddenUpdate.db, deleteByKey(schema.entries, 'e4'));
+    const promotedChange = promoted.materializations?.changes[0];
+
+    expect(promoted.committed).toBe(true);
+    expect(promotedChange).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true },
+        { id: 'e2', accountId: 'sales', amount: -1, memo: 'invoice paid', posted: true }
+      ],
+      added: [{ id: 'e2', accountId: 'sales', amount: -1, memo: 'invoice paid', posted: true }],
+      removed: [{ id: 'e4', accountId: 'cash', amount: 0, posted: false }],
+      diagnostics: []
+    }));
+    expect(q(promoted.db, query)).toBe(promotedChange?.rows);
+    expect(q(promoted.db, query)).toEqual(q(demat(promoted.db, query), query));
+  });
+
+  it('recomputes top-N when the final sort does not include materialized identity', () => {
+    const query = pipe(
+      from(entry),
+      sort(desc(entry.amount)),
+      limit(2)
+    );
+    const reason = 'top-N incremental maintenance requires final sort to include materialized identity';
+    const db = mat(makeDb(), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: reason,
+          surface: 'materialization'
+        })
+      ]
+    }));
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'e3', { amount: 150 }));
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: reason,
+          surface: 'materialization'
+        })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('recomputes top-N limits with offsets', () => {
+    const query = pipe(
+      from(entry),
+      sort(asc(entry.id)),
+      limit(2, 1)
+    );
+    const reason = 'top-N incremental maintenance does not support offset';
+    const db = mat(makeDb(), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: reason,
+          surface: 'materialization'
+        })
+      ]
+    }));
+
+    const result = tryTransact(db, deleteByKey(schema.entries, 'e1'));
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: reason,
+          surface: 'materialization'
+        })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
   it('recomputes sort-before-project when the projection drops a sort key', () => {
     const query = pipe(
       from(entry),
@@ -1351,14 +1545,9 @@ describe('materialization, watch, and store behavior', () => {
         reason: 'non-final sort queries are not incrementally maintained'
       },
       {
-        label: 'sort and limit',
-        query: firstTwoEntries as Query<unknown>,
-        reason: 'limit queries require auxiliary pre-limit state and are not incrementally maintained'
-      },
-      {
-        label: 'sortLimit',
-        query: pipe(from(entry), sortLimit(2, asc(entry.id))) as Query<unknown>,
-        reason: 'limit queries require auxiliary pre-limit state and are not incrementally maintained'
+        label: 'unsorted limit',
+        query: pipe(from(entry), limit(2)) as Query<unknown>,
+        reason: 'top-N incremental maintenance requires sorted limit input'
       },
       {
         label: 'join',

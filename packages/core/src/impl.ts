@@ -1695,6 +1695,7 @@ export function mat<DbValue extends object>(dbValue: DbValue, ...inputs: readonl
   let state: InternalMaterializationState = {
     metadata: [...current.metadata],
     rows: new Map(current.rows),
+    aux: new Map(current.aux),
     constraints: [...current.constraints]
   };
 
@@ -1741,11 +1742,16 @@ export const demat = <DbValue extends MaterializableDb>(dbValue: DbValue, ...tar
   }
 
   const rows = new Map(current.rows);
-  for (const id of metadataIds) rows.delete(id);
+  const aux = new Map(current.aux);
+  for (const id of metadataIds) {
+    rows.delete(id);
+    aux.delete(id);
+  }
 
   return withMaterializedState(dbValue, {
     metadata: current.metadata.filter((item) => !metadataIds.has(item.id)),
     rows,
+    aux,
     constraints: current.constraints.filter((item) => !constraintKeys.has(constraintKey(item)))
   }) as DbValue;
 };
@@ -1795,6 +1801,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
   }
 
   const changes: MaterializationMaintenanceChange<Row>[] = [];
+  const nextAux = new Map(beforeState.aux);
   const touchedDependencies = relationDeltaNames(options.deltas ?? []);
   const touchedEnvDependencies = materializationEnvDeltaNames(options.envDeltas ?? []);
   const hasRelationChangeHints = options.deltas !== undefined;
@@ -1835,9 +1842,10 @@ export function maintainMaterializationSnapshots<Row = unknown>(
 
     const incremental = previousRows === undefined || !hasRelationChangeHints || !envHintsCoverDependencies || touchedEnv.length > 0
       ? undefined
-      : maintainMaterializationIncrementally(before, target, metadata.query as Query<Row>, previousRows, options.deltas);
+      : maintainMaterializationIncrementally(before, target, metadata.query as Query<Row>, previousRows, options.deltas, beforeState.aux.get(metadata.id));
 
     if (incremental !== undefined && incremental.supported) {
+      if (incremental.aux !== undefined) nextAux.set(metadata.id, incremental.aux);
       changes.push({
         update: 'incremental',
         recomputed: false,
@@ -1867,7 +1875,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
       ...(touchedEnv.length > 0 ? [materializationUnsupportedDiagnostic(`env dependency changed: ${touchedEnv.join(', ')}`)] : []),
       ...(incremental === undefined ? [] : incremental.diagnostics)
     ];
-    changes.push(recomputeMaterializationChange(target, metadata as MaterializationMetadata<Row>, previousRows, {
+    const recomputed = recomputeMaterializationChange(target, metadata as MaterializationMetadata<Row>, previousRows, {
       dependencies,
       touchedDependencies: touched,
       envDependencies,
@@ -1877,10 +1885,14 @@ export function maintainMaterializationSnapshots<Row = unknown>(
         ? 'snapshot recompute'
         : `snapshot recompute: ${fallbackDiagnostics.map((item) => item.message).join('; ')}`,
       diagnostics: fallbackDiagnostics
-    }));
+    });
+    changes.push(recomputed);
+    const refreshedAux = materializationAuxForTarget<Row>(target, metadata.query as Query<Row>);
+    if (refreshedAux === undefined) nextAux.delete(metadata.id);
+    else nextAux.set(metadata.id, refreshedAux);
   }
 
-  return {
+  const result: MaterializationMaintenanceResult<Row> = {
     maintained: changes.length,
     recomputed: changes.filter((change) => change.recomputed).length,
     carried: changes.filter((change) => change.update === 'carried').length,
@@ -1888,6 +1900,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
     changes,
     diagnostics: changes.flatMap((change) => change.diagnostics)
   };
+  return withMaterializationMaintenanceAux(result, nextAux);
 }
 
 export function maintainMaterializations<DbValue extends Db, Row = unknown>(
@@ -1930,6 +1943,18 @@ type IncrementalAggregateShape = {
   readonly relation: RelationRef;
   readonly groupIdentity: MaterializationRowIdentity;
 };
+const MATERIALIZATION_MAINTENANCE_AUX: unique symbol = Symbol('tarstate.materializationMaintenanceAux');
+type IncrementalTopNShape = {
+  readonly count: number;
+  readonly preLimitData: QueryData;
+  readonly finalSort: QueryData;
+};
+type InternalMaterializationAux = {
+  readonly topNPreLimitRows: readonly unknown[];
+};
+type InternalMaterializationMaintenanceAux<Row = unknown> = MaterializationMaintenanceResult<Row> & {
+  readonly [MATERIALIZATION_MAINTENANCE_AUX]?: ReadonlyMap<string, InternalMaterializationAux>;
+};
 type IncrementalAggregateAccumulatorField =
   | { readonly kind: 'count'; readonly field: string; readonly predicate?: unknown }
   | { readonly kind: 'sum'; readonly field: string; readonly expr: unknown };
@@ -1949,6 +1974,7 @@ type IncrementalMaterializationSupport<Row = unknown> =
       readonly touchedRelations: readonly RelationRef[];
       readonly identity: MaterializationRowIdentity<Row>;
       readonly finalSort?: QueryData;
+      readonly topN?: IncrementalTopNShape;
       readonly join?: IncrementalJoinShape;
       readonly aggregate?: IncrementalAggregateShape;
       readonly trusted: boolean;
@@ -1965,6 +1991,7 @@ type IncrementalMaterializationShape =
       readonly relation: RelationRef;
       readonly touchedRelations: readonly RelationRef[];
       readonly finalSort?: QueryData;
+      readonly topN?: IncrementalTopNShape;
       readonly join?: IncrementalJoinShape;
       readonly aggregate?: IncrementalAggregateShape;
     }
@@ -1982,6 +2009,7 @@ type IncrementalMaterializationResult<Row = unknown> =
       readonly removed: readonly Row[];
       readonly rowChanges: readonly RowChange<Row>[];
       readonly diagnostics: readonly TarstateDiagnostic[];
+      readonly aux?: InternalMaterializationAux;
     }
   | {
       readonly supported: false;
@@ -2013,7 +2041,8 @@ function maintainMaterializationIncrementally<Row>(
   target: unknown,
   query: Query<Row>,
   previousRows: readonly Row[],
-  deltas: readonly RelationDelta[]
+  deltas: readonly RelationDelta[],
+  previousAux?: InternalMaterializationAux
 ): IncrementalMaterializationResult<Row> {
   const support = incrementalMaterializationSupport(query);
   if (!support.supported) return support;
@@ -2039,8 +2068,52 @@ function maintainMaterializationIncrementally<Row>(
   if (support.aggregate !== undefined) {
     return maintainAggregateMaterializationIncrementally(before, target, query, previousRows, relationDeltasForQuery, support, support.aggregate, evaluateOptions);
   }
+  if (support.topN !== undefined) {
+    return maintainTopNMaterializationIncrementally(target, query, previousRows, relationDeltasForQuery, support, support.topN, evaluateOptions, previousAux);
+  }
 
   return maintainSingleRelationMaterializationIncrementally(target, query, previousRows, relationDeltasForQuery, support, evaluateOptions);
+}
+
+function maintainTopNMaterializationIncrementally<Row>(
+  target: unknown,
+  query: Query<Row>,
+  previousRows: readonly Row[],
+  relationDeltasForQuery: readonly RelationDelta[],
+  support: Extract<IncrementalMaterializationSupport<Row>, { readonly supported: true }>,
+  topN: IncrementalTopNShape,
+  evaluateOptions: EvaluateOptions,
+  previousAux?: InternalMaterializationAux
+): IncrementalMaterializationResult<Row> {
+  const previousPreLimitRows = previousAux?.topNPreLimitRows as readonly Row[] | undefined;
+  if (previousPreLimitRows === undefined) {
+    const reason = 'top-N incremental maintenance requires auxiliary pre-limit rows';
+    return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+  }
+
+  const preLimitQuery = { data: topN.preLimitData, relations: query.relations } as Query<Row>;
+  const preLimitUpdate = maintainSingleRelationMaterializationIncrementally(
+    target,
+    preLimitQuery,
+    previousPreLimitRows,
+    relationDeltasForQuery,
+    support,
+    evaluateOptions
+  );
+  if (!preLimitUpdate.supported) return preLimitUpdate;
+
+  const rows = preLimitUpdate.rows.slice(0, topN.count);
+  const diff = diffRows(previousRows, rows, { keyBy: support.identity.keyBy });
+  return {
+    supported: true,
+    reason: 'incremental delta maintenance',
+    rows,
+    added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    rowChanges: diff.changes,
+    diagnostics: [...preLimitUpdate.diagnostics, ...diff.diagnostics],
+    aux: { topNPreLimitRows: preLimitUpdate.rows }
+  };
 }
 
 function maintainSingleRelationMaterializationIncrementally<Row>(
@@ -2932,6 +3005,10 @@ function materializationIndexSpecFromData(data: QueryData): MaterializationIndex
 }
 
 function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalMaterializationSupport<Row> {
+  const topN = incrementalTopNMaterializationPlan(query.data, query.relations);
+  if (topN.kind === 'unsupported') return { supported: false, reason: topN.reason, diagnostics: topN.diagnostics };
+  if (topN.kind === 'supported') return incrementalTopNMaterializationSupport(query, topN.plan);
+
   const shape = incrementalMaterializationShape(query.data, query.relations);
   if (!shape.supported) return shape;
 
@@ -2977,6 +3054,7 @@ function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalM
     touchedRelations: shape.touchedRelations,
     identity,
     ...(shape.finalSort === undefined ? {} : { finalSort: shape.finalSort }),
+    ...(shape.topN === undefined ? {} : { topN: shape.topN }),
     ...(shape.join === undefined ? {} : { join: shape.join }),
     ...(shape.aggregate === undefined ? {} : { aggregate: shape.aggregate }),
     trusted: trustedIncrementalMaterialization(query, shape, identity),
@@ -2985,6 +3063,111 @@ function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalM
         ? 'single-source pipeline with stable row identity'
         : 'single-source aggregate pipeline with stable group identity'
       : 'two-relation equi-join pipeline with stable row identity'
+  };
+}
+
+type IncrementalTopNPlanResult =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'supported'; readonly plan: IncrementalTopNShape }
+  | { readonly kind: 'unsupported'; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] };
+
+function incrementalTopNMaterializationPlan(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): IncrementalTopNPlanResult {
+  switch (data.op) {
+    case 'limit': {
+      const count = topNLimitCount(data.count);
+      if (count === undefined) return unsupportedTopNPlan('top-N incremental maintenance requires a finite limit count');
+      if (data.offset !== undefined && topNLimitCount(data.offset) !== 0) {
+        return unsupportedTopNPlan('top-N incremental maintenance does not support offset');
+      }
+
+      const input = queryDataFrom(data.input);
+      if (input?.op !== 'sort') {
+        return unsupportedTopNPlan('top-N incremental maintenance requires sorted limit input');
+      }
+
+      return { kind: 'supported', plan: { count, preLimitData: input, finalSort: input } };
+    }
+    case 'sortLimit': {
+      const count = topNLimitCount(data.count);
+      if (count === undefined) return unsupportedTopNPlan('top-N incremental maintenance requires a finite limit count');
+      const finalSort = sortDataForSortLimit(data);
+      return { kind: 'supported', plan: { count, preLimitData: finalSort, finalSort } };
+    }
+    case 'project': {
+      const input = queryDataFrom(data.input);
+      if (input === undefined) return { kind: 'none' };
+      const nested = incrementalTopNMaterializationPlan(input, relations);
+      if (nested.kind !== 'supported') return nested;
+
+      const preLimitData = { ...data, input: nested.plan.preLimitData } as QueryData;
+      const finalSort = projectedFinalSortData(preLimitData, nested.plan.finalSort, relations);
+      const identity = rowIdentityForQueryData(preLimitData, relations);
+      if (finalSort === undefined || identity === undefined || identity.readable === false) {
+        return unsupportedTopNPlan('project-after-top-N requires final projection to preserve row identity and sort keys');
+      }
+
+      return {
+        kind: 'supported',
+        plan: {
+          count: nested.plan.count,
+          preLimitData,
+          finalSort
+        }
+      };
+    }
+    default:
+      return { kind: 'none' };
+  }
+}
+
+function topNLimitCount(input: unknown): number | undefined {
+  return typeof input === 'number' && Number.isFinite(input) ? Math.max(0, input) : undefined;
+}
+
+function sortDataForSortLimit(data: QueryData): QueryData {
+  return { op: 'sort', input: data.input, order: data.order };
+}
+
+function unsupportedTopNPlan(reason: string): Extract<IncrementalTopNPlanResult, { readonly kind: 'unsupported' }> {
+  return { kind: 'unsupported', reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+}
+
+function incrementalTopNMaterializationSupport<Row>(
+  query: Query<Row>,
+  topN: IncrementalTopNShape
+): IncrementalMaterializationSupport<Row> {
+  const preLimitQuery = { data: topN.preLimitData, relations: query.relations } as Query<Row>;
+  const support = incrementalMaterializationSupport(preLimitQuery);
+  if (!support.supported) return support;
+
+  if (support.join !== undefined || support.aggregate !== undefined) {
+    return unsupportedIncrementalShape('top-N incremental maintenance requires a direct single-source input');
+  }
+  if (support.finalSort === undefined) {
+    return unsupportedIncrementalShape('top-N incremental maintenance requires a final sort order');
+  }
+  if (!finalSortEvaluableFromFinalRow(support.finalSort, query.relations)) {
+    return unsupportedIncrementalShape('top-N incremental maintenance requires sort expressions evaluable from final rows');
+  }
+  if (!finalSortIncludesMaterializedIdentity(support.finalSort, query.relations, support.identity)) {
+    return unsupportedIncrementalShape('top-N incremental maintenance requires final sort to include materialized identity');
+  }
+  if (!support.trusted) {
+    return unsupportedIncrementalShape('top-N incremental maintenance requires trusted row-local expressions');
+  }
+
+  return {
+    supported: true,
+    relation: support.relation,
+    touchedRelations: support.touchedRelations,
+    identity: support.identity,
+    finalSort: support.finalSort,
+    topN: { ...topN, finalSort: support.finalSort },
+    trusted: true,
+    reason: 'single-source top-N pipeline with total sort order'
   };
 }
 
@@ -4956,6 +5139,7 @@ type WriteApplyResult = {
 type InternalMaterializationState = {
   metadata: readonly MaterializationMetadata[];
   rows: ReadonlyMap<string, readonly unknown[]>;
+  aux: ReadonlyMap<string, InternalMaterializationAux>;
   constraints: readonly ConstraintData[];
 };
 
@@ -4974,6 +5158,7 @@ const ATTACHED_WATCH_TARGETS = Symbol('tarstate.attachedWatchTargets');
 const EMPTY_MATERIALIZATION_STATE: InternalMaterializationState = Object.freeze({
   metadata: Object.freeze([]) as readonly MaterializationMetadata[],
   rows: new Map<string, readonly unknown[]>(),
+  aux: new Map<string, InternalMaterializationAux>(),
   constraints: Object.freeze([]) as readonly ConstraintData[]
 });
 const WATCH_STATES = new Map<string, InternalWatchState<unknown>>();
@@ -6602,10 +6787,16 @@ function addMaterializationMetadata(
   metadata: MaterializationMetadata
 ): InternalMaterializationState {
   const rows = new Map(state.rows);
-  rows.set(metadata.id, refreshMaterializationRows(target, metadata.query).rows);
+  const refresh = refreshMaterializationRows(target, metadata.query);
+  rows.set(metadata.id, refresh.rows);
+  const aux = new Map(state.aux);
+  const materializationAux = materializationAuxForTarget(target, metadata.query);
+  if (materializationAux === undefined) aux.delete(metadata.id);
+  else aux.set(metadata.id, materializationAux);
   return {
     metadata: [...state.metadata.filter((item) => item.id !== metadata.id), metadata],
     rows,
+    aux,
     constraints: state.constraints
   };
 }
@@ -6622,6 +6813,31 @@ function materializationMetadata<Row>(query: Query<Row>, options: Materializatio
 
 function materializationIdForQuery<Row>(query: Query<Row>): string {
   return `query:${queryKey(query)}`;
+}
+
+function materializationAuxForTarget<Row>(target: unknown, query: Query<Row>): InternalMaterializationAux | undefined {
+  const support = incrementalMaterializationSupport(query);
+  if (!support.supported || support.topN === undefined) return undefined;
+  const preLimitQuery = { data: support.topN.preLimitData, relations: query.relations } as Query<Row>;
+  return { topNPreLimitRows: refreshMaterializationRows(target, preLimitQuery).rows };
+}
+
+function withMaterializationMaintenanceAux<Row>(
+  result: MaterializationMaintenanceResult<Row>,
+  aux: ReadonlyMap<string, InternalMaterializationAux>
+): MaterializationMaintenanceResult<Row> {
+  Object.defineProperty(result, MATERIALIZATION_MAINTENANCE_AUX, {
+    value: aux,
+    enumerable: false,
+    configurable: true
+  });
+  return result;
+}
+
+function materializationMaintenanceAuxFor<Row>(
+  maintenance: MaterializationMaintenanceResult<Row>
+): ReadonlyMap<string, InternalMaterializationAux> | undefined {
+  return (maintenance as InternalMaterializationMaintenanceAux<Row>)[MATERIALIZATION_MAINTENANCE_AUX];
 }
 
 function materializedStateFor(input: unknown): InternalMaterializationState {
@@ -6676,16 +6892,18 @@ function withMaterializedState<DbValue extends object>(input: DbValue, state: In
 }
 
 function emptyMaterializationState(): InternalMaterializationState {
-  return { metadata: [], rows: new Map(), constraints: [] };
+  return { metadata: [], rows: new Map(), aux: new Map(), constraints: [] };
 }
 
 function applyMaterializationState(dbValue: Db, previous: InternalMaterializationState, maintenance: MaterializationMaintenanceResult): Db {
   if (previous.metadata.length === 0 && previous.constraints.length === 0) return dbValue;
   const rows = new Map(previous.rows);
   for (const change of maintenance.changes) rows.set(change.id, change.rows);
+  const aux = new Map(materializationMaintenanceAuxFor(maintenance) ?? previous.aux);
   return withMaterializedState(dbValue, {
     metadata: previous.metadata,
     rows,
+    aux,
     constraints: previous.constraints
   });
 }
