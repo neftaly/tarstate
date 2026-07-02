@@ -220,6 +220,104 @@ type ExpandedRow<
  *
  * @example `pipe(from(object), where(eq(object.kind, 'file')), project({ id: object.id }))`
  */
+export function pipe<Input>(input: Input): Input;
+export function pipe<Input, Output1>(
+  input: Input,
+  transform1: Transform<Input, Output1>
+): Output1;
+export function pipe<Input, Output1, Output2>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>
+): Output2;
+export function pipe<Input, Output1, Output2, Output3>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>
+): Output3;
+export function pipe<Input, Output1, Output2, Output3, Output4>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>,
+  transform4: Transform<Output3, Output4>
+): Output4;
+export function pipe<Input, Output1, Output2, Output3, Output4, Output5>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>,
+  transform4: Transform<Output3, Output4>,
+  transform5: Transform<Output4, Output5>
+): Output5;
+export function pipe<Input, Output1, Output2, Output3, Output4, Output5, Output6>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>,
+  transform4: Transform<Output3, Output4>,
+  transform5: Transform<Output4, Output5>,
+  transform6: Transform<Output5, Output6>
+): Output6;
+export function pipe<Input, Output1, Output2, Output3, Output4, Output5, Output6, Output7>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>,
+  transform4: Transform<Output3, Output4>,
+  transform5: Transform<Output4, Output5>,
+  transform6: Transform<Output5, Output6>,
+  transform7: Transform<Output6, Output7>
+): Output7;
+export function pipe<Input, Output1, Output2, Output3, Output4, Output5, Output6, Output7, Output8>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>,
+  transform4: Transform<Output3, Output4>,
+  transform5: Transform<Output4, Output5>,
+  transform6: Transform<Output5, Output6>,
+  transform7: Transform<Output6, Output7>,
+  transform8: Transform<Output7, Output8>
+): Output8;
+export function pipe<Input, Output1, Output2, Output3, Output4, Output5, Output6, Output7, Output8, Output9>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>,
+  transform4: Transform<Output3, Output4>,
+  transform5: Transform<Output4, Output5>,
+  transform6: Transform<Output5, Output6>,
+  transform7: Transform<Output6, Output7>,
+  transform8: Transform<Output7, Output8>,
+  transform9: Transform<Output8, Output9>
+): Output9;
+export function pipe<
+  Input,
+  Output1,
+  Output2,
+  Output3,
+  Output4,
+  Output5,
+  Output6,
+  Output7,
+  Output8,
+  Output9,
+  Output10
+>(
+  input: Input,
+  transform1: Transform<Input, Output1>,
+  transform2: Transform<Output1, Output2>,
+  transform3: Transform<Output2, Output3>,
+  transform4: Transform<Output3, Output4>,
+  transform5: Transform<Output4, Output5>,
+  transform6: Transform<Output5, Output6>,
+  transform7: Transform<Output6, Output7>,
+  transform8: Transform<Output7, Output8>,
+  transform9: Transform<Output8, Output9>,
+  transform10: Transform<Output9, Output10>
+): Output10;
 export function pipe<Input, const Outputs extends readonly unknown[]>(
   input: Input,
   ...transforms: PipeTransforms<Input, Outputs>

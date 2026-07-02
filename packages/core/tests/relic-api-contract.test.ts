@@ -15,6 +15,7 @@ import {
   hostCall,
   index,
   insert,
+  keyBy,
   mat,
   pipe,
   project,
@@ -87,7 +88,7 @@ function usersByNameQuery(): Query<UserListRow> {
     hash(user.teamId),
     project({ id: user.id, name: user.name, teamId: user.teamId }),
     sort(user.name)
-  ) as Query<UserListRow>;
+  ) satisfies Query<UserListRow>;
 }
 
 describe('Relic public TypeScript API contract', () => {
@@ -126,6 +127,33 @@ describe('Relic public TypeScript API contract', () => {
       { id: 'ada', name: 'Ada', teamId: 'eng' },
       { id: 'bea', name: 'Bea', teamId: 'design' },
       { id: 'cal', name: 'Cal', teamId: 'missing' }
+    ]);
+  });
+
+  it('infers projected pipe row types for public query consumers', async () => {
+    const user = as(coreSchema.users, 'user');
+    const state = createDb(sourceData);
+    const usersById = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) satisfies Query<{ readonly id: string; readonly name: string }>;
+    const rows = qRows(state, usersById);
+    const materialized = mat(state, usersById, { id: 'active-user-names' });
+    const events: WatchEvent<{ readonly id: string; readonly name: string }>[] = [];
+    const handle = watch(state, usersById, (event) => {
+      events.push(event);
+    });
+
+    expectTypeOf(rows).toEqualTypeOf<Promise<readonly { readonly id: string; readonly name: string }[]>>();
+    expectTypeOf(materialized).toMatchTypeOf<Db & MaterializedDb>();
+    expectTypeOf(handle).toEqualTypeOf<WatchHandle<Db, { readonly id: string; readonly name: string }>>();
+    expect(unwatch(handle)).toMatchObject({ kind: 'unwatch', closed: true });
+    expect(events).toEqual([]);
+    await expect(rows).resolves.toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
     ]);
   });
 
@@ -188,7 +216,7 @@ describe('Relic public TypeScript API contract', () => {
       where(eq(user.active, true)),
       where(eq(user.age, env<number>('minimumAge'))),
       project({ id: user.id, name: user.name })
-    ) as Query<{ readonly id: string; readonly name: string }>;
+    ) satisfies Query<{ readonly id: string; readonly name: string }>;
     const requiredName = req(coreSchema.users, 'name');
     const taskOwner = fk(coreSchema.tasks, 'ownerId', coreSchema.users, 'id');
     const uniqueUserName = unique(coreSchema.users, ['teamId', 'name'] as const);
@@ -268,7 +296,7 @@ describe('Relic public TypeScript API contract', () => {
         senior: seniorCall
       }),
       sort(user.id)
-    ) as Query<UserLabelRow>;
+    ) satisfies Query<UserLabelRow>;
     const rows = qRows(createDb(sourceData), query, {
       env: { suffix: 'core' },
       functions: { label: (name, suffix) => `${name}:${suffix}` }
