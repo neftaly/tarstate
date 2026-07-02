@@ -1,6 +1,6 @@
 import type { RelationDelta } from './adapter.js';
 import type { RowChange, RowDiffDiagnostic } from './diff.js';
-import { rowKey } from './evaluate.js';
+import { rowKey, type EvaluateFunctions } from './evaluate.js';
 import { stableKey } from './identity.js';
 import { equalityJoinPlan, type EqualityJoinPlan, type FieldExpression } from './join-planner.js';
 import {
@@ -92,6 +92,10 @@ export type IncrementalPlanResult =
       readonly supported: false;
       readonly reason: string;
     };
+
+export type IncrementalMaterializationPlanOptions = {
+  readonly functions?: EvaluateFunctions;
+};
 
 export type IncrementalMaintenanceResult<Row = unknown> =
   | {
@@ -286,6 +290,12 @@ type PlanCollection = {
   ordered?: MutableIncrementalOrderedStep;
 };
 
+type IncrementalEvaluationContext = Readonly<Record<string, unknown>> & {
+  readonly env: Readonly<Record<string, unknown>>;
+  readonly functions?: EvaluateFunctions;
+  readonly [incrementalEvaluationContext]: true;
+};
+
 type MutableIncrementalOrderedStep = {
   readonly kind: 'ordered';
   readonly order: readonly SortData[];
@@ -421,6 +431,8 @@ type RightBranchPlanCollection = {
   branchJoinCount: number;
 };
 
+const incrementalEvaluationContext = Symbol('incrementalEvaluationContext');
+
 const supportedAggregateFunctions: ReadonlySet<AggregateFunction> = new Set([
   'count',
   'sum',
@@ -440,8 +452,34 @@ const supportedAggregateFunctions: ReadonlySet<AggregateFunction> = new Set([
 
 const staticRowsRelationReason = 'query depends on relation rows';
 
-export function planIncrementalMaterialization(query: Query): IncrementalPlanResult {
-  const staticPlan = collectStaticRowsPlan(query.data);
+function incrementalEvalContext(
+  env: Readonly<Record<string, unknown>>,
+  options: IncrementalMaterializationPlanOptions
+): IncrementalEvaluationContext {
+  return {
+    [incrementalEvaluationContext]: true,
+    env,
+    ...(options.functions === undefined ? {} : { functions: options.functions })
+  } as IncrementalEvaluationContext;
+}
+
+function isIncrementalEvalContext(input: Readonly<Record<string, unknown>>): input is IncrementalEvaluationContext {
+  return (input as Partial<IncrementalEvaluationContext>)[incrementalEvaluationContext] === true;
+}
+
+function evalEnv(input: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+  return isIncrementalEvalContext(input) ? input.env : input;
+}
+
+function evalFunctions(input: Readonly<Record<string, unknown>>): EvaluateFunctions | undefined {
+  return isIncrementalEvalContext(input) ? input.functions : undefined;
+}
+
+export function planIncrementalMaterialization(
+  query: Query,
+  options: IncrementalMaterializationPlanOptions = {}
+): IncrementalPlanResult {
+  const staticPlan = collectStaticRowsPlan(query.data, options);
   if (typeof staticPlan !== 'string') {
     return {
       supported: true,
@@ -454,10 +492,10 @@ export function planIncrementalMaterialization(query: Query): IncrementalPlanRes
     };
   }
 
-  const dynamicSetPlan = collectDynamicSetPlan(query.data);
+  const dynamicSetPlan = collectDynamicSetPlan(query.data, options);
   const steps: IncrementalStep[] = [];
   const collection: PlanCollection = { joinCount: 0, subqueryCount: 0, subqueryKeys: new Set() };
-  const root = collectSingleRootPlan(query.data, steps, collection);
+  const root = collectSingleRootPlan(query.data, steps, collection, options);
   if (typeof root === 'string') {
     if (dynamicSetPlan.supported) {
       for (const relationName of dynamicSetRelationNames(dynamicSetPlan.plan)) {
@@ -519,14 +557,16 @@ export function buildIncrementalMaterialization<Row>(
   env: Readonly<Record<string, unknown>>,
   relationSnapshots: ReadonlyMap<string, IncrementalRelationSnapshot> = relation === undefined
     ? new Map()
-    : new Map([[relation.name, { relation, rows: rootRows }]])
+    : new Map([[relation.name, { relation, rows: rootRows }]]),
+  options: IncrementalMaterializationPlanOptions = {}
 ): IncrementalMaterializationBuildResult<Row> {
+  const ctx = incrementalEvalContext(env, options);
   if (plan.kind === 'staticRows') {
-    return buildStaticIncrementalMaterialization(plan, env);
+    return buildStaticIncrementalMaterialization(plan, ctx);
   }
 
   if (plan.kind === 'dynamicSet') {
-    return buildDynamicSetIncrementalMaterialization(plan, relationSnapshots, env);
+    return buildDynamicSetIncrementalMaterialization(plan, relationSnapshots, ctx);
   }
 
   if (relation === undefined) {
@@ -544,7 +584,7 @@ export function buildIncrementalMaterialization<Row>(
     };
   }
 
-  const joinStatesResult = buildJoinStates(plan, relationSnapshots, env);
+  const joinStatesResult = buildJoinStates(plan, relationSnapshots, ctx);
   if (!joinStatesResult.supported) {
     return {
       supported: false,
@@ -563,7 +603,7 @@ export function buildIncrementalMaterialization<Row>(
     rootKeys.push(key);
     rootRowsByRootKey.set(key, row);
 
-    const evaluated = evaluateRootRow<unknown>(plan, row, env, joinStateById);
+    const evaluated = evaluateRootRow<unknown>(plan, row, ctx, joinStateById);
     if (!evaluated.supported) {
       return {
         supported: false,
@@ -582,7 +622,7 @@ export function buildIncrementalMaterialization<Row>(
   const aggregate = aggregateStep(plan);
   const aggregateState = aggregate === undefined
     ? undefined
-    : buildAggregateState<Row>(plan, rootKeys, outputsByRootKey, env, joinStateMap(joinStates));
+    : buildAggregateState<Row>(plan, rootKeys, outputsByRootKey, ctx, joinStateMap(joinStates));
   if (aggregateState !== undefined && !aggregateState.supported) {
     return {
       supported: false,
@@ -594,7 +634,7 @@ export function buildIncrementalMaterialization<Row>(
       plan,
       joinStates,
       aggregateState.state,
-      env
+      ctx
     );
     if (!postAggregateJoinStates.supported) {
       return {
@@ -616,7 +656,7 @@ export function buildIncrementalMaterialization<Row>(
     ...(aggregateState === undefined ? {} : { aggregate: aggregateState.state })
   };
 
-  const orderedState = buildOrderedState<Row>(plan, state, env);
+  const orderedState = buildOrderedState<Row>(plan, state, ctx);
   if (orderedState !== undefined) {
     if (!orderedState.supported) {
       return {
@@ -650,9 +690,11 @@ export function buildIncrementalMaterialization<Row>(
 
 export function buildStaticIncrementalMaterialization<Row>(
   plan: IncrementalStaticRowsMaterializationPlan,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  options: IncrementalMaterializationPlanOptions = {}
 ): IncrementalMaterializationBuildResult<Row> {
-  const evaluated = evaluateStaticRows(plan.data, env);
+  const ctx = isIncrementalEvalContext(env) ? env : incrementalEvalContext(env, options);
+  const evaluated = evaluateStaticRows(plan.data, ctx);
   if (!evaluated.supported) {
     return {
       supported: false,
@@ -774,8 +816,10 @@ export function maintainIncrementalMaterialization<Row>(
   materialization: IncrementalMaterialization<Row>,
   relation: RelationRef | undefined,
   deltas: readonly RelationDelta[],
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  options: IncrementalMaterializationPlanOptions = {}
 ): IncrementalMaintenanceResult<Row> {
+  const ctx = incrementalEvalContext(env, options);
   if (materialization.plan.kind === 'staticRows') {
     return {
       updated: true,
@@ -792,7 +836,7 @@ export function maintainIncrementalMaterialization<Row>(
   }
 
   if (materialization.plan.kind === 'dynamicSet') {
-    return maintainDynamicSetMaterialization(materialization.plan, materialization, deltas, env);
+    return maintainDynamicSetMaterialization(materialization.plan, materialization, deltas, ctx);
   }
 
   if (relation === undefined) {
@@ -910,7 +954,7 @@ export function maintainIncrementalMaterialization<Row>(
     }
 
     let nextJoinState = currentState;
-    const nestedChanged = applyNestedBranchJoinChanges(joinStep, nextJoinState, deltas, env);
+    const nestedChanged = applyNestedBranchJoinChanges(joinStep, nextJoinState, deltas, ctx);
     if (!nestedChanged.supported) {
       return {
         updated: false,
@@ -945,7 +989,7 @@ export function maintainIncrementalMaterialization<Row>(
           };
         }
       } else {
-        const changed = applyRightRelationChanges(joinStep, nextJoinState, deltaRelation, rightChanges.changes, env);
+        const changed = applyRightRelationChanges(joinStep, nextJoinState, deltaRelation, rightChanges.changes, ctx);
         if (!changed.supported) {
           return {
             updated: false,
@@ -976,7 +1020,7 @@ export function maintainIncrementalMaterialization<Row>(
     }
 
     let nextJoinState = currentState;
-    const nestedChanged = applyNestedBranchJoinChanges(joinStep, nextJoinState, deltas, env);
+    const nestedChanged = applyNestedBranchJoinChanges(joinStep, nextJoinState, deltas, ctx);
     if (!nestedChanged.supported) {
       return {
         updated: false,
@@ -1010,7 +1054,7 @@ export function maintainIncrementalMaterialization<Row>(
           };
         }
       } else {
-        const changed = applyRightRelationChanges(joinStep, nextJoinState, deltaRelation, rightChanges.changes, env);
+        const changed = applyRightRelationChanges(joinStep, nextJoinState, deltaRelation, rightChanges.changes, ctx);
         if (!changed.supported) {
           return {
             updated: false,
@@ -1110,7 +1154,7 @@ export function maintainIncrementalMaterialization<Row>(
     groupKeysByRootKey?.delete(rootKey);
     removeRootJoinValues(rootJoinIndexes, rootKey);
 
-    const evaluated = evaluateRootRow<unknown>(materialization.plan, row, env, joinStateById);
+    const evaluated = evaluateRootRow<unknown>(materialization.plan, row, ctx, joinStateById);
     if (!evaluated.supported) {
       return {
         updated: false,
@@ -1120,7 +1164,7 @@ export function maintainIncrementalMaterialization<Row>(
 
     outputsByRootKey.set(rootKey, evaluated.rows);
     if (aggregate !== undefined && groupKeysByRootKey !== undefined) {
-      const nextGroupKeys = aggregateGroupKeysForRows(aggregate, evaluated.rows, env);
+      const nextGroupKeys = aggregateGroupKeysForRows(aggregate, evaluated.rows, ctx);
       recordAggregateGroupKeys(affectedAggregateGroupKeys, nextGroupKeys);
       if (nextGroupKeys.length > 0) {
         groupKeysByRootKey.set(rootKey, nextGroupKeys);
@@ -1144,7 +1188,7 @@ export function maintainIncrementalMaterialization<Row>(
       groupKeysByRootKey ?? new Map(),
       rootKeysByGroupKey ?? new Map(),
       affectedAggregateGroupKeys,
-      env,
+      ctx,
       joinStateMap(nextJoinStates)
     );
   if (nextAggregateState !== undefined && !nextAggregateState.supported) {
@@ -1158,7 +1202,7 @@ export function maintainIncrementalMaterialization<Row>(
       materialization.plan,
       nextJoinStates,
       nextAggregateState.state,
-      env
+      ctx
     );
     if (!postAggregateJoinStates.supported) {
       return {
@@ -1186,7 +1230,7 @@ export function maintainIncrementalMaterialization<Row>(
       previousOrderedState as IncrementalOrderedState<Row>,
       state,
       nextAggregateState === undefined ? changedRootKeys : affectedAggregateGroupKeys,
-      env
+      ctx
     );
     if (!nextOrderedState.supported) {
       return {
@@ -1500,17 +1544,20 @@ function dynamicSetRowReport<Row>(
   };
 }
 
-function collectDynamicSetPlan(data: QueryData):
+function collectDynamicSetPlan(
+  data: QueryData,
+  options: IncrementalMaterializationPlanOptions
+):
   | { readonly supported: true; readonly plan: IncrementalDynamicSetMaterializationPlan }
   | { readonly supported: false; readonly reason: string } {
   switch (data.op) {
     case 'keyBy':
-      return collectDynamicSetPlan(data.input);
+      return collectDynamicSetPlan(data.input, options);
     case 'union':
     case 'intersection':
-      return collectDynamicSetBranches(data.op, data.inputs);
+      return collectDynamicSetBranches(data.op, data.inputs, options);
     case 'difference':
-      return collectDynamicSetBranches('difference', [data.left, data.right]);
+      return collectDynamicSetBranches('difference', [data.left, data.right], options);
     default:
       return {
         supported: false,
@@ -1521,7 +1568,8 @@ function collectDynamicSetPlan(data: QueryData):
 
 function collectDynamicSetBranches(
   op: 'union' | 'intersection' | 'difference',
-  inputs: readonly QueryData[]
+  inputs: readonly QueryData[],
+  options: IncrementalMaterializationPlanOptions
 ):
   | { readonly supported: true; readonly plan: IncrementalDynamicSetMaterializationPlan }
   | { readonly supported: false; readonly reason: string } {
@@ -1534,7 +1582,7 @@ function collectDynamicSetBranches(
 
   const branches: IncrementalBranchPlan[] = [];
   for (const [index, input] of inputs.entries()) {
-    const branch = collectRightBranchPlan(input, { allowNestedJoin: false });
+    const branch = collectRightBranchPlan(input, { allowNestedJoin: false }, options);
     if (typeof branch === 'string') {
       return {
         supported: false,
@@ -1561,7 +1609,8 @@ function isSetQueryData(data: QueryData): boolean {
 function collectSingleRootPlan(
   data: QueryData,
   steps: IncrementalStep[],
-  collection: PlanCollection
+  collection: PlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): RootPlan | string {
   switch (data.op) {
     case 'from':
@@ -1572,7 +1621,7 @@ function collectSingleRootPlan(
         shape: shapeForRoot(data.relation, data.alias)
       };
     case 'lookup': {
-      const reason = simpleExprReason(data.value);
+      const reason = constantExprReason(data.value, options);
       if (reason !== undefined) {
         return `lookup value is not supported for incremental maintenance: ${reason}`;
       }
@@ -1584,14 +1633,14 @@ function collectSingleRootPlan(
       };
     }
     case 'where': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       if (collection.ordered !== undefined) {
         return 'where after order/window is not supported for incremental maintenance';
       }
       const reason = hasAggregateStep(steps)
-        ? rowLocalPredicateReason(data.predicate, root.shape)
-        : planPredicateReason(data.predicate, root.shape, steps, collection);
+        ? rowLocalPredicateReason(data.predicate, root.shape, options)
+        : planPredicateReason(data.predicate, root.shape, steps, collection, options);
       if (reason !== undefined) {
         return `where predicate is not supported for incremental maintenance: ${reason}`;
       }
@@ -1600,10 +1649,10 @@ function collectSingleRootPlan(
     }
     case 'hash':
     case 'btree': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       for (const expression of data.expressions) {
-        const reason = simpleExprReason(expression);
+        const reason = rowLocalExprReason(expression, root.shape, options);
         if (reason !== undefined) {
           return `${data.op} expression is not supported for incremental maintenance: ${reason}`;
         }
@@ -1611,13 +1660,13 @@ function collectSingleRootPlan(
       return root;
     }
     case 'keyBy':
-      return collectSingleRootPlan(data.input, steps, collection);
+      return collectSingleRootPlan(data.input, steps, collection, options);
     case 'select': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const reason = planProjectionReason(data.projection, root.shape, steps, collection, {
         allowSubqueries: collection.ordered === undefined && !hasAggregateStep(steps)
-      });
+      }, options);
       if (reason !== undefined) {
         return `select projection is not supported for incremental maintenance: ${reason}`;
       }
@@ -1630,11 +1679,11 @@ function collectSingleRootPlan(
       return { ...root, shape: selectShape(root.shape, data.projection) };
     }
     case 'extend': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const reason = planProjectionReason(data.projection, root.shape, steps, collection, {
         allowSubqueries: collection.ordered === undefined && !hasAggregateStep(steps)
-      });
+      }, options);
       if (reason !== undefined) {
         return `extend projection is not supported for incremental maintenance: ${reason}`;
       }
@@ -1647,7 +1696,7 @@ function collectSingleRootPlan(
       return { ...root, shape: extendShape(root.shape, data.projection) };
     }
     case 'without': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const step = { kind: 'without', fields: data.fields } satisfies IncrementalPostOrderStep;
       if (collection.ordered !== undefined) {
@@ -1658,7 +1707,7 @@ function collectSingleRootPlan(
       return { ...root, shape: withoutShape(root.shape, data.fields) };
     }
     case 'rename': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const step = { kind: 'rename', fields: data.fields } satisfies IncrementalPostOrderStep;
       if (collection.ordered !== undefined) {
@@ -1669,7 +1718,7 @@ function collectSingleRootPlan(
       return { ...root, shape: renameShape(root.shape, data.fields) };
     }
     case 'qualify': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const step = { kind: 'qualify', alias: data.alias } satisfies IncrementalPostOrderStep;
       if (collection.ordered !== undefined) {
@@ -1680,12 +1729,12 @@ function collectSingleRootPlan(
       return { ...root, shape: qualifyShape(root.shape, data.alias) };
     }
     case 'expand': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       if (collection.ordered !== undefined) {
         return 'expand after order/window is not supported for incremental maintenance';
       }
-      const reason = rowLocalExprReason(data.collection, root.shape);
+      const reason = rowLocalExprReason(data.collection, root.shape, options);
       if (reason !== undefined) {
         return `expand collection is not supported for incremental maintenance: ${reason}`;
       }
@@ -1698,12 +1747,12 @@ function collectSingleRootPlan(
       return { ...root, shape: expandShape(root.shape, data.alias, data.fields) };
     }
     case 'join': {
-      const left = collectSingleRootPlan(data.left, steps, collection);
+      const left = collectSingleRootPlan(data.left, steps, collection, options);
       if (typeof left === 'string') return left;
       if (collection.ordered !== undefined) {
         return `${data.kind} join after order/window is not supported for incremental maintenance`;
       }
-      const right = collectRightBranchPlan(data.right, { allowNestedJoin: true });
+      const right = collectRightBranchPlan(data.right, { allowNestedJoin: true }, options);
       if (typeof right === 'string') {
         return `join right branch is not supported for incremental maintenance: ${right}`;
       }
@@ -1738,12 +1787,12 @@ function collectSingleRootPlan(
       return { ...left, shape: mergeShapes(left.shape, right.shape) };
     }
     case 'sort': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       if (collection.ordered !== undefined) {
         return 'sort after order/window is not supported for incremental maintenance';
       }
-      const reason = sortOrderReason(data.order, root.shape);
+      const reason = sortOrderReason(data.order, root.shape, options);
       if (reason !== undefined) {
         return `sort order is not supported for incremental maintenance: ${reason}`;
       }
@@ -1755,7 +1804,7 @@ function collectSingleRootPlan(
       return root;
     }
     case 'limit': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const window = normalizedWindow(data.count, data.offset ?? 0);
       if (typeof window === 'string') {
@@ -1774,12 +1823,12 @@ function collectSingleRootPlan(
       return root;
     }
     case 'sortLimit': {
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       if (collection.ordered !== undefined) {
         return 'sortLimit after order/window is not supported for incremental maintenance';
       }
-      const orderReason = sortOrderReason(data.order, root.shape);
+      const orderReason = sortOrderReason(data.order, root.shape, options);
       if (orderReason !== undefined) {
         return `sortLimit order is not supported for incremental maintenance: ${orderReason}`;
       }
@@ -1798,14 +1847,14 @@ function collectSingleRootPlan(
     case 'union':
       return 'union is not supported for incremental maintenance';
     case 'intersection':
-      return collectIntersectionPlan(data.inputs, steps, collection);
+      return collectIntersectionPlan(data.inputs, steps, collection, options);
     case 'difference':
-      return collectDifferencePlan(data.left, data.right, steps, collection);
+      return collectDifferencePlan(data.left, data.right, steps, collection, options);
     case 'constRows':
       return 'constRows is not supported for incremental maintenance';
     case 'aggregate': {
       const stepCount = steps.length;
-      const root = collectSingleRootPlan(data.input, steps, collection);
+      const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       if (collection.ordered !== undefined) {
         return 'aggregate after order/window is not supported for incremental maintenance';
@@ -1815,12 +1864,12 @@ function collectSingleRootPlan(
         return 'nested aggregate is not supported for incremental maintenance';
       }
 
-      const groupReason = rowLocalProjectionReason(data.groupBy, root.shape);
+      const groupReason = rowLocalProjectionReason(data.groupBy, root.shape, options);
       if (groupReason !== undefined) {
         return `aggregate groupBy projection is not supported for incremental maintenance: ${groupReason}`;
       }
 
-      const aggregateReason = aggregateProjectionReason(data.aggregates, root.shape);
+      const aggregateReason = aggregateProjectionReason(data.aggregates, root.shape, options);
       if (aggregateReason !== undefined) {
         return `aggregate projection is not supported for incremental maintenance: ${aggregateReason}`;
       }
@@ -1836,10 +1885,11 @@ function planProjectionReason(
   shape: PlanShape,
   steps: IncrementalStep[],
   collection: PlanCollection,
-  options: { readonly allowSubqueries: boolean }
+  options: { readonly allowSubqueries: boolean },
+  planOptions: IncrementalMaterializationPlanOptions
 ): string | undefined {
   for (const item of Object.values(projection)) {
-    const reason = planExprReason(projectionExpr(item), shape, steps, collection, options);
+    const reason = planExprReason(projectionExpr(item), shape, steps, collection, options, planOptions);
     if (reason !== undefined) {
       return reason;
     }
@@ -1851,7 +1901,8 @@ function planPredicateReason(
   predicate: PredicateData,
   shape: PlanShape,
   steps: IncrementalStep[],
-  collection: PlanCollection
+  collection: PlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): string | undefined {
   switch (predicate.op) {
     case 'eq':
@@ -1860,19 +1911,19 @@ function planPredicateReason(
     case 'lte':
     case 'gt':
     case 'gte':
-      return planExprReason(predicate.left, shape, steps, collection, { allowSubqueries: true }) ??
-        planExprReason(predicate.right, shape, steps, collection, { allowSubqueries: true });
+      return planExprReason(predicate.left, shape, steps, collection, { allowSubqueries: true }, options) ??
+        planExprReason(predicate.right, shape, steps, collection, { allowSubqueries: true }, options);
     case 'and':
     case 'or':
       for (const item of predicate.predicates) {
-        const reason = planPredicateReason(item, shape, steps, collection);
+        const reason = planPredicateReason(item, shape, steps, collection, options);
         if (reason !== undefined) {
           return reason;
         }
       }
       return undefined;
     case 'not':
-      return planPredicateReason(predicate.predicate, shape, steps, collection);
+      return planPredicateReason(predicate.predicate, shape, steps, collection, options);
   }
 }
 
@@ -1881,7 +1932,8 @@ function planExprReason(
   shape: PlanShape,
   steps: IncrementalStep[],
   collection: PlanCollection,
-  options: { readonly allowSubqueries: boolean }
+  options: { readonly allowSubqueries: boolean },
+  planOptions: IncrementalMaterializationPlanOptions
 ): string | undefined {
   switch (expr.op) {
     case 'field':
@@ -1890,7 +1942,7 @@ function planExprReason(
       return undefined;
     case 'tuple':
       for (const item of expr.items) {
-        const reason = planExprReason(item, shape, steps, collection, options);
+        const reason = planExprReason(item, shape, steps, collection, options, planOptions);
         if (reason !== undefined) {
           return reason;
         }
@@ -1900,11 +1952,12 @@ function planExprReason(
       if (!options.allowSubqueries) {
         return 'subquery expressions after aggregate/order are not supported for incremental maintenance';
       }
-      return planSubqueryExpression(expr, shape, steps, collection);
+      return planSubqueryExpression(expr, shape, steps, collection, planOptions);
     case 'hostCall':
-      return rowLocalExprReason(expr, shape);
-    case 'env':
+      return rowLocalExprReason(expr, shape, planOptions);
     case 'call':
+      return namedCallReason(expr, (arg) => planExprReason(arg, shape, steps, collection, options, planOptions), planOptions);
+    case 'env':
     case 'aggregateCall':
       return simpleExprReason(expr);
   }
@@ -1914,7 +1967,8 @@ function planSubqueryExpression(
   expr: Extract<ExprData, { readonly op: 'subquery' }>,
   outerShape: PlanShape,
   steps: IncrementalStep[],
-  collection: PlanCollection
+  collection: PlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): string | undefined {
   const exprKey = subqueryExprKey(expr);
   if (collection.subqueryKeys.has(exprKey)) {
@@ -1926,7 +1980,7 @@ function planSubqueryExpression(
     hiddenField,
     allowCorrelation: true
   };
-  const lowered = lowerCorrelatedSubqueryData(expr.query, outerShape, lowerState);
+  const lowered = lowerCorrelatedSubqueryData(expr.query, outerShape, lowerState, options);
   if (typeof lowered === 'string') {
     return `subquery expression is not supported for incremental maintenance: ${lowered}`;
   }
@@ -1934,7 +1988,7 @@ function planSubqueryExpression(
     return 'subquery incremental maintenance requires an unambiguous equality correlation';
   }
 
-  const right = collectRightBranchPlan(lowered.data, { allowNestedJoin: true });
+  const right = collectRightBranchPlan(lowered.data, { allowNestedJoin: true }, options);
   if (typeof right === 'string') {
     return `subquery branch is not supported for incremental maintenance: ${right}`;
   }
@@ -1977,7 +2031,8 @@ type LoweredCorrelatedSubqueryData = {
 function lowerCorrelatedSubqueryData(
   data: QueryData,
   outerShape: PlanShape,
-  state: LowerCorrelatedSubqueryState
+  state: LowerCorrelatedSubqueryState,
+  options: IncrementalMaterializationPlanOptions
 ): LoweredCorrelatedSubqueryData | string {
   switch (data.op) {
     case 'from':
@@ -1986,7 +2041,7 @@ function lowerCorrelatedSubqueryData(
         shape: shapeForRoot(data.relation, data.alias)
       };
     case 'lookup': {
-      const reason = constantExprReason(data.value);
+      const reason = constantExprReason(data.value, options);
       if (reason !== undefined) {
         return `lookup value is not supported: ${reason}`;
       }
@@ -1996,9 +2051,9 @@ function lowerCorrelatedSubqueryData(
       };
     }
     case 'where': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
-      const split = splitSubqueryPredicate(data.predicate, outerShape, input.shape);
+      const split = splitSubqueryPredicate(data.predicate, outerShape, input.shape, options);
       if (typeof split === 'string') return split;
 
       let nextData = input.data;
@@ -2031,10 +2086,10 @@ function lowerCorrelatedSubqueryData(
     }
     case 'hash':
     case 'btree': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
       for (const expression of data.expressions) {
-        const reason = simpleExprReason(expression) ?? exprShapeReason(expression, input.shape);
+        const reason = rowLocalExprReason(expression, input.shape, options);
         if (reason !== undefined) {
           return `${data.op} expression is not supported: ${reason}`;
         }
@@ -2045,18 +2100,18 @@ function lowerCorrelatedSubqueryData(
       };
     }
     case 'keyBy': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       return typeof input === 'string'
         ? input
         : { data: { ...data, input: input.data }, shape: input.shape };
     }
     case 'select': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
       const projection = state.correlation === undefined
         ? data.projection
         : projectionWithHiddenSubqueryField(data.projection, state.hiddenField);
-      const reason = rowLocalProjectionReason(projection, input.shape);
+      const reason = rowLocalProjectionReason(projection, input.shape, options);
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
       }
@@ -2066,12 +2121,12 @@ function lowerCorrelatedSubqueryData(
       };
     }
     case 'extend': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
       if (Object.hasOwn(data.projection, state.hiddenField)) {
         return 'subquery projection conflicts with an internal correlation field';
       }
-      const reason = rowLocalProjectionReason(data.projection, input.shape);
+      const reason = rowLocalProjectionReason(data.projection, input.shape, options);
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
       }
@@ -2081,9 +2136,9 @@ function lowerCorrelatedSubqueryData(
       };
     }
     case 'expand': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
-      const reason = rowLocalExprReason(data.collection, input.shape);
+      const reason = rowLocalExprReason(data.collection, input.shape, options);
       if (reason !== undefined) {
         return `expand collection is not supported: ${reason}`;
       }
@@ -2093,7 +2148,7 @@ function lowerCorrelatedSubqueryData(
       };
     }
     case 'without': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
       if (state.correlation !== undefined && data.fields.includes(state.hiddenField)) {
         return 'without cannot remove an internal subquery correlation field';
@@ -2104,7 +2159,7 @@ function lowerCorrelatedSubqueryData(
       };
     }
     case 'rename': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
       if (
         state.correlation !== undefined &&
@@ -2118,7 +2173,7 @@ function lowerCorrelatedSubqueryData(
       };
     }
     case 'qualify': {
-      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state, options);
       if (typeof input === 'string') return input;
       if (state.correlation !== undefined) {
         return 'qualify after subquery correlation is not supported';
@@ -2133,7 +2188,7 @@ function lowerCorrelatedSubqueryData(
         return 'left joins inside correlated subqueries are not supported';
       }
 
-      const left = lowerCorrelatedSubqueryData(data.left, outerShape, state);
+      const left = lowerCorrelatedSubqueryData(data.left, outerShape, state, options);
       if (typeof left === 'string') {
         return `subquery join left side is not supported: ${left}`;
       }
@@ -2142,7 +2197,7 @@ function lowerCorrelatedSubqueryData(
         hiddenField: state.hiddenField,
         allowCorrelation: false
       };
-      const right = lowerCorrelatedSubqueryData(data.right, outerShape, rightState);
+      const right = lowerCorrelatedSubqueryData(data.right, outerShape, rightState, options);
       if (typeof right === 'string') {
         return `subquery join right side is not supported: ${right}`;
       }
@@ -2185,13 +2240,14 @@ type SplitSubqueryPredicateResult = {
 function splitSubqueryPredicate(
   predicate: PredicateData,
   outerShape: PlanShape,
-  branchShape: PlanShape
+  branchShape: PlanShape,
+  options: IncrementalMaterializationPlanOptions
 ): SplitSubqueryPredicateResult | string {
   if (predicate.op === 'and') {
     let correlation: EqualityJoinPlan | undefined;
     const residuals: PredicateData[] = [];
     for (const item of predicate.predicates) {
-      const split = splitSubqueryPredicate(item, outerShape, branchShape);
+      const split = splitSubqueryPredicate(item, outerShape, branchShape, options);
       if (typeof split === 'string') return split;
       if (split.correlation !== undefined) {
         if (correlation !== undefined) {
@@ -2214,13 +2270,13 @@ function splitSubqueryPredicate(
     return { correlation: equality };
   }
 
-  const branchReason = rowLocalPredicateReason(predicate, branchShape);
+  const branchReason = rowLocalPredicateReason(predicate, branchShape, options);
   if (branchReason === undefined) {
     return { residual: predicate };
   }
 
   const mergedShape = mergeShapes(outerShape, branchShape);
-  const mergedReason = rowLocalPredicateReason(predicate, mergedShape);
+  const mergedReason = rowLocalPredicateReason(predicate, mergedShape, options);
   if (mergedReason === undefined) {
     return 'non-equality correlated subquery predicates are not supported for incremental maintenance';
   }
@@ -2257,9 +2313,13 @@ function subqueryExprKey(expr: Extract<ExprData, { readonly op: 'subquery' }>): 
   return stableKey({ mode: expr.mode, query: expr.query });
 }
 
-function sortOrderReason(order: readonly SortData[], shape: PlanShape): string | undefined {
+function sortOrderReason(
+  order: readonly SortData[],
+  shape: PlanShape,
+  options: IncrementalMaterializationPlanOptions
+): string | undefined {
   for (const item of order) {
-    const reason = rowLocalExprReason(item.expr, shape);
+    const reason = rowLocalExprReason(item.expr, shape, options);
     if (reason !== undefined) {
       return reason;
     }
@@ -2296,14 +2356,15 @@ function combineWindows(
 function collectIntersectionPlan(
   inputs: readonly QueryData[],
   steps: IncrementalStep[],
-  collection: PlanCollection
+  collection: PlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): RootPlan | string {
   const [leftInput, ...rightInputs] = inputs;
   if (leftInput === undefined || rightInputs.length === 0) {
     return 'intersection incremental maintenance requires one supported root branch and static right branches';
   }
 
-  const root = collectSingleRootPlan(leftInput, steps, collection);
+  const root = collectSingleRootPlan(leftInput, steps, collection, options);
   if (typeof root === 'string') {
     return `intersection first branch is not supported for incremental maintenance: ${root}`;
   }
@@ -2311,7 +2372,7 @@ function collectIntersectionPlan(
     return 'intersection after order/window is not supported for incremental maintenance';
   }
 
-  const rightRows = collectStaticSetRows(rightInputs, 'intersection');
+  const rightRows = collectStaticSetRows(rightInputs, 'intersection', options);
   if (typeof rightRows === 'string') {
     return rightRows;
   }
@@ -2324,9 +2385,10 @@ function collectDifferencePlan(
   leftInput: QueryData,
   rightInput: QueryData,
   steps: IncrementalStep[],
-  collection: PlanCollection
+  collection: PlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): RootPlan | string {
-  const root = collectSingleRootPlan(leftInput, steps, collection);
+  const root = collectSingleRootPlan(leftInput, steps, collection, options);
   if (typeof root === 'string') {
     return `difference left branch is not supported for incremental maintenance: ${root}`;
   }
@@ -2334,7 +2396,7 @@ function collectDifferencePlan(
     return 'difference after order/window is not supported for incremental maintenance';
   }
 
-  const rightRows = collectStaticSetRows([rightInput], 'difference');
+  const rightRows = collectStaticSetRows([rightInput], 'difference', options);
   if (typeof rightRows === 'string') {
     return rightRows;
   }
@@ -2345,16 +2407,17 @@ function collectDifferencePlan(
 
 function collectStaticSetRows(
   inputs: readonly QueryData[],
-  op: 'intersection' | 'difference'
+  op: 'intersection' | 'difference',
+  options: IncrementalMaterializationPlanOptions
 ): readonly (readonly Record<string, unknown>[])[] | string {
   const rows: Array<readonly Record<string, unknown>[]> = [];
   for (const input of inputs) {
-    const planned = collectStaticRowsPlan(input);
+    const planned = collectStaticRowsPlan(input, options);
     if (typeof planned === 'string') {
       return `${op} static branch is not supported for incremental maintenance: ${planned}`;
     }
 
-    const evaluated = evaluateStaticRows(input, {});
+    const evaluated = evaluateStaticRows(input, incrementalEvalContext({}, options));
     if (!evaluated.supported) {
       return `${op} static branch is not supported for incremental maintenance: ${evaluated.reason}`;
     }
@@ -2363,22 +2426,25 @@ function collectStaticSetRows(
   return rows;
 }
 
-function collectStaticRowsPlan(data: QueryData): PlanShape | string {
+function collectStaticRowsPlan(
+  data: QueryData,
+  options: IncrementalMaterializationPlanOptions
+): PlanShape | string {
   switch (data.op) {
     case 'constRows':
       return shapeForConstRows(data.rows);
     case 'where': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
-      const reason = rowLocalPredicateReason(data.predicate, shape);
+      const reason = rowLocalPredicateReason(data.predicate, shape, options);
       return reason === undefined ? shape : `where predicate is not supported: ${reason}`;
     }
     case 'hash':
     case 'btree': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
       for (const expression of data.expressions) {
-        const reason = simpleExprReason(expression) ?? exprShapeReason(expression, shape);
+        const reason = rowLocalExprReason(expression, shape, options);
         if (reason !== undefined) {
           return `${data.op} expression is not supported: ${reason}`;
         }
@@ -2386,60 +2452,60 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
       return shape;
     }
     case 'keyBy':
-      return collectStaticRowsPlan(data.input);
+      return collectStaticRowsPlan(data.input, options);
     case 'select': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
-      const reason = rowLocalProjectionReason(data.projection, shape);
+      const reason = rowLocalProjectionReason(data.projection, shape, options);
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
       }
       return selectShape(shape, data.projection);
     }
     case 'extend': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
-      const reason = rowLocalProjectionReason(data.projection, shape);
+      const reason = rowLocalProjectionReason(data.projection, shape, options);
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
       }
       return extendShape(shape, data.projection);
     }
     case 'expand': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
-      const reason = rowLocalExprReason(data.collection, shape);
+      const reason = rowLocalExprReason(data.collection, shape, options);
       if (reason !== undefined) {
         return `expand collection is not supported: ${reason}`;
       }
       return expandShape(shape, data.alias, data.fields);
     }
     case 'without': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       return typeof shape === 'string' ? shape : withoutShape(shape, data.fields);
     }
     case 'rename': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       return typeof shape === 'string' ? shape : renameShape(shape, data.fields);
     }
     case 'qualify': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       return typeof shape === 'string' ? shape : qualifyShape(shape, data.alias);
     }
     case 'union': {
-      const shapes = collectStaticInputShapes(data.inputs);
+      const shapes = collectStaticInputShapes(data.inputs, options);
       if (typeof shapes === 'string') return shapes;
       return shapes.reduce<PlanShape>((shape, item) => mergeShapes(shape, item), emptyShape());
     }
     case 'intersection': {
-      const shapes = collectStaticInputShapes(data.inputs);
+      const shapes = collectStaticInputShapes(data.inputs, options);
       if (typeof shapes === 'string') return shapes;
       return shapes[0] ?? emptyShape();
     }
     case 'difference': {
-      const left = collectStaticRowsPlan(data.left);
+      const left = collectStaticRowsPlan(data.left, options);
       if (typeof left === 'string') return left;
-      const right = collectStaticRowsPlan(data.right);
+      const right = collectStaticRowsPlan(data.right, options);
       return typeof right === 'string' ? right : left;
     }
     case 'from':
@@ -2447,21 +2513,21 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
     case 'join':
       return staticRowsRelationReason;
     case 'sort': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
-      const reason = sortOrderReason(data.order, shape);
+      const reason = sortOrderReason(data.order, shape, options);
       return reason === undefined ? shape : `sort order is not supported: ${reason}`;
     }
     case 'limit': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
       const window = normalizedWindow(data.count, data.offset ?? 0);
       return typeof window === 'string' ? `limit is not supported: ${window}` : shape;
     }
     case 'sortLimit': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
-      const orderReason = sortOrderReason(data.order, shape);
+      const orderReason = sortOrderReason(data.order, shape, options);
       if (orderReason !== undefined) {
         return `sortLimit order is not supported: ${orderReason}`;
       }
@@ -2469,13 +2535,13 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
       return typeof window === 'string' ? `sortLimit is not supported: ${window}` : shape;
     }
     case 'aggregate': {
-      const shape = collectStaticRowsPlan(data.input);
+      const shape = collectStaticRowsPlan(data.input, options);
       if (typeof shape === 'string') return shape;
-      const groupReason = rowLocalProjectionReason(data.groupBy, shape);
+      const groupReason = rowLocalProjectionReason(data.groupBy, shape, options);
       if (groupReason !== undefined) {
         return `aggregate groupBy projection is not supported: ${groupReason}`;
       }
-      const aggregateReason = aggregateProjectionReason(data.aggregates, shape);
+      const aggregateReason = aggregateProjectionReason(data.aggregates, shape, options);
       if (aggregateReason !== undefined) {
         return `aggregate projection is not supported: ${aggregateReason}`;
       }
@@ -2484,10 +2550,13 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
   }
 }
 
-function collectStaticInputShapes(inputs: readonly QueryData[]): readonly PlanShape[] | string {
+function collectStaticInputShapes(
+  inputs: readonly QueryData[],
+  options: IncrementalMaterializationPlanOptions
+): readonly PlanShape[] | string {
   const shapes: PlanShape[] = [];
   for (const input of inputs) {
-    const shape = collectStaticRowsPlan(input);
+    const shape = collectStaticRowsPlan(input, options);
     if (typeof shape === 'string') {
       return shape;
     }
@@ -2498,19 +2567,21 @@ function collectStaticInputShapes(inputs: readonly QueryData[]): readonly PlanSh
 
 function collectRightBranchPlan(
   data: QueryData,
-  options: { readonly allowNestedJoin: boolean }
+  branchOptions: { readonly allowNestedJoin: boolean },
+  options: IncrementalMaterializationPlanOptions
 ): RightBranchPlan | string {
   const steps: IncrementalBranchStep[] = [];
   return collectRightBranchPlanInternal(data, steps, {
-    allowNestedJoin: options.allowNestedJoin,
+    allowNestedJoin: branchOptions.allowNestedJoin,
     branchJoinCount: 0
-  });
+  }, options);
 }
 
 function collectRightBranchPlanInternal(
   data: QueryData,
   steps: IncrementalBranchStep[],
-  collection: RightBranchPlanCollection
+  collection: RightBranchPlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): RightBranchPlan | string {
   switch (data.op) {
     case 'from':
@@ -2522,7 +2593,7 @@ function collectRightBranchPlanInternal(
         shape: shapeForRoot(data.relation, data.alias)
       };
     case 'lookup': {
-      const reason = constantExprReason(data.value);
+      const reason = constantExprReason(data.value, options);
       if (reason !== undefined) {
         return `lookup value is not supported: ${reason}`;
       }
@@ -2535,9 +2606,9 @@ function collectRightBranchPlanInternal(
       };
     }
     case 'where': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
-      const reason = rowLocalPredicateReason(data.predicate, root.shape);
+      const reason = rowLocalPredicateReason(data.predicate, root.shape, options);
       if (reason !== undefined) {
         return `where predicate is not supported: ${reason}`;
       }
@@ -2546,10 +2617,10 @@ function collectRightBranchPlanInternal(
     }
     case 'hash':
     case 'btree': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       for (const expression of data.expressions) {
-        const reason = simpleExprReason(expression) ?? exprShapeReason(expression, root.shape);
+        const reason = rowLocalExprReason(expression, root.shape, options);
         if (reason !== undefined) {
           return `${data.op} expression is not supported: ${reason}`;
         }
@@ -2557,11 +2628,11 @@ function collectRightBranchPlanInternal(
       return root;
     }
     case 'keyBy':
-      return collectRightBranchPlanInternal(data.input, steps, collection);
+      return collectRightBranchPlanInternal(data.input, steps, collection, options);
     case 'select': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
-      const reason = rowLocalProjectionReason(data.projection, root.shape);
+      const reason = rowLocalProjectionReason(data.projection, root.shape, options);
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
       }
@@ -2569,9 +2640,9 @@ function collectRightBranchPlanInternal(
       return { ...root, shape: selectShape(root.shape, data.projection) };
     }
     case 'extend': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
-      const reason = rowLocalProjectionReason(data.projection, root.shape);
+      const reason = rowLocalProjectionReason(data.projection, root.shape, options);
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
       }
@@ -2579,9 +2650,9 @@ function collectRightBranchPlanInternal(
       return { ...root, shape: extendShape(root.shape, data.projection) };
     }
     case 'expand': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
-      const reason = rowLocalExprReason(data.collection, root.shape);
+      const reason = rowLocalExprReason(data.collection, root.shape, options);
       if (reason !== undefined) {
         return `expand collection is not supported: ${reason}`;
       }
@@ -2594,19 +2665,19 @@ function collectRightBranchPlanInternal(
       return { ...root, shape: expandShape(root.shape, data.alias, data.fields) };
     }
     case 'without': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       steps.push({ kind: 'without', fields: data.fields });
       return { ...root, shape: withoutShape(root.shape, data.fields) };
     }
     case 'rename': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       steps.push({ kind: 'rename', fields: data.fields });
       return { ...root, shape: renameShape(root.shape, data.fields) };
     }
     case 'qualify': {
-      const root = collectRightBranchPlanInternal(data.input, steps, collection);
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       steps.push({ kind: 'qualify', alias: data.alias });
       return { ...root, shape: qualifyShape(root.shape, data.alias) };
@@ -2625,12 +2696,12 @@ function collectRightBranchPlanInternal(
       const left = collectRightBranchPlanInternal(data.left, steps, {
         allowNestedJoin: false,
         branchJoinCount: 0
-      });
+      }, options);
       if (typeof left === 'string') {
         return `nested right branch join left side is not supported: ${left}`;
       }
 
-      const right = collectRightBranchPlan(data.right, { allowNestedJoin: false });
+      const right = collectRightBranchPlan(data.right, { allowNestedJoin: false }, options);
       if (typeof right === 'string') {
         return `nested right branch join right side is not supported: ${right}`;
       }
@@ -2672,9 +2743,9 @@ function collectRightBranchPlanInternal(
     case 'union':
       return 'union is not supported';
     case 'intersection':
-      return collectRightBranchIntersectionPlan(data.inputs, steps, collection);
+      return collectRightBranchIntersectionPlan(data.inputs, steps, collection, options);
     case 'difference':
-      return collectRightBranchDifferencePlan(data.left, data.right, steps, collection);
+      return collectRightBranchDifferencePlan(data.left, data.right, steps, collection, options);
     case 'constRows':
       return 'constRows is not supported';
     case 'aggregate':
@@ -2685,19 +2756,20 @@ function collectRightBranchPlanInternal(
 function collectRightBranchIntersectionPlan(
   inputs: readonly QueryData[],
   steps: IncrementalBranchStep[],
-  collection: RightBranchPlanCollection
+  collection: RightBranchPlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): RightBranchPlan | string {
   const [leftInput, ...rightInputs] = inputs;
   if (leftInput === undefined || rightInputs.length === 0) {
     return 'intersection requires one supported relation branch and static right branches';
   }
 
-  const root = collectRightBranchPlanInternal(leftInput, steps, collection);
+  const root = collectRightBranchPlanInternal(leftInput, steps, collection, options);
   if (typeof root === 'string') {
     return `intersection first branch is not supported: ${root}`;
   }
 
-  const rightRows = collectStaticSetRows(rightInputs, 'intersection');
+  const rightRows = collectStaticSetRows(rightInputs, 'intersection', options);
   if (typeof rightRows === 'string') {
     return rightRows;
   }
@@ -2710,14 +2782,15 @@ function collectRightBranchDifferencePlan(
   leftInput: QueryData,
   rightInput: QueryData,
   steps: IncrementalBranchStep[],
-  collection: RightBranchPlanCollection
+  collection: RightBranchPlanCollection,
+  options: IncrementalMaterializationPlanOptions
 ): RightBranchPlan | string {
-  const root = collectRightBranchPlanInternal(leftInput, steps, collection);
+  const root = collectRightBranchPlanInternal(leftInput, steps, collection, options);
   if (typeof root === 'string') {
     return `difference left branch is not supported: ${root}`;
   }
 
-  const rightRows = collectStaticSetRows([rightInput], 'difference');
+  const rightRows = collectStaticSetRows([rightInput], 'difference', options);
   if (typeof rightRows === 'string') {
     return rightRows;
   }
@@ -5582,14 +5655,18 @@ function predicateShapeReason(predicate: PredicateData, shape: PlanShape): strin
   }
 }
 
-function aggregateProjectionReason(aggregates: ProjectionData, shape: PlanShape): string | undefined {
+function aggregateProjectionReason(
+  aggregates: ProjectionData,
+  shape: PlanShape,
+  options: IncrementalMaterializationPlanOptions
+): string | undefined {
   for (const [name, item] of Object.entries(aggregates)) {
     const expr = projectionExpr(item);
     if (expr.op !== 'aggregateCall') {
       return `field ${name} is not an aggregate call`;
     }
 
-    const reason = aggregateCallReason(expr, shape);
+    const reason = aggregateCallReason(expr, shape, options);
     if (reason !== undefined) {
       return `field ${name}: ${reason}`;
     }
@@ -5599,7 +5676,8 @@ function aggregateProjectionReason(aggregates: ProjectionData, shape: PlanShape)
 
 function aggregateCallReason(
   expr: Extract<ExprData, { readonly op: 'aggregateCall' }>,
-  shape: PlanShape
+  shape: PlanShape,
+  options: IncrementalMaterializationPlanOptions
 ): string | undefined {
   if (!supportedAggregateFunctions.has(expr.name)) {
     return `${expr.name} aggregate is not supported`;
@@ -5611,12 +5689,16 @@ function aggregateCallReason(
       : `${expr.name} aggregate requires an input expression`;
   }
 
-  return rowLocalExprReason(expr.expr, shape);
+  return rowLocalExprReason(expr.expr, shape, options);
 }
 
-function rowLocalProjectionReason(projection: ProjectionData, shape: PlanShape): string | undefined {
+function rowLocalProjectionReason(
+  projection: ProjectionData,
+  shape: PlanShape,
+  options: IncrementalMaterializationPlanOptions
+): string | undefined {
   for (const item of Object.values(projection)) {
-    const reason = rowLocalExprReason(projectionExpr(item), shape);
+    const reason = rowLocalExprReason(projectionExpr(item), shape, options);
     if (reason !== undefined) {
       return reason;
     }
@@ -5624,7 +5706,11 @@ function rowLocalProjectionReason(projection: ProjectionData, shape: PlanShape):
   return undefined;
 }
 
-function rowLocalPredicateReason(predicate: PredicateData, shape: PlanShape): string | undefined {
+function rowLocalPredicateReason(
+  predicate: PredicateData,
+  shape: PlanShape,
+  options: IncrementalMaterializationPlanOptions
+): string | undefined {
   switch (predicate.op) {
     case 'eq':
     case 'neq':
@@ -5632,22 +5718,26 @@ function rowLocalPredicateReason(predicate: PredicateData, shape: PlanShape): st
     case 'lte':
     case 'gt':
     case 'gte':
-      return rowLocalExprReason(predicate.left, shape) ?? rowLocalExprReason(predicate.right, shape);
+      return rowLocalExprReason(predicate.left, shape, options) ?? rowLocalExprReason(predicate.right, shape, options);
     case 'and':
     case 'or':
       for (const item of predicate.predicates) {
-        const reason = rowLocalPredicateReason(item, shape);
+        const reason = rowLocalPredicateReason(item, shape, options);
         if (reason !== undefined) {
           return reason;
         }
       }
       return undefined;
     case 'not':
-      return rowLocalPredicateReason(predicate.predicate, shape);
+      return rowLocalPredicateReason(predicate.predicate, shape, options);
   }
 }
 
-function rowLocalExprReason(expr: ExprData, shape: PlanShape): string | undefined {
+function rowLocalExprReason(
+  expr: ExprData,
+  shape: PlanShape,
+  options: IncrementalMaterializationPlanOptions
+): string | undefined {
   switch (expr.op) {
     case 'field':
       return exprShapeReason(expr, shape);
@@ -5655,7 +5745,7 @@ function rowLocalExprReason(expr: ExprData, shape: PlanShape): string | undefine
       return undefined;
     case 'tuple':
       for (const item of expr.items) {
-        const reason = rowLocalExprReason(item, shape);
+        const reason = rowLocalExprReason(item, shape, options);
         if (reason !== undefined) {
           return reason;
         }
@@ -5666,18 +5756,37 @@ function rowLocalExprReason(expr: ExprData, shape: PlanShape): string | undefine
         return `host function ${expr.name} is not available; function expressions only work in memory`;
       }
       for (const arg of expr.args) {
-        const reason = rowLocalExprReason(arg, shape);
+        const reason = rowLocalExprReason(arg, shape, options);
         if (reason !== undefined) {
           return reason;
         }
       }
       return undefined;
-    case 'env':
     case 'call':
+      return namedCallReason(expr, (arg) => rowLocalExprReason(arg, shape, options), options);
+    case 'env':
     case 'subquery':
     case 'aggregateCall':
       return simpleExprReason(expr);
   }
+}
+
+function namedCallReason(
+  expr: Extract<ExprData, { readonly op: 'call' }>,
+  argReason: (arg: ExprData) => string | undefined,
+  options: IncrementalMaterializationPlanOptions
+): string | undefined {
+  if (options.functions?.[expr.name] === undefined) {
+    return `named function ${expr.name} is not available for incremental maintenance`;
+  }
+
+  for (const arg of expr.args) {
+    const reason = argReason(arg);
+    if (reason !== undefined) {
+      return reason;
+    }
+  }
+  return undefined;
 }
 
 function exprShapeReason(expr: ExprData, shape: PlanShape): string | undefined {
@@ -5705,13 +5814,16 @@ function exprShapeReason(expr: ExprData, shape: PlanShape): string | undefined {
   }
 }
 
-function constantExprReason(expr: ExprData): string | undefined {
+function constantExprReason(
+  expr: ExprData,
+  options: IncrementalMaterializationPlanOptions
+): string | undefined {
   switch (expr.op) {
     case 'value':
       return undefined;
     case 'tuple':
       for (const item of expr.items) {
-        const reason = constantExprReason(item);
+        const reason = constantExprReason(item, options);
         if (reason !== undefined) {
           return reason;
         }
@@ -5719,8 +5831,9 @@ function constantExprReason(expr: ExprData): string | undefined {
       return undefined;
     case 'field':
       return 'field expressions are not supported in right branch lookup values';
-    case 'env':
     case 'call':
+      return namedCallReason(expr, (arg) => constantExprReason(arg, options), options);
+    case 'env':
     case 'hostCall':
     case 'subquery':
     case 'aggregateCall':
@@ -5784,7 +5897,7 @@ function exprValue(
     case 'value':
       return expr.value;
     case 'env':
-      return env[expr.name];
+      return evalEnv(env)[expr.name];
     case 'field': {
       const aliased = row[expr.alias];
       if (isRecord(aliased)) {
@@ -5797,7 +5910,17 @@ function exprValue(
     }
     case 'tuple':
       return expr.items.map((item) => exprValue(row, item, env, subqueryStateByKey));
-    case 'call':
+    case 'call': {
+      const fn = evalFunctions(env)?.[expr.name];
+      if (fn === undefined) {
+        return undefined;
+      }
+      try {
+        return fn(...expr.args.map((arg) => exprValue(row, arg, env, subqueryStateByKey)));
+      } catch {
+        return undefined;
+      }
+    }
     case 'aggregateCall':
       return undefined;
     case 'hostCall': {

@@ -32,6 +32,7 @@ import {
   rowsFromIncrementalState,
   type IncrementalMaterialization,
   type IncrementalMaterializationPlan,
+  type IncrementalMaterializationPlanOptions,
   type IncrementalRowBatch
 } from './materialization-plan.js';
 import {
@@ -491,10 +492,13 @@ export function explainMaterialization<Row>(
 ): MaterializationExplanation<Row> {
   const key = queryKey(query);
   const requestedMode = options.mode ?? 'snapshot';
-  const planned = requestedMode === 'incremental' ? planIncrementalMaterialization(query) : undefined;
+  const evaluateOptions = materializationEvaluateOptions(options);
+  const planned = requestedMode === 'incremental'
+    ? planIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
+    : undefined;
   const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
   const id = options.id ?? options.name ?? key;
-  const functionDiagnostics = missingFunctionDiagnostics(query, options.functions);
+  const functionDiagnostics = missingFunctionDiagnostics(query, evaluateOptions.functions);
   return {
     kind: 'materializationExplanation',
     queryKey: key,
@@ -613,7 +617,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
           stored.incremental,
           undefined,
           options.deltas ?? [],
-          envFor(next)
+          envFor(next),
+          incrementalPlanOptions(stored.evaluateOptions)
         );
         if (maintained.updated) {
           const nextIncremental = {
@@ -670,7 +675,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             stored.incremental,
             undefined,
             options.deltas,
-            envFor(next)
+            envFor(next),
+            incrementalPlanOptions(stored.evaluateOptions)
           );
           if (maintained.updated) {
             const nextIncremental = {
@@ -741,7 +747,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             stored.incremental,
             rootRelation,
             options.deltas,
-            envFor(next)
+            envFor(next),
+            incrementalPlanOptions(stored.evaluateOptions)
           );
           if (maintained.updated) {
             const nextIncremental = {
@@ -1218,7 +1225,9 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
   const id = options.id ?? options.name ?? key;
   const evaluateOptions = materializationEvaluateOptions(options);
   const functionDiagnostics = missingFunctionDiagnostics(query, evaluateOptions.functions);
-  const planned = requestedMode === 'incremental' ? planIncrementalMaterialization(query) : undefined;
+  const planned = requestedMode === 'incremental'
+    ? planIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
+    : undefined;
   const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
   const metadata: MaterializationMetadata<Row> = {
     kind: 'materialization',
@@ -1280,7 +1289,11 @@ function materializationEntryFor<Row>(
 ): StoredMaterialization<Row> {
   if (cacheable && plan !== undefined) {
     if (plan.kind === 'staticRows') {
-      const built = buildStaticIncrementalMaterialization<Row>(plan, envFor(target));
+      const built = buildStaticIncrementalMaterialization<Row>(
+        plan,
+        envFor(target),
+        incrementalPlanOptions(evaluateOptions)
+      );
       if (!built.supported) {
         return materializationEntryWithRows(
           metadataWithIncrementalFallback(metadata, built.reason),
@@ -1307,7 +1320,8 @@ function materializationEntryFor<Row>(
         undefined,
         [],
         envFor(target),
-        relationSnapshots
+        relationSnapshots,
+        incrementalPlanOptions(evaluateOptions)
       );
       if (!built.supported) {
         return materializationEntryWithRows(
@@ -1337,7 +1351,8 @@ function materializationEntryFor<Row>(
         relation,
         rootRows,
         envFor(target),
-        relationSnapshots
+        relationSnapshots,
+        incrementalPlanOptions(evaluateOptions)
       );
       if (!built.supported) {
         return materializationEntryWithRows(
@@ -2177,6 +2192,10 @@ function materializationEvaluateOptions(options: EvaluateOptions): EvaluateOptio
     ...(options.functions === undefined ? {} : { functions: options.functions }),
     ...(options.env === undefined ? {} : { env: options.env })
   };
+}
+
+function incrementalPlanOptions(options: EvaluateOptions): IncrementalMaterializationPlanOptions {
+  return options.functions === undefined ? {} : { functions: options.functions };
 }
 
 function missingFunctionDiagnostics(
