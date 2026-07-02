@@ -188,6 +188,9 @@ type IncrementalPostOrderStep = Extract<IncrementalPipelineStep, {
 }>;
 
 type IncrementalPostAggregateStep = IncrementalPipelineStep | IncrementalJoinStep;
+type IncrementalBranchPostAggregateStep = Extract<IncrementalPipelineStep, {
+  readonly kind: 'where' | 'select' | 'extend' | 'without' | 'rename' | 'qualify';
+}>;
 
 type IncrementalWindow = {
   readonly offset: number;
@@ -211,6 +214,8 @@ type IncrementalBranchPlan = {
   readonly alias: string;
   readonly root: IncrementalRoot;
   readonly steps: readonly IncrementalBranchStep[];
+  readonly aggregate?: IncrementalAggregateStep;
+  readonly postAggregateSteps?: readonly IncrementalBranchPostAggregateStep[];
   readonly ordered?: IncrementalOrderedStep;
 };
 
@@ -235,6 +240,7 @@ type IncrementalJoinState = {
   readonly indexByValue: ReadonlyMap<string, readonly IndexedRightRow[]>;
   readonly rootValuesByKey: ReadonlyMap<string, readonly unknown[]>;
   readonly rootKeysByValue: ReadonlyMap<string, readonly RootJoinValue[]>;
+  readonly branchAggregate?: IncrementalAggregateState<Record<string, unknown>>;
   readonly branchOrdered?: IncrementalOrderedState<Record<string, unknown>>;
   readonly nestedBranchJoinStates?: readonly IncrementalJoinState[];
 };
@@ -443,7 +449,10 @@ type SubqueryEvaluationState = {
 type RightBranchPlanCollection = {
   readonly allowNestedJoin: boolean;
   readonly allowOrderedWindow: boolean;
+  readonly allowAggregate: boolean;
   branchJoinCount: number;
+  aggregate?: IncrementalAggregateStep;
+  postAggregateSteps?: IncrementalBranchPostAggregateStep[];
   ordered?: MutableIncrementalOrderedStep;
 };
 
@@ -1633,7 +1642,11 @@ function collectDynamicSetBranches(
 
   const branches: IncrementalBranchPlan[] = [];
   for (const [index, input] of inputs.entries()) {
-    const branch = collectRightBranchPlan(input, { allowNestedJoin: false, allowOrderedWindow: false }, options);
+    const branch = collectRightBranchPlan(
+      input,
+      { allowNestedJoin: false, allowOrderedWindow: false, allowAggregate: false },
+      options
+    );
     if (typeof branch === 'string') {
       return {
         supported: false,
@@ -1821,7 +1834,11 @@ function collectSingleRootPlan(
       if (collection.ordered !== undefined) {
         return `${data.kind} join after order/window is not supported for incremental maintenance`;
       }
-      const right = collectRightBranchPlan(data.right, { allowNestedJoin: true, allowOrderedWindow: true }, options);
+      const right = collectRightBranchPlan(
+        data.right,
+        { allowNestedJoin: true, allowOrderedWindow: true, allowAggregate: true },
+        options
+      );
       if (typeof right === 'string') {
         return `join right branch is not supported for incremental maintenance: ${right}`;
       }
@@ -2065,7 +2082,11 @@ function planSubqueryExpression(
     return 'subquery incremental maintenance requires an unambiguous equality correlation';
   }
 
-  const right = collectRightBranchPlan(lowered.data, { allowNestedJoin: true, allowOrderedWindow: true }, options);
+  const right = collectRightBranchPlan(
+    lowered.data,
+    { allowNestedJoin: true, allowOrderedWindow: true, allowAggregate: true },
+    options
+  );
   if (typeof right === 'string') {
     return `subquery branch is not supported for incremental maintenance: ${right}`;
   }
@@ -2707,13 +2728,18 @@ function collectStaticInputShapes(
 
 function collectRightBranchPlan(
   data: QueryData,
-  branchOptions: { readonly allowNestedJoin: boolean; readonly allowOrderedWindow: boolean },
+  branchOptions: {
+    readonly allowNestedJoin: boolean;
+    readonly allowOrderedWindow: boolean;
+    readonly allowAggregate: boolean;
+  },
   options: IncrementalMaterializationPlanOptions
 ): RightBranchPlan | string {
   const steps: IncrementalBranchStep[] = [];
   return collectRightBranchPlanInternal(data, steps, {
     allowNestedJoin: branchOptions.allowNestedJoin,
     allowOrderedWindow: branchOptions.allowOrderedWindow,
+    allowAggregate: branchOptions.allowAggregate,
     branchJoinCount: 0
   }, options);
 }
@@ -2756,7 +2782,7 @@ function collectRightBranchPlanInternal(
       if (reason !== undefined) {
         return `where predicate is not supported: ${reason}`;
       }
-      steps.push({ kind: 'where', predicate: data.predicate });
+      pushRightBranchPipelineStep(steps, collection, { kind: 'where', predicate: data.predicate });
       return rightBranchPlan(root, collection);
     }
     case 'hash':
@@ -2781,11 +2807,7 @@ function collectRightBranchPlanInternal(
         return `select projection is not supported: ${reason}`;
       }
       const step = { kind: 'select', projection: data.projection } satisfies IncrementalPostOrderStep;
-      if (collection.ordered !== undefined) {
-        collection.ordered.postSteps.push(step);
-      } else {
-        steps.push(step);
-      }
+      pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: selectShape(root.shape, data.projection) }, collection);
     }
     case 'extend': {
@@ -2796,11 +2818,7 @@ function collectRightBranchPlanInternal(
         return `extend projection is not supported: ${reason}`;
       }
       const step = { kind: 'extend', projection: data.projection } satisfies IncrementalPostOrderStep;
-      if (collection.ordered !== undefined) {
-        collection.ordered.postSteps.push(step);
-      } else {
-        steps.push(step);
-      }
+      pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: extendShape(root.shape, data.projection) }, collection);
     }
     case 'expand': {
@@ -2808,6 +2826,9 @@ function collectRightBranchPlanInternal(
       if (typeof root === 'string') return root;
       if (collection.ordered !== undefined) {
         return 'expand after order/window is not supported';
+      }
+      if (collection.aggregate !== undefined) {
+        return 'expand after aggregate is not supported';
       }
       const reason = rowLocalExprReason(data.collection, root.shape, options);
       if (reason !== undefined) {
@@ -2825,33 +2846,21 @@ function collectRightBranchPlanInternal(
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const step = { kind: 'without', fields: data.fields } satisfies IncrementalPostOrderStep;
-      if (collection.ordered !== undefined) {
-        collection.ordered.postSteps.push(step);
-      } else {
-        steps.push(step);
-      }
+      pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: withoutShape(root.shape, data.fields) }, collection);
     }
     case 'rename': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const step = { kind: 'rename', fields: data.fields } satisfies IncrementalPostOrderStep;
-      if (collection.ordered !== undefined) {
-        collection.ordered.postSteps.push(step);
-      } else {
-        steps.push(step);
-      }
+      pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: renameShape(root.shape, data.fields) }, collection);
     }
     case 'qualify': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
       const step = { kind: 'qualify', alias: data.alias } satisfies IncrementalPostOrderStep;
-      if (collection.ordered !== undefined) {
-        collection.ordered.postSteps.push(step);
-      } else {
-        steps.push(step);
-      }
+      pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: qualifyShape(root.shape, data.alias) }, collection);
     }
     case 'join': {
@@ -2868,10 +2877,14 @@ function collectRightBranchPlanInternal(
       const left = collectRightBranchPlanInternal(data.left, steps, {
         allowNestedJoin: false,
         allowOrderedWindow: collection.allowOrderedWindow,
+        allowAggregate: false,
         branchJoinCount: 0
       }, options);
       if (typeof left === 'string') {
         return `nested right branch join left side is not supported: ${left}`;
+      }
+      if (collection.aggregate !== undefined) {
+        return 'join after aggregate is not supported';
       }
       if (left.ordered !== undefined || collection.ordered !== undefined) {
         return 'join after order/window is not supported';
@@ -2879,7 +2892,7 @@ function collectRightBranchPlanInternal(
 
       const right = collectRightBranchPlan(
         data.right,
-        { allowNestedJoin: false, allowOrderedWindow: collection.allowOrderedWindow },
+        { allowNestedJoin: false, allowOrderedWindow: collection.allowOrderedWindow, allowAggregate: false },
         options
       );
       if (typeof right === 'string') {
@@ -2924,6 +2937,9 @@ function collectRightBranchPlanInternal(
       }
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      if (collection.aggregate !== undefined) {
+        return 'sortLimit after aggregate is not supported';
+      }
       if (collection.ordered !== undefined) {
         return 'sortLimit after order/window is not supported';
       }
@@ -2951,9 +2967,61 @@ function collectRightBranchPlanInternal(
       return collectRightBranchDifferencePlan(data.left, data.right, steps, collection, options);
     case 'constRows':
       return 'constRows is not supported';
-    case 'aggregate':
-      return 'aggregate is not supported';
+    case 'aggregate': {
+      if (!collection.allowAggregate) {
+        return 'aggregate is not supported';
+      }
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
+      if (typeof root === 'string') return root;
+      if (collection.aggregate !== undefined) {
+        return 'nested aggregate is not supported';
+      }
+      if (collection.ordered !== undefined) {
+        return 'aggregate after order/window is not supported';
+      }
+
+      const groupReason = rowLocalProjectionReason(data.groupBy, root.shape, options);
+      if (groupReason !== undefined) {
+        return `aggregate groupBy projection is not supported: ${groupReason}`;
+      }
+
+      const aggregateReason = aggregateProjectionReason(data.aggregates, root.shape, options);
+      if (aggregateReason !== undefined) {
+        return `aggregate projection is not supported: ${aggregateReason}`;
+      }
+
+      collection.aggregate = { kind: 'aggregate', groupBy: data.groupBy, aggregates: data.aggregates };
+      collection.postAggregateSteps = [];
+      return rightBranchPlan({
+        ...root,
+        shape: aggregateShape(root.shape, data.groupBy, data.aggregates)
+      }, collection);
+    }
   }
+}
+
+function pushRightBranchPipelineStep(
+  steps: IncrementalBranchStep[],
+  collection: RightBranchPlanCollection,
+  step: IncrementalPipelineStep
+): void {
+  if (collection.aggregate !== undefined) {
+    collection.postAggregateSteps = [...(collection.postAggregateSteps ?? []), step as IncrementalBranchPostAggregateStep];
+  } else if (collection.ordered !== undefined && isPostOrderStep(step)) {
+    collection.ordered.postSteps.push(step);
+  } else {
+    steps.push(step);
+  }
+}
+
+function isPostOrderStep(step: IncrementalPipelineStep): step is IncrementalPostOrderStep {
+  return (
+    step.kind === 'select' ||
+    step.kind === 'extend' ||
+    step.kind === 'without' ||
+    step.kind === 'rename' ||
+    step.kind === 'qualify'
+  );
 }
 
 function collectRightBranchIntersectionPlan(
@@ -2973,6 +3041,9 @@ function collectRightBranchIntersectionPlan(
   }
   if (collection.ordered !== undefined) {
     return 'intersection after order/window is not supported';
+  }
+  if (collection.aggregate !== undefined) {
+    return 'intersection after aggregate is not supported';
   }
 
   const rightRows = collectStaticSetRows(rightInputs, 'intersection', options);
@@ -2998,6 +3069,9 @@ function collectRightBranchDifferencePlan(
   if (collection.ordered !== undefined) {
     return 'difference after order/window is not supported';
   }
+  if (collection.aggregate !== undefined) {
+    return 'difference after aggregate is not supported';
+  }
 
   const rightRows = collectStaticSetRows([rightInput], 'difference', options);
   if (typeof rightRows === 'string') {
@@ -3014,6 +3088,8 @@ function branchPlan(plan: RightBranchPlan): IncrementalBranchPlan {
     alias: plan.alias,
     root: plan.root,
     steps: plan.steps,
+    ...optionalBranchAggregateStep(plan.aggregate),
+    ...optionalBranchPostAggregateSteps(plan.postAggregateSteps),
     ...optionalImmutableOrderedStep(plan.ordered)
   };
 }
@@ -3024,6 +3100,8 @@ function rightBranchPlan(
 ): RightBranchPlan {
   return {
     ...plan,
+    ...optionalBranchAggregateStep(collection.aggregate),
+    ...optionalBranchPostAggregateSteps(collection.postAggregateSteps),
     ...optionalOrderedStep(collection.ordered)
   };
 }
@@ -4443,6 +4521,218 @@ function orderedEntriesForBranchOwner(
   return { supported: true, entries };
 }
 
+function buildBranchAggregateState(
+  branch: IncrementalBranchPlan,
+  relationKeys: readonly string[],
+  rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
+  env: Readonly<Record<string, unknown>>
+): AggregateStateResult<Record<string, unknown>> | undefined {
+  if (branch.aggregate === undefined) {
+    return undefined;
+  }
+
+  const groupKeysByRootKey = new Map<string, readonly string[]>();
+  for (const relationKey of relationKeys) {
+    const groupKeys = aggregateGroupKeysForRows(branch.aggregate, rowsByRelationKey.get(relationKey) ?? [], env);
+    if (groupKeys.length > 0) {
+      groupKeysByRootKey.set(relationKey, groupKeys);
+    }
+  }
+
+  const rootKeysByGroupKey = buildRootKeysByGroupKey(relationKeys, groupKeysByRootKey);
+  const groupKeys = aggregateGroupOrder(branch.aggregate, indexKeys(relationKeys), rootKeysByGroupKey);
+  const groupsByKey = new Map<string, IncrementalAggregateGroupState<Record<string, unknown>>>();
+  for (const groupKey of groupKeys) {
+    const group = recomputeBranchAggregateGroup(
+      branch,
+      groupKey,
+      rootKeysByGroupKey.get(groupKey) ?? [],
+      rowsByRelationKey,
+      env
+    );
+    if (!group.supported) {
+      return group;
+    }
+    if (group.state !== undefined) {
+      groupsByKey.set(groupKey, group.state);
+    }
+  }
+
+  return {
+    supported: true,
+    state: {
+      groupKeys,
+      groupKeysByRootKey,
+      rootKeysByGroupKey,
+      groupsByKey
+    }
+  };
+}
+
+function maintainBranchAggregateState(
+  branch: IncrementalBranchPlan,
+  previous: IncrementalAggregateState<Record<string, unknown>>,
+  relationKeys: readonly string[],
+  relationIndexByKey: ReadonlyMap<string, number>,
+  rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
+  groupKeysByRootKey: ReadonlyMap<string, readonly string[]>,
+  rootKeysByGroupKey: ReadonlyMap<string, readonly string[]>,
+  affectedGroupKeys: ReadonlySet<string>,
+  env: Readonly<Record<string, unknown>>
+): AggregateStateResult<Record<string, unknown>> {
+  if (branch.aggregate === undefined) {
+    return {
+      supported: false,
+      reason: 'right branch aggregate step is missing from branch aggregate state'
+    };
+  }
+
+  const groupKeys = aggregateGroupOrder(branch.aggregate, relationIndexByKey, rootKeysByGroupKey);
+  const groupsByKey = new Map(previous.groupsByKey);
+  for (const groupKey of affectedGroupKeys) {
+    const group = recomputeBranchAggregateGroup(
+      branch,
+      groupKey,
+      rootKeysByGroupKey.get(groupKey) ?? [],
+      rowsByRelationKey,
+      env
+    );
+    if (!group.supported) {
+      return group;
+    }
+    if (group.state === undefined) {
+      groupsByKey.delete(groupKey);
+    } else {
+      groupsByKey.set(groupKey, group.state);
+    }
+  }
+
+  if (isUngroupedAggregate(branch.aggregate)) {
+    const emptyKey = emptyGroupKey();
+    if (!groupsByKey.has(emptyKey)) {
+      const group = recomputeBranchAggregateGroup(branch, emptyKey, relationKeys, rowsByRelationKey, env);
+      if (!group.supported) {
+        return group;
+      }
+      if (group.state !== undefined) {
+        groupsByKey.set(emptyKey, group.state);
+      }
+    }
+  }
+
+  for (const groupKey of previous.groupKeys) {
+    if (!groupKeys.includes(groupKey)) {
+      groupsByKey.delete(groupKey);
+    }
+  }
+
+  return {
+    supported: true,
+    state: {
+      groupKeys,
+      groupKeysByRootKey,
+      rootKeysByGroupKey,
+      groupsByKey
+    }
+  };
+}
+
+function recomputeBranchAggregateGroup(
+  branch: IncrementalBranchPlan,
+  groupKey: string,
+  relationKeys: readonly string[],
+  rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
+  env: Readonly<Record<string, unknown>>
+):
+  | {
+      readonly supported: true;
+      readonly state: IncrementalAggregateGroupState<Record<string, unknown>> | undefined;
+    }
+  | { readonly supported: false; readonly reason: string } {
+  const aggregate = branch.aggregate;
+  if (aggregate === undefined) {
+    return {
+      supported: false,
+      reason: 'right branch aggregate step is missing from branch aggregate state'
+    };
+  }
+
+  const rows: Record<string, unknown>[] = [];
+  let group: Record<string, unknown> | undefined;
+  for (const relationKey of relationKeys) {
+    for (const row of rowsByRelationKey.get(relationKey) ?? []) {
+      const rowGroup = projectRow(row, aggregate.groupBy, env);
+      if (stableKey(rowGroup) !== groupKey) {
+        continue;
+      }
+      group ??= rowGroup;
+      rows.push(row);
+    }
+  }
+
+  if (rows.length === 0) {
+    if (!isUngroupedAggregate(aggregate) || groupKey !== emptyGroupKey()) {
+      return { supported: true, state: undefined };
+    }
+    group = {};
+  }
+
+  const aggregateRow = evaluateAggregateRow(aggregate, group ?? {}, rows, env);
+  const postAggregateRows = evaluateBranchPostAggregateRows(branch, aggregateRow, env);
+  if (!postAggregateRows.supported) {
+    return postAggregateRows;
+  }
+
+  return {
+    supported: true,
+    state: {
+      group: group ?? {},
+      rowCount: rows.length,
+      rawRow: aggregateRow,
+      rows: postAggregateRows.rows
+    }
+  };
+}
+
+function evaluateBranchPostAggregateRows(
+  branch: IncrementalBranchPlan,
+  row: Record<string, unknown>,
+  env: Readonly<Record<string, unknown>>
+):
+  | { readonly supported: true; readonly rows: readonly Record<string, unknown>[] }
+  | { readonly supported: false; readonly reason: string } {
+  let rows: readonly Record<string, unknown>[] = [row];
+  for (const step of branch.postAggregateSteps ?? []) {
+    rows = evaluateStep(rows, step, env);
+    if (rows.length === 0) {
+      return { supported: true, rows: [] };
+    }
+  }
+  return { supported: true, rows };
+}
+
+function aggregateRowsForKeys<Row>(
+  aggregate: IncrementalAggregateState<Row> | undefined,
+  groupKeys: Iterable<string>
+): readonly Row[] {
+  if (aggregate === undefined) {
+    return [];
+  }
+
+  const rows: Row[] = [];
+  for (const groupKey of groupKeys) {
+    const group = aggregate.groupsByKey.get(groupKey);
+    if (group !== undefined) {
+      rows.push(...group.rows);
+    }
+  }
+  return rows;
+}
+
+function rowsFromAggregateState<Row>(aggregate: IncrementalAggregateState<Row>): readonly Row[] {
+  return aggregate.groupKeys.flatMap((key) => aggregate.groupsByKey.get(key)?.rows ?? []);
+}
+
 function duplicateOrderedRowKeyReason<Row>(
   entries: Iterable<IncrementalOrderedEntry<Row>>
 ): string | undefined {
@@ -5044,6 +5334,13 @@ function buildJoinStates(
         reason: branchOrdered.reason
       };
     }
+    const branchAggregate = buildBranchAggregateState(step.right, relationKeys, rowsByRelationKey, env);
+    if (branchAggregate !== undefined && !branchAggregate.supported) {
+      return {
+        supported: false,
+        reason: branchAggregate.reason
+      };
+    }
     states.push({
       id: step.id,
       relation: step.right.relation,
@@ -5051,9 +5348,17 @@ function buildJoinStates(
       relationIndexByKey: indexKeys(relationKeys),
       relationRowsByKey,
       rowsByRelationKey,
-      indexByValue: buildRightIndex(step, relationKeys, rowsByRelationKey, env, branchOrdered?.state),
+      indexByValue: buildRightIndex(
+        step,
+        relationKeys,
+        rowsByRelationKey,
+        env,
+        branchOrdered?.state,
+        branchAggregate?.state
+      ),
       rootValuesByKey: new Map(),
       rootKeysByValue: new Map(),
+      ...(branchAggregate === undefined ? {} : { branchAggregate: branchAggregate.state }),
       ...(branchOrdered === undefined ? {} : { branchOrdered: branchOrdered.state }),
       ...(nestedBranchJoinStates.length === 0 ? {} : { nestedBranchJoinStates })
     });
@@ -5114,6 +5419,13 @@ function buildBranchJoinStates(
         reason: branchOrdered.reason
       };
     }
+    const branchAggregate = buildBranchAggregateState(step.right, relationKeys, rowsByRelationKey, env);
+    if (branchAggregate !== undefined && !branchAggregate.supported) {
+      return {
+        supported: false,
+        reason: branchAggregate.reason
+      };
+    }
     states.push({
       id: step.id,
       relation: step.right.relation,
@@ -5121,9 +5433,17 @@ function buildBranchJoinStates(
       relationIndexByKey: indexKeys(relationKeys),
       relationRowsByKey,
       rowsByRelationKey,
-      indexByValue: buildRightIndex(step, relationKeys, rowsByRelationKey, env, branchOrdered?.state),
+      indexByValue: buildRightIndex(
+        step,
+        relationKeys,
+        rowsByRelationKey,
+        env,
+        branchOrdered?.state,
+        branchAggregate?.state
+      ),
       rootValuesByKey: new Map(),
       rootKeysByValue: new Map(),
+      ...(branchAggregate === undefined ? {} : { branchAggregate: branchAggregate.state }),
       ...(branchOrdered === undefined ? {} : { branchOrdered: branchOrdered.state })
     });
   }
@@ -5136,12 +5456,15 @@ function buildRightIndex(
   relationKeys: readonly string[],
   rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
   env: Readonly<Record<string, unknown>>,
-  branchOrdered?: IncrementalOrderedState<Record<string, unknown>>
+  branchOrdered?: IncrementalOrderedState<Record<string, unknown>>,
+  branchAggregate?: IncrementalAggregateState<Record<string, unknown>>
 ): ReadonlyMap<string, readonly IndexedRightRow[]> {
   const index = new Map<string, IndexedRightRow[]>();
-  const rows = branchOrdered === undefined
-    ? relationKeys.flatMap((relationKey) => rowsByRelationKey.get(relationKey) ?? [])
-    : branchOrdered.rows;
+  const rows = branchAggregate === undefined
+    ? branchOrdered === undefined
+      ? relationKeys.flatMap((relationKey) => rowsByRelationKey.get(relationKey) ?? [])
+      : branchOrdered.rows
+    : rowsFromAggregateState(branchAggregate);
 
   for (const row of rows) {
     const value = exprValue(row, step.rightExpr, env);
@@ -5409,6 +5732,7 @@ function reindexBranchRelationKeys(
   }
 
   const rowsByRelationKey = new Map(state.rowsByRelationKey);
+  const branchAggregate = step.right.aggregate;
   if (step.right.ordered === undefined && state.branchOrdered !== undefined) {
     return {
       supported: false,
@@ -5421,10 +5745,26 @@ function reindexBranchRelationKeys(
       reason: 'right branch ordered state is missing; snapshot recompute is required'
     };
   }
+  if (branchAggregate === undefined && state.branchAggregate !== undefined) {
+    return {
+      supported: false,
+      reason: 'right branch aggregate state is present for a non-aggregate branch; snapshot recompute is required'
+    };
+  }
+  if (branchAggregate !== undefined && state.branchAggregate === undefined) {
+    return {
+      supported: false,
+      reason: 'right branch aggregate state is missing; snapshot recompute is required'
+    };
+  }
 
   const affectedValues: unknown[] = state.branchOrdered === undefined
     ? []
     : state.branchOrdered.rows.map((row) => exprValue(row, step.rightExpr, env));
+  const groupKeysByRelationKey = state.branchAggregate === undefined
+    ? undefined
+    : new Map(state.branchAggregate.groupKeysByRootKey);
+  const affectedAggregateGroupKeys = new Set<string>();
   const nestedRootJoinIndexes = state.nestedBranchJoinStates === undefined
     ? undefined
     : mutableRootJoinIndexes(state.nestedBranchJoinStates);
@@ -5433,7 +5773,13 @@ function reindexBranchRelationKeys(
   for (const relationKey of relationKeysToEvaluate) {
     const previousRows = rowsByRelationKey.get(relationKey);
     if (previousRows !== undefined) {
-      affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
+      if (state.branchAggregate === undefined) {
+        affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
+      } else {
+        const previousGroupKeys = groupKeysByRelationKey?.get(relationKey);
+        recordAggregateGroupKeys(affectedAggregateGroupKeys, previousGroupKeys);
+        groupKeysByRelationKey?.delete(relationKey);
+      }
       rowsByRelationKey.delete(relationKey);
     }
     if (nestedRootJoinIndexes !== undefined) {
@@ -5454,7 +5800,15 @@ function reindexBranchRelationKeys(
     }
 
     rowsByRelationKey.set(relationKey, evaluated.rows);
-    affectedValues.push(...evaluated.rows.map((row) => exprValue(row, step.rightExpr, env)));
+    if (branchAggregate === undefined) {
+      affectedValues.push(...evaluated.rows.map((row) => exprValue(row, step.rightExpr, env)));
+    } else if (groupKeysByRelationKey !== undefined) {
+      const nextGroupKeys = aggregateGroupKeysForRows(branchAggregate, evaluated.rows, env);
+      recordAggregateGroupKeys(affectedAggregateGroupKeys, nextGroupKeys);
+      if (nextGroupKeys.length > 0) {
+        groupKeysByRelationKey.set(relationKey, nextGroupKeys);
+      }
+    }
     if (nestedRootJoinIndexes !== undefined) {
       addRootJoinValues(nestedRootJoinIndexes, relationKey, evaluated.joinValuesByStep);
     }
@@ -5482,13 +5836,48 @@ function reindexBranchRelationKeys(
   if (branchOrdered !== undefined) {
     affectedValues.push(...branchOrdered.state.rows.map((row) => exprValue(row, step.rightExpr, env)));
   }
+  if (state.branchAggregate !== undefined) {
+    affectedValues.push(...aggregateRowsForKeys(state.branchAggregate, affectedAggregateGroupKeys)
+      .map((row) => exprValue(row, step.rightExpr, env)));
+  }
+  const nextBranchAggregate = branchAggregate === undefined
+    ? undefined
+    : maintainBranchAggregateState(
+      step.right,
+      state.branchAggregate as IncrementalAggregateState<Record<string, unknown>>,
+      state.relationKeys,
+      relationIndexByKeyForState(state),
+      rowsByRelationKey,
+      groupKeysByRelationKey ?? new Map(),
+      buildRootKeysByGroupKey(state.relationKeys, groupKeysByRelationKey ?? new Map()),
+      affectedAggregateGroupKeys,
+      env
+    );
+  if (nextBranchAggregate !== undefined && !nextBranchAggregate.supported) {
+    return {
+      supported: false,
+      reason: nextBranchAggregate.reason
+    };
+  }
+  if (nextBranchAggregate !== undefined) {
+    affectedValues.push(...aggregateRowsForKeys(nextBranchAggregate.state, affectedAggregateGroupKeys)
+      .map((row) => exprValue(row, step.rightExpr, env)));
+  }
 
   return {
     supported: true,
     state: {
       ...state,
       rowsByRelationKey,
-      indexByValue: buildRightIndex(step, state.relationKeys, rowsByRelationKey, env, branchOrdered?.state),
+      indexByValue: buildRightIndex(
+        step,
+        state.relationKeys,
+        rowsByRelationKey,
+        env,
+        branchOrdered?.state,
+        nextBranchAggregate?.state
+      ),
+      ...optionalBranchAggregateState(nextBranchAggregate?.state),
       ...optionalBranchOrderedState(branchOrdered?.state),
       ...(nextNestedBranchJoinStates === undefined ? {} : { nestedBranchJoinStates: nextNestedBranchJoinStates })
     },
@@ -5508,6 +5897,7 @@ function applyRightRelationChanges(
   const relationInsertIndexByKey = keyChangeInsertIndexes(relation, changes, relationIndexByKey);
   const relationRowsByKey = new Map(state.relationRowsByKey);
   const rowsByRelationKey = new Map(state.rowsByRelationKey);
+  const branchAggregate = step.right.aggregate;
   if (step.right.ordered === undefined && state.branchOrdered !== undefined) {
     return {
       supported: false,
@@ -5520,13 +5910,29 @@ function applyRightRelationChanges(
       reason: 'right branch ordered state is missing; snapshot recompute is required'
     };
   }
+  if (branchAggregate === undefined && state.branchAggregate !== undefined) {
+    return {
+      supported: false,
+      reason: 'right branch aggregate state is present for a non-aggregate branch; snapshot recompute is required'
+    };
+  }
+  if (branchAggregate !== undefined && state.branchAggregate === undefined) {
+    return {
+      supported: false,
+      reason: 'right branch aggregate state is missing; snapshot recompute is required'
+    };
+  }
 
-  const indexByValue: Map<string, IndexedRightRow[]> = state.branchOrdered === undefined
+  const indexByValue: Map<string, IndexedRightRow[]> = state.branchOrdered === undefined && state.branchAggregate === undefined
     ? mutableRightIndex(state.indexByValue)
     : new Map();
   const affectedValues: unknown[] = state.branchOrdered === undefined
     ? []
     : state.branchOrdered.rows.map((row) => exprValue(row, step.rightExpr, env));
+  const groupKeysByRelationKey = state.branchAggregate === undefined
+    ? undefined
+    : new Map(state.branchAggregate.groupKeysByRootKey);
+  const affectedAggregateGroupKeys = new Set<string>();
   const changedRelationKeys = new Set<string>();
   const nestedRootJoinIndexes = state.nestedBranchJoinStates === undefined
     ? undefined
@@ -5546,8 +5952,14 @@ function applyRightRelationChanges(
         };
       }
 
-      affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
-      if (state.branchOrdered === undefined) {
+      if (state.branchAggregate === undefined) {
+        affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
+      } else {
+        const previousGroupKeys = groupKeysByRelationKey?.get(change.key);
+        recordAggregateGroupKeys(affectedAggregateGroupKeys, previousGroupKeys);
+        groupKeysByRelationKey?.delete(change.key);
+      }
+      if (state.branchOrdered === undefined && state.branchAggregate === undefined) {
         removeRightIndexRows(step, indexByValue, previousRows, env);
       }
       relationKeys[index] = undefined;
@@ -5589,8 +6001,14 @@ function applyRightRelationChanges(
     }
 
     if (previousRows !== undefined) {
-      affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
-      if (state.branchOrdered === undefined) {
+      if (state.branchAggregate === undefined) {
+        affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
+      } else {
+        const previousGroupKeys = groupKeysByRelationKey?.get(change.key);
+        recordAggregateGroupKeys(affectedAggregateGroupKeys, previousGroupKeys);
+        groupKeysByRelationKey?.delete(change.key);
+      }
+      if (state.branchOrdered === undefined && state.branchAggregate === undefined) {
         removeRightIndexRows(step, indexByValue, previousRows, env);
       }
       if (nestedRootJoinIndexes !== undefined) {
@@ -5607,8 +6025,16 @@ function applyRightRelationChanges(
       };
     }
     const nextRows = evaluated.rows;
-    affectedValues.push(...nextRows.map((row) => exprValue(row, step.rightExpr, env)));
-    if (state.branchOrdered === undefined) {
+    if (branchAggregate === undefined) {
+      affectedValues.push(...nextRows.map((row) => exprValue(row, step.rightExpr, env)));
+    } else if (groupKeysByRelationKey !== undefined) {
+      const nextGroupKeys = aggregateGroupKeysForRows(branchAggregate, nextRows, env);
+      recordAggregateGroupKeys(affectedAggregateGroupKeys, nextGroupKeys);
+      if (nextGroupKeys.length > 0) {
+        groupKeysByRelationKey.set(change.key, nextGroupKeys);
+      }
+    }
+    if (state.branchOrdered === undefined && state.branchAggregate === undefined) {
       addRightIndexRows(step, indexByValue, nextRows, env);
     }
     rowsByRelationKey.set(change.key, nextRows);
@@ -5648,8 +6074,47 @@ function applyRightRelationChanges(
   if (branchOrdered !== undefined) {
     affectedValues.push(...branchOrdered.state.rows.map((row) => exprValue(row, step.rightExpr, env)));
   }
-  const nextIndexByValue = branchOrdered !== undefined || state.nestedBranchJoinStates !== undefined
-    ? buildRightIndex(step, compactRelationKeys, rowsByRelationKey, env, branchOrdered?.state)
+  if (state.branchAggregate !== undefined) {
+    affectedValues.push(...aggregateRowsForKeys(state.branchAggregate, affectedAggregateGroupKeys)
+      .map((row) => exprValue(row, step.rightExpr, env)));
+  }
+  const compactRelationIndexByKey = indexKeys(compactRelationKeys);
+  const nextBranchAggregate = branchAggregate === undefined
+    ? undefined
+    : maintainBranchAggregateState(
+      step.right,
+      state.branchAggregate as IncrementalAggregateState<Record<string, unknown>>,
+      compactRelationKeys,
+      compactRelationIndexByKey,
+      rowsByRelationKey,
+      groupKeysByRelationKey ?? new Map(),
+      buildRootKeysByGroupKey(compactRelationKeys, groupKeysByRelationKey ?? new Map()),
+      affectedAggregateGroupKeys,
+      env
+    );
+  if (nextBranchAggregate !== undefined && !nextBranchAggregate.supported) {
+    return {
+      supported: false,
+      reason: nextBranchAggregate.reason
+    };
+  }
+  if (nextBranchAggregate !== undefined) {
+    affectedValues.push(...aggregateRowsForKeys(nextBranchAggregate.state, affectedAggregateGroupKeys)
+      .map((row) => exprValue(row, step.rightExpr, env)));
+  }
+  const nextIndexByValue = (
+    branchOrdered !== undefined ||
+    nextBranchAggregate !== undefined ||
+    state.nestedBranchJoinStates !== undefined
+  )
+    ? buildRightIndex(
+      step,
+      compactRelationKeys,
+      rowsByRelationKey,
+      env,
+      branchOrdered?.state,
+      nextBranchAggregate?.state
+    )
     : indexByValue;
 
   return {
@@ -5657,10 +6122,11 @@ function applyRightRelationChanges(
     state: {
       ...state,
       relationKeys: compactRelationKeys,
-      relationIndexByKey: indexKeys(compactRelationKeys),
+      relationIndexByKey: compactRelationIndexByKey,
       relationRowsByKey,
       rowsByRelationKey,
       indexByValue: nextIndexByValue,
+      ...optionalBranchAggregateState(nextBranchAggregate?.state),
       ...optionalBranchOrderedState(branchOrdered?.state),
       ...(nextNestedBranchJoinStates === undefined ? {} : { nestedBranchJoinStates: nextNestedBranchJoinStates })
     },
@@ -5772,6 +6238,24 @@ function optionalImmutableOrderedStep(
   ordered: IncrementalOrderedStep | undefined
 ): { readonly ordered?: IncrementalOrderedStep } {
   return ordered === undefined ? {} : { ordered };
+}
+
+function optionalBranchAggregateStep(
+  aggregate: IncrementalAggregateStep | undefined
+): { readonly aggregate?: IncrementalAggregateStep } {
+  return aggregate === undefined ? {} : { aggregate };
+}
+
+function optionalBranchPostAggregateSteps(
+  steps: readonly IncrementalBranchPostAggregateStep[] | undefined
+): { readonly postAggregateSteps?: readonly IncrementalBranchPostAggregateStep[] } {
+  return steps === undefined || steps.length === 0 ? {} : { postAggregateSteps: [...steps] };
+}
+
+function optionalBranchAggregateState(
+  branchAggregate: IncrementalAggregateState<Record<string, unknown>> | undefined
+): { readonly branchAggregate?: IncrementalAggregateState<Record<string, unknown>> } {
+  return branchAggregate === undefined ? {} : { branchAggregate };
 }
 
 function optionalBranchOrderedState(

@@ -254,6 +254,13 @@ type UserTopTaskRow = {
   readonly points: number;
 };
 
+type UserTaskRollupRow = {
+  readonly ownerId: string;
+  readonly owner: string;
+  readonly taskCount: number;
+  readonly totalPoints: number;
+};
+
 type TaskNestedOwnerTeamRow = {
   readonly id: string;
   readonly ownerId: string;
@@ -547,6 +554,75 @@ function taskActiveOwnersViaRightStaticFilterQuery(): Query<TaskActiveOwnerRow> 
     project({ id: task.id, ownerId: task.ownerId, title: task.title }),
     keyBy('id')
   ) as Query<TaskActiveOwnerRow>;
+}
+
+function usersWithTaskRollupsRightAggregateQuery(): Query<UserTaskRollupRow> {
+  const owner = as(coreSchema.users, 'owner');
+  const task = as(coreSchema.tasks, 'task');
+  const aggregateOwnerId = field<string>('taskRollup', 'ownerId');
+  const aggregateTasks = field<number>('taskRollup', 'tasks');
+  const aggregatePoints = field<number>('taskRollup', 'points');
+  const rollupOwnerId = field<string>('rollup', 'ownerId');
+  const rollupTaskCount = field<number>('rollup', 'taskCount');
+  const rollupTotalPoints = field<number>('rollup', 'totalPoints');
+  const taskRollups = pipe(
+    from(task),
+    aggregate({
+      groupBy: { ownerId: task.ownerId },
+      aggregates: {
+        tasks: count(),
+        points: sum(task.points)
+      }
+    }),
+    project({ ownerId: aggregateOwnerId, tasks: aggregateTasks, points: aggregatePoints }),
+    extend({ label: value('task-rollup') }),
+    without('label'),
+    rename({ tasks: 'taskCount', points: 'totalPoints' }),
+    qualify('rollup')
+  );
+
+  return pipe(
+    from(owner),
+    join(taskRollups, eq(owner.id, rollupOwnerId)),
+    project({
+      ownerId: owner.id,
+      owner: owner.name,
+      taskCount: rollupTaskCount,
+      totalPoints: rollupTotalPoints
+    }),
+    keyBy('ownerId')
+  ) as Query<UserTaskRollupRow>;
+}
+
+function usersWithSortedTaskRollupsRightAggregateQuery(): Query<UserTaskRollupRow> {
+  const owner = as(coreSchema.users, 'owner');
+  const task = as(coreSchema.tasks, 'task');
+  const branchOwnerId = field<string>('taskRollup', 'ownerId');
+  const branchTaskCount = field<number>('taskRollup', 'taskCount');
+  const branchTotalPoints = field<number>('taskRollup', 'totalPoints');
+  const taskRollups = pipe(
+    from(task),
+    sortLimit(2, desc(task.points), asc(task.id)),
+    aggregate({
+      groupBy: { ownerId: task.ownerId },
+      aggregates: {
+        taskCount: count(),
+        totalPoints: sum(task.points)
+      }
+    })
+  );
+
+  return pipe(
+    from(owner),
+    join(taskRollups, eq(owner.id, branchOwnerId)),
+    project({
+      ownerId: owner.id,
+      owner: owner.name,
+      taskCount: branchTaskCount,
+      totalPoints: branchTotalPoints
+    }),
+    keyBy('ownerId')
+  ) as Query<UserTaskRollupRow>;
 }
 
 function usersWithGlobalTopTasksRightSortLimitQuery(count = 2): Query<UserTopTaskRow> {
@@ -4803,6 +4879,122 @@ describe('incremental materialization', () => {
     expect(materializedRowsForQuery(next, taskActiveOwners)).toEqual(change.rows);
   });
 
+  it('incrementally maintains a join whose right branch uses aggregate', () => {
+    const userTaskRollups = usersWithTaskRollupsRightAggregateQuery();
+    const state = mat(createDb(sourceData), userTaskRollups, {
+      id: 'user-task-rollups-right-aggregate',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, userTaskRollups);
+
+    expect(metadata).toMatchObject({
+      id: 'user-task-rollups-right-aggregate',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['users', 'tasks']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, userTaskRollups)).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskCount: 2, totalPoints: 13 },
+      { ownerId: 'bea', owner: 'Bea', taskCount: 1, totalPoints: 3 }
+    ]);
+
+    const adaTask: TaskRow = {
+      id: 't4',
+      ownerId: 'ada',
+      title: 'Add right branch aggregate work',
+      done: false,
+      points: 2
+    };
+    const withAdaTask = createDb({
+      ...sourceData,
+      tasks: [...sourceData.tasks, adaTask]
+    });
+    const inserted = maintainMaterializations(state, withAdaTask, {
+      deltas: [tasksDelta([adaTask], [])]
+    });
+    const insertedChange = expectIncrementalMaintenance(inserted, 'user-task-rollups-right-aggregate');
+
+    expect(insertedChange).toMatchObject({
+      touchedDependencies: ['tasks'],
+      rows: [
+        { ownerId: 'ada', owner: 'Ada', taskCount: 3, totalPoints: 15 },
+        { ownerId: 'bea', owner: 'Bea', taskCount: 1, totalPoints: 3 }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expect(insertedChange.rowChanges).toEqual([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { ownerId: 'ada', owner: 'Ada', taskCount: 2, totalPoints: 13 },
+        after: { ownerId: 'ada', owner: 'Ada', taskCount: 3, totalPoints: 15 }
+      })
+    ]);
+    expect(materializedRowsForQuery(withAdaTask, userTaskRollups)).toEqual(insertedChange.rows);
+
+    const movedDraftTask = { ...draftEvaluatorTask, ownerId: 'bea' };
+    const withMovedTask = createDb({
+      ...sourceData,
+      tasks: [movedDraftTask, shipRuntimeTask, reviewFixturesTask]
+    });
+    const moved = maintainMaterializations(state, withMovedTask, {
+      deltas: [tasksDelta([movedDraftTask], [draftEvaluatorTask])]
+    });
+    const movedChange = expectIncrementalMaintenance(moved, 'user-task-rollups-right-aggregate');
+
+    expect(movedChange).toMatchObject({
+      touchedDependencies: ['tasks'],
+      rows: [
+        { ownerId: 'ada', owner: 'Ada', taskCount: 1, totalPoints: 8 },
+        { ownerId: 'bea', owner: 'Bea', taskCount: 2, totalPoints: 8 }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expect(movedChange.rowChanges).toHaveLength(2);
+    expect(movedChange.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { ownerId: 'ada', owner: 'Ada', taskCount: 2, totalPoints: 13 },
+        after: { ownerId: 'ada', owner: 'Ada', taskCount: 1, totalPoints: 8 }
+      }),
+      expect.objectContaining({
+        kind: 'updated',
+        before: { ownerId: 'bea', owner: 'Bea', taskCount: 1, totalPoints: 3 },
+        after: { ownerId: 'bea', owner: 'Bea', taskCount: 2, totalPoints: 8 }
+      })
+    ]));
+    expect(materializedRowsForQuery(withMovedTask, userTaskRollups)).toEqual(movedChange.rows);
+
+    const withoutBeaTasks = createDb({
+      ...sourceData,
+      tasks: [draftEvaluatorTask, shipRuntimeTask]
+    });
+    const deleted = maintainMaterializations(state, withoutBeaTasks, {
+      deltas: [tasksDelta([], [reviewFixturesTask])]
+    });
+    const deletedChange = expectIncrementalMaintenance(deleted, 'user-task-rollups-right-aggregate');
+
+    expect(deletedChange).toMatchObject({
+      touchedDependencies: ['tasks'],
+      rows: [
+        { ownerId: 'ada', owner: 'Ada', taskCount: 2, totalPoints: 13 }
+      ],
+      addedRows: [],
+      removedRows: [
+        { ownerId: 'bea', owner: 'Bea', taskCount: 1, totalPoints: 3 }
+      ]
+    });
+    expect(deletedChange.rowChanges).toEqual([
+      expect.objectContaining({
+        kind: 'removed',
+        row: { ownerId: 'bea', owner: 'Bea', taskCount: 1, totalPoints: 3 }
+      })
+    ]);
+    expect(materializedRowsForQuery(withoutBeaTasks, userTaskRollups)).toEqual(deletedChange.rows);
+  });
+
   it('incrementally maintains a join whose right branch uses sortLimit', () => {
     const userTopTasks = usersWithGlobalTopTasksRightSortLimitQuery(2);
     const state = mat(createDb(sourceData), userTopTasks, {
@@ -4927,17 +5119,22 @@ describe('incremental materialization', () => {
     expect(materializedRowsForQuery(nonVisibleDb, userTopTasks)).toEqual(nonVisibleChange.rows);
   });
 
-  it('keeps right branch sort without limit and standalone limit on snapshot fallback', () => {
-    const cases = [
+  it('keeps right branch sort without limit, standalone limit, and aggregate after sortLimit on snapshot fallback', () => {
+    const cases: Array<{ readonly id: string; readonly query: Query<unknown>; readonly reason: string }> = [
       {
         id: 'user-sorted-tasks-right-branch',
-        query: usersWithSortedTasksRightBranchQuery(),
+        query: usersWithSortedTasksRightBranchQuery() as Query<unknown>,
         reason: 'sort is not supported'
       },
       {
         id: 'user-limited-tasks-right-branch',
-        query: usersWithLimitedTasksRightBranchQuery(),
+        query: usersWithLimitedTasksRightBranchQuery() as Query<unknown>,
         reason: 'limit is not supported'
+      },
+      {
+        id: 'user-sorted-task-rollups-right-branch',
+        query: usersWithSortedTaskRollupsRightAggregateQuery() as Query<unknown>,
+        reason: 'aggregate after order/window is not supported'
       }
     ];
 
