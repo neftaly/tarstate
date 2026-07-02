@@ -706,6 +706,82 @@ function usersWithLimitedTasksRightBranchQuery(): Query<UserTopTaskRow> {
   ) as Query<UserTopTaskRow>;
 }
 
+function taskProjectionBranch(): Query<{
+  readonly ownerId: string;
+  readonly taskId: string;
+  readonly title: string;
+  readonly points: number;
+}> {
+  const task = as(coreSchema.tasks, 'task');
+  return pipe(
+    from(task),
+    project({ ownerId: task.ownerId, taskId: task.id, title: task.title, points: task.points })
+  ) as Query<{
+    readonly ownerId: string;
+    readonly taskId: string;
+    readonly title: string;
+    readonly points: number;
+  }>;
+}
+
+function usersWithUnionTasksRightBranchQuery(): Query<UserTopTaskRow> {
+  const owner = as(coreSchema.users, 'owner');
+  const branchOwnerId = field<string>('unionTask', 'ownerId');
+  const branchTaskId = field<string>('unionTask', 'taskId');
+  const branchTitle = field<string>('unionTask', 'title');
+  const branchPoints = field<number>('unionTask', 'points');
+  const staticBefore = pipe(
+    constRows([{ ownerId: 'cal', taskId: 'pin-cal', title: 'Pinned Cal', points: 0 }]),
+    keyBy('taskId')
+  );
+  const staticAfter = pipe(
+    constRows([{ ownerId: 'bea', taskId: 'pin-bea', title: 'Pinned Bea', points: 1 }]),
+    keyBy('taskId')
+  );
+  const unionTasks = union(staticBefore, taskProjectionBranch(), staticAfter);
+
+  return pipe(
+    from(owner),
+    join(unionTasks, eq(owner.id, branchOwnerId)),
+    project({
+      ownerId: owner.id,
+      owner: owner.name,
+      taskId: branchTaskId,
+      title: branchTitle,
+      points: branchPoints
+    }),
+    keyBy('ownerId', 'taskId')
+  ) as Query<UserTopTaskRow>;
+}
+
+function usersWithDynamicUnionTasksRightBranchQuery(): Query<UserTopTaskRow> {
+  const owner = as(coreSchema.users, 'owner');
+  const task = as(coreSchema.tasks, 'task');
+  const branchOwnerId = field<string>('unionTask', 'ownerId');
+  const branchTaskId = field<string>('unionTask', 'taskId');
+  const branchTitle = field<string>('unionTask', 'title');
+  const branchPoints = field<number>('unionTask', 'points');
+  const activeTasks = pipe(
+    from(task),
+    where(eq(task.done, false)),
+    project({ ownerId: task.ownerId, taskId: task.id, title: task.title, points: task.points })
+  );
+  const unionTasks = union(taskProjectionBranch(), activeTasks);
+
+  return pipe(
+    from(owner),
+    join(unionTasks, eq(owner.id, branchOwnerId)),
+    project({
+      ownerId: owner.id,
+      owner: owner.name,
+      taskId: branchTaskId,
+      title: branchTitle,
+      points: branchPoints
+    }),
+    keyBy('ownerId', 'taskId')
+  ) as Query<UserTopTaskRow>;
+}
+
 function taskOwnerTeamNestedRightBranchQuery(): Query<TaskNestedOwnerTeamRow> {
   const task = as(coreSchema.tasks, 'task');
   const owner = as(coreSchema.users, 'owner');
@@ -2478,7 +2554,7 @@ describe('incremental materialization', () => {
             union(ownerRollupBase, dynamicAllowedRollups),
             keyBy('ownerId')
           ) as Query<unknown>,
-          reason: 'union static branch'
+          reason: 'union incremental maintenance requires exactly one supported dynamic branch'
         },
         {
           id: 'aggregate-then-dynamic-intersection-fallback',
@@ -5119,17 +5195,147 @@ describe('incremental materialization', () => {
     expect(materializedRowsForQuery(nonVisibleDb, userTopTasks)).toEqual(nonVisibleChange.rows);
   });
 
-  it('keeps right branch sort without limit, standalone limit, and aggregate after sortLimit on snapshot fallback', () => {
+  it('incrementally maintains joins whose right branch uses plain sort or standalone limit', () => {
+    const sortedTasks = usersWithSortedTasksRightBranchQuery();
+    const sortedState = mat(createDb(sourceData), sortedTasks, {
+      id: 'user-sorted-tasks-right-branch',
+      mode: 'incremental'
+    });
+    const sortedMetadata = materializationForQuery(sortedState, sortedTasks);
+
+    expect(sortedMetadata).toMatchObject({
+      id: 'user-sorted-tasks-right-branch',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(sortedMetadata?.dependencies).toEqual(expect.arrayContaining(['users', 'tasks']));
+    expectNoIncrementalFallback(sortedMetadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(sortedState, sortedTasks)).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 },
+      { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 },
+      { ownerId: 'bea', owner: 'Bea', taskId: 't3', title: 'Review fixtures', points: 3 }
+    ]);
+
+    const beaWinnerTask: TaskRow = {
+      id: 't4',
+      ownerId: 'bea',
+      title: 'Win sorted branch',
+      done: false,
+      points: 20
+    };
+    const sortedNext = createDb({ ...sourceData, tasks: [...sourceData.tasks, beaWinnerTask] });
+    const sortedMaintained = maintainMaterializations(sortedState, sortedNext, {
+      deltas: [tasksDelta([beaWinnerTask], [])]
+    });
+    const sortedChange = expectIncrementalMaintenance(sortedMaintained, 'user-sorted-tasks-right-branch');
+
+    expect(sortedChange.rows).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 },
+      { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 },
+      { ownerId: 'bea', owner: 'Bea', taskId: 't4', title: 'Win sorted branch', points: 20 },
+      { ownerId: 'bea', owner: 'Bea', taskId: 't3', title: 'Review fixtures', points: 3 }
+    ]);
+    expect(materializedRowsForQuery(sortedNext, sortedTasks)).toEqual(sortedChange.rows);
+
+    const limitedTasks = usersWithLimitedTasksRightBranchQuery();
+    const limitedState = mat(createDb(sourceData), limitedTasks, {
+      id: 'user-limited-tasks-right-branch',
+      mode: 'incremental'
+    });
+    const limitedMetadata = materializationForQuery(limitedState, limitedTasks);
+
+    expect(limitedMetadata).toMatchObject({
+      id: 'user-limited-tasks-right-branch',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(limitedMetadata?.dependencies).toEqual(expect.arrayContaining(['users', 'tasks']));
+    expectNoIncrementalFallback(limitedMetadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(limitedState, limitedTasks)).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 }
+    ]);
+
+    const limitedNext = createDb({
+      ...sourceData,
+      tasks: [shipRuntimeTask, reviewFixturesTask]
+    });
+    const limitedMaintained = maintainMaterializations(limitedState, limitedNext, {
+      deltas: [tasksDelta([], [draftEvaluatorTask])]
+    });
+    const limitedChange = expectIncrementalMaintenance(limitedMaintained, 'user-limited-tasks-right-branch');
+
+    expect(limitedChange.rows).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 }
+    ]);
+    expect(limitedChange.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'removed',
+        row: { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 }
+      })
+    ]));
+    expect(materializedRowsForQuery(limitedNext, limitedTasks)).toEqual(limitedChange.rows);
+  });
+
+  it('incrementally maintains joins whose right branch is a mixed static/dynamic union', () => {
+    const unionTasks = usersWithUnionTasksRightBranchQuery();
+    const state = mat(createDb(sourceData), unionTasks, {
+      id: 'user-union-tasks-right-branch',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, unionTasks);
+
+    expect(metadata).toMatchObject({
+      id: 'user-union-tasks-right-branch',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['users', 'tasks']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, unionTasks)).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 },
+      { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 },
+      { ownerId: 'bea', owner: 'Bea', taskId: 't3', title: 'Review fixtures', points: 3 },
+      { ownerId: 'bea', owner: 'Bea', taskId: 'pin-bea', title: 'Pinned Bea', points: 1 },
+      { ownerId: 'cal', owner: 'Cal', taskId: 'pin-cal', title: 'Pinned Cal', points: 0 }
+    ]);
+
+    const calTask: TaskRow = {
+      id: 't4',
+      ownerId: 'cal',
+      title: 'Cal right branch union',
+      done: false,
+      points: 4
+    };
+    const next = createDb({ ...sourceData, tasks: [...sourceData.tasks, calTask] });
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [tasksDelta([calTask], [])]
+    });
+    const change = expectIncrementalMaintenance(maintained, 'user-union-tasks-right-branch');
+
+    expect(change.rows).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 },
+      { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 },
+      { ownerId: 'bea', owner: 'Bea', taskId: 't3', title: 'Review fixtures', points: 3 },
+      { ownerId: 'bea', owner: 'Bea', taskId: 'pin-bea', title: 'Pinned Bea', points: 1 },
+      { ownerId: 'cal', owner: 'Cal', taskId: 'pin-cal', title: 'Pinned Cal', points: 0 },
+      { ownerId: 'cal', owner: 'Cal', taskId: 't4', title: 'Cal right branch union', points: 4 }
+    ]);
+    expect(change.addedRows).toEqual([
+      { ownerId: 'cal', owner: 'Cal', taskId: 't4', title: 'Cal right branch union', points: 4 }
+    ]);
+    expect(materializedRowsForQuery(next, unionTasks)).toEqual(change.rows);
+  });
+
+  it('keeps dynamic-dynamic right branch union and aggregate after sortLimit on snapshot fallback', () => {
     const cases: Array<{ readonly id: string; readonly query: Query<unknown>; readonly reason: string }> = [
       {
-        id: 'user-sorted-tasks-right-branch',
-        query: usersWithSortedTasksRightBranchQuery() as Query<unknown>,
-        reason: 'sort is not supported'
-      },
-      {
-        id: 'user-limited-tasks-right-branch',
-        query: usersWithLimitedTasksRightBranchQuery() as Query<unknown>,
-        reason: 'limit is not supported'
+        id: 'user-dynamic-union-tasks-right-branch',
+        query: usersWithDynamicUnionTasksRightBranchQuery() as Query<unknown>,
+        reason: 'right branch union incremental maintenance requires exactly one supported dynamic branch'
       },
       {
         id: 'user-sorted-task-rollups-right-branch',

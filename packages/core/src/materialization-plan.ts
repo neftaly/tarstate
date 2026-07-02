@@ -204,10 +204,13 @@ type IncrementalOrderedStep = {
   readonly postSteps: readonly IncrementalPostOrderStep[];
 };
 
-type IncrementalRelationPostStep = {
+type IncrementalStaticUnionStep = {
   readonly kind: 'staticUnion';
+  readonly beforeRows?: readonly Record<string, unknown>[];
   readonly rows: readonly Record<string, unknown>[];
 };
+
+type IncrementalRelationPostStep = IncrementalStaticUnionStep;
 
 type IncrementalBranchPlan = {
   readonly relation: string;
@@ -217,6 +220,7 @@ type IncrementalBranchPlan = {
   readonly aggregate?: IncrementalAggregateStep;
   readonly postAggregateSteps?: readonly IncrementalBranchPostAggregateStep[];
   readonly ordered?: IncrementalOrderedStep;
+  readonly staticUnion?: IncrementalStaticUnionStep;
 };
 
 type IncrementalDynamicSetState = {
@@ -454,6 +458,7 @@ type RightBranchPlanCollection = {
   aggregate?: IncrementalAggregateStep;
   postAggregateSteps?: IncrementalBranchPostAggregateStep[];
   ordered?: MutableIncrementalOrderedStep;
+  staticUnion?: IncrementalStaticUnionStep;
 };
 
 const incrementalEvaluationContext = Symbol('incrementalEvaluationContext');
@@ -2457,26 +2462,26 @@ function collectStaticUnionPlan(
   collection: PlanCollection,
   options: IncrementalMaterializationPlanOptions
 ): RootPlan | string {
-  const [leftInput, ...rightInputs] = inputs;
-  if (leftInput === undefined || rightInputs.length === 0) {
+  if (inputs.length < 2) {
     return 'union incremental maintenance requires one supported root branch and static right branches';
   }
 
-  const root = collectSingleRootPlan(leftInput, steps, collection, options);
-  if (typeof root === 'string') {
-    return `union first branch is not supported for incremental maintenance: ${root}`;
+  const split = splitStaticUnionInputs(inputs, 'union', options);
+  if (typeof split === 'string') {
+    return split;
   }
 
-  const rows = collectStaticUnionRows(rightInputs, options);
-  if (typeof rows === 'string') {
-    return rows;
+  const root = collectSingleRootPlan(split.dynamicInput, steps, collection, options);
+  if (typeof root === 'string') {
+    return `union dynamic branch is not supported for incremental maintenance: ${root}`;
   }
 
   collection.relationPostSteps.push({
     kind: 'staticUnion',
-    rows
+    ...optionalBeforeStaticUnionRows(split.beforeRows),
+    rows: split.afterRows
   });
-  return root;
+  return { ...root, shape: mergeShapes(root.shape, split.staticShape) };
 }
 
 function collectIntersectionPlan(
@@ -2556,24 +2561,58 @@ function collectStaticSetRows(
   return rows;
 }
 
-function collectStaticUnionRows(
+type SplitStaticUnionInputsResult = {
+  readonly dynamicInput: QueryData;
+  readonly beforeRows: readonly Record<string, unknown>[];
+  readonly afterRows: readonly Record<string, unknown>[];
+  readonly staticShape: PlanShape;
+};
+
+function splitStaticUnionInputs(
   inputs: readonly QueryData[],
+  op: 'union' | 'right branch union',
   options: IncrementalMaterializationPlanOptions
-): readonly Record<string, unknown>[] | string {
-  const rows: Array<readonly Record<string, unknown>[]> = [];
-  for (const input of inputs) {
+): SplitStaticUnionInputsResult | string {
+  let dynamicInput: QueryData | undefined;
+  let dynamicIndex = -1;
+  const staticInputs: Array<{
+    readonly index: number;
+    readonly rows: readonly Record<string, unknown>[];
+    readonly shape: PlanShape;
+  }> = [];
+
+  for (const [index, input] of inputs.entries()) {
     const staticConstRowsReason = staticUnionConstRowsReason(input);
-    if (staticConstRowsReason !== undefined) {
-      return `union static branch is not supported for incremental maintenance: ${staticConstRowsReason}`;
+    if (staticConstRowsReason === undefined) {
+      const evaluated = evaluateStaticRows(input, incrementalEvalContext({}, options));
+      if (!evaluated.supported) {
+        return `${op} static branch is not supported for incremental maintenance: ${evaluated.reason}`;
+      }
+      const shape = collectStaticRowsPlan(input, options);
+      if (typeof shape === 'string') {
+        return `${op} static branch is not supported for incremental maintenance: ${shape}`;
+      }
+      staticInputs.push({ index, rows: evaluated.rows, shape });
+      continue;
     }
 
-    const evaluated = evaluateStaticRows(input, incrementalEvalContext({}, options));
-    if (!evaluated.supported) {
-      return `union static branch is not supported for incremental maintenance: ${evaluated.reason}`;
+    if (dynamicInput !== undefined) {
+      return `${op} incremental maintenance requires exactly one supported dynamic branch and static constRows branches`;
     }
-    rows.push(evaluated.rows);
+    dynamicInput = input;
+    dynamicIndex = index;
   }
-  return setUnionRows(rows);
+
+  if (dynamicInput === undefined || staticInputs.length === 0) {
+    return `${op} incremental maintenance requires one supported dynamic branch and static constRows branches`;
+  }
+
+  return {
+    dynamicInput,
+    beforeRows: setUnionRows(staticInputs.filter((input) => input.index < dynamicIndex).map((input) => input.rows)),
+    afterRows: setUnionRows(staticInputs.filter((input) => input.index > dynamicIndex).map((input) => input.rows)),
+    staticShape: staticInputs.reduce<PlanShape>((shape, input) => mergeShapes(shape, input.shape), emptyShape())
+  };
 }
 
 function staticUnionConstRowsReason(data: QueryData): string | undefined {
@@ -2775,6 +2814,8 @@ function collectRightBranchPlanInternal(
     case 'where': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'where');
+      if (unionReason !== undefined) return unionReason;
       if (collection.ordered !== undefined) {
         return 'where after order/window is not supported';
       }
@@ -2789,6 +2830,8 @@ function collectRightBranchPlanInternal(
     case 'btree': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, data.op);
+      if (unionReason !== undefined) return unionReason;
       for (const expression of data.expressions) {
         const reason = rowLocalExprReason(expression, root.shape, options);
         if (reason !== undefined) {
@@ -2802,6 +2845,8 @@ function collectRightBranchPlanInternal(
     case 'select': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'select');
+      if (unionReason !== undefined) return unionReason;
       const reason = rowLocalProjectionReason(data.projection, root.shape, options);
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
@@ -2813,6 +2858,8 @@ function collectRightBranchPlanInternal(
     case 'extend': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'extend');
+      if (unionReason !== undefined) return unionReason;
       const reason = rowLocalProjectionReason(data.projection, root.shape, options);
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
@@ -2824,6 +2871,8 @@ function collectRightBranchPlanInternal(
     case 'expand': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'expand');
+      if (unionReason !== undefined) return unionReason;
       if (collection.ordered !== undefined) {
         return 'expand after order/window is not supported';
       }
@@ -2845,6 +2894,8 @@ function collectRightBranchPlanInternal(
     case 'without': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'without');
+      if (unionReason !== undefined) return unionReason;
       const step = { kind: 'without', fields: data.fields } satisfies IncrementalPostOrderStep;
       pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: withoutShape(root.shape, data.fields) }, collection);
@@ -2852,6 +2903,8 @@ function collectRightBranchPlanInternal(
     case 'rename': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'rename');
+      if (unionReason !== undefined) return unionReason;
       const step = { kind: 'rename', fields: data.fields } satisfies IncrementalPostOrderStep;
       pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: renameShape(root.shape, data.fields) }, collection);
@@ -2859,6 +2912,8 @@ function collectRightBranchPlanInternal(
     case 'qualify': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'qualify');
+      if (unionReason !== undefined) return unionReason;
       const step = { kind: 'qualify', alias: data.alias } satisfies IncrementalPostOrderStep;
       pushRightBranchPipelineStep(steps, collection, step);
       return rightBranchPlan({ ...root, shape: qualifyShape(root.shape, data.alias) }, collection);
@@ -2883,6 +2938,11 @@ function collectRightBranchPlanInternal(
       if (typeof left === 'string') {
         return `nested right branch join left side is not supported: ${left}`;
       }
+      if (left.staticUnion !== undefined) {
+        return 'join after terminal union is not supported';
+      }
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'join');
+      if (unionReason !== undefined) return unionReason;
       if (collection.aggregate !== undefined) {
         return 'join after aggregate is not supported';
       }
@@ -2927,16 +2987,66 @@ function collectRightBranchPlanInternal(
       });
       return rightBranchPlan({ ...left, shape: mergeShapes(left.shape, right.shape) }, collection);
     }
-    case 'sort':
-      return 'sort is not supported';
-    case 'limit':
-      return 'limit is not supported';
+    case 'sort': {
+      if (!collection.allowOrderedWindow) {
+        return 'sort is not supported';
+      }
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
+      if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'sort');
+      if (unionReason !== undefined) return unionReason;
+      if (collection.aggregate !== undefined) {
+        return 'sort after aggregate is not supported';
+      }
+      if (collection.ordered !== undefined) {
+        return 'sort after order/window is not supported';
+      }
+      const orderReason = sortOrderReason(data.order, root.shape, options);
+      if (orderReason !== undefined) {
+        return `sort order is not supported: ${orderReason}`;
+      }
+      collection.ordered = {
+        kind: 'ordered',
+        order: data.order,
+        postSteps: []
+      };
+      return rightBranchPlan(root, collection);
+    }
+    case 'limit': {
+      if (!collection.allowOrderedWindow) {
+        return 'limit is not supported';
+      }
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
+      if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'limit');
+      if (unionReason !== undefined) return unionReason;
+      const window = normalizedWindow(data.count, data.offset ?? 0);
+      if (typeof window === 'string') {
+        return `limit is not supported: ${window}`;
+      }
+      if (collection.aggregate !== undefined) {
+        return 'limit after aggregate is not supported';
+      }
+      if (collection.ordered === undefined) {
+        collection.ordered = {
+          kind: 'ordered',
+          order: [],
+          window,
+          postSteps: []
+        };
+      } else {
+        collection.ordered.window = combineWindows(collection.ordered.window, window);
+      }
+      return rightBranchPlan(root, collection);
+    }
     case 'sortLimit': {
       if (!collection.allowOrderedWindow) {
         return 'sortLimit is not supported';
       }
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'sortLimit');
+      if (unionReason !== undefined) return unionReason;
       if (collection.aggregate !== undefined) {
         return 'sortLimit after aggregate is not supported';
       }
@@ -2960,7 +3070,7 @@ function collectRightBranchPlanInternal(
       return rightBranchPlan(root, collection);
     }
     case 'union':
-      return 'union is not supported';
+      return collectRightBranchUnionPlan(data.inputs, steps, collection, options);
     case 'intersection':
       return collectRightBranchIntersectionPlan(data.inputs, steps, collection, options);
     case 'difference':
@@ -2973,6 +3083,8 @@ function collectRightBranchPlanInternal(
       }
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'aggregate');
+      if (unionReason !== undefined) return unionReason;
       if (collection.aggregate !== undefined) {
         return 'nested aggregate is not supported';
       }
@@ -3024,6 +3136,49 @@ function isPostOrderStep(step: IncrementalPipelineStep): step is IncrementalPost
   );
 }
 
+function rightBranchOperatorAfterStaticUnionReason(
+  collection: RightBranchPlanCollection,
+  operator: string
+): string | undefined {
+  return collection.staticUnion === undefined
+    ? undefined
+    : `${operator} after terminal union is not supported`;
+}
+
+function collectRightBranchUnionPlan(
+  inputs: readonly QueryData[],
+  steps: IncrementalBranchStep[],
+  collection: RightBranchPlanCollection,
+  options: IncrementalMaterializationPlanOptions
+): RightBranchPlan | string {
+  if (inputs.length < 2) {
+    return 'union requires one supported relation branch and static constRows branches';
+  }
+  if (collection.staticUnion !== undefined) {
+    return 'nested terminal union is not supported';
+  }
+
+  const split = splitStaticUnionInputs(inputs, 'right branch union', options);
+  if (typeof split === 'string') {
+    return split;
+  }
+
+  const root = collectRightBranchPlanInternal(split.dynamicInput, steps, collection, options);
+  if (typeof root === 'string') {
+    return `union dynamic branch is not supported: ${root}`;
+  }
+  if (collection.staticUnion !== undefined) {
+    return 'nested terminal union is not supported';
+  }
+
+  collection.staticUnion = {
+    kind: 'staticUnion',
+    ...optionalBeforeStaticUnionRows(split.beforeRows),
+    rows: split.afterRows
+  };
+  return rightBranchPlan({ ...root, shape: mergeShapes(root.shape, split.staticShape) }, collection);
+}
+
 function collectRightBranchIntersectionPlan(
   inputs: readonly QueryData[],
   steps: IncrementalBranchStep[],
@@ -3039,6 +3194,8 @@ function collectRightBranchIntersectionPlan(
   if (typeof root === 'string') {
     return `intersection first branch is not supported: ${root}`;
   }
+  const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'intersection');
+  if (unionReason !== undefined) return unionReason;
   if (collection.ordered !== undefined) {
     return 'intersection after order/window is not supported';
   }
@@ -3066,6 +3223,8 @@ function collectRightBranchDifferencePlan(
   if (typeof root === 'string') {
     return `difference left branch is not supported: ${root}`;
   }
+  const unionReason = rightBranchOperatorAfterStaticUnionReason(collection, 'difference');
+  if (unionReason !== undefined) return unionReason;
   if (collection.ordered !== undefined) {
     return 'difference after order/window is not supported';
   }
@@ -3090,7 +3249,8 @@ function branchPlan(plan: RightBranchPlan): IncrementalBranchPlan {
     steps: plan.steps,
     ...optionalBranchAggregateStep(plan.aggregate),
     ...optionalBranchPostAggregateSteps(plan.postAggregateSteps),
-    ...optionalImmutableOrderedStep(plan.ordered)
+    ...optionalImmutableOrderedStep(plan.ordered),
+    ...optionalBranchStaticUnionStep(plan.staticUnion)
   };
 }
 
@@ -3102,7 +3262,8 @@ function rightBranchPlan(
     ...plan,
     ...optionalBranchAggregateStep(collection.aggregate),
     ...optionalBranchPostAggregateSteps(collection.postAggregateSteps),
-    ...optionalOrderedStep(collection.ordered)
+    ...optionalOrderedStep(collection.ordered),
+    ...optionalBranchStaticUnionStep(collection.staticUnion)
   };
 }
 
@@ -4218,7 +4379,7 @@ function applyRelationPostSteps(
   for (const step of steps) {
     switch (step.kind) {
       case 'staticUnion':
-        output = setUnionRows([output, step.rows]);
+        output = setUnionRows([step.beforeRows ?? [], output, step.rows]);
         break;
     }
   }
@@ -5460,11 +5621,7 @@ function buildRightIndex(
   branchAggregate?: IncrementalAggregateState<Record<string, unknown>>
 ): ReadonlyMap<string, readonly IndexedRightRow[]> {
   const index = new Map<string, IndexedRightRow[]>();
-  const rows = branchAggregate === undefined
-    ? branchOrdered === undefined
-      ? relationKeys.flatMap((relationKey) => rowsByRelationKey.get(relationKey) ?? [])
-      : branchOrdered.rows
-    : rowsFromAggregateState(branchAggregate);
+  const rows = rightIndexRows(step.right, relationKeys, rowsByRelationKey, branchOrdered, branchAggregate);
 
   for (const row of rows) {
     const value = exprValue(row, step.rightExpr, env);
@@ -5478,6 +5635,24 @@ function buildRightIndex(
   }
 
   return index;
+}
+
+function rightIndexRows(
+  branch: IncrementalBranchPlan,
+  relationKeys: readonly string[],
+  rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
+  branchOrdered?: IncrementalOrderedState<Record<string, unknown>>,
+  branchAggregate?: IncrementalAggregateState<Record<string, unknown>>
+): readonly Record<string, unknown>[] {
+  const rows = branchAggregate === undefined
+    ? branchOrdered === undefined
+      ? relationKeys.flatMap((relationKey) => rowsByRelationKey.get(relationKey) ?? [])
+      : branchOrdered.rows
+    : rowsFromAggregateState(branchAggregate);
+
+  return branch.staticUnion === undefined
+    ? rows
+    : setUnionRows([branch.staticUnion.beforeRows ?? [], rows, branch.staticUnion.rows]);
 }
 
 function joinStateMap(states: readonly IncrementalJoinState[]): ReadonlyMap<string, IncrementalJoinState> {
@@ -6252,6 +6427,18 @@ function optionalBranchPostAggregateSteps(
   return steps === undefined || steps.length === 0 ? {} : { postAggregateSteps: [...steps] };
 }
 
+function optionalBranchStaticUnionStep(
+  step: IncrementalStaticUnionStep | undefined
+): { readonly staticUnion?: IncrementalStaticUnionStep } {
+  return step === undefined ? {} : { staticUnion: step };
+}
+
+function optionalBeforeStaticUnionRows(
+  rows: readonly Record<string, unknown>[]
+): { readonly beforeRows?: readonly Record<string, unknown>[] } {
+  return rows.length === 0 ? {} : { beforeRows: rows };
+}
+
 function optionalBranchAggregateState(
   branchAggregate: IncrementalAggregateState<Record<string, unknown>> | undefined
 ): { readonly branchAggregate?: IncrementalAggregateState<Record<string, unknown>> } {
@@ -6283,6 +6470,8 @@ function incrementalSingleRootPlanReason(collection: PlanCollection): string {
 }
 
 function operatorAfterRelationPostReason(collection: PlanCollection, operator: string): string | undefined {
+  // TODO: represent row-local relation-post operators here so select/extend/without/rename/qualify
+  // after a terminal static union can be incrementally composed instead of falling back.
   return collection.relationPostSteps.length === 0
     ? undefined
     : `${operator} after terminal union is not supported for incremental maintenance`;

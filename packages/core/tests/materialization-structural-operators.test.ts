@@ -646,6 +646,85 @@ describe('incremental materialization for pure structural operators', () => {
     expect(materializedRowsForQuery(deletedTaskState, setQuery)).toEqual(deletedTaskChange.rows);
   });
 
+  it('plans mixed static and dynamic top-level unions with the supported dynamic branch in any position', () => {
+    const staticBefore = pipe(
+      constRows([{ id: 'pin-a', name: 'Pinned A' }]),
+      keyBy('id')
+    ) as Query<UserNameRow>;
+    const staticBeforeDuplicate = pipe(
+      constRows([{ id: 'pin-a', name: 'Pinned A' }, { id: 'pin-b', name: 'Pinned B' }]),
+      keyBy('id')
+    ) as Query<UserNameRow>;
+    const staticAfter = pipe(
+      constRows([{ id: 'ada', name: 'Ada' }, { id: 'pin-c', name: 'Pinned C' }]),
+      keyBy('id')
+    ) as Query<UserNameRow>;
+    const setQuery = union(staticBefore, staticBeforeDuplicate, userNamesQuery(), staticAfter);
+    const state = mat(createDb(sourceData), setQuery, {
+      id: 'mixed-static-dynamic-union',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, setQuery);
+
+    expect(metadata).toMatchObject({
+      id: 'mixed-static-dynamic-union',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(['users']);
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, setQuery)).toEqual([
+      { id: 'pin-a', name: 'Pinned A' },
+      { id: 'pin-b', name: 'Pinned B' },
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' },
+      { id: 'pin-c', name: 'Pinned C' }
+    ]);
+
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, diaUser]
+    }) as typeof state;
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([diaUser], [])]
+    });
+    const change = expectIncrementalMaintenance(maintained, 'mixed-static-dynamic-union');
+
+    expect(change.rows).toEqual([
+      { id: 'pin-a', name: 'Pinned A' },
+      { id: 'pin-b', name: 'Pinned B' },
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' },
+      { id: 'dia', name: 'Dia' },
+      { id: 'pin-c', name: 'Pinned C' }
+    ]);
+    expect(materializedRowsForQuery(next, setQuery)).toEqual(change.rows);
+  });
+
+  it('falls back when mixed static and dynamic top-level union rows duplicate final keyBy keys', () => {
+    const staticAda = pipe(
+      constRows([{ id: 'ada', name: 'Static Ada' }]),
+      keyBy('id')
+    ) as Query<UserNameRow>;
+    const setQuery = pipe(
+      union(staticAda, userNamesQuery()),
+      keyBy('id')
+    ) as Query<UserNameRow>;
+    const state = mat(createDb(sourceData), setQuery, {
+      id: 'mixed-static-dynamic-union-key-collision',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, setQuery);
+
+    expect(metadata).toMatchObject({
+      id: 'mixed-static-dynamic-union-key-collision',
+      requestedMode: 'incremental',
+      maintenance: 'snapshot'
+    });
+    expect(metadata?.maintenanceReason).toContain('duplicated');
+    expectIncrementalFallback(metadata?.diagnostics ?? []);
+  });
+
   it('incrementally maintains dynamic intersection with duplicate right contributors', () => {
     const setQuery = intersection(userNamesQuery(), taskOwnerNamesQuery());
     const initial = createDb({ ...sourceData, tasks: [adaNameTask, adaNameTaskDuplicate] });
