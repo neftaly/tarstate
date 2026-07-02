@@ -1835,7 +1835,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
 
     const incremental = previousRows === undefined || !hasRelationChangeHints || !envHintsCoverDependencies || touchedEnv.length > 0
       ? undefined
-      : maintainMaterializationIncrementally(target, metadata.query as Query<Row>, previousRows, options.deltas);
+      : maintainMaterializationIncrementally(before, target, metadata.query as Query<Row>, previousRows, options.deltas);
 
     if (incremental !== undefined && incremental.supported) {
       changes.push({
@@ -1906,16 +1906,32 @@ type MaterializationRowKeyPath = readonly string[];
 type MaterializationRowIdentity<Row = unknown> = {
   readonly paths: readonly MaterializationRowKeyPath[];
   readonly fields: readonly string[] | undefined;
+  readonly expressions?: readonly ExprData[];
   readonly keyBy: RowKeySelector<Row>;
   readonly keyOf: (row: Row) => string;
   readonly unique: boolean;
+  readonly readable?: boolean;
+};
+type IncrementalJoinSide = {
+  readonly side: 'left' | 'right';
+  readonly relation: RelationRef;
+  readonly alias: string;
+  readonly data: QueryData;
+};
+type IncrementalJoinShape = {
+  readonly data: QueryData;
+  readonly clause: Readonly<Record<string, string>>;
+  readonly left: IncrementalJoinSide;
+  readonly right: IncrementalJoinSide;
 };
 type IncrementalMaterializationSupport<Row = unknown> =
   | {
       readonly supported: true;
       readonly relation: RelationRef;
+      readonly touchedRelations: readonly RelationRef[];
       readonly identity: MaterializationRowIdentity<Row>;
       readonly finalSort?: QueryData;
+      readonly join?: IncrementalJoinShape;
       readonly trusted: boolean;
       readonly reason: string;
     }
@@ -1928,7 +1944,9 @@ type IncrementalMaterializationShape =
   | {
       readonly supported: true;
       readonly relation: RelationRef;
+      readonly touchedRelations: readonly RelationRef[];
       readonly finalSort?: QueryData;
+      readonly join?: IncrementalJoinShape;
     }
   | {
       readonly supported: false;
@@ -1962,9 +1980,16 @@ type IncrementalMaterializedRowsResult<Row = unknown> =
 type IncrementalMaterializedSortPlacement<Row = unknown> = {
   readonly compare: (left: Row, right: Row) => number;
 };
+type IncrementalJoinContribution<Row = unknown> = {
+  readonly side: IncrementalJoinSide['side'];
+  readonly deltaIndex: number;
+  readonly row: Row;
+  readonly key: string;
+};
 const SOURCE_ORDER_PLACEMENT_MIN_ROWS = 64;
 
 function maintainMaterializationIncrementally<Row>(
+  before: unknown,
   target: unknown,
   query: Query<Row>,
   previousRows: readonly Row[],
@@ -1973,7 +1998,8 @@ function maintainMaterializationIncrementally<Row>(
   const support = incrementalMaterializationSupport(query);
   if (!support.supported) return support;
 
-  const relationDeltasForQuery = deltas.filter((delta) => delta.relation.name === support.relation.name);
+  const touchedRelationNames = new Set(support.touchedRelations.map((relationRef) => relationRef.name));
+  const relationDeltasForQuery = deltas.filter((delta) => touchedRelationNames.has(delta.relation.name));
   if (relationDeltasForQuery.length === 0) {
     return {
       supported: true,
@@ -1987,6 +2013,21 @@ function maintainMaterializationIncrementally<Row>(
   }
 
   const evaluateOptions = materializationEvaluateOptions(target);
+  if (support.join !== undefined) {
+    return maintainJoinMaterializationIncrementally(before, target, query, previousRows, relationDeltasForQuery, support, support.join, evaluateOptions);
+  }
+
+  return maintainSingleRelationMaterializationIncrementally(target, query, previousRows, relationDeltasForQuery, support, evaluateOptions);
+}
+
+function maintainSingleRelationMaterializationIncrementally<Row>(
+  target: unknown,
+  query: Query<Row>,
+  previousRows: readonly Row[],
+  relationDeltasForQuery: readonly RelationDelta[],
+  support: Extract<IncrementalMaterializationSupport<Row>, { readonly supported: true }>,
+  evaluateOptions: EvaluateOptions
+): IncrementalMaterializationResult<Row> {
   const diagnostics: TarstateDiagnostic[] = [];
   let rows = previousRows;
   const useDirectRowChanges = support.trusted;
@@ -2073,6 +2114,263 @@ function maintainMaterializationIncrementally<Row>(
   };
 }
 
+function maintainJoinMaterializationIncrementally<Row>(
+  before: unknown,
+  target: unknown,
+  query: Query<Row>,
+  previousRows: readonly Row[],
+  relationDeltasForQuery: readonly RelationDelta[],
+  support: Extract<IncrementalMaterializationSupport<Row>, { readonly supported: true }>,
+  joinShape: IncrementalJoinShape,
+  evaluateOptions: EvaluateOptions
+): IncrementalMaterializationResult<Row> {
+  const beforeLeftRows = materializationTargetRelationRows(before, joinShape.left.relation);
+  const beforeRightRows = materializationTargetRelationRows(before, joinShape.right.relation);
+  const afterLeftRows = materializationTargetRelationRows(target, joinShape.left.relation);
+  const afterRightRows = materializationTargetRelationRows(target, joinShape.right.relation);
+  if (beforeLeftRows === undefined || beforeRightRows === undefined || afterLeftRows === undefined || afterRightRows === undefined) {
+    return unsupportedIncrementalShape('join incremental maintenance requires readable before and after relation snapshots');
+  }
+
+  const previousDuplicateKeys = duplicateMaterializedRowKeys(previousRows, support.identity);
+  if (previousDuplicateKeys.length > 0) return nonUniqueMaterializedRowKeysResult(previousDuplicateKeys);
+
+  const diagnostics: TarstateDiagnostic[] = [];
+  const removedContributions: IncrementalJoinContribution<Row>[] = [];
+  const addedContributions: IncrementalJoinContribution<Row>[] = [];
+
+  for (const [deltaIndex, delta] of relationDeltasForQuery.entries()) {
+    const side = delta.relation.name === joinShape.left.relation.name
+      ? joinShape.left
+      : delta.relation.name === joinShape.right.relation.name
+        ? joinShape.right
+        : undefined;
+    if (side === undefined) continue;
+
+    const removedResult = evaluateJoinDeltaRows(
+      query,
+      joinShape,
+      side.side,
+      delta.removed,
+      side.side === 'left' ? beforeRightRows : beforeLeftRows,
+      evaluateOptions
+    );
+    const addedResult = evaluateJoinDeltaRows(
+      query,
+      joinShape,
+      side.side,
+      delta.added,
+      side.side === 'left' ? afterRightRows : afterLeftRows,
+      evaluateOptions
+    );
+    diagnostics.push(...removedResult.diagnostics, ...addedResult.diagnostics);
+    removedContributions.push(...joinContributions(removedResult.rows, side.side, deltaIndex, support.identity));
+    addedContributions.push(...joinContributions(addedResult.rows, side.side, deltaIndex, support.identity));
+  }
+
+  const removedRows = coalesceJoinContributions(removedContributions, 'removed');
+  const addedRows = coalesceJoinContributions(addedContributions, 'added');
+  if (!removedRows.supported) return { ...removedRows, diagnostics: [...diagnostics, ...removedRows.diagnostics] };
+  if (!addedRows.supported) return { ...addedRows, diagnostics: [...diagnostics, ...addedRows.diagnostics] };
+
+  const finalSortPlacement = support.finalSort === undefined
+    ? undefined
+    : incrementalMaterializedSortPlacement(support.finalSort, query.relations, evaluateOptions, diagnostics);
+  const sourceOrderPlacement = support.finalSort === undefined
+    ? incrementalJoinSourceOrderPlacement(target, joinShape, support.identity)
+    : undefined;
+  const sortPlacement = finalSortPlacement ?? sourceOrderPlacement;
+  const rowUpdate = applyIncrementalMaterializedRows(
+    previousRows,
+    removedRows.rows,
+    addedRows.rows,
+    support.identity,
+    {
+      sourceRemovedCount: relationDeltasForQuery.reduce((countValue, delta) => countValue + delta.removed.length, 0),
+      sorted: support.finalSort !== undefined || sourceOrderPlacement !== undefined,
+      ...(sortPlacement === undefined ? {} : { sortPlacement })
+    }
+  );
+  if (!rowUpdate.supported) {
+    return {
+      supported: false,
+      reason: rowUpdate.reason,
+      diagnostics: [...diagnostics, ...rowUpdate.diagnostics]
+    };
+  }
+
+  const orderedRows = { rows: rowUpdate.rows, diagnostics: [] };
+  if (!support.trusted) {
+    const refresh = refreshMaterializationRows(target, query);
+    if (stableKey(orderedRows.rows) !== stableKey(refresh.rows)) {
+      const reason = 'incremental materialization candidate differed from full recompute';
+      return {
+        supported: false,
+        reason,
+        diagnostics: [...diagnostics, ...orderedRows.diagnostics, ...refresh.diagnostics, materializationUnsupportedDiagnostic(reason)]
+      };
+    }
+  }
+
+  const diff = diffRows(previousRows, orderedRows.rows, { keyBy: support.identity.keyBy });
+  return {
+    supported: true,
+    reason: 'incremental delta maintenance',
+    rows: orderedRows.rows,
+    added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    rowChanges: diff.changes,
+    diagnostics: [...diagnostics, ...orderedRows.diagnostics, ...diff.diagnostics]
+  };
+}
+
+function materializationTargetRelationRows(target: unknown, relationRef: RelationRef): readonly unknown[] | undefined {
+  if (isDb(target)) return target.data[relationRef.name] ?? [];
+  if (isRelationSource(target)) return target.rows(relationRef);
+  return undefined;
+}
+
+function evaluateJoinDeltaRows<Row>(
+  query: Query<Row>,
+  joinShape: IncrementalJoinShape,
+  changedSide: IncrementalJoinSide['side'],
+  changedRows: readonly unknown[],
+  oppositeRows: readonly unknown[],
+  options: EvaluateOptions
+): MaterializationRefreshResult<Row> {
+  if (changedRows.length === 0 || oppositeRows.length === 0) return { rows: [], diagnostics: [] };
+  const source = fromObjectSource({
+    [joinShape.left.relation.name]: changedSide === 'left' ? changedRows : oppositeRows,
+    [joinShape.right.relation.name]: changedSide === 'right' ? changedRows : oppositeRows
+  });
+  return evaluate(source, query, options);
+}
+
+function joinContributions<Row>(
+  rows: readonly Row[],
+  side: IncrementalJoinSide['side'],
+  deltaIndex: number,
+  identity: MaterializationRowIdentity<Row>
+): readonly IncrementalJoinContribution<Row>[] {
+  return rows.map((rowValue) => ({ side, deltaIndex, row: rowValue, key: identity.keyOf(rowValue) }));
+}
+
+function coalesceJoinContributions<Row>(
+  contributions: readonly IncrementalJoinContribution<Row>[],
+  phase: 'removed' | 'added'
+): { readonly supported: true; readonly rows: readonly Row[] } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  const byKey = new Map<string, IncrementalJoinContribution<Row>[]>();
+  for (const contribution of contributions) {
+    const existing = byKey.get(contribution.key);
+    if (existing === undefined) byKey.set(contribution.key, [contribution]);
+    else existing.push(contribution);
+  }
+
+  const rows: Row[] = [];
+  const duplicateKeys: string[] = [];
+  for (const [key, entries] of byKey) {
+    const first = entries[0];
+    if (first === undefined) continue;
+    if (entries.length === 1) {
+      rows.push(first.row);
+      continue;
+    }
+
+    const perDelta = new Map<number, IncrementalJoinContribution<Row>[]>();
+    for (const entry of entries) {
+      const deltaEntries = perDelta.get(entry.deltaIndex);
+      if (deltaEntries === undefined) perDelta.set(entry.deltaIndex, [entry]);
+      else deltaEntries.push(entry);
+    }
+
+    if (Array.from(perDelta.values()).some((deltaEntries) => deltaEntries.length > 1)) {
+      duplicateKeys.push(key);
+      continue;
+    }
+
+    if (entries.every((entry) => rowsEqualForDiff(first.row, entry.row))) {
+      rows.push(first.row);
+      continue;
+    }
+
+    const sorted = [...entries].sort((left, right) => left.deltaIndex - right.deltaIndex);
+    const selected = phase === 'removed' ? sorted[0] : sorted[sorted.length - 1];
+    if (selected === undefined) duplicateKeys.push(key);
+    else rows.push(selected.row);
+  }
+
+  return duplicateKeys.length === 0
+    ? { supported: true, rows }
+    : nonUniqueMaterializedRowKeysResult(duplicateKeys);
+}
+
+function duplicateMaterializedRowKeys<Row>(
+  rows: readonly Row[],
+  identity: MaterializationRowIdentity<Row>
+): readonly string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const rowValue of rows) {
+    const key = identity.keyOf(rowValue);
+    if (seen.has(key)) duplicates.add(key);
+    else seen.add(key);
+  }
+  return [...duplicates];
+}
+
+function nonUniqueMaterializedRowKeysResult(
+  duplicateKeys: readonly string[]
+): { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  const reason = `incremental maintenance requires unique materialized row keys: ${uniqueStrings(duplicateKeys).join(', ')}`;
+  return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+}
+
+function incrementalJoinSourceOrderPlacement<Row>(
+  target: unknown,
+  joinShape: IncrementalJoinShape,
+  identity: MaterializationRowIdentity<Row>
+): IncrementalMaterializedSortPlacement<Row> | undefined {
+  if (!identity.unique || identity.paths.length === 0) return undefined;
+  const leftKeyFields = relationKeyFields(joinShape.left.relation);
+  const rightKeyFields = relationKeyFields(joinShape.right.relation);
+  if (identity.paths.length !== leftKeyFields.length + rightKeyFields.length) return undefined;
+
+  const leftRows = materializationTargetRelationRows(target, joinShape.left.relation);
+  const rightRows = materializationTargetRelationRows(target, joinShape.right.relation);
+  if (leftRows === undefined || rightRows === undefined) return undefined;
+
+  const leftOrder = relationKeyOrder(leftRows, joinShape.left.relation);
+  const rightOrder = relationKeyOrder(rightRows, joinShape.right.relation);
+  const leftKeyCount = leftKeyFields.length;
+
+  const orderFor = (rowValue: Row): { readonly left: number; readonly right: number; readonly key: string } => {
+    const values = identity.paths.map((path) => valueAtPath(rowValue, path));
+    const left = leftOrder.get(stableKey(values.slice(0, leftKeyCount))) ?? Number.POSITIVE_INFINITY;
+    const right = rightOrder.get(stableKey(values.slice(leftKeyCount))) ?? Number.POSITIVE_INFINITY;
+    return { left, right, key: stableKey(values) };
+  };
+
+  return {
+    compare: (left, right) => {
+      const leftOrderValue = orderFor(left);
+      const rightOrderValue = orderFor(right);
+      if (leftOrderValue.left !== rightOrderValue.left) return leftOrderValue.left < rightOrderValue.left ? -1 : 1;
+      if (leftOrderValue.right !== rightOrderValue.right) return leftOrderValue.right < rightOrderValue.right ? -1 : 1;
+      return leftOrderValue.key < rightOrderValue.key ? -1 : leftOrderValue.key > rightOrderValue.key ? 1 : 0;
+    }
+  };
+}
+
+function relationKeyOrder(rows: readonly unknown[], relationRef: RelationRef): ReadonlyMap<string, number> {
+  const fields = relationKeyFields(relationRef);
+  const order = new Map<string, number>();
+  rows.forEach((rowValue, indexValue) => {
+    const key = stableKey(fields.map((fieldName) => isRecord(rowValue) ? rowValue[fieldName] : undefined));
+    if (!order.has(key)) order.set(key, indexValue);
+  });
+  return order;
+}
+
 function recomputeMaterializationChange<Row>(
   target: unknown,
   metadata: MaterializationMetadata<Row>,
@@ -2149,8 +2447,10 @@ function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalM
   const shape = incrementalMaterializationShape(query.data, query.relations);
   if (!shape.supported) return shape;
 
-  const identity = rowIdentityForQueryData<Row>(query.data, query.relations);
-  if (identity === undefined) {
+  const identity = shape.join === undefined
+    ? rowIdentityForQueryData<Row>(query.data, query.relations)
+    : joinMaterializedRowIdentity<Row>(query.data, query.relations, shape.join);
+  if (identity === undefined || identity.readable === false) {
     return {
       supported: false,
       reason: 'incremental maintenance requires a stable materialized row identity',
@@ -2161,10 +2461,14 @@ function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalM
   return {
     supported: true,
     relation: shape.relation,
+    touchedRelations: shape.touchedRelations,
     identity,
     ...(shape.finalSort === undefined ? {} : { finalSort: shape.finalSort }),
+    ...(shape.join === undefined ? {} : { join: shape.join }),
     trusted: trustedIncrementalMaterialization(query, shape, identity),
-    reason: 'single-source pipeline with stable row identity'
+    reason: shape.join === undefined
+      ? 'single-source pipeline with stable row identity'
+      : 'two-relation equi-join pipeline with stable row identity'
   };
 }
 
@@ -2195,7 +2499,7 @@ function incrementalMaterializationShape(
         const reason = 'incremental maintenance requires a readable source relation';
         return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
       }
-      return { supported: true, relation: relationRef as RelationRef };
+      return { supported: true, relation: relationRef as RelationRef, touchedRelations: [relationRef as RelationRef] };
     }
     case 'where':
       if (containsIncrementalSubquery(data.predicate)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
@@ -2243,7 +2547,7 @@ function incrementalMaterializationShape(
     case 'sortLimit':
       return unsupportedIncrementalShape('limit queries require auxiliary pre-limit state and are not incrementally maintained');
     case 'join':
-      return unsupportedIncrementalShape('join queries are not incrementally maintained');
+      return incrementalJoinMaterializationShape(data, relations);
     case 'union':
     case 'intersection':
     case 'difference':
@@ -2267,6 +2571,62 @@ function incrementalNestedShape(
 
 function unsupportedIncrementalShape(reason: string): { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
   return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+}
+
+function incrementalJoinMaterializationShape(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): IncrementalMaterializationShape {
+  if (data.kind !== 'inner') {
+    return unsupportedIncrementalShape(data.kind === 'left'
+      ? 'left join queries are not incrementally maintained'
+      : 'non-inner join queries are not incrementally maintained');
+  }
+
+  if (isPredicateData(data.on)) {
+    return unsupportedIncrementalShape('predicate join queries are not incrementally maintained');
+  }
+
+  const clause = equiJoinClauseMapFrom(data.on);
+  if (clause === undefined) {
+    return unsupportedIncrementalShape('join clause queries require a non-empty equi-clause map');
+  }
+
+  const leftData = queryDataFrom(data.left);
+  const rightData = queryDataFrom(data.right);
+  const left = leftData === undefined ? undefined : directIncrementalJoinSide('left', leftData, relations);
+  const right = rightData === undefined ? undefined : directIncrementalJoinSide('right', rightData, relations);
+  if (left === undefined || right === undefined || left.relation.name === right.relation.name) {
+    return unsupportedIncrementalShape('join incremental maintenance requires two direct relation inputs');
+  }
+
+  const joinShape: IncrementalJoinShape = { data, clause, left, right };
+  return {
+    supported: true,
+    relation: left.relation,
+    touchedRelations: [left.relation, right.relation],
+    join: joinShape
+  };
+}
+
+function directIncrementalJoinSide(
+  side: 'left' | 'right',
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): IncrementalJoinSide | undefined {
+  if (data.op !== 'from' && data.op !== 'lookup') return undefined;
+  const relationName = typeof data.relation === 'string' ? data.relation : undefined;
+  const relationRef = relationName === undefined ? undefined : relations[relationName];
+  if (!isRelationRef(relationRef)) return undefined;
+  const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
+  return { side, relation: relationRef as RelationRef, alias, data };
+}
+
+function equiJoinClauseMapFrom(input: unknown): Readonly<Record<string, string>> | undefined {
+  if (!isRecord(input) || isPredicateData(input)) return undefined;
+  const entries = Object.entries(input);
+  if (entries.length === 0 || entries.some(([, rightField]) => typeof rightField !== 'string')) return undefined;
+  return Object.fromEntries(entries) as Record<string, string>;
 }
 
 function materializationUnsupportedDiagnostic(message: string): TarstateDiagnostic {
@@ -2934,6 +3294,15 @@ function trustedIncrementalQueryExpressions(data: QueryData): boolean {
       return arrayFromUnknown(data.order)
         .every((sortInput) => trustedRowLocalExpr(normalizeSortInput(sortInput).expr))
         && nestedTrusted();
+    case 'join': {
+      if (data.kind !== 'inner' || isPredicateData(data.on) || equiJoinClauseMapFrom(data.on) === undefined) return false;
+      const left = queryDataFrom(data.left);
+      const right = queryDataFrom(data.right);
+      return left !== undefined
+        && right !== undefined
+        && (left.op === 'from' || left.op === 'lookup')
+        && (right.op === 'from' || right.op === 'lookup');
+    }
     case 'without':
     case 'rename':
     case 'qualify':
@@ -3071,6 +3440,20 @@ function finalRowFieldExpressions(data: QueryData, relations: Readonly<Record<st
       if (!isRelationRef(relationRef)) return new Map();
       const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
       return new Map(relationFieldNames(relationRef).map((fieldName) => [fieldName, field(alias, fieldName)]));
+    }
+    case 'join': {
+      const leftData = queryDataFrom(data.left);
+      const rightData = queryDataFrom(data.right);
+      const left = leftData === undefined ? undefined : directIncrementalJoinSide('left', leftData, relations);
+      const right = rightData === undefined ? undefined : directIncrementalJoinSide('right', rightData, relations);
+      if (left === undefined || right === undefined) return new Map();
+      const rightFieldNames = new Set(relationFieldNames(right.relation));
+      const fields = new Map<string, ExprData>();
+      for (const fieldName of relationFieldNames(left.relation)) {
+        if (!rightFieldNames.has(fieldName)) fields.set(fieldName, field(left.alias, fieldName));
+      }
+      for (const fieldName of relationFieldNames(right.relation)) fields.set(fieldName, field(right.alias, fieldName));
+      return fields;
     }
     case 'where':
     case 'hash':
@@ -5935,6 +6318,41 @@ function rowIdentityForNestedQuery<Row>(
 ): MaterializationRowIdentity<Row> | undefined {
   const input = queryDataFrom(data.input);
   return input === undefined ? undefined : rowIdentityForQueryData(input, relations);
+}
+
+function joinMaterializedRowIdentity<Row>(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  joinShape: IncrementalJoinShape
+): MaterializationRowIdentity<Row> | undefined {
+  const finalFields = finalRowFieldExpressions(data, relations);
+  if (finalFields.size === 0) return undefined;
+
+  const paths: MaterializationRowKeyPath[] = [];
+  for (const exprData of joinIdentityFieldExpressions(joinShape)) {
+    const fieldName = directFinalFieldForExpr(exprData, finalFields);
+    if (fieldName === undefined) return undefined;
+    paths.push([fieldName]);
+  }
+
+  const fieldNames = paths.map((path) => path[0] as string);
+  if (new Set(fieldNames).size !== fieldNames.length) return undefined;
+  return rowIdentityFromPaths<Row>(paths, { unique: true });
+}
+
+function joinIdentityFieldExpressions(joinShape: IncrementalJoinShape): readonly ExprData[] {
+  return [
+    ...relationKeyFields(joinShape.left.relation).map((fieldName) => field(joinShape.left.alias, fieldName)),
+    ...relationKeyFields(joinShape.right.relation).map((fieldName) => field(joinShape.right.alias, fieldName))
+  ];
+}
+
+function directFinalFieldForExpr(exprData: ExprData, finalFields: ReadonlyMap<string, ExprData>): string | undefined {
+  const key = stableKey(exprData);
+  for (const [fieldName, finalExpr] of finalFields) {
+    if (stableKey(finalExpr) === key) return fieldName;
+  }
+  return undefined;
 }
 
 function projectedRowIdentity<Row>(
