@@ -22,6 +22,7 @@ import {
   sortLimit,
   union,
   intersection,
+  value,
   where
 } from '@tarstate/core';
 import type { MaterializationMaintenanceResult, Query, RelationDelta } from '@tarstate/core';
@@ -31,6 +32,7 @@ import {
   calUser,
   coreSchema,
   sourceData,
+  type TaskRow,
   type UserRow
 } from './fixtures';
 
@@ -62,6 +64,30 @@ type UserTagRow = {
 type UserNameRow = {
   readonly id: string;
   readonly name: string;
+};
+
+const adaNameTask: TaskRow = {
+  id: 'name-ada',
+  ownerId: 'ada',
+  title: 'Ada',
+  done: false,
+  points: 1
+};
+
+const adaNameTaskDuplicate: TaskRow = {
+  id: 'name-ada-duplicate',
+  ownerId: 'ada',
+  title: 'Ada',
+  done: false,
+  points: 2
+};
+
+const calNameTask: TaskRow = {
+  id: 'name-cal',
+  ownerId: 'cal',
+  title: 'Cal',
+  done: false,
+  points: 3
 };
 
 const diaUser: UserRow = {
@@ -128,6 +154,25 @@ function userNamesQuery(): Query<UserNameRow> {
   ) as Query<UserNameRow>;
 }
 
+function taskOwnerNamesQuery(): Query<UserNameRow> {
+  const task = as(coreSchema.tasks, 'task');
+  return pipe(
+    from(task),
+    where(eq(task.done, false)),
+    project({ id: task.ownerId, name: task.title }),
+    keyBy('id')
+  ) as Query<UserNameRow>;
+}
+
+function taskOwnerCollisionNamesQuery(): Query<UserNameRow> {
+  const task = as(coreSchema.tasks, 'task');
+  return pipe(
+    from(task),
+    where(eq(task.done, false)),
+    project({ id: task.ownerId, name: value('Task') })
+  ) as Query<UserNameRow>;
+}
+
 function sortedUserNamesQuery(): Query<UserNameRow> {
   const user = as(coreSchema.users, 'user');
   return pipe(
@@ -140,6 +185,10 @@ function sortedUserNamesQuery(): Query<UserNameRow> {
 
 function usersDelta(added: readonly UserRow[], removed: readonly UserRow[]): RelationDelta<typeof coreSchema.users> {
   return { relation: coreSchema.users, added, removed };
+}
+
+function tasksDelta(added: readonly TaskRow[], removed: readonly TaskRow[]): RelationDelta<typeof coreSchema.tasks> {
+  return { relation: coreSchema.tasks, added, removed };
 }
 
 function singleMaterializationChange(result: MaterializationMaintenanceResult, id: string) {
@@ -364,6 +413,212 @@ describe('incremental materialization for pure structural operators', () => {
       expect.objectContaining({ kind: 'added', row: { id: 'dia', tag: 'docs' } })
     ]));
     expect(materializedRowsForQuery(next, userTags)).toEqual(change.rows);
+  });
+
+  it.each([
+    {
+      name: 'union',
+      id: 'dynamic-set-union',
+      query: () => union(userNamesQuery(), taskOwnerNamesQuery())
+    },
+    {
+      name: 'intersection',
+      id: 'dynamic-set-intersection',
+      query: () => intersection(userNamesQuery(), taskOwnerNamesQuery())
+    },
+    {
+      name: 'difference',
+      id: 'dynamic-set-difference',
+      query: () => difference(userNamesQuery(), taskOwnerNamesQuery())
+    }
+  ])('plans dynamic $name over supported branches incrementally', ({ id, query }) => {
+    const setQuery = query();
+    const state = mat(createDb(sourceData), setQuery, { id, mode: 'incremental' });
+    const metadata = materializationForQuery(state, setQuery);
+
+    expect(metadata).toMatchObject({
+      id,
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['users', 'tasks']));
+    expect(metadata?.dependencies).toHaveLength(2);
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+  });
+
+  it('incrementally maintains dynamic union across both branch deltas', () => {
+    const setQuery = union(userNamesQuery(), taskOwnerNamesQuery());
+    const initial = createDb({ ...sourceData, tasks: [adaNameTask] });
+    const state = mat(initial, setQuery, { id: 'dynamic-union-deltas', mode: 'incremental' });
+
+    expect(materializedRowsForQuery(state, setQuery)).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
+    ]);
+
+    const insertedTaskState = createDb({ ...sourceData, tasks: [adaNameTask, calNameTask] }) as typeof state;
+    const insertedTask = maintainMaterializations(state, insertedTaskState, {
+      deltas: [tasksDelta([calNameTask], [])]
+    });
+    const insertedTaskChange = expectIncrementalMaintenance(insertedTask, 'dynamic-union-deltas');
+
+    expect(insertedTaskChange.rows).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' },
+      { id: 'cal', name: 'Cal' }
+    ]);
+
+    const inactiveAda = { ...adaUser, active: false };
+    const inactiveUserState = createDb({
+      ...sourceData,
+      users: [inactiveAda, beaUser, calUser],
+      tasks: [adaNameTask, calNameTask]
+    }) as typeof state;
+    const inactiveUser = maintainMaterializations(insertedTaskState, inactiveUserState, {
+      deltas: [usersDelta([inactiveAda], [adaUser])]
+    });
+    const inactiveUserChange = expectIncrementalMaintenance(inactiveUser, 'dynamic-union-deltas');
+
+    expect(inactiveUserChange.rows).toEqual([
+      { id: 'bea', name: 'Bea' },
+      { id: 'ada', name: 'Ada' },
+      { id: 'cal', name: 'Cal' }
+    ]);
+
+    const deletedTaskState = createDb({
+      ...sourceData,
+      users: [inactiveAda, beaUser, calUser],
+      tasks: [calNameTask]
+    }) as typeof state;
+    const deletedTask = maintainMaterializations(inactiveUserState, deletedTaskState, {
+      deltas: [tasksDelta([], [adaNameTask])]
+    });
+    const deletedTaskChange = expectIncrementalMaintenance(deletedTask, 'dynamic-union-deltas');
+
+    expect(deletedTaskChange.rows).toEqual([
+      { id: 'bea', name: 'Bea' },
+      { id: 'cal', name: 'Cal' }
+    ]);
+    expect(materializedRowsForQuery(deletedTaskState, setQuery)).toEqual(deletedTaskChange.rows);
+  });
+
+  it('incrementally maintains dynamic intersection with duplicate right contributors', () => {
+    const setQuery = intersection(userNamesQuery(), taskOwnerNamesQuery());
+    const initial = createDb({ ...sourceData, tasks: [adaNameTask, adaNameTaskDuplicate] });
+    const state = mat(initial, setQuery, { id: 'dynamic-intersection-duplicates', mode: 'incremental' });
+
+    expect(materializedRowsForQuery(state, setQuery)).toEqual([{ id: 'ada', name: 'Ada' }]);
+
+    const oneDuplicateState = createDb({ ...sourceData, tasks: [adaNameTaskDuplicate] }) as typeof state;
+    const oneDuplicate = maintainMaterializations(state, oneDuplicateState, {
+      deltas: [tasksDelta([], [adaNameTask])]
+    });
+    const oneDuplicateChange = expectIncrementalMaintenance(oneDuplicate, 'dynamic-intersection-duplicates');
+
+    expect(oneDuplicateChange.rows).toEqual([{ id: 'ada', name: 'Ada' }]);
+    expect(oneDuplicateChange.addedRows).toEqual([]);
+    expect(oneDuplicateChange.removedRows).toEqual([]);
+
+    const noDuplicateState = createDb({ ...sourceData, tasks: [] }) as typeof state;
+    const noDuplicate = maintainMaterializations(oneDuplicateState, noDuplicateState, {
+      deltas: [tasksDelta([], [adaNameTaskDuplicate])]
+    });
+    const noDuplicateChange = expectIncrementalMaintenance(noDuplicate, 'dynamic-intersection-duplicates');
+
+    expect(noDuplicateChange.rows).toEqual([]);
+    expect(noDuplicateChange.removedRows).toEqual([{ id: 'ada', name: 'Ada' }]);
+
+    const activeCal = { ...calUser, active: true };
+    const activeInsertedState = createDb({
+      ...sourceData,
+      users: [adaUser, beaUser, activeCal],
+      tasks: [calNameTask]
+    }) as typeof state;
+    const activeInserted = maintainMaterializations(noDuplicateState, activeInsertedState, {
+      deltas: [
+        usersDelta([activeCal], [calUser]),
+        tasksDelta([calNameTask], [])
+      ]
+    });
+    const activeInsertedChange = expectIncrementalMaintenance(activeInserted, 'dynamic-intersection-duplicates');
+
+    expect(activeInsertedChange.rows).toEqual([{ id: 'cal', name: 'Cal' }]);
+    expect(activeInsertedChange.addedRows).toEqual([{ id: 'cal', name: 'Cal' }]);
+    expect(materializedRowsForQuery(activeInsertedState, setQuery)).toEqual(activeInsertedChange.rows);
+  });
+
+  it('incrementally maintains dynamic difference when the right branch inserts and deletes', () => {
+    const setQuery = difference(userNamesQuery(), taskOwnerNamesQuery());
+    const initial = createDb({ ...sourceData, tasks: [adaNameTask] });
+    const state = mat(initial, setQuery, { id: 'dynamic-difference-right-deltas', mode: 'incremental' });
+
+    expect(materializedRowsForQuery(state, setQuery)).toEqual([{ id: 'bea', name: 'Bea' }]);
+
+    const deletedRightState = createDb({ ...sourceData, tasks: [] }) as typeof state;
+    const deletedRight = maintainMaterializations(state, deletedRightState, {
+      deltas: [tasksDelta([], [adaNameTask])]
+    });
+    const deletedRightChange = expectIncrementalMaintenance(deletedRight, 'dynamic-difference-right-deltas');
+
+    expect(deletedRightChange.rows).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
+    ]);
+    expect(deletedRightChange.addedRows).toEqual([{ id: 'ada', name: 'Ada' }]);
+
+    const inactiveBea = { ...beaUser, active: false };
+    const inactiveLeftState = createDb({
+      ...sourceData,
+      users: [adaUser, inactiveBea, calUser],
+      tasks: []
+    }) as typeof state;
+    const inactiveLeft = maintainMaterializations(deletedRightState, inactiveLeftState, {
+      deltas: [usersDelta([inactiveBea], [beaUser])]
+    });
+    const inactiveLeftChange = expectIncrementalMaintenance(inactiveLeft, 'dynamic-difference-right-deltas');
+
+    expect(inactiveLeftChange.rows).toEqual([{ id: 'ada', name: 'Ada' }]);
+    expect(inactiveLeftChange.removedRows).toEqual([{ id: 'bea', name: 'Bea' }]);
+
+    const insertedRightState = createDb({
+      ...sourceData,
+      users: [adaUser, inactiveBea, calUser],
+      tasks: [adaNameTask]
+    }) as typeof state;
+    const insertedRight = maintainMaterializations(inactiveLeftState, insertedRightState, {
+      deltas: [tasksDelta([adaNameTask], [])]
+    });
+    const insertedRightChange = expectIncrementalMaintenance(insertedRight, 'dynamic-difference-right-deltas');
+
+    expect(insertedRightChange.rows).toEqual([]);
+    expect(insertedRightChange.removedRows).toEqual([{ id: 'ada', name: 'Ada' }]);
+    expect(materializedRowsForQuery(insertedRightState, setQuery)).toEqual(insertedRightChange.rows);
+  });
+
+  it('falls back when a dynamic set has duplicate final row keys after keyBy', () => {
+    const setQuery = pipe(
+      union(userNamesQuery(), taskOwnerCollisionNamesQuery()),
+      keyBy('id')
+    ) as Query<UserNameRow>;
+    const state = mat(createDb(sourceData), setQuery, {
+      id: 'dynamic-set-final-key-collision',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, setQuery);
+
+    expect(metadata).toMatchObject({
+      id: 'dynamic-set-final-key-collision',
+      requestedMode: 'incremental',
+      maintenance: 'snapshot'
+    });
+    expect(metadata?.maintenanceReason).toContain('duplicate');
+    expectIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, setQuery)).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' },
+      { id: 'ada', name: 'Task' },
+      { id: 'bea', name: 'Task' }
+    ]);
   });
 
   it.each([

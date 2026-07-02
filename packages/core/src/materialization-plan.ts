@@ -38,9 +38,17 @@ export type IncrementalStaticRowsMaterializationPlan = {
   readonly rowKeyFields?: readonly string[];
 };
 
+export type IncrementalDynamicSetMaterializationPlan = {
+  readonly kind: 'dynamicSet';
+  readonly op: 'union' | 'intersection' | 'difference';
+  readonly branches: readonly IncrementalBranchPlan[];
+  readonly rowKeyFields?: readonly string[];
+};
+
 export type IncrementalMaterializationPlan =
   | IncrementalSingleRootMaterializationPlan
-  | IncrementalStaticRowsMaterializationPlan;
+  | IncrementalStaticRowsMaterializationPlan
+  | IncrementalDynamicSetMaterializationPlan;
 
 export type IncrementalMaterializationState<Row = unknown> = {
   readonly kind: 'incrementalMaterializationState';
@@ -52,6 +60,7 @@ export type IncrementalMaterializationState<Row = unknown> = {
   readonly joinStates: readonly IncrementalJoinState[];
   readonly aggregate?: IncrementalAggregateState<Row>;
   readonly ordered?: IncrementalOrderedState<Row>;
+  readonly dynamicSet?: IncrementalDynamicSetState;
 };
 
 export type IncrementalMaterialization<Row = unknown> = {
@@ -164,6 +173,17 @@ type IncrementalBranchPlan = {
   readonly alias: string;
   readonly root: IncrementalRoot;
   readonly steps: readonly IncrementalBranchStep[];
+};
+
+type IncrementalDynamicSetState = {
+  readonly branches: readonly IncrementalSetBranchState[];
+};
+
+type IncrementalSetBranchState = {
+  readonly relation: string;
+  readonly relationKeys: readonly string[];
+  readonly relationIndexByKey: ReadonlyMap<string, number>;
+  readonly rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>;
 };
 
 type IncrementalJoinState = {
@@ -381,10 +401,35 @@ export function planIncrementalMaterialization(query: Query): IncrementalPlanRes
     };
   }
 
+  const dynamicSetPlan = collectDynamicSetPlan(query.data);
   const steps: IncrementalStep[] = [];
   const collection: PlanCollection = { joinCount: 0 };
   const root = collectSingleRootPlan(query.data, steps, collection);
   if (typeof root === 'string') {
+    if (dynamicSetPlan.supported) {
+      for (const relationName of dynamicSetRelationNames(dynamicSetPlan.plan)) {
+        if (query.relations[relationName] === undefined) {
+          return { supported: false, reason: `relation ${relationName} is not available for incremental maintenance` };
+        }
+      }
+
+      return {
+        supported: true,
+        plan: {
+          ...dynamicSetPlan.plan,
+          ...optionalRowKeyFields(queryRowKeyFields(query))
+        },
+        reason: `incremental maintenance for supported dynamic ${dynamicSetPlan.plan.op} branches`
+      };
+    }
+
+    if (isSetQueryData(query.data)) {
+      return {
+        supported: false,
+        reason: dynamicSetPlan.reason
+      };
+    }
+
     return {
       supported: false,
       reason: staticPlan === staticRowsRelationReason ? root : staticPlan
@@ -416,15 +461,26 @@ export function planIncrementalMaterialization(query: Query): IncrementalPlanRes
 
 export function buildIncrementalMaterialization<Row>(
   plan: IncrementalMaterializationPlan,
-  relation: RelationRef,
-  rootRows: readonly unknown[],
+  relation: RelationRef | undefined,
+  rootRows: readonly unknown[] = [],
   env: Readonly<Record<string, unknown>>,
-  relationSnapshots: ReadonlyMap<string, IncrementalRelationSnapshot> = new Map([
-    [relation.name, { relation, rows: rootRows }]
-  ])
+  relationSnapshots: ReadonlyMap<string, IncrementalRelationSnapshot> = relation === undefined
+    ? new Map()
+    : new Map([[relation.name, { relation, rows: rootRows }]])
 ): IncrementalMaterializationBuildResult<Row> {
   if (plan.kind === 'staticRows') {
     return buildStaticIncrementalMaterialization(plan, env);
+  }
+
+  if (plan.kind === 'dynamicSet') {
+    return buildDynamicSetIncrementalMaterialization(plan, relationSnapshots, env);
+  }
+
+  if (relation === undefined) {
+    return {
+      supported: false,
+      reason: `relation ${plan.rootRelation} is not available for incremental maintenance`
+    };
   }
 
   const duplicateReason = duplicateRelationRowsReason(relation, rootRows);
@@ -573,6 +629,72 @@ export function buildStaticIncrementalMaterialization<Row>(
   };
 }
 
+function buildDynamicSetIncrementalMaterialization<Row>(
+  plan: IncrementalDynamicSetMaterializationPlan,
+  relationSnapshots: ReadonlyMap<string, IncrementalRelationSnapshot>,
+  env: Readonly<Record<string, unknown>>
+): IncrementalMaterializationBuildResult<Row> {
+  const branchStates: IncrementalSetBranchState[] = [];
+  const checkedRelations = new Set<string>();
+
+  for (const branch of plan.branches) {
+    const snapshot = relationSnapshots.get(branch.relation);
+    if (snapshot === undefined) {
+      return {
+        supported: false,
+        reason: `relation ${branch.relation} is not available for dynamic set maintenance`
+      };
+    }
+
+    if (!checkedRelations.has(snapshot.relation.name)) {
+      checkedRelations.add(snapshot.relation.name);
+      const duplicateReason = duplicateRelationRowsReason(
+        snapshot.relation,
+        snapshot.rows,
+        'set branch relation'
+      );
+      if (duplicateReason !== undefined) {
+        return {
+          supported: false,
+          reason: duplicateReason
+        };
+      }
+    }
+
+    const relationKeys: string[] = [];
+    const rowsByRelationKey = new Map<string, readonly Record<string, unknown>[]>();
+    for (const row of snapshot.rows) {
+      const key = relationKeyForRow(snapshot.relation, row);
+      relationKeys.push(key);
+      rowsByRelationKey.set(key, evaluateBranchRows(branch, row, env));
+    }
+
+    branchStates.push({
+      relation: branch.relation,
+      relationKeys,
+      relationIndexByKey: indexKeys(relationKeys),
+      rowsByRelationKey
+    });
+  }
+
+  const rows = dynamicSetRows(plan, branchStates) as readonly Row[];
+  const ambiguousRowsReason = ambiguousFinalRowsReason(plan, rows);
+  if (ambiguousRowsReason !== undefined) {
+    return {
+      supported: false,
+      reason: ambiguousRowsReason
+    };
+  }
+
+  return {
+    supported: true,
+    reason: 'incremental materialization state built for dynamic set branches',
+    plan,
+    state: dynamicSetMaterializationState(branchStates, rows),
+    rows
+  };
+}
+
 export function maintainIncrementalMaterialization<Row>(
   materialization: IncrementalMaterialization<Row>,
   relation: RelationRef | undefined,
@@ -592,6 +714,10 @@ export function maintainIncrementalMaterialization<Row>(
       changedGroupKeys: [],
       diagnostics: []
     };
+  }
+
+  if (materialization.plan.kind === 'dynamicSet') {
+    return maintainDynamicSetMaterialization(materialization.plan, materialization, deltas, env);
   }
 
   if (relation === undefined) {
@@ -938,6 +1064,312 @@ export function maintainIncrementalMaterialization<Row>(
     changedGroupKeys: rowReport.changedGroupKeys,
     diagnostics: rowReport.diagnostics
   };
+}
+
+function maintainDynamicSetMaterialization<Row>(
+  plan: IncrementalDynamicSetMaterializationPlan,
+  materialization: IncrementalMaterialization<Row>,
+  deltas: readonly RelationDelta[],
+  env: Readonly<Record<string, unknown>>
+): IncrementalMaintenanceResult<Row> {
+  const previousDynamicSet = materialization.state.dynamicSet;
+  if (previousDynamicSet === undefined) {
+    return {
+      updated: false,
+      reason: 'incremental dynamic set state is missing; snapshot recompute is required'
+    };
+  }
+
+  if (previousDynamicSet.branches.length !== plan.branches.length) {
+    return {
+      updated: false,
+      reason: 'incremental dynamic set branch state does not match the plan; snapshot recompute is required'
+    };
+  }
+
+  for (const branchState of previousDynamicSet.branches) {
+    const duplicateReason = duplicateRelationKeysReason(
+      branchState.relationKeys,
+      `set branch relation ${branchState.relation}`
+    );
+    if (duplicateReason !== undefined) {
+      return {
+        updated: false,
+        reason: duplicateReason
+      };
+    }
+  }
+
+  let branchStates = previousDynamicSet.branches;
+  let touched = false;
+  let changed = false;
+
+  for (const [index, branch] of plan.branches.entries()) {
+    const branchState = branchStates[index];
+    if (branchState === undefined || branchState.relation !== branch.relation) {
+      return {
+        updated: false,
+        reason: 'incremental dynamic set branch state does not match the plan; snapshot recompute is required'
+      };
+    }
+
+    const deltaRelation = relationForDeltas(branch.relation, deltas);
+    if (deltaRelation === undefined) {
+      continue;
+    }
+    touched = true;
+
+    const relationChanges = normalizedRelationChanges(
+      deltaRelation,
+      deltas,
+      `set branch relation ${deltaRelation.name}`
+    );
+    if (!relationChanges.supported) {
+      return {
+        updated: false,
+        reason: relationChanges.reason
+      };
+    }
+
+    if (relationChanges.changes.length === 0) {
+      if (hasRelationDeltaRows(deltaRelation, deltas)) {
+        return {
+          updated: false,
+          reason: `set branch relation ${deltaRelation.name} deltas had no net keyed row changes; snapshot recompute is required to preserve set order`
+        };
+      }
+      continue;
+    }
+
+    const nextBranch = applyDynamicSetBranchChanges(branch, branchState, deltaRelation, relationChanges.changes, env);
+    if (!nextBranch.supported) {
+      return {
+        updated: false,
+        reason: nextBranch.reason
+      };
+    }
+
+    branchStates = branchStates.map((state, stateIndex) => stateIndex === index ? nextBranch.state : state);
+    changed = true;
+  }
+
+  if (!touched || !changed) {
+    return {
+      updated: true,
+      reason: 'dynamic set relation deltas had no net row changes',
+      state: materialization.state,
+      rowChanges: [],
+      addedRows: [],
+      removedRows: [],
+      rowBatches: [],
+      changedRootKeys: [],
+      changedGroupKeys: [],
+      diagnostics: []
+    };
+  }
+
+  const rows = dynamicSetRows(plan, branchStates) as readonly Row[];
+  const ambiguousRowsReason = ambiguousFinalRowsReason(plan, rows);
+  if (ambiguousRowsReason !== undefined) {
+    return {
+      updated: false,
+      reason: ambiguousRowsReason
+    };
+  }
+
+  const state = dynamicSetMaterializationState(branchStates, rows);
+  const rowReport = dynamicSetRowReport(plan, materialization.state, state);
+
+  return {
+    updated: true,
+    reason: 'dependencies touched; incrementally maintained dynamic set rows',
+    state,
+    rowChanges: rowReport.rowChanges,
+    addedRows: rowReport.addedRows,
+    removedRows: rowReport.removedRows,
+    rowBatches: rowReport.rowBatches,
+    changedRootKeys: rowReport.changedRootKeys,
+    changedGroupKeys: rowReport.changedGroupKeys,
+    diagnostics: rowReport.diagnostics
+  };
+}
+
+type DynamicSetBranchChangeResult =
+  | {
+      readonly supported: true;
+      readonly state: IncrementalSetBranchState;
+    }
+  | {
+      readonly supported: false;
+      readonly reason: string;
+    };
+
+function applyDynamicSetBranchChanges(
+  branch: IncrementalBranchPlan,
+  state: IncrementalSetBranchState,
+  relation: RelationRef,
+  changes: readonly DeltaRowChange[],
+  env: Readonly<Record<string, unknown>>
+): DynamicSetBranchChangeResult {
+  const relationKeys: (string | undefined)[] = [...state.relationKeys];
+  const relationIndexByKey = new Map(state.relationIndexByKey);
+  const relationInsertIndexByKey = keyChangeInsertIndexes(relation, changes, relationIndexByKey);
+  const rowsByRelationKey = new Map(state.rowsByRelationKey);
+
+  for (const change of changes) {
+    const index = relationIndexByKey.get(change.key) ?? -1;
+    const previousRows = rowsByRelationKey.get(change.key);
+
+    if (change.after === undefined) {
+      if (index === -1 || previousRows === undefined) {
+        return {
+          supported: false,
+          reason: `set branch relation ${relation.name} delta removed missing key ${change.key}; snapshot recompute is required`
+        };
+      }
+
+      relationKeys[index] = undefined;
+      relationIndexByKey.delete(change.key);
+      rowsByRelationKey.delete(change.key);
+      continue;
+    }
+
+    if (index === -1) {
+      if (change.before !== undefined) {
+        return {
+          supported: false,
+          reason: `set branch relation ${relation.name} delta updated missing key ${change.key}; snapshot recompute is required`
+        };
+      }
+
+      const keyChangeIndex = relationInsertIndexByKey.get(change.key);
+      if (keyChangeIndex !== undefined && relationKeys[keyChangeIndex] === undefined) {
+        relationKeys[keyChangeIndex] = change.key;
+        relationIndexByKey.set(change.key, keyChangeIndex);
+      } else {
+        relationIndexByKey.set(change.key, relationKeys.length);
+        relationKeys.push(change.key);
+      }
+    } else if (change.before === undefined) {
+      return {
+        supported: false,
+        reason: `set branch relation ${relation.name} delta added duplicate key ${change.key}; snapshot recompute is required`
+      };
+    } else if (previousRows === undefined) {
+      return {
+        supported: false,
+        reason: `set branch relation ${relation.name} delta updated missing key ${change.key}; snapshot recompute is required`
+      };
+    }
+
+    rowsByRelationKey.set(change.key, evaluateBranchRows(branch, change.after, env));
+  }
+
+  const compactRelationKeys = relationKeys.filter((key): key is string => key !== undefined);
+  const duplicateReason = duplicateRelationKeysReason(compactRelationKeys, `set branch relation ${relation.name}`);
+  if (duplicateReason !== undefined) {
+    return {
+      supported: false,
+      reason: duplicateReason
+    };
+  }
+
+  return {
+    supported: true,
+    state: {
+      relation: state.relation,
+      relationKeys: compactRelationKeys,
+      relationIndexByKey: indexKeys(compactRelationKeys),
+      rowsByRelationKey
+    }
+  };
+}
+
+function dynamicSetRowReport<Row>(
+  plan: IncrementalDynamicSetMaterializationPlan,
+  previous: IncrementalMaterializationState<Row>,
+  next: IncrementalMaterializationState<Row>
+): IncrementalRowReport<Row> {
+  const options = rowDiffOptionsForPlan(plan);
+  const beforeRows = rowsFromIncrementalState(previous);
+  const afterRows = rowsFromIncrementalState(next);
+  const diff = diffMaterializationRows(beforeRows, afterRows, options);
+  const changed = materializationStableKey(beforeRows) !== materializationStableKey(afterRows);
+  const changedKeys = changed
+    ? orderedChangedKeys(
+      previous.rootKeys,
+      next.rootKeys,
+      new Set([...previous.rootKeys, ...next.rootKeys])
+    )
+    : [];
+
+  return {
+    rowChanges: diff.changes,
+    addedRows: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
+    removedRows: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
+    rowBatches: changed ? [{ beforeRows, afterRows }] : [],
+    changedRootKeys: changedKeys,
+    changedGroupKeys: [],
+    diagnostics: diff.diagnostics
+  };
+}
+
+function collectDynamicSetPlan(data: QueryData):
+  | { readonly supported: true; readonly plan: IncrementalDynamicSetMaterializationPlan }
+  | { readonly supported: false; readonly reason: string } {
+  switch (data.op) {
+    case 'keyBy':
+      return collectDynamicSetPlan(data.input);
+    case 'union':
+    case 'intersection':
+      return collectDynamicSetBranches(data.op, data.inputs);
+    case 'difference':
+      return collectDynamicSetBranches('difference', [data.left, data.right]);
+    default:
+      return {
+        supported: false,
+        reason: 'query is not a dynamic set operation'
+      };
+  }
+}
+
+function collectDynamicSetBranches(
+  op: 'union' | 'intersection' | 'difference',
+  inputs: readonly QueryData[]
+):
+  | { readonly supported: true; readonly plan: IncrementalDynamicSetMaterializationPlan }
+  | { readonly supported: false; readonly reason: string } {
+  if (inputs.length < 2) {
+    return {
+      supported: false,
+      reason: `${op} incremental maintenance requires at least two supported dynamic branches`
+    };
+  }
+
+  const branches: IncrementalBranchPlan[] = [];
+  for (const [index, input] of inputs.entries()) {
+    const branch = collectRightBranchPlan(input);
+    if (typeof branch === 'string') {
+      return {
+        supported: false,
+        reason: `${op} branch ${index + 1} is not supported for incremental maintenance: ${branch}`
+      };
+    }
+    branches.push(branchPlan(branch));
+  }
+
+  return {
+    supported: true,
+    plan: {
+      kind: 'dynamicSet',
+      op,
+      branches
+    }
+  };
+}
+
+function isSetQueryData(data: QueryData): boolean {
+  return data.op === 'union' || data.op === 'intersection' || data.op === 'difference';
 }
 
 function collectSingleRootPlan(
@@ -1591,22 +2023,26 @@ function planRelationNames(root: RootPlan, steps: readonly IncrementalStep[]): r
   return Array.from(names);
 }
 
+function dynamicSetRelationNames(plan: IncrementalDynamicSetMaterializationPlan): readonly string[] {
+  return Array.from(new Set(plan.branches.map((branch) => branch.relation)));
+}
+
 function joinSteps(plan: IncrementalMaterializationPlan): readonly IncrementalJoinStep[] {
-  if (plan.kind === 'staticRows') {
+  if (plan.kind !== 'singleRoot') {
     return [];
   }
   return plan.steps.filter((step): step is IncrementalJoinStep => step.kind === 'join');
 }
 
 function aggregateStep(plan: IncrementalMaterializationPlan): IncrementalAggregateStep | undefined {
-  if (plan.kind === 'staticRows') {
+  if (plan.kind !== 'singleRoot') {
     return undefined;
   }
   return plan.steps.find((step): step is IncrementalAggregateStep => step.kind === 'aggregate');
 }
 
 function orderedStep(plan: IncrementalMaterializationPlan): IncrementalOrderedStep | undefined {
-  return plan.kind === 'staticRows' ? undefined : plan.ordered;
+  return plan.kind === 'singleRoot' ? plan.ordered : undefined;
 }
 
 function hasAggregateStep(steps: readonly IncrementalStep[]): boolean {
@@ -1616,7 +2052,7 @@ function hasAggregateStep(steps: readonly IncrementalStep[]): boolean {
 function stepsAfterAggregate(
   plan: IncrementalMaterializationPlan
 ): readonly Exclude<IncrementalPipelineStep, { readonly kind: 'expand' }>[] {
-  if (plan.kind === 'staticRows') {
+  if (plan.kind !== 'singleRoot') {
     return [];
   }
 
@@ -2268,6 +2704,161 @@ function setDifferenceRows(
 ): readonly Record<string, unknown>[] {
   const rightKeys = new Set(right.map((row) => stableKey(row)));
   return left.filter((row) => !rightKeys.has(stableKey(row)));
+}
+
+type DynamicSetBranchSummary = {
+  readonly countsByRowKey: ReadonlyMap<string, number>;
+  readonly firstRowsByRowKey: ReadonlyMap<string, Record<string, unknown>>;
+  readonly firstOrderByRowKey: ReadonlyMap<string, number>;
+};
+
+function dynamicSetRows(
+  plan: IncrementalDynamicSetMaterializationPlan,
+  branchStates: readonly IncrementalSetBranchState[]
+): readonly Record<string, unknown>[] {
+  const summaries = branchStates.map(dynamicSetBranchSummary);
+  switch (plan.op) {
+    case 'union':
+      return dynamicSetUnionRows(summaries);
+    case 'intersection':
+      return dynamicSetIntersectionRows(summaries);
+    case 'difference':
+      return dynamicSetDifferenceRows(summaries);
+  }
+}
+
+function dynamicSetBranchSummary(state: IncrementalSetBranchState): DynamicSetBranchSummary {
+  const countsByRowKey = new Map<string, number>();
+  const firstRowsByRowKey = new Map<string, Record<string, unknown>>();
+  const firstOrderByRowKey = new Map<string, number>();
+  let order = 0;
+
+  for (const relationKey of state.relationKeys) {
+    for (const row of state.rowsByRelationKey.get(relationKey) ?? []) {
+      const key = stableKey(row);
+      countsByRowKey.set(key, (countsByRowKey.get(key) ?? 0) + 1);
+      if (!firstRowsByRowKey.has(key)) {
+        firstRowsByRowKey.set(key, row);
+        firstOrderByRowKey.set(key, order);
+      }
+      order += 1;
+    }
+  }
+
+  return { countsByRowKey, firstRowsByRowKey, firstOrderByRowKey };
+}
+
+function dynamicSetUnionRows(
+  summaries: readonly DynamicSetBranchSummary[]
+): readonly Record<string, unknown>[] {
+  const seen = new Set<string>();
+  const entries: Array<{
+    readonly branchIndex: number;
+    readonly order: number;
+    readonly row: Record<string, unknown>;
+  }> = [];
+
+  summaries.forEach((summary, branchIndex) => {
+    for (const [rowKey, row] of summary.firstRowsByRowKey) {
+      if (seen.has(rowKey) || (summary.countsByRowKey.get(rowKey) ?? 0) === 0) {
+        continue;
+      }
+      seen.add(rowKey);
+      entries.push({
+        branchIndex,
+        order: summary.firstOrderByRowKey.get(rowKey) ?? Number.MAX_SAFE_INTEGER,
+        row
+      });
+    }
+  });
+
+  return entries
+    .sort((left, right) => left.branchIndex - right.branchIndex || left.order - right.order)
+    .map((entry) => entry.row);
+}
+
+function dynamicSetIntersectionRows(
+  summaries: readonly DynamicSetBranchSummary[]
+): readonly Record<string, unknown>[] {
+  const [left, ...rest] = summaries;
+  if (left === undefined) {
+    return [];
+  }
+
+  const entries: Array<{
+    readonly order: number;
+    readonly row: Record<string, unknown>;
+  }> = [];
+  for (const [rowKey, row] of left.firstRowsByRowKey) {
+    if ((left.countsByRowKey.get(rowKey) ?? 0) === 0) {
+      continue;
+    }
+    if (!rest.every((summary) => (summary.countsByRowKey.get(rowKey) ?? 0) > 0)) {
+      continue;
+    }
+    entries.push({
+      order: left.firstOrderByRowKey.get(rowKey) ?? Number.MAX_SAFE_INTEGER,
+      row
+    });
+  }
+
+  return entries.sort((leftEntry, rightEntry) => leftEntry.order - rightEntry.order).map((entry) => entry.row);
+}
+
+function dynamicSetDifferenceRows(
+  summaries: readonly DynamicSetBranchSummary[]
+): readonly Record<string, unknown>[] {
+  const [left, ...right] = summaries;
+  if (left === undefined) {
+    return [];
+  }
+
+  const entries: Array<{
+    readonly order: number;
+    readonly row: Record<string, unknown>;
+  }> = [];
+  for (const [rowKey, row] of left.firstRowsByRowKey) {
+    if ((left.countsByRowKey.get(rowKey) ?? 0) === 0) {
+      continue;
+    }
+    if (right.some((summary) => (summary.countsByRowKey.get(rowKey) ?? 0) > 0)) {
+      continue;
+    }
+    entries.push({
+      order: left.firstOrderByRowKey.get(rowKey) ?? Number.MAX_SAFE_INTEGER,
+      row
+    });
+  }
+
+  return entries.sort((leftEntry, rightEntry) => leftEntry.order - rightEntry.order).map((entry) => entry.row);
+}
+
+function dynamicSetMaterializationState<Row>(
+  branchStates: readonly IncrementalSetBranchState[],
+  rows: readonly Row[]
+): IncrementalMaterializationState<Row> {
+  const rootKeys = rows.map((row) => stableKey(row));
+  const rootRowsByRootKey = new Map<string, unknown>();
+  const outputsByRootKey = new Map<string, readonly unknown[]>();
+
+  for (const [index, row] of rows.entries()) {
+    const key = rootKeys[index] as string;
+    rootRowsByRootKey.set(key, row);
+    outputsByRootKey.set(key, [row]);
+  }
+
+  return {
+    kind: 'incrementalMaterializationState',
+    rootRelation: '',
+    rootKeys,
+    rootIndexByKey: indexKeys(rootKeys),
+    rootRowsByRootKey,
+    outputsByRootKey,
+    joinStates: [],
+    dynamicSet: {
+      branches: branchStates
+    }
+  };
 }
 
 export function rowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {

@@ -658,6 +658,64 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
           stored.metadata.queryKey,
           maintained.reason
         ));
+      } else if (stored.incremental?.plan.kind === 'dynamicSet') {
+        if (options.deltas === undefined) {
+          incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
+            stored.metadata.id,
+            stored.metadata.queryKey,
+            'transaction deltas are required for incremental maintenance'
+          ));
+        } else {
+          const maintained = maintainIncrementalMaterialization(
+            stored.incremental,
+            undefined,
+            options.deltas,
+            envFor(next)
+          );
+          if (maintained.updated) {
+            const nextIncremental = {
+              plan: stored.incremental.plan,
+              state: maintained.state
+            };
+            const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
+            const change: MaterializationMaintenanceChange = {
+              kind: 'materializationMaintenanceChange',
+              update: 'incremental',
+              recomputed: false,
+              reason: maintained.rowChanges.length === 0
+                ? 'dependencies touched; incrementally maintained rows unchanged'
+                : maintained.reason,
+              id: stored.metadata.id,
+              queryKey: stored.metadata.queryKey,
+              query: stored.metadata.query,
+              maintenance: stored.metadata.maintenance,
+              dependencies: stored.metadata.dependencies,
+              touchedDependencies,
+              indexSpecs: stored.metadata.indexSpecs,
+              previousRowsAvailable: true,
+              previousRows: stored.rows,
+              rows: maintainedRows,
+              addedRows: maintained.addedRows,
+              removedRows: maintained.removedRows,
+              rowChanges: maintained.rowChanges,
+              diagnostics: maintained.diagnostics
+            };
+            changes.push(change);
+            storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
+              stored,
+              maintainedRows,
+              nextIncremental,
+              maintained.rowBatches
+            ));
+            continue;
+          }
+
+          incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
+            stored.metadata.id,
+            stored.metadata.queryKey,
+            maintained.reason
+          ));
+        }
       } else if (options.deltas === undefined) {
         incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
           stored.metadata.id,
@@ -1223,6 +1281,34 @@ function materializationEntryFor<Row>(
   if (cacheable && plan !== undefined) {
     if (plan.kind === 'staticRows') {
       const built = buildStaticIncrementalMaterialization<Row>(plan, envFor(target));
+      if (!built.supported) {
+        return materializationEntryWithRows(
+          metadataWithIncrementalFallback(metadata, built.reason),
+          evaluateTargetRows(target, metadata.query, evaluateOptions),
+          evaluateOptions,
+          cacheable
+        );
+      }
+
+      return materializationEntryWithRows(
+        metadata,
+        built.rows,
+        evaluateOptions,
+        cacheable,
+        { plan: built.plan, state: built.state }
+      );
+    }
+
+    if (plan.kind === 'dynamicSet') {
+      const source = sourceFor(target);
+      const relationSnapshots = incrementalRelationSnapshots(source, metadata.query.relations);
+      const built = buildIncrementalMaterialization<Row>(
+        plan,
+        undefined,
+        [],
+        envFor(target),
+        relationSnapshots
+      );
       if (!built.supported) {
         return materializationEntryWithRows(
           metadataWithIncrementalFallback(metadata, built.reason),
