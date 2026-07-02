@@ -19,6 +19,9 @@ import type { RelationRef } from './schema.js';
 import { isRelationSource, type RelationSource } from './source.js';
 import {
   attachConstraints,
+  attachedConstraintsFor,
+  constraintDataList,
+  detachConstraints,
   isConstraintAttachmentInput,
   type ConstraintAttachmentInput
 } from './constraints-attachment.js';
@@ -429,11 +432,15 @@ type MaterializationIndexFieldOptions<Field extends string = string> =
   | { readonly field: Field; readonly fields?: never }
   | { readonly field?: never; readonly fields: readonly [Field, ...Field[]] };
 
+type MaterializationIndexExpressionOptions =
+  | { readonly expression: ExprData; readonly expressions?: never }
+  | { readonly expression?: never; readonly expressions: readonly [ExprData, ...ExprData[]] };
+
 export type MaterializationIndexOptions<Field extends string = string> =
   | { readonly kind?: 'set' }
-  | ({ readonly kind: 'hash' } & MaterializationIndexFieldOptions<Field>)
-  | ({ readonly kind: 'btree' } & MaterializationIndexFieldOptions<Field>)
-  | ({ readonly kind: 'unique' } & MaterializationIndexFieldOptions<Field>);
+  | ({ readonly kind: 'hash' } & (MaterializationIndexFieldOptions<Field> | MaterializationIndexExpressionOptions))
+  | ({ readonly kind: 'btree' } & (MaterializationIndexFieldOptions<Field> | MaterializationIndexExpressionOptions))
+  | ({ readonly kind: 'unique' } & (MaterializationIndexFieldOptions<Field> | MaterializationIndexExpressionOptions));
 
 type StoredMaterialization<Row = unknown> = {
   readonly metadata: MaterializationMetadata<Row>;
@@ -897,27 +904,35 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
   };
 }
 
+type DematerializationTarget = string | Query | MaterializationMetadata | ConstraintAttachmentInput;
+
 export function demat<Db extends MaterializableDb>(db: Db): Db;
 export function demat<Db extends MaterializableDb>(
   db: Db,
-  ...targets: readonly [string | Query | MaterializationMetadata, ...(string | Query | MaterializationMetadata)[]]
+  ...targets: readonly [DematerializationTarget, ...DematerializationTarget[]]
 ): Db;
 export function demat<Db extends MaterializableDb>(
   db: Db,
-  ...targets: readonly (string | Query | MaterializationMetadata)[]
+  ...targets: readonly DematerializationTarget[]
 ): Db {
   if (targets.length === 0) {
     materializedDbs.delete(db);
     materializationStore.delete(db);
-    return db;
+    return detachConstraints(db);
   }
 
   const store = materializationStore.get(db);
-  if (store === undefined) {
-    return db;
-  }
 
   for (const target of targets) {
+    if (isConstraintAttachmentInput(target)) {
+      removeAttachedConstraints(db, target);
+      continue;
+    }
+
+    if (store === undefined) {
+      continue;
+    }
+
     const stored = resolveMaterialization(db, target);
     if (stored === undefined) {
       continue;
@@ -926,9 +941,31 @@ export function demat<Db extends MaterializableDb>(
     store.delete(stored.metadata.id);
     store.delete(stored.metadata.queryKey);
   }
-  if (store.size === 0) {
+  if (store !== undefined && store.size === 0) {
     materializedDbs.delete(db);
     materializationStore.delete(db);
+  }
+  return db;
+}
+
+function removeAttachedConstraints<Db extends object>(
+  db: Db,
+  input: ConstraintAttachmentInput
+): Db {
+  const current = attachedConstraintsFor(db);
+  if (current.length === 0) {
+    return db;
+  }
+
+  const removed = new Set(constraintDataList(input).map((constraint) => stableKey(constraint)));
+  const remaining = current.filter((constraint) => !removed.has(stableKey(constraint)));
+  if (remaining.length === current.length) {
+    return db;
+  }
+
+  detachConstraints(db);
+  if (remaining.length > 0) {
+    attachConstraints(db, remaining);
   }
   return db;
 }
@@ -1152,12 +1189,27 @@ export function index<Row = unknown, Value = unknown>(
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
+  options: { readonly kind: 'hash'; readonly expression: ExprData } | { readonly kind: 'hash'; readonly expressions: readonly [ExprData, ...ExprData[]] }
+): MaterializationHashIndexResult<Row, Value>;
+export function index<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: string | Query<Row> | MaterializationMetadata<Row>,
   options: { readonly kind: 'btree'; readonly field: string } | { readonly kind: 'btree'; readonly fields: readonly [string, ...string[]] }
 ): MaterializationBtreeIndexResult<Row, Value>;
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
+  options: { readonly kind: 'btree'; readonly expression: ExprData } | { readonly kind: 'btree'; readonly expressions: readonly [ExprData, ...ExprData[]] }
+): MaterializationBtreeIndexResult<Row, Value>;
+export function index<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: string | Query<Row> | MaterializationMetadata<Row>,
   options: { readonly kind: 'unique'; readonly field: string } | { readonly kind: 'unique'; readonly fields: readonly [string, ...string[]] }
+): MaterializationUniqueIndexResult<Row, Value>;
+export function index<Row = unknown, Value = unknown>(
+  input: unknown,
+  target: string | Query<Row> | MaterializationMetadata<Row>,
+  options: { readonly kind: 'unique'; readonly expression: ExprData } | { readonly kind: 'unique'; readonly expressions: readonly [ExprData, ...ExprData[]] }
 ): MaterializationUniqueIndexResult<Row, Value>;
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
@@ -1174,12 +1226,12 @@ export function index<Row = unknown, Value = unknown>(
     return missingIndexResult<Row, Value>(resolvedOptions.kind);
   }
 
-  const directExpression = directExpressionIndexExpression(resolvedOptions);
-  if (directExpression !== undefined) {
-    return unsupportedDirectExpressionIndexResult<Row, Value>(
+  const directExpressions = directExpressionIndexExpressions(resolvedOptions);
+  if (directExpressions !== undefined) {
+    return expressionIndexResult<Row, Value>(
       stored,
       resolvedOptions.kind as 'hash' | 'btree' | 'unique',
-      directExpression
+      directExpressions
     );
   }
 
@@ -1218,20 +1270,28 @@ function inferredIndexOptions(
 
   const inferred = stored.metadata.indexSpecs
     .filter((spec): spec is Exclude<MaterializationIndexSpec, { readonly kind: 'set' }> => spec.kind !== 'set')
-    .map((spec) => ({ spec, fields: indexSpecFields(spec) }))
-    .filter((entry): entry is {
-      readonly spec: Exclude<MaterializationIndexSpec, { readonly kind: 'set' }>;
-      readonly fields: readonly [string, ...string[]];
-    } => entry.fields !== undefined);
+    .map((spec) => ({
+      spec,
+      fields: indexSpecFields(spec),
+      expressions: indexSpecExpressions(spec)
+    }));
 
   if (inferred.length !== 1) {
     return {};
   }
 
-  const { spec, fields } = inferred[0] as {
+  const { spec, fields, expressions } = inferred[0] as {
     readonly spec: Exclude<MaterializationIndexSpec, { readonly kind: 'set' }>;
-    readonly fields: readonly [string, ...string[]];
+    readonly fields: readonly [string, ...string[]] | undefined;
+    readonly expressions: readonly [ExprData, ...ExprData[]];
   };
+  if (fields === undefined) {
+    return {
+      kind: spec.kind,
+      ...indexExpressionShape(expressions)
+    } as MaterializationIndexOptions;
+  }
+
   return {
     kind: spec.kind,
     ...indexFieldShape(fields)
@@ -1260,6 +1320,31 @@ function hashIndexResult<Row, Value>(
       }));
 }
 
+function expressionHashIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaterializationHashIndexResult<Row, Value> {
+  const maintained = maintainedExpressionIndexFor<Row>(stored, 'hash', expressions) as MaintainedHashIndexState<Row> | undefined;
+  if (maintained === undefined) {
+    return unsupportedDirectExpressionIndexResult<Row, Value>(stored, 'hash', expressions);
+  }
+
+  const lookup = maintained.lookup as ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  const facade = hashIndex<Row, Value>(lookup, maintained.fields);
+  const diagnostics = maintained.diagnostics;
+  return withMapLike(lookup, withTarget(stored, {
+    kind: 'materializationHashIndex',
+    indexed: diagnostics.length === 0,
+    maintained: true,
+    diagnostics,
+    ...indexFieldShape(maintained.fields),
+    fields: maintained.fields,
+    lookup,
+    raw: lookup,
+    index: facade
+  }));
+}
+
 function btreeIndexResult<Row, Value>(
   stored: StoredMaterialization<Row>,
   fields: readonly string[]
@@ -1281,6 +1366,37 @@ function btreeIndexResult<Row, Value>(
     diagnostics,
     ...indexFieldShape(fields),
     fields,
+    lookup,
+    raw: lookup,
+    ordered: facade.ordered,
+    range: facade.range,
+    index: facade
+  }));
+}
+
+function expressionBtreeIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaterializationBtreeIndexResult<Row, Value> {
+  const maintained = maintainedExpressionIndexFor<Row>(stored, 'btree', expressions) as MaintainedBtreeIndexState<Row> | undefined;
+  if (maintained === undefined) {
+    return unsupportedDirectExpressionIndexResult<Row, Value>(stored, 'btree', expressions);
+  }
+
+  const lookup = maintained.lookup as ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+  const facade = btreeIndex<Row, Value>(
+    lookup,
+    maintained.fields,
+    maintained.ordered as readonly Value[]
+  );
+  const diagnostics = maintained.diagnostics;
+  return withMapLike(lookup, withTarget(stored, {
+    kind: 'materializationBtreeIndex',
+    indexed: diagnostics.length === 0,
+    maintained: true,
+    diagnostics,
+    ...indexFieldShape(maintained.fields),
+    fields: maintained.fields,
     lookup,
     raw: lookup,
     ordered: facade.ordered,
@@ -2713,6 +2829,14 @@ function indexSpecExpressions(
   return spec.expressions ?? [spec.expression];
 }
 
+function indexExpressionShape(
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaterializationIndexExpressionOptions {
+  return expressions.length === 1
+    ? { expression: expressions[0] as ExprData }
+    : { expressions };
+}
+
 function expressionMaintainedIndexDefinition(
   kind: MaintainedIndexKind,
   expressions: readonly [ExprData, ...ExprData[]]
@@ -3028,6 +3152,20 @@ function maintainedIndexFor<Row>(
   return state?.kind === kind ? state : undefined;
 }
 
+function maintainedExpressionIndexFor<Row>(
+  stored: StoredMaterialization<Row>,
+  kind: MaintainedIndexKind,
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaintainedIndexState<Row> | undefined {
+  const definition = expressionMaintainedIndexDefinition(kind, expressions);
+  const state = stored.indexes.byKey.get(maintainedIndexKey(
+    kind,
+    definition.fields,
+    definition.parts?.map((part) => part.identity)
+  ));
+  return state?.kind === kind ? state : undefined;
+}
+
 function indexFieldShape(fields: readonly string[]): { readonly field?: string } {
   const field = fields[0];
   return fields.length === 1 && field !== undefined ? { field } : {};
@@ -3182,6 +3320,32 @@ function uniqueIndexResult<Row, Value>(
     diagnostics: resultDiagnostics,
     ...indexFieldShape(fields),
     fields,
+    lookup,
+    raw: lookup,
+    index: facade
+  }));
+}
+
+function expressionUniqueIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaterializationUniqueIndexResult<Row, Value> {
+  const maintained = maintainedExpressionIndexFor<Row>(stored, 'unique', expressions) as MaintainedUniqueIndexState<Row> | undefined;
+  if (maintained === undefined) {
+    return unsupportedDirectExpressionIndexResult<Row, Value>(stored, 'unique', expressions);
+  }
+
+  const lookup = maintained.lookup as ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>>;
+  const facade = uniqueIndex<Row, Value>(lookup, maintained.fields);
+  const diagnostics = maintained.diagnostics;
+
+  return withMapLike(lookup, withTarget(stored, {
+    kind: 'materializationUniqueIndex',
+    indexed: diagnostics.length === 0,
+    maintained: true,
+    diagnostics,
+    ...indexFieldShape(maintained.fields),
+    fields: maintained.fields,
     lookup,
     raw: lookup,
     index: facade
@@ -3403,30 +3567,77 @@ function missingIndexResult<Row, Value>(kind: MaterializationIndexOptions['kind'
   }
 }
 
-function directExpressionIndexExpression(options: MaterializationIndexOptions): ExprData | undefined {
-  const candidate = options as { readonly expression?: unknown };
-  return options.kind !== undefined &&
+function directExpressionIndexExpressions(options: MaterializationIndexOptions): readonly [ExprData, ...ExprData[]] | undefined {
+  const candidate = options as {
+    readonly expression?: unknown;
+    readonly expressions?: unknown;
+  };
+  if (options.kind === undefined ||
     options.kind !== 'set' &&
-    candidate.expression !== undefined &&
-    !('field' in options) &&
-    !('fields' in options)
-    ? candidate.expression as ExprData
+    ('field' in options || 'fields' in options)) {
+    return undefined;
+  }
+
+  if (candidate.expressions !== undefined) {
+    return Array.isArray(candidate.expressions) && candidate.expressions.length > 0
+      ? candidate.expressions as unknown as readonly [ExprData, ...ExprData[]]
+      : undefined;
+  }
+
+  return options.kind !== 'set' && candidate.expression !== undefined
+    ? [candidate.expression as ExprData]
     : undefined;
+}
+
+function expressionIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  kind: 'hash' | 'btree' | 'unique',
+  expressions: readonly [ExprData, ...ExprData[]]
+):
+  | MaterializationHashIndexResult<Row, Value>
+  | MaterializationBtreeIndexResult<Row, Value>
+  | MaterializationUniqueIndexResult<Row, Value> {
+  switch (kind) {
+    case 'hash':
+      return expressionHashIndexResult<Row, Value>(stored, expressions);
+    case 'btree':
+      return expressionBtreeIndexResult<Row, Value>(stored, expressions);
+    case 'unique':
+      return expressionUniqueIndexResult<Row, Value>(stored, expressions);
+  }
 }
 
 function unsupportedDirectExpressionIndexResult<Row, Value>(
   stored: StoredMaterialization<Row>,
+  kind: 'hash',
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaterializationHashIndexResult<Row, Value>;
+function unsupportedDirectExpressionIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  kind: 'btree',
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaterializationBtreeIndexResult<Row, Value>;
+function unsupportedDirectExpressionIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
+  kind: 'unique',
+  expressions: readonly [ExprData, ...ExprData[]]
+): MaterializationUniqueIndexResult<Row, Value>;
+function unsupportedDirectExpressionIndexResult<Row, Value>(
+  stored: StoredMaterialization<Row>,
   kind: 'hash' | 'btree' | 'unique',
-  expression: ExprData
+  expressions: readonly [ExprData, ...ExprData[]]
 ):
   | MaterializationHashIndexResult<Row, Value>
   | MaterializationBtreeIndexResult<Row, Value>
   | MaterializationUniqueIndexResult<Row, Value> {
   const diagnostics: readonly MaterializationDiagnostic[] = [{
     code: 'materialization_index_unsupported',
-    message: 'direct expression materialization index facade reads are not supported; project the expression into a field',
+    message: 'declared direct expression materialization index facade was not found',
     surface: 'materialization',
-    detail: { kind, expression }
+    detail: {
+      kind,
+      ...indexExpressionShape(expressions)
+    }
   }];
 
   switch (kind) {

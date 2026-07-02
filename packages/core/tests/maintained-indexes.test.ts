@@ -242,10 +242,6 @@ function isMutableRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
-function expressionHashOptions(expression: unknown): { readonly kind: 'hash'; readonly field: string } {
-  return { kind: 'hash', expression } as unknown as { readonly kind: 'hash'; readonly field: string };
-}
-
 describe('maintained materialized indexes', () => {
   it('keeps declared compound hash and unique indexes maintained after insert, update, and delete', () => {
     const user = as(coreSchema.users, 'user');
@@ -373,7 +369,7 @@ describe('maintained materialized indexes', () => {
     ]);
   });
 
-  it('reports unsupported diagnostics for ad hoc direct expression index facade reads', () => {
+  it('builds direct expression-backed hash, btree, and unique index facades', () => {
     const user = as(coreSchema.users, 'user');
     const normalizedTeam = call(normalizeTeam, user.teamId);
     const decade = call(ageDecade, user.age);
@@ -403,13 +399,90 @@ describe('maintained materialized indexes', () => {
       expect.objectContaining({ kind: 'unique', expression: slug })
     ]));
 
-    const unsupported = index<UserRow, string>(
+    const byNormalizedTeam = index<UserRow, string>(
       state,
       directExpressionIndexes,
-      expressionHashOptions(normalizedTeam)
+      { kind: 'hash', expression: normalizedTeam }
+    );
+    const byDecade = index<UserRow, number>(
+      state,
+      directExpressionIndexes,
+      { kind: 'btree', expression: decade }
+    );
+    const bySlug = index<UserRow, string>(
+      state,
+      directExpressionIndexes,
+      { kind: 'unique', expression: slug }
     );
 
-    expect(unsupported).toMatchObject({
+    expect(byNormalizedTeam).toMatchObject({
+      indexed: true,
+      maintained: true,
+      diagnostics: []
+    });
+    expect(ids(byNormalizedTeam.index?.get('ENG'))).toEqual(['ada']);
+    expect(ids(byNormalizedTeam.index?.get('DESIGN'))).toEqual(['bea']);
+    expect(ids(byDecade.index?.get(20))).toEqual(['bea']);
+    expect(ids(byDecade.range({ lower: 30 }))).toEqual(['ada', 'cal']);
+    expect(byDecade.ordered).toEqual([20, 30, 40]);
+    expect(bySlug.index?.get('eng:ada')).toMatchObject({ id: 'ada', teamId: 'eng' });
+  });
+
+  it('infers an unambiguous direct expression-backed index from index(db, query)', () => {
+    const user = as(coreSchema.users, 'user');
+    const normalizedTeam = call(normalizeTeam, user.teamId);
+    const usersByNormalizedTeam = pipe(
+      from(user),
+      hash(normalizedTeam),
+      project({
+        id: user.id,
+        teamId: user.teamId,
+        name: user.name,
+        active: user.active,
+        age: user.age,
+        tags: user.tags
+      }),
+      keyBy('id')
+    ) as Query<UserRow>;
+    const state = mat(createDb(testData()), usersByNormalizedTeam, {
+      id: 'users-by-normalized-team'
+    });
+    const inferred = index(state, usersByNormalizedTeam);
+
+    expect(inferred.kind).toBe('materializationHashIndex');
+    if (inferred.kind !== 'materializationHashIndex') {
+      throw new Error('expected hash index');
+    }
+    expect(inferred.maintained).toBe(true);
+    expect(ids(inferred.index?.get('ENG'))).toEqual(['ada']);
+    expect(ids(inferred.index?.get('MISSING'))).toEqual(['cal']);
+  });
+
+  it('preserves unsupported diagnostics for unmatched direct expression index facade reads', () => {
+    const user = as(coreSchema.users, 'user');
+    const declared = call(normalizeTeam, user.teamId);
+    const unmatched = call(ageDecade, user.age);
+    const usersByNormalizedTeam = pipe(
+      from(user),
+      hash(declared),
+      project({
+        id: user.id,
+        teamId: user.teamId,
+        name: user.name,
+        active: user.active,
+        age: user.age,
+        tags: user.tags
+      }),
+      keyBy('id')
+    ) as Query<UserRow>;
+    const state = mat(createDb(testData()), usersByNormalizedTeam, {
+      id: 'users-by-normalized-team'
+    });
+
+    expect(index<UserRow, number>(state, usersByNormalizedTeam, {
+      kind: 'hash',
+      expression: unmatched
+    })).toMatchObject({
       indexed: false,
       maintained: false,
       diagnostics: [
@@ -417,7 +490,7 @@ describe('maintained materialized indexes', () => {
           code: 'materialization_index_unsupported',
           detail: expect.objectContaining({
             kind: 'hash',
-            expression: normalizedTeam
+            expression: unmatched
           })
         })
       ]

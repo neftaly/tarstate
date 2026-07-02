@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   aggregate,
+  attachedConstraintsFor,
   as,
   avg,
   bottom,
@@ -27,6 +28,7 @@ import {
   getEnv,
   gt,
   hash,
+  hasAttachedConstraints,
   hostCall,
   insert,
   insertOrMerge,
@@ -543,6 +545,41 @@ describe('TypeScript Relic core acceptance', () => {
     expect(materializedRowsForQuery(dematerialized, activeUsers)).toBeUndefined();
     expect(materializedRowsForQuery(dematerialized, openTasks)).toBeUndefined();
     expect(materializationsFor(dematerialized)).toEqual([]);
+  });
+
+  it('accepts Relic-shaped demat constraint arguments', () => {
+    const uniqueName = unique(coreSchema.users, 'name');
+    const requiredName = req(coreSchema.users, 'name');
+    const state = mat(createDb(sourceData), constrain(uniqueName, requiredName));
+
+    expect(attachedConstraintsFor(state)).toEqual([uniqueName, requiredName]);
+    expect(hasAttachedConstraints(state)).toBe(true);
+    expect(() => transact(state, insert(coreSchema.users, {
+      id: 'dia',
+      teamId: 'eng',
+      name: 'Ada',
+      active: true,
+      age: 24,
+      tags: []
+    }))).toThrow();
+
+    const withoutUnique = demat(state, constrain(uniqueName));
+    const duplicateName = tryTransact(withoutUnique, insert(coreSchema.users, {
+      id: 'dia',
+      teamId: 'eng',
+      name: 'Ada',
+      active: true,
+      age: 24,
+      tags: []
+    }));
+
+    expect(attachedConstraintsFor(withoutUnique)).toEqual([requiredName]);
+    expect(duplicateName).toMatchObject({ committed: true, applied: 1 });
+
+    const clean = demat(withoutUnique, constrain(requiredName));
+
+    expect(attachedConstraintsFor(clean)).toEqual([]);
+    expect(hasAttachedConstraints(clean)).toBe(false);
   });
 
   it('skips recomputing materializations whose dependencies are untouched by transaction deltas', () => {
