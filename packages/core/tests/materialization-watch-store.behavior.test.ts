@@ -76,6 +76,17 @@ const cashEntryList = pipe(
   })
 );
 
+const sortedCashEntryProjection = pipe(
+  from(entry),
+  where(eq(entry.accountId, value('cash'))),
+  sort(asc(entry.amount), asc(entry.id)),
+  project({
+    id: entry.id,
+    accountId: entry.accountId,
+    amount: entry.amount
+  })
+);
+
 const cashEntryProjection = pipe(
   from(entry),
   where(eq(entry.accountId, value('cash'))),
@@ -150,6 +161,11 @@ const supportedIncrementalVariants: readonly IncrementalQueryVariant[] = [
       rename({ id: 'entryId' })
     ) as Query<unknown>,
     keyBy: pathKey('entryId')
+  },
+  {
+    label: 'filtered sort-before-project preserving sort keys',
+    query: sortedCashEntryProjection as Query<unknown>,
+    keyBy: pathKey('id')
   },
   {
     label: 'qualified rows',
@@ -345,6 +361,89 @@ describe('materialization, watch, and store behavior', () => {
     expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
   });
 
+  it('incrementally maintains sort-before-project when the projection preserves sort keys and identity', () => {
+    const db = mat(makeDb(), sortedCashEntryProjection);
+    const beforeRows = q(db, sortedCashEntryProjection);
+
+    expect(explainMaterialization(sortedCashEntryProjection)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    const result = tryTransact(
+      db,
+      updateByKey(schema.entries, 'e1', { amount: -10 }),
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true })
+    );
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations).toEqual(expect.objectContaining({
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: []
+    }));
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      reason: 'incremental delta maintenance',
+      previousRows: beforeRows,
+      rows: [
+        { id: 'e1', accountId: 'cash', amount: -10 },
+        { id: 'e4', accountId: 'cash', amount: 0 },
+        { id: 'e5', accountId: 'cash', amount: 35 }
+      ],
+      added: [{ id: 'e5', accountId: 'cash', amount: 35 }],
+      removed: [],
+      diagnostics: []
+    }));
+    expect(q(result.db, sortedCashEntryProjection)).toBe(result.materializations?.changes[0]?.rows);
+    expect(q(result.db, sortedCashEntryProjection)).toEqual(q(demat(result.db, sortedCashEntryProjection), sortedCashEntryProjection));
+  });
+
+  it('recomputes sort-before-project when the projection drops a sort key', () => {
+    const query = pipe(
+      from(entry),
+      where(eq(entry.accountId, value('cash'))),
+      sort(asc(entry.amount), asc(entry.id)),
+      project({ id: entry.id, accountId: entry.accountId })
+    );
+    const reason = 'sort-before-project requires final projection to preserve sort keys';
+    const db = mat(makeDb(), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: reason,
+          surface: 'materialization'
+        })
+      ]
+    }));
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'e1', { amount: -10 }));
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: reason,
+          surface: 'materialization'
+        })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
   it('falls back for non-total final sort ties when an earlier filtered source row enters', () => {
     const query = pipe(
       from(entry),
@@ -433,7 +532,11 @@ describe('materialization, watch, and store behavior', () => {
       },
       {
         label: 'non-final sort',
-        query: entryList as Query<unknown>,
+        query: pipe(
+          from(entry),
+          sort(asc(entry.id)),
+          where(eq(entry.accountId, value('cash')))
+        ) as Query<unknown>,
         reason: 'non-final sort queries are not incrementally maintained'
       },
       {

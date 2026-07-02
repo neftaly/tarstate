@@ -2203,6 +2203,20 @@ function incrementalMaterializationShape(
     case 'project':
       if (projectionHasAggregate(projectionFrom(data.projection))) return unsupportedIncrementalShape('aggregate projection is not incrementally maintained');
       if (containsIncrementalSubquery(data.projection)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
+      if (finalPosition) {
+        const input = queryDataFrom(data.input);
+        if (input?.op === 'sort') {
+          const order = arrayFromUnknown(input.order);
+          if (order.some(containsIncrementalSubquery)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
+          if (order.some(containsAggregateCall)) return unsupportedIncrementalShape('aggregate sort expressions are not incrementally maintained');
+          const finalSort = projectedFinalSortData(data, input, relations);
+          if (finalSort === undefined) {
+            return unsupportedIncrementalShape('sort-before-project requires final projection to preserve sort keys');
+          }
+          const nested = incrementalNestedShape(input, relations);
+          return nested.supported ? { ...nested, finalSort } : nested;
+        }
+      }
       return incrementalNestedShape(data, relations);
     case 'extend':
       if (containsIncrementalSubquery(data.projection)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
@@ -2262,6 +2276,15 @@ function materializationUnsupportedDiagnostic(message: string): TarstateDiagnost
     message,
     surface: 'materialization'
   };
+}
+
+function projectedFinalSortData(
+  projectData: QueryData,
+  sortData: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): QueryData | undefined {
+  const finalSort = { ...sortData, input: projectData } as QueryData;
+  return finalSortEvaluableFromFinalRow(finalSort, relations) ? finalSort : undefined;
 }
 
 function evaluateDeltaRows<Row>(
