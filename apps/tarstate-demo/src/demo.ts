@@ -32,7 +32,6 @@ import {
   pipe,
   project,
   qRows,
-  qualify,
   req,
   sort,
   sum,
@@ -141,8 +140,8 @@ export type PropertyInfoRow = {
   readonly agentName: string;
   readonly areaCode: string;
   readonly priceBand: PriceBand;
-  readonly roomCount: number;
-  readonly squareFeet: number;
+  readonly roomCount: number | undefined;
+  readonly squareFeet: number | undefined;
 };
 
 export type OfferSummaryRow = {
@@ -192,6 +191,18 @@ export type CommissionDueRow = {
   readonly sales: number;
   readonly saleVolume: number;
   readonly commissionDue: number;
+};
+
+export type PropertyRoomStatsRow = {
+  readonly propertyId: string;
+  readonly roomCount: number;
+  readonly squareFeet: number;
+};
+
+export type LatestOfferMarkRow = {
+  readonly propertyId: string;
+  readonly buyerId: string;
+  readonly offeredAt: string;
 };
 
 export type PlaygroundRow =
@@ -335,51 +346,6 @@ const offerRef = as(realEstateSchema.offers, 'offer');
 const decisionRef = as(realEstateSchema.decisions, 'decision');
 const rateRef = as(realEstateSchema.commissionRates, 'rate');
 
-const roomStats = {
-  propertyId: field<string>('roomStats', 'propertyId'),
-  roomCount: field<number>('roomStats', 'roomCount'),
-  squareFeet: field<number>('roomStats', 'squareFeet')
-};
-
-const latest = {
-  propertyId: field<string>('latest', 'propertyId'),
-  buyerId: field<string>('latest', 'buyerId'),
-  offeredAt: field<string>('latest', 'offeredAt')
-};
-
-const sale = {
-  id: field<string>('sale', 'id'),
-  offerId: field<string>('sale', 'offerId'),
-  propertyId: field<string>('sale', 'propertyId'),
-  propertyAddress: field<string>('sale', 'propertyAddress'),
-  price: field<number>('sale', 'price'),
-  buyerId: field<string>('sale', 'buyerId'),
-  buyerName: field<string>('sale', 'buyerName'),
-  agentId: field<string>('sale', 'agentId'),
-  agentName: field<string>('sale', 'agentName'),
-  areaCode: field<string>('sale', 'areaCode'),
-  priceBand: field<PriceBand>('sale', 'priceBand'),
-  registeredAt: field<string>('sale', 'registeredAt'),
-  decidedAt: field<string>('sale', 'decidedAt'),
-  saleSpeed: field<SaleSpeed>('sale', 'saleSpeed'),
-  amount: field<number>('sale', 'amount'),
-  listingState: field<'sold'>('sale', 'listingState')
-};
-
-const info = {
-  id: field<string>('info', 'id'),
-  address: field<string>('info', 'address'),
-  price: field<number>('info', 'price'),
-  registeredAt: field<string>('info', 'registeredAt'),
-  photo: field<string>('info', 'photo'),
-  agentId: field<string>('info', 'agentId'),
-  agentName: field<string>('info', 'agentName'),
-  areaCode: field<string>('info', 'areaCode'),
-  priceBand: field<PriceBand>('info', 'priceBand'),
-  roomCount: field<number>('info', 'roomCount'),
-  squareFeet: field<number>('info', 'squareFeet')
-};
-
 const row = {
   agentId: field<string>('row', 'agentId'),
   areaCode: field<string>('row', 'areaCode'),
@@ -474,7 +440,7 @@ export function seedRealEstateData(): RealEstateData {
   };
 }
 
-export const propertyRoomStatsQuery = pipe(
+export const propertyRoomStatsQuery: Query<PropertyRoomStatsRow> = pipe(
   from(roomRef),
   aggregate({
     groupBy: { propertyId: roomRef.propertyId },
@@ -482,11 +448,11 @@ export const propertyRoomStatsQuery = pipe(
       roomCount: count(),
       squareFeet: sum(roomRef.squareFeet)
     }
-  }),
-  qualify('roomStats')
-) as unknown as Query<{ readonly roomStats: { readonly propertyId: string; readonly roomCount: number; readonly squareFeet: number } }>;
+  })
+);
+const roomStats = as(propertyRoomStatsQuery, 'roomStats');
 
-export const propertyInfoQuery = pipe(
+export const propertyInfoQuery: Query<PropertyInfoRow> = pipe(
   from(propertyRef),
   hash(propertyRef.agentId, propertyRef.areaCode, propertyRef.priceBand),
   btree(propertyRef.price),
@@ -507,9 +473,10 @@ export const propertyInfoQuery = pipe(
     squareFeet: maybe(roomStats.squareFeet)
   }),
   keyBy('id')
-) as unknown as Query<PropertyInfoRow>;
+);
+const info = as(propertyInfoQuery, 'info');
 
-export const latestOfferMarksQuery = pipe(
+export const latestOfferMarksQuery: Query<LatestOfferMarkRow> = pipe(
   from(offerRef),
   aggregate({
     groupBy: {
@@ -519,11 +486,11 @@ export const latestOfferMarksQuery = pipe(
     aggregates: {
       offeredAt: max(offerRef.offeredAt)
     }
-  }),
-  qualify('latest')
-) as unknown as Query<{ readonly latest: { readonly propertyId: string; readonly buyerId: string; readonly offeredAt: string } }>;
+  })
+);
+const latest = as(latestOfferMarksQuery, 'latest');
 
-export const currentOffersQuery = pipe(
+export const currentOffersQuery: Query<OfferSummaryRow> = pipe(
   from(offerRef),
   join(latestOfferMarksQuery, and(
     eq(offerRef.propertyId, latest.propertyId),
@@ -552,9 +519,10 @@ export const currentOffersQuery = pipe(
     decisionStatus: maybe(decisionRef.accepted)
   }),
   keyBy('id')
-) as unknown as Query<OfferSummaryRow>;
+);
+const current = as(currentOffersQuery, 'current');
 
-export const acceptedSalesQuery = pipe(
+export const acceptedSalesQuery: Query<AcceptedSaleRow> = pipe(
   from(decisionRef),
   where(eq(decisionRef.accepted, true)),
   join(from(offerRef), eq(decisionRef.offerId, offerRef.id)),
@@ -581,12 +549,12 @@ export const acceptedSalesQuery = pipe(
     listingState: value('sold')
   }),
   keyBy('id')
-) as unknown as Query<AcceptedSaleRow>;
+);
+const sale = as(acceptedSalesQuery, 'sale');
 
-export const listingRowsQuery = pipe(
-  propertyInfoQuery,
-  qualify('info'),
-  leftJoin(pipe(acceptedSalesQuery, qualify('sale')), eq(info.id, sale.propertyId)),
+export const listingRowsQuery: Query<ListingRow> = pipe(
+  info,
+  leftJoin(sale, eq(info.id, sale.propertyId)),
   where(eq(sale.propertyId, value<string | undefined>(undefined))),
   project({
     id: info.id,
@@ -604,36 +572,34 @@ export const listingRowsQuery = pipe(
   }),
   keyBy('id'),
   sort(asc(field<number>('row', 'price')))
-) as unknown as Query<ListingRow>;
+);
 
 export const unsoldPropertiesQuery = listingRowsQuery;
 
-export const openOffersQuery = pipe(
-  currentOffersQuery,
-  qualify('current'),
-  where(eq(field('current', 'decisionId'), value(undefined))),
+export const openOffersQuery: Query<OfferSummaryRow> = pipe(
+  current,
+  where(eq(current.decisionId, value(undefined))),
   project({
-    id: field<string>('current', 'id'),
-    propertyId: field<string>('current', 'propertyId'),
-    propertyAddress: field<string>('current', 'propertyAddress'),
-    price: field<number>('current', 'price'),
-    buyerId: field<string>('current', 'buyerId'),
-    buyerName: field<string>('current', 'buyerName'),
-    agentId: field<string>('current', 'agentId'),
-    agentName: field<string>('current', 'agentName'),
-    areaCode: field<string>('current', 'areaCode'),
-    priceBand: field<PriceBand>('current', 'priceBand'),
-    offeredAt: field<string>('current', 'offeredAt'),
-    amount: field<number>('current', 'amount'),
-    decisionId: field<string | undefined>('current', 'decisionId'),
+    id: current.id,
+    propertyId: current.propertyId,
+    propertyAddress: current.propertyAddress,
+    price: current.price,
+    buyerId: current.buyerId,
+    buyerName: current.buyerName,
+    agentId: current.agentId,
+    agentName: current.agentName,
+    areaCode: current.areaCode,
+    priceBand: current.priceBand,
+    offeredAt: current.offeredAt,
+    amount: current.amount,
+    decisionId: current.decisionId,
     decisionStatus: value('open')
   }),
   keyBy('id')
-) as unknown as Query<OfferSummaryRow>;
+);
 
-export const commissionDueQuery = pipe(
-  acceptedSalesQuery,
-  qualify('sale'),
+export const commissionDueQuery: Query<CommissionDueRow> = pipe(
+  sale,
   join(from(rateRef), and(
     eq(sale.priceBand, rateRef.priceBand),
     eq(sale.areaCode, rateRef.areaCode),
@@ -653,9 +619,9 @@ export const commissionDueQuery = pipe(
   }),
   keyBy('id'),
   sort(asc(field<string>('row', 'agentName')))
-) as unknown as Query<CommissionDueRow>;
+);
 
-export const offerConstraintRowsQuery = pipe(
+export const offerConstraintRowsQuery: Query<OfferRow> = pipe(
   from(offerRef),
   project({
     id: offerRef.id,
@@ -665,9 +631,9 @@ export const offerConstraintRowsQuery = pipe(
     amount: offerRef.amount
   }),
   keyBy('id')
-) as unknown as Query<OfferRow>;
+);
 
-export const decisionConstraintRowsQuery = pipe(
+export const decisionConstraintRowsQuery: Query<DecisionRow> = pipe(
   from(decisionRef),
   project({
     id: decisionRef.id,
@@ -677,7 +643,7 @@ export const decisionConstraintRowsQuery = pipe(
     saleSpeed: decisionRef.saleSpeed
   }),
   keyBy('id')
-) as unknown as Query<DecisionRow>;
+);
 
 export const queryExamples: readonly {
   readonly id: QueryExampleId;
@@ -690,7 +656,7 @@ export const queryExamples: readonly {
   {
     id: 'propertyInfo',
     label: 'Property info',
-    query: propertyInfoQuery as unknown as Query<PlaygroundRow>,
+    query: propertyInfoQuery,
     columns: ['id', 'address', 'agentName', 'price', 'priceBand', 'areaCode', 'roomCount', 'squareFeet'],
     filters: ['agentId', 'areaCode', 'priceBand', 'minPrice', 'maxPrice'],
     snippet: `pipe(
@@ -703,7 +669,7 @@ export const queryExamples: readonly {
   {
     id: 'currentOffers',
     label: 'Current offers',
-    query: currentOffersQuery as unknown as Query<PlaygroundRow>,
+    query: currentOffersQuery,
     columns: ['id', 'propertyAddress', 'buyerName', 'agentName', 'amount', 'offeredAt', 'decisionStatus'],
     filters: ['agentId', 'areaCode', 'priceBand', 'buyerId', 'minPrice', 'maxPrice'],
     snippet: `const latest = aggregate({
@@ -716,7 +682,7 @@ offer |> join(latest, same property/buyer/date)`
   {
     id: 'acceptedSales',
     label: 'Accepted sales',
-    query: acceptedSalesQuery as unknown as Query<PlaygroundRow>,
+    query: acceptedSalesQuery,
     columns: ['id', 'propertyAddress', 'buyerName', 'agentName', 'amount', 'priceBand', 'saleSpeed', 'listingState'],
     filters: ['agentId', 'areaCode', 'priceBand', 'buyerId', 'listingState', 'minPrice', 'maxPrice'],
     snippet: `decision
@@ -729,7 +695,7 @@ offer |> join(latest, same property/buyer/date)`
   {
     id: 'listingRows',
     label: 'Unsold listings',
-    query: listingRowsQuery as unknown as Query<PlaygroundRow>,
+    query: listingRowsQuery,
     columns: ['id', 'address', 'agentName', 'price', 'priceBand', 'areaCode', 'roomCount', 'listingState'],
     filters: ['agentId', 'areaCode', 'priceBand', 'listingState', 'minPrice', 'maxPrice'],
     snippet: `propertyInfo
@@ -739,7 +705,7 @@ offer |> join(latest, same property/buyer/date)`
   {
     id: 'openOffers',
     label: 'Open offers',
-    query: openOffersQuery as unknown as Query<PlaygroundRow>,
+    query: openOffersQuery,
     columns: ['id', 'propertyAddress', 'buyerName', 'agentName', 'amount', 'offeredAt', 'decisionStatus'],
     filters: ['agentId', 'areaCode', 'priceBand', 'buyerId', 'minPrice', 'maxPrice'],
     snippet: `currentOffers
@@ -749,7 +715,7 @@ offer |> join(latest, same property/buyer/date)`
   {
     id: 'commissionDue',
     label: 'Commission due',
-    query: commissionDueQuery as unknown as Query<PlaygroundRow>,
+    query: commissionDueQuery,
     columns: ['agentName', 'sales', 'saleVolume', 'commissionDue'],
     filters: ['agentId'],
     snippet: `acceptedSales
@@ -833,25 +799,25 @@ export function buildPlaygroundQuery(
   let query = example.query;
 
   if (active.has('agentId') && hasFilterValue(filters.agentId)) {
-    query = pipe(query, where(eq(row.agentId, env('agentId')))) as Query<PlaygroundRow>;
+    query = pipe(query, where(eq(row.agentId, env('agentId'))));
   }
   if (active.has('areaCode') && hasFilterValue(filters.areaCode)) {
-    query = pipe(query, where(eq(row.areaCode, env('areaCode')))) as Query<PlaygroundRow>;
+    query = pipe(query, where(eq(row.areaCode, env('areaCode'))));
   }
   if (active.has('priceBand') && hasFilterValue(filters.priceBand)) {
-    query = pipe(query, where(eq(row.priceBand, env('priceBand')))) as Query<PlaygroundRow>;
+    query = pipe(query, where(eq(row.priceBand, env('priceBand'))));
   }
   if (active.has('buyerId') && hasFilterValue(filters.buyerId)) {
-    query = pipe(query, where(eq(row.buyerId, env('buyerId')))) as Query<PlaygroundRow>;
+    query = pipe(query, where(eq(row.buyerId, env('buyerId'))));
   }
   if (active.has('listingState') && hasFilterValue(filters.listingState)) {
-    query = pipe(query, where(eq(row.listingState, env('listingState')))) as Query<PlaygroundRow>;
+    query = pipe(query, where(eq(row.listingState, env('listingState'))));
   }
   if (active.has('minPrice') && typeof filters.minPrice === 'number') {
-    query = pipe(query, where(gte(row.price, env('minPrice')))) as Query<PlaygroundRow>;
+    query = pipe(query, where(gte(row.price, env('minPrice'))));
   }
   if (active.has('maxPrice') && typeof filters.maxPrice === 'number') {
-    query = pipe(query, where(lte(row.price, env('maxPrice')))) as Query<PlaygroundRow>;
+    query = pipe(query, where(lte(row.price, env('maxPrice'))));
   }
 
   return query;

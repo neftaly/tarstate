@@ -45,5 +45,7 @@ export type {
   QueryBatch,
   QueryBatchResult,
   QueryBatchRows,
+  QueryBatchTarget,
+  QueryBatchTargetRow,
   SetEnvTransaction
 } from './stub.js';

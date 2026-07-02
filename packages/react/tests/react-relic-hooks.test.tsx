@@ -11,6 +11,7 @@ import {
   useTarstateStore,
   useView,
   useWatch,
+  type HookStatus,
   type QueryHookState,
   type RowHookState,
   type TarstateCommit,
@@ -72,9 +73,11 @@ describe('@tarstate/react future hook facade contract', () => {
 
   it('keeps public state and options types assignable', () => {
     expectTypeOf<TarstateProviderProps>().toMatchTypeOf<{ readonly children?: unknown }>();
+    expectTypeOf<TarstateProviderProps>().toMatchTypeOf<{ readonly resetKey?: string | number }>();
     expectTypeOf<TarstateDbInput>().toMatchTypeOf<Parameters<typeof createStore>[0]>();
     expectTypeOf<TarstateDbSnapshot>().toMatchTypeOf<ReturnType<Store['getSnapshot']>>();
     expectTypeOf<TarstateCommit>().toEqualTypeOf<Store['commit']>();
+    expectTypeOf<HookStatus>().toEqualTypeOf<'loading' | 'ready' | 'error'>();
     expectTypeOf<UseViewOptions>().toMatchTypeOf<{ readonly deps?: readonly unknown[] }>();
     const queryOptions = {
       select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`)
@@ -156,6 +159,73 @@ describe('@tarstate/react future hook facade contract', () => {
     });
 
     probe.renderer.unmount();
+  });
+
+  it('treats provider db as an initial seed until resetKey changes', async () => {
+    const seenStores: Store[] = [];
+    const seenItems: (readonly unknown[] | undefined)[] = [];
+
+    function Probe() {
+      const store = useTarstateStore();
+      seenStores.push(store);
+      seenItems.push(useTarstateSnapshot().db.data.items);
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    await act(async () => {
+      renderer = create(createElement(
+        TarstateProvider,
+        { db: { items: [{ id: 'item-a', label: 'Alpha' }] } },
+        createElement(Probe)
+      ));
+    });
+    await act(async () => {
+      renderer?.update(createElement(
+        TarstateProvider,
+        { db: { items: [{ id: 'item-a', label: 'Beta' }] } },
+        createElement(Probe)
+      ));
+    });
+    await act(async () => {
+      renderer?.update(createElement(
+        TarstateProvider,
+        { db: { items: [{ id: 'item-a', label: 'Gamma' }] }, resetKey: 1 },
+        createElement(Probe)
+      ));
+    });
+
+    expect(seenStores[1]).toBe(seenStores[0]);
+    expect(seenItems[0]).toEqual([{ id: 'item-a', label: 'Alpha' }]);
+    expect(seenItems[1]).toEqual([{ id: 'item-a', label: 'Alpha' }]);
+    expect(seenStores[2]).not.toBe(seenStores[0]);
+    expect(seenItems[2]).toEqual([{ id: 'item-a', label: 'Gamma' }]);
+
+    renderer?.unmount();
+  });
+
+  it('dedupes useView view creation by queryKey for inline query construction', async () => {
+    const store = createStore({ items: [] });
+    const seenViews: ViewHookState<ItemProjection>[] = [];
+
+    function Probe() {
+      seenViews.push(useView(freshQueryIdentity(itemQuery)));
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    await act(async () => {
+      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+    await act(async () => {
+      renderer?.update(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+
+    expect(seenViews[1]?.queryKey).toBe(seenViews[0]?.queryKey);
+    expect(seenViews[1]?.view).toBe(seenViews[0]?.view);
+    expect(seenViews[1]?.snapshot.queryKey).toBe(seenViews[0]?.snapshot.queryKey);
+
+    renderer?.unmount();
   });
 
   it('selects rows from the current synchronous view snapshot', async () => {
@@ -299,4 +369,8 @@ function live<State extends object>(
 
 function assertDefined<Value>(value: Value): asserts value is NonNullable<Value> {
   expect(value).toBeDefined();
+}
+
+function freshQueryIdentity<Row>(query: Query<Row>): Query<Row> {
+  return Object.assign({}, query);
 }

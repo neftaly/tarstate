@@ -68,10 +68,12 @@ export {
 export type {
   AggregateConfig,
   AggregateFunction,
+  AliasedQuery,
   AliasedRelationRef,
   ComparisonOp,
   ExpandOptions,
   ExprData,
+  FieldExprProxy,
   ExprInput,
   HostExpressionFunction,
   NullSortOrder,

@@ -38,53 +38,79 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 type PrimitiveFieldKind = 'string' | 'number' | 'boolean' | 'id' | 'ref' | 'anchoredPath' | 'json';
 
-export type FieldSpec = {
+export type FieldSpec<Value = unknown> = {
   readonly kind: 'field';
   readonly valueKind: PrimitiveFieldKind;
   readonly optional: boolean;
   readonly nullable: boolean;
   readonly idDomain?: string;
   readonly ref?: string;
+  readonly __value?: Value;
 };
 
-export type RelationRef<Row extends Record<string, unknown> = Record<string, unknown>> = {
+type RelationFields = Record<string, FieldSpec>;
+type AnyRelationRef = {
+  readonly kind: 'relation';
+  readonly name: string;
+  readonly key: string | readonly string[];
+  readonly fields: RelationFields;
+  readonly ephemeral: boolean;
+  readonly __row?: unknown;
+};
+
+export type RelationRef<Row extends object = Record<string, unknown>> = {
   readonly kind: 'relation';
   readonly name: string;
   readonly key: keyof Row & string | readonly (keyof Row & string)[];
-  readonly fields: Record<keyof Row & string, FieldSpec>;
+  readonly fields: RelationFields;
   readonly ephemeral: boolean;
   readonly __row?: Row;
 };
 
-type RelationInput<Row extends Record<string, unknown>> = {
+type RelationRowFromFields<Fields extends RelationFields> = {
+  readonly [Field in keyof Fields & string]: Fields[Field] extends FieldSpec<infer Value> ? Value : unknown;
+};
+type NonNullish<Value> = Exclude<Value, null | undefined>;
+type RelationInputField<Value> =
+  NonNullish<Value> extends string ? FieldSpec<string | Extract<Value, null | undefined>>
+    : NonNullish<Value> extends number ? FieldSpec<number | Extract<Value, null | undefined>>
+      : NonNullish<Value> extends boolean ? FieldSpec<boolean | Extract<Value, null | undefined>>
+        : FieldSpec<Value>;
+type RelationInput<Row extends object> = {
   readonly key: keyof Row & string | readonly (keyof Row & string)[];
-  readonly fields: Record<keyof Row & string, FieldSpec>;
+  readonly fields: { readonly [Field in keyof Row & string]: RelationInputField<Row[Field]> };
   readonly ephemeral?: boolean;
 };
 
-export function relation<Row extends Record<string, unknown>>(input: RelationInput<Row>): RelationRef<Row> {
+export function relation<Row extends object>(input: RelationInput<Row>): RelationRef<Row>;
+export function relation<const Fields extends RelationFields>(input: {
+  readonly key: keyof Fields & string | readonly (keyof Fields & string)[];
+  readonly fields: Fields;
+  readonly ephemeral?: boolean;
+}): RelationRef<RelationRowFromFields<Fields>>;
+export function relation<Row extends object>(input: RelationInput<Row>): RelationRef<Row> {
   return { kind: 'relation', name: '', key: input.key, fields: input.fields, ephemeral: input.ephemeral ?? false };
 }
 
-export function defineSchema<const Schema extends Record<string, RelationRef>>(
+export function defineSchema<const Schema extends Record<string, AnyRelationRef>>(
   schema: Schema
 ): { readonly [Key in keyof Schema]: Schema[Key] & { readonly name: Key & string } } {
   return Object.fromEntries(Object.entries(schema).map(([name, ref]) => [name, { ...ref, name }])) as never;
 }
 
-function fieldSpec(valueKind: PrimitiveFieldKind): FieldSpec {
+function fieldSpec<Value>(valueKind: PrimitiveFieldKind): FieldSpec<Value> {
   return { kind: 'field', valueKind, optional: false, nullable: false };
 }
 
-export const stringField = (): FieldSpec => fieldSpec('string');
-export const numberField = (): FieldSpec => fieldSpec('number');
-export const booleanField = (): FieldSpec => fieldSpec('boolean');
-export const anchoredPathField = (): FieldSpec => fieldSpec('anchoredPath');
-export const jsonField = (): FieldSpec => fieldSpec('json');
-export const idField = (domain: string): FieldSpec => ({ ...fieldSpec('id'), idDomain: domain });
-export const refField = (target: string): FieldSpec => ({ ...fieldSpec('ref'), ref: target });
-export const nullable = (spec: FieldSpec): FieldSpec => ({ ...spec, nullable: true });
-export const optional = (spec: FieldSpec): FieldSpec => ({ ...spec, optional: true });
+export const stringField = (): FieldSpec<string> => fieldSpec('string');
+export const numberField = (): FieldSpec<number> => fieldSpec('number');
+export const booleanField = (): FieldSpec<boolean> => fieldSpec('boolean');
+export const anchoredPathField = (): FieldSpec<string> => fieldSpec('anchoredPath');
+export const jsonField = (): FieldSpec<JsonValue> => fieldSpec('json');
+export const idField = (domain: string): FieldSpec<string> => ({ ...fieldSpec<string>('id'), idDomain: domain });
+export const refField = (target: string): FieldSpec<string> => ({ ...fieldSpec<string>('ref'), ref: target });
+export const nullable = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | null> => ({ ...spec, nullable: true });
+export const optional = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | undefined> => ({ ...spec, optional: true });
 
 export function isJsonValue(input: unknown): input is JsonValue {
   if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') return true;
@@ -142,12 +168,15 @@ export type ExpandOptions<
 export type QueryData = Readonly<Record<string, unknown>> & { readonly op: string };
 export type Query<Row = unknown> = {
   readonly data: QueryData;
-  readonly relations: Record<string, RelationRef>;
+  readonly relations: Record<string, AnyRelationRef>;
   readonly __row?: Row;
 };
 export type QueryKeyInput = Query | QueryData;
-export type AliasedRelationRef<Row extends Record<string, unknown>, Alias extends string> =
-  RelationRef<Row> & { readonly alias: Alias } & { readonly [Field in keyof Row & string]: ExprData<Row[Field]> };
+export type FieldExprProxy<Row, Alias extends string> =
+  { readonly alias: Alias } & { readonly [Field in keyof Row & string]: ExprData<Row[Field]> };
+export type AliasedRelationRef<Row extends object, Alias extends string> =
+  RelationRef<Row> & FieldExprProxy<Row, Alias>;
+export type AliasedQuery<Row, Alias extends string> = Query<Row> & FieldExprProxy<Row, Alias>;
 
 type ExprValue<Input> = Input extends ExprData<infer Value> ? Value : Input;
 type ProjectedRow<Shape extends ProjectionData> = {
@@ -158,22 +187,37 @@ type ProjectedRow<Shape extends ProjectionData> = {
       : unknown;
 };
 
-type Transform<Input, Output> = (input: Input) => Output;
-type PipeTransforms<Input, Outputs extends readonly unknown[]> = {
-  readonly [Index in keyof Outputs]: Index extends keyof readonly [Input, ...Outputs]
-    ? Transform<(readonly [Input, ...Outputs])[Index], Outputs[Index]>
-    : never;
+type PreserveQueryTransform = (<Row>(query: Query<Row>) => Query<Row>) & { readonly __queryTransform?: 'preserve' };
+type ProjectQueryTransform<RowOut> = (<Row>(query: Query<Row>) => Query<RowOut>) & { readonly __queryProject?: RowOut };
+type ExtendQueryTransform<RowAdd> = (<Row>(query: Query<Row>) => Query<Row & RowAdd>) & { readonly __queryExtend?: RowAdd };
+type JoinQueryTransform<Right, Kind extends 'inner' | 'left'> = (<Left>(query: Query<Left>) => Query<Kind extends 'left' ? Left & Partial<Right> : Left & Right>) & {
+  readonly __queryJoin?: Kind;
+  readonly __queryRight?: Right;
 };
-type PipeResult<Input, Outputs extends readonly unknown[]> = Outputs extends readonly []
+type QualifyQueryTransform<Alias extends string> = (<Row>(query: Query<Row>) => Query<Record<Alias, Row>>) & { readonly __queryQualify?: Alias };
+type PipeStep<Input, Transform> =
+  Transform extends { readonly __queryTransform?: 'preserve' } ? Input
+    : Transform extends { readonly __queryProject?: infer RowOut } ? Query<RowOut>
+      : Transform extends { readonly __queryExtend?: infer RowAdd } ? Input extends Query<infer Row> ? Query<Row & RowAdd> : never
+        : Transform extends { readonly __queryJoin?: infer Kind; readonly __queryRight?: infer Right }
+          ? Input extends Query<infer Left>
+            ? Query<Kind extends 'left' ? Left & Partial<Right> : Left & Right>
+            : never
+          : Transform extends { readonly __queryQualify?: infer Alias }
+            ? Input extends Query<infer Row>
+              ? Alias extends string ? Query<Record<Alias, Row>> : never
+              : never
+            : Transform extends (input: Input) => infer Output ? Output : never;
+type PipeResult<Input, Transforms extends readonly unknown[]> = Transforms extends readonly []
   ? Input
-  : Outputs extends readonly [...unknown[], infer Last]
-    ? Last
-    : Input;
+  : Transforms extends readonly [infer First, ...infer Rest]
+    ? PipeResult<PipeStep<Input, First>, Rest>
+    : never;
 
-export function pipe<Input, const Outputs extends readonly unknown[]>(
+export function pipe<Input, const Transforms extends readonly unknown[]>(
   input: Input,
-  ...transforms: PipeTransforms<Input, Outputs>
-): PipeResult<Input, Outputs>;
+  ...transforms: Transforms
+): PipeResult<Input, Transforms>;
 export function pipe(input: unknown, ...transforms: readonly ((input: unknown) => unknown)[]): unknown {
   return transforms.reduce((current, transform) => transform(current), input);
 }
@@ -194,11 +238,13 @@ export function queryRowKeyFields(_input: QueryKeyInput): readonly string[] | un
 
 export const rowKeyFields = queryRowKeyFields;
 
-export function as<Row extends Record<string, unknown>, Alias extends string>(
-  relationRef: RelationRef<Row>,
+export function as<Row extends object, Alias extends string>(relationRef: RelationRef<Row>, alias: Alias): AliasedRelationRef<Row, Alias>;
+export function as<Row, Alias extends string>(query: Query<Row>, alias: Alias): AliasedQuery<Row, Alias>;
+export function as<Row, Alias extends string>(
+  input: RelationRef<Row & object> | Query<Row>,
   alias: Alias
-): AliasedRelationRef<Row, Alias> {
-  const target = { ...relationRef, alias };
+): AliasedRelationRef<Row & object, Alias> | AliasedQuery<Row, Alias> {
+  const target = { ...input, alias };
   return new Proxy(target, {
     get(valueTarget, property, receiver) {
       if (typeof property === 'string' && !(property in valueTarget)) {
@@ -206,7 +252,7 @@ export function as<Row extends Record<string, unknown>, Alias extends string>(
       }
       return Reflect.get(valueTarget, property, receiver);
     }
-  }) as AliasedRelationRef<Row, Alias>;
+  }) as AliasedRelationRef<Row & object, Alias> | AliasedQuery<Row, Alias>;
 }
 
 export function field<Value = unknown>(alias: string, name: string): ExprData<Value> {
@@ -266,69 +312,68 @@ export const not = (predicate: PredicateData): PredicateData => ({ op: 'not', pr
 export const any = (...predicates: readonly PredicateData[]): PredicateData => ({ op: 'any', predicates });
 export const notAny = (...predicates: readonly PredicateData[]): PredicateData => ({ op: 'notAny', predicates });
 
-export function from<Row extends Record<string, unknown>>(relationRef: RelationRef<Row> | AliasedRelationRef<Row, string>): Query<Row> {
+export function from<Row extends object>(relationRef: RelationRef<Row> | AliasedRelationRef<Row, string>): Query<Row> {
   const alias = 'alias' in relationRef ? relationRef.alias : relationRef.name;
   return { data: { op: 'from', relation: relationRef.name, alias }, relations: { [relationRef.name]: relationRef } };
 }
 
-export function lookup<Row extends Record<string, unknown>>(
+export function lookup<Row extends object, Field extends keyof Row & string>(
   relationRef: RelationRef<Row> | AliasedRelationRef<Row, string>,
-  fieldName: keyof Row & string,
-  lookupValue: unknown
+  fieldName: Field,
+  lookupValue: Row[Field]
 ): Query<Row> {
   const alias = 'alias' in relationRef ? relationRef.alias : relationRef.name;
   return { data: { op: 'lookup', relation: relationRef.name, alias, field: fieldName, value: lookupValue }, relations: { [relationRef.name]: relationRef } };
 }
 
-export function constRows<Row extends Record<string, unknown>>(rows: readonly Row[]): Query<Row> {
+export function constRows<Row extends object>(rows: readonly Row[]): Query<Row> {
   return { data: { op: 'constRows', rows }, relations: {} };
 }
 
-type QueryTransform<RowIn, RowOut> = (query: Query<RowIn>) => Query<RowOut>;
-export const where = (predicate: PredicateData) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'where', input: query.data, predicate } });
-export const hash = (...expressions: readonly ExprData[]) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'hash', input: query.data, expressions } });
-export const btree = (...expressions: readonly ExprData[]) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'btree', input: query.data, expressions } });
-export const uniqueIndex = (...expressions: readonly ExprData[]) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'hash', input: query.data, expressions, unique: true } });
-export const keyBy = (...fields: readonly string[]) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'keyBy', input: query.data, fields } });
-export const join = <Right>(right: Query<Right>, on: PredicateData) => <Left>(left: Query<Left>): Query<Left & Right> =>
-  ({ data: { op: 'join', kind: 'inner', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } }) as Query<Left & Right>;
-export const leftJoin = <Right>(right: Query<Right>, on: PredicateData) => <Left>(left: Query<Left>): Query<Left & Partial<Right>> =>
-  ({ data: { op: 'join', kind: 'left', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } }) as Query<Left & Partial<Right>>;
-export const project = <Shape extends ProjectionData>(projection: Shape): QueryTransform<unknown, ProjectedRow<Shape>> =>
-  (query) => ({ data: { op: 'project', input: query.data, projection }, relations: query.relations }) as Query<ProjectedRow<Shape>>;
-export const extend = <Shape extends ProjectionData>(projection: Shape) => <Row>(query: Query<Row>): Query<Row & ProjectedRow<Shape>> =>
-  ({ data: { op: 'extend', input: query.data, projection }, relations: query.relations }) as Query<Row & ProjectedRow<Shape>>;
+export const where = (predicate: PredicateData): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'where', input: query.data, predicate } })) as PreserveQueryTransform;
+export const hash = (...expressions: readonly ExprData[]): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'hash', input: query.data, expressions } })) as PreserveQueryTransform;
+export const btree = (...expressions: readonly ExprData[]): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'btree', input: query.data, expressions } })) as PreserveQueryTransform;
+export const uniqueIndex = (...expressions: readonly ExprData[]): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'hash', input: query.data, expressions, unique: true } })) as PreserveQueryTransform;
+export const keyBy = (...fields: readonly string[]): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'keyBy', input: query.data, fields } })) as PreserveQueryTransform;
+export const join = <Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'inner'> => ((left) =>
+  ({ data: { op: 'join', kind: 'inner', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'inner'>;
+export const leftJoin = <Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'left'> => ((left) =>
+  ({ data: { op: 'join', kind: 'left', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'left'>;
+export const project = <Shape extends ProjectionData>(projection: Shape): ProjectQueryTransform<ProjectedRow<Shape>> => ((query) =>
+  ({ data: { op: 'project', input: query.data, projection }, relations: query.relations })) as ProjectQueryTransform<ProjectedRow<Shape>>;
+export const extend = <Shape extends ProjectionData>(projection: Shape): ExtendQueryTransform<ProjectedRow<Shape>> => ((query) =>
+  ({ data: { op: 'extend', input: query.data, projection }, relations: query.relations })) as ExtendQueryTransform<ProjectedRow<Shape>>;
 export const expand = <Collection, Alias extends string | undefined = undefined, Fields extends readonly string[] | undefined = undefined>(
   collection: ExprData<Collection>,
   options: ExpandOptions<Alias, Fields> = {}
-) => <Row>(query: Query<Row>): Query<Row> => ({ ...query, data: { op: 'expand', input: query.data, collection, ...options } });
-export const without = (...fields: readonly string[]) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'without', input: query.data, fields } });
-export const sort = (...order: readonly SortInput[]) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'sort', input: query.data, order } });
-export const limit = (count: number, offset?: number) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'limit', input: query.data, count, offset } });
-export const sortLimit = (count: number, ...order: readonly SortInput[]) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'sortLimit', input: query.data, order, count } });
+) => ((query) => ({ ...query, data: { op: 'expand', input: query.data, collection, ...options } })) as PreserveQueryTransform;
+export const without = (...fields: readonly string[]): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'without', input: query.data, fields } })) as PreserveQueryTransform;
+export const sort = (...order: readonly SortInput[]): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'sort', input: query.data, order } })) as PreserveQueryTransform;
+export const limit = (count: number, offset?: number): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'limit', input: query.data, count, offset } })) as PreserveQueryTransform;
+export const sortLimit = (count: number, ...order: readonly SortInput[]): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'sortLimit', input: query.data, order, count } })) as PreserveQueryTransform;
 export const union = <Row>(...inputs: readonly Query<Row>[]): Query<Row> =>
   ({ data: { op: 'union', inputs: inputs.map((item) => item.data) }, relations: mergeRelations(inputs) });
 export const intersection = <Row>(...inputs: readonly Query<Row>[]): Query<Row> =>
   ({ data: { op: 'intersection', inputs: inputs.map((item) => item.data) }, relations: mergeRelations(inputs) });
 export const difference = <Row>(left: Query<Row>, right: Query<Row>): Query<Row> =>
   ({ data: { op: 'difference', left: left.data, right: right.data }, relations: { ...left.relations, ...right.relations } });
-export const rename = (fields: Record<string, string>) => <Row>(query: Query<Row>): Query<Row> =>
-  ({ ...query, data: { op: 'rename', input: query.data, fields } });
-export const qualify = <Alias extends string>(alias: Alias) => <Row>(query: Query<Row>): Query<Record<Alias, Row>> =>
-  ({ data: { op: 'qualify', input: query.data, alias }, relations: query.relations }) as Query<Record<Alias, Row>>;
+export const rename = (fields: Record<string, string>): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'rename', input: query.data, fields } })) as PreserveQueryTransform;
+export const qualify = <Alias extends string>(alias: Alias): QualifyQueryTransform<Alias> => ((query) =>
+  ({ data: { op: 'qualify', input: query.data, alias }, relations: query.relations })) as QualifyQueryTransform<Alias>;
 export const aggregate = <GroupBy extends ProjectionData, Aggregates extends ProjectionData>(
   config: AggregateConfig<GroupBy, Aggregates>
-): QueryTransform<unknown, ProjectedRow<GroupBy> & ProjectedRow<Aggregates>> =>
-  (query) => ({ data: { op: 'aggregate', input: query.data, ...config }, relations: query.relations }) as Query<ProjectedRow<GroupBy> & ProjectedRow<Aggregates>>;
+): ProjectQueryTransform<ProjectedRow<GroupBy> & ProjectedRow<Aggregates>> =>
+  ((query) => ({ data: { op: 'aggregate', input: query.data, ...config }, relations: query.relations })) as ProjectQueryTransform<ProjectedRow<GroupBy> & ProjectedRow<Aggregates>>;
 
 export const asc = (input: SortInput, nulls?: NullSortOrder): SortData => ({ expr: expr(input), direction: 'asc', ...(nulls === undefined ? {} : { nulls }) });
 export const desc = (input: SortInput, nulls?: NullSortOrder): SortData => ({ expr: expr(input), direction: 'desc', ...(nulls === undefined ? {} : { nulls }) });
@@ -548,10 +593,18 @@ export type DbTransactionPlan = {
 };
 export type DbTransactionBuilder = RelationWriterMap;
 export type DbTransactionContext = Db & DbTransactionBuilder;
-export type QueryBatch = Record<string, Query<unknown> | RelationRef | { readonly q: Query<unknown> | RelationRef }>;
-export type QueryBatchResult<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: QueryResult<unknown> };
+export type QueryBatchTarget = Query<unknown> | RelationRef | { readonly q: Query<unknown> | RelationRef };
+export type QueryBatch = Record<string, QueryBatchTarget>;
+export type QueryBatchTargetRow<Target> = Target extends { readonly q: infer QueryValue }
+  ? QueryBatchTargetRow<QueryValue>
+  : Target extends Query<infer Row>
+    ? Row
+    : Target extends RelationRef<infer Row>
+      ? Row
+      : unknown;
+export type QueryBatchResult<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: QueryResult<QueryBatchTargetRow<Queries[Key]>> };
 export type MappedQueryBatchResult<Queries extends QueryBatch, MappedRow> = { readonly [Key in keyof Queries]: QueryResult<MappedRow> };
-export type QueryBatchRows<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: readonly unknown[] };
+export type QueryBatchRows<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: readonly QueryBatchTargetRow<Queries[Key]>[] };
 export type MappedQueryBatchRows<Queries extends QueryBatch, MappedRow> = { readonly [Key in keyof Queries]: readonly MappedRow[] };
 export type DbQueryIntoResult<Row, Rows> = Omit<QueryResult<Row>, 'rows'> & { readonly rows: Rows };
 export type DbQuerySort<Row = unknown> = DbQuerySortKey<Row> | readonly DbQuerySortKey<Row>[];
@@ -602,7 +655,9 @@ export function row<Row>(_db: Db, _query: Query<Row> | RelationRef, ..._args: re
 export function exists<Row>(_db: Db, _query: Query<Row> | RelationRef, ..._args: readonly unknown[]): boolean {
   throw notImplemented('exists');
 }
-export function whatIf<Row>(_db: Db, _query: Query<Row> | RelationRef | QueryBatch, ..._inputs: readonly unknown[]): QueryResult<Row> | QueryBatchResult<QueryBatch> {
+export function whatIf<Queries extends QueryBatch>(_db: Db, _query: Queries, ..._inputs: readonly unknown[]): QueryBatchResult<Queries>;
+export function whatIf<Row>(_db: Db, _query: Query<Row> | RelationRef, ..._inputs: readonly unknown[]): QueryResult<Row>;
+export function whatIf(_db: Db, _query: Query<unknown> | RelationRef | QueryBatch, ..._inputs: readonly unknown[]): QueryResult<unknown> | QueryBatchResult<QueryBatch> {
   throw notImplemented('whatIf');
 }
 export function transact(inputDb: Db, ...inputs: DbTransactionInputs): Db {
@@ -914,7 +969,7 @@ export type StoreSnapshot<Version = unknown> = {
   readonly version?: Version;
 };
 export type StoreQueryResult<Row = unknown> = QueryResult<Row> & { readonly revision: number };
-export type StoreQueryBatchResult<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: StoreQueryResult<unknown> };
+export type StoreQueryBatchResult<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: StoreQueryResult<QueryBatchTargetRow<Queries[Key]>> };
 export type StoreMappedQueryBatchResult<Queries extends QueryBatch, MappedRow> = { readonly [Key in keyof Queries]: StoreQueryResult<MappedRow> };
 export type StoreCommitStatus = RelationApplyStatus;
 export type StoreCommitEffects<Version = unknown> = {
@@ -949,7 +1004,10 @@ export type StoreViewSnapshot<Row = unknown, Version = unknown> = {
 };
 export type StoreQuery = <Row>(query: Query<Row> | RelationRef, options?: StoreQueryOptions<Row>) => StoreQueryResult<Row>;
 export type StoreQueries = <Queries extends QueryBatch>(queries: Queries, options?: StoreQueryOptions) => StoreQueryBatchResult<Queries>;
-export type StoreWhatIf = <Row>(query: Query<Row> | RelationRef | QueryBatch, ...inputs: readonly unknown[]) => StoreQueryResult<Row> | StoreQueryBatchResult<QueryBatch>;
+export type StoreWhatIf = {
+  <Queries extends QueryBatch>(query: Queries, ...inputs: readonly unknown[]): StoreQueryBatchResult<Queries>;
+  <Row>(query: Query<Row> | RelationRef, ...inputs: readonly unknown[]): StoreQueryResult<Row>;
+};
 export type StoreViewRead<Row = unknown, Version = unknown> = () => StoreViewSnapshot<Row, Version>;
 export type StoreView<Row = unknown, Version = unknown> = {
   readonly kind: 'view';

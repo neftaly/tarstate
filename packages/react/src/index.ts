@@ -9,10 +9,9 @@ import {
   type ReactNode
 } from 'react';
 import type { Db, DbInputData } from '@tarstate/core/db';
-import type { RowChange } from '@tarstate/core/diff';
 import type { EvaluateOptions } from '@tarstate/core/evaluate';
+import { queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
-import type { RelationRef } from '@tarstate/core/schema';
 import {
   createStore,
   type Store,
@@ -23,6 +22,13 @@ import {
   type StoreView,
   type StoreViewSnapshot
 } from '@tarstate/core/store';
+import type {
+  WatchDiagnostic,
+  WatchEvent as CoreWatchEvent,
+  WatchListener as CoreWatchListener,
+  WatchOptions as CoreWatchOptions,
+  WatchTarget as CoreWatchTarget
+} from '@tarstate/core/watch';
 
 export type TarstateReactDiagnostic =
   | StoreDiagnostic
@@ -40,6 +46,7 @@ export type TarstateCommit = Store['commit'];
 export type TarstateProviderProps = {
   readonly store?: Store;
   readonly db?: TarstateDbInput;
+  readonly resetKey?: string | number;
   readonly children?: ReactNode;
 };
 
@@ -56,8 +63,10 @@ type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
   readonly select: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
 
+export type HookStatus = 'loading' | 'ready' | 'error';
+
 export type ViewHookState<Row> = {
-  readonly status: 'ready' | 'error';
+  readonly status: HookStatus;
   readonly rows: readonly Row[];
   readonly diagnostics: readonly TarstateReactDiagnostic[];
   readonly queryKey: string;
@@ -69,7 +78,7 @@ export type ViewHookState<Row> = {
 };
 
 export type QueryHookState<Row, Selected = readonly Row[]> = {
-  readonly status: 'ready' | 'error';
+  readonly status: HookStatus;
   readonly rows: readonly Row[];
   readonly data: Selected | undefined;
   readonly diagnostics: readonly TarstateReactDiagnostic[];
@@ -88,46 +97,26 @@ export type UseRowKeyOptions<Row, Key> = UseViewOptions & {
   readonly keyBy: (row: Row) => Key;
 };
 
-export type WatchTarget<Row = unknown> = Query<Row> | RelationRef;
-
-export type WatchEvent<Row = unknown> = {
-  readonly kind: 'watchEvent';
-  readonly id: string;
-  readonly target: WatchTarget<Row>;
-  readonly changed: boolean;
-  readonly previousRows: readonly Row[];
-  readonly rows: readonly Row[];
-  readonly added: readonly Row[];
-  readonly removed: readonly Row[];
-  readonly unchanged: readonly Row[];
-  readonly rowChanges: readonly RowChange<Row>[];
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-};
+export type WatchTarget<Row = unknown> = CoreWatchTarget<Row>;
+export type WatchEvent<Row = unknown> = CoreWatchEvent<Row>;
+export type WatchListener<Row = unknown> = CoreWatchListener<Row>;
+export type WatchOptions<Row = unknown> = CoreWatchOptions<Row>;
 
 export type WatchHookState<Row> = {
   readonly event: WatchEvent<Row> | undefined;
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-};
-
-export type WatchListener<Row = unknown> = (event: WatchEvent<Row>) => void | Promise<void>;
-
-export type WatchOptions<Row = unknown> = EvaluateOptions & {
-  readonly label?: string;
-  readonly immediate?: boolean;
-  readonly keyBy?: readonly string[] | ((row: Row) => unknown);
+  readonly diagnostics: readonly WatchDiagnostic[];
 };
 
 const TarstateContext = createContext<Store | undefined>(undefined);
-const emptyDiagnostics: readonly TarstateReactDiagnostic[] = Object.freeze([]);
+const emptyWatchDiagnostics: readonly WatchDiagnostic[] = Object.freeze([]);
 const emptyDeps: readonly unknown[] = Object.freeze([]);
 
-export function TarstateProvider({ children, db, store }: TarstateProviderProps) {
-  const dbRevision = useDependencyVersion(db === undefined ? emptyDeps : [db]);
-  const ownedStore = useRef<{ readonly dbRevision: number; readonly store: Store } | undefined>(undefined);
+export function TarstateProvider({ children, db, resetKey, store }: TarstateProviderProps) {
+  const ownedStore = useRef<{ readonly resetKey: string | number | undefined; readonly store: Store } | undefined>(undefined);
 
   if (store === undefined) {
-    if (ownedStore.current === undefined || ownedStore.current.dbRevision !== dbRevision) {
-      ownedStore.current = { dbRevision, store: createStore(db) };
+    if (ownedStore.current === undefined || !Object.is(ownedStore.current.resetKey, resetKey)) {
+      ownedStore.current = { resetKey, store: createStore(db) };
     }
   } else {
     ownedStore.current = undefined;
@@ -174,7 +163,8 @@ export function useView<Row>(
 ): ViewHookState<Row> {
   const store = useTarstateStore();
   const depsVersion = useDependencyVersion(options.deps ?? emptyDeps);
-  const view = useMemo(() => store.view(query), [store, query, depsVersion]);
+  const key = queryKey(query);
+  const view = useMemo(() => store.view(query), [store, key, depsVersion]);
   const snapshot = view.getSnapshot();
   const refresh = useCallback(() => {
     void view.refresh();
@@ -266,7 +256,7 @@ export function useWatch<Row>(
 ): WatchHookState<Row> {
   return {
     event: undefined,
-    diagnostics: emptyDiagnostics
+    diagnostics: emptyWatchDiagnostics
   };
 }
 

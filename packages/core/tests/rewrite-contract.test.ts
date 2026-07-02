@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
+  aggregate,
   as,
   attachConstraints,
   check,
@@ -14,7 +15,9 @@ import {
   from,
   gt,
   insert,
+  leftJoin,
   mat,
+  maybe,
   numberField,
   pipe,
   project,
@@ -24,6 +27,7 @@ import {
   req,
   row,
   stringField,
+  sum,
   transact,
   tryTransactConstrained,
   unique,
@@ -36,7 +40,7 @@ import {
 type Account = {
   readonly id: string;
   readonly name: string;
-  readonly kind: 'asset' | 'liability' | 'income' | 'expense';
+  readonly kind: string;
 };
 
 type Entry = {
@@ -110,6 +114,65 @@ describe('rewrite public contracts', () => {
       summary: [{ entryCount: 2 }]
     });
     expect(row(openingDb, positiveEntries, 'e1')).toEqual({ id: 'e1' });
+  });
+
+  it('keeps derived query field access typed without casts', () => {
+    const entry = as(schema.entries, 'entry');
+    const account = as(schema.accounts, 'account');
+    const summaryRows = pipe(
+      from(entry),
+      aggregate({
+        groupBy: { accountId: entry.accountId },
+        aggregates: {
+          entryCount: count(),
+          total: sum(entry.amount)
+        }
+      }),
+      project({
+        accountId: field<string>('row', 'accountId'),
+        entryCount: field<number>('row', 'entryCount'),
+        total: field<number>('row', 'total')
+      })
+    );
+    const summary = as(summaryRows, 'summary');
+    const accountSummaryRows = pipe(
+      from(account),
+      leftJoin(summaryRows, eq(account.id, summary.accountId)),
+      project({
+        id: account.id,
+        name: field<string>('account', 'name'),
+        entryCount: maybe(summary.entryCount),
+        total: maybe(summary.total)
+      })
+    );
+
+    const readAccountSummaryRows = () => qRows(openingDb, accountSummaryRows);
+    expectTypeOf<ReturnType<typeof readAccountSummaryRows>>().toEqualTypeOf<readonly {
+      readonly id: string;
+      readonly name: string;
+      readonly entryCount: number | undefined;
+      readonly total: number | undefined;
+    }[]>();
+    expect(() => qRows(openingDb, accountSummaryRows)).toThrow('q is not implemented in rewrite stub');
+  });
+
+  it('preserves row types for zero-cast batch query rows', () => {
+    const entry = as(schema.entries, 'entry');
+    const positiveEntries = pipe(
+      from(entry),
+      where(gt(entry.amount, value(0))),
+      project({ id: entry.id, amount: entry.amount })
+    );
+    const summary = pipe(
+      from(entry),
+      project({ entryCount: count() })
+    );
+    const readBatchRows = () => qManyRows(openingDb, { positiveEntries, summary });
+    expectTypeOf<ReturnType<typeof readBatchRows>>().toEqualTypeOf<{
+      readonly positiveEntries: readonly { readonly id: string; readonly amount: number }[];
+      readonly summary: readonly { readonly entryCount: number }[];
+    }>();
+    expect(() => qManyRows(openingDb, { positiveEntries, summary })).toThrow('qMany is not implemented in rewrite stub');
   });
 
   it('keeps writes functional and returns a new Db value', () => {
