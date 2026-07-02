@@ -56,6 +56,7 @@ import {
   trackTransact,
   transact,
   topBy,
+  union,
   uniqueIndex,
   updateWhere,
   value,
@@ -142,6 +143,21 @@ type TaskProjectRollupRow = {
   readonly tasks: number;
   readonly points: number;
   readonly averagePoints: number;
+};
+
+type TaskOwnerRollupRow = {
+  readonly ownerId: string;
+  readonly tasks: number;
+  readonly points: number;
+};
+
+type TaskOwnerInfoRollupRow = TaskOwnerRollupRow & {
+  readonly owner: string;
+  readonly team: string;
+};
+
+type TaskOwnerMaybeInfoRollupRow = TaskOwnerRollupRow & {
+  readonly owner: string | undefined;
 };
 
 type TaskProjectStatsRow = TaskProjectRollupRow & {
@@ -1669,56 +1685,393 @@ describe('incremental materialization', () => {
       expect(materializedRowsForQuery(next, teamTags)).toEqual(change.rows);
     });
 
-    it('keeps join and set operations after aggregate on snapshot fallback', () => {
+    it('incrementally maintains aggregate output followed by join with nested right branch updates', () => {
       const task = as(coreSchema.tasks, 'task');
       const user = as(coreSchema.users, 'user');
-      const projectId = field<string>('taskRollup', 'projectId');
-      const aggregateBase = pipe(
+      const team = as(coreSchema.teams, 'team');
+      const ownerId = field<string>('ownerRollup', 'ownerId');
+      const tasks = field<number>('ownerRollup', 'tasks');
+      const points = field<number>('ownerRollup', 'points');
+      const ownerInfoUserId = field<string>('ownerInfo', 'userId');
+      const ownerInfoOwner = field<string>('ownerInfo', 'owner');
+      const ownerInfoTeam = field<string>('ownerInfo', 'team');
+      const ownerInfo = pipe(
+        from(user),
+        join(from(team), eq(user.teamId, team.id)),
+        project({ userId: user.id, owner: user.name, team: team.name })
+      );
+      const ownerRollups = pipe(
         from(task),
         aggregate({
-          groupBy: { projectId: task.ownerId },
+          groupBy: { ownerId: task.ownerId },
           aggregates: {
             tasks: count(),
-            points: sum(task.points),
-            averagePoints: avg(task.points)
+            points: sum(task.points)
+          }
+        }),
+        join(ownerInfo, eq(ownerId, ownerInfoUserId)),
+        project({ ownerId, tasks, points, owner: ownerInfoOwner, team: ownerInfoTeam }),
+        keyBy('ownerId')
+      ) as Query<TaskOwnerInfoRollupRow>;
+      const state = mat(createDb(sourceData), ownerRollups, {
+        id: 'aggregate-then-owner-info',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, ownerRollups);
+      const renamedAda = { ...adaUser, name: 'Ada Lovelace' };
+      const withRenamedAda = createDb({
+        ...sourceData,
+        users: [renamedAda, beaUser, calUser]
+      });
+
+      expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+      expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users', 'teams']));
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, ownerRollups)).toEqual([
+        { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada', team: 'Engineering' },
+        { ownerId: 'bea', tasks: 1, points: 3, owner: 'Bea', team: 'Design' }
+      ]);
+
+      const renamedOwner = maintainMaterializations(state, withRenamedAda, {
+        deltas: [usersDelta([renamedAda], [adaUser])]
+      });
+      const renamedOwnerChange = singleMaterializationChange(renamedOwner, 'aggregate-then-owner-info');
+
+      expect(renamedOwner).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(renamedOwnerChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['users'],
+        rows: [
+          { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada Lovelace', team: 'Engineering' },
+          { ownerId: 'bea', tasks: 1, points: 3, owner: 'Bea', team: 'Design' }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...renamedOwner.diagnostics, ...renamedOwnerChange.diagnostics]);
+      expect(renamedOwnerChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada', team: 'Engineering' },
+          after: { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada Lovelace', team: 'Engineering' }
+        })
+      ]);
+      expect(materializedRowsForQuery(withRenamedAda, ownerRollups)).toEqual(renamedOwnerChange.rows);
+
+      const renamedEngineering = { ...engineeringTeam, name: 'Platform' };
+      const withRenamedTeam = createDb({
+        ...sourceData,
+        teams: [designTeam, renamedEngineering],
+        users: [renamedAda, beaUser, calUser]
+      });
+      const renamedTeam = maintainMaterializations(withRenamedAda, withRenamedTeam, {
+        deltas: [teamsDelta([renamedEngineering], [engineeringTeam])]
+      });
+      const renamedTeamChange = singleMaterializationChange(renamedTeam, 'aggregate-then-owner-info');
+
+      expect(renamedTeam).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(renamedTeamChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['teams'],
+        rows: [
+          { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada Lovelace', team: 'Platform' },
+          { ownerId: 'bea', tasks: 1, points: 3, owner: 'Bea', team: 'Design' }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...renamedTeam.diagnostics, ...renamedTeamChange.diagnostics]);
+      expect(renamedTeamChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada Lovelace', team: 'Engineering' },
+          after: { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada Lovelace', team: 'Platform' }
+        })
+      ]);
+      expect(materializedRowsForQuery(withRenamedTeam, ownerRollups)).toEqual(renamedTeamChange.rows);
+    });
+
+    it('incrementally maintains aggregate output followed by leftJoin when a right row appears', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const user = as(coreSchema.users, 'user');
+      const ownerId = field<string>('ownerRollup', 'ownerId');
+      const tasks = field<number>('ownerRollup', 'tasks');
+      const points = field<number>('ownerRollup', 'points');
+      const orphanTask: TaskRow = {
+        id: 't-flo',
+        ownerId: 'flo',
+        title: 'Unmatched owner aggregate',
+        done: false,
+        points: 6
+      };
+      const ownerRollups = pipe(
+        from(task),
+        aggregate({
+          groupBy: { ownerId: task.ownerId },
+          aggregates: {
+            tasks: count(),
+            points: sum(task.points)
+          }
+        }),
+        leftJoin(from(user), eq(ownerId, user.id)),
+        project({ ownerId, tasks, points, owner: maybe(user.name) }),
+        keyBy('ownerId')
+      ) as Query<TaskOwnerMaybeInfoRollupRow>;
+      const initial = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, orphanTask]
+      });
+      const state = mat(initial, ownerRollups, {
+        id: 'aggregate-then-left-owner',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, ownerRollups);
+
+      expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, ownerRollups)).toEqual([
+        { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada' },
+        { ownerId: 'bea', tasks: 1, points: 3, owner: 'Bea' },
+        { ownerId: 'flo', tasks: 1, points: 6, owner: undefined }
+      ]);
+
+      const withFlo = createDb({
+        ...sourceData,
+        users: [...sourceData.users, floUser],
+        tasks: [...sourceData.tasks, orphanTask]
+      });
+      const inserted = maintainMaterializations(state, withFlo, {
+        deltas: [usersDelta([floUser], [])]
+      });
+      const insertedChange = singleMaterializationChange(inserted, 'aggregate-then-left-owner');
+
+      expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(insertedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        touchedDependencies: ['users'],
+        rows: [
+          { ownerId: 'ada', tasks: 2, points: 13, owner: 'Ada' },
+          { ownerId: 'bea', tasks: 1, points: 3, owner: 'Bea' },
+          { ownerId: 'flo', tasks: 1, points: 6, owner: 'Flo' }
+        ],
+        addedRows: [],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+      expect(insertedChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'updated',
+          before: { ownerId: 'flo', tasks: 1, points: 6, owner: undefined },
+          after: { ownerId: 'flo', tasks: 1, points: 6, owner: 'Flo' }
+        })
+      ]);
+      expect(materializedRowsForQuery(withFlo, ownerRollups)).toEqual(insertedChange.rows);
+    });
+
+    it('incrementally maintains aggregate output followed by static intersection filters', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const ownerRollupBase = pipe(
+        from(task),
+        aggregate({
+          groupBy: { ownerId: task.ownerId },
+          aggregates: {
+            tasks: count(),
+            points: sum(task.points)
           }
         })
-      ) as Query<TaskProjectRollupRow>;
-      const allowedRollups = constRows([
-        { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 }
+      ) as Query<TaskOwnerRollupRow>;
+      const matchingRollups = constRows([
+        { ownerId: 'ada', tasks: 2, points: 13 },
+        { ownerId: 'bea', tasks: 2, points: 10 }
       ]);
-      const aggregateUserJoin = pipe(
-        aggregateBase,
-        join(from(user), eq(projectId, user.id))
-      ) as Query<TaskProjectRollupRow & { readonly user: UserRow }>;
+      const matchingOwnerRollups = pipe(
+        intersection(ownerRollupBase, matchingRollups),
+        keyBy('ownerId')
+      ) as Query<TaskOwnerRollupRow>;
+      const state = mat(createDb(sourceData), matchingOwnerRollups, {
+        id: 'aggregate-then-static-intersection',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, matchingOwnerRollups);
+      const extraReviewTask: TaskRow = {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Match static aggregate filter',
+        done: false,
+        points: 7
+      };
+      const withExtraReview = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, extraReviewTask]
+      });
+
+      expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, matchingOwnerRollups)).toEqual([
+        { ownerId: 'ada', tasks: 2, points: 13 }
+      ]);
+
+      const inserted = maintainMaterializations(state, withExtraReview, {
+        deltas: [tasksDelta([extraReviewTask], [])]
+      });
+      const insertedChange = singleMaterializationChange(inserted, 'aggregate-then-static-intersection');
+
+      expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(insertedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { ownerId: 'ada', tasks: 2, points: 13 },
+          { ownerId: 'bea', tasks: 2, points: 10 }
+        ],
+        addedRows: [{ ownerId: 'bea', tasks: 2, points: 10 }],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+      expect(insertedChange.rowChanges).toEqual([
+        expect.objectContaining({ kind: 'added', row: { ownerId: 'bea', tasks: 2, points: 10 } })
+      ]);
+      expect(materializedRowsForQuery(withExtraReview, matchingOwnerRollups)).toEqual(insertedChange.rows);
+
+      const deleted = maintainMaterializations(withExtraReview, createDb(sourceData), {
+        deltas: [tasksDelta([], [extraReviewTask])]
+      });
+      const deletedChange = singleMaterializationChange(deleted, 'aggregate-then-static-intersection');
+
+      expect(deleted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(deletedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { ownerId: 'ada', tasks: 2, points: 13 }
+        ],
+        addedRows: [],
+        removedRows: [{ ownerId: 'bea', tasks: 2, points: 10 }]
+      });
+      expectNoIncrementalFallback([...deleted.diagnostics, ...deletedChange.diagnostics]);
+      expect(deletedChange.rowChanges).toEqual([
+        expect.objectContaining({ kind: 'removed', row: { ownerId: 'bea', tasks: 2, points: 10 } })
+      ]);
+    });
+
+    it('incrementally maintains aggregate output followed by static difference filters', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const ownerRollupBase = pipe(
+        from(task),
+        aggregate({
+          groupBy: { ownerId: task.ownerId },
+          aggregates: {
+            tasks: count(),
+            points: sum(task.points)
+          }
+        })
+      ) as Query<TaskOwnerRollupRow>;
+      const blockedRollups = constRows([{ ownerId: 'ada', tasks: 2, points: 13 }]);
+      const unblockedOwnerRollups = pipe(
+        difference(ownerRollupBase, blockedRollups),
+        keyBy('ownerId')
+      ) as Query<TaskOwnerRollupRow>;
+      const state = mat(createDb(sourceData), unblockedOwnerRollups, {
+        id: 'aggregate-then-static-difference',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, unblockedOwnerRollups);
+      const updatedDraft = { ...draftEvaluatorTask, points: 6 };
+      const withUpdatedDraft = createDb({
+        ...sourceData,
+        tasks: [updatedDraft, shipRuntimeTask, reviewFixturesTask]
+      });
+
+      expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, unblockedOwnerRollups)).toEqual([
+        { ownerId: 'bea', tasks: 1, points: 3 }
+      ]);
+
+      const updated = maintainMaterializations(state, withUpdatedDraft, {
+        deltas: [tasksDelta([updatedDraft], [draftEvaluatorTask])]
+      });
+      const updatedChange = singleMaterializationChange(updated, 'aggregate-then-static-difference');
+
+      expect(updated).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(updatedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { ownerId: 'ada', tasks: 2, points: 14 },
+          { ownerId: 'bea', tasks: 1, points: 3 }
+        ],
+        addedRows: [{ ownerId: 'ada', tasks: 2, points: 14 }],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...updated.diagnostics, ...updatedChange.diagnostics]);
+      expect(updatedChange.rowChanges).toEqual([
+        expect.objectContaining({ kind: 'added', row: { ownerId: 'ada', tasks: 2, points: 14 } })
+      ]);
+      expect(materializedRowsForQuery(withUpdatedDraft, unblockedOwnerRollups)).toEqual(updatedChange.rows);
+
+      const restored = maintainMaterializations(withUpdatedDraft, createDb(sourceData), {
+        deltas: [tasksDelta([draftEvaluatorTask], [updatedDraft])]
+      });
+      const restoredChange = singleMaterializationChange(restored, 'aggregate-then-static-difference');
+
+      expect(restored).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(restoredChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { ownerId: 'bea', tasks: 1, points: 3 }
+        ],
+        addedRows: [],
+        removedRows: [{ ownerId: 'ada', tasks: 2, points: 14 }]
+      });
+      expectNoIncrementalFallback([...restored.diagnostics, ...restoredChange.diagnostics]);
+      expect(restoredChange.rowChanges).toEqual([
+        expect.objectContaining({ kind: 'removed', row: { ownerId: 'ada', tasks: 2, points: 14 } })
+      ]);
+    });
+
+    it('keeps aggregate output followed by union or dynamic set branches on snapshot fallback', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const user = as(coreSchema.users, 'user');
+      const ownerRollupBase = pipe(
+        from(task),
+        aggregate({
+          groupBy: { ownerId: task.ownerId },
+          aggregates: {
+            tasks: count(),
+            points: sum(task.points)
+          }
+        })
+      ) as Query<TaskOwnerRollupRow>;
+      const staticExtraRollups = constRows([{ ownerId: 'cal', tasks: 0, points: 0 }]);
+      const dynamicAllowedRollups = pipe(
+        from(user),
+        project({ ownerId: user.id, tasks: value(2), points: value(13) })
+      ) as Query<TaskOwnerRollupRow>;
       const cases: readonly {
         readonly id: string;
         readonly query: Query<unknown>;
         readonly reason: string;
       }[] = [
         {
-          id: 'aggregate-then-join-fallback',
+          id: 'aggregate-then-static-union-fallback',
           query: pipe(
-            aggregateUserJoin,
-            keyBy('projectId')
+            union(ownerRollupBase, staticExtraRollups),
+            keyBy('ownerId')
           ) as Query<unknown>,
-          reason: 'join after aggregate'
+          reason: 'union is not supported'
         },
         {
-          id: 'aggregate-then-intersection-fallback',
+          id: 'aggregate-then-dynamic-intersection-fallback',
           query: pipe(
-            intersection(aggregateBase, allowedRollups),
-            keyBy('projectId')
+            intersection(ownerRollupBase, dynamicAllowedRollups),
+            keyBy('ownerId')
           ) as Query<unknown>,
-          reason: 'intersection after aggregate'
-        },
-        {
-          id: 'aggregate-then-difference-fallback',
-          query: pipe(
-            difference(aggregateBase, allowedRollups),
-            keyBy('projectId')
-          ) as Query<unknown>,
-          reason: 'difference after aggregate'
+          reason: 'intersection static branch'
         }
       ];
 

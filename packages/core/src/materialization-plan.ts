@@ -181,6 +181,8 @@ type IncrementalPostOrderStep = Extract<IncrementalPipelineStep, {
   readonly kind: 'select' | 'extend' | 'without' | 'rename' | 'qualify';
 }>;
 
+type IncrementalPostAggregateStep = IncrementalPipelineStep | IncrementalJoinStep;
+
 type IncrementalWindow = {
   readonly offset: number;
   readonly count: number;
@@ -573,19 +575,34 @@ export function buildIncrementalMaterialization<Row>(
     recordRootJoinValues(rootValuesByStep, key, evaluated.joinValuesByStep);
   }
 
-  const joinStates = joinStatesResult.states.map((state) =>
+  let joinStates: readonly IncrementalJoinState[] = joinStatesResult.states.map((state) =>
     withRootJoinValues(state, rootValuesByStep.get(state.id) ?? new Map())
   );
 
   const aggregate = aggregateStep(plan);
   const aggregateState = aggregate === undefined
     ? undefined
-    : buildAggregateState<Row>(plan, rootKeys, outputsByRootKey, env);
+    : buildAggregateState<Row>(plan, rootKeys, outputsByRootKey, env, joinStateMap(joinStates));
   if (aggregateState !== undefined && !aggregateState.supported) {
     return {
       supported: false,
       reason: aggregateState.reason
     };
+  }
+  if (aggregateState !== undefined) {
+    const postAggregateJoinStates = withPostAggregateJoinValues(
+      plan,
+      joinStates,
+      aggregateState.state,
+      env
+    );
+    if (!postAggregateJoinStates.supported) {
+      return {
+        supported: false,
+        reason: postAggregateJoinStates.reason
+      };
+    }
+    joinStates = postAggregateJoinStates.states;
   }
 
   let state: IncrementalMaterializationState<Row> = {
@@ -876,8 +893,14 @@ export function maintainIncrementalMaterialization<Row>(
     ? undefined
     : mutableRootKeysByGroupKey(previousAggregateState);
   let joinStates = materialization.state.joinStates;
+  const preAggregateDependencySteps = aggregate === undefined
+    ? rootDependencySteps(materialization.plan)
+    : rootDependencyStepsBeforeAggregate(materialization.plan);
+  const postAggregateDependencySteps = aggregate === undefined
+    ? []
+    : rootDependencyStepsAfterAggregate(materialization.plan);
 
-  for (const joinStep of rootDependencySteps(materialization.plan)) {
+  for (const joinStep of preAggregateDependencySteps) {
     const currentState = joinStates.find((state) => state.id === joinStep.id);
     if (currentState === undefined) {
       return {
@@ -943,7 +966,74 @@ export function maintainIncrementalMaterialization<Row>(
     }
   }
 
-  const rootJoinIndexes = mutableRootJoinIndexes(joinStates);
+  for (const joinStep of postAggregateDependencySteps) {
+    const currentState = joinStates.find((state) => state.id === joinStep.id);
+    if (currentState === undefined) {
+      return {
+        updated: false,
+        reason: `incremental join state ${joinStep.id} is missing; snapshot recompute is required`
+      };
+    }
+
+    let nextJoinState = currentState;
+    const nestedChanged = applyNestedBranchJoinChanges(joinStep, nextJoinState, deltas, env);
+    if (!nestedChanged.supported) {
+      return {
+        updated: false,
+        reason: nestedChanged.reason
+      };
+    }
+    nextJoinState = nestedChanged.state;
+    for (const groupKey of nestedChanged.affectedRootKeys) {
+      affectedAggregateGroupKeys.add(groupKey);
+    }
+
+    const deltaRelation = relationForDeltas(joinStep.right.relation, deltas);
+    if (deltaRelation !== undefined) {
+      const rightChanges = normalizedRelationChanges(
+        deltaRelation,
+        deltas,
+        `right relation ${deltaRelation.name}`
+      );
+      if (!rightChanges.supported) {
+        return {
+          updated: false,
+          reason: rightChanges.reason
+        };
+      }
+
+      if (rightChanges.changes.length === 0) {
+        if (hasRelationDeltaRows(deltaRelation, deltas)) {
+          return {
+            updated: false,
+            reason: `right relation ${deltaRelation.name} deltas had no net keyed row changes; snapshot recompute is required to preserve join order`
+          };
+        }
+      } else {
+        const changed = applyRightRelationChanges(joinStep, nextJoinState, deltaRelation, rightChanges.changes, env);
+        if (!changed.supported) {
+          return {
+            updated: false,
+            reason: changed.reason
+          };
+        }
+
+        nextJoinState = changed.state;
+        for (const groupKey of changed.affectedRootKeys) {
+          affectedAggregateGroupKeys.add(groupKey);
+        }
+      }
+    }
+
+    if (nextJoinState !== currentState) {
+      joinStates = joinStates.map((state) => state.id === nextJoinState.id ? nextJoinState : state);
+    }
+  }
+
+  const preAggregateDependencyStepIds = new Set(preAggregateDependencySteps.map((step) => step.id));
+  const rootJoinIndexes = mutableRootJoinIndexes(
+    joinStates.filter((state) => preAggregateDependencyStepIds.has(state.id))
+  );
 
   for (const change of rootChanges) {
     const index = rootIndexByKey.get(change.key) ?? -1;
@@ -1040,7 +1130,7 @@ export function maintainIncrementalMaterialization<Row>(
     addRootJoinValues(rootJoinIndexes, rootKey, evaluated.joinValuesByStep);
   }
 
-  const nextJoinStates = joinStates.map((state) =>
+  let nextJoinStates: readonly IncrementalJoinState[] = joinStates.map((state) =>
     withRootJoinIndex(state, rootJoinIndexes.get(state.id))
   );
   const nextAggregateState = aggregate === undefined
@@ -1054,13 +1144,29 @@ export function maintainIncrementalMaterialization<Row>(
       groupKeysByRootKey ?? new Map(),
       rootKeysByGroupKey ?? new Map(),
       affectedAggregateGroupKeys,
-      env
+      env,
+      joinStateMap(nextJoinStates)
     );
   if (nextAggregateState !== undefined && !nextAggregateState.supported) {
     return {
       updated: false,
       reason: nextAggregateState.reason
     };
+  }
+  if (nextAggregateState !== undefined) {
+    const postAggregateJoinStates = withPostAggregateJoinValues(
+      materialization.plan,
+      nextJoinStates,
+      nextAggregateState.state,
+      env
+    );
+    if (!postAggregateJoinStates.supported) {
+      return {
+        updated: false,
+        reason: postAggregateJoinStates.reason
+      };
+    }
+    nextJoinStates = postAggregateJoinStates.states;
   }
 
   let state: IncrementalMaterializationState<Row> = {
@@ -1592,16 +1698,11 @@ function collectSingleRootPlan(
       return { ...root, shape: expandShape(root.shape, data.alias, data.fields) };
     }
     case 'join': {
-      const stepCount = steps.length;
       const left = collectSingleRootPlan(data.left, steps, collection);
       if (typeof left === 'string') return left;
       if (collection.ordered !== undefined) {
         return `${data.kind} join after order/window is not supported for incremental maintenance`;
       }
-      if (hasAggregateStep(steps.slice(stepCount))) {
-        return 'join after aggregate is not supported for incremental maintenance';
-      }
-
       const right = collectRightBranchPlan(data.right, { allowNestedJoin: true });
       if (typeof right === 'string') {
         return `join right branch is not supported for incremental maintenance: ${right}`;
@@ -2201,16 +2302,12 @@ function collectIntersectionPlan(
     return 'intersection incremental maintenance requires one supported root branch and static right branches';
   }
 
-  const stepCount = steps.length;
   const root = collectSingleRootPlan(leftInput, steps, collection);
   if (typeof root === 'string') {
     return `intersection first branch is not supported for incremental maintenance: ${root}`;
   }
   if (collection.ordered !== undefined) {
     return 'intersection after order/window is not supported for incremental maintenance';
-  }
-  if (hasAggregateStep(steps.slice(stepCount))) {
-    return 'intersection after aggregate is not supported for incremental maintenance';
   }
 
   const rightRows = collectStaticSetRows(rightInputs, 'intersection');
@@ -2228,16 +2325,12 @@ function collectDifferencePlan(
   steps: IncrementalStep[],
   collection: PlanCollection
 ): RootPlan | string {
-  const stepCount = steps.length;
   const root = collectSingleRootPlan(leftInput, steps, collection);
   if (typeof root === 'string') {
     return `difference left branch is not supported for incremental maintenance: ${root}`;
   }
   if (collection.ordered !== undefined) {
     return 'difference after order/window is not supported for incremental maintenance';
-  }
-  if (hasAggregateStep(steps.slice(stepCount))) {
-    return 'difference after aggregate is not supported for incremental maintenance';
   }
 
   const rightRows = collectStaticSetRows([rightInput], 'difference');
@@ -2665,6 +2758,37 @@ function rootDependencySteps(plan: IncrementalMaterializationPlan): readonly Inc
   );
 }
 
+function rootDependencyStepsBeforeAggregate(
+  plan: IncrementalMaterializationPlan
+): readonly IncrementalRootDependencyStep[] {
+  if (plan.kind !== 'singleRoot') {
+    return [];
+  }
+
+  const aggregateIndex = plan.steps.findIndex((step) => step.kind === 'aggregate');
+  const steps = aggregateIndex === -1 ? plan.steps : plan.steps.slice(0, aggregateIndex);
+  return steps.filter((step): step is IncrementalRootDependencyStep =>
+    step.kind === 'join' || step.kind === 'subquery'
+  );
+}
+
+function rootDependencyStepsAfterAggregate(
+  plan: IncrementalMaterializationPlan
+): readonly IncrementalJoinStep[] {
+  if (plan.kind !== 'singleRoot') {
+    return [];
+  }
+
+  const aggregateIndex = plan.steps.findIndex((step) => step.kind === 'aggregate');
+  if (aggregateIndex === -1) {
+    return [];
+  }
+
+  return plan.steps.slice(aggregateIndex + 1).filter((step): step is IncrementalJoinStep =>
+    step.kind === 'join'
+  );
+}
+
 function subquerySteps(plan: IncrementalMaterializationPlan): readonly IncrementalSubqueryStep[] {
   if (plan.kind !== 'singleRoot') {
     return [];
@@ -2693,7 +2817,7 @@ function hasAggregateStep(steps: readonly IncrementalStep[]): boolean {
 
 function stepsAfterAggregate(
   plan: IncrementalMaterializationPlan
-): readonly IncrementalPipelineStep[] {
+): readonly IncrementalPostAggregateStep[] {
   if (plan.kind !== 'singleRoot') {
     return [];
   }
@@ -2705,8 +2829,8 @@ function stepsAfterAggregate(
 
   return plan.steps.slice(aggregateIndex + 1).filter((
     step
-  ): step is IncrementalPipelineStep =>
-    step.kind !== 'join' && step.kind !== 'subquery' && step.kind !== 'aggregate'
+  ): step is IncrementalPostAggregateStep =>
+    step.kind !== 'subquery' && step.kind !== 'aggregate'
   );
 }
 
@@ -3794,7 +3918,8 @@ function buildAggregateState<Row>(
   plan: IncrementalMaterializationPlan,
   rootKeys: readonly string[],
   outputsByRootKey: ReadonlyMap<string, readonly unknown[]>,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  joinStateById: ReadonlyMap<string, IncrementalJoinState>
 ): AggregateStateResult<Row> {
   const aggregate = aggregateStep(plan);
   if (aggregate === undefined) {
@@ -3821,7 +3946,8 @@ function buildAggregateState<Row>(
       groupKey,
       rootKeysByGroupKey.get(groupKey) ?? [],
       outputsByRootKey,
-      env
+      env,
+      joinStateById
     );
     if (!group.supported) {
       return group;
@@ -3851,7 +3977,8 @@ function maintainAggregateState<Row>(
   groupKeysByRootKey: ReadonlyMap<string, readonly string[]>,
   rootKeysByGroupKey: ReadonlyMap<string, readonly string[]>,
   affectedGroupKeys: ReadonlySet<string>,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  joinStateById: ReadonlyMap<string, IncrementalJoinState>
 ): AggregateStateResult<Row> {
   const aggregate = aggregateStep(plan);
   if (aggregate === undefined) {
@@ -3869,7 +3996,8 @@ function maintainAggregateState<Row>(
       groupKey,
       rootKeysByGroupKey.get(groupKey) ?? [],
       outputsByRootKey,
-      env
+      env,
+      joinStateById
     );
     if (!group.supported) {
       return group;
@@ -3884,7 +4012,7 @@ function maintainAggregateState<Row>(
   if (isUngroupedAggregate(aggregate)) {
     const emptyKey = emptyGroupKey();
     if (!groupsByKey.has(emptyKey)) {
-      const group = recomputeAggregateGroup<Row>(plan, emptyKey, rootKeys, outputsByRootKey, env);
+      const group = recomputeAggregateGroup<Row>(plan, emptyKey, rootKeys, outputsByRootKey, env, joinStateById);
       if (!group.supported) {
         return group;
       }
@@ -3916,7 +4044,8 @@ function recomputeAggregateGroup<Row>(
   groupKey: string,
   rootKeys: readonly string[],
   outputsByRootKey: ReadonlyMap<string, readonly unknown[]>,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  joinStateById: ReadonlyMap<string, IncrementalJoinState>
 ):
   | { readonly supported: true; readonly state: IncrementalAggregateGroupState<Row> | undefined }
   | { readonly supported: false; readonly reason: string } {
@@ -3949,7 +4078,7 @@ function recomputeAggregateGroup<Row>(
   }
 
   const aggregateRow = evaluateAggregateRow(aggregate, group ?? {}, rows, env);
-  const postAggregateRows = evaluatePostAggregateRows(plan, aggregateRow, env);
+  const postAggregateRows = evaluatePostAggregateRows(plan, aggregateRow, env, joinStateById);
   if (!postAggregateRows.supported) {
     return postAggregateRows;
   }
@@ -3962,6 +4091,42 @@ function recomputeAggregateGroup<Row>(
       rawRow: aggregateRow,
       rows: postAggregateRows.rows as readonly Row[]
     }
+  };
+}
+
+function withPostAggregateJoinValues<Row>(
+  plan: IncrementalMaterializationPlan,
+  joinStates: readonly IncrementalJoinState[],
+  aggregate: IncrementalAggregateState<Row>,
+  env: Readonly<Record<string, unknown>>
+): JoinStateBuildResult {
+  const postAggregateJoinStepIds = new Set(rootDependencyStepsAfterAggregate(plan).map((step) => step.id));
+  if (postAggregateJoinStepIds.size === 0) {
+    return { supported: true, states: joinStates };
+  }
+
+  const joinStateById = joinStateMap(joinStates);
+  const groupValuesByStep = new Map<string, Map<string, readonly unknown[]>>();
+  for (const groupKey of aggregate.groupKeys) {
+    const group = aggregate.groupsByKey.get(groupKey);
+    if (group === undefined) {
+      continue;
+    }
+
+    const evaluated = evaluatePostAggregateRows(plan, group.rawRow, env, joinStateById);
+    if (!evaluated.supported) {
+      return evaluated;
+    }
+    recordRootJoinValues(groupValuesByStep, groupKey, evaluated.joinValuesByStep);
+  }
+
+  return {
+    supported: true,
+    states: joinStates.map((state) =>
+      postAggregateJoinStepIds.has(state.id)
+        ? withRootJoinValues(state, groupValuesByStep.get(state.id) ?? new Map())
+        : state
+    )
   };
 }
 
@@ -4110,13 +4275,29 @@ function evaluateAggregateRow(
 function evaluatePostAggregateRows(
   plan: IncrementalMaterializationPlan,
   row: Record<string, unknown>,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  joinStateById: ReadonlyMap<string, IncrementalJoinState>
 ):
-  | { readonly supported: true; readonly rows: readonly Record<string, unknown>[] }
+  | {
+      readonly supported: true;
+      readonly rows: readonly Record<string, unknown>[];
+      readonly joinValuesByStep: ReadonlyMap<string, readonly unknown[]>;
+    }
   | { readonly supported: false; readonly reason: string } {
   let rows: readonly Record<string, unknown>[] = [row];
+  const joinValuesByStep = new Map<string, readonly unknown[]>();
   for (const step of stepsAfterAggregate(plan)) {
-    if (step.kind === 'expand') {
+    if (step.kind === 'join') {
+      const joinState = joinStateById.get(step.id);
+      if (joinState === undefined) {
+        return {
+          supported: false,
+          reason: `incremental join state ${step.id} is missing; snapshot recompute is required`
+        };
+      }
+      joinValuesByStep.set(step.id, rows.map((item) => exprValue(item, step.left, env)));
+      rows = evaluateJoinStep(rows, step, joinState, env);
+    } else if (step.kind === 'expand') {
       const expanded = evaluateExpandStep(rows, step, env);
       if (!expanded.supported) {
         return expanded;
@@ -4125,8 +4306,11 @@ function evaluatePostAggregateRows(
     } else {
       rows = evaluateStep(rows, step, env);
     }
+    if (rows.length === 0) {
+      return { supported: true, rows: [], joinValuesByStep };
+    }
   }
-  return { supported: true, rows };
+  return { supported: true, rows, joinValuesByStep };
 }
 
 function evaluateAggregate(
