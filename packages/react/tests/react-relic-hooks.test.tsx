@@ -80,6 +80,10 @@ describe('@tarstate/react future hook facade contract', () => {
     }>();
     expectTypeOf<UseQuerySelectedOptions<ItemProjection, readonly string[]>>()
       .toMatchTypeOf<UseQueryOptions<ItemProjection, readonly string[]>>();
+    const defaultQueryOptions = {
+      select: (rows) => rows
+    } satisfies UseQueryOptions<ItemProjection>;
+    expectTypeOf(defaultQueryOptions.select).toEqualTypeOf<(rows: readonly ItemProjection[]) => readonly ItemProjection[]>();
     const queryOptions = {
       select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`)
     } satisfies UseQueryOptions<ItemProjection, readonly string[]>;

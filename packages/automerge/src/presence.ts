@@ -116,7 +116,7 @@ export function automergePresenceRuntime<
   const fields = { ...defaultPresenceFields, ...options.fields };
   const listeners = new Set<() => void>();
   const presence = new Presence<State, DocType>({ handle: presenceHandleForConstructor(options.handle) });
-  const localState = compactState(options.initialState, options.isClearedValue ?? defaultAutomergePresenceClearedValue) as State;
+  const localState = compactState(options.initialState, options.isClearedValue ?? defaultAutomergePresenceClearedValue);
   let revision = 0;
   let running = false;
   const version = (): AutomergePresenceVersion => ({
@@ -204,11 +204,11 @@ function presenceHandleForConstructor<DocType>(handle: AutomergePresenceHandle<D
   return handle as DocHandle<DocType>;
 }
 
-function compactState(
-  state: PresenceState,
+function compactState<State extends PresenceState>(
+  state: State,
   isClearedValue: AutomergePresenceClearedValue
-): PresenceState {
-  return Object.fromEntries(Object.entries(state).filter(([, value]) => !isClearedValue(value)));
+): State {
+  return Object.fromEntries(Object.entries(state).filter(([, value]) => !isClearedValue(value))) as State;
 }
 
 function stubDiagnostic(message: string): TarstateDiagnostic {

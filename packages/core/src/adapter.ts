@@ -2,6 +2,7 @@ export { composeRelationRuntimes, isRelationRuntime, tryApplyRelationPatches } f
 export type {
   AdapterSnapshot,
   AdapterSource,
+  ComposedRelationRuntimeVersion,
   MaybePromise,
   RelationApply,
   RelationApplyAcceptedResult,
@@ -18,6 +19,7 @@ export type {
   RelationRangeBound,
   RelationRangeLookup,
   RelationRuntime,
+  RelationRuntimeVersion,
   RelationSource,
   TarstateDiagnostic,
   WritePatch

@@ -178,12 +178,12 @@ export type AggregateFunction =
   | 'maxBy'
   | 'minBy'
   | 'setConcat';
-export type PredicateData = Readonly<Record<string, unknown>> & { readonly op: string };
+export type PredicateData = ExprData<boolean>;
 export type OptionalProjection<Value = unknown> = {
   readonly kind: 'optionalProjection';
   readonly expr: ExprData<Value>;
 };
-export type ProjectionData = Record<string, ExprData | OptionalProjection>;
+export type ProjectionData = Readonly<Record<string, ExprData | OptionalProjection>>;
 export type SortDirection = 'asc' | 'desc';
 export type NullSortOrder = 'first' | 'last';
 export type SortData = {
@@ -206,7 +206,7 @@ export type ExpandOptions<
 export type QueryData = Readonly<Record<string, unknown>> & { readonly op: string };
 export type Query<Row = unknown> = {
   readonly data: QueryData;
-  readonly relations: Record<string, AnyRelationRef>;
+  readonly relations: Readonly<Record<string, AnyRelationRef>>;
   readonly __row?: Row;
 };
 export type QueryKeyInput = Query | QueryData;
@@ -326,7 +326,9 @@ export function maybe<Value>(expr: ExprData<Value>): ExprData<Value | undefined>
   return { op: 'maybe', expr };
 }
 
-export function tuple<const Values extends readonly ExprInput[]>(...values: Values): ExprData<unknown[]> {
+export function tuple<const Values extends readonly ExprInput[]>(
+  ...values: Values
+): ExprData<{ readonly [Index in keyof Values]: ExprValue<Values[Index]> }> {
   return { op: 'tuple', values };
 }
 
@@ -426,8 +428,8 @@ export const asc = (input: SortInput, nulls?: NullSortOrder): SortData => ({ exp
 export const desc = (input: SortInput, nulls?: NullSortOrder): SortData => ({ expr: expr(input), direction: 'desc', ...(nulls === undefined ? {} : { nulls }) });
 export const count = (): ExprData<number> => aggregateCall<number>('count');
 export const countDistinct = (input?: ExprInput): ExprData<number> => aggregateCall<number>('countDistinct', input);
-export const sum = (input: ExprInput): ExprData<number> => aggregateCall<number>('sum', input);
-export const avg = (input: ExprInput): ExprData<number> => aggregateCall<number>('avg', input);
+export const sum = (input: ExprInput<number>): ExprData<number> => aggregateCall<number>('sum', input);
+export const avg = (input: ExprInput<number>): ExprData<number> => aggregateCall<number>('avg', input);
 export const min = <Value = unknown>(input: ExprInput<Value>): ExprData<Value> => aggregateCall<Value>('min', input);
 export const max = <Value = unknown>(input: ExprInput<Value>): ExprData<Value> => aggregateCall<Value>('max', input);
 export const top = <Value = unknown>(input: ExprInput<Value>, countValue = 1): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('top', input, countValue);
@@ -578,6 +580,11 @@ export type RelationRuntime<Version = unknown> = {
   readonly snapshot?: () => AdapterSnapshot<Version>;
   readonly subscribe?: (listener: () => void) => () => void;
 };
+export type RelationRuntimeVersion<Runtime extends RelationRuntime = RelationRuntime> =
+  Runtime extends RelationRuntime<infer Version> ? Version : never;
+export type ComposedRelationRuntimeVersion<Runtimes extends readonly RelationRuntime[]> = {
+  readonly [Index in keyof Runtimes]: RelationRuntimeVersion<Runtimes[Index]>;
+};
 export type RelationApplyOptions = TarstateDiagnosticOptions & { readonly readVersion?: boolean };
 export type RelationApplyReport<Version = unknown> = RelationApplyResult<Version> & { readonly source: AdapterSource<Version> };
 
@@ -597,8 +604,10 @@ export async function tryApplyRelationPatches<Version = unknown>(
   };
 }
 
-export const composeRelationRuntimes = (...runtimes: readonly RelationRuntime[]): RelationRuntime<readonly unknown[]> => ({
-  source: composeSources(...runtimes.map((runtime) => runtime.source)) as AdapterSource<readonly unknown[]>
+export const composeRelationRuntimes = <const Runtimes extends readonly RelationRuntime[]>(
+  ...runtimes: Runtimes
+): RelationRuntime<ComposedRelationRuntimeVersion<Runtimes>> => ({
+  source: composeSources(...runtimes.map((runtime) => runtime.source)) as AdapterSource<ComposedRelationRuntimeVersion<Runtimes>>
 });
 export const isRelationRuntime = (input: unknown): input is RelationRuntime => isRecord(input) && isRelationSource(input.source);
 
@@ -634,6 +643,11 @@ export type DbTransactionPlan = {
   readonly patches: readonly WritePatch[];
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
+/**
+ * Placeholder for the transaction-builder surface (patch/read helpers exposed
+ * to transaction callbacks). The rewrite fills this in; it intentionally adds
+ * no members yet so `DbTransactionContext` is currently just `Db`.
+ */
 export type DbTransactionBuilder = object;
 export type DbTransactionContext = Db & DbTransactionBuilder;
 export type QueryBatchTarget = Query<unknown> | RelationRef | { readonly q: Query<unknown> | RelationRef };
@@ -701,7 +715,6 @@ export function qManyRows<Queries extends QueryBatch>(inputDb: Db, queries: Quer
   return Object.fromEntries(Object.entries(result).map(([name, queryResult]) => [name, queryResult.rows])) as QueryBatchRows<Queries>;
 }
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _key: RelationKeyValue<Relation>, _options?: RowLookupOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
-export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _key: RelationKeyInput, _options?: RowLookupOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
 export function row<Row>(_db: Db, _query: Query<Row>, _predicate: PredicateData, _options?: RowPredicateOptions<Row>): Row | undefined;
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _predicate: PredicateData, _options?: RowPredicateOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
 export function row<Row>(_db: Db, _query: Query<Row>, _options?: RowLookupOptions<Row>): Row | undefined;
@@ -855,8 +868,11 @@ export class DbConstraintTransactionError extends Error {
   }
 }
 
-export const check = (queryOrPredicate: Query | PredicateData, predicate?: PredicateData): CheckConstraintData =>
-  ({ op: 'check', ...(predicate === undefined ? { predicate: queryOrPredicate as PredicateData } : { query: queryOrPredicate as Query, predicate }) });
+export function check(predicate: PredicateData): CheckConstraintData;
+export function check(query: Query, predicate: PredicateData): CheckConstraintData;
+export function check(queryOrPredicate: Query | PredicateData, predicate?: PredicateData): CheckConstraintData {
+  return { op: 'check', ...(predicate === undefined ? { predicate: queryOrPredicate as PredicateData } : { query: queryOrPredicate as Query, predicate }) };
+}
 export const req = (query: Query | RelationRef, ...fields: readonly string[]): RequiredConstraintData => ({ op: 'req', query, fields });
 export const fk = (
   query: Query | RelationRef,
@@ -874,7 +890,7 @@ export const fk = (
 });
 export const unique = (query: Query | RelationRef, ...fields: readonly string[]): UniqueConstraintData => ({ op: 'unique', query, fields });
 export const constrain = (...constraints: readonly ConstraintData[]): ConstraintSet => constraints;
-export const attachConstraints = <DbValue extends Db>(dbValue: DbValue, constraints: ConstraintSet): DbValue & ConstrainedDb => ({ ...dbValue, constraints });
+export const attachConstraints = <DbValue extends Db>(dbValue: DbValue, constraints: ConstraintSet): DbValue & { readonly constraints: ConstraintSet } => ({ ...dbValue, constraints });
 export const detachConstraints = <DbValue extends Db>(dbValue: DbValue): DbValue => dbValue;
 export const attachedConstraintsFor = (dbValue: Partial<ConstrainedDb>): ConstraintSet => dbValue.constraints ?? [];
 export const hasAttachedConstraints = (dbValue: Partial<ConstrainedDb>): boolean => attachedConstraintsFor(dbValue).length > 0;
@@ -882,6 +898,11 @@ export const validateConstraints = async (): Promise<ConstraintValidationResult>
 export const tryTransactConstrained = (dbValue: Db, ...inputs: DbTransactionInputs): DbTransactionResult => tryTransact(dbValue, ...inputs);
 export const transactConstrained = (dbValue: Db, ...inputs: DbTransactionInputs): Db => transact(dbValue, inputs);
 
+/**
+ * Placeholder for any db-like value that can carry materializations. The
+ * rewrite narrows this; today `mat`/`demat` accept any object and return it
+ * unchanged.
+ */
 export type MaterializableDb = object;
 export type SnapshotMaterializationTarget = Db | RelationSource;
 export type MaterializedDb = { readonly materialized?: readonly MaterializationMetadata[] };
@@ -1161,7 +1182,6 @@ export type QueryDiff<Row = unknown> = {
 export function attachWatches<DbValue extends Db>(dbValue: DbValue, ..._targets: readonly WatchTarget[]): DbValue {
   return dbValue;
 }
-export function watch<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, listener: WatchListener<Row>, options?: WatchOptions<Row>): WatchHandle<DbValue, Row>;
 export function watch<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, _listener: WatchListener<Row>, options: WatchOptions<Row> = {}): WatchHandle<DbValue, Row> {
   return createWatchHandle(dbValue, target, options);
 }

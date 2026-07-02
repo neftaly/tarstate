@@ -9,7 +9,14 @@ import {
   unique
 } from '@tarstate/core/constraints';
 import {
+  composeRelationRuntimes,
+  type ComposedRelationRuntimeVersion,
+  type RelationRuntime,
+  type RelationRuntimeVersion
+} from '@tarstate/core/adapter';
+import {
   createDb,
+  exists,
   qManyRows,
   qRows,
   row,
@@ -162,6 +169,90 @@ describe('rewrite public contracts', () => {
     const entry = row(openingDb, schema.entries, 'e1');
     expectTypeOf(entry).toEqualTypeOf<Entry | undefined>();
     expect(entry).toEqual({ id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid' });
+  });
+
+  it('keeps relation key lookup typed from relation metadata', () => {
+    type KeyedEntry = {
+      readonly id: string;
+      readonly amount: number;
+    };
+    type TenantEntry = {
+      readonly tenantId: string;
+      readonly id: string;
+      readonly amount: number;
+    };
+    const keyedSchema = defineSchema({
+      byId: relation<KeyedEntry, 'id'>({
+        key: 'id',
+        fields: {
+          id: stringField(),
+          amount: numberField()
+        }
+      }),
+      byTenantAndId: relation<TenantEntry, readonly ['tenantId', 'id']>({
+        key: ['tenantId', 'id'] as const,
+        fields: {
+          tenantId: stringField(),
+          id: stringField(),
+          amount: numberField()
+        }
+      })
+    });
+
+    const readById = () => row(openingDb, keyedSchema.byId, 'entry-a');
+    const readByTenantAndId = () => row(openingDb, keyedSchema.byTenantAndId, ['acme', 'entry-a'] as const);
+    const hasById = () => exists(openingDb, keyedSchema.byId, 'entry-a');
+
+    expectTypeOf<ReturnType<typeof readById>>().toEqualTypeOf<{ readonly id: string; readonly amount: number } | undefined>();
+    expectTypeOf<ReturnType<typeof readByTenantAndId>>().toEqualTypeOf<{
+      readonly tenantId: string;
+      readonly id: string;
+      readonly amount: number;
+    } | undefined>();
+    expectTypeOf<ReturnType<typeof hasById>>().toEqualTypeOf<boolean>();
+
+    const invalidReadById = () =>
+      // @ts-expect-error row keys must match the relation key field type.
+      row(openingDb, keyedSchema.byId, 1);
+    const invalidHasById = () =>
+      // @ts-expect-error exists keys must match the relation key field type.
+      exists(openingDb, keyedSchema.byId, 1);
+    const invalidCompositeRead = () =>
+      // @ts-expect-error composite row keys use the relation key tuple shape.
+      row(openingDb, keyedSchema.byTenantAndId, 'entry-a');
+    const invalidCompositeExists = () =>
+      // @ts-expect-error composite key component types follow row fields.
+      exists(openingDb, keyedSchema.byTenantAndId, ['acme', 1] as const);
+    void invalidReadById;
+    void invalidHasById;
+    void invalidCompositeRead;
+    void invalidCompositeExists;
+  });
+
+  it('preserves composed relation runtime version types', () => {
+    const numberRuntime = {
+      source: {
+        relationNames: ['numbers'],
+        version: () => 1,
+        rows: () => []
+      }
+    } satisfies RelationRuntime<number>;
+    const labelRuntime = {
+      source: {
+        relationNames: ['labels'],
+        version: () => 'ready',
+        rows: () => []
+      }
+    } satisfies RelationRuntime<'ready'>;
+    const runtime = composeRelationRuntimes(numberRuntime, labelRuntime);
+
+    expectTypeOf<RelationRuntimeVersion<typeof numberRuntime>>().toEqualTypeOf<number>();
+    expectTypeOf<ComposedRelationRuntimeVersion<[typeof numberRuntime, typeof labelRuntime]>>()
+      .toEqualTypeOf<readonly [number, 'ready']>();
+    expectTypeOf(runtime).toMatchTypeOf<RelationRuntime<readonly [number, 'ready']>>();
+    expectTypeOf<NonNullable<typeof runtime.source.version>>()
+      .returns.toEqualTypeOf<readonly [number, 'ready'] | undefined>();
+    expect(runtime.source.rows(schema.entries)).toEqual([]);
   });
 
   it('keeps derived query field access typed without casts', () => {

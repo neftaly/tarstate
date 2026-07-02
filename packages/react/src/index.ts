@@ -8,10 +8,10 @@ import {
   useRef,
   useSyncExternalStore,
   type DependencyList,
+  type ReactElement,
   type ReactNode
 } from 'react';
-import type { Db, DbInputData } from '@tarstate/core/db';
-import type { TarstateDiagnostic } from '@tarstate/core/diagnostics';
+import type { Db } from '@tarstate/core/db';
 import { queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
 import {
@@ -25,15 +25,9 @@ import {
   type StoreViewSnapshot
 } from '@tarstate/core/store';
 
-export type TarstateReactDiagnostic =
-  | StoreDiagnostic
-  | (TarstateDiagnostic & {
-      readonly message: string;
-      readonly surface?: string;
-      readonly detail?: unknown;
-    });
+export type TarstateReactDiagnostic = StoreDiagnostic;
 
-export type TarstateDbInput = StoreSeedInput | DbInputData;
+export type TarstateDbInput = StoreSeedInput;
 export type TarstateDbSnapshot = StoreSnapshot;
 export type TarstateCommit = Store['commit'];
 
@@ -48,7 +42,7 @@ export type UseViewOptions = {
   readonly deps?: DependencyList;
 };
 
-export type UseQueryOptions<Row, Selected> = {
+export type UseQueryOptions<Row, Selected = readonly Row[]> = {
   readonly deps?: DependencyList;
   readonly select?: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
@@ -92,7 +86,7 @@ export type UseRowKeyOptions<Row, Key> = UseViewOptions & {
 const TarstateContext = createContext<Store | undefined>(undefined);
 const emptyDeps: DependencyList = Object.freeze([]);
 
-export function TarstateProvider({ children, db, resetKey, store }: TarstateProviderProps) {
+export function TarstateProvider({ children, db, resetKey, store }: TarstateProviderProps): ReactElement {
   const ownedStore = useRef<{ readonly resetKey: string | number | undefined; readonly store: Store } | undefined>(undefined);
 
   if (store === undefined) {
@@ -201,7 +195,7 @@ export function useRow<Row, Key>(
 
 export function useQuery<Row>(
   query: Query<Row>,
-  options?: Omit<UseQueryOptions<Row, readonly Row[]>, 'select'>
+  options?: UseViewOptions
 ): QueryHookState<Row>;
 export function useQuery<Row, Selected>(
   query: Query<Row>,

@@ -4,9 +4,18 @@
   "version": "0.0.0",
   "license": "AGPL-3.0-only",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
   "exports": {
-    ".": "./src/index.ts",
-    "./presence": "./src/presence.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./presence": {
+      "types": "./dist/presence.d.ts",
+      "import": "./dist/presence.js"
+    }
   },
   "scripts": {
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",

@@ -80,6 +80,7 @@ export type AutomergeMapRuntime<
   readonly kind: 'automergeMapRuntime';
   readonly adapter: AutomergeMapAdapter<DocumentShape>;
   readonly relations: readonly RelationRef[];
+  readonly subscribe: (listener: () => void) => () => void;
 };
 
 export function automergeMapSource<
@@ -88,7 +89,6 @@ export function automergeMapSource<
   doc: Automerge.Doc<DocumentShape>,
   options: AutomergeMapSourceOptions
 ): AutomergeMapSource {
-  void doc;
   const relationNames = relationNamesFor(options.relations);
 
   return {
