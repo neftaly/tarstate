@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  aggregate,
   as,
   constRows,
+  count,
   createDb,
   desc,
   difference,
@@ -10,6 +12,7 @@ import {
   field,
   from,
   keyBy,
+  limit,
   maintainMaterializations,
   mat,
   materializationForQuery,
@@ -19,7 +22,9 @@ import {
   qRows,
   qualify,
   qualifyRow,
+  sort,
   sortLimit,
+  sum,
   union,
   intersection,
   value,
@@ -54,6 +59,18 @@ type QualifiedRowActiveUserRow = {
 type LiteralRow = {
   readonly id: string;
   readonly label: string;
+};
+
+type LiteralMetricRow = {
+  readonly id: string;
+  readonly team: string;
+  readonly points: number;
+};
+
+type LiteralMetricRollupRow = {
+  readonly team: string;
+  readonly items: number;
+  readonly points: number;
 };
 
 type UserTagRow = {
@@ -104,6 +121,12 @@ const pinnedRows: readonly LiteralRow[] = [
   { id: 'pin-b', label: 'Pinned B' }
 ];
 
+const metricRows: readonly LiteralMetricRow[] = [
+  { id: 'metric-a', team: 'eng', points: 3 },
+  { id: 'metric-b', team: 'design', points: 4 },
+  { id: 'metric-c', team: 'eng', points: 5 }
+];
+
 function activeUserRows(): Query<ActiveUserRow> {
   const user = as(coreSchema.users, 'user');
   return pipe(
@@ -132,6 +155,39 @@ function literalRowsQuery(): Query<LiteralRow> {
     constRows(pinnedRows),
     keyBy('id')
   ) as Query<LiteralRow>;
+}
+
+function literalMetricRollupsQuery(): Query<LiteralMetricRollupRow> {
+  const team = field<string>('metric', 'team');
+  const points = field<number>('metric', 'points');
+  return pipe(
+    constRows(metricRows),
+    aggregate({
+      groupBy: { team },
+      aggregates: {
+        items: count(),
+        points: sum(points)
+      }
+    }),
+    keyBy('team')
+  ) as Query<LiteralMetricRollupRow>;
+}
+
+function topLiteralMetricsQuery(): Query<LiteralMetricRow> {
+  const points = field<number>('metric', 'points');
+  return pipe(
+    constRows(metricRows),
+    sortLimit(2, desc(points))
+  ) as Query<LiteralMetricRow>;
+}
+
+function sortedLimitedLiteralMetricsQuery(): Query<LiteralMetricRow> {
+  const points = field<number>('metric', 'points');
+  return pipe(
+    constRows(metricRows),
+    sort(desc(points)),
+    limit(2)
+  ) as Query<LiteralMetricRow>;
 }
 
 function expandedUserTagsQuery(): Query<UserTagRow> {
@@ -356,6 +412,94 @@ describe('incremental materialization for pure structural operators', () => {
     });
     expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
     expect(materializedRowsForQuery(next, literalRows)).toEqual(pinnedRows);
+  });
+
+  it('builds constRows aggregate materializations incrementally and skips unrelated deltas unchanged', () => {
+    const literalRollups = literalMetricRollupsQuery();
+    const state = mat(createDb(sourceData), literalRollups, {
+      id: 'literal-rollups',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, literalRollups);
+
+    expect(metadata).toMatchObject({
+      id: 'literal-rollups',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      dependencies: []
+    });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, literalRollups)).toEqual([
+      { team: 'eng', items: 2, points: 8 },
+      { team: 'design', items: 1, points: 4 }
+    ]);
+
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, diaUser]
+    }) as typeof state;
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([diaUser], [])]
+    });
+    const change = singleMaterializationChange(maintained, 'literal-rollups');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 1 });
+    expect(change).toMatchObject({
+      update: 'skipped',
+      maintenance: 'incremental',
+      recomputed: false,
+      dependencies: [],
+      touchedDependencies: [],
+      rows: [
+        { team: 'eng', items: 2, points: 8 },
+        { team: 'design', items: 1, points: 4 }
+      ],
+      addedRows: [],
+      removedRows: [],
+      rowChanges: []
+    });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(materializedRowsForQuery(next, literalRollups)).toEqual(change.rows);
+  });
+
+  it('builds constRows sortLimit materializations incrementally with static row order', () => {
+    const topMetrics = topLiteralMetricsQuery();
+    const state = mat(createDb(sourceData), topMetrics, {
+      id: 'top-literal-metrics',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, topMetrics);
+
+    expect(metadata).toMatchObject({
+      id: 'top-literal-metrics',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      dependencies: []
+    });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, topMetrics)).toEqual([
+      { id: 'metric-c', team: 'eng', points: 5 },
+      { id: 'metric-b', team: 'design', points: 4 }
+    ]);
+
+    const sortedLimitedMetrics = sortedLimitedLiteralMetricsQuery();
+    const sortedLimitedState = mat(createDb(sourceData), sortedLimitedMetrics, {
+      id: 'sorted-limited-literal-metrics',
+      mode: 'incremental'
+    });
+    const sortedLimitedMetadata = materializationForQuery(sortedLimitedState, sortedLimitedMetrics);
+
+    expect(sortedLimitedMetadata).toMatchObject({
+      id: 'sorted-limited-literal-metrics',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      dependencies: []
+    });
+    expectNoIncrementalFallback(sortedLimitedMetadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(sortedLimitedState, sortedLimitedMetrics)).toEqual([
+      { id: 'metric-c', team: 'eng', points: 5 },
+      { id: 'metric-b', team: 'design', points: 4 }
+    ]);
   });
 
   it('incrementally maintains expand output rows affected by root inserts, updates, and deletes', () => {

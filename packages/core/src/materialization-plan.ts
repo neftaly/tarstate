@@ -2447,27 +2447,38 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
       return staticRowsRelationReason;
     case 'sort': {
       const shape = collectStaticRowsPlan(data.input);
-      return shape === staticRowsRelationReason
-        ? shape
-        : 'sort is not supported for static incremental maintenance';
+      if (typeof shape === 'string') return shape;
+      const reason = sortOrderReason(data.order, shape);
+      return reason === undefined ? shape : `sort order is not supported: ${reason}`;
     }
     case 'limit': {
       const shape = collectStaticRowsPlan(data.input);
-      return shape === staticRowsRelationReason
-        ? shape
-        : 'limit is not supported for static incremental maintenance';
+      if (typeof shape === 'string') return shape;
+      const window = normalizedWindow(data.count, data.offset ?? 0);
+      return typeof window === 'string' ? `limit is not supported: ${window}` : shape;
     }
     case 'sortLimit': {
       const shape = collectStaticRowsPlan(data.input);
-      return shape === staticRowsRelationReason
-        ? shape
-        : 'sortLimit is not supported for static incremental maintenance';
+      if (typeof shape === 'string') return shape;
+      const orderReason = sortOrderReason(data.order, shape);
+      if (orderReason !== undefined) {
+        return `sortLimit order is not supported: ${orderReason}`;
+      }
+      const window = normalizedWindow(data.count, 0);
+      return typeof window === 'string' ? `sortLimit is not supported: ${window}` : shape;
     }
     case 'aggregate': {
       const shape = collectStaticRowsPlan(data.input);
-      return shape === staticRowsRelationReason
-        ? shape
-        : 'aggregate is not supported for static incremental maintenance';
+      if (typeof shape === 'string') return shape;
+      const groupReason = simpleProjectionReason(data.groupBy) ?? projectionShapeReason(data.groupBy, shape);
+      if (groupReason !== undefined) {
+        return `aggregate groupBy projection is not supported: ${groupReason}`;
+      }
+      const aggregateReason = aggregateProjectionReason(data.aggregates, shape);
+      if (aggregateReason !== undefined) {
+        return `aggregate projection is not supported: ${aggregateReason}`;
+      }
+      return aggregateShape(shape, data.groupBy, data.aggregates);
     }
   }
 }
@@ -3389,15 +3400,34 @@ function evaluateStaticRows(
       if (!right.supported) return right;
       return { supported: true, rows: setDifferenceRows(left.rows, right.rows) };
     }
+    case 'sort': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? { supported: true, rows: sortStaticRows(input.rows, data.order, env) }
+        : input;
+    }
+    case 'limit': {
+      const input = evaluateStaticRows(data.input, env);
+      if (!input.supported) return input;
+      const offset = data.offset ?? 0;
+      return { supported: true, rows: input.rows.slice(offset, offset + data.count) };
+    }
+    case 'sortLimit': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? { supported: true, rows: sortStaticRows(input.rows, data.order, env).slice(0, data.count) }
+        : input;
+    }
+    case 'aggregate': {
+      const input = evaluateStaticRows(data.input, env);
+      return input.supported
+        ? { supported: true, rows: aggregateStaticRows(input.rows, data.groupBy, data.aggregates, env) }
+        : input;
+    }
     case 'from':
     case 'lookup':
     case 'join':
       return { supported: false, reason: staticRowsRelationReason };
-    case 'sort':
-    case 'limit':
-    case 'sortLimit':
-    case 'aggregate':
-      return { supported: false, reason: `${data.op} is not supported for static incremental maintenance` };
   }
 }
 
@@ -3498,6 +3528,60 @@ function setDifferenceRows(
 ): readonly Record<string, unknown>[] {
   const rightKeys = new Set(right.map((row) => stableKey(row)));
   return left.filter((row) => !rightKeys.has(stableKey(row)));
+}
+
+function sortStaticRows(
+  rows: readonly Record<string, unknown>[],
+  order: readonly SortData[],
+  env: Readonly<Record<string, unknown>>
+): readonly Record<string, unknown>[] {
+  return rows.map((row, index) => ({
+    row,
+    index,
+    values: order.map((item) => exprValue(row, item.expr, env))
+  })).sort((left, right) => {
+    for (let index = 0; index < order.length; index += 1) {
+      const item = order[index] as SortData;
+      const comparison = compareSortValues(
+        left.values[index],
+        right.values[index],
+        item.direction,
+        item.nulls
+      );
+      if (comparison !== 0) {
+        return comparison;
+      }
+    }
+    return left.index - right.index;
+  }).map((item) => item.row);
+}
+
+function aggregateStaticRows(
+  rows: readonly Record<string, unknown>[],
+  groupBy: ProjectionData,
+  aggregates: ProjectionData,
+  env: Readonly<Record<string, unknown>>
+): readonly Record<string, unknown>[] {
+  const groups = new Map<string, { readonly group: Record<string, unknown>; readonly rows: Record<string, unknown>[] }>();
+
+  for (const row of rows) {
+    const group = projectRow(row, groupBy, env);
+    const key = stableKey(group);
+    const existing = groups.get(key);
+    if (existing === undefined) {
+      groups.set(key, { group, rows: [row] });
+    } else {
+      existing.rows.push(row);
+    }
+  }
+
+  if (groups.size === 0 && Object.keys(groupBy).length === 0) {
+    groups.set(stableKey({}), { group: {}, rows: [] });
+  }
+
+  return Array.from(groups.values()).map(({ group, rows: groupRows }) =>
+    evaluateAggregateRow({ kind: 'aggregate', groupBy, aggregates }, group, groupRows, env)
+  );
 }
 
 type DynamicSetBranchSummary = {
