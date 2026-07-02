@@ -243,7 +243,8 @@ describe('Relic public TypeScript API contract', () => {
     expectTypeOf(attached).toMatchTypeOf<Db & ConstrainedDb>();
     expect(constrained.constraints.map((constraint) => constraint.op)).toEqual(['req', 'fk', 'unique', 'check']);
 
-    if (false) {
+    const typeOnly = false as boolean;
+    if (typeOnly) {
       // @ts-expect-error relation constraints only accept fields from the relation row.
       req(coreSchema.users, 'missing');
       // @ts-expect-error relation unique constraints only accept fields from the relation row.
@@ -299,7 +300,7 @@ describe('Relic public TypeScript API contract', () => {
     ) satisfies Query<UserLabelRow>;
     const rows = qRows(createDb(sourceData), query, {
       env: { suffix: 'core' },
-      functions: { label: (name, suffix) => `${name}:${suffix}` }
+      functions: { label: (name, suffix) => `${String(name)}:${String(suffix)}` }
     });
 
     expectTypeOf(labelCall).toEqualTypeOf<ExprData<string>>();
