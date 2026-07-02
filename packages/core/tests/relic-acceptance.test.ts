@@ -69,6 +69,7 @@ import {
   sum,
   top,
   topBy,
+  trackRuntimeCommit,
   trackTransact,
   transact,
   tryTransactConstrained,
@@ -1243,6 +1244,66 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
   });
 
+  it('treats a single function argument as a transaction input in trackTransact', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) as Query<{ readonly id: string; readonly name: string }>;
+    const state = watch(createDb(sourceData), activeUsers, coreSchema.users);
+
+    const tracked = await trackTransact(state, (tx: DbTransactionContext) =>
+      tx.insert(coreSchema.users, {
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      })
+    );
+
+    expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
+    expect(tracked.changesByTargetKey.get(queryKey(activeUsers))).toMatchObject({
+      addedRows: [{ id: 'dia', name: 'Dia' }],
+      removedRows: []
+    });
+    expect(tracked.changesByQueryKey[queryKey(activeUsers)]).toMatchObject({
+      addedRows: [{ id: 'dia', name: 'Dia' }],
+      removedRows: []
+    });
+    expect(tracked.changesByTargetKey.get(watchTargetKey(coreSchema.users))).toMatchObject({
+      addedRows: [{
+        id: 'dia',
+        teamId: 'eng',
+        name: 'Dia',
+        active: true,
+        age: 24,
+        tags: []
+      }]
+    });
+  });
+
+  it('uses product diagnostics for unsupported runtime tracking inputs', async () => {
+    const tracked = await trackTransact({} as Db, insert(coreSchema.users, adaUser));
+    const committed = await trackRuntimeCommit({}, []);
+
+    for (const result of [tracked, committed]) {
+      expect(result).toMatchObject({
+        supported: false,
+        diagnostics: [
+          expect.objectContaining({
+            code: 'change_tracking_unsupported',
+            message: 'change tracking is not available for this database or runtime value'
+          })
+        ]
+      });
+      expect(result.diagnostics[0]?.message).not.toMatch(/implementation has been removed|regenerate/i);
+    }
+  });
+
   it('accepts transaction-shaped environment updates', async () => {
     const user = as(coreSchema.users, 'user');
     const olderThanMinimum = pipe(
@@ -1655,7 +1716,7 @@ describe('TypeScript Relic core acceptance', () => {
       committed: true,
       deltas,
       diagnostics: []
-    }));
+    }), { mode: 'callback' });
 
     expect(tracked.changes).toHaveLength(2);
     expect(tracked.changeMap.get(coreSchema.users)).toMatchObject({

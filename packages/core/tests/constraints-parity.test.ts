@@ -14,6 +14,7 @@ import {
   fk,
   from,
   gt,
+  hostCall,
   insert,
   insertOrMerge,
   insertOrReplace,
@@ -674,7 +675,7 @@ describe('Relic-style constraints', () => {
       .toThrow(/expression|unsupported|unique|project/i);
   });
 
-  it('rejects function-shaped query constraints explicitly instead of silently passing', async () => {
+  it('keeps named query functions unsupported without a registry', async () => {
     const namedFunctionProjection = pipe(
       from(member),
       project({
@@ -702,17 +703,20 @@ describe('Relic-style constraints', () => {
       })]
     });
     await expect(qRows(namedResult.db, schema.members)).resolves.toEqual([ann, bob, cy]);
+  });
 
+  it('evaluates direct hostCall expressions in query-bound constraints', async () => {
+    const normalizeEmail = (email: string) => email.toLowerCase();
     const hostFunctionProjection = pipe(
       from(member),
       project({
         id: member.id,
-        normalizedEmail: call((email: string) => email.toLowerCase(), member.email)
+        normalizedEmail: hostCall(normalizeEmail, member.email)
       })
     );
     const hostFunctionDb = mat(baseDb(), constrain(unique(hostFunctionProjection, 'normalizedEmail')));
 
-    const hostResult = tryTransact(hostFunctionDb, insert(schema.members, {
+    const hostPass = tryTransact(hostFunctionDb, insert(schema.members, {
       id: 'dee',
       teamId: 'a',
       email: 'DEE@example.test',
@@ -720,16 +724,82 @@ describe('Relic-style constraints', () => {
       age: 28
     }));
 
-    expect(hostResult).toMatchObject({
+    expect(hostPass).toMatchObject({
+      committed: true,
+      diagnostics: []
+    });
+    await expect(qRows(hostPass.db, schema.members)).resolves.toEqual([
+      ann,
+      bob,
+      cy,
+      {
+        id: 'dee',
+        teamId: 'a',
+        email: 'DEE@example.test',
+        active: true,
+        age: 28
+      }
+    ]);
+
+    const hostFail = tryTransact(hostFunctionDb, insert(schema.members, {
+      id: 'ann-copy',
+      teamId: 'a',
+      email: 'ANN@example.test',
+      active: true,
+      age: 29
+    }));
+
+    expect(hostFail).toMatchObject({
       committed: false,
       db: hostFunctionDb,
       applied: 0,
       diagnostics: [expect.objectContaining({
-        code: 'unsupported_expression',
-        message: expect.stringMatching(/host function/i)
+        code: 'constraint_unique',
+        field: 'normalizedEmail'
       })]
     });
-    await expect(qRows(hostResult.db, schema.members)).resolves.toEqual([ann, bob, cy]);
+    expect(hostFail.diagnostics).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'unsupported_expression' })
+    ]));
+    await expect(qRows(hostFail.db, schema.members)).resolves.toEqual([ann, bob, cy]);
+
+    const isAdult = (age: number) => age >= 18;
+    const hostCheckDb = mat(baseDb(), constrain(
+      check(activeMembers, eq(hostCall(isAdult, field<number>('member', 'age')), true))
+    ));
+
+    const checkPass = tryTransact(hostCheckDb, insert(schema.members, {
+      id: 'elder',
+      teamId: 'a',
+      email: 'elder@example.test',
+      active: true,
+      age: 64
+    }));
+    expect(checkPass).toMatchObject({
+      committed: true,
+      diagnostics: []
+    });
+
+    const checkFail = tryTransact(hostCheckDb, insert(schema.members, {
+      id: 'young',
+      teamId: 'a',
+      email: 'young@example.test',
+      active: true,
+      age: 16
+    }));
+    expect(checkFail).toMatchObject({
+      committed: false,
+      db: hostCheckDb,
+      applied: 0,
+      diagnostics: [expect.objectContaining({
+        code: 'constraint_check',
+        relation: expect.stringContaining('query:')
+      })]
+    });
+    expect(checkFail.diagnostics).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'unsupported_expression' })
+    ]));
+    await expect(qRows(checkFail.db, schema.members)).resolves.toEqual([ann, bob, cy]);
   });
 
   it('cascades direct relation foreign-key deletes and rejects unsupported cascade modes', async () => {

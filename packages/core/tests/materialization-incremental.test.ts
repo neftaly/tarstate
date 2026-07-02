@@ -4742,7 +4742,7 @@ describe('incremental materialization', () => {
       db: materializedNext,
       deltas: [delta],
       materializations
-    }));
+    }), { mode: 'callback' });
 
     expect(ownerTasks.length).toBeGreaterThan(1);
     expect(ownerTasks.length).toBeLessThan(data.tasks.length);
@@ -5813,7 +5813,7 @@ describe('incremental materialization', () => {
       db: materializedNext,
       deltas: [delta],
       materializations
-    }));
+    }), { mode: 'callback' });
     const materializedChange = singleMaterializationChange(materializations, 'active-users');
     const trackedChange = tracked.changes.find((change) => change.id === 'active-users');
 

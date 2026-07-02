@@ -1,5 +1,5 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
-import { tryTransact, type Db, type DbTransactionInput, type DbTransactionInputs, type DbTransactionResult } from './db.js';
+import { tryTransact, type Db, type DbTransactionInput, type DbTransactionResult } from './db.js';
 import type { RelationDelta } from './delta.js';
 import {
   isRelationAdapter,
@@ -33,6 +33,7 @@ export type TrackTransactCallback<Db extends WatchDb, Result extends TrackTransa
   (db: Db) => Result | Promise<Result>;
 export type TrackTransactOptions = {
   readonly label?: string;
+  readonly mode?: 'transaction' | 'callback';
   readonly throwOnUnsupported?: boolean;
 };
 export type TrackTransactChangeView<Row = unknown> = {
@@ -126,11 +127,11 @@ export class UnsupportedChangeTrackingError extends Error {
 export function trackTransact<Db extends WatchDb, Result extends TrackTransactOutput<Db>>(
   db: Db,
   transact: TrackTransactCallback<Db, Result>,
-  options?: TrackTransactOptions
+  options: TrackTransactOptions & { readonly mode: 'callback' }
 ): Promise<TrackTransactResult<Db>>;
 export function trackTransact(
   db: Db,
-  ...inputs: DbTransactionInputs
+  ...inputs: readonly (DbTransactionInput | TrackTransactOptions)[]
 ): Promise<TrackTransactResult<Db>>;
 export async function trackTransact(
   db: WatchDb,
@@ -138,7 +139,7 @@ export async function trackTransact(
   ...rest: readonly unknown[]
 ): Promise<TrackTransactResult<WatchDb>> {
   const typedRest = rest as readonly (DbTransactionInput | TrackTransactOptions)[];
-  if (transactOrInput === undefined || typeof transactOrInput !== 'function' || isWriteTransactionInput(typedRest)) {
+  if (!isCallbackTrackTransactCall(transactOrInput, typedRest)) {
     const args = (transactOrInput === undefined ? rest : [transactOrInput, ...rest]) as readonly (
       DbTransactionInput | TrackTransactOptions
     )[];
@@ -321,23 +322,32 @@ function isDb(input: WatchDb): input is Db {
   return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
 }
 
-function isWriteTransactionInput(inputs: readonly (DbTransactionInput | TrackTransactOptions)[]): boolean {
-  return inputs.some((input) => !isTrackTransactOptions(input));
-}
-
 function isTrackTransactOptions(input: DbTransactionInput | TrackTransactOptions): input is TrackTransactOptions {
   return typeof input === 'object' &&
     input !== null &&
     !('op' in input) &&
     !(Symbol.iterator in input) &&
-    ('label' in input || 'throwOnUnsupported' in input);
+    ('label' in input || 'mode' in input || 'throwOnUnsupported' in input);
+}
+
+function isCallbackTrackTransactCall(
+  transactOrInput: unknown,
+  rest: readonly (DbTransactionInput | TrackTransactOptions)[]
+): boolean {
+  return typeof transactOrInput === 'function' &&
+    rest.length === 1 &&
+    isTrackTransactOptions(rest[0]!) &&
+    rest[0]!.mode === 'callback';
 }
 
 function unsupportedDiagnostic(): WatchDiagnostic {
   return {
     code: 'change_tracking_unsupported',
-    message: 'runtime tracking implementation has been removed; regenerate this API implementation',
-    surface: 'changeTracking'
+    message: 'change tracking is not available for this database or runtime value',
+    surface: 'changeTracking',
+    detail: {
+      reason: 'expected a Tarstate database, relation runtime, or relation adapter with tracking support'
+    }
   };
 }
 

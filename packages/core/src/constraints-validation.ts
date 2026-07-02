@@ -540,12 +540,36 @@ function exprValue(row: unknown, expr: ExprData, state: ConstraintExpressionStat
       return value;
     }
     case 'hostCall':
-      pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
-        `host function ${expr.name} cannot be validated synchronously in constraints`,
-        state.relation,
-        expr
-      ));
-      return undefined;
+      if (expr.fn === undefined) {
+        pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+          `host function ${expr.name} is not available for constraint validation`,
+          state.relation,
+          expr
+        ));
+        return undefined;
+      }
+
+      try {
+        const args = expr.args.map((arg) => exprValue(row, arg, state));
+        const value = expr.fn(...args);
+        if (isPromiseLike(value)) {
+          pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+            `host function ${expr.name} returned a Promise and cannot be validated synchronously`,
+            state.relation,
+            expr
+          ));
+          return undefined;
+        }
+
+        return value;
+      } catch {
+        pushUnsupportedExpressionDiagnostic(state, unsupportedExpressionDiagnostic(
+          `host function ${expr.name} failed during constraint validation`,
+          state.relation,
+          expr
+        ));
+        return undefined;
+      }
     case 'field': {
       return readField(asRecord(row), expr.alias, expr.field);
     }
