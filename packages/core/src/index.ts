@@ -42,6 +42,7 @@ export {
   qManyRows,
   qRows,
   row,
+  setEnvTx,
   stripMeta,
   transact,
   tryTransact,
@@ -57,6 +58,8 @@ export type {
   DbInputEnv,
   DbOptions,
   DbQueryOptions,
+  DbEnvUpdate,
+  DbTransactionItem,
   DbTransactionBuilder,
   DbTransactionContext,
   DbTransactionInput,
@@ -69,7 +72,8 @@ export type {
   MappedQueryBatchRows,
   QueryBatch,
   QueryBatchResult,
-  QueryBatchRows
+  QueryBatchRows,
+  SetEnvTransaction
 } from './db.js';
 export { evaluate } from './evaluate.js';
 export type { EvaluateEnv, EvaluateFunction, EvaluateFunctions, EvaluateOptions, QueryResult } from './evaluate.js';
@@ -211,6 +215,7 @@ export {
   gt,
   gte,
   hash,
+  hostCall,
   intersection,
   join,
   keyBy,
@@ -261,6 +266,7 @@ export type {
   ExpandOptions,
   ExprData,
   ExprInput,
+  HostExpressionFunction,
   NullSortOrder,
   OptionalProjection,
   PredicateData,
@@ -321,9 +327,11 @@ export type {
   TrackRuntimeCommitSupportedResult,
   TrackRuntimeCommitUnsupportedResult,
   TrackTransactCallback,
+  TrackTransactChangeView,
   TrackTransactDiagnostic,
   TrackTransactOptions,
   TrackTransactOutput,
+  TrackTransactQueryChanges,
   TrackTransactResult
 } from './runtime.js';
 export {

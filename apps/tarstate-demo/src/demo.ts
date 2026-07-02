@@ -1073,7 +1073,7 @@ await transact(insert(schema.decisions, {
       codeBlock(`constrain(
   fk(offers, 'propertyId', properties, 'id'),
   fk(offers, 'buyerId', buyers, 'id'),
-  check(offers, amount > 0),
+  check(offerConstraintRowsQuery, gt(field('offer', 'amount'), value(0))),
   unique(decisions, 'offerId')
 )`),
       actionRow(actionButton('invalid-offer', 'Try offer after accepted sale', () => void runInvalid())),

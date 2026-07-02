@@ -594,8 +594,20 @@ export function call<Value = unknown>(
   ...args: readonly ExprInput[]
 ): ExprData<Value> {
   return typeof nameOrFn === 'function'
-    ? hostCall(nameOrFn, args)
+    ? createHostCall(nameOrFn, args)
     : { op: 'call', name: nameOrFn, args: args.map(expr) };
+}
+
+/** Build an expression call backed directly by a host function. */
+export function hostCall<const Args extends readonly ExprInput[], Value>(
+  fn: (...args: TupleValues<Args>) => Value,
+  ...args: Args
+): ExprData<Value>;
+export function hostCall<Value = unknown>(
+  fn: HostExpressionFunction<Value>,
+  ...args: readonly ExprInput[]
+): ExprData<Value> {
+  return createHostCall(fn, args);
 }
 
 /** Build a tuple expression. */
@@ -1121,7 +1133,7 @@ function isOptionalProjection(input: ExprData | OptionalProjection): input is Op
 const hostFunctionIds = new WeakMap<HostExpressionFunction, string>();
 let nextHostFunctionId = 0;
 
-function hostCall<Value>(fn: HostExpressionFunction<Value>, args: readonly ExprInput[]): ExprData<Value> {
+function createHostCall<Value>(fn: HostExpressionFunction<Value>, args: readonly ExprInput[]): ExprData<Value> {
   const output = {
     op: 'hostCall',
     id: stableHostFunctionId(fn),

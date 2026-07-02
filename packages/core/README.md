@@ -71,7 +71,8 @@ The core API is stabilizing around a Relic-shaped split:
   Incremental aggregate maintenance supports a narrow subset; `avg(expr)` is
   incremental only when matching visible `sum(expr)`/`count(expr)` fields are
   present over a non-null numeric base field or numeric literal. Named
-  `call(...)` functions are deterministic evaluate-time expressions;
+  `call('name', ...)` functions are deterministic evaluate-time expressions;
+  direct host functions use `hostCall(fn, ...)` or the `call(fn, ...)` overload.
   materialized/incremental paths keep diagnostics and fallback unless a function
   registry exists. Adapter-fed invalidations, async watch streams, and public IVM
   APIs are outside the current guarantees.

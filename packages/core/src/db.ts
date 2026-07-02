@@ -30,7 +30,7 @@ import {
   insertOrUpdate as writeInsertOrUpdate,
   replaceAll as writeReplaceAll,
   updateWhere as writeUpdateWhere,
-  writeInputPatches,
+  isWritePatch,
   type DeleteByKeyPatch,
   type DeleteExactPatch,
   type DeletePatch,
@@ -164,10 +164,16 @@ export type DbTransactionBuilder = {
   ) => ReplaceAllPatch<Relation>;
 };
 export type DbTransactionContext = Db & DbTransactionBuilder;
+export type DbEnvUpdate = DbInputEnv | ((env: DbEnv, db: Db) => DbInputEnv);
+export type SetEnvTransaction = {
+  readonly op: 'setEnv';
+  readonly env: DbEnvUpdate;
+};
+export type DbTransactionItem = WriteInput | SetEnvTransaction | Iterable<WritePatch | SetEnvTransaction>;
 export type DbTransactionInput =
-  | WriteInput
-  | ((_db: DbTransactionContext) => WriteInput)
-  | ((_tx: DbTransactionContext, db: Db) => WriteInput);
+  | DbTransactionItem
+  | ((_db: DbTransactionContext) => DbTransactionItem)
+  | ((_tx: DbTransactionContext, db: Db) => DbTransactionItem);
 export type DbTransactionInputs = readonly DbTransactionInput[];
 export type DbWritePredicate<Relation extends RelationRef> = (
   row: RelationRow<Relation>,
@@ -297,6 +303,10 @@ export function getEnv(db: Db): DbEnv {
 
 export function updateEnv(db: Db, update: (env: DbEnv) => DbInputEnv): Db {
   return withEnv(db, update(db.env));
+}
+
+export function setEnvTx(env: DbEnvUpdate): SetEnvTransaction {
+  return { op: 'setEnv', env };
 }
 
 export function q<Row, MappedRow, Rows>(
@@ -544,9 +554,9 @@ export function tryTransactWithConstraints(
   constraints: ConstraintValidationInput,
   ...inputs: DbTransactionInputs
 ): DbTransactionResult {
-  const patches = transactionPatches(db, inputs);
+  const transaction = transactionPlan(db, inputs);
   const constraintData = constraintDataList(constraints);
-  const result = dbEngineFor(db).transact(patches, { constraints: constraintData });
+  const result = dbEngineFor(db).transact(transaction.patches, { constraints: constraintData });
   if (!result.committed) {
     return {
       db,
@@ -558,7 +568,7 @@ export function tryTransactWithConstraints(
     };
   }
 
-  const nextDb = dbFromEngine(result.engine, db.env);
+  const nextDb = dbFromEngine(result.engine, transaction.env);
   transferConstraintAttachments(db, nextDb);
   const validation = validateAttachedConstraintsSync(nextDb);
   if (!validation.valid) {
@@ -572,7 +582,10 @@ export function tryTransactWithConstraints(
     };
   }
 
-  const materializations = maintainMaterializations(db, nextDb, { deltas: result.deltas });
+  const materializations = maintainMaterializations(db, nextDb, {
+    deltas: result.deltas,
+    envDeltas: transaction.envDeltas
+  });
   transferWatches(db, nextDb);
 
   return {
@@ -586,11 +599,45 @@ export function tryTransactWithConstraints(
   };
 }
 
-function transactionPatches(db: Db, inputs: DbTransactionInputs): readonly WritePatch[] {
+function transactionPlan(
+  db: Db,
+  inputs: DbTransactionInputs
+): {
+  readonly patches: readonly WritePatch[];
+  readonly env: DbInputEnv;
+  readonly envDeltas: readonly MaterializationEnvDelta[];
+} {
   const context = transactionContext(db);
-  return inputs.flatMap((input) =>
-    Array.from(writeInputPatches(typeof input === 'function' ? input(context, db) : input))
-  );
+  const patches: WritePatch[] = [];
+  let env: DbInputEnv = db.env;
+
+  const append = (input: DbTransactionItem | WritePatch | SetEnvTransaction): void => {
+    if (isSetEnvTransaction(input)) {
+      env = typeof input.env === 'function' ? input.env(env, db) : input.env;
+      return;
+    }
+
+    if (isWritePatch(input)) {
+      patches.push(input);
+      return;
+    }
+
+    if (isIterable(input)) {
+      for (const item of input) {
+        append(item);
+      }
+    }
+  };
+
+  for (const input of inputs) {
+    append(typeof input === 'function' ? input(context, db) : input);
+  }
+
+  return {
+    patches,
+    env,
+    envDeltas: dbEnvDeltas(db.env, env)
+  };
 }
 
 function evaluateOptions(db: Db, options: EvaluateOptions): EvaluateOptions {
@@ -718,6 +765,7 @@ function splitWhatIfArgs(
 function isQueryOptions(input: DbTransactionInput | DbQueryOptions): input is DbQueryOptions {
   return isRecord(input) &&
     !isWritePatchLike(input) &&
+    !isSetEnvTransaction(input) &&
     ('env' in input || 'functions' in input || 'mapRows' in input || 'sort' in input || 'rsort' in input || 'into' in input);
 }
 
@@ -836,6 +884,14 @@ function sortToken(value: unknown): string {
 
 function isWritePatchLike(input: unknown): input is WritePatch {
   return isRecord(input) && typeof input.op === 'string' && 'relation' in input;
+}
+
+function isIterable(input: unknown): input is Iterable<WritePatch | SetEnvTransaction> {
+  return typeof input === 'object' && input !== null && Symbol.iterator in input;
+}
+
+function isSetEnvTransaction(input: unknown): input is SetEnvTransaction {
+  return isRecord(input) && input.op === 'setEnv' && 'env' in input;
 }
 
 function isQuery(input: unknown): input is Query {

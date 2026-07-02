@@ -35,6 +35,18 @@ export type TrackTransactOptions = {
   readonly label?: string;
   readonly throwOnUnsupported?: boolean;
 };
+export type TrackTransactChangeView<Row = unknown> = {
+  readonly targetKey: string;
+  readonly target: QueryChangeTarget<Row>;
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly addedRows: readonly Row[];
+  readonly deletedRows: readonly Row[];
+  readonly removedRows: readonly Row[];
+  readonly rowChanges: TrackedChange<Row>['rowChanges'];
+};
+export type TrackTransactQueryChanges<Row = unknown> = Readonly<Record<string, TrackTransactChangeView<Row>>>;
 export type TrackRuntimeCommitOptions = TrackTransactOptions & {
   readonly readVersion?: boolean;
 };
@@ -47,11 +59,13 @@ export type TrackTransactResult<Db extends WatchDb = WatchDb> = {
   readonly changeMap: WatchChangeMap;
   readonly changesByTarget: WatchChangeMap;
   readonly changesByTargetKey: WatchChangeKeyMap;
+  readonly changesByQueryKey: TrackTransactQueryChanges;
   readonly deltas: readonly RelationDelta[];
   readonly materializations?: MaterializationMaintenanceResult;
   readonly diagnostics: readonly TrackTransactDiagnostic[];
   readonly label?: string;
 };
+type QueryChangeTarget<Row = unknown> = TrackedChange<Row>['target'];
 export type TrackRuntimeCommitStatus = 'accepted' | 'partial' | 'rejected';
 type TrackRuntimeCommitResultBase<Version = unknown> = {
   readonly kind: 'trackRuntimeCommit';
@@ -143,6 +157,7 @@ export async function trackTransact(
         changeMap: watchChangeMap([]),
         changesByTarget: watchChangeMap([]),
         changesByTargetKey: watchChangeKeyMap([]),
+        changesByQueryKey: {},
         deltas: [],
         diagnostics: [diagnostic],
         ...(options?.label === undefined ? {} : { label: options.label })
@@ -163,6 +178,7 @@ export async function trackTransact(
       changeMap: watchChangeMap(tracked.changes),
       changesByTarget: watchChangeMap(tracked.changes),
       changesByTargetKey: watchChangeKeyMap(tracked.changes),
+      changesByQueryKey: trackChangeViewsByQueryKey(tracked.changes),
       deltas: result.deltas,
       ...(result.materializations === undefined ? {} : { materializations: result.materializations }),
       diagnostics: uniqueDiagnostics([...result.diagnostics, ...tracked.diagnostics])
@@ -194,6 +210,7 @@ export async function trackTransact(
     changeMap: watchChangeMap(changes),
     changesByTarget: watchChangeMap(changes),
     changesByTargetKey: watchChangeKeyMap(changes),
+    changesByQueryKey: trackChangeViewsByQueryKey(changes),
     deltas: envelope ? output.deltas ?? [] : [],
     ...(envelope && output.materializations !== undefined ? { materializations: output.materializations } : {}),
     diagnostics: uniqueDiagnostics([...(envelope ? output.diagnostics ?? [] : []), ...tracked.diagnostics]),
@@ -360,6 +377,26 @@ function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChan
     ],
     diagnostics: []
   }));
+}
+
+function trackChangeViewsByQueryKey(changes: readonly TrackedChange[]): TrackTransactQueryChanges {
+  return Object.fromEntries(changes
+    .filter((change) => isQueryTarget(change.target))
+    .map((change) => [change.targetKey, {
+      targetKey: change.targetKey,
+      target: change.target,
+      added: change.added,
+      deleted: change.deleted,
+      removed: change.removedRows,
+      addedRows: change.addedRows,
+      deletedRows: change.deletedRows,
+      removedRows: change.removedRows,
+      rowChanges: change.rowChanges
+    }]));
+}
+
+function isQueryTarget(target: TrackedChange['target']): boolean {
+  return typeof target === 'object' && target !== null && 'data' in target && 'relations' in target;
 }
 
 function uniqueDiagnostics<Diagnostic extends TrackTransactDiagnostic>(

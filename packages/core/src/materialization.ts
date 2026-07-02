@@ -465,24 +465,50 @@ export function mat<Db extends SnapshotMaterializationTarget, Row>(
 ): Db & MaterializedDb;
 export function mat<Db extends SnapshotMaterializationTarget>(
   db: Db,
+  ...queries: readonly [Query, Query, ...Query[]]
+): Db & MaterializedDb;
+export function mat<Db extends SnapshotMaterializationTarget>(
+  db: Db,
   queries: MaterializationQueryBatch,
   options?: SnapshotMaterializationOptions
 ): Db & MaterializedDb;
 export function mat<Db extends object, Row>(
   db: Db,
   queryOrConstraints: Query<Row> | MaterializationQueryBatch | ConstraintAttachmentInput,
-  options: SnapshotMaterializationOptions = {}
+  optionsOrQuery: SnapshotMaterializationOptions | Query = {},
+  ...queries: readonly Query[]
 ): Db {
   if (isConstraintAttachmentInput(queryOrConstraints)) {
     return attachConstraints(db, queryOrConstraints);
   }
 
   if (isQuery(queryOrConstraints)) {
-    return materializeDbSnapshot(db as Db & SnapshotMaterializationTarget, queryOrConstraints, options);
+    const queryList = [
+      queryOrConstraints,
+      ...(isQuery(optionsOrQuery) ? [optionsOrQuery] : []),
+      ...queries
+    ];
+    if (queryList.length > 1) {
+      return materializeDbSnapshots(
+        db as Db & SnapshotMaterializationTarget,
+        materializationBatchFromQueries(queryList),
+        {}
+      );
+    }
+
+    return materializeDbSnapshot(
+      db as Db & SnapshotMaterializationTarget,
+      queryOrConstraints,
+      isQuery(optionsOrQuery) ? {} : optionsOrQuery
+    );
   }
 
   if (isQueryBatch(queryOrConstraints)) {
-    return materializeDbSnapshots(db as Db & SnapshotMaterializationTarget, queryOrConstraints, options);
+    return materializeDbSnapshots(
+      db as Db & SnapshotMaterializationTarget,
+      queryOrConstraints,
+      isQuery(optionsOrQuery) ? {} : optionsOrQuery
+    );
   }
 
   return attachConstraints(db, queryOrConstraints as ConstraintAttachmentInput);
@@ -871,8 +897,16 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
   };
 }
 
-export function demat<Db extends MaterializableDb>(db: Db, target?: string | Query | MaterializationMetadata): Db {
-  if (target === undefined) {
+export function demat<Db extends MaterializableDb>(db: Db): Db;
+export function demat<Db extends MaterializableDb>(
+  db: Db,
+  ...targets: readonly [string | Query | MaterializationMetadata, ...(string | Query | MaterializationMetadata)[]]
+): Db;
+export function demat<Db extends MaterializableDb>(
+  db: Db,
+  ...targets: readonly (string | Query | MaterializationMetadata)[]
+): Db {
+  if (targets.length === 0) {
     materializedDbs.delete(db);
     materializationStore.delete(db);
     return db;
@@ -883,13 +917,15 @@ export function demat<Db extends MaterializableDb>(db: Db, target?: string | Que
     return db;
   }
 
-  const stored = resolveMaterialization(db, target);
-  if (stored === undefined) {
-    return db;
-  }
+  for (const target of targets) {
+    const stored = resolveMaterialization(db, target);
+    if (stored === undefined) {
+      continue;
+    }
 
-  store.delete(stored.metadata.id);
-  store.delete(stored.metadata.queryKey);
+    store.delete(stored.metadata.id);
+    store.delete(stored.metadata.queryKey);
+  }
   if (store.size === 0) {
     materializedDbs.delete(db);
     materializationStore.delete(db);
@@ -1097,6 +1133,14 @@ function materializedRangeRowsFor<Row>(
 
 export function index<Row = unknown>(
   input: unknown,
+  target: Query<Row> | MaterializationMetadata<Row>
+):
+  | MaterializationIndexResult<Row>
+  | MaterializationHashIndexResult<Row, unknown>
+  | MaterializationBtreeIndexResult<Row, unknown>
+  | MaterializationUniqueIndexResult<Row, unknown>;
+export function index<Row = unknown>(
+  input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
   options?: { readonly kind?: 'set' }
 ): MaterializationIndexResult<Row>;
@@ -1118,33 +1162,34 @@ export function index<Row = unknown, Value = unknown>(
 export function index<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
-  options: MaterializationIndexOptions = {}
+  options?: MaterializationIndexOptions
 ):
   | MaterializationIndexResult<Row>
   | MaterializationHashIndexResult<Row, Value>
   | MaterializationBtreeIndexResult<Row, Value>
   | MaterializationUniqueIndexResult<Row, Value> {
   const stored = resolveMaterialization(input, target);
+  const resolvedOptions = options ?? inferredIndexOptions(stored, target);
   if (stored === undefined) {
-    return missingIndexResult<Row, Value>(options.kind);
+    return missingIndexResult<Row, Value>(resolvedOptions.kind);
   }
 
-  const directExpression = directExpressionIndexExpression(options);
+  const directExpression = directExpressionIndexExpression(resolvedOptions);
   if (directExpression !== undefined) {
     return unsupportedDirectExpressionIndexResult<Row, Value>(
       stored,
-      options.kind as 'hash' | 'btree' | 'unique',
+      resolvedOptions.kind as 'hash' | 'btree' | 'unique',
       directExpression
     );
   }
 
-  switch (options.kind) {
+  switch (resolvedOptions.kind) {
     case 'hash':
-      return hashIndexResult<Row, Value>(stored, indexFields(options));
+      return hashIndexResult<Row, Value>(stored, indexFields(resolvedOptions));
     case 'btree':
-      return btreeIndexResult<Row, Value>(stored, indexFields(options));
+      return btreeIndexResult<Row, Value>(stored, indexFields(resolvedOptions));
     case 'unique':
-      return uniqueIndexResult<Row, Value>(stored, indexFields(options));
+      return uniqueIndexResult<Row, Value>(stored, indexFields(resolvedOptions));
     default:
       return setIndexResult(stored);
   }
@@ -1161,6 +1206,36 @@ function setIndexResult<Row>(stored: StoredMaterialization<Row>): Materializatio
     raw: rows,
     index: setIndex(rows)
   }));
+}
+
+function inferredIndexOptions(
+  stored: StoredMaterialization | undefined,
+  target: string | Query | MaterializationMetadata
+): MaterializationIndexOptions {
+  if (stored === undefined || typeof target === 'string') {
+    return {};
+  }
+
+  const inferred = stored.metadata.indexSpecs
+    .filter((spec): spec is Exclude<MaterializationIndexSpec, { readonly kind: 'set' }> => spec.kind !== 'set')
+    .map((spec) => ({ spec, fields: indexSpecFields(spec) }))
+    .filter((entry): entry is {
+      readonly spec: Exclude<MaterializationIndexSpec, { readonly kind: 'set' }>;
+      readonly fields: readonly [string, ...string[]];
+    } => entry.fields !== undefined);
+
+  if (inferred.length !== 1) {
+    return {};
+  }
+
+  const { spec, fields } = inferred[0] as {
+    readonly spec: Exclude<MaterializationIndexSpec, { readonly kind: 'set' }>;
+    readonly fields: readonly [string, ...string[]];
+  };
+  return {
+    kind: spec.kind,
+    ...indexFieldShape(fields)
+  } as MaterializationIndexOptions;
 }
 
 function hashIndexResult<Row, Value>(
@@ -1299,6 +1374,10 @@ function materializeDbSnapshots<Db extends SnapshotMaterializationTarget>(
     materializeDbSnapshot(db, query, materializationOptionsForBatchItem(name, options));
   }
   return markMaterialized(db);
+}
+
+function materializationBatchFromQueries(queries: readonly Query[]): MaterializationQueryBatch {
+  return Object.fromEntries(queries.map((query) => [queryKey(query), query]));
 }
 
 function materializationOptionsForBatchItem(

@@ -27,6 +27,7 @@ import {
   getEnv,
   gt,
   hash,
+  hostCall,
   insert,
   insertOrMerge,
   insertOrUpdate,
@@ -58,6 +59,7 @@ import {
   row,
   sel,
   sel1,
+  setEnvTx,
   setConcat,
   sort,
   stripMeta,
@@ -220,11 +222,21 @@ describe('TypeScript Relic core acceptance', () => {
       from(user),
       project({ id: user.id, band: call(ageBand, user.age) })
     );
+    const explicitHostFunctionQuery = pipe(
+      from(user),
+      project({ id: user.id, band: hostCall(ageBand, user.age) }),
+      sort(user.id)
+    );
 
     await expect(qRows(state, query)).resolves.toEqual([
       { id: 'ada', band: 'senior', initials: 'A:eng' },
       { id: 'bea', band: 'junior', initials: 'B:design' },
       { id: 'cal', band: 'senior', initials: 'C:missing' }
+    ]);
+    await expect(qRows(state, explicitHostFunctionQuery)).resolves.toEqual([
+      { id: 'ada', band: 'senior' },
+      { id: 'bea', band: 'junior' },
+      { id: 'cal', band: 'senior' }
     ]);
     expect(queryKey(sameFunctionQuery)).toBe(queryKey(sameFunctionQueryAgain));
     expect(JSON.stringify(query.data)).not.toContain('fn');
@@ -494,6 +506,43 @@ describe('TypeScript Relic core acceptance', () => {
       { id: 't3', ownerId: 'bea', points: 3 },
       { id: 't4', ownerId: 'dia', points: 2 }
     ]);
+  });
+
+  it('accepts Relic-shaped variadic mat and demat query arguments', () => {
+    const user = as(coreSchema.users, 'user');
+    const task = as(coreSchema.tasks, 'task');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    );
+    const openTasks = pipe(
+      from(task),
+      where(eq(task.done, false)),
+      project({ id: task.id, ownerId: task.ownerId }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), activeUsers, openTasks);
+
+    expect(materializedRowsForQuery(state, activeUsers)).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
+    ]);
+    expect(materializedRowsForQuery(state, openTasks)).toEqual([
+      { id: 't1', ownerId: 'ada' },
+      { id: 't3', ownerId: 'bea' }
+    ]);
+    expect(materializationsFor(state).map((entry) => entry.id).sort()).toEqual([
+      queryKey(activeUsers),
+      queryKey(openTasks)
+    ].sort());
+
+    const dematerialized = demat(state, activeUsers, openTasks);
+
+    expect(materializedRowsForQuery(dematerialized, activeUsers)).toBeUndefined();
+    expect(materializedRowsForQuery(dematerialized, openTasks)).toBeUndefined();
+    expect(materializationsFor(dematerialized)).toEqual([]);
   });
 
   it('skips recomputing materializations whose dependencies are untouched by transaction deltas', () => {
@@ -923,6 +972,27 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
   });
 
+  it('infers an unambiguous declared materialized index from index(db, query)', () => {
+    const user = as(coreSchema.users, 'user');
+    const usersByTeam = pipe(
+      from(user),
+      hash(user.teamId),
+      project({ id: user.id, name: user.name, teamId: user.teamId }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), usersByTeam, { id: 'users-by-team' });
+    const inferred = index(state, usersByTeam);
+
+    expect(inferred.kind).toBe('materializationHashIndex');
+    if (inferred.kind !== 'materializationHashIndex') {
+      throw new Error('expected hash index');
+    }
+    expect(inferred.index?.get('eng')).toEqual([
+      { id: 'ada', name: 'Ada', teamId: 'eng' }
+    ]);
+    expect(index(state, usersByTeam, { kind: 'set' }).kind).toBe('materializationIndex');
+  });
+
   it('builds nested raw maps for multi-key hash, btree, and unique indexes', () => {
     const user = as(coreSchema.users, 'user');
     const userRows = pipe(
@@ -1124,10 +1194,43 @@ describe('TypeScript Relic core acceptance', () => {
         addedRows: [{ id: 'dia', name: 'Dia' }]
       })
     ]));
+    expect(tracked.changesByQueryKey[queryKey(activeUsers)]).toMatchObject({
+      added: [{ id: 'dia', name: 'Dia' }],
+      deleted: [],
+      removed: []
+    });
     await expect(qRows(tracked.db, activeUsers)).resolves.toEqual([
       { id: 'ada', name: 'Ada' },
       { id: 'bea', name: 'Bea' },
       { id: 'dia', name: 'Dia' }
+    ]);
+  });
+
+  it('accepts transaction-shaped environment updates', async () => {
+    const user = as(coreSchema.users, 'user');
+    const olderThanMinimum = pipe(
+      from(user),
+      where(gt(user.age, env<number>('minimumAge'))),
+      project({ id: user.id, age: user.age }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData, { env: { minimumAge: 20 } }), olderThanMinimum, {
+      id: 'older-than-minimum'
+    });
+    const tracked = await trackTransact(
+      state,
+      setEnvTx((current) => ({ ...current, minimumAge: 30 }))
+    );
+
+    expect(tracked.result).toMatchObject({ committed: true, patches: 0, applied: 0 });
+    expect(getEnv(tracked.db)).toMatchObject({ minimumAge: 30 });
+    expect(tracked.materializations?.changes.find((change) => change.id === 'older-than-minimum')).toMatchObject({
+      addedRows: [],
+      removedRows: [{ id: 'bea', age: 29 }]
+    });
+    await expect(qRows(tracked.db, olderThanMinimum)).resolves.toEqual([
+      { id: 'ada', age: 37 },
+      { id: 'cal', age: 41 }
     ]);
   });
 
