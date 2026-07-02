@@ -11,7 +11,6 @@ import type { RelationDelta } from './adapter.js';
 import type { RowChange, RowDiffDiagnostic } from './diff.js';
 import {
   queryKey,
-  queryRowKeyFields,
   relationDependencies,
   type ExprData,
   type NullSortOrder,
@@ -42,19 +41,11 @@ import {
   rowsFromIncrementalState,
   type IncrementalMaterialization,
   type IncrementalMaterializationPlan,
-  type IncrementalMaterializationPlanOptions,
-  type IncrementalRowBatch
+  type IncrementalMaterializationPlanOptions
 } from './materialization-plan.js';
-import {
-  materializationRowIndex,
-  materializationRowKey,
-  type MaterializationRowDiffOptions,
-  type MaterializationRowIndex
-} from './materialization-row-changes.js';
 import {
   buildMaintainedIndexes,
   maintainedIndexKey,
-  patchMaintainedIndexes,
   type MaintainedBtreeIndexState,
   type MaintainedHashIndexState,
   type MaintainedIndexDefinition,
@@ -454,7 +445,6 @@ type StoredMaterialization<Row = unknown> = {
   readonly metadata: MaterializationMetadata<Row>;
   readonly derivationSnapshot: DerivationSnapshot<Row>;
   readonly rows: readonly Row[];
-  readonly rowIndex: MaterializationRowIndex<Row>;
   readonly indexes: MaintainedIndexes<Row>;
   readonly evaluateOptions: EvaluateOptions;
   readonly cacheable: boolean;
@@ -544,7 +534,7 @@ export function explainMaterialization<Row>(
   options: MaterializationOptions = {}
 ): MaterializationExplanation<Row> {
   const key = queryKey(query);
-  const requestedMode = options.mode ?? 'snapshot';
+  const requestedMode = requestedMaterializationMode(options, key);
   const evaluateOptions = materializationEvaluateOptions(options);
   const planned = requestedMode === 'incremental'
     ? planIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
@@ -722,8 +712,7 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
           storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
             stored,
             refresh.snapshot,
-            nextIncremental,
-            maintained.rowBatches
+            nextIncremental
           ));
           continue;
         }
@@ -788,8 +777,7 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
               stored,
               refresh.snapshot,
-              nextIncremental,
-              maintained.rowBatches
+              nextIncremental
             ));
             continue;
           }
@@ -868,8 +856,7 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
               stored,
               refresh.snapshot,
-              nextIncremental,
-              maintained.rowBatches
+              nextIncremental
             ));
             continue;
           }
@@ -1498,7 +1485,7 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
   options: SnapshotMaterializationOptions
 ): Db & MaterializedDb {
   const key = queryKey(query);
-  const requestedMode = options.mode ?? 'snapshot';
+  const requestedMode = requestedMaterializationMode(options, key);
   const id = options.id ?? options.name ?? key;
   const evaluateOptions = materializationEvaluateOptions(options);
   const functionDiagnostics = missingFunctionDiagnostics(query, evaluateOptions.functions);
@@ -1560,6 +1547,17 @@ function materializationOptionsForBatchItem(
     id: baseId === undefined ? name : `${baseId}:${name}`,
     name: baseId === undefined ? name : `${baseId}:${name}`
   };
+}
+
+function requestedMaterializationMode(
+  options: MaterializationOptions,
+  key: string
+): MaterializationMode {
+  if (options.mode !== undefined) {
+    return options.mode;
+  }
+
+  return options.id === key && options.name === undefined ? 'incremental' : 'snapshot';
 }
 
 function materializationEntryFor<Row>(
@@ -1695,7 +1693,6 @@ function materializationEntryWithDerivationSnapshot<Row>(
     ),
     derivationSnapshot,
     rows,
-    rowIndex: materializationRowIndex(rows, materializationDiffOptions(metadata.query)),
     indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
     evaluateOptions,
     cacheable,
@@ -1706,23 +1703,22 @@ function materializationEntryWithDerivationSnapshot<Row>(
 function materializationEntryWithIncrementalRows<Row>(
   stored: StoredMaterialization<Row>,
   derivationSnapshot: DerivationSnapshot<Row>,
-  incremental: IncrementalMaterialization<Row>,
-  rowBatches: readonly IncrementalRowBatch<Row>[]
+  incremental: IncrementalMaterialization<Row>
 ): StoredMaterialization<Row> {
   const rows = derivationSnapshot.rows;
+  const maintainedDefinitions = maintainedIndexDefinitions(stored.metadata.indexSpecs);
   return {
     ...stored,
     derivationSnapshot,
     rows,
-    rowIndex: materializationRowIndex(rows, materializationDiffOptions(stored.metadata.query)),
-    indexes: patchMaintainedIndexes(stored.indexes, rows, rowBatches),
+    indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
     incremental
   };
 }
 
 function rowsForMaintainedIncremental<Row>(
   stored: StoredMaterialization<Row>,
-  rowBatches: readonly IncrementalRowBatch<Row>[],
+  rowBatches: readonly unknown[],
   incremental: IncrementalMaterialization<Row>
 ): readonly Row[] {
   if (incremental.state.aggregate !== undefined) {
@@ -1733,12 +1729,7 @@ function rowsForMaintainedIncremental<Row>(
     return materializationRows(stored);
   }
 
-  return patchMaterializationRows(
-    materializationRows(stored),
-    stored.rowIndex,
-    rowBatches,
-    materializationDiffOptions(stored.metadata.query)
-  ) ?? rowsFromIncrementalState(incremental.state);
+  return rowsFromIncrementalState(incremental.state);
 }
 
 function materializationRows<Row>(stored: StoredMaterialization<Row>): readonly Row[] {
@@ -1774,115 +1765,6 @@ function derivationTargetFor<Row>(metadata: MaterializationMetadata<Row>): Deriv
     id: metadata.id,
     query: metadata.query
   };
-}
-
-function patchMaterializationRows<Row>(
-  rows: readonly Row[],
-  rowIndex: MaterializationRowIndex<Row>,
-  rowBatches: readonly IncrementalRowBatch<Row>[],
-  options: MaterializationRowDiffOptions
-): readonly Row[] | undefined {
-  if (rowIndex.duplicates.size > 0) {
-    return undefined;
-  }
-
-  const operations: Array<{
-    readonly start: number;
-    readonly deleteCount: number;
-    readonly rows: readonly Row[];
-    readonly order: number;
-  }> = [];
-
-  for (const [order, batch] of rowBatches.entries()) {
-    if (batch.beforeRows.length > 0) {
-      const positions = rowPositions(batch.beforeRows, rowIndex, options);
-      if (positions === undefined) {
-        return undefined;
-      }
-      const start = positions[0];
-      if (start === undefined || !positionsAreContiguous(positions)) {
-        return undefined;
-      }
-      operations.push({
-        start,
-        deleteCount: batch.beforeRows.length,
-        rows: batch.afterRows,
-        order
-      });
-      continue;
-    }
-
-    if (batch.afterRows.length === 0) {
-      continue;
-    }
-
-    const start = insertionIndex(rows, rowIndex, batch);
-    if (start === undefined) {
-      return undefined;
-    }
-    operations.push({
-      start,
-      deleteCount: 0,
-      rows: batch.afterRows,
-      order
-    });
-  }
-
-  if (operations.length === 0) {
-    return rows;
-  }
-
-  const patched = [...rows];
-  for (const operation of operations.sort((left, right) => (
-    right.start - left.start || left.order - right.order
-  ))) {
-    patched.splice(operation.start, operation.deleteCount, ...operation.rows);
-  }
-
-  return patched;
-}
-
-function rowPositions<Row>(
-  rows: readonly Row[],
-  rowIndex: MaterializationRowIndex<Row>,
-  options: MaterializationRowDiffOptions
-): readonly number[] | undefined {
-  const positions: number[] = [];
-  for (const row of rows) {
-    let key: string;
-    try {
-      key = materializationRowKey(row, options);
-    } catch {
-      return undefined;
-    }
-    const position = rowIndex.indexByKey.get(key);
-    if (position === undefined) {
-      return undefined;
-    }
-    positions.push(position);
-  }
-  return positions.sort((left, right) => left - right);
-}
-
-function positionsAreContiguous(positions: readonly number[]): boolean {
-  return positions.every((position, index) => index === 0 || position === (positions[index - 1] ?? position) + 1);
-}
-
-function insertionIndex<Row>(
-  rows: readonly Row[],
-  rowIndex: MaterializationRowIndex<Row>,
-  batch: IncrementalRowBatch<Row>
-): number | undefined {
-  if (batch.insertAfterKey !== undefined) {
-    const position = rowIndex.indexByKey.get(batch.insertAfterKey);
-    return position === undefined ? undefined : position + 1;
-  }
-
-  if (batch.insertBeforeKey !== undefined) {
-    return rowIndex.indexByKey.get(batch.insertBeforeKey);
-  }
-
-  return rows.length;
 }
 
 function incrementalRelationSnapshots(
@@ -2730,11 +2612,6 @@ function collectExpression(expr: ExprData, expressions: ExprData[]): void {
 
 function uniqueMaterializations(store: Map<string, AnyStoredMaterialization>): readonly AnyStoredMaterialization[] {
   return Array.from(new Set(store.values()));
-}
-
-function materializationDiffOptions<Row>(query: Query<Row>): MaterializationRowDiffOptions {
-  const keyBy = queryRowKeyFields(query);
-  return keyBy === undefined ? {} : { keyBy };
 }
 
 function maintenanceReasonForMode(mode: MaterializationMode): string {

@@ -5,12 +5,6 @@ export type MaterializationRowDiffOptions = {
   readonly keyBy?: readonly string[];
 };
 
-export type MaterializationRowIndex<Row = unknown> = {
-  readonly indexByKey: ReadonlyMap<string, number>;
-  readonly duplicates: ReadonlySet<string>;
-  readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
-};
-
 export function diffMaterializationRows<Row>(
   before: readonly Row[],
   after: readonly Row[],
@@ -48,51 +42,6 @@ export function diffMaterializationRows<Row>(
     changes,
     diagnostics: [...beforeIndex.diagnostics, ...afterIndex.diagnostics]
   };
-}
-
-export function materializationRowIndex<Row>(
-  rows: readonly Row[],
-  options: MaterializationRowDiffOptions = {}
-): MaterializationRowIndex<Row> {
-  const keyFor = materializationRowKeySelector(options);
-  const indexByKey = new Map<string, number>();
-  const duplicates = new Set<string>();
-  const diagnostics: RowDiffDiagnostic<Row>[] = [];
-
-  rows.forEach((row, index) => {
-    let key: string;
-    try {
-      key = keyFor(row);
-    } catch (error) {
-      diagnostics.push({
-        code: 'invalid_row',
-        message: 'row key selection failed',
-        side: 'after',
-        row,
-        ...(error === undefined ? {} : { key: materializationErrorMessage(error) })
-      });
-      return;
-    }
-
-    if (indexByKey.has(key)) {
-      duplicates.add(key);
-      indexByKey.delete(key);
-      diagnostics.push({
-        code: 'duplicate_key',
-        message: 'duplicate after row key',
-        side: 'after',
-        key,
-        row
-      });
-      return;
-    }
-
-    if (!duplicates.has(key)) {
-      indexByKey.set(key, index);
-    }
-  });
-
-  return { indexByKey, duplicates, diagnostics };
 }
 
 export function materializationRowKey<Row>(

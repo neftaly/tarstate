@@ -1,5 +1,4 @@
 import { stableKey } from './identity.js';
-import type { IncrementalRowBatch } from './materialization-plan.js';
 import type {
   MaterializationDiagnostic,
   MaterializationNestedRows,
@@ -104,26 +103,6 @@ export function buildMaintainedIndexes<Row>(
   };
 }
 
-export function patchMaintainedIndexes<Row>(
-  previous: MaintainedIndexes<Row>,
-  rows: readonly Row[],
-  rowBatches: readonly IncrementalRowBatch<Row>[]
-): MaintainedIndexes<Row> {
-  if (rowBatches.length === 0) {
-    return previous;
-  }
-
-  const byKey = new Map<string, MaintainedIndexState<Row>>();
-  for (const [key, state] of previous.byKey) {
-    byKey.set(key, patchMaintainedIndex(state, rows, rowBatches));
-  }
-
-  return {
-    set: new Set(rows),
-    byKey
-  };
-}
-
 function buildMaintainedIndex<Row>(
   rows: readonly Row[],
   definition: MaintainedIndexDefinition
@@ -158,99 +137,6 @@ function buildMaintainedIndex<Row>(
     case 'unique':
       return buildUniqueState(rows, definition.fields);
   }
-}
-
-function patchMaintainedIndex<Row>(
-  state: MaintainedIndexState<Row>,
-  rows: readonly Row[],
-  rowBatches: readonly IncrementalRowBatch<Row>[]
-): MaintainedIndexState<Row> {
-  if (state.parts !== undefined) {
-    return buildMaintainedIndex(rows, {
-      kind: state.kind,
-      fields: state.fields,
-      parts: state.parts,
-      diagnostics: state.definitionDiagnostics
-    });
-  }
-
-  switch (state.kind) {
-    case 'hash':
-      return patchRowsIndex(state, rows, rowBatches);
-    case 'btree':
-      return patchBtreeIndex(state, rows, rowBatches);
-    case 'unique':
-      return patchUniqueIndex(state, rows, rowBatches);
-  }
-}
-
-function patchRowsIndex<Row>(
-  state: MaintainedHashIndexState<Row>,
-  rows: readonly Row[],
-  rowBatches: readonly IncrementalRowBatch<Row>[]
-): MaintainedHashIndexState<Row> {
-  const affected = affectedTopKeys(state.fields, rowBatches);
-  if (affected.length === 0) {
-    return state;
-  }
-
-  const lookup = new Map(state.lookup);
-  for (const key of affected) {
-    replaceRowsBranch(lookup, state.fields, rows, key, false);
-  }
-
-  return {
-    ...state,
-    lookup: orderRowsLookupByRows(lookup, state.fields, rows)
-  };
-}
-
-function patchBtreeIndex<Row>(
-  state: MaintainedBtreeIndexState<Row>,
-  rows: readonly Row[],
-  rowBatches: readonly IncrementalRowBatch<Row>[]
-): MaintainedBtreeIndexState<Row> {
-  const affected = affectedTopKeys(state.fields, rowBatches);
-  if (affected.length === 0) {
-    return state;
-  }
-
-  const lookup = new Map(state.lookup);
-  for (const key of affected) {
-    replaceRowsBranch(lookup, state.fields, rows, key, true);
-  }
-
-  const sorted = sortRowsLookup(lookup);
-  return {
-    ...state,
-    lookup: sorted,
-    ordered: Array.from(sorted.keys()).sort(compareValues)
-  };
-}
-
-function patchUniqueIndex<Row>(
-  state: MaintainedUniqueIndexState<Row>,
-  rows: readonly Row[],
-  rowBatches: readonly IncrementalRowBatch<Row>[]
-): MaintainedUniqueIndexState<Row> {
-  const affected = affectedTopKeys(state.fields, rowBatches);
-  if (affected.length === 0) {
-    return state;
-  }
-
-  const lookup = new Map(state.lookup);
-  const diagnosticsByTopKey = new Map(state.diagnosticsByTopKey);
-  for (const key of affected) {
-    replaceUniqueBranch(lookup, diagnosticsByTopKey, state.fields, rows, key);
-  }
-
-  const orderedLookup = orderUniqueLookupByRows(lookup, state.fields, rows);
-  return {
-    ...state,
-    lookup: orderedLookup,
-    diagnosticsByTopKey,
-    diagnostics: diagnosticsForUniqueLookup(orderedLookup, diagnosticsByTopKey)
-  };
 }
 
 function buildRowsLookup<Row>(
@@ -289,28 +175,6 @@ function addRowToRowsLookup<Row>(
     cursor.set(key, next);
     cursor = next;
   }
-}
-
-function replaceRowsBranch<Row>(
-  lookup: Map<unknown, MaterializationNestedRows<Row>>,
-  fields: readonly string[],
-  rows: readonly Row[],
-  key: unknown,
-  sorted: boolean
-): void {
-  const topRows = rowsForTopKey(rows, fields, key);
-  if (topRows.length === 0) {
-    lookup.delete(key);
-    return;
-  }
-
-  if (fields.length === 1) {
-    lookup.set(key, new Set(topRows));
-    return;
-  }
-
-  const branch = buildRowsLookup(topRows, fields.slice(1));
-  lookup.set(key, sorted ? sortRowsLookup(branch) : branch);
 }
 
 function buildUniqueState<Row>(
@@ -559,38 +423,6 @@ function addRowToUniqueLookup<Row>(
   }
 }
 
-function affectedTopKeys<Row>(
-  fields: readonly string[],
-  rowBatches: readonly IncrementalRowBatch<Row>[]
-): readonly unknown[] {
-  const field = fields[0];
-  if (field === undefined) {
-    return [];
-  }
-
-  const keys: unknown[] = [];
-  for (const batch of rowBatches) {
-    for (const row of [...batch.beforeRows, ...batch.afterRows]) {
-      const key = fieldValue(row, field);
-      if (!keys.some((candidate) => sameMapKey(candidate, key))) {
-        keys.push(key);
-      }
-    }
-  }
-  return keys;
-}
-
-function rowsForTopKey<Row>(
-  rows: readonly Row[],
-  fields: readonly string[],
-  key: unknown
-): readonly Row[] {
-  const field = fields[0];
-  return field === undefined
-    ? []
-    : rows.filter((row) => sameMapKey(fieldValue(row, field), key));
-}
-
 function topKeysForRows<Row>(
   rows: readonly Row[],
   fields: readonly string[]
@@ -610,34 +442,15 @@ function topKeysForRows<Row>(
   return keys;
 }
 
-function orderRowsLookupByRows<Row>(
-  lookup: ReadonlyMap<unknown, MaterializationNestedRows<Row>>,
+function rowsForTopKey<Row>(
+  rows: readonly Row[],
   fields: readonly string[],
-  rows: readonly Row[]
-): ReadonlyMap<unknown, MaterializationNestedRows<Row>> {
-  const ordered = new Map<unknown, MaterializationNestedRows<Row>>();
-  for (const key of topKeysForRows(rows, fields)) {
-    const value = lookup.get(key);
-    if (value !== undefined || lookup.has(key)) {
-      ordered.set(key, value as MaterializationNestedRows<Row>);
-    }
-  }
-  return ordered;
-}
-
-function orderUniqueLookupByRows<Row>(
-  lookup: ReadonlyMap<unknown, MaterializationNestedUniqueRows<Row>>,
-  fields: readonly string[],
-  rows: readonly Row[]
-): ReadonlyMap<unknown, MaterializationNestedUniqueRows<Row>> {
-  const ordered = new Map<unknown, MaterializationNestedUniqueRows<Row>>();
-  for (const key of topKeysForRows(rows, fields)) {
-    const value = lookup.get(key);
-    if (value !== undefined || lookup.has(key)) {
-      ordered.set(key, value as MaterializationNestedUniqueRows<Row>);
-    }
-  }
-  return ordered;
+  key: unknown
+): readonly Row[] {
+  const field = fields[0];
+  return field === undefined
+    ? []
+    : rows.filter((row) => sameMapKey(fieldValue(row, field), key));
 }
 
 function diagnosticsForUniqueLookup<Row>(

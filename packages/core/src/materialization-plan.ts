@@ -5,7 +5,6 @@ import { stableKey } from './identity.js';
 import { equalityJoinPlan, type EqualityJoinPlan, type FieldExpression } from './join-planner.js';
 import {
   diffMaterializationRows,
-  materializationRowIndex,
   materializationRowKey,
   materializationStableKey,
   type MaterializationRowDiffOptions
@@ -3580,25 +3579,25 @@ function orderedMoveRowChanges<Row>(
   options: MaterializationRowDiffOptions,
   existingChanges: readonly RowChange<Row>[]
 ): readonly RowChange<Row>[] {
-  const beforeIndex = materializationRowIndex(beforeRows, options);
-  const afterIndex = materializationRowIndex(afterRows, options);
+  const beforeIndex = materializationRowPositions(beforeRows, options);
+  const afterIndex = materializationRowPositions(afterRows, options);
   if (
-    beforeIndex.duplicates.size > 0 ||
-    afterIndex.duplicates.size > 0 ||
-    beforeIndex.diagnostics.length > 0 ||
-    afterIndex.diagnostics.length > 0
+    beforeIndex.duplicateKey !== undefined ||
+    afterIndex.duplicateKey !== undefined ||
+    beforeIndex.invalid ||
+    afterIndex.invalid
   ) {
     return [];
   }
 
   const changedKeys = new Set(existingChanges.map((change) => change.key));
   const changes: RowChange<Row>[] = [];
-  for (const [key, beforePosition] of beforeIndex.indexByKey) {
+  for (const [key, beforePosition] of beforeIndex.positionsByKey) {
     if (changedKeys.has(key)) {
       continue;
     }
 
-    const afterPosition = afterIndex.indexByKey.get(key);
+    const afterPosition = afterIndex.positionsByKey.get(key);
     if (afterPosition !== undefined && afterPosition !== beforePosition) {
       changes.push({
         kind: 'updated',
@@ -3609,6 +3608,47 @@ function orderedMoveRowChanges<Row>(
     }
   }
   return changes;
+}
+
+function materializationRowPositions<Row>(
+  rows: readonly Row[],
+  options: MaterializationRowDiffOptions
+): {
+  readonly positionsByKey: ReadonlyMap<string, number>;
+  readonly duplicateKey?: string;
+  readonly invalid: boolean;
+} {
+  const positionsByKey = new Map<string, number>();
+  const duplicates = new Set<string>();
+  let duplicateKey: string | undefined;
+  let invalid = false;
+
+  rows.forEach((row, position) => {
+    let key: string;
+    try {
+      key = materializationRowKey(row, options);
+    } catch {
+      invalid = true;
+      return;
+    }
+
+    if (positionsByKey.has(key)) {
+      duplicates.add(key);
+      duplicateKey ??= key;
+      positionsByKey.delete(key);
+      return;
+    }
+
+    if (!duplicates.has(key)) {
+      positionsByKey.set(key, position);
+    }
+  });
+
+  return {
+    positionsByKey,
+    ...(duplicateKey === undefined ? {} : { duplicateKey }),
+    invalid
+  };
 }
 
 function orderedChangedKeys(
@@ -6485,14 +6525,12 @@ function ambiguousFinalRowsReason<Row>(
   plan: IncrementalMaterializationPlan,
   rows: readonly Row[]
 ): string | undefined {
-  const index = materializationRowIndex(rows, rowDiffOptionsForPlan(plan));
-  const duplicate = index.duplicates.values().next();
-  if (!duplicate.done) {
-    return `final materialized row key ${duplicate.value} is duplicated; snapshot recompute is required`;
+  const index = materializationRowPositions(rows, rowDiffOptionsForPlan(plan));
+  if (index.duplicateKey !== undefined) {
+    return `final materialized row key ${index.duplicateKey} is duplicated; snapshot recompute is required`;
   }
 
-  const invalid = index.diagnostics.find((diagnostic) => diagnostic.code === 'invalid_row');
-  if (invalid !== undefined) {
+  if (index.invalid) {
     return 'final materialized row key selection failed; snapshot recompute is required';
   }
 
