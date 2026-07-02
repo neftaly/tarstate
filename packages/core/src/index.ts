@@ -306,6 +306,7 @@ export type { MaybePromise, RelationLookup, RelationRangeBound, RelationRangeLoo
 export { createRuntimeStore, createStore } from './store.js';
 export type {
   Store,
+  StoreCommitEffects,
   StoreCommitInput,
   StoreCommitResult,
   StoreCommitSnapshot,
@@ -317,8 +318,8 @@ export type {
   StoreQueryBatchResult,
   StoreQueryOptions,
   StoreQueryResult,
-  StoreInput,
   StoreRuntimeInput,
+  StoreSeedInput,
   StoreSnapshot,
   StoreView,
   StoreViewReadOptions

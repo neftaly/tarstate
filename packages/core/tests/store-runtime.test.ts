@@ -17,7 +17,14 @@ import {
   stringField
 } from '@tarstate/core/schema';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
-import { createRuntimeStore, type Store, type StoreCommitResult, type StoreRuntimeInput } from '@tarstate/core/store';
+import {
+  createRuntimeStore,
+  createStore,
+  type Store,
+  type StoreCommitResult,
+  type StoreRuntimeInput,
+  type StoreSeedInput
+} from '@tarstate/core/store';
 import { write } from '@tarstate/core/write';
 import { watch, type WatchEvent } from '@tarstate/core/watch';
 import type { RelationDelta, RelationRuntime } from '@tarstate/core/adapter';
@@ -75,7 +82,8 @@ describe('runtime-backed Store', () => {
       events.push(store.getSnapshot().revision);
     });
 
-    expectTypeOf(store).toEqualTypeOf<Store>();
+    expectTypeOf(store).toEqualTypeOf<Store<number>>();
+    expectTypeOf(store.getSnapshot().version).toEqualTypeOf<number | undefined>();
     await expect(store.query(schema.items)).resolves.toMatchObject({
       rows: [
         { id: 'item-a', label: 'Alpha', done: false },
@@ -134,7 +142,9 @@ describe('runtime-backed Store', () => {
       items.insert({ id: 'item-c', label: 'Gamma', done: false })
     ]);
 
-    expectTypeOf(result).toEqualTypeOf<StoreCommitResult>();
+    expectTypeOf(result).toEqualTypeOf<StoreCommitResult<number>>();
+    expectTypeOf(result.effects.version).toEqualTypeOf<number | undefined>();
+    expectTypeOf(result.snapshot.version).toEqualTypeOf<number | undefined>();
     expect(result).toMatchObject({
       kind: 'tarstateCommit',
       status: 'accepted',
@@ -184,6 +194,94 @@ describe('runtime-backed Store', () => {
     });
     expect(handle.db).toBe(store.getSnapshot().db);
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
+  });
+
+  it('closes object-backed stores idempotently and suppresses future notifications', async () => {
+    const store = createStore({ items: [] });
+    const notified: number[] = [];
+    const unsubscribe = store.subscribe(() => {
+      notified.push(store.getSnapshot().revision);
+    });
+
+    store.close();
+    store.close();
+    unsubscribe();
+    const lateUnsubscribe = store.subscribe(() => {
+      notified.push(-1);
+    });
+
+    const result = await store.commit(items.insert({ id: 'item-a', label: 'Alpha', done: false }));
+    const refreshed = await store.refresh();
+
+    expectTypeOf(store).toEqualTypeOf<Store>();
+    expectTypeOf<StoreSeedInput>().toEqualTypeOf<NonNullable<Parameters<typeof createStore>[0]>>();
+    expectTypeOf<StoreRuntimeInput<number>>().not.toMatchTypeOf<StoreSeedInput>();
+    expect(result).toMatchObject({
+      status: 'accepted',
+      snapshot: {
+        revision: 1
+      }
+    });
+    expect(refreshed.revision).toBe(2);
+    await expect(store.query(schema.items)).resolves.toMatchObject({
+      rows: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+    expect(notified).toEqual([]);
+    expect(lateUnsubscribe()).toBeUndefined();
+  });
+
+  it('closes runtime-backed stores, unsubscribes from runtime refreshes, and suppresses notifications', async () => {
+    const runtime = createMemoryRelationRuntime({ items: [] });
+    let subscribeBalance = 0;
+    const trackedRuntime = {
+      ...runtime,
+      subscribe: (listener: () => void) => {
+        subscribeBalance += 1;
+        const unsubscribe = runtime.subscribe?.(listener);
+        return () => {
+          subscribeBalance -= 1;
+          unsubscribe?.();
+        };
+      }
+    } satisfies RelationRuntime<number>;
+    const store = await createRuntimeStore({ runtime: trackedRuntime, relations: [schema.items] });
+    const notified: number[] = [];
+    const unsubscribe = store.subscribe(() => {
+      notified.push(store.getSnapshot().revision);
+    });
+
+    expect(subscribeBalance).toBe(1);
+
+    store.close();
+    store.close();
+    unsubscribe();
+    const lateUnsubscribe = store.subscribe(() => {
+      notified.push(-1);
+    });
+
+    await runtime.target?.apply([items.insert({ id: 'item-a', label: 'Alpha', done: false })]);
+    expect(store.getSnapshot().revision).toBe(0);
+
+    const result = await store.commit(items.insert({ id: 'item-b', label: 'Beta', done: false }));
+    const refreshed = await store.refresh();
+
+    expect(subscribeBalance).toBe(0);
+    expect(result).toMatchObject({
+      status: 'accepted',
+      snapshot: {
+        revision: 1,
+        version: 2
+      }
+    });
+    expect(refreshed.revision).toBe(2);
+    await expect(store.query(schema.items)).resolves.toMatchObject({
+      rows: [
+        { id: 'item-a', label: 'Alpha', done: false },
+        { id: 'item-b', label: 'Beta', done: false }
+      ]
+    });
+    expect(notified).toEqual([]);
+    expect(lateUnsubscribe()).toBeUndefined();
   });
 
   it('keeps partial runtime commits visible in store results', async () => {

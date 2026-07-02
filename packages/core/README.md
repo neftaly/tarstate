@@ -14,7 +14,7 @@ The core API is stabilizing around a Relic-shaped split:
   object-backed renderer-independent store, and
   `await createRuntimeStore({ runtime, relations })` returns the same facade over
   a pluggable `RelationRuntime`. Stores provide `query`, `queries`, `view`,
-  non-throwing `commit`, and subscriptions. Store commit results use
+  non-throwing `commit`, subscriptions, and idempotent `close`. Store commit results use
   `accepted`/`partial`/`rejected` status plus a separate `reflected` flag for row
   effects. A `view(query)` is the stable derived-read API; materialization
   remains a diagnostic-backed core cache API outside the stable store contract.

@@ -76,6 +76,7 @@ describe('@tarstate/react DB-first hooks', () => {
     expect(useTransact).toBe(useTarstateTransact);
     expect(useMaterialized).toBe(useTarstateMaterialized);
     expect(useWatch).toBe(useTarstateWatch);
+    expect(createDbStore().close).toBeTypeOf('function');
   });
 
   it('renders core query rows and transacts through the provider DB', async () => {
@@ -140,6 +141,33 @@ describe('@tarstate/react DB-first hooks', () => {
     expect(publishes).toBe(0);
 
     unsubscribe();
+  });
+
+  it('closes DB stores idempotently and suppresses future notifications', async () => {
+    const store = createDbStore({ items: [] });
+    const notified: number[] = [];
+    const unsubscribe = store.subscribe(() => {
+      notified.push(store.getSnapshot().revision);
+    });
+
+    store.close();
+    store.close();
+    unsubscribe();
+    const lateUnsubscribe = store.subscribe(() => {
+      notified.push(-1);
+    });
+
+    await store.transact(insert(schema.items, { id: 'item-a', label: 'Alpha', done: false }));
+    await store.replaceDb({
+      items: [{ id: 'item-b', label: 'Beta', done: true }]
+    });
+
+    expect(store.getSnapshot().revision).toBe(2);
+    expect(store.getSnapshot().db.data.items).toEqual([
+      { id: 'item-b', label: 'Beta', done: true }
+    ]);
+    expect(notified).toEqual([]);
+    expect(lateUnsubscribe()).toBeUndefined();
   });
 
   it('reads and refreshes materialized query rows from core materialization', async () => {

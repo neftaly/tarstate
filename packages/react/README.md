@@ -8,6 +8,7 @@ Primary API:
 
 - `createDbStore(db?)` creates a revisioned React store around a core `Db`.
 - `TarstateProvider` accepts either a `store` or a provider-owned `db`.
+- Stores expose `close()` for idempotent subscription cleanup.
 - `useDb()` reads the current core `Db`.
 - `useQuery(query)` evaluates a core query with `q`.
 - `useTransact()` applies explicit core write patches with `tryTransact`.

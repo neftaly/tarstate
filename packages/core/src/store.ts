@@ -53,39 +53,39 @@ export type StoreMappedQueryBatchResult<Queries extends QueryBatch, MappedRow> =
   readonly [Key in keyof Queries]: StoreQueryResult<MappedRow>;
 };
 
-export type StoreCommitSnapshot = {
+export type StoreCommitSnapshot<Version = unknown> = {
   readonly source: RelationSource;
   readonly revision: number;
   readonly diagnostics: readonly StoreDiagnostic[];
-  readonly version?: unknown;
+  readonly version?: Version;
 };
 
-export type StoreSnapshot = StoreCommitSnapshot & {
+export type StoreSnapshot<Version = unknown> = StoreCommitSnapshot<Version> & {
   readonly db: Db;
 };
 
 export type StoreCommitInput = WriteInput;
 
-export type StoreCommitEffects = {
+export type StoreCommitEffects<Version = unknown> = {
   readonly patches: number;
   readonly applied: number;
   readonly deltas: readonly RelationDelta[];
   readonly durability?: RelationApplyDurability;
-  readonly version?: unknown;
+  readonly version?: Version;
 };
 
 export type StoreCommitStatus = RelationApplyStatus;
 
 export type StoreCommitResult<
-  Snapshot extends StoreCommitSnapshot = StoreSnapshot,
+  Version = unknown,
   Diagnostic extends StoreDiagnostic = StoreDiagnostic
 > = {
   readonly kind: 'tarstateCommit';
   readonly status: StoreCommitStatus;
   readonly reflected: boolean;
-  readonly effects: StoreCommitEffects;
+  readonly effects: StoreCommitEffects<Version>;
   readonly diagnostics: readonly Diagnostic[];
-  readonly snapshot: Snapshot;
+  readonly snapshot: StoreSnapshot<Version>;
 };
 
 export type StoreQueryOptions<Row = unknown, MappedRow = Row> = DbQueryOptions<Row, MappedRow>;
@@ -93,9 +93,10 @@ export type StoreViewReadOptions<Row = unknown, MappedRow = Row> = StoreQueryOpt
 
 export type StoreQuery = {
   <Row, MappedRow>(
-    query: StoreQueryTarget<Row>,
+    query: Query<Row>,
     options: StoreQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
   ): Promise<StoreQueryResult<MappedRow>>;
+  <Row>(query: Query<Row>, options?: StoreQueryOptions<Row>): Promise<StoreQueryResult<Row>>;
   <Relation extends RelationRef, MappedRow>(
     relation: Relation,
     options: StoreQueryOptions<RelationRow<Relation>, MappedRow> & {
@@ -106,7 +107,13 @@ export type StoreQuery = {
     relation: Relation,
     options?: StoreQueryOptions<RelationRow<Relation>>
   ): Promise<StoreQueryResult<RelationRow<Relation>>>;
-  <Row>(query: StoreQueryTarget<Row>, options?: StoreQueryOptions<Row>): Promise<StoreQueryResult<Row>>;
+  <MappedRow>(
+    relationName: string,
+    options: StoreQueryOptions<unknown, MappedRow> & {
+      readonly mapRows: (rows: readonly unknown[]) => readonly MappedRow[];
+    }
+  ): Promise<StoreQueryResult<MappedRow>>;
+  (relationName: string, options?: StoreQueryOptions<unknown>): Promise<StoreQueryResult<unknown>>;
 };
 
 export type StoreQueries = {
@@ -131,11 +138,11 @@ export type StoreViewRead<Row = unknown> = {
     (options?: StoreViewReadOptions<Row>): Promise<StoreQueryResult<Row>>;
 };
 
-export type StoreView<Row = unknown> = {
+export type StoreView<Row = unknown, Version = unknown> = {
   readonly kind: 'view';
   readonly query: Query<Row>;
   readonly queryKey: string;
-  readonly getSnapshot: () => StoreSnapshot;
+  readonly getSnapshot: () => StoreSnapshot<Version>;
   readonly subscribe: (listener: () => void) => () => void;
   readonly read: StoreViewRead<Row>;
   readonly rows: {
@@ -149,15 +156,16 @@ export type StoreView<Row = unknown> = {
   readonly refresh: StoreViewRead<Row>;
 };
 
-export type Store = {
+export type Store<Version = unknown> = {
   readonly kind: 'store';
-  readonly getSnapshot: () => StoreSnapshot;
+  readonly getSnapshot: () => StoreSnapshot<Version>;
   readonly subscribe: (listener: () => void) => () => void;
   readonly query: StoreQuery;
   readonly queries: StoreQueries;
-  readonly view: <Row>(query: Query<Row>) => StoreView<Row>;
-  readonly commit: (patches: StoreCommitInput) => Promise<StoreCommitResult>;
-  readonly refresh: () => Promise<StoreSnapshot>;
+  readonly view: <Row>(query: Query<Row>) => StoreView<Row, Version>;
+  readonly commit: (patches: StoreCommitInput) => Promise<StoreCommitResult<Version>>;
+  readonly refresh: () => Promise<StoreSnapshot<Version>>;
+  readonly close: () => void;
 };
 
 export type StoreRuntimeInput<Version = unknown> = {
@@ -166,18 +174,26 @@ export type StoreRuntimeInput<Version = unknown> = {
   readonly env?: DbInputEnv;
 };
 
-export type StoreInput<Version = unknown> = Db | DbInputData | StoreRuntimeInput<Version>;
+export type StoreSeedInput = Db | DbInputData;
 
-export function createStore(input?: Db | DbInputData): Store;
-export function createStore(input: Db | DbInputData = createDb()): Store {
+export function createStore(input?: StoreSeedInput): Store;
+export function createStore(input: StoreSeedInput = createDb()): Store {
   const db = isDb(input) ? input : createDb(input);
   let snapshot = storeSnapshot(db, 0, []);
   const listeners = new Set<() => void>();
+  let closed = false;
   const subscribe = (listener: () => void): (() => void) => {
+    if (closed) {
+      return () => {};
+    }
     listeners.add(listener);
     return () => {
       listeners.delete(listener);
     };
+  };
+  const notify = (): void => {
+    if (closed) return;
+    for (const listener of listeners) listener();
   };
 
   const store: Store = {
@@ -195,7 +211,7 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
       if (reflected) {
         snapshot = storeSnapshot(result.db, snapshot.revision + 1, result.diagnostics);
         void trackWatchedChanges(previousDb, result.db, result.deltas, result.materializations);
-        for (const listener of listeners) listener();
+        notify();
       }
 
       return {
@@ -213,17 +229,23 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
     },
     refresh: async () => {
       snapshot = storeSnapshot(snapshot.db, snapshot.revision + 1, []);
-      for (const listener of listeners) listener();
+      notify();
       return snapshot;
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      listeners.clear();
     }
   };
 
   return store;
 
   function queryStore<Row, MappedRow>(
-    queryValue: StoreQueryTarget<Row>,
+    queryValue: Query<Row>,
     options: StoreQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
   ): Promise<StoreQueryResult<MappedRow>>;
+  function queryStore<Row>(queryValue: Query<Row>, options?: StoreQueryOptions<Row>): Promise<StoreQueryResult<Row>>;
   function queryStore<Relation extends RelationRef, MappedRow>(
     relation: Relation,
     options: StoreQueryOptions<RelationRow<Relation>, MappedRow> & {
@@ -234,7 +256,13 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
     relation: Relation,
     options?: StoreQueryOptions<RelationRow<Relation>>
   ): Promise<StoreQueryResult<RelationRow<Relation>>>;
-  function queryStore<Row>(queryValue: StoreQueryTarget<Row>, options?: StoreQueryOptions<Row>): Promise<StoreQueryResult<Row>>;
+  function queryStore<MappedRow>(
+    relationName: string,
+    options: StoreQueryOptions<unknown, MappedRow> & {
+      readonly mapRows: (rows: readonly unknown[]) => readonly MappedRow[];
+    }
+  ): Promise<StoreQueryResult<MappedRow>>;
+  function queryStore(relationName: string, options?: StoreQueryOptions<unknown>): Promise<StoreQueryResult<unknown>>;
   function queryStore(queryValue: StoreQueryTarget, options?: StoreQueryOptions<any, any>): Promise<any> {
     return queryOne(snapshot.db, queryValue, options);
   }
@@ -254,18 +282,20 @@ export function createStore(input: Db | DbInputData = createDb()): Store {
   }
 }
 
-export async function createRuntimeStore<Version>(input: StoreRuntimeInput<Version>): Promise<Store> {
+export async function createRuntimeStore<Version>(input: StoreRuntimeInput<Version>): Promise<Store<Version>> {
   const relationList = uniqueRelations(input.relations);
   let snapshot = await runtimeStoreSnapshot(input.runtime, relationList, 0, [], input.env);
   const listeners = new Set<() => void>();
   let applyingCommit = false;
+  let closed = false;
   const notify = (): void => {
+    if (closed) return;
     for (const listener of listeners) listener();
   };
   const publish = async (
     diagnostics: readonly StoreDiagnostic[] = [],
     deltas: readonly RelationDelta[] = []
-  ): Promise<StoreSnapshot> => {
+  ): Promise<StoreSnapshot<Version>> => {
     const previousDb = snapshot.db;
     snapshot = await runtimeStoreSnapshot(input.runtime, relationList, snapshot.revision + 1, diagnostics, input.env);
     const materializations = maintainMaterializations(previousDb, snapshot.db, { deltas });
@@ -274,15 +304,18 @@ export async function createRuntimeStore<Version>(input: StoreRuntimeInput<Versi
     notify();
     return snapshot;
   };
-  input.runtime.subscribe?.(() => {
-    if (!applyingCommit) {
+  const unsubscribeRuntime = input.runtime.subscribe?.(() => {
+    if (!closed && !applyingCommit) {
       void publish();
     }
   });
-  const store: Store = {
+  const store: Store<Version> = {
     kind: 'store',
     getSnapshot: () => snapshot,
     subscribe: (listener) => {
+      if (closed) {
+        return () => {};
+      }
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
@@ -319,15 +352,22 @@ export async function createRuntimeStore<Version>(input: StoreRuntimeInput<Versi
         snapshot
       };
     },
-    refresh: async () => publish()
+    refresh: async () => publish(),
+    close: () => {
+      if (closed) return;
+      closed = true;
+      unsubscribeRuntime?.();
+      listeners.clear();
+    }
   };
 
   return store;
 
   async function queryRuntimeStore<Row, MappedRow>(
-    queryValue: StoreQueryTarget<Row>,
+    queryValue: Query<Row>,
     options: StoreQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
   ): Promise<StoreQueryResult<MappedRow>>;
+  async function queryRuntimeStore<Row>(queryValue: Query<Row>, options?: StoreQueryOptions<Row>): Promise<StoreQueryResult<Row>>;
   async function queryRuntimeStore<Relation extends RelationRef, MappedRow>(
     relation: Relation,
     options: StoreQueryOptions<RelationRow<Relation>, MappedRow> & {
@@ -338,7 +378,13 @@ export async function createRuntimeStore<Version>(input: StoreRuntimeInput<Versi
     relation: Relation,
     options?: StoreQueryOptions<RelationRow<Relation>>
   ): Promise<StoreQueryResult<RelationRow<Relation>>>;
-  async function queryRuntimeStore<Row>(queryValue: StoreQueryTarget<Row>, options?: StoreQueryOptions<Row>): Promise<StoreQueryResult<Row>>;
+  async function queryRuntimeStore<MappedRow>(
+    relationName: string,
+    options: StoreQueryOptions<unknown, MappedRow> & {
+      readonly mapRows: (rows: readonly unknown[]) => readonly MappedRow[];
+    }
+  ): Promise<StoreQueryResult<MappedRow>>;
+  async function queryRuntimeStore(relationName: string, options?: StoreQueryOptions<unknown>): Promise<StoreQueryResult<unknown>>;
   async function queryRuntimeStore(queryValue: StoreQueryTarget, options?: StoreQueryOptions<any, any>): Promise<any> {
     return queryOne(snapshot.db, queryValue, options);
   }
@@ -361,7 +407,7 @@ export async function createRuntimeStore<Version>(input: StoreRuntimeInput<Versi
   }
 }
 
-function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
+function createStoreView<Row, Version>(query: Query<Row>, store: Store<Version>): StoreView<Row, Version> {
   return {
     kind: 'view',
     query,
@@ -428,13 +474,13 @@ function queryOne(
   return q(db, target, options) as Promise<StoreQueryResult>;
 }
 
-function storeSnapshot(
+function storeSnapshot<Version = unknown>(
   db: Db,
   revision: number,
   diagnostics: readonly StoreDiagnostic[],
   source: RelationSource = dbSource(db),
-  version?: unknown
-): StoreSnapshot {
+  version?: Version
+): StoreSnapshot<Version> {
   return {
     db,
     source,
@@ -450,7 +496,7 @@ async function runtimeStoreSnapshot<Version>(
   revision: number,
   diagnostics: readonly StoreDiagnostic[],
   env: DbInputEnv | undefined
-): Promise<StoreSnapshot> {
+): Promise<StoreSnapshot<Version>> {
   const runtimeSnapshot = runtime.snapshot?.();
   const source = runtimeSnapshot?.source ?? runtime.source;
   const db = await sourceDb(source, relations, env);

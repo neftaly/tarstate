@@ -65,6 +65,7 @@ export type TarstateTransactResult = DbTransactionResult & {
 export type TarstateDbStore = {
   readonly getSnapshot: () => TarstateDbSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
+  readonly close: () => void;
   readonly replaceDb: (input: TarstateDbInput, diagnostics?: readonly TarstateReactDiagnostic[]) => Promise<void>;
   readonly query: {
     <Row, MappedRow>(
@@ -193,7 +194,9 @@ export function createDbStore(input: TarstateDbInput = createDb()): TarstateDbSt
     readonly query: Query;
     readonly options: SnapshotMaterializationOptions;
   }>();
+  let closed = false;
   const notify = (): void => {
+    if (closed) return;
     for (const listener of listeners) listener();
   };
   const publish = async (
@@ -216,10 +219,18 @@ export function createDbStore(input: TarstateDbInput = createDb()): TarstateDbSt
   const store: TarstateDbStore = {
     getSnapshot: () => snapshot,
     subscribe: (listener) => {
+      if (closed) {
+        return () => {};
+      }
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
       };
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      listeners.clear();
     },
     replaceDb: async (input, diagnostics = emptyDiagnostics) => {
       await publish(normalizeDb(input), diagnostics);
