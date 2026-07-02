@@ -17,7 +17,6 @@ export {
 export type {
   MaterializableDb,
   MaterializationBtreeIndex,
-  MaterializationDiagnostic,
   MaterializationEnvDelta,
   MaterializationExplanation,
   MaterializationHashIndex,

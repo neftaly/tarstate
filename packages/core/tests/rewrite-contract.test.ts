@@ -1,30 +1,30 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
+import * as constraintsApi from '@tarstate/core/constraints';
 import {
   attachConstraints,
   check,
   constrain,
   fk,
   req,
-  tryTransactConstrained,
   unique
 } from '@tarstate/core/constraints';
-import {
-  composeRelationRuntimes,
-  type ComposedRelationRuntimeVersion,
-  type RelationRuntime,
-  type RelationRuntimeVersion
-} from '@tarstate/core/adapter';
+import * as dbApi from '@tarstate/core/db';
 import {
   createDb,
   exists,
-  qManyRows,
-  qRows,
+  q,
+  qMany,
+  qManyResult,
+  qResult,
   row,
   transact,
-  type DbOptions
+  tryTransact,
+  type DbOptions,
+  type DbTransactionResult,
+  type QueryBatchResult,
+  type QueryBatchRows
 } from '@tarstate/core/db';
 import {
-  collectDiagnostics,
   diagnostic,
   type TarstateCoreDiagnosticCode,
   type TarstateDiagnostic,
@@ -34,7 +34,7 @@ import {
   type TarstateDiagnosticSeverity
 } from '@tarstate/core/diagnostics';
 import { type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
-import { mat } from '@tarstate/core/materialization';
+import * as queryApi from '@tarstate/core/query';
 import {
   aggregate,
   as,
@@ -43,13 +43,26 @@ import {
   field,
   from,
   gt,
+  isMissing,
+  isNull,
+  join,
   leftJoin,
   maybe,
+  notMissing,
+  notNull,
   pipe,
   project,
+  sel,
+  sel1,
+  self,
   sum,
   value,
-  where
+  where,
+  type CorrelationClauseMap,
+  type EquiJoinClauseMap,
+  type ExprData,
+  type PredicateData,
+  type Query
 } from '@tarstate/core/query';
 import {
   defineSchema,
@@ -59,9 +72,15 @@ import {
 } from '@tarstate/core/schema';
 import {
   createStore,
+  type StoreCommitResult,
   type StoreViewSnapshot
 } from '@tarstate/core/store';
-import { insert } from '@tarstate/core/write';
+import {
+  insert,
+  seed,
+  type SchemaSeedInput,
+  type SchemaSeedPatches
+} from '@tarstate/core/write';
 
 type Account = {
   readonly id: string;
@@ -75,6 +94,9 @@ type Entry = {
   readonly amount: number;
   readonly memo: string;
 };
+
+type QueryRow<Input> = Input extends Query<infer Row> ? Row : never;
+type HasKind<Input> = Input extends { readonly kind: unknown } ? true : false;
 
 const schema = defineSchema({
   accounts: relation<Account>({
@@ -107,19 +129,14 @@ const openingDb = createDb({
   ]
 });
 
-describe('rewrite public contracts', () => {
-  it('names core diagnostic codes while preserving app-extension codes and severity', () => {
+describe('rewrite public API contracts', () => {
+  it('keeps TarstateDiagnostic as the canonical diagnostic type', () => {
     const known = diagnostic({
       code: 'not_implemented',
       severity: 'warning',
       message: 'stubbed'
     });
-    const extended = diagnostic({
-      code: 'app/custom-rule',
-      severity: 'error',
-      message: 'custom app diagnostic'
-    });
-    const normalized = collectDiagnostics('plain message');
+    const dbWithEnv = createDb({}, { env: { tenant: 'acme' } });
 
     expectTypeOf<TarstateCoreDiagnosticCode>().toMatchTypeOf<TarstateDiagnosticCode>();
     expectTypeOf<'foreign_key'>().toMatchTypeOf<TarstateCoreDiagnosticCode>();
@@ -130,45 +147,64 @@ describe('rewrite public contracts', () => {
     expectTypeOf<EvaluateOptions>().toMatchTypeOf<TarstateDiagnosticOptions>();
     expectTypeOf<DbOptions>().toMatchTypeOf<TarstateDiagnosticOptions>();
     expectTypeOf<typeof known>().toEqualTypeOf<TarstateDiagnostic>();
-    expect(known).toEqual({ code: 'not_implemented', severity: 'warning', message: 'stubbed' });
-    expect(extended.code).toBe('app/custom-rule');
-    expect(normalized[0]).toMatchObject({ code: 'diagnostic', severity: 'info', message: 'plain message' });
+    expect(dbWithEnv.env).toEqual({ tenant: 'acme' });
+
+    // @ts-expect-error createDb env must be passed through DbOptions.env.
+    createDb({}, { tenant: 'acme' });
   });
 
-  it('evaluates Relic-style query data synchronously over a Db snapshot', () => {
-    const cashEntries = pipe(
-      from(as(schema.entries, 'entry')),
-      where(eq(field('entry', 'accountId'), value('cash'))),
-      project({
-        id: field<string>('entry', 'id'),
-        amount: field<number>('entry', 'amount')
-      })
-    );
-
-    const rows = qRows(openingDb, cashEntries);
-
-    expectTypeOf(rows).toEqualTypeOf<readonly { readonly id: string; readonly amount: number }[]>();
-    expect(rows).toEqual([{ id: 'e1', amount: 120 }]);
-  });
-
-  it('supports sync batch reads, row lookup, and aggregate projections from one snapshot', () => {
+  it('makes q and qMany row-first with explicit result envelopes', () => {
+    const entry = as(schema.entries, 'entry');
     const positiveEntries = pipe(
-      from(as(schema.entries, 'entry')),
-      where(gt(field('entry', 'amount'), value(0))),
-      project({ id: field<string>('entry', 'id') })
+      from(entry),
+      where(gt(entry.amount, value(0))),
+      project({ id: entry.id, amount: entry.amount })
     );
     const summary = pipe(
-      from(as(schema.entries, 'entry')),
+      from(entry),
       project({ entryCount: count() })
     );
+    const batch = { positiveEntries, summary };
 
-    expect(qManyRows(openingDb, { positiveEntries, summary })).toEqual({
-      positiveEntries: [{ id: 'e1' }],
-      summary: [{ entryCount: 2 }]
-    });
-    const entry = row(openingDb, schema.entries, 'e1');
-    expectTypeOf(entry).toEqualTypeOf<Entry | undefined>();
-    expect(entry).toEqual({ id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid' });
+    const readRows = () => q(openingDb, positiveEntries);
+    const readRelationRows = () => q(openingDb, schema.entries);
+    const readResult = () => qResult(openingDb, positiveEntries);
+    const readBatchRows = () => qMany(openingDb, batch);
+    const readBatchResult = () => qManyResult(openingDb, batch);
+
+    expectTypeOf<ReturnType<typeof readRows>>().toEqualTypeOf<readonly {
+      readonly id: string;
+      readonly amount: number;
+    }[]>();
+    expectTypeOf<ReturnType<typeof readRelationRows>>().toEqualTypeOf<readonly Entry[]>();
+    expectTypeOf<ReturnType<typeof readResult>>().toEqualTypeOf<QueryResult<{
+      readonly id: string;
+      readonly amount: number;
+    }>>();
+    expectTypeOf<ReturnType<typeof readBatchRows>>().toEqualTypeOf<QueryBatchRows<typeof batch>>();
+    expectTypeOf<ReturnType<typeof readBatchResult>>().toEqualTypeOf<QueryBatchResult<typeof batch>>();
+  });
+
+  it('removes duplicated row-only read helpers and the constrained transaction fork from public exports', () => {
+    expect('qRows' in dbApi).toBe(false);
+    expect('qManyRows' in dbApi).toBe(false);
+    expect('tryTransactConstrained' in constraintsApi).toBe(false);
+    expect('transactConstrained' in constraintsApi).toBe(false);
+    expect('any' in queryApi).toBe(false);
+    expect('notAny' in queryApi).toBe(false);
+
+    // @ts-expect-error qRows is intentionally not exported.
+    expect(dbApi.qRows).toBeUndefined();
+    // @ts-expect-error qManyRows is intentionally not exported.
+    expect(dbApi.qManyRows).toBeUndefined();
+    // @ts-expect-error constrained transaction forks are intentionally not exported.
+    expect(constraintsApi.tryTransactConstrained).toBeUndefined();
+    // @ts-expect-error constrained transaction forks are intentionally not exported.
+    expect(constraintsApi.transactConstrained).toBeUndefined();
+    // @ts-expect-error any is intentionally not exported; use or/not instead.
+    expect(queryApi.any).toBeUndefined();
+    // @ts-expect-error notAny is intentionally not exported; use or/not instead.
+    expect(queryApi.notAny).toBeUndefined();
   });
 
   it('keeps relation key lookup typed from relation metadata', () => {
@@ -203,12 +239,8 @@ describe('rewrite public contracts', () => {
     const readByTenantAndId = () => row(openingDb, keyedSchema.byTenantAndId, ['acme', 'entry-a'] as const);
     const hasById = () => exists(openingDb, keyedSchema.byId, 'entry-a');
 
-    expectTypeOf<ReturnType<typeof readById>>().toEqualTypeOf<{ readonly id: string; readonly amount: number } | undefined>();
-    expectTypeOf<ReturnType<typeof readByTenantAndId>>().toEqualTypeOf<{
-      readonly tenantId: string;
-      readonly id: string;
-      readonly amount: number;
-    } | undefined>();
+    expectTypeOf<ReturnType<typeof readById>>().toEqualTypeOf<KeyedEntry | undefined>();
+    expectTypeOf<ReturnType<typeof readByTenantAndId>>().toEqualTypeOf<TenantEntry | undefined>();
     expectTypeOf<ReturnType<typeof hasById>>().toEqualTypeOf<boolean>();
 
     const invalidReadById = () =>
@@ -229,35 +261,30 @@ describe('rewrite public contracts', () => {
     void invalidCompositeExists;
   });
 
-  it('preserves composed relation runtime version types', () => {
-    const numberRuntime = {
-      source: {
-        relationNames: ['numbers'],
-        version: () => 1,
-        rows: () => []
-      }
-    } satisfies RelationRuntime<number>;
-    const labelRuntime = {
-      source: {
-        relationNames: ['labels'],
-        version: () => 'ready',
-        rows: () => []
-      }
-    } satisfies RelationRuntime<'ready'>;
-    const runtime = composeRelationRuntimes(numberRuntime, labelRuntime);
+  it('treats attached constraints as normal Db transaction metadata', () => {
+    const constrained = attachConstraints(openingDb, constrain(
+      req(schema.entries, 'id', 'accountId', 'amount'),
+      unique(schema.entries, 'id'),
+      fk(schema.entries, 'accountId', schema.accounts, 'id'),
+      check(from(as(schema.entries, 'entry')), gt(field('entry', 'amount'), value(-1_000_000)))
+    ));
 
-    expectTypeOf<RelationRuntimeVersion<typeof numberRuntime>>().toEqualTypeOf<number>();
-    expectTypeOf<ComposedRelationRuntimeVersion<[typeof numberRuntime, typeof labelRuntime]>>()
-      .toEqualTypeOf<readonly [number, 'ready']>();
-    expectTypeOf(runtime).toMatchTypeOf<RelationRuntime<readonly [number, 'ready']>>();
-    expectTypeOf<NonNullable<typeof runtime.source.version>>()
-      .returns.toEqualTypeOf<readonly [number, 'ready'] | undefined>();
-    expect(runtime.source.rows(schema.entries)).toEqual([]);
+    const tryCommit = () => tryTransact(
+      constrained,
+      insert(schema.entries, { id: 'bad', accountId: 'missing', amount: 10, memo: 'bad account' })
+    );
+    const commit = () => transact(
+      constrained,
+      insert(schema.entries, { id: 'e3', accountId: 'cash', amount: -20, memo: 'bank fee' })
+    );
+
+    expectTypeOf<ReturnType<typeof tryCommit>>().toEqualTypeOf<DbTransactionResult<typeof constrained>>();
+    expectTypeOf<ReturnType<typeof commit>>().toEqualTypeOf<typeof constrained>();
   });
 
-  it('keeps derived query field access typed without casts', () => {
-    const entry = as(schema.entries, 'entry');
+  it('adds Relic-shaped helper signatures without evaluator behavior', () => {
     const account = as(schema.accounts, 'account');
+    const entry = as(schema.entries, 'entry');
     const summaryRows = pipe(
       from(entry),
       aggregate({
@@ -274,102 +301,90 @@ describe('rewrite public contracts', () => {
       })
     );
     const summary = as(summaryRows, 'summary');
-    const accountSummaryRows = pipe(
+    const byPredicate = pipe(from(entry), join(from(account), eq(entry.accountId, account.id)));
+    const byClause = pipe(
+      from(entry),
+      join(from(account), { accountId: 'id' } satisfies EquiJoinClauseMap<Entry, Account>)
+    );
+    const leftByClause = pipe(
       from(account),
-      leftJoin(summaryRows, eq(account.id, summary.accountId)),
+      leftJoin(summaryRows, { id: 'accountId' } satisfies EquiJoinClauseMap<Account, QueryRow<typeof summaryRows>>),
       project({
         id: account.id,
-        name: field<string>('account', 'name'),
+        name: account.$.name,
         entryCount: maybe(summary.entryCount),
         total: maybe(summary.total)
       })
     );
+    const correlatedRows = sel(from(account), { accountId: 'id' } satisfies CorrelationClauseMap<Entry, Account>);
+    const correlatedRow = sel1(from(account), { accountId: 'id' } satisfies CorrelationClauseMap<Entry, Account>);
+    const wholeRow = self<Entry>();
+    const predicates = [
+      isNull(account.id),
+      notNull(account.$.name),
+      isMissing(field('entry', 'optional')),
+      notMissing(entry.id)
+    ];
 
-    const readAccountSummaryRows = () => qRows(openingDb, accountSummaryRows);
-    expectTypeOf<ReturnType<typeof readAccountSummaryRows>>().toEqualTypeOf<readonly {
+    expectTypeOf<QueryRow<typeof byPredicate>>().toMatchTypeOf<Entry & Account>();
+    expectTypeOf<QueryRow<typeof byClause>>().toMatchTypeOf<Entry & Account>();
+    expectTypeOf<QueryRow<typeof leftByClause>>().toEqualTypeOf<{
       readonly id: string;
       readonly name: string;
       readonly entryCount: number | undefined;
       readonly total: number | undefined;
-    }[]>();
-    expect(() => qRows(openingDb, accountSummaryRows)).toThrow('q is not implemented in rewrite stub');
-  });
-
-  it('preserves row types for zero-cast batch query rows', () => {
-    const entry = as(schema.entries, 'entry');
-    const positiveEntries = pipe(
-      from(entry),
-      where(gt(entry.amount, value(0))),
-      project({ id: entry.id, amount: entry.amount })
-    );
-    const summary = pipe(
-      from(entry),
-      project({ entryCount: count() })
-    );
-    const readBatchRows = () => qManyRows(openingDb, { positiveEntries, summary });
-    expectTypeOf<ReturnType<typeof readBatchRows>>().toEqualTypeOf<{
-      readonly positiveEntries: readonly { readonly id: string; readonly amount: number }[];
-      readonly summary: readonly { readonly entryCount: number }[];
     }>();
-    expect(() => qManyRows(openingDb, { positiveEntries, summary })).toThrow('qMany is not implemented in rewrite stub');
+    expectTypeOf<typeof correlatedRows>().toEqualTypeOf<ExprData<readonly Account[]>>();
+    expectTypeOf<typeof correlatedRow>().toEqualTypeOf<ExprData<Account | undefined>>();
+    expectTypeOf<typeof wholeRow>().toEqualTypeOf<ExprData<Entry>>();
+    expectTypeOf<(typeof predicates)[number]>().toEqualTypeOf<PredicateData>();
   });
 
-  it('keeps writes functional and returns a new Db value', () => {
-    const next = transact(
-      openingDb,
+  it('adds a schema-keyed seed helper for terse transaction rows', () => {
+    const rows = {
+      accounts: [{ id: 'cash', name: 'Cash', kind: 'asset' }],
+      entries: [{ id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid' }]
+    } satisfies SchemaSeedInput<typeof schema>;
+    const patches = () => seed(schema, rows);
+    const commit = () => transact(openingDb, patches());
+
+    expectTypeOf<ReturnType<typeof patches>>().toEqualTypeOf<SchemaSeedPatches<typeof schema>>();
+    expectTypeOf<ReturnType<typeof commit>>().toEqualTypeOf<typeof openingDb>();
+
+    // @ts-expect-error schema-keyed seed rows must match their relation row type.
+    const invalidRows: SchemaSeedInput<typeof schema> = { entries: [{ id: 'e1' }] };
+    void invalidRows;
+  });
+
+  it('trims StoreView and StoreViewSnapshot to the sync external store shape', () => {
+    const view = createStore(openingDb).view(from(schema.entries));
+    const snapshot = view.getSnapshot();
+    const commitResult = () => createStore(openingDb).commit(
       insert(schema.entries, { id: 'e3', accountId: 'cash', amount: -20, memo: 'bank fee' })
     );
 
-    expect(qRows(openingDb, from(schema.entries))).toHaveLength(2);
-    expect(qRows(next, from(schema.entries))).toHaveLength(3);
-  });
+    expectTypeOf<typeof snapshot>().toEqualTypeOf<StoreViewSnapshot<Entry>>();
+    expectTypeOf<StoreViewSnapshot<Entry>>().toEqualTypeOf<{
+      readonly rows: readonly Entry[];
+      readonly diagnostics: readonly TarstateDiagnostic[];
+      readonly revision: number;
+      readonly queryKey: string;
+      readonly version?: unknown;
+    }>();
+    expectTypeOf<Awaited<ReturnType<typeof commitResult>>>().toEqualTypeOf<StoreCommitResult>();
+    expectTypeOf<HasKind<StoreCommitResult>>().toEqualTypeOf<false>();
 
-  it('enforces required, unique, foreign-key, and check constraints as query data', () => {
-    const constrained = attachConstraints(openingDb, constrain(
-      req(schema.entries, 'id', 'accountId', 'amount'),
-      unique(schema.entries, 'id'),
-      fk(schema.entries, 'accountId', schema.accounts, 'id'),
-      check(from(as(schema.entries, 'entry')), gt(field('entry', 'amount'), value(-1_000_000)))
-    ));
-
-    const result = tryTransactConstrained(
-      constrained,
-      insert(schema.entries, { id: 'bad', accountId: 'missing', amount: 10, memo: 'bad account' })
-    );
-
-    expect(result.committed).toBe(false);
-    expect(result.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'foreign_key' })
-    ]));
-  });
-
-  it('gives React-facing stores stable synchronous view snapshots by revision', () => {
-    const store = createStore(openingDb);
-    const view = store.view(from(schema.entries));
-    const first = view.getSnapshot();
-    const second = view.getSnapshot();
-
-    expectTypeOf(first).toMatchTypeOf<StoreViewSnapshot<Entry>>();
-    expect(first.rows).toBe(second.rows);
-    expect(first.revision).toBe(0);
-    expect(first.rows).toHaveLength(2);
-  });
-
-  it('materializes query results without changing the query-facing API', () => {
-    const entries = from(schema.entries);
-    const materialized = mat(openingDb, entries);
-
-    expect(qRows(materialized, entries)).toHaveLength(2);
-    expect(qRows(materialized, entries)).toBe(qRows(materialized, entries));
-  });
-
-  it('keeps projection result types on QueryResult and qRows', () => {
-    const query = pipe(
-      from(as(schema.accounts, 'account')),
-      project({ name: field<string>('account', 'name') })
-    );
-    const result: QueryResult<{ readonly name: string }> = { rows: qRows(openingDb, query), diagnostics: [] };
-
-    expect(result.rows).toEqual([{ name: 'Cash' }, { name: 'Sales' }]);
+    // @ts-expect-error StoreView.read is intentionally not public.
+    expect(view.read).toBeUndefined();
+    // @ts-expect-error StoreView.rows is intentionally not public.
+    expect(view.rows).toBeUndefined();
+    // @ts-expect-error StoreView.kind is intentionally not public.
+    expect(view.kind).toBeUndefined();
+    // @ts-expect-error StoreViewSnapshot.db is intentionally not public.
+    expect(snapshot.db).toBeUndefined();
+    // @ts-expect-error StoreViewSnapshot.source is intentionally not public.
+    expect(snapshot.source).toBeUndefined();
+    // @ts-expect-error StoreViewSnapshot.snapshot is intentionally not public.
+    expect(snapshot.snapshot).toBeUndefined();
   });
 });

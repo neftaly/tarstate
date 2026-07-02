@@ -2,24 +2,27 @@ import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { isRelationRuntime, type RelationRuntime } from '@tarstate/core/adapter';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
-import { createRuntimeStore } from '@tarstate/core/store';
-import { write, type WritePatch } from '@tarstate/core/write';
 import {
   automergeMapAdapter,
   automergeMapSource,
   createAutomergeMapRuntime,
+  defineAutomergeMapRelations,
   withAutomergeRuntimeRelations,
   type AutomergeMapAdapter,
+  type AutomergeMapAdapterOptions,
   type AutomergeMapPath,
-  type AutomergeMapRuntime,
   type AutomergeMapRelation,
-  type AutomergeMapSource
+  type AutomergeMapRuntime,
+  type AutomergeMapRuntimeOptions,
+  type AutomergeMapSource,
+  type AutomergeRelationRuntimeMetadata
 } from '@tarstate/automerge';
 
 type TaskRow = {
   readonly id: string;
   readonly title: string;
 };
+
 type LabelRow = {
   readonly id: string;
   readonly name: string;
@@ -28,6 +31,7 @@ type LabelRow = {
 interface WorkspaceDoc {
   readonly workspace: {
     readonly tasks: readonly TaskRow[];
+    readonly labels: readonly LabelRow[];
   };
 }
 
@@ -48,207 +52,126 @@ const schema = defineSchema({
   })
 });
 
-const taskMapping = [{ relation: schema.tasks, path: ['workspace', 'tasks'] }] as const;
-const tasks = write(schema.tasks);
-const labels = write(schema.labels);
+const defineWorkspaceRelations = defineAutomergeMapRelations<WorkspaceDoc>();
+const taskMapping = defineWorkspaceRelations([
+  { relation: schema.tasks, path: ['workspace', 'tasks'] }
+]);
 
-describe('automerge public adapter contract', () => {
-  it('preserves root exports and typed runtime shapes', async () => {
+describe('automerge public API contract', () => {
+  it('preserves root exports as API stubs', async () => {
     const api = await import('@tarstate/automerge');
-    const doc = Automerge.from<Record<string, unknown>>({});
-    const adapter = automergeMapAdapter({ doc, relations: taskMapping });
-    const source = automergeMapSource(doc, { relations: taskMapping });
-    const runtime = createAutomergeMapRuntime({ doc, relations: taskMapping });
+    const doc = workspaceDoc();
 
     expect(api.automergeMapAdapter).toBe(automergeMapAdapter);
     expect(api.automergeMapSource).toBe(automergeMapSource);
     expect(api.createAutomergeMapRuntime).toBe(createAutomergeMapRuntime);
+    expect(api.defineAutomergeMapRelations).toBe(defineAutomergeMapRelations);
     expect(api.withAutomergeRuntimeRelations).toBe(withAutomergeRuntimeRelations);
     expect('automergeDb' in api).toBe(false);
     expect('automergeDbRelationRuntime' in api).toBe(false);
-    expect(isRelationRuntime(adapter)).toBe(true);
-    expect(isRelationRuntime(runtime)).toBe(true);
-    expect(runtime.kind).toBe('automergeMapRuntime');
-    expect(runtime.adapter.getDoc()).toBe(doc);
-    expectTypeOf(adapter).toMatchTypeOf<AutomergeMapAdapter>();
-    expectTypeOf(source).toMatchTypeOf<AutomergeMapSource>();
-    expectTypeOf(createAutomergeMapRuntime<Record<string, unknown>>).returns.toMatchTypeOf<AutomergeMapRuntime<Record<string, unknown>>>();
+    expect(() => automergeMapAdapter({ doc, relations: taskMapping })).toThrow(/not implemented/);
+    expect(() => automergeMapSource(doc, { relations: taskMapping })).toThrow(/not implemented/);
+    expect(() => createAutomergeMapRuntime({ doc, relations: taskMapping })).toThrow(/not implemented/);
+    expectTypeOf(automergeMapAdapter<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapAdapter<WorkspaceDoc>>();
+    expectTypeOf(automergeMapSource<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapSource>();
   });
 
-  it('checks Automerge relation path roots against document shape keys', () => {
+  it('drops onDocChange from adapter options', () => {
+    const adapterOptions = {
+      doc: workspaceDoc(),
+      relations: taskMapping
+    } satisfies AutomergeMapAdapterOptions<WorkspaceDoc>;
+    const legacyAdapterOptions = {
+      doc: workspaceDoc(),
+      relations: taskMapping,
+      // @ts-expect-error onDocChange was removed; subscribe and call getDoc() instead.
+      onDocChange: () => {}
+    } satisfies AutomergeMapAdapterOptions<WorkspaceDoc>;
+
+    void adapterOptions;
+    void legacyAdapterOptions;
+  });
+
+  it('checks Automerge relation path roots through the helper', () => {
     const workspacePath = ['workspace', 'tasks'] as const satisfies AutomergeMapPath<WorkspaceDoc>;
     const workspaceMapping = taskMapping satisfies readonly AutomergeMapRelation<typeof schema.tasks, WorkspaceDoc>[];
     const invalidWorkspacePath =
       // @ts-expect-error Automerge map paths start with a document key.
       ['missing', 'tasks'] as const satisfies AutomergeMapPath<WorkspaceDoc>;
+    const invalidWorkspaceMapping = defineWorkspaceRelations([
+      {
+        relation: schema.tasks,
+        // @ts-expect-error Automerge map paths start with a document key.
+        path: ['missing', 'tasks']
+      }
+    ]);
 
     expect(workspacePath[0]).toBe('workspace');
-    expect(workspaceMapping[0].path[0]).toBe('workspace');
+    expect(workspaceMapping[0]?.path[0]).toBe('workspace');
     void invalidWorkspacePath;
+    void invalidWorkspaceMapping;
   });
 
-  it('keeps Automerge pluggable through relation runtime metadata', () => {
+  it('normalizes Automerge runtime metadata to relations only', () => {
     const runtime = withAutomergeRuntimeRelations({
       source: {
         relationNames: ['tasks'],
-        rows: () => [{ id: 'task-a', title: 'from optional runtime' }]
+        rows: () => []
       }
     }, schema.tasks);
-
-    expect(runtime.relation).toBe(schema.tasks);
-    expect(runtime.source.relationNames).toEqual(['tasks']);
-    expect(isRelationRuntime(runtime)).toBe(true);
-  });
-
-  it('accepts interface document shapes and preserves extra runtime versions', () => {
-    const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({ workspace: { tasks: [] as readonly TaskRow[] } });
-    const extraRuntime = withAutomergeRuntimeRelations({
+    const mappedRuntime = withAutomergeRuntimeRelations({
       source: {
         relationNames: ['tasks'],
+        rows: () => []
+      }
+    }, taskMapping);
+    const metadata = { relations: [schema.tasks] } satisfies AutomergeRelationRuntimeMetadata;
+
+    expect(runtime.relations).toEqual([schema.tasks]);
+    expect(mappedRuntime.relations).toEqual([schema.tasks]);
+    expect(isRelationRuntime(runtime)).toBe(true);
+    expectTypeOf(runtime.relations).toMatchTypeOf<AutomergeRelationRuntimeMetadata['relations']>();
+    // @ts-expect-error singular relation metadata was removed.
+    void runtime.relation;
+    void metadata;
+  });
+
+  it('keeps adapter-only and composed runtime version types distinct', () => {
+    const extraRuntime = withAutomergeRuntimeRelations({
+      source: {
+        relationNames: ['labels'],
         version: () => 1,
         rows: () => []
       }
-    } satisfies RelationRuntime<number>, schema.tasks);
-    const runtime = createAutomergeMapRuntime({ doc, relations: taskMapping, runtimes: [extraRuntime] });
-
-    expect(runtime.adapter.getDoc()).toBe(doc);
-    expectTypeOf(runtime).toMatchTypeOf<AutomergeMapRuntime<WorkspaceDoc, number>>();
-    expectTypeOf(runtime.source.version).returns.toMatchTypeOf<
-      Automerge.Heads | readonly [Automerge.Heads, ...number[]] | undefined
-    >();
-  });
-
-  it('preserves composed runtime target routing, snapshots, diagnostics, and subscriptions', async () => {
-    const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({ workspace: { tasks: [] as readonly TaskRow[] } });
-    const listenerSet = new Set<() => void>();
-    const appliedPatchBatches: (readonly WritePatch[])[] = [];
-    let unsubscribeCalls = 0;
-    const extraRuntime = withAutomergeRuntimeRelations({
-      source: {
-        relationNames: ['labels'],
-        version: () => 7,
-        rows: (relationRef) => relationRef.name === 'labels'
-          ? [{ id: 'label-a', name: 'from optional runtime' }]
-          : [],
-        diagnostics: () => [{ code: 'diagnostic', message: 'extra source diagnostic' }]
-      },
-      target: {
-        relationNames: ['labels'],
-        apply: (patches) => {
-          appliedPatchBatches.push(patches);
-
-          return {
-            status: 'accepted',
-            patches: patches.length,
-            applied: patches.length,
-            deltas: [],
-            diagnostics: [{ code: 'diagnostic', message: 'extra target diagnostic' }],
-            durability: 'memory',
-            version: 8
-          };
-        }
-      },
-      snapshot: () => ({
-        source: {
-          relationNames: ['labels'],
-          version: () => 9,
-          rows: (relationRef) => relationRef.name === 'labels'
-            ? [{ id: 'label-b', name: 'from snapshot' }]
-            : [],
-          diagnostics: () => [{ code: 'diagnostic', message: 'extra snapshot source diagnostic' }]
-        },
-        version: 9,
-        diagnostics: [{ code: 'diagnostic', message: 'extra snapshot diagnostic' }]
-      }),
-      subscribe: (listener) => {
-        listenerSet.add(listener);
-
-        return () => {
-          unsubscribeCalls += 1;
-          listenerSet.delete(listener);
-        };
-      }
     } satisfies RelationRuntime<number>, schema.labels);
-    const runtime = createAutomergeMapRuntime({ doc, relations: taskMapping, runtimes: [extraRuntime] });
-    let notifications = 0;
-    const unsubscribe = runtime.subscribe(() => {
-      notifications += 1;
-    });
-
-    expect(runtime.source.rows(schema.labels)).toEqual([{ id: 'label-a', name: 'from optional runtime' }]);
-    expect(runtime.source.version?.()).toEqual([Automerge.getHeads(doc), 7]);
-    expect(runtime.source.diagnostics?.()).toEqual([
-      expect.objectContaining({ code: 'not_implemented' }),
-      { code: 'diagnostic', message: 'extra source diagnostic' }
-    ]);
-    expect(runtime.target?.relationNames).toEqual(['tasks', 'labels']);
-    expect(runtime.target?.ownsRelation?.('tasks')).toBe(true);
-    expect(runtime.target?.ownsRelation?.('labels')).toBe(true);
-
-    const result = await runtime.target?.apply([labels.insert({ id: 'label-a', name: 'urgent' })]);
-    expect(result).toMatchObject({
-      status: 'accepted',
-      patches: 1,
-      applied: 1,
-      durability: 'memory',
-      diagnostics: [{ code: 'diagnostic', message: 'extra target diagnostic' }],
-      version: [Automerge.getHeads(doc), 7]
-    });
-    expect(appliedPatchBatches).toHaveLength(1);
-    expect(appliedPatchBatches[0]).toEqual([labels.insert({ id: 'label-a', name: 'urgent' })]);
-
-    const snapshot = runtime.snapshot?.();
-    expect(snapshot?.source.rows(schema.labels)).toEqual([{ id: 'label-b', name: 'from snapshot' }]);
-    expect(snapshot?.version).toEqual([Automerge.getHeads(doc), 9]);
-    expect(snapshot?.diagnostics).toEqual([
-      expect.objectContaining({ code: 'not_implemented' }),
-      { code: 'diagnostic', message: 'extra snapshot diagnostic' },
-      expect.objectContaining({ code: 'not_implemented' }),
-      { code: 'diagnostic', message: 'extra snapshot source diagnostic' }
-    ]);
-
-    runtime.adapter.setDoc(doc);
-    for (const listener of listenerSet) listener();
-    expect(notifications).toBe(2);
-
-    unsubscribe();
-    expect(unsubscribeCalls).toBe(1);
-    expect(listenerSet.size).toBe(0);
-  });
-
-  it('reports map writes as unimplemented without mutating the document', async () => {
-    const doc = Automerge.from<Record<string, unknown>>({});
-    const adapter = automergeMapAdapter({ doc, relations: taskMapping });
-
-    const result = await adapter.target.apply([
-      tasks.insert({ id: 'task-a', title: 'rewrite target' })
-    ]);
-
-    expect(result).toMatchObject({
-      status: 'rejected',
-      patches: 1,
-      applied: 0,
-      diagnostics: [expect.objectContaining({ code: 'not_implemented' })]
-    });
-    expect(adapter.getDoc()).toBe(doc);
-    expect(adapter.source.rows(schema.tasks)).toEqual([]);
-  });
-
-  it('creates a runtime that plugs into the core store surface', async () => {
-    const runtime = createAutomergeMapRuntime({
-      doc: Automerge.from<Record<string, unknown>>({}),
+    const adapterOnlyOptions = {
+      doc: workspaceDoc(),
       relations: taskMapping
-    });
-    const store = createRuntimeStore({ runtime, relations: runtime.relations, env: { tenant: 'acme' } });
-    const snapshot = store.getSnapshot();
-    const result = await store.commit(tasks.insert({ id: 'task-a', title: 'rewrite target' }));
+    } satisfies AutomergeMapRuntimeOptions<WorkspaceDoc>;
+    const composedOptions = {
+      doc: workspaceDoc(),
+      relations: taskMapping,
+      runtimes: [extraRuntime]
+    } satisfies AutomergeMapRuntimeOptions<WorkspaceDoc, number>;
+    const createAdapterOnly = () => createAutomergeMapRuntime(adapterOnlyOptions);
+    const createComposed = () => createAutomergeMapRuntime(composedOptions);
 
-    expect(snapshot.db.data).toEqual({});
-    expect(runtime.adapter.source.diagnostics?.()).toEqual([expect.objectContaining({ code: 'not_implemented' })]);
-    expect(result).toMatchObject({
-      kind: 'tarstateCommit',
-      status: 'rejected',
-      diagnostics: [expect.objectContaining({ code: 'not_implemented' })]
-    });
+    expectTypeOf(createAdapterOnly).returns.toMatchTypeOf<AutomergeMapRuntime<WorkspaceDoc>>();
+    expectTypeOf(createComposed).returns.toMatchTypeOf<AutomergeMapRuntime<WorkspaceDoc, number>>();
+    expectTypeOf<NonNullable<AutomergeMapRuntime<WorkspaceDoc>['source']['version']>>()
+      .returns.toMatchTypeOf<Automerge.Heads | undefined>();
+    expectTypeOf<NonNullable<AutomergeMapRuntime<WorkspaceDoc, number>['source']['version']>>()
+      .returns.toMatchTypeOf<readonly [Automerge.Heads, ...number[]] | undefined>();
   });
 });
+
+function workspaceDoc(): Automerge.Doc<WorkspaceDoc> {
+  const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({
+    workspace: {
+      tasks: [],
+      labels: []
+    }
+  });
+
+  return doc;
+}

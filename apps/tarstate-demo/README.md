@@ -1,22 +1,11 @@
-# Tarstate Real Estate Demo
+# Tarstate API Walkthrough Demo
 
-This package is a compact React walkthrough for Relic-style Tarstate queries.
+This package is a compact React walkthrough for the app-facing Tarstate API
+shape. It intentionally avoids runtime query execution while the core packages
+are being rewritten.
 
-The demo uses one normalized real-estate sales dataset:
-
-- `agents`
-- `buyers`
-- `properties`
-- `rooms`
-- `offers`
-- `decisions`
-- `commissionRates`
-
-It shows query values for property info, current offers, accepted sales, unsold
-listings, open offers, and commission due by agent. The page keeps the focus on
-controls, query snippets, result tables, materialized reads, transactions,
-diagnostics, React store views, and running the same listing query over an
-Automerge-backed runtime snapshot.
+The page shows snippets for rows-first `q`, diagnostics-aware `qResult`, the
+React provider `initialDb` seed prop, and slim hook return state.
 
 Run locally:
 

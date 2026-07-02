@@ -1,12 +1,11 @@
-import * as Automerge from '@automerge/automerge';
+import type * as Automerge from '@automerge/automerge';
 import type {
   AdapterSnapshot,
   AdapterSource,
+  ComposedRelationRuntimeVersion,
   RelationPatchTarget,
-  RelationRuntime,
-  TarstateDiagnostic
+  RelationRuntime
 } from '@tarstate/core/adapter';
-import { composeRelationRuntimes } from '@tarstate/core/adapter';
 import type { RelationRef } from '@tarstate/core/schema';
 import type { WritePatch } from '@tarstate/core/write';
 
@@ -33,7 +32,6 @@ export type AutomergeMapAdapterOptions<
 > = {
   readonly doc: Automerge.Doc<DocumentShape>;
   readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
-  readonly onDocChange?: (doc: Automerge.Doc<DocumentShape>) => void;
   readonly changeMessage?: string | ((patches: readonly WritePatch[]) => string | undefined);
   readonly storage?: AutomergeMapStorageOptions;
 };
@@ -46,10 +44,9 @@ export type AutomergeMapSourceOptions<
 
 export type AutomergeMapSource = AdapterSource<Automerge.Heads>;
 export type AutomergeComposedRuntimeVersion<RuntimeVersion = unknown> =
-  readonly [Automerge.Heads, ...RuntimeVersion[]];
-export type AutomergeRuntimeVersion<RuntimeVersion = unknown> =
-  | Automerge.Heads
-  | AutomergeComposedRuntimeVersion<RuntimeVersion>;
+  ComposedRelationRuntimeVersion<readonly [RelationRuntime<Automerge.Heads>, ...RelationRuntime<RuntimeVersion>[]]>;
+export type AutomergeRuntimeVersion<RuntimeVersion = never> =
+  [RuntimeVersion] extends [never] ? Automerge.Heads : AutomergeComposedRuntimeVersion<RuntimeVersion>;
 
 export type AutomergeMapAdapter<
   DocumentShape extends object = Record<string, unknown>
@@ -62,29 +59,23 @@ export type AutomergeMapAdapter<
   readonly subscribe: (listener: () => void) => () => void;
 };
 
-export type AutomergeRelationRuntimeMetadata =
-  | {
-      readonly relation: RelationRef;
-      readonly relations?: never;
-    }
-  | {
-      readonly relation?: never;
-      readonly relations: readonly (RelationRef | AutomergeMapRelation)[];
-    };
+export type AutomergeRelationRuntimeMetadata = {
+  readonly relations: readonly RelationRef[];
+};
 
 export type AutomergeRelationRuntime<Version = unknown> =
   RelationRuntime<Version> & AutomergeRelationRuntimeMetadata;
 
 export type AutomergeMapRuntimeOptions<
   DocumentShape extends object = Record<string, unknown>,
-  RuntimeVersion = unknown
+  RuntimeVersion = never
 > = AutomergeMapAdapterOptions<DocumentShape> & {
   readonly runtimes?: readonly AutomergeRelationRuntime<RuntimeVersion>[];
 };
 
 export type AutomergeMapRuntime<
   DocumentShape extends object = Record<string, unknown>,
-  RuntimeVersion = unknown
+  RuntimeVersion = never
 > = RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>> & {
   readonly kind: 'automergeMapRuntime';
   readonly adapter: AutomergeMapAdapter<DocumentShape>;
@@ -92,81 +83,27 @@ export type AutomergeMapRuntime<
   readonly subscribe: (listener: () => void) => () => void;
 };
 
+export function defineAutomergeMapRelations<DocumentShape extends object>() {
+  return <const Relations extends readonly AutomergeMapRelation<RelationRef, DocumentShape>[]>(
+    relations: Relations
+  ): Relations => relations;
+}
+
 export function automergeMapSource<
   DocumentShape extends object = Record<string, unknown>
 >(
-  doc: Automerge.Doc<DocumentShape>,
-  options: AutomergeMapSourceOptions<DocumentShape>
+  _doc: Automerge.Doc<DocumentShape>,
+  _options: AutomergeMapSourceOptions<DocumentShape>
 ): AutomergeMapSource {
-  const relationNames = relationNamesFor(options.relations);
-
-  return {
-    relationNames,
-    rows: () => [],
-    lookup: () => [],
-    rangeLookup: () => [],
-    version: () => Automerge.getHeads(doc),
-    diagnostics: () => [stubDiagnostic('automerge map source is not implemented')]
-  };
+  throwNotImplemented('automergeMapSource');
 }
 
 export function automergeMapAdapter<
   DocumentShape extends object = Record<string, unknown>
 >(
-  options: AutomergeMapAdapterOptions<DocumentShape>
+  _options: AutomergeMapAdapterOptions<DocumentShape>
 ): AutomergeMapAdapter<DocumentShape> {
-  assertSupportedStorage(options.storage);
-
-  let doc = options.doc;
-  const listeners = new Set<() => void>();
-  const relationNames = relationNamesFor(options.relations);
-  const source: AutomergeMapSource = {
-    relationNames,
-    rows: () => [],
-    lookup: () => [],
-    rangeLookup: () => [],
-    version: () => Automerge.getHeads(doc),
-    diagnostics: () => [stubDiagnostic('automerge map adapter source is not implemented')]
-  };
-  const target: RelationPatchTarget<Automerge.Heads> = {
-    relationNames,
-    ownsRelation: (relationName) => relationNames.includes(relationName),
-    apply: (patches) => ({
-      status: 'rejected',
-      patches: patches.length,
-      applied: 0,
-      deltas: [],
-      diagnostics: [stubDiagnostic('automerge map adapter writes are not implemented')],
-      durability: 'durable',
-      version: Automerge.getHeads(doc)
-    })
-  };
-  const notify = () => {
-    for (const listener of listeners) listener();
-  };
-
-  return {
-    source,
-    target,
-    relations: options.relations,
-    getDoc: () => doc,
-    setDoc: (nextDoc) => {
-      doc = nextDoc;
-      options.onDocChange?.(doc);
-      notify();
-    },
-    snapshot: () => ({
-      source,
-      version: Automerge.getHeads(doc),
-      diagnostics: [stubDiagnostic('automerge map adapter snapshot is not implemented')]
-    }),
-    subscribe: (listener) => {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    }
-  };
+  throwNotImplemented('automergeMapAdapter');
 }
 
 export function withAutomergeRuntimeRelations<Version>(
@@ -181,83 +118,42 @@ export function withAutomergeRuntimeRelations<Version>(
   runtime: RelationRuntime<Version>,
   relationOrRelations: RelationRef | readonly (RelationRef | AutomergeMapRelation)[]
 ): AutomergeRelationRuntime<Version> {
-  if (isReadonlyArray(relationOrRelations)) {
-    return { ...runtime, relations: relationOrRelations };
-  }
+  const relations: readonly RelationRef[] = isReadonlyArray(relationOrRelations)
+    ? relationOrRelations.map(relationRefFor)
+    : [relationOrRelations];
 
-  return { ...runtime, relation: relationOrRelations };
+  return { ...runtime, relations };
 }
 
+export function createAutomergeMapRuntime<
+  DocumentShape extends object = Record<string, unknown>
+>(
+  options: AutomergeMapAdapterOptions<DocumentShape> & { readonly runtimes?: readonly [] | undefined }
+): AutomergeMapRuntime<DocumentShape>;
 export function createAutomergeMapRuntime<
   DocumentShape extends object = Record<string, unknown>,
   RuntimeVersion = unknown
 >(
-  options: AutomergeMapRuntimeOptions<DocumentShape, RuntimeVersion>
-): AutomergeMapRuntime<DocumentShape, RuntimeVersion> {
-  const adapter = automergeMapAdapter<DocumentShape>(options);
-  const runtimes = options.runtimes ?? [];
-  const runtime: RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>> = runtimes.length === 0
-    ? adapter
-    : composeRelationRuntimes(adapter, ...runtimes);
-  const relations = uniqueRelations([
-    ...options.relations.map((mapping) => mapping.relation),
-    ...runtimes.flatMap(runtimeRelations)
-  ]);
-
-  return {
-    kind: 'automergeMapRuntime',
-    ...runtime,
-    adapter,
-    relations,
-    subscribe: runtime.subscribe ?? adapter.subscribe
-  };
-}
-
-function relationNamesFor<DocumentShape extends object>(
-  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[]
-): readonly string[] {
-  return Array.from(new Set(relations.map((mapping) => mapping.relation.name)));
-}
-
-function runtimeRelations(runtime: AutomergeRelationRuntime<unknown>): readonly RelationRef[] {
-  if ('relation' in runtime && runtime.relation !== undefined) {
-    return [runtime.relation];
+  options: AutomergeMapAdapterOptions<DocumentShape> & {
+    readonly runtimes: readonly AutomergeRelationRuntime<RuntimeVersion>[];
   }
-
-  return runtime.relations.map((relationOrMapping) =>
-    isMapRelation(relationOrMapping) ? relationOrMapping.relation : relationOrMapping
-  );
+): AutomergeMapRuntime<DocumentShape, RuntimeVersion>;
+export function createAutomergeMapRuntime(_options: unknown): never {
+  throwNotImplemented('createAutomergeMapRuntime');
 }
 
-function uniqueRelations(relations: readonly RelationRef[]): readonly RelationRef[] {
-  const seen = new Set<string>();
-  return relations.filter((relation) => {
-    if (seen.has(relation.name)) {
-      return false;
-    }
-
-    seen.add(relation.name);
-    return true;
-  });
+function relationRefFor(input: RelationRef | AutomergeMapRelation): RelationRef {
+  return isMapRelation(input) ? input.relation : input;
 }
 
 function isMapRelation(input: RelationRef | AutomergeMapRelation): input is AutomergeMapRelation {
-  return 'relation' in input && 'path' in input;
+  return 'path' in input;
 }
 
 function isReadonlyArray<Value>(input: Value | readonly Value[]): input is readonly Value[] {
   return Array.isArray(input);
 }
 
-function assertSupportedStorage(storage: AutomergeMapStorageOptions | undefined): void {
-  if (storage?.codec !== undefined && storage.codec !== 'map-v1') {
-    throw new Error(`unsupported Automerge storage codec: ${String(storage.codec)}`);
-  }
-}
-
-function stubDiagnostic(message: string): TarstateDiagnostic {
-  return {
-    code: 'not_implemented',
-    message
-  };
+function throwNotImplemented(surface: string): never {
+  throw new Error(`${surface} is not implemented`);
 }

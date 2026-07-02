@@ -8,7 +8,6 @@ export type {
   StoreCommitResult,
   StoreCommitSnapshot,
   StoreCommitStatus,
-  StoreDiagnostic,
   StoreMappedQueryBatchResult,
   StoreQueries,
   StoreQuery,
@@ -19,8 +18,6 @@ export type {
   StoreSeedInput,
   StoreSnapshot,
   StoreView,
-  StoreViewRead,
-  StoreViewReadOptions,
   StoreViewSnapshot,
   StoreWhatIf
 } from './stub.js';

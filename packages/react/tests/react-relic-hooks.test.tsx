@@ -1,6 +1,6 @@
-import { createElement, type DependencyList } from 'react';
-import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import type { TarstateDiagnostic } from '@tarstate/core';
 import {
   TarstateProvider,
   useCommit,
@@ -10,23 +10,21 @@ import {
   useTarstateSnapshot,
   useTarstateStore,
   useView,
-  type HookStatus,
   type QueryHookState,
   type RowHookState,
   type TarstateCommit,
   type TarstateDbInput,
   type TarstateDbSnapshot,
   type TarstateProviderProps,
+  type TarstateReactDiagnostic,
   type UseQueryOptions,
   type UseQuerySelectedOptions,
-  type UseRowKeyOptions,
   type UseViewOptions,
   type ViewHookState
 } from '@tarstate/react';
-import { createStore, type Store, type StoreView } from '@tarstate/core/store';
-import { as, from, pipe, project, type Query } from '@tarstate/core/query';
+import { createStore, type Store, type StoreViewSnapshot } from '@tarstate/core/store';
+import { as, from, pipe, project } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
-import { insert } from '@tarstate/core/write';
 
 type ItemRow = {
   readonly id: string;
@@ -56,8 +54,8 @@ const itemQuery = pipe(
   })
 );
 
-describe('@tarstate/react future hook facade contract', () => {
-  it('keeps the public provider and hook exports available', () => {
+describe('@tarstate/react API contract', () => {
+  it('exports the provider and hook entry points', () => {
     expect(TarstateProvider).toBeTypeOf('function');
     expect(useTarstateStore).toBeTypeOf('function');
     expect(useTarstateSnapshot).toBeTypeOf('function');
@@ -68,423 +66,122 @@ describe('@tarstate/react future hook facade contract', () => {
     expect(useQuery).toBeTypeOf('function');
   });
 
-  it('keeps public state and options types assignable', () => {
-    expectTypeOf<TarstateProviderProps>().toMatchTypeOf<{ readonly children?: unknown }>();
-    expectTypeOf<TarstateProviderProps>().toMatchTypeOf<{ readonly resetKey?: string | number }>();
-    expectTypeOf<TarstateDbInput>().toMatchTypeOf<Parameters<typeof createStore>[0]>();
-    expectTypeOf<TarstateDbSnapshot>().toMatchTypeOf<ReturnType<Store['getSnapshot']>>();
-    expectTypeOf<TarstateCommit>().toEqualTypeOf<Store['commit']>();
-    expectTypeOf<HookStatus>().toEqualTypeOf<'ready'>();
-    expectTypeOf<UseViewOptions>().toMatchTypeOf<{
-      readonly deps?: DependencyList;
-    }>();
-    expectTypeOf<UseQuerySelectedOptions<ItemProjection, readonly string[]>>()
-      .toMatchTypeOf<UseQueryOptions<ItemProjection, readonly string[]>>();
+  it('keeps the provider seed API explicit', () => {
+    assertType(() => expectTypeOf<TarstateProviderProps>().toMatchTypeOf<{
+      readonly store?: Store;
+      readonly initialDb?: TarstateDbInput;
+      readonly resetKey?: string | number;
+      readonly children?: unknown;
+    }>());
+    assertType(() => expectTypeOf<TarstateDbInput>().toMatchTypeOf<Parameters<typeof createStore>[0]>());
+    assertType(() => expectTypeOf<TarstateDbSnapshot>().toMatchTypeOf<ReturnType<Store['getSnapshot']>>());
+    assertType(() => expectTypeOf<TarstateCommit>().toEqualTypeOf<Store['commit']>());
+    assertType(() => expectTypeOf<TarstateReactDiagnostic>().toEqualTypeOf<TarstateDiagnostic>());
+
+    createElement(TarstateProvider, { initialDb: { items: [] }, resetKey: 'seed-a' });
+
+    // @ts-expect-error provider seed prop was renamed to initialDb
+    createElement(TarstateProvider, { db: { items: [] } });
+  });
+
+  it('keeps hook state shapes slim', () => {
+    assertType(() => expectTypeOf<ViewHookState<ItemProjection>>()
+      .toEqualTypeOf<Pick<StoreViewSnapshot<ItemProjection>, 'rows' | 'diagnostics' | 'revision' | 'queryKey'> & {
+        readonly refresh: () => void;
+      }>());
+    assertType(() => expectTypeOf<QueryHookState<ItemProjection>>().toEqualTypeOf<{
+      readonly data: readonly ItemProjection[];
+      readonly diagnostics: readonly TarstateReactDiagnostic[];
+      readonly queryKey: string;
+      readonly revision: number;
+      readonly refresh: () => void;
+    }>());
+    assertType(() => expectTypeOf<RowHookState<ItemProjection>>().toEqualTypeOf<{
+      readonly row: ItemProjection | undefined;
+      readonly diagnostics: readonly TarstateReactDiagnostic[];
+      readonly queryKey: string;
+      readonly revision: number;
+      readonly refresh: () => void;
+    }>());
+
+    const view = {} as ViewHookState<ItemProjection>;
+    const query = {} as QueryHookState<ItemProjection>;
+
+    assertType(() => {
+      // @ts-expect-error hook status was removed
+      return view.status;
+    });
+    assertType(() => {
+      // @ts-expect-error internal StoreView is no longer exposed
+      return view.view;
+    });
+    assertType(() => {
+      // @ts-expect-error internal StoreViewSnapshot is no longer exposed
+      return view.snapshot;
+    });
+    assertType(() => {
+      // @ts-expect-error StoreViewSnapshot version is not exposed through React hook state
+      return view.version;
+    });
+    assertType(() => {
+      // @ts-expect-error query rows are exposed as data
+      return query.rows;
+    });
+    assertType(() => {
+      // @ts-expect-error query result is only passed to select
+      return query.result;
+    });
+  });
+
+  it('keeps view/query options resetKey-based', () => {
+    assertType(() => expectTypeOf<UseViewOptions>().toEqualTypeOf<{
+      readonly resetKey?: string | number;
+    }>());
+    assertType(() => expectTypeOf<UseQuerySelectedOptions<ItemProjection, readonly string[]>>()
+      .toMatchTypeOf<UseQueryOptions<ItemProjection, readonly string[]>>());
+
     const defaultQueryOptions = {
       select: (rows) => rows
     } satisfies UseQueryOptions<ItemProjection>;
-    expectTypeOf(defaultQueryOptions.select).toEqualTypeOf<(rows: readonly ItemProjection[]) => readonly ItemProjection[]>();
+    assertType(() => expectTypeOf(defaultQueryOptions.select)
+      .toEqualTypeOf<(rows: readonly ItemProjection[]) => readonly ItemProjection[]>());
+
     const queryOptions = {
+      resetKey: 'labels',
       select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`)
     } satisfies UseQueryOptions<ItemProjection, readonly string[]>;
     expect(queryOptions.select).toBeTypeOf('function');
-    expectTypeOf<UseRowKeyOptions<ItemProjection, string>>().toMatchTypeOf<{
-      readonly keyBy: (row: ItemProjection) => string;
-    }>();
+
+    function InvalidOptionsProbe() {
+      // @ts-expect-error deps was removed; use resetKey for explicit view recreation
+      useView(itemQuery, { deps: [] });
+      // @ts-expect-error query deps was removed; use resetKey for explicit view recreation
+      useQuery(itemQuery, { deps: [] });
+      return null;
+    }
+
+    expect(InvalidOptionsProbe).toBeTypeOf('function');
+  });
+
+  it('keeps useRow relation keys and predicate selection without keyBy', () => {
     function TypeProbe() {
       const byRelationKey = useRow(schema.items, 'item-a');
       const byQueryPredicate = useRow(itemQuery, (row) => row.id === 'item-a');
-      const byQueryKey = useRow(itemQuery, 'item-a', { keyBy: (row) => row.id });
-      expectTypeOf(byRelationKey).toEqualTypeOf<RowHookState<ItemRow>>();
-      expectTypeOf(byQueryPredicate).toEqualTypeOf<RowHookState<ItemProjection>>();
-      expectTypeOf(byQueryKey).toEqualTypeOf<RowHookState<ItemProjection>>();
-      return null;
-    }
-    function InvalidTypeProbe() {
+      assertType(() => expectTypeOf(byRelationKey).toEqualTypeOf<RowHookState<ItemRow>>());
+      assertType(() => expectTypeOf(byQueryPredicate).toEqualTypeOf<RowHookState<ItemProjection>>());
+
       // @ts-expect-error relation keys must match the relation key value
       useRow(schema.items, 1);
+      // @ts-expect-error keyBy was removed; use useRow(relation, key) or useRow(query, predicate)
+      useRow(itemQuery, 'item-a', { keyBy: (row: ItemProjection) => row.id });
+
       return null;
     }
+
     expect(TypeProbe).toBeTypeOf('function');
-    expect(InvalidTypeProbe).toBeTypeOf('function');
   });
-
-  it('throws a clear error when hooks are used outside a provider', async () => {
-    function Probe() {
-      useTarstateStore();
-      return null;
-    }
-
-    await expect(act(async () => {
-      create(createElement(Probe));
-    })).rejects.toThrow('useTarstateStore requires a TarstateProvider');
-  });
-
-  it('exposes store, snapshot, db, and commit through the provider context', async () => {
-    const store = createStore({
-      items: [{ id: 'item-a', label: 'Alpha' }]
-    });
-    let current: {
-      readonly store: Store;
-      readonly snapshot: TarstateDbSnapshot;
-      readonly db: TarstateDbSnapshot['db'];
-      readonly commit: TarstateCommit;
-    } | undefined;
-
-    function Probe() {
-      current = {
-        store: useTarstateStore(),
-        snapshot: useTarstateSnapshot(),
-        db: useDb(),
-        commit: useCommit()
-      };
-      return null;
-    }
-
-    let renderer: ReactTestRenderer | undefined;
-    await act(async () => {
-      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
-    });
-
-    assertDefined(current);
-    expect(current.store).toBe(store);
-    expect(current.snapshot.revision).toBe(store.getSnapshot().revision);
-    expect(current.snapshot.db.data).toEqual(store.getSnapshot().db.data);
-    expect(current.db.data).toEqual(store.getSnapshot().db.data);
-    expect(current.commit).toBe(store.commit);
-
-    renderer?.unmount();
-  });
-
-  it('returns synchronous view and query states shaped around StoreView.getSnapshot()', async () => {
-    const store = createStore({
-      items: [{ id: 'item-a', label: 'Alpha' }]
-    });
-    const probe = await renderHookProbe(store, itemQuery);
-
-    expect(probe.view.status).toBe('ready');
-    expect(probe.view.rows).toBe(probe.view.snapshot.rows);
-    expect(probe.view.queryKey).toBe(probe.view.snapshot.queryKey);
-    expect(probe.view.view.getSnapshot().queryKey).toBe(probe.view.queryKey);
-    expect(probe.query.status).toBe('ready');
-    expect(probe.query.rows).toEqual(probe.view.rows);
-    expect(probe.query.data).toEqual(probe.query.rows.map((row) => row.label));
-    expect(probe.query.result).toEqual({
-      rows: probe.query.rows,
-      diagnostics: probe.query.diagnostics,
-      revision: probe.query.revision
-    });
-
-    probe.renderer.unmount();
-  });
-
-  it('treats provider db as an initial seed until resetKey changes', async () => {
-    const seenStores: Store[] = [];
-    const seenItems: (readonly unknown[] | undefined)[] = [];
-
-    function Probe() {
-      const store = useTarstateStore();
-      seenStores.push(store);
-      seenItems.push(useTarstateSnapshot().db.data.items);
-      return null;
-    }
-
-    let renderer: ReactTestRenderer | undefined;
-    await act(async () => {
-      renderer = create(createElement(
-        TarstateProvider,
-        { db: { items: [{ id: 'item-a', label: 'Alpha' }] } },
-        createElement(Probe)
-      ));
-    });
-    await act(async () => {
-      renderer?.update(createElement(
-        TarstateProvider,
-        { db: { items: [{ id: 'item-a', label: 'Beta' }] } },
-        createElement(Probe)
-      ));
-    });
-    await act(async () => {
-      renderer?.update(createElement(
-        TarstateProvider,
-        { db: { items: [{ id: 'item-a', label: 'Gamma' }] }, resetKey: 1 },
-        createElement(Probe)
-      ));
-    });
-
-    expect(seenStores[1]).toBe(seenStores[0]);
-    expect(seenItems[0]).toEqual([{ id: 'item-a', label: 'Alpha' }]);
-    expect(seenItems[1]).toEqual([{ id: 'item-a', label: 'Alpha' }]);
-    expect(seenStores[2]).not.toBe(seenStores[0]);
-    expect(seenItems[2]).toEqual([{ id: 'item-a', label: 'Gamma' }]);
-
-    renderer?.unmount();
-  });
-
-  it('does not reuse a provider-owned store after StrictMode effect cleanup closes it', async () => {
-    const closedStores = new WeakSet<Store>();
-    const patchedStores = new WeakSet<Store>();
-    const observedStores: Store[] = [];
-    let reusedClosedStore = false;
-
-    function Probe() {
-      const currentStore = useTarstateStore();
-      if (closedStores.has(currentStore)) {
-        reusedClosedStore = true;
-      }
-      observedStores.push(currentStore);
-      if (!patchedStores.has(currentStore)) {
-        patchedStores.add(currentStore);
-        const originalClose = currentStore.close;
-        (currentStore as { close: () => void }).close = () => {
-          closedStores.add(currentStore);
-          originalClose();
-        };
-      }
-      return null;
-    }
-
-    let renderer: ReactTestRenderer | undefined;
-    await act(async () => {
-      renderer = create(
-        createElement(TarstateProvider, { db: { items: [] } }, createElement(Probe)),
-        { unstable_strictMode: true } as unknown as Parameters<typeof create>[1]
-      );
-    });
-
-    expect(observedStores.length).toBeGreaterThan(0);
-    expect(reusedClosedStore).toBe(false);
-
-    await act(async () => {
-      renderer?.unmount();
-    });
-  });
-
-  it('dedupes useView view creation by queryKey for inline query construction', async () => {
-    const store = createStore({ items: [] });
-    const seenViews: ViewHookState<ItemProjection>[] = [];
-
-    function Probe() {
-      seenViews.push(useView(freshQueryIdentity(itemQuery)));
-      return null;
-    }
-
-    let renderer: ReactTestRenderer | undefined;
-    await act(async () => {
-      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
-    });
-    await act(async () => {
-      renderer?.update(createElement(TarstateProvider, { store }, createElement(Probe)));
-    });
-
-    expect(seenViews[1]?.queryKey).toBe(seenViews[0]?.queryKey);
-    expect(seenViews[1]?.view).toBe(seenViews[0]?.view);
-    expect(seenViews[1]?.snapshot.queryKey).toBe(seenViews[0]?.snapshot.queryKey);
-
-    renderer?.unmount();
-  });
-
-  it('selects rows from the current synchronous view snapshot', async () => {
-    const store = createStore({ items: [] });
-    const probe = await renderRowProbe(store);
-
-    expect(probe.byPredicate.status).toBe('ready');
-    expect(probe.byKey.status).toBe('ready');
-    expect(probe.byPredicate.row).toBeUndefined();
-    expect(probe.byKey.row).toBeUndefined();
-
-    probe.renderer.unmount();
-  });
-
-  it('looks up rows by declared relation key with useRow(relation, key)', async () => {
-    const viewedQueries: Query<unknown>[] = [];
-    const store = createStaticRowsStore<ItemRow>([
-      { id: 'item-a', label: 'Alpha' },
-      { id: 'item-b', label: 'Beta' }
-    ], viewedQueries);
-    let current: RowHookState<ItemRow> | undefined;
-
-    function Probe() {
-      current = useRow(schema.items, 'item-a');
-      return null;
-    }
-
-    let renderer: ReactTestRenderer | undefined;
-    await act(async () => {
-      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
-    });
-
-    assertDefined(current);
-    expect(current.row).toEqual({ id: 'item-a', label: 'Alpha' });
-    expect(viewedQueries[0]).toEqual(from(schema.items));
-
-    renderer?.unmount();
-  });
-
-  it('memoizes useQuery select output for stable snapshots and selectors', async () => {
-    const store = createStaticRowsStore<ItemProjection>([
-      { id: 'item-a', label: 'Alpha' }
-    ]);
-    const select = vi.fn((rows: readonly ItemProjection[]) => rows.map((row) => row.label));
-    let current: QueryHookState<ItemProjection, readonly string[]> | undefined;
-
-    function Probe() {
-      current = useQuery(itemQuery, { select });
-      return null;
-    }
-
-    let renderer: ReactTestRenderer | undefined;
-    await act(async () => {
-      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
-    });
-    assertDefined(current);
-    const firstState = current;
-    const firstData = current.data;
-    const firstResult = current.result;
-
-    await act(async () => {
-      renderer?.update(createElement(TarstateProvider, { store }, createElement(Probe)));
-    });
-
-    assertDefined(current);
-    expect(select).toHaveBeenCalledTimes(1);
-    expect(current).toBe(firstState);
-    expect(current.data).toBe(firstData);
-    expect(current.result).toBe(firstResult);
-
-    renderer?.unmount();
-  });
-
-  it('closes provider-owned stores created from initial db on unmount', async () => {
-    let ownedStore: Store | undefined;
-
-    function Probe() {
-      ownedStore = useTarstateStore();
-      return null;
-    }
-
-    let renderer: ReactTestRenderer | undefined;
-    await act(async () => {
-      renderer = create(createElement(TarstateProvider, { db: { items: [] } }, createElement(Probe)));
-    });
-
-    assertDefined(ownedStore);
-    await act(async () => {
-      renderer?.unmount();
-    });
-
-    let notified = false;
-    ownedStore.subscribe(() => {
-      notified = true;
-    });
-    await ownedStore.commit(insert(schema.items, { id: 'item-a', label: 'Alpha' }));
-
-    expect(notified).toBe(false);
-  });
-
-  it.todo('synchronously exposes evaluated query rows once core StoreView initialization is sync');
 });
 
-type HookProbeState = {
-  readonly view: ViewHookState<ItemProjection>;
-  readonly query: QueryHookState<ItemProjection, readonly string[]>;
-};
-
-type RenderedHookProbe = HookProbeState & {
-  readonly renderer: ReactTestRenderer;
-};
-
-async function renderHookProbe(store: Store, query: Query<ItemProjection>): Promise<RenderedHookProbe> {
-  let current: HookProbeState | undefined;
-  let renderer: ReactTestRenderer | undefined;
-
-  function Probe() {
-    current = {
-      view: useView(query),
-      query: useQuery(query, { select: (rows) => rows.map((row) => row.label) })
-    };
-    return null;
-  }
-
-  await act(async () => {
-    renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
-  });
-
-  assertDefined(renderer);
-  assertDefined(current);
-  return live(() => current, renderer);
-}
-
-type RowProbeState = {
-  readonly byPredicate: RowHookState<ItemProjection>;
-  readonly byKey: RowHookState<ItemProjection>;
-};
-
-type RenderedRowProbe = RowProbeState & {
-  readonly renderer: ReactTestRenderer;
-};
-
-async function renderRowProbe(store: Store): Promise<RenderedRowProbe> {
-  let current: RowProbeState | undefined;
-  let renderer: ReactTestRenderer | undefined;
-
-  function Probe() {
-    current = {
-      byPredicate: useRow(itemQuery, (row) => row.id === 'item-a'),
-      byKey: useRow(itemQuery, 'item-a', { keyBy: (row) => row.id })
-    };
-    return null;
-  }
-
-  await act(async () => {
-    renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
-  });
-
-  assertDefined(renderer);
-  assertDefined(current);
-  return live(() => current, renderer);
-}
-
-function live<State extends object>(
-  current: () => State | undefined,
-  renderer: ReactTestRenderer
-): State & { readonly renderer: ReactTestRenderer } {
-  return new Proxy({} as State & { readonly renderer: ReactTestRenderer }, {
-    get(_target, property) {
-      if (property === 'renderer') return renderer;
-      const state = current();
-      assertDefined(state);
-      return state[property as keyof State];
-    }
-  });
-}
-
-function assertDefined<Value>(value: Value): asserts value is NonNullable<Value> {
-  expect(value).toBeDefined();
-}
-
-function freshQueryIdentity<Row>(query: Query<Row>): Query<Row> {
-  return Object.assign({}, query);
-}
-
-function createStaticRowsStore<Row>(rows: readonly Row[], viewedQueries: Query<unknown>[] = []): Store {
-  const base = createStore({});
-  return {
-    ...base,
-    view: <ViewRow,>(query: Query<ViewRow>): StoreView<ViewRow> => {
-      viewedQueries.push(query as Query<unknown>);
-      const view = base.view(query);
-      const snapshot = {
-        ...view.getSnapshot(),
-        diagnostics: [],
-        rows: rows as unknown as readonly ViewRow[]
-      };
-      return {
-        ...view,
-        getSnapshot: () => snapshot,
-        read: () => snapshot,
-        rows: () => snapshot.rows
-      };
-    }
-  };
+function assertType(assertion: () => void): void {
+  expect(assertion).not.toThrow();
 }

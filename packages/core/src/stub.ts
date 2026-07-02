@@ -196,6 +196,11 @@ export type AggregateConfig<GroupBy extends ProjectionData = ProjectionData, Agg
   readonly groupBy?: GroupBy;
   readonly aggregates: Aggregates;
 };
+type ClauseFieldKeys<Row> = Row extends object ? keyof Row & string : string;
+export type EquiJoinClauseMap<Left = Record<string, unknown>, Right = Record<string, unknown>> =
+  Readonly<Partial<Record<ClauseFieldKeys<Left>, ClauseFieldKeys<Right>>>>;
+export type CorrelationClauseMap<Outer = Record<string, unknown>, Inner = Record<string, unknown>> =
+  EquiJoinClauseMap<Outer, Inner>;
 export type ExpandOptions<
   Alias extends string | undefined = string | undefined,
   Fields extends readonly string[] | undefined = readonly string[] | undefined
@@ -423,8 +428,10 @@ export function gte<Left extends ExprInput>(left: Left, right: ExprInput<ExprVal
 export const and = (...predicates: readonly PredicateData[]): PredicateData => ({ op: 'and', predicates });
 export const or = (...predicates: readonly PredicateData[]): PredicateData => ({ op: 'or', predicates });
 export const not = (predicate: PredicateData): PredicateData => ({ op: 'not', predicate });
-export const any = (...predicates: readonly PredicateData[]): PredicateData => ({ op: 'any', predicates });
-export const notAny = (...predicates: readonly PredicateData[]): PredicateData => ({ op: 'notAny', predicates });
+export const isNull = (input: ExprInput): PredicateData => ({ op: 'isNull', expr: expr(input) });
+export const notNull = (input: ExprInput): PredicateData => ({ op: 'notNull', expr: expr(input) });
+export const isMissing = (input: ExprInput): PredicateData => ({ op: 'isMissing', expr: expr(input) });
+export const notMissing = (input: ExprInput): PredicateData => ({ op: 'notMissing', expr: expr(input) });
 
 export function from<Row extends object>(relationRef: RelationRef<Row> | AliasedRelationRef<Row, string>): Query<Row> {
   const alias = 'alias' in relationRef ? relationRef.alias : relationRef.name;
@@ -454,10 +461,18 @@ export const uniqueIndex = (...expressions: readonly ExprData[]): PreserveQueryT
   ({ ...query, data: { op: 'hash', input: query.data, expressions, unique: true } })) as PreserveQueryTransform;
 export const keyBy = (...fields: readonly string[]): PreserveQueryTransform => ((query) =>
   ({ ...query, data: { op: 'keyBy', input: query.data, fields } })) as PreserveQueryTransform;
-export const join = <Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'inner'> => ((left) =>
-  ({ data: { op: 'join', kind: 'inner', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'inner'>;
-export const leftJoin = <Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'left'> => ((left) =>
-  ({ data: { op: 'join', kind: 'left', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'left'>;
+export function join<Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'inner'>;
+export function join<Right>(right: Query<Right>, on: EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'inner'>;
+export function join<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'inner'> {
+  return ((left) =>
+    ({ data: { op: 'join', kind: 'inner', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'inner'>;
+}
+export function leftJoin<Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'left'>;
+export function leftJoin<Right>(right: Query<Right>, on: EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'left'>;
+export function leftJoin<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'left'> {
+  return ((left) =>
+    ({ data: { op: 'join', kind: 'left', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'left'>;
+}
 export const project = <Shape extends ProjectionData>(projection: Shape): ProjectQueryTransform<ProjectedRow<Shape>> => ((query) =>
   ({ data: { op: 'project', input: query.data, projection }, relations: query.relations })) as ProjectQueryTransform<ProjectedRow<Shape>>;
 export const extend = <Shape extends ProjectionData>(projection: Shape): ExtendQueryTransform<ProjectedRow<Shape>> => ((query) =>
@@ -505,8 +520,17 @@ export const bottomBy = <Value = unknown>(input: ExprInput<Value>, by: ExprInput
 export const maxBy = <Row = unknown>(input: ExprInput<Row>, by: ExprInput): ExprData<Row> => aggregateCall<Row>('maxBy', input, by);
 export const minBy = <Row = unknown>(input: ExprInput<Row>, by: ExprInput): ExprData<Row> => aggregateCall<Row>('minBy', input, by);
 export const setConcat = <Value = unknown>(input: ExprInput<readonly Value[]>): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('setConcat', input);
-export const sel = <Row>(query: Query<Row>): ExprData<readonly Row[]> => ({ op: 'sel', query: query.data });
-export const sel1 = <Row>(query: Query<Row>): ExprData<Row | undefined> => ({ op: 'sel1', query: query.data });
+export const self = <Row = unknown>(): ExprData<Row> => ({ op: 'self' });
+export function sel<Row>(query: Query<Row>): ExprData<readonly Row[]>;
+export function sel<Row>(query: Query<Row>, correlation: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<readonly Row[]>;
+export function sel<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<readonly Row[]> {
+  return { op: 'sel', query: query.data, ...(correlation === undefined ? {} : { correlation }) };
+}
+export function sel1<Row>(query: Query<Row>): ExprData<Row | undefined>;
+export function sel1<Row>(query: Query<Row>, correlation: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<Row | undefined>;
+export function sel1<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<Row | undefined> {
+  return { op: 'sel1', query: query.data, ...(correlation === undefined ? {} : { correlation }) };
+}
 
 export type EvaluateFunction = (...args: readonly unknown[]) => unknown;
 export type EvaluateFunctions = Readonly<Record<string, EvaluateFunction>>;
@@ -891,8 +915,8 @@ export type DbTransactionInput =
   | ((db: DbTransactionContext) => DbTransactionItem)
   | ((tx: DbTransactionContext, db: Db) => DbTransactionItem);
 export type DbTransactionInputs = readonly DbTransactionInput[];
-export type DbTransactionResult = {
-  readonly db: Db;
+export type DbTransactionResult<DbValue extends Db = Db> = {
+  readonly db: DbValue;
   readonly patches: number;
   readonly applied: number;
   readonly deltas: readonly RelationDelta[];
@@ -945,16 +969,16 @@ export type RelationKeyValue<Relation extends RelationRef> =
 export type RowLookupOptions<Row = unknown, MappedRow = Row> = DbQueryOptions<Row, MappedRow>;
 export type RowPredicateOptions<Row = unknown, MappedRow = Row> = DbQueryOptions<Row, MappedRow>;
 
-export class DbTransactionError extends Error {
-  readonly result: DbTransactionResult;
-  constructor(result: DbTransactionResult) {
+export class DbTransactionError<DbValue extends Db = Db> extends Error {
+  readonly result: DbTransactionResult<DbValue>;
+  constructor(result: DbTransactionResult<DbValue>) {
     super('transaction failed');
     this.name = 'DbTransactionError';
     this.result = result;
   }
 }
 
-export function createDb(data: DbInputData = {}, options: DbInputEnv | DbOptions = EMPTY_DB_ENV): Db {
+export function createDb(data: DbInputData = {}, options: DbOptions = {}): Db {
   return { data, env: dbEnvFromOptions(options) };
 }
 export const dbSource = (input: Db): RelationSource => fromObjectSource(input.data);
@@ -963,18 +987,23 @@ export const withEnv = (input: Db, envValue: DbInputEnv): Db => ({ ...input, env
 export const getEnv = (input: Db): DbEnv => input.env;
 export const updateEnv = (input: Db, update: (env: DbEnv) => DbInputEnv): Db => withEnv(input, update(input.env));
 export const setEnvTx = (envValue: DbEnvUpdate): SetEnvTransaction => ({ op: 'setEnv', env: envValue });
-export function q<Row>(_db: Db, _query: Query<Row> | RelationRef, _options: DbQueryOptions<Row> = {}): QueryResult<Row> {
+export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): readonly MappedRow[];
+export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
+export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
+export function q(_db: Db, _query: Query<any> | RelationRef<any, any>, _options?: any): readonly any[] {
   throw notImplemented('q');
 }
-export function qRows<Row>(inputDb: Db, query: Query<Row> | RelationRef, options: DbQueryOptions<Row> = {}): readonly Row[] {
-  return q(inputDb, query, options).rows;
+export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): QueryResult<MappedRow>;
+export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
+export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
+export function qResult(_db: Db, _query: Query<any> | RelationRef<any, any>, _options?: any): QueryResult<any> {
+  throw notImplemented('qResult');
 }
-export function qMany<Queries extends QueryBatch>(_db: Db, _queries: Queries, _options: DbQueryOptions = {}): QueryBatchResult<Queries> {
+export function qMany<Queries extends QueryBatch>(_db: Db, _queries: Queries, _options: DbQueryOptions = {}): QueryBatchRows<Queries> {
   throw notImplemented('qMany');
 }
-export function qManyRows<Queries extends QueryBatch>(inputDb: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchRows<Queries> {
-  const result = qMany(inputDb, queries, options);
-  return Object.fromEntries(Object.entries(result).map(([name, queryResult]) => [name, queryResult.rows])) as QueryBatchRows<Queries>;
+export function qManyResult<Queries extends QueryBatch>(_db: Db, _queries: Queries, _options: DbQueryOptions = {}): QueryBatchResult<Queries> {
+  throw notImplemented('qManyResult');
 }
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _key: RelationKeyValue<Relation>, _options?: RowLookupOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
 export function row<Row>(_db: Db, _query: Query<Row>, _predicate: PredicateData, _options?: RowPredicateOptions<Row>): Row | undefined;
@@ -998,14 +1027,14 @@ export function whatIf<Row>(_db: Db, _query: Query<Row> | RelationRef, ..._input
 export function whatIf(_db: Db, _query: Query<unknown> | RelationRef | QueryBatch, ..._inputs: DbTransactionInputs): QueryResult<unknown> | QueryBatchResult<QueryBatch> {
   throw notImplemented('whatIf');
 }
-export function transact(inputDb: Db, inputs: DbTransactionInputs, options?: DbTransactionOptions): Db;
-export function transact(inputDb: Db, input: DbTransactionInput, options?: DbTransactionOptions): Db;
-export function transact(inputDb: Db, inputOrInputs: DbTransactionInput | DbTransactionInputs, _options: DbTransactionOptions = {}): Db {
+export function transact<DbValue extends Db>(inputDb: DbValue, inputs: DbTransactionInputs, options?: DbTransactionOptions): DbValue;
+export function transact<DbValue extends Db>(inputDb: DbValue, input: DbTransactionInput, options?: DbTransactionOptions): DbValue;
+export function transact<DbValue extends Db>(inputDb: DbValue, inputOrInputs: DbTransactionInput | DbTransactionInputs, _options: DbTransactionOptions = {}): DbValue {
   const result = tryTransact(inputDb, ...normalizeTransactionInputs(inputOrInputs));
   if (!result.committed) throw new DbTransactionError(result);
   return result.db;
 }
-export function tryTransact(inputDb: Db, ...inputs: DbTransactionInputs): DbTransactionResult {
+export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbTransactionInputs): DbTransactionResult<DbValue> {
   return { db: inputDb, patches: inputs.length, applied: 0, deltas: [], diagnostics: [stubDiagnostic('tryTransact')], committed: false };
 }
 function normalizeTransactionInputs(inputOrInputs: DbTransactionInput | DbTransactionInputs): DbTransactionInputs {
@@ -1034,6 +1063,14 @@ export type DeleteByKeyPatch<Relation extends RelationRef = RelationRef> = { rea
 export type DeletePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'delete'; readonly relation: Relation; readonly predicate: PredicateData };
 export type DeleteExactPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'deleteExact'; readonly relation: Relation; readonly row: Partial<RelationRow<Relation>> };
 export type ReplaceAllPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'replaceAll'; readonly relation: Relation; readonly rows: readonly RelationRow<Relation>[] };
+export type RelationSchema = Readonly<Record<string, RelationRef>>;
+export type SchemaSeedInput<Schema extends RelationSchema> = {
+  readonly [Name in keyof Schema]?: readonly RelationRow<Schema[Name]>[];
+};
+export type SchemaSeedPatch<Schema extends RelationSchema> = {
+  readonly [Name in keyof Schema]: InsertPatch<Schema[Name]>;
+}[keyof Schema];
+export type SchemaSeedPatches<Schema extends RelationSchema> = readonly SchemaSeedPatch<Schema>[];
 export type WritePatch<Relation extends RelationRef = RelationRef> =
   | InsertPatch<Relation>
   | InsertIgnorePatch<Relation>
@@ -1081,6 +1118,9 @@ export const deleteByKey = <Relation extends RelationRef>(relationRef: Relation,
 export const deleteRows = <Relation extends RelationRef>(relationRef: Relation, predicate: PredicateData): DeletePatch<Relation> => ({ op: 'delete', relation: relationRef, predicate });
 export const deleteExact = <Relation extends RelationRef>(relationRef: Relation, rowValue: Partial<RelationRow<Relation>>): DeleteExactPatch<Relation> => ({ op: 'deleteExact', relation: relationRef, row: rowValue });
 export const replaceAll = <Relation extends RelationRef>(relationRef: Relation, rows: readonly RelationRow<Relation>[]): ReplaceAllPatch<Relation> => ({ op: 'replaceAll', relation: relationRef, rows });
+export function seed<Schema extends RelationSchema>(_schema: Schema, _rows: SchemaSeedInput<Schema>): SchemaSeedPatches<Schema> {
+  throw notImplemented('seed');
+}
 export const write = <Relation extends RelationRef>(relationRef: Relation): RelationWriter<Relation> => ({
   insert: (rowValue) => insert(relationRef, rowValue),
   insertIgnore: (rowValue) => insertIgnore(relationRef, rowValue),
@@ -1121,15 +1161,6 @@ export type ConstraintValidationResult = {
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 
-export class DbConstraintTransactionError extends Error {
-  readonly result: DbTransactionResult;
-  constructor(result: DbTransactionResult) {
-    super('constraint transaction failed');
-    this.name = 'DbConstraintTransactionError';
-    this.result = result;
-  }
-}
-
 export function check(predicate: PredicateData): CheckConstraintData;
 export function check(query: Query, predicate: PredicateData): CheckConstraintData;
 export function check(queryOrPredicate: Query | PredicateData, predicate?: PredicateData): CheckConstraintData {
@@ -1157,8 +1188,6 @@ export const detachConstraints = <DbValue extends Db>(dbValue: DbValue): DbValue
 export const attachedConstraintsFor = (dbValue: Partial<ConstrainedDb>): ConstraintSet => dbValue.constraints ?? [];
 export const hasAttachedConstraints = (dbValue: Partial<ConstrainedDb>): boolean => attachedConstraintsFor(dbValue).length > 0;
 export const validateConstraints = async (): Promise<ConstraintValidationResult> => ({ valid: false, diagnostics: [stubDiagnostic('validateConstraints')] });
-export const tryTransactConstrained = (dbValue: Db, ...inputs: DbTransactionInputs): DbTransactionResult => tryTransact(dbValue, ...inputs);
-export const transactConstrained = (dbValue: Db, ...inputs: DbTransactionInputs): Db => transact(dbValue, inputs);
 
 /**
  * Placeholder for any db-like value that can carry materializations. The
@@ -1192,16 +1221,13 @@ export type MaterializationMetadata<Row = unknown> = {
 export type MaterializationExplanation<Row = unknown> = {
   readonly query: Query<Row>;
   readonly supported: boolean;
-  readonly diagnostics: readonly MaterializationDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
 };
-export type MaterializationDiagnostic = TarstateDiagnostic;
 export type MaterializationRefreshResult<Row = unknown> = {
-  readonly kind: 'materializationRefresh';
   readonly rows: readonly Row[];
-  readonly diagnostics: readonly MaterializationDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
 };
 export type MaterializationMaintenanceChange<Row = unknown> = {
-  readonly kind: 'materializationMaintenanceChange';
   readonly update: MaterializationMaintenanceDecision;
   readonly recomputed: boolean;
   readonly reason: string;
@@ -1220,16 +1246,15 @@ export type MaterializationMaintenanceChange<Row = unknown> = {
   readonly added: readonly Row[];
   readonly removed: readonly Row[];
   readonly rowChanges: readonly RowChange<Row>[];
-  readonly diagnostics: readonly MaterializationDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
 };
 export type MaterializationMaintenanceResult<Row = unknown> = {
-  readonly kind: 'materializationMaintenance';
   readonly maintained: number;
   readonly recomputed: number;
   readonly carried: number;
   readonly skipped: number;
   readonly changes: readonly MaterializationMaintenanceChange<Row>[];
-  readonly diagnostics: readonly MaterializationDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
 };
 export type MaterializationIndex<Row = unknown> = Readonly<Record<string, unknown>> & { readonly rows?: readonly Row[] };
 export type MaterializationNestedRows<Row = unknown> = Readonly<Record<string, readonly Row[]>>;
@@ -1282,12 +1307,11 @@ export function createMemoryRelationRuntime(data: DbInputData = {}, options: Mem
   };
 }
 
-export type StoreDiagnostic = TarstateDiagnostic;
 export type StoreSnapshot<Version = unknown> = {
   readonly db: Db;
   readonly source: RelationSource;
   readonly revision: number;
-  readonly diagnostics: readonly StoreDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
   readonly version?: Version;
 };
 export type StoreQueryResult<Row = unknown> = QueryResult<Row> & { readonly revision: number };
@@ -1298,18 +1322,17 @@ export type StoreCommitEffects<Version = unknown> = {
   readonly patches: number;
   readonly applied: number;
   readonly deltas: readonly RelationDelta[];
-  readonly diagnostics: readonly StoreDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
   readonly version?: Version;
   readonly durability?: RelationApplyDurability;
 };
 export type StoreCommitSnapshot<Version = unknown> = StoreSnapshot<Version>;
 export type StoreCommitResult<Version = unknown> = {
-  readonly kind: 'tarstateCommit';
   readonly status: StoreCommitStatus;
   readonly reflected: boolean;
   readonly effects: StoreCommitEffects<Version>;
   readonly snapshot: StoreCommitSnapshot<Version>;
-  readonly diagnostics: readonly StoreDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
 };
 export type StoreCommitInput = DbTransactionInput;
 export type StoreCommitOptions = DbTransactionOptions;
@@ -1318,15 +1341,11 @@ export type StoreCommit<Version = unknown> = {
   (input: DbTransactionInput, options?: StoreCommitOptions): Promise<StoreCommitResult<Version>>;
 };
 export type StoreQueryOptions<Row = unknown, MappedRow = Row> = DbQueryOptions<Row, MappedRow>;
-export type StoreViewReadOptions<Row = unknown, MappedRow = Row> = StoreQueryOptions<Row, MappedRow>;
 export type StoreViewSnapshot<Row = unknown, Version = unknown> = {
   readonly rows: readonly Row[];
-  readonly diagnostics: readonly StoreDiagnostic[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
   readonly revision: number;
   readonly queryKey: string;
-  readonly snapshot: StoreSnapshot<Version>;
-  readonly db: Db;
-  readonly source: RelationSource;
   readonly version?: Version;
 };
 export type StoreQuery = <Row>(query: Query<Row> | RelationRef, options?: StoreQueryOptions<Row>) => StoreQueryResult<Row>;
@@ -1335,15 +1354,11 @@ export type StoreWhatIf = {
   <Queries extends QueryBatch>(query: Queries, ...inputs: DbTransactionInputs): StoreQueryBatchResult<Queries>;
   <Row>(query: Query<Row> | RelationRef, ...inputs: DbTransactionInputs): StoreQueryResult<Row>;
 };
-export type StoreViewRead<Row = unknown, Version = unknown> = () => StoreViewSnapshot<Row, Version>;
 export type StoreView<Row = unknown, Version = unknown> = {
-  readonly kind: 'view';
   readonly query: Query<Row>;
   readonly queryKey: string;
   readonly getSnapshot: () => StoreViewSnapshot<Row, Version>;
   readonly subscribe: (listener: () => void) => () => void;
-  readonly read: StoreViewRead<Row, Version>;
-  readonly rows: () => readonly Row[];
   readonly refresh: () => Promise<StoreViewSnapshot<Row, Version>>;
 };
 export type Store<Version = unknown> = {
@@ -1472,7 +1487,7 @@ export async function trackedChangesForDbTransition(): Promise<{ readonly change
 export const trackedChangeFromMaterializationChange = <Row>(change: MaterializationMaintenanceChange<Row>): TrackedChange<Row> =>
   ({ kind: 'trackedChange', id: change.id, targetKey: change.queryKey, target: change.query, changed: change.rowChanges.length > 0, previousRows: change.previousRows ?? [], rows: change.rows, added: change.added, removed: change.removed, unchanged: [], rowChanges: change.rowChanges, diagnostics: change.diagnostics });
 
-export type TrackTransactDiagnostic = WatchRuntimeDiagnostic | MaterializationDiagnostic;
+export type TrackTransactDiagnostic = WatchRuntimeDiagnostic | TarstateDiagnostic;
 export type TrackRuntimeCommitDiagnostic = TrackTransactDiagnostic;
 export type TrackTransactOutput<DbValue extends WatchDb = WatchDb> = DbValue | { readonly db: DbValue };
 export type TrackTransactCallback<DbValue extends WatchDb, Result extends TrackTransactOutput<DbValue>> = (db: DbValue) => Result | Promise<Result>;
@@ -1548,7 +1563,7 @@ function createStubStore<Version = unknown>(state: Db): Store<Version> {
   return {
     getSnapshot: snapshot,
     subscribe: () => () => {},
-    query: (queryValue, options) => ({ ...q(state, queryValue, options), revision }),
+    query: (queryValue, options) => ({ ...qResult(state, queryValue, options), revision }),
     queries: () => {
       throw notImplemented('store.queries');
     },
@@ -1560,7 +1575,6 @@ function createStubStore<Version = unknown>(state: Db): Store<Version> {
       const inputs = normalizeTransactionInputs(inputOrInputs);
       revision += 1;
       return {
-        kind: 'tarstateCommit',
         status: 'rejected',
         reflected: false,
         effects: { patches: inputs.length, applied: 0, deltas: [], diagnostics: [stubDiagnostic('store.commit')] },
@@ -1575,23 +1589,21 @@ function createStubStore<Version = unknown>(state: Db): Store<Version> {
 
 function createStubView<Row, Version>(queryValue: Query<Row>, snapshot: () => StoreSnapshot<Version>): StoreView<Row, Version> {
   const key = queryKey(queryValue);
-  const viewSnapshot = (): StoreViewSnapshot<Row, Version> => ({
-    rows: [],
-    diagnostics: [stubDiagnostic('store.view')],
-    revision: snapshot().revision,
-    queryKey: key,
-    snapshot: snapshot(),
-    db: snapshot().db,
-    source: snapshot().source
-  });
+  const viewSnapshot = (): StoreViewSnapshot<Row, Version> => {
+    const current = snapshot();
+    return {
+      rows: [],
+      diagnostics: [stubDiagnostic('store.view')],
+      revision: current.revision,
+      queryKey: key,
+      ...(current.version === undefined ? {} : { version: current.version })
+    };
+  };
   return {
-    kind: 'view',
     query: queryValue,
     queryKey: key,
     getSnapshot: viewSnapshot,
     subscribe: () => () => {},
-    read: viewSnapshot,
-    rows: () => [],
     refresh: async () => viewSnapshot()
   };
 }
@@ -1765,7 +1777,7 @@ function arrayify(input: ConstraintRelationFields): readonly string[] {
 }
 
 function emptyMaintenance(): MaterializationMaintenanceResult {
-  return { kind: 'materializationMaintenance', maintained: 0, recomputed: 0, carried: 0, skipped: 0, changes: [], diagnostics: [stubDiagnostic('maintainMaterializationSnapshots')] };
+  return { maintained: 0, recomputed: 0, carried: 0, skipped: 0, changes: [], diagnostics: [stubDiagnostic('maintainMaterializationSnapshots')] };
 }
 
 function isRelationRef(input: unknown): input is RelationRef {
@@ -1780,11 +1792,8 @@ function isDb(input: unknown): input is Db {
   return isRecord(input) && isRecord(input.data) && isRecord(input.env);
 }
 
-function dbEnvFromOptions(options: DbInputEnv | DbOptions): DbInputEnv {
-  if ('env' in options) {
-    return isRecord(options.env) ? options.env : EMPTY_DB_ENV;
-  }
-  return Object.fromEntries(Object.entries(options));
+function dbEnvFromOptions(options: DbOptions): DbInputEnv {
+  return isRecord(options.env) ? options.env : EMPTY_DB_ENV;
 }
 
 function isDiagnostic(input: unknown): input is TarstateDiagnostic {
