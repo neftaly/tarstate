@@ -34,15 +34,13 @@ import {
 import { stableKey } from './identity.js';
 import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
 import {
-  buildIncrementalMaterialization,
-  buildStaticIncrementalMaterialization,
-  maintainIncrementalMaterialization,
-  planIncrementalMaterialization,
-  rowsFromIncrementalState,
-  type IncrementalMaterialization,
-  type IncrementalMaterializationPlan,
-  type IncrementalMaterializationPlanOptions
-} from './materialization-plan.js';
+  legacyBuildIncrementalMaterialization,
+  legacyMaintainIncrementalMaterialization,
+  legacyPlanIncrementalMaterialization,
+  type LegacyIncrementalMaterialization,
+  type LegacyIncrementalMaterializationOptions,
+  type LegacyIncrementalMaterializationPlan
+} from './materialization-compat.js';
 import {
   buildMaintainedIndexes,
   maintainedIndexKey,
@@ -448,7 +446,7 @@ type StoredMaterialization<Row = unknown> = {
   readonly indexes: MaintainedIndexes<Row>;
   readonly evaluateOptions: EvaluateOptions;
   readonly cacheable: boolean;
-  readonly incremental?: IncrementalMaterialization<Row>;
+  readonly incremental?: LegacyIncrementalMaterialization<Row>;
 };
 type AnyStoredMaterialization = StoredMaterialization<any>;
 type MaterializationEvalTarget = {
@@ -537,7 +535,7 @@ export function explainMaterialization<Row>(
   const requestedMode = requestedMaterializationMode(options, key);
   const evaluateOptions = materializationEvaluateOptions(options);
   const planned = requestedMode === 'incremental'
-    ? planIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
+    ? legacyPlanIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
     : undefined;
   const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
   const id = options.id ?? options.name ?? key;
@@ -664,210 +662,59 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
 
     const incrementalFallbackDiagnostics: MaterializationDiagnostic[] = [];
     if (touchedEnvDependencies.length === 0 && stored.metadata.maintenance === 'incremental') {
-      if (stored.incremental?.plan.kind === 'staticRows') {
-        const maintained = maintainIncrementalMaterialization(
-          stored.incremental,
-          undefined,
-          options.deltas ?? [],
-          envFor(next),
-          incrementalPlanOptions(stored.evaluateOptions)
+      const maintained = legacyMaintainIncrementalMaterialization(
+        stored.incremental,
+        stored.metadata.query.relations,
+        options.deltas,
+        materializationRows(stored),
+        envFor(next),
+        incrementalPlanOptions(stored.evaluateOptions)
+      );
+      if (maintained.updated) {
+        const refresh = refreshDerivedSnapshotFromRows(
+          stored.derivationSnapshot,
+          maintained.rows,
+          derivationRefreshOptions(options.deltas)
         );
-        if (maintained.updated) {
-          const nextIncremental = {
-            plan: stored.incremental.plan,
-            state: maintained.state
-          };
-          const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
-          const refresh = refreshDerivedSnapshotFromRows(
-            stored.derivationSnapshot,
-            maintainedRows,
-            derivationRefreshOptions(options.deltas)
-          );
-          const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
-          const change: MaterializationMaintenanceChange = {
-            kind: 'materializationMaintenanceChange',
-            update: 'incremental',
-            recomputed: false,
-            reason: rowDelta.rowChanges.length === 0
-              ? 'dependencies touched; incrementally maintained rows unchanged'
-              : maintained.reason,
-            id: stored.metadata.id,
-            queryKey: stored.metadata.queryKey,
-            query: stored.metadata.query,
-            maintenance: stored.metadata.maintenance,
-            dependencies: stored.metadata.dependencies,
-            touchedDependencies,
-            envDependencies: stored.metadata.envDependencies,
-            touchedEnvDependencies,
-            indexSpecs: stored.metadata.indexSpecs,
-            previousRowsAvailable: true,
-            previousRows: materializationRows(stored),
-            rows: refresh.snapshot.rows,
-            addedRows: rowDelta.addedRows,
-            removedRows: rowDelta.removedRows,
-            rowChanges: rowDelta.rowChanges,
-            diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
-          };
-          changes.push(change);
-          storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
-            stored,
-            refresh.snapshot,
-            nextIncremental
-          ));
-          continue;
-        }
-
-        incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-          stored.metadata.id,
-          stored.metadata.queryKey,
-          maintained.reason
+        const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
+        const change: MaterializationMaintenanceChange = {
+          kind: 'materializationMaintenanceChange',
+          update: 'incremental',
+          recomputed: false,
+          reason: rowDelta.rowChanges.length === 0
+            ? 'dependencies touched; incrementally maintained rows unchanged'
+            : maintained.reason,
+          id: stored.metadata.id,
+          queryKey: stored.metadata.queryKey,
+          query: stored.metadata.query,
+          maintenance: stored.metadata.maintenance,
+          dependencies: stored.metadata.dependencies,
+          touchedDependencies,
+          envDependencies: stored.metadata.envDependencies,
+          touchedEnvDependencies,
+          indexSpecs: stored.metadata.indexSpecs,
+          previousRowsAvailable: true,
+          previousRows: materializationRows(stored),
+          rows: refresh.snapshot.rows,
+          addedRows: rowDelta.addedRows,
+          removedRows: rowDelta.removedRows,
+          rowChanges: rowDelta.rowChanges,
+          diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
+        };
+        changes.push(change);
+        storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
+          stored,
+          refresh.snapshot,
+          maintained.incremental
         ));
-      } else if (stored.incremental?.plan.kind === 'dynamicSet') {
-        if (options.deltas === undefined) {
-          incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-            stored.metadata.id,
-            stored.metadata.queryKey,
-            'transaction deltas are required for incremental maintenance'
-          ));
-        } else {
-          const maintained = maintainIncrementalMaterialization(
-            stored.incremental,
-            undefined,
-            options.deltas,
-            envFor(next),
-            incrementalPlanOptions(stored.evaluateOptions)
-          );
-          if (maintained.updated) {
-            const nextIncremental = {
-              plan: stored.incremental.plan,
-              state: maintained.state
-            };
-            const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
-            const refresh = refreshDerivedSnapshotFromRows(
-              stored.derivationSnapshot,
-              maintainedRows,
-              derivationRefreshOptions(options.deltas)
-            );
-            const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
-            const change: MaterializationMaintenanceChange = {
-              kind: 'materializationMaintenanceChange',
-              update: 'incremental',
-              recomputed: false,
-              reason: rowDelta.rowChanges.length === 0
-                ? 'dependencies touched; incrementally maintained rows unchanged'
-                : maintained.reason,
-              id: stored.metadata.id,
-              queryKey: stored.metadata.queryKey,
-              query: stored.metadata.query,
-              maintenance: stored.metadata.maintenance,
-              dependencies: stored.metadata.dependencies,
-              touchedDependencies,
-              envDependencies: stored.metadata.envDependencies,
-              touchedEnvDependencies,
-              indexSpecs: stored.metadata.indexSpecs,
-              previousRowsAvailable: true,
-              previousRows: materializationRows(stored),
-              rows: refresh.snapshot.rows,
-              addedRows: rowDelta.addedRows,
-              removedRows: rowDelta.removedRows,
-              rowChanges: rowDelta.rowChanges,
-              diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
-            };
-            changes.push(change);
-            storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
-              stored,
-              refresh.snapshot,
-              nextIncremental
-            ));
-            continue;
-          }
-
-          incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-            stored.metadata.id,
-            stored.metadata.queryKey,
-            maintained.reason
-          ));
-        }
-      } else if (options.deltas === undefined) {
-        incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-          stored.metadata.id,
-          stored.metadata.queryKey,
-          'transaction deltas are required for incremental maintenance'
-        ));
-      } else if (stored.incremental === undefined) {
-        incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-          stored.metadata.id,
-          stored.metadata.queryKey,
-          'incremental materialization state is missing'
-        ));
-      } else {
-        const rootRelation = stored.metadata.query.relations[stored.incremental.plan.rootRelation];
-        if (rootRelation === undefined) {
-          incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-            stored.metadata.id,
-            stored.metadata.queryKey,
-            `relation ${stored.incremental.plan.rootRelation} is not available for incremental maintenance`
-          ));
-        } else {
-          const maintained = maintainIncrementalMaterialization(
-            stored.incremental,
-            rootRelation,
-            options.deltas,
-            envFor(next),
-            incrementalPlanOptions(stored.evaluateOptions)
-          );
-          if (maintained.updated) {
-            const nextIncremental = {
-              plan: stored.incremental.plan,
-              state: maintained.state
-            };
-            const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
-            const refresh = refreshDerivedSnapshotFromRows(
-              stored.derivationSnapshot,
-              maintainedRows,
-              derivationRefreshOptions(options.deltas)
-            );
-            const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
-            const change: MaterializationMaintenanceChange = {
-              kind: 'materializationMaintenanceChange',
-              update: 'incremental',
-              recomputed: false,
-              reason: rowDelta.rowChanges.length === 0
-                ? 'dependencies touched; incrementally maintained rows unchanged'
-                : maintained.reason,
-              id: stored.metadata.id,
-              queryKey: stored.metadata.queryKey,
-              query: stored.metadata.query,
-              maintenance: stored.metadata.maintenance,
-              dependencies: stored.metadata.dependencies,
-              touchedDependencies,
-              envDependencies: stored.metadata.envDependencies,
-              touchedEnvDependencies,
-              indexSpecs: stored.metadata.indexSpecs,
-              previousRowsAvailable: true,
-              previousRows: materializationRows(stored),
-              rows: refresh.snapshot.rows,
-              addedRows: rowDelta.addedRows,
-              removedRows: rowDelta.removedRows,
-              rowChanges: rowDelta.rowChanges,
-              diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
-            };
-            changes.push(change);
-            storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
-              stored,
-              refresh.snapshot,
-              nextIncremental
-            ));
-            continue;
-          }
-
-          incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-            stored.metadata.id,
-            stored.metadata.queryKey,
-            maintained.reason
-          ));
-        }
+        continue;
       }
+
+      incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
+        stored.metadata.id,
+        stored.metadata.queryKey,
+        maintained.reason
+      ));
     }
 
     const entry = recomputeMaterializationEntry(next, stored);
@@ -1490,7 +1337,7 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
   const evaluateOptions = materializationEvaluateOptions(options);
   const functionDiagnostics = missingFunctionDiagnostics(query, evaluateOptions.functions);
   const planned = requestedMode === 'incremental'
-    ? planIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
+    ? legacyPlanIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
     : undefined;
   const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
   const metadata: MaterializationMetadata<Row> = {
@@ -1565,92 +1412,32 @@ function materializationEntryFor<Row>(
   metadata: MaterializationMetadata<Row>,
   evaluateOptions: EvaluateOptions,
   cacheable: boolean,
-  plan?: IncrementalMaterializationPlan
+  plan?: LegacyIncrementalMaterializationPlan
 ): StoredMaterialization<Row> {
   if (cacheable && plan !== undefined) {
-    if (plan.kind === 'staticRows') {
-      const built = buildStaticIncrementalMaterialization<Row>(
-        plan,
-        envFor(target),
-        incrementalPlanOptions(evaluateOptions)
-      );
-      if (!built.supported) {
-        return materializationEntryWithRows(
-          metadataWithIncrementalFallback(metadata, built.reason),
-          evaluateTargetRows(target, metadata.query, evaluateOptions),
-          evaluateOptions,
-          cacheable
-        );
-      }
-
+    const built = legacyBuildIncrementalMaterialization<Row>(
+      plan,
+      sourceFor(target),
+      metadata.query.relations,
+      envFor(target),
+      incrementalPlanOptions(evaluateOptions)
+    );
+    if (!built.supported) {
       return materializationEntryWithRows(
-        metadata,
-        built.rows,
+        metadataWithIncrementalFallback(metadata, built.reason),
+        evaluateTargetRows(target, metadata.query, evaluateOptions),
         evaluateOptions,
-        cacheable,
-        { plan: built.plan, state: built.state }
+        cacheable
       );
     }
 
-    if (plan.kind === 'dynamicSet') {
-      const source = sourceFor(target);
-      const relationSnapshots = incrementalRelationSnapshots(source, metadata.query.relations);
-      const built = buildIncrementalMaterialization<Row>(
-        plan,
-        undefined,
-        [],
-        envFor(target),
-        relationSnapshots,
-        incrementalPlanOptions(evaluateOptions)
-      );
-      if (!built.supported) {
-        return materializationEntryWithRows(
-          metadataWithIncrementalFallback(metadata, built.reason),
-          evaluateTargetRows(target, metadata.query, evaluateOptions),
-          evaluateOptions,
-          cacheable
-        );
-      }
-
-      return materializationEntryWithRows(
-        metadata,
-        built.rows,
-        evaluateOptions,
-        cacheable,
-        { plan: built.plan, state: built.state }
-      );
-    }
-
-    const relation = metadata.query.relations[plan.rootRelation];
-    if (relation !== undefined) {
-      const source = sourceFor(target);
-      const relationSnapshots = incrementalRelationSnapshots(source, metadata.query.relations);
-      const rootRows = relationSnapshots.get(relation.name)?.rows ?? readRows(source, relation);
-      const built = buildIncrementalMaterialization<Row>(
-        plan,
-        relation,
-        rootRows,
-        envFor(target),
-        relationSnapshots,
-        incrementalPlanOptions(evaluateOptions)
-      );
-      if (!built.supported) {
-        return materializationEntryWithRows(
-          metadataWithIncrementalFallback(metadata, built.reason),
-          evaluateTargetRows(target, metadata.query, evaluateOptions),
-          evaluateOptions,
-          cacheable
-        );
-      }
-
-      return materializationEntryWithRows(
-        metadata,
-        built.rows,
-        evaluateOptions,
-        cacheable,
-        { plan: built.plan, state: built.state }
-      );
-    }
+    return materializationEntryWithRows(
+      metadata,
+      built.rows,
+      evaluateOptions,
+      cacheable,
+      built.incremental
+    );
   }
 
   return materializationEntryWithRows(
@@ -1666,7 +1453,7 @@ function materializationEntryWithRows<Row>(
   rows: readonly Row[],
   evaluateOptions: EvaluateOptions,
   cacheable: boolean,
-  incremental?: IncrementalMaterialization<Row>
+  incremental?: LegacyIncrementalMaterialization<Row>
 ): StoredMaterialization<Row> {
   return materializationEntryWithDerivationSnapshot(
     metadata,
@@ -1682,7 +1469,7 @@ function materializationEntryWithDerivationSnapshot<Row>(
   derivationSnapshot: DerivationSnapshot<Row>,
   evaluateOptions: EvaluateOptions,
   cacheable: boolean,
-  incremental?: IncrementalMaterialization<Row>
+  incremental?: LegacyIncrementalMaterialization<Row>
 ): StoredMaterialization<Row> {
   const rows = derivationSnapshot.rows;
   const maintainedDefinitions = maintainedIndexDefinitions(metadata.indexSpecs);
@@ -1703,7 +1490,7 @@ function materializationEntryWithDerivationSnapshot<Row>(
 function materializationEntryWithIncrementalRows<Row>(
   stored: StoredMaterialization<Row>,
   derivationSnapshot: DerivationSnapshot<Row>,
-  incremental: IncrementalMaterialization<Row>
+  incremental: LegacyIncrementalMaterialization<Row>
 ): StoredMaterialization<Row> {
   const rows = derivationSnapshot.rows;
   const maintainedDefinitions = maintainedIndexDefinitions(stored.metadata.indexSpecs);
@@ -1714,22 +1501,6 @@ function materializationEntryWithIncrementalRows<Row>(
     indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
     incremental
   };
-}
-
-function rowsForMaintainedIncremental<Row>(
-  stored: StoredMaterialization<Row>,
-  rowBatches: readonly unknown[],
-  incremental: IncrementalMaterialization<Row>
-): readonly Row[] {
-  if (incremental.state.aggregate !== undefined) {
-    return rowsFromIncrementalState(incremental.state);
-  }
-
-  if (rowBatches.length === 0) {
-    return materializationRows(stored);
-  }
-
-  return rowsFromIncrementalState(incremental.state);
 }
 
 function materializationRows<Row>(stored: StoredMaterialization<Row>): readonly Row[] {
@@ -1765,16 +1536,6 @@ function derivationTargetFor<Row>(metadata: MaterializationMetadata<Row>): Deriv
     id: metadata.id,
     query: metadata.query
   };
-}
-
-function incrementalRelationSnapshots(
-  source: RelationSource,
-  relations: Readonly<Record<string, RelationRef>>
-): ReadonlyMap<string, { readonly relation: RelationRef; readonly rows: readonly unknown[] }> {
-  return new Map(Object.values(relations).map((relation) => [
-    relation.name,
-    { relation, rows: readRows(source, relation) }
-  ]));
 }
 
 function metadataWithIncrementalFallback<Row>(
@@ -2436,7 +2197,7 @@ function materializationEvaluateOptions(options: EvaluateOptions): EvaluateOptio
   };
 }
 
-function incrementalPlanOptions(options: EvaluateOptions): IncrementalMaterializationPlanOptions {
+function incrementalPlanOptions(options: EvaluateOptions): LegacyIncrementalMaterializationOptions {
   return options.functions === undefined ? {} : { functions: options.functions };
 }
 
