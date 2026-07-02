@@ -5,6 +5,7 @@ import {
   maintainMaterializations,
   materializedLookupRowsFor,
   queryRowsFromMaterialization,
+  type MaterializationEnvDelta,
   type MaterializationMaintenanceResult
 } from './materialization.js';
 import { constRows, where, type PredicateData, type Query } from './query.js';
@@ -272,7 +273,14 @@ export function stripMeta(input: unknown): unknown {
 }
 
 export function withEnv(db: Db, env: DbInputEnv): Db {
-  return dbFromEngine(dbEngineFor(db), env);
+  const nextDb = dbFromEngine(dbEngineFor(db), env);
+  transferConstraintAttachments(db, nextDb);
+  maintainMaterializations(db, nextDb, {
+    deltas: [],
+    envDeltas: dbEnvDeltas(db.env, nextDb.env)
+  });
+  transferWatches(db, nextDb);
+  return nextDb;
 }
 
 export function forkDb(db: Db): Db {
@@ -594,6 +602,17 @@ function evaluateOptions(db: Db, options: EvaluateOptions): EvaluateOptions {
 
 function dbEnv(options: DbInputEnv | DbOptions): DbInputEnv {
   return isDbOptions(options) ? options.env ?? {} : options;
+}
+
+function dbEnvDeltas(previous: DbEnv, next: DbEnv): readonly MaterializationEnvDelta[] {
+  const names = new Set([...Object.keys(previous), ...Object.keys(next)]);
+  return Array.from(names)
+    .filter((name) => !Object.is(previous[name], next[name]))
+    .map((name) => ({
+      name,
+      previous: previous[name],
+      next: next[name]
+    }));
 }
 
 function isDbOptions(input: DbInputEnv | DbOptions): input is DbOptions {

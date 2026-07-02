@@ -181,8 +181,14 @@ export type MaterializationOptions = {
 } & EvaluateOptions;
 export type SnapshotMaterializationOptions = MaterializationOptions;
 export type MaterializationQueryBatch<Row = unknown> = Record<string, Query<Row>>;
+export type MaterializationEnvDelta = {
+  readonly name: string;
+  readonly previous: unknown;
+  readonly next: unknown;
+};
 export type MaterializationMaintenanceOptions = {
   readonly deltas?: readonly RelationDelta[];
+  readonly envDeltas?: readonly MaterializationEnvDelta[];
 };
 export type SnapshotRefreshTarget<Row = unknown> = string | MaterializationMetadata<Row> | Query<Row>;
 export type MaterializedSourceOptions = {
@@ -198,6 +204,7 @@ export type MaterializationMetadata<Row = unknown> = {
   readonly maintenance: MaterializationMaintenanceKind;
   readonly maintenanceReason: string;
   readonly dependencies: readonly string[];
+  readonly envDependencies: readonly string[];
   readonly indexSpecs: readonly MaterializationIndexSpec[];
   readonly diagnostics: readonly MaterializationDiagnostic[];
   readonly name?: string;
@@ -211,6 +218,7 @@ export type MaterializationExplanation<Row = unknown> = {
   readonly maintenance: MaterializationMaintenanceKind;
   readonly maintenanceReason: string;
   readonly dependencies: readonly string[];
+  readonly envDependencies: readonly string[];
   readonly indexSpecs: readonly MaterializationIndexSpec[];
   readonly diagnostics: readonly MaterializationDiagnostic[];
 };
@@ -237,6 +245,8 @@ export type MaterializationMaintenanceChange<Row = unknown> = {
   readonly maintenance: MaterializationMaintenanceKind;
   readonly dependencies: readonly string[];
   readonly touchedDependencies: readonly string[];
+  readonly envDependencies: readonly string[];
+  readonly touchedEnvDependencies: readonly string[];
   readonly indexSpecs: readonly MaterializationIndexSpec[];
   readonly previousRowsAvailable: boolean;
   readonly previousRows: readonly Row[] | undefined;
@@ -509,6 +519,7 @@ export function explainMaterialization<Row>(
       ? maintenanceReasonForMode(requestedMode)
       : planned.reason,
     dependencies: relationDependencies(query),
+    envDependencies: Array.from(envReferences(query)),
     indexSpecs: materializationIndexSpecs(query),
     diagnostics: [
       ...(planned?.supported === false ? [incrementalFallbackDiagnostic(id, key, planned.reason)] : []),
@@ -583,8 +594,14 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
     const touchedDependencies = touchedRelations === undefined
       ? stored.metadata.dependencies
       : stored.metadata.dependencies.filter((dependency) => touchedRelations.has(dependency));
+    const touchedEnvDependencies = touchedEnvDependenciesFor(
+      stored,
+      previous,
+      next,
+      options.envDeltas
+    );
 
-    if (touchedRelations !== undefined && touchedDependencies.length === 0) {
+    if (touchedRelations !== undefined && touchedDependencies.length === 0 && touchedEnvDependencies.length === 0) {
       const change: MaterializationMaintenanceChange = {
         kind: 'materializationMaintenanceChange',
         update: 'skipped',
@@ -596,6 +613,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
         maintenance: stored.metadata.maintenance,
         dependencies: stored.metadata.dependencies,
         touchedDependencies,
+        envDependencies: stored.metadata.envDependencies,
+        touchedEnvDependencies,
         indexSpecs: stored.metadata.indexSpecs,
         previousRowsAvailable: true,
         previousRows: stored.rows,
@@ -611,7 +630,7 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
     }
 
     const incrementalFallbackDiagnostics: MaterializationDiagnostic[] = [];
-    if (stored.metadata.maintenance === 'incremental') {
+    if (touchedEnvDependencies.length === 0 && stored.metadata.maintenance === 'incremental') {
       if (stored.incremental?.plan.kind === 'staticRows') {
         const maintained = maintainIncrementalMaterialization(
           stored.incremental,
@@ -639,6 +658,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             maintenance: stored.metadata.maintenance,
             dependencies: stored.metadata.dependencies,
             touchedDependencies,
+            envDependencies: stored.metadata.envDependencies,
+            touchedEnvDependencies,
             indexSpecs: stored.metadata.indexSpecs,
             previousRowsAvailable: true,
             previousRows: stored.rows,
@@ -697,6 +718,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
               maintenance: stored.metadata.maintenance,
               dependencies: stored.metadata.dependencies,
               touchedDependencies,
+              envDependencies: stored.metadata.envDependencies,
+              touchedEnvDependencies,
               indexSpecs: stored.metadata.indexSpecs,
               previousRowsAvailable: true,
               previousRows: stored.rows,
@@ -769,6 +792,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
               maintenance: stored.metadata.maintenance,
               dependencies: stored.metadata.dependencies,
               touchedDependencies,
+              envDependencies: stored.metadata.envDependencies,
+              touchedEnvDependencies,
               indexSpecs: stored.metadata.indexSpecs,
               previousRowsAvailable: true,
               previousRows: stored.rows,
@@ -799,19 +824,26 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
 
     const entry = recomputeMaterializationEntry(next, stored);
     const diff = diffMaterializationRows(stored.rows, entry.rows, stored.metadata.query);
+    const recomputeReason = touchedEnvDependencies.length === 0
+      ? diff.changes.length === 0
+        ? 'dependencies touched; recomputed rows unchanged'
+        : 'dependencies touched; recomputed rows changed'
+      : diff.changes.length === 0
+        ? 'environment dependencies touched; recomputed rows unchanged'
+        : 'environment dependencies touched; recomputed rows changed';
     const change: MaterializationMaintenanceChange = {
       kind: 'materializationMaintenanceChange',
       update: diff.changes.length === 0 ? 'carried' : 'recomputed',
       recomputed: true,
-      reason: diff.changes.length === 0
-        ? 'dependencies touched; recomputed rows unchanged'
-        : 'dependencies touched; recomputed rows changed',
+      reason: recomputeReason,
       id: stored.metadata.id,
       queryKey: stored.metadata.queryKey,
       query: stored.metadata.query,
       maintenance: stored.metadata.maintenance,
       dependencies: stored.metadata.dependencies,
       touchedDependencies,
+      envDependencies: stored.metadata.envDependencies,
+      touchedEnvDependencies,
       indexSpecs: stored.metadata.indexSpecs,
       previousRowsAvailable: true,
       previousRows: stored.rows,
@@ -1240,6 +1272,7 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
       ? maintenanceReasonForMode(requestedMode)
       : planned.reason,
     dependencies: relationDependencies(query),
+    envDependencies: Array.from(envReferences(query)),
     indexSpecs: materializationIndexSpecs(query),
     diagnostics: [
       ...(planned?.supported === false ? [incrementalFallbackDiagnostic(id, key, planned.reason)] : []),
@@ -2127,6 +2160,29 @@ function sourceFor(target: SnapshotMaterializationTarget): RelationSource {
 function envFor(target: SnapshotMaterializationTarget): Readonly<Record<string, unknown>> {
   const candidate = target as { readonly env?: unknown };
   return isRecord(candidate.env) ? candidate.env : {};
+}
+
+function touchedEnvDependenciesFor(
+  stored: StoredMaterialization,
+  previous: SnapshotMaterializationTarget,
+  next: SnapshotMaterializationTarget,
+  envDeltas: readonly MaterializationEnvDelta[] | undefined
+): readonly string[] {
+  return stored.metadata.envDependencies.filter((name) => {
+    if (hasOwnEnvValue(stored.evaluateOptions.env, name)) {
+      return false;
+    }
+
+    if (envDeltas !== undefined) {
+      return envDeltas.some((delta) => delta.name === name);
+    }
+
+    return !Object.is(envFor(previous)[name], envFor(next)[name]);
+  });
+}
+
+function hasOwnEnvValue(env: EvaluateOptions['env'], name: string): boolean {
+  return env !== undefined && Object.prototype.hasOwnProperty.call(env, name);
 }
 
 function storeMaterialization<Row>(db: object, entry: StoredMaterialization<Row>): void {

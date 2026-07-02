@@ -6001,9 +6001,8 @@ function simpleExprReason(expr: ExprData): string | undefined {
   switch (expr.op) {
     case 'field':
     case 'value':
-      return undefined;
     case 'env':
-      return 'env expressions are not supported because environment changes are not tracked';
+      return undefined;
     case 'tuple':
       for (const item of expr.items) {
         const reason = simpleExprReason(item);

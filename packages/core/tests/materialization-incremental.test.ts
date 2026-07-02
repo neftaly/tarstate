@@ -59,9 +59,11 @@ import {
   union,
   uniqueIndex,
   updateWhere,
+  updateEnv,
   value,
   watch,
   where,
+  withEnv,
   without
 } from '@tarstate/core';
 import type { MaterializationMaintenanceResult, Query, RelationDelta, WatchEvent } from '@tarstate/core';
@@ -86,6 +88,12 @@ type ActiveUserRow = {
   readonly name: string;
   readonly age: number;
   readonly teamId: string;
+};
+
+type MinimumAgeUserRow = {
+  readonly id: string;
+  readonly name: string;
+  readonly minimumAge: number | undefined;
 };
 
 type UserTeamRow = {
@@ -321,6 +329,16 @@ function activeUsersQuery(): Query<ActiveUserRow> {
     project({ id: user.id, name: user.name, age: user.age, teamId: user.teamId }),
     keyBy('id')
   ) as Query<ActiveUserRow>;
+}
+
+function minimumAgeUsersQuery(): Query<MinimumAgeUserRow> {
+  const user = as(coreSchema.users, 'user');
+  return pipe(
+    from(user),
+    where(gt(user.age, env<number>('minimumAge'))),
+    project({ id: user.id, name: user.name, minimumAge: env<number>('minimumAge') }),
+    keyBy('id')
+  ) as Query<MinimumAgeUserRow>;
 }
 
 function activeUserTeamsQuery(): Query<UserTeamRow> {
@@ -3037,14 +3055,8 @@ describe('incremental materialization', () => {
     ]);
   });
 
-  it('falls back to snapshot maintenance for env expressions', async () => {
-    const user = as(coreSchema.users, 'user');
-    const adultUsers = pipe(
-      from(user),
-      where(gt(user.age, env<number>('minimumAge'))),
-      project({ id: user.id, name: user.name }),
-      keyBy('id')
-    );
+  it('supports env expressions in incremental materializations under stable env', async () => {
+    const adultUsers = minimumAgeUsersQuery();
     const state = mat(
       createDb(sourceData, { env: { minimumAge: 30 } }),
       adultUsers,
@@ -3053,15 +3065,111 @@ describe('incremental materialization', () => {
     const metadata = materializationForQuery(state, adultUsers);
 
     expect(metadata).toMatchObject({
+      id: 'adult-users',
       requestedMode: 'incremental',
-      maintenance: 'snapshot'
+      maintenance: 'incremental',
+      dependencies: ['users'],
+      envDependencies: ['minimumAge']
     });
-    expect(metadata?.maintenanceReason).toContain('env expressions');
-    expectIncrementalFallback(metadata?.diagnostics ?? []);
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
     await expect(qRows(state, adultUsers)).resolves.toEqual([
-      { id: 'ada', name: 'Ada' },
-      { id: 'cal', name: 'Cal' }
+      { id: 'ada', name: 'Ada', minimumAge: 30 },
+      { id: 'cal', name: 'Cal', minimumAge: 30 }
     ]);
+
+    const adultDia = { ...diaUser, age: 32 };
+    const next = createDb({
+      ...sourceData,
+      users: [...sourceData.users, adultDia]
+    }, { env: { minimumAge: 30 } });
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([adultDia], [])]
+    });
+    const change = singleMaterializationChange(maintained, 'adult-users');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      touchedEnvDependencies: [],
+      rows: [
+        { id: 'ada', name: 'Ada', minimumAge: 30 },
+        { id: 'cal', name: 'Cal', minimumAge: 30 },
+        { id: 'dia', name: 'Dia', minimumAge: 30 }
+      ],
+      addedRows: [{ id: 'dia', name: 'Dia', minimumAge: 30 }]
+    });
+    expectNoIncrementalFallback(change.diagnostics);
+    expect(materializedRowsForQuery(next, adultUsers)).toEqual([
+      { id: 'ada', name: 'Ada', minimumAge: 30 },
+      { id: 'cal', name: 'Cal', minimumAge: 30 },
+      { id: 'dia', name: 'Dia', minimumAge: 30 }
+    ]);
+  });
+
+  it('refreshes env-dependent materializations when withEnv and updateEnv change env', async () => {
+    const adultUsers = minimumAgeUsersQuery();
+    const state = mat(
+      createDb(sourceData, { env: { minimumAge: 30 } }),
+      adultUsers,
+      { id: 'adult-users', mode: 'incremental' }
+    );
+    const directlyRaised = createDb(sourceData, { env: { minimumAge: 38 } });
+    const maintained = maintainMaterializations(state, directlyRaised, { deltas: [] });
+    const change = singleMaterializationChange(maintained, 'adult-users');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 1, skipped: 0 });
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: true,
+      touchedDependencies: [],
+      touchedEnvDependencies: ['minimumAge'],
+      rows: [{ id: 'cal', name: 'Cal', minimumAge: 38 }]
+    });
+    expectNoIncrementalFallback(change.diagnostics);
+
+    const raised = withEnv(state, { minimumAge: 38 });
+    expect(materializedRowsForQuery(raised, adultUsers)).toEqual([
+      { id: 'cal', name: 'Cal', minimumAge: 38 }
+    ]);
+    await expect(qRows(raised, adultUsers)).resolves.toEqual([
+      { id: 'cal', name: 'Cal', minimumAge: 38 }
+    ]);
+
+    const lowered = updateEnv(raised, (current) => ({
+      ...current,
+      minimumAge: 28
+    }));
+    expect(materializedRowsForQuery(lowered, adultUsers)).toEqual([
+      { id: 'ada', name: 'Ada', minimumAge: 28 },
+      { id: 'bea', name: 'Bea', minimumAge: 28 },
+      { id: 'cal', name: 'Cal', minimumAge: 28 }
+    ]);
+  });
+
+  it('materializes missing env values the same as normal evaluation', async () => {
+    const user = as(coreSchema.users, 'user');
+    const query = pipe(
+      from(user),
+      project({ id: user.id, missing: env<unknown>('missingValue') }),
+      keyBy('id')
+    );
+    const expected = await qRows(createDb(sourceData), query);
+    const state = mat(createDb(sourceData), query, {
+      id: 'missing-env',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, query);
+
+    expect(metadata).toMatchObject({
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      envDependencies: ['missingValue']
+    });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, query)).toEqual(expected);
+    await expect(qRows(state, query)).resolves.toEqual(expected);
   });
 
   it('incrementally maintains projected sel and sel1 equality-correlated subqueries', () => {
