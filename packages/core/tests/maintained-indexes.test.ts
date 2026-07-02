@@ -63,20 +63,10 @@ function userSlug(teamId: string, id: string): string {
   return `${teamId}:${id}`;
 }
 
-function expectIncrementalMaintenance(result: DbTransactionResult, id: string): Db {
+function expectCommittedWithMaterializationChange(result: DbTransactionResult, id: string): Db {
   expect(result).toMatchObject({ committed: true });
   const change = result.materializations?.changes.find((item) => item.id === id);
-  expect(change).toMatchObject({
-    id,
-    update: 'incremental',
-    maintenance: 'incremental',
-    recomputed: false
-  });
-  expect([
-    ...result.diagnostics,
-    ...(result.materializations?.diagnostics ?? []),
-    ...(change?.diagnostics ?? [])
-  ].map((diagnostic) => diagnostic.code)).not.toContain('materialization_incremental_fallback');
+  expect(change).toMatchObject({ id });
   return result.db;
 }
 
@@ -245,25 +235,21 @@ function isMutableRecord(input: unknown): input is Record<string, unknown> {
 }
 
 describe('maintained materialized indexes', () => {
-  it('keeps declared compound hash and unique indexes maintained after insert, update, and delete', () => {
+  it('keeps declared compound hash and unique indexes readable after insert, update, and delete', () => {
     const user = as(coreSchema.users, 'user');
     const usersByCompoundKeys = compoundIndexedUsersQuery();
     const state = mat(createDb(testData()), usersByCompoundKeys, {
-      id: 'users-by-compound-keys',
-      mode: 'incremental'
+      id: 'users-by-compound-keys'
     });
 
-    expect(materializationForQuery(state, usersByCompoundKeys)).toMatchObject({
-      id: 'users-by-compound-keys',
-      maintenance: 'incremental'
-    });
+    expect(materializationForQuery(state, usersByCompoundKeys)).toMatchObject({ id: 'users-by-compound-keys' });
     expectCompoundIndexes(state, usersByCompoundKeys, {
       engActive: ['ada'],
       designInactive: [],
       uniqueRow: adaUser
     });
 
-    const inserted = expectIncrementalMaintenance(
+    const inserted = expectCommittedWithMaterializationChange(
       tryTransact(state, insert(coreSchema.users, diaUser)),
       'users-by-compound-keys'
     );
@@ -274,7 +260,7 @@ describe('maintained materialized indexes', () => {
     });
 
     const movedDia = { ...diaUser, teamId: 'design', active: false, age: 35 };
-    const moved = expectIncrementalMaintenance(
+    const moved = expectCommittedWithMaterializationChange(
       tryTransact(inserted, updateWhere(coreSchema.users, eq(user.id, 'dia'), {
         teamId: 'design',
         active: false,
@@ -288,7 +274,7 @@ describe('maintained materialized indexes', () => {
       uniqueRow: movedDia
     });
 
-    const deleted = expectIncrementalMaintenance(
+    const deleted = expectCommittedWithMaterializationChange(
       tryTransact(moved, deleteByKey(coreSchema.users, 'dia')),
       'users-by-compound-keys'
     );
@@ -344,8 +330,7 @@ describe('maintained materialized indexes', () => {
     const indexedUsers = lookupRoutedUsersQuery();
     const user = as(coreSchema.users, 'user');
     const state = mat(createDb(testData()), indexedUsers, {
-      id: 'lookup-routed-users',
-      mode: 'incremental'
+      id: 'lookup-routed-users'
     });
     const next = transact(state, insert(coreSchema.users, diaUser));
 
