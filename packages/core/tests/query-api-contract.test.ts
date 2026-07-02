@@ -1,12 +1,19 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   as,
+  eq,
   expand,
   field,
   from,
+  gt,
+  gte,
+  lt,
+  lte,
+  neq,
   pipe,
   project,
   rename,
+  value,
   without,
   type ExprData,
   type Query
@@ -101,5 +108,41 @@ describe('query API contracts', () => {
       as: 'pair',
       fields: ['code', 'count']
     });
+  });
+
+  it('rejects cross-type predicate comparisons', () => {
+    const name = field<string>('account', 'name');
+    const amount = field<number>('entry', 'amount');
+    const posted = field<boolean>('entry', 'posted');
+
+    expect(eq(name, value('Cash'))).toEqual({
+      op: 'eq',
+      left: name,
+      right: { op: 'value', value: 'Cash' }
+    });
+    const invalidEq = () =>
+      // @ts-expect-error equality predicates require comparable expression value types.
+      eq(name, amount);
+    const invalidNeq = () =>
+      // @ts-expect-error inequality predicates require comparable expression value types.
+      neq(amount, posted);
+    const invalidLt = () =>
+      // @ts-expect-error range predicates require comparable expression value types.
+      lt(name, amount);
+    const invalidLte = () =>
+      // @ts-expect-error range predicates require comparable expression value types.
+      lte(amount, name);
+    const invalidGt = () =>
+      // @ts-expect-error range predicates require comparable expression value types.
+      gt(posted, amount);
+    const invalidGte = () =>
+      // @ts-expect-error range predicates require comparable expression value types.
+      gte(amount, posted);
+    void invalidEq;
+    void invalidNeq;
+    void invalidLt;
+    void invalidLte;
+    void invalidGt;
+    void invalidGte;
   });
 });

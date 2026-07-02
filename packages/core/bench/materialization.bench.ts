@@ -29,6 +29,7 @@ import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tar
 import { account, entry, schema, type Account, type Entry } from '../tests/behavior-fixtures.js';
 
 const ROW_COUNT = 5_000;
+const LARGE_ROW_COUNT = 50_000;
 const PATCH_COUNT = 512;
 const TOP_N_COUNT = 25;
 const BENCH_OPTIONS = {
@@ -41,6 +42,7 @@ type BenchmarkMutation = WritePatch | readonly WritePatch[];
 type BenchmarkScenario = {
   readonly label: string;
   readonly queries: readonly Query<unknown>[];
+  readonly rowCount?: number;
   readonly mutations?: readonly BenchmarkMutation[];
 };
 
@@ -120,8 +122,9 @@ const btreeIndexedEntries = pipe(
   btree(field<number>('row', 'amount'))
 );
 
-const patches = makePatches();
-const mixedBatches = makeMixedBatches();
+const patches = makePatches(ROW_COUNT);
+const largePatches = makePatches(LARGE_ROW_COUNT);
+const mixedBatches = makeMixedBatches(ROW_COUNT);
 
 const scenarios: readonly BenchmarkScenario[] = [
   { label: 'filter/project', queries: [filterProject as Query<unknown>] },
@@ -143,6 +146,18 @@ const scenarios: readonly BenchmarkScenario[] = [
     label: 'filter/project mixed transaction batch',
     queries: [filterProject as Query<unknown>],
     mutations: mixedBatches
+  },
+  {
+    label: 'large grouped aggregate count/sum',
+    queries: [groupedEntryTotals as Query<unknown>],
+    rowCount: LARGE_ROW_COUNT,
+    mutations: largePatches
+  },
+  {
+    label: 'large top-N sortLimit',
+    queries: [topEntriesBySortLimit as Query<unknown>],
+    rowCount: LARGE_ROW_COUNT,
+    mutations: largePatches
   }
 ];
 
@@ -167,7 +182,7 @@ describe('core materialized source indexes', () => {
 });
 
 function materializedMaintenance(scenario: BenchmarkScenario): () => void {
-  let db = mat(makeDb(), ...scenario.queries);
+  let db = mat(makeDb(scenario.rowCount), ...scenario.queries);
   let cursor = 0;
   const mutations = scenario.mutations ?? patches;
 
@@ -179,7 +194,7 @@ function materializedMaintenance(scenario: BenchmarkScenario): () => void {
 }
 
 function fullRecompute(scenario: BenchmarkScenario): () => void {
-  let db = makeDb();
+  let db = makeDb(scenario.rowCount);
   let cursor = 0;
   const mutations = scenario.mutations ?? patches;
 
@@ -277,10 +292,10 @@ function explainScenario(queries: readonly Query<unknown>[]): string {
   return queries.map((query) => explainMaterialization(query).update).join(' + ');
 }
 
-function makeDb(): Db {
+function makeDb(rowCount = ROW_COUNT): Db {
   return createDb({
     accounts: accounts.map((row) => ({ ...row })),
-    entries: makeEntries(ROW_COUNT)
+    entries: makeEntries(rowCount)
   });
 }
 
@@ -296,11 +311,11 @@ function makeEntries(count: number): Entry[] {
   }));
 }
 
-function makePatches(): readonly WritePatch[] {
+function makePatches(rowCount: number): readonly WritePatch[] {
   const accountIds = accounts.map((account) => account.id);
 
   return Array.from({ length: PATCH_COUNT }, (_, index) => {
-    const rowIndex = (index * 97) % ROW_COUNT;
+    const rowIndex = (index * 97) % rowCount;
     const amount = ((index * 53) % 20_000) - 10_000;
     return insertOrReplace(schema.entries, {
       id: `entry-${rowIndex}`,
@@ -312,11 +327,11 @@ function makePatches(): readonly WritePatch[] {
   });
 }
 
-function makeMixedBatches(): readonly (readonly WritePatch[])[] {
+function makeMixedBatches(rowCount: number): readonly (readonly WritePatch[])[] {
   const accountIds = accounts.map((account) => account.id);
 
   return Array.from({ length: PATCH_COUNT }, (_, index) => {
-    const rowIndex = (index * 89) % ROW_COUNT;
+    const rowIndex = (index * 89) % rowCount;
     const accountRow = accountAt(index);
     const accountId = accountIds[(index + rowIndex) % accountIds.length] ?? 'cash';
     const scratchId = `batch-entry-${index % 32}`;

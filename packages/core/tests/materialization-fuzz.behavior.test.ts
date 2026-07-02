@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { createDb, q, tryTransact } from '@tarstate/core/db';
 import { diffRows, type RowChange, type RowKeySelector } from '@tarstate/core/diff';
-import { demat, explainMaterialization, mat } from '@tarstate/core/materialization';
+import { demat, explainMaterialization, mat, materializationForQuery, materializedSourceFor } from '@tarstate/core/materialization';
 import {
   aggregate,
   asc,
+  btree,
+  clauses,
   count,
   desc,
   eq,
@@ -12,6 +14,8 @@ import {
   field,
   from,
   gte,
+  hash,
+  join,
   keyBy,
   limit,
   pipe,
@@ -21,15 +25,18 @@ import {
   sort,
   sum,
   union,
+  uniqueIndex,
   value,
   where,
   without,
   type Query
 } from '@tarstate/core/query';
+import { type RelationRef } from '@tarstate/core/schema';
+import { type RelationRangeLookup, type RelationSource } from '@tarstate/core/source';
 import { createStore } from '@tarstate/core/store';
 import { watch, watchTargetKey } from '@tarstate/core/watch';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
-import { entry, makeDb, schema, type Entry } from './behavior-fixtures.js';
+import { account, entry, makeDb, schema, type Account, type Entry } from './behavior-fixtures.js';
 
 type SupportedVariant = {
   readonly label: string;
@@ -143,6 +150,60 @@ const postedEntryIds = pipe(
   project({ id: entry.id })
 );
 
+type DeclaredIndexVariant = {
+  readonly label: string;
+  readonly op: 'hash' | 'btree' | 'uniqueIndex';
+  readonly field: 'accountId' | 'amount';
+  readonly query: Query<unknown>;
+};
+
+const declaredIndexVariants: readonly DeclaredIndexVariant[] = [
+  {
+    label: 'hash(accountId)',
+    op: 'hash',
+    field: 'accountId',
+    query: pipe(
+      from(entry),
+      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted }),
+      hash(field<string>('row', 'accountId'))
+    ) as Query<unknown>
+  },
+  {
+    label: 'btree(amount)',
+    op: 'btree',
+    field: 'amount',
+    query: pipe(
+      from(entry),
+      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted }),
+      btree(field<number>('row', 'amount'))
+    ) as Query<unknown>
+  },
+  {
+    label: 'uniqueIndex(accountId)',
+    op: 'uniqueIndex',
+    field: 'accountId',
+    query: pipe(
+      from(entry),
+      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted }),
+      uniqueIndex(field<string>('row', 'accountId'))
+    ) as Query<unknown>
+  }
+];
+
+const joinedEntryAccounts = pipe(
+  from(entry),
+  join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
+  project({
+    entryId: entry.id,
+    accountId: account.id,
+    entryAccountId: entry.accountId,
+    amount: entry.amount,
+    posted: entry.posted,
+    accountName: account.$.name,
+    accountKind: account.$.kind
+  })
+) as Query<unknown>;
+
 const unsupportedVariants: readonly UnsupportedVariant[] = [
   {
     label: 'unsorted limit',
@@ -236,6 +297,107 @@ describe('materialization fuzz behavior', () => {
 
     expect(maintainedChanges).toBeGreaterThan(0);
     expect(equivalenceChecks).toBeGreaterThan(0);
+  });
+
+  it('keeps declared materialized indexes equivalent to source row filtering after seeded random writes', () => {
+    let lookupChecks = 0;
+    let indexSpecChecks = 0;
+
+    for (const variant of declaredIndexVariants) {
+      expect(explainMaterialization(variant.query), variant.label).toEqual(expect.objectContaining({
+        supported: true,
+        update: 'incremental',
+        recomputed: false,
+        diagnostics: []
+      }));
+
+      for (const seed of [13, 37, 73]) {
+        let db = mat(seededDb(seed), variant.query);
+        lookupChecks += expectDeclaredIndexLookups(db, variant, seed);
+
+        for (const [step, patch] of randomEntryPatchesForDb(seed, seed * 811 + variant.label.length, 28).entries()) {
+          const result = tryTransact(db, patch);
+          expect(result.committed, `${variant.label} committed ${patch.op}`).toBe(true);
+          db = result.db;
+
+          const change = result.materializations?.changes[0];
+          expect(q(db, variant.query)).toEqual(q(demat(db, variant.query), variant.query));
+          if (change !== undefined) {
+            indexSpecChecks += 1;
+            expect(change.indexSpecs, `${variant.label} ${patch.op}`).toEqual([
+              expect.objectContaining({ op: variant.op, field: variant.field })
+            ]);
+          }
+
+          lookupChecks += expectDeclaredIndexLookups(db, variant, seed * 4099 + step);
+        }
+      }
+    }
+
+    expect(lookupChecks).toBeGreaterThan(0);
+    expect(indexSpecChecks).toBeGreaterThan(0);
+  });
+
+  it('keeps supported two-relation join materializations equivalent to dematerialized recompute across seeded random writes', () => {
+    let equivalenceChecks = 0;
+    let diffChecks = 0;
+
+    expect(explainMaterialization(joinedEntryAccounts)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    for (const seed of [19, 41, 83]) {
+      let db = mat(seededDb(seed), joinedEntryAccounts);
+      expect(q(db, joinedEntryAccounts)).toEqual(q(demat(db, joinedEntryAccounts), joinedEntryAccounts));
+
+      for (const patch of randomJoinPatches(seed, seed * 1559, 36)) {
+        const beforeRows = q(db, joinedEntryAccounts);
+        const result = tryTransact(db, patch);
+        expect(result.committed, `join committed ${patch.op}`).toBe(true);
+        db = result.db;
+
+        const materializedRows = q(db, joinedEntryAccounts);
+        const dematerializedRows = q(demat(db, joinedEntryAccounts), joinedEntryAccounts);
+        const change = result.materializations?.changes[0];
+
+        equivalenceChecks += 1;
+        expect(materializedRows).toEqual(dematerializedRows);
+        expect(change, `join maintained ${patch.op}`).toBeDefined();
+        if (change === undefined) continue;
+
+        expect(materializedRows).toBe(change.rows);
+        expect(change.rows).toEqual(dematerializedRows);
+        expect(change.previousRows).toEqual(beforeRows);
+
+        if (change.update === 'incremental') {
+          const expected = diffRows(beforeRows, dematerializedRows, { keyBy: joinedEntryAccountKey });
+          diffChecks += 1;
+          expect(change.recomputed).toBe(false);
+          expect(change.reason).toBe('incremental delta maintenance');
+          expect(change.diagnostics).toEqual([]);
+          expect(change.rowChanges).toEqual(expected.changes);
+          expect(change.added).toEqual(addedRows(expected.changes));
+          expect(change.removed).toEqual(removedRows(expected.changes));
+          expect(expected.diagnostics).toEqual([]);
+        } else if (change.update === 'carried') {
+          expect(change.recomputed).toBe(false);
+          expect(change.reason).toBe('dependencies unchanged');
+          expect(change.diagnostics).toEqual([]);
+          expect(change.rowChanges).toEqual([]);
+          expect(change.added).toEqual([]);
+          expect(change.removed).toEqual([]);
+        } else {
+          expect(change.update).toBe('recomputed');
+          expect(change.recomputed, `join ${patch.op} ${change.reason}`).toBe(true);
+        }
+      }
+    }
+
+    expect(equivalenceChecks).toBeGreaterThan(0);
+    expect(diffChecks).toBeGreaterThan(0);
   });
 
   it('reports materialized watch and store row changes that match diffRows for seeded transactions', async () => {
@@ -390,6 +552,96 @@ function pathKey(...path: readonly string[]): RowKeySelector<unknown> {
   };
 }
 
+function joinedEntryAccountKey(row: unknown): readonly unknown[] {
+  return isRecord(row) ? [row.entryId, row.accountId] : [undefined, undefined];
+}
+
+function expectDeclaredIndexLookups(db: unknown, variant: DeclaredIndexVariant, seed: number): number {
+  const relation = materializedRelationFor(db, variant.query);
+  const source = requireMaterializedSourceFor(db);
+  const rows = source.rows(relation);
+
+  if (variant.op === 'btree') {
+    const lookups = amountRangeLookups(seed, relation);
+    for (const lookup of lookups) {
+      expect(source.rangeLookup?.(lookup), `${variant.label} range ${JSON.stringify(lookup)}`).toEqual(
+        rows.filter((row) => rangeContains(row, lookup))
+      );
+    }
+    return lookups.length;
+  }
+
+  const values = ['cash', 'sales', 'fees', 'equity', 'missing'] as const;
+  for (const valueValue of values) {
+    expect(source.lookup?.({ relation, field: variant.field, value: valueValue }), `${variant.label} lookup ${valueValue}`).toEqual(
+      rows.filter((row) => isRecord(row) && Object.is(row[variant.field], valueValue))
+    );
+  }
+  return values.length;
+}
+
+function materializedRelationFor(db: unknown, query: Query<unknown>): RelationRef<Record<string, unknown>> {
+  const metadata = materializationForQuery(db, query);
+  if (metadata === undefined) throw new Error('expected materialization metadata');
+  return {
+    kind: 'relation',
+    name: metadata.id,
+    key: 'id',
+    fields: {},
+    ephemeral: true
+  };
+}
+
+function requireMaterializedSourceFor(input: unknown): RelationSource {
+  const source = materializedSourceFor(input);
+  if (source === undefined) throw new Error('expected materialized source');
+  return source;
+}
+
+function amountRangeLookups(seed: number, relation: RelationRef): readonly RelationRangeLookup[] {
+  const next = random(seed);
+  const first = Math.floor(next() * 501) - 250;
+  const second = Math.floor(next() * 501) - 250;
+  const lower = Math.min(first, second);
+  const upper = Math.max(first, second);
+  return [
+    { relation, field: 'amount' },
+    { relation, field: 'amount', lower: { value: -100, inclusive: true } },
+    { relation, field: 'amount', lower: { value: 0, inclusive: false } },
+    { relation, field: 'amount', upper: { value: 0, inclusive: true } },
+    {
+      relation,
+      field: 'amount',
+      lower: { value: lower, inclusive: next() > 0.5 },
+      upper: { value: upper, inclusive: next() > 0.5 }
+    }
+  ];
+}
+
+function rangeContains(row: unknown, lookup: RelationRangeLookup): boolean {
+  if (!isRecord(row)) return false;
+  const rowValue = row[lookup.field];
+  if (lookup.lower !== undefined) {
+    const comparisonValue = compareLookupValues(rowValue, lookup.lower.value);
+    if (comparisonValue < 0 || (comparisonValue === 0 && !lookup.lower.inclusive)) return false;
+  }
+  if (lookup.upper !== undefined) {
+    const comparisonValue = compareLookupValues(rowValue, lookup.upper.value);
+    if (comparisonValue > 0 || (comparisonValue === 0 && !lookup.upper.inclusive)) return false;
+  }
+  return true;
+}
+
+function compareLookupValues(left: unknown, right: unknown): number {
+  if (Object.is(left, right)) return 0;
+  if (left === undefined || left === null) return -1;
+  if (right === undefined || right === null) return 1;
+  if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : 1;
+  if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right);
+  if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
+  return JSON.stringify(left).localeCompare(JSON.stringify(right));
+}
+
 function addedRows<Row>(changes: readonly RowChange<Row>[]): readonly Row[] {
   return changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
 }
@@ -423,6 +675,64 @@ function randomEntryPatches(seed: number, count: number): WritePatch[] {
       patches.push(deleteByKey(schema.entries, id));
     }
   }
+  return patches;
+}
+
+function randomEntryPatchesForDb(dbSeed: number, seed: number, count: number): WritePatch[] {
+  const next = random(seed);
+  const patches: WritePatch[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const id = index % 4 === 0
+      ? `r${dbSeed}-new-${Math.floor(next() * 6)}`
+      : `r${dbSeed}-${Math.floor(next() * 12)}`;
+    const row = randomEntry(next, id, index);
+    const op = index % 5;
+    if (op === 0 || op === 3 || op === 4) {
+      patches.push(insertOrReplace(schema.entries, row));
+    } else if (op === 1) {
+      patches.push(updateByKey(schema.entries, id, {
+        accountId: row.accountId,
+        amount: row.amount,
+        ...(row.memo === undefined ? {} : { memo: row.memo }),
+        posted: row.posted
+      }));
+    } else {
+      patches.push(deleteByKey(schema.entries, id));
+    }
+  }
+  return patches;
+}
+
+function randomJoinPatches(dbSeed: number, seed: number, count: number): WritePatch[] {
+  const next = random(seed);
+  const patches: WritePatch[] = [];
+  const accountIds = ['cash', 'sales', 'fees', 'equity'] as const;
+  const accountKinds = ['asset', 'income', 'expense', 'equity', 'liability'] as const satisfies readonly Account['kind'][];
+
+  for (let index = 0; index < count; index += 1) {
+    const op = index % 6;
+    if (op === 0 || op === 3) {
+      const id = next() > 0.25 ? `r${dbSeed}-${Math.floor(next() * 12)}` : `r${dbSeed}-join-${Math.floor(next() * 8)}`;
+      patches.push(insertOrReplace(schema.entries, randomEntry(next, id, index)));
+    } else if (op === 1) {
+      const id = `r${dbSeed}-${Math.floor(next() * 12)}`;
+      const row = randomEntry(next, id, index);
+      patches.push(updateByKey(schema.entries, id, {
+        accountId: row.accountId,
+        amount: row.amount,
+        posted: row.posted
+      }));
+    } else if (op === 2) {
+      patches.push(deleteByKey(schema.entries, `r${dbSeed}-${Math.floor(next() * 12)}`));
+    } else {
+      const accountId = accountIds[Math.floor(next() * accountIds.length)] ?? 'cash';
+      patches.push(updateByKey(schema.accounts, accountId, {
+        name: `Account ${accountId} ${seed}-${index}-${Math.floor(next() * 100)}`,
+        kind: accountKinds[Math.floor(next() * accountKinds.length)] ?? 'asset'
+      }));
+    }
+  }
+
   return patches;
 }
 

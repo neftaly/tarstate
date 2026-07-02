@@ -1,8 +1,8 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { call, eq, field, hostFn, isMissing, isNull, notMissing, notNull, value } from '@tarstate/core';
+import { call, eq, field, from, gte, hostFn, isMissing, isNull, notMissing, notNull, pipe, value, where } from '@tarstate/core';
 import { isRelationRuntime, type RelationRuntime } from '@tarstate/core/adapter';
-import { validateRelationRow } from '@tarstate/core/evaluate';
+import { evaluate, validateRelationRow } from '@tarstate/core/evaluate';
 import {
   anchoredPathField,
   booleanField,
@@ -161,6 +161,58 @@ describe('automerge map adapter', () => {
       lower: { value: 'A', inclusive: true },
       upper: { value: 'M', inclusive: false }
     })).toEqual([{ id: 'task-1', title: 'Draft' }]);
+  });
+
+  it('pushes where evaluation through Automerge source lookup hooks', () => {
+    const source = automergeMapSource(workspaceDoc([
+      { id: 'task-1', title: 'Draft', effort: 1 },
+      { id: 'task-2', title: 'Build', effort: 3 },
+      { id: 'task-3', title: 'Ship', effort: 5 }
+    ]), { relations: taskMapping });
+    const reads = { rows: 0, lookup: 0, rangeLookup: 0 };
+    const counted: AutomergeMapSource = {
+      ...source,
+      rows: (relationRef) => {
+        reads.rows += 1;
+        return source.rows(relationRef);
+      },
+      lookup: (lookupValue) => {
+        reads.lookup += 1;
+        return source.lookup?.(lookupValue);
+      },
+      rangeLookup: (lookupValue) => {
+        reads.rangeLookup += 1;
+        return source.rangeLookup?.(lookupValue);
+      }
+    };
+
+    const lookupResult = evaluate(
+      counted,
+      pipe(
+        from(schema.tasks),
+        where(eq(field<string>('tasks', 'id'), value('task-2')))
+      )
+    );
+    const rangeResult = evaluate(
+      counted,
+      pipe(
+        from(schema.tasks),
+        where(gte(field<number>('tasks', 'effort'), value(3)))
+      )
+    );
+
+    expect(lookupResult).toEqual({
+      rows: [{ id: 'task-2', title: 'Build', effort: 3 }],
+      diagnostics: []
+    });
+    expect(rangeResult).toEqual({
+      rows: [
+        { id: 'task-2', title: 'Build', effort: 3 },
+        { id: 'task-3', title: 'Ship', effort: 5 }
+      ],
+      diagnostics: []
+    });
+    expect(reads).toEqual({ rows: 0, lookup: 1, rangeLookup: 1 });
   });
 
   it('applies key, predicate, and map-v1 writes back to an immutable Automerge doc', async () => {
