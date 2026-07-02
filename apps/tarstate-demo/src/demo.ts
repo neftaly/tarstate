@@ -587,7 +587,7 @@ export const listingRowsQuery = pipe(
   propertyInfoQuery,
   qualify('info'),
   leftJoin(pipe(acceptedSalesQuery, qualify('sale')), eq(info.id, sale.propertyId)),
-  where(eq(sale.propertyId, value(undefined))),
+  where(eq(sale.propertyId, value<string | undefined>(undefined))),
   project({
     id: info.id,
     address: info.address,
@@ -863,11 +863,11 @@ export function playgroundEnvForFilters(filters: PlaygroundFilters): Record<stri
   ));
 }
 
-export async function runPlaygroundQuery(
+export function runPlaygroundQuery(
   currentDb: Db,
   queryId: QueryExampleId,
   filters: PlaygroundFilters = {}
-): Promise<readonly PlaygroundRow[]> {
+): readonly PlaygroundRow[] {
   return qRows(currentDb, buildPlaygroundQuery(queryId, filters), {
     env: playgroundEnvForFilters(filters)
   });
@@ -1101,7 +1101,7 @@ await commit(insert(schema.decisions, {
       '7. Automerge',
       'The listing query runs against an Automerge-backed snapshot without changing query shape.',
       codeBlock(`const snapshot = await automergeDb(doc, { relations }).getSnapshot();
-const rows = await qRows(snapshot.db, listingRowsQuery);`),
+const rows = qRows(snapshot.db, listingRowsQuery);`),
       metricGrid(
         metric('Automerge heads', automerge.beforeHeads.length),
         metric('Automerge rows', automergeRows.length === 0 ? 'not run' : `${automergeRows.length}: ${automergeRows.map((item) => item.id).join(', ')}`)

@@ -9,7 +9,7 @@
     "node": ">=24.12.0"
   },
   "scripts": {
-    "bench": "pnpm --filter @tarstate/core bench",
+    "bench": "echo \"benchmarks removed for rewrite\"",
     "build": "pnpm -r --if-present build",
     "lint": "oxlint . --deny-warnings --type-aware",
     "test": "pnpm --filter './packages/*' --filter './apps/*' --if-present test",

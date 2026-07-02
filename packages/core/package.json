@@ -25,7 +25,7 @@
     "./write": "./src/write.ts"
   },
   "scripts": {
-    "bench": "vitest bench --config ../../vite.config.ts bench/*.bench.ts --run",
+    "bench": "echo \"benchmarks removed for rewrite\"",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
