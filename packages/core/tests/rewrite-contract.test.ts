@@ -1,12 +1,13 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as constraintsApi from '@tarstate/core/constraints';
 import {
-  attachConstraints,
   check,
   constrain,
   fk,
   req,
-  unique
+  unique,
+  type ConstraintData,
+  type ConstraintSet
 } from '@tarstate/core/constraints';
 import * as dbApi from '@tarstate/core/db';
 import {
@@ -34,10 +35,18 @@ import {
   type TarstateDiagnosticSeverity
 } from '@tarstate/core/diagnostics';
 import { type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
+import {
+  demat,
+  mat,
+  type MaterializationInput,
+  type MaterializedDb
+} from '@tarstate/core/materialization';
 import * as queryApi from '@tarstate/core/query';
 import {
   aggregate,
   as,
+  clauses,
+  correlate,
   count,
   eq,
   field,
@@ -58,12 +67,16 @@ import {
   sum,
   value,
   where,
-  type CorrelationClauseMap,
-  type EquiJoinClauseMap,
   type ExprData,
   type PredicateData,
   type Query
 } from '@tarstate/core/query';
+import type {
+  TrackRuntimeCommitResult,
+  TrackRuntimeCommitSupportedResult,
+  TrackRuntimeCommitUnsupportedResult,
+  TrackTransactResult
+} from '@tarstate/core/runtime';
 import {
   defineSchema,
   numberField,
@@ -81,6 +94,23 @@ import {
   type SchemaSeedInput,
   type SchemaSeedPatches
 } from '@tarstate/core/write';
+import {
+  diffQuery,
+  subscribeWatch,
+  unwatch,
+  watch,
+  watchTarget,
+  type QueryDiff,
+  type TrackedChange,
+  type UnwatchResult,
+  type WatchEvent,
+  type WatchHandle,
+  type WatchRefreshResult,
+  type WatchSubscription,
+  type WatchTargetChange,
+  type WatchTargetRegistration,
+  type WatchUnsubscribeResult
+} from '@tarstate/core/watch';
 
 type Account = {
   readonly id: string;
@@ -188,6 +218,10 @@ describe('rewrite public API contracts', () => {
   it('removes duplicated row-only read helpers and the constrained transaction fork from public exports', () => {
     expect('qRows' in dbApi).toBe(false);
     expect('qManyRows' in dbApi).toBe(false);
+    expect('attachConstraints' in constraintsApi).toBe(false);
+    expect('detachConstraints' in constraintsApi).toBe(false);
+    expect('attachedConstraintsFor' in constraintsApi).toBe(false);
+    expect('hasAttachedConstraints' in constraintsApi).toBe(false);
     expect('tryTransactConstrained' in constraintsApi).toBe(false);
     expect('transactConstrained' in constraintsApi).toBe(false);
     expect('any' in queryApi).toBe(false);
@@ -197,6 +231,14 @@ describe('rewrite public API contracts', () => {
     expect(dbApi.qRows).toBeUndefined();
     // @ts-expect-error qManyRows is intentionally not exported.
     expect(dbApi.qManyRows).toBeUndefined();
+    // @ts-expect-error constraints install through mat, not a separate attachment API.
+    expect(constraintsApi.attachConstraints).toBeUndefined();
+    // @ts-expect-error constraints remove through demat, not a separate attachment API.
+    expect(constraintsApi.detachConstraints).toBeUndefined();
+    // @ts-expect-error attached constraint inspection is intentionally not public.
+    expect(constraintsApi.attachedConstraintsFor).toBeUndefined();
+    // @ts-expect-error attached constraint inspection is intentionally not public.
+    expect(constraintsApi.hasAttachedConstraints).toBeUndefined();
     // @ts-expect-error constrained transaction forks are intentionally not exported.
     expect(constraintsApi.tryTransactConstrained).toBeUndefined();
     // @ts-expect-error constrained transaction forks are intentionally not exported.
@@ -261,13 +303,16 @@ describe('rewrite public API contracts', () => {
     void invalidCompositeExists;
   });
 
-  it('treats attached constraints as normal Db transaction metadata', () => {
-    const constrained = attachConstraints(openingDb, constrain(
-      req(schema.entries, 'id', 'accountId', 'amount'),
+  it('installs and removes constraints through materialization inputs', () => {
+    const required = req(schema.entries, 'id', 'accountId', 'amount');
+    const constraints = constrain(
+      required,
       unique(schema.entries, 'id'),
       fk(schema.entries, 'accountId', schema.accounts, 'id'),
       check(from(as(schema.entries, 'entry')), gt(field('entry', 'amount'), value(-1_000_000)))
-    ));
+    );
+    const constrained = mat(openingDb, constraints, required);
+    const dematerialized = demat(constrained, constraints, required);
 
     const tryCommit = () => tryTransact(
       constrained,
@@ -278,8 +323,19 @@ describe('rewrite public API contracts', () => {
       insert(schema.entries, { id: 'e3', accountId: 'cash', amount: -20, memo: 'bank fee' })
     );
 
+    expectTypeOf<typeof constraints>().toEqualTypeOf<ConstraintSet>();
+    expectTypeOf<(typeof constraints)[number]>().toEqualTypeOf<ConstraintData>();
+    expectTypeOf<typeof constraints>().toMatchTypeOf<MaterializationInput>();
+    expectTypeOf<(typeof constraints)[number]>().toMatchTypeOf<MaterializationInput>();
+    expectTypeOf<typeof constrained>().toMatchTypeOf<MaterializedDb>();
+    expectTypeOf<typeof dematerialized>().toEqualTypeOf<typeof constrained>();
     expectTypeOf<ReturnType<typeof tryCommit>>().toEqualTypeOf<DbTransactionResult<typeof constrained>>();
     expectTypeOf<ReturnType<typeof commit>>().toEqualTypeOf<typeof constrained>();
+
+    const invalidMaterializationInput = () =>
+      // @ts-expect-error mat inputs are query/constraint/metadata values, not loose options objects.
+      mat(openingDb, { id: 'entries' });
+    void invalidMaterializationInput;
   });
 
   it('adds Relic-shaped helper signatures without evaluator behavior', () => {
@@ -304,11 +360,11 @@ describe('rewrite public API contracts', () => {
     const byPredicate = pipe(from(entry), join(from(account), eq(entry.accountId, account.id)));
     const byClause = pipe(
       from(entry),
-      join(from(account), { accountId: 'id' } satisfies EquiJoinClauseMap<Entry, Account>)
+      join(from(account), clauses<Entry, Account>({ accountId: 'id' }))
     );
     const leftByClause = pipe(
       from(account),
-      leftJoin(summaryRows, { id: 'accountId' } satisfies EquiJoinClauseMap<Account, QueryRow<typeof summaryRows>>),
+      leftJoin(summaryRows, clauses<Account, QueryRow<typeof summaryRows>>({ id: 'accountId' })),
       project({
         id: account.id,
         name: account.$.name,
@@ -316,8 +372,8 @@ describe('rewrite public API contracts', () => {
         total: maybe(summary.total)
       })
     );
-    const correlatedRows = sel(from(account), { accountId: 'id' } satisfies CorrelationClauseMap<Entry, Account>);
-    const correlatedRow = sel1(from(account), { accountId: 'id' } satisfies CorrelationClauseMap<Entry, Account>);
+    const correlatedRows = sel(from(account), correlate<Entry, Account>({ accountId: 'id' }));
+    const correlatedRow = sel1(from(account), correlate<Entry, Account>({ accountId: 'id' }));
     const wholeRow = self<Entry>();
     const predicates = [
       isNull(account.id),
@@ -338,6 +394,23 @@ describe('rewrite public API contracts', () => {
     expectTypeOf<typeof correlatedRow>().toEqualTypeOf<ExprData<Account | undefined>>();
     expectTypeOf<typeof wholeRow>().toEqualTypeOf<ExprData<Entry>>();
     expectTypeOf<(typeof predicates)[number]>().toEqualTypeOf<PredicateData>();
+
+    const invalidJoinLeft = () =>
+      // @ts-expect-error clause helpers reject keys outside the left row.
+      clauses<Entry, Account>({ missingAccount: 'id' });
+    const invalidJoinRight = () =>
+      // @ts-expect-error clause helpers reject values outside the right row.
+      clauses<Entry, Account>({ accountId: 'missingId' });
+    const invalidCorrelationOuter = () =>
+      // @ts-expect-error correlation helpers reject keys outside the outer row.
+      correlate<Entry, Account>({ missingAccount: 'id' });
+    const invalidCorrelationInner = () =>
+      // @ts-expect-error correlation helpers reject values outside the inner row.
+      correlate<Entry, Account>({ accountId: 'missingId' });
+    void invalidJoinLeft;
+    void invalidJoinRight;
+    void invalidCorrelationOuter;
+    void invalidCorrelationInner;
   });
 
   it('adds a schema-keyed seed helper for terse transaction rows', () => {
@@ -354,6 +427,56 @@ describe('rewrite public API contracts', () => {
     // @ts-expect-error schema-keyed seed rows must match their relation row type.
     const invalidRows: SchemaSeedInput<typeof schema> = { entries: [{ id: 'e1' }] };
     void invalidRows;
+  });
+
+  it('keeps watch and change tracking results free of constant kind tags', async () => {
+    const target = from(schema.entries);
+    const handle = watch(openingDb, target, () => undefined, { label: 'entries' });
+    const registration = watchTarget(openingDb, target);
+    const refresh = await handle.refresh();
+    const closed = handle.unwatch();
+    const closedAgain = unwatch(handle);
+    const subscription = subscribeWatch(handle, () => undefined);
+    const unsubscribe = subscription.unsubscribe();
+    const diff = await diffQuery(openingDb, openingDb, target);
+
+    expect('kind' in handle).toBe(false);
+    expect('kind' in registration).toBe(false);
+    expect('kind' in refresh).toBe(false);
+    expect('kind' in closed).toBe(false);
+    expect('kind' in closedAgain).toBe(false);
+    expect('kind' in subscription).toBe(false);
+    expect('kind' in unsubscribe).toBe(false);
+    expect('kind' in diff).toBe(false);
+
+    expectTypeOf<typeof handle>().toEqualTypeOf<WatchHandle<typeof openingDb, Entry>>();
+    expectTypeOf<typeof registration>().toEqualTypeOf<WatchTargetRegistration<typeof openingDb, Entry>>();
+    expectTypeOf<typeof refresh>().toEqualTypeOf<WatchRefreshResult<Entry>>();
+    expectTypeOf<typeof closed>().toEqualTypeOf<UnwatchResult>();
+    expectTypeOf<typeof subscription>().toEqualTypeOf<WatchSubscription>();
+    expectTypeOf<typeof unsubscribe>().toEqualTypeOf<WatchUnsubscribeResult>();
+    expectTypeOf<typeof diff>().toEqualTypeOf<QueryDiff<Entry>>();
+    expectTypeOf<HasKind<WatchEvent<Entry>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<WatchRefreshResult<Entry>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<WatchUnsubscribeResult>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<WatchSubscription>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<WatchHandle<typeof openingDb, Entry>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<WatchTargetRegistration<typeof openingDb, Entry>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<UnwatchResult>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<TrackedChange<Entry>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<WatchTargetChange<Entry>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<QueryDiff<Entry>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<TrackTransactResult<typeof openingDb>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<TrackRuntimeCommitSupportedResult<number>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<TrackRuntimeCommitUnsupportedResult<number>>>().toEqualTypeOf<false>();
+    expectTypeOf<HasKind<TrackRuntimeCommitResult<number>>>().toEqualTypeOf<false>();
+
+    // @ts-expect-error WatchHandle.kind is intentionally not public.
+    expect(handle.kind).toBeUndefined();
+    // @ts-expect-error WatchSubscription.kind is intentionally not public.
+    expect(subscription.kind).toBeUndefined();
+    // @ts-expect-error QueryDiff.kind is intentionally not public.
+    expect(diff.kind).toBeUndefined();
   });
 
   it('trims StoreView and StoreViewSnapshot to the sync external store shape', () => {

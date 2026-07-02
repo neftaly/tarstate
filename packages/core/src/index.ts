@@ -34,7 +34,9 @@ export {
   bottomBy,
   btree,
   call,
+  clauses,
   constRows,
+  correlate,
   count,
   countDistinct,
   desc,
@@ -170,22 +172,15 @@ export type {
 } from './db.js';
 
 export {
-  attachConstraints,
-  attachedConstraintsFor,
   check,
   constrain,
-  detachConstraints,
   fk,
-  hasAttachedConstraints,
   req,
   unique,
   validateConstraints
 } from './constraints.js';
 export type {
   CheckConstraintData,
-  ConstrainedDb,
-  ConstraintAttachment,
-  ConstraintAttachmentInput,
   ConstraintData,
   ConstraintOptions,
   ConstraintRelationField,

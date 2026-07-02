@@ -197,10 +197,24 @@ export type AggregateConfig<GroupBy extends ProjectionData = ProjectionData, Agg
   readonly aggregates: Aggregates;
 };
 type ClauseFieldKeys<Row> = Row extends object ? keyof Row & string : string;
-export type EquiJoinClauseMap<Left = Record<string, unknown>, Right = Record<string, unknown>> =
+type ClauseMapShape<Left, Right> =
   Readonly<Partial<Record<ClauseFieldKeys<Left>, ClauseFieldKeys<Right>>>>;
+declare const EQUI_JOIN_CLAUSE_MAP: unique symbol;
+declare const CORRELATION_CLAUSE_MAP: unique symbol;
+export type EquiJoinClauseMap<Left = Record<string, unknown>, Right = Record<string, unknown>> =
+  ClauseMapShape<Left, Right> & {
+    readonly [EQUI_JOIN_CLAUSE_MAP]: {
+      readonly left: Left;
+      readonly right: Right;
+    };
+  };
 export type CorrelationClauseMap<Outer = Record<string, unknown>, Inner = Record<string, unknown>> =
-  EquiJoinClauseMap<Outer, Inner>;
+  ClauseMapShape<Outer, Inner> & {
+    readonly [CORRELATION_CLAUSE_MAP]: {
+      readonly outer: Outer;
+      readonly inner: Inner;
+    };
+  };
 export type ExpandOptions<
   Alias extends string | undefined = string | undefined,
   Fields extends readonly string[] | undefined = readonly string[] | undefined
@@ -350,6 +364,13 @@ export function queryRowKeyFields(_input: QueryKeyInput): readonly string[] | un
   return undefined;
 }
 
+export const clauses = <Left = Record<string, unknown>, Right = Record<string, unknown>>(
+  map: ClauseMapShape<Left, Right>
+): EquiJoinClauseMap<Left, Right> => map as EquiJoinClauseMap<Left, Right>;
+export const correlate = <Outer = Record<string, unknown>, Inner = Record<string, unknown>>(
+  map: ClauseMapShape<Outer, Inner>
+): CorrelationClauseMap<Outer, Inner> => map as CorrelationClauseMap<Outer, Inner>;
+
 export function as<Row extends object, Alias extends string>(relationRef: RelationRef<Row>, alias: Alias): AliasedRelationRef<Row, Alias>;
 export function as<Row, Alias extends string>(query: Query<Row>, alias: Alias): AliasedQuery<Row, Alias>;
 export function as<Row, Alias extends string>(
@@ -462,14 +483,14 @@ export const uniqueIndex = (...expressions: readonly ExprData[]): PreserveQueryT
 export const keyBy = (...fields: readonly string[]): PreserveQueryTransform => ((query) =>
   ({ ...query, data: { op: 'keyBy', input: query.data, fields } })) as PreserveQueryTransform;
 export function join<Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'inner'>;
-export function join<Right>(right: Query<Right>, on: EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'inner'>;
-export function join<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'inner'> {
+export function join<Left, Right>(right: Query<Right>, on: EquiJoinClauseMap<Left, Right>): JoinQueryTransform<Right, 'inner'>;
+export function join<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<unknown, Right>): JoinQueryTransform<Right, 'inner'> {
   return ((left) =>
     ({ data: { op: 'join', kind: 'inner', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'inner'>;
 }
 export function leftJoin<Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'left'>;
-export function leftJoin<Right>(right: Query<Right>, on: EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'left'>;
-export function leftJoin<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<Record<string, unknown>, Right>): JoinQueryTransform<Right, 'left'> {
+export function leftJoin<Left, Right>(right: Query<Right>, on: EquiJoinClauseMap<Left, Right>): JoinQueryTransform<Right, 'left'>;
+export function leftJoin<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<unknown, Right>): JoinQueryTransform<Right, 'left'> {
   return ((left) =>
     ({ data: { op: 'join', kind: 'left', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'left'>;
 }
@@ -522,13 +543,13 @@ export const minBy = <Row = unknown>(input: ExprInput<Row>, by: ExprInput): Expr
 export const setConcat = <Value = unknown>(input: ExprInput<readonly Value[]>): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('setConcat', input);
 export const self = <Row = unknown>(): ExprData<Row> => ({ op: 'self' });
 export function sel<Row>(query: Query<Row>): ExprData<readonly Row[]>;
-export function sel<Row>(query: Query<Row>, correlation: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<readonly Row[]>;
-export function sel<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<readonly Row[]> {
+export function sel<Outer, Row>(query: Query<Row>, correlation: CorrelationClauseMap<Outer, Row>): ExprData<readonly Row[]>;
+export function sel<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<unknown, Row>): ExprData<readonly Row[]> {
   return { op: 'sel', query: query.data, ...(correlation === undefined ? {} : { correlation }) };
 }
 export function sel1<Row>(query: Query<Row>): ExprData<Row | undefined>;
-export function sel1<Row>(query: Query<Row>, correlation: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<Row | undefined>;
-export function sel1<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<Record<string, unknown>, Row>): ExprData<Row | undefined> {
+export function sel1<Outer, Row>(query: Query<Row>, correlation: CorrelationClauseMap<Outer, Row>): ExprData<Row | undefined>;
+export function sel1<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<unknown, Row>): ExprData<Row | undefined> {
   return { op: 'sel1', query: query.data, ...(correlation === undefined ? {} : { correlation }) };
 }
 
@@ -1151,9 +1172,6 @@ export type QueryUniqueConstraintData = UniqueConstraintData;
 export type ConstraintData = CheckConstraintData | RequiredConstraintData | ForeignKeyConstraintData | UniqueConstraintData;
 export type ConstraintSet = readonly ConstraintData[];
 export type ConstraintOptions = { readonly name?: string };
-export type ConstraintAttachmentInput = ConstraintData | ConstraintSet;
-export type ConstraintAttachment = { readonly constraints: ConstraintSet };
-export type ConstrainedDb = Db & { readonly constraints?: ConstraintSet };
 export type ConstraintValidationInput = ConstraintSet | ConstraintData;
 export type ConstraintValidationOptions = EvaluateOptions;
 export type ConstraintValidationResult = {
@@ -1183,10 +1201,6 @@ export const fk = (
 });
 export const unique = (query: Query | RelationRef, ...fields: readonly string[]): UniqueConstraintData => ({ op: 'unique', query, fields });
 export const constrain = (...constraints: readonly ConstraintData[]): ConstraintSet => constraints;
-export const attachConstraints = <DbValue extends Db>(dbValue: DbValue, constraints: ConstraintSet): DbValue & { readonly constraints: ConstraintSet } => ({ ...dbValue, constraints });
-export const detachConstraints = <DbValue extends Db>(dbValue: DbValue): DbValue => dbValue;
-export const attachedConstraintsFor = (dbValue: Partial<ConstrainedDb>): ConstraintSet => dbValue.constraints ?? [];
-export const hasAttachedConstraints = (dbValue: Partial<ConstrainedDb>): boolean => attachedConstraintsFor(dbValue).length > 0;
 export const validateConstraints = async (): Promise<ConstraintValidationResult> => ({ valid: false, diagnostics: [stubDiagnostic('validateConstraints')] });
 
 /**
@@ -1269,8 +1283,19 @@ export type MaterializationUniqueIndex<Row = unknown, Value = unknown> = Materia
 export type MaterializationIndexResult<Row = unknown> = MaterializationSetLike<Row>;
 export type MaterializedQueryResult<Row = unknown> = QueryResult<Row> & { readonly materialized: boolean };
 export type MaterializationIndexOptions<Field extends string = string> = { readonly fields?: readonly Field[] };
+export type MaterializationInput<Row = unknown> =
+  | Query<Row>
+  | ConstraintData
+  | ConstraintSet
+  | MaterializationMetadata<Row>;
+export type MaterializationTarget<Row = unknown> =
+  | string
+  | Query<Row>
+  | ConstraintData
+  | ConstraintSet
+  | MaterializationMetadata<Row>;
 
-export function mat<DbValue extends object>(dbValue: DbValue, ..._inputs: readonly unknown[]): DbValue & MaterializedDb {
+export function mat<DbValue extends object>(dbValue: DbValue, ..._inputs: readonly MaterializationInput[]): DbValue & MaterializedDb {
   return dbValue as DbValue & MaterializedDb;
 }
 export async function materializeSnapshot<DbValue extends SnapshotMaterializationTarget, Row>(
@@ -1280,7 +1305,7 @@ export async function materializeSnapshot<DbValue extends SnapshotMaterializatio
 ): Promise<DbValue & MaterializedDb> {
   return dbValue as DbValue & MaterializedDb;
 }
-export const demat = <DbValue extends MaterializableDb>(dbValue: DbValue, ..._targets: readonly unknown[]): DbValue => dbValue;
+export const demat = <DbValue extends MaterializableDb>(dbValue: DbValue, ..._targets: readonly MaterializationTarget[]): DbValue => dbValue;
 export const isMaterialized = (input: unknown): input is MaterializedDb => isRecord(input) && 'materialized' in input;
 export const materializationsFor = (_input: unknown): readonly MaterializationMetadata[] => [];
 export const materializationForQuery = <Row = unknown>(_input: unknown, _query: Query<Row>): MaterializationMetadata<Row> | undefined => undefined;
@@ -1393,7 +1418,6 @@ export type WatchRuntimeDiagnostic<Row = unknown> = WatchDiagnostic | RowDiffDia
 export type ChangeSet = { readonly deltas?: readonly RelationDelta[]; readonly diagnostics: readonly WatchDiagnostic[] };
 export type WatchTarget<Row = unknown> = Query<Row> | RelationRef;
 export type WatchEvent<Row = unknown> = {
-  readonly kind: 'watchEvent';
   readonly id: string;
   readonly targetKey: string;
   readonly target: WatchTarget<Row>;
@@ -1409,11 +1433,10 @@ export type WatchEvent<Row = unknown> = {
 };
 export type WatchListener<Row = unknown> = (event: WatchEvent<Row>) => void | Promise<void>;
 export type WatchOptions<Row = unknown> = EvaluateOptions & RowDiffOptions<Row> & { readonly label?: string; readonly immediate?: boolean };
-export type WatchRefreshResult<Row = unknown> = Omit<WatchEvent<Row>, 'kind' | 'changes'> & { readonly kind: 'watchRefresh'; readonly delivered: boolean };
-export type WatchUnsubscribeResult = { readonly kind: 'watchUnsubscribe'; readonly id: string; readonly unsubscribed: boolean; readonly diagnostics: readonly WatchDiagnostic[] };
-export type WatchSubscription = { readonly kind: 'watchSubscription'; readonly id: string; readonly active: boolean; readonly diagnostics: readonly WatchDiagnostic[]; readonly unsubscribe: () => WatchUnsubscribeResult };
+export type WatchRefreshResult<Row = unknown> = Omit<WatchEvent<Row>, 'changes'> & { readonly delivered: boolean };
+export type WatchUnsubscribeResult = { readonly id: string; readonly unsubscribed: boolean; readonly diagnostics: readonly WatchDiagnostic[] };
+export type WatchSubscription = { readonly id: string; readonly active: boolean; readonly diagnostics: readonly WatchDiagnostic[]; readonly unsubscribe: () => WatchUnsubscribeResult };
 export type WatchHandle<DbValue extends WatchDb = WatchDb, Row = unknown> = {
-  readonly kind: 'watch';
   readonly id: string;
   readonly db: DbValue;
   readonly target: WatchTarget<Row>;
@@ -1426,7 +1449,6 @@ export type WatchHandle<DbValue extends WatchDb = WatchDb, Row = unknown> = {
 };
 export type RuntimeWatchHandle<Row = unknown> = WatchHandle<RelationSource, Row>;
 export type WatchTargetRegistration<DbValue extends WatchDb = WatchDb, Row = unknown> = {
-  readonly kind: 'watchTarget';
   readonly db: DbValue;
   readonly target: WatchTarget<Row>;
   readonly handle: WatchHandle<DbValue, Row>;
@@ -1435,15 +1457,14 @@ export type WatchTargetRegistration<DbValue extends WatchDb = WatchDb, Row = unk
   readonly unwatch: () => UnwatchResult;
   readonly label?: string;
 };
-export type UnwatchResult = { readonly kind: 'unwatch'; readonly id: string; readonly closed: boolean; readonly diagnostics: readonly WatchDiagnostic[] };
-export type TrackedChange<Row = unknown> = Omit<WatchEvent<Row>, 'kind' | 'changes'> & { readonly kind: 'trackedChange' };
-export type WatchTargetChange<Row = unknown> = Pick<TrackedChange<Row>, 'kind' | 'id' | 'targetKey' | 'target' | 'changed' | 'added' | 'removed' | 'unchanged' | 'rowChanges' | 'diagnostics'>;
+export type UnwatchResult = { readonly id: string; readonly closed: boolean; readonly diagnostics: readonly WatchDiagnostic[] };
+export type TrackedChange<Row = unknown> = Omit<WatchEvent<Row>, 'changes'>;
+export type WatchTargetChange<Row = unknown> = Pick<TrackedChange<Row>, 'id' | 'targetKey' | 'target' | 'changed' | 'added' | 'removed' | 'unchanged' | 'rowChanges' | 'diagnostics'>;
 export type WatchChangeMap<Row = unknown> = ReadonlyMap<WatchTarget<Row>, WatchTargetChange<Row>>;
 export type WatchChangeKeyMap<Row = unknown> = ReadonlyMap<string, WatchTargetChange<Row>>;
 export type QueryDiffOptions<Row = unknown> = EvaluateOptions & RowDiffOptions<Row>;
 export type QueryDiffDiagnostic<Row = unknown> = TarstateDiagnostic | RowDiffDiagnostic<Row>;
 export type QueryDiff<Row = unknown> = {
-  readonly kind: 'queryDiff';
   readonly target: Query<Row>;
   readonly queryKey: string;
   readonly beforeRows: readonly Row[];
@@ -1464,20 +1485,20 @@ export function watch<DbValue extends WatchDb, Row>(dbValue: DbValue, target: Wa
 }
 export const watchTarget = <DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, options: WatchOptions<Row> = {}): WatchTargetRegistration<DbValue, Row> => {
   const handle = createWatchHandle(dbValue, target, options);
-  return { kind: 'watchTarget', db: dbValue, target, handle, supported: true, diagnostics: [], unwatch: handle.unwatch };
+  return { db: dbValue, target, handle, supported: true, diagnostics: [], unwatch: handle.unwatch };
 };
-export const unwatchTarget = (_registration: Pick<WatchTargetRegistration, 'handle'> | Pick<WatchHandle, 'id'>): UnwatchResult => ({ kind: 'unwatch', id: 'watch', closed: true, diagnostics: [] });
+export const unwatchTarget = (_registration: Pick<WatchTargetRegistration, 'handle'> | Pick<WatchHandle, 'id'>): UnwatchResult => ({ id: 'watch', closed: true, diagnostics: [] });
 export const watchChangeMap = <Row>(_changes: Iterable<TrackedChange<Row>>): WatchChangeMap<Row> => new Map();
 export const watchChangeKeyMap = <Row>(_changes: Iterable<TrackedChange<Row>>): WatchChangeKeyMap<Row> => new Map();
 export const watchTargetKey = (target: WatchTarget): string => isQuery(target) ? queryKey(target) : `relation:${target.name}`;
 export const isWatchMaterialization = (): boolean => false;
 export const watchRuntime = <Version, Row>(runtime: RelationRuntime<Version>, target: WatchTarget<Row>, listener: WatchListener<Row>, options: WatchOptions<Row> = {}): RuntimeWatchHandle<Row> =>
   watch(runtime.source, target, listener, options) as RuntimeWatchHandle<Row>;
-export const unwatch = (_handle: Pick<WatchHandle, 'id'>): UnwatchResult => ({ kind: 'unwatch', id: _handle.id, closed: true, diagnostics: [] });
+export const unwatch = (_handle: Pick<WatchHandle, 'id'>): UnwatchResult => ({ id: _handle.id, closed: true, diagnostics: [] });
 export const subscribeWatch = <Row>(_handle: Pick<WatchHandle<WatchDb, Row>, 'id' | 'supported' | 'target'>, _listener: WatchListener<Row>): WatchSubscription =>
-  ({ kind: 'watchSubscription', id: _handle.id, active: false, diagnostics: [watchDiagnostic('subscribeWatch')], unsubscribe: () => ({ kind: 'watchUnsubscribe', id: _handle.id, unsubscribed: false, diagnostics: [] }) });
+  ({ id: _handle.id, active: false, diagnostics: [watchDiagnostic('subscribeWatch')], unsubscribe: () => ({ id: _handle.id, unsubscribed: false, diagnostics: [] }) });
 export async function diffQuery<Row>(_before: WatchDb, _after: WatchDb, target: Query<Row>): Promise<QueryDiff<Row>> {
-  return { kind: 'queryDiff', target, queryKey: queryKey(target), beforeRows: [], afterRows: [], changed: false, added: [], removed: [], unchanged: [], rowChanges: [], diagnostics: [stubDiagnostic('diffQuery')] };
+  return { target, queryKey: queryKey(target), beforeRows: [], afterRows: [], changed: false, added: [], removed: [], unchanged: [], rowChanges: [], diagnostics: [stubDiagnostic('diffQuery')] };
 }
 export const diffOptionsForTarget = <Row>(_target: WatchTarget<Row>, options: WatchOptions<Row>): RowDiffOptions<Row> => options;
 export const transferWatches = (): void => {};
@@ -1485,7 +1506,7 @@ export async function trackedChangesForDbTransition(): Promise<{ readonly change
   return { changes: [], diagnostics: [stubDiagnostic('trackedChangesForDbTransition')] };
 }
 export const trackedChangeFromMaterializationChange = <Row>(change: MaterializationMaintenanceChange<Row>): TrackedChange<Row> =>
-  ({ kind: 'trackedChange', id: change.id, targetKey: change.queryKey, target: change.query, changed: change.rowChanges.length > 0, previousRows: change.previousRows ?? [], rows: change.rows, added: change.added, removed: change.removed, unchanged: [], rowChanges: change.rowChanges, diagnostics: change.diagnostics });
+  ({ id: change.id, targetKey: change.queryKey, target: change.query, changed: change.rowChanges.length > 0, previousRows: change.previousRows ?? [], rows: change.rows, added: change.added, removed: change.removed, unchanged: [], rowChanges: change.rowChanges, diagnostics: change.diagnostics });
 
 export type TrackTransactDiagnostic = WatchRuntimeDiagnostic | TarstateDiagnostic;
 export type TrackRuntimeCommitDiagnostic = TrackTransactDiagnostic;
@@ -1503,7 +1524,6 @@ export type TrackTransactChangeView<Row = unknown> = {
 export type TrackTransactQueryChanges<Row = unknown> = Readonly<Record<string, TrackTransactChangeView<Row>>>;
 export type TrackRuntimeCommitOptions = TrackTransactOptions & RelationApplyOptions;
 export type TrackTransactResult<DbValue extends WatchDb = WatchDb> = {
-  readonly kind: 'trackTransact';
   readonly db: DbValue;
   readonly result?: DbTransactionResult;
   readonly supported: boolean;
@@ -1519,7 +1539,6 @@ export type TrackTransactResult<DbValue extends WatchDb = WatchDb> = {
 };
 export type TrackRuntimeCommitStatus = RelationApplyStatus;
 export type TrackRuntimeCommitSupportedResult<Version = unknown> = {
-  readonly kind: 'trackRuntimeCommit';
   readonly runtime: RelationRuntime<Version>;
   readonly source: AdapterSource<Version>;
   readonly supported: true;
@@ -1610,15 +1629,14 @@ function createStubView<Row, Version>(queryValue: Query<Row>, snapshot: () => St
 
 function createWatchHandle<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, options: WatchOptions<Row>): WatchHandle<DbValue, Row> {
   return {
-    kind: 'watch',
     id: options.label ?? 'watch',
     db: dbValue,
     target,
     supported: true,
     mode: 'db',
     diagnostics: [watchDiagnostic('watch')],
-    refresh: async () => ({ kind: 'watchRefresh', id: options.label ?? 'watch', targetKey: watchTargetKey(target), target, delivered: false, changed: false, previousRows: [], rows: [], added: [], removed: [], unchanged: [], rowChanges: [], diagnostics: [watchDiagnostic('watch.refresh')] }),
-    unwatch: () => ({ kind: 'unwatch', id: options.label ?? 'watch', closed: true, diagnostics: [] }),
+    refresh: async () => ({ id: options.label ?? 'watch', targetKey: watchTargetKey(target), target, delivered: false, changed: false, previousRows: [], rows: [], added: [], removed: [], unchanged: [], rowChanges: [], diagnostics: [watchDiagnostic('watch.refresh')] }),
+    unwatch: () => ({ id: options.label ?? 'watch', closed: true, diagnostics: [] }),
     ...(options.label === undefined ? {} : { label: options.label })
   };
 }
