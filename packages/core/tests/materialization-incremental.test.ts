@@ -17,6 +17,7 @@ import {
   difference,
   eq,
   env,
+  extend,
   expand,
   field,
   from,
@@ -43,7 +44,9 @@ import {
   notAny,
   pipe,
   project,
+  qualify,
   qRows,
+  rename,
   sel,
   sel1,
   setConcat,
@@ -57,7 +60,8 @@ import {
   updateWhere,
   value,
   watch,
-  where
+  where,
+  without
 } from '@tarstate/core';
 import type { MaterializationMaintenanceResult, Query, RelationDelta, WatchEvent } from '@tarstate/core';
 import {
@@ -1441,6 +1445,297 @@ describe('incremental materialization', () => {
         })
       ]);
       expect(materializedRowsForQuery(withoutMissingGroup, teamUserFacets)).toEqual(deletedChange.rows);
+    });
+
+    it('incrementally maintains aggregate output followed by where threshold changes', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const points = field<number>('taskRollup', 'points');
+      const taskProjectRollups = pipe(
+        from(task),
+        aggregate({
+          groupBy: { projectId: task.ownerId },
+          aggregates: {
+            tasks: count(),
+            points: sum(task.points),
+            averagePoints: avg(task.points)
+          }
+        })
+      ) as Query<TaskProjectRollupRow>;
+      const filteredTaskProjectRollups = where<TaskProjectRollupRow>(
+        gt(points, value(9))
+      )(taskProjectRollups);
+      const taskProjectRollupsOverNine = keyBy('projectId')(filteredTaskProjectRollups);
+      const state = mat(createDb(sourceData), taskProjectRollupsOverNine, {
+        id: 'task-project-rollups-over-nine',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, taskProjectRollupsOverNine);
+      const extraReviewTask: TaskRow = {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Cross aggregate threshold',
+        done: false,
+        points: 7
+      };
+      const withExtraReview = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, extraReviewTask]
+      });
+
+      expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, taskProjectRollupsOverNine)).toEqual([
+        { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 }
+      ]);
+
+      const inserted = maintainMaterializations(state, withExtraReview, {
+        deltas: [tasksDelta([extraReviewTask], [])]
+      });
+      const insertedChange = singleMaterializationChange(inserted, 'task-project-rollups-over-nine');
+
+      expect(inserted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(insertedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 },
+          { projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 }
+        ],
+        addedRows: [{ projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 }],
+        removedRows: []
+      });
+      expectNoIncrementalFallback([...inserted.diagnostics, ...insertedChange.diagnostics]);
+      expect(insertedChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'added',
+          row: { projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 }
+        })
+      ]);
+      expect(materializedRowsForQuery(withExtraReview, taskProjectRollupsOverNine)).toEqual(insertedChange.rows);
+
+      const withoutExtraReview = createDb(sourceData);
+      const deleted = maintainMaterializations(withExtraReview, withoutExtraReview, {
+        deltas: [tasksDelta([], [extraReviewTask])]
+      });
+      const deletedChange = singleMaterializationChange(deleted, 'task-project-rollups-over-nine');
+
+      expect(deleted).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(deletedChange).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 }
+        ],
+        addedRows: [],
+        removedRows: [{ projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 }]
+      });
+      expectNoIncrementalFallback([...deleted.diagnostics, ...deletedChange.diagnostics]);
+      expect(deletedChange.rowChanges).toEqual([
+        expect.objectContaining({
+          kind: 'removed',
+          row: { projectId: 'bea', tasks: 2, points: 10, averagePoints: 5 }
+        })
+      ]);
+      expect(materializedRowsForQuery(withoutExtraReview, taskProjectRollupsOverNine)).toEqual(deletedChange.rows);
+    });
+
+    it('incrementally maintains aggregate output followed by project, extend, without, rename, and qualify', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const projectId = field<string>('taskRollup', 'projectId');
+      const tasks = field<number>('taskRollup', 'tasks');
+      const points = field<number>('taskRollup', 'points');
+      const qualifiedTaskRollups = pipe(
+        from(task),
+        aggregate({
+          groupBy: { projectId: task.ownerId },
+          aggregates: {
+            tasks: count(),
+            points: sum(task.points)
+          }
+        }),
+        project({ projectId, tasks, points }),
+        extend({ label: value('rollup') }),
+        without('tasks'),
+        rename({ projectId: 'ownerId', points: 'totalPoints' }),
+        qualify('rollup')
+      ) as Query<{ readonly rollup: { readonly ownerId: string; readonly totalPoints: number; readonly label: string } }>;
+      const state = mat(createDb(sourceData), qualifiedTaskRollups, {
+        id: 'qualified-task-rollups',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, qualifiedTaskRollups);
+      const extraReviewTask: TaskRow = {
+        id: 't4',
+        ownerId: 'bea',
+        title: 'Transform aggregate output',
+        done: false,
+        points: 7
+      };
+      const next = createDb({
+        ...sourceData,
+        tasks: [...sourceData.tasks, extraReviewTask]
+      });
+
+      expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, qualifiedTaskRollups)).toEqual([
+        { rollup: { ownerId: 'ada', totalPoints: 13, label: 'rollup' } },
+        { rollup: { ownerId: 'bea', totalPoints: 3, label: 'rollup' } }
+      ]);
+
+      const maintained = maintainMaterializations(state, next, {
+        deltas: [tasksDelta([extraReviewTask], [])]
+      });
+      const change = singleMaterializationChange(maintained, 'qualified-task-rollups');
+
+      expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(change).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { rollup: { ownerId: 'ada', totalPoints: 13, label: 'rollup' } },
+          { rollup: { ownerId: 'bea', totalPoints: 10, label: 'rollup' } }
+        ]
+      });
+      expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+      expect(change.rowChanges.length).toBeGreaterThan(0);
+      expect(materializedRowsForQuery(next, qualifiedTaskRollups)).toEqual(change.rows);
+    });
+
+    it('incrementally maintains aggregate output followed by expand', () => {
+      const user = as(coreSchema.users, 'user');
+      const teamId = field<string>('teamFacet', 'teamId');
+      const tags = field<ReadonlySet<string>>('teamFacet', 'tags');
+      const tag = field<string>('tag', 'value');
+      const teamTags = pipe(
+        from(user),
+        aggregate({
+          groupBy: { teamId: user.teamId },
+          aggregates: {
+            tags: setConcat(user.tags)
+          }
+        }),
+        expand(tags, { as: 'tag' }),
+        project({ teamId, tag }),
+        keyBy('teamId', 'tag')
+      ) as Query<{ readonly teamId: string; readonly tag: string }>;
+      const state = mat(createDb(sourceData), teamTags, {
+        id: 'team-tags-from-aggregate',
+        mode: 'incremental'
+      });
+      const metadata = materializationForQuery(state, teamTags);
+      const updatedAda = { ...adaUser, tags: ['compiler', 'logic'] };
+      const next = createDb({
+        ...sourceData,
+        users: [updatedAda, beaUser, calUser]
+      });
+
+      expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+      expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+      expect(materializedRowsForQuery(state, teamTags)).toEqual([
+        { teamId: 'eng', tag: 'compiler' },
+        { teamId: 'eng', tag: 'runtime' },
+        { teamId: 'design', tag: 'research' }
+      ]);
+
+      const maintained = maintainMaterializations(state, next, {
+        deltas: [usersDelta([updatedAda], [adaUser])]
+      });
+      const change = singleMaterializationChange(maintained, 'team-tags-from-aggregate');
+
+      expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+      expect(change).toMatchObject({
+        maintenance: 'incremental',
+        recomputed: false,
+        rows: [
+          { teamId: 'eng', tag: 'compiler' },
+          { teamId: 'eng', tag: 'logic' },
+          { teamId: 'design', tag: 'research' }
+        ],
+        addedRows: [{ teamId: 'eng', tag: 'logic' }],
+        removedRows: [{ teamId: 'eng', tag: 'runtime' }]
+      });
+      expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+      expect(change.rowChanges).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'added',
+          row: { teamId: 'eng', tag: 'logic' }
+        }),
+        expect.objectContaining({
+          kind: 'removed',
+          row: { teamId: 'eng', tag: 'runtime' }
+        })
+      ]));
+      expect(materializedRowsForQuery(next, teamTags)).toEqual(change.rows);
+    });
+
+    it('keeps join and set operations after aggregate on snapshot fallback', () => {
+      const task = as(coreSchema.tasks, 'task');
+      const user = as(coreSchema.users, 'user');
+      const projectId = field<string>('taskRollup', 'projectId');
+      const aggregateBase = pipe(
+        from(task),
+        aggregate({
+          groupBy: { projectId: task.ownerId },
+          aggregates: {
+            tasks: count(),
+            points: sum(task.points),
+            averagePoints: avg(task.points)
+          }
+        })
+      ) as Query<TaskProjectRollupRow>;
+      const allowedRollups = constRows([
+        { projectId: 'ada', tasks: 2, points: 13, averagePoints: 6.5 }
+      ]);
+      const aggregateUserJoin = pipe(
+        aggregateBase,
+        join(from(user), eq(projectId, user.id))
+      ) as Query<TaskProjectRollupRow & { readonly user: UserRow }>;
+      const cases: readonly {
+        readonly id: string;
+        readonly query: Query<unknown>;
+        readonly reason: string;
+      }[] = [
+        {
+          id: 'aggregate-then-join-fallback',
+          query: pipe(
+            aggregateUserJoin,
+            keyBy('projectId')
+          ) as Query<unknown>,
+          reason: 'join after aggregate'
+        },
+        {
+          id: 'aggregate-then-intersection-fallback',
+          query: pipe(
+            intersection(aggregateBase, allowedRollups),
+            keyBy('projectId')
+          ) as Query<unknown>,
+          reason: 'intersection after aggregate'
+        },
+        {
+          id: 'aggregate-then-difference-fallback',
+          query: pipe(
+            difference(aggregateBase, allowedRollups),
+            keyBy('projectId')
+          ) as Query<unknown>,
+          reason: 'difference after aggregate'
+        }
+      ];
+
+      for (const item of cases) {
+        const state = mat(createDb(sourceData), item.query, {
+          id: item.id,
+          mode: 'incremental'
+        });
+        const metadata = materializationForQuery(state, item.query);
+
+        expect(metadata).toMatchObject({
+          requestedMode: 'incremental',
+          maintenance: 'snapshot'
+        });
+        expect(metadata?.maintenanceReason).toContain(item.reason);
+        expectIncrementalFallback(metadata?.diagnostics ?? []);
+      }
     });
 
     it('marks initial by-row aggregate winner materialization as incrementally maintained', () => {
