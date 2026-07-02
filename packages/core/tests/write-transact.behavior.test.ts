@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { unique } from '@tarstate/core/constraints';
 import {
   createDb,
   DbTransactionError,
@@ -8,7 +9,9 @@ import {
   tryTransact,
   type DbTransactionContext
 } from '@tarstate/core/db';
-import { asc, eq, from, gt, pipe, project, sort, value } from '@tarstate/core/query';
+import { mat } from '@tarstate/core/materialization';
+import { any as anyAggregate, asc, call, count, eq, field, from, gt, hostFn, pipe, project, sort, value } from '@tarstate/core/query';
+import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import {
   deleteByKey,
   deleteExact,
@@ -36,6 +39,23 @@ import {
   type Account,
   type Entry
 } from './behavior-fixtures.js';
+
+type Contact = {
+  readonly id: string;
+  readonly email: string;
+  readonly name: string;
+};
+
+const contactSchema = defineSchema({
+  contacts: relation<Contact>({
+    key: 'id',
+    fields: {
+      id: idField('contact'),
+      email: stringField(),
+      name: stringField()
+    }
+  })
+});
 
 function deltaRows(result: { readonly deltas: readonly { readonly relation: { readonly name: string }; readonly added: readonly unknown[]; readonly removed: readonly unknown[] }[] }, relationName: string): {
   readonly added: readonly unknown[];
@@ -98,6 +118,41 @@ describe('write and transaction behavior', () => {
     ]);
   });
 
+  it('resolves insert variants against materialized unique constraints', () => {
+    const uniqueEmail = unique(contactSchema.contacts, 'email');
+    const original = { id: 'old', email: 'ada@example.test', name: 'Ada' } as const satisfies Contact;
+    const incoming = { id: 'new', email: 'ada@example.test', name: 'Ada Lovelace' } as const satisfies Contact;
+    const freshDb = () => mat(createDb({ contacts: [original] }), uniqueEmail);
+
+    const ignored = tryTransact(freshDb(), insertIgnore(contactSchema.contacts, incoming));
+    const replaced = tryTransact(freshDb(), insertOrReplace(contactSchema.contacts, incoming));
+    const merged = tryTransact(
+      freshDb(),
+      insertOrMerge(contactSchema.contacts, incoming, { merge: ['name'] })
+    );
+    const updated = tryTransact(
+      freshDb(),
+      insertOrUpdate(contactSchema.contacts, incoming, { update: { name: 'Updated Ada' } })
+    );
+
+    expect(ignored.committed).toBe(true);
+    expect(ignored.applied).toBe(0);
+    expect(q(ignored.db, contactSchema.contacts)).toEqual([original]);
+
+    expect(replaced.committed).toBe(true);
+    expect(q(replaced.db, contactSchema.contacts)).toEqual([incoming]);
+
+    expect(merged.committed).toBe(true);
+    expect(q(merged.db, contactSchema.contacts)).toEqual([
+      { id: 'old', email: 'ada@example.test', name: 'Ada Lovelace' }
+    ]);
+
+    expect(updated.committed).toBe(true);
+    expect(q(updated.db, contactSchema.contacts)).toEqual([
+      { id: 'old', email: 'ada@example.test', name: 'Updated Ada' }
+    ]);
+  });
+
   it('updates and deletes by key, predicate, exact row, and replaceAll', () => {
     const db = makeDb();
     const replacementAccounts = [
@@ -112,7 +167,7 @@ describe('write and transaction behavior', () => {
       })),
       deleteByKey(schema.entries, 'e2'),
       deleteRows(schema.entries, eq(entry.posted, value(false))),
-      deleteExact(schema.entries, { id: 'e3', accountId: 'fees' }),
+      deleteExact(schema.entries, { id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true }),
       replaceAll(schema.accounts, replacementAccounts)
     );
 
@@ -156,6 +211,56 @@ describe('write and transaction behavior', () => {
         ]
       }
     ]);
+  });
+
+  it('deleteExact requires full row equality', () => {
+    const db = makeDb();
+    const partialEntry = { id: 'e3', accountId: 'fees' } as unknown as Entry;
+    const afterPartial = transact(db, deleteExact(schema.entries, partialEntry));
+
+    expect(q(afterPartial, entriesById)).toEqual(openingEntries);
+
+    const afterExact = transact(
+      afterPartial,
+      deleteExact(schema.entries, { id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true })
+    );
+
+    expect(q(afterExact, entriesById)).toEqual([
+      { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true },
+      { id: 'e2', accountId: 'sales', amount: -120, memo: 'invoice paid', posted: true },
+      { id: 'e4', accountId: 'cash', amount: 0, posted: false }
+    ]);
+  });
+
+  it('evaluates expression-valued update maps against the current row', () => {
+    const add = hostFn<number>('math.add', (left, right) => Number(left) + Number(right));
+    const memoFromRow = hostFn<string>('memo.from-row', (id, accountId) => `${String(id)}:${String(accountId)}`);
+
+    const next = transact(
+      makeDb(),
+      updateByKey(schema.entries, 'e1', {
+        accountId: field('row', 'accountId'),
+        amount: call(add, entry.amount, value(8)),
+        memo: call(memoFromRow, entry.id, entry.accountId),
+        posted: field('row', 'posted')
+      })
+    );
+
+    expect(row(next, schema.entries, 'e1')).toEqual({
+      id: 'e1',
+      accountId: 'cash',
+      amount: 128,
+      memo: 'e1:cash',
+      posted: true
+    });
+
+    // @ts-expect-error aggregate expressions cannot be evaluated in a row update context.
+    const invalidCountUpdate = updateByKey(schema.entries, 'e1', { amount: count() });
+    void invalidCountUpdate;
+
+    // @ts-expect-error aggregate expressions cannot be evaluated in a row update context.
+    const invalidAnyUpdate = updateByKey(schema.entries, 'e1', { posted: anyAggregate(eq(entry.posted, value(true))) });
+    void invalidAnyUpdate;
   });
 
   it('evaluates transaction callbacks against staged db state', () => {

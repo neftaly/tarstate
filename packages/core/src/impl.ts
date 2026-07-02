@@ -162,11 +162,19 @@ export type ExprData<Value = unknown> = Readonly<Record<string, unknown>> & {
   readonly op: string;
   readonly __value?: Value;
 };
+export type AggregateExprData<Value = unknown> = ExprData<Value> & {
+  readonly __tarstateExprKind: 'aggregate';
+};
+export type RowExprData<Value = unknown> = ExprData<Value> & {
+  readonly __tarstateExprKind?: never;
+};
 export type ExprInput<Value = unknown> = ExprData<Value> | PrimitiveValue;
 export type ComparisonOp = 'eq' | 'neq' | 'lt' | 'lte' | 'gt' | 'gte';
 export type AggregateFunction =
   | 'count'
   | 'countDistinct'
+  | 'any'
+  | 'notAny'
   | 'sum'
   | 'avg'
   | 'min'
@@ -529,19 +537,21 @@ export const aggregate = <GroupBy extends ProjectionData, Aggregates extends Pro
 
 export const asc = (input: SortInput, nulls?: NullSortOrder): SortData => ({ expr: expr(input), direction: 'asc', ...(nulls === undefined ? {} : { nulls }) });
 export const desc = (input: SortInput, nulls?: NullSortOrder): SortData => ({ expr: expr(input), direction: 'desc', ...(nulls === undefined ? {} : { nulls }) });
-export const count = (): ExprData<number> => aggregateCall<number>('count');
-export const countDistinct = (input?: ExprInput): ExprData<number> => aggregateCall<number>('countDistinct', input);
-export const sum = (input: ExprInput<number>): ExprData<number> => aggregateCall<number>('sum', input);
-export const avg = (input: ExprInput<number>): ExprData<number> => aggregateCall<number>('avg', input);
-export const min = <Value = unknown>(input: ExprInput<Value>): ExprData<Value> => aggregateCall<Value>('min', input);
-export const max = <Value = unknown>(input: ExprInput<Value>): ExprData<Value> => aggregateCall<Value>('max', input);
-export const top = <Value = unknown>(input: ExprInput<Value>, countValue = 1): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('top', input, countValue);
-export const bottom = <Value = unknown>(input: ExprInput<Value>, countValue = 1): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('bottom', input, countValue);
-export const topBy = <Value = unknown>(input: ExprInput<Value>, by: ExprInput, countValue = 1): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('topBy', input, by, countValue);
-export const bottomBy = <Value = unknown>(input: ExprInput<Value>, by: ExprInput, countValue = 1): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('bottomBy', input, by, countValue);
-export const maxBy = <Row = unknown>(input: ExprInput<Row>, by: ExprInput): ExprData<Row> => aggregateCall<Row>('maxBy', input, by);
-export const minBy = <Row = unknown>(input: ExprInput<Row>, by: ExprInput): ExprData<Row> => aggregateCall<Row>('minBy', input, by);
-export const setConcat = <Value = unknown>(input: ExprInput<readonly Value[]>): ExprData<readonly Value[]> => aggregateCall<readonly Value[]>('setConcat', input);
+export const count = (predicate?: PredicateData): AggregateExprData<number> => predicate === undefined ? aggregateCall<number>('count') : aggregateCall<number>('count', predicate);
+export const countDistinct = (input?: ExprInput): AggregateExprData<number> => aggregateCall<number>('countDistinct', input);
+export const any = (predicate: PredicateData): AggregateExprData<boolean> => aggregateCall<boolean>('any', predicate);
+export const notAny = (predicate: PredicateData): AggregateExprData<boolean> => aggregateCall<boolean>('notAny', predicate);
+export const sum = (input: ExprInput<number>): AggregateExprData<number> => aggregateCall<number>('sum', input);
+export const avg = (input: ExprInput<number>): AggregateExprData<number> => aggregateCall<number>('avg', input);
+export const min = <Value = unknown>(input: ExprInput<Value>): AggregateExprData<Value> => aggregateCall<Value>('min', input);
+export const max = <Value = unknown>(input: ExprInput<Value>): AggregateExprData<Value> => aggregateCall<Value>('max', input);
+export const top = <Value = unknown>(input: ExprInput<Value>, countValue = 1): AggregateExprData<readonly Value[]> => aggregateCall<readonly Value[]>('top', input, countValue);
+export const bottom = <Value = unknown>(input: ExprInput<Value>, countValue = 1): AggregateExprData<readonly Value[]> => aggregateCall<readonly Value[]>('bottom', input, countValue);
+export const topBy = <Value = unknown>(input: ExprInput<Value>, by: ExprInput, countValue = 1): AggregateExprData<readonly Value[]> => aggregateCall<readonly Value[]>('topBy', input, by, countValue);
+export const bottomBy = <Value = unknown>(input: ExprInput<Value>, by: ExprInput, countValue = 1): AggregateExprData<readonly Value[]> => aggregateCall<readonly Value[]>('bottomBy', input, by, countValue);
+export const maxBy = <Row = unknown>(input: ExprInput<Row>, by: ExprInput): AggregateExprData<Row> => aggregateCall<Row>('maxBy', input, by);
+export const minBy = <Row = unknown>(input: ExprInput<Row>, by: ExprInput): AggregateExprData<Row> => aggregateCall<Row>('minBy', input, by);
+export const setConcat = <Value = unknown>(input: ExprInput<readonly Value[]>): AggregateExprData<readonly Value[]> => aggregateCall<readonly Value[]>('setConcat', input);
 export const self = <Row = unknown>(): ExprData<Row> => ({ op: 'self' });
 export function sel<Row>(query: Query<Row>): ExprData<readonly Row[]>;
 export function sel<Outer, Row>(query: Query<Row>, correlation: CorrelationClauseMap<Outer, Row>): ExprData<readonly Row[]>;
@@ -840,6 +850,8 @@ export type RelationDelta<Relation extends RelationRef = RelationRef> = {
 export const relationDeltas = (...deltas: readonly RelationDelta[]): readonly RelationDelta[] => deltas;
 export const relationDeltaNames = (deltas: readonly RelationDelta[]): readonly string[] =>
   Array.from(new Set(deltas.map((delta) => delta.relation.name)));
+const materializationEnvDeltaNames = (deltas: readonly MaterializationEnvDelta[]): readonly string[] =>
+  Array.from(new Set(deltas.map((delta) => delta.name)));
 
 export type AdapterSource<Version = unknown> = Omit<RelationSource, 'version'> & {
   readonly version?: () => Version | undefined;
@@ -1308,21 +1320,25 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
   let workingDb: Db = cloneDb(inputDb);
   let applied = 0;
   const deltas: RelationDelta[] = [];
+  const envDeltas: MaterializationEnvDelta[] = [];
+  const materializationConstraints = materializedConstraintsFor(inputDb);
 
   for (const input of inputs) {
     const items = normalizeTransactionItem(resolveTransactionInput(input, workingDb));
     for (const item of items) {
       if (isSetEnvTransaction(item)) {
+        const beforeEnv = workingDb.env;
         workingDb = applySetEnvTransaction(workingDb, item);
+        envDeltas.push(...envDeltasFor(beforeEnv, workingDb.env));
         continue;
       }
 
       patches.push(item);
-      const patchResult = applyWritePatchToDb(workingDb, item);
+      const patchResult = applyWritePatchToDb(workingDb, item, materializationConstraints);
       diagnostics.push(...patchResult.diagnostics);
 
       if (patchResult.diagnostics.some(isErrorDiagnostic)) {
-        diagnostics.push(...constraintDiagnosticsForInvalidPatch(item, materializedConstraintsFor(inputDb)));
+        diagnostics.push(...constraintDiagnosticsForInvalidPatch(item, materializationConstraints));
         return {
           db: inputDb,
           patches: patches.length,
@@ -1336,11 +1352,10 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
       workingDb = patchResult.db;
       applied += patchResult.applied;
       deltas.push(...patchResult.deltas);
-      workingDb = applyCascadeDeletes(workingDb, materializedConstraintsFor(inputDb), patchResult.deltas, deltas);
+      workingDb = applyCascadeDeletes(workingDb, materializationConstraints, patchResult.deltas, deltas);
     }
   }
 
-  const materializationConstraints = materializedConstraintsFor(inputDb);
   if (materializationConstraints.length > 0) {
     const validation = validateConstraintsSync(workingDb, materializationConstraints, { env: workingDb.env });
     diagnostics.push(...validation.diagnostics);
@@ -1356,7 +1371,7 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     }
   }
 
-  const materializations = maintainMaterializationSnapshots(inputDb, workingDb, { deltas });
+  const materializations = maintainMaterializationSnapshots(inputDb, workingDb, { deltas, envDeltas });
   diagnostics.push(...materializations.diagnostics);
   const committedDb = applyMaterializationState(workingDb, materializedStateFor(inputDb), materializations) as DbValue;
 
@@ -1375,7 +1390,10 @@ function normalizeTransactionInputs(inputOrInputs: DbTransactionInput | DbTransa
 }
 
 export type RelationRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
-export type RelationRowUpdate<Relation extends RelationRef> = Partial<RelationRow<Relation>>;
+type RelationFieldUpdateValue<Value> = Value | RowExprData<Value>;
+export type RelationRowUpdate<Relation extends RelationRef> = Partial<{
+  readonly [Field in keyof RelationRow<Relation>]: RelationFieldUpdateValue<RelationRow<Relation>[Field]>;
+}>;
 export type RelationRowUpdateInput<Relation extends RelationRef> =
   | RelationRowUpdate<Relation>
   | ((row: RelationRow<Relation>) => RelationRowUpdate<Relation>);
@@ -1394,7 +1412,7 @@ export type InsertOrUpdateOptions<Relation extends RelationRef = RelationRef> = 
 export type InsertOrUpdatePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertOrUpdate'; readonly relation: Relation; readonly row: RelationRow<Relation>; readonly update?: RelationRowUpdateInput<Relation> };
 export type DeleteByKeyPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'deleteByKey'; readonly relation: Relation; readonly key: RelationKeyValue<Relation> };
 export type DeletePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'delete'; readonly relation: Relation; readonly predicate: PredicateData };
-export type DeleteExactPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'deleteExact'; readonly relation: Relation; readonly row: Partial<RelationRow<Relation>> };
+export type DeleteExactPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'deleteExact'; readonly relation: Relation; readonly row: RelationRow<Relation> };
 export type ReplaceAllPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'replaceAll'; readonly relation: Relation; readonly rows: readonly RelationRow<Relation>[] };
 export type RelationSchema = Readonly<Record<string, RelationRef>>;
 export type SchemaSeedInput<Schema extends RelationSchema> = {
@@ -1427,7 +1445,7 @@ export type RelationWriter<Relation extends RelationRef> = {
   readonly insertOrUpdate: (row: RelationRow<Relation>, options?: InsertOrUpdateOptions<Relation>) => InsertOrUpdatePatch<Relation>;
   readonly deleteByKey: (key: RelationKeyValue<Relation>) => DeleteByKeyPatch<Relation>;
   readonly delete: (predicate: PredicateData) => DeletePatch<Relation>;
-  readonly deleteExact: (row: Partial<RelationRow<Relation>>) => DeleteExactPatch<Relation>;
+  readonly deleteExact: (row: RelationRow<Relation>) => DeleteExactPatch<Relation>;
   readonly replaceAll: (rows: readonly RelationRow<Relation>[]) => ReplaceAllPatch<Relation>;
 };
 export const insert = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>): InsertPatch<Relation> => ({ op: 'insert', relation: relationRef, row: rowValue });
@@ -1449,7 +1467,7 @@ export const insertOrUpdate = <Relation extends RelationRef>(relationRef: Relati
 });
 export const deleteByKey = <Relation extends RelationRef>(relationRef: Relation, key: RelationKeyValue<Relation>): DeleteByKeyPatch<Relation> => ({ op: 'deleteByKey', relation: relationRef, key });
 export const deleteRows = <Relation extends RelationRef>(relationRef: Relation, predicate: PredicateData): DeletePatch<Relation> => ({ op: 'delete', relation: relationRef, predicate });
-export const deleteExact = <Relation extends RelationRef>(relationRef: Relation, rowValue: Partial<RelationRow<Relation>>): DeleteExactPatch<Relation> => ({ op: 'deleteExact', relation: relationRef, row: rowValue });
+export const deleteExact = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>): DeleteExactPatch<Relation> => ({ op: 'deleteExact', relation: relationRef, row: rowValue });
 export const replaceAll = <Relation extends RelationRef>(relationRef: Relation, rows: readonly RelationRow<Relation>[]): ReplaceAllPatch<Relation> => ({ op: 'replaceAll', relation: relationRef, rows });
 export function seed<Schema extends RelationSchema>(schemaValue: Schema, rows: SchemaSeedInput<Schema>): SchemaSeedPatches<Schema> {
   const patches: WritePatch[] = [];
@@ -1563,7 +1581,7 @@ export type MaterializationEnvDelta = {
   readonly before: unknown;
   readonly after: unknown;
 };
-export type MaterializationMaintenanceOptions = { readonly deltas?: readonly RelationDelta[]; readonly envDeltas?: readonly unknown[] };
+export type MaterializationMaintenanceOptions = { readonly deltas?: readonly RelationDelta[]; readonly envDeltas?: readonly MaterializationEnvDelta[] };
 export type SnapshotRefreshTarget<Row = unknown> = string | MaterializationMetadata<Row> | Query<Row>;
 export type MaterializedSourceOptions = EvaluateOptions;
 export type MaterializationMetadata<Row = unknown> = {
@@ -1741,12 +1759,16 @@ export function maintainMaterializationSnapshots<Row = unknown>(
 
   const changes: MaterializationMaintenanceChange<Row>[] = [];
   const touchedDependencies = relationDeltaNames(options.deltas ?? []);
+  const touchedEnvDependencies = materializationEnvDeltaNames(options.envDeltas ?? []);
+  const hasChangeHints = options.deltas !== undefined || options.envDeltas !== undefined;
 
   for (const metadata of beforeState.metadata) {
     const previousRows = beforeState.rows.get(metadata.id) as readonly Row[] | undefined;
     const dependencies = relationDependencies(metadata.query);
     const touched = dependencies.filter((name) => touchedDependencies.includes(name));
-    if (previousRows !== undefined && options.deltas !== undefined && touched.length === 0) {
+    const envDependencies = queryEnvDependencies(metadata.query);
+    const touchedEnv = envDependencies.filter((name) => touchedEnvDependencies.includes(name));
+    if (previousRows !== undefined && hasChangeHints && touched.length === 0 && touchedEnv.length === 0) {
       changes.push({
         update: 'carried',
         recomputed: false,
@@ -1757,7 +1779,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
         maintenance: metadata.mode,
         dependencies,
         touchedDependencies: [],
-        envDependencies: queryEnvDependencies(metadata.query),
+        envDependencies,
         touchedEnvDependencies: [],
         indexSpecs: [],
         previousRowsAvailable: true,
@@ -1786,8 +1808,8 @@ export function maintainMaterializationSnapshots<Row = unknown>(
       maintenance: metadata.mode,
       dependencies,
       touchedDependencies: touched,
-      envDependencies: queryEnvDependencies(metadata.query),
-      touchedEnvDependencies: [],
+      envDependencies,
+      touchedEnvDependencies: touchedEnv,
       indexSpecs: [],
       previousRowsAvailable: previousRows !== undefined,
       previousRows,
@@ -3008,12 +3030,18 @@ function evaluateAggregateExpr(
   const args = arrayFromUnknown(data.args);
   const values = (argIndex: number): readonly unknown[] => rows.map((entry) =>
     evaluateExpr(args[argIndex], entry, source, relations, options, diagnostics, outer));
+  const predicateMatches = (argIndex: number): readonly EvalEntry[] => rows.filter((entry) =>
+    Boolean(evaluateExpr(args[argIndex], entry, source, relations, options, diagnostics, outer)));
 
   switch (fn) {
     case 'count':
-      return rows.length;
+      return args.length === 0 ? rows.length : predicateMatches(0).length;
     case 'countDistinct':
       return new Set((args.length === 0 ? rows.map((entry) => entry.row) : values(0)).map(stableKey)).size;
+    case 'any':
+      return predicateMatches(0).length > 0;
+    case 'notAny':
+      return predicateMatches(0).length === 0;
     case 'sum':
       return values(0).reduce<number>((sumValue, valueValue) => sumValue + (typeof valueValue === 'number' ? valueValue : 0), 0);
     case 'avg': {
@@ -3490,7 +3518,18 @@ function applySetEnvTransaction(dbValue: Db, tx: SetEnvTransaction): Db {
   return { ...dbValue, env: envValue };
 }
 
-function applyWritePatchToDb(dbValue: Db, patch: WritePatch): WriteApplyResult {
+function envDeltasFor(before: DbEnv, after: DbEnv): readonly MaterializationEnvDelta[] {
+  const names = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const deltas: MaterializationEnvDelta[] = [];
+  for (const name of names) {
+    if (!Object.is(before[name], after[name])) {
+      deltas.push({ name, before: before[name], after: after[name] });
+    }
+  }
+  return deltas;
+}
+
+function applyWritePatchToDb(dbValue: Db, patch: WritePatch, constraints: readonly ConstraintData[] = []): WriteApplyResult {
   const relationRef = patch.relation;
   const beforeRows = [...(dbValue.data[relationRef.name] ?? [])] as Record<string, unknown>[];
   const diagnostics: TarstateDiagnostic[] = [];
@@ -3502,6 +3541,7 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch): WriteApplyResult {
   const keyOf = (rowValue: Record<string, unknown>): string | undefined => rowKey(relationRef, rowValue);
   const keyFromPatch = (key: RelationKeyInput): string => relationKeyInputToKey(relationRef, key);
   const findIndexByKey = (key: string | undefined): number => key === undefined ? -1 : rows.findIndex((rowValue) => keyOf(rowValue) === key);
+  const findConflictIndexes = (rowValue: Record<string, unknown>): readonly number[] => conflictIndexesFor(dbValue, relationRef, rows, rowValue, constraints);
   let added: unknown[] = [];
   let removed: unknown[] = [];
 
@@ -3516,54 +3556,51 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch): WriteApplyResult {
       break;
     }
     case 'insertIgnore': {
-      const key = keyOf(patch.row as Record<string, unknown>);
-      if (findIndexByKey(key) === -1) {
+      if (findConflictIndexes(patch.row as Record<string, unknown>).length === 0) {
         rows.push(patch.row as Record<string, unknown>);
         added = [patch.row];
       }
       break;
     }
     case 'insertOrReplace': {
-      const key = keyOf(patch.row as Record<string, unknown>);
-      const indexValue = findIndexByKey(key);
-      if (indexValue === -1) {
+      const conflictIndexes = findConflictIndexes(patch.row as Record<string, unknown>);
+      if (conflictIndexes.length === 0) {
         rows.push(patch.row as Record<string, unknown>);
         added = [patch.row];
       } else {
-        removed = [rows[indexValue]];
-        rows[indexValue] = patch.row as Record<string, unknown>;
+        removed = replaceConflictingRows(rows, conflictIndexes, patch.row as Record<string, unknown>);
         added = [patch.row];
       }
       break;
     }
     case 'insertOrMerge': {
-      const key = keyOf(patch.row as Record<string, unknown>);
-      const indexValue = findIndexByKey(key);
+      const conflictIndexes = findConflictIndexes(patch.row as Record<string, unknown>);
+      const indexValue = conflictIndexes[0] ?? -1;
       if (indexValue === -1) {
         rows.push(patch.row as Record<string, unknown>);
         added = [patch.row];
       } else {
         const current = rows[indexValue] as RelationRow<RelationRef>;
-        const updateValue = mergeUpdate(current, patch.row, patch.merge);
-        const next = { ...current, ...updateValue };
-        removed = [current];
-        rows[indexValue] = next;
+        const updateResult = mergeUpdate(current, patch.row, patch.merge, relationRef, dbValue);
+        diagnostics.push(...updateResult.diagnostics);
+        const next = { ...current, ...updateResult.update };
+        removed = replaceConflictingRows(rows, conflictIndexes, next);
         added = [next];
       }
       break;
     }
     case 'insertOrUpdate': {
-      const key = keyOf(patch.row as Record<string, unknown>);
-      const indexValue = findIndexByKey(key);
+      const conflictIndexes = findConflictIndexes(patch.row as Record<string, unknown>);
+      const indexValue = conflictIndexes[0] ?? -1;
       if (indexValue === -1) {
         rows.push(patch.row as Record<string, unknown>);
         added = [patch.row];
       } else {
         const current = rows[indexValue] as RelationRow<RelationRef>;
-        const updateValue = relationUpdateFor(current, patch.update ?? patch.row);
-        const next = { ...current, ...updateValue };
-        removed = [current];
-        rows[indexValue] = next;
+        const updateResult = relationUpdateFor(current, patch.update ?? patch.row, relationRef, dbValue);
+        diagnostics.push(...updateResult.diagnostics);
+        const next = { ...current, ...updateResult.update };
+        removed = replaceConflictingRows(rows, conflictIndexes, next);
         added = [next];
       }
       break;
@@ -3572,7 +3609,9 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch): WriteApplyResult {
       const indexValue = findIndexByKey(keyFromPatch(patch.key as RelationKeyInput));
       if (indexValue !== -1) {
         const current = rows[indexValue] as RelationRow<RelationRef>;
-        const next = { ...current, ...relationUpdateFor(current, patch.changes) };
+        const updateResult = relationUpdateFor(current, patch.changes, relationRef, dbValue);
+        diagnostics.push(...updateResult.diagnostics);
+        const next = { ...current, ...updateResult.update };
         const nextDiagnostics = validateRelationRow(relationRef, next);
         diagnostics.push(...nextDiagnostics);
         if (!nextDiagnostics.some(isErrorDiagnostic)) {
@@ -3586,7 +3625,9 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch): WriteApplyResult {
     case 'update': {
       const nextRows = rows.map((current) => {
         if (!predicateMatchesRow(patch.predicate, current, relationRef, dbValue)) return current;
-        const next = { ...current, ...relationUpdateFor(current as RelationRow<RelationRef>, patch.changes) };
+        const updateResult = relationUpdateFor(current as RelationRow<RelationRef>, patch.changes, relationRef, dbValue);
+        diagnostics.push(...updateResult.diagnostics);
+        const next = { ...current, ...updateResult.update };
         diagnostics.push(...validateRelationRow(relationRef, next));
         removed.push(current);
         added.push(next);
@@ -3615,7 +3656,7 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch): WriteApplyResult {
     case 'deleteExact': {
       const kept: Record<string, unknown>[] = [];
       for (const rowValue of rows) {
-        if (partialRowMatches(rowValue, patch.row as Record<string, unknown>)) removed.push(rowValue);
+        if (rowExactlyMatches(rowValue, patch.row as Record<string, unknown>)) removed.push(rowValue);
         else kept.push(rowValue);
       }
       rows.splice(0, rows.length, ...kept);
@@ -3656,23 +3697,34 @@ function validatePatchRows(patch: WritePatch): readonly TarstateDiagnostic[] {
   }
 }
 
+type EvaluatedRelationUpdate = {
+  readonly update: RelationRowUpdate<RelationRef>;
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+
 function relationUpdateFor(
   current: RelationRow<RelationRef>,
-  input: RelationRowUpdateInput<RelationRef>
-): RelationRowUpdate<RelationRef> {
-  return typeof input === 'function' ? input(current) : input;
+  input: RelationRowUpdateInput<RelationRef>,
+  relationRef: RelationRef,
+  dbValue: Db
+): EvaluatedRelationUpdate {
+  const updateValue = typeof input === 'function' ? input(current) : input;
+  return evaluateRelationUpdateMap(current, updateValue, relationRef, dbValue);
 }
 
 function mergeUpdate(
   current: RelationRow<RelationRef>,
   incoming: RelationRow<RelationRef>,
-  merge: RelationMergeInput<RelationRef> | undefined
-): RelationRowUpdate<RelationRef> {
-  if (typeof merge === 'function') return merge(current, incoming);
-  if (Array.isArray(merge)) {
-    return Object.fromEntries(merge.map((fieldName) => [fieldName, incoming[fieldName]]));
-  }
-  return incoming;
+  merge: RelationMergeInput<RelationRef> | undefined,
+  relationRef: RelationRef,
+  dbValue: Db
+): EvaluatedRelationUpdate {
+  const updateValue = typeof merge === 'function'
+    ? merge(current, incoming)
+    : Array.isArray(merge)
+      ? Object.fromEntries(merge.map((fieldName) => [fieldName, incoming[fieldName]]))
+      : incoming;
+  return evaluateRelationUpdateMap(current, updateValue, relationRef, dbValue);
 }
 
 function predicateMatchesRow(predicate: PredicateData, rowValue: Record<string, unknown>, relationRef: RelationRef, dbValue: Db): boolean {
@@ -3682,8 +3734,157 @@ function predicateMatchesRow(predicate: PredicateData, rowValue: Record<string, 
   return Boolean(evaluateExpr(predicate, entry, dbSource(dbValue), { [relationRef.name]: relationRef }, { env: dbValue.env }, diagnostics, undefined));
 }
 
-function partialRowMatches(rowValue: Record<string, unknown>, partial: Record<string, unknown>): boolean {
-  return Object.entries(partial).every(([fieldName, fieldValue]) => Object.is(rowValue[fieldName], fieldValue));
+function rowExactlyMatches(rowValue: Record<string, unknown>, exact: Record<string, unknown>): boolean {
+  return stableKey(rowValue) === stableKey(exact);
+}
+
+function evaluateRelationUpdateMap(
+  current: RelationRow<RelationRef>,
+  input: RelationRowUpdate<RelationRef>,
+  relationRef: RelationRef,
+  dbValue: Db
+): EvaluatedRelationUpdate {
+  const updateValue: Record<string, unknown> = {};
+  const diagnostics: TarstateDiagnostic[] = [];
+  const entry = entryForRow(current, relationRef.name, relationRef.name);
+  for (const alias of relationPredicateAliases(relationRef.name)) entry.aliases[alias] = current;
+
+  for (const [fieldName, fieldValue] of Object.entries(input)) {
+    updateValue[fieldName] = isEvaluableExpr(fieldValue)
+      ? evaluateExpr(fieldValue, entry, dbSource(dbValue), { [relationRef.name]: relationRef }, { env: dbValue.env }, diagnostics, undefined)
+      : fieldValue;
+  }
+
+  return { update: updateValue as RelationRowUpdate<RelationRef>, diagnostics };
+}
+
+function isEvaluableExpr(input: unknown): input is ExprData {
+  if (!isExpr(input)) return false;
+  return [
+    'value',
+    'field',
+    'env',
+    'self',
+    'maybe',
+    'tuple',
+    'call',
+    'sel',
+    'sel1',
+    'eq',
+    'neq',
+    'lt',
+    'lte',
+    'gt',
+    'gte',
+    'and',
+    'or',
+    'not',
+    'isNull',
+    'notNull',
+    'isMissing',
+    'notMissing'
+  ].includes(input.op);
+}
+
+function replaceConflictingRows(
+  rows: Record<string, unknown>[],
+  conflictIndexes: readonly number[],
+  next: Record<string, unknown>
+): unknown[] {
+  const indexes = uniqueSortedIndexes(conflictIndexes);
+  const firstIndex = indexes[0];
+  if (firstIndex === undefined) return [];
+
+  const removed = indexes.map((indexValue) => rows[indexValue]).filter((rowValue): rowValue is Record<string, unknown> => rowValue !== undefined);
+  const removeSet = new Set(indexes);
+  const nextRows = rows.filter((_, indexValue) => !removeSet.has(indexValue));
+  nextRows.splice(Math.min(firstIndex, nextRows.length), 0, next);
+  rows.splice(0, rows.length, ...nextRows);
+  return removed;
+}
+
+function conflictIndexesFor(
+  dbValue: Db,
+  relationRef: RelationRef,
+  rows: readonly Record<string, unknown>[],
+  incoming: Record<string, unknown>,
+  constraints: readonly ConstraintData[]
+): readonly number[] {
+  const indexes: number[] = [];
+  const incomingKey = rowKey(relationRef, incoming);
+  if (incomingKey !== undefined) {
+    const relationKeyIndex = rows.findIndex((rowValue) => rowKey(relationRef, rowValue) === incomingKey);
+    if (relationKeyIndex !== -1) indexes.push(relationKeyIndex);
+  }
+
+  for (const constraint of constraints) {
+    if (constraint.op !== 'unique') continue;
+    indexes.push(...uniqueConstraintConflictIndexes(dbValue, relationRef, rows, incoming, constraint));
+  }
+
+  return uniqueSortedIndexes(indexes);
+}
+
+function uniqueConstraintConflictIndexes(
+  dbValue: Db,
+  relationRef: RelationRef,
+  rows: readonly Record<string, unknown>[],
+  incoming: Record<string, unknown>,
+  constraint: UniqueConstraintData
+): readonly number[] {
+  if (constraint.fields.length === 0 || constraintRelationName(constraint.query) !== relationRef.name) return [];
+
+  const incomingKey = uniqueConstraintRowKey(incoming, constraint.fields);
+  if (incomingKey === undefined) return [];
+
+  if (!incomingParticipatesInUniqueConstraint(dbValue, relationRef, rows, incoming, constraint, incomingKey)) return [];
+
+  return rows.flatMap((rowValue, indexValue) =>
+    uniqueConstraintRowKey(rowValue, constraint.fields) === incomingKey ? [indexValue] : []);
+}
+
+function incomingParticipatesInUniqueConstraint(
+  dbValue: Db,
+  relationRef: RelationRef,
+  rows: readonly Record<string, unknown>[],
+  incoming: Record<string, unknown>,
+  constraint: UniqueConstraintData,
+  incomingKey: string
+): boolean {
+  if (isRelationRef(constraint.query)) return true;
+
+  const beforeCounts = uniqueConstraintQueryKeyCounts(dbValue, constraint);
+  const nextDb = {
+    ...dbValue,
+    data: {
+      ...dbValue.data,
+      [relationRef.name]: [...rows, incoming]
+    }
+  };
+  const afterCounts = uniqueConstraintQueryKeyCounts(nextDb, constraint);
+  const beforeCount = beforeCounts.get(incomingKey) ?? 0;
+  const afterCount = afterCounts.get(incomingKey) ?? 0;
+  return beforeCount > 0 && afterCount > beforeCount;
+}
+
+function uniqueConstraintQueryKeyCounts(dbValue: Db, constraint: UniqueConstraintData): Map<string, number> {
+  const counts = new Map<string, number>();
+  const result = evaluateConstraintQuery(dbSource(dbValue), constraint.query, { env: dbValue.env });
+  for (const rowValue of result.rows) {
+    if (!isRecord(rowValue)) continue;
+    const key = uniqueConstraintRowKey(rowValue, constraint.fields);
+    if (key === undefined) continue;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function uniqueConstraintRowKey(rowValue: Record<string, unknown>, fields: readonly string[]): string | undefined {
+  return stableKey(fields.map((fieldName) => rowValue[fieldName]));
+}
+
+function uniqueSortedIndexes(indexes: readonly number[]): readonly number[] {
+  return [...new Set(indexes)].sort((left, right) => left - right);
 }
 
 function relationPredicateAliases(relationName: string): readonly string[] {
@@ -3919,11 +4120,12 @@ function applyCascadeDeletes(
   let current = dbValue;
   for (const constraint of constraints) {
     if (constraint.op !== 'fk' || constraint.cascade !== 'delete' || !isRelationRef(constraint.query)) continue;
+    if (constraint.fields.length === 0) continue;
     for (const delta of newDeltas) {
       if (delta.relation.name !== constraint.target.name || delta.removed.length === 0) continue;
       for (const removedRow of delta.removed) {
         if (!isRecord(removedRow)) continue;
-        const predicate = or(...constraint.fields.map((fieldName, indexValue) =>
+        const predicate = and(...constraint.fields.map((fieldName, indexValue) =>
           eq(field('row', fieldName), value(removedRow[constraint.targetFields[indexValue] ?? ''] as PrimitiveValue))));
         const result = applyWritePatchToDb(current, deleteRows(constraint.query, predicate));
         current = result.db;
@@ -4318,8 +4520,8 @@ function isExpr(input: unknown): input is ExprData {
   return isRecord(input) && typeof input.op === 'string';
 }
 
-function aggregateCall<Value = unknown>(op: AggregateFunction, ...args: readonly unknown[]): ExprData<Value> {
-  return { op: 'aggregateCall', fn: op, args };
+function aggregateCall<Value = unknown>(op: AggregateFunction, ...args: readonly unknown[]): AggregateExprData<Value> {
+  return { op: 'aggregateCall', fn: op, args } as unknown as AggregateExprData<Value>;
 }
 
 const ALIASED_FIELD_RESERVED_KEYS = new Set<string>([

@@ -27,6 +27,7 @@ export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.
 export {
   aggregate,
   and,
+  any,
   as,
   asc,
   avg,
@@ -68,6 +69,7 @@ export {
   minBy,
   neq,
   not,
+  notAny,
   notMissing,
   notNull,
   or,
@@ -97,6 +99,7 @@ export {
 } from './query.js';
 export type {
   AggregateConfig,
+  AggregateExprData,
   AggregateFunction,
   AliasedQuery,
   AliasedRelationRef,
@@ -116,6 +119,7 @@ export type {
   Query,
   QueryData,
   QueryKeyInput,
+  RowExprData,
   SortData,
   SortDirection,
   SortInput

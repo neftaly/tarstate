@@ -1,8 +1,8 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { eq, field } from '@tarstate/core';
+import { call, eq, field, hostFn, isMissing, isNull, notMissing, notNull, value } from '@tarstate/core';
 import { isRelationRuntime, type RelationRuntime } from '@tarstate/core/adapter';
-import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
+import { defineSchema, idField, nullable, optional, relation, stringField } from '@tarstate/core/schema';
 import { write } from '@tarstate/core/write';
 import {
   automergeMapAdapter,
@@ -23,6 +23,7 @@ import {
 type TaskRow = {
   readonly id: string;
   readonly title: string;
+  readonly memo?: string | null;
 };
 
 type LabelRow = {
@@ -42,7 +43,8 @@ const schema = defineSchema({
     key: 'id',
     fields: {
       id: idField('task'),
-      title: stringField()
+      title: stringField(),
+      memo: optional(nullable(stringField()))
     }
   }),
   labels: relation<LabelRow>({
@@ -181,6 +183,115 @@ describe('automerge map adapter', () => {
     unsubscribe();
   });
 
+  it('matches core null and missing semantics for predicate writes', async () => {
+    const adapter = automergeMapAdapter({ doc: predicateWorkspaceDoc(), relations: taskMapping });
+    const memo = field('tasks', 'memo');
+
+    expect(adapter.target.apply([
+      write(schema.tasks).update(notNull(memo), { title: 'Not null' })
+    ])).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-1', title: 'Not null', memo: 'ready' },
+      { id: 'task-2', title: 'Null memo', memo: null },
+      { id: 'task-3', title: 'Missing memo' }
+    ]);
+
+    expect(adapter.target.apply([
+      write(schema.tasks).update(isNull(memo), { title: 'Null' })
+    ])).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-1', title: 'Not null', memo: 'ready' },
+      { id: 'task-2', title: 'Null', memo: null },
+      { id: 'task-3', title: 'Missing memo' }
+    ]);
+
+    expect(adapter.target.apply([
+      write(schema.tasks).update(isMissing(memo), { title: 'Missing' })
+    ])).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-1', title: 'Not null', memo: 'ready' },
+      { id: 'task-2', title: 'Null', memo: null },
+      { id: 'task-3', title: 'Missing' }
+    ]);
+
+    expect(adapter.target.apply([
+      write(schema.tasks).delete(notMissing(memo))
+    ])).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-3', title: 'Missing' }
+    ]);
+  });
+
+  it('requires exact full-row equality for deleteExact', async () => {
+    const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+
+    const partialResult = await adapter.target.apply([
+      write(schema.tasks).deleteExact({ id: 'task-1' } as TaskRow)
+    ]);
+
+    expect(partialResult.status).toBe('accepted');
+    expect(partialResult.applied).toBe(0);
+    expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+
+    const exactResult = await adapter.target.apply([
+      write(schema.tasks).deleteExact({ id: 'task-1', title: 'Draft' })
+    ]);
+
+    expect(exactResult.status).toBe('accepted');
+    expect(exactResult.applied).toBe(1);
+    expect(adapter.source.rows(schema.tasks)).toEqual([]);
+  });
+
+  it('evaluates expression-valued update maps against current rows', async () => {
+    const adapter = automergeMapAdapter({ doc: expressionWorkspaceDoc(), relations: taskMapping });
+    const upper = hostFn<string>('text.upper', (input) => String(input).toUpperCase());
+    const join = hostFn<string>('text.join', (...parts) => parts.map(String).join(''));
+    const taskId = field<string>('tasks', 'id');
+    const taskTitle = field<string>('tasks', 'title');
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).updateByKey('task-1', {
+        title: call(upper, taskTitle)
+      }),
+      write(schema.tasks).update(eq(taskId, 'task-2'), {
+        memo: call(join, taskId, value(':memo'))
+      }),
+      write(schema.tasks).insertOrUpdate({ id: 'task-1', title: 'Ignored incoming' }, {
+        update: { title: call(join, taskTitle, value('!')) }
+      }),
+      write(schema.tasks).insertOrMerge({ id: 'task-3', title: 'Incoming' }, {
+        merge: () => ({ title: call(join, taskTitle, value('+merged')) })
+      })
+    ]);
+
+    expect(result.status).toBe('accepted');
+    expect(result.applied).toBe(4);
+    expect(result.diagnostics).toEqual([]);
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-1', title: 'DRAFT!' },
+      { id: 'task-2', title: 'Todo', memo: 'task-2:memo' },
+      { id: 'task-3', title: 'Merge+merged' }
+    ]);
+  });
+
+  it('rejects unsupported update expressions instead of storing expression objects', async () => {
+    const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).updateByKey('task-1', {
+        title: { op: 'env', name: 'title' } as never
+      })
+    ]);
+
+    expect(result.status).toBe('rejected');
+    expect(result.applied).toBe(0);
+    expect(result.diagnostics[0]).toMatchObject({
+      code: 'runtime_unsupported',
+      relation: 'tasks'
+    });
+    expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+  });
+
   it('supports setDoc/snapshot and reports unsupported writes honestly', async () => {
     const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
     let notifications = 0;
@@ -302,6 +413,40 @@ function workspaceDoc(): Automerge.Doc<WorkspaceDoc> {
   const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({
     workspace: {
       tasks: [{ id: 'task-1', title: 'Draft' }],
+      labelsById: {
+        'label-1': { id: 'label-1', name: 'Urgent' }
+      }
+    }
+  });
+
+  return doc;
+}
+
+function predicateWorkspaceDoc(): Automerge.Doc<WorkspaceDoc> {
+  const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({
+    workspace: {
+      tasks: [
+        { id: 'task-1', title: 'Present memo', memo: 'ready' },
+        { id: 'task-2', title: 'Null memo', memo: null },
+        { id: 'task-3', title: 'Missing memo' }
+      ],
+      labelsById: {
+        'label-1': { id: 'label-1', name: 'Urgent' }
+      }
+    }
+  });
+
+  return doc;
+}
+
+function expressionWorkspaceDoc(): Automerge.Doc<WorkspaceDoc> {
+  const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({
+    workspace: {
+      tasks: [
+        { id: 'task-1', title: 'Draft' },
+        { id: 'task-2', title: 'Todo' },
+        { id: 'task-3', title: 'Merge' }
+      ],
       labelsById: {
         'label-1': { id: 'label-1', name: 'Urgent' }
       }

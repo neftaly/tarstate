@@ -41,9 +41,9 @@ import {
   type MaterializationInput,
   type MaterializedDb
 } from '@tarstate/core/materialization';
-import * as queryApi from '@tarstate/core/query';
 import {
   aggregate,
+  any as anyAggregate,
   as,
   clauses,
   correlate,
@@ -58,6 +58,7 @@ import {
   leftJoin,
   maybe,
   notMissing,
+  notAny,
   notNull,
   pipe,
   project,
@@ -89,6 +90,7 @@ import {
   type StoreViewSnapshot
 } from '@tarstate/core/store';
 import {
+  deleteExact,
   insert,
   seed,
   type SchemaSeedInput,
@@ -224,8 +226,6 @@ describe('rewrite public API contracts', () => {
     expect('hasAttachedConstraints' in constraintsApi).toBe(false);
     expect('tryTransactConstrained' in constraintsApi).toBe(false);
     expect('transactConstrained' in constraintsApi).toBe(false);
-    expect('any' in queryApi).toBe(false);
-    expect('notAny' in queryApi).toBe(false);
 
     // @ts-expect-error qRows is intentionally not exported.
     expect(dbApi.qRows).toBeUndefined();
@@ -243,10 +243,6 @@ describe('rewrite public API contracts', () => {
     expect(constraintsApi.tryTransactConstrained).toBeUndefined();
     // @ts-expect-error constrained transaction forks are intentionally not exported.
     expect(constraintsApi.transactConstrained).toBeUndefined();
-    // @ts-expect-error any is intentionally not exported; use or/not instead.
-    expect(queryApi.any).toBeUndefined();
-    // @ts-expect-error notAny is intentionally not exported; use or/not instead.
-    expect(queryApi.notAny).toBeUndefined();
   });
 
   it('keeps relation key lookup typed from relation metadata', () => {
@@ -347,12 +343,18 @@ describe('rewrite public API contracts', () => {
         groupBy: { accountId: entry.accountId },
         aggregates: {
           entryCount: count(),
+          positiveCount: count(gt(entry.amount, value(0))),
+          hasIncome: anyAggregate(gt(entry.amount, value(0))),
+          hasNoMissingMemo: notAny(isMissing(entry.memo)),
           total: sum(entry.amount)
         }
       }),
       project({
         accountId: field<string>('row', 'accountId'),
         entryCount: field<number>('row', 'entryCount'),
+        positiveCount: field<number>('row', 'positiveCount'),
+        hasIncome: field<boolean>('row', 'hasIncome'),
+        hasNoMissingMemo: field<boolean>('row', 'hasNoMissingMemo'),
         total: field<number>('row', 'total')
       })
     );
@@ -375,6 +377,9 @@ describe('rewrite public API contracts', () => {
     const correlatedRows = sel(from(account), correlate<Entry, Account>({ accountId: 'id' }));
     const correlatedRow = sel1(from(account), correlate<Entry, Account>({ accountId: 'id' }));
     const wholeRow = self<Entry>();
+    const hasPositiveAmount = anyAggregate(gt(entry.amount, value(0)));
+    const hasNoPositiveAmount = notAny(gt(entry.amount, value(0)));
+    const positiveCount = count(gt(entry.amount, value(0)));
     const predicates = [
       isNull(account.id),
       notNull(account.$.name),
@@ -390,6 +395,9 @@ describe('rewrite public API contracts', () => {
       readonly entryCount: number | undefined;
       readonly total: number | undefined;
     }>();
+    expectTypeOf<typeof hasPositiveAmount>().toMatchTypeOf<ExprData<boolean>>();
+    expectTypeOf<typeof hasNoPositiveAmount>().toMatchTypeOf<ExprData<boolean>>();
+    expectTypeOf<typeof positiveCount>().toMatchTypeOf<ExprData<number>>();
     expectTypeOf<typeof correlatedRows>().toEqualTypeOf<ExprData<readonly Account[]>>();
     expectTypeOf<typeof correlatedRow>().toEqualTypeOf<ExprData<Account | undefined>>();
     expectTypeOf<typeof wholeRow>().toEqualTypeOf<ExprData<Entry>>();
@@ -427,6 +435,10 @@ describe('rewrite public API contracts', () => {
     // @ts-expect-error schema-keyed seed rows must match their relation row type.
     const invalidRows: SchemaSeedInput<typeof schema> = { entries: [{ id: 'e1' }] };
     void invalidRows;
+
+    // @ts-expect-error deleteExact requires a complete relation row, not a partial match shape.
+    const invalidDeleteExact = deleteExact(schema.entries, { id: 'e1', accountId: 'cash' });
+    void invalidDeleteExact;
   });
 
   it('keeps watch and change tracking results free of constant kind tags', async () => {

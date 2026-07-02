@@ -3,6 +3,7 @@ import { createDb, q, qMany, qManyResult, qResult } from '@tarstate/core/db';
 import {
   aggregate,
   and,
+  any as anyAggregate,
   asc,
   clauses,
   constRows,
@@ -27,6 +28,7 @@ import {
   max,
   maybe,
   neq,
+  notAny,
   notMissing,
   notNull,
   pipe,
@@ -264,6 +266,24 @@ describe('query evaluation behavior', () => {
     expect(q(db, largestOutflows)).toEqual([
       { id: 'e2', amount: -120 },
       { id: 'e3', amount: -5 }
+    ]);
+  });
+
+  it('evaluates predicate-aware aggregate helpers', () => {
+    const db = makeDb();
+    const summary = pipe(
+      from(entry),
+      aggregate({
+        aggregates: {
+          postedCount: count(eq(entry.posted, value(true))),
+          hasDraft: anyAggregate(eq(entry.posted, value(false))),
+          hasNoLargeOutflow: notAny(lte(entry.amount, value(-1_000)))
+        }
+      })
+    );
+
+    expect(q(db, summary)).toEqual([
+      { postedCount: 3, hasDraft: true, hasNoLargeOutflow: true }
     ]);
   });
 

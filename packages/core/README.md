@@ -12,16 +12,14 @@ other structured data outside a renderer package.
 The core API is stabilizing around a Relic-shaped split:
 
 - `store` is the small app-facing facade: root `createStore(seedRows)` returns
-  an object-backed renderer-independent store. The runtime-backed
-  `createRuntimeStore` helper is an advanced `@tarstate/core/store`
-  subpath-only API. Stores provide `query`, `queries`, `view`, non-throwing
-  `commit`, subscriptions, and idempotent `close`. Store commit results use
-  `accepted`/`partial`/`rejected` status plus a separate `reflected` flag for row
-  effects. A `view(query)` is the stable derived-read API; materialization
-  remains a diagnostic-backed core cache API outside the stable store contract.
+  an object-backed renderer-independent `Store`. Stores provide synchronous
+  `query`/`queries` reads, `view(query)` `StoreView` snapshots, what-if reads,
+  non-throwing `commit`, subscriptions, `refresh`, and idempotent `close`. The
+  runtime-backed `createRuntimeStore` helper is an advanced
+  `@tarstate/core/store` subpath API for adapters.
 - `query` describes relational row programs as data, including joins,
   explicit lookup, hash-declared equality lookup planning, btree-declared range
-  lookup planning, query-only `uniqueIndex` metadata, dependency analysis,
+  lookup planning, query-only unique metadata, dependency analysis,
   propagated result identity,
   projections, `qualify`, `aggregate({ groupBy, aggregates })`, aggregate
   helpers such as `countDistinct`/`avg`/`notAny`/`setConcat`/`maxBy`/`minBy`,
@@ -40,40 +38,28 @@ The core API is stabilizing around a Relic-shaped split:
   `source.relationNames` as a compatibility fallback.
 - `write` defines the typed mutation vocabulary, including insert/insert-ignore,
   `insertOrReplace`, key-scoped `updateByKey`/`deleteByKey`, predicate
-  `update`/`deleteRows`,
-  `deleteExact`, `replaceAll`, `insertOrMerge(row, { merge })`, and explicit
-  `insertOrUpdate(row, { update })` constant set-map descriptors. Computed
-  update expressions are left to a future explicit API.
+  `update`/`deleteRows`, full-row `deleteExact`, `replaceAll`,
+  `insertOrMerge(row, { merge })`, and explicit
+  `insertOrUpdate(row, { update })` set-map descriptors.
 - `RelationDelta` is the stable adapter change-report type; diff helpers remain
   lower-level change primitives.
 - Root db/query helpers give those programs a small object-backed runtime for
-  examples, tests, and local state: diagnostics-aware `q`/`qMany`, row-only
-  `qRows`/`qManyRows`, `stripMeta` for recovering normalized row data from a
-  `Db`, and variadic all-or-nothing `tryTransact`/`transact` helpers. Explicit
-  insert-or-update writes use `insertOrUpdate(row, { update })` from `write`.
+  examples, tests, and local state: row-returning `q`/`qMany`, diagnostics-aware
+  `qResult`/`qManyResult`, single-row `row`, `stripMeta` for recovering
+  normalized row data from a `Db`, and variadic all-or-nothing
+  `tryTransact`/`transact` helpers.
 - `memory-runtime` exposes `createMemoryRelationRuntime`, a non-durable
   `RelationRuntime` over object-backed rows for tests, local state, and adapter
   prototyping.
 - `constraints`, `materialization`, `watch`, and `runtime` are diagnostic-backed
-  core surfaces. They provide baseline validation, object-backed
-  constraint enforcement, query-shaped `req`/`unique`/`fk` enforcement for
-  deterministic query shapes, committed relation deltas, exact
-  materialized-query read-through, maintained declared materialized
-  set/hash/btree/unique indexes, Relic-style `watchTarget`/`unwatchTarget`
-  registration, `watchChangeMap`, `trackTransact`, and patch-target commit
-  tracking. Watch delivery uses ephemeral materializations and delta-first row
-  changes where available. Unsupported
-  incremental operator shapes keep explicit diagnostics and recompute/refresh
-  fallback; final row `sort(...)`, `limit(...)`, and `sortLimit(...)`
-  materializations rebuild affected ordered/windowed snapshots from source rows.
-  Incremental aggregate maintenance supports a narrow subset; `avg(expr)` is
-  incremental only when matching visible `sum(expr)`/`count(expr)` fields are
-  present over a non-null numeric base field or numeric literal. Host functions
-  are registered with `hostFn(name, fn)` and invoked as deterministic
-  evaluate-time expressions with `call(fnRef, ...)`. Materialized/incremental
-  paths keep diagnostics and fallback unless a function
-  registry exists. Adapter-fed invalidations, async watch streams, and public IVM
-  APIs are outside the current guarantees.
+  core surfaces. They provide object-backed constraint enforcement,
+  materialized-query read-through, declared lookup metadata, Relic-style watch
+  registration, change maps, tracked transactions, and runtime composition.
+  Materialization is recompute/cache backed where required; declared indexes are
+  planning and lookup metadata, not a general promise of fully maintained
+  physical indexes.
+- Automerge is a pluggable adapter/runtime package rather than the core storage
+  model.
 
 ```tsx
 import { evaluate } from '@tarstate/core/evaluate'

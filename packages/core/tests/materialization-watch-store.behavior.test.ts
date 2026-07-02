@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { q, transact } from '@tarstate/core/db';
+import { createDb, q, setEnvTx, transact } from '@tarstate/core/db';
 import {
   mat,
   materializedRowsForQuery,
@@ -7,7 +7,7 @@ import {
 } from '@tarstate/core/materialization';
 import { trackTransact } from '@tarstate/core/runtime';
 import { createStore } from '@tarstate/core/store';
-import { asc, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
+import { asc, env, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
 import {
   attachWatches,
   diffQuery,
@@ -71,6 +71,33 @@ describe('materialization, watch, and store behavior', () => {
       { id: 'e1', amount: 120 },
       { id: 'e4', amount: 0 },
       { id: 'e5', amount: 35 }
+    ]);
+  });
+
+  it('refreshes materialized query rows when dependent env values change', () => {
+    const envFilteredEntries = pipe(
+      from(entry),
+      where(eq(entry.accountId, env<string>('accountId'))),
+      sort(asc(entry.id)),
+      project({
+        id: entry.id,
+        accountId: entry.accountId
+      })
+    );
+    const db = mat(createDb(makeDb().data, { env: { accountId: 'cash' } }), envFilteredEntries);
+    const first = q(db, envFilteredEntries);
+
+    expect(first).toEqual([
+      { id: 'e1', accountId: 'cash' },
+      { id: 'e4', accountId: 'cash' }
+    ]);
+
+    const next = transact(db, setEnvTx({ accountId: 'sales' }));
+    const changed = q(next, envFilteredEntries);
+
+    expect(changed).not.toBe(first);
+    expect(changed).toEqual([
+      { id: 'e2', accountId: 'sales' }
     ]);
   });
 

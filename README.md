@@ -6,4 +6,4 @@ Tarstate is a TypeScript adaptation of
 
 Tarstate brings Relic's normalized, query-as-data model to TypeScript with
 functional transactions, materialized views, constraints, watches, and pluggable
-storage.
+runtimes such as Automerge.

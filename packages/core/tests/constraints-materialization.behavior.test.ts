@@ -1,10 +1,44 @@
 import { describe, expect, it } from 'vitest';
 import { check, constrain, fk, req, unique, type ConstraintSet } from '@tarstate/core/constraints';
-import { q, row, tryTransact } from '@tarstate/core/db';
+import { createDb, q, row, tryTransact } from '@tarstate/core/db';
 import { demat, mat } from '@tarstate/core/materialization';
 import { field, from, gt, pipe, project, sort, asc, value } from '@tarstate/core/query';
-import { insert } from '@tarstate/core/write';
+import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
+import { deleteByKey, insert } from '@tarstate/core/write';
 import { entry, entriesById, makeDb, schema, type Entry } from './behavior-fixtures.js';
+
+type Parent = {
+  readonly tenantId: string;
+  readonly id: string;
+  readonly name: string;
+};
+
+type Child = {
+  readonly id: string;
+  readonly tenantId: string;
+  readonly parentId: string;
+  readonly note: string;
+};
+
+const cascadeSchema = defineSchema({
+  parents: relation<Parent, readonly ['tenantId', 'id']>({
+    key: ['tenantId', 'id'] as const,
+    fields: {
+      tenantId: idField('tenant'),
+      id: idField('parent'),
+      name: stringField()
+    }
+  }),
+  children: relation<Child>({
+    key: 'id',
+    fields: {
+      id: idField('child'),
+      tenantId: stringField(),
+      parentId: stringField(),
+      note: stringField()
+    }
+  })
+});
 
 const entryConstraints: ConstraintSet = constrain(
   req(schema.entries, 'id', 'accountId', 'amount', 'posted'),
@@ -91,6 +125,55 @@ describe('constraint enforcement through materialization', () => {
       { id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true },
       { id: 'e4', accountId: 'cash', amount: 0, posted: false },
       orphan
+    ]);
+  });
+
+  it('cascades simple foreign-key deletes', () => {
+    const constrained = mat(
+      makeDb(),
+      fk(schema.entries, 'accountId', schema.accounts, 'id', { cascade: 'delete' })
+    );
+    const result = tryTransact(constrained, deleteByKey(schema.accounts, 'cash'));
+
+    expect(result.committed).toBe(true);
+    expect(q(result.db, entriesById)).toEqual([
+      { id: 'e2', accountId: 'sales', amount: -120, memo: 'invoice paid', posted: true },
+      { id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true }
+    ]);
+  });
+
+  it('cascades composite foreign-key deletes by matching all components together', () => {
+    const db = createDb({
+      parents: [
+        { tenantId: 't1', id: 'p1', name: 'target' },
+        { tenantId: 't1', id: 'p2', name: 'same tenant' },
+        { tenantId: 't2', id: 'p1', name: 'same parent id' }
+      ] satisfies readonly Parent[],
+      children: [
+        { id: 'match', tenantId: 't1', parentId: 'p1', note: 'delete me' },
+        { id: 'same-tenant', tenantId: 't1', parentId: 'p2', note: 'keep me' },
+        { id: 'same-parent', tenantId: 't2', parentId: 'p1', note: 'keep me too' }
+      ] satisfies readonly Child[]
+    });
+    const constrained = mat(
+      db,
+      fk(
+        cascadeSchema.children,
+        ['tenantId', 'parentId'],
+        cascadeSchema.parents,
+        ['tenantId', 'id'],
+        { cascade: 'delete' }
+      )
+    );
+    const result = tryTransact(
+      constrained,
+      deleteByKey(cascadeSchema.parents, ['t1', 'p1'] as const)
+    );
+
+    expect(result.committed).toBe(true);
+    expect(q(result.db, cascadeSchema.children, { sort: 'id' })).toEqual([
+      { id: 'same-parent', tenantId: 't2', parentId: 'p1', note: 'keep me too' },
+      { id: 'same-tenant', tenantId: 't1', parentId: 'p2', note: 'keep me' }
     ]);
   });
 });

@@ -118,6 +118,9 @@ type PatchOutcome = {
 type ExprEvalResult =
   | { readonly supported: true; readonly value: unknown }
   | { readonly supported: false; readonly op?: string };
+type RowUpdateResult =
+  | { readonly supported: true; readonly row: Row }
+  | { readonly supported: false; readonly op?: string };
 
 export function defineAutomergeMapRelations<DocumentShape extends object>() {
   return <const Relations extends readonly AutomergeMapRelation<RelationRef, DocumentShape>[]>(
@@ -404,7 +407,7 @@ function applyPatchToPlan(plan: RowPlan, patch: WritePatch): PatchOutcome {
     case 'insertOrMerge':
       return upsertRow(plan, patch.row, (current, incoming) => mergeRows(current, incoming, patch.merge));
     case 'insertOrUpdate':
-      return upsertRow(plan, patch.row, (current, incoming) => applyRowUpdate(current, patch.update ?? incoming));
+      return upsertRow(plan, patch.row, (current, incoming) => rowUpdateFor(current, patch.update ?? incoming));
     case 'updateByKey':
       return updateRowByKey(plan, patch.key, patch.changes);
     case 'update':
@@ -456,7 +459,16 @@ function upsertRow(
     return accepted(true);
   }
 
-  const merged = coerceRow(nextRow(plan.rows[index] ?? row, row));
+  const next = nextRow(plan.rows[index] ?? row, row);
+  let merged: Row | undefined;
+  if (isRowUpdateResult(next)) {
+    if (!next.supported) {
+      return rejected(unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, next.op));
+    }
+    merged = next.row;
+  } else {
+    merged = coerceRow(next);
+  }
   if (merged === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
 
   const mergedKey = rowKeyFor(plan.mapping.relation, merged);
@@ -478,7 +490,10 @@ function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown): Pat
   const current = plan.rows[index];
   if (current === undefined) return accepted(false);
 
-  const updated = coerceRow(applyRowUpdate(current, changes));
+  const updateResult = rowUpdateFor(current, changes);
+  if (!updateResult.supported) return rejected(unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, updateResult.op));
+
+  const updated = updateResult.row;
   if (updated === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, changes));
   if (rowKeyFor(plan.mapping.relation, updated) !== key) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
   if (valuesEqual(current, updated)) return accepted(false);
@@ -500,8 +515,10 @@ function updateRowsByPredicate(plan: RowPlan, predicate: PredicateData, changes:
     const current = nextRows[index];
     if (current === undefined) continue;
 
-    const updated = coerceRow(applyRowUpdate(current, changes));
-    if (updated === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, changes));
+    const updateResult = rowUpdateFor(current, changes);
+    if (!updateResult.supported) return rejected(unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, updateResult.op));
+
+    const updated = updateResult.row;
     if (rowKeyFor(plan.mapping.relation, updated) !== rowKeyFor(plan.mapping.relation, current)) {
       return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
     }
@@ -540,13 +557,11 @@ function deleteRowsByPredicate(plan: RowPlan, predicate: PredicateData): PatchOu
   return accepted(true);
 }
 
-function deleteRowsExact(plan: RowPlan, partial: unknown): PatchOutcome {
-  if (!isRecord(partial)) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, partial));
+function deleteRowsExact(plan: RowPlan, exact: unknown): PatchOutcome {
+  const row = coerceRow(exact);
+  if (row === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, exact));
 
-  const entries = Object.entries(partial);
-  const nextRows = plan.rows.filter((row) =>
-    entries.some(([field, value]) => !valuesEqual(row[field], value))
-  );
+  const nextRows = plan.rows.filter((current) => !rowsExactlyMatch(current, row));
   if (nextRows.length === plan.rows.length) return accepted(false);
 
   plan.rows = nextRows;
@@ -576,23 +591,52 @@ function replaceRows(plan: RowPlan, rowsValue: readonly unknown[]): PatchOutcome
   return accepted(true);
 }
 
-function mergeRows(current: Row, incoming: Row, merge: unknown): Row {
+function mergeRows(current: Row, incoming: Row, merge: unknown): RowUpdateResult {
   if (Array.isArray(merge)) {
     return {
-      ...current,
-      ...Object.fromEntries(merge.map((field) => [String(field), incoming[String(field)]]))
+      supported: true,
+      row: {
+        ...current,
+        ...Object.fromEntries(merge.map((field) => [String(field), incoming[String(field)]]))
+      }
     };
   }
-  if (typeof merge === 'function') return applyRowUpdate(current, merge(current, incoming));
-  return { ...current, ...incoming };
+  if (typeof merge === 'function') return rowUpdateFor(current, merge(current, incoming));
+  return rowUpdateFor(current, incoming);
 }
 
-function applyRowUpdate(current: Row, changes: unknown): Row {
+function rowUpdateFor(current: Row, changes: unknown): RowUpdateResult {
   const update = typeof changes === 'function'
     ? changes(current)
     : changes;
 
-  return isRecord(update) ? { ...current, ...cloneRow(update) } : current;
+  if (!isRecord(update)) return { supported: true, row: current };
+
+  const evaluated = evaluateUpdateMap(update, current);
+  if (!evaluated.supported) return evaluated;
+
+  return { supported: true, row: { ...current, ...evaluated.row } };
+}
+
+function evaluateUpdateMap(update: Record<string, unknown>, current: Row): RowUpdateResult {
+  const evaluated: MutableRecord = {};
+
+  for (const [fieldName, fieldValue] of Object.entries(update)) {
+    if (!isExprData(fieldValue)) {
+      evaluated[fieldName] = cloneValue(fieldValue);
+      continue;
+    }
+
+    const result = evaluateExpr(fieldValue, current);
+    if (!result.supported) return result;
+    evaluated[fieldName] = cloneValue(result.value);
+  }
+
+  return { supported: true, row: evaluated };
+}
+
+function isRowUpdateResult(input: unknown): input is RowUpdateResult {
+  return isRecord(input) && typeof input.supported === 'boolean' && ('row' in input || 'op' in input);
 }
 
 function matchingIndexes(
@@ -628,6 +672,12 @@ function evaluateExpr(expr: unknown, row: Row): ExprEvalResult {
         : { supported: false, op: expr.op };
     case 'self':
       return { supported: true, value: row };
+    case 'maybe':
+      return evaluateExpr(expr.expr, row);
+    case 'tuple':
+      return evaluateTuple(expr.values, row);
+    case 'call':
+      return evaluateCall(expr, row);
     case 'eq':
     case 'neq':
     case 'lt':
@@ -649,7 +699,7 @@ function evaluateExpr(expr: unknown, row: Row): ExprEvalResult {
     }
     case 'notNull': {
       const result = evaluateExpr(expr.expr, row);
-      return result.supported ? { supported: true, value: result.value !== null } : result;
+      return result.supported ? { supported: true, value: result.value !== null && result.value !== undefined } : result;
     }
     case 'isMissing': {
       const result = evaluateExpr(expr.expr, row);
@@ -662,6 +712,35 @@ function evaluateExpr(expr: unknown, row: Row): ExprEvalResult {
     default:
       return { supported: false, op: expr.op };
   }
+}
+
+function evaluateTuple(input: unknown, row: Row): ExprEvalResult {
+  if (!Array.isArray(input)) return { supported: false, op: 'tuple' };
+
+  const values: unknown[] = [];
+  for (const item of input) {
+    const result = evaluateExpr(item, row);
+    if (!result.supported) return result;
+    values.push(result.value);
+  }
+
+  return { supported: true, value: values };
+}
+
+function evaluateCall(expr: Record<string, unknown>, row: Row): ExprEvalResult {
+  const fn = expr.fn;
+  if (!isHostFunction(fn)) return { supported: false, op: 'call' };
+  const argsInput = expr.args;
+  if (!Array.isArray(argsInput)) return { supported: false, op: 'call' };
+
+  const args: unknown[] = [];
+  for (const arg of argsInput) {
+    const result = evaluateExpr(arg, row);
+    if (!result.supported) return result;
+    args.push(result.value);
+  }
+
+  return { supported: true, value: fn.fn(...args) };
 }
 
 function evaluateComparison(op: string, leftExpr: unknown, rightExpr: unknown, row: Row): ExprEvalResult {
@@ -896,6 +975,14 @@ function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
+function isExprData(input: unknown): input is Record<string, unknown> & { readonly op: string } {
+  return isRecord(input) && typeof input.op === 'string';
+}
+
+function isHostFunction(input: unknown): input is { readonly fn: (...args: readonly unknown[]) => unknown } {
+  return isRecord(input) && input.kind === 'hostFunction' && typeof input.fn === 'function';
+}
+
 function isPlainObjectLike(input: Record<string, unknown>): boolean {
   const prototype = Object.getPrototypeOf(input);
   return prototype === Object.prototype || prototype === null;
@@ -903,6 +990,26 @@ function isPlainObjectLike(input: Record<string, unknown>): boolean {
 
 function valuesEqual(left: unknown, right: unknown): boolean {
   return stableStringify(left) === stableStringify(right);
+}
+
+function rowsExactlyMatch(left: Row, right: Row): boolean {
+  return stableKey(left) === stableKey(right);
+}
+
+function stableKey(input: unknown): string {
+  if (input === undefined) return '~undefined';
+  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+    return JSON.stringify(input);
+  }
+  if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
+  if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
+  if (typeof input === 'function') return `~function:${input.name}`;
+  if (Array.isArray(input)) return `[${input.map(stableKey).join(',')}]`;
+  if (isRecord(input)) {
+    return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${stableKey(input[key])}`).join(',')}}`;
+  }
+
+  return JSON.stringify(String(input as string | number | boolean | bigint | null | undefined));
 }
 
 function stableStringify(input: unknown): string {
@@ -1000,6 +1107,16 @@ function unsupportedPredicateDiagnostic(relation: string, op: string | undefined
     relation,
     surface: 'automergeMapAdapter',
     message: `Automerge map adapter cannot apply predicate${op === undefined ? '' : ` op "${op}"`}`
+  };
+}
+
+function unsupportedUpdateExpressionDiagnostic(relation: string, op: string | undefined): TarstateDiagnostic {
+  return {
+    code: 'runtime_unsupported',
+    severity: 'warning',
+    relation,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map adapter cannot apply update expression${op === undefined ? '' : ` op "${op}"`}`
   };
 }
 

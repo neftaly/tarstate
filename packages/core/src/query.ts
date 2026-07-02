@@ -1,6 +1,7 @@
 export {
   aggregate,
   and,
+  any,
   as,
   asc,
   avg,
@@ -42,6 +43,7 @@ export {
   minBy,
   neq,
   not,
+  notAny,
   notMissing,
   notNull,
   or,
@@ -71,6 +73,7 @@ export {
 } from './impl.js';
 export type {
   AggregateConfig,
+  AggregateExprData,
   AggregateFunction,
   AliasedQuery,
   AliasedRelationRef,
@@ -90,6 +93,7 @@ export type {
   Query,
   QueryData,
   QueryKeyInput,
+  RowExprData,
   SortData,
   SortDirection,
   SortInput

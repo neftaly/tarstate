@@ -13,16 +13,14 @@ Primary API:
 - `useTarstateSnapshot()` subscribes with `store.subscribe` and returns the
   current core `StoreSnapshot` from `store.getSnapshot`.
 - `useDb()` reads the current core `Db`.
-- `useView(query, { deps })` is the canonical read hook. It creates
-  `store.view(query)`, subscribes with `view.subscribe`, reads
-  `view.getSnapshot`, and returns `{ status, rows, diagnostics, revision,
-  queryKey, refresh, view, snapshot }`. The hook is synchronous: `status` is
-  `ready`, and diagnostics pass through from the store view snapshot.
+- `useView(query, { resetKey })` is the canonical read hook. It creates a core
+  `StoreView`, subscribes to it, and returns synchronous rows, diagnostics,
+  revision, query key, and a refresh callback.
 - `useRow(query, predicate)` returns the first view row matching a type-safe
-  predicate. Use `useRow(query, key, { keyBy })` for keyed lookup, where
-  `keyBy(row)` produces the same key type as `key`.
+  predicate.
+- `useRow(relation, key)` returns the matching relation row by key.
 - `useQuery(query)` remains available for selected data via
-  `useQuery(query, { select, deps })`; it is a thin selection wrapper over
+  `useQuery(query, { select, resetKey })`; it is a thin selection wrapper over
   `useView`. New read-only components should prefer `useView`.
 - `useCommit()` returns the active core `Store.commit` function.
 - `Store.close()` provides idempotent subscription cleanup.
