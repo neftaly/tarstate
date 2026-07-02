@@ -1262,10 +1262,12 @@ describe('TypeScript Relic core acceptance', () => {
         active: true,
         age: 24,
         tags: []
-      })
+      }),
+      { label: 'function-input' }
     );
 
     expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
+    expect(tracked.label).toBe('function-input');
     expect(tracked.changesByTargetKey.get(queryKey(activeUsers))).toMatchObject({
       addedRows: [{ id: 'dia', name: 'Dia' }],
       removedRows: []

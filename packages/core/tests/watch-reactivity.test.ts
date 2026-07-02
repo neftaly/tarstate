@@ -156,4 +156,14 @@ describe('watch reactivity', () => {
     });
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
   });
+
+  it('passes read options through store views', async () => {
+    const store = createStore(createDb({ users: baseUsers }));
+    const view = store.view(activeUsers);
+
+    await expect(view.rows({ rsort: 'name' })).resolves.toEqual([
+      { id: 'bea', name: 'Bea' },
+      { id: 'ada', name: 'Ada' }
+    ]);
+  });
 });

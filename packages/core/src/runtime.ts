@@ -182,7 +182,8 @@ export async function trackTransact(
       changesByQueryKey: trackChangeViewsByQueryKey(tracked.changes),
       deltas: result.deltas,
       ...(result.materializations === undefined ? {} : { materializations: result.materializations }),
-      diagnostics: uniqueDiagnostics([...result.diagnostics, ...tracked.diagnostics])
+      diagnostics: uniqueDiagnostics([...result.diagnostics, ...tracked.diagnostics]),
+      ...(options?.label === undefined ? {} : { label: options.label })
     };
   }
 

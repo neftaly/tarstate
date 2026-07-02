@@ -19,6 +19,8 @@ import {
   pipe,
   project,
   qRows,
+  snapshotHashIndex,
+  snapshotIndex,
   transact,
   tryTransact,
   uniqueIndex,
@@ -426,6 +428,16 @@ describe('maintained materialized indexes', () => {
     expect(ids(byDecade.range({ lower: 30 }))).toEqual(['ada', 'cal']);
     expect(byDecade.ordered).toEqual([20, 30, 40]);
     expect(bySlug.index?.get('eng:ada')).toMatchObject({ id: 'ada', teamId: 'eng' });
+
+    expect(snapshotIndex<UserRow>(state, directExpressionIndexes)).toMatchObject({
+      kind: 'materializationIndex',
+      indexed: true
+    });
+    expect(ids(snapshotHashIndex<UserRow, string>(
+      state,
+      directExpressionIndexes,
+      { expression: normalizedTeam }
+    ).index?.get('ENG'))).toEqual(['ada']);
   });
 
   it('infers an unambiguous direct expression-backed index from index(db, query)', () => {

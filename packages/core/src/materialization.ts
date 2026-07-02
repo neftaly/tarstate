@@ -441,6 +441,8 @@ export type MaterializationIndexOptions<Field extends string = string> =
   | ({ readonly kind: 'hash' } & (MaterializationIndexFieldOptions<Field> | MaterializationIndexExpressionOptions))
   | ({ readonly kind: 'btree' } & (MaterializationIndexFieldOptions<Field> | MaterializationIndexExpressionOptions))
   | ({ readonly kind: 'unique' } & (MaterializationIndexFieldOptions<Field> | MaterializationIndexExpressionOptions));
+type MaterializationHashIndexOptions<Field extends string = string> =
+  MaterializationIndexFieldOptions<Field> | MaterializationIndexExpressionOptions;
 
 type StoredMaterialization<Row = unknown> = {
   readonly metadata: MaterializationMetadata<Row>;
@@ -1409,7 +1411,7 @@ export function snapshotIndex<Row = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>
 ): MaterializationIndexResult<Row> {
-  return index(input, target);
+  return index(input, target, { kind: 'set' });
 }
 
 export function snapshotHashIndex<Row = unknown, Value = unknown>(
@@ -1420,15 +1422,26 @@ export function snapshotHashIndex<Row = unknown, Value = unknown>(
 export function snapshotHashIndex<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
-  options: { readonly field: string }
+  options: MaterializationHashIndexOptions
 ): MaterializationHashIndexResult<Row, Value>;
 export function snapshotHashIndex<Row = unknown, Value = unknown>(
   input: unknown,
   target: string | Query<Row> | MaterializationMetadata<Row>,
-  fieldOrOptions: string | { readonly field: string }
+  fieldOrOptions: string | MaterializationHashIndexOptions
 ): MaterializationHashIndexResult<Row, Value> {
-  const field = typeof fieldOrOptions === 'string' ? fieldOrOptions : fieldOrOptions.field;
-  return index(input, target, { kind: 'hash', field });
+  if (typeof fieldOrOptions === 'string') {
+    return index(input, target, { kind: 'hash', field: fieldOrOptions });
+  }
+  if ('field' in fieldOrOptions) {
+    return index(input, target, { kind: 'hash', field: fieldOrOptions.field });
+  }
+  if ('fields' in fieldOrOptions) {
+    return index(input, target, { kind: 'hash', fields: fieldOrOptions.fields });
+  }
+  if ('expression' in fieldOrOptions) {
+    return index(input, target, { kind: 'hash', expression: fieldOrOptions.expression });
+  }
+  return index(input, target, { kind: 'hash', expressions: fieldOrOptions.expressions });
 }
 
 export function evaluateDbQueryRows<Row>(

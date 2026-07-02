@@ -234,7 +234,7 @@ function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
       });
     }
 
-    return store.query(query);
+    return store.query(query, viewReadOptionsWithoutMapRows(options));
   }
 
   function readRows<MappedRow>(
@@ -252,8 +252,18 @@ function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
       })).rows;
     }
 
-    return (await readView()).rows;
+    return (await readView(viewReadOptionsWithoutMapRows(options))).rows;
   }
+}
+
+function viewReadOptionsWithoutMapRows<Row>(
+  options: StoreViewReadOptions<Row, unknown> | undefined
+): StoreQueryOptions<Row> | undefined {
+  if (options === undefined) {
+    return undefined;
+  }
+  const { mapRows: _mapRows, ...rowOptions } = options;
+  return rowOptions;
 }
 
 function storeSnapshot(db: Db, revision: number, diagnostics: readonly StoreDiagnostic[]): StoreSnapshot {
