@@ -165,5 +165,11 @@ describe('watch reactivity', () => {
       { id: 'bea', name: 'Bea' },
       { id: 'ada', name: 'Ada' }
     ]);
+    await expect(view.refresh({
+      sort: 'name',
+      mapRows: (rows) => rows.map((row) => row.id)
+    })).resolves.toMatchObject({
+      rows: ['ada', 'bea']
+    });
   });
 });

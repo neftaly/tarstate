@@ -440,6 +440,50 @@ describe('maintained materialized indexes', () => {
     ).index?.get('ENG'))).toEqual(['ada']);
   });
 
+  it('supports snapshotHashIndex selector forms', () => {
+    const user = as(coreSchema.users, 'user');
+    const normalizedTeam = call(normalizeTeam, user.teamId);
+    const decade = call(ageDecade, user.age);
+    const compound = mat(createDb(testData()), compoundIndexedUsersQuery(), {
+      id: 'snapshot-compound-hash'
+    });
+    const expressionBacked = mat(createDb(testData()), expressionIndexedUsersQuery(), {
+      id: 'snapshot-field-expression-hash'
+    });
+    const directExpressions = pipe(
+      from(user),
+      hash(normalizedTeam, decade),
+      project({
+        id: user.id,
+        teamId: user.teamId,
+        name: user.name,
+        active: user.active,
+        age: user.age,
+        tags: user.tags
+      }),
+      keyBy('id')
+    ) as Query<UserRow>;
+    const direct = mat(createDb(testData()), directExpressions, {
+      id: 'snapshot-direct-expressions-hash'
+    });
+
+    expect(ids(snapshotHashIndex<ExpressionIndexedUser, string>(
+      expressionBacked,
+      expressionIndexedUsersQuery(),
+      { field: 'normalizedTeam' }
+    ).index?.get('ENG'))).toEqual(['ada']);
+    expect(ids(snapshotHashIndex<UserRow, string>(
+      compound,
+      compoundIndexedUsersQuery(),
+      { fields: ['teamId', 'active'] }
+    ).index?.rowsFor('eng', true))).toEqual(['ada']);
+    expect(ids(snapshotHashIndex<UserRow, string>(
+      direct,
+      directExpressions,
+      { expressions: [normalizedTeam, decade] }
+    ).index?.rowsFor('ENG', 30))).toEqual(['ada']);
+  });
+
   it('infers an unambiguous direct expression-backed index from index(db, query)', () => {
     const user = as(coreSchema.users, 'user');
     const normalizedTeam = call(normalizeTeam, user.teamId);

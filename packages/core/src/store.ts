@@ -96,20 +96,22 @@ export type StoreQueries = {
   ): Promise<StoreQueryBatchResult<Queries>>;
 };
 
-export type StoreView<Row = unknown> = {
-  readonly kind: 'view';
-  readonly query: Query<Row>;
-  readonly queryKey: string;
-  readonly getSnapshot: () => StoreSnapshot;
-  readonly subscribe: (listener: () => void) => () => void;
-  readonly read: {
+export type StoreViewRead<Row = unknown> = {
     <MappedRow>(
       options: StoreViewReadOptions<Row, MappedRow> & {
         readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[];
       }
     ): Promise<StoreQueryResult<MappedRow>>;
     (options?: StoreViewReadOptions<Row>): Promise<StoreQueryResult<Row>>;
-  };
+};
+
+export type StoreView<Row = unknown> = {
+  readonly kind: 'view';
+  readonly query: Query<Row>;
+  readonly queryKey: string;
+  readonly getSnapshot: () => StoreSnapshot;
+  readonly subscribe: (listener: () => void) => () => void;
+  readonly read: StoreViewRead<Row>;
   readonly rows: {
     <MappedRow>(
       options: StoreViewReadOptions<Row, MappedRow> & {
@@ -118,7 +120,7 @@ export type StoreView<Row = unknown> = {
     ): Promise<readonly MappedRow[]>;
     (options?: StoreViewReadOptions<Row>): Promise<readonly Row[]>;
   };
-  readonly refresh: (options?: StoreQueryOptions<Row>) => Promise<StoreQueryResult<Row>>;
+  readonly refresh: StoreViewRead<Row>;
 };
 
 export type Store = {
@@ -216,7 +218,7 @@ function createStoreView<Row>(query: Query<Row>, store: Store): StoreView<Row> {
     subscribe: store.subscribe,
     read: readView,
     rows: readRows,
-    refresh: async (options = {}) => store.query(query, options)
+    refresh: readView
   };
 
   function readView<MappedRow>(
