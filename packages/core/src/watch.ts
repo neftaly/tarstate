@@ -7,10 +7,12 @@ import type { EvaluateOptions } from './evaluate.js';
 import { forkDb, type Db } from './db.js';
 import {
   demat,
+  maintainMaterializations,
   mat,
   materializationForQuery,
   queryRowsFromMaterialization,
   type MaterializationMaintenanceChange,
+  type MaterializationMaintenanceResult,
   type SnapshotMaterializationTarget
 } from './materialization.js';
 import { queryKey, queryRowKeyFields, type Query } from './query.js';
@@ -532,37 +534,18 @@ export async function trackedChangesForDbTransition(
         record.options,
         { deltas, diagnostics: [] }
       )
-      : buildWatchEventFromRows(
+      : buildWatchEventFromMaterializationChange(
         record.id,
         record.target,
-        materializedChange.previousRows ?? [],
-        materializedChange.rows,
-        materializedChange.rowChanges,
+        materializedChange,
         record.options,
-        { deltas, diagnostics: [] },
-        materializedChange.diagnostics
+        { deltas, diagnostics: [] }
       );
     if (!event.changed) {
       continue;
     }
 
-    changes.push({
-      kind: 'trackedChange',
-      id: event.id,
-      targetKey: event.targetKey,
-      target: event.target,
-      changed: event.changed,
-      previousRows: event.previousRows,
-      rows: event.rows,
-      added: event.added,
-      deleted: event.deleted,
-      addedRows: event.addedRows,
-      deletedRows: event.deletedRows,
-      removedRows: event.removedRows,
-      unchangedRows: event.unchangedRows,
-      rowChanges: event.rowChanges,
-      diagnostics: event.diagnostics
-    });
+    changes.push(trackedChangeFromWatchEvent(event));
     diagnostics.push(...event.diagnostics);
 
     diagnostics.push(...await deliverWatchEvent(record, event));
@@ -590,9 +573,15 @@ function watchHandle<Db extends WatchDb, Row>(record: WatchRecord<Db, Row>): Wat
         };
       }
 
-      const previousRows = await readTargetRows(record.db, record.target, record.options);
-      const rows = await readTargetRows(nextDb, record.target, record.options);
-      const event = buildWatchEvent(record.id, record.target, previousRows, rows, record.options, { diagnostics: [] });
+      const event = materializedRefreshEvent(record, nextDb)
+        ?? buildWatchEvent(
+          record.id,
+          record.target,
+          await readTargetRows(record.db, record.target, record.options),
+          await readTargetRows(nextDb, record.target, record.options),
+          record.options,
+          { diagnostics: [] }
+        );
       const deliveryDiagnostics = await deliverWatchEvent(record, event);
       if (deliveryDiagnostics.length === 0) {
         return { ...event, kind: 'watchRefresh', delivered: true };
@@ -607,6 +596,40 @@ function watchHandle<Db extends WatchDb, Row>(record: WatchRecord<Db, Row>): Wat
     },
     unwatch: () => unwatch(record),
     ...(record.options.label === undefined ? {} : { label: record.options.label })
+  };
+}
+
+export function trackedChangeFromMaterializationChange<Row>(
+  change: MaterializationMaintenanceChange<Row>,
+  options: WatchOptions<Row> = {},
+  id = change.id
+): TrackedChange<Row> {
+  return trackedChangeFromWatchEvent(buildWatchEventFromMaterializationChange(
+    id,
+    change.query,
+    change,
+    options,
+    { diagnostics: [] }
+  ));
+}
+
+function trackedChangeFromWatchEvent<Row>(event: WatchEvent<Row>): TrackedChange<Row> {
+  return {
+    kind: 'trackedChange',
+    id: event.id,
+    targetKey: event.targetKey,
+    target: event.target,
+    changed: event.changed,
+    previousRows: event.previousRows,
+    rows: event.rows,
+    added: event.added,
+    deleted: event.deleted,
+    addedRows: event.addedRows,
+    deletedRows: event.deletedRows,
+    removedRows: event.removedRows,
+    unchangedRows: event.unchangedRows,
+    rowChanges: event.rowChanges,
+    diagnostics: event.diagnostics
   };
 }
 
@@ -675,6 +698,49 @@ function buildWatchEventFromRows<Row>(
     changes,
     diagnostics
   };
+}
+
+function buildWatchEventFromMaterializationChange<Row>(
+  id: string,
+  target: WatchTarget<Row>,
+  change: MaterializationMaintenanceChange<Row>,
+  options: WatchOptions<Row>,
+  changes: ChangeSet
+): WatchEvent<Row> {
+  return buildWatchEventFromRows(
+    id,
+    target,
+    change.previousRowsAvailable ? change.previousRows ?? [] : [],
+    change.rows,
+    change.rowChanges,
+    options,
+    changes,
+    change.diagnostics
+  );
+}
+
+function materializedRefreshEvent<Db extends WatchDb, Row>(
+  record: WatchRecord<Db, Row>,
+  nextDb: Db | RelationSource
+): WatchEvent<Row> | undefined {
+  if (!isQuery(record.target) || record.db === nextDb || !isObject(record.db) || !isObject(nextDb)) {
+    return undefined;
+  }
+
+  const materializations = maintainMaterializations(
+    record.db as SnapshotMaterializationTarget,
+    nextDb as SnapshotMaterializationTarget
+  );
+  const change = materializationChangeForTarget(materializations, record.target);
+  return change === undefined
+    ? undefined
+    : buildWatchEventFromMaterializationChange(
+      record.id,
+      record.target,
+      change,
+      record.options,
+      { diagnostics: [] }
+    );
 }
 
 function addedAliasRows<Row>(
@@ -778,7 +844,7 @@ function ensureWatchMaterialization<Row>(
   if (state === undefined) {
     const owned = materializationForQuery(db, target) === undefined;
     if (owned) {
-      mat(db as SnapshotMaterializationTarget, target, { id: targetKey, mode: 'incremental', ...options });
+      mat(db as SnapshotMaterializationTarget, target, { id: targetKey, ...options });
     }
 
     state = {
@@ -857,7 +923,6 @@ function transferWatchMaterialization(
     if (previousState.owned && materializationForQuery(next, record.target) === undefined) {
       mat(next as SnapshotMaterializationTarget, record.target, {
         id: targetKey,
-        mode: 'incremental',
         ...record.options
       });
     }
@@ -940,6 +1005,15 @@ function materializationChangesByTarget(
     byTarget.set(watchTargetIdentity(change.query), change);
   }
   return byTarget;
+}
+
+function materializationChangeForTarget<Row>(
+  materializations: MaterializationMaintenanceResult,
+  target: Query<Row>
+): MaterializationMaintenanceChange<Row> | undefined {
+  return materializationChangesByTarget(materializations.changes).get(watchTargetIdentity(target)) as
+    | MaterializationMaintenanceChange<Row>
+    | undefined;
 }
 
 async function deliverWatchEvent<Db extends WatchDb, Row>(

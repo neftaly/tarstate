@@ -78,8 +78,9 @@ describe('watch reactivity', () => {
     const watchedChange = tracked.changes.find((change) => change.target === activeUsers);
 
     expect(materializedChange).toMatchObject({
-      update: 'incremental',
-      addedRows: [{ id: 'dia', name: 'Dia' }]
+      addedRows: [{ id: 'dia', name: 'Dia' }],
+      removedRows: [],
+      rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'dia', name: 'Dia' } })]
     });
     expect(watchedChange).toMatchObject({
       changed: true,

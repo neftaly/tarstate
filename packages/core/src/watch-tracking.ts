@@ -8,6 +8,7 @@ import type { RelationSource } from './source.js';
 import {
   diffOptionsForTarget,
   isWatchMaterialization,
+  trackedChangeFromMaterializationChange,
   trackedChangesForDbTransition,
   watchTargetKey
 } from './watch.js';
@@ -45,23 +46,7 @@ function materializedChangesFromMaintenance(
   return {
     changes: materializations.changes.filter((change) =>
       !isWatchMaterialization(before, change.query) && !isWatchMaterialization(after, change.query)
-    ).map((change) => ({
-      kind: 'trackedChange',
-      id: change.id,
-      targetKey: watchTargetKey(change.query),
-      target: change.query,
-      changed: change.rowChanges.length > 0,
-      previousRows: change.previousRows ?? [],
-      rows: change.rows,
-      added: change.addedRows,
-      deleted: change.removedRows,
-      addedRows: change.addedRows,
-      deletedRows: change.removedRows,
-      removedRows: change.removedRows,
-      unchangedRows: unchangedRows(change.rows, change.rowChanges, diffOptionsForTarget(change.query, {})),
-      rowChanges: change.rowChanges,
-      diagnostics: change.diagnostics
-    })),
+    ).map((change) => trackedChangeFromMaterializationChange(change)),
     diagnostics: materializations.diagnostics
   };
 }
