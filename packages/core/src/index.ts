@@ -146,7 +146,6 @@ export {
   snapshotIndex
 } from './materialization.js';
 export type {
-  IncrementalFallbackMaterializationDiagnostic,
   MaterializableDb,
   MaterializationBtreeIndex,
   MaterializationBtreeIndexResult,

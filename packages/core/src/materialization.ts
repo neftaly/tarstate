@@ -2,7 +2,6 @@ import type { TarstateDiagnostic } from './diagnostics.js';
 import {
   deriveSnapshotFromRows,
   refreshDerivedSnapshotFromRows,
-  type DerivationRefresh,
   type DerivationSnapshot,
   type DerivationTarget
 } from './derivation-engine.js';
@@ -33,14 +32,6 @@ import {
 } from './constraints-attachment.js';
 import { stableKey } from './identity.js';
 import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
-import {
-  legacyBuildIncrementalMaterialization,
-  legacyMaintainIncrementalMaterialization,
-  legacyPlanIncrementalMaterialization,
-  type LegacyIncrementalMaterialization,
-  type LegacyIncrementalMaterializationOptions,
-  type LegacyIncrementalMaterializationPlan
-} from './materialization-compat.js';
 import {
   buildMaintainedIndexes,
   maintainedIndexKey,
@@ -84,18 +75,6 @@ export type UnsupportedMaterializationIndexDiagnostic = {
   readonly surface: 'materialization';
   readonly detail?: unknown;
 };
-export type IncrementalFallbackMaterializationDiagnostic = {
-  readonly code: 'materialization_incremental_fallback';
-  readonly message: string;
-  readonly surface: 'materialization';
-  readonly detail: {
-    readonly mode: 'incremental';
-    readonly fallback: 'recompute';
-    readonly id: string;
-    readonly queryKey: string;
-    readonly reason: string;
-  };
-};
 export type MissingMaterializationRowsDiagnostic = {
   readonly code: 'materialization_rows_missing';
   readonly message: string;
@@ -132,7 +111,6 @@ export type MaterializationDiagnostic =
   | UnsupportedMaterializationDiagnostic
   | MissingMaterializationDiagnostic
   | UnsupportedMaterializationIndexDiagnostic
-  | IncrementalFallbackMaterializationDiagnostic
   | MissingMaterializationRowsDiagnostic
   | StaleMaterializationDiagnostic
   | UnknownMaterializationVersionDiagnostic
@@ -446,7 +424,6 @@ type StoredMaterialization<Row = unknown> = {
   readonly indexes: MaintainedIndexes<Row>;
   readonly evaluateOptions: EvaluateOptions;
   readonly cacheable: boolean;
-  readonly incremental?: LegacyIncrementalMaterialization<Row>;
 };
 type AnyStoredMaterialization = StoredMaterialization<any>;
 type MaterializationEvalTarget = {
@@ -534,11 +511,7 @@ export function explainMaterialization<Row>(
   const key = queryKey(query);
   const requestedMode = requestedMaterializationMode(options, key);
   const evaluateOptions = materializationEvaluateOptions(options);
-  const planned = requestedMode === 'incremental'
-    ? legacyPlanIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
-    : undefined;
-  const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
-  const id = options.id ?? options.name ?? key;
+  const maintenance = maintenanceForRequestedMode(requestedMode);
   const functionDiagnostics = missingFunctionDiagnostics(query, evaluateOptions.functions);
   return {
     kind: 'materializationExplanation',
@@ -546,16 +519,11 @@ export function explainMaterialization<Row>(
     query,
     requestedMode,
     maintenance,
-    maintenanceReason: planned === undefined
-      ? maintenanceReasonForMode(requestedMode)
-      : planned.reason,
+    maintenanceReason: maintenanceReasonForMode(requestedMode),
     dependencies: relationDependencies(query),
     envDependencies: Array.from(envReferences(query)),
     indexSpecs: materializationIndexSpecs(query),
-    diagnostics: [
-      ...(planned?.supported === false ? [incrementalFallbackDiagnostic(id, key, planned.reason)] : []),
-      ...functionDiagnostics
-    ]
+    diagnostics: functionDiagnostics
   };
 }
 
@@ -660,63 +628,6 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
       continue;
     }
 
-    const incrementalFallbackDiagnostics: MaterializationDiagnostic[] = [];
-    if (touchedEnvDependencies.length === 0 && stored.metadata.maintenance === 'incremental') {
-      const maintained = legacyMaintainIncrementalMaterialization(
-        stored.incremental,
-        stored.metadata.query.relations,
-        options.deltas,
-        materializationRows(stored),
-        envFor(next),
-        incrementalPlanOptions(stored.evaluateOptions)
-      );
-      if (maintained.updated) {
-        const refresh = refreshDerivedSnapshotFromRows(
-          stored.derivationSnapshot,
-          maintained.rows,
-          derivationRefreshOptions(options.deltas)
-        );
-        const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
-        const change: MaterializationMaintenanceChange = {
-          kind: 'materializationMaintenanceChange',
-          update: 'incremental',
-          recomputed: false,
-          reason: rowDelta.rowChanges.length === 0
-            ? 'dependencies touched; incrementally maintained rows unchanged'
-            : maintained.reason,
-          id: stored.metadata.id,
-          queryKey: stored.metadata.queryKey,
-          query: stored.metadata.query,
-          maintenance: stored.metadata.maintenance,
-          dependencies: stored.metadata.dependencies,
-          touchedDependencies,
-          envDependencies: stored.metadata.envDependencies,
-          touchedEnvDependencies,
-          indexSpecs: stored.metadata.indexSpecs,
-          previousRowsAvailable: true,
-          previousRows: materializationRows(stored),
-          rows: refresh.snapshot.rows,
-          addedRows: rowDelta.addedRows,
-          removedRows: rowDelta.removedRows,
-          rowChanges: rowDelta.rowChanges,
-          diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
-        };
-        changes.push(change);
-        storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
-          stored,
-          refresh.snapshot,
-          maintained.incremental
-        ));
-        continue;
-      }
-
-      incrementalFallbackDiagnostics.push(incrementalFallbackDiagnostic(
-        stored.metadata.id,
-        stored.metadata.queryKey,
-        maintained.reason
-      ));
-    }
-
     const entry = recomputeMaterializationEntry(next, stored);
     const refresh = refreshDerivedSnapshotFromRows(
       stored.derivationSnapshot,
@@ -750,15 +661,14 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
       addedRows: refresh.delta.addedRows,
       removedRows: refresh.delta.removedRows,
       rowChanges: refresh.delta.rowChanges,
-      diagnostics: [...incrementalFallbackDiagnostics, ...refresh.delta.diagnostics]
+      diagnostics: refresh.delta.diagnostics
     };
     changes.push(change);
     storeMaterializationIn(nextStore, materializationEntryWithDerivationSnapshot(
       entry.metadata,
       refresh.snapshot,
       entry.evaluateOptions,
-      entry.cacheable,
-      entry.incremental
+      entry.cacheable
     ));
   }
 
@@ -1336,10 +1246,7 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
   const id = options.id ?? options.name ?? key;
   const evaluateOptions = materializationEvaluateOptions(options);
   const functionDiagnostics = missingFunctionDiagnostics(query, evaluateOptions.functions);
-  const planned = requestedMode === 'incremental'
-    ? legacyPlanIncrementalMaterialization(query, incrementalPlanOptions(evaluateOptions))
-    : undefined;
-  const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
+  const maintenance = maintenanceForRequestedMode(requestedMode);
   const metadata: MaterializationMetadata<Row> = {
     kind: 'materialization',
     id,
@@ -1347,24 +1254,18 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
     query,
     requestedMode,
     maintenance,
-    maintenanceReason: planned === undefined
-      ? maintenanceReasonForMode(requestedMode)
-      : planned.reason,
+    maintenanceReason: maintenanceReasonForMode(requestedMode),
     dependencies: relationDependencies(query),
     envDependencies: Array.from(envReferences(query)),
     indexSpecs: materializationIndexSpecs(query),
-    diagnostics: [
-      ...(planned?.supported === false ? [incrementalFallbackDiagnostic(id, key, planned.reason)] : []),
-      ...functionDiagnostics
-    ],
+    diagnostics: functionDiagnostics,
     ...(options.name === undefined ? {} : { name: options.name })
   };
   storeMaterialization(db, materializationEntryFor(
     db,
     metadata,
     evaluateOptions,
-    functionDiagnostics.length === 0,
-    planned?.supported === true ? planned.plan : undefined
+    functionDiagnostics.length === 0
   ));
   return markMaterialized(db);
 }
@@ -1411,35 +1312,8 @@ function materializationEntryFor<Row>(
   target: SnapshotMaterializationTarget,
   metadata: MaterializationMetadata<Row>,
   evaluateOptions: EvaluateOptions,
-  cacheable: boolean,
-  plan?: LegacyIncrementalMaterializationPlan
+  cacheable: boolean
 ): StoredMaterialization<Row> {
-  if (cacheable && plan !== undefined) {
-    const built = legacyBuildIncrementalMaterialization<Row>(
-      plan,
-      sourceFor(target),
-      metadata.query.relations,
-      envFor(target),
-      incrementalPlanOptions(evaluateOptions)
-    );
-    if (!built.supported) {
-      return materializationEntryWithRows(
-        metadataWithIncrementalFallback(metadata, built.reason),
-        evaluateTargetRows(target, metadata.query, evaluateOptions),
-        evaluateOptions,
-        cacheable
-      );
-    }
-
-    return materializationEntryWithRows(
-      metadata,
-      built.rows,
-      evaluateOptions,
-      cacheable,
-      built.incremental
-    );
-  }
-
   return materializationEntryWithRows(
     metadata,
     cacheable ? evaluateTargetRows(target, metadata.query, evaluateOptions) : [],
@@ -1452,15 +1326,13 @@ function materializationEntryWithRows<Row>(
   metadata: MaterializationMetadata<Row>,
   rows: readonly Row[],
   evaluateOptions: EvaluateOptions,
-  cacheable: boolean,
-  incremental?: LegacyIncrementalMaterialization<Row>
+  cacheable: boolean
 ): StoredMaterialization<Row> {
   return materializationEntryWithDerivationSnapshot(
     metadata,
     deriveSnapshotFromRows(derivationTargetFor(metadata), rows),
     evaluateOptions,
-    cacheable,
-    incremental
+    cacheable
   );
 }
 
@@ -1468,8 +1340,7 @@ function materializationEntryWithDerivationSnapshot<Row>(
   metadata: MaterializationMetadata<Row>,
   derivationSnapshot: DerivationSnapshot<Row>,
   evaluateOptions: EvaluateOptions,
-  cacheable: boolean,
-  incremental?: LegacyIncrementalMaterialization<Row>
+  cacheable: boolean
 ): StoredMaterialization<Row> {
   const rows = derivationSnapshot.rows;
   const maintainedDefinitions = maintainedIndexDefinitions(metadata.indexSpecs);
@@ -1482,24 +1353,7 @@ function materializationEntryWithDerivationSnapshot<Row>(
     rows,
     indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
     evaluateOptions,
-    cacheable,
-    ...(incremental === undefined ? {} : { incremental })
-  };
-}
-
-function materializationEntryWithIncrementalRows<Row>(
-  stored: StoredMaterialization<Row>,
-  derivationSnapshot: DerivationSnapshot<Row>,
-  incremental: LegacyIncrementalMaterialization<Row>
-): StoredMaterialization<Row> {
-  const rows = derivationSnapshot.rows;
-  const maintainedDefinitions = maintainedIndexDefinitions(stored.metadata.indexSpecs);
-  return {
-    ...stored,
-    derivationSnapshot,
-    rows,
-    indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
-    incremental
+    cacheable
   };
 }
 
@@ -1513,47 +1367,11 @@ function derivationRefreshOptions(
   return deltas === undefined ? {} : { inputDeltas: deltas };
 }
 
-function materializationMaintenanceRowDelta<Row>(
-  refresh: DerivationRefresh<Row>,
-  maintained: {
-    readonly addedRows: readonly Row[];
-    readonly removedRows: readonly Row[];
-    readonly rowChanges: readonly RowChange<Row>[];
-  }
-): {
-  readonly addedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly rowChanges: readonly RowChange<Row>[];
-} {
-  return refresh.delta.rowChanges.length === 0 && maintained.rowChanges.length > 0
-    ? maintained
-    : refresh.delta;
-}
-
 function derivationTargetFor<Row>(metadata: MaterializationMetadata<Row>): DerivationTarget<Row> {
   return {
     kind: 'query',
     id: metadata.id,
     query: metadata.query
-  };
-}
-
-function metadataWithIncrementalFallback<Row>(
-  metadata: MaterializationMetadata<Row>,
-  reason: string
-): MaterializationMetadata<Row> {
-  if (metadata.requestedMode !== 'incremental') {
-    return metadata;
-  }
-
-  return {
-    ...metadata,
-    maintenance: 'snapshot',
-    maintenanceReason: reason,
-    diagnostics: [
-      ...metadata.diagnostics,
-      incrementalFallbackDiagnostic(metadata.id, metadata.queryKey, reason)
-    ]
   };
 }
 
@@ -1588,8 +1406,7 @@ function recomputeMaterializationEntry<Row>(
     target,
     stored.metadata,
     stored.evaluateOptions,
-    stored.cacheable,
-    stored.incremental?.plan
+    stored.cacheable
   );
 }
 
@@ -2197,10 +2014,6 @@ function materializationEvaluateOptions(options: EvaluateOptions): EvaluateOptio
   };
 }
 
-function incrementalPlanOptions(options: EvaluateOptions): LegacyIncrementalMaterializationOptions {
-  return options.functions === undefined ? {} : { functions: options.functions };
-}
-
 function missingFunctionDiagnostics(
   query: Query,
   functions: EvaluateFunctions | undefined
@@ -2375,9 +2188,13 @@ function uniqueMaterializations(store: Map<string, AnyStoredMaterialization>): r
   return Array.from(new Set(store.values()));
 }
 
+function maintenanceForRequestedMode(_mode: MaterializationMode): MaterializationMaintenanceKind {
+  return 'snapshot';
+}
+
 function maintenanceReasonForMode(mode: MaterializationMode): string {
   return mode === 'incremental'
-    ? 'incremental maintenance requested'
+    ? 'incremental mode requested; maintained by derivation snapshot refresh'
     : 'snapshot maintenance with dependency-aware invalidation';
 }
 
@@ -3447,25 +3264,6 @@ function missingDiagnostic(): MissingMaterializationDiagnostic {
     code: 'materialization_missing',
     message: 'materialization is not attached to this database value',
     surface: 'materialization'
-  };
-}
-
-function incrementalFallbackDiagnostic(
-  id: string,
-  key: string,
-  reason = 'snapshot-first Relic implementation'
-): IncrementalFallbackMaterializationDiagnostic {
-  return {
-    code: 'materialization_incremental_fallback',
-    message: 'incremental materialization is not available; snapshot recompute will be used',
-    surface: 'materialization',
-    detail: {
-      mode: 'incremental',
-      fallback: 'recompute',
-      id,
-      queryKey: key,
-      reason
-    }
   };
 }
 

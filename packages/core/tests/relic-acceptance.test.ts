@@ -109,10 +109,6 @@ import {
   users
 } from './fixtures';
 
-function expectNoMaterializationFallback(diagnostics: readonly { readonly code: string }[]): void {
-  expect(diagnostics.map((diagnostic) => diagnostic.code)).not.toContain('materialization_incremental_fallback');
-}
-
 describe('TypeScript Relic core acceptance', () => {
   it('creates immutable database values and reads tables or queries', async () => {
     const state = db(sourceData, { env: { minimumAge: 30 } });
@@ -716,10 +712,10 @@ describe('TypeScript Relic core acceptance', () => {
     });
     expect(taskChange).toMatchObject({
       update: 'skipped',
-      recomputed: false,
       dependencies: ['tasks'],
       touchedDependencies: []
     });
+    expect(taskChange?.recomputed).toBe(false);
     expect(materializedRowsForQuery(next, activeUsers)).not.toBe(previousActiveRows);
     expect(materializedRowsForQuery(next, openTasks)).toBe(previousTaskRows);
   });
@@ -1241,8 +1237,8 @@ describe('TypeScript Relic core acceptance', () => {
     if (tracked.result?.materializations === undefined) {
       throw new Error('missing materialization maintenance report');
     }
-    expect(tracked.result.materializations).toMatchObject({ recomputed: 0 });
-    expectNoMaterializationFallback(tracked.result.materializations.diagnostics);
+    expect(tracked.result.materializations).toMatchObject({ recomputed: 1 });
+    expect(tracked.result.materializations.diagnostics).toEqual([]);
 
     let rowsCalls = 0;
     let lookupCalls = 0;
@@ -1421,7 +1417,7 @@ describe('TypeScript Relic core acceptance', () => {
     ]);
   });
 
-  it('delivers query watch events from incremental materialization changes', async () => {
+  it('delivers query watch events from materialization refresh changes', async () => {
     const user = as(coreSchema.users, 'user');
     const activeUsers = pipe(
       from(user),
@@ -1456,8 +1452,8 @@ describe('TypeScript Relic core acceptance', () => {
 
     expect(tracked.result).toMatchObject({ committed: true, applied: 1 });
     expect(materializedChange).toMatchObject({
-      update: 'incremental',
-      recomputed: false,
+      update: 'recomputed',
+      recomputed: true,
       addedRows: [{ id: 'dia', name: 'Dia' }],
       removedRows: []
     });
@@ -1471,8 +1467,8 @@ describe('TypeScript Relic core acceptance', () => {
     expect(events[0]?.rowChanges).toEqual(materializedChange?.rowChanges);
     expect(events[0]?.rowChanges).toHaveLength(1);
     expect(events[0]?.rowChanges.length).toBeLessThan(events[0]?.rows.length ?? 0);
-    expectNoMaterializationFallback(tracked.diagnostics);
-    expectNoMaterializationFallback(events[0]?.diagnostics ?? []);
+    expect(tracked.diagnostics).toEqual([]);
+    expect(events[0]?.diagnostics ?? []).toEqual([]);
 
     const transacted = transact(tracked.db, insert(coreSchema.users, eli));
 
@@ -1483,7 +1479,7 @@ describe('TypeScript Relic core acceptance', () => {
       removedRows: [],
       rowChanges: [expect.objectContaining({ kind: 'added', row: { id: 'eli', name: 'Eli' } })]
     });
-    expectNoMaterializationFallback(events.at(-1)?.diagnostics ?? []);
+    expect(events.at(-1)?.diagnostics ?? []).toEqual([]);
     await expect(qRows(transacted, activeUsers)).resolves.toEqual([
       { id: 'ada', name: 'Ada' },
       { id: 'bea', name: 'Bea' },
