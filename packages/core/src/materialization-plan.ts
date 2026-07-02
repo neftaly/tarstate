@@ -29,6 +29,7 @@ export type IncrementalSingleRootMaterializationPlan = {
   readonly root: IncrementalRoot;
   readonly steps: readonly IncrementalStep[];
   readonly ordered?: IncrementalOrderedStep;
+  readonly relationPostSteps?: readonly IncrementalRelationPostStep[];
   readonly rowKeyFields?: readonly string[];
 };
 
@@ -60,6 +61,7 @@ export type IncrementalMaterializationState<Row = unknown> = {
   readonly joinStates: readonly IncrementalJoinState[];
   readonly aggregate?: IncrementalAggregateState<Row>;
   readonly ordered?: IncrementalOrderedState<Row>;
+  readonly relationPost?: IncrementalRelationPostState<Row>;
   readonly dynamicSet?: IncrementalDynamicSetState;
 };
 
@@ -199,6 +201,11 @@ type IncrementalOrderedStep = {
   readonly postSteps: readonly IncrementalPostOrderStep[];
 };
 
+type IncrementalRelationPostStep = {
+  readonly kind: 'staticUnion';
+  readonly rows: readonly Record<string, unknown>[];
+};
+
 type IncrementalBranchPlan = {
   readonly relation: string;
   readonly alias: string;
@@ -252,6 +259,10 @@ type IncrementalOrderedState<Row = unknown> = {
   readonly rows: readonly Row[];
 };
 
+type IncrementalRelationPostState<Row = unknown> = {
+  readonly rows: readonly Row[];
+};
+
 type IncrementalOrderedEntry<Row = unknown> = {
   readonly key: string;
   readonly ownerKey: string;
@@ -287,6 +298,7 @@ type PlanCollection = {
   joinCount: number;
   subqueryCount: number;
   readonly subqueryKeys: Set<string>;
+  readonly relationPostSteps: IncrementalRelationPostStep[];
   ordered?: MutableIncrementalOrderedStep;
 };
 
@@ -494,7 +506,12 @@ export function planIncrementalMaterialization(
 
   const dynamicSetPlan = collectDynamicSetPlan(query.data, options);
   const steps: IncrementalStep[] = [];
-  const collection: PlanCollection = { joinCount: 0, subqueryCount: 0, subqueryKeys: new Set() };
+  const collection: PlanCollection = {
+    joinCount: 0,
+    subqueryCount: 0,
+    subqueryKeys: new Set(),
+    relationPostSteps: []
+  };
   const root = collectSingleRootPlan(query.data, steps, collection, options);
   if (typeof root === 'string') {
     if (dynamicSetPlan.supported) {
@@ -542,11 +559,10 @@ export function planIncrementalMaterialization(
       root: root.root,
       steps,
       ...optionalOrderedStep(collection.ordered),
+      ...optionalRelationPostSteps(collection.relationPostSteps),
       ...optionalRowKeyFields(queryRowKeyFields(query))
     },
-    reason: collection.ordered === undefined
-      ? 'incremental maintenance for supported single-root relation pipeline'
-      : 'incremental maintenance for supported single-root relation pipeline with final order/window'
+    reason: incrementalSingleRootPlanReason(collection)
   };
 }
 
@@ -667,6 +683,14 @@ export function buildIncrementalMaterialization<Row>(
     state = {
       ...state,
       ordered: orderedState.state
+    };
+  }
+
+  const relationPostState = buildRelationPostState<Row>(plan, state);
+  if (relationPostState !== undefined) {
+    state = {
+      ...state,
+      relationPost: relationPostState
     };
   }
 
@@ -901,6 +925,21 @@ export function maintainIncrementalMaterialization<Row>(
     return {
       updated: false,
       reason: 'incremental ordered state is present for a non-ordered plan; snapshot recompute is required'
+    };
+  }
+
+  const relationPostSteps = relationPostStepsForPlan(materialization.plan);
+  const previousRelationPostState = materialization.state.relationPost;
+  if (relationPostSteps.length > 0 && previousRelationPostState === undefined) {
+    return {
+      updated: false,
+      reason: 'incremental relation post state is missing; snapshot recompute is required'
+    };
+  }
+  if (relationPostSteps.length === 0 && previousRelationPostState !== undefined) {
+    return {
+      updated: false,
+      reason: 'incremental relation post state is present for a non-relation-post plan; snapshot recompute is required'
     };
   }
 
@@ -1241,6 +1280,14 @@ export function maintainIncrementalMaterialization<Row>(
     state = {
       ...state,
       ordered: nextOrderedState.state
+    };
+  }
+
+  const relationPostState = buildRelationPostState<Row>(materialization.plan, state);
+  if (relationPostState !== undefined) {
+    state = {
+      ...state,
+      relationPost: relationPostState
     };
   }
 
@@ -1635,6 +1682,8 @@ function collectSingleRootPlan(
     case 'where': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'where');
+      if (relationPostReason !== undefined) return relationPostReason;
       if (collection.ordered !== undefined) {
         return 'where after order/window is not supported for incremental maintenance';
       }
@@ -1651,6 +1700,8 @@ function collectSingleRootPlan(
     case 'btree': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, data.op);
+      if (relationPostReason !== undefined) return relationPostReason;
       for (const expression of data.expressions) {
         const reason = rowLocalExprReason(expression, root.shape, options);
         if (reason !== undefined) {
@@ -1664,6 +1715,8 @@ function collectSingleRootPlan(
     case 'select': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'select');
+      if (relationPostReason !== undefined) return relationPostReason;
       const reason = planProjectionReason(data.projection, root.shape, steps, collection, {
         allowSubqueries: collection.ordered === undefined && !hasAggregateStep(steps)
       }, options);
@@ -1681,6 +1734,8 @@ function collectSingleRootPlan(
     case 'extend': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'extend');
+      if (relationPostReason !== undefined) return relationPostReason;
       const reason = planProjectionReason(data.projection, root.shape, steps, collection, {
         allowSubqueries: collection.ordered === undefined && !hasAggregateStep(steps)
       }, options);
@@ -1698,6 +1753,8 @@ function collectSingleRootPlan(
     case 'without': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'without');
+      if (relationPostReason !== undefined) return relationPostReason;
       const step = { kind: 'without', fields: data.fields } satisfies IncrementalPostOrderStep;
       if (collection.ordered !== undefined) {
         collection.ordered.postSteps.push(step);
@@ -1709,6 +1766,8 @@ function collectSingleRootPlan(
     case 'rename': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'rename');
+      if (relationPostReason !== undefined) return relationPostReason;
       const step = { kind: 'rename', fields: data.fields } satisfies IncrementalPostOrderStep;
       if (collection.ordered !== undefined) {
         collection.ordered.postSteps.push(step);
@@ -1720,6 +1779,8 @@ function collectSingleRootPlan(
     case 'qualify': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'qualify');
+      if (relationPostReason !== undefined) return relationPostReason;
       const step = { kind: 'qualify', alias: data.alias } satisfies IncrementalPostOrderStep;
       if (collection.ordered !== undefined) {
         collection.ordered.postSteps.push(step);
@@ -1731,6 +1792,8 @@ function collectSingleRootPlan(
     case 'expand': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'expand');
+      if (relationPostReason !== undefined) return relationPostReason;
       if (collection.ordered !== undefined) {
         return 'expand after order/window is not supported for incremental maintenance';
       }
@@ -1749,6 +1812,8 @@ function collectSingleRootPlan(
     case 'join': {
       const left = collectSingleRootPlan(data.left, steps, collection, options);
       if (typeof left === 'string') return left;
+      const relationPostReason = operatorAfterRelationPostReason(collection, `${data.kind} join`);
+      if (relationPostReason !== undefined) return relationPostReason;
       if (collection.ordered !== undefined) {
         return `${data.kind} join after order/window is not supported for incremental maintenance`;
       }
@@ -1789,6 +1854,8 @@ function collectSingleRootPlan(
     case 'sort': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'sort');
+      if (relationPostReason !== undefined) return relationPostReason;
       if (collection.ordered !== undefined) {
         return 'sort after order/window is not supported for incremental maintenance';
       }
@@ -1806,6 +1873,8 @@ function collectSingleRootPlan(
     case 'limit': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'limit');
+      if (relationPostReason !== undefined) return relationPostReason;
       const window = normalizedWindow(data.count, data.offset ?? 0);
       if (typeof window === 'string') {
         return `limit is not supported for incremental maintenance: ${window}`;
@@ -1825,6 +1894,8 @@ function collectSingleRootPlan(
     case 'sortLimit': {
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'sortLimit');
+      if (relationPostReason !== undefined) return relationPostReason;
       if (collection.ordered !== undefined) {
         return 'sortLimit after order/window is not supported for incremental maintenance';
       }
@@ -1845,7 +1916,7 @@ function collectSingleRootPlan(
       return root;
     }
     case 'union':
-      return 'union is not supported for incremental maintenance';
+      return collectStaticUnionPlan(data.inputs, steps, collection, options);
     case 'intersection':
       return collectIntersectionPlan(data.inputs, steps, collection, options);
     case 'difference':
@@ -1856,6 +1927,8 @@ function collectSingleRootPlan(
       const stepCount = steps.length;
       const root = collectSingleRootPlan(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      const relationPostReason = operatorAfterRelationPostReason(collection, 'aggregate');
+      if (relationPostReason !== undefined) return relationPostReason;
       if (collection.ordered !== undefined) {
         return 'aggregate after order/window is not supported for incremental maintenance';
       }
@@ -2353,6 +2426,34 @@ function combineWindows(
   };
 }
 
+function collectStaticUnionPlan(
+  inputs: readonly QueryData[],
+  steps: IncrementalStep[],
+  collection: PlanCollection,
+  options: IncrementalMaterializationPlanOptions
+): RootPlan | string {
+  const [leftInput, ...rightInputs] = inputs;
+  if (leftInput === undefined || rightInputs.length === 0) {
+    return 'union incremental maintenance requires one supported root branch and static right branches';
+  }
+
+  const root = collectSingleRootPlan(leftInput, steps, collection, options);
+  if (typeof root === 'string') {
+    return `union first branch is not supported for incremental maintenance: ${root}`;
+  }
+
+  const rows = collectStaticUnionRows(rightInputs, options);
+  if (typeof rows === 'string') {
+    return rows;
+  }
+
+  collection.relationPostSteps.push({
+    kind: 'staticUnion',
+    rows
+  });
+  return root;
+}
+
 function collectIntersectionPlan(
   inputs: readonly QueryData[],
   steps: IncrementalStep[],
@@ -2368,6 +2469,8 @@ function collectIntersectionPlan(
   if (typeof root === 'string') {
     return `intersection first branch is not supported for incremental maintenance: ${root}`;
   }
+  const relationPostReason = operatorAfterRelationPostReason(collection, 'intersection');
+  if (relationPostReason !== undefined) return relationPostReason;
   if (collection.ordered !== undefined) {
     return 'intersection after order/window is not supported for incremental maintenance';
   }
@@ -2392,6 +2495,8 @@ function collectDifferencePlan(
   if (typeof root === 'string') {
     return `difference left branch is not supported for incremental maintenance: ${root}`;
   }
+  const relationPostReason = operatorAfterRelationPostReason(collection, 'difference');
+  if (relationPostReason !== undefined) return relationPostReason;
   if (collection.ordered !== undefined) {
     return 'difference after order/window is not supported for incremental maintenance';
   }
@@ -2424,6 +2529,37 @@ function collectStaticSetRows(
     rows.push(evaluated.rows);
   }
   return rows;
+}
+
+function collectStaticUnionRows(
+  inputs: readonly QueryData[],
+  options: IncrementalMaterializationPlanOptions
+): readonly Record<string, unknown>[] | string {
+  const rows: Array<readonly Record<string, unknown>[]> = [];
+  for (const input of inputs) {
+    const staticConstRowsReason = staticUnionConstRowsReason(input);
+    if (staticConstRowsReason !== undefined) {
+      return `union static branch is not supported for incremental maintenance: ${staticConstRowsReason}`;
+    }
+
+    const evaluated = evaluateStaticRows(input, incrementalEvalContext({}, options));
+    if (!evaluated.supported) {
+      return `union static branch is not supported for incremental maintenance: ${evaluated.reason}`;
+    }
+    rows.push(evaluated.rows);
+  }
+  return setUnionRows(rows);
+}
+
+function staticUnionConstRowsReason(data: QueryData): string | undefined {
+  switch (data.op) {
+    case 'constRows':
+      return undefined;
+    case 'keyBy':
+      return staticUnionConstRowsReason(data.input);
+    default:
+      return `${data.op} is not static constRows`;
+  }
 }
 
 function collectStaticRowsPlan(
@@ -2896,6 +3032,10 @@ function orderedStep(plan: IncrementalMaterializationPlan): IncrementalOrderedSt
   return plan.kind === 'singleRoot' ? plan.ordered : undefined;
 }
 
+function relationPostStepsForPlan(plan: IncrementalMaterializationPlan): readonly IncrementalRelationPostStep[] {
+  return plan.kind === 'singleRoot' ? plan.relationPostSteps ?? [] : [];
+}
+
 function hasAggregateStep(steps: readonly IncrementalStep[]): boolean {
   return steps.some((step) => step.kind === 'aggregate');
 }
@@ -2932,6 +3072,10 @@ function incrementalRowReport<Row>(
   changedRootKeys: ReadonlySet<string>,
   changedGroupKeys: ReadonlySet<string>
 ): IncrementalRowReport<Row> {
+  if (next.relationPost !== undefined || previous.relationPost !== undefined) {
+    return relationPostRowReport(plan, previous, next, changedRootKeys, changedGroupKeys);
+  }
+
   if (next.ordered !== undefined || previous.ordered !== undefined) {
     return orderedRowReport(plan, previous, next, changedRootKeys, changedGroupKeys);
   }
@@ -2941,6 +3085,38 @@ function incrementalRowReport<Row>(
   }
 
   return rootRowReport(plan, previous, next, changedRootKeys);
+}
+
+function relationPostRowReport<Row>(
+  plan: IncrementalMaterializationPlan,
+  previous: IncrementalMaterializationState<Row>,
+  next: IncrementalMaterializationState<Row>,
+  changedRootKeys: ReadonlySet<string>,
+  changedGroupKeys: ReadonlySet<string>
+): IncrementalRowReport<Row> {
+  const options = rowDiffOptionsForPlan(plan);
+  const beforeRows = rowsFromIncrementalState(previous);
+  const afterRows = rowsFromIncrementalState(next);
+  const diff = diffMaterializationRows(beforeRows, afterRows, options);
+  const rowChanges = [
+    ...diff.changes,
+    ...(next.ordered !== undefined || previous.ordered !== undefined
+      ? orderedMoveRowChanges(beforeRows, afterRows, options, diff.changes)
+      : [])
+  ];
+  const rowBatches = materializationStableKey(beforeRows) === materializationStableKey(afterRows)
+    ? []
+    : [{ beforeRows, afterRows }];
+
+  return {
+    rowChanges,
+    addedRows: rowChanges.flatMap((item) => item.kind === 'added' ? [item.row] : []),
+    removedRows: rowChanges.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
+    rowBatches,
+    changedRootKeys: orderedChangedKeys(previous.rootKeys, next.rootKeys, changedRootKeys),
+    changedGroupKeys: orderedChangedKeys(previous.aggregate?.groupKeys ?? [], next.aggregate?.groupKeys ?? [], changedGroupKeys),
+    diagnostics: diff.diagnostics
+  };
 }
 
 function rootRowReport<Row>(
@@ -3814,6 +3990,14 @@ function dynamicSetMaterializationState<Row>(
 }
 
 export function rowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {
+  if (state.relationPost !== undefined) {
+    return state.relationPost.rows;
+  }
+
+  return baseRowsFromIncrementalState(state);
+}
+
+function baseRowsFromIncrementalState<Row>(state: IncrementalMaterializationState<Row>): readonly Row[] {
   if (state.ordered !== undefined) {
     return state.ordered.rows;
   }
@@ -3826,6 +4010,35 @@ export function rowsFromIncrementalState<Row>(state: IncrementalMaterializationS
   }
 
   return state.rootKeys.flatMap((key) => state.outputsByRootKey.get(key) ?? []) as readonly Row[];
+}
+
+function buildRelationPostState<Row>(
+  plan: IncrementalMaterializationPlan,
+  state: IncrementalMaterializationState<Row>
+): IncrementalRelationPostState<Row> | undefined {
+  const steps = relationPostStepsForPlan(plan);
+  if (steps.length === 0) {
+    return undefined;
+  }
+
+  return {
+    rows: applyRelationPostSteps(baseRowsFromIncrementalState(state), steps) as readonly Row[]
+  };
+}
+
+function applyRelationPostSteps(
+  rows: readonly unknown[],
+  steps: readonly IncrementalRelationPostStep[]
+): readonly Record<string, unknown>[] {
+  let output = rows as readonly Record<string, unknown>[];
+  for (const step of steps) {
+    switch (step.kind) {
+      case 'staticUnion':
+        output = setUnionRows([output, step.rows]);
+        break;
+    }
+  }
+  return output;
 }
 
 function buildOrderedState<Row>(
@@ -5252,6 +5465,30 @@ function optionalOrderedStep(
           postSteps: [...ordered.postSteps]
         }
       };
+}
+
+function optionalRelationPostSteps(
+  steps: readonly IncrementalRelationPostStep[]
+): { readonly relationPostSteps?: readonly IncrementalRelationPostStep[] } {
+  return steps.length === 0 ? {} : { relationPostSteps: [...steps] };
+}
+
+function incrementalSingleRootPlanReason(collection: PlanCollection): string {
+  if (collection.relationPostSteps.length > 0) {
+    return collection.ordered === undefined
+      ? 'incremental maintenance for supported single-root relation pipeline with final static union'
+      : 'incremental maintenance for supported single-root relation pipeline with final order/window and static union';
+  }
+
+  return collection.ordered === undefined
+    ? 'incremental maintenance for supported single-root relation pipeline'
+    : 'incremental maintenance for supported single-root relation pipeline with final order/window';
+}
+
+function operatorAfterRelationPostReason(collection: PlanCollection, operator: string): string | undefined {
+  return collection.relationPostSteps.length === 0
+    ? undefined
+    : `${operator} after terminal union is not supported for incremental maintenance`;
 }
 
 function rowDiffOptionsForPlan(plan: IncrementalMaterializationPlan): MaterializationRowDiffOptions {
