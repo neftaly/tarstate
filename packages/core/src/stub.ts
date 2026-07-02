@@ -223,7 +223,19 @@ export class QueryKeyError extends Error {
   }
 }
 type AliasedFieldAccess<Row, Alias extends string> =
-  { readonly alias: Alias } & { readonly [Field in keyof Row & string]: ExprData<Row[Field]> };
+  {
+    readonly alias: Alias;
+    readonly $: AliasFieldNamespace<Row>;
+  } & AliasedFlatFieldAccess<Row>;
+type RowFieldKeys<Row> = Row extends object ? keyof Row & string : never;
+type LiteralRowFieldKeys<Row> = string extends RowFieldKeys<Row> ? never : RowFieldKeys<Row>;
+type AliasedReservedField = keyof RelationRef | keyof Query | 'alias' | '$';
+type AliasFieldNamespace<Row> = string extends RowFieldKeys<Row>
+  ? Readonly<Record<string, ExprData<unknown>>>
+  : { readonly [Field in RowFieldKeys<Row>]: ExprData<Row[Field]> };
+type AliasedFlatFieldAccess<Row> = {
+  readonly [Field in Exclude<LiteralRowFieldKeys<Row>, AliasedReservedField>]: ExprData<Row[Field]>;
+};
 export type AliasedRelationRef<Row extends object, Alias extends string> =
   RelationRef<Row> & AliasedFieldAccess<Row, Alias>;
 export type AliasedQuery<Row, Alias extends string> = Query<Row> & AliasedFieldAccess<Row, Alias>;
@@ -240,6 +252,45 @@ type ProjectedRow<Shape extends ProjectionData> = {
 type PreserveQueryTransform = (<Row>(query: Query<Row>) => Query<Row>) & { readonly __queryTransform?: 'preserve' };
 type ProjectQueryTransform<RowOut> = (<Row>(query: Query<Row>) => Query<RowOut>) & { readonly __queryProject?: RowOut };
 type ExtendQueryTransform<RowAdd> = (<Row>(query: Query<Row>) => Query<Row & RowAdd>) & { readonly __queryExtend?: RowAdd };
+type WithoutQueryTransform<Fields extends readonly string[]> = (<Row>(query: Query<Row>) => Query<Omit<Row, Extract<Fields[number], keyof Row>>>) & {
+  readonly __queryWithout?: Fields;
+};
+type RenameFields = Readonly<Record<string, string>>;
+type RenameSourceKeys<Row, Fields extends RenameFields> = Extract<keyof Fields, keyof Row> & string;
+type RenameDestinationKeys<Row, Fields extends RenameFields> = Fields[RenameSourceKeys<Row, Fields>] & string;
+type RenameRow<Row, Fields extends RenameFields> =
+  Omit<Row, RenameSourceKeys<Row, Fields> | Extract<RenameDestinationKeys<Row, Fields>, keyof Row & string>>
+  & { readonly [Field in RenameSourceKeys<Row, Fields> as Fields[Field] & string]: Row[Field] };
+type RenameQueryTransform<Fields extends RenameFields> = (<Row>(query: Query<Row>) => Query<RenameRow<Row, Fields>>) & {
+  readonly __queryRename?: Fields;
+};
+type ExpandedItem<Collection> = NonNullish<Collection> extends ReadonlyArray<infer Item>
+  ? Item
+  : NonNullish<Collection> extends Iterable<infer Item>
+    ? Item
+    : unknown;
+type ExpandAliasRow<Collection, Alias> = Alias extends string ? { readonly [Key in Alias]: ExpandedItem<Collection> } : {};
+type TupleFieldValue<Item, Index extends PropertyKey> =
+  Index extends keyof Item
+    ? Item[Index]
+    : Index extends `${infer NumberIndex extends number}`
+      ? NumberIndex extends keyof Item ? Item[NumberIndex] : unknown
+      : unknown;
+type ExpandTupleFieldsRow<Item, Fields extends readonly string[]> = {
+  readonly [Index in keyof Fields as Index extends `${number}` ? Fields[Index] extends string ? Fields[Index] : never : never]: TupleFieldValue<Item, Index>;
+};
+type ExpandObjectFieldsRow<Item, Fields extends readonly string[]> = {
+  readonly [Field in Fields[number]]: Field extends keyof Item ? Item[Field] : unknown;
+};
+type ExpandFieldsRow<Collection, Fields> = Fields extends readonly string[]
+  ? ExpandedItem<Collection> extends readonly unknown[]
+    ? ExpandTupleFieldsRow<ExpandedItem<Collection>, Fields>
+    : ExpandedItem<Collection> extends object
+      ? ExpandObjectFieldsRow<ExpandedItem<Collection>, Fields>
+      : { readonly [Field in Fields[number]]: unknown }
+  : {};
+type ExpandRow<Collection, Alias, Fields> = ExpandAliasRow<Collection, Alias> & ExpandFieldsRow<Collection, Fields>;
+type ExpandQueryTransform<RowAdd> = (<Row>(query: Query<Row>) => Query<Row & RowAdd>) & { readonly __queryExpand?: RowAdd };
 type JoinQueryTransform<Right, Kind extends 'inner' | 'left'> = (<Left>(query: Query<Left>) => Query<Kind extends 'left' ? Left & Partial<Right> : Left & Right>) & {
   readonly __queryJoin?: Kind;
   readonly __queryRight?: Right;
@@ -249,11 +300,21 @@ type PipeStep<Input, Transform> =
   Transform extends { readonly __queryTransform?: 'preserve' } ? Input
     : Transform extends { readonly __queryProject?: infer RowOut } ? Query<RowOut>
       : Transform extends { readonly __queryExtend?: infer RowAdd } ? Input extends Query<infer Row> ? Query<Row & RowAdd> : never
-        : Transform extends { readonly __queryJoin?: infer Kind; readonly __queryRight?: infer Right }
-          ? Input extends Query<infer Left>
-            ? Query<Kind extends 'left' ? Left & Partial<Right> : Left & Right>
+        : Transform extends { readonly __queryWithout?: infer Fields }
+          ? Input extends Query<infer Row>
+            ? Fields extends readonly string[] ? Query<Omit<Row, Extract<Fields[number], keyof Row>>> : never
             : never
-          : Transform extends { readonly __queryQualify?: infer Alias }
+          : Transform extends { readonly __queryRename?: infer Fields }
+            ? Input extends Query<infer Row>
+              ? Fields extends RenameFields ? Query<RenameRow<Row, Fields>> : never
+              : never
+            : Transform extends { readonly __queryExpand?: infer RowAdd }
+              ? Input extends Query<infer Row> ? Query<Row & RowAdd> : never
+              : Transform extends { readonly __queryJoin?: infer Kind; readonly __queryRight?: infer Right }
+                ? Input extends Query<infer Left>
+                  ? Query<Kind extends 'left' ? Left & Partial<Right> : Left & Right>
+                  : never
+                : Transform extends { readonly __queryQualify?: infer Alias }
             ? Input extends Query<infer Row>
               ? Alias extends string ? Query<Record<Alias, Row>> : never
               : never
@@ -290,15 +351,19 @@ export function as<Row, Alias extends string>(
   input: RelationRef<Row & object> | Query<Row>,
   alias: Alias
 ): AliasedRelationRef<Row & object, Alias> | AliasedQuery<Row, Alias> {
-  const target = { ...input, alias };
-  return new Proxy(target, {
-    get(valueTarget, property, receiver) {
-      if (typeof property === 'string' && !(property in valueTarget)) {
-        return field(alias, property);
-      }
-      return Reflect.get(valueTarget, property, receiver);
+  const target: Record<string, unknown> = { ...input, alias };
+  const namespace: Record<string, ExprData> = {};
+
+  for (const fieldName of aliasedFieldNames(input)) {
+    const exprData = field(alias, fieldName);
+    defineAliasProperty(namespace, fieldName, exprData);
+    if (!(fieldName in target) && !ALIASED_FIELD_RESERVED_KEYS.has(fieldName)) {
+      defineAliasProperty(target, fieldName, exprData);
     }
-  }) as AliasedRelationRef<Row & object, Alias> | AliasedQuery<Row, Alias>;
+  }
+
+  defineAliasProperty(target, '$', namespace);
+  return target as AliasedRelationRef<Row & object, Alias> | AliasedQuery<Row, Alias>;
 }
 
 export function field<Value = unknown>(alias: string, name: string): ExprData<Value> {
@@ -397,12 +462,13 @@ export const project = <Shape extends ProjectionData>(projection: Shape): Projec
   ({ data: { op: 'project', input: query.data, projection }, relations: query.relations })) as ProjectQueryTransform<ProjectedRow<Shape>>;
 export const extend = <Shape extends ProjectionData>(projection: Shape): ExtendQueryTransform<ProjectedRow<Shape>> => ((query) =>
   ({ data: { op: 'extend', input: query.data, projection }, relations: query.relations })) as ExtendQueryTransform<ProjectedRow<Shape>>;
-export const expand = <Collection, Alias extends string | undefined = undefined, Fields extends readonly string[] | undefined = undefined>(
+export const expand = <Collection, const Alias extends string | undefined = undefined, const Fields extends readonly string[] | undefined = undefined>(
   collection: ExprData<Collection>,
-  options: ExpandOptions<Alias, Fields> = {}
-) => ((query) => ({ ...query, data: { op: 'expand', input: query.data, collection, ...options } })) as PreserveQueryTransform;
-export const without = (...fields: readonly string[]): PreserveQueryTransform => ((query) =>
-  ({ ...query, data: { op: 'without', input: query.data, fields } })) as PreserveQueryTransform;
+  options: ExpandOptions<Alias, Fields> = {} as ExpandOptions<Alias, Fields>
+): ExpandQueryTransform<ExpandRow<Collection, Alias, Fields>> =>
+  ((query) => ({ ...query, data: { op: 'expand', input: query.data, collection, ...options } })) as ExpandQueryTransform<ExpandRow<Collection, Alias, Fields>>;
+export const without = <const Fields extends readonly string[]>(...fields: Fields): WithoutQueryTransform<Fields> => ((query) =>
+  ({ ...query, data: { op: 'without', input: query.data, fields } })) as WithoutQueryTransform<Fields>;
 export const sort = (...order: readonly SortInput[]): PreserveQueryTransform => ((query) =>
   ({ ...query, data: { op: 'sort', input: query.data, order } })) as PreserveQueryTransform;
 export const limit = (count: number, offset?: number): PreserveQueryTransform => ((query) =>
@@ -415,8 +481,8 @@ export const intersection = <Row>(...inputs: readonly Query<Row>[]): Query<Row> 
   ({ data: { op: 'intersection', inputs: inputs.map((item) => item.data) }, relations: mergeRelations(inputs) });
 export const difference = <Row>(left: Query<Row>, right: Query<Row>): Query<Row> =>
   ({ data: { op: 'difference', left: left.data, right: right.data }, relations: { ...left.relations, ...right.relations } });
-export const rename = (fields: Record<string, string>): PreserveQueryTransform => ((query) =>
-  ({ ...query, data: { op: 'rename', input: query.data, fields } })) as PreserveQueryTransform;
+export const rename = <const Fields extends RenameFields>(fields: Fields): RenameQueryTransform<Fields> => ((query) =>
+  ({ ...query, data: { op: 'rename', input: query.data, fields } })) as RenameQueryTransform<Fields>;
 export const qualify = <Alias extends string>(alias: Alias): QualifyQueryTransform<Alias> => ((query) =>
   ({ data: { op: 'qualify', input: query.data, alias }, relations: query.relations })) as QualifyQueryTransform<Alias>;
 export const aggregate = <GroupBy extends ProjectionData, Aggregates extends ProjectionData>(
@@ -606,10 +672,206 @@ export async function tryApplyRelationPatches<Version = unknown>(
 
 export const composeRelationRuntimes = <const Runtimes extends readonly RelationRuntime[]>(
   ...runtimes: Runtimes
-): RelationRuntime<ComposedRelationRuntimeVersion<Runtimes>> => ({
-  source: composeSources(...runtimes.map((runtime) => runtime.source)) as AdapterSource<ComposedRelationRuntimeVersion<Runtimes>>
-});
+): RelationRuntime<ComposedRelationRuntimeVersion<Runtimes>> => {
+  const source = composeRuntimeSources(runtimes);
+  const target = composeRuntimeTarget(runtimes, source);
+  const subscribe = composeRuntimeSubscribe(runtimes);
+
+  return {
+    source,
+    ...(target === undefined ? {} : { target }),
+    snapshot: () => composeRuntimeSnapshot(runtimes),
+    ...(subscribe === undefined ? {} : { subscribe })
+  };
+};
 export const isRelationRuntime = (input: unknown): input is RelationRuntime => isRecord(input) && isRelationSource(input.source);
+
+function composeRuntimeSources<const Runtimes extends readonly RelationRuntime[]>(
+  runtimes: Runtimes,
+  sources: readonly AdapterSource[] = runtimes.map((runtime) => runtime.source)
+): AdapterSource<ComposedRelationRuntimeVersion<Runtimes>> {
+  const rowSource = composeSources(...sources);
+  const hasDiagnostics = sources.some((source) => source.diagnostics !== undefined);
+
+  return {
+    ...rowSource,
+    version: () => composeSourceVersions<Runtimes>(sources),
+    ...(hasDiagnostics ? { diagnostics: () => sources.flatMap((source) => source.diagnostics?.() ?? []) } : {})
+  };
+}
+
+function composeSourceVersions<const Runtimes extends readonly RelationRuntime[]>(
+  sources: readonly AdapterSource[]
+): ComposedRelationRuntimeVersion<Runtimes> | undefined {
+  const versions: unknown[] = [];
+
+  for (const source of sources) {
+    const version = source.version?.();
+    if (version === undefined) return undefined;
+    versions.push(version);
+  }
+
+  return versions as ComposedRelationRuntimeVersion<Runtimes>;
+}
+
+function composeRuntimeSnapshot<const Runtimes extends readonly RelationRuntime[]>(
+  runtimes: Runtimes
+): AdapterSnapshot<ComposedRelationRuntimeVersion<Runtimes>> {
+  const sources: AdapterSource[] = [];
+  const snapshotDiagnostics: TarstateDiagnostic[] = [];
+  const versions: unknown[] = [];
+  let hasCompleteVersion = true;
+
+  for (const runtime of runtimes) {
+    const snapshot = runtime.snapshot?.();
+    const source = snapshot?.source ?? runtime.source;
+    const version = snapshot?.version ?? source.version?.();
+
+    sources.push(source);
+    if (snapshot?.diagnostics !== undefined) snapshotDiagnostics.push(...snapshot.diagnostics);
+
+    if (version === undefined) {
+      hasCompleteVersion = false;
+    } else {
+      versions.push(version);
+    }
+  }
+
+  const source = composeRuntimeSources(runtimes, sources);
+  const diagnostics = [
+    ...snapshotDiagnostics,
+    ...(source.diagnostics?.() ?? [])
+  ];
+  const version = hasCompleteVersion
+    ? versions as ComposedRelationRuntimeVersion<Runtimes>
+    : undefined;
+
+  return {
+    source,
+    ...(version === undefined ? {} : { version }),
+    ...(diagnostics.length === 0 ? {} : { diagnostics })
+  };
+}
+
+function composeRuntimeTarget<const Runtimes extends readonly RelationRuntime[]>(
+  runtimes: Runtimes,
+  source: AdapterSource<ComposedRelationRuntimeVersion<Runtimes>>
+): RelationPatchTarget<ComposedRelationRuntimeVersion<Runtimes>> | undefined {
+  const targets = runtimes.flatMap((runtime) => runtime.target === undefined ? [] : [runtime.target]);
+  if (targets.length === 0) return undefined;
+
+  const targetRelationNames = Array.from(new Set(targets.flatMap((target) => target.relationNames ?? [])));
+
+  return {
+    ...(targetRelationNames.length === 0 ? {} : { relationNames: targetRelationNames }),
+    ownsRelation: (relationName) => targets.some((target) => targetOwnsRelation(target, relationName)),
+    apply: async (patches) => {
+      const patchList = Array.from(patches);
+      const routedTargets = targets.map((target) => ({ target, patches: [] as WritePatch[] }));
+      const unroutedPatches: WritePatch[] = [];
+
+      for (const patch of patchList) {
+        const owningTargets = routedTargets.filter(({ target }) => targetOwnsRelation(target, patch.relation.name));
+
+        if (owningTargets.length === 0) {
+          unroutedPatches.push(patch);
+          continue;
+        }
+
+        for (const routedTarget of owningTargets) {
+          routedTarget.patches.push(patch);
+        }
+      }
+
+      const results = await Promise.all(routedTargets
+        .filter(({ patches: targetPatches }) => targetPatches.length > 0)
+        .map(({ target, patches: targetPatches }) => Promise.resolve(target.apply(targetPatches))));
+      const diagnostics = [
+        ...results.flatMap((result) => result.diagnostics),
+        ...unroutedPatches.map((patch) => unsupportedRuntimeTargetDiagnostic(patch.relation.name))
+      ];
+      const version = source.version?.();
+      const durability = composeApplyDurability(results);
+      const status = composeApplyStatus(patchList.length, unroutedPatches.length, results);
+      const applied = results.reduce<number>((sum, result) => sum + result.applied, 0);
+      const deltas = results.flatMap((result) => result.deltas);
+      const resultBase = {
+        patches: patchList.length,
+        diagnostics,
+        ...(version === undefined ? {} : { version }),
+        ...(durability === undefined ? {} : { durability })
+      };
+
+      return status === 'rejected'
+        ? { status, ...resultBase, applied: 0, deltas: [] }
+        : { status, ...resultBase, applied, deltas };
+    }
+  };
+}
+
+function targetOwnsRelation(target: RelationPatchTarget, relationName: string): boolean {
+  if (target.ownsRelation !== undefined) return target.ownsRelation(relationName);
+  if (target.relationNames !== undefined) return target.relationNames.includes(relationName);
+  return true;
+}
+
+function composeApplyStatus(
+  patchCount: number,
+  unroutedPatchCount: number,
+  results: readonly RelationApplyResult[]
+): RelationApplyStatus {
+  if (patchCount === 0) return 'accepted';
+  if (results.length === 0) return 'rejected';
+  if (unroutedPatchCount > 0) {
+    return results.some((result) => result.status !== 'rejected' || result.applied > 0) ? 'partial' : 'rejected';
+  }
+
+  if (results.every((result) => result.status === 'accepted')) return 'accepted';
+  return results.some((result) => result.status !== 'rejected' || result.applied > 0) ? 'partial' : 'rejected';
+}
+
+function composeApplyDurability(results: readonly RelationApplyResult[]): RelationApplyDurability | undefined {
+  const durabilities = results
+    .map((result) => result.durability)
+    .filter((durability): durability is RelationApplyDurability => durability !== undefined);
+  const first = durabilities[0];
+
+  return first !== undefined && durabilities.every((durability) => durability === first) ? first : undefined;
+}
+
+function composeRuntimeSubscribe(
+  runtimes: readonly RelationRuntime[]
+): ((listener: () => void) => () => void) | undefined {
+  const subscribedRuntimes = runtimes.filter(hasRuntimeSubscribe);
+  if (subscribedRuntimes.length === 0) return undefined;
+
+  return (listener) => {
+    const unsubscribers = subscribedRuntimes.map((runtime) => runtime.subscribe(listener));
+    let subscribed = true;
+
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      for (const unsubscribe of unsubscribers) unsubscribe();
+    };
+  };
+}
+
+function hasRuntimeSubscribe(
+  runtime: RelationRuntime
+): runtime is RelationRuntime & { readonly subscribe: (listener: () => void) => () => void } {
+  return runtime.subscribe !== undefined;
+}
+
+function unsupportedRuntimeTargetDiagnostic(relationName: string): TarstateDiagnostic {
+  return {
+    code: 'runtime_unsupported',
+    severity: 'warning',
+    message: `no composed relation runtime target owns relation "${relationName}"`,
+    relation: relationName,
+    surface: 'composeRelationRuntimes'
+  };
+}
 
 export type DbInputData = { readonly [relationName: string]: readonly unknown[] };
 export type DbData = { readonly [relationName: string]: readonly unknown[] };
@@ -1359,6 +1621,139 @@ function isExpr(input: unknown): input is ExprData {
 
 function aggregateCall<Value = unknown>(op: AggregateFunction, ...args: readonly unknown[]): ExprData<Value> {
   return { op: 'aggregateCall', fn: op, args };
+}
+
+const ALIASED_FIELD_RESERVED_KEYS = new Set<string>([
+  'kind',
+  'name',
+  'key',
+  'fields',
+  'ephemeral',
+  '__row',
+  'data',
+  'relations',
+  'alias',
+  '$'
+]);
+
+function defineAliasProperty(target: Record<string, unknown>, name: string, value: unknown): void {
+  Object.defineProperty(target, name, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: false
+  });
+}
+
+function aliasedFieldNames(input: AnyRelationRef | Query): readonly string[] {
+  if (isQuery(input)) return queryFieldNames(input);
+  return Object.keys(input.fields);
+}
+
+function queryFieldNames(query: Query): readonly string[] {
+  return queryDataFieldNames(query.data, query.relations);
+}
+
+function queryDataFieldNames(data: QueryData, relations: Readonly<Record<string, AnyRelationRef>>): readonly string[] {
+  switch (data.op) {
+    case 'from':
+    case 'lookup':
+      return typeof data.relation === 'string' ? relationFieldNames(relations[data.relation]) : [];
+    case 'constRows':
+      return rowFieldNames(data.rows);
+    case 'project':
+      return projectionFieldNames(data.projection);
+    case 'aggregate':
+      return uniqueStrings(projectionFieldNames(data.groupBy), projectionFieldNames(data.aggregates));
+    case 'extend':
+      return uniqueStrings(inputFieldNames(data, relations), projectionFieldNames(data.projection));
+    case 'where':
+    case 'hash':
+    case 'btree':
+    case 'keyBy':
+    case 'sort':
+    case 'limit':
+    case 'sortLimit':
+      return inputFieldNames(data, relations);
+    case 'join':
+      return uniqueStrings(nestedQueryFieldNames(data.left, relations), nestedQueryFieldNames(data.right, relations));
+    case 'union':
+    case 'intersection':
+      return Array.isArray(data.inputs)
+        ? uniqueStrings(...data.inputs.map((input) => nestedQueryFieldNames(input, relations)))
+        : [];
+    case 'difference':
+      return nestedQueryFieldNames(data.left, relations);
+    case 'without': {
+      const removed = new Set(stringArray(data.fields));
+      return inputFieldNames(data, relations).filter((fieldName) => !removed.has(fieldName));
+    }
+    case 'rename':
+      return renamedFieldNames(inputFieldNames(data, relations), data.fields);
+    case 'expand':
+      return uniqueStrings(
+        inputFieldNames(data, relations),
+        typeof data.as === 'string' ? [data.as] : [],
+        stringArray(data.fields)
+      );
+    case 'qualify':
+      return typeof data.alias === 'string' ? [data.alias] : [];
+    default:
+      return [];
+  }
+}
+
+function inputFieldNames(data: QueryData, relations: Readonly<Record<string, AnyRelationRef>>): readonly string[] {
+  return nestedQueryFieldNames(data.input, relations);
+}
+
+function nestedQueryFieldNames(data: unknown, relations: Readonly<Record<string, AnyRelationRef>>): readonly string[] {
+  const queryData = queryDataFrom(data);
+  return queryData === undefined ? [] : queryDataFieldNames(queryData, relations);
+}
+
+function queryDataFrom(data: unknown): QueryData | undefined {
+  return isRecord(data) && typeof data.op === 'string' ? data as QueryData : undefined;
+}
+
+function relationFieldNames(relationRef: unknown): readonly string[] {
+  return isRelationRef(relationRef) ? Object.keys(relationRef.fields) : [];
+}
+
+function projectionFieldNames(projection: unknown): readonly string[] {
+  return isRecord(projection) ? Object.keys(projection) : [];
+}
+
+function rowFieldNames(rows: unknown): readonly string[] {
+  return Array.isArray(rows)
+    ? uniqueStrings(...rows.map((rowValue) => isRecord(rowValue) ? Object.keys(rowValue) : []))
+    : [];
+}
+
+function renamedFieldNames(inputFields: readonly string[], fields: unknown): readonly string[] {
+  if (!isRecord(fields)) return inputFields;
+  return inputFields.map((fieldName) => {
+    const renamed = fields[fieldName];
+    return typeof renamed === 'string' ? renamed : fieldName;
+  });
+}
+
+function stringArray(input: unknown): readonly string[] {
+  return Array.isArray(input) && input.every((item) => typeof item === 'string') ? input : [];
+}
+
+function uniqueStrings(...groups: readonly (readonly string[])[]): readonly string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const group of groups) {
+    for (const item of group) {
+      if (!seen.has(item)) {
+        seen.add(item);
+        result.push(item);
+      }
+    }
+  }
+  return result;
 }
 
 function mergeRelations(inputs: readonly Query[]): Record<string, RelationRef> {

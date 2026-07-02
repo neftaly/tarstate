@@ -1,6 +1,6 @@
 import { createElement, type DependencyList } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { describe, expect, expectTypeOf, it } from 'vitest';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import {
   TarstateProvider,
   useCommit,
@@ -23,7 +23,7 @@ import {
   type UseViewOptions,
   type ViewHookState
 } from '@tarstate/react';
-import { createStore, type Store } from '@tarstate/core/store';
+import { createStore, type Store, type StoreView } from '@tarstate/core/store';
 import { as, from, pipe, project, type Query } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { insert } from '@tarstate/core/write';
@@ -91,6 +91,22 @@ describe('@tarstate/react future hook facade contract', () => {
     expectTypeOf<UseRowKeyOptions<ItemProjection, string>>().toMatchTypeOf<{
       readonly keyBy: (row: ItemProjection) => string;
     }>();
+    function TypeProbe() {
+      const byRelationKey = useRow(schema.items, 'item-a');
+      const byQueryPredicate = useRow(itemQuery, (row) => row.id === 'item-a');
+      const byQueryKey = useRow(itemQuery, 'item-a', { keyBy: (row) => row.id });
+      expectTypeOf(byRelationKey).toEqualTypeOf<RowHookState<ItemRow>>();
+      expectTypeOf(byQueryPredicate).toEqualTypeOf<RowHookState<ItemProjection>>();
+      expectTypeOf(byQueryKey).toEqualTypeOf<RowHookState<ItemProjection>>();
+      return null;
+    }
+    function InvalidTypeProbe() {
+      // @ts-expect-error relation keys must match the relation key value
+      useRow(schema.items, 1);
+      return null;
+    }
+    expect(TypeProbe).toBeTypeOf('function');
+    expect(InvalidTypeProbe).toBeTypeOf('function');
   });
 
   it('throws a clear error when hooks are used outside a provider', async () => {
@@ -205,6 +221,45 @@ describe('@tarstate/react future hook facade contract', () => {
     renderer?.unmount();
   });
 
+  it('does not reuse a provider-owned store after StrictMode effect cleanup closes it', async () => {
+    const closedStores = new WeakSet<Store>();
+    const patchedStores = new WeakSet<Store>();
+    const observedStores: Store[] = [];
+    let reusedClosedStore = false;
+
+    function Probe() {
+      const currentStore = useTarstateStore();
+      if (closedStores.has(currentStore)) {
+        reusedClosedStore = true;
+      }
+      observedStores.push(currentStore);
+      if (!patchedStores.has(currentStore)) {
+        patchedStores.add(currentStore);
+        const originalClose = currentStore.close;
+        (currentStore as { close: () => void }).close = () => {
+          closedStores.add(currentStore);
+          originalClose();
+        };
+      }
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    await act(async () => {
+      renderer = create(
+        createElement(TarstateProvider, { db: { items: [] } }, createElement(Probe)),
+        { unstable_strictMode: true } as unknown as Parameters<typeof create>[1]
+      );
+    });
+
+    expect(observedStores.length).toBeGreaterThan(0);
+    expect(reusedClosedStore).toBe(false);
+
+    await act(async () => {
+      renderer?.unmount();
+    });
+  });
+
   it('dedupes useView view creation by queryKey for inline query construction', async () => {
     const store = createStore({ items: [] });
     const seenViews: ViewHookState<ItemProjection>[] = [];
@@ -239,6 +294,65 @@ describe('@tarstate/react future hook facade contract', () => {
     expect(probe.byKey.row).toBeUndefined();
 
     probe.renderer.unmount();
+  });
+
+  it('looks up rows by declared relation key with useRow(relation, key)', async () => {
+    const viewedQueries: Query<unknown>[] = [];
+    const store = createStaticRowsStore<ItemRow>([
+      { id: 'item-a', label: 'Alpha' },
+      { id: 'item-b', label: 'Beta' }
+    ], viewedQueries);
+    let current: RowHookState<ItemRow> | undefined;
+
+    function Probe() {
+      current = useRow(schema.items, 'item-a');
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    await act(async () => {
+      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+
+    assertDefined(current);
+    expect(current.row).toEqual({ id: 'item-a', label: 'Alpha' });
+    expect(viewedQueries[0]).toEqual(from(schema.items));
+
+    renderer?.unmount();
+  });
+
+  it('memoizes useQuery select output for stable snapshots and selectors', async () => {
+    const store = createStaticRowsStore<ItemProjection>([
+      { id: 'item-a', label: 'Alpha' }
+    ]);
+    const select = vi.fn((rows: readonly ItemProjection[]) => rows.map((row) => row.label));
+    let current: QueryHookState<ItemProjection, readonly string[]> | undefined;
+
+    function Probe() {
+      current = useQuery(itemQuery, { select });
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    await act(async () => {
+      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+    assertDefined(current);
+    const firstState = current;
+    const firstData = current.data;
+    const firstResult = current.result;
+
+    await act(async () => {
+      renderer?.update(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+
+    assertDefined(current);
+    expect(select).toHaveBeenCalledTimes(1);
+    expect(current).toBe(firstState);
+    expect(current.data).toBe(firstData);
+    expect(current.result).toBe(firstResult);
+
+    renderer?.unmount();
   });
 
   it('closes provider-owned stores created from initial db on unmount', async () => {
@@ -351,4 +465,26 @@ function assertDefined<Value>(value: Value): asserts value is NonNullable<Value>
 
 function freshQueryIdentity<Row>(query: Query<Row>): Query<Row> {
   return Object.assign({}, query);
+}
+
+function createStaticRowsStore<Row>(rows: readonly Row[], viewedQueries: Query<unknown>[] = []): Store {
+  const base = createStore({});
+  return {
+    ...base,
+    view: <ViewRow,>(query: Query<ViewRow>): StoreView<ViewRow> => {
+      viewedQueries.push(query as Query<unknown>);
+      const view = base.view(query);
+      const snapshot = {
+        ...view.getSnapshot(),
+        diagnostics: [],
+        rows: rows as unknown as readonly ViewRow[]
+      };
+      return {
+        ...view,
+        getSnapshot: () => snapshot,
+        read: () => snapshot,
+        rows: () => snapshot.rows
+      };
+    }
+  };
 }

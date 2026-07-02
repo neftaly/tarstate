@@ -5,15 +5,17 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useSyncExternalStore,
   type DependencyList,
   type ReactElement,
   type ReactNode
 } from 'react';
-import type { Db } from '@tarstate/core/db';
-import { queryKey } from '@tarstate/core/query';
+import type { Db, RelationKeyValue } from '@tarstate/core/db';
+import { from, queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
+import type { RelationRef } from '@tarstate/core/schema';
 import {
   createStore,
   type Store,
@@ -83,31 +85,51 @@ export type UseRowKeyOptions<Row, Key> = UseViewOptions & {
   readonly keyBy: (row: Row) => Key;
 };
 
+type OwnedStoreState = {
+  readonly resetKey: string | number | undefined;
+  readonly seed: TarstateDbInput | undefined;
+  readonly store: Store;
+  closed: boolean;
+};
+
+type RelationRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
+
 const TarstateContext = createContext<Store | undefined>(undefined);
 const emptyDeps: DependencyList = Object.freeze([]);
 
 export function TarstateProvider({ children, db, resetKey, store }: TarstateProviderProps): ReactElement {
-  const ownedStore = useRef<{ readonly resetKey: string | number | undefined; readonly store: Store } | undefined>(undefined);
+  const ownedStore = useRef<OwnedStoreState | undefined>(undefined);
+  const [, refreshOwnedStore] = useReducer((version: number) => version + 1, 0);
 
   if (store === undefined) {
-    if (ownedStore.current === undefined || !Object.is(ownedStore.current.resetKey, resetKey)) {
-      ownedStore.current = { resetKey, store: createStore(db) };
+    if (ownedStore.current === undefined || ownedStore.current.closed || !Object.is(ownedStore.current.resetKey, resetKey)) {
+      ownedStore.current = createOwnedStore(db, resetKey);
     }
   } else {
     ownedStore.current = undefined;
   }
 
-  const activeStore = store ?? ownedStore.current?.store;
+  const activeOwnedStore = store === undefined ? ownedStore.current : undefined;
+  const activeStore = store ?? activeOwnedStore?.store;
 
   useEffect(() => {
-    if (store !== undefined || activeStore === undefined) {
+    if (store !== undefined || activeOwnedStore === undefined) {
+      return;
+    }
+
+    if (activeOwnedStore.closed) {
+      if (ownedStore.current === activeOwnedStore) {
+        ownedStore.current = createOwnedStore(activeOwnedStore.seed, activeOwnedStore.resetKey);
+        refreshOwnedStore();
+      }
       return;
     }
 
     return () => {
-      activeStore.close();
+      activeOwnedStore.closed = true;
+      activeOwnedStore.store.close();
     };
-  }, [activeStore, store]);
+  }, [activeOwnedStore, store]);
 
   return createElement(TarstateContext.Provider, { value: activeStore }, children);
 }
@@ -165,20 +187,29 @@ export function useRow<Row>(
   predicate: (row: Row) => boolean,
   options?: UseViewOptions
 ): RowHookState<Row>;
+export function useRow<Relation extends RelationRef>(
+  relation: Relation,
+  key: RelationKeyValue<Relation>,
+  options?: UseViewOptions
+): RowHookState<RelationRow<Relation>>;
 export function useRow<Row, Key>(
   query: Query<Row>,
   key: Key,
   options: UseRowKeyOptions<Row, Key>
 ): RowHookState<Row>;
 export function useRow<Row, Key>(
-  query: Query<Row>,
+  queryOrRelation: Query<Row> | RelationRef,
   keyOrPredicate: Key | ((row: Row) => boolean),
   options: UseViewOptions | UseRowKeyOptions<Row, Key> = {}
 ): RowHookState<Row> {
+  const relation = isRelationRef(queryOrRelation) ? queryOrRelation : undefined;
+  const query = (relation === undefined ? queryOrRelation : from(relation)) as Query<Row>;
   const view = useView(query, options);
-  const predicate = typeof keyOrPredicate === 'function' && !hasKeyBy(options)
+  const predicate = relation === undefined && typeof keyOrPredicate === 'function' && !hasKeyBy(options)
     ? keyOrPredicate as (row: Row) => boolean
-    : (row: Row) => Object.is((options as UseRowKeyOptions<Row, Key>).keyBy(row), keyOrPredicate);
+    : relation === undefined
+      ? (row: Row) => Object.is((options as UseRowKeyOptions<Row, Key>).keyBy(row), keyOrPredicate)
+      : (row: Row) => relationKeyMatches(relation, row, keyOrPredicate);
   const row = view.rows.find(predicate);
 
   return {
@@ -206,23 +237,32 @@ export function useQuery<Row, Selected>(
   options: UseQueryOptions<Row, Selected> = {}
 ): QueryHookState<Row, readonly Row[] | Selected> {
   const view = useView(query, options);
-  const result: StoreQueryResult<Row> = {
-    rows: view.rows,
-    diagnostics: view.diagnostics,
-    revision: view.revision
-  };
-  const data = options.select === undefined ? view.rows : options.select(view.rows, result);
+  const { select } = options;
+  const snapshot = view.snapshot;
+  const result = useMemo<StoreQueryResult<Row>>(() => ({
+    rows: snapshot.rows,
+    diagnostics: snapshot.diagnostics,
+    revision: snapshot.revision
+  }), [snapshot]);
+  const data = useMemo<readonly Row[] | Selected>(
+    () => select === undefined ? snapshot.rows : select(snapshot.rows, result),
+    [snapshot, select, result]
+  );
 
-  return {
+  return useMemo<QueryHookState<Row, readonly Row[] | Selected>>(() => ({
     status: view.status,
-    rows: view.rows,
+    rows: snapshot.rows,
     data,
-    diagnostics: view.diagnostics,
-    queryKey: view.queryKey,
-    revision: view.revision,
+    diagnostics: snapshot.diagnostics,
+    queryKey: snapshot.queryKey,
+    revision: snapshot.revision,
     refresh: view.refresh,
     result
-  };
+  }), [data, result, snapshot, view.refresh, view.status]);
+}
+
+function createOwnedStore(seed: TarstateDbInput | undefined, resetKey: string | number | undefined): OwnedStoreState {
+  return { resetKey, seed, store: createStore(seed), closed: false };
 }
 
 function useDependencyVersion(deps: DependencyList): number {
@@ -301,4 +341,35 @@ function shallowEqualDeps(left: DependencyList, right: DependencyList): boolean 
 
 function hasKeyBy<Row, Key>(options: UseViewOptions | UseRowKeyOptions<Row, Key>): options is UseRowKeyOptions<Row, Key> {
   return 'keyBy' in options;
+}
+
+function isRelationRef(input: unknown): input is RelationRef {
+  return isRecord(input) && input.kind === 'relation' && typeof input.name === 'string';
+}
+
+function relationKeyMatches(relation: RelationRef, row: unknown, key: unknown): boolean {
+  if (!isRecord(row)) {
+    return false;
+  }
+  const relationKey = relation.key as string | readonly string[];
+  const keyFields = relationKeyFields(relation);
+  if (!Array.isArray(relationKey)) {
+    const [fieldName] = keyFields;
+    return fieldName !== undefined && Object.is(row[fieldName], key);
+  }
+  return Array.isArray(key)
+    && key.length === keyFields.length
+    && keyFields.every((fieldName, index) => Object.is(row[fieldName], key[index]));
+}
+
+function relationKeyFields(relation: RelationRef): readonly string[] {
+  const key = relation.key as string | readonly string[];
+  if (Array.isArray(key)) {
+    return key;
+  }
+  return [key as string];
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null;
 }

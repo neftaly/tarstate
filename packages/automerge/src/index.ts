@@ -10,11 +10,16 @@ import { composeRelationRuntimes } from '@tarstate/core/adapter';
 import type { RelationRef } from '@tarstate/core/schema';
 import type { WritePatch } from '@tarstate/core/write';
 
-export type AutomergeMapPath = readonly string[];
+export type AutomergeMapPath<
+  DocumentShape extends object = Record<string, unknown>
+> = readonly [keyof DocumentShape & string, ...string[]];
 
-export type AutomergeMapRelation<Relation extends RelationRef = RelationRef> = {
+export type AutomergeMapRelation<
+  Relation extends RelationRef = RelationRef,
+  DocumentShape extends object = Record<string, unknown>
+> = {
   readonly relation: Relation;
-  readonly path: AutomergeMapPath;
+  readonly path: AutomergeMapPath<DocumentShape>;
 };
 
 export type AutomergeMapStorageCodec = 'map-v1';
@@ -27,25 +32,29 @@ export type AutomergeMapAdapterOptions<
   DocumentShape extends object = Record<string, unknown>
 > = {
   readonly doc: Automerge.Doc<DocumentShape>;
-  readonly relations: readonly AutomergeMapRelation[];
+  readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
   readonly onDocChange?: (doc: Automerge.Doc<DocumentShape>) => void;
   readonly changeMessage?: string | ((patches: readonly WritePatch[]) => string | undefined);
   readonly storage?: AutomergeMapStorageOptions;
 };
 
-export type AutomergeMapSourceOptions = {
-  readonly relations: readonly AutomergeMapRelation[];
+export type AutomergeMapSourceOptions<
+  DocumentShape extends object = Record<string, unknown>
+> = {
+  readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
 };
 
 export type AutomergeMapSource = AdapterSource<Automerge.Heads>;
+export type AutomergeComposedRuntimeVersion<RuntimeVersion = unknown> =
+  readonly [Automerge.Heads, ...RuntimeVersion[]];
 export type AutomergeRuntimeVersion<RuntimeVersion = unknown> =
   | Automerge.Heads
-  | readonly (Automerge.Heads | RuntimeVersion)[];
+  | AutomergeComposedRuntimeVersion<RuntimeVersion>;
 
 export type AutomergeMapAdapter<
   DocumentShape extends object = Record<string, unknown>
 > = RelationRuntime<Automerge.Heads> & {
-  readonly relations: readonly AutomergeMapRelation[];
+  readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
   readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
   readonly snapshot: () => AdapterSnapshot<Automerge.Heads>;
@@ -87,7 +96,7 @@ export function automergeMapSource<
   DocumentShape extends object = Record<string, unknown>
 >(
   doc: Automerge.Doc<DocumentShape>,
-  options: AutomergeMapSourceOptions
+  options: AutomergeMapSourceOptions<DocumentShape>
 ): AutomergeMapSource {
   const relationNames = relationNamesFor(options.relations);
 
@@ -187,9 +196,9 @@ export function createAutomergeMapRuntime<
 ): AutomergeMapRuntime<DocumentShape, RuntimeVersion> {
   const adapter = automergeMapAdapter<DocumentShape>(options);
   const runtimes = options.runtimes ?? [];
-  const runtime = runtimes.length === 0
-    ? adapter as RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>>
-    : composeRelationRuntimes(adapter, ...runtimes) as RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>>;
+  const runtime: RelationRuntime<AutomergeRuntimeVersion<RuntimeVersion>> = runtimes.length === 0
+    ? adapter
+    : composeRelationRuntimes(adapter, ...runtimes);
   const relations = uniqueRelations([
     ...options.relations.map((mapping) => mapping.relation),
     ...runtimes.flatMap(runtimeRelations)
@@ -204,7 +213,9 @@ export function createAutomergeMapRuntime<
   };
 }
 
-function relationNamesFor(relations: readonly AutomergeMapRelation[]): readonly string[] {
+function relationNamesFor<DocumentShape extends object>(
+  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[]
+): readonly string[] {
   return Array.from(new Set(relations.map((mapping) => mapping.relation.name)));
 }
 
