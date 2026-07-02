@@ -1,8 +1,8 @@
 import * as Automerge from '@automerge/automerge';
 import { createElement, useMemo, useState, type ReactElement } from 'react';
-import { automergeDb, type AutomergeDb } from '@tarstate/automerge';
+import { createAutomergeMapRuntime, type AutomergeMapRuntime } from '@tarstate/automerge';
 import { check, constrain, fk, req, unique } from '@tarstate/core/constraints';
-import { db, qRows, type Db } from '@tarstate/core/db';
+import { createDb, qRows, type Db } from '@tarstate/core/db';
 import { mat, materializeSnapshot } from '@tarstate/core/materialization';
 import {
   aggregate,
@@ -12,7 +12,6 @@ import {
   btree,
   count,
   desc,
-  env,
   eq,
   field,
   from,
@@ -44,6 +43,7 @@ import {
 } from '@tarstate/core/schema';
 import {
   createStore,
+  createRuntimeStore,
   type Store,
   type StoreCommitInput,
   type StoreCommitResult
@@ -54,8 +54,7 @@ import {
   TarstateProvider,
   useCommit,
   useQuery,
-  useView,
-  useWatch
+  useView
 } from '@tarstate/react';
 
 export type PriceBand = 'low' | 'med' | 'high' | 'premium';
@@ -241,7 +240,8 @@ export type RealEstateDocument = {
 };
 
 export type AutomergeRealEstateBacking = {
-  readonly relic: AutomergeDb<RealEstateDocument>;
+  readonly runtime: AutomergeMapRuntime<RealEstateDocument>;
+  readonly store: Store;
   readonly beforeHeads: readonly string[];
 };
 
@@ -721,7 +721,7 @@ offer |> join(latest, same property/buyer/date)`
 
 export function createRealEstateDb(input: Db['data'] = seedRealEstateData()): Db {
   return mat(
-    db(input),
+    createDb(input),
     constrain(
       req(offerConstraintRowsQuery, 'propertyId'),
       req(offerConstraintRowsQuery, 'buyerId'),
@@ -757,17 +757,18 @@ export async function createRealEstateModel(): Promise<RealEstateModel> {
 
 export function createAutomergeRealEstateBacking(): AutomergeRealEstateBacking {
   const seed = seedRealEstateData();
-  const relic = automergeDb<RealEstateDocument>(Automerge.from<RealEstateDocument>({
-    market: {
-      agents: rowsById(seed.agents ?? []),
-      buyers: rowsById(seed.buyers ?? []),
-      properties: rowsById(seed.properties ?? []),
-      rooms: rowsById(seed.rooms ?? []),
-      offers: rowsById(seed.offers ?? []),
-      decisions: rowsById(seed.decisions ?? []),
-      commissionRates: rowsById(seed.commissionRates ?? [])
-    }
-  }), {
+  const runtime = createAutomergeMapRuntime<RealEstateDocument>({
+    doc: Automerge.from<RealEstateDocument>({
+      market: {
+        agents: rowsById(seed.agents ?? []),
+        buyers: rowsById(seed.buyers ?? []),
+        properties: rowsById(seed.properties ?? []),
+        rooms: rowsById(seed.rooms ?? []),
+        offers: rowsById(seed.offers ?? []),
+        decisions: rowsById(seed.decisions ?? []),
+        commissionRates: rowsById(seed.commissionRates ?? [])
+      }
+    }),
     relations: [
       { relation: realEstateSchema.agents, path: ['market', 'agents'] },
       { relation: realEstateSchema.buyers, path: ['market', 'buyers'] },
@@ -778,10 +779,12 @@ export function createAutomergeRealEstateBacking(): AutomergeRealEstateBacking {
       { relation: realEstateSchema.commissionRates, path: ['market', 'commissionRates'] }
     ]
   });
+  const store = createRuntimeStore({ runtime, relations: runtime.relations });
 
   return {
-    relic,
-    beforeHeads: Automerge.getHeads(relic.getDoc())
+    runtime,
+    store,
+    beforeHeads: Automerge.getHeads(runtime.adapter.getDoc())
   };
 }
 
@@ -794,34 +797,28 @@ export function buildPlaygroundQuery(
   let query = example.query;
 
   if (active.has('agentId') && hasFilterValue(filters.agentId)) {
-    query = pipe(query, where(eq(row.agentId, env('agentId'))));
+    query = pipe(query, where(eq(row.agentId, value(filters.agentId))));
   }
   if (active.has('areaCode') && hasFilterValue(filters.areaCode)) {
-    query = pipe(query, where(eq(row.areaCode, env('areaCode'))));
+    query = pipe(query, where(eq(row.areaCode, value(filters.areaCode))));
   }
   if (active.has('priceBand') && hasFilterValue(filters.priceBand)) {
-    query = pipe(query, where(eq(row.priceBand, env('priceBand'))));
+    query = pipe(query, where(eq(row.priceBand, value(filters.priceBand))));
   }
   if (active.has('buyerId') && hasFilterValue(filters.buyerId)) {
-    query = pipe(query, where(eq(row.buyerId, env('buyerId'))));
+    query = pipe(query, where(eq(row.buyerId, value(filters.buyerId))));
   }
   if (active.has('listingState') && hasFilterValue(filters.listingState)) {
-    query = pipe(query, where(eq(row.listingState, env('listingState'))));
+    query = pipe(query, where(eq(row.listingState, value(filters.listingState))));
   }
   if (active.has('minPrice') && typeof filters.minPrice === 'number') {
-    query = pipe(query, where(gte(row.price, env('minPrice'))));
+    query = pipe(query, where(gte(row.price, value(filters.minPrice))));
   }
   if (active.has('maxPrice') && typeof filters.maxPrice === 'number') {
-    query = pipe(query, where(lte(row.price, env('maxPrice'))));
+    query = pipe(query, where(lte(row.price, value(filters.maxPrice))));
   }
 
   return query;
-}
-
-export function playgroundEnvForFilters(filters: PlaygroundFilters): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(filters).filter(([, item]) =>
-    item !== undefined && item !== '' && item !== 'all'
-  ));
 }
 
 export function runPlaygroundQuery(
@@ -829,9 +826,7 @@ export function runPlaygroundQuery(
   queryId: QueryExampleId,
   filters: PlaygroundFilters = {}
 ): readonly PlaygroundRow[] {
-  return qRows(currentDb, buildPlaygroundQuery(queryId, filters), {
-    env: playgroundEnvForFilters(filters)
-  });
+  return qRows(currentDb, buildPlaygroundQuery(queryId, filters));
 }
 
 export async function runAcceptHarbourOfferTransaction(
@@ -899,7 +894,7 @@ export function invalidOfferAfterAcceptedInputs(): StoreCommitInput {
 export async function runAutomergeListingRows(
   backing: AutomergeRealEstateBacking
 ): Promise<readonly ListingRow[]> {
-  const snapshot = await backing.relic.getSnapshot();
+  const snapshot = backing.store.getSnapshot();
   return qRows(snapshot.db, listingRowsQuery);
 }
 
@@ -939,15 +934,12 @@ export function RealEstateWalkthrough({
   const [diagnostics, setDiagnostics] = useState<readonly ReadableDiagnostic[]>([]);
   const [automergeRows, setAutomergeRows] = useState<readonly ListingRow[]>([]);
   const example = queryExampleById(queryId);
-  const envValues = useMemo(() => playgroundEnvForFilters(filters), [filters]);
   const playgroundQuery = useMemo(() => buildPlaygroundQuery(queryId, filters), [queryId, filters]);
   const playground = useQuery(playgroundQuery, {
-    env: envValues,
     deps: [queryId, filters.agentId, filters.areaCode, filters.priceBand, filters.buyerId, filters.listingState, filters.minPrice, filters.maxPrice]
   });
   const materializedListings = useView(listingRowsQuery);
   const materializedCommission = useView(commissionDueQuery);
-  const watch = useWatch(listingRowsQuery, undefined, { keyBy: ['id'] });
   const seed = seedRealEstateData();
 
   const runTransaction = async (
@@ -992,7 +984,7 @@ export function RealEstateWalkthrough({
     section(
       'playground',
       '2. Query playground',
-      'Pick a query, set env filters, and read the result table.',
+      'Pick a query, set filters, and read the result table.',
       codeBlock(example.snippet),
       controlsPanel(queryId, setQueryId, filters, setFilters),
       resultTable(example.columns, playground.rows, { table: 'playground' })
@@ -1045,23 +1037,23 @@ await commit(insert(schema.decisions, {
       diagnosticsList(diagnostics)
     ),
     section(
-      'watch',
-      '6. Watch',
-      'useWatch tracks the latest changed listing rows across transactions.',
-      codeBlock(`const watch = useWatch(listingRowsQuery, undefined, {
-  keyBy: ['id']
-});`),
+      'react',
+      '6. React views',
+      'React reads subscribe to store views through useSyncExternalStore.',
+      codeBlock(`const listings = useView(listingRowsQuery);
+const commission = useView(commissionDueQuery);`),
       metricGrid(
-        metric('Watch changed', watch.event?.changed ? 'yes' : 'no'),
-        metric('Watch added', watch.event?.added.map((item) => item.id).join(', ') || 'none'),
-        metric('Watch removed', watch.event?.removed.map((item) => item.id).join(', ') || 'none')
+        metric('Listing revision', materializedListings.revision),
+        metric('Commission revision', materializedCommission.revision)
       )
     ),
     section(
       'automerge',
       '7. Automerge',
       'The listing query runs against an Automerge-backed snapshot without changing query shape.',
-      codeBlock(`const snapshot = await automergeDb(doc, { relations }).getSnapshot();
+      codeBlock(`const runtime = createAutomergeMapRuntime({ doc, relations });
+const store = createRuntimeStore({ runtime, relations: runtime.relations });
+const snapshot = store.getSnapshot();
 const rows = qRows(snapshot.db, listingRowsQuery);`),
       metricGrid(
         metric('Automerge heads', automerge.beforeHeads.length),

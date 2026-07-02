@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  call,
   constRows,
-  hostCall,
   hostFn,
   pipe,
   project,
@@ -15,8 +15,8 @@ describe('queryKey host function contracts', () => {
   it('rejects raw functions instead of silently aliasing them', () => {
     const first = () => 'first';
     const second = () => 'second';
-    const firstQuery: QueryData = { op: 'hostCall', fn: first, args: [] };
-    const secondQuery: QueryData = { op: 'hostCall', fn: second, args: [] };
+    const firstQuery: QueryData = { op: 'call', fn: first, args: [] };
+    const secondQuery: QueryData = { op: 'call', fn: second, args: [] };
 
     expect(() => queryKey(firstQuery)).toThrow(QueryKeyError);
     expect(() => queryKey(secondQuery)).toThrow(QueryKeyError);
@@ -29,9 +29,9 @@ describe('queryKey host function contracts', () => {
     const otherName = hostFn('text.initial', (input) => String(input).slice(0, 1));
 
     const base = constRows([{ title: 'Hello World' }]);
-    const firstQuery = pipe(base, project({ slug: hostCall(byNameA, value('Hello World')) }));
-    const secondQuery = pipe(base, project({ slug: hostCall(byNameB, value('Hello World')) }));
-    const thirdQuery = pipe(base, project({ slug: hostCall(otherName, value('Hello World')) }));
+    const firstQuery = pipe(base, project({ slug: call(byNameA, value('Hello World')) }));
+    const secondQuery = pipe(base, project({ slug: call(byNameB, value('Hello World')) }));
+    const thirdQuery = pipe(base, project({ slug: call(otherName, value('Hello World')) }));
 
     expect(queryKey(firstQuery)).toBe(queryKey(secondQuery));
     expect(queryKey(firstQuery)).not.toBe(queryKey(thirdQuery));

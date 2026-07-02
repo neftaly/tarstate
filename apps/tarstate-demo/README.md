@@ -15,8 +15,8 @@ The demo uses one normalized real-estate sales dataset:
 It shows query values for property info, current offers, accepted sales, unsold
 listings, open offers, and commission due by agent. The page keeps the focus on
 controls, query snippets, result tables, materialized reads, transactions,
-diagnostics, watch events, and running the same listing query over an
-`automergeDb` snapshot.
+diagnostics, React store views, and running the same listing query over an
+Automerge-backed runtime snapshot.
 
 Run locally:
 

@@ -2,15 +2,15 @@ import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { isRelationRuntime } from '@tarstate/core/adapter';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
+import { createRuntimeStore } from '@tarstate/core/store';
 import { write } from '@tarstate/core/write';
 import {
-  automergeDb,
-  automergeDbRelationRuntime,
   automergeMapAdapter,
   automergeMapSource,
-  type AutomergeDb,
-  type AutomergeDbVersion,
+  createAutomergeMapRuntime,
+  withAutomergeRuntimeRelations,
   type AutomergeMapAdapter,
+  type AutomergeMapRuntime,
   type AutomergeMapSource
 } from '@tarstate/automerge';
 
@@ -33,27 +33,30 @@ const taskMapping = [{ relation: schema.tasks, path: ['workspace', 'tasks'] }] a
 const tasks = write(schema.tasks);
 
 describe('automerge public adapter contract', () => {
-  it('preserves root exports and typed facade shapes', async () => {
+  it('preserves root exports and typed runtime shapes', async () => {
     const api = await import('@tarstate/automerge');
     const doc = Automerge.from<Record<string, unknown>>({});
     const adapter = automergeMapAdapter({ doc, relations: taskMapping });
     const source = automergeMapSource(doc, { relations: taskMapping });
-    const db = automergeDb(doc, { relations: taskMapping });
+    const runtime = createAutomergeMapRuntime({ doc, relations: taskMapping });
 
-    expect(api.automergeDb).toBe(automergeDb);
-    expect(api.automergeDbRelationRuntime).toBe(automergeDbRelationRuntime);
     expect(api.automergeMapAdapter).toBe(automergeMapAdapter);
     expect(api.automergeMapSource).toBe(automergeMapSource);
+    expect(api.createAutomergeMapRuntime).toBe(createAutomergeMapRuntime);
+    expect(api.withAutomergeRuntimeRelations).toBe(withAutomergeRuntimeRelations);
+    expect('automergeDb' in api).toBe(false);
+    expect('automergeDbRelationRuntime' in api).toBe(false);
     expect(isRelationRuntime(adapter)).toBe(true);
-    expect(db.kind).toBe('automergeDb');
+    expect(isRelationRuntime(runtime)).toBe(true);
+    expect(runtime.kind).toBe('automergeMapRuntime');
+    expect(runtime.adapter.getDoc()).toBe(doc);
     expectTypeOf(adapter).toMatchTypeOf<AutomergeMapAdapter>();
     expectTypeOf(source).toMatchTypeOf<AutomergeMapSource>();
-    expectTypeOf(automergeDb<Record<string, unknown>>).returns.toMatchTypeOf<AutomergeDb<Record<string, unknown>>>();
-    expectTypeOf<Awaited<ReturnType<typeof db.getSnapshot>>['version']>().toMatchTypeOf<AutomergeDbVersion | undefined>();
+    expectTypeOf(createAutomergeMapRuntime<Record<string, unknown>>).returns.toMatchTypeOf<AutomergeMapRuntime<Record<string, unknown>>>();
   });
 
   it('keeps Automerge pluggable through relation runtime metadata', () => {
-    const runtime = automergeDbRelationRuntime({
+    const runtime = withAutomergeRuntimeRelations({
       source: {
         relationNames: ['tasks'],
         rows: () => [{ id: 'task-a', title: 'from optional runtime' }]
@@ -83,27 +86,21 @@ describe('automerge public adapter contract', () => {
     expect(adapter.source.rows(schema.tasks)).toEqual([]);
   });
 
-  it('exposes a compiling DB facade over an empty core snapshot', async () => {
-    const relic = automergeDb(Automerge.from<Record<string, unknown>>({}), {
-      relations: taskMapping,
-      env: { tenant: 'acme' }
+  it('creates a runtime that plugs into the core store surface', async () => {
+    const runtime = createAutomergeMapRuntime({
+      doc: Automerge.from<Record<string, unknown>>({}),
+      relations: taskMapping
     });
-    const snapshot = await relic.getSnapshot();
-    const result = await relic.tryTransact(tasks.insert({ id: 'task-a', title: 'rewrite target' }));
+    const store = createRuntimeStore({ runtime, relations: runtime.relations, env: { tenant: 'acme' } });
+    const snapshot = store.getSnapshot();
+    const result = await store.commit(tasks.insert({ id: 'task-a', title: 'rewrite target' }));
 
-    expect(snapshot.db.env).toEqual({ tenant: 'acme' });
     expect(snapshot.db.data).toEqual({});
-    expect(snapshot.diagnostics).toEqual([expect.objectContaining({ code: 'not_implemented' })]);
+    expect(runtime.adapter.source.diagnostics?.()).toEqual([expect.objectContaining({ code: 'not_implemented' })]);
     expect(result).toMatchObject({
-      kind: 'automergeDbTransaction',
-      committed: false,
-      patches: 1,
-      applied: 0,
+      kind: 'tarstateCommit',
+      status: 'rejected',
       diagnostics: [expect.objectContaining({ code: 'not_implemented' })]
-    });
-    await expect(relic.q(schema.tasks)).resolves.toMatchObject({
-      rows: [],
-      diagnostics: []
     });
   });
 });

@@ -280,13 +280,9 @@ export function relationDependencies(_input: QueryKeyInput): readonly string[] {
   return [];
 }
 
-export const dependencies = relationDependencies;
-
 export function queryRowKeyFields(_input: QueryKeyInput): readonly string[] | undefined {
   return undefined;
 }
-
-export const rowKeyFields = queryRowKeyFields;
 
 export function as<Row extends object, Alias extends string>(relationRef: RelationRef<Row>, alias: Alias): AliasedRelationRef<Row, Alias>;
 export function as<Row, Alias extends string>(query: Query<Row>, alias: Alias): AliasedQuery<Row, Alias>;
@@ -324,10 +320,6 @@ export function hostFn<Value = unknown>(name: string, fn: HostExpressionFunction
 
 export function call<Value = unknown>(fn: HostFunction<Value>, ...args: readonly ExprInput[]): ExprData<Value> {
   return { op: 'call', fn, args };
-}
-
-export function hostCall<Value = unknown>(fn: HostFunction<Value>, ...args: readonly ExprInput[]): ExprData<Value> {
-  return { op: 'hostCall', fn, args };
 }
 
 export function maybe<Value>(expr: ExprData<Value>): ExprData<Value | undefined> {
@@ -500,9 +492,6 @@ export function rowDiffKey<Row>(row: Row, options: RowDiffOptions<Row> = {}): st
   if (Array.isArray(options.keyBy) && isRecord(row)) return JSON.stringify(options.keyBy.map((fieldName) => row[fieldName]));
   return JSON.stringify(row);
 }
-
-export const stableValue = (value: unknown): unknown => value;
-export const stableRowKey = rowDiffKey;
 
 export type RelationLookup = {
   readonly relation: RelationRef;
@@ -693,11 +682,9 @@ export class DbTransactionError extends Error {
 export function createDb(data: DbInputData = {}, options: DbInputEnv | DbOptions = EMPTY_DB_ENV): Db {
   return { data, env: dbEnvFromOptions(options) };
 }
-export const db = createDb;
 export const dbSource = (input: Db): RelationSource => fromObjectSource(input.data);
 export const stripMeta = <Input>(input: Input): Input extends Db ? DbData : Input => (isDb(input) ? input.data : input) as never;
 export const withEnv = (input: Db, envValue: DbInputEnv): Db => ({ ...input, env: envValue });
-export const forkDb = (input: Db): Db => ({ data: input.data, env: input.env });
 export const getEnv = (input: Db): DbEnv => input.env;
 export const updateEnv = (input: Db, update: (env: DbEnv) => DbInputEnv): Db => withEnv(input, update(input.env));
 export const setEnvTx = (envValue: DbEnvUpdate): SetEnvTransaction => ({ op: 'setEnv', env: envValue });
@@ -746,12 +733,6 @@ export function transact(inputDb: Db, inputOrInputs: DbTransactionInput | DbTran
 }
 export function tryTransact(inputDb: Db, ...inputs: DbTransactionInputs): DbTransactionResult {
   return { db: inputDb, patches: inputs.length, applied: 0, deltas: [], diagnostics: [stubDiagnostic('tryTransact')], committed: false };
-}
-export function tryTransactWithConstraints(inputDb: Db, ...inputs: DbTransactionInputs): DbTransactionResult {
-  return tryTransact(inputDb, ...inputs);
-}
-export function transactionPlan(inputs: DbTransactionInputs): DbTransactionPlan {
-  return { inputs, patches: [], diagnostics: [stubDiagnostic('transactionPlan')] };
 }
 function normalizeTransactionInputs(inputOrInputs: DbTransactionInput | DbTransactionInputs): DbTransactionInputs {
   return (Array.isArray(inputOrInputs) ? inputOrInputs : [inputOrInputs]) as DbTransactionInputs;
@@ -900,10 +881,8 @@ export const constrain = (...constraints: readonly ConstraintData[]): Constraint
 export const attachConstraints = <DbValue extends Db>(dbValue: DbValue, constraints: ConstraintSet): DbValue & ConstrainedDb => ({ ...dbValue, constraints });
 export const detachConstraints = <DbValue extends Db>(dbValue: DbValue): DbValue => dbValue;
 export const attachedConstraintsFor = (dbValue: Partial<ConstrainedDb>): ConstraintSet => dbValue.constraints ?? [];
-export const constraintAttachmentsFor = attachedConstraintsFor;
 export const hasAttachedConstraints = (dbValue: Partial<ConstrainedDb>): boolean => attachedConstraintsFor(dbValue).length > 0;
 export const validateConstraints = async (): Promise<ConstraintValidationResult> => ({ valid: false, diagnostics: [stubDiagnostic('validateConstraints')] });
-export const validateAttachedConstraints = validateConstraints;
 export const tryTransactConstrained = (dbValue: Db, ...inputs: DbTransactionInputs): DbTransactionResult => tryTransact(dbValue, ...inputs);
 export const transactConstrained = (dbValue: Db, ...inputs: DbTransactionInputs): Db => transact(dbValue, inputs);
 
@@ -1014,21 +993,14 @@ export const materializationsFor = (_input: unknown): readonly MaterializationMe
 export const materializationForQuery = <Row = unknown>(_input: unknown, _query: Query<Row>): MaterializationMetadata<Row> | undefined => undefined;
 export const materializedRowsFor = <Row = unknown>(_input: unknown, _id: string): readonly Row[] | undefined => undefined;
 export const materializedRowsForQuery = <Row = unknown>(_input: unknown, _query: Query<Row>): readonly Row[] | undefined => undefined;
-export const queryRowsFromMaterialization = materializedRowsForQuery;
 export function readMaterializedQuery<Row>(_input: unknown, _query: Query<Row>): MaterializedQueryResult<Row> {
   throw notImplemented('readMaterializedQuery');
 }
 export const materializedSourceFor = (_input: unknown): RelationSource | undefined => undefined;
 export const materializedLookupRowsFor = (): readonly unknown[] | undefined => undefined;
-export const refreshMaterializationSnapshot = materializeSnapshot;
-export const refreshMaterialization = materializeSnapshot;
 export const maintainMaterializationSnapshots = (): MaterializationMaintenanceResult => emptyMaintenance();
-export const maintainMaterializations = maintainMaterializationSnapshots;
 export const explainMaterialization = <Row>(query: Query<Row>): MaterializationExplanation<Row> => ({ query, supported: false, diagnostics: [stubDiagnostic('explainMaterialization')] });
 export const index = <Row = unknown>(): MaterializationIndex<Row> => ({});
-export const snapshotIndex = index;
-export const snapshotHashIndex = index;
-export const evaluateDbQueryRows = qRows;
 
 export type MemoryRelationRuntimeOptions = { readonly relationNames?: readonly string[] };
 export function createMemoryRelationRuntime(data: DbInputData = {}, options: MemoryRelationRuntimeOptions = {}): RelationRuntime<number> {
@@ -1393,7 +1365,7 @@ function arrayify(input: ConstraintRelationFields): readonly string[] {
 }
 
 function emptyMaintenance(): MaterializationMaintenanceResult {
-  return { kind: 'materializationMaintenance', maintained: 0, recomputed: 0, carried: 0, skipped: 0, changes: [], diagnostics: [stubDiagnostic('maintainMaterializations')] };
+  return { kind: 'materializationMaintenance', maintained: 0, recomputed: 0, carried: 0, skipped: 0, changes: [], diagnostics: [stubDiagnostic('maintainMaterializationSnapshots')] };
 }
 
 function isRelationRef(input: unknown): input is RelationRef {

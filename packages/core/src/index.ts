@@ -49,7 +49,6 @@ export {
   gt,
   gte,
   hash,
-  hostCall,
   hostFn,
   intersection,
   join,

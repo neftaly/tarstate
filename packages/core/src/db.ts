@@ -1,10 +1,8 @@
 export {
   DbTransactionError,
   createDb,
-  db,
   dbSource,
   exists,
-  forkDb,
   getEnv,
   q,
   qMany,
@@ -14,9 +12,7 @@ export {
   setEnvTx,
   stripMeta,
   transact,
-  transactionPlan,
   tryTransact,
-  tryTransactWithConstraints,
   updateEnv,
   whatIf,
   withEnv

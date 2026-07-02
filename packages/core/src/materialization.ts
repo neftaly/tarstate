@@ -1,10 +1,8 @@
 export {
   demat,
-  evaluateDbQueryRows,
   explainMaterialization,
   index,
   isMaterialized,
-  maintainMaterializations,
   maintainMaterializationSnapshots,
   mat,
   materializationForQuery,
@@ -14,12 +12,7 @@ export {
   materializedRowsForQuery,
   materializedSourceFor,
   materializeSnapshot,
-  queryRowsFromMaterialization,
   readMaterializedQuery,
-  refreshMaterialization,
-  refreshMaterializationSnapshot,
-  snapshotHashIndex,
-  snapshotIndex
 } from './stub.js';
 export type {
   MaterializableDb,

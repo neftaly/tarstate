@@ -6,11 +6,11 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useSyncExternalStore,
   type ReactNode
 } from 'react';
 import type { Db, DbInputData } from '@tarstate/core/db';
-import type { TarstateDiagnostic, TarstateDiagnosticMode, TarstateDiagnosticSeverity } from '@tarstate/core/diagnostics';
-import type { EvaluateOptions } from '@tarstate/core/evaluate';
+import type { TarstateDiagnostic } from '@tarstate/core/diagnostics';
 import { queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
 import {
@@ -23,13 +23,6 @@ import {
   type StoreView,
   type StoreViewSnapshot
 } from '@tarstate/core/store';
-import type {
-  WatchDiagnostic,
-  WatchEvent as CoreWatchEvent,
-  WatchListener as CoreWatchListener,
-  WatchOptions as CoreWatchOptions,
-  WatchTarget as CoreWatchTarget
-} from '@tarstate/core/watch';
 
 export type TarstateReactDiagnostic =
   | StoreDiagnostic
@@ -50,19 +43,11 @@ export type TarstateProviderProps = {
   readonly children?: ReactNode;
 };
 
-export type HookRuntimeKind = 'syncSeedStore' | 'asyncRuntime';
-export type HookDiagnosticErrorPolicy = 'errorSeverityOnly' | 'thrownErrorsOnly' | 'errorSeverityOrThrown';
-export type HookStatusOptions = {
-  readonly runtimeKind?: HookRuntimeKind;
-  readonly diagnosticMode?: TarstateDiagnosticMode;
-  readonly errorPolicy?: HookDiagnosticErrorPolicy;
-};
-
-export type UseViewOptions = HookStatusOptions & {
+export type UseViewOptions = {
   readonly deps?: readonly unknown[];
 };
 
-export type UseQueryOptions<Row, Selected> = EvaluateOptions & {
+export type UseQueryOptions<Row, Selected> = {
   readonly deps?: readonly unknown[];
   readonly select?: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
@@ -71,22 +56,7 @@ type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
   readonly select: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
 
-export type HookStatus = 'loading' | 'ready' | 'error';
-export type HookStatusMeaning = {
-  readonly loading: {
-    readonly runtimeKind: 'asyncRuntime';
-    readonly description: 'Async runtime or hydration has not produced a readable snapshot yet.';
-  };
-  readonly ready: {
-    readonly runtimeKind: HookRuntimeKind;
-    readonly description: 'A synchronous seed store or hydrated async runtime snapshot is readable.';
-  };
-  readonly error: {
-    readonly runtimeKind: HookRuntimeKind;
-    readonly diagnosticSeverity: Extract<TarstateDiagnosticSeverity, 'error'>;
-    readonly description: 'A thrown read error or error-severity diagnostic should be surfaced through error.';
-  };
-};
+export type HookStatus = 'ready';
 
 export type ViewHookState<Row> = {
   readonly status: HookStatus;
@@ -97,19 +67,17 @@ export type ViewHookState<Row> = {
   readonly refresh: () => void;
   readonly view: StoreView<Row>;
   readonly snapshot: StoreViewSnapshot<Row>;
-  readonly error?: unknown;
 };
 
 export type QueryHookState<Row, Selected = readonly Row[]> = {
   readonly status: HookStatus;
   readonly rows: readonly Row[];
-  readonly data: Selected | undefined;
+  readonly data: Selected;
   readonly diagnostics: readonly TarstateReactDiagnostic[];
   readonly queryKey: string;
   readonly revision: number;
   readonly refresh: () => void;
   readonly result: StoreQueryResult<Row>;
-  readonly error?: unknown;
 };
 
 export type RowHookState<Row> = Omit<ViewHookState<Row>, 'rows'> & {
@@ -120,18 +88,7 @@ export type UseRowKeyOptions<Row, Key> = UseViewOptions & {
   readonly keyBy: (row: Row) => Key;
 };
 
-export type WatchTarget<Row = unknown> = CoreWatchTarget<Row>;
-export type WatchEvent<Row = unknown> = CoreWatchEvent<Row>;
-export type WatchListener<Row = unknown> = CoreWatchListener<Row>;
-export type WatchOptions<Row = unknown> = CoreWatchOptions<Row>;
-
-export type WatchHookState<Row> = {
-  readonly event: WatchEvent<Row> | undefined;
-  readonly diagnostics: readonly WatchDiagnostic[];
-};
-
 const TarstateContext = createContext<Store | undefined>(undefined);
-const emptyWatchDiagnostics: readonly WatchDiagnostic[] = Object.freeze([]);
 const emptyDeps: readonly unknown[] = Object.freeze([]);
 
 export function TarstateProvider({ children, db, resetKey, store }: TarstateProviderProps) {
@@ -169,7 +126,9 @@ export function useTarstateStore(): Store {
 }
 
 export function useTarstateSnapshot(): TarstateDbSnapshot {
-  return useTarstateStore().getSnapshot();
+  const store = useTarstateStore();
+  const getSnapshot = useStableStoreSnapshot(store);
+  return useSyncExternalStore(store.subscribe, getSnapshot, getSnapshot);
 }
 
 export function useDb(): Db {
@@ -188,7 +147,8 @@ export function useView<Row>(
   const depsVersion = useDependencyVersion(options.deps ?? emptyDeps);
   const key = queryKey(query);
   const view = useMemo(() => store.view(query), [store, key, depsVersion]);
-  const snapshot = view.getSnapshot();
+  const getSnapshot = useStableViewSnapshot(view);
+  const snapshot = useSyncExternalStore(view.subscribe, getSnapshot, getSnapshot);
   const refresh = useCallback(() => {
     void view.refresh();
   }, [view]);
@@ -234,8 +194,7 @@ export function useRow<Row, Key>(
     refresh: view.refresh,
     view: view.view,
     snapshot: view.snapshot,
-    row,
-    ...(view.error === undefined ? {} : { error: view.error })
+    row
   };
 }
 
@@ -267,19 +226,7 @@ export function useQuery<Row, Selected>(
     queryKey: view.queryKey,
     revision: view.revision,
     refresh: view.refresh,
-    result,
-    ...(view.error === undefined ? {} : { error: view.error })
-  };
-}
-
-export function useWatch<Row>(
-  _target: WatchTarget<Row>,
-  _listener?: WatchListener<Row>,
-  _options: WatchOptions<Row> & { readonly deps?: readonly unknown[] } = {}
-): WatchHookState<Row> {
-  return {
-    event: undefined,
-    diagnostics: emptyWatchDiagnostics
+    result
   };
 }
 
@@ -289,6 +236,68 @@ function useDependencyVersion(deps: readonly unknown[]): number {
     state.current = { deps, version: state.current.version + 1 };
   }
   return state.current.version;
+}
+
+function useStableStoreSnapshot(store: Store): () => StoreSnapshot {
+  return useMemo(() => {
+    let current = store.getSnapshot();
+    return () => {
+      const next = store.getSnapshot();
+      if (sameStoreSnapshot(current, next)) {
+        return current;
+      }
+      current = next;
+      return current;
+    };
+  }, [store]);
+}
+
+function useStableViewSnapshot<Row>(view: StoreView<Row>): () => StoreViewSnapshot<Row> {
+  return useMemo(() => {
+    let current = view.getSnapshot();
+    return () => {
+      const next = view.getSnapshot();
+      if (sameViewSnapshot(current, next)) {
+        return current;
+      }
+      current = next;
+      return current;
+    };
+  }, [view]);
+}
+
+function sameStoreSnapshot(left: StoreSnapshot, right: StoreSnapshot): boolean {
+  return left.revision === right.revision
+    && left.db === right.db
+    && left.version === right.version
+    && shallowEqualDiagnostics(left.diagnostics, right.diagnostics);
+}
+
+function sameViewSnapshot<Row>(left: StoreViewSnapshot<Row>, right: StoreViewSnapshot<Row>): boolean {
+  return left.revision === right.revision
+    && left.queryKey === right.queryKey
+    && left.db === right.db
+    && left.version === right.version
+    && shallowEqualDeps(left.rows, right.rows)
+    && shallowEqualDiagnostics(left.diagnostics, right.diagnostics);
+}
+
+function shallowEqualDiagnostics(
+  left: readonly TarstateReactDiagnostic[],
+  right: readonly TarstateReactDiagnostic[]
+): boolean {
+  return left.length === right.length
+    && left.every((diagnostic, index) => {
+      const other = right[index];
+      return other !== undefined
+        && diagnostic.code === other.code
+        && diagnostic.severity === other.severity
+        && diagnostic.message === other.message
+        && diagnostic.relation === other.relation
+        && diagnostic.field === other.field
+        && diagnostic.surface === other.surface
+        && Object.is(diagnostic.detail, other.detail);
+    });
 }
 
 function shallowEqualDeps(left: readonly unknown[], right: readonly unknown[]): boolean {

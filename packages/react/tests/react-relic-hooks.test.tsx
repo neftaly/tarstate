@@ -10,12 +10,7 @@ import {
   useTarstateSnapshot,
   useTarstateStore,
   useView,
-  useWatch,
-  type HookDiagnosticErrorPolicy,
-  type HookRuntimeKind,
   type HookStatus,
-  type HookStatusMeaning,
-  type HookStatusOptions,
   type QueryHookState,
   type RowHookState,
   type TarstateCommit,
@@ -25,15 +20,12 @@ import {
   type UseQueryOptions,
   type UseRowKeyOptions,
   type UseViewOptions,
-  type ViewHookState,
-  type WatchHookState,
-  type WatchOptions
+  type ViewHookState
 } from '@tarstate/react';
 import { createStore, type Store } from '@tarstate/core/store';
 import { as, from, pipe, project, type Query } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { insert } from '@tarstate/core/write';
-import type { TarstateDiagnosticMode } from '@tarstate/core/diagnostics';
 
 type ItemRow = {
   readonly id: string;
@@ -73,7 +65,6 @@ describe('@tarstate/react future hook facade contract', () => {
     expect(useView).toBeTypeOf('function');
     expect(useRow).toBeTypeOf('function');
     expect(useQuery).toBeTypeOf('function');
-    expect(useWatch).toBeTypeOf('function');
   });
 
   it('keeps public state and options types assignable', () => {
@@ -82,32 +73,16 @@ describe('@tarstate/react future hook facade contract', () => {
     expectTypeOf<TarstateDbInput>().toMatchTypeOf<Parameters<typeof createStore>[0]>();
     expectTypeOf<TarstateDbSnapshot>().toMatchTypeOf<ReturnType<Store['getSnapshot']>>();
     expectTypeOf<TarstateCommit>().toEqualTypeOf<Store['commit']>();
-    expectTypeOf<HookStatus>().toEqualTypeOf<'loading' | 'ready' | 'error'>();
-    expectTypeOf<HookRuntimeKind>().toEqualTypeOf<'syncSeedStore' | 'asyncRuntime'>();
-    expectTypeOf<HookDiagnosticErrorPolicy>().toEqualTypeOf<'errorSeverityOnly' | 'thrownErrorsOnly' | 'errorSeverityOrThrown'>();
-    expectTypeOf<HookStatusOptions>().toMatchTypeOf<{
-      readonly runtimeKind?: HookRuntimeKind;
-      readonly diagnosticMode?: TarstateDiagnosticMode;
-      readonly errorPolicy?: HookDiagnosticErrorPolicy;
-    }>();
-    expectTypeOf<HookStatusMeaning['loading']>().toMatchTypeOf<{ readonly runtimeKind: 'asyncRuntime' }>();
-    expectTypeOf<HookStatusMeaning['ready']>().toMatchTypeOf<{ readonly runtimeKind: HookRuntimeKind }>();
-    expectTypeOf<HookStatusMeaning['error']>().toMatchTypeOf<{ readonly diagnosticSeverity: 'error' }>();
+    expectTypeOf<HookStatus>().toEqualTypeOf<'ready'>();
     expectTypeOf<UseViewOptions>().toMatchTypeOf<{
       readonly deps?: readonly unknown[];
-      readonly diagnosticMode?: TarstateDiagnosticMode;
     }>();
     const queryOptions = {
-      diagnosticMode: 'collect',
       select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`)
     } satisfies UseQueryOptions<ItemProjection, readonly string[]>;
     expect(queryOptions.select).toBeTypeOf('function');
     expectTypeOf<UseRowKeyOptions<ItemProjection, string>>().toMatchTypeOf<{
       readonly keyBy: (row: ItemProjection) => string;
-    }>();
-    expectTypeOf<WatchOptions<ItemProjection>>().toMatchTypeOf<{
-      readonly immediate?: boolean;
-      readonly keyBy?: readonly string[] | ((row: ItemProjection) => unknown);
     }>();
   });
 
@@ -259,28 +234,6 @@ describe('@tarstate/react future hook facade contract', () => {
     probe.renderer.unmount();
   });
 
-  it('keeps useWatch as a typed no-op placeholder until watch reactivity is rebuilt', async () => {
-    const store = createStore({ items: [] });
-    let current: WatchHookState<ItemProjection> | undefined;
-    let renderer: ReactTestRenderer | undefined;
-
-    function Probe() {
-      current = useWatch(itemQuery);
-      return null;
-    }
-
-    await act(async () => {
-      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
-    });
-
-    expect(current).toEqual({
-      event: undefined,
-      diagnostics: []
-    });
-
-    renderer?.unmount();
-  });
-
   it('closes provider-owned stores created from initial db on unmount', async () => {
     let ownedStore: Store | undefined;
 
@@ -309,7 +262,6 @@ describe('@tarstate/react future hook facade contract', () => {
   });
 
   it.todo('synchronously exposes evaluated query rows once core StoreView initialization is sync');
-  it.todo('delivers watch events once watch reactivity is rebuilt on top of the new core APIs');
 });
 
 type HookProbeState = {

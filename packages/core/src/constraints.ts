@@ -3,7 +3,6 @@ export {
   attachedConstraintsFor,
   check,
   constrain,
-  constraintAttachmentsFor,
   DbConstraintTransactionError,
   detachConstraints,
   fk,
@@ -12,7 +11,6 @@ export {
   transactConstrained,
   tryTransactConstrained,
   unique,
-  validateAttachedConstraints,
   validateConstraints
 } from './stub.js';
 export type {
