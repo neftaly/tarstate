@@ -2,7 +2,7 @@ import type { RelationDelta } from './adapter.js';
 import type { RowChange, RowDiffDiagnostic } from './diff.js';
 import { rowKey } from './evaluate.js';
 import { stableKey } from './identity.js';
-import { equalityJoinPlan, type FieldExpression } from './join-planner.js';
+import { equalityJoinPlan, type EqualityJoinPlan, type FieldExpression } from './join-planner.js';
 import {
   diffMaterializationRows,
   materializationRowIndex,
@@ -140,6 +140,19 @@ type IncrementalJoinStep = {
   readonly needsPredicateCheck: boolean;
 };
 
+type IncrementalSubqueryStep = {
+  readonly kind: 'subquery';
+  readonly id: string;
+  readonly exprKey: string;
+  readonly mode: 'many' | 'one';
+  readonly right: IncrementalBranchPlan;
+  readonly left: ExprData;
+  readonly rightExpr: ExprData;
+  readonly predicate: PredicateData;
+  readonly needsPredicateCheck: false;
+  readonly hiddenField: string;
+};
+
 type IncrementalBranchJoinStep = {
   readonly kind: 'join';
   readonly joinKind: 'inner';
@@ -152,7 +165,9 @@ type IncrementalBranchJoinStep = {
 };
 
 type IncrementalBranchStep = IncrementalPipelineStep | IncrementalBranchJoinStep;
+type IncrementalRootDependencyStep = IncrementalJoinStep | IncrementalSubqueryStep;
 type IncrementalJoinLikeStep = IncrementalJoinStep | IncrementalBranchJoinStep;
+type IncrementalIndexLikeStep = IncrementalJoinLikeStep | IncrementalSubqueryStep;
 
 type IncrementalAggregateStep = {
   readonly kind: 'aggregate';
@@ -160,7 +175,7 @@ type IncrementalAggregateStep = {
   readonly aggregates: ProjectionData;
 };
 
-type IncrementalStep = IncrementalPipelineStep | IncrementalJoinStep | IncrementalAggregateStep;
+type IncrementalStep = IncrementalPipelineStep | IncrementalJoinStep | IncrementalSubqueryStep | IncrementalAggregateStep;
 
 type IncrementalPostOrderStep = Extract<IncrementalPipelineStep, {
   readonly kind: 'select' | 'extend' | 'without' | 'rename' | 'qualify';
@@ -263,6 +278,8 @@ type PlanShape = {
 
 type PlanCollection = {
   joinCount: number;
+  subqueryCount: number;
+  readonly subqueryKeys: Set<string>;
   ordered?: MutableIncrementalOrderedStep;
 };
 
@@ -391,6 +408,11 @@ type BranchEvaluation =
       readonly reason: string;
     };
 
+type SubqueryEvaluationState = {
+  readonly step: IncrementalSubqueryStep;
+  readonly state: IncrementalJoinState;
+};
+
 type RightBranchPlanCollection = {
   readonly allowNestedJoin: boolean;
   branchJoinCount: number;
@@ -431,7 +453,7 @@ export function planIncrementalMaterialization(query: Query): IncrementalPlanRes
 
   const dynamicSetPlan = collectDynamicSetPlan(query.data);
   const steps: IncrementalStep[] = [];
-  const collection: PlanCollection = { joinCount: 0 };
+  const collection: PlanCollection = { joinCount: 0, subqueryCount: 0, subqueryKeys: new Set() };
   const root = collectSingleRootPlan(query.data, steps, collection);
   if (typeof root === 'string') {
     if (dynamicSetPlan.supported) {
@@ -854,7 +876,7 @@ export function maintainIncrementalMaterialization<Row>(
     : mutableRootKeysByGroupKey(previousAggregateState);
   let joinStates = materialization.state.joinStates;
 
-  for (const joinStep of joinSteps(materialization.plan)) {
+  for (const joinStep of rootDependencySteps(materialization.plan)) {
     const currentState = joinStates.find((state) => state.id === joinStep.id);
     if (currentState === undefined) {
       return {
@@ -1463,7 +1485,7 @@ function collectSingleRootPlan(
       if (hasAggregateStep(steps)) {
         return 'where after aggregate is not supported for incremental maintenance';
       }
-      const reason = simplePredicateReason(data.predicate);
+      const reason = planPredicateReason(data.predicate, root.shape, steps, collection);
       if (reason !== undefined) {
         return `where predicate is not supported for incremental maintenance: ${reason}`;
       }
@@ -1487,7 +1509,9 @@ function collectSingleRootPlan(
     case 'select': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      const reason = simpleProjectionReason(data.projection);
+      const reason = planProjectionReason(data.projection, root.shape, steps, collection, {
+        allowSubqueries: collection.ordered === undefined && !hasAggregateStep(steps)
+      });
       if (reason !== undefined) {
         return `select projection is not supported for incremental maintenance: ${reason}`;
       }
@@ -1502,7 +1526,9 @@ function collectSingleRootPlan(
     case 'extend': {
       const root = collectSingleRootPlan(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      const reason = simpleProjectionReason(data.projection);
+      const reason = planProjectionReason(data.projection, root.shape, steps, collection, {
+        allowSubqueries: collection.ordered === undefined && !hasAggregateStep(steps)
+      });
       if (reason !== undefined) {
         return `extend projection is not supported for incremental maintenance: ${reason}`;
       }
@@ -1705,6 +1731,431 @@ function collectSingleRootPlan(
       return { ...root, shape: aggregateShape(root.shape, data.groupBy, data.aggregates) };
     }
   }
+}
+
+function planProjectionReason(
+  projection: ProjectionData,
+  shape: PlanShape,
+  steps: IncrementalStep[],
+  collection: PlanCollection,
+  options: { readonly allowSubqueries: boolean }
+): string | undefined {
+  for (const item of Object.values(projection)) {
+    const reason = planExprReason(projectionExpr(item), shape, steps, collection, options);
+    if (reason !== undefined) {
+      return reason;
+    }
+  }
+  return undefined;
+}
+
+function planPredicateReason(
+  predicate: PredicateData,
+  shape: PlanShape,
+  steps: IncrementalStep[],
+  collection: PlanCollection
+): string | undefined {
+  switch (predicate.op) {
+    case 'eq':
+    case 'neq':
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte':
+      return planExprReason(predicate.left, shape, steps, collection, { allowSubqueries: true }) ??
+        planExprReason(predicate.right, shape, steps, collection, { allowSubqueries: true });
+    case 'and':
+    case 'or':
+      for (const item of predicate.predicates) {
+        const reason = planPredicateReason(item, shape, steps, collection);
+        if (reason !== undefined) {
+          return reason;
+        }
+      }
+      return undefined;
+    case 'not':
+      return planPredicateReason(predicate.predicate, shape, steps, collection);
+  }
+}
+
+function planExprReason(
+  expr: ExprData,
+  shape: PlanShape,
+  steps: IncrementalStep[],
+  collection: PlanCollection,
+  options: { readonly allowSubqueries: boolean }
+): string | undefined {
+  switch (expr.op) {
+    case 'field':
+      return exprShapeReason(expr, shape);
+    case 'value':
+      return undefined;
+    case 'tuple':
+      for (const item of expr.items) {
+        const reason = planExprReason(item, shape, steps, collection, options);
+        if (reason !== undefined) {
+          return reason;
+        }
+      }
+      return undefined;
+    case 'subquery':
+      if (!options.allowSubqueries) {
+        return 'subquery expressions after aggregate/order are not supported for incremental maintenance';
+      }
+      return planSubqueryExpression(expr, shape, steps, collection);
+    case 'env':
+    case 'call':
+    case 'hostCall':
+    case 'aggregateCall':
+      return simpleExprReason(expr);
+  }
+}
+
+function planSubqueryExpression(
+  expr: Extract<ExprData, { readonly op: 'subquery' }>,
+  outerShape: PlanShape,
+  steps: IncrementalStep[],
+  collection: PlanCollection
+): string | undefined {
+  const exprKey = subqueryExprKey(expr);
+  if (collection.subqueryKeys.has(exprKey)) {
+    return undefined;
+  }
+
+  const hiddenField = `__tarstate_subquery_${collection.subqueryCount}_key`;
+  const lowerState: LowerCorrelatedSubqueryState = {
+    hiddenField,
+    allowCorrelation: true
+  };
+  const lowered = lowerCorrelatedSubqueryData(expr.query, outerShape, lowerState);
+  if (typeof lowered === 'string') {
+    return `subquery expression is not supported for incremental maintenance: ${lowered}`;
+  }
+  if (lowerState.correlation === undefined) {
+    return 'subquery incremental maintenance requires an unambiguous equality correlation';
+  }
+
+  const right = collectRightBranchPlan(lowered.data, { allowNestedJoin: true });
+  if (typeof right === 'string') {
+    return `subquery branch is not supported for incremental maintenance: ${right}`;
+  }
+  if (intersects(outerShape.relations, right.shape.relations)) {
+    return 'self-correlated subqueries are not supported for incremental maintenance';
+  }
+
+  const id = `subquery:${collection.subqueryCount}`;
+  collection.subqueryCount += 1;
+  collection.subqueryKeys.add(exprKey);
+  const hiddenExpr = subqueryHiddenFieldExpr(hiddenField);
+  steps.push({
+    kind: 'subquery',
+    id,
+    exprKey,
+    mode: expr.mode,
+    right: branchPlan(right),
+    left: lowerState.correlation.left,
+    rightExpr: hiddenExpr,
+    predicate: { op: 'eq', left: lowerState.correlation.left, right: hiddenExpr },
+    needsPredicateCheck: false,
+    hiddenField
+  });
+  return undefined;
+}
+
+type LowerCorrelatedSubqueryState = {
+  readonly hiddenField: string;
+  readonly allowCorrelation: boolean;
+  correlation?: {
+    readonly left: ExprData;
+  };
+};
+
+type LoweredCorrelatedSubqueryData = {
+  readonly data: QueryData;
+  readonly shape: PlanShape;
+};
+
+function lowerCorrelatedSubqueryData(
+  data: QueryData,
+  outerShape: PlanShape,
+  state: LowerCorrelatedSubqueryState
+): LoweredCorrelatedSubqueryData | string {
+  switch (data.op) {
+    case 'from':
+      return {
+        data,
+        shape: shapeForRoot(data.relation, data.alias)
+      };
+    case 'lookup': {
+      const reason = constantExprReason(data.value);
+      if (reason !== undefined) {
+        return `lookup value is not supported: ${reason}`;
+      }
+      return {
+        data,
+        shape: shapeForRoot(data.relation, data.alias)
+      };
+    }
+    case 'where': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      const split = splitSubqueryPredicate(data.predicate, outerShape, input.shape);
+      if (typeof split === 'string') return split;
+
+      let nextData = input.data;
+      let nextShape = input.shape;
+      if (split.correlation !== undefined) {
+        if (!state.allowCorrelation) {
+          return 'correlation inside nested subquery branches is not supported';
+        }
+        if (state.correlation !== undefined) {
+          return 'multiple subquery equality correlations are not supported';
+        }
+
+        state.correlation = { left: split.correlation.left };
+        nextData = {
+          op: 'extend',
+          input: nextData,
+          projection: { [state.hiddenField]: split.correlation.right }
+        };
+        nextShape = extendShape(nextShape, { [state.hiddenField]: split.correlation.right });
+      }
+
+      if (split.residual !== undefined) {
+        nextData = {
+          op: 'where',
+          input: nextData,
+          predicate: split.residual
+        };
+      }
+      return { data: nextData, shape: nextShape };
+    }
+    case 'hash':
+    case 'btree': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      for (const expression of data.expressions) {
+        const reason = simpleExprReason(expression) ?? exprShapeReason(expression, input.shape);
+        if (reason !== undefined) {
+          return `${data.op} expression is not supported: ${reason}`;
+        }
+      }
+      return {
+        data: { ...data, input: input.data },
+        shape: input.shape
+      };
+    }
+    case 'keyBy': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      return typeof input === 'string'
+        ? input
+        : { data: { ...data, input: input.data }, shape: input.shape };
+    }
+    case 'select': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      const projection = state.correlation === undefined
+        ? data.projection
+        : projectionWithHiddenSubqueryField(data.projection, state.hiddenField);
+      const reason = simpleProjectionReason(projection) ?? projectionShapeReason(projection, input.shape);
+      if (reason !== undefined) {
+        return `select projection is not supported: ${reason}`;
+      }
+      return {
+        data: { op: 'select', input: input.data, projection },
+        shape: selectShape(input.shape, projection)
+      };
+    }
+    case 'extend': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      if (Object.hasOwn(data.projection, state.hiddenField)) {
+        return 'subquery projection conflicts with an internal correlation field';
+      }
+      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, input.shape);
+      if (reason !== undefined) {
+        return `extend projection is not supported: ${reason}`;
+      }
+      return {
+        data: { ...data, input: input.data },
+        shape: extendShape(input.shape, data.projection)
+      };
+    }
+    case 'expand': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, input.shape);
+      if (reason !== undefined) {
+        return `expand collection is not supported: ${reason}`;
+      }
+      return {
+        data: { ...data, input: input.data },
+        shape: expandShape(input.shape, data.alias, data.fields)
+      };
+    }
+    case 'without': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      if (state.correlation !== undefined && data.fields.includes(state.hiddenField)) {
+        return 'without cannot remove an internal subquery correlation field';
+      }
+      return {
+        data: { ...data, input: input.data },
+        shape: withoutShape(input.shape, data.fields)
+      };
+    }
+    case 'rename': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      if (
+        state.correlation !== undefined &&
+        (Object.hasOwn(data.fields, state.hiddenField) || Object.values(data.fields).includes(state.hiddenField))
+      ) {
+        return 'rename cannot rewrite an internal subquery correlation field';
+      }
+      return {
+        data: { ...data, input: input.data },
+        shape: renameShape(input.shape, data.fields)
+      };
+    }
+    case 'qualify': {
+      const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
+      if (typeof input === 'string') return input;
+      if (state.correlation !== undefined) {
+        return 'qualify after subquery correlation is not supported';
+      }
+      return {
+        data: { ...data, input: input.data },
+        shape: qualifyShape(input.shape, data.alias)
+      };
+    }
+    case 'join': {
+      if (data.kind !== 'inner') {
+        return 'left joins inside correlated subqueries are not supported';
+      }
+
+      const left = lowerCorrelatedSubqueryData(data.left, outerShape, state);
+      if (typeof left === 'string') {
+        return `subquery join left side is not supported: ${left}`;
+      }
+
+      const rightState: LowerCorrelatedSubqueryState = {
+        hiddenField: state.hiddenField,
+        allowCorrelation: false
+      };
+      const right = lowerCorrelatedSubqueryData(data.right, outerShape, rightState);
+      if (typeof right === 'string') {
+        return `subquery join right side is not supported: ${right}`;
+      }
+
+      const shape = mergeShapes(left.shape, right.shape);
+      const predicateReason = simplePredicateReason(data.on) ?? predicateShapeReason(data.on, shape);
+      if (predicateReason !== undefined) {
+        return `subquery join predicate is not supported: ${predicateReason}`;
+      }
+
+      return {
+        data: { ...data, left: left.data, right: right.data },
+        shape
+      };
+    }
+    case 'sort':
+      return 'sort is not supported';
+    case 'limit':
+      return 'limit is not supported';
+    case 'sortLimit':
+      return 'sortLimit is not supported';
+    case 'union':
+      return 'union is not supported';
+    case 'intersection':
+      return 'intersection is not supported';
+    case 'difference':
+      return 'difference is not supported';
+    case 'constRows':
+      return 'constRows is not supported';
+    case 'aggregate':
+      return 'aggregate is not supported';
+  }
+}
+
+type SplitSubqueryPredicateResult = {
+  readonly correlation?: EqualityJoinPlan;
+  readonly residual?: PredicateData;
+};
+
+function splitSubqueryPredicate(
+  predicate: PredicateData,
+  outerShape: PlanShape,
+  branchShape: PlanShape
+): SplitSubqueryPredicateResult | string {
+  if (predicate.op === 'and') {
+    let correlation: EqualityJoinPlan | undefined;
+    const residuals: PredicateData[] = [];
+    for (const item of predicate.predicates) {
+      const split = splitSubqueryPredicate(item, outerShape, branchShape);
+      if (typeof split === 'string') return split;
+      if (split.correlation !== undefined) {
+        if (correlation !== undefined) {
+          return 'multiple subquery equality correlations are not supported';
+        }
+        correlation = split.correlation;
+      }
+      if (split.residual !== undefined) {
+        residuals.push(split.residual);
+      }
+    }
+    return {
+      ...(correlation === undefined ? {} : { correlation }),
+      ...optionalAndPredicate(residuals)
+    };
+  }
+
+  const equality = equalityJoinPlan(predicate, (expr) => expressionSideForShapes(expr, outerShape, branchShape));
+  if (equality !== undefined) {
+    return { correlation: equality };
+  }
+
+  const branchReason = simplePredicateReason(predicate) ?? predicateShapeReason(predicate, branchShape);
+  if (branchReason === undefined) {
+    return { residual: predicate };
+  }
+
+  const mergedShape = mergeShapes(outerShape, branchShape);
+  const mergedReason = simplePredicateReason(predicate) ?? predicateShapeReason(predicate, mergedShape);
+  if (mergedReason === undefined) {
+    return 'non-equality correlated subquery predicates are not supported for incremental maintenance';
+  }
+
+  return branchReason;
+}
+
+function optionalAndPredicate(
+  predicates: readonly PredicateData[]
+): { readonly residual?: PredicateData } {
+  if (predicates.length === 0) {
+    return {};
+  }
+  if (predicates.length === 1) {
+    return { residual: predicates[0] as PredicateData };
+  }
+  return { residual: { op: 'and', predicates } };
+}
+
+function projectionWithHiddenSubqueryField(
+  projection: ProjectionData,
+  hiddenField: string
+): ProjectionData {
+  return Object.hasOwn(projection, hiddenField)
+    ? projection
+    : { ...projection, [hiddenField]: subqueryHiddenFieldExpr(hiddenField) };
+}
+
+function subqueryHiddenFieldExpr(hiddenField: string): ExprData {
+  return { op: 'field', alias: '__tarstateSubquery', field: hiddenField };
+}
+
+function subqueryExprKey(expr: Extract<ExprData, { readonly op: 'subquery' }>): string {
+  return stableKey({ mode: expr.mode, query: expr.query });
 }
 
 function sortOrderReason(order: readonly SortData[], shape: PlanShape): string | undefined {
@@ -2185,7 +2636,7 @@ function branchPlan(plan: RightBranchPlan): IncrementalBranchPlan {
 function planRelationNames(root: RootPlan, steps: readonly IncrementalStep[]): readonly string[] {
   const names = new Set<string>([root.relation]);
   for (const step of steps) {
-    if (step.kind === 'join') {
+    if (step.kind === 'join' || step.kind === 'subquery') {
       for (const relation of branchRelationNames(step.right)) {
         names.add(relation);
       }
@@ -2208,11 +2659,20 @@ function dynamicSetRelationNames(plan: IncrementalDynamicSetMaterializationPlan)
   return Array.from(new Set(plan.branches.map((branch) => branch.relation)));
 }
 
-function joinSteps(plan: IncrementalMaterializationPlan): readonly IncrementalJoinStep[] {
+function rootDependencySteps(plan: IncrementalMaterializationPlan): readonly IncrementalRootDependencyStep[] {
   if (plan.kind !== 'singleRoot') {
     return [];
   }
-  return plan.steps.filter((step): step is IncrementalJoinStep => step.kind === 'join');
+  return plan.steps.filter((step): step is IncrementalRootDependencyStep =>
+    step.kind === 'join' || step.kind === 'subquery'
+  );
+}
+
+function subquerySteps(plan: IncrementalMaterializationPlan): readonly IncrementalSubqueryStep[] {
+  if (plan.kind !== 'singleRoot') {
+    return [];
+  }
+  return plan.steps.filter((step): step is IncrementalSubqueryStep => step.kind === 'subquery');
 }
 
 function branchJoinSteps(branch: IncrementalBranchPlan): readonly IncrementalBranchJoinStep[] {
@@ -2531,9 +2991,12 @@ function evaluateRootRow<Row>(
 
   let rows: readonly Record<string, unknown>[] = [rootRow];
   const joinValuesByStep = new Map<string, readonly unknown[]>();
+  const subqueryStateByKey = subqueryEvaluationMap(plan, joinStateById);
   for (const step of plan.steps) {
     if (step.kind === 'aggregate') {
       break;
+    } else if (step.kind === 'subquery') {
+      joinValuesByStep.set(step.id, rows.map((row) => exprValue(row, step.left, env, subqueryStateByKey)));
     } else if (step.kind === 'join') {
       const joinState = joinStateById.get(step.id);
       if (joinState === undefined) {
@@ -2542,10 +3005,10 @@ function evaluateRootRow<Row>(
           reason: `incremental join state ${step.id} is missing; snapshot recompute is required`
         };
       }
-      joinValuesByStep.set(step.id, rows.map((row) => exprValue(row, step.left, env)));
+      joinValuesByStep.set(step.id, rows.map((row) => exprValue(row, step.left, env, subqueryStateByKey)));
       rows = evaluateJoinStep(rows, step, joinState, env);
     } else if (step.kind === 'expand') {
-      const expanded = evaluateExpandStep(rows, step, env);
+      const expanded = evaluateExpandStep(rows, step, env, subqueryStateByKey);
       if (!expanded.supported) {
         return {
           supported: false,
@@ -2554,7 +3017,7 @@ function evaluateRootRow<Row>(
       }
       rows = expanded.rows;
     } else {
-      rows = evaluateStep(rows, step, env);
+      rows = evaluateStep(rows, step, env, subqueryStateByKey);
     }
     if (rows.length === 0) {
       return { supported: true, rows: [], joinValuesByStep };
@@ -2581,15 +3044,16 @@ function rootContext(
 function evaluateStep(
   rows: readonly Record<string, unknown>[],
   step: Exclude<IncrementalPipelineStep, { readonly kind: 'expand' }>,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  subqueryStateByKey: ReadonlyMap<string, SubqueryEvaluationState> = new Map()
 ): readonly Record<string, unknown>[] {
   switch (step.kind) {
     case 'where':
-      return rows.filter((row) => matchesPredicate(row, step.predicate, env));
+      return rows.filter((row) => matchesPredicate(row, step.predicate, env, subqueryStateByKey));
     case 'select':
-      return rows.map((row) => projectRow(row, step.projection, env));
+      return rows.map((row) => projectRow(row, step.projection, env, subqueryStateByKey));
     case 'extend':
-      return rows.map((row) => ({ ...row, ...projectRow(row, step.projection, env) }));
+      return rows.map((row) => ({ ...row, ...projectRow(row, step.projection, env, subqueryStateByKey) }));
     case 'without':
       return rows.map((row) => {
         const output = { ...row };
@@ -2610,14 +3074,15 @@ function evaluateStep(
 function evaluateExpandStep(
   rows: readonly Record<string, unknown>[],
   step: Extract<IncrementalPipelineStep, { readonly kind: 'expand' }>,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  subqueryStateByKey: ReadonlyMap<string, SubqueryEvaluationState> = new Map()
 ):
   | { readonly supported: true; readonly rows: readonly Record<string, unknown>[] }
   | { readonly supported: false; readonly reason: string } {
   const output: Record<string, unknown>[] = [];
 
   for (const row of rows) {
-    const value = exprValue(row, step.collection, env);
+    const value = exprValue(row, step.collection, env, subqueryStateByKey);
     if (value === null || value === undefined || !isIterable(value)) {
       continue;
     }
@@ -2847,11 +3312,12 @@ function branchRootContext(
 function projectRow(
   row: Record<string, unknown>,
   projection: ProjectionData,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  subqueryStateByKey: ReadonlyMap<string, SubqueryEvaluationState> = new Map()
 ): Record<string, unknown> {
   return Object.fromEntries(Object.entries(projection).map(([field, item]) => [
     field,
-    exprValue(row, projectionExpr(item), env)
+    exprValue(row, projectionExpr(item), env, subqueryStateByKey)
   ]));
 }
 
@@ -3754,7 +4220,7 @@ function buildJoinStates(
 ): JoinStateBuildResult {
   const states: IncrementalJoinState[] = [];
 
-  for (const step of joinSteps(plan)) {
+  for (const step of rootDependencySteps(plan)) {
     const nestedJoinStatesResult = buildBranchJoinStates(step.right, relationSnapshots, env);
     if (!nestedJoinStatesResult.supported) {
       return nestedJoinStatesResult;
@@ -3881,7 +4347,7 @@ function buildBranchJoinStates(
 }
 
 function buildRightIndex(
-  step: IncrementalJoinLikeStep,
+  step: IncrementalIndexLikeStep,
   relationKeys: readonly string[],
   rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
   env: Readonly<Record<string, unknown>>
@@ -3907,6 +4373,16 @@ function buildRightIndex(
 
 function joinStateMap(states: readonly IncrementalJoinState[]): ReadonlyMap<string, IncrementalJoinState> {
   return new Map(states.map((state) => [state.id, state]));
+}
+
+function subqueryEvaluationMap(
+  plan: IncrementalMaterializationPlan,
+  stateById: ReadonlyMap<string, IncrementalJoinState>
+): ReadonlyMap<string, SubqueryEvaluationState> {
+  return new Map(subquerySteps(plan).flatMap((step) => {
+    const state = stateById.get(step.id);
+    return state === undefined ? [] : [[step.exprKey, { step, state }] as const];
+  }));
 }
 
 function recordRootJoinValues(
@@ -4036,7 +4512,7 @@ function withRootJoinIndex(
 }
 
 function applyNestedBranchJoinChanges(
-  step: IncrementalJoinStep,
+  step: IncrementalRootDependencyStep,
   state: IncrementalJoinState,
   deltas: readonly RelationDelta[],
   env: Readonly<Record<string, unknown>>
@@ -4133,7 +4609,7 @@ function applyNestedBranchJoinChanges(
 }
 
 function reindexBranchRelationKeys(
-  step: IncrementalJoinStep,
+  step: IncrementalRootDependencyStep,
   state: IncrementalJoinState,
   relationKeysToEvaluate: ReadonlySet<string>,
   env: Readonly<Record<string, unknown>>
@@ -4202,7 +4678,7 @@ function reindexBranchRelationKeys(
 }
 
 function applyRightRelationChanges(
-  step: IncrementalJoinLikeStep,
+  step: IncrementalIndexLikeStep,
   state: IncrementalJoinState,
   relation: RelationRef,
   changes: readonly DeltaRowChange[],
@@ -4336,7 +4812,7 @@ function mutableRightIndex(
 }
 
 function removeRightIndexRows(
-  step: IncrementalJoinLikeStep,
+  step: IncrementalIndexLikeStep,
   index: Map<string, IndexedRightRow[]>,
   rows: readonly Record<string, unknown>[],
   env: Readonly<Record<string, unknown>>
@@ -4359,7 +4835,7 @@ function removeRightIndexRows(
 }
 
 function addRightIndexRows(
-  step: IncrementalJoinLikeStep,
+  step: IncrementalIndexLikeStep,
   index: Map<string, IndexedRightRow[]>,
   rows: readonly Record<string, unknown>[],
   env: Readonly<Record<string, unknown>>
@@ -4923,34 +5399,54 @@ function constantExprReason(expr: ExprData): string | undefined {
 function matchesPredicate(
   row: Record<string, unknown>,
   predicate: PredicateData,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  subqueryStateByKey: ReadonlyMap<string, SubqueryEvaluationState> = new Map()
 ): boolean {
   switch (predicate.op) {
     case 'eq':
-      return Object.is(exprValue(row, predicate.left, env), exprValue(row, predicate.right, env));
+      return Object.is(
+        exprValue(row, predicate.left, env, subqueryStateByKey),
+        exprValue(row, predicate.right, env, subqueryStateByKey)
+      );
     case 'neq':
-      return !Object.is(exprValue(row, predicate.left, env), exprValue(row, predicate.right, env));
+      return !Object.is(
+        exprValue(row, predicate.left, env, subqueryStateByKey),
+        exprValue(row, predicate.right, env, subqueryStateByKey)
+      );
     case 'lt':
-      return compareValues(exprValue(row, predicate.left, env), exprValue(row, predicate.right, env)) < 0;
+      return compareValues(
+        exprValue(row, predicate.left, env, subqueryStateByKey),
+        exprValue(row, predicate.right, env, subqueryStateByKey)
+      ) < 0;
     case 'lte':
-      return compareValues(exprValue(row, predicate.left, env), exprValue(row, predicate.right, env)) <= 0;
+      return compareValues(
+        exprValue(row, predicate.left, env, subqueryStateByKey),
+        exprValue(row, predicate.right, env, subqueryStateByKey)
+      ) <= 0;
     case 'gt':
-      return compareValues(exprValue(row, predicate.left, env), exprValue(row, predicate.right, env)) > 0;
+      return compareValues(
+        exprValue(row, predicate.left, env, subqueryStateByKey),
+        exprValue(row, predicate.right, env, subqueryStateByKey)
+      ) > 0;
     case 'gte':
-      return compareValues(exprValue(row, predicate.left, env), exprValue(row, predicate.right, env)) >= 0;
+      return compareValues(
+        exprValue(row, predicate.left, env, subqueryStateByKey),
+        exprValue(row, predicate.right, env, subqueryStateByKey)
+      ) >= 0;
     case 'and':
-      return predicate.predicates.every((item) => matchesPredicate(row, item, env));
+      return predicate.predicates.every((item) => matchesPredicate(row, item, env, subqueryStateByKey));
     case 'or':
-      return predicate.predicates.some((item) => matchesPredicate(row, item, env));
+      return predicate.predicates.some((item) => matchesPredicate(row, item, env, subqueryStateByKey));
     case 'not':
-      return !matchesPredicate(row, predicate.predicate, env);
+      return !matchesPredicate(row, predicate.predicate, env, subqueryStateByKey);
   }
 }
 
 function exprValue(
   row: Record<string, unknown>,
   expr: ExprData,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  subqueryStateByKey: ReadonlyMap<string, SubqueryEvaluationState> = new Map()
 ): unknown {
   switch (expr.op) {
     case 'value':
@@ -4968,13 +5464,50 @@ function exprValue(
       return row[expr.field];
     }
     case 'tuple':
-      return expr.items.map((item) => exprValue(row, item, env));
+      return expr.items.map((item) => exprValue(row, item, env, subqueryStateByKey));
     case 'call':
     case 'hostCall':
-    case 'subquery':
     case 'aggregateCall':
       return undefined;
+    case 'subquery':
+      return subqueryExprValue(row, expr, env, subqueryStateByKey);
   }
+}
+
+function subqueryExprValue(
+  row: Record<string, unknown>,
+  expr: Extract<ExprData, { readonly op: 'subquery' }>,
+  env: Readonly<Record<string, unknown>>,
+  subqueryStateByKey: ReadonlyMap<string, SubqueryEvaluationState>
+): unknown {
+  const planned = subqueryStateByKey.get(subqueryExprKey(expr));
+  if (planned === undefined) {
+    return undefined;
+  }
+
+  const leftValue = exprValue(row, planned.step.left, env, subqueryStateByKey);
+  const candidates = planned.state.indexByValue.get(stableKey(leftValue)) ?? [];
+  const rows: Record<string, unknown>[] = [];
+  for (const candidate of candidates) {
+    if (Object.is(leftValue, candidate.value)) {
+      rows.push(stripSubqueryHiddenField(candidate.row, planned.step.hiddenField));
+    }
+  }
+
+  return planned.step.mode === 'one' ? rows[0] : rows;
+}
+
+function stripSubqueryHiddenField(
+  row: Record<string, unknown>,
+  hiddenField: string
+): Record<string, unknown> {
+  if (!Object.hasOwn(row, hiddenField)) {
+    return row;
+  }
+
+  const output = { ...row };
+  delete output[hiddenField];
+  return output;
 }
 
 function simpleProjectionReason(projection: ProjectionData): string | undefined {

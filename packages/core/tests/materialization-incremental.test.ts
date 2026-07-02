@@ -39,10 +39,13 @@ import {
   maybe,
   min,
   minBy,
+  neq,
   notAny,
   pipe,
   project,
   qRows,
+  sel,
+  sel1,
   setConcat,
   sort,
   sortLimit,
@@ -96,6 +99,13 @@ type UserAgeRow = {
 type UserNameRow = {
   readonly id: string;
   readonly name: string;
+};
+
+type UserOpenTasksTeamRow = {
+  readonly id: string;
+  readonly name: string;
+  readonly openTasks: readonly { readonly title: string }[];
+  readonly team: { readonly name: string } | undefined;
 };
 
 type UserRankRow = {
@@ -763,6 +773,50 @@ function joinedTaskOwnersSortedQuery(): Query<TaskOwnerRow> {
     keyBy('id'),
     sort(desc(projectedPoints), asc(projectedId))
   ) as Query<TaskOwnerRow>;
+}
+
+function userOpenTasksAndTeamSubqueriesQuery(): Query<UserOpenTasksTeamRow> {
+  const user = as(coreSchema.users, 'user');
+  const task = as(coreSchema.tasks, 'task');
+  const team = as(coreSchema.teams, 'team');
+  const openTasksForUser = pipe(
+    from(task),
+    where(and(eq(task.ownerId, user.id), eq(task.done, false))),
+    project({ title: task.title })
+  );
+  const teamForUser = pipe(
+    from(team),
+    where(eq(team.id, user.teamId)),
+    project({ name: team.name })
+  );
+
+  return pipe(
+    from(user),
+    project({
+      id: user.id,
+      name: user.name,
+      openTasks: sel(openTasksForUser),
+      team: sel1(teamForUser)
+    }),
+    keyBy('id')
+  ) as Query<UserOpenTasksTeamRow>;
+}
+
+function usersWithAnyOpenTaskSubqueryQuery(): Query<UserNameRow> {
+  const user = as(coreSchema.users, 'user');
+  const task = as(coreSchema.tasks, 'task');
+  const openTasksForUser = pipe(
+    from(task),
+    where(and(eq(task.ownerId, user.id), eq(task.done, false))),
+    project({ id: task.id })
+  );
+
+  return pipe(
+    from(user),
+    where(neq(sel1(openTasksForUser), undefined)),
+    project({ id: user.id, name: user.name }),
+    keyBy('id')
+  ) as Query<UserNameRow>;
 }
 
 function ids(rows: readonly { readonly id: string }[] | undefined): readonly string[] {
@@ -2314,6 +2368,158 @@ describe('incremental materialization', () => {
       { id: 'ada', name: 'Ada' },
       { id: 'cal', name: 'Cal' }
     ]);
+  });
+
+  it('incrementally maintains projected sel and sel1 equality-correlated subqueries', () => {
+    const userSubqueries = userOpenTasksAndTeamSubqueriesQuery();
+    const state = mat(createDb(sourceData), userSubqueries, {
+      id: 'user-subqueries',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, userSubqueries);
+
+    expect(metadata).toMatchObject({
+      id: 'user-subqueries',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      dependencies: expect.arrayContaining(['users', 'tasks', 'teams'])
+    });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, userSubqueries)).toEqual([
+      {
+        id: 'ada',
+        name: 'Ada',
+        openTasks: [{ title: 'Draft evaluator' }],
+        team: { name: 'Engineering' }
+      },
+      {
+        id: 'bea',
+        name: 'Bea',
+        openTasks: [{ title: 'Review fixtures' }],
+        team: { name: 'Design' }
+      },
+      {
+        id: 'cal',
+        name: 'Cal',
+        openTasks: [],
+        team: undefined
+      }
+    ]);
+
+    const renamedAdaTask: TaskRow = {
+      ...draftEvaluatorTask,
+      title: 'Draft incremental evaluator'
+    };
+    const renamedEngineeringTeam: TeamRow = {
+      ...engineeringTeam,
+      name: 'Platform Engineering'
+    };
+    const next = createDb({
+      ...sourceData,
+      teams: [designTeam, renamedEngineeringTeam],
+      tasks: [renamedAdaTask, shipRuntimeTask, reviewFixturesTask]
+    });
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [
+        tasksDelta([renamedAdaTask], [draftEvaluatorTask]),
+        teamsDelta([renamedEngineeringTeam], [engineeringTeam])
+      ]
+    });
+    const change = singleMaterializationChange(maintained, 'user-subqueries');
+
+    expect(maintained).toMatchObject({ recomputed: 0 });
+    expect(change).toMatchObject({ maintenance: 'incremental', recomputed: false });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change.rowChanges).toEqual([
+      expect.objectContaining({
+        kind: 'updated',
+        before: {
+          id: 'ada',
+          name: 'Ada',
+          openTasks: [{ title: 'Draft evaluator' }],
+          team: { name: 'Engineering' }
+        },
+        after: {
+          id: 'ada',
+          name: 'Ada',
+          openTasks: [{ title: 'Draft incremental evaluator' }],
+          team: { name: 'Platform Engineering' }
+        }
+      })
+    ]);
+    expect(materializedRowsForQuery(next, userSubqueries)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains predicates that read sel1 equality-correlated subqueries', () => {
+    const usersWithOpenTasks = usersWithAnyOpenTaskSubqueryQuery();
+    const state = mat(createDb(sourceData), usersWithOpenTasks, {
+      id: 'users-with-open-tasks',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, usersWithOpenTasks);
+
+    expect(metadata).toMatchObject({
+      id: 'users-with-open-tasks',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      dependencies: expect.arrayContaining(['users', 'tasks'])
+    });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, usersWithOpenTasks)).toEqual([
+      { id: 'ada', name: 'Ada' },
+      { id: 'bea', name: 'Bea' }
+    ]);
+
+    const completedAdaTask: TaskRow = {
+      ...draftEvaluatorTask,
+      done: true
+    };
+    const next = createDb({
+      ...sourceData,
+      tasks: [completedAdaTask, shipRuntimeTask, reviewFixturesTask]
+    });
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [tasksDelta([completedAdaTask], [draftEvaluatorTask])]
+    });
+    const change = singleMaterializationChange(maintained, 'users-with-open-tasks');
+
+    expect(maintained).toMatchObject({ recomputed: 0 });
+    expect(change).toMatchObject({ maintenance: 'incremental', recomputed: false });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change.rowChanges).toEqual([
+      expect.objectContaining({
+        kind: 'removed',
+        row: { id: 'ada', name: 'Ada' }
+      })
+    ]);
+    expect(materializedRowsForQuery(next, usersWithOpenTasks)).toEqual(change.rows);
+  });
+
+  it('keeps unsupported non-equality correlated subqueries on snapshot fallback', () => {
+    const user = as(coreSchema.users, 'user');
+    const task = as(coreSchema.tasks, 'task');
+    const largeTasksForUser = pipe(
+      from(task),
+      where(gt(task.points, user.age)),
+      project({ title: task.title })
+    );
+    const query = pipe(
+      from(user),
+      project({ id: user.id, task: sel1(largeTasksForUser) }),
+      keyBy('id')
+    );
+    const state = mat(createDb(sourceData), query, {
+      id: 'non-equality-subquery',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, query);
+
+    expect(metadata).toMatchObject({
+      requestedMode: 'incremental',
+      maintenance: 'snapshot'
+    });
+    expect(metadata?.maintenanceReason).toContain('non-equality correlated subquery');
+    expectIncrementalFallback(metadata?.diagnostics ?? []);
   });
 
   it('marks requested sortLimit materialization as incremental for supported keyed shapes', () => {
