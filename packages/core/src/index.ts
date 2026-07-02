@@ -303,7 +303,7 @@ export {
 export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
 export { composeSources, fromObjectSource, isRelationSource } from './source.js';
 export type { MaybePromise, RelationLookup, RelationRangeBound, RelationRangeLookup, RelationSource } from './source.js';
-export { createStore } from './store.js';
+export { createRuntimeStore, createStore } from './store.js';
 export type {
   Store,
   StoreCommitInput,
@@ -317,6 +317,8 @@ export type {
   StoreQueryBatchResult,
   StoreQueryOptions,
   StoreQueryResult,
+  StoreInput,
+  StoreRuntimeInput,
   StoreSnapshot,
   StoreView,
   StoreViewReadOptions

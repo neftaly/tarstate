@@ -10,11 +10,13 @@ other structured data outside a renderer package.
 
 The core API is stabilizing around a Relic-shaped split:
 
-- `store` is the small app-facing facade: `createStore(seedRows)` returns a
-  renderer-independent store with `query`, `queries`, `view`, non-throwing
-  `commit`, and subscriptions. Store commit results use
-  `accepted`/`partial`/`rejected` status plus a separate `reflected` flag for
-  row effects. A `view(query)` is the stable derived-read API; materialization
+- `store` is the small app-facing facade: `createStore(seedRows)` returns an
+  object-backed renderer-independent store, and
+  `await createRuntimeStore({ runtime, relations })` returns the same facade over
+  a pluggable `RelationRuntime`. Stores provide `query`, `queries`, `view`,
+  non-throwing `commit`, and subscriptions. Store commit results use
+  `accepted`/`partial`/`rejected` status plus a separate `reflected` flag for row
+  effects. A `view(query)` is the stable derived-read API; materialization
   remains a diagnostic-backed core cache API outside the stable store contract.
 - `query` describes relational row programs as data, including joins,
   explicit lookup, hash-declared equality lookup planning, btree-declared range

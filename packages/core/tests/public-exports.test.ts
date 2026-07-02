@@ -137,6 +137,7 @@ describe('public core exports', () => {
     expect(core.diffRows).toBe(diffExports.diffRows);
     expect(core.rowDiffKey).toBe(diffExports.rowDiffKey);
     expect(core.relationDeltas).toBe(deltaExports.relationDeltas);
+    expect(core.createRuntimeStore).toBe(storeExports.createRuntimeStore);
     expect(deltaExports.relationDeltaNames(deltas).has('items')).toBe(true);
     expect(evaluated.rows).toEqual([{ id: 'a', label: 'Alpha' }]);
     expect(metadata?.kind).toBe('materialization');
