@@ -109,6 +109,13 @@ export type DerivationDiagnostic<Row = unknown> =
   | DerivationIndexDiagnostic<Row>;
 
 export type DerivationOptions = EvaluateOptions;
+export type DerivedRowsSnapshotOptions<Row = unknown> = {
+  readonly diagnostics?: readonly DerivationDiagnostic<Row>[];
+  readonly version?: unknown;
+};
+export type DerivedRowsRefreshOptions<Row = unknown> = DerivedRowsSnapshotOptions<Row> & {
+  readonly inputDeltas?: readonly RelationDelta[];
+};
 
 export async function deriveSnapshot<Row>(
   target: DerivationTarget<Row>,
@@ -116,18 +123,29 @@ export async function deriveSnapshot<Row>(
   options: DerivationOptions = {}
 ): Promise<DerivationSnapshot<Row>> {
   const result = await evaluate(input.source, target.query, options);
+  return deriveSnapshotFromRows(target, result.rows, {
+    diagnostics: result.diagnostics,
+    version: input.version
+  });
+}
+
+export function deriveSnapshotFromRows<Row>(
+  target: DerivationTarget<Row>,
+  rows: readonly Row[],
+  options: DerivedRowsSnapshotOptions<Row> = {}
+): DerivationSnapshot<Row> {
   const rowIdentity = rowIdentityForTarget(target);
-  const rowsByKey = indexSnapshotRows(result.rows, rowIdentity);
-  const indexes = buildDerivationIndexes(result.rows, target.indexes ?? []);
+  const rowsByKey = indexSnapshotRows(rows, rowIdentity);
+  const indexes = buildDerivationIndexes(rows, target.indexes ?? []);
   const indexDiagnostics = Array.from(indexes.values()).flatMap((index) => index.diagnostics);
 
   return snapshotValue(target, {
     rowIdentity,
-    rows: result.rows,
+    rows,
     rowsByKey,
     indexes,
-    diagnostics: [...result.diagnostics, ...indexDiagnostics],
-    version: input.version
+    diagnostics: [...(options.diagnostics ?? []), ...indexDiagnostics],
+    version: options.version
   });
 }
 
@@ -137,10 +155,30 @@ export async function refreshDerivedSnapshot<Row>(
   options: DerivationOptions = {}
 ): Promise<DerivationRefresh<Row>> {
   const snapshot = await deriveSnapshot(previous.target, input, options);
+  return refreshValue(previous, snapshot, input.deltas ?? []);
+}
+
+export function refreshDerivedSnapshotFromRows<Row>(
+  previous: DerivationSnapshot<Row>,
+  rows: readonly Row[],
+  options: DerivedRowsRefreshOptions<Row> = {}
+): DerivationRefresh<Row> {
+  const snapshot = deriveSnapshotFromRows(previous.target, rows, {
+    ...(options.diagnostics === undefined ? {} : { diagnostics: options.diagnostics }),
+    ...(options.version === undefined ? {} : { version: options.version })
+  });
+  return refreshValue(previous, snapshot, options.inputDeltas ?? []);
+}
+
+function refreshValue<Row>(
+  previous: DerivationSnapshot<Row>,
+  snapshot: DerivationSnapshot<Row>,
+  inputDeltas: readonly RelationDelta[]
+): DerivationRefresh<Row> {
   const diff = diffRows(previous.rows, snapshot.rows, diffOptionsForIdentity(snapshot.rowIdentity));
   const delta: DerivedRowsDelta<Row> = {
     kind: 'derivedRows',
-    inputDeltas: input.deltas ?? [],
+    inputDeltas,
     rowChanges: diff.changes,
     addedRows: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
     removedRows: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),

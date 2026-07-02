@@ -1,7 +1,14 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
+import {
+  deriveSnapshotFromRows,
+  refreshDerivedSnapshotFromRows,
+  type DerivationRefresh,
+  type DerivationSnapshot,
+  type DerivationTarget
+} from './derivation-engine.js';
 import type { EvaluateFunctions, EvaluateOptions } from './evaluate.js';
 import type { RelationDelta } from './adapter.js';
-import type { RowChange, RowDiff, RowDiffDiagnostic } from './diff.js';
+import type { RowChange, RowDiffDiagnostic } from './diff.js';
 import {
   queryKey,
   queryRowKeyFields,
@@ -39,7 +46,6 @@ import {
   type IncrementalRowBatch
 } from './materialization-plan.js';
 import {
-  diffMaterializationRows as diffMaterializationRowsByOptions,
   materializationRowIndex,
   materializationRowKey,
   type MaterializationRowDiffOptions,
@@ -446,6 +452,7 @@ type MaterializationHashIndexOptions<Field extends string = string> =
 
 type StoredMaterialization<Row = unknown> = {
   readonly metadata: MaterializationMetadata<Row>;
+  readonly derivationSnapshot: DerivationSnapshot<Row>;
   readonly rows: readonly Row[];
   readonly rowIndex: MaterializationRowIndex<Row>;
   readonly indexes: MaintainedIndexes<Row>;
@@ -453,6 +460,7 @@ type StoredMaterialization<Row = unknown> = {
   readonly cacheable: boolean;
   readonly incremental?: IncrementalMaterialization<Row>;
 };
+type AnyStoredMaterialization = StoredMaterialization<any>;
 type MaterializationEvalTarget = {
   readonly source: RelationSource;
   readonly query: Query;
@@ -461,7 +469,7 @@ type MaterializationEvalTarget = {
 };
 
 const materializedDbs = new WeakSet<object>();
-const materializationStore = new WeakMap<object, Map<string, StoredMaterialization>>();
+const materializationStore = new WeakMap<object, Map<string, AnyStoredMaterialization>>();
 
 export function mat<Db extends object>(
   db: Db,
@@ -593,7 +601,7 @@ export function refreshMaterialization<Db extends SnapshotMaterializationTarget,
     id: stored.metadata.id,
     queryKey: stored.metadata.queryKey,
     refreshed: true,
-    rows: refreshed.rows,
+    rows: materializationRows(refreshed),
     diagnostics: []
   };
 }
@@ -621,7 +629,7 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
     return emptyMaintenance();
   }
 
-  const nextStore = new Map<string, StoredMaterialization>();
+  const nextStore = new Map<string, AnyStoredMaterialization>();
   const changes: MaterializationMaintenanceChange[] = [];
   const touchedRelations = options.deltas === undefined ? undefined : new Set(options.deltas.map((delta) => delta.relation.name));
 
@@ -652,8 +660,8 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
         touchedEnvDependencies,
         indexSpecs: stored.metadata.indexSpecs,
         previousRowsAvailable: true,
-        previousRows: stored.rows,
-        rows: stored.rows,
+        previousRows: materializationRows(stored),
+        rows: materializationRows(stored),
         addedRows: [],
         removedRows: [],
         rowChanges: [],
@@ -680,11 +688,17 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             state: maintained.state
           };
           const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
+          const refresh = refreshDerivedSnapshotFromRows(
+            stored.derivationSnapshot,
+            maintainedRows,
+            derivationRefreshOptions(options.deltas)
+          );
+          const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
           const change: MaterializationMaintenanceChange = {
             kind: 'materializationMaintenanceChange',
             update: 'incremental',
             recomputed: false,
-            reason: maintained.rowChanges.length === 0
+            reason: rowDelta.rowChanges.length === 0
               ? 'dependencies touched; incrementally maintained rows unchanged'
               : maintained.reason,
             id: stored.metadata.id,
@@ -697,17 +711,17 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
             touchedEnvDependencies,
             indexSpecs: stored.metadata.indexSpecs,
             previousRowsAvailable: true,
-            previousRows: stored.rows,
-            rows: maintainedRows,
-            addedRows: maintained.addedRows,
-            removedRows: maintained.removedRows,
-            rowChanges: maintained.rowChanges,
-            diagnostics: maintained.diagnostics
+            previousRows: materializationRows(stored),
+            rows: refresh.snapshot.rows,
+            addedRows: rowDelta.addedRows,
+            removedRows: rowDelta.removedRows,
+            rowChanges: rowDelta.rowChanges,
+            diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
           };
           changes.push(change);
           storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
             stored,
-            maintainedRows,
+            refresh.snapshot,
             nextIncremental,
             maintained.rowBatches
           ));
@@ -740,11 +754,17 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
               state: maintained.state
             };
             const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
+            const refresh = refreshDerivedSnapshotFromRows(
+              stored.derivationSnapshot,
+              maintainedRows,
+              derivationRefreshOptions(options.deltas)
+            );
+            const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
             const change: MaterializationMaintenanceChange = {
               kind: 'materializationMaintenanceChange',
               update: 'incremental',
               recomputed: false,
-              reason: maintained.rowChanges.length === 0
+              reason: rowDelta.rowChanges.length === 0
                 ? 'dependencies touched; incrementally maintained rows unchanged'
                 : maintained.reason,
               id: stored.metadata.id,
@@ -757,17 +777,17 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
               touchedEnvDependencies,
               indexSpecs: stored.metadata.indexSpecs,
               previousRowsAvailable: true,
-              previousRows: stored.rows,
-              rows: maintainedRows,
-              addedRows: maintained.addedRows,
-              removedRows: maintained.removedRows,
-              rowChanges: maintained.rowChanges,
-              diagnostics: maintained.diagnostics
+              previousRows: materializationRows(stored),
+              rows: refresh.snapshot.rows,
+              addedRows: rowDelta.addedRows,
+              removedRows: rowDelta.removedRows,
+              rowChanges: rowDelta.rowChanges,
+              diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
             };
             changes.push(change);
             storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
               stored,
-              maintainedRows,
+              refresh.snapshot,
               nextIncremental,
               maintained.rowBatches
             ));
@@ -814,11 +834,17 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
               state: maintained.state
             };
             const maintainedRows = rowsForMaintainedIncremental(stored, maintained.rowBatches, nextIncremental);
+            const refresh = refreshDerivedSnapshotFromRows(
+              stored.derivationSnapshot,
+              maintainedRows,
+              derivationRefreshOptions(options.deltas)
+            );
+            const rowDelta = materializationMaintenanceRowDelta(refresh, maintained);
             const change: MaterializationMaintenanceChange = {
               kind: 'materializationMaintenanceChange',
               update: 'incremental',
               recomputed: false,
-              reason: maintained.rowChanges.length === 0
+              reason: rowDelta.rowChanges.length === 0
                 ? 'dependencies touched; incrementally maintained rows unchanged'
                 : maintained.reason,
               id: stored.metadata.id,
@@ -831,17 +857,17 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
               touchedEnvDependencies,
               indexSpecs: stored.metadata.indexSpecs,
               previousRowsAvailable: true,
-              previousRows: stored.rows,
-              rows: maintainedRows,
-              addedRows: maintained.addedRows,
-              removedRows: maintained.removedRows,
-              rowChanges: maintained.rowChanges,
-              diagnostics: maintained.diagnostics
+              previousRows: materializationRows(stored),
+              rows: refresh.snapshot.rows,
+              addedRows: rowDelta.addedRows,
+              removedRows: rowDelta.removedRows,
+              rowChanges: rowDelta.rowChanges,
+              diagnostics: [...maintained.diagnostics, ...refresh.delta.diagnostics]
             };
             changes.push(change);
             storeMaterializationIn(nextStore, materializationEntryWithIncrementalRows(
               stored,
-              maintainedRows,
+              refresh.snapshot,
               nextIncremental,
               maintained.rowBatches
             ));
@@ -858,17 +884,21 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
     }
 
     const entry = recomputeMaterializationEntry(next, stored);
-    const diff = diffMaterializationRows(stored.rows, entry.rows, stored.metadata.query);
+    const refresh = refreshDerivedSnapshotFromRows(
+      stored.derivationSnapshot,
+      materializationRows(entry),
+      derivationRefreshOptions(options.deltas)
+    );
     const recomputeReason = touchedEnvDependencies.length === 0
-      ? diff.changes.length === 0
+      ? refresh.delta.rowChanges.length === 0
         ? 'dependencies touched; recomputed rows unchanged'
         : 'dependencies touched; recomputed rows changed'
-      : diff.changes.length === 0
+      : refresh.delta.rowChanges.length === 0
         ? 'environment dependencies touched; recomputed rows unchanged'
         : 'environment dependencies touched; recomputed rows changed';
     const change: MaterializationMaintenanceChange = {
       kind: 'materializationMaintenanceChange',
-      update: diff.changes.length === 0 ? 'carried' : 'recomputed',
+      update: refresh.delta.rowChanges.length === 0 ? 'carried' : 'recomputed',
       recomputed: true,
       reason: recomputeReason,
       id: stored.metadata.id,
@@ -881,15 +911,21 @@ export function maintainMaterializations<Next extends SnapshotMaterializationTar
       touchedEnvDependencies,
       indexSpecs: stored.metadata.indexSpecs,
       previousRowsAvailable: true,
-      previousRows: stored.rows,
-      rows: entry.rows,
-      addedRows: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
-      removedRows: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
-      rowChanges: diff.changes,
-      diagnostics: [...incrementalFallbackDiagnostics, ...diff.diagnostics]
+      previousRows: materializationRows(stored),
+      rows: refresh.snapshot.rows,
+      addedRows: refresh.delta.addedRows,
+      removedRows: refresh.delta.removedRows,
+      rowChanges: refresh.delta.rowChanges,
+      diagnostics: [...incrementalFallbackDiagnostics, ...refresh.delta.diagnostics]
     };
     changes.push(change);
-    storeMaterializationIn(nextStore, entry);
+    storeMaterializationIn(nextStore, materializationEntryWithDerivationSnapshot(
+      entry.metadata,
+      refresh.snapshot,
+      entry.evaluateOptions,
+      entry.cacheable,
+      entry.incremental
+    ));
   }
 
   materializationStore.set(next, nextStore);
@@ -990,14 +1026,16 @@ export function materializationForQuery<Row = unknown>(
 }
 
 export function materializedRowsFor<Row = unknown>(input: unknown, id: string): readonly Row[] | undefined {
-  return resolveMaterialization(input, id)?.rows as readonly Row[] | undefined;
+  const stored = resolveMaterialization(input, id);
+  return stored === undefined ? undefined : materializationRows(stored) as readonly Row[];
 }
 
 export function materializedRowsForQuery<Row = unknown>(
   input: unknown,
   query: Query<Row>
 ): readonly Row[] | undefined {
-  return resolveMaterialization(input, query)?.rows as readonly Row[] | undefined;
+  const stored = resolveMaterialization(input, query);
+  return stored === undefined ? undefined : materializationRows(stored) as readonly Row[];
 }
 
 export function queryRowsFromMaterialization<Row = unknown>(
@@ -1007,7 +1045,7 @@ export function queryRowsFromMaterialization<Row = unknown>(
 ): readonly Row[] | undefined {
   const stored = resolveMaterialization(input, query);
   return stored !== undefined && materializedRowsCanServeQuery(stored, options)
-    ? stored.rows as readonly Row[]
+    ? materializationRows(stored) as readonly Row[]
     : undefined;
 }
 
@@ -1020,7 +1058,7 @@ export function readMaterializedQuery<Row = unknown>(
     return Promise.resolve({
       kind: 'materializedQueryResult',
       materialized: true,
-      rows: stored.rows as readonly Row[],
+      rows: materializationRows(stored) as readonly Row[],
       diagnostics: [],
       queryKey: stored.metadata.queryKey,
       id: stored.metadata.id
@@ -1044,7 +1082,10 @@ export function materializedSourceFor<Row = unknown>(
   const relationName = options.relationName ?? 'materialized';
   return {
     relationNames: [relationName],
-    rows: () => resolveMaterialization(input, target)?.rows ?? [],
+    rows: () => {
+      const stored = resolveMaterialization(input, target);
+      return stored === undefined ? [] : materializationRows(stored);
+    },
     lookup: ({ relation, field, value }) => relation.name === relationName
       ? materializedEqualityRowsFor(input, target, field, value)
       : undefined,
@@ -1262,9 +1303,9 @@ function setIndexResult<Row>(stored: StoredMaterialization<Row>): Materializatio
   }));
 }
 
-function inferredIndexOptions(
-  stored: StoredMaterialization | undefined,
-  target: string | Query | MaterializationMetadata
+function inferredIndexOptions<Row>(
+  stored: StoredMaterialization<Row> | undefined,
+  target: string | Query<Row> | MaterializationMetadata<Row>
 ): MaterializationIndexOptions {
   if (stored === undefined || typeof target === 'string') {
     return {};
@@ -1306,7 +1347,7 @@ function hashIndexResult<Row, Value>(
 ): MaterializationHashIndexResult<Row, Value> {
   const maintained = maintainedIndexFor<Row>(stored, 'hash', fields);
   const maintainedLookup = maintained?.lookup as ReadonlyMap<Value, MaterializationNestedRows<Row>> | undefined;
-  const lookup = maintainedLookup ?? groupRowsByFields<Row, Value>(stored.rows as readonly Row[], fields);
+  const lookup = maintainedLookup ?? groupRowsByFields<Row, Value>(materializationRows(stored) as readonly Row[], fields);
   const facade = hashIndex<Row, Value>(lookup, fields);
   const diagnostics = maintained?.diagnostics ?? [];
   return withMapLike(lookup, withTarget(stored, {
@@ -1354,7 +1395,7 @@ function btreeIndexResult<Row, Value>(
   const maintained = maintainedIndexFor<Row>(stored, 'btree', fields) as MaintainedBtreeIndexState<Row> | undefined;
   const maintainedLookup = maintained?.lookup as ReadonlyMap<Value, MaterializationNestedRows<Row>> | undefined;
   const lookup = maintainedLookup
-    ?? sortNestedLookup(groupRowsByFields<Row, Value>(stored.rows as readonly Row[], fields)) as ReadonlyMap<Value, MaterializationNestedRows<Row>>;
+    ?? sortNestedLookup(groupRowsByFields<Row, Value>(materializationRows(stored) as readonly Row[], fields)) as ReadonlyMap<Value, MaterializationNestedRows<Row>>;
   const facade = btreeIndex<Row, Value>(
     lookup,
     fields,
@@ -1629,12 +1670,30 @@ function materializationEntryWithRows<Row>(
   cacheable: boolean,
   incremental?: IncrementalMaterialization<Row>
 ): StoredMaterialization<Row> {
+  return materializationEntryWithDerivationSnapshot(
+    metadata,
+    deriveSnapshotFromRows(derivationTargetFor(metadata), rows),
+    evaluateOptions,
+    cacheable,
+    incremental
+  );
+}
+
+function materializationEntryWithDerivationSnapshot<Row>(
+  metadata: MaterializationMetadata<Row>,
+  derivationSnapshot: DerivationSnapshot<Row>,
+  evaluateOptions: EvaluateOptions,
+  cacheable: boolean,
+  incremental?: IncrementalMaterialization<Row>
+): StoredMaterialization<Row> {
+  const rows = derivationSnapshot.rows;
   const maintainedDefinitions = maintainedIndexDefinitions(metadata.indexSpecs);
   return {
     metadata: metadataWithIndexDiagnostics(
       metadata,
       maintainedDefinitions.flatMap((definition) => definition.diagnostics ?? [])
     ),
+    derivationSnapshot,
     rows,
     rowIndex: materializationRowIndex(rows, materializationDiffOptions(metadata.query)),
     indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
@@ -1646,12 +1705,14 @@ function materializationEntryWithRows<Row>(
 
 function materializationEntryWithIncrementalRows<Row>(
   stored: StoredMaterialization<Row>,
-  rows: readonly Row[],
+  derivationSnapshot: DerivationSnapshot<Row>,
   incremental: IncrementalMaterialization<Row>,
   rowBatches: readonly IncrementalRowBatch<Row>[]
 ): StoredMaterialization<Row> {
+  const rows = derivationSnapshot.rows;
   return {
     ...stored,
+    derivationSnapshot,
     rows,
     rowIndex: materializationRowIndex(rows, materializationDiffOptions(stored.metadata.query)),
     indexes: patchMaintainedIndexes(stored.indexes, rows, rowBatches),
@@ -1669,15 +1730,50 @@ function rowsForMaintainedIncremental<Row>(
   }
 
   if (rowBatches.length === 0) {
-    return stored.rows;
+    return materializationRows(stored);
   }
 
   return patchMaterializationRows(
-    stored.rows,
+    materializationRows(stored),
     stored.rowIndex,
     rowBatches,
     materializationDiffOptions(stored.metadata.query)
   ) ?? rowsFromIncrementalState(incremental.state);
+}
+
+function materializationRows<Row>(stored: StoredMaterialization<Row>): readonly Row[] {
+  return stored.derivationSnapshot.rows;
+}
+
+function derivationRefreshOptions(
+  deltas: readonly RelationDelta[] | undefined
+): { readonly inputDeltas: readonly RelationDelta[] } | Record<string, never> {
+  return deltas === undefined ? {} : { inputDeltas: deltas };
+}
+
+function materializationMaintenanceRowDelta<Row>(
+  refresh: DerivationRefresh<Row>,
+  maintained: {
+    readonly addedRows: readonly Row[];
+    readonly removedRows: readonly Row[];
+    readonly rowChanges: readonly RowChange<Row>[];
+  }
+): {
+  readonly addedRows: readonly Row[];
+  readonly removedRows: readonly Row[];
+  readonly rowChanges: readonly RowChange<Row>[];
+} {
+  return refresh.delta.rowChanges.length === 0 && maintained.rowChanges.length > 0
+    ? maintained
+    : refresh.delta;
+}
+
+function derivationTargetFor<Row>(metadata: MaterializationMetadata<Row>): DerivationTarget<Row> {
+  return {
+    kind: 'query',
+    id: metadata.id,
+    query: metadata.query
+  };
 }
 
 function patchMaterializationRows<Row>(
@@ -2394,12 +2490,12 @@ function hasOwnEnvValue(env: EvaluateOptions['env'], name: string): boolean {
 }
 
 function storeMaterialization<Row>(db: object, entry: StoredMaterialization<Row>): void {
-  const store = materializationStore.get(db) ?? new Map<string, StoredMaterialization>();
+  const store = materializationStore.get(db) ?? new Map<string, AnyStoredMaterialization>();
   storeMaterializationIn(store, entry);
   materializationStore.set(db, store);
 }
 
-function storeMaterializationIn<Row>(store: Map<string, StoredMaterialization>, entry: StoredMaterialization<Row>): void {
+function storeMaterializationIn<Row>(store: Map<string, AnyStoredMaterialization>, entry: StoredMaterialization<Row>): void {
   store.set(entry.metadata.id, entry);
   store.set(entry.metadata.queryKey, entry);
 }
@@ -2632,16 +2728,8 @@ function collectExpression(expr: ExprData, expressions: ExprData[]): void {
   }
 }
 
-function uniqueMaterializations(store: Map<string, StoredMaterialization>): readonly StoredMaterialization[] {
+function uniqueMaterializations(store: Map<string, AnyStoredMaterialization>): readonly AnyStoredMaterialization[] {
   return Array.from(new Set(store.values()));
-}
-
-function diffMaterializationRows<Row>(
-  before: readonly Row[],
-  after: readonly Row[],
-  query: Query<Row>
-): RowDiff<Row> {
-  return diffMaterializationRowsByOptions(before, after, materializationDiffOptions(query));
 }
 
 function materializationDiffOptions<Row>(query: Query<Row>): MaterializationRowDiffOptions {
@@ -3322,7 +3410,11 @@ function uniqueIndexResult<Row, Value>(
   const diagnostics: readonly MaterializationDiagnostic[] = maintained?.diagnostics ?? [];
   const fallbackDiagnostics: MaterializationDiagnostic[] = [];
   const maintainedLookup = maintained?.lookup as ReadonlyMap<Value, MaterializationNestedUniqueRows<Row>> | undefined;
-  const lookup = maintainedLookup ?? groupUniqueRowsByFields<Row, Value>(stored.rows as readonly Row[], fields, fallbackDiagnostics);
+  const lookup = maintainedLookup ?? groupUniqueRowsByFields<Row, Value>(
+    materializationRows(stored) as readonly Row[],
+    fields,
+    fallbackDiagnostics
+  );
   const facade = uniqueIndex<Row, Value>(lookup, fields);
   const resultDiagnostics = maintained === undefined ? fallbackDiagnostics : diagnostics;
 
@@ -3695,8 +3787,8 @@ function unsupportedDirectExpressionIndexResult<Row, Value>(
   }
 }
 
-function withTarget<Result extends object>(
-  stored: StoredMaterialization,
+function withTarget<Row, Result extends object>(
+  stored: StoredMaterialization<Row>,
   result: Result
 ): Result & { readonly id: string; readonly queryKey: string } {
   return {

@@ -87,6 +87,8 @@ import {
   watchTargetKey,
   constrain,
   req,
+  refreshMaterialization,
+  readMaterializedQuery,
   unique
 } from '@tarstate/core';
 import type { Db, DbTransactionContext, RelationDelta, RelationSource, WatchEvent } from '@tarstate/core';
@@ -95,6 +97,7 @@ import { diffRows, stableValue } from '@tarstate/core/diff';
 import {
   adaUser,
   beaUser,
+  calUser,
   coreSchema,
   designTeam,
   draftEvaluatorTask,
@@ -450,6 +453,90 @@ describe('TypeScript Relic core acceptance', () => {
       { id: 'ada', name: 'Ada', age: 37, teamId: 'eng' },
       { id: 'dia', name: 'Dia', age: 24, teamId: 'eng' }
     ]);
+  });
+
+  it('refreshes public materialized rows from the derivation snapshot', async () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) as Query<{ readonly id: string; readonly name: string }>;
+    const target = {
+      data: {
+        users: [adaUser, beaUser]
+      } as Record<string, readonly unknown[]>
+    };
+    const state = mat(target, activeUsers, { id: 'active-users' });
+    const nextAda = { ...adaUser, name: 'Ada Lovelace' };
+    const nextCal = { ...calUser, active: true };
+
+    target.data.users = [nextAda, { ...beaUser, active: false }, nextCal];
+
+    const refreshed = refreshMaterialization(state, activeUsers);
+    const readThrough = await readMaterializedQuery(state, activeUsers);
+
+    expect(refreshed).toMatchObject({
+      refreshed: true,
+      rows: [
+        { id: 'ada', name: 'Ada Lovelace' },
+        { id: 'cal', name: 'Cal' }
+      ]
+    });
+    expect(materializedRowsForQuery(state, activeUsers)).toBe(refreshed.rows);
+    expect(readThrough.rows).toBe(refreshed.rows);
+  });
+
+  it('reports maintained row changes from derivation snapshot identity', () => {
+    const user = as(coreSchema.users, 'user');
+    const activeUsers = pipe(
+      from(user),
+      where(eq(user.active, true)),
+      project({ id: user.id, name: user.name }),
+      keyBy('id')
+    ) as Query<{ readonly id: string; readonly name: string }>;
+    const state = mat(createDb({ users: [adaUser, beaUser] }), activeUsers, { id: 'active-users' });
+    const nextAda = { ...adaUser, name: 'Ada Lovelace' };
+    const dia = {
+      id: 'dia',
+      teamId: 'eng',
+      name: 'Dia',
+      active: true,
+      age: 24,
+      tags: []
+    };
+    const inactiveBea = { ...beaUser, active: false };
+    const next = createDb({ users: [nextAda, inactiveBea, dia] });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [{
+        relation: coreSchema.users,
+        added: [nextAda, inactiveBea, dia],
+        removed: [adaUser, beaUser]
+      }]
+    });
+    const change = maintained.changes.find((item) => item.id === 'active-users');
+
+    expect(change?.rowChanges).toEqual([
+      {
+        kind: 'updated',
+        key: '["ada"]',
+        before: { id: 'ada', name: 'Ada' },
+        after: { id: 'ada', name: 'Ada Lovelace' }
+      },
+      {
+        kind: 'removed',
+        key: '["bea"]',
+        row: { id: 'bea', name: 'Bea' }
+      },
+      {
+        kind: 'added',
+        key: '["dia"]',
+        row: { id: 'dia', name: 'Dia' }
+      }
+    ]);
+    expect(materializedRowsForQuery(next, activeUsers)).toBe(change?.rows);
   });
 
   it('maintains multiple materialized queries independently across transactions', async () => {
