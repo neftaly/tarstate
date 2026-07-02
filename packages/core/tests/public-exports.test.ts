@@ -1,19 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { req, type ConstraintData } from '@tarstate/core/constraints';
-import { req as experimentalReq } from '@tarstate/core/experimental/constraints';
 import { diffRows } from '@tarstate/core/diff';
-import { diffRows as experimentalDiffRows } from '@tarstate/core/experimental/diff';
 import { mat, materializationForQuery, type MaterializationMetadata } from '@tarstate/core/materialization';
-import {
-  mat as experimentalMat,
-  materializationForQuery as experimentalMaterializationForQuery
-} from '@tarstate/core/experimental/materialization';
 import { trackTransact, type TrackTransactResult } from '@tarstate/core/runtime';
-import { trackTransact as experimentalTrackTransact } from '@tarstate/core/experimental/runtime';
 import { watch, type WatchEvent } from '@tarstate/core/watch';
-import { watch as experimentalWatch } from '@tarstate/core/experimental/watch';
 import {
+  agg,
+  aggregate,
   as,
+  count,
   createDb,
   defineSchema,
   deleteRows,
@@ -74,6 +69,8 @@ describe('public Relic-shaped exports', () => {
     expect(req(item, 'label') satisfies ConstraintData).toMatchObject({ op: 'req' });
     expect(diffRows([{ id: 'a' }], [{ id: 'b' }]).changes).toHaveLength(2);
     expect(deleteRows(item, eq(itemRow.id, 'a'))).toMatchObject({ op: 'delete' });
+    expect(agg).toBe(aggregate);
+    expect(pipe(from(itemRow), agg({ aggregates: { total: count() } })).data).toMatchObject({ op: 'aggregate' });
     expect(typeof maxBy).toBe('function');
     expect(typeof minBy).toBe('function');
     expect(metadata?.kind).toBe('materialization');
@@ -82,25 +79,5 @@ describe('public Relic-shaped exports', () => {
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
     expect(tracked).toMatchObject({ kind: 'trackTransact' });
     expect(tracked.changes.at(0)).toMatchObject({ kind: 'trackedChange' });
-  });
-
-  it('keeps legacy experimental aliases loadable beside stable subpaths', async () => {
-    const itemRow = as(item, 'item');
-    const query = pipe(
-      from(itemRow),
-      project({
-        id: itemRow.id,
-        label: itemRow.label
-      })
-    ) satisfies Query<ItemProjection>;
-    const db = experimentalMat(createDb({ items: [{ id: 'a', label: 'Alpha' }] }), query);
-    const metadata = experimentalMaterializationForQuery(db, query) satisfies MaterializationMetadata<ItemProjection> | undefined;
-    const watched = experimentalWatch(db, query);
-    const tracked = await experimentalTrackTransact(watched, insert(item, { id: 'b', label: 'Beta' })) satisfies TrackTransactResult;
-
-    expect(experimentalReq(item, 'label') satisfies ConstraintData).toMatchObject({ op: 'req' });
-    expect(experimentalDiffRows([{ id: 'a' }], [{ id: 'b' }]).changes).toHaveLength(2);
-    expect(metadata?.kind).toBe('materialization');
-    expect(tracked.kind).toBe('trackTransact');
   });
 });

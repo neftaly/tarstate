@@ -1,4 +1,5 @@
 import type { TarstateDiagnostic } from './diagnostics.js';
+import type { EvaluateFunctions, EvaluateOptions } from './evaluate.js';
 import type { RelationDelta } from './adapter.js';
 import type { RowChange, RowDiff, RowDiffDiagnostic } from './diff.js';
 import {
@@ -176,7 +177,7 @@ export type MaterializationOptions = {
   readonly id?: string;
   readonly name?: string;
   readonly mode?: MaterializationMode;
-};
+} & EvaluateOptions;
 export type SnapshotMaterializationOptions = MaterializationOptions;
 export type MaterializationQueryBatch<Row = unknown> = Record<string, Query<Row>>;
 export type MaterializationMaintenanceOptions = {
@@ -428,12 +429,15 @@ type StoredMaterialization<Row = unknown> = {
   readonly rows: readonly Row[];
   readonly rowIndex: MaterializationRowIndex<Row>;
   readonly indexes: MaintainedIndexes<Row>;
+  readonly evaluateOptions: EvaluateOptions;
+  readonly cacheable: boolean;
   readonly incremental?: IncrementalMaterialization<Row>;
 };
 type MaterializationEvalTarget = {
   readonly source: RelationSource;
   readonly query: Query;
   readonly env: Readonly<Record<string, unknown>>;
+  readonly functions?: EvaluateFunctions;
 };
 
 const materializedDbs = new WeakSet<object>();
@@ -490,6 +494,7 @@ export function explainMaterialization<Row>(
   const planned = requestedMode === 'incremental' ? planIncrementalMaterialization(query) : undefined;
   const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
   const id = options.id ?? options.name ?? key;
+  const functionDiagnostics = missingFunctionDiagnostics(query, options.functions);
   return {
     kind: 'materializationExplanation',
     queryKey: key,
@@ -501,9 +506,10 @@ export function explainMaterialization<Row>(
       : planned.reason,
     dependencies: relationDependencies(query),
     indexSpecs: materializationIndexSpecs(query),
-    diagnostics: planned?.supported === false
-      ? [incrementalFallbackDiagnostic(id, key, planned.reason)]
-      : []
+    diagnostics: [
+      ...(planned?.supported === false ? [incrementalFallbackDiagnostic(id, key, planned.reason)] : []),
+      ...functionDiagnostics
+    ]
   };
 }
 
@@ -824,9 +830,13 @@ export function materializedRowsForQuery<Row = unknown>(
 
 export function queryRowsFromMaterialization<Row = unknown>(
   input: unknown,
-  query: Query<Row>
+  query: Query<Row>,
+  options: EvaluateOptions = {}
 ): readonly Row[] | undefined {
-  return materializedRowsForQuery(input, query);
+  const stored = resolveMaterialization(input, query);
+  return stored !== undefined && materializedRowsCanServeQuery(stored, options)
+    ? stored.rows as readonly Row[]
+    : undefined;
 }
 
 export function readMaterializedQuery<Row = unknown>(
@@ -834,7 +844,7 @@ export function readMaterializedQuery<Row = unknown>(
   query: Query<Row>
 ): Promise<MaterializedQueryResult<Row>> {
   const stored = resolveMaterialization(input, query);
-  if (stored !== undefined) {
+  if (stored !== undefined && materializedRowsCanServeQuery(stored, {})) {
     return Promise.resolve({
       kind: 'materializedQueryResult',
       materialized: true,
@@ -849,7 +859,7 @@ export function readMaterializedQuery<Row = unknown>(
     kind: 'materializedQueryResult',
     materialized: false,
     rows: [],
-    diagnostics: [missingDiagnostic()],
+    diagnostics: stored === undefined ? [missingDiagnostic()] : stored.metadata.diagnostics,
     queryKey: queryKey(query)
   });
 }
@@ -891,6 +901,10 @@ export function materializedLookupRowsFor(
   }
 
   for (const stored of uniqueMaterializations(store)) {
+    if (!stored.cacheable) {
+      continue;
+    }
+
     if (!materializationCanServeRelationLookup(stored, relation, field)) {
       continue;
     }
@@ -912,6 +926,9 @@ function materializedEqualityRowsFor<Row>(
 ): readonly Row[] | undefined {
   const stored = resolveMaterialization(input, target);
   if (stored === undefined) {
+    return undefined;
+  }
+  if (!stored.cacheable) {
     return undefined;
   }
 
@@ -966,6 +983,9 @@ function materializedRangeRowsFor<Row>(
 
   const stored = resolveMaterialization(input, target);
   if (stored === undefined) {
+    return undefined;
+  }
+  if (!stored.cacheable) {
     return undefined;
   }
 
@@ -1138,6 +1158,8 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
   const key = queryKey(query);
   const requestedMode = options.mode ?? 'snapshot';
   const id = options.id ?? options.name ?? key;
+  const evaluateOptions = materializationEvaluateOptions(options);
+  const functionDiagnostics = missingFunctionDiagnostics(query, evaluateOptions.functions);
   const planned = requestedMode === 'incremental' ? planIncrementalMaterialization(query) : undefined;
   const maintenance = planned?.supported === true ? 'incremental' : 'snapshot';
   const metadata: MaterializationMetadata<Row> = {
@@ -1152,12 +1174,19 @@ function materializeDbSnapshot<Db extends SnapshotMaterializationTarget, Row>(
       : planned.reason,
     dependencies: relationDependencies(query),
     indexSpecs: materializationIndexSpecs(query),
-    diagnostics: planned?.supported === false
-      ? [incrementalFallbackDiagnostic(id, key, planned.reason)]
-      : [],
+    diagnostics: [
+      ...(planned?.supported === false ? [incrementalFallbackDiagnostic(id, key, planned.reason)] : []),
+      ...functionDiagnostics
+    ],
     ...(options.name === undefined ? {} : { name: options.name })
   };
-  storeMaterialization(db, materializationEntryFor(db, metadata, planned?.supported === true ? planned.plan : undefined));
+  storeMaterialization(db, materializationEntryFor(
+    db,
+    metadata,
+    evaluateOptions,
+    functionDiagnostics.length === 0,
+    planned?.supported === true ? planned.plan : undefined
+  ));
   return markMaterialized(db);
 }
 
@@ -1187,22 +1216,29 @@ function materializationOptionsForBatchItem(
 function materializationEntryFor<Row>(
   target: SnapshotMaterializationTarget,
   metadata: MaterializationMetadata<Row>,
+  evaluateOptions: EvaluateOptions,
+  cacheable: boolean,
   plan?: IncrementalMaterializationPlan
 ): StoredMaterialization<Row> {
-  if (plan !== undefined) {
+  if (cacheable && plan !== undefined) {
     if (plan.kind === 'staticRows') {
       const built = buildStaticIncrementalMaterialization<Row>(plan, envFor(target));
       if (!built.supported) {
         return materializationEntryWithRows(
           metadataWithIncrementalFallback(metadata, built.reason),
-          evaluateTargetRows(target, metadata.query)
+          evaluateTargetRows(target, metadata.query, evaluateOptions),
+          evaluateOptions,
+          cacheable
         );
       }
 
-      return materializationEntryWithRows(metadata, built.rows, {
-        plan: built.plan,
-        state: built.state
-      });
+      return materializationEntryWithRows(
+        metadata,
+        built.rows,
+        evaluateOptions,
+        cacheable,
+        { plan: built.plan, state: built.state }
+      );
     }
 
     const relation = metadata.query.relations[plan.rootRelation];
@@ -1220,23 +1256,35 @@ function materializationEntryFor<Row>(
       if (!built.supported) {
         return materializationEntryWithRows(
           metadataWithIncrementalFallback(metadata, built.reason),
-          evaluateTargetRows(target, metadata.query)
+          evaluateTargetRows(target, metadata.query, evaluateOptions),
+          evaluateOptions,
+          cacheable
         );
       }
 
-      return materializationEntryWithRows(metadata, built.rows, {
-        plan: built.plan,
-        state: built.state
-      });
+      return materializationEntryWithRows(
+        metadata,
+        built.rows,
+        evaluateOptions,
+        cacheable,
+        { plan: built.plan, state: built.state }
+      );
     }
   }
 
-  return materializationEntryWithRows(metadata, evaluateTargetRows(target, metadata.query));
+  return materializationEntryWithRows(
+    metadata,
+    cacheable ? evaluateTargetRows(target, metadata.query, evaluateOptions) : [],
+    evaluateOptions,
+    cacheable
+  );
 }
 
 function materializationEntryWithRows<Row>(
   metadata: MaterializationMetadata<Row>,
   rows: readonly Row[],
+  evaluateOptions: EvaluateOptions,
+  cacheable: boolean,
   incremental?: IncrementalMaterialization<Row>
 ): StoredMaterialization<Row> {
   const maintainedDefinitions = maintainedIndexDefinitions(metadata.indexSpecs);
@@ -1248,6 +1296,8 @@ function materializationEntryWithRows<Row>(
     rows,
     rowIndex: materializationRowIndex(rows, materializationDiffOptions(metadata.query)),
     indexes: buildMaintainedIndexes(rows, maintainedDefinitions),
+    evaluateOptions,
+    cacheable,
     ...(incremental === undefined ? {} : { incremental })
   };
 }
@@ -1453,11 +1503,26 @@ function recomputeMaterializationEntry<Row>(
   target: SnapshotMaterializationTarget,
   stored: StoredMaterialization<Row>
 ): StoredMaterialization<Row> {
-  return materializationEntryFor(target, stored.metadata, stored.incremental?.plan);
+  return materializationEntryFor(
+    target,
+    stored.metadata,
+    stored.evaluateOptions,
+    stored.cacheable,
+    stored.incremental?.plan
+  );
 }
 
-function evaluateTargetRows<Row>(target: SnapshotMaterializationTarget, query: Query<Row>): readonly Row[] {
-  return evaluateData({ source: sourceFor(target), query, env: envFor(target) }, query.data) as readonly Row[];
+function evaluateTargetRows<Row>(
+  target: SnapshotMaterializationTarget,
+  query: Query<Row>,
+  options: EvaluateOptions = {}
+): readonly Row[] {
+  return evaluateData({
+    source: sourceFor(target),
+    query,
+    env: { ...envFor(target), ...options.env },
+    ...(options.functions === undefined ? {} : { functions: options.functions })
+  }, query.data) as readonly Row[];
 }
 
 function evaluateData(target: MaterializationEvalTarget, data: QueryData, outerRow: Record<string, unknown> = {}): readonly unknown[] {
@@ -1871,8 +1936,17 @@ function exprValue(row: unknown, expr: ExprData, target: MaterializationEvalTarg
       return expr.value;
     case 'env':
       return target.env[expr.name];
-    case 'call':
-      return undefined;
+    case 'call': {
+      const fn = target.functions?.[expr.name];
+      if (fn === undefined) {
+        return undefined;
+      }
+      try {
+        return fn(...expr.args.map((arg) => exprValue(row, arg, target)));
+      } catch {
+        return undefined;
+      }
+    }
     case 'hostCall': {
       if (expr.fn === undefined) {
         return undefined;
@@ -1975,6 +2049,218 @@ function resolveMaterialization<Row>(
   if (typeof target === 'string') return store.get(target) as StoredMaterialization<Row> | undefined;
   if (isQuery(target)) return store.get(queryKey(target)) as StoredMaterialization<Row> | undefined;
   return store.get(target.id) as StoredMaterialization<Row> | undefined;
+}
+
+function materializedRowsCanServeQuery<Row>(
+  stored: StoredMaterialization<Row> | undefined,
+  options: EvaluateOptions
+): boolean {
+  if (stored === undefined || !stored.cacheable) {
+    return false;
+  }
+
+  return materializationOptionsCanServeQuery(stored.metadata.query, stored.evaluateOptions, options);
+}
+
+function materializationOptionsCanServeQuery(
+  query: Query,
+  stored: EvaluateOptions,
+  requested: EvaluateOptions
+): boolean {
+  if (requested.functions !== undefined) {
+    for (const name of namedFunctionCalls(query)) {
+      if (stored.functions?.[name] !== requested.functions[name]) {
+        return false;
+      }
+    }
+  }
+
+  if (requested.env !== undefined) {
+    for (const name of envReferences(query)) {
+      if (!Object.is(stored.env?.[name], requested.env[name])) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+function materializationEvaluateOptions(options: EvaluateOptions): EvaluateOptions {
+  return {
+    ...(options.functions === undefined ? {} : { functions: options.functions }),
+    ...(options.env === undefined ? {} : { env: options.env })
+  };
+}
+
+function missingFunctionDiagnostics(
+  query: Query,
+  functions: EvaluateFunctions | undefined
+): readonly MaterializationDiagnostic[] {
+  return Array.from(namedFunctionCalls(query))
+    .filter((name) => functions?.[name] === undefined)
+    .sort()
+    .map((name): UnsupportedMaterializationDiagnostic => ({
+      code: 'materialization_unsupported',
+      message: `materialization function ${name} is not available`,
+      surface: 'materialization',
+      detail: {
+        expression: 'call',
+        function: name,
+        reason: 'named function expressions require a materialization functions registry'
+      }
+    }));
+}
+
+function namedFunctionCalls(query: Query): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const expression of queryExpressions(query)) {
+    if (expression.op === 'call') {
+      names.add(expression.name);
+    }
+  }
+  return names;
+}
+
+function envReferences(query: Query): ReadonlySet<string> {
+  const names = new Set<string>();
+  for (const expression of queryExpressions(query)) {
+    if (expression.op === 'env') {
+      names.add(expression.name);
+    }
+  }
+  return names;
+}
+
+function queryExpressions(query: Query): readonly ExprData[] {
+  const expressions: ExprData[] = [];
+  collectExpressions(query.data, expressions);
+  return expressions;
+}
+
+function collectExpressions(data: QueryData, expressions: ExprData[]): void {
+  switch (data.op) {
+    case 'from':
+    case 'constRows':
+      return;
+    case 'lookup':
+      collectExpression(data.value, expressions);
+      return;
+    case 'where':
+      collectExpressions(data.input, expressions);
+      collectPredicateExpressions(data.predicate, expressions);
+      return;
+    case 'hash':
+    case 'btree':
+      collectExpressions(data.input, expressions);
+      for (const expression of data.expressions) {
+        collectExpression(expression, expressions);
+      }
+      return;
+    case 'keyBy':
+    case 'without':
+    case 'rename':
+    case 'qualify':
+      collectExpressions(data.input, expressions);
+      return;
+    case 'select':
+    case 'extend':
+      collectExpressions(data.input, expressions);
+      collectProjectionExpressions(data.projection, expressions);
+      return;
+    case 'expand':
+      collectExpressions(data.input, expressions);
+      collectExpression(data.collection, expressions);
+      return;
+    case 'sort':
+    case 'sortLimit':
+      collectExpressions(data.input, expressions);
+      for (const item of data.order) {
+        collectExpression(item.expr, expressions);
+      }
+      return;
+    case 'limit':
+      collectExpressions(data.input, expressions);
+      return;
+    case 'join':
+      collectExpressions(data.left, expressions);
+      collectExpressions(data.right, expressions);
+      collectPredicateExpressions(data.on, expressions);
+      return;
+    case 'union':
+    case 'intersection':
+      for (const input of data.inputs) {
+        collectExpressions(input, expressions);
+      }
+      return;
+    case 'difference':
+      collectExpressions(data.left, expressions);
+      collectExpressions(data.right, expressions);
+      return;
+    case 'aggregate':
+      collectExpressions(data.input, expressions);
+      collectProjectionExpressions(data.groupBy, expressions);
+      collectProjectionExpressions(data.aggregates, expressions);
+      return;
+  }
+}
+
+function collectPredicateExpressions(predicate: PredicateData, expressions: ExprData[]): void {
+  switch (predicate.op) {
+    case 'eq':
+    case 'neq':
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte':
+      collectExpression(predicate.left, expressions);
+      collectExpression(predicate.right, expressions);
+      return;
+    case 'and':
+    case 'or':
+      for (const item of predicate.predicates) {
+        collectPredicateExpressions(item, expressions);
+      }
+      return;
+    case 'not':
+      collectPredicateExpressions(predicate.predicate, expressions);
+      return;
+  }
+}
+
+function collectProjectionExpressions(projection: ProjectionData, expressions: ExprData[]): void {
+  for (const item of Object.values(projection)) {
+    collectExpression(projectionExpr(item), expressions);
+  }
+}
+
+function collectExpression(expr: ExprData, expressions: ExprData[]): void {
+  expressions.push(expr);
+  switch (expr.op) {
+    case 'call':
+    case 'hostCall':
+      for (const arg of expr.args) {
+        collectExpression(arg, expressions);
+      }
+      return;
+    case 'tuple':
+      for (const item of expr.items) {
+        collectExpression(item, expressions);
+      }
+      return;
+    case 'aggregateCall':
+      if (expr.expr !== undefined) {
+        collectExpression(expr.expr, expressions);
+      }
+      return;
+    case 'subquery':
+      collectExpressions(expr.query, expressions);
+      return;
+    case 'field':
+    case 'value':
+    case 'env':
+      return;
+  }
 }
 
 function uniqueMaterializations(store: Map<string, StoredMaterialization>): readonly StoredMaterialization[] {

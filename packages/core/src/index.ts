@@ -73,12 +73,120 @@ export type {
 } from './db.js';
 export { evaluate } from './evaluate.js';
 export type { EvaluateEnv, EvaluateFunction, EvaluateFunctions, EvaluateOptions, QueryResult } from './evaluate.js';
-export * from './constraints.js';
+export {
+  attachConstraints,
+  attachedConstraintsFor,
+  check,
+  constrain,
+  constraintAttachmentsFor,
+  DbConstraintTransactionError,
+  detachConstraints,
+  fk,
+  hasAttachedConstraints,
+  req,
+  transactConstrained,
+  tryTransactConstrained,
+  unique,
+  validateAttachedConstraints,
+  validateConstraints
+} from './constraints.js';
+export type {
+  CheckConstraintData,
+  ConstrainedDb,
+  ConstraintAttachment,
+  ConstraintAttachmentInput,
+  ConstraintData,
+  ConstraintOptions,
+  ConstraintRelationField,
+  ConstraintRelationFields,
+  ConstraintRelationRow,
+  ConstraintSet,
+  ConstraintValidationInput,
+  ConstraintValidationOptions,
+  ConstraintValidationResult,
+  ForeignKeyCascade,
+  ForeignKeyConstraintData,
+  QueryForeignKeyConstraintData,
+  QueryRequiredConstraintData,
+  QueryUniqueConstraintData,
+  QueryUniqueExpressionConstraintData,
+  RequiredConstraintData,
+  UniqueConstraintData
+} from './constraints.js';
 export { createMemoryRelationRuntime } from './memory-runtime.js';
 export type { MemoryRelationRuntimeOptions } from './memory-runtime.js';
-export * from './materialization.js';
+export {
+  demat,
+  evaluateDbQueryRows,
+  explainMaterialization,
+  index,
+  isMaterialized,
+  maintainMaterializationSnapshots,
+  maintainMaterializations,
+  mat,
+  materializationForQuery,
+  materializationsFor,
+  materializedLookupRowsFor,
+  materializedRowsFor,
+  materializedRowsForQuery,
+  materializedSourceFor,
+  materializeSnapshot,
+  queryRowsFromMaterialization,
+  readMaterializedQuery,
+  refreshMaterialization,
+  refreshMaterializationSnapshot,
+  snapshotHashIndex,
+  snapshotIndex
+} from './materialization.js';
+export type {
+  IncrementalFallbackMaterializationDiagnostic,
+  MaterializableDb,
+  MaterializationBtreeIndex,
+  MaterializationBtreeIndexResult,
+  MaterializationDiagnostic,
+  MaterializationExplanation,
+  MaterializationHashIndex,
+  MaterializationHashIndexResult,
+  MaterializationIndex,
+  MaterializationIndexOptions,
+  MaterializationIndexResult,
+  MaterializationIndexSpec,
+  MaterializationMaintenanceChange,
+  MaterializationMaintenanceChangeKind,
+  MaterializationMaintenanceDecision,
+  MaterializationMaintenanceKind,
+  MaterializationMaintenanceOptions,
+  MaterializationMaintenanceResult,
+  MaterializationMapLike,
+  MaterializationMetadata,
+  MaterializationMode,
+  MaterializationNestedRows,
+  MaterializationNestedUniqueRows,
+  MaterializationOptions,
+  MaterializationQueryBatch,
+  MaterializationRange,
+  MaterializationRangeBound,
+  MaterializationRefreshResult,
+  MaterializationSetLike,
+  MaterializationUniqueIndex,
+  MaterializationUniqueIndexResult,
+  MaterializedDb,
+  MaterializedQueryResult,
+  MaterializedSourceOptions,
+  MissingMaterializationDiagnostic,
+  MissingMaterializationRowsDiagnostic,
+  ObjectBackedMaterializableDb,
+  SnapshotMaterializationOptions,
+  SnapshotMaterializationTarget,
+  SnapshotRefreshTarget,
+  StaleMaterializationDiagnostic,
+  UnknownMaterializationVersionDiagnostic,
+  UnsupportedMaterializationDiagnostic,
+  UnsupportedMaterializationIndexDiagnostic
+} from './materialization.js';
 export {
   aggregate,
+  agg,
   and,
   any,
   as,
@@ -199,8 +307,65 @@ export type {
   StoreView,
   StoreViewReadOptions
 } from './store.js';
-export * from './runtime.js';
-export * from './watch.js';
+export {
+  trackRuntimeCommit,
+  trackTransact,
+  trackTransactPatches,
+  UnsupportedChangeTrackingError
+} from './runtime.js';
+export type {
+  TrackRuntimeCommitDiagnostic,
+  TrackRuntimeCommitOptions,
+  TrackRuntimeCommitResult,
+  TrackRuntimeCommitStatus,
+  TrackRuntimeCommitSupportedResult,
+  TrackRuntimeCommitUnsupportedResult,
+  TrackTransactCallback,
+  TrackTransactDiagnostic,
+  TrackTransactOptions,
+  TrackTransactOutput,
+  TrackTransactResult
+} from './runtime.js';
+export {
+  diffOptionsForTarget,
+  diffQuery,
+  isWatchMaterialization,
+  subscribeWatch,
+  trackedChangesForDbTransition,
+  transferWatches,
+  unwatch,
+  unwatchTarget,
+  watch,
+  watchChangeKeyMap,
+  watchChangeMap,
+  watchRuntime,
+  watchTarget,
+  watchTargetKey
+} from './watch.js';
+export type {
+  ChangeSet,
+  QueryDiff,
+  QueryDiffDiagnostic,
+  QueryDiffOptions,
+  RuntimeWatchHandle,
+  TrackedChange,
+  UnwatchResult,
+  WatchChangeKeyMap,
+  WatchChangeMap,
+  WatchDb,
+  WatchDiagnostic,
+  WatchEvent,
+  WatchHandle,
+  WatchListener,
+  WatchOptions,
+  WatchRefreshResult,
+  WatchRuntimeDiagnostic,
+  WatchSubscription,
+  WatchTarget,
+  WatchTargetChange,
+  WatchTargetRegistration,
+  WatchUnsubscribeResult
+} from './watch.js';
 export {
   deleteRows,
   deleteExact,

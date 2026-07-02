@@ -54,9 +54,9 @@ import {
   type DbTransactionInput,
   type Query
 } from '@tarstate/core';
-import { diffRows } from '@tarstate/core/experimental/diff';
-import { fromIndexedObjectSource } from '@tarstate/core/experimental/indexed-source';
-import { diffQuery } from '@tarstate/core/experimental/watch';
+import { diffRows } from '@tarstate/core/diff';
+import { fromIndexedObjectSource } from '@tarstate/core/indexed-source';
+import { diffQuery } from '@tarstate/core/watch';
 import { coreSchema, sourceData } from './fixtures';
 
 type ItemRow = {

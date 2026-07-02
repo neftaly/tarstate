@@ -520,6 +520,9 @@ export function aggregate<GroupBy extends ProjectionShape, Aggregates extends Pr
   }) as Query<ProjectedRow<GroupBy> & ProjectedRow<Aggregates>>;
 }
 
+/** Relic-shaped alias for `aggregate`. */
+export const agg = aggregate;
+
 /** Compare expressions or primitive literals with strict equality. */
 export function eq(left: ExprInput, right: ExprInput): PredicateData {
   return comparison('eq', left, right);

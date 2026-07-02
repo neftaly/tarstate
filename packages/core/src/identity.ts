@@ -1,5 +1,23 @@
+const stableValueCache = new Map<string, unknown>();
+
 /** Canonicalize values for stable structural identity. */
 export function stableValue(value: unknown): unknown {
+  const canonical = canonicalStableValue(value);
+  if (!isRecord(canonical) && !Array.isArray(canonical)) {
+    return canonical;
+  }
+
+  const key = JSON.stringify(stableKeyValue(value));
+  const existing = stableValueCache.get(key);
+  if (existing !== undefined) {
+    return existing;
+  }
+
+  stableValueCache.set(key, canonical);
+  return canonical;
+}
+
+function canonicalStableValue(value: unknown): unknown {
   if (value === undefined) {
     return { $tarstate: 'undefined' };
   }

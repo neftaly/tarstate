@@ -86,8 +86,7 @@ import {
 } from '@tarstate/core';
 import type { Db, DbTransactionContext, RelationDelta, RelationSource, WatchEvent } from '@tarstate/core';
 import type { Query } from '@tarstate/core/query';
-import { diffRows } from '@tarstate/core/experimental/diff';
-import { stableKey } from '@tarstate/core/experimental/identity';
+import { diffRows, stableValue } from '@tarstate/core/diff';
 import {
   adaUser,
   beaUser,
@@ -1587,7 +1586,7 @@ describe('TypeScript Relic core acceptance', () => {
     }));
 
     expect(getEnv(changed)).toEqual({ minimumPoints: 6 });
-    expect(stableKey({ b: 2, a: 1 })).toBe(stableKey({ a: 1, b: 2 }));
+    expect(stableValue({ b: 2, a: 1 })).toBe(stableValue({ a: 1, b: 2 }));
     expect(diffRows([{ id: 'a', n: 1 }], [{ id: 'a', n: 2 }, { id: 'b', n: 1 }], {
       keyBy: ['id']
     }).changes).toEqual([

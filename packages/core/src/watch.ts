@@ -243,7 +243,7 @@ function createWatchHandle<DbValue extends WatchDb, Row>(
   record.handle = handle;
   const storedRecord = record as AnyWatchRecord;
   addRecord(db, storedRecord);
-  ensureWatchMaterialization(db, target, record.id);
+  ensureWatchMaterialization(db, target, record.id, options);
   allWatchRecords.set(record.id, storedRecord);
 
   if (options.immediate === true) {
@@ -709,7 +709,7 @@ async function readTargetRows<Row>(
     return await source.rows(target) as readonly Row[];
   }
 
-  const materializedRows = queryRowsFromMaterialization(db, target);
+  const materializedRows = queryRowsFromMaterialization(db, target, options);
   return materializedRows ?? (await evaluate(source, target, options)).rows;
 }
 
@@ -765,7 +765,8 @@ function addDbTrackedWatch<Row>(db: WatchDb, target: WatchTarget<Row>): void {
 function ensureWatchMaterialization<Row>(
   db: WatchDb,
   target: WatchTarget<Row>,
-  ownerId: string
+  ownerId: string,
+  options: EvaluateOptions = {}
 ): void {
   if (!isQuery(target) || !isObject(db)) {
     return;
@@ -777,7 +778,7 @@ function ensureWatchMaterialization<Row>(
   if (state === undefined) {
     const owned = materializationForQuery(db, target) === undefined;
     if (owned) {
-      mat(db as SnapshotMaterializationTarget, target, { id: targetKey, mode: 'incremental' });
+      mat(db as SnapshotMaterializationTarget, target, { id: targetKey, mode: 'incremental', ...options });
     }
 
     state = {
@@ -854,7 +855,11 @@ function transferWatchMaterialization(
   let nextState = nextStates.get(targetKey);
   if (nextState === undefined) {
     if (previousState.owned && materializationForQuery(next, record.target) === undefined) {
-      mat(next as SnapshotMaterializationTarget, record.target, { id: targetKey, mode: 'incremental' });
+      mat(next as SnapshotMaterializationTarget, record.target, {
+        id: targetKey,
+        mode: 'incremental',
+        ...record.options
+      });
     }
 
     nextState = {

@@ -10,7 +10,6 @@
       "@tarstate/core/adapter": ["../core/dist/adapter.d.ts"],
       "@tarstate/core/schema": ["../core/dist/schema.d.ts"],
       "@tarstate/core/source": ["../core/dist/source.d.ts"],
-      "@tarstate/core/experimental/write-apply": ["../core/dist/write-apply.d.ts"],
       "@tarstate/core/write": ["../core/dist/write.d.ts"]
     }
   },

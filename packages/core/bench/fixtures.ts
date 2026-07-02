@@ -37,7 +37,7 @@ import {
   type Db,
   type RelationSource
 } from '@tarstate/core';
-import { fromIndexedObjectSource } from '@tarstate/core/experimental/indexed-source';
+import { fromIndexedObjectSource } from '@tarstate/core/indexed-source';
 
 export type ProjectRow = {
   readonly id: string;

@@ -22,16 +22,13 @@
       "@tarstate/core/adapter": [
         "./packages/core/src/adapter.ts"
       ],
-      "@tarstate/core/experimental/constraints": [
+      "@tarstate/core/constraints": [
         "./packages/core/src/constraints.ts"
       ],
       "@tarstate/core/db": [
         "./packages/core/src/db.ts"
       ],
-      "@tarstate/core/experimental/delta": [
-        "./packages/core/src/delta.ts"
-      ],
-      "@tarstate/core/experimental/diff": [
+      "@tarstate/core/diff": [
         "./packages/core/src/diff.ts"
       ],
       "@tarstate/core/diagnostics": [
@@ -40,13 +37,10 @@
       "@tarstate/core/evaluate": [
         "./packages/core/src/evaluate.ts"
       ],
-      "@tarstate/core/experimental/identity": [
-        "./packages/core/src/identity.ts"
-      ],
-      "@tarstate/core/experimental/indexed-source": [
+      "@tarstate/core/indexed-source": [
         "./packages/core/src/indexed-source.ts"
       ],
-      "@tarstate/core/experimental/materialization": [
+      "@tarstate/core/materialization": [
         "./packages/core/src/materialization.ts"
       ],
       "@tarstate/core/memory-runtime": [
@@ -55,7 +49,7 @@
       "@tarstate/core/query": [
         "./packages/core/src/query.ts"
       ],
-      "@tarstate/core/experimental/runtime": [
+      "@tarstate/core/runtime": [
         "./packages/core/src/runtime.ts"
       ],
       "@tarstate/core/schema": [
@@ -67,11 +61,8 @@
       "@tarstate/core/store": [
         "./packages/core/src/store.ts"
       ],
-      "@tarstate/core/experimental/watch": [
+      "@tarstate/core/watch": [
         "./packages/core/src/watch.ts"
-      ],
-      "@tarstate/core/experimental/write-apply": [
-        "./packages/core/src/write-apply.ts"
       ],
       "@tarstate/core/write": [
         "./packages/core/src/write.ts"

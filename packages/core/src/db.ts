@@ -346,7 +346,7 @@ export async function q(
     return mappedResult(relationQueryResult(db, queryOrQueries), options);
   }
 
-  const materializedRows = queryRowsFromMaterialization(db, queryOrQueries);
+  const materializedRows = queryRowsFromMaterialization(db, queryOrQueries, options);
   if (materializedRows !== undefined) {
     return mappedResult({ rows: materializedRows, diagnostics: [] }, options);
   }

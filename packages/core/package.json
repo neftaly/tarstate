@@ -12,6 +12,7 @@
     "./diagnostics": "./src/diagnostics.ts",
     "./diff": "./src/diff.ts",
     "./evaluate": "./src/evaluate.ts",
+    "./indexed-source": "./src/indexed-source.ts",
     "./memory-runtime": "./src/memory-runtime.ts",
     "./materialization": "./src/materialization.ts",
     "./query": "./src/query.ts",
@@ -20,16 +21,7 @@
     "./source": "./src/source.ts",
     "./store": "./src/store.ts",
     "./watch": "./src/watch.ts",
-    "./write": "./src/write.ts",
-    "./experimental/constraints": "./src/constraints.ts",
-    "./experimental/delta": "./src/delta.ts",
-    "./experimental/diff": "./src/diff.ts",
-    "./experimental/identity": "./src/identity.ts",
-    "./experimental/indexed-source": "./src/indexed-source.ts",
-    "./experimental/materialization": "./src/materialization.ts",
-    "./experimental/runtime": "./src/runtime.ts",
-    "./experimental/watch": "./src/watch.ts",
-    "./experimental/write-apply": "./src/write-apply.ts"
+    "./write": "./src/write.ts"
   },
   "scripts": {
     "bench": "vitest bench --config ../../vite.config.ts bench/*.bench.ts --run",

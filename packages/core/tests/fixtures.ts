@@ -1,4 +1,4 @@
-import { fromIndexedObjectSource } from '@tarstate/core/experimental/indexed-source';
+import { fromIndexedObjectSource } from '@tarstate/core/indexed-source';
 import {
   booleanField,
   defineSchema,

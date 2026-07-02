@@ -15,7 +15,7 @@ The core API is stabilizing around a Relic-shaped split:
   `commit`, and subscriptions. Store commit results use
   `accepted`/`partial`/`rejected` status plus a separate `reflected` flag for
   row effects. A `view(query)` is the stable derived-read API; materialization
-  remains an experimental core cache API outside the stable store contract.
+  remains a diagnostic-backed core cache API outside the stable store contract.
 - `query` describes relational row programs as data, including joins,
   explicit lookup, hash-declared equality lookup planning, btree-declared range
   lookup planning, query-only `uniqueIndex` metadata, dependency analysis
@@ -45,8 +45,8 @@ The core API is stabilizing around a Relic-shaped split:
   `deleteExact`, `replaceAll`, `insertOrMerge(row, { merge })`, and explicit
   `insertOrUpdate(row, { update })` constant set-map descriptors. Computed
   update expressions are left to a future explicit API.
-- `RelationDelta` is the stable adapter change-report type; experimental delta
-  and diff helpers remain lower-level change primitives.
+- `RelationDelta` is the stable adapter change-report type; diff helpers remain
+  lower-level change primitives.
 - `db` gives those programs a small object-backed runtime for examples, tests,
   and local state: diagnostics-aware `q`/`qMany`, row-only `qRows`/`qManyRows`,
   `stripMeta` for recovering normalized row data from a `Db`, and variadic
@@ -55,8 +55,8 @@ The core API is stabilizing around a Relic-shaped split:
   use `insertOrUpdate(row, { update })` from `write`.
 - `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
   rows for tests, local state, and adapter prototyping.
-- `constraints`, `materialization`, `watch`, and `runtime` are experimental,
-  diagnostic-backed surfaces. They provide baseline validation, object-backed
+- `constraints`, `materialization`, `watch`, and `runtime` are diagnostic-backed
+  core surfaces. They provide baseline validation, object-backed
   constraint enforcement, query-shaped `req`/`unique`/`fk` enforcement for
   deterministic query shapes, committed relation deltas, exact
   materialized-query read-through, maintained declared materialized
@@ -75,11 +75,6 @@ The core API is stabilizing around a Relic-shaped split:
   materialized/incremental paths keep diagnostics and fallback unless a function
   registry exists. Adapter-fed invalidations, async watch streams, and public IVM
   APIs are outside the current guarantees.
-
-See [developer-onboarding.md](../../docs/developer-onboarding.md) for current
-API status, onboarding flows, and package direction.
-See [roadmap.md](../../docs/roadmap.md) for maturity labels, open decision
-areas, and release readiness signals.
 
 ```tsx
 import { evaluate } from '@tarstate/core/evaluate'
@@ -145,23 +140,20 @@ code independent from application schemas, renderers, adapters, and wrappers.
 Examples and onboarding should teach taxonomy subpath imports:
 
 - `@tarstate/core/adapter`
-- `@tarstate/core/experimental/constraints`
+- `@tarstate/core/constraints`
 - `@tarstate/core/db`
-- `@tarstate/core/experimental/delta`
-- `@tarstate/core/experimental/diff`
 - `@tarstate/core/diagnostics`
+- `@tarstate/core/diff`
 - `@tarstate/core/evaluate`
-- `@tarstate/core/experimental/identity`
-- `@tarstate/core/experimental/indexed-source`
-- `@tarstate/core/experimental/materialization`
+- `@tarstate/core/indexed-source`
+- `@tarstate/core/materialization`
 - `@tarstate/core/query`
-- `@tarstate/core/experimental/runtime`
+- `@tarstate/core/runtime`
 - `@tarstate/core/schema`
 - `@tarstate/core/source`
 - `@tarstate/core/store`
-- `@tarstate/core/experimental/watch`
+- `@tarstate/core/watch`
 - `@tarstate/core/write`
-- `@tarstate/core/experimental/write-apply`
 
 The root barrel `@tarstate/core` remains a public convenience export for small
 consumers and compatibility, but subpaths make API ownership clearer in docs and
