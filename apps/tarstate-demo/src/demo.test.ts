@@ -1,8 +1,8 @@
 import { createElement, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
-import { qRows } from '@tarstate/core';
-import { TarstateProvider, type TarstateDbStore } from '@tarstate/react';
+import { qRows, readMaterializedQuery, type Store } from '@tarstate/core';
+import { TarstateProvider } from '@tarstate/react';
 import {
   RealEstateApp,
   RealEstateWalkthrough,
@@ -141,7 +141,7 @@ describe('Relic-style real-estate demo', () => {
   it('materializes listing rows and commission due', async () => {
     const store = await createRealEstateStore();
 
-    await expect(store.readMaterialized(listingRowsQuery)).resolves.toMatchObject({
+    await expect(readMaterializedQuery(store.getSnapshot().db, listingRowsQuery)).resolves.toMatchObject({
       materialized: true,
       rows: [
         expect.objectContaining({ id: 'property-garden' }),
@@ -149,7 +149,7 @@ describe('Relic-style real-estate demo', () => {
         expect.objectContaining({ id: 'property-mill' })
       ]
     });
-    await expect(store.readMaterialized(commissionDueQuery)).resolves.toMatchObject({
+    await expect(readMaterializedQuery(store.getSnapshot().db, commissionDueQuery)).resolves.toMatchObject({
       materialized: true,
       rows: [
         { id: 'agent-rose', agentId: 'agent-rose', agentName: 'Rose Patel', sales: 1, saleVolume: 343000, commissionDue: 2000 }
@@ -160,27 +160,47 @@ describe('Relic-style real-estate demo', () => {
   it('commits real-estate transactions and rejects invalid writes with diagnostics', async () => {
     const store = await createRealEstateStore();
 
-    await expect(runAddMillOfferTransaction(store)).resolves.toMatchObject({ committed: true });
-    await expect(store.rows(openOffersQuery)).resolves.toEqual(expect.arrayContaining([
+    await expect(runAddMillOfferTransaction(store)).resolves.toMatchObject({
+      status: 'accepted',
+      reflected: true,
+      effects: { patches: 1, applied: 1 },
+      snapshot: { revision: 1 }
+    });
+    await expect(store.view(openOffersQuery).rows()).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'offer-mill-mia-1' })
     ]));
 
-    await expect(runRejectGardenLatestTransaction(store)).resolves.toMatchObject({ committed: true });
-    await expect(store.rows(openOffersQuery)).resolves.not.toEqual(expect.arrayContaining([
+    await expect(runRejectGardenLatestTransaction(store)).resolves.toMatchObject({
+      status: 'accepted',
+      reflected: true,
+      effects: { patches: 1, applied: 1 },
+      snapshot: { revision: 2 }
+    });
+    await expect(store.view(openOffersQuery).rows()).resolves.not.toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'offer-garden-nico-2' })
     ]));
 
-    await expect(runAcceptHarbourOfferTransaction(store)).resolves.toMatchObject({ committed: true });
-    await expect(store.rows(listingRowsQuery)).resolves.toMatchObject([
+    await expect(runAcceptHarbourOfferTransaction(store)).resolves.toMatchObject({
+      status: 'accepted',
+      reflected: true,
+      effects: { patches: 1, applied: 1 },
+      snapshot: { revision: 3 }
+    });
+    await expect(store.view(listingRowsQuery).rows()).resolves.toMatchObject([
       { id: 'property-garden' },
       { id: 'property-mill' }
     ]);
-    await expect(store.rows(commissionDueQuery)).resolves.toEqual(expect.arrayContaining([
+    await expect(store.query(commissionDueQuery)).resolves.toMatchObject({
+      rows: expect.arrayContaining([
       { id: 'agent-bob', agentId: 'agent-bob', agentName: 'Bob Stone', sales: 1, saleVolume: 900000, commissionDue: 4500 }
-    ]));
+      ])
+    });
 
     const invalid = await runInvalidOfferAfterAcceptedTransaction(store);
-    expect(invalid.committed).toBe(false);
+    expect(invalid.status).toBe('rejected');
+    expect(invalid.reflected).toBe(false);
+    expect(invalid.effects.applied).toBe(0);
+    expect(invalid.snapshot.revision).toBe(3);
     expect(readableDiagnostics(invalid.diagnostics)).toContainEqual(expect.objectContaining({
       code: 'constraint_check',
       field: 'amount'
@@ -233,7 +253,7 @@ describe('Relic-style real-estate demo', () => {
     await waitFor(() => {
       expect(tableRowIds(renderer, 'playground')).toEqual(['property-mill']);
       expect(tableRowIds(renderer, 'materialized-listings')).toEqual(['property-garden', 'property-mill']);
-      expect(metric(renderer, 'Watch deleted')).toBe('property-harbour');
+      expect(metric(renderer, 'Watch removed')).toBe('property-harbour');
     });
 
     await click(renderer, 'invalid-offer');
@@ -264,7 +284,7 @@ async function renderApp(model: RealEstateModel): Promise<ReactTestRenderer> {
 }
 
 async function renderWithProvider(
-  store: TarstateDbStore,
+  store: Store,
   child: ReactElement
 ): Promise<ReactTestRenderer> {
   let renderer: ReactTestRenderer | undefined;

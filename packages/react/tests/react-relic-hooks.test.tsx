@@ -2,30 +2,24 @@ import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
 import {
-  createDbStore,
   TarstateProvider,
+  useCommit,
   useDb,
   useMaterialized,
   useQuery,
-  useTarstateDb,
-  useTarstateMaterialized,
-  useTarstateQuery,
   useTarstateSnapshot,
-  useTarstateTransact,
-  useTarstateWatch,
-  useTransact,
   useWatch,
   type MaterializedHookState,
   type QueryHookState,
   type TarstateDbSnapshot,
-  type TarstateDbStore,
-  type TarstateTransactResult,
   type WatchHookState
 } from '@tarstate/react';
+import { createStore, type Store, type StoreCommitResult } from '@tarstate/core/store';
 import { as, eq, from, pipe, project, where, type Query } from '@tarstate/core/query';
 import { booleanField, defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { insert, updateByKey } from '@tarstate/core/write';
-import type { Db } from '@tarstate/core/db';
+import { createDb, type Db } from '@tarstate/core/db';
+import { materializeSnapshot } from '@tarstate/core/materialization';
 
 type ItemRow = {
   readonly id: string;
@@ -68,24 +62,22 @@ const openItemQuery = pipe(
 );
 
 describe('@tarstate/react DB-first hooks', () => {
-  it('publishes provider, DB store, query, materialized, watch, and transact APIs', () => {
-    expect(createDbStore).toBeTypeOf('function');
+  it('publishes provider, store, query, materialized, watch, and commit APIs', () => {
     expect(TarstateProvider).toBeTypeOf('function');
-    expect(useDb).toBe(useTarstateDb);
-    expect(useQuery).toBe(useTarstateQuery);
-    expect(useTransact).toBe(useTarstateTransact);
-    expect(useMaterialized).toBe(useTarstateMaterialized);
-    expect(useWatch).toBe(useTarstateWatch);
-    expect(createDbStore().close).toBeTypeOf('function');
+    expect(useCommit).toBeTypeOf('function');
+    expect(useDb).toBeTypeOf('function');
+    expect(useQuery).toBeTypeOf('function');
+    expect(useMaterialized).toBeTypeOf('function');
+    expect(useWatch).toBeTypeOf('function');
   });
 
-  it('renders core query rows and transacts through the provider DB', async () => {
-    const store = createDbStore({
+  it('renders core query rows and commits through the provider Store', async () => {
+    const store = createStore({
       items: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
-    await expect(store.rows(schema.items)).resolves.toEqual([
-      { id: 'item-a', label: 'Alpha', done: false }
-    ]);
+    await expect(store.query(schema.items)).resolves.toMatchObject({
+      rows: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
     await expect(store.query('items')).resolves.toMatchObject({
       rows: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
@@ -98,34 +90,32 @@ describe('@tarstate/react DB-first hooks', () => {
     expect(probe.query.data).toEqual(['Alpha']);
     expect(probe.snapshot.revision).toBe(0);
 
-    let result: TarstateTransactResult | undefined;
+    let result: StoreCommitResult | undefined;
     await act(async () => {
-      result = await probe.transact(insert(schema.items, { id: 'item-b', label: 'Beta', done: true }));
+      result = await probe.commit(insert(schema.items, { id: 'item-b', label: 'Beta', done: true }));
     });
     await waitFor(() => probe.query.revision === 1 && probe.query.status === 'ready');
 
     expect(result).toMatchObject({
-      kind: 'tarstateTransact',
-      committed: true,
-      patches: 1,
-      applied: 1,
-      revision: 1
+      kind: 'tarstateCommit',
+      status: 'accepted',
+      reflected: true,
+      effects: {
+        patches: 1,
+        applied: 1
+      },
+      snapshot: {
+        revision: 1
+      }
     });
-    expect(result?.changes).toEqual([
-      expect.objectContaining({
-        kind: 'trackedChange',
-        changed: true,
-        addedRows: [{ id: 'item-b', label: 'Beta', done: true }]
-      })
-    ]);
     expect(probe.query.rows).toEqual([
       { id: 'item-a', label: 'Alpha', done: false },
       { id: 'item-b', label: 'Beta', done: true }
     ]);
   });
 
-  it('does not publish rejected transactions', async () => {
-    const store = createDbStore({
+  it('does not publish rejected commits', async () => {
+    const store = createStore({
       items: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
     let publishes = 0;
@@ -133,18 +123,19 @@ describe('@tarstate/react DB-first hooks', () => {
       publishes += 1;
     });
 
-    const result = await store.transact(insert(schema.items, { id: 'item-a', label: 'Duplicate', done: true }));
+    const result = await store.commit(insert(schema.items, { id: 'item-a', label: 'Duplicate', done: true }));
 
-    expect(result.committed).toBe(false);
-    expect(result.applied).toBe(0);
+    expect(result.status).toBe('rejected');
+    expect(result.reflected).toBe(false);
+    expect(result.effects.applied).toBe(0);
     expect(store.getSnapshot().revision).toBe(0);
     expect(publishes).toBe(0);
 
     unsubscribe();
   });
 
-  it('closes DB stores idempotently and suppresses future notifications', async () => {
-    const store = createDbStore({ items: [] });
+  it('closes core Stores idempotently and suppresses future notifications', async () => {
+    const store = createStore({ items: [] });
     const notified: number[] = [];
     const unsubscribe = store.subscribe(() => {
       notified.push(store.getSnapshot().revision);
@@ -157,27 +148,24 @@ describe('@tarstate/react DB-first hooks', () => {
       notified.push(-1);
     });
 
-    await store.transact(insert(schema.items, { id: 'item-a', label: 'Alpha', done: false }));
-    await store.replaceDb({
-      items: [{ id: 'item-b', label: 'Beta', done: true }]
-    });
+    await store.commit(insert(schema.items, { id: 'item-a', label: 'Alpha', done: false }));
 
-    expect(store.getSnapshot().revision).toBe(2);
+    expect(store.getSnapshot().revision).toBe(1);
     expect(store.getSnapshot().db.data.items).toEqual([
-      { id: 'item-b', label: 'Beta', done: true }
+      { id: 'item-a', label: 'Alpha', done: false }
     ]);
     expect(notified).toEqual([]);
     expect(lateUnsubscribe()).toBeUndefined();
   });
 
   it('reads and refreshes materialized query rows from core materialization', async () => {
-    const store = createDbStore({
+    const db = await materializeSnapshot(createDb({
       items: [
         { id: 'item-a', label: 'Alpha', done: false },
         { id: 'item-b', label: 'Beta', done: true }
       ]
-    });
-    await store.materialize(openItemQuery, { id: 'open-items' });
+    }), openItemQuery, { id: 'open-items' });
+    const store = createStore(db);
     const probe = await renderMaterializedProbe(store, openItemQuery);
 
     await waitFor(() => probe.materialized.status === 'ready');
@@ -186,13 +174,13 @@ describe('@tarstate/react DB-first hooks', () => {
       status: 'ready',
       materialized: true,
       rows: [{ id: 'item-a', label: 'Alpha' }],
-      revision: 1
+      revision: 0
     });
 
     await act(async () => {
-      await store.transact(updateByKey(schema.items, 'item-b', { done: false }));
+      await store.commit(updateByKey(schema.items, 'item-b', { done: false }));
     });
-    await waitFor(() => probe.materialized.revision === 2 && probe.materialized.status === 'ready');
+    await waitFor(() => probe.materialized.revision === 1 && probe.materialized.status === 'ready');
 
     expect(probe.materialized.rows).toEqual([
       { id: 'item-a', label: 'Alpha' },
@@ -201,31 +189,31 @@ describe('@tarstate/react DB-first hooks', () => {
   });
 
   it('delivers watch-derived notifications when transactions change query rows', async () => {
-    const store = createDbStore({
+    const store = createStore({
       items: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
     const probe = await renderWatchProbe(store, itemQuery);
 
-    await waitFor(() => probe.watch.events.length === 1);
+    await waitFor(() => probe.watch.event !== undefined);
     expect(probe.watch.event).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'item-a', label: 'Alpha', done: false }]
+      added: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
 
     await act(async () => {
-      await store.transact(insert(schema.items, { id: 'item-b', label: 'Beta', done: false }));
+      await store.commit(insert(schema.items, { id: 'item-b', label: 'Beta', done: false }));
     });
-    await waitFor(() => probe.watch.events.length === 2);
+    await waitFor(() => probe.watch.event?.rows.length === 2);
 
     expect(probe.watch.event).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'item-b', label: 'Beta', done: false }],
+      added: [{ id: 'item-b', label: 'Beta', done: false }],
       previousRows: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
   });
 
   it('updates watch listeners on transactions and cleans up after unmount', async () => {
-    const store = createDbStore({
+    const store = createStore({
       items: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
     const listenerEvents: Array<NonNullable<WatchHookState<ItemProjection>['event']>> = [];
@@ -243,21 +231,21 @@ describe('@tarstate/react DB-first hooks', () => {
       renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
     });
 
-    await waitFor(() => listenerEvents.length === 1 && current?.events.length === 1);
+    await waitFor(() => listenerEvents.length === 1 && current?.event !== undefined);
     expect(listenerEvents[0]).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'item-a', label: 'Alpha', done: false }]
+      added: [{ id: 'item-a', label: 'Alpha', done: false }]
     });
 
     await act(async () => {
-      await store.transact(insert(schema.items, { id: 'item-b', label: 'Beta', done: false }));
+      await store.commit(insert(schema.items, { id: 'item-b', label: 'Beta', done: false }));
     });
-    await waitFor(() => listenerEvents.length === 2 && current?.events.length === 2);
+    await waitFor(() => listenerEvents.length === 2 && current?.event?.rows.length === 2);
 
     expect(listenerEvents.at(-1)).toMatchObject({
       changed: true,
-      addedRows: [{ id: 'item-b', label: 'Beta', done: false }],
-      removedRows: []
+      added: [{ id: 'item-b', label: 'Beta', done: false }],
+      removed: []
     });
 
     assertDefined(renderer);
@@ -266,7 +254,7 @@ describe('@tarstate/react DB-first hooks', () => {
       mountedRenderer.unmount();
     });
     await act(async () => {
-      await store.transact(insert(schema.items, { id: 'item-c', label: 'Gamma', done: false }));
+      await store.commit(insert(schema.items, { id: 'item-c', label: 'Gamma', done: false }));
       await Promise.resolve();
     });
 
@@ -289,10 +277,39 @@ describe('@tarstate/react DB-first hooks', () => {
     await act(async () => {
       probe.renderer.update(createElement(TarstateProvider, { db: secondDb }, createElement(probe.Component)));
     });
-    await waitFor(() => probe.query.revision === 1 && probe.query.status === 'ready');
+    await waitFor(() => probe.query.revision === 0 && probe.query.status === 'ready');
 
     expect(probe.query.rows).toEqual([{ id: 'item-b', label: 'Beta', done: true }]);
     expect(probe.snapshot.db.data.items).toEqual(secondDb.items);
+  });
+
+  it('creates a fresh provider-owned Store after rendering with a caller Store', async () => {
+    const firstDb = {
+      items: [{ id: 'item-a', label: 'Alpha', done: false }]
+    };
+    const callerStore = createStore({
+      items: [{ id: 'item-b', label: 'Beta', done: true }]
+    });
+    const nextDb = {
+      items: [{ id: 'item-c', label: 'Gamma', done: false }]
+    };
+    const probe = await renderProviderDbProbe(firstDb);
+
+    await waitFor(() => probe.query.status === 'ready');
+    expect(probe.query.rows).toEqual([{ id: 'item-a', label: 'Alpha', done: false }]);
+
+    await act(async () => {
+      probe.renderer.update(createElement(TarstateProvider, { store: callerStore }, createElement(probe.Component)));
+    });
+    await waitFor(() => probe.query.rows.some((row) => row.id === 'item-b') && probe.query.status === 'ready');
+
+    await act(async () => {
+      probe.renderer.update(createElement(TarstateProvider, { db: nextDb }, createElement(probe.Component)));
+    });
+    await waitFor(() => probe.query.rows.some((row) => row.id === 'item-c') && probe.query.status === 'ready');
+
+    expect(probe.query.rows).toEqual([{ id: 'item-c', label: 'Gamma', done: false }]);
+    expect(probe.snapshot.db.data.items).toEqual(nextDb.items);
   });
 });
 
@@ -300,14 +317,14 @@ type ProbeState = {
   readonly db: Db;
   readonly query: QueryHookState<ItemProjection, readonly string[]>;
   readonly snapshot: TarstateDbSnapshot;
-  readonly transact: TarstateDbStore['transact'];
+  readonly commit: Store['commit'];
 };
 
 type RenderedProbe = ProbeState & {
   readonly renderer: ReactTestRenderer;
 };
 
-async function renderProbe(store: TarstateDbStore): Promise<RenderedProbe> {
+async function renderProbe(store: Store): Promise<RenderedProbe> {
   let current: ProbeState | undefined;
   let renderer: ReactTestRenderer | undefined;
 
@@ -316,7 +333,7 @@ async function renderProbe(store: TarstateDbStore): Promise<RenderedProbe> {
       db: useDb(),
       query: useQuery(itemQuery, { select: (rows) => rows.map((row) => row.label) }),
       snapshot: useTarstateSnapshot(),
-      transact: useTransact()
+      commit: useCommit()
     };
     return null;
   }
@@ -339,7 +356,7 @@ type RenderedMaterializedProbe = MaterializedProbeState & {
 };
 
 async function renderMaterializedProbe(
-  store: TarstateDbStore,
+  store: Store,
   query: Query<{ readonly id: string; readonly label: string }>
 ): Promise<RenderedMaterializedProbe> {
   let current: MaterializedProbeState | undefined;
@@ -370,7 +387,7 @@ type RenderedWatchProbe = WatchProbeState & {
 };
 
 async function renderWatchProbe(
-  store: TarstateDbStore,
+  store: Store,
   query: Query<ItemProjection>
 ): Promise<RenderedWatchProbe> {
   let current: WatchProbeState | undefined;

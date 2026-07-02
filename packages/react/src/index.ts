@@ -4,40 +4,36 @@ import {
   useCallback,
   useContext,
   useEffect,
-  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
   type ReactNode
 } from 'react';
-import type { RelationDelta } from '@tarstate/core/adapter';
 import {
-  createDb,
   q,
-  qRows,
-  tryTransact,
   type Db,
-  type DbInputData,
-  type DbQueryOptions,
-  type DbTransactionInput,
-  type DbTransactionResult,
-  type QueryBatch,
-  type QueryBatchResult
+  type DbInputData
 } from '@tarstate/core/db';
 import type { TarstateDiagnostic } from '@tarstate/core/diagnostics';
-import type { EvaluateOptions, QueryResult } from '@tarstate/core/evaluate';
+import type { EvaluateOptions } from '@tarstate/core/evaluate';
 import { queryKey, type Query } from '@tarstate/core/query';
-import type { RelationRef } from '@tarstate/core/schema';
 import {
-  materializeSnapshot,
   readMaterializedQuery,
   type MaterializationDiagnostic,
-  type MaterializedQueryResult,
-  type SnapshotMaterializationOptions
+  type MaterializedQueryResult
 } from '@tarstate/core/materialization';
+import {
+  createStore,
+  type Store,
+  type StoreDiagnostic,
+  type StoreQueryResult,
+  type StoreSeedInput,
+  type StoreSnapshot
+} from '@tarstate/core/store';
 
 export type TarstateReactDiagnostic =
   | TarstateDiagnostic
+  | StoreDiagnostic
   | MaterializationDiagnostic
   | {
       readonly code: string;
@@ -46,66 +42,25 @@ export type TarstateReactDiagnostic =
       readonly detail?: unknown;
     };
 
-export type TarstateDbInput = Db | DbInputData;
+export type TarstateDbInput = StoreSeedInput | DbInputData;
 
-export type TarstateDbSnapshot = {
-  readonly db: Db;
-  readonly revision: number;
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-};
-
-export type TarstateTransactResult = DbTransactionResult & {
-  readonly kind: 'tarstateTransact';
-  readonly previousDb: Db;
-  readonly revision: number;
-  readonly changes: readonly TrackedChange[];
-  readonly trackingDiagnostics: readonly TarstateReactDiagnostic[];
-};
-
-export type TarstateDbStore = {
-  readonly getSnapshot: () => TarstateDbSnapshot;
-  readonly subscribe: (listener: () => void) => () => void;
-  readonly close: () => void;
-  readonly replaceDb: (input: TarstateDbInput, diagnostics?: readonly TarstateReactDiagnostic[]) => Promise<void>;
-  readonly query: {
-    <Row, MappedRow>(
-      query: StoreQueryTarget<Row>,
-      options: DbQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
-    ): Promise<QueryResult<MappedRow>>;
-    <Row>(query: StoreQueryTarget<Row>, options?: DbQueryOptions<Row>): Promise<QueryResult<Row>>;
-    <const Queries extends QueryBatch>(queries: Queries, options?: DbQueryOptions): Promise<QueryBatchResult<Queries>>;
-  };
-  readonly rows: {
-    <Row, MappedRow>(
-      query: StoreQueryTarget<Row>,
-      options: DbQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
-    ): Promise<readonly MappedRow[]>;
-    <Row>(query: StoreQueryTarget<Row>, options?: DbQueryOptions<Row>): Promise<readonly Row[]>;
-  };
-  readonly transact: (...inputs: readonly DbTransactionInput[]) => Promise<TarstateTransactResult>;
-  readonly materialize: <Row>(
-    query: Query<Row>,
-    options?: SnapshotMaterializationOptions
-  ) => Promise<TarstateDbSnapshot>;
-  readonly readMaterialized: <Row>(query: Query<Row>) => Promise<MaterializedQueryResult<Row>>;
-};
+export type TarstateDbSnapshot = StoreSnapshot;
+export type TarstateCommit = Store['commit'];
 
 export type TarstateProviderProps = {
-  readonly store?: TarstateDbStore;
+  readonly store?: Store;
   readonly db?: TarstateDbInput;
   readonly children?: ReactNode;
 };
 
 export type UseQueryOptions<Row, Selected> = EvaluateOptions & {
   readonly deps?: readonly unknown[];
-  readonly select?: (rows: readonly Row[], result: QueryResult<Row>) => Selected;
+  readonly select?: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
 
 type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
-  readonly select: (rows: readonly Row[], result: QueryResult<Row>) => Selected;
+  readonly select: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
-
-type StoreQueryTarget<Row = unknown> = Query<Row> | RelationRef | string;
 
 export type QueryHookState<Row, Selected = readonly Row[]> = {
   readonly status: 'loading' | 'ready' | 'error';
@@ -115,7 +70,7 @@ export type QueryHookState<Row, Selected = readonly Row[]> = {
   readonly queryKey: string;
   readonly revision: number;
   readonly refresh: () => void;
-  readonly result?: QueryResult<Row>;
+  readonly result?: StoreQueryResult<Row>;
   readonly error?: unknown;
 };
 
@@ -139,12 +94,14 @@ export type WatchEvent<Row = unknown> = {
   readonly previousRows: readonly Row[];
   readonly rows: readonly Row[];
   readonly added: readonly Row[];
-  readonly deleted: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: readonly unknown[];
+  readonly diagnostics: readonly TarstateReactDiagnostic[];
+};
+
+export type WatchHookState<Row> = {
+  readonly event: WatchEvent<Row> | undefined;
   readonly diagnostics: readonly TarstateReactDiagnostic[];
 };
 
@@ -156,131 +113,36 @@ export type WatchOptions<Row = unknown> = EvaluateOptions & {
   readonly keyBy?: readonly string[] | ((row: Row) => unknown);
 };
 
-export type TrackedChange<Row = unknown> = {
-  readonly kind: 'trackedChange';
-  readonly id: string;
-  readonly target: string;
-  readonly changed: boolean;
-  readonly previousRows: readonly Row[];
-  readonly rows: readonly Row[];
-  readonly added: readonly Row[];
-  readonly deleted: readonly Row[];
-  readonly addedRows: readonly Row[];
-  readonly deletedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
-  readonly rowChanges: readonly unknown[];
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-};
-
-export type WatchHookState<Row> = {
-  readonly event: WatchEvent<Row> | undefined;
-  readonly events: readonly WatchEvent<Row>[];
-  readonly diagnostics: readonly TarstateReactDiagnostic[];
-};
-
-const TarstateContext = createContext<TarstateDbStore | undefined>(undefined);
+const TarstateContext = createContext<Store | undefined>(undefined);
 const emptyDiagnostics: readonly TarstateReactDiagnostic[] = Object.freeze([]);
 const emptyDeps: readonly unknown[] = Object.freeze([]);
 
-export function createDbStore(input: TarstateDbInput = createDb()): TarstateDbStore {
-  let snapshot: TarstateDbSnapshot = {
-    db: normalizeDb(input),
-    revision: 0,
-    diagnostics: emptyDiagnostics
-  };
-  const listeners = new Set<() => void>();
-  const materializations = new Map<string, {
-    readonly query: Query;
-    readonly options: SnapshotMaterializationOptions;
-  }>();
-  let closed = false;
-  const notify = (): void => {
-    if (closed) return;
-    for (const listener of listeners) listener();
-  };
-  const publish = async (
-    db: Db,
-    diagnostics: readonly TarstateReactDiagnostic[] = emptyDiagnostics
-  ): Promise<TarstateDbSnapshot> => {
-    let nextDb = db;
-    for (const entry of materializations.values()) {
-      nextDb = await materializeSnapshot(nextDb, entry.query, entry.options);
-    }
-    snapshot = {
-      db: nextDb,
-      revision: snapshot.revision + 1,
-      diagnostics
-    };
-    notify();
-    return snapshot;
-  };
-
-  const store: TarstateDbStore = {
-    getSnapshot: () => snapshot,
-    subscribe: (listener) => {
-      if (closed) {
-        return () => {};
-      }
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    close: () => {
-      if (closed) return;
-      closed = true;
-      listeners.clear();
-    },
-    replaceDb: async (input, diagnostics = emptyDiagnostics) => {
-      await publish(normalizeDb(input), diagnostics);
-    },
-    query: ((queryOrQueries: Query | QueryBatch, options?: DbQueryOptions) =>
-      queryDb(snapshot.db, queryOrQueries, options)) as TarstateDbStore['query'],
-    rows: ((queryValue: Query, options?: DbQueryOptions) =>
-      qRows(snapshot.db, queryValue, options)) as TarstateDbStore['rows'],
-    transact: async (...inputs) => {
-      const previousDb = snapshot.db;
-      const result = tryTransact(previousDb, ...inputs);
-      if (result.committed) {
-        await publish(result.db, result.diagnostics);
-      }
-      return {
-        kind: 'tarstateTransact',
-        ...result,
-        previousDb,
-        revision: snapshot.revision,
-        changes: deltasToChanges(result.deltas),
-        trackingDiagnostics: result.diagnostics
-      };
-    },
-    materialize: async (queryValue, options = {}) => {
-      materializations.set(queryKey(queryValue), { query: queryValue, options });
-      return publish(snapshot.db);
-    },
-    readMaterialized: (queryValue) => readMaterializedQuery(snapshot.db, queryValue)
-  };
-
-  return store;
-}
-
 export function TarstateProvider({ children, db, store }: TarstateProviderProps) {
-  const fallbackStore = useMemo(() => createDbStore(db), []);
-  const activeStore = store ?? fallbackStore;
   const dbRevision = useDependencyVersion(db === undefined ? emptyDeps : [db]);
-  const previousDb = useRef(db);
+  const ownedStore = useRef<{ readonly dbRevision: number; readonly store: Store } | undefined>(undefined);
 
-  useEffect(() => {
-    if (store === undefined && db !== undefined && previousDb.current !== db) {
-      void activeStore.replaceDb(db);
+  if (store === undefined) {
+    if (ownedStore.current === undefined || ownedStore.current.dbRevision !== dbRevision) {
+      ownedStore.current = { dbRevision, store: createStore(db) };
     }
-    previousDb.current = db;
-  }, [activeStore, store, dbRevision]);
+  } else {
+    ownedStore.current = undefined;
+  }
+
+  const activeStore = store ?? ownedStore.current?.store;
+  useEffect(() => {
+    if (store !== undefined || activeStore === undefined) {
+      return;
+    }
+    return () => {
+      activeStore.close();
+    };
+  }, [store, activeStore]);
 
   return createElement(TarstateContext.Provider, { value: activeStore }, children);
 }
 
-export function useTarstateStore(): TarstateDbStore {
+export function useTarstateStore(): Store {
   const store = useContext(TarstateContext);
   if (store === undefined) {
     throw new Error('useTarstateStore requires a TarstateProvider');
@@ -297,14 +159,10 @@ export function useDb(): Db {
   return useTarstateSnapshot().db;
 }
 
-export const useTarstateDb = useDb;
-
-export function useTransact(): TarstateDbStore['transact'] {
+export function useCommit(): TarstateCommit {
   const store = useTarstateStore();
-  return useCallback((...inputs: readonly DbTransactionInput[]) => store.transact(...inputs), [store]);
+  return store.commit;
 }
-
-export const useTarstateTransact = useTransact;
 
 export function useQuery<Row>(
   query: Query<Row>,
@@ -362,8 +220,6 @@ export function useQuery<Row, Selected>(
   return loadingQueryState(key, revision, refresh, lastReady.current);
 }
 
-export const useTarstateQuery = useQuery;
-
 export function useMaterialized<Row>(
   query: Query<Row>,
   options: { readonly deps?: readonly unknown[] } = {}
@@ -384,7 +240,7 @@ export function useMaterialized<Row>(
     setState((current) => current !== undefined && matches(current, identity)
       ? current
       : { ...loadingMaterializedState(key, revision, refresh), ...identity });
-    store.readMaterialized(query).then(
+    readMaterializedQuery(store.getSnapshot().db, query).then(
       (result) => {
         if (active) {
           setState({ ...readyMaterializedState(result, key, revision, refresh), ...identity });
@@ -408,8 +264,6 @@ export function useMaterialized<Row>(
   return loadingMaterializedState(key, revision, refresh);
 }
 
-export const useTarstateMaterialized = useMaterialized;
-
 export function useWatch<Row>(
   target: Query<Row>,
   listener?: WatchListener<Row>,
@@ -418,7 +272,7 @@ export function useWatch<Row>(
   const { db, revision } = useTarstateSnapshot();
   const targetKey = queryKey(target);
   const depsVersion = useDependencyVersion(options.deps ?? emptyDeps);
-  const [events, setEvents] = useState<readonly WatchEvent<Row>[]>([]);
+  const [event, setEvent] = useState<WatchEvent<Row> | undefined>();
   const [diagnostics, setDiagnostics] = useState<readonly TarstateReactDiagnostic[]>(emptyDiagnostics);
   const listenerRef = useRef<WatchListener<Row> | undefined>(listener);
   const previousRowsRef = useRef<readonly Row[]>([]);
@@ -427,7 +281,7 @@ export function useWatch<Row>(
 
   useEffect(() => {
     previousRowsRef.current = [];
-    setEvents([]);
+    setEvent(undefined);
     setDiagnostics(emptyDiagnostics);
   }, [targetKey, depsVersion]);
 
@@ -441,20 +295,17 @@ export function useWatch<Row>(
         kind: 'watchEvent',
         id: `watch-${targetKey}`,
         target,
-        changed: rowDiff.addedRows.length > 0 || rowDiff.removedRows.length > 0,
+        changed: rowDiff.added.length > 0 || rowDiff.removed.length > 0,
         previousRows,
         rows: result.rows,
-        added: rowDiff.addedRows,
-        deleted: rowDiff.removedRows,
-        addedRows: rowDiff.addedRows,
-        deletedRows: rowDiff.removedRows,
-        removedRows: rowDiff.removedRows,
-        unchangedRows: rowDiff.unchangedRows,
+        added: rowDiff.added,
+        removed: rowDiff.removed,
+        unchanged: rowDiff.unchanged,
         rowChanges: rowDiff.rowChanges,
         diagnostics: result.diagnostics
       };
       previousRowsRef.current = result.rows;
-      setEvents((current) => [...current, event]);
+      setEvent(event);
       setDiagnostics(result.diagnostics);
       await listenerRef.current?.(event);
     }, (error: unknown) => {
@@ -468,45 +319,13 @@ export function useWatch<Row>(
   }, [db, revision, targetKey, depsVersion]);
 
   return {
-    event: events.at(-1),
-    events,
+    event,
     diagnostics
   };
 }
 
-export const useTarstateWatch = useWatch;
-
-function normalizeDb(input: TarstateDbInput | undefined): Db {
-  if (isDb(input)) return input;
-  return createDb(input ?? {});
-}
-
-function queryDb<Row, MappedRow>(
-  db: Db,
-  query: StoreQueryTarget<Row>,
-  options: DbQueryOptions<Row, MappedRow> & { readonly mapRows: (rows: readonly Row[]) => readonly MappedRow[] }
-): Promise<QueryResult<MappedRow>>;
-function queryDb<Row>(db: Db, query: StoreQueryTarget<Row>, options?: DbQueryOptions<Row>): Promise<QueryResult<Row>>;
-function queryDb<const Queries extends QueryBatch>(
-  db: Db,
-  queries: Queries,
-  options?: DbQueryOptions
-): Promise<QueryBatchResult<Queries>>;
-function queryDb(
-  db: Db,
-  queryOrQueries: StoreQueryTarget | QueryBatch,
-  options?: DbQueryOptions
-): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>>;
-function queryDb(
-  db: Db,
-  queryOrQueries: StoreQueryTarget | QueryBatch,
-  options?: DbQueryOptions
-): Promise<QueryResult<unknown> | QueryBatchResult<QueryBatch>> {
-  return q(db, queryOrQueries as never, options as never);
-}
-
 function readyQueryState<Row, Selected>(
-  result: QueryResult<Row>,
+  result: StoreQueryResult<Row>,
   queryKeyValue: string,
   revision: number,
   refresh: () => void,
@@ -553,7 +372,7 @@ function errorQueryState<Row, Selected>(
   refresh: () => void,
   error: unknown,
   previousReady: QueryHookState<Row, Selected> | undefined,
-  result?: QueryResult<Row>
+  result?: StoreQueryResult<Row>
 ): QueryHookState<Row, Selected> {
   const state: QueryHookState<Row, Selected> = {
     status: 'error',
@@ -635,7 +454,7 @@ function withMaterializedRefresh<Row>(
 }
 
 type Identity = {
-  readonly store: TarstateDbStore;
+  readonly store: Store;
   readonly revision: number;
   readonly queryKey: string;
   readonly depsVersion: number;
@@ -665,10 +484,6 @@ function shallowEqualDeps(left: readonly unknown[], right: readonly unknown[]): 
   return left.length === right.length && left.every((value, index) => Object.is(value, right[index]));
 }
 
-function isDb(input: unknown): input is Db {
-  return typeof input === 'object' && input !== null && 'data' in input && 'env' in input;
-}
-
 function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null;
 }
@@ -678,23 +493,23 @@ function diffRows<Row>(
   rows: readonly Row[],
   keyBy: WatchOptions<Row>['keyBy']
 ): {
-  readonly addedRows: readonly Row[];
-  readonly removedRows: readonly Row[];
-  readonly unchangedRows: readonly Row[];
+  readonly added: readonly Row[];
+  readonly removed: readonly Row[];
+  readonly unchanged: readonly Row[];
   readonly rowChanges: readonly unknown[];
 } {
   const previousByKey = new Map(previousRows.map((row) => [rowKey(row, keyBy), row]));
   const nextByKey = new Map(rows.map((row) => [rowKey(row, keyBy), row]));
-  const addedRows = rows.filter((row) => !previousByKey.has(rowKey(row, keyBy)));
-  const removedRows = previousRows.filter((row) => !nextByKey.has(rowKey(row, keyBy)));
-  const unchangedRows = rows.filter((row) => previousByKey.has(rowKey(row, keyBy)));
+  const added = rows.filter((row) => !previousByKey.has(rowKey(row, keyBy)));
+  const removed = previousRows.filter((row) => !nextByKey.has(rowKey(row, keyBy)));
+  const unchanged = rows.filter((row) => previousByKey.has(rowKey(row, keyBy)));
   return {
-    addedRows,
-    removedRows,
-    unchangedRows,
+    added,
+    removed,
+    unchanged,
     rowChanges: [
-      ...removedRows.map((row) => ({ kind: 'removed', key: rowKey(row, keyBy), row })),
-      ...addedRows.map((row) => ({ kind: 'added', key: rowKey(row, keyBy), row }))
+      ...removed.map((row) => ({ kind: 'removed', key: rowKey(row, keyBy), row })),
+      ...added.map((row) => ({ kind: 'added', key: rowKey(row, keyBy), row }))
     ]
   };
 }
@@ -705,28 +520,6 @@ function rowKey<Row>(row: Row, keyBy: WatchOptions<Row>['keyBy']): string {
     return JSON.stringify(keyBy.map((field) => row[field]));
   }
   return JSON.stringify(row);
-}
-
-function deltasToChanges(deltas: readonly RelationDelta[]): readonly TrackedChange[] {
-  return deltas.map((delta, index) => ({
-    kind: 'trackedChange',
-    id: `delta-${index + 1}`,
-    target: delta.relation.name,
-    changed: delta.added.length > 0 || delta.removed.length > 0,
-    previousRows: delta.removed,
-    rows: delta.added,
-    added: delta.added,
-    deleted: delta.removed,
-    addedRows: delta.added,
-    deletedRows: delta.removed,
-    removedRows: delta.removed,
-    unchangedRows: [],
-    rowChanges: [
-      ...delta.removed.map((row) => ({ kind: 'removed', key: JSON.stringify(row), row })),
-      ...delta.added.map((row) => ({ kind: 'added', key: JSON.stringify(row), row }))
-    ],
-    diagnostics: []
-  }));
 }
 
 function reactDiagnostic(message: string, error: unknown): TarstateReactDiagnostic {

@@ -175,6 +175,12 @@ export type DbTransactionInput =
   | ((_db: DbTransactionContext) => DbTransactionItem)
   | ((_tx: DbTransactionContext, db: Db) => DbTransactionItem);
 export type DbTransactionInputs = readonly DbTransactionInput[];
+export type DbTransactionPlan = {
+  readonly patches: readonly WritePatch[];
+  readonly env: DbInputEnv;
+  readonly envDeltas: readonly MaterializationEnvDelta[];
+  readonly envUpdates: number;
+};
 export type DbWritePredicate<Relation extends RelationRef> = (
   row: RelationRow<Relation>,
   index: number,
@@ -599,20 +605,18 @@ export function tryTransactWithConstraints(
   };
 }
 
-function transactionPlan(
+export function transactionPlan(
   db: Db,
   inputs: DbTransactionInputs
-): {
-  readonly patches: readonly WritePatch[];
-  readonly env: DbInputEnv;
-  readonly envDeltas: readonly MaterializationEnvDelta[];
-} {
+): DbTransactionPlan {
   const context = transactionContext(db);
   const patches: WritePatch[] = [];
   let env: DbInputEnv = db.env;
+  let envUpdates = 0;
 
   const append = (input: DbTransactionItem | WritePatch | SetEnvTransaction): void => {
     if (isSetEnvTransaction(input)) {
+      envUpdates += 1;
       env = typeof input.env === 'function' ? input.env(env, db) : input.env;
       return;
     }
@@ -636,7 +640,8 @@ function transactionPlan(
   return {
     patches,
     env,
-    envDeltas: dbEnvDeltas(db.env, env)
+    envDeltas: dbEnvDeltas(db.env, env),
+    envUpdates
   };
 }
 

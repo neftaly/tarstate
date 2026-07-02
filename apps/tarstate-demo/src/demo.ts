@@ -39,9 +39,13 @@ import {
   unique,
   value,
   where,
+  createStore,
+  materializeSnapshot,
   type Db,
-  type DbTransactionInput,
   type Query,
+  type Store,
+  type StoreCommitInput,
+  type StoreCommitResult,
   type TarstateDiagnostic
 } from '@tarstate/core';
 import {
@@ -53,14 +57,11 @@ import {
   stringField
 } from '@tarstate/core/schema';
 import {
-  createDbStore,
   TarstateProvider,
+  useCommit,
   useMaterialized,
   useQuery,
-  useTransact,
-  useWatch,
-  type TarstateDbStore,
-  type TarstateTransactResult
+  useWatch
 } from '@tarstate/react';
 
 export type PriceBand = 'low' | 'med' | 'high' | 'premium';
@@ -239,7 +240,7 @@ export type AutomergeRealEstateBacking = {
 };
 
 export type RealEstateModel = {
-  readonly store: TarstateDbStore;
+  readonly store: Store;
   readonly automerge: AutomergeRealEstateBacking;
 };
 
@@ -780,11 +781,10 @@ export function createRealEstateDb(input: Db['data'] = seedRealEstateData()): Db
   );
 }
 
-export async function createRealEstateStore(input: Db = createRealEstateDb()): Promise<TarstateDbStore> {
-  const store = createDbStore(input);
-  await store.materialize(listingRowsQuery, { id: 'listing-rows' });
-  await store.materialize(commissionDueQuery, { id: 'commission-due' });
-  return store;
+export async function createRealEstateStore(input: Db = createRealEstateDb()): Promise<Store> {
+  let materializedDb = await materializeSnapshot(input, listingRowsQuery, { id: 'listing-rows' });
+  materializedDb = await materializeSnapshot(materializedDb, commissionDueQuery, { id: 'commission-due' });
+  return createStore(materializedDb);
 }
 
 export async function createRealEstateModel(): Promise<RealEstateModel> {
@@ -874,12 +874,12 @@ export async function runPlaygroundQuery(
 }
 
 export async function runAcceptHarbourOfferTransaction(
-  store: TarstateDbStore
-): Promise<TarstateTransactResult> {
-  return store.transact(...acceptHarbourOfferInputs());
+  store: Store
+): Promise<StoreCommitResult> {
+  return store.commit(acceptHarbourOfferInputs());
 }
 
-export function acceptHarbourOfferInputs() {
+export function acceptHarbourOfferInputs(): StoreCommitInput {
   return [insert(realEstateSchema.decisions, {
     id: 'decision-harbour-accepted',
     offerId: 'offer-harbour-mia-1',
@@ -889,11 +889,11 @@ export function acceptHarbourOfferInputs() {
   })];
 }
 
-export async function runAddMillOfferTransaction(store: TarstateDbStore): Promise<TarstateTransactResult> {
-  return store.transact(...addMillOfferInputs());
+export async function runAddMillOfferTransaction(store: Store): Promise<StoreCommitResult> {
+  return store.commit(addMillOfferInputs());
 }
 
-export function addMillOfferInputs() {
+export function addMillOfferInputs(): StoreCommitInput {
   return [insert(realEstateSchema.offers, {
     id: 'offer-mill-mia-1',
     propertyId: 'property-mill',
@@ -904,12 +904,12 @@ export function addMillOfferInputs() {
 }
 
 export async function runRejectGardenLatestTransaction(
-  store: TarstateDbStore
-): Promise<TarstateTransactResult> {
-  return store.transact(...rejectGardenLatestInputs());
+  store: Store
+): Promise<StoreCommitResult> {
+  return store.commit(rejectGardenLatestInputs());
 }
 
-export function rejectGardenLatestInputs() {
+export function rejectGardenLatestInputs(): StoreCommitInput {
   return [insert(realEstateSchema.decisions, {
     id: 'decision-garden-latest-rejected',
     offerId: 'offer-garden-nico-2',
@@ -920,12 +920,12 @@ export function rejectGardenLatestInputs() {
 }
 
 export async function runInvalidOfferAfterAcceptedTransaction(
-  store: TarstateDbStore
-): Promise<TarstateTransactResult> {
-  return store.transact(...invalidOfferAfterAcceptedInputs());
+  store: Store
+): Promise<StoreCommitResult> {
+  return store.commit(invalidOfferAfterAcceptedInputs());
 }
 
-export function invalidOfferAfterAcceptedInputs() {
+export function invalidOfferAfterAcceptedInputs(): StoreCommitInput {
   return [insert(realEstateSchema.offers, {
     id: 'offer-elm-late-invalid',
     propertyId: 'property-elm',
@@ -970,7 +970,7 @@ export function RealEstateWalkthrough({
 }: {
   readonly automerge: AutomergeRealEstateBacking;
 }): ReactElement {
-  const transact = useTransact();
+  const commit = useCommit();
   const [factTab, setFactTab] = useState<keyof typeof realEstateSchema>('properties');
   const [queryId, setQueryId] = useState<QueryExampleId>('propertyInfo');
   const [filters, setFilters] = useState<PlaygroundFilters>({});
@@ -991,18 +991,20 @@ export function RealEstateWalkthrough({
 
   const runTransaction = async (
     label: string,
-    inputs: readonly DbTransactionInput[]
+    input: StoreCommitInput
   ): Promise<void> => {
-    const result = await transact(...inputs);
-    setTransactionText(result.committed
-      ? `${label}: committed at revision ${result.revision}`
+    const result = await commit(input);
+    setTransactionText(result.reflected
+      ? `${label}: ${result.status} at revision ${result.snapshot.revision} (${result.effects.applied}/${result.effects.patches} reflected)`
       : `${label}: rejected (${readableDiagnostics(result.diagnostics).map((item) => item.code).join(', ')})`);
   };
 
   const runInvalid = async (): Promise<void> => {
-    const result = await transact(...invalidOfferAfterAcceptedInputs());
+    const result = await commit(invalidOfferAfterAcceptedInputs());
     setDiagnostics(readableDiagnostics(result.diagnostics));
-    setTransactionText(result.committed ? 'Invalid offer unexpectedly committed.' : 'Invalid offer rejected.');
+    setTransactionText(result.reflected
+      ? `Invalid offer unexpectedly ${result.status} at revision ${result.snapshot.revision}.`
+      : `Invalid offer ${result.status}: ${readableDiagnostics(result.diagnostics).map((item) => item.code).join(', ')}`);
   };
 
   const runAutomerge = async (): Promise<void> => {
@@ -1038,8 +1040,9 @@ export function RealEstateWalkthrough({
       'materialized',
       '3. Materialized views',
       'The same query values can be materialized and read through React.',
-      codeBlock(`await store.materialize(listingRowsQuery, { id: 'listing-rows' });
-await store.materialize(commissionDueQuery, { id: 'commission-due' });
+      codeBlock(`let db = await materializeSnapshot(sourceDb, listingRowsQuery, { id: 'listing-rows' });
+db = await materializeSnapshot(db, commissionDueQuery, { id: 'commission-due' });
+const store = createStore(db);
 
 const listings = useMaterialized(listingRowsQuery);`),
       metricGrid(
@@ -1053,12 +1056,13 @@ const listings = useMaterialized(listingRowsQuery);`),
       'transactions',
       '4. Transactions',
       'Writes use the same relations and immediately change query output.',
-      codeBlock(`const transact = useTransact();
-await transact(insert(schema.decisions, {
+      codeBlock(`const commit = useCommit();
+await commit(insert(schema.decisions, {
   id: 'decision-harbour-accepted',
   offerId: 'offer-harbour-mia-1',
   accepted: true
-}));`),
+}));
+// { status, reflected, effects, snapshot, diagnostics }`),
       metricGrid(metric('Last transaction', transactionText)),
       actionRow(
         actionButton('accept-harbour', 'Accept harbour offer', () => void runTransaction('Accept harbour', acceptHarbourOfferInputs())),
@@ -1082,14 +1086,14 @@ await transact(insert(schema.decisions, {
     section(
       'watch',
       '6. Watch',
-      'useWatch tracks added and deleted listing rows across transactions.',
+      'useWatch tracks the latest changed listing rows across transactions.',
       codeBlock(`const watch = useWatch(listingRowsQuery, undefined, {
   keyBy: ['id']
 });`),
       metricGrid(
-        metric('Watch events', watch.events.length),
+        metric('Watch changed', watch.event?.changed ? 'yes' : 'no'),
         metric('Watch added', watch.event?.added.map((item) => item.id).join(', ') || 'none'),
-        metric('Watch deleted', watch.event?.deleted.map((item) => item.id).join(', ') || 'none')
+        metric('Watch removed', watch.event?.removed.map((item) => item.id).join(', ') || 'none')
       )
     ),
     section(

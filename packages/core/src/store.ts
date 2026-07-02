@@ -5,11 +5,14 @@ import {
   dbSource,
   q,
   qMany,
+  transactionPlan,
   tryTransact,
   type Db,
   type DbInputData,
   type DbInputEnv,
   type DbQueryOptions,
+  type DbTransactionInput,
+  type DbTransactionInputs,
   type QueryBatch
 } from './db.js';
 import { maintainMaterializations } from './materialization.js';
@@ -19,7 +22,7 @@ import type { RelationSource } from './source.js';
 import { trackRuntimeCommit } from './runtime.js';
 import { transferWatches } from './watch.js';
 import { trackWatchedChanges } from './watch-tracking.js';
-import { writeInputPatches, type RelationRow, type WriteInput } from './write.js';
+import type { RelationRow } from './write.js';
 
 type QueryRow<QueryValue> = QueryValue extends Query<infer Row>
   ? Row
@@ -64,7 +67,7 @@ export type StoreSnapshot<Version = unknown> = StoreCommitSnapshot<Version> & {
   readonly db: Db;
 };
 
-export type StoreCommitInput = WriteInput;
+export type StoreCommitInput = DbTransactionInput;
 
 export type StoreCommitEffects<Version = unknown> = {
   readonly patches: number;
@@ -163,7 +166,7 @@ export type Store<Version = unknown> = {
   readonly query: StoreQuery;
   readonly queries: StoreQueries;
   readonly view: <Row>(query: Query<Row>) => StoreView<Row, Version>;
-  readonly commit: (patches: StoreCommitInput) => Promise<StoreCommitResult<Version>>;
+  readonly commit: (...inputs: DbTransactionInputs) => Promise<StoreCommitResult<Version>>;
   readonly refresh: () => Promise<StoreSnapshot<Version>>;
   readonly close: () => void;
 };
@@ -203,9 +206,9 @@ export function createStore(input: StoreSeedInput = createDb()): Store {
     query: queryStore,
     queries: queryStores,
     view: <Row>(queryValue: Query<Row>) => createStoreView(queryValue, store),
-    commit: async (patches) => {
+    commit: async (...inputs) => {
       const previousDb = snapshot.db;
-      const result = tryTransact(previousDb, patches);
+      const result = tryTransact(previousDb, ...inputs);
       const reflected = result.committed;
 
       if (reflected) {
@@ -324,10 +327,29 @@ export async function createRuntimeStore<Version>(input: StoreRuntimeInput<Versi
     query: queryRuntimeStore,
     queries: queryRuntimeStores,
     view: <Row>(queryValue: Query<Row>) => createStoreView(queryValue, store),
-    commit: async (patches) => {
-      const patchList = Array.from(writeInputPatches(patches));
+    commit: async (...inputs) => {
+      const transaction = transactionPlan(snapshot.db, inputs);
+      if (transaction.envUpdates > 0) {
+        const diagnostics = [{
+          code: 'unsupported_runtime_env_transaction',
+          message: 'runtime-backed stores cannot apply environment transactions'
+        }] satisfies readonly StoreDiagnostic[];
+        return {
+          kind: 'tarstateCommit',
+          status: 'rejected',
+          reflected: false,
+          effects: {
+            patches: transaction.patches.length,
+            applied: 0,
+            deltas: []
+          },
+          diagnostics,
+          snapshot
+        };
+      }
+
       applyingCommit = true;
-      const result = await trackRuntimeCommit(input.runtime, patchList, { readVersion: true })
+      const result = await trackRuntimeCommit(input.runtime, transaction.patches, { readVersion: true })
         .finally(() => {
           applyingCommit = false;
         });

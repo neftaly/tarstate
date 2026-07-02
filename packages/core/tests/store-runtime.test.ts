@@ -25,6 +25,7 @@ import {
   type StoreRuntimeInput,
   type StoreSeedInput
 } from '@tarstate/core/store';
+import { setEnvTx, type DbTransactionContext } from '@tarstate/core/db';
 import { write } from '@tarstate/core/write';
 import { watch, type WatchEvent } from '@tarstate/core/watch';
 import type { RelationDelta, RelationRuntime } from '@tarstate/core/adapter';
@@ -64,6 +65,29 @@ function openItemsQuery(): Query<OpenItemRow> {
 }
 
 describe('runtime-backed Store', () => {
+  it('accepts a transaction builder function for object-backed commits', async () => {
+    const store = createStore({ items: [] });
+
+    const result = await store.commit((tx: DbTransactionContext) =>
+      tx.insert(schema.items, { id: 'item-a', label: 'Alpha', done: false })
+    );
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      reflected: true,
+      effects: {
+        patches: 1,
+        applied: 1
+      },
+      snapshot: {
+        revision: 1
+      }
+    });
+    await expect(store.query(schema.items)).resolves.toMatchObject({
+      rows: [{ id: 'item-a', label: 'Alpha', done: false }]
+    });
+  });
+
   it('queries and commits through a declared RelationRuntime', async () => {
     const runtime = createMemoryRelationRuntime({
       items: [
@@ -194,6 +218,72 @@ describe('runtime-backed Store', () => {
     });
     expect(handle.db).toBe(store.getSnapshot().db);
     expect(handle.unwatch()).toMatchObject({ kind: 'unwatch', closed: true });
+  });
+
+  it('accepts a transaction builder function for runtime-backed commits', async () => {
+    const runtime = createMemoryRelationRuntime({ items: [] });
+    const store = await createRuntimeStore({ runtime, relations: [schema.items] });
+
+    const result = await store.commit((tx: DbTransactionContext) => [
+      tx.insert(schema.items, { id: 'item-a', label: 'Alpha', done: false }),
+      tx.insert(schema.items, { id: 'item-b', label: 'Beta', done: true })
+    ]);
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      reflected: true,
+      effects: {
+        patches: 2,
+        applied: 2,
+        durability: 'memory',
+        version: 1
+      },
+      snapshot: {
+        revision: 1,
+        version: 1
+      }
+    });
+    await expect(store.query(schema.items)).resolves.toMatchObject({
+      rows: [
+        { id: 'item-a', label: 'Alpha', done: false },
+        { id: 'item-b', label: 'Beta', done: true }
+      ]
+    });
+  });
+
+  it('rejects runtime env-only commits without publishing', async () => {
+    const runtime = createMemoryRelationRuntime({ items: [] });
+    const store = await createRuntimeStore({
+      runtime,
+      relations: [schema.items],
+      env: { minimumAge: 18 }
+    });
+    const notified: number[] = [];
+    store.subscribe(() => {
+      notified.push(store.getSnapshot().revision);
+    });
+
+    const result = await store.commit(setEnvTx({ minimumAge: 21 }));
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      reflected: false,
+      effects: {
+        patches: 0,
+        applied: 0,
+        deltas: []
+      },
+      diagnostics: [{
+        code: 'unsupported_runtime_env_transaction',
+        message: 'runtime-backed stores cannot apply environment transactions'
+      }],
+      snapshot: {
+        revision: 0
+      }
+    });
+    expect(store.getSnapshot().db.env).toEqual({ minimumAge: 18 });
+    expect(store.getSnapshot().revision).toBe(0);
+    expect(notified).toEqual([]);
   });
 
   it('closes object-backed stores idempotently and suppresses future notifications', async () => {
