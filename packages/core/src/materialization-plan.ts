@@ -129,9 +129,7 @@ type IncrementalPipelineStep =
       readonly rightRows: readonly (readonly Record<string, unknown>[])[];
     };
 
-type IncrementalBranchStep = Exclude<IncrementalPipelineStep, {
-  readonly kind: 'expand' | 'setFilter';
-}>;
+type IncrementalBranchStep = IncrementalPipelineStep;
 
 type IncrementalJoinStep = {
   readonly kind: 'join';
@@ -367,6 +365,8 @@ type StaticRowsEvaluation =
       readonly supported: false;
       readonly reason: string;
     };
+
+type BranchEvaluation = StaticRowsEvaluation;
 
 const supportedAggregateFunctions: ReadonlySet<AggregateFunction> = new Set([
   'count',
@@ -665,8 +665,15 @@ function buildDynamicSetIncrementalMaterialization<Row>(
     const rowsByRelationKey = new Map<string, readonly Record<string, unknown>[]>();
     for (const row of snapshot.rows) {
       const key = relationKeyForRow(snapshot.relation, row);
+      const evaluated = evaluateBranchRows(branch, row, env);
+      if (!evaluated.supported) {
+        return {
+          supported: false,
+          reason: evaluated.reason
+        };
+      }
       relationKeys.push(key);
-      rowsByRelationKey.set(key, evaluateBranchRows(branch, row, env));
+      rowsByRelationKey.set(key, evaluated.rows);
     }
 
     branchStates.push({
@@ -1262,7 +1269,14 @@ function applyDynamicSetBranchChanges(
       };
     }
 
-    rowsByRelationKey.set(change.key, evaluateBranchRows(branch, change.after, env));
+    const evaluated = evaluateBranchRows(branch, change.after, env);
+    if (!evaluated.supported) {
+      return {
+        supported: false,
+        reason: evaluated.reason
+      };
+    }
+    rowsByRelationKey.set(change.key, evaluated.rows);
   }
 
   const compactRelationKeys = relationKeys.filter((key): key is string => key !== undefined);
@@ -1961,6 +1975,21 @@ function collectRightBranchPlanInternal(
       steps.push({ kind: 'extend', projection: data.projection });
       return { ...root, shape: extendShape(root.shape, data.projection) };
     }
+    case 'expand': {
+      const root = collectRightBranchPlanInternal(data.input, steps);
+      if (typeof root === 'string') return root;
+      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, root.shape);
+      if (reason !== undefined) {
+        return `expand collection is not supported: ${reason}`;
+      }
+      steps.push({
+        kind: 'expand',
+        collection: data.collection,
+        ...(data.alias === undefined ? {} : { alias: data.alias }),
+        ...(data.fields === undefined ? {} : { fields: data.fields })
+      });
+      return { ...root, shape: expandShape(root.shape, data.alias, data.fields) };
+    }
     case 'without': {
       const root = collectRightBranchPlanInternal(data.input, steps);
       if (typeof root === 'string') return root;
@@ -1989,19 +2018,59 @@ function collectRightBranchPlanInternal(
       return 'limit is not supported';
     case 'sortLimit':
       return 'sortLimit is not supported';
-    case 'expand':
-      return 'expand is not supported';
     case 'union':
       return 'union is not supported';
     case 'intersection':
-      return 'intersection is not supported';
+      return collectRightBranchIntersectionPlan(data.inputs, steps);
     case 'difference':
-      return 'difference is not supported';
+      return collectRightBranchDifferencePlan(data.left, data.right, steps);
     case 'constRows':
       return 'constRows is not supported';
     case 'aggregate':
       return 'aggregate is not supported';
   }
+}
+
+function collectRightBranchIntersectionPlan(
+  inputs: readonly QueryData[],
+  steps: IncrementalBranchStep[]
+): RightBranchPlan | string {
+  const [leftInput, ...rightInputs] = inputs;
+  if (leftInput === undefined || rightInputs.length === 0) {
+    return 'intersection requires one supported relation branch and static right branches';
+  }
+
+  const root = collectRightBranchPlanInternal(leftInput, steps);
+  if (typeof root === 'string') {
+    return `intersection first branch is not supported: ${root}`;
+  }
+
+  const rightRows = collectStaticSetRows(rightInputs, 'intersection');
+  if (typeof rightRows === 'string') {
+    return rightRows;
+  }
+
+  steps.push({ kind: 'setFilter', op: 'intersection', rightRows });
+  return root;
+}
+
+function collectRightBranchDifferencePlan(
+  leftInput: QueryData,
+  rightInput: QueryData,
+  steps: IncrementalBranchStep[]
+): RightBranchPlan | string {
+  const root = collectRightBranchPlanInternal(leftInput, steps);
+  if (typeof root === 'string') {
+    return `difference left branch is not supported: ${root}`;
+  }
+
+  const rightRows = collectStaticSetRows([rightInput], 'difference');
+  if (typeof rightRows === 'string') {
+    return rightRows;
+  }
+
+  steps.push({ kind: 'setFilter', op: 'difference', rightRows });
+  return root;
 }
 
 function branchPlan(plan: RightBranchPlan): IncrementalBranchPlan {
@@ -2491,21 +2560,29 @@ function evaluateBranchRows(
   branch: IncrementalBranchPlan,
   relationRow: unknown,
   env: Readonly<Record<string, unknown>>
-): readonly Record<string, unknown>[] {
+): BranchEvaluation {
   const rootRow = branchRootContext(branch, relationRow, env);
   if (rootRow === undefined) {
-    return [];
+    return { supported: true, rows: [] };
   }
 
   let rows: readonly Record<string, unknown>[] = [rootRow];
   for (const step of branch.steps) {
-    rows = evaluateStep(rows, step, env);
+    if (step.kind === 'expand') {
+      const expanded = evaluateExpandStep(rows, step, env);
+      if (!expanded.supported) {
+        return expanded;
+      }
+      rows = expanded.rows;
+    } else {
+      rows = evaluateStep(rows, step, env);
+    }
     if (rows.length === 0) {
-      return [];
+      return { supported: true, rows: [] };
     }
   }
 
-  return rows;
+  return { supported: true, rows };
 }
 
 function evaluateStaticRows(
@@ -3574,8 +3651,15 @@ function buildJoinStates(
     const rowsByRelationKey = new Map<string, readonly Record<string, unknown>[]>();
     for (const row of snapshot.rows) {
       const key = relationKeyForRow(snapshot.relation, row);
+      const evaluated = evaluateBranchRows(step.right, row, env);
+      if (!evaluated.supported) {
+        return {
+          supported: false,
+          reason: evaluated.reason
+        };
+      }
       relationKeys.push(key);
-      rowsByRelationKey.set(key, evaluateBranchRows(step.right, row, env));
+      rowsByRelationKey.set(key, evaluated.rows);
     }
 
     states.push({
@@ -3815,7 +3899,14 @@ function applyRightRelationChanges(
       removeRightIndexRows(step, indexByValue, previousRows, env);
     }
 
-    const nextRows = evaluateBranchRows(step.right, change.after, env);
+    const evaluated = evaluateBranchRows(step.right, change.after, env);
+    if (!evaluated.supported) {
+      return {
+        supported: false,
+        reason: evaluated.reason
+      };
+    }
+    const nextRows = evaluated.rows;
     affectedValues.push(...nextRows.map((row) => exprValue(row, step.rightExpr, env)));
     addRightIndexRows(step, indexByValue, nextRows, env);
     rowsByRelationKey.set(change.key, nextRows);
@@ -4287,8 +4378,19 @@ function expressionSideForShapes(
   left: PlanShape,
   right: PlanShape
 ): 'left' | 'right' | undefined {
-  const inLeft = shapeHasField(left, expr);
-  const inRight = shapeHasField(right, expr);
+  const inLeftAlias = left.aliases.has(expr.alias);
+  const inRightAlias = right.aliases.has(expr.alias);
+
+  if (inLeftAlias || inRightAlias) {
+    if (inLeftAlias === inRightAlias) {
+      return undefined;
+    }
+
+    return inLeftAlias ? 'left' : 'right';
+  }
+
+  const inLeft = left.fields.has(expr.field);
+  const inRight = right.fields.has(expr.field);
 
   if (inLeft === inRight) {
     return undefined;

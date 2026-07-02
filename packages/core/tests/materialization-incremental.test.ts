@@ -10,11 +10,14 @@ import {
   call,
   count,
   countDistinct,
+  constRows,
   createDb,
   deleteByKey,
   desc,
+  difference,
   eq,
   env,
+  expand,
   field,
   from,
   gt,
@@ -22,6 +25,7 @@ import {
   any as anyAggregate,
   insert,
   index,
+  intersection,
   join,
   keyBy,
   leftJoin,
@@ -171,6 +175,25 @@ type TaskOwnerTeamRow = {
   readonly teamId: string;
   readonly team: string;
   readonly points: number;
+};
+
+type TaskOwnerTagRow = {
+  readonly id: string;
+  readonly ownerId: string;
+  readonly tag: string;
+};
+
+type TaskActiveOwnerRow = {
+  readonly id: string;
+  readonly ownerId: string;
+  readonly title: string;
+};
+
+type TaskNestedOwnerTeamRow = {
+  readonly id: string;
+  readonly ownerId: string;
+  readonly owner: string;
+  readonly team: string;
 };
 
 type JoinedTaskOwnerTeamRollupRow = {
@@ -374,6 +397,75 @@ function taskOwnerTeamQuery(): Query<TaskOwnerTeamRow> {
     }),
     keyBy('id')
   ) as Query<TaskOwnerTeamRow>;
+}
+
+function taskOwnerTagsViaRightExpandQuery(): Query<TaskOwnerTagRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const owner = as(coreSchema.users, 'owner');
+  const branchOwnerId = field<string>('ownerTag', 'ownerId');
+  const branchTag = field<string>('ownerTag', 'tag');
+  const tag = field<string>('tag', 'tag');
+  const ownerTags = pipe(
+    from(owner),
+    expand(owner.tags, { as: 'tag' }),
+    project({ ownerId: owner.id, tag })
+  );
+
+  return pipe(
+    from(task),
+    join(ownerTags, eq(task.ownerId, branchOwnerId)),
+    project({ id: task.id, ownerId: task.ownerId, tag: branchTag }),
+    keyBy('id', 'tag')
+  ) as Query<TaskOwnerTagRow>;
+}
+
+function taskActiveOwnersViaRightStaticFilterQuery(): Query<TaskActiveOwnerRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const owner = as(coreSchema.users, 'owner');
+  const branchOwnerId = field<string>('activeOwner', 'ownerId');
+  const activeOwnerIds = pipe(
+    from(owner),
+    where(eq(owner.active, true)),
+    project({ ownerId: owner.id })
+  );
+  const allowedOwnerIds = constRows([
+    { ownerId: 'ada' },
+    { ownerId: 'bea' },
+    { ownerId: 'cal' }
+  ]);
+  const blockedOwnerIds = constRows([{ ownerId: 'bea' }]);
+  const activeAllowedOwnerIds = difference(
+    intersection(activeOwnerIds, allowedOwnerIds),
+    blockedOwnerIds
+  );
+
+  return pipe(
+    from(task),
+    join(activeAllowedOwnerIds, eq(task.ownerId, branchOwnerId)),
+    project({ id: task.id, ownerId: task.ownerId, title: task.title }),
+    keyBy('id')
+  ) as Query<TaskActiveOwnerRow>;
+}
+
+function taskOwnerTeamNestedRightBranchQuery(): Query<TaskNestedOwnerTeamRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const owner = as(coreSchema.users, 'owner');
+  const team = as(coreSchema.teams, 'team');
+  const branchOwnerId = field<string>('ownerTeam', 'ownerId');
+  const branchOwner = field<string>('ownerTeam', 'owner');
+  const branchTeam = field<string>('ownerTeam', 'team');
+  const ownerTeams = pipe(
+    from(owner),
+    join(from(team), eq(owner.teamId, team.id)),
+    project({ ownerId: owner.id, owner: owner.name, team: team.name })
+  );
+
+  return pipe(
+    from(task),
+    join(ownerTeams, eq(task.ownerId, branchOwnerId)),
+    project({ id: task.id, ownerId: task.ownerId, owner: branchOwner, team: branchTeam }),
+    keyBy('id')
+  ) as Query<TaskNestedOwnerTeamRow>;
 }
 
 function joinedTaskOwnerTeamRollupsQuery(): Query<JoinedTaskOwnerTeamRollupRow> {
@@ -3008,6 +3100,171 @@ describe('incremental materialization', () => {
       })
     ]));
     expect(materializedRowsForQuery(next, residualTaskOwners)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains a join whose right branch expands rows', () => {
+    const taskOwnerTags = taskOwnerTagsViaRightExpandQuery();
+    const state = mat(createDb(sourceData), taskOwnerTags, {
+      id: 'task-owner-tags-right-expand',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, taskOwnerTags);
+
+    expect(metadata).toMatchObject({
+      id: 'task-owner-tags-right-expand',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, taskOwnerTags)).toEqual([
+      { id: 't1', ownerId: 'ada', tag: 'compiler' },
+      { id: 't1', ownerId: 'ada', tag: 'runtime' },
+      { id: 't2', ownerId: 'ada', tag: 'compiler' },
+      { id: 't2', ownerId: 'ada', tag: 'runtime' },
+      { id: 't3', ownerId: 'bea', tag: 'research' }
+    ]);
+
+    const updatedAda = { ...adaUser, tags: ['runtime', 'logic'] };
+    const next = createDb({
+      ...sourceData,
+      users: [updatedAda, beaUser, calUser]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([updatedAda], [adaUser])]
+    });
+    const change = singleMaterializationChange(maintained, 'task-owner-tags-right-expand');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { id: 't1', ownerId: 'ada', tag: 'runtime' },
+        { id: 't1', ownerId: 'ada', tag: 'logic' },
+        { id: 't2', ownerId: 'ada', tag: 'runtime' },
+        { id: 't2', ownerId: 'ada', tag: 'logic' },
+        { id: 't3', ownerId: 'bea', tag: 'research' }
+      ],
+      addedRows: [
+        { id: 't1', ownerId: 'ada', tag: 'logic' },
+        { id: 't2', ownerId: 'ada', tag: 'logic' }
+      ],
+      removedRows: [
+        { id: 't1', ownerId: 'ada', tag: 'compiler' },
+        { id: 't2', ownerId: 'ada', tag: 'compiler' }
+      ]
+    });
+    expect(change.rowChanges).toHaveLength(4);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'removed', row: { id: 't1', ownerId: 'ada', tag: 'compiler' } }),
+      expect.objectContaining({ kind: 'removed', row: { id: 't2', ownerId: 'ada', tag: 'compiler' } }),
+      expect.objectContaining({ kind: 'added', row: { id: 't1', ownerId: 'ada', tag: 'logic' } }),
+      expect.objectContaining({ kind: 'added', row: { id: 't2', ownerId: 'ada', tag: 'logic' } })
+    ]));
+    expect(materializedRowsForQuery(next, taskOwnerTags)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains a join whose right branch uses a static set filter', () => {
+    const taskActiveOwners = taskActiveOwnersViaRightStaticFilterQuery();
+    const calTask: TaskRow = {
+      id: 't-cal',
+      ownerId: 'cal',
+      title: 'Cal onboarding',
+      done: false,
+      points: 2
+    };
+    const initial = createDb({
+      ...sourceData,
+      tasks: [...sourceData.tasks, calTask]
+    });
+    const state = mat(initial, taskActiveOwners, {
+      id: 'task-active-owners-right-static-filter',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, taskActiveOwners);
+
+    expect(metadata).toMatchObject({
+      id: 'task-active-owners-right-static-filter',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, taskActiveOwners)).toEqual([
+      { id: 't1', ownerId: 'ada', title: 'Draft evaluator' },
+      { id: 't2', ownerId: 'ada', title: 'Ship runtime' }
+    ]);
+
+    const inactiveAda = { ...adaUser, active: false };
+    const activeCal = { ...calUser, active: true };
+    const next = createDb({
+      ...sourceData,
+      users: [inactiveAda, beaUser, activeCal],
+      tasks: [...sourceData.tasks, calTask]
+    });
+
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([inactiveAda, activeCal], [adaUser, calUser])]
+    });
+    const change = singleMaterializationChange(maintained, 'task-active-owners-right-static-filter');
+
+    expect(maintained).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expectNoIncrementalFallback([...maintained.diagnostics, ...change.diagnostics]);
+    expect(change).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { id: 't-cal', ownerId: 'cal', title: 'Cal onboarding' }
+      ],
+      addedRows: [
+        { id: 't-cal', ownerId: 'cal', title: 'Cal onboarding' }
+      ],
+      removedRows: [
+        { id: 't1', ownerId: 'ada', title: 'Draft evaluator' },
+        { id: 't2', ownerId: 'ada', title: 'Ship runtime' }
+      ]
+    });
+    expect(change.rowChanges).toHaveLength(3);
+    expect(change.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'removed', row: { id: 't1', ownerId: 'ada', title: 'Draft evaluator' } }),
+      expect.objectContaining({ kind: 'removed', row: { id: 't2', ownerId: 'ada', title: 'Ship runtime' } }),
+      expect.objectContaining({ kind: 'added', row: { id: 't-cal', ownerId: 'cal', title: 'Cal onboarding' } })
+    ]));
+    expect(materializedRowsForQuery(next, taskActiveOwners)).toEqual(change.rows);
+  });
+
+  it('keeps an explicit fallback diagnostic for nested right branch joins', async () => {
+    const taskOwnerTeams = taskOwnerTeamNestedRightBranchQuery();
+    const state = mat(createDb(sourceData), taskOwnerTeams, {
+      id: 'task-owner-team-nested-right-branch',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, taskOwnerTeams);
+
+    expect(metadata).toMatchObject({
+      id: 'task-owner-team-nested-right-branch',
+      requestedMode: 'incremental',
+      maintenance: 'snapshot'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users', 'teams']));
+    expect(metadata?.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'materialization_incremental_fallback',
+        detail: expect.objectContaining({
+          reason: expect.stringContaining('right branch joins are not supported')
+        })
+      })
+    ]));
+    await expect(qRows(state, taskOwnerTeams)).resolves.toEqual([
+      { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Engineering' },
+      { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Engineering' },
+      { id: 't3', ownerId: 'bea', owner: 'Bea', team: 'Design' }
+    ]);
   });
 
   it('marks initial left equality joins as incrementally maintained without fallback', () => {
