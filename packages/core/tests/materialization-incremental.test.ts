@@ -109,6 +109,17 @@ type UserAgeRow = {
   readonly age: number;
 };
 
+type UserAgeBandRow = {
+  readonly id: string;
+  readonly band: string;
+};
+
+type UserAgeDecadeRollupRow = {
+  readonly decade: number;
+  readonly users: number;
+  readonly activeUsers: number;
+};
+
 type UserNameRow = {
   readonly id: string;
   readonly name: string;
@@ -3574,26 +3585,139 @@ describe('incremental materialization', () => {
     }
   });
 
-  it('keeps snapshot fallback diagnostics and correctness for unsupported host-call shapes', async () => {
+  it('incrementally maintains row-local hostCall projection and where expressions', async () => {
     const user = as(coreSchema.users, 'user');
+    const ageBand = (age: number) => age >= 30 ? 'senior' : 'junior';
+    const seniorOrUndefined = (age: number) => {
+      if (age === beaUser.age) {
+        throw new Error('expected hostCall test failure');
+      }
+      return age >= 30;
+    };
     const withAgeBand = pipe(
       from(user),
+      where(eq(call(seniorOrUndefined, user.age), true)),
       project({
         id: user.id,
-        band: call((age: number) => age >= 30 ? 'senior' : 'junior', user.age)
+        band: call(ageBand, user.age)
       }),
       keyBy('id')
-    );
+    ) as Query<UserAgeBandRow>;
 
-    const hostState = mat(createDb(sourceData), withAgeBand, { id: 'age-bands', mode: 'incremental' });
-    const hostMetadata = materializationForQuery(hostState, withAgeBand);
-    expect(hostMetadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'snapshot' });
-    expectIncrementalFallback(hostMetadata?.diagnostics ?? []);
-    await expect(qRows(hostState, withAgeBand)).resolves.toEqual([
+    const state = mat(createDb(sourceData), withAgeBand, { id: 'age-bands', mode: 'incremental' });
+    const metadata = materializationForQuery(state, withAgeBand);
+
+    expect(metadata).toMatchObject({
+      id: 'age-bands',
+      requestedMode: 'incremental',
+      maintenance: 'incremental',
+      dependencies: ['users']
+    });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, withAgeBand)).toEqual([
       { id: 'ada', band: 'senior' },
-      { id: 'bea', band: 'junior' },
       { id: 'cal', band: 'senior' }
     ]);
+    await expect(qRows(state, withAgeBand)).resolves.toEqual([
+      { id: 'ada', band: 'senior' },
+      { id: 'cal', band: 'senior' }
+    ]);
+
+    const updatedBea = { ...beaUser, age: 36 };
+    const next = createDb({ ...sourceData, users: [adaUser, updatedBea, calUser] });
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([updatedBea], [beaUser])]
+    });
+    const change = expectIncrementalMaintenance(maintained, 'age-bands');
+
+    expect(change.rows).toEqual([
+      { id: 'ada', band: 'senior' },
+      { id: 'bea', band: 'senior' },
+      { id: 'cal', band: 'senior' }
+    ]);
+    expect(change.addedRows).toEqual([{ id: 'bea', band: 'senior' }]);
+    expect(change.removedRows).toEqual([]);
+    expect(change.rowChanges).toEqual([
+      expect.objectContaining({ kind: 'added', row: { id: 'bea', band: 'senior' } })
+    ]);
+    expect(materializedRowsForQuery(next, withAgeBand)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains sort order expressions with row-local hostCall', () => {
+    const user = as(coreSchema.users, 'user');
+    const ageOnes = (age: number) => age % 10;
+    const sortedUsers = pipe(
+      from(user),
+      sort(asc(call(ageOnes, user.age)), asc(user.id)),
+      project({ id: user.id, name: user.name, age: user.age }),
+      keyBy('id')
+    ) as Query<UserAgeRow>;
+    const state = mat(createDb(sourceData), sortedUsers, { id: 'users-by-age-ones', mode: 'incremental' });
+    const metadata = materializationForQuery(state, sortedUsers);
+
+    expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, sortedUsers)).toEqual([
+      { id: 'cal', name: 'Cal', age: 41 },
+      { id: 'ada', name: 'Ada', age: 37 },
+      { id: 'bea', name: 'Bea', age: 29 }
+    ]);
+
+    const updatedBea = { ...beaUser, age: 40 };
+    const next = createDb({ ...sourceData, users: [adaUser, updatedBea, calUser] });
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([updatedBea], [beaUser])]
+    });
+    const change = expectIncrementalMaintenance(maintained, 'users-by-age-ones');
+
+    expect(change.rows).toEqual([
+      { id: 'bea', name: 'Bea', age: 40 },
+      { id: 'cal', name: 'Cal', age: 41 },
+      { id: 'ada', name: 'Ada', age: 37 }
+    ]);
+    expect(materializedRowsForQuery(next, sortedUsers)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains aggregate hostCall groupBy and input expressions', () => {
+    const user = as(coreSchema.users, 'user');
+    const decade = field<number>('ageRollup', 'decade');
+    const ageDecade = (age: number) => Math.floor(age / 10) * 10;
+    const activeScore = (active: boolean) => active ? 1 : 0;
+    const ageRollupRows = pipe(
+      from(user),
+      aggregate({
+        groupBy: { decade: call(ageDecade, user.age) },
+        aggregates: {
+          users: count(),
+          activeUsers: sum(call(activeScore, user.active))
+        }
+      }),
+      sort(asc(decade))
+    ) as Query<UserAgeDecadeRollupRow>;
+    const ageRollups = pipe(ageRollupRows, keyBy('decade')) as Query<UserAgeDecadeRollupRow>;
+    const state = mat(createDb(sourceData), ageRollups, { id: 'age-rollups', mode: 'incremental' });
+    const metadata = materializationForQuery(state, ageRollups);
+
+    expect(metadata).toMatchObject({ requestedMode: 'incremental', maintenance: 'incremental' });
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, ageRollups)).toEqual([
+      { decade: 20, users: 1, activeUsers: 1 },
+      { decade: 30, users: 1, activeUsers: 1 },
+      { decade: 40, users: 1, activeUsers: 0 }
+    ]);
+
+    const updatedBea = { ...beaUser, age: 36 };
+    const next = createDb({ ...sourceData, users: [adaUser, updatedBea, calUser] });
+    const maintained = maintainMaterializations(state, next, {
+      deltas: [usersDelta([updatedBea], [beaUser])]
+    });
+    const change = expectIncrementalMaintenance(maintained, 'age-rollups');
+
+    expect(change.rows).toEqual([
+      { decade: 30, users: 2, activeUsers: 2 },
+      { decade: 40, users: 1, activeUsers: 0 }
+    ]);
+    expect(materializedRowsForQuery(next, ageRollups)).toEqual(change.rows);
   });
 
   it('marks initial inner equality joins as incrementally maintained', () => {

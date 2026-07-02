@@ -1590,7 +1590,7 @@ function collectSingleRootPlan(
         return 'where after order/window is not supported for incremental maintenance';
       }
       const reason = hasAggregateStep(steps)
-        ? simplePredicateReason(data.predicate) ?? predicateShapeReason(data.predicate, root.shape)
+        ? rowLocalPredicateReason(data.predicate, root.shape)
         : planPredicateReason(data.predicate, root.shape, steps, collection);
       if (reason !== undefined) {
         return `where predicate is not supported for incremental maintenance: ${reason}`;
@@ -1685,7 +1685,7 @@ function collectSingleRootPlan(
       if (collection.ordered !== undefined) {
         return 'expand after order/window is not supported for incremental maintenance';
       }
-      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, root.shape);
+      const reason = rowLocalExprReason(data.collection, root.shape);
       if (reason !== undefined) {
         return `expand collection is not supported for incremental maintenance: ${reason}`;
       }
@@ -1815,7 +1815,7 @@ function collectSingleRootPlan(
         return 'nested aggregate is not supported for incremental maintenance';
       }
 
-      const groupReason = simpleProjectionReason(data.groupBy) ?? projectionShapeReason(data.groupBy, root.shape);
+      const groupReason = rowLocalProjectionReason(data.groupBy, root.shape);
       if (groupReason !== undefined) {
         return `aggregate groupBy projection is not supported for incremental maintenance: ${groupReason}`;
       }
@@ -1901,9 +1901,10 @@ function planExprReason(
         return 'subquery expressions after aggregate/order are not supported for incremental maintenance';
       }
       return planSubqueryExpression(expr, shape, steps, collection);
+    case 'hostCall':
+      return rowLocalExprReason(expr, shape);
     case 'env':
     case 'call':
-    case 'hostCall':
     case 'aggregateCall':
       return simpleExprReason(expr);
   }
@@ -2055,7 +2056,7 @@ function lowerCorrelatedSubqueryData(
       const projection = state.correlation === undefined
         ? data.projection
         : projectionWithHiddenSubqueryField(data.projection, state.hiddenField);
-      const reason = simpleProjectionReason(projection) ?? projectionShapeReason(projection, input.shape);
+      const reason = rowLocalProjectionReason(projection, input.shape);
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
       }
@@ -2070,7 +2071,7 @@ function lowerCorrelatedSubqueryData(
       if (Object.hasOwn(data.projection, state.hiddenField)) {
         return 'subquery projection conflicts with an internal correlation field';
       }
-      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, input.shape);
+      const reason = rowLocalProjectionReason(data.projection, input.shape);
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
       }
@@ -2082,7 +2083,7 @@ function lowerCorrelatedSubqueryData(
     case 'expand': {
       const input = lowerCorrelatedSubqueryData(data.input, outerShape, state);
       if (typeof input === 'string') return input;
-      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, input.shape);
+      const reason = rowLocalExprReason(data.collection, input.shape);
       if (reason !== undefined) {
         return `expand collection is not supported: ${reason}`;
       }
@@ -2213,13 +2214,13 @@ function splitSubqueryPredicate(
     return { correlation: equality };
   }
 
-  const branchReason = simplePredicateReason(predicate) ?? predicateShapeReason(predicate, branchShape);
+  const branchReason = rowLocalPredicateReason(predicate, branchShape);
   if (branchReason === undefined) {
     return { residual: predicate };
   }
 
   const mergedShape = mergeShapes(outerShape, branchShape);
-  const mergedReason = simplePredicateReason(predicate) ?? predicateShapeReason(predicate, mergedShape);
+  const mergedReason = rowLocalPredicateReason(predicate, mergedShape);
   if (mergedReason === undefined) {
     return 'non-equality correlated subquery predicates are not supported for incremental maintenance';
   }
@@ -2258,7 +2259,7 @@ function subqueryExprKey(expr: Extract<ExprData, { readonly op: 'subquery' }>): 
 
 function sortOrderReason(order: readonly SortData[], shape: PlanShape): string | undefined {
   for (const item of order) {
-    const reason = simpleExprReason(item.expr) ?? exprShapeReason(item.expr, shape);
+    const reason = rowLocalExprReason(item.expr, shape);
     if (reason !== undefined) {
       return reason;
     }
@@ -2369,7 +2370,7 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
     case 'where': {
       const shape = collectStaticRowsPlan(data.input);
       if (typeof shape === 'string') return shape;
-      const reason = simplePredicateReason(data.predicate) ?? predicateShapeReason(data.predicate, shape);
+      const reason = rowLocalPredicateReason(data.predicate, shape);
       return reason === undefined ? shape : `where predicate is not supported: ${reason}`;
     }
     case 'hash':
@@ -2389,7 +2390,7 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
     case 'select': {
       const shape = collectStaticRowsPlan(data.input);
       if (typeof shape === 'string') return shape;
-      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, shape);
+      const reason = rowLocalProjectionReason(data.projection, shape);
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
       }
@@ -2398,7 +2399,7 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
     case 'extend': {
       const shape = collectStaticRowsPlan(data.input);
       if (typeof shape === 'string') return shape;
-      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, shape);
+      const reason = rowLocalProjectionReason(data.projection, shape);
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
       }
@@ -2407,7 +2408,7 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
     case 'expand': {
       const shape = collectStaticRowsPlan(data.input);
       if (typeof shape === 'string') return shape;
-      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, shape);
+      const reason = rowLocalExprReason(data.collection, shape);
       if (reason !== undefined) {
         return `expand collection is not supported: ${reason}`;
       }
@@ -2470,7 +2471,7 @@ function collectStaticRowsPlan(data: QueryData): PlanShape | string {
     case 'aggregate': {
       const shape = collectStaticRowsPlan(data.input);
       if (typeof shape === 'string') return shape;
-      const groupReason = simpleProjectionReason(data.groupBy) ?? projectionShapeReason(data.groupBy, shape);
+      const groupReason = rowLocalProjectionReason(data.groupBy, shape);
       if (groupReason !== undefined) {
         return `aggregate groupBy projection is not supported: ${groupReason}`;
       }
@@ -2536,7 +2537,7 @@ function collectRightBranchPlanInternal(
     case 'where': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      const reason = simplePredicateReason(data.predicate) ?? predicateShapeReason(data.predicate, root.shape);
+      const reason = rowLocalPredicateReason(data.predicate, root.shape);
       if (reason !== undefined) {
         return `where predicate is not supported: ${reason}`;
       }
@@ -2560,7 +2561,7 @@ function collectRightBranchPlanInternal(
     case 'select': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, root.shape);
+      const reason = rowLocalProjectionReason(data.projection, root.shape);
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
       }
@@ -2570,7 +2571,7 @@ function collectRightBranchPlanInternal(
     case 'extend': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      const reason = simpleProjectionReason(data.projection) ?? projectionShapeReason(data.projection, root.shape);
+      const reason = rowLocalProjectionReason(data.projection, root.shape);
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
       }
@@ -2580,7 +2581,7 @@ function collectRightBranchPlanInternal(
     case 'expand': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection);
       if (typeof root === 'string') return root;
-      const reason = simpleExprReason(data.collection) ?? exprShapeReason(data.collection, root.shape);
+      const reason = rowLocalExprReason(data.collection, root.shape);
       if (reason !== undefined) {
         return `expand collection is not supported: ${reason}`;
       }
@@ -5558,16 +5559,6 @@ function intersects(left: ReadonlySet<string>, right: ReadonlySet<string>): bool
   return false;
 }
 
-function projectionShapeReason(projection: ProjectionData, shape: PlanShape): string | undefined {
-  for (const item of Object.values(projection)) {
-    const reason = exprShapeReason(projectionExpr(item), shape);
-    if (reason !== undefined) {
-      return reason;
-    }
-  }
-  return undefined;
-}
-
 function predicateShapeReason(predicate: PredicateData, shape: PlanShape): string | undefined {
   switch (predicate.op) {
     case 'eq':
@@ -5620,7 +5611,73 @@ function aggregateCallReason(
       : `${expr.name} aggregate requires an input expression`;
   }
 
-  return simpleExprReason(expr.expr) ?? exprShapeReason(expr.expr, shape);
+  return rowLocalExprReason(expr.expr, shape);
+}
+
+function rowLocalProjectionReason(projection: ProjectionData, shape: PlanShape): string | undefined {
+  for (const item of Object.values(projection)) {
+    const reason = rowLocalExprReason(projectionExpr(item), shape);
+    if (reason !== undefined) {
+      return reason;
+    }
+  }
+  return undefined;
+}
+
+function rowLocalPredicateReason(predicate: PredicateData, shape: PlanShape): string | undefined {
+  switch (predicate.op) {
+    case 'eq':
+    case 'neq':
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte':
+      return rowLocalExprReason(predicate.left, shape) ?? rowLocalExprReason(predicate.right, shape);
+    case 'and':
+    case 'or':
+      for (const item of predicate.predicates) {
+        const reason = rowLocalPredicateReason(item, shape);
+        if (reason !== undefined) {
+          return reason;
+        }
+      }
+      return undefined;
+    case 'not':
+      return rowLocalPredicateReason(predicate.predicate, shape);
+  }
+}
+
+function rowLocalExprReason(expr: ExprData, shape: PlanShape): string | undefined {
+  switch (expr.op) {
+    case 'field':
+      return exprShapeReason(expr, shape);
+    case 'value':
+      return undefined;
+    case 'tuple':
+      for (const item of expr.items) {
+        const reason = rowLocalExprReason(item, shape);
+        if (reason !== undefined) {
+          return reason;
+        }
+      }
+      return undefined;
+    case 'hostCall':
+      if (expr.fn === undefined) {
+        return `host function ${expr.name} is not available; function expressions only work in memory`;
+      }
+      for (const arg of expr.args) {
+        const reason = rowLocalExprReason(arg, shape);
+        if (reason !== undefined) {
+          return reason;
+        }
+      }
+      return undefined;
+    case 'env':
+    case 'call':
+    case 'subquery':
+    case 'aggregateCall':
+      return simpleExprReason(expr);
+  }
 }
 
 function exprShapeReason(expr: ExprData, shape: PlanShape): string | undefined {
@@ -5741,9 +5798,18 @@ function exprValue(
     case 'tuple':
       return expr.items.map((item) => exprValue(row, item, env, subqueryStateByKey));
     case 'call':
-    case 'hostCall':
     case 'aggregateCall':
       return undefined;
+    case 'hostCall': {
+      if (expr.fn === undefined) {
+        return undefined;
+      }
+      try {
+        return expr.fn(...expr.args.map((arg) => exprValue(row, arg, env, subqueryStateByKey)));
+      } catch {
+        return undefined;
+      }
+    }
     case 'subquery':
       return subqueryExprValue(row, expr, env, subqueryStateByKey);
   }
@@ -5783,16 +5849,6 @@ function stripSubqueryHiddenField(
   const output = { ...row };
   delete output[hiddenField];
   return output;
-}
-
-function simpleProjectionReason(projection: ProjectionData): string | undefined {
-  for (const item of Object.values(projection)) {
-    const reason = simpleExprReason(projectionExpr(item));
-    if (reason !== undefined) {
-      return reason;
-    }
-  }
-  return undefined;
 }
 
 function simplePredicateReason(predicate: PredicateData): string | undefined {
