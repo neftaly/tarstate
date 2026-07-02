@@ -1,7 +1,9 @@
 import { createElement, type ReactElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
-import { qRows, readMaterializedQuery, type Store } from '@tarstate/core';
+import { qRows } from '@tarstate/core/db';
+import { readMaterializedQuery } from '@tarstate/core/materialization';
+import { type Store } from '@tarstate/core/store';
 import { TarstateProvider } from '@tarstate/react';
 import {
   RealEstateApp,

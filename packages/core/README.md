@@ -1,8 +1,9 @@
 # Tarstate
 
 Tarstate core is a generic relational query and derivation toolkit for
-JSON-shaped application state. It is the package for schemas, sources, queries,
-writes, and object-backed runtime helpers.
+JSON-shaped application state. Its root API is the stable starter surface for
+diagnostics, schemas, canonical queries, db/query helpers, constraints, stores,
+and typed writes.
 
 Use `@tarstate/react` as the idiomatic React entrypoint. Use `@tarstate/core`
 directly when code needs to combine stored records, assignments, visibility, or
@@ -10,18 +11,18 @@ other structured data outside a renderer package.
 
 The core API is stabilizing around a Relic-shaped split:
 
-- `store` is the small app-facing facade: `createStore(seedRows)` returns an
-  object-backed renderer-independent store, and
-  `await createRuntimeStore({ runtime, relations })` returns the same facade over
-  a pluggable `RelationRuntime`. Stores provide `query`, `queries`, `view`,
-  non-throwing `commit`, subscriptions, and idempotent `close`. Store commit results use
+- `store` is the small app-facing facade: root `createStore(seedRows)` returns
+  an object-backed renderer-independent store. The runtime-backed
+  `createRuntimeStore` helper is an advanced `@tarstate/core/store`
+  subpath-only API. Stores provide `query`, `queries`, `view`, non-throwing
+  `commit`, subscriptions, and idempotent `close`. Store commit results use
   `accepted`/`partial`/`rejected` status plus a separate `reflected` flag for row
   effects. A `view(query)` is the stable derived-read API; materialization
   remains a diagnostic-backed core cache API outside the stable store contract.
 - `query` describes relational row programs as data, including joins,
   explicit lookup, hash-declared equality lookup planning, btree-declared range
-  lookup planning, query-only `uniqueIndex` metadata, dependency analysis
-  through `dependencies`, propagated result identity through `rowKeyFields`,
+  lookup planning, query-only `uniqueIndex` metadata, dependency analysis,
+  propagated result identity,
   projections, `qualify`, `aggregate({ groupBy, aggregates })`, aggregate
   helpers such as `countDistinct`/`avg`/`notAny`/`setConcat`/`maxBy`/`minBy`,
   and nested collection expansion.
@@ -36,9 +37,7 @@ The core API is stabilizing around a Relic-shaped split:
   accepted. Patch targets can declare writable
   relation ownership with `target.relationNames` or `target.ownsRelation`;
   composed runtimes use that target metadata before treating read-side
-  `source.relationNames` as a compatibility fallback. The root convenience
-  barrel also exports `createMemoryRelationRuntime` for small non-durable
-  examples and tests.
+  `source.relationNames` as a compatibility fallback.
 - `write` defines the typed mutation vocabulary, including insert/insert-ignore,
   `insertOrReplace`, key-scoped `updateByKey`/`deleteByKey`, predicate
   `update`/`deleteRows`,
@@ -47,13 +46,14 @@ The core API is stabilizing around a Relic-shaped split:
   update expressions are left to a future explicit API.
 - `RelationDelta` is the stable adapter change-report type; diff helpers remain
   lower-level change primitives.
-- `db` gives those programs a small object-backed runtime for examples, tests,
-  and local state: diagnostics-aware `q`/`qMany`, row-only `qRows`/`qManyRows`,
-  `stripMeta` for recovering normalized row data from a `Db`, and variadic
-  all-or-nothing `tryTransact`/`transact` helpers. Explicit insert-or-update
-  writes use `insertOrUpdate(row, { update })` from `write`.
-- `memory-runtime` exposes a non-durable `RelationRuntime` over object-backed
-  rows for tests, local state, and adapter prototyping.
+- Root db/query helpers give those programs a small object-backed runtime for
+  examples, tests, and local state: diagnostics-aware `q`/`qMany`, row-only
+  `qRows`/`qManyRows`, `stripMeta` for recovering normalized row data from a
+  `Db`, and variadic all-or-nothing `tryTransact`/`transact` helpers. Explicit
+  insert-or-update writes use `insertOrUpdate(row, { update })` from `write`.
+- `memory-runtime` exposes `createMemoryRelationRuntime`, a non-durable
+  `RelationRuntime` over object-backed rows for tests, local state, and adapter
+  prototyping.
 - `constraints`, `materialization`, `watch`, and `runtime` are diagnostic-backed
   core surfaces. They provide baseline validation, object-backed
   constraint enforcement, query-shaped `req`/`unique`/`fk` enforcement for
@@ -136,27 +136,25 @@ const todos = (await evaluate(source, todoRows)).rows
 `@tarstate/core` is the standalone generic query/data library. Keep package
 code independent from application schemas, renderers, adapters, and wrappers.
 
-Examples and onboarding should teach taxonomy subpath imports:
+Advanced examples and integration docs should teach explicit subpath imports:
 
 - `@tarstate/core/adapter`
-- `@tarstate/core/constraints`
-- `@tarstate/core/db`
-- `@tarstate/core/diagnostics`
+- `@tarstate/core/delta`
 - `@tarstate/core/diff`
 - `@tarstate/core/evaluate`
 - `@tarstate/core/indexed-source`
 - `@tarstate/core/materialization`
-- `@tarstate/core/query`
+- `@tarstate/core/memory-runtime`
 - `@tarstate/core/runtime`
-- `@tarstate/core/schema`
 - `@tarstate/core/source`
 - `@tarstate/core/store`
 - `@tarstate/core/watch`
-- `@tarstate/core/write`
 
-The root barrel `@tarstate/core` remains a public convenience export for small
-consumers and compatibility, but subpaths make API ownership clearer in docs and
-examples.
+The root barrel `@tarstate/core` is the stable starter surface: diagnostics,
+schema, the canonical query DSL, db/query helpers, constraints, `createStore`,
+and write patch builders/types. Advanced surfaces are explicit subpaths only:
+adapter, runtime, source, delta, diff, evaluate, indexed-source, memory-runtime,
+materialization, and watch.
 
 Do not import `packages/core/src/*`, `@tarstate/core/src/*`, or any other
 source-path package internals.

@@ -1,24 +1,3 @@
-export {
-  composeRelationRuntimes,
-  isRelationRuntime,
-  tryApplyRelationPatches
-} from './adapter.js';
-export type {
-  AdapterSnapshot,
-  AdapterSource,
-  RelationApply,
-  RelationApplyAcceptedResult,
-  RelationApplyDurability,
-  RelationApplyOptions,
-  RelationApplyPartialResult,
-  RelationApplyRejectedResult,
-  RelationApplyReport,
-  RelationApplyResult,
-  RelationApplyStatus,
-  RelationDelta,
-  RelationPatchTarget,
-  RelationRuntime
-} from './adapter.js';
 export { collectDiagnostics, diagnostic, normalizeDiagnostics } from './diagnostics.js';
 export type {
   TarstateCoreDiagnosticCode,
@@ -28,171 +7,23 @@ export type {
   TarstateDiagnosticOptions,
   TarstateDiagnosticSeverity
 } from './diagnostics.js';
-export { relationDeltaNames, relationDeltas } from './delta.js';
+
 export {
-  DbTransactionError,
-  createDb,
-  db,
-  dbSource,
-  exists,
-  getEnv,
-  q,
-  qMany,
-  qManyRows,
-  qRows,
-  row,
-  setEnvTx,
-  stripMeta,
-  transact,
-  tryTransact,
-  updateEnv,
-  whatIf,
-  withEnv
-} from './db.js';
-export type {
-  Db,
-  DbData,
-  DbEnv,
-  DbInputData,
-  DbInputEnv,
-  DbOptions,
-  DbQueryIntoResult,
-  DbQueryOptions,
-  DbQuerySort,
-  DbQuerySortKey,
-  DbEnvUpdate,
-  DbTransactionItem,
-  DbTransactionBuilder,
-  DbTransactionContext,
-  DbTransactionInput,
-  DbTransactionInputs,
-  DbTransactionOptions,
-  DbTransactionResult,
-  MappedQueryBatchResult,
-  MappedQueryBatchRows,
-  QueryBatch,
-  QueryBatchResult,
-  QueryBatchRows,
-  RelationKeyValue,
-  RowLookupOptions,
-  RowPredicateOptions,
-  SetEnvTransaction
-} from './db.js';
-export { diffRows, rowDiffKey } from './diff.js';
-export type { RowChange, RowDiff, RowDiffDiagnostic, RowDiffOptions, RowDiffSide, RowKeySelector } from './diff.js';
-export { evaluate } from './evaluate.js';
-export type { EvaluateEnv, EvaluateFunction, EvaluateFunctions, EvaluateOptions, QueryResult } from './evaluate.js';
-export { fromIndexedObjectSource } from './indexed-source.js';
-export {
-  attachConstraints,
-  attachedConstraintsFor,
-  check,
-  constrain,
-  constraintAttachmentsFor,
-  DbConstraintTransactionError,
-  detachConstraints,
-  fk,
-  hasAttachedConstraints,
-  req,
-  transactConstrained,
-  tryTransactConstrained,
-  unique,
-  validateAttachedConstraints,
-  validateConstraints
-} from './constraints.js';
-export type {
-  CheckConstraintData,
-  ConstrainedDb,
-  ConstraintAttachment,
-  ConstraintAttachmentInput,
-  ConstraintData,
-  ConstraintOptions,
-  ConstraintRelationField,
-  ConstraintRelationFields,
-  ConstraintRelationRow,
-  ConstraintSet,
-  ConstraintValidationInput,
-  ConstraintValidationOptions,
-  ConstraintValidationResult,
-  ForeignKeyCascade,
-  ForeignKeyConstraintData,
-  QueryForeignKeyConstraintData,
-  QueryRequiredConstraintData,
-  QueryUniqueConstraintData,
-  QueryUniqueExpressionConstraintData,
-  RequiredConstraintData,
-  UniqueConstraintData
-} from './constraints.js';
-export { createMemoryRelationRuntime } from './memory-runtime.js';
-export type { MemoryRelationRuntimeOptions } from './memory-runtime.js';
-export {
-  demat,
-  evaluateDbQueryRows,
-  explainMaterialization,
-  index,
-  isMaterialized,
-  maintainMaterializationSnapshots,
-  maintainMaterializations,
-  mat,
-  materializationForQuery,
-  materializationsFor,
-  materializedLookupRowsFor,
-  materializedRowsFor,
-  materializedRowsForQuery,
-  materializedSourceFor,
-  materializeSnapshot,
-  queryRowsFromMaterialization,
-  readMaterializedQuery,
-  refreshMaterialization,
-  refreshMaterializationSnapshot,
-  snapshotHashIndex,
-  snapshotIndex
-} from './materialization.js';
-export type {
-  MaterializableDb,
-  MaterializationBtreeIndex,
-  MaterializationBtreeIndexResult,
-  MaterializationDiagnostic,
-  MaterializationExplanation,
-  MaterializationHashIndex,
-  MaterializationHashIndexResult,
-  MaterializationIndex,
-  MaterializationIndexOptions,
-  MaterializationIndexResult,
-  MaterializationIndexSpec,
-  MaterializationMaintenanceChange,
-  MaterializationMaintenanceChangeKind,
-  MaterializationMaintenanceDecision,
-  MaterializationMaintenanceKind,
-  MaterializationMaintenanceOptions,
-  MaterializationMaintenanceResult,
-  MaterializationMapLike,
-  MaterializationMetadata,
-  MaterializationMode,
-  MaterializationNestedRows,
-  MaterializationNestedUniqueRows,
-  MaterializationOptions,
-  MaterializationQueryBatch,
-  MaterializationRange,
-  MaterializationRangeBound,
-  MaterializationRefreshResult,
-  MaterializationSetLike,
-  MaterializationUniqueIndex,
-  MaterializationUniqueIndexResult,
-  MaterializedDb,
-  MaterializedQueryResult,
-  MaterializedSourceOptions,
-  MissingMaterializationDiagnostic,
-  MissingMaterializationRowsDiagnostic,
-  ObjectBackedMaterializableDb,
-  SnapshotMaterializationOptions,
-  SnapshotMaterializationTarget,
-  SnapshotRefreshTarget,
-  StaleMaterializationDiagnostic,
-  UnknownMaterializationVersionDiagnostic,
-  UnsupportedMaterializationDiagnostic,
-  UnsupportedMaterializationIndexDiagnostic
-} from './materialization.js';
+  anchoredPathField,
+  booleanField,
+  defineSchema,
+  idField,
+  isJsonValue,
+  jsonField,
+  nullable,
+  numberField,
+  optional,
+  refField,
+  relation,
+  stringField
+} from './schema.js';
+export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
+
 export {
   aggregate,
   and,
@@ -207,7 +38,6 @@ export {
   constRows,
   count,
   countDistinct,
-  dependencies,
   desc,
   difference,
   env,
@@ -246,7 +76,6 @@ export {
   queryRowKeyFields,
   relationDependencies,
   rename,
-  rowKeyFields,
   sel,
   sel1,
   setConcat,
@@ -265,13 +94,14 @@ export {
 export type {
   AggregateConfig,
   AggregateFunction,
+  AliasedQuery,
   AliasedRelationRef,
   ComparisonOp,
   ExpandOptions,
   ExprData,
   ExprInput,
-  HostFunction,
   HostExpressionFunction,
+  HostFunction,
   NullSortOrder,
   OptionalProjection,
   PredicateData,
@@ -284,32 +114,103 @@ export type {
   SortDirection,
   SortInput
 } from './query.js';
+
 export {
-  anchoredPathField,
-  booleanField,
-  defineSchema,
-  idField,
-  isJsonValue,
-  jsonField,
-  nullable,
-  numberField,
-  optional,
-  refField,
-  relation,
-  stringField
-} from './schema.js';
-export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
-export { composeSources, fromObjectSource, isRelationSource } from './source.js';
-export type { MaybePromise, RelationLookup, RelationRangeBound, RelationRangeLookup, RelationSource } from './source.js';
-export { createRuntimeStore, createStore } from './store.js';
+  DbTransactionError,
+  createDb,
+  exists,
+  getEnv,
+  q,
+  qMany,
+  qManyRows,
+  qRows,
+  row,
+  setEnvTx,
+  stripMeta,
+  transact,
+  tryTransact,
+  updateEnv,
+  whatIf,
+  withEnv
+} from './db.js';
+export type {
+  Db,
+  DbData,
+  DbEnv,
+  DbEnvUpdate,
+  DbInputData,
+  DbInputEnv,
+  DbOptions,
+  DbQueryIntoResult,
+  DbQueryOptions,
+  DbQuerySort,
+  DbQuerySortKey,
+  DbTransactionBuilder,
+  DbTransactionContext,
+  DbTransactionInput,
+  DbTransactionInputs,
+  DbTransactionItem,
+  DbTransactionOptions,
+  DbTransactionResult,
+  MappedQueryBatchResult,
+  MappedQueryBatchRows,
+  QueryBatch,
+  QueryBatchResult,
+  QueryBatchRows,
+  QueryBatchTarget,
+  QueryBatchTargetRow,
+  RelationKeyValue,
+  RowLookupOptions,
+  RowPredicateOptions,
+  SetEnvTransaction
+} from './db.js';
+
+export {
+  attachConstraints,
+  attachedConstraintsFor,
+  check,
+  constrain,
+  DbConstraintTransactionError,
+  detachConstraints,
+  fk,
+  hasAttachedConstraints,
+  req,
+  transactConstrained,
+  tryTransactConstrained,
+  unique,
+  validateConstraints
+} from './constraints.js';
+export type {
+  CheckConstraintData,
+  ConstrainedDb,
+  ConstraintAttachment,
+  ConstraintAttachmentInput,
+  ConstraintData,
+  ConstraintOptions,
+  ConstraintRelationField,
+  ConstraintRelationFields,
+  ConstraintRelationRow,
+  ConstraintSet,
+  ConstraintValidationInput,
+  ConstraintValidationOptions,
+  ConstraintValidationResult,
+  ForeignKeyCascade,
+  ForeignKeyConstraintData,
+  QueryForeignKeyConstraintData,
+  QueryRequiredConstraintData,
+  QueryUniqueConstraintData,
+  QueryUniqueExpressionConstraintData,
+  RequiredConstraintData,
+  UniqueConstraintData
+} from './constraints.js';
+
+export { createStore } from './store.js';
 export type {
   Store,
   StoreCommit,
-  StoreCommitEffects,
   StoreCommitInput,
   StoreCommitOptions,
   StoreCommitResult,
-  StoreCommitSnapshot,
   StoreCommitStatus,
   StoreDiagnostic,
   StoreMappedQueryBatchResult,
@@ -318,79 +219,18 @@ export type {
   StoreQueryBatchResult,
   StoreQueryOptions,
   StoreQueryResult,
-  StoreRuntimeInput,
   StoreSeedInput,
-  StoreSnapshot,
   StoreView,
-  StoreViewSnapshot,
+  StoreViewRead,
   StoreViewReadOptions,
+  StoreViewSnapshot,
   StoreWhatIf
 } from './store.js';
+
 export {
-  trackRuntimeCommit,
-  trackTransact,
-  UnsupportedChangeTrackingError
-} from './runtime.js';
-export type {
-  TrackRuntimeCommitDiagnostic,
-  TrackRuntimeCommitOptions,
-  TrackRuntimeCommitResult,
-  TrackRuntimeCommitStatus,
-  TrackRuntimeCommitSupportedResult,
-  TrackRuntimeCommitUnsupportedResult,
-  TrackTransactCallback,
-  TrackTransactChangeView,
-  TrackTransactDiagnostic,
-  TrackTransactOptions,
-  TrackTransactOutput,
-  TrackTransactQueryChanges,
-  TrackTransactResult
-} from './runtime.js';
-export {
-  attachWatches,
-  diffOptionsForTarget,
-  diffQuery,
-  isWatchMaterialization,
-  subscribeWatch,
-  trackedChangesForDbTransition,
-  transferWatches,
-  unwatch,
-  unwatchTarget,
-  watch,
-  watchChangeKeyMap,
-  watchChangeMap,
-  watchRuntime,
-  watchTarget,
-  watchTargetKey
-} from './watch.js';
-export type {
-  ChangeSet,
-  QueryDiff,
-  QueryDiffDiagnostic,
-  QueryDiffOptions,
-  RuntimeWatchHandle,
-  TrackedChange,
-  UnwatchResult,
-  WatchChangeKeyMap,
-  WatchChangeMap,
-  WatchDb,
-  WatchDiagnostic,
-  WatchEvent,
-  WatchHandle,
-  WatchListener,
-  WatchOptions,
-  WatchRefreshResult,
-  WatchRuntimeDiagnostic,
-  WatchSubscription,
-  WatchTarget,
-  WatchTargetChange,
-  WatchTargetRegistration,
-  WatchUnsubscribeResult
-} from './watch.js';
-export {
-  deleteRows,
-  deleteExact,
   deleteByKey,
+  deleteExact,
+  deleteRows,
   insert,
   insertIgnore,
   insertOrMerge,
@@ -400,7 +240,8 @@ export {
   replaceAll,
   update,
   updateByKey,
-  write
+  write,
+  writeInputPatches
 } from './write.js';
 export type {
   DeleteByKeyPatch,
@@ -409,9 +250,9 @@ export type {
   InsertIgnorePatch,
   InsertOrMergeOptions,
   InsertOrMergePatch,
+  InsertOrReplacePatch,
   InsertOrUpdateOptions,
   InsertOrUpdatePatch,
-  InsertOrReplacePatch,
   InsertPatch,
   RelationKeyInput,
   RelationMergeInput,

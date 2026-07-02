@@ -1,51 +1,60 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
-  aggregate,
-  as,
   attachConstraints,
   check,
   constrain,
-  collectDiagnostics,
-  count,
-  createDb,
-  createStore,
-  defineSchema,
-  diagnostic,
-  eq,
-  field,
   fk,
-  from,
-  gt,
-  insert,
-  leftJoin,
-  mat,
-  maybe,
-  numberField,
-  pipe,
-  project,
+  req,
+  tryTransactConstrained,
+  unique
+} from '@tarstate/core/constraints';
+import {
+  createDb,
   qManyRows,
   qRows,
-  relation,
-  req,
   row,
-  stringField,
-  sum,
   transact,
-  tryTransactConstrained,
-  unique,
-  value,
-  where,
-  type DbOptions,
-  type EvaluateOptions,
+  type DbOptions
+} from '@tarstate/core/db';
+import {
+  collectDiagnostics,
+  diagnostic,
   type TarstateCoreDiagnosticCode,
   type TarstateDiagnostic,
   type TarstateDiagnosticCode,
   type TarstateDiagnosticMode,
   type TarstateDiagnosticOptions,
-  type TarstateDiagnosticSeverity,
-  type QueryResult,
+  type TarstateDiagnosticSeverity
+} from '@tarstate/core/diagnostics';
+import { type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
+import { mat } from '@tarstate/core/materialization';
+import {
+  aggregate,
+  as,
+  count,
+  eq,
+  field,
+  from,
+  gt,
+  leftJoin,
+  maybe,
+  pipe,
+  project,
+  sum,
+  value,
+  where
+} from '@tarstate/core/query';
+import {
+  defineSchema,
+  numberField,
+  relation,
+  stringField
+} from '@tarstate/core/schema';
+import {
+  createStore,
   type StoreViewSnapshot
-} from '@tarstate/core';
+} from '@tarstate/core/store';
+import { insert } from '@tarstate/core/write';
 
 type Account = {
   readonly id: string;

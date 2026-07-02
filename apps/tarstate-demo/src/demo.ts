@@ -1,52 +1,39 @@
 import * as Automerge from '@automerge/automerge';
 import { createElement, useMemo, useState, type ReactElement } from 'react';
 import { automergeDb, type AutomergeDb } from '@tarstate/automerge';
+import { check, constrain, fk, req, unique } from '@tarstate/core/constraints';
+import { db, qRows, type Db } from '@tarstate/core/db';
+import { mat, materializeSnapshot } from '@tarstate/core/materialization';
 import {
   aggregate,
   and,
   as,
   asc,
   btree,
-  check,
-  constrain,
   count,
-  db,
   desc,
   env,
   eq,
   field,
-  fk,
   from,
   gt,
   gte,
   hash,
-  insert,
   join,
   keyBy,
   leftJoin,
   lte,
-  mat,
   max,
   maybe,
   or,
   pipe,
   project,
-  qRows,
-  req,
   sort,
   sum,
-  unique,
   value,
   where,
-  createStore,
-  materializeSnapshot,
-  type Db,
-  type Query,
-  type Store,
-  type StoreCommitInput,
-  type StoreCommitResult,
-  type TarstateDiagnostic
-} from '@tarstate/core';
+  type Query
+} from '@tarstate/core/query';
 import {
   booleanField,
   defineSchema,
@@ -55,6 +42,14 @@ import {
   relation,
   stringField
 } from '@tarstate/core/schema';
+import {
+  createStore,
+  type Store,
+  type StoreCommitInput,
+  type StoreCommitResult
+} from '@tarstate/core/store';
+import { insert } from '@tarstate/core/write';
+import { type TarstateDiagnostic } from '@tarstate/core/diagnostics';
 import {
   TarstateProvider,
   useCommit,
