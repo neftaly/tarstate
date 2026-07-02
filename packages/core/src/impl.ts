@@ -370,7 +370,7 @@ export function relationDependencies(input: QueryKeyInput): readonly string[] {
 
 export function queryRowKeyFields(input: QueryKeyInput): readonly string[] | undefined {
   const data = isQuery(input) ? input.data : input as QueryData;
-  return queryDataRowKeyFields(data);
+  return queryDataRowKeyFields(data, isQuery(input) ? input.relations : {});
 }
 
 export const clauses = <Left = Record<string, unknown>, Right = Record<string, unknown>>(
@@ -1168,6 +1168,10 @@ export type DbTransactionResult<DbValue extends Db = Db> = {
   readonly committed: boolean;
   readonly materializations?: MaterializationMaintenanceResult;
 };
+const TRANSACTION_WRITE_PATCHES = Symbol('tarstate.transactionWritePatches');
+type DbTransactionResultWithWritePatches<DbValue extends Db = Db> = DbTransactionResult<DbValue> & {
+  readonly [TRANSACTION_WRITE_PATCHES]: readonly WritePatch[];
+};
 export type DbTransactionPlan = {
   readonly inputs: DbTransactionInputs;
   readonly patches: readonly WritePatch[];
@@ -1243,7 +1247,7 @@ export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | Rela
 export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): QueryResult<any> {
   const queryObject = queryForTarget(queryValue);
   const materializedRows = isQuery(queryValue) ? materializedRowsForQuery(dbValue, queryObject) : undefined;
-  if (materializedRows !== undefined) {
+  if (materializedRows !== undefined && !hasEvaluateContextOverrides(options)) {
     return {
       rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(materializedRows, options) : materializedRows,
       diagnostics: []
@@ -1339,14 +1343,14 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
 
       if (patchResult.diagnostics.some(isErrorDiagnostic)) {
         diagnostics.push(...constraintDiagnosticsForInvalidPatch(item, materializationConstraints));
-        return {
+        return withTransactionWritePatches({
           db: inputDb,
           patches: patches.length,
           applied,
           deltas,
           diagnostics,
           committed: false
-        };
+        }, patches);
       }
 
       workingDb = patchResult.db;
@@ -1360,14 +1364,14 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     const validation = validateConstraintsSync(workingDb, materializationConstraints, { env: workingDb.env });
     diagnostics.push(...validation.diagnostics);
     if (!validation.valid) {
-      return {
+      return withTransactionWritePatches({
         db: inputDb,
         patches: patches.length,
         applied: 0,
         deltas: [],
         diagnostics,
         committed: false
-      };
+      }, patches);
     }
   }
 
@@ -1375,7 +1379,7 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
   diagnostics.push(...materializations.diagnostics);
   const committedDb = applyMaterializationState(workingDb, materializedStateFor(inputDb), materializations) as DbValue;
 
-  return {
+  return withTransactionWritePatches({
     db: committedDb,
     patches: patches.length,
     applied,
@@ -1383,10 +1387,30 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     diagnostics,
     committed: true,
     ...(materializations.maintained === 0 ? {} : { materializations })
-  };
+  }, patches);
 }
 function normalizeTransactionInputs(inputOrInputs: DbTransactionInput | DbTransactionInputs): DbTransactionInputs {
   return (Array.isArray(inputOrInputs) ? inputOrInputs : [inputOrInputs]) as DbTransactionInputs;
+}
+
+function hasEvaluateContextOverrides(options: EvaluateOptions): boolean {
+  return options.env !== undefined || options.functions !== undefined;
+}
+
+function withTransactionWritePatches<DbValue extends Db>(
+  result: DbTransactionResult<DbValue>,
+  patches: readonly WritePatch[]
+): DbTransactionResult<DbValue> {
+  Object.defineProperty(result, TRANSACTION_WRITE_PATCHES, {
+    value: patches,
+    enumerable: false,
+    configurable: false
+  });
+  return result;
+}
+
+function transactionWritePatches(result: DbTransactionResult): readonly WritePatch[] {
+  return (result as Partial<DbTransactionResultWithWritePatches>)[TRANSACTION_WRITE_PATCHES] ?? [];
 }
 
 export type RelationRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
@@ -1593,6 +1617,9 @@ export type MaterializationMetadata<Row = unknown> = {
 export type MaterializationExplanation<Row = unknown> = {
   readonly query: Query<Row>;
   readonly supported: boolean;
+  readonly update: 'incremental' | 'recomputed';
+  readonly recomputed: boolean;
+  readonly reason: string;
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 export type MaterializationRefreshResult<Row = unknown> = {
@@ -1631,7 +1658,12 @@ export type MaterializationMaintenanceResult<Row = unknown> = {
 export type MaterializationIndex<Row = unknown> = Readonly<Record<string, unknown>> & { readonly rows?: readonly Row[] };
 export type MaterializationNestedRows<Row = unknown> = Readonly<Record<string, readonly Row[]>>;
 export type MaterializationNestedUniqueRows<Row = unknown> = Readonly<Record<string, Row | undefined>>;
-export type MaterializationSetLike<Row = unknown> = { readonly values: () => IterableIterator<Row> };
+export type MaterializationSetLike<Row = unknown> = {
+  readonly size: number;
+  readonly has: (row: Row) => boolean;
+  readonly values: () => IterableIterator<Row>;
+  readonly [Symbol.iterator]: () => IterableIterator<Row>;
+};
 export type MaterializationMapLike<Key = unknown, Value = unknown> = { readonly get: (key: Key) => Value | undefined };
 export type MaterializationHashIndex<Row = unknown, Value = unknown> = MaterializationMapLike<Value, readonly Row[]>;
 export type MaterializationRangeBound<Value = unknown> = RelationRangeBound<Value>;
@@ -1760,7 +1792,8 @@ export function maintainMaterializationSnapshots<Row = unknown>(
   const changes: MaterializationMaintenanceChange<Row>[] = [];
   const touchedDependencies = relationDeltaNames(options.deltas ?? []);
   const touchedEnvDependencies = materializationEnvDeltaNames(options.envDeltas ?? []);
-  const hasChangeHints = options.deltas !== undefined || options.envDeltas !== undefined;
+  const hasRelationChangeHints = options.deltas !== undefined;
+  const hasEnvChangeHints = options.envDeltas !== undefined;
 
   for (const metadata of beforeState.metadata) {
     const previousRows = beforeState.rows.get(metadata.id) as readonly Row[] | undefined;
@@ -1768,7 +1801,8 @@ export function maintainMaterializationSnapshots<Row = unknown>(
     const touched = dependencies.filter((name) => touchedDependencies.includes(name));
     const envDependencies = queryEnvDependencies(metadata.query);
     const touchedEnv = envDependencies.filter((name) => touchedEnvDependencies.includes(name));
-    if (previousRows !== undefined && hasChangeHints && touched.length === 0 && touchedEnv.length === 0) {
+    const envHintsCoverDependencies = hasEnvChangeHints || envDependencies.length === 0;
+    if (previousRows !== undefined && hasRelationChangeHints && envHintsCoverDependencies && touched.length === 0 && touchedEnv.length === 0) {
       changes.push({
         update: 'carried',
         recomputed: false,
@@ -1793,32 +1827,50 @@ export function maintainMaterializationSnapshots<Row = unknown>(
       continue;
     }
 
-    const refresh = refreshMaterializationRows<Row>(target, metadata.query as Query<Row>);
-    const diff = diffRows(previousRows ?? [], refresh.rows);
-    const added = diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
-    const removed = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+    const incremental = previousRows === undefined || !hasRelationChangeHints || !envHintsCoverDependencies || touchedEnv.length > 0
+      ? undefined
+      : maintainMaterializationIncrementally(target, metadata.query as Query<Row>, previousRows, options.deltas);
 
-    changes.push({
-      update: 'recomputed',
-      recomputed: true,
-      reason: 'snapshot recompute',
-      id: metadata.id,
-      queryKey: metadata.queryKey,
-      query: metadata.query as Query<Row>,
-      maintenance: metadata.mode,
+    if (incremental !== undefined && incremental.supported) {
+      changes.push({
+        update: 'incremental',
+        recomputed: false,
+        reason: incremental.reason,
+        id: metadata.id,
+        queryKey: metadata.queryKey,
+        query: metadata.query as Query<Row>,
+        maintenance: metadata.mode,
+        dependencies,
+        touchedDependencies: touched,
+        envDependencies,
+        touchedEnvDependencies: touchedEnv,
+        indexSpecs: [],
+        previousRowsAvailable: true,
+        previousRows,
+        rows: incremental.rows,
+        added: incremental.added,
+        removed: incremental.removed,
+        rowChanges: incremental.rowChanges,
+        diagnostics: incremental.diagnostics
+      });
+      continue;
+    }
+
+    const fallbackDiagnostics = [
+      ...(previousRows === undefined ? [materializationUnsupportedDiagnostic('incremental maintenance requires previous rows')] : []),
+      ...(touchedEnv.length > 0 ? [materializationUnsupportedDiagnostic(`env dependency changed: ${touchedEnv.join(', ')}`)] : []),
+      ...(incremental === undefined ? [] : incremental.diagnostics)
+    ];
+    changes.push(recomputeMaterializationChange(target, metadata as MaterializationMetadata<Row>, previousRows, {
       dependencies,
       touchedDependencies: touched,
       envDependencies,
       touchedEnvDependencies: touchedEnv,
-      indexSpecs: [],
-      previousRowsAvailable: previousRows !== undefined,
-      previousRows,
-      rows: refresh.rows,
-      added,
-      removed,
-      rowChanges: diff.changes,
-      diagnostics: [...refresh.diagnostics, ...diff.diagnostics]
-    });
+      reason: fallbackDiagnostics.length === 0
+        ? 'snapshot recompute'
+        : `snapshot recompute: ${fallbackDiagnostics.map((item) => item.message).join('; ')}`,
+      diagnostics: fallbackDiagnostics
+    }));
   }
 
   return {
@@ -1830,8 +1882,336 @@ export function maintainMaterializationSnapshots<Row = unknown>(
     diagnostics: changes.flatMap((change) => change.diagnostics)
   };
 }
-export const explainMaterialization = <Row>(query: Query<Row>): MaterializationExplanation<Row> => ({ query, supported: true, diagnostics: [] });
-export const index = <Row = unknown>(): MaterializationIndex<Row> => ({});
+
+type MaterializationRowKeyPath = readonly string[];
+type MaterializationRowIdentity<Row = unknown> = {
+  readonly paths: readonly MaterializationRowKeyPath[];
+  readonly fields: readonly string[] | undefined;
+  readonly keyBy: RowKeySelector<Row>;
+};
+type IncrementalMaterializationSupport<Row = unknown> =
+  | {
+      readonly supported: true;
+      readonly relation: RelationRef;
+      readonly identity: MaterializationRowIdentity<Row>;
+      readonly reason: string;
+    }
+  | {
+      readonly supported: false;
+      readonly reason: string;
+      readonly diagnostics: readonly TarstateDiagnostic[];
+    };
+type IncrementalMaterializationResult<Row = unknown> =
+  | {
+      readonly supported: true;
+      readonly reason: string;
+      readonly rows: readonly Row[];
+      readonly added: readonly Row[];
+      readonly removed: readonly Row[];
+      readonly rowChanges: readonly RowChange<Row>[];
+      readonly diagnostics: readonly TarstateDiagnostic[];
+    }
+  | {
+      readonly supported: false;
+      readonly reason: string;
+      readonly diagnostics: readonly TarstateDiagnostic[];
+    };
+
+function maintainMaterializationIncrementally<Row>(
+  target: unknown,
+  query: Query<Row>,
+  previousRows: readonly Row[],
+  deltas: readonly RelationDelta[]
+): IncrementalMaterializationResult<Row> {
+  const support = incrementalMaterializationSupport(query);
+  if (!support.supported) return support;
+
+  const relationDeltasForQuery = deltas.filter((delta) => delta.relation.name === support.relation.name);
+  if (relationDeltasForQuery.length === 0) {
+    return {
+      supported: true,
+      reason: 'incremental delta maintenance',
+      rows: previousRows,
+      added: [],
+      removed: [],
+      rowChanges: [],
+      diagnostics: []
+    };
+  }
+
+  const addedSourceRows = relationDeltasForQuery.flatMap((delta) => delta.added);
+  const removedSourceRows = relationDeltasForQuery.flatMap((delta) => delta.removed);
+  const evaluateOptions = materializationEvaluateOptions(target);
+  const addedResult = evaluateDeltaRows(query, support.relation, addedSourceRows, evaluateOptions);
+  const removedResult = evaluateDeltaRows(query, support.relation, removedSourceRows, evaluateOptions);
+  const diagnostics = [...addedResult.diagnostics, ...removedResult.diagnostics];
+  const rowUpdate = applyIncrementalMaterializedRows(
+    previousRows,
+    removedResult.rows,
+    addedResult.rows,
+    support.identity.keyBy
+  );
+
+  if (!rowUpdate.supported) {
+    return {
+      supported: false,
+      reason: rowUpdate.reason,
+      diagnostics: [...diagnostics, ...rowUpdate.diagnostics]
+    };
+  }
+
+  const refresh = refreshMaterializationRows(target, query);
+  if (stableKey(rowUpdate.rows) !== stableKey(refresh.rows)) {
+    const reason = 'incremental materialization candidate differed from full recompute';
+    return {
+      supported: false,
+      reason,
+      diagnostics: [...diagnostics, ...refresh.diagnostics, materializationUnsupportedDiagnostic(reason)]
+    };
+  }
+
+  const diff = diffRows(previousRows, rowUpdate.rows, { keyBy: support.identity.keyBy });
+  return {
+    supported: true,
+    reason: 'incremental delta maintenance',
+    rows: rowUpdate.rows,
+    added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    rowChanges: diff.changes,
+    diagnostics: [...diagnostics, ...diff.diagnostics]
+  };
+}
+
+function recomputeMaterializationChange<Row>(
+  target: unknown,
+  metadata: MaterializationMetadata<Row>,
+  previousRows: readonly Row[] | undefined,
+  options: {
+    readonly dependencies: readonly string[];
+    readonly touchedDependencies: readonly string[];
+    readonly envDependencies: readonly string[];
+    readonly touchedEnvDependencies: readonly string[];
+    readonly reason: string;
+    readonly diagnostics: readonly TarstateDiagnostic[];
+  }
+): MaterializationMaintenanceChange<Row> {
+  const refresh = refreshMaterializationRows<Row>(target, metadata.query);
+  const diff = diffRows(previousRows ?? [], refresh.rows);
+  return {
+    update: 'recomputed',
+    recomputed: true,
+    reason: options.reason,
+    id: metadata.id,
+    queryKey: metadata.queryKey,
+    query: metadata.query,
+    maintenance: metadata.mode,
+    dependencies: options.dependencies,
+    touchedDependencies: options.touchedDependencies,
+    envDependencies: options.envDependencies,
+    touchedEnvDependencies: options.touchedEnvDependencies,
+    indexSpecs: [],
+    previousRowsAvailable: previousRows !== undefined,
+    previousRows,
+    rows: refresh.rows,
+    added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    rowChanges: diff.changes,
+    diagnostics: [...options.diagnostics, ...refresh.diagnostics, ...diff.diagnostics]
+  };
+}
+
+function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalMaterializationSupport<Row> {
+  const shape = incrementalMaterializationShape(query.data, query.relations);
+  if (!shape.supported) return shape;
+
+  const identity = rowIdentityForQueryData<Row>(query.data, query.relations);
+  if (identity === undefined) {
+    return {
+      supported: false,
+      reason: 'incremental maintenance requires a stable materialized row identity',
+      diagnostics: [materializationUnsupportedDiagnostic('incremental maintenance requires a stable materialized row identity')]
+    };
+  }
+
+  return {
+    supported: true,
+    relation: shape.relation,
+    identity,
+    reason: 'single-source pipeline with stable row identity'
+  };
+}
+
+function incrementalMaterializationShape(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): { readonly supported: true; readonly relation: RelationRef } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  switch (data.op) {
+    case 'from':
+    case 'lookup': {
+      const relationName = typeof data.relation === 'string' ? data.relation : undefined;
+      const relationRef = relationName === undefined ? undefined : relations[relationName];
+      if (relationRef === undefined) {
+        const reason = 'incremental maintenance requires a readable source relation';
+        return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+      }
+      return { supported: true, relation: relationRef as RelationRef };
+    }
+    case 'where':
+      if (containsIncrementalSubquery(data.predicate)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
+      return incrementalNestedShape(data, relations);
+    case 'project':
+      if (projectionHasAggregate(projectionFrom(data.projection))) return unsupportedIncrementalShape('aggregate projection is not incrementally maintained');
+      if (containsIncrementalSubquery(data.projection)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
+      return incrementalNestedShape(data, relations);
+    case 'extend':
+      if (containsIncrementalSubquery(data.projection)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
+      return incrementalNestedShape(data, relations);
+    case 'without':
+    case 'rename':
+    case 'qualify':
+    case 'keyBy':
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+      return incrementalNestedShape(data, relations);
+    case 'aggregate':
+      return unsupportedIncrementalShape('aggregate queries are not incrementally maintained');
+    case 'sort':
+    case 'limit':
+    case 'sortLimit':
+      return unsupportedIncrementalShape('final sort and limit queries are not incrementally maintained');
+    case 'join':
+      return unsupportedIncrementalShape('join queries are not incrementally maintained');
+    case 'union':
+    case 'intersection':
+    case 'difference':
+      return unsupportedIncrementalShape('set operation queries are not incrementally maintained');
+    case 'expand':
+      return unsupportedIncrementalShape('expand queries are not incrementally maintained');
+    default:
+      return unsupportedIncrementalShape(`query op "${data.op}" is not incrementally maintained`);
+  }
+}
+
+function incrementalNestedShape(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): ReturnType<typeof incrementalMaterializationShape> {
+  const input = queryDataFrom(data.input);
+  return input === undefined
+    ? unsupportedIncrementalShape('incremental maintenance requires a nested input query')
+    : incrementalMaterializationShape(input, relations);
+}
+
+function unsupportedIncrementalShape(reason: string): { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+}
+
+function materializationUnsupportedDiagnostic(message: string): TarstateDiagnostic {
+  return {
+    code: 'materialization_unsupported',
+    severity: 'info',
+    message,
+    surface: 'materialization'
+  };
+}
+
+function evaluateDeltaRows<Row>(
+  query: Query<Row>,
+  relationRef: RelationRef,
+  rows: readonly unknown[],
+  options: EvaluateOptions
+): MaterializationRefreshResult<Row> {
+  if (rows.length === 0) return { rows: [], diagnostics: [] };
+  return evaluate(fromObjectSource({ [relationRef.name]: rows }), query, options);
+}
+
+function materializationEvaluateOptions(target: unknown): EvaluateOptions {
+  return isDb(target) ? { env: target.env } : {};
+}
+
+function applyIncrementalMaterializedRows<Row>(
+  previousRows: readonly Row[],
+  removedRows: readonly Row[],
+  addedRows: readonly Row[],
+  keyBy: RowKeySelector<Row>
+): { readonly supported: true; readonly rows: readonly Row[] } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  const previousByKey = new Map<string, number>();
+  const removedByKey = new Map<string, Row>();
+  const addedByKey = new Map<string, Row>();
+  const duplicateKeys = new Set<string>();
+
+  const track = (map: Map<string, Row> | Map<string, number>, key: string, value: Row | number): void => {
+    if (map.has(key)) duplicateKeys.add(key);
+    (map as Map<string, Row | number>).set(key, value);
+  };
+
+  previousRows.forEach((rowValue, indexValue) => track(previousByKey, rowDiffKey(rowValue, { keyBy }), indexValue));
+  removedRows.forEach((rowValue) => track(removedByKey, rowDiffKey(rowValue, { keyBy }), rowValue));
+  addedRows.forEach((rowValue) => track(addedByKey, rowDiffKey(rowValue, { keyBy }), rowValue));
+
+  if (duplicateKeys.size > 0) {
+    const reason = `incremental maintenance requires unique materialized row keys: ${Array.from(duplicateKeys).join(', ')}`;
+    return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+  }
+
+  const rows: Row[] = [];
+  for (const rowValue of previousRows) {
+    const key = rowDiffKey(rowValue, { keyBy });
+    const added = addedByKey.get(key);
+    if (added !== undefined) {
+      rows.push(added);
+      continue;
+    }
+    if (!removedByKey.has(key)) rows.push(rowValue);
+  }
+
+  for (const rowValue of addedRows) {
+    const key = rowDiffKey(rowValue, { keyBy });
+    if (!previousByKey.has(key)) rows.push(rowValue);
+  }
+
+  return { supported: true, rows };
+}
+
+function containsIncrementalSubquery(input: unknown): boolean {
+  if (!isRecord(input)) return false;
+  if (input.op === 'sel' || input.op === 'sel1' || 'correlation' in input) return true;
+  return Object.values(input).some((valueValue) => {
+    if (Array.isArray(valueValue)) return valueValue.some(containsIncrementalSubquery);
+    return containsIncrementalSubquery(valueValue);
+  });
+}
+
+export const explainMaterialization = <Row>(query: Query<Row>): MaterializationExplanation<Row> => {
+  const incremental = incrementalMaterializationSupport(query);
+  return {
+    query,
+    supported: incremental.supported,
+    update: incremental.supported ? 'incremental' : 'recomputed',
+    recomputed: !incremental.supported,
+    reason: incremental.reason,
+    diagnostics: incremental.supported ? [] : incremental.diagnostics
+  };
+};
+export const index = <Row = unknown>(rows: Iterable<Row> = []): MaterializationIndex<Row> & MaterializationSetLike<Row> => {
+  const valuesArray = Array.from(rows);
+  return {
+    rows: valuesArray,
+    size: valuesArray.length,
+    has: (rowValue: Row): boolean => valuesArray.includes(rowValue),
+    values: function* values(): IterableIterator<Row> {
+      yield* valuesArray;
+    },
+    [Symbol.iterator]: function* iterator(): IterableIterator<Row> {
+      yield* valuesArray;
+    },
+    forEach: (callback: (rowValue: Row, rowKey: Row, set: ReadonlySet<Row>) => void, thisArg?: unknown): void => {
+      const set = new Set(valuesArray);
+      set.forEach((rowValue, rowKey) => callback.call(thisArg, rowValue, rowKey, set));
+    }
+  };
+};
 
 export type MemoryRelationRuntimeOptions = { readonly relationNames?: readonly string[] };
 export function createMemoryRelationRuntime(data: DbInputData = {}, options: MemoryRelationRuntimeOptions = {}): RelationRuntime<number> {
@@ -2066,9 +2446,23 @@ export const watchChangeMap = <Row>(changes: Iterable<TrackedChange<Row>>): Watc
 export const watchChangeKeyMap = <Row>(changes: Iterable<TrackedChange<Row>>): WatchChangeKeyMap<Row> =>
   new Map(Array.from(changes, (change) => [change.targetKey, change as WatchTargetChange<Row>]));
 export const watchTargetKey = (target: WatchTarget): string => isQuery(target) ? queryKey(target) : `relation:${target.name}`;
-export const isWatchMaterialization = (): boolean => false;
-export const watchRuntime = <Version, Row>(runtime: RelationRuntime<Version>, target: WatchTarget<Row>, listener: WatchListener<Row>, options: WatchOptions<Row> = {}): RuntimeWatchHandle<Row> =>
-  watch(runtime.source, target, listener, options) as RuntimeWatchHandle<Row>;
+export const isWatchMaterialization = (input: unknown): input is MaterializationMetadata | MaterializationMaintenanceChange =>
+  isMaterializationMetadata(input) || isMaterializationMaintenanceChange(input);
+export const watchRuntime = <Version, Row>(runtime: RelationRuntime<Version>, target: WatchTarget<Row>, listener: WatchListener<Row>, options: WatchOptions<Row> = {}): RuntimeWatchHandle<Row> => {
+  const source = runtime.snapshot?.().source ?? runtime.source;
+  const handle = watch(source, target, listener, options) as RuntimeWatchHandle<Row>;
+  const runtimeUnsubscribe = runtime.subscribe?.(() => {
+    void handle.refresh(runtime.snapshot?.().source ?? runtime.source);
+  });
+
+  return {
+    ...handle,
+    unwatch: () => {
+      runtimeUnsubscribe?.();
+      return handle.unwatch();
+    }
+  };
+};
 export const unwatch = (handle: Pick<WatchHandle, 'id'>): UnwatchResult => {
   const state = WATCH_STATES.get(handle.id);
   if (state === undefined) return { id: handle.id, closed: false, diagnostics: [] };
@@ -2125,7 +2519,8 @@ export async function diffQuery<Row>(before: WatchDb, after: WatchDb, target: Qu
   };
 }
 export const diffOptionsForTarget = <Row>(_target: WatchTarget<Row>, options: WatchOptions<Row>): RowDiffOptions<Row> => options;
-export const transferWatches = (): void => {};
+export const transferWatches = <DbValue extends Db>(from: Db, to: DbValue): DbValue =>
+  withAttachedWatchTargets(to, uniqueWatchTargets([...attachedWatchTargetsFor(to), ...attachedWatchTargetsFor(from)]));
 export async function trackedChangesForDbTransition<DbValue extends WatchDb = WatchDb>(
   before?: DbValue,
   after?: DbValue,
@@ -2386,27 +2781,29 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
   let revision = 0;
   let closed = false;
   const listeners = new Set<() => void>();
-  let state = dbFromRuntime(input.runtime, input.relations, input.env);
-  let version = input.runtime.source.version?.();
+  const initialRuntimeSnapshot = input.runtime.snapshot?.();
+  let currentSource = initialRuntimeSnapshot?.source ?? input.runtime.source;
+  let state = dbFromSource(currentSource, input.relations, input.env);
+  let version = initialRuntimeSnapshot?.version ?? currentSource.version?.();
   const snapshot = (): StoreSnapshot<Version> => ({
     db: state,
-    source: input.runtime.source,
+    source: currentSource,
     revision,
-    diagnostics: input.runtime.source.diagnostics?.() ?? [],
+    diagnostics: currentSource.diagnostics?.() ?? [],
     ...(version === undefined ? {} : { version })
   });
   const refreshFromRuntime = (): StoreSnapshot<Version> => {
     const runtimeSnapshot = input.runtime.snapshot?.();
-    const source = runtimeSnapshot?.source ?? input.runtime.source;
-    version = runtimeSnapshot?.version ?? source.version?.();
-    state = dbFromSource(source, input.relations, state.env);
+    currentSource = runtimeSnapshot?.source ?? input.runtime.source;
+    version = runtimeSnapshot?.version ?? currentSource.version?.();
+    state = dbFromSource(currentSource, input.relations, state.env);
     revision += 1;
     for (const listener of listeners) listener();
     return {
       db: state,
-      source,
+      source: currentSource,
       revision,
-      diagnostics: runtimeSnapshot?.diagnostics ?? source.diagnostics?.() ?? [],
+      diagnostics: runtimeSnapshot?.diagnostics ?? currentSource.diagnostics?.() ?? [],
       ...(version === undefined ? {} : { version })
     };
   };
@@ -2436,6 +2833,23 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       };
     }),
     commit: async (inputOrInputs) => {
+      if (closed) {
+        const closedSnapshot = snapshot();
+        const diagnostics: readonly TarstateDiagnostic[] = [{
+          code: 'runtime_unsupported',
+          severity: 'error',
+          message: 'store is closed',
+          surface: 'store.commit'
+        }];
+        return {
+          status: 'rejected',
+          reflected: false,
+          effects: { patches: 0, applied: 0, deltas: [], diagnostics },
+          snapshot: closedSnapshot,
+          diagnostics
+        };
+      }
+
       const transactionResult = tryTransact(state, ...normalizeTransactionInputs(inputOrInputs));
       if (!transactionResult.committed) {
         return {
@@ -2452,8 +2866,8 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
         };
       }
 
-      const report = await tryApplyRelationPatches(input.runtime, transactionResult.deltas.flatMap(deltaToPatches), { readVersion: true });
-      const nextSnapshot = refreshFromRuntime();
+      const report = await tryApplyRelationPatches(input.runtime, transactionWritePatches(transactionResult), { readVersion: true });
+      const nextSnapshot = report.status === 'rejected' ? snapshot() : refreshFromRuntime();
       return {
         status: report.status,
         reflected: report.status !== 'rejected',
@@ -2505,7 +2919,7 @@ function createStoreView<Row, Version>(
 }
 
 function createWatchHandle<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, options: WatchOptions<Row>): WatchHandle<DbValue, Row> {
-  const id = options.label ?? `watch:${WATCH_ID += 1}`;
+  const id = nextWatchId(options.label);
   const initial = readWatchTargetRows(dbValue, target, options);
   const state: InternalWatchState<Row> = {
     id,
@@ -2573,6 +2987,16 @@ function createWatchHandle<DbValue extends WatchDb, Row>(dbValue: DbValue, targe
     unwatch: () => unwatch({ id }),
     ...(options.label === undefined ? {} : { label: options.label })
   };
+}
+
+function nextWatchId(label: string | undefined): string {
+  if (label !== undefined && !WATCH_STATES.has(label)) return label;
+
+  let id: string;
+  do {
+    id = label === undefined ? `watch:${WATCH_ID += 1}` : `${label}:${WATCH_ID += 1}`;
+  } while (WATCH_STATES.has(id));
+  return id;
 }
 
 type EvalEntry<Row = unknown> = {
@@ -4246,7 +4670,7 @@ function applyMaterializationState(dbValue: Db, previous: InternalMaterializatio
 }
 
 function refreshMaterializationRows<Row>(target: unknown, query: Query<Row>): MaterializationRefreshResult<Row> {
-  if (isDb(target)) return qResult(target, query);
+  if (isDb(target)) return qResult(demat(target, query), query);
   if (isRelationSource(target)) return evaluate(target, query);
   return {
     rows: [],
@@ -4265,6 +4689,16 @@ function isMaterializationMetadata(input: unknown): input is MaterializationMeta
     && isQuery(input.query)
     && typeof input.queryKey === 'string'
     && (input.mode === 'snapshot' || input.mode === 'incremental');
+}
+
+function isMaterializationMaintenanceChange(input: unknown): input is MaterializationMaintenanceChange {
+  return isRecord(input)
+    && typeof input.id === 'string'
+    && typeof input.queryKey === 'string'
+    && isQuery(input.query)
+    && (input.update === 'skipped' || input.update === 'carried' || input.update === 'recomputed' || input.update === 'incremental')
+    && Array.isArray(input.rows)
+    && Array.isArray(input.rowChanges);
 }
 
 function constraintKey(input: ConstraintData): string {
@@ -4384,22 +4818,118 @@ function exprDependencies(input: unknown): readonly string[] {
   return uniqueStrings(...dependencies);
 }
 
-function queryDataRowKeyFields(data: QueryData): readonly string[] | undefined {
+function queryDataRowKeyFields(data: QueryData, relations: Readonly<Record<string, AnyRelationRef>> = {}): readonly string[] | undefined {
+  return rowIdentityForQueryData(data, relations)?.fields;
+}
+
+function rowIdentityForQueryData<Row = unknown>(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): MaterializationRowIdentity<Row> | undefined {
   switch (data.op) {
-    case 'keyBy':
-      return stringArray(data.fields);
     case 'from':
-      return typeof data.relation === 'string' ? undefined : undefined;
+    case 'lookup': {
+      const relationName = typeof data.relation === 'string' ? data.relation : undefined;
+      const relationRef = relationName === undefined ? undefined : relations[relationName];
+      if (relationRef === undefined) return undefined;
+      return rowIdentityFromPaths(relationKeyFields(relationRef as RelationRef).map((fieldName) => [fieldName]));
+    }
     case 'where':
     case 'hash':
     case 'btree':
+    case 'uniqueIndex':
     case 'sort':
     case 'limit':
     case 'sortLimit':
-      return queryDataFrom(data.input) === undefined ? undefined : queryDataRowKeyFields(queryDataFrom(data.input) as QueryData);
+      return rowIdentityForNestedQuery<Row>(data, relations);
+    case 'keyBy': {
+      const fields = stringArray(data.fields);
+      return fields.length === 0 ? undefined : rowIdentityFromPaths(fields.map((fieldName) => [fieldName]));
+    }
+    case 'extend':
+      return rowIdentityForNestedQuery<Row>(data, relations);
+    case 'without': {
+      const input = rowIdentityForNestedQuery<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const removed = new Set(stringArray(data.fields));
+      return input.paths.some((path) => removed.has(path[0] ?? '')) ? undefined : input;
+    }
+    case 'rename': {
+      const input = rowIdentityForNestedQuery<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const fields = isRecord(data.fields) ? data.fields : {};
+      const paths = input.paths.map((path) => {
+        const [first, ...rest] = path;
+        if (first === undefined) return path;
+        const renamed = fields[first];
+        return [typeof renamed === 'string' ? renamed : first, ...rest];
+      });
+      return rowIdentityFromPaths(paths);
+    }
+    case 'qualify': {
+      const input = rowIdentityForNestedQuery<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const alias = typeof data.alias === 'string' ? data.alias : 'row';
+      return rowIdentityFromPaths(input.paths.map((path) => [alias, ...path]));
+    }
+    case 'project':
+      return projectedRowIdentity<Row>(data, relations);
     default:
       return undefined;
   }
+}
+
+function rowIdentityForNestedQuery<Row>(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): MaterializationRowIdentity<Row> | undefined {
+  const input = queryDataFrom(data.input);
+  return input === undefined ? undefined : rowIdentityForQueryData(input, relations);
+}
+
+function projectedRowIdentity<Row>(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): MaterializationRowIdentity<Row> | undefined {
+  const input = rowIdentityForNestedQuery(data, relations);
+  if (input === undefined) return undefined;
+
+  const projection = projectionFrom(data.projection);
+  const paths: MaterializationRowKeyPath[] = [];
+  for (const path of input.paths) {
+    if (path.length !== 1) return undefined;
+    const outputField = directProjectionFieldFor(path[0] as string, projection);
+    if (outputField === undefined) return undefined;
+    paths.push([outputField]);
+  }
+
+  return rowIdentityFromPaths<Row>(paths);
+}
+
+function directProjectionFieldFor(inputField: string, projection: ProjectionData): string | undefined {
+  for (const [outputField, projectionExpr] of Object.entries(projection)) {
+    const exprValue = unwrapOptionalProjection(projectionExpr);
+    if (isRecord(exprValue) && exprValue.op === 'field' && exprValue.field === inputField) return outputField;
+  }
+  return undefined;
+}
+
+function rowIdentityFromPaths<Row = unknown>(paths: readonly MaterializationRowKeyPath[]): MaterializationRowIdentity<Row> | undefined {
+  if (paths.length === 0) return undefined;
+  return {
+    paths,
+    fields: paths.every((path) => path.length === 1) ? paths.map((path) => path[0] as string) : undefined,
+    keyBy: (rowValue) => paths.map((path) => valueAtPath(rowValue, path))
+  };
+}
+
+function valueAtPath(input: unknown, path: readonly string[]): unknown {
+  let current = input;
+  for (const fieldName of path) {
+    if (!isRecord(current)) return undefined;
+    current = current[fieldName];
+  }
+  return current;
 }
 
 function queryEnvDependencies(query: Query): readonly string[] {
@@ -4424,22 +4954,11 @@ function addRevisionToBatch<Queries extends QueryBatch>(result: QueryBatchResult
   return Object.fromEntries(Object.entries(result).map(([name, valueValue]) => [name, { ...valueValue, revision }])) as StoreQueryBatchResult<Queries>;
 }
 
-function dbFromRuntime<Version>(runtime: RelationRuntime<Version>, relations: readonly RelationRef[], envValue: DbInputEnv | undefined): Db {
-  return dbFromSource(runtime.snapshot?.().source ?? runtime.source, relations, envValue);
-}
-
 function dbFromSource(source: RelationSource, relations: readonly RelationRef[], envValue: DbInputEnv | undefined): Db {
   return createDb(
     Object.fromEntries(relations.map((relationRef) => [relationRef.name, source.rows(relationRef)])),
     envValue === undefined ? {} : { env: envValue }
   );
-}
-
-function deltaToPatches(delta: RelationDelta): readonly WritePatch[] {
-  return [
-    ...delta.removed.map((rowValue) => deleteExact(delta.relation, rowValue as Record<string, unknown>)),
-    ...delta.added.map((rowValue) => insertOrReplace(delta.relation, rowValue as Record<string, unknown>))
-  ];
 }
 
 function readWatchTargetRows<Row>(dbValue: WatchDb, target: WatchTarget<Row>, options: WatchOptions<Row> | QueryDiffOptions<Row> = {}): QueryResult<Row> {

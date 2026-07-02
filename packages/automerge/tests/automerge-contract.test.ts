@@ -2,7 +2,21 @@ import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { call, eq, field, hostFn, isMissing, isNull, notMissing, notNull, value } from '@tarstate/core';
 import { isRelationRuntime, type RelationRuntime } from '@tarstate/core/adapter';
-import { defineSchema, idField, nullable, optional, relation, stringField } from '@tarstate/core/schema';
+import { validateRelationRow } from '@tarstate/core/evaluate';
+import {
+  anchoredPathField,
+  booleanField,
+  defineSchema,
+  idField,
+  jsonField,
+  nullable,
+  numberField,
+  optional,
+  refField,
+  relation,
+  stringField,
+  type JsonValue
+} from '@tarstate/core/schema';
 import { write } from '@tarstate/core/write';
 import {
   automergeMapAdapter,
@@ -24,6 +38,11 @@ type TaskRow = {
   readonly id: string;
   readonly title: string;
   readonly memo?: string | null;
+  readonly effort?: number | null;
+  readonly done?: boolean;
+  readonly projectId?: string;
+  readonly anchor?: string;
+  readonly meta?: JsonValue;
 };
 
 type LabelRow = {
@@ -44,7 +63,12 @@ const schema = defineSchema({
     fields: {
       id: idField('task'),
       title: stringField(),
-      memo: optional(nullable(stringField()))
+      memo: optional(nullable(stringField())),
+      effort: optional(nullable(numberField())),
+      done: optional(booleanField()),
+      projectId: optional(refField('projects.id')),
+      anchor: optional(anchoredPathField()),
+      meta: optional(jsonField())
     }
   }),
   labels: relation<LabelRow>({
@@ -274,6 +298,211 @@ describe('automerge map adapter', () => {
     ]);
   });
 
+  it('fuzzes adapter write validation against core row validation', async () => {
+    const invalidRows = generatedInvalidTaskRows();
+    const baselineRows = [{ id: 'task-1', title: 'Draft' }] satisfies readonly TaskRow[];
+
+    for (const row of invalidRows) {
+      const coreDiagnostics = summarizeDiagnostics(validateRelationRow(schema.tasks, row as never));
+      expect(coreDiagnostics.length, `core accepted invalid row ${JSON.stringify(row)}`).toBeGreaterThan(0);
+
+      const insertPatches = [
+        write(schema.tasks).insert(row as never),
+        write(schema.tasks).insertIgnore(row as never),
+        write(schema.tasks).insertOrReplace(row as never),
+        write(schema.tasks).insertOrMerge(row as never),
+        write(schema.tasks).insertOrUpdate(row as never),
+        write(schema.tasks).replaceAll([row as never])
+      ];
+
+      for (const patch of insertPatches) {
+        const adapter = automergeMapAdapter({ doc: workspaceDoc(baselineRows), relations: taskMapping });
+        const result = await adapter.target.apply([patch]);
+
+        expect(result.status, `adapter accepted invalid row ${JSON.stringify(row)}`).toBe('rejected');
+        expect(result.applied).toBe(0);
+        expect(summarizeDiagnostics(result.diagnostics)).toEqual(coreDiagnostics);
+        expect(adapter.source.rows(schema.tasks)).toEqual(baselineRows);
+      }
+    }
+  });
+
+  it('fuzzes valid writes and invalid update maps without mutating rejected docs', async () => {
+    const validRows = generatedValidTaskRows();
+    const invalidUpdates = generatedInvalidTaskUpdates();
+    const taskId = field('tasks', 'id');
+
+    for (const [index, row] of validRows.entries()) {
+      const insertCases = [
+        write(schema.tasks).insert(row),
+        write(schema.tasks).insertIgnore(row),
+        write(schema.tasks).insertOrReplace(row),
+        write(schema.tasks).insertOrMerge(row),
+        write(schema.tasks).insertOrUpdate(row)
+      ];
+
+      for (const patch of insertCases) {
+        const adapter = automergeMapAdapter({ doc: workspaceDoc([]), relations: taskMapping });
+        const result = await adapter.target.apply([patch]);
+
+        expect(result.status).toBe('accepted');
+        expect(result.applied).toBe(1);
+        expect(adapter.source.rows(schema.tasks)).toEqual([row]);
+      }
+
+      const nextTitle = `Updated ${index}`;
+      const byKeyAdapter = automergeMapAdapter({ doc: workspaceDoc([row]), relations: taskMapping });
+      const byKeyResult = await byKeyAdapter.target.apply([
+        write(schema.tasks).updateByKey(row.id, { title: nextTitle })
+      ]);
+      expect(byKeyResult.status).toBe('accepted');
+      expect(byKeyResult.applied).toBe(1);
+      expect(byKeyAdapter.source.rows(schema.tasks)).toEqual([{ ...row, title: nextTitle }]);
+
+      const predicateAdapter = automergeMapAdapter({ doc: workspaceDoc([row]), relations: taskMapping });
+      const predicateResult = await predicateAdapter.target.apply([
+        write(schema.tasks).update(eq(taskId, row.id), { title: nextTitle })
+      ]);
+      expect(predicateResult.status).toBe('accepted');
+      expect(predicateResult.applied).toBe(1);
+      expect(predicateAdapter.source.rows(schema.tasks)).toEqual([{ ...row, title: nextTitle }]);
+
+      const replacement = { ...row, title: `Replaced ${index}` };
+      const replaceExistingAdapter = automergeMapAdapter({ doc: workspaceDoc([row]), relations: taskMapping });
+      const replaceExistingResult = await replaceExistingAdapter.target.apply([
+        write(schema.tasks).insertOrReplace(replacement)
+      ]);
+      expect(replaceExistingResult.status).toBe('accepted');
+      expect(replaceExistingResult.applied).toBe(1);
+      expect(replaceExistingAdapter.source.rows(schema.tasks)).toEqual([replacement]);
+
+      const mergeExistingAdapter = automergeMapAdapter({ doc: workspaceDoc([row]), relations: taskMapping });
+      const mergeExistingResult = await mergeExistingAdapter.target.apply([
+        write(schema.tasks).insertOrMerge({ ...row, title: `Merged ${index}` }, { merge: ['title'] })
+      ]);
+      expect(mergeExistingResult.status).toBe('accepted');
+      expect(mergeExistingResult.applied).toBe(1);
+      expect(mergeExistingAdapter.source.rows(schema.tasks)).toEqual([{ ...row, title: `Merged ${index}` }]);
+
+      const updateExistingAdapter = automergeMapAdapter({ doc: workspaceDoc([row]), relations: taskMapping });
+      const updateExistingResult = await updateExistingAdapter.target.apply([
+        write(schema.tasks).insertOrUpdate({ ...row, title: 'Ignored incoming' }, { update: { title: nextTitle } })
+      ]);
+      expect(updateExistingResult.status).toBe('accepted');
+      expect(updateExistingResult.applied).toBe(1);
+      expect(updateExistingAdapter.source.rows(schema.tasks)).toEqual([{ ...row, title: nextTitle }]);
+    }
+
+    const replaceRows = validRows.slice(0, 8);
+    const replaceAdapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+    const replaceResult = await replaceAdapter.target.apply([
+      write(schema.tasks).replaceAll(replaceRows)
+    ]);
+    expect(replaceResult.status).toBe('accepted');
+    expect(replaceResult.applied).toBe(1);
+    expect(replaceAdapter.source.rows(schema.tasks)).toEqual(replaceRows);
+
+    for (const changes of invalidUpdates) {
+      const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+      const byKeyResult = await adapter.target.apply([
+        write(schema.tasks).updateByKey('task-1', changes as never)
+      ]);
+      expect(byKeyResult.status).toBe('rejected');
+      expect(byKeyResult.applied).toBe(0);
+      expect(byKeyResult.diagnostics.some((diagnostic) => diagnostic.severity === 'error')).toBe(true);
+      expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+
+      const predicateAdapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+      const predicateResult = await predicateAdapter.target.apply([
+        write(schema.tasks).update(eq(taskId, 'task-1'), changes as never)
+      ]);
+      expect(predicateResult.status).toBe('rejected');
+      expect(predicateResult.applied).toBe(0);
+      expect(predicateResult.diagnostics.some((diagnostic) => diagnostic.severity === 'error')).toBe(true);
+      expect(predicateAdapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+
+      const mergeAdapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+      const mergeResult = await mergeAdapter.target.apply([
+        write(schema.tasks).insertOrMerge({ id: 'task-1', title: 'Incoming' }, { merge: () => changes as never })
+      ]);
+      expect(mergeResult.status).toBe('rejected');
+      expect(mergeResult.applied).toBe(0);
+      expect(mergeResult.diagnostics.some((diagnostic) => diagnostic.severity === 'error')).toBe(true);
+      expect(mergeAdapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+
+      const upsertUpdateAdapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+      const upsertUpdateResult = await upsertUpdateAdapter.target.apply([
+        write(schema.tasks).insertOrUpdate({ id: 'task-1', title: 'Incoming' }, { update: changes as never })
+      ]);
+      expect(upsertUpdateResult.status).toBe('rejected');
+      expect(upsertUpdateResult.applied).toBe(0);
+      expect(upsertUpdateResult.diagnostics.some((diagnostic) => diagnostic.severity === 'error')).toBe(true);
+      expect(upsertUpdateAdapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+    }
+  });
+
+  it('rejects mixed batches without committing callback-mutated staged rows', async () => {
+    const baselineRows = [
+      { id: 'task-1', title: 'Draft' },
+      { id: 'task-2', title: 'Todo' }
+    ] satisfies readonly TaskRow[];
+    const taskId = field('tasks', 'id');
+    const cases = [
+      write(schema.tasks).insertOrMerge({ id: 'task-1', title: 'Incoming' }, {
+        merge: ((current: TaskRow) => {
+          (current as unknown as Record<string, unknown>).title = 'Mutated by merge callback';
+          return { title: null };
+        }) as never
+      }),
+      write(schema.tasks).insertOrUpdate({ id: 'task-1', title: 'Incoming' }, {
+        update: ((current: TaskRow) => {
+          (current as unknown as Record<string, unknown>).title = 'Mutated by update callback';
+          return { title: null };
+        }) as never
+      })
+    ];
+
+    for (const rejectedPatch of cases) {
+      const adapter = automergeMapAdapter({ doc: workspaceDoc(baselineRows), relations: taskMapping });
+      const beforeDoc = adapter.getDoc();
+      const beforeHeads = Automerge.getHeads(beforeDoc);
+
+      const result = await adapter.target.apply([
+        write(schema.tasks).update(eq(taskId, 'task-2'), { title: 'Changed first' }),
+        rejectedPatch
+      ]);
+
+      expect(result.status).toBe('rejected');
+      expect(result.applied).toBe(0);
+      expect(result.diagnostics.some((diagnostic) => diagnostic.severity === 'error')).toBe(true);
+      expect(adapter.getDoc()).toBe(beforeDoc);
+      expect(Automerge.getHeads(adapter.getDoc())).toEqual(beforeHeads);
+      expect(adapter.source.rows(schema.tasks)).toEqual(baselineRows);
+    }
+  });
+
+  it('ignores insertOrMerge callback current mutations unless returned', async () => {
+    const adapter = automergeMapAdapter({
+      doc: workspaceDoc([{ id: 'task-1', title: 'Draft' }]),
+      relations: taskMapping
+    });
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).insertOrMerge({ id: 'task-1', title: 'Incoming' }, {
+        merge: ((current: TaskRow) => {
+          (current as unknown as Record<string, unknown>).title = 'MUTATED';
+          return { memo: 'ok' };
+        }) as never
+      })
+    ]);
+
+    expect(result.status).toBe('accepted');
+    expect(result.applied).toBe(1);
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-1', title: 'Draft', memo: 'ok' }
+    ]);
+  });
+
   it('rejects unsupported update expressions instead of storing expression objects', async () => {
     const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
 
@@ -409,10 +638,10 @@ describe('automerge map adapter', () => {
   });
 });
 
-function workspaceDoc(): Automerge.Doc<WorkspaceDoc> {
+function workspaceDoc(tasks: readonly TaskRow[] = [{ id: 'task-1', title: 'Draft' }]): Automerge.Doc<WorkspaceDoc> {
   const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({
     workspace: {
-      tasks: [{ id: 'task-1', title: 'Draft' }],
+      tasks,
       labelsById: {
         'label-1': { id: 'label-1', name: 'Urgent' }
       }
@@ -420,6 +649,165 @@ function workspaceDoc(): Automerge.Doc<WorkspaceDoc> {
   });
 
   return doc;
+}
+
+type DiagnosticSummary = {
+  readonly code?: string;
+  readonly severity?: string;
+  readonly relation?: string;
+  readonly field?: string;
+};
+
+type SeededRandom = {
+  readonly int: (maxExclusive: number) => number;
+  readonly bool: () => boolean;
+  readonly pick: <Value>(values: readonly Value[]) => Value;
+};
+
+function summarizeDiagnostics(diagnostics: readonly DiagnosticSummary[]): readonly DiagnosticSummary[] {
+  return diagnostics.map((diagnostic) => {
+    const summary: {
+      code?: string;
+      severity?: string;
+      relation?: string;
+      field?: string;
+    } = {};
+
+    if (diagnostic.code !== undefined) summary.code = diagnostic.code;
+    if (diagnostic.severity !== undefined) summary.severity = diagnostic.severity;
+    if (diagnostic.relation !== undefined) summary.relation = diagnostic.relation;
+    if (diagnostic.field !== undefined) summary.field = diagnostic.field;
+
+    return summary;
+  });
+}
+
+function generatedValidTaskRows(): readonly TaskRow[] {
+  const random = seededRandom(0x5eed2026);
+
+  return Array.from({ length: 32 }, (_, index) => {
+    const row: Record<string, unknown> = {
+      id: `task-fuzz-${index}`,
+      title: `Task ${index}`
+    };
+
+    if (random.bool()) row.memo = random.pick(['memo', '', null]);
+    if (random.bool()) row.effort = random.pick([0, 1, index + 0.5, null]);
+    if (random.bool()) row.done = random.bool();
+    if (random.bool()) row.projectId = `project-${random.int(4)}`;
+    if (random.bool()) row.anchor = `/workspace/tasks/${index}`;
+    if (random.bool()) row.meta = randomJson(random, 2);
+
+    return row as TaskRow;
+  });
+}
+
+function generatedInvalidTaskRows(): readonly unknown[] {
+  const random = seededRandom(0xbad2026);
+  const rows: unknown[] = [null, undefined, 42, 'task', true, []];
+
+  for (let index = 0; index < 72; index += 1) {
+    const row: Record<string, unknown> = {
+      id: `task-invalid-${index}`,
+      title: `Invalid ${index}`
+    };
+
+    switch (random.int(14)) {
+      case 0:
+        delete row.id;
+        break;
+      case 1:
+        row.id = null;
+        break;
+      case 2:
+        row.id = 12;
+        break;
+      case 3:
+        delete row.title;
+        break;
+      case 4:
+        row.title = undefined;
+        break;
+      case 5:
+        row.title = null;
+        break;
+      case 6:
+        row.title = false;
+        break;
+      case 7:
+        row.memo = 12;
+        break;
+      case 8:
+        row.effort = 'large';
+        break;
+      case 9:
+        row.effort = Number.POSITIVE_INFINITY;
+        break;
+      case 10:
+        row.done = 'yes';
+        break;
+      case 11:
+        row.projectId = 8;
+        break;
+      case 12:
+        row.anchor = { path: '/workspace/tasks/1' };
+        break;
+      default:
+        row.meta = { nested: undefined };
+        break;
+    }
+
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function generatedInvalidTaskUpdates(): readonly Record<string, unknown>[] {
+  return [
+    { id: null },
+    { id: 7 },
+    { title: undefined },
+    { title: null },
+    { title: 7 },
+    { memo: { text: 'memo' } },
+    { effort: Number.NaN },
+    { done: 1 },
+    { projectId: false },
+    { anchor: ['/workspace/tasks/1'] },
+    { meta: { nested: undefined } }
+  ];
+}
+
+function seededRandom(seed: number): SeededRandom {
+  let state = seed >>> 0;
+  const next = (): number => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+
+  return {
+    int: (maxExclusive) => Math.floor(next() * maxExclusive),
+    bool: () => next() >= 0.5,
+    pick: (values) => values[Math.floor(next() * values.length)] as never
+  };
+}
+
+function randomJson(random: SeededRandom, depth: number): JsonValue {
+  if (depth <= 0) return random.pick([null, true, false, 'json', random.int(100)]);
+
+  switch (random.int(5)) {
+    case 0:
+      return random.pick([null, true, false, 'json', random.int(100)]);
+    case 1:
+      return [randomJson(random, depth - 1), randomJson(random, depth - 1)];
+    case 2:
+      return { note: randomJson(random, depth - 1), count: random.int(10) };
+    case 3:
+      return [];
+    default:
+      return {};
+  }
 }
 
 function predicateWorkspaceDoc(): Automerge.Doc<WorkspaceDoc> {

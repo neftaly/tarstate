@@ -204,7 +204,10 @@ export function automergeMapAdapter<
         if (outcome.applied) applied += 1;
       }
 
-      const changedPlans = Array.from(plans.values()).filter((plan) => plan.changed);
+      const status = applyStatus(patchList.length, accepted);
+      const changedPlans = status === 'accepted'
+        ? Array.from(plans.values()).filter((plan) => plan.changed)
+        : [];
       if (changedPlans.length > 0) {
         const message = changeMessageFor(options.changeMessage, patchList);
         const nextDoc = changeDocument(doc, message, (draft) => {
@@ -220,7 +223,6 @@ export function automergeMapAdapter<
       const deltas = changedPlans
         .map((plan) => relationDelta(plan.mapping.relation, plan.before, plan.rows))
         .filter((delta): delta is RelationDelta => delta !== undefined);
-      const status = applyStatus(patchList.length, accepted);
       const version = Automerge.getHeads(doc);
       const base = {
         patches: patchList.length,
@@ -426,6 +428,8 @@ function applyPatchToPlan(plan: RowPlan, patch: WritePatch): PatchOutcome {
 function insertRow(plan: RowPlan, rowValue: unknown, duplicateMode: 'reject' | 'ignore'): PatchOutcome {
   const row = coerceRow(rowValue);
   if (row === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
+  const rowDiagnostics = validatePlanRow(plan, row);
+  if (rowDiagnostics.length > 0) return rejected(...rowDiagnostics);
 
   const key = rowKeyFor(plan.mapping.relation, row);
   if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
@@ -448,6 +452,8 @@ function upsertRow(
 ): PatchOutcome {
   const row = coerceRow(rowValue);
   if (row === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
+  const rowDiagnostics = validatePlanRow(plan, row);
+  if (rowDiagnostics.length > 0) return rejected(...rowDiagnostics);
 
   const key = rowKeyFor(plan.mapping.relation, row);
   if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
@@ -459,7 +465,7 @@ function upsertRow(
     return accepted(true);
   }
 
-  const next = nextRow(plan.rows[index] ?? row, row);
+  const next = nextRow(cloneRow(plan.rows[index] ?? row), cloneRow(row));
   let merged: Row | undefined;
   if (isRowUpdateResult(next)) {
     if (!next.supported) {
@@ -470,6 +476,8 @@ function upsertRow(
     merged = coerceRow(next);
   }
   if (merged === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
+  const mergedDiagnostics = validatePlanRow(plan, merged);
+  if (mergedDiagnostics.length > 0) return rejected(...mergedDiagnostics);
 
   const mergedKey = rowKeyFor(plan.mapping.relation, merged);
   if (mergedKey !== key) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, merged));
@@ -495,6 +503,8 @@ function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown): Pat
 
   const updated = updateResult.row;
   if (updated === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, changes));
+  const updateDiagnostics = validatePlanRow(plan, updated);
+  if (updateDiagnostics.length > 0) return rejected(...updateDiagnostics);
   if (rowKeyFor(plan.mapping.relation, updated) !== key) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
   if (valuesEqual(current, updated)) return accepted(false);
 
@@ -519,6 +529,8 @@ function updateRowsByPredicate(plan: RowPlan, predicate: PredicateData, changes:
     if (!updateResult.supported) return rejected(unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, updateResult.op));
 
     const updated = updateResult.row;
+    const updateDiagnostics = validatePlanRow(plan, updated);
+    if (updateDiagnostics.length > 0) return rejected(...updateDiagnostics);
     if (rowKeyFor(plan.mapping.relation, updated) !== rowKeyFor(plan.mapping.relation, current)) {
       return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
     }
@@ -576,6 +588,8 @@ function replaceRows(plan: RowPlan, rowsValue: readonly unknown[]): PatchOutcome
   for (const item of rowsValue) {
     const row = coerceRow(item);
     if (row === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, item));
+    const rowDiagnostics = validatePlanRow(plan, row);
+    if (rowDiagnostics.length > 0) return rejected(...rowDiagnostics);
 
     const key = rowKeyFor(plan.mapping.relation, row);
     if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
@@ -601,16 +615,19 @@ function mergeRows(current: Row, incoming: Row, merge: unknown): RowUpdateResult
       }
     };
   }
-  if (typeof merge === 'function') return rowUpdateFor(current, merge(current, incoming));
+  if (typeof merge === 'function') {
+    const baseline = cloneRow(current);
+    return rowUpdateFor(baseline, merge(cloneRow(current), cloneRow(incoming)));
+  }
   return rowUpdateFor(current, incoming);
 }
 
 function rowUpdateFor(current: Row, changes: unknown): RowUpdateResult {
   const update = typeof changes === 'function'
-    ? changes(current)
+    ? changes(cloneRow(current))
     : changes;
 
-  if (!isRecord(update)) return { supported: true, row: current };
+  if (!isRecord(update)) return { supported: true, row: cloneRow(current) };
 
   const evaluated = evaluateUpdateMap(update, current);
   if (!evaluated.supported) return evaluated;
@@ -901,6 +918,88 @@ function coerceRow(input: unknown): Row | undefined {
   return isRecord(input) ? cloneRow(input) : undefined;
 }
 
+function validatePlanRow(plan: RowPlan, row: Row): readonly TarstateDiagnostic[] {
+  return validateRelationRowForAutomerge(plan.mapping.relation, row);
+}
+
+function validateRelationRowForAutomerge(relation: RelationRef, row: Row): readonly TarstateDiagnostic[] {
+  const diagnostics: TarstateDiagnostic[] = [];
+
+  for (const [fieldName, spec] of Object.entries(relation.fields)) {
+    const hasField = Object.prototype.hasOwnProperty.call(row, fieldName);
+    const fieldValue = row[fieldName];
+
+    if (!hasField || fieldValue === undefined) {
+      if (!spec.optional) diagnostics.push(fieldMissingDiagnostic(relation.name, fieldName, false));
+      continue;
+    }
+
+    if (fieldValue === null) {
+      if (!spec.nullable) diagnostics.push(fieldInvalidDiagnostic(
+        relation.name,
+        fieldName,
+        `relation "${relation.name}" field "${fieldName}" must not be null`,
+        fieldValue
+      ));
+      continue;
+    }
+
+    if (!fieldValueMatchesSpec(spec, fieldValue)) {
+      diagnostics.push(fieldInvalidDiagnostic(
+        relation.name,
+        fieldName,
+        `relation "${relation.name}" field "${fieldName}" must be ${fieldSpecDescription(spec)}`,
+        fieldValue
+      ));
+    }
+  }
+
+  for (const keyField of relationKeyFields(relation)) {
+    if (row[keyField] === undefined || row[keyField] === null) {
+      diagnostics.push(fieldMissingDiagnostic(relation.name, keyField, true));
+    }
+  }
+
+  return diagnostics;
+}
+
+function fieldValueMatchesSpec(spec: RelationRef['fields'][string], value: unknown): boolean {
+  switch (spec.valueKind) {
+    case 'string':
+    case 'id':
+    case 'ref':
+    case 'anchoredPath':
+      return typeof value === 'string';
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'json':
+      return isJsonValue(value);
+    default:
+      return true;
+  }
+}
+
+function fieldSpecDescription(spec: RelationRef['fields'][string]): string {
+  switch (spec.valueKind) {
+    case 'id':
+    case 'ref':
+    case 'anchoredPath':
+      return 'a string';
+    case 'json':
+      return 'a JSON value';
+    default:
+      return `a ${spec.valueKind}`;
+  }
+}
+
+function isJsonValue(input: unknown): boolean {
+  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') return true;
+  if (Array.isArray(input)) return input.every(isJsonValue);
+  return isRecord(input) && Object.values(input).every(isJsonValue);
+}
+
 function cloneRow(input: Record<string, unknown>): Row {
   return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, cloneValue(value)]));
 }
@@ -1083,10 +1182,9 @@ function replaceAt(rows: readonly Row[], index: number, row: Row): Row[] {
   return rows.map((item, itemIndex) => itemIndex === index ? row : item);
 }
 
-function applyStatus(patches: number, accepted: number): 'accepted' | 'partial' | 'rejected' {
+function applyStatus(patches: number, accepted: number): 'accepted' | 'rejected' {
   if (patches === 0) return 'accepted';
   if (accepted === patches) return 'accepted';
-  if (accepted > 0) return 'partial';
   return 'rejected';
 }
 
@@ -1137,7 +1235,7 @@ function invalidPathDiagnostic(
 function rowInvalidDiagnostic(relation: string, row: unknown): TarstateDiagnostic {
   return {
     code: 'row_invalid',
-    severity: 'warning',
+    severity: 'error',
     relation,
     surface: 'automergeMapAdapter',
     message: `Automerge map adapter expected an object row for relation "${relation}"`,
@@ -1148,10 +1246,35 @@ function rowInvalidDiagnostic(relation: string, row: unknown): TarstateDiagnosti
 function rowKeyDiagnostic(relation: string, detail: unknown): TarstateDiagnostic {
   return {
     code: 'row_invalid',
-    severity: 'warning',
+    severity: 'error',
     relation,
     surface: 'automergeMapAdapter',
     message: `Automerge map adapter could not resolve a complete key for relation "${relation}"`,
+    detail
+  };
+}
+
+function fieldMissingDiagnostic(relation: string, field: string, keyField: boolean): TarstateDiagnostic {
+  return {
+    code: 'field_missing',
+    severity: 'error',
+    relation,
+    field,
+    surface: 'automergeMapAdapter',
+    message: keyField
+      ? `relation "${relation}" key field "${field}" is missing`
+      : `relation "${relation}" row is missing required field "${field}"`
+  };
+}
+
+function fieldInvalidDiagnostic(relation: string, field: string, message: string, detail: unknown): TarstateDiagnostic {
+  return {
+    code: 'field_invalid',
+    severity: 'error',
+    relation,
+    field,
+    surface: 'automergeMapAdapter',
+    message,
     detail
   };
 }
