@@ -68,13 +68,14 @@ const sortedRows = pipe(
 const joinedEntryAccounts = pipe(
   from(entry),
   join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
-  sort(asc(entry.id)),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
+    entryId: entry.id,
+    accountId: account.id,
+    entryAccountId: entry.accountId,
     accountName: account.$.name,
     amount: entry.amount
-  })
+  }),
+  sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
 );
 
 const groupedEntryTotals = pipe(
@@ -109,7 +110,7 @@ const scenarios: readonly BenchmarkScenario[] = [
   { label: 'filter/project', queries: [filterProject as Query<unknown>] },
   { label: 'filter/project/sort', queries: [sortedFilterProject as Query<unknown>] },
   { label: 'sort', queries: [sortedRows as Query<unknown>] },
-  { label: 'equi-join', queries: [joinedEntryAccounts as Query<unknown>] },
+  { label: 'equi-join identity projection', queries: [joinedEntryAccounts as Query<unknown>] },
   { label: 'grouped aggregate count/sum', queries: [groupedEntryTotals as Query<unknown>] },
   { label: 'top-N sort + limit', queries: [topEntriesBySortAndLimit as Query<unknown>] },
   { label: 'top-N sortLimit', queries: [topEntriesBySortLimit as Query<unknown>] },

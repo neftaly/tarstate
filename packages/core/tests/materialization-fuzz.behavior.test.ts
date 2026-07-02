@@ -3,7 +3,9 @@ import { createDb, q, tryTransact } from '@tarstate/core/db';
 import { diffRows, type RowChange, type RowKeySelector } from '@tarstate/core/diff';
 import { demat, explainMaterialization, mat } from '@tarstate/core/materialization';
 import {
+  aggregate,
   asc,
+  count,
   eq,
   extend,
   field,
@@ -16,6 +18,7 @@ import {
   qualify,
   rename,
   sort,
+  sum,
   union,
   value,
   where,
@@ -99,6 +102,21 @@ const supportedVariants: readonly SupportedVariant[] = [
     label: 'explicit keyBy identity',
     query: pipe(from(entry), keyBy('id')) as Query<unknown>,
     keyBy: pathKey('id')
+  },
+  {
+    label: 'grouped aggregate',
+    query: pipe(
+      from(entry),
+      aggregate({
+        groupBy: { accountId: entry.accountId },
+        aggregates: {
+          entryCount: count(),
+          total: sum(entry.amount)
+        }
+      }),
+      sort(asc(field<string>('row', 'accountId')))
+    ) as Query<unknown>,
+    keyBy: pathKey('accountId')
   }
 ];
 

@@ -17,6 +17,7 @@ import { createRuntimeStore, createStore } from '@tarstate/core/store';
 import {
   aggregate,
   asc,
+  avg,
   call,
   clauses,
   count,
@@ -31,6 +32,8 @@ import {
   join,
   keyBy,
   limit,
+  max,
+  min,
   pipe,
   project,
   qualify,
@@ -39,6 +42,7 @@ import {
   sort,
   sortLimit,
   sum,
+  top,
   union,
   value,
   where,
@@ -421,16 +425,11 @@ describe('materialization, watch, and store behavior', () => {
     expect(result.committed).toBe(true);
     expect(result.materializations).toEqual(expect.objectContaining({
       maintained: 3,
-      recomputed: 1,
+      recomputed: 0,
       carried: 0,
-      diagnostics: expect.arrayContaining([
-        expect.objectContaining({
-          code: 'materialization_unsupported',
-          message: 'aggregate queries are not incrementally maintained'
-        })
-      ])
+      diagnostics: []
     }));
-    expect(changes.map((change) => change.update)).toEqual(['incremental', 'incremental', 'recomputed']);
+    expect(changes.map((change) => change.update)).toEqual(['incremental', 'incremental', 'incremental']);
     expect(changes[0]).toEqual(expect.objectContaining({
       update: 'incremental',
       recomputed: false,
@@ -452,24 +451,327 @@ describe('materialization, watch, and store behavior', () => {
       diagnostics: []
     }));
     expect(changes[2]).toEqual(expect.objectContaining({
-      update: 'recomputed',
-      recomputed: true,
+      update: 'incremental',
+      recomputed: false,
       rows: [
         { accountId: 'cash', entryCount: 2, total: 160 },
         { accountId: 'fees', entryCount: 1, total: -5 },
         { accountId: 'sales', entryCount: 1, total: -120 }
       ],
-      diagnostics: expect.arrayContaining([
-        expect.objectContaining({
-          code: 'materialization_unsupported',
-          message: 'aggregate queries are not incrementally maintained'
-        })
-      ])
+      rowChanges: [
+        {
+          kind: 'updated',
+          key: '["cash"]',
+          before: { accountId: 'cash', entryCount: 2, total: 120 },
+          after: { accountId: 'cash', entryCount: 2, total: 160 }
+        }
+      ],
+      diagnostics: []
     }));
 
     for (const query of queries) {
       expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
     }
+  });
+
+  it('incrementally maintains grouped aggregate count/sum for amount changes, account moves, inserts, and deletes', () => {
+    let db = mat(makeDb(), entryTotalsByAccount);
+
+    expect(explainMaterialization(entryTotalsByAccount)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    const assertIncremental = (patch: WritePatch, expectedRows: readonly unknown[]): void => {
+      const beforeRows = q(db, entryTotalsByAccount);
+      const result = tryTransact(db, patch);
+      const afterRows = q(demat(result.db, entryTotalsByAccount), entryTotalsByAccount);
+      const diff = diffRows(beforeRows, afterRows, { keyBy: pathKey('accountId') });
+      const change = result.materializations?.changes[0];
+
+      expect(result.committed).toBe(true);
+      expect(change).toEqual(expect.objectContaining({
+        update: 'incremental',
+        recomputed: false,
+        reason: 'incremental delta maintenance',
+        previousRows: beforeRows,
+        rows: afterRows,
+        rowChanges: diff.changes,
+        added: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
+        removed: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
+        diagnostics: []
+      }));
+      expect(q(result.db, entryTotalsByAccount)).toBe(change?.rows);
+      expect(q(result.db, entryTotalsByAccount)).toEqual(afterRows);
+      expect(afterRows).toEqual(expectedRows);
+      expect(diff.diagnostics).toEqual([]);
+      db = result.db;
+    };
+
+    assertIncremental(updateByKey(schema.entries, 'e1', { amount: 125 }), [
+      { accountId: 'cash', entryCount: 2, total: 125 },
+      { accountId: 'fees', entryCount: 1, total: -5 },
+      { accountId: 'sales', entryCount: 1, total: -120 }
+    ]);
+    assertIncremental(updateByKey(schema.entries, 'e1', { accountId: 'fees' }), [
+      { accountId: 'cash', entryCount: 1, total: 0 },
+      { accountId: 'fees', entryCount: 2, total: 120 },
+      { accountId: 'sales', entryCount: 1, total: -120 }
+    ]);
+    assertIncremental(insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true }), [
+      { accountId: 'cash', entryCount: 2, total: 35 },
+      { accountId: 'fees', entryCount: 2, total: 120 },
+      { accountId: 'sales', entryCount: 1, total: -120 }
+    ]);
+    assertIncremental(deleteByKey(schema.entries, 'e3'), [
+      { accountId: 'cash', entryCount: 2, total: 35 },
+      { accountId: 'fees', entryCount: 1, total: 125 },
+      { accountId: 'sales', entryCount: 1, total: -120 }
+    ]);
+  });
+
+  it('incrementally maintains count(predicate) when the predicate flips', () => {
+    const postedCountsByAccount = pipe(
+      from(entry),
+      aggregate({
+        groupBy: { accountId: entry.accountId },
+        aggregates: { postedCount: count(eq(entry.posted, value(true))) }
+      }),
+      sort(asc(field<string>('row', 'accountId')))
+    );
+    const db = mat(makeDb(), postedCountsByAccount);
+    const beforeRows = q(db, postedCountsByAccount);
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'e4', { posted: true }));
+    const afterRows = q(demat(result.db, postedCountsByAccount), postedCountsByAccount);
+    const diff = diffRows(beforeRows, afterRows, { keyBy: pathKey('accountId') });
+    const change = result.materializations?.changes[0];
+
+    expect(result.committed).toBe(true);
+    expect(change).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: afterRows,
+      rowChanges: diff.changes,
+      diagnostics: []
+    }));
+    expect(afterRows).toEqual([
+      { accountId: 'cash', postedCount: 2 },
+      { accountId: 'fees', postedCount: 1 },
+      { accountId: 'sales', postedCount: 1 }
+    ]);
+    expect(q(result.db, postedCountsByAccount)).toBe(change?.rows);
+    expect(q(result.db, postedCountsByAccount)).toEqual(afterRows);
+  });
+
+  it('coalesces multiple aggregate source changes into one final group update per affected group', () => {
+    const db = mat(makeDb(), entryTotalsByAccount);
+    const beforeRows = q(db, entryTotalsByAccount);
+
+    const result = tryTransact(db, [
+      updateByKey(schema.entries, 'e1', { amount: 125 }),
+      updateByKey(schema.entries, 'e4', { amount: 5 }),
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 10, memo: 'top-up', posted: true }),
+      updateByKey(schema.entries, 'e2', { amount: -130 })
+    ]);
+    const afterRows = q(demat(result.db, entryTotalsByAccount), entryTotalsByAccount);
+    const diff = diffRows(beforeRows, afterRows, { keyBy: pathKey('accountId') });
+    const change = result.materializations?.changes[0];
+
+    expect(result.committed).toBe(true);
+    expect(change).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: afterRows,
+      rowChanges: diff.changes,
+      diagnostics: []
+    }));
+    expect(change?.rowChanges).toEqual([
+      {
+        kind: 'updated',
+        key: '["cash"]',
+        before: { accountId: 'cash', entryCount: 2, total: 120 },
+        after: { accountId: 'cash', entryCount: 3, total: 140 }
+      },
+      {
+        kind: 'updated',
+        key: '["sales"]',
+        before: { accountId: 'sales', entryCount: 1, total: -120 },
+        after: { accountId: 'sales', entryCount: 1, total: -130 }
+      }
+    ]);
+    expect(afterRows).toEqual([
+      { accountId: 'cash', entryCount: 3, total: 140 },
+      { accountId: 'fees', entryCount: 1, total: -5 },
+      { accountId: 'sales', entryCount: 1, total: -130 }
+    ]);
+    expect(q(result.db, entryTotalsByAccount)).toBe(change?.rows);
+    expect(q(result.db, entryTotalsByAccount)).toEqual(afterRows);
+  });
+
+  it('recomputes unsupported aggregate functions with diagnostics', () => {
+    const cases: readonly { readonly label: string; readonly query: Query<unknown>; readonly reason: string }[] = [
+      {
+        label: 'avg',
+        query: pipe(from(entry), aggregate({ groupBy: { accountId: entry.accountId }, aggregates: { amount: avg(entry.amount) } })) as Query<unknown>,
+        reason: 'aggregate function "avg" is not incrementally maintained'
+      },
+      {
+        label: 'min',
+        query: pipe(from(entry), aggregate({ groupBy: { accountId: entry.accountId }, aggregates: { amount: min(entry.amount) } })) as Query<unknown>,
+        reason: 'aggregate function "min" is not incrementally maintained'
+      },
+      {
+        label: 'max',
+        query: pipe(from(entry), aggregate({ groupBy: { accountId: entry.accountId }, aggregates: { amount: max(entry.amount) } })) as Query<unknown>,
+        reason: 'aggregate function "max" is not incrementally maintained'
+      },
+      {
+        label: 'top',
+        query: pipe(from(entry), aggregate({ groupBy: { accountId: entry.accountId }, aggregates: { amounts: top(entry.amount, 2) } })) as Query<unknown>,
+        reason: 'aggregate function "top" is not incrementally maintained'
+      }
+    ];
+
+    for (const item of cases) {
+      const db = mat(makeDb(), item.query);
+
+      expect(explainMaterialization(item.query), item.label).toEqual(expect.objectContaining({
+        supported: false,
+        update: 'recomputed',
+        recomputed: true,
+        reason: item.reason,
+        diagnostics: [expect.objectContaining({ code: 'materialization_unsupported', message: item.reason })]
+      }));
+
+      const result = tryTransact(db, updateByKey(schema.entries, 'e1', { amount: 125 }));
+
+      expect(result.committed).toBe(true);
+      expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+        update: 'recomputed',
+        recomputed: true,
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({ code: 'materialization_unsupported', message: item.reason })
+        ])
+      }));
+      expect(q(result.db, item.query)).toEqual(q(demat(result.db, item.query), item.query));
+    }
+  });
+
+  it('recomputes aggregate projections that drop group identity', () => {
+    const query = pipe(
+      from(entry),
+      aggregate({
+        groupBy: { accountId: entry.accountId },
+        aggregates: { total: sum(entry.amount) }
+      }),
+      project({ total: field<number>('row', 'total') })
+    );
+    const reason = 'aggregate incremental maintenance requires final projection to preserve group identity';
+    const db = mat(makeDb(), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [expect.objectContaining({ code: 'materialization_unsupported', message: reason })]
+    }));
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'e1', { amount: 125 }));
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: 'materialization_unsupported', message: reason })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('requires sorted aggregate output to include group identity in the final sort', () => {
+    const query = pipe(
+      from(entry),
+      aggregate({
+        groupBy: { accountId: entry.accountId },
+        aggregates: { total: sum(entry.amount) }
+      }),
+      sort(asc(field<number>('row', 'total')))
+    );
+    const reason = 'aggregate final sort requires group identity in sort order';
+    const db = mat(makeDb(), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [expect.objectContaining({ code: 'materialization_unsupported', message: reason })]
+    }));
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'e1', { amount: 125 }));
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: 'materialization_unsupported', message: reason })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('recomputes unsorted aggregate output because group order can change without group identity changes', () => {
+    const query = pipe(
+      from(entry),
+      aggregate({
+        groupBy: { accountId: entry.accountId },
+        aggregates: {
+          entryCount: count(),
+          total: sum(entry.amount)
+        }
+      })
+    );
+    const reason = 'aggregate incremental maintenance requires final sort with group identity';
+    const db = mat(createDb({
+      accounts: [],
+      entries: [
+        { id: 'a', accountId: 'A', amount: 1, posted: true },
+        { id: 'b', accountId: 'B', amount: 2, posted: true }
+      ]
+    }), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [expect.objectContaining({ code: 'materialization_unsupported', message: reason })]
+    }));
+
+    const result = tryTransact(db, [
+      updateByKey(schema.entries, 'a', { accountId: 'B' }),
+      updateByKey(schema.entries, 'b', { accountId: 'A' })
+    ]);
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      rows: [
+        { accountId: 'B', entryCount: 1, total: 1 },
+        { accountId: 'A', entryCount: 1, total: 2 }
+      ],
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: 'materialization_unsupported', message: reason })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
   });
 
   it('incrementally maintains filtered projections across mixed transaction batches', () => {
@@ -1029,7 +1331,7 @@ describe('materialization, watch, and store behavior', () => {
       {
         label: 'aggregate',
         query: entryCount as Query<unknown>,
-        reason: 'aggregate queries are not incrementally maintained'
+        reason: 'aggregate incremental maintenance requires non-empty groupBy identity'
       },
       {
         label: 'aggregate projection',

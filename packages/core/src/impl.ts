@@ -1924,6 +1924,24 @@ type IncrementalJoinShape = {
   readonly left: IncrementalJoinSide;
   readonly right: IncrementalJoinSide;
 };
+type IncrementalAggregateShape = {
+  readonly data: QueryData;
+  readonly input: QueryData;
+  readonly relation: RelationRef;
+  readonly groupIdentity: MaterializationRowIdentity;
+};
+type IncrementalAggregateAccumulatorField =
+  | { readonly kind: 'count'; readonly field: string; readonly predicate?: unknown }
+  | { readonly kind: 'sum'; readonly field: string; readonly expr: unknown };
+type IncrementalAggregateAccumulator = {
+  readonly plainCountField: string;
+  readonly fields: readonly IncrementalAggregateAccumulatorField[];
+};
+type IncrementalAggregateContribution = {
+  readonly group: Record<string, unknown>;
+  readonly removed: Map<string, number>;
+  readonly added: Map<string, number>;
+};
 type IncrementalMaterializationSupport<Row = unknown> =
   | {
       readonly supported: true;
@@ -1932,6 +1950,7 @@ type IncrementalMaterializationSupport<Row = unknown> =
       readonly identity: MaterializationRowIdentity<Row>;
       readonly finalSort?: QueryData;
       readonly join?: IncrementalJoinShape;
+      readonly aggregate?: IncrementalAggregateShape;
       readonly trusted: boolean;
       readonly reason: string;
     }
@@ -1947,6 +1966,7 @@ type IncrementalMaterializationShape =
       readonly touchedRelations: readonly RelationRef[];
       readonly finalSort?: QueryData;
       readonly join?: IncrementalJoinShape;
+      readonly aggregate?: IncrementalAggregateShape;
     }
   | {
       readonly supported: false;
@@ -2015,6 +2035,9 @@ function maintainMaterializationIncrementally<Row>(
   const evaluateOptions = materializationEvaluateOptions(target);
   if (support.join !== undefined) {
     return maintainJoinMaterializationIncrementally(before, target, query, previousRows, relationDeltasForQuery, support, support.join, evaluateOptions);
+  }
+  if (support.aggregate !== undefined) {
+    return maintainAggregateMaterializationIncrementally(before, target, query, previousRows, relationDeltasForQuery, support, support.aggregate, evaluateOptions);
   }
 
   return maintainSingleRelationMaterializationIncrementally(target, query, previousRows, relationDeltasForQuery, support, evaluateOptions);
@@ -2112,6 +2135,471 @@ function maintainSingleRelationMaterializationIncrementally<Row>(
     rowChanges: diff.changes,
     diagnostics: [...diagnostics, ...orderedRows.diagnostics, ...diff.diagnostics]
   };
+}
+
+function maintainAggregateMaterializationIncrementally<Row>(
+  before: unknown,
+  target: unknown,
+  query: Query<Row>,
+  previousRows: readonly Row[],
+  relationDeltasForQuery: readonly RelationDelta[],
+  support: Extract<IncrementalMaterializationSupport<Row>, { readonly supported: true }>,
+  aggregateShape: IncrementalAggregateShape,
+  evaluateOptions: EvaluateOptions
+): IncrementalMaterializationResult<Row> {
+  const diagnostics: TarstateDiagnostic[] = [];
+  const accumulated = maintainAggregateMaterializationWithAccumulator(
+    target,
+    query,
+    previousRows,
+    relationDeltasForQuery,
+    support,
+    aggregateShape,
+    evaluateOptions,
+    diagnostics
+  );
+  if (accumulated !== undefined) return accumulated;
+
+  const affected = affectedAggregateGroupKeys(aggregateShape, query.relations, relationDeltasForQuery, evaluateOptions, diagnostics);
+  if (!affected.supported) return { ...affected, diagnostics: [...diagnostics, ...affected.diagnostics] };
+  if (affected.keys.size === 0) {
+    return {
+      supported: true,
+      reason: 'incremental delta maintenance',
+      rows: previousRows,
+      added: [],
+      removed: [],
+      rowChanges: [],
+      diagnostics
+    };
+  }
+
+  const beforeRows = aggregateMaterializationRowsForAffectedGroups(
+    before,
+    query,
+    aggregateShape,
+    affected.keys,
+    materializationEvaluateOptions(before),
+    diagnostics
+  );
+  if (!beforeRows.supported) return { ...beforeRows, diagnostics: [...diagnostics, ...beforeRows.diagnostics] };
+
+  const afterRows = aggregateMaterializationRowsForAffectedGroups(
+    target,
+    query,
+    aggregateShape,
+    affected.keys,
+    evaluateOptions,
+    diagnostics
+  );
+  if (!afterRows.supported) return { ...afterRows, diagnostics: [...diagnostics, ...afterRows.diagnostics] };
+
+  return applyAggregateMaterializedRows(
+    target,
+    query,
+    previousRows,
+    beforeRows.rows,
+    afterRows.rows,
+    relationDeltasForQuery,
+    support,
+    evaluateOptions,
+    diagnostics
+  );
+}
+
+function maintainAggregateMaterializationWithAccumulator<Row>(
+  target: unknown,
+  query: Query<Row>,
+  previousRows: readonly Row[],
+  relationDeltasForQuery: readonly RelationDelta[],
+  support: Extract<IncrementalMaterializationSupport<Row>, { readonly supported: true }>,
+  aggregateShape: IncrementalAggregateShape,
+  evaluateOptions: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): IncrementalMaterializationResult<Row> | undefined {
+  const accumulator = incrementalAggregateAccumulatorFor(aggregateShape.data);
+  if (accumulator === undefined) return undefined;
+  if (!aggregateAccumulatorCanUseMaterializedRows(query.data, aggregateShape.data)) return undefined;
+
+  const contributions = aggregateDeltaContributions(
+    aggregateShape,
+    query.relations,
+    relationDeltasForQuery,
+    accumulator,
+    evaluateOptions,
+    diagnostics
+  );
+  if (contributions.size === 0) {
+    return {
+      supported: true,
+      reason: 'incremental delta maintenance',
+      rows: previousRows,
+      added: [],
+      removed: [],
+      rowChanges: [],
+      diagnostics
+    };
+  }
+
+  const rows = aggregateAccumulatorMaterializedRows(previousRows, contributions, support.identity, aggregateShape, accumulator);
+  if (rows === undefined) return undefined;
+
+  return applyAggregateMaterializedRows(
+    target,
+    query,
+    previousRows,
+    rows.removed,
+    rows.added,
+    relationDeltasForQuery,
+    support,
+    evaluateOptions,
+    diagnostics
+  );
+}
+
+function applyAggregateMaterializedRows<Row>(
+  target: unknown,
+  query: Query<Row>,
+  previousRows: readonly Row[],
+  removedRows: readonly Row[],
+  addedRows: readonly Row[],
+  relationDeltasForQuery: readonly RelationDelta[],
+  support: Extract<IncrementalMaterializationSupport<Row>, { readonly supported: true }>,
+  evaluateOptions: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): IncrementalMaterializationResult<Row> {
+  const finalSortPlacement = support.finalSort === undefined
+    ? undefined
+    : incrementalMaterializedSortPlacement(support.finalSort, query.relations, evaluateOptions, diagnostics);
+  if (finalSortPlacement === undefined) {
+    const reason = 'aggregate incremental maintenance requires final sort with group identity';
+    return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+  }
+
+  const rowUpdate = applyIncrementalMaterializedRows(
+    previousRows,
+    removedRows,
+    addedRows,
+    support.identity,
+    {
+      sourceRemovedCount: relationDeltasForQuery.reduce((countValue, delta) => countValue + delta.removed.length, 0),
+      sorted: true,
+      sortPlacement: finalSortPlacement
+    }
+  );
+  if (!rowUpdate.supported) {
+    return {
+      supported: false,
+      reason: rowUpdate.reason,
+      diagnostics: [...diagnostics, ...rowUpdate.diagnostics]
+    };
+  }
+
+  if (!support.trusted) {
+    const refresh = refreshMaterializationRows(target, query);
+    if (stableKey(rowUpdate.rows) !== stableKey(refresh.rows)) {
+      const reason = 'incremental materialization candidate differed from full recompute';
+      return {
+        supported: false,
+        reason,
+        diagnostics: [...diagnostics, ...refresh.diagnostics, materializationUnsupportedDiagnostic(reason)]
+      };
+    }
+  }
+
+  const diff = diffRows(previousRows, rowUpdate.rows, { keyBy: support.identity.keyBy });
+  return {
+    supported: true,
+    reason: 'incremental delta maintenance',
+    rows: rowUpdate.rows,
+    added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
+    removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
+    rowChanges: diff.changes,
+    diagnostics: [...diagnostics, ...diff.diagnostics]
+  };
+}
+
+function incrementalAggregateAccumulatorFor(data: QueryData): IncrementalAggregateAccumulator | undefined {
+  const fields: IncrementalAggregateAccumulatorField[] = [];
+  let plainCountField: string | undefined;
+
+  for (const [fieldName, projectionExpr] of Object.entries(projectionFrom(data.aggregates))) {
+    const exprData = unwrapOptionalProjection(projectionExpr);
+    if (!isExpr(exprData) || exprData.op !== 'aggregateCall') return undefined;
+
+    const fn = typeof exprData.fn === 'string' ? exprData.fn : '';
+    const args = arrayFromUnknown(exprData.args);
+    if (fn === 'count' && args.length === 0) {
+      plainCountField ??= fieldName;
+      fields.push({ kind: 'count', field: fieldName });
+      continue;
+    }
+    if (fn === 'count' && args.length === 1 && trustedRowLocalExpr(args[0])) {
+      fields.push({ kind: 'count', field: fieldName, predicate: args[0] });
+      continue;
+    }
+    if (fn === 'sum' && args.length === 1 && trustedRowLocalExpr(args[0])) {
+      fields.push({ kind: 'sum', field: fieldName, expr: args[0] });
+      continue;
+    }
+    return undefined;
+  }
+
+  return plainCountField === undefined ? undefined : { plainCountField, fields };
+}
+
+function aggregateAccumulatorCanUseMaterializedRows(data: QueryData, aggregateData: QueryData): boolean {
+  if (data === aggregateData) return true;
+  switch (data.op) {
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+    case 'keyBy':
+    case 'sort': {
+      const input = queryDataFrom(data.input);
+      return input !== undefined && aggregateAccumulatorCanUseMaterializedRows(input, aggregateData);
+    }
+    default:
+      return false;
+  }
+}
+
+function aggregateDeltaContributions(
+  aggregateShape: IncrementalAggregateShape,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  relationDeltasForQuery: readonly RelationDelta[],
+  accumulator: IncrementalAggregateAccumulator,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): ReadonlyMap<string, IncrementalAggregateContribution> {
+  const contributions = new Map<string, IncrementalAggregateContribution>();
+  for (const delta of relationDeltasForQuery) {
+    if (delta.relation.name !== aggregateShape.relation.name) continue;
+    accumulateAggregateDeltaRows(aggregateShape, relations, delta.removed, 'removed', accumulator, options, diagnostics, contributions);
+    accumulateAggregateDeltaRows(aggregateShape, relations, delta.added, 'added', accumulator, options, diagnostics, contributions);
+  }
+  return contributions;
+}
+
+function accumulateAggregateDeltaRows(
+  aggregateShape: IncrementalAggregateShape,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  rows: readonly unknown[],
+  phase: 'removed' | 'added',
+  accumulator: IncrementalAggregateAccumulator,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  contributions: Map<string, IncrementalAggregateContribution>
+): void {
+  if (rows.length === 0) return;
+  const source = fromObjectSource({ [aggregateShape.relation.name]: rows });
+  const entries = evaluateQueryData(source, aggregateShape.input, relations, options, undefined, diagnostics);
+  const groupProjection = projectionFrom(aggregateShape.data.groupBy);
+  for (const entry of entries) {
+    const group = evaluateProjection(groupProjection, entry, source, relations, options, diagnostics, undefined);
+    const key = aggregateShape.groupIdentity.keyOf(group);
+    let contribution = contributions.get(key);
+    if (contribution === undefined) {
+      contribution = { group, removed: new Map(), added: new Map() };
+      contributions.set(key, contribution);
+    }
+    const values = phase === 'removed' ? contribution.removed : contribution.added;
+    for (const field of accumulator.fields) {
+      const valueValue = aggregateDeltaContributionValue(field, entry, source, relations, options, diagnostics);
+      values.set(field.field, (values.get(field.field) ?? 0) + valueValue);
+    }
+  }
+}
+
+function aggregateDeltaContributionValue(
+  fieldValue: IncrementalAggregateAccumulatorField,
+  entry: EvalEntry,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): number {
+  if (fieldValue.kind === 'count') {
+    return fieldValue.predicate === undefined
+      ? 1
+      : evaluateExpr(fieldValue.predicate, entry, source, relations, options, diagnostics, undefined) ? 1 : 0;
+  }
+
+  const valueValue = evaluateExpr(fieldValue.expr, entry, source, relations, options, diagnostics, undefined);
+  return typeof valueValue === 'number' ? valueValue : 0;
+}
+
+function aggregateAccumulatorMaterializedRows<Row>(
+  previousRows: readonly Row[],
+  contributions: ReadonlyMap<string, IncrementalAggregateContribution>,
+  identity: MaterializationRowIdentity<Row>,
+  aggregateShape: IncrementalAggregateShape,
+  accumulator: IncrementalAggregateAccumulator
+): { readonly removed: readonly Row[]; readonly added: readonly Row[] } | undefined {
+  const previousLookup = previousRowLookup(previousRows, identity);
+  const groupFields = projectionFieldNames(aggregateShape.data.groupBy);
+  const removed: Row[] = [];
+  const added: Row[] = [];
+
+  for (const [key, contribution] of contributions) {
+    const previous = previousLookup.get(key)?.row;
+    const previousRecord = isRecord(previous) ? previous : undefined;
+    const previousCount = aggregateNumericField(previousRecord, accumulator.plainCountField);
+    if (previousCount === undefined) return undefined;
+
+    const removedCount = contribution.removed.get(accumulator.plainCountField) ?? 0;
+    if (previous === undefined && removedCount > 0) return undefined;
+    const nextCount = previousCount
+      - removedCount
+      + (contribution.added.get(accumulator.plainCountField) ?? 0);
+    if (!Number.isFinite(nextCount) || nextCount < 0) return undefined;
+
+    if (previous !== undefined) removed.push(previous);
+    if (nextCount === 0) continue;
+
+    const rowValue: Record<string, unknown> = {};
+    const groupSource = previousRecord ?? contribution.group;
+    for (const fieldName of groupFields) rowValue[fieldName] = groupSource[fieldName];
+
+    for (const fieldValue of accumulator.fields) {
+      const previousValue = aggregateNumericField(previousRecord, fieldValue.field);
+      if (previousValue === undefined) return undefined;
+      const nextValue = previousValue
+        - (contribution.removed.get(fieldValue.field) ?? 0)
+        + (contribution.added.get(fieldValue.field) ?? 0);
+      if (fieldValue.kind === 'count' && (!Number.isFinite(nextValue) || nextValue < 0)) return undefined;
+      rowValue[fieldValue.field] = nextValue;
+    }
+    added.push(rowValue as Row);
+  }
+
+  return { removed, added };
+}
+
+function aggregateNumericField(rowValue: Record<string, unknown> | undefined, fieldName: string): number | undefined {
+  if (rowValue === undefined) return 0;
+  const valueValue = rowValue[fieldName];
+  return typeof valueValue === 'number' ? valueValue : undefined;
+}
+
+function aggregateMaterializationRowsForAffectedGroups<Row>(
+  target: unknown,
+  query: Query<Row>,
+  aggregateShape: IncrementalAggregateShape,
+  affectedKeys: ReadonlySet<string>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): { readonly supported: true; readonly rows: readonly Row[] } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  const relationRows = materializationTargetRelationRows(target, aggregateShape.relation);
+  if (relationRows === undefined) {
+    return unsupportedIncrementalShape('aggregate incremental maintenance requires readable relation snapshots');
+  }
+
+  const source = fromObjectSource({ [aggregateShape.relation.name]: relationRows });
+  const aggregateRows = aggregateRowsForAffectedGroups(source, aggregateShape, query.relations, affectedKeys, options, diagnostics);
+  const finalData = queryDataReplacingAggregateWithRows(query.data, aggregateShape.data, aggregateRows);
+  if (finalData === undefined) {
+    return unsupportedIncrementalShape('aggregate incremental maintenance requires supported final aggregate wrappers');
+  }
+
+  return {
+    supported: true,
+    rows: evaluateQueryData(fromObjectSource({}), finalData, query.relations, options, undefined, diagnostics)
+      .map((entry) => entry.row as Row)
+  };
+}
+
+function aggregateRowsForAffectedGroups(
+  source: RelationSource,
+  aggregateShape: IncrementalAggregateShape,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  affectedKeys: ReadonlySet<string>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): readonly Record<string, unknown>[] {
+  const input = evaluateQueryData(source, aggregateShape.input, relations, options, undefined, diagnostics);
+  const groupProjection = projectionFrom(aggregateShape.data.groupBy);
+  const aggregateProjection = projectionFrom(aggregateShape.data.aggregates);
+  const groups = new Map<string, { readonly group: Record<string, unknown>; readonly rows: EvalEntry[] }>();
+
+  for (const entry of input) {
+    const group = evaluateProjection(groupProjection, entry, source, relations, options, diagnostics, undefined);
+    const key = aggregateShape.groupIdentity.keyOf(group);
+    if (!affectedKeys.has(key)) continue;
+    const existing = groups.get(key);
+    if (existing === undefined) {
+      groups.set(key, { group, rows: [entry] });
+    } else {
+      existing.rows.push(entry);
+    }
+  }
+
+  return Array.from(groups.values()).map(({ group, rows }) => ({
+    ...group,
+    ...evaluateAggregateProjection(aggregateProjection, rows, source, relations, options, diagnostics, undefined)
+  }));
+}
+
+function queryDataReplacingAggregateWithRows(
+  data: QueryData,
+  aggregateData: QueryData,
+  rows: readonly Record<string, unknown>[]
+): QueryData | undefined {
+  if (data === aggregateData) return { op: 'constRows', rows };
+  const input = queryDataFrom(data.input);
+  if (input === undefined) return undefined;
+  const replaced = queryDataReplacingAggregateWithRows(input, aggregateData, rows);
+  if (replaced === undefined) return undefined;
+
+  switch (data.op) {
+    case 'where':
+    case 'project':
+    case 'extend':
+    case 'without':
+    case 'rename':
+    case 'qualify':
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+    case 'keyBy':
+    case 'sort':
+      return { ...data, input: replaced };
+    default:
+      return undefined;
+  }
+}
+
+function affectedAggregateGroupKeys(
+  aggregateShape: IncrementalAggregateShape,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  relationDeltasForQuery: readonly RelationDelta[],
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): { readonly supported: true; readonly keys: ReadonlySet<string> } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  const keys = new Set<string>();
+  for (const delta of relationDeltasForQuery) {
+    if (delta.relation.name !== aggregateShape.relation.name) continue;
+    for (const key of aggregateGroupKeysForRows(aggregateShape, relations, delta.removed, options, diagnostics)) keys.add(key);
+    for (const key of aggregateGroupKeysForRows(aggregateShape, relations, delta.added, options, diagnostics)) keys.add(key);
+  }
+  return { supported: true, keys };
+}
+
+function aggregateGroupKeysForRows(
+  aggregateShape: IncrementalAggregateShape,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  rows: readonly unknown[],
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): readonly string[] {
+  if (rows.length === 0) return [];
+  const source = fromObjectSource({ [aggregateShape.relation.name]: rows });
+  const entries = evaluateQueryData(source, aggregateShape.input, relations, options, undefined, diagnostics);
+  const groupProjection = projectionFrom(aggregateShape.data.groupBy);
+  return entries.map((entry) => {
+    const group = evaluateProjection(groupProjection, entry, source, relations, options, diagnostics, undefined);
+    return aggregateShape.groupIdentity.keyOf(group);
+  });
 }
 
 function maintainJoinMaterializationIncrementally<Row>(
@@ -2450,12 +2938,37 @@ function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalM
   const identity = shape.join === undefined
     ? rowIdentityForQueryData<Row>(query.data, query.relations)
     : joinMaterializedRowIdentity<Row>(query.data, query.relations, shape.join);
+  const aggregateGroupIdentity = shape.aggregate === undefined
+    ? undefined
+    : aggregateGroupIdentityForFinalData<Row>(query.data, query.relations);
+  if (shape.aggregate !== undefined && aggregateGroupIdentity === undefined) {
+    const reason = 'aggregate incremental maintenance requires final projection to preserve group identity';
+    return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+  }
   if (identity === undefined || identity.readable === false) {
     return {
       supported: false,
       reason: 'incremental maintenance requires a stable materialized row identity',
       diagnostics: [materializationUnsupportedDiagnostic('incremental maintenance requires a stable materialized row identity')]
     };
+  }
+  if (shape.aggregate !== undefined) {
+    if (shape.finalSort === undefined) {
+      const reason = 'aggregate incremental maintenance requires final sort with group identity';
+      return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+    }
+    const preservesGroupIdentity = aggregateGroupIdentity !== undefined && stableKey(aggregateGroupIdentity.paths) === stableKey(identity.paths);
+    if (!preservesGroupIdentity) {
+      const reason = 'aggregate incremental maintenance requires final projection to preserve group identity';
+      return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+    }
+    if (
+      shape.finalSort !== undefined
+      && !finalSortIncludesMaterializedIdentity(shape.finalSort, query.relations, identity)
+    ) {
+      const reason = 'aggregate final sort requires group identity in sort order';
+      return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+    }
   }
 
   return {
@@ -2465,9 +2978,12 @@ function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalM
     identity,
     ...(shape.finalSort === undefined ? {} : { finalSort: shape.finalSort }),
     ...(shape.join === undefined ? {} : { join: shape.join }),
+    ...(shape.aggregate === undefined ? {} : { aggregate: shape.aggregate }),
     trusted: trustedIncrementalMaterialization(query, shape, identity),
     reason: shape.join === undefined
-      ? 'single-source pipeline with stable row identity'
+      ? shape.aggregate === undefined
+        ? 'single-source pipeline with stable row identity'
+        : 'single-source aggregate pipeline with stable group identity'
       : 'two-relation equi-join pipeline with stable row identity'
   };
 }
@@ -2534,7 +3050,7 @@ function incrementalMaterializationShape(
     case 'uniqueIndex':
       return incrementalNestedShape(data, relations);
     case 'aggregate':
-      return unsupportedIncrementalShape('aggregate queries are not incrementally maintained');
+      return incrementalAggregateMaterializationShape(data, relations);
     case 'sort': {
       if (!finalPosition) return unsupportedIncrementalShape('non-final sort queries are not incrementally maintained');
       const order = arrayFromUnknown(data.order);
@@ -2571,6 +3087,74 @@ function incrementalNestedShape(
 
 function unsupportedIncrementalShape(reason: string): { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
   return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+}
+
+function incrementalAggregateMaterializationShape(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): IncrementalMaterializationShape {
+  const groupProjection = projectionFrom(data.groupBy);
+  if (Object.keys(groupProjection).length === 0) {
+    return unsupportedIncrementalShape('aggregate incremental maintenance requires non-empty groupBy identity');
+  }
+  if (!trustedProjectionExpressions(groupProjection)) {
+    return unsupportedIncrementalShape('aggregate groupBy expressions are not incrementally maintained');
+  }
+
+  const aggregateProjectionSupport = supportedIncrementalAggregateProjection(data.aggregates);
+  if (!aggregateProjectionSupport.supported) return aggregateProjectionSupport;
+
+  const input = queryDataFrom(data.input);
+  if (input === undefined) return unsupportedIncrementalShape('incremental maintenance requires a nested input query');
+  const nested = incrementalMaterializationShape(input, relations, false);
+  if (!nested.supported) return nested;
+  if (nested.join !== undefined || nested.aggregate !== undefined) {
+    return unsupportedIncrementalShape('aggregate incremental maintenance requires a direct single-source input');
+  }
+
+  const groupIdentity = aggregateGroupIdentityForData(data);
+  if (groupIdentity === undefined) {
+    return unsupportedIncrementalShape('aggregate incremental maintenance requires non-empty groupBy identity');
+  }
+
+  return {
+    supported: true,
+    relation: nested.relation,
+    touchedRelations: nested.touchedRelations,
+    aggregate: {
+      data,
+      input,
+      relation: nested.relation,
+      groupIdentity
+    }
+  };
+}
+
+function supportedIncrementalAggregateProjection(
+  input: unknown
+): { readonly supported: true } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  const projection = projectionFrom(input);
+  for (const projectionExpr of Object.values(projection)) {
+    const data = unwrapOptionalProjection(projectionExpr);
+    if (!isExpr(data) || data.op !== 'aggregateCall') {
+      return unsupportedIncrementalShape('aggregate projections must contain only supported aggregate calls');
+    }
+
+    const fn = typeof data.fn === 'string' ? data.fn : '';
+    const args = arrayFromUnknown(data.args);
+    if (fn === 'count') {
+      if (args.length === 0) continue;
+      if (args.length === 1 && trustedRowLocalExpr(args[0])) continue;
+      return unsupportedIncrementalShape('count aggregate predicates are not incrementally maintained');
+    }
+    if (fn === 'sum') {
+      if (args.length === 1 && trustedRowLocalExpr(args[0])) continue;
+      return unsupportedIncrementalShape('sum aggregate expressions are not incrementally maintained');
+    }
+
+    return unsupportedIncrementalShape(`aggregate function "${fn}" is not incrementally maintained`);
+  }
+  return { supported: true };
 }
 
 function incrementalJoinMaterializationShape(
@@ -3294,6 +3878,10 @@ function trustedIncrementalQueryExpressions(data: QueryData): boolean {
       return arrayFromUnknown(data.order)
         .every((sortInput) => trustedRowLocalExpr(normalizeSortInput(sortInput).expr))
         && nestedTrusted();
+    case 'aggregate':
+      return trustedProjectionExpressions(data.groupBy)
+        && supportedIncrementalAggregateProjection(data.aggregates).supported
+        && nestedTrusted();
     case 'join': {
       if (data.kind !== 'inner' || isPredicateData(data.on) || equiJoinClauseMapFrom(data.on) === undefined) return false;
       const left = queryDataFrom(data.left);
@@ -3453,6 +4041,13 @@ function finalRowFieldExpressions(data: QueryData, relations: Readonly<Record<st
         if (!rightFieldNames.has(fieldName)) fields.set(fieldName, field(left.alias, fieldName));
       }
       for (const fieldName of relationFieldNames(right.relation)) fields.set(fieldName, field(right.alias, fieldName));
+      return fields;
+    }
+    case 'aggregate': {
+      const fields = new Map<string, ExprData>();
+      for (const fieldName of uniqueStrings(projectionFieldNames(data.groupBy), projectionFieldNames(data.aggregates))) {
+        fields.set(fieldName, field('row', fieldName));
+      }
       return fields;
     }
     case 'where':
@@ -6307,6 +6902,8 @@ function rowIdentityForQueryData<Row = unknown>(
     }
     case 'project':
       return projectedRowIdentity<Row>(data, relations);
+    case 'aggregate':
+      return aggregateGroupIdentityForData<Row>(data);
     default:
       return undefined;
   }
@@ -6375,11 +6972,96 @@ function projectedRowIdentity<Row>(
 }
 
 function directProjectionFieldFor(inputField: string, projection: ProjectionData): string | undefined {
+  return directProjectionFieldForAlias(inputField, projection);
+}
+
+function directProjectionFieldForAlias(inputField: string, projection: ProjectionData, alias?: string): string | undefined {
   for (const [outputField, projectionExpr] of Object.entries(projection)) {
     const exprValue = unwrapOptionalProjection(projectionExpr);
-    if (isRecord(exprValue) && exprValue.op === 'field' && exprValue.field === inputField) return outputField;
+    if (
+      isRecord(exprValue)
+      && exprValue.op === 'field'
+      && exprValue.field === inputField
+      && (alias === undefined || exprValue.alias === alias)
+    ) return outputField;
   }
   return undefined;
+}
+
+function aggregateGroupIdentityForData<Row = unknown>(data: QueryData): MaterializationRowIdentity<Row> | undefined {
+  const fields = projectionFieldNames(data.groupBy);
+  return fields.length === 0 ? undefined : rowIdentityFromPaths<Row>(fields.map((fieldName) => [fieldName]), { unique: true });
+}
+
+function aggregateGroupIdentityForFinalData<Row = unknown>(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): MaterializationRowIdentity<Row> | undefined {
+  switch (data.op) {
+    case 'aggregate':
+      return aggregateGroupIdentityForData<Row>(data);
+    case 'where':
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+    case 'sort':
+    case 'keyBy':
+      return aggregateGroupIdentityForNestedFinalData<Row>(data, relations);
+    case 'extend': {
+      const input = aggregateGroupIdentityForNestedFinalData<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const projection = projectionFrom(data.projection);
+      return input.paths.some((path) => path.length === 1 && Object.prototype.hasOwnProperty.call(projection, path[0] ?? ''))
+        ? undefined
+        : input;
+    }
+    case 'without': {
+      const input = aggregateGroupIdentityForNestedFinalData<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const removed = new Set(stringArray(data.fields));
+      return input.paths.some((path) => removed.has(path[0] ?? '')) ? undefined : input;
+    }
+    case 'rename': {
+      const input = aggregateGroupIdentityForNestedFinalData<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const fields = isRecord(data.fields) ? data.fields : {};
+      return rowIdentityFromPaths<Row>(input.paths.map((path) => {
+        const [first, ...rest] = path;
+        if (first === undefined) return path;
+        const renamed = fields[first];
+        return [typeof renamed === 'string' ? renamed : first, ...rest];
+      }), { unique: input.unique });
+    }
+    case 'qualify': {
+      const input = aggregateGroupIdentityForNestedFinalData<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const alias = typeof data.alias === 'string' ? data.alias : 'row';
+      return rowIdentityFromPaths<Row>(input.paths.map((path) => [alias, ...path]), { unique: input.unique });
+    }
+    case 'project': {
+      const input = aggregateGroupIdentityForNestedFinalData<Row>(data, relations);
+      if (input === undefined) return undefined;
+      const projection = projectionFrom(data.projection);
+      const paths: MaterializationRowKeyPath[] = [];
+      for (const path of input.paths) {
+        if (path.length !== 1) return undefined;
+        const outputField = directProjectionFieldForAlias(path[0] as string, projection, 'row');
+        if (outputField === undefined) return undefined;
+        paths.push([outputField]);
+      }
+      return rowIdentityFromPaths<Row>(paths, { unique: input.unique });
+    }
+    default:
+      return undefined;
+  }
+}
+
+function aggregateGroupIdentityForNestedFinalData<Row>(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): MaterializationRowIdentity<Row> | undefined {
+  const input = queryDataFrom(data.input);
+  return input === undefined ? undefined : aggregateGroupIdentityForFinalData<Row>(input, relations);
 }
 
 function rowIdentityFromPaths<Row = unknown>(
