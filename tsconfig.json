@@ -85,7 +85,6 @@
     ]
   },
   "include": [
-    "apps/*/src",
     "packages/*/bench",
     "packages/*/src",
     "packages/*/tests",

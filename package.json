@@ -12,7 +12,7 @@
     "bench": "echo \"benchmarks removed for rewrite\"",
     "build": "pnpm -r --if-present build",
     "lint": "oxlint . --deny-warnings --type-aware",
-    "test": "pnpm --filter './packages/*' --filter './apps/*' --if-present test",
+    "test": "pnpm --filter './packages/*' --if-present test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

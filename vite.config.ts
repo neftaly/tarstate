@@ -75,9 +75,6 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
         fileName: (_format, entryName) => entryName + '.js'
       },
     }
-  },
-  '@tarstate/demo': {
-    build: sharedBuildOptions
   }
 };
 
