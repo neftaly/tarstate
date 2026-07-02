@@ -1,5 +1,6 @@
 import { createElement } from 'react';
-import { describe, expect, expectTypeOf, it } from 'vitest';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { TarstateDiagnostic } from '@tarstate/core';
 import {
   TarstateProvider,
@@ -22,9 +23,14 @@ import {
   type UseViewOptions,
   type ViewHookState
 } from '@tarstate/react';
-import { createStore, type Store, type StoreViewSnapshot } from '@tarstate/core/store';
-import { as, from, pipe, project } from '@tarstate/core/query';
+import type { Db } from '@tarstate/core/db';
+import { createStore, type Store, type StoreCommitResult, type StoreSnapshot, type StoreView, type StoreViewSnapshot } from '@tarstate/core/store';
+import { as, from, pipe, project, queryKey } from '@tarstate/core/query';
+import type { Query } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
+import type { RelationRef } from '@tarstate/core/schema';
+import type { RelationSource } from '@tarstate/core/source';
+import { replaceAll, type WritePatch } from '@tarstate/core/write';
 
 type ItemRow = {
   readonly id: string;
@@ -36,12 +42,28 @@ type ItemProjection = {
   readonly label: string;
 };
 
+type MembershipRow = {
+  readonly orgId: string;
+  readonly itemId: string;
+  readonly role: string;
+};
+
 const schema = defineSchema({
   items: relation<ItemRow>({
     key: 'id',
     fields: {
       id: idField('item'),
       label: stringField()
+    }
+  })
+});
+const relationKeySchema = defineSchema({
+  memberships: relation<MembershipRow, readonly ['orgId', 'itemId']>({
+    key: ['orgId', 'itemId'],
+    fields: {
+      orgId: idField('org'),
+      itemId: idField('item'),
+      role: stringField()
     }
   })
 });
@@ -167,11 +189,15 @@ describe('@tarstate/react API contract', () => {
     function TypeProbe() {
       const byRelationKey = useRow(schema.items, 'item-a');
       const byQueryPredicate = useRow(itemQuery, (row) => row.id === 'item-a');
+      const byCompositeRelationKey = useRow(relationKeySchema.memberships, ['org-a', 'item-a']);
       assertType(() => expectTypeOf(byRelationKey).toEqualTypeOf<RowHookState<ItemRow>>());
       assertType(() => expectTypeOf(byQueryPredicate).toEqualTypeOf<RowHookState<ItemProjection>>());
+      assertType(() => expectTypeOf(byCompositeRelationKey).toEqualTypeOf<RowHookState<MembershipRow>>());
 
       // @ts-expect-error relation keys must match the relation key value
       useRow(schema.items, 1);
+      // @ts-expect-error composite relation keys must include each key field
+      useRow(relationKeySchema.memberships, ['org-a']);
       // @ts-expect-error keyBy was removed; use useRow(relation, key) or useRow(query, predicate)
       useRow(itemQuery, 'item-a', { keyBy: (row: ItemProjection) => row.id });
 
@@ -182,6 +208,275 @@ describe('@tarstate/react API contract', () => {
   });
 });
 
+describe('@tarstate/react hooks', () => {
+  it('reads view, query, and row state from core store views', () => {
+    const fake = createFakeItemStore([
+      { id: 'item-a', label: 'Alpha' },
+      { id: 'item-b', label: 'Beta' }
+    ]);
+    const states: {
+      view?: ViewHookState<ItemProjection>;
+      query?: QueryHookState<ItemProjection, readonly string[]>;
+      rowByPredicate?: RowHookState<ItemProjection>;
+      rowByRelation?: RowHookState<ItemRow>;
+    } = {};
+
+    function Probe() {
+      states.view = useView(itemQuery);
+      states.query = useQuery(itemQuery, {
+        select: (rows, result) => rows.map((row) => `${row.label}:${result.revision}:${result.diagnostics.length}`)
+      });
+      states.rowByPredicate = useRow(itemQuery, (row) => row.id === 'item-b');
+      states.rowByRelation = useRow(schema.items, 'item-a');
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(TarstateProvider, { store: fake.store }, createElement(Probe)));
+    });
+
+    expect(states.view?.rows).toEqual([
+      { id: 'item-a', label: 'Alpha' },
+      { id: 'item-b', label: 'Beta' }
+    ]);
+    expect(states.query?.data).toEqual(['Alpha:0:0', 'Beta:0:0']);
+    expect(states.rowByPredicate?.row).toEqual({ id: 'item-b', label: 'Beta' });
+    expect(states.rowByRelation?.row).toEqual({ id: 'item-a', label: 'Alpha' });
+
+    act(() => {
+      fake.setRows([{ id: 'item-c', label: 'Gamma' }]);
+    });
+
+    expect(states.view?.revision).toBe(1);
+    expect(states.view?.rows).toEqual([{ id: 'item-c', label: 'Gamma' }]);
+    expect(states.query?.data).toEqual(['Gamma:1:0']);
+    expect(states.rowByPredicate?.row).toBeUndefined();
+    expect(states.rowByRelation?.row).toBeUndefined();
+
+    states.view?.refresh();
+    expect(fake.viewRefreshes()).toBeGreaterThan(0);
+
+    act(() => {
+      renderer?.unmount();
+    });
+  });
+
+  it('exposes commit, snapshot, and db updates from the active store', async () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const states: {
+      commit?: TarstateCommit;
+      snapshot?: TarstateDbSnapshot;
+      db?: Db;
+      labels?: readonly string[];
+    } = {};
+
+    function Probe() {
+      states.commit = useCommit();
+      states.snapshot = useTarstateSnapshot();
+      states.db = useDb();
+      states.labels = useQuery(itemQuery, {
+        select: (rows) => rows.map((row) => row.label)
+      }).data;
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(TarstateProvider, { store: fake.store }, createElement(Probe)));
+    });
+
+    expect(states.snapshot?.revision).toBe(0);
+    expect(states.db?.data.items).toEqual([{ id: 'item-a', label: 'Alpha' }]);
+    expect(states.labels).toEqual(['Alpha']);
+
+    if (states.commit === undefined) throw new Error('commit hook was not captured');
+    await act(async () => {
+      await states.commit?.(replaceAll(schema.items, [{ id: 'item-b', label: 'Beta' }]));
+    });
+
+    expect(states.snapshot?.revision).toBe(1);
+    expect(states.db?.data.items).toEqual([{ id: 'item-b', label: 'Beta' }]);
+    expect(states.labels).toEqual(['Beta']);
+
+    act(() => {
+      renderer?.unmount();
+    });
+  });
+
+  it('keeps selected query data stable across unrelated rerenders', () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const select = vi.fn((rows: readonly ItemProjection[]) => rows.map((row) => row.label));
+    const selectedRefs: unknown[] = [];
+
+    function Probe({ tick }: { readonly tick: number }) {
+      const state = useQuery(itemQuery, { select });
+      selectedRefs.push(state.data);
+      return createElement('span', undefined, tick);
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(
+        TarstateProvider,
+        { store: fake.store },
+        createElement(Probe, { tick: 0 })
+      ));
+    });
+    act(() => {
+      renderer?.update(createElement(
+        TarstateProvider,
+        { store: fake.store },
+        createElement(Probe, { tick: 1 })
+      ));
+    });
+
+    expect(select).toHaveBeenCalledTimes(1);
+    expect(selectedRefs).toHaveLength(2);
+    expect(selectedRefs[1]).toBe(selectedRefs[0]);
+
+    act(() => {
+      renderer?.unmount();
+    });
+  });
+});
+
 function assertType(assertion: () => void): void {
   expect(assertion).not.toThrow();
+}
+
+type FakeItemStore = {
+  readonly store: Store;
+  readonly setRows: (rows: readonly ItemRow[]) => void;
+  readonly viewRefreshes: () => number;
+};
+
+function createFakeItemStore(initialRows: readonly ItemRow[]): FakeItemStore {
+  let rows = initialRows;
+  let revision = 0;
+  let db = createItemDb(rows);
+  let closeCalls = 0;
+  const diagnostics: readonly TarstateDiagnostic[] = [];
+  const storeListeners = new Set<() => void>();
+  const views = new Set<{ readonly listeners: Set<() => void>; refreshes: number }>();
+  const source: RelationSource = {
+    relationNames: ['items'],
+    rows: (relationRef) => relationRef.name === 'items' ? rows : []
+  };
+  const getSnapshot = (): StoreSnapshot => ({ db, source, revision, diagnostics });
+  const notify = (): void => {
+    for (const listener of storeListeners) listener();
+    for (const view of views) {
+      for (const listener of view.listeners) listener();
+    }
+  };
+  const setRows = (nextRows: readonly ItemRow[]): void => {
+    rows = nextRows;
+    db = createItemDb(rows);
+    revision += 1;
+    notify();
+  };
+  const commit = (async (inputOrInputs: unknown): Promise<StoreCommitResult> => {
+    const patches = fakeWritePatches(inputOrInputs);
+    const replaceAllPatch = patches.find(isItemsReplaceAllPatch);
+    if (replaceAllPatch !== undefined) setRows(replaceAllPatch.rows as readonly ItemRow[]);
+
+    return {
+      status: 'accepted',
+      reflected: true,
+      effects: {
+        patches: patches.length,
+        applied: patches.length,
+        deltas: [],
+        diagnostics
+      },
+      snapshot: getSnapshot(),
+      diagnostics
+    };
+  }) as Store['commit'];
+  const createView = <Row,>(query: Query<Row>): StoreView<Row> => {
+    const key = queryKey(query);
+    const viewState = { listeners: new Set<() => void>(), refreshes: 0 };
+    const view: StoreView<Row> = {
+      query,
+      queryKey: key,
+      getSnapshot: () => ({
+        rows: rows as readonly Row[],
+        diagnostics,
+        revision,
+        queryKey: key
+      }),
+      subscribe: (listener) => {
+        viewState.listeners.add(listener);
+        return () => {
+          viewState.listeners.delete(listener);
+        };
+      },
+      refresh: async () => {
+        viewState.refreshes += 1;
+        return view.getSnapshot();
+      }
+    };
+
+    views.add(viewState);
+    return view;
+  };
+  const store = {
+    getSnapshot,
+    subscribe: (listener) => {
+      storeListeners.add(listener);
+      return () => {
+        storeListeners.delete(listener);
+      };
+    },
+    query: <Row,>(_target: Query<Row> | RelationRef, _options?: unknown) => ({
+      rows: rows as readonly Row[],
+      diagnostics,
+      revision
+    }),
+    queries: (() => {
+      throw new Error('fake store does not implement queries');
+    }) as Store['queries'],
+    whatIf: (() => {
+      throw new Error('fake store does not implement whatIf');
+    }) as Store['whatIf'],
+    view: createView,
+    commit,
+    refresh: async () => getSnapshot(),
+    close: () => {
+      closeCalls += 1;
+    }
+  } satisfies Store;
+
+  expect(closeCalls).toBe(0);
+  return {
+    store,
+    setRows,
+    viewRefreshes: () => Array.from(views).reduce((total, view) => total + view.refreshes, 0)
+  };
+}
+
+function createItemDb(rows: readonly ItemRow[]): Db {
+  return {
+    data: { items: rows },
+    env: {}
+  };
+}
+
+function fakeWritePatches(input: unknown): readonly WritePatch[] {
+  if (Array.isArray(input)) return input.flatMap((item) => fakeWritePatches(item));
+  return isWritePatch(input) ? [input] : [];
+}
+
+function isWritePatch(input: unknown): input is WritePatch {
+  return typeof input === 'object'
+    && input !== null
+    && 'op' in input
+    && typeof input.op === 'string';
+}
+
+function isItemsReplaceAllPatch(
+  patch: WritePatch
+): patch is WritePatch & { readonly op: 'replaceAll'; readonly rows: readonly unknown[] } {
+  return patch.op === 'replaceAll' && patch.relation.name === 'items';
 }

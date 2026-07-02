@@ -1,11 +1,15 @@
-import type * as Automerge from '@automerge/automerge';
-import type {
-  AdapterSnapshot,
-  AdapterSource,
-  ComposedRelationRuntimeVersion,
-  RelationPatchTarget,
-  RelationRuntime
+import * as Automerge from '@automerge/automerge';
+import {
+  composeRelationRuntimes,
+  type AdapterSnapshot,
+  type AdapterSource,
+  type ComposedRelationRuntimeVersion,
+  type RelationDelta,
+  type RelationPatchTarget,
+  type RelationRuntime,
+  type TarstateDiagnostic
 } from '@tarstate/core/adapter';
+import type { PredicateData } from '@tarstate/core/query';
 import type { RelationRef } from '@tarstate/core/schema';
 import type { WritePatch } from '@tarstate/core/write';
 
@@ -83,6 +87,38 @@ export type AutomergeMapRuntime<
   readonly subscribe: (listener: () => void) => () => void;
 };
 
+type Row = Record<string, unknown>;
+type MutableRecord = Record<string, unknown>;
+type StorageKind = 'array' | 'map';
+type PathLookup =
+  | { readonly status: 'found'; readonly value: unknown }
+  | { readonly status: 'missing' }
+  | { readonly status: 'invalid'; readonly segment: string; readonly value: unknown };
+type MappedCollection = {
+  readonly rows: readonly Row[];
+  readonly kind: StorageKind;
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+type AnyMapRelation = {
+  readonly relation: RelationRef;
+  readonly path: readonly string[];
+};
+type RowPlan = {
+  readonly mapping: AnyMapRelation;
+  readonly kind: StorageKind;
+  readonly before: readonly Row[];
+  rows: Row[];
+  changed: boolean;
+};
+type PatchOutcome = {
+  readonly accepted: boolean;
+  readonly applied: boolean;
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+type ExprEvalResult =
+  | { readonly supported: true; readonly value: unknown }
+  | { readonly supported: false; readonly op?: string };
+
 export function defineAutomergeMapRelations<DocumentShape extends object>() {
   return <const Relations extends readonly AutomergeMapRelation<RelationRef, DocumentShape>[]>(
     relations: Relations
@@ -92,18 +128,121 @@ export function defineAutomergeMapRelations<DocumentShape extends object>() {
 export function automergeMapSource<
   DocumentShape extends object = Record<string, unknown>
 >(
-  _doc: Automerge.Doc<DocumentShape>,
-  _options: AutomergeMapSourceOptions<DocumentShape>
+  doc: Automerge.Doc<DocumentShape>,
+  options: AutomergeMapSourceOptions<DocumentShape>
 ): AutomergeMapSource {
-  throwNotImplemented('automergeMapSource');
+  return createAutomergeMapSource(() => doc, options.relations);
 }
 
 export function automergeMapAdapter<
   DocumentShape extends object = Record<string, unknown>
 >(
-  _options: AutomergeMapAdapterOptions<DocumentShape>
+  options: AutomergeMapAdapterOptions<DocumentShape>
 ): AutomergeMapAdapter<DocumentShape> {
-  throwNotImplemented('automergeMapAdapter');
+  let doc = options.doc;
+  const listeners = new Set<() => void>();
+  const source = createAutomergeMapSource(() => doc, options.relations);
+  const relationNames = relationNamesFor(options.relations);
+
+  const notify = () => {
+    for (const listener of listeners) listener();
+  };
+  const getDoc = () => doc;
+  const setDoc = (nextDoc: Automerge.Doc<DocumentShape>) => {
+    const previousHeads = Automerge.getHeads(doc);
+    doc = nextDoc;
+    if (!headsEqual(previousHeads, Automerge.getHeads(doc))) notify();
+  };
+  const snapshot = (): AdapterSnapshot<Automerge.Heads> => {
+    const version = Automerge.getHeads(doc);
+    const diagnostics = source.diagnostics?.() ?? [];
+
+    return {
+      source,
+      version,
+      ...(diagnostics.length === 0 ? {} : { diagnostics })
+    };
+  };
+  const subscribe = (listener: () => void) => {
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  };
+  const target: RelationPatchTarget<Automerge.Heads> = {
+    relationNames,
+    ownsRelation: (relationName) => options.relations.some((mapping) => mapping.relation.name === relationName),
+    apply: (patches) => {
+      const patchList = Array.from(patches);
+      const beforeDoc = doc;
+      const plans = new Map<string, RowPlan>();
+      const diagnostics: TarstateDiagnostic[] = [];
+      let accepted = 0;
+      let applied = 0;
+
+      for (const patch of patchList) {
+        const mapping = options.relations.find((candidate) => candidate.relation.name === patch.relation.name);
+
+        if (mapping === undefined) {
+          diagnostics.push(unsupportedRelationDiagnostic(patch.relation.name));
+          continue;
+        }
+
+        const plan = getOrCreatePlan(beforeDoc, mapping, plans);
+
+        if (plan === undefined) {
+          diagnostics.push(invalidPathDiagnostic(mapping, getPathValue(beforeDoc, mapping.path)));
+          continue;
+        }
+
+        const outcome = applyPatchToPlan(plan, patch);
+        diagnostics.push(...outcome.diagnostics);
+        if (outcome.accepted) accepted += 1;
+        if (outcome.applied) applied += 1;
+      }
+
+      const changedPlans = Array.from(plans.values()).filter((plan) => plan.changed);
+      if (changedPlans.length > 0) {
+        const message = changeMessageFor(options.changeMessage, patchList);
+        const nextDoc = changeDocument(doc, message, (draft) => {
+          for (const plan of changedPlans) {
+            setPathValue(draft, plan.mapping.path, encodeRows(plan.rows, plan.mapping.relation, plan.kind));
+          }
+        });
+
+        doc = nextDoc;
+        notify();
+      }
+
+      const deltas = changedPlans
+        .map((plan) => relationDelta(plan.mapping.relation, plan.before, plan.rows))
+        .filter((delta): delta is RelationDelta => delta !== undefined);
+      const status = applyStatus(patchList.length, accepted);
+      const version = Automerge.getHeads(doc);
+      const base = {
+        patches: patchList.length,
+        diagnostics,
+        version,
+        durability: 'durable' as const
+      };
+
+      return status === 'rejected'
+        ? { status, ...base, applied: 0, deltas: [] }
+        : { status, ...base, applied, deltas };
+    }
+  };
+
+  void options.storage?.codec;
+
+  return {
+    relations: options.relations,
+    getDoc,
+    setDoc,
+    source,
+    target,
+    snapshot,
+    subscribe
+  };
 }
 
 export function withAutomergeRuntimeRelations<Version>(
@@ -138,8 +277,597 @@ export function createAutomergeMapRuntime<
     readonly runtimes: readonly AutomergeRelationRuntime<RuntimeVersion>[];
   }
 ): AutomergeMapRuntime<DocumentShape, RuntimeVersion>;
-export function createAutomergeMapRuntime(_options: unknown): never {
-  throwNotImplemented('createAutomergeMapRuntime');
+export function createAutomergeMapRuntime<
+  DocumentShape extends object = Record<string, unknown>,
+  RuntimeVersion = unknown
+>(
+  options: AutomergeMapAdapterOptions<DocumentShape> & {
+    readonly runtimes?: readonly AutomergeRelationRuntime<RuntimeVersion>[] | undefined;
+  }
+): AutomergeMapRuntime<DocumentShape> | AutomergeMapRuntime<DocumentShape, RuntimeVersion> {
+  const adapter = automergeMapAdapter(options);
+  const runtimes = options.runtimes ?? [];
+  const runtime = runtimes.length === 0
+    ? adapter
+    : composeRelationRuntimes(adapter, ...runtimes);
+  const subscribe = runtime.subscribe ?? adapter.subscribe;
+
+  return {
+    kind: 'automergeMapRuntime',
+    adapter,
+    relations: uniqueRelationRefs([
+      ...options.relations.map((mapping) => mapping.relation),
+      ...runtimes.flatMap((item) => item.relations)
+    ]),
+    source: runtime.source,
+    ...(runtime.target === undefined ? {} : { target: runtime.target }),
+    ...(runtime.snapshot === undefined ? {} : { snapshot: runtime.snapshot }),
+    subscribe
+  } as AutomergeMapRuntime<DocumentShape, RuntimeVersion>;
+}
+
+function createAutomergeMapSource<DocumentShape extends object>(
+  getDoc: () => Automerge.Doc<DocumentShape>,
+  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[]
+): AutomergeMapSource {
+  const relationNames = relationNamesFor(relations);
+
+  return {
+    relationNames,
+    rows: (relationRef) => rowsForRelation(getDoc(), relations, relationRef),
+    lookup: (lookup) => rowsForRelation(getDoc(), relations, lookup.relation)
+      .filter((row) => Object.is(row[lookup.field], lookup.value)),
+    rangeLookup: (lookup) => rowsForRelation(getDoc(), relations, lookup.relation)
+      .filter((row) => inRange(row[lookup.field], lookup.lower, lookup.upper)),
+    version: () => Automerge.getHeads(getDoc()),
+    diagnostics: () => relations.flatMap((mapping) => mappedCollection(getDoc(), mapping).diagnostics)
+  };
+}
+
+function rowsForRelation<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[],
+  relationRef: RelationRef
+): readonly Row[] {
+  return relations
+    .filter((mapping) => mapping.relation.name === relationRef.name)
+    .flatMap((mapping) => mappedCollection(doc, mapping).rows);
+}
+
+function mappedCollection<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  mapping: AnyMapRelation
+): MappedCollection {
+  const lookup = getPathValue(doc, mapping.path);
+
+  if (lookup.status === 'missing') return { rows: [], kind: 'map', diagnostics: [] };
+  if (lookup.status === 'invalid') {
+    return {
+      rows: [],
+      kind: 'map',
+      diagnostics: [invalidPathDiagnostic(mapping, lookup)]
+    };
+  }
+  if (Array.isArray(lookup.value)) {
+    return {
+      rows: lookup.value.flatMap((item) => isRecord(item) ? [cloneRow(item)] : []),
+      kind: 'array',
+      diagnostics: []
+    };
+  }
+  if (isRecord(lookup.value)) {
+    return {
+      rows: Object.entries(lookup.value).flatMap(([key, value]) => rowFromMapEntry(mapping.relation, key, value)),
+      kind: 'map',
+      diagnostics: []
+    };
+  }
+
+  return {
+    rows: [],
+    kind: 'map',
+    diagnostics: [invalidPathDiagnostic(mapping, lookup)]
+  };
+}
+
+function getOrCreatePlan<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  mapping: AnyMapRelation,
+  plans: Map<string, RowPlan>
+): RowPlan | undefined {
+  const existing = plans.get(mapping.relation.name);
+  if (existing !== undefined) return existing;
+
+  const collection = mappedCollection(doc, mapping);
+  if (collection.diagnostics.length > 0) return undefined;
+
+  const plan: RowPlan = {
+    mapping,
+    kind: collection.kind,
+    before: collection.rows,
+    rows: collection.rows.map(cloneRow),
+    changed: false
+  };
+  plans.set(mapping.relation.name, plan);
+
+  return plan;
+}
+
+function applyPatchToPlan(plan: RowPlan, patch: WritePatch): PatchOutcome {
+  switch (patch.op) {
+    case 'insert':
+      return insertRow(plan, patch.row, 'reject');
+    case 'insertIgnore':
+      return insertRow(plan, patch.row, 'ignore');
+    case 'insertOrReplace':
+      return upsertRow(plan, patch.row, () => patch.row);
+    case 'insertOrMerge':
+      return upsertRow(plan, patch.row, (current, incoming) => mergeRows(current, incoming, patch.merge));
+    case 'insertOrUpdate':
+      return upsertRow(plan, patch.row, (current, incoming) => applyRowUpdate(current, patch.update ?? incoming));
+    case 'updateByKey':
+      return updateRowByKey(plan, patch.key, patch.changes);
+    case 'update':
+      return updateRowsByPredicate(plan, patch.predicate, patch.changes);
+    case 'deleteByKey':
+      return deleteRowByKey(plan, patch.key);
+    case 'delete':
+      return deleteRowsByPredicate(plan, patch.predicate);
+    case 'deleteExact':
+      return deleteRowsExact(plan, patch.row);
+    case 'replaceAll':
+      return replaceRows(plan, patch.rows);
+  }
+}
+
+function insertRow(plan: RowPlan, rowValue: unknown, duplicateMode: 'reject' | 'ignore'): PatchOutcome {
+  const row = coerceRow(rowValue);
+  if (row === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
+
+  const key = rowKeyFor(plan.mapping.relation, row);
+  if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
+
+  if (plan.rows.some((item) => rowKeyFor(plan.mapping.relation, item) === key)) {
+    return duplicateMode === 'ignore'
+      ? accepted(false)
+      : rejected(uniqueDiagnostic(plan.mapping.relation.name, row));
+  }
+
+  plan.rows = [...plan.rows, row];
+  plan.changed = true;
+  return accepted(true);
+}
+
+function upsertRow(
+  plan: RowPlan,
+  rowValue: unknown,
+  nextRow: (current: Row, incoming: Row) => unknown
+): PatchOutcome {
+  const row = coerceRow(rowValue);
+  if (row === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
+
+  const key = rowKeyFor(plan.mapping.relation, row);
+  if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
+
+  const index = plan.rows.findIndex((item) => rowKeyFor(plan.mapping.relation, item) === key);
+  if (index === -1) {
+    plan.rows = [...plan.rows, row];
+    plan.changed = true;
+    return accepted(true);
+  }
+
+  const merged = coerceRow(nextRow(plan.rows[index] ?? row, row));
+  if (merged === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
+
+  const mergedKey = rowKeyFor(plan.mapping.relation, merged);
+  if (mergedKey !== key) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, merged));
+  if (valuesEqual(plan.rows[index], merged)) return accepted(false);
+
+  plan.rows = replaceAt(plan.rows, index, merged);
+  plan.changed = true;
+  return accepted(true);
+}
+
+function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown): PatchOutcome {
+  const key = keyValueFor(plan.mapping.relation, keyValue);
+  if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, keyValue));
+
+  const index = plan.rows.findIndex((item) => rowKeyFor(plan.mapping.relation, item) === key);
+  if (index === -1) return accepted(false);
+
+  const current = plan.rows[index];
+  if (current === undefined) return accepted(false);
+
+  const updated = coerceRow(applyRowUpdate(current, changes));
+  if (updated === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, changes));
+  if (rowKeyFor(plan.mapping.relation, updated) !== key) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
+  if (valuesEqual(current, updated)) return accepted(false);
+
+  plan.rows = replaceAt(plan.rows, index, updated);
+  plan.changed = true;
+  return accepted(true);
+}
+
+function updateRowsByPredicate(plan: RowPlan, predicate: PredicateData, changes: unknown): PatchOutcome {
+  const matches = matchingIndexes(plan.rows, predicate);
+  if (!matches.supported) return rejected(unsupportedPredicateDiagnostic(plan.mapping.relation.name, matches.op));
+  if (matches.indexes.length === 0) return accepted(false);
+
+  const nextRows = [...plan.rows];
+  let changed = false;
+
+  for (const index of matches.indexes) {
+    const current = nextRows[index];
+    if (current === undefined) continue;
+
+    const updated = coerceRow(applyRowUpdate(current, changes));
+    if (updated === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, changes));
+    if (rowKeyFor(plan.mapping.relation, updated) !== rowKeyFor(plan.mapping.relation, current)) {
+      return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
+    }
+    if (!valuesEqual(current, updated)) {
+      nextRows[index] = updated;
+      changed = true;
+    }
+  }
+
+  if (!changed) return accepted(false);
+  plan.rows = nextRows;
+  plan.changed = true;
+  return accepted(true);
+}
+
+function deleteRowByKey(plan: RowPlan, keyValue: unknown): PatchOutcome {
+  const key = keyValueFor(plan.mapping.relation, keyValue);
+  if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, keyValue));
+
+  const nextRows = plan.rows.filter((item) => rowKeyFor(plan.mapping.relation, item) !== key);
+  if (nextRows.length === plan.rows.length) return accepted(false);
+
+  plan.rows = nextRows;
+  plan.changed = true;
+  return accepted(true);
+}
+
+function deleteRowsByPredicate(plan: RowPlan, predicate: PredicateData): PatchOutcome {
+  const matches = matchingIndexes(plan.rows, predicate);
+  if (!matches.supported) return rejected(unsupportedPredicateDiagnostic(plan.mapping.relation.name, matches.op));
+  if (matches.indexes.length === 0) return accepted(false);
+
+  const matchSet = new Set(matches.indexes);
+  plan.rows = plan.rows.filter((_, index) => !matchSet.has(index));
+  plan.changed = true;
+  return accepted(true);
+}
+
+function deleteRowsExact(plan: RowPlan, partial: unknown): PatchOutcome {
+  if (!isRecord(partial)) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, partial));
+
+  const entries = Object.entries(partial);
+  const nextRows = plan.rows.filter((row) =>
+    entries.some(([field, value]) => !valuesEqual(row[field], value))
+  );
+  if (nextRows.length === plan.rows.length) return accepted(false);
+
+  plan.rows = nextRows;
+  plan.changed = true;
+  return accepted(true);
+}
+
+function replaceRows(plan: RowPlan, rowsValue: readonly unknown[]): PatchOutcome {
+  const rows: Row[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const item of rowsValue) {
+    const row = coerceRow(item);
+    if (row === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, item));
+
+    const key = rowKeyFor(plan.mapping.relation, row);
+    if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
+    if (seenKeys.has(key)) return rejected(uniqueDiagnostic(plan.mapping.relation.name, row));
+
+    seenKeys.add(key);
+    rows.push(row);
+  }
+
+  if (valuesEqual(plan.rows, rows)) return accepted(false);
+  plan.rows = rows;
+  plan.changed = true;
+  return accepted(true);
+}
+
+function mergeRows(current: Row, incoming: Row, merge: unknown): Row {
+  if (Array.isArray(merge)) {
+    return {
+      ...current,
+      ...Object.fromEntries(merge.map((field) => [String(field), incoming[String(field)]]))
+    };
+  }
+  if (typeof merge === 'function') return applyRowUpdate(current, merge(current, incoming));
+  return { ...current, ...incoming };
+}
+
+function applyRowUpdate(current: Row, changes: unknown): Row {
+  const update = typeof changes === 'function'
+    ? changes(current)
+    : changes;
+
+  return isRecord(update) ? { ...current, ...cloneRow(update) } : current;
+}
+
+function matchingIndexes(
+  rows: readonly Row[],
+  predicate: PredicateData
+): { readonly supported: true; readonly indexes: readonly number[] } | { readonly supported: false; readonly op?: string } {
+  const indexes: number[] = [];
+
+  for (const [index, row] of rows.entries()) {
+    const result = evaluatePredicate(predicate, row);
+    if (!result.supported) return result.op === undefined
+      ? { supported: false }
+      : { supported: false, op: result.op };
+    if (result.value === true) indexes.push(index);
+  }
+
+  return { supported: true, indexes };
+}
+
+function evaluatePredicate(predicate: PredicateData, row: Row): ExprEvalResult {
+  return evaluateExpr(predicate, row);
+}
+
+function evaluateExpr(expr: unknown, row: Row): ExprEvalResult {
+  if (!isRecord(expr) || typeof expr.op !== 'string') return { supported: true, value: expr };
+
+  switch (expr.op) {
+    case 'value':
+      return { supported: true, value: expr.value };
+    case 'field':
+      return typeof expr.field === 'string'
+        ? { supported: true, value: row[expr.field] }
+        : { supported: false, op: expr.op };
+    case 'self':
+      return { supported: true, value: row };
+    case 'eq':
+    case 'neq':
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte':
+      return evaluateComparison(expr.op, expr.left, expr.right, row);
+    case 'and':
+      return evaluateAnd(expr.predicates, row);
+    case 'or':
+      return evaluateOr(expr.predicates, row);
+    case 'not': {
+      const result = evaluateExpr(expr.predicate, row);
+      return result.supported ? { supported: true, value: result.value !== true } : result;
+    }
+    case 'isNull': {
+      const result = evaluateExpr(expr.expr, row);
+      return result.supported ? { supported: true, value: result.value === null } : result;
+    }
+    case 'notNull': {
+      const result = evaluateExpr(expr.expr, row);
+      return result.supported ? { supported: true, value: result.value !== null } : result;
+    }
+    case 'isMissing': {
+      const result = evaluateExpr(expr.expr, row);
+      return result.supported ? { supported: true, value: result.value === undefined } : result;
+    }
+    case 'notMissing': {
+      const result = evaluateExpr(expr.expr, row);
+      return result.supported ? { supported: true, value: result.value !== undefined } : result;
+    }
+    default:
+      return { supported: false, op: expr.op };
+  }
+}
+
+function evaluateComparison(op: string, leftExpr: unknown, rightExpr: unknown, row: Row): ExprEvalResult {
+  const left = evaluateExpr(leftExpr, row);
+  if (!left.supported) return left;
+
+  const right = evaluateExpr(rightExpr, row);
+  if (!right.supported) return right;
+
+  switch (op) {
+    case 'eq':
+      return { supported: true, value: valuesEqual(left.value, right.value) };
+    case 'neq':
+      return { supported: true, value: !valuesEqual(left.value, right.value) };
+    case 'lt':
+      return { supported: true, value: compareValues(left.value, right.value) < 0 };
+    case 'lte':
+      return { supported: true, value: compareValues(left.value, right.value) <= 0 };
+    case 'gt':
+      return { supported: true, value: compareValues(left.value, right.value) > 0 };
+    case 'gte':
+      return { supported: true, value: compareValues(left.value, right.value) >= 0 };
+    default:
+      return { supported: false, op };
+  }
+}
+
+function evaluateAnd(input: unknown, row: Row): ExprEvalResult {
+  if (!Array.isArray(input)) return { supported: false, op: 'and' };
+
+  for (const item of input) {
+    const result = evaluateExpr(item, row);
+    if (!result.supported) return result;
+    if (result.value !== true) return { supported: true, value: false };
+  }
+
+  return { supported: true, value: true };
+}
+
+function evaluateOr(input: unknown, row: Row): ExprEvalResult {
+  if (!Array.isArray(input)) return { supported: false, op: 'or' };
+
+  for (const item of input) {
+    const result = evaluateExpr(item, row);
+    if (!result.supported) return result;
+    if (result.value === true) return { supported: true, value: true };
+  }
+
+  return { supported: true, value: false };
+}
+
+function accepted(applied: boolean): PatchOutcome {
+  return { accepted: true, applied, diagnostics: [] };
+}
+
+function rejected(...diagnostics: readonly TarstateDiagnostic[]): PatchOutcome {
+  return { accepted: false, applied: false, diagnostics };
+}
+
+function relationDelta(relation: RelationRef, before: readonly Row[], after: readonly Row[]): RelationDelta | undefined {
+  const beforeRows = keyedRows(relation, before);
+  const afterRows = keyedRows(relation, after);
+  const removed: Row[] = [];
+  const added: Row[] = [];
+
+  for (const [key, row] of beforeRows) {
+    const next = afterRows.get(key);
+    if (next === undefined || !valuesEqual(row, next)) removed.push(row);
+  }
+
+  for (const [key, row] of afterRows) {
+    const previous = beforeRows.get(key);
+    if (previous === undefined || !valuesEqual(previous, row)) added.push(row);
+  }
+
+  return removed.length === 0 && added.length === 0
+    ? undefined
+    : { relation, removed, added };
+}
+
+function keyedRows(relation: RelationRef, rows: readonly Row[]): Map<string, Row> {
+  return new Map(rows.map((row, index) => [rowKeyFor(relation, row) ?? `row:${index}:${stableStringify(row)}`, row]));
+}
+
+function getPathValue(root: unknown, path: readonly string[]): PathLookup {
+  let current = root;
+
+  for (const segment of path) {
+    if (current === undefined || current === null) return { status: 'missing' };
+
+    if (Array.isArray(current)) {
+      const index = arrayIndex(segment);
+      if (index === undefined) return { status: 'invalid', segment, value: current };
+      current = current[index];
+      continue;
+    }
+
+    if (!isRecord(current)) return { status: 'invalid', segment, value: current };
+    current = current[segment];
+  }
+
+  return current === undefined
+    ? { status: 'missing' }
+    : { status: 'found', value: current };
+}
+
+function setPathValue(root: unknown, path: readonly string[], value: unknown): void {
+  let current = root;
+
+  for (const [index, segment] of path.entries()) {
+    const isLeaf = index === path.length - 1;
+
+    if (Array.isArray(current)) {
+      const arrayItem = arrayIndex(segment);
+      if (arrayItem === undefined) return;
+      if (isLeaf) {
+        current[arrayItem] = value;
+        return;
+      }
+      if (current[arrayItem] === undefined || current[arrayItem] === null) current[arrayItem] = {};
+      current = current[arrayItem];
+      continue;
+    }
+
+    if (!isRecord(current)) return;
+    const record = current as MutableRecord;
+
+    if (isLeaf) {
+      record[segment] = value;
+      return;
+    }
+
+    if (record[segment] === undefined || record[segment] === null) record[segment] = {};
+    current = record[segment];
+  }
+}
+
+function rowFromMapEntry(relation: RelationRef, key: string, value: unknown): readonly Row[] {
+  if (!isRecord(value)) return [];
+
+  const row = cloneRow(value);
+  const keyFields = relationKeyFields(relation);
+  if (keyFields.length === 1 && row[keyFields[0] ?? ''] === undefined) {
+    const field = keyFields[0];
+    if (field !== undefined) row[field] = key;
+  }
+
+  return [row];
+}
+
+function encodeRows(rows: readonly Row[], relation: RelationRef, kind: StorageKind): unknown {
+  if (kind === 'array') return rows.map(cloneValue);
+
+  return Object.fromEntries(rows.map((row) => [storageKeyForRow(relation, row), cloneValue(row)]));
+}
+
+function coerceRow(input: unknown): Row | undefined {
+  return isRecord(input) ? cloneRow(input) : undefined;
+}
+
+function cloneRow(input: Record<string, unknown>): Row {
+  return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, cloneValue(value)]));
+}
+
+function cloneValue(input: unknown): unknown {
+  if (Array.isArray(input)) return input.map(cloneValue);
+  if (isRecord(input) && isPlainObjectLike(input)) return cloneRow(input);
+  return input;
+}
+
+function relationKeyFields(relation: RelationRef): readonly string[] {
+  return typeof relation.key === 'string' ? [relation.key] : relation.key;
+}
+
+function rowKeyFor(relation: RelationRef, row: Row): string | undefined {
+  const values = relationKeyFields(relation).map((field) => row[field]);
+  return values.some((value) => value === undefined) ? undefined : stableStringify(values);
+}
+
+function keyValueFor(relation: RelationRef, keyValue: unknown): string | undefined {
+  const fields = relationKeyFields(relation);
+  const values = fields.length === 1 && (!Array.isArray(keyValue) || keyValue.length !== 1)
+    ? [keyValue]
+    : Array.isArray(keyValue)
+      ? keyValue
+      : undefined;
+
+  return values !== undefined && values.length === fields.length
+    ? stableStringify(values)
+    : undefined;
+}
+
+function storageKeyForRow(relation: RelationRef, row: Row): string {
+  const fields = relationKeyFields(relation);
+  const values = fields.map((field) => row[field]);
+
+  if (fields.length === 1) {
+    const value = values[0];
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  }
+
+  return stableStringify(values);
+}
+
+function relationNamesFor(relations: readonly { readonly relation: RelationRef }[]): readonly string[] {
+  return Array.from(new Set(relations.map((mapping) => mapping.relation.name)));
 }
 
 function relationRefFor(input: RelationRef | AutomergeMapRelation): RelationRef {
@@ -150,10 +878,174 @@ function isMapRelation(input: RelationRef | AutomergeMapRelation): input is Auto
   return 'path' in input;
 }
 
+function uniqueRelationRefs(relations: readonly RelationRef[]): readonly RelationRef[] {
+  const byName = new Map<string, RelationRef>();
+
+  for (const relation of relations) {
+    if (!byName.has(relation.name)) byName.set(relation.name, relation);
+  }
+
+  return Array.from(byName.values());
+}
+
 function isReadonlyArray<Value>(input: Value | readonly Value[]): input is readonly Value[] {
   return Array.isArray(input);
 }
 
-function throwNotImplemented(surface: string): never {
-  throw new Error(`${surface} is not implemented`);
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null && !Array.isArray(input);
+}
+
+function isPlainObjectLike(input: Record<string, unknown>): boolean {
+  const prototype = Object.getPrototypeOf(input);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+  return stableStringify(left) === stableStringify(right);
+}
+
+function stableStringify(input: unknown): string {
+  return JSON.stringify(normalizeForStableStringify(input));
+}
+
+function normalizeForStableStringify(input: unknown): unknown {
+  if (Array.isArray(input)) return input.map(normalizeForStableStringify);
+  if (isRecord(input) && isPlainObjectLike(input)) {
+    return Object.fromEntries(Object.keys(input)
+      .sort()
+      .map((key) => [key, normalizeForStableStringify(input[key])]));
+  }
+
+  return input;
+}
+
+function compareValues(left: unknown, right: unknown): number {
+  if (typeof left === 'number' && typeof right === 'number') return left - right;
+  if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right);
+  if (left instanceof Date && right instanceof Date) return left.getTime() - right.getTime();
+  return String(left).localeCompare(String(right));
+}
+
+function inRange(
+  value: unknown,
+  lower: { readonly value: unknown; readonly inclusive: boolean } | undefined,
+  upper: { readonly value: unknown; readonly inclusive: boolean } | undefined
+): boolean {
+  if (lower !== undefined) {
+    const compared = compareValues(value, lower.value);
+    if (compared < 0 || (compared === 0 && !lower.inclusive)) return false;
+  }
+  if (upper !== undefined) {
+    const compared = compareValues(value, upper.value);
+    if (compared > 0 || (compared === 0 && !upper.inclusive)) return false;
+  }
+
+  return true;
+}
+
+function arrayIndex(segment: string): number | undefined {
+  const index = Number(segment);
+  return Number.isInteger(index) && index >= 0 && String(index) === segment ? index : undefined;
+}
+
+function changeMessageFor(
+  changeMessage: AutomergeMapAdapterOptions['changeMessage'],
+  patches: readonly WritePatch[]
+): string | undefined {
+  return typeof changeMessage === 'function' ? changeMessage(patches) : changeMessage;
+}
+
+function changeDocument<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  message: string | undefined,
+  callback: Automerge.ChangeFn<DocumentShape>
+): Automerge.Doc<DocumentShape> {
+  return message === undefined
+    ? Automerge.change(doc, callback)
+    : Automerge.change(doc, { message }, callback);
+}
+
+function headsEqual(left: Automerge.Heads, right: Automerge.Heads): boolean {
+  if (left.length !== right.length) return false;
+  const rightHeads = new Set(right);
+  return left.every((head) => rightHeads.has(head));
+}
+
+function replaceAt(rows: readonly Row[], index: number, row: Row): Row[] {
+  return rows.map((item, itemIndex) => itemIndex === index ? row : item);
+}
+
+function applyStatus(patches: number, accepted: number): 'accepted' | 'partial' | 'rejected' {
+  if (patches === 0) return 'accepted';
+  if (accepted === patches) return 'accepted';
+  if (accepted > 0) return 'partial';
+  return 'rejected';
+}
+
+function unsupportedRelationDiagnostic(relation: string): TarstateDiagnostic {
+  return {
+    code: 'runtime_unsupported',
+    severity: 'warning',
+    relation,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map adapter has no mapping for relation "${relation}"`
+  };
+}
+
+function unsupportedPredicateDiagnostic(relation: string, op: string | undefined): TarstateDiagnostic {
+  return {
+    code: 'runtime_unsupported',
+    severity: 'warning',
+    relation,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map adapter cannot apply predicate${op === undefined ? '' : ` op "${op}"`}`
+  };
+}
+
+function invalidPathDiagnostic(
+  mapping: AnyMapRelation,
+  lookup: PathLookup
+): TarstateDiagnostic {
+  return {
+    code: 'runtime_unsupported',
+    severity: 'warning',
+    relation: mapping.relation.name,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map relation "${mapping.relation.name}" path "${mapping.path.join('.')}" is not an array or map`,
+    detail: lookup
+  };
+}
+
+function rowInvalidDiagnostic(relation: string, row: unknown): TarstateDiagnostic {
+  return {
+    code: 'row_invalid',
+    severity: 'warning',
+    relation,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map adapter expected an object row for relation "${relation}"`,
+    detail: row
+  };
+}
+
+function rowKeyDiagnostic(relation: string, detail: unknown): TarstateDiagnostic {
+  return {
+    code: 'row_invalid',
+    severity: 'warning',
+    relation,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map adapter could not resolve a complete key for relation "${relation}"`,
+    detail
+  };
+}
+
+function uniqueDiagnostic(relation: string, row: Row): TarstateDiagnostic {
+  return {
+    code: 'unique',
+    severity: 'warning',
+    relation,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map adapter rejected a duplicate key for relation "${relation}"`,
+    detail: row
+  };
 }

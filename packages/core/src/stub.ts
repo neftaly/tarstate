@@ -356,12 +356,13 @@ export function queryKey(input: QueryKeyInput): string {
   return `query:${encodeQueryKeyValue('data' in input ? input.data : input, '$')}`;
 }
 
-export function relationDependencies(_input: QueryKeyInput): readonly string[] {
-  return [];
+export function relationDependencies(input: QueryKeyInput): readonly string[] {
+  return queryDataDependencies(isQuery(input) ? input.data : input as QueryData);
 }
 
-export function queryRowKeyFields(_input: QueryKeyInput): readonly string[] | undefined {
-  return undefined;
+export function queryRowKeyFields(input: QueryKeyInput): readonly string[] | undefined {
+  const data = isQuery(input) ? input.data : input as QueryData;
+  return queryDataRowKeyFields(data);
 }
 
 export const clauses = <Left = Record<string, unknown>, Right = Record<string, unknown>>(
@@ -486,13 +487,13 @@ export function join<Right>(right: Query<Right>, on: PredicateData): JoinQueryTr
 export function join<Left, Right>(right: Query<Right>, on: EquiJoinClauseMap<Left, Right>): JoinQueryTransform<Right, 'inner'>;
 export function join<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<unknown, Right>): JoinQueryTransform<Right, 'inner'> {
   return ((left) =>
-    ({ data: { op: 'join', kind: 'inner', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'inner'>;
+    ({ data: { op: 'join', kind: 'inner', left: left.data, right: right.data, on, ...queryAliasData(right, 'rightAlias') }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'inner'>;
 }
 export function leftJoin<Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'left'>;
 export function leftJoin<Left, Right>(right: Query<Right>, on: EquiJoinClauseMap<Left, Right>): JoinQueryTransform<Right, 'left'>;
 export function leftJoin<Right>(right: Query<Right>, on: PredicateData | EquiJoinClauseMap<unknown, Right>): JoinQueryTransform<Right, 'left'> {
   return ((left) =>
-    ({ data: { op: 'join', kind: 'left', left: left.data, right: right.data, on }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'left'>;
+    ({ data: { op: 'join', kind: 'left', left: left.data, right: right.data, on, ...queryAliasData(right, 'rightAlias') }, relations: { ...left.relations, ...right.relations } })) as JoinQueryTransform<Right, 'left'>;
 }
 export const project = <Shape extends ProjectionData>(projection: Shape): ProjectQueryTransform<ProjectedRow<Shape>> => ((query) =>
   ({ data: { op: 'project', input: query.data, projection }, relations: query.relations })) as ProjectQueryTransform<ProjectedRow<Shape>>;
@@ -545,12 +546,12 @@ export const self = <Row = unknown>(): ExprData<Row> => ({ op: 'self' });
 export function sel<Row>(query: Query<Row>): ExprData<readonly Row[]>;
 export function sel<Outer, Row>(query: Query<Row>, correlation: CorrelationClauseMap<Outer, Row>): ExprData<readonly Row[]>;
 export function sel<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<unknown, Row>): ExprData<readonly Row[]> {
-  return { op: 'sel', query: query.data, ...(correlation === undefined ? {} : { correlation }) };
+  return { op: 'sel', query: query.data, relations: query.relations, ...(correlation === undefined ? {} : { correlation }) };
 }
 export function sel1<Row>(query: Query<Row>): ExprData<Row | undefined>;
 export function sel1<Outer, Row>(query: Query<Row>, correlation: CorrelationClauseMap<Outer, Row>): ExprData<Row | undefined>;
 export function sel1<Row>(query: Query<Row>, correlation?: CorrelationClauseMap<unknown, Row>): ExprData<Row | undefined> {
-  return { op: 'sel1', query: query.data, ...(correlation === undefined ? {} : { correlation }) };
+  return { op: 'sel1', query: query.data, relations: query.relations, ...(correlation === undefined ? {} : { correlation }) };
 }
 
 export type EvaluateFunction = (...args: readonly unknown[]) => unknown;
@@ -565,17 +566,110 @@ export type QueryResult<Row> = {
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 
-export function evaluate<Row>(_source: RelationSource, _query: Query<Row>, _options: EvaluateOptions = {}): QueryResult<Row> {
-  throw notImplemented('evaluate');
+export function evaluate<Row>(source: RelationSource, query: Query<Row>, options: EvaluateOptions = {}): QueryResult<Row> {
+  const diagnostics: TarstateDiagnostic[] = [...(source.diagnostics?.() ?? [])];
+
+  try {
+    const rows = evaluateQueryData(source, query.data, query.relations, options, undefined, diagnostics)
+      .map((entry) => entry.row as Row);
+    return finishQueryResult({ rows, diagnostics }, options);
+  } catch (error) {
+    diagnostics.push(...normalizeDiagnostics(error, {
+      code: 'query_invalid',
+      severity: 'error',
+      message: 'query evaluation failed',
+      surface: 'evaluate'
+    }));
+    return finishQueryResult({ rows: [], diagnostics }, options);
+  }
 }
 
-export function validateRelationRow(_relation: RelationRef, _row: Record<string, unknown>): readonly TarstateDiagnostic[] {
-  throw notImplemented('validateRelationRow');
+export function validateRelationRow(relationRef: RelationRef, rowValue: Record<string, unknown>): readonly TarstateDiagnostic[] {
+  const diagnostics: TarstateDiagnostic[] = [];
+
+  if (!isRecord(rowValue)) {
+    diagnostics.push({
+      code: 'row_invalid',
+      severity: 'error',
+      message: `row for relation "${relationRef.name}" must be an object`,
+      relation: relationRef.name,
+      surface: 'validateRelationRow',
+      detail: rowValue
+    });
+    return diagnostics;
+  }
+
+  for (const [fieldName, spec] of Object.entries(relationRef.fields)) {
+    const hasField = Object.prototype.hasOwnProperty.call(rowValue, fieldName);
+    const fieldValue = rowValue[fieldName];
+
+    if (!hasField || fieldValue === undefined) {
+      if (!spec.optional) {
+        diagnostics.push({
+          code: 'field_missing',
+          severity: 'error',
+          message: `relation "${relationRef.name}" row is missing required field "${fieldName}"`,
+          relation: relationRef.name,
+          field: fieldName,
+          surface: 'validateRelationRow'
+        });
+      }
+      continue;
+    }
+
+    if (fieldValue === null) {
+      if (!spec.nullable) {
+        diagnostics.push({
+          code: 'field_invalid',
+          severity: 'error',
+          message: `relation "${relationRef.name}" field "${fieldName}" must not be null`,
+          relation: relationRef.name,
+          field: fieldName,
+          surface: 'validateRelationRow'
+        });
+      }
+      continue;
+    }
+
+    if (!fieldValueMatchesSpec(spec, fieldValue)) {
+      diagnostics.push({
+        code: 'field_invalid',
+        severity: 'error',
+        message: `relation "${relationRef.name}" field "${fieldName}" must be ${fieldSpecDescription(spec)}`,
+        relation: relationRef.name,
+        field: fieldName,
+        surface: 'validateRelationRow',
+        detail: fieldValue
+      });
+    }
+  }
+
+  for (const keyField of relationKeyFields(relationRef)) {
+    if (rowValue[keyField] === undefined || rowValue[keyField] === null) {
+      diagnostics.push({
+        code: 'field_missing',
+        severity: 'error',
+        message: `relation "${relationRef.name}" key field "${keyField}" is missing`,
+        relation: relationRef.name,
+        field: keyField,
+        surface: 'validateRelationRow'
+      });
+    }
+  }
+
+  return diagnostics;
 }
 
 export function rowKey(relationRef: RelationRef, row: Record<string, unknown>): string | undefined {
-  const fields = Array.isArray(relationRef.key) ? relationRef.key : [relationRef.key];
-  return JSON.stringify(fields.map((fieldName) => row[fieldName]));
+  const fields = relationKeyFields(relationRef);
+  const values: unknown[] = [];
+
+  for (const fieldName of fields) {
+    if (!Object.prototype.hasOwnProperty.call(row, fieldName) || row[fieldName] === undefined) return undefined;
+    values.push(row[fieldName]);
+  }
+
+  return stableKey(values);
 }
 
 export type RowChange<Row = unknown> =
@@ -596,8 +690,68 @@ export type RowDiff<Row = unknown> = {
   readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
 };
 
-export function diffRows<Row>(_before: readonly Row[], _after: readonly Row[], _options: RowDiffOptions<Row> = {}): RowDiff<Row> {
-  throw notImplemented('diffRows');
+export function diffRows<Row>(before: readonly Row[], after: readonly Row[], options: RowDiffOptions<Row> = {}): RowDiff<Row> {
+  const diagnostics: RowDiffDiagnostic<Row>[] = [];
+  const beforeMap = new Map<string, Row>();
+  const afterMap = new Map<string, Row>();
+  const duplicateBefore = new Set<string>();
+  const duplicateAfter = new Set<string>();
+
+  for (const rowValue of before) {
+    const key = rowDiffKey(rowValue, options);
+    if (beforeMap.has(key)) duplicateBefore.add(key);
+    beforeMap.set(key, rowValue);
+  }
+
+  for (const rowValue of after) {
+    const key = rowDiffKey(rowValue, options);
+    if (afterMap.has(key)) duplicateAfter.add(key);
+    afterMap.set(key, rowValue);
+  }
+
+  for (const key of duplicateBefore) {
+    diagnostics.push({
+      code: 'row_invalid',
+      severity: 'warning',
+      message: `duplicate before row diff key ${key}`,
+      side: 'before',
+      surface: 'diffRows'
+    });
+  }
+
+  for (const key of duplicateAfter) {
+    diagnostics.push({
+      code: 'row_invalid',
+      severity: 'warning',
+      message: `duplicate after row diff key ${key}`,
+      side: 'after',
+      surface: 'diffRows'
+    });
+  }
+
+  const changes: RowChange<Row>[] = [];
+  const keys = new Set<string>([...beforeMap.keys(), ...afterMap.keys()]);
+
+  for (const key of keys) {
+    const beforeRow = beforeMap.get(key);
+    const afterRow = afterMap.get(key);
+
+    if (beforeRow === undefined && afterRow !== undefined) {
+      changes.push({ kind: 'added', row: afterRow, key });
+      continue;
+    }
+
+    if (beforeRow !== undefined && afterRow === undefined) {
+      changes.push({ kind: 'removed', row: beforeRow, key });
+      continue;
+    }
+
+    if (beforeRow !== undefined && afterRow !== undefined && stableKey(beforeRow) !== stableKey(afterRow)) {
+      changes.push({ kind: 'updated', before: beforeRow, after: afterRow, key });
+    }
+  }
+
+  return { changes, diagnostics };
 }
 
 export function rowDiffKey<Row>(row: Row, options: RowDiffOptions<Row> = {}): string {
@@ -631,13 +785,50 @@ export type RelationSource = {
 };
 
 export function fromObjectSource(data: Record<string, readonly unknown[]>): RelationSource {
-  return { relationNames: Object.keys(data), rows: (relationRef) => data[relationRef.name] ?? [] };
+  return {
+    relationNames: Object.keys(data),
+    rows: (relationRef) => data[relationRef.name] ?? [],
+    lookup: ({ relation: relationRef, field: fieldName, value: lookupValue }) =>
+      (data[relationRef.name] ?? []).filter((rowValue) => isRecord(rowValue) && Object.is(rowValue[fieldName], lookupValue)),
+    rangeLookup: ({ relation: relationRef, field: fieldName, lower, upper }) =>
+      (data[relationRef.name] ?? []).filter((rowValue) => {
+        if (!isRecord(rowValue)) return false;
+        const valueValue = rowValue[fieldName];
+        if (lower !== undefined) {
+          const comparisonValue = compareValues(valueValue, lower.value);
+          if (comparisonValue < 0 || (comparisonValue === 0 && !lower.inclusive)) return false;
+        }
+        if (upper !== undefined) {
+          const comparisonValue = compareValues(valueValue, upper.value);
+          if (comparisonValue > 0 || (comparisonValue === 0 && !upper.inclusive)) return false;
+        }
+        return true;
+      })
+  };
 }
 
 export const isRelationSource = (input: unknown): input is RelationSource => isRecord(input) && typeof input.rows === 'function';
 export const composeSources = (...sources: readonly RelationSource[]): RelationSource => ({
   relationNames: Array.from(new Set(sources.flatMap((source) => source.relationNames ?? []))),
-  rows: (relationRef) => sources.flatMap((source) => source.rows(relationRef))
+  rows: (relationRef) => sources.flatMap((source) => source.rows(relationRef)),
+  lookup: (lookupValue) => sources.flatMap((source) =>
+    source.lookup?.(lookupValue) ?? source.rows(lookupValue.relation)
+      .filter((rowValue) => isRecord(rowValue) && Object.is(rowValue[lookupValue.field], lookupValue.value))),
+  rangeLookup: (lookupValue) => sources.flatMap((source) =>
+    source.rangeLookup?.(lookupValue) ?? source.rows(lookupValue.relation)
+      .filter((rowValue) => {
+        if (!isRecord(rowValue)) return false;
+        const valueValue = rowValue[lookupValue.field];
+        if (lookupValue.lower !== undefined) {
+          const comparisonValue = compareValues(valueValue, lookupValue.lower.value);
+          if (comparisonValue < 0 || (comparisonValue === 0 && !lookupValue.lower.inclusive)) return false;
+        }
+        if (lookupValue.upper !== undefined) {
+          const comparisonValue = compareValues(valueValue, lookupValue.upper.value);
+          if (comparisonValue > 0 || (comparisonValue === 0 && !lookupValue.upper.inclusive)) return false;
+        }
+        return true;
+      }))
 });
 
 export type RelationDelta<Relation extends RelationRef = RelationRef> = {
@@ -702,16 +893,36 @@ export type RelationApplyReport<Version = unknown> = RelationApplyResult<Version
 export async function tryApplyRelationPatches<Version = unknown>(
   runtime: RelationRuntime<Version>,
   patches: Iterable<WritePatch>,
-  _options: RelationApplyOptions = {}
+  options: RelationApplyOptions = {}
 ): Promise<RelationApplyReport<Version>> {
   const patchList = Array.from(patches);
+  if (runtime.target === undefined) {
+    return {
+      status: 'rejected',
+      patches: patchList.length,
+      applied: 0,
+      deltas: [],
+      diagnostics: [{
+        code: 'runtime_unsupported',
+        severity: 'error',
+        message: 'relation runtime does not expose a writable target',
+        surface: 'tryApplyRelationPatches'
+      }],
+      source: runtime.source
+    };
+  }
+
+  const result = await Promise.resolve(runtime.target.apply(patchList));
+  const snapshot = runtime.snapshot?.();
+  const source = snapshot?.source ?? runtime.source;
+  const version = options.readVersion === false
+    ? result.version
+    : snapshot?.version ?? result.version ?? source.version?.();
+
   return {
-    status: 'rejected',
-    patches: patchList.length,
-    applied: 0,
-    deltas: [],
-    diagnostics: [stubDiagnostic('tryApplyRelationPatches')],
-    source: runtime.source
+    ...result,
+    ...(version === undefined ? {} : { version }),
+    source
   };
 }
 
@@ -1000,7 +1211,7 @@ export class DbTransactionError<DbValue extends Db = Db> extends Error {
 }
 
 export function createDb(data: DbInputData = {}, options: DbOptions = {}): Db {
-  return { data, env: dbEnvFromOptions(options) };
+  return { data: cloneDbData(data), env: dbEnvFromOptions(options) };
 }
 export const dbSource = (input: Db): RelationSource => fromObjectSource(input.data);
 export const stripMeta = <Input>(input: Input): Input extends Db ? DbData : Input => (isDb(input) ? input.data : input) as never;
@@ -1011,42 +1222,78 @@ export const setEnvTx = (envValue: DbEnvUpdate): SetEnvTransaction => ({ op: 'se
 export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): readonly MappedRow[];
 export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
 export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
-export function q(_db: Db, _query: Query<any> | RelationRef<any, any>, _options?: any): readonly any[] {
-  throw notImplemented('q');
+export function q(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): readonly any[] {
+  return qResult(dbValue, queryValue, options).rows;
 }
 export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): QueryResult<MappedRow>;
 export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
 export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
-export function qResult(_db: Db, _query: Query<any> | RelationRef<any, any>, _options?: any): QueryResult<any> {
-  throw notImplemented('qResult');
+export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): QueryResult<any> {
+  const queryObject = queryForTarget(queryValue);
+  const materializedRows = isQuery(queryValue) ? materializedRowsForQuery(dbValue, queryObject) : undefined;
+  if (materializedRows !== undefined) {
+    return {
+      rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(materializedRows, options) : materializedRows,
+      diagnostics: []
+    };
+  }
+  const result = evaluate(dbSource(dbValue), queryObject, { ...options, env: options.env ?? dbValue.env });
+  const sortedRows = applyDbQueryOptions(result.rows, options);
+  return { rows: sortedRows, diagnostics: result.diagnostics };
 }
-export function qMany<Queries extends QueryBatch>(_db: Db, _queries: Queries, _options: DbQueryOptions = {}): QueryBatchRows<Queries> {
-  throw notImplemented('qMany');
+export function qMany<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchRows<Queries> {
+  const results: Record<string, readonly unknown[]> = {};
+  for (const [name, target] of Object.entries(queries)) {
+    results[name] = q(dbValue, queryBatchTargetQuery(target), options);
+  }
+  return results as QueryBatchRows<Queries>;
 }
-export function qManyResult<Queries extends QueryBatch>(_db: Db, _queries: Queries, _options: DbQueryOptions = {}): QueryBatchResult<Queries> {
-  throw notImplemented('qManyResult');
+export function qManyResult<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchResult<Queries> {
+  const results: Record<string, QueryResult<unknown>> = {};
+  for (const [name, target] of Object.entries(queries)) {
+    results[name] = qResult(dbValue, queryBatchTargetQuery(target), options);
+  }
+  return results as QueryBatchResult<Queries>;
 }
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _key: RelationKeyValue<Relation>, _options?: RowLookupOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
 export function row<Row>(_db: Db, _query: Query<Row>, _predicate: PredicateData, _options?: RowPredicateOptions<Row>): Row | undefined;
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _predicate: PredicateData, _options?: RowPredicateOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
 export function row<Row>(_db: Db, _query: Query<Row>, _options?: RowLookupOptions<Row>): Row | undefined;
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _options?: RowLookupOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
-export function row<Row>(_db: Db, _query: Query<Row> | RelationRef, _keyOrPredicateOrOptions?: RelationKeyInput | PredicateData | RowLookupOptions<Row>, _options?: RowLookupOptions<Row>): Row | undefined {
-  throw notImplemented('row');
+export function row<Row>(dbValue: Db, queryValue: Query<Row> | RelationRef, keyOrPredicateOrOptions?: RelationKeyInput | PredicateData | RowLookupOptions<Row>, options?: RowLookupOptions<Row>): Row | undefined {
+  if (isRelationRef(queryValue) && isRelationKeyInput(keyOrPredicateOrOptions)) {
+    const key = relationKeyInputToKey(queryValue, keyOrPredicateOrOptions);
+    return q(dbValue, queryValue, options as DbQueryOptions<Row>)
+      .find((rowValue) => isRecord(rowValue) && rowKey(queryValue, rowValue) === key) as Row | undefined;
+  }
+
+  if (isPredicateData(keyOrPredicateOrOptions)) {
+    const queryObject = pipe(queryForTarget(queryValue), where(keyOrPredicateOrOptions));
+    return q(dbValue, queryObject, options as DbQueryOptions<Row>)[0] as Row | undefined;
+  }
+
+  const readOptions = (keyOrPredicateOrOptions === undefined || isRelationKeyInput(keyOrPredicateOrOptions))
+    ? options
+    : keyOrPredicateOrOptions;
+  return q(dbValue, queryForTarget(queryValue), readOptions as DbQueryOptions<Row>)[0] as Row | undefined;
 }
 export function exists<Relation extends RelationRef>(_db: Db, _relation: Relation, _key: RelationKeyValue<Relation>, _options?: RowLookupOptions<RelationRow<Relation>>): boolean;
 export function exists<Row>(_db: Db, _query: Query<Row>, _predicate: PredicateData, _options?: RowPredicateOptions<Row>): boolean;
 export function exists<Relation extends RelationRef>(_db: Db, _relation: Relation, _predicate: PredicateData, _options?: RowPredicateOptions<RelationRow<Relation>>): boolean;
 export function exists<Row>(_db: Db, _query: Query<Row>, _options?: RowLookupOptions<Row>): boolean;
 export function exists<Relation extends RelationRef>(_db: Db, _relation: Relation, _options?: RowLookupOptions<RelationRow<Relation>>): boolean;
-export function exists<Row>(_db: Db, _query: Query<Row> | RelationRef, _keyOrPredicateOrOptions?: RelationKeyInput | PredicateData | RowLookupOptions<Row>, _options?: RowLookupOptions<Row>): boolean {
-  throw notImplemented('exists');
+export function exists<Row>(dbValue: Db, queryValue: Query<Row> | RelationRef, keyOrPredicateOrOptions?: RelationKeyInput | PredicateData | RowLookupOptions<Row>, options?: RowLookupOptions<Row>): boolean {
+  return row(dbValue, queryValue as Query<Row>, keyOrPredicateOrOptions as never, options) !== undefined;
 }
 export type DbTransactionOptions = { readonly label?: string };
 export function whatIf<Queries extends QueryBatch>(_db: Db, _query: Queries, ..._inputs: DbTransactionInputs): QueryBatchResult<Queries>;
 export function whatIf<Row>(_db: Db, _query: Query<Row> | RelationRef, ..._inputs: DbTransactionInputs): QueryResult<Row>;
-export function whatIf(_db: Db, _query: Query<unknown> | RelationRef | QueryBatch, ..._inputs: DbTransactionInputs): QueryResult<unknown> | QueryBatchResult<QueryBatch> {
-  throw notImplemented('whatIf');
+export function whatIf(dbValue: Db, queryValue: Query<unknown> | RelationRef | QueryBatch, ...inputs: DbTransactionInputs): QueryResult<unknown> | QueryBatchResult<QueryBatch> {
+  const result = tryTransact(dbValue, ...inputs);
+  const readDb = result.committed ? result.db : dbValue;
+  return isQueryBatch(queryValue)
+    ? qManyResult(readDb, queryValue)
+    : qResult(readDb, queryValue);
 }
 export function transact<DbValue extends Db>(inputDb: DbValue, inputs: DbTransactionInputs, options?: DbTransactionOptions): DbValue;
 export function transact<DbValue extends Db>(inputDb: DbValue, input: DbTransactionInput, options?: DbTransactionOptions): DbValue;
@@ -1056,7 +1303,72 @@ export function transact<DbValue extends Db>(inputDb: DbValue, inputOrInputs: Db
   return result.db;
 }
 export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbTransactionInputs): DbTransactionResult<DbValue> {
-  return { db: inputDb, patches: inputs.length, applied: 0, deltas: [], diagnostics: [stubDiagnostic('tryTransact')], committed: false };
+  const diagnostics: TarstateDiagnostic[] = [];
+  const patches: WritePatch[] = [];
+  let workingDb: Db = cloneDb(inputDb);
+  let applied = 0;
+  const deltas: RelationDelta[] = [];
+
+  for (const input of inputs) {
+    const items = normalizeTransactionItem(resolveTransactionInput(input, workingDb));
+    for (const item of items) {
+      if (isSetEnvTransaction(item)) {
+        workingDb = applySetEnvTransaction(workingDb, item);
+        continue;
+      }
+
+      patches.push(item);
+      const patchResult = applyWritePatchToDb(workingDb, item);
+      diagnostics.push(...patchResult.diagnostics);
+
+      if (patchResult.diagnostics.some(isErrorDiagnostic)) {
+        diagnostics.push(...constraintDiagnosticsForInvalidPatch(item, materializedConstraintsFor(inputDb)));
+        return {
+          db: inputDb,
+          patches: patches.length,
+          applied,
+          deltas,
+          diagnostics,
+          committed: false
+        };
+      }
+
+      workingDb = patchResult.db;
+      applied += patchResult.applied;
+      deltas.push(...patchResult.deltas);
+      workingDb = applyCascadeDeletes(workingDb, materializedConstraintsFor(inputDb), patchResult.deltas, deltas);
+    }
+  }
+
+  const materializationConstraints = materializedConstraintsFor(inputDb);
+  if (materializationConstraints.length > 0) {
+    const validation = validateConstraintsSync(workingDb, materializationConstraints, { env: workingDb.env });
+    diagnostics.push(...validation.diagnostics);
+    if (!validation.valid) {
+      return {
+        db: inputDb,
+        patches: patches.length,
+        applied: 0,
+        deltas: [],
+        diagnostics,
+        committed: false
+      };
+    }
+  }
+
+  const materializations = maintainMaterializationSnapshots(inputDb, workingDb, { deltas });
+  diagnostics.push(...materializations.diagnostics);
+  const committedDb = applyMaterializationState(workingDb, materializedStateFor(inputDb), materializations) as DbValue;
+
+  return {
+    db: committedDb,
+    patches: patches.length,
+    applied,
+    deltas,
+    diagnostics,
+    committed: true,
+    ...(materializations.maintained === 0 ? {} : { materializations })
+  };
 }
 function normalizeTransactionInputs(inputOrInputs: DbTransactionInput | DbTransactionInputs): DbTransactionInputs {
   return (Array.isArray(inputOrInputs) ? inputOrInputs : [inputOrInputs]) as DbTransactionInputs;
@@ -1139,8 +1451,16 @@ export const deleteByKey = <Relation extends RelationRef>(relationRef: Relation,
 export const deleteRows = <Relation extends RelationRef>(relationRef: Relation, predicate: PredicateData): DeletePatch<Relation> => ({ op: 'delete', relation: relationRef, predicate });
 export const deleteExact = <Relation extends RelationRef>(relationRef: Relation, rowValue: Partial<RelationRow<Relation>>): DeleteExactPatch<Relation> => ({ op: 'deleteExact', relation: relationRef, row: rowValue });
 export const replaceAll = <Relation extends RelationRef>(relationRef: Relation, rows: readonly RelationRow<Relation>[]): ReplaceAllPatch<Relation> => ({ op: 'replaceAll', relation: relationRef, rows });
-export function seed<Schema extends RelationSchema>(_schema: Schema, _rows: SchemaSeedInput<Schema>): SchemaSeedPatches<Schema> {
-  throw notImplemented('seed');
+export function seed<Schema extends RelationSchema>(schemaValue: Schema, rows: SchemaSeedInput<Schema>): SchemaSeedPatches<Schema> {
+  const patches: WritePatch[] = [];
+  for (const [name, relationRef] of Object.entries(schemaValue)) {
+    const relationRows = rows[name as keyof Schema] as readonly RelationRow<RelationRef>[] | undefined;
+    if (relationRows === undefined) continue;
+    for (const rowValue of relationRows) {
+      patches.push(insert(relationRef, rowValue));
+    }
+  }
+  return patches as unknown as SchemaSeedPatches<Schema>;
 }
 export const write = <Relation extends RelationRef>(relationRef: Relation): RelationWriter<Relation> => ({
   insert: (rowValue) => insert(relationRef, rowValue),
@@ -1201,7 +1521,27 @@ export const fk = (
 });
 export const unique = (query: Query | RelationRef, ...fields: readonly string[]): UniqueConstraintData => ({ op: 'unique', query, fields });
 export const constrain = (...constraints: readonly ConstraintData[]): ConstraintSet => constraints;
-export const validateConstraints = async (): Promise<ConstraintValidationResult> => ({ valid: false, diagnostics: [stubDiagnostic('validateConstraints')] });
+export async function validateConstraints(dbValue: Db | RelationSource, constraints: ConstraintValidationInput, options?: ConstraintValidationOptions): Promise<ConstraintValidationResult>;
+export async function validateConstraints(constraints: ConstraintValidationInput, options?: ConstraintValidationOptions): Promise<ConstraintValidationResult>;
+export async function validateConstraints(
+  dbOrConstraints: Db | RelationSource | ConstraintValidationInput,
+  constraintsOrOptions?: ConstraintValidationInput | ConstraintValidationOptions,
+  maybeOptions: ConstraintValidationOptions = {}
+): Promise<ConstraintValidationResult> {
+  if (isDb(dbOrConstraints) || isRelationSource(dbOrConstraints)) {
+    return validateConstraintsSync(dbOrConstraints, constraintsOrOptions as ConstraintValidationInput, maybeOptions);
+  }
+
+  return {
+    valid: false,
+    diagnostics: [{
+      code: 'constraint_failed',
+      severity: 'error',
+      message: 'validateConstraints requires a Db or RelationSource as its first argument',
+      surface: 'validateConstraints'
+    }]
+  };
+}
 
 /**
  * Placeholder for any db-like value that can carry materializations. The
@@ -1295,40 +1635,247 @@ export type MaterializationTarget<Row = unknown> =
   | ConstraintSet
   | MaterializationMetadata<Row>;
 
-export function mat<DbValue extends object>(dbValue: DbValue, ..._inputs: readonly MaterializationInput[]): DbValue & MaterializedDb {
-  return dbValue as DbValue & MaterializedDb;
+export function mat<DbValue extends object>(dbValue: DbValue, ...inputs: readonly MaterializationInput[]): DbValue & MaterializedDb {
+  const current = materializedStateFor(dbValue);
+  let state: InternalMaterializationState = {
+    metadata: [...current.metadata],
+    rows: new Map(current.rows),
+    constraints: [...current.constraints]
+  };
+
+  for (const input of inputs) {
+    state = addMaterializationInput(dbValue, state, input);
+  }
+
+  return withMaterializedState(dbValue, state) as DbValue & MaterializedDb;
 }
 export async function materializeSnapshot<DbValue extends SnapshotMaterializationTarget, Row>(
   dbValue: DbValue,
-  _query: Query<Row>,
-  _options: SnapshotMaterializationOptions = {}
+  query: Query<Row>,
+  options: SnapshotMaterializationOptions = {}
 ): Promise<DbValue & MaterializedDb> {
-  return dbValue as DbValue & MaterializedDb;
+  return mat(dbValue, materializationMetadata(query, options));
 }
-export const demat = <DbValue extends MaterializableDb>(dbValue: DbValue, ..._targets: readonly MaterializationTarget[]): DbValue => dbValue;
+export const demat = <DbValue extends MaterializableDb>(dbValue: DbValue, ...targets: readonly MaterializationTarget[]): DbValue => {
+  const current = materializedStateFor(dbValue);
+  if (current.metadata.length === 0 && current.constraints.length === 0) return dbValue;
+
+  if (targets.length === 0) {
+    return withMaterializedState(dbValue, emptyMaterializationState()) as DbValue;
+  }
+
+  const metadataIds = new Set<string>();
+  const constraintKeys = new Set<string>();
+
+  for (const target of targets) {
+    if (typeof target === 'string') {
+      metadataIds.add(target);
+      continue;
+    }
+    if (isQuery(target)) {
+      metadataIds.add(materializationIdForQuery(target));
+      continue;
+    }
+    if (isMaterializationMetadata(target)) {
+      metadataIds.add(target.id);
+      continue;
+    }
+    for (const constraint of flattenConstraints(target as ConstraintValidationInput)) {
+      constraintKeys.add(constraintKey(constraint));
+    }
+  }
+
+  const rows = new Map(current.rows);
+  for (const id of metadataIds) rows.delete(id);
+
+  return withMaterializedState(dbValue, {
+    metadata: current.metadata.filter((item) => !metadataIds.has(item.id)),
+    rows,
+    constraints: current.constraints.filter((item) => !constraintKeys.has(constraintKey(item)))
+  }) as DbValue;
+};
 export const isMaterialized = (input: unknown): input is MaterializedDb => isRecord(input) && 'materialized' in input;
-export const materializationsFor = (_input: unknown): readonly MaterializationMetadata[] => [];
-export const materializationForQuery = <Row = unknown>(_input: unknown, _query: Query<Row>): MaterializationMetadata<Row> | undefined => undefined;
-export const materializedRowsFor = <Row = unknown>(_input: unknown, _id: string): readonly Row[] | undefined => undefined;
-export const materializedRowsForQuery = <Row = unknown>(_input: unknown, _query: Query<Row>): readonly Row[] | undefined => undefined;
-export function readMaterializedQuery<Row>(_input: unknown, _query: Query<Row>): MaterializedQueryResult<Row> {
-  throw notImplemented('readMaterializedQuery');
+export const materializationsFor = (input: unknown): readonly MaterializationMetadata[] => materializedStateFor(input).metadata;
+export const materializationForQuery = <Row = unknown>(input: unknown, query: Query<Row>): MaterializationMetadata<Row> | undefined =>
+  materializationsFor(input).find((item) => item.queryKey === queryKey(query)) as MaterializationMetadata<Row> | undefined;
+export const materializedRowsFor = <Row = unknown>(input: unknown, id: string): readonly Row[] | undefined =>
+  materializedStateFor(input).rows.get(id) as readonly Row[] | undefined;
+export const materializedRowsForQuery = <Row = unknown>(input: unknown, query: Query<Row>): readonly Row[] | undefined => {
+  const metadata = materializationForQuery(input, query);
+  return metadata === undefined ? undefined : materializedRowsFor<Row>(input, metadata.id);
+};
+export function readMaterializedQuery<Row>(input: unknown, query: Query<Row>): MaterializedQueryResult<Row> {
+  const rows = materializedRowsForQuery<Row>(input, query);
+  if (rows !== undefined) return { rows, diagnostics: [], materialized: true };
+  if (isDb(input)) return { ...qResult(input, query), materialized: false };
+  if (isRelationSource(input)) return { ...evaluate(input, query), materialized: false };
+  return {
+    rows: [],
+    diagnostics: [{
+      code: 'materialization_missing',
+      severity: 'error',
+      message: 'materialized query is not available',
+      surface: 'readMaterializedQuery'
+    }],
+    materialized: false
+  };
 }
-export const materializedSourceFor = (_input: unknown): RelationSource | undefined => undefined;
-export const materializedLookupRowsFor = (): readonly unknown[] | undefined => undefined;
-export const maintainMaterializationSnapshots = (): MaterializationMaintenanceResult => emptyMaintenance();
-export const explainMaterialization = <Row>(query: Query<Row>): MaterializationExplanation<Row> => ({ query, supported: false, diagnostics: [stubDiagnostic('explainMaterialization')] });
+export const materializedSourceFor = (input: unknown): RelationSource | undefined => {
+  const state = materializedStateFor(input);
+  if (state.metadata.length === 0) return undefined;
+  const data = Object.fromEntries(state.metadata.map((item) => [item.id, state.rows.get(item.id) ?? []]));
+  return fromObjectSource(data);
+};
+export const materializedLookupRowsFor = <Row = unknown>(input?: unknown, id?: string): readonly Row[] | undefined =>
+  input === undefined || id === undefined ? undefined : materializedRowsFor<Row>(input, id);
+export function maintainMaterializationSnapshots<Row = unknown>(
+  before?: unknown,
+  after?: unknown,
+  options: MaterializationMaintenanceOptions = {}
+): MaterializationMaintenanceResult<Row> {
+  const beforeState = materializedStateFor(before);
+  const target = after ?? before;
+  if (beforeState.metadata.length === 0 || target === undefined) {
+    return { maintained: 0, recomputed: 0, carried: 0, skipped: 0, changes: [], diagnostics: [] };
+  }
+
+  const changes: MaterializationMaintenanceChange<Row>[] = [];
+  const touchedDependencies = relationDeltaNames(options.deltas ?? []);
+
+  for (const metadata of beforeState.metadata) {
+    const previousRows = beforeState.rows.get(metadata.id) as readonly Row[] | undefined;
+    const dependencies = relationDependencies(metadata.query);
+    const touched = dependencies.filter((name) => touchedDependencies.includes(name));
+    if (previousRows !== undefined && options.deltas !== undefined && touched.length === 0) {
+      changes.push({
+        update: 'carried',
+        recomputed: false,
+        reason: 'dependencies unchanged',
+        id: metadata.id,
+        queryKey: metadata.queryKey,
+        query: metadata.query as Query<Row>,
+        maintenance: metadata.mode,
+        dependencies,
+        touchedDependencies: [],
+        envDependencies: queryEnvDependencies(metadata.query),
+        touchedEnvDependencies: [],
+        indexSpecs: [],
+        previousRowsAvailable: true,
+        previousRows,
+        rows: previousRows,
+        added: [],
+        removed: [],
+        rowChanges: [],
+        diagnostics: []
+      });
+      continue;
+    }
+
+    const refresh = refreshMaterializationRows<Row>(target, metadata.query as Query<Row>);
+    const diff = diffRows(previousRows ?? [], refresh.rows);
+    const added = diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
+    const removed = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+
+    changes.push({
+      update: 'recomputed',
+      recomputed: true,
+      reason: 'snapshot recompute',
+      id: metadata.id,
+      queryKey: metadata.queryKey,
+      query: metadata.query as Query<Row>,
+      maintenance: metadata.mode,
+      dependencies,
+      touchedDependencies: touched,
+      envDependencies: queryEnvDependencies(metadata.query),
+      touchedEnvDependencies: [],
+      indexSpecs: [],
+      previousRowsAvailable: previousRows !== undefined,
+      previousRows,
+      rows: refresh.rows,
+      added,
+      removed,
+      rowChanges: diff.changes,
+      diagnostics: [...refresh.diagnostics, ...diff.diagnostics]
+    });
+  }
+
+  return {
+    maintained: changes.length,
+    recomputed: changes.filter((change) => change.recomputed).length,
+    carried: changes.filter((change) => change.update === 'carried').length,
+    skipped: 0,
+    changes,
+    diagnostics: changes.flatMap((change) => change.diagnostics)
+  };
+}
+export const explainMaterialization = <Row>(query: Query<Row>): MaterializationExplanation<Row> => ({ query, supported: true, diagnostics: [] });
 export const index = <Row = unknown>(): MaterializationIndex<Row> => ({});
 
 export type MemoryRelationRuntimeOptions = { readonly relationNames?: readonly string[] };
 export function createMemoryRelationRuntime(data: DbInputData = {}, options: MemoryRelationRuntimeOptions = {}): RelationRuntime<number> {
+  let dbValue = createDb(data);
+  let version = 0;
+  const listeners = new Set<() => void>();
+  const relationNames = options.relationNames ?? Object.keys(data);
+  const source = (): AdapterSource<number> => ({
+    ...fromObjectSource(dbValue.data),
+    relationNames,
+    version: () => version
+  });
+  const notify = (): void => {
+    for (const listener of listeners) listener();
+  };
+
   return {
-    source: { ...fromObjectSource(data), version: () => 0 },
-    target: {
-      relationNames: options.relationNames ?? Object.keys(data),
-      apply: (patches) => ({ status: 'rejected', patches: patches.length, applied: 0, deltas: [], diagnostics: [stubDiagnostic('createMemoryRelationRuntime')] })
+    source: {
+      relationNames,
+      rows: (relationRef) => dbValue.data[relationRef.name] ?? [],
+      lookup: (lookupValue) => fromObjectSource(dbValue.data).lookup?.(lookupValue),
+      rangeLookup: (lookupValue) => fromObjectSource(dbValue.data).rangeLookup?.(lookupValue),
+      version: () => version
     },
-    snapshot: () => ({ source: { ...fromObjectSource(data), version: () => 0 }, version: 0 })
+    target: {
+      relationNames,
+      apply: (patches) => {
+        const patchList = Array.from(patches);
+        let nextDb = dbValue;
+        let applied = 0;
+        const diagnostics: TarstateDiagnostic[] = [];
+        const deltas: RelationDelta[] = [];
+
+        for (const patch of patchList) {
+          const result = applyWritePatchToDb(nextDb, patch);
+          diagnostics.push(...result.diagnostics);
+          if (result.diagnostics.some(isErrorDiagnostic)) {
+            return { status: 'rejected', patches: patchList.length, applied: 0, deltas: [], diagnostics, version };
+          }
+          nextDb = result.db;
+          applied += result.applied;
+          deltas.push(...result.deltas);
+        }
+
+        dbValue = nextDb;
+        version += 1;
+        notify();
+
+        return {
+          status: 'accepted',
+          patches: patchList.length,
+          applied,
+          deltas,
+          diagnostics,
+          version,
+          durability: 'memory'
+        };
+      }
+    },
+    snapshot: () => ({ source: source(), version }),
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    }
   };
 }
 
@@ -1406,10 +1953,10 @@ export type StoreRuntimeInput<Version = unknown> = TarstateDiagnosticOptions & {
 
 export function createStore(input: StoreSeedInput = createDb()): Store {
   const state = isDb(input) ? input : createDb(input);
-  return createStubStore(state);
+  return createDbBackedStore(state);
 }
-export function createRuntimeStore<Version>(_input: StoreRuntimeInput<Version>): Store<Version> {
-  return createStubStore(createDb()) as Store<Version>;
+export function createRuntimeStore<Version>(input: StoreRuntimeInput<Version>): Store<Version> {
+  return createRuntimeBackedStore(input);
 }
 
 export type WatchDb = Db | RelationSource;
@@ -1477,33 +2024,118 @@ export type QueryDiff<Row = unknown> = {
   readonly diagnostics: readonly QueryDiffDiagnostic<Row>[];
 };
 
-export function attachWatches<DbValue extends Db>(dbValue: DbValue, ..._targets: readonly WatchTarget[]): DbValue {
-  return dbValue;
+export function attachWatches<DbValue extends Db>(dbValue: DbValue, ...targets: readonly WatchTarget[]): DbValue {
+  return withAttachedWatchTargets(dbValue, uniqueWatchTargets([...attachedWatchTargetsFor(dbValue), ...targets]));
 }
-export function watch<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, _listener: WatchListener<Row>, options: WatchOptions<Row> = {}): WatchHandle<DbValue, Row> {
-  return createWatchHandle(dbValue, target, options);
+export function watch<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, listener: WatchListener<Row>, options: WatchOptions<Row> = {}): WatchHandle<DbValue, Row> {
+  const handle = createWatchHandle(dbValue, target, options);
+  subscribeWatch(handle, listener);
+  if (options.immediate === true) void handle.refresh(dbValue);
+  return handle;
 }
 export const watchTarget = <DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, options: WatchOptions<Row> = {}): WatchTargetRegistration<DbValue, Row> => {
   const handle = createWatchHandle(dbValue, target, options);
   return { db: dbValue, target, handle, supported: true, diagnostics: [], unwatch: handle.unwatch };
 };
-export const unwatchTarget = (_registration: Pick<WatchTargetRegistration, 'handle'> | Pick<WatchHandle, 'id'>): UnwatchResult => ({ id: 'watch', closed: true, diagnostics: [] });
-export const watchChangeMap = <Row>(_changes: Iterable<TrackedChange<Row>>): WatchChangeMap<Row> => new Map();
-export const watchChangeKeyMap = <Row>(_changes: Iterable<TrackedChange<Row>>): WatchChangeKeyMap<Row> => new Map();
+export const unwatchTarget = (registration: Pick<WatchTargetRegistration, 'handle'> | Pick<WatchHandle, 'id'>): UnwatchResult =>
+  'handle' in registration ? registration.handle.unwatch() : unwatch(registration);
+export const watchChangeMap = <Row>(changes: Iterable<TrackedChange<Row>>): WatchChangeMap<Row> =>
+  new Map(Array.from(changes, (change) => [change.target, change as WatchTargetChange<Row>]));
+export const watchChangeKeyMap = <Row>(changes: Iterable<TrackedChange<Row>>): WatchChangeKeyMap<Row> =>
+  new Map(Array.from(changes, (change) => [change.targetKey, change as WatchTargetChange<Row>]));
 export const watchTargetKey = (target: WatchTarget): string => isQuery(target) ? queryKey(target) : `relation:${target.name}`;
 export const isWatchMaterialization = (): boolean => false;
 export const watchRuntime = <Version, Row>(runtime: RelationRuntime<Version>, target: WatchTarget<Row>, listener: WatchListener<Row>, options: WatchOptions<Row> = {}): RuntimeWatchHandle<Row> =>
   watch(runtime.source, target, listener, options) as RuntimeWatchHandle<Row>;
-export const unwatch = (_handle: Pick<WatchHandle, 'id'>): UnwatchResult => ({ id: _handle.id, closed: true, diagnostics: [] });
-export const subscribeWatch = <Row>(_handle: Pick<WatchHandle<WatchDb, Row>, 'id' | 'supported' | 'target'>, _listener: WatchListener<Row>): WatchSubscription =>
-  ({ id: _handle.id, active: false, diagnostics: [watchDiagnostic('subscribeWatch')], unsubscribe: () => ({ id: _handle.id, unsubscribed: false, diagnostics: [] }) });
-export async function diffQuery<Row>(_before: WatchDb, _after: WatchDb, target: Query<Row>): Promise<QueryDiff<Row>> {
-  return { target, queryKey: queryKey(target), beforeRows: [], afterRows: [], changed: false, added: [], removed: [], unchanged: [], rowChanges: [], diagnostics: [stubDiagnostic('diffQuery')] };
+export const unwatch = (handle: Pick<WatchHandle, 'id'>): UnwatchResult => {
+  const state = WATCH_STATES.get(handle.id);
+  if (state === undefined) return { id: handle.id, closed: false, diagnostics: [] };
+  state.active = false;
+  state.listeners.clear();
+  WATCH_STATES.delete(handle.id);
+  return { id: handle.id, closed: true, diagnostics: [] };
+};
+export const subscribeWatch = <Row>(handle: Pick<WatchHandle<WatchDb, Row>, 'id' | 'supported' | 'target'>, listener: WatchListener<Row>): WatchSubscription => {
+  const state = WATCH_STATES.get(handle.id);
+  if (state === undefined || !handle.supported) {
+    return {
+      id: handle.id,
+      active: false,
+      diagnostics: [watchDiagnostic('subscribeWatch')],
+      unsubscribe: () => ({ id: handle.id, unsubscribed: false, diagnostics: [] })
+    };
+  }
+
+  state.listeners.add(listener as WatchListener<unknown>);
+  let active = true;
+  return {
+    id: handle.id,
+    active,
+    diagnostics: [],
+    unsubscribe: () => {
+      if (!active) return { id: handle.id, unsubscribed: false, diagnostics: [] };
+      active = false;
+      state.listeners.delete(listener as WatchListener<unknown>);
+      return { id: handle.id, unsubscribed: true, diagnostics: [] };
+    }
+  };
+};
+export async function diffQuery<Row>(before: WatchDb, after: WatchDb, target: Query<Row>, options: QueryDiffOptions<Row> = {}): Promise<QueryDiff<Row>> {
+  const beforeResult = readWatchTargetRows(before, target, options);
+  const afterResult = readWatchTargetRows(after, target, options);
+  const diff = diffRows(beforeResult.rows, afterResult.rows, options);
+  const added = diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
+  const removed = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+  const changedKeys = new Set(diff.changes.map((change) => change.key));
+  const unchanged = afterResult.rows.filter((rowValue) => !changedKeys.has(rowDiffKey(rowValue, options)));
+
+  return {
+    target,
+    queryKey: queryKey(target),
+    beforeRows: beforeResult.rows,
+    afterRows: afterResult.rows,
+    changed: diff.changes.length > 0,
+    added,
+    removed,
+    unchanged,
+    rowChanges: diff.changes,
+    diagnostics: [...beforeResult.diagnostics, ...afterResult.diagnostics, ...diff.diagnostics]
+  };
 }
 export const diffOptionsForTarget = <Row>(_target: WatchTarget<Row>, options: WatchOptions<Row>): RowDiffOptions<Row> => options;
 export const transferWatches = (): void => {};
-export async function trackedChangesForDbTransition(): Promise<{ readonly changes: readonly TrackedChange[]; readonly diagnostics: readonly WatchRuntimeDiagnostic[] }> {
-  return { changes: [], diagnostics: [stubDiagnostic('trackedChangesForDbTransition')] };
+export async function trackedChangesForDbTransition<DbValue extends WatchDb = WatchDb>(
+  before?: DbValue,
+  after?: DbValue,
+  targets: readonly WatchTarget[] = []
+): Promise<{ readonly changes: readonly TrackedChange[]; readonly diagnostics: readonly WatchRuntimeDiagnostic[] }> {
+  if (before === undefined || after === undefined) return { changes: [], diagnostics: [] };
+  const changes: TrackedChange[] = [];
+  const diagnostics: WatchRuntimeDiagnostic[] = [];
+  const effectiveTargets = targets.length > 0
+    ? targets
+    : uniqueWatchTargets([...attachedWatchTargetsFor(before), ...materializationsFor(before).map((item) => item.query)]);
+
+  for (const target of effectiveTargets) {
+    const queryTarget = queryForTarget(target);
+    const diff = await diffQuery(before, after, queryTarget);
+    diagnostics.push(...diff.diagnostics);
+    changes.push({
+      id: watchTargetKey(target),
+      targetKey: diff.queryKey,
+      target,
+      changed: diff.changed,
+      previousRows: diff.beforeRows,
+      rows: diff.afterRows,
+      added: diff.added,
+      removed: diff.removed,
+      unchanged: diff.unchanged,
+      rowChanges: diff.rowChanges,
+      diagnostics: diff.diagnostics
+    });
+  }
+
+  return { changes, diagnostics };
 }
 export const trackedChangeFromMaterializationChange = <Row>(change: MaterializationMaintenanceChange<Row>): TrackedChange<Row> =>
   ({ id: change.id, targetKey: change.queryKey, target: change.query, changed: change.rowChanges.length > 0, previousRows: change.previousRows ?? [], rows: change.rows, added: change.added, removed: change.removed, unchanged: [], rowChanges: change.rowChanges, diagnostics: change.diagnostics });
@@ -1569,50 +2201,273 @@ export class UnsupportedChangeTrackingError extends Error {
   readonly code = 'change_tracking_unsupported';
 }
 
-export async function trackTransact<DbValue extends WatchDb>(_db: DbValue, ..._inputs: readonly unknown[]): Promise<TrackTransactResult<DbValue>> {
-  throw notImplemented('trackTransact');
-}
-export async function trackRuntimeCommit<Version>(_runtime: RelationRuntime<Version>, _patches: Iterable<WritePatch>, _options: TrackRuntimeCommitOptions = {}): Promise<TrackRuntimeCommitResult<Version>> {
-  throw notImplemented('trackRuntimeCommit');
-}
+export async function trackTransact<DbValue extends WatchDb>(dbValue: DbValue, ...inputs: readonly unknown[]): Promise<TrackTransactResult<DbValue>> {
+  const options = trackOptionsFromInputs(inputs);
+  if (!isDb(dbValue)) {
+    if (options.throwOnUnsupported === true) throw new UnsupportedChangeTrackingError('change tracking requires a Db input');
+    return unsupportedTrackTransactResult(dbValue, options);
+  }
 
-function createStubStore<Version = unknown>(state: Db): Store<Version> {
-  let revision = 0;
-  const snapshot = (): StoreSnapshot<Version> => ({ db: state, source: dbSource(state), revision, diagnostics: [] });
+  const transactionInputs = inputs.filter((input): input is DbTransactionInput => !isTrackTransactOptions(input));
+  const result = transactionInputs.length === 1 && typeof transactionInputs[0] === 'function'
+    ? tryTransact(dbValue, transactionInputs[0])
+    : tryTransact(dbValue, ...(transactionInputs as DbTransactionInputs));
+  const nextDb = result.committed ? result.db : dbValue;
+  const tracked = await trackedChangesForDbTransition(dbValue, nextDb);
+
   return {
-    getSnapshot: snapshot,
-    subscribe: () => () => {},
-    query: (queryValue, options) => ({ ...qResult(state, queryValue, options), revision }),
-    queries: () => {
-      throw notImplemented('store.queries');
-    },
-    whatIf: () => {
-      throw notImplemented('store.whatIf');
-    },
-    view: (queryValue) => createStubView(queryValue, snapshot),
-    commit: async (inputOrInputs, _options = {}) => {
-      const inputs = normalizeTransactionInputs(inputOrInputs);
-      revision += 1;
-      return {
-        status: 'rejected',
-        reflected: false,
-        effects: { patches: inputs.length, applied: 0, deltas: [], diagnostics: [stubDiagnostic('store.commit')] },
-        snapshot: snapshot(),
-        diagnostics: [stubDiagnostic('store.commit')]
-      };
-    },
-    refresh: async () => snapshot(),
-    close: () => {}
+    db: nextDb as DbValue,
+    result,
+    supported: true,
+    changes: tracked.changes,
+    changeMap: watchChangeMap(tracked.changes),
+    changesByTarget: watchChangeMap(tracked.changes),
+    changesByTargetKey: watchChangeKeyMap(tracked.changes),
+    changesByQueryKey: Object.fromEntries(tracked.changes.map((change) => [change.targetKey, toTrackChangeView(change)])),
+    deltas: result.deltas,
+    ...(result.materializations === undefined ? {} : { materializations: result.materializations }),
+    diagnostics: [...result.diagnostics, ...tracked.diagnostics],
+    ...(options.label === undefined ? {} : { label: options.label })
+  };
+}
+export async function trackRuntimeCommit<Version>(runtime: RelationRuntime<Version>, patches: Iterable<WritePatch>, options: TrackRuntimeCommitOptions = {}): Promise<TrackRuntimeCommitResult<Version>> {
+  if (runtime.target === undefined) {
+    if (options.throwOnUnsupported === true) throw new UnsupportedChangeTrackingError('runtime does not expose a writable target');
+    return {
+      runtime,
+      source: runtime.source,
+      supported: false,
+      status: 'rejected',
+      patches: 0,
+      applied: 0,
+      changes: [],
+      changeMap: new Map(),
+      changesByTarget: new Map(),
+      changesByTargetKey: new Map(),
+      deltas: [],
+      diagnostics: [{
+        code: 'change_tracking_unsupported',
+        severity: 'error',
+        message: 'runtime does not expose a writable target',
+        surface: 'trackRuntimeCommit'
+      }],
+      ...(options.label === undefined ? {} : { label: options.label })
+    };
+  }
+
+  const beforeSource = runtime.snapshot?.().source ?? runtime.source;
+  const report = await tryApplyRelationPatches(runtime, patches, options);
+  const afterSource = report.source;
+  const relationTargets = relationDeltaNames(report.deltas)
+    .map((name) => relationFromSourceName(name))
+    .filter((relationRef): relationRef is RelationRef => relationRef !== undefined);
+  const tracked = await trackedChangesForDbTransition(beforeSource, afterSource, relationTargets);
+
+  return {
+    runtime,
+    source: afterSource,
+    supported: true,
+    status: report.status,
+    patches: report.patches,
+    applied: report.applied,
+    changes: tracked.changes,
+    changeMap: watchChangeMap(tracked.changes),
+    changesByTarget: watchChangeMap(tracked.changes),
+    changesByTargetKey: watchChangeKeyMap(tracked.changes),
+    deltas: report.deltas,
+    diagnostics: [...report.diagnostics, ...tracked.diagnostics],
+    ...(report.version === undefined ? {} : { version: report.version }),
+    ...(report.durability === undefined ? {} : { durability: report.durability }),
+    ...(options.label === undefined ? {} : { label: options.label })
   };
 }
 
-function createStubView<Row, Version>(queryValue: Query<Row>, snapshot: () => StoreSnapshot<Version>): StoreView<Row, Version> {
+function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version> {
+  let state = initialState;
+  let revision = 0;
+  let closed = false;
+  const listeners = new Set<() => void>();
+  const snapshot = (): StoreSnapshot<Version> => ({ db: state, source: dbSource(state), revision, diagnostics: [] });
+  const notify = (): void => {
+    if (closed) return;
+    for (const listener of listeners) listener();
+  };
+
+  return {
+    getSnapshot: snapshot,
+    subscribe: (listener) => {
+      if (closed) return () => {};
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    query: (queryValue, options) => ({ ...qResult(state, queryValue, options), revision }),
+    queries: (queries, options) => addRevisionToBatch(qManyResult(state, queries, options), revision),
+    whatIf: ((queryValue: Query<unknown> | RelationRef | QueryBatch, ...inputs: DbTransactionInputs) => {
+      if (isQueryBatch(queryValue)) return addRevisionToBatch(whatIf(state, queryValue, ...inputs), revision);
+      return { ...whatIf(state, queryValue, ...inputs), revision };
+    }) as StoreWhatIf,
+    view: (queryValue) => createStoreView(queryValue, snapshot, (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    }),
+    commit: async (inputOrInputs, _options = {}) => {
+      if (closed) {
+        const closedSnapshot = snapshot();
+        const diagnostics: readonly TarstateDiagnostic[] = [{
+          code: 'runtime_unsupported',
+          severity: 'error',
+          message: 'store is closed',
+          surface: 'store.commit'
+        }];
+        return {
+          status: 'rejected',
+          reflected: false,
+          effects: { patches: 0, applied: 0, deltas: [], diagnostics },
+          snapshot: closedSnapshot,
+          diagnostics
+        };
+      }
+
+      const result = tryTransact(state, ...normalizeTransactionInputs(inputOrInputs));
+      if (result.committed) {
+        state = result.db;
+        revision += 1;
+        notify();
+      }
+
+      return {
+        status: result.committed ? 'accepted' : 'rejected',
+        reflected: result.committed,
+        effects: {
+          patches: result.patches,
+          applied: result.applied,
+          deltas: result.deltas,
+          diagnostics: result.diagnostics
+        },
+        snapshot: snapshot(),
+        diagnostics: result.diagnostics
+      };
+    },
+    refresh: async () => snapshot(),
+    close: () => {
+      closed = true;
+      listeners.clear();
+    }
+  };
+}
+
+function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): Store<Version> {
+  let revision = 0;
+  let closed = false;
+  const listeners = new Set<() => void>();
+  let state = dbFromRuntime(input.runtime, input.relations, input.env);
+  let version = input.runtime.source.version?.();
+  const snapshot = (): StoreSnapshot<Version> => ({
+    db: state,
+    source: input.runtime.source,
+    revision,
+    diagnostics: input.runtime.source.diagnostics?.() ?? [],
+    ...(version === undefined ? {} : { version })
+  });
+  const refreshFromRuntime = (): StoreSnapshot<Version> => {
+    const runtimeSnapshot = input.runtime.snapshot?.();
+    const source = runtimeSnapshot?.source ?? input.runtime.source;
+    version = runtimeSnapshot?.version ?? source.version?.();
+    state = dbFromSource(source, input.relations, state.env);
+    revision += 1;
+    for (const listener of listeners) listener();
+    return {
+      db: state,
+      source,
+      revision,
+      diagnostics: runtimeSnapshot?.diagnostics ?? source.diagnostics?.() ?? [],
+      ...(version === undefined ? {} : { version })
+    };
+  };
+  const runtimeUnsubscribe = input.runtime.subscribe?.(() => {
+    if (!closed) refreshFromRuntime();
+  });
+
+  return {
+    getSnapshot: snapshot,
+    subscribe: (listener) => {
+      if (closed) return () => {};
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    query: (queryValue, options) => ({ ...qResult(state, queryValue, options), revision }),
+    queries: (queries, options) => addRevisionToBatch(qManyResult(state, queries, options), revision),
+    whatIf: ((queryValue: Query<unknown> | RelationRef | QueryBatch, ...inputs: DbTransactionInputs) => {
+      if (isQueryBatch(queryValue)) return addRevisionToBatch(whatIf(state, queryValue, ...inputs), revision);
+      return { ...whatIf(state, queryValue, ...inputs), revision };
+    }) as StoreWhatIf,
+    view: (queryValue) => createStoreView(queryValue, snapshot, (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    }),
+    commit: async (inputOrInputs) => {
+      const transactionResult = tryTransact(state, ...normalizeTransactionInputs(inputOrInputs));
+      if (!transactionResult.committed) {
+        return {
+          status: 'rejected',
+          reflected: false,
+          effects: {
+            patches: transactionResult.patches,
+            applied: 0,
+            deltas: [],
+            diagnostics: transactionResult.diagnostics
+          },
+          snapshot: snapshot(),
+          diagnostics: transactionResult.diagnostics
+        };
+      }
+
+      const report = await tryApplyRelationPatches(input.runtime, transactionResult.deltas.flatMap(deltaToPatches), { readVersion: true });
+      const nextSnapshot = refreshFromRuntime();
+      return {
+        status: report.status,
+        reflected: report.status !== 'rejected',
+        effects: {
+          patches: report.patches,
+          applied: report.applied,
+          deltas: report.deltas,
+          diagnostics: report.diagnostics,
+          ...(report.version === undefined ? {} : { version: report.version }),
+          ...(report.durability === undefined ? {} : { durability: report.durability })
+        },
+        snapshot: nextSnapshot,
+        diagnostics: report.diagnostics
+      };
+    },
+    refresh: async () => refreshFromRuntime(),
+    close: () => {
+      closed = true;
+      runtimeUnsubscribe?.();
+      listeners.clear();
+    }
+  };
+}
+
+function createStoreView<Row, Version>(
+  queryValue: Query<Row>,
+  snapshot: () => StoreSnapshot<Version>,
+  subscribeStore: (listener: () => void) => () => void
+): StoreView<Row, Version> {
   const key = queryKey(queryValue);
   const viewSnapshot = (): StoreViewSnapshot<Row, Version> => {
     const current = snapshot();
+    const result = qResult(current.db, queryValue);
     return {
-      rows: [],
-      diagnostics: [stubDiagnostic('store.view')],
+      rows: result.rows,
+      diagnostics: [...current.diagnostics, ...result.diagnostics],
       revision: current.revision,
       queryKey: key,
       ...(current.version === undefined ? {} : { version: current.version })
@@ -1622,23 +2477,1837 @@ function createStubView<Row, Version>(queryValue: Query<Row>, snapshot: () => St
     query: queryValue,
     queryKey: key,
     getSnapshot: viewSnapshot,
-    subscribe: () => () => {},
+    subscribe: subscribeStore,
     refresh: async () => viewSnapshot()
   };
 }
 
 function createWatchHandle<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, options: WatchOptions<Row>): WatchHandle<DbValue, Row> {
+  const id = options.label ?? `watch:${WATCH_ID += 1}`;
+  const initial = readWatchTargetRows(dbValue, target, options);
+  const state: InternalWatchState<Row> = {
+    id,
+    target,
+    db: dbValue,
+    previousRows: initial.rows,
+    listeners: new Set(),
+    active: true,
+    options
+  };
+  WATCH_STATES.set(id, state as InternalWatchState<unknown>);
+
   return {
-    id: options.label ?? 'watch',
+    id,
     db: dbValue,
     target,
     supported: true,
     mode: 'db',
-    diagnostics: [watchDiagnostic('watch')],
-    refresh: async () => ({ id: options.label ?? 'watch', targetKey: watchTargetKey(target), target, delivered: false, changed: false, previousRows: [], rows: [], added: [], removed: [], unchanged: [], rowChanges: [], diagnostics: [watchDiagnostic('watch.refresh')] }),
-    unwatch: () => ({ id: options.label ?? 'watch', closed: true, diagnostics: [] }),
+    diagnostics: initial.diagnostics.map(toWatchDiagnostic),
+    refresh: async (nextDb) => {
+      const currentState = WATCH_STATES.get(id) as InternalWatchState<Row> | undefined;
+      if (currentState === undefined || !currentState.active) {
+        return {
+          id,
+          targetKey: watchTargetKey(target),
+          target,
+          delivered: false,
+          changed: false,
+          previousRows: state.previousRows,
+          rows: state.previousRows,
+          added: [],
+          removed: [],
+          unchanged: state.previousRows,
+          rowChanges: [],
+          diagnostics: []
+        };
+      }
+
+      const currentDb = nextDb ?? currentState.db;
+      currentState.db = currentDb;
+      const next = readWatchTargetRows(currentDb, target, currentState.options);
+      const diff = diffRows(currentState.previousRows, next.rows, currentState.options);
+      const added = diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
+      const removed = diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+      const changedKeys = new Set(diff.changes.map((change) => change.key));
+      const unchanged = next.rows.filter((rowValue) => !changedKeys.has(rowDiffKey(rowValue, currentState.options)));
+      const event: WatchEvent<Row> = {
+        id,
+        targetKey: watchTargetKey(target),
+        target,
+        changed: diff.changes.length > 0,
+        previousRows: currentState.previousRows,
+        rows: next.rows,
+        added,
+        removed,
+        unchanged,
+        rowChanges: diff.changes,
+        changes: { diagnostics: [] },
+        diagnostics: [...next.diagnostics, ...diff.diagnostics]
+      };
+      currentState.previousRows = next.rows;
+      await Promise.all(Array.from(currentState.listeners, (listener) => Promise.resolve(listener(event))));
+      return { ...event, delivered: currentState.listeners.size > 0 };
+    },
+    unwatch: () => unwatch({ id }),
     ...(options.label === undefined ? {} : { label: options.label })
   };
+}
+
+type EvalEntry<Row = unknown> = {
+  row: Row;
+  aliases: Record<string, unknown>;
+};
+
+type WriteApplyResult = {
+  db: Db;
+  applied: number;
+  deltas: readonly RelationDelta[];
+  diagnostics: readonly TarstateDiagnostic[];
+};
+
+type InternalMaterializationState = {
+  metadata: readonly MaterializationMetadata[];
+  rows: ReadonlyMap<string, readonly unknown[]>;
+  constraints: readonly ConstraintData[];
+};
+
+type InternalWatchState<Row = unknown> = {
+  id: string;
+  target: WatchTarget<Row>;
+  db: WatchDb;
+  previousRows: readonly Row[];
+  listeners: Set<WatchListener<Row>>;
+  active: boolean;
+  options: WatchOptions<Row>;
+};
+
+const MATERIALIZATION_STATE = Symbol('tarstate.materializationState');
+const ATTACHED_WATCH_TARGETS = Symbol('tarstate.attachedWatchTargets');
+const EMPTY_MATERIALIZATION_STATE: InternalMaterializationState = Object.freeze({
+  metadata: Object.freeze([]) as readonly MaterializationMetadata[],
+  rows: new Map<string, readonly unknown[]>(),
+  constraints: Object.freeze([]) as readonly ConstraintData[]
+});
+const WATCH_STATES = new Map<string, InternalWatchState<unknown>>();
+let WATCH_ID = 0;
+
+function evaluateQueryData(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  outer: EvalEntry | undefined,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  switch (data.op) {
+    case 'from':
+      return evaluateFrom(source, data, relations, diagnostics);
+    case 'lookup':
+      return evaluateLookup(source, data, relations, diagnostics);
+    case 'constRows':
+      return arrayFromUnknown(data.rows).map((rowValue) => entryForRow(rowValue));
+    case 'where':
+      return evaluateNestedInput(source, data, relations, options, outer, diagnostics)
+        .filter((entry) => Boolean(evaluateExpr(data.predicate, entry, source, relations, options, diagnostics, outer)));
+    case 'project': {
+      const input = evaluateNestedInput(source, data, relations, options, outer, diagnostics);
+      const projection = projectionFrom(data.projection);
+      if (projectionHasAggregate(projection)) {
+        const rowValue = evaluateProjectionAggregate(projection, input, source, relations, options, diagnostics, outer);
+        return [entryForRow(rowValue)];
+      }
+      return input.map((entry) => {
+        const rowValue = evaluateProjection(projection, entry, source, relations, options, diagnostics, outer);
+        return { row: rowValue, aliases: { ...entry.aliases, row: rowValue } };
+      });
+    }
+    case 'extend': {
+      const input = evaluateNestedInput(source, data, relations, options, outer, diagnostics);
+      const projection = projectionFrom(data.projection);
+      return input.map((entry) => {
+        const extension = evaluateProjection(projection, entry, source, relations, options, diagnostics, outer);
+        const rowValue = { ...(isRecord(entry.row) ? entry.row : {}), ...extension };
+        return { row: rowValue, aliases: { ...entry.aliases, row: rowValue } };
+      });
+    }
+    case 'without': {
+      const removed = new Set(stringArray(data.fields));
+      return evaluateNestedInput(source, data, relations, options, outer, diagnostics).map((entry) => {
+        const rowValue: Record<string, unknown> = {};
+        if (isRecord(entry.row)) {
+          for (const [fieldName, fieldValue] of Object.entries(entry.row)) {
+            if (!removed.has(fieldName)) rowValue[fieldName] = fieldValue;
+          }
+        }
+        return { row: rowValue, aliases: { ...entry.aliases, row: rowValue } };
+      });
+    }
+    case 'rename': {
+      const fields = isRecord(data.fields) ? data.fields : {};
+      return evaluateNestedInput(source, data, relations, options, outer, diagnostics).map((entry) => {
+        const rowValue: Record<string, unknown> = {};
+        if (isRecord(entry.row)) {
+          for (const [fieldName, fieldValue] of Object.entries(entry.row)) {
+            const renamed = fields[fieldName];
+            rowValue[typeof renamed === 'string' ? renamed : fieldName] = fieldValue;
+          }
+        }
+        return { row: rowValue, aliases: { ...entry.aliases, row: rowValue } };
+      });
+    }
+    case 'qualify': {
+      const alias = typeof data.alias === 'string' ? data.alias : 'row';
+      return evaluateNestedInput(source, data, relations, options, outer, diagnostics).map((entry) => {
+        const rowValue = { [alias]: entry.row };
+        return { row: rowValue, aliases: { ...entry.aliases, [alias]: entry.row, row: rowValue } };
+      });
+    }
+    case 'expand':
+      return evaluateExpand(source, data, relations, options, outer, diagnostics);
+    case 'join':
+      return evaluateJoin(source, data, relations, options, outer, diagnostics);
+    case 'aggregate':
+      return evaluateAggregate(source, data, relations, options, outer, diagnostics);
+    case 'sort':
+      return sortEntries(evaluateNestedInput(source, data, relations, options, outer, diagnostics), arrayFromUnknown(data.order), source, relations, options, diagnostics, outer);
+    case 'limit':
+      return limitEntries(evaluateNestedInput(source, data, relations, options, outer, diagnostics), data.count, data.offset);
+    case 'sortLimit':
+      return limitEntries(sortEntries(evaluateNestedInput(source, data, relations, options, outer, diagnostics), arrayFromUnknown(data.order), source, relations, options, diagnostics, outer), data.count);
+    case 'union':
+      return setUnionEntries(queryDataArray(data.inputs).map((input) => evaluateQueryData(source, input, relations, options, outer, diagnostics)));
+    case 'intersection':
+      return setIntersectionEntries(queryDataArray(data.inputs).map((input) => evaluateQueryData(source, input, relations, options, outer, diagnostics)));
+    case 'difference':
+      return setDifferenceEntries(
+        evaluateQueryData(source, queryDataFrom(data.left) ?? { op: 'constRows', rows: [] }, relations, options, outer, diagnostics),
+        evaluateQueryData(source, queryDataFrom(data.right) ?? { op: 'constRows', rows: [] }, relations, options, outer, diagnostics)
+      );
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+    case 'keyBy':
+      return evaluateNestedInput(source, data, relations, options, outer, diagnostics);
+    default:
+      diagnostics.push({
+        code: 'query_invalid',
+        severity: 'error',
+        message: `unsupported query op "${data.op}"`,
+        surface: 'evaluate'
+      });
+      return [];
+  }
+}
+
+function evaluateFrom(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const relationName = typeof data.relation === 'string' ? data.relation : undefined;
+  const relationRef = relationName === undefined ? undefined : relations[relationName];
+  if (!isRelationRef(relationRef)) {
+    diagnostics.push(relationMissingDiagnostic(relationName ?? String(data.relation), 'from'));
+    return [];
+  }
+  const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
+  return readRelationRows(source, relationRef, diagnostics).map((rowValue) => entryForRow(rowValue, alias, relationRef.name));
+}
+
+function evaluateLookup(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const relationName = typeof data.relation === 'string' ? data.relation : undefined;
+  const relationRef = relationName === undefined ? undefined : relations[relationName];
+  const fieldName = typeof data.field === 'string' ? data.field : undefined;
+  if (!isRelationRef(relationRef) || fieldName === undefined) {
+    diagnostics.push(relationMissingDiagnostic(relationName ?? String(data.relation), 'lookup'));
+    return [];
+  }
+  const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
+  const lookupRows = source.lookup?.({ relation: relationRef, field: fieldName, value: data.value })
+    ?? source.rows(relationRef).filter((rowValue) => isRecord(rowValue) && Object.is(rowValue[fieldName], data.value));
+  return validateSourceRows(relationRef, lookupRows, diagnostics).map((rowValue) => entryForRow(rowValue, alias, relationRef.name));
+}
+
+function evaluateNestedInput(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  outer: EvalEntry | undefined,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const input = queryDataFrom(data.input);
+  return input === undefined ? [] : evaluateQueryData(source, input, relations, options, outer, diagnostics);
+}
+
+function evaluateJoin(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  outer: EvalEntry | undefined,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const leftData = queryDataFrom(data.left);
+  const rightData = queryDataFrom(data.right);
+  if (leftData === undefined || rightData === undefined) return [];
+  const leftRows = evaluateQueryData(source, leftData, relations, options, outer, diagnostics);
+  const rightRows = evaluateQueryData(source, rightData, relations, options, outer, diagnostics);
+  const rightAlias = typeof data.rightAlias === 'string' ? data.rightAlias : undefined;
+  const rows: EvalEntry[] = [];
+
+  for (const leftEntry of leftRows) {
+    let matched = false;
+    for (const rightEntry of rightRows) {
+      const combined = combineEntries(leftEntry, rightEntry, rightAlias);
+      if (joinMatches(data.on, leftEntry, rightEntry, combined, source, relations, options, diagnostics, outer)) {
+        matched = true;
+        rows.push(combined);
+      }
+    }
+
+    if (!matched && data.kind === 'left') rows.push(leftEntry);
+  }
+
+  return rows;
+}
+
+function evaluateAggregate(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  outer: EvalEntry | undefined,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const input = evaluateNestedInput(source, data, relations, options, outer, diagnostics);
+  const groupProjection = projectionFrom(data.groupBy);
+  const aggregateProjection = projectionFrom(data.aggregates);
+  const groups = new Map<string, { group: Record<string, unknown>; rows: EvalEntry[] }>();
+
+  if (Object.keys(groupProjection).length === 0) {
+    groups.set('[]', { group: {}, rows: [...input] });
+  } else {
+    for (const entry of input) {
+      const group = evaluateProjection(groupProjection, entry, source, relations, options, diagnostics, outer);
+      const key = stableKey(group);
+      const existing = groups.get(key);
+      if (existing === undefined) {
+        groups.set(key, { group, rows: [entry] });
+      } else {
+        existing.rows.push(entry);
+      }
+    }
+  }
+
+  if (input.length === 0 && groups.size === 0) groups.set('[]', { group: {}, rows: [] });
+
+  return Array.from(groups.values()).map(({ group, rows }) => {
+    const aggregateRow = evaluateAggregateProjection(aggregateProjection, rows, source, relations, options, diagnostics, outer);
+    const rowValue = { ...group, ...aggregateRow };
+    return entryForRow(rowValue);
+  });
+}
+
+function evaluateExpand(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  outer: EvalEntry | undefined,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const input = evaluateNestedInput(source, data, relations, options, outer, diagnostics);
+  const collectionExpr = exprFrom(data.collection);
+  const alias = typeof data.as === 'string' ? data.as : undefined;
+  const fields = stringArray(data.fields);
+  const rows: EvalEntry[] = [];
+
+  for (const entry of input) {
+    const collection = evaluateExpr(collectionExpr, entry, source, relations, options, diagnostics, outer);
+    for (const item of iterableValues(collection)) {
+      const extension: Record<string, unknown> = {};
+      if (alias !== undefined) extension[alias] = item;
+      for (const [index, fieldName] of fields.entries()) {
+        extension[fieldName] = Array.isArray(item) ? item[index] : isRecord(item) ? item[fieldName] : undefined;
+      }
+      const rowValue = { ...(isRecord(entry.row) ? entry.row : {}), ...extension };
+      rows.push({
+        row: rowValue,
+        aliases: { ...entry.aliases, ...(alias === undefined ? {} : { [alias]: item }), row: rowValue }
+      });
+    }
+  }
+
+  return rows;
+}
+
+function evaluateProjection(
+  projection: ProjectionData,
+  entry: EvalEntry,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): Record<string, unknown> {
+  const rowValue: Record<string, unknown> = {};
+  for (const [fieldName, projectionExpr] of Object.entries(projection)) {
+    rowValue[fieldName] = evaluateProjectionValue(projectionExpr, entry, source, relations, options, diagnostics, outer);
+  }
+  return rowValue;
+}
+
+function evaluateProjectionAggregate(
+  projection: ProjectionData,
+  rows: readonly EvalEntry[],
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): Record<string, unknown> {
+  const aggregateRows = evaluateAggregateProjection(projection, rows, source, relations, options, diagnostics, outer);
+  const scalarRows = rows[0] === undefined
+    ? {}
+    : evaluateProjection(
+        Object.fromEntries(Object.entries(projection).filter(([, projectionExpr]) => !containsAggregateCall(projectionExpr))) as ProjectionData,
+        rows[0],
+        source,
+        relations,
+        options,
+        diagnostics,
+        outer
+      );
+  return { ...scalarRows, ...aggregateRows };
+}
+
+function evaluateAggregateProjection(
+  projection: ProjectionData,
+  rows: readonly EvalEntry[],
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): Record<string, unknown> {
+  const rowValue: Record<string, unknown> = {};
+  for (const [fieldName, projectionExpr] of Object.entries(projection)) {
+    if (containsAggregateCall(projectionExpr)) {
+      rowValue[fieldName] = evaluateAggregateExpr(projectionExpr, rows, source, relations, options, diagnostics, outer);
+    }
+  }
+  return rowValue;
+}
+
+function evaluateProjectionValue(
+  projectionExpr: ExprData | OptionalProjection,
+  entry: EvalEntry,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): unknown {
+  if (isOptionalProjection(projectionExpr)) {
+    return evaluateExpr(projectionExpr.expr, entry, source, relations, options, diagnostics, outer);
+  }
+  return evaluateExpr(projectionExpr, entry, source, relations, options, diagnostics, outer);
+}
+
+function evaluateExpr(
+  input: unknown,
+  entry: EvalEntry,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): unknown {
+  const data = exprFrom(input);
+  switch (data.op) {
+    case 'value':
+      return data.value;
+    case 'field':
+      return evaluateField(data, entry);
+    case 'env':
+      return typeof data.name === 'string' ? options.env?.[data.name] : undefined;
+    case 'self':
+      return entry.row;
+    case 'maybe':
+      return evaluateExpr(data.expr, entry, source, relations, options, diagnostics, outer);
+    case 'tuple':
+      return arrayFromUnknown(data.values).map((valueData) => evaluateExpr(valueData, entry, source, relations, options, diagnostics, outer));
+    case 'call':
+      return evaluateCall(data, entry, source, relations, options, diagnostics, outer);
+    case 'sel':
+    case 'sel1':
+      return evaluateSelectionExpr(data, entry, source, relations, options, diagnostics, outer);
+    case 'eq':
+      return Object.is(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer));
+    case 'neq':
+      return !Object.is(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer));
+    case 'lt':
+      return compareValues(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer)) < 0;
+    case 'lte':
+      return compareValues(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer)) <= 0;
+    case 'gt':
+      return compareValues(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer)) > 0;
+    case 'gte':
+      return compareValues(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer)) >= 0;
+    case 'and':
+      return arrayFromUnknown(data.predicates).every((predicate) => Boolean(evaluateExpr(predicate, entry, source, relations, options, diagnostics, outer)));
+    case 'or':
+      return arrayFromUnknown(data.predicates).some((predicate) => Boolean(evaluateExpr(predicate, entry, source, relations, options, diagnostics, outer)));
+    case 'not':
+      return !evaluateExpr(data.predicate, entry, source, relations, options, diagnostics, outer);
+    case 'isNull':
+      return evaluateExpr(data.expr, entry, source, relations, options, diagnostics, outer) === null;
+    case 'notNull':
+      return evaluateExpr(data.expr, entry, source, relations, options, diagnostics, outer) !== null
+        && evaluateExpr(data.expr, entry, source, relations, options, diagnostics, outer) !== undefined;
+    case 'isMissing':
+      return evaluateExpr(data.expr, entry, source, relations, options, diagnostics, outer) === undefined;
+    case 'notMissing':
+      return evaluateExpr(data.expr, entry, source, relations, options, diagnostics, outer) !== undefined;
+    case 'aggregateCall':
+      diagnostics.push({
+        code: 'query_invalid',
+        severity: 'warning',
+        message: 'aggregate expression was evaluated outside an aggregate context',
+        surface: 'evaluate'
+      });
+      return undefined;
+    default:
+      return undefined;
+  }
+}
+
+function evaluateAggregateExpr(
+  input: unknown,
+  rows: readonly EvalEntry[],
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): unknown {
+  const data = unwrapOptionalProjection(input);
+  if (!isExpr(data)) return undefined;
+  if (data.op !== 'aggregateCall') {
+    return rows[0] === undefined ? undefined : evaluateExpr(data, rows[0], source, relations, options, diagnostics, outer);
+  }
+
+  const fn = typeof data.fn === 'string' ? data.fn : '';
+  const args = arrayFromUnknown(data.args);
+  const values = (argIndex: number): readonly unknown[] => rows.map((entry) =>
+    evaluateExpr(args[argIndex], entry, source, relations, options, diagnostics, outer));
+
+  switch (fn) {
+    case 'count':
+      return rows.length;
+    case 'countDistinct':
+      return new Set((args.length === 0 ? rows.map((entry) => entry.row) : values(0)).map(stableKey)).size;
+    case 'sum':
+      return values(0).reduce<number>((sumValue, valueValue) => sumValue + (typeof valueValue === 'number' ? valueValue : 0), 0);
+    case 'avg': {
+      const numeric = values(0).filter((valueValue): valueValue is number => typeof valueValue === 'number');
+      return numeric.length === 0 ? undefined : numeric.reduce((sumValue, valueValue) => sumValue + valueValue, 0) / numeric.length;
+    }
+    case 'min':
+      return extremum(values(0), 'min');
+    case 'max':
+      return extremum(values(0), 'max');
+    case 'top':
+      return sortedValues(values(0), 'desc').slice(0, numberArg(args[1], 1));
+    case 'bottom':
+      return sortedValues(values(0), 'asc').slice(0, numberArg(args[1], 1));
+    case 'topBy':
+      return rowsBy(rows, args[1], 'desc', source, relations, options, diagnostics, outer)
+        .slice(0, numberArg(args[2], 1))
+        .map((entry) => evaluateExpr(args[0], entry, source, relations, options, diagnostics, outer));
+    case 'bottomBy':
+      return rowsBy(rows, args[1], 'asc', source, relations, options, diagnostics, outer)
+        .slice(0, numberArg(args[2], 1))
+        .map((entry) => evaluateExpr(args[0], entry, source, relations, options, diagnostics, outer));
+    case 'maxBy': {
+      const entryValue = rowsBy(rows, args[1], 'desc', source, relations, options, diagnostics, outer)[0];
+      return entryValue === undefined ? undefined : evaluateExpr(args[0], entryValue, source, relations, options, diagnostics, outer);
+    }
+    case 'minBy': {
+      const entryValue = rowsBy(rows, args[1], 'asc', source, relations, options, diagnostics, outer)[0];
+      return entryValue === undefined ? undefined : evaluateExpr(args[0], entryValue, source, relations, options, diagnostics, outer);
+    }
+    case 'setConcat': {
+      const seen = new Set<string>();
+      const result: unknown[] = [];
+      for (const valueValue of values(0)) {
+        if (!Array.isArray(valueValue)) continue;
+        for (const item of valueValue) {
+          const key = stableKey(item);
+          if (!seen.has(key)) {
+            seen.add(key);
+            result.push(item);
+          }
+        }
+      }
+      return result;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function evaluateField(data: ExprData, entry: EvalEntry): unknown {
+  const alias = typeof data.alias === 'string' ? data.alias : 'row';
+  const fieldName = typeof data.field === 'string' ? data.field : undefined;
+  if (fieldName === undefined) return undefined;
+  const target = alias === 'row' ? entry.row : entry.aliases[alias];
+  return isRecord(target) ? target[fieldName] : undefined;
+}
+
+function evaluateCall(
+  data: ExprData,
+  entry: EvalEntry,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): unknown {
+  const fn = data.fn;
+  if (!isHostFunction(fn)) return undefined;
+  const args = arrayFromUnknown(data.args).map((arg) => evaluateExpr(arg, entry, source, relations, options, diagnostics, outer));
+  const registryFn = options.functions?.[fn.name];
+  return (registryFn ?? fn.fn)(...args);
+}
+
+function evaluateSelectionExpr(
+  data: ExprData,
+  entry: EvalEntry,
+  source: RelationSource,
+  parentRelations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  _outer: EvalEntry | undefined
+): unknown {
+  const queryData = queryDataFrom(data.query);
+  if (queryData === undefined) return data.op === 'sel1' ? undefined : [];
+  const relationData = isRecord(data.relations) ? data.relations as Readonly<Record<string, AnyRelationRef>> : parentRelations;
+  const rows = evaluateQueryData(source, queryData, { ...parentRelations, ...relationData }, options, entry, diagnostics)
+    .filter((innerEntry) => correlationMatches(data.correlation, entry, innerEntry));
+  const resultRows = rows.map((rowEntry) => rowEntry.row);
+  return data.op === 'sel1' ? resultRows[0] : resultRows;
+}
+
+function finishQueryResult<Row>(result: QueryResult<Row>, options: EvaluateOptions): QueryResult<Row> {
+  const diagnostics = result.diagnostics;
+  if (diagnostics.length > 0) {
+    if (options.diagnosticMode === 'throw') throw new Error(diagnostics.map((item) => item.message).join('\n'));
+    if (options.diagnosticMode === 'warn') {
+      for (const item of diagnostics) console.warn(item.message);
+    }
+  }
+  return result;
+}
+
+function readRelationRows(
+  source: RelationSource,
+  relationRef: RelationRef,
+  diagnostics: TarstateDiagnostic[]
+): readonly Record<string, unknown>[] {
+  return validateSourceRows(relationRef, source.rows(relationRef), diagnostics);
+}
+
+function validateSourceRows(
+  relationRef: RelationRef,
+  rows: readonly unknown[],
+  diagnostics: TarstateDiagnostic[]
+): readonly Record<string, unknown>[] {
+  const result: Record<string, unknown>[] = [];
+  for (const rowValue of rows) {
+    if (!isRecord(rowValue)) {
+      diagnostics.push({
+        code: 'row_invalid',
+        severity: 'error',
+        message: `relation "${relationRef.name}" row must be an object`,
+        relation: relationRef.name,
+        surface: 'evaluate',
+        detail: rowValue
+      });
+      continue;
+    }
+    diagnostics.push(...validateRelationRow(relationRef, rowValue));
+    result.push(rowValue);
+  }
+  return result;
+}
+
+function relationMissingDiagnostic(relationName: string, surface: string): TarstateDiagnostic {
+  return {
+    code: 'relation_missing',
+    severity: 'error',
+    message: `relation "${relationName}" is not available`,
+    relation: relationName,
+    surface
+  };
+}
+
+function entryForRow(rowValue: unknown, alias?: string, relationName?: string): EvalEntry {
+  const aliases: Record<string, unknown> = { row: rowValue };
+  if (alias !== undefined) aliases[alias] = rowValue;
+  if (relationName !== undefined) aliases[relationName] = rowValue;
+  return { row: rowValue, aliases };
+}
+
+function combineEntries(left: EvalEntry, right: EvalEntry, rightAlias?: string): EvalEntry {
+  const rowValue = {
+    ...(isRecord(left.row) ? left.row : {}),
+    ...(isRecord(right.row) ? right.row : {})
+  };
+  return {
+    row: rowValue,
+    aliases: {
+      ...left.aliases,
+      ...right.aliases,
+      ...(rightAlias === undefined ? {} : { [rightAlias]: right.row }),
+      row: rowValue
+    }
+  };
+}
+
+function joinMatches(
+  on: unknown,
+  left: EvalEntry,
+  right: EvalEntry,
+  combined: EvalEntry,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): boolean {
+  if (isPredicateData(on)) {
+    return Boolean(evaluateExpr(on, combined, source, relations, options, diagnostics, outer));
+  }
+  if (!isRecord(on)) return false;
+  return Object.entries(on).every(([leftField, rightField]) =>
+    typeof rightField === 'string'
+      && isRecord(left.row)
+      && isRecord(right.row)
+      && Object.is(left.row[leftField], right.row[rightField]));
+}
+
+function correlationMatches(correlation: unknown, outer: EvalEntry, inner: EvalEntry): boolean {
+  if (!isRecord(correlation)) return true;
+  return Object.entries(correlation).every(([outerField, innerField]) =>
+    typeof innerField === 'string'
+      && isRecord(outer.row)
+      && isRecord(inner.row)
+      && Object.is(outer.row[outerField], inner.row[innerField]));
+}
+
+function sortEntries(
+  rows: readonly EvalEntry[],
+  order: readonly unknown[],
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): readonly EvalEntry[] {
+  if (order.length === 0) return [...rows];
+  return [...rows].sort((left, right) => {
+    for (const sortInput of order) {
+      const sortData = normalizeSortInput(sortInput);
+      const leftValue = evaluateExpr(sortData.expr, left, source, relations, options, diagnostics, outer);
+      const rightValue = evaluateExpr(sortData.expr, right, source, relations, options, diagnostics, outer);
+      const comparisonValue = compareNullable(leftValue, rightValue, sortData.nulls);
+      if (comparisonValue !== 0) return sortData.direction === 'desc' ? -comparisonValue : comparisonValue;
+    }
+    return 0;
+  });
+}
+
+function limitEntries(rows: readonly EvalEntry[], countValue: unknown, offsetValue?: unknown): readonly EvalEntry[] {
+  const countNumber = typeof countValue === 'number' ? Math.max(0, countValue) : rows.length;
+  const offsetNumber = typeof offsetValue === 'number' ? Math.max(0, offsetValue) : 0;
+  return rows.slice(offsetNumber, offsetNumber + countNumber);
+}
+
+function setUnionEntries(groups: readonly (readonly EvalEntry[])[]): readonly EvalEntry[] {
+  const seen = new Set<string>();
+  const result: EvalEntry[] = [];
+  for (const group of groups) {
+    for (const entry of group) {
+      const key = stableKey(entry.row);
+      if (!seen.has(key)) {
+        seen.add(key);
+        result.push(entry);
+      }
+    }
+  }
+  return result;
+}
+
+function setIntersectionEntries(groups: readonly (readonly EvalEntry[])[]): readonly EvalEntry[] {
+  const [first, ...rest] = groups;
+  if (first === undefined) return [];
+  return first.filter((entry) => {
+    const key = stableKey(entry.row);
+    return rest.every((group) => group.some((candidate) => stableKey(candidate.row) === key));
+  });
+}
+
+function setDifferenceEntries(left: readonly EvalEntry[], right: readonly EvalEntry[]): readonly EvalEntry[] {
+  const rightKeys = new Set(right.map((entry) => stableKey(entry.row)));
+  return left.filter((entry) => !rightKeys.has(stableKey(entry.row)));
+}
+
+function projectionFrom(input: unknown): ProjectionData {
+  return isRecord(input) ? input as ProjectionData : {};
+}
+
+function exprFrom(input: unknown): ExprData {
+  return isExpr(input) ? input : value(input as PrimitiveValue);
+}
+
+function queryDataArray(input: unknown): readonly QueryData[] {
+  return Array.isArray(input) ? input.flatMap((item) => {
+    const data = queryDataFrom(item);
+    return data === undefined ? [] : [data];
+  }) : [];
+}
+
+function arrayFromUnknown(input: unknown): readonly unknown[] {
+  return Array.isArray(input) ? input : [];
+}
+
+function iterableValues(input: unknown): readonly unknown[] {
+  if (input === undefined || input === null) return [];
+  if (typeof input === 'string') return Array.from(input);
+  if (Array.isArray(input)) return input;
+  if (typeof (input as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function') {
+    return Array.from(input as Iterable<unknown>);
+  }
+  return [];
+}
+
+function isOptionalProjection(input: unknown): input is OptionalProjection {
+  return isRecord(input) && input.kind === 'optionalProjection' && isExpr(input.expr);
+}
+
+function isPredicateData(input: unknown): input is PredicateData {
+  return isExpr(input) && (
+    input.op === 'eq'
+    || input.op === 'neq'
+    || input.op === 'lt'
+    || input.op === 'lte'
+    || input.op === 'gt'
+    || input.op === 'gte'
+    || input.op === 'and'
+    || input.op === 'or'
+    || input.op === 'not'
+    || input.op === 'isNull'
+    || input.op === 'notNull'
+    || input.op === 'isMissing'
+    || input.op === 'notMissing'
+  );
+}
+
+function unwrapOptionalProjection(input: unknown): unknown {
+  return isOptionalProjection(input) ? input.expr : input;
+}
+
+function projectionHasAggregate(projection: ProjectionData): boolean {
+  return Object.values(projection).some(containsAggregateCall);
+}
+
+function containsAggregateCall(input: unknown): boolean {
+  const valueValue = unwrapOptionalProjection(input);
+  if (!isRecord(valueValue)) return false;
+  if (valueValue.op === 'aggregateCall') return true;
+  return Object.values(valueValue).some((item) => {
+    if (Array.isArray(item)) return item.some(containsAggregateCall);
+    return containsAggregateCall(item);
+  });
+}
+
+function normalizeSortInput(input: unknown): SortData {
+  if (isRecord(input) && isExpr(input.expr) && (input.direction === 'asc' || input.direction === 'desc')) {
+    return {
+      expr: input.expr,
+      direction: input.direction,
+      ...(input.nulls === 'first' || input.nulls === 'last' ? { nulls: input.nulls } : {})
+    };
+  }
+  return { expr: exprFrom(input), direction: 'asc' };
+}
+
+function compareNullable(left: unknown, right: unknown, nulls: NullSortOrder | undefined): number {
+  const leftNullish = left === null || left === undefined;
+  const rightNullish = right === null || right === undefined;
+  if (leftNullish || rightNullish) {
+    if (leftNullish && rightNullish) return 0;
+    const nullFirst = nulls === 'first';
+    return leftNullish ? (nullFirst ? -1 : 1) : (nullFirst ? 1 : -1);
+  }
+  return compareValues(left, right);
+}
+
+function compareValues(left: unknown, right: unknown): number {
+  if (Object.is(left, right)) return 0;
+  if (left === undefined || left === null) return -1;
+  if (right === undefined || right === null) return 1;
+  if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : 1;
+  if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right);
+  if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
+  return stableKey(left).localeCompare(stableKey(right));
+}
+
+function sortedValues(values: readonly unknown[], direction: SortDirection): readonly unknown[] {
+  return [...values].sort((left, right) => direction === 'desc' ? -compareValues(left, right) : compareValues(left, right));
+}
+
+function extremum(values: readonly unknown[], mode: 'min' | 'max'): unknown {
+  const filtered = values.filter((valueValue) => valueValue !== undefined && valueValue !== null);
+  return filtered.reduce<unknown>((current, valueValue) => {
+    if (current === undefined) return valueValue;
+    const comparisonValue = compareValues(valueValue, current);
+    return mode === 'min'
+      ? comparisonValue < 0 ? valueValue : current
+      : comparisonValue > 0 ? valueValue : current;
+  }, undefined);
+}
+
+function rowsBy(
+  rows: readonly EvalEntry[],
+  by: unknown,
+  direction: SortDirection,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): readonly EvalEntry[] {
+  return [...rows].sort((left, right) => {
+    const leftValue = evaluateExpr(by, left, source, relations, options, diagnostics, outer);
+    const rightValue = evaluateExpr(by, right, source, relations, options, diagnostics, outer);
+    const comparisonValue = compareValues(leftValue, rightValue);
+    return direction === 'desc' ? -comparisonValue : comparisonValue;
+  });
+}
+
+function numberArg(input: unknown, fallback: number): number {
+  return typeof input === 'number' && Number.isFinite(input) ? input : fallback;
+}
+
+function queryForTarget<Row>(target: Query<Row> | RelationRef): Query<Row> {
+  return isQuery(target) ? target : from(target as RelationRef<Record<string, unknown>>) as Query<Row>;
+}
+
+function queryBatchTargetQuery(target: QueryBatchTarget): Query<unknown> | RelationRef {
+  return isRecord(target) && 'q' in target ? target.q as Query<unknown> | RelationRef : target as Query<unknown> | RelationRef;
+}
+
+function isQueryBatch(input: unknown): input is QueryBatch {
+  return isRecord(input) && !isQuery(input) && !isRelationRef(input);
+}
+
+function applyDbQueryOptions<Row, MappedRow>(rows: readonly Row[], options: DbQueryOptions<Row, MappedRow>): readonly MappedRow[] {
+  let result = [...rows];
+  if (options.sort !== undefined) result = sortPlainRows(result, options.sort, 'asc');
+  if (options.rsort !== undefined) result = sortPlainRows(result, options.rsort, 'desc');
+  const mapped = options.mapRows === undefined ? result as unknown as readonly MappedRow[] : options.mapRows(result);
+  return mapped;
+}
+
+function hasDbQueryRowTransforms(options: DbQueryOptions<unknown, unknown>): boolean {
+  return options.sort !== undefined || options.rsort !== undefined || options.mapRows !== undefined;
+}
+
+function sortPlainRows<Row>(rows: readonly Row[], sortValue: DbQuerySort<Row>, direction: SortDirection): Row[] {
+  const keys = Array.isArray(sortValue) ? sortValue : [sortValue];
+  return [...rows].sort((left, right) => {
+    for (const key of keys) {
+      const leftValue = typeof key === 'function' ? key(left) : isRecord(left) ? left[key] : undefined;
+      const rightValue = typeof key === 'function' ? key(right) : isRecord(right) ? right[key] : undefined;
+      const comparisonValue = compareValues(leftValue, rightValue);
+      if (comparisonValue !== 0) return direction === 'desc' ? -comparisonValue : comparisonValue;
+    }
+    return 0;
+  });
+}
+
+function isRelationKeyInput(input: unknown): input is RelationKeyInput {
+  return typeof input === 'string' || typeof input === 'number' || Array.isArray(input);
+}
+
+function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput): string {
+  return stableKey(Array.isArray(relationRef.key) ? input : [input]);
+}
+
+function cloneDb(input: Db): Db {
+  return { ...input, data: cloneDbData(input.data), env: input.env };
+}
+
+function cloneDbData(data: DbInputData): DbData {
+  return Object.fromEntries(Object.entries(data).map(([name, rows]) => [name, [...rows]]));
+}
+
+function resolveTransactionInput(input: DbTransactionInput, dbValue: Db): DbTransactionItem {
+  if (typeof input === 'function') return input(dbValue as DbTransactionContext, dbValue);
+  return input;
+}
+
+function normalizeTransactionItem(input: DbTransactionItem): readonly (WritePatch | SetEnvTransaction)[] {
+  if (isWritePatch(input) || isSetEnvTransaction(input)) return [input];
+  if (isIterableTransactionItems(input)) return Array.from(input);
+  return writeInputPatches(input as WriteInput);
+}
+
+function isIterableTransactionItems(input: unknown): input is Iterable<WritePatch | SetEnvTransaction> {
+  return !isWritePatch(input)
+    && !isSetEnvTransaction(input)
+    && typeof input !== 'string'
+    && input !== undefined
+    && input !== null
+    && typeof (input as { [Symbol.iterator]?: unknown })[Symbol.iterator] === 'function';
+}
+
+function isSetEnvTransaction(input: unknown): input is SetEnvTransaction {
+  return isRecord(input) && input.op === 'setEnv';
+}
+
+function applySetEnvTransaction(dbValue: Db, tx: SetEnvTransaction): Db {
+  const envValue = typeof tx.env === 'function' ? tx.env(dbValue.env, dbValue) : tx.env;
+  return { ...dbValue, env: envValue };
+}
+
+function applyWritePatchToDb(dbValue: Db, patch: WritePatch): WriteApplyResult {
+  const relationRef = patch.relation;
+  const beforeRows = [...(dbValue.data[relationRef.name] ?? [])] as Record<string, unknown>[];
+  const diagnostics: TarstateDiagnostic[] = [];
+  const rowDiagnostics = validatePatchRows(patch);
+  diagnostics.push(...rowDiagnostics);
+  if (rowDiagnostics.some(isErrorDiagnostic)) return { db: dbValue, applied: 0, deltas: [], diagnostics };
+
+  const rows = [...beforeRows];
+  const keyOf = (rowValue: Record<string, unknown>): string | undefined => rowKey(relationRef, rowValue);
+  const keyFromPatch = (key: RelationKeyInput): string => relationKeyInputToKey(relationRef, key);
+  const findIndexByKey = (key: string | undefined): number => key === undefined ? -1 : rows.findIndex((rowValue) => keyOf(rowValue) === key);
+  let added: unknown[] = [];
+  let removed: unknown[] = [];
+
+  switch (patch.op) {
+    case 'insert': {
+      const key = keyOf(patch.row as Record<string, unknown>);
+      if (findIndexByKey(key) !== -1) diagnostics.push(uniqueKeyDiagnostic(relationRef, patch.row));
+      else {
+        rows.push(patch.row as Record<string, unknown>);
+        added = [patch.row];
+      }
+      break;
+    }
+    case 'insertIgnore': {
+      const key = keyOf(patch.row as Record<string, unknown>);
+      if (findIndexByKey(key) === -1) {
+        rows.push(patch.row as Record<string, unknown>);
+        added = [patch.row];
+      }
+      break;
+    }
+    case 'insertOrReplace': {
+      const key = keyOf(patch.row as Record<string, unknown>);
+      const indexValue = findIndexByKey(key);
+      if (indexValue === -1) {
+        rows.push(patch.row as Record<string, unknown>);
+        added = [patch.row];
+      } else {
+        removed = [rows[indexValue]];
+        rows[indexValue] = patch.row as Record<string, unknown>;
+        added = [patch.row];
+      }
+      break;
+    }
+    case 'insertOrMerge': {
+      const key = keyOf(patch.row as Record<string, unknown>);
+      const indexValue = findIndexByKey(key);
+      if (indexValue === -1) {
+        rows.push(patch.row as Record<string, unknown>);
+        added = [patch.row];
+      } else {
+        const current = rows[indexValue] as RelationRow<RelationRef>;
+        const updateValue = mergeUpdate(current, patch.row, patch.merge);
+        const next = { ...current, ...updateValue };
+        removed = [current];
+        rows[indexValue] = next;
+        added = [next];
+      }
+      break;
+    }
+    case 'insertOrUpdate': {
+      const key = keyOf(patch.row as Record<string, unknown>);
+      const indexValue = findIndexByKey(key);
+      if (indexValue === -1) {
+        rows.push(patch.row as Record<string, unknown>);
+        added = [patch.row];
+      } else {
+        const current = rows[indexValue] as RelationRow<RelationRef>;
+        const updateValue = relationUpdateFor(current, patch.update ?? patch.row);
+        const next = { ...current, ...updateValue };
+        removed = [current];
+        rows[indexValue] = next;
+        added = [next];
+      }
+      break;
+    }
+    case 'updateByKey': {
+      const indexValue = findIndexByKey(keyFromPatch(patch.key as RelationKeyInput));
+      if (indexValue !== -1) {
+        const current = rows[indexValue] as RelationRow<RelationRef>;
+        const next = { ...current, ...relationUpdateFor(current, patch.changes) };
+        const nextDiagnostics = validateRelationRow(relationRef, next);
+        diagnostics.push(...nextDiagnostics);
+        if (!nextDiagnostics.some(isErrorDiagnostic)) {
+          removed = [current];
+          rows[indexValue] = next;
+          added = [next];
+        }
+      }
+      break;
+    }
+    case 'update': {
+      const nextRows = rows.map((current) => {
+        if (!predicateMatchesRow(patch.predicate, current, relationRef, dbValue)) return current;
+        const next = { ...current, ...relationUpdateFor(current as RelationRow<RelationRef>, patch.changes) };
+        diagnostics.push(...validateRelationRow(relationRef, next));
+        removed.push(current);
+        added.push(next);
+        return next;
+      });
+      rows.splice(0, rows.length, ...nextRows);
+      break;
+    }
+    case 'deleteByKey': {
+      const indexValue = findIndexByKey(keyFromPatch(patch.key as RelationKeyInput));
+      if (indexValue !== -1) {
+        const [rowValue] = rows.splice(indexValue, 1);
+        if (rowValue !== undefined) removed = [rowValue];
+      }
+      break;
+    }
+    case 'delete': {
+      const kept: Record<string, unknown>[] = [];
+      for (const rowValue of rows) {
+        if (predicateMatchesRow(patch.predicate, rowValue, relationRef, dbValue)) removed.push(rowValue);
+        else kept.push(rowValue);
+      }
+      rows.splice(0, rows.length, ...kept);
+      break;
+    }
+    case 'deleteExact': {
+      const kept: Record<string, unknown>[] = [];
+      for (const rowValue of rows) {
+        if (partialRowMatches(rowValue, patch.row as Record<string, unknown>)) removed.push(rowValue);
+        else kept.push(rowValue);
+      }
+      rows.splice(0, rows.length, ...kept);
+      break;
+    }
+    case 'replaceAll':
+      removed = [...rows];
+      rows.splice(0, rows.length, ...(patch.rows as readonly Record<string, unknown>[]));
+      added = [...patch.rows];
+      break;
+    default:
+      break;
+  }
+
+  if (diagnostics.some(isErrorDiagnostic)) return { db: dbValue, applied: 0, deltas: [], diagnostics };
+  if (added.length === 0 && removed.length === 0) return { db: dbValue, applied: 0, deltas: [], diagnostics };
+  const nextData = { ...dbValue.data, [relationRef.name]: rows };
+  return {
+    db: { ...dbValue, data: nextData },
+    applied: 1,
+    deltas: [{ relation: relationRef, added, removed }],
+    diagnostics
+  };
+}
+
+function validatePatchRows(patch: WritePatch): readonly TarstateDiagnostic[] {
+  switch (patch.op) {
+    case 'insert':
+    case 'insertIgnore':
+    case 'insertOrReplace':
+    case 'insertOrMerge':
+    case 'insertOrUpdate':
+      return validateRelationRow(patch.relation, patch.row as Record<string, unknown>);
+    case 'replaceAll':
+      return patch.rows.flatMap((rowValue) => validateRelationRow(patch.relation, rowValue as Record<string, unknown>));
+    default:
+      return [];
+  }
+}
+
+function relationUpdateFor(
+  current: RelationRow<RelationRef>,
+  input: RelationRowUpdateInput<RelationRef>
+): RelationRowUpdate<RelationRef> {
+  return typeof input === 'function' ? input(current) : input;
+}
+
+function mergeUpdate(
+  current: RelationRow<RelationRef>,
+  incoming: RelationRow<RelationRef>,
+  merge: RelationMergeInput<RelationRef> | undefined
+): RelationRowUpdate<RelationRef> {
+  if (typeof merge === 'function') return merge(current, incoming);
+  if (Array.isArray(merge)) {
+    return Object.fromEntries(merge.map((fieldName) => [fieldName, incoming[fieldName]]));
+  }
+  return incoming;
+}
+
+function predicateMatchesRow(predicate: PredicateData, rowValue: Record<string, unknown>, relationRef: RelationRef, dbValue: Db): boolean {
+  const diagnostics: TarstateDiagnostic[] = [];
+  const entry = entryForRow(rowValue, relationRef.name, relationRef.name);
+  for (const alias of relationPredicateAliases(relationRef.name)) entry.aliases[alias] = rowValue;
+  return Boolean(evaluateExpr(predicate, entry, dbSource(dbValue), { [relationRef.name]: relationRef }, { env: dbValue.env }, diagnostics, undefined));
+}
+
+function partialRowMatches(rowValue: Record<string, unknown>, partial: Record<string, unknown>): boolean {
+  return Object.entries(partial).every(([fieldName, fieldValue]) => Object.is(rowValue[fieldName], fieldValue));
+}
+
+function relationPredicateAliases(relationName: string): readonly string[] {
+  if (relationName.endsWith('ies')) return [relationName.slice(0, -3) + 'y'];
+  if (relationName.endsWith('s') && relationName.length > 1) return [relationName.slice(0, -1)];
+  return [];
+}
+
+function uniqueKeyDiagnostic(relationRef: RelationRef, rowValue: unknown): TarstateDiagnostic {
+  const keyFields = relationKeyFields(relationRef);
+  return {
+    code: 'unique',
+    severity: 'error',
+    message: `relation "${relationRef.name}" already contains key ${rowKey(relationRef, rowValue as Record<string, unknown>) ?? '<missing>'}`,
+    relation: relationRef.name,
+    ...(keyFields.length === 1 ? { field: keyFields[0] } : {}),
+    surface: 'write'
+  };
+}
+
+function constraintDiagnosticsForInvalidPatch(patch: WritePatch, constraints: readonly ConstraintData[]): readonly TarstateDiagnostic[] {
+  const relationRef = patch.relation;
+  const rowValue = patchRowForDiagnostics(patch);
+  if (rowValue === undefined) return [];
+  const diagnostics: TarstateDiagnostic[] = [];
+
+  for (const constraint of constraints) {
+    if (constraint.op !== 'req' || !constraintMatchesRelation(constraint.query, relationRef.name)) continue;
+    for (const fieldName of constraint.fields) {
+      if (rowValue[fieldName] === undefined || rowValue[fieldName] === null) {
+        diagnostics.push({
+          code: 'required',
+          severity: 'error',
+          message: `required field "${fieldName}" is missing`,
+          relation: relationRef.name,
+          field: fieldName,
+          surface: 'validateConstraints',
+          detail: rowValue
+        });
+      }
+    }
+  }
+
+  return diagnostics;
+}
+
+function patchRowForDiagnostics(patch: WritePatch): Record<string, unknown> | undefined {
+  switch (patch.op) {
+    case 'insert':
+    case 'insertIgnore':
+    case 'insertOrReplace':
+    case 'insertOrMerge':
+    case 'insertOrUpdate':
+      return isRecord(patch.row) ? patch.row : undefined;
+    default:
+      return undefined;
+  }
+}
+
+function constraintMatchesRelation(queryValue: Query | RelationRef, relationName: string): boolean {
+  return isRelationRef(queryValue)
+    ? queryValue.name === relationName
+    : relationDependencies(queryValue).includes(relationName);
+}
+
+function validateConstraintsSync(
+  dbOrSource: Db | RelationSource,
+  input: ConstraintValidationInput | undefined,
+  options: ConstraintValidationOptions = {}
+): ConstraintValidationResult {
+  const constraints = flattenConstraints(input);
+  const diagnostics: TarstateDiagnostic[] = [];
+  const source = isDb(dbOrSource) ? dbSource(dbOrSource) : dbOrSource;
+  const envValue = options.env ?? (isDb(dbOrSource) ? dbOrSource.env : undefined);
+
+  const evaluateOptions = envValue === undefined ? options : { ...options, env: envValue };
+  for (const constraint of constraints) {
+    diagnostics.push(...validateConstraint(source, constraint, evaluateOptions));
+  }
+
+  return { valid: !diagnostics.some(isErrorDiagnostic), diagnostics };
+}
+
+function validateConstraint(source: RelationSource, constraint: ConstraintData, options: EvaluateOptions): readonly TarstateDiagnostic[] {
+  switch (constraint.op) {
+    case 'req':
+      return validateRequiredConstraint(source, constraint, options);
+    case 'unique':
+      return validateUniqueConstraint(source, constraint, options);
+    case 'fk':
+      return validateForeignKeyConstraint(source, constraint, options);
+    case 'check':
+      return validateCheckConstraint(source, constraint, options);
+    default:
+      return [];
+  }
+}
+
+function validateRequiredConstraint(source: RelationSource, constraint: RequiredConstraintData, options: EvaluateOptions): readonly TarstateDiagnostic[] {
+  const result = evaluateConstraintQuery(source, constraint.query, options);
+  const diagnostics: TarstateDiagnostic[] = [...result.diagnostics];
+  const relationName = constraintRelationName(constraint.query);
+  for (const rowValue of result.rows) {
+    if (!isRecord(rowValue)) continue;
+    for (const fieldName of constraint.fields) {
+      if (rowValue[fieldName] === undefined || rowValue[fieldName] === null) {
+        diagnostics.push({
+          code: 'required',
+          severity: 'error',
+          message: `required field "${fieldName}" is missing`,
+          field: fieldName,
+          ...(relationName === undefined ? {} : { relation: relationName }),
+          surface: 'validateConstraints',
+          detail: rowValue
+        });
+      }
+    }
+  }
+  return diagnostics;
+}
+
+function validateUniqueConstraint(source: RelationSource, constraint: UniqueConstraintData, options: EvaluateOptions): readonly TarstateDiagnostic[] {
+  const result = evaluateConstraintQuery(source, constraint.query, options);
+  const diagnostics: TarstateDiagnostic[] = [...result.diagnostics];
+  const seen = new Map<string, unknown>();
+  const relationName = constraintRelationName(constraint.query);
+  for (const rowValue of result.rows) {
+    if (!isRecord(rowValue)) continue;
+    const key = stableKey(constraint.fields.map((fieldName) => rowValue[fieldName]));
+    if (seen.has(key)) {
+      diagnostics.push({
+        code: 'unique',
+        severity: 'error',
+        message: `unique constraint failed for fields ${constraint.fields.join(', ')}`,
+        ...(relationName === undefined ? {} : { relation: relationName }),
+        ...(constraint.fields.length === 1 ? { field: constraint.fields[0] } : {}),
+        surface: 'validateConstraints',
+        detail: rowValue
+      });
+    }
+    seen.set(key, rowValue);
+  }
+  return diagnostics;
+}
+
+function validateForeignKeyConstraint(source: RelationSource, constraint: ForeignKeyConstraintData, options: EvaluateOptions): readonly TarstateDiagnostic[] {
+  const result = evaluateConstraintQuery(source, constraint.query, options);
+  const targetRows = source.rows(constraint.target).filter(isRecord);
+  const targetKeys = new Set(targetRows.map((rowValue) => stableKey(constraint.targetFields.map((fieldName) => rowValue[fieldName]))));
+  const diagnostics: TarstateDiagnostic[] = [...result.diagnostics];
+  const relationName = constraintRelationName(constraint.query);
+
+  for (const rowValue of result.rows) {
+    if (!isRecord(rowValue)) continue;
+    const values = constraint.fields.map((fieldName) => rowValue[fieldName]);
+    if (values.some((valueValue) => valueValue === undefined || valueValue === null)) continue;
+    if (!targetKeys.has(stableKey(values))) {
+      diagnostics.push({
+        code: 'foreign_key',
+        severity: 'error',
+        message: `foreign key constraint failed for fields ${constraint.fields.join(', ')}`,
+        ...(relationName === undefined ? { relation: constraint.target.name } : { relation: relationName }),
+        ...(constraint.fields.length === 1 ? { field: constraint.fields[0] } : {}),
+        surface: 'validateConstraints',
+        detail: rowValue
+      });
+    }
+  }
+  return diagnostics;
+}
+
+function validateCheckConstraint(source: RelationSource, constraint: CheckConstraintData, options: EvaluateOptions): readonly TarstateDiagnostic[] {
+  const queryValue = constraint.query ?? constRows([{}]);
+  const diagnostics: TarstateDiagnostic[] = [];
+  const entries = evaluateConstraintEntries(source, queryValue, options, diagnostics);
+  const relationName = constraintRelationName(queryValue);
+  const fieldName = checkConstraintField(constraint.predicate);
+  for (const entry of entries) {
+    if (!evaluateExpr(constraint.predicate, entry, source, isQuery(queryValue) ? queryValue.relations : {}, options, diagnostics, undefined)) {
+      diagnostics.push({
+        code: 'check',
+        severity: 'error',
+        message: 'check constraint failed',
+        ...(relationName === undefined ? {} : { relation: relationName }),
+        ...(fieldName === undefined ? {} : { field: fieldName }),
+        surface: 'validateConstraints',
+        detail: entry.row
+      });
+    }
+  }
+  return diagnostics;
+}
+
+function constraintRelationName(queryValue: Query | RelationRef): string | undefined {
+  if (isRelationRef(queryValue)) return queryValue.name;
+  const dependencies = relationDependencies(queryValue);
+  return dependencies.length === 1 ? dependencies[0] : undefined;
+}
+
+function checkConstraintField(predicate: PredicateData): string | undefined {
+  if (predicate.op === 'gt' || predicate.op === 'gte' || predicate.op === 'lt' || predicate.op === 'lte' || predicate.op === 'eq' || predicate.op === 'neq') {
+    const left = predicate.left;
+    return isExpr(left) && left.op === 'field' && typeof left.field === 'string' ? left.field : undefined;
+  }
+  return undefined;
+}
+
+function evaluateConstraintQuery(source: RelationSource, queryValue: Query | RelationRef, options: EvaluateOptions): QueryResult<unknown> {
+  return evaluate(source, queryForTarget(queryValue), options);
+}
+
+function evaluateConstraintEntries(
+  source: RelationSource,
+  queryValue: Query | RelationRef,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const queryObject = queryForTarget(queryValue);
+  return evaluateQueryData(source, queryObject.data, queryObject.relations, options, undefined, diagnostics);
+}
+
+function flattenConstraints(input: ConstraintValidationInput | undefined): readonly ConstraintData[] {
+  if (input === undefined) return [];
+  return Array.isArray(input) ? input.flatMap((item) => flattenConstraints(item)) : [input as ConstraintData];
+}
+
+function applyCascadeDeletes(
+  dbValue: Db,
+  constraints: readonly ConstraintData[],
+  newDeltas: readonly RelationDelta[],
+  allDeltas: RelationDelta[]
+): Db {
+  let current = dbValue;
+  for (const constraint of constraints) {
+    if (constraint.op !== 'fk' || constraint.cascade !== 'delete' || !isRelationRef(constraint.query)) continue;
+    for (const delta of newDeltas) {
+      if (delta.relation.name !== constraint.target.name || delta.removed.length === 0) continue;
+      for (const removedRow of delta.removed) {
+        if (!isRecord(removedRow)) continue;
+        const predicate = or(...constraint.fields.map((fieldName, indexValue) =>
+          eq(field('row', fieldName), value(removedRow[constraint.targetFields[indexValue] ?? ''] as PrimitiveValue))));
+        const result = applyWritePatchToDb(current, deleteRows(constraint.query, predicate));
+        current = result.db;
+        allDeltas.push(...result.deltas);
+      }
+    }
+  }
+  return current;
+}
+
+function addMaterializationInput(
+  target: unknown,
+  state: InternalMaterializationState,
+  input: MaterializationInput
+): InternalMaterializationState {
+  if (isQuery(input)) {
+    return addMaterializationMetadata(target, state, materializationMetadata(input));
+  }
+  if (isMaterializationMetadata(input)) {
+    return addMaterializationMetadata(target, state, input);
+  }
+  const constraints = [...state.constraints, ...flattenConstraints(input as ConstraintValidationInput)];
+  return { ...state, constraints: dedupeConstraints(constraints) };
+}
+
+function addMaterializationMetadata(
+  target: unknown,
+  state: InternalMaterializationState,
+  metadata: MaterializationMetadata
+): InternalMaterializationState {
+  const rows = new Map(state.rows);
+  rows.set(metadata.id, refreshMaterializationRows(target, metadata.query).rows);
+  return {
+    metadata: [...state.metadata.filter((item) => item.id !== metadata.id), metadata],
+    rows,
+    constraints: state.constraints
+  };
+}
+
+function materializationMetadata<Row>(query: Query<Row>, options: MaterializationOptions = {}): MaterializationMetadata<Row> {
+  const key = queryKey(query);
+  return {
+    id: options.id ?? materializationIdForQuery(query),
+    query,
+    queryKey: key,
+    mode: options.mode ?? 'snapshot'
+  };
+}
+
+function materializationIdForQuery<Row>(query: Query<Row>): string {
+  return `query:${queryKey(query)}`;
+}
+
+function materializedStateFor(input: unknown): InternalMaterializationState {
+  if (!isRecord(input)) return EMPTY_MATERIALIZATION_STATE;
+  const state = (input as { [MATERIALIZATION_STATE]?: InternalMaterializationState })[MATERIALIZATION_STATE];
+  return state ?? EMPTY_MATERIALIZATION_STATE;
+}
+
+function attachedWatchTargetsFor(input: unknown): readonly WatchTarget[] {
+  if (!isRecord(input)) return [];
+  return (input as { [ATTACHED_WATCH_TARGETS]?: readonly WatchTarget[] })[ATTACHED_WATCH_TARGETS] ?? [];
+}
+
+function withAttachedWatchTargets<DbValue extends Db>(input: DbValue, targets: readonly WatchTarget[]): DbValue {
+  const output = { ...input } as DbValue & { [ATTACHED_WATCH_TARGETS]?: readonly WatchTarget[] };
+  Object.defineProperty(output, ATTACHED_WATCH_TARGETS, {
+    value: targets,
+    enumerable: false,
+    configurable: true
+  });
+  return output;
+}
+
+function uniqueWatchTargets(targets: readonly WatchTarget[]): readonly WatchTarget[] {
+  const seen = new Set<string>();
+  const result: WatchTarget[] = [];
+  for (const target of targets) {
+    const key = watchTargetKey(target);
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(target);
+    }
+  }
+  return result;
+}
+
+function materializedConstraintsFor(input: unknown): readonly ConstraintData[] {
+  return materializedStateFor(input).constraints;
+}
+
+function withMaterializedState<DbValue extends object>(input: DbValue, state: InternalMaterializationState): DbValue & MaterializedDb {
+  const output = {
+    ...input,
+    ...(state.metadata.length === 0 ? {} : { materialized: state.metadata })
+  } as DbValue & MaterializedDb & { [MATERIALIZATION_STATE]?: InternalMaterializationState };
+  Object.defineProperty(output, MATERIALIZATION_STATE, {
+    value: state,
+    enumerable: false,
+    configurable: true
+  });
+  return output;
+}
+
+function emptyMaterializationState(): InternalMaterializationState {
+  return { metadata: [], rows: new Map(), constraints: [] };
+}
+
+function applyMaterializationState(dbValue: Db, previous: InternalMaterializationState, maintenance: MaterializationMaintenanceResult): Db {
+  if (previous.metadata.length === 0 && previous.constraints.length === 0) return dbValue;
+  const rows = new Map(previous.rows);
+  for (const change of maintenance.changes) rows.set(change.id, change.rows);
+  return withMaterializedState(dbValue, {
+    metadata: previous.metadata,
+    rows,
+    constraints: previous.constraints
+  });
+}
+
+function refreshMaterializationRows<Row>(target: unknown, query: Query<Row>): MaterializationRefreshResult<Row> {
+  if (isDb(target)) return qResult(target, query);
+  if (isRelationSource(target)) return evaluate(target, query);
+  return {
+    rows: [],
+    diagnostics: [{
+      code: 'materialization_unsupported',
+      severity: 'warning',
+      message: 'materialization target is not readable',
+      surface: 'materialization'
+    }]
+  };
+}
+
+function isMaterializationMetadata(input: unknown): input is MaterializationMetadata {
+  return isRecord(input)
+    && typeof input.id === 'string'
+    && isQuery(input.query)
+    && typeof input.queryKey === 'string'
+    && (input.mode === 'snapshot' || input.mode === 'incremental');
+}
+
+function constraintKey(input: ConstraintData): string {
+  return encodeQueryKeyValue(input, '$constraint');
+}
+
+function dedupeConstraints(constraints: readonly ConstraintData[]): readonly ConstraintData[] {
+  const seen = new Set<string>();
+  const result: ConstraintData[] = [];
+  for (const constraint of constraints) {
+    const key = constraintKey(constraint);
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(constraint);
+    }
+  }
+  return result;
+}
+
+function fieldValueMatchesSpec(spec: FieldSpec, valueValue: unknown): boolean {
+  switch (spec.valueKind) {
+    case 'string':
+    case 'id':
+    case 'ref':
+    case 'anchoredPath':
+      return typeof valueValue === 'string';
+    case 'number':
+      return typeof valueValue === 'number' && Number.isFinite(valueValue);
+    case 'boolean':
+      return typeof valueValue === 'boolean';
+    case 'json':
+      return isJsonValue(valueValue);
+    default:
+      return true;
+  }
+}
+
+function fieldSpecDescription(spec: FieldSpec): string {
+  switch (spec.valueKind) {
+    case 'id':
+    case 'ref':
+    case 'anchoredPath':
+      return 'a string';
+    case 'json':
+      return 'a JSON value';
+    default:
+      return `a ${spec.valueKind}`;
+  }
+}
+
+function relationKeyFields(relationRef: RelationRef): readonly string[] {
+  return Array.isArray(relationRef.key) ? [...relationRef.key] : [relationRef.key as string];
+}
+
+function isErrorDiagnostic(input: TarstateDiagnostic): boolean {
+  return input.severity === 'error';
+}
+
+function stableKey(input: unknown): string {
+  if (input === undefined) return '~undefined';
+  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') return JSON.stringify(input);
+  if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
+  if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
+  if (typeof input === 'function') return `~function:${input.name}`;
+  if (Array.isArray(input)) return `[${input.map(stableKey).join(',')}]`;
+  if (isRecord(input)) {
+    return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${stableKey(input[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(String(input as string | number | boolean | bigint | null | undefined));
+}
+
+function queryAliasData(query: Query<unknown>, name: string): Record<string, string> {
+  return 'alias' in query && typeof query.alias === 'string' ? { [name]: query.alias } : {};
+}
+
+function queryDataDependencies(data: QueryData): readonly string[] {
+  switch (data.op) {
+    case 'from':
+    case 'lookup':
+      return typeof data.relation === 'string' ? [data.relation] : [];
+    case 'join':
+      return uniqueStrings(
+        nestedDependencies(data.left),
+        nestedDependencies(data.right),
+        exprDependencies(data.on)
+      );
+    case 'union':
+    case 'intersection':
+      return uniqueStrings(...queryDataArray(data.inputs).map(queryDataDependencies));
+    case 'difference':
+      return uniqueStrings(nestedDependencies(data.left), nestedDependencies(data.right));
+    default:
+      return uniqueStrings(nestedDependencies(data.input), exprDependencies(data), projectionDependencies(data.projection), projectionDependencies(data.groupBy), projectionDependencies(data.aggregates));
+  }
+}
+
+function nestedDependencies(input: unknown): readonly string[] {
+  const data = queryDataFrom(input);
+  return data === undefined ? [] : queryDataDependencies(data);
+}
+
+function projectionDependencies(input: unknown): readonly string[] {
+  if (!isRecord(input)) return [];
+  return uniqueStrings(...Object.values(input).map(exprDependencies));
+}
+
+function exprDependencies(input: unknown): readonly string[] {
+  if (!isRecord(input)) return [];
+  const dependencies: (readonly string[])[] = Object.entries(input).map(([key, valueValue]) => {
+    if (key === 'query') {
+      const data = queryDataFrom(valueValue);
+      return data === undefined ? [] : queryDataDependencies(data);
+    }
+    if (Array.isArray(valueValue)) return uniqueStrings(...valueValue.map(exprDependencies));
+    return exprDependencies(valueValue);
+  });
+  return uniqueStrings(...dependencies);
+}
+
+function queryDataRowKeyFields(data: QueryData): readonly string[] | undefined {
+  switch (data.op) {
+    case 'keyBy':
+      return stringArray(data.fields);
+    case 'from':
+      return typeof data.relation === 'string' ? undefined : undefined;
+    case 'where':
+    case 'hash':
+    case 'btree':
+    case 'sort':
+    case 'limit':
+    case 'sortLimit':
+      return queryDataFrom(data.input) === undefined ? undefined : queryDataRowKeyFields(queryDataFrom(data.input) as QueryData);
+    default:
+      return undefined;
+  }
+}
+
+function queryEnvDependencies(query: Query): readonly string[] {
+  return envDependenciesFromData(query.data);
+}
+
+function envDependenciesFromData(data: unknown): readonly string[] {
+  if (!isRecord(data)) return [];
+  const names: string[] = [];
+  if (data.op === 'env' && typeof data.name === 'string') names.push(data.name);
+  for (const valueValue of Object.values(data)) {
+    if (Array.isArray(valueValue)) {
+      for (const item of valueValue) names.push(...envDependenciesFromData(item));
+    } else {
+      names.push(...envDependenciesFromData(valueValue));
+    }
+  }
+  return uniqueStrings(names);
+}
+
+function addRevisionToBatch<Queries extends QueryBatch>(result: QueryBatchResult<Queries>, revision: number): StoreQueryBatchResult<Queries> {
+  return Object.fromEntries(Object.entries(result).map(([name, valueValue]) => [name, { ...valueValue, revision }])) as StoreQueryBatchResult<Queries>;
+}
+
+function dbFromRuntime<Version>(runtime: RelationRuntime<Version>, relations: readonly RelationRef[], envValue: DbInputEnv | undefined): Db {
+  return dbFromSource(runtime.snapshot?.().source ?? runtime.source, relations, envValue);
+}
+
+function dbFromSource(source: RelationSource, relations: readonly RelationRef[], envValue: DbInputEnv | undefined): Db {
+  return createDb(
+    Object.fromEntries(relations.map((relationRef) => [relationRef.name, source.rows(relationRef)])),
+    envValue === undefined ? {} : { env: envValue }
+  );
+}
+
+function deltaToPatches(delta: RelationDelta): readonly WritePatch[] {
+  return [
+    ...delta.removed.map((rowValue) => deleteExact(delta.relation, rowValue as Record<string, unknown>)),
+    ...delta.added.map((rowValue) => insertOrReplace(delta.relation, rowValue as Record<string, unknown>))
+  ];
+}
+
+function readWatchTargetRows<Row>(dbValue: WatchDb, target: WatchTarget<Row>, options: WatchOptions<Row> | QueryDiffOptions<Row> = {}): QueryResult<Row> {
+  if (isDb(dbValue)) return qResult(dbValue, queryForTarget(target), options);
+  return evaluate(dbValue, queryForTarget(target), options);
+}
+
+function toWatchDiagnostic(input: TarstateDiagnostic): WatchDiagnostic {
+  return {
+    code: input.code,
+    message: input.message,
+    ...(input.severity === undefined ? {} : { severity: input.severity }),
+    ...(input.relation === undefined ? {} : { relation: input.relation }),
+    ...(input.field === undefined ? {} : { field: input.field }),
+    surface: input.surface === 'changeTracking' ? 'changeTracking' : 'watch',
+    ...(input.detail === undefined ? {} : { detail: input.detail })
+  };
+}
+
+function toTrackChangeView<Row>(change: TrackedChange<Row>): TrackTransactChangeView<Row> {
+  return {
+    targetKey: change.targetKey,
+    target: change.target,
+    added: change.added,
+    removed: change.removed,
+    unchanged: change.unchanged,
+    rowChanges: change.rowChanges
+  };
+}
+
+function isTrackTransactOptions(input: unknown): input is TrackTransactOptions {
+  return isRecord(input)
+    && !isWritePatch(input)
+    && !isSetEnvTransaction(input)
+    && ('label' in input || 'mode' in input || 'throwOnUnsupported' in input);
+}
+
+function trackOptionsFromInputs(inputs: readonly unknown[]): TrackTransactOptions {
+  const last = inputs[inputs.length - 1];
+  return isTrackTransactOptions(last) ? last : {};
+}
+
+function unsupportedTrackTransactResult<DbValue extends WatchDb>(dbValue: DbValue, options: TrackTransactOptions): TrackTransactResult<DbValue> {
+  return {
+    db: dbValue,
+    supported: false,
+    changes: [],
+    changeMap: new Map(),
+    changesByTarget: new Map(),
+    changesByTargetKey: new Map(),
+    changesByQueryKey: {},
+    deltas: [],
+    diagnostics: [{
+      code: 'change_tracking_unsupported',
+      severity: 'error',
+      message: 'change tracking requires a Db input',
+      surface: 'trackTransact'
+    }],
+    ...(options.label === undefined ? {} : { label: options.label })
+  };
+}
+
+function relationFromSourceName(name: string): RelationRef | undefined {
+  return {
+    kind: 'relation',
+    name,
+    key: [],
+    fields: {},
+    ephemeral: false
+  } as RelationRef;
 }
 
 function expr(input: ExprInput | SortInput): ExprData {
@@ -1794,10 +4463,6 @@ function arrayify(input: ConstraintRelationFields): readonly string[] {
   return typeof input === 'string' ? [input] : input;
 }
 
-function emptyMaintenance(): MaterializationMaintenanceResult {
-  return { maintained: 0, recomputed: 0, carried: 0, skipped: 0, changes: [], diagnostics: [stubDiagnostic('maintainMaterializationSnapshots')] };
-}
-
 function isRelationRef(input: unknown): input is RelationRef {
   return isRecord(input) && input.kind === 'relation' && typeof input.name === 'string';
 }
@@ -1862,14 +4527,6 @@ function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
-function stubDiagnostic(surface: string): TarstateDiagnostic {
-  return { code: 'not_implemented', severity: 'warning', message: `${surface} is not implemented in rewrite stub`, surface };
-}
-
 function watchDiagnostic(label: string): WatchDiagnostic {
-  return { code: 'not_implemented', severity: 'warning', message: `${label} is not implemented in rewrite stub`, surface: 'watch' };
-}
-
-function notImplemented(surface: string): Error {
-  return Object.assign(new Error(`${surface} is not implemented in rewrite stub`), { code: 'not_implemented', surface });
+  return { code: 'change_tracking_unsupported', severity: 'warning', message: `${label} is not attached to an active watch`, surface: 'watch' };
 }
