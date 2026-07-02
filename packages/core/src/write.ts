@@ -14,7 +14,7 @@ export {
   updateByKey,
   write,
   writeInputPatches
-} from './stub.js';
+} from './impl.js';
 export type {
   DeleteByKeyPatch,
   DeleteExactPatch,
@@ -41,4 +41,4 @@ export type {
   UpdatePatch,
   WriteInput,
   WritePatch
-} from './stub.js';
+} from './impl.js';

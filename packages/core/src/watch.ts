@@ -15,7 +15,7 @@ export {
   watchRuntime,
   watchTarget,
   watchTargetKey
-} from './stub.js';
+} from './impl.js';
 export type {
   ChangeSet,
   QueryDiff,
@@ -39,4 +39,4 @@ export type {
   WatchTargetChange,
   WatchTargetRegistration,
   WatchUnsubscribeResult
-} from './stub.js';
+} from './impl.js';

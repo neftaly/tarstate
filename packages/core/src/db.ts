@@ -16,7 +16,7 @@ export {
   updateEnv,
   whatIf,
   withEnv
-} from './stub.js';
+} from './impl.js';
 export type {
   Db,
   DbData,
@@ -48,4 +48,4 @@ export type {
   RowLookupOptions,
   RowPredicateOptions,
   SetEnvTransaction
-} from './stub.js';
+} from './impl.js';

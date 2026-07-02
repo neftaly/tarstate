@@ -1162,9 +1162,9 @@ export type DbTransactionPlan = {
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 /**
- * Placeholder for the transaction-builder surface (patch/read helpers exposed
- * to transaction callbacks). The rewrite fills this in; it intentionally adds
- * no members yet so `DbTransactionContext` is currently just `Db`.
+ * Extension point for patch/read helpers exposed to transaction callbacks.
+ * Today the callback context is the staged `Db`; helpers can be added here
+ * without changing callback call sites.
  */
 export type DbTransactionBuilder = object;
 export type DbTransactionContext = Db & DbTransactionBuilder;
@@ -1544,9 +1544,9 @@ export async function validateConstraints(
 }
 
 /**
- * Placeholder for any db-like value that can carry materializations. The
- * rewrite narrows this; today `mat`/`demat` accept any object and return it
- * unchanged.
+ * Any db-like value that can carry materialization metadata.
+ * `Db` values are maintained by transactions; source-only targets can still
+ * be materialized for snapshot reads.
  */
 export type MaterializableDb = object;
 export type SnapshotMaterializationTarget = Db | RelationSource;

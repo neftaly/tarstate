@@ -1,2 +1,2 @@
-export { diffRows, rowDiffKey } from './stub.js';
-export type { RowChange, RowDiff, RowDiffDiagnostic, RowDiffOptions, RowDiffSide, RowKeySelector } from './stub.js';
+export { diffRows, rowDiffKey } from './impl.js';
+export type { RowChange, RowDiff, RowDiffDiagnostic, RowDiffOptions, RowDiffSide, RowKeySelector } from './impl.js';

@@ -11,5 +11,5 @@ export {
   refField,
   relation,
   stringField
-} from './stub.js';
-export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './stub.js';
+} from './impl.js';
+export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './impl.js';

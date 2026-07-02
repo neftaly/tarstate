@@ -1,4 +1,4 @@
-export { composeRelationRuntimes, isRelationRuntime, tryApplyRelationPatches } from './stub.js';
+export { composeRelationRuntimes, isRelationRuntime, tryApplyRelationPatches } from './impl.js';
 export type {
   AdapterSnapshot,
   AdapterSource,
@@ -23,4 +23,4 @@ export type {
   RelationSource,
   TarstateDiagnostic,
   WritePatch
-} from './stub.js';
+} from './impl.js';

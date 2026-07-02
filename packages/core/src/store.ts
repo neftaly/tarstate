@@ -1,4 +1,4 @@
-export { createRuntimeStore, createStore } from './stub.js';
+export { createRuntimeStore, createStore } from './impl.js';
 export type {
   Store,
   StoreCommit,
@@ -20,4 +20,4 @@ export type {
   StoreView,
   StoreViewSnapshot,
   StoreWhatIf
-} from './stub.js';
+} from './impl.js';

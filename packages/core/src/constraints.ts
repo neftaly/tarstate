@@ -5,7 +5,7 @@ export {
   req,
   unique,
   validateConstraints
-} from './stub.js';
+} from './impl.js';
 export type {
   CheckConstraintData,
   ConstraintData,
@@ -24,4 +24,4 @@ export type {
   QueryUniqueConstraintData,
   RequiredConstraintData,
   UniqueConstraintData
-} from './stub.js';
+} from './impl.js';

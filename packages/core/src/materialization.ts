@@ -13,7 +13,7 @@ export {
   materializedSourceFor,
   materializeSnapshot,
   readMaterializedQuery,
-} from './stub.js';
+} from './impl.js';
 export type {
   MaterializableDb,
   MaterializationBtreeIndex,
@@ -49,4 +49,4 @@ export type {
   SnapshotMaterializationOptions,
   SnapshotMaterializationTarget,
   SnapshotRefreshTarget,
-} from './stub.js';
+} from './impl.js';

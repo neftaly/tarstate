@@ -1,2 +1,2 @@
-export { createMemoryRelationRuntime } from './stub.js';
-export type { MemoryRelationRuntimeOptions } from './stub.js';
+export { createMemoryRelationRuntime } from './impl.js';
+export type { MemoryRelationRuntimeOptions } from './impl.js';

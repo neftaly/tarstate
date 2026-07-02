@@ -1,4 +1,4 @@
-export { collectDiagnostics, diagnostic, normalizeDiagnostics } from './stub.js';
+export { collectDiagnostics, diagnostic, normalizeDiagnostics } from './impl.js';
 export type {
   TarstateCoreDiagnosticCode,
   TarstateDiagnostic,
@@ -6,4 +6,4 @@ export type {
   TarstateDiagnosticMode,
   TarstateDiagnosticOptions,
   TarstateDiagnosticSeverity
-} from './stub.js';
+} from './impl.js';

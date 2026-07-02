@@ -68,7 +68,7 @@ export {
   value,
   where,
   without
-} from './stub.js';
+} from './impl.js';
 export type {
   AggregateConfig,
   AggregateFunction,
@@ -93,4 +93,4 @@ export type {
   SortData,
   SortDirection,
   SortInput
-} from './stub.js';
+} from './impl.js';

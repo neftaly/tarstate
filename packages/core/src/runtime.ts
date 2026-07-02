@@ -1,4 +1,4 @@
-export { trackRuntimeCommit, trackTransact, UnsupportedChangeTrackingError } from './stub.js';
+export { trackRuntimeCommit, trackTransact, UnsupportedChangeTrackingError } from './impl.js';
 export type {
   TrackRuntimeCommitDiagnostic,
   TrackRuntimeCommitOptions,
@@ -13,4 +13,4 @@ export type {
   TrackTransactOutput,
   TrackTransactQueryChanges,
   TrackTransactResult
-} from './stub.js';
+} from './impl.js';
