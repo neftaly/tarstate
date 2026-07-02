@@ -3846,9 +3846,16 @@ function createStoreView<Row, Version>(
 ): StoreView<Row, Version> {
   const key = queryKey(queryValue);
   let cachedSnapshot: StoreViewSnapshot<Row, Version> | undefined;
+  let cachedSnapshotDiagnosticsKey: string | undefined;
   const viewSnapshot = (): StoreViewSnapshot<Row, Version> => {
     const current = snapshot();
-    if (cachedSnapshot !== undefined && cachedSnapshot.revision === current.revision && cachedSnapshot.queryKey === key) {
+    const diagnosticsKey = diagnosticsFingerprint(current.diagnostics);
+    if (
+      cachedSnapshot !== undefined
+      && cachedSnapshot.revision === current.revision
+      && cachedSnapshot.queryKey === key
+      && cachedSnapshotDiagnosticsKey === diagnosticsKey
+    ) {
       return cachedSnapshot;
     }
     const result = qResult(current.db, queryValue);
@@ -3859,6 +3866,7 @@ function createStoreView<Row, Version>(
       queryKey: key,
       ...(current.version === undefined ? {} : { version: current.version })
     };
+    cachedSnapshotDiagnosticsKey = diagnosticsKey;
     return cachedSnapshot;
   };
   return {
@@ -3868,6 +3876,10 @@ function createStoreView<Row, Version>(
     subscribe: subscribeStore,
     refresh: async () => viewSnapshot()
   };
+}
+
+function diagnosticsFingerprint(diagnostics: readonly TarstateDiagnostic[]): string {
+  return envValueFingerprint(diagnostics);
 }
 
 function createWatchHandle<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, options: WatchOptions<Row>): WatchHandle<DbValue, Row> {
@@ -4944,6 +4956,18 @@ function envValueFingerprint(
   if (typeof input === 'function') return `~function:${input.name}`;
   if (input instanceof Date) return `~date:${Number.isNaN(input.valueOf()) ? 'Invalid' : input.toISOString()}`;
   if (input instanceof RegExp) return `~regexp:${input.source}/${input.flags}`;
+  if (input instanceof Map) {
+    const reference = envSeenReference(input, seen);
+    if (reference !== undefined) return reference;
+    return `~map:{${Array.from(input.entries())
+      .map(([key, valueValue]) => `${envValueFingerprint(key, seen)}=>${envValueFingerprint(valueValue, seen)}`)
+      .join(',')}}`;
+  }
+  if (input instanceof Set) {
+    const reference = envSeenReference(input, seen);
+    if (reference !== undefined) return reference;
+    return `~set:[${Array.from(input.values()).map((item) => envValueFingerprint(item, seen)).join(',')}]`;
+  }
   if (Array.isArray(input)) {
     const reference = envSeenReference(input, seen);
     if (reference !== undefined) return reference;

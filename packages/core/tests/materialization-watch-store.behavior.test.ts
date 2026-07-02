@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createDb, q, qResult, setEnvTx, transact, tryTransact, type DbTransactionContext } from '@tarstate/core/db';
+import { type TarstateDiagnostic } from '@tarstate/core/diagnostics';
 import { diffRows } from '@tarstate/core/diff';
 import {
   demat,
@@ -22,6 +23,7 @@ import {
   eq,
   expand,
   extend,
+  field,
   from,
   gte,
   hostFn,
@@ -34,6 +36,7 @@ import {
   rename,
   sel,
   sort,
+  sortLimit,
   sum,
   union,
   value,
@@ -99,6 +102,18 @@ const cashEntryProjection = pipe(
 const entryCount = pipe(
   from(entry),
   aggregate({ aggregates: { count: count() } })
+);
+
+const entryTotalsByAccount = pipe(
+  from(entry),
+  aggregate({
+    groupBy: { accountId: entry.accountId },
+    aggregates: {
+      entryCount: count(),
+      total: sum(entry.amount)
+    }
+  }),
+  sort(asc(field<string>('row', 'accountId')))
 );
 
 const firstTwoEntries = pipe(
@@ -361,6 +376,116 @@ describe('materialization, watch, and store behavior', () => {
     expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
   });
 
+  it('maintains multiple materializations over one relation while unsupported peers recompute', () => {
+    const queries: readonly Query<unknown>[] = [
+      cashEntryProjection as Query<unknown>,
+      sortedCashEntryProjection as Query<unknown>,
+      entryTotalsByAccount as Query<unknown>
+    ];
+    const db = mat(makeDb(), ...queries);
+
+    const result = tryTransact(
+      db,
+      updateByKey(schema.entries, 'e1', { amount: 125 }),
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true }),
+      deleteByKey(schema.entries, 'e4')
+    );
+    const changes = result.materializations?.changes ?? [];
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations).toEqual(expect.objectContaining({
+      maintained: 3,
+      recomputed: 1,
+      carried: 0,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: 'aggregate queries are not incrementally maintained'
+        })
+      ])
+    }));
+    expect(changes.map((change) => change.update)).toEqual(['incremental', 'incremental', 'recomputed']);
+    expect(changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'e1', amount: 125 },
+        { id: 'e5', amount: 35 }
+      ],
+      added: [{ id: 'e5', amount: 35 }],
+      removed: [{ id: 'e4', amount: 0 }],
+      diagnostics: []
+    }));
+    expect(changes[1]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'e5', accountId: 'cash', amount: 35 },
+        { id: 'e1', accountId: 'cash', amount: 125 }
+      ],
+      diagnostics: []
+    }));
+    expect(changes[2]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      rows: [
+        { accountId: 'cash', entryCount: 2, total: 160 },
+        { accountId: 'fees', entryCount: 1, total: -5 },
+        { accountId: 'sales', entryCount: 1, total: -120 }
+      ],
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: 'aggregate queries are not incrementally maintained'
+        })
+      ])
+    }));
+
+    for (const query of queries) {
+      expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+    }
+  });
+
+  it('incrementally maintains filtered projections across mixed transaction batches', () => {
+    const db = mat(makeDb(), cashEntryProjection);
+
+    const result = tryTransact(db, [
+      updateByKey(schema.entries, 'e1', { amount: 130 }),
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true }),
+      deleteByKey(schema.entries, 'e4'),
+      updateByKey(schema.accounts, 'cash', { name: 'Operating cash' })
+    ]);
+    const change = result.materializations?.changes[0];
+
+    expect(result.committed).toBe(true);
+    expect(result.patches).toBe(4);
+    expect(result.applied).toBe(4);
+    expect(result.materializations).toEqual(expect.objectContaining({
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: []
+    }));
+    expect(change).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rows: [
+        { id: 'e1', amount: 130 },
+        { id: 'e5', amount: 35 }
+      ],
+      added: [{ id: 'e5', amount: 35 }],
+      removed: [{ id: 'e4', amount: 0 }],
+      diagnostics: []
+    }));
+    expect(change?.rowChanges).toEqual(expect.arrayContaining([
+      { kind: 'updated', key: '["e1"]', before: { id: 'e1', amount: 120 }, after: { id: 'e1', amount: 130 } },
+      { kind: 'removed', key: '["e4"]', row: { id: 'e4', amount: 0 } },
+      { kind: 'added', key: '["e5"]', row: { id: 'e5', amount: 35 } }
+    ]));
+    expect(q(result.db, cashEntryProjection)).toBe(change?.rows);
+    expect(q(result.db, cashEntryProjection)).toEqual(q(demat(result.db, cashEntryProjection), cashEntryProjection));
+  });
+
   it('incrementally maintains sort-before-project when the projection preserves sort keys and identity', () => {
     const db = mat(makeDb(), sortedCashEntryProjection);
     const beforeRows = q(db, sortedCashEntryProjection);
@@ -542,6 +667,11 @@ describe('materialization, watch, and store behavior', () => {
       {
         label: 'sort and limit',
         query: firstTwoEntries as Query<unknown>,
+        reason: 'limit queries require auxiliary pre-limit state and are not incrementally maintained'
+      },
+      {
+        label: 'sortLimit',
+        query: pipe(from(entry), sortLimit(2, asc(entry.id))) as Query<unknown>,
         reason: 'limit queries require auxiliary pre-limit state and are not incrementally maintained'
       },
       {
@@ -897,6 +1027,51 @@ describe('materialization, watch, and store behavior', () => {
     ]);
   });
 
+  it('refreshes materialized query rows when setEnvTx mutates Map and Set env internals in place', () => {
+    const envProjectedEntry = pipe(
+      from(entry),
+      where(eq(entry.id, value('e1'))),
+      project({
+        id: entry.id,
+        routing: env<Map<string, string>>('routing'),
+        flags: env<Set<string>>('flags')
+      })
+    );
+    const routing = new Map([['accountId', 'cash']]);
+    const flags = new Set(['posted']);
+    const db = mat(createDb(makeDb().data, { env: { routing, flags } }), envProjectedEntry);
+    const first = q(db, envProjectedEntry);
+
+    expect((first[0] as { readonly routing: Map<string, string> }).routing.get('accountId')).toBe('cash');
+    expect((first[0] as { readonly flags: Set<string> }).flags.has('reviewed')).toBe(false);
+
+    const result = tryTransact(db, setEnvTx((envValue) => {
+      (envValue.routing as Map<string, string>).set('accountId', 'sales');
+      (envValue.flags as Set<string>).add('reviewed');
+      return envValue;
+    }));
+    const changed = q(result.db, envProjectedEntry);
+    const changedRow = changed[0] as { readonly routing: Map<string, string>; readonly flags: Set<string> };
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      touchedEnvDependencies: ['routing', 'flags'],
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: 'env dependency changed: routing, flags'
+        })
+      ])
+    }));
+    expect(changed).not.toBe(first);
+    expect(changedRow.routing).toBe(routing);
+    expect(changedRow.flags).toBe(flags);
+    expect(changedRow.routing.get('accountId')).toBe('sales');
+    expect(changedRow.flags.has('reviewed')).toBe(true);
+  });
+
   it('watch refresh and query diffs report added, removed, and unchanged rows', async () => {
     const before = makeDb();
     const after = transact(
@@ -1114,6 +1289,42 @@ describe('materialization, watch, and store behavior', () => {
     expect(viewRevisions).toEqual([1]);
 
     store.close();
+    store.close();
+  });
+
+  it('store view invalidates cached snapshots when runtime diagnostics change without a revision change', () => {
+    const data = makeDb().data;
+    let runtimeDiagnostics: readonly TarstateDiagnostic[] = [];
+    const runtime = {
+      source: {
+        relationNames: Object.keys(data),
+        rows: (relationRef) => data[relationRef.name] ?? [],
+        diagnostics: () => runtimeDiagnostics
+      }
+    } satisfies RelationRuntime<number>;
+    const store = createRuntimeStore({ runtime, relations: [schema.accounts, schema.entries] });
+    const view = store.view(entryList);
+    const first = view.getSnapshot();
+
+    runtimeDiagnostics = [{
+      code: 'adapter_warning',
+      severity: 'warning',
+      message: 'adapter diagnostics changed',
+      surface: 'adapter'
+    }];
+    const changed = view.getSnapshot();
+
+    expect(first).toEqual(expect.objectContaining({ revision: 0, diagnostics: [] }));
+    expect(changed).not.toBe(first);
+    expect(changed).toEqual(expect.objectContaining({
+      revision: 0,
+      diagnostics: runtimeDiagnostics
+    }));
+    expect(store.getSnapshot()).toEqual(expect.objectContaining({
+      revision: 0,
+      diagnostics: runtimeDiagnostics
+    }));
+
     store.close();
   });
 
