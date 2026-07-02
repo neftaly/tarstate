@@ -468,6 +468,29 @@ function taskOwnerTeamNestedRightBranchQuery(): Query<TaskNestedOwnerTeamRow> {
   ) as Query<TaskNestedOwnerTeamRow>;
 }
 
+function taskOwnerTeamDeeperNestedRightBranchQuery(): Query<TaskNestedOwnerTeamRow> {
+  const task = as(coreSchema.tasks, 'task');
+  const owner = as(coreSchema.users, 'owner');
+  const team = as(coreSchema.teams, 'team');
+  const teamByRank = as(coreSchema.teams, 'teamByRank');
+  const branchOwnerId = field<string>('ownerTeam', 'ownerId');
+  const branchOwner = field<string>('ownerTeam', 'owner');
+  const branchTeam = field<string>('ownerTeam', 'team');
+  const ownerTeams = pipe(
+    from(owner),
+    join(from(team), eq(owner.teamId, team.id)),
+    join(from(teamByRank), eq(team.rank, teamByRank.rank)),
+    project({ ownerId: owner.id, owner: owner.name, team: teamByRank.name })
+  );
+
+  return pipe(
+    from(task),
+    join(ownerTeams, eq(task.ownerId, branchOwnerId)),
+    project({ id: task.id, ownerId: task.ownerId, owner: branchOwner, team: branchTeam }),
+    keyBy('id')
+  ) as Query<TaskNestedOwnerTeamRow>;
+}
+
 function joinedTaskOwnerTeamRollupsQuery(): Query<JoinedTaskOwnerTeamRollupRow> {
   const task = as(coreSchema.tasks, 'task');
   const owner = as(coreSchema.users, 'owner');
@@ -3238,7 +3261,7 @@ describe('incremental materialization', () => {
     expect(materializedRowsForQuery(next, taskActiveOwners)).toEqual(change.rows);
   });
 
-  it('keeps an explicit fallback diagnostic for nested right branch joins', async () => {
+  it('incrementally maintains a join whose right branch contains one nested equality join', () => {
     const taskOwnerTeams = taskOwnerTeamNestedRightBranchQuery();
     const state = mat(createDb(sourceData), taskOwnerTeams, {
       id: 'task-owner-team-nested-right-branch',
@@ -3249,6 +3272,107 @@ describe('incremental materialization', () => {
     expect(metadata).toMatchObject({
       id: 'task-owner-team-nested-right-branch',
       requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users', 'teams']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, taskOwnerTeams)).toEqual([
+      { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Engineering' },
+      { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Engineering' },
+      { id: 't3', ownerId: 'bea', owner: 'Bea', team: 'Design' }
+    ]);
+
+    const renamedEngineeringTeam = { ...engineeringTeam, name: 'Engineering Platform' };
+    const renamedTeamDb = createDb({
+      ...sourceData,
+      teams: [designTeam, renamedEngineeringTeam]
+    });
+    const renamedTeamMaintenance = maintainMaterializations(state, renamedTeamDb, {
+      deltas: [teamsDelta([renamedEngineeringTeam], [engineeringTeam])]
+    });
+    const renamedTeamChange = singleMaterializationChange(renamedTeamMaintenance, 'task-owner-team-nested-right-branch');
+
+    expect(renamedTeamMaintenance).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expectNoIncrementalFallback([...renamedTeamMaintenance.diagnostics, ...renamedTeamChange.diagnostics]);
+    expect(renamedTeamChange).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['teams'],
+      rows: [
+        { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Engineering Platform' },
+        { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Engineering Platform' },
+        { id: 't3', ownerId: 'bea', owner: 'Bea', team: 'Design' }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expect(renamedTeamChange.rowChanges).toHaveLength(2);
+    expect(renamedTeamChange.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Engineering' },
+        after: { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Engineering Platform' }
+      }),
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Engineering' },
+        after: { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Engineering Platform' }
+      })
+    ]));
+    expect(materializedRowsForQuery(renamedTeamDb, taskOwnerTeams)).toEqual(renamedTeamChange.rows);
+
+    const movedAda = { ...adaUser, teamId: 'design' };
+    const movedOwnerDb = createDb({
+      ...sourceData,
+      teams: [designTeam, renamedEngineeringTeam],
+      users: [movedAda, beaUser, calUser]
+    });
+    const movedOwnerMaintenance = maintainMaterializations(renamedTeamDb, movedOwnerDb, {
+      deltas: [usersDelta([movedAda], [adaUser])]
+    });
+    const movedOwnerChange = singleMaterializationChange(movedOwnerMaintenance, 'task-owner-team-nested-right-branch');
+
+    expect(movedOwnerMaintenance).toMatchObject({ maintained: 1, recomputed: 0, skipped: 0 });
+    expectNoIncrementalFallback([...movedOwnerMaintenance.diagnostics, ...movedOwnerChange.diagnostics]);
+    expect(movedOwnerChange).toMatchObject({
+      maintenance: 'incremental',
+      recomputed: false,
+      touchedDependencies: ['users'],
+      rows: [
+        { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Design' },
+        { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Design' },
+        { id: 't3', ownerId: 'bea', owner: 'Bea', team: 'Design' }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expect(movedOwnerChange.rowChanges).toHaveLength(2);
+    expect(movedOwnerChange.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Engineering Platform' },
+        after: { id: 't1', ownerId: 'ada', owner: 'Ada', team: 'Design' }
+      }),
+      expect.objectContaining({
+        kind: 'updated',
+        before: { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Engineering Platform' },
+        after: { id: 't2', ownerId: 'ada', owner: 'Ada', team: 'Design' }
+      })
+    ]));
+    expect(materializedRowsForQuery(movedOwnerDb, taskOwnerTeams)).toEqual(movedOwnerChange.rows);
+  });
+
+  it('keeps an explicit fallback diagnostic for deeper nested right branch joins', async () => {
+    const taskOwnerTeams = taskOwnerTeamDeeperNestedRightBranchQuery();
+    const state = mat(createDb(sourceData), taskOwnerTeams, {
+      id: 'task-owner-team-deeper-nested-right-branch',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, taskOwnerTeams);
+
+    expect(metadata).toMatchObject({
+      id: 'task-owner-team-deeper-nested-right-branch',
+      requestedMode: 'incremental',
       maintenance: 'snapshot'
     });
     expect(metadata?.dependencies).toEqual(expect.arrayContaining(['tasks', 'users', 'teams']));
@@ -3256,7 +3380,7 @@ describe('incremental materialization', () => {
       expect.objectContaining({
         code: 'materialization_incremental_fallback',
         detail: expect.objectContaining({
-          reason: expect.stringContaining('right branch joins are not supported')
+          reason: expect.stringContaining('nested right branch join left side is not supported')
         })
       })
     ]));
