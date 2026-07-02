@@ -246,6 +246,14 @@ type TaskActiveOwnerRow = {
   readonly title: string;
 };
 
+type UserTopTaskRow = {
+  readonly ownerId: string;
+  readonly owner: string;
+  readonly taskId: string;
+  readonly title: string;
+  readonly points: number;
+};
+
 type TaskNestedOwnerTeamRow = {
   readonly id: string;
   readonly ownerId: string;
@@ -539,6 +547,87 @@ function taskActiveOwnersViaRightStaticFilterQuery(): Query<TaskActiveOwnerRow> 
     project({ id: task.id, ownerId: task.ownerId, title: task.title }),
     keyBy('id')
   ) as Query<TaskActiveOwnerRow>;
+}
+
+function usersWithGlobalTopTasksRightSortLimitQuery(count = 2): Query<UserTopTaskRow> {
+  const owner = as(coreSchema.users, 'owner');
+  const task = as(coreSchema.tasks, 'task');
+  const branchOwnerId = field<string>('topTask', 'ownerId');
+  const branchTaskId = field<string>('topTask', 'taskId');
+  const branchTitle = field<string>('topTask', 'title');
+  const branchPoints = field<number>('topTask', 'points');
+  const topTasks = pipe(
+    from(task),
+    sortLimit(count, desc(task.points), asc(task.id)),
+    project({ ownerId: task.ownerId, taskId: task.id, title: task.title, points: task.points })
+  );
+
+  return pipe(
+    from(owner),
+    join(topTasks, eq(owner.id, branchOwnerId)),
+    project({
+      ownerId: owner.id,
+      owner: owner.name,
+      taskId: branchTaskId,
+      title: branchTitle,
+      points: branchPoints
+    }),
+    keyBy('ownerId', 'taskId')
+  ) as Query<UserTopTaskRow>;
+}
+
+function usersWithSortedTasksRightBranchQuery(): Query<UserTopTaskRow> {
+  const owner = as(coreSchema.users, 'owner');
+  const task = as(coreSchema.tasks, 'task');
+  const branchOwnerId = field<string>('sortedTask', 'ownerId');
+  const branchTaskId = field<string>('sortedTask', 'taskId');
+  const branchTitle = field<string>('sortedTask', 'title');
+  const branchPoints = field<number>('sortedTask', 'points');
+  const sortedTasks = pipe(
+    from(task),
+    sort(desc(task.points), asc(task.id)),
+    project({ ownerId: task.ownerId, taskId: task.id, title: task.title, points: task.points })
+  );
+
+  return pipe(
+    from(owner),
+    join(sortedTasks, eq(owner.id, branchOwnerId)),
+    project({
+      ownerId: owner.id,
+      owner: owner.name,
+      taskId: branchTaskId,
+      title: branchTitle,
+      points: branchPoints
+    }),
+    keyBy('ownerId', 'taskId')
+  ) as Query<UserTopTaskRow>;
+}
+
+function usersWithLimitedTasksRightBranchQuery(): Query<UserTopTaskRow> {
+  const owner = as(coreSchema.users, 'owner');
+  const task = as(coreSchema.tasks, 'task');
+  const branchOwnerId = field<string>('limitedTask', 'ownerId');
+  const branchTaskId = field<string>('limitedTask', 'taskId');
+  const branchTitle = field<string>('limitedTask', 'title');
+  const branchPoints = field<number>('limitedTask', 'points');
+  const limitedTasks = pipe(
+    from(task),
+    limit(1),
+    project({ ownerId: task.ownerId, taskId: task.id, title: task.title, points: task.points })
+  );
+
+  return pipe(
+    from(owner),
+    join(limitedTasks, eq(owner.id, branchOwnerId)),
+    project({
+      ownerId: owner.id,
+      owner: owner.name,
+      taskId: branchTaskId,
+      title: branchTitle,
+      points: branchPoints
+    }),
+    keyBy('ownerId', 'taskId')
+  ) as Query<UserTopTaskRow>;
 }
 
 function taskOwnerTeamNestedRightBranchQuery(): Query<TaskNestedOwnerTeamRow> {
@@ -4712,6 +4801,158 @@ describe('incremental materialization', () => {
       expect.objectContaining({ kind: 'added', row: { id: 't-cal', ownerId: 'cal', title: 'Cal onboarding' } })
     ]));
     expect(materializedRowsForQuery(next, taskActiveOwners)).toEqual(change.rows);
+  });
+
+  it('incrementally maintains a join whose right branch uses sortLimit', () => {
+    const userTopTasks = usersWithGlobalTopTasksRightSortLimitQuery(2);
+    const state = mat(createDb(sourceData), userTopTasks, {
+      id: 'user-global-top-tasks-right-sort-limit',
+      mode: 'incremental'
+    });
+    const metadata = materializationForQuery(state, userTopTasks);
+
+    expect(metadata).toMatchObject({
+      id: 'user-global-top-tasks-right-sort-limit',
+      requestedMode: 'incremental',
+      maintenance: 'incremental'
+    });
+    expect(metadata?.dependencies).toEqual(expect.arrayContaining(['users', 'tasks']));
+    expectNoIncrementalFallback(metadata?.diagnostics ?? []);
+    expect(materializedRowsForQuery(state, userTopTasks)).toEqual([
+      { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 },
+      { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 }
+    ]);
+
+    const beaWinnerTask: TaskRow = {
+      id: 't4',
+      ownerId: 'bea',
+      title: 'Win right branch window',
+      done: false,
+      points: 20
+    };
+    const insertedWinnerDb = createDb({ ...sourceData, tasks: [...sourceData.tasks, beaWinnerTask] });
+    const insertedWinner = maintainMaterializations(state, insertedWinnerDb, {
+      deltas: [tasksDelta([beaWinnerTask], [])]
+    });
+    const insertedWinnerChange = expectIncrementalMaintenance(
+      insertedWinner,
+      'user-global-top-tasks-right-sort-limit'
+    );
+
+    expect(insertedWinnerChange).toMatchObject({
+      touchedDependencies: ['tasks'],
+      rows: [
+        { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 },
+        { ownerId: 'bea', owner: 'Bea', taskId: 't4', title: 'Win right branch window', points: 20 }
+      ],
+      addedRows: [
+        { ownerId: 'bea', owner: 'Bea', taskId: 't4', title: 'Win right branch window', points: 20 }
+      ],
+      removedRows: [
+        { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 }
+      ]
+    });
+    expect(insertedWinnerChange.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'removed',
+        row: { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { ownerId: 'bea', owner: 'Bea', taskId: 't4', title: 'Win right branch window', points: 20 }
+      })
+    ]));
+    expect(materializedRowsForQuery(insertedWinnerDb, userTopTasks)).toEqual(insertedWinnerChange.rows);
+
+    const deletedWinnerDb = createDb({
+      ...sourceData,
+      tasks: [draftEvaluatorTask, reviewFixturesTask]
+    });
+    const deletedWinner = maintainMaterializations(state, deletedWinnerDb, {
+      deltas: [tasksDelta([], [shipRuntimeTask])]
+    });
+    const deletedWinnerChange = expectIncrementalMaintenance(
+      deletedWinner,
+      'user-global-top-tasks-right-sort-limit'
+    );
+
+    expect(deletedWinnerChange).toMatchObject({
+      touchedDependencies: ['tasks'],
+      rows: [
+        { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 },
+        { ownerId: 'bea', owner: 'Bea', taskId: 't3', title: 'Review fixtures', points: 3 }
+      ],
+      addedRows: [
+        { ownerId: 'bea', owner: 'Bea', taskId: 't3', title: 'Review fixtures', points: 3 }
+      ],
+      removedRows: [
+        { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 }
+      ]
+    });
+    expect(deletedWinnerChange.rowChanges).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'removed',
+        row: { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 }
+      }),
+      expect.objectContaining({
+        kind: 'added',
+        row: { ownerId: 'bea', owner: 'Bea', taskId: 't3', title: 'Review fixtures', points: 3 }
+      })
+    ]));
+    expect(materializedRowsForQuery(deletedWinnerDb, userTopTasks)).toEqual(deletedWinnerChange.rows);
+
+    const updatedNonVisibleTask = { ...reviewFixturesTask, title: 'Non-visible update', points: 4 };
+    const nonVisibleDb = createDb({
+      ...sourceData,
+      tasks: [draftEvaluatorTask, shipRuntimeTask, updatedNonVisibleTask]
+    });
+    const nonVisible = maintainMaterializations(state, nonVisibleDb, {
+      deltas: [tasksDelta([updatedNonVisibleTask], [reviewFixturesTask])]
+    });
+    const nonVisibleChange = expectIncrementalMaintenance(
+      nonVisible,
+      'user-global-top-tasks-right-sort-limit'
+    );
+
+    expect(nonVisibleChange).toMatchObject({
+      touchedDependencies: ['tasks'],
+      rows: [
+        { ownerId: 'ada', owner: 'Ada', taskId: 't2', title: 'Ship runtime', points: 8 },
+        { ownerId: 'ada', owner: 'Ada', taskId: 't1', title: 'Draft evaluator', points: 5 }
+      ],
+      addedRows: [],
+      removedRows: []
+    });
+    expect(nonVisibleChange.rowChanges).toEqual([]);
+    expect(materializedRowsForQuery(nonVisibleDb, userTopTasks)).toEqual(nonVisibleChange.rows);
+  });
+
+  it('keeps right branch sort without limit and standalone limit on snapshot fallback', () => {
+    const cases = [
+      {
+        id: 'user-sorted-tasks-right-branch',
+        query: usersWithSortedTasksRightBranchQuery(),
+        reason: 'sort is not supported'
+      },
+      {
+        id: 'user-limited-tasks-right-branch',
+        query: usersWithLimitedTasksRightBranchQuery(),
+        reason: 'limit is not supported'
+      }
+    ];
+
+    for (const testCase of cases) {
+      const state = mat(createDb(sourceData), testCase.query, { id: testCase.id, mode: 'incremental' });
+      const metadata = materializationForQuery(state, testCase.query);
+
+      expect(metadata).toMatchObject({
+        id: testCase.id,
+        requestedMode: 'incremental',
+        maintenance: 'snapshot'
+      });
+      expect(metadata?.maintenanceReason).toContain(testCase.reason);
+      expectIncrementalFallback(metadata?.diagnostics ?? []);
+    }
   });
 
   it('incrementally maintains a join whose right branch contains one nested equality join', () => {

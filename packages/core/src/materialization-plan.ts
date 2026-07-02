@@ -211,6 +211,7 @@ type IncrementalBranchPlan = {
   readonly alias: string;
   readonly root: IncrementalRoot;
   readonly steps: readonly IncrementalBranchStep[];
+  readonly ordered?: IncrementalOrderedStep;
 };
 
 type IncrementalDynamicSetState = {
@@ -234,6 +235,7 @@ type IncrementalJoinState = {
   readonly indexByValue: ReadonlyMap<string, readonly IndexedRightRow[]>;
   readonly rootValuesByKey: ReadonlyMap<string, readonly unknown[]>;
   readonly rootKeysByValue: ReadonlyMap<string, readonly RootJoinValue[]>;
+  readonly branchOrdered?: IncrementalOrderedState<Record<string, unknown>>;
   readonly nestedBranchJoinStates?: readonly IncrementalJoinState[];
 };
 
@@ -440,7 +442,9 @@ type SubqueryEvaluationState = {
 
 type RightBranchPlanCollection = {
   readonly allowNestedJoin: boolean;
+  readonly allowOrderedWindow: boolean;
   branchJoinCount: number;
+  ordered?: MutableIncrementalOrderedStep;
 };
 
 const incrementalEvaluationContext = Symbol('incrementalEvaluationContext');
@@ -1629,7 +1633,7 @@ function collectDynamicSetBranches(
 
   const branches: IncrementalBranchPlan[] = [];
   for (const [index, input] of inputs.entries()) {
-    const branch = collectRightBranchPlan(input, { allowNestedJoin: false }, options);
+    const branch = collectRightBranchPlan(input, { allowNestedJoin: false, allowOrderedWindow: false }, options);
     if (typeof branch === 'string') {
       return {
         supported: false,
@@ -1817,7 +1821,7 @@ function collectSingleRootPlan(
       if (collection.ordered !== undefined) {
         return `${data.kind} join after order/window is not supported for incremental maintenance`;
       }
-      const right = collectRightBranchPlan(data.right, { allowNestedJoin: true }, options);
+      const right = collectRightBranchPlan(data.right, { allowNestedJoin: true, allowOrderedWindow: true }, options);
       if (typeof right === 'string') {
         return `join right branch is not supported for incremental maintenance: ${right}`;
       }
@@ -2061,7 +2065,7 @@ function planSubqueryExpression(
     return 'subquery incremental maintenance requires an unambiguous equality correlation';
   }
 
-  const right = collectRightBranchPlan(lowered.data, { allowNestedJoin: true }, options);
+  const right = collectRightBranchPlan(lowered.data, { allowNestedJoin: true, allowOrderedWindow: true }, options);
   if (typeof right === 'string') {
     return `subquery branch is not supported for incremental maintenance: ${right}`;
   }
@@ -2703,12 +2707,13 @@ function collectStaticInputShapes(
 
 function collectRightBranchPlan(
   data: QueryData,
-  branchOptions: { readonly allowNestedJoin: boolean },
+  branchOptions: { readonly allowNestedJoin: boolean; readonly allowOrderedWindow: boolean },
   options: IncrementalMaterializationPlanOptions
 ): RightBranchPlan | string {
   const steps: IncrementalBranchStep[] = [];
   return collectRightBranchPlanInternal(data, steps, {
     allowNestedJoin: branchOptions.allowNestedJoin,
+    allowOrderedWindow: branchOptions.allowOrderedWindow,
     branchJoinCount: 0
   }, options);
 }
@@ -2721,35 +2726,38 @@ function collectRightBranchPlanInternal(
 ): RightBranchPlan | string {
   switch (data.op) {
     case 'from':
-      return {
+      return rightBranchPlan({
         relation: data.relation,
         alias: data.alias,
         root: { kind: 'from' },
         steps,
         shape: shapeForRoot(data.relation, data.alias)
-      };
+      }, collection);
     case 'lookup': {
       const reason = constantExprReason(data.value, options);
       if (reason !== undefined) {
         return `lookup value is not supported: ${reason}`;
       }
-      return {
+      return rightBranchPlan({
         relation: data.relation,
         alias: data.alias,
         root: { kind: 'lookup', field: data.field, value: data.value },
         steps,
         shape: shapeForRoot(data.relation, data.alias)
-      };
+      }, collection);
     }
     case 'where': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'where after order/window is not supported';
+      }
       const reason = rowLocalPredicateReason(data.predicate, root.shape, options);
       if (reason !== undefined) {
         return `where predicate is not supported: ${reason}`;
       }
       steps.push({ kind: 'where', predicate: data.predicate });
-      return root;
+      return rightBranchPlan(root, collection);
     }
     case 'hash':
     case 'btree': {
@@ -2761,7 +2769,7 @@ function collectRightBranchPlanInternal(
           return `${data.op} expression is not supported: ${reason}`;
         }
       }
-      return root;
+      return rightBranchPlan(root, collection);
     }
     case 'keyBy':
       return collectRightBranchPlanInternal(data.input, steps, collection, options);
@@ -2772,8 +2780,13 @@ function collectRightBranchPlanInternal(
       if (reason !== undefined) {
         return `select projection is not supported: ${reason}`;
       }
-      steps.push({ kind: 'select', projection: data.projection });
-      return { ...root, shape: selectShape(root.shape, data.projection) };
+      const step = { kind: 'select', projection: data.projection } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
+      return rightBranchPlan({ ...root, shape: selectShape(root.shape, data.projection) }, collection);
     }
     case 'extend': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
@@ -2782,12 +2795,20 @@ function collectRightBranchPlanInternal(
       if (reason !== undefined) {
         return `extend projection is not supported: ${reason}`;
       }
-      steps.push({ kind: 'extend', projection: data.projection });
-      return { ...root, shape: extendShape(root.shape, data.projection) };
+      const step = { kind: 'extend', projection: data.projection } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
+      return rightBranchPlan({ ...root, shape: extendShape(root.shape, data.projection) }, collection);
     }
     case 'expand': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'expand after order/window is not supported';
+      }
       const reason = rowLocalExprReason(data.collection, root.shape, options);
       if (reason !== undefined) {
         return `expand collection is not supported: ${reason}`;
@@ -2798,25 +2819,40 @@ function collectRightBranchPlanInternal(
         ...(data.alias === undefined ? {} : { alias: data.alias }),
         ...(data.fields === undefined ? {} : { fields: data.fields })
       });
-      return { ...root, shape: expandShape(root.shape, data.alias, data.fields) };
+      return rightBranchPlan({ ...root, shape: expandShape(root.shape, data.alias, data.fields) }, collection);
     }
     case 'without': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
-      steps.push({ kind: 'without', fields: data.fields });
-      return { ...root, shape: withoutShape(root.shape, data.fields) };
+      const step = { kind: 'without', fields: data.fields } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
+      return rightBranchPlan({ ...root, shape: withoutShape(root.shape, data.fields) }, collection);
     }
     case 'rename': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
-      steps.push({ kind: 'rename', fields: data.fields });
-      return { ...root, shape: renameShape(root.shape, data.fields) };
+      const step = { kind: 'rename', fields: data.fields } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
+      return rightBranchPlan({ ...root, shape: renameShape(root.shape, data.fields) }, collection);
     }
     case 'qualify': {
       const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
       if (typeof root === 'string') return root;
-      steps.push({ kind: 'qualify', alias: data.alias });
-      return { ...root, shape: qualifyShape(root.shape, data.alias) };
+      const step = { kind: 'qualify', alias: data.alias } satisfies IncrementalPostOrderStep;
+      if (collection.ordered !== undefined) {
+        collection.ordered.postSteps.push(step);
+      } else {
+        steps.push(step);
+      }
+      return rightBranchPlan({ ...root, shape: qualifyShape(root.shape, data.alias) }, collection);
     }
     case 'join': {
       if (data.kind !== 'inner') {
@@ -2831,13 +2867,21 @@ function collectRightBranchPlanInternal(
 
       const left = collectRightBranchPlanInternal(data.left, steps, {
         allowNestedJoin: false,
+        allowOrderedWindow: collection.allowOrderedWindow,
         branchJoinCount: 0
       }, options);
       if (typeof left === 'string') {
         return `nested right branch join left side is not supported: ${left}`;
       }
+      if (left.ordered !== undefined || collection.ordered !== undefined) {
+        return 'join after order/window is not supported';
+      }
 
-      const right = collectRightBranchPlan(data.right, { allowNestedJoin: false }, options);
+      const right = collectRightBranchPlan(
+        data.right,
+        { allowNestedJoin: false, allowOrderedWindow: collection.allowOrderedWindow },
+        options
+      );
       if (typeof right === 'string') {
         return `nested right branch join right side is not supported: ${right}`;
       }
@@ -2868,14 +2912,37 @@ function collectRightBranchPlanInternal(
         predicate: data.on,
         needsPredicateCheck: equality.needsPredicateCheck
       });
-      return { ...left, shape: mergeShapes(left.shape, right.shape) };
+      return rightBranchPlan({ ...left, shape: mergeShapes(left.shape, right.shape) }, collection);
     }
     case 'sort':
       return 'sort is not supported';
     case 'limit':
       return 'limit is not supported';
-    case 'sortLimit':
-      return 'sortLimit is not supported';
+    case 'sortLimit': {
+      if (!collection.allowOrderedWindow) {
+        return 'sortLimit is not supported';
+      }
+      const root = collectRightBranchPlanInternal(data.input, steps, collection, options);
+      if (typeof root === 'string') return root;
+      if (collection.ordered !== undefined) {
+        return 'sortLimit after order/window is not supported';
+      }
+      const orderReason = sortOrderReason(data.order, root.shape, options);
+      if (orderReason !== undefined) {
+        return `sortLimit order is not supported: ${orderReason}`;
+      }
+      const window = normalizedWindow(data.count, 0);
+      if (typeof window === 'string') {
+        return `sortLimit is not supported: ${window}`;
+      }
+      collection.ordered = {
+        kind: 'ordered',
+        order: data.order,
+        window,
+        postSteps: []
+      };
+      return rightBranchPlan(root, collection);
+    }
     case 'union':
       return 'union is not supported';
     case 'intersection':
@@ -2904,6 +2971,9 @@ function collectRightBranchIntersectionPlan(
   if (typeof root === 'string') {
     return `intersection first branch is not supported: ${root}`;
   }
+  if (collection.ordered !== undefined) {
+    return 'intersection after order/window is not supported';
+  }
 
   const rightRows = collectStaticSetRows(rightInputs, 'intersection', options);
   if (typeof rightRows === 'string') {
@@ -2911,7 +2981,7 @@ function collectRightBranchIntersectionPlan(
   }
 
   steps.push({ kind: 'setFilter', op: 'intersection', rightRows });
-  return root;
+  return rightBranchPlan(root, collection);
 }
 
 function collectRightBranchDifferencePlan(
@@ -2925,6 +2995,9 @@ function collectRightBranchDifferencePlan(
   if (typeof root === 'string') {
     return `difference left branch is not supported: ${root}`;
   }
+  if (collection.ordered !== undefined) {
+    return 'difference after order/window is not supported';
+  }
 
   const rightRows = collectStaticSetRows([rightInput], 'difference', options);
   if (typeof rightRows === 'string') {
@@ -2932,7 +3005,7 @@ function collectRightBranchDifferencePlan(
   }
 
   steps.push({ kind: 'setFilter', op: 'difference', rightRows });
-  return root;
+  return rightBranchPlan(root, collection);
 }
 
 function branchPlan(plan: RightBranchPlan): IncrementalBranchPlan {
@@ -2940,7 +3013,18 @@ function branchPlan(plan: RightBranchPlan): IncrementalBranchPlan {
     relation: plan.relation,
     alias: plan.alias,
     root: plan.root,
-    steps: plan.steps
+    steps: plan.steps,
+    ...optionalImmutableOrderedStep(plan.ordered)
+  };
+}
+
+function rightBranchPlan(
+  plan: Omit<RightBranchPlan, 'ordered'> & { readonly ordered?: IncrementalOrderedStep },
+  collection: RightBranchPlanCollection
+): RightBranchPlan {
+  return {
+    ...plan,
+    ...optionalOrderedStep(collection.ordered)
   };
 }
 
@@ -3134,12 +3218,9 @@ function rootRowReport<Row>(
     .filter((rootKey) => changedRootKeys.has(rootKey))
     .flatMap((rootKey) => next.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
   const diff = diffMaterializationRows(beforeRows, afterRows, options);
-
-  return {
-    rowChanges: diff.changes,
-    addedRows: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
-    removedRows: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
-    rowBatches: changedKeys.map((rootKey) => {
+  const rowBatches = branchOrderedJoinStatePresent(previous) || branchOrderedJoinStatePresent(next)
+    ? branchOrderedFullRowBatches(previous, next)
+    : changedKeys.map((rootKey) => {
       const before = (previous.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
       const after = (next.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
       return {
@@ -3147,11 +3228,36 @@ function rootRowReport<Row>(
         afterRows: after,
         ...insertAnchorsForRoot(next, rootKey, after, options)
       };
-    }).filter((batch) => batch.beforeRows.length > 0 || batch.afterRows.length > 0),
+    }).filter((batch) => batch.beforeRows.length > 0 || batch.afterRows.length > 0);
+
+  return {
+    rowChanges: diff.changes,
+    addedRows: diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []),
+    removedRows: diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []),
+    rowBatches,
     changedRootKeys: changedKeys,
     changedGroupKeys: [],
     diagnostics: diff.diagnostics
   };
+}
+
+function branchOrderedFullRowBatches<Row>(
+  previous: IncrementalMaterializationState<Row>,
+  next: IncrementalMaterializationState<Row>
+): readonly IncrementalRowBatch<Row>[] {
+  const beforeRows = previous.rootKeys.flatMap((rootKey) => previous.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
+  const afterRows = next.rootKeys.flatMap((rootKey) => next.outputsByRootKey.get(rootKey) ?? []) as readonly Row[];
+  return materializationStableKey(beforeRows) === materializationStableKey(afterRows)
+    ? []
+    : [{ beforeRows, afterRows }];
+}
+
+function branchOrderedJoinStatePresent<Row>(state: IncrementalMaterializationState<Row>): boolean {
+  return state.joinStates.some(joinStateHasBranchOrdered);
+}
+
+function joinStateHasBranchOrdered(state: IncrementalJoinState): boolean {
+  return state.branchOrdered !== undefined || (state.nestedBranchJoinStates ?? []).some(joinStateHasBranchOrdered);
 }
 
 function aggregateRowReport<Row>(
@@ -4063,7 +4169,7 @@ function buildOrderedState<Row>(
     }
   }
 
-  return finalizeOrderedState(plan, entriesByOwnerKey, ownerKeys);
+  return finalizeOrderedState(ordered, entriesByOwnerKey, ownerKeys);
 }
 
 function maintainOrderedState<Row>(
@@ -4073,6 +4179,14 @@ function maintainOrderedState<Row>(
   changedOwnerKeys: ReadonlySet<string>,
   env: Readonly<Record<string, unknown>>
 ): OrderedStateResult<Row> {
+  const ordered = orderedStep(plan);
+  if (ordered === undefined) {
+    return {
+      supported: false,
+      reason: 'ordered step is missing from ordered incremental plan'
+    };
+  }
+
   const ownerKeys = orderedOwnerKeys(state);
   const ownerKeySet = new Set(ownerKeys);
   const entriesByOwnerKey = new Map(previous.entriesByOwnerKey);
@@ -4100,22 +4214,14 @@ function maintainOrderedState<Row>(
     }
   }
 
-  return finalizeOrderedState(plan, entriesByOwnerKey, ownerKeys);
+  return finalizeOrderedState(ordered, entriesByOwnerKey, ownerKeys);
 }
 
 function finalizeOrderedState<Row>(
-  plan: IncrementalMaterializationPlan,
+  ordered: IncrementalOrderedStep,
   entriesByOwnerKey: ReadonlyMap<string, readonly IncrementalOrderedEntry<Row>[]>,
   ownerKeys: readonly string[]
 ): OrderedStateResult<Row> {
-  const ordered = orderedStep(plan);
-  if (ordered === undefined) {
-    return {
-      supported: false,
-      reason: 'ordered step is missing from ordered incremental plan'
-    };
-  }
-
   const ownerIndexByKey = indexKeys(ownerKeys);
   const entriesByKey = new Map<string, IncrementalOrderedEntry<Row>>();
   for (const entries of entriesByOwnerKey.values()) {
@@ -4234,6 +4340,107 @@ function orderedOwnerRows<Row>(
   }
 
   return state.outputsByRootKey.get(ownerKey) ?? [];
+}
+
+function buildBranchOrderedState(
+  branch: IncrementalBranchPlan,
+  relationKeys: readonly string[],
+  rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
+  env: Readonly<Record<string, unknown>>
+): OrderedStateResult<Record<string, unknown>> | undefined {
+  if (branch.ordered === undefined) {
+    return undefined;
+  }
+
+  const entriesByOwnerKey = new Map<string, readonly IncrementalOrderedEntry<Record<string, unknown>>[]>();
+  for (const relationKey of relationKeys) {
+    const entries = orderedEntriesForBranchOwner(branch.ordered, relationKey, rowsByRelationKey, env);
+    if (!entries.supported) {
+      return entries;
+    }
+    if (entries.entries.length > 0) {
+      entriesByOwnerKey.set(relationKey, entries.entries);
+    }
+  }
+
+  return finalizeOrderedState(branch.ordered, entriesByOwnerKey, relationKeys);
+}
+
+function maintainBranchOrderedState(
+  branch: IncrementalBranchPlan,
+  previous: IncrementalOrderedState<Record<string, unknown>> | undefined,
+  relationKeys: readonly string[],
+  rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
+  changedRelationKeys: ReadonlySet<string>,
+  env: Readonly<Record<string, unknown>>
+): OrderedStateResult<Record<string, unknown>> | undefined {
+  if (branch.ordered === undefined) {
+    return undefined;
+  }
+  if (previous === undefined) {
+    return {
+      supported: false,
+      reason: 'right branch ordered state is missing; snapshot recompute is required'
+    };
+  }
+
+  const relationKeySet = new Set(relationKeys);
+  const entriesByOwnerKey = new Map(previous.entriesByOwnerKey);
+  for (const ownerKey of entriesByOwnerKey.keys()) {
+    if (!relationKeySet.has(ownerKey)) {
+      entriesByOwnerKey.delete(ownerKey);
+    }
+  }
+
+  for (const relationKey of changedRelationKeys) {
+    if (!relationKeySet.has(relationKey)) {
+      entriesByOwnerKey.delete(relationKey);
+      continue;
+    }
+
+    const entries = orderedEntriesForBranchOwner(branch.ordered, relationKey, rowsByRelationKey, env);
+    if (!entries.supported) {
+      return entries;
+    }
+    if (entries.entries.length === 0) {
+      entriesByOwnerKey.delete(relationKey);
+    } else {
+      entriesByOwnerKey.set(relationKey, entries.entries);
+    }
+  }
+
+  return finalizeOrderedState(branch.ordered, entriesByOwnerKey, relationKeys);
+}
+
+function orderedEntriesForBranchOwner(
+  ordered: IncrementalOrderedStep,
+  ownerKey: string,
+  rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
+  env: Readonly<Record<string, unknown>>
+):
+  | { readonly supported: true; readonly entries: readonly IncrementalOrderedEntry<Record<string, unknown>>[] }
+  | { readonly supported: false; readonly reason: string } {
+  const entries: IncrementalOrderedEntry<Record<string, unknown>>[] = [];
+  for (const [rowIndex, sourceRow] of (rowsByRelationKey.get(ownerKey) ?? []).entries()) {
+    const postOrderRows = evaluatePostOrderRows(ordered, sourceRow, env);
+    if (postOrderRows.length !== 1) {
+      return {
+        supported: false,
+        reason: 'right branch post-order projection produced an unexpected row count; snapshot recompute is required'
+      };
+    }
+
+    const key = stableKey([ownerKey, rowIndex]);
+    entries.push({
+      key,
+      ownerKey,
+      rowIndex,
+      sortValues: ordered.order.map((item) => exprValue(sourceRow, item.expr, env)),
+      row: postOrderRows[0] as Record<string, unknown>,
+      rowKey: key
+    });
+  }
+  return { supported: true, entries };
 }
 
 function duplicateOrderedRowKeyReason<Row>(
@@ -4830,6 +5037,13 @@ function buildJoinStates(
     const nestedBranchJoinStates = nestedJoinStatesResult.states.map((state) =>
       withRootJoinValues(state, nestedRootValuesByStep.get(state.id) ?? new Map())
     );
+    const branchOrdered = buildBranchOrderedState(step.right, relationKeys, rowsByRelationKey, env);
+    if (branchOrdered !== undefined && !branchOrdered.supported) {
+      return {
+        supported: false,
+        reason: branchOrdered.reason
+      };
+    }
     states.push({
       id: step.id,
       relation: step.right.relation,
@@ -4837,9 +5051,10 @@ function buildJoinStates(
       relationIndexByKey: indexKeys(relationKeys),
       relationRowsByKey,
       rowsByRelationKey,
-      indexByValue: buildRightIndex(step, relationKeys, rowsByRelationKey, env),
+      indexByValue: buildRightIndex(step, relationKeys, rowsByRelationKey, env, branchOrdered?.state),
       rootValuesByKey: new Map(),
       rootKeysByValue: new Map(),
+      ...(branchOrdered === undefined ? {} : { branchOrdered: branchOrdered.state }),
       ...(nestedBranchJoinStates.length === 0 ? {} : { nestedBranchJoinStates })
     });
   }
@@ -4892,6 +5107,13 @@ function buildBranchJoinStates(
       rowsByRelationKey.set(key, evaluated.rows);
     }
 
+    const branchOrdered = buildBranchOrderedState(step.right, relationKeys, rowsByRelationKey, env);
+    if (branchOrdered !== undefined && !branchOrdered.supported) {
+      return {
+        supported: false,
+        reason: branchOrdered.reason
+      };
+    }
     states.push({
       id: step.id,
       relation: step.right.relation,
@@ -4899,9 +5121,10 @@ function buildBranchJoinStates(
       relationIndexByKey: indexKeys(relationKeys),
       relationRowsByKey,
       rowsByRelationKey,
-      indexByValue: buildRightIndex(step, relationKeys, rowsByRelationKey, env),
+      indexByValue: buildRightIndex(step, relationKeys, rowsByRelationKey, env, branchOrdered?.state),
       rootValuesByKey: new Map(),
-      rootKeysByValue: new Map()
+      rootKeysByValue: new Map(),
+      ...(branchOrdered === undefined ? {} : { branchOrdered: branchOrdered.state })
     });
   }
 
@@ -4912,21 +5135,22 @@ function buildRightIndex(
   step: IncrementalIndexLikeStep,
   relationKeys: readonly string[],
   rowsByRelationKey: ReadonlyMap<string, readonly Record<string, unknown>[]>,
-  env: Readonly<Record<string, unknown>>
+  env: Readonly<Record<string, unknown>>,
+  branchOrdered?: IncrementalOrderedState<Record<string, unknown>>
 ): ReadonlyMap<string, readonly IndexedRightRow[]> {
   const index = new Map<string, IndexedRightRow[]>();
+  const rows = branchOrdered === undefined
+    ? relationKeys.flatMap((relationKey) => rowsByRelationKey.get(relationKey) ?? [])
+    : branchOrdered.rows;
 
-  for (const relationKey of relationKeys) {
-    const rows = rowsByRelationKey.get(relationKey) ?? [];
-    for (const row of rows) {
-      const value = exprValue(row, step.rightExpr, env);
-      const key = stableKey(value);
-      const candidates = index.get(key);
-      if (candidates === undefined) {
-        index.set(key, [{ row, value }]);
-      } else {
-        candidates.push({ row, value });
-      }
+  for (const row of rows) {
+    const value = exprValue(row, step.rightExpr, env);
+    const key = stableKey(value);
+    const candidates = index.get(key);
+    if (candidates === undefined) {
+      index.set(key, [{ row, value }]);
+    } else {
+      candidates.push({ row, value });
     }
   }
 
@@ -5185,7 +5409,22 @@ function reindexBranchRelationKeys(
   }
 
   const rowsByRelationKey = new Map(state.rowsByRelationKey);
-  const affectedValues: unknown[] = [];
+  if (step.right.ordered === undefined && state.branchOrdered !== undefined) {
+    return {
+      supported: false,
+      reason: 'right branch ordered state is present for a non-ordered branch; snapshot recompute is required'
+    };
+  }
+  if (step.right.ordered !== undefined && state.branchOrdered === undefined) {
+    return {
+      supported: false,
+      reason: 'right branch ordered state is missing; snapshot recompute is required'
+    };
+  }
+
+  const affectedValues: unknown[] = state.branchOrdered === undefined
+    ? []
+    : state.branchOrdered.rows.map((row) => exprValue(row, step.rightExpr, env));
   const nestedRootJoinIndexes = state.nestedBranchJoinStates === undefined
     ? undefined
     : mutableRootJoinIndexes(state.nestedBranchJoinStates);
@@ -5226,13 +5465,31 @@ function reindexBranchRelationKeys(
     : state.nestedBranchJoinStates.map((nestedState) =>
       withRootJoinIndex(nestedState, nestedRootJoinIndexes?.get(nestedState.id))
     );
+  const branchOrdered = maintainBranchOrderedState(
+    step.right,
+    state.branchOrdered,
+    state.relationKeys,
+    rowsByRelationKey,
+    relationKeysToEvaluate,
+    env
+  );
+  if (branchOrdered !== undefined && !branchOrdered.supported) {
+    return {
+      supported: false,
+      reason: branchOrdered.reason
+    };
+  }
+  if (branchOrdered !== undefined) {
+    affectedValues.push(...branchOrdered.state.rows.map((row) => exprValue(row, step.rightExpr, env)));
+  }
 
   return {
     supported: true,
     state: {
       ...state,
       rowsByRelationKey,
-      indexByValue: buildRightIndex(step, state.relationKeys, rowsByRelationKey, env),
+      indexByValue: buildRightIndex(step, state.relationKeys, rowsByRelationKey, env, branchOrdered?.state),
+      ...optionalBranchOrderedState(branchOrdered?.state),
       ...(nextNestedBranchJoinStates === undefined ? {} : { nestedBranchJoinStates: nextNestedBranchJoinStates })
     },
     affectedRootKeys: rootKeysMatchingJoinValues(state, affectedValues)
@@ -5251,8 +5508,26 @@ function applyRightRelationChanges(
   const relationInsertIndexByKey = keyChangeInsertIndexes(relation, changes, relationIndexByKey);
   const relationRowsByKey = new Map(state.relationRowsByKey);
   const rowsByRelationKey = new Map(state.rowsByRelationKey);
-  const indexByValue = mutableRightIndex(state.indexByValue);
-  const affectedValues: unknown[] = [];
+  if (step.right.ordered === undefined && state.branchOrdered !== undefined) {
+    return {
+      supported: false,
+      reason: 'right branch ordered state is present for a non-ordered branch; snapshot recompute is required'
+    };
+  }
+  if (step.right.ordered !== undefined && state.branchOrdered === undefined) {
+    return {
+      supported: false,
+      reason: 'right branch ordered state is missing; snapshot recompute is required'
+    };
+  }
+
+  const indexByValue: Map<string, IndexedRightRow[]> = state.branchOrdered === undefined
+    ? mutableRightIndex(state.indexByValue)
+    : new Map();
+  const affectedValues: unknown[] = state.branchOrdered === undefined
+    ? []
+    : state.branchOrdered.rows.map((row) => exprValue(row, step.rightExpr, env));
+  const changedRelationKeys = new Set<string>();
   const nestedRootJoinIndexes = state.nestedBranchJoinStates === undefined
     ? undefined
     : mutableRootJoinIndexes(state.nestedBranchJoinStates);
@@ -5261,6 +5536,7 @@ function applyRightRelationChanges(
   for (const change of changes) {
     const index = relationIndexByKey.get(change.key) ?? -1;
     const previousRows = rowsByRelationKey.get(change.key);
+    changedRelationKeys.add(change.key);
 
     if (change.after === undefined) {
       if (index === -1 || previousRows === undefined) {
@@ -5271,7 +5547,9 @@ function applyRightRelationChanges(
       }
 
       affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
-      removeRightIndexRows(step, indexByValue, previousRows, env);
+      if (state.branchOrdered === undefined) {
+        removeRightIndexRows(step, indexByValue, previousRows, env);
+      }
       relationKeys[index] = undefined;
       relationIndexByKey.delete(change.key);
       relationRowsByKey.delete(change.key);
@@ -5312,7 +5590,9 @@ function applyRightRelationChanges(
 
     if (previousRows !== undefined) {
       affectedValues.push(...previousRows.map((row) => exprValue(row, step.rightExpr, env)));
-      removeRightIndexRows(step, indexByValue, previousRows, env);
+      if (state.branchOrdered === undefined) {
+        removeRightIndexRows(step, indexByValue, previousRows, env);
+      }
       if (nestedRootJoinIndexes !== undefined) {
         removeRootJoinValues(nestedRootJoinIndexes, change.key);
       }
@@ -5328,7 +5608,9 @@ function applyRightRelationChanges(
     }
     const nextRows = evaluated.rows;
     affectedValues.push(...nextRows.map((row) => exprValue(row, step.rightExpr, env)));
-    addRightIndexRows(step, indexByValue, nextRows, env);
+    if (state.branchOrdered === undefined) {
+      addRightIndexRows(step, indexByValue, nextRows, env);
+    }
     rowsByRelationKey.set(change.key, nextRows);
     if (nestedRootJoinIndexes !== undefined) {
       addRootJoinValues(nestedRootJoinIndexes, change.key, evaluated.joinValuesByStep);
@@ -5349,6 +5631,26 @@ function applyRightRelationChanges(
     : state.nestedBranchJoinStates.map((nestedState) =>
       withRootJoinIndex(nestedState, nestedRootJoinIndexes?.get(nestedState.id))
     );
+  const branchOrdered = maintainBranchOrderedState(
+    step.right,
+    state.branchOrdered,
+    compactRelationKeys,
+    rowsByRelationKey,
+    changedRelationKeys,
+    env
+  );
+  if (branchOrdered !== undefined && !branchOrdered.supported) {
+    return {
+      supported: false,
+      reason: branchOrdered.reason
+    };
+  }
+  if (branchOrdered !== undefined) {
+    affectedValues.push(...branchOrdered.state.rows.map((row) => exprValue(row, step.rightExpr, env)));
+  }
+  const nextIndexByValue = branchOrdered !== undefined || state.nestedBranchJoinStates !== undefined
+    ? buildRightIndex(step, compactRelationKeys, rowsByRelationKey, env, branchOrdered?.state)
+    : indexByValue;
 
   return {
     supported: true,
@@ -5358,9 +5660,8 @@ function applyRightRelationChanges(
       relationIndexByKey: indexKeys(compactRelationKeys),
       relationRowsByKey,
       rowsByRelationKey,
-      indexByValue: state.nestedBranchJoinStates === undefined
-        ? indexByValue
-        : buildRightIndex(step, compactRelationKeys, rowsByRelationKey, env),
+      indexByValue: nextIndexByValue,
+      ...optionalBranchOrderedState(branchOrdered?.state),
       ...(nextNestedBranchJoinStates === undefined ? {} : { nestedBranchJoinStates: nextNestedBranchJoinStates })
     },
     affectedRootKeys: rootKeysMatchingJoinValues(state, affectedValues)
@@ -5465,6 +5766,18 @@ function optionalOrderedStep(
           postSteps: [...ordered.postSteps]
         }
       };
+}
+
+function optionalImmutableOrderedStep(
+  ordered: IncrementalOrderedStep | undefined
+): { readonly ordered?: IncrementalOrderedStep } {
+  return ordered === undefined ? {} : { ordered };
+}
+
+function optionalBranchOrderedState(
+  branchOrdered: IncrementalOrderedState<Record<string, unknown>> | undefined
+): { readonly branchOrdered?: IncrementalOrderedState<Record<string, unknown>> } {
+  return branchOrdered === undefined ? {} : { branchOrdered };
 }
 
 function optionalRelationPostSteps(
