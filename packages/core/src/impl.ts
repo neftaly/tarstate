@@ -483,12 +483,12 @@ export function constRows<Row extends object>(rows: readonly Row[]): Query<Row> 
 
 export const where = (predicate: PredicateData): PreserveQueryTransform => ((query) =>
   ({ ...query, data: { op: 'where', input: query.data, predicate } })) as PreserveQueryTransform;
-export const hash = (...expressions: readonly ExprData[]): PreserveQueryTransform => ((query) =>
-  ({ ...query, data: { op: 'hash', input: query.data, expressions } })) as PreserveQueryTransform;
-export const btree = (...expressions: readonly ExprData[]): PreserveQueryTransform => ((query) =>
-  ({ ...query, data: { op: 'btree', input: query.data, expressions } })) as PreserveQueryTransform;
-export const uniqueIndex = (...expressions: readonly ExprData[]): PreserveQueryTransform => ((query) =>
-  ({ ...query, data: { op: 'hash', input: query.data, expressions, unique: true } })) as PreserveQueryTransform;
+export const hash = (expression: ExprData): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'hash', input: query.data, expressions: [expression] } })) as PreserveQueryTransform;
+export const btree = (expression: ExprData): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'btree', input: query.data, expressions: [expression] } })) as PreserveQueryTransform;
+export const uniqueIndex = (expression: ExprData): PreserveQueryTransform => ((query) =>
+  ({ ...query, data: { op: 'uniqueIndex', input: query.data, expressions: [expression] } })) as PreserveQueryTransform;
 export const keyBy = (...fields: readonly string[]): PreserveQueryTransform => ((query) =>
   ({ ...query, data: { op: 'keyBy', input: query.data, fields } })) as PreserveQueryTransform;
 export function join<Right>(right: Query<Right>, on: PredicateData): JoinQueryTransform<Right, 'inner'>;
@@ -1597,18 +1597,30 @@ export type MaterializedDb = { readonly materialized?: readonly MaterializationM
 export type MaterializationMode = 'snapshot' | 'incremental';
 export type MaterializationMaintenanceKind = MaterializationMode;
 export type MaterializationMaintenanceDecision = 'skipped' | 'carried' | 'recomputed' | 'incremental';
-export type MaterializationIndexSpec = Readonly<Record<string, unknown>>;
+export type MaterializationIndexSpec =
+  | {
+      readonly op: 'hash';
+      readonly field: string;
+      readonly expressions: readonly [ExprData];
+    }
+  | {
+      readonly op: 'btree';
+      readonly field: string;
+      readonly expressions: readonly [ExprData];
+    }
+  | {
+      readonly op: 'uniqueIndex';
+      readonly field: string;
+      readonly expressions: readonly [ExprData];
+    };
 export type MaterializationOptions = { readonly id?: string; readonly mode?: MaterializationMode };
 export type SnapshotMaterializationOptions = MaterializationOptions;
-export type MaterializationQueryBatch<Row = unknown> = Record<string, Query<Row>>;
 export type MaterializationEnvDelta = {
   readonly name: string;
   readonly before: unknown;
   readonly after: unknown;
 };
 export type MaterializationMaintenanceOptions = { readonly deltas?: readonly RelationDelta[]; readonly envDeltas?: readonly MaterializationEnvDelta[] };
-export type SnapshotRefreshTarget<Row = unknown> = string | MaterializationMetadata<Row> | Query<Row>;
-export type MaterializedSourceOptions = EvaluateOptions;
 export type MaterializationMetadata<Row = unknown> = {
   readonly id: string;
   readonly query: Query<Row>;
@@ -1669,15 +1681,9 @@ export type MaterializationSetLike<Row = unknown> = {
   readonly values: () => IterableIterator<Row>;
   readonly [Symbol.iterator]: () => IterableIterator<Row>;
 };
-export type MaterializationMapLike<Key = unknown, Value = unknown> = { readonly get: (key: Key) => Value | undefined };
-export type MaterializationHashIndex<Row = unknown, Value = unknown> = MaterializationMapLike<Value, readonly Row[]>;
 export type MaterializationRangeBound<Value = unknown> = RelationRangeBound<Value>;
 export type MaterializationRange<Value = unknown> = { readonly lower?: MaterializationRangeBound<Value>; readonly upper?: MaterializationRangeBound<Value> };
-export type MaterializationBtreeIndex<Row = unknown, Value = unknown> = MaterializationMapLike<Value, readonly Row[]>;
-export type MaterializationUniqueIndex<Row = unknown, Value = unknown> = MaterializationMapLike<Value, Row>;
-export type MaterializationIndexResult<Row = unknown> = MaterializationSetLike<Row>;
 export type MaterializedQueryResult<Row = unknown> = QueryResult<Row> & { readonly materialized: boolean };
-export type MaterializationIndexOptions<Field extends string = string> = { readonly fields?: readonly Field[] };
 export type MaterializationInput<Row = unknown> =
   | Query<Row>
   | ConstraintData
@@ -1704,13 +1710,6 @@ export function mat<DbValue extends object>(dbValue: DbValue, ...inputs: readonl
   }
 
   return withMaterializedState(dbValue, state) as DbValue & MaterializedDb;
-}
-export async function materializeSnapshot<DbValue extends SnapshotMaterializationTarget, Row>(
-  dbValue: DbValue,
-  query: Query<Row>,
-  options: SnapshotMaterializationOptions = {}
-): Promise<DbValue & MaterializedDb> {
-  return mat(dbValue, materializationMetadata(query, options));
 }
 export const demat = <DbValue extends MaterializableDb>(dbValue: DbValue, ...targets: readonly MaterializationTarget[]): DbValue => {
   const current = materializedStateFor(dbValue);
@@ -1785,10 +1784,14 @@ export const materializedSourceFor = (input: unknown): RelationSource | undefine
   const state = materializedStateFor(input);
   if (state.metadata.length === 0) return undefined;
   const data = Object.fromEntries(state.metadata.map((item) => [item.id, state.rows.get(item.id) ?? []]));
-  return fromObjectSource(data);
+  const fallback = fromObjectSource(data);
+  return {
+    ...(fallback.relationNames === undefined ? {} : { relationNames: fallback.relationNames }),
+    rows: fallback.rows,
+    lookup: (lookupValue) => materializedIndexLookup(state, lookupValue) ?? fallback.lookup?.(lookupValue),
+    rangeLookup: (lookupValue) => materializedIndexRangeLookup(state, lookupValue) ?? fallback.rangeLookup?.(lookupValue)
+  };
 };
-export const materializedLookupRowsFor = <Row = unknown>(input?: unknown, id?: string): readonly Row[] | undefined =>
-  input === undefined || id === undefined ? undefined : materializedRowsFor<Row>(input, id);
 export function maintainMaterializationSnapshots<Row = unknown>(
   before?: unknown,
   after?: unknown,
@@ -1845,7 +1848,9 @@ export function maintainMaterializationSnapshots<Row = unknown>(
       : maintainMaterializationIncrementally(before, target, metadata.query as Query<Row>, previousRows, options.deltas, beforeState.aux.get(metadata.id));
 
     if (incremental !== undefined && incremental.supported) {
-      if (incremental.aux !== undefined) nextAux.set(metadata.id, incremental.aux);
+      const refreshedAux = materializationAuxForRows(target, metadata.query as Query<Row>, incremental.rows, incremental.aux);
+      if (refreshedAux === undefined) nextAux.delete(metadata.id);
+      else nextAux.set(metadata.id, refreshedAux);
       changes.push({
         update: 'incremental',
         recomputed: false,
@@ -1887,7 +1892,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
       diagnostics: fallbackDiagnostics
     });
     changes.push(recomputed);
-    const refreshedAux = materializationAuxForTarget<Row>(target, metadata.query as Query<Row>);
+    const refreshedAux = materializationAuxForRows<Row>(target, metadata.query as Query<Row>, recomputed.rows);
     if (refreshedAux === undefined) nextAux.delete(metadata.id);
     else nextAux.set(metadata.id, refreshedAux);
   }
@@ -1949,8 +1954,26 @@ type IncrementalTopNShape = {
   readonly preLimitData: QueryData;
   readonly finalSort: QueryData;
 };
+type InternalMaterializationIndexKind = 'hash' | 'btree' | 'uniqueIndex';
+type InternalMaterializationIndexSpec = {
+  readonly op: InternalMaterializationIndexKind;
+  readonly field: string;
+};
+type InternalMaterializationIndexEntry = {
+  readonly order: number;
+  readonly row: unknown;
+};
+type InternalMaterializationIndexBucket = {
+  readonly value: unknown;
+  readonly entries: readonly InternalMaterializationIndexEntry[];
+};
+type InternalMaterializationIndex = InternalMaterializationIndexSpec & {
+  readonly buckets: ReadonlyMap<string, InternalMaterializationIndexBucket>;
+  readonly orderedBuckets?: readonly InternalMaterializationIndexBucket[];
+};
 type InternalMaterializationAux = {
-  readonly topNPreLimitRows: readonly unknown[];
+  readonly topNPreLimitRows?: readonly unknown[];
+  readonly indexes?: readonly InternalMaterializationIndex[];
 };
 type InternalMaterializationMaintenanceAux<Row = unknown> = MaterializationMaintenanceResult<Row> & {
   readonly [MATERIALIZATION_MAINTENANCE_AUX]?: ReadonlyMap<string, InternalMaterializationAux>;
@@ -2972,36 +2995,192 @@ function recomputeMaterializationChange<Row>(
 }
 
 function materializationIndexSpecs(query: Query): readonly MaterializationIndexSpec[] {
-  return materializationIndexSpecsFromData(query.data);
+  const finalFields = finalRowFieldExpressions(query.data, query.relations);
+  return materializationIndexSpecsFromData(query.data, finalFields);
 }
 
-function materializationIndexSpecsFromData(data: QueryData): readonly MaterializationIndexSpec[] {
+function materializationIndexSpecsFromData(
+  data: QueryData,
+  finalFields: ReadonlyMap<string, ExprData>
+): readonly MaterializationIndexSpec[] {
   const input = queryDataFrom(data.input);
-  const nested = input === undefined ? [] : materializationIndexSpecsFromData(input);
-  const own = materializationIndexSpecFromData(data);
+  const nested = input === undefined ? [] : materializationIndexSpecsFromData(input, finalFields);
+  const own = materializationIndexSpecFromData(data, finalFields);
   return own === undefined ? nested : [...nested, own];
 }
 
-function materializationIndexSpecFromData(data: QueryData): MaterializationIndexSpec | undefined {
+function materializationIndexSpecFromData(
+  data: QueryData,
+  finalFields: ReadonlyMap<string, ExprData>
+): MaterializationIndexSpec | undefined {
+  const expression = arrayFromUnknown(data.expressions)[0];
+  if (!isExpr(expression) || arrayFromUnknown(data.expressions).length !== 1) return undefined;
+  const expressions = [expression] as const;
+  const fieldName = finalRowFieldNameForExpr(expression, finalFields);
+  if (fieldName === undefined) return undefined;
+
   switch (data.op) {
     case 'hash':
       return {
-        op: data.unique === true ? 'uniqueIndex' : 'hash',
-        expressions: arrayFromUnknown(data.expressions)
+        op: 'hash',
+        field: fieldName,
+        expressions
       };
     case 'btree':
       return {
         op: 'btree',
-        expressions: arrayFromUnknown(data.expressions)
+        field: fieldName,
+        expressions
       };
     case 'uniqueIndex':
       return {
         op: 'uniqueIndex',
-        expressions: arrayFromUnknown(data.expressions)
+        field: fieldName,
+        expressions
       };
     default:
       return undefined;
   }
+}
+
+function internalMaterializationIndexSpec(input: MaterializationIndexSpec): InternalMaterializationIndexSpec | undefined {
+  const op = input.op;
+  const fieldName = input.field;
+  if ((op !== 'hash' && op !== 'btree' && op !== 'uniqueIndex') || typeof fieldName !== 'string') return undefined;
+  return { op, field: fieldName };
+}
+
+function materializationIndexesForRows<Row>(
+  query: Query<Row>,
+  rows: readonly Row[]
+): readonly InternalMaterializationIndex[] | undefined {
+  const specs = materializationIndexSpecs(query).flatMap((spec) => {
+    const internal = internalMaterializationIndexSpec(spec);
+    return internal === undefined ? [] : [internal];
+  });
+  if (specs.length === 0) return undefined;
+  return specs.map((spec) => materializationIndexForRows(spec, rows));
+}
+
+function materializationIndexForRows<Row>(
+  spec: InternalMaterializationIndexSpec,
+  rows: readonly Row[]
+): InternalMaterializationIndex {
+  const buckets = new Map<string, { value: unknown; entries: InternalMaterializationIndexEntry[] }>();
+  for (const [order, rowValue] of rows.entries()) {
+    if (!isRecord(rowValue)) continue;
+    const valueValue = rowValue[spec.field];
+    const key = stableKey(valueValue);
+    const existing = buckets.get(key);
+    if (existing === undefined) {
+      buckets.set(key, { value: valueValue, entries: [{ order, row: rowValue }] });
+    } else {
+      existing.entries.push({ order, row: rowValue });
+    }
+  }
+
+  const finalizedBuckets = new Map<string, InternalMaterializationIndexBucket>(
+    Array.from(buckets, ([key, bucket]) => [key, { value: bucket.value, entries: bucket.entries }])
+  );
+  return {
+    ...spec,
+    buckets: finalizedBuckets,
+    ...(spec.op === 'btree'
+      ? { orderedBuckets: Array.from(finalizedBuckets.values()).sort((left, right) => compareValues(left.value, right.value)) }
+      : {})
+  };
+}
+
+function materializedIndexLookup(
+  state: InternalMaterializationState,
+  lookupValue: RelationLookup
+): readonly unknown[] | undefined {
+  const indexes = state.aux.get(lookupValue.relation.name)?.indexes;
+  const index = indexes?.find((item) =>
+    (item.op === 'hash' || item.op === 'uniqueIndex') && item.field === lookupValue.field);
+  if (index === undefined) return undefined;
+  const bucket = index.buckets.get(stableKey(lookupValue.value));
+  if (bucket === undefined) return [];
+  return bucket.entries
+    .filter((entry) => isRecord(entry.row) && Object.is(entry.row[lookupValue.field], lookupValue.value))
+    .map((entry) => entry.row);
+}
+
+function materializedIndexRangeLookup(
+  state: InternalMaterializationState,
+  lookupValue: RelationRangeLookup
+): readonly unknown[] | undefined {
+  const rows = state.rows.get(lookupValue.relation.name);
+  const indexes = state.aux.get(lookupValue.relation.name)?.indexes;
+  const index = indexes?.find((item) => item.op === 'btree' && item.field === lookupValue.field);
+  if (index === undefined) return undefined;
+  const buckets = materializedIndexRangeBuckets(index, lookupValue);
+  const matchedEntryCount = buckets.reduce((sumValue, bucket) => sumValue + bucket.entries.length, 0);
+  if (rows !== undefined && matchedEntryCount > rows.length / 16) {
+    return rows.filter((rowValue) =>
+      isRecord(rowValue) && materializationRangeContainsValue(rowValue[lookupValue.field], lookupValue));
+  }
+  return buckets.flatMap((bucket) => bucket.entries)
+    .sort((left, right) => left.order - right.order)
+    .map((entry) => entry.row);
+}
+
+function materializedIndexRangeBuckets(
+  index: InternalMaterializationIndex,
+  lookupValue: RelationRangeLookup
+): readonly InternalMaterializationIndexBucket[] {
+  const orderedBuckets = index.orderedBuckets;
+  if (orderedBuckets === undefined) {
+    return Array.from(index.buckets.values()).filter((bucket) => materializationRangeContainsValue(bucket.value, lookupValue));
+  }
+
+  const start = lookupValue.lower === undefined ? 0 : materializationRangeLowerIndex(orderedBuckets, lookupValue.lower);
+  const end = lookupValue.upper === undefined ? orderedBuckets.length : materializationRangeUpperIndex(orderedBuckets, lookupValue.upper);
+  return orderedBuckets.slice(start, end);
+}
+
+function materializationRangeLowerIndex(
+  buckets: readonly InternalMaterializationIndexBucket[],
+  lower: RelationRangeBound
+): number {
+  let start = 0;
+  let end = buckets.length;
+  while (start < end) {
+    const midpoint = Math.floor((start + end) / 2);
+    const bucket = buckets[midpoint];
+    const comparisonValue = bucket === undefined ? 1 : compareValues(bucket.value, lower.value);
+    if (comparisonValue < 0 || (comparisonValue === 0 && !lower.inclusive)) start = midpoint + 1;
+    else end = midpoint;
+  }
+  return start;
+}
+
+function materializationRangeUpperIndex(
+  buckets: readonly InternalMaterializationIndexBucket[],
+  upper: RelationRangeBound
+): number {
+  let start = 0;
+  let end = buckets.length;
+  while (start < end) {
+    const midpoint = Math.floor((start + end) / 2);
+    const bucket = buckets[midpoint];
+    const comparisonValue = bucket === undefined ? 1 : compareValues(bucket.value, upper.value);
+    if (comparisonValue > 0 || (comparisonValue === 0 && !upper.inclusive)) end = midpoint;
+    else start = midpoint + 1;
+  }
+  return start;
+}
+
+function materializationRangeContainsValue(valueValue: unknown, lookupValue: RelationRangeLookup): boolean {
+  if (lookupValue.lower !== undefined) {
+    const comparisonValue = compareValues(valueValue, lookupValue.lower.value);
+    if (comparisonValue < 0 || (comparisonValue === 0 && !lookupValue.lower.inclusive)) return false;
+  }
+  if (lookupValue.upper !== undefined) {
+    const comparisonValue = compareValues(valueValue, lookupValue.upper.value);
+    if (comparisonValue > 0 || (comparisonValue === 0 && !lookupValue.upper.inclusive)) return false;
+  }
+  return true;
 }
 
 function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalMaterializationSupport<Row> {
@@ -5152,6 +5331,18 @@ type InternalWatchState<Row = unknown> = {
   active: boolean;
   options: WatchOptions<Row>;
 };
+type WherePushdown =
+  | { readonly kind: 'lookup'; readonly field: string; readonly value: unknown }
+  | {
+      readonly kind: 'range';
+      readonly field: string;
+      readonly lower?: RelationRangeBound;
+      readonly upper?: RelationRangeBound;
+    };
+type WherePushdownTarget = WherePushdown & {
+  readonly relation: RelationRef;
+  readonly alias: string;
+};
 
 const MATERIALIZATION_STATE = Symbol('tarstate.materializationState');
 const ATTACHED_WATCH_TARGETS = Symbol('tarstate.attachedWatchTargets');
@@ -5180,8 +5371,7 @@ function evaluateQueryData(
     case 'constRows':
       return arrayFromUnknown(data.rows).map((rowValue) => entryForRow(rowValue));
     case 'where':
-      return evaluateNestedInput(source, data, relations, options, outer, diagnostics)
-        .filter((entry) => Boolean(evaluateExpr(data.predicate, entry, source, relations, options, diagnostics, outer)));
+      return evaluateWhere(source, data, relations, options, outer, diagnostics);
     case 'project': {
       const input = evaluateNestedInput(source, data, relations, options, outer, diagnostics);
       const projection = projectionFrom(data.projection);
@@ -5305,6 +5495,147 @@ function evaluateLookup(
   const lookupRows = source.lookup?.({ relation: relationRef, field: fieldName, value: data.value })
     ?? source.rows(relationRef).filter((rowValue) => isRecord(rowValue) && Object.is(rowValue[fieldName], data.value));
   return validateSourceRows(relationRef, lookupRows, diagnostics).map((rowValue) => entryForRow(rowValue, alias, relationRef.name));
+}
+
+function evaluateWhere(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  outer: EvalEntry | undefined,
+  diagnostics: TarstateDiagnostic[]
+): readonly EvalEntry[] {
+  const pushed = wherePushdownTarget(data, relations);
+  let input: readonly EvalEntry[];
+  if (pushed === undefined) {
+    input = evaluateNestedInput(source, data, relations, options, outer, diagnostics);
+  } else {
+    const pushedRows = readWherePushdownRows(source, pushed);
+    input = pushedRows === undefined
+      ? evaluateNestedInput(source, data, relations, options, outer, diagnostics)
+      : validateSourceRows(pushed.relation, pushedRows, diagnostics)
+        .map((rowValue) => entryForRow(rowValue, pushed.alias, pushed.relation.name));
+  }
+  return input.filter((entry) => Boolean(evaluateExpr(data.predicate, entry, source, relations, options, diagnostics, outer)));
+}
+
+function readWherePushdownRows(
+  source: RelationSource,
+  pushdown: WherePushdownTarget
+): readonly unknown[] | undefined {
+  switch (pushdown.kind) {
+    case 'lookup':
+      return source.lookup?.({ relation: pushdown.relation, field: pushdown.field, value: pushdown.value });
+    case 'range':
+      return source.rangeLookup?.({
+        relation: pushdown.relation,
+        field: pushdown.field,
+        ...(pushdown.lower === undefined ? {} : { lower: pushdown.lower }),
+        ...(pushdown.upper === undefined ? {} : { upper: pushdown.upper })
+      });
+  }
+}
+
+function wherePushdownTarget(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): WherePushdownTarget | undefined {
+  const input = queryDataFrom(data.input);
+  if (input?.op !== 'from') return undefined;
+  const relationName = typeof input.relation === 'string' ? input.relation : undefined;
+  const relationRef = relationName === undefined ? undefined : relations[relationName];
+  if (!isRelationRef(relationRef)) return undefined;
+  const alias = typeof input.alias === 'string' ? input.alias : relationRef.name;
+  const pushdown = wherePushdown(data.predicate, new Set([alias, relationRef.name, 'row']));
+  return pushdown === undefined ? undefined : { ...pushdown, relation: relationRef, alias };
+}
+
+function wherePushdown(input: unknown, aliases: ReadonlySet<string>): WherePushdown | undefined {
+  const data = exprFrom(unwrapOptionalProjection(input));
+  switch (data.op) {
+    case 'eq':
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte':
+      return comparisonWherePushdown(data.op, data.left, data.right, aliases);
+    case 'and':
+      for (const predicate of arrayFromUnknown(data.predicates)) {
+        const pushed = wherePushdown(predicate, aliases);
+        if (pushed !== undefined) return pushed;
+      }
+      return undefined;
+    default:
+      return undefined;
+  }
+}
+
+function comparisonWherePushdown(
+  op: string,
+  left: unknown,
+  right: unknown,
+  aliases: ReadonlySet<string>
+): WherePushdown | undefined {
+  const leftField = wherePushdownField(left, aliases);
+  const rightLiteral = wherePushdownLiteral(right);
+  if (leftField !== undefined && rightLiteral !== undefined) {
+    return directComparisonWherePushdown(op, leftField, rightLiteral.value);
+  }
+
+  const rightField = wherePushdownField(right, aliases);
+  const leftLiteral = wherePushdownLiteral(left);
+  if (rightField !== undefined && leftLiteral !== undefined) {
+    return reversedComparisonWherePushdown(op, rightField, leftLiteral.value);
+  }
+
+  return undefined;
+}
+
+function directComparisonWherePushdown(op: string, fieldName: string, valueValue: unknown): WherePushdown | undefined {
+  switch (op) {
+    case 'eq':
+      return { kind: 'lookup', field: fieldName, value: valueValue };
+    case 'gt':
+      return { kind: 'range', field: fieldName, lower: { value: valueValue, inclusive: false } };
+    case 'gte':
+      return { kind: 'range', field: fieldName, lower: { value: valueValue, inclusive: true } };
+    case 'lt':
+      return { kind: 'range', field: fieldName, upper: { value: valueValue, inclusive: false } };
+    case 'lte':
+      return { kind: 'range', field: fieldName, upper: { value: valueValue, inclusive: true } };
+    default:
+      return undefined;
+  }
+}
+
+function reversedComparisonWherePushdown(op: string, fieldName: string, valueValue: unknown): WherePushdown | undefined {
+  switch (op) {
+    case 'eq':
+      return { kind: 'lookup', field: fieldName, value: valueValue };
+    case 'gt':
+      return { kind: 'range', field: fieldName, upper: { value: valueValue, inclusive: false } };
+    case 'gte':
+      return { kind: 'range', field: fieldName, upper: { value: valueValue, inclusive: true } };
+    case 'lt':
+      return { kind: 'range', field: fieldName, lower: { value: valueValue, inclusive: false } };
+    case 'lte':
+      return { kind: 'range', field: fieldName, lower: { value: valueValue, inclusive: true } };
+    default:
+      return undefined;
+  }
+}
+
+function wherePushdownField(input: unknown, aliases: ReadonlySet<string>): string | undefined {
+  const data = exprFrom(unwrapOptionalProjection(input));
+  if (data.op !== 'field') return undefined;
+  const alias = typeof data.alias === 'string' ? data.alias : 'row';
+  const fieldName = typeof data.field === 'string' ? data.field : undefined;
+  return fieldName !== undefined && aliases.has(alias) ? fieldName : undefined;
+}
+
+function wherePushdownLiteral(input: unknown): { readonly value: unknown } | undefined {
+  const data = exprFrom(unwrapOptionalProjection(input));
+  return data.op === 'value' ? { value: data.value } : undefined;
 }
 
 function evaluateNestedInput(
@@ -6790,7 +7121,12 @@ function addMaterializationMetadata(
   const refresh = refreshMaterializationRows(target, metadata.query);
   rows.set(metadata.id, refresh.rows);
   const aux = new Map(state.aux);
-  const materializationAux = materializationAuxForTarget(target, metadata.query);
+  const materializationAux = materializationAuxForRows(
+    target,
+    metadata.query,
+    refresh.rows,
+    materializationAuxForTarget(target, metadata.query)
+  );
   if (materializationAux === undefined) aux.delete(metadata.id);
   else aux.set(metadata.id, materializationAux);
   return {
@@ -6820,6 +7156,21 @@ function materializationAuxForTarget<Row>(target: unknown, query: Query<Row>): I
   if (!support.supported || support.topN === undefined) return undefined;
   const preLimitQuery = { data: support.topN.preLimitData, relations: query.relations } as Query<Row>;
   return { topNPreLimitRows: refreshMaterializationRows(target, preLimitQuery).rows };
+}
+
+function materializationAuxForRows<Row>(
+  target: unknown,
+  query: Query<Row>,
+  rows: readonly Row[],
+  existingAux?: InternalMaterializationAux
+): InternalMaterializationAux | undefined {
+  const topNPreLimitRows = existingAux?.topNPreLimitRows ?? materializationAuxForTarget(target, query)?.topNPreLimitRows;
+  const indexes = materializationIndexesForRows(query, rows);
+  if (topNPreLimitRows === undefined && indexes === undefined) return undefined;
+  return {
+    ...(topNPreLimitRows === undefined ? {} : { topNPreLimitRows }),
+    ...(indexes === undefined ? {} : { indexes })
+  };
 }
 
 function withMaterializationMaintenanceAux<Row>(

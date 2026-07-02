@@ -114,7 +114,7 @@ const todoRows = pipe(
 )
 
 // Run the query against the current data.
-const todos = (await evaluate(source, todoRows)).rows
+const todos = evaluate(source, todoRows).rows
 ```
 
 ## Package Boundary

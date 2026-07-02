@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createDb, q, qMany, qManyResult, qResult } from '@tarstate/core/db';
+import { evaluate } from '@tarstate/core/evaluate';
 import {
   aggregate,
   and,
@@ -24,6 +25,7 @@ import {
   join,
   leftJoin,
   limit,
+  lt,
   lte,
   max,
   maybe,
@@ -44,6 +46,7 @@ import {
   where,
   without
 } from '@tarstate/core/query';
+import { type RelationLookup, type RelationRangeLookup, type RelationSource } from '@tarstate/core/source';
 import {
   account,
   accountsById,
@@ -51,6 +54,7 @@ import {
   entriesById,
   makeDb,
   openingAccounts,
+  openingEntries,
   schema,
   type Account,
   type Entry
@@ -124,6 +128,262 @@ describe('query evaluation behavior', () => {
     expect(q(db, missingMemo)).toEqual([{ id: 'e4' }]);
     expect(q(db, presentMemo)).toEqual([{ id: 'e1' }, { id: 'e2' }, { id: 'e3' }]);
     expect(q(db, nonNullMemo)).toEqual([{ id: 'e1' }, { id: 'e2' }]);
+  });
+
+  it('pushes direct equality filters into relation lookup and rechecks returned candidates', () => {
+    const rows = openingEntries.map((row) => ({ ...row }));
+    const lookups: RelationLookup[] = [];
+    let rowReads = 0;
+    const source: RelationSource = {
+      rows: (relationRef) => {
+        rowReads += 1;
+        return relationRef.name === 'entries' ? rows : [];
+      },
+      lookup: (lookupValue) => {
+        lookups.push(lookupValue);
+        return [
+          { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true },
+          { id: 'e2', accountId: 'sales', amount: -120, memo: 'invoice paid', posted: true },
+          { id: 'e4', accountId: 'cash', amount: 0, posted: false }
+        ];
+      }
+    };
+
+    const result = evaluate(
+      source,
+      pipe(
+        from(entry),
+        where(eq(entry.accountId, value('cash'))),
+        sort(asc(entry.id)),
+        project({ id: entry.id, accountId: entry.accountId })
+      )
+    );
+
+    expect(result).toEqual({
+      rows: [{ id: 'e1', accountId: 'cash' }, { id: 'e4', accountId: 'cash' }],
+      diagnostics: []
+    });
+    expect(rowReads).toBe(0);
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]).toEqual(expect.objectContaining({
+      field: 'accountId',
+      value: 'cash'
+    }));
+    expect(lookups[0]?.relation.name).toBe('entries');
+  });
+
+  it('pushes reversed equality filters into relation lookup', () => {
+    const rows = openingEntries.map((row) => ({ ...row }));
+    const lookups: RelationLookup[] = [];
+    let rowReads = 0;
+    const source: RelationSource = {
+      rows: (relationRef) => {
+        rowReads += 1;
+        return relationRef.name === 'entries' ? rows : [];
+      },
+      lookup: (lookupValue) => {
+        lookups.push(lookupValue);
+        return rows;
+      }
+    };
+
+    const result = evaluate(
+      source,
+      pipe(
+        from(entry),
+        where(eq(value<string>('cash'), entry.accountId)),
+        sort(asc(entry.id)),
+        project({ id: entry.id, accountId: entry.accountId })
+      )
+    );
+
+    expect(result).toEqual({
+      rows: [{ id: 'e1', accountId: 'cash' }, { id: 'e4', accountId: 'cash' }],
+      diagnostics: []
+    });
+    expect(rowReads).toBe(0);
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]).toEqual(expect.objectContaining({
+      field: 'accountId',
+      value: 'cash'
+    }));
+    expect(lookups[0]?.relation.name).toBe('entries');
+  });
+
+  it('pushes direct range filters into relation range lookups', () => {
+    const rows = openingEntries.map((row) => ({ ...row }));
+    const ranges: RelationRangeLookup[] = [];
+    let rowReads = 0;
+    const source: RelationSource = {
+      rows: (relationRef) => {
+        rowReads += 1;
+        return relationRef.name === 'entries' ? rows : [];
+      },
+      rangeLookup: (lookupValue) => {
+        ranges.push(lookupValue);
+        return rows.filter((rowValue) => rowValue.amount >= 0);
+      }
+    };
+
+    const result = evaluate(
+      source,
+      pipe(
+        from(entry),
+        where(gte(entry.amount, value(0))),
+        sort(asc(entry.id)),
+        project({ id: entry.id, amount: entry.amount })
+      )
+    );
+
+    expect(result).toEqual({
+      rows: [{ id: 'e1', amount: 120 }, { id: 'e4', amount: 0 }],
+      diagnostics: []
+    });
+    expect(rowReads).toBe(0);
+    expect(ranges).toHaveLength(1);
+    expect(ranges[0]).toEqual(expect.objectContaining({
+      field: 'amount',
+      lower: { value: 0, inclusive: true }
+    }));
+    expect(ranges[0]?.relation.name).toBe('entries');
+  });
+
+  it('pushes reversed range filters into relation range lookups with flipped bounds', () => {
+    const rows = openingEntries.map((row) => ({ ...row }));
+    const cases = [
+      {
+        predicate: lt(value<number>(0), entry.amount),
+        expectedLookup: { lower: { value: 0, inclusive: false } },
+        expectedRows: [{ id: 'e1', amount: 120 }]
+      },
+      {
+        predicate: lte(value<number>(0), entry.amount),
+        expectedLookup: { lower: { value: 0, inclusive: true } },
+        expectedRows: [{ id: 'e1', amount: 120 }, { id: 'e4', amount: 0 }]
+      },
+      {
+        predicate: gt(value<number>(0), entry.amount),
+        expectedLookup: { upper: { value: 0, inclusive: false } },
+        expectedRows: [{ id: 'e2', amount: -120 }, { id: 'e3', amount: -5 }]
+      },
+      {
+        predicate: gte(value<number>(0), entry.amount),
+        expectedLookup: { upper: { value: 0, inclusive: true } },
+        expectedRows: [{ id: 'e2', amount: -120 }, { id: 'e3', amount: -5 }, { id: 'e4', amount: 0 }]
+      }
+    ] as const;
+
+    for (const testCase of cases) {
+      const ranges: RelationRangeLookup[] = [];
+      let rowReads = 0;
+      const source: RelationSource = {
+        rows: (relationRef) => {
+          rowReads += 1;
+          return relationRef.name === 'entries' ? rows : [];
+        },
+        rangeLookup: (lookupValue) => {
+          ranges.push(lookupValue);
+          return rows;
+        }
+      };
+
+      const result = evaluate(
+        source,
+        pipe(
+          from(entry),
+          where(testCase.predicate),
+          sort(asc(entry.id)),
+          project({ id: entry.id, amount: entry.amount })
+        )
+      );
+
+      expect(result).toEqual({
+        rows: testCase.expectedRows,
+        diagnostics: []
+      });
+      expect(rowReads).toBe(0);
+      expect(ranges).toHaveLength(1);
+      expect(ranges[0]).toEqual({
+        relation: expect.objectContaining({ name: 'entries' }),
+        field: 'amount',
+        ...testCase.expectedLookup
+      });
+    }
+  });
+
+  it('pushes one and() conjunct and reapplies the full predicate to candidates', () => {
+    const rows = openingEntries.map((row) => ({ ...row }));
+    const lookups: RelationLookup[] = [];
+    let rowReads = 0;
+    const source: RelationSource = {
+      rows: (relationRef) => {
+        rowReads += 1;
+        return relationRef.name === 'entries' ? rows : [];
+      },
+      lookup: (lookupValue) => {
+        lookups.push(lookupValue);
+        return [
+          { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true },
+          { id: 'e2', accountId: 'sales', amount: -120, memo: 'invoice paid', posted: true },
+          { id: 'e4', accountId: 'cash', amount: 0, posted: false }
+        ];
+      }
+    };
+
+    const result = evaluate(
+      source,
+      pipe(
+        from(entry),
+        where(and(neq(entry.posted, value(false)), eq(entry.accountId, value('cash')))),
+        sort(asc(entry.id)),
+        project({ id: entry.id, accountId: entry.accountId, posted: entry.posted })
+      )
+    );
+
+    expect(result).toEqual({
+      rows: [{ id: 'e1', accountId: 'cash', posted: true }],
+      diagnostics: []
+    });
+    expect(rowReads).toBe(0);
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]).toEqual(expect.objectContaining({
+      field: 'accountId',
+      value: 'cash'
+    }));
+    expect(lookups[0]?.relation.name).toBe('entries');
+  });
+
+  it('falls back to relation rows when an indexed source declines a where lookup', () => {
+    const rows = openingEntries.map((row) => ({ ...row }));
+    let rowReads = 0;
+    let lookupReads = 0;
+    const source: RelationSource = {
+      rows: (relationRef) => {
+        rowReads += 1;
+        return relationRef.name === 'entries' ? rows : [];
+      },
+      lookup: () => {
+        lookupReads += 1;
+        return undefined;
+      }
+    };
+
+    const result = evaluate(
+      source,
+      pipe(
+        from(entry),
+        where(eq(entry.accountId, value('cash'))),
+        sort(asc(entry.id)),
+        project({ id: entry.id })
+      )
+    );
+
+    expect(result).toEqual({
+      rows: [{ id: 'e1' }, { id: 'e4' }],
+      diagnostics: []
+    });
+    expect(lookupReads).toBe(1);
+    expect(rowReads).toBe(1);
   });
 
   it('projects, extends, removes, renames, and qualifies rows', () => {

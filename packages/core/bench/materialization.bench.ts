@@ -1,15 +1,17 @@
 import { bench, describe } from 'vitest';
 import { createDb, q, transact, type Db } from '@tarstate/core/db';
-import { explainMaterialization, mat } from '@tarstate/core/materialization';
+import { explainMaterialization, mat, materializationForQuery, materializedSourceFor } from '@tarstate/core/materialization';
 import {
   aggregate,
   asc,
+  btree,
   clauses,
   count,
   desc,
   eq,
   field,
   from,
+  hash,
   join,
   limit,
   pipe,
@@ -21,6 +23,8 @@ import {
   where,
   type Query
 } from '@tarstate/core/query';
+import { type RelationRef } from '@tarstate/core/schema';
+import { type RelationSource } from '@tarstate/core/source';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { account, entry, schema, type Account, type Entry } from '../tests/behavior-fixtures.js';
 
@@ -103,6 +107,19 @@ const topEntriesBySortLimit = pipe(
   project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
 );
 
+const hashIndexedEntries = pipe(
+  from(entry),
+  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
+  hash(field<string>('row', 'accountId'))
+);
+
+const btreeIndexedEntries = pipe(
+  from(entry),
+  sort(asc(entry.id)),
+  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
+  btree(field<number>('row', 'amount'))
+);
+
 const patches = makePatches();
 const mixedBatches = makeMixedBatches();
 
@@ -142,6 +159,13 @@ describe('core materialization maintenance', () => {
   }
 });
 
+describe('core materialized source indexes', () => {
+  bench('hash lookup by accountId', indexedHashLookup(), BENCH_OPTIONS);
+  bench('scan materialized rows by accountId', scannedHashLookup(), BENCH_OPTIONS);
+  bench('btree range lookup by amount', indexedRangeLookup(), BENCH_OPTIONS);
+  bench('scan materialized rows by amount range', scannedRangeLookup(), BENCH_OPTIONS);
+});
+
 function materializedMaintenance(scenario: BenchmarkScenario): () => void {
   let db = mat(makeDb(), ...scenario.queries);
   let cursor = 0;
@@ -163,6 +187,83 @@ function fullRecompute(scenario: BenchmarkScenario): () => void {
     db = transact(db, mutationAt(mutations, cursor));
     cursor = (cursor + 1) % mutations.length;
     consumeQueries(db, scenario.queries);
+  };
+}
+
+function indexedHashLookup(): () => void {
+  const { source, relation } = indexedSource(hashIndexedEntries as Query<unknown>);
+  const values = accounts.map((row) => row.id);
+  let cursor = 0;
+
+  return () => {
+    const valueValue = values[cursor % values.length] ?? 'cash';
+    cursor += 1;
+    consume(source.lookup?.({ relation, field: 'accountId', value: valueValue }) ?? []);
+  };
+}
+
+function scannedHashLookup(): () => void {
+  const { source, relation } = indexedSource(hashIndexedEntries as Query<unknown>);
+  const values = accounts.map((row) => row.id);
+  let cursor = 0;
+
+  return () => {
+    const valueValue = values[cursor % values.length] ?? 'cash';
+    cursor += 1;
+    consume(source.rows(relation).filter((row) => isRecord(row) && Object.is(row.accountId, valueValue)));
+  };
+}
+
+function indexedRangeLookup(): () => void {
+  const { source, relation } = indexedSource(btreeIndexedEntries as Query<unknown>);
+  let cursor = 0;
+
+  return () => {
+    const lower = -10_000 + (cursor % 20) * 500;
+    const upper = lower + 100;
+    cursor += 1;
+    consume(source.rangeLookup?.({
+      relation,
+      field: 'amount',
+      lower: { value: lower, inclusive: true },
+      upper: { value: upper, inclusive: true }
+    }) ?? []);
+  };
+}
+
+function scannedRangeLookup(): () => void {
+  const { source, relation } = indexedSource(btreeIndexedEntries as Query<unknown>);
+  let cursor = 0;
+
+  return () => {
+    const lower = -10_000 + (cursor % 20) * 500;
+    const upper = lower + 100;
+    cursor += 1;
+    consume(source.rows(relation).filter((row) =>
+      isRecord(row)
+      && typeof row.amount === 'number'
+      && row.amount >= lower
+      && row.amount <= upper));
+  };
+}
+
+function indexedSource(query: Query<unknown>): {
+  readonly source: RelationSource;
+  readonly relation: RelationRef<Record<string, unknown>>;
+} {
+  const db = mat(makeDb(), query);
+  const source = materializedSourceFor(db);
+  const metadata = materializationForQuery(db, query);
+  if (source === undefined || metadata === undefined) throw new Error('expected indexed materialized source');
+  return {
+    source,
+    relation: {
+      kind: 'relation',
+      name: metadata.id,
+      key: 'id',
+      fields: {},
+      ephemeral: true
+    }
   };
 }
 
@@ -255,4 +356,8 @@ function consumeQueries(db: Db, queries: readonly Query<unknown>[]): void {
 function consume(rows: readonly unknown[]): void {
   rowSink = (rowSink + rows.length) % Number.MAX_SAFE_INTEGER;
   if (rowSink < 0) throw new Error('unreachable benchmark sink');
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null;
 }
