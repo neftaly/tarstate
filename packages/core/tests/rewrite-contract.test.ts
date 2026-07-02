@@ -5,10 +5,12 @@ import {
   attachConstraints,
   check,
   constrain,
+  collectDiagnostics,
   count,
   createDb,
   createStore,
   defineSchema,
+  diagnostic,
   eq,
   field,
   fk,
@@ -33,6 +35,14 @@ import {
   unique,
   value,
   where,
+  type DbOptions,
+  type EvaluateOptions,
+  type TarstateCoreDiagnosticCode,
+  type TarstateDiagnostic,
+  type TarstateDiagnosticCode,
+  type TarstateDiagnosticMode,
+  type TarstateDiagnosticOptions,
+  type TarstateDiagnosticSeverity,
   type QueryResult,
   type StoreViewSnapshot
 } from '@tarstate/core';
@@ -82,6 +92,33 @@ const openingDb = createDb({
 });
 
 describe('rewrite public contracts', () => {
+  it('names core diagnostic codes while preserving app-extension codes and severity', () => {
+    const known = diagnostic({
+      code: 'not_implemented',
+      severity: 'warning',
+      message: 'stubbed'
+    });
+    const extended = diagnostic({
+      code: 'app/custom-rule',
+      severity: 'error',
+      message: 'custom app diagnostic'
+    });
+    const normalized = collectDiagnostics('plain message');
+
+    expectTypeOf<TarstateCoreDiagnosticCode>().toMatchTypeOf<TarstateDiagnosticCode>();
+    expectTypeOf<'foreign_key'>().toMatchTypeOf<TarstateCoreDiagnosticCode>();
+    expectTypeOf<'app/custom-rule'>().toMatchTypeOf<TarstateDiagnosticCode>();
+    expectTypeOf<TarstateDiagnosticSeverity>().toEqualTypeOf<'info' | 'warning' | 'error'>();
+    expectTypeOf<TarstateDiagnosticMode>().toEqualTypeOf<'collect' | 'throw' | 'warn'>();
+    expectTypeOf<TarstateDiagnosticOptions>().toMatchTypeOf<{ readonly diagnosticMode?: TarstateDiagnosticMode }>();
+    expectTypeOf<EvaluateOptions>().toMatchTypeOf<TarstateDiagnosticOptions>();
+    expectTypeOf<DbOptions>().toMatchTypeOf<TarstateDiagnosticOptions>();
+    expectTypeOf<typeof known>().toEqualTypeOf<TarstateDiagnostic>();
+    expect(known).toEqual({ code: 'not_implemented', severity: 'warning', message: 'stubbed' });
+    expect(extended.code).toBe('app/custom-rule');
+    expect(normalized[0]).toMatchObject({ code: 'diagnostic', severity: 'info', message: 'plain message' });
+  });
+
   it('evaluates Relic-style query data synchronously over a Db snapshot', () => {
     const cashEntries = pipe(
       from(as(schema.entries, 'entry')),
@@ -113,7 +150,9 @@ describe('rewrite public contracts', () => {
       positiveEntries: [{ id: 'e1' }],
       summary: [{ entryCount: 2 }]
     });
-    expect(row(openingDb, positiveEntries, 'e1')).toEqual({ id: 'e1' });
+    const entry = row(openingDb, schema.entries, 'e1');
+    expectTypeOf(entry).toEqualTypeOf<Entry | undefined>();
+    expect(entry).toEqual({ id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid' });
   });
 
   it('keeps derived query field access typed without casts', () => {

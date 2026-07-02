@@ -9,6 +9,7 @@ import {
   type ReactNode
 } from 'react';
 import type { Db, DbInputData } from '@tarstate/core/db';
+import type { TarstateDiagnostic, TarstateDiagnosticMode, TarstateDiagnosticSeverity } from '@tarstate/core/diagnostics';
 import type { EvaluateOptions } from '@tarstate/core/evaluate';
 import { queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
@@ -32,12 +33,11 @@ import type {
 
 export type TarstateReactDiagnostic =
   | StoreDiagnostic
-  | {
-      readonly code: string;
+  | (TarstateDiagnostic & {
       readonly message: string;
       readonly surface?: string;
       readonly detail?: unknown;
-    };
+    });
 
 export type TarstateDbInput = StoreSeedInput | DbInputData;
 export type TarstateDbSnapshot = StoreSnapshot;
@@ -50,7 +50,15 @@ export type TarstateProviderProps = {
   readonly children?: ReactNode;
 };
 
-export type UseViewOptions = {
+export type HookRuntimeKind = 'syncSeedStore' | 'asyncRuntime';
+export type HookDiagnosticErrorPolicy = 'errorSeverityOnly' | 'thrownErrorsOnly' | 'errorSeverityOrThrown';
+export type HookStatusOptions = {
+  readonly runtimeKind?: HookRuntimeKind;
+  readonly diagnosticMode?: TarstateDiagnosticMode;
+  readonly errorPolicy?: HookDiagnosticErrorPolicy;
+};
+
+export type UseViewOptions = HookStatusOptions & {
   readonly deps?: readonly unknown[];
 };
 
@@ -64,6 +72,21 @@ type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
 };
 
 export type HookStatus = 'loading' | 'ready' | 'error';
+export type HookStatusMeaning = {
+  readonly loading: {
+    readonly runtimeKind: 'asyncRuntime';
+    readonly description: 'Async runtime or hydration has not produced a readable snapshot yet.';
+  };
+  readonly ready: {
+    readonly runtimeKind: HookRuntimeKind;
+    readonly description: 'A synchronous seed store or hydrated async runtime snapshot is readable.';
+  };
+  readonly error: {
+    readonly runtimeKind: HookRuntimeKind;
+    readonly diagnosticSeverity: Extract<TarstateDiagnosticSeverity, 'error'>;
+    readonly description: 'A thrown read error or error-severity diagnostic should be surfaced through error.';
+  };
+};
 
 export type ViewHookState<Row> = {
   readonly status: HookStatus;

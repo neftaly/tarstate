@@ -38,6 +38,7 @@ export type {
   DbTransactionInput,
   DbTransactionInputs,
   DbTransactionItem,
+  DbTransactionOptions,
   DbTransactionPlan,
   DbTransactionResult,
   MappedQueryBatchResult,
@@ -47,5 +48,8 @@ export type {
   QueryBatchRows,
   QueryBatchTarget,
   QueryBatchTargetRow,
+  RelationKeyValue,
+  RowLookupOptions,
+  RowPredicateOptions,
   SetEnvTransaction
 } from './stub.js';

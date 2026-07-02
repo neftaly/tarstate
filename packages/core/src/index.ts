@@ -20,7 +20,14 @@ export type {
   RelationRuntime
 } from './adapter.js';
 export { collectDiagnostics, diagnostic, normalizeDiagnostics } from './diagnostics.js';
-export type { TarstateDiagnostic } from './diagnostics.js';
+export type {
+  TarstateCoreDiagnosticCode,
+  TarstateDiagnostic,
+  TarstateDiagnosticCode,
+  TarstateDiagnosticMode,
+  TarstateDiagnosticOptions,
+  TarstateDiagnosticSeverity
+} from './diagnostics.js';
 export { relationDeltaNames, relationDeltas } from './delta.js';
 export {
   DbTransactionError,
@@ -59,12 +66,16 @@ export type {
   DbTransactionContext,
   DbTransactionInput,
   DbTransactionInputs,
+  DbTransactionOptions,
   DbTransactionResult,
   MappedQueryBatchResult,
   MappedQueryBatchRows,
   QueryBatch,
   QueryBatchResult,
   QueryBatchRows,
+  RelationKeyValue,
+  RowLookupOptions,
+  RowPredicateOptions,
   SetEnvTransaction
 } from './db.js';
 export { diffRows, rowDiffKey } from './diff.js';
@@ -209,6 +220,7 @@ export {
   gte,
   hash,
   hostCall,
+  hostFn,
   intersection,
   join,
   keyBy,
@@ -230,6 +242,7 @@ export {
   project,
   qualify,
   queryKey,
+  QueryKeyError,
   queryRowKeyFields,
   relationDependencies,
   rename,
@@ -257,6 +270,7 @@ export type {
   ExpandOptions,
   ExprData,
   ExprInput,
+  HostFunction,
   HostExpressionFunction,
   NullSortOrder,
   OptionalProjection,
@@ -290,8 +304,10 @@ export type { MaybePromise, RelationLookup, RelationRangeBound, RelationRangeLoo
 export { createRuntimeStore, createStore } from './store.js';
 export type {
   Store,
+  StoreCommit,
   StoreCommitEffects,
   StoreCommitInput,
+  StoreCommitOptions,
   StoreCommitResult,
   StoreCommitSnapshot,
   StoreCommitStatus,
@@ -331,6 +347,7 @@ export type {
   TrackTransactResult
 } from './runtime.js';
 export {
+  attachWatches,
   diffOptionsForTarget,
   diffQuery,
   isWatchMaterialization,

@@ -11,7 +11,11 @@ import {
   useTarstateStore,
   useView,
   useWatch,
+  type HookDiagnosticErrorPolicy,
+  type HookRuntimeKind,
   type HookStatus,
+  type HookStatusMeaning,
+  type HookStatusOptions,
   type QueryHookState,
   type RowHookState,
   type TarstateCommit,
@@ -29,6 +33,7 @@ import { createStore, type Store } from '@tarstate/core/store';
 import { as, from, pipe, project, type Query } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { insert } from '@tarstate/core/write';
+import type { TarstateDiagnosticMode } from '@tarstate/core/diagnostics';
 
 type ItemRow = {
   readonly id: string;
@@ -78,8 +83,22 @@ describe('@tarstate/react future hook facade contract', () => {
     expectTypeOf<TarstateDbSnapshot>().toMatchTypeOf<ReturnType<Store['getSnapshot']>>();
     expectTypeOf<TarstateCommit>().toEqualTypeOf<Store['commit']>();
     expectTypeOf<HookStatus>().toEqualTypeOf<'loading' | 'ready' | 'error'>();
-    expectTypeOf<UseViewOptions>().toMatchTypeOf<{ readonly deps?: readonly unknown[] }>();
+    expectTypeOf<HookRuntimeKind>().toEqualTypeOf<'syncSeedStore' | 'asyncRuntime'>();
+    expectTypeOf<HookDiagnosticErrorPolicy>().toEqualTypeOf<'errorSeverityOnly' | 'thrownErrorsOnly' | 'errorSeverityOrThrown'>();
+    expectTypeOf<HookStatusOptions>().toMatchTypeOf<{
+      readonly runtimeKind?: HookRuntimeKind;
+      readonly diagnosticMode?: TarstateDiagnosticMode;
+      readonly errorPolicy?: HookDiagnosticErrorPolicy;
+    }>();
+    expectTypeOf<HookStatusMeaning['loading']>().toMatchTypeOf<{ readonly runtimeKind: 'asyncRuntime' }>();
+    expectTypeOf<HookStatusMeaning['ready']>().toMatchTypeOf<{ readonly runtimeKind: HookRuntimeKind }>();
+    expectTypeOf<HookStatusMeaning['error']>().toMatchTypeOf<{ readonly diagnosticSeverity: 'error' }>();
+    expectTypeOf<UseViewOptions>().toMatchTypeOf<{
+      readonly deps?: readonly unknown[];
+      readonly diagnosticMode?: TarstateDiagnosticMode;
+    }>();
     const queryOptions = {
+      diagnosticMode: 'collect',
       select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`)
     } satisfies UseQueryOptions<ItemProjection, readonly string[]>;
     expect(queryOptions.select).toBeTypeOf('function');

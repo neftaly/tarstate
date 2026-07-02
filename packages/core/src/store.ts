@@ -1,8 +1,10 @@
 export { createRuntimeStore, createStore } from './stub.js';
 export type {
   Store,
+  StoreCommit,
   StoreCommitEffects,
   StoreCommitInput,
+  StoreCommitOptions,
   StoreCommitResult,
   StoreCommitSnapshot,
   StoreCommitStatus,
