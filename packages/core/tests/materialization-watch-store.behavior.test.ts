@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createDb, q, qResult, setEnvTx, transact, tryTransact, type DbTransactionContext } from '@tarstate/core/db';
+import { diffRows } from '@tarstate/core/diff';
 import {
   demat,
   explainMaterialization,
@@ -12,7 +13,34 @@ import {
 import { trackTransact } from '@tarstate/core/runtime';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { createRuntimeStore, createStore } from '@tarstate/core/store';
-import { aggregate, asc, call, count, env, eq, from, hostFn, keyBy, limit, pipe, project, sort, value, where, type Query } from '@tarstate/core/query';
+import {
+  aggregate,
+  asc,
+  call,
+  count,
+  env,
+  eq,
+  expand,
+  extend,
+  from,
+  gte,
+  hostFn,
+  join,
+  keyBy,
+  limit,
+  pipe,
+  project,
+  qualify,
+  rename,
+  sel,
+  sort,
+  sum,
+  union,
+  value,
+  where,
+  without,
+  type Query
+} from '@tarstate/core/query';
 import { type RelationRuntime } from '@tarstate/core/adapter';
 import {
   attachWatches,
@@ -26,7 +54,7 @@ import {
   watchTargetKey
 } from '@tarstate/core/watch';
 import { deleteByKey, insert, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
-import { entry, makeDb, schema, type Entry } from './behavior-fixtures.js';
+import { account, entry, makeDb, schema, type Entry } from './behavior-fixtures.js';
 
 const entryList = pipe(
   from(entry),
@@ -72,6 +100,81 @@ const entriesByAccountId = pipe(
   from(entry),
   keyBy('accountId')
 );
+
+type IncrementalQueryVariant = {
+  readonly label: string;
+  readonly query: Query<unknown>;
+  readonly keyBy: (row: unknown) => unknown;
+};
+
+function pathKey(...path: readonly string[]): (row: unknown) => unknown {
+  return (row) => {
+    let current = row;
+    for (const segment of path) {
+      if (!isRecord(current)) return undefined;
+      current = current[segment];
+    }
+    return [current];
+  };
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null;
+}
+
+const supportedIncrementalVariants: readonly IncrementalQueryVariant[] = [
+  {
+    label: 'source relation',
+    query: from(entry) as Query<unknown>,
+    keyBy: pathKey('id')
+  },
+  {
+    label: 'final sort',
+    query: pipe(from(entry), sort(asc(entry.amount), asc(entry.id))) as Query<unknown>,
+    keyBy: pathKey('id')
+  },
+  {
+    label: 'filtered projection',
+    query: pipe(
+      from(entry),
+      where(gte(entry.amount, value(-75))),
+      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+    ) as Query<unknown>,
+    keyBy: pathKey('id')
+  },
+  {
+    label: 'renamed projection key',
+    query: pipe(
+      from(entry),
+      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
+      rename({ id: 'entryId' })
+    ) as Query<unknown>,
+    keyBy: pathKey('entryId')
+  },
+  {
+    label: 'qualified rows',
+    query: pipe(
+      from(entry),
+      where(eq(entry.posted, value(true))),
+      qualify('entry')
+    ) as Query<unknown>,
+    keyBy: pathKey('entry', 'id')
+  },
+  {
+    label: 'extended rows without non-key fields',
+    query: pipe(
+      from(entry),
+      extend({ kind: value('ledger-entry') }),
+      without('memo')
+    ) as Query<unknown>,
+    keyBy: pathKey('id')
+  },
+  {
+    label: 'explicit keyBy identity',
+    query: pipe(from(entry), keyBy('id')) as Query<unknown>,
+    keyBy: pathKey('id')
+  }
+];
 
 describe('materialization, watch, and store behavior', () => {
   it('maintains materialized queries equivalent to dematerialized evaluation across seeded transaction sequences', () => {
@@ -134,6 +237,282 @@ describe('materialization, watch, and store behavior', () => {
     }));
   });
 
+  it('fuzzes single-source materializations against dematerialized recompute and row diffs', () => {
+    let incrementalChanges = 0;
+    let carriedChanges = 0;
+    let safetyRecomputes = 0;
+
+    for (const seed of [5, 17, 43, 91, 137]) {
+      for (const variant of supportedIncrementalVariants) {
+        const base = makeDb();
+        let db = mat(createDb({ accounts: base.data.accounts ?? [], entries: randomEntries(seed, 12) }), variant.query);
+
+        for (const patch of randomEntryPatches(seed * 211 + variant.label.length, 36)) {
+          const beforeRows = q(db, variant.query);
+          const result = tryTransact(db, patch);
+          expect(result.committed).toBe(true);
+          db = result.db;
+
+          const materializedRows = q(db, variant.query);
+          const dematerializedRows = q(demat(db, variant.query), variant.query);
+          const change = result.materializations?.changes[0];
+
+          expect(change, `${variant.label} should report maintenance for ${patch.op}`).toBeDefined();
+          if (change === undefined) continue;
+
+          expect(materializedRows).toBe(change.rows);
+          expect(materializedRows).toEqual(dematerializedRows);
+          expect(change.rows).toEqual(dematerializedRows);
+          expect(change.previousRows).toEqual(beforeRows);
+
+          if (change.update === 'incremental') {
+            const diff = diffRows(beforeRows, dematerializedRows, { keyBy: variant.keyBy });
+
+            incrementalChanges += 1;
+            expect(change.recomputed, variant.label).toBe(false);
+            expect(change.reason).toBe('incremental delta maintenance');
+            expect(change.diagnostics, variant.label).toEqual([]);
+            expect(change.rowChanges).toEqual(diff.changes);
+            expect(change.added).toEqual(diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []));
+            expect(change.removed).toEqual(diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []));
+            expect(diff.diagnostics).toEqual([]);
+          } else if (change.update === 'carried') {
+            carriedChanges += 1;
+            expect(change.recomputed, variant.label).toBe(false);
+            expect(change.diagnostics, variant.label).toEqual([]);
+            expect(change.reason).toBe('dependencies unchanged');
+            expect(change.added).toEqual([]);
+            expect(change.removed).toEqual([]);
+            expect(change.rowChanges).toEqual([]);
+          } else {
+            safetyRecomputes += 1;
+            expect(change.update).toBe('recomputed');
+            expect(change.recomputed, `${variant.label} ${patch.op} ${change.reason}`).toBe(true);
+            expect(change.diagnostics).toEqual(expect.arrayContaining([
+              expect.objectContaining({ code: 'materialization_unsupported' })
+            ]));
+          }
+        }
+      }
+    }
+
+    expect(incrementalChanges).toBeGreaterThan(0);
+    expect(carriedChanges).toBeGreaterThan(0);
+    expect(safetyRecomputes).toBeGreaterThan(0);
+  });
+
+  it('reports an incremental change with no recompute fallback for a focused delta', () => {
+    const query = pipe(
+      from(entry),
+      where(eq(entry.accountId, value('cash'))),
+      project({ id: entry.id, amount: entry.amount })
+    );
+    const db = mat(makeDb(), query);
+    const beforeRows = q(db, query);
+
+    const result = tryTransact(
+      db,
+      updateByKey(schema.entries, 'e1', { amount: 125 }),
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true })
+    );
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations).toEqual(expect.objectContaining({
+      maintained: 1,
+      recomputed: 0,
+      carried: 0,
+      diagnostics: []
+    }));
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      reason: 'incremental delta maintenance',
+      previousRows: beforeRows,
+      rows: [
+        { id: 'e1', amount: 125 },
+        { id: 'e4', amount: 0 },
+        { id: 'e5', amount: 35 }
+      ],
+      added: [{ id: 'e5', amount: 35 }],
+      removed: [],
+      rowChanges: [
+        { kind: 'updated', key: '["e1"]', before: { id: 'e1', amount: 120 }, after: { id: 'e1', amount: 125 } },
+        { kind: 'added', key: '["e5"]', row: { id: 'e5', amount: 35 } }
+      ],
+      diagnostics: []
+    }));
+    expect(q(result.db, query)).toBe(result.materializations?.changes[0]?.rows);
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('falls back for non-total final sort ties when an earlier filtered source row enters', () => {
+    const query = pipe(
+      from(entry),
+      where(eq(entry.posted, value(true))),
+      sort(asc(entry.amount))
+    );
+    const db = mat(createDb({
+      accounts: makeDb().data.accounts ?? [],
+      entries: [
+        { id: 'a', accountId: 'cash', amount: 10, posted: false },
+        { id: 'b', accountId: 'cash', amount: 10, posted: true },
+        { id: 'c', accountId: 'cash', amount: 20, posted: true }
+      ]
+    }), query);
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'a', { posted: true }));
+    const change = result.materializations?.changes[0];
+
+    expect(result.committed).toBe(true);
+    expect(change).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      rows: [
+        { id: 'a', accountId: 'cash', amount: 10, posted: true },
+        { id: 'b', accountId: 'cash', amount: 10, posted: true },
+        { id: 'c', accountId: 'cash', amount: 20, posted: true }
+      ],
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: 'incremental materialization candidate differed from full recompute'
+        })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('keeps materialized identity keys distinct for undefined and null values', () => {
+    const query = pipe(from(entry), keyBy('memo'));
+    const db = mat(createDb({
+      accounts: makeDb().data.accounts ?? [],
+      entries: [
+        { id: 'missing', accountId: 'cash', amount: 1, posted: true },
+        { id: 'nullish', accountId: 'cash', amount: 2, memo: null, posted: true }
+      ]
+    }), query);
+
+    const result = tryTransact(db, updateByKey(schema.entries, 'missing', { amount: 3 }));
+    const change = result.materializations?.changes[0];
+
+    expect(result.committed).toBe(true);
+    expect(change).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: [],
+      rowChanges: [
+        {
+          kind: 'updated',
+          key: '[~undefined]',
+          before: { id: 'missing', accountId: 'cash', amount: 1, posted: true },
+          after: { id: 'missing', accountId: 'cash', amount: 3, posted: true }
+        }
+      ]
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('falls back with explicit diagnostics for unsupported incremental shapes', () => {
+    const projectedEntries = pipe(
+      from(entry),
+      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+    );
+    const cases: readonly { readonly label: string; readonly query: Query<unknown>; readonly reason: string }[] = [
+      {
+        label: 'aggregate',
+        query: entryCount as Query<unknown>,
+        reason: 'aggregate queries are not incrementally maintained'
+      },
+      {
+        label: 'aggregate projection',
+        query: pipe(
+          from(entry),
+          project({ id: entry.id, total: sum(entry.amount) })
+        ) as Query<unknown>,
+        reason: 'aggregate projection is not incrementally maintained'
+      },
+      {
+        label: 'non-final sort',
+        query: entryList as Query<unknown>,
+        reason: 'non-final sort queries are not incrementally maintained'
+      },
+      {
+        label: 'sort and limit',
+        query: firstTwoEntries as Query<unknown>,
+        reason: 'limit queries require auxiliary pre-limit state and are not incrementally maintained'
+      },
+      {
+        label: 'join',
+        query: pipe(from(entry), join(from(account), eq(entry.accountId, account.id))) as Query<unknown>,
+        reason: 'join queries are not incrementally maintained'
+      },
+      {
+        label: 'set operation',
+        query: union(
+          pipe(projectedEntries, where(eq(entry.accountId, value('cash')))),
+          pipe(projectedEntries, where(eq(entry.accountId, value('sales'))))
+        ) as Query<unknown>,
+        reason: 'set operation queries are not incrementally maintained'
+      },
+      {
+        label: 'expand',
+        query: pipe(from(entry), expand(entry.memo, { as: 'tag' })) as Query<unknown>,
+        reason: 'expand queries are not incrementally maintained'
+      },
+      {
+        label: 'selected subquery',
+        query: pipe(
+          from(entry),
+          project({ id: entry.id, accounts: sel(from(account)) })
+        ) as Query<unknown>,
+        reason: 'correlated or selected subqueries are not incrementally maintained'
+      },
+      {
+        label: 'missing row identity',
+        query: pipe(from(entry), without('id')) as Query<unknown>,
+        reason: 'incremental maintenance requires a stable materialized row identity'
+      }
+    ];
+
+    for (const item of cases) {
+      const explanation = explainMaterialization(item.query);
+      expect(explanation, item.label).toEqual(expect.objectContaining({
+        supported: false,
+        update: 'recomputed',
+        recomputed: true,
+        reason: item.reason,
+        diagnostics: [
+          expect.objectContaining({
+            code: 'materialization_unsupported',
+            message: item.reason,
+            surface: 'materialization'
+          })
+        ]
+      }));
+
+      const db = mat(makeDb(), item.query);
+      const result = tryTransact(
+        db,
+        insert(schema.entries, { id: `unsupported-${item.label}`, accountId: 'cash', amount: 9, posted: true })
+      );
+      const change = result.materializations?.changes[0];
+
+      expect(result.committed).toBe(true);
+      expect(change, item.label).toEqual(expect.objectContaining({
+        update: 'recomputed',
+        recomputed: true,
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            code: 'materialization_unsupported',
+            message: item.reason,
+            surface: 'materialization'
+          })
+        ])
+      }));
+      expect(q(result.db, item.query)).toEqual(q(demat(result.db, item.query), item.query));
+    }
+  });
+
   it('falls back to recompute when a keyBy mutation collides with a retained materialized row', () => {
     const query = pipe(from(entry), keyBy('accountId'));
     const db = mat(createDb({
@@ -156,7 +535,7 @@ describe('materialization, watch, and store behavior', () => {
       diagnostics: expect.arrayContaining([
         expect.objectContaining({
           code: 'materialization_unsupported',
-          message: 'incremental materialization candidate differed from full recompute'
+          message: 'incremental maintenance cannot add materialized row keys that collide with retained rows: ["cash"]'
         })
       ])
     }));
@@ -297,6 +676,118 @@ describe('materialization, watch, and store behavior', () => {
     const next = transact(db, setEnvTx({ accountId: 'sales' }));
     const changed = q(next, envFilteredEntries);
 
+    expect(changed).not.toBe(first);
+    expect(changed).toEqual([
+      { id: 'e2', accountId: 'sales' }
+    ]);
+  });
+
+  it('refreshes materialized query rows when dependent non-plain env values are replaced with same-shape values', () => {
+    class EnvMarker {
+      constructor(readonly label: string) {}
+    }
+
+    const envProjectedEntry = pipe(
+      from(entry),
+      where(eq(entry.id, value('e1'))),
+      project({
+        id: entry.id,
+        stamp: env<Date>('stamp'),
+        marker: env<EnvMarker>('marker')
+      })
+    );
+    const firstStamp = new Date('2026-01-01T00:00:00.000Z');
+    const firstMarker = new EnvMarker('same-shape');
+    const db = mat(createDb(makeDb().data, { env: { stamp: firstStamp, marker: firstMarker } }), envProjectedEntry);
+    const first = q(db, envProjectedEntry);
+
+    const nextStamp = new Date('2026-01-01T00:00:00.000Z');
+    const nextMarker = new EnvMarker('same-shape');
+    const result = tryTransact(db, setEnvTx({ stamp: nextStamp, marker: nextMarker }));
+    const changed = q(result.db, envProjectedEntry);
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      touchedEnvDependencies: ['stamp', 'marker']
+    }));
+    expect(changed).not.toBe(first);
+    expect(changed).toHaveLength(1);
+    expect(changed[0]).toEqual(expect.objectContaining({ id: 'e1' }));
+    expect((changed[0] as { readonly stamp: Date }).stamp).toBe(nextStamp);
+    expect((changed[0] as { readonly marker: EnvMarker }).marker).toBe(nextMarker);
+    expect((changed[0] as { readonly stamp: Date }).stamp).not.toBe(firstStamp);
+    expect((changed[0] as { readonly marker: EnvMarker }).marker).not.toBe(firstMarker);
+  });
+
+  it('does not throw when setEnvTx touches another key while env contains a cyclic object', () => {
+    const envFilteredEntries = pipe(
+      from(entry),
+      where(eq(entry.accountId, env<string>('accountId'))),
+      sort(asc(entry.id)),
+      project({
+        id: entry.id,
+        accountId: entry.accountId
+      })
+    );
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const db = mat(createDb(makeDb().data, { env: { accountId: 'cash', cyclic } }), envFilteredEntries);
+
+    const result = tryTransact(db, setEnvTx((envValue) => ({ ...envValue, accountId: 'sales' })));
+    const changed = q(result.db, envFilteredEntries);
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      touchedEnvDependencies: ['accountId']
+    }));
+    expect(changed).toEqual([
+      { id: 'e2', accountId: 'sales' }
+    ]);
+  });
+
+  it('refreshes materialized query rows when setEnvTx mutates env in place', () => {
+    const envFilteredEntries = pipe(
+      from(entry),
+      where(eq(entry.accountId, env<string>('accountId'))),
+      sort(asc(entry.id)),
+      project({
+        id: entry.id,
+        accountId: entry.accountId
+      })
+    );
+    const db = mat(createDb(makeDb().data, { env: { accountId: 'cash' } }), envFilteredEntries);
+    const first = q(db, envFilteredEntries);
+
+    const result = tryTransact(db, setEnvTx((envValue) => {
+      // @ts-expect-error mutating readonly env verifies runtime change detection for updater callbacks.
+      envValue.accountId = 'sales';
+      return envValue;
+    }));
+    const changed = q(result.db, envFilteredEntries);
+
+    expect(first).toEqual([
+      { id: 'e1', accountId: 'cash' },
+      { id: 'e4', accountId: 'cash' }
+    ]);
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      touchedEnvDependencies: ['accountId'],
+      rows: [
+        { id: 'e2', accountId: 'sales' }
+      ],
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'materialization_unsupported',
+          message: 'env dependency changed: accountId'
+        })
+      ])
+    }));
     expect(changed).not.toBe(first);
     expect(changed).toEqual([
       { id: 'e2', accountId: 'sales' }

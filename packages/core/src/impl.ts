@@ -765,9 +765,9 @@ export function diffRows<Row>(before: readonly Row[], after: readonly Row[], opt
 }
 
 export function rowDiffKey<Row>(row: Row, options: RowDiffOptions<Row> = {}): string {
-  if (typeof options.keyBy === 'function') return JSON.stringify(options.keyBy(row));
-  if (Array.isArray(options.keyBy) && isRecord(row)) return JSON.stringify(options.keyBy.map((fieldName) => row[fieldName]));
-  return JSON.stringify(row);
+  if (typeof options.keyBy === 'function') return stableKey(options.keyBy(row));
+  if (Array.isArray(options.keyBy) && isRecord(row)) return stableKey(options.keyBy.map((fieldName) => row[fieldName]));
+  return stableKey(row);
 }
 
 export type RelationLookup = {
@@ -1331,7 +1331,7 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     const items = normalizeTransactionItem(resolveTransactionInput(input, workingDb));
     for (const item of items) {
       if (isSetEnvTransaction(item)) {
-        const beforeEnv = workingDb.env;
+        const beforeEnv = envSnapshot(workingDb.env);
         workingDb = applySetEnvTransaction(workingDb, item);
         envDeltas.push(...envDeltasFor(beforeEnv, workingDb.env));
         continue;
@@ -1375,9 +1375,10 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     }
   }
 
-  const materializations = maintainMaterializationSnapshots(inputDb, workingDb, { deltas, envDeltas });
+  const maintained = maintainMaterializations(inputDb, workingDb, { deltas, envDeltas });
+  const materializations = maintained.materializations;
   diagnostics.push(...materializations.diagnostics);
-  const committedDb = applyMaterializationState(workingDb, materializedStateFor(inputDb), materializations) as DbValue;
+  const committedDb = maintained.db as DbValue;
 
   return withTransactionWritePatches({
     db: committedDb,
@@ -1655,6 +1656,10 @@ export type MaterializationMaintenanceResult<Row = unknown> = {
   readonly changes: readonly MaterializationMaintenanceChange<Row>[];
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
+export type MaterializationMaintainResult<DbValue extends Db = Db, Row = unknown> = {
+  readonly db: DbValue & MaterializedDb;
+  readonly materializations: MaterializationMaintenanceResult<Row>;
+};
 export type MaterializationIndex<Row = unknown> = Readonly<Record<string, unknown>> & { readonly rows?: readonly Row[] };
 export type MaterializationNestedRows<Row = unknown> = Readonly<Record<string, readonly Row[]>>;
 export type MaterializationNestedUniqueRows<Row = unknown> = Readonly<Record<string, Row | undefined>>;
@@ -1802,6 +1807,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
     const envDependencies = queryEnvDependencies(metadata.query);
     const touchedEnv = envDependencies.filter((name) => touchedEnvDependencies.includes(name));
     const envHintsCoverDependencies = hasEnvChangeHints || envDependencies.length === 0;
+    const indexSpecs = materializationIndexSpecs(metadata.query);
     if (previousRows !== undefined && hasRelationChangeHints && envHintsCoverDependencies && touched.length === 0 && touchedEnv.length === 0) {
       changes.push({
         update: 'carried',
@@ -1815,7 +1821,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
         touchedDependencies: [],
         envDependencies,
         touchedEnvDependencies: [],
-        indexSpecs: [],
+        indexSpecs,
         previousRowsAvailable: true,
         previousRows,
         rows: previousRows,
@@ -1844,7 +1850,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
         touchedDependencies: touched,
         envDependencies,
         touchedEnvDependencies: touchedEnv,
-        indexSpecs: [],
+        indexSpecs,
         previousRowsAvailable: true,
         previousRows,
         rows: incremental.rows,
@@ -1866,6 +1872,7 @@ export function maintainMaterializationSnapshots<Row = unknown>(
       touchedDependencies: touched,
       envDependencies,
       touchedEnvDependencies: touchedEnv,
+      indexSpecs,
       reason: fallbackDiagnostics.length === 0
         ? 'snapshot recompute'
         : `snapshot recompute: ${fallbackDiagnostics.map((item) => item.message).join('; ')}`,
@@ -1883,18 +1890,45 @@ export function maintainMaterializationSnapshots<Row = unknown>(
   };
 }
 
+export function maintainMaterializations<DbValue extends Db, Row = unknown>(
+  before: Db,
+  after: DbValue,
+  options: MaterializationMaintenanceOptions = {}
+): MaterializationMaintainResult<DbValue, Row> {
+  const materializations = maintainMaterializationSnapshots<Row>(before, after, options);
+  return {
+    db: applyMaterializationState(after, materializedStateFor(before), materializations) as DbValue & MaterializedDb,
+    materializations
+  };
+}
+
 type MaterializationRowKeyPath = readonly string[];
 type MaterializationRowIdentity<Row = unknown> = {
   readonly paths: readonly MaterializationRowKeyPath[];
   readonly fields: readonly string[] | undefined;
   readonly keyBy: RowKeySelector<Row>;
+  readonly keyOf: (row: Row) => string;
+  readonly unique: boolean;
 };
 type IncrementalMaterializationSupport<Row = unknown> =
   | {
       readonly supported: true;
       readonly relation: RelationRef;
       readonly identity: MaterializationRowIdentity<Row>;
+      readonly finalSort?: QueryData;
+      readonly trusted: boolean;
       readonly reason: string;
+    }
+  | {
+      readonly supported: false;
+      readonly reason: string;
+      readonly diagnostics: readonly TarstateDiagnostic[];
+    };
+type IncrementalMaterializationShape =
+  | {
+      readonly supported: true;
+      readonly relation: RelationRef;
+      readonly finalSort?: QueryData;
     }
   | {
       readonly supported: false;
@@ -1916,6 +1950,19 @@ type IncrementalMaterializationResult<Row = unknown> =
       readonly reason: string;
       readonly diagnostics: readonly TarstateDiagnostic[];
     };
+type IncrementalMaterializedRowsResult<Row = unknown> =
+  | {
+      readonly supported: true;
+      readonly rows: readonly Row[];
+      readonly added: readonly Row[];
+      readonly removed: readonly Row[];
+      readonly rowChanges: readonly RowChange<Row>[];
+    }
+  | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] };
+type IncrementalMaterializedSortPlacement<Row = unknown> = {
+  readonly compare: (left: Row, right: Row) => number;
+};
+const SOURCE_ORDER_PLACEMENT_MIN_ROWS = 64;
 
 function maintainMaterializationIncrementally<Row>(
   target: unknown,
@@ -1939,46 +1986,90 @@ function maintainMaterializationIncrementally<Row>(
     };
   }
 
-  const addedSourceRows = relationDeltasForQuery.flatMap((delta) => delta.added);
-  const removedSourceRows = relationDeltasForQuery.flatMap((delta) => delta.removed);
   const evaluateOptions = materializationEvaluateOptions(target);
-  const addedResult = evaluateDeltaRows(query, support.relation, addedSourceRows, evaluateOptions);
-  const removedResult = evaluateDeltaRows(query, support.relation, removedSourceRows, evaluateOptions);
-  const diagnostics = [...addedResult.diagnostics, ...removedResult.diagnostics];
-  const rowUpdate = applyIncrementalMaterializedRows(
-    previousRows,
-    removedResult.rows,
-    addedResult.rows,
-    support.identity.keyBy
-  );
+  const diagnostics: TarstateDiagnostic[] = [];
+  let rows = previousRows;
+  const useDirectRowChanges = support.trusted;
+  const directRowChanges = support.trusted
+    ? incrementalRowChangeTracker(previousRows, support.identity.keyOf)
+    : undefined;
+  const sortPlacement = support.trusted && support.finalSort !== undefined
+    ? incrementalMaterializedSortPlacement(support.finalSort, query.relations, evaluateOptions, diagnostics)
+    : undefined;
+  let singleDeltaRowChanges: readonly RowChange<Row>[] | undefined;
+  for (const delta of relationDeltasForQuery) {
+    const addedResult = evaluateDeltaRows(query, support.relation, delta.added, evaluateOptions);
+    const removedResult = evaluateDeltaRows(query, support.relation, delta.removed, evaluateOptions);
+    diagnostics.push(...addedResult.diagnostics, ...removedResult.diagnostics);
 
-  if (!rowUpdate.supported) {
-    return {
-      supported: false,
-      reason: rowUpdate.reason,
-      diagnostics: [...diagnostics, ...rowUpdate.diagnostics]
-    };
+    const rowUpdate = applyIncrementalMaterializedRows(
+      rows,
+      removedResult.rows,
+      addedResult.rows,
+      support.identity,
+      {
+        sourceRemovedCount: delta.removed.length,
+        sorted: support.finalSort !== undefined,
+        ...(
+          support.finalSort === undefined && support.identity.unique
+            ? { sourceOrderKeys: () => materializedSourceOrderKeys(target, support.relation) }
+            : {}
+        ),
+        ...(sortPlacement === undefined ? {} : { sortPlacement })
+      }
+    );
+
+    if (!rowUpdate.supported) {
+      return {
+        supported: false,
+        reason: rowUpdate.reason,
+        diagnostics: [...diagnostics, ...rowUpdate.diagnostics]
+      };
+    }
+    rows = rowUpdate.rows;
+    if (
+      useDirectRowChanges
+      && relationDeltasForQuery.length === 1
+      && (support.finalSort === undefined || addedRowChangeCount(rowUpdate.rowChanges) <= 1)
+    ) {
+      singleDeltaRowChanges = rowUpdate.rowChanges;
+    } else {
+      directRowChanges?.apply(rowUpdate.rowChanges);
+    }
   }
 
-  const refresh = refreshMaterializationRows(target, query);
-  if (stableKey(rowUpdate.rows) !== stableKey(refresh.rows)) {
-    const reason = 'incremental materialization candidate differed from full recompute';
-    return {
-      supported: false,
-      reason,
-      diagnostics: [...diagnostics, ...refresh.diagnostics, materializationUnsupportedDiagnostic(reason)]
-    };
+  const orderedRows = sortPlacement === undefined
+    ? applyIncrementalMaterializedSort(
+        rows,
+        support.finalSort,
+        query.relations,
+        evaluateOptions
+      )
+    : { rows, diagnostics: [] };
+  if (!support.trusted) {
+    const refresh = refreshMaterializationRows(target, query);
+    if (stableKey(orderedRows.rows) !== stableKey(refresh.rows)) {
+      const reason = 'incremental materialization candidate differed from full recompute';
+      return {
+        supported: false,
+        reason,
+        diagnostics: [...diagnostics, ...orderedRows.diagnostics, ...refresh.diagnostics, materializationUnsupportedDiagnostic(reason)]
+      };
+    }
   }
 
-  const diff = diffRows(previousRows, rowUpdate.rows, { keyBy: support.identity.keyBy });
+  const directChanges = singleDeltaRowChanges ?? directRowChanges?.changes(orderedRows.rows);
+  const diff = directChanges === undefined
+    ? diffRows(previousRows, orderedRows.rows, { keyBy: support.identity.keyBy })
+    : { changes: directChanges, diagnostics: [] };
   return {
     supported: true,
     reason: 'incremental delta maintenance',
-    rows: rowUpdate.rows,
+    rows: orderedRows.rows,
     added: diff.changes.flatMap((change) => change.kind === 'added' ? [change.row] : []),
     removed: diff.changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []),
     rowChanges: diff.changes,
-    diagnostics: [...diagnostics, ...diff.diagnostics]
+    diagnostics: [...diagnostics, ...orderedRows.diagnostics, ...diff.diagnostics]
   };
 }
 
@@ -1991,6 +2082,7 @@ function recomputeMaterializationChange<Row>(
     readonly touchedDependencies: readonly string[];
     readonly envDependencies: readonly string[];
     readonly touchedEnvDependencies: readonly string[];
+    readonly indexSpecs: readonly MaterializationIndexSpec[];
     readonly reason: string;
     readonly diagnostics: readonly TarstateDiagnostic[];
   }
@@ -2009,7 +2101,7 @@ function recomputeMaterializationChange<Row>(
     touchedDependencies: options.touchedDependencies,
     envDependencies: options.envDependencies,
     touchedEnvDependencies: options.touchedEnvDependencies,
-    indexSpecs: [],
+    indexSpecs: options.indexSpecs,
     previousRowsAvailable: previousRows !== undefined,
     previousRows,
     rows: refresh.rows,
@@ -2018,6 +2110,39 @@ function recomputeMaterializationChange<Row>(
     rowChanges: diff.changes,
     diagnostics: [...options.diagnostics, ...refresh.diagnostics, ...diff.diagnostics]
   };
+}
+
+function materializationIndexSpecs(query: Query): readonly MaterializationIndexSpec[] {
+  return materializationIndexSpecsFromData(query.data);
+}
+
+function materializationIndexSpecsFromData(data: QueryData): readonly MaterializationIndexSpec[] {
+  const input = queryDataFrom(data.input);
+  const nested = input === undefined ? [] : materializationIndexSpecsFromData(input);
+  const own = materializationIndexSpecFromData(data);
+  return own === undefined ? nested : [...nested, own];
+}
+
+function materializationIndexSpecFromData(data: QueryData): MaterializationIndexSpec | undefined {
+  switch (data.op) {
+    case 'hash':
+      return {
+        op: data.unique === true ? 'uniqueIndex' : 'hash',
+        expressions: arrayFromUnknown(data.expressions)
+      };
+    case 'btree':
+      return {
+        op: 'btree',
+        expressions: arrayFromUnknown(data.expressions)
+      };
+    case 'uniqueIndex':
+      return {
+        op: 'uniqueIndex',
+        expressions: arrayFromUnknown(data.expressions)
+      };
+    default:
+      return undefined;
+  }
 }
 
 function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalMaterializationSupport<Row> {
@@ -2037,14 +2162,30 @@ function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalM
     supported: true,
     relation: shape.relation,
     identity,
+    ...(shape.finalSort === undefined ? {} : { finalSort: shape.finalSort }),
+    trusted: trustedIncrementalMaterialization(query, shape, identity),
     reason: 'single-source pipeline with stable row identity'
   };
 }
 
+function trustedIncrementalMaterialization<Row>(
+  query: Query<Row>,
+  shape: Extract<IncrementalMaterializationShape, { readonly supported: true }>,
+  identity: MaterializationRowIdentity<Row>
+): boolean {
+  if (!trustedIncrementalQueryExpressions(query.data)) return false;
+  return shape.finalSort === undefined
+    || (
+      finalSortEvaluableFromFinalRow(shape.finalSort, query.relations)
+      && finalSortIncludesMaterializedIdentity(shape.finalSort, query.relations, identity)
+    );
+}
+
 function incrementalMaterializationShape(
   data: QueryData,
-  relations: Readonly<Record<string, AnyRelationRef>>
-): { readonly supported: true; readonly relation: RelationRef } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  finalPosition = true
+): IncrementalMaterializationShape {
   switch (data.op) {
     case 'from':
     case 'lookup': {
@@ -2076,10 +2217,17 @@ function incrementalMaterializationShape(
       return incrementalNestedShape(data, relations);
     case 'aggregate':
       return unsupportedIncrementalShape('aggregate queries are not incrementally maintained');
-    case 'sort':
+    case 'sort': {
+      if (!finalPosition) return unsupportedIncrementalShape('non-final sort queries are not incrementally maintained');
+      const order = arrayFromUnknown(data.order);
+      if (order.some(containsIncrementalSubquery)) return unsupportedIncrementalShape('correlated or selected subqueries are not incrementally maintained');
+      if (order.some(containsAggregateCall)) return unsupportedIncrementalShape('aggregate sort expressions are not incrementally maintained');
+      const nested = incrementalNestedShape(data, relations);
+      return nested.supported ? { ...nested, finalSort: data } : nested;
+    }
     case 'limit':
     case 'sortLimit':
-      return unsupportedIncrementalShape('final sort and limit queries are not incrementally maintained');
+      return unsupportedIncrementalShape('limit queries require auxiliary pre-limit state and are not incrementally maintained');
     case 'join':
       return unsupportedIncrementalShape('join queries are not incrementally maintained');
     case 'union':
@@ -2100,7 +2248,7 @@ function incrementalNestedShape(
   const input = queryDataFrom(data.input);
   return input === undefined
     ? unsupportedIncrementalShape('incremental maintenance requires a nested input query')
-    : incrementalMaterializationShape(input, relations);
+    : incrementalMaterializationShape(input, relations, false);
 }
 
 function unsupportedIncrementalShape(reason: string): { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
@@ -2134,44 +2282,820 @@ function applyIncrementalMaterializedRows<Row>(
   previousRows: readonly Row[],
   removedRows: readonly Row[],
   addedRows: readonly Row[],
-  keyBy: RowKeySelector<Row>
-): { readonly supported: true; readonly rows: readonly Row[] } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
-  const previousByKey = new Map<string, number>();
+  identity: MaterializationRowIdentity<Row>,
+  options: {
+    readonly sourceRemovedCount?: number;
+    readonly sorted?: boolean;
+    readonly sourceOrderKeys?: () => readonly string[] | undefined;
+    readonly sortPlacement?: IncrementalMaterializedSortPlacement<Row>;
+  } = {}
+): IncrementalMaterializedRowsResult<Row> {
+  const keyOf = identity.keyOf;
   const removedByKey = new Map<string, Row>();
   const addedByKey = new Map<string, Row>();
   const duplicateKeys = new Set<string>();
 
-  const track = (map: Map<string, Row> | Map<string, number>, key: string, value: Row | number): void => {
+  const track = <Value>(map: Map<string, Value>, key: string, value: Value): void => {
     if (map.has(key)) duplicateKeys.add(key);
-    (map as Map<string, Row | number>).set(key, value);
+    map.set(key, value);
   };
 
-  previousRows.forEach((rowValue, indexValue) => track(previousByKey, rowDiffKey(rowValue, { keyBy }), indexValue));
-  removedRows.forEach((rowValue) => track(removedByKey, rowDiffKey(rowValue, { keyBy }), rowValue));
-  addedRows.forEach((rowValue) => track(addedByKey, rowDiffKey(rowValue, { keyBy }), rowValue));
+  const removedKeyedRows = removedRows.map((rowValue) => {
+    const key = keyOf(rowValue);
+    track(removedByKey, key, rowValue);
+    return { key, row: rowValue };
+  });
+  const addedKeyedRows = addedRows.map((rowValue) => {
+    const key = keyOf(rowValue);
+    track(addedByKey, key, rowValue);
+    return { key, row: rowValue };
+  });
+
+  const previousLookup = previousRowLookup(previousRows, identity);
+  for (const key of previousLookup.duplicateKeys) duplicateKeys.add(key);
 
   if (duplicateKeys.size > 0) {
     const reason = `incremental maintenance requires unique materialized row keys: ${Array.from(duplicateKeys).join(', ')}`;
     return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
   }
 
-  const rows: Row[] = [];
-  for (const rowValue of previousRows) {
-    const key = rowDiffKey(rowValue, { keyBy });
-    const added = addedByKey.get(key);
-    if (added !== undefined) {
-      rows.push(added);
+  const staleRemovedKeys: string[] = [];
+  const removedEntries = removedKeyedRows.map(({ key, row }) => {
+    const previous = previousLookup.get(key);
+    if (previous === undefined || !rowsEqualForDiff(previous.row, row)) staleRemovedKeys.push(key);
+    return { key, row, previous: previous?.row, index: previous?.index ?? -1 };
+  });
+
+  if (staleRemovedKeys.length > 0) {
+    const reason = `incremental maintenance found stale removed materialized row keys: ${[...uniqueStrings(staleRemovedKeys)].sort().join(', ')}`;
+    return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+  }
+
+  const retainedCollisionKeys = Array.from(addedByKey.keys())
+    .filter((key) => previousLookup.get(key) !== undefined && !removedByKey.has(key))
+    .sort();
+  if (retainedCollisionKeys.length > 0) {
+    const reason = `incremental maintenance cannot add materialized row keys that collide with retained rows: ${retainedCollisionKeys.join(', ')}`;
+    return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+  }
+
+  const retainedCount = previousRows.length - removedRows.length;
+  const sourceRemovedCount = options.sourceRemovedCount ?? removedRows.length;
+  const ambiguousUnsortedPlacement = options.sorted !== true
+    && sourceRemovedCount > 0
+    && addedRows.length > 0
+    && retainedCount > 0
+    && (sourceRemovedCount > removedRows.length || removedRows.length !== addedRows.length);
+  const sourceOrderKeys = ambiguousUnsortedPlacement && identity.unique && previousRows.length >= SOURCE_ORDER_PLACEMENT_MIN_ROWS
+    ? options.sourceOrderKeys?.()
+    : undefined;
+  if (ambiguousUnsortedPlacement && sourceOrderKeys === undefined) {
+    const reason = 'incremental maintenance cannot deterministically place materialized rows added by source updates';
+    return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+  }
+
+  const removedIndexes = new Set(removedEntries.map((entry) => entry.index));
+  const rowChanges = materializedDeltaRowChanges(removedEntries, addedKeyedRows, removedByKey, addedByKey);
+  const added = rowChanges.flatMap((change) => change.kind === 'added' ? [change.row] : []);
+  const removed = rowChanges.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+
+  if (removedRows.length === 0 && addedRows.length === 0) {
+    return { supported: true, rows: previousRows, added, removed, rowChanges };
+  }
+
+  const sortedRows = (): readonly Row[] | undefined => options.sortPlacement === undefined
+    ? undefined
+    : incrementalSortedMaterializedRows(previousRows, removedEntries, addedRows, options.sortPlacement);
+  const sourceOrderedRows = (): readonly Row[] | undefined => sourceOrderKeys === undefined
+    ? undefined
+    : incrementalSourceOrderedMaterializedRows(previousRows, removedEntries, addedRows, identity, sourceOrderKeys);
+
+  if (removedRows.length === previousRows.length) {
+    return {
+      supported: true,
+      rows: sortedRows() ?? sourceOrderedRows() ?? addedRows,
+      added,
+      removed,
+      rowChanges
+    };
+  }
+
+  if (removedRows.length === 0) {
+    return {
+      supported: true,
+      rows: sortedRows() ?? sourceOrderedRows() ?? [...previousRows, ...addedRows],
+      added,
+      removed,
+      rowChanges
+    };
+  }
+
+  if (removedRows.length === 1 && addedRows.length === 1) {
+    const removedEntry = removedEntries[0];
+    const addedRow = addedRows[0];
+    if (removedEntry !== undefined && addedRow !== undefined) {
+      const sorted = sortedRows();
+      if (sorted !== undefined) return { supported: true, rows: sorted, added, removed, rowChanges };
+      const rows = [...previousRows];
+      rows[removedEntry.index] = addedRow;
+      return { supported: true, rows, added, removed, rowChanges };
+    }
+  }
+
+  if (removedRows.length === 1 && addedRows.length === 0) {
+    const removedEntry = removedEntries[0];
+    if (removedEntry !== undefined) {
+      const sorted = sortedRows();
+      if (sorted !== undefined) return { supported: true, rows: sorted, added, removed, rowChanges };
+      return {
+        supported: true,
+        rows: [...previousRows.slice(0, removedEntry.index), ...previousRows.slice(removedEntry.index + 1)],
+        added,
+        removed,
+        rowChanges
+      };
+    }
+  }
+
+  if (removedRows.length === addedRows.length) {
+    const sorted = sortedRows();
+    if (sorted !== undefined) return { supported: true, rows: sorted, added, removed, rowChanges };
+    const replacements = new Map<number, Row>();
+    removedEntries.forEach((entry, indexValue) => {
+      const added = addedRows[indexValue];
+      if (added !== undefined) replacements.set(entry.index, added);
+    });
+    const rows: Row[] = [];
+    previousRows.forEach((rowValue, indexValue) => {
+      const replacement = replacements.get(indexValue);
+      if (replacement !== undefined) {
+        rows.push(replacement);
+      } else if (!removedIndexes.has(indexValue)) {
+        rows.push(rowValue);
+      }
+    });
+    return {
+      supported: true,
+      rows,
+      added,
+      removed,
+      rowChanges
+    };
+  }
+
+  const rows = previousRows.filter((_, indexValue) => !removedIndexes.has(indexValue));
+  if (addedRows.length > 0) {
+    const firstRemovedIndex = Math.min(...removedEntries.map((entry) => entry.index));
+    rows.splice(Number.isFinite(firstRemovedIndex) ? Math.min(firstRemovedIndex, rows.length) : rows.length, 0, ...addedRows);
+  }
+  return { supported: true, rows: sortedRows() ?? sourceOrderedRows() ?? rows, added, removed, rowChanges };
+}
+
+function previousRowLookup<Row>(
+  rows: readonly Row[],
+  identity: MaterializationRowIdentity<Row>
+): {
+  readonly duplicateKeys: ReadonlySet<string>;
+  readonly get: (key: string) => { readonly row: Row; readonly index: number } | undefined;
+} {
+  if (!identity.unique) {
+    const map = new Map<string, { readonly row: Row; readonly index: number }>();
+    const duplicateKeys = new Set<string>();
+    rows.forEach((rowValue, indexValue) => {
+      const key = identity.keyOf(rowValue);
+      if (map.has(key)) duplicateKeys.add(key);
+      map.set(key, { row: rowValue, index: indexValue });
+    });
+    return { duplicateKeys, get: (key) => map.get(key) };
+  }
+
+  const cache = new Map<string, { readonly row: Row; readonly index: number } | undefined>();
+  return {
+    duplicateKeys: new Set<string>(),
+    get: (key) => {
+      if (cache.has(key)) return cache.get(key);
+      const entry = findMaterializedRowByKey(rows, identity.keyOf, key);
+      cache.set(key, entry);
+      return entry;
+    }
+  };
+}
+
+function findMaterializedRowByKey<Row>(
+  rows: readonly Row[],
+  keyOf: (row: Row) => string,
+  key: string
+): { readonly row: Row; readonly index: number } | undefined {
+  for (let indexValue = 0; indexValue < rows.length; indexValue += 1) {
+    const rowValue = rows[indexValue];
+    if (rowValue !== undefined && keyOf(rowValue) === key) return { row: rowValue, index: indexValue };
+  }
+  return undefined;
+}
+
+function materializedSourceOrderKeys(target: unknown, relationRef: RelationRef): readonly string[] | undefined {
+  const rows = isDb(target)
+    ? target.data[relationRef.name] ?? []
+    : isRelationSource(target)
+      ? target.rows(relationRef)
+      : undefined;
+  if (rows === undefined) return undefined;
+  const paths = relationKeyFields(relationRef).map((fieldName) => [fieldName]);
+  return rows.map((rowValue) => rowIdentityKey(rowValue, paths));
+}
+
+function incrementalSourceOrderedMaterializedRows<Row>(
+  previousRows: readonly Row[],
+  removedEntries: readonly { readonly index: number }[],
+  addedRows: readonly Row[],
+  identity: MaterializationRowIdentity<Row>,
+  sourceOrderKeys: readonly string[]
+): readonly Row[] {
+  if (addedRows.length === 0) {
+    const removedIndexes = new Set(removedEntries.map((entry) => entry.index));
+    return previousRows.filter((_, indexValue) => !removedIndexes.has(indexValue));
+  }
+
+  const sourceIndex = new Map<string, number>();
+  sourceOrderKeys.forEach((key, indexValue) => {
+    if (!sourceIndex.has(key)) sourceIndex.set(key, indexValue);
+  });
+
+  const sourcePosition = (rowValue: Row): number => sourceIndex.get(identity.keyOf(rowValue)) ?? Number.POSITIVE_INFINITY;
+  const removedIndexes = new Set(removedEntries.map((entry) => entry.index));
+  const rows = previousRows.filter((_, indexValue) => !removedIndexes.has(indexValue));
+  const additions = addedRows
+    .map((rowValue, ordinal) => ({ row: rowValue, position: sourcePosition(rowValue), ordinal }))
+    .sort((left, right) => left.position === right.position ? left.ordinal - right.ordinal : left.position - right.position);
+
+  for (const addition of additions) {
+    const insertIndex = rows.findIndex((rowValue) => sourcePosition(rowValue) > addition.position);
+    rows.splice(insertIndex === -1 ? rows.length : insertIndex, 0, addition.row);
+  }
+
+  return rows;
+}
+
+function materializedDeltaRowChanges<Row>(
+  removedEntries: readonly {
+    readonly key: string;
+    readonly row: Row;
+    readonly previous: Row | undefined;
+    readonly index: number;
+  }[],
+  addedRows: readonly { readonly key: string; readonly row: Row }[],
+  removedByKey: ReadonlyMap<string, Row>,
+  addedByKey: ReadonlyMap<string, Row>
+): readonly RowChange<Row>[] {
+  const existingChanges: { readonly index: number; readonly change: RowChange<Row> }[] = [];
+  const consumedAddedKeys = new Set<string>();
+
+  for (const entry of removedEntries) {
+    const before = entry.previous ?? entry.row;
+    const after = addedByKey.get(entry.key);
+    if (after === undefined) {
+      existingChanges.push({ index: entry.index, change: { kind: 'removed', row: before, key: entry.key } });
       continue;
     }
-    if (!removedByKey.has(key)) rows.push(rowValue);
+
+    consumedAddedKeys.add(entry.key);
+    if (!rowsEqualForDiff(before, after)) {
+      existingChanges.push({ index: entry.index, change: { kind: 'updated', before, after, key: entry.key } });
+    }
   }
 
-  for (const rowValue of addedRows) {
-    const key = rowDiffKey(rowValue, { keyBy });
-    if (!previousByKey.has(key)) rows.push(rowValue);
+  const addedChanges = addedRows
+    .filter((entry) => !removedByKey.has(entry.key) && !consumedAddedKeys.has(entry.key))
+    .map((entry): RowChange<Row> => ({ kind: 'added', row: entry.row, key: entry.key }));
+
+  return [
+    ...existingChanges
+      .sort((left, right) => left.index - right.index)
+      .map((entry) => entry.change),
+    ...addedChanges
+  ];
+}
+
+function rowsEqualForDiff<Row>(left: Row, right: Row): boolean {
+  return Object.is(left, right) || stableKey(left) === stableKey(right);
+}
+
+function addedRowChangeCount<Row>(changes: readonly RowChange<Row>[]): number {
+  let count = 0;
+  for (const change of changes) {
+    if (change.kind === 'added') count += 1;
+  }
+  return count;
+}
+
+function incrementalRowChangeTracker<Row>(
+  previousRows: readonly Row[],
+  keyOf: (row: Row) => string
+): {
+  readonly apply: (changes: readonly RowChange<Row>[]) => void;
+  readonly changes: (finalRows: readonly Row[]) => readonly RowChange<Row>[];
+} {
+  type ChangeState = {
+    existedBefore: boolean;
+    before?: Row;
+    after?: Row;
+    beforeIndex: number;
+    sequence: number;
+  };
+
+  const states = new Map<string, ChangeState>();
+  const originalCache = new Map<string, { readonly row: Row; readonly index: number } | undefined>();
+  let sequence = 0;
+
+  const original = (key: string): { readonly row: Row; readonly index: number } | undefined => {
+    if (originalCache.has(key)) return originalCache.get(key);
+    const entry = findMaterializedRowByKey(previousRows, keyOf, key);
+    originalCache.set(key, entry);
+    return entry;
+  };
+
+  const apply = (changes: readonly RowChange<Row>[]): void => {
+    for (const change of changes) {
+      const current = states.get(change.key);
+
+      if (change.kind === 'added') {
+        if (current === undefined) {
+          states.set(change.key, {
+            existedBefore: false,
+            after: change.row,
+            beforeIndex: Number.POSITIVE_INFINITY,
+            sequence: sequence++
+          });
+        } else {
+          current.after = change.row;
+        }
+        continue;
+      }
+
+      if (change.kind === 'removed') {
+        if (current === undefined) {
+          const entry = original(change.key);
+          states.set(change.key, {
+            existedBefore: true,
+            before: entry?.row ?? change.row,
+            beforeIndex: entry?.index ?? Number.POSITIVE_INFINITY,
+            sequence: sequence++
+          });
+        } else if (!current.existedBefore) {
+          states.delete(change.key);
+        } else {
+          delete current.after;
+        }
+        continue;
+      }
+
+      if (current === undefined) {
+        const entry = original(change.key);
+        states.set(change.key, {
+          existedBefore: entry !== undefined,
+          before: entry?.row ?? change.before,
+          after: change.after,
+          beforeIndex: entry?.index ?? Number.POSITIVE_INFINITY,
+          sequence: sequence++
+        });
+      } else {
+        current.after = change.after;
+      }
+    }
+  };
+
+  const changes = (finalRows: readonly Row[]): readonly RowChange<Row>[] => {
+    const existingChanges: { readonly index: number; readonly change: RowChange<Row> }[] = [];
+    const addedStates = new Map<string, ChangeState>();
+
+    for (const [key, state] of states) {
+      if (!state.existedBefore) {
+        if (state.after !== undefined) addedStates.set(key, state);
+        continue;
+      }
+
+      if (state.before === undefined) continue;
+      if (state.after === undefined) {
+        existingChanges.push({ index: state.beforeIndex, change: { kind: 'removed', row: state.before, key } });
+      } else if (!rowsEqualForDiff(state.before, state.after)) {
+        existingChanges.push({ index: state.beforeIndex, change: { kind: 'updated', before: state.before, after: state.after, key } });
+      }
+    }
+
+    const addedChanges: RowChange<Row>[] = [];
+    if (addedStates.size === 1) {
+      const [entry] = addedStates;
+      if (entry !== undefined && entry[1].after !== undefined) addedChanges.push({ kind: 'added', row: entry[1].after, key: entry[0] });
+    } else if (addedStates.size > 1) {
+      for (const rowValue of finalRows) {
+        const key = keyOf(rowValue);
+        const state = addedStates.get(key);
+        if (state?.after === undefined) continue;
+        addedChanges.push({ kind: 'added', row: state.after, key });
+        addedStates.delete(key);
+      }
+      addedChanges.push(...Array.from(addedStates, ([key, state]) => ({ key, state }))
+        .sort((left, right) => left.state.sequence - right.state.sequence)
+        .flatMap(({ key, state }): RowChange<Row>[] => state.after === undefined ? [] : [{ kind: 'added', row: state.after, key }]));
+    }
+
+    return [
+      ...existingChanges
+        .sort((left, right) => left.index - right.index)
+        .map((entry) => entry.change),
+      ...addedChanges
+    ];
+  };
+
+  return { apply, changes };
+}
+
+function incrementalMaterializedSortPlacement<Row>(
+  sortData: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[]
+): IncrementalMaterializedSortPlacement<Row> {
+  const order = arrayFromUnknown(sortData.order);
+  const source = fromObjectSource({});
+  const aliases = uniqueStrings(Object.keys(relations), queryDataAliases(sortData));
+  return {
+    compare: (left, right) => compareMaterializedSortRows(left, right, order, source, relations, options, diagnostics, aliases)
+  };
+}
+
+function compareMaterializedSortRows<Row>(
+  left: Row,
+  right: Row,
+  order: readonly unknown[],
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  aliases: readonly string[]
+): number {
+  if (order.length === 0) return 0;
+  const leftEntry = entryForMaterializedSortRow(left, aliases);
+  const rightEntry = entryForMaterializedSortRow(right, aliases);
+  for (const sortInput of order) {
+    const sortData = normalizeSortInput(sortInput);
+    const leftValue = evaluateExpr(sortData.expr, leftEntry, source, relations, options, diagnostics, undefined);
+    const rightValue = evaluateExpr(sortData.expr, rightEntry, source, relations, options, diagnostics, undefined);
+    const comparisonValue = compareNullable(leftValue, rightValue, sortData.nulls);
+    if (comparisonValue !== 0) return sortData.direction === 'desc' ? -comparisonValue : comparisonValue;
+  }
+  return 0;
+}
+
+function incrementalSortedMaterializedRows<Row>(
+  previousRows: readonly Row[],
+  removedEntries: readonly { readonly index: number }[],
+  addedRows: readonly Row[],
+  placement: IncrementalMaterializedSortPlacement<Row>
+): readonly Row[] {
+  type PositionedRow = { readonly row: Row; readonly ordinal: number };
+
+  const removedIndexes = new Set(removedEntries.map((entry) => entry.index));
+  const base: PositionedRow[] = [];
+  const insertions: PositionedRow[] = [];
+  const pushInsertion = (row: Row, ordinal: number): void => {
+    insertions.push({ row, ordinal });
+  };
+
+  if (removedEntries.length === previousRows.length) {
+    addedRows.forEach((rowValue, indexValue) => pushInsertion(rowValue, indexValue));
+    return mergePositionedMaterializedRows(base, insertions, placement);
   }
 
-  return { supported: true, rows };
+  if (removedEntries.length === 0) {
+    previousRows.forEach((rowValue, indexValue) => base.push({ row: rowValue, ordinal: indexValue }));
+    addedRows.forEach((rowValue, indexValue) => pushInsertion(rowValue, previousRows.length + indexValue));
+    return mergePositionedMaterializedRows(base, insertions, placement);
+  }
+
+  if (removedEntries.length === addedRows.length) {
+    const replacements = new Map<number, Row>();
+    removedEntries.forEach((entry, indexValue) => {
+      const added = addedRows[indexValue];
+      if (added !== undefined) replacements.set(entry.index, added);
+    });
+
+    let ordinal = 0;
+    previousRows.forEach((rowValue, indexValue) => {
+      const replacement = replacements.get(indexValue);
+      if (replacement !== undefined) {
+        pushInsertion(replacement, ordinal);
+        ordinal += 1;
+      } else if (!removedIndexes.has(indexValue)) {
+        base.push({ row: rowValue, ordinal });
+        ordinal += 1;
+      }
+    });
+    return mergePositionedMaterializedRows(base, insertions, placement);
+  }
+
+  const retainedRows = previousRows.filter((_, indexValue) => !removedIndexes.has(indexValue));
+  const firstRemovedIndex = Math.min(...removedEntries.map((entry) => entry.index));
+  const insertIndex = Number.isFinite(firstRemovedIndex) ? Math.min(firstRemovedIndex, retainedRows.length) : retainedRows.length;
+  let ordinal = 0;
+  for (let indexValue = 0; indexValue <= retainedRows.length; indexValue += 1) {
+    if (indexValue === insertIndex) {
+      for (const rowValue of addedRows) {
+        pushInsertion(rowValue, ordinal);
+        ordinal += 1;
+      }
+    }
+    const rowValue = retainedRows[indexValue];
+    if (rowValue !== undefined) {
+      base.push({ row: rowValue, ordinal });
+      ordinal += 1;
+    }
+  }
+
+  return mergePositionedMaterializedRows(base, insertions, placement);
+}
+
+function mergePositionedMaterializedRows<Row>(
+  base: { readonly row: Row; readonly ordinal: number }[],
+  insertions: readonly { readonly row: Row; readonly ordinal: number }[],
+  placement: IncrementalMaterializedSortPlacement<Row>
+): readonly Row[] {
+  if (insertions.length === 0) return base.map((entry) => entry.row);
+
+  for (const insertion of insertions) {
+    let low = 0;
+    let high = base.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      const current = base[mid];
+      if (current === undefined || comparePositionedMaterializedRows(current, insertion, placement) <= 0) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    base.splice(low, 0, insertion);
+  }
+
+  return base.map((entry) => entry.row);
+}
+
+function comparePositionedMaterializedRows<Row>(
+  left: { readonly row: Row; readonly ordinal: number },
+  right: { readonly row: Row; readonly ordinal: number },
+  placement: IncrementalMaterializedSortPlacement<Row>
+): number {
+  const comparisonValue = placement.compare(left.row, right.row);
+  return comparisonValue === 0 ? left.ordinal - right.ordinal : comparisonValue;
+}
+
+function applyIncrementalMaterializedSort<Row>(
+  rows: readonly Row[],
+  sortData: QueryData | undefined,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions
+): MaterializationRefreshResult<Row> {
+  if (sortData === undefined) return { rows, diagnostics: [] };
+  const diagnostics: TarstateDiagnostic[] = [];
+  const source = fromObjectSource({});
+  const aliases = uniqueStrings(Object.keys(relations), queryDataAliases(sortData));
+  const entries = rows.map((rowValue) => entryForMaterializedSortRow(rowValue, aliases));
+  return {
+    rows: sortEntries(entries, arrayFromUnknown(sortData.order), source, relations, options, diagnostics, undefined)
+      .map((entry) => entry.row as Row),
+    diagnostics
+  };
+}
+
+function entryForMaterializedSortRow(rowValue: unknown, aliases: readonly string[]): EvalEntry {
+  const entry = entryForRow(rowValue);
+  const aliasValues = Object.fromEntries(aliases.map((alias) => [alias, rowValue]));
+  return { row: rowValue, aliases: { ...aliasValues, ...entry.aliases } };
+}
+
+function queryDataAliases(data: QueryData): readonly string[] {
+  const aliases: string[] = [];
+  const visit = (valueValue: unknown): void => {
+    const queryData = queryDataFrom(valueValue);
+    if (queryData === undefined) return;
+    if (typeof queryData.alias === 'string') aliases.push(queryData.alias);
+    if (typeof queryData.rightAlias === 'string') aliases.push(queryData.rightAlias);
+    for (const item of [queryData.input, queryData.left, queryData.right]) visit(item);
+    for (const item of queryDataArray(queryData.inputs)) visit(item);
+  };
+  visit(data);
+  return uniqueStrings(aliases);
+}
+
+function trustedIncrementalQueryExpressions(data: QueryData): boolean {
+  const nestedTrusted = (): boolean => {
+    const input = queryDataFrom(data.input);
+    return input !== undefined && trustedIncrementalQueryExpressions(input);
+  };
+
+  switch (data.op) {
+    case 'from':
+    case 'lookup':
+      return true;
+    case 'where':
+      return trustedRowLocalExpr(data.predicate) && nestedTrusted();
+    case 'project':
+      return trustedProjectionExpressions(data.projection) && nestedTrusted();
+    case 'extend':
+      return trustedProjectionExpressions(data.projection) && nestedTrusted();
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+      return arrayFromUnknown(data.expressions).every(trustedRowLocalExpr) && nestedTrusted();
+    case 'sort':
+      return arrayFromUnknown(data.order)
+        .every((sortInput) => trustedRowLocalExpr(normalizeSortInput(sortInput).expr))
+        && nestedTrusted();
+    case 'without':
+    case 'rename':
+    case 'qualify':
+    case 'keyBy':
+      return nestedTrusted();
+    default:
+      return false;
+  }
+}
+
+function trustedProjectionExpressions(input: unknown): boolean {
+  return Object.values(projectionFrom(input)).every(trustedRowLocalExpr);
+}
+
+function trustedRowLocalExpr(input: unknown): boolean {
+  const data = exprFrom(unwrapOptionalProjection(input));
+  switch (data.op) {
+    case 'value':
+    case 'field':
+    case 'env':
+    case 'self':
+      return true;
+    case 'maybe':
+      return trustedRowLocalExpr(data.expr);
+    case 'tuple':
+      return arrayFromUnknown(data.values).every(trustedRowLocalExpr);
+    case 'eq':
+    case 'neq':
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte':
+      return trustedRowLocalExpr(data.left) && trustedRowLocalExpr(data.right);
+    case 'and':
+    case 'or':
+      return arrayFromUnknown(data.predicates).every(trustedRowLocalExpr);
+    case 'not':
+      return trustedRowLocalExpr(data.predicate);
+    case 'isNull':
+    case 'notNull':
+    case 'isMissing':
+    case 'notMissing':
+      return trustedRowLocalExpr(data.expr);
+    default:
+      return false;
+  }
+}
+
+function finalSortEvaluableFromFinalRow(sortData: QueryData, relations: Readonly<Record<string, AnyRelationRef>>): boolean {
+  const input = queryDataFrom(sortData.input);
+  if (input === undefined) return false;
+  const finalRowFields = finalRowFieldExpressions(input, relations);
+  if (finalRowFields.size === 0) return false;
+  return arrayFromUnknown(sortData.order)
+    .every((sortInput) => finalRowExprEvaluableFromFields(normalizeSortInput(sortInput).expr, finalRowFields));
+}
+
+function finalSortIncludesMaterializedIdentity<Row>(
+  sortData: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  identity: MaterializationRowIdentity<Row>
+): boolean {
+  if (!identity.unique || identity.fields === undefined) return false;
+  const input = queryDataFrom(sortData.input);
+  if (input === undefined) return false;
+  const finalRowFields = finalRowFieldExpressions(input, relations);
+  if (finalRowFields.size === 0) return false;
+  const sortedFields = new Set(arrayFromUnknown(sortData.order)
+    .flatMap((sortInput) => {
+      const fieldName = finalRowFieldNameForExpr(normalizeSortInput(sortInput).expr, finalRowFields);
+      return fieldName === undefined ? [] : [fieldName];
+    }));
+  return identity.fields.every((fieldName) => sortedFields.has(fieldName));
+}
+
+function finalRowFieldNameForExpr(input: unknown, finalRowFields: ReadonlyMap<string, ExprData>): string | undefined {
+  const data = exprFrom(unwrapOptionalProjection(input));
+  if (data.op !== 'field') return undefined;
+  const fieldName = typeof data.field === 'string' ? data.field : undefined;
+  if (fieldName === undefined) return undefined;
+  const alias = typeof data.alias === 'string' ? data.alias : 'row';
+  if (alias === 'row') return finalRowFields.has(fieldName) ? fieldName : undefined;
+  const finalExpr = finalRowFields.get(fieldName);
+  return finalExpr !== undefined && stableKey(finalExpr) === stableKey(data) ? fieldName : undefined;
+}
+
+function finalRowExprEvaluableFromFields(input: unknown, finalRowFields: ReadonlyMap<string, ExprData>): boolean {
+  if (!trustedRowLocalExpr(input)) return false;
+  const data = exprFrom(unwrapOptionalProjection(input));
+  switch (data.op) {
+    case 'value':
+    case 'env':
+      return true;
+    case 'field': {
+      const fieldName = typeof data.field === 'string' ? data.field : undefined;
+      if (fieldName === undefined) return false;
+      const alias = typeof data.alias === 'string' ? data.alias : 'row';
+      if (alias === 'row') return finalRowFields.has(fieldName);
+      const finalExpr = finalRowFields.get(fieldName);
+      return finalExpr !== undefined && stableKey(finalExpr) === stableKey(data);
+    }
+    case 'maybe':
+      return finalRowExprEvaluableFromFields(data.expr, finalRowFields);
+    case 'tuple':
+      return arrayFromUnknown(data.values).every((item) => finalRowExprEvaluableFromFields(item, finalRowFields));
+    case 'eq':
+    case 'neq':
+    case 'lt':
+    case 'lte':
+    case 'gt':
+    case 'gte':
+      return finalRowExprEvaluableFromFields(data.left, finalRowFields)
+        && finalRowExprEvaluableFromFields(data.right, finalRowFields);
+    case 'and':
+    case 'or':
+      return arrayFromUnknown(data.predicates).every((item) => finalRowExprEvaluableFromFields(item, finalRowFields));
+    case 'not':
+      return finalRowExprEvaluableFromFields(data.predicate, finalRowFields);
+    case 'isNull':
+    case 'notNull':
+    case 'isMissing':
+    case 'notMissing':
+      return finalRowExprEvaluableFromFields(data.expr, finalRowFields);
+    default:
+      return false;
+  }
+}
+
+function finalRowFieldExpressions(data: QueryData, relations: Readonly<Record<string, AnyRelationRef>>): ReadonlyMap<string, ExprData> {
+  switch (data.op) {
+    case 'from':
+    case 'lookup': {
+      const relationName = typeof data.relation === 'string' ? data.relation : undefined;
+      const relationRef = relationName === undefined ? undefined : relations[relationName];
+      if (!isRelationRef(relationRef)) return new Map();
+      const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
+      return new Map(relationFieldNames(relationRef).map((fieldName) => [fieldName, field(alias, fieldName)]));
+    }
+    case 'where':
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+    case 'keyBy':
+    case 'sort':
+      return nestedFinalRowFieldExpressions(data, relations);
+    case 'project':
+      return projectionFieldExpressions(projectionFrom(data.projection));
+    case 'extend': {
+      const fields = new Map(nestedFinalRowFieldExpressions(data, relations));
+      for (const [fieldName, exprData] of projectionFieldExpressions(projectionFrom(data.projection))) fields.set(fieldName, exprData);
+      return fields;
+    }
+    case 'without': {
+      const fields = new Map(nestedFinalRowFieldExpressions(data, relations));
+      for (const fieldName of stringArray(data.fields)) fields.delete(fieldName);
+      return fields;
+    }
+    case 'rename': {
+      const fields = isRecord(data.fields) ? data.fields : {};
+      return new Map(Array.from(nestedFinalRowFieldExpressions(data, relations), ([fieldName, exprData]) => {
+        const renamed = fields[fieldName];
+        return [typeof renamed === 'string' ? renamed : fieldName, exprData];
+      }));
+    }
+    case 'qualify': {
+      const alias = typeof data.alias === 'string' ? data.alias : 'row';
+      return new Map([[alias, { op: 'self' } as ExprData]]);
+    }
+    default:
+      return new Map();
+  }
+}
+
+function nestedFinalRowFieldExpressions(data: QueryData, relations: Readonly<Record<string, AnyRelationRef>>): ReadonlyMap<string, ExprData> {
+  const input = queryDataFrom(data.input);
+  return input === undefined ? new Map() : finalRowFieldExpressions(input, relations);
+}
+
+function projectionFieldExpressions(projection: ProjectionData): ReadonlyMap<string, ExprData> {
+  const fields = new Map<string, ExprData>();
+  for (const [fieldName, projectionExpr] of Object.entries(projection)) {
+    const exprData = unwrapOptionalProjection(projectionExpr);
+    if (isExpr(exprData)) fields.set(fieldName, exprData);
+  }
+  return fields;
 }
 
 function containsIncrementalSubquery(input: unknown): boolean {
@@ -2898,16 +3822,21 @@ function createStoreView<Row, Version>(
   subscribeStore: (listener: () => void) => () => void
 ): StoreView<Row, Version> {
   const key = queryKey(queryValue);
+  let cachedSnapshot: StoreViewSnapshot<Row, Version> | undefined;
   const viewSnapshot = (): StoreViewSnapshot<Row, Version> => {
     const current = snapshot();
+    if (cachedSnapshot !== undefined && cachedSnapshot.revision === current.revision && cachedSnapshot.queryKey === key) {
+      return cachedSnapshot;
+    }
     const result = qResult(current.db, queryValue);
-    return {
+    cachedSnapshot = {
       rows: result.rows,
       diagnostics: [...current.diagnostics, ...result.diagnostics],
       revision: current.revision,
       queryKey: key,
       ...(current.version === undefined ? {} : { version: current.version })
     };
+    return cachedSnapshot;
   };
   return {
     query: queryValue,
@@ -3942,15 +4871,82 @@ function applySetEnvTransaction(dbValue: Db, tx: SetEnvTransaction): Db {
   return { ...dbValue, env: envValue };
 }
 
-function envDeltasFor(before: DbEnv, after: DbEnv): readonly MaterializationEnvDelta[] {
-  const names = new Set([...Object.keys(before), ...Object.keys(after)]);
+type EnvSnapshotEntry = {
+  readonly value: unknown;
+  readonly fingerprint: string;
+  readonly identitySensitive: boolean;
+};
+type EnvSnapshot = ReadonlyMap<string, EnvSnapshotEntry>;
+
+function envSnapshot(envValue: DbEnv): EnvSnapshot {
+  return new Map(Object.keys(envValue).map((name) => [name, {
+    value: envValue[name],
+    fingerprint: envValueFingerprint(envValue[name]),
+    identitySensitive: envValueIdentitySensitive(envValue[name])
+  }]));
+}
+
+function envDeltasFor(before: EnvSnapshot, after: DbEnv): readonly MaterializationEnvDelta[] {
+  const names = new Set([...before.keys(), ...Object.keys(after)]);
   const deltas: MaterializationEnvDelta[] = [];
   for (const name of names) {
-    if (!Object.is(before[name], after[name])) {
-      deltas.push({ name, before: before[name], after: after[name] });
+    const beforeValue = before.get(name);
+    const afterHasValue = Object.prototype.hasOwnProperty.call(after, name);
+    const afterValue = afterHasValue ? after[name] : undefined;
+    const beforeFingerprint = beforeValue?.fingerprint ?? '~missing';
+    const afterFingerprint = afterHasValue ? envValueFingerprint(afterValue) : '~missing';
+    const identityChanged = beforeValue?.identitySensitive === true && !Object.is(beforeValue.value, afterValue);
+    if (beforeFingerprint !== afterFingerprint || identityChanged) {
+      deltas.push({ name, before: beforeValue?.value, after: afterValue });
     }
   }
   return deltas;
+}
+
+function envValueFingerprint(
+  input: unknown,
+  seen: Map<object, number> = new Map()
+): string {
+  if (input === undefined) return '~undefined';
+  if (typeof input === 'number') {
+    if (Number.isNaN(input)) return '~number:NaN';
+    if (input === Infinity) return '~number:Infinity';
+    if (input === -Infinity) return '~number:-Infinity';
+    if (Object.is(input, -0)) return '~number:-0';
+    return JSON.stringify(input);
+  }
+  if (input === null || typeof input === 'string' || typeof input === 'boolean') return JSON.stringify(input);
+  if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
+  if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
+  if (typeof input === 'function') return `~function:${input.name}`;
+  if (input instanceof Date) return `~date:${Number.isNaN(input.valueOf()) ? 'Invalid' : input.toISOString()}`;
+  if (input instanceof RegExp) return `~regexp:${input.source}/${input.flags}`;
+  if (Array.isArray(input)) {
+    const reference = envSeenReference(input, seen);
+    if (reference !== undefined) return reference;
+    return `[${input.map((item) => envValueFingerprint(item, seen)).join(',')}]`;
+  }
+  if (isRecord(input)) {
+    const reference = envSeenReference(input, seen);
+    if (reference !== undefined) return reference;
+    return `{${Object.keys(input)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${envValueFingerprint(input[key], seen)}`)
+      .join(',')}}`;
+  }
+  if (typeof input === 'object' && input !== null) return Object.prototype.toString.call(input);
+  return JSON.stringify(String(input as string | number | boolean | bigint | null | undefined));
+}
+
+function envValueIdentitySensitive(input: unknown): boolean {
+  return (typeof input === 'object' && input !== null) || typeof input === 'function' || typeof input === 'symbol';
+}
+
+function envSeenReference(input: object, seen: Map<object, number>): string | undefined {
+  const existing = seen.get(input);
+  if (existing !== undefined) return `~ref:${existing}`;
+  seen.set(input, seen.size);
+  return undefined;
 }
 
 function applyWritePatchToDb(dbValue: Db, patch: WritePatch, constraints: readonly ConstraintData[] = []): WriteApplyResult {
@@ -4759,7 +5755,14 @@ function isErrorDiagnostic(input: TarstateDiagnostic): boolean {
 
 function stableKey(input: unknown): string {
   if (input === undefined) return '~undefined';
-  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') return JSON.stringify(input);
+  if (typeof input === 'number') {
+    if (Number.isNaN(input)) return '~number:NaN';
+    if (input === Infinity) return '~number:Infinity';
+    if (input === -Infinity) return '~number:-Infinity';
+    if (Object.is(input, -0)) return '~number:-0';
+    return JSON.stringify(input);
+  }
+  if (input === null || typeof input === 'string' || typeof input === 'boolean') return JSON.stringify(input);
   if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
   if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
   if (typeof input === 'function') return `~function:${input.name}`;
@@ -4832,7 +5835,7 @@ function rowIdentityForQueryData<Row = unknown>(
       const relationName = typeof data.relation === 'string' ? data.relation : undefined;
       const relationRef = relationName === undefined ? undefined : relations[relationName];
       if (relationRef === undefined) return undefined;
-      return rowIdentityFromPaths(relationKeyFields(relationRef as RelationRef).map((fieldName) => [fieldName]));
+      return rowIdentityFromPaths(relationKeyFields(relationRef as RelationRef).map((fieldName) => [fieldName]), { unique: true });
     }
     case 'where':
     case 'hash':
@@ -4864,13 +5867,13 @@ function rowIdentityForQueryData<Row = unknown>(
         const renamed = fields[first];
         return [typeof renamed === 'string' ? renamed : first, ...rest];
       });
-      return rowIdentityFromPaths(paths);
+      return rowIdentityFromPaths(paths, { unique: input.unique });
     }
     case 'qualify': {
       const input = rowIdentityForNestedQuery<Row>(data, relations);
       if (input === undefined) return undefined;
       const alias = typeof data.alias === 'string' ? data.alias : 'row';
-      return rowIdentityFromPaths(input.paths.map((path) => [alias, ...path]));
+      return rowIdentityFromPaths(input.paths.map((path) => [alias, ...path]), { unique: input.unique });
     }
     case 'project':
       return projectedRowIdentity<Row>(data, relations);
@@ -4903,7 +5906,7 @@ function projectedRowIdentity<Row>(
     paths.push([outputField]);
   }
 
-  return rowIdentityFromPaths<Row>(paths);
+  return rowIdentityFromPaths<Row>(paths, { unique: input.unique });
 }
 
 function directProjectionFieldFor(inputField: string, projection: ProjectionData): string | undefined {
@@ -4914,13 +5917,22 @@ function directProjectionFieldFor(inputField: string, projection: ProjectionData
   return undefined;
 }
 
-function rowIdentityFromPaths<Row = unknown>(paths: readonly MaterializationRowKeyPath[]): MaterializationRowIdentity<Row> | undefined {
+function rowIdentityFromPaths<Row = unknown>(
+  paths: readonly MaterializationRowKeyPath[],
+  options: { readonly unique?: boolean } = {}
+): MaterializationRowIdentity<Row> | undefined {
   if (paths.length === 0) return undefined;
   return {
     paths,
     fields: paths.every((path) => path.length === 1) ? paths.map((path) => path[0] as string) : undefined,
-    keyBy: (rowValue) => paths.map((path) => valueAtPath(rowValue, path))
+    keyBy: (rowValue) => paths.map((path) => valueAtPath(rowValue, path)),
+    keyOf: (rowValue) => rowIdentityKey(rowValue, paths),
+    unique: options.unique === true
   };
+}
+
+function rowIdentityKey(input: unknown, paths: readonly MaterializationRowKeyPath[]): string {
+  return stableKey(paths.map((path) => valueAtPath(input, path)));
 }
 
 function valueAtPath(input: unknown, path: readonly string[]): unknown {
