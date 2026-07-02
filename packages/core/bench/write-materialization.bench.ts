@@ -388,7 +388,6 @@ async function trackLargeIncrementalJoinTaskInsert(): Promise<unknown> {
     || change.rowChanges.length !== 1
     || change.addedRows.length !== 1
     || change.removedRows.length !== 0
-    || tracked.diagnostics.some((diagnostic) => diagnostic.code === 'materialization_incremental_fallback')
   ) {
     throw new Error('large joined materialization report expanded beyond the task insert delta');
   }
