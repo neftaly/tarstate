@@ -276,6 +276,25 @@ type MappedCollection = {
   readonly kind: StorageKind;
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
+type MappedRelationRows = {
+  readonly relation: RelationRef;
+  readonly rows: readonly Row[];
+  readonly equalityIndexes: Map<string, ReadonlyMap<string, readonly Row[]>>;
+  readonly rangeIndexes: Map<string, readonly IndexedRangeRow[]>;
+};
+type IndexedRangeRow = {
+  readonly row: Row;
+  readonly ordinal: number;
+  readonly value: unknown;
+};
+type AutomergeMapSourceSnapshot = {
+  readonly heads: Automerge.Heads;
+  readonly collections: readonly MappedRelationRows[];
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+type AutomergeMapSourceSnapshotCache = {
+  readonly current: () => AutomergeMapSourceSnapshot;
+};
 type AnyMapRelation = {
   readonly relation: RelationRef;
   readonly path: readonly string[];
@@ -801,14 +820,15 @@ function createAutomergeMapSource<DocumentShape extends object>(
   relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[]
 ): AutomergeMapSource {
   const relationNames = relationNamesFor(relations);
+  const snapshotCache = createMapSourceSnapshotCache(getDoc, relations);
 
   return {
     relationNames,
-    rows: (relationRef) => rowsForRelation(getDoc(), relations, relationRef),
-    lookup: (lookup) => lookupRowsForRelation(getDoc(), relations, lookup),
-    rangeLookup: (lookup) => rangeRowsForRelation(getDoc(), relations, lookup),
+    rows: (relationRef) => rowsForRelationSnapshot(snapshotCache.current(), relationRef),
+    lookup: (lookup) => lookupRowsForRelationSnapshot(snapshotCache.current(), lookup),
+    rangeLookup: (lookup) => rangeRowsForRelationSnapshot(snapshotCache.current(), lookup),
     version: () => Automerge.getHeads(getDoc()),
-    diagnostics: () => relations.flatMap((mapping) => mappedCollection(getDoc(), mapping).diagnostics)
+    diagnostics: () => snapshotCache.current().diagnostics
   };
 }
 
@@ -966,61 +986,250 @@ function rowsForRelation<DocumentShape extends object>(
       .map((row) => decodeRelationRow(mapping.relation, row)));
 }
 
-function lookupRowsForRelation<DocumentShape extends object>(
-  doc: Automerge.Doc<DocumentShape>,
-  relations: readonly AnyMapRelation[],
-  lookup: RelationLookup
-): readonly Row[] {
-  return relations
-    .filter((mapping) => mapping.relation.name === lookup.relation.name)
-    .flatMap((mapping) => mappedRowsMatching(
-      doc,
-      mapping,
-      (row) => fieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value)
-    ));
+function createMapSourceSnapshotCache<DocumentShape extends object>(
+  getDoc: () => Automerge.Doc<DocumentShape>,
+  relations: readonly AnyMapRelation[]
+): AutomergeMapSourceSnapshotCache {
+  let cached: AutomergeMapSourceSnapshot | undefined;
+
+  return {
+    current: () => {
+      const doc = getDoc();
+      const heads = Automerge.getHeads(doc);
+      if (cached !== undefined && headsEqual(cached.heads, heads)) return cached;
+
+      cached = mapSourceSnapshot(doc, heads, relations);
+      return cached;
+    }
+  };
 }
 
-function rangeRowsForRelation<DocumentShape extends object>(
+function mapSourceSnapshot<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
-  relations: readonly AnyMapRelation[],
-  lookup: RelationRangeLookup
-): readonly Row[] {
-  return relations
-    .filter((mapping) => mapping.relation.name === lookup.relation.name)
-    .flatMap((mapping) => mappedRowsMatching(
-      doc,
-      mapping,
-      (row) => fieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper)
-    ));
-}
+  heads: Automerge.Heads,
+  relations: readonly AnyMapRelation[]
+): AutomergeMapSourceSnapshot {
+  const byRelation = new Map<string, {
+    readonly relation: RelationRef;
+    readonly rows: Row[];
+    readonly equalityIndexes: Map<string, ReadonlyMap<string, readonly Row[]>>;
+    readonly rangeIndexes: Map<string, readonly IndexedRangeRow[]>;
+  }>();
+  const diagnostics: TarstateDiagnostic[] = [];
 
-function mappedRowsMatching<DocumentShape extends object>(
-  doc: Automerge.Doc<DocumentShape>,
-  mapping: AnyMapRelation,
-  predicate: (row: Record<string, unknown>) => boolean
-): readonly Row[] {
-  const lookup = getPathValue(doc, mapping.path);
-  if (lookup.status !== 'found') return [];
+  for (const mapping of relations) {
+    const collection = mappedCollection(doc, mapping);
+    diagnostics.push(...collection.diagnostics);
 
-  if (Array.isArray(lookup.value)) return rowsMatching(mapping.relation, lookup.value, predicate);
-  if (isRecord(lookup.value)) return rowsMatching(mapping.relation, Object.values(lookup.value), predicate);
-  return [];
-}
+    let relationRows = byRelation.get(mapping.relation.name);
+    if (relationRows === undefined) {
+      relationRows = {
+        relation: mapping.relation,
+        rows: [],
+        equalityIndexes: new Map(),
+        rangeIndexes: new Map()
+      };
+      byRelation.set(mapping.relation.name, relationRows);
+    }
 
-function rowsMatching(
-  relation: RelationRef,
-  values: readonly unknown[],
-  predicate: (row: Record<string, unknown>) => boolean
-): readonly Row[] {
-  const rows: Row[] = [];
-
-  for (const value of values) {
-    if (!isRecord(value)) continue;
-    const row = decodeRelationRow(relation, value);
-    if (predicate(row)) rows.push(row);
+    for (const row of collection.rows) relationRows.rows.push(decodeRelationRow(mapping.relation, row));
   }
 
-  return rows;
+  return {
+    heads,
+    collections: Array.from(byRelation.values()),
+    diagnostics
+  };
+}
+
+function rowsForRelationSnapshot(
+  snapshot: AutomergeMapSourceSnapshot,
+  relationRef: RelationRef
+): readonly Row[] {
+  return mappedRowsForRelation(snapshot, relationRef)?.rows ?? [];
+}
+
+function lookupRowsForRelationSnapshot(
+  snapshot: AutomergeMapSourceSnapshot,
+  lookup: RelationLookup
+): readonly Row[] {
+  const relationRows = mappedRowsForRelation(snapshot, lookup.relation);
+  if (relationRows === undefined) return [];
+
+  const spec = lookup.relation.fields[lookup.field];
+  const key = equalityIndexKey(spec, lookup.value, 'lookup');
+  if (key === undefined) {
+    return rowsMatchingSnapshot(relationRows.rows, (row) =>
+      fieldLookupMatches(spec, row[lookup.field], lookup.value));
+  }
+
+  return equalityIndexFor(relationRows, lookup.field, spec).get(key) ?? [];
+}
+
+function rangeRowsForRelationSnapshot(
+  snapshot: AutomergeMapSourceSnapshot,
+  lookup: RelationRangeLookup
+): readonly Row[] {
+  const relationRows = mappedRowsForRelation(snapshot, lookup.relation);
+  if (relationRows === undefined) return [];
+
+  const spec = lookup.relation.fields[lookup.field];
+  if (!canRangeIndex(spec)) {
+    return rowsMatchingSnapshot(relationRows.rows, (row) =>
+      fieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
+  }
+  if (lookup.lower === undefined && lookup.upper === undefined) return relationRows.rows;
+
+  const index = rangeIndexFor(relationRows, lookup.field, spec);
+  if (index === undefined) {
+    return rowsMatchingSnapshot(relationRows.rows, (row) =>
+      fieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
+  }
+  const lowerIndex = lookup.lower === undefined
+    ? 0
+    : lowerBoundRangeIndex(index, spec, lookup.lower.value, lookup.lower.inclusive);
+  const upperIndex = lookup.upper === undefined
+    ? index.length
+    : upperBoundRangeIndex(index, spec, lookup.upper.value, lookup.upper.inclusive);
+
+  return index
+    .slice(lowerIndex, upperIndex)
+    .filter((entry) => fieldValueInRange(spec, entry.row[lookup.field], lookup.lower, lookup.upper))
+    .sort((left, right) => left.ordinal - right.ordinal)
+    .map((entry) => entry.row);
+}
+
+function mappedRowsForRelation(
+  snapshot: AutomergeMapSourceSnapshot,
+  relationRef: RelationRef
+): MappedRelationRows | undefined {
+  return snapshot.collections.find((entry) => entry.relation.name === relationRef.name);
+}
+
+function rowsMatchingSnapshot(
+  rows: readonly Row[],
+  predicate: (row: Row) => boolean
+): readonly Row[] {
+  return rows.filter(predicate);
+}
+
+function equalityIndexFor(
+  relationRows: MappedRelationRows,
+  field: string,
+  spec: FieldSpec | undefined
+): ReadonlyMap<string, readonly Row[]> {
+  const existing = relationRows.equalityIndexes.get(field);
+  if (existing !== undefined) return existing;
+
+  const mutable = new Map<string, Row[]>();
+  for (const row of relationRows.rows) {
+    const key = equalityIndexKey(spec, row[field], 'row');
+    if (key === undefined) continue;
+
+    const bucket = mutable.get(key);
+    if (bucket === undefined) mutable.set(key, [row]);
+    else bucket.push(row);
+  }
+
+  relationRows.equalityIndexes.set(field, mutable);
+  return mutable;
+}
+
+function equalityIndexKey(
+  spec: FieldSpec | undefined,
+  value: unknown,
+  position: 'row' | 'lookup'
+): string | undefined {
+  const custom = customSpecForField(spec);
+  if (custom?.compare !== undefined) return undefined;
+  if (custom?.toScalar !== undefined) {
+    return objectIsIndexKey(position === 'row' ? fieldReadValue(spec, value) : value);
+  }
+  if (custom?.stableKey !== undefined) return `custom:${custom.stableKey(value)}`;
+  return objectIsIndexKey(value);
+}
+
+function objectIsIndexKey(value: unknown): string | undefined {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  switch (typeof value) {
+    case 'string':
+      return `string:${value}`;
+    case 'number':
+      if (Number.isNaN(value)) return 'number:NaN';
+      return Object.is(value, -0) ? 'number:-0' : `number:${value}`;
+    case 'boolean':
+      return `boolean:${value}`;
+    case 'bigint':
+      return `bigint:${value.toString()}`;
+    default:
+      return undefined;
+  }
+}
+
+function canRangeIndex(spec: FieldSpec | undefined): boolean {
+  const custom = customSpecForField(spec);
+  return custom === undefined || custom.compare !== undefined || custom.toScalar !== undefined;
+}
+
+function rangeIndexFor(
+  relationRows: MappedRelationRows,
+  field: string,
+  spec: FieldSpec | undefined
+): readonly IndexedRangeRow[] | undefined {
+  const existing = relationRows.rangeIndexes.get(field);
+  if (existing !== undefined) return existing;
+  if (relationRows.rows.some((row) => !hasStableRangeComparison(spec, row[field]))) return undefined;
+
+  const index = relationRows.rows
+    .map((row, ordinal): IndexedRangeRow => ({ row, ordinal, value: row[field] }))
+    .sort((left, right) => compareRangeRows(spec, left, right));
+  relationRows.rangeIndexes.set(field, index);
+  return index;
+}
+
+function compareRangeRows(spec: FieldSpec | undefined, left: IndexedRangeRow, right: IndexedRangeRow): number {
+  const compared = compareFieldValueToBound(spec, left.value, right.value) ?? 0;
+  return compared === 0 ? left.ordinal - right.ordinal : compared;
+}
+
+function hasStableRangeComparison(spec: FieldSpec | undefined, value: unknown): boolean {
+  const compared = compareFieldValueToBound(spec, value, value);
+  return compared !== undefined && Number.isFinite(compared);
+}
+
+function lowerBoundRangeIndex(
+  index: readonly IndexedRangeRow[],
+  spec: FieldSpec | undefined,
+  value: unknown,
+  inclusive: boolean
+): number {
+  let low = 0;
+  let high = index.length;
+  while (low < high) {
+    const mid = low + Math.floor((high - low) / 2);
+    const compared = compareFieldValueToBound(spec, index[mid]?.value, value) ?? 0;
+    if (compared < 0 || (compared === 0 && !inclusive)) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+function upperBoundRangeIndex(
+  index: readonly IndexedRangeRow[],
+  spec: FieldSpec | undefined,
+  value: unknown,
+  inclusive: boolean
+): number {
+  let low = 0;
+  let high = index.length;
+  while (low < high) {
+    const mid = low + Math.floor((high - low) / 2);
+    const compared = compareFieldValueToBound(spec, index[mid]?.value, value) ?? 0;
+    if (compared < 0 || (compared === 0 && inclusive)) low = mid + 1;
+    else high = mid;
+  }
+  return low;
 }
 
 function objectIdForRelation<DocumentShape extends object>(

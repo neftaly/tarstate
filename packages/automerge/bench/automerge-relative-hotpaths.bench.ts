@@ -213,7 +213,7 @@ function sourceLookupProbe(): () => void {
     }
 
     record(metric, performance.now() - startedAt, {
-      rowsVisited: ROW_COUNT * SAMPLE_OPS,
+      rowsVisited: rowsReturned,
       rowsReturned
     });
   };
@@ -247,6 +247,7 @@ function sourceRangeLookupProbe(): () => void {
 
   return () => {
     const startedAt = performance.now();
+    let rowsVisited = 0;
     let rowsReturned = 0;
 
     for (let index = 0; index < SAMPLE_OPS; index += 1) {
@@ -257,12 +258,13 @@ function sourceRangeLookupProbe(): () => void {
         field: 'effort',
         lower: { value: lower, inclusive: true }
       }) ?? [];
+      rowsVisited += binarySearchVisitCount(ROW_COUNT) + rows.length;
       rowsReturned += rows.length;
       consume(rows);
     }
 
     record(metric, performance.now() - startedAt, {
-      rowsVisited: ROW_COUNT * SAMPLE_OPS,
+      rowsVisited,
       rowsReturned
     });
   };
