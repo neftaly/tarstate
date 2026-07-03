@@ -1,4 +1,5 @@
 import * as Automerge from '@automerge/automerge';
+import { Repo, type DocHandle } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   call,
@@ -39,11 +40,28 @@ import {
 } from '@tarstate/core/schema';
 import { write } from '@tarstate/core/write';
 import {
+  automergeChangeAt,
+  automergeConflictDiagnostics,
+  automergeConflictsAt,
+  automergeBytesField,
+  automergeCounterField,
+  automergeDateField,
   automergeMapAdapter,
   automergeMapSource,
+  automergeDocHandleAdapter,
+  automergeFork,
+  automergeMerge,
+  automergeObjectId,
+  automergeObjectIdAt,
+  automergeTextField,
+  automergeView,
+  createAutomergeDocHandleRuntime,
   createAutomergeMapRuntime,
   defineAutomergeMapRelations,
   withAutomergeRuntimeRelations,
+  type AutomergeConflict,
+  type AutomergeDocHandleAdapter,
+  type AutomergeDocHandleRuntime,
   type AutomergeMapAdapter,
   type AutomergeMapAdapterOptions,
   type AutomergeMapPath,
@@ -77,6 +95,26 @@ interface WorkspaceDoc {
   };
 }
 
+type AutomergeScalarRow = {
+  readonly id: string;
+  readonly title: string;
+  readonly body: string;
+  readonly views: number;
+  readonly bytes: string;
+  readonly publishedAt: string;
+};
+
+type AutomergeScalarDoc = {
+  readonly notes: readonly {
+    readonly id: string;
+    readonly title: string;
+    readonly body: Automerge.ImmutableString;
+    readonly views: Automerge.Counter;
+    readonly bytes: Uint8Array;
+    readonly publishedAt: Date;
+  }[];
+};
+
 const schema = defineSchema({
   tasks: relation<TaskRow>({
     key: 'id',
@@ -100,13 +138,31 @@ const schema = defineSchema({
   })
 });
 
+const automergeScalarSchema = defineSchema({
+  notes: relation<AutomergeScalarRow>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      title: stringField(),
+      body: automergeTextField(),
+      views: automergeCounterField(),
+      bytes: automergeBytesField(),
+      publishedAt: automergeDateField()
+    }
+  })
+});
+
 const defineWorkspaceRelations = defineAutomergeMapRelations<WorkspaceDoc>();
+const defineAutomergeScalarRelations = defineAutomergeMapRelations<AutomergeScalarDoc>();
 const taskMapping = defineWorkspaceRelations([
   { relation: schema.tasks, path: ['workspace', 'tasks'] }
 ]);
 const allMappings = defineWorkspaceRelations([
   { relation: schema.tasks, path: ['workspace', 'tasks'] },
   { relation: schema.labels, path: ['workspace', 'labelsById'] }
+]);
+const automergeScalarMapping = defineAutomergeScalarRelations([
+  { relation: automergeScalarSchema.notes, path: ['notes'] }
 ]);
 
 describe('automerge map adapter', () => {
@@ -118,15 +174,31 @@ describe('automerge map adapter', () => {
 
     expect(api.automergeMapAdapter).toBe(automergeMapAdapter);
     expect(api.automergeMapSource).toBe(automergeMapSource);
+    expect(api.automergeDocHandleAdapter).toBe(automergeDocHandleAdapter);
+    expect(api.automergeView).toBe(automergeView);
+    expect(api.automergeFork).toBe(automergeFork);
+    expect(api.automergeChangeAt).toBe(automergeChangeAt);
+    expect(api.automergeMerge).toBe(automergeMerge);
+    expect(api.automergeObjectId).toBe(automergeObjectId);
+    expect(api.automergeObjectIdAt).toBe(automergeObjectIdAt);
+    expect(api.automergeConflictsAt).toBe(automergeConflictsAt);
+    expect(api.automergeConflictDiagnostics).toBe(automergeConflictDiagnostics);
+    expect(api.createAutomergeDocHandleRuntime).toBe(createAutomergeDocHandleRuntime);
     expect(api.createAutomergeMapRuntime).toBe(createAutomergeMapRuntime);
     expect(api.defineAutomergeMapRelations).toBe(defineAutomergeMapRelations);
     expect(api.withAutomergeRuntimeRelations).toBe(withAutomergeRuntimeRelations);
     expect('automergeDb' in api).toBe(false);
     expect('automergeDbRelationRuntime' in api).toBe(false);
+    expect('automergeSchema' in api).toBe(false);
+    expect('keyhive' in api).toBe(false);
+    expect('sedimentree' in api).toBe(false);
     expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
     expect(source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
     expect(adapter.snapshot().version).toEqual(Automerge.getHeads(doc));
     expectTypeOf(automergeMapAdapter<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapAdapter<WorkspaceDoc>>();
+    expectTypeOf(automergeDocHandleAdapter<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeDocHandleAdapter<WorkspaceDoc>>();
+    expectTypeOf(createAutomergeDocHandleRuntime<WorkspaceDoc>).returns
+      .toMatchTypeOf<AutomergeDocHandleRuntime<WorkspaceDoc>>();
     expectTypeOf(automergeMapSource<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapSource>();
   });
 
@@ -197,6 +269,59 @@ describe('automerge map adapter', () => {
       lower: { value: 'A', inclusive: true },
       upper: { value: 'M', inclusive: false }
     })).toEqual([{ id: 'task-1', title: 'Draft' }]);
+  });
+
+  it('projects stable Automerge scalar field views for queries', async () => {
+    const publishedAt = new Date('2026-07-03T00:00:00.000Z');
+    const adapter = automergeMapAdapter({ doc: Automerge.from<AutomergeScalarDoc>({
+      notes: [
+        {
+          id: 'note-1',
+          title: 'Initial',
+          body: new Automerge.ImmutableString('hello'),
+          views: new Automerge.Counter(3),
+          bytes: new Uint8Array([1, 2, 255]),
+          publishedAt
+        }
+      ]
+    }), relations: automergeScalarMapping });
+
+    expect(adapter.source.rows(automergeScalarSchema.notes)).toEqual([
+      {
+        id: 'note-1',
+        title: 'Initial',
+        body: 'hello',
+        views: 3,
+        bytes: '0102ff',
+        publishedAt: publishedAt.toISOString()
+      }
+    ]);
+    expect(adapter.source.lookup?.({
+      relation: automergeScalarSchema.notes,
+      field: 'body',
+      value: 'hello'
+    })).toEqual(adapter.source.rows(automergeScalarSchema.notes));
+    expect(adapter.source.rangeLookup?.({
+      relation: automergeScalarSchema.notes,
+      field: 'views',
+      lower: { value: 2, inclusive: true }
+    })).toEqual(adapter.source.rows(automergeScalarSchema.notes));
+
+    const bodyBefore = adapter.getDoc().notes[0]?.body;
+    const viewsBefore = adapter.getDoc().notes[0]?.views;
+    const bytesBefore = adapter.getDoc().notes[0]?.bytes;
+    const dateBefore = adapter.getDoc().notes[0]?.publishedAt;
+
+    const updateResult = await adapter.target.apply([
+      write(automergeScalarSchema.notes).updateByKey('note-1', { title: 'Edited' })
+    ]);
+
+    expect(updateResult).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(automergeScalarSchema.notes)[0]).toMatchObject({ title: 'Edited', body: 'hello' });
+    expect(adapter.getDoc().notes[0]?.body).toBe(bodyBefore);
+    expect(adapter.getDoc().notes[0]?.views).toBe(viewsBefore);
+    expect(adapter.getDoc().notes[0]?.bytes).toBe(bytesBefore);
+    expect(adapter.getDoc().notes[0]?.publishedAt).toBe(dateBefore);
   });
 
   it('pushes where evaluation through Automerge source lookup hooks', () => {
@@ -815,6 +940,118 @@ describe('automerge map adapter', () => {
     expect(result.diagnostics[0]?.code).toBe('runtime_unsupported');
   });
 
+  it('subscribes to DocHandle changes and writes through the handle', async () => {
+    const handle = workspaceHandle();
+    const adapter = createAutomergeDocHandleRuntime({ handle, relations: taskMapping });
+    let notifications = 0;
+    const unsubscribe = adapter.subscribe(() => {
+      notifications += 1;
+    });
+
+    handle.change((draft) => {
+      (draft.workspace.tasks as TaskRow[]).push({ id: 'task-2', title: 'Remote-ish' });
+    });
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).updateByKey('task-2', { title: 'Via handle runtime' })
+    ]);
+
+    expect(adapter.handle).toBe(handle);
+    expect(adapter.kind).toBe('automergeDocHandleRuntime');
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-1', title: 'Draft' },
+      { id: 'task-2', title: 'Via handle runtime' }
+    ]);
+    expect(handle.doc().workspace.tasks[1]?.title).toBe('Via handle runtime');
+    expect(adapter.snapshot().version).toEqual(Automerge.getHeads(handle.doc()));
+    expect(result).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(notifications).toBe(2);
+
+    unsubscribe();
+    adapter.close();
+  });
+
+  it('preserves mapped row object IDs for ordinary array and map updates', async () => {
+    const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: allMappings });
+    const taskObjectId = adapter.objectIdFor(schema.tasks, 'task-1');
+    const labelObjectId = adapter.objectIdFor(schema.labels, 'label-1');
+
+    const taskCollectionObjectId = automergeObjectIdAt(adapter.getDoc(), ['workspace', 'tasks']);
+    expect(taskObjectId).toBeTruthy();
+    expect(labelObjectId).toBeTruthy();
+    expect(taskCollectionObjectId).toBe(automergeObjectId(adapter.getDoc().workspace.tasks));
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).updateByKey('task-1', { title: 'Edited' }),
+      write(schema.labels).updateByKey('label-1', { name: 'Important' })
+    ]);
+
+    expect(result).toMatchObject({ status: 'accepted', applied: 2 });
+    expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Edited' }]);
+    expect(adapter.source.rows(schema.labels)).toEqual([{ id: 'label-1', name: 'Important' }]);
+    expect(adapter.objectIdFor(schema.tasks, 'task-1')).toBe(taskObjectId);
+    expect(adapter.objectIdFor(schema.labels, 'label-1')).toBe(labelObjectId);
+  });
+
+  it('wraps stable Automerge view, fork, changeAt, and merge flows', () => {
+    let doc = workspaceDoc();
+    const baseHeads = Automerge.getHeads(doc);
+
+    doc = Automerge.change(doc, (draft) => {
+      (draft.workspace.tasks as TaskRow[]).push({ id: 'task-live', title: 'Live branch' });
+    });
+
+    const fork = automergeFork(automergeView(doc, baseHeads));
+    const editedFork = Automerge.change(fork, (draft) => {
+      (draft.workspace.tasks as TaskRow[]).push({ id: 'task-fork', title: 'Fork branch' });
+    });
+    const merged = automergeMerge(doc, editedFork);
+    const changedAt = automergeChangeAt(merged, baseHeads, (draft) => {
+      (draft.workspace.tasks as TaskRow[]).push({ id: 'task-at', title: 'Backdated branch' });
+    }, 'backdated task');
+
+    expect(automergeView(merged, baseHeads).workspace.tasks).toEqual([{ id: 'task-1', title: 'Draft' }]);
+    expect(changedAt.newHeads).not.toBeNull();
+    expect(changedAt.newDoc.workspace.tasks.map((task) => task.id).sort()).toEqual([
+      'task-1',
+      'task-at',
+      'task-fork',
+      'task-live'
+    ]);
+  });
+
+  it('reports object ids and conflicts at explicit Automerge paths', () => {
+    const base = workspaceDoc();
+    const left = Automerge.change(automergeFork(base), (draft) => {
+      (draft.workspace.tasks[0] as { title: string }).title = 'Left title';
+    });
+    const right = Automerge.change(automergeFork(base), (draft) => {
+      (draft.workspace.tasks[0] as { title: string }).title = 'Right title';
+    });
+    const merged = automergeMerge(left, right);
+    const conflicts = automergeConflictsAt(merged, ['workspace', 'tasks', 0, 'title']);
+    const diagnostics = automergeConflictDiagnostics(merged, [['workspace', 'tasks', 0, 'title']], {
+      relation: schema.tasks.name,
+      field: 'title'
+    });
+
+    expect(automergeObjectIdAt(merged)).toBe('_root');
+    expect(automergeObjectIdAt(merged, ['workspace', 'tasks', 0])).toEqual(expect.any(String));
+    expect(conflicts.map((conflict) => conflict.value).sort((left, right) => String(left).localeCompare(String(right)))).toEqual([
+      'Left title',
+      'Right title'
+    ]);
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        code: 'automerge_conflict',
+        severity: 'warning',
+        relation: 'tasks',
+        field: 'title'
+      })
+    ]);
+    expectTypeOf<AutomergeConflict['opId']>().toEqualTypeOf<string>();
+  });
+
   it('normalizes Automerge runtime metadata to relations only', () => {
     const runtime = withAutomergeRuntimeRelations({
       source: {
@@ -918,6 +1155,18 @@ function workspaceDoc(tasks: readonly TaskRow[] = [{ id: 'task-1', title: 'Draft
   });
 
   return doc;
+}
+
+function workspaceHandle(tasks: readonly TaskRow[] = [{ id: 'task-1', title: 'Draft' }]): DocHandle<WorkspaceDoc> {
+  const repo = new Repo({ peerId: 'peer-workspace' as never });
+  return repo.create<WorkspaceDoc>({
+    workspace: {
+      tasks,
+      labelsById: {
+        'label-1': { id: 'label-1', name: 'Urgent' }
+      }
+    }
+  });
 }
 
 type DiagnosticSummary = {

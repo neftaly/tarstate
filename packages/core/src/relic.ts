@@ -876,7 +876,7 @@ function isPrimitive(input: unknown): input is string | number | boolean | null 
 }
 
 function isLikelyEdnText(input: unknown): boolean {
-  return typeof input === 'string' && /^[\s]*[\[{(]/.test(input);
+  return typeof input === 'string' && /^\s*[[{(]/.test(input);
 }
 
 function isExpr(input: unknown): input is ExprData {

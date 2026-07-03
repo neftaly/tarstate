@@ -11,18 +11,20 @@ export type {
 export {
   anchoredPathField,
   booleanField,
+  customField,
   defineSchema,
   idField,
   isJsonValue,
   jsonField,
   nullable,
   numberField,
+  opaqueField,
   optional,
   refField,
   relation,
   stringField
 } from './schema.js';
-export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
+export type { CustomFieldSpec, FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
 
 export {
   agg,

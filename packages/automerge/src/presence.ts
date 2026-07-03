@@ -76,6 +76,28 @@ export type AutomergePresenceWritableRuntime<State extends PresenceState = Prese
 
 type PresenceRow = Record<string, unknown>;
 type PresenceEventName = 'update' | 'snapshot' | 'heartbeat' | 'goodbye' | 'pruning';
+type PresenceAcceptedPatchOutcome = {
+  readonly accepted: true;
+  readonly applied: boolean;
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+type PresenceRejectedPatchOutcome = {
+  readonly accepted: false;
+  readonly applied: false;
+  readonly diagnostics: readonly TarstateDiagnostic[];
+};
+type PresencePatchOutcome = PresenceAcceptedPatchOutcome | PresenceRejectedPatchOutcome;
+type PresenceKey = {
+  readonly peerId: string;
+  readonly channel: string;
+};
+type PresenceWriteRow = PresenceKey & {
+  readonly value: unknown;
+};
+type PresenceWriteRowResult = PresenceRejectedPatchOutcome | {
+  readonly accepted: true;
+  readonly row: PresenceWriteRow;
+};
 
 const DEFAULT_FIELDS: AutomergePresenceFieldNames = {
   peerId: 'peerId',
@@ -314,11 +336,13 @@ function createPresenceTarget<State extends PresenceState>(options: {
 function applyPresencePatch<State extends PresenceState>(
   options: {
     readonly presence: Presence<State>;
+    readonly relation: RelationRef;
     readonly fields: AutomergePresenceFieldNames;
     readonly localPeerId: string;
+    readonly isClearedValue: AutomergePresenceClearedValue;
   },
   patch: WritePatch
-): { readonly accepted: boolean; readonly applied: boolean; readonly diagnostics: readonly TarstateDiagnostic[] } {
+): PresencePatchOutcome {
   switch (patch.op) {
     case 'insert':
     case 'insertIgnore':
@@ -327,22 +351,25 @@ function applyPresencePatch<State extends PresenceState>(
     case 'insertOrUpdate':
       return broadcastPresenceRow(options, patch.row);
     case 'updateByKey': {
-      const channel = channelFromKey(patch.key);
-      if (channel === undefined) return rejected(rowKeyDiagnostic(patch.relation.name, patch.key));
+      const key = presenceKeyFromPatchKey(options.relation, options.fields, patch.key);
+      if (key === undefined) return rejected(rowKeyDiagnostic(patch.relation.name, patch.key));
+      if (key.peerId !== options.localPeerId) return rejected(remoteWriteDiagnostic(key.peerId));
 
-      const current = options.presence.getLocalState()[channel];
+      const current = options.presence.getLocalState()[key.channel];
       const update = typeof patch.changes === 'function'
-        ? patch.changes(presenceRow(options.localPeerId, channel, current, options.fields))
+        ? patch.changes(presenceRow(options.localPeerId, key.channel, current, options.fields))
         : patch.changes;
 
       if (!isRecord(update) || !(options.fields.value in update)) return accepted(false);
-      options.presence.broadcast(channel, update[options.fields.value] as State[keyof State]);
+      options.presence.broadcast(key.channel, update[options.fields.value] as State[keyof State]);
       return accepted(true);
     }
     case 'deleteByKey': {
-      const channel = channelFromKey(patch.key);
-      if (channel === undefined) return rejected(rowKeyDiagnostic(patch.relation.name, patch.key));
-      options.presence.broadcast(channel, undefined as State[keyof State]);
+      const key = presenceKeyFromPatchKey(options.relation, options.fields, patch.key);
+      if (key === undefined) return rejected(rowKeyDiagnostic(patch.relation.name, patch.key));
+      if (key.peerId !== options.localPeerId) return rejected(remoteWriteDiagnostic(key.peerId));
+
+      options.presence.broadcast(key.channel, undefined as State[keyof State]);
       return accepted(true);
     }
     case 'deleteExact':
@@ -362,18 +389,12 @@ function broadcastPresenceRow<State extends PresenceState>(
     readonly localPeerId: string;
   },
   row: unknown
-): { readonly accepted: boolean; readonly applied: boolean; readonly diagnostics: readonly TarstateDiagnostic[] } {
-  if (!isRecord(row)) return rejected(rowInvalidDiagnostic(row));
+): PresencePatchOutcome {
+  const parsed = presenceWriteRow(options.fields, row);
+  if (!('row' in parsed)) return parsed;
+  if (parsed.row.peerId !== options.localPeerId) return rejected(remoteWriteDiagnostic(parsed.row.peerId));
 
-  const peerId = row[options.fields.peerId];
-  if (peerId !== options.localPeerId && row[options.fields.local] !== true) {
-    return rejected(remoteWriteDiagnostic(String(peerId)));
-  }
-
-  const channel = row[options.fields.channel];
-  if (typeof channel !== 'string') return rejected(rowKeyDiagnostic('presence', row));
-
-  options.presence.broadcast(channel, row[options.fields.value] as State[keyof State]);
+  options.presence.broadcast(parsed.row.channel, parsed.row.value as State[keyof State]);
   return accepted(true);
 }
 
@@ -384,9 +405,13 @@ function broadcastPresenceDeleteExact<State extends PresenceState>(
     readonly localPeerId: string;
   },
   partial: unknown
-): { readonly accepted: boolean; readonly applied: boolean; readonly diagnostics: readonly TarstateDiagnostic[] } {
+): PresencePatchOutcome {
   if (!isRecord(partial)) return rejected(rowInvalidDiagnostic(partial));
-  if (partial[options.fields.peerId] !== undefined && partial[options.fields.peerId] !== options.localPeerId) return accepted(false);
+
+  const peerId = partial[options.fields.peerId];
+  if (peerId !== undefined && peerId !== options.localPeerId) {
+    return typeof peerId === 'string' ? rejected(remoteWriteDiagnostic(peerId)) : accepted(false);
+  }
 
   const channel = partial[options.fields.channel];
   if (typeof channel !== 'string') return accepted(false);
@@ -400,20 +425,89 @@ function replacePresenceRows<State extends PresenceState>(
     readonly presence: Presence<State>;
     readonly fields: AutomergePresenceFieldNames;
     readonly localPeerId: string;
+    readonly isClearedValue: AutomergePresenceClearedValue;
   },
   rows: readonly unknown[]
-): { readonly accepted: boolean; readonly applied: boolean; readonly diagnostics: readonly TarstateDiagnostic[] } {
+): PresencePatchOutcome {
+  const nextState: Record<string, State[keyof State] | undefined> = {};
+  const seenChannels = new Set<string>();
+
   for (const row of rows) {
-    const outcome = broadcastPresenceRow(options, row);
-    if (!outcome.accepted) return outcome;
+    const parsed = presenceWriteRow(options.fields, row);
+    if (!('row' in parsed)) return parsed;
+    if (parsed.row.peerId !== options.localPeerId) return rejected(remoteWriteDiagnostic(parsed.row.peerId));
+    if (seenChannels.has(parsed.row.channel)) return rejected(duplicateChannelDiagnostic(parsed.row.channel));
+
+    seenChannels.add(parsed.row.channel);
+    if (!options.isClearedValue(parsed.row.value)) {
+      nextState[parsed.row.channel] = parsed.row.value as State[keyof State];
+    }
   }
 
-  return accepted(rows.length > 0);
+  const currentState = options.presence.getLocalState();
+  let changed = false;
+
+  for (const channel of Object.keys(currentState)) {
+    if (seenChannels.has(channel)) continue;
+    if (options.isClearedValue(currentState[channel])) continue;
+
+    options.presence.broadcast(channel, undefined as State[keyof State]);
+    changed = true;
+  }
+
+  for (const [channel, value] of Object.entries(nextState)) {
+    if (valuesEqual(currentState[channel], value)) continue;
+
+    options.presence.broadcast(channel, value as State[keyof State]);
+    changed = true;
+  }
+
+  return accepted(changed);
 }
 
-function channelFromKey(key: unknown): string | undefined {
-  if (Array.isArray(key) && typeof key[1] === 'string') return key[1];
-  return typeof key === 'string' ? key : undefined;
+function presenceWriteRow(
+  fields: AutomergePresenceFieldNames,
+  row: unknown
+): PresenceWriteRowResult {
+  if (!isRecord(row)) return rejected(rowInvalidDiagnostic(row));
+
+  const peerId = row[fields.peerId];
+  const channel = row[fields.channel];
+  if (typeof peerId !== 'string' || typeof channel !== 'string') {
+    return rejected(rowKeyDiagnostic('presence', row));
+  }
+
+  return {
+    accepted: true,
+    row: {
+      peerId,
+      channel,
+      value: row[fields.value]
+    }
+  };
+}
+
+function presenceKeyFromPatchKey(
+  relation: RelationRef,
+  fields: AutomergePresenceFieldNames,
+  key: unknown
+): PresenceKey | undefined {
+  if (!Array.isArray(key)) return undefined;
+
+  const keyFields = relationKeyFields(relation);
+  const peerIndex = keyFields.indexOf(fields.peerId);
+  const channelIndex = keyFields.indexOf(fields.channel);
+  if (peerIndex === -1 || channelIndex === -1) return undefined;
+
+  const peerId = key[peerIndex];
+  const channel = key[channelIndex];
+  return typeof peerId === 'string' && typeof channel === 'string'
+    ? { peerId, channel }
+    : undefined;
+}
+
+function relationKeyFields(relation: RelationRef): readonly string[] {
+  return typeof relation.key === 'string' ? [relation.key] : relation.key;
 }
 
 function presenceRow(
@@ -456,13 +550,13 @@ function presenceRowKey(row: PresenceRow, fields: AutomergePresenceFieldNames): 
   return JSON.stringify([row[fields.peerId], row[fields.channel]]);
 }
 
-function accepted(applied: boolean): { readonly accepted: true; readonly applied: boolean; readonly diagnostics: readonly [] } {
+function accepted(applied: boolean): PresenceAcceptedPatchOutcome {
   return { accepted: true, applied, diagnostics: [] };
 }
 
 function rejected(
   ...diagnostics: readonly TarstateDiagnostic[]
-): { readonly accepted: false; readonly applied: false; readonly diagnostics: readonly TarstateDiagnostic[] } {
+): PresenceRejectedPatchOutcome {
   return { accepted: false, applied: false, diagnostics };
 }
 
@@ -479,6 +573,16 @@ function isRecord(input: unknown): input is Record<string, unknown> {
 
 function valuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function duplicateChannelDiagnostic(channel: string): TarstateDiagnostic {
+  return {
+    code: 'unique',
+    severity: 'warning',
+    surface: 'automergePresenceRuntime',
+    message: `Presence runtime rejected duplicate local channel "${channel}"`,
+    detail: { channel }
+  };
 }
 
 function unsupportedRelationDiagnostic(relation: string): TarstateDiagnostic {

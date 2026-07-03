@@ -38,7 +38,7 @@ import {
   type TarstateDiagnosticOptions,
   type TarstateDiagnosticSeverity
 } from '@tarstate/core/diagnostics';
-import { type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
+import { validateRelationRow, type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
 import {
   demat,
   index as materializedIndex,
@@ -87,10 +87,13 @@ import type {
   TrackTransactResult
 } from '@tarstate/core/runtime';
 import {
+  customField,
   defineSchema,
   numberField,
+  opaqueField,
   relation,
-  stringField
+  stringField,
+  type CustomFieldSpec
 } from '@tarstate/core/schema';
 import {
   createStore,
@@ -305,6 +308,102 @@ describe('public API contracts', () => {
     void invalidHasById;
     void invalidCompositeRead;
     void invalidCompositeExists;
+  });
+
+  it('supports custom and opaque field specs without making them stringly', () => {
+    type RichText = {
+      readonly text: string;
+      readonly objectId: string;
+    };
+    const richTextSpec = {
+      kind: 'automergeText',
+      description: 'an Automerge text value',
+      validate: (value: unknown): value is RichText =>
+        typeof value === 'object'
+        && value !== null
+        && 'text' in value
+        && typeof value.text === 'string',
+      toScalar: (value: unknown) => typeof value === 'object' && value !== null && 'text' in value
+        ? String(value.text)
+        : null
+    } satisfies CustomFieldSpec<RichText>;
+    const customSchema = defineSchema({
+      notes: relation<{ readonly id: string; readonly body: RichText; readonly raw: unknown }>({
+        key: 'id',
+        fields: {
+          id: stringField(),
+          body: customField(richTextSpec),
+          raw: opaqueField('hostObject')
+        }
+      })
+    });
+
+    expect(validateRelationRow(customSchema.notes, {
+      id: 'note-1',
+      body: { text: 'hello', objectId: '1@actor' },
+      raw: { host: true }
+    })).toEqual([]);
+    expect(validateRelationRow(customSchema.notes, {
+      id: 'note-1',
+      body: 'plain string',
+      raw: { host: true }
+    } as never)).toEqual([
+      expect.objectContaining({
+        code: 'field_invalid',
+        field: 'body'
+      })
+    ]);
+
+    const db = createDb({
+      notes: [
+        { id: 'note-1', body: { text: 'hello', objectId: '1@actor' }, raw: { host: true } },
+        { id: 'note-2', body: { text: 'bye', objectId: '2@actor' }, raw: { host: true } }
+      ]
+    });
+    const rows = q(
+      db,
+      pipe(
+        from(customSchema.notes),
+        where(eq(field<string>('notes', 'body'), value('hello'))),
+        project({ id: field<string>('notes', 'id'), body: field<string>('notes', 'body') })
+      )
+    );
+
+    expect(rows).toEqual([{ id: 'note-1', body: 'hello' }]);
+
+    const unsafeKeySchema = defineSchema({
+      notes: relation<{ readonly id: RichText }>({
+        key: 'id',
+        fields: {
+          id: opaqueField<RichText>('automergeText')
+        }
+      })
+    });
+    const safeKeySchema = defineSchema({
+      notes: relation<{ readonly id: RichText }>({
+        key: 'id',
+        fields: {
+          id: customField<RichText>({
+            kind: 'automergeText',
+            stableKey: (value) => typeof value === 'object' && value !== null && 'objectId' in value
+              ? String(value.objectId)
+              : ''
+          })
+        }
+      })
+    });
+
+    expect(validateRelationRow(unsafeKeySchema.notes, {
+      id: { text: 'hello', objectId: '1@actor' }
+    })).toEqual([
+      expect.objectContaining({
+        code: 'field_invalid',
+        field: 'id'
+      })
+    ]);
+    expect(validateRelationRow(safeKeySchema.notes, {
+      id: { text: 'hello', objectId: '1@actor' }
+    })).toEqual([]);
   });
 
   it('installs and removes constraints through materialization inputs', () => {

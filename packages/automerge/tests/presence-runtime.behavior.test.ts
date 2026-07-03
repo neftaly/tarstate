@@ -193,6 +193,69 @@ describe('automerge presence runtime', () => {
     expect(runtime.source.rows(schema.presence)).toEqual([]);
     runtime.stop();
   });
+
+  it('uses peer and channel for keyed presence writes', async () => {
+    const runtime = automergePresenceRuntime({
+      handle: realDocHandle(),
+      relation: schema.presence,
+      fields,
+      localPeerId: 'peer-local',
+      includeLocalRows: true,
+      initialState: { color: 'blue', cursor: 'a1' } satisfies PresenceChannels
+    });
+    runtime.start();
+
+    const remoteDelete = await runtime.target.apply([
+      write(schema.presence).deleteByKey(['peer-remote', 'color'] as const)
+    ]);
+    const malformedDelete = await runtime.target.apply([
+      write(schema.presence).deleteByKey('color')
+    ]);
+    const localUpdate = await runtime.target.apply([
+      write(schema.presence).updateByKey(['peer-local', 'color'] as const, { payload: 'red' })
+    ]);
+
+    expect(remoteDelete.status).toBe('rejected');
+    expect(remoteDelete.diagnostics[0]?.code).toBe('runtime_unsupported');
+    expect(malformedDelete.status).toBe('rejected');
+    expect(malformedDelete.diagnostics[0]?.code).toBe('row_invalid');
+    expect(localUpdate).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(runtime.getLocalState()).toMatchObject({ color: 'red', cursor: 'a1' });
+    runtime.stop();
+  });
+
+  it('replaces local presence rows and clears omitted channels', async () => {
+    const runtime = automergePresenceRuntime({
+      handle: realDocHandle(),
+      relation: schema.presence,
+      fields,
+      localPeerId: 'peer-local',
+      includeLocalRows: true,
+      initialState: { color: 'blue', cursor: 'a1' } satisfies PresenceChannels
+    });
+    runtime.start();
+
+    const replaced = await runtime.target.apply([
+      write(schema.presence).replaceAll([
+        { peer: 'peer-local', topic: 'color', payload: 'green' }
+      ])
+    ]);
+    const rejected = await runtime.target.apply([
+      write(schema.presence).replaceAll([
+        { peer: 'peer-local', topic: 'color', payload: 'orange' },
+        { peer: 'peer-remote', topic: 'cursor', payload: 'b2' }
+      ])
+    ]);
+
+    expect(replaced).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(runtime.getLocalState()).toMatchObject({ color: 'green', cursor: undefined });
+    expect(runtime.source.rows(schema.presence)).toMatchObject([
+      { peer: 'peer-local', topic: 'color', payload: 'green', isLocal: true }
+    ]);
+    expect(rejected.status).toBe('rejected');
+    expect(runtime.getLocalState()).toMatchObject({ color: 'green', cursor: undefined });
+    runtime.stop();
+  });
 });
 
 function realDocHandle(): DocHandle<PresenceDoc> {

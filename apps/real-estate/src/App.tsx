@@ -1288,7 +1288,7 @@ function LiveChangesSection({
   const inquiryQueue = useView(inquiryQueueQuery);
   const previousDb = useRef<Db | undefined>(undefined);
   const [subscriptionEvents, setSubscriptionEvents] = useState<readonly string[]>([]);
-  const [watchDiff, setWatchDiff] = useState<unknown | undefined>(undefined);
+  const [watchDiff, setWatchDiff] = useState<unknown>(undefined);
   const watchOutput = useMemo(() => watchDiff ?? {
     queryKey: inquiryQueue.queryKey,
     changed: false,
@@ -1502,12 +1502,12 @@ function normalizeDisplayJson(value: unknown): unknown {
   return value;
 }
 
-function parseQueryKeyData(value: string): unknown | undefined {
+function parseQueryKeyData(value: string): unknown {
   if (!value.startsWith(queryKeyPrefix)) return undefined;
   return parseStringifiedJson(value.slice(queryKeyPrefix.length));
 }
 
-function parseStringifiedJson(value: string): unknown | undefined {
+function parseStringifiedJson(value: string): unknown {
   const trimmed = value.trim();
   if (!isJsonContainerString(trimmed)) return undefined;
 

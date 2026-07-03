@@ -64,7 +64,17 @@ export function collectDiagnostics(...diagnostics: readonly unknown[]): readonly
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-type PrimitiveFieldKind = 'string' | 'number' | 'boolean' | 'id' | 'ref' | 'anchoredPath' | 'json';
+type PrimitiveFieldKind = 'string' | 'number' | 'boolean' | 'id' | 'ref' | 'anchoredPath' | 'json' | 'custom';
+
+export type CustomFieldSpec<Value = unknown> = {
+  readonly kind: string;
+  readonly description?: string;
+  readonly validate?: (value: unknown) => boolean;
+  readonly stableKey?: (value: unknown) => string;
+  readonly compare?: (left: unknown, right: unknown) => number;
+  readonly toScalar?: (value: unknown) => string | number | boolean | null;
+  readonly valueType?: Value;
+};
 
 export type FieldSpec<Value = unknown> = {
   readonly kind: 'field';
@@ -73,6 +83,7 @@ export type FieldSpec<Value = unknown> = {
   readonly nullable: boolean;
   readonly idDomain?: string;
   readonly ref?: string;
+  readonly custom?: CustomFieldSpec<Value>;
   readonly __value?: Value;
 };
 
@@ -141,6 +152,12 @@ export const anchoredPathField = (): FieldSpec<string> => fieldSpec('anchoredPat
 export const jsonField = (): FieldSpec<JsonValue> => fieldSpec('json');
 export const idField = (domain: string): FieldSpec<string> => ({ ...fieldSpec<string>('id'), idDomain: domain });
 export const refField = (target: string): FieldSpec<string> => ({ ...fieldSpec<string>('ref'), ref: target });
+export const customField = <Value = unknown>(spec: CustomFieldSpec<Value> | string): FieldSpec<Value> => ({
+  ...fieldSpec<Value>('custom'),
+  custom: typeof spec === 'string' ? { kind: spec } : spec
+});
+export const opaqueField = <Value = unknown>(spec: CustomFieldSpec<Value> | string = 'opaque'): FieldSpec<Value> =>
+  customField<Value>(typeof spec === 'string' ? { kind: spec } : spec);
 export const nullable = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | null> => ({ ...spec, nullable: true });
 export const optional = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | undefined> => ({ ...spec, optional: true });
 
@@ -435,6 +452,7 @@ export function ifElse<Value>(
   thenValue: ExprInput<Value>,
   elseValue: ExprInput<Value>
 ): ExprData<Value> {
+  // oxlint-disable-next-line unicorn/no-thenable -- this is serialized query data, not a Promise-like object.
   return { op: 'ifElse', predicate, then: expr(thenValue), else: expr(elseValue) };
 }
 
@@ -674,7 +692,8 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
   }
 
   for (const keyField of relationKeyFields(relationRef)) {
-    if (rowValue[keyField] === undefined || rowValue[keyField] === null) {
+    const keyValue = rowValue[keyField];
+    if (keyValue === undefined || keyValue === null) {
       diagnostics.push({
         code: 'field_missing',
         severity: 'error',
@@ -682,6 +701,24 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
         relation: relationRef.name,
         field: keyField,
         surface: 'validateRelationRow'
+      });
+      continue;
+    }
+
+    const spec = relationRef.fields[keyField];
+    if (
+      spec?.valueKind === 'custom'
+      && spec.custom?.stableKey === undefined
+      && spec.custom?.toScalar === undefined
+    ) {
+      diagnostics.push({
+        code: 'field_invalid',
+        severity: 'error',
+        message: `relation "${relationRef.name}" key field "${keyField}" must define stableKey or toScalar`,
+        relation: relationRef.name,
+        field: keyField,
+        surface: 'validateRelationRow',
+        detail: keyValue
       });
     }
   }
@@ -695,7 +732,11 @@ export function rowKey(relationRef: RelationRef, row: Record<string, unknown>): 
 
   for (const fieldName of fields) {
     if (!Object.prototype.hasOwnProperty.call(row, fieldName) || row[fieldName] === undefined) return undefined;
-    values.push(row[fieldName]);
+    const fieldValue = row[fieldName];
+    const spec = relationRef.fields[fieldName];
+    const keyValue = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
+    if (keyValue === undefined) return undefined;
+    values.push(keyValue);
   }
 
   return stableKey(values);
@@ -818,20 +859,12 @@ export function fromObjectSource(data: Record<string, readonly unknown[]>): Rela
     relationNames: Object.keys(data),
     rows: (relationRef) => data[relationRef.name] ?? [],
     lookup: ({ relation: relationRef, field: fieldName, value: lookupValue }) =>
-      (data[relationRef.name] ?? []).filter((rowValue) => isRecord(rowValue) && Object.is(rowValue[fieldName], lookupValue)),
+      (data[relationRef.name] ?? []).filter((rowValue) => isRecord(rowValue)
+        && fieldLookupMatches(relationRef.fields[fieldName], rowValue[fieldName], lookupValue)),
     rangeLookup: ({ relation: relationRef, field: fieldName, lower, upper }) =>
       (data[relationRef.name] ?? []).filter((rowValue) => {
         if (!isRecord(rowValue)) return false;
-        const valueValue = rowValue[fieldName];
-        if (lower !== undefined) {
-          const comparisonValue = compareValues(valueValue, lower.value);
-          if (comparisonValue < 0 || (comparisonValue === 0 && !lower.inclusive)) return false;
-        }
-        if (upper !== undefined) {
-          const comparisonValue = compareValues(valueValue, upper.value);
-          if (comparisonValue > 0 || (comparisonValue === 0 && !upper.inclusive)) return false;
-        }
-        return true;
+        return fieldValueInRange(relationRef.fields[fieldName], rowValue[fieldName], lower, upper);
       })
   };
 }
@@ -842,21 +875,18 @@ export const composeSources = (...sources: readonly RelationSource[]): RelationS
   rows: (relationRef) => sources.flatMap((source) => source.rows(relationRef)),
   lookup: (lookupValue) => sources.flatMap((source) =>
     source.lookup?.(lookupValue) ?? source.rows(lookupValue.relation)
-      .filter((rowValue) => isRecord(rowValue) && Object.is(rowValue[lookupValue.field], lookupValue.value))),
+      .filter((rowValue) => isRecord(rowValue)
+        && fieldLookupMatches(lookupValue.relation.fields[lookupValue.field], rowValue[lookupValue.field], lookupValue.value))),
   rangeLookup: (lookupValue) => sources.flatMap((source) =>
     source.rangeLookup?.(lookupValue) ?? source.rows(lookupValue.relation)
       .filter((rowValue) => {
         if (!isRecord(rowValue)) return false;
-        const valueValue = rowValue[lookupValue.field];
-        if (lookupValue.lower !== undefined) {
-          const comparisonValue = compareValues(valueValue, lookupValue.lower.value);
-          if (comparisonValue < 0 || (comparisonValue === 0 && !lookupValue.lower.inclusive)) return false;
-        }
-        if (lookupValue.upper !== undefined) {
-          const comparisonValue = compareValues(valueValue, lookupValue.upper.value);
-          if (comparisonValue > 0 || (comparisonValue === 0 && !lookupValue.upper.inclusive)) return false;
-        }
-        return true;
+        return fieldValueInRange(
+          lookupValue.relation.fields[lookupValue.field],
+          rowValue[lookupValue.field],
+          lookupValue.lower,
+          lookupValue.upper
+        );
       }))
 });
 
@@ -5854,6 +5884,7 @@ function nextWatchId(label: string | undefined): string {
 type EvalEntry<Row = unknown> = {
   row: Row;
   aliases: Record<string, unknown>;
+  fieldSpecsByAlias?: Record<string, RelationFields>;
 };
 
 type WriteApplyResult = {
@@ -6031,7 +6062,8 @@ function evaluateFrom(
     return [];
   }
   const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
-  return readRelationRows(source, relationRef, diagnostics).map((rowValue) => entryForRow(rowValue, alias, relationRef.name));
+  return readRelationRows(source, relationRef, diagnostics)
+    .map((rowValue) => entryForRow(rowValue, alias, relationRef.name, relationRef.fields));
 }
 
 function evaluateLookup(
@@ -6049,8 +6081,10 @@ function evaluateLookup(
   }
   const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
   const lookupRows = source.lookup?.({ relation: relationRef, field: fieldName, value: data.value })
-    ?? source.rows(relationRef).filter((rowValue) => isRecord(rowValue) && Object.is(rowValue[fieldName], data.value));
-  return validateSourceRows(relationRef, lookupRows, diagnostics).map((rowValue) => entryForRow(rowValue, alias, relationRef.name));
+    ?? source.rows(relationRef).filter((rowValue) => isRecord(rowValue)
+      && fieldLookupMatches(relationRef.fields[fieldName], rowValue[fieldName], data.value));
+  return validateSourceRows(relationRef, lookupRows, diagnostics)
+    .map((rowValue) => entryForRow(rowValue, alias, relationRef.name, relationRef.fields));
 }
 
 function evaluateWhere(
@@ -6067,7 +6101,7 @@ function evaluateWhere(
     const pushedRows = readWherePushdownRows(source, candidate);
     if (pushedRows !== undefined) {
       input = validateSourceRows(candidate.relation, pushedRows, diagnostics)
-        .map((rowValue) => entryForRow(rowValue, candidate.alias, candidate.relation.name));
+        .map((rowValue) => entryForRow(rowValue, candidate.alias, candidate.relation.name, candidate.relation.fields));
       break;
     }
   }
@@ -6577,7 +6611,8 @@ function evaluateField(data: ExprData, entry: EvalEntry): unknown {
   const fieldName = typeof data.field === 'string' ? data.field : undefined;
   if (fieldName === undefined) return undefined;
   const target = alias === 'row' ? entry.row : entry.aliases[alias];
-  return isRecord(target) ? target[fieldName] : undefined;
+  if (!isRecord(target)) return undefined;
+  return fieldReadValue(entry.fieldSpecsByAlias?.[alias]?.[fieldName], target[fieldName]);
 }
 
 function evaluateCall(
@@ -6697,11 +6732,23 @@ function queryInvalidDiagnostic(message: string, detail?: unknown): TarstateDiag
   };
 }
 
-function entryForRow(rowValue: unknown, alias?: string, relationName?: string): EvalEntry {
+function entryForRow(
+  rowValue: unknown,
+  alias?: string,
+  relationName?: string,
+  fields?: RelationFields
+): EvalEntry {
   const aliases: Record<string, unknown> = { row: rowValue };
   if (alias !== undefined) aliases[alias] = rowValue;
   if (relationName !== undefined) aliases[relationName] = rowValue;
-  return { row: rowValue, aliases };
+  const fieldSpecsByAlias = fields === undefined
+    ? undefined
+    : Object.fromEntries(['row', alias, relationName]
+      .filter((name): name is string => name !== undefined)
+      .map((name) => [name, fields]));
+  return fieldSpecsByAlias === undefined
+    ? { row: rowValue, aliases }
+    : { row: rowValue, aliases, fieldSpecsByAlias };
 }
 
 function combineEntries(left: EvalEntry, right: EvalEntry, rightAlias?: string): EvalEntry {
@@ -6716,6 +6763,11 @@ function combineEntries(left: EvalEntry, right: EvalEntry, rightAlias?: string):
       ...right.aliases,
       ...(rightAlias === undefined ? {} : { [rightAlias]: right.row }),
       row: rowValue
+    },
+    fieldSpecsByAlias: {
+      ...left.fieldSpecsByAlias,
+      ...right.fieldSpecsByAlias,
+      ...(rightAlias === undefined || right.fieldSpecsByAlias?.row === undefined ? {} : { [rightAlias]: right.fieldSpecsByAlias.row })
     }
   };
 }
@@ -6906,7 +6958,18 @@ function compareValues(left: unknown, right: unknown): number {
   if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : 1;
   if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right);
   if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
+  if (left instanceof Date && right instanceof Date) return left.getTime() < right.getTime() ? -1 : 1;
+  if (left instanceof Uint8Array && right instanceof Uint8Array) return compareBytes(left, right);
   return stableKey(left).localeCompare(stableKey(right));
+}
+
+function compareBytes(left: Uint8Array, right: Uint8Array): number {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (left[index] ?? 0) - (right[index] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return left.length - right.length;
 }
 
 function sortedValues(values: readonly unknown[], direction: SortDirection): readonly unknown[] {
@@ -7163,6 +7226,8 @@ function envValueFingerprint(
     return JSON.stringify(input);
   }
   if (input === null || typeof input === 'string' || typeof input === 'boolean') return JSON.stringify(input);
+  if (input instanceof Date) return `~date:${Number.isNaN(input.valueOf()) ? 'Invalid' : input.toISOString()}`;
+  if (input instanceof Uint8Array) return `~bytes:${hexFromBytes(input)}`;
   if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
   if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
   if (typeof input === 'function') return `~function:${input.name}`;
@@ -7405,8 +7470,12 @@ function mergeUpdate(
 
 function predicateMatchesRow(predicate: PredicateData, rowValue: Record<string, unknown>, relationRef: RelationRef, dbValue: Db): boolean {
   const diagnostics: TarstateDiagnostic[] = [];
-  const entry = entryForRow(rowValue, relationRef.name, relationRef.name);
-  for (const alias of relationPredicateAliases(relationRef.name)) entry.aliases[alias] = rowValue;
+  const entry = entryForRow(rowValue, relationRef.name, relationRef.name, relationRef.fields);
+  for (const alias of relationPredicateAliases(relationRef.name)) {
+    entry.aliases[alias] = rowValue;
+    entry.fieldSpecsByAlias ??= {};
+    entry.fieldSpecsByAlias[alias] = relationRef.fields;
+  }
   return Boolean(evaluateExpr(predicate, entry, dbSource(dbValue), { [relationRef.name]: relationRef }, { env: dbValue.env }, diagnostics, undefined));
 }
 
@@ -8073,9 +8142,60 @@ function fieldValueMatchesSpec(spec: FieldSpec, valueValue: unknown): boolean {
       return typeof valueValue === 'boolean';
     case 'json':
       return isJsonValue(valueValue);
+    case 'custom':
+      return spec.custom?.validate === undefined || spec.custom.validate(valueValue);
     default:
       return true;
   }
+}
+
+function fieldReadValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
+  if (spec?.valueKind !== 'custom' || spec.custom?.toScalar === undefined || valueValue === null || valueValue === undefined) {
+    return valueValue;
+  }
+  return spec.custom.toScalar(valueValue);
+}
+
+function fieldKeyValue(spec: FieldSpec, valueValue: unknown): unknown {
+  if (spec.valueKind !== 'custom') return valueValue;
+  if (valueValue === null || valueValue === undefined) return valueValue;
+  if (spec.custom?.stableKey !== undefined) return spec.custom.stableKey(valueValue);
+  if (spec.custom?.toScalar !== undefined) return spec.custom.toScalar(valueValue);
+  return undefined;
+}
+
+function fieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
+  if (spec?.valueKind === 'custom' && spec.custom?.toScalar !== undefined) {
+    return Object.is(fieldReadValue(spec, fieldValue), lookupValue);
+  }
+  if (spec?.valueKind === 'custom' && spec.custom?.stableKey !== undefined) {
+    return spec.custom.stableKey(fieldValue) === spec.custom.stableKey(lookupValue);
+  }
+  return Object.is(fieldValue, lookupValue);
+}
+
+function fieldValueInRange(
+  spec: FieldSpec | undefined,
+  valueValue: unknown,
+  lower: RelationRangeBound | undefined,
+  upper: RelationRangeBound | undefined
+): boolean {
+  if (lower !== undefined) {
+    const comparisonValue = compareFieldValueToBound(spec, valueValue, lower.value);
+    if (comparisonValue === undefined || comparisonValue < 0 || (comparisonValue === 0 && !lower.inclusive)) return false;
+  }
+  if (upper !== undefined) {
+    const comparisonValue = compareFieldValueToBound(spec, valueValue, upper.value);
+    if (comparisonValue === undefined || comparisonValue > 0 || (comparisonValue === 0 && !upper.inclusive)) return false;
+  }
+  return true;
+}
+
+function compareFieldValueToBound(spec: FieldSpec | undefined, valueValue: unknown, boundValue: unknown): number | undefined {
+  if (spec?.valueKind !== 'custom') return compareValues(valueValue, boundValue);
+  if (spec.custom?.compare !== undefined) return spec.custom.compare(valueValue, boundValue);
+  if (spec.custom?.toScalar !== undefined) return compareValues(fieldReadValue(spec, valueValue), boundValue);
+  return undefined;
 }
 
 function fieldSpecDescription(spec: FieldSpec): string {
@@ -8086,6 +8206,8 @@ function fieldSpecDescription(spec: FieldSpec): string {
       return 'a string';
     case 'json':
       return 'a JSON value';
+    case 'custom':
+      return spec.custom?.description ?? `a ${spec.custom?.kind ?? 'custom'} value`;
     default:
       return `a ${spec.valueKind}`;
   }
@@ -8117,6 +8239,10 @@ function stableKey(input: unknown): string {
     return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${stableKey(input[key])}`).join(',')}}`;
   }
   return JSON.stringify(String(input as string | number | boolean | bigint | null | undefined));
+}
+
+function hexFromBytes(input: Uint8Array): string {
+  return Array.from(input, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function queryAliasData(query: Query<unknown>, name: string): Record<string, string> {
