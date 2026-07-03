@@ -3,6 +3,7 @@ import { createDb, q, qResult, transact } from '@tarstate/core/db';
 import { evaluate } from '@tarstate/core/evaluate';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
 import {
+  demat,
   maintainMaterializationSnapshots,
   mat,
   materializedRelationForQuery,
@@ -28,6 +29,7 @@ import {
   project,
   sort,
   sum,
+  uniqueIndex,
   value,
   where
 } from '@tarstate/core/query';
@@ -76,6 +78,38 @@ const entryTotalsByAccount = pipe(
 
 const entriesByAccount = pipe(entryRows, hash(field<string>('row', 'accountId')));
 const entriesByAmount = pipe(entryRows, btree(field<number>('row', 'amount')));
+const directEntriesByAccount = pipe(from(entry), hash(entry.accountId));
+const directEntriesById = pipe(from(entry), uniqueIndex(entry.id));
+
+const cashEntriesByBaseLookup = pipe(
+  from(entry),
+  where(eq(entry.accountId, value('cash'))),
+  sort(asc(entry.id)),
+  project({
+    id: entry.id,
+    amount: entry.amount
+  })
+);
+
+const entryByIdBaseLookup = pipe(
+  from(entry),
+  where(eq(entry.id, value('e2'))),
+  project({
+    id: entry.id,
+    accountId: entry.accountId,
+    amount: entry.amount
+  })
+);
+
+const filteredProjectedEntriesByAccount = pipe(
+  from(entry),
+  where(eq(entry.accountId, value('cash'))),
+  project({
+    id: entry.id,
+    accountId: entry.accountId
+  }),
+  hash(field<string>('row', 'accountId'))
+);
 
 describe('materialized source behavior', () => {
   it('serves materialized query rows from a stable cache until dependencies change', () => {
@@ -221,6 +255,74 @@ describe('materialized source behavior', () => {
     ))).toEqual([{ id: 'e2', amount: -120 }]);
   });
 
+  it('uses a direct materialized hash for base relation equality lookups', () => {
+    const instrumented = instrumentEntryArrayReads();
+    const db = mat(instrumented.db, directEntriesByAccount);
+    instrumented.reset();
+
+    expect(q(db, cashEntriesByBaseLookup)).toEqual([
+      { id: 'e1', amount: 120 },
+      { id: 'e4', amount: 0 }
+    ]);
+    expect(instrumented.reads.rows).toBe(0);
+  });
+
+  it('uses a direct materialized unique index for base relation equality lookups', () => {
+    const instrumented = instrumentEntryArrayReads();
+    const db = mat(instrumented.db, directEntriesById);
+    instrumented.reset();
+
+    expect(q(db, entryByIdBaseLookup)).toEqual([
+      { id: 'e2', accountId: 'sales', amount: -120 }
+    ]);
+    expect(instrumented.reads.rows).toBe(0);
+  });
+
+  it('does not use filtered or projected hash materializations for broader base relation lookups', () => {
+    const db = mat(makeDb(), filteredProjectedEntriesByAccount);
+    const fullCashEntries = pipe(
+      from(entry),
+      where(eq(entry.accountId, value('cash'))),
+      sort(asc(entry.id)),
+      project({
+        id: entry.id,
+        accountId: entry.accountId,
+        amount: entry.amount,
+        posted: entry.posted
+      })
+    );
+    const feesEntries = pipe(
+      from(entry),
+      where(eq(entry.accountId, value('fees'))),
+      project({
+        id: entry.id,
+        accountId: entry.accountId,
+        amount: entry.amount,
+        posted: entry.posted
+      })
+    );
+
+    expect(q(db, fullCashEntries)).toEqual([
+      { id: 'e1', accountId: 'cash', amount: 120, posted: true },
+      { id: 'e4', accountId: 'cash', amount: 0, posted: false }
+    ]);
+    expect(q(db, feesEntries)).toEqual([
+      { id: 'e3', accountId: 'fees', amount: -5, posted: true }
+    ]);
+  });
+
+  it('falls back to base rows after direct hash materialization is removed', () => {
+    const instrumented = instrumentEntryArrayReads();
+    const db = demat(mat(instrumented.db, directEntriesByAccount), directEntriesByAccount);
+    instrumented.reset();
+
+    expect(q(db, cashEntriesByBaseLookup)).toEqual([
+      { id: 'e1', amount: 120 },
+      { id: 'e4', amount: 0 }
+    ]);
+    expect(instrumented.reads.rows).toBeGreaterThan(0);
+  });
+
   it('uses materialized index lookups for q equality filters over materialized relations', () => {
     const db = mat(makeDb(), entriesByAccount);
     const relation = materializedRelationForQuery(db, entriesByAccount);
@@ -298,6 +400,67 @@ type SourceReadCounts = {
   rows: number;
   lookup: number;
 };
+
+function instrumentEntryArrayReads(): {
+  readonly db: ReturnType<typeof makeDb>;
+  readonly reads: { rows: number };
+  readonly reset: () => void;
+} {
+  const db = makeDb();
+  const instrumented = instrumentArrayReads(db.data.entries ?? []);
+  return {
+    db: {
+      ...db,
+      data: {
+        ...db.data,
+        entries: instrumented.rows
+      }
+    },
+    reads: instrumented.reads,
+    reset: instrumented.reset
+  };
+}
+
+function instrumentArrayReads<Row>(input: readonly Row[]): {
+  readonly rows: readonly Row[];
+  readonly reads: { rows: number };
+  readonly reset: () => void;
+} {
+  const reads = { rows: 0 };
+  const target = [...input];
+  const rows = new Proxy(target, {
+    get(targetRows, prop, receiver) {
+      if (prop === 'filter') {
+        return (callbackfn: (value: Row, index: number, array: Row[]) => unknown, thisArg?: unknown): Row[] => {
+          reads.rows += 1;
+          return targetRows.filter(callbackfn, thisArg);
+        };
+      }
+      if (prop === Symbol.iterator) {
+        return function* iterator(): IterableIterator<Row> {
+          reads.rows += 1;
+          yield* targetRows;
+        };
+      }
+      if (isArrayIndexProperty(prop)) reads.rows += 1;
+      return Reflect.get(targetRows, prop, receiver);
+    }
+  });
+
+  return {
+    rows,
+    reads,
+    reset: () => {
+      reads.rows = 0;
+    }
+  };
+}
+
+function isArrayIndexProperty(prop: string | symbol): boolean {
+  if (typeof prop !== 'string' || prop.length === 0) return false;
+  const index = Number(prop);
+  return Number.isInteger(index) && index >= 0 && String(index) === prop;
+}
 
 function instrumentSourceLookups(source: RelationSource): {
   readonly source: RelationSource;

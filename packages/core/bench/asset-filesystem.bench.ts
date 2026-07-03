@@ -64,7 +64,7 @@ type RequestOp = {
   readonly kind: RequestKind;
   readonly index: number;
 };
-type ProbeMode = 'array-query' | 'materialized-index' | 'oracle' | 'inline-svg' | 'write-edge';
+type ProbeMode = 'array-query' | 'automatic-q-index' | 'materialized-index' | 'oracle' | 'inline-svg' | 'write-edge';
 type ProbeMetric = {
   readonly probe: string;
   readonly mode: ProbeMode;
@@ -179,6 +179,10 @@ const manifestsByPackageIndex = pipe(
   where(eq(field<AssetKind>('row', 'kind'), value('manifest'))),
   hash(field<string>('row', 'packageId'))
 );
+const directFilesByPathIndex = pipe(from(file), uniqueIndex(file.path));
+const directFilesByDirectoryIndex = pipe(from(file), hash(file.directory));
+const directFilesByPackageIndex = pipe(from(file), hash(file.packageId));
+const directDependenciesByFromPathIndex = pipe(from(dependency), hash(dependency.fromPath));
 const fixture = makeFixture();
 const refDb = createDb({
   assetFiles: fixture.files.map((row) => withoutInlineText(row)),
@@ -189,6 +193,7 @@ const inlineDb = createDb({
   assetDependencies: fixture.dependencies
 });
 const indexedDb = mat(refDb, filesByPathIndex, filesByDirectoryIndex, dependenciesByFromPathIndex, manifestsByPackageIndex);
+const directIndexedDb = mat(refDb, directFilesByPathIndex, directFilesByDirectoryIndex, directFilesByPackageIndex, directDependenciesByFromPathIndex);
 const assetIndexes = makeAssetIndexes(indexedDb);
 const oracle = makeOracle(fixture);
 const queries = makeQueries(fixture);
@@ -200,6 +205,7 @@ assertRequestPathParity();
 
 describe('asset filesystem hot paths for Probability/Royal-shaped packages', () => {
   bench('tarstate array query request mix', tarstateRequestProbe(refDb, queries, 'tarstate array query request mix', 'array-query'), BENCH_OPTIONS);
+  bench('tarstate automatic q lookup request mix', tarstateRequestProbe(directIndexedDb, queries, 'tarstate automatic q lookup request mix', 'automatic-q-index'), BENCH_OPTIONS);
   bench('tarstate declared materialized index handle request mix', materializedRequestProbe('tarstate declared materialized index handle request mix'), BENCH_OPTIONS);
   bench('prebuilt map request oracle', oracleRequestProbe('prebuilt map request oracle'), BENCH_OPTIONS);
   bench('inline SVG projection stress edge', tarstateSvgInlineProbe(), BENCH_OPTIONS);
@@ -230,6 +236,7 @@ afterAll(() => {
   console.info([
     'Asset filesystem guidance:',
     '- The array-query probe is an unindexed row-backed baseline for query-engine overhead on a Probability/Royal-shaped asset graph.',
+    '- The automatic-q-index probe uses normal q(where(eq(...))) reads against direct base-relation materialized indexes on assetFiles.path/directory/packageId and assetDependencies.fromPath.',
     '- The materialized-index probe uses tarstate mat(...) plus index(...) handles over declared unique/hash queries; it is not claiming automatic q(where(...)) lookup pushdown.',
     '- The oracle is a handbuilt map lower bound for the same request rows, with parity checked at startup.',
     '- The inline SVG stress edge prices projecting body-sized strings through query results; the low-GC path should keep content in contentRef/R2/cache storage.',
@@ -672,6 +679,7 @@ function assertRequestPathParity(): void {
   for (const [index, op] of requestMix.entries()) {
     const expected = pathsFor(oracleRows(op));
     assertSamePaths(expected, pathsFor(q(refDb, queryFor(queries, op))), 'array-query/oracle', index);
+    assertSamePaths(expected, pathsFor(q(directIndexedDb, queryFor(queries, op))), 'automatic-q-index/oracle', index);
     assertSamePaths(expected, pathsFor(materializedRows(op)), 'materialized-index/oracle', index);
   }
 }

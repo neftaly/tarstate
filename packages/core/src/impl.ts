@@ -1732,23 +1732,31 @@ export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _opti
 export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
 export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): QueryResult<any> {
   const queryObject = queryForTarget(queryValue);
+  const contextOverrides = hasEvaluateContextOverrides(options);
   const materializedRows = isQuery(queryValue) ? materializedRowsForQuery(dbValue, queryObject) : undefined;
-  if (materializedRows !== undefined && !hasEvaluateContextOverrides(options)) {
+  if (materializedRows !== undefined && !contextOverrides) {
     return {
       rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(materializedRows, options) : materializedRows,
       diagnostics: []
     };
   }
-  const result = evaluate(querySourceFor(dbValue), queryObject, { ...options, env: options.env ?? dbValue.env });
+  const result = evaluate(querySourceFor(dbValue, { materializedBaseRelationLookup: !contextOverrides }), queryObject, { ...options, env: options.env ?? dbValue.env });
   const sortedRows = applyDbQueryOptions(result.rows, options);
   return { rows: sortedRows, diagnostics: result.diagnostics };
 }
 
-function querySourceFor(dbValue: Db): RelationSource {
+type QuerySourceOptions = {
+  readonly materializedBaseRelationLookup?: boolean;
+};
+
+function querySourceFor(dbValue: Db, options: QuerySourceOptions = {}): RelationSource {
   const materializedSource = materializedSourceFor(dbValue);
-  return materializedSource === undefined
+  const source = materializedSource === undefined
     ? dbSource(dbValue)
     : composeSources(dbSource(dbValue), materializedSource);
+  return options.materializedBaseRelationLookup === true
+    ? materializedBaseRelationLookupSource(dbValue, source)
+    : source;
 }
 export function qMany<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchRows<Queries> {
   const results: Record<string, unknown> = {};
@@ -2480,6 +2488,15 @@ export const materializedSourceFor = (input: unknown): RelationSource | undefine
     rangeLookup: (lookupValue) => materializedIndexRangeLookup(state, lookupValue) ?? fallback.rangeLookup?.(lookupValue)
   };
 };
+
+function materializedBaseRelationLookupSource(input: unknown, source: RelationSource): RelationSource {
+  const state = materializedStateFor(input);
+  if (state.metadata.length === 0) return source;
+  return {
+    ...source,
+    lookup: (lookupValue) => materializedBaseRelationIndexLookup(state, lookupValue) ?? source.lookup?.(lookupValue)
+  };
+}
 
 function materializedIndexBase<Row>(
   metadata: MaterializationMetadata<Row>,
@@ -4011,6 +4028,47 @@ function materializedIndexLookup(
   const index = indexes?.find((item) =>
     (item.op === 'hash' || item.op === 'uniqueIndex') && item.field === lookupValue.field);
   if (index === undefined) return undefined;
+  return materializedInternalIndexLookupRows(index, lookupValue);
+}
+
+function materializedBaseRelationIndexLookup(
+  state: InternalMaterializationState,
+  lookupValue: RelationLookup
+): readonly unknown[] | undefined {
+  const fieldSpec = lookupValue.relation.fields[lookupValue.field];
+  if (fieldSpec?.valueKind === 'custom') return undefined;
+  for (const metadata of state.metadata) {
+    if (!state.rows.has(metadata.id)) continue;
+    const indexSpec = materializedDirectBaseRelationLookupIndexSpec(metadata.query, lookupValue);
+    if (indexSpec === undefined) continue;
+    const index = state.aux.get(metadata.id)?.indexes?.find((item) =>
+      item.op === indexSpec.op && item.field === indexSpec.field);
+    if (index !== undefined) return materializedInternalIndexLookupRows(index, lookupValue);
+  }
+  return undefined;
+}
+
+function materializedDirectBaseRelationLookupIndexSpec(
+  query: Query,
+  lookupValue: RelationLookup
+): InternalMaterializationIndexSpec | undefined {
+  if (query.data.op !== 'hash' && query.data.op !== 'uniqueIndex') return undefined;
+  const input = queryDataFrom(query.data.input);
+  if (input?.op !== 'from') return undefined;
+  const relationName = typeof input.relation === 'string' ? input.relation : undefined;
+  if (relationName !== lookupValue.relation.name) return undefined;
+  const relationRef = query.relations[relationName];
+  if (!isRelationRef(relationRef) || relationRef.name !== lookupValue.relation.name) return undefined;
+  const spec = materializationIndexSpecFromData(query.data, finalRowFieldExpressions(query.data, query.relations));
+  const indexSpec = spec === undefined ? undefined : internalMaterializationIndexSpec(spec);
+  if (indexSpec === undefined || indexSpec.field !== lookupValue.field) return undefined;
+  return indexSpec.op === 'hash' || indexSpec.op === 'uniqueIndex' ? indexSpec : undefined;
+}
+
+function materializedInternalIndexLookupRows(
+  index: InternalMaterializationIndex,
+  lookupValue: RelationLookup
+): readonly unknown[] {
   const bucket = index.buckets.get(stableKey(lookupValue.value));
   if (bucket === undefined) return [];
   if (Object.is(bucket.value, lookupValue.value)) return bucket.entries.map((entry) => entry.row);
