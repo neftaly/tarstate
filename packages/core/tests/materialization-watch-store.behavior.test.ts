@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { createDb, q, tryTransact } from '@tarstate/core/db';
-import { diffRows } from '@tarstate/core/diff';
 import { demat, explainMaterialization, mat } from '@tarstate/core/materialization';
 import {
   aggregate,
@@ -9,17 +8,13 @@ import {
   desc,
   eq,
   expand,
-  extend,
   field,
   from,
-  gte,
   join,
   keyBy,
   limit,
   pipe,
   project,
-  qualify,
-  rename,
   sel,
   sort,
   sortLimit,
@@ -30,18 +25,8 @@ import {
   without,
   type Query
 } from '@tarstate/core/query';
-import { deleteByKey, insert, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
-import { account, entry, makeDb, schema, type Entry } from './behavior-fixtures.js';
-
-const entryList = pipe(
-  from(entry),
-  sort(asc(entry.id)),
-  project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount
-  })
-);
+import { deleteByKey, insert, updateByKey } from '@tarstate/core/write';
+import { account, entry, makeDb, schema } from './behavior-fixtures.js';
 
 const sortedCashEntryProjection = pipe(
   from(entry),
@@ -86,216 +71,7 @@ const firstTwoEntries = pipe(
   limit(2)
 );
 
-const entriesByAccountId = pipe(
-  from(entry),
-  keyBy('accountId')
-);
-
-type IncrementalQueryVariant = {
-  readonly label: string;
-  readonly query: Query<unknown>;
-  readonly keyBy: (row: unknown) => unknown;
-};
-
-function pathKey(...path: readonly string[]): (row: unknown) => unknown {
-  return (row) => {
-    let current = row;
-    for (const segment of path) {
-      if (!isRecord(current)) return undefined;
-      current = current[segment];
-    }
-    return [current];
-  };
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null;
-}
-
-const supportedIncrementalVariants: readonly IncrementalQueryVariant[] = [
-  {
-    label: 'source relation',
-    query: from(entry) as Query<unknown>,
-    keyBy: pathKey('id')
-  },
-  {
-    label: 'final sort',
-    query: pipe(from(entry), sort(asc(entry.amount), asc(entry.id))) as Query<unknown>,
-    keyBy: pathKey('id')
-  },
-  {
-    label: 'filtered projection',
-    query: pipe(
-      from(entry),
-      where(gte(entry.amount, value(-75))),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
-    ) as Query<unknown>,
-    keyBy: pathKey('id')
-  },
-  {
-    label: 'renamed projection key',
-    query: pipe(
-      from(entry),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
-      rename({ id: 'entryId' })
-    ) as Query<unknown>,
-    keyBy: pathKey('entryId')
-  },
-  {
-    label: 'filtered sort-before-project preserving sort keys',
-    query: sortedCashEntryProjection as Query<unknown>,
-    keyBy: pathKey('id')
-  },
-  {
-    label: 'qualified rows',
-    query: pipe(
-      from(entry),
-      where(eq(entry.posted, value(true))),
-      qualify('entry')
-    ) as Query<unknown>,
-    keyBy: pathKey('entry', 'id')
-  },
-  {
-    label: 'extended rows without non-key fields',
-    query: pipe(
-      from(entry),
-      extend({ kind: value('ledger-entry') }),
-      without('memo')
-    ) as Query<unknown>,
-    keyBy: pathKey('id')
-  },
-  {
-    label: 'explicit keyBy identity',
-    query: pipe(from(entry), keyBy('id')) as Query<unknown>,
-    keyBy: pathKey('id')
-  }
-];
-
 describe('materialization, watch, and store behavior', () => {
-  it('maintains materialized queries equivalent to dematerialized evaluation across seeded transaction sequences', () => {
-    const queries: readonly Query<unknown>[] = [
-      cashEntryProjection as Query<unknown>,
-      entryList as Query<unknown>,
-      entriesByAccountId as Query<unknown>,
-      entryCount as Query<unknown>,
-      firstTwoEntries as Query<unknown>
-    ];
-    let incrementalUpdates = 0;
-    let fallbackRecomputes = 0;
-
-    for (const seed of [3, 11, 29, 47, 83]) {
-      for (const query of queries) {
-        const base = makeDb();
-        let db = mat(createDb({ accounts: base.data.accounts ?? [], entries: randomEntries(seed, 7) }), query);
-        for (const patch of randomEntryPatches(seed * 97 + query.data.op.length, 24)) {
-          const result = tryTransact(db, patch);
-          expect(result.committed).toBe(true);
-          db = result.db;
-
-          const materializedRows = q(db, query);
-          const dematerializedRows = q(demat(db, query), query);
-          expect(materializedRows).toEqual(dematerializedRows);
-
-          const change = result.materializations?.changes[0];
-          if (change?.update === 'incremental') incrementalUpdates += 1;
-          if (change?.update === 'recomputed') {
-            expect(change.diagnostics).toEqual(expect.arrayContaining([
-              expect.objectContaining({ code: 'materialization_unsupported' })
-            ]));
-            fallbackRecomputes += 1;
-          }
-        }
-      }
-    }
-
-    expect(incrementalUpdates).toBeGreaterThan(0);
-    expect(fallbackRecomputes).toBeGreaterThan(0);
-    expect(explainMaterialization(cashEntryProjection)).toEqual(expect.objectContaining({
-      supported: true,
-      update: 'incremental',
-      recomputed: false,
-      diagnostics: []
-    }));
-    expect(explainMaterialization(entriesByAccountId)).toEqual(expect.objectContaining({
-      supported: true,
-      update: 'incremental',
-      recomputed: false,
-      diagnostics: []
-    }));
-    expect(explainMaterialization(entryCount)).toEqual(expect.objectContaining({
-      supported: false,
-      update: 'recomputed',
-      recomputed: true,
-      diagnostics: expect.arrayContaining([
-        expect.objectContaining({ code: 'materialization_unsupported' })
-      ])
-    }));
-  });
-
-  it('fuzzes single-source materializations against dematerialized recompute and row diffs', () => {
-    let incrementalChanges = 0;
-    let carriedChanges = 0;
-    let safetyRecomputes = 0;
-
-    for (const seed of [5, 17, 43, 91, 137]) {
-      for (const variant of supportedIncrementalVariants) {
-        const base = makeDb();
-        let db = mat(createDb({ accounts: base.data.accounts ?? [], entries: randomEntries(seed, 12) }), variant.query);
-
-        for (const patch of randomEntryPatches(seed * 211 + variant.label.length, 36)) {
-          const beforeRows = q(db, variant.query);
-          const result = tryTransact(db, patch);
-          expect(result.committed).toBe(true);
-          db = result.db;
-
-          const materializedRows = q(db, variant.query);
-          const dematerializedRows = q(demat(db, variant.query), variant.query);
-          const change = result.materializations?.changes[0];
-
-          expect(change, `${variant.label} should report maintenance for ${patch.op}`).toBeDefined();
-          if (change === undefined) continue;
-
-          expect(materializedRows).toBe(change.rows);
-          expect(materializedRows).toEqual(dematerializedRows);
-          expect(change.rows).toEqual(dematerializedRows);
-          expect(change.previousRows).toEqual(beforeRows);
-
-          if (change.update === 'incremental') {
-            const diff = diffRows(beforeRows, dematerializedRows, { keyBy: variant.keyBy });
-
-            incrementalChanges += 1;
-            expect(change.recomputed, variant.label).toBe(false);
-            expect(change.reason).toBe('incremental delta maintenance');
-            expect(change.diagnostics, variant.label).toEqual([]);
-            expect(change.rowChanges).toEqual(diff.changes);
-            expect(change.added).toEqual(diff.changes.flatMap((item) => item.kind === 'added' ? [item.row] : []));
-            expect(change.removed).toEqual(diff.changes.flatMap((item) => item.kind === 'removed' ? [item.row] : []));
-            expect(diff.diagnostics).toEqual([]);
-          } else if (change.update === 'carried') {
-            carriedChanges += 1;
-            expect(change.recomputed, variant.label).toBe(false);
-            expect(change.diagnostics, variant.label).toEqual([]);
-            expect(change.reason).toBe('dependencies unchanged');
-            expect(change.added).toEqual([]);
-            expect(change.removed).toEqual([]);
-            expect(change.rowChanges).toEqual([]);
-          } else {
-            safetyRecomputes += 1;
-            expect(change.update).toBe('recomputed');
-            expect(change.recomputed, `${variant.label} ${patch.op} ${change.reason}`).toBe(true);
-            expect(change.diagnostics).toEqual(expect.arrayContaining([
-              expect.objectContaining({ code: 'materialization_unsupported' })
-            ]));
-          }
-        }
-      }
-    }
-
-    expect(incrementalChanges).toBeGreaterThan(0);
-    expect(carriedChanges).toBeGreaterThan(0);
-    expect(safetyRecomputes).toBeGreaterThan(0);
-  });
-
   it('reports an incremental change with no recompute fallback for a focused delta', () => {
     const query = pipe(
       from(entry),
@@ -930,43 +706,3 @@ describe('materialization, watch, and store behavior', () => {
   });
 
 });
-
-function randomEntries(seed: number, countValue: number): Entry[] {
-  const next = random(seed);
-  const accountIds = ['cash', 'sales', 'fees', 'equity'];
-  return Array.from({ length: countValue }, (_, indexValue) => ({
-    id: `r${seed}-${indexValue}`,
-    accountId: accountIds[Math.floor(next() * accountIds.length)] ?? 'cash',
-    amount: Math.floor(next() * 401) - 200,
-    memo: next() > 0.66 ? null : `memo-${Math.floor(next() * 20)}`,
-    posted: next() > 0.35
-  }));
-}
-
-function randomEntryPatches(seed: number, countValue: number): WritePatch[] {
-  const next = random(seed);
-  const accountIds = ['cash', 'sales', 'fees', 'equity'];
-  const patches: WritePatch[] = [];
-  for (let indexValue = 0; indexValue < countValue; indexValue += 1) {
-    const rowValue: Entry = {
-      id: `r${seed}-${Math.floor(next() * 10)}`,
-      accountId: accountIds[Math.floor(next() * accountIds.length)] ?? 'cash',
-      amount: Math.floor(next() * 501) - 250,
-      memo: next() > 0.5 ? null : `patch-${indexValue}`,
-      posted: next() > 0.25
-    };
-    const op = Math.floor(next() * 3);
-    if (op === 0) patches.push(insertOrReplace(schema.entries, rowValue));
-    else if (op === 1) patches.push(updateByKey(schema.entries, rowValue.id, { amount: rowValue.amount, accountId: rowValue.accountId, posted: rowValue.posted }));
-    else patches.push(deleteByKey(schema.entries, rowValue.id));
-  }
-  return patches;
-}
-
-function random(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state * 1664525 + 1013904223) >>> 0;
-    return state / 0x100000000;
-  };
-}

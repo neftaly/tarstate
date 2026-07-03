@@ -49,6 +49,41 @@ type UnsupportedVariant = {
   readonly query: Query<unknown>;
 };
 
+const cashEntryProjection = pipe(
+  from(entry),
+  where(eq(entry.accountId, value('cash'))),
+  project({
+    id: entry.id,
+    amount: entry.amount
+  })
+);
+
+const sortedEntryProjection = pipe(
+  from(entry),
+  sort(asc(entry.id)),
+  project({
+    id: entry.id,
+    accountId: entry.accountId,
+    amount: entry.amount
+  })
+);
+
+const entryCount = pipe(
+  from(entry),
+  aggregate({ aggregates: { count: count() } })
+);
+
+const firstTwoEntries = pipe(
+  from(entry),
+  sort(asc(entry.id)),
+  limit(2)
+);
+
+const entriesByAccountId = pipe(
+  from(entry),
+  keyBy('accountId')
+);
+
 const supportedVariants: readonly SupportedVariant[] = [
   {
     label: 'source relation',
@@ -206,6 +241,10 @@ const joinedEntryAccounts = pipe(
 
 const unsupportedVariants: readonly UnsupportedVariant[] = [
   {
+    label: 'aggregate without groupBy identity',
+    query: entryCount as Query<unknown>
+  },
+  {
     label: 'unsorted limit',
     query: pipe(from(entry), limit(3)) as Query<unknown>
   },
@@ -238,6 +277,9 @@ describe('materialization fuzz behavior', () => {
   it('keeps supported single-source materializations equivalent to dematerialized rows across seeded transactions', () => {
     let maintainedChanges = 0;
     let equivalenceChecks = 0;
+    let incrementalChanges = 0;
+    let carriedChanges = 0;
+    let safetyRecomputes = 0;
 
     for (const variant of supportedVariants) {
       expect(explainMaterialization(variant.query), variant.label).toEqual(expect.objectContaining({
@@ -247,21 +289,21 @@ describe('materialization fuzz behavior', () => {
         diagnostics: []
       }));
 
-      for (const seed of [5, 17, 43, 91]) {
+      for (const seed of [5, 17, 43, 91, 137]) {
         let db = mat(seededDb(seed), variant.query);
         expect(q(db, variant.query)).toEqual(q(demat(db, variant.query), variant.query));
 
-        for (const patch of randomEntryPatches(seed * 997 + variant.label.length, 24)) {
+        for (const [step, patch] of randomEntryPatches(seed * 211 + variant.label.length, 36).entries()) {
           const beforeRows = q(db, variant.query);
           const result = tryTransact(db, patch);
-          expect(result.committed, `${variant.label} committed ${patch.op}`).toBe(true);
+          expect(result.committed, `${variant.label} seed ${seed} step ${step} committed ${patch.op}`).toBe(true);
           db = result.db;
 
           const materializedRows = q(db, variant.query);
           const dematerializedRows = q(demat(db, variant.query), variant.query);
           const change = result.materializations?.changes[0];
 
-          expect(change, `${variant.label} maintained ${patch.op}`).toBeDefined();
+          expect(change, `${variant.label} seed ${seed} step ${step} maintained ${patch.op}`).toBeDefined();
           if (change === undefined) continue;
 
           maintainedChanges += 1;
@@ -273,6 +315,7 @@ describe('materialization fuzz behavior', () => {
 
           if (change.update === 'incremental') {
             const expected = diffRows(beforeRows, dematerializedRows, { keyBy: variant.keyBy });
+            incrementalChanges += 1;
             expect(change.recomputed, variant.label).toBe(false);
             expect(change.reason).toBe('incremental delta maintenance');
             expect(change.diagnostics, variant.label).toEqual([]);
@@ -281,6 +324,7 @@ describe('materialization fuzz behavior', () => {
             expect(change.removed).toEqual(removedRows(expected.changes));
             expect(expected.diagnostics).toEqual([]);
           } else if (change.update === 'carried') {
+            carriedChanges += 1;
             expect(change.recomputed, variant.label).toBe(false);
             expect(change.reason).toBe('dependencies unchanged');
             expect(change.diagnostics, variant.label).toEqual([]);
@@ -288,15 +332,80 @@ describe('materialization fuzz behavior', () => {
             expect(change.added).toEqual([]);
             expect(change.removed).toEqual([]);
           } else {
+            safetyRecomputes += 1;
             expect(change.update).toBe('recomputed');
             expect(change.recomputed, `${variant.label} ${patch.op} ${change.reason}`).toBe(true);
+            expect(change.diagnostics, `${variant.label} ${patch.op} ${change.reason}`).toEqual(expect.arrayContaining([
+              expect.objectContaining({ code: 'materialization_unsupported' })
+            ]));
           }
         }
       }
     }
 
-    expect(maintainedChanges).toBeGreaterThan(0);
-    expect(equivalenceChecks).toBeGreaterThan(0);
+    expect(maintainedChanges, 'expected seeded supported materialization changes').toBeGreaterThan(0);
+    expect(equivalenceChecks, 'expected seeded materialized/dematerialized equivalence checks').toBeGreaterThan(0);
+    expect(incrementalChanges, 'expected seeded incremental changes').toBeGreaterThan(0);
+    expect(carriedChanges, 'expected seeded carried changes').toBeGreaterThan(0);
+    expect(safetyRecomputes, 'expected seeded safety recomputes').toBeGreaterThan(0);
+  });
+
+  it('keeps mixed single-source materializations equivalent across seeded transaction sequences', () => {
+    const variants: readonly UnsupportedVariant[] = [
+      { label: 'cash projection', query: cashEntryProjection as Query<unknown> },
+      { label: 'sorted projection', query: sortedEntryProjection as Query<unknown> },
+      { label: 'account keyBy', query: entriesByAccountId as Query<unknown> },
+      { label: 'entry count', query: entryCount as Query<unknown> },
+      { label: 'first two entries', query: firstTwoEntries as Query<unknown> }
+    ];
+    let incrementalUpdates = 0;
+    let fallbackRecomputes = 0;
+
+    for (const seed of [3, 11, 29, 47, 83]) {
+      for (const variant of variants) {
+        let db = mat(createDb({ accounts: makeDb().data.accounts ?? [], entries: randomEntries(seed, 7) }), variant.query);
+
+        for (const patch of randomEntryPatches(seed * 97 + variant.query.data.op.length, 24)) {
+          const result = tryTransact(db, patch);
+          expect(result.committed, `${variant.label} committed ${patch.op}`).toBe(true);
+          db = result.db;
+
+          expect(q(db, variant.query)).toEqual(q(demat(db, variant.query), variant.query));
+
+          const change = result.materializations?.changes[0];
+          if (change?.update === 'incremental') incrementalUpdates += 1;
+          if (change?.update === 'recomputed') {
+            expect(change.diagnostics).toEqual(expect.arrayContaining([
+              expect.objectContaining({ code: 'materialization_unsupported' })
+            ]));
+            fallbackRecomputes += 1;
+          }
+        }
+      }
+    }
+
+    expect(incrementalUpdates).toBeGreaterThan(0);
+    expect(fallbackRecomputes).toBeGreaterThan(0);
+    expect(explainMaterialization(cashEntryProjection)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+    expect(explainMaterialization(entriesByAccountId)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+    expect(explainMaterialization(entryCount)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: 'materialization_unsupported' })
+      ])
+    }));
   });
 
   it('keeps declared materialized indexes equivalent to source row filtering after seeded random writes', () => {
