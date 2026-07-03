@@ -7,6 +7,28 @@ type PackageConfig = {
   readonly build: NonNullable<UserConfig['build']>;
 };
 
+const coreSubpathEntryNames = [
+  'adapter',
+  'constraints',
+  'db',
+  'diagnostics',
+  'delta',
+  'diff',
+  'evaluate',
+  'materialization',
+  'memory-runtime',
+  'query',
+  'runtime',
+  'schema',
+  'source',
+  'store',
+  'watch',
+  'write'
+] as const;
+
+const packageEntryPath = (entryName: string): string => 'src/' + entryName + '.ts';
+const coreBuildEntries = Object.fromEntries(['index', ...coreSubpathEntryNames].map((entryName) => [entryName, packageEntryPath(entryName)]));
+
 const failOnRollupWarning = (warning: string | { readonly message?: string }): never => {
   const message = typeof warning === 'string' ? warning : warning.message ?? JSON.stringify(warning);
   throw new Error('Rollup warning treated as error: ' + message);
@@ -52,28 +74,10 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
     build: {
       ...sharedBuildOptions,
       lib: {
-        entry: {
-          index: 'src/index.ts',
-          adapter: 'src/adapter.ts',
-          constraints: 'src/constraints.ts',
-          db: 'src/db.ts',
-          diagnostics: 'src/diagnostics.ts',
-          delta: 'src/delta.ts',
-          diff: 'src/diff.ts',
-          evaluate: 'src/evaluate.ts',
-          materialization: 'src/materialization.ts',
-          'memory-runtime': 'src/memory-runtime.ts',
-          query: 'src/query.ts',
-          runtime: 'src/runtime.ts',
-          schema: 'src/schema.ts',
-          source: 'src/source.ts',
-          store: 'src/store.ts',
-          watch: 'src/watch.ts',
-          write: 'src/write.ts'
-        },
+        entry: coreBuildEntries,
         formats: ['es'],
         fileName: (_format, entryName) => entryName + '.js'
-      },
+      }
     }
   }
 };
@@ -81,27 +85,13 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
 const manifest = JSON.parse(readFileSync('package.json', 'utf8')) as { readonly name?: string };
 const packageConfig = manifest.name ? buildConfigsByPackageName[manifest.name] : undefined;
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
+const sourceAlias = (find: string, replacement: string) => ({ find, replacement: path.join(repoRoot, replacement) });
 const sourceAliases = [
-  { find: '@tarstate/core/adapter', replacement: path.join(repoRoot, 'packages/core/src/adapter.ts') },
-  { find: '@tarstate/core/constraints', replacement: path.join(repoRoot, 'packages/core/src/constraints.ts') },
-  { find: '@tarstate/core/db', replacement: path.join(repoRoot, 'packages/core/src/db.ts') },
-  { find: '@tarstate/core/diagnostics', replacement: path.join(repoRoot, 'packages/core/src/diagnostics.ts') },
-  { find: '@tarstate/core/delta', replacement: path.join(repoRoot, 'packages/core/src/delta.ts') },
-  { find: '@tarstate/core/diff', replacement: path.join(repoRoot, 'packages/core/src/diff.ts') },
-  { find: '@tarstate/core/evaluate', replacement: path.join(repoRoot, 'packages/core/src/evaluate.ts') },
-  { find: '@tarstate/core/memory-runtime', replacement: path.join(repoRoot, 'packages/core/src/memory-runtime.ts') },
-  { find: '@tarstate/core/materialization', replacement: path.join(repoRoot, 'packages/core/src/materialization.ts') },
-  { find: '@tarstate/core/query', replacement: path.join(repoRoot, 'packages/core/src/query.ts') },
-  { find: '@tarstate/core/runtime', replacement: path.join(repoRoot, 'packages/core/src/runtime.ts') },
-  { find: '@tarstate/core/schema', replacement: path.join(repoRoot, 'packages/core/src/schema.ts') },
-  { find: '@tarstate/core/source', replacement: path.join(repoRoot, 'packages/core/src/source.ts') },
-  { find: '@tarstate/core/store', replacement: path.join(repoRoot, 'packages/core/src/store.ts') },
-  { find: '@tarstate/core/watch', replacement: path.join(repoRoot, 'packages/core/src/watch.ts') },
-  { find: '@tarstate/core/write', replacement: path.join(repoRoot, 'packages/core/src/write.ts') },
-  { find: '@tarstate/automerge/presence', replacement: path.join(repoRoot, 'packages/automerge/src/presence.ts') },
-  { find: '@tarstate/automerge', replacement: path.join(repoRoot, 'packages/automerge/src/index.ts') },
-  { find: '@tarstate/react', replacement: path.join(repoRoot, 'packages/react/src/index.ts') },
-  { find: '@tarstate/core', replacement: path.join(repoRoot, 'packages/core/src/index.ts') }
+  ...coreSubpathEntryNames.map((entryName) => sourceAlias('@tarstate/core/' + entryName, 'packages/core/src/' + entryName + '.ts')),
+  sourceAlias('@tarstate/automerge/presence', 'packages/automerge/src/presence.ts'),
+  sourceAlias('@tarstate/automerge', 'packages/automerge/src/index.ts'),
+  sourceAlias('@tarstate/react', 'packages/react/src/index.ts'),
+  sourceAlias('@tarstate/core', 'packages/core/src/index.ts')
 ];
 
 export default defineConfig(({ command }): UserConfig => {

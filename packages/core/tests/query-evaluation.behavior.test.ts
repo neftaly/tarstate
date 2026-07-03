@@ -353,6 +353,49 @@ describe('query evaluation behavior', () => {
     expect(lookups[0]?.relation.name).toBe('entries');
   });
 
+  it('tries later and() pushdowns when an earlier indexed predicate is declined', () => {
+    const rows = openingEntries.map((row) => ({ ...row }));
+    const lookups: RelationLookup[] = [];
+    const ranges: RelationRangeLookup[] = [];
+    let rowReads = 0;
+    const source: RelationSource = {
+      rows: (relationRef) => {
+        rowReads += 1;
+        return relationRef.name === 'entries' ? rows : [];
+      },
+      lookup: (lookupValue) => {
+        lookups.push(lookupValue);
+        return undefined;
+      },
+      rangeLookup: (lookupValue) => {
+        ranges.push(lookupValue);
+        return rows.filter((rowValue) => rowValue.amount >= 0);
+      }
+    };
+
+    const result = evaluate(
+      source,
+      pipe(
+        from(entry),
+        where(and(eq(entry.accountId, value('cash')), gte(entry.amount, value(0)))),
+        sort(asc(entry.id)),
+        project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      )
+    );
+
+    expect(result).toEqual({
+      rows: [{ id: 'e1', accountId: 'cash', amount: 120 }, { id: 'e4', accountId: 'cash', amount: 0 }],
+      diagnostics: []
+    });
+    expect(rowReads).toBe(0);
+    expect(lookups).toEqual([
+      expect.objectContaining({ field: 'accountId', value: 'cash' })
+    ]);
+    expect(ranges).toEqual([
+      expect.objectContaining({ field: 'amount', lower: { value: 0, inclusive: true } })
+    ]);
+  });
+
   it('falls back to relation rows when an indexed source declines a where lookup', () => {
     const rows = openingEntries.map((row) => ({ ...row }));
     let rowReads = 0;

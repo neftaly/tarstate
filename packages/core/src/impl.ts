@@ -1672,15 +1672,6 @@ export type MaterializationMaintainResult<DbValue extends Db = Db, Row = unknown
   readonly db: DbValue & MaterializedDb;
   readonly materializations: MaterializationMaintenanceResult<Row>;
 };
-export type MaterializationIndex<Row = unknown> = Readonly<Record<string, unknown>> & { readonly rows?: readonly Row[] };
-export type MaterializationNestedRows<Row = unknown> = Readonly<Record<string, readonly Row[]>>;
-export type MaterializationNestedUniqueRows<Row = unknown> = Readonly<Record<string, Row | undefined>>;
-export type MaterializationSetLike<Row = unknown> = {
-  readonly size: number;
-  readonly has: (row: Row) => boolean;
-  readonly values: () => IterableIterator<Row>;
-  readonly [Symbol.iterator]: () => IterableIterator<Row>;
-};
 export type MaterializationRangeBound<Value = unknown> = RelationRangeBound<Value>;
 export type MaterializationRange<Value = unknown> = { readonly lower?: MaterializationRangeBound<Value>; readonly upper?: MaterializationRangeBound<Value> };
 export type MaterializedQueryResult<Row = unknown> = QueryResult<Row> & { readonly materialized: boolean };
@@ -1758,6 +1749,17 @@ export const isMaterialized = (input: unknown): input is MaterializedDb => isRec
 export const materializationsFor = (input: unknown): readonly MaterializationMetadata[] => materializedStateFor(input).metadata;
 export const materializationForQuery = <Row = unknown>(input: unknown, query: Query<Row>): MaterializationMetadata<Row> | undefined =>
   materializationsFor(input).find((item) => item.queryKey === queryKey(query)) as MaterializationMetadata<Row> | undefined;
+export const materializedRelationFor = (id: string): RelationRef<Record<string, unknown>> => ({
+  kind: 'relation',
+  name: id,
+  key: 'id',
+  fields: {},
+  ephemeral: true
+});
+export const materializedRelationForQuery = <Row = unknown>(input: unknown, query: Query<Row>): RelationRef<Record<string, unknown>> | undefined => {
+  const metadata = materializationForQuery(input, query);
+  return metadata === undefined ? undefined : materializedRelationFor(metadata.id);
+};
 export const materializedRowsFor = <Row = unknown>(input: unknown, id: string): readonly Row[] | undefined =>
   materializedStateFor(input).rows.get(id) as readonly Row[] | undefined;
 export const materializedRowsForQuery = <Row = unknown>(input: unknown, query: Query<Row>): readonly Row[] | undefined => {
@@ -4481,25 +4483,6 @@ export const explainMaterialization = <Row>(query: Query<Row>): MaterializationE
     diagnostics: incremental.supported ? [] : incremental.diagnostics
   };
 };
-export const index = <Row = unknown>(rows: Iterable<Row> = []): MaterializationIndex<Row> & MaterializationSetLike<Row> => {
-  const valuesArray = Array.from(rows);
-  return {
-    rows: valuesArray,
-    size: valuesArray.length,
-    has: (rowValue: Row): boolean => valuesArray.includes(rowValue),
-    values: function* values(): IterableIterator<Row> {
-      yield* valuesArray;
-    },
-    [Symbol.iterator]: function* iterator(): IterableIterator<Row> {
-      yield* valuesArray;
-    },
-    forEach: (callback: (rowValue: Row, rowKey: Row, set: ReadonlySet<Row>) => void, thisArg?: unknown): void => {
-      const set = new Set(valuesArray);
-      set.forEach((rowValue, rowKey) => callback.call(thisArg, rowValue, rowKey, set));
-    }
-  };
-};
-
 export type MemoryRelationRuntimeOptions = { readonly relationNames?: readonly string[] };
 export function createMemoryRelationRuntime(data: DbInputData = {}, options: MemoryRelationRuntimeOptions = {}): RelationRuntime<number> {
   let dbValue = createDb(data);
@@ -5505,16 +5488,18 @@ function evaluateWhere(
   outer: EvalEntry | undefined,
   diagnostics: TarstateDiagnostic[]
 ): readonly EvalEntry[] {
-  const pushed = wherePushdownTarget(data, relations);
-  let input: readonly EvalEntry[];
-  if (pushed === undefined) {
+  const pushed = wherePushdownTargets(data, relations);
+  let input: readonly EvalEntry[] | undefined;
+  for (const candidate of pushed) {
+    const pushedRows = readWherePushdownRows(source, candidate);
+    if (pushedRows !== undefined) {
+      input = validateSourceRows(candidate.relation, pushedRows, diagnostics)
+        .map((rowValue) => entryForRow(rowValue, candidate.alias, candidate.relation.name));
+      break;
+    }
+  }
+  if (input === undefined) {
     input = evaluateNestedInput(source, data, relations, options, outer, diagnostics);
-  } else {
-    const pushedRows = readWherePushdownRows(source, pushed);
-    input = pushedRows === undefined
-      ? evaluateNestedInput(source, data, relations, options, outer, diagnostics)
-      : validateSourceRows(pushed.relation, pushedRows, diagnostics)
-        .map((rowValue) => entryForRow(rowValue, pushed.alias, pushed.relation.name));
   }
   return input.filter((entry) => Boolean(evaluateExpr(data.predicate, entry, source, relations, options, diagnostics, outer)));
 }
@@ -5536,37 +5521,35 @@ function readWherePushdownRows(
   }
 }
 
-function wherePushdownTarget(
+function wherePushdownTargets(
   data: QueryData,
   relations: Readonly<Record<string, AnyRelationRef>>
-): WherePushdownTarget | undefined {
+): readonly WherePushdownTarget[] {
   const input = queryDataFrom(data.input);
-  if (input?.op !== 'from') return undefined;
+  if (input?.op !== 'from') return [];
   const relationName = typeof input.relation === 'string' ? input.relation : undefined;
   const relationRef = relationName === undefined ? undefined : relations[relationName];
-  if (!isRelationRef(relationRef)) return undefined;
+  if (!isRelationRef(relationRef)) return [];
   const alias = typeof input.alias === 'string' ? input.alias : relationRef.name;
-  const pushdown = wherePushdown(data.predicate, new Set([alias, relationRef.name, 'row']));
-  return pushdown === undefined ? undefined : { ...pushdown, relation: relationRef, alias };
+  return wherePushdowns(data.predicate, new Set([alias, relationRef.name, 'row']))
+    .map((pushdown) => ({ ...pushdown, relation: relationRef, alias }));
 }
 
-function wherePushdown(input: unknown, aliases: ReadonlySet<string>): WherePushdown | undefined {
+function wherePushdowns(input: unknown, aliases: ReadonlySet<string>): readonly WherePushdown[] {
   const data = exprFrom(unwrapOptionalProjection(input));
   switch (data.op) {
     case 'eq':
     case 'lt':
     case 'lte':
     case 'gt':
-    case 'gte':
-      return comparisonWherePushdown(data.op, data.left, data.right, aliases);
+    case 'gte': {
+      const pushdown = comparisonWherePushdown(data.op, data.left, data.right, aliases);
+      return pushdown === undefined ? [] : [pushdown];
+    }
     case 'and':
-      for (const predicate of arrayFromUnknown(data.predicates)) {
-        const pushed = wherePushdown(predicate, aliases);
-        if (pushed !== undefined) return pushed;
-      }
-      return undefined;
+      return arrayFromUnknown(data.predicates).flatMap((predicate) => wherePushdowns(predicate, aliases));
     default:
-      return undefined;
+      return [];
   }
 }
 

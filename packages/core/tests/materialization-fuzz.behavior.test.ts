@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createDb, q, tryTransact } from '@tarstate/core/db';
 import { diffRows, type RowChange, type RowKeySelector } from '@tarstate/core/diff';
-import { demat, explainMaterialization, mat, materializationForQuery, materializedSourceFor } from '@tarstate/core/materialization';
+import { demat, explainMaterialization, mat, materializedRelationForQuery, materializedSourceFor } from '@tarstate/core/materialization';
 import {
   aggregate,
   asc,
@@ -557,7 +557,7 @@ function joinedEntryAccountKey(row: unknown): readonly unknown[] {
 }
 
 function expectDeclaredIndexLookups(db: unknown, variant: DeclaredIndexVariant, seed: number): number {
-  const relation = materializedRelationFor(db, variant.query);
+  const relation = requireMaterializedRelationForQuery(db, variant.query);
   const source = requireMaterializedSourceFor(db);
   const rows = source.rows(relation);
 
@@ -580,16 +580,10 @@ function expectDeclaredIndexLookups(db: unknown, variant: DeclaredIndexVariant, 
   return values.length;
 }
 
-function materializedRelationFor(db: unknown, query: Query<unknown>): RelationRef<Record<string, unknown>> {
-  const metadata = materializationForQuery(db, query);
-  if (metadata === undefined) throw new Error('expected materialization metadata');
-  return {
-    kind: 'relation',
-    name: metadata.id,
-    key: 'id',
-    fields: {},
-    ephemeral: true
-  };
+function requireMaterializedRelationForQuery(db: unknown, query: Query<unknown>): RelationRef<Record<string, unknown>> {
+  const relation = materializedRelationForQuery(db, query);
+  if (relation === undefined) throw new Error('expected materialized relation metadata');
+  return relation;
 }
 
 function requireMaterializedSourceFor(input: unknown): RelationSource {
