@@ -2160,7 +2160,9 @@ function valueAtPropertyPath(
     current = current[segment];
   }
 
-  return { found: true, value: current };
+  return current === undefined
+    ? { found: false }
+    : { found: true, value: current };
 }
 
 function setPathValue(root: unknown, path: readonly string[], value: unknown): void {

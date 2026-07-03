@@ -15,6 +15,8 @@ export type TarstateCoreDiagnosticCode =
   | 'foreign_key'
   | 'check'
   | 'constraint_failed'
+  | 'transaction_failed'
+  | 'write_patch_invalid'
   | 'materialization_unsupported'
   | 'materialization_missing'
   | 'materialization_stale'
@@ -1837,17 +1839,69 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
   const materializationConstraints = materializedConstraintsFor(inputDb);
 
   for (const input of inputs) {
-    const items = normalizeTransactionItem(resolveTransactionInput(input, workingDb));
+    let items: readonly (WritePatch | SetEnvTransaction)[];
+    try {
+      items = normalizeTransactionItem(resolveTransactionInput(input, workingDb));
+    } catch (error) {
+      diagnostics.push(...normalizeDiagnostics(error, transactionFailedDiagnostic('transaction input failed')));
+      return withTransactionWritePatches({
+        db: inputDb,
+        patches: patches.length,
+        applied,
+        deltas,
+        diagnostics,
+        committed: false
+      }, patches);
+    }
+
     for (const item of items) {
       if (isSetEnvTransaction(item)) {
-        const beforeEnv = envSnapshot(workingDb.env);
-        workingDb = applySetEnvTransaction(workingDb, item);
-        envDeltas.push(...envDeltasFor(beforeEnv, workingDb.env));
+        try {
+          const beforeEnv = envSnapshot(workingDb.env);
+          workingDb = applySetEnvTransaction(workingDb, item);
+          envDeltas.push(...envDeltasFor(beforeEnv, workingDb.env));
+        } catch (error) {
+          diagnostics.push(...normalizeDiagnostics(error, transactionFailedDiagnostic('environment transaction failed')));
+          return withTransactionWritePatches({
+            db: inputDb,
+            patches: patches.length,
+            applied,
+            deltas,
+            diagnostics,
+            committed: false
+          }, patches);
+        }
         continue;
       }
 
       patches.push(item);
-      const patchResult = applyWritePatchToDb(workingDb, item, materializationConstraints);
+      const patchEnvelopeDiagnostics = validateWritePatchEnvelope(item);
+      if (patchEnvelopeDiagnostics.some(isErrorDiagnostic)) {
+        diagnostics.push(...patchEnvelopeDiagnostics);
+        return withTransactionWritePatches({
+          db: inputDb,
+          patches: patches.length,
+          applied,
+          deltas,
+          diagnostics,
+          committed: false
+        }, patches);
+      }
+
+      let patchResult: WriteApplyResult;
+      try {
+        patchResult = applyWritePatchToDb(workingDb, item, materializationConstraints);
+      } catch (error) {
+        diagnostics.push(...normalizeDiagnostics(error, transactionFailedDiagnostic('write patch failed', item.relation.name)));
+        return withTransactionWritePatches({
+          db: inputDb,
+          patches: patches.length,
+          applied,
+          deltas,
+          diagnostics,
+          committed: false
+        }, patches);
+      }
       diagnostics.push(...patchResult.diagnostics);
 
       if (patchResult.diagnostics.some(isErrorDiagnostic)) {
@@ -7648,6 +7702,121 @@ function isIterableTransactionItems(input: unknown): input is Iterable<WritePatc
 
 function isSetEnvTransaction(input: unknown): input is SetEnvTransaction {
   return isRecord(input) && input.op === 'setEnv';
+}
+
+const WRITE_PATCH_OPS = new Set([
+  'insert',
+  'insertIgnore',
+  'insertOrReplace',
+  'insertOrMerge',
+  'insertOrUpdate',
+  'updateByKey',
+  'update',
+  'deleteByKey',
+  'delete',
+  'deleteExact',
+  'replaceAll'
+]);
+
+function transactionFailedDiagnostic(message: string, relationName?: string): TarstateDiagnostic {
+  return {
+    code: 'transaction_failed',
+    severity: 'error',
+    message,
+    ...(relationName === undefined ? {} : { relation: relationName }),
+    surface: 'tryTransact'
+  };
+}
+
+function writePatchInvalidDiagnostic(message: string, patch: unknown, relationName?: string): TarstateDiagnostic {
+  return {
+    code: 'write_patch_invalid',
+    severity: 'error',
+    message,
+    ...(relationName === undefined ? {} : { relation: relationName }),
+    surface: 'tryTransact',
+    detail: patch
+  };
+}
+
+function validateWritePatchEnvelope(patch: unknown): readonly TarstateDiagnostic[] {
+  const diagnostics: TarstateDiagnostic[] = [];
+  if (!isRecord(patch)) {
+    diagnostics.push(writePatchInvalidDiagnostic('write patch must be an object', patch));
+    return diagnostics;
+  }
+
+  diagnostics.push(...prototypePollutionDiagnostics(patch, 'write patch', patch));
+
+  const op = patch.op;
+  if (typeof op !== 'string' || !WRITE_PATCH_OPS.has(op)) {
+    diagnostics.push(writePatchInvalidDiagnostic(`write patch op "${String(op)}" is not supported`, patch));
+  }
+
+  const relationRef = patch.relation;
+  if (!isUsableRelationRef(relationRef)) {
+    diagnostics.push(writePatchInvalidDiagnostic('write patch relation must be a relation ref with fields and key metadata', patch));
+    return diagnostics;
+  }
+
+  switch (op) {
+    case 'insert':
+    case 'insertIgnore':
+    case 'insertOrReplace':
+    case 'insertOrMerge':
+    case 'insertOrUpdate':
+      diagnostics.push(...prototypePollutionDiagnostics(patch.row, 'write patch row', patch, relationRef.name));
+      break;
+    case 'updateByKey':
+    case 'deleteByKey':
+      diagnostics.push(...keyArityDiagnostics(relationRef, patch.key, patch));
+      if (op === 'updateByKey') diagnostics.push(...prototypePollutionDiagnostics(patch.changes, 'write patch changes', patch, relationRef.name));
+      break;
+    case 'update':
+      if (!isPredicateData(patch.predicate)) diagnostics.push(writePatchInvalidDiagnostic('write patch predicate must be a predicate expression', patch, relationRef.name));
+      diagnostics.push(...prototypePollutionDiagnostics(patch.changes, 'write patch changes', patch, relationRef.name));
+      break;
+    case 'delete':
+      if (!isPredicateData(patch.predicate)) diagnostics.push(writePatchInvalidDiagnostic('write patch predicate must be a predicate expression', patch, relationRef.name));
+      break;
+    case 'deleteExact':
+      diagnostics.push(...prototypePollutionDiagnostics(patch.row, 'write patch row', patch, relationRef.name));
+      break;
+    case 'replaceAll':
+      if (!Array.isArray(patch.rows)) {
+        diagnostics.push(writePatchInvalidDiagnostic('replaceAll rows must be an array', patch, relationRef.name));
+      } else {
+        for (const rowValue of patch.rows) {
+          diagnostics.push(...prototypePollutionDiagnostics(rowValue, 'replaceAll row', patch, relationRef.name));
+        }
+      }
+      break;
+    default:
+      break;
+  }
+
+  return diagnostics;
+}
+
+function isUsableRelationRef(input: unknown): input is RelationRef {
+  return isRelationRef(input)
+    && isRecord(input.fields)
+    && (typeof input.key === 'string' || (Array.isArray(input.key) && input.key.every((fieldName) => typeof fieldName === 'string')));
+}
+
+function keyArityDiagnostics(relationRef: RelationRef, key: unknown, patch: unknown): readonly TarstateDiagnostic[] {
+  const fields = relationKeyFields(relationRef);
+  if (fields.length <= 1) return [];
+  return Array.isArray(key) && key.length === fields.length
+    ? []
+    : [writePatchInvalidDiagnostic(`relation "${relationRef.name}" composite key requires ${fields.length} values`, patch, relationRef.name)];
+}
+
+function prototypePollutionDiagnostics(input: unknown, label: string, patch: unknown, relationName?: string): readonly TarstateDiagnostic[] {
+  if (!isRecord(input)) return [];
+  const blocked = ['__proto__', 'constructor', 'prototype'].filter((fieldName) => Object.prototype.hasOwnProperty.call(input, fieldName));
+  return blocked.map((fieldName) =>
+    writePatchInvalidDiagnostic(`${label} must not contain prototype-pollution key "${fieldName}"`, patch, relationName));
 }
 
 function applySetEnvTransaction(dbValue: Db, tx: SetEnvTransaction): Db {

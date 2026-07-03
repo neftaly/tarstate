@@ -198,6 +198,8 @@ describe('public API contracts', () => {
 
     expectTypeOf<TarstateCoreDiagnosticCode>().toMatchTypeOf<TarstateDiagnosticCode>();
     expectTypeOf<'foreign_key'>().toMatchTypeOf<TarstateCoreDiagnosticCode>();
+    expectTypeOf<'write_patch_invalid'>().toMatchTypeOf<TarstateCoreDiagnosticCode>();
+    expectTypeOf<'transaction_failed'>().toMatchTypeOf<TarstateCoreDiagnosticCode>();
     expectTypeOf<'app/custom-rule'>().toMatchTypeOf<TarstateDiagnosticCode>();
     expectTypeOf<TarstateDiagnosticSeverity>().toEqualTypeOf<'info' | 'warning' | 'error'>();
     expectTypeOf<TarstateDiagnosticMode>().toEqualTypeOf<'collect' | 'throw' | 'warn'>();
