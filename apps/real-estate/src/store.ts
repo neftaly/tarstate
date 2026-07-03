@@ -12,16 +12,19 @@ import {
 } from './queries';
 
 export function createRealEstateStore(includeInvalidRows: boolean): Store {
-  const db = mat(
-    createDb(makeRealEstateSeed(includeInvalidRows)),
-    realEstateConstraints,
-    listingsByNeighborhoodIndex,
-    listingsByPriceIndex,
-    listingsByIdIndex,
-    neighborhoodMarketSummaryQuery,
-    openHouseScheduleQuery,
-    pipelineByListingQuery
-  );
+  const source = createDb(makeRealEstateSeed(includeInvalidRows));
+  const db = includeInvalidRows
+    ? mat(source, realEstateConstraints)
+    : mat(
+        source,
+        realEstateConstraints,
+        listingsByNeighborhoodIndex,
+        listingsByPriceIndex,
+        listingsByIdIndex,
+        neighborhoodMarketSummaryQuery,
+        openHouseScheduleQuery,
+        pipelineByListingQuery
+      );
 
   return createStore(db);
 }

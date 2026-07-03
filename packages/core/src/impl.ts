@@ -5484,6 +5484,7 @@ function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version
   let revision = 0;
   let closed = false;
   const listeners = new Set<() => void>();
+  const viewCache: StoreViewCache<Version> = new Map();
   const snapshot = (): StoreSnapshot<Version> => ({ db: state, source: dbSource(state), revision, diagnostics: [] });
   const notify = (): void => {
     if (closed) return;
@@ -5505,7 +5506,7 @@ function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version
       if (isQueryBatch(queryValue)) return addRevisionToBatch(whatIf(state, queryValue, ...inputs), revision);
       return { ...whatIf(state, queryValue, ...inputs), revision };
     }) as StoreWhatIf,
-    view: (queryValue) => createStoreView(queryValue, snapshot, (listener) => {
+    view: (queryValue) => createStoreView(queryValue, snapshot, viewCache, (listener) => {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
@@ -5553,6 +5554,7 @@ function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version
     close: () => {
       closed = true;
       listeners.clear();
+      viewCache.clear();
     }
   };
 }
@@ -5566,6 +5568,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
   let state = dbFromSource(currentSource, input.relations, input.env);
   let version = initialRuntimeSnapshot?.version ?? currentSource.version?.();
   let pendingApplyEnv: DbEnv | undefined;
+  const viewCache: StoreViewCache<Version> = new Map();
   const snapshot = (): StoreSnapshot<Version> => ({
     db: state,
     source: currentSource,
@@ -5607,7 +5610,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       if (isQueryBatch(queryValue)) return addRevisionToBatch(whatIf(state, queryValue, ...inputs), revision);
       return { ...whatIf(state, queryValue, ...inputs), revision };
     }) as StoreWhatIf,
-    view: (queryValue) => createStoreView(queryValue, snapshot, (listener) => {
+    view: (queryValue) => createStoreView(queryValue, snapshot, viewCache, (listener) => {
       listeners.add(listener);
       return () => {
         listeners.delete(listener);
@@ -5683,45 +5686,82 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       closed = true;
       runtimeUnsubscribe?.();
       listeners.clear();
+      viewCache.clear();
     }
   };
 }
 
+type StoreViewCache<Version> = Map<string, StoreViewCacheEntry<unknown, Version>>;
+
+type StoreViewCacheEntry<Row, Version> = {
+  readonly query: Query<Row>;
+  cachedSnapshot: StoreViewSnapshot<Row, Version> | undefined;
+  cachedSnapshotDiagnosticsKey: string | undefined;
+  subscribers: number;
+};
+
 function createStoreView<Row, Version>(
   queryValue: Query<Row>,
   snapshot: () => StoreSnapshot<Version>,
+  viewCache: StoreViewCache<Version>,
   subscribeStore: (listener: () => void) => () => void
 ): StoreView<Row, Version> {
   const key = queryKey(queryValue);
-  let cachedSnapshot: StoreViewSnapshot<Row, Version> | undefined;
-  let cachedSnapshotDiagnosticsKey: string | undefined;
+  const cacheEntry = (): StoreViewCacheEntry<Row, Version> => {
+    const existing = viewCache.get(key) as StoreViewCacheEntry<Row, Version> | undefined;
+    if (existing !== undefined) return existing;
+
+    const next: StoreViewCacheEntry<Row, Version> = {
+      query: queryValue,
+      cachedSnapshot: undefined,
+      cachedSnapshotDiagnosticsKey: undefined,
+      subscribers: 0
+    };
+    viewCache.set(key, next as StoreViewCacheEntry<unknown, Version>);
+    return next;
+  };
   const viewSnapshot = (): StoreViewSnapshot<Row, Version> => {
+    const entry = cacheEntry();
     const current = snapshot();
     const diagnosticsKey = diagnosticsFingerprint(current.diagnostics);
     if (
-      cachedSnapshot !== undefined
-      && cachedSnapshot.revision === current.revision
-      && cachedSnapshot.queryKey === key
-      && cachedSnapshotDiagnosticsKey === diagnosticsKey
+      entry.cachedSnapshot !== undefined
+      && entry.cachedSnapshot.revision === current.revision
+      && entry.cachedSnapshot.queryKey === key
+      && entry.cachedSnapshotDiagnosticsKey === diagnosticsKey
     ) {
-      return cachedSnapshot;
+      return entry.cachedSnapshot;
     }
-    const result = qResult(current.db, queryValue);
-    cachedSnapshot = {
+    const result = qResult(current.db, entry.query);
+    entry.cachedSnapshot = {
       rows: result.rows,
       diagnostics: [...current.diagnostics, ...result.diagnostics],
       revision: current.revision,
       queryKey: key,
       ...(current.version === undefined ? {} : { version: current.version })
     };
-    cachedSnapshotDiagnosticsKey = diagnosticsKey;
-    return cachedSnapshot;
+    entry.cachedSnapshotDiagnosticsKey = diagnosticsKey;
+    return entry.cachedSnapshot;
   };
+  const subscribeView = (listener: () => void): (() => void) => {
+    const entry = cacheEntry();
+    entry.subscribers += 1;
+    let subscribed = true;
+    const unsubscribeStore = subscribeStore(listener);
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      unsubscribeStore();
+      entry.subscribers -= 1;
+      if (entry.subscribers === 0 && viewCache.get(key) === entry) viewCache.delete(key);
+    };
+  };
+
   return {
     query: queryValue,
     queryKey: key,
     getSnapshot: viewSnapshot,
-    subscribe: subscribeStore,
+    subscribe: subscribeView,
     refresh: async () => viewSnapshot()
   };
 }

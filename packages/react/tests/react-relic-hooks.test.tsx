@@ -1,4 +1,4 @@
-import { createElement } from 'react';
+import { Fragment, createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { TarstateDiagnostic } from '@tarstate/core';
@@ -339,6 +339,134 @@ describe('@tarstate/react hooks', () => {
       renderer?.unmount();
     });
   });
+
+  it('unmounting useView releases its subscription while a matching useQuery keeps updating', () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const states: {
+      viewRows?: readonly ItemProjection[];
+      queryLabels?: string;
+    } = {};
+
+    function ViewProbe() {
+      states.viewRows = useView(itemQuery).rows;
+      return null;
+    }
+
+    function QueryProbe() {
+      states.queryLabels = useQuery(itemQuery, {
+        select: (rows) => rows.map((row) => row.label).join('|')
+      }).data;
+      return null;
+    }
+
+    function App({ showView }: { readonly showView: boolean }) {
+      return createElement(
+        TarstateProvider,
+        { store: fake.store },
+        createElement(
+          Fragment,
+          undefined,
+          showView ? createElement(ViewProbe, { key: 'view' }) : null,
+          createElement(QueryProbe, { key: 'query' })
+        )
+      );
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(App, { showView: true }));
+    });
+
+    expect(states.viewRows).toEqual([{ id: 'item-a', label: 'Alpha' }]);
+    expect(states.queryLabels).toBe('Alpha');
+    expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([1, 1]);
+
+    act(() => {
+      renderer?.update(createElement(App, { showView: false }));
+    });
+
+    const afterUnmount = fake.viewStats();
+    const unmountedViewReads = afterUnmount[0]?.snapshotReads;
+    expect(afterUnmount.map((stats) => stats.activeListeners)).toEqual([0, 1]);
+    expect(unmountedViewReads).toBeGreaterThan(0);
+
+    act(() => {
+      fake.setRows([{ id: 'item-b', label: 'Beta' }]);
+    });
+
+    const afterUpdate = fake.viewStats();
+    expect(afterUpdate[0]?.snapshotReads).toBe(unmountedViewReads);
+    expect(afterUpdate[1]?.snapshotReads).toBeGreaterThan(afterUnmount[1]?.snapshotReads ?? 0);
+    expect(states.queryLabels).toBe('Beta');
+
+    act(() => {
+      renderer?.unmount();
+    });
+  });
+
+  it('unmounting useQuery releases its subscription while a matching useView keeps updating', () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const states: {
+      viewLabels?: string;
+      queryLabels?: string;
+    } = {};
+
+    function ViewProbe() {
+      states.viewLabels = useView(itemQuery).rows.map((row) => row.label).join('|');
+      return null;
+    }
+
+    function QueryProbe() {
+      states.queryLabels = useQuery(itemQuery, {
+        select: (rows) => rows.map((row) => row.label).join('|')
+      }).data;
+      return null;
+    }
+
+    function App({ showQuery }: { readonly showQuery: boolean }) {
+      return createElement(
+        TarstateProvider,
+        { store: fake.store },
+        createElement(
+          Fragment,
+          undefined,
+          createElement(ViewProbe, { key: 'view' }),
+          showQuery ? createElement(QueryProbe, { key: 'query' }) : null
+        )
+      );
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(App, { showQuery: true }));
+    });
+
+    expect(states.viewLabels).toBe('Alpha');
+    expect(states.queryLabels).toBe('Alpha');
+    expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([1, 1]);
+
+    act(() => {
+      renderer?.update(createElement(App, { showQuery: false }));
+    });
+
+    const afterUnmount = fake.viewStats();
+    const unmountedQueryReads = afterUnmount[1]?.snapshotReads;
+    expect(afterUnmount.map((stats) => stats.activeListeners)).toEqual([1, 0]);
+    expect(unmountedQueryReads).toBeGreaterThan(0);
+
+    act(() => {
+      fake.setRows([{ id: 'item-b', label: 'Beta' }]);
+    });
+
+    const afterUpdate = fake.viewStats();
+    expect(afterUpdate[0]?.snapshotReads).toBeGreaterThan(afterUnmount[0]?.snapshotReads ?? 0);
+    expect(afterUpdate[1]?.snapshotReads).toBe(unmountedQueryReads);
+    expect(states.viewLabels).toBe('Beta');
+
+    act(() => {
+      renderer?.unmount();
+    });
+  });
 });
 
 function assertType(assertion: () => void): void {
@@ -349,6 +477,13 @@ type FakeItemStore = {
   readonly store: Store;
   readonly setRows: (rows: readonly ItemRow[]) => void;
   readonly viewRefreshes: () => number;
+  readonly viewStats: () => readonly FakeItemViewStats[];
+};
+
+type FakeItemViewStats = {
+  readonly activeListeners: number;
+  readonly snapshotReads: number;
+  readonly refreshes: number;
 };
 
 function createFakeItemStore(initialRows: readonly ItemRow[]): FakeItemStore {
@@ -358,7 +493,7 @@ function createFakeItemStore(initialRows: readonly ItemRow[]): FakeItemStore {
   let closeCalls = 0;
   const diagnostics: readonly TarstateDiagnostic[] = [];
   const storeListeners = new Set<() => void>();
-  const views = new Set<{ readonly listeners: Set<() => void>; refreshes: number }>();
+  const views: { readonly listeners: Set<() => void>; refreshes: number; snapshotReads: number }[] = [];
   const source: RelationSource = {
     relationNames: ['items'],
     rows: (relationRef) => relationRef.name === 'items' ? rows : []
@@ -396,16 +531,19 @@ function createFakeItemStore(initialRows: readonly ItemRow[]): FakeItemStore {
   }) as Store['commit'];
   const createView = <Row,>(query: Query<Row>): StoreView<Row> => {
     const key = queryKey(query);
-    const viewState = { listeners: new Set<() => void>(), refreshes: 0 };
+    const viewState = { listeners: new Set<() => void>(), refreshes: 0, snapshotReads: 0 };
     const view: StoreView<Row> = {
       query,
       queryKey: key,
-      getSnapshot: () => ({
-        rows: rows as readonly Row[],
-        diagnostics,
-        revision,
-        queryKey: key
-      }),
+      getSnapshot: () => {
+        viewState.snapshotReads += 1;
+        return {
+          rows: rows as readonly Row[],
+          diagnostics,
+          revision,
+          queryKey: key
+        };
+      },
       subscribe: (listener) => {
         viewState.listeners.add(listener);
         return () => {
@@ -418,7 +556,7 @@ function createFakeItemStore(initialRows: readonly ItemRow[]): FakeItemStore {
       }
     };
 
-    views.add(viewState);
+    views.push(viewState);
     return view;
   };
   const store = {
@@ -452,7 +590,12 @@ function createFakeItemStore(initialRows: readonly ItemRow[]): FakeItemStore {
   return {
     store,
     setRows,
-    viewRefreshes: () => Array.from(views).reduce((total, view) => total + view.refreshes, 0)
+    viewRefreshes: () => views.reduce((total, view) => total + view.refreshes, 0),
+    viewStats: () => views.map((view) => ({
+      activeListeners: view.listeners.size,
+      snapshotReads: view.snapshotReads,
+      refreshes: view.refreshes
+    }))
   };
 }
 

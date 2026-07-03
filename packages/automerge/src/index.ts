@@ -106,7 +106,7 @@ type RowPlan = {
   readonly mapping: AnyMapRelation;
   readonly kind: StorageKind;
   readonly before: readonly Row[];
-  rows: Row[];
+  rows: readonly Row[];
   changed: boolean;
 };
 type RowPlanResult =
@@ -190,7 +190,7 @@ export function automergeMapAdapter<
     relationNames,
     ownsRelation: (relationName) => options.relations.some((mapping) => mapping.relation.name === relationName),
     apply: (patches: readonly WritePatch[], applyContext?: AutomergeApplyContext) => {
-      const patchList = Array.from(patches);
+      const patchList = patches;
       const beforeDoc = doc;
       const plans = new Map<string, RowPlan>();
       const context: PatchEvaluationContext<DocumentShape> = {
@@ -484,7 +484,7 @@ function getOrCreatePlan<DocumentShape extends object>(
     mapping,
     kind: collection.kind,
     before: collection.rows,
-    rows: collection.rows.map(cloneRow),
+    rows: collection.rows,
     changed: false
   };
   plans.set(mapping.relation.name, plan);
