@@ -267,3 +267,15 @@ export type {
   WriteInput,
   WritePatch
 } from './write.js';
+
+export { index } from './materialization.js';
+export type {
+  MaterializedBtreeIndex,
+  MaterializedHashIndex,
+  MaterializedIndex,
+  MaterializedIndexBase,
+  MaterializedIndexBucket,
+  MaterializedIndexKind,
+  MaterializedSetIndex,
+  MaterializedUniqueIndex
+} from './materialization.js';

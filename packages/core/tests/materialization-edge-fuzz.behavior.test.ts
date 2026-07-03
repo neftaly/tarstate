@@ -5,6 +5,7 @@ import { demat, explainMaterialization, mat } from '@tarstate/core/materializati
 import {
   aggregate,
   asc,
+  avg,
   clauses,
   count,
   desc,
@@ -13,6 +14,8 @@ import {
   from,
   join,
   limit,
+  max,
+  min,
   pipe,
   project,
   sort,
@@ -35,6 +38,9 @@ const totalsByAccount = pipe(
     aggregates: {
       entryCount: count(),
       postedCount: count(eq(entry.posted, value(true))),
+      lowest: min(entry.amount),
+      highest: max(entry.amount),
+      average: avg(entry.amount),
       total: sum(entry.amount)
     }
   }),

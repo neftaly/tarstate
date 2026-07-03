@@ -1,4 +1,8 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
+import {
+  index as rootMaterializedIndex,
+  type MaterializedIndex as RootMaterializedIndex
+} from '@tarstate/core';
 import * as constraintsApi from '@tarstate/core/constraints';
 import {
   check,
@@ -37,7 +41,10 @@ import {
 import { type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
 import {
   demat,
+  index as materializedIndex,
   mat,
+  type MaterializedHashIndex,
+  type MaterializedIndex,
   type MaterializationInput,
   type MaterializedDb
 } from '@tarstate/core/materialization';
@@ -52,6 +59,7 @@ import {
   field,
   from,
   gt,
+  hash,
   isMissing,
   isNull,
   join,
@@ -332,6 +340,34 @@ describe('public API contracts', () => {
       // @ts-expect-error mat inputs are query/constraint/metadata values, not loose options objects.
       mat(openingDb, { id: 'entries' });
     void invalidMaterializationInput;
+  });
+
+  it('exports materialized index helper types from root and materialization subpath', () => {
+    const entry = as(schema.entries, 'entry');
+    const indexedEntries = pipe(
+      from(entry),
+      project({
+        id: entry.id,
+        accountId: entry.accountId,
+        amount: entry.amount
+      }),
+      hash(field<string>('row', 'accountId'))
+    );
+    const db = mat(openingDb, indexedEntries);
+    const readIndex = () => materializedIndex(db, indexedEntries);
+    const readRootIndex = () => rootMaterializedIndex(db, indexedEntries);
+    type IndexedEntry = QueryRow<typeof indexedEntries>;
+
+    expectTypeOf<ReturnType<typeof readIndex>>().toEqualTypeOf<MaterializedIndex<IndexedEntry> | undefined>();
+    expectTypeOf<ReturnType<typeof readRootIndex>>().toEqualTypeOf<RootMaterializedIndex<IndexedEntry> | undefined>();
+    expectTypeOf<RootMaterializedIndex<IndexedEntry>>().toEqualTypeOf<MaterializedIndex<IndexedEntry>>();
+
+    const raw = readIndex();
+    expect(raw?.op).toBe('hash');
+    if (raw?.op !== 'hash') throw new Error('expected hash index');
+    expectTypeOf<typeof raw>().toMatchTypeOf<MaterializedHashIndex<IndexedEntry>>();
+    expect(raw.lookup('cash').map((row) => row.id)).toEqual(['e1']);
+    expect(readRootIndex()?.op).toBe('hash');
   });
 
   it('adds Relic-shaped helper signatures without evaluator behavior', () => {

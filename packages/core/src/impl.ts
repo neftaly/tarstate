@@ -1259,15 +1259,31 @@ export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, a
 }
 export function qMany<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchRows<Queries> {
   const results: Record<string, readonly unknown[]> = {};
-  for (const [name, target] of Object.entries(queries)) {
-    results[name] = q(dbValue, queryBatchTargetQuery(target), options);
+  for (const [name, result] of Object.entries(qManyResult(dbValue, queries, options))) {
+    results[name] = result.rows;
   }
   return results as QueryBatchRows<Queries>;
 }
 export function qManyResult<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchResult<Queries> {
   const results: Record<string, QueryResult<unknown>> = {};
+  const cache = canReuseQueryBatchResults(options) ? new Map<string, QueryResult<unknown>>() : undefined;
   for (const [name, target] of Object.entries(queries)) {
-    results[name] = qResult(dbValue, queryBatchTargetQuery(target), options);
+    const queryValue = queryBatchTargetQuery(target);
+    let cacheKey: string | undefined;
+    if (cache !== undefined) {
+      cacheKey = queryBatchReuseKey(queryValue);
+      if (cacheKey !== undefined) {
+        const cached = cache.get(cacheKey);
+        if (cached !== undefined) {
+          results[name] = replayQueryBatchResult(cached, options);
+          continue;
+        }
+      }
+    }
+
+    const result = qResult(dbValue, queryValue, options);
+    if (cache !== undefined && cacheKey !== undefined) cache.set(cacheKey, result);
+    results[name] = result;
   }
   return results as QueryBatchResult<Queries>;
 }
@@ -1674,6 +1690,39 @@ export type MaterializationMaintainResult<DbValue extends Db = Db, Row = unknown
 };
 export type MaterializationRangeBound<Value = unknown> = RelationRangeBound<Value>;
 export type MaterializationRange<Value = unknown> = { readonly lower?: MaterializationRangeBound<Value>; readonly upper?: MaterializationRangeBound<Value> };
+export type MaterializedIndexKind = 'set' | 'hash' | 'btree' | 'uniqueIndex';
+export type MaterializedIndexBucket<Row = unknown, Value = unknown> = {
+  readonly value: Value;
+  readonly rows: readonly Row[];
+};
+export type MaterializedIndexBase<Row = unknown, Kind extends MaterializedIndexKind = MaterializedIndexKind> = {
+  readonly op: Kind;
+  readonly id: string;
+  readonly queryKey: string;
+  readonly rows: readonly Row[];
+};
+export type MaterializedSetIndex<Row = unknown> = MaterializedIndexBase<Row, 'set'>;
+export type MaterializedHashIndex<Row = unknown, Value = unknown> = MaterializedIndexBase<Row, 'hash'> & {
+  readonly field: string;
+  readonly buckets: readonly MaterializedIndexBucket<Row, Value>[];
+  readonly lookup: (value: Value) => readonly Row[];
+};
+export type MaterializedBtreeIndex<Row = unknown, Value = unknown> = MaterializedIndexBase<Row, 'btree'> & {
+  readonly field: string;
+  readonly buckets: readonly MaterializedIndexBucket<Row, Value>[];
+  readonly range: (range?: MaterializationRange<Value>) => readonly Row[];
+};
+export type MaterializedUniqueIndex<Row = unknown, Value = unknown> = MaterializedIndexBase<Row, 'uniqueIndex'> & {
+  readonly field: string;
+  readonly buckets: readonly MaterializedIndexBucket<Row, Value>[];
+  readonly get: (value: Value) => Row | undefined;
+  readonly lookup: (value: Value) => readonly Row[];
+};
+export type MaterializedIndex<Row = unknown> =
+  | MaterializedSetIndex<Row>
+  | MaterializedHashIndex<Row>
+  | MaterializedBtreeIndex<Row>
+  | MaterializedUniqueIndex<Row>;
 export type MaterializedQueryResult<Row = unknown> = QueryResult<Row> & { readonly materialized: boolean };
 export type MaterializationInput<Row = unknown> =
   | Query<Row>
@@ -1766,6 +1815,22 @@ export const materializedRowsForQuery = <Row = unknown>(input: unknown, query: Q
   const metadata = materializationForQuery(input, query);
   return metadata === undefined ? undefined : materializedRowsFor<Row>(input, metadata.id);
 };
+export function index<Row = unknown>(input: unknown, query: Query<Row>): MaterializedIndex<Row> | undefined {
+  const metadata = materializationForQuery(input, query);
+  if (metadata === undefined) return undefined;
+
+  const state = materializedStateFor(input);
+  const rows = state.rows.get(metadata.id) as readonly Row[] | undefined;
+  if (rows === undefined) return undefined;
+
+  const base = materializedIndexBase(metadata as MaterializationMetadata<Row>, rows);
+  const indexOp = materializedIndexKindForQuery(query);
+  if (indexOp === undefined) return Object.freeze({ ...base, op: 'set' }) as MaterializedSetIndex<Row>;
+
+  const materializedIndex = materializedInternalIndexForQuery(state, metadata.id, query, indexOp);
+  if (materializedIndex === undefined) return undefined;
+  return materializedIndexSnapshot(base, materializedIndex);
+}
 export function readMaterializedQuery<Row>(input: unknown, query: Query<Row>): MaterializedQueryResult<Row> {
   const rows = materializedRowsForQuery<Row>(input, query);
   if (rows !== undefined) return { rows, diagnostics: [], materialized: true };
@@ -1794,6 +1859,148 @@ export const materializedSourceFor = (input: unknown): RelationSource | undefine
     rangeLookup: (lookupValue) => materializedIndexRangeLookup(state, lookupValue) ?? fallback.rangeLookup?.(lookupValue)
   };
 };
+
+function materializedIndexBase<Row>(
+  metadata: MaterializationMetadata<Row>,
+  rows: readonly Row[]
+): Omit<MaterializedIndexBase<Row>, 'op'> {
+  return {
+    id: metadata.id,
+    queryKey: metadata.queryKey,
+    rows: frozenArray(rows)
+  };
+}
+
+function materializedIndexKindForQuery<Row>(query: Query<Row>): InternalMaterializationIndexKind | undefined {
+  switch (query.data.op) {
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+      return query.data.op;
+    default:
+      return undefined;
+  }
+}
+
+function materializedInternalIndexForQuery<Row>(
+  state: InternalMaterializationState,
+  id: string,
+  query: Query<Row>,
+  op: InternalMaterializationIndexKind
+): InternalMaterializationIndex | undefined {
+  const finalFields = finalRowFieldExpressions(query.data, query.relations);
+  const spec = materializationIndexSpecFromData(query.data, finalFields);
+  const internalSpec = spec === undefined ? undefined : internalMaterializationIndexSpec(spec);
+  if (internalSpec === undefined || internalSpec.op !== op) return undefined;
+  return state.aux.get(id)?.indexes?.find((item) =>
+    item.op === internalSpec.op && item.field === internalSpec.field);
+}
+
+function materializedIndexSnapshot<Row>(
+  base: Omit<MaterializedIndexBase<Row>, 'op'>,
+  internal: InternalMaterializationIndex
+): MaterializedIndex<Row> {
+  switch (internal.op) {
+    case 'hash':
+      return materializedHashIndexSnapshot(base, internal);
+    case 'btree':
+      return materializedBtreeIndexSnapshot(base, internal);
+    case 'uniqueIndex':
+      return materializedUniqueIndexSnapshot(base, internal);
+  }
+}
+
+function materializedHashIndexSnapshot<Row, Value = unknown>(
+  base: Omit<MaterializedIndexBase<Row>, 'op'>,
+  internal: InternalMaterializationIndex
+): MaterializedHashIndex<Row, Value> {
+  const fieldName = internal.field;
+  const buckets = materializedIndexBucketsSnapshot<Row, Value>(internal);
+  const bucketMap = materializedIndexBucketMap(buckets);
+  return Object.freeze({
+    ...base,
+    op: 'hash',
+    field: fieldName,
+    buckets,
+    lookup: (value: Value) => materializedIndexLookupRows(bucketMap, fieldName, value)
+  });
+}
+
+function materializedBtreeIndexSnapshot<Row, Value = unknown>(
+  base: Omit<MaterializedIndexBase<Row>, 'op'>,
+  internal: InternalMaterializationIndex
+): MaterializedBtreeIndex<Row, Value> {
+  const buckets = materializedIndexBucketsSnapshot<Row, Value>(internal, { ordered: true });
+  return Object.freeze({
+    ...base,
+    op: 'btree',
+    field: internal.field,
+    buckets,
+    range: (range: MaterializationRange<Value> = {}) => materializedIndexRangeRowsFromBuckets(buckets, range)
+  });
+}
+
+function materializedUniqueIndexSnapshot<Row, Value = unknown>(
+  base: Omit<MaterializedIndexBase<Row>, 'op'>,
+  internal: InternalMaterializationIndex
+): MaterializedUniqueIndex<Row, Value> {
+  const fieldName = internal.field;
+  const buckets = materializedIndexBucketsSnapshot<Row, Value>(internal);
+  const bucketMap = materializedIndexBucketMap(buckets);
+  const lookup = (value: Value): readonly Row[] => materializedIndexLookupRows(bucketMap, fieldName, value);
+  return Object.freeze({
+    ...base,
+    op: 'uniqueIndex',
+    field: fieldName,
+    buckets,
+    get: (value: Value) => lookup(value)[0],
+    lookup
+  });
+}
+
+function materializedIndexBucketsSnapshot<Row, Value = unknown>(
+  internal: InternalMaterializationIndex,
+  options: { readonly ordered?: boolean } = {}
+): readonly MaterializedIndexBucket<Row, Value>[] {
+  const buckets = options.ordered === true && internal.orderedBuckets !== undefined
+    ? internal.orderedBuckets
+    : Array.from(internal.buckets.values());
+  return frozenArray(buckets.map((bucket) => Object.freeze({
+    value: bucket.value as Value,
+    rows: frozenArray(bucket.entries.map((entry) => entry.row as Row))
+  })));
+}
+
+function materializedIndexBucketMap<Row, Value>(
+  buckets: readonly MaterializedIndexBucket<Row, Value>[]
+): ReadonlyMap<string, MaterializedIndexBucket<Row, Value>> {
+  return new Map(buckets.map((bucket) => [stableKey(bucket.value), bucket]));
+}
+
+function materializedIndexLookupRows<Row, Value>(
+  buckets: ReadonlyMap<string, MaterializedIndexBucket<Row, Value>>,
+  fieldName: string,
+  valueValue: Value
+): readonly Row[] {
+  const bucket = buckets.get(stableKey(valueValue));
+  if (bucket === undefined) return frozenArray([]);
+  return frozenArray(bucket.rows.filter((rowValue) =>
+    isRecord(rowValue) && Object.is(rowValue[fieldName], valueValue)));
+}
+
+function materializedIndexRangeRowsFromBuckets<Row, Value>(
+  buckets: readonly MaterializedIndexBucket<Row, Value>[],
+  range: MaterializationRange<Value>
+): readonly Row[] {
+  return frozenArray(buckets
+    .filter((bucket) => materializationRangeContainsValue(bucket.value, range))
+    .flatMap((bucket) => bucket.rows));
+}
+
+function frozenArray<Value>(values: readonly Value[]): readonly Value[] {
+  return Object.freeze([...values]);
+}
+
 export function maintainMaterializationSnapshots<Row = unknown>(
   before?: unknown,
   after?: unknown,
@@ -1944,11 +2151,13 @@ type IncrementalJoinShape = {
   readonly left: IncrementalJoinSide;
   readonly right: IncrementalJoinSide;
 };
+type IncrementalAggregateMaintenanceStrategy = 'accumulator' | 'affectedGroups';
 type IncrementalAggregateShape = {
   readonly data: QueryData;
   readonly input: QueryData;
   readonly relation: RelationRef;
   readonly groupIdentity: MaterializationRowIdentity;
+  readonly strategy: IncrementalAggregateMaintenanceStrategy;
 };
 const MATERIALIZATION_MAINTENANCE_AUX: unique symbol = Symbol('tarstate.materializationMaintenanceAux');
 type IncrementalTopNShape = {
@@ -2246,17 +2455,19 @@ function maintainAggregateMaterializationIncrementally<Row>(
   evaluateOptions: EvaluateOptions
 ): IncrementalMaterializationResult<Row> {
   const diagnostics: TarstateDiagnostic[] = [];
-  const accumulated = maintainAggregateMaterializationWithAccumulator(
-    target,
-    query,
-    previousRows,
-    relationDeltasForQuery,
-    support,
-    aggregateShape,
-    evaluateOptions,
-    diagnostics
-  );
-  if (accumulated !== undefined) return accumulated;
+  if (aggregateShape.strategy === 'accumulator') {
+    const accumulated = maintainAggregateMaterializationWithAccumulator(
+      target,
+      query,
+      previousRows,
+      relationDeltasForQuery,
+      support,
+      aggregateShape,
+      evaluateOptions,
+      diagnostics
+    );
+    if (accumulated !== undefined) return accumulated;
+  }
 
   const affected = affectedAggregateGroupKeys(aggregateShape, query.relations, relationDeltasForQuery, evaluateOptions, diagnostics);
   if (!affected.supported) return { ...affected, diagnostics: [...diagnostics, ...affected.diagnostics] };
@@ -3173,7 +3384,7 @@ function materializationRangeUpperIndex(
   return start;
 }
 
-function materializationRangeContainsValue(valueValue: unknown, lookupValue: RelationRangeLookup): boolean {
+function materializationRangeContainsValue(valueValue: unknown, lookupValue: MaterializationRange): boolean {
   if (lookupValue.lower !== undefined) {
     const comparisonValue = compareValues(valueValue, lookupValue.lower.value);
     if (comparisonValue < 0 || (comparisonValue === 0 && !lookupValue.lower.inclusive)) return false;
@@ -3465,8 +3676,8 @@ function incrementalAggregateMaterializationShape(
     return unsupportedIncrementalShape('aggregate groupBy expressions are not incrementally maintained');
   }
 
-  const aggregateProjectionSupport = supportedIncrementalAggregateProjection(data.aggregates);
-  if (!aggregateProjectionSupport.supported) return aggregateProjectionSupport;
+  const aggregateStrategy = incrementalAggregateMaintenanceStrategy(data.aggregates);
+  if (!aggregateStrategy.supported) return aggregateStrategy;
 
   const input = queryDataFrom(data.input);
   if (input === undefined) return unsupportedIncrementalShape('incremental maintenance requires a nested input query');
@@ -3489,15 +3700,17 @@ function incrementalAggregateMaterializationShape(
       data,
       input,
       relation: nested.relation,
-      groupIdentity
+      groupIdentity,
+      strategy: aggregateStrategy.strategy
     }
   };
 }
 
-function supportedIncrementalAggregateProjection(
+function incrementalAggregateMaintenanceStrategy(
   input: unknown
-): { readonly supported: true } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
+): { readonly supported: true; readonly strategy: IncrementalAggregateMaintenanceStrategy } | { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
   const projection = projectionFrom(input);
+  let strategy: IncrementalAggregateMaintenanceStrategy = 'accumulator';
   for (const projectionExpr of Object.values(projection)) {
     const data = unwrapOptionalProjection(projectionExpr);
     if (!isExpr(data) || data.op !== 'aggregateCall') {
@@ -3515,10 +3728,24 @@ function supportedIncrementalAggregateProjection(
       if (args.length === 1 && trustedRowLocalExpr(args[0])) continue;
       return unsupportedIncrementalShape('sum aggregate expressions are not incrementally maintained');
     }
+    if (fn === 'avg') {
+      if (args.length === 1 && trustedRowLocalExpr(args[0])) {
+        strategy = 'affectedGroups';
+        continue;
+      }
+      return unsupportedIncrementalShape('avg aggregate expressions are not incrementally maintained');
+    }
+    if (fn === 'min' || fn === 'max') {
+      if (args.length === 1 && trustedRowLocalExpr(args[0])) {
+        strategy = 'affectedGroups';
+        continue;
+      }
+      return unsupportedIncrementalShape(`${fn} aggregate expressions are not incrementally maintained`);
+    }
 
     return unsupportedIncrementalShape(`aggregate function "${fn}" is not incrementally maintained`);
   }
-  return { supported: true };
+  return { supported: true, strategy };
 }
 
 function incrementalJoinMaterializationShape(
@@ -4244,7 +4471,7 @@ function trustedIncrementalQueryExpressions(data: QueryData): boolean {
         && nestedTrusted();
     case 'aggregate':
       return trustedProjectionExpressions(data.groupBy)
-        && supportedIncrementalAggregateProjection(data.aggregates).supported
+        && incrementalAggregateMaintenanceStrategy(data.aggregates).supported
         && nestedTrusted();
     case 'join': {
       if (data.kind !== 'inner' || isPredicateData(data.on) || equiJoinClauseMapFrom(data.on) === undefined) return false;
@@ -6307,6 +6534,43 @@ function queryForTarget<Row>(target: Query<Row> | RelationRef): Query<Row> {
 
 function queryBatchTargetQuery(target: QueryBatchTarget): Query<unknown> | RelationRef {
   return isRecord(target) && 'q' in target ? target.q as Query<unknown> | RelationRef : target as Query<unknown> | RelationRef;
+}
+
+function queryBatchReuseKey(target: Query<unknown> | RelationRef): string | undefined {
+  const queryObject = queryForTarget(target);
+  if (queryContainsHostFunction(queryObject.data)) return undefined;
+  return `${isQuery(target) ? 'query' : 'relation'}:${queryKey(queryObject)}`;
+}
+
+function canReuseQueryBatchResults(options: DbQueryOptions): boolean {
+  return options.mapRows === undefined
+    && options.into === undefined
+    && options.functions === undefined
+    && !hasFunctionSortKey(options.sort)
+    && !hasFunctionSortKey(options.rsort);
+}
+
+function hasFunctionSortKey(sortValue: DbQuerySort | undefined): boolean {
+  if (sortValue === undefined) return false;
+  const keys = Array.isArray(sortValue) ? sortValue : [sortValue];
+  return keys.some((key) => typeof key === 'function');
+}
+
+function queryContainsHostFunction(input: unknown, seen: WeakSet<object> = new WeakSet()): boolean {
+  if (input === null || typeof input !== 'object') return false;
+  if (seen.has(input)) return false;
+  seen.add(input);
+  if (isHostFunction(input)) return true;
+  if (Array.isArray(input)) return input.some((item) => queryContainsHostFunction(item, seen));
+  if (!isRecord(input)) return false;
+  return Object.values(input).some((valueValue) => queryContainsHostFunction(valueValue, seen));
+}
+
+function replayQueryBatchResult<Row>(result: QueryResult<Row>, options: DbQueryOptions): QueryResult<Row> {
+  return finishQueryResult({
+    rows: [...result.rows],
+    diagnostics: [...result.diagnostics]
+  }, options);
 }
 
 function isQueryBatch(input: unknown): input is QueryBatch {

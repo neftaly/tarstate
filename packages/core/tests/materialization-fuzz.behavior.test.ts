@@ -5,6 +5,7 @@ import { demat, explainMaterialization, mat, materializedRelationForQuery, mater
 import {
   aggregate,
   asc,
+  avg,
   btree,
   clauses,
   count,
@@ -18,6 +19,8 @@ import {
   join,
   keyBy,
   limit,
+  max,
+  min,
   pipe,
   project,
   qualify,
@@ -155,6 +158,9 @@ const supportedVariants: readonly SupportedVariant[] = [
         groupBy: { accountId: entry.accountId },
         aggregates: {
           entryCount: count(),
+          lowest: min(entry.amount),
+          highest: max(entry.amount),
+          average: avg(entry.amount),
           total: sum(entry.amount)
         }
       }),
