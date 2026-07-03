@@ -101,6 +101,81 @@ describe('Relic compatibility parser', () => {
     ]);
   });
 
+  it('parses expand, rename, qualify, and rel/get query forms', () => {
+    const query = fromRelicQuery([
+      [':const', [{
+        id: 'o1',
+        lines: [{ sku: 'tea', qty: 2 }, { sku: 'milk', qty: 1 }]
+      }]],
+      [':expand', [[':sku', ':qty'], ':lines']],
+      [':rename', { ':sku': ':itemSku' }],
+      [':qualify', 'order'],
+      [':select',
+        [':sku', ['rel/get', ':order', ':itemSku']],
+        [':qty', ['::rel/get', ':order', ':qty']]],
+      [':sort', ':sku']
+    ], schema);
+
+    expect(q(createDb(), query)).toEqual([
+      { sku: 'milk', qty: 1 },
+      { sku: 'tea', qty: 2 }
+    ]);
+  });
+
+  it('parses sort and sort-limit query forms', () => {
+    const sorted = fromRelicQuery([
+      [':from', ':entries'],
+      [':sort', [':amount', ':desc'], ':id'],
+      [':select', ':id', ':amount']
+    ], schema);
+    const limited = fromRelicQuery([
+      [':from', ':entries'],
+      [':sort-limit', 2, [':amount', ':asc']],
+      [':select', ':id', ':amount']
+    ], schema);
+
+    expect(q(makeDb(), sorted)).toEqual([
+      { id: 'e1', amount: 120 },
+      { id: 'e4', amount: 0 },
+      { id: 'e3', amount: -5 },
+      { id: 'e2', amount: -120 }
+    ]);
+    expect(q(makeDb(), limited)).toEqual([
+      { id: 'e2', amount: -120 },
+      { id: 'e3', amount: -5 }
+    ]);
+  });
+
+  it('parses index metadata query clauses', () => {
+    const indexed = [
+      [fromRelicQuery([[':from', ':entries'], [':hash', ':accountId']], schema), 'hash'],
+      [fromRelicQuery([[':from', ':entries'], [':btree', ':amount']], schema), 'btree'],
+      [fromRelicQuery([[':from', ':entries'], [':unique', ':id']], schema), 'uniqueIndex']
+    ] as const;
+
+    for (const [query, op] of indexed) {
+      expect(query.data.op).toBe(op);
+      expect(q(makeDb(), pipe(query, byId)).map((row) => row.id)).toEqual(['e1', 'e2', 'e3', 'e4']);
+    }
+  });
+
+  it('parses documented lookup forms over indexed queries', () => {
+    const indexed = [
+      [':from', ':entries'],
+      [':hash', ':accountId']
+    ] as const;
+    const query = fromRelicQuery([
+      [':lookup', indexed, 'cash'],
+      [':select', ':id', ':accountId'],
+      [':sort', ':id']
+    ], schema);
+
+    expect(q(makeDb(), query)).toEqual([
+      { id: 'e1', accountId: 'cash' },
+      { id: 'e4', accountId: 'cash' }
+    ]);
+  });
+
   it('parses transaction vectors', () => {
     const db = transact(makeDb(), fromRelicTx([
       [':insert', ':entries', { id: 'e5', accountId: 'cash', amount: 15, posted: true }],
@@ -145,6 +220,75 @@ describe('Relic compatibility parser', () => {
     ]);
   });
 
+  it('parses insert-or-merge and insert-or-update transaction forms', () => {
+    const db = transact(makeDb(), fromRelicTx([
+      [':insert-or-merge', ':entries', ':*', {
+        id: 'e1',
+        accountId: 'sales',
+        amount: 130,
+        memo: 'merged all',
+        posted: false
+      }],
+      [':insert-or-merge', ':entries', [':amount'], {
+        id: 'e3',
+        accountId: 'cash',
+        amount: -6,
+        memo: 'ignored',
+        posted: false
+      }],
+      [':insert-or-update', ':entries', { memo: 'updated', posted: false }, {
+        id: 'e2',
+        accountId: 'sales',
+        amount: -999,
+        posted: true
+      }]
+    ], schema));
+
+    const rows = q(
+      db,
+      pipe(
+        fromRelicQuery([[':from', ':entries'], [':select', ':id', ':accountId', ':amount', ':memo', ':posted']], schema),
+        sort(asc(entry.id))
+      )
+    );
+
+    expect(rows).toEqual([
+      { id: 'e1', accountId: 'sales', amount: 130, memo: 'merged all', posted: false },
+      { id: 'e2', accountId: 'sales', amount: -120, memo: 'updated', posted: false },
+      { id: 'e3', accountId: 'fees', amount: -6, memo: null, posted: true },
+      { id: 'e4', accountId: 'cash', amount: 0, memo: undefined, posted: false }
+    ]);
+  });
+
+  it('parses expression helpers', () => {
+    const query = fromRelicQuery([
+      [':const', [
+        { id: 'a', amount: 2, meta: { kind: 'asset' }, memo: 'cash' },
+        { id: 'b', amount: -1, meta: {}, memo: null }
+      ]],
+      [':select',
+        ':id',
+        [':bucket', [':if', ['>=', ':amount', 0], 'non-negative', 'negative']],
+        [':kind', ['::rel/get', ':meta', ':kind']]],
+      [':sort', ':id']
+    ], schema);
+    const nilSafe = fromRelicExpr([':?', 'text.upper', ':memo'], {
+      functions: {
+        'text.upper': (input) => String(input).toUpperCase()
+      }
+    });
+
+    expect(q(createDb(), query)).toEqual([
+      { id: 'a', bucket: 'non-negative', kind: 'asset' },
+      { id: 'b', bucket: 'negative', kind: undefined }
+    ]);
+    expect(nilSafe).toMatchObject({
+      op: 'callMaybe',
+      fn: { kind: 'hostFunction', name: 'text.upper' },
+      args: [{ op: 'field', alias: 'row', field: 'memo' }]
+    });
+  });
+
   it('exposes expression parsing and explicit unsupported-form errors', () => {
     expect(fromRelicExpr(['=', ':id', 'e1'])).toEqual({
       op: 'eq',
@@ -152,11 +296,15 @@ describe('Relic compatibility parser', () => {
       right: { op: 'value', value: 'e1' }
     });
     expectRelicError(
-      () => fromRelicQuery([[':lookup', ':entries', ':id', 'e1']], schema),
+      () => fromRelicQuery([[':from', ':entries'], [':expand', [':*', ':memo']]], schema),
       'relic_unsupported'
     );
     expectRelicError(
-      () => fromRelicTx([':insert-or-merge', ':entries', ':*', { id: 'e1' }], schema),
+      () => fromRelicExpr(['rel/sel', ':entries', { accountId: ':id' }]),
+      'relic_unsupported'
+    );
+    expectRelicError(
+      () => fromRelicTx([':insert-or-merge', ':entries', ':memo', { id: 'e1' }], schema),
       'relic_unsupported'
     );
     expectRelicError(

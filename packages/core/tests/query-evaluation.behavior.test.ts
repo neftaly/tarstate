@@ -1,5 +1,5 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { createDb, q, qMany, qManyResult, qResult, type Db } from '@tarstate/core/db';
+import { createDb, q, qMany, qManyResult, qResult } from '@tarstate/core/db';
 import { mat } from '@tarstate/core/materialization';
 import {
   aggregate,
@@ -59,7 +59,6 @@ import {
   entry,
   makeDb,
   openingAccounts,
-  openingEntries,
   schema,
   type Account,
   type Entry
@@ -104,54 +103,6 @@ describe('query evaluation behavior', () => {
       positives: { rows: [{ id: 'e1', amount: 120 }], diagnostics: [] },
       wrappedTotals: { rows: [{ entryCount: 4, total: -5 }], diagnostics: [] }
     });
-  });
-
-  it('reuses exact duplicate query keys within safe query batches', () => {
-    const countedEntriesDb = () => {
-      let entryReads = 0;
-      const entryRows = openingEntries.map((rowValue) => ({ ...rowValue }));
-      const data: Record<string, readonly unknown[]> = {
-        accounts: openingAccounts.map((rowValue) => ({ ...rowValue }))
-      };
-      Object.defineProperty(data, 'entries', {
-        enumerable: true,
-        get: () => {
-          entryReads += 1;
-          return entryRows;
-        }
-      });
-      return {
-        db: { data, env: {} } satisfies Db,
-        reads: () => entryReads
-      };
-    };
-    const postedEntryIds = () => pipe(
-      from(entry),
-      where(eq(entry.posted, value(true))),
-      project({ id: entry.id })
-    );
-    const batch = {
-      first: postedEntryIds(),
-      second: postedEntryIds(),
-      wrapped: { q: postedEntryIds() }
-    };
-    const expectedRows = [{ id: 'e1' }, { id: 'e2' }, { id: 'e3' }];
-
-    const resultDb = countedEntriesDb();
-    expect(qManyResult(resultDb.db, batch)).toEqual({
-      first: { rows: expectedRows, diagnostics: [] },
-      second: { rows: expectedRows, diagnostics: [] },
-      wrapped: { rows: expectedRows, diagnostics: [] }
-    });
-    expect(resultDb.reads()).toBe(1);
-
-    const rowsDb = countedEntriesDb();
-    expect(qMany(rowsDb.db, batch)).toEqual({
-      first: expectedRows,
-      second: expectedRows,
-      wrapped: expectedRows
-    });
-    expect(rowsDb.reads()).toBe(1);
   });
 
   it('applies q option sorting and row mapping across single and batch reads', () => {
@@ -211,23 +162,6 @@ describe('query evaluation behavior', () => {
       mapRows: (rows) => rows.map((row) => row.id),
       into: (rows) => rows.join('|')
     })).toBe('e2|e3|e4|e1');
-  });
-
-  it('does not reuse duplicate query keys when row transform options are function-bearing', () => {
-    const entryIds = () => pipe(
-      from(entry),
-      sort(asc(entry.id)),
-      project({ id: entry.id })
-    );
-    let mapCalls = 0;
-
-    expect(qManyResult(makeDb(), { first: entryIds(), second: entryIds() }, {
-      mapRows: (rows) => [{ call: ++mapCalls, rowCount: rows.length }]
-    })).toEqual({
-      first: { rows: [{ call: 1, rowCount: 4 }], diagnostics: [] },
-      second: { rows: [{ call: 2, rowCount: 4 }], diagnostics: [] }
-    });
-    expect(mapCalls).toBe(2);
   });
 
   it('applies per-target qMany options and keeps unsafe target transforms out of duplicate cache', () => {

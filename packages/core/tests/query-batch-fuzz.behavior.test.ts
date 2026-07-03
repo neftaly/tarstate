@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { q, qMany, qManyResult, type Db } from '@tarstate/core/db';
-import { asc, call, eq, field, from, gt, hostFn, pipe, project, sort, value, where, type Query } from '@tarstate/core/query';
+import { q, qMany, qManyResult, qResult, type Db, type DbQueryOptions } from '@tarstate/core/db';
+import { mat } from '@tarstate/core/materialization';
+import { asc, call, env, eq, field, from, gt, gte, hostFn, pipe, project, sort, value, where, type Query } from '@tarstate/core/query';
 import { entry, makeDb, openingAccounts, openingEntries, type Entry } from './behavior-fixtures.js';
-import { createSeededRandom } from './fuzz-helpers.js';
+import { chooseSeeded, createSeededRandom } from './fuzz-helpers.js';
 
 type IdRow = {
   readonly id: string;
@@ -89,6 +90,19 @@ describe('qMany seeded duplicate cache behavior', () => {
       expect(hostDb.reads(), `seed ${seed} host reads`).toBe(2);
       expect(hostResult.first.rows.map((row) => row.marker), `seed ${seed} host first markers`).toEqual([1, 2, 3, 4]);
       expect(hostResult.duplicate.rows.map((row) => row.marker), `seed ${seed} host duplicate markers`).toEqual([5, 6, 7, 8]);
+    }
+  });
+
+  it('matches independent reads across generated batch target and option shapes', () => {
+    for (const seed of [3, 8, 13, 21, 34, 55, 89, 144] as const) {
+      const testCase = batchCase(seed);
+
+      expect(qMany(testCase.db, testCase.batch, testCase.options), `seed ${seed} ${testCase.label} rows`).toEqual(
+        expectedBatchRows(testCase.db, testCase.batch, testCase.options)
+      );
+      expect(qManyResult(testCase.db, testCase.batch, testCase.options), `seed ${seed} ${testCase.label} result`).toEqual(
+        expectedBatchResult(testCase.db, testCase.batch, testCase.options)
+      );
     }
   });
 });
@@ -181,4 +195,194 @@ function countedEntriesDb(rows: readonly Entry[] = openingEntries): { readonly d
     db: { data, env: {} } satisfies Db,
     reads: () => entryReads
   };
+}
+
+type AnyBatchTarget =
+  | Query<unknown>
+  | (DbQueryOptions<unknown, unknown, unknown> & { readonly q: Query<unknown> });
+type AnyBatch = Record<string, AnyBatchTarget>;
+type BatchOptions = DbQueryOptions<unknown, unknown>;
+type BatchCase = {
+  readonly label: string;
+  readonly db: Db;
+  readonly batch: AnyBatch;
+  readonly options: BatchOptions;
+};
+
+function batchCase(seed: number): BatchCase {
+  const next = createSeededRandom(seed);
+  const minAmount = chooseSeeded(next, [-120, -5, 0, 1, 50] as const);
+  const projected = () => pipe(
+    from(entry),
+    project({
+      id: entry.id,
+      accountId: entry.accountId,
+      amount: entry.amount,
+      posted: entry.posted
+    })
+  );
+  const envFiltered = () => pipe(
+    from(entry),
+    where(gte(entry.amount, env<number>('minAmount'))),
+    project({
+      id: entry.id,
+      accountId: entry.accountId,
+      amount: entry.amount,
+      posted: entry.posted
+    })
+  );
+  const materializedQuery = projected();
+  const db = seed % 2 === 0 ? mat(makeDb(), materializedQuery) : makeDb();
+
+  switch (seed % 4) {
+    case 0:
+      return {
+        label: 'global-env-and-sort',
+        db,
+        options: { env: { minAmount }, sort: ['accountId', 'id'] },
+        batch: {
+          raw: envFiltered(),
+          wrapped: { q: envFiltered() },
+          targetOverride: { q: envFiltered(), rsort: ['amount', 'id'] }
+        }
+      };
+    case 1:
+      return {
+        label: 'map-rows-and-into',
+        db,
+        options: { env: { minAmount } },
+        batch: {
+          raw: envFiltered(),
+          labels: {
+            q: envFiltered(),
+            sort: ['accountId', 'id'],
+            mapRows: (rows) => rows.map((row) => {
+              const value = idRow(row);
+              return { id: value.id, label: `${value.accountId}:${value.amount}` };
+            })
+          },
+          joinedIds: {
+            q: envFiltered(),
+            sort: 'id',
+            mapRows: (rows) => rows.map((row) => idRow(row).id),
+            into: (rows) => rows.join('|')
+          }
+        }
+      };
+    case 2:
+      return {
+        label: 'materialized-targets',
+        db,
+        options: { sort: ['accountId', 'id'] },
+        batch: {
+          rawMaterialized: materializedQuery,
+          wrappedMaterialized: { q: materializedQuery },
+          descendingMaterialized: { q: materializedQuery, rsort: ['amount', 'id'] }
+        }
+      };
+    default:
+      return {
+        label: 'function-sort-keys',
+        db,
+        options: {},
+        batch: {
+          raw: projected(),
+          functionSorted: {
+            q: projected(),
+            sort: [
+              (row) => idRow(row).accountId ?? '',
+              (row) => idRow(row).id
+            ]
+          },
+          functionReverse: {
+            q: projected(),
+            rsort: (row) => idRow(row).amount ?? 0
+          }
+        }
+      };
+  }
+}
+
+function expectedBatchRows(
+  db: Db,
+  batch: AnyBatch,
+  options: BatchOptions
+): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const [name, target] of Object.entries(batch)) {
+    output[name] = readRows(db, targetQuery(target), targetOptions(target, options));
+  }
+  return output;
+}
+
+function expectedBatchResult(
+  db: Db,
+  batch: AnyBatch,
+  options: BatchOptions
+): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+  for (const [name, target] of Object.entries(batch)) {
+    output[name] = readResult(db, targetQuery(target), targetOptions(target, options));
+  }
+  return output;
+}
+
+function targetQuery(target: AnyBatchTarget): Query<unknown> {
+  return isWrappedTarget(target) ? target.q : target;
+}
+
+function targetOptions(
+  target: AnyBatchTarget,
+  options: BatchOptions
+): DbQueryOptions<unknown, unknown, unknown> {
+  if (!isWrappedTarget(target)) return options;
+  const { q: _query, ...targetOnlyOptions } = target;
+  return { ...options, ...targetOnlyOptions };
+}
+
+function readRows(
+  db: Db,
+  query: Query<unknown>,
+  options: DbQueryOptions<unknown, unknown, unknown>
+): unknown {
+  return hasInto(options)
+    ? q(db, query, options)
+    : q(db, query, options as DbQueryOptions<unknown, unknown>);
+}
+
+function readResult(
+  db: Db,
+  query: Query<unknown>,
+  options: DbQueryOptions<unknown, unknown, unknown>
+): unknown {
+  return hasInto(options)
+    ? qResult(db, query, options)
+    : qResult(db, query, options as DbQueryOptions<unknown, unknown>);
+}
+
+function hasInto(
+  options: DbQueryOptions<unknown, unknown, unknown>
+): options is DbQueryOptions<unknown, unknown, unknown> & { readonly into: (rows: readonly unknown[]) => unknown } {
+  return options.into !== undefined;
+}
+
+function isWrappedTarget(
+  target: AnyBatchTarget
+): target is DbQueryOptions<unknown, unknown, unknown> & { readonly q: Query<unknown> } {
+  return 'q' in target;
+}
+
+function idRow(input: unknown): IdRow {
+  if (!isRecord(input)) throw new TypeError('Expected object row');
+  const id = input.id;
+  if (typeof id !== 'string') throw new TypeError('Expected row id');
+  const output: { id: string; accountId?: string; amount?: number; marker?: number } = { id };
+  if (typeof input.accountId === 'string') output.accountId = input.accountId;
+  if (typeof input.amount === 'number') output.amount = input.amount;
+  if (typeof input.marker === 'number') output.marker = input.marker;
+  return output;
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { q, transact, tryTransact, type DbTransactionContext } from '@tarstate/core/db';
+import { q, setEnvTx, transact, tryTransact, type DbTransactionContext } from '@tarstate/core/db';
 import { type TarstateDiagnostic } from '@tarstate/core/diagnostics';
 import { explainMaterialization, mat, materializedRelationFor } from '@tarstate/core/materialization';
 import { relicChanges, trackTransact } from '@tarstate/core/runtime';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { createRuntimeStore, createStore } from '@tarstate/core/store';
-import { asc, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
-import { type RelationRuntime } from '@tarstate/core/adapter';
+import { asc, env, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
+import { composeRelationRuntimes, type RelationApplyContext, type RelationRuntime } from '@tarstate/core/adapter';
 import {
   attachWatches,
   detachWatches,
@@ -37,6 +37,16 @@ const cashEntryProjection = pipe(
   where(eq(entry.accountId, value('cash'))),
   project({
     id: entry.id,
+    amount: entry.amount
+  })
+);
+
+const envEntryProjection = pipe(
+  from(entry),
+  where(eq(entry.accountId, env<string>('accountId'))),
+  project({
+    id: entry.id,
+    accountId: entry.accountId,
     amount: entry.amount
   })
 );
@@ -447,6 +457,153 @@ describe('watch and store behavior', () => {
         expect.objectContaining({ code: 'runtime_unsupported', message: 'store is closed' })
       ])
     }));
+  });
+
+  it('runtime store applies original patches with the committed transaction env', async () => {
+    const inner = createMemoryRelationRuntime(makeDb().data);
+    const target = inner.target;
+    if (target === undefined) throw new Error('memory runtime target missing');
+    const applyEnvs: (RelationApplyContext['env'] | undefined)[] = [];
+    const runtime = {
+      ...inner,
+      target: {
+        ...target,
+        apply: (patches: readonly WritePatch[], context: RelationApplyContext | undefined) => {
+          applyEnvs.push(context?.env);
+          return target.apply(patches, context);
+        }
+      }
+    } satisfies RelationRuntime<number>;
+    const store = createRuntimeStore({
+      runtime,
+      relations: [schema.accounts, schema.entries],
+      env: { accountId: 'cash' }
+    });
+
+    const commit = await store.commit([
+      setEnvTx({ accountId: 'fees' }),
+      updateByKey(schema.entries, 'e1', { accountId: env<string>('accountId') })
+    ]);
+
+    expect(commit.status).toBe('accepted');
+    expect(applyEnvs).toEqual([{ accountId: 'fees' }]);
+    expect(commit.snapshot.db.env).toEqual({ accountId: 'fees' });
+    expect(store.query(entryList).rows).toEqual([
+      { id: 'e1', accountId: 'fees', amount: 120 },
+      { id: 'e2', accountId: 'sales', amount: -120 },
+      { id: 'e3', accountId: 'fees', amount: -5 },
+      { id: 'e4', accountId: 'cash', amount: 0 }
+    ]);
+
+    store.close();
+  });
+
+  it('runtime store preserves pure env commits without mutating the memory runtime', async () => {
+    const runtime = createMemoryRelationRuntime(makeDb().data);
+    const beforeRuntimeVersion = runtime.snapshot?.().version;
+    const runtimeRevisions: number[] = [];
+    const storeRevisions: number[] = [];
+    const unsubscribeRuntime = runtime.subscribe?.(() => {
+      const runtimeVersion = runtime.snapshot?.().version;
+      if (runtimeVersion !== undefined) runtimeRevisions.push(runtimeVersion);
+    });
+    const store = createRuntimeStore({
+      runtime,
+      relations: [schema.accounts, schema.entries],
+      env: { accountId: 'cash' }
+    });
+    const unsubscribeStore = store.subscribe(() => {
+      storeRevisions.push(store.getSnapshot().revision);
+    });
+
+    const commit = await store.commit(setEnvTx({ accountId: 'sales' }));
+
+    expect(commit).toEqual(expect.objectContaining({
+      status: 'accepted',
+      reflected: true,
+      effects: expect.objectContaining({
+        patches: 0,
+        applied: 0,
+        deltas: [],
+        diagnostics: []
+      }),
+      diagnostics: []
+    }));
+    expect(commit.snapshot.revision).toBe(1);
+    expect(commit.snapshot.db.env).toEqual({ accountId: 'sales' });
+    expect(store.query(envEntryProjection).rows).toEqual([
+      { id: 'e2', accountId: 'sales', amount: -120 }
+    ]);
+    expect(storeRevisions).toEqual([1]);
+    expect(runtime.snapshot?.().version).toBe(beforeRuntimeVersion);
+    expect(runtimeRevisions).toEqual([]);
+
+    unsubscribeStore();
+    unsubscribeRuntime?.();
+    store.close();
+  });
+
+  it('runtime store does not double notify when apply synchronously refreshes from subscription', async () => {
+    const runtime = createMemoryRelationRuntime(makeDb().data);
+    const store = createRuntimeStore({ runtime, relations: [schema.accounts, schema.entries] });
+    const storeRevisions: number[] = [];
+    const unsubscribeStore = store.subscribe(() => {
+      storeRevisions.push(store.getSnapshot().revision);
+    });
+
+    const commit = await store.commit(
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true })
+    );
+
+    expect(commit.status).toBe('accepted');
+    expect(commit.snapshot.revision).toBe(1);
+    expect(store.getSnapshot().revision).toBe(1);
+    expect(storeRevisions).toEqual([1]);
+
+    unsubscribeStore();
+    store.close();
+  });
+
+  it('composed runtime leaves anonymous targets without source relation names unrouted', async () => {
+    const routedPatches: (readonly WritePatch[])[] = [];
+    const runtime = {
+      source: {
+        rows: () => []
+      },
+      target: {
+        apply: (patches: readonly WritePatch[]) => {
+          routedPatches.push([...patches]);
+          return {
+            status: 'accepted' as const,
+            patches: patches.length,
+            applied: patches.length,
+            deltas: [],
+            diagnostics: [],
+            version: 1
+          };
+        }
+      }
+    } satisfies RelationRuntime<number>;
+    const composed = composeRelationRuntimes(runtime);
+    const result = await composed.target?.apply([
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, posted: true })
+    ]);
+
+    expect(composed.target?.ownsRelation?.('entries')).toBe(false);
+    expect(result).toEqual(expect.objectContaining({
+      status: 'rejected',
+      patches: 1,
+      applied: 0,
+      deltas: [],
+      diagnostics: [
+        expect.objectContaining({
+          code: 'runtime_unsupported',
+          relation: 'entries',
+          surface: 'composeRelationRuntimes'
+        })
+      ]
+    }));
+    expect(routedPatches).toEqual([]);
   });
 
   it('runtime store keeps its current snapshot when an adapter rejects original patches', async () => {

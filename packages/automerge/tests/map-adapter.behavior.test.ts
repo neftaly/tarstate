@@ -146,6 +146,22 @@ describe('automerge map adapter', () => {
     void legacyAdapterOptions;
   });
 
+  it('drops ignored storage codec adapter options', () => {
+    const adapterOptions = {
+      doc: workspaceDoc(),
+      relations: taskMapping
+    } satisfies AutomergeMapAdapterOptions<WorkspaceDoc>;
+    const storageOptions = {
+      doc: workspaceDoc(),
+      relations: taskMapping,
+      // @ts-expect-error storage codec options were removed because they were ignored.
+      storage: { codec: 'map-v1' }
+    } satisfies AutomergeMapAdapterOptions<WorkspaceDoc>;
+
+    void adapterOptions;
+    void storageOptions;
+  });
+
   it('checks Automerge relation path roots through the helper', () => {
     const workspacePath = ['workspace', 'tasks'] as const satisfies AutomergeMapPath<WorkspaceDoc>;
     const workspaceMapping = taskMapping satisfies readonly AutomergeMapRelation<typeof schema.tasks, WorkspaceDoc>[];
@@ -233,6 +249,77 @@ describe('automerge map adapter', () => {
       diagnostics: []
     });
     expect(reads).toEqual({ rows: 0, lookup: 1, rangeLookup: 1 });
+  });
+
+  it('reports missing mapped paths and rejects writes without creating them', async () => {
+    const missingMapping = defineWorkspaceRelations([
+      { relation: schema.tasks, path: ['workspace', 'missingTasks'] }
+    ]);
+    const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: missingMapping });
+    const beforeDoc = adapter.getDoc();
+    const beforeHeads = Automerge.getHeads(beforeDoc);
+
+    expect(adapter.source.rows(schema.tasks)).toEqual([]);
+    expect(adapter.source.diagnostics?.()).toEqual([
+      expect.objectContaining({
+        code: 'runtime_unsupported',
+        severity: 'warning',
+        relation: 'tasks'
+      })
+    ]);
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).insert({ id: 'task-2', title: 'Should not create path' })
+    ]);
+
+    expect(result.status).toBe('rejected');
+    expect(result.applied).toBe(0);
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        code: 'runtime_unsupported',
+        relation: 'tasks'
+      })
+    ]);
+    expect(adapter.getDoc()).toBe(beforeDoc);
+    expect(Automerge.getHeads(adapter.getDoc())).toEqual(beforeHeads);
+    expect('missingTasks' in adapter.getDoc().workspace).toBe(false);
+  });
+
+  it('does not inject missing key fields from Automerge map keys', async () => {
+    const doc = Automerge.from({
+      workspace: {
+        tasks: [],
+        labelsById: {
+          'label-1': { name: 'Urgent' }
+        }
+      }
+    }) as unknown as Automerge.Doc<WorkspaceDoc>;
+    const adapter = automergeMapAdapter({ doc, relations: allMappings });
+
+    expect(adapter.source.rows(schema.labels)).toEqual([{ name: 'Urgent' }]);
+    expect(adapter.source.diagnostics?.()).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'field_missing',
+        severity: 'error',
+        relation: 'labels',
+        field: 'id'
+      })
+    ]));
+
+    const result = await adapter.target.apply([
+      write(schema.labels).updateByKey('label-1', { name: 'Later' })
+    ]);
+
+    expect(result.status).toBe('rejected');
+    expect(result.applied).toBe(0);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'field_missing',
+        relation: 'labels',
+        field: 'id'
+      })
+    ]));
+    expect(adapter.source.rows(schema.labels)).toEqual([{ name: 'Urgent' }]);
   });
 
   it('applies key, predicate, and map-v1 writes back to an immutable Automerge doc', async () => {
@@ -426,6 +513,27 @@ describe('automerge map adapter', () => {
         memo: 'Later',
         meta: [{ id: 'label-2', name: 'Later' }]
       }
+    ]);
+  });
+
+  it('uses apply context env for expression-valued writes', async () => {
+    const adapter = automergeMapAdapter({
+      doc: workspaceDoc(),
+      relations: taskMapping,
+      env: { prefix: 'Adapter' }
+    });
+    const join = hostFn<string>('text.join', (...parts) => parts.map(String).join(''));
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).updateByKey('task-1', {
+        title: call(join, env<string>('prefix'), value(': '), field<string>('tasks', 'title'))
+      })
+    ], { env: { prefix: 'Context' } });
+
+    expect(result.status).toBe('accepted');
+    expect(result.diagnostics).toEqual([]);
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-1', title: 'Context: Draft' }
     ]);
   });
 
@@ -650,6 +758,36 @@ describe('automerge map adapter', () => {
       relation: 'tasks'
     });
     expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+  });
+
+  it('rejects non-object update output instead of accepting a no-op', async () => {
+    const taskId = field('tasks', 'id');
+    const cases = [
+      write(schema.tasks).updateByKey('task-1', null as never),
+      write(schema.tasks).update(eq(taskId, 'task-1'), 'not an update' as never),
+      write(schema.tasks).insertOrUpdate({ id: 'task-1', title: 'Incoming' }, { update: 42 as never }),
+      write(schema.tasks).insertOrUpdate({ id: 'task-1', title: 'Incoming' }, { update: (() => null) as never }),
+      write(schema.tasks).insertOrMerge({ id: 'task-1', title: 'Incoming' }, { merge: (() => 'no row') as never })
+    ];
+
+    for (const patch of cases) {
+      const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: taskMapping });
+      const beforeDoc = adapter.getDoc();
+
+      const result = await adapter.target.apply([patch]);
+
+      expect(result.status).toBe('rejected');
+      expect(result.applied).toBe(0);
+      expect(result.diagnostics).toEqual([
+        expect.objectContaining({
+          code: 'row_invalid',
+          severity: 'error',
+          relation: 'tasks'
+        })
+      ]);
+      expect(adapter.getDoc()).toBe(beforeDoc);
+      expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+    }
   });
 
   it('supports setDoc/snapshot and reports unsupported writes honestly', async () => {

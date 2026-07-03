@@ -9,12 +9,12 @@
     "node": ">=24.12.0"
   },
   "scripts": {
-    "bench": "pnpm -r --if-present bench",
-    "build": "pnpm -r --if-present build",
-    "dev": "pnpm -r --filter './apps/*' --parallel --if-present dev",
+    "bench": "pnpm --filter @tarstate/core --filter @tarstate/automerge bench",
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --filter './apps/*' --parallel dev",
     "lint": "oxlint . --deny-warnings --type-aware",
     "relic:oracle": "TARSTATE_RELIC_ORACLE=1 pnpm --filter @tarstate/core exec vitest run --config ../../vite.config.ts tests/relic-oracle.test.ts",
-    "test": "pnpm --filter './packages/*' --if-present test",
+    "test": "pnpm --filter './packages/*' test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

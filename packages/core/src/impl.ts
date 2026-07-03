@@ -901,7 +901,14 @@ type RelationApplyResultBase<Version = unknown> = {
   readonly version?: Version;
   readonly durability?: RelationApplyDurability;
 };
-export type RelationApply<Version = unknown> = (patches: readonly WritePatch[]) => MaybePromise<RelationApplyResult<Version>>;
+export type RelationApplyContext = {
+  readonly env?: EvaluateEnv;
+  readonly envDeltas?: readonly MaterializationEnvDelta[];
+};
+export type RelationApply<Version = unknown> = (
+  patches: readonly WritePatch[],
+  context?: RelationApplyContext
+) => MaybePromise<RelationApplyResult<Version>>;
 export type RelationPatchTarget<Version = unknown> = {
   readonly relationNames?: readonly string[];
   readonly ownsRelation?: (relationName: string) => boolean;
@@ -918,7 +925,10 @@ export type RelationRuntimeVersion<Runtime extends RelationRuntime = RelationRun
 export type ComposedRelationRuntimeVersion<Runtimes extends readonly RelationRuntime[]> = {
   readonly [Index in keyof Runtimes]: RelationRuntimeVersion<Runtimes[Index]>;
 };
-export type RelationApplyOptions = TarstateDiagnosticOptions & { readonly readVersion?: boolean };
+export type RelationApplyOptions = TarstateDiagnosticOptions & {
+  readonly readVersion?: boolean;
+  readonly context?: RelationApplyContext;
+};
 export type RelationApplyReport<Version = unknown> = RelationApplyResult<Version> & { readonly source: AdapterSource<Version> };
 
 export async function tryApplyRelationPatches<Version = unknown>(
@@ -943,7 +953,7 @@ export async function tryApplyRelationPatches<Version = unknown>(
     };
   }
 
-  const result = await Promise.resolve(runtime.target.apply(patchList));
+  const result = await Promise.resolve(runtime.target.apply(patchList, options.context));
   const snapshot = runtime.snapshot?.();
   const source = snapshot?.source ?? runtime.source;
   const version = options.readVersion === false
@@ -1044,21 +1054,25 @@ function composeRuntimeTarget<const Runtimes extends readonly RelationRuntime[]>
   runtimes: Runtimes,
   source: AdapterSource<ComposedRelationRuntimeVersion<Runtimes>>
 ): RelationPatchTarget<ComposedRelationRuntimeVersion<Runtimes>> | undefined {
-  const targets = runtimes.flatMap((runtime) => runtime.target === undefined ? [] : [runtime.target]);
-  if (targets.length === 0) return undefined;
+  const targetEntries = runtimes.flatMap((runtime) =>
+    runtime.target === undefined ? [] : [{ target: runtime.target, source: runtime.source }]);
+  if (targetEntries.length === 0) return undefined;
 
-  const targetRelationNames = Array.from(new Set(targets.flatMap((target) => target.relationNames ?? [])));
+  const targetRelationNames = Array.from(new Set(targetEntries.flatMap(({ target, source: targetSource }) =>
+    target.relationNames ?? targetSource.relationNames ?? [])));
 
   return {
     ...(targetRelationNames.length === 0 ? {} : { relationNames: targetRelationNames }),
-    ownsRelation: (relationName) => targets.some((target) => targetOwnsRelation(target, relationName)),
-    apply: async (patches) => {
+    ownsRelation: (relationName) => targetEntries.some(({ target, source: targetSource }) =>
+      targetOwnsRelation(target, relationName, targetSource)),
+    apply: async (patches, context) => {
       const patchList = Array.from(patches);
-      const routedTargets = targets.map((target) => ({ target, patches: [] as WritePatch[] }));
+      const routedTargets = targetEntries.map((entry) => ({ ...entry, patches: [] as WritePatch[] }));
       const unroutedPatches: WritePatch[] = [];
 
       for (const patch of patchList) {
-        const owningTargets = routedTargets.filter(({ target }) => targetOwnsRelation(target, patch.relation.name));
+        const owningTargets = routedTargets.filter(({ target, source: targetSource }) =>
+          targetOwnsRelation(target, patch.relation.name, targetSource));
 
         if (owningTargets.length === 0) {
           unroutedPatches.push(patch);
@@ -1072,7 +1086,7 @@ function composeRuntimeTarget<const Runtimes extends readonly RelationRuntime[]>
 
       const results = await Promise.all(routedTargets
         .filter(({ patches: targetPatches }) => targetPatches.length > 0)
-        .map(({ target, patches: targetPatches }) => Promise.resolve(target.apply(targetPatches))));
+        .map(({ target, patches: targetPatches }) => Promise.resolve(target.apply(targetPatches, context))));
       const diagnostics = [
         ...results.flatMap((result) => result.diagnostics),
         ...unroutedPatches.map((patch) => unsupportedRuntimeTargetDiagnostic(patch.relation.name))
@@ -1096,10 +1110,11 @@ function composeRuntimeTarget<const Runtimes extends readonly RelationRuntime[]>
   };
 }
 
-function targetOwnsRelation(target: RelationPatchTarget, relationName: string): boolean {
+function targetOwnsRelation(target: RelationPatchTarget, relationName: string, source?: AdapterSource): boolean {
   if (target.ownsRelation !== undefined) return target.ownsRelation(relationName);
   if (target.relationNames !== undefined) return target.relationNames.includes(relationName);
-  return true;
+  if (source?.relationNames !== undefined) return source.relationNames.includes(relationName);
+  return false;
 }
 
 function composeApplyStatus(
@@ -1297,9 +1312,16 @@ export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, a
       diagnostics: []
     };
   }
-  const result = evaluate(dbSource(dbValue), queryObject, { ...options, env: options.env ?? dbValue.env });
+  const result = evaluate(querySourceFor(dbValue), queryObject, { ...options, env: options.env ?? dbValue.env });
   const sortedRows = applyDbQueryOptions(result.rows, options);
   return { rows: sortedRows, diagnostics: result.diagnostics };
+}
+
+function querySourceFor(dbValue: Db): RelationSource {
+  const materializedSource = materializedSourceFor(dbValue);
+  return materializedSource === undefined
+    ? dbSource(dbValue)
+    : composeSources(dbSource(dbValue), materializedSource);
 }
 export function qMany<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchRows<Queries> {
   const results: Record<string, unknown> = {};
@@ -1675,8 +1697,8 @@ export async function validateConstraints(
  * `Db` values are maintained by transactions; source-only targets can still
  * be materialized for snapshot reads.
  */
-export type MaterializableDb = object;
 export type SnapshotMaterializationTarget = Db | RelationSource;
+export type MaterializableDb = SnapshotMaterializationTarget;
 export type MaterializedDb = { readonly materialized?: readonly MaterializationMetadata[] };
 export type MaterializationMode = 'snapshot' | 'incremental';
 export type MaterializationMaintenanceKind = MaterializationMode;
@@ -1804,7 +1826,8 @@ export type MaterializationTarget<Row = unknown> =
   | ConstraintSet
   | MaterializationMetadata<Row>;
 
-export function mat<DbValue extends object>(dbValue: DbValue, ...inputs: readonly MaterializationInput[]): DbValue & MaterializedDb {
+export function mat<DbValue extends SnapshotMaterializationTarget>(dbValue: DbValue, ...inputs: readonly MaterializationInput[]): DbValue & MaterializedDb {
+  assertReadableMaterializationTarget(dbValue);
   const current = materializedStateFor(dbValue);
   let state: InternalMaterializationState = {
     metadata: [...current.metadata],
@@ -1875,7 +1898,13 @@ export const materializedRelationFor = (id: string): RelationRef<Record<string, 
 });
 export const materializedRelationForQuery = <Row = unknown>(input: unknown, query: Query<Row>): RelationRef<Record<string, unknown>> | undefined => {
   const metadata = materializationForQuery(input, query);
-  return metadata === undefined ? undefined : materializedRelationFor(metadata.id);
+  if (metadata === undefined) return undefined;
+  const keyFields = queryRowKeyFields(query);
+  if (keyFields === undefined || keyFields.length === 0) return materializedRelationFor(metadata.id);
+  return {
+    ...materializedRelationFor(metadata.id),
+    key: keyFields.length === 1 ? keyFields[0] as string : keyFields
+  };
 };
 export const materializedRowsFor = <Row = unknown>(input: unknown, id: string): readonly Row[] | undefined =>
   materializedStateFor(input).rows.get(id) as readonly Row[] | undefined;
@@ -4958,9 +4987,9 @@ export function createMemoryRelationRuntime(data: DbInputData = {}, options: Mem
     },
     target: {
       relationNames,
-      apply: (patches) => {
+      apply: (patches, context) => {
         const patchList = Array.from(patches);
-        let nextDb = dbValue;
+        let nextDb = context?.env === undefined ? dbValue : withEnv(dbValue, context.env);
         let applied = 0;
         const diagnostics: TarstateDiagnostic[] = [];
         const deltas: RelationDelta[] = [];
@@ -4976,9 +5005,11 @@ export function createMemoryRelationRuntime(data: DbInputData = {}, options: Mem
           deltas.push(...result.deltas);
         }
 
-        dbValue = nextDb;
-        version += 1;
-        notify();
+        if (deltas.length > 0) {
+          dbValue = { ...dbValue, data: nextDb.data };
+          version += 1;
+          notify();
+        }
 
         return {
           status: 'accepted',
@@ -5533,6 +5564,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
   let currentSource = initialRuntimeSnapshot?.source ?? input.runtime.source;
   let state = dbFromSource(currentSource, input.relations, input.env);
   let version = initialRuntimeSnapshot?.version ?? currentSource.version?.();
+  let pendingApplyEnv: DbEnv | undefined;
   const snapshot = (): StoreSnapshot<Version> => ({
     db: state,
     source: currentSource,
@@ -5540,11 +5572,11 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
     diagnostics: currentSource.diagnostics?.() ?? [],
     ...(version === undefined ? {} : { version })
   });
-  const refreshFromRuntime = (): StoreSnapshot<Version> => {
+  const refreshFromRuntime = (envValue: DbInputEnv | undefined = pendingApplyEnv ?? state.env): StoreSnapshot<Version> => {
     const runtimeSnapshot = input.runtime.snapshot?.();
     currentSource = runtimeSnapshot?.source ?? input.runtime.source;
     version = runtimeSnapshot?.version ?? currentSource.version?.();
-    state = dbFromSource(currentSource, input.relations, state.env);
+    state = dbFromSource(currentSource, input.relations, envValue);
     revision += 1;
     for (const listener of listeners) listener();
     return {
@@ -5614,8 +5646,22 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
         };
       }
 
-      const report = await tryApplyRelationPatches(input.runtime, transactionWritePatches(transactionResult), { readVersion: true });
-      const nextSnapshot = report.status === 'rejected' ? snapshot() : refreshFromRuntime();
+      const revisionBeforeApply = revision;
+      pendingApplyEnv = transactionResult.db.env;
+      let report: RelationApplyReport<Version>;
+      try {
+        report = await tryApplyRelationPatches(input.runtime, transactionWritePatches(transactionResult), {
+          readVersion: true,
+          context: { env: transactionResult.db.env }
+        });
+      } finally {
+        pendingApplyEnv = undefined;
+      }
+      const nextSnapshot = report.status === 'rejected'
+        ? snapshot()
+        : revision === revisionBeforeApply
+          ? refreshFromRuntime(transactionResult.db.env)
+          : snapshot();
       return {
         status: report.status,
         reflected: report.status !== 'rejected',
@@ -5898,15 +5944,23 @@ function evaluateQueryData(
       return limitEntries(evaluateNestedInput(source, data, relations, options, outer, diagnostics), data.count, data.offset);
     case 'sortLimit':
       return limitEntries(sortEntries(evaluateNestedInput(source, data, relations, options, outer, diagnostics), arrayFromUnknown(data.order), source, relations, options, diagnostics, outer), data.count);
-    case 'union':
-      return setUnionEntries(queryDataArray(data.inputs).map((input) => evaluateQueryData(source, input, relations, options, outer, diagnostics)));
-    case 'intersection':
-      return setIntersectionEntries(queryDataArray(data.inputs).map((input) => evaluateQueryData(source, input, relations, options, outer, diagnostics)));
-    case 'difference':
+    case 'union': {
+      const inputs = evaluateSetInputs(source, data, relations, options, outer, diagnostics);
+      return inputs === undefined ? [] : setUnionEntries(inputs);
+    }
+    case 'intersection': {
+      const inputs = evaluateSetInputs(source, data, relations, options, outer, diagnostics);
+      return inputs === undefined ? [] : setIntersectionEntries(inputs);
+    }
+    case 'difference': {
+      const left = requiredNestedQueryData(data.left, 'difference.left', diagnostics);
+      const right = requiredNestedQueryData(data.right, 'difference.right', diagnostics);
+      if (left === undefined || right === undefined) return [];
       return setDifferenceEntries(
-        evaluateQueryData(source, queryDataFrom(data.left) ?? { op: 'constRows', rows: [] }, relations, options, outer, diagnostics),
-        evaluateQueryData(source, queryDataFrom(data.right) ?? { op: 'constRows', rows: [] }, relations, options, outer, diagnostics)
+        evaluateQueryData(source, left, relations, options, outer, diagnostics),
+        evaluateQueryData(source, right, relations, options, outer, diagnostics)
       );
+    }
     case 'hash':
     case 'btree':
     case 'uniqueIndex':
@@ -6107,8 +6161,41 @@ function evaluateNestedInput(
   outer: EvalEntry | undefined,
   diagnostics: TarstateDiagnostic[]
 ): readonly EvalEntry[] {
-  const input = queryDataFrom(data.input);
+  const input = requiredNestedQueryData(data.input, `${data.op}.input`, diagnostics);
   return input === undefined ? [] : evaluateQueryData(source, input, relations, options, outer, diagnostics);
+}
+
+function evaluateSetInputs(
+  source: RelationSource,
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  outer: EvalEntry | undefined,
+  diagnostics: TarstateDiagnostic[]
+): readonly (readonly EvalEntry[])[] | undefined {
+  if (!Array.isArray(data.inputs)) {
+    diagnostics.push(queryInvalidDiagnostic(`${data.op}.inputs must be an array of query data`, { op: data.op, inputs: data.inputs }));
+    return undefined;
+  }
+
+  const inputs: (readonly EvalEntry[])[] = [];
+  for (const [index, inputValue] of data.inputs.entries()) {
+    const input = requiredNestedQueryData(inputValue, `${data.op}.inputs[${index}]`, diagnostics);
+    if (input === undefined) return undefined;
+    inputs.push(evaluateQueryData(source, input, relations, options, outer, diagnostics));
+  }
+  return inputs;
+}
+
+function requiredNestedQueryData(
+  input: unknown,
+  path: string,
+  diagnostics: TarstateDiagnostic[]
+): QueryData | undefined {
+  const data = queryDataFrom(input);
+  if (data !== undefined) return data;
+  diagnostics.push(queryInvalidDiagnostic(`${path} must be query data`, { path, input }));
+  return undefined;
 }
 
 function evaluateJoin(
@@ -6119,8 +6206,8 @@ function evaluateJoin(
   outer: EvalEntry | undefined,
   diagnostics: TarstateDiagnostic[]
 ): readonly EvalEntry[] {
-  const leftData = queryDataFrom(data.left);
-  const rightData = queryDataFrom(data.right);
+  const leftData = requiredNestedQueryData(data.left, 'join.left', diagnostics);
+  const rightData = requiredNestedQueryData(data.right, 'join.right', diagnostics);
   if (leftData === undefined || rightData === undefined) return [];
   const leftRows = evaluateQueryData(source, leftData, relations, options, outer, diagnostics);
   const rightRows = evaluateQueryData(source, rightData, relations, options, outer, diagnostics);
@@ -6555,6 +6642,16 @@ function relationMissingDiagnostic(relationName: string, surface: string): Tarst
     message: `relation "${relationName}" is not available`,
     relation: relationName,
     surface
+  };
+}
+
+function queryInvalidDiagnostic(message: string, detail?: unknown): TarstateDiagnostic {
+  return {
+    code: 'query_invalid',
+    severity: 'error',
+    message,
+    surface: 'evaluate',
+    ...(detail === undefined ? {} : { detail })
   };
 }
 
@@ -7666,6 +7763,7 @@ function addMaterializationMetadata(
 ): InternalMaterializationState {
   const rows = new Map(state.rows);
   const refresh = refreshMaterializationRows(target, metadata.query);
+  throwMaterializationRefreshErrors(refresh.diagnostics);
   rows.set(metadata.id, refresh.rows);
   const aux = new Map(state.aux);
   const materializationAux = materializationAuxForRows(
@@ -7702,7 +7800,9 @@ function materializationAuxForTarget<Row>(target: unknown, query: Query<Row>): I
   const support = incrementalMaterializationSupport(query);
   if (!support.supported || support.topN === undefined) return undefined;
   const preLimitQuery = { data: support.topN.preLimitData, relations: query.relations } as Query<Row>;
-  return { topNPreLimitRows: refreshMaterializationRows(target, preLimitQuery).rows };
+  const refresh = refreshMaterializationRows(target, preLimitQuery);
+  throwMaterializationRefreshErrors(refresh.diagnostics);
+  return { topNPreLimitRows: refresh.rows };
 }
 
 function materializationAuxForRows<Row>(
@@ -7813,11 +7913,22 @@ function refreshMaterializationRows<Row>(target: unknown, query: Query<Row>): Ma
     rows: [],
     diagnostics: [{
       code: 'materialization_unsupported',
-      severity: 'warning',
-      message: 'materialization target is not readable',
+      severity: 'error',
+      message: 'materialization target must be a Db or RelationSource',
       surface: 'materialization'
     }]
   };
+}
+
+function assertReadableMaterializationTarget(input: unknown): asserts input is SnapshotMaterializationTarget {
+  if (isDb(input) || isRelationSource(input)) return;
+  throw new Error('materialization target must be a Db or RelationSource');
+}
+
+function throwMaterializationRefreshErrors(diagnostics: readonly TarstateDiagnostic[]): void {
+  const errors = diagnostics.filter(isErrorDiagnostic);
+  if (errors.length === 0) return;
+  throw new Error(`materialization refresh failed: ${errors.map((item) => item.message).join('\n')}`);
 }
 
 function isMaterializationMetadata(input: unknown): input is MaterializationMetadata {

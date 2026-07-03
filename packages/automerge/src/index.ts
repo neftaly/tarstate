@@ -26,12 +26,6 @@ export type AutomergeMapRelation<
   readonly path: AutomergeMapPath<DocumentShape>;
 };
 
-export type AutomergeMapStorageCodec = 'map-v1';
-
-export type AutomergeMapStorageOptions = {
-  readonly codec?: AutomergeMapStorageCodec;
-};
-
 export type AutomergeMapEnvInput = EvaluateEnv | (() => EvaluateEnv | undefined);
 
 export type AutomergeMapAdapterOptions<
@@ -41,7 +35,6 @@ export type AutomergeMapAdapterOptions<
   readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
   readonly changeMessage?: string | ((patches: readonly WritePatch[]) => string | undefined);
   readonly env?: AutomergeMapEnvInput;
-  readonly storage?: AutomergeMapStorageOptions;
 };
 
 export type AutomergeMapSourceOptions<
@@ -114,6 +107,9 @@ type RowPlan = {
   rows: Row[];
   changed: boolean;
 };
+type RowPlanResult =
+  | { readonly plan: RowPlan; readonly diagnostics: readonly [] }
+  | { readonly plan?: undefined; readonly diagnostics: readonly TarstateDiagnostic[] };
 type PatchOutcome = {
   readonly accepted: boolean;
   readonly applied: boolean;
@@ -133,6 +129,9 @@ type PatchEvaluationContext<DocumentShape extends object = Record<string, unknow
   readonly relations: readonly AnyMapRelation[];
   readonly plans: Map<string, RowPlan>;
   readonly env: () => EvaluateEnv | undefined;
+};
+type AutomergeApplyContext = {
+  readonly env?: EvaluateEnv;
 };
 
 export function defineAutomergeMapRelations<DocumentShape extends object>() {
@@ -188,7 +187,7 @@ export function automergeMapAdapter<
   const target: RelationPatchTarget<Automerge.Heads> = {
     relationNames,
     ownsRelation: (relationName) => options.relations.some((mapping) => mapping.relation.name === relationName),
-    apply: (patches) => {
+    apply: (patches: readonly WritePatch[], applyContext?: AutomergeApplyContext) => {
       const patchList = Array.from(patches);
       const beforeDoc = doc;
       const plans = new Map<string, RowPlan>();
@@ -196,7 +195,7 @@ export function automergeMapAdapter<
         doc: beforeDoc,
         relations: options.relations,
         plans,
-        env: () => automergeMapEnv(options.env)
+        env: () => applyContext?.env ?? automergeMapEnv(options.env)
       };
       const diagnostics: TarstateDiagnostic[] = [];
       let accepted = 0;
@@ -210,14 +209,12 @@ export function automergeMapAdapter<
           continue;
         }
 
-        const plan = getOrCreatePlan(beforeDoc, mapping, plans);
+        const planResult = getOrCreatePlan(beforeDoc, mapping, plans);
+        diagnostics.push(...planResult.diagnostics);
 
-        if (plan === undefined) {
-          diagnostics.push(invalidPathDiagnostic(mapping, getPathValue(beforeDoc, mapping.path)));
-          continue;
-        }
+        if (planResult.plan === undefined) continue;
 
-        const outcome = applyPatchToPlan(plan, patch, context);
+        const outcome = applyPatchToPlan(planResult.plan, patch, context);
         diagnostics.push(...outcome.diagnostics);
         if (outcome.accepted) accepted += 1;
         if (outcome.applied) applied += 1;
@@ -255,8 +252,6 @@ export function automergeMapAdapter<
         : { status, ...base, applied, deltas };
     }
   };
-
-  void options.storage?.codec;
 
   return {
     relations: options.relations,
@@ -384,7 +379,13 @@ function mappedCollection<DocumentShape extends object>(
 ): MappedCollection {
   const lookup = getPathValue(doc, mapping.path);
 
-  if (lookup.status === 'missing') return { rows: [], kind: 'map', diagnostics: [] };
+  if (lookup.status === 'missing') {
+    return {
+      rows: [],
+      kind: 'map',
+      diagnostics: [invalidPathDiagnostic(mapping, lookup)]
+    };
+  }
   if (lookup.status === 'invalid') {
     return {
       rows: [],
@@ -393,17 +394,21 @@ function mappedCollection<DocumentShape extends object>(
     };
   }
   if (Array.isArray(lookup.value)) {
+    const rows = lookup.value.flatMap((item) => isRecord(item) ? [cloneRow(item)] : []);
+
     return {
-      rows: lookup.value.flatMap((item) => isRecord(item) ? [cloneRow(item)] : []),
+      rows,
       kind: 'array',
-      diagnostics: []
+      diagnostics: validateCollectionRows(mapping.relation, rows)
     };
   }
   if (isRecord(lookup.value)) {
+    const rows = Object.values(lookup.value).flatMap((value) => rowFromMapEntry(value));
+
     return {
-      rows: Object.entries(lookup.value).flatMap(([key, value]) => rowFromMapEntry(mapping.relation, key, value)),
+      rows,
       kind: 'map',
-      diagnostics: []
+      diagnostics: validateCollectionRows(mapping.relation, rows)
     };
   }
 
@@ -418,12 +423,12 @@ function getOrCreatePlan<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
   mapping: AnyMapRelation,
   plans: Map<string, RowPlan>
-): RowPlan | undefined {
+): RowPlanResult {
   const existing = plans.get(mapping.relation.name);
-  if (existing !== undefined) return existing;
+  if (existing !== undefined) return { plan: existing, diagnostics: [] };
 
   const collection = mappedCollection(doc, mapping);
-  if (collection.diagnostics.length > 0) return undefined;
+  if (collection.diagnostics.length > 0) return { diagnostics: collection.diagnostics };
 
   const plan: RowPlan = {
     mapping,
@@ -434,7 +439,7 @@ function getOrCreatePlan<DocumentShape extends object>(
   };
   plans.set(mapping.relation.name, plan);
 
-  return plan;
+  return { plan, diagnostics: [] };
 }
 
 function applyPatchToPlan(plan: RowPlan, patch: WritePatch, context: PatchEvaluationContext): PatchOutcome {
@@ -702,7 +707,12 @@ function rowUpdateFor(
     ? changes(cloneRow(current))
     : changes;
 
-  if (!isRecord(update)) return { supported: true, row: cloneRow(current), diagnostics: [] };
+  if (!isRecord(update)) {
+    return {
+      supported: false,
+      diagnostics: [updateInvalidDiagnostic(plan.mapping.relation.name, update)]
+    };
+  }
 
   const evaluated = evaluateUpdateMap(update, current, plan, context);
   if (!evaluated.supported) return evaluated;
@@ -736,7 +746,9 @@ function evaluateUpdateMap(
 }
 
 function isRowUpdateResult(input: unknown): input is RowUpdateResult {
-  return isRecord(input) && typeof input.supported === 'boolean' && ('row' in input || 'op' in input);
+  return isRecord(input)
+    && typeof input.supported === 'boolean'
+    && (input.supported === false || 'row' in input || 'op' in input);
 }
 
 function matchingIndexes(
@@ -1066,7 +1078,7 @@ function setPathValue(root: unknown, path: readonly string[], value: unknown): v
         current[arrayItem] = value;
         return;
       }
-      if (current[arrayItem] === undefined || current[arrayItem] === null) current[arrayItem] = {};
+      if (current[arrayItem] === undefined || current[arrayItem] === null) return;
       current = current[arrayItem];
       continue;
     }
@@ -1079,22 +1091,19 @@ function setPathValue(root: unknown, path: readonly string[], value: unknown): v
       return;
     }
 
-    if (record[segment] === undefined || record[segment] === null) record[segment] = {};
+    if (record[segment] === undefined || record[segment] === null) return;
     current = record[segment];
   }
 }
 
-function rowFromMapEntry(relation: RelationRef, key: string, value: unknown): readonly Row[] {
+function rowFromMapEntry(value: unknown): readonly Row[] {
   if (!isRecord(value)) return [];
 
-  const row = cloneRow(value);
-  const keyFields = relationKeyFields(relation);
-  if (keyFields.length === 1 && row[keyFields[0] ?? ''] === undefined) {
-    const field = keyFields[0];
-    if (field !== undefined) row[field] = key;
-  }
+  return [cloneRow(value)];
+}
 
-  return [row];
+function validateCollectionRows(relation: RelationRef, rows: readonly Row[]): readonly TarstateDiagnostic[] {
+  return rows.flatMap((row) => validateRelationRowForAutomerge(relation, row));
 }
 
 function encodeRows(rows: readonly Row[], relation: RelationRef, kind: StorageKind): unknown {
@@ -1476,6 +1485,17 @@ function rowInvalidDiagnostic(relation: string, row: unknown): TarstateDiagnosti
     surface: 'automergeMapAdapter',
     message: `Automerge map adapter expected an object row for relation "${relation}"`,
     detail: row
+  };
+}
+
+function updateInvalidDiagnostic(relation: string, update: unknown): TarstateDiagnostic {
+  return {
+    code: 'row_invalid',
+    severity: 'error',
+    relation,
+    surface: 'automergeMapAdapter',
+    message: `Automerge map adapter expected an object update for relation "${relation}"`,
+    detail: update
   };
 }
 

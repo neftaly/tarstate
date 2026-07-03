@@ -6,6 +6,7 @@ export type {
   MaybePromise,
   RelationApply,
   RelationApplyAcceptedResult,
+  RelationApplyContext,
   RelationApplyDurability,
   RelationApplyOptions,
   RelationApplyPartialResult,
