@@ -21,6 +21,7 @@
     "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.ts",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
+    "test:fuzz": "vitest run --config ../../vite.config.ts tests/*fuzz*.test.ts",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
