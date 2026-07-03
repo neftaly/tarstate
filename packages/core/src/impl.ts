@@ -3009,7 +3009,12 @@ function maintainJoinMaterializationIncrementally<Row>(
     }
   }
 
-  const diff = diffRows(previousRows, orderedRows.rows, { keyBy: support.identity.keyBy });
+  const directChanges = support.trusted && (support.finalSort === undefined || addedRowChangeCount(rowUpdate.rowChanges) <= 1)
+    ? rowUpdate.rowChanges
+    : undefined;
+  const diff = directChanges === undefined
+    ? diffRows(previousRows, orderedRows.rows, { keyBy: support.identity.keyBy })
+    : { changes: directChanges, diagnostics: [] };
   return {
     supported: true,
     reason: 'incremental delta maintenance',
@@ -3314,6 +3319,7 @@ function materializedIndexLookup(
   if (index === undefined) return undefined;
   const bucket = index.buckets.get(stableKey(lookupValue.value));
   if (bucket === undefined) return [];
+  if (Object.is(bucket.value, lookupValue.value)) return bucket.entries.map((entry) => entry.row);
   return bucket.entries
     .filter((entry) => isRecord(entry.row) && Object.is(entry.row[lookupValue.field], lookupValue.value))
     .map((entry) => entry.row);
@@ -4313,6 +4319,39 @@ function incrementalSortedMaterializedRows<Row>(
 ): readonly Row[] {
   type PositionedRow = { readonly row: Row; readonly ordinal: number };
 
+  if (removedEntries.length === 0 && addedRows.length === 1) {
+    const addedRow = addedRows[0];
+    if (addedRow !== undefined) {
+      return sortedRowsWithSingleInsertion(previousRows, addedRow, previousRows.length, placement);
+    }
+  }
+
+  if (removedEntries.length === 1) {
+    const removedEntry = removedEntries[0];
+    if (removedEntry !== undefined) {
+      if (addedRows.length === 0) {
+        return [
+          ...previousRows.slice(0, removedEntry.index),
+          ...previousRows.slice(removedEntry.index + 1)
+        ];
+      }
+      const addedRow = addedRows[0];
+      if (addedRows.length === 1 && addedRow !== undefined) {
+        const retainedRows = [
+          ...previousRows.slice(0, removedEntry.index),
+          ...previousRows.slice(removedEntry.index + 1)
+        ];
+        return sortedRowsWithSingleInsertion(
+          retainedRows,
+          addedRow,
+          removedEntry.index,
+          placement,
+          (indexValue) => indexValue < removedEntry.index ? indexValue : indexValue + 1
+        );
+      }
+    }
+  }
+
   const removedIndexes = new Set(removedEntries.map((entry) => entry.index));
   const base: PositionedRow[] = [];
   const insertions: PositionedRow[] = [];
@@ -4371,6 +4410,33 @@ function incrementalSortedMaterializedRows<Row>(
   }
 
   return mergePositionedMaterializedRows(base, insertions, placement);
+}
+
+function sortedRowsWithSingleInsertion<Row>(
+  rows: readonly Row[],
+  insertedRow: Row,
+  insertedOrdinal: number,
+  placement: IncrementalMaterializedSortPlacement<Row>,
+  ordinalForIndex: (indexValue: number) => number = (indexValue) => indexValue
+): readonly Row[] {
+  const result = [...rows];
+  const insertion = { row: insertedRow, ordinal: insertedOrdinal };
+  let low = 0;
+  let high = result.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    const rowValue = result[mid];
+    const current = rowValue === undefined
+      ? undefined
+      : { row: rowValue, ordinal: ordinalForIndex(mid) };
+    if (current === undefined || comparePositionedMaterializedRows(current, insertion, placement) <= 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  result.splice(low, 0, insertedRow);
+  return result;
 }
 
 function mergePositionedMaterializedRows<Row>(
