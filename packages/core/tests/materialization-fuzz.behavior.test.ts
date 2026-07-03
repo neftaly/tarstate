@@ -37,6 +37,7 @@ import { createStore } from '@tarstate/core/store';
 import { watch, watchTargetKey } from '@tarstate/core/watch';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { account, entry, makeDb, schema, type Account, type Entry } from './behavior-fixtures.js';
+import { createSeededRandom } from './fuzz-helpers.js';
 
 type SupportedVariant = {
   readonly label: string;
@@ -702,7 +703,7 @@ function requireMaterializedSourceFor(input: unknown): RelationSource {
 }
 
 function amountRangeLookups(seed: number, relation: RelationRef): readonly RelationRangeLookup[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   const first = Math.floor(next() * 501) - 250;
   const second = Math.floor(next() * 501) - 250;
   const lower = Math.min(first, second);
@@ -754,12 +755,12 @@ function removedRows<Row>(changes: readonly RowChange<Row>[]): readonly Row[] {
 }
 
 function randomEntries(seed: number, count: number): Entry[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   return Array.from({ length: count }, (_, index) => randomEntry(next, `r${seed}-${index}`, index));
 }
 
 function randomEntryPatches(seed: number, count: number): WritePatch[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   const patches: WritePatch[] = [];
   for (let index = 0; index < count; index += 1) {
     const id = `r${seed}-${Math.floor(next() * 12)}`;
@@ -782,7 +783,7 @@ function randomEntryPatches(seed: number, count: number): WritePatch[] {
 }
 
 function randomEntryPatchesForDb(dbSeed: number, seed: number, count: number): WritePatch[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   const patches: WritePatch[] = [];
   for (let index = 0; index < count; index += 1) {
     const id = index % 4 === 0
@@ -807,7 +808,7 @@ function randomEntryPatchesForDb(dbSeed: number, seed: number, count: number): W
 }
 
 function randomJoinPatches(dbSeed: number, seed: number, count: number): WritePatch[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   const patches: WritePatch[] = [];
   const accountIds = ['cash', 'sales', 'fees', 'equity'] as const;
   const accountKinds = ['asset', 'income', 'expense', 'equity', 'liability'] as const satisfies readonly Account['kind'][];
@@ -840,7 +841,7 @@ function randomJoinPatches(dbSeed: number, seed: number, count: number): WritePa
 }
 
 function guaranteedEntryReplacements(seed: number, count: number): WritePatch[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   return Array.from({ length: count }, (_, index) => {
     const id = `r${seed}-${index % 8}`;
     return insertOrReplace(schema.entries, randomEntry(next, id, index));
@@ -855,14 +856,6 @@ function randomEntry(next: () => number, id: string, index: number): Entry {
     amount: Math.floor(next() * 501) - 250,
     memo: next() > 0.66 ? null : `fuzz-${index}-${Math.floor(next() * 20)}`,
     posted: next() > 0.35
-  };
-}
-
-function random(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state * 1664525 + 1013904223) >>> 0;
-    return state / 0x100000000;
   };
 }
 

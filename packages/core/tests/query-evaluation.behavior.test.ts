@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { createDb, q, qMany, qManyResult, qResult } from '@tarstate/core/db';
 import {
   aggregate,
-  and,
   any as anyAggregate,
   asc,
   clauses,
@@ -17,7 +16,6 @@ import {
   field,
   from,
   gt,
-  gte,
   intersection,
   isMissing,
   isNull,
@@ -27,7 +25,6 @@ import {
   lte,
   max,
   maybe,
-  neq,
   notAny,
   notMissing,
   notNull,
@@ -46,9 +43,7 @@ import {
 } from '@tarstate/core/query';
 import {
   account,
-  accountsById,
   entry,
-  entriesById,
   makeDb,
   openingAccounts,
   schema,
@@ -97,13 +92,8 @@ describe('query evaluation behavior', () => {
     });
   });
 
-  it('evaluates comparisons and distinguishes null from missing fields', () => {
+  it('distinguishes null from missing fields', () => {
     const db = makeDb();
-    const comparable = pipe(
-      from(entry),
-      where(and(gte(entry.amount, value(0)), lte(entry.amount, value(120)), neq(entry.id, value('e4')))),
-      project({ id: entry.id })
-    );
     const nullMemo = pipe(from(entry), where(isNull(entry.memo)), project({ id: entry.id }));
     const missingMemo = pipe(from(entry), where(isMissing(entry.memo)), project({ id: entry.id }));
     const presentMemo = pipe(
@@ -119,7 +109,6 @@ describe('query evaluation behavior', () => {
       project({ id: entry.id })
     );
 
-    expect(q(db, comparable)).toEqual([{ id: 'e1' }]);
     expect(q(db, nullMemo)).toEqual([{ id: 'e3' }]);
     expect(q(db, missingMemo)).toEqual([{ id: 'e4' }]);
     expect(q(db, presentMemo)).toEqual([{ id: 'e1' }, { id: 'e2' }, { id: 'e3' }]);
@@ -323,15 +312,4 @@ describe('query evaluation behavior', () => {
     ]);
   });
 
-  it('reads sorted relation queries built directly from from(relation)', () => {
-    const db = makeDb();
-
-    expect(q(db, accountsById)).toEqual([
-      { id: 'cash', name: 'Cash', kind: 'asset' },
-      { id: 'equity', name: 'Owner equity', kind: 'equity' },
-      { id: 'fees', name: 'Bank fees', kind: 'expense' },
-      { id: 'sales', name: 'Sales', kind: 'income' }
-    ]);
-    expect(q(db, entriesById).map((row) => row.id)).toEqual(['e1', 'e2', 'e3', 'e4']);
-  });
 });

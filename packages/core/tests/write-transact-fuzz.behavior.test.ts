@@ -16,6 +16,7 @@ import {
   updateByKey,
   type WritePatch
 } from '@tarstate/core/write';
+import { createSeededRandom } from './fuzz-helpers.js';
 
 type Widget = {
   readonly id: string;
@@ -141,11 +142,7 @@ const FUZZ_SEEDS = [0x7710, 0x7711, 0x7712, 0x7713] as const;
 const BATCHES_PER_SEED = COVERAGE_TAGS.length * 3;
 
 function createRandom(seedValue: number): Random {
-  let state = seedValue >>> 0;
-  const next = (): number => {
-    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-    return state / 0x1_0000_0000;
-  };
+  const next = createSeededRandom(seedValue);
   const int = (exclusiveMax: number): number => {
     if (exclusiveMax <= 0) throw new Error('cannot choose from an empty range');
     return Math.floor(next() * exclusiveMax);

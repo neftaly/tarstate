@@ -161,7 +161,7 @@ const openingDb = createDb({
   ]
 });
 
-describe('rewrite public API contracts', () => {
+describe('public API contracts', () => {
   it('keeps TarstateDiagnostic as the canonical diagnostic type', () => {
     const known = diagnostic({
       code: 'not_implemented',

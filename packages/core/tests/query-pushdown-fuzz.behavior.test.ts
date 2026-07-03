@@ -20,6 +20,7 @@ import {
 } from '@tarstate/core/query';
 import { type RelationLookup, type RelationRangeLookup, type RelationSource } from '@tarstate/core/source';
 import { entry, openingEntries, type Entry } from './behavior-fixtures.js';
+import { createSeededRandom, pickSeeded } from './fuzz-helpers.js';
 
 type HookMode = 'exact' | 'superset' | 'decline' | 'missing';
 type HookProfile = {
@@ -83,7 +84,7 @@ describe('query pushdown seeded fuzz behavior', () => {
   it('matches row-scan results for direct and reversed equality and range predicates', () => {
     for (const seed of seeds) {
       const rows = seededEntries(seed);
-      const equalityValue = pick(accountIds, seed);
+      const equalityValue = pickSeeded(accountIds, seed);
       const threshold = amountThreshold(seed);
       const cases = [
         lookupPredicate('direct', equalityValue),
@@ -105,8 +106,8 @@ describe('query pushdown seeded fuzz behavior', () => {
   it('matches row-scan results across and() permutations and hook modes', () => {
     for (const seed of seeds) {
       const rows = seededEntries(seed);
-      const equality = lookupPredicate(pick(orientations, seed ^ 0xa11d), pick(accountIds, seed ^ 0xe9));
-      const range = rangePredicate(pick(rangeOps, seed ^ 0x51), pick(orientations, seed ^ 0x7a), amountThreshold(seed ^ 0x37));
+      const equality = lookupPredicate(pickSeeded(orientations, seed ^ 0xa11d), pickSeeded(accountIds, seed ^ 0xe9));
+      const range = rangePredicate(pickSeeded(rangeOps, seed ^ 0x51), pickSeeded(orientations, seed ^ 0x7a), amountThreshold(seed ^ 0x37));
       const posted: PredicateSpec = {
         label: 'posted neq false',
         predicate: neq(entry.posted, value(false))
@@ -338,10 +339,10 @@ function rowValue(row: Entry, fieldName: string): unknown {
 }
 
 function seededEntries(seed: number): readonly Entry[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   const rows: Entry[] = openingEntries.map((row) => ({ ...row }));
   for (let index = 0; index < 18; index += 1) {
-    const accountId = pick(accountIds, Math.floor(next() * 0xffff_ffff));
+    const accountId = pickSeeded(accountIds, Math.floor(next() * 0xffff_ffff));
     const amount = Math.floor(next() * 421) - 210;
     rows.push({
       id: `s${seed.toString(16)}_${index}`,
@@ -355,19 +356,7 @@ function seededEntries(seed: number): readonly Entry[] {
 }
 
 function amountThreshold(seed: number): number {
-  return Math.floor(random(seed ^ 0x71_3a)() * 301) - 150;
-}
-
-function pick<const Value>(values: readonly Value[], seed: number): Value {
-  return values[Math.abs(seed) % values.length] as Value;
-}
-
-function random(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-    return state / 0x1_0000_0000;
-  };
+  return Math.floor(createSeededRandom(seed ^ 0x71_3a)() * 301) - 150;
 }
 
 function permutations<const Value>(values: readonly Value[]): readonly (readonly Value[])[] {

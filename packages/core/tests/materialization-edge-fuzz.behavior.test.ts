@@ -22,6 +22,7 @@ import {
 } from '@tarstate/core/query';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { account, entry, openingAccounts, schema, type Account, type Entry } from './behavior-fixtures.js';
+import { createSeededRandom } from './fuzz-helpers.js';
 
 const aggregateSeeds = [0xa661, 0xa662, 0xa663, 0xa664] as const;
 const topNSeeds = [0x70a1, 0x70a2, 0x70a3] as const;
@@ -230,7 +231,7 @@ function expectBatch(input: {
 }
 
 function aggregateEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
-  const next = random(seed ^ 0xa660);
+  const next = createSeededRandom(seed ^ 0xa660);
   const suffix = hex(seed);
   return Array.from({ length: 5 }, (_, index) => {
     const repeatedId = `e${(index + 1) % 8}`;
@@ -258,7 +259,7 @@ function aggregateEdgeBatches(seed: number): readonly (readonly WritePatch[])[] 
 }
 
 function topNEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
-  const next = random(seed ^ 0x70a0);
+  const next = createSeededRandom(seed ^ 0x70a0);
   const suffix = hex(seed);
   return [
     [
@@ -300,7 +301,7 @@ function topNEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
 }
 
 function joinEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
-  const next = random(seed ^ 0x91f0);
+  const next = createSeededRandom(seed ^ 0x91f0);
   const suffix = hex(seed);
   const bankId = `bank-${suffix}`;
   return [
@@ -335,7 +336,7 @@ function joinEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
 }
 
 function edgeDb(seed: number) {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   return createDb({
     accounts: openingAccounts.map((row) => ({ ...row })),
     entries: Array.from({ length: 8 }, (_, index): Entry => ({
@@ -411,14 +412,6 @@ function removedRows<Row>(changes: readonly RowChange<Row>[]): readonly Row[] {
 function edgeAmount(next: () => number, index: number, spread: number): number {
   const sign = index % 2 === 0 ? 1 : -1;
   return sign * Math.floor(next() * spread);
-}
-
-function random(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state * 1664525 + 1013904223) >>> 0;
-    return state / 0x100000000;
-  };
 }
 
 function hex(seed: number): string {

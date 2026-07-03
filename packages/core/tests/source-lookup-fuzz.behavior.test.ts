@@ -8,6 +8,7 @@ import {
   type RelationSource
 } from '@tarstate/core/source';
 import { schema } from './behavior-fixtures.js';
+import { chooseSeeded, createSeededRandom } from './fuzz-helpers.js';
 
 type HookMode = 'handled' | 'declined' | 'missing';
 
@@ -163,7 +164,7 @@ function expectedRangeLookup(rows: readonly unknown[], lookup: RelationRangeLook
 }
 
 function rangeLookups(seed: number): readonly RelationRangeLookup[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   const fixed: RelationRangeLookup[] = [
     {
       relation: schema.entries,
@@ -204,7 +205,7 @@ function rangeLookups(seed: number): readonly RelationRangeLookup[] {
       const upper = next() > 0.25 ? randomBound(next) : undefined;
       return {
         relation: schema.entries,
-        field: choose(next, lookupFields),
+        field: chooseSeeded(next, lookupFields),
         ...(lower === undefined ? {} : { lower }),
         ...(upper === undefined ? {} : { upper })
       };
@@ -214,13 +215,13 @@ function rangeLookups(seed: number): readonly RelationRangeLookup[] {
 
 function randomBound(next: () => number): RelationRangeBound {
   return {
-    value: choose(next, [0, -0, Number.NaN, null, undefined, -5, 5, 10, 'cash', 'fees'] as const),
+    value: chooseSeeded(next, [0, -0, Number.NaN, null, undefined, -5, 5, 10, 'cash', 'fees'] as const),
     inclusive: next() > 0.5
   };
 }
 
 function randomSourceRows(seed: number, count: number): readonly unknown[] {
-  const next = random(seed);
+  const next = createSeededRandom(seed);
   const rows: unknown[] = [
     { id: `zero-${seed}`, amount: 0, accountId: 'cash', memo: null, rank: 0 },
     { id: `negative-zero-${seed}`, amount: -0, accountId: 'cash', memo: 'negative-zero', rank: -0 },
@@ -253,19 +254,19 @@ function randomSourceRows(seed: number, count: number): readonly unknown[] {
 }
 
 function randomFieldValue(next: () => number): unknown {
-  return choose(next, [0, -0, Number.NaN, null, undefined, -10, -5, 5, 10, 25] as const);
+  return chooseSeeded(next, [0, -0, Number.NaN, null, undefined, -10, -5, 5, 10, 25] as const);
 }
 
 function randomAccountId(next: () => number): unknown {
-  return choose(next, ['cash', 'fees', 'sales', null, undefined, 0, -0, Number.NaN] as const);
+  return chooseSeeded(next, ['cash', 'fees', 'sales', null, undefined, 0, -0, Number.NaN] as const);
 }
 
 function randomMemo(next: () => number, seed: number, index: number): unknown {
-  return choose(next, [null, undefined, 'cash', 'fees', `memo-${seed}-${index}`, 0, -0, Number.NaN] as const);
+  return chooseSeeded(next, [null, undefined, 'cash', 'fees', `memo-${seed}-${index}`, 0, -0, Number.NaN] as const);
 }
 
 function randomNonRecord(next: () => number): unknown {
-  return choose(next, ['scalar', null, undefined, 0, -0, Number.NaN, true, ['array-row']] as const);
+  return chooseSeeded(next, ['scalar', null, undefined, 0, -0, Number.NaN, true, ['array-row']] as const);
 }
 
 function compareRangeValues(left: unknown, right: unknown): number {
@@ -296,18 +297,6 @@ function stableKey(input: unknown): string {
     return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${stableKey(input[key])}`).join(',')}}`;
   }
   return JSON.stringify(String(input as string | number | boolean | bigint | null | undefined));
-}
-
-function choose<const Value>(next: () => number, values: readonly Value[]): Value {
-  return values[Math.floor(next() * values.length)]!;
-}
-
-function random(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state * 1664525 + 1013904223) >>> 0;
-    return state / 0x100000000;
-  };
 }
 
 function rangeLabel(lookup: RelationRangeLookup): string {

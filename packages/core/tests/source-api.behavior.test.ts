@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { composeSources, fromObjectSource } from '@tarstate/core/source';
 import { schema } from './behavior-fixtures.js';
 
-describe('source contracts', () => {
+describe('source API behavior', () => {
   it('exposes minimal object-source and composed-source API shape', () => {
     const entryRow = { id: 'entry', accountId: 'cash', amount: 1 };
     const accountRow = { id: 'cash' };
