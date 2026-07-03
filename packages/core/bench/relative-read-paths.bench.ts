@@ -1,7 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import { afterAll, bench, describe } from 'vitest';
 import { createDb, q, tryTransact, type Db } from '@tarstate/core/db';
-import { mat } from '@tarstate/core/materialization';
+import { mat, type MaterializationMaintenanceChange } from '@tarstate/core/materialization';
 import {
   aggregate,
   asc,
@@ -61,11 +61,26 @@ type ProbeMetrics = {
   samples: number;
   operations: number;
   reads: number;
+  readPasses: number;
   writes: number;
   rowsRead: number;
+  coldRowsRead: number;
+  hotRowsRead: number;
   rowsChanged: number;
-  touchedLowerBound: number;
+  writeEffects: number;
+  outputRowChanges: number;
+  irrelevantWrites: number;
+  incrementalEffects: number;
+  recomputedEffects: number;
   elapsedMs: number;
+  readonly shapes: Record<QueryShape, ShapeMetrics>;
+};
+type ShapeMetrics = {
+  reads: number;
+  coldPasses: number;
+  hotPasses: number;
+  coldRowsRead: number;
+  hotRowsRead: number;
 };
 const accountKinds = ['asset', 'income', 'expense', 'equity', 'liability'] as const;
 const accounts: readonly Account[] = Array.from({ length: ACCOUNT_COUNT }, (_, index) => ({
@@ -119,21 +134,29 @@ afterAll(() => {
     ops: item.operations,
     reads: item.reads,
     writes: item.writes,
+    readPassMode: `cold+${READ_REPEAT_COUNT - 1} hot`,
     rowsReadPerOp: ratio(item.rowsRead, item.operations),
     rowsReadPerRead: ratio(item.rowsRead, item.reads),
+    coldRowsPerRead: ratio(item.coldRowsRead, item.reads),
+    hotRowsPerRead: ratio(item.hotRowsRead, item.reads),
     rowsChangedPerWrite: ratio(item.rowsChanged, item.writes),
-    touchedLowerBoundPerWrite: ratio(item.touchedLowerBound, item.writes),
+    writeEffectsPerWrite: ratio(item.writeEffects, item.writes),
+    outputRowChangesPerWrite: ratio(item.outputRowChanges, item.writes),
+    irrelevantWrites: item.irrelevantWrites,
+    incrementalEffects: item.incrementalEffects,
+    recomputedEffects: item.recomputedEffects,
     meanSampleMs: ms(item.elapsedMs / Math.max(1, item.samples)),
     usPerOp: micros(item.elapsedMs, item.operations),
     usPerReturnedRow: micros(item.elapsedMs, item.rowsRead)
   })));
 
+  console.table(shapeRows());
   console.table(ratioRows());
   console.info([
     'Decomplection hints:',
-    '- If materialized/recompute usPerOp stays near 1.0 while touchedLowerBoundPerWrite or rowsChangedPerWrite is higher, simplify by removing that materialized shape first.',
+    '- If materialized/recompute usPerOp stays near 1.0 while outputRowChangesPerWrite or rowsChangedPerWrite is higher, simplify by removing that materialized shape first.',
     '- If store-view/materialized usPerOp stays near 1.0 and rowsReadPerRead matches, the separate store-view cache path is the simplification target.',
-    '- If recompute/materialized grows with rowCount while materialized touchedLowerBoundPerWrite stays low, keep the materialized maintenance path for that query shape.'
+    '- If recompute/materialized grows with rowCount while materialized writeEffectsPerWrite and irrelevantWrites stay low, keep the materialized maintenance path for that query shape.'
   ].join('\n'));
 });
 
@@ -158,10 +181,7 @@ function makeDbProbe(
       cursor += 1;
 
       if (operation.kind === 'read') {
-        for (let repeat = 0; repeat < READ_REPEAT_COUNT; repeat += 1) {
-          sample.rowsRead += consume(q(db, queryAt(operation.queryIndex)));
-        }
-        sample.reads += 1;
+        recordRead(sample, operation.queryShape, () => consume(q(db, queryAt(operation.queryIndex))), repeatMode);
         continue;
       }
 
@@ -170,9 +190,12 @@ function makeDbProbe(
       db = result.db;
       sample.writes += 1;
       sample.rowsChanged += changedRows(result.deltas);
-      sample.touchedLowerBound += mode === 'materialized'
-        ? materializationTouchedLowerBound(result.materializations?.changes ?? [])
-        : changedRelationsLowerBound(result.deltas);
+      addWriteImpact(
+        sample,
+        mode === 'materialized'
+          ? materializationWriteImpact(result.materializations?.changes ?? [])
+          : relationWriteImpact(result.deltas)
+      );
     }
 
     record(metric, sample, performance.now() - startedAt);
@@ -200,10 +223,7 @@ function makeStoreViewProbe(scenario: Scenario, operations: readonly FuzzOperati
 
       if (operation.kind === 'read') {
         const view = viewAt(views, operation.queryIndex);
-        for (let repeat = 0; repeat < READ_REPEAT_COUNT; repeat += 1) {
-          sample.rowsRead += consume(view.getSnapshot().rows);
-        }
-        sample.reads += 1;
+        recordRead(sample, operation.queryShape, () => consume(view.getSnapshot().rows), repeatMode);
         continue;
       }
 
@@ -213,7 +233,7 @@ function makeStoreViewProbe(scenario: Scenario, operations: readonly FuzzOperati
       }
       sample.writes += 1;
       sample.rowsChanged += changedRows(result.effects.deltas);
-      sample.touchedLowerBound += Math.min(views.length, changedRelationsLowerBound(result.effects.deltas) * views.length);
+      addWriteImpact(sample, relationWriteImpact(result.effects.deltas));
     }
 
     record(metric, sample, performance.now() - startedAt);
@@ -400,12 +420,89 @@ function changedRelationsLowerBound(deltas: readonly { readonly relation: { read
   return new Set(deltas.map((delta) => delta.relation.name)).size;
 }
 
-function materializationTouchedLowerBound(changes: readonly {
-  readonly touchedDependencies: readonly string[];
-  readonly rowChanges: readonly unknown[];
-}[]): number {
-  return changes.reduce((sumValue, change) =>
-    sumValue + Math.max(change.touchedDependencies.length, change.rowChanges.length > 0 ? 1 : 0), 0);
+type WriteImpact = {
+  readonly effects: number;
+  readonly outputRowChanges: number;
+  readonly irrelevant: boolean;
+  readonly incremental: number;
+  readonly recomputed: number;
+};
+
+function relationWriteImpact(deltas: readonly { readonly added: readonly unknown[]; readonly removed: readonly unknown[]; readonly relation: { readonly name: string } }[]): WriteImpact {
+  return {
+    effects: changedRelationsLowerBound(deltas),
+    outputRowChanges: changedRows(deltas),
+    irrelevant: changedRows(deltas) === 0,
+    incremental: 0,
+    recomputed: 0
+  };
+}
+
+function materializationWriteImpact(changes: readonly MaterializationMaintenanceChange[]): WriteImpact {
+  const outputRowChanges = changes.reduce((sumValue, change) => sumValue + change.rowChanges.length, 0);
+  return {
+    effects: changes.length,
+    outputRowChanges,
+    irrelevant: changes.length > 0 && outputRowChanges === 0,
+    incremental: changes.filter((change) => change.update === 'incremental').length,
+    recomputed: changes.filter((change) => change.recomputed).length
+  };
+}
+
+type SampleMetrics = Pick<
+  ProbeMetrics,
+  | 'reads'
+  | 'readPasses'
+  | 'writes'
+  | 'rowsRead'
+  | 'coldRowsRead'
+  | 'hotRowsRead'
+  | 'rowsChanged'
+  | 'writeEffects'
+  | 'outputRowChanges'
+  | 'irrelevantWrites'
+  | 'incrementalEffects'
+  | 'recomputedEffects'
+  | 'shapes'
+>;
+
+function addWriteImpact(sample: SampleMetrics, impact: WriteImpact): void {
+  sample.writeEffects += impact.effects;
+  sample.outputRowChanges += impact.outputRowChanges;
+  sample.irrelevantWrites += impact.irrelevant ? 1 : 0;
+  sample.incrementalEffects += impact.incremental;
+  sample.recomputedEffects += impact.recomputed;
+}
+
+function repeatMode(repeat: number): 'cold' | 'hot' {
+  return repeat === 0 ? 'cold' : 'hot';
+}
+
+function recordRead(
+  sample: SampleMetrics,
+  shape: QueryShape,
+  readRows: (repeat: number) => number,
+  modeForRepeat: (repeat: number) => 'cold' | 'hot'
+): void {
+  const shapeMetric = sample.shapes[shape];
+  sample.reads += 1;
+  shapeMetric.reads += 1;
+
+  for (let repeat = 0; repeat < READ_REPEAT_COUNT; repeat += 1) {
+    const rowCount = readRows(repeat);
+    const mode = modeForRepeat(repeat);
+    sample.readPasses += 1;
+    sample.rowsRead += rowCount;
+    if (mode === 'cold') {
+      sample.coldRowsRead += rowCount;
+      shapeMetric.coldPasses += 1;
+      shapeMetric.coldRowsRead += rowCount;
+    } else {
+      sample.hotRowsRead += rowCount;
+      shapeMetric.hotPasses += 1;
+      shapeMetric.hotRowsRead += rowCount;
+    }
+  }
 }
 
 function registerMetrics(scenario: string, mode: ReadPathMode): ProbeMetrics {
@@ -415,39 +512,99 @@ function registerMetrics(scenario: string, mode: ReadPathMode): ProbeMetrics {
     samples: 0,
     operations: 0,
     reads: 0,
+    readPasses: 0,
     writes: 0,
     rowsRead: 0,
+    coldRowsRead: 0,
+    hotRowsRead: 0,
     rowsChanged: 0,
-    touchedLowerBound: 0,
-    elapsedMs: 0
+    writeEffects: 0,
+    outputRowChanges: 0,
+    irrelevantWrites: 0,
+    incrementalEffects: 0,
+    recomputedEffects: 0,
+    elapsedMs: 0,
+    shapes: emptyShapeMetrics()
   };
   metrics.push(metric);
   return metric;
 }
 
-function emptySample(): Pick<ProbeMetrics, 'reads' | 'writes' | 'rowsRead' | 'rowsChanged' | 'touchedLowerBound'> {
+function emptyShapeMetrics(): Record<QueryShape, ShapeMetrics> {
+  return {
+    lookup: { reads: 0, coldPasses: 0, hotPasses: 0, coldRowsRead: 0, hotRowsRead: 0 },
+    range: { reads: 0, coldPasses: 0, hotPasses: 0, coldRowsRead: 0, hotRowsRead: 0 },
+    aggregate: { reads: 0, coldPasses: 0, hotPasses: 0, coldRowsRead: 0, hotRowsRead: 0 },
+    topN: { reads: 0, coldPasses: 0, hotPasses: 0, coldRowsRead: 0, hotRowsRead: 0 }
+  };
+}
+
+function emptySample(): SampleMetrics {
   return {
     reads: 0,
+    readPasses: 0,
     writes: 0,
     rowsRead: 0,
+    coldRowsRead: 0,
+    hotRowsRead: 0,
     rowsChanged: 0,
-    touchedLowerBound: 0
+    writeEffects: 0,
+    outputRowChanges: 0,
+    irrelevantWrites: 0,
+    incrementalEffects: 0,
+    recomputedEffects: 0,
+    shapes: emptyShapeMetrics()
   };
 }
 
 function record(
   metric: ProbeMetrics,
-  sample: Pick<ProbeMetrics, 'reads' | 'writes' | 'rowsRead' | 'rowsChanged' | 'touchedLowerBound'>,
+  sample: SampleMetrics,
   elapsedMs: number
 ): void {
   metric.samples += 1;
   metric.operations += SAMPLE_OPS;
   metric.reads += sample.reads;
+  metric.readPasses += sample.readPasses;
   metric.writes += sample.writes;
   metric.rowsRead += sample.rowsRead;
+  metric.coldRowsRead += sample.coldRowsRead;
+  metric.hotRowsRead += sample.hotRowsRead;
   metric.rowsChanged += sample.rowsChanged;
-  metric.touchedLowerBound += sample.touchedLowerBound;
+  metric.writeEffects += sample.writeEffects;
+  metric.outputRowChanges += sample.outputRowChanges;
+  metric.irrelevantWrites += sample.irrelevantWrites;
+  metric.incrementalEffects += sample.incrementalEffects;
+  metric.recomputedEffects += sample.recomputedEffects;
   metric.elapsedMs += elapsedMs;
+
+  for (const shape of queryShapes) {
+    const target = metric.shapes[shape];
+    const source = sample.shapes[shape];
+    target.reads += source.reads;
+    target.coldPasses += source.coldPasses;
+    target.hotPasses += source.hotPasses;
+    target.coldRowsRead += source.coldRowsRead;
+    target.hotRowsRead += source.hotRowsRead;
+  }
+}
+
+const queryShapes: readonly QueryShape[] = ['lookup', 'range', 'aggregate', 'topN'];
+
+function shapeRows(): readonly Record<string, string | number>[] {
+  return metrics.flatMap((metric) => queryShapes.map((shape) => {
+    const shapeMetric = metric.shapes[shape];
+    return {
+      scenario: metric.scenario,
+      mode: metric.mode,
+      shape,
+      reads: shapeMetric.reads,
+      readPassMode: `cold+${READ_REPEAT_COUNT - 1} hot`,
+      coldRowsPerRead: ratio(shapeMetric.coldRowsRead, shapeMetric.reads),
+      hotRowsPerRead: ratio(shapeMetric.hotRowsRead, shapeMetric.reads),
+      hotRowsPerHotPass: ratio(shapeMetric.hotRowsRead, shapeMetric.hotPasses)
+    };
+  })).filter((row) => row.reads !== 0);
 }
 
 function ratioRows(): readonly Record<string, string>[] {
@@ -493,9 +650,13 @@ function compareRow(scenario: string, comparison: string, left: ProbeMetrics, ri
     usPerReturnedRowRatio: ratioNumber(usPerReturnedRow(left), usPerReturnedRow(right)),
     rowsReadPerReadRatio: ratioNumber(left.rowsRead / Math.max(1, left.reads), right.rowsRead / Math.max(1, right.reads)),
     rowsChangedPerWriteRatio: ratioNumber(left.rowsChanged / Math.max(1, left.writes), right.rowsChanged / Math.max(1, right.writes)),
-    touchedLowerBoundPerWriteRatio: ratioNumber(
-      left.touchedLowerBound / Math.max(1, left.writes),
-      right.touchedLowerBound / Math.max(1, right.writes)
+    writeEffectsPerWriteRatio: ratioNumber(
+      left.writeEffects / Math.max(1, left.writes),
+      right.writeEffects / Math.max(1, right.writes)
+    ),
+    outputRowChangesPerWriteRatio: ratioNumber(
+      left.outputRowChanges / Math.max(1, left.writes),
+      right.outputRowChanges / Math.max(1, right.writes)
     )
   };
 }

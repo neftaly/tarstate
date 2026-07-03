@@ -177,12 +177,6 @@ export type AutomergeObjectLocationOptions<
   readonly heads?: Automerge.Heads;
   readonly detail?: unknown;
 };
-type RuntimeObjectLocationOptions<
-  DocumentShape extends object = Record<string, unknown>
-> = AutomergeObjectLocationOptions<DocumentShape> & {
-  readonly runtimeId?: string;
-};
-
 export type AutomergeMapAdapterOptions<
   DocumentShape extends object = Record<string, unknown>
 > = {
@@ -333,6 +327,15 @@ type AutomergeDocumentDriver<DocumentShape extends object> = {
   readonly subscribe?: (listener: () => void) => () => void;
   readonly notifyAfterChange: boolean;
 };
+type AutomergeObjectLocationSnapshot = {
+  readonly heads: Automerge.Heads;
+  readonly locations: readonly AutomergeObjectLocation[];
+  readonly locationByObjectId: ReadonlyMap<Automerge.ObjID, AutomergeObjectLocation>;
+  readonly runtimeRows: readonly RuntimeObjectLocationRow[];
+};
+type AutomergeObjectLocationSnapshotCache = {
+  readonly current: () => AutomergeObjectLocationSnapshot;
+};
 
 export function defineAutomergeMapRelations<DocumentShape extends object>() {
   return <const Relations extends readonly AutomergeMapRelation<RelationRef, DocumentShape>[]>(
@@ -347,13 +350,15 @@ export function automergeMapSource<
   options: AutomergeMapSourceOptions<DocumentShape>
 ): AutomergeMapSource {
   const dataSource = createAutomergeMapSource(() => doc, options.relations);
+  const runtimeId = options.runtimeId ?? 'automergeMapSource';
   return withAutomergeSystemSource(
     () => doc,
     dataSource,
     options.relations,
-    options.runtimeId ?? 'automergeMapSource',
+    runtimeId,
     new Map(),
-    options.system
+    options.system,
+    createObjectLocationSnapshotCache(() => doc, options.relations, runtimeId)
   );
 }
 
@@ -479,13 +484,19 @@ function createAutomergeMapAdapter<
   const interests = new Map<string, RuntimeInterestRow>();
   const dataSource = createAutomergeMapSource(driver.getDoc, options.relations);
   const runtimeId = options.runtimeId ?? 'automergeMapRuntime';
+  const objectLocationCache = createObjectLocationSnapshotCache(
+    driver.getDoc,
+    options.relations,
+    runtimeId
+  );
   const source = withAutomergeSystemSource(
     driver.getDoc,
     dataSource,
     options.relations,
     runtimeId,
     interests,
-    options.system
+    options.system,
+    objectLocationCache
   );
   const relationNames = relationNamesFor(options.relations);
   let closed = false;
@@ -542,16 +553,17 @@ function createAutomergeMapAdapter<
   const objectIdFor = (relation: RelationRef, key: unknown) =>
     objectIdForRelation(driver.getDoc(), options.relations, relation, key);
   const pathForObjectId = (objectId: Automerge.ObjID) =>
-    automergePathForObjectId(driver.getDoc(), objectId);
+    pathForObjectIdFromSnapshot(objectLocationCache.current(), objectId);
   const objectReferenceFor = (relation: RelationRef, key: unknown) => {
     const objectId = objectIdFor(relation, key);
     if (objectId === null) return null;
-    const path = pathForObjectId(objectId) ?? undefined;
+    const snapshot = objectLocationCache.current();
+    const location = snapshot.locationByObjectId.get(objectId);
 
     return automergeObjectReference({
       objectId,
-      ...(path === undefined ? {} : { path }),
-      heads: Automerge.getHeads(driver.getDoc()),
+      ...(location === undefined ? {} : { path: [...location.path] }),
+      heads: snapshot.heads,
       relation: relation.name,
       ...(key === undefined ? {} : { key })
     });
@@ -806,10 +818,18 @@ function withAutomergeSystemSource<DocumentShape extends object>(
   relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[],
   runtimeId: string,
   interests: ReadonlyMap<string, RuntimeInterestRow>,
-  input?: RuntimeSystemState | (() => RuntimeSystemState)
+  input?: RuntimeSystemState | (() => RuntimeSystemState),
+  objectLocationCache = createObjectLocationSnapshotCache(getDoc, relations, runtimeId)
 ): AutomergeMapSource {
+  const extraState = (): RuntimeSystemState | undefined => typeof input === 'function' ? input() : input;
+  const objectLocationRows = (): readonly RuntimeObjectLocationRow[] => {
+    const extraObjectLocations = extraState()?.objectLocations ?? [];
+    return extraObjectLocations.length === 0
+      ? objectLocationCache.current().runtimeRows
+      : [...extraObjectLocations, ...objectLocationCache.current().runtimeRows];
+  };
   const systemState = (): RuntimeSystemState => {
-    const extra = typeof input === 'function' ? input() : input;
+    const extra = extraState();
     const heads = Automerge.getHeads(getDoc());
     const diagnostics = dataSource.diagnostics?.() ?? [];
 
@@ -858,19 +878,28 @@ function withAutomergeSystemSource<DocumentShape extends object>(
     };
   };
   const systemSource = runtimeSystemSource(systemState);
-  const objectLocationSource: AdapterSource<Automerge.Heads> = {
-    relationNames: [runtimeSystemRelations.objectLocations.name],
-    rows: (relationRef) => relationRef.name === runtimeSystemRelations.objectLocations.name
-      ? runtimeObjectLocationRows(getDoc(), { runtimeId, relations })
-      : []
-  };
-  const rowSource = composeSources(dataSource, systemSource, objectLocationSource);
+  const rowSource = composeSources(dataSource, systemSource);
 
   return {
     ...rowSource,
+    rows: (relationRef) => relationRef.name === runtimeSystemRelations.objectLocations.name
+      ? objectLocationRows()
+      : rowSource.rows(relationRef),
+    lookup: (lookup) => lookup.relation.name === runtimeSystemRelations.objectLocations.name
+      ? objectLocationRows().filter((row) =>
+        fieldLookupMatches(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.value))
+      : rowSource.lookup?.(lookup) ?? [],
+    rangeLookup: (lookup) => lookup.relation.name === runtimeSystemRelations.objectLocations.name
+      ? objectLocationRows().filter((row) =>
+        fieldValueInRange(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.lower, lookup.upper))
+      : rowSource.rangeLookup?.(lookup) ?? [],
     version: () => dataSource.version?.() ?? Automerge.getHeads(getDoc()),
     ...(dataSource.diagnostics === undefined ? {} : { diagnostics: dataSource.diagnostics })
   };
+}
+
+function runtimeRowField(row: RuntimeObjectLocationRow, field: string): unknown {
+  return (row as unknown as Record<string, unknown>)[field];
 }
 
 function decodeRelationRow(relation: RelationRef, row: Row): Row {
@@ -1009,18 +1038,43 @@ function objectIdForRelation<DocumentShape extends object>(
     const lookup = getPathValue(doc, mapping.path);
     if (lookup.status !== 'found') continue;
 
+    if (isRecord(lookup.value)) {
+      const objectId = objectIdForMapKey(mapping.relation, lookup.value, keyValue, key);
+      if (objectId !== undefined) return objectId;
+    }
+
     const values = Array.isArray(lookup.value)
       ? lookup.value
       : isRecord(lookup.value)
         ? Object.values(lookup.value)
         : [];
-
     for (const value of values) {
       if (currentRowKey(mapping.relation, value) === key) return Automerge.getObjectId(value);
     }
   }
 
   return null;
+}
+
+function objectIdForMapKey(
+  relation: RelationRef,
+  values: Record<string, unknown>,
+  keyValue: unknown,
+  normalizedKey: string
+): Automerge.ObjID | undefined {
+  const fields = relationKeyFields(relation);
+  if (fields.length !== 1) return undefined;
+
+  const key = fieldKeyValue(relation.fields[fields[0] as string], keyValue);
+  if (typeof key !== 'string' && typeof key !== 'number' && typeof key !== 'boolean') return undefined;
+
+  const property = String(key);
+  if (!Object.prototype.hasOwnProperty.call(values, property)) return undefined;
+
+  const value = values[property];
+  if (currentRowKey(relation, value) !== normalizedKey) return undefined;
+
+  return Automerge.getObjectId(value) ?? undefined;
 }
 
 function automergeObjectLocationRows<DocumentShape extends object>(
@@ -1073,13 +1127,46 @@ function automergeObjectLocationRows<DocumentShape extends object>(
   return rows;
 }
 
-function runtimeObjectLocationRows<DocumentShape extends object>(
-  doc: Automerge.Doc<DocumentShape>,
-  options: RuntimeObjectLocationOptions<DocumentShape>
-): readonly RuntimeObjectLocationRow[] {
-  const runtime = options.runtimeId ?? 'automergeMapRuntime';
+function createObjectLocationSnapshotCache<DocumentShape extends object>(
+  getDoc: () => Automerge.Doc<DocumentShape>,
+  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[],
+  runtimeId: string
+): AutomergeObjectLocationSnapshotCache {
+  let cached: AutomergeObjectLocationSnapshot | undefined;
 
-  return automergeObjectLocationRows(doc, options).map((location): RuntimeObjectLocationRow => ({
+  return {
+    current: () => {
+      const doc = getDoc();
+      const heads = Automerge.getHeads(doc);
+      if (cached !== undefined && headsEqual(cached.heads, heads)) return cached;
+
+      const locations = automergeObjectLocationRows(doc, { heads, relations });
+      const locationByObjectId = new Map(locations.map((location) => [location.objectId, location]));
+      cached = {
+        heads,
+        locations,
+        locationByObjectId,
+        runtimeRows: runtimeObjectLocationRowsFromLocations(locations, runtimeId)
+      };
+
+      return cached;
+    }
+  };
+}
+
+function pathForObjectIdFromSnapshot(
+  snapshot: AutomergeObjectLocationSnapshot,
+  objectId: Automerge.ObjID
+): AutomergeObjectPath | null {
+  const location = snapshot.locationByObjectId.get(objectId);
+  return location === undefined ? null : [...location.path];
+}
+
+function runtimeObjectLocationRowsFromLocations(
+  locations: readonly AutomergeObjectLocation[],
+  runtime: string
+): readonly RuntimeObjectLocationRow[] {
+  return locations.map((location): RuntimeObjectLocationRow => ({
     id: `${runtime}:object:${location.objectId}`,
     runtime,
     objectId: location.objectId,
