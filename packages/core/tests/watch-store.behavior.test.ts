@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { q, setEnvTx, transact, tryTransact, type DbTransactionContext } from '@tarstate/core/db';
 import { type TarstateDiagnostic } from '@tarstate/core/diagnostics';
+import { diffRows, rowDiffKey, type RowChange } from '@tarstate/core/diff';
 import { explainMaterialization, mat, materializedRelationFor } from '@tarstate/core/materialization';
 import { relicChanges, trackTransact } from '@tarstate/core/runtime';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
@@ -21,6 +22,7 @@ import {
 } from '@tarstate/core/watch';
 import { deleteByKey, insert, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { entry, makeDb, schema } from './behavior-fixtures.js';
+import { createSeededRandom } from './fuzz-helpers.js';
 
 const entryList = pipe(
   from(entry),
@@ -172,6 +174,91 @@ describe('watch and store behavior', () => {
       { id: 'e4', accountId: 'cash', amount: 0 },
       { id: 'e5', accountId: 'cash', amount: 35 }
     ]);
+  });
+
+  it('watch refresh, query diffs, and tracked transactions match seeded row-diff oracles', async () => {
+    let checks = 0;
+
+    for (const seed of [0x4a11, 0x4a12, 0x4a13] as const) {
+      let db = makeDb();
+
+      for (const [index, batch] of seededWatchBatches(seed).entries()) {
+        const beforeRows = q(db, entryList);
+        const after = transact(db, batch);
+        const afterRows = q(after, entryList);
+        const expected = diffRows(beforeRows, afterRows);
+        const expectedAdded = addedRows(expected.changes);
+        const expectedRemoved = removedRows(expected.changes);
+        const expectedUnchanged = unchangedRows(afterRows, expected.changes);
+        const label = `seed ${seed.toString(16)} batch ${index}`;
+        const events: unknown[] = [];
+        const handle = watch(db, entryList, (event) => {
+          events.push(event);
+        }, { label });
+
+        try {
+          const refresh = await handle.refresh(after);
+          const diff = await diffQuery(db, after, entryList);
+          const tracked = await trackTransact(attachWatches(db, entryList), ...batch);
+
+          expect(expected.diagnostics, `${label} oracle diagnostics`).toEqual([]);
+          expect(refresh, `${label} refresh`).toEqual(expect.objectContaining({
+            targetKey: watchTargetKey(entryList),
+            previousRows: beforeRows,
+            rows: afterRows,
+            changed: expected.changes.length > 0,
+            added: expectedAdded,
+            removed: expectedRemoved,
+            unchanged: expectedUnchanged,
+            rowChanges: expected.changes,
+            diagnostics: []
+          }));
+          expect(events, `${label} events`).toEqual([
+            expect.objectContaining({
+              changed: expected.changes.length > 0,
+              added: expectedAdded,
+              removed: expectedRemoved,
+              unchanged: expectedUnchanged,
+              rowChanges: expected.changes
+            })
+          ]);
+          expect(diff, `${label} diff`).toEqual(expect.objectContaining({
+            beforeRows,
+            afterRows,
+            changed: expected.changes.length > 0,
+            added: expectedAdded,
+            removed: expectedRemoved,
+            unchanged: expectedUnchanged,
+            rowChanges: expected.changes,
+            diagnostics: []
+          }));
+          expect(tracked.supported, `${label} tracked supported`).toBe(true);
+          expect(tracked.result, `${label} tracked result`).toEqual(expect.objectContaining({
+            committed: true,
+            diagnostics: []
+          }));
+          expect(tracked.changes, `${label} tracked changes`).toEqual([
+            expect.objectContaining({
+              targetKey: watchTargetKey(entryList),
+              changed: expected.changes.length > 0,
+              added: expectedAdded,
+              removed: expectedRemoved,
+              unchanged: expectedUnchanged,
+              rowChanges: expected.changes,
+              diagnostics: []
+            })
+          ]);
+          expect(q(tracked.db, entryList), `${label} tracked rows`).toEqual(afterRows);
+        } finally {
+          handle.unwatch();
+        }
+
+        db = after;
+        checks += 1;
+      }
+    }
+
+    expect(checks).toBeGreaterThan(0);
   });
 
   it('detaches pure db watches and projects trackTransact changes with Relic deleted spelling', async () => {
@@ -647,6 +734,73 @@ describe('watch and store behavior', () => {
     ]);
   });
 });
+
+const watchAccountIds = ['cash', 'sales', 'fees', 'equity'] as const;
+
+function seededWatchBatches(seed: number): readonly (readonly WritePatch[])[] {
+  const next = createSeededRandom(seed);
+  const suffix = seed.toString(16);
+  return [
+    [
+      updateByKey(schema.entries, 'e1', { amount: seededWatchAmount(next) })
+    ],
+    [
+      insert(schema.entries, {
+        id: `watch-${suffix}-a`,
+        accountId: seededWatchAccountId(next),
+        amount: seededWatchAmount(next),
+        memo: `seed-${suffix}-a`,
+        posted: true
+      })
+    ],
+    [
+      deleteByKey(schema.entries, 'e2')
+    ],
+    [
+      updateByKey(schema.entries, 'e4', {
+        accountId: seededWatchAccountId(next),
+        amount: seededWatchAmount(next),
+        posted: next() > 0.5
+      })
+    ],
+    [
+      insert(schema.entries, {
+        id: `watch-${suffix}-b`,
+        accountId: seededWatchAccountId(next),
+        amount: seededWatchAmount(next),
+        posted: next() > 0.25
+      }),
+      updateByKey(schema.entries, `watch-${suffix}-a`, {
+        accountId: seededWatchAccountId(next),
+        amount: seededWatchAmount(next)
+      })
+    ],
+    [
+      deleteByKey(schema.entries, `watch-${suffix}-b`)
+    ]
+  ];
+}
+
+function seededWatchAccountId(next: () => number): typeof watchAccountIds[number] {
+  return watchAccountIds[Math.floor(next() * watchAccountIds.length)] ?? 'cash';
+}
+
+function seededWatchAmount(next: () => number): number {
+  return Math.floor(next() * 401) - 200;
+}
+
+function addedRows<Row>(changes: readonly RowChange<Row>[]): readonly Row[] {
+  return changes.flatMap((change) => change.kind === 'added' ? [change.row] : []);
+}
+
+function removedRows<Row>(changes: readonly RowChange<Row>[]): readonly Row[] {
+  return changes.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+}
+
+function unchangedRows<Row>(rows: readonly Row[], changes: readonly RowChange<Row>[]): readonly Row[] {
+  const changedKeys = new Set(changes.map((change) => change.key));
+  return rows.filter((rowValue) => !changedKeys.has(rowDiffKey(rowValue)));
+}
 
 async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));

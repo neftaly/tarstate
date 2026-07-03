@@ -13,6 +13,7 @@ import {
   field,
   from,
   join,
+  leftJoin,
   limit,
   max,
   min,
@@ -21,6 +22,7 @@ import {
   sort,
   sum,
   value,
+  where,
   type Query
 } from '@tarstate/core/query';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
@@ -28,8 +30,11 @@ import { account, entry, openingAccounts, schema, type Account, type Entry } fro
 import { createSeededRandom } from './fuzz-helpers.js';
 
 const aggregateSeeds = [0xa661, 0xa662, 0xa663, 0xa664] as const;
+const aggregateTransitionSeeds = [0xa771, 0xa772, 0xa773] as const;
 const topNSeeds = [0x70a1, 0x70a2, 0x70a3] as const;
 const joinSeeds = [0x91f1, 0x91f2, 0x91f3] as const;
+const leftJoinSeeds = [0x1ef1, 0x1ef2, 0x1ef3] as const;
+const sortTieFallbackSeeds = [0x5011, 0x5012, 0x5013] as const;
 
 const totalsByAccount = pipe(
   from(entry),
@@ -66,6 +71,39 @@ const joinedEntryAccounts = pipe(
   })
 ) as Query<unknown>;
 
+const leftJoinedEntryAccounts = pipe(
+  from(entry),
+  leftJoin(from(account), clauses<Entry, Account>({ accountId: 'id' })),
+  project({
+    entryId: entry.id,
+    accountId: account.id,
+    entryAccountId: entry.accountId,
+    amount: entry.amount,
+    accountName: account.$.name
+  }),
+  sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
+) as Query<unknown>;
+
+const postedEntriesByAmountTie = pipe(
+  from(entry),
+  wherePosted(),
+  sort(asc(entry.amount))
+) as Query<unknown>;
+
+const joinedPostedEntriesByAccountNameTie = pipe(
+  from(entry),
+  join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
+  wherePosted(),
+  project({
+    entryId: entry.id,
+    accountId: account.id,
+    entryAccountId: entry.accountId,
+    amount: entry.amount,
+    accountName: account.$.name
+  }),
+  sort(asc(field<string>('row', 'accountName')))
+) as Query<unknown>;
+
 describe('materialization edge fuzz behavior', () => {
   it('maintains aggregate edge batches against dematerialized diffRows oracles', () => {
     expect(explainMaterialization(totalsByAccount)).toEqual(expect.objectContaining({
@@ -83,6 +121,29 @@ describe('materialization edge fuzz behavior', () => {
         query: totalsByAccount,
         keyBy: pathKey('accountId'),
         batches: aggregateEdgeBatches(seed)
+      });
+    }
+
+    expect(changedBatches).toBeGreaterThan(0);
+  });
+
+  it('maintains aggregate extrema and averages across seeded group transitions', () => {
+    expect(explainMaterialization(totalsByAccount)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    let changedBatches = 0;
+    for (const seed of aggregateTransitionSeeds) {
+      changedBatches += expectSeededBatches({
+        label: `aggregate transitions ${hex(seed)}`,
+        seed,
+        createDb: aggregateTransitionDb,
+        query: totalsByAccount,
+        keyBy: pathKey('accountId'),
+        batches: aggregateTransitionBatches(seed)
       });
     }
 
@@ -160,16 +221,58 @@ describe('materialization edge fuzz behavior', () => {
 
     expect(changedBatches).toBeGreaterThan(0);
   });
+
+  it('maintains seeded left-join matched and unmatched transitions against dematerialized diffRows oracles', () => {
+    expect(explainMaterialization(leftJoinedEntryAccounts)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    let changedBatches = 0;
+    for (const seed of leftJoinSeeds) {
+      changedBatches += expectSeededBatches({
+        label: `left join ${hex(seed)}`,
+        seed,
+        createDb: leftJoinEdgeDb,
+        query: leftJoinedEntryAccounts,
+        keyBy: joinedEntryAccountKey,
+        batches: leftJoinEdgeBatches(seed)
+      });
+    }
+
+    expect(changedBatches).toBeGreaterThan(0);
+  });
+
+  it('falls back for seeded non-total sort tie entrances that change full recompute order', () => {
+    for (const seed of sortTieFallbackSeeds) {
+      expectFallbackRecompute({
+        label: `single-source tie ${hex(seed)}`,
+        db: mat(sortTieDb(seed), postedEntriesByAmountTie),
+        query: postedEntriesByAmountTie,
+        batch: [updateByKey(schema.entries, `tie-${hex(seed)}-a`, { posted: true })]
+      });
+
+      expectFallbackRecompute({
+        label: `join tie ${hex(seed)}`,
+        db: mat(joinSortTieDb(seed), joinedPostedEntriesByAccountNameTie),
+        query: joinedPostedEntriesByAccountNameTie,
+        batch: [updateByKey(schema.entries, `join-tie-${hex(seed)}-a`, { posted: true })]
+      });
+    }
+  });
 });
 
 function expectSeededBatches(input: {
   readonly label: string;
   readonly seed: number;
+  readonly createDb?: (seed: number) => Db;
   readonly query: Query<unknown>;
   readonly keyBy: RowKeySelector<unknown>;
   readonly batches: readonly (readonly WritePatch[])[];
 }): number {
-  let db = mat(edgeDb(input.seed), input.query);
+  let db = mat((input.createDb ?? edgeDb)(input.seed), input.query);
   let changedBatches = 0;
 
   expect(q(db, input.query), `${input.label} initial rows`).toEqual(q(demat(db, input.query), input.query));
@@ -236,6 +339,34 @@ function expectBatch(input: {
   return { db: result.db, beforeRows, afterRows: dematerializedRows, diff: expected, change };
 }
 
+function expectFallbackRecompute(input: {
+  readonly label: string;
+  readonly db: Db;
+  readonly query: Query<unknown>;
+  readonly batch: readonly WritePatch[];
+}): Db {
+  const result = tryTransact(input.db, input.batch);
+  expect(result.committed, `${input.label} committed`).toBe(true);
+
+  const dematerializedRows = q(demat(result.db, input.query), input.query);
+  const change = result.materializations?.changes[0];
+
+  expect(change, `${input.label} materialization change`).toEqual(expect.objectContaining({
+    update: 'recomputed',
+    recomputed: true,
+    rows: dematerializedRows,
+    diagnostics: expect.arrayContaining([
+      expect.objectContaining({
+        code: 'materialization_unsupported',
+        message: 'incremental materialization candidate differed from full recompute'
+      })
+    ])
+  }));
+  expect(q(result.db, input.query), `${input.label} materialized rows`).toEqual(dematerializedRows);
+
+  return result.db;
+}
+
 function aggregateEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
   const next = createSeededRandom(seed ^ 0xa660);
   const suffix = hex(seed);
@@ -262,6 +393,51 @@ function aggregateEdgeBatches(seed: number): readonly (readonly WritePatch[])[] 
       ...(index % 2 === 0 ? [deleteByKey(schema.entries, `e${(index + 6) % 8}`)] : [])
     ];
   });
+}
+
+function aggregateTransitionBatches(seed: number): readonly (readonly WritePatch[])[] {
+  const next = createSeededRandom(seed ^ 0xa770);
+  const suffix = hex(seed);
+  return [
+    [
+      updateByKey(schema.entries, `agg-${suffix}-cash-low`, { amount: 30 + Math.floor(next() * 5) }),
+      updateByKey(schema.entries, `agg-${suffix}-cash-mid`, { amount: -15 - Math.floor(next() * 5), posted: true })
+    ],
+    [
+      deleteByKey(schema.entries, `agg-${suffix}-sales-low`),
+      insertOrReplace(schema.entries, {
+        id: `agg-${suffix}-sales-new`,
+        accountId: 'sales',
+        amount: 9 + Math.floor(next() * 7),
+        memo: `sales-new-${suffix}`,
+        posted: next() > 0.25
+      })
+    ],
+    [
+      updateByKey(schema.entries, `agg-${suffix}-cash-high`, {
+        accountId: 'sales',
+        amount: -20 - Math.floor(next() * 6)
+      })
+    ],
+    [
+      deleteByKey(schema.entries, `agg-${suffix}-fees-only`)
+    ],
+    [
+      insertOrReplace(schema.entries, {
+        id: `agg-${suffix}-fees-return`,
+        accountId: 'fees',
+        amount: 4 + Math.floor(next() * 10),
+        memo: null,
+        posted: true
+      }),
+      insertOrReplace(schema.entries, {
+        id: `agg-${suffix}-equity-new`,
+        accountId: 'equity',
+        amount: -4 - Math.floor(next() * 10),
+        posted: false
+      })
+    ]
+  ];
 }
 
 function topNEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
@@ -341,7 +517,106 @@ function joinEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
   ];
 }
 
-function edgeDb(seed: number) {
+function leftJoinEdgeBatches(seed: number): readonly (readonly WritePatch[])[] {
+  const next = createSeededRandom(seed ^ 0x1ef0);
+  const suffix = hex(seed);
+  const pendingId = `pending-${suffix}`;
+  const futureId = `future-${suffix}`;
+  const lateId = `late-${suffix}`;
+  return [
+    [
+      insertOrReplace(schema.accounts, { id: pendingId, name: `Pending ${suffix}`, kind: 'asset' })
+    ],
+    [
+      updateByKey(schema.accounts, pendingId, { name: `Pending ${suffix} renamed`, kind: 'liability' })
+    ],
+    [
+      deleteByKey(schema.accounts, pendingId)
+    ],
+    [
+      insertOrReplace(schema.accounts, { id: futureId, name: `Future ${suffix}`, kind: 'asset' })
+    ],
+    [
+      updateByKey(schema.entries, `lj-${suffix}-future`, {
+        accountId: 'cash',
+        amount: 40 + Math.floor(next() * 10)
+      })
+    ],
+    [
+      insertOrReplace(schema.entries, {
+        id: `lj-${suffix}-late`,
+        accountId: lateId,
+        amount: 12 + Math.floor(next() * 10),
+        memo: `late-${suffix}`,
+        posted: true
+      })
+    ],
+    [
+      insertOrReplace(schema.accounts, { id: lateId, name: `Late ${suffix}`, kind: 'income' })
+    ]
+  ];
+}
+
+function aggregateTransitionDb(seed: number): Db {
+  const suffix = hex(seed);
+  const next = createSeededRandom(seed ^ 0xa771);
+  const shift = Math.floor(next() * 4);
+  return createDb({
+    accounts: openingAccounts.map((row) => ({ ...row })),
+    entries: [
+      { id: `agg-${suffix}-cash-low`, accountId: 'cash', amount: 3 + shift, posted: true },
+      { id: `agg-${suffix}-cash-mid`, accountId: 'cash', amount: 10 + shift, posted: false },
+      { id: `agg-${suffix}-cash-high`, accountId: 'cash', amount: 17 + shift, posted: true },
+      { id: `agg-${suffix}-sales-low`, accountId: 'sales', amount: -2 - shift, posted: true },
+      { id: `agg-${suffix}-sales-high`, accountId: 'sales', amount: 8 + shift, posted: false },
+      { id: `agg-${suffix}-fees-only`, accountId: 'fees', amount: 5 + shift, memo: null, posted: true }
+    ] satisfies readonly Entry[]
+  });
+}
+
+function leftJoinEdgeDb(seed: number): Db {
+  const suffix = hex(seed);
+  return createDb({
+    accounts: openingAccounts.map((row) => ({ ...row })),
+    entries: [
+      { id: `lj-${suffix}-cash`, accountId: 'cash', amount: 10, posted: true },
+      { id: `lj-${suffix}-pending`, accountId: `pending-${suffix}`, amount: 20, posted: true },
+      { id: `lj-${suffix}-future`, accountId: `future-${suffix}`, amount: -5, posted: false },
+      { id: `lj-${suffix}-fees`, accountId: 'fees', amount: 5, posted: true }
+    ] satisfies readonly Entry[]
+  });
+}
+
+function sortTieDb(seed: number): Db {
+  const suffix = hex(seed);
+  const amount = 10 + seed % 5;
+  return createDb({
+    accounts: openingAccounts.map((row) => ({ ...row })),
+    entries: [
+      { id: `tie-${suffix}-a`, accountId: 'cash', amount, posted: false },
+      { id: `tie-${suffix}-b`, accountId: 'cash', amount, posted: true },
+      { id: `tie-${suffix}-c`, accountId: 'fees', amount: amount + 10, posted: true },
+      { id: `tie-${suffix}-d`, accountId: 'sales', amount: amount - 5, posted: true }
+    ] satisfies readonly Entry[]
+  });
+}
+
+function joinSortTieDb(seed: number): Db {
+  const suffix = hex(seed);
+  return createDb({
+    accounts: [
+      { id: 'cash', name: `Cash ${suffix}`, kind: 'asset' },
+      { id: 'fees', name: `Fees ${suffix}`, kind: 'expense' }
+    ] satisfies readonly Account[],
+    entries: [
+      { id: `join-tie-${suffix}-a`, accountId: 'cash', amount: 10, posted: false },
+      { id: `join-tie-${suffix}-b`, accountId: 'cash', amount: 20, posted: true },
+      { id: `join-tie-${suffix}-c`, accountId: 'fees', amount: 30, posted: true }
+    ] satisfies readonly Entry[]
+  });
+}
+
+function edgeDb(seed: number): Db {
   const next = createSeededRandom(seed);
   return createDb({
     accounts: openingAccounts.map((row) => ({ ...row })),
@@ -356,6 +631,10 @@ function edgeDb(seed: number) {
 }
 
 const accountIds = ['cash', 'sales', 'fees', 'equity'] as const;
+
+function wherePosted() {
+  return where(eq(entry.posted, value(true)));
+}
 
 function pathKey(...path: readonly string[]): RowKeySelector<unknown> {
   return (row) => {

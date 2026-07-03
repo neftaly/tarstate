@@ -5,7 +5,9 @@ import {
   type AdapterSource,
   type ComposedRelationRuntimeVersion,
   type RelationDelta,
+  type RelationLookup,
   type RelationPatchTarget,
+  type RelationRangeLookup,
   type RelationRuntime,
   type TarstateDiagnostic
 } from '@tarstate/core/adapter';
@@ -334,10 +336,8 @@ function createAutomergeMapSource<DocumentShape extends object>(
   return {
     relationNames,
     rows: (relationRef) => rowsForRelation(getDoc(), relations, relationRef),
-    lookup: (lookup) => rowsForRelation(getDoc(), relations, lookup.relation)
-      .filter((row) => Object.is(row[lookup.field], lookup.value)),
-    rangeLookup: (lookup) => rowsForRelation(getDoc(), relations, lookup.relation)
-      .filter((row) => inRange(row[lookup.field], lookup.lower, lookup.upper)),
+    lookup: (lookup) => lookupRowsForRelation(getDoc(), relations, lookup),
+    rangeLookup: (lookup) => rangeRowsForRelation(getDoc(), relations, lookup),
     version: () => Automerge.getHeads(getDoc()),
     diagnostics: () => relations.flatMap((mapping) => mappedCollection(getDoc(), mapping).diagnostics)
   };
@@ -351,6 +351,56 @@ function rowsForRelation<DocumentShape extends object>(
   return relations
     .filter((mapping) => mapping.relation.name === relationRef.name)
     .flatMap((mapping) => mappedCollection(doc, mapping).rows);
+}
+
+function lookupRowsForRelation<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  relations: readonly AnyMapRelation[],
+  lookup: RelationLookup
+): readonly Row[] {
+  return relations
+    .filter((mapping) => mapping.relation.name === lookup.relation.name)
+    .flatMap((mapping) => mappedRowsMatching(doc, mapping, (row) => Object.is(row[lookup.field], lookup.value)));
+}
+
+function rangeRowsForRelation<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  relations: readonly AnyMapRelation[],
+  lookup: RelationRangeLookup
+): readonly Row[] {
+  return relations
+    .filter((mapping) => mapping.relation.name === lookup.relation.name)
+    .flatMap((mapping) => mappedRowsMatching(
+      doc,
+      mapping,
+      (row) => inRange(row[lookup.field], lookup.lower, lookup.upper)
+    ));
+}
+
+function mappedRowsMatching<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  mapping: AnyMapRelation,
+  predicate: (row: Record<string, unknown>) => boolean
+): readonly Row[] {
+  const lookup = getPathValue(doc, mapping.path);
+  if (lookup.status !== 'found') return [];
+
+  if (Array.isArray(lookup.value)) return rowsMatching(lookup.value, predicate);
+  if (isRecord(lookup.value)) return rowsMatching(Object.values(lookup.value), predicate);
+  return [];
+}
+
+function rowsMatching(
+  values: readonly unknown[],
+  predicate: (row: Record<string, unknown>) => boolean
+): readonly Row[] {
+  const rows: Row[] = [];
+
+  for (const value of values) {
+    if (isRecord(value) && predicate(value)) rows.push(cloneRow(value));
+  }
+
+  return rows;
 }
 
 function stagedSourceFor(context: PatchEvaluationContext): AdapterSource<Automerge.Heads> {

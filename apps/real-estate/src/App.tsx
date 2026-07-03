@@ -1,4 +1,14 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type Dispatch,
+  type FormEvent,
+  type SetStateAction
+} from 'react';
 import {
   TarstateProvider,
   useCommit,
@@ -15,6 +25,7 @@ import {
   index as materializedIndex,
   readMaterializedQuery
 } from '@tarstate/core/materialization';
+import { queryKey, type Query } from '@tarstate/core/query';
 import type { StoreCommitResult } from '@tarstate/core/store';
 import { diffQuery } from '@tarstate/core/watch';
 import { insert, updateByKey } from '@tarstate/core/write';
@@ -34,6 +45,7 @@ import {
   type PropertyType
 } from './domain';
 import {
+  allListingsQuery,
   defaultFilters,
   inquiryQueueQuery,
   listingLookupQuery,
@@ -48,6 +60,7 @@ import {
   topPricedListingsQuery,
   type ListingFilters,
   type ListingIndexRow,
+  type MarketSummaryRow,
   type ListingResult
 } from './queries';
 import { createRealEstateStore } from './store';
@@ -72,18 +85,19 @@ type SelectOption<Value extends string> = {
   readonly label: string;
 };
 
-const allListingsFilters: ListingFilters = {
-  status: 'all',
-  neighborhoodId: 'all',
-  propertyType: 'all',
-  maxPrice: 3000000,
-  minBedrooms: 0,
-  sort: 'price_asc'
-};
-
 const fixtureDate = '2026-07-03';
 const jsonIndent = 2;
 const queryKeyPrefix = 'query:';
+const currencyFormatter = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+  maximumFractionDigits: 0
+});
+const wholeNumberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
+const decimalFormatter = new Intl.NumberFormat('en-US', {
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1
+});
 
 const statusOptions: readonly SelectOption<ListingStatus | 'all'>[] = [
   { value: 'all', label: 'All statuses' },
@@ -121,15 +135,17 @@ const relationOptions = [
   readonly relation: RelationRef;
 }[];
 
+const marketMaterializationExplanation = explainMaterialization(neighborhoodMarketSummaryQuery);
+
 export function App() {
   const [includeInvalidRows, setIncludeInvalidRowsState] = useState(false);
   const [lastCommit, setLastCommit] = useState<CommitReport | undefined>(undefined);
   const store = useMemo(() => createRealEstateStore(includeInvalidRows), [includeInvalidRows]);
 
-  const setIncludeInvalidRows = (value: boolean) => {
+  const setIncludeInvalidRows = useCallback((value: boolean) => {
     setLastCommit(undefined);
     setIncludeInvalidRowsState(value);
-  };
+  }, []);
 
   return (
     <TarstateProvider store={store}>
@@ -212,12 +228,12 @@ function SourceDataSection() {
   const [selectedRelationName, setSelectedRelationName] = useState('listings');
   const selected = relationOptionFor(selectedRelationName);
   const rows = snapshot.db.data[selected.name] ?? [];
-  const relationSummary = useMemo(() => describeRelation(selected.relation), [selected]);
-  const relationCounts = relationOptions.map((item) => ({
+  const relationSummary = useMemo(() => describeRelation(selected.relation), [selected.relation]);
+  const relationCounts = useMemo(() => relationOptions.map((item) => ({
     relation: item.label,
     rows: snapshot.db.data[item.name]?.length ?? 0,
     key: item.relation.key
-  }));
+  })), [snapshot.db]);
 
   return (
     <section className="walkthrough-section" id="source">
@@ -284,17 +300,16 @@ function ListingsSection({
   setSelectedListingId
 }: {
   readonly filters: ListingFilters;
-  readonly setFilters: (filters: ListingFilters) => void;
+  readonly setFilters: Dispatch<SetStateAction<ListingFilters>>;
   readonly selectedListingId: string;
   readonly setSelectedListingId: (id: string) => void;
 }) {
   const query = useMemo(() => listingWalkthroughQuery(filters), [filters]);
-  const view = useView(query);
+  const queryResetKey = useQueryResetKey(query);
+  const view = useView(query, { resetKey: queryResetKey });
   const totals = useQuery(query, {
-    select: (rows) => ({
-      count: rows.length,
-      averagePrice: rows.length === 0 ? 0 : rows.reduce((sum, item) => sum + safeNumber(item.price), 0) / rows.length
-    })
+    resetKey: queryResetKey,
+    select: selectListingTotals
   });
   const neighborhoodOptions = useMemo<readonly SelectOption<string>[]>(() => [
     { value: 'all', label: 'All neighborhoods' },
@@ -302,7 +317,7 @@ function ListingsSection({
   ], []);
 
   const updateFilter = <Key extends keyof ListingFilters>(key: Key, value: ListingFilters[Key]) => {
-    setFilters({ ...filters, [key]: value });
+    setFilters((current) => ({ ...current, [key]: value }));
   };
 
   return (
@@ -457,9 +472,13 @@ function ListingCard({
 function HooksSection({ selectedListingId }: { readonly selectedListingId: string }) {
   const listingRow = useRow(schema.listings, selectedListingId);
   const lookupQuery = useMemo(() => listingLookupQuery(selectedListingId), [selectedListingId]);
-  const lookupView = useView(lookupQuery);
+  const lookupResetKey = useQueryResetKey(lookupQuery);
+  const lookupView = useView(lookupQuery, { resetKey: lookupResetKey });
   const openHouses = useView(openHouseScheduleQuery);
-  const selectedOpenHouses = openHouses.rows.filter((item) => item.listingId === selectedListingId);
+  const selectedOpenHouses = useMemo(
+    () => openHouses.rows.filter((item) => item.listingId === selectedListingId),
+    [openHouses.rows, selectedListingId]
+  );
 
   return (
     <section className="walkthrough-section" id="hooks">
@@ -529,7 +548,8 @@ function HooksSection({ selectedListingId }: { readonly selectedListingId: strin
 function JoinsSection() {
   const [brokerOnly, setBrokerOnly] = useState(false);
   const joinQuery = useMemo(() => openHouseJoinQuery(brokerOnly), [brokerOnly]);
-  const schedule = useView(joinQuery);
+  const joinResetKey = useQueryResetKey(joinQuery);
+  const schedule = useView(joinQuery, { resetKey: joinResetKey });
 
   return (
     <section className="walkthrough-section" id="joins">
@@ -599,13 +619,7 @@ function MarketSection() {
   const market = useView(neighborhoodMarketSummaryQuery);
   const pipeline = useView(pipelineByListingQuery);
   const rollup = useQuery(neighborhoodMarketSummaryQuery, {
-    select: (rows) => ({
-      active: rows.reduce((sum, item) => sum + safeNumber(item.activeCount), 0),
-      listings: rows.reduce((sum, item) => sum + safeNumber(item.listingCount), 0),
-      averageDays: rows.length === 0
-        ? 0
-        : rows.reduce((sum, item) => sum + safeNumber(item.daysOnMarket), 0) / rows.length
-    })
+    select: selectMarketRollup
   });
 
   return (
@@ -671,7 +685,8 @@ function TopNSection() {
   const [countValue, setCountValue] = useState(4);
   const [status, setStatus] = useState<ListingStatus | 'all'>('active');
   const query = useMemo(() => topPricedListingsQuery(countValue, status), [countValue, status]);
-  const topRows = useView(query);
+  const queryResetKey = useQueryResetKey(query);
+  const topRows = useView(query, { resetKey: queryResetKey });
 
   return (
     <section className="walkthrough-section" id="topn">
@@ -740,17 +755,28 @@ function MaterializedIndexSection() {
   const [neighborhoodId, setNeighborhoodId] = useState('nh-capitol-hill');
   const [priceFloor, setPriceFloor] = useState(650000);
   const [priceCeiling, setPriceCeiling] = useState(1000000);
-  const byNeighborhood = materializedIndex<ListingIndexRow>(snapshot.db, listingsByNeighborhoodIndex);
-  const byPrice = materializedIndex<ListingIndexRow>(snapshot.db, listingsByPriceIndex);
-  const neighborhoodRows = byNeighborhood?.op === 'hash' ? byNeighborhood.lookup(neighborhoodId) : [];
-  const priceRows = byPrice?.op === 'btree'
+  const byNeighborhood = useMemo(
+    () => materializedIndex<ListingIndexRow>(snapshot.db, listingsByNeighborhoodIndex),
+    [snapshot.db]
+  );
+  const byPrice = useMemo(
+    () => materializedIndex<ListingIndexRow>(snapshot.db, listingsByPriceIndex),
+    [snapshot.db]
+  );
+  const neighborhoodRows = useMemo(
+    () => byNeighborhood?.op === 'hash' ? byNeighborhood.lookup(neighborhoodId) : [],
+    [byNeighborhood, neighborhoodId]
+  );
+  const priceRows = useMemo(() => byPrice?.op === 'btree'
     ? byPrice.range({
         lower: { value: priceFloor, inclusive: true },
         upper: { value: priceCeiling, inclusive: true }
       })
-    : [];
-  const materializedMarket = readMaterializedQuery(snapshot.db, neighborhoodMarketSummaryQuery);
-  const marketExplanation = explainMaterialization(neighborhoodMarketSummaryQuery);
+    : [], [byPrice, priceCeiling, priceFloor]);
+  const materializedMarket = useMemo(
+    () => readMaterializedQuery(snapshot.db, neighborhoodMarketSummaryQuery),
+    [snapshot.db]
+  );
 
   return (
     <section className="walkthrough-section" id="indexes">
@@ -813,7 +839,7 @@ function MaterializedIndexSection() {
             </div>
             <div>
               <dt>Maintenance</dt>
-              <dd>{marketExplanation.update}</dd>
+              <dd>{marketMaterializationExplanation.update}</dd>
             </div>
             <div>
               <dt>Hash buckets</dt>
@@ -859,7 +885,7 @@ function TransactionsSection({
 }) {
   const commit = useCommit();
   const listingRow = useRow(schema.listings, selectedListingId);
-  const allListings = useView(useMemo(() => listingWalkthroughQuery(allListingsFilters), []));
+  const allListings = useView(allListingsQuery);
   const offers = useView(offerBookQuery);
   const inquiries = useView(inquiryQueueQuery);
   const [inquiryDraft, setInquiryDraft] = useState({
@@ -964,7 +990,7 @@ function TransactionsSection({
             <input
               name="inquiryBuyerName"
               value={inquiryDraft.buyerName}
-              onChange={(event) => setInquiryDraft({ ...inquiryDraft, buyerName: event.target.value })}
+              onChange={(event) => setInquiryDraft((draft) => ({ ...draft, buyerName: event.target.value }))}
             />
           </label>
           <label>
@@ -974,7 +1000,7 @@ function TransactionsSection({
               type="number"
               step="10000"
               value={inquiryDraft.budget}
-              onChange={(event) => setInquiryDraft({ ...inquiryDraft, budget: Number(event.target.value) })}
+              onChange={(event) => setInquiryDraft((draft) => ({ ...draft, budget: Number(event.target.value) }))}
             />
           </label>
           <label>
@@ -982,7 +1008,7 @@ function TransactionsSection({
             <select
               name="inquiryFinancing"
               value={inquiryDraft.financing}
-              onChange={(event) => setInquiryDraft({ ...inquiryDraft, financing: event.target.value as FinancingType })}
+              onChange={(event) => setInquiryDraft((draft) => ({ ...draft, financing: event.target.value as FinancingType }))}
             >
               {financingTypes.map((item) => <option key={item} value={item}>{formatStatus(item)}</option>)}
             </select>
@@ -992,7 +1018,7 @@ function TransactionsSection({
             <select
               name="inquiryStatus"
               value={inquiryDraft.status}
-              onChange={(event) => setInquiryDraft({ ...inquiryDraft, status: event.target.value as InquiryStatus })}
+              onChange={(event) => setInquiryDraft((draft) => ({ ...draft, status: event.target.value as InquiryStatus }))}
             >
               {inquiryStatuses.map((item) => <option key={item} value={item}>{formatStatus(item)}</option>)}
             </select>
@@ -1002,7 +1028,7 @@ function TransactionsSection({
             <textarea
               name="inquiryNotes"
               value={inquiryDraft.notes}
-              onChange={(event) => setInquiryDraft({ ...inquiryDraft, notes: event.target.value })}
+              onChange={(event) => setInquiryDraft((draft) => ({ ...draft, notes: event.target.value }))}
             />
           </label>
           <button type="submit">Add inquiry</button>
@@ -1016,7 +1042,7 @@ function TransactionsSection({
             <input
               name="offerBuyerName"
               value={offerDraft.buyerName}
-              onChange={(event) => setOfferDraft({ ...offerDraft, buyerName: event.target.value })}
+              onChange={(event) => setOfferDraft((draft) => ({ ...draft, buyerName: event.target.value }))}
             />
           </label>
           <label>
@@ -1026,7 +1052,7 @@ function TransactionsSection({
               type="number"
               step="10000"
               value={offerDraft.amount}
-              onChange={(event) => setOfferDraft({ ...offerDraft, amount: Number(event.target.value) })}
+              onChange={(event) => setOfferDraft((draft) => ({ ...draft, amount: Number(event.target.value) }))}
             />
           </label>
           <label>
@@ -1034,7 +1060,7 @@ function TransactionsSection({
             <select
               name="offerFinancing"
               value={offerDraft.financing}
-              onChange={(event) => setOfferDraft({ ...offerDraft, financing: event.target.value as FinancingType })}
+              onChange={(event) => setOfferDraft((draft) => ({ ...draft, financing: event.target.value as FinancingType }))}
             >
               {financingTypes.map((item) => <option key={item} value={item}>{formatStatus(item)}</option>)}
             </select>
@@ -1044,7 +1070,7 @@ function TransactionsSection({
             <select
               name="offerStatus"
               value={offerDraft.status}
-              onChange={(event) => setOfferDraft({ ...offerDraft, status: event.target.value as OfferStatus })}
+              onChange={(event) => setOfferDraft((draft) => ({ ...draft, status: event.target.value as OfferStatus }))}
             >
               {offerStatuses.map((item) => <option key={item} value={item}>{formatStatus(item)}</option>)}
             </select>
@@ -1054,7 +1080,7 @@ function TransactionsSection({
             <textarea
               name="offerContingencies"
               value={offerDraft.contingencies}
-              onChange={(event) => setOfferDraft({ ...offerDraft, contingencies: event.target.value })}
+              onChange={(event) => setOfferDraft((draft) => ({ ...draft, contingencies: event.target.value }))}
             />
           </label>
           <div className="button-row">
@@ -1161,7 +1187,7 @@ function DiagnosticsSection({
   readonly lastCommit: CommitReport | undefined;
 }) {
   const snapshot = useTarstateSnapshot();
-  const diagnosticRead = useView(useMemo(() => listingWalkthroughQuery(allListingsFilters), []));
+  const diagnosticRead = useView(allListingsQuery);
   const [constraintDiagnostics, setConstraintDiagnostics] = useState<readonly TarstateDiagnostic[]>([]);
 
   useEffect(() => {
@@ -1174,11 +1200,11 @@ function DiagnosticsSection({
     };
   }, [snapshot.db, snapshot.revision]);
 
-  const diagnostics = [
+  const diagnostics = useMemo(() => [
     ...diagnosticRead.diagnostics,
     ...constraintDiagnostics,
     ...(lastCommit?.diagnostics ?? [])
-  ];
+  ], [constraintDiagnostics, diagnosticRead.diagnostics, lastCommit]);
 
   return (
     <section className="walkthrough-section" id="diagnostics">
@@ -1258,19 +1284,23 @@ function LiveChangesSection({
   const store = useTarstateStore();
   const snapshot = useTarstateSnapshot();
   const listingRow = useRow(schema.listings, selectedListingId);
-  const listings = useView(useMemo(() => listingWalkthroughQuery(allListingsFilters), []));
+  const listings = useView(allListingsQuery);
   const inquiryQueue = useView(inquiryQueueQuery);
   const previousDb = useRef<Db | undefined>(undefined);
   const [subscriptionEvents, setSubscriptionEvents] = useState<readonly string[]>([]);
-  const [watchOutput, setWatchOutput] = useState<unknown>({
+  const [watchDiff, setWatchDiff] = useState<unknown | undefined>(undefined);
+  const watchOutput = useMemo(() => watchDiff ?? {
     queryKey: inquiryQueue.queryKey,
     changed: false,
     added: [],
     removed: [],
     unchanged: inquiryQueue.rows
-  });
+  }, [inquiryQueue.queryKey, inquiryQueue.rows, watchDiff]);
 
   useEffect(() => {
+    previousDb.current = undefined;
+    setWatchDiff(undefined);
+
     return store.subscribe(() => {
       const next = store.getSnapshot();
       setSubscriptionEvents((events) => [
@@ -1287,7 +1317,7 @@ function LiveChangesSection({
 
     let active = true;
     void diffQuery(previous, snapshot.db, inquiryQueueQuery).then((event) => {
-      if (active) setWatchOutput(event);
+      if (active) setWatchDiff(event);
     });
 
     return () => {
@@ -1367,12 +1397,35 @@ function LiveChangesSection({
       <div className="compact-list">
         {subscriptionEvents.length === 0 ? (
           <EmptyState label="No store subscription events yet. Commit a change above." />
-        ) : subscriptionEvents.map((event) => (
-          <div className="compact-row live-row" key={event}>{event}</div>
+        ) : subscriptionEvents.map((event, indexValue) => (
+          <div className="compact-row live-row" key={`${indexValue}-${event}`}>{event}</div>
         ))}
       </div>
     </section>
   );
+}
+
+function useQueryResetKey<Row>(query: Query<Row>): string {
+  return useMemo(() => queryKey(query), [query]);
+}
+
+function selectListingTotals(rows: readonly ListingResult[]) {
+  return {
+    count: rows.length,
+    averagePrice: rows.length === 0
+      ? 0
+      : rows.reduce((sum, item) => sum + safeNumber(item.price), 0) / rows.length
+  };
+}
+
+function selectMarketRollup(rows: readonly MarketSummaryRow[]) {
+  return {
+    active: rows.reduce((sum, item) => sum + safeNumber(item.activeCount), 0),
+    listings: rows.reduce((sum, item) => sum + safeNumber(item.listingCount), 0),
+    averageDays: rows.length === 0
+      ? 0
+      : rows.reduce((sum, item) => sum + safeNumber(item.daysOnMarket), 0) / rows.length
+  };
 }
 
 function SectionHeader({ step, title, detail }: { readonly step: string; readonly title: string; readonly detail: string }) {
@@ -1589,24 +1642,17 @@ function safeNumber(value: number | undefined): number {
 
 function formatCurrency(value: number | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return 'n/a';
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0
-  }).format(value);
+  return currencyFormatter.format(value);
 }
 
 function formatNumber(value: number | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '0';
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value);
+  return wholeNumberFormatter.format(value);
 }
 
 function formatDecimal(value: number | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '0.0';
-  return new Intl.NumberFormat('en-US', {
-    minimumFractionDigits: 1,
-    maximumFractionDigits: 1
-  }).format(value);
+  return decimalFormatter.format(value);
 }
 
 function formatStatus(value: string): string {

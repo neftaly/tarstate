@@ -2469,6 +2469,7 @@ function maintainSingleRelationMaterializationIncrementally<Row>(
     const addedResult = evaluateDeltaRows(query, support.relation, delta.added, evaluateOptions);
     const removedResult = evaluateDeltaRows(query, support.relation, delta.removed, evaluateOptions);
     diagnostics.push(...addedResult.diagnostics, ...removedResult.diagnostics);
+    if (addedResult.rows.length === 0 && removedResult.rows.length === 0) continue;
 
     const rowUpdate = applyIncrementalMaterializedRows(
       rows,
@@ -6063,7 +6064,8 @@ function wherePushdownTargets(
   const relationRef = relationName === undefined ? undefined : relations[relationName];
   if (!isRelationRef(relationRef)) return [];
   const alias = typeof input.alias === 'string' ? input.alias : relationRef.name;
-  return wherePushdowns(data.predicate, new Set([alias, relationRef.name, 'row']))
+  const aliases = new Set([alias, relationRef.name, 'row']);
+  return wherePushdowns(data.predicate, aliases)
     .map((pushdown) => ({ ...pushdown, relation: relationRef, alias }));
 }
 
@@ -7004,6 +7006,41 @@ function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput
   return stableKey(Array.isArray(relationRef.key) ? input : [input]);
 }
 
+function relationKeyInputMatchesRow(
+  relationRef: RelationRef,
+  input: RelationKeyInput,
+  rowValue: Record<string, unknown>
+): boolean {
+  const fields = relationKeyFields(relationRef);
+  const fieldName = fields.length === 1 ? fields[0] : undefined;
+  if (fieldName !== undefined && !Array.isArray(input) && canCompareRelationKeyAtom(input)) {
+    return rowValue[fieldName] !== undefined && Object.is(rowValue[fieldName], input);
+  }
+  return rowKey(relationRef, rowValue) === relationKeyInputToKey(relationRef, input);
+}
+
+function relationRowKeyMatchesRow(
+  relationRef: RelationRef,
+  left: Record<string, unknown>,
+  right: Record<string, unknown>
+): boolean {
+  const fields = relationKeyFields(relationRef);
+  const fieldName = fields.length === 1 ? fields[0] : undefined;
+  if (fieldName !== undefined) {
+    const valueValue = right[fieldName];
+    if (valueValue === undefined) return false;
+    if (canCompareRelationKeyAtom(valueValue)) {
+      return left[fieldName] !== undefined && Object.is(left[fieldName], valueValue);
+    }
+  }
+  const key = rowKey(relationRef, right);
+  return key !== undefined && rowKey(relationRef, left) === key;
+}
+
+function canCompareRelationKeyAtom(input: unknown): boolean {
+  return input === null || (typeof input !== 'object' && typeof input !== 'function' && typeof input !== 'symbol');
+}
+
 function cloneDb(input: Db): Db {
   return { ...input, data: cloneDbData(input.data), env: input.env };
 }
@@ -7133,24 +7170,21 @@ function envSeenReference(input: object, seen: Map<object, number>): string | un
 
 function applyWritePatchToDb(dbValue: Db, patch: WritePatch, constraints: readonly ConstraintData[] = []): WriteApplyResult {
   const relationRef = patch.relation;
-  const beforeRows = [...(dbValue.data[relationRef.name] ?? [])] as Record<string, unknown>[];
   const diagnostics: TarstateDiagnostic[] = [];
   const rowDiagnostics = validatePatchRows(patch);
   diagnostics.push(...rowDiagnostics);
   if (rowDiagnostics.some(isErrorDiagnostic)) return { db: dbValue, applied: 0, deltas: [], diagnostics };
 
-  const rows = [...beforeRows];
-  const keyOf = (rowValue: Record<string, unknown>): string | undefined => rowKey(relationRef, rowValue);
-  const keyFromPatch = (key: RelationKeyInput): string => relationKeyInputToKey(relationRef, key);
-  const findIndexByKey = (key: string | undefined): number => key === undefined ? -1 : rows.findIndex((rowValue) => keyOf(rowValue) === key);
+  const rows = [...(dbValue.data[relationRef.name] ?? [])] as Record<string, unknown>[];
+  const findIndexByKey = (key: RelationKeyInput): number => rows.findIndex((rowValue) => relationKeyInputMatchesRow(relationRef, key, rowValue));
   const findConflictIndexes = (rowValue: Record<string, unknown>): readonly number[] => conflictIndexesFor(dbValue, relationRef, rows, rowValue, constraints);
   let added: unknown[] = [];
   let removed: unknown[] = [];
 
   switch (patch.op) {
     case 'insert': {
-      const key = keyOf(patch.row as Record<string, unknown>);
-      if (findIndexByKey(key) !== -1) diagnostics.push(uniqueKeyDiagnostic(relationRef, patch.row));
+      const duplicateIndex = rows.findIndex((rowValue) => relationRowKeyMatchesRow(relationRef, rowValue, patch.row as Record<string, unknown>));
+      if (duplicateIndex !== -1) diagnostics.push(uniqueKeyDiagnostic(relationRef, patch.row));
       else {
         rows.push(patch.row as Record<string, unknown>);
         added = [patch.row];
@@ -7208,7 +7242,7 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch, constraints: readon
       break;
     }
     case 'updateByKey': {
-      const indexValue = findIndexByKey(keyFromPatch(patch.key as RelationKeyInput));
+      const indexValue = findIndexByKey(patch.key as RelationKeyInput);
       if (indexValue !== -1) {
         const current = rows[indexValue] as RelationRow<RelationRef>;
         const updateResult = relationUpdateFor(current, patch.changes, relationRef, dbValue);
@@ -7239,7 +7273,7 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch, constraints: readon
       break;
     }
     case 'deleteByKey': {
-      const indexValue = findIndexByKey(keyFromPatch(patch.key as RelationKeyInput));
+      const indexValue = findIndexByKey(patch.key as RelationKeyInput);
       if (indexValue !== -1) {
         const [rowValue] = rows.splice(indexValue, 1);
         if (rowValue !== undefined) removed = [rowValue];
@@ -7416,11 +7450,8 @@ function conflictIndexesFor(
   constraints: readonly ConstraintData[]
 ): readonly number[] {
   const indexes: number[] = [];
-  const incomingKey = rowKey(relationRef, incoming);
-  if (incomingKey !== undefined) {
-    const relationKeyIndex = rows.findIndex((rowValue) => rowKey(relationRef, rowValue) === incomingKey);
-    if (relationKeyIndex !== -1) indexes.push(relationKeyIndex);
-  }
+  const relationKeyIndex = rows.findIndex((rowValue) => relationRowKeyMatchesRow(relationRef, rowValue, incoming));
+  if (relationKeyIndex !== -1) indexes.push(relationKeyIndex);
 
   for (const constraint of constraints) {
     if (constraint.op !== 'unique') continue;
@@ -7811,6 +7842,7 @@ function materializationAuxForRows<Row>(
   rows: readonly Row[],
   existingAux?: InternalMaterializationAux
 ): InternalMaterializationAux | undefined {
+  if (existingAux === undefined && !queryDataMayNeedMaterializationAux(query.data)) return undefined;
   const topNPreLimitRows = existingAux?.topNPreLimitRows ?? materializationAuxForTarget(target, query)?.topNPreLimitRows;
   const indexes = materializationIndexesForRows(query, rows);
   if (topNPreLimitRows === undefined && indexes === undefined) return undefined;
@@ -7818,6 +7850,28 @@ function materializationAuxForRows<Row>(
     ...(topNPreLimitRows === undefined ? {} : { topNPreLimitRows }),
     ...(indexes === undefined ? {} : { indexes })
   };
+}
+
+function queryDataMayNeedMaterializationAux(data: QueryData): boolean {
+  switch (data.op) {
+    case 'limit':
+    case 'sortLimit':
+    case 'hash':
+    case 'btree':
+    case 'uniqueIndex':
+      return true;
+    default:
+      break;
+  }
+
+  for (const input of [data.input, data.left, data.right]) {
+    const nested = queryDataFrom(input);
+    if (nested !== undefined && queryDataMayNeedMaterializationAux(nested)) return true;
+  }
+  for (const input of queryDataArray(data.inputs)) {
+    if (queryDataMayNeedMaterializationAux(input)) return true;
+  }
+  return false;
 }
 
 function withMaterializationMaintenanceAux<Row>(

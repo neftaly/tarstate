@@ -32,7 +32,9 @@ forms represented as JavaScript arrays/objects.
   projection with Relic `deleted` spelling.
 - Compatibility parser: `@tarstate/core/relic` exports `fromRelicQuery`,
   `fromRelicExpr`, `fromRelicTx`, and structured `RelicParseError`. It supports
-  the oracle-backed query/write subset with colon-prefixed keyword strings.
+  the oracle-backed query/write subset with colon-prefixed keyword strings,
+  including `:lookup`, `:expand`, `:rename`, `:qualify`, index metadata
+  clauses, and `:insert-or-merge :*`.
 
 ## Intentional TypeScript Differences
 
@@ -50,26 +52,31 @@ forms represented as JavaScript arrays/objects.
 - Storage is pluggable through source/runtime/adapter boundaries; core does not
   collapse Automerge or other adapters into the plain `Db` shape.
 
-## Known Remaining Gaps
+## Remaining Work and Non-Goals
 
-- `@tarstate/core/relic` does not parse raw EDN text and intentionally supports
-  only a narrow source-compatibility subset. Unsupported parser forms include
-  arbitrary Clojure functions/macros, `rel/sel`/`rel/sel1`, correlation maps,
-  constraints, q batch option maps, transducers, `:lookup`, `:expand`,
-  `:rename`, `:qualify`, index clauses, `:insert-or-merge :*`, and
-  function-valued tx/update forms.
-- Incremental materialization still recomputes for set operations, predicate
-  joins, non-direct joins, selected/correlated subqueries, and aggregate forms
-  that require more state than the current delta model preserves. Direct
-  single-source pipelines, supported grouped aggregates, top-N, inner/left
-  equi-joins, and identity-preserving `expand` are incrementally maintained.
-- Constraint custom error expressions are not exposed as a Relic-compatible
-  parser form.
-- Runtime `setEnvTx` propagation into external adapter envelopes remains an
-  adapter/runtime integration concern. Direct Automerge adapter use supports an
-  `env` option.
-- Atomic multi-target runtime commits are still bounded by each target adapter's
-  patch application semantics.
+### Clojure Compatibility Non-Goals
+
+- `@tarstate/core/relic` parses Relic-shaped JS arrays/objects, not raw EDN
+  text. It intentionally does not chase arbitrary Clojure functions/macros,
+  `rel/sel`/`rel/sel1` namespace spellings, correlation maps, Clojure
+  constraint forms, q batch option maps, transducers, or function-valued
+  tx/update forms. These are Clojure source compatibility gaps, not TypeScript
+  API parity gaps.
+- Constraint custom-error expressions are not exposed as parser forms; use the
+  typed TypeScript constraint helpers.
+
+### Implementation/Performance Parity
+
+- IVM breadth and recompute diagnostics: direct single-source pipelines,
+  supported grouped aggregates, top-N, inner/left equi-joins, and
+  identity-preserving `expand` are incrementally maintained. Recompute fallbacks
+  still cover set operations, predicate/non-direct joins, selected/correlated
+  subqueries, and aggregate shapes that need more retained state.
+- Oracle/fuzz coverage: expand cross-product coverage for parser, query, write,
+  materialization, and runtime edge cases.
+- Benchmark-guided decomplection: keep separating planner pushdown,
+  materialization maintenance, adapter/runtime costs, and storage integration
+  boundaries using benchmark evidence.
 
 ## Oracle Coverage
 

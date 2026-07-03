@@ -149,6 +149,15 @@ export const defaultFilters: ListingFilters = {
   sort: 'price_asc'
 };
 
+export const allListingsFilters: ListingFilters = {
+  status: 'all',
+  neighborhoodId: 'all',
+  propertyType: 'all',
+  maxPrice: 3000000,
+  minBedrooms: 0,
+  sort: 'price_asc'
+};
+
 export function listingWalkthroughQuery(filters: ListingFilters): Query<ListingResult> {
   const predicates: PredicateData[] = [
     lte(listing.price, value(filters.maxPrice)),
@@ -190,6 +199,8 @@ export function listingWalkthroughQuery(filters: ListingFilters): Query<ListingR
     })
   ) as Query<ListingResult>;
 }
+
+export const allListingsQuery = listingWalkthroughQuery(allListingsFilters);
 
 export function listingLookupQuery(id: string): Query<Listing> {
   return lookup(schema.listings, 'id', id);
@@ -404,6 +415,7 @@ export const listingsByIdIndex = pipe(
 
 export const queryLabels = {
   listings: queryKey(listingWalkthroughQuery(defaultFilters)),
+  allListings: queryKey(allListingsQuery),
   market: queryKey(neighborhoodMarketSummaryQuery),
   openHouses: queryKey(openHouseScheduleQuery),
   pipeline: queryKey(pipelineByListingQuery),
