@@ -600,12 +600,14 @@ describe('watch and store behavior', () => {
     const target = inner.target;
     if (target === undefined) throw new Error('memory runtime target missing');
     const applyEnvs: (RelationApplyContext['env'] | undefined)[] = [];
+    const applyEnvDeltas: (RelationApplyContext['envDeltas'] | undefined)[] = [];
     const runtime = {
       ...inner,
       target: {
         ...target,
         apply: (patches: readonly WritePatch[], context: RelationApplyContext | undefined) => {
           applyEnvs.push(context?.env);
+          applyEnvDeltas.push(context?.envDeltas);
           return target.apply(patches, context);
         }
       }
@@ -619,10 +621,16 @@ describe('watch and store behavior', () => {
     const commit = await store.commit([
       setEnvTx({ accountId: 'fees' }),
       updateByKey(schema.entries, 'e1', { accountId: env<string>('accountId') })
-    ]);
+    ], {
+      context: {
+        env: { accountId: 'ignored' },
+        envDeltas: [{ name: 'accountId', before: 'cash', after: 'fees' }]
+      }
+    });
 
     expect(commit.status).toBe('accepted');
     expect(applyEnvs).toEqual([{ accountId: 'fees' }]);
+    expect(applyEnvDeltas).toEqual([[{ name: 'accountId', before: 'cash', after: 'fees' }]]);
     expect(commit.snapshot.db.env).toEqual({ accountId: 'fees' });
     expect(store.query(entryList).rows).toEqual([
       { id: 'e1', accountId: 'fees', amount: 120 },

@@ -14,7 +14,7 @@ import {
 } from 'react';
 import type { TarstateDiagnostic } from '@tarstate/core';
 import type { Db, RelationKeyValue } from '@tarstate/core/db';
-import { from } from '@tarstate/core/query';
+import { from, queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
 import type { RelationRef } from '@tarstate/core/schema';
 import { createStore } from '@tarstate/core/store';
@@ -155,7 +155,8 @@ export function useView<Row>(
 ): ViewHookState<Row> {
   const store = useTarstateStore();
   const resetKey = options.resetKey;
-  const view = useMemo(() => store.view(query), [store, resetKey]);
+  const canonicalQueryKey = useMemo(() => queryKey(query), [query]);
+  const view = useMemo(() => store.view(query), [store, resetKey, canonicalQueryKey]);
   const subscribe = useCallback((listener: () => void) => view.subscribe(listener), [view]);
   const getSnapshot = useMemo(
     () => stableSnapshotReader(() => view.getSnapshot(), areViewSnapshotsEqual),

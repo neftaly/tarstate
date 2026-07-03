@@ -5,7 +5,10 @@ import {
   runtimeSystemSource,
   type RuntimeObjectLocationRow,
   type RuntimeSystemState,
-  type MaterializedIndex as RootMaterializedIndex
+  type MaterializedIndex as RootMaterializedIndex,
+  type StoreCommitEffects as RootStoreCommitEffects,
+  type StoreCommitSnapshot as RootStoreCommitSnapshot,
+  type StoreSnapshot as RootStoreSnapshot
 } from '@tarstate/core';
 import * as adapterApi from '@tarstate/core/adapter';
 import * as constraintsApi from '@tarstate/core/constraints';
@@ -16,6 +19,7 @@ import {
   req,
   unique,
   type ConstraintData,
+  type ConstraintOptions,
   type ConstraintSet
 } from '@tarstate/core/constraints';
 import * as dbApi from '@tarstate/core/db';
@@ -51,6 +55,9 @@ import {
   type MaterializedHashIndex,
   type MaterializedIndex,
   type MaterializationInput,
+  type MaterializationTarget,
+  type MaterializationTargetValue,
+  type MaterializedTarget,
   type MaterializedDb
 } from '@tarstate/core/materialization';
 import {
@@ -103,6 +110,9 @@ import {
 import {
   createStore,
   type StoreCommitResult,
+  type StoreCommitEffects,
+  type StoreCommitSnapshot,
+  type StoreSnapshot,
   type StoreViewSnapshot
 } from '@tarstate/core/store';
 import {
@@ -483,11 +493,15 @@ describe('public API contracts', () => {
 
   it('installs and removes constraints through materialization inputs', () => {
     const required = req(schema.entries, 'id', 'accountId', 'amount');
+    const namedRequired = req(schema.entries, ['id', 'accountId'], { name: 'entries.required' });
+    const namedUnique = unique(schema.entries, ['id'], { name: 'entries.id' });
+    const namedForeignKey = fk(schema.entries, 'accountId', schema.accounts, 'id', { name: 'entries.account', cascade: 'delete' });
+    const namedCheck = check(from(as(schema.entries, 'entry')), gt(field('entry', 'amount'), value(-1_000_000)), { name: 'entries.amount_floor' });
     const constraints = constrain(
       required,
-      unique(schema.entries, 'id'),
-      fk(schema.entries, 'accountId', schema.accounts, 'id'),
-      check(from(as(schema.entries, 'entry')), gt(field('entry', 'amount'), value(-1_000_000)))
+      namedUnique,
+      namedForeignKey,
+      namedCheck
     );
     const constrained = mat(openingDb, constraints, required);
     const dematerialized = demat(constrained, constraints, required);
@@ -503,6 +517,7 @@ describe('public API contracts', () => {
 
     expectTypeOf<typeof constraints>().toEqualTypeOf<ConstraintSet>();
     expectTypeOf<(typeof constraints)[number]>().toEqualTypeOf<ConstraintData>();
+    expectTypeOf<typeof namedRequired>().toMatchTypeOf<ConstraintData & ConstraintOptions>();
     expectTypeOf<typeof constraints>().toMatchTypeOf<MaterializationInput>();
     expectTypeOf<(typeof constraints)[number]>().toMatchTypeOf<MaterializationInput>();
     expectTypeOf<typeof constrained>().toMatchTypeOf<MaterializedDb>();
@@ -514,6 +529,16 @@ describe('public API contracts', () => {
       // @ts-expect-error mat inputs are query/constraint/metadata values, not loose options objects.
       mat(openingDb, { id: 'entries' });
     void invalidMaterializationInput;
+    expect(namedRequired.name).toBe('entries.required');
+    expect(namedUnique.name).toBe('entries.id');
+    expect(namedForeignKey).toEqual(expect.objectContaining({ name: 'entries.account', cascade: 'delete' }));
+    expect(namedCheck.name).toBe('entries.amount_floor');
+  });
+
+  it('exports store snapshot types from root and the store subpath', () => {
+    expectTypeOf<RootStoreSnapshot>().toEqualTypeOf<StoreSnapshot>();
+    expectTypeOf<RootStoreCommitEffects>().toEqualTypeOf<StoreCommitEffects>();
+    expectTypeOf<RootStoreCommitSnapshot>().toEqualTypeOf<StoreCommitSnapshot>();
   });
 
   it('exports materialized index helper types from root and materialization subpath', () => {
@@ -535,6 +560,8 @@ describe('public API contracts', () => {
     expectTypeOf<ReturnType<typeof readIndex>>().toEqualTypeOf<MaterializedIndex<IndexedEntry> | undefined>();
     expectTypeOf<ReturnType<typeof readRootIndex>>().toEqualTypeOf<RootMaterializedIndex<IndexedEntry> | undefined>();
     expectTypeOf<RootMaterializedIndex<IndexedEntry>>().toEqualTypeOf<MaterializedIndex<IndexedEntry>>();
+    expectTypeOf<MaterializationTargetValue<IndexedEntry>>().toEqualTypeOf<MaterializationTarget<IndexedEntry>>();
+    expectTypeOf<MaterializedTarget<IndexedEntry>>().toEqualTypeOf<MaterializationTargetValue<IndexedEntry>>();
 
     const raw = readIndex();
     expect(raw?.op).toBe('hash');

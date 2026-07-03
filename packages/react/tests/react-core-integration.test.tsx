@@ -9,7 +9,7 @@ import {
   useView
 } from '@tarstate/react';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
-import { asc, as, from, pipe, project, sort } from '@tarstate/core/query';
+import { asc, as, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { createRuntimeStore, createStore } from '@tarstate/core/store';
 import { replaceAll } from '@tarstate/core/write';
@@ -78,6 +78,57 @@ describe('@tarstate/react core integration', () => {
       });
 
       expect(renderer?.toJSON()).toEqual(renderedOutput('1:Beta Prime|Gamma:Beta Prime:missing:2'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+      store.close();
+    }
+  });
+
+  it('recreates view hooks when the query key changes', async () => {
+    const store = createStore({
+      items: [
+        { id: 'item-a', label: 'Alpha' },
+        { id: 'item-b', label: 'Beta' }
+      ]
+    });
+    let renderer: ReactTestRenderer | undefined;
+
+    function Probe({ label }: { readonly label: string }) {
+      const query = pipe(
+        from(item),
+        where(eq(item.label, value(label))),
+        project({
+          id: item.id,
+          label: item.label
+        })
+      );
+      const view = useView(query);
+      const queryState = useQuery(query, {
+        select: (rows) => rows.map((row) => row.label).join('|')
+      });
+      const rowState = useRow(query, (row) => row.id === 'item-b');
+
+      return createElement(
+        'output',
+        undefined,
+        `${view.rows.map((row) => row.label).join('|')}:${queryState.data}:${rowState.row?.label ?? 'missing'}`
+      );
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(TarstateProvider, { store }, createElement(Probe, { label: 'Alpha' })));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('Alpha:Alpha:missing'));
+
+      await act(async () => {
+        renderer?.update(createElement(TarstateProvider, { store }, createElement(Probe, { label: 'Beta' })));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('Beta:Beta:Beta'));
     } finally {
       act(() => {
         renderer?.unmount();

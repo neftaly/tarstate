@@ -253,6 +253,7 @@ export type {
   ConstraintValidationOptions,
   ConstraintValidationResult,
   ForeignKeyCascade,
+  ForeignKeyConstraintOptions,
   ForeignKeyConstraintData,
   QueryForeignKeyConstraintData,
   QueryRequiredConstraintData,
@@ -265,9 +266,11 @@ export { createStore } from './store.js';
 export type {
   Store,
   StoreCommit,
+  StoreCommitEffects,
   StoreCommitInput,
   StoreCommitOptions,
   StoreCommitResult,
+  StoreCommitSnapshot,
   StoreCommitStatus,
   StoreMappedQueryBatchResult,
   StoreQueries,
@@ -276,6 +279,7 @@ export type {
   StoreQueryOptions,
   StoreQueryResult,
   StoreSeedInput,
+  StoreSnapshot,
   StoreView,
   StoreViewSnapshot,
   StoreWhatIf
@@ -406,6 +410,7 @@ export type {
   MaterializationRangeBound,
   MaterializationRefreshResult,
   MaterializationTarget,
+  MaterializationTargetValue,
   MaterializedBtreeIndex,
   MaterializedDb,
   MaterializedHashIndex,
@@ -415,6 +420,7 @@ export type {
   MaterializedIndexKind,
   MaterializedQueryResult,
   MaterializedSetIndex,
+  MaterializedTarget,
   MaterializedUniqueIndex,
   SnapshotMaterializationOptions,
   SnapshotMaterializationTarget

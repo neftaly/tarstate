@@ -73,6 +73,7 @@ import {
   type AutomergeConflict,
   type AutomergeDocHandleAdapter,
   type AutomergeDocHandleRuntime,
+  type AutomergeObjectLocation,
   type AutomergeMapAdapter,
   type AutomergeMapAdapterOptions,
   type AutomergeMapPath,
@@ -1053,6 +1054,16 @@ describe('automerge map adapter', () => {
     });
     expect(adapter.pathForObjectId(taskObjectId)).toEqual(['workspace', 'tasks', 0]);
     expect(automergePathForObjectId(adapter.getDoc(), taskObjectId)).toEqual(['workspace', 'tasks', 0]);
+    const publicLocations = automergeObjectLocations(adapter.getDoc(), { relations: allMappings });
+    expect(publicLocations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        objectId: taskObjectId,
+        path: ['workspace', 'tasks', 0],
+        relation: 'tasks',
+        key: 'task-1'
+      }) satisfies Partial<AutomergeObjectLocation>
+    ]));
+    expect(publicLocations.some((location) => 'pathSegments' in location)).toBe(false);
     expect(adapter.source.rows(runtimeSystemRelations.objectLocations)).toEqual(expect.arrayContaining([
       expect.objectContaining({
         runtime: 'workspace',

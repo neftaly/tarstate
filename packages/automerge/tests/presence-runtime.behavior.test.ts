@@ -17,7 +17,6 @@ import {
   defaultAutomergePresenceClearedValue,
   type AutomergePresenceFieldNames,
   type AutomergePresenceLocationState,
-  type AutomergePresenceOperation,
   type AutomergePresenceRuntime,
   type AutomergePresenceRuntimeOptions,
   type AutomergePresenceWritableRuntime
@@ -34,7 +33,6 @@ type PresenceRow = {
 
 type PresenceChannels = Record<string, JsonValue | undefined>;
 type LocationChannels = AutomergePresenceLocationState<'cursor' | 'selection'>;
-type OperationChannels = Record<string, AutomergePresenceOperation | undefined>;
 type PresenceDoc = {
   readonly presence?: PresenceChannels;
 };
@@ -316,42 +314,6 @@ describe('automerge presence runtime', () => {
     runtime.stop();
   });
 
-  it('round-trips Automerge operation payloads through writable patches', async () => {
-    const operation = {
-      action: 'put',
-      anchoredPath: ['3@actor', 'title'] as const,
-      objectId: '3@actor',
-      heads: ['1@actor', '2@actor'],
-      value: 'Done'
-    } satisfies AutomergePresenceOperation;
-    const runtime = automergePresenceRuntime<OperationChannels, PresenceDoc>({
-      handle: realDocHandle(),
-      relation: schema.presence,
-      fields,
-      localPeerId: 'peer-local',
-      includeLocalRows: true,
-      initialState: {}
-    });
-    runtime.start();
-
-    const result = await runtime.target.apply([
-      write(schema.presence).insertOrReplace({
-        peer: 'peer-local',
-        topic: 'localEdit',
-        payload: operation
-      })
-    ]);
-
-    expect(result).toMatchObject({ status: 'accepted', applied: 1, durability: 'ephemeral' });
-    expect(result.deltas[0]?.added).toMatchObject([
-      { peer: 'peer-local', topic: 'localEdit', payload: operation, isLocal: true }
-    ]);
-    expect(runtime.getLocalState().localEdit).toEqual(operation);
-    expect(runtime.source.rows(schema.presence)).toMatchObject([
-      { peer: 'peer-local', topic: 'localEdit', payload: operation, isLocal: true }
-    ]);
-    runtime.stop();
-  });
 });
 
 function realDocHandle(): DocHandle<PresenceDoc> {

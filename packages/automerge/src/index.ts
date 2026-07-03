@@ -56,6 +56,18 @@ export type AutomergeObjectReference = {
   readonly detail?: unknown;
 };
 export type AutomergeObjectReferenceOptions = Omit<AutomergeObjectReference, 'objectId' | 'path'>;
+export type AutomergeObjectLocation = {
+  readonly objectId: Automerge.ObjID;
+  readonly path: AutomergeObjectPath;
+  readonly parentObjectId?: Automerge.ObjID;
+  readonly prop?: Automerge.Prop;
+  readonly documentId?: string;
+  readonly branch?: string;
+  readonly heads?: Automerge.Heads;
+  readonly relation?: string;
+  readonly key?: unknown;
+  readonly detail?: unknown;
+};
 export type AutomergeTextValue = string | Automerge.ImmutableString;
 export type AutomergeCounterValue = number | Automerge.Counter;
 
@@ -159,12 +171,16 @@ export type AutomergeMapEnvInput = EvaluateEnv | (() => EvaluateEnv | undefined)
 export type AutomergeObjectLocationOptions<
   DocumentShape extends object = Record<string, unknown>
 > = {
-  readonly runtimeId?: string;
   readonly relations?: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
   readonly documentId?: string;
   readonly branch?: string;
   readonly heads?: Automerge.Heads;
   readonly detail?: unknown;
+};
+type RuntimeObjectLocationOptions<
+  DocumentShape extends object = Record<string, unknown>
+> = AutomergeObjectLocationOptions<DocumentShape> & {
+  readonly runtimeId?: string;
 };
 
 export type AutomergeMapAdapterOptions<
@@ -443,13 +459,13 @@ export function automergePathForObjectId<DocumentShape extends object>(
   objectId: Automerge.ObjID
 ): AutomergeObjectPath | null {
   const location = automergeObjectLocations(doc).find((row) => row.objectId === objectId);
-  return location === undefined ? null : [...location.pathSegments];
+  return location === undefined ? null : [...location.path];
 }
 
 export function automergeObjectLocations<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
   options: AutomergeObjectLocationOptions<DocumentShape> = {}
-): readonly RuntimeObjectLocationRow[] {
+): readonly AutomergeObjectLocation[] {
   return automergeObjectLocationRows(doc, options);
 }
 
@@ -845,7 +861,7 @@ function withAutomergeSystemSource<DocumentShape extends object>(
   const objectLocationSource: AdapterSource<Automerge.Heads> = {
     relationNames: [runtimeSystemRelations.objectLocations.name],
     rows: (relationRef) => relationRef.name === runtimeSystemRelations.objectLocations.name
-      ? automergeObjectLocationRows(getDoc(), { runtimeId, relations })
+      ? runtimeObjectLocationRows(getDoc(), { runtimeId, relations })
       : []
   };
   const rowSource = composeSources(dataSource, systemSource, objectLocationSource);
@@ -1010,11 +1026,10 @@ function objectIdForRelation<DocumentShape extends object>(
 function automergeObjectLocationRows<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
   options: AutomergeObjectLocationOptions<DocumentShape>
-): readonly RuntimeObjectLocationRow[] {
-  const runtime = options.runtimeId ?? 'automergeMapRuntime';
+): readonly AutomergeObjectLocation[] {
   const heads = options.heads ?? Automerge.getHeads(doc);
   const relations = options.relations ?? [];
-  const rows: RuntimeObjectLocationRow[] = [];
+  const rows: AutomergeObjectLocation[] = [];
   const seen = new Set<Automerge.ObjID>();
 
   const visit = (
@@ -1029,11 +1044,8 @@ function automergeObjectLocationRows<DocumentShape extends object>(
     seen.add(objectId);
     const mapped = mappedObjectLocation(relations, path, value);
     rows.push({
-      id: `${runtime}:object:${objectId}`,
-      runtime,
       objectId,
-      path: formatRuntimeObjectPath(path),
-      pathSegments: [...path],
+      path: [...path],
       ...(parentObjectId === undefined ? {} : { parentObjectId }),
       ...(prop === undefined ? {} : { prop }),
       ...(options.documentId === undefined ? {} : { documentId: options.documentId }),
@@ -1059,6 +1071,29 @@ function automergeObjectLocationRows<DocumentShape extends object>(
 
   visit(doc, []);
   return rows;
+}
+
+function runtimeObjectLocationRows<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  options: RuntimeObjectLocationOptions<DocumentShape>
+): readonly RuntimeObjectLocationRow[] {
+  const runtime = options.runtimeId ?? 'automergeMapRuntime';
+
+  return automergeObjectLocationRows(doc, options).map((location): RuntimeObjectLocationRow => ({
+    id: `${runtime}:object:${location.objectId}`,
+    runtime,
+    objectId: location.objectId,
+    path: formatRuntimeObjectPath(location.path),
+    pathSegments: location.path,
+    ...(location.parentObjectId === undefined ? {} : { parentObjectId: location.parentObjectId }),
+    ...(location.prop === undefined ? {} : { prop: location.prop }),
+    ...(location.documentId === undefined ? {} : { documentId: location.documentId }),
+    ...(location.branch === undefined ? {} : { branch: location.branch }),
+    ...(location.heads === undefined ? {} : { heads: location.heads }),
+    ...(location.relation === undefined ? {} : { relation: location.relation }),
+    ...(location.key === undefined ? {} : { key: location.key }),
+    ...(location.detail === undefined ? {} : { detail: location.detail })
+  }));
 }
 
 function mappedObjectLocation(

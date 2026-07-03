@@ -18,6 +18,7 @@ export type {
   ConstraintValidationOptions,
   ConstraintValidationResult,
   ForeignKeyCascade,
+  ForeignKeyConstraintOptions,
   ForeignKeyConstraintData,
   QueryForeignKeyConstraintData,
   QueryRequiredConstraintData,

@@ -1925,6 +1925,20 @@ function isDbTransactionOptions(input: unknown): input is DbTransactionOptions {
     && Object.keys(input).every((key) => key === 'label');
 }
 
+function isConstraintOptions(input: unknown): input is ConstraintOptions {
+  return isRecord(input)
+    && Object.keys(input).every((key) => key === 'name' || key === 'cascade');
+}
+
+function trailingConstraintOptions(inputs: readonly unknown[]): ConstraintOptions | undefined {
+  const input = inputs[inputs.length - 1];
+  return isConstraintOptions(input) ? input : undefined;
+}
+
+function constraintName(options: ConstraintOptions | undefined): ConstraintOptions {
+  return options?.name === undefined ? {} : { name: options.name };
+}
+
 function hasEvaluateContextOverrides(options: EvaluateOptions): boolean {
   return options.env !== undefined || options.functions !== undefined;
 }
@@ -2056,16 +2070,17 @@ export type ConstraintRelationField = string;
 export type ConstraintRelationFields = ConstraintRelationField | readonly ConstraintRelationField[];
 export type ConstraintRelationRow<Relation extends RelationRef = RelationRef> = RelationRow<Relation>;
 export type ForeignKeyCascade = 'restrict' | 'delete';
-export type CheckConstraintData = { readonly op: 'check'; readonly query?: Query; readonly predicate: PredicateData };
-export type RequiredConstraintData = { readonly op: 'req'; readonly query: Query | RelationRef; readonly fields: readonly string[] };
-export type ForeignKeyConstraintData = { readonly op: 'fk'; readonly query: Query | RelationRef; readonly fields: readonly string[]; readonly target: RelationRef; readonly targetFields: readonly string[]; readonly cascade?: ForeignKeyCascade };
-export type UniqueConstraintData = { readonly op: 'unique'; readonly query: Query | RelationRef; readonly fields: readonly string[] };
+export type ConstraintOptions = { readonly name?: string };
+export type CheckConstraintData = ConstraintOptions & { readonly op: 'check'; readonly query?: Query; readonly predicate: PredicateData };
+export type RequiredConstraintData = ConstraintOptions & { readonly op: 'req'; readonly query: Query | RelationRef; readonly fields: readonly string[] };
+export type ForeignKeyConstraintOptions = ConstraintOptions & { readonly cascade?: ForeignKeyCascade };
+export type ForeignKeyConstraintData = ConstraintOptions & { readonly op: 'fk'; readonly query: Query | RelationRef; readonly fields: readonly string[]; readonly target: RelationRef; readonly targetFields: readonly string[]; readonly cascade?: ForeignKeyCascade };
+export type UniqueConstraintData = ConstraintOptions & { readonly op: 'unique'; readonly query: Query | RelationRef; readonly fields: readonly string[] };
 export type QueryRequiredConstraintData = RequiredConstraintData;
 export type QueryForeignKeyConstraintData = ForeignKeyConstraintData;
 export type QueryUniqueConstraintData = UniqueConstraintData;
 export type ConstraintData = CheckConstraintData | RequiredConstraintData | ForeignKeyConstraintData | UniqueConstraintData;
 export type ConstraintSet = readonly ConstraintData[];
-export type ConstraintOptions = { readonly name?: string };
 export type ConstraintValidationInput = ConstraintSet | ConstraintData;
 export type ConstraintValidationOptions = EvaluateOptions;
 export type ConstraintValidationResult = {
@@ -2074,26 +2089,54 @@ export type ConstraintValidationResult = {
 };
 
 export function check(predicate: PredicateData): CheckConstraintData;
+export function check(predicate: PredicateData, options: ConstraintOptions): CheckConstraintData;
 export function check(query: Query, predicate: PredicateData): CheckConstraintData;
-export function check(queryOrPredicate: Query | PredicateData, predicate?: PredicateData): CheckConstraintData {
-  return { op: 'check', ...(predicate === undefined ? { predicate: queryOrPredicate as PredicateData } : { query: queryOrPredicate as Query, predicate }) };
+export function check(query: Query, predicate: PredicateData, options: ConstraintOptions): CheckConstraintData;
+export function check(queryOrPredicate: Query | PredicateData, predicateOrOptions?: PredicateData | ConstraintOptions, options: ConstraintOptions = {}): CheckConstraintData {
+  if (predicateOrOptions === undefined || isConstraintOptions(predicateOrOptions)) {
+    const constraintOptions = predicateOrOptions ?? options;
+    return { op: 'check', predicate: queryOrPredicate as PredicateData, ...constraintName(constraintOptions) };
+  }
+  return { op: 'check', query: queryOrPredicate as Query, predicate: predicateOrOptions, ...constraintName(options) };
 }
-export const req = (query: Query | RelationRef, ...fields: readonly string[]): RequiredConstraintData => ({ op: 'req', query, fields });
-export const fk = (
+export function req(query: Query | RelationRef, ...fields: readonly string[]): RequiredConstraintData;
+export function req(query: Query | RelationRef, fields: ConstraintRelationFields, options: ConstraintOptions): RequiredConstraintData;
+export function req(query: Query | RelationRef, ...fieldsOrOptions: readonly (string | readonly string[] | ConstraintOptions)[]): RequiredConstraintData {
+  const options = trailingConstraintOptions(fieldsOrOptions);
+  const fieldInputs = options === undefined ? fieldsOrOptions : fieldsOrOptions.slice(0, -1);
+  return { op: 'req', query, fields: fieldInputs.flatMap((fieldInput) => arrayify(fieldInput as ConstraintRelationFields)), ...constraintName(options) };
+}
+export function fk(
   query: Query | RelationRef,
   fields: ConstraintRelationFields,
   target: RelationRef,
   targetFields: ConstraintRelationFields,
-  options: { readonly cascade?: ForeignKeyCascade } = {}
-): ForeignKeyConstraintData => ({
-  op: 'fk',
-  query,
-  fields: arrayify(fields),
-  target,
-  targetFields: arrayify(targetFields),
-  ...(options.cascade === undefined ? {} : { cascade: options.cascade })
-});
-export const unique = (query: Query | RelationRef, ...fields: readonly string[]): UniqueConstraintData => ({ op: 'unique', query, fields });
+  options?: ForeignKeyConstraintOptions
+): ForeignKeyConstraintData;
+export function fk(
+  query: Query | RelationRef,
+  fields: ConstraintRelationFields,
+  target: RelationRef,
+  targetFields: ConstraintRelationFields,
+  options: ForeignKeyConstraintOptions = {}
+): ForeignKeyConstraintData {
+  return {
+    op: 'fk',
+    query,
+    fields: arrayify(fields),
+    target,
+    targetFields: arrayify(targetFields),
+    ...(options.cascade === undefined ? {} : { cascade: options.cascade }),
+    ...constraintName(options)
+  };
+}
+export function unique(query: Query | RelationRef, ...fields: readonly string[]): UniqueConstraintData;
+export function unique(query: Query | RelationRef, fields: ConstraintRelationFields, options: ConstraintOptions): UniqueConstraintData;
+export function unique(query: Query | RelationRef, ...fieldsOrOptions: readonly (string | readonly string[] | ConstraintOptions)[]): UniqueConstraintData {
+  const options = trailingConstraintOptions(fieldsOrOptions);
+  const fieldInputs = options === undefined ? fieldsOrOptions : fieldsOrOptions.slice(0, -1);
+  return { op: 'unique', query, fields: fieldInputs.flatMap((fieldInput) => arrayify(fieldInput as ConstraintRelationFields)), ...constraintName(options) };
+}
 export const constrain = (...constraints: readonly ConstraintData[]): ConstraintSet => constraints;
 export async function validateConstraints(dbValue: Db | RelationSource, constraints: ConstraintValidationInput, options?: ConstraintValidationOptions): Promise<ConstraintValidationResult>;
 export async function validateConstraints(constraints: ConstraintValidationInput, options?: ConstraintValidationOptions): Promise<ConstraintValidationResult>;
@@ -2244,12 +2287,14 @@ export type MaterializationInput<Row = unknown> =
   | ConstraintData
   | ConstraintSet
   | MaterializationMetadata<Row>;
-export type MaterializationTarget<Row = unknown> =
+export type MaterializationTargetValue<Row = unknown> =
   | string
   | Query<Row>
   | ConstraintData
   | ConstraintSet
   | MaterializationMetadata<Row>;
+export type MaterializedTarget<Row = unknown> = MaterializationTargetValue<Row>;
+export type MaterializationTarget<Row = unknown> = MaterializationTargetValue<Row>;
 
 export function mat<DbValue extends SnapshotMaterializationTarget>(dbValue: DbValue, ...inputs: readonly MaterializationInput[]): DbValue & MaterializedDb {
   assertReadableMaterializationTarget(dbValue);
@@ -5486,7 +5531,7 @@ export type StoreCommitResult<Version = unknown> = {
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 export type StoreCommitInput = DbTransactionInput;
-export type StoreCommitOptions = DbTransactionOptions;
+export type StoreCommitOptions = DbTransactionOptions & RelationApplyOptions;
 export type StoreCommit<Version = unknown> = {
   (inputs: DbTransactionInputs, options?: StoreCommitOptions): Promise<StoreCommitResult<Version>>;
   (input: DbTransactionInput, options?: StoreCommitOptions): Promise<StoreCommitResult<Version>>;
@@ -6042,7 +6087,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
         listeners.delete(listener);
       };
     }, input.runtime.retainInterest),
-    commit: async (inputOrInputs) => {
+    commit: async (inputOrInputs, options = {}) => {
       if (closed) {
         const closedSnapshot = snapshot();
         const diagnostics: readonly TarstateDiagnostic[] = [{
@@ -6081,8 +6126,9 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       let report: RelationApplyReport<Version>;
       try {
         report = await tryApplyRelationPatches(input.runtime, transactionWritePatches(transactionResult), {
+          ...options,
           readVersion: true,
-          context: { env: transactionResult.db.env }
+          context: { ...options.context, env: transactionResult.db.env }
         });
       } finally {
         pendingApplyEnv = undefined;
