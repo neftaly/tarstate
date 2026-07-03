@@ -1,6 +1,9 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   index as rootMaterializedIndex,
+  runtimeSystemRelations,
+  runtimeSystemSource,
+  type RuntimeSystemState,
   type MaterializedIndex as RootMaterializedIndex
 } from '@tarstate/core';
 import * as constraintsApi from '@tarstate/core/constraints';
@@ -194,6 +197,61 @@ describe('public API contracts', () => {
 
     // @ts-expect-error createDb env must be passed through DbOptions.env.
     createDb({}, { tenant: 'acme' });
+  });
+
+  it('exposes runtime system state as queryable relation rows', () => {
+    const state = {
+      sources: [{
+        id: 'runtime:source:storage',
+        runtime: 'runtime',
+        source: 'storage',
+        state: 'loading'
+      }],
+      diagnostics: [diagnostic({
+        code: 'not_implemented',
+        severity: 'warning',
+        message: 'source is still loading',
+        surface: 'runtime'
+      })],
+      interests: [{
+        id: 'view:entries',
+        runtime: 'runtime',
+        queryKey: 'query:entries',
+        state: 'active',
+        relationNames: ['entries'],
+        subscriberCount: 1
+      }]
+    } satisfies RuntimeSystemState;
+    const source = runtimeSystemSource(state);
+
+    expect(runtimeSystemRelations.sources.name).toBe('tarstate.runtime.sources');
+    expect(runtimeSystemRelations.diagnostics.ephemeral).toBe(true);
+    expect(source.relationNames).toEqual([
+      'tarstate.runtime.sources',
+      'tarstate.runtime.diagnostics',
+      'tarstate.runtime.peers',
+      'tarstate.runtime.sync',
+      'tarstate.runtime.conflicts',
+      'tarstate.runtime.storage',
+      'tarstate.runtime.interests'
+    ]);
+    expect(source.rows(runtimeSystemRelations.sources)).toEqual(state.sources);
+    expect(source.rows(runtimeSystemRelations.interests)).toEqual(state.interests);
+    expect(source.rows(runtimeSystemRelations.diagnostics)).toEqual([
+      expect.objectContaining({
+        runtime: 'runtime',
+        code: 'not_implemented',
+        severity: 'warning',
+        message: 'source is still loading'
+      })
+    ]);
+    expect(source.diagnostics?.()).toEqual([
+      expect.objectContaining({
+        code: 'not_implemented',
+        severity: 'warning',
+        message: 'source is still loading'
+      })
+    ]);
   });
 
   it('makes q and qMany row-first with explicit result envelopes', () => {

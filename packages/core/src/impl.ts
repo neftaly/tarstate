@@ -854,6 +854,321 @@ export type RelationSource = {
   readonly diagnostics?: () => readonly TarstateDiagnostic[];
 };
 
+export type RuntimeSourceState =
+  | 'idle'
+  | 'loading'
+  | 'ready'
+  | 'syncing'
+  | 'unavailable'
+  | 'failed'
+  | 'closed';
+export type RuntimeSourceRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly source: string;
+  readonly state: RuntimeSourceState;
+  readonly priority?: number;
+  readonly message?: string;
+  readonly updatedAt?: number;
+  readonly detail?: unknown;
+};
+export type RuntimeDiagnosticRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly code: string;
+  readonly severity: TarstateDiagnosticSeverity;
+  readonly message: string;
+  readonly surface?: string;
+  readonly relation?: string;
+  readonly source?: string;
+  readonly detail?: unknown;
+};
+export type RuntimePeerState = 'connected' | 'connecting' | 'disconnected' | 'unknown';
+export type RuntimePeerRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly peerId: string;
+  readonly state: RuntimePeerState;
+  readonly userId?: string;
+  readonly deviceId?: string;
+  readonly sessionId?: string;
+  readonly connected?: boolean;
+  readonly ephemeral?: boolean;
+  readonly updatedAt?: number;
+  readonly detail?: unknown;
+};
+export type RuntimeSyncState =
+  | 'idle'
+  | 'loading'
+  | 'syncing'
+  | 'synced'
+  | 'diverged'
+  | 'failed'
+  | 'unknown';
+export type RuntimeSyncRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly state: RuntimeSyncState;
+  readonly documentId?: string;
+  readonly peerId?: string;
+  readonly storageId?: string;
+  readonly localHeads?: readonly string[];
+  readonly remoteHeads?: readonly string[];
+  readonly sharedHeads?: readonly string[];
+  readonly updatedAt?: number;
+  readonly detail?: unknown;
+};
+export type RuntimeConflictRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly path: string;
+  readonly documentId?: string;
+  readonly relation?: string;
+  readonly field?: string;
+  readonly conflictCount: number;
+  readonly values?: unknown;
+  readonly detail?: unknown;
+};
+export type RuntimeStorageState =
+  | 'idle'
+  | 'loading'
+  | 'saving'
+  | 'flushing'
+  | 'synced'
+  | 'failed'
+  | 'closed';
+export type RuntimeStorageRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly storage: string;
+  readonly state: RuntimeStorageState;
+  readonly durability?: RelationApplyDurability;
+  readonly pendingWrites?: number;
+  readonly lastFlushAt?: number;
+  readonly lastError?: string;
+  readonly detail?: unknown;
+};
+export type RuntimeInterestState = 'active' | 'released';
+export type RuntimeInterestRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly queryKey: string;
+  readonly state: RuntimeInterestState;
+  readonly relationNames: readonly string[];
+  readonly subscriberCount?: number;
+  readonly retainedAt?: number;
+  readonly releasedAt?: number;
+  readonly detail?: unknown;
+};
+export type RuntimeSystemState = {
+  readonly sources?: readonly RuntimeSourceRow[];
+  readonly diagnostics?: readonly (RuntimeDiagnosticRow | TarstateDiagnostic)[];
+  readonly peers?: readonly RuntimePeerRow[];
+  readonly sync?: readonly RuntimeSyncRow[];
+  readonly conflicts?: readonly RuntimeConflictRow[];
+  readonly storage?: readonly RuntimeStorageRow[];
+  readonly interests?: readonly RuntimeInterestRow[];
+};
+export type RuntimeSystemStateInput = RuntimeSystemState | (() => RuntimeSystemState);
+
+export const runtimeSystemRelations = {
+  sources: {
+    ...relation<RuntimeSourceRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.source'),
+        runtime: stringField(),
+        source: stringField(),
+        state: stringField(),
+        priority: optional(numberField()),
+        message: optional(stringField()),
+        updatedAt: optional(numberField()),
+        detail: optional(opaqueField<unknown>('runtime.source.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.sources'
+  },
+  diagnostics: {
+    ...relation<RuntimeDiagnosticRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.diagnostic'),
+        runtime: stringField(),
+        code: stringField(),
+        severity: stringField(),
+        message: stringField(),
+        surface: optional(stringField()),
+        relation: optional(stringField()),
+        source: optional(stringField()),
+        detail: optional(opaqueField<unknown>('runtime.diagnostic.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.diagnostics'
+  },
+  peers: {
+    ...relation<RuntimePeerRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.peer'),
+        runtime: stringField(),
+        peerId: stringField(),
+        state: stringField(),
+        userId: optional(stringField()),
+        deviceId: optional(stringField()),
+        sessionId: optional(stringField()),
+        connected: optional(booleanField()),
+        ephemeral: optional(booleanField()),
+        updatedAt: optional(numberField()),
+        detail: optional(opaqueField<unknown>('runtime.peer.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.peers'
+  },
+  sync: {
+    ...relation<RuntimeSyncRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.sync'),
+        runtime: stringField(),
+        state: stringField(),
+        documentId: optional(stringField()),
+        peerId: optional(stringField()),
+        storageId: optional(stringField()),
+        localHeads: optional(jsonField() as FieldSpec<readonly string[]>),
+        remoteHeads: optional(jsonField() as FieldSpec<readonly string[]>),
+        sharedHeads: optional(jsonField() as FieldSpec<readonly string[]>),
+        updatedAt: optional(numberField()),
+        detail: optional(opaqueField<unknown>('runtime.sync.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.sync'
+  },
+  conflicts: {
+    ...relation<RuntimeConflictRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.conflict'),
+        runtime: stringField(),
+        path: stringField(),
+        documentId: optional(stringField()),
+        relation: optional(stringField()),
+        field: optional(stringField()),
+        conflictCount: numberField(),
+        values: optional(opaqueField<unknown>('runtime.conflict.values')),
+        detail: optional(opaqueField<unknown>('runtime.conflict.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.conflicts'
+  },
+  storage: {
+    ...relation<RuntimeStorageRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.storage'),
+        runtime: stringField(),
+        storage: stringField(),
+        state: stringField(),
+        durability: optional(stringField()),
+        pendingWrites: optional(numberField()),
+        lastFlushAt: optional(numberField()),
+        lastError: optional(stringField()),
+        detail: optional(opaqueField<unknown>('runtime.storage.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.storage'
+  },
+  interests: {
+    ...relation<RuntimeInterestRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.interest'),
+        runtime: stringField(),
+        queryKey: stringField(),
+        state: stringField(),
+        relationNames: jsonField() as FieldSpec<readonly string[]>,
+        subscriberCount: optional(numberField()),
+        retainedAt: optional(numberField()),
+        releasedAt: optional(numberField()),
+        detail: optional(opaqueField<unknown>('runtime.interest.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.interests'
+  }
+} as const;
+export const runtimeSystemRelationList: readonly RelationRef[] = Object.values(runtimeSystemRelations);
+
+export function runtimeSystemSource(input: RuntimeSystemStateInput): RelationSource {
+  const readState = (): RuntimeSystemState => typeof input === 'function' ? input() : input;
+  return {
+    relationNames: runtimeSystemRelationList.map((relationRef) => relationRef.name),
+    rows: (relationRef) => runtimeSystemRows(readState(), relationRef),
+    diagnostics: () => runtimeSystemDiagnosticRows(readState()).map(runtimeDiagnosticRowToDiagnostic)
+  };
+}
+
+function runtimeSystemRows(state: RuntimeSystemState, relationRef: RelationRef): readonly unknown[] {
+  switch (relationRef.name) {
+    case runtimeSystemRelations.sources.name:
+      return state.sources ?? [];
+    case runtimeSystemRelations.diagnostics.name:
+      return runtimeSystemDiagnosticRows(state);
+    case runtimeSystemRelations.peers.name:
+      return state.peers ?? [];
+    case runtimeSystemRelations.sync.name:
+      return state.sync ?? [];
+    case runtimeSystemRelations.conflicts.name:
+      return state.conflicts ?? [];
+    case runtimeSystemRelations.storage.name:
+      return state.storage ?? [];
+    case runtimeSystemRelations.interests.name:
+      return state.interests ?? [];
+    default:
+      return [];
+  }
+}
+
+function runtimeSystemDiagnosticRows(state: RuntimeSystemState): readonly RuntimeDiagnosticRow[] {
+  return (state.diagnostics ?? []).map((diagnosticValue, index) =>
+    isRuntimeDiagnosticRow(diagnosticValue)
+      ? diagnosticValue
+      : runtimeDiagnosticRowFromDiagnostic(diagnosticValue, index));
+}
+
+function isRuntimeDiagnosticRow(input: RuntimeDiagnosticRow | TarstateDiagnostic): input is RuntimeDiagnosticRow {
+  return 'id' in input && 'runtime' in input;
+}
+
+function runtimeDiagnosticRowFromDiagnostic(input: TarstateDiagnostic, index: number): RuntimeDiagnosticRow {
+  return {
+    id: `diagnostic:${index}:${stableKey(input)}`,
+    runtime: typeof input.surface === 'string' ? input.surface : 'runtime',
+    code: input.code,
+    severity: input.severity ?? 'info',
+    message: input.message,
+    ...(typeof input.surface === 'string' ? { surface: input.surface } : {}),
+    ...(typeof input.relation === 'string' ? { relation: input.relation } : {}),
+    ...(input.detail === undefined ? {} : { detail: input.detail })
+  };
+}
+
+function runtimeDiagnosticRowToDiagnostic(row: RuntimeDiagnosticRow): TarstateDiagnostic {
+  return {
+    code: row.code,
+    severity: row.severity,
+    message: row.message,
+    ...(row.surface === undefined ? {} : { surface: row.surface }),
+    ...(row.relation === undefined ? {} : { relation: row.relation }),
+    ...(row.detail === undefined ? {} : { detail: row.detail })
+  };
+}
+
 export function fromObjectSource(data: Record<string, readonly unknown[]>): RelationSource {
   return {
     relationNames: Object.keys(data),
@@ -944,11 +1259,23 @@ export type RelationPatchTarget<Version = unknown> = {
   readonly ownsRelation?: (relationName: string) => boolean;
   readonly apply: RelationApply<Version>;
 };
+export type RelationRuntimeInterestKind = 'view';
+export type RelationRuntimeInterest = {
+  readonly id: string;
+  readonly kind: RelationRuntimeInterestKind;
+  readonly queryKey: string;
+  readonly query: Query;
+  readonly relationNames: readonly string[];
+};
+export type RelationRuntimeReleaseInterest = () => void;
+export type RelationRuntimeRetainInterest =
+  (interest: RelationRuntimeInterest) => RelationRuntimeReleaseInterest | void;
 export type RelationRuntime<Version = unknown> = {
   readonly source: AdapterSource<Version>;
   readonly target?: RelationPatchTarget<Version>;
   readonly snapshot?: () => AdapterSnapshot<Version>;
   readonly subscribe?: (listener: () => void) => () => void;
+  readonly retainInterest?: RelationRuntimeRetainInterest;
 };
 export type RelationRuntimeVersion<Runtime extends RelationRuntime = RelationRuntime> =
   Runtime extends RelationRuntime<infer Version> ? Version : never;
@@ -1003,12 +1330,14 @@ export const composeRelationRuntimes = <const Runtimes extends readonly Relation
   const source = composeRuntimeSources(runtimes);
   const target = composeRuntimeTarget(runtimes, source);
   const subscribe = composeRuntimeSubscribe(runtimes);
+  const retainInterest = composeRuntimeRetainInterest(runtimes);
 
   return {
     source,
     ...(target === undefined ? {} : { target }),
     snapshot: () => composeRuntimeSnapshot(runtimes),
-    ...(subscribe === undefined ? {} : { subscribe })
+    ...(subscribe === undefined ? {} : { subscribe }),
+    ...(retainInterest === undefined ? {} : { retainInterest })
   };
 };
 export const isRelationRuntime = (input: unknown): input is RelationRuntime => isRecord(input) && isRelationSource(input.source);
@@ -1193,6 +1522,30 @@ function hasRuntimeSubscribe(
   runtime: RelationRuntime
 ): runtime is RelationRuntime & { readonly subscribe: (listener: () => void) => () => void } {
   return runtime.subscribe !== undefined;
+}
+
+function composeRuntimeRetainInterest(
+  runtimes: readonly RelationRuntime[]
+): RelationRuntimeRetainInterest | undefined {
+  const interestedRuntimes = runtimes.filter(hasRuntimeRetainInterest);
+  if (interestedRuntimes.length === 0) return undefined;
+
+  return (interest) => {
+    const releasers = interestedRuntimes.map((runtime) => runtime.retainInterest(interest));
+    let retained = true;
+
+    return () => {
+      if (!retained) return;
+      retained = false;
+      for (const release of releasers) release?.();
+    };
+  };
+}
+
+function hasRuntimeRetainInterest(
+  runtime: RelationRuntime
+): runtime is RelationRuntime & { readonly retainInterest: RelationRuntimeRetainInterest } {
+  return runtime.retainInterest !== undefined;
 }
 
 function unsupportedRuntimeTargetDiagnostic(relationName: string): TarstateDiagnostic {
@@ -5131,7 +5484,7 @@ export type Store<Version = unknown> = {
 export type StoreSeedInput = Db | DbInputData;
 export type StoreRuntimeInput<Version = unknown> = TarstateDiagnosticOptions & {
   readonly runtime: RelationRuntime<Version>;
-  readonly relations: readonly RelationRef[];
+  readonly relations?: readonly RelationRef[];
   readonly env?: DbInputEnv;
 };
 
@@ -5584,7 +5937,7 @@ function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version
     close: () => {
       closed = true;
       listeners.clear();
-      viewCache.clear();
+      clearStoreViewCache(viewCache);
     }
   };
 }
@@ -5595,7 +5948,8 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
   const listeners = new Set<() => void>();
   const initialRuntimeSnapshot = input.runtime.snapshot?.();
   let currentSource = initialRuntimeSnapshot?.source ?? input.runtime.source;
-  let state = dbFromSource(currentSource, input.relations, input.env);
+  const storeRelations = input.relations ?? runtimeRelations(input.runtime);
+  let state = dbFromSource(currentSource, storeRelations, input.env);
   let version = initialRuntimeSnapshot?.version ?? currentSource.version?.();
   let pendingApplyEnv: DbEnv | undefined;
   const viewCache: StoreViewCache<Version> = new Map();
@@ -5610,7 +5964,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
     const runtimeSnapshot = input.runtime.snapshot?.();
     currentSource = runtimeSnapshot?.source ?? input.runtime.source;
     version = runtimeSnapshot?.version ?? currentSource.version?.();
-    state = dbFromSource(currentSource, input.relations, envValue);
+    state = dbFromSource(currentSource, storeRelations, envValue);
     revision += 1;
     for (const listener of listeners) listener();
     return {
@@ -5645,7 +5999,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       return () => {
         listeners.delete(listener);
       };
-    }),
+    }, input.runtime.retainInterest),
     commit: async (inputOrInputs) => {
       if (closed) {
         const closedSnapshot = snapshot();
@@ -5716,9 +6070,16 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       closed = true;
       runtimeUnsubscribe?.();
       listeners.clear();
-      viewCache.clear();
+      clearStoreViewCache(viewCache);
     }
   };
+}
+
+function runtimeRelations(runtime: RelationRuntime): readonly RelationRef[] {
+  const relations = (runtime as { readonly relations?: unknown }).relations;
+  return Array.isArray(relations) && relations.every(isRelationRef)
+    ? relations
+    : [];
 }
 
 type StoreViewCache<Version> = Map<string, StoreViewCacheEntry<unknown, Version>>;
@@ -5728,13 +6089,23 @@ type StoreViewCacheEntry<Row, Version> = {
   cachedSnapshot: StoreViewSnapshot<Row, Version> | undefined;
   cachedSnapshotDiagnosticsKey: string | undefined;
   subscribers: number;
+  releaseInterest: RelationRuntimeReleaseInterest | undefined;
 };
+
+function clearStoreViewCache<Version>(viewCache: StoreViewCache<Version>): void {
+  for (const entry of viewCache.values()) {
+    entry.releaseInterest?.();
+    entry.releaseInterest = undefined;
+  }
+  viewCache.clear();
+}
 
 function createStoreView<Row, Version>(
   queryValue: Query<Row>,
   snapshot: () => StoreSnapshot<Version>,
   viewCache: StoreViewCache<Version>,
-  subscribeStore: (listener: () => void) => () => void
+  subscribeStore: (listener: () => void) => () => void,
+  retainInterest?: RelationRuntimeRetainInterest
 ): StoreView<Row, Version> {
   const key = queryKey(queryValue);
   const cacheEntry = (): StoreViewCacheEntry<Row, Version> => {
@@ -5745,7 +6116,8 @@ function createStoreView<Row, Version>(
       query: queryValue,
       cachedSnapshot: undefined,
       cachedSnapshotDiagnosticsKey: undefined,
-      subscribers: 0
+      subscribers: 0,
+      releaseInterest: undefined
     };
     viewCache.set(key, next as StoreViewCacheEntry<unknown, Version>);
     return next;
@@ -5776,6 +6148,16 @@ function createStoreView<Row, Version>(
   const subscribeView = (listener: () => void): (() => void) => {
     const entry = cacheEntry();
     entry.subscribers += 1;
+    if (entry.subscribers === 1) {
+      const releaseInterest = retainInterest?.({
+        id: key,
+        kind: 'view',
+        queryKey: key,
+        query: entry.query,
+        relationNames: relationDependencies(entry.query)
+      });
+      entry.releaseInterest = typeof releaseInterest === 'function' ? releaseInterest : undefined;
+    }
     let subscribed = true;
     const unsubscribeStore = subscribeStore(listener);
     return () => {
@@ -5783,7 +6165,11 @@ function createStoreView<Row, Version>(
       subscribed = false;
       unsubscribeStore();
       entry.subscribers -= 1;
-      if (entry.subscribers === 0 && viewCache.get(key) === entry) viewCache.delete(key);
+      if (entry.subscribers === 0 && viewCache.get(key) === entry) {
+        entry.releaseInterest?.();
+        entry.releaseInterest = undefined;
+        viewCache.delete(key);
+      }
     };
   };
 

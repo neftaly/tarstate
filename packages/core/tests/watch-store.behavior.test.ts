@@ -7,7 +7,12 @@ import { relicChanges, trackTransact } from '@tarstate/core/runtime';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { createRuntimeStore, createStore } from '@tarstate/core/store';
 import { asc, env, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
-import { composeRelationRuntimes, type RelationApplyContext, type RelationRuntime } from '@tarstate/core/adapter';
+import {
+  composeRelationRuntimes,
+  type RelationApplyContext,
+  type RelationRuntime,
+  type RelationRuntimeInterest
+} from '@tarstate/core/adapter';
 import {
   attachWatches,
   detachWatches,
@@ -495,6 +500,50 @@ describe('watch and store behavior', () => {
     }));
 
     store.close();
+  });
+
+  it('runtime store retains view interests only while subscribers are mounted', () => {
+    const inner = createMemoryRelationRuntime(makeDb().data);
+    const retained: RelationRuntimeInterest[] = [];
+    const released: RelationRuntimeInterest[] = [];
+    const runtime = {
+      ...inner,
+      retainInterest: (interest: RelationRuntimeInterest) => {
+        retained.push(interest);
+        return () => {
+          released.push(interest);
+        };
+      }
+    } satisfies RelationRuntime<number>;
+    const store = createRuntimeStore({ runtime, relations: [schema.accounts, schema.entries] });
+    const view = store.view(entryList);
+
+    const unsubscribeFirst = view.subscribe(() => {});
+    const unsubscribeSecond = view.subscribe(() => {});
+
+    expect(retained).toEqual([
+      expect.objectContaining({
+        kind: 'view',
+        queryKey: view.queryKey,
+        relationNames: ['entries']
+      })
+    ]);
+    expect(released).toEqual([]);
+
+    unsubscribeFirst();
+    expect(released).toEqual([]);
+
+    unsubscribeSecond();
+    expect(released).toEqual([retained[0]]);
+
+    const secondView = store.view(cashEntryProjection);
+    const unsubscribeThird = secondView.subscribe(() => {});
+    expect(retained).toHaveLength(2);
+
+    store.close();
+    expect(released).toEqual([retained[0], retained[1]]);
+    unsubscribeThird();
+    expect(released).toEqual([retained[0], retained[1]]);
   });
 
   it('runtime store routes original patches, preserves callback semantics, and rejects after close', async () => {

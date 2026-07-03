@@ -1,4 +1,12 @@
-export { composeRelationRuntimes, isRelationRuntime, tryApplyRelationPatches } from './impl.js';
+export {
+  composeSources,
+  composeRelationRuntimes,
+  isRelationRuntime,
+  runtimeSystemRelationList,
+  runtimeSystemRelations,
+  runtimeSystemSource,
+  tryApplyRelationPatches
+} from './impl.js';
 export type {
   AdapterSnapshot,
   AdapterSource,
@@ -20,8 +28,26 @@ export type {
   RelationRangeBound,
   RelationRangeLookup,
   RelationRuntime,
+  RelationRuntimeInterest,
+  RelationRuntimeInterestKind,
+  RelationRuntimeReleaseInterest,
+  RelationRuntimeRetainInterest,
   RelationRuntimeVersion,
   RelationSource,
+  RuntimeConflictRow,
+  RuntimeDiagnosticRow,
+  RuntimeInterestRow,
+  RuntimeInterestState,
+  RuntimePeerRow,
+  RuntimePeerState,
+  RuntimeSourceRow,
+  RuntimeSourceState,
+  RuntimeStorageRow,
+  RuntimeStorageState,
+  RuntimeSyncRow,
+  RuntimeSyncState,
+  RuntimeSystemState,
+  RuntimeSystemStateInput,
   TarstateDiagnostic,
   WritePatch
 } from './impl.js';

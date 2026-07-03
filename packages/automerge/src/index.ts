@@ -1,15 +1,21 @@
 import * as Automerge from '@automerge/automerge';
 import type { DocHandle } from '@automerge/automerge-repo';
 import {
+  composeSources,
   composeRelationRuntimes,
   type AdapterSnapshot,
   type AdapterSource,
   type ComposedRelationRuntimeVersion,
   type RelationDelta,
+  type RelationRuntimeInterest,
   type RelationLookup,
   type RelationPatchTarget,
   type RelationRangeLookup,
   type RelationRuntime,
+  type RuntimeInterestRow,
+  type RuntimeSystemState,
+  runtimeSystemRelationList,
+  runtimeSystemSource,
   type TarstateDiagnostic
 } from '@tarstate/core/adapter';
 import { evaluate, type EvaluateEnv } from '@tarstate/core/evaluate';
@@ -130,6 +136,8 @@ export type AutomergeMapAdapterOptions<
   readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
   readonly changeMessage?: string | ((patches: readonly WritePatch[]) => string | undefined);
   readonly env?: AutomergeMapEnvInput;
+  readonly runtimeId?: string;
+  readonly system?: RuntimeSystemState | (() => RuntimeSystemState);
 };
 
 export type AutomergeDocHandleRuntimeOptions<
@@ -142,6 +150,8 @@ export type AutomergeMapSourceOptions<
   DocumentShape extends object = Record<string, unknown>
 > = {
   readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
+  readonly runtimeId?: string;
+  readonly system?: RuntimeSystemState | (() => RuntimeSystemState);
 };
 
 export type AutomergeMapSource = AdapterSource<Automerge.Heads>;
@@ -276,7 +286,15 @@ export function automergeMapSource<
   doc: Automerge.Doc<DocumentShape>,
   options: AutomergeMapSourceOptions<DocumentShape>
 ): AutomergeMapSource {
-  return createAutomergeMapSource(() => doc, options.relations);
+  const dataSource = createAutomergeMapSource(() => doc, options.relations);
+  return withAutomergeSystemSource(
+    () => doc,
+    dataSource,
+    options.relations,
+    options.runtimeId ?? 'automergeMapSource',
+    new Map(),
+    options.system
+  );
 }
 
 export function automergeMapAdapter<
@@ -355,7 +373,17 @@ function createAutomergeMapAdapter<
   driver: AutomergeDocumentDriver<DocumentShape>
 ): AutomergeMapAdapter<DocumentShape> & { readonly close: () => void } {
   const listeners = new Set<() => void>();
-  const source = createAutomergeMapSource(driver.getDoc, options.relations);
+  const interests = new Map<string, RuntimeInterestRow>();
+  const dataSource = createAutomergeMapSource(driver.getDoc, options.relations);
+  const runtimeId = options.runtimeId ?? 'automergeMapRuntime';
+  const source = withAutomergeSystemSource(
+    driver.getDoc,
+    dataSource,
+    options.relations,
+    runtimeId,
+    interests,
+    options.system
+  );
   const relationNames = relationNamesFor(options.relations);
   let closed = false;
 
@@ -385,6 +413,27 @@ function createAutomergeMapAdapter<
     listeners.add(listener);
     return () => {
       listeners.delete(listener);
+    };
+  };
+  const retainInterest = (interest: RelationRuntimeInterest) => {
+    const retainedAt = Date.now();
+    interests.set(interest.id, {
+      id: interest.id,
+      runtime: runtimeId,
+      queryKey: interest.queryKey,
+      state: 'active',
+      relationNames: interest.relationNames,
+      subscriberCount: 1,
+      retainedAt
+    });
+    notify();
+    let retained = true;
+
+    return () => {
+      if (!retained) return;
+      retained = false;
+      interests.delete(interest.id);
+      notify();
     };
   };
   const objectIdFor = (relation: RelationRef, key: unknown) =>
@@ -466,6 +515,7 @@ function createAutomergeMapAdapter<
     target,
     snapshot,
     subscribe,
+    retainInterest,
     close: () => {
       closed = true;
       listeners.clear();
@@ -609,12 +659,14 @@ export function createAutomergeMapRuntime<
     adapter,
     relations: uniqueRelationRefs([
       ...options.relations.map((mapping) => mapping.relation),
-      ...runtimes.flatMap((item) => item.relations)
+      ...runtimes.flatMap((item) => item.relations),
+      ...runtimeSystemRelationList
     ]),
     source: runtime.source,
     ...(runtime.target === undefined ? {} : { target: runtime.target }),
     ...(runtime.snapshot === undefined ? {} : { snapshot: runtime.snapshot }),
-    subscribe
+    subscribe,
+    ...(runtime.retainInterest === undefined ? {} : { retainInterest: runtime.retainInterest })
   } as AutomergeMapRuntime<DocumentShape, RuntimeVersion>;
 }
 
@@ -631,6 +683,72 @@ function createAutomergeMapSource<DocumentShape extends object>(
     rangeLookup: (lookup) => rangeRowsForRelation(getDoc(), relations, lookup),
     version: () => Automerge.getHeads(getDoc()),
     diagnostics: () => relations.flatMap((mapping) => mappedCollection(getDoc(), mapping).diagnostics)
+  };
+}
+
+function withAutomergeSystemSource<DocumentShape extends object>(
+  getDoc: () => Automerge.Doc<DocumentShape>,
+  dataSource: AutomergeMapSource,
+  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[],
+  runtimeId: string,
+  interests: ReadonlyMap<string, RuntimeInterestRow>,
+  input?: RuntimeSystemState | (() => RuntimeSystemState)
+): AutomergeMapSource {
+  const systemState = (): RuntimeSystemState => {
+    const extra = typeof input === 'function' ? input() : input;
+    const heads = Automerge.getHeads(getDoc());
+    const diagnostics = dataSource.diagnostics?.() ?? [];
+
+    return {
+      sources: [
+        {
+          id: `${runtimeId}:source:document`,
+          runtime: runtimeId,
+          source: 'automerge.document',
+          state: 'ready',
+          message: `${relations.length} mapped relation${relations.length === 1 ? '' : 's'}`
+        },
+        ...(extra?.sources ?? [])
+      ],
+      diagnostics: [
+        ...diagnostics.map((diagnosticValue, index) => ({
+          id: `${runtimeId}:diagnostic:${index}`,
+          runtime: runtimeId,
+          source: 'automerge.document',
+          code: diagnosticValue.code,
+          severity: diagnosticValue.severity ?? 'info',
+          message: diagnosticValue.message,
+          ...(diagnosticValue.surface === undefined ? {} : { surface: diagnosticValue.surface }),
+          ...(diagnosticValue.relation === undefined ? {} : { relation: diagnosticValue.relation }),
+          ...(diagnosticValue.detail === undefined ? {} : { detail: diagnosticValue.detail })
+        })),
+        ...(extra?.diagnostics ?? [])
+      ],
+      sync: [
+        {
+          id: `${runtimeId}:sync:local-heads`,
+          runtime: runtimeId,
+          state: 'synced',
+          localHeads: heads
+        },
+        ...(extra?.sync ?? [])
+      ],
+      interests: [
+        ...Array.from(interests.values()),
+        ...(extra?.interests ?? [])
+      ],
+      ...(extra?.peers === undefined ? {} : { peers: extra.peers }),
+      ...(extra?.conflicts === undefined ? {} : { conflicts: extra.conflicts }),
+      ...(extra?.storage === undefined ? {} : { storage: extra.storage })
+    };
+  };
+  const systemSource = runtimeSystemSource(systemState);
+  const rowSource = composeSources(dataSource, systemSource);
+
+  return {
+    ...rowSource,
+    version: () => dataSource.version?.() ?? Automerge.getHeads(getDoc()),
+    ...(dataSource.diagnostics === undefined ? {} : { diagnostics: dataSource.diagnostics })
   };
 }
 

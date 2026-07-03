@@ -22,7 +22,7 @@ import {
   value,
   where
 } from '@tarstate/core';
-import { isRelationRuntime, type RelationRuntime } from '@tarstate/core/adapter';
+import { isRelationRuntime, runtimeSystemRelations, type RelationRuntime } from '@tarstate/core/adapter';
 import { evaluate, validateRelationRow } from '@tarstate/core/evaluate';
 import {
   anchoredPathField,
@@ -38,6 +38,7 @@ import {
   stringField,
   type JsonValue
 } from '@tarstate/core/schema';
+import { createRuntimeStore } from '@tarstate/core/store';
 import { write } from '@tarstate/core/write';
 import {
   automergeChangeAt,
@@ -194,12 +195,51 @@ describe('automerge map adapter', () => {
     expect('sedimentree' in api).toBe(false);
     expect(adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
     expect(source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
+    expect(source.rows(runtimeSystemRelations.sources)).toEqual([
+      expect.objectContaining({
+        runtime: 'automergeMapSource',
+        source: 'automerge.document',
+        state: 'ready'
+      })
+    ]);
     expect(adapter.snapshot().version).toEqual(Automerge.getHeads(doc));
     expectTypeOf(automergeMapAdapter<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapAdapter<WorkspaceDoc>>();
     expectTypeOf(automergeDocHandleAdapter<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeDocHandleAdapter<WorkspaceDoc>>();
     expectTypeOf(createAutomergeDocHandleRuntime<WorkspaceDoc>).returns
       .toMatchTypeOf<AutomergeDocHandleRuntime<WorkspaceDoc>>();
     expectTypeOf(automergeMapSource<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapSource>();
+  });
+
+  it('publishes Automerge runtime state and active view interests as relation rows', () => {
+    const runtime = createAutomergeMapRuntime({
+      doc: workspaceDoc(),
+      relations: taskMapping,
+      runtimeId: 'workspace'
+    });
+    const store = createRuntimeStore({ runtime });
+    const view = store.view(from(schema.tasks));
+    const unsubscribe = view.subscribe(() => {});
+
+    expect(runtime.source.rows(runtimeSystemRelations.sync)).toEqual([
+      expect.objectContaining({
+        runtime: 'workspace',
+        state: 'synced',
+        localHeads: runtime.adapter.source.version?.()
+      })
+    ]);
+    expect(store.query(runtimeSystemRelations.interests).rows).toEqual([
+      expect.objectContaining({
+        runtime: 'workspace',
+        queryKey: view.queryKey,
+        state: 'active',
+        relationNames: ['tasks']
+      })
+    ]);
+
+    unsubscribe();
+    expect(store.query(runtimeSystemRelations.interests).rows).toEqual([]);
+
+    store.close();
   });
 
   it('drops onDocChange from adapter options', () => {
@@ -257,7 +297,11 @@ describe('automerge map adapter', () => {
   it('maps array and map collections to relation rows', () => {
     const source = automergeMapSource(workspaceDoc(), { relations: allMappings });
 
-    expect(source.relationNames).toEqual(['tasks', 'labels']);
+    expect(source.relationNames).toEqual([
+      'tasks',
+      'labels',
+      ...Object.values(runtimeSystemRelations).map((relationRef) => relationRef.name)
+    ]);
     expect(source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
     expect(source.rows(schema.labels)).toEqual([{ id: 'label-1', name: 'Urgent' }]);
     expect(source.lookup?.({ relation: schema.tasks, field: 'id', value: 'task-1' })).toEqual([
@@ -1106,7 +1150,11 @@ describe('automerge map adapter', () => {
     expect(runtime.adapter.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
     expect(runtime.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft' }]);
     expect(runtime.source.rows(schema.labels)).toEqual([{ id: 'label-extra', name: 'Extra' }]);
-    expect(runtime.relations.map((item) => item.name)).toEqual(['tasks', 'labels']);
+    expect(runtime.relations.map((item) => item.name)).toEqual([
+      'tasks',
+      'labels',
+      ...Object.values(runtimeSystemRelations).map((relationRef) => relationRef.name)
+    ]);
     expect(isRelationRuntime(runtime)).toBe(true);
     expect(runtime.source.version?.()).toEqual([runtime.adapter.source.version?.(), 1]);
     await expect(runtime.target?.apply([

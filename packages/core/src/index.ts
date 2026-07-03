@@ -207,6 +207,32 @@ export type {
 } from './runtime.js';
 
 export {
+  runtimeSystemRelationList,
+  runtimeSystemRelations,
+  runtimeSystemSource
+} from './adapter.js';
+export type {
+  RelationRuntimeInterest,
+  RelationRuntimeInterestKind,
+  RelationRuntimeReleaseInterest,
+  RelationRuntimeRetainInterest,
+  RuntimeConflictRow,
+  RuntimeDiagnosticRow,
+  RuntimeInterestRow,
+  RuntimeInterestState,
+  RuntimePeerRow,
+  RuntimePeerState,
+  RuntimeSourceRow,
+  RuntimeSourceState,
+  RuntimeStorageRow,
+  RuntimeStorageState,
+  RuntimeSyncRow,
+  RuntimeSyncState,
+  RuntimeSystemState,
+  RuntimeSystemStateInput
+} from './adapter.js';
+
+export {
   check,
   constrain,
   fk,
