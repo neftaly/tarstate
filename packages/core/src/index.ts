@@ -25,6 +25,7 @@ export {
 export type { FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
 
 export {
+  agg,
   aggregate,
   and,
   any,
@@ -35,7 +36,10 @@ export {
   bottomBy,
   btree,
   call,
+  callMaybe,
   clauses,
+  constRelation,
+  constantRows,
   constRows,
   correlate,
   count,
@@ -50,8 +54,10 @@ export {
   from,
   gt,
   gte,
+  getKey,
   hash,
   hostFn,
+  ifElse,
   intersection,
   isMissing,
   isNull,
@@ -74,11 +80,13 @@ export {
   notNull,
   or,
   pipe,
+  select,
   project,
   qualify,
   queryKey,
   QueryKeyError,
   queryRowKeyFields,
+  dependencies,
   relationDependencies,
   rename,
   sel,
@@ -168,12 +176,33 @@ export type {
   QueryBatchResult,
   QueryBatchRows,
   QueryBatchTarget,
+  QueryBatchTargetObject,
+  QueryBatchTargetOptions,
   QueryBatchTargetRow,
   RelationKeyValue,
   RowLookupOptions,
   RowPredicateOptions,
   SetEnvTransaction
 } from './db.js';
+
+export { relicChanges, trackRuntimeCommit, trackTransact, UnsupportedChangeTrackingError } from './runtime.js';
+export type {
+  RelicTrackChangeView,
+  RelicTrackTransactResult,
+  TrackRuntimeCommitDiagnostic,
+  TrackRuntimeCommitOptions,
+  TrackRuntimeCommitResult,
+  TrackRuntimeCommitStatus,
+  TrackRuntimeCommitSupportedResult,
+  TrackRuntimeCommitUnsupportedResult,
+  TrackTransactCallback,
+  TrackTransactChangeView,
+  TrackTransactDiagnostic,
+  TrackTransactOptions,
+  TrackTransactOutput,
+  TrackTransactQueryChanges,
+  TrackTransactResult
+} from './runtime.js';
 
 export {
   check,
@@ -224,6 +253,50 @@ export type {
 } from './store.js';
 
 export {
+  attachWatches,
+  detachWatches,
+  diffOptionsForTarget,
+  diffQuery,
+  isWatchMaterialization,
+  subscribeWatch,
+  trackedChangeFromMaterializationChange,
+  trackedChangesForDbTransition,
+  transferWatches,
+  unwatch,
+  unwatchTarget,
+  watch,
+  watchChangeKeyMap,
+  watchChangeMap,
+  watchRuntime,
+  watchTarget,
+  watchTargetKey
+} from './watch.js';
+export type {
+  ChangeSet,
+  QueryDiff,
+  QueryDiffDiagnostic,
+  QueryDiffOptions,
+  RuntimeWatchHandle,
+  TrackedChange,
+  UnwatchResult,
+  WatchChangeKeyMap,
+  WatchChangeMap,
+  WatchDb,
+  WatchDiagnostic,
+  WatchEvent,
+  WatchHandle,
+  WatchListener,
+  WatchOptions,
+  WatchRefreshResult,
+  WatchRuntimeDiagnostic,
+  WatchSubscription,
+  WatchTarget,
+  WatchTargetChange,
+  WatchTargetRegistration,
+  WatchUnsubscribeResult
+} from './watch.js';
+
+export {
   deleteByKey,
   deleteExact,
   deleteRows,
@@ -268,14 +341,52 @@ export type {
   WritePatch
 } from './write.js';
 
-export { index } from './materialization.js';
+export {
+  demat,
+  explainMaterialization,
+  index,
+  isMaterialized,
+  maintainMaterializationSnapshots,
+  maintainMaterializations,
+  mat,
+  materializationForQuery,
+  materializationsFor,
+  materializedRelationFor,
+  materializedRelationForQuery,
+  materializedRowsFor,
+  materializedRowsForQuery,
+  materializedSourceFor,
+  readMaterializedQuery
+} from './materialization.js';
 export type {
+  MaterializableDb,
+  MaterializationEnvDelta,
+  MaterializationExplanation,
+  MaterializationIndexSpec,
+  MaterializationInput,
+  MaterializationMaintenanceChange,
+  MaterializationMaintenanceDecision,
+  MaterializationMaintenanceKind,
+  MaterializationMaintenanceOptions,
+  MaterializationMaintenanceResult,
+  MaterializationMaintainResult,
+  MaterializationMetadata,
+  MaterializationMode,
+  MaterializationOptions,
+  MaterializationRange,
+  MaterializationRangeBound,
+  MaterializationRefreshResult,
+  MaterializationTarget,
   MaterializedBtreeIndex,
+  MaterializedDb,
   MaterializedHashIndex,
   MaterializedIndex,
   MaterializedIndexBase,
   MaterializedIndexBucket,
   MaterializedIndexKind,
+  MaterializedQueryResult,
   MaterializedSetIndex,
-  MaterializedUniqueIndex
+  MaterializedUniqueIndex,
+  SnapshotMaterializationOptions,
+  SnapshotMaterializationTarget
 } from './materialization.js';

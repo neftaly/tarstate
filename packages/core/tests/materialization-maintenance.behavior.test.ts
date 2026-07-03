@@ -24,8 +24,43 @@ import {
   without,
   type Query
 } from '@tarstate/core/query';
+import { defineSchema, jsonField, relation, stringField, type JsonValue } from '@tarstate/core/schema';
 import { deleteByKey, insert, updateByKey } from '@tarstate/core/write';
 import { account, entry, makeDb, schema } from './behavior-fixtures.js';
+
+type TaggedItem = {
+  readonly id: string;
+  readonly tags: JsonValue;
+};
+
+type SetItem = {
+  readonly id: string;
+  readonly label: string;
+};
+
+const expandSchema = defineSchema({
+  items: relation<TaggedItem>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      tags: jsonField()
+    }
+  }),
+  leftItems: relation<SetItem>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      label: stringField()
+    }
+  }),
+  rightItems: relation<SetItem>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      label: stringField()
+    }
+  })
+});
 
 const sortedCashEntryProjection = pipe(
   from(entry),
@@ -321,6 +356,128 @@ describe('materialization maintenance behavior', () => {
     expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
   });
 
+  it('incrementally maintains expand over direct row-local collections with exposed item identity', () => {
+    const query = pipe(
+      from(expandSchema.items),
+      expand(field<readonly string[]>('items', 'tags'), { as: 'tag' }),
+      project({
+        id: field<string>('items', 'id'),
+        tag: field<string>('row', 'tag')
+      }),
+      sort(asc(field<string>('row', 'id')), asc(field<string>('row', 'tag')))
+    );
+    const db = mat(createDb({
+      items: [
+        { id: 'a', tags: ['red', 'blue'] },
+        { id: 'b', tags: [] }
+      ]
+    }), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    const inserted = tryTransact(db, insert(expandSchema.items, { id: 'c', tags: ['amber'] }));
+    expect(inserted.committed).toBe(true);
+    expect(inserted.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rowChanges: [
+        { kind: 'added', key: '["c","amber"]', row: { id: 'c', tag: 'amber' } }
+      ],
+      diagnostics: []
+    }));
+    expect(q(inserted.db, query)).toEqual(q(demat(inserted.db, query), query));
+
+    const updated = tryTransact(inserted.db, updateByKey(expandSchema.items, 'a', { tags: ['blue', 'green'] }));
+    expect(updated.committed).toBe(true);
+    expect(updated.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rowChanges: [
+        { kind: 'removed', key: '["a","red"]', row: { id: 'a', tag: 'red' } },
+        { kind: 'added', key: '["a","green"]', row: { id: 'a', tag: 'green' } }
+      ],
+      diagnostics: []
+    }));
+    expect(q(updated.db, query)).toEqual(q(demat(updated.db, query), query));
+  });
+
+  it('recomputes expand when expanded rows do not expose item identity', () => {
+    const query = pipe(
+      from(expandSchema.items),
+      expand(field<readonly string[]>('items', 'tags'))
+    );
+    const reason = 'incremental maintenance requires a stable materialized row identity';
+    const db = mat(createDb({
+      items: [
+        { id: 'a', tags: ['red', 'blue'] }
+      ]
+    }), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [expect.objectContaining({ code: 'materialization_unsupported', message: reason })]
+    }));
+
+    const result = tryTransact(db, updateByKey(expandSchema.items, 'a', { tags: ['blue', 'green'] }));
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: 'materialization_unsupported', message: reason })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
+  it('recomputes set operations so duplicate contributors are not removed prematurely', () => {
+    const left = pipe(from(expandSchema.leftItems), project({ id: field<string>('leftItems', 'id') }));
+    const right = pipe(from(expandSchema.rightItems), project({ id: field<string>('rightItems', 'id') }));
+    const query = pipe(
+      union(left, right),
+      sort(asc(field<string>('row', 'id')))
+    );
+    const reason = 'set operation queries are not incrementally maintained';
+    const db = mat(createDb({
+      leftItems: [
+        { id: 'a', label: 'left a' },
+        { id: 'b', label: 'left b' }
+      ],
+      rightItems: [
+        { id: 'b', label: 'right b' },
+        { id: 'c', label: 'right c' }
+      ]
+    }), query);
+
+    expect(explainMaterialization(query)).toEqual(expect.objectContaining({
+      supported: false,
+      update: 'recomputed',
+      recomputed: true,
+      reason,
+      diagnostics: [expect.objectContaining({ code: 'materialization_unsupported', message: reason })]
+    }));
+
+    const result = tryTransact(db, deleteByKey(expandSchema.rightItems, 'b'));
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'recomputed',
+      recomputed: true,
+      rows: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ code: 'materialization_unsupported', message: reason })
+      ])
+    }));
+    expect(q(result.db, query)).toEqual(q(demat(result.db, query), query));
+  });
+
   it('falls back with explicit diagnostics for unsupported incremental shapes', () => {
     const projectedEntries = pipe(
       from(entry),
@@ -366,11 +523,6 @@ describe('materialization maintenance behavior', () => {
           pipe(projectedEntries, where(eq(entry.accountId, value('sales'))))
         ) as Query<unknown>,
         reason: 'set operation queries are not incrementally maintained'
-      },
-      {
-        label: 'expand',
-        query: pipe(from(entry), expand(entry.memo, { as: 'tag' })) as Query<unknown>,
-        reason: 'expand queries are not incrementally maintained'
       },
       {
         label: 'selected subquery',

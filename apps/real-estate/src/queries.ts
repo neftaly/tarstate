@@ -1,5 +1,5 @@
 import {
-  aggregate,
+  agg,
   and,
   any,
   as,
@@ -22,8 +22,8 @@ import {
   maybe,
   min,
   pipe,
-  project,
   queryKey,
+  select,
   sort,
   sortLimit,
   uniqueIndex,
@@ -171,7 +171,7 @@ export function listingWalkthroughQuery(filters: ListingFilters): Query<ListingR
 
   return pipe(
     sorted,
-    project({
+    select({
       id: listing.id,
       address: listing.address,
       neighborhoodId: listing.neighborhoodId,
@@ -197,7 +197,7 @@ export function listingLookupQuery(id: string): Query<Listing> {
 
 const listingStatsByNeighborhood = pipe(
   from(listing),
-  aggregate({
+  agg({
     groupBy: { neighborhoodId: listing.neighborhoodId },
     aggregates: {
       listingCount: count(),
@@ -208,7 +208,7 @@ const listingStatsByNeighborhood = pipe(
       maxPrice: max(listing.price)
     }
   }),
-  project({
+  select({
     neighborhoodId: field<string>('row', 'neighborhoodId'),
     listingCount: field<number>('row', 'listingCount'),
     activeCount: field<number>('row', 'activeCount'),
@@ -225,7 +225,7 @@ export const neighborhoodMarketSummaryQuery = pipe(
   from(neighborhood),
   leftJoin(market, clauses<Neighborhood, QueryRow<typeof listingStatsByNeighborhood>>({ id: 'neighborhoodId' })),
   sort(asc(neighborhood.$.name), asc(neighborhood.id)),
-  project({
+  select({
     neighborhoodId: neighborhood.id,
     neighborhoodName: neighborhood.$.name,
     borough: neighborhood.borough,
@@ -256,7 +256,7 @@ export function openHouseJoinQuery(brokerOnly: boolean): Query<OpenHouseSchedule
   return pipe(
     filtered,
     sort(asc(openHouse.date), asc(openHouse.startsAt), asc(openHouse.id)),
-    project({
+    select({
       id: openHouse.id,
       listingId: openHouse.listingId,
       address: listing.address,
@@ -278,7 +278,7 @@ export function topPricedListingsQuery(countValue: number, status: ListingStatus
   return pipe(
     filtered,
     sortLimit(countValue, desc(listing.price), asc(listing.id)),
-    project({
+    select({
       id: listing.id,
       address: listing.address,
       neighborhoodName: neighborhood.$.name,
@@ -292,11 +292,11 @@ export function topPricedListingsQuery(countValue: number, status: ListingStatus
 
 const inquiryCounts = pipe(
   from(inquiry),
-  aggregate({
+  agg({
     groupBy: { listingId: inquiry.listingId },
     aggregates: { inquiryCount: count() }
   }),
-  project({
+  select({
     listingId: field<string>('row', 'listingId'),
     inquiryCount: field<number>('row', 'inquiryCount')
   })
@@ -304,14 +304,14 @@ const inquiryCounts = pipe(
 
 const offerStats = pipe(
   from(offer),
-  aggregate({
+  agg({
     groupBy: { listingId: offer.listingId },
     aggregates: {
       submittedOffers: count(),
       topOffer: max(offer.amount)
     }
   }),
-  project({
+  select({
     listingId: field<string>('row', 'listingId'),
     submittedOffers: field<number>('row', 'submittedOffers'),
     topOffer: field<number>('row', 'topOffer')
@@ -327,7 +327,7 @@ export const pipelineByListingQuery = pipe(
   leftJoin(inquirySummary, clauses<Listing, QueryRow<typeof inquiryCounts>>({ id: 'listingId' })),
   leftJoin(offerSummary, clauses<Listing, QueryRow<typeof offerStats>>({ id: 'listingId' })),
   sort(desc(listing.price), asc(listing.id)),
-  project({
+  select({
     listingId: listing.id,
     address: listing.address,
     price: listing.price,
@@ -342,7 +342,7 @@ export const offerBookQuery = pipe(
   from(offer),
   join(from(listing), eq(offer.listingId, listing.id)),
   sort(desc(offer.submittedAt), asc(offer.id)),
-  project({
+  select({
     id: offer.id,
     listingId: offer.listingId,
     address: listing.address,
@@ -361,7 +361,7 @@ export const inquiryQueueQuery = pipe(
   join(from(listing), eq(inquiry.listingId, listing.id)),
   join(from(agent), eq(inquiry.agentId, agent.id)),
   sort(desc(inquiry.createdAt), asc(inquiry.id)),
-  project({
+  select({
     id: inquiry.id,
     listingId: inquiry.listingId,
     address: listing.address,
@@ -377,7 +377,7 @@ export const inquiryQueueQuery = pipe(
 
 export const listingIndexRows = pipe(
   from(listing),
-  project({
+  select({
     id: listing.id,
     address: listing.address,
     neighborhoodId: listing.neighborhoodId,

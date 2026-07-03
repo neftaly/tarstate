@@ -13,12 +13,15 @@ import { mat } from '@tarstate/core/materialization';
 import { any as anyAggregate, asc, call, count, eq, field, from, hostFn, pipe, project, sort, value } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import {
+  deleteExact,
   insert,
   insertIgnore,
   insertOrMerge,
   insertOrReplace,
   insertOrUpdate,
+  replaceAll,
   seed,
+  update,
   updateByKey,
   write,
   type WritePatch
@@ -75,6 +78,30 @@ describe('write and transaction behavior', () => {
 
     expect(q(next, accountsById)).toEqual(rows.accounts);
     expect(q(next, entriesById)).toEqual(rows.entries);
+  });
+
+  it('commits variadic transaction inputs through transact like tryTransact', () => {
+    const next = transact(
+      createDb(),
+      insert(schema.accounts, { id: 'cash', name: 'Cash', kind: 'asset' }),
+      insert(schema.accounts, { id: 'sales', name: 'Sales', kind: 'income' }),
+      insert(schema.entries, { id: 'e1', accountId: 'cash', amount: 10, posted: true })
+    );
+
+    expect(q(next, accountsById)).toEqual([
+      { id: 'cash', name: 'Cash', kind: 'asset' },
+      { id: 'sales', name: 'Sales', kind: 'income' }
+    ]);
+    expect(q(next, entriesById)).toEqual([
+      { id: 'e1', accountId: 'cash', amount: 10, posted: true }
+    ]);
+
+    const withOptions = transact(
+      next,
+      updateByKey(schema.entries, 'e1', { amount: 12 }),
+      { label: 'variadic compatibility' }
+    );
+    expect(row(withOptions, schema.entries, 'e1')?.amount).toBe(12);
   });
 
   it('resolves insert variants against materialized unique constraints', () => {
@@ -141,6 +168,40 @@ describe('write and transaction behavior', () => {
     // @ts-expect-error aggregate expressions cannot be evaluated in a row update context.
     const invalidAnyUpdate = updateByKey(schema.entries, 'e1', { posted: anyAggregate(eq(entry.posted, value(true))) });
     void invalidAnyUpdate;
+  });
+
+  it('applies predicate updates, exact deletes, and relation replacement writes', () => {
+    const updated = transact(
+      makeDb(),
+      update(schema.entries, eq(entry.accountId, value('cash')), {
+        memo: 'cash movement',
+        posted: true
+      })
+    );
+    const deleted = transact(
+      updated,
+      deleteExact(schema.entries, { id: 'e3', accountId: 'fees', amount: -5, memo: null, posted: true })
+    );
+    const replaced = transact(
+      deleted,
+      replaceAll(schema.accounts, [
+        { id: 'cash', name: 'Operating cash', kind: 'asset' },
+        { id: 'suspense', name: 'Suspense', kind: 'liability' }
+      ])
+    );
+
+    expect(row(updated, schema.entries, 'e4')).toEqual({
+      id: 'e4',
+      accountId: 'cash',
+      amount: 0,
+      memo: 'cash movement',
+      posted: true
+    });
+    expect(row(deleted, schema.entries, 'e3')).toBeUndefined();
+    expect(q(replaced, accountsById)).toEqual([
+      { id: 'cash', name: 'Operating cash', kind: 'asset' },
+      { id: 'suspense', name: 'Suspense', kind: 'liability' }
+    ]);
   });
 
   it('evaluates transaction callbacks against staged db state', () => {

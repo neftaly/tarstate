@@ -9,13 +9,14 @@ import {
   from,
   join,
   keyBy,
+  leftJoin,
   pipe,
   project,
   sort,
   value,
   where
 } from '@tarstate/core/query';
-import { updateByKey } from '@tarstate/core/write';
+import { deleteByKey, insert, updateByKey } from '@tarstate/core/write';
 import { account, entry, makeDb, schema } from './behavior-fixtures.js';
 
 const joinedEntryAccounts = pipe(
@@ -39,7 +40,123 @@ const joinedEntryAccountsSortedByAccount = pipe(
   )
 );
 
+const leftJoinedEntryAccounts = pipe(
+  from(entry),
+  leftJoin(from(account), clauses({ accountId: 'id' })),
+  project({
+    entryId: entry.id,
+    accountId: account.id,
+    entryAccountId: entry.accountId,
+    amount: entry.amount,
+    accountName: account.$.name
+  }),
+  sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
+);
+
 describe('materialization join behavior', () => {
+  it('incrementally maintains left joins across unmatched and matched transitions', () => {
+    const db = mat(createDb({
+      accounts: [
+        { id: 'cash', name: 'Cash', kind: 'asset' }
+      ],
+      entries: [
+        { id: 'e1', accountId: 'cash', amount: 120, posted: true },
+        { id: 'e2', accountId: 'pending', amount: 30, posted: true }
+      ]
+    }), leftJoinedEntryAccounts);
+
+    expect(explainMaterialization(leftJoinedEntryAccounts)).toEqual(expect.objectContaining({
+      supported: true,
+      update: 'incremental',
+      recomputed: false,
+      diagnostics: []
+    }));
+
+    const matched = tryTransact(db, insert(schema.accounts, { id: 'pending', name: 'Pending', kind: 'asset' }));
+    expect(matched.committed).toBe(true);
+    expect(matched.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rowChanges: [
+        {
+          kind: 'removed',
+          key: '["e2",~undefined]',
+          row: { entryId: 'e2', accountId: undefined, entryAccountId: 'pending', amount: 30, accountName: undefined }
+        },
+        {
+          kind: 'added',
+          key: '["e2","pending"]',
+          row: { entryId: 'e2', accountId: 'pending', entryAccountId: 'pending', amount: 30, accountName: 'Pending' }
+        }
+      ],
+      diagnostics: []
+    }));
+    expect(q(matched.db, leftJoinedEntryAccounts)).toEqual(q(demat(matched.db, leftJoinedEntryAccounts), leftJoinedEntryAccounts));
+
+    const renamed = tryTransact(matched.db, updateByKey(schema.accounts, 'pending', { name: 'Pending settlement' }));
+    expect(renamed.committed).toBe(true);
+    expect(renamed.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rowChanges: [
+        {
+          kind: 'updated',
+          key: '["e2","pending"]',
+          before: { entryId: 'e2', accountId: 'pending', entryAccountId: 'pending', amount: 30, accountName: 'Pending' },
+          after: { entryId: 'e2', accountId: 'pending', entryAccountId: 'pending', amount: 30, accountName: 'Pending settlement' }
+        }
+      ],
+      diagnostics: []
+    }));
+    expect(q(renamed.db, leftJoinedEntryAccounts)).toEqual(q(demat(renamed.db, leftJoinedEntryAccounts), leftJoinedEntryAccounts));
+
+    const unmatched = tryTransact(renamed.db, deleteByKey(schema.accounts, 'pending'));
+    expect(unmatched.committed).toBe(true);
+    expect(unmatched.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rowChanges: [
+        {
+          kind: 'removed',
+          key: '["e2","pending"]',
+          row: { entryId: 'e2', accountId: 'pending', entryAccountId: 'pending', amount: 30, accountName: 'Pending settlement' }
+        },
+        {
+          kind: 'added',
+          key: '["e2",~undefined]',
+          row: { entryId: 'e2', accountId: undefined, entryAccountId: 'pending', amount: 30, accountName: undefined }
+        }
+      ],
+      diagnostics: []
+    }));
+    expect(q(unmatched.db, leftJoinedEntryAccounts)).toEqual(q(demat(unmatched.db, leftJoinedEntryAccounts), leftJoinedEntryAccounts));
+  });
+
+  it('incrementally keeps unmatched left rows when left inputs are inserted without right matches', () => {
+    const db = mat(makeDb(), leftJoinedEntryAccounts);
+    const result = tryTransact(db, insert(schema.entries, {
+      id: 'orphan',
+      accountId: 'pending',
+      amount: 45,
+      posted: true
+    }));
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false,
+      rowChanges: [
+        {
+          kind: 'added',
+          key: '["orphan",~undefined]',
+          row: { entryId: 'orphan', entryAccountId: 'pending', amount: 45 }
+        }
+      ],
+      diagnostics: []
+    }));
+    expect(q(result.db, leftJoinedEntryAccounts)).toEqual(q(demat(result.db, leftJoinedEntryAccounts), leftJoinedEntryAccounts));
+  });
+
   it('falls back instead of collapsing non-unique right fanout identities', () => {
     const base = makeDb();
     const db = mat(createDb({

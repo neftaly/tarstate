@@ -43,6 +43,8 @@ export type {
   QueryBatchResult,
   QueryBatchRows,
   QueryBatchTarget,
+  QueryBatchTargetObject,
+  QueryBatchTargetOptions,
   QueryBatchTargetRow,
   RelationKeyValue,
   RowLookupOptions,

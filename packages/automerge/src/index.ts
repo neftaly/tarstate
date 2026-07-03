@@ -9,7 +9,8 @@ import {
   type RelationRuntime,
   type TarstateDiagnostic
 } from '@tarstate/core/adapter';
-import type { PredicateData } from '@tarstate/core/query';
+import { evaluate, type EvaluateEnv } from '@tarstate/core/evaluate';
+import type { PredicateData, Query } from '@tarstate/core/query';
 import type { RelationRef } from '@tarstate/core/schema';
 import type { WritePatch } from '@tarstate/core/write';
 
@@ -31,12 +32,15 @@ export type AutomergeMapStorageOptions = {
   readonly codec?: AutomergeMapStorageCodec;
 };
 
+export type AutomergeMapEnvInput = EvaluateEnv | (() => EvaluateEnv | undefined);
+
 export type AutomergeMapAdapterOptions<
   DocumentShape extends object = Record<string, unknown>
 > = {
   readonly doc: Automerge.Doc<DocumentShape>;
   readonly relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
   readonly changeMessage?: string | ((patches: readonly WritePatch[]) => string | undefined);
+  readonly env?: AutomergeMapEnvInput;
   readonly storage?: AutomergeMapStorageOptions;
 };
 
@@ -116,11 +120,20 @@ type PatchOutcome = {
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 type ExprEvalResult =
-  | { readonly supported: true; readonly value: unknown }
-  | { readonly supported: false; readonly op?: string };
+  | { readonly supported: true; readonly value: unknown; readonly diagnostics?: readonly TarstateDiagnostic[] }
+  | { readonly supported: false; readonly op?: string; readonly diagnostics?: readonly TarstateDiagnostic[] };
 type RowUpdateResult =
-  | { readonly supported: true; readonly row: Row }
-  | { readonly supported: false; readonly op?: string };
+  | { readonly supported: true; readonly row: Row; readonly diagnostics: readonly TarstateDiagnostic[] }
+  | { readonly supported: false; readonly op?: string; readonly diagnostics: readonly TarstateDiagnostic[] };
+type MatchingIndexesResult =
+  | { readonly supported: true; readonly indexes: readonly number[]; readonly diagnostics: readonly TarstateDiagnostic[] }
+  | { readonly supported: false; readonly op?: string; readonly diagnostics: readonly TarstateDiagnostic[] };
+type PatchEvaluationContext<DocumentShape extends object = Record<string, unknown>> = {
+  readonly doc: Automerge.Doc<DocumentShape>;
+  readonly relations: readonly AnyMapRelation[];
+  readonly plans: Map<string, RowPlan>;
+  readonly env: () => EvaluateEnv | undefined;
+};
 
 export function defineAutomergeMapRelations<DocumentShape extends object>() {
   return <const Relations extends readonly AutomergeMapRelation<RelationRef, DocumentShape>[]>(
@@ -179,6 +192,12 @@ export function automergeMapAdapter<
       const patchList = Array.from(patches);
       const beforeDoc = doc;
       const plans = new Map<string, RowPlan>();
+      const context: PatchEvaluationContext<DocumentShape> = {
+        doc: beforeDoc,
+        relations: options.relations,
+        plans,
+        env: () => automergeMapEnv(options.env)
+      };
       const diagnostics: TarstateDiagnostic[] = [];
       let accepted = 0;
       let applied = 0;
@@ -198,7 +217,7 @@ export function automergeMapAdapter<
           continue;
         }
 
-        const outcome = applyPatchToPlan(plan, patch);
+        const outcome = applyPatchToPlan(plan, patch, context);
         diagnostics.push(...outcome.diagnostics);
         if (outcome.accepted) accepted += 1;
         if (outcome.applied) applied += 1;
@@ -331,12 +350,32 @@ function createAutomergeMapSource<DocumentShape extends object>(
 
 function rowsForRelation<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
-  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[],
+  relations: readonly AnyMapRelation[],
   relationRef: RelationRef
 ): readonly Row[] {
   return relations
     .filter((mapping) => mapping.relation.name === relationRef.name)
     .flatMap((mapping) => mappedCollection(doc, mapping).rows);
+}
+
+function stagedSourceFor(context: PatchEvaluationContext): AdapterSource<Automerge.Heads> {
+  const relationNames = relationNamesFor(context.relations);
+
+  return {
+    relationNames,
+    rows: (relationRef) => stagedRowsForRelation(context, relationRef),
+    lookup: (lookup) => stagedRowsForRelation(context, lookup.relation)
+      .filter((row) => Object.is(row[lookup.field], lookup.value)),
+    rangeLookup: (lookup) => stagedRowsForRelation(context, lookup.relation)
+      .filter((row) => inRange(row[lookup.field], lookup.lower, lookup.upper)),
+    version: () => Automerge.getHeads(context.doc),
+    diagnostics: () => context.relations.flatMap((mapping) =>
+      context.plans.has(mapping.relation.name) ? [] : mappedCollection(context.doc, mapping).diagnostics)
+  };
+}
+
+function stagedRowsForRelation(context: PatchEvaluationContext, relationRef: RelationRef): readonly Row[] {
+  return context.plans.get(relationRef.name)?.rows ?? rowsForRelation(context.doc, context.relations, relationRef);
 }
 
 function mappedCollection<DocumentShape extends object>(
@@ -398,7 +437,7 @@ function getOrCreatePlan<DocumentShape extends object>(
   return plan;
 }
 
-function applyPatchToPlan(plan: RowPlan, patch: WritePatch): PatchOutcome {
+function applyPatchToPlan(plan: RowPlan, patch: WritePatch, context: PatchEvaluationContext): PatchOutcome {
   switch (patch.op) {
     case 'insert':
       return insertRow(plan, patch.row, 'reject');
@@ -407,17 +446,17 @@ function applyPatchToPlan(plan: RowPlan, patch: WritePatch): PatchOutcome {
     case 'insertOrReplace':
       return upsertRow(plan, patch.row, () => patch.row);
     case 'insertOrMerge':
-      return upsertRow(plan, patch.row, (current, incoming) => mergeRows(current, incoming, patch.merge));
+      return upsertRow(plan, patch.row, (current, incoming) => mergeRows(current, incoming, patch.merge, plan, context));
     case 'insertOrUpdate':
-      return upsertRow(plan, patch.row, (current, incoming) => rowUpdateFor(current, patch.update ?? incoming));
+      return upsertRow(plan, patch.row, (current, incoming) => rowUpdateFor(current, patch.update ?? incoming, plan, context));
     case 'updateByKey':
-      return updateRowByKey(plan, patch.key, patch.changes);
+      return updateRowByKey(plan, patch.key, patch.changes, context);
     case 'update':
-      return updateRowsByPredicate(plan, patch.predicate, patch.changes);
+      return updateRowsByPredicate(plan, patch.predicate, patch.changes, context);
     case 'deleteByKey':
       return deleteRowByKey(plan, patch.key);
     case 'delete':
-      return deleteRowsByPredicate(plan, patch.predicate);
+      return deleteRowsByPredicate(plan, patch.predicate, context);
     case 'deleteExact':
       return deleteRowsExact(plan, patch.row);
     case 'replaceAll':
@@ -467,9 +506,12 @@ function upsertRow(
 
   const next = nextRow(cloneRow(plan.rows[index] ?? row), cloneRow(row));
   let merged: Row | undefined;
+  let expressionDiagnostics: readonly TarstateDiagnostic[] = [];
   if (isRowUpdateResult(next)) {
+    expressionDiagnostics = next.diagnostics;
+    if (hasErrorDiagnostics(expressionDiagnostics)) return rejected(...expressionDiagnostics);
     if (!next.supported) {
-      return rejected(unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, next.op));
+      return rejected(...expressionDiagnostics, unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, next.op));
     }
     merged = next.row;
   } else {
@@ -477,18 +519,18 @@ function upsertRow(
   }
   if (merged === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, rowValue));
   const mergedDiagnostics = validatePlanRow(plan, merged);
-  if (mergedDiagnostics.length > 0) return rejected(...mergedDiagnostics);
+  if (mergedDiagnostics.length > 0) return rejected(...expressionDiagnostics, ...mergedDiagnostics);
 
   const mergedKey = rowKeyFor(plan.mapping.relation, merged);
-  if (mergedKey !== key) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, merged));
-  if (valuesEqual(plan.rows[index], merged)) return accepted(false);
+  if (mergedKey !== key) return rejected(...expressionDiagnostics, rowKeyDiagnostic(plan.mapping.relation.name, merged));
+  if (valuesEqual(plan.rows[index], merged)) return accepted(false, expressionDiagnostics);
 
   plan.rows = replaceAt(plan.rows, index, merged);
   plan.changed = true;
-  return accepted(true);
+  return accepted(true, expressionDiagnostics);
 }
 
-function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown): PatchOutcome {
+function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown, context: PatchEvaluationContext): PatchOutcome {
   const key = keyValueFor(plan.mapping.relation, keyValue);
   if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, keyValue));
 
@@ -498,41 +540,59 @@ function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown): Pat
   const current = plan.rows[index];
   if (current === undefined) return accepted(false);
 
-  const updateResult = rowUpdateFor(current, changes);
-  if (!updateResult.supported) return rejected(unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, updateResult.op));
+  const updateResult = rowUpdateFor(current, changes, plan, context);
+  if (hasErrorDiagnostics(updateResult.diagnostics)) return rejected(...updateResult.diagnostics);
+  if (!updateResult.supported) {
+    return rejected(...updateResult.diagnostics, unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, updateResult.op));
+  }
 
   const updated = updateResult.row;
-  if (updated === undefined) return rejected(rowInvalidDiagnostic(plan.mapping.relation.name, changes));
+  if (updated === undefined) return rejected(...updateResult.diagnostics, rowInvalidDiagnostic(plan.mapping.relation.name, changes));
   const updateDiagnostics = validatePlanRow(plan, updated);
-  if (updateDiagnostics.length > 0) return rejected(...updateDiagnostics);
-  if (rowKeyFor(plan.mapping.relation, updated) !== key) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
-  if (valuesEqual(current, updated)) return accepted(false);
+  if (updateDiagnostics.length > 0) return rejected(...updateResult.diagnostics, ...updateDiagnostics);
+  if (rowKeyFor(plan.mapping.relation, updated) !== key) {
+    return rejected(...updateResult.diagnostics, rowKeyDiagnostic(plan.mapping.relation.name, updated));
+  }
+  if (valuesEqual(current, updated)) return accepted(false, updateResult.diagnostics);
 
   plan.rows = replaceAt(plan.rows, index, updated);
   plan.changed = true;
-  return accepted(true);
+  return accepted(true, updateResult.diagnostics);
 }
 
-function updateRowsByPredicate(plan: RowPlan, predicate: PredicateData, changes: unknown): PatchOutcome {
-  const matches = matchingIndexes(plan.rows, predicate);
-  if (!matches.supported) return rejected(unsupportedPredicateDiagnostic(plan.mapping.relation.name, matches.op));
+function updateRowsByPredicate(
+  plan: RowPlan,
+  predicate: PredicateData,
+  changes: unknown,
+  context: PatchEvaluationContext
+): PatchOutcome {
+  const matches = matchingIndexes(plan.rows, predicate, plan, context);
+  if (hasErrorDiagnostics(matches.diagnostics)) return rejected(...matches.diagnostics);
+  if (!matches.supported) {
+    return rejected(...matches.diagnostics, unsupportedPredicateDiagnostic(plan.mapping.relation.name, matches.op));
+  }
   if (matches.indexes.length === 0) return accepted(false);
 
   const nextRows = [...plan.rows];
   let changed = false;
+  const diagnostics = [...matches.diagnostics];
 
   for (const index of matches.indexes) {
     const current = nextRows[index];
     if (current === undefined) continue;
 
-    const updateResult = rowUpdateFor(current, changes);
-    if (!updateResult.supported) return rejected(unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, updateResult.op));
+    const updateResult = rowUpdateFor(current, changes, plan, context);
+    diagnostics.push(...updateResult.diagnostics);
+    if (hasErrorDiagnostics(updateResult.diagnostics)) return rejected(...diagnostics);
+    if (!updateResult.supported) {
+      return rejected(...diagnostics, unsupportedUpdateExpressionDiagnostic(plan.mapping.relation.name, updateResult.op));
+    }
 
     const updated = updateResult.row;
     const updateDiagnostics = validatePlanRow(plan, updated);
-    if (updateDiagnostics.length > 0) return rejected(...updateDiagnostics);
+    if (updateDiagnostics.length > 0) return rejected(...diagnostics, ...updateDiagnostics);
     if (rowKeyFor(plan.mapping.relation, updated) !== rowKeyFor(plan.mapping.relation, current)) {
-      return rejected(rowKeyDiagnostic(plan.mapping.relation.name, updated));
+      return rejected(...diagnostics, rowKeyDiagnostic(plan.mapping.relation.name, updated));
     }
     if (!valuesEqual(current, updated)) {
       nextRows[index] = updated;
@@ -540,10 +600,10 @@ function updateRowsByPredicate(plan: RowPlan, predicate: PredicateData, changes:
     }
   }
 
-  if (!changed) return accepted(false);
+  if (!changed) return accepted(false, diagnostics);
   plan.rows = nextRows;
   plan.changed = true;
-  return accepted(true);
+  return accepted(true, diagnostics);
 }
 
 function deleteRowByKey(plan: RowPlan, keyValue: unknown): PatchOutcome {
@@ -558,15 +618,18 @@ function deleteRowByKey(plan: RowPlan, keyValue: unknown): PatchOutcome {
   return accepted(true);
 }
 
-function deleteRowsByPredicate(plan: RowPlan, predicate: PredicateData): PatchOutcome {
-  const matches = matchingIndexes(plan.rows, predicate);
-  if (!matches.supported) return rejected(unsupportedPredicateDiagnostic(plan.mapping.relation.name, matches.op));
-  if (matches.indexes.length === 0) return accepted(false);
+function deleteRowsByPredicate(plan: RowPlan, predicate: PredicateData, context: PatchEvaluationContext): PatchOutcome {
+  const matches = matchingIndexes(plan.rows, predicate, plan, context);
+  if (hasErrorDiagnostics(matches.diagnostics)) return rejected(...matches.diagnostics);
+  if (!matches.supported) {
+    return rejected(...matches.diagnostics, unsupportedPredicateDiagnostic(plan.mapping.relation.name, matches.op));
+  }
+  if (matches.indexes.length === 0) return accepted(false, matches.diagnostics);
 
   const matchSet = new Set(matches.indexes);
   plan.rows = plan.rows.filter((_, index) => !matchSet.has(index));
   plan.changed = true;
-  return accepted(true);
+  return accepted(true, matches.diagnostics);
 }
 
 function deleteRowsExact(plan: RowPlan, exact: unknown): PatchOutcome {
@@ -605,38 +668,56 @@ function replaceRows(plan: RowPlan, rowsValue: readonly unknown[]): PatchOutcome
   return accepted(true);
 }
 
-function mergeRows(current: Row, incoming: Row, merge: unknown): RowUpdateResult {
+function mergeRows(
+  current: Row,
+  incoming: Row,
+  merge: unknown,
+  plan: RowPlan,
+  context: PatchEvaluationContext
+): RowUpdateResult {
   if (Array.isArray(merge)) {
     return {
       supported: true,
       row: {
         ...current,
         ...Object.fromEntries(merge.map((field) => [String(field), incoming[String(field)]]))
-      }
+      },
+      diagnostics: []
     };
   }
   if (typeof merge === 'function') {
     const baseline = cloneRow(current);
-    return rowUpdateFor(baseline, merge(cloneRow(current), cloneRow(incoming)));
+    return rowUpdateFor(baseline, merge(cloneRow(current), cloneRow(incoming)), plan, context);
   }
-  return rowUpdateFor(current, incoming);
+  return rowUpdateFor(current, incoming, plan, context);
 }
 
-function rowUpdateFor(current: Row, changes: unknown): RowUpdateResult {
+function rowUpdateFor(
+  current: Row,
+  changes: unknown,
+  plan: RowPlan,
+  context: PatchEvaluationContext
+): RowUpdateResult {
   const update = typeof changes === 'function'
     ? changes(cloneRow(current))
     : changes;
 
-  if (!isRecord(update)) return { supported: true, row: cloneRow(current) };
+  if (!isRecord(update)) return { supported: true, row: cloneRow(current), diagnostics: [] };
 
-  const evaluated = evaluateUpdateMap(update, current);
+  const evaluated = evaluateUpdateMap(update, current, plan, context);
   if (!evaluated.supported) return evaluated;
 
-  return { supported: true, row: { ...current, ...evaluated.row } };
+  return { supported: true, row: { ...current, ...evaluated.row }, diagnostics: evaluated.diagnostics };
 }
 
-function evaluateUpdateMap(update: Record<string, unknown>, current: Row): RowUpdateResult {
+function evaluateUpdateMap(
+  update: Record<string, unknown>,
+  current: Row,
+  plan: RowPlan,
+  context: PatchEvaluationContext
+): RowUpdateResult {
   const evaluated: MutableRecord = {};
+  const diagnostics: TarstateDiagnostic[] = [];
 
   for (const [fieldName, fieldValue] of Object.entries(update)) {
     if (!isExprData(fieldValue)) {
@@ -644,12 +725,14 @@ function evaluateUpdateMap(update: Record<string, unknown>, current: Row): RowUp
       continue;
     }
 
-    const result = evaluateExpr(fieldValue, current);
-    if (!result.supported) return result;
+    const result = evaluateExpr(fieldValue, current, plan.mapping.relation, context);
+    diagnostics.push(...(result.diagnostics ?? []));
+    if (hasErrorDiagnostics(result.diagnostics ?? [])) return { supported: false, op: fieldValue.op, diagnostics };
+    if (!result.supported) return unsupportedRowUpdateResult(result.op, diagnostics);
     evaluated[fieldName] = cloneValue(result.value);
   }
 
-  return { supported: true, row: evaluated };
+  return { supported: true, row: evaluated, diagnostics };
 }
 
 function isRowUpdateResult(input: unknown): input is RowUpdateResult {
@@ -658,159 +741,265 @@ function isRowUpdateResult(input: unknown): input is RowUpdateResult {
 
 function matchingIndexes(
   rows: readonly Row[],
-  predicate: PredicateData
-): { readonly supported: true; readonly indexes: readonly number[] } | { readonly supported: false; readonly op?: string } {
+  predicate: PredicateData,
+  plan: RowPlan,
+  context: PatchEvaluationContext
+): MatchingIndexesResult {
   const indexes: number[] = [];
+  const diagnostics: TarstateDiagnostic[] = [];
 
   for (const [index, row] of rows.entries()) {
-    const result = evaluatePredicate(predicate, row);
+    const result = evaluatePredicate(predicate, row, plan, context);
+    diagnostics.push(...(result.diagnostics ?? []));
+    if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedMatchingIndexesResult(exprResultOp(result), diagnostics);
     if (!result.supported) return result.op === undefined
-      ? { supported: false }
-      : { supported: false, op: result.op };
+      ? { supported: false, diagnostics }
+      : unsupportedMatchingIndexesResult(result.op, diagnostics);
     if (result.value === true) indexes.push(index);
   }
 
-  return { supported: true, indexes };
+  return { supported: true, indexes, diagnostics };
 }
 
-function evaluatePredicate(predicate: PredicateData, row: Row): ExprEvalResult {
-  return evaluateExpr(predicate, row);
+function evaluatePredicate(
+  predicate: PredicateData,
+  row: Row,
+  plan: RowPlan,
+  context: PatchEvaluationContext
+): ExprEvalResult {
+  return evaluateExpr(predicate, row, plan.mapping.relation, context);
 }
 
-function evaluateExpr(expr: unknown, row: Row): ExprEvalResult {
+function evaluateExpr(
+  expr: unknown,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
   if (!isRecord(expr) || typeof expr.op !== 'string') return { supported: true, value: expr };
 
   switch (expr.op) {
     case 'value':
       return { supported: true, value: expr.value };
+    case 'env':
+      return typeof expr.name === 'string'
+        ? { supported: true, value: context.env()?.[expr.name] }
+        : { supported: true, value: undefined };
     case 'field':
       return typeof expr.field === 'string'
-        ? { supported: true, value: row[expr.field] }
+        ? { supported: true, value: rowValueForFieldExpr(row, relation, expr) }
         : { supported: false, op: expr.op };
     case 'self':
       return { supported: true, value: row };
     case 'maybe':
-      return evaluateExpr(expr.expr, row);
+      return evaluateExpr(expr.expr, row, relation, context);
     case 'tuple':
-      return evaluateTuple(expr.values, row);
+      return evaluateTuple(expr.values, row, relation, context);
     case 'call':
-      return evaluateCall(expr, row);
+      return evaluateCall(expr, row, relation, context);
+    case 'sel':
+    case 'sel1':
+      return evaluateSelectionExpr(expr, row, context);
     case 'eq':
     case 'neq':
     case 'lt':
     case 'lte':
     case 'gt':
     case 'gte':
-      return evaluateComparison(expr.op, expr.left, expr.right, row);
+      return evaluateComparison(expr.op, expr.left, expr.right, row, relation, context);
     case 'and':
-      return evaluateAnd(expr.predicates, row);
+      return evaluateAnd(expr.predicates, row, relation, context);
     case 'or':
-      return evaluateOr(expr.predicates, row);
+      return evaluateOr(expr.predicates, row, relation, context);
     case 'not': {
-      const result = evaluateExpr(expr.predicate, row);
-      return result.supported ? { supported: true, value: result.value !== true } : result;
+      const result = evaluateExpr(expr.predicate, row, relation, context);
+      return result.supported ? supportedExpr(result.value !== true, result.diagnostics) : result;
     }
     case 'isNull': {
-      const result = evaluateExpr(expr.expr, row);
-      return result.supported ? { supported: true, value: result.value === null } : result;
+      const result = evaluateExpr(expr.expr, row, relation, context);
+      return result.supported ? supportedExpr(result.value === null, result.diagnostics) : result;
     }
     case 'notNull': {
-      const result = evaluateExpr(expr.expr, row);
-      return result.supported ? { supported: true, value: result.value !== null && result.value !== undefined } : result;
+      const result = evaluateExpr(expr.expr, row, relation, context);
+      return result.supported ? supportedExpr(result.value !== null && result.value !== undefined, result.diagnostics) : result;
     }
     case 'isMissing': {
-      const result = evaluateExpr(expr.expr, row);
-      return result.supported ? { supported: true, value: result.value === undefined } : result;
+      const result = evaluateExpr(expr.expr, row, relation, context);
+      return result.supported ? supportedExpr(result.value === undefined, result.diagnostics) : result;
     }
     case 'notMissing': {
-      const result = evaluateExpr(expr.expr, row);
-      return result.supported ? { supported: true, value: result.value !== undefined } : result;
+      const result = evaluateExpr(expr.expr, row, relation, context);
+      return result.supported ? supportedExpr(result.value !== undefined, result.diagnostics) : result;
     }
     default:
       return { supported: false, op: expr.op };
   }
 }
 
-function evaluateTuple(input: unknown, row: Row): ExprEvalResult {
+function evaluateTuple(
+  input: unknown,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
   if (!Array.isArray(input)) return { supported: false, op: 'tuple' };
 
   const values: unknown[] = [];
+  const diagnostics: TarstateDiagnostic[] = [];
   for (const item of input) {
-    const result = evaluateExpr(item, row);
+    const result = evaluateExpr(item, row, relation, context);
+    diagnostics.push(...(result.diagnostics ?? []));
+    if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedExprResult(exprResultOp(result), diagnostics);
     if (!result.supported) return result;
     values.push(result.value);
   }
 
-  return { supported: true, value: values };
+  return { supported: true, value: values, diagnostics };
 }
 
-function evaluateCall(expr: Record<string, unknown>, row: Row): ExprEvalResult {
+function evaluateCall(
+  expr: Record<string, unknown>,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
   const fn = expr.fn;
   if (!isHostFunction(fn)) return { supported: false, op: 'call' };
   const argsInput = expr.args;
   if (!Array.isArray(argsInput)) return { supported: false, op: 'call' };
 
   const args: unknown[] = [];
+  const diagnostics: TarstateDiagnostic[] = [];
   for (const arg of argsInput) {
-    const result = evaluateExpr(arg, row);
+    const result = evaluateExpr(arg, row, relation, context);
+    diagnostics.push(...(result.diagnostics ?? []));
+    if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedExprResult(exprResultOp(result), diagnostics);
     if (!result.supported) return result;
     args.push(result.value);
   }
 
-  return { supported: true, value: fn.fn(...args) };
+  return { supported: true, value: fn.fn(...args), diagnostics };
 }
 
-function evaluateComparison(op: string, leftExpr: unknown, rightExpr: unknown, row: Row): ExprEvalResult {
-  const left = evaluateExpr(leftExpr, row);
+function evaluateSelectionExpr(expr: Record<string, unknown>, row: Row, context: PatchEvaluationContext): ExprEvalResult {
+  const query = queryForSelectionExpr(expr);
+  if (query === undefined) return { supported: true, value: expr.op === 'sel1' ? undefined : [] };
+
+  const envValue = context.env();
+  const result = evaluate(stagedSourceFor(context), query, envValue === undefined ? {} : { env: envValue });
+  if (hasErrorDiagnostics(result.diagnostics)) {
+    return unsupportedExprResult(typeof expr.op === 'string' ? expr.op : undefined, result.diagnostics);
+  }
+
+  const rows = result.rows.filter((inner) => correlationMatches(expr.correlation, row, inner));
+  return {
+    supported: true,
+    value: expr.op === 'sel1' ? rows[0] : rows,
+    diagnostics: result.diagnostics
+  };
+}
+
+function evaluateComparison(
+  op: string,
+  leftExpr: unknown,
+  rightExpr: unknown,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
+  const left = evaluateExpr(leftExpr, row, relation, context);
   if (!left.supported) return left;
 
-  const right = evaluateExpr(rightExpr, row);
+  const right = evaluateExpr(rightExpr, row, relation, context);
   if (!right.supported) return right;
+  const diagnostics = [...(left.diagnostics ?? []), ...(right.diagnostics ?? [])];
+  if (hasErrorDiagnostics(diagnostics)) return { supported: false, op, diagnostics };
 
   switch (op) {
     case 'eq':
-      return { supported: true, value: valuesEqual(left.value, right.value) };
+      return { supported: true, value: valuesEqual(left.value, right.value), diagnostics };
     case 'neq':
-      return { supported: true, value: !valuesEqual(left.value, right.value) };
+      return { supported: true, value: !valuesEqual(left.value, right.value), diagnostics };
     case 'lt':
-      return { supported: true, value: compareValues(left.value, right.value) < 0 };
+      return { supported: true, value: compareValues(left.value, right.value) < 0, diagnostics };
     case 'lte':
-      return { supported: true, value: compareValues(left.value, right.value) <= 0 };
+      return { supported: true, value: compareValues(left.value, right.value) <= 0, diagnostics };
     case 'gt':
-      return { supported: true, value: compareValues(left.value, right.value) > 0 };
+      return { supported: true, value: compareValues(left.value, right.value) > 0, diagnostics };
     case 'gte':
-      return { supported: true, value: compareValues(left.value, right.value) >= 0 };
+      return { supported: true, value: compareValues(left.value, right.value) >= 0, diagnostics };
     default:
       return { supported: false, op };
   }
 }
 
-function evaluateAnd(input: unknown, row: Row): ExprEvalResult {
+function evaluateAnd(
+  input: unknown,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
   if (!Array.isArray(input)) return { supported: false, op: 'and' };
 
+  const diagnostics: TarstateDiagnostic[] = [];
   for (const item of input) {
-    const result = evaluateExpr(item, row);
+    const result = evaluateExpr(item, row, relation, context);
+    diagnostics.push(...(result.diagnostics ?? []));
+    if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedExprResult(exprResultOp(result), diagnostics);
     if (!result.supported) return result;
-    if (result.value !== true) return { supported: true, value: false };
+    if (result.value !== true) return { supported: true, value: false, diagnostics };
   }
 
-  return { supported: true, value: true };
+  return { supported: true, value: true, diagnostics };
 }
 
-function evaluateOr(input: unknown, row: Row): ExprEvalResult {
+function evaluateOr(
+  input: unknown,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
   if (!Array.isArray(input)) return { supported: false, op: 'or' };
 
+  const diagnostics: TarstateDiagnostic[] = [];
   for (const item of input) {
-    const result = evaluateExpr(item, row);
+    const result = evaluateExpr(item, row, relation, context);
+    diagnostics.push(...(result.diagnostics ?? []));
+    if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedExprResult(exprResultOp(result), diagnostics);
     if (!result.supported) return result;
-    if (result.value === true) return { supported: true, value: true };
+    if (result.value === true) return { supported: true, value: true, diagnostics };
   }
 
-  return { supported: true, value: false };
+  return { supported: true, value: false, diagnostics };
 }
 
-function accepted(applied: boolean): PatchOutcome {
-  return { accepted: true, applied, diagnostics: [] };
+function supportedExpr(value: unknown, diagnostics: readonly TarstateDiagnostic[] | undefined): ExprEvalResult {
+  return diagnostics === undefined ? { supported: true, value } : { supported: true, value, diagnostics };
+}
+
+function unsupportedExprResult(op: string | undefined, diagnostics: readonly TarstateDiagnostic[]): ExprEvalResult {
+  return op === undefined
+    ? { supported: false, diagnostics }
+    : { supported: false, op, diagnostics };
+}
+
+function unsupportedRowUpdateResult(op: string | undefined, diagnostics: readonly TarstateDiagnostic[]): RowUpdateResult {
+  return op === undefined
+    ? { supported: false, diagnostics }
+    : { supported: false, op, diagnostics };
+}
+
+function unsupportedMatchingIndexesResult(
+  op: string | undefined,
+  diagnostics: readonly TarstateDiagnostic[]
+): MatchingIndexesResult {
+  return op === undefined
+    ? { supported: false, diagnostics }
+    : { supported: false, op, diagnostics };
+}
+
+function accepted(applied: boolean, diagnostics: readonly TarstateDiagnostic[] = []): PatchOutcome {
+  return { accepted: true, applied, diagnostics };
 }
 
 function rejected(...diagnostics: readonly TarstateDiagnostic[]): PatchOutcome {
@@ -1064,6 +1253,53 @@ function uniqueRelationRefs(relations: readonly RelationRef[]): readonly Relatio
   }
 
   return Array.from(byName.values());
+}
+
+function automergeMapEnv(input: AutomergeMapEnvInput | undefined): EvaluateEnv | undefined {
+  return typeof input === 'function' ? input() : input;
+}
+
+function rowValueForFieldExpr(row: Row, relation: RelationRef, expr: Record<string, unknown>): unknown {
+  const fieldName = typeof expr.field === 'string' ? expr.field : undefined;
+  if (fieldName === undefined) return undefined;
+
+  const alias = typeof expr.alias === 'string' ? expr.alias : 'row';
+  return rowLocalAliases(relation).includes(alias) ? row[fieldName] : undefined;
+}
+
+function rowLocalAliases(relation: RelationRef): readonly string[] {
+  return ['row', relation.name, ...relationPredicateAliases(relation.name)];
+}
+
+function relationPredicateAliases(relationName: string): readonly string[] {
+  if (relationName.endsWith('ies')) return [relationName.slice(0, -3) + 'y'];
+  if (relationName.endsWith('s') && relationName.length > 1) return [relationName.slice(0, -1)];
+  return [];
+}
+
+function queryForSelectionExpr(expr: Record<string, unknown>): Query<unknown> | undefined {
+  if (!isRecord(expr.query)) return undefined;
+
+  return {
+    data: expr.query as Query['data'],
+    relations: (isRecord(expr.relations) ? expr.relations : {}) as Query['relations']
+  };
+}
+
+function correlationMatches(correlation: unknown, outer: Row, inner: unknown): boolean {
+  if (!isRecord(correlation)) return true;
+  if (!isRecord(inner)) return false;
+
+  return Object.entries(correlation).every(([outerField, innerField]) =>
+    typeof innerField === 'string' && Object.is(outer[outerField], inner[innerField]));
+}
+
+function hasErrorDiagnostics(diagnostics: readonly TarstateDiagnostic[]): boolean {
+  return diagnostics.some((diagnostic) => diagnostic.severity === 'error');
+}
+
+function exprResultOp(result: ExprEvalResult): string | undefined {
+  return result.supported ? undefined : result.op;
 }
 
 function isReadonlyArray<Value>(input: Value | readonly Value[]): input is readonly Value[] {

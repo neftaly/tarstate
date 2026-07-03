@@ -1,21 +1,31 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import { createDb, q, qMany, qManyResult, qResult, type Db } from '@tarstate/core/db';
+import { mat } from '@tarstate/core/materialization';
 import {
   aggregate,
   any as anyAggregate,
   asc,
+  bottom,
+  bottomBy,
+  callMaybe,
   clauses,
   constRows,
   correlate,
   count,
+  countDistinct,
   desc,
   difference,
   eq,
+  env,
   expand,
   extend,
   field,
   from,
   gt,
+  gte,
+  getKey,
+  hostFn,
+  ifElse,
   intersection,
   isMissing,
   isNull,
@@ -35,7 +45,10 @@ import {
   sel,
   sel1,
   sort,
+  setConcat,
   sum,
+  top,
+  topBy,
   union,
   value,
   where,
@@ -141,6 +154,65 @@ describe('query evaluation behavior', () => {
     expect(rowsDb.reads()).toBe(1);
   });
 
+  it('applies q option sorting and row mapping across single and batch reads', () => {
+    const db = makeDb();
+    const amounts = pipe(
+      from(entry),
+      project({
+        id: entry.id,
+        amount: entry.amount
+      })
+    );
+
+    expect(q(db, amounts, { sort: 'amount' })).toEqual([
+      { id: 'e2', amount: -120 },
+      { id: 'e3', amount: -5 },
+      { id: 'e4', amount: 0 },
+      { id: 'e1', amount: 120 }
+    ]);
+    expect(q(db, amounts, { rsort: 'amount' })).toEqual([
+      { id: 'e1', amount: 120 },
+      { id: 'e4', amount: 0 },
+      { id: 'e3', amount: -5 },
+      { id: 'e2', amount: -120 }
+    ]);
+    expect(qMany(db, { first: amounts, wrapped: { q: amounts } }, {
+      rsort: 'amount',
+      mapRows: (rows) => rows.slice(0, 2).map((row) => ({ id: (row as { readonly id: string }).id }))
+    })).toEqual({
+      first: [{ id: 'e1' }, { id: 'e4' }],
+      wrapped: [{ id: 'e1' }, { id: 'e4' }]
+    });
+
+    const joinedIds = q(db, amounts, {
+      sort: 'amount',
+      mapRows: (rows) => rows.map((row) => row.id),
+      into: (rows) => rows.join('|')
+    });
+    expectTypeOf(joinedIds).toEqualTypeOf<string>();
+    expect(joinedIds).toBe('e2|e3|e4|e1');
+
+    const summarized = qResult(db, amounts, {
+      rsort: 'amount',
+      mapRows: (rows) => rows.map((row) => row.id),
+      into: (rows): { readonly count: number; readonly first: string | undefined } => ({
+        count: rows.length,
+        first: rows[0]
+      })
+    });
+    expectTypeOf(summarized.rows).toEqualTypeOf<{ readonly count: number; readonly first: string | undefined }>();
+    expect(summarized).toEqual({
+      rows: { count: 4, first: 'e1' },
+      diagnostics: []
+    });
+
+    expect(q(mat(db, amounts), amounts, {
+      sort: 'amount',
+      mapRows: (rows) => rows.map((row) => row.id),
+      into: (rows) => rows.join('|')
+    })).toBe('e2|e3|e4|e1');
+  });
+
   it('does not reuse duplicate query keys when row transform options are function-bearing', () => {
     const entryIds = () => pipe(
       from(entry),
@@ -156,6 +228,61 @@ describe('query evaluation behavior', () => {
       second: { rows: [{ call: 2, rowCount: 4 }], diagnostics: [] }
     });
     expect(mapCalls).toBe(2);
+  });
+
+  it('applies per-target qMany options and keeps unsafe target transforms out of duplicate cache', () => {
+    const db = makeDb();
+    const amounts = pipe(
+      from(entry),
+      project({
+        id: entry.id,
+        amount: entry.amount
+      })
+    );
+    let firstMapCalls = 0;
+    let secondMapCalls = 0;
+    const batch = {
+      ascendingIds: {
+        q: amounts,
+        sort: 'amount',
+        mapRows: (rows: readonly { readonly id: string; readonly amount: number }[]) => {
+          firstMapCalls += 1;
+          return rows.map((row) => row.id);
+        },
+        into: (rows: readonly string[]) => rows.join(',')
+      },
+      topDescending: {
+        q: amounts,
+        rsort: 'amount',
+        mapRows: (rows: readonly { readonly id: string; readonly amount: number }[]): readonly { readonly id: string }[] => {
+          secondMapCalls += 1;
+          return rows.slice(0, 2).map((row) => ({ id: row.id }));
+        }
+      },
+      raw: amounts
+    };
+
+    const rows = qMany(db, batch);
+    expectTypeOf(rows.ascendingIds).toEqualTypeOf<string>();
+    expectTypeOf(rows.topDescending).toEqualTypeOf<readonly { readonly id: string }[]>();
+    expect(rows).toEqual({
+      ascendingIds: 'e2,e3,e4,e1',
+      topDescending: [{ id: 'e1' }, { id: 'e4' }],
+      raw: [
+        { id: 'e1', amount: 120 },
+        { id: 'e2', amount: -120 },
+        { id: 'e3', amount: -5 },
+        { id: 'e4', amount: 0 }
+      ]
+    });
+
+    const result = qManyResult(db, batch);
+    expectTypeOf(result.ascendingIds.rows).toEqualTypeOf<string>();
+    expectTypeOf(result.topDescending.rows).toEqualTypeOf<readonly { readonly id: string }[]>();
+    expect(result.ascendingIds).toEqual({ rows: 'e2,e3,e4,e1', diagnostics: [] });
+    expect(result.topDescending).toEqual({ rows: [{ id: 'e1' }, { id: 'e4' }], diagnostics: [] });
+    expect(firstMapCalls).toBe(2);
+    expect(secondMapCalls).toBe(2);
   });
 
   it('distinguishes null from missing fields', () => {
@@ -206,6 +333,31 @@ describe('query evaluation behavior', () => {
           stableKind: 'asset'
         }
       }
+    ]);
+  });
+
+  it('evaluates Relic expression helpers for conditional values, keyed lookup, and nil-safe calls', () => {
+    const upper = hostFn<string>('text.upperMaybe', (input) => String(input).toUpperCase());
+    const rows = constRows([
+      { id: 'a', amount: 2, meta: { kind: 'asset' }, memo: 'cash' },
+      { id: 'b', amount: -1, meta: { kind: 'expense' }, memo: null },
+      { id: 'c', amount: 0, meta: {}, memo: undefined }
+    ]);
+    const result = q(createDb(), pipe(
+      rows,
+      sort(asc(field<string>('row', 'id'))),
+      project({
+        id: field<string>('row', 'id'),
+        bucket: ifElse(gte(field<number>('row', 'amount'), value(0)), value('non-negative'), value('negative')),
+        kind: getKey<string>(field('row', 'meta'), value('kind')),
+        shout: callMaybe(upper, field('row', 'memo'))
+      })
+    ));
+
+    expect(result).toEqual([
+      { id: 'a', bucket: 'non-negative', kind: 'asset', shout: 'CASH' },
+      { id: 'b', bucket: 'negative', kind: 'expense', shout: undefined },
+      { id: 'c', bucket: 'non-negative', kind: undefined, shout: undefined }
     ]);
   });
 
@@ -285,6 +437,39 @@ describe('query evaluation behavior', () => {
     ]);
   });
 
+  it('evaluates env-backed subqueries and single-row selections', () => {
+    const db = createDb(makeDb().data, {
+      env: {
+        selectedAccount: 'cash',
+        minimumAmount: 1
+      }
+    });
+    const selectedEntries = pipe(
+      from(entry),
+      where(eq(entry.accountId, env<string>('selectedAccount'))),
+      where(gte(entry.amount, env<number>('minimumAmount'))),
+      sort(asc(entry.id)),
+      project({
+        id: entry.id,
+        amount: entry.amount
+      })
+    );
+    const summary = pipe(
+      constRows([{}]),
+      project({
+        entries: sel(selectedEntries),
+        firstEntry: sel1(selectedEntries)
+      })
+    );
+
+    expect(q(db, summary)).toEqual([
+      {
+        entries: [{ id: 'e1', amount: 120 }],
+        firstEntry: { id: 'e1', amount: 120 }
+      }
+    ]);
+  });
+
   it('aggregates, sorts, and limits rows', () => {
     const db = makeDb();
     const summary = pipe(
@@ -339,6 +524,45 @@ describe('query evaluation behavior', () => {
 
     expect(q(db, summary)).toEqual([
       { postedCount: 3, hasDraft: true, hasNoLargeOutflow: true }
+    ]);
+  });
+
+  it('evaluates Relic aggregate helpers for top, bottom, distinct counts, and set concatenation', () => {
+    const scoredRows = constRows([
+      { id: 'a', score: 2, tags: ['red', 'blue'], archived: false },
+      { id: 'b', score: 9, tags: ['blue', 'green'], archived: false },
+      { id: 'c', score: 7, tags: [], archived: false },
+      { id: 'd', score: 9, tags: ['red'], archived: false }
+    ]);
+    const score = field<number>('row', 'score');
+    const id = field<string>('row', 'id');
+    const tags = field<readonly string[]>('row', 'tags');
+    const archived = field<boolean>('row', 'archived');
+    const summary = pipe(
+      scoredRows,
+      aggregate({
+        aggregates: {
+          topScores: top(score, 2),
+          bottomScores: bottom(score, 2),
+          topIds: topBy(id, score, 2),
+          bottomIds: bottomBy(id, score, 2),
+          distinctScores: countDistinct(score),
+          allTags: setConcat(tags),
+          noneArchived: notAny(eq(archived, value(true)))
+        }
+      })
+    );
+
+    expect(q(createDb(), summary)).toEqual([
+      {
+        topScores: [9, 9],
+        bottomScores: [2, 7],
+        topIds: ['b', 'd'],
+        bottomIds: ['a', 'c'],
+        distinctScores: 3,
+        allTags: ['red', 'blue', 'green'],
+        noneArchived: true
+      }
     ]);
   });
 

@@ -1,5 +1,6 @@
 export {
   attachWatches,
+  detachWatches,
   diffOptionsForTarget,
   diffQuery,
   isWatchMaterialization,

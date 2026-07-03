@@ -1,6 +1,26 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { call, eq, field, from, gte, hostFn, isMissing, isNull, notMissing, notNull, pipe, value, where } from '@tarstate/core';
+import {
+  call,
+  correlate,
+  env,
+  eq,
+  field,
+  from,
+  gte,
+  hostFn,
+  isMissing,
+  isNull,
+  notMissing,
+  notNull,
+  pipe,
+  project,
+  sel,
+  sel1,
+  tuple,
+  value,
+  where
+} from '@tarstate/core';
 import { isRelationRuntime, type RelationRuntime } from '@tarstate/core/adapter';
 import { evaluate, validateRelationRow } from '@tarstate/core/evaluate';
 import {
@@ -332,6 +352,9 @@ describe('automerge map adapter', () => {
       write(schema.tasks).update(eq(taskId, 'task-2'), {
         memo: call(join, taskId, value(':memo'))
       }),
+      write(schema.tasks).update(eq(tuple(taskId, taskTitle), tuple(value('task-2'), value('Todo'))), {
+        effort: 3
+      }),
       write(schema.tasks).insertOrUpdate({ id: 'task-1', title: 'Ignored incoming' }, {
         update: { title: call(join, taskTitle, value('!')) }
       }),
@@ -341,12 +364,68 @@ describe('automerge map adapter', () => {
     ]);
 
     expect(result.status).toBe('accepted');
-    expect(result.applied).toBe(4);
+    expect(result.applied).toBe(5);
     expect(result.diagnostics).toEqual([]);
     expect(adapter.source.rows(schema.tasks)).toEqual([
       { id: 'task-1', title: 'DRAFT!' },
-      { id: 'task-2', title: 'Todo', memo: 'task-2:memo' },
+      { id: 'task-2', title: 'Todo', memo: 'task-2:memo', effort: 3 },
       { id: 'task-3', title: 'Merge+merged' }
+    ]);
+  });
+
+  it('evaluates env and selection expressions against staged Automerge rows', async () => {
+    const adapter = automergeMapAdapter({
+      doc: workspaceDoc([
+        { id: 'task-1', title: 'Draft', projectId: 'label-1' },
+        { id: 'task-2', title: 'Todo', projectId: 'label-2' }
+      ]),
+      relations: allMappings,
+      env: { prefix: 'Ready' }
+    });
+    const join = hostFn<string>('text.join', (...parts) => parts.map(String).join(''));
+    const labelName = hostFn<string>('label.name', (input) =>
+      typeof input === 'object' && input !== null && 'name' in input
+        ? String((input as { readonly name: unknown }).name)
+        : 'missing');
+    const labelForTask = sel1(from(schema.labels), correlate<TaskRow, LabelRow>({ projectId: 'id' }));
+    const labelsForTask = sel(
+      pipe(
+        from(schema.labels),
+        project({
+          id: field<string>('labels', 'id'),
+          name: field<string>('labels', 'name')
+        })
+      ),
+      correlate<TaskRow, Pick<LabelRow, 'id' | 'name'>>({ projectId: 'id' })
+    );
+
+    const result = await adapter.target.apply([
+      write(schema.labels).insertOrReplace({ id: 'label-2', name: 'Later' }),
+      write(schema.tasks).update(notMissing(labelForTask), {
+        title: call(join, env<string>('prefix'), value(': '), field<string>('tasks', 'title')),
+        memo: call(labelName, labelForTask),
+        meta: labelsForTask
+      })
+    ]);
+
+    expect(result.status).toBe('accepted');
+    expect(result.applied).toBe(2);
+    expect(result.diagnostics).toEqual([]);
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      {
+        id: 'task-1',
+        title: 'Ready: Draft',
+        projectId: 'label-1',
+        memo: 'Urgent',
+        meta: [{ id: 'label-1', name: 'Urgent' }]
+      },
+      {
+        id: 'task-2',
+        title: 'Ready: Todo',
+        projectId: 'label-2',
+        memo: 'Later',
+        meta: [{ id: 'label-2', name: 'Later' }]
+      }
     ]);
   });
 
@@ -560,7 +639,7 @@ describe('automerge map adapter', () => {
 
     const result = await adapter.target.apply([
       write(schema.tasks).updateByKey('task-1', {
-        title: { op: 'env', name: 'title' } as never
+        title: { op: 'customExpr', name: 'title' } as never
       })
     ]);
 

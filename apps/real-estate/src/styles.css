@@ -296,6 +296,20 @@ h2 {
   line-height: 1.45;
 }
 
+.query-key-code {
+  overflow: auto;
+  max-height: 220px;
+  width: 100%;
+  margin: 0;
+  border: 1px solid #dbe3ee;
+  border-radius: 6px;
+  padding: 0.65rem;
+  color: #183a43;
+  background: #f2f6fa;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
 .listing-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));

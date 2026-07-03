@@ -13,6 +13,7 @@ import {
   from,
   hash,
   join,
+  leftJoin,
   limit,
   pipe,
   project,
@@ -84,6 +85,19 @@ const joinedEntryAccounts = pipe(
   sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
 );
 
+const leftJoinedEntryAccounts = pipe(
+  from(entry),
+  leftJoin(from(account), clauses<Entry, Account>({ accountId: 'id' })),
+  project({
+    entryId: entry.id,
+    accountId: account.id,
+    entryAccountId: entry.accountId,
+    accountName: account.$.name,
+    amount: entry.amount
+  }),
+  sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
+);
+
 const groupedEntryTotals = pipe(
   from(entry),
   aggregate({
@@ -131,6 +145,7 @@ const scenarios: readonly BenchmarkScenario[] = [
   { label: 'filter/project/sort', queries: [sortedFilterProject as Query<unknown>] },
   { label: 'sort', queries: [sortedRows as Query<unknown>] },
   { label: 'equi-join identity projection', queries: [joinedEntryAccounts as Query<unknown>] },
+  { label: 'left equi-join identity projection', queries: [leftJoinedEntryAccounts as Query<unknown>] },
   { label: 'grouped aggregate count/sum', queries: [groupedEntryTotals as Query<unknown>] },
   { label: 'top-N sort + limit', queries: [topEntriesBySortAndLimit as Query<unknown>] },
   { label: 'top-N sortLimit', queries: [topEntriesBySortLimit as Query<unknown>] },

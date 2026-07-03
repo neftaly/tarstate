@@ -46,6 +46,9 @@
       "@tarstate/core/query": [
         "./packages/core/src/query.ts"
       ],
+      "@tarstate/core/relic": [
+        "./packages/core/src/relic.ts"
+      ],
       "@tarstate/core/runtime": [
         "./packages/core/src/runtime.ts"
       ],

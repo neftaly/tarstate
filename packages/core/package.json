@@ -52,6 +52,10 @@
       "types": "./dist/query.d.ts",
       "import": "./dist/query.js"
     },
+    "./relic": {
+      "types": "./dist/relic.d.ts",
+      "import": "./dist/relic.js"
+    },
     "./runtime": {
       "types": "./dist/runtime.d.ts",
       "import": "./dist/runtime.js"

@@ -45,7 +45,6 @@ import {
   openHouseJoinQuery,
   openHouseScheduleQuery,
   pipelineByListingQuery,
-  queryLabels,
   topPricedListingsQuery,
   type ListingFilters,
   type ListingIndexRow,
@@ -83,6 +82,8 @@ const allListingsFilters: ListingFilters = {
 };
 
 const fixtureDate = '2026-07-03';
+const jsonIndent = 2;
+const queryKeyPrefix = 'query:';
 
 const statusOptions: readonly SelectOption<ListingStatus | 'all'>[] = [
   { value: 'all', label: 'All statuses' },
@@ -309,7 +310,7 @@ function ListingsSection({
       <SectionHeader
         step="02"
         title="Query As Data"
-        detail="Build a filter/sort/project query from controls and inspect the query object as data"
+        detail="Build a filter, sort, and select query from controls and inspect the query object as data"
       />
       <div className="tool-grid">
         <div className="tool-panel">
@@ -393,7 +394,7 @@ function ListingsSection({
           <dl className="fact-list">
             <div>
               <dt>Query key</dt>
-              <dd className="mono breakable">{view.queryKey}</dd>
+              <dd><QueryKeyBlock value={view.queryKey} /></dd>
             </div>
             <div>
               <dt>Rows</dt>
@@ -502,7 +503,7 @@ function HooksSection({ selectedListingId }: { readonly selectedListingId: strin
             </div>
             <div>
               <dt>Lookup key</dt>
-              <dd className="mono breakable">{lookupView.queryKey}</dd>
+              <dd><QueryKeyBlock value={lookupView.queryKey} /></dd>
             </div>
             <div>
               <dt>Open houses</dt>
@@ -556,7 +557,7 @@ function JoinsSection() {
             </div>
             <div>
               <dt>Query key</dt>
-              <dd className="mono breakable">{schedule.queryKey}</dd>
+              <dd><QueryKeyBlock value={schedule.queryKey} /></dd>
             </div>
             <div>
               <dt>Diagnostics</dt>
@@ -612,13 +613,13 @@ function MarketSection() {
       <SectionHeader
         step="05"
         title="Aggregations"
-        detail="Neighborhood market stats and listing pipeline rows"
+        detail="Neighborhood market stats with agg rollups and listing pipeline rows"
       />
       <div className="metric-strip">
         <Metric label="active listings" value={String(rollup.data.active)} />
         <Metric label="total listings" value={String(rollup.data.listings)} />
         <Metric label="avg DOM" value={formatDecimal(rollup.data.averageDays)} />
-        <Metric label="market query" value={shortKey(queryLabels.market)} />
+        <Metric label="pipeline rows" value={String(pipeline.rows.length)} />
       </div>
       <div className="table-wrap">
         <table>
@@ -712,7 +713,7 @@ function TopNSection() {
             </div>
             <div>
               <dt>Query key</dt>
-              <dd className="mono breakable">{topRows.queryKey}</dd>
+              <dd><QueryKeyBlock value={topRows.queryKey} /></dd>
             </div>
           </dl>
           <JsonBlock value={query.data} />
@@ -1348,7 +1349,7 @@ function LiveChangesSection({
             </div>
             <div>
               <dt>Watched query</dt>
-              <dd className="mono breakable">{inquiryQueue.queryKey}</dd>
+              <dd><QueryKeyBlock value={inquiryQueue.queryKey} /></dd>
             </div>
           </dl>
           <div className="button-row">
@@ -1407,8 +1408,117 @@ function relationOptionFor(name: string): (typeof relationOptions)[number] {
   return relationOptions.find((item) => item.name === name) ?? relationOptions[0];
 }
 
+function QueryKeyBlock({ value }: { readonly value: string }) {
+  return <pre className="query-key-code">{formatQueryKey(value)}</pre>;
+}
+
 function JsonBlock({ value }: { readonly value: unknown }) {
-  return <pre className="query-code">{JSON.stringify(value, null, 2)}</pre>;
+  return <pre className="query-code">{formatDisplayJson(value)}</pre>;
+}
+
+function formatDisplayJson(value: unknown): string {
+  return JSON.stringify(normalizeDisplayJson(value), null, jsonIndent) ?? 'undefined';
+}
+
+function formatQueryKey(value: string): string {
+  const parsed = parseQueryKeyData(value);
+  if (parsed !== undefined) return `${queryKeyPrefix}\n${formatDisplayJson(parsed)}`;
+  if (value.startsWith(queryKeyPrefix)) return `${queryKeyPrefix}\n${formatJsonLike(value.slice(queryKeyPrefix.length))}`;
+
+  const parsedJson = parseStringifiedJson(value);
+  return parsedJson === undefined ? value : formatDisplayJson(parsedJson);
+}
+
+function normalizeDisplayJson(value: unknown): unknown {
+  if (typeof value === 'string') {
+    const queryKeyData = parseQueryKeyData(value);
+    if (queryKeyData !== undefined) return normalizeDisplayJson(queryKeyData);
+
+    const parsedJson = parseStringifiedJson(value);
+    return parsedJson === undefined ? value : normalizeDisplayJson(parsedJson);
+  }
+
+  if (Array.isArray(value)) return value.map((item) => normalizeDisplayJson(item));
+
+  if (isPlainDisplayRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, normalizeDisplayJson(item)])
+    );
+  }
+
+  return value;
+}
+
+function parseQueryKeyData(value: string): unknown | undefined {
+  if (!value.startsWith(queryKeyPrefix)) return undefined;
+  return parseStringifiedJson(value.slice(queryKeyPrefix.length));
+}
+
+function parseStringifiedJson(value: string): unknown | undefined {
+  const trimmed = value.trim();
+  if (!isJsonContainerString(trimmed)) return undefined;
+
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+}
+
+function isJsonContainerString(value: string): boolean {
+  return (value.startsWith('{') && value.endsWith('}')) || (value.startsWith('[') && value.endsWith(']'));
+}
+
+function isPlainDisplayRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function formatJsonLike(value: string): string {
+  let output = '';
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (const char of value) {
+    if (inString) {
+      output += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+      output += char;
+      continue;
+    }
+
+    if (char === '{' || char === '[') {
+      depth += 1;
+      output += `${char}\n${' '.repeat(depth * jsonIndent)}`;
+      continue;
+    }
+
+    if (char === '}' || char === ']') {
+      depth = Math.max(0, depth - 1);
+      output += `\n${' '.repeat(depth * jsonIndent)}${char}`;
+      continue;
+    }
+
+    if (char === ',') {
+      output += `,\n${' '.repeat(depth * jsonIndent)}`;
+      continue;
+    }
+
+    output += char === ':' ? ': ' : char;
+  }
+
+  return output;
 }
 
 function toCommitReport(label: string, result: StoreCommitResult): CommitReport {
@@ -1507,8 +1617,4 @@ function formatDate(value: string): string {
   const [year, month, day] = value.split('-');
   if (year === undefined || month === undefined || day === undefined) return value;
   return `${month}/${day}/${year}`;
-}
-
-function shortKey(value: string): string {
-  return value.length > 24 ? `${value.slice(0, 21)}...` : value;
 }

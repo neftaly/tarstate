@@ -422,8 +422,27 @@ export function call<Value = unknown>(fn: HostFunction<Value>, ...args: readonly
   return { op: 'call', fn, args };
 }
 
+export function callMaybe<Value = unknown>(fn: HostFunction<Value>, ...args: readonly ExprInput[]): ExprData<Value | undefined> {
+  return { op: 'callMaybe', fn, args };
+}
+
 export function maybe<Value>(expr: ExprData<Value>): ExprData<Value | undefined> {
   return { op: 'maybe', expr };
+}
+
+export function ifElse<Value>(
+  predicate: PredicateData,
+  thenValue: ExprInput<Value>,
+  elseValue: ExprInput<Value>
+): ExprData<Value> {
+  return { op: 'ifElse', predicate, then: expr(thenValue), else: expr(elseValue) };
+}
+
+export function getKey<Value = unknown>(
+  input: ExprInput,
+  key: ExprInput<string | number>
+): ExprData<Value | undefined> {
+  return { op: 'getKey', input: expr(input), key: expr(key) };
 }
 
 export function tuple<const Values extends readonly ExprInput[]>(
@@ -1184,7 +1203,10 @@ export type DbTransactionPlan = {
  */
 export type DbTransactionBuilder = object;
 export type DbTransactionContext = Db & DbTransactionBuilder;
-export type QueryBatchTarget = Query<unknown> | RelationRef | { readonly q: Query<unknown> | RelationRef };
+export type QueryBatchTargetOptions<Row = any, MappedRow = Row, IntoResult = readonly MappedRow[]> = DbQueryOptions<Row, MappedRow, IntoResult>;
+export type QueryBatchTargetObject<Row = any, MappedRow = Row, IntoResult = readonly MappedRow[]> =
+  QueryBatchTargetOptions<Row, MappedRow, IntoResult> & { readonly q: Query<Row> | RelationRef };
+export type QueryBatchTarget = Query<unknown> | RelationRef | QueryBatchTargetObject<any, any, any>;
 export type QueryBatch = Record<string, QueryBatchTarget>;
 export type QueryBatchTargetRow<Target> = Target extends { readonly q: infer QueryValue }
   ? QueryBatchTargetRow<QueryValue>
@@ -1193,19 +1215,35 @@ export type QueryBatchTargetRow<Target> = Target extends { readonly q: infer Que
     : Target extends RelationRef<infer Row>
       ? Row
       : unknown;
-export type QueryBatchResult<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: QueryResult<QueryBatchTargetRow<Queries[Key]>> };
+export type QueryBatchTargetMappedRows<Target> =
+  Target extends { readonly mapRows: (...args: readonly never[]) => infer Rows }
+    ? Rows
+    : readonly QueryBatchTargetRow<Target>[];
+export type QueryBatchTargetMappedRow<Target> =
+  QueryBatchTargetMappedRows<Target> extends readonly (infer Row)[] ? Row : QueryBatchTargetRow<Target>;
+export type QueryBatchTargetRows<Target> =
+  Target extends { readonly into: (...args: readonly never[]) => infer IntoResult }
+    ? IntoResult
+    : QueryBatchTargetMappedRows<Target>;
+export type QueryBatchTargetResult<Target> =
+  Target extends { readonly into: (...args: readonly never[]) => infer IntoResult }
+    ? DbQueryIntoResult<QueryBatchTargetMappedRow<Target>, IntoResult>
+    : QueryResult<QueryBatchTargetMappedRow<Target>>;
+export type QueryBatchResult<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: QueryBatchTargetResult<Queries[Key]> };
 export type MappedQueryBatchResult<Queries extends QueryBatch, MappedRow> = { readonly [Key in keyof Queries]: QueryResult<MappedRow> };
-export type QueryBatchRows<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: readonly QueryBatchTargetRow<Queries[Key]>[] };
+export type QueryBatchRows<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: QueryBatchTargetRows<Queries[Key]> };
 export type MappedQueryBatchRows<Queries extends QueryBatch, MappedRow> = { readonly [Key in keyof Queries]: readonly MappedRow[] };
 export type DbQueryIntoResult<Row, Rows> = Omit<QueryResult<Row>, 'rows'> & { readonly rows: Rows };
 export type DbQuerySort<Row = unknown> = DbQuerySortKey<Row> | readonly DbQuerySortKey<Row>[];
 export type DbQuerySortKey<Row = unknown> = string | ((row: Row) => unknown);
-export type DbQueryOptions<Row = unknown, MappedRow = Row> = EvaluateOptions & {
+export type DbQueryOptions<Row = unknown, MappedRow = Row, IntoResult = readonly MappedRow[]> = EvaluateOptions & {
   readonly sort?: DbQuerySort<Row>;
   readonly rsort?: DbQuerySort<Row>;
   readonly mapRows?: (rows: readonly Row[]) => readonly MappedRow[];
-  readonly into?: (rows: readonly MappedRow[]) => unknown;
+  readonly into?: (rows: readonly MappedRow[]) => IntoResult;
 };
+type DbQueryIntoOptions<Row, MappedRow, IntoResult> =
+  DbQueryOptions<Row, MappedRow, IntoResult> & { readonly into: (rows: readonly MappedRow[]) => IntoResult };
 export type RelationKeyValue<Relation extends RelationRef> =
   Relation extends RelationRef<infer Row, infer Key>
     ? Key extends readonly (keyof Row & string)[]
@@ -1235,12 +1273,18 @@ export const withEnv = (input: Db, envValue: DbInputEnv): Db => ({ ...input, env
 export const getEnv = (input: Db): DbEnv => input.env;
 export const updateEnv = (input: Db, update: (env: DbEnv) => DbInputEnv): Db => withEnv(input, update(input.env));
 export const setEnvTx = (envValue: DbEnvUpdate): SetEnvTransaction => ({ op: 'setEnv', env: envValue });
+export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>, IntoResult = unknown>(_db: Db, _query: Relation, _options: DbQueryIntoOptions<RelationRow<Relation>, MappedRow, IntoResult>): IntoResult;
+export function q<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row>, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): IntoResult;
+export function q<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row> | RelationRef, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): IntoResult;
 export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): readonly MappedRow[];
 export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
 export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
-export function q(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): readonly any[] {
+export function q(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): any {
   return qResult(dbValue, queryValue, options).rows;
 }
+export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>, IntoResult = unknown>(_db: Db, _query: Relation, _options: DbQueryIntoOptions<RelationRow<Relation>, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
+export function qResult<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row>, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
+export function qResult<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row> | RelationRef, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
 export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): QueryResult<MappedRow>;
 export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
 export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
@@ -1258,7 +1302,7 @@ export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, a
   return { rows: sortedRows, diagnostics: result.diagnostics };
 }
 export function qMany<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchRows<Queries> {
-  const results: Record<string, readonly unknown[]> = {};
+  const results: Record<string, unknown> = {};
   for (const [name, result] of Object.entries(qManyResult(dbValue, queries, options))) {
     results[name] = result.rows;
   }
@@ -1266,23 +1310,24 @@ export function qMany<Queries extends QueryBatch>(dbValue: Db, queries: Queries,
 }
 export function qManyResult<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchResult<Queries> {
   const results: Record<string, QueryResult<unknown>> = {};
-  const cache = canReuseQueryBatchResults(options) ? new Map<string, QueryResult<unknown>>() : undefined;
+  const cache = new Map<string, QueryResult<unknown>>();
   for (const [name, target] of Object.entries(queries)) {
     const queryValue = queryBatchTargetQuery(target);
+    const targetOptions = queryBatchTargetOptions(target, options);
     let cacheKey: string | undefined;
-    if (cache !== undefined) {
-      cacheKey = queryBatchReuseKey(queryValue);
+    if (canReuseQueryBatchResults(targetOptions)) {
+      cacheKey = queryBatchReuseKey(queryValue, targetOptions);
       if (cacheKey !== undefined) {
         const cached = cache.get(cacheKey);
         if (cached !== undefined) {
-          results[name] = replayQueryBatchResult(cached, options);
+          results[name] = replayQueryBatchResult(cached);
           continue;
         }
       }
     }
 
-    const result = qResult(dbValue, queryValue, options);
-    if (cache !== undefined && cacheKey !== undefined) cache.set(cacheKey, result);
+    const result = qResult(dbValue, queryValue, targetOptions);
+    if (cacheKey !== undefined) cache.set(cacheKey, result);
     results[name] = result;
   }
   return results as QueryBatchResult<Queries>;
@@ -1329,8 +1374,9 @@ export function whatIf(dbValue: Db, queryValue: Query<unknown> | RelationRef | Q
 }
 export function transact<DbValue extends Db>(inputDb: DbValue, inputs: DbTransactionInputs, options?: DbTransactionOptions): DbValue;
 export function transact<DbValue extends Db>(inputDb: DbValue, input: DbTransactionInput, options?: DbTransactionOptions): DbValue;
-export function transact<DbValue extends Db>(inputDb: DbValue, inputOrInputs: DbTransactionInput | DbTransactionInputs, _options: DbTransactionOptions = {}): DbValue {
-  const result = tryTransact(inputDb, ...normalizeTransactionInputs(inputOrInputs));
+export function transact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbTransactionInputs): DbValue;
+export function transact<DbValue extends Db>(inputDb: DbValue, ...args: any[]): DbValue {
+  const result = tryTransact(inputDb, ...transactionInputsFromArgs(args[0] as DbTransactionInput | DbTransactionInputs | undefined, args.slice(1)));
   if (!result.committed) throw new DbTransactionError(result);
   return result.db;
 }
@@ -1408,6 +1454,28 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
 }
 function normalizeTransactionInputs(inputOrInputs: DbTransactionInput | DbTransactionInputs): DbTransactionInputs {
   return (Array.isArray(inputOrInputs) ? inputOrInputs : [inputOrInputs]) as DbTransactionInputs;
+}
+
+function transactionInputsFromArgs(
+  inputOrInputs: DbTransactionInput | DbTransactionInputs | undefined,
+  rest: readonly (DbTransactionInput | DbTransactionOptions)[]
+): DbTransactionInputs {
+  if (inputOrInputs === undefined) return [];
+  const args = [inputOrInputs, ...rest];
+  const maybeOptions = args[args.length - 1];
+  const values = maybeOptions !== undefined && isDbTransactionOptions(maybeOptions)
+    ? args.slice(0, -1)
+    : args;
+  if (values.length === 1) return normalizeTransactionInputs(values[0] as DbTransactionInput | DbTransactionInputs);
+  return values as DbTransactionInputs;
+}
+
+function isDbTransactionOptions(input: unknown): input is DbTransactionOptions {
+  return isRecord(input)
+    && !isWritePatch(input)
+    && !isSetEnvTransaction(input)
+    && 'label' in input
+    && Object.keys(input).every((key) => key === 'label');
 }
 
 function hasEvaluateContextOverrides(options: EvaluateOptions): boolean {
@@ -2944,22 +3012,38 @@ function maintainJoinMaterializationIncrementally<Row>(
         : undefined;
     if (side === undefined) continue;
 
-    const removedResult = evaluateJoinDeltaRows(
-      query,
-      joinShape,
-      side.side,
-      delta.removed,
-      side.side === 'left' ? beforeRightRows : beforeLeftRows,
-      evaluateOptions
-    );
-    const addedResult = evaluateJoinDeltaRows(
-      query,
-      joinShape,
-      side.side,
-      delta.added,
-      side.side === 'left' ? afterRightRows : afterLeftRows,
-      evaluateOptions
-    );
+    const removedResult = joinShape.data.kind === 'left' && side.side === 'right'
+      ? evaluateLeftJoinAffectedRows(
+        query,
+        joinShape,
+        affectedLeftJoinRows(beforeLeftRows, joinShape, rightJoinChangedKeys(joinShape, delta.removed, delta.added)),
+        beforeRightRows,
+        evaluateOptions
+      )
+      : evaluateJoinDeltaRows(
+        query,
+        joinShape,
+        side.side,
+        delta.removed,
+        side.side === 'left' ? beforeRightRows : beforeLeftRows,
+        evaluateOptions
+      );
+    const addedResult = joinShape.data.kind === 'left' && side.side === 'right'
+      ? evaluateLeftJoinAffectedRows(
+        query,
+        joinShape,
+        affectedLeftJoinRows(afterLeftRows, joinShape, rightJoinChangedKeys(joinShape, delta.removed, delta.added)),
+        afterRightRows,
+        evaluateOptions
+      )
+      : evaluateJoinDeltaRows(
+        query,
+        joinShape,
+        side.side,
+        delta.added,
+        side.side === 'left' ? afterRightRows : afterLeftRows,
+        evaluateOptions
+      );
     diagnostics.push(...removedResult.diagnostics, ...addedResult.diagnostics);
     removedContributions.push(...joinContributions(removedResult.rows, side.side, deltaIndex, support.identity));
     addedContributions.push(...joinContributions(addedResult.rows, side.side, deltaIndex, support.identity));
@@ -3040,12 +3124,53 @@ function evaluateJoinDeltaRows<Row>(
   oppositeRows: readonly unknown[],
   options: EvaluateOptions
 ): MaterializationRefreshResult<Row> {
-  if (changedRows.length === 0 || oppositeRows.length === 0) return { rows: [], diagnostics: [] };
+  if (changedRows.length === 0) return { rows: [], diagnostics: [] };
+  if (oppositeRows.length === 0 && (joinShape.data.kind !== 'left' || changedSide !== 'left')) return { rows: [], diagnostics: [] };
   const source = fromObjectSource({
     [joinShape.left.relation.name]: changedSide === 'left' ? changedRows : oppositeRows,
     [joinShape.right.relation.name]: changedSide === 'right' ? changedRows : oppositeRows
   });
   return evaluate(source, query, options);
+}
+
+function evaluateLeftJoinAffectedRows<Row>(
+  query: Query<Row>,
+  joinShape: IncrementalJoinShape,
+  leftRows: readonly unknown[],
+  rightRows: readonly unknown[],
+  options: EvaluateOptions
+): MaterializationRefreshResult<Row> {
+  if (leftRows.length === 0) return { rows: [], diagnostics: [] };
+  const source = fromObjectSource({
+    [joinShape.left.relation.name]: leftRows,
+    [joinShape.right.relation.name]: rightRows
+  });
+  return evaluate(source, query, options);
+}
+
+function rightJoinChangedKeys(
+  joinShape: IncrementalJoinShape,
+  removedRows: readonly unknown[],
+  addedRows: readonly unknown[]
+): ReadonlySet<string> {
+  return new Set([...removedRows, ...addedRows].map((rowValue) => rightJoinClauseKey(joinShape, rowValue)));
+}
+
+function affectedLeftJoinRows(
+  rows: readonly unknown[],
+  joinShape: IncrementalJoinShape,
+  rightKeys: ReadonlySet<string>
+): readonly unknown[] {
+  if (rightKeys.size === 0) return [];
+  return rows.filter((rowValue) => rightKeys.has(leftJoinClauseKey(joinShape, rowValue)));
+}
+
+function leftJoinClauseKey(joinShape: IncrementalJoinShape, rowValue: unknown): string {
+  return stableKey(Object.entries(joinShape.clause).map(([leftField]) => isRecord(rowValue) ? rowValue[leftField] : undefined));
+}
+
+function rightJoinClauseKey(joinShape: IncrementalJoinShape, rowValue: unknown): string {
+  return stableKey(Object.entries(joinShape.clause).map(([, rightField]) => isRecord(rowValue) ? rowValue[rightField] : undefined));
 }
 
 function joinContributions<Row>(
@@ -3650,7 +3775,7 @@ function incrementalMaterializationShape(
     case 'difference':
       return unsupportedIncrementalShape('set operation queries are not incrementally maintained');
     case 'expand':
-      return unsupportedIncrementalShape('expand queries are not incrementally maintained');
+      return incrementalExpandMaterializationShape(data, relations);
     default:
       return unsupportedIncrementalShape(`query op "${data.op}" is not incrementally maintained`);
   }
@@ -3668,6 +3793,22 @@ function incrementalNestedShape(
 
 function unsupportedIncrementalShape(reason: string): { readonly supported: false; readonly reason: string; readonly diagnostics: readonly TarstateDiagnostic[] } {
   return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
+}
+
+function incrementalExpandMaterializationShape(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): IncrementalMaterializationShape {
+  if (!trustedRowLocalExpr(data.collection)) {
+    return unsupportedIncrementalShape('expand incremental maintenance requires a row-local collection expression');
+  }
+
+  const nested = incrementalNestedShape(data, relations);
+  if (!nested.supported) return nested;
+  if (nested.join !== undefined || nested.aggregate !== undefined) {
+    return unsupportedIncrementalShape('expand incremental maintenance requires a direct single-source input');
+  }
+  return nested;
 }
 
 function incrementalAggregateMaterializationShape(
@@ -3758,10 +3899,8 @@ function incrementalJoinMaterializationShape(
   data: QueryData,
   relations: Readonly<Record<string, AnyRelationRef>>
 ): IncrementalMaterializationShape {
-  if (data.kind !== 'inner') {
-    return unsupportedIncrementalShape(data.kind === 'left'
-      ? 'left join queries are not incrementally maintained'
-      : 'non-inner join queries are not incrementally maintained');
+  if (data.kind !== 'inner' && data.kind !== 'left') {
+    return unsupportedIncrementalShape('non-inner join queries are not incrementally maintained');
   }
 
   if (isPredicateData(data.on)) {
@@ -4539,8 +4678,10 @@ function trustedIncrementalQueryExpressions(data: QueryData): boolean {
       return trustedProjectionExpressions(data.groupBy)
         && incrementalAggregateMaintenanceStrategy(data.aggregates).supported
         && nestedTrusted();
+    case 'expand':
+      return trustedRowLocalExpr(data.collection) && nestedTrusted();
     case 'join': {
-      if (data.kind !== 'inner' || isPredicateData(data.on) || equiJoinClauseMapFrom(data.on) === undefined) return false;
+      if ((data.kind !== 'inner' && data.kind !== 'left') || isPredicateData(data.on) || equiJoinClauseMapFrom(data.on) === undefined) return false;
       const left = queryDataFrom(data.left);
       const right = queryDataFrom(data.right);
       return left !== undefined
@@ -4574,6 +4715,10 @@ function trustedRowLocalExpr(input: unknown): boolean {
       return trustedRowLocalExpr(data.expr);
     case 'tuple':
       return arrayFromUnknown(data.values).every(trustedRowLocalExpr);
+    case 'ifElse':
+      return trustedRowLocalExpr(data.predicate) && trustedRowLocalExpr(data.then) && trustedRowLocalExpr(data.else);
+    case 'getKey':
+      return trustedRowLocalExpr(data.input) && trustedRowLocalExpr(data.key);
     case 'eq':
     case 'neq':
     case 'lt':
@@ -4653,6 +4798,13 @@ function finalRowExprEvaluableFromFields(input: unknown, finalRowFields: Readonl
       return finalRowExprEvaluableFromFields(data.expr, finalRowFields);
     case 'tuple':
       return arrayFromUnknown(data.values).every((item) => finalRowExprEvaluableFromFields(item, finalRowFields));
+    case 'ifElse':
+      return finalRowExprEvaluableFromFields(data.predicate, finalRowFields)
+        && finalRowExprEvaluableFromFields(data.then, finalRowFields)
+        && finalRowExprEvaluableFromFields(data.else, finalRowFields);
+    case 'getKey':
+      return finalRowExprEvaluableFromFields(data.input, finalRowFields)
+        && finalRowExprEvaluableFromFields(data.key, finalRowFields);
     case 'eq':
     case 'neq':
     case 'lt':
@@ -4705,6 +4857,11 @@ function finalRowFieldExpressions(data: QueryData, relations: Readonly<Record<st
       for (const fieldName of uniqueStrings(projectionFieldNames(data.groupBy), projectionFieldNames(data.aggregates))) {
         fields.set(fieldName, field('row', fieldName));
       }
+      return fields;
+    }
+    case 'expand': {
+      const fields = new Map(nestedFinalRowFieldExpressions(data, relations));
+      for (const fieldName of expandIdentityFieldNames(data)) fields.set(fieldName, field('row', fieldName));
       return fields;
     }
     case 'where':
@@ -4992,6 +5149,12 @@ export type QueryDiff<Row = unknown> = {
 export function attachWatches<DbValue extends Db>(dbValue: DbValue, ...targets: readonly WatchTarget[]): DbValue {
   return withAttachedWatchTargets(dbValue, uniqueWatchTargets([...attachedWatchTargetsFor(dbValue), ...targets]));
 }
+export function detachWatches<DbValue extends Db>(dbValue: DbValue, ...targets: readonly WatchTarget[]): DbValue {
+  const attached = attachedWatchTargetsFor(dbValue);
+  if (targets.length === 0) return withAttachedWatchTargets(dbValue, []);
+  const removedKeys = new Set(targets.map(watchTargetKey));
+  return withAttachedWatchTargets(dbValue, attached.filter((target) => !removedKeys.has(watchTargetKey(target))));
+}
 export function watch<DbValue extends WatchDb, Row>(dbValue: DbValue, target: WatchTarget<Row>, listener: WatchListener<Row>, options: WatchOptions<Row> = {}): WatchHandle<DbValue, Row> {
   const handle = createWatchHandle(dbValue, target, options);
   subscribeWatch(handle, listener);
@@ -5134,6 +5297,16 @@ export type TrackTransactChangeView<Row = unknown> = {
   readonly rowChanges: readonly RowChange<Row>[];
 };
 export type TrackTransactQueryChanges<Row = unknown> = Readonly<Record<string, TrackTransactChangeView<Row>>>;
+export type RelicTrackChangeView<Row = unknown> = {
+  readonly added: readonly Row[];
+  readonly deleted: readonly Row[];
+  readonly removed: readonly Row[];
+};
+export type RelicTrackTransactResult<DbValue extends WatchDb = WatchDb> = {
+  readonly db: DbValue;
+  readonly result?: DbTransactionResult;
+  readonly changes: Readonly<Record<string, RelicTrackChangeView>>;
+};
 export type TrackRuntimeCommitOptions = TrackTransactOptions & RelationApplyOptions;
 export type TrackTransactResult<DbValue extends WatchDb = WatchDb> = {
   readonly db: DbValue;
@@ -5208,6 +5381,18 @@ export async function trackTransact<DbValue extends WatchDb>(dbValue: DbValue, .
     ...(result.materializations === undefined ? {} : { materializations: result.materializations }),
     diagnostics: [...result.diagnostics, ...tracked.diagnostics],
     ...(options.label === undefined ? {} : { label: options.label })
+  };
+}
+
+export function relicChanges<DbValue extends WatchDb>(result: TrackTransactResult<DbValue>): RelicTrackTransactResult<DbValue> {
+  return {
+    db: result.db,
+    ...(result.result === undefined ? {} : { result: result.result }),
+    changes: Object.fromEntries(result.changes.map((change) => [change.targetKey, {
+      added: change.added,
+      deleted: change.removed,
+      removed: change.removed
+    }]))
   };
 }
 export async function trackRuntimeCommit<Version>(runtime: RelationRuntime<Version>, patches: Iterable<WritePatch>, options: TrackRuntimeCommitOptions = {}): Promise<TrackRuntimeCommitResult<Version>> {
@@ -6126,6 +6311,14 @@ function evaluateExpr(
       return arrayFromUnknown(data.values).map((valueData) => evaluateExpr(valueData, entry, source, relations, options, diagnostics, outer));
     case 'call':
       return evaluateCall(data, entry, source, relations, options, diagnostics, outer);
+    case 'callMaybe':
+      return evaluateCall(data, entry, source, relations, options, diagnostics, outer, true);
+    case 'ifElse':
+      return evaluateExpr(data.predicate, entry, source, relations, options, diagnostics, outer)
+        ? evaluateExpr(data.then, entry, source, relations, options, diagnostics, outer)
+        : evaluateExpr(data.else, entry, source, relations, options, diagnostics, outer);
+    case 'getKey':
+      return evaluateGetKey(data, entry, source, relations, options, diagnostics, outer);
     case 'sel':
     case 'sel1':
       return evaluateSelectionExpr(data, entry, source, relations, options, diagnostics, outer);
@@ -6265,13 +6458,33 @@ function evaluateCall(
   relations: Readonly<Record<string, AnyRelationRef>>,
   options: EvaluateOptions,
   diagnostics: TarstateDiagnostic[],
-  outer: EvalEntry | undefined
+  outer: EvalEntry | undefined,
+  nilSafe = false
 ): unknown {
   const fn = data.fn;
   if (!isHostFunction(fn)) return undefined;
   const args = arrayFromUnknown(data.args).map((arg) => evaluateExpr(arg, entry, source, relations, options, diagnostics, outer));
+  if (nilSafe && args.some((arg) => arg === null || arg === undefined)) return undefined;
   const registryFn = options.functions?.[fn.name];
   return (registryFn ?? fn.fn)(...args);
+}
+
+function evaluateGetKey(
+  data: ExprData,
+  entry: EvalEntry,
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): unknown {
+  const target = evaluateExpr(data.input, entry, source, relations, options, diagnostics, outer);
+  const key = evaluateExpr(data.key, entry, source, relations, options, diagnostics, outer);
+  if (target === null || target === undefined || key === null || key === undefined) return undefined;
+  if (Array.isArray(target) && typeof key === 'number') return target[key];
+  if (isRecord(target) && (typeof key === 'string' || typeof key === 'number')) return target[String(key)];
+  if (target instanceof Map) return target.get(key);
+  return undefined;
 }
 
 function evaluateSelectionExpr(
@@ -6602,10 +6815,16 @@ function queryBatchTargetQuery(target: QueryBatchTarget): Query<unknown> | Relat
   return isRecord(target) && 'q' in target ? target.q as Query<unknown> | RelationRef : target as Query<unknown> | RelationRef;
 }
 
-function queryBatchReuseKey(target: Query<unknown> | RelationRef): string | undefined {
+function queryBatchTargetOptions(target: QueryBatchTarget, options: DbQueryOptions): DbQueryOptions {
+  if (!isRecord(target) || !('q' in target)) return options;
+  const { q: _queryValue, ...targetOptions } = target;
+  return { ...options, ...targetOptions } as DbQueryOptions;
+}
+
+function queryBatchReuseKey(target: Query<unknown> | RelationRef, options: DbQueryOptions): string | undefined {
   const queryObject = queryForTarget(target);
   if (queryContainsHostFunction(queryObject.data)) return undefined;
-  return `${isQuery(target) ? 'query' : 'relation'}:${queryKey(queryObject)}`;
+  return `${isQuery(target) ? 'query' : 'relation'}:${queryKey(queryObject)}:${stableKey(queryBatchCacheOptions(options))}`;
 }
 
 function canReuseQueryBatchResults(options: DbQueryOptions): boolean {
@@ -6614,6 +6833,15 @@ function canReuseQueryBatchResults(options: DbQueryOptions): boolean {
     && options.functions === undefined
     && !hasFunctionSortKey(options.sort)
     && !hasFunctionSortKey(options.rsort);
+}
+
+function queryBatchCacheOptions(options: DbQueryOptions): Record<string, unknown> {
+  return {
+    ...(options.sort === undefined ? {} : { sort: options.sort }),
+    ...(options.rsort === undefined ? {} : { rsort: options.rsort }),
+    ...(options.env === undefined ? {} : { env: options.env }),
+    ...(options.diagnosticMode === undefined ? {} : { diagnosticMode: options.diagnosticMode })
+  };
 }
 
 function hasFunctionSortKey(sortValue: DbQuerySort | undefined): boolean {
@@ -6632,27 +6860,30 @@ function queryContainsHostFunction(input: unknown, seen: WeakSet<object> = new W
   return Object.values(input).some((valueValue) => queryContainsHostFunction(valueValue, seen));
 }
 
-function replayQueryBatchResult<Row>(result: QueryResult<Row>, options: DbQueryOptions): QueryResult<Row> {
-  return finishQueryResult({
+function replayQueryBatchResult<Row>(result: QueryResult<Row>): QueryResult<Row> {
+  return {
     rows: [...result.rows],
     diagnostics: [...result.diagnostics]
-  }, options);
+  };
 }
 
 function isQueryBatch(input: unknown): input is QueryBatch {
   return isRecord(input) && !isQuery(input) && !isRelationRef(input);
 }
 
-function applyDbQueryOptions<Row, MappedRow>(rows: readonly Row[], options: DbQueryOptions<Row, MappedRow>): readonly MappedRow[] {
+function applyDbQueryOptions<Row, MappedRow, IntoResult>(
+  rows: readonly Row[],
+  options: DbQueryOptions<Row, MappedRow, IntoResult>
+): readonly MappedRow[] | IntoResult {
   let result = [...rows];
   if (options.sort !== undefined) result = sortPlainRows(result, options.sort, 'asc');
   if (options.rsort !== undefined) result = sortPlainRows(result, options.rsort, 'desc');
   const mapped = options.mapRows === undefined ? result as unknown as readonly MappedRow[] : options.mapRows(result);
-  return mapped;
+  return options.into === undefined ? mapped : options.into(mapped);
 }
 
 function hasDbQueryRowTransforms(options: DbQueryOptions<unknown, unknown>): boolean {
-  return options.sort !== undefined || options.rsort !== undefined || options.mapRows !== undefined;
+  return options.sort !== undefined || options.rsort !== undefined || options.mapRows !== undefined || options.into !== undefined;
 }
 
 function sortPlainRows<Row>(rows: readonly Row[], sortValue: DbQuerySort<Row>, direction: SortDirection): Row[] {
@@ -7042,6 +7273,9 @@ function isEvaluableExpr(input: unknown): input is ExprData {
     'maybe',
     'tuple',
     'call',
+    'callMaybe',
+    'ifElse',
+    'getKey',
     'sel',
     'sel1',
     'eq',
@@ -7782,6 +8016,8 @@ function rowIdentityForQueryData<Row = unknown>(
       const alias = typeof data.alias === 'string' ? data.alias : 'row';
       return rowIdentityFromPaths(input.paths.map((path) => [alias, ...path]), { unique: input.unique });
     }
+    case 'expand':
+      return expandedRowIdentity<Row>(data, relations);
     case 'project':
       return projectedRowIdentity<Row>(data, relations);
     case 'aggregate':
@@ -7797,6 +8033,29 @@ function rowIdentityForNestedQuery<Row>(
 ): MaterializationRowIdentity<Row> | undefined {
   const input = queryDataFrom(data.input);
   return input === undefined ? undefined : rowIdentityForQueryData(input, relations);
+}
+
+function expandedRowIdentity<Row>(
+  data: QueryData,
+  relations: Readonly<Record<string, AnyRelationRef>>
+): MaterializationRowIdentity<Row> | undefined {
+  const input = rowIdentityForNestedQuery<Row>(data, relations);
+  if (input === undefined) return undefined;
+  const expansionFields = expandIdentityFieldNames(data);
+  if (expansionFields.length === 0) return undefined;
+  const overwritten = new Set(expansionFields);
+  if (input.paths.some((path) => overwritten.has(path[0] ?? ''))) return undefined;
+  return rowIdentityFromPaths<Row>([
+    ...input.paths,
+    ...expansionFields.map((fieldName) => [fieldName])
+  ], { unique: false });
+}
+
+function expandIdentityFieldNames(data: QueryData): readonly string[] {
+  return uniqueStrings(
+    typeof data.as === 'string' ? [data.as] : [],
+    stringArray(data.fields)
+  );
 }
 
 function joinMaterializedRowIdentity<Row>(

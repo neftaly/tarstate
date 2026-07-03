@@ -18,6 +18,7 @@ const coreSubpathEntryNames = [
   'materialization',
   'memory-runtime',
   'query',
+  'relic',
   'runtime',
   'schema',
   'source',

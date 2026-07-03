@@ -2,13 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { q, transact, tryTransact, type DbTransactionContext } from '@tarstate/core/db';
 import { type TarstateDiagnostic } from '@tarstate/core/diagnostics';
 import { explainMaterialization, mat, materializedRelationFor } from '@tarstate/core/materialization';
-import { trackTransact } from '@tarstate/core/runtime';
+import { relicChanges, trackTransact } from '@tarstate/core/runtime';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { createRuntimeStore, createStore } from '@tarstate/core/store';
 import { asc, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
 import { type RelationRuntime } from '@tarstate/core/adapter';
 import {
   attachWatches,
+  detachWatches,
   diffQuery,
   isWatchMaterialization,
   subscribeWatch,
@@ -161,6 +162,86 @@ describe('watch and store behavior', () => {
       { id: 'e4', accountId: 'cash', amount: 0 },
       { id: 'e5', accountId: 'cash', amount: 35 }
     ]);
+  });
+
+  it('detaches pure db watches and projects trackTransact changes with Relic deleted spelling', async () => {
+    const watched = attachWatches(makeDb(), entryList, cashEntryProjection);
+    const cashOnly = detachWatches(watched, entryList);
+    const targetKey = watchTargetKey(cashEntryProjection);
+    const tracked = await trackTransact(
+      cashOnly,
+      deleteByKey(schema.entries, 'e1'),
+      insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true })
+    );
+    const relic = relicChanges(tracked);
+
+    expect(tracked.changes.map((change) => change.targetKey)).toEqual([targetKey]);
+    expect(relic.db).toBe(tracked.db);
+    expect(relic.result).toEqual(tracked.result);
+    expect(relic.changes[targetKey]).toEqual({
+      added: [{ id: 'e5', amount: 35 }],
+      deleted: [{ id: 'e1', amount: 120 }],
+      removed: [{ id: 'e1', amount: 120 }]
+    });
+
+    const detachedAll = detachWatches(cashOnly);
+    const untracked = await trackTransact(detachedAll, updateByKey(schema.entries, 'e4', { amount: 1 }));
+    expect(untracked.changes).toEqual([]);
+  });
+
+  it('tracks rejected transactions without changing watched rows and closes watches idempotently', async () => {
+    const watched = attachWatches(makeDb(), entryList);
+    const beforeRows = q(watched, entryList);
+    const duplicate = insert(schema.entries, {
+      id: 'e1',
+      accountId: 'cash',
+      amount: 999,
+      memo: 'duplicate',
+      posted: true
+    });
+    const tracked = await trackTransact(watched, duplicate);
+
+    expect(tracked.supported).toBe(true);
+    expect(tracked.db).toBe(watched);
+    expect(tracked.result).toEqual(expect.objectContaining({
+      committed: false,
+      applied: 0,
+      diagnostics: expect.arrayContaining([expect.objectContaining({ code: 'unique', relation: 'entries' })])
+    }));
+    expect(tracked.changes).toEqual([
+      expect.objectContaining({
+        changed: false,
+        added: [],
+        removed: [],
+        unchanged: beforeRows
+      })
+    ]);
+    expect(q(tracked.db, entryList)).toEqual(beforeRows);
+
+    const events: unknown[] = [];
+    const handle = watch(makeDb(), entryList, (event) => {
+      events.push(event);
+    }, { label: 'close-parity' });
+
+    expect(handle.unwatch()).toEqual({ id: 'close-parity', closed: true, diagnostics: [] });
+    expect(unwatch(handle)).toEqual({ id: 'close-parity', closed: false, diagnostics: [] });
+    expect(subscribeWatch(handle, () => undefined)).toEqual(expect.objectContaining({
+      id: 'close-parity',
+      active: false
+    }));
+    expect(await handle.refresh(transact(makeDb(), insert(schema.entries, {
+      id: 'e5',
+      accountId: 'cash',
+      amount: 35,
+      memo: 'top-up',
+      posted: true
+    })))).toEqual(expect.objectContaining({
+      delivered: false,
+      changed: false,
+      added: [],
+      removed: []
+    }));
+    expect(events).toEqual([]);
   });
 
   it('runtime watches subscribe to runtime changes and duplicate labels stay isolated', async () => {

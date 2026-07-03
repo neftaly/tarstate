@@ -1,5 +1,7 @@
-export { trackRuntimeCommit, trackTransact, UnsupportedChangeTrackingError } from './impl.js';
+export { relicChanges, trackRuntimeCommit, trackTransact, UnsupportedChangeTrackingError } from './impl.js';
 export type {
+  RelicTrackChangeView,
+  RelicTrackTransactResult,
   TrackRuntimeCommitDiagnostic,
   TrackRuntimeCommitOptions,
   TrackRuntimeCommitResult,

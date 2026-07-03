@@ -13,6 +13,7 @@
     "build": "pnpm -r --if-present build",
     "dev": "pnpm -r --filter './apps/*' --parallel --if-present dev",
     "lint": "oxlint . --deny-warnings --type-aware",
+    "relic:oracle": "TARSTATE_RELIC_ORACLE=1 pnpm --filter @tarstate/core exec vitest run --config ../../vite.config.ts tests/relic-oracle.test.ts",
     "test": "pnpm --filter './packages/*' --if-present test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
