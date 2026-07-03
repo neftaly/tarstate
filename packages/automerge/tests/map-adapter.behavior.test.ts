@@ -2,20 +2,25 @@ import * as Automerge from '@automerge/automerge';
 import { Repo, type DocHandle } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
+  as,
+  constRows,
   call,
   correlate,
   env,
   eq,
   field,
   from,
+  getKey,
   gte,
   hostFn,
   isMissing,
   isNull,
+  join,
   notMissing,
   notNull,
   pipe,
   project,
+  qualify,
   sel,
   sel1,
   tuple,
@@ -54,6 +59,11 @@ import {
   automergeMerge,
   automergeObjectId,
   automergeObjectIdAt,
+  automergeObjectLocations,
+  automergeObjectReference,
+  automergeObjectReferenceAt,
+  automergeObjectReferenceField,
+  automergePathForObjectId,
   automergeTextField,
   automergeView,
   createAutomergeDocHandleRuntime,
@@ -182,6 +192,11 @@ describe('automerge map adapter', () => {
     expect(api.automergeMerge).toBe(automergeMerge);
     expect(api.automergeObjectId).toBe(automergeObjectId);
     expect(api.automergeObjectIdAt).toBe(automergeObjectIdAt);
+    expect(api.automergeObjectLocations).toBe(automergeObjectLocations);
+    expect(api.automergeObjectReference).toBe(automergeObjectReference);
+    expect(api.automergeObjectReferenceAt).toBe(automergeObjectReferenceAt);
+    expect(api.automergeObjectReferenceField).toBe(automergeObjectReferenceField);
+    expect(api.automergePathForObjectId).toBe(automergePathForObjectId);
     expect(api.automergeConflictsAt).toBe(automergeConflictsAt);
     expect(api.automergeConflictDiagnostics).toBe(automergeConflictDiagnostics);
     expect(api.createAutomergeDocHandleRuntime).toBe(createAutomergeDocHandleRuntime);
@@ -1016,14 +1031,74 @@ describe('automerge map adapter', () => {
   });
 
   it('preserves mapped row object IDs for ordinary array and map updates', async () => {
-    const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: allMappings });
+    const adapter = automergeMapAdapter({ doc: workspaceDoc(), relations: allMappings, runtimeId: 'workspace' });
     const taskObjectId = adapter.objectIdFor(schema.tasks, 'task-1');
     const labelObjectId = adapter.objectIdFor(schema.labels, 'label-1');
 
     const taskCollectionObjectId = automergeObjectIdAt(adapter.getDoc(), ['workspace', 'tasks']);
     expect(taskObjectId).toBeTruthy();
     expect(labelObjectId).toBeTruthy();
+    if (taskObjectId === null || labelObjectId === null) throw new Error('expected mapped row object IDs');
     expect(taskCollectionObjectId).toBe(automergeObjectId(adapter.getDoc().workspace.tasks));
+    expect(automergeObjectIdAt(adapter.getDoc(), ['workspace', 'tasks', 0])).toBe(taskObjectId);
+    expect(automergeObjectReferenceAt(adapter.getDoc(), ['workspace', 'tasks', 0])).toMatchObject({
+      objectId: taskObjectId,
+      path: ['workspace', 'tasks', 0]
+    });
+    expect(adapter.objectReferenceFor(schema.tasks, 'task-1')).toMatchObject({
+      objectId: taskObjectId,
+      path: ['workspace', 'tasks', 0],
+      relation: 'tasks',
+      key: 'task-1'
+    });
+    expect(adapter.pathForObjectId(taskObjectId)).toEqual(['workspace', 'tasks', 0]);
+    expect(automergePathForObjectId(adapter.getDoc(), taskObjectId)).toEqual(['workspace', 'tasks', 0]);
+    expect(adapter.source.rows(runtimeSystemRelations.objectLocations)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        runtime: 'workspace',
+        objectId: taskObjectId,
+        pathSegments: ['workspace', 'tasks', 0],
+        relation: 'tasks',
+        key: 'task-1'
+      }),
+      expect.objectContaining({
+        runtime: 'workspace',
+        objectId: labelObjectId,
+        pathSegments: ['workspace', 'labelsById', 'label-1'],
+        relation: 'labels',
+        key: 'label-1'
+      })
+    ]));
+    const objectLocation = as(runtimeSystemRelations.objectLocations, 'objectLocation');
+    const presenceFocus = as(
+      pipe(
+        constRows([{ peer: 'peer-remote', payload: { objectId: taskObjectId } }]),
+        qualify('presenceFocus')
+      ),
+      'presenceFocus'
+    );
+    const resolvedFocus = pipe(
+      presenceFocus,
+      join(
+        from(objectLocation),
+        eq(getKey<string>(presenceFocus.payload, value('objectId')), objectLocation.objectId)
+      ),
+      project({
+        peer: presenceFocus.peer,
+        path: objectLocation.pathSegments,
+        relation: objectLocation.relation,
+        key: objectLocation.key
+      })
+    );
+
+    expect(evaluate(adapter.source, resolvedFocus).rows).toEqual([
+      {
+        peer: 'peer-remote',
+        path: ['workspace', 'tasks', 0],
+        relation: 'tasks',
+        key: 'task-1'
+      }
+    ]);
 
     const result = await adapter.target.apply([
       write(schema.tasks).updateByKey('task-1', { title: 'Edited' }),
@@ -1035,6 +1110,19 @@ describe('automerge map adapter', () => {
     expect(adapter.source.rows(schema.labels)).toEqual([{ id: 'label-1', name: 'Important' }]);
     expect(adapter.objectIdFor(schema.tasks, 'task-1')).toBe(taskObjectId);
     expect(adapter.objectIdFor(schema.labels, 'label-1')).toBe(labelObjectId);
+
+    const editedHeads = Automerge.getHeads(adapter.getDoc());
+    adapter.setDoc(Automerge.change(adapter.getDoc(), (draft) => {
+      (draft.workspace.tasks as TaskRow[]).unshift({ id: 'task-0', title: 'Prep' });
+    }));
+    expect(adapter.pathForObjectId(taskObjectId)).toEqual(['workspace', 'tasks', 1]);
+    expect(automergePathForObjectId(automergeView(adapter.getDoc(), editedHeads), taskObjectId))
+      .toEqual(['workspace', 'tasks', 0]);
+
+    adapter.setDoc(Automerge.change(adapter.getDoc(), (draft) => {
+      (draft.workspace.tasks as TaskRow[]).splice(1, 1);
+    }));
+    expect(adapter.pathForObjectId(taskObjectId)).toBeNull();
   });
 
   it('wraps stable Automerge view, fork, changeAt, and merge flows', () => {

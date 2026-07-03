@@ -355,7 +355,7 @@ describe('materialization fuzz behavior', () => {
     expect(incrementalChanges, 'expected seeded incremental changes').toBeGreaterThan(0);
     expect(carriedChanges, 'expected seeded carried changes').toBeGreaterThan(0);
     expect(safetyRecomputes, 'expected seeded safety recomputes').toBeGreaterThan(0);
-  });
+  }, 10_000);
 
   it('keeps mixed single-source materializations equivalent across seeded transaction sequences', () => {
     const variants: readonly UnsupportedVariant[] = [

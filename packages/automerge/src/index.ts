@@ -13,9 +13,11 @@ import {
   type RelationRangeLookup,
   type RelationRuntime,
   type RuntimeInterestRow,
+  type RuntimeObjectLocationRow,
   type RuntimeSystemState,
   runtimeSystemRelationList,
   runtimeSystemSource,
+  runtimeSystemRelations,
   type TarstateDiagnostic
 } from '@tarstate/core/adapter';
 import { evaluate, type EvaluateEnv } from '@tarstate/core/evaluate';
@@ -41,6 +43,19 @@ export type AutomergeConflictDiagnosticOptions = {
   readonly field?: string;
   readonly surface?: string;
 };
+export type AutomergeObjectPath = readonly Automerge.Prop[];
+export type AutomergeAnchoredPath = readonly [Automerge.ObjID, ...Automerge.Prop[]];
+export type AutomergeObjectReference = {
+  readonly objectId: Automerge.ObjID;
+  readonly path?: AutomergeObjectPath;
+  readonly heads?: Automerge.Heads;
+  readonly documentId?: string;
+  readonly branch?: string;
+  readonly relation?: string;
+  readonly key?: unknown;
+  readonly detail?: unknown;
+};
+export type AutomergeObjectReferenceOptions = Omit<AutomergeObjectReference, 'objectId' | 'path'>;
 export type AutomergeTextValue = string | Automerge.ImmutableString;
 export type AutomergeCounterValue = number | Automerge.Counter;
 
@@ -115,6 +130,19 @@ export function automergeDateField(
   });
 }
 
+export function automergeObjectReferenceField(
+  options: Partial<CustomFieldSpec<unknown>> = {}
+): FieldSpec<AutomergeObjectReference> {
+  return customScalarField<AutomergeObjectReference>({
+    kind: 'automerge.objectReference',
+    description: 'an Automerge object reference',
+    validate: isAutomergeObjectReference,
+    stableKey,
+    compare: (left, right) => stableKey(left).localeCompare(stableKey(right)),
+    ...options
+  });
+}
+
 function customScalarField<Value>(spec: CustomFieldSpec<unknown>): FieldSpec<Value> {
   return customField<unknown>(spec) as FieldSpec<Value>;
 }
@@ -128,6 +156,16 @@ export type AutomergeMapRelation<
 };
 
 export type AutomergeMapEnvInput = EvaluateEnv | (() => EvaluateEnv | undefined);
+export type AutomergeObjectLocationOptions<
+  DocumentShape extends object = Record<string, unknown>
+> = {
+  readonly runtimeId?: string;
+  readonly relations?: readonly AutomergeMapRelation<RelationRef, DocumentShape>[];
+  readonly documentId?: string;
+  readonly branch?: string;
+  readonly heads?: Automerge.Heads;
+  readonly detail?: unknown;
+};
 
 export type AutomergeMapAdapterOptions<
   DocumentShape extends object = Record<string, unknown>
@@ -167,6 +205,8 @@ export type AutomergeMapAdapter<
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
   readonly setDoc: (doc: Automerge.Doc<DocumentShape>) => void;
   readonly objectIdFor: (relation: RelationRef, key: unknown) => Automerge.ObjID | null;
+  readonly pathForObjectId: (objectId: Automerge.ObjID) => AutomergeObjectPath | null;
+  readonly objectReferenceFor: (relation: RelationRef, key: unknown) => AutomergeObjectReference | null;
   readonly snapshot: () => AdapterSnapshot<Automerge.Heads>;
   readonly target: RelationPatchTarget<Automerge.Heads>;
   readonly subscribe: (listener: () => void) => () => void;
@@ -229,6 +269,10 @@ type MappedCollection = {
 type AnyMapRelation = {
   readonly relation: RelationRef;
   readonly path: readonly string[];
+};
+type MappedObjectLocation = {
+  readonly relation: string;
+  readonly key?: unknown;
 };
 type RowPlan = {
   readonly mapping: AnyMapRelation;
@@ -366,6 +410,49 @@ export function automergeObjectId(input: unknown, prop?: Automerge.Prop): Autome
   return Automerge.getObjectId(input, prop);
 }
 
+export function automergeObjectReference(input: AutomergeObjectReference): AutomergeObjectReference {
+  return {
+    ...input,
+    ...(input.path === undefined ? {} : { path: [...input.path] }),
+    ...(input.heads === undefined ? {} : { heads: [...input.heads] })
+  };
+}
+
+export function automergeObjectReferenceAt<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  path: AutomergeObjectPath = [],
+  options: AutomergeObjectReferenceOptions = {}
+): AutomergeObjectReference | null {
+  const objectId = automergeObjectIdAt(doc, path);
+  return objectId === null
+    ? null
+    : automergeObjectReference({
+      objectId,
+      path: [...path],
+      heads: options.heads ?? Automerge.getHeads(doc),
+      ...(options.documentId === undefined ? {} : { documentId: options.documentId }),
+      ...(options.branch === undefined ? {} : { branch: options.branch }),
+      ...(options.relation === undefined ? {} : { relation: options.relation }),
+      ...(options.key === undefined ? {} : { key: options.key }),
+      ...(options.detail === undefined ? {} : { detail: options.detail })
+    });
+}
+
+export function automergePathForObjectId<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  objectId: Automerge.ObjID
+): AutomergeObjectPath | null {
+  const location = automergeObjectLocations(doc).find((row) => row.objectId === objectId);
+  return location === undefined ? null : [...location.pathSegments];
+}
+
+export function automergeObjectLocations<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  options: AutomergeObjectLocationOptions<DocumentShape> = {}
+): readonly RuntimeObjectLocationRow[] {
+  return automergeObjectLocationRows(doc, options);
+}
+
 function createAutomergeMapAdapter<
   DocumentShape extends object = Record<string, unknown>
 >(
@@ -438,6 +525,21 @@ function createAutomergeMapAdapter<
   };
   const objectIdFor = (relation: RelationRef, key: unknown) =>
     objectIdForRelation(driver.getDoc(), options.relations, relation, key);
+  const pathForObjectId = (objectId: Automerge.ObjID) =>
+    automergePathForObjectId(driver.getDoc(), objectId);
+  const objectReferenceFor = (relation: RelationRef, key: unknown) => {
+    const objectId = objectIdFor(relation, key);
+    if (objectId === null) return null;
+    const path = pathForObjectId(objectId) ?? undefined;
+
+    return automergeObjectReference({
+      objectId,
+      ...(path === undefined ? {} : { path }),
+      heads: Automerge.getHeads(driver.getDoc()),
+      relation: relation.name,
+      ...(key === undefined ? {} : { key })
+    });
+  };
   const target: RelationPatchTarget<Automerge.Heads> = {
     relationNames,
     ownsRelation: (relationName) => options.relations.some((mapping) => mapping.relation.name === relationName),
@@ -511,6 +613,8 @@ function createAutomergeMapAdapter<
     getDoc,
     setDoc,
     objectIdFor,
+    pathForObjectId,
+    objectReferenceFor,
     source,
     target,
     snapshot,
@@ -557,16 +661,10 @@ export function automergeMerge<DocumentShape extends object>(
 
 export function automergeObjectIdAt<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
-  path: readonly Automerge.Prop[] = []
+  path: AutomergeObjectPath = []
 ): Automerge.ObjID | null {
-  if (path.length === 0) return Automerge.getObjectId(doc);
-
-  const parent = valueAtPropertyPath(doc, path.slice(0, -1));
-  const prop = path[path.length - 1];
-  return parent.found
-    && prop !== undefined
-    ? Automerge.getObjectId(parent.value, prop)
-    : null;
+  const value = valueAtPropertyPath(doc, path);
+  return value.found ? Automerge.getObjectId(value.value) : null;
 }
 
 export function automergeConflictsAt<DocumentShape extends object>(
@@ -739,11 +837,18 @@ function withAutomergeSystemSource<DocumentShape extends object>(
       ],
       ...(extra?.peers === undefined ? {} : { peers: extra.peers }),
       ...(extra?.conflicts === undefined ? {} : { conflicts: extra.conflicts }),
+      ...(extra?.objectLocations === undefined ? {} : { objectLocations: extra.objectLocations }),
       ...(extra?.storage === undefined ? {} : { storage: extra.storage })
     };
   };
   const systemSource = runtimeSystemSource(systemState);
-  const rowSource = composeSources(dataSource, systemSource);
+  const objectLocationSource: AdapterSource<Automerge.Heads> = {
+    relationNames: [runtimeSystemRelations.objectLocations.name],
+    rows: (relationRef) => relationRef.name === runtimeSystemRelations.objectLocations.name
+      ? automergeObjectLocationRows(getDoc(), { runtimeId, relations })
+      : []
+  };
+  const rowSource = composeSources(dataSource, systemSource, objectLocationSource);
 
   return {
     ...rowSource,
@@ -900,6 +1005,95 @@ function objectIdForRelation<DocumentShape extends object>(
   }
 
   return null;
+}
+
+function automergeObjectLocationRows<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  options: AutomergeObjectLocationOptions<DocumentShape>
+): readonly RuntimeObjectLocationRow[] {
+  const runtime = options.runtimeId ?? 'automergeMapRuntime';
+  const heads = options.heads ?? Automerge.getHeads(doc);
+  const relations = options.relations ?? [];
+  const rows: RuntimeObjectLocationRow[] = [];
+  const seen = new Set<Automerge.ObjID>();
+
+  const visit = (
+    value: unknown,
+    path: readonly Automerge.Prop[],
+    parentObjectId?: Automerge.ObjID,
+    prop?: Automerge.Prop
+  ): void => {
+    const objectId = Automerge.getObjectId(value);
+    if (objectId === null || seen.has(objectId)) return;
+
+    seen.add(objectId);
+    const mapped = mappedObjectLocation(relations, path, value);
+    rows.push({
+      id: `${runtime}:object:${objectId}`,
+      runtime,
+      objectId,
+      path: formatRuntimeObjectPath(path),
+      pathSegments: [...path],
+      ...(parentObjectId === undefined ? {} : { parentObjectId }),
+      ...(prop === undefined ? {} : { prop }),
+      ...(options.documentId === undefined ? {} : { documentId: options.documentId }),
+      ...(options.branch === undefined ? {} : { branch: options.branch }),
+      ...(heads.length === 0 ? {} : { heads }),
+      ...(mapped === undefined ? {} : mapped),
+      ...(options.detail === undefined ? {} : { detail: options.detail })
+    });
+
+    if (Array.isArray(value)) {
+      for (const [index, item] of value.entries()) {
+        visit(item, [...path, index], objectId, index);
+      }
+      return;
+    }
+
+    if (!isRecord(value)) return;
+
+    for (const [key, item] of Object.entries(value)) {
+      visit(item, [...path, key], objectId, key);
+    }
+  };
+
+  visit(doc, []);
+  return rows;
+}
+
+function mappedObjectLocation(
+  relations: readonly AnyMapRelation[],
+  path: readonly Automerge.Prop[],
+  value: unknown
+): MappedObjectLocation | undefined {
+  if (!isRecord(value)) return undefined;
+
+  for (const mapping of relations) {
+    if (!isDirectChildPath(mapping.path, path)) continue;
+
+    const key = relationKeyValue(mapping.relation, value);
+    return key === undefined
+      ? { relation: mapping.relation.name }
+      : { relation: mapping.relation.name, key };
+  }
+
+  return undefined;
+}
+
+function relationKeyValue(relation: RelationRef, row: Row): unknown {
+  const keyValues = relationKeyFields(relation)
+    .map((fieldName) => fieldReadValue(relation.fields[fieldName], row[fieldName]));
+
+  return keyValues.some((value) => value === undefined || value === null)
+    ? undefined
+    : keyValues.length === 1
+      ? keyValues[0]
+      : keyValues;
+}
+
+function isDirectChildPath(parent: readonly string[], child: readonly Automerge.Prop[]): boolean {
+  return child.length === parent.length + 1
+    && parent.every((segment, index) => child[index] === segment);
 }
 
 function stagedSourceFor(context: PatchEvaluationContext): AdapterSource<Automerge.Heads> {
@@ -2037,6 +2231,25 @@ function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
+function isAutomergeObjectReference(input: unknown): boolean {
+  if (!isRecord(input) || typeof input.objectId !== 'string') return false;
+  if (input.path !== undefined && !isAutomergePath(input.path)) return false;
+  if (input.heads !== undefined && !isStringArray(input.heads)) return false;
+  if (input.documentId !== undefined && typeof input.documentId !== 'string') return false;
+  if (input.branch !== undefined && typeof input.branch !== 'string') return false;
+  if (input.relation !== undefined && typeof input.relation !== 'string') return false;
+  return true;
+}
+
+function isAutomergePath(input: unknown): input is readonly Automerge.Prop[] {
+  return Array.isArray(input) && input.every((segment) =>
+    typeof segment === 'string' || typeof segment === 'number');
+}
+
+function isStringArray(input: unknown): input is readonly string[] {
+  return Array.isArray(input) && input.every((item) => typeof item === 'string');
+}
+
 function isExprData(input: unknown): input is Record<string, unknown> & { readonly op: string } {
   return isRecord(input) && typeof input.op === 'string';
 }
@@ -2126,6 +2339,10 @@ function headsEqual(left: Automerge.Heads, right: Automerge.Heads): boolean {
 
 function formatAutomergePath(path: readonly Automerge.Prop[]): string {
   return path.map((segment) => typeof segment === 'number' ? `[${segment}]` : segment).join('.');
+}
+
+function formatRuntimeObjectPath(path: readonly Automerge.Prop[]): string {
+  return path.length === 0 ? '$' : formatAutomergePath(path);
 }
 
 function replaceAt(rows: readonly Row[], index: number, row: Row): Row[] {

@@ -16,6 +16,8 @@ import {
   automergePresenceRuntime,
   defaultAutomergePresenceClearedValue,
   type AutomergePresenceFieldNames,
+  type AutomergePresenceLocationState,
+  type AutomergePresenceOperation,
   type AutomergePresenceRuntime,
   type AutomergePresenceRuntimeOptions,
   type AutomergePresenceWritableRuntime
@@ -31,6 +33,8 @@ type PresenceRow = {
 };
 
 type PresenceChannels = Record<string, JsonValue | undefined>;
+type LocationChannels = AutomergePresenceLocationState<'cursor' | 'selection'>;
+type OperationChannels = Record<string, AutomergePresenceOperation | undefined>;
 type PresenceDoc = {
   readonly presence?: PresenceChannels;
 };
@@ -132,6 +136,11 @@ describe('automerge presence runtime', () => {
     expectTypeOf(createWritableRuntime).returns.toMatchTypeOf<AutomergePresenceWritableRuntime<PresenceChannels>>();
     expectTypeOf<AutomergePresenceRuntime<PresenceChannels>['start']>().toEqualTypeOf<() => void>();
     expectTypeOf<AutomergePresenceRuntime<PresenceChannels>['stop']>().toEqualTypeOf<() => void>();
+    expectTypeOf<LocationChannels['cursor']>().toMatchTypeOf<{
+      readonly objectId?: string;
+      readonly path?: readonly (string | number)[];
+      readonly heads?: string[];
+    } | undefined>();
   });
 
   it('starts and stops explicitly and exposes local presence rows when requested', () => {
@@ -254,6 +263,93 @@ describe('automerge presence runtime', () => {
     ]);
     expect(rejected.status).toBe('rejected');
     expect(runtime.getLocalState()).toMatchObject({ color: 'green', cursor: undefined });
+    runtime.stop();
+  });
+
+  it('round-trips Automerge location payloads through local rows and writable patches', async () => {
+    const initialLocation = {
+      objectId: '3@actor',
+      path: ['tasks', 0] as const,
+      heads: ['1@actor'],
+      relation: 'tasks',
+      key: 'task-1'
+    };
+    const nextLocation = {
+      objectId: '4@actor',
+      path: ['tasks', 1, 'title'] as const,
+      heads: ['2@actor', '3@actor'],
+      relation: 'tasks',
+      key: 'task-2',
+      detail: { field: 'title' }
+    };
+    const runtime = automergePresenceRuntime<LocationChannels, PresenceDoc>({
+      handle: realDocHandle(),
+      relation: schema.presence,
+      fields,
+      localPeerId: 'peer-local',
+      includeLocalRows: true,
+      initialState: { cursor: initialLocation }
+    });
+    runtime.start();
+
+    expect(runtime.source.rows(schema.presence)).toMatchObject([
+      { peer: 'peer-local', topic: 'cursor', payload: initialLocation, isLocal: true }
+    ]);
+
+    const result = await runtime.target.apply([
+      write(schema.presence).insertOrReplace({
+        peer: 'peer-local',
+        topic: 'selection',
+        payload: nextLocation
+      })
+    ]);
+
+    expect(result).toMatchObject({ status: 'accepted', applied: 1, durability: 'ephemeral' });
+    expect(result.deltas[0]?.added).toMatchObject([
+      { peer: 'peer-local', topic: 'selection', payload: nextLocation, isLocal: true }
+    ]);
+    expect(runtime.getLocalState().selection).toEqual(nextLocation);
+    expect(runtime.source.rows(schema.presence)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ peer: 'peer-local', topic: 'cursor', payload: initialLocation, isLocal: true }),
+      expect.objectContaining({ peer: 'peer-local', topic: 'selection', payload: nextLocation, isLocal: true })
+    ]));
+    runtime.stop();
+  });
+
+  it('round-trips Automerge operation payloads through writable patches', async () => {
+    const operation = {
+      action: 'put',
+      anchoredPath: ['3@actor', 'title'] as const,
+      objectId: '3@actor',
+      heads: ['1@actor', '2@actor'],
+      value: 'Done'
+    } satisfies AutomergePresenceOperation;
+    const runtime = automergePresenceRuntime<OperationChannels, PresenceDoc>({
+      handle: realDocHandle(),
+      relation: schema.presence,
+      fields,
+      localPeerId: 'peer-local',
+      includeLocalRows: true,
+      initialState: {}
+    });
+    runtime.start();
+
+    const result = await runtime.target.apply([
+      write(schema.presence).insertOrReplace({
+        peer: 'peer-local',
+        topic: 'localEdit',
+        payload: operation
+      })
+    ]);
+
+    expect(result).toMatchObject({ status: 'accepted', applied: 1, durability: 'ephemeral' });
+    expect(result.deltas[0]?.added).toMatchObject([
+      { peer: 'peer-local', topic: 'localEdit', payload: operation, isLocal: true }
+    ]);
+    expect(runtime.getLocalState().localEdit).toEqual(operation);
+    expect(runtime.source.rows(schema.presence)).toMatchObject([
+      { peer: 'peer-local', topic: 'localEdit', payload: operation, isLocal: true }
+    ]);
     runtime.stop();
   });
 });

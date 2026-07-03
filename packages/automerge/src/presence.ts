@@ -4,6 +4,11 @@ import {
   type PeerState,
   type PresenceState
 } from '@automerge/automerge-repo';
+import type * as Automerge from '@automerge/automerge';
+import type {
+  AutomergeAnchoredPath,
+  AutomergeObjectReference
+} from './index.js';
 import type {
   AdapterSnapshot,
   RelationDelta,
@@ -34,6 +39,20 @@ export type AutomergePresenceRelationOptions<Relation extends RelationRef = Rela
 };
 
 export type AutomergePresenceClearedValue = (value: unknown) => boolean;
+export type AutomergePresencePartialObjectReference = Partial<AutomergeObjectReference>;
+export type AutomergePresenceLocation = AutomergePresencePartialObjectReference;
+export type AutomergePresenceLocationState<Channel extends string = string> =
+  Partial<Record<Channel, AutomergePresenceLocation | AutomergeObjectReference | undefined>>;
+export type AutomergePresenceOperationPayload = {
+  readonly anchoredPath: AutomergeAnchoredPath;
+  readonly objectId?: Automerge.ObjID;
+  readonly heads?: Automerge.Heads;
+  readonly value?: unknown;
+};
+export type AutomergePresenceOperation =
+  | (AutomergePresenceOperationPayload & { readonly action: 'focus' })
+  | (AutomergePresenceOperationPayload & { readonly action: 'put'; readonly value: unknown })
+  | (AutomergePresenceOperationPayload & { readonly action: 'move'; readonly to: AutomergeAnchoredPath });
 
 export type AutomergePresenceRuntimeOptions<
   State extends PresenceState = PresenceState,

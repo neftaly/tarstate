@@ -273,7 +273,7 @@ type AliasedFieldAccess<Row, Alias extends string> =
   } & AliasedFlatFieldAccess<Row>;
 type RowFieldKeys<Row> = Row extends object ? keyof Row & string : never;
 type LiteralRowFieldKeys<Row> = string extends RowFieldKeys<Row> ? never : RowFieldKeys<Row>;
-type AliasedReservedField = keyof RelationRef | keyof Query | 'alias' | '$';
+type AliasedReservedField = Exclude<keyof RelationRef | keyof Query, 'key'> | 'alias' | '$';
 type AliasFieldNamespace<Row> = string extends RowFieldKeys<Row>
   ? Readonly<Record<string, ExprData<unknown>>>
   : { readonly [Field in RowFieldKeys<Row>]: ExprData<Row[Field]> };
@@ -282,7 +282,9 @@ type AliasedFlatFieldAccess<Row> = {
 };
 export type AliasedRelationRef<Row extends object, Alias extends string> =
   RelationRef<Row> & AliasedFieldAccess<Row, Alias>;
-export type AliasedQuery<Row, Alias extends string> = Query<Row> & AliasedFieldAccess<Row, Alias>;
+type AliasedQueryFieldRow<Row, Alias extends string> =
+  Row extends Record<Alias, infer QualifiedRow> ? QualifiedRow : Row;
+export type AliasedQuery<Row, Alias extends string> = Query<Row> & AliasedFieldAccess<AliasedQueryFieldRow<Row, Alias>, Alias>;
 
 type ExprValue<Input> = Input extends ExprData<infer Value> ? Value : Input;
 type ProjectedRow<Shape extends ProjectionData> = {
@@ -406,10 +408,10 @@ export function as<Row, Alias extends string>(
   const target: Record<string, unknown> = { ...input, alias };
   const namespace: Record<string, ExprData> = {};
 
-  for (const fieldName of aliasedFieldNames(input)) {
+  for (const fieldName of aliasedFieldNames(input, alias)) {
     const exprData = field(alias, fieldName);
     defineAliasProperty(namespace, fieldName, exprData);
-    if (!(fieldName in target) && !ALIASED_FIELD_RESERVED_KEYS.has(fieldName)) {
+    if ((fieldName === 'key' || !(fieldName in target)) && !ALIASED_FIELD_RESERVED_KEYS.has(fieldName)) {
       defineAliasProperty(target, fieldName, exprData);
     }
   }
@@ -929,6 +931,21 @@ export type RuntimeConflictRow = {
   readonly values?: unknown;
   readonly detail?: unknown;
 };
+export type RuntimeObjectLocationRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly objectId: string;
+  readonly path: string;
+  readonly pathSegments: readonly (string | number)[];
+  readonly parentObjectId?: string;
+  readonly prop?: string | number;
+  readonly documentId?: string;
+  readonly branch?: string;
+  readonly heads?: readonly string[];
+  readonly relation?: string;
+  readonly key?: unknown;
+  readonly detail?: unknown;
+};
 export type RuntimeStorageState =
   | 'idle'
   | 'loading'
@@ -966,6 +983,7 @@ export type RuntimeSystemState = {
   readonly peers?: readonly RuntimePeerRow[];
   readonly sync?: readonly RuntimeSyncRow[];
   readonly conflicts?: readonly RuntimeConflictRow[];
+  readonly objectLocations?: readonly RuntimeObjectLocationRow[];
   readonly storage?: readonly RuntimeStorageRow[];
   readonly interests?: readonly RuntimeInterestRow[];
 };
@@ -1065,6 +1083,28 @@ export const runtimeSystemRelations = {
     }),
     name: 'tarstate.runtime.conflicts'
   },
+  objectLocations: {
+    ...relation<RuntimeObjectLocationRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.objectLocation'),
+        runtime: stringField(),
+        objectId: idField('tarstate.runtime.object'),
+        path: stringField(),
+        pathSegments: jsonField() as FieldSpec<readonly (string | number)[]>,
+        parentObjectId: optional(refField('tarstate.runtime.object')),
+        prop: optional(jsonField() as FieldSpec<string | number>),
+        documentId: optional(stringField()),
+        branch: optional(stringField()),
+        heads: optional(jsonField() as FieldSpec<readonly string[]>),
+        relation: optional(stringField()),
+        key: optional(opaqueField<unknown>('runtime.objectLocation.key')),
+        detail: optional(opaqueField<unknown>('runtime.objectLocation.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.objectLocations'
+  },
   storage: {
     ...relation<RuntimeStorageRow, 'id'>({
       key: 'id',
@@ -1125,6 +1165,8 @@ function runtimeSystemRows(state: RuntimeSystemState, relationRef: RelationRef):
       return state.sync ?? [];
     case runtimeSystemRelations.conflicts.name:
       return state.conflicts ?? [];
+    case runtimeSystemRelations.objectLocations.name:
+      return state.objectLocations ?? [];
     case runtimeSystemRelations.storage.name:
       return state.storage ?? [];
     case runtimeSystemRelations.interests.name:
@@ -9063,7 +9105,6 @@ function aggregateCall<Value = unknown>(op: AggregateFunction, ...args: readonly
 const ALIASED_FIELD_RESERVED_KEYS = new Set<string>([
   'kind',
   'name',
-  'key',
   'fields',
   'ephemeral',
   '__row',
@@ -9082,16 +9123,16 @@ function defineAliasProperty(target: Record<string, unknown>, name: string, valu
   });
 }
 
-function aliasedFieldNames(input: AnyRelationRef | Query): readonly string[] {
-  if (isQuery(input)) return queryFieldNames(input);
+function aliasedFieldNames(input: AnyRelationRef | Query, alias?: string): readonly string[] {
+  if (isQuery(input)) return queryFieldNames(input, alias);
   return Object.keys(input.fields);
 }
 
-function queryFieldNames(query: Query): readonly string[] {
-  return queryDataFieldNames(query.data, query.relations);
+function queryFieldNames(query: Query, alias?: string): readonly string[] {
+  return queryDataFieldNames(query.data, query.relations, alias);
 }
 
-function queryDataFieldNames(data: QueryData, relations: Readonly<Record<string, AnyRelationRef>>): readonly string[] {
+function queryDataFieldNames(data: QueryData, relations: Readonly<Record<string, AnyRelationRef>>, alias?: string): readonly string[] {
   switch (data.op) {
     case 'from':
     case 'lookup':
@@ -9134,6 +9175,7 @@ function queryDataFieldNames(data: QueryData, relations: Readonly<Record<string,
         stringArray(data.fields)
       );
     case 'qualify':
+      if (typeof data.alias === 'string' && data.alias === alias) return inputFieldNames(data, relations);
       return typeof data.alias === 'string' ? [data.alias] : [];
     default:
       return [];

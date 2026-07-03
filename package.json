@@ -15,6 +15,7 @@
     "lint": "oxlint . --deny-warnings --type-aware",
     "relic:oracle": "TARSTATE_RELIC_ORACLE=1 pnpm --filter @tarstate/core exec vitest run --config ../../vite.config.ts tests/relic-oracle.test.ts",
     "test": "pnpm --filter './packages/*' test",
+    "test:fuzz": "pnpm --filter './packages/*' --if-present test:fuzz",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

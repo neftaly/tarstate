@@ -220,6 +220,7 @@ export type {
   RuntimeDiagnosticRow,
   RuntimeInterestRow,
   RuntimeInterestState,
+  RuntimeObjectLocationRow,
   RuntimePeerRow,
   RuntimePeerState,
   RuntimeSourceRow,

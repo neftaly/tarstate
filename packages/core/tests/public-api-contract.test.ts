@@ -3,9 +3,11 @@ import {
   index as rootMaterializedIndex,
   runtimeSystemRelations,
   runtimeSystemSource,
+  type RuntimeObjectLocationRow,
   type RuntimeSystemState,
   type MaterializedIndex as RootMaterializedIndex
 } from '@tarstate/core';
+import * as adapterApi from '@tarstate/core/adapter';
 import * as constraintsApi from '@tarstate/core/constraints';
 import {
   check,
@@ -200,6 +202,15 @@ describe('public API contracts', () => {
   });
 
   it('exposes runtime system state as queryable relation rows', () => {
+    const objectLocation = {
+      id: 'runtime:object:1@actor',
+      runtime: 'runtime',
+      objectId: '1@actor',
+      path: 'entries.[0]',
+      pathSegments: ['entries', 0],
+      relation: 'entries',
+      key: 'entry-1'
+    } satisfies RuntimeObjectLocationRow;
     const state = {
       sources: [{
         id: 'runtime:source:storage',
@@ -220,23 +231,29 @@ describe('public API contracts', () => {
         state: 'active',
         relationNames: ['entries'],
         subscriberCount: 1
-      }]
+      }],
+      objectLocations: [objectLocation]
     } satisfies RuntimeSystemState;
     const source = runtimeSystemSource(state);
 
     expect(runtimeSystemRelations.sources.name).toBe('tarstate.runtime.sources');
     expect(runtimeSystemRelations.diagnostics.ephemeral).toBe(true);
+    expect(adapterApi.runtimeSystemRelations.objectLocations.name).toBe('tarstate.runtime.objectLocations');
+    expect(runtimeSystemRelations.objectLocations.key).toBe('id');
+    expectTypeOf<typeof objectLocation>().toMatchTypeOf<RuntimeObjectLocationRow>();
     expect(source.relationNames).toEqual([
       'tarstate.runtime.sources',
       'tarstate.runtime.diagnostics',
       'tarstate.runtime.peers',
       'tarstate.runtime.sync',
       'tarstate.runtime.conflicts',
+      'tarstate.runtime.objectLocations',
       'tarstate.runtime.storage',
       'tarstate.runtime.interests'
     ]);
     expect(source.rows(runtimeSystemRelations.sources)).toEqual(state.sources);
     expect(source.rows(runtimeSystemRelations.interests)).toEqual(state.interests);
+    expect(source.rows(runtimeSystemRelations.objectLocations)).toEqual(state.objectLocations);
     expect(source.rows(runtimeSystemRelations.diagnostics)).toEqual([
       expect.objectContaining({
         runtime: 'runtime',
