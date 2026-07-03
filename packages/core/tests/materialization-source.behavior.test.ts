@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { createDb, q, qResult, transact } from '@tarstate/core/db';
+import { evaluate } from '@tarstate/core/evaluate';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
 import {
   maintainMaterializationSnapshots,
   mat,
   materializedRelationForQuery,
   materializedRowsForQuery,
+  materializedSourceFor,
   readMaterializedQuery
 } from '@tarstate/core/materialization';
 import {
@@ -219,6 +221,46 @@ describe('materialized source behavior', () => {
     ))).toEqual([{ id: 'e2', amount: -120 }]);
   });
 
+  it('uses materialized index lookups for q equality filters over materialized relations', () => {
+    const db = mat(makeDb(), entriesByAccount);
+    const relation = materializedRelationForQuery(db, entriesByAccount);
+    const materializedSource = materializedSourceFor(db);
+    if (relation === undefined || materializedSource === undefined) {
+      throw new Error('expected materialized index relation and source');
+    }
+
+    const scanQuery = pipe(
+      from(relation),
+      sort(asc(field<string>('row', 'id')))
+    );
+    const indexedFilter = pipe(
+      from(relation),
+      where(eq(field<string>('row', 'accountId'), value('cash'))),
+      sort(asc(field<string>('row', 'id')))
+    );
+
+    const scannedRows = q(db, scanQuery).filter((row) => row.accountId === 'cash');
+    const filteredRows = q(db, indexedFilter);
+
+    expect(filteredRows).toEqual(scannedRows);
+    expect(filteredRows).toEqual([
+      { id: 'e1', accountId: 'cash', amount: 120, posted: true },
+      { id: 'e4', accountId: 'cash', amount: 0, posted: false }
+    ]);
+
+    const instrumented = instrumentSourceLookups(materializedSource);
+    expect(evaluate(instrumented.source, indexedFilter)).toEqual({
+      rows: scannedRows,
+      diagnostics: []
+    });
+    expect(instrumented.reads).toEqual({ rows: 0, lookup: 1 });
+    expect(instrumented.lookups).toEqual([{
+      relation: relation.name,
+      field: 'accountId',
+      value: 'cash'
+    }]);
+  });
+
   it('materializes readable relation sources without treating arbitrary objects as empty sources', () => {
     const source = fromObjectSource(makeDb().data);
     const materialized = mat(source, cashEntryProjection);
@@ -251,3 +293,43 @@ describe('materialized source behavior', () => {
   });
 
 });
+
+type SourceReadCounts = {
+  rows: number;
+  lookup: number;
+};
+
+function instrumentSourceLookups(source: RelationSource): {
+  readonly source: RelationSource;
+  readonly reads: SourceReadCounts;
+  readonly lookups: readonly { readonly relation: string; readonly field: string; readonly value: unknown }[];
+} {
+  const reads: SourceReadCounts = { rows: 0, lookup: 0 };
+  const lookups: { relation: string; field: string; value: unknown }[] = [];
+
+  return {
+    reads,
+    lookups,
+    source: {
+      ...(source.relationNames === undefined ? {} : { relationNames: source.relationNames }),
+      rows: (relationRef) => {
+        reads.rows += 1;
+        return source.rows(relationRef);
+      },
+      lookup: (lookupValue) => {
+        reads.lookup += 1;
+        lookups.push({
+          relation: lookupValue.relation.name,
+          field: lookupValue.field,
+          value: lookupValue.value
+        });
+        return source.lookup?.(lookupValue);
+      },
+      ...(source.rangeLookup === undefined
+        ? {}
+        : { rangeLookup: (lookupValue) => source.rangeLookup?.(lookupValue) }),
+      ...(source.version === undefined ? {} : { version: source.version }),
+      ...(source.diagnostics === undefined ? {} : { diagnostics: source.diagnostics })
+    }
+  };
+}

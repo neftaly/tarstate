@@ -2537,7 +2537,7 @@ function materializedHashIndexSnapshot<Row, Value = unknown>(
 ): MaterializedHashIndex<Row, Value> {
   const fieldName = internal.field;
   const buckets = materializedIndexBucketsSnapshot<Row, Value>(internal);
-  const bucketMap = materializedIndexBucketMap(buckets);
+  const bucketMap = materializedIndexBucketMap(buckets, fieldName);
   return Object.freeze({
     ...base,
     op: 'hash',
@@ -2567,7 +2567,7 @@ function materializedUniqueIndexSnapshot<Row, Value = unknown>(
 ): MaterializedUniqueIndex<Row, Value> {
   const fieldName = internal.field;
   const buckets = materializedIndexBucketsSnapshot<Row, Value>(internal);
-  const bucketMap = materializedIndexBucketMap(buckets);
+  const bucketMap = materializedIndexBucketMap(buckets, fieldName);
   const lookup = (value: Value): readonly Row[] => materializedIndexLookupRows(bucketMap, fieldName, value);
   return Object.freeze({
     ...base,
@@ -2592,19 +2592,31 @@ function materializedIndexBucketsSnapshot<Row, Value = unknown>(
   })));
 }
 
+type MaterializedIndexLookupBucket<Row, Value> = {
+  readonly bucket: MaterializedIndexBucket<Row, Value>;
+  readonly exactValueOnly: boolean;
+};
+
 function materializedIndexBucketMap<Row, Value>(
-  buckets: readonly MaterializedIndexBucket<Row, Value>[]
-): ReadonlyMap<string, MaterializedIndexBucket<Row, Value>> {
-  return new Map(buckets.map((bucket) => [stableKey(bucket.value), bucket]));
+  buckets: readonly MaterializedIndexBucket<Row, Value>[],
+  fieldName: string
+): ReadonlyMap<string, MaterializedIndexLookupBucket<Row, Value>> {
+  return new Map(buckets.map((bucket) => [stableKey(bucket.value), {
+    bucket,
+    exactValueOnly: bucket.rows.every((rowValue) =>
+      isRecord(rowValue) && Object.is(rowValue[fieldName], bucket.value))
+  }]));
 }
 
 function materializedIndexLookupRows<Row, Value>(
-  buckets: ReadonlyMap<string, MaterializedIndexBucket<Row, Value>>,
+  buckets: ReadonlyMap<string, MaterializedIndexLookupBucket<Row, Value>>,
   fieldName: string,
   valueValue: Value
 ): readonly Row[] {
-  const bucket = buckets.get(stableKey(valueValue));
-  if (bucket === undefined) return frozenArray([]);
+  const lookupBucket = buckets.get(stableKey(valueValue));
+  if (lookupBucket === undefined) return EMPTY_FROZEN_ARRAY;
+  const { bucket } = lookupBucket;
+  if (lookupBucket.exactValueOnly && Object.is(bucket.value, valueValue)) return bucket.rows;
   return frozenArray(bucket.rows.filter((rowValue) =>
     isRecord(rowValue) && Object.is(rowValue[fieldName], valueValue)));
 }
@@ -2618,7 +2630,10 @@ function materializedIndexRangeRowsFromBuckets<Row, Value>(
     .flatMap((bucket) => bucket.rows));
 }
 
+const EMPTY_FROZEN_ARRAY = Object.freeze([]) as readonly never[];
+
 function frozenArray<Value>(values: readonly Value[]): readonly Value[] {
+  if (values.length === 0) return EMPTY_FROZEN_ARRAY;
   return Object.freeze([...values]);
 }
 
