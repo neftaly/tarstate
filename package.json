@@ -11,6 +11,7 @@
   "scripts": {
     "bench": "pnpm -r --if-present bench",
     "build": "pnpm -r --if-present build",
+    "dev": "pnpm -r --filter './apps/*' --parallel --if-present dev",
     "lint": "oxlint . --deny-warnings --type-aware",
     "test": "pnpm --filter './packages/*' --if-present test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
