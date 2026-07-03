@@ -75,6 +75,7 @@ export type CustomFieldSpec<Value = unknown> = {
   readonly stableKey?: (value: unknown) => string;
   readonly compare?: (left: unknown, right: unknown) => number;
   readonly toScalar?: (value: unknown) => string | number | boolean | null;
+  readonly fromScalar?: (value: unknown) => unknown;
   readonly valueType?: Value;
 };
 
@@ -933,6 +934,18 @@ export type RuntimeConflictRow = {
   readonly values?: unknown;
   readonly detail?: unknown;
 };
+export type RuntimeHistoryRow = {
+  readonly id: string;
+  readonly runtime: string;
+  readonly documentId?: string;
+  readonly hash: string;
+  readonly actor?: string;
+  readonly message?: string;
+  readonly time?: number;
+  readonly deps?: readonly string[];
+  readonly heads?: readonly string[];
+  readonly detail?: unknown;
+};
 export type RuntimeObjectLocationRow = {
   readonly id: string;
   readonly runtime: string;
@@ -985,6 +998,7 @@ export type RuntimeSystemState = {
   readonly peers?: readonly RuntimePeerRow[];
   readonly sync?: readonly RuntimeSyncRow[];
   readonly conflicts?: readonly RuntimeConflictRow[];
+  readonly history?: readonly RuntimeHistoryRow[];
   readonly objectLocations?: readonly RuntimeObjectLocationRow[];
   readonly storage?: readonly RuntimeStorageRow[];
   readonly interests?: readonly RuntimeInterestRow[];
@@ -1085,6 +1099,25 @@ export const runtimeSystemRelations = {
     }),
     name: 'tarstate.runtime.conflicts'
   },
+  history: {
+    ...relation<RuntimeHistoryRow, 'id'>({
+      key: 'id',
+      fields: {
+        id: idField('tarstate.runtime.history'),
+        runtime: stringField(),
+        documentId: optional(stringField()),
+        hash: stringField(),
+        actor: optional(stringField()),
+        message: optional(stringField()),
+        time: optional(numberField()),
+        deps: optional(jsonField() as FieldSpec<readonly string[]>),
+        heads: optional(jsonField() as FieldSpec<readonly string[]>),
+        detail: optional(opaqueField<unknown>('runtime.history.detail'))
+      },
+      ephemeral: true
+    }),
+    name: 'tarstate.runtime.history'
+  },
   objectLocations: {
     ...relation<RuntimeObjectLocationRow, 'id'>({
       key: 'id',
@@ -1167,6 +1200,8 @@ function runtimeSystemRows(state: RuntimeSystemState, relationRef: RelationRef):
       return state.sync ?? [];
     case runtimeSystemRelations.conflicts.name:
       return state.conflicts ?? [];
+    case runtimeSystemRelations.history.name:
+      return state.history ?? [];
     case runtimeSystemRelations.objectLocations.name:
       return state.objectLocations ?? [];
     case runtimeSystemRelations.storage.name:
@@ -2023,6 +2058,13 @@ function transactionWritePatches(result: DbTransactionResult): readonly WritePat
 
 export type RelationRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
 type RelationFieldUpdateValue<Value> = Value | RowExprData<Value>;
+export type RelationNumericField<Relation extends RelationRef> =
+  string extends keyof RelationRow<Relation>
+    ? string
+    : {
+        readonly [Field in keyof RelationRow<Relation> & string]:
+          Exclude<RelationRow<Relation>[Field], null | undefined> extends number ? Field : never;
+      }[keyof RelationRow<Relation> & string];
 export type RelationRowUpdate<Relation extends RelationRef> = Partial<{
   readonly [Field in keyof RelationRow<Relation>]: RelationFieldUpdateValue<RelationRow<Relation>[Field]>;
 }>;
@@ -2037,6 +2079,7 @@ export type InsertPatch<Relation extends RelationRef = RelationRef> = { readonly
 export type InsertIgnorePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertIgnore'; readonly relation: Relation; readonly row: RelationRow<Relation> };
 export type InsertOrReplacePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertOrReplace'; readonly relation: Relation; readonly row: RelationRow<Relation> };
 export type UpdateByKeyPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'updateByKey'; readonly relation: Relation; readonly key: RelationKeyValue<Relation>; readonly changes: RelationRowUpdateInput<Relation> };
+export type IncrementByKeyPatch<Relation extends RelationRef = RelationRef> = { readonly op: 'incrementByKey'; readonly relation: Relation; readonly key: RelationKeyValue<Relation>; readonly field: RelationNumericField<Relation>; readonly amount: number };
 export type UpdatePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'update'; readonly relation: Relation; readonly predicate: PredicateData; readonly changes: RelationRowUpdateInput<Relation> };
 export type InsertOrMergeOptions<Relation extends RelationRef = RelationRef> = { readonly merge?: RelationMergeInput<Relation> };
 export type InsertOrMergePatch<Relation extends RelationRef = RelationRef> = { readonly op: 'insertOrMerge'; readonly relation: Relation; readonly row: RelationRow<Relation>; readonly merge?: RelationMergeInput<Relation> };
@@ -2059,6 +2102,7 @@ export type WritePatch<Relation extends RelationRef = RelationRef> =
   | InsertIgnorePatch<Relation>
   | InsertOrReplacePatch<Relation>
   | UpdateByKeyPatch<Relation>
+  | IncrementByKeyPatch<Relation>
   | UpdatePatch<Relation>
   | InsertOrMergePatch<Relation>
   | InsertOrUpdatePatch<Relation>
@@ -2072,6 +2116,7 @@ export type RelationWriter<Relation extends RelationRef> = {
   readonly insertIgnore: (row: RelationRow<Relation>) => InsertIgnorePatch<Relation>;
   readonly insertOrReplace: (row: RelationRow<Relation>) => InsertOrReplacePatch<Relation>;
   readonly updateByKey: (key: RelationKeyValue<Relation>, changes: RelationRowUpdateInput<Relation>) => UpdateByKeyPatch<Relation>;
+  readonly incrementByKey: (key: RelationKeyValue<Relation>, field: RelationNumericField<Relation>, amount: number) => IncrementByKeyPatch<Relation>;
   readonly update: (predicate: PredicateData, changes: RelationRowUpdateInput<Relation>) => UpdatePatch<Relation>;
   readonly insertOrMerge: (row: RelationRow<Relation>, options?: InsertOrMergeOptions<Relation>) => InsertOrMergePatch<Relation>;
   readonly insertOrUpdate: (row: RelationRow<Relation>, options?: InsertOrUpdateOptions<Relation>) => InsertOrUpdatePatch<Relation>;
@@ -2084,6 +2129,7 @@ export const insert = <Relation extends RelationRef>(relationRef: Relation, rowV
 export const insertIgnore = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>): InsertIgnorePatch<Relation> => ({ op: 'insertIgnore', relation: relationRef, row: rowValue });
 export const insertOrReplace = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>): InsertOrReplacePatch<Relation> => ({ op: 'insertOrReplace', relation: relationRef, row: rowValue });
 export const updateByKey = <Relation extends RelationRef>(relationRef: Relation, key: RelationKeyValue<Relation>, changes: RelationRowUpdateInput<Relation>): UpdateByKeyPatch<Relation> => ({ op: 'updateByKey', relation: relationRef, key, changes });
+export const incrementByKey = <Relation extends RelationRef>(relationRef: Relation, key: RelationKeyValue<Relation>, field: RelationNumericField<Relation>, amount: number): IncrementByKeyPatch<Relation> => ({ op: 'incrementByKey', relation: relationRef, key, field, amount });
 export const update = <Relation extends RelationRef>(relationRef: Relation, predicate: PredicateData, changes: RelationRowUpdateInput<Relation>): UpdatePatch<Relation> => ({ op: 'update', relation: relationRef, predicate, changes });
 export const insertOrMerge = <Relation extends RelationRef>(relationRef: Relation, rowValue: RelationRow<Relation>, options: InsertOrMergeOptions<Relation> = {}): InsertOrMergePatch<Relation> => ({
   op: 'insertOrMerge',
@@ -2117,6 +2163,7 @@ export const write = <Relation extends RelationRef>(relationRef: Relation): Rela
   insertIgnore: (rowValue) => insertIgnore(relationRef, rowValue),
   insertOrReplace: (rowValue) => insertOrReplace(relationRef, rowValue),
   updateByKey: (key, changes) => updateByKey(relationRef, key, changes),
+  incrementByKey: (key, field, amount) => incrementByKey(relationRef, key, field, amount),
   update: (predicate, changes) => update(relationRef, predicate, changes),
   insertOrMerge: (rowValue, options) => insertOrMerge(relationRef, rowValue, options),
   insertOrUpdate: (rowValue, options) => insertOrUpdate(relationRef, rowValue, options),
@@ -7784,6 +7831,7 @@ const WRITE_PATCH_OPS = new Set([
   'insertOrMerge',
   'insertOrUpdate',
   'updateByKey',
+  'incrementByKey',
   'update',
   'deleteByKey',
   'delete',
@@ -7841,9 +7889,19 @@ function validateWritePatchEnvelope(patch: unknown): readonly TarstateDiagnostic
       diagnostics.push(...prototypePollutionDiagnostics(patch.row, 'write patch row', patch, relationRef.name));
       break;
     case 'updateByKey':
+    case 'incrementByKey':
     case 'deleteByKey':
       diagnostics.push(...keyArityDiagnostics(relationRef, patch.key, patch));
-      if (op === 'updateByKey') diagnostics.push(...prototypePollutionDiagnostics(patch.changes, 'write patch changes', patch, relationRef.name));
+      if (op === 'updateByKey') {
+        diagnostics.push(...prototypePollutionDiagnostics(patch.changes, 'write patch changes', patch, relationRef.name));
+      } else if (op === 'incrementByKey') {
+        if (typeof patch.field !== 'string') {
+          diagnostics.push(writePatchInvalidDiagnostic('incrementByKey field must be a field name', patch, relationRef.name));
+        }
+        if (typeof patch.amount !== 'number' || !Number.isFinite(patch.amount)) {
+          diagnostics.push(writePatchInvalidDiagnostic('incrementByKey amount must be a finite number', patch, relationRef.name));
+        }
+      }
       break;
     case 'update':
       if (!isPredicateData(patch.predicate)) diagnostics.push(writePatchInvalidDiagnostic('write patch predicate must be a predicate expression', patch, relationRef.name));
@@ -8076,6 +8134,57 @@ function applyWritePatchToDb(dbValue: Db, patch: WritePatch, constraints: readon
           rows[indexValue] = next;
           added = [next];
         }
+      }
+      break;
+    }
+    case 'incrementByKey': {
+      const fieldName = patch.field as string;
+      const amount = patch.amount;
+      const indexValue = findIndexByKey(patch.key as RelationKeyInput);
+      if (indexValue === -1) {
+        diagnostics.push(rowMissingForIncrementDiagnostic(relationRef, patch.key, fieldName));
+        break;
+      }
+
+      const current = rows[indexValue] as Record<string, unknown>;
+      const fieldSpec = relationRef.fields[fieldName];
+      const currentValue = current[fieldName];
+
+      if (fieldSpec === undefined) {
+        diagnostics.push(incrementFieldInvalidDiagnostic(relationRef, fieldName, `relation "${relationRef.name}" does not define field "${fieldName}"`, fieldName));
+        break;
+      }
+      if (!Object.prototype.hasOwnProperty.call(current, fieldName) || currentValue === undefined) {
+        diagnostics.push(incrementFieldMissingDiagnostic(relationRef, fieldName));
+        break;
+      }
+      if (typeof currentValue !== 'number' || !Number.isFinite(currentValue)) {
+        diagnostics.push(incrementFieldInvalidDiagnostic(relationRef, fieldName, `relation "${relationRef.name}" field "${fieldName}" must contain a finite number before it can be incremented`, currentValue));
+        break;
+      }
+      if (typeof amount !== 'number' || !Number.isFinite(amount)) {
+        diagnostics.push(incrementFieldInvalidDiagnostic(relationRef, fieldName, `increment amount for relation "${relationRef.name}" field "${fieldName}" must be a finite number`, amount));
+        break;
+      }
+
+      const nextValue = currentValue + amount;
+      if (!Number.isFinite(nextValue)) {
+        diagnostics.push(incrementFieldInvalidDiagnostic(relationRef, fieldName, `increment result for relation "${relationRef.name}" field "${fieldName}" must be finite`, nextValue));
+        break;
+      }
+
+      const next = { ...current, [fieldName]: nextValue };
+      if (relationKeyFields(relationRef).includes(fieldName) && rowKey(relationRef, next) !== rowKey(relationRef, current)) {
+        diagnostics.push(incrementKeyFieldDiagnostic(relationRef, fieldName, next));
+        break;
+      }
+
+      const nextDiagnostics = validateRelationRow(relationRef, next);
+      diagnostics.push(...nextDiagnostics);
+      if (!nextDiagnostics.some(isErrorDiagnostic)) {
+        removed = [current];
+        rows[indexValue] = next;
+        added = [next];
       }
       break;
     }
@@ -8363,6 +8472,62 @@ function uniqueKeyDiagnostic(relationRef: RelationRef, rowValue: unknown): Tarst
     relation: relationRef.name,
     ...(keyFields.length === 1 ? { field: keyFields[0] } : {}),
     surface: 'write'
+  };
+}
+
+function rowMissingForIncrementDiagnostic(relationRef: RelationRef, key: unknown, fieldName: string): TarstateDiagnostic {
+  return {
+    code: 'row_invalid',
+    severity: 'error',
+    message: `relation "${relationRef.name}" does not contain a row for increment key ${relationKeyInputToKey(relationRef, key as RelationKeyInput)}`,
+    relation: relationRef.name,
+    field: fieldName,
+    surface: 'write',
+    detail: key
+  };
+}
+
+function incrementFieldMissingDiagnostic(relationRef: RelationRef, fieldName: string): TarstateDiagnostic {
+  return {
+    code: 'field_missing',
+    severity: 'error',
+    message: `relation "${relationRef.name}" row is missing numeric field "${fieldName}"`,
+    relation: relationRef.name,
+    field: fieldName,
+    surface: 'write'
+  };
+}
+
+function incrementFieldInvalidDiagnostic(
+  relationRef: RelationRef,
+  fieldName: string,
+  message: string,
+  detail: unknown
+): TarstateDiagnostic {
+  return {
+    code: 'field_invalid',
+    severity: 'error',
+    message,
+    relation: relationRef.name,
+    field: fieldName,
+    surface: 'write',
+    detail
+  };
+}
+
+function incrementKeyFieldDiagnostic(
+  relationRef: RelationRef,
+  fieldName: string,
+  rowValue: Record<string, unknown>
+): TarstateDiagnostic {
+  return {
+    code: 'field_invalid',
+    severity: 'error',
+    message: `incrementing relation "${relationRef.name}" key field "${fieldName}" would change row identity`,
+    relation: relationRef.name,
+    field: fieldName,
+    surface: 'write',
+    detail: rowValue
   };
 }
 

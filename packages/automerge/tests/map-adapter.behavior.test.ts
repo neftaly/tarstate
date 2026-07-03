@@ -1,5 +1,5 @@
 import * as Automerge from '@automerge/automerge';
-import { Repo, type DocHandle } from '@automerge/automerge-repo';
+import { Repo, type Chunk, type DocHandle, type StorageAdapterInterface, type StorageKey } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   as,
@@ -27,7 +27,7 @@ import {
   value,
   where
 } from '@tarstate/core';
-import { isRelationRuntime, runtimeSystemRelations, type RelationRuntime } from '@tarstate/core/adapter';
+import { isRelationRuntime, runtimeSystemRelations, type RelationRuntime, type RuntimeHistoryRow } from '@tarstate/core/adapter';
 import { evaluate, validateRelationRow } from '@tarstate/core/evaluate';
 import {
   anchoredPathField,
@@ -74,6 +74,7 @@ import {
   type AutomergeDocHandleAdapter,
   type AutomergeDocHandleRuntime,
   type AutomergeObjectLocation,
+  type AutomergeTextValue,
   type AutomergeMapAdapter,
   type AutomergeMapAdapterOptions,
   type AutomergeMapPath,
@@ -120,7 +121,7 @@ type AutomergeScalarDoc = {
   readonly notes: readonly {
     readonly id: string;
     readonly title: string;
-    readonly body: Automerge.ImmutableString;
+    readonly body: AutomergeTextValue;
     readonly views: Automerge.Counter;
     readonly bytes: Uint8Array;
     readonly publishedAt: Date;
@@ -176,6 +177,26 @@ const allMappings = defineWorkspaceRelations([
 const automergeScalarMapping = defineAutomergeScalarRelations([
   { relation: automergeScalarSchema.notes, path: ['notes'] }
 ]);
+
+function expectNativeScalarNote(
+  note: AutomergeScalarDoc['notes'][number] | undefined,
+  expected: {
+    readonly body: string;
+    readonly views: number;
+    readonly bytes: readonly number[];
+    readonly publishedAt: string;
+  }
+): void {
+  expect(note).toBeDefined();
+  expect(Automerge.isImmutableString(note?.body)).toBe(true);
+  expect(String(note?.body)).toBe(expected.body);
+  expect(Automerge.isCounter(note?.views)).toBe(true);
+  expect(Number(note?.views)).toBe(expected.views);
+  expect(note?.bytes).toBeInstanceOf(Uint8Array);
+  expect(Array.from(note?.bytes ?? [])).toEqual(expected.bytes);
+  expect(note?.publishedAt).toBeInstanceOf(Date);
+  expect(note?.publishedAt.toISOString()).toBe(expected.publishedAt);
+}
 
 describe('automerge map adapter', () => {
   it('preserves public exports and creates real source/adapter instances', async () => {
@@ -256,6 +277,190 @@ describe('automerge map adapter', () => {
     expect(store.query(runtimeSystemRelations.interests).rows).toEqual([]);
 
     store.close();
+  });
+
+  it('publishes Automerge history rows for active history interests', () => {
+    const changedAt = 1_783_036_800;
+    const doc = Automerge.change(workspaceDoc(), { message: 'rename task', time: changedAt }, (draft) => {
+      (draft.workspace.tasks[0] as { title: string }).title = 'Ready';
+    });
+    const runtime = createAutomergeMapRuntime({
+      doc,
+      relations: taskMapping,
+      runtimeId: 'workspace'
+    });
+    const store = createRuntimeStore({ runtime });
+
+    expect(runtime.source.rows(runtimeSystemRelations.history)).toEqual([]);
+
+    const view = store.view(from(runtimeSystemRelations.history));
+    const unsubscribe = view.subscribe(() => {});
+    const historyRows = store.query(runtimeSystemRelations.history).rows as readonly RuntimeHistoryRow[];
+
+    expect(historyRows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        runtime: 'workspace',
+        message: 'rename task',
+        time: changedAt,
+        actor: expect.any(String),
+        hash: expect.any(String),
+        deps: expect.any(Array),
+        detail: expect.objectContaining({
+          seq: expect.any(Number),
+          startOp: expect.any(Number),
+          opCount: expect.any(Number)
+        })
+      })
+    ]));
+    expect(historyRows.find((row) => row.message === 'rename task')?.hash).toEqual(expect.any(String));
+
+    unsubscribe();
+    expect(runtime.source.rows(runtimeSystemRelations.history)).toEqual([]);
+    store.close();
+  });
+
+  it('publishes mapped Automerge conflicts as runtime conflict rows', () => {
+    const base = workspaceDoc();
+    const left = Automerge.change(automergeFork(base), (draft) => {
+      (draft.workspace.tasks[0] as { title: string }).title = 'Left title';
+    });
+    const right = Automerge.change(automergeFork(base), (draft) => {
+      (draft.workspace.tasks[0] as { title: string }).title = 'Right title';
+    });
+    const callerConflict = {
+      id: 'caller:conflict',
+      runtime: 'caller',
+      path: 'caller.path',
+      conflictCount: 1
+    };
+    const runtime = createAutomergeMapRuntime({
+      doc: automergeMerge(left, right),
+      relations: taskMapping,
+      runtimeId: 'workspace',
+      system: { conflicts: [callerConflict] }
+    });
+    const conflicts = runtime.source.rows(runtimeSystemRelations.conflicts);
+
+    expect(conflicts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        runtime: 'workspace',
+        relation: 'tasks',
+        field: 'title',
+        conflictCount: 2,
+        values: expect.arrayContaining(['Left title', 'Right title']),
+        detail: expect.objectContaining({
+          key: 'task-1',
+          pathSegments: ['workspace', 'tasks', 0, 'title']
+        })
+      }),
+      callerConflict
+    ]));
+  });
+
+  it('publishes conservative repo-fed system rows for DocHandle runtimes', async () => {
+    const storage = new MemoryStorageAdapter();
+    const repo = new Repo({ peerId: 'peer-local' as never, storage });
+    const handle = repo.create<WorkspaceDoc>({
+      workspace: {
+        tasks: [{ id: 'task-1', title: 'Draft' }],
+        labelsById: {
+          'label-1': { id: 'label-1', name: 'Urgent' }
+        }
+      }
+    });
+    const remoteStorageId = 'storage-remote' as never;
+
+    repo.networkSubsystem.emit('peer', {
+      peerId: 'peer-remote' as never,
+      peerMetadata: { storageId: remoteStorageId, isEphemeral: true }
+    });
+    handle.setSyncInfo(remoteStorageId, {
+      lastHeads: ['remote-head'] as never,
+      lastSyncTimestamp: 123
+    });
+
+    const runtime = createAutomergeDocHandleRuntime({
+      repo,
+      handle,
+      relations: taskMapping,
+      runtimeId: 'workspace',
+      system: {
+        peers: [{
+          id: 'caller:peer',
+          runtime: 'caller',
+          peerId: 'caller-peer',
+          state: 'unknown'
+        }]
+      }
+    });
+
+    expect(runtime.source.rows(runtimeSystemRelations.peers)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'workspace:peer:peer-remote',
+        runtime: 'workspace',
+        peerId: 'peer-remote',
+        state: 'connected',
+        connected: true,
+        ephemeral: true
+      }),
+      expect.objectContaining({
+        id: 'caller:peer',
+        peerId: 'caller-peer'
+      })
+    ]));
+    expect(runtime.source.rows(runtimeSystemRelations.sync)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'workspace:sync:local-heads',
+        runtime: 'workspace',
+        documentId: String(handle.documentId),
+        state: 'synced',
+        localHeads: Automerge.getHeads(handle.doc())
+      }),
+      expect.objectContaining({
+        id: 'workspace:sync:remote:storage-remote',
+        runtime: 'workspace',
+        documentId: String(handle.documentId),
+        peerId: 'peer-remote',
+        storageId: 'storage-remote',
+        state: 'synced',
+        remoteHeads: ['remote-head'],
+        updatedAt: 123
+      })
+    ]));
+
+    const storageRows = runtime.source.rows(runtimeSystemRelations.storage) as readonly Record<string, unknown>[];
+    expect(storageRows).toHaveLength(1);
+    expect(storageRows[0]).toEqual(expect.objectContaining({
+      runtime: 'workspace',
+      storage: expect.any(String),
+      durability: 'durable'
+    }));
+    expect(['idle', 'synced']).toContain(storageRows[0]?.state);
+    expect(storageRows[0]).not.toHaveProperty('pendingWrites');
+    expect(storageRows[0]).not.toHaveProperty('lastFlushAt');
+
+    repo.emit('doc-metrics', {
+      type: 'doc-saved',
+      documentId: String(handle.documentId) as never,
+      durationMillis: 5,
+      sinceHeads: []
+    });
+
+    expect(runtime.source.rows(runtimeSystemRelations.storage)).toEqual([
+      expect.objectContaining({
+        runtime: 'workspace',
+        state: 'synced',
+        detail: expect.objectContaining({
+          lastCompleted: expect.objectContaining({
+            type: 'doc-saved',
+            documentId: String(handle.documentId)
+          })
+        })
+      })
+    ]);
+
+    runtime.close();
+    await repo.shutdown();
   });
 
   it('drops onDocChange from adapter options', () => {
@@ -382,6 +587,264 @@ describe('automerge map adapter', () => {
     expect(adapter.getDoc().notes[0]?.views).toBe(viewsBefore);
     expect(adapter.getDoc().notes[0]?.bytes).toBe(bytesBefore);
     expect(adapter.getDoc().notes[0]?.publishedAt).toBe(dateBefore);
+  });
+
+  it('encodes changed Automerge scalar field views back to native doc values', async () => {
+    const publishedAt = '2026-07-04T00:00:00.000Z';
+    const adapter = automergeMapAdapter({ doc: Automerge.from<AutomergeScalarDoc>({
+      notes: [
+        {
+          id: 'note-1',
+          title: 'Initial',
+          body: new Automerge.ImmutableString('hello'),
+          views: new Automerge.Counter(3),
+          bytes: new Uint8Array([1, 2, 255]),
+          publishedAt: new Date('2026-07-03T00:00:00.000Z')
+        }
+      ]
+    }), relations: automergeScalarMapping });
+
+    const updateResult = await adapter.target.apply([
+      write(automergeScalarSchema.notes).updateByKey('note-1', {
+        body: 'changed',
+        views: 9,
+        bytes: '0a0bff',
+        publishedAt
+      })
+    ]);
+
+    expect(updateResult).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(automergeScalarSchema.notes)[0]).toMatchObject({
+      body: 'changed',
+      views: 9,
+      bytes: '0a0bff',
+      publishedAt
+    });
+    expectNativeScalarNote(adapter.getDoc().notes[0], {
+      body: 'changed',
+      views: 9,
+      bytes: [10, 11, 255],
+      publishedAt
+    });
+  });
+
+  it('increments mapped Automerge counter fields with native Counter semantics', async () => {
+    const base = Automerge.from<AutomergeScalarDoc>({
+      notes: [
+        {
+          id: 'note-1',
+          title: 'Initial',
+          body: new Automerge.ImmutableString('hello'),
+          views: new Automerge.Counter(3),
+          bytes: new Uint8Array([1, 2, 255]),
+          publishedAt: new Date('2026-07-03T00:00:00.000Z')
+        }
+      ]
+    });
+    const concurrent = Automerge.change(Automerge.clone(base), (draft) => {
+      draft.notes[0]?.views.increment(2);
+    });
+    const adapter = automergeMapAdapter({ doc: base, relations: automergeScalarMapping });
+
+    const result = await adapter.target.apply([
+      write(automergeScalarSchema.notes).incrementByKey('note-1', 'views', 4)
+    ]);
+
+    expect(result).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(automergeScalarSchema.notes)[0]).toMatchObject({ views: 7 });
+    expect(Automerge.isCounter(adapter.getDoc().notes[0]?.views)).toBe(true);
+    expect(Number(adapter.getDoc().notes[0]?.views)).toBe(7);
+
+    const merged = Automerge.merge(adapter.getDoc(), concurrent);
+    expect(Automerge.isCounter(merged.notes[0]?.views)).toBe(true);
+    expect(Number(merged.notes[0]?.views)).toBe(9);
+  });
+
+  it('rejects increments for non-counter mapped fields', async () => {
+    const adapter = automergeMapAdapter({ doc: workspaceDoc([
+      { id: 'task-1', title: 'Draft', effort: 3 }
+    ]), relations: taskMapping });
+    const beforeDoc = adapter.getDoc();
+
+    const result = await adapter.target.apply([
+      write(schema.tasks).incrementByKey('task-1', 'effort', 2)
+    ]);
+
+    expect(result.status).toBe('rejected');
+    expect(result.applied).toBe(0);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'field_invalid', relation: 'tasks', field: 'effort' })
+    ]));
+    expect(adapter.getDoc()).toBe(beforeDoc);
+    expect(adapter.source.rows(schema.tasks)[0]).toMatchObject({ effort: 3 });
+  });
+
+  it('rejects counter increments when the mapped field is stored as a plain number', async () => {
+    const adapter = automergeMapAdapter({ doc: Automerge.from<AutomergeScalarDoc>({
+      notes: [
+        {
+          id: 'note-1',
+          title: 'Initial',
+          body: new Automerge.ImmutableString('hello'),
+          views: 3 as unknown as Automerge.Counter,
+          bytes: new Uint8Array([1, 2, 255]),
+          publishedAt: new Date('2026-07-03T00:00:00.000Z')
+        }
+      ]
+    }), relations: automergeScalarMapping });
+    const beforeDoc = adapter.getDoc();
+
+    const result = await adapter.target.apply([
+      write(automergeScalarSchema.notes).incrementByKey('note-1', 'views', 4)
+    ]);
+
+    expect(result.status).toBe('rejected');
+    expect(result.applied).toBe(0);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'field_invalid', relation: 'notes', field: 'views' })
+    ]));
+    expect(adapter.getDoc()).toBe(beforeDoc);
+    expect(Automerge.isCounter(adapter.getDoc().notes[0]?.views)).toBe(false);
+    expect(adapter.source.rows(automergeScalarSchema.notes)[0]).toMatchObject({ views: 3 });
+  });
+
+  it('updates existing plain-string text fields without replacing them with ImmutableString', async () => {
+    const adapter = automergeMapAdapter({ doc: Automerge.from<AutomergeScalarDoc>({
+      notes: [
+        {
+          id: 'note-1',
+          title: 'Initial',
+          body: 'hello',
+          views: new Automerge.Counter(3),
+          bytes: new Uint8Array([1, 2, 255]),
+          publishedAt: new Date('2026-07-03T00:00:00.000Z')
+        }
+      ]
+    }), relations: automergeScalarMapping });
+
+    const updateResult = await adapter.target.apply([
+      write(automergeScalarSchema.notes).updateByKey('note-1', { body: 'hullo' })
+    ]);
+
+    expect(updateResult).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(adapter.source.rows(automergeScalarSchema.notes)[0]).toMatchObject({ body: 'hullo' });
+    expect(adapter.getDoc().notes[0]?.body).toBe('hullo');
+    expect(Automerge.isImmutableString(adapter.getDoc().notes[0]?.body)).toBe(false);
+  });
+
+  it('keeps replacement encoding for ImmutableString because updateText cannot target immutable scalar text', async () => {
+    const doc = Automerge.from<AutomergeScalarDoc>({
+      notes: [
+        {
+          id: 'note-1',
+          title: 'Initial',
+          body: new Automerge.ImmutableString('hello'),
+          views: new Automerge.Counter(3),
+          bytes: new Uint8Array([1, 2, 255]),
+          publishedAt: new Date('2026-07-03T00:00:00.000Z')
+        }
+      ]
+    });
+    const bodyBefore = doc.notes[0]?.body;
+
+    expect(() => Automerge.change(doc, (draft) => {
+      Automerge.updateText(draft, ['notes', 0, 'body'], 'hullo');
+    })).toThrow(/path did not refer to an object/u);
+
+    const adapter = automergeMapAdapter({ doc, relations: automergeScalarMapping });
+    const updateResult = await adapter.target.apply([
+      write(automergeScalarSchema.notes).updateByKey('note-1', { body: 'hullo' })
+    ]);
+
+    expect(updateResult).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(String(adapter.getDoc().notes[0]?.body)).toBe('hullo');
+    expect(Automerge.isImmutableString(adapter.getDoc().notes[0]?.body)).toBe(true);
+    expect(adapter.getDoc().notes[0]?.body).not.toBe(bodyBefore);
+  });
+
+  it('encodes inserted and replaced Automerge scalar field rows back to native doc values', async () => {
+    const insertedAt = '2026-07-04T01:00:00.000Z';
+    const insertAdapter = automergeMapAdapter({
+      doc: Automerge.from<AutomergeScalarDoc>({ notes: [] }),
+      relations: automergeScalarMapping
+    });
+
+    const insertResult = await insertAdapter.target.apply([
+      write(automergeScalarSchema.notes).insertOrReplace({
+        id: 'note-1',
+        title: 'Inserted',
+        body: 'inserted',
+        views: 4,
+        bytes: '010203',
+        publishedAt: insertedAt
+      })
+    ]);
+
+    expect(insertResult).toMatchObject({ status: 'accepted', applied: 1 });
+    expectNativeScalarNote(insertAdapter.getDoc().notes[0], {
+      body: 'inserted',
+      views: 4,
+      bytes: [1, 2, 3],
+      publishedAt: insertedAt
+    });
+
+    const replacedAt = '2026-07-04T02:00:00.000Z';
+    const replaceAdapter = automergeMapAdapter({
+      doc: Automerge.from<AutomergeScalarDoc>({ notes: [] }),
+      relations: automergeScalarMapping
+    });
+
+    const replaceResult = await replaceAdapter.target.apply([
+      write(automergeScalarSchema.notes).replaceAll([
+        {
+          id: 'note-1',
+          title: 'Replaced',
+          body: 'replaced',
+          views: 7,
+          bytes: '0c0d',
+          publishedAt: replacedAt
+        }
+      ])
+    ]);
+
+    expect(replaceResult).toMatchObject({ status: 'accepted', applied: 1 });
+    expectNativeScalarNote(replaceAdapter.getDoc().notes[0], {
+      body: 'replaced',
+      views: 7,
+      bytes: [12, 13],
+      publishedAt: replacedAt
+    });
+  });
+
+  it('rejects malformed Automerge scalar relation writes before encoding', async () => {
+    const adapter = automergeMapAdapter({ doc: Automerge.from<AutomergeScalarDoc>({
+      notes: [
+        {
+          id: 'note-1',
+          title: 'Initial',
+          body: new Automerge.ImmutableString('hello'),
+          views: new Automerge.Counter(3),
+          bytes: new Uint8Array([1, 2, 255]),
+          publishedAt: new Date('2026-07-03T00:00:00.000Z')
+        }
+      ]
+    }), relations: automergeScalarMapping });
+    const beforeDoc = adapter.getDoc();
+
+    const result = await adapter.target.apply([
+      write(automergeScalarSchema.notes).updateByKey('note-1', {
+        bytes: 'xyz',
+        publishedAt: 'not-a-date'
+      })
+    ]);
+
+    expect(result.status).toBe('rejected');
+    expect(result.applied).toBe(0);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'field_invalid', field: 'bytes' }),
+      expect.objectContaining({ code: 'field_invalid', field: 'publishedAt' })
+    ]));
+    expect(adapter.getDoc()).toBe(beforeDoc);
   });
 
   it('pushes where evaluation through Automerge source lookup hooks', () => {
@@ -1290,6 +1753,46 @@ describe('automerge map adapter', () => {
       .returns.toMatchTypeOf<readonly [Automerge.Heads, ...number[]] | undefined>();
   });
 });
+
+class MemoryStorageAdapter implements StorageAdapterInterface {
+  readonly #values = new Map<string, Uint8Array>();
+
+  async load(key: StorageKey): Promise<Uint8Array | undefined> {
+    return this.#values.get(this.#key(key));
+  }
+
+  async save(key: StorageKey, data: Uint8Array): Promise<void> {
+    this.#values.set(this.#key(key), data);
+  }
+
+  async remove(key: StorageKey): Promise<void> {
+    this.#values.delete(this.#key(key));
+  }
+
+  async loadRange(keyPrefix: StorageKey): Promise<Chunk[]> {
+    const prefix = this.#key(keyPrefix);
+    const chunks: Chunk[] = [];
+
+    for (const [key, data] of this.#values) {
+      const segments = key.split('\u0000');
+      if (segments.slice(0, keyPrefix.length).join('\u0000') === prefix) chunks.push({ key: segments, data });
+    }
+
+    return chunks;
+  }
+
+  async removeRange(keyPrefix: StorageKey): Promise<void> {
+    const prefix = this.#key(keyPrefix);
+
+    for (const key of this.#values.keys()) {
+      if (key === prefix || key.startsWith(`${prefix}\u0000`)) this.#values.delete(key);
+    }
+  }
+
+  #key(key: StorageKey): string {
+    return key.join('\u0000');
+  }
+}
 
 function workspaceDoc(tasks: readonly TaskRow[] = [{ id: 'task-1', title: 'Draft' }]): Automerge.Doc<WorkspaceDoc> {
   const doc: Automerge.Doc<WorkspaceDoc> = Automerge.from({

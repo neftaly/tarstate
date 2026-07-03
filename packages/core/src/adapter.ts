@@ -36,6 +36,7 @@ export type {
   RelationSource,
   RuntimeConflictRow,
   RuntimeDiagnosticRow,
+  RuntimeHistoryRow,
   RuntimeInterestRow,
   RuntimeInterestState,
   RuntimeObjectLocationRow,

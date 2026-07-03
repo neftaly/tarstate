@@ -6,9 +6,9 @@ and writes go through the canonical `Store` API from `@tarstate/core/store`.
 
 Primary API:
 
-- `TarstateProvider` accepts either a core `store` or provider-owned `db` seed
-  data. When no store is provided, React creates a core `Store` with
-  `createStore(db)`.
+- `TarstateProvider` accepts either a core `store` or provider-owned
+  `initialDb` seed data. When no store is provided, React creates a core
+  `Store` with `createStore(initialDb)`.
 - `useTarstateStore()` returns the active core `Store`.
 - `useTarstateSnapshot()` subscribes with `store.subscribe` and returns the
   current core `StoreSnapshot` from `store.getSnapshot`.
@@ -28,8 +28,8 @@ Primary API:
 Core materialization helpers retain their core shapes. React keeps these thin:
 materialized rows, commit diagnostics, and DB snapshots pass through as core
 data rather than React-specific models. Materialize seed data with core helpers
-before passing it to `createStore` or `TarstateProvider`, then read the query
-with `useView`.
+before passing it to `createStore` or `TarstateProvider` as `initialDb`, then
+read the query with `useView`.
 
 Keep schemas, queries, and write patch builders in plain TypeScript modules so
 they can be tested directly against `@tarstate/core` without rendering React.

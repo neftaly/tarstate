@@ -36,6 +36,11 @@ The core API is stabilizing around a Relic-shaped split:
   relation ownership with `target.relationNames` or `target.ownsRelation`;
   composed runtimes use that target metadata before treating read-side
   `source.relationNames` as a compatibility fallback.
+  Adapter-specific runtimes may further narrow writable operations. For example,
+  the Automerge presence runtime is writable only when constructed with a
+  `localPeerId`, only writes rows for that local peer, and rejects predicate
+  `update`/`delete` patches through diagnostics because presence writes must be
+  key- or row-based.
 - `write` defines the typed mutation vocabulary, including insert/insert-ignore,
   `insertOrReplace`, key-scoped `updateByKey`/`deleteByKey`, predicate
   `update`/`deleteRows`, full-row `deleteExact`, `replaceAll`,

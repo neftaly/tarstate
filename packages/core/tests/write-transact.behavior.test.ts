@@ -11,9 +11,10 @@ import {
 } from '@tarstate/core/db';
 import { mat } from '@tarstate/core/materialization';
 import { any as anyAggregate, asc, call, count, eq, field, from, hostFn, pipe, project, sort, value } from '@tarstate/core/query';
-import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
+import { defineSchema, idField, numberField, relation, stringField } from '@tarstate/core/schema';
 import {
   deleteExact,
+  incrementByKey,
   insert,
   insertIgnore,
   insertOrMerge,
@@ -49,6 +50,21 @@ const contactSchema = defineSchema({
       id: idField('contact'),
       email: stringField(),
       name: stringField()
+    }
+  })
+});
+
+type CounterMetric = {
+  readonly id: number;
+  readonly value: number;
+};
+
+const counterMetricSchema = defineSchema({
+  metrics: relation<CounterMetric>({
+    key: 'id',
+    fields: {
+      id: numberField(),
+      value: numberField()
     }
   })
 });
@@ -168,6 +184,83 @@ describe('write and transaction behavior', () => {
     // @ts-expect-error aggregate expressions cannot be evaluated in a row update context.
     const invalidAnyUpdate = updateByKey(schema.entries, 'e1', { posted: anyAggregate(eq(entry.posted, value(true))) });
     void invalidAnyUpdate;
+  });
+
+  it('increments finite numeric fields by key through transaction helpers', () => {
+    const next = transact(
+      makeDb(),
+      incrementByKey(schema.entries, 'e1', 'amount', 5),
+      write(schema.entries).incrementByKey('e1', 'amount', -2)
+    );
+
+    expect(row(next, schema.entries, 'e1')?.amount).toBe(123);
+  });
+
+  it('rejects invalid numeric increments with diagnostics and leaves the input db unchanged', () => {
+    const db = makeDb();
+
+    const missingRow = tryTransact(db, incrementByKey(schema.entries, 'missing', 'amount', 1));
+    expect(missingRow).toEqual(expect.objectContaining({
+      committed: false,
+      applied: 0,
+      db
+    }));
+    expect(missingRow.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'row_invalid', relation: 'entries', field: 'amount' })
+    ]));
+
+    const missingField = tryTransact(db, {
+      op: 'incrementByKey',
+      relation: schema.entries,
+      key: 'e1',
+      field: 'missing',
+      amount: 1
+    } as WritePatch);
+    expect(missingField.committed).toBe(false);
+    expect(missingField.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'field_invalid', relation: 'entries', field: 'missing' })
+    ]));
+
+    const nonNumberField = tryTransact(db, {
+      op: 'incrementByKey',
+      relation: schema.entries,
+      key: 'e1',
+      field: 'memo',
+      amount: 1
+    } as WritePatch);
+    expect(nonNumberField.committed).toBe(false);
+    expect(nonNumberField.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'field_invalid', relation: 'entries', field: 'memo' })
+    ]));
+
+    const nonFiniteAmount = tryTransact(db, incrementByKey(schema.entries, 'e1', 'amount', Number.POSITIVE_INFINITY));
+    expect(nonFiniteAmount.committed).toBe(false);
+    expect(nonFiniteAmount.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'write_patch_invalid', relation: 'entries' })
+    ]));
+
+    const nonFiniteResultDb = createDb({
+      entries: [{ id: 'max', accountId: 'cash', amount: Number.MAX_VALUE, posted: true }]
+    });
+    const nonFiniteResult = tryTransact(
+      nonFiniteResultDb,
+      incrementByKey(schema.entries, 'max', 'amount', Number.MAX_VALUE)
+    );
+    expect(nonFiniteResult.committed).toBe(false);
+    expect(nonFiniteResult.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'field_invalid', relation: 'entries', field: 'amount' })
+    ]));
+    expect(row(nonFiniteResultDb, schema.entries, 'max')?.amount).toBe(Number.MAX_VALUE);
+
+    const numericKeyDb = createDb({ metrics: [{ id: 1, value: 10 }] });
+    const keyIncrement = tryTransact(numericKeyDb, incrementByKey(counterMetricSchema.metrics, 1, 'id', 1));
+    expect(keyIncrement.committed).toBe(false);
+    expect(keyIncrement.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'field_invalid', relation: 'metrics', field: 'id' })
+    ]));
+    expect(row(numericKeyDb, counterMetricSchema.metrics, 1)).toEqual({ id: 1, value: 10 });
+
+    expect(row(db, schema.entries, 'e1')?.amount).toBe(120);
   });
 
   it('applies predicate updates, exact deletes, and relation replacement writes', () => {

@@ -1,11 +1,15 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
+  incrementByKey as rootIncrementByKey,
   index as rootMaterializedIndex,
   runtimeSystemRelations,
   runtimeSystemSource,
+  type IncrementByKeyPatch as RootIncrementByKeyPatch,
+  type RuntimeHistoryRow,
   type RuntimeObjectLocationRow,
   type RuntimeSystemState,
   type MaterializedIndex as RootMaterializedIndex,
+  type RelationNumericField as RootRelationNumericField,
   type StoreCommitEffects as RootStoreCommitEffects,
   type StoreCommitSnapshot as RootStoreCommitSnapshot,
   type StoreSnapshot as RootStoreSnapshot
@@ -117,8 +121,12 @@ import {
 } from '@tarstate/core/store';
 import {
   deleteExact,
+  incrementByKey,
   insert,
   seed,
+  write,
+  type IncrementByKeyPatch,
+  type RelationNumericField,
   type SchemaSeedInput,
   type SchemaSeedPatches
 } from '@tarstate/core/write';
@@ -223,6 +231,18 @@ describe('public API contracts', () => {
       relation: 'entries',
       key: 'entry-1'
     } satisfies RuntimeObjectLocationRow;
+    const history = {
+      id: 'runtime:history:hash-1',
+      runtime: 'runtime',
+      documentId: 'document-1',
+      hash: 'hash-1',
+      actor: 'actor-1',
+      message: 'created entry',
+      time: 1_783_036_800,
+      deps: [],
+      heads: ['hash-1'],
+      detail: { seq: 1 }
+    } satisfies RuntimeHistoryRow;
     const state = {
       sources: [{
         id: 'runtime:source:storage',
@@ -244,14 +264,18 @@ describe('public API contracts', () => {
         relationNames: ['entries'],
         subscriberCount: 1
       }],
+      history: [history],
       objectLocations: [objectLocation]
     } satisfies RuntimeSystemState;
     const source = runtimeSystemSource(state);
 
     expect(runtimeSystemRelations.sources.name).toBe('tarstate.runtime.sources');
     expect(runtimeSystemRelations.diagnostics.ephemeral).toBe(true);
+    expect(runtimeSystemRelations.history.name).toBe('tarstate.runtime.history');
     expect(adapterApi.runtimeSystemRelations.objectLocations.name).toBe('tarstate.runtime.objectLocations');
     expect(runtimeSystemRelations.objectLocations.key).toBe('id');
+    expect(adapterApi.runtimeSystemRelations.history.key).toBe('id');
+    expectTypeOf<typeof history>().toMatchTypeOf<RuntimeHistoryRow>();
     expectTypeOf<typeof objectLocation>().toMatchTypeOf<RuntimeObjectLocationRow>();
     expect(source.relationNames).toEqual([
       'tarstate.runtime.sources',
@@ -259,12 +283,14 @@ describe('public API contracts', () => {
       'tarstate.runtime.peers',
       'tarstate.runtime.sync',
       'tarstate.runtime.conflicts',
+      'tarstate.runtime.history',
       'tarstate.runtime.objectLocations',
       'tarstate.runtime.storage',
       'tarstate.runtime.interests'
     ]);
     expect(source.rows(runtimeSystemRelations.sources)).toEqual(state.sources);
     expect(source.rows(runtimeSystemRelations.interests)).toEqual(state.interests);
+    expect(source.rows(runtimeSystemRelations.history)).toEqual(state.history);
     expect(source.rows(runtimeSystemRelations.objectLocations)).toEqual(state.objectLocations);
     expect(source.rows(runtimeSystemRelations.diagnostics)).toEqual([
       expect.objectContaining({
@@ -374,10 +400,18 @@ describe('public API contracts', () => {
     const readById = () => row(openingDb, keyedSchema.byId, 'entry-a');
     const readByTenantAndId = () => row(openingDb, keyedSchema.byTenantAndId, ['acme', 'entry-a'] as const);
     const hasById = () => exists(openingDb, keyedSchema.byId, 'entry-a');
+    const incrementAmount = () => incrementByKey(keyedSchema.byId, 'entry-a', 'amount', 2);
+    const rootIncrementAmount = () => rootIncrementByKey(keyedSchema.byId, 'entry-a', 'amount', 2);
+    const writerIncrementAmount = () => write(keyedSchema.byTenantAndId).incrementByKey(['acme', 'entry-a'] as const, 'amount', 2);
 
     expectTypeOf<ReturnType<typeof readById>>().toEqualTypeOf<KeyedEntry | undefined>();
     expectTypeOf<ReturnType<typeof readByTenantAndId>>().toEqualTypeOf<TenantEntry | undefined>();
     expectTypeOf<ReturnType<typeof hasById>>().toEqualTypeOf<boolean>();
+    expectTypeOf<ReturnType<typeof incrementAmount>>().toEqualTypeOf<IncrementByKeyPatch<typeof keyedSchema.byId>>();
+    expectTypeOf<ReturnType<typeof rootIncrementAmount>>().toEqualTypeOf<RootIncrementByKeyPatch<typeof keyedSchema.byId>>();
+    expectTypeOf<ReturnType<typeof rootIncrementAmount>>().toEqualTypeOf<ReturnType<typeof incrementAmount>>();
+    expectTypeOf<ReturnType<typeof writerIncrementAmount>>().toEqualTypeOf<IncrementByKeyPatch<typeof keyedSchema.byTenantAndId>>();
+    expectTypeOf<RootRelationNumericField<typeof keyedSchema.byId>>().toEqualTypeOf<RelationNumericField<typeof keyedSchema.byId>>();
 
     const invalidReadById = () =>
       // @ts-expect-error row keys must match the relation key field type.
@@ -391,10 +425,29 @@ describe('public API contracts', () => {
     const invalidCompositeExists = () =>
       // @ts-expect-error composite key component types follow row fields.
       exists(openingDb, keyedSchema.byTenantAndId, ['acme', 1] as const);
+    const invalidIncrementKey = () =>
+      // @ts-expect-error incrementByKey keys must match relation key metadata.
+      incrementByKey(keyedSchema.byId, 1, 'amount', 2);
+    const invalidRootIncrementField = () =>
+      // @ts-expect-error root incrementByKey fields must be numeric relation fields.
+      rootIncrementByKey(keyedSchema.byTenantAndId, ['acme', 'entry-a'] as const, 'id', 2);
+    const invalidIncrementField = () =>
+      // @ts-expect-error incrementByKey fields must be numeric relation fields.
+      incrementByKey(keyedSchema.byTenantAndId, ['acme', 'entry-a'] as const, 'id', 2);
+    const invalidIncrementAmount = () =>
+      // @ts-expect-error incrementByKey amount must be numeric.
+      write(keyedSchema.byId).incrementByKey('entry-a', 'amount', '2');
     void invalidReadById;
     void invalidHasById;
     void invalidCompositeRead;
     void invalidCompositeExists;
+    void incrementAmount;
+    void rootIncrementAmount;
+    void writerIncrementAmount;
+    void invalidIncrementKey;
+    void invalidRootIncrementField;
+    void invalidIncrementField;
+    void invalidIncrementAmount;
   });
 
   it('supports custom and opaque field specs without making them stringly', () => {

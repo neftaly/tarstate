@@ -369,6 +369,8 @@ function applyPresencePatch<State extends PresenceState>(
       options.presence.broadcast(key.channel, update[options.fields.value] as State[keyof State]);
       return accepted(true);
     }
+    case 'incrementByKey':
+      return rejected(unsupportedWritePatchDiagnostic(patch.relation.name, patch.op));
     case 'deleteByKey': {
       const key = presenceKeyFromPatchKey(options.relation, options.fields, patch.key);
       if (key === undefined) return rejected(rowKeyDiagnostic(patch.relation.name, patch.key));
@@ -607,6 +609,16 @@ function unsupportedPredicateDiagnostic(relation: string): TarstateDiagnostic {
     relation,
     surface: 'automergePresenceRuntime',
     message: `Presence runtime only supports key and row based writes for relation "${relation}"`
+  };
+}
+
+function unsupportedWritePatchDiagnostic(relation: string, op: string): TarstateDiagnostic {
+  return {
+    code: 'runtime_unsupported',
+    severity: 'warning',
+    relation,
+    surface: 'automergePresenceRuntime',
+    message: `Presence runtime cannot apply write patch op "${op}"`
   };
 }
 

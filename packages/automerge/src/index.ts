@@ -1,7 +1,12 @@
 import * as Automerge from '@automerge/automerge';
-import type { DocHandle } from '@automerge/automerge-repo';
+import type {
+  DocHandle,
+  DocHandleRemoteHeadsPayload,
+  PeerMetadata,
+  Repo,
+  StorageId
+} from '@automerge/automerge-repo';
 import {
-  composeSources,
   composeRelationRuntimes,
   type AdapterSnapshot,
   type AdapterSource,
@@ -12,8 +17,13 @@ import {
   type RelationPatchTarget,
   type RelationRangeLookup,
   type RelationRuntime,
+  type RuntimeConflictRow,
+  type RuntimeHistoryRow,
   type RuntimeInterestRow,
   type RuntimeObjectLocationRow,
+  type RuntimePeerRow,
+  type RuntimeStorageRow,
+  type RuntimeSyncRow,
   type RuntimeSystemState,
   runtimeSystemRelationList,
   runtimeSystemSource,
@@ -74,6 +84,57 @@ export type AutomergeCounterValue = number | Automerge.Counter;
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 
+const isHexString = (value: unknown): value is string =>
+  typeof value === 'string' && value.length % 2 === 0 && /^[0-9a-f]*$/iu.test(value);
+
+const hexToBytes = (value: unknown): Uint8Array => {
+  if (value instanceof Uint8Array) return value;
+  if (!isHexString(value)) throw new TypeError('Automerge bytes fields must be encoded as even-length hex strings');
+
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < value.length; index += 2) {
+    bytes[index / 2] = Number.parseInt(value.slice(index, index + 2), 16);
+  }
+  return bytes;
+};
+
+const bytesScalar = (value: unknown): string =>
+  value instanceof Uint8Array ? bytesToHex(value) : isHexString(value) ? value.toLowerCase() : '';
+
+const bytesValue = (value: unknown): Uint8Array | undefined =>
+  value instanceof Uint8Array ? value : isHexString(value) ? hexToBytes(value) : undefined;
+
+const isValidDateScalar = (value: unknown): value is string => {
+  if (typeof value !== 'string') return false;
+  const time = Date.parse(value);
+  return Number.isFinite(time);
+};
+
+const scalarToDate = (value: unknown): Date => {
+  if (value instanceof Date && !Number.isNaN(value.valueOf())) return value;
+  if (!isValidDateScalar(value)) throw new TypeError('Automerge date fields must be valid date strings');
+
+  return new Date(value);
+};
+
+const dateTime = (value: unknown): number | undefined => {
+  if (value instanceof Date && !Number.isNaN(value.valueOf())) return value.getTime();
+  if (isValidDateScalar(value)) return Date.parse(value);
+  return undefined;
+};
+
+const dateScalar = (value: unknown): string => {
+  const time = dateTime(value);
+  return time === undefined ? '' : new Date(time).toISOString();
+};
+
+const scalarToCounter = (value: unknown): Automerge.Counter => {
+  if (Automerge.isCounter(value)) return value;
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) throw new TypeError('Automerge counter fields must be finite numbers');
+  return new Automerge.Counter(numberValue);
+};
+
 const compareByteArrays = (left: Uint8Array, right: Uint8Array): number => {
   const length = Math.min(left.length, right.length);
   for (let index = 0; index < length; index += 1) {
@@ -93,6 +154,9 @@ export function automergeTextField(
     validate: (value): value is unknown =>
       typeof value === 'string' || Automerge.isImmutableString(value),
     toScalar: (value) => String(value),
+    fromScalar: (value) => Automerge.isImmutableString(value)
+      ? value
+      : new Automerge.ImmutableString(String(value)),
     stableKey: (value) => String(value),
     compare: (left, right) => String(left).localeCompare(String(right)),
     ...options
@@ -106,8 +170,9 @@ export function automergeCounterField(
     kind: 'automerge.counter',
     description: 'an Automerge counter value',
     validate: (value): value is unknown =>
-      typeof value === 'number' || Automerge.isCounter(value),
+      typeof value === 'number' && Number.isFinite(value) || Automerge.isCounter(value),
     toScalar: (value) => Number(value),
+    fromScalar: scalarToCounter,
     stableKey: (value) => String(Number(value)),
     compare: (left, right) => Number(left) - Number(right),
     ...options
@@ -120,10 +185,15 @@ export function automergeBytesField(
   return customScalarField<string>({
     kind: 'automerge.bytes',
     description: 'an Automerge bytes value',
-    validate: (value): value is unknown => value instanceof Uint8Array,
-    toScalar: (value) => value instanceof Uint8Array ? bytesToHex(value) : '',
-    stableKey: (value) => value instanceof Uint8Array ? bytesToHex(value) : '',
-    compare: (left, right) => left instanceof Uint8Array && right instanceof Uint8Array ? compareByteArrays(left, right) : 0,
+    validate: (value): value is unknown => value instanceof Uint8Array || isHexString(value),
+    toScalar: bytesScalar,
+    fromScalar: hexToBytes,
+    stableKey: bytesScalar,
+    compare: (left, right) => {
+      const leftBytes = bytesValue(left);
+      const rightBytes = bytesValue(right);
+      return leftBytes !== undefined && rightBytes !== undefined ? compareByteArrays(leftBytes, rightBytes) : compareValues(left, right);
+    },
     ...options
   });
 }
@@ -134,10 +204,16 @@ export function automergeDateField(
   return customScalarField<string>({
     kind: 'automerge.date',
     description: 'an Automerge date value',
-    validate: (value): value is unknown => value instanceof Date && !Number.isNaN(value.valueOf()),
-    toScalar: (value) => value instanceof Date && !Number.isNaN(value.valueOf()) ? value.toISOString() : '',
-    stableKey: (value) => value instanceof Date ? value.toISOString() : '',
-    compare: (left, right) => left instanceof Date && right instanceof Date ? left.getTime() - right.getTime() : 0,
+    validate: (value): value is unknown =>
+      (value instanceof Date && !Number.isNaN(value.valueOf())) || isValidDateScalar(value),
+    toScalar: dateScalar,
+    fromScalar: scalarToDate,
+    stableKey: dateScalar,
+    compare: (left, right) => {
+      const leftTime = dateTime(left);
+      const rightTime = dateTime(right);
+      return leftTime !== undefined && rightTime !== undefined ? leftTime - rightTime : compareValues(left, right);
+    },
     ...options
   });
 }
@@ -192,6 +268,7 @@ export type AutomergeDocHandleRuntimeOptions<
   DocumentShape extends object = Record<string, unknown>
 > = Omit<AutomergeMapAdapterOptions<DocumentShape>, 'doc'> & {
   readonly handle: DocHandle<DocumentShape>;
+  readonly repo?: Repo;
 };
 
 export type AutomergeMapSourceOptions<
@@ -307,8 +384,14 @@ type RowPlan = {
   readonly mapping: AnyMapRelation;
   readonly kind: StorageKind;
   readonly before: readonly Row[];
+  readonly nativeCounterIncrements: NativeCounterIncrement[];
   rows: readonly Row[];
   changed: boolean;
+};
+type NativeCounterIncrement = {
+  readonly rowKey: string;
+  readonly field: string;
+  amount: number;
 };
 type RowPlanResult =
   | { readonly plan: RowPlan; readonly diagnostics: readonly [] }
@@ -346,6 +429,12 @@ type AutomergeDocumentDriver<DocumentShape extends object> = {
   readonly subscribe?: (listener: () => void) => () => void;
   readonly notifyAfterChange: boolean;
 };
+type AutomergeMapAdapterRuntimeOptions<
+  DocumentShape extends object = Record<string, unknown>
+> = Omit<AutomergeMapAdapterOptions<DocumentShape>, 'doc'> & {
+  readonly handle?: DocHandle<DocumentShape>;
+  readonly repo?: Repo;
+};
 type AutomergeObjectLocationSnapshot = {
   readonly heads: Automerge.Heads;
   readonly locations: readonly AutomergeObjectLocation[];
@@ -354,6 +443,19 @@ type AutomergeObjectLocationSnapshot = {
 };
 type AutomergeObjectLocationSnapshotCache = {
   readonly current: () => AutomergeObjectLocationSnapshot;
+};
+type AutomergeRepoSystemState = {
+  readonly state: () => RuntimeSystemState;
+  readonly close: () => void;
+};
+type AutomergeRepoStorageMetric = {
+  readonly type: 'doc-loaded' | 'doc-saved' | 'doc-compacted';
+  readonly documentId: string;
+  readonly durationMillis?: number;
+  readonly numOps?: number;
+  readonly numChanges?: number;
+  readonly sinceHeads?: readonly string[];
+  readonly savedHeads?: readonly string[];
 };
 
 export function defineAutomergeMapRelations<DocumentShape extends object>() {
@@ -496,13 +598,27 @@ export function automergeObjectLocations<DocumentShape extends object>(
 function createAutomergeMapAdapter<
   DocumentShape extends object = Record<string, unknown>
 >(
-  options: Omit<AutomergeMapAdapterOptions<DocumentShape>, 'doc'>,
+  options: AutomergeMapAdapterRuntimeOptions<DocumentShape>,
   driver: AutomergeDocumentDriver<DocumentShape>
 ): AutomergeMapAdapter<DocumentShape> & { readonly close: () => void } {
   const listeners = new Set<() => void>();
   const interests = new Map<string, RuntimeInterestRow>();
   const dataSource = createAutomergeMapSource(driver.getDoc, options.relations);
   const runtimeId = options.runtimeId ?? 'automergeMapRuntime';
+  let closed = false;
+  const notify = () => {
+    if (closed) return;
+    for (const listener of listeners) listener();
+  };
+  const repoSystem = options.repo === undefined || options.handle === undefined
+    ? undefined
+    : createAutomergeRepoSystemState({
+      repo: options.repo,
+      handle: options.handle,
+      runtimeId,
+      getDoc: driver.getDoc,
+      notify
+    });
   const objectLocationCache = createObjectLocationSnapshotCache(
     driver.getDoc,
     options.relations,
@@ -515,15 +631,11 @@ function createAutomergeMapAdapter<
     runtimeId,
     interests,
     options.system,
-    objectLocationCache
+    objectLocationCache,
+    options.handle?.documentId,
+    repoSystem?.state
   );
   const relationNames = relationNamesFor(options.relations);
-  let closed = false;
-
-  const notify = () => {
-    if (closed) return;
-    for (const listener of listeners) listener();
-  };
   const stopDriver = driver.subscribe?.(notify);
   const getDoc = driver.getDoc;
   const setDoc = (nextDoc: Automerge.Doc<DocumentShape>) => {
@@ -671,6 +783,7 @@ function createAutomergeMapAdapter<
       closed = true;
       listeners.clear();
       stopDriver?.();
+      repoSystem?.close();
     }
   };
 }
@@ -839,17 +952,31 @@ function withAutomergeSystemSource<DocumentShape extends object>(
   runtimeId: string,
   interests: ReadonlyMap<string, RuntimeInterestRow>,
   input?: RuntimeSystemState | (() => RuntimeSystemState),
-  objectLocationCache = createObjectLocationSnapshotCache(getDoc, relations, runtimeId)
+  objectLocationCache = createObjectLocationSnapshotCache(getDoc, relations, runtimeId),
+  documentId?: string,
+  repoSystemState?: () => RuntimeSystemState
 ): AutomergeMapSource {
   const extraState = (): RuntimeSystemState | undefined => typeof input === 'function' ? input() : input;
+  const repoState = (): RuntimeSystemState | undefined => repoSystemState?.();
   const objectLocationRows = (): readonly RuntimeObjectLocationRow[] => {
     const extraObjectLocations = extraState()?.objectLocations ?? [];
     return extraObjectLocations.length === 0
       ? objectLocationCache.current().runtimeRows
       : [...extraObjectLocations, ...objectLocationCache.current().runtimeRows];
   };
+  const conflictRows = (): readonly RuntimeConflictRow[] => [
+    ...runtimeConflictRowsForMappedRelations(getDoc(), relations, runtimeId, documentId),
+    ...(repoState()?.conflicts ?? []),
+    ...(extraState()?.conflicts ?? [])
+  ];
+  const historyRows = (): readonly RuntimeHistoryRow[] => [
+    ...(hasRuntimeHistoryInterest(interests) ? automergeHistoryRows(getDoc(), runtimeId, documentId) : []),
+    ...(repoState()?.history ?? []),
+    ...(extraState()?.history ?? [])
+  ];
   const systemState = (): RuntimeSystemState => {
     const extra = extraState();
+    const repo = repoState();
     const heads = Automerge.getHeads(getDoc());
     const diagnostics = dataSource.diagnostics?.() ?? [];
 
@@ -883,43 +1010,276 @@ function withAutomergeSystemSource<DocumentShape extends object>(
           id: `${runtimeId}:sync:local-heads`,
           runtime: runtimeId,
           state: 'synced',
+          ...(documentId === undefined ? {} : { documentId }),
           localHeads: heads
         },
+        ...(repo?.sync ?? []),
         ...(extra?.sync ?? [])
       ],
       interests: [
         ...Array.from(interests.values()),
+        ...(repo?.interests ?? []),
         ...(extra?.interests ?? [])
       ],
-      ...(extra?.peers === undefined ? {} : { peers: extra.peers }),
-      ...(extra?.conflicts === undefined ? {} : { conflicts: extra.conflicts }),
+      peers: [
+        ...(repo?.peers ?? []),
+        ...(extra?.peers ?? [])
+      ],
+      conflicts: conflictRows(),
+      history: historyRows(),
       ...(extra?.objectLocations === undefined ? {} : { objectLocations: extra.objectLocations }),
-      ...(extra?.storage === undefined ? {} : { storage: extra.storage })
+      storage: [
+        ...(repo?.storage ?? []),
+        ...(extra?.storage ?? [])
+      ]
     };
   };
   const systemSource = runtimeSystemSource(systemState);
-  const rowSource = composeSources(dataSource, systemSource);
+  const systemRelationNames = new Set(runtimeSystemRelationList.map((relationRef) => relationRef.name));
+  const relationNames = Array.from(new Set([
+    ...(dataSource.relationNames ?? []),
+    ...runtimeSystemRelationList.map((relationRef) => relationRef.name)
+  ]));
+  const isSystemRelation = (relationRef: RelationRef): boolean => systemRelationNames.has(relationRef.name);
+  const systemRows = (relationRef: RelationRef): readonly unknown[] =>
+    relationRef.name === runtimeSystemRelations.objectLocations.name
+      ? objectLocationRows()
+      : systemSource.rows(relationRef);
 
   return {
-    ...rowSource,
-    rows: (relationRef) => relationRef.name === runtimeSystemRelations.objectLocations.name
-      ? objectLocationRows()
-      : rowSource.rows(relationRef),
-    lookup: (lookup) => lookup.relation.name === runtimeSystemRelations.objectLocations.name
-      ? objectLocationRows().filter((row) =>
-        fieldLookupMatches(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.value))
-      : rowSource.lookup?.(lookup) ?? [],
-    rangeLookup: (lookup) => lookup.relation.name === runtimeSystemRelations.objectLocations.name
-      ? objectLocationRows().filter((row) =>
-        fieldValueInRange(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.lower, lookup.upper))
-      : rowSource.rangeLookup?.(lookup) ?? [],
+    relationNames,
+    rows: (relationRef) => isSystemRelation(relationRef)
+      ? systemRows(relationRef)
+      : dataSource.rows(relationRef),
+    lookup: (lookup) => isSystemRelation(lookup.relation)
+      ? systemRows(lookup.relation).filter((row) => isRecord(row)
+        && fieldLookupMatches(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.value))
+      : dataSource.lookup?.(lookup) ?? dataSource.rows(lookup.relation)
+        .filter((row) => isRecord(row)
+          && fieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value)),
+    rangeLookup: (lookup) => isSystemRelation(lookup.relation)
+      ? systemRows(lookup.relation).filter((row) => isRecord(row)
+        && fieldValueInRange(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.lower, lookup.upper))
+      : dataSource.rangeLookup?.(lookup) ?? dataSource.rows(lookup.relation)
+        .filter((row) => isRecord(row)
+          && fieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper)),
     version: () => dataSource.version?.() ?? Automerge.getHeads(getDoc()),
     ...(dataSource.diagnostics === undefined ? {} : { diagnostics: dataSource.diagnostics })
   };
 }
 
-function runtimeRowField(row: RuntimeObjectLocationRow, field: string): unknown {
+function runtimeRowField(row: Record<string, unknown>, field: string): unknown {
   return (row as unknown as Record<string, unknown>)[field];
+}
+
+function hasRuntimeHistoryInterest(interests: ReadonlyMap<string, RuntimeInterestRow>): boolean {
+  for (const interest of interests.values()) {
+    if (
+      interest.state === 'active'
+      && interest.relationNames.includes(runtimeSystemRelations.history.name)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function automergeHistoryRows<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  runtimeId: string,
+  documentId?: string
+): readonly RuntimeHistoryRow[] {
+  return Automerge.getHistory(doc).map(({ change }): RuntimeHistoryRow => ({
+    id: `${runtimeId}:history:${change.hash}`,
+    runtime: runtimeId,
+    ...(documentId === undefined ? {} : { documentId }),
+    hash: change.hash,
+    actor: change.actor,
+    ...(change.message === null ? {} : { message: change.message }),
+    ...(Number.isFinite(change.time) ? { time: change.time } : {}),
+    deps: change.deps,
+    detail: {
+      seq: change.seq,
+      startOp: change.startOp,
+      opCount: change.ops.length
+    }
+  }));
+}
+
+function createAutomergeRepoSystemState<DocumentShape extends object>(options: {
+  readonly repo: Repo;
+  readonly handle: DocHandle<DocumentShape>;
+  readonly runtimeId: string;
+  readonly getDoc: () => Automerge.Doc<DocumentShape>;
+  readonly notify: () => void;
+}): AutomergeRepoSystemState {
+  const remoteStorageIds = new Set<string>();
+  let localStorageId: string | undefined;
+  let storageError: string | undefined;
+  let lastStorageMetric: AutomergeRepoStorageMetric | undefined;
+
+  const peerStorageIds = () => {
+    const ids: string[] = [];
+    for (const peerId of options.repo.peers) {
+      const storageId = peerMetadataFor(options.repo, peerId)?.storageId;
+      if (storageId !== undefined) ids.push(String(storageId));
+    }
+    return ids;
+  };
+  const readStorageId = () => {
+    if (options.repo.storageSubsystem === undefined) return;
+    options.repo.storageId()
+      .then((storageId) => {
+        if (storageId === undefined || localStorageId === String(storageId)) return;
+        localStorageId = String(storageId);
+        options.notify();
+      })
+      .catch((error: unknown) => {
+        storageError = error instanceof Error ? error.message : String(error);
+        options.notify();
+      });
+  };
+  const onRemoteHeads = (payload: DocHandleRemoteHeadsPayload) => {
+    remoteStorageIds.add(String(payload.storageId));
+    options.notify();
+  };
+  const onPeer = () => {
+    for (const storageId of peerStorageIds()) remoteStorageIds.add(storageId);
+    options.notify();
+  };
+  const onStorageMetric = (metric: unknown) => {
+    if (!isRepoStorageMetric(metric) || metric.documentId !== String(options.handle.documentId)) return;
+    lastStorageMetric = metric;
+    options.notify();
+  };
+
+  for (const storageId of peerStorageIds()) remoteStorageIds.add(storageId);
+  readStorageId();
+  options.handle.on('remote-heads', onRemoteHeads);
+  options.repo.networkSubsystem.on('peer', onPeer);
+  options.repo.networkSubsystem.on('peer-disconnected', onPeer);
+  options.repo.on('doc-metrics', onStorageMetric);
+
+  return {
+    state: () => ({
+      peers: runtimePeerRowsFromRepo(options.repo, options.runtimeId),
+      sync: runtimeSyncRowsFromRepo({
+        repo: options.repo,
+        handle: options.handle,
+        runtimeId: options.runtimeId,
+        localHeads: safeAutomergeHeads(options.getDoc),
+        storageIds: Array.from(new Set([...peerStorageIds(), ...remoteStorageIds]))
+      }),
+      storage: runtimeStorageRowsFromRepo({
+        repo: options.repo,
+        runtimeId: options.runtimeId,
+        localStorageId,
+        storageError,
+        lastStorageMetric
+      })
+    }),
+    close: () => {
+      options.handle.off('remote-heads', onRemoteHeads);
+      options.repo.networkSubsystem.off('peer', onPeer);
+      options.repo.networkSubsystem.off('peer-disconnected', onPeer);
+      options.repo.off('doc-metrics', onStorageMetric);
+    }
+  };
+}
+
+function runtimePeerRowsFromRepo(repo: Repo, runtime: string): readonly RuntimePeerRow[] {
+  return repo.peers.map((peerId): RuntimePeerRow => {
+    const metadata = peerMetadataFor(repo, peerId);
+    return {
+      id: `${runtime}:peer:${String(peerId)}`,
+      runtime,
+      peerId: String(peerId),
+      state: 'connected',
+      connected: true,
+      ...(metadata?.isEphemeral === undefined ? {} : { ephemeral: metadata.isEphemeral }),
+      ...(metadata === undefined || Object.keys(metadata).length === 0 ? {} : { detail: { metadata } })
+    };
+  });
+}
+
+function runtimeSyncRowsFromRepo<DocumentShape extends object>(options: {
+  readonly repo: Repo;
+  readonly handle: DocHandle<DocumentShape>;
+  readonly runtimeId: string;
+  readonly localHeads: readonly string[] | undefined;
+  readonly storageIds: readonly string[];
+}): readonly RuntimeSyncRow[] {
+  return options.storageIds.map((storageId): RuntimeSyncRow => {
+    const syncInfo = options.handle.getSyncInfo(storageId as StorageId);
+    const peerId = peerIdForStorageId(options.repo, storageId);
+    return {
+      id: `${options.runtimeId}:sync:remote:${storageId}`,
+      runtime: options.runtimeId,
+      state: syncInfo === undefined ? 'unknown' : 'synced',
+      documentId: String(options.handle.documentId),
+      storageId,
+      ...(peerId === undefined ? {} : { peerId }),
+      ...(options.localHeads === undefined ? {} : { localHeads: options.localHeads }),
+      ...(syncInfo?.lastHeads === undefined ? {} : { remoteHeads: [...syncInfo.lastHeads] }),
+      ...(syncInfo?.lastSyncTimestamp === undefined ? {} : { updatedAt: syncInfo.lastSyncTimestamp }),
+      detail: {
+        source: 'automerge.repo.getSyncInfo'
+      }
+    };
+  });
+}
+
+function runtimeStorageRowsFromRepo(options: {
+  readonly repo: Repo;
+  readonly runtimeId: string;
+  readonly localStorageId: string | undefined;
+  readonly storageError: string | undefined;
+  readonly lastStorageMetric: AutomergeRepoStorageMetric | undefined;
+}): readonly RuntimeStorageRow[] {
+  if (options.repo.storageSubsystem === undefined) return [];
+
+  const storage = options.localStorageId ?? 'automerge.repo.storage';
+  return [{
+    id: `${options.runtimeId}:storage:${storage}`,
+    runtime: options.runtimeId,
+    storage,
+    state: options.storageError !== undefined ? 'failed' : options.lastStorageMetric === undefined ? 'idle' : 'synced',
+    durability: 'durable',
+    ...(options.storageError === undefined ? {} : { lastError: options.storageError }),
+    detail: {
+      source: 'automerge.repo.storageSubsystem',
+      ...(options.localStorageId === undefined ? {} : { storageId: options.localStorageId }),
+      ...(options.lastStorageMetric === undefined ? {} : { lastCompleted: options.lastStorageMetric })
+    }
+  }];
+}
+
+function peerMetadataFor(repo: Repo, peerId: unknown): PeerMetadata | undefined {
+  return repo.peerMetadataByPeerId[String(peerId) as keyof Repo['peerMetadataByPeerId']];
+}
+
+function peerIdForStorageId(repo: Repo, storageId: string): string | undefined {
+  for (const peerId of repo.peers) {
+    if (String(peerMetadataFor(repo, peerId)?.storageId) === storageId) return String(peerId);
+  }
+
+  return undefined;
+}
+
+function safeAutomergeHeads<DocumentShape extends object>(
+  getDoc: () => Automerge.Doc<DocumentShape>
+): readonly string[] | undefined {
+  try {
+    return Automerge.getHeads(getDoc());
+  } catch {
+    return undefined;
+  }
+}
+
+function isRepoStorageMetric(input: unknown): input is AutomergeRepoStorageMetric {
+  if (!isRecord(input) || typeof input.type !== 'string' || typeof input.documentId !== 'string') return false;
+  return input.type === 'doc-loaded' || input.type === 'doc-saved' || input.type === 'doc-compacted';
 }
 
 function decodeRelationRow(relation: RelationRef, row: Row): Row {
@@ -1392,6 +1752,57 @@ function runtimeObjectLocationRowsFromLocations(
   }));
 }
 
+function runtimeConflictRowsForMappedRelations<DocumentShape extends object>(
+  doc: Automerge.Doc<DocumentShape>,
+  relations: readonly AutomergeMapRelation<RelationRef, DocumentShape>[],
+  runtime: string,
+  documentId?: string
+): readonly RuntimeConflictRow[] {
+  const rows: RuntimeConflictRow[] = [];
+
+  for (const mapping of relations) {
+    const lookup = getPathValue(doc, mapping.path);
+    if (lookup.status !== 'found') continue;
+
+    const entries = Array.isArray(lookup.value)
+      ? lookup.value.map((value, index) => ({ path: [...mapping.path, index] as readonly Automerge.Prop[], value }))
+      : isRecord(lookup.value)
+        ? Object.entries(lookup.value).map(([key, value]) => ({ path: [...mapping.path, key] as readonly Automerge.Prop[], value }))
+        : [];
+
+    for (const entry of entries) {
+      if (!isRecord(entry.value)) continue;
+
+      const key = relationKeyValue(mapping.relation, entry.value);
+      for (const fieldName of Object.keys(mapping.relation.fields)) {
+        const path = [...entry.path, fieldName] as unknown as AutomergePropertyPath;
+        const conflicts = automergeConflictsAt(doc, path);
+        if (conflicts.length === 0) continue;
+
+        const fieldSpec = mapping.relation.fields[fieldName];
+        const pathText = formatRuntimeObjectPath(path);
+        rows.push({
+          id: `${runtime}:conflict:${pathText}`,
+          runtime,
+          path: pathText,
+          ...(documentId === undefined ? {} : { documentId }),
+          relation: mapping.relation.name,
+          field: fieldName,
+          conflictCount: conflicts.length,
+          values: conflicts.map((conflict) => fieldReadValue(fieldSpec, conflict.value)),
+          detail: {
+            pathSegments: path,
+            ...(key === undefined ? {} : { key }),
+            conflicts
+          }
+        });
+      }
+    }
+  }
+
+  return rows;
+}
+
 function mappedObjectLocation(
   relations: readonly AnyMapRelation[],
   path: readonly Automerge.Prop[],
@@ -1511,6 +1922,7 @@ function getOrCreatePlan<DocumentShape extends object>(
     mapping,
     kind: collection.kind,
     before: collection.rows,
+    nativeCounterIncrements: [],
     rows: collection.rows,
     changed: false
   };
@@ -1533,6 +1945,8 @@ function applyPatchToPlan(plan: RowPlan, patch: WritePatch, context: PatchEvalua
       return upsertRow(plan, patch.row, (current, incoming) => rowUpdateFor(current, patch.update ?? incoming, plan, context));
     case 'updateByKey':
       return updateRowByKey(plan, patch.key, patch.changes, context);
+    case 'incrementByKey':
+      return incrementRowByKey(plan, patch.key, patch.field, patch.amount, context);
     case 'update':
       return updateRowsByPredicate(plan, patch.predicate, patch.changes, context);
     case 'deleteByKey':
@@ -1640,6 +2054,104 @@ function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown, cont
   plan.rows = replaceAt(plan.rows, index, updated);
   plan.changed = true;
   return accepted(true, updateResult.diagnostics);
+}
+
+function incrementRowByKey(
+  plan: RowPlan,
+  keyValue: unknown,
+  fieldName: string,
+  amount: number,
+  context: PatchEvaluationContext
+): PatchOutcome {
+  const relation = plan.mapping.relation;
+  const key = keyValueFor(relation, keyValue);
+  if (key === undefined) return rejected(rowKeyDiagnostic(relation.name, keyValue));
+
+  const fieldSpec = relation.fields[fieldName];
+  if (fieldSpec === undefined) {
+    return rejected(fieldInvalidDiagnostic(
+      relation.name,
+      fieldName,
+      `relation "${relation.name}" does not define field "${fieldName}"`,
+      fieldName
+    ));
+  }
+  if (customSpecForField(fieldSpec)?.kind !== 'automerge.counter') {
+    return rejected(fieldInvalidDiagnostic(
+      relation.name,
+      fieldName,
+      `relation "${relation.name}" field "${fieldName}" must be an Automerge counter field`,
+      fieldName
+    ));
+  }
+  if (typeof amount !== 'number' || !Number.isFinite(amount)) {
+    return rejected(fieldInvalidDiagnostic(
+      relation.name,
+      fieldName,
+      `increment amount for relation "${relation.name}" field "${fieldName}" must be a finite number`,
+      amount
+    ));
+  }
+
+  const index = plan.rows.findIndex((item) => rowKeyFor(relation, item) === key);
+  if (index === -1) return rejected(rowMissingForIncrementDiagnostic(relation, keyValue, fieldName));
+
+  const current = plan.rows[index];
+  if (current === undefined) return rejected(rowMissingForIncrementDiagnostic(relation, keyValue, fieldName));
+  if (!Object.prototype.hasOwnProperty.call(current, fieldName) || current[fieldName] === undefined) {
+    return rejected(fieldMissingDiagnostic(relation.name, fieldName, false));
+  }
+
+  const currentValue = current[fieldName];
+  const currentNumber = Number(currentValue);
+  if (!Number.isFinite(currentNumber)) {
+    return rejected(fieldInvalidDiagnostic(
+      relation.name,
+      fieldName,
+      `relation "${relation.name}" field "${fieldName}" must contain a finite number before it can be incremented`,
+      currentValue
+    ));
+  }
+
+  const nativeRow = nativeRowForPlanKey(context.doc, plan, key);
+  const nativeValue = nativeRow?.[fieldName];
+  if (!Automerge.isCounter(nativeValue)) {
+    return rejected(fieldInvalidDiagnostic(
+      relation.name,
+      fieldName,
+      `relation "${relation.name}" field "${fieldName}" must be stored as an Automerge Counter before native increment can be applied`,
+      nativeValue
+    ));
+  }
+
+  const nextValue = currentNumber + amount;
+  if (!Number.isFinite(nextValue)) {
+    return rejected(fieldInvalidDiagnostic(
+      relation.name,
+      fieldName,
+      `increment result for relation "${relation.name}" field "${fieldName}" must be finite`,
+      nextValue
+    ));
+  }
+
+  const next = { ...current, [fieldName]: nextValue };
+  if (relationKeyFields(relation).includes(fieldName) && rowKeyFor(relation, next) !== key) {
+    return rejected(fieldInvalidDiagnostic(
+      relation.name,
+      fieldName,
+      `incrementing relation "${relation.name}" key field "${fieldName}" would change row identity`,
+      next
+    ));
+  }
+
+  const nextDiagnostics = validatePlanRow(plan, next);
+  if (nextDiagnostics.length > 0) return rejected(...nextDiagnostics);
+  if (valuesEqual(current, next)) return accepted(false);
+
+  plan.rows = replaceAt(plan.rows, index, next);
+  plan.changed = true;
+  recordNativeCounterIncrement(plan, key, fieldName, amount);
+  return accepted(true);
 }
 
 function updateRowsByPredicate(
@@ -2209,14 +2721,14 @@ function applyRowsToDraft(root: unknown, plan: RowPlan): void {
   }
 
   if (plan.kind === 'map' && isRecord(lookup.value)) {
-    applyMapRowsToDraft(lookup.value, plan);
+    applyMapRowsToDraft(root, lookup.value, plan);
     return;
   }
 
   setPathValue(root, plan.mapping.path, encodeRows(plan.rows, plan.mapping.relation, plan.kind));
 }
 
-function applyMapRowsToDraft(collection: Record<string, unknown>, plan: RowPlan): void {
+function applyMapRowsToDraft(root: unknown, collection: Record<string, unknown>, plan: RowPlan): void {
   const desired = new Map(plan.rows.map((row) => [storageKeyForRow(plan.mapping.relation, row), row]));
 
   for (const key of Object.keys(collection)) {
@@ -2228,15 +2740,15 @@ function applyMapRowsToDraft(collection: Record<string, unknown>, plan: RowPlan)
 
     const current = collection[key];
     if (isRecord(current)) {
-      patchRowObject(plan.mapping.relation, current, row);
+      patchRowObject(root, [...plan.mapping.path, key], plan, current, row);
     } else {
-      collection[key] = cloneValue(row);
+      collection[key] = encodeRow(row, plan.mapping.relation);
     }
     desired.delete(key);
   }
 
   for (const [key, row] of desired) {
-    collection[key] = cloneValue(row);
+    collection[key] = encodeRow(row, plan.mapping.relation);
   }
 }
 
@@ -2255,14 +2767,14 @@ function applyArrayRowsToDraft(root: unknown, collection: unknown[], plan: RowPl
   for (const [index, row] of plan.rows.entries()) {
     const current = collection[index];
     if (currentRowKey(plan.mapping.relation, current) !== rowKeyFor(plan.mapping.relation, row)) {
-      insertArrayItem(collection, index, cloneValue(row));
+      insertArrayItem(collection, index, encodeRow(row, plan.mapping.relation));
       continue;
     }
 
     if (isRecord(current)) {
-      patchRowObject(plan.mapping.relation, current, row);
+      patchRowObject(root, [...plan.mapping.path, index], plan, current, row);
     } else {
-      collection[index] = cloneValue(row);
+      collection[index] = encodeRow(row, plan.mapping.relation);
     }
   }
 }
@@ -2279,13 +2791,33 @@ function arrayRowsCanBePatchedWithoutMoving(collection: readonly unknown[], plan
     && keptCurrentKeys.every((key, index) => key === keptDesiredKeys[index]);
 }
 
-function patchRowObject(relation: RelationRef, target: Record<string, unknown>, row: Row): void {
+function patchRowObject(
+  root: unknown,
+  rowPath: readonly Automerge.Prop[],
+  plan: RowPlan,
+  target: Record<string, unknown>,
+  row: Row
+): void {
+  const relation = plan.mapping.relation;
+  const rowKey = rowKeyFor(relation, row);
+
   for (const key of Object.keys(target)) {
     if (!Object.prototype.hasOwnProperty.call(row, key)) delete target[key];
   }
 
   for (const [key, value] of Object.entries(row)) {
-    if (!fieldValuesEqual(relation.fields[key], target[key], value)) target[key] = cloneValue(value);
+    const spec = relation.fields[key];
+    if (fieldValuesEqual(spec, target[key], value)) continue;
+    if (updateTextFieldValue(root, [...rowPath, key], spec, target[key], value)) continue;
+    const incrementAmount = rowKey === undefined ? undefined : nativeCounterIncrementAmount(plan, rowKey, key);
+    if (
+      incrementAmount !== undefined
+      && applyNativeCounterIncrement(spec, target, key, incrementAmount)
+      && fieldValuesEqual(spec, target[key], value)
+    ) {
+      continue;
+    }
+    target[key] = fieldWriteValue(spec, value);
   }
 }
 
@@ -2293,8 +2825,73 @@ function fieldValuesEqual(spec: FieldSpec | undefined, current: unknown, next: u
   return valuesEqual(fieldReadValue(spec, current), next);
 }
 
+function updateTextFieldValue(
+  root: unknown,
+  path: readonly Automerge.Prop[],
+  spec: FieldSpec | undefined,
+  current: unknown,
+  next: unknown
+): boolean {
+  if (customSpecForField(spec)?.kind !== 'automerge.text') return false;
+  // Automerge 3.2.6 updateText targets string/text objects by path; ImmutableString is a scalar and throws.
+  if (typeof current !== 'string' || typeof next !== 'string') return false;
+
+  Automerge.updateText(root as Automerge.Doc<unknown>, [...path], next);
+  return true;
+}
+
 function currentRowKey(relation: RelationRef, input: unknown): string | undefined {
   return isRecord(input) ? rowKeyFor(relation, input) : undefined;
+}
+
+function nativeRowForPlanKey(doc: unknown, plan: RowPlan, key: string): Record<string, unknown> | undefined {
+  const lookup = getPathValue(doc, plan.mapping.path);
+  if (lookup.status !== 'found') return undefined;
+
+  if (Array.isArray(lookup.value)) {
+    return lookup.value.find((item): item is Record<string, unknown> =>
+      isRecord(item) && currentRowKey(plan.mapping.relation, item) === key);
+  }
+
+  if (isRecord(lookup.value)) {
+    return Object.values(lookup.value).find((item): item is Record<string, unknown> =>
+      isRecord(item) && currentRowKey(plan.mapping.relation, item) === key);
+  }
+
+  return undefined;
+}
+
+function recordNativeCounterIncrement(plan: RowPlan, rowKey: string, field: string, amount: number): void {
+  if (amount === 0) return;
+  const existing = plan.nativeCounterIncrements.find((increment) =>
+    increment.rowKey === rowKey && increment.field === field);
+  if (existing === undefined) {
+    plan.nativeCounterIncrements.push({ rowKey, field, amount });
+  } else {
+    existing.amount += amount;
+  }
+}
+
+function nativeCounterIncrementAmount(plan: RowPlan, rowKey: string, field: string): number | undefined {
+  const amount = plan.nativeCounterIncrements
+    .filter((increment) => increment.rowKey === rowKey && increment.field === field)
+    .reduce((sum, increment) => sum + increment.amount, 0);
+
+  return amount === 0 ? undefined : amount;
+}
+
+function applyNativeCounterIncrement(
+  spec: FieldSpec | undefined,
+  target: Record<string, unknown>,
+  field: string,
+  amount: number
+): boolean {
+  if (customSpecForField(spec)?.kind !== 'automerge.counter') return false;
+  const counter = target[field];
+  if (!Automerge.isCounter(counter)) return false;
+
+  counter.increment(amount);
+  return true;
 }
 
 function insertArrayItem(collection: unknown[], index: number, value: unknown): void {
@@ -2316,9 +2913,22 @@ function validateCollectionRows(relation: RelationRef, rows: readonly Row[]): re
 }
 
 function encodeRows(rows: readonly Row[], relation: RelationRef, kind: StorageKind): unknown {
-  if (kind === 'array') return rows.map(cloneValue);
+  if (kind === 'array') return rows.map((row) => encodeRow(row, relation));
 
-  return Object.fromEntries(rows.map((row) => [storageKeyForRow(relation, row), cloneValue(row)]));
+  return Object.fromEntries(rows.map((row) => [storageKeyForRow(relation, row), encodeRow(row, relation)]));
+}
+
+function encodeRow(row: Row, relation: RelationRef): Row {
+  return Object.fromEntries(Object.entries(row).map(([fieldName, value]) => [
+    fieldName,
+    fieldWriteValue(relation.fields[fieldName], value)
+  ]));
+}
+
+function fieldWriteValue(spec: FieldSpec | undefined, value: unknown): unknown {
+  const custom = customSpecForField(spec);
+  if (custom?.fromScalar === undefined || value === null || value === undefined) return cloneValue(value);
+  return custom.fromScalar(value);
 }
 
 function coerceRow(input: unknown): Row | undefined {
@@ -2762,6 +3372,18 @@ function rowKeyDiagnostic(relation: string, detail: unknown): TarstateDiagnostic
     surface: 'automergeMapAdapter',
     message: `Automerge map adapter could not resolve a complete key for relation "${relation}"`,
     detail
+  };
+}
+
+function rowMissingForIncrementDiagnostic(relation: RelationRef, key: unknown, field: string): TarstateDiagnostic {
+  return {
+    code: 'row_invalid',
+    severity: 'error',
+    relation: relation.name,
+    field,
+    surface: 'automergeMapAdapter',
+    message: `relation "${relation.name}" does not contain a row for increment key ${String(keyValueFor(relation, key) ?? '<invalid>')}`,
+    detail: key
   };
 }
 
