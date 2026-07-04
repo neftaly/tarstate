@@ -1865,6 +1865,8 @@ function mappedCollection<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
   mapping: AnyMapRelation
 ): MappedCollection {
+  // Relation scan order is unspecified, matching Relic semantics; consumers that
+  // need stable ordering must express it in the query, e.g. with ORDER BY.
   const lookup = getPathValue(doc, mapping.path);
 
   if (lookup.status === 'missing') {
