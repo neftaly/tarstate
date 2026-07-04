@@ -17,11 +17,15 @@ import {
   type RelationPatchTarget,
   type RelationRangeLookup,
   type RelationRuntime,
+  type RelationRuntimeListener,
+  type RelationRuntimeNotification,
   type RuntimeConflictRow,
+  type RuntimeDiagnosticRow,
   type RuntimeHistoryRow,
   type RuntimeInterestRow,
   type RuntimeObjectLocationRow,
   type RuntimePeerRow,
+  type RuntimeSourceRow,
   type RuntimeStorageRow,
   type RuntimeSyncRow,
   type RuntimeSystemState,
@@ -39,6 +43,8 @@ import {
   type RelationRef
 } from '@tarstate/core/schema';
 import type { WritePatch } from '@tarstate/core/write';
+
+const runtimeSystemRelationNameSet = new Set(runtimeSystemRelationList.map((relationRef) => relationRef.name));
 
 export type AutomergeMapPath<
   DocumentShape extends object = Record<string, unknown>
@@ -296,7 +302,7 @@ export type AutomergeMapAdapter<
   readonly objectReferenceFor: (relation: RelationRef, key: unknown) => AutomergeObjectReference | null;
   readonly snapshot: () => AdapterSnapshot<Automerge.Heads>;
   readonly target: RelationPatchTarget<Automerge.Heads>;
-  readonly subscribe: (listener: () => void) => () => void;
+  readonly subscribe: (listener: RelationRuntimeListener) => () => void;
 };
 
 export type AutomergeDocHandleRuntime<
@@ -338,7 +344,7 @@ export type AutomergeMapRuntime<
   readonly kind: 'automergeMapRuntime';
   readonly adapter: AutomergeMapAdapter<DocumentShape>;
   readonly relations: readonly RelationRef[];
-  readonly subscribe: (listener: () => void) => () => void;
+  readonly subscribe: (listener: RelationRuntimeListener) => () => void;
 };
 
 type Row = Record<string, unknown>;
@@ -601,14 +607,14 @@ function createAutomergeMapAdapter<
   options: AutomergeMapAdapterRuntimeOptions<DocumentShape>,
   driver: AutomergeDocumentDriver<DocumentShape>
 ): AutomergeMapAdapter<DocumentShape> & { readonly close: () => void } {
-  const listeners = new Set<() => void>();
+  const listeners = new Set<RelationRuntimeListener>();
   const interests = new Map<string, RuntimeInterestRow>();
   const dataSource = createAutomergeMapSource(driver.getDoc, options.relations);
   const runtimeId = options.runtimeId ?? 'automergeMapRuntime';
   let closed = false;
-  const notify = () => {
+  const notify = (notification?: RelationRuntimeNotification) => {
     if (closed) return;
-    for (const listener of listeners) listener();
+    for (const listener of listeners) listener(notification);
   };
   const repoSystem = options.repo === undefined || options.handle === undefined
     ? undefined
@@ -654,7 +660,7 @@ function createAutomergeMapAdapter<
       ...(diagnostics.length === 0 ? {} : { diagnostics })
     };
   };
-  const subscribe = (listener: () => void) => {
+  const subscribe = (listener: RelationRuntimeListener) => {
     listeners.add(listener);
     return () => {
       listeners.delete(listener);
@@ -662,6 +668,10 @@ function createAutomergeMapAdapter<
   };
   const retainInterest = (interest: RelationRuntimeInterest) => {
     const retainedAt = Date.now();
+    const interestRelationNames = Array.from(new Set([
+      runtimeSystemRelations.interests.name,
+      ...interest.relationNames.filter((relationName) => runtimeSystemRelationNameSet.has(relationName))
+    ]));
     interests.set(interest.id, {
       id: interest.id,
       runtime: runtimeId,
@@ -671,14 +681,14 @@ function createAutomergeMapAdapter<
       subscriberCount: 1,
       retainedAt
     });
-    notify();
+    notify({ relationNames: interestRelationNames });
     let retained = true;
 
     return () => {
       if (!retained) return;
       retained = false;
       interests.delete(interest.id);
-      notify();
+      notify({ relationNames: interestRelationNames });
     };
   };
   const objectIdFor = (relation: RelationRef, key: unknown) =>
@@ -958,6 +968,65 @@ function withAutomergeSystemSource<DocumentShape extends object>(
 ): AutomergeMapSource {
   const extraState = (): RuntimeSystemState | undefined => typeof input === 'function' ? input() : input;
   const repoState = (): RuntimeSystemState | undefined => repoSystemState?.();
+  const sourceRows = (): readonly RuntimeSourceRow[] => [
+    {
+      id: `${runtimeId}:source:document`,
+      runtime: runtimeId,
+      source: 'automerge.document',
+      state: 'ready',
+      message: `${relations.length} mapped relation${relations.length === 1 ? '' : 's'}`
+    },
+    ...(extraState()?.sources ?? [])
+  ];
+  const adapterDiagnosticRows = (): readonly RuntimeDiagnosticRow[] =>
+    (dataSource.diagnostics?.() ?? []).map((diagnosticValue, index) => ({
+      id: `${runtimeId}:diagnostic:${index}`,
+      runtime: runtimeId,
+      source: 'automerge.document',
+      code: diagnosticValue.code,
+      severity: diagnosticValue.severity ?? 'info',
+      message: diagnosticValue.message,
+      ...(diagnosticValue.surface === undefined ? {} : { surface: diagnosticValue.surface }),
+      ...(diagnosticValue.relation === undefined ? {} : { relation: diagnosticValue.relation }),
+      ...(diagnosticValue.detail === undefined ? {} : { detail: diagnosticValue.detail })
+    }));
+  const diagnosticState = (): RuntimeSystemState => ({
+    diagnostics: [
+      ...adapterDiagnosticRows(),
+      ...(extraState()?.diagnostics ?? [])
+    ]
+  });
+  const diagnosticSource = runtimeSystemSource(diagnosticState);
+  const diagnosticRows = (): readonly RuntimeDiagnosticRow[] =>
+    diagnosticSource.rows(runtimeSystemRelations.diagnostics) as readonly RuntimeDiagnosticRow[];
+  const syncRows = (): readonly RuntimeSyncRow[] => {
+    const repo = repoState();
+    const extra = extraState();
+    return [
+      {
+        id: `${runtimeId}:sync:local-heads`,
+        runtime: runtimeId,
+        state: 'synced',
+        ...(documentId === undefined ? {} : { documentId }),
+        localHeads: Automerge.getHeads(getDoc())
+      },
+      ...(repo?.sync ?? []),
+      ...(extra?.sync ?? [])
+    ];
+  };
+  const interestRows = (): readonly RuntimeInterestRow[] => [
+    ...Array.from(interests.values()),
+    ...(repoState()?.interests ?? []),
+    ...(extraState()?.interests ?? [])
+  ];
+  const peerRows = (): readonly RuntimePeerRow[] => [
+    ...(repoState()?.peers ?? []),
+    ...(extraState()?.peers ?? [])
+  ];
+  const storageRows = (): readonly RuntimeStorageRow[] => [
+    ...(repoState()?.storage ?? []),
+    ...(extraState()?.storage ?? [])
+  ];
   const objectLocationRows = (): readonly RuntimeObjectLocationRow[] => {
     const extraObjectLocations = extraState()?.objectLocations ?? [];
     return extraObjectLocations.length === 0
@@ -976,62 +1045,17 @@ function withAutomergeSystemSource<DocumentShape extends object>(
   ];
   const systemState = (): RuntimeSystemState => {
     const extra = extraState();
-    const repo = repoState();
-    const heads = Automerge.getHeads(getDoc());
-    const diagnostics = dataSource.diagnostics?.() ?? [];
 
     return {
-      sources: [
-        {
-          id: `${runtimeId}:source:document`,
-          runtime: runtimeId,
-          source: 'automerge.document',
-          state: 'ready',
-          message: `${relations.length} mapped relation${relations.length === 1 ? '' : 's'}`
-        },
-        ...(extra?.sources ?? [])
-      ],
-      diagnostics: [
-        ...diagnostics.map((diagnosticValue, index) => ({
-          id: `${runtimeId}:diagnostic:${index}`,
-          runtime: runtimeId,
-          source: 'automerge.document',
-          code: diagnosticValue.code,
-          severity: diagnosticValue.severity ?? 'info',
-          message: diagnosticValue.message,
-          ...(diagnosticValue.surface === undefined ? {} : { surface: diagnosticValue.surface }),
-          ...(diagnosticValue.relation === undefined ? {} : { relation: diagnosticValue.relation }),
-          ...(diagnosticValue.detail === undefined ? {} : { detail: diagnosticValue.detail })
-        })),
-        ...(extra?.diagnostics ?? [])
-      ],
-      sync: [
-        {
-          id: `${runtimeId}:sync:local-heads`,
-          runtime: runtimeId,
-          state: 'synced',
-          ...(documentId === undefined ? {} : { documentId }),
-          localHeads: heads
-        },
-        ...(repo?.sync ?? []),
-        ...(extra?.sync ?? [])
-      ],
-      interests: [
-        ...Array.from(interests.values()),
-        ...(repo?.interests ?? []),
-        ...(extra?.interests ?? [])
-      ],
-      peers: [
-        ...(repo?.peers ?? []),
-        ...(extra?.peers ?? [])
-      ],
+      sources: sourceRows(),
+      diagnostics: diagnosticState().diagnostics ?? [],
+      sync: syncRows(),
+      interests: interestRows(),
+      peers: peerRows(),
       conflicts: conflictRows(),
       history: historyRows(),
       ...(extra?.objectLocations === undefined ? {} : { objectLocations: extra.objectLocations }),
-      storage: [
-        ...(repo?.storage ?? []),
-        ...(extra?.storage ?? [])
-      ]
+      storage: storageRows()
     };
   };
   const systemSource = runtimeSystemSource(systemState);
@@ -1041,10 +1065,30 @@ function withAutomergeSystemSource<DocumentShape extends object>(
     ...runtimeSystemRelationList.map((relationRef) => relationRef.name)
   ]));
   const isSystemRelation = (relationRef: RelationRef): boolean => systemRelationNames.has(relationRef.name);
-  const systemRows = (relationRef: RelationRef): readonly unknown[] =>
-    relationRef.name === runtimeSystemRelations.objectLocations.name
-      ? objectLocationRows()
-      : systemSource.rows(relationRef);
+  const systemRows = (relationRef: RelationRef): readonly unknown[] => {
+    switch (relationRef.name) {
+      case runtimeSystemRelations.sources.name:
+        return sourceRows();
+      case runtimeSystemRelations.diagnostics.name:
+        return diagnosticRows();
+      case runtimeSystemRelations.peers.name:
+        return peerRows();
+      case runtimeSystemRelations.sync.name:
+        return syncRows();
+      case runtimeSystemRelations.conflicts.name:
+        return conflictRows();
+      case runtimeSystemRelations.history.name:
+        return historyRows();
+      case runtimeSystemRelations.objectLocations.name:
+        return objectLocationRows();
+      case runtimeSystemRelations.storage.name:
+        return storageRows();
+      case runtimeSystemRelations.interests.name:
+        return interestRows();
+      default:
+        return systemSource.rows(relationRef);
+    }
+  };
 
   return {
     relationNames,
@@ -1112,7 +1156,7 @@ function createAutomergeRepoSystemState<DocumentShape extends object>(options: {
   readonly handle: DocHandle<DocumentShape>;
   readonly runtimeId: string;
   readonly getDoc: () => Automerge.Doc<DocumentShape>;
-  readonly notify: () => void;
+  readonly notify: (notification?: RelationRuntimeNotification) => void;
 }): AutomergeRepoSystemState {
   const remoteStorageIds = new Set<string>();
   let localStorageId: string | undefined;
@@ -1133,25 +1177,25 @@ function createAutomergeRepoSystemState<DocumentShape extends object>(options: {
       .then((storageId) => {
         if (storageId === undefined || localStorageId === String(storageId)) return;
         localStorageId = String(storageId);
-        options.notify();
+        options.notify({ relationNames: [runtimeSystemRelations.storage.name] });
       })
       .catch((error: unknown) => {
         storageError = error instanceof Error ? error.message : String(error);
-        options.notify();
+        options.notify({ relationNames: [runtimeSystemRelations.storage.name] });
       });
   };
   const onRemoteHeads = (payload: DocHandleRemoteHeadsPayload) => {
     remoteStorageIds.add(String(payload.storageId));
-    options.notify();
+    options.notify({ relationNames: [runtimeSystemRelations.sync.name] });
   };
   const onPeer = () => {
     for (const storageId of peerStorageIds()) remoteStorageIds.add(storageId);
-    options.notify();
+    options.notify({ relationNames: [runtimeSystemRelations.peers.name, runtimeSystemRelations.sync.name] });
   };
   const onStorageMetric = (metric: unknown) => {
     if (!isRepoStorageMetric(metric) || metric.documentId !== String(options.handle.documentId)) return;
     lastStorageMetric = metric;
-    options.notify();
+    options.notify({ relationNames: [runtimeSystemRelations.storage.name] });
   };
 
   for (const storageId of peerStorageIds()) remoteStorageIds.add(storageId);

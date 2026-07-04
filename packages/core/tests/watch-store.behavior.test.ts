@@ -7,6 +7,7 @@ import { relicChanges, trackTransact } from '@tarstate/core/runtime';
 import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { createRuntimeStore, createStore } from '@tarstate/core/store';
 import { asc, env, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
+import { type RelationRef } from '@tarstate/core/schema';
 import {
   composeRelationRuntimes,
   type RelationApplyContext,
@@ -26,7 +27,7 @@ import {
   watchTargetKey
 } from '@tarstate/core/watch';
 import { deleteByKey, insert, updateByKey, type WritePatch } from '@tarstate/core/write';
-import { entry, makeDb, schema } from './behavior-fixtures.js';
+import { accountsById, entry, makeDb, schema } from './behavior-fixtures.js';
 import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 const entryList = pipe(
@@ -365,6 +366,14 @@ describe('watch and store behavior', () => {
         added: [{ id: 'e5', accountId: 'cash', amount: 35 }]
       })
     ]);
+
+    runtimeEvents.length = 0;
+    await runtime.target?.apply([
+      updateByKey(schema.accounts, 'cash', { name: 'Cash account' })
+    ]);
+    await tick();
+    expect(runtimeEvents).toEqual([]);
+
     expect(runtimeHandle.unwatch()).toEqual({ id: 'entries-runtime', closed: true, diagnostics: [] });
 
     const db = makeDb();
@@ -545,6 +554,85 @@ describe('watch and store behavior', () => {
     expect(released).toEqual([retained[0], retained[1]]);
     unsubscribeThird();
     expect(released).toEqual([retained[0], retained[1]]);
+  });
+
+  it('runtime store uses changed relation notifications to refresh only affected rows', () => {
+    let data = makeDb().data;
+    let version = 0;
+    let subscribedListener: ((notification?: { readonly relationNames?: readonly string[] }) => void) | undefined;
+    const rowReads: Record<string, number> = {};
+    const source = {
+      relationNames: Object.keys(data),
+      rows: (relationRef: RelationRef) => {
+        rowReads[relationRef.name] = (rowReads[relationRef.name] ?? 0) + 1;
+        return data[relationRef.name] ?? [];
+      },
+      version: () => version
+    };
+    const runtime = {
+      source,
+      snapshot: () => ({
+        source,
+        version
+      }),
+      subscribe: (listener: (notification?: { readonly relationNames?: readonly string[] }) => void) => {
+        subscribedListener = listener;
+        return () => {
+          subscribedListener = undefined;
+        };
+      }
+    } satisfies RelationRuntime<number>;
+    const store = createRuntimeStore({ runtime, relations: [schema.accounts, schema.entries] });
+    const accountsView = store.view(accountsById);
+    const entriesView = store.view(entryList);
+    const notifiedViews: string[] = [];
+    const unsubscribeAccounts = accountsView.subscribe(() => {
+      notifiedViews.push('accounts');
+    });
+    const unsubscribeEntries = entriesView.subscribe(() => {
+      notifiedViews.push('entries');
+    });
+
+    expect(rowReads).toEqual({ accounts: 1, entries: 1 });
+
+    data = {
+      ...data,
+      entries: [
+        ...(data.entries ?? []),
+        { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true }
+      ]
+    };
+    subscribedListener?.({ relationNames: ['entries'] });
+
+    expect(rowReads).toEqual({ accounts: 1, entries: 2 });
+    expect(notifiedViews).toEqual(['entries']);
+    expect(entriesView.getSnapshot().rows).toEqual([
+      { id: 'e1', accountId: 'cash', amount: 120 },
+      { id: 'e2', accountId: 'sales', amount: -120 },
+      { id: 'e3', accountId: 'fees', amount: -5 },
+      { id: 'e4', accountId: 'cash', amount: 0 },
+      { id: 'e5', accountId: 'cash', amount: 35 }
+    ]);
+
+    notifiedViews.length = 0;
+    data = {
+      ...data,
+      accounts: [
+        { id: 'cash', name: 'Cash account', kind: 'asset' },
+        { id: 'sales', name: 'Sales', kind: 'income' },
+        { id: 'fees', name: 'Bank fees', kind: 'expense' },
+        { id: 'equity', name: 'Owner equity', kind: 'equity' }
+      ]
+    };
+    version += 1;
+    subscribedListener?.({ relationNames: ['accounts'] });
+
+    expect(rowReads).toEqual({ accounts: 2, entries: 2 });
+    expect(notifiedViews).toEqual(['accounts', 'entries']);
+
+    unsubscribeEntries();
+    unsubscribeAccounts();
+    store.close();
   });
 
   it('runtime store routes original patches, preserves callback semantics, and rejects after close', async () => {

@@ -254,6 +254,10 @@ describe('automerge map adapter', () => {
       runtimeId: 'workspace'
     });
     const store = createRuntimeStore({ runtime });
+    const relationNotifications: string[][] = [];
+    const unsubscribeRuntime = runtime.subscribe((notification) => {
+      if (notification?.relationNames !== undefined) relationNotifications.push([...notification.relationNames]);
+    });
     const view = store.view(from(schema.tasks));
     const unsubscribe = view.subscribe(() => {});
 
@@ -275,8 +279,90 @@ describe('automerge map adapter', () => {
 
     unsubscribe();
     expect(store.query(runtimeSystemRelations.interests).rows).toEqual([]);
+    expect(relationNotifications).toEqual([
+      [runtimeSystemRelations.interests.name],
+      [runtimeSystemRelations.interests.name]
+    ]);
 
+    unsubscribeRuntime();
     store.close();
+  });
+
+  it('reads Automerge runtime system rows without materializing unrelated relations', () => {
+    const reads = {
+      sources: 0,
+      diagnostics: 0,
+      peers: 0,
+      sync: 0,
+      conflicts: 0,
+      history: 0,
+      objectLocations: 0,
+      storage: 0,
+      interests: 0
+    };
+    const callerInterest = {
+      id: 'caller:interest:tasks',
+      runtime: 'caller',
+      queryKey: 'query:tasks',
+      state: 'active',
+      relationNames: ['tasks']
+    } as const;
+    const runtime = createAutomergeMapRuntime({
+      doc: workspaceDoc(),
+      relations: taskMapping,
+      runtimeId: 'workspace',
+      system: () => ({
+        get sources() {
+          reads.sources += 1;
+          return [];
+        },
+        get diagnostics() {
+          reads.diagnostics += 1;
+          return [];
+        },
+        get peers() {
+          reads.peers += 1;
+          return [];
+        },
+        get sync() {
+          reads.sync += 1;
+          return [];
+        },
+        get conflicts() {
+          reads.conflicts += 1;
+          return [];
+        },
+        get history() {
+          reads.history += 1;
+          return [];
+        },
+        get objectLocations() {
+          reads.objectLocations += 1;
+          return [];
+        },
+        get storage() {
+          reads.storage += 1;
+          return [];
+        },
+        get interests() {
+          reads.interests += 1;
+          return [callerInterest];
+        }
+      })
+    });
+
+    expect(runtime.source.rows(runtimeSystemRelations.interests)).toEqual([callerInterest]);
+    expect(reads).toEqual({
+      sources: 0,
+      diagnostics: 0,
+      peers: 0,
+      sync: 0,
+      conflicts: 0,
+      history: 0,
+      objectLocations: 0,
+      storage: 0,
+      interests: 1
+    });
   });
 
   it('publishes Automerge history rows for active history interests', () => {

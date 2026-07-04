@@ -1349,11 +1349,16 @@ export type RelationRuntimeInterest = {
 export type RelationRuntimeReleaseInterest = () => void;
 export type RelationRuntimeRetainInterest =
   (interest: RelationRuntimeInterest) => RelationRuntimeReleaseInterest | void;
+/** Omit `relationNames` when a runtime change may affect unknown relations. */
+export type RelationRuntimeNotification = {
+  readonly relationNames?: readonly string[];
+};
+export type RelationRuntimeListener = (notification?: RelationRuntimeNotification) => void;
 export type RelationRuntime<Version = unknown> = {
   readonly source: AdapterSource<Version>;
   readonly target?: RelationPatchTarget<Version>;
   readonly snapshot?: () => AdapterSnapshot<Version>;
-  readonly subscribe?: (listener: () => void) => () => void;
+  readonly subscribe?: (listener: RelationRuntimeListener) => () => void;
   readonly retainInterest?: RelationRuntimeRetainInterest;
 };
 export type RelationRuntimeVersion<Runtime extends RelationRuntime = RelationRuntime> =
@@ -1581,7 +1586,7 @@ function composeApplyDurability(results: readonly RelationApplyResult[]): Relati
 
 function composeRuntimeSubscribe(
   runtimes: readonly RelationRuntime[]
-): ((listener: () => void) => () => void) | undefined {
+): ((listener: RelationRuntimeListener) => () => void) | undefined {
   const subscribedRuntimes = runtimes.filter(hasRuntimeSubscribe);
   if (subscribedRuntimes.length === 0) return undefined;
 
@@ -1599,7 +1604,7 @@ function composeRuntimeSubscribe(
 
 function hasRuntimeSubscribe(
   runtime: RelationRuntime
-): runtime is RelationRuntime & { readonly subscribe: (listener: () => void) => () => void } {
+): runtime is RelationRuntime & { readonly subscribe: (listener: RelationRuntimeListener) => () => void } {
   return runtime.subscribe !== undefined;
 }
 
@@ -5611,15 +5616,15 @@ export type MemoryRelationRuntimeOptions = { readonly relationNames?: readonly s
 export function createMemoryRelationRuntime(data: DbInputData = {}, options: MemoryRelationRuntimeOptions = {}): RelationRuntime<number> {
   let dbValue = createDb(data);
   let version = 0;
-  const listeners = new Set<() => void>();
+  const listeners = new Set<RelationRuntimeListener>();
   const relationNames = options.relationNames ?? Object.keys(data);
   const source = (): AdapterSource<number> => ({
     ...fromObjectSource(dbValue.data),
     relationNames,
     version: () => version
   });
-  const notify = (): void => {
-    for (const listener of listeners) listener();
+  const notify = (notification?: RelationRuntimeNotification): void => {
+    for (const listener of listeners) listener(notification);
   };
 
   return {
@@ -5653,7 +5658,7 @@ export function createMemoryRelationRuntime(data: DbInputData = {}, options: Mem
         if (deltas.length > 0) {
           dbValue = { ...dbValue, data: nextDb.data };
           version += 1;
-          notify();
+          notify({ relationNames: relationDeltaNames(deltas) });
         }
 
         return {
@@ -5853,7 +5858,8 @@ export const isWatchMaterialization = (input: unknown): input is Materialization
 export const watchRuntime = <Version, Row>(runtime: RelationRuntime<Version>, target: WatchTarget<Row>, listener: WatchListener<Row>, options: WatchOptions<Row> = {}): RuntimeWatchHandle<Row> => {
   const source = runtime.snapshot?.().source ?? runtime.source;
   const handle = watch(source, target, listener, options) as RuntimeWatchHandle<Row>;
-  const runtimeUnsubscribe = runtime.subscribe?.(() => {
+  const runtimeUnsubscribe = runtime.subscribe?.((notification) => {
+    if (!watchTargetMayDependOnChangedRelations(target, notification?.relationNames)) return;
     void handle.refresh(runtime.snapshot?.().source ?? runtime.source);
   });
 
@@ -5865,6 +5871,16 @@ export const watchRuntime = <Version, Row>(runtime: RelationRuntime<Version>, ta
     }
   };
 };
+function watchTargetMayDependOnChangedRelations<Row>(
+  target: WatchTarget<Row>,
+  changedRelationNames: readonly string[] | undefined
+): boolean {
+  if (changedRelationNames === undefined || changedRelationNames.length === 0) return true;
+
+  const dependencies = isRelationRef(target) ? [target.name] : relationDependencies(target);
+  if (dependencies.length === 0) return true;
+  return dependencies.some((dependency) => changedRelationNames.includes(dependency));
+}
 export const unwatch = (handle: Pick<WatchHandle, 'id'>): UnwatchResult => {
   const state = WATCH_STATES.get(handle.id);
   if (state === undefined) return { id: handle.id, closed: false, diagnostics: [] };
@@ -6213,6 +6229,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
   let state = dbFromSource(currentSource, storeRelations, input.env);
   let version = initialRuntimeSnapshot?.version ?? currentSource.version?.();
   let pendingApplyEnv: DbEnv | undefined;
+  let pendingApplyEnvChanged = false;
   const viewCache: StoreViewCache<Version> = new Map();
   const snapshot = (): StoreSnapshot<Version> => ({
     db: state,
@@ -6227,10 +6244,13 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
   ): StoreSnapshot<Version> => {
     const previousVersionKey = storeViewVersionFingerprint(version);
     const previousDiagnosticsKey = diagnosticsFingerprint(snapshot().diagnostics);
+    const namesForRefresh = pendingApplyEnvChanged || changedRelationNames?.length === 0
+      ? undefined
+      : changedRelationNames;
     const runtimeSnapshot = input.runtime.snapshot?.();
     currentSource = runtimeSnapshot?.source ?? input.runtime.source;
     version = runtimeSnapshot?.version ?? currentSource.version?.();
-    state = dbFromSource(currentSource, storeRelations, envValue);
+    state = dbFromSource(currentSource, storeRelations, envValue, state, namesForRefresh);
     revision += 1;
     const nextSnapshot = {
       db: state,
@@ -6239,14 +6259,17 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       diagnostics: runtimeSnapshot?.diagnostics ?? currentSource.diagnostics?.() ?? [],
       ...(version === undefined ? {} : { version })
     };
-    const storeMetadataChanged = previousVersionKey !== storeViewVersionFingerprint(version)
-      || previousDiagnosticsKey !== diagnosticsFingerprint(nextSnapshot.diagnostics);
-    notifyStoreViewSubscribers(viewCache, nextSnapshot, storeMetadataChanged ? undefined : changedRelationNames);
+    const diagnosticsChanged = previousDiagnosticsKey !== diagnosticsFingerprint(nextSnapshot.diagnostics);
+    const versionChanged = previousVersionKey !== storeViewVersionFingerprint(version);
+    const viewChangedRelationNames = diagnosticsChanged || versionChanged
+      ? undefined
+      : namesForRefresh;
+    notifyStoreViewSubscribers(viewCache, nextSnapshot, viewChangedRelationNames);
     for (const listener of listeners) listener();
     return nextSnapshot;
   };
-  const runtimeUnsubscribe = input.runtime.subscribe?.(() => {
-    if (!closed) refreshFromRuntime();
+  const runtimeUnsubscribe = input.runtime.subscribe?.((notification) => {
+    if (!closed) refreshFromRuntime(undefined, notification?.relationNames);
   });
 
   return {
@@ -6302,6 +6325,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       const revisionBeforeApply = revision;
       const envChanged = envValueFingerprint(state.env) !== envValueFingerprint(transactionResult.db.env);
       pendingApplyEnv = transactionResult.db.env;
+      pendingApplyEnvChanged = envChanged;
       let report: RelationApplyReport<Version>;
       try {
         report = await tryApplyRelationPatches(input.runtime, transactionWritePatches(transactionResult), {
@@ -6311,6 +6335,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
         });
       } finally {
         pendingApplyEnv = undefined;
+        pendingApplyEnvChanged = false;
       }
       const nextSnapshot = report.status === 'rejected'
         ? snapshot()
@@ -9557,11 +9582,32 @@ function addRevisionToBatch<Queries extends QueryBatch>(result: QueryBatchResult
   return Object.fromEntries(Object.entries(result).map(([name, valueValue]) => [name, { ...valueValue, revision }])) as StoreQueryBatchResult<Queries>;
 }
 
-function dbFromSource(source: RelationSource, relations: readonly RelationRef[], envValue: DbInputEnv | undefined): Db {
-  return createDb(
-    Object.fromEntries(relations.map((relationRef) => [relationRef.name, source.rows(relationRef)])),
-    envValue === undefined ? {} : { env: envValue }
-  );
+function dbFromSource(
+  source: RelationSource,
+  relations: readonly RelationRef[],
+  envValue: DbInputEnv | undefined,
+  previous?: Db,
+  changedRelationNames?: readonly string[]
+): Db {
+  if (previous === undefined || changedRelationNames === undefined || changedRelationNames.length === 0) {
+    return createDb(
+      Object.fromEntries(relations.map((relationRef) => [relationRef.name, source.rows(relationRef)])),
+      envValue === undefined ? {} : { env: envValue }
+    );
+  }
+
+  const changedNames = new Set(changedRelationNames);
+  const changedRelations = relations.filter((relationRef) => changedNames.has(relationRef.name));
+  const data = { ...previous.data };
+
+  for (const relationRef of changedRelations) {
+    data[relationRef.name] = [...source.rows(relationRef)];
+  }
+
+  return {
+    data,
+    env: envValue === undefined ? EMPTY_DB_ENV : envValue
+  };
 }
 
 function readWatchTargetRows<Row>(dbValue: WatchDb, target: WatchTarget<Row>, options: WatchOptions<Row> | QueryDiffOptions<Row> = {}): QueryResult<Row> {

@@ -53,9 +53,9 @@ const VIEW_COUNT = 8;
 const CHURN_VIEW_COUNT = 4;
 const PATCH_COUNT = 128;
 const BENCH_OPTIONS = {
-  time: 30,
+  time: 500,
   iterations: 1,
-  warmupTime: 1,
+  warmupTime: 50,
   warmupIterations: 1
 };
 

@@ -28,6 +28,8 @@ export type {
   RelationRangeBound,
   RelationRangeLookup,
   RelationRuntime,
+  RelationRuntimeListener,
+  RelationRuntimeNotification,
   RelationRuntimeInterest,
   RelationRuntimeInterestKind,
   RelationRuntimeReleaseInterest,
