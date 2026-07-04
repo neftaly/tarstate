@@ -12,9 +12,14 @@ import { createMemoryRelationRuntime } from '@tarstate/core/memory-runtime';
 import { asc, as, eq, from, pipe, project, sort, value, where } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { createRuntimeStore, createStore } from '@tarstate/core/store';
-import { replaceAll } from '@tarstate/core/write';
+import { insertOrReplace, replaceAll } from '@tarstate/core/write';
 
 type ItemRow = {
+  readonly id: string;
+  readonly label: string;
+};
+
+type TagRow = {
   readonly id: string;
   readonly label: string;
 };
@@ -24,6 +29,13 @@ const schema = defineSchema({
     key: 'id',
     fields: {
       id: idField('item'),
+      label: stringField()
+    }
+  }),
+  tags: relation<TagRow>({
+    key: 'id',
+    fields: {
+      id: idField('tag'),
       label: stringField()
     }
   })
@@ -86,12 +98,192 @@ describe('@tarstate/react core integration', () => {
     }
   });
 
+  it('does not re-render a query subscriber on commits to an unrelated relation', async () => {
+    const store = createStore({
+      items: [{ id: 'item-a', label: 'Alpha' }],
+      tags: [{ id: 'tag-a', label: 'Tag A' }]
+    });
+    let renderer: ReactTestRenderer | undefined;
+    let renders = 0;
+
+    function Probe() {
+      renders += 1;
+      const query = useQuery(itemQuery, {
+        select: (rows) => rows.map((row) => row.label).join('|')
+      });
+
+      return createElement('output', undefined, `${renders}:${query.data}`);
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Alpha'));
+
+      await act(async () => {
+        await store.commit(insertOrReplace(schema.tags, { id: 'tag-b', label: 'Tag B' }));
+      });
+
+      expect(renders).toBe(1);
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Alpha'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+      store.close();
+    }
+  });
+
+  it('does not re-render when a same-relation commit is filtered out of the query', async () => {
+    const visibleQuery = pipe(
+      from(item),
+      where(eq(item.label, value('Visible'))),
+      project({
+        id: item.id,
+        label: item.label
+      })
+    );
+    const store = createStore({
+      items: [
+        { id: 'item-visible', label: 'Visible' },
+        { id: 'item-hidden', label: 'Hidden' }
+      ],
+      tags: []
+    });
+    const selectedRefs: unknown[] = [];
+    let renderer: ReactTestRenderer | undefined;
+    let renders = 0;
+
+    function Probe() {
+      renders += 1;
+      const query = useQuery(visibleQuery, {
+        select: (rows) => rows.map((row) => row.label)
+      });
+      selectedRefs.push(query.data);
+
+      return createElement('output', undefined, `${renders}:${query.data.join('|')}`);
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Visible'));
+      expect(selectedRefs).toHaveLength(1);
+
+      await act(async () => {
+        await store.commit(insertOrReplace(schema.items, { id: 'item-hidden', label: 'Hidden Prime' }));
+      });
+
+      expect(renders).toBe(1);
+      expect(selectedRefs).toHaveLength(1);
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Visible'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+      store.close();
+    }
+  });
+
+  it('keeps selected query data stable across unrelated store commits', async () => {
+    const store = createStore({
+      items: [{ id: 'item-a', label: 'Alpha' }],
+      tags: [{ id: 'tag-a', label: 'Tag A' }]
+    });
+    const selectedRefs: unknown[] = [];
+    let selectCalls = 0;
+    let selectedData: readonly string[] | undefined;
+    let renderer: ReactTestRenderer | undefined;
+
+    function Probe() {
+      const query = useQuery(itemQuery, {
+        select: (rows) => {
+          selectCalls += 1;
+          return rows.map((row) => row.label);
+        }
+      });
+      selectedData = query.data;
+      selectedRefs.push(query.data);
+
+      return createElement('output', undefined, query.data.join('|'));
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+      });
+
+      const initialData = selectedData;
+      expect(selectCalls).toBe(1);
+      expect(selectedRefs).toHaveLength(1);
+      expect(renderer?.toJSON()).toEqual(renderedOutput('Alpha'));
+
+      await act(async () => {
+        await store.commit(insertOrReplace(schema.tags, { id: 'tag-b', label: 'Tag B' }));
+      });
+
+      expect(selectCalls).toBe(1);
+      expect(selectedData).toBe(initialData);
+      expect(selectedRefs).toEqual([initialData]);
+      expect(renderer?.toJSON()).toEqual(renderedOutput('Alpha'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+      store.close();
+    }
+  });
+
+  it('does not re-render a keyed row subscriber when a different row changes', async () => {
+    const store = createStore({
+      items: [
+        { id: 'item-a', label: 'Alpha' },
+        { id: 'item-b', label: 'Beta' }
+      ],
+      tags: []
+    });
+    let renderer: ReactTestRenderer | undefined;
+    let renders = 0;
+
+    function Probe() {
+      renders += 1;
+      const state = useRow(schema.items, 'item-a');
+
+      return createElement('output', undefined, `${renders}:${state.row?.label ?? 'missing'}`);
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Alpha'));
+
+      await act(async () => {
+        await store.commit(insertOrReplace(schema.items, { id: 'item-b', label: 'Beta Prime' }));
+      });
+
+      expect(renders).toBe(1);
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Alpha'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+      store.close();
+    }
+  });
+
   it('recreates view hooks when the query key changes', async () => {
     const store = createStore({
       items: [
         { id: 'item-a', label: 'Alpha' },
         { id: 'item-b', label: 'Beta' }
-      ]
+      ],
+      tags: []
     });
     let renderer: ReactTestRenderer | undefined;
 
@@ -178,7 +370,7 @@ describe('@tarstate/react core integration', () => {
         await store.refresh();
       });
 
-      expect(renderer?.toJSON()).toEqual(renderedOutput('2/2:1:Beta'));
+      expect(renderer?.toJSON()).toEqual(renderedOutput('2/1:1:Beta'));
     } finally {
       act(() => {
         renderer?.unmount();

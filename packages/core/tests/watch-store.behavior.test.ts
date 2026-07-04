@@ -492,7 +492,7 @@ describe('watch and store behavior', () => {
     expect(first).toEqual(expect.objectContaining({ revision: 0, diagnostics: [] }));
     expect(changed).not.toBe(first);
     expect(changed).toEqual(expect.objectContaining({
-      revision: 0,
+      revision: 1,
       diagnostics: runtimeDiagnostics
     }));
     expect(store.getSnapshot()).toEqual(expect.objectContaining({

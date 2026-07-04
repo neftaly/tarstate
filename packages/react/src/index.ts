@@ -14,7 +14,7 @@ import {
 } from 'react';
 import type { TarstateDiagnostic } from '@tarstate/core';
 import type { Db, RelationKeyValue } from '@tarstate/core/db';
-import { from, queryKey } from '@tarstate/core/query';
+import { from, lookup as lookupQuery, queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
 import type { RelationRef } from '@tarstate/core/schema';
 import { createStore } from '@tarstate/core/store';
@@ -192,9 +192,12 @@ export function useRow<Row>(
   options?: UseViewOptions
 ): RowHookState<Row> {
   const relation = isRelationRef(queryOrRelation) ? queryOrRelation : undefined;
-  const query = relation === undefined
-    ? queryOrRelation
-    : from(relation);
+  const query = useMemo(
+    () => relation === undefined
+      ? queryOrRelation
+      : relationKeyQuery(relation, keyOrPredicate),
+    [keyOrPredicate, queryOrRelation, relation]
+  );
   const viewState = useView(query as Query<Row>, options);
 
   return useMemo(() => {
@@ -329,6 +332,34 @@ function isRelationRef(input: unknown): input is RelationRef {
     && input !== null
     && 'kind' in input
     && input.kind === 'relation';
+}
+
+function relationKeyQuery<Relation extends RelationRef>(
+  relation: Relation,
+  key: unknown
+): Query<RelationRow<Relation>> {
+  return typeof relation.key === 'string' && isQueryKeyValue(key)
+    ? lookupQuery(
+      relation as RelationRef<Record<string, unknown>, string>,
+      relation.key,
+      key
+    ) as Query<RelationRow<Relation>>
+    : from(relation) as Query<RelationRow<Relation>>;
+}
+
+function isQueryKeyValue(input: unknown): boolean {
+  if (input === undefined || input === null || typeof input === 'string' || typeof input === 'boolean') return true;
+  if (typeof input === 'number') return Number.isFinite(input);
+  if (typeof input === 'function' || typeof input === 'bigint' || typeof input === 'symbol') return false;
+  if (Array.isArray(input)) return input.every(isQueryKeyValue);
+  if (!isPlainRecord(input)) return false;
+  return Object.values(input).every(isQueryKeyValue);
+}
+
+function isPlainRecord(input: unknown): input is Record<string, unknown> {
+  if (typeof input !== 'object' || input === null) return false;
+  const prototype = Object.getPrototypeOf(input);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function relationKeyMatches<Row>(relation: RelationRef, row: Row, key: unknown): boolean {
