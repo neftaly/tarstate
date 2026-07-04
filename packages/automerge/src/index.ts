@@ -50,6 +50,8 @@ import type {
 } from './fields.js';
 import {
   compareValues,
+  isPlainObjectLike,
+  isRecord,
   stableKey,
   stableStringify,
   valuesEqual
@@ -917,12 +919,11 @@ function withAutomergeSystemSource<DocumentShape extends object>(
     };
   };
   const systemSource = runtimeSystemSource(systemState);
-  const systemRelationNames = new Set(runtimeSystemRelationList.map((relationRef) => relationRef.name));
   const relationNames = Array.from(new Set([
     ...(dataSource.relationNames ?? []),
     ...runtimeSystemRelationList.map((relationRef) => relationRef.name)
   ]));
-  const isSystemRelation = (relationRef: RelationRef): boolean => systemRelationNames.has(relationRef.name);
+  const isSystemRelation = (relationRef: RelationRef): boolean => runtimeSystemRelationNameSet.has(relationRef.name);
   const systemRows = (relationRef: RelationRef): readonly unknown[] => {
     switch (relationRef.name) {
       case runtimeSystemRelations.sources.name:
@@ -955,23 +956,19 @@ function withAutomergeSystemSource<DocumentShape extends object>(
       : dataSource.rows(relationRef),
     lookup: (lookup) => isSystemRelation(lookup.relation)
       ? systemRows(lookup.relation).filter((row) => isRecord(row)
-        && fieldLookupMatches(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.value))
+        && fieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value))
       : dataSource.lookup?.(lookup) ?? dataSource.rows(lookup.relation)
         .filter((row) => isRecord(row)
           && fieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value)),
     rangeLookup: (lookup) => isSystemRelation(lookup.relation)
       ? systemRows(lookup.relation).filter((row) => isRecord(row)
-        && fieldValueInRange(lookup.relation.fields[lookup.field], runtimeRowField(row, lookup.field), lookup.lower, lookup.upper))
+        && fieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper))
       : dataSource.rangeLookup?.(lookup) ?? dataSource.rows(lookup.relation)
         .filter((row) => isRecord(row)
           && fieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper)),
     version: () => dataSource.version?.() ?? Automerge.getHeads(getDoc()),
     ...(dataSource.diagnostics === undefined ? {} : { diagnostics: dataSource.diagnostics })
   };
-}
-
-function runtimeRowField(row: Record<string, unknown>, field: string): unknown {
-  return (row as unknown as Record<string, unknown>)[field];
 }
 
 function hasRuntimeHistoryInterest(interests: ReadonlyMap<string, RuntimeInterestRow>): boolean {
@@ -1321,7 +1318,7 @@ function lookupRowsForRelationSnapshot(
   const spec = lookup.relation.fields[lookup.field];
   const key = equalityIndexKey(spec, lookup.value, 'lookup');
   if (key === undefined) {
-    return rowsMatchingSnapshot(relationRows.rows, (row) =>
+    return relationRows.rows.filter((row) =>
       fieldLookupMatches(spec, row[lookup.field], lookup.value));
   }
 
@@ -1337,14 +1334,14 @@ function rangeRowsForRelationSnapshot(
 
   const spec = lookup.relation.fields[lookup.field];
   if (!canRangeIndex(spec)) {
-    return rowsMatchingSnapshot(relationRows.rows, (row) =>
+    return relationRows.rows.filter((row) =>
       fieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
   }
   if (lookup.lower === undefined && lookup.upper === undefined) return relationRows.rows;
 
   const index = rangeIndexFor(relationRows, lookup.field, spec);
   if (index === undefined) {
-    return rowsMatchingSnapshot(relationRows.rows, (row) =>
+    return relationRows.rows.filter((row) =>
       fieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
   }
   const lowerIndex = lookup.lower === undefined
@@ -1366,13 +1363,6 @@ function mappedRowsForRelation(
   relationRef: RelationRef
 ): MappedRelationRows | undefined {
   return snapshot.collections.find((entry) => entry.relation.name === relationRef.name);
-}
-
-function rowsMatchingSnapshot(
-  rows: readonly Row[],
-  predicate: (row: Row) => boolean
-): readonly Row[] {
-  return rows.filter(predicate);
 }
 
 function equalityIndexFor(
@@ -1786,7 +1776,7 @@ function mappedCollection<DocumentShape extends object>(
     };
   }
   if (Array.isArray(lookup.value)) {
-    const rows = lookup.value.flatMap((item) => isRecord(item) ? [cloneRow(item)] : []);
+    const rows = lookup.value.filter(isRecord).map(cloneRow);
 
     return {
       rows,
@@ -1795,7 +1785,7 @@ function mappedCollection<DocumentShape extends object>(
     };
   }
   if (isRecord(lookup.value)) {
-    const rows = Object.values(lookup.value).flatMap((value) => rowFromMapEntry(value));
+    const rows = Object.values(lookup.value).filter(isRecord).map(cloneRow);
 
     return {
       rows,
@@ -2254,7 +2244,7 @@ function matchingIndexes(
   const diagnostics: TarstateDiagnostic[] = [];
 
   for (const [index, row] of rows.entries()) {
-    const result = evaluatePredicate(predicate, row, plan, context);
+    const result = evaluateExpr(predicate, row, plan.mapping.relation, context);
     diagnostics.push(...(result.diagnostics ?? []));
     if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedMatchingIndexesResult(exprResultOp(result), diagnostics);
     if (!result.supported) return result.op === undefined
@@ -2264,15 +2254,6 @@ function matchingIndexes(
   }
 
   return { supported: true, indexes, diagnostics };
-}
-
-function evaluatePredicate(
-  predicate: PredicateData,
-  row: Row,
-  plan: RowPlan,
-  context: PatchEvaluationContext
-): ExprEvalResult {
-  return evaluateExpr(predicate, row, plan.mapping.relation, context);
 }
 
 function evaluateExpr(
@@ -2665,13 +2646,15 @@ function applyArrayRowsToDraft(root: unknown, collection: unknown[], plan: RowPl
   const desiredKeys = new Set(plan.rows.map((row) => rowKeyFor(plan.mapping.relation, row)));
   for (let index = collection.length - 1; index >= 0; index -= 1) {
     const rowKey = currentRowKey(plan.mapping.relation, collection[index]);
-    if (rowKey === undefined || !desiredKeys.has(rowKey)) deleteArrayItem(collection, index);
+    if (rowKey === undefined || !desiredKeys.has(rowKey)) {
+      Automerge.deleteAt(collection, index, 1);
+    }
   }
 
   for (const [index, row] of plan.rows.entries()) {
     const current = collection[index];
     if (currentRowKey(plan.mapping.relation, current) !== rowKeyFor(plan.mapping.relation, row)) {
-      insertArrayItem(collection, index, encodeRow(row, plan.mapping.relation));
+      Automerge.insertAt(collection, index, encodeRow(row, plan.mapping.relation));
       continue;
     }
 
@@ -2796,20 +2779,6 @@ function applyNativeCounterIncrement(
 
   counter.increment(amount);
   return true;
-}
-
-function insertArrayItem(collection: unknown[], index: number, value: unknown): void {
-  Automerge.insertAt(collection, index, value);
-}
-
-function deleteArrayItem(collection: unknown[], index: number): void {
-  Automerge.deleteAt(collection, index, 1);
-}
-
-function rowFromMapEntry(value: unknown): readonly Row[] {
-  if (!isRecord(value)) return [];
-
-  return [cloneRow(value)];
 }
 
 function validateCollectionRows(relation: RelationRef, rows: readonly Row[]): readonly TarstateDiagnostic[] {
@@ -3074,21 +3043,12 @@ function isReadonlyArray<Value>(input: Value | readonly Value[]): input is reado
   return Array.isArray(input);
 }
 
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
-}
-
 function isExprData(input: unknown): input is Record<string, unknown> & { readonly op: string } {
   return isRecord(input) && typeof input.op === 'string';
 }
 
 function isHostFunction(input: unknown): input is { readonly fn: (...args: readonly unknown[]) => unknown } {
   return isRecord(input) && input.kind === 'hostFunction' && typeof input.fn === 'function';
-}
-
-function isPlainObjectLike(input: Record<string, unknown>): boolean {
-  const prototype = Object.getPrototypeOf(input);
-  return prototype === Object.prototype || prototype === null;
 }
 
 function rowsExactlyMatch(left: Row, right: Row): boolean {

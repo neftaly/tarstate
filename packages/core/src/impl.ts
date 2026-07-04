@@ -1,9 +1,24 @@
 import { normalizeDiagnostics } from './diagnostics.js';
+import { relationDeltaNames } from './delta.js';
+import {
+  booleanField,
+  idField,
+  isJsonValue,
+  jsonField,
+  numberField,
+  opaqueField,
+  optional,
+  refField,
+  relation,
+  stringField
+} from './schema.js';
 import type {
   TarstateDiagnostic,
   TarstateDiagnosticOptions,
   TarstateDiagnosticSeverity
 } from './diagnostics.js';
+import type { RelationDelta } from './delta.js';
+import type { FieldSpec, RelationRef } from './schema.js';
 
 export { collectDiagnostics, diagnostic, normalizeDiagnostics } from './diagnostics.js';
 export type {
@@ -14,37 +29,30 @@ export type {
   TarstateDiagnosticOptions,
   TarstateDiagnosticSeverity
 } from './diagnostics.js';
+export { relationDeltaNames, relationDeltas } from './delta.js';
+export type { RelationDelta } from './delta.js';
+
+export {
+  anchoredPathField,
+  booleanField,
+  customField,
+  defineSchema,
+  idField,
+  isJsonValue,
+  jsonField,
+  nullable,
+  numberField,
+  opaqueField,
+  optional,
+  refField,
+  relation,
+  stringField
+} from './schema.js';
+export type { CustomFieldSpec, FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
 
 export type MaybePromise<T> = T | Promise<T>;
 
-export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
-type PrimitiveFieldKind = 'string' | 'number' | 'boolean' | 'id' | 'ref' | 'anchoredPath' | 'json' | 'custom';
-
-export type CustomFieldSpec<Value = unknown> = {
-  readonly kind: string;
-  readonly description?: string;
-  readonly validate?: (value: unknown) => boolean;
-  readonly stableKey?: (value: unknown) => string;
-  readonly compare?: (left: unknown, right: unknown) => number;
-  readonly toScalar?: (value: unknown) => string | number | boolean | null;
-  readonly fromScalar?: (value: unknown) => unknown;
-  readonly valueType?: Value;
-};
-
-export type FieldSpec<Value = unknown> = {
-  readonly kind: 'field';
-  readonly valueKind: PrimitiveFieldKind;
-  readonly optional: boolean;
-  readonly nullable: boolean;
-  readonly idDomain?: string;
-  readonly ref?: string;
-  readonly custom?: CustomFieldSpec<Value>;
-  readonly __value?: Value;
-};
-
 type RelationFields = Record<string, FieldSpec>;
-type RelationKeySpec<Row extends object> = keyof Row & string | readonly (keyof Row & string)[];
 type AnyRelationRef = {
   readonly kind: 'relation';
   readonly name: string;
@@ -53,75 +61,7 @@ type AnyRelationRef = {
   readonly ephemeral: boolean;
   readonly __row?: unknown;
 };
-
-export type RelationRef<
-  Row extends object = Record<string, unknown>,
-  Key extends RelationKeySpec<Row> = RelationKeySpec<Row>
-> = {
-  readonly kind: 'relation';
-  readonly name: string;
-  readonly key: Key;
-  readonly fields: RelationFields;
-  readonly ephemeral: boolean;
-  readonly __row?: Row;
-};
-
-type RelationRowFromFields<Fields extends RelationFields> = {
-  readonly [Field in keyof Fields & string]: Fields[Field] extends FieldSpec<infer Value> ? Value : unknown;
-};
 type NonNullish<Value> = Exclude<Value, null | undefined>;
-type RelationInputField<Value> =
-  NonNullish<Value> extends string ? FieldSpec<string | Extract<Value, null | undefined>>
-    : NonNullish<Value> extends number ? FieldSpec<number | Extract<Value, null | undefined>>
-      : NonNullish<Value> extends boolean ? FieldSpec<boolean | Extract<Value, null | undefined>>
-        : FieldSpec<Value>;
-type RelationInput<Row extends object, Key extends RelationKeySpec<Row> = RelationKeySpec<Row>> = {
-  readonly key: Key;
-  readonly fields: { readonly [Field in keyof Row & string]: RelationInputField<Row[Field]> };
-  readonly ephemeral?: boolean;
-};
-
-export function relation<Row extends object, const Key extends RelationKeySpec<Row> = RelationKeySpec<Row>>(input: RelationInput<Row, Key>): RelationRef<Row, Key>;
-export function relation<const Fields extends RelationFields, const Key extends RelationKeySpec<RelationRowFromFields<Fields>>>(input: {
-  readonly key: Key;
-  readonly fields: Fields;
-  readonly ephemeral?: boolean;
-}): RelationRef<RelationRowFromFields<Fields>, Key>;
-export function relation<Row extends object, Key extends RelationKeySpec<Row> = RelationKeySpec<Row>>(input: RelationInput<Row, Key>): RelationRef<Row, Key> {
-  return { kind: 'relation', name: '', key: input.key, fields: input.fields, ephemeral: input.ephemeral ?? false };
-}
-
-export function defineSchema<const Schema extends Record<string, AnyRelationRef>>(
-  schema: Schema
-): { readonly [Key in keyof Schema]: Schema[Key] & { readonly name: Key & string } } {
-  return Object.fromEntries(Object.entries(schema).map(([name, ref]) => [name, { ...ref, name }])) as never;
-}
-
-function fieldSpec<Value>(valueKind: PrimitiveFieldKind): FieldSpec<Value> {
-  return { kind: 'field', valueKind, optional: false, nullable: false };
-}
-
-export const stringField = (): FieldSpec<string> => fieldSpec('string');
-export const numberField = (): FieldSpec<number> => fieldSpec('number');
-export const booleanField = (): FieldSpec<boolean> => fieldSpec('boolean');
-export const anchoredPathField = (): FieldSpec<string> => fieldSpec('anchoredPath');
-export const jsonField = (): FieldSpec<JsonValue> => fieldSpec('json');
-export const idField = (domain: string): FieldSpec<string> => ({ ...fieldSpec<string>('id'), idDomain: domain });
-export const refField = (target: string): FieldSpec<string> => ({ ...fieldSpec<string>('ref'), ref: target });
-export const customField = <Value = unknown>(spec: CustomFieldSpec<Value> | string): FieldSpec<Value> => ({
-  ...fieldSpec<Value>('custom'),
-  custom: typeof spec === 'string' ? { kind: spec } : spec
-});
-export const opaqueField = <Value = unknown>(spec: CustomFieldSpec<Value> | string = 'opaque'): FieldSpec<Value> =>
-  customField<Value>(typeof spec === 'string' ? { kind: spec } : spec);
-export const nullable = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | null> => ({ ...spec, nullable: true });
-export const optional = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | undefined> => ({ ...spec, optional: true });
-
-export function isJsonValue(input: unknown): input is JsonValue {
-  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') return true;
-  if (Array.isArray(input)) return input.every(isJsonValue);
-  return isRecord(input) && Object.values(input).every(isJsonValue);
-}
 
 export type HostExpressionFunction<Value = unknown> = (...args: readonly unknown[]) => Value;
 export type HostFunction<Value = unknown> = {
@@ -1205,14 +1145,8 @@ export function fromObjectSource(data: Record<string, readonly unknown[]>): Rela
   return {
     relationNames: Object.keys(data),
     rows: (relationRef) => data[relationRef.name] ?? [],
-    lookup: ({ relation: relationRef, field: fieldName, value: lookupValue }) =>
-      (data[relationRef.name] ?? []).filter((rowValue) => isRecord(rowValue)
-        && fieldLookupMatches(relationRef.fields[fieldName], rowValue[fieldName], lookupValue)),
-    rangeLookup: ({ relation: relationRef, field: fieldName, lower, upper }) =>
-      (data[relationRef.name] ?? []).filter((rowValue) => {
-        if (!isRecord(rowValue)) return false;
-        return fieldValueInRange(relationRef.fields[fieldName], rowValue[fieldName], lower, upper);
-      })
+    lookup: (lookupValue) => scanLookupRows(data[lookupValue.relation.name] ?? [], lookupValue),
+    rangeLookup: (lookupValue) => scanRangeRows(data[lookupValue.relation.name] ?? [], lookupValue)
   };
 }
 
@@ -1221,31 +1155,30 @@ export const composeSources = (...sources: readonly RelationSource[]): RelationS
   relationNames: Array.from(new Set(sources.flatMap((source) => source.relationNames ?? []))),
   rows: (relationRef) => sources.flatMap((source) => source.rows(relationRef)),
   lookup: (lookupValue) => sources.flatMap((source) =>
-    source.lookup?.(lookupValue) ?? source.rows(lookupValue.relation)
-      .filter((rowValue) => isRecord(rowValue)
-        && fieldLookupMatches(lookupValue.relation.fields[lookupValue.field], rowValue[lookupValue.field], lookupValue.value))),
+    source.lookup?.(lookupValue) ?? scanLookupRows(source.rows(lookupValue.relation), lookupValue)),
   rangeLookup: (lookupValue) => sources.flatMap((source) =>
-    source.rangeLookup?.(lookupValue) ?? source.rows(lookupValue.relation)
-      .filter((rowValue) => {
-        if (!isRecord(rowValue)) return false;
-        return fieldValueInRange(
-          lookupValue.relation.fields[lookupValue.field],
-          rowValue[lookupValue.field],
-          lookupValue.lower,
-          lookupValue.upper
-        );
-      }))
+    source.rangeLookup?.(lookupValue) ?? scanRangeRows(source.rows(lookupValue.relation), lookupValue))
 });
 
-export type RelationDelta<Relation extends RelationRef = RelationRef> = {
-  readonly relation: Relation;
-  readonly added: readonly unknown[];
-  readonly removed: readonly unknown[];
-};
+function scanLookupRows(rows: readonly unknown[], lookupValue: RelationLookup): readonly unknown[] {
+  return rows.filter((rowValue) => isRecord(rowValue)
+    && fieldLookupMatches(
+      lookupValue.relation.fields[lookupValue.field],
+      rowValue[lookupValue.field],
+      lookupValue.value
+    ));
+}
 
-export const relationDeltas = (...deltas: readonly RelationDelta[]): readonly RelationDelta[] => deltas;
-export const relationDeltaNames = (deltas: readonly RelationDelta[]): readonly string[] =>
-  Array.from(new Set(deltas.map((delta) => delta.relation.name)));
+function scanRangeRows(rows: readonly unknown[], lookupValue: RelationRangeLookup): readonly unknown[] {
+  return rows.filter((rowValue) => isRecord(rowValue)
+    && fieldValueInRange(
+      lookupValue.relation.fields[lookupValue.field],
+      rowValue[lookupValue.field],
+      lookupValue.lower,
+      lookupValue.upper
+    ));
+}
+
 const materializationEnvDeltaNames = (deltas: readonly MaterializationEnvDelta[]): readonly string[] =>
   Array.from(new Set(deltas.map((delta) => delta.name)));
 
@@ -5828,11 +5761,10 @@ function watchTargetMayDependOnChangedRelations<Row>(
   target: WatchTarget<Row>,
   changedRelationNames: readonly string[] | undefined
 ): boolean {
-  if (changedRelationNames === undefined || changedRelationNames.length === 0) return true;
-
-  const dependencies = isRelationRef(target) ? [target.name] : relationDependencies(target);
-  if (dependencies.length === 0) return true;
-  return dependencies.some((dependency) => changedRelationNames.includes(dependency));
+  return relationDependenciesMayDependOnChangedRelations(
+    isRelationRef(target) ? [target.name] : relationDependencies(target),
+    changedRelationNames
+  );
 }
 export const unwatch = (handle: Pick<WatchHandle, 'id'>): UnwatchResult => {
   const state = WATCH_STATES.get(handle.id);
@@ -6377,9 +6309,14 @@ function storeViewMayDependOnChangedRelations<Row, Version>(
   entry: StoreViewCacheEntry<Row, Version>,
   changedRelationNames: readonly string[] | undefined
 ): boolean {
-  if (changedRelationNames === undefined || changedRelationNames.length === 0) return true;
+  return relationDependenciesMayDependOnChangedRelations(relationDependencies(entry.query), changedRelationNames);
+}
 
-  const dependencies = relationDependencies(entry.query);
+function relationDependenciesMayDependOnChangedRelations(
+  dependencies: readonly string[],
+  changedRelationNames: readonly string[] | undefined
+): boolean {
+  if (changedRelationNames === undefined || changedRelationNames.length === 0) return true;
   if (dependencies.length === 0) return true;
   return dependencies.some((dependency) => changedRelationNames.includes(dependency));
 }
@@ -6798,8 +6735,7 @@ function evaluateLookup(
   }
   const alias = typeof data.alias === 'string' ? data.alias : relationRef.name;
   const lookupRows = source.lookup?.({ relation: relationRef, field: fieldName, value: data.value })
-    ?? source.rows(relationRef).filter((rowValue) => isRecord(rowValue)
-      && fieldLookupMatches(relationRef.fields[fieldName], rowValue[fieldName], data.value));
+    ?? scanLookupRows(source.rows(relationRef), { relation: relationRef, field: fieldName, value: data.value });
   return validateSourceRows(relationRef, lookupRows, diagnostics)
     .map((rowValue) => entryForRow(rowValue, alias, relationRef.name, relationRef.fields));
 }
@@ -7834,7 +7770,7 @@ function relationKeyInputMatchesRow(
   const fields = relationKeyFields(relationRef);
   const fieldName = fields.length === 1 ? fields[0] : undefined;
   if (fieldName !== undefined && !Array.isArray(input) && canCompareRelationKeyAtom(input)) {
-    return rowValue[fieldName] !== undefined && Object.is(rowValue[fieldName], input);
+    return relationKeyFieldValueMatches(rowValue, fieldName, input);
   }
   return rowKey(relationRef, rowValue) === relationKeyInputToKey(relationRef, input);
 }
@@ -7850,11 +7786,15 @@ function relationRowKeyMatchesRow(
     const valueValue = right[fieldName];
     if (valueValue === undefined) return false;
     if (canCompareRelationKeyAtom(valueValue)) {
-      return left[fieldName] !== undefined && Object.is(left[fieldName], valueValue);
+      return relationKeyFieldValueMatches(left, fieldName, valueValue);
     }
   }
   const key = rowKey(relationRef, right);
   return key !== undefined && rowKey(relationRef, left) === key;
+}
+
+function relationKeyFieldValueMatches(rowValue: Record<string, unknown>, fieldName: string, valueValue: unknown): boolean {
+  return rowValue[fieldName] !== undefined && Object.is(rowValue[fieldName], valueValue);
 }
 
 function canCompareRelationKeyAtom(input: unknown): boolean {
@@ -8074,7 +8014,6 @@ function envValueFingerprint(
   if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
   if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
   if (typeof input === 'function') return `~function:${input.name}`;
-  if (input instanceof Date) return `~date:${Number.isNaN(input.valueOf()) ? 'Invalid' : input.toISOString()}`;
   if (input instanceof RegExp) return `~regexp:${input.source}/${input.flags}`;
   if (input instanceof Map) {
     const reference = envSeenReference(input, seen);

@@ -5,7 +5,7 @@ import {
   type FieldSpec
 } from '@tarstate/core/schema';
 
-import { compareValues, stableKey } from './value.js';
+import { compareValues, isRecord, stableKey } from './value.js';
 
 export type AutomergeObjectPath = readonly Automerge.Prop[];
 export type AutomergeObjectReference = {
@@ -193,8 +193,4 @@ function isAutomergePath(input: unknown): input is readonly Automerge.Prop[] {
 
 function isStringArray(input: unknown): input is readonly string[] {
   return Array.isArray(input) && input.every((item) => typeof item === 'string');
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

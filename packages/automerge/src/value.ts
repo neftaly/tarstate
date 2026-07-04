@@ -40,11 +40,11 @@ export function compareValues(left: unknown, right: unknown): number {
   return String(left).localeCompare(String(right));
 }
 
-function isRecord(input: unknown): input is Record<string, unknown> {
+export function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
-function isPlainObjectLike(input: Record<string, unknown>): boolean {
+export function isPlainObjectLike(input: Record<string, unknown>): boolean {
   const prototype = Object.getPrototypeOf(input);
   return prototype === Object.prototype || prototype === null;
 }

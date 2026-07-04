@@ -123,52 +123,33 @@ export function useTarstateSubscription<Row, Selected>(
   const view = useStoreView(query, options);
   const onChangeRef = useRef(options.onChange);
   onChangeRef.current = options.onChange;
-  const select = hasSubscriptionSelect(options) ? options.select : undefined;
-  const equality = hasSubscriptionSelect(options) ? options.equality : undefined;
+  const selectedOptions = hasSubscriptionSelect(options) ? options : undefined;
+  const select = selectedOptions?.select;
+  const equality = selectedOptions?.equality;
   const fireImmediately = options.fireImmediately;
 
   useEffect(() => {
-    if (select === undefined) {
-      const read = selectedSnapshotReader(
-        () => view.getSnapshot(),
-        (snapshot) => snapshot,
-        areViewSnapshotsEqual,
-        Object.is
-      );
-      const notifyIfChanged = (): void => {
-        const next = read();
-        if (!next.changed) return;
-
-        (onChangeRef.current as (snapshot: StoreViewSnapshot<Row>) => void)(next.selected);
-      };
-
-      const initial = read();
-      if (fireImmediately === true) {
-        (onChangeRef.current as (snapshot: StoreViewSnapshot<Row>) => void)(initial.selected);
-      }
-
-      return view.subscribe(notifyIfChanged);
-    }
-
     const read = selectedSnapshotReader(
       () => view.getSnapshot(),
-      select,
+      (snapshot): StoreViewSnapshot<Row> | Selected => select === undefined ? snapshot : select(snapshot),
       areViewSnapshotsEqual,
-      (left, right) => equality === undefined ? Object.is(left, right) : equality(left, right)
+      (left, right) => equality === undefined ? Object.is(left, right) : equality(left as Selected, right as Selected)
     );
-    const notifyIfChanged = (): void => {
-      const next = read();
-      if (!next.changed) return;
+    const notify = (next: ReturnType<typeof read>): void => {
+      if (select === undefined) {
+        (onChangeRef.current as (snapshot: StoreViewSnapshot<Row>) => void)(next.selected as StoreViewSnapshot<Row>);
+        return;
+      }
 
-      (onChangeRef.current as (selected: Selected, snapshot: StoreViewSnapshot<Row>) => void)(next.selected, next.source);
+      (onChangeRef.current as (selected: Selected, snapshot: StoreViewSnapshot<Row>) => void)(next.selected as Selected, next.source);
     };
-
     const initial = read();
-    if (fireImmediately === true) {
-      (onChangeRef.current as (selected: Selected, snapshot: StoreViewSnapshot<Row>) => void)(initial.selected, initial.source);
-    }
+    if (fireImmediately === true) notify(initial);
 
-    return view.subscribe(notifyIfChanged);
+    return view.subscribe(() => {
+      const next = read();
+      if (next.changed) notify(next);
+    });
   }, [equality, fireImmediately, select, view]);
 }
 
@@ -286,16 +267,8 @@ function areQueryHookSnapshotsEqual<Row, Selected>(
   equality: ((left: Selected, right: Selected) => boolean) | undefined
 ): boolean {
   return left.queryKey === right.queryKey
-    && selectedDataEqual(left.data, right.data, equality)
+    && (equality === undefined ? Object.is(left.data, right.data) : equality(left.data, right.data))
     && diagnosticsEqual(left.diagnostics, right.diagnostics);
-}
-
-function selectedDataEqual<Selected>(
-  left: Selected,
-  right: Selected,
-  equality: ((left: Selected, right: Selected) => boolean) | undefined
-): boolean {
-  return equality === undefined ? Object.is(left, right) : equality(left, right);
 }
 
 function hasSelect<Row, Selected>(

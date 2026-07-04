@@ -51,6 +51,7 @@ import {
   type TarstateDiagnosticOptions,
   type TarstateDiagnosticSeverity
 } from '@tarstate/core/diagnostics';
+import { relationDeltaNames, relationDeltas, type RelationDelta } from '@tarstate/core/delta';
 import { validateRelationRow, type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
 import {
   demat,
@@ -105,6 +106,7 @@ import type {
 import {
   customField,
   defineSchema,
+  isJsonValue,
   numberField,
   opaqueField,
   relation,
@@ -196,6 +198,25 @@ const openingDb = createDb({
 });
 
 describe('public API contracts', () => {
+  it('keeps schema JSON validation on JSON-compatible values only', () => {
+    expect(isJsonValue({ nested: ['value', 1, true, null] })).toBe(true);
+    expect(isJsonValue([1, { ok: false }])).toBe(true);
+    expect(isJsonValue(() => undefined)).toBe(false);
+    expect(isJsonValue({ callback: () => undefined })).toBe(false);
+    expect(isJsonValue(undefined)).toBe(false);
+  });
+
+  it('exposes relation deltas from the delta subpath', () => {
+    const delta = {
+      relation: schema.entries,
+      added: [{ id: 'e3', accountId: 'cash', amount: 20, memo: 'sale' }],
+      removed: []
+    } satisfies RelationDelta<typeof schema.entries>;
+
+    expect(relationDeltas(delta)).toEqual([delta]);
+    expect(relationDeltaNames(relationDeltas(delta, delta))).toEqual(['entries']);
+  });
+
   it('keeps TarstateDiagnostic as the canonical diagnostic type', () => {
     const known = diagnostic({
       code: 'not_implemented',

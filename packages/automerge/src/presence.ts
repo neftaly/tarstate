@@ -14,6 +14,7 @@ import type {
 } from '@tarstate/core/adapter';
 import type { RelationRef } from '@tarstate/core/schema';
 import type { WritePatch } from '@tarstate/core/write';
+import { isRecord } from './value.js';
 
 export type AutomergePresenceVersion = {
   readonly revision: number;
@@ -572,10 +573,6 @@ function applyStatus(patches: number, acceptedPatches: number): 'accepted' | 'pa
   if (acceptedPatches === patches) return 'accepted';
   if (acceptedPatches > 0) return 'partial';
   return 'rejected';
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
 function valuesEqual(left: unknown, right: unknown): boolean {

@@ -10,23 +10,26 @@ export function selectedSnapshotReader<Source, Selected>(
   sourceEqual: (left: Source, right: Source) => boolean,
   selectedEqual: (left: Selected, right: Selected) => boolean
 ): () => SelectedSnapshotRead<Source, Selected> {
-  let current: Pick<SelectedSnapshotRead<Source, Selected>, 'source' | 'selected'> | undefined;
+  let currentSource: Source;
+  let currentSelected: Selected;
+  let hasCurrent = false;
 
   return () => {
     const nextSource = readSource();
-    if (current !== undefined && sourceEqual(current.source, nextSource)) {
-      return { source: current.source, selected: current.selected, changed: false };
+    if (hasCurrent && sourceEqual(currentSource, nextSource)) {
+      return { source: currentSource, selected: currentSelected, changed: false };
     }
 
     const nextSelected = select(nextSource);
-    if (current !== undefined && selectedEqual(current.selected, nextSelected)) {
-      const selected = current.selected;
-      current = { source: nextSource, selected };
-      return { source: current.source, selected: current.selected, changed: false };
+    if (hasCurrent && selectedEqual(currentSelected, nextSelected)) {
+      currentSource = nextSource;
+      return { source: nextSource, selected: currentSelected, changed: false };
     }
 
-    current = { source: nextSource, selected: nextSelected };
-    return { source: current.source, selected: current.selected, changed: true };
+    currentSource = nextSource;
+    currentSelected = nextSelected;
+    hasCurrent = true;
+    return { source: nextSource, selected: nextSelected, changed: true };
   };
 }
 
