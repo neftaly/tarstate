@@ -1942,7 +1942,7 @@ entire research note.
 V1 includes:
 
 - `SchemaManifest` with `kind`, `formatVersion`, `schemaId`, `relations`, and
-  optional `description`/`metadata`.
+  optional `description`/`metadata`/`codecs`.
 - `RelationManifest` with `key`, `fields`, optional `ephemeral`, and optional
   `description`/`metadata`.
 - `FieldManifest` for existing Tarstate field kinds: `string`, `number`,
@@ -2018,12 +2018,19 @@ The spec deliberately tightens a few research ideas for v1:
 - V1 refs target string-valued single-field relation keys only. Composite refs,
   refs to non-key unique fields, and refs to custom/numeric/boolean keys are
   reserved for a later layer.
+- Single-field keys use string form in canonical v1 manifests; key arrays are
+  only for composite keys with at least two fields.
+- Canonical byte stability is defined by the canonical string, using emit-time
+  key sorting and UTF-16 code-unit order.
 - Codec declarations expose primitive scalar representations only.
+- Custom key fields require runtime `stableKey` or `toScalar`; `compare` is not
+  a v1 keying capability.
 - Strict row validation rejects undeclared extra fields; adapters may preserve
   them outside the declared relation view.
 - Schema diagnostics have a fixed minimum shape and fixture matrix.
 - Manifests are treated as untrusted data, with robustness requirements for
-  prototype-safe inspection and no mutation during canonicalization.
+  prototype-safe inspection, no user-defined conversion hooks, and no mutation
+  during canonicalization.
 
 The research items intentionally deferred by the spec are still represented as
 reserved layers or explicit non-goals:
