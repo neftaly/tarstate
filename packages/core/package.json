@@ -4,82 +4,10 @@
   "version": "0.0.0",
   "license": "AGPL-3.0-only",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": ["src"],
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    },
-    "./adapter": {
-      "types": "./dist/adapter.d.ts",
-      "import": "./dist/adapter.js"
-    },
-    "./constraints": {
-      "types": "./dist/constraints.d.ts",
-      "import": "./dist/constraints.js"
-    },
-    "./db": {
-      "types": "./dist/db.d.ts",
-      "import": "./dist/db.js"
-    },
-    "./diagnostics": {
-      "types": "./dist/diagnostics.d.ts",
-      "import": "./dist/diagnostics.js"
-    },
-    "./delta": {
-      "types": "./dist/delta.d.ts",
-      "import": "./dist/delta.js"
-    },
-    "./diff": {
-      "types": "./dist/diff.d.ts",
-      "import": "./dist/diff.js"
-    },
-    "./evaluate": {
-      "types": "./dist/evaluate.d.ts",
-      "import": "./dist/evaluate.js"
-    },
-    "./memory-runtime": {
-      "types": "./dist/memory-runtime.d.ts",
-      "import": "./dist/memory-runtime.js"
-    },
-    "./materialization": {
-      "types": "./dist/materialization.d.ts",
-      "import": "./dist/materialization.js"
-    },
-    "./query": {
-      "types": "./dist/query.d.ts",
-      "import": "./dist/query.js"
-    },
-    "./relic": {
-      "types": "./dist/relic.d.ts",
-      "import": "./dist/relic.js"
-    },
-    "./runtime": {
-      "types": "./dist/runtime.d.ts",
-      "import": "./dist/runtime.js"
-    },
-    "./schema": {
-      "types": "./dist/schema.d.ts",
-      "import": "./dist/schema.js"
-    },
-    "./source": {
-      "types": "./dist/source.d.ts",
-      "import": "./dist/source.js"
-    },
-    "./store": {
-      "types": "./dist/store.d.ts",
-      "import": "./dist/store.js"
-    },
-    "./watch": {
-      "types": "./dist/watch.d.ts",
-      "import": "./dist/watch.js"
-    },
-    "./write": {
-      "types": "./dist/write.d.ts",
-      "import": "./dist/write.js"
-    }
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
   },
   "scripts": {
     "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.ts",

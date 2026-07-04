@@ -4,14 +4,10 @@
   "version": "0.0.0",
   "license": "AGPL-3.0-only",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": ["src"],
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
   },
   "scripts": {
     "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.tsx",
