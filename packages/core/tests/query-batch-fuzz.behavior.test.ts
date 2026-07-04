@@ -3,7 +3,7 @@ import { q, qMany, qManyResult, qResult, type Db, type DbQueryOptions } from '@t
 import { mat } from '@tarstate/core/materialization';
 import { asc, call, env, eq, field, from, gt, gte, hostFn, pipe, project, sort, value, where, type Query } from '@tarstate/core/query';
 import { entry, makeDb, openingAccounts, openingEntries, type Entry } from './behavior-fixtures.js';
-import { chooseSeeded, createSeededRandom } from './fuzz-helpers.js';
+import { chooseSeeded, createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type IdRow = {
   readonly id: string;
@@ -17,9 +17,13 @@ type QueryFactory = {
   readonly make: () => Query<IdRow>;
 };
 
+const duplicateCacheSeeds = resolveFuzzSeeds([5, 17, 31, 43] as const);
+const unsafeDuplicateSeeds = resolveFuzzSeeds([7, 19, 53] as const);
+const batchShapeSeeds = resolveFuzzSeeds([3, 8, 13, 21, 34, 55, 89, 144] as const);
+
 describe('qMany seeded duplicate cache behavior', () => {
   it('reuses generated safe duplicate query batches once per duplicate key', () => {
-    for (const seed of [5, 17, 31, 43] as const) {
+    for (const seed of duplicateCacheSeeds) {
       const [first, second] = safeFactories(seed);
       const batch = {
         first: first.make(),
@@ -53,7 +57,7 @@ describe('qMany seeded duplicate cache behavior', () => {
   });
 
   it('skips generated duplicate reuse for unsafe options, host functions, and function sort keys', () => {
-    for (const seed of [7, 19, 53] as const) {
+    for (const seed of unsafeDuplicateSeeds) {
       const duplicateQuery = safeFactories(seed)[0].make;
 
       let mapCalls = 0;
@@ -94,7 +98,7 @@ describe('qMany seeded duplicate cache behavior', () => {
   });
 
   it('matches independent reads across generated batch target and option shapes', () => {
-    for (const seed of [3, 8, 13, 21, 34, 55, 89, 144] as const) {
+    for (const seed of batchShapeSeeds) {
       const testCase = batchCase(seed);
 
       expect(qMany(testCase.db, testCase.batch, testCase.options), `seed ${seed} ${testCase.label} rows`).toEqual(

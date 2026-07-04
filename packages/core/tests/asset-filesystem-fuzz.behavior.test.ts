@@ -15,7 +15,7 @@ import {
 } from '@tarstate/core/schema';
 import { fromObjectSource } from '@tarstate/core/source';
 import { deleteByKey, deleteExact, insert, replaceAll, updateByKey, type WritePatch } from '@tarstate/core/write';
-import { chooseSeeded, createSeededRandom } from './fuzz-helpers.js';
+import { chooseSeeded, createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type AssetKind = 'svg' | 'gltf' | 'bin' | 'json';
 type AssetDependencyKind = 'buffer' | 'svg-texture' | 'manifest' | 'preview' | 'schema' | 'sibling';
@@ -126,7 +126,7 @@ const dependenciesBySource = pipe(from(dependency), sort(asc(dependency.fromAsse
 const ASSET_KINDS = ['bin', 'gltf', 'json', 'svg'] as const satisfies readonly AssetKind[];
 const MUTATION_ACTIONS = ['insert:duplicate-path', 'insert:fresh-path', 'rename', 'deleteByKey', 'deleteExact'] as const;
 
-const SEEDS = [0xa55e_7001, 0xa55e_7002, 0xa55e_7003] as const;
+const SEEDS = resolveFuzzSeeds([0xa55e_7001, 0xa55e_7002, 0xa55e_7003] as const);
 const ROWS_PER_SEED = 72;
 const MUTATIONS_PER_SEED = 15;
 const FULL_ASSERTION_INTERVAL = 5;
@@ -307,16 +307,16 @@ function assertSourceLookups(seed: number, rows: readonly AssetRow[]): void {
   expect(source.rows(assetSchema.assets), `seed ${seed.toString(16)} source rows`).toEqual(rows);
 
   for (const path of samplePaths) {
-    expect(source.lookup?.({ relation: assetSchema.assets, field: 'path', value: path }), `source lookup path ${path}`)
+    expect(source.lookup?.({ relation: assetSchema.assets, field: 'path', value: path }), `seed ${seed.toString(16)} source lookup path ${path}`)
       .toEqual(rows.filter((row) => row.path === path));
   }
 
   for (const dir of sampleDirs) {
-    expect(source.lookup?.({ relation: assetSchema.assets, field: 'dir', value: dir }), `source list dir ${dir}`)
+    expect(source.lookup?.({ relation: assetSchema.assets, field: 'dir', value: dir }), `seed ${seed.toString(16)} source list dir ${dir}`)
       .toEqual(rows.filter((row) => row.dir === dir));
   }
 
-  expect(source.lookup?.({ relation: assetSchema.assets, field: 'path', value: `missing://${seed.toString(16)}` }))
+  expect(source.lookup?.({ relation: assetSchema.assets, field: 'path', value: `missing://${seed.toString(16)}` }), `seed ${seed.toString(16)} source missing path`)
     .toEqual([]);
 }
 

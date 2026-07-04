@@ -27,7 +27,7 @@ import {
 } from '@tarstate/core/watch';
 import { deleteByKey, insert, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { entry, makeDb, schema } from './behavior-fixtures.js';
-import { createSeededRandom } from './fuzz-helpers.js';
+import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 const entryList = pipe(
   from(entry),
@@ -38,6 +38,7 @@ const entryList = pipe(
     amount: entry.amount
   })
 );
+const watchSeeds = resolveFuzzSeeds([0x4a11, 0x4a12, 0x4a13] as const);
 
 const cashEntryProjection = pipe(
   from(entry),
@@ -184,7 +185,7 @@ describe('watch and store behavior', () => {
   it('watch refresh, query diffs, and tracked transactions match seeded row-diff oracles', async () => {
     let checks = 0;
 
-    for (const seed of [0x4a11, 0x4a12, 0x4a13] as const) {
+    for (const seed of watchSeeds) {
       let db = makeDb();
 
       for (const [index, batch] of seededWatchBatches(seed).entries()) {

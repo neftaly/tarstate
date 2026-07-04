@@ -52,7 +52,7 @@ import {
   type WritePatch
 } from '@tarstate/core/write';
 import { account, entry, makeDb, schema, type Account, type Entry } from './behavior-fixtures.js';
-import { chooseSeeded, createSeededRandom } from './fuzz-helpers.js';
+import { chooseSeeded, createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type RelicQueryCase = {
   readonly label: string;
@@ -68,8 +68,8 @@ type TxCase = {
   readonly patches: readonly WritePatch[];
 };
 
-const querySeeds = Array.from({ length: 48 }, (_, index) => index + 1);
-const txSeeds = Array.from({ length: 32 }, (_, index) => index + 101);
+const querySeeds = resolveFuzzSeeds(Array.from({ length: 48 }, (_, index) => index + 1));
+const txSeeds = resolveFuzzSeeds(Array.from({ length: 32 }, (_, index) => index + 101));
 
 describe('Relic compatibility seeded fuzz', () => {
   it('parses generated query forms like equivalent builder queries', () => {

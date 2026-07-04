@@ -10,9 +10,9 @@ import {
   value,
   type QueryData
 } from '@tarstate/core/query';
-import { createSeededRandom } from './fuzz-helpers.js';
+import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
-const seeds = [3, 7, 11, 19, 31, 47, 73, 101] as const;
+const seeds = resolveFuzzSeeds([3, 7, 11, 19, 31, 47, 73, 101] as const);
 
 describe('queryKey seeded fuzz behavior', () => {
   it('rejects generated raw function positions with useful paths', () => {

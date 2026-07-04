@@ -40,7 +40,7 @@ import { createStore } from '@tarstate/core/store';
 import { watch, watchTargetKey } from '@tarstate/core/watch';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { account, entry, makeDb, schema, type Account, type Entry } from './behavior-fixtures.js';
-import { createSeededRandom } from './fuzz-helpers.js';
+import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type SupportedVariant = {
   readonly label: string;
@@ -280,6 +280,13 @@ const unsupportedVariants: readonly UnsupportedVariant[] = [
   }
 ];
 
+const supportedMaterializationSeeds = resolveFuzzSeeds([5, 17, 43, 91, 137] as const);
+const mixedMaterializationSeeds = resolveFuzzSeeds([3, 11, 29, 47, 83] as const);
+const declaredIndexSeeds = resolveFuzzSeeds([13, 37, 73] as const);
+const joinMaterializationSeeds = resolveFuzzSeeds([19, 41, 83] as const);
+const watchStoreSeeds = resolveFuzzSeeds([11, 29, 47] as const);
+const unsupportedMaterializationSeeds = resolveFuzzSeeds([7, 23, 61] as const);
+
 describe('materialization fuzz behavior', () => {
   it('keeps supported single-source materializations equivalent to dematerialized rows across seeded transactions', () => {
     let maintainedChanges = 0;
@@ -296,53 +303,54 @@ describe('materialization fuzz behavior', () => {
         diagnostics: []
       }));
 
-      for (const seed of [5, 17, 43, 91, 137]) {
+      for (const seed of supportedMaterializationSeeds) {
         let db = mat(seededDb(seed), variant.query);
-        expect(q(db, variant.query)).toEqual(q(demat(db, variant.query), variant.query));
+        expect(q(db, variant.query), `${variant.label} seed ${seed} initial rows`).toEqual(q(demat(db, variant.query), variant.query));
 
         for (const [step, patch] of randomEntryPatches(seed * 211 + variant.label.length, 36).entries()) {
+          const label = `${variant.label} seed ${seed} step ${step} ${patch.op}`;
           const beforeRows = q(db, variant.query);
           const result = tryTransact(db, patch);
-          expect(result.committed, `${variant.label} seed ${seed} step ${step} committed ${patch.op}`).toBe(true);
+          expect(result.committed, `${label} committed`).toBe(true);
           db = result.db;
 
           const materializedRows = q(db, variant.query);
           const dematerializedRows = q(demat(db, variant.query), variant.query);
           const change = result.materializations?.changes[0];
 
-          expect(change, `${variant.label} seed ${seed} step ${step} maintained ${patch.op}`).toBeDefined();
+          expect(change, `${label} maintained`).toBeDefined();
           if (change === undefined) continue;
 
           maintainedChanges += 1;
           equivalenceChecks += 1;
-          expect(materializedRows).toBe(change.rows);
-          expect(materializedRows).toEqual(dematerializedRows);
-          expect(change.rows).toEqual(dematerializedRows);
-          expect(change.previousRows).toEqual(beforeRows);
+          expect(materializedRows, `${label} row identity`).toBe(change.rows);
+          expect(materializedRows, `${label} materialized rows`).toEqual(dematerializedRows);
+          expect(change.rows, `${label} change rows`).toEqual(dematerializedRows);
+          expect(change.previousRows, `${label} previous rows`).toEqual(beforeRows);
 
           if (change.update === 'incremental') {
             const expected = diffRows(beforeRows, dematerializedRows, { keyBy: variant.keyBy });
             incrementalChanges += 1;
-            expect(change.recomputed, variant.label).toBe(false);
-            expect(change.reason).toBe('incremental delta maintenance');
-            expect(change.diagnostics, variant.label).toEqual([]);
-            expect(change.rowChanges).toEqual(expected.changes);
-            expect(change.added).toEqual(addedRows(expected.changes));
-            expect(change.removed).toEqual(removedRows(expected.changes));
-            expect(expected.diagnostics).toEqual([]);
+            expect(change.recomputed, `${label} recomputed`).toBe(false);
+            expect(change.reason, `${label} reason`).toBe('incremental delta maintenance');
+            expect(change.diagnostics, `${label} diagnostics`).toEqual([]);
+            expect(change.rowChanges, `${label} row changes`).toEqual(expected.changes);
+            expect(change.added, `${label} added`).toEqual(addedRows(expected.changes));
+            expect(change.removed, `${label} removed`).toEqual(removedRows(expected.changes));
+            expect(expected.diagnostics, `${label} oracle diagnostics`).toEqual([]);
           } else if (change.update === 'carried') {
             carriedChanges += 1;
-            expect(change.recomputed, variant.label).toBe(false);
-            expect(change.reason).toBe('dependencies unchanged');
-            expect(change.diagnostics, variant.label).toEqual([]);
-            expect(change.rowChanges).toEqual([]);
-            expect(change.added).toEqual([]);
-            expect(change.removed).toEqual([]);
+            expect(change.recomputed, `${label} recomputed`).toBe(false);
+            expect(change.reason, `${label} reason`).toBe('dependencies unchanged');
+            expect(change.diagnostics, `${label} diagnostics`).toEqual([]);
+            expect(change.rowChanges, `${label} row changes`).toEqual([]);
+            expect(change.added, `${label} added`).toEqual([]);
+            expect(change.removed, `${label} removed`).toEqual([]);
           } else {
             safetyRecomputes += 1;
-            expect(change.update).toBe('recomputed');
-            expect(change.recomputed, `${variant.label} ${patch.op} ${change.reason}`).toBe(true);
-            expect(change.diagnostics, `${variant.label} ${patch.op} ${change.reason}`).toEqual(expect.arrayContaining([
+            expect(change.update, `${label} update kind`).toBe('recomputed');
+            expect(change.recomputed, `${label} ${change.reason}`).toBe(true);
+            expect(change.diagnostics, `${label} ${change.reason}`).toEqual(expect.arrayContaining([
               expect.objectContaining({ code: 'materialization_unsupported' })
             ]));
           }
@@ -368,21 +376,22 @@ describe('materialization fuzz behavior', () => {
     let incrementalUpdates = 0;
     let fallbackRecomputes = 0;
 
-    for (const seed of [3, 11, 29, 47, 83]) {
+    for (const seed of mixedMaterializationSeeds) {
       for (const variant of variants) {
         let db = mat(createDb({ accounts: makeDb().data.accounts ?? [], entries: randomEntries(seed, 7) }), variant.query);
 
-        for (const patch of randomEntryPatches(seed * 97 + variant.query.data.op.length, 24)) {
+        for (const [step, patch] of randomEntryPatches(seed * 97 + variant.query.data.op.length, 24).entries()) {
+          const label = `${variant.label} seed ${seed} step ${step} ${patch.op}`;
           const result = tryTransact(db, patch);
-          expect(result.committed, `${variant.label} committed ${patch.op}`).toBe(true);
+          expect(result.committed, `${label} committed`).toBe(true);
           db = result.db;
 
-          expect(q(db, variant.query)).toEqual(q(demat(db, variant.query), variant.query));
+          expect(q(db, variant.query), `${label} materialized rows`).toEqual(q(demat(db, variant.query), variant.query));
 
           const change = result.materializations?.changes[0];
           if (change?.update === 'incremental') incrementalUpdates += 1;
           if (change?.update === 'recomputed') {
-            expect(change.diagnostics).toEqual(expect.arrayContaining([
+            expect(change.diagnostics, `${label} recompute diagnostics`).toEqual(expect.arrayContaining([
               expect.objectContaining({ code: 'materialization_unsupported' })
             ]));
             fallbackRecomputes += 1;
@@ -427,20 +436,21 @@ describe('materialization fuzz behavior', () => {
         diagnostics: []
       }));
 
-      for (const seed of [13, 37, 73]) {
+      for (const seed of declaredIndexSeeds) {
         let db = mat(seededDb(seed), variant.query);
         lookupChecks += expectDeclaredIndexLookups(db, variant, seed);
 
         for (const [step, patch] of randomEntryPatchesForDb(seed, seed * 811 + variant.label.length, 28).entries()) {
+          const label = `${variant.label} seed ${seed} step ${step} ${patch.op}`;
           const result = tryTransact(db, patch);
-          expect(result.committed, `${variant.label} committed ${patch.op}`).toBe(true);
+          expect(result.committed, `${label} committed`).toBe(true);
           db = result.db;
 
           const change = result.materializations?.changes[0];
-          expect(q(db, variant.query)).toEqual(q(demat(db, variant.query), variant.query));
+          expect(q(db, variant.query), `${label} materialized rows`).toEqual(q(demat(db, variant.query), variant.query));
           if (change !== undefined) {
             indexSpecChecks += 1;
-            expect(change.indexSpecs, `${variant.label} ${patch.op}`).toEqual([
+            expect(change.indexSpecs, `${label} index specs`).toEqual([
               expect.objectContaining({ op: variant.op, field: variant.field })
             ]);
           }
@@ -465,14 +475,15 @@ describe('materialization fuzz behavior', () => {
       diagnostics: []
     }));
 
-    for (const seed of [19, 41, 83]) {
+    for (const seed of joinMaterializationSeeds) {
       let db = mat(seededDb(seed), joinedEntryAccounts);
-      expect(q(db, joinedEntryAccounts)).toEqual(q(demat(db, joinedEntryAccounts), joinedEntryAccounts));
+      expect(q(db, joinedEntryAccounts), `join seed ${seed} initial rows`).toEqual(q(demat(db, joinedEntryAccounts), joinedEntryAccounts));
 
-      for (const patch of randomJoinPatches(seed, seed * 1559, 36)) {
+      for (const [step, patch] of randomJoinPatches(seed, seed * 1559, 36).entries()) {
+        const label = `join seed ${seed} step ${step} ${patch.op}`;
         const beforeRows = q(db, joinedEntryAccounts);
         const result = tryTransact(db, patch);
-        expect(result.committed, `join committed ${patch.op}`).toBe(true);
+        expect(result.committed, `${label} committed`).toBe(true);
         db = result.db;
 
         const materializedRows = q(db, joinedEntryAccounts);
@@ -480,34 +491,34 @@ describe('materialization fuzz behavior', () => {
         const change = result.materializations?.changes[0];
 
         equivalenceChecks += 1;
-        expect(materializedRows).toEqual(dematerializedRows);
-        expect(change, `join maintained ${patch.op}`).toBeDefined();
+        expect(materializedRows, `${label} materialized rows`).toEqual(dematerializedRows);
+        expect(change, `${label} maintained`).toBeDefined();
         if (change === undefined) continue;
 
-        expect(materializedRows).toBe(change.rows);
-        expect(change.rows).toEqual(dematerializedRows);
-        expect(change.previousRows).toEqual(beforeRows);
+        expect(materializedRows, `${label} row identity`).toBe(change.rows);
+        expect(change.rows, `${label} change rows`).toEqual(dematerializedRows);
+        expect(change.previousRows, `${label} previous rows`).toEqual(beforeRows);
 
         if (change.update === 'incremental') {
           const expected = diffRows(beforeRows, dematerializedRows, { keyBy: joinedEntryAccountKey });
           diffChecks += 1;
-          expect(change.recomputed).toBe(false);
-          expect(change.reason).toBe('incremental delta maintenance');
-          expect(change.diagnostics).toEqual([]);
-          expect(change.rowChanges).toEqual(expected.changes);
-          expect(change.added).toEqual(addedRows(expected.changes));
-          expect(change.removed).toEqual(removedRows(expected.changes));
-          expect(expected.diagnostics).toEqual([]);
+          expect(change.recomputed, `${label} recomputed`).toBe(false);
+          expect(change.reason, `${label} reason`).toBe('incremental delta maintenance');
+          expect(change.diagnostics, `${label} diagnostics`).toEqual([]);
+          expect(change.rowChanges, `${label} row changes`).toEqual(expected.changes);
+          expect(change.added, `${label} added`).toEqual(addedRows(expected.changes));
+          expect(change.removed, `${label} removed`).toEqual(removedRows(expected.changes));
+          expect(expected.diagnostics, `${label} oracle diagnostics`).toEqual([]);
         } else if (change.update === 'carried') {
-          expect(change.recomputed).toBe(false);
-          expect(change.reason).toBe('dependencies unchanged');
-          expect(change.diagnostics).toEqual([]);
-          expect(change.rowChanges).toEqual([]);
-          expect(change.added).toEqual([]);
-          expect(change.removed).toEqual([]);
+          expect(change.recomputed, `${label} recomputed`).toBe(false);
+          expect(change.reason, `${label} reason`).toBe('dependencies unchanged');
+          expect(change.diagnostics, `${label} diagnostics`).toEqual([]);
+          expect(change.rowChanges, `${label} row changes`).toEqual([]);
+          expect(change.added, `${label} added`).toEqual([]);
+          expect(change.removed, `${label} removed`).toEqual([]);
         } else {
-          expect(change.update).toBe('recomputed');
-          expect(change.recomputed, `join ${patch.op} ${change.reason}`).toBe(true);
+          expect(change.update, `${label} update kind`).toBe('recomputed');
+          expect(change.recomputed, `${label} ${change.reason}`).toBe(true);
         }
       }
     }
@@ -521,7 +532,7 @@ describe('materialization fuzz behavior', () => {
     let storeDiffChecks = 0;
 
     for (const variant of supportedVariants.slice(0, 4)) {
-      for (const seed of [11, 29, 47]) {
+      for (const seed of watchStoreSeeds) {
         let db = mat(seededDb(seed), variant.query);
         const store = createStore(mat(seededDb(seed), variant.query));
         const view = store.view(variant.query);
@@ -534,26 +545,27 @@ describe('materialization fuzz behavior', () => {
         });
 
         try {
-          for (const patch of randomEntryPatches(seed * 1231 + variant.label.length, 10)) {
+          for (const [step, patch] of randomEntryPatches(seed * 1231 + variant.label.length, 10).entries()) {
+            const label = `${variant.label} seed ${seed} step ${step} ${patch.op}`;
             const beforeRows = q(db, variant.query);
             const beforeStoreRows = view.getSnapshot().rows;
-            expect(beforeStoreRows).toEqual(beforeRows);
+            expect(beforeStoreRows, `${label} store rows before`).toEqual(beforeRows);
 
             const result = tryTransact(db, patch);
-            expect(result.committed, `${variant.label} committed ${patch.op}`).toBe(true);
+            expect(result.committed, `${label} committed`).toBe(true);
             db = result.db;
 
             const afterRows = q(demat(db, variant.query), variant.query);
             const expected = diffRows(beforeRows, afterRows, { keyBy: variant.keyBy });
-            expect(expected.diagnostics).toEqual([]);
+            expect(expected.diagnostics, `${label} oracle diagnostics`).toEqual([]);
 
             const materializationChange = result.materializations?.changes[0];
             if (materializationChange?.update === 'incremental') {
-              expect(materializationChange.rowChanges).toEqual(expected.changes);
+              expect(materializationChange.rowChanges, `${label} materialization changes`).toEqual(expected.changes);
             }
 
             const refresh = await handle.refresh(db);
-            expect(refresh).toEqual(expect.objectContaining({
+            expect(refresh, `${label} watch refresh`).toEqual(expect.objectContaining({
               targetKey: watchTargetKey(variant.query),
               previousRows: beforeRows,
               rows: afterRows,
@@ -562,7 +574,7 @@ describe('materialization fuzz behavior', () => {
               removed: removedRows(expected.changes),
               diagnostics: []
             }));
-            expect(events[events.length - 1]).toEqual(expect.objectContaining({
+            expect(events[events.length - 1], `${label} watch event`).toEqual(expect.objectContaining({
               rowChanges: expected.changes,
               added: addedRows(expected.changes),
               removed: removedRows(expected.changes)
@@ -570,16 +582,16 @@ describe('materialization fuzz behavior', () => {
             watchDiffChecks += 1;
 
             const commit = await store.commit(patch);
-            expect(commit).toEqual(expect.objectContaining({
+            expect(commit, `${label} store commit`).toEqual(expect.objectContaining({
               status: 'accepted',
               reflected: true
             }));
-            expect(commit.diagnostics.filter((diagnostic) => diagnostic.severity === 'error')).toEqual([]);
-            expect(commit.effects.diagnostics.filter((diagnostic) => diagnostic.severity === 'error')).toEqual([]);
+            expect(commit.diagnostics.filter((diagnostic) => diagnostic.severity === 'error'), `${label} commit diagnostics`).toEqual([]);
+            expect(commit.effects.diagnostics.filter((diagnostic) => diagnostic.severity === 'error'), `${label} effect diagnostics`).toEqual([]);
             const afterStoreRows = view.getSnapshot().rows;
             const storeDiff = diffRows(beforeStoreRows, afterStoreRows, { keyBy: variant.keyBy });
-            expect(afterStoreRows).toEqual(afterRows);
-            expect(storeDiff).toEqual(expected);
+            expect(afterStoreRows, `${label} store rows after`).toEqual(afterRows);
+            expect(storeDiff, `${label} store diff`).toEqual(expected);
             storeDiffChecks += 1;
           }
         } finally {
@@ -606,15 +618,16 @@ describe('materialization fuzz behavior', () => {
         ])
       }));
 
-      for (const seed of [7, 23, 61]) {
+      for (const seed of unsupportedMaterializationSeeds) {
         let db = mat(seededDb(seed), variant.query);
-        expect(q(db, variant.query)).toEqual(q(demat(db, variant.query), variant.query));
+        expect(q(db, variant.query), `${variant.label} seed ${seed} initial rows`).toEqual(q(demat(db, variant.query), variant.query));
 
-        for (const patch of guaranteedEntryReplacements(seed * 1543 + variant.label.length, 14)) {
+        for (const [step, patch] of guaranteedEntryReplacements(seed * 1543 + variant.label.length, 14).entries()) {
+          const label = `${variant.label} seed ${seed} step ${step} ${patch.op}`;
           const beforeRows = q(db, variant.query);
           const result = tryTransact(db, patch);
-          expect(result.committed, `${variant.label} committed ${patch.op}`).toBe(true);
-          expect(result.applied, `${variant.label} applied ${patch.op}`).toBeGreaterThan(0);
+          expect(result.committed, `${label} committed`).toBe(true);
+          expect(result.applied, `${label} applied`).toBeGreaterThan(0);
           db = result.db;
 
           const materializedRows = q(db, variant.query);
@@ -622,13 +635,13 @@ describe('materialization fuzz behavior', () => {
           const change = result.materializations?.changes[0];
           const expected = diffRows(beforeRows, dematerializedRows);
 
-          expect(change, `${variant.label} recomputed ${patch.op}`).toBeDefined();
+          expect(change, `${label} recomputed`).toBeDefined();
           if (change === undefined) continue;
 
           recomputes += 1;
-          expect(materializedRows).toBe(change.rows);
-          expect(materializedRows).toEqual(dematerializedRows);
-          expect(change).toEqual(expect.objectContaining({
+          expect(materializedRows, `${label} row identity`).toBe(change.rows);
+          expect(materializedRows, `${label} materialized rows`).toEqual(dematerializedRows);
+          expect(change, `${label} materialization change`).toEqual(expect.objectContaining({
             update: 'recomputed',
             recomputed: true,
             previousRows: beforeRows,
@@ -640,7 +653,7 @@ describe('materialization fuzz behavior', () => {
               expect.objectContaining({ code: 'materialization_unsupported' })
             ])
           }));
-          expect(expected.diagnostics).toEqual([]);
+          expect(expected.diagnostics, `${label} oracle diagnostics`).toEqual([]);
         }
       }
     }
@@ -680,7 +693,7 @@ function expectDeclaredIndexLookups(db: unknown, variant: DeclaredIndexVariant, 
   if (variant.op === 'btree') {
     const lookups = amountRangeLookups(seed, relation);
     for (const lookup of lookups) {
-      expect(source.rangeLookup?.(lookup), `${variant.label} range ${JSON.stringify(lookup)}`).toEqual(
+      expect(source.rangeLookup?.(lookup), `${variant.label} seed ${seed} range ${JSON.stringify(lookup)}`).toEqual(
         rows.filter((row) => rangeContains(row, lookup))
       );
     }
@@ -689,7 +702,7 @@ function expectDeclaredIndexLookups(db: unknown, variant: DeclaredIndexVariant, 
 
   const values = ['cash', 'sales', 'fees', 'equity', 'missing'] as const;
   for (const valueValue of values) {
-    expect(source.lookup?.({ relation, field: variant.field, value: valueValue }), `${variant.label} lookup ${valueValue}`).toEqual(
+    expect(source.lookup?.({ relation, field: variant.field, value: valueValue }), `${variant.label} seed ${seed} lookup ${valueValue}`).toEqual(
       rows.filter((row) => isRecord(row) && Object.is(row[variant.field], valueValue))
     );
   }

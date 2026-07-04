@@ -27,14 +27,14 @@ import {
 } from '@tarstate/core/query';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { account, entry, openingAccounts, schema, type Account, type Entry } from './behavior-fixtures.js';
-import { createSeededRandom } from './fuzz-helpers.js';
+import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
-const aggregateSeeds = [0xa661, 0xa662, 0xa663, 0xa664] as const;
-const aggregateTransitionSeeds = [0xa771, 0xa772, 0xa773] as const;
-const topNSeeds = [0x70a1, 0x70a2, 0x70a3] as const;
-const joinSeeds = [0x91f1, 0x91f2, 0x91f3] as const;
-const leftJoinSeeds = [0x1ef1, 0x1ef2, 0x1ef3] as const;
-const sortTieFallbackSeeds = [0x5011, 0x5012, 0x5013] as const;
+const aggregateSeeds = resolveFuzzSeeds([0xa661, 0xa662, 0xa663, 0xa664] as const);
+const aggregateTransitionSeeds = resolveFuzzSeeds([0xa771, 0xa772, 0xa773] as const);
+const topNSeeds = resolveFuzzSeeds([0x70a1, 0x70a2, 0x70a3] as const);
+const joinSeeds = resolveFuzzSeeds([0x91f1, 0x91f2, 0x91f3] as const);
+const leftJoinSeeds = resolveFuzzSeeds([0x1ef1, 0x1ef2, 0x1ef3] as const);
+const sortTieFallbackSeeds = resolveFuzzSeeds([0x5011, 0x5012, 0x5013] as const);
 
 const totalsByAccount = pipe(
   from(entry),
@@ -183,7 +183,7 @@ describe('materialization edge fuzz behavior', () => {
         keyBy: pathKey('id'),
         batch: [updateByKey(schema.entries, 'e3', { amount: 24 })]
       });
-      expect(hiddenUpdate.change.rowChanges).toEqual([]);
+      expect(hiddenUpdate.change.rowChanges, `top-N hidden update ${hex(seed)} row changes`).toEqual([]);
       db = hiddenUpdate.db;
 
       const promoted = expectBatch({
@@ -193,7 +193,7 @@ describe('materialization edge fuzz behavior', () => {
         keyBy: pathKey('id'),
         batch: [deleteByKey(schema.entries, 'e2')]
       });
-      expect(promoted.change.rowChanges).toEqual([
+      expect(promoted.change.rowChanges, `top-N hidden promotion ${hex(seed)} row changes`).toEqual([
         expect.objectContaining({ kind: 'removed', key: '["e2"]' }),
         expect.objectContaining({ kind: 'added', key: '["e3"]' })
       ]);
@@ -321,7 +321,7 @@ function expectBatch(input: {
   expect(change, `${input.label} materialization change`).toBeDefined();
   if (change === undefined) throw new Error(`${input.label} did not emit a materialization change`);
 
-  expect(change).toEqual(expect.objectContaining({
+  expect(change, `${input.label} materialization payload`).toEqual(expect.objectContaining({
     update: 'incremental',
     recomputed: false,
     reason: 'incremental delta maintenance',
@@ -332,8 +332,8 @@ function expectBatch(input: {
     removed: removedRows(expected.changes),
     diagnostics: []
   }));
-  expect(materializedRows).toBe(change.rows);
-  expect(materializedRows).toEqual(dematerializedRows);
+  expect(materializedRows, `${input.label} materialized row identity`).toBe(change.rows);
+  expect(materializedRows, `${input.label} materialized rows`).toEqual(dematerializedRows);
   expectOneFinalChangePerKey(change.rowChanges, beforeRows, dematerializedRows, input.keyBy, input.label);
 
   return { db: result.db, beforeRows, afterRows: dematerializedRows, diff: expected, change };

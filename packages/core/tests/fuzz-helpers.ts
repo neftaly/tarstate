@@ -8,6 +8,14 @@ export function createSeededRandom(seed: number): SeededRandom {
   };
 }
 
+export function resolveFuzzSeeds(defaultSeeds: readonly number[]): readonly number[] {
+  const envSeed = process.env.TARSTATE_FUZZ_SEED;
+  if (envSeed === undefined || envSeed.trim() === '') return defaultSeeds;
+
+  const seed = Number(envSeed);
+  return Number.isFinite(seed) ? [seed] : defaultSeeds;
+}
+
 export function chooseSeeded<const Value>(next: SeededRandom, values: readonly Value[]): Value {
   if (values.length === 0) throw new Error('cannot choose from an empty array');
   return values[Math.floor(next() * values.length)] as Value;

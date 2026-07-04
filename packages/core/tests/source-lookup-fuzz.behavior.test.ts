@@ -8,7 +8,7 @@ import {
   type RelationSource
 } from '@tarstate/core/source';
 import { schema } from './behavior-fixtures.js';
-import { chooseSeeded, createSeededRandom } from './fuzz-helpers.js';
+import { chooseSeeded, createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type HookMode = 'handled' | 'declined' | 'missing';
 
@@ -24,7 +24,7 @@ type FuzzSourcePart = {
   readonly source: RelationSource;
 };
 
-const seeds = [0x500a, 0x500b, 0x500c, 0x500d] as const;
+const seeds = resolveFuzzSeeds([0x500a, 0x500b, 0x500c, 0x500d] as const);
 const lookupFields = ['amount', 'accountId', 'memo', 'rank', 'missing'] as const;
 const lookupValues = [0, -0, Number.NaN, null, undefined, 'cash', 'fees', true] as const;
 

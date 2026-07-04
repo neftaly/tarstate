@@ -20,7 +20,7 @@ import {
 } from '@tarstate/core/query';
 import { type RelationLookup, type RelationRangeLookup, type RelationSource } from '@tarstate/core/source';
 import { entry, openingEntries, type Entry } from './behavior-fixtures.js';
-import { createSeededRandom, pickSeeded } from './fuzz-helpers.js';
+import { createSeededRandom, pickSeeded, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type HookMode = 'exact' | 'superset' | 'decline' | 'missing';
 type HookProfile = {
@@ -71,7 +71,7 @@ type ObservedPushdown =
       readonly upper?: ExpectedRangeBound;
     };
 
-const seeds = [0x5151, 0x5152, 0x5153, 0x5154] as const;
+const seeds = resolveFuzzSeeds([0x5151, 0x5152, 0x5153, 0x5154] as const);
 const hookModes = ['exact', 'superset', 'decline', 'missing'] as const satisfies readonly HookMode[];
 const rangeOps = ['gt', 'gte', 'lt', 'lte'] as const satisfies readonly RangeOp[];
 const orientations = ['direct', 'reversed'] as const satisfies readonly PredicateOrientation[];

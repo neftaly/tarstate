@@ -16,7 +16,7 @@ import {
   updateByKey,
   type WritePatch
 } from '@tarstate/core/write';
-import { createSeededRandom } from './fuzz-helpers.js';
+import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type Widget = {
   readonly id: string;
@@ -138,7 +138,7 @@ const INVALID_TAGS = new Set<CoverageTag>([
   'replaceAll:invalid'
 ]);
 
-const FUZZ_SEEDS = [0x7710, 0x7711, 0x7712, 0x7713] as const;
+const FUZZ_SEEDS = resolveFuzzSeeds([0x7710, 0x7711, 0x7712, 0x7713] as const);
 const BATCHES_PER_SEED = COVERAGE_TAGS.length * 3;
 
 function createRandom(seedValue: number): Random {

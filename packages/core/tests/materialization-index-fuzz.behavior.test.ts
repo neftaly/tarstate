@@ -4,7 +4,7 @@ import { demat, index as materializedIndex, mat, type MaterializationRange } fro
 import { btree, field, from, hash, pipe, project, uniqueIndex } from '@tarstate/core/query';
 import { deleteByKey, insertOrReplace, updateByKey, type WritePatch } from '@tarstate/core/write';
 import { entry, openingAccounts, schema, type Entry } from './behavior-fixtures.js';
-import { createSeededRandom } from './fuzz-helpers.js';
+import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 type EntryIndexRow = {
   readonly id: string;
@@ -31,10 +31,11 @@ const entriesByAccount = pipe(entryRows, hash(field<string>('row', 'accountId'))
 const entriesByAmount = pipe(entryRows, btree(field<number>('row', 'amount')));
 const entriesById = pipe(entryRows, uniqueIndex(field<string>('row', 'id')));
 const indexedQueries = [entrySet, entriesByAccount, entriesByAmount, entriesById] as const;
+const seeds = resolveFuzzSeeds([13, 29, 47] as const);
 
 describe('materialized index API seeded fuzz', () => {
   it('keeps public set/hash/btree/unique snapshots equivalent to scan oracles after writes', () => {
-    for (const seed of [13, 29, 47] as const) {
+    for (const seed of seeds) {
       let db = mat(seededDb(seed), ...indexedQueries);
 
       for (let step = 0; step < 8; step += 1) {
