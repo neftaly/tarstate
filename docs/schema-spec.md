@@ -1,0 +1,1008 @@
+# Tarstate Schema Manifest Specification
+
+Status: v1 draft-final.
+
+This document specifies the first serializable schema manifest for Tarstate. It
+is intentionally narrower than the research note. The goal is a stable,
+canonical, JSON-compatible description of base relations that can be exported,
+validated, hashed, generated from, and hydrated back into Tarstate runtime
+schema objects.
+
+## 1. Scope
+
+This specification defines:
+
+- the `tarstate.schema` manifest document
+- v1 relation manifests
+- v1 field manifests
+- canonicalization rules
+- validation rules
+- custom codec references
+- hydration requirements
+- forward-compatibility rules for later schema evolution work
+
+This specification does not define:
+
+- EDN or YAML authoring syntax
+- JSON Schema generation
+- serializable queries
+- serializable constraints
+- serializable indexes
+- derived relation manifests
+- runtime topology manifests
+- Cambria-style schema lenses
+- sidecar storage for unknown future data
+
+Those are expected later layers. Their names and boundaries are reserved here
+so v1 does not block them.
+
+The v1 format is designed to be self-hostable: a schema manifest is
+projectable into Tarstate relations so Tarstate itself can inspect, query,
+compare, validate, document, and eventually evolve schemas. V1 does not require
+an implementation of that projection, but it reserves stable relational meaning
+for the manifest parts defined here.
+
+## 2. Normative Language
+
+The terms MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
+
+Unless otherwise stated, "JSON-compatible" means one of:
+
+- string
+- finite number
+- boolean
+- null
+- array of JSON-compatible values
+- object whose keys are strings and whose values are JSON-compatible
+
+The following JavaScript values are not JSON-compatible manifest values:
+`undefined`, functions, symbols, `NaN`, infinity, `BigInt`, `Date`,
+`Uint8Array`, `Map`, and `Set`.
+
+## 3. Document Model
+
+A schema manifest is a JSON-compatible object with this TypeScript shape:
+
+```ts
+export type SchemaManifestV1 = {
+  readonly kind: 'tarstate.schema';
+  readonly formatVersion: 1;
+  readonly schemaId: string;
+  readonly description?: string;
+  readonly relations: Record<string, RelationManifestV1>;
+  readonly codecs?: Record<string, CodecDeclarationV1>;
+  readonly metadata?: Record<string, JsonValue>;
+};
+```
+
+`kind` identifies the document family. It MUST be exactly
+`"tarstate.schema"`.
+
+`formatVersion` identifies this manifest wire format. It MUST be exactly the
+integer `1`.
+
+`schemaId` identifies the application schema node. It MUST be a non-empty
+string. It is not a content hash and it is not the manifest format version.
+Within Tarstate schema tooling, `schemaId` is immutable: changing relation or
+field meaning MUST mint a new `schemaId`. Changing only `description` or inert
+`metadata` MAY keep the same `schemaId` when the application does not treat
+those changes as generated-artifact changes.
+
+`description` is documentation. It MUST NOT affect validation, hydration, or
+canonical identity except as data included in canonical output.
+
+`relations` is the logical relation catalog. It MAY be empty so package
+boundaries, generated artifacts, and tooling can represent an empty schema.
+
+`codecs` declares custom field capabilities used by this manifest. It is
+optional only when the manifest contains no `custom` fields. Every field with
+`type: "custom"` MUST reference a codec declared in `codecs`. Hydration MUST
+also receive a runtime implementation for that codec.
+
+`metadata` is inert JSON-compatible data. Core MUST preserve it during
+canonicalization, but MUST NOT interpret it.
+
+Unknown top-level properties are invalid in v1 except inside `metadata`.
+
+## 4. Relation Manifest
+
+```ts
+export type RelationManifestV1 = {
+  readonly key: string | readonly string[];
+  readonly fields: Record<string, FieldManifestV1>;
+  readonly ephemeral?: boolean;
+  readonly description?: string;
+  readonly metadata?: Record<string, JsonValue>;
+};
+```
+
+A relation name is the object key in `SchemaManifestV1.relations`. Relation
+names MUST be non-empty strings. The v1 wire format permits any non-empty
+string, but authoring tools MAY restrict names to TypeScript-safe identifiers.
+
+`key` declares the logical row identity. A single-field key MAY be encoded as a
+string. A composite key MUST be a non-empty array of field names. Composite key
+order is significant.
+
+A single-field row key is the value of that field. A composite row key is the
+ordered tuple of key-field values in declared key order. The manifest does not
+define a string encoding for composite row keys.
+
+Every key field MUST:
+
+- exist in `fields`
+- be required
+- be non-nullable
+- be keyable
+
+The key array MUST NOT contain duplicate field names.
+
+`fields` maps field names to field manifests. Field names MUST be non-empty
+strings. A relation MUST contain at least one field.
+
+`ephemeral` marks a relation whose rows are not expected to be durable domain
+facts. Examples include presence, connection state, runtime diagnostics, and
+local UI observations. `ephemeral` defaults to `false`.
+
+`description` and `metadata` have the same semantics as the top-level fields.
+
+Unknown relation properties are invalid in v1 except inside `metadata`.
+
+## 5. Field Manifest
+
+```ts
+export type FieldManifestV1 =
+  | StringFieldManifestV1
+  | NumberFieldManifestV1
+  | BooleanFieldManifestV1
+  | IdFieldManifestV1
+  | RefFieldManifestV1
+  | AnchoredPathFieldManifestV1
+  | JsonFieldManifestV1
+  | CustomFieldManifestV1;
+
+type FieldBaseV1 = {
+  readonly optional?: boolean;
+  readonly nullable?: boolean;
+  readonly description?: string;
+  readonly metadata?: Record<string, JsonValue>;
+};
+```
+
+Field names are the object keys in `RelationManifestV1.fields`.
+
+`optional` means a row MAY omit the field. It defaults to `false`.
+
+`nullable` means a row MAY set the field to `null`. It defaults to `false`.
+
+If both `optional` and `nullable` are true, both omission and `null` are valid.
+
+Unknown field properties are invalid in v1 except inside `metadata`.
+
+### 5.1 `string`
+
+```ts
+type StringFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'string';
+};
+```
+
+Valid row values are JavaScript strings.
+
+Strings MUST NOT be normalized, trimmed, case-folded, or otherwise rewritten by
+schema validation.
+
+String fields are keyable.
+
+### 5.2 `number`
+
+```ts
+type NumberFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'number';
+};
+```
+
+Valid row values are finite JavaScript numbers.
+
+`NaN`, positive infinity, and negative infinity are invalid.
+
+Number fields are keyable.
+
+### 5.3 `boolean`
+
+```ts
+type BooleanFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'boolean';
+};
+```
+
+Valid row values are booleans.
+
+Boolean fields are keyable.
+
+### 5.4 `id`
+
+```ts
+type IdFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'id';
+  readonly domain: string;
+};
+```
+
+Valid row values are strings.
+
+`domain` names the id namespace. It MUST be a non-empty string. Two `id` fields
+with different domains SHOULD NOT be considered interchangeable even though
+both are represented as strings.
+
+Id fields are keyable.
+
+### 5.5 `ref`
+
+```ts
+type RefFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'ref';
+  readonly target: RefTargetV1;
+};
+
+type RefTargetV1 = {
+  readonly relation: string;
+  readonly field: string;
+};
+```
+
+Valid row values are strings.
+
+`target` names the relation field being referenced. The target relation MUST
+exist in the same manifest. The target field MUST exist in the target relation.
+
+The target MUST be the target relation key field. The target field MUST be
+string-valued in v1: `string`, `id`, `anchoredPath`, or `ref`. Composite refs,
+refs to non-key unique fields, and refs to numeric, boolean, JSON, or custom
+keys are reserved for a later format version or constraint layer.
+
+Ref fields are keyable.
+
+### 5.6 `anchoredPath`
+
+```ts
+type AnchoredPathFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'anchoredPath';
+};
+```
+
+Valid row values are strings.
+
+`anchoredPath` is a stable path-like scalar used by existing Tarstate runtime
+features. The schema manifest treats it as an opaque string with path semantics
+defined by the runtime.
+
+Anchored path fields are keyable.
+
+### 5.7 `json`
+
+```ts
+type JsonFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'json';
+};
+```
+
+Valid row values are JSON-compatible values.
+
+JSON fields are not keyable in v1.
+
+### 5.8 `custom`
+
+```ts
+type CustomFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'custom';
+  readonly codec: string;
+};
+```
+
+Valid row values are defined by the named codec.
+
+`codec` MUST be a non-empty string. It names a capability supplied by a runtime
+codec registry. The manifest MUST NOT serialize validator, comparator,
+stable-key, scalar-conversion, or hydration functions directly.
+
+Custom fields are keyable only when their codec supplies at least one stable
+key strategy to the hydration runtime:
+
+- stable key function
+- scalar conversion
+- comparator plus runtime-supported lookup semantics
+
+`opaqueField(...)` in the TypeScript API serializes as `type: "custom"` with an
+appropriate `codec` name. `opaque` is not a separate v1 wire type.
+
+## 6. Codec Declarations
+
+```ts
+export type CodecDeclarationV1 = {
+  readonly description?: string;
+  readonly scalar?: 'string' | 'number' | 'boolean' | 'null';
+  readonly keyable?: boolean;
+  readonly metadata?: Record<string, JsonValue>;
+};
+```
+
+A codec declaration describes the portable contract for a custom field. It does
+not implement behavior.
+
+`scalar` declares the JSON-compatible scalar representation when the codec has
+one. It is documentation plus a hint for generated validators, storage
+adapters, and code generators.
+
+`keyable` declares that the codec is expected to support stable keying in a
+runtime registry. If omitted, hydration MUST treat keyability as unknown until
+it sees the actual registry entry.
+
+Unknown codec declaration properties are invalid in v1 except inside
+`metadata`.
+
+## 7. Canonical Form
+
+Canonicalization produces a byte-stable JSON-compatible object. It is used for
+hashing, equality, cache keys, generated artifacts, and cross-runtime exchange.
+
+Canonicalization MUST:
+
+- sort object keys lexicographically at every level
+- preserve array order
+- emit `kind: "tarstate.schema"`
+- emit `formatVersion: 1`
+- require non-empty `schemaId`
+- omit empty optional `codecs` objects
+- omit empty optional `metadata` objects
+- omit `optional: false`
+- omit `nullable: false`
+- omit `ephemeral: false`
+- preserve meaningful `false` and `null` values inside `metadata`
+- preserve non-empty `metadata` objects after sorting their keys
+- preserve `description` exactly when provided
+- reject non-JSON-compatible values
+- reject unknown properties outside `metadata`
+
+Canonicalization MUST NOT:
+
+- duplicate relation names inside relation entries
+- duplicate field names inside field entries
+- rewrite strings
+- evaluate custom codecs
+- hydrate host functions
+- resolve remote references
+
+The canonical ref target form is structured:
+
+```json
+{ "relation": "agents", "field": "id" }
+```
+
+Authoring APIs MAY accept string shorthand such as `"agents.id"`, but
+canonical output MUST use structured ref targets.
+
+Canonical stringification for v1 is Tarstate sorted-key JSON:
+
+- canonicalize the manifest object first
+- recursively sort object keys lexicographically by Unicode code point
+- preserve array order
+- encode with JSON syntax and no insignificant whitespace
+- escape strings according to JSON rules
+- encode finite numbers with the ECMAScript `JSON.stringify` number algorithm
+- reject non-finite numbers before stringification
+
+This profile is intentionally smaller than RFC 8785. If Tarstate later adopts
+RFC 8785, that change must be a new `formatVersion` or an explicitly named
+content-hash profile.
+
+Golden canonical strings:
+
+```json
+{"formatVersion":1,"kind":"tarstate.schema","relations":{},"schemaId":"empty@1"}
+```
+
+An authoring input with unsorted fields and explicit default flags:
+
+```json
+{
+  "kind": "tarstate.schema",
+  "formatVersion": 1,
+  "schemaId": "people@1",
+  "relations": {
+    "people": {
+      "key": "id",
+      "fields": {
+        "name": { "type": "string" },
+        "id": { "type": "id", "domain": "person" },
+        "age": { "type": "number", "optional": false }
+      }
+    }
+  }
+}
+```
+
+MUST canonicalize to:
+
+```json
+{"formatVersion":1,"kind":"tarstate.schema","relations":{"people":{"fields":{"age":{"type":"number"},"id":{"domain":"person","type":"id"},"name":{"type":"string"}},"key":"id"}},"schemaId":"people@1"}
+```
+
+## 8. Validation
+
+Manifest validation MUST check document structure before hydration.
+
+Validation MUST reject:
+
+- non-object manifest values
+- missing or wrong `kind`
+- missing or wrong `formatVersion`
+- missing, empty, or non-string `schemaId`
+- missing or non-object `relations`
+- non-string `description`
+- non-object `codecs`
+- non-object `metadata`
+- empty relation names
+- empty field names
+- empty codec names
+- relation entries with missing or non-object `fields`
+- relation entries with missing `key`
+- relation entries with non-boolean `ephemeral`
+- relation entries with non-string `description`
+- relation entries with non-object `metadata`
+- key fields that do not exist
+- duplicate composite-key fields
+- optional or nullable key fields
+- non-keyable key fields
+- field entries with unknown `type`
+- field entries with type-specific fields missing
+- field entries with type-specific fields that do not belong to their type
+- field entries with non-boolean `optional` or `nullable`
+- field entries with non-string `description`
+- field entries with non-object `metadata`
+- `id` fields without a non-empty `domain`
+- `ref` fields without a valid `target`
+- ref targets whose relation or field does not exist
+- ref targets that do not point at the target relation key
+- ref targets that point at a non-string-valued key field
+- `custom` fields without a non-empty `codec`
+- `custom` fields whose codec is not declared in `codecs`
+- custom key fields whose codec declaration does not set `keyable: true`
+- codec declarations with invalid `scalar`
+- codec declarations with non-boolean `keyable`
+- non-JSON-compatible `metadata`
+- unknown properties outside `metadata`
+
+Validation MUST produce structured diagnostics with paths. A diagnostic path
+MUST identify the manifest location, for example:
+
+```json
+["relations", "listings", "fields", "agentId", "target"]
+```
+
+Schema diagnostics have this minimum shape:
+
+```ts
+export type SchemaManifestDiagnosticV1 = {
+  readonly code: SchemaManifestDiagnosticCodeV1;
+  readonly severity: 'error' | 'warning';
+  readonly message: string;
+  readonly path: readonly (string | number)[];
+  readonly detail?: JsonValue;
+};
+
+export type SchemaManifestDiagnosticCodeV1 =
+  | 'schema_manifest.invalid'
+  | 'schema_manifest.non_json_value'
+  | 'schema_manifest.unknown_property'
+  | 'schema_manifest.missing_required'
+  | 'schema_manifest.invalid_name'
+  | 'schema_manifest.invalid_key'
+  | 'schema_manifest.invalid_field'
+  | 'schema_manifest.invalid_ref'
+  | 'schema_manifest.invalid_codec';
+```
+
+`severity` MUST be `"error"` for diagnostics that make the manifest invalid.
+`warning` is reserved for accepted but suspicious input, such as a declared
+codec that is not used by any field.
+
+`detail` MUST be JSON-compatible. It MUST contain only small machine-readable
+facts, not host objects or error instances.
+
+Implementations MAY adapt these diagnostics into Tarstate's general
+`TarstateDiagnostic` shape, but the schema path MUST remain available to
+authoring tools.
+
+Validation fixture matrix:
+
+| Case | Example shape | Required code |
+| --- | --- | --- |
+| Not an object | `null` | `schema_manifest.invalid` |
+| Wrong kind | `{ "kind": "other" }` | `schema_manifest.invalid` |
+| Missing schema id | `{ "kind": "tarstate.schema", "formatVersion": 1, "relations": {} }` | `schema_manifest.missing_required` |
+| Empty schema id | `{ "schemaId": "" }` | `schema_manifest.invalid_name` |
+| Unknown property | `{ "extra": true }` | `schema_manifest.unknown_property` |
+| Missing relation key | relation has `fields` but no `key` | `schema_manifest.missing_required` |
+| Missing key field | `key: "id"` with no `fields.id` | `schema_manifest.invalid_key` |
+| Duplicate composite key | `key: ["a", "a"]` | `schema_manifest.invalid_key` |
+| Optional key field | key field has `optional: true` | `schema_manifest.invalid_key` |
+| Nullable key field | key field has `nullable: true` | `schema_manifest.invalid_key` |
+| JSON key field | key field has `type: "json"` | `schema_manifest.invalid_key` |
+| Missing id domain | `{ "type": "id" }` | `schema_manifest.invalid_field` |
+| Missing ref target | `{ "type": "ref" }` | `schema_manifest.invalid_ref` |
+| Ref missing relation | target relation does not exist | `schema_manifest.invalid_ref` |
+| Ref missing field | target field does not exist | `schema_manifest.invalid_ref` |
+| Ref targets non-key field | target field exists but is not the target relation key | `schema_manifest.invalid_ref` |
+| Ref targets non-string key | target key field is not string-valued in v1 | `schema_manifest.invalid_ref` |
+| Missing custom codec | `{ "type": "custom" }` | `schema_manifest.invalid_codec` |
+| Undeclared custom codec | custom field references absent `codecs` key | `schema_manifest.invalid_codec` |
+| Non-keyable custom key | key field codec lacks `keyable: true` | `schema_manifest.invalid_key` |
+| Non-JSON metadata | metadata contains `undefined`, function, or `NaN` | `schema_manifest.non_json_value` |
+
+Examples in this matrix are illustrative. A validator MAY emit additional
+diagnostics for a malformed manifest, but it MUST include the required code for
+the named case. The diagnostic path and detail MUST point to the precise
+offending location.
+
+## 9. Hydration
+
+Hydration turns a validated manifest into runtime Tarstate schema objects.
+
+Hydration input:
+
+```ts
+type HydrateSchemaManifestOptions = {
+  readonly codecs?: Record<string, RuntimeCodec>;
+  readonly diagnosticMode?: 'throw' | 'collect';
+};
+```
+
+The runtime codec contract is:
+
+```ts
+export type RuntimeCodec = {
+  readonly codec: string;
+  readonly description?: string;
+  readonly validate?: (value: unknown) => boolean;
+  readonly stableKey?: (value: unknown) => string;
+  readonly compare?: (left: unknown, right: unknown) => number;
+  readonly toScalar?: (value: unknown) => string | number | boolean | null;
+  readonly fromScalar?: (value: unknown) => unknown;
+};
+```
+
+`codec` MUST match the manifest codec key it is registered under. This catches
+accidental registry wiring mistakes.
+
+A runtime codec is keyable when it provides `stableKey`, `toScalar`, or
+`compare`. If a codec declaration says `keyable: true`, hydration MUST still
+verify that the runtime codec is actually keyable before using the field as a
+relation key.
+
+`toScalar` and `fromScalar` are not required to be perfect inverses for every
+host value, but any lossiness SHOULD be documented in the codec declaration
+metadata or avoided for key fields.
+
+For custom key fields, the runtime key behavior MUST be stable and non-lossy for
+the key domain. Two distinct key values MUST NOT produce the same stable key or
+scalar representation unless the codec defines them as equal.
+
+Hydration MUST:
+
+- validate the manifest first
+- canonicalize accepted authoring shorthand before building runtime refs
+- resolve every `custom` field codec declared by used fields
+- fail if a required codec is missing
+- fail if a key field uses a custom codec whose runtime implementation cannot
+  key rows
+- preserve `optional`, `nullable`, `domain`, `target`, `ephemeral`, and
+  description data
+
+Hydration MUST NOT:
+
+- execute functions from the manifest
+- accept executable source text as a codec implementation
+- infer a missing custom codec from its name alone
+- silently degrade a custom key field to unstable object identity
+
+## 10. Row Validation Semantics
+
+Given a hydrated relation and row value, row validation MUST apply these rules:
+
+- required non-nullable fields must be present and non-null
+- optional fields may be absent
+- nullable fields may be null
+- present non-null fields must match their field type
+- custom fields must pass their codec validator when one is supplied
+- extra row fields are invalid in strict row validation
+
+The schema manifest is closed-world for declared fields. A missing required
+declared field is invalid. Open-world linking to external data is a later layer.
+
+Runtime row validation MUST reject extra row fields in strict validation mode.
+Storage adapters MAY preserve extra fields for forward compatibility outside
+the declared relation view, but preserved undeclared fields MUST NOT become
+queryable as declared relation fields.
+
+## 11. Extension Reserve
+
+The following names are reserved for later manifest layers and MUST NOT be used
+as arbitrary v1 extension properties:
+
+- `constraints`
+- `indexes`
+- `queries`
+- `derivedRelations`
+- `topology`
+- `dataSpaces`
+- `relationBindings`
+- `extensions`
+- `requires`
+- `capabilities`
+- `evolution`
+- `schemaNodes`
+- `lenses`
+- `contentHash`
+
+Tools MAY preserve those names inside `metadata`, but core v1 MUST NOT interpret
+them there.
+
+## 12. Evolution Reserve
+
+V1 does not define schema evolution. It still reserves these rules so later
+Cambria-style lenses can compose with v1 manifests:
+
+- `schemaId` identifies an immutable schema node and MAY be any non-empty
+  string.
+- Renaming a relation or field MUST mint a new `schemaId`.
+- Changing a field's meaning MUST mint a new `schemaId`.
+- Changing only descriptions or inert metadata MAY keep the same `schemaId` if
+  the application considers generated artifacts unchanged.
+- Future evolution manifests SHOULD connect schema nodes with bidirectional
+  lens operations rather than one-way migrations.
+- Future write compatibility SHOULD translate deltas or patches when possible,
+  not only full snapshots.
+
+## 13. Robustness Requirements
+
+Manifest consumers MUST treat manifests as untrusted data.
+
+Implementations MUST:
+
+- validate before hydration
+- enumerate only own enumerable string keys
+- avoid prototype-chain reads when inspecting manifest objects
+- treat relation, field, codec, and schema ids as data, not object paths
+- reject executable values and source text as behavior
+- reject unknown semantic properties outside `metadata`
+- avoid mutating caller-owned manifest objects during canonicalization
+
+Implementations SHOULD use null-prototype maps, `Map`, or equivalent internal
+data structures when materializing manifest records in JavaScript.
+
+## 14. Examples
+
+### 14.1 Minimal Domain Schema
+
+```json
+{
+  "kind": "tarstate.schema",
+  "formatVersion": 1,
+  "schemaId": "real-estate@1",
+  "relations": {
+    "agents": {
+      "key": "id",
+      "fields": {
+        "id": { "type": "id", "domain": "agent" },
+        "name": { "type": "string" }
+      }
+    },
+    "listings": {
+      "key": "id",
+      "fields": {
+        "id": { "type": "id", "domain": "listing" },
+        "agentId": {
+          "type": "ref",
+          "target": { "relation": "agents", "field": "id" }
+        },
+        "address": { "type": "string" },
+        "price": { "type": "number", "nullable": true }
+      }
+    }
+  }
+}
+```
+
+### 14.2 Collaborative Runtime Values
+
+```json
+{
+  "kind": "tarstate.schema",
+  "formatVersion": 1,
+  "schemaId": "notes@2",
+  "codecs": {
+    "collab.richText": {
+      "description": "Collaborative text value",
+      "scalar": "string",
+      "keyable": true
+    },
+    "collab.objectReference": {
+      "description": "Collaborative object reference",
+      "keyable": true
+    }
+  },
+  "relations": {
+    "notes": {
+      "key": "id",
+      "fields": {
+        "id": { "type": "id", "domain": "note" },
+        "body": { "type": "custom", "codec": "collab.richText" }
+      }
+    },
+    "peerSelections": {
+      "key": ["peerId", "selectionId"],
+      "ephemeral": true,
+      "fields": {
+        "peerId": { "type": "string" },
+        "selectionId": { "type": "string" },
+        "target": {
+          "type": "custom",
+          "codec": "collab.objectReference"
+        }
+      }
+    }
+  }
+}
+```
+
+### 14.3 Runtime Detail As Opaque Custom Data
+
+```json
+{
+  "kind": "tarstate.schema",
+  "formatVersion": 1,
+  "schemaId": "runtime-diagnostics@1",
+  "codecs": {
+    "runtime.diagnostic.detail": {
+      "description": "Host-owned diagnostic detail object",
+      "keyable": false
+    }
+  },
+  "relations": {
+    "diagnostics": {
+      "key": "id",
+      "ephemeral": true,
+      "fields": {
+        "id": { "type": "string" },
+        "message": { "type": "string" },
+        "detail": {
+          "type": "custom",
+          "codec": "runtime.diagnostic.detail",
+          "optional": true
+        }
+      }
+    }
+  }
+}
+```
+
+## 15. Self-Hosting Projection
+
+A conforming v1 manifest can be projected into ordinary Tarstate relations. The
+projection is not the canonical wire format; it is a relational view of the
+canonical manifest.
+
+The minimum self-hosting projection is:
+
+```ts
+const schemaCatalog = defineSchema({
+  schemaManifests: relation({
+    key: 'schemaId',
+    fields: {
+      schemaId: idField('schema'),
+      kind: stringField(),
+      formatVersion: numberField(),
+      description: optional(stringField()),
+      metadata: optional(jsonField())
+    }
+  }),
+  schemaCodecs: relation({
+    key: ['schemaId', 'codec'],
+    fields: {
+      schemaId: refField('schemaManifests.schemaId'),
+      codec: stringField(),
+      description: optional(stringField()),
+      scalar: optional(stringField()),
+      keyable: optional(booleanField()),
+      metadata: optional(jsonField())
+    }
+  }),
+  schemaRelations: relation({
+    key: ['schemaId', 'relation'],
+    fields: {
+      schemaId: refField('schemaManifests.schemaId'),
+      relation: stringField(),
+      key: jsonField(),
+      ephemeral: optional(booleanField()),
+      description: optional(stringField()),
+      metadata: optional(jsonField())
+    }
+  }),
+  schemaFields: relation({
+    key: ['schemaId', 'relation', 'field'],
+    fields: {
+      schemaId: refField('schemaManifests.schemaId'),
+      relation: stringField(),
+      field: stringField(),
+      type: stringField(),
+      optional: optional(booleanField()),
+      nullable: optional(booleanField()),
+      domain: optional(stringField()),
+      target: optional(jsonField()),
+      codec: optional(stringField()),
+      description: optional(stringField()),
+      metadata: optional(jsonField())
+    }
+  })
+});
+```
+
+This projection MUST obey these rules:
+
+- `schemaManifests` has one row per manifest.
+- `schemaCodecs` has one row per `codecs` entry.
+- `schemaRelations` has one row per relation entry.
+- `schemaFields` has one row per field entry.
+- Relation and field names remain data values in the projection even though
+  they are object keys in the canonical manifest.
+- The projection MUST preserve enough information to reconstruct the canonical
+  manifest exactly, modulo object key order, omitted default flags, and omitted
+  empty optional objects.
+- The projection SHOULD make validation expressible as Tarstate queries where
+  practical, such as missing key fields, missing ref targets, unused codecs, and
+  custom fields without declarations.
+- The projection does not require current `refField(...)` to express every
+  integrity rule. Composite relationships such as `(schemaId, relation)` and
+  `(schemaId, relation, field)` can be checked by validation queries until
+  composite refs are part of the core schema API.
+- `schemaRelations.key` is stored as JSON because v1 relation keys may be either
+  a string or an ordered array of strings. Validation queries SHOULD normalize
+  it into derived key-field rows when checking key existence and keyability.
+
+The following derived relations are useful for self-hosted validation and
+documentation, but are not required storage rows:
+
+- `schemaRelationKeyFields(schemaId, relation, field, position)`
+- `schemaRefTargets(schemaId, relation, field, targetRelation, targetField,
+  position)`
+- `schemaUsedCodecs(schemaId, codec)`
+- `schemaUnusedCodecs(schemaId, codec)`
+- `schemaInvalidRefs(schemaId, relation, field, reason)`
+- `schemaInvalidKeys(schemaId, relation, field, reason)`
+
+Self-hosting matters because schema work is relational work:
+
+- documentation views are projections over schema rows
+- generated TypeScript types are derived artifacts
+- compatibility checks compare two schema graphs
+- future lenses transform relation and field rows between schema nodes
+- tooling can query which relations use a codec, ref a target, or contain
+  runtime-only metadata
+
+The canonical manifest remains the interchange format. The relational
+projection is the way Tarstate can reason about that interchange format using
+its own paradigm.
+
+## 16. Implementation Surface
+
+The initial implementation should expose these functions:
+
+```ts
+toSchemaManifest(schema, options): SchemaManifestV1
+canonicalSchemaManifest(manifest): SchemaManifestV1
+stringifyCanonicalSchemaManifest(manifest): string
+validateSchemaManifest(manifest): SchemaDiagnostic[]
+hydrateSchemaManifest(manifest, options): HydratedSchema
+```
+
+`toSchemaManifest` exports existing TypeScript builder schemas.
+
+```ts
+type ToSchemaManifestOptions = {
+  readonly schemaId: string;
+  readonly description?: string;
+  readonly metadata?: Record<string, JsonValue>;
+  readonly codecs?: Record<string, CodecDeclarationV1>;
+};
+```
+
+`toSchemaManifest` MUST require `schemaId`; the existing builder schema does not
+carry a durable application schema node id.
+
+When exporting built-in fields, `toSchemaManifest` maps current field specs as
+follows:
+
+| Builder field | Manifest field |
+| --- | --- |
+| `stringField()` | `{ "type": "string" }` |
+| `numberField()` | `{ "type": "number" }` |
+| `booleanField()` | `{ "type": "boolean" }` |
+| `idField(domain)` | `{ "type": "id", "domain": domain }` |
+| `refField("relation.field")` | `{ "type": "ref", "target": { "relation": relation, "field": field } }` |
+| `anchoredPathField()` | `{ "type": "anchoredPath" }` |
+| `jsonField()` | `{ "type": "json" }` |
+| `customField(spec)` | `{ "type": "custom", "codec": spec.kind }` |
+| `opaqueField(spec)` | `{ "type": "custom", "codec": spec.kind }` |
+
+Current `refField(...)` stores its target as a string. Export MUST parse
+`"relation.field"` only when it contains exactly one dot and both sides are
+non-empty. If a target string is ambiguous, export MUST fail with
+`schema_manifest.invalid_ref`. The canonical manifest itself does not have this
+ambiguity because it uses structured targets.
+
+When exporting `customField` or `opaqueField`, the codec name MUST come from the
+custom spec `kind`. Export MUST fail with `schema_manifest.invalid_codec` if the
+kind is empty. Export MUST synthesize a codec declaration when `options.codecs`
+does not provide one:
+
+- `description` from `spec.description`
+- `keyable: true` when `spec.stableKey`, `spec.toScalar`, or `spec.compare` is
+  present
+- `scalar` from `spec.toScalar` only when the exporter can determine it without
+  executing user code; otherwise omit it
+
+Export MUST NOT execute custom field functions to infer schema data.
+
+`canonicalSchemaManifest` validates and normalizes an input manifest.
+
+`stringifyCanonicalSchemaManifest` serializes canonical output with stable key
+ordering.
+
+`validateSchemaManifest` returns diagnostics without hydrating runtime refs.
+
+`hydrateSchemaManifest` validates, canonicalizes, resolves codecs, and returns
+runtime relation refs.
+
+## 17. V1 Decisions
+
+- Empty `relations` is allowed.
+- `schemaId` is any non-empty string.
+- Canonical stringification uses a Tarstate-defined sorted-key JSON profile, not
+  full RFC 8785.
+- Every custom field codec must be declared in `codecs`.
+- V1 refs target string-valued single-field relation keys only.
+- Hydration still requires runtime codec implementations; declarations are not
+  executable behavior.
+- Runtime row validation rejects extra row fields in strict validation mode,
+  while storage adapters may preserve them outside the declared relation view.
+- The manifest must be projectable into ordinary Tarstate relations for
+  self-hosted inspection and tooling.
+
+## 18. Conformance Checklist
+
+A v1 implementation conforms to this spec when it can:
+
+- accept and canonicalize all examples in section 14
+- reject unknown properties outside `metadata`
+- reject non-JSON-compatible manifest data
+- reject missing `kind`, `formatVersion`, `schemaId`, `relations`, `key`, or
+  `fields`
+- reject optional, nullable, missing, duplicate, or non-keyable key fields
+- reject refs to missing relations, missing fields, non-key fields, or
+  non-string-valued key fields
+- reject custom fields without declared codecs
+- reject custom key fields unless the codec declaration and runtime codec are
+  keyable
+- reject manifests that would require executable behavior from manifest data
+- produce stable canonical strings for semantically identical manifests with
+  different object key order
+- hydrate built-in field types into the current Tarstate schema API
+- hydrate custom fields only through a supplied runtime codec registry
+- serialize `opaqueField(...)` as `type: "custom"` with a codec name
+- preserve non-empty inert `metadata` as JSON-compatible data, modulo object key
+  order in canonical output
+- produce diagnostics with paths precise enough for authoring tools to point at
+  the offending manifest location
+- project a manifest into the self-hosting relations in section 15 without
+  losing information required to reconstruct the canonical manifest
