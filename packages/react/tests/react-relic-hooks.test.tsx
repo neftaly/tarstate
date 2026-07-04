@@ -9,6 +9,7 @@ import {
   useQuery,
   useRow,
   useTarstateSnapshot,
+  useTarstateMutation,
   useTarstateStore,
   useView,
   type QueryHookState,
@@ -16,6 +17,7 @@ import {
   type TarstateCommit,
   type TarstateDbInput,
   type TarstateDbSnapshot,
+  type TarstateMutationState,
   type TarstateProviderProps,
   type TarstateReactDiagnostic,
   type UseQueryOptions,
@@ -83,6 +85,7 @@ describe('@tarstate/react API contract', () => {
     expect(useTarstateSnapshot).toBeTypeOf('function');
     expect(useDb).toBeTypeOf('function');
     expect(useCommit).toBeTypeOf('function');
+    expect(useTarstateMutation).toBeTypeOf('function');
     expect(useView).toBeTypeOf('function');
     expect(useRow).toBeTypeOf('function');
     expect(useQuery).toBeTypeOf('function');
@@ -124,6 +127,13 @@ describe('@tarstate/react API contract', () => {
       readonly queryKey: string;
       readonly revision: number;
       readonly refresh: () => void;
+    }>());
+    assertType(() => expectTypeOf<TarstateMutationState>().toEqualTypeOf<{
+      readonly commit: TarstateCommit;
+      readonly pending: boolean;
+      readonly error: unknown;
+      readonly result: StoreCommitResult | undefined;
+      readonly reset: () => void;
     }>());
 
     const view = {} as ViewHookState<ItemProjection>;
@@ -170,9 +180,12 @@ describe('@tarstate/react API contract', () => {
 
     const queryOptions = {
       resetKey: 'labels',
-      select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`)
+      select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`),
+      equality: (left, right) => left.length === right.length
+        && left.every((item, index) => item === right[index])
     } satisfies UseQueryOptions<ItemProjection, readonly string[]>;
     expect(queryOptions.select).toBeTypeOf('function');
+    expect(queryOptions.equality).toBeTypeOf('function');
 
     function InvalidOptionsProbe() {
       // @ts-expect-error deps was removed; use resetKey for explicit view recreation
@@ -298,6 +311,70 @@ describe('@tarstate/react hooks', () => {
     expect(states.snapshot?.revision).toBe(1);
     expect(states.db?.data.items).toEqual([{ id: 'item-b', label: 'Beta' }]);
     expect(states.labels).toEqual(['Beta']);
+
+    act(() => {
+      renderer?.unmount();
+    });
+  });
+
+  it('tracks mutation pending and result state around commits', async () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const deferred = createDeferred<StoreCommitResult>();
+    const result: StoreCommitResult = {
+      status: 'accepted',
+      reflected: true,
+      effects: {
+        patches: 1,
+        applied: 1,
+        deltas: [],
+        diagnostics: []
+      },
+      snapshot: fake.store.getSnapshot(),
+      diagnostics: []
+    };
+    const store = {
+      ...fake.store,
+      commit: vi.fn(async () => deferred.promise) as Store['commit']
+    } satisfies Store;
+    const states: TarstateMutationState[] = [];
+
+    function Probe() {
+      states.push(useTarstateMutation());
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+    });
+
+    expect(states.at(-1)?.pending).toBe(false);
+    expect(states.at(-1)?.result).toBeUndefined();
+
+    let commitPromise: Promise<StoreCommitResult> | undefined;
+    act(() => {
+      commitPromise = states.at(-1)?.commit(replaceAll(schema.items, [{ id: 'item-b', label: 'Beta' }]));
+    });
+
+    expect(store.commit).toHaveBeenCalledTimes(1);
+    expect(states.at(-1)?.pending).toBe(true);
+    expect(states.at(-1)?.result).toBeUndefined();
+
+    await act(async () => {
+      deferred.resolve(result);
+      await commitPromise;
+    });
+
+    expect(states.at(-1)?.pending).toBe(false);
+    expect(states.at(-1)?.result).toBe(result);
+    expect(states.at(-1)?.error).toBeUndefined();
+
+    act(() => {
+      states.at(-1)?.reset();
+    });
+
+    expect(states.at(-1)?.pending).toBe(false);
+    expect(states.at(-1)?.result).toBeUndefined();
 
     act(() => {
       renderer?.unmount();
@@ -471,6 +548,20 @@ describe('@tarstate/react hooks', () => {
 
 function assertType(assertion: () => void): void {
   expect(assertion).not.toThrow();
+}
+
+function createDeferred<Value>(): {
+  readonly promise: Promise<Value>;
+  readonly resolve: (value: Value) => void;
+  readonly reject: (error: unknown) => void;
+} {
+  let resolve: (value: Value) => void = () => undefined;
+  let reject: (error: unknown) => void = () => undefined;
+  const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 type FakeItemStore = {

@@ -238,6 +238,48 @@ describe('@tarstate/react core integration', () => {
     }
   });
 
+  it('uses selector equality to skip renders when selected data is equivalent', async () => {
+    const store = createStore({
+      items: [
+        { id: 'item-a', label: 'Alpha' },
+        { id: 'item-b', label: 'Beta' }
+      ],
+      tags: []
+    });
+    let renderer: ReactTestRenderer | undefined;
+    let renders = 0;
+
+    function Probe() {
+      renders += 1;
+      const query = useQuery(itemQuery, {
+        select: (rows) => rows.length,
+        equality: Object.is
+      });
+
+      return createElement('output', undefined, `${renders}:${query.data}`);
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(TarstateProvider, { store }, createElement(Probe)));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:2'));
+
+      await act(async () => {
+        await store.commit(insertOrReplace(schema.items, { id: 'item-b', label: 'Beta Prime' }));
+      });
+
+      expect(renders).toBe(1);
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:2'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+      store.close();
+    }
+  });
+
   it('does not re-render a keyed row subscriber when a different row changes', async () => {
     const store = createStore({
       items: [

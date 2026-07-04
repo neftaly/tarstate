@@ -20,9 +20,12 @@ import type { RelationRef } from '@tarstate/core/schema';
 import { createStore } from '@tarstate/core/store';
 import type {
   Store,
+  StoreCommitOptions,
+  StoreCommitResult,
   StoreQueryResult,
   StoreSeedInput,
   StoreSnapshot,
+  StoreView,
   StoreViewSnapshot
 } from '@tarstate/core/store';
 
@@ -45,6 +48,7 @@ export type UseViewOptions = {
 
 export type UseQueryOptions<Row, Selected = readonly Row[]> = UseViewOptions & {
   readonly select?: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
+  readonly equality?: (left: Selected, right: Selected) => boolean;
 };
 
 export type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
@@ -73,7 +77,17 @@ export type RowHookState<Row> = {
   readonly refresh: () => void;
 };
 
+export type TarstateMutationState = {
+  readonly commit: TarstateCommit;
+  readonly pending: boolean;
+  readonly error: unknown;
+  readonly result: StoreCommitResult | undefined;
+  readonly reset: () => void;
+};
+
 type RelationRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
+type QueryHookSnapshotState<Row, Selected> = Omit<QueryHookState<Row, Selected>, 'refresh'>;
+type TarstateMutationSnapshot = Pick<TarstateMutationState, 'pending' | 'error' | 'result'>;
 type ResetKey = string | number | undefined;
 type OwnedStoreState = {
   readonly store: Store;
@@ -149,14 +163,59 @@ export function useCommit(): TarstateCommit {
   return useTarstateStore().commit;
 }
 
+export function useTarstateMutation(): TarstateMutationState {
+  const storeCommit = useCommit();
+  const mountedRef = useRef(true);
+  const sequenceRef = useRef(0);
+  const [state, setState] = useState<TarstateMutationSnapshot>(emptyMutationSnapshot);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const commit = useCallback((async (inputOrInputs: unknown, options?: StoreCommitOptions) => {
+    const sequence = sequenceRef.current + 1;
+    sequenceRef.current = sequence;
+    if (mountedRef.current) {
+      setState((current) => ({ ...current, pending: true, error: undefined }));
+    }
+
+    try {
+      const result = await (storeCommit as (input: unknown, options?: StoreCommitOptions) => Promise<StoreCommitResult>)(inputOrInputs, options);
+      if (mountedRef.current && sequenceRef.current === sequence) {
+        setState({ pending: false, error: undefined, result });
+      }
+      return result;
+    } catch (error) {
+      if (mountedRef.current && sequenceRef.current === sequence) {
+        setState((current) => ({ ...current, pending: false, error }));
+      }
+      throw error;
+    }
+  }) as TarstateCommit, [storeCommit]);
+
+  const reset = useCallback(() => {
+    sequenceRef.current += 1;
+    if (mountedRef.current) setState(emptyMutationSnapshot);
+  }, []);
+
+  return useMemo(() => ({
+    commit,
+    pending: state.pending,
+    error: state.error,
+    result: state.result,
+    reset
+  }), [commit, reset, state.error, state.pending, state.result]);
+}
+
 export function useView<Row>(
   query: Query<Row>,
   options: UseViewOptions = {}
 ): ViewHookState<Row> {
-  const store = useTarstateStore();
-  const resetKey = options.resetKey;
-  const canonicalQueryKey = useMemo(() => queryKey(query), [query]);
-  const view = useMemo(() => store.view(query), [store, resetKey, canonicalQueryKey]);
+  const view = useStoreView(query, options);
   const subscribe = useCallback((listener: () => void) => view.subscribe(listener), [view]);
   const getSnapshot = useMemo(
     () => stableSnapshotReader(() => view.getSnapshot(), areViewSnapshotsEqual),
@@ -227,25 +286,33 @@ export function useQuery<Row, Selected>(
   query: Query<Row>,
   options?: UseViewOptions | UseQuerySelectedOptions<Row, Selected>
 ): QueryHookState<Row, readonly Row[] | Selected> {
-  const viewState = useView(query, options);
+  const view = useStoreView(query, options);
   const select = hasSelect(options) ? options.select : undefined;
-  const result = useMemo<StoreQueryResult<Row>>(() => ({
-    rows: viewState.rows,
-    diagnostics: viewState.diagnostics,
-    revision: viewState.revision
-  }), [viewState.diagnostics, viewState.revision, viewState.rows]);
-  const data = useMemo(() => (
-    select === undefined ? viewState.rows : select(viewState.rows, result)
-  ), [result, select, viewState.rows]);
+  const equality = hasEquality<Row, Selected>(options) ? options.equality : undefined;
+  const subscribe = useCallback((listener: () => void) => view.subscribe(listener), [view]);
+  const getSnapshot = useMemo(
+    () => queryHookSnapshotReader(view, select, equality),
+    [equality, select, view]
+  );
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const refresh = useCallback(() => {
+    void view.refresh();
+  }, [view]);
 
   return useMemo(() => ({
-    data,
-    diagnostics: viewState.diagnostics,
-    queryKey: viewState.queryKey,
-    revision: viewState.revision,
-    refresh: viewState.refresh
-  }), [data, viewState.diagnostics, viewState.queryKey, viewState.refresh, viewState.revision]);
+    data: snapshot.data,
+    diagnostics: snapshot.diagnostics,
+    queryKey: snapshot.queryKey,
+    revision: snapshot.revision,
+    refresh
+  }), [refresh, snapshot]);
 }
+
+const emptyMutationSnapshot: TarstateMutationSnapshot = {
+  pending: false,
+  error: undefined,
+  result: undefined
+};
 
 function createOwnedStore(initialDb: TarstateDbInput | undefined, resetKey: ResetKey): OwnedStoreState {
   return {
@@ -256,6 +323,81 @@ function createOwnedStore(initialDb: TarstateDbInput | undefined, resetKey: Rese
 
 function closeOwnedStore(ownedStore: OwnedStoreState | undefined): void {
   ownedStore?.store.close();
+}
+
+function useStoreView<Row>(query: Query<Row>, options: UseViewOptions = {}): StoreView<Row> {
+  const store = useTarstateStore();
+  const resetKey = options.resetKey;
+  const canonicalQueryKey = useMemo(() => queryKey(query), [query]);
+  return useMemo(() => store.view(query), [store, resetKey, canonicalQueryKey]);
+}
+
+function queryHookSnapshot<Row, Selected>(
+  snapshot: StoreViewSnapshot<Row>,
+  select: ((rows: readonly Row[], result: StoreQueryResult<Row>) => Selected) | undefined
+): QueryHookSnapshotState<Row, readonly Row[] | Selected> {
+  const result: StoreQueryResult<Row> = {
+    rows: snapshot.rows,
+    diagnostics: snapshot.diagnostics,
+    revision: snapshot.revision
+  };
+  return {
+    data: select === undefined ? snapshot.rows : select(snapshot.rows, result),
+    diagnostics: snapshot.diagnostics,
+    queryKey: snapshot.queryKey,
+    revision: snapshot.revision
+  };
+}
+
+function queryHookSnapshotReader<Row, Selected>(
+  view: StoreView<Row>,
+  select: ((rows: readonly Row[], result: StoreQueryResult<Row>) => Selected) | undefined,
+  equality: ((left: Selected, right: Selected) => boolean) | undefined
+): () => QueryHookSnapshotState<Row, readonly Row[] | Selected> {
+  let currentViewSnapshot: StoreViewSnapshot<Row> | undefined;
+  let current: QueryHookSnapshotState<Row, readonly Row[] | Selected> | undefined;
+  const selectedEquality = equality as ((left: readonly Row[] | Selected, right: readonly Row[] | Selected) => boolean) | undefined;
+
+  return () => {
+    const viewSnapshot = view.getSnapshot();
+    if (current !== undefined && currentViewSnapshot === viewSnapshot) return current;
+    if (
+      current !== undefined
+      && currentViewSnapshot !== undefined
+      && areViewSnapshotsEqual(currentViewSnapshot, viewSnapshot)
+    ) {
+      currentViewSnapshot = viewSnapshot;
+      return current;
+    }
+
+    const next = queryHookSnapshot(viewSnapshot, select);
+    if (current !== undefined && areQueryHookSnapshotsEqual(current, next, selectedEquality)) {
+      currentViewSnapshot = viewSnapshot;
+      return current;
+    }
+
+    currentViewSnapshot = viewSnapshot;
+    current = next;
+    return current;
+  };
+}
+
+function areQueryHookSnapshotsEqual<Row, Selected>(
+  left: QueryHookSnapshotState<Row, Selected>,
+  right: QueryHookSnapshotState<Row, Selected>,
+  equality: ((left: Selected, right: Selected) => boolean) | undefined
+): boolean {
+  return left.queryKey === right.queryKey
+    && selectedDataEqual(left.data, right.data, equality)
+    && diagnosticsEqual(left.diagnostics, right.diagnostics);
+}
+
+function selectedDataEqual<Selected>(
+  left: Selected,
+  right: Selected,
+  equality: ((left: Selected, right: Selected) => boolean) | undefined
+): boolean {
+  return equality === undefined ? Object.is(left, right) : equality(left, right);
 }
 
 function stableSnapshotReader<Snapshot>(
@@ -325,6 +467,12 @@ function hasSelect<Row, Selected>(
   options: UseViewOptions | UseQuerySelectedOptions<Row, Selected> | undefined
 ): options is UseQuerySelectedOptions<Row, Selected> {
   return options !== undefined && 'select' in options && typeof options.select === 'function';
+}
+
+function hasEquality<Row, Selected>(
+  options: UseViewOptions | UseQuerySelectedOptions<Row, Selected> | undefined
+): options is UseQueryOptions<Row, Selected> & { readonly equality: (left: Selected, right: Selected) => boolean } {
+  return options !== undefined && 'equality' in options && typeof options.equality === 'function';
 }
 
 function isRelationRef(input: unknown): input is RelationRef {
