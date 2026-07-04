@@ -14,8 +14,10 @@
     }
   },
   "scripts": {
+    "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.tsx",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.tsx",
+    "test:fuzz": "vitest run --config ../../vite.config.ts tests/*fuzz*.test.tsx",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "peerDependencies": {

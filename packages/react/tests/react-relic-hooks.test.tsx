@@ -4,12 +4,14 @@ import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { TarstateDiagnostic } from '@tarstate/core';
 import {
   TarstateProvider,
+  shallow,
   useCommit,
   useDb,
   useQuery,
   useRow,
   useTarstateSnapshot,
   useTarstateMutation,
+  useTarstateSubscription,
   useTarstateStore,
   useView,
   type QueryHookState,
@@ -22,6 +24,8 @@ import {
   type TarstateReactDiagnostic,
   type UseQueryOptions,
   type UseQuerySelectedOptions,
+  type UseTarstateSubscriptionOptions,
+  type UseTarstateSubscriptionSelectedOptions,
   type UseViewOptions,
   type ViewHookState
 } from '@tarstate/react';
@@ -81,14 +85,31 @@ const itemQuery = pipe(
 describe('@tarstate/react API contract', () => {
   it('exports the provider and hook entry points', () => {
     expect(TarstateProvider).toBeTypeOf('function');
+    expect(shallow).toBeTypeOf('function');
     expect(useTarstateStore).toBeTypeOf('function');
     expect(useTarstateSnapshot).toBeTypeOf('function');
     expect(useDb).toBeTypeOf('function');
     expect(useCommit).toBeTypeOf('function');
     expect(useTarstateMutation).toBeTypeOf('function');
+    expect(useTarstateSubscription).toBeTypeOf('function');
     expect(useView).toBeTypeOf('function');
     expect(useRow).toBeTypeOf('function');
     expect(useQuery).toBeTypeOf('function');
+  });
+
+  it('keeps shallow equality intentionally shallow', () => {
+    const leftNullPrototype = Object.create(null) as Record<string, unknown>;
+    const rightNullPrototype = Object.create(null) as Record<string, unknown>;
+    leftNullPrototype.id = 'item-a';
+    rightNullPrototype.id = 'item-a';
+
+    expect(shallow(Number.NaN, Number.NaN)).toBe(true);
+    expect(shallow([1, 'two', undefined], [1, 'two', undefined])).toBe(true);
+    expect(shallow([{}], [{}])).toBe(false);
+    expect(shallow({ id: 'item-a', label: undefined }, { label: undefined, id: 'item-a' })).toBe(true);
+    expect(shallow({ nested: { id: 'item-a' } }, { nested: { id: 'item-a' } })).toBe(false);
+    expect(shallow(leftNullPrototype, rightNullPrototype)).toBe(true);
+    expect(shallow(new Date(0), new Date(0))).toBe(false);
   });
 
   it('keeps the provider seed API explicit', () => {
@@ -186,6 +207,33 @@ describe('@tarstate/react API contract', () => {
     } satisfies UseQueryOptions<ItemProjection, readonly string[]>;
     expect(queryOptions.select).toBeTypeOf('function');
     expect(queryOptions.equality).toBeTypeOf('function');
+
+    assertType(() => expectTypeOf<UseTarstateSubscriptionOptions<ItemProjection>>()
+      .toEqualTypeOf<UseViewOptions & {
+        readonly onChange: (snapshot: StoreViewSnapshot<ItemProjection>) => void;
+        readonly fireImmediately?: boolean;
+      }>());
+    assertType(() => expectTypeOf<UseTarstateSubscriptionSelectedOptions<ItemProjection, readonly string[]>>()
+      .toEqualTypeOf<UseViewOptions & {
+        readonly select: (snapshot: StoreViewSnapshot<ItemProjection>) => readonly string[];
+        readonly equality?: (left: readonly string[], right: readonly string[]) => boolean;
+        readonly onChange: (selected: readonly string[], snapshot: StoreViewSnapshot<ItemProjection>) => void;
+        readonly fireImmediately?: boolean;
+      }>());
+
+    const rawSubscriptionOptions = {
+      onChange: (snapshot) => snapshot.rows
+    } satisfies UseTarstateSubscriptionOptions<ItemProjection>;
+    const subscriptionOptions = {
+      resetKey: 'labels',
+      select: (snapshot) => snapshot.rows.map((row) => row.label),
+      equality: shallow,
+      onChange: (_selected, _snapshot) => undefined,
+      fireImmediately: true
+    } satisfies UseTarstateSubscriptionSelectedOptions<ItemProjection, readonly string[]>;
+    expect(rawSubscriptionOptions.onChange).toBeTypeOf('function');
+    expect(subscriptionOptions.select).toBeTypeOf('function');
+    expect(subscriptionOptions.equality).toBe(shallow);
 
     function InvalidOptionsProbe() {
       // @ts-expect-error deps was removed; use resetKey for explicit view recreation
@@ -415,6 +463,199 @@ describe('@tarstate/react hooks', () => {
     act(() => {
       renderer?.unmount();
     });
+  });
+
+  it('delivers raw view snapshots to imperative subscribers', () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const snapshots: { readonly labels: readonly string[]; readonly revision: number }[] = [];
+    let renders = 0;
+
+    function Probe() {
+      renders += 1;
+      useTarstateSubscription(itemQuery, {
+        fireImmediately: true,
+        onChange: (snapshot) => {
+          snapshots.push({
+            labels: snapshot.rows.map((row) => row.label),
+            revision: snapshot.revision
+          });
+        }
+      });
+
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(TarstateProvider, { store: fake.store }, createElement(Probe)));
+    });
+
+    expect(renders).toBe(1);
+    expect(snapshots).toEqual([{ labels: ['Alpha'], revision: 0 }]);
+    expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([1]);
+
+    act(() => {
+      fake.setRows([{ id: 'item-a', label: 'Beta' }]);
+    });
+
+    expect(renders).toBe(1);
+    expect(snapshots).toEqual([
+      { labels: ['Alpha'], revision: 0 },
+      { labels: ['Beta'], revision: 1 }
+    ]);
+
+    act(() => {
+      renderer?.unmount();
+    });
+
+    const afterUnmount = fake.viewStats();
+    const unmountedReads = afterUnmount[0]?.snapshotReads;
+    expect(afterUnmount.map((stats) => stats.activeListeners)).toEqual([0]);
+
+    act(() => {
+      fake.setRows([{ id: 'item-a', label: 'Gamma' }]);
+    });
+
+    expect(snapshots).toHaveLength(2);
+    expect(fake.viewStats()[0]?.snapshotReads).toBe(unmountedReads);
+  });
+
+  it('drives imperative subscribers without React rerenders and cleans up on unmount', () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const changes: number[][] = [];
+    const target = { text: '' };
+    let renders = 0;
+
+    function Probe() {
+      renders += 1;
+      useTarstateSubscription(itemQuery, {
+        fireImmediately: true,
+        select: (snapshot: StoreViewSnapshot<ItemProjection>) => snapshot.rows.map((row) => row.label.length),
+        equality: shallow,
+        onChange: (selected: readonly number[], snapshot: StoreViewSnapshot<ItemProjection>) => {
+          expect(snapshot.rows).toHaveLength(1);
+          changes.push([...selected]);
+          target.text = selected.join('|');
+        }
+      });
+
+      return createElement('span', undefined, `renders:${renders}`);
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(TarstateProvider, { store: fake.store }, createElement(Probe)));
+    });
+
+    expect(renders).toBe(1);
+    expect(changes).toEqual([[5]]);
+    expect(target.text).toBe('5');
+    expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([1]);
+
+    act(() => {
+      fake.setRows([{ id: 'item-a', label: 'Bravo' }]);
+    });
+
+    expect(renders).toBe(1);
+    expect(changes).toEqual([[5]]);
+    expect(target.text).toBe('5');
+
+    act(() => {
+      fake.setRows([{ id: 'item-a', label: 'Charlie' }]);
+    });
+
+    expect(renders).toBe(1);
+    expect(changes).toEqual([[5], [7]]);
+    expect(target.text).toBe('7');
+
+    act(() => {
+      renderer?.unmount();
+    });
+
+    const afterUnmount = fake.viewStats();
+    const unmountedReads = afterUnmount[0]?.snapshotReads;
+    expect(afterUnmount.map((stats) => stats.activeListeners)).toEqual([0]);
+
+    act(() => {
+      fake.setRows([{ id: 'item-a', label: 'Delta' }]);
+    });
+
+    expect(renders).toBe(1);
+    expect(changes).toHaveLength(2);
+    expect(target.text).toBe('7');
+    expect(fake.viewStats()[0]?.snapshotReads).toBe(unmountedReads);
+  });
+
+  it('replaces imperative subscriptions when resetKey changes without leaking stale views', () => {
+    const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
+    const changes: number[][] = [];
+    let renders = 0;
+
+    function Probe({ resetKey }: { readonly resetKey: string }) {
+      renders += 1;
+      useTarstateSubscription(itemQuery, {
+        resetKey,
+        fireImmediately: true,
+        select: (snapshot: StoreViewSnapshot<ItemProjection>) => snapshot.rows.map((row) => row.label.length),
+        equality: shallow,
+        onChange: (selected: readonly number[], snapshot: StoreViewSnapshot<ItemProjection>) => {
+          expect(snapshot.rows).toHaveLength(1);
+          changes.push([...selected]);
+        }
+      });
+
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(
+        TarstateProvider,
+        { store: fake.store },
+        createElement(Probe, { resetKey: 'a' })
+      ));
+    });
+
+    expect(renders).toBe(1);
+    expect(changes).toEqual([[5]]);
+    expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([1]);
+
+    act(() => {
+      renderer?.update(createElement(
+        TarstateProvider,
+        { store: fake.store },
+        createElement(Probe, { resetKey: 'b' })
+      ));
+    });
+
+    const afterReset = fake.viewStats();
+    const staleReads = afterReset[0]?.snapshotReads;
+    expect(renders).toBe(2);
+    expect(changes).toEqual([[5], [5]]);
+    expect(afterReset.map((stats) => stats.activeListeners)).toEqual([0, 1]);
+
+    act(() => {
+      fake.setRows([{ id: 'item-a', label: 'Delta' }]);
+    });
+
+    expect(renders).toBe(2);
+    expect(changes).toEqual([[5], [5]]);
+    expect(fake.viewStats()[0]?.snapshotReads).toBe(staleReads);
+    expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([0, 1]);
+
+    act(() => {
+      fake.setRows([{ id: 'item-a', label: 'Echo!!' }]);
+    });
+
+    expect(renders).toBe(2);
+    expect(changes).toEqual([[5], [5], [6]]);
+    expect(fake.viewStats()[0]?.snapshotReads).toBe(staleReads);
+
+    act(() => {
+      renderer?.unmount();
+    });
+
+    expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([0, 0]);
   });
 
   it('unmounting useView releases its subscription while a matching useQuery keeps updating', () => {

@@ -20,8 +20,17 @@ Primary API:
   predicate.
 - `useRow(relation, key)` returns the matching relation row by key.
 - `useQuery(query)` remains available for selected data via
-  `useQuery(query, { select, resetKey })`; it is a thin selection wrapper over
-  `useView`. New read-only components should prefer `useView`.
+  `useQuery(query, { select, equality, resetKey })`; it uses the same
+  store-view subscription path as `useView`. New read-only components should
+  prefer `useView`.
+- `shallow(left, right)` is an intentionally shallow selector equality helper
+  for `Object.is`, arrays, and plain records.
+- `useTarstateSubscription(query, { onChange })` subscribes imperatively to a
+  query without scheduling React renders. The selected form,
+  `useTarstateSubscription(query, { select, equality, onChange })`, is for
+  animation, canvas, and large-data paths that need to write into an external
+  target directly. Changing `select`, `equality`, `resetKey`, or the query
+  replaces the subscription; `onChange` is read live.
 - `useCommit()` returns the active core `Store.commit` function.
 - `Store.close()` provides idempotent subscription cleanup.
 

@@ -55,6 +55,18 @@ export type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Select
   readonly select: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
 };
 
+export type UseTarstateSubscriptionOptions<Row> = UseViewOptions & {
+  readonly onChange: (snapshot: StoreViewSnapshot<Row>) => void;
+  readonly fireImmediately?: boolean;
+};
+
+export type UseTarstateSubscriptionSelectedOptions<Row, Selected> = UseViewOptions & {
+  readonly select: (snapshot: StoreViewSnapshot<Row>) => Selected;
+  readonly onChange: (selected: Selected, snapshot: StoreViewSnapshot<Row>) => void;
+  readonly equality?: (left: Selected, right: Selected) => boolean;
+  readonly fireImmediately?: boolean;
+};
+
 type ViewHookSnapshotState<Row> = Pick<StoreViewSnapshot<Row>, 'rows' | 'diagnostics' | 'revision' | 'queryKey'>;
 
 export type ViewHookState<Row> = ViewHookSnapshotState<Row> & {
@@ -87,6 +99,11 @@ export type TarstateMutationState = {
 
 type RelationRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
 type QueryHookSnapshotState<Row, Selected> = Omit<QueryHookState<Row, Selected>, 'refresh'>;
+type SelectedSnapshotRead<Source, Selected> = {
+  readonly source: Source;
+  readonly selected: Selected;
+  readonly changed: boolean;
+};
 type TarstateMutationSnapshot = Pick<TarstateMutationState, 'pending' | 'error' | 'result'>;
 type ResetKey = string | number | undefined;
 type OwnedStoreState = {
@@ -95,6 +112,26 @@ type OwnedStoreState = {
 };
 
 const TarstateContext = createContext<Store | undefined>(undefined);
+
+export function shallow(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return readonlyArraysEqual(left, right, Object.is);
+  }
+
+  if (!isPlainRecord(left) || !isPlainRecord(right)) return false;
+
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+
+  for (const key of leftKeys) {
+    if (!Object.prototype.hasOwnProperty.call(right, key) || !Object.is(left[key], right[key])) return false;
+  }
+
+  return true;
+}
 
 export function TarstateProvider({ store, initialDb, resetKey, children }: TarstateProviderProps): ReactElement {
   const initialDbRef = useRef<TarstateDbInput | undefined>(initialDb);
@@ -235,6 +272,70 @@ export function useView<Row>(
   }), [snapshot, refresh]);
 }
 
+export function useTarstateSubscription<Row>(
+  query: Query<Row>,
+  options: UseTarstateSubscriptionOptions<Row>
+): void;
+export function useTarstateSubscription<Row, Selected>(
+  query: Query<Row>,
+  options: UseTarstateSubscriptionSelectedOptions<Row, Selected>
+): void;
+export function useTarstateSubscription<Row, Selected>(
+  query: Query<Row>,
+  options: UseTarstateSubscriptionOptions<Row> | UseTarstateSubscriptionSelectedOptions<Row, Selected>
+): void {
+  const view = useStoreView(query, options);
+  const onChangeRef = useRef(options.onChange);
+  onChangeRef.current = options.onChange;
+  const select = hasSubscriptionSelect(options) ? options.select : undefined;
+  const equality = hasSubscriptionSelect(options) ? options.equality : undefined;
+  const fireImmediately = options.fireImmediately;
+
+  useEffect(() => {
+    if (select === undefined) {
+      const read = selectedSnapshotReader(
+        () => view.getSnapshot(),
+        (snapshot) => snapshot,
+        areViewSnapshotsEqual,
+        Object.is
+      );
+      const notifyIfChanged = (): void => {
+        const next = read();
+        if (!next.changed) return;
+
+        (onChangeRef.current as (snapshot: StoreViewSnapshot<Row>) => void)(next.selected);
+      };
+
+      const initial = read();
+      if (fireImmediately === true) {
+        (onChangeRef.current as (snapshot: StoreViewSnapshot<Row>) => void)(initial.selected);
+      }
+
+      return view.subscribe(notifyIfChanged);
+    }
+
+    const read = selectedSnapshotReader(
+      () => view.getSnapshot(),
+      select,
+      areViewSnapshotsEqual,
+      (left, right) => equality === undefined ? Object.is(left, right) : equality(left, right)
+    );
+    const notifyIfChanged = (): void => {
+      const next = read();
+      if (!next.changed) return;
+
+      (onChangeRef.current as (selected: Selected, snapshot: StoreViewSnapshot<Row>) => void)(next.selected, next.source);
+    };
+
+    const initial = read();
+    if (fireImmediately === true) {
+      (onChangeRef.current as (selected: Selected, snapshot: StoreViewSnapshot<Row>) => void)(initial.selected, initial.source);
+    }
+
+    return view.subscribe(notifyIfChanged);
+  }, [equality, fireImmediately, select, view]);
+}
+
 export function useRow<Row>(
   query: Query<Row>,
   predicate: (row: Row) => boolean,
@@ -291,7 +392,18 @@ export function useQuery<Row, Selected>(
   const equality = hasEquality<Row, Selected>(options) ? options.equality : undefined;
   const subscribe = useCallback((listener: () => void) => view.subscribe(listener), [view]);
   const getSnapshot = useMemo(
-    () => queryHookSnapshotReader(view, select, equality),
+    () => {
+      const selectedEquality = equality as (
+        (left: readonly Row[] | Selected, right: readonly Row[] | Selected) => boolean
+      ) | undefined;
+      const read = selectedSnapshotReader(
+        () => view.getSnapshot(),
+        (snapshot) => queryHookSnapshot(snapshot, select),
+        areViewSnapshotsEqual,
+        (left, right) => areQueryHookSnapshotsEqual(left, right, selectedEquality)
+      );
+      return () => read().selected;
+    },
     [equality, select, view]
   );
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
@@ -349,39 +461,6 @@ function queryHookSnapshot<Row, Selected>(
   };
 }
 
-function queryHookSnapshotReader<Row, Selected>(
-  view: StoreView<Row>,
-  select: ((rows: readonly Row[], result: StoreQueryResult<Row>) => Selected) | undefined,
-  equality: ((left: Selected, right: Selected) => boolean) | undefined
-): () => QueryHookSnapshotState<Row, readonly Row[] | Selected> {
-  let currentViewSnapshot: StoreViewSnapshot<Row> | undefined;
-  let current: QueryHookSnapshotState<Row, readonly Row[] | Selected> | undefined;
-  const selectedEquality = equality as ((left: readonly Row[] | Selected, right: readonly Row[] | Selected) => boolean) | undefined;
-
-  return () => {
-    const viewSnapshot = view.getSnapshot();
-    if (current !== undefined && currentViewSnapshot === viewSnapshot) return current;
-    if (
-      current !== undefined
-      && currentViewSnapshot !== undefined
-      && areViewSnapshotsEqual(currentViewSnapshot, viewSnapshot)
-    ) {
-      currentViewSnapshot = viewSnapshot;
-      return current;
-    }
-
-    const next = queryHookSnapshot(viewSnapshot, select);
-    if (current !== undefined && areQueryHookSnapshotsEqual(current, next, selectedEquality)) {
-      currentViewSnapshot = viewSnapshot;
-      return current;
-    }
-
-    currentViewSnapshot = viewSnapshot;
-    current = next;
-    return current;
-  };
-}
-
 function areQueryHookSnapshotsEqual<Row, Selected>(
   left: QueryHookSnapshotState<Row, Selected>,
   right: QueryHookSnapshotState<Row, Selected>,
@@ -398,6 +477,32 @@ function selectedDataEqual<Selected>(
   equality: ((left: Selected, right: Selected) => boolean) | undefined
 ): boolean {
   return equality === undefined ? Object.is(left, right) : equality(left, right);
+}
+
+function selectedSnapshotReader<Source, Selected>(
+  readSource: () => Source,
+  select: (source: Source) => Selected,
+  sourceEqual: (left: Source, right: Source) => boolean,
+  selectedEqual: (left: Selected, right: Selected) => boolean
+): () => SelectedSnapshotRead<Source, Selected> {
+  let current: Pick<SelectedSnapshotRead<Source, Selected>, 'source' | 'selected'> | undefined;
+
+  return () => {
+    const nextSource = readSource();
+    if (current !== undefined && sourceEqual(current.source, nextSource)) {
+      return { source: current.source, selected: current.selected, changed: false };
+    }
+
+    const nextSelected = select(nextSource);
+    if (current !== undefined && selectedEqual(current.selected, nextSelected)) {
+      const selected = current.selected;
+      current = { source: nextSource, selected };
+      return { source: current.source, selected: current.selected, changed: false };
+    }
+
+    current = { source: nextSource, selected: nextSelected };
+    return { source: current.source, selected: current.selected, changed: true };
+  };
 }
 
 function stableSnapshotReader<Snapshot>(
@@ -473,6 +578,12 @@ function hasEquality<Row, Selected>(
   options: UseViewOptions | UseQuerySelectedOptions<Row, Selected> | undefined
 ): options is UseQueryOptions<Row, Selected> & { readonly equality: (left: Selected, right: Selected) => boolean } {
   return options !== undefined && 'equality' in options && typeof options.equality === 'function';
+}
+
+function hasSubscriptionSelect<Row, Selected>(
+  options: UseTarstateSubscriptionOptions<Row> | UseTarstateSubscriptionSelectedOptions<Row, Selected>
+): options is UseTarstateSubscriptionSelectedOptions<Row, Selected> {
+  return 'select' in options && typeof options.select === 'function';
 }
 
 function isRelationRef(input: unknown): input is RelationRef {
