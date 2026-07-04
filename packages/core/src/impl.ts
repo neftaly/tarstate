@@ -1768,7 +1768,7 @@ export function transact<DbValue extends Db>(inputDb: DbValue, ...args: any[]): 
 export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbTransactionInputs): DbTransactionResult<DbValue> {
   const diagnostics: TarstateDiagnostic[] = [];
   const patches: WritePatch[] = [];
-  let workingDb: Db = cloneDb(inputDb);
+  let workingDb: Db = stageDb(inputDb);
   let applied = 0;
   const deltas: RelationDelta[] = [];
   const envDeltas: MaterializationEnvDelta[] = [];
@@ -2606,22 +2606,38 @@ export function maintainMaterializationSnapshots<Row = unknown>(
   }
 
   const changes: MaterializationMaintenanceChange<Row>[] = [];
-  const nextAux = new Map(beforeState.aux);
-  const touchedDependencies = relationDeltaNames(options.deltas ?? []);
-  const touchedEnvDependencies = materializationEnvDeltaNames(options.envDeltas ?? []);
+  const diagnostics: TarstateDiagnostic[] = [];
+  let recomputedCount = 0;
+  let carriedCount = 0;
+  let nextAux: Map<string, InternalMaterializationAux> | undefined;
+  const touchedDependencies = new Set(relationDeltaNames(options.deltas ?? []));
+  const touchedEnvDependencies = new Set(materializationEnvDeltaNames(options.envDeltas ?? []));
   const hasRelationChangeHints = options.deltas !== undefined;
   const hasEnvChangeHints = options.envDeltas !== undefined;
+  const updateAux = (id: string, beforeAux: InternalMaterializationAux | undefined, refreshedAux: InternalMaterializationAux | undefined): void => {
+    if (refreshedAux === beforeAux) return;
+    nextAux ??= new Map(beforeState.aux);
+    if (refreshedAux === undefined) nextAux.delete(id);
+    else nextAux.set(id, refreshedAux);
+  };
+  const pushChange = (change: MaterializationMaintenanceChange<Row>): void => {
+    changes.push(change);
+    if (change.recomputed) recomputedCount += 1;
+    if (change.update === 'carried') carriedCount += 1;
+    diagnostics.push(...change.diagnostics);
+  };
 
   for (const metadata of beforeState.metadata) {
     const previousRows = beforeState.rows.get(metadata.id) as readonly Row[] | undefined;
+    const previousAux = beforeState.aux.get(metadata.id);
     const dependencies = relationDependencies(metadata.query);
-    const touched = dependencies.filter((name) => touchedDependencies.includes(name));
+    const touched = dependencies.filter((name) => touchedDependencies.has(name));
     const envDependencies = queryEnvDependencies(metadata.query);
-    const touchedEnv = envDependencies.filter((name) => touchedEnvDependencies.includes(name));
+    const touchedEnv = envDependencies.filter((name) => touchedEnvDependencies.has(name));
     const envHintsCoverDependencies = hasEnvChangeHints || envDependencies.length === 0;
     const indexSpecs = materializationIndexSpecs(metadata.query);
     if (previousRows !== undefined && hasRelationChangeHints && envHintsCoverDependencies && touched.length === 0 && touchedEnv.length === 0) {
-      changes.push({
+      pushChange({
         update: 'carried',
         recomputed: false,
         reason: 'dependencies unchanged',
@@ -2647,13 +2663,18 @@ export function maintainMaterializationSnapshots<Row = unknown>(
 
     const incremental = previousRows === undefined || !hasRelationChangeHints || !envHintsCoverDependencies || touchedEnv.length > 0
       ? undefined
-      : maintainMaterializationIncrementally(before, target, metadata.query as Query<Row>, previousRows, options.deltas, beforeState.aux.get(metadata.id));
+      : maintainMaterializationIncrementally(before, target, metadata.query as Query<Row>, previousRows, options.deltas, previousAux);
 
     if (incremental !== undefined && incremental.supported) {
-      const refreshedAux = materializationAuxForRows(target, metadata.query as Query<Row>, incremental.rows, incremental.aux);
-      if (refreshedAux === undefined) nextAux.delete(metadata.id);
-      else nextAux.set(metadata.id, refreshedAux);
-      changes.push({
+      const canCarryAux = incremental.rows === previousRows
+        && incremental.rowChanges.length === 0
+        && (incremental.aux === undefined || incremental.aux === previousAux)
+        && (previousAux !== undefined || !queryDataMayNeedMaterializationAux(metadata.query.data));
+      const refreshedAux = canCarryAux
+        ? previousAux
+        : materializationAuxForRows(target, metadata.query as Query<Row>, incremental.rows, incremental.aux);
+      updateAux(metadata.id, previousAux, refreshedAux);
+      pushChange({
         update: 'incremental',
         recomputed: false,
         reason: incremental.reason,
@@ -2693,21 +2714,20 @@ export function maintainMaterializationSnapshots<Row = unknown>(
         : `snapshot recompute: ${fallbackDiagnostics.map((item) => item.message).join('; ')}`,
       diagnostics: fallbackDiagnostics
     });
-    changes.push(recomputed);
+    pushChange(recomputed);
     const refreshedAux = materializationAuxForRows<Row>(target, metadata.query as Query<Row>, recomputed.rows);
-    if (refreshedAux === undefined) nextAux.delete(metadata.id);
-    else nextAux.set(metadata.id, refreshedAux);
+    updateAux(metadata.id, previousAux, refreshedAux);
   }
 
   const result: MaterializationMaintenanceResult<Row> = {
     maintained: changes.length,
-    recomputed: changes.filter((change) => change.recomputed).length,
-    carried: changes.filter((change) => change.update === 'carried').length,
+    recomputed: recomputedCount,
+    carried: carriedCount,
     skipped: 0,
     changes,
-    diagnostics: changes.flatMap((change) => change.diagnostics)
+    diagnostics
   };
-  return withMaterializationMaintenanceAux(result, nextAux);
+  return withMaterializationMaintenanceAux(result, nextAux ?? beforeState.aux);
 }
 
 export function maintainMaterializations<DbValue extends Db, Row = unknown>(
@@ -2928,6 +2948,18 @@ function maintainTopNMaterializationIncrementally<Row>(
     evaluateOptions
   );
   if (!preLimitUpdate.supported) return preLimitUpdate;
+  if (preLimitUpdate.rows === previousPreLimitRows && preLimitUpdate.rowChanges.length === 0) {
+    return {
+      supported: true,
+      reason: 'incremental delta maintenance',
+      rows: previousRows,
+      added: [],
+      removed: [],
+      rowChanges: [],
+      diagnostics: preLimitUpdate.diagnostics,
+      ...(previousAux === undefined ? {} : { aux: previousAux })
+    };
+  }
 
   const rows = preLimitUpdate.rows.slice(0, topN.count);
   const diff = diffRows(previousRows, rows, { keyBy: support.identity.keyBy });
@@ -3923,10 +3955,11 @@ function materializationIndexesForRows<Row>(
   query: Query<Row>,
   rows: readonly Row[]
 ): readonly InternalMaterializationIndex[] | undefined {
-  const specs = materializationIndexSpecs(query).flatMap((spec) => {
+  const specs: InternalMaterializationIndexSpec[] = [];
+  for (const spec of materializationIndexSpecs(query)) {
     const internal = internalMaterializationIndexSpec(spec);
-    return internal === undefined ? [] : [internal];
-  });
+    if (internal !== undefined) specs.push(internal);
+  }
   if (specs.length === 0) return undefined;
   return specs.map((spec) => materializationIndexForRows(spec, rows));
 }
@@ -3936,7 +3969,8 @@ function materializationIndexForRows<Row>(
   rows: readonly Row[]
 ): InternalMaterializationIndex {
   const buckets = new Map<string, { value: unknown; entries: InternalMaterializationIndexEntry[] }>();
-  for (const [order, rowValue] of rows.entries()) {
+  for (let order = 0; order < rows.length; order += 1) {
+    const rowValue = rows[order];
     if (!isRecord(rowValue)) continue;
     const valueValue = rowValue[spec.field];
     const key = stableKey(valueValue);
@@ -3948,9 +3982,10 @@ function materializationIndexForRows<Row>(
     }
   }
 
-  const finalizedBuckets = new Map<string, InternalMaterializationIndexBucket>(
-    Array.from(buckets, ([key, bucket]) => [key, { value: bucket.value, entries: bucket.entries }])
-  );
+  const finalizedBuckets = new Map<string, InternalMaterializationIndexBucket>();
+  for (const [key, bucket] of buckets) {
+    finalizedBuckets.set(key, { value: bucket.value, entries: bucket.entries });
+  }
   return {
     ...spec,
     buckets: finalizedBuckets,
@@ -4601,9 +4636,11 @@ function applyIncrementalMaterializedRows<Row>(
     return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
   }
 
-  const retainedCollisionKeys = Array.from(addedByKey.keys())
-    .filter((key) => previousLookup.get(key) !== undefined && !removedByKey.has(key))
-    .sort();
+  const retainedCollisionKeys = addedRows.length === 0
+    ? []
+    : Array.from(addedByKey.keys())
+      .filter((key) => previousLookup.get(key) !== undefined && !removedByKey.has(key))
+      .sort();
   if (retainedCollisionKeys.length > 0) {
     const reason = `incremental maintenance cannot add materialized row keys that collide with retained rows: ${retainedCollisionKeys.join(', ')}`;
     return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
@@ -4624,10 +4661,16 @@ function applyIncrementalMaterializedRows<Row>(
     return { supported: false, reason, diagnostics: [materializationUnsupportedDiagnostic(reason)] };
   }
 
-  const removedIndexes = new Set(removedEntries.map((entry) => entry.index));
   const rowChanges = materializedDeltaRowChanges(removedEntries, addedKeyedRows, removedByKey, addedByKey);
-  const added = rowChanges.flatMap((change) => change.kind === 'added' ? [change.row] : []);
-  const removed = rowChanges.flatMap((change) => change.kind === 'removed' ? [change.row] : []);
+  const added: Row[] = [];
+  const removed: Row[] = [];
+  for (const change of rowChanges) {
+    if (change.kind === 'added') added.push(change.row);
+    else if (change.kind === 'removed') removed.push(change.row);
+  }
+  if (rowChanges.length === 0) {
+    return { supported: true, rows: previousRows, added, removed, rowChanges };
+  }
 
   if (removedRows.length === 0 && addedRows.length === 0) {
     return { supported: true, rows: previousRows, added, removed, rowChanges };
@@ -4687,6 +4730,7 @@ function applyIncrementalMaterializedRows<Row>(
     }
   }
 
+  const removedIndexes = new Set(removedEntries.map((entry) => entry.index));
   if (removedRows.length === addedRows.length) {
     const sorted = sortedRows();
     if (sorted !== undefined) return { supported: true, rows: sorted, added, removed, rowChanges };
@@ -4834,9 +4878,12 @@ function materializedDeltaRowChanges<Row>(
     }
   }
 
-  const addedChanges = addedRows
-    .filter((entry) => !removedByKey.has(entry.key) && !consumedAddedKeys.has(entry.key))
-    .map((entry): RowChange<Row> => ({ kind: 'added', row: entry.row, key: entry.key }));
+  const addedChanges: RowChange<Row>[] = [];
+  for (const entry of addedRows) {
+    if (!removedByKey.has(entry.key) && !consumedAddedKeys.has(entry.key)) {
+      addedChanges.push({ kind: 'added', row: entry.row, key: entry.key });
+    }
+  }
 
   return [
     ...existingChanges
@@ -6342,7 +6389,19 @@ function readStoreViewSnapshot<Row, Version>(
 
   const previous = entry.cachedSnapshot;
   const result = qResult(current.db, entry.query);
-  const nextDiagnostics = [...current.diagnostics, ...result.diagnostics];
+  if (
+    previous !== undefined
+    && result.rows === previous.rows
+    && result.diagnostics.length === 0
+    && previous.diagnostics.length === current.diagnostics.length
+    && entry.cachedSnapshotDiagnosticsKey === diagnosticsKey
+    && entry.cachedSnapshotVersionKey === versionKey
+  ) {
+    entry.cachedStoreRevision = current.revision;
+    return previous;
+  }
+
+  const nextDiagnostics = storeViewDiagnostics(current.diagnostics, result.diagnostics);
   const nextValueKey = storeViewSnapshotValueFingerprint(result.rows, nextDiagnostics, current.version);
 
   if (previous !== undefined && entry.cachedSnapshotValueKey === nextValueKey) {
@@ -6365,6 +6424,15 @@ function readStoreViewSnapshot<Row, Version>(
   entry.cachedSnapshotVersionKey = versionKey;
   entry.cachedSnapshotValueKey = nextValueKey;
   return entry.cachedSnapshot;
+}
+
+function storeViewDiagnostics(
+  storeDiagnostics: readonly TarstateDiagnostic[],
+  queryDiagnostics: readonly TarstateDiagnostic[]
+): readonly TarstateDiagnostic[] {
+  if (queryDiagnostics.length === 0) return storeDiagnostics;
+  if (storeDiagnostics.length === 0) return queryDiagnostics;
+  return [...storeDiagnostics, ...queryDiagnostics];
 }
 
 function createStoreView<Row, Version>(
@@ -7803,8 +7871,8 @@ function canCompareRelationKeyAtom(input: unknown): boolean {
   return input === null || (typeof input !== 'object' && typeof input !== 'function' && typeof input !== 'symbol');
 }
 
-function cloneDb(input: Db): Db {
-  return { ...input, data: cloneDbData(input.data), env: input.env };
+function stageDb(input: Db): Db {
+  return { ...input, data: input.data, env: input.env };
 }
 
 function cloneDbData(data: DbInputData): DbData {
@@ -8843,8 +8911,12 @@ function materializationAuxForRows<Row>(
   existingAux?: InternalMaterializationAux
 ): InternalMaterializationAux | undefined {
   if (existingAux === undefined && !queryDataMayNeedMaterializationAux(query.data)) return undefined;
-  const topNPreLimitRows = existingAux?.topNPreLimitRows ?? materializationAuxForTarget(target, query)?.topNPreLimitRows;
-  const indexes = materializationIndexesForRows(query, rows);
+  const topNPreLimitRows = queryDataMayNeedTopNAux(query.data) || existingAux?.topNPreLimitRows !== undefined
+    ? existingAux?.topNPreLimitRows ?? materializationAuxForTarget(target, query)?.topNPreLimitRows
+    : undefined;
+  const indexes = queryDataMayNeedMaterializationIndexes(query.data) || existingAux?.indexes !== undefined
+    ? materializationIndexesForRows(query, rows)
+    : undefined;
   if (topNPreLimitRows === undefined && indexes === undefined) return undefined;
   return {
     ...(topNPreLimitRows === undefined ? {} : { topNPreLimitRows }),
@@ -8853,9 +8925,23 @@ function materializationAuxForRows<Row>(
 }
 
 function queryDataMayNeedMaterializationAux(data: QueryData): boolean {
+  return queryDataMayNeedTopNAux(data) || queryDataMayNeedMaterializationIndexes(data);
+}
+
+function queryDataMayNeedTopNAux(data: QueryData): boolean {
   switch (data.op) {
     case 'limit':
     case 'sortLimit':
+      return true;
+    default:
+      break;
+  }
+
+  return nestedQueryDataMayNeed(data, queryDataMayNeedTopNAux);
+}
+
+function queryDataMayNeedMaterializationIndexes(data: QueryData): boolean {
+  switch (data.op) {
     case 'hash':
     case 'btree':
     case 'uniqueIndex':
@@ -8864,12 +8950,19 @@ function queryDataMayNeedMaterializationAux(data: QueryData): boolean {
       break;
   }
 
+  return nestedQueryDataMayNeed(data, queryDataMayNeedMaterializationIndexes);
+}
+
+function nestedQueryDataMayNeed(
+  data: QueryData,
+  predicate: (nested: QueryData) => boolean
+): boolean {
   for (const input of [data.input, data.left, data.right]) {
     const nested = queryDataFrom(input);
-    if (nested !== undefined && queryDataMayNeedMaterializationAux(nested)) return true;
+    if (nested !== undefined && predicate(nested)) return true;
   }
   for (const input of queryDataArray(data.inputs)) {
-    if (queryDataMayNeedMaterializationAux(input)) return true;
+    if (predicate(input)) return true;
   }
   return false;
 }

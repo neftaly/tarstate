@@ -233,6 +233,7 @@ type IndexedRangeRow = {
 type AutomergeMapSourceSnapshot = {
   readonly heads: Automerge.Heads;
   readonly collections: readonly MappedRelationRows[];
+  readonly byRelation: ReadonlyMap<string, MappedRelationRows>;
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
 type AutomergeMapSourceSnapshotCache = {
@@ -1182,10 +1183,11 @@ function isRepoStorageMetric(input: unknown): input is AutomergeRepoStorageMetri
 }
 
 function decodeRelationRow(relation: RelationRef, row: Row): Row {
-  return Object.fromEntries(Object.entries(row).map(([fieldName, value]) => [
-    fieldName,
-    fieldReadValue(relation.fields[fieldName], cloneValue(value))
-  ]));
+  const decoded: Row = {};
+  for (const [fieldName, value] of Object.entries(row)) {
+    decoded[fieldName] = fieldReadValue(relation.fields[fieldName], cloneValue(value));
+  }
+  return decoded;
 }
 
 function fieldReadValue(spec: FieldSpec | undefined, value: unknown): unknown {
@@ -1297,6 +1299,7 @@ function mapSourceSnapshot<DocumentShape extends object>(
   return {
     heads,
     collections: Array.from(byRelation.values()),
+    byRelation,
     diagnostics
   };
 }
@@ -1351,18 +1354,22 @@ function rangeRowsForRelationSnapshot(
     ? index.length
     : upperBoundRangeIndex(index, spec, lookup.upper.value, lookup.upper.inclusive);
 
-  return index
-    .slice(lowerIndex, upperIndex)
-    .filter((entry) => fieldValueInRange(spec, entry.row[lookup.field], lookup.lower, lookup.upper))
-    .sort((left, right) => left.ordinal - right.ordinal)
-    .map((entry) => entry.row);
+  const entries: IndexedRangeRow[] = [];
+  for (let indexValue = lowerIndex; indexValue < upperIndex; indexValue += 1) {
+    const entry = index[indexValue];
+    if (entry !== undefined && fieldValueInRange(spec, entry.row[lookup.field], lookup.lower, lookup.upper)) {
+      entries.push(entry);
+    }
+  }
+  entries.sort((left, right) => left.ordinal - right.ordinal);
+  return entries.map((entry) => entry.row);
 }
 
 function mappedRowsForRelation(
   snapshot: AutomergeMapSourceSnapshot,
   relationRef: RelationRef
 ): MappedRelationRows | undefined {
-  return snapshot.collections.find((entry) => entry.relation.name === relationRef.name);
+  return snapshot.byRelation.get(relationRef.name);
 }
 
 function equalityIndexFor(
