@@ -6390,7 +6390,8 @@ function notifyStoreViewSubscribers<Version>(
     const next = readStoreViewSnapshot(entry, current, key);
     if (previous === next) continue;
 
-    for (const listener of [...entry.listeners]) listener();
+    const listeners = Array.from(entry.listeners);
+    for (const listener of listeners) listener();
   }
 }
 
