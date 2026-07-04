@@ -37,12 +37,38 @@ import {
 import { evaluate, type EvaluateEnv } from '@tarstate/core/evaluate';
 import type { PredicateData, Query } from '@tarstate/core/query';
 import {
-  customField,
   type CustomFieldSpec,
   type FieldSpec,
   type RelationRef
 } from '@tarstate/core/schema';
 import type { WritePatch } from '@tarstate/core/write';
+
+import type {
+  AutomergeObjectPath,
+  AutomergeObjectReference,
+  AutomergeObjectReferenceOptions
+} from './fields.js';
+import {
+  compareValues,
+  stableKey,
+  stableStringify,
+  valuesEqual
+} from './value.js';
+
+export {
+  automergeBytesField,
+  automergeCounterField,
+  automergeDateField,
+  automergeObjectReferenceField,
+  automergeTextField
+} from './fields.js';
+export type {
+  AutomergeCounterValue,
+  AutomergeObjectPath,
+  AutomergeObjectReference,
+  AutomergeObjectReferenceOptions,
+  AutomergeTextValue
+} from './fields.js';
 
 const runtimeSystemRelationNameSet = new Set(runtimeSystemRelationList.map((relationRef) => relationRef.name));
 
@@ -59,19 +85,7 @@ export type AutomergeConflictDiagnosticOptions = {
   readonly field?: string;
   readonly surface?: string;
 };
-export type AutomergeObjectPath = readonly Automerge.Prop[];
 export type AutomergeAnchoredPath = readonly [Automerge.ObjID, ...Automerge.Prop[]];
-export type AutomergeObjectReference = {
-  readonly objectId: Automerge.ObjID;
-  readonly path?: AutomergeObjectPath;
-  readonly heads?: Automerge.Heads;
-  readonly documentId?: string;
-  readonly branch?: string;
-  readonly relation?: string;
-  readonly key?: unknown;
-  readonly detail?: unknown;
-};
-export type AutomergeObjectReferenceOptions = Omit<AutomergeObjectReference, 'objectId' | 'path'>;
 export type AutomergeObjectLocation = {
   readonly objectId: Automerge.ObjID;
   readonly path: AutomergeObjectPath;
@@ -84,162 +98,6 @@ export type AutomergeObjectLocation = {
   readonly key?: unknown;
   readonly detail?: unknown;
 };
-export type AutomergeTextValue = string | Automerge.ImmutableString;
-export type AutomergeCounterValue = number | Automerge.Counter;
-
-const bytesToHex = (bytes: Uint8Array): string =>
-  Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-
-const isHexString = (value: unknown): value is string =>
-  typeof value === 'string' && value.length % 2 === 0 && /^[0-9a-f]*$/iu.test(value);
-
-const hexToBytes = (value: unknown): Uint8Array => {
-  if (value instanceof Uint8Array) return value;
-  if (!isHexString(value)) throw new TypeError('Automerge bytes fields must be encoded as even-length hex strings');
-
-  const bytes = new Uint8Array(value.length / 2);
-  for (let index = 0; index < value.length; index += 2) {
-    bytes[index / 2] = Number.parseInt(value.slice(index, index + 2), 16);
-  }
-  return bytes;
-};
-
-const bytesScalar = (value: unknown): string =>
-  value instanceof Uint8Array ? bytesToHex(value) : isHexString(value) ? value.toLowerCase() : '';
-
-const bytesValue = (value: unknown): Uint8Array | undefined =>
-  value instanceof Uint8Array ? value : isHexString(value) ? hexToBytes(value) : undefined;
-
-const isValidDateScalar = (value: unknown): value is string => {
-  if (typeof value !== 'string') return false;
-  const time = Date.parse(value);
-  return Number.isFinite(time);
-};
-
-const scalarToDate = (value: unknown): Date => {
-  if (value instanceof Date && !Number.isNaN(value.valueOf())) return value;
-  if (!isValidDateScalar(value)) throw new TypeError('Automerge date fields must be valid date strings');
-
-  return new Date(value);
-};
-
-const dateTime = (value: unknown): number | undefined => {
-  if (value instanceof Date && !Number.isNaN(value.valueOf())) return value.getTime();
-  if (isValidDateScalar(value)) return Date.parse(value);
-  return undefined;
-};
-
-const dateScalar = (value: unknown): string => {
-  const time = dateTime(value);
-  return time === undefined ? '' : new Date(time).toISOString();
-};
-
-const scalarToCounter = (value: unknown): Automerge.Counter => {
-  if (Automerge.isCounter(value)) return value;
-  const numberValue = Number(value);
-  if (!Number.isFinite(numberValue)) throw new TypeError('Automerge counter fields must be finite numbers');
-  return new Automerge.Counter(numberValue);
-};
-
-const compareByteArrays = (left: Uint8Array, right: Uint8Array): number => {
-  const length = Math.min(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const compared = (left[index] ?? 0) - (right[index] ?? 0);
-    if (compared !== 0) return compared;
-  }
-
-  return left.length - right.length;
-};
-
-export function automergeTextField(
-  options: Partial<CustomFieldSpec<unknown>> = {}
-): FieldSpec<string> {
-  return customScalarField<string>({
-    kind: 'automerge.text',
-    description: 'an Automerge text value',
-    validate: (value): value is unknown =>
-      typeof value === 'string' || Automerge.isImmutableString(value),
-    toScalar: (value) => String(value),
-    fromScalar: (value) => Automerge.isImmutableString(value)
-      ? value
-      : new Automerge.ImmutableString(String(value)),
-    stableKey: (value) => String(value),
-    compare: (left, right) => String(left).localeCompare(String(right)),
-    ...options
-  });
-}
-
-export function automergeCounterField(
-  options: Partial<CustomFieldSpec<unknown>> = {}
-): FieldSpec<number> {
-  return customScalarField<number>({
-    kind: 'automerge.counter',
-    description: 'an Automerge counter value',
-    validate: (value): value is unknown =>
-      typeof value === 'number' && Number.isFinite(value) || Automerge.isCounter(value),
-    toScalar: (value) => Number(value),
-    fromScalar: scalarToCounter,
-    stableKey: (value) => String(Number(value)),
-    compare: (left, right) => Number(left) - Number(right),
-    ...options
-  });
-}
-
-export function automergeBytesField(
-  options: Partial<CustomFieldSpec<unknown>> = {}
-): FieldSpec<string> {
-  return customScalarField<string>({
-    kind: 'automerge.bytes',
-    description: 'an Automerge bytes value',
-    validate: (value): value is unknown => value instanceof Uint8Array || isHexString(value),
-    toScalar: bytesScalar,
-    fromScalar: hexToBytes,
-    stableKey: bytesScalar,
-    compare: (left, right) => {
-      const leftBytes = bytesValue(left);
-      const rightBytes = bytesValue(right);
-      return leftBytes !== undefined && rightBytes !== undefined ? compareByteArrays(leftBytes, rightBytes) : compareValues(left, right);
-    },
-    ...options
-  });
-}
-
-export function automergeDateField(
-  options: Partial<CustomFieldSpec<unknown>> = {}
-): FieldSpec<string> {
-  return customScalarField<string>({
-    kind: 'automerge.date',
-    description: 'an Automerge date value',
-    validate: (value): value is unknown =>
-      (value instanceof Date && !Number.isNaN(value.valueOf())) || isValidDateScalar(value),
-    toScalar: dateScalar,
-    fromScalar: scalarToDate,
-    stableKey: dateScalar,
-    compare: (left, right) => {
-      const leftTime = dateTime(left);
-      const rightTime = dateTime(right);
-      return leftTime !== undefined && rightTime !== undefined ? leftTime - rightTime : compareValues(left, right);
-    },
-    ...options
-  });
-}
-
-export function automergeObjectReferenceField(
-  options: Partial<CustomFieldSpec<unknown>> = {}
-): FieldSpec<AutomergeObjectReference> {
-  return customScalarField<AutomergeObjectReference>({
-    kind: 'automerge.objectReference',
-    description: 'an Automerge object reference',
-    validate: isAutomergeObjectReference,
-    stableKey,
-    compare: (left, right) => stableKey(left).localeCompare(stableKey(right)),
-    ...options
-  });
-}
-
-function customScalarField<Value>(spec: CustomFieldSpec<unknown>): FieldSpec<Value> {
-  return customField<unknown>(spec) as FieldSpec<Value>;
-}
 
 export type AutomergeMapRelation<
   Relation extends RelationRef = RelationRef,
@@ -3220,25 +3078,6 @@ function isRecord(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
-function isAutomergeObjectReference(input: unknown): boolean {
-  if (!isRecord(input) || typeof input.objectId !== 'string') return false;
-  if (input.path !== undefined && !isAutomergePath(input.path)) return false;
-  if (input.heads !== undefined && !isStringArray(input.heads)) return false;
-  if (input.documentId !== undefined && typeof input.documentId !== 'string') return false;
-  if (input.branch !== undefined && typeof input.branch !== 'string') return false;
-  if (input.relation !== undefined && typeof input.relation !== 'string') return false;
-  return true;
-}
-
-function isAutomergePath(input: unknown): input is readonly Automerge.Prop[] {
-  return Array.isArray(input) && input.every((segment) =>
-    typeof segment === 'string' || typeof segment === 'number');
-}
-
-function isStringArray(input: unknown): input is readonly string[] {
-  return Array.isArray(input) && input.every((item) => typeof item === 'string');
-}
-
 function isExprData(input: unknown): input is Record<string, unknown> & { readonly op: string } {
   return isRecord(input) && typeof input.op === 'string';
 }
@@ -3252,50 +3091,8 @@ function isPlainObjectLike(input: Record<string, unknown>): boolean {
   return prototype === Object.prototype || prototype === null;
 }
 
-function valuesEqual(left: unknown, right: unknown): boolean {
-  return stableStringify(left) === stableStringify(right);
-}
-
 function rowsExactlyMatch(left: Row, right: Row): boolean {
   return stableKey(left) === stableKey(right);
-}
-
-function stableKey(input: unknown): string {
-  if (input === undefined) return '~undefined';
-  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
-    return JSON.stringify(input);
-  }
-  if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
-  if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
-  if (typeof input === 'function') return `~function:${input.name}`;
-  if (Array.isArray(input)) return `[${input.map(stableKey).join(',')}]`;
-  if (isRecord(input)) {
-    return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${stableKey(input[key])}`).join(',')}}`;
-  }
-
-  return JSON.stringify(String(input as string | number | boolean | bigint | null | undefined));
-}
-
-function stableStringify(input: unknown): string {
-  return JSON.stringify(normalizeForStableStringify(input));
-}
-
-function normalizeForStableStringify(input: unknown): unknown {
-  if (Array.isArray(input)) return input.map(normalizeForStableStringify);
-  if (isRecord(input) && isPlainObjectLike(input)) {
-    return Object.fromEntries(Object.keys(input)
-      .sort()
-      .map((key) => [key, normalizeForStableStringify(input[key])]));
-  }
-
-  return input;
-}
-
-function compareValues(left: unknown, right: unknown): number {
-  if (typeof left === 'number' && typeof right === 'number') return left - right;
-  if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right);
-  if (left instanceof Date && right instanceof Date) return left.getTime() - right.getTime();
-  return String(left).localeCompare(String(right));
 }
 
 function arrayIndex(segment: string): number | undefined {
