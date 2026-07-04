@@ -1667,8 +1667,10 @@ export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, a
     };
   }
   const result = evaluate(querySourceFor(dbValue, { materializedBaseRelationLookup: !contextOverrides }), queryObject, { ...options, env: options.env ?? dbValue.env });
-  const sortedRows = applyDbQueryOptions(result.rows, options);
-  return { rows: sortedRows, diagnostics: result.diagnostics };
+  return {
+    rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(result.rows, options) : result.rows,
+    diagnostics: result.diagnostics
+  };
 }
 
 type QuerySourceOptions = {

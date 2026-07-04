@@ -77,11 +77,11 @@ const fuzzShapes: readonly FuzzShape[] = [
     queryWeights: { lookup: 4, scan: 2, aggregate: 2, topN: 2 }
   },
   {
-    label: 'write-heavy maintenance mix',
+    label: 'write-heavy GC maintenance mix',
     rowCount: ROW_COUNT,
-    readWeight: 2,
-    writeWeight: 3,
-    queryWeights: { lookup: 2, scan: 1, aggregate: 4, topN: 4 }
+    readWeight: 1,
+    writeWeight: 4,
+    queryWeights: { lookup: 1, scan: 1, aggregate: 5, topN: 5 }
   }
 ];
 const accountKinds = ['asset', 'income', 'expense', 'equity', 'liability'] as const;

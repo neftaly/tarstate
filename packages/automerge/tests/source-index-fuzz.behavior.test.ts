@@ -9,6 +9,7 @@ import {
   defineAutomergeMapRelations,
   type AutomergeMapAdapter
 } from '@tarstate/automerge';
+import { choose, isRecord, mulberry32 } from './fuzz-helpers.js';
 
 type IndexedRow = {
   readonly id: string;
@@ -348,25 +349,4 @@ function valueLabel(value: unknown): string {
   if (typeof value === 'string') return JSON.stringify(value);
   if (typeof value === 'number' || typeof value === 'boolean') return `${value}`;
   return JSON.stringify(value) ?? '[object]';
-}
-
-function choose<Value>(next: () => number, values: readonly Value[]): Value {
-  const value = values[Math.floor(next() * values.length)];
-  if (value === undefined && !values.includes(undefined as Value)) throw new Error('seeded choice escaped values');
-  return value as Value;
-}
-
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state += 0x6d2b_79f5;
-    let value = state;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
-  };
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

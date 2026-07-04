@@ -19,6 +19,7 @@ import {
   automergePathForObjectId,
   defineAutomergeMapRelations
 } from '@tarstate/automerge';
+import { colorAt, createSeededRandom, randomInt, stableSize, valueAt } from './bench-helpers.js';
 
 type TaskRow = {
   readonly id: string;
@@ -49,7 +50,6 @@ interface WorkspaceDoc {
   };
 }
 
-type SeededRandom = () => number;
 type RelationName = 'tasks' | 'labels';
 type KeyRef = {
   readonly relation: RelationName;
@@ -256,7 +256,7 @@ function locationObjectIds(doc: Automerge.Doc<WorkspaceDoc>): readonly Automerge
 function seededObjectIds(seed: number, doc: Automerge.Doc<WorkspaceDoc>): readonly Automerge.ObjID[] {
   const next = createSeededRandom(seed);
   const objectIds = locationObjectIds(doc);
-  return Array.from({ length: SAMPLE_KEY_COUNT }, () => valueAt(objectIds, Math.floor(next() * objectIds.length)));
+  return Array.from({ length: SAMPLE_KEY_COUNT }, () => valueAt(objectIds, randomInt(next, objectIds.length)));
 }
 
 function makeKeyRefs(seed: number): readonly KeyRef[] {
@@ -267,8 +267,8 @@ function makeKeyRefs(seed: number): readonly KeyRef[] {
     return {
       relation,
       key: relation === 'tasks'
-        ? `task-${Math.floor(next() * ROW_COUNT)}`
-        : `label-${Math.floor(next() * LABEL_COUNT)}`
+        ? `task-${randomInt(next, ROW_COUNT)}`
+        : `label-${randomInt(next, LABEL_COUNT)}`
     };
   });
 }
@@ -293,25 +293,6 @@ function relationFor(name: RelationName) {
   return name === 'tasks' ? schema.tasks : schema.labels;
 }
 
-function valueAt<const Value>(values: readonly Value[], cursor: number): Value {
-  const valueValue = values[cursor % values.length];
-  if (valueValue === undefined) throw new Error('value set is empty');
-  return valueValue;
-}
-
-function createSeededRandom(seed: number): SeededRandom {
-  let state = seed >>> 0;
-  return () => {
-    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
-    return state / 0x1_0000_0000;
-  };
-}
-
-function colorAt(index: number): string {
-  const colors = ['red', 'blue', 'green', 'yellow', 'purple', 'gray'] as const;
-  return colors[index % colors.length] ?? 'gray';
-}
-
 function consume(rows: readonly unknown[]): void {
   sink = (sink + rows.length) % Number.MAX_SAFE_INTEGER;
   if (sink < 0) throw new Error('unreachable benchmark sink');
@@ -334,18 +315,6 @@ function consumeApply(result: RelationApplyResult | PromiseLike<RelationApplyRes
   if (result.status !== 'accepted') {
     throw new Error(result.diagnostics.map((diagnostic) => diagnostic.message).join('; '));
   }
-}
-
-function stableSize(input: unknown): number {
-  if (input === null || input === undefined) return 0;
-  if (Array.isArray(input)) return input.length;
-  if (typeof input === 'object') return Object.keys(input).length;
-  if (typeof input === 'string') return input.length;
-  if (typeof input === 'number' || typeof input === 'boolean' || typeof input === 'bigint') {
-    return input.toString().length;
-  }
-  if (typeof input === 'symbol' || typeof input === 'function') return input.toString().length;
-  return 0;
 }
 
 function isPromiseLike(input: unknown): input is PromiseLike<unknown> {

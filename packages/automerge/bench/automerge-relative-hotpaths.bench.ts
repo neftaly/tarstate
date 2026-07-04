@@ -22,6 +22,7 @@ import {
   type AutomergeObjectLocation,
   type AutomergeObjectReference
 } from '@tarstate/automerge';
+import { colorAt, stableSize, valueAt } from './bench-helpers.js';
 
 type TaskRow = {
   readonly id: string;
@@ -636,17 +637,6 @@ function micros(elapsedMs: number, count: number): string {
   return `${((elapsedMs * 1_000) / count).toFixed(2)}us`;
 }
 
-function valueAt<const Value>(values: readonly Value[], cursor: number): Value {
-  const value = values[cursor % values.length];
-  if (value === undefined) throw new Error('benchmark value set is empty');
-  return value;
-}
-
-function colorAt(index: number): string {
-  const colors = ['red', 'blue', 'green', 'yellow', 'purple', 'gray'] as const;
-  return colors[index % colors.length] ?? 'gray';
-}
-
 function consume(rows: readonly unknown[]): void {
   sink = (sink + rows.length) % Number.MAX_SAFE_INTEGER;
   if (sink < 0) throw new Error('unreachable benchmark sink');
@@ -655,16 +645,4 @@ function consume(rows: readonly unknown[]): void {
 function consumeValue(value: unknown): void {
   sink = (sink + stableSize(value)) % Number.MAX_SAFE_INTEGER;
   if (sink < 0) throw new Error('unreachable benchmark sink');
-}
-
-function stableSize(input: unknown): number {
-  if (input === null || input === undefined) return 0;
-  if (Array.isArray(input)) return input.length;
-  if (typeof input === 'object') return Object.keys(input).length;
-  if (typeof input === 'string') return input.length;
-  if (typeof input === 'number' || typeof input === 'boolean' || typeof input === 'bigint') {
-    return input.toString().length;
-  }
-  if (typeof input === 'symbol' || typeof input === 'function') return input.toString().length;
-  return 0;
 }

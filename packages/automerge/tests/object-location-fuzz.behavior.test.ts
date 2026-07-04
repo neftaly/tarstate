@@ -30,6 +30,7 @@ import {
   defineAutomergeMapRelations,
   type AutomergeMapAdapter
 } from '@tarstate/automerge';
+import { mulberry32, randomInt } from './fuzz-helpers.js';
 
 type TaskRow = {
   readonly id: string;
@@ -103,16 +104,16 @@ describe('automerge object location fuzz', () => {
     assertObjectLocationInvariants(adapter, model, `seed ${seed} initial`);
 
     for (let step = 0; step < 48; step += 1) {
-      const operation = Math.floor(next() * 8);
+      const operation = randomInt(next, 8);
 
       if (operation === 0 || model.tasks.size === 0) {
-        const row = { id: `task-${seed.toString(16)}-${step}`, title: `Task ${step}-${pickDigit(next)}` };
+        const row = { id: `task-${seed.toString(16)}-${step}`, title: `Task ${step}-${randomInt(next, 10)}` };
         const result = await adapter.target.apply([write(schema.tasks).insertOrReplace(row)]);
         expect(result.status, `seed ${seed} step ${step} insert task`).toBe('accepted');
         model.tasks.set(row.id, row);
       } else if (operation === 1) {
         const row = pickMapValue(model.tasks, next);
-        const title = `${row.title} updated ${step}-${pickDigit(next)}`;
+        const title = `${row.title} updated ${step}-${randomInt(next, 10)}`;
         const result = await adapter.target.apply([write(schema.tasks).updateByKey(row.id, { title })]);
         expect(result.status, `seed ${seed} step ${step} update task`).toBe('accepted');
         model.tasks.set(row.id, { ...row, title });
@@ -122,13 +123,13 @@ describe('automerge object location fuzz', () => {
         expect(result.status, `seed ${seed} step ${step} delete task`).toBe('accepted');
         model.tasks.delete(row.id);
       } else if (operation === 3 || model.labels.size === 0) {
-        const row = { id: `label-${seed.toString(16)}-${step}`, name: `Label ${step}-${pickDigit(next)}` };
+        const row = { id: `label-${seed.toString(16)}-${step}`, name: `Label ${step}-${randomInt(next, 10)}` };
         const result = await adapter.target.apply([write(schema.labels).insertOrReplace(row)]);
         expect(result.status, `seed ${seed} step ${step} insert label`).toBe('accepted');
         model.labels.set(row.id, row);
       } else if (operation === 4) {
         const row = pickMapValue(model.labels, next);
-        const name = `${row.name} updated ${step}-${pickDigit(next)}`;
+        const name = `${row.name} updated ${step}-${randomInt(next, 10)}`;
         const result = await adapter.target.apply([write(schema.labels).updateByKey(row.id, { name })]);
         expect(result.status, `seed ${seed} step ${step} update label`).toBe('accepted');
         model.labels.set(row.id, { ...row, name });
@@ -150,7 +151,7 @@ describe('automerge object location fuzz', () => {
         adapter.setDoc(Automerge.change(adapter.getDoc(), (draft) => {
           const tasks = draft.workspace.tasks as TaskRow[];
           if (tasks.length > 1) {
-            const [row] = tasks.splice(Math.floor(next() * tasks.length), 1);
+            const [row] = tasks.splice(randomInt(next, tasks.length), 1);
             deletedId = row?.id;
           }
         }));
@@ -319,23 +320,7 @@ function objectLocationRows(adapter: AutomergeMapAdapter<WorkspaceDoc>): readonl
 
 function pickMapValue<Value>(map: ReadonlyMap<string, Value>, next: () => number): Value {
   const values = Array.from(map.values());
-  const valueAtIndex = values[Math.floor(next() * values.length)];
+  const valueAtIndex = values[randomInt(next, values.length)];
   if (valueAtIndex === undefined) throw new Error('expected non-empty map');
   return valueAtIndex;
-}
-
-function pickDigit(next: () => number): number {
-  return Math.floor(next() * 10);
-}
-
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-
-  return () => {
-    state += 0x6d2b_79f5;
-    let mixed = state;
-    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
-    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
-    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
-  };
 }

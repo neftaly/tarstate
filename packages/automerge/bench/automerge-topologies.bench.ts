@@ -13,6 +13,7 @@ import {
   type JsonValue
 } from '@tarstate/core/schema';
 import { automergeMapSource, defineAutomergeMapRelations } from '@tarstate/automerge';
+import { colorAt, valueAt } from './bench-helpers.js';
 
 type TaskRow = {
   readonly id: string;
@@ -665,20 +666,9 @@ function binarySearchVisitCount(length: number): number {
   return Math.max(1, Math.ceil(Math.log2(Math.max(1, length))));
 }
 
-function valueAt<const Value>(values: readonly Value[], cursor: number): Value {
-  const value = values[cursor % values.length];
-  if (value === undefined) throw new Error('benchmark value set is empty');
-  return value;
-}
-
 function requiredNumber(value: number | undefined): number {
   if (value === undefined) throw new Error('expected benchmark field to be present');
   return value;
-}
-
-function colorAt(index: number): string {
-  const colors = ['red', 'blue', 'green', 'yellow', 'purple', 'gray'] as const;
-  return colors[index % colors.length] ?? 'gray';
 }
 
 function micros(elapsedMs: number, samples: number): string {

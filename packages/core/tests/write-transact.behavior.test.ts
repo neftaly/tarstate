@@ -198,67 +198,62 @@ describe('write and transaction behavior', () => {
 
   it('rejects invalid numeric increments with diagnostics and leaves the input db unchanged', () => {
     const db = makeDb();
-
-    const missingRow = tryTransact(db, incrementByKey(schema.entries, 'missing', 'amount', 1));
-    expect(missingRow).toEqual(expect.objectContaining({
-      committed: false,
-      applied: 0,
-      db
-    }));
-    expect(missingRow.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'row_invalid', relation: 'entries', field: 'amount' })
-    ]));
-
-    const missingField = tryTransact(db, {
-      op: 'incrementByKey',
-      relation: schema.entries,
-      key: 'e1',
-      field: 'missing',
-      amount: 1
-    } as WritePatch);
-    expect(missingField.committed).toBe(false);
-    expect(missingField.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'field_invalid', relation: 'entries', field: 'missing' })
-    ]));
-
-    const nonNumberField = tryTransact(db, {
-      op: 'incrementByKey',
-      relation: schema.entries,
-      key: 'e1',
-      field: 'memo',
-      amount: 1
-    } as WritePatch);
-    expect(nonNumberField.committed).toBe(false);
-    expect(nonNumberField.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'field_invalid', relation: 'entries', field: 'memo' })
-    ]));
-
-    const nonFiniteAmount = tryTransact(db, incrementByKey(schema.entries, 'e1', 'amount', Number.POSITIVE_INFINITY));
-    expect(nonFiniteAmount.committed).toBe(false);
-    expect(nonFiniteAmount.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'write_patch_invalid', relation: 'entries' })
-    ]));
-
     const nonFiniteResultDb = createDb({
       entries: [{ id: 'max', accountId: 'cash', amount: Number.MAX_VALUE, posted: true }]
     });
-    const nonFiniteResult = tryTransact(
-      nonFiniteResultDb,
-      incrementByKey(schema.entries, 'max', 'amount', Number.MAX_VALUE)
-    );
-    expect(nonFiniteResult.committed).toBe(false);
-    expect(nonFiniteResult.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'field_invalid', relation: 'entries', field: 'amount' })
-    ]));
-    expect(row(nonFiniteResultDb, schema.entries, 'max')?.amount).toBe(Number.MAX_VALUE);
-
     const numericKeyDb = createDb({ metrics: [{ id: 1, value: 10 }] });
-    const keyIncrement = tryTransact(numericKeyDb, incrementByKey(counterMetricSchema.metrics, 1, 'id', 1));
-    expect(keyIncrement.committed).toBe(false);
-    expect(keyIncrement.diagnostics).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'field_invalid', relation: 'metrics', field: 'id' })
-    ]));
-    expect(row(numericKeyDb, counterMetricSchema.metrics, 1)).toEqual({ id: 1, value: 10 });
+    const cases = [
+      {
+        label: 'missing row',
+        db,
+        patch: incrementByKey(schema.entries, 'missing', 'amount', 1),
+        applied: 0,
+        diagnostic: { code: 'row_invalid', relation: 'entries', field: 'amount' }
+      },
+      {
+        label: 'missing field',
+        db,
+        patch: { op: 'incrementByKey', relation: schema.entries, key: 'e1', field: 'missing', amount: 1 } as WritePatch,
+        diagnostic: { code: 'field_invalid', relation: 'entries', field: 'missing' }
+      },
+      {
+        label: 'non-number field',
+        db,
+        patch: { op: 'incrementByKey', relation: schema.entries, key: 'e1', field: 'memo', amount: 1 } as WritePatch,
+        diagnostic: { code: 'field_invalid', relation: 'entries', field: 'memo' }
+      },
+      {
+        label: 'non-finite amount',
+        db,
+        patch: incrementByKey(schema.entries, 'e1', 'amount', Number.POSITIVE_INFINITY),
+        diagnostic: { code: 'write_patch_invalid', relation: 'entries' }
+      },
+      {
+        label: 'non-finite result',
+        db: nonFiniteResultDb,
+        patch: incrementByKey(schema.entries, 'max', 'amount', Number.MAX_VALUE),
+        diagnostic: { code: 'field_invalid', relation: 'entries', field: 'amount' },
+        assertUnchanged: () => expect(row(nonFiniteResultDb, schema.entries, 'max')?.amount).toBe(Number.MAX_VALUE)
+      },
+      {
+        label: 'numeric key field',
+        db: numericKeyDb,
+        patch: incrementByKey(counterMetricSchema.metrics, 1, 'id', 1),
+        diagnostic: { code: 'field_invalid', relation: 'metrics', field: 'id' },
+        assertUnchanged: () => expect(row(numericKeyDb, counterMetricSchema.metrics, 1)).toEqual({ id: 1, value: 10 })
+      }
+    ];
+
+    for (const item of cases) {
+      const result = tryTransact(item.db, item.patch);
+      expect(result.committed, item.label).toBe(false);
+      expect(result.db, item.label).toEqual(item.db);
+      if (item.applied !== undefined) expect(result.applied, item.label).toBe(item.applied);
+      expect(result.diagnostics, item.label).toEqual(expect.arrayContaining([
+        expect.objectContaining(item.diagnostic)
+      ]));
+      item.assertUnchanged?.();
+    }
 
     expect(row(db, schema.entries, 'e1')?.amount).toBe(120);
   });

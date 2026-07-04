@@ -16,6 +16,7 @@ import {
   automergePresenceRuntime,
   type AutomergePresenceFieldNames
 } from '@tarstate/automerge/presence';
+import { choose, mulberry32, randomInt, shuffle } from './fuzz-helpers.js';
 
 type PresenceRow = {
   readonly peer: string;
@@ -232,7 +233,7 @@ function fuzzOperation(
 ): FuzzOperation {
   const opRoll = random();
   const peer = random() < 0.86 ? localPeer : remotePeer;
-  const channel = pick(random, channels);
+  const channel = choose(random, channels);
 
   if (opRoll < 0.3) {
     return { op: 'insertOrReplace', peer, channel, payload: fuzzPayload(random, seed, step, channel) };
@@ -244,7 +245,7 @@ function fuzzOperation(
     return { op: 'deleteByKey', peer, channel };
   }
 
-  const rowCount = 1 + Math.floor(random() * 4);
+  const rowCount = 1 + randomInt(random, 4);
   const replaceChannels = shuffle(random, channels).slice(0, rowCount);
   const rows = replaceChannels.map((replaceChannel, index) => ({
     peer: index === rowCount - 1 && random() < 0.16 ? remotePeer : localPeer,
@@ -256,7 +257,7 @@ function fuzzOperation(
   if (random() < 0.2 && Object.keys(state).length > 0) {
     return {
       op: 'replaceAll',
-      rows: rows.filter((row) => row.channel !== pick(random, Object.keys(state)))
+      rows: rows.filter((row) => row.channel !== choose(random, Object.keys(state)))
     };
   }
   return { op: 'replaceAll', rows };
@@ -273,11 +274,11 @@ function fuzzPayload(
     return objectReferencePayload(seed, step);
   }
 
-  switch (Math.floor(random() * 4)) {
+  switch (randomInt(random, 4)) {
     case 0:
       return `value-${seed.toString(16)}-${step}`;
     case 1:
-      return Math.floor(random() * 10);
+      return randomInt(random, 10);
     case 2:
       return random() < 0.5;
     default:
@@ -349,32 +350,8 @@ function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function pick<T>(random: () => number, values: readonly T[]): T {
-  return values[Math.floor(random() * values.length)] as T;
-}
-
-function shuffle<T>(random: () => number, values: readonly T[]): readonly T[] {
-  const shuffled = [...values];
-  for (let index = shuffled.length - 1; index > 0; index -= 1) {
-    const swapIndex = Math.floor(random() * (index + 1));
-    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex] as T, shuffled[index] as T];
-  }
-  return shuffled;
-}
-
 function message(seed: number, step: number, operation: FuzzOperation): string {
   return `seed=${seed.toString(16)} step=${step} op=${JSON.stringify(operation)}`;
-}
-
-function mulberry32(seed: number): () => number {
-  let state = seed;
-  return () => {
-    state |= 0;
-    state = state + 0x6d2b79f5 | 0;
-    let mixed = Math.imul(state ^ state >>> 15, 1 | state);
-    mixed ^= mixed + Math.imul(mixed ^ mixed >>> 7, 61 | mixed);
-    return ((mixed ^ mixed >>> 14) >>> 0) / 4294967296;
-  };
 }
 
 function realDocHandle(seed: number): DocHandle<PresenceDoc> {

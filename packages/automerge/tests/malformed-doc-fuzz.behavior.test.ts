@@ -8,6 +8,7 @@ import {
   automergeMapSource,
   defineAutomergeMapRelations
 } from '@tarstate/automerge';
+import { isRecord } from './fuzz-helpers.js';
 
 type FuzzRow = {
   readonly id: string;
@@ -267,8 +268,4 @@ function rangeLookup(field: string, lower?: unknown, upper?: unknown): RelationR
 
 function asDoc(input: unknown): Automerge.Doc<FuzzDoc> {
   return Automerge.from(input as FuzzDoc);
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

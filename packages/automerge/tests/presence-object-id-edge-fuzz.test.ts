@@ -31,6 +31,7 @@ import {
   defineAutomergeMapRelations,
   type AutomergeMapAdapter
 } from '@tarstate/automerge';
+import { choose, mulberry32 } from './fuzz-helpers.js';
 
 type TaskRow = {
   readonly id: string;
@@ -99,8 +100,8 @@ describe('presence object-id edge fuzz', () => {
     assertScalarAndMissingPathHelpers(adapter, `seed ${seed} initial`);
 
     for (let step = 0; step < 32; step += 1) {
-      const existingTask = pick(taskRows(adapter), random);
-      const existingLabel = pick(labelRows(adapter), random);
+      const existingTask = choose(random, taskRows(adapter));
+      const existingLabel = choose(random, labelRows(adapter));
       const taskObjectId = adapter.objectIdFor(schema.tasks, existingTask.id);
       const labelObjectId = adapter.objectIdFor(schema.labels, existingLabel.id);
       expect(taskObjectId, `seed ${seed} step ${step} task object id`).toEqual(expect.any(String));
@@ -108,8 +109,8 @@ describe('presence object-id edge fuzz', () => {
       if (taskObjectId === null || labelObjectId === null) throw new Error('expected row object ids');
 
       const deletedTask = await deleteTrackedTask(adapter, random, seed, step);
-      const currentTask = pick(taskRows(adapter), random);
-      const currentLabel = pick(labelRows(adapter), random);
+      const currentTask = choose(random, taskRows(adapter));
+      const currentLabel = choose(random, labelRows(adapter));
       const currentTaskObjectId = adapter.objectIdFor(schema.tasks, currentTask.id);
       const currentLabelObjectId = adapter.objectIdFor(schema.labels, currentLabel.id);
       expect(currentTaskObjectId, `seed ${seed} step ${step} current task object id`).toEqual(expect.any(String));
@@ -260,7 +261,7 @@ async function deleteTrackedTask(
 ): Promise<{ readonly id: string; readonly objectId: string }> {
   const tasks = taskRows(adapter);
   expect(tasks.length, `seed ${seed} step ${step} task count before delete`).toBeGreaterThan(1);
-  const task = pick(tasks, random);
+  const task = choose(random, tasks);
   const objectId = adapter.objectIdFor(schema.tasks, task.id);
   expect(objectId, `seed ${seed} step ${step} deleted object id`).toEqual(expect.any(String));
   if (objectId === null) throw new Error('expected object id before delete');
@@ -500,24 +501,6 @@ function sortedResolvedRows(rows: readonly unknown[]): readonly ResolvedPresence
     .sort((left, right) => `${left.peer}:${left.objectId}`.localeCompare(`${right.peer}:${right.objectId}`));
 }
 
-function pick<T>(values: readonly T[], random: () => number): T {
-  const valueAtIndex = values[Math.floor(random() * values.length)];
-  if (valueAtIndex === undefined) throw new Error('expected non-empty values');
-  return valueAtIndex;
-}
-
 function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-
-  return () => {
-    state += 0x6d2b_79f5;
-    let mixed = state;
-    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
-    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
-    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
-  };
 }

@@ -33,6 +33,7 @@ import {
 import type { RelationSource } from '@tarstate/core/source';
 import { write, type WritePatch } from '@tarstate/core/write';
 import { automergeMapAdapter, defineAutomergeMapRelations } from '@tarstate/automerge';
+import { canonicalRows, choose, chooseFromSet, mulberry32, randomInt } from './fuzz-helpers.js';
 
 type ProjectRow = {
   readonly id: string;
@@ -242,8 +243,8 @@ function assertQueryParity(
 
     expect(automergeResult.diagnostics, `${label} ${queryCase.label} automerge diagnostics`).toEqual([]);
     expect(memoryResult.diagnostics, `${label} ${queryCase.label} memory diagnostics`).toEqual([]);
-    expect(normalizedRows(automergeResult.rows), `${label} ${queryCase.label}`).toEqual(
-      normalizedRows(memoryResult.rows)
+    expect(canonicalRows(automergeResult.rows), `${label} ${queryCase.label}`).toEqual(
+      canonicalRows(memoryResult.rows)
     );
   }
 }
@@ -355,7 +356,7 @@ function commentRow(id: string, state: FuzzState, step: number, next: () => numb
 }
 
 function projectUpdate(step: number, next: () => number): Partial<ProjectRow> {
-  switch (Math.floor(next() * 4)) {
+  switch (randomInt(next, 4)) {
     case 0:
       return { name: choose(next, ['renamed', '', `project update ${step}`] as const) };
     case 1:
@@ -368,7 +369,7 @@ function projectUpdate(step: number, next: () => number): Partial<ProjectRow> {
 }
 
 function taskUpdate(state: FuzzState, step: number, next: () => number): Partial<TaskRow> {
-  switch (Math.floor(next() * 5)) {
+  switch (randomInt(next, 5)) {
     case 0:
       return { title: choose(next, ['updated', '', `task update ${step}`] as const) };
     case 1:
@@ -383,7 +384,7 @@ function taskUpdate(state: FuzzState, step: number, next: () => number): Partial
 }
 
 function commentUpdate(state: FuzzState, step: number, next: () => number): Partial<CommentRow> {
-  switch (Math.floor(next() * 4)) {
+  switch (randomInt(next, 4)) {
     case 0:
       return { body: choose(next, ['updated', '', `comment update ${step}`, 'quote "'] as const) };
     case 1:
@@ -454,13 +455,13 @@ function initialState(initial: ReturnType<typeof initialRows>): FuzzState {
 function randomJson(next: () => number, depth: number): JsonValue {
   if (depth <= 0) return choose(next, [null, true, false, '', 'json', -1, 0, 7.5] as const);
 
-  switch (Math.floor(next() * 6)) {
+  switch (randomInt(next, 6)) {
     case 0:
       return choose(next, [null, true, false, '', 'json', -1, 0, 7.5] as const);
     case 1:
       return [randomJson(next, depth - 1), randomJson(next, depth - 1)];
     case 2:
-      return { note: randomJson(next, depth - 1), count: Math.floor(next() * 5) };
+      return { note: randomJson(next, depth - 1), count: randomInt(next, 5) };
     case 3:
       return { awkward: { emptyArray: [], emptyObject: {}, text: 'quote "' } };
     case 4:
@@ -468,50 +469,4 @@ function randomJson(next: () => number, depth: number): JsonValue {
     default:
       return {};
   }
-}
-
-function normalizedRows(rows: readonly unknown[]): readonly unknown[] {
-  return rows.map(canonicalValue).sort(compareCanonicalRows);
-}
-
-function compareCanonicalRows(left: unknown, right: unknown): number {
-  return canonicalRowKey(left).localeCompare(canonicalRowKey(right));
-}
-
-function canonicalRowKey(input: unknown): string {
-  const json = JSON.stringify(input);
-  return json === undefined ? String(input) : json;
-}
-
-function canonicalValue(input: unknown): unknown {
-  if (Array.isArray(input)) return input.map(canonicalValue);
-  if (isRecord(input)) {
-    return Object.fromEntries(Object.keys(input).sort().map((key) => [key, canonicalValue(input[key])]));
-  }
-  return input;
-}
-
-function choose<Value>(next: () => number, values: readonly Value[]): Value {
-  const value = values[Math.floor(next() * values.length)];
-  if (value === undefined && !values.includes(undefined as Value)) throw new Error('seeded choice escaped values');
-  return value as Value;
-}
-
-function chooseFromSet(next: () => number, values: ReadonlySet<string>): string {
-  return choose(next, Array.from(values).sort());
-}
-
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state += 0x6d2b_79f5;
-    let value = state;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
-  };
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }

@@ -270,6 +270,7 @@ function replaceRow(rows: readonly ItemRow[], nextRow: ItemRow): readonly ItemRo
 function chooseAction(random: SeededRandom, mounted: boolean, step: number): FuzzAction {
   if (mounted && step % 17 === 9) return 'unmount';
   if (!mounted && step % 5 === 2) return 'remount';
+  if (mounted && step % 13 === 4) return 'reset-key';
 
   const actions = mounted ? mountedActions : unmountedActions;
   const action = actions[randomIndex(random, actions.length)];
