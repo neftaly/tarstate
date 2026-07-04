@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createDb, q, qResult, transact } from '@tarstate/core/db';
+import { createDb, q, qResult, transact, tryTransact } from '@tarstate/core/db';
 import { evaluate } from '@tarstate/core/evaluate';
 import { fromObjectSource, type RelationSource } from '@tarstate/core/source';
 import {
@@ -33,7 +33,7 @@ import {
   value,
   where
 } from '@tarstate/core/query';
-import { insert } from '@tarstate/core/write';
+import { deleteByKey, insert } from '@tarstate/core/write';
 import { entry, makeDb, schema } from './behavior-fixtures.js';
 
 const cashEntryList = pipe(
@@ -217,6 +217,23 @@ describe('materialized source behavior', () => {
       ],
       diagnostics: []
     });
+  });
+
+  it('preserves unsorted source order across same-relation delete and insert batches', () => {
+    const db = mat(makeDb(), entryRows);
+    const result = tryTransact(
+      db,
+      deleteByKey(schema.entries, 'e1'),
+      insert(schema.entries, { id: 'e1', accountId: 'cash', amount: 120, memo: 'invoice paid', posted: true })
+    );
+
+    expect(result.committed).toBe(true);
+    expect(result.materializations?.changes[0]).toEqual(expect.objectContaining({
+      update: 'incremental',
+      recomputed: false
+    }));
+    expect(q(result.db, entryRows).map((row) => row.id)).toEqual(['e2', 'e3', 'e4', 'e1']);
+    expect(q(result.db, entryRows)).toEqual(q(demat(result.db, entryRows), entryRows));
   });
 
   it('uses materialized lookup and range reads through q while preserving live db reads', () => {

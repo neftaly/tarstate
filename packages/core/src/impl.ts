@@ -1152,13 +1152,48 @@ export function fromObjectSource(data: Record<string, readonly unknown[]>): Rela
 
 export const isRelationSource = (input: unknown): input is RelationSource => isRecord(input) && typeof input.rows === 'function';
 export const composeSources = (...sources: readonly RelationSource[]): RelationSource => ({
-  relationNames: Array.from(new Set(sources.flatMap((source) => source.relationNames ?? []))),
-  rows: (relationRef) => sources.flatMap((source) => source.rows(relationRef)),
-  lookup: (lookupValue) => sources.flatMap((source) =>
-    source.lookup?.(lookupValue) ?? scanLookupRows(source.rows(lookupValue.relation), lookupValue)),
-  rangeLookup: (lookupValue) => sources.flatMap((source) =>
-    source.rangeLookup?.(lookupValue) ?? scanRangeRows(source.rows(lookupValue.relation), lookupValue))
+  ...composeSourceRelationNames(sources),
+  rows: (relationRef) => {
+    const rows: unknown[] = [];
+    for (const source of sources) {
+      if (sourceMayOwnRelation(source, relationRef.name)) appendRows(rows, source.rows(relationRef));
+    }
+    return rows;
+  },
+  lookup: (lookupValue) => {
+    const rows: unknown[] = [];
+    for (const source of sources) {
+      if (!sourceMayOwnRelation(source, lookupValue.relation.name)) continue;
+      appendRows(rows, source.lookup?.(lookupValue) ?? scanLookupRows(source.rows(lookupValue.relation), lookupValue));
+    }
+    return rows;
+  },
+  rangeLookup: (lookupValue) => {
+    const rows: unknown[] = [];
+    for (const source of sources) {
+      if (!sourceMayOwnRelation(source, lookupValue.relation.name)) continue;
+      appendRows(rows, source.rangeLookup?.(lookupValue) ?? scanRangeRows(source.rows(lookupValue.relation), lookupValue));
+    }
+    return rows;
+  }
 });
+
+function appendRows(target: unknown[], rows: readonly unknown[]): void {
+  for (const rowValue of rows) target.push(rowValue);
+}
+
+function composeSourceRelationNames(sources: readonly RelationSource[]): Pick<RelationSource, 'relationNames'> | Record<string, never> {
+  if (sources.some((source) => source.relationNames === undefined)) return {};
+  const relationNames = new Set<string>();
+  for (const source of sources) {
+    for (const relationName of source.relationNames ?? []) relationNames.add(relationName);
+  }
+  return { relationNames: Array.from(relationNames) };
+}
+
+function sourceMayOwnRelation(source: RelationSource, relationName: string): boolean {
+  return source.relationNames === undefined || source.relationNames.includes(relationName);
+}
 
 function scanLookupRows(rows: readonly unknown[], lookupValue: RelationLookup): readonly unknown[] {
   return rows.filter((rowValue) => isRecord(rowValue)
@@ -1724,6 +1759,8 @@ export function row<Row>(_db: Db, _query: Query<Row>, _options?: RowLookupOption
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _options?: RowLookupOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
 export function row<Row>(dbValue: Db, queryValue: Query<Row> | RelationRef, keyOrPredicateOrOptions?: RelationKeyInput | PredicateData | RowLookupOptions<Row>, options?: RowLookupOptions<Row>): Row | undefined {
   if (isRelationRef(queryValue) && isRelationKeyInput(keyOrPredicateOrOptions)) {
+    const direct = directRelationRowByKey(dbValue, queryValue, keyOrPredicateOrOptions, options as DbQueryOptions<Row> | undefined);
+    if (direct.used) return direct.row as Row | undefined;
     const key = relationKeyInputToKey(queryValue, keyOrPredicateOrOptions);
     return q(dbValue, queryValue, options as DbQueryOptions<Row>)
       .find((rowValue) => isRecord(rowValue) && rowKey(queryValue, rowValue) === key) as Row | undefined;
@@ -1738,6 +1775,34 @@ export function row<Row>(dbValue: Db, queryValue: Query<Row> | RelationRef, keyO
     ? options
     : keyOrPredicateOrOptions;
   return q(dbValue, queryForTarget(queryValue), readOptions as DbQueryOptions<Row>)[0] as Row | undefined;
+}
+
+function directRelationRowByKey(
+  dbValue: Db,
+  relationRef: RelationRef,
+  keyInput: RelationKeyInput,
+  options: DbQueryOptions<any, any> | undefined
+): { readonly used: true; readonly row: unknown } | { readonly used: false } {
+  const fields = relationKeyFields(relationRef);
+  const fieldName = fields.length === 1 ? fields[0] : undefined;
+  if (
+    fieldName === undefined
+    || Array.isArray(keyInput)
+    || !canCompareRelationKeyAtom(keyInput)
+    || hasDbQueryRowTransforms(options ?? {})
+  ) {
+    return { used: false };
+  }
+
+  const source = querySourceFor(dbValue, { materializedBaseRelationLookup: !hasEvaluateContextOverrides(options ?? {}) });
+  const lookupKey = relationSourceLookupValueForKey(relationRef.fields[fieldName], keyInput);
+  if (lookupKey === undefined) return { used: false };
+  const lookupValue = { relation: relationRef, field: fieldName, value: lookupKey };
+  const rows = source.lookup?.(lookupValue) ?? scanLookupRows(source.rows(relationRef), lookupValue);
+  return {
+    used: true,
+    row: rows.find((rowValue) => isRecord(rowValue) && relationKeyInputMatchesRow(relationRef, keyInput, rowValue))
+  };
 }
 export function exists<Relation extends RelationRef>(_db: Db, _relation: Relation, _key: RelationKeyValue<Relation>, _options?: RowLookupOptions<RelationRow<Relation>>): boolean;
 export function exists<Row>(_db: Db, _query: Query<Row>, _predicate: PredicateData, _options?: RowPredicateOptions<Row>): boolean;
@@ -1874,7 +1939,10 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     }
   }
 
-  const maintained = maintainMaterializations(inputDb, workingDb, { deltas, envDeltas });
+  const maintained = maintainMaterializations(inputDb, workingDb, {
+    deltas: materializationMaintenanceDeltas(deltas),
+    envDeltas
+  });
   const materializations = maintained.materializations;
   diagnostics.push(...materializations.diagnostics);
   const committedDb = maintained.db as DbValue;
@@ -2630,12 +2698,13 @@ export function maintainMaterializationSnapshots<Row = unknown>(
   for (const metadata of beforeState.metadata) {
     const previousRows = beforeState.rows.get(metadata.id) as readonly Row[] | undefined;
     const previousAux = beforeState.aux.get(metadata.id);
-    const dependencies = relationDependencies(metadata.query);
+    const analysis = materializationQueryAnalysis(metadata.query);
+    const dependencies = analysis.dependencies;
     const touched = dependencies.filter((name) => touchedDependencies.has(name));
-    const envDependencies = queryEnvDependencies(metadata.query);
+    const envDependencies = analysis.envDependencies;
     const touchedEnv = envDependencies.filter((name) => touchedEnvDependencies.has(name));
     const envHintsCoverDependencies = hasEnvChangeHints || envDependencies.length === 0;
-    const indexSpecs = materializationIndexSpecs(metadata.query);
+    const indexSpecs = analysis.indexSpecs;
     if (previousRows !== undefined && hasRelationChangeHints && envHintsCoverDependencies && touched.length === 0 && touchedEnv.length === 0) {
       pushChange({
         update: 'carried',
@@ -2742,6 +2811,120 @@ export function maintainMaterializations<DbValue extends Db, Row = unknown>(
   };
 }
 
+type MaterializationDeltaCoalesceEntry = {
+  before: unknown;
+  after: unknown;
+  hasBefore: boolean;
+  hasAfter: boolean;
+};
+
+function materializationMaintenanceDeltas(deltas: readonly RelationDelta[]): readonly RelationDelta[] {
+  if (deltas.length <= 1) return deltas;
+
+  const groups = new Map<string, { relation: RelationRef; deltas: RelationDelta[] }>();
+  let hasRepeatedRelation = false;
+  for (const delta of deltas) {
+    const group = groups.get(delta.relation.name);
+    if (group === undefined) groups.set(delta.relation.name, { relation: delta.relation, deltas: [delta] });
+    else {
+      hasRepeatedRelation = true;
+      group.deltas.push(delta);
+    }
+  }
+
+  if (!hasRepeatedRelation) return deltas;
+
+  const coalesced: RelationDelta[] = [];
+  for (const group of groups.values()) {
+    if (group.deltas.length === 1) {
+      const delta = group.deltas[0];
+      if (delta !== undefined) coalesced.push(delta);
+      continue;
+    }
+
+    const relationDelta = coalesceMaterializationRelationDeltas(group.relation, group.deltas);
+    if (relationDelta === undefined) {
+      coalesced.push(...group.deltas);
+    } else if (relationDelta !== null) {
+      coalesced.push(relationDelta);
+    }
+  }
+
+  return coalesced;
+}
+
+function coalesceMaterializationRelationDeltas(
+  relation: RelationRef,
+  deltas: readonly RelationDelta[]
+): RelationDelta | null | undefined {
+  const rowsByKey = new Map<string, MaterializationDeltaCoalesceEntry>();
+
+  for (const delta of deltas) {
+    const removedInDelta = new Set<string>();
+    for (const rowValue of delta.removed) {
+      const key = materializationDeltaRowKey(relation, rowValue);
+      if (key === undefined) return undefined;
+      removedInDelta.add(key);
+      const entry = rowsByKey.get(key);
+      if (entry === undefined) {
+        rowsByKey.set(key, { before: rowValue, after: undefined, hasBefore: true, hasAfter: false });
+        continue;
+      }
+      if (entry.hasAfter) {
+        if (!rowsEqualForDiff(entry.after, rowValue)) return undefined;
+        entry.after = undefined;
+        entry.hasAfter = false;
+        if (!entry.hasBefore) rowsByKey.delete(key);
+        continue;
+      }
+      return undefined;
+    }
+
+    for (const rowValue of delta.added) {
+      const key = materializationDeltaRowKey(relation, rowValue);
+      if (key === undefined) return undefined;
+      const entry = rowsByKey.get(key);
+      if (entry === undefined) {
+        rowsByKey.set(key, { before: undefined, after: rowValue, hasBefore: false, hasAfter: true });
+        continue;
+      }
+      if (entry.hasAfter) return undefined;
+      if (entry.hasBefore && !removedInDelta.has(key)) return undefined;
+      entry.after = rowValue;
+      entry.hasAfter = true;
+    }
+  }
+
+  const added: unknown[] = [];
+  const removed: unknown[] = [];
+  let hasPureAdded = false;
+  let hasPureRemoved = false;
+  for (const entry of rowsByKey.values()) {
+    if (entry.hasBefore && entry.hasAfter) {
+      if (!rowsEqualForDiff(entry.before, entry.after)) {
+        removed.push(entry.before);
+        added.push(entry.after);
+      }
+    } else if (entry.hasBefore) {
+      hasPureRemoved = true;
+      removed.push(entry.before);
+    } else if (entry.hasAfter) {
+      hasPureAdded = true;
+      added.push(entry.after);
+    }
+  }
+
+  if (hasPureAdded && hasPureRemoved) return undefined;
+
+  return added.length === 0 && removed.length === 0
+    ? null
+    : { relation, added, removed };
+}
+
+function materializationDeltaRowKey(relation: RelationRef, rowValue: unknown): string | undefined {
+  return isRecord(rowValue) ? rowKey(relation, rowValue) : undefined;
+}
+
 type MaterializationRowKeyPath = readonly string[];
 type MaterializationRowIdentity<Row = unknown> = {
   readonly paths: readonly MaterializationRowKeyPath[];
@@ -2764,6 +2947,7 @@ type IncrementalJoinShape = {
   readonly left: IncrementalJoinSide;
   readonly right: IncrementalJoinSide;
 };
+type JoinClausePlan = readonly (readonly [leftField: string, rightField: string])[];
 type IncrementalAggregateMaintenanceStrategy = 'accumulator' | 'affectedGroups';
 type IncrementalAggregateShape = {
   readonly data: QueryData;
@@ -2881,7 +3065,28 @@ type IncrementalJoinContribution<Row = unknown> = {
   readonly row: Row;
   readonly key: string;
 };
+type MaterializationQueryAnalysis = {
+  readonly dependencies: readonly string[];
+  readonly envDependencies: readonly string[];
+  readonly indexSpecs: readonly MaterializationIndexSpec[];
+};
 const SOURCE_ORDER_PLACEMENT_MIN_ROWS = 64;
+const PREVIOUS_ROW_LOOKUP_INDEX_MIN_LOOKUPS = 8;
+const MATERIALIZATION_QUERY_ANALYSIS_CACHE = new WeakMap<Query, MaterializationQueryAnalysis>();
+const INCREMENTAL_MATERIALIZATION_SUPPORT_CACHE = new WeakMap<Query, IncrementalMaterializationSupport>();
+
+function materializationQueryAnalysis(query: Query): MaterializationQueryAnalysis {
+  const cached = MATERIALIZATION_QUERY_ANALYSIS_CACHE.get(query);
+  if (cached !== undefined) return cached;
+
+  const analysis = {
+    dependencies: relationDependencies(query),
+    envDependencies: queryEnvDependencies(query),
+    indexSpecs: materializationIndexSpecs(query)
+  };
+  MATERIALIZATION_QUERY_ANALYSIS_CACHE.set(query, analysis);
+  return analysis;
+}
 
 function maintainMaterializationIncrementally<Row>(
   before: unknown,
@@ -3371,7 +3576,7 @@ function aggregateAccumulatorMaterializedRows<Row>(
   aggregateShape: IncrementalAggregateShape,
   accumulator: IncrementalAggregateAccumulator
 ): { readonly removed: readonly Row[]; readonly added: readonly Row[] } | undefined {
-  const previousLookup = previousRowLookup(previousRows, identity);
+  const previousLookup = previousRowLookup(previousRows, identity, contributions.size);
   const groupFields = projectionFieldNames(aggregateShape.data.groupBy);
   const removed: Row[] = [];
   const added: Row[] = [];
@@ -4130,6 +4335,15 @@ function materializationRangeContainsValue(valueValue: unknown, lookupValue: Mat
 }
 
 function incrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalMaterializationSupport<Row> {
+  const cached = INCREMENTAL_MATERIALIZATION_SUPPORT_CACHE.get(query) as IncrementalMaterializationSupport<Row> | undefined;
+  if (cached !== undefined) return cached;
+
+  const support = computeIncrementalMaterializationSupport(query);
+  INCREMENTAL_MATERIALIZATION_SUPPORT_CACHE.set(query, support as IncrementalMaterializationSupport);
+  return support;
+}
+
+function computeIncrementalMaterializationSupport<Row>(query: Query<Row>): IncrementalMaterializationSupport<Row> {
   const topN = incrementalTopNMaterializationPlan(query.data, query.relations);
   if (topN.kind === 'unsupported') return { supported: false, reason: topN.reason, diagnostics: topN.diagnostics };
   if (topN.kind === 'supported') return incrementalTopNMaterializationSupport(query, topN.plan);
@@ -4616,7 +4830,7 @@ function applyIncrementalMaterializedRows<Row>(
     return { key, row: rowValue };
   });
 
-  const previousLookup = previousRowLookup(previousRows, identity);
+  const previousLookup = previousRowLookup(previousRows, identity, removedKeyedRows.length + addedKeyedRows.length);
   for (const key of previousLookup.duplicateKeys) duplicateKeys.add(key);
 
   if (duplicateKeys.size > 0) {
@@ -4767,7 +4981,8 @@ function applyIncrementalMaterializedRows<Row>(
 
 function previousRowLookup<Row>(
   rows: readonly Row[],
-  identity: MaterializationRowIdentity<Row>
+  identity: MaterializationRowIdentity<Row>,
+  expectedLookupCount = 0
 ): {
   readonly duplicateKeys: ReadonlySet<string>;
   readonly get: (key: string) => { readonly row: Row; readonly index: number } | undefined;
@@ -4781,6 +4996,15 @@ function previousRowLookup<Row>(
       map.set(key, { row: rowValue, index: indexValue });
     });
     return { duplicateKeys, get: (key) => map.get(key) };
+  }
+
+  if (expectedLookupCount >= PREVIOUS_ROW_LOOKUP_INDEX_MIN_LOOKUPS && rows.length >= SOURCE_ORDER_PLACEMENT_MIN_ROWS) {
+    const map = new Map<string, { readonly row: Row; readonly index: number }>();
+    rows.forEach((rowValue, indexValue) => {
+      const key = identity.keyOf(rowValue);
+      if (!map.has(key)) map.set(key, { row: rowValue, index: indexValue });
+    });
+    return { duplicateKeys: new Set<string>(), get: (key) => map.get(key) };
   }
 
   const cache = new Map<string, { readonly row: Row; readonly index: number } | undefined>();
@@ -7011,6 +7235,9 @@ function evaluateJoin(
   const leftRows = evaluateQueryData(source, leftData, relations, options, outer, diagnostics);
   const rightRows = evaluateQueryData(source, rightData, relations, options, outer, diagnostics);
   const rightAlias = typeof data.rightAlias === 'string' ? data.rightAlias : undefined;
+  const hashed = evaluateHashJoinRows(data, leftRows, rightRows, rightAlias);
+  if (hashed !== undefined) return hashed;
+
   const rows: EvalEntry[] = [];
 
   for (const leftEntry of leftRows) {
@@ -7027,6 +7254,79 @@ function evaluateJoin(
   }
 
   return rows;
+}
+
+function evaluateHashJoinRows(
+  data: QueryData,
+  leftRows: readonly EvalEntry[],
+  rightRows: readonly EvalEntry[],
+  rightAlias: string | undefined
+): readonly EvalEntry[] | undefined {
+  if (isPredicateData(data.on)) return undefined;
+  const clause = equiJoinClauseMapFrom(data.on);
+  if (clause === undefined) return undefined;
+  const plan = Object.entries(clause);
+
+  const rightBuckets = new Map<string, EvalEntry[]>();
+  for (const rightEntry of rightRows) {
+    const key = joinClauseRightKey(plan, rightEntry);
+    if (key === undefined) return undefined;
+    const bucket = rightBuckets.get(key);
+    if (bucket === undefined) rightBuckets.set(key, [rightEntry]);
+    else bucket.push(rightEntry);
+  }
+
+  const rows: EvalEntry[] = [];
+  for (const leftEntry of leftRows) {
+    const key = joinClauseLeftKey(plan, leftEntry);
+    if (key === undefined) return undefined;
+    const matches = rightBuckets.get(key);
+    if (matches === undefined) {
+      if (data.kind === 'left') rows.push(leftEntry);
+      continue;
+    }
+    let matched = false;
+    for (const rightEntry of matches) {
+      if (!joinClauseRowsMatch(plan, leftEntry, rightEntry)) continue;
+      matched = true;
+      rows.push(combineEntries(leftEntry, rightEntry, rightAlias));
+    }
+    if (!matched && data.kind === 'left') rows.push(leftEntry);
+  }
+
+  return rows;
+}
+
+function joinClauseRowsMatch(plan: JoinClausePlan, left: EvalEntry, right: EvalEntry): boolean {
+  const leftRow = left.row;
+  const rightRow = right.row;
+  if (!isRecord(leftRow) || !isRecord(rightRow)) return false;
+  return plan.every(([leftField, rightField]) => Object.is(leftRow[leftField], rightRow[rightField]));
+}
+
+function joinClauseLeftKey(plan: JoinClausePlan, entry: EvalEntry): string | undefined {
+  const rowValue = entry.row;
+  if (!isRecord(rowValue)) return undefined;
+  return stableJoinClauseKey(plan.map(([fieldName]) => rowValue[fieldName]));
+}
+
+function joinClauseRightKey(plan: JoinClausePlan, entry: EvalEntry): string | undefined {
+  const rowValue = entry.row;
+  if (!isRecord(rowValue)) return undefined;
+  return stableJoinClauseKey(plan.map(([, fieldName]) => rowValue[fieldName]));
+}
+
+function stableJoinClauseKey(values: readonly unknown[]): string | undefined {
+  return values.every(canHashJoinClauseValue) ? stableKey(values) : undefined;
+}
+
+function canHashJoinClauseValue(valueValue: unknown): boolean {
+  return valueValue === null
+    || valueValue === undefined
+    || typeof valueValue === 'string'
+    || typeof valueValue === 'number'
+    || typeof valueValue === 'boolean'
+    || typeof valueValue === 'bigint';
 }
 
 function evaluateAggregate(
@@ -7829,7 +8129,14 @@ function isRelationKeyInput(input: unknown): input is RelationKeyInput {
 }
 
 function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput): string {
-  return stableKey(Array.isArray(relationRef.key) ? input : [input]);
+  const fields = relationKeyFields(relationRef);
+  const values = Array.isArray(input) ? input : [input];
+  const keyValues = values.map((valueValue, indexValue) => {
+    const fieldName = fields[indexValue];
+    const spec = fieldName === undefined ? undefined : relationRef.fields[fieldName];
+    return spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
+  });
+  return stableKey(keyValues);
 }
 
 function relationKeyInputMatchesRow(
@@ -7840,7 +8147,7 @@ function relationKeyInputMatchesRow(
   const fields = relationKeyFields(relationRef);
   const fieldName = fields.length === 1 ? fields[0] : undefined;
   if (fieldName !== undefined && !Array.isArray(input) && canCompareRelationKeyAtom(input)) {
-    return relationKeyFieldValueMatches(rowValue, fieldName, input);
+    return relationKeyFieldValueMatches(relationRef, rowValue, fieldName, input);
   }
   return rowKey(relationRef, rowValue) === relationKeyInputToKey(relationRef, input);
 }
@@ -7856,15 +8163,30 @@ function relationRowKeyMatchesRow(
     const valueValue = right[fieldName];
     if (valueValue === undefined) return false;
     if (canCompareRelationKeyAtom(valueValue)) {
-      return relationKeyFieldValueMatches(left, fieldName, valueValue);
+      return relationKeyFieldValueMatches(relationRef, left, fieldName, valueValue);
     }
   }
   const key = rowKey(relationRef, right);
   return key !== undefined && rowKey(relationRef, left) === key;
 }
 
-function relationKeyFieldValueMatches(rowValue: Record<string, unknown>, fieldName: string, valueValue: unknown): boolean {
-  return rowValue[fieldName] !== undefined && Object.is(rowValue[fieldName], valueValue);
+function relationKeyFieldValueMatches(
+  relationRef: RelationRef,
+  rowValue: Record<string, unknown>,
+  fieldName: string,
+  valueValue: unknown
+): boolean {
+  const fieldValue = rowValue[fieldName];
+  if (fieldValue === undefined) return false;
+  const spec = relationRef.fields[fieldName];
+  const left = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
+  const right = spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
+  return left !== undefined && right !== undefined && Object.is(left, right);
+}
+
+function relationSourceLookupValueForKey(spec: FieldSpec | undefined, keyInput: unknown): unknown {
+  if (spec?.valueKind !== 'custom' || spec.custom?.toScalar === undefined) return keyInput;
+  return fieldKeyValue(spec, keyInput);
 }
 
 function canCompareRelationKeyAtom(input: unknown): boolean {

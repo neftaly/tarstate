@@ -532,6 +532,25 @@ describe('public API contracts', () => {
 
     expect(rows).toEqual([{ id: 'note-1', body: 'hello' }]);
 
+    const normalizedKeySchema = defineSchema({
+      tags: relation<{ readonly id: string; readonly label: string }>({
+        key: 'id',
+        fields: {
+          id: customField<string>({
+            kind: 'caseInsensitiveKey',
+            validate: (value): value is string => typeof value === 'string',
+            toScalar: (value) => typeof value === 'string' ? value.toLowerCase() : null
+          }),
+          label: stringField()
+        }
+      })
+    });
+    const normalizedKeyDb = createDb({
+      tags: [{ id: 'Hello', label: 'Greeting' }]
+    });
+    expect(row(normalizedKeyDb, normalizedKeySchema.tags, 'hello')).toEqual({ id: 'Hello', label: 'Greeting' });
+    expect(row(normalizedKeyDb, normalizedKeySchema.tags, 'HELLO')).toEqual({ id: 'Hello', label: 'Greeting' });
+
     const unsafeKeySchema = defineSchema({
       notes: relation<{ readonly id: RichText }>({
         key: 'id',

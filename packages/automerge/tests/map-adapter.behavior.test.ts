@@ -32,6 +32,7 @@ import { evaluate, validateRelationRow } from '@tarstate/core/evaluate';
 import {
   anchoredPathField,
   booleanField,
+  customField,
   defineSchema,
   idField,
   jsonField,
@@ -1683,6 +1684,68 @@ describe('automerge map adapter', () => {
       (draft.workspace.tasks as TaskRow[]).splice(1, 1);
     }));
     expect(adapter.pathForObjectId(taskObjectId)).toBeNull();
+  });
+
+  it('resolves map object IDs by composite custom storage key and checks the row key', () => {
+    type OwnerKey = {
+      readonly kind: string;
+      readonly id: string;
+    };
+    type RoutedRow = {
+      readonly owner: OwnerKey;
+      readonly localId: string;
+      readonly title: string;
+    };
+    interface CompositeStorageDoc {
+      readonly itemsByKey: Readonly<Record<string, RoutedRow>>;
+    }
+
+    const isOwnerKey = (value: unknown): value is OwnerKey =>
+      typeof value === 'object'
+      && value !== null
+      && typeof (value as Partial<OwnerKey>).kind === 'string'
+      && typeof (value as Partial<OwnerKey>).id === 'string';
+    const ownerKey = (value: unknown) =>
+      isOwnerKey(value) ? `${value.kind}:${value.id}` : String(value);
+    const ownerAlpha = { kind: 'team', id: 'alpha' };
+    const ownerBeta = { kind: 'team', id: 'beta' };
+    const storageKey = JSON.stringify(['team:alpha', 'first']);
+    const mismatchedStorageKey = JSON.stringify(['team:alpha', 'second']);
+    const compositeSchema = defineSchema({
+      routedItems: relation<RoutedRow>({
+        key: ['owner', 'localId'],
+        fields: {
+          owner: customField<OwnerKey>({
+            kind: 'owner-key',
+            stableKey: ownerKey
+          }),
+          localId: stringField(),
+          title: stringField()
+        }
+      })
+    });
+    const compositeRelations = defineAutomergeMapRelations<CompositeStorageDoc>()([
+      { relation: compositeSchema.routedItems, path: ['itemsByKey'] }
+    ]);
+    const doc: Automerge.Doc<CompositeStorageDoc> = Automerge.from({
+      itemsByKey: {
+        stale: { owner: ownerAlpha, localId: 'first', title: 'Duplicate under stale key' },
+        [storageKey]: { owner: ownerAlpha, localId: 'first', title: 'Stored row' },
+        [mismatchedStorageKey]: { owner: ownerBeta, localId: 'second', title: 'Mismatched row' }
+      }
+    });
+    const adapter = automergeMapAdapter({ doc, relations: compositeRelations });
+    const staleObjectId = automergeObjectIdAt(doc, ['itemsByKey', 'stale']);
+    const storedObjectId = automergeObjectIdAt(doc, ['itemsByKey', storageKey]);
+    const mismatchedObjectId = automergeObjectIdAt(doc, ['itemsByKey', mismatchedStorageKey]);
+
+    if (staleObjectId === null || storedObjectId === null || mismatchedObjectId === null) {
+      throw new Error('expected mapped Automerge object IDs');
+    }
+
+    expect(staleObjectId).not.toBe(storedObjectId);
+    expect(adapter.objectIdFor(compositeSchema.routedItems, [ownerAlpha, 'first'])).toBe(storedObjectId);
+    expect(adapter.objectIdFor(compositeSchema.routedItems, [ownerAlpha, 'second'])).toBeNull();
   });
 
   it('wraps stable Automerge view, fork, changeAt, and merge flows', () => {

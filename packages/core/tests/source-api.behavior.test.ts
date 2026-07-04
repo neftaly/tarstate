@@ -53,4 +53,16 @@ describe('source API behavior', () => {
     })).toEqual([]);
     expect(rowsRead).toBe(0);
   });
+
+  it('keeps unconstrained composed sources visible when nested', () => {
+    const row = { id: 'fallback', accountId: 'cash' };
+    const unconstrained = composeSources({
+      rows: () => [row]
+    });
+    const source = composeSources(fromObjectSource({ accounts: [] }), unconstrained);
+
+    expect(unconstrained.relationNames).toBeUndefined();
+    expect(source.relationNames).toBeUndefined();
+    expect(source.rows(schema.entries)).toEqual([row]);
+  });
 });

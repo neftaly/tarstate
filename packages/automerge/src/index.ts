@@ -1530,13 +1530,8 @@ function objectIdForMapKey(
   keyValue: unknown,
   normalizedKey: string
 ): Automerge.ObjID | undefined {
-  const fields = relationKeyFields(relation);
-  if (fields.length !== 1) return undefined;
-
-  const key = fieldKeyValue(relation.fields[fields[0] as string], keyValue);
-  if (typeof key !== 'string' && typeof key !== 'number' && typeof key !== 'boolean') return undefined;
-
-  const property = String(key);
+  const property = storageKeyForKeyValue(relation, keyValue);
+  if (property === undefined) return undefined;
   if (!Object.prototype.hasOwnProperty.call(values, property)) return undefined;
 
   const value = values[property];
@@ -2952,6 +2947,24 @@ function keyValueFor(relation: RelationRef, keyValue: unknown): string | undefin
     && values.every((value) => value !== undefined)
     ? stableStringify(values)
     : undefined;
+}
+
+function storageKeyForKeyValue(relation: RelationRef, keyValue: unknown): string | undefined {
+  const fields = relationKeyFields(relation);
+  const inputValues = fields.length === 1 && (!Array.isArray(keyValue) || keyValue.length !== 1)
+    ? [keyValue]
+    : Array.isArray(keyValue)
+      ? keyValue
+      : undefined;
+  const values = inputValues?.map((value, index) => fieldKeyValue(relation.fields[fields[index] as string], value));
+  if (values === undefined || values.length !== fields.length || values.some((value) => value === undefined)) return undefined;
+
+  if (fields.length === 1) {
+    const value = values[0];
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  }
+
+  return stableStringify(values);
 }
 
 function storageKeyForRow(relation: RelationRef, row: Row): string {

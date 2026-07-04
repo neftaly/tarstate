@@ -1,12 +1,13 @@
 import { bench, describe } from 'vitest';
 import { evaluate } from '@tarstate/core/evaluate';
-import { eq, from, gte, pipe, project, value, where, type Query } from '@tarstate/core/query';
-import { type RelationSource } from '@tarstate/core/source';
-import { entry, schema, type Entry } from '../tests/behavior-fixtures.js';
+import { clauses, eq, from, gte, join, pipe, project, value, where, type Query } from '@tarstate/core/query';
+import { composeSources, type RelationSource } from '@tarstate/core/source';
+import { account, entry, schema, type Account, type Entry } from '../tests/behavior-fixtures.js';
 
 const ROW_COUNT = 8_000;
 const ACCOUNT_GROUP_COUNT = 128;
 const QUERY_VARIANT_COUNT = 16;
+const COMPOSE_UNRELATED_SOURCE_COUNT = 64;
 const BENCH_OPTIONS = {
   time: 200,
   iterations: 10,
@@ -15,9 +16,12 @@ const BENCH_OPTIONS = {
 };
 
 const accountIds = Array.from({ length: ACCOUNT_GROUP_COUNT }, (_, index) => `account-${index}`);
+const accounts = makeAccounts(ACCOUNT_GROUP_COUNT);
 const rows = makeEntries(ROW_COUNT);
 const indexed = indexedSource(rows);
 const scanFallback = scanFallbackSource(rows);
+const routedComposed = composedLookupSource(rows, true);
+const unconstrainedComposed = composedLookupSource(rows, false);
 const equalityQueries = accountIds.slice(0, QUERY_VARIANT_COUNT).map((accountId) =>
   pipe(
     from(entry),
@@ -32,6 +36,20 @@ const rangeQueries = Array.from({ length: QUERY_VARIANT_COUNT }, (_, index) => 4
     project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
   )
 ) satisfies readonly Query<unknown>[];
+const joinQueries = [
+  pipe(
+    from(entry),
+    join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
+    project({ id: entry.id, accountId: entry.accountId, accountName: account.$.name, amount: entry.amount })
+  )
+] satisfies readonly Query<unknown>[];
+const predicateJoinQueries = [
+  pipe(
+    from(entry),
+    join(from(account), eq(entry.accountId, account.id)),
+    project({ id: entry.id, accountId: entry.accountId, accountName: account.$.name, amount: entry.amount })
+  )
+] satisfies readonly Query<unknown>[];
 
 let rowSink = 0;
 
@@ -45,11 +63,27 @@ describe('core query evaluation where pushdown', () => {
     bench('RelationSource.rangeLookup pushdown', evaluateQueries(indexed, rangeQueries), BENCH_OPTIONS);
     bench('rows scan fallback', evaluateQueries(scanFallback, rangeQueries), BENCH_OPTIONS);
   });
+
+  describe('join fanout', () => {
+    bench('clause-map hash join', evaluateQueries(scanFallback, joinQueries), BENCH_OPTIONS);
+    bench('predicate nested join', evaluateQueries(scanFallback, predicateJoinQueries), BENCH_OPTIONS);
+  });
+
+  describe('composeSources relation filtering', () => {
+    bench('relationNames-routed composed lookup', evaluateQueries(routedComposed, equalityQueries), BENCH_OPTIONS);
+    bench('unconstrained composed lookup', evaluateQueries(unconstrainedComposed, equalityQueries), BENCH_OPTIONS);
+  });
 });
 
 function scanFallbackSource(entryRows: readonly Entry[]): RelationSource {
   return {
-    rows: (relation) => relation.name === schema.entries.name ? entryRows : []
+    relationNames: [schema.entries.name, schema.accounts.name],
+    rows: (relation) =>
+      relation.name === schema.entries.name
+        ? entryRows
+        : relation.name === schema.accounts.name
+          ? accounts
+          : []
   };
 }
 
@@ -66,7 +100,13 @@ function indexedSource(entryRows: readonly Entry[]): RelationSource {
   const amountRows = [...entryRows].sort((left, right) => left.amount - right.amount || left.id.localeCompare(right.id));
 
   return {
-    rows: (relation) => relation.name === schema.entries.name ? entryRows : [],
+    relationNames: [schema.entries.name, schema.accounts.name],
+    rows: (relation) =>
+      relation.name === schema.entries.name
+        ? entryRows
+        : relation.name === schema.accounts.name
+          ? accounts
+          : [],
     lookup: (lookupValue) => {
       if (lookupValue.relation.name !== schema.entries.name || lookupValue.field !== 'accountId') return undefined;
       return typeof lookupValue.value === 'string'
@@ -94,6 +134,19 @@ function indexedSource(entryRows: readonly Entry[]): RelationSource {
       return amountRows.slice(start, end);
     }
   };
+}
+
+function composedLookupSource(entryRows: readonly Entry[], routed: boolean): RelationSource {
+  const unmatchedRows = entryRows.slice(0, ACCOUNT_GROUP_COUNT).map((rowValue, index) => ({
+    ...rowValue,
+    id: `compose-unused-${index}`,
+    accountId: `compose-unused-${index}`
+  }));
+  const unrelatedSources = Array.from({ length: COMPOSE_UNRELATED_SOURCE_COUNT }, (_, index): RelationSource => ({
+    ...(routed ? { relationNames: [`compose-unused-${index}`] } : {}),
+    rows: (relation) => relation.name === schema.entries.name && !routed ? unmatchedRows : []
+  }));
+  return composeSources(indexedSource(entryRows), ...unrelatedSources);
 }
 
 function evaluateQueries(source: RelationSource, queries: readonly Query<unknown>[]): () => void {
@@ -142,6 +195,14 @@ function upperBoundByAmount(sortedRows: readonly Entry[], valueValue: number, in
     }
   }
   return low;
+}
+
+function makeAccounts(count: number): Account[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: accountIds[index] ?? `account-${index}`,
+    name: `Account ${index}`,
+    kind: 'asset'
+  }));
 }
 
 function makeEntries(count: number): Entry[] {

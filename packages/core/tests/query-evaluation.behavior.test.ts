@@ -344,6 +344,29 @@ describe('query evaluation behavior', () => {
     ]);
   });
 
+  it('keeps clause joins identity-sensitive for cyclic object values', () => {
+    const shared: { key: string; self?: unknown } = { key: 'shared' };
+    shared.self = shared;
+    const left = constRows([
+      { leftId: 'same-shape', tag: { key: 'shape' } },
+      { leftId: 'same-ref', tag: shared }
+    ]);
+    const right = constRows([
+      { rightId: 'same-shape', tag: { key: 'shape' } },
+      { rightId: 'same-ref', tag: shared }
+    ]);
+    const query = pipe(
+      left,
+      join(right, clauses<{ readonly tag: unknown }, { readonly tag: unknown }>({ tag: 'tag' })),
+      project({
+        leftId: field<string>('row', 'leftId'),
+        rightId: field<string>('row', 'rightId')
+      })
+    );
+
+    expect(q(createDb(), query)).toEqual([{ leftId: 'same-ref', rightId: 'same-ref' }]);
+  });
+
   it('evaluates correlated selections and single-row selections', () => {
     const entriesForAccount = pipe(from(entry), sort(asc(entry.id)));
     const rows = q(

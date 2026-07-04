@@ -1,5 +1,5 @@
 import { bench, describe } from 'vitest';
-import { createDb, q, transact, type Db } from '@tarstate/core/db';
+import { createDb, q, row, transact, type Db } from '@tarstate/core/db';
 import { explainMaterialization, mat, materializationForQuery, materializedSourceFor } from '@tarstate/core/materialization';
 import {
   aggregate,
@@ -20,6 +20,7 @@ import {
   sort,
   sortLimit,
   sum,
+  uniqueIndex,
   value,
   where,
   type Query
@@ -129,6 +130,8 @@ const hashIndexedEntries = pipe(
   hash(field<string>('row', 'accountId'))
 );
 
+const entriesByIdUniqueIndex = pipe(from(entry), uniqueIndex(entry.id));
+
 const btreeIndexedEntries = pipe(
   from(entry),
   sort(asc(entry.id)),
@@ -139,6 +142,7 @@ const btreeIndexedEntries = pipe(
 const patches = makePatches(ROW_COUNT);
 const largePatches = makePatches(LARGE_ROW_COUNT);
 const mixedBatches = makeMixedBatches(ROW_COUNT);
+const multiUpdateBatches = makeMultiUpdateBatches(ROW_COUNT);
 
 const scenarios: readonly BenchmarkScenario[] = [
   { label: 'filter/project', queries: [filterProject as Query<unknown>] },
@@ -161,6 +165,11 @@ const scenarios: readonly BenchmarkScenario[] = [
     label: 'filter/project mixed transaction batch',
     queries: [filterProject as Query<unknown>],
     mutations: mixedBatches
+  },
+  {
+    label: 'filter/project same-relation update batch',
+    queries: [filterProject as Query<unknown>],
+    mutations: multiUpdateBatches
   },
   {
     label: 'large grouped aggregate count/sum',
@@ -192,6 +201,8 @@ describe('core materialization maintenance', () => {
 describe('core materialized source indexes', () => {
   bench('hash lookup by accountId', indexedHashLookup(), BENCH_OPTIONS);
   bench('scan materialized rows by accountId', scannedHashLookup(), BENCH_OPTIONS);
+  bench('row by id via materialized uniqueIndex', materializedRowLookup(), BENCH_OPTIONS);
+  bench('q(...).find row by id baseline', queryFindRowLookup(), BENCH_OPTIONS);
   bench('btree range lookup by amount', indexedRangeLookup(), BENCH_OPTIONS);
   bench('scan materialized rows by amount range', scannedRangeLookup(), BENCH_OPTIONS);
 });
@@ -241,6 +252,32 @@ function scannedHashLookup(): () => void {
     const valueValue = values[cursor % values.length] ?? 'cash';
     cursor += 1;
     consume(source.rows(relation).filter((row) => isRecord(row) && Object.is(row.accountId, valueValue)));
+  };
+}
+
+function materializedRowLookup(): () => void {
+  const db = mat(makeDb(), entriesByIdUniqueIndex as Query<unknown>);
+  const keys = lookupKeys(ROW_COUNT);
+  let cursor = 0;
+
+  return () => {
+    const key = keys[cursor % keys.length] ?? 'entry-0';
+    cursor += 1;
+    const rowValue = row(db, schema.entries, key);
+    consume(rowValue === undefined ? [] : [rowValue]);
+  };
+}
+
+function queryFindRowLookup(): () => void {
+  const db = makeDb();
+  const keys = lookupKeys(ROW_COUNT);
+  let cursor = 0;
+
+  return () => {
+    const key = keys[cursor % keys.length] ?? 'entry-0';
+    cursor += 1;
+    const rowValue = q(db, schema.entries).find((candidate) => candidate.id === key);
+    consume(rowValue === undefined ? [] : [rowValue]);
   };
 }
 
@@ -371,6 +408,27 @@ function makeMixedBatches(rowCount: number): readonly (readonly WritePatch[])[] 
       })
     ];
   });
+}
+
+function makeMultiUpdateBatches(rowCount: number, batchSize = 16): readonly (readonly WritePatch[])[] {
+  const accountIds = accounts.map((account) => account.id);
+
+  return Array.from({ length: PATCH_COUNT }, (_, batchIndex) =>
+    Array.from({ length: batchSize }, (_, patchIndex) => {
+      const rowIndex = (batchIndex * 97 + patchIndex * 37) % rowCount;
+      const amount = ((batchIndex * 83 + patchIndex * 191) % 20_000) - 10_000;
+      return updateByKey(schema.entries, `entry-${rowIndex}`, {
+        accountId: accountIds[(batchIndex + patchIndex + rowIndex) % accountIds.length] ?? 'cash',
+        amount,
+        memo: patchIndex % 4 === 0 ? null : `multi-${batchIndex % 101}-${patchIndex}`,
+        posted: (batchIndex + patchIndex) % 6 !== 0
+      });
+    })
+  );
+}
+
+function lookupKeys(rowCount: number): readonly string[] {
+  return Array.from({ length: PATCH_COUNT }, (_, index) => `entry-${(index * 97) % rowCount}`);
 }
 
 function accountAt(index: number): Account {
