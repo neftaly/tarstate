@@ -3,7 +3,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
 import {
   TarstateProvider,
-  useQuery,
+  useViewSelector,
   useRow,
   useTarstateSnapshot,
   useView
@@ -51,7 +51,7 @@ const itemQuery = pipe(
 );
 
 describe('@tarstate/react core integration', () => {
-  it('renders view, query, and row hook state from a real createStore provider', async () => {
+  it('renders view, selector, and row hook state from a real createStore provider', async () => {
     const store = createStore({
       items: [
         { id: 'item-a', label: 'Alpha' },
@@ -62,7 +62,7 @@ describe('@tarstate/react core integration', () => {
 
     function Probe() {
       const view = useView(itemQuery);
-      const query = useQuery(itemQuery, {
+      const selector = useViewSelector(itemQuery, {
         select: (rows) => rows.map((row) => row.label).join('|')
       });
       const rowByPredicate = useRow(itemQuery, (row) => row.id === 'item-b');
@@ -71,7 +71,7 @@ describe('@tarstate/react core integration', () => {
       return createElement(
         'output',
         undefined,
-        `${view.revision}:${query.data}:${rowByPredicate.row?.label ?? 'missing'}:${rowByRelation.row?.label ?? 'missing'}:${view.rows.length}`
+        `${view.revision}:${selector.data}:${rowByPredicate.row?.label ?? 'missing'}:${rowByRelation.row?.label ?? 'missing'}:${view.rows.length}`
       );
     }
 
@@ -98,7 +98,7 @@ describe('@tarstate/react core integration', () => {
     }
   });
 
-  it('does not re-render a query subscriber on commits to an unrelated relation', async () => {
+  it('does not re-render a view selector subscriber on commits to an unrelated relation', async () => {
     const store = createStore({
       items: [{ id: 'item-a', label: 'Alpha' }],
       tags: [{ id: 'tag-a', label: 'Tag A' }]
@@ -108,11 +108,11 @@ describe('@tarstate/react core integration', () => {
 
     function Probe() {
       renders += 1;
-      const query = useQuery(itemQuery, {
+      const selector = useViewSelector(itemQuery, {
         select: (rows) => rows.map((row) => row.label).join('|')
       });
 
-      return createElement('output', undefined, `${renders}:${query.data}`);
+      return createElement('output', undefined, `${renders}:${selector.data}`);
     }
 
     try {
@@ -158,12 +158,12 @@ describe('@tarstate/react core integration', () => {
 
     function Probe() {
       renders += 1;
-      const query = useQuery(visibleQuery, {
+      const selector = useViewSelector(visibleQuery, {
         select: (rows) => rows.map((row) => row.label)
       });
-      selectedRefs.push(query.data);
+      selectedRefs.push(selector.data);
 
-      return createElement('output', undefined, `${renders}:${query.data.join('|')}`);
+      return createElement('output', undefined, `${renders}:${selector.data.join('|')}`);
     }
 
     try {
@@ -189,7 +189,7 @@ describe('@tarstate/react core integration', () => {
     }
   });
 
-  it('keeps selected query data stable across unrelated store commits', async () => {
+  it('keeps selected view data stable across unrelated store commits', async () => {
     const store = createStore({
       items: [{ id: 'item-a', label: 'Alpha' }],
       tags: [{ id: 'tag-a', label: 'Tag A' }]
@@ -200,16 +200,16 @@ describe('@tarstate/react core integration', () => {
     let renderer: ReactTestRenderer | undefined;
 
     function Probe() {
-      const query = useQuery(itemQuery, {
+      const selector = useViewSelector(itemQuery, {
         select: (rows) => {
           selectCalls += 1;
           return rows.map((row) => row.label);
         }
       });
-      selectedData = query.data;
-      selectedRefs.push(query.data);
+      selectedData = selector.data;
+      selectedRefs.push(selector.data);
 
-      return createElement('output', undefined, query.data.join('|'));
+      return createElement('output', undefined, selector.data.join('|'));
     }
 
     try {
@@ -251,12 +251,12 @@ describe('@tarstate/react core integration', () => {
 
     function Probe() {
       renders += 1;
-      const query = useQuery(itemQuery, {
-        select: (rows) => rows.length,
+      const selector = useViewSelector(itemQuery, {
+        select: (rows: readonly ItemRow[]) => rows.length,
         equality: Object.is
       });
 
-      return createElement('output', undefined, `${renders}:${query.data}`);
+      return createElement('output', undefined, `${renders}:${selector.data}`);
     }
 
     try {
@@ -339,7 +339,7 @@ describe('@tarstate/react core integration', () => {
         })
       );
       const view = useView(query);
-      const queryState = useQuery(query, {
+      const selectorState = useViewSelector(query, {
         select: (rows) => rows.map((row) => row.label).join('|')
       });
       const rowState = useRow(query, (row) => row.id === 'item-b');
@@ -347,7 +347,7 @@ describe('@tarstate/react core integration', () => {
       return createElement(
         'output',
         undefined,
-        `${view.rows.map((row) => row.label).join('|')}:${queryState.data}:${rowState.row?.label ?? 'missing'}`
+        `${view.rows.map((row) => row.label).join('|')}:${selectorState.data}:${rowState.row?.label ?? 'missing'}`
       );
     }
 
@@ -382,14 +382,14 @@ describe('@tarstate/react core integration', () => {
 
     function Probe() {
       const snapshot = useTarstateSnapshot();
-      const query = useQuery(itemQuery, {
+      const selector = useViewSelector(itemQuery, {
         select: (rows) => rows.map((row) => row.label).join('|')
       });
 
       return createElement(
         'output',
         undefined,
-        `${snapshot.revision}/${query.revision}:${formatVersion(snapshot.version)}:${query.data}`
+        `${snapshot.revision}/${selector.revision}:${formatVersion(snapshot.version)}:${selector.data}`
       );
     }
 

@@ -12,11 +12,11 @@ import {
 import {
   TarstateProvider,
   useCommit,
-  useQuery,
   useRow,
   useTarstateSnapshot,
   useTarstateStore,
-  useView
+  useView,
+  useViewSelector
 } from '@tarstate/react';
 import { validateConstraints, type RelationRef, type TarstateDiagnostic } from '@tarstate/core';
 import { row, type Db, type DbTransactionContext } from '@tarstate/core/db';
@@ -307,7 +307,7 @@ function ListingsSection({
   const query = useMemo(() => listingWalkthroughQuery(filters), [filters]);
   const queryResetKey = useQueryResetKey(query);
   const view = useView(query, { resetKey: queryResetKey });
-  const totals = useQuery(query, {
+  const totals = useViewSelector(query, {
     resetKey: queryResetKey,
     select: selectListingTotals
   });
@@ -618,7 +618,7 @@ function JoinsSection() {
 function MarketSection() {
   const market = useView(neighborhoodMarketSummaryQuery);
   const pipeline = useView(pipelineByListingQuery);
-  const rollup = useQuery(neighborhoodMarketSummaryQuery, {
+  const rollup = useViewSelector(neighborhoodMarketSummaryQuery, {
     select: selectMarketRollup
   });
 

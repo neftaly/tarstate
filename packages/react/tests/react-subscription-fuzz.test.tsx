@@ -1,7 +1,7 @@
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
-import { TarstateProvider, shallow, useTarstateSubscription } from '@tarstate/react';
+import { TarstateProvider, shallow, useViewSubscription } from '@tarstate/react';
 import { asc, as, from, pipe, project, sort } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { createStore, type StoreViewSnapshot } from '@tarstate/core/store';
@@ -98,7 +98,7 @@ async function runSubscriptionFuzz(seed: number): Promise<void> {
 
   function Probe({ resetKey }: { readonly resetKey: number }) {
     renders += 1;
-    useTarstateSubscription(itemQuery, {
+    useViewSubscription(itemQuery, {
       resetKey,
       fireImmediately: true,
       select: (snapshot: StoreViewSnapshot<ItemProjection>) => snapshot.rows.map((row) => row.label.length),

@@ -7,14 +7,14 @@ import {
   shallow,
   useCommit,
   useDb,
-  useQuery,
+  useViewSelector,
   useRow,
   useTarstateSnapshot,
   useTarstateMutation,
-  useTarstateSubscription,
+  useViewSubscription,
   useTarstateStore,
   useView,
-  type QueryHookState,
+  type ViewSelectorHookState,
   type RowHookState,
   type TarstateCommit,
   type TarstateDbInput,
@@ -22,10 +22,10 @@ import {
   type TarstateMutationState,
   type TarstateProviderProps,
   type TarstateReactDiagnostic,
-  type UseQueryOptions,
-  type UseQuerySelectedOptions,
-  type UseTarstateSubscriptionOptions,
-  type UseTarstateSubscriptionSelectedOptions,
+  type UseViewSelectorOptions,
+  type UseViewSelectorSelectedOptions,
+  type UseViewSubscriptionOptions,
+  type UseViewSubscriptionSelectedOptions,
   type UseViewOptions,
   type ViewHookState
 } from '@tarstate/react';
@@ -91,10 +91,10 @@ describe('@tarstate/react API contract', () => {
     expect(useDb).toBeTypeOf('function');
     expect(useCommit).toBeTypeOf('function');
     expect(useTarstateMutation).toBeTypeOf('function');
-    expect(useTarstateSubscription).toBeTypeOf('function');
+    expect(useViewSubscription).toBeTypeOf('function');
     expect(useView).toBeTypeOf('function');
     expect(useRow).toBeTypeOf('function');
-    expect(useQuery).toBeTypeOf('function');
+    expect(useViewSelector).toBeTypeOf('function');
   });
 
   it('keeps shallow equality intentionally shallow', () => {
@@ -135,7 +135,7 @@ describe('@tarstate/react API contract', () => {
       .toEqualTypeOf<Pick<StoreViewSnapshot<ItemProjection>, 'rows' | 'diagnostics' | 'revision' | 'queryKey'> & {
         readonly refresh: () => void;
       }>());
-    assertType(() => expectTypeOf<QueryHookState<ItemProjection>>().toEqualTypeOf<{
+    assertType(() => expectTypeOf<ViewSelectorHookState<ItemProjection>>().toEqualTypeOf<{
       readonly data: readonly ItemProjection[];
       readonly diagnostics: readonly TarstateReactDiagnostic[];
       readonly queryKey: string;
@@ -158,7 +158,7 @@ describe('@tarstate/react API contract', () => {
     }>());
 
     const view = {} as ViewHookState<ItemProjection>;
-    const query = {} as QueryHookState<ItemProjection>;
+    const selector = {} as ViewSelectorHookState<ItemProjection>;
 
     assertType(() => {
       // @ts-expect-error hook status was removed
@@ -177,43 +177,42 @@ describe('@tarstate/react API contract', () => {
       return view.version;
     });
     assertType(() => {
-      // @ts-expect-error query rows are exposed as data
-      return query.rows;
+      // @ts-expect-error selected rows are exposed as data
+      return selector.rows;
     });
     assertType(() => {
-      // @ts-expect-error query result is only passed to select
-      return query.result;
+      // @ts-expect-error StoreQueryResult is only passed to select
+      return selector.result;
     });
   });
 
-  it('keeps view/query options resetKey-based', () => {
+  it('keeps view selector options resetKey-based', () => {
     assertType(() => expectTypeOf<UseViewOptions>().toEqualTypeOf<{
       readonly resetKey?: string | number;
     }>());
-    assertType(() => expectTypeOf<UseQuerySelectedOptions<ItemProjection, readonly string[]>>()
-      .toMatchTypeOf<UseQueryOptions<ItemProjection, readonly string[]>>());
 
-    const defaultQueryOptions = {
-      select: (rows) => rows
-    } satisfies UseQueryOptions<ItemProjection>;
-    assertType(() => expectTypeOf(defaultQueryOptions.select)
-      .toEqualTypeOf<(rows: readonly ItemProjection[]) => readonly ItemProjection[]>());
+    const rowSelectorOptions = {
+      resetKey: 'rows',
+      equality: (left, right) => left.length === right.length
+    } satisfies UseViewSelectorOptions<ItemProjection>;
+    assertType(() => expectTypeOf(rowSelectorOptions.equality)
+      .toEqualTypeOf<(left: readonly ItemProjection[], right: readonly ItemProjection[]) => boolean>());
 
-    const queryOptions = {
+    const selectorOptions = {
       resetKey: 'labels',
       select: (rows, result) => rows.map((row) => `${row.label}:${result.diagnostics.length}`),
       equality: (left, right) => left.length === right.length
         && left.every((item, index) => item === right[index])
-    } satisfies UseQueryOptions<ItemProjection, readonly string[]>;
-    expect(queryOptions.select).toBeTypeOf('function');
-    expect(queryOptions.equality).toBeTypeOf('function');
+    } satisfies UseViewSelectorSelectedOptions<ItemProjection, readonly string[]>;
+    expect(selectorOptions.select).toBeTypeOf('function');
+    expect(selectorOptions.equality).toBeTypeOf('function');
 
-    assertType(() => expectTypeOf<UseTarstateSubscriptionOptions<ItemProjection>>()
+    assertType(() => expectTypeOf<UseViewSubscriptionOptions<ItemProjection>>()
       .toEqualTypeOf<UseViewOptions & {
         readonly onChange: (snapshot: StoreViewSnapshot<ItemProjection>) => void;
         readonly fireImmediately?: boolean;
       }>());
-    assertType(() => expectTypeOf<UseTarstateSubscriptionSelectedOptions<ItemProjection, readonly string[]>>()
+    assertType(() => expectTypeOf<UseViewSubscriptionSelectedOptions<ItemProjection, readonly string[]>>()
       .toEqualTypeOf<UseViewOptions & {
         readonly select: (snapshot: StoreViewSnapshot<ItemProjection>) => readonly string[];
         readonly equality?: (left: readonly string[], right: readonly string[]) => boolean;
@@ -223,14 +222,14 @@ describe('@tarstate/react API contract', () => {
 
     const rawSubscriptionOptions = {
       onChange: (snapshot) => snapshot.rows
-    } satisfies UseTarstateSubscriptionOptions<ItemProjection>;
+    } satisfies UseViewSubscriptionOptions<ItemProjection>;
     const subscriptionOptions = {
       resetKey: 'labels',
       select: (snapshot) => snapshot.rows.map((row) => row.label),
       equality: shallow,
       onChange: (_selected, _snapshot) => undefined,
       fireImmediately: true
-    } satisfies UseTarstateSubscriptionSelectedOptions<ItemProjection, readonly string[]>;
+    } satisfies UseViewSubscriptionSelectedOptions<ItemProjection, readonly string[]>;
     expect(rawSubscriptionOptions.onChange).toBeTypeOf('function');
     expect(subscriptionOptions.select).toBeTypeOf('function');
     expect(subscriptionOptions.equality).toBe(shallow);
@@ -238,8 +237,8 @@ describe('@tarstate/react API contract', () => {
     function InvalidOptionsProbe() {
       // @ts-expect-error deps was removed; use resetKey for explicit view recreation
       useView(itemQuery, { deps: [] });
-      // @ts-expect-error query deps was removed; use resetKey for explicit view recreation
-      useQuery(itemQuery, { deps: [] });
+      // @ts-expect-error selector deps was removed; use resetKey for explicit view recreation
+      useViewSelector(itemQuery, { deps: [] });
       return null;
     }
 
@@ -270,21 +269,21 @@ describe('@tarstate/react API contract', () => {
 });
 
 describe('@tarstate/react hooks', () => {
-  it('reads view, query, and row state from core store views', () => {
+  it('reads view, selector, and row state from core store views', () => {
     const fake = createFakeItemStore([
       { id: 'item-a', label: 'Alpha' },
       { id: 'item-b', label: 'Beta' }
     ]);
     const states: {
       view?: ViewHookState<ItemProjection>;
-      query?: QueryHookState<ItemProjection, readonly string[]>;
+      selector?: ViewSelectorHookState<ItemProjection, readonly string[]>;
       rowByPredicate?: RowHookState<ItemProjection>;
       rowByRelation?: RowHookState<ItemRow>;
     } = {};
 
     function Probe() {
       states.view = useView(itemQuery);
-      states.query = useQuery(itemQuery, {
+      states.selector = useViewSelector(itemQuery, {
         select: (rows, result) => rows.map((row) => `${row.label}:${result.revision}:${result.diagnostics.length}`)
       });
       states.rowByPredicate = useRow(itemQuery, (row) => row.id === 'item-b');
@@ -301,7 +300,7 @@ describe('@tarstate/react hooks', () => {
       { id: 'item-a', label: 'Alpha' },
       { id: 'item-b', label: 'Beta' }
     ]);
-    expect(states.query?.data).toEqual(['Alpha:0:0', 'Beta:0:0']);
+    expect(states.selector?.data).toEqual(['Alpha:0:0', 'Beta:0:0']);
     expect(states.rowByPredicate?.row).toEqual({ id: 'item-b', label: 'Beta' });
     expect(states.rowByRelation?.row).toEqual({ id: 'item-a', label: 'Alpha' });
 
@@ -311,7 +310,7 @@ describe('@tarstate/react hooks', () => {
 
     expect(states.view?.revision).toBe(1);
     expect(states.view?.rows).toEqual([{ id: 'item-c', label: 'Gamma' }]);
-    expect(states.query?.data).toEqual(['Gamma:1:0']);
+    expect(states.selector?.data).toEqual(['Gamma:1:0']);
     expect(states.rowByPredicate?.row).toBeUndefined();
     expect(states.rowByRelation?.row).toBeUndefined();
 
@@ -336,7 +335,7 @@ describe('@tarstate/react hooks', () => {
       states.commit = useCommit();
       states.snapshot = useTarstateSnapshot();
       states.db = useDb();
-      states.labels = useQuery(itemQuery, {
+      states.labels = useViewSelector(itemQuery, {
         select: (rows) => rows.map((row) => row.label)
       }).data;
       return null;
@@ -429,13 +428,13 @@ describe('@tarstate/react hooks', () => {
     });
   });
 
-  it('keeps selected query data stable across unrelated rerenders', () => {
+  it('keeps selected view data stable across unrelated rerenders', () => {
     const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
     const select = vi.fn((rows: readonly ItemProjection[]) => rows.map((row) => row.label));
     const selectedRefs: unknown[] = [];
 
     function Probe({ tick }: { readonly tick: number }) {
-      const state = useQuery(itemQuery, { select });
+      const state = useViewSelector(itemQuery, { select });
       selectedRefs.push(state.data);
       return createElement('span', undefined, tick);
     }
@@ -472,7 +471,7 @@ describe('@tarstate/react hooks', () => {
 
     function Probe() {
       renders += 1;
-      useTarstateSubscription(itemQuery, {
+      useViewSubscription(itemQuery, {
         fireImmediately: true,
         onChange: (snapshot) => {
           snapshots.push({
@@ -520,11 +519,11 @@ describe('@tarstate/react hooks', () => {
     expect(fake.viewStats()[0]?.snapshotReads).toBe(unmountedReads);
   });
 
-  it('unmounting useView releases its subscription while a matching useQuery keeps updating', () => {
+  it('unmounting useView releases its subscription while a matching useViewSelector keeps updating', () => {
     const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
     const states: {
       viewRows?: readonly ItemProjection[];
-      queryLabels?: string;
+      selectorLabels?: string;
     } = {};
 
     function ViewProbe() {
@@ -532,8 +531,8 @@ describe('@tarstate/react hooks', () => {
       return null;
     }
 
-    function QueryProbe() {
-      states.queryLabels = useQuery(itemQuery, {
+    function SelectorProbe() {
+      states.selectorLabels = useViewSelector(itemQuery, {
         select: (rows) => rows.map((row) => row.label).join('|')
       }).data;
       return null;
@@ -547,7 +546,7 @@ describe('@tarstate/react hooks', () => {
           Fragment,
           undefined,
           showView ? createElement(ViewProbe, { key: 'view' }) : null,
-          createElement(QueryProbe, { key: 'query' })
+          createElement(SelectorProbe, { key: 'selector' })
         )
       );
     }
@@ -558,7 +557,7 @@ describe('@tarstate/react hooks', () => {
     });
 
     expect(states.viewRows).toEqual([{ id: 'item-a', label: 'Alpha' }]);
-    expect(states.queryLabels).toBe('Alpha');
+    expect(states.selectorLabels).toBe('Alpha');
     expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([1, 1]);
 
     act(() => {
@@ -577,18 +576,18 @@ describe('@tarstate/react hooks', () => {
     const afterUpdate = fake.viewStats();
     expect(afterUpdate[0]?.snapshotReads).toBe(unmountedViewReads);
     expect(afterUpdate[1]?.snapshotReads).toBeGreaterThan(afterUnmount[1]?.snapshotReads ?? 0);
-    expect(states.queryLabels).toBe('Beta');
+    expect(states.selectorLabels).toBe('Beta');
 
     act(() => {
       renderer?.unmount();
     });
   });
 
-  it('unmounting useQuery releases its subscription while a matching useView keeps updating', () => {
+  it('unmounting useViewSelector releases its subscription while a matching useView keeps updating', () => {
     const fake = createFakeItemStore([{ id: 'item-a', label: 'Alpha' }]);
     const states: {
       viewLabels?: string;
-      queryLabels?: string;
+      selectorLabels?: string;
     } = {};
 
     function ViewProbe() {
@@ -596,14 +595,14 @@ describe('@tarstate/react hooks', () => {
       return null;
     }
 
-    function QueryProbe() {
-      states.queryLabels = useQuery(itemQuery, {
+    function SelectorProbe() {
+      states.selectorLabels = useViewSelector(itemQuery, {
         select: (rows) => rows.map((row) => row.label).join('|')
       }).data;
       return null;
     }
 
-    function App({ showQuery }: { readonly showQuery: boolean }) {
+    function App({ showSelector }: { readonly showSelector: boolean }) {
       return createElement(
         TarstateProvider,
         { store: fake.store },
@@ -611,28 +610,28 @@ describe('@tarstate/react hooks', () => {
           Fragment,
           undefined,
           createElement(ViewProbe, { key: 'view' }),
-          showQuery ? createElement(QueryProbe, { key: 'query' }) : null
+          showSelector ? createElement(SelectorProbe, { key: 'selector' }) : null
         )
       );
     }
 
     let renderer: ReactTestRenderer | undefined;
     act(() => {
-      renderer = create(createElement(App, { showQuery: true }));
+      renderer = create(createElement(App, { showSelector: true }));
     });
 
     expect(states.viewLabels).toBe('Alpha');
-    expect(states.queryLabels).toBe('Alpha');
+    expect(states.selectorLabels).toBe('Alpha');
     expect(fake.viewStats().map((stats) => stats.activeListeners)).toEqual([1, 1]);
 
     act(() => {
-      renderer?.update(createElement(App, { showQuery: false }));
+      renderer?.update(createElement(App, { showSelector: false }));
     });
 
     const afterUnmount = fake.viewStats();
-    const unmountedQueryReads = afterUnmount[1]?.snapshotReads;
+    const unmountedSelectorReads = afterUnmount[1]?.snapshotReads;
     expect(afterUnmount.map((stats) => stats.activeListeners)).toEqual([1, 0]);
-    expect(unmountedQueryReads).toBeGreaterThan(0);
+    expect(unmountedSelectorReads).toBeGreaterThan(0);
 
     act(() => {
       fake.setRows([{ id: 'item-b', label: 'Beta' }]);
@@ -640,7 +639,7 @@ describe('@tarstate/react hooks', () => {
 
     const afterUpdate = fake.viewStats();
     expect(afterUpdate[0]?.snapshotReads).toBeGreaterThan(afterUnmount[0]?.snapshotReads ?? 0);
-    expect(afterUpdate[1]?.snapshotReads).toBe(unmountedQueryReads);
+    expect(afterUpdate[1]?.snapshotReads).toBe(unmountedSelectorReads);
     expect(states.viewLabels).toBe('Beta');
 
     act(() => {

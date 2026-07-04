@@ -1,7 +1,7 @@
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterAll, bench, describe } from 'vitest';
-import { TarstateProvider, useQuery, useTarstateSubscription } from '@tarstate/react';
+import { TarstateProvider, useViewSubscription, useView } from '@tarstate/react';
 import { asc, as, from, pipe, project, sort } from '@tarstate/core/query';
 import { defineSchema, idField, relation, stringField } from '@tarstate/core/schema';
 import { createStore, type StoreViewSnapshot } from '@tarstate/core/store';
@@ -60,7 +60,7 @@ const benchMetrics: BenchMetrics[] = [];
 let valueSink = 0;
 
 describe('@tarstate/react subscription paths', () => {
-  bench('useQuery render path', hookRenderPath(), BENCH_OPTIONS);
+  bench('useView render path', useViewRenderPath(), BENCH_OPTIONS);
   bench('imperative subscription path', imperativeSubscriptionPath(), BENCH_OPTIONS);
 });
 
@@ -79,10 +79,10 @@ afterAll(() => {
   for (const metrics of benchMetrics) metrics.cleanup();
 });
 
-function hookRenderPath(): () => Promise<void> {
+function useViewRenderPath(): () => Promise<void> {
   const store = createStore({ items: makeRows() });
   const metrics: BenchMetrics = {
-    label: 'useQuery render path',
+    label: 'useView render path',
     commits: 0,
     renders: 0,
     callbacks: 0,
@@ -94,13 +94,10 @@ function hookRenderPath(): () => Promise<void> {
 
   function Probe() {
     metrics.renders += 1;
-    const state = useQuery(itemQuery, {
-      select: selectedLabels,
-      equality: Object.is
-    });
-    selected = state.data;
+    const state = useView(itemQuery);
+    selected = selectedLabels(state.rows);
 
-    return createElement('output', undefined, state.data);
+    return createElement('output', undefined, selected);
   }
 
   act(() => {
@@ -140,7 +137,7 @@ function imperativeSubscriptionPath(): () => Promise<void> {
 
   function Probe() {
     metrics.renders += 1;
-    useTarstateSubscription(itemQuery, {
+    useViewSubscription(itemQuery, {
       fireImmediately: true,
       select: (snapshot: StoreViewSnapshot<ItemProjection>) => selectedLabels(snapshot.rows),
       equality: Object.is,

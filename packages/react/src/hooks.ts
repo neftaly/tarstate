@@ -15,17 +15,17 @@ import { useCommit, useTarstateStore } from './provider.js';
 import { isRelationRef, relationKeyMatches, relationKeyQuery } from './relation.js';
 import { selectedSnapshotReader, stableSnapshotReader } from './snapshot.js';
 import type {
-  QueryHookSnapshotState,
-  QueryHookState,
+  ViewSelectorSnapshotState,
+  ViewSelectorHookState,
   RelationRow,
   RowHookState,
   TarstateCommit,
   TarstateMutationSnapshot,
   TarstateMutationState,
-  UseQueryOptions,
-  UseQuerySelectedOptions,
-  UseTarstateSubscriptionOptions,
-  UseTarstateSubscriptionSelectedOptions,
+  UseViewSelectorOptions,
+  UseViewSelectorSelectedOptions,
+  UseViewSubscriptionOptions,
+  UseViewSubscriptionSelectedOptions,
   UseViewOptions,
   ViewHookState
 } from './types.js';
@@ -108,17 +108,17 @@ export function useView<Row>(
   }), [snapshot, refresh]);
 }
 
-export function useTarstateSubscription<Row>(
+export function useViewSubscription<Row>(
   query: Query<Row>,
-  options: UseTarstateSubscriptionOptions<Row>
+  options: UseViewSubscriptionOptions<Row>
 ): void;
-export function useTarstateSubscription<Row, Selected>(
+export function useViewSubscription<Row, Selected>(
   query: Query<Row>,
-  options: UseTarstateSubscriptionSelectedOptions<Row, Selected>
+  options: UseViewSubscriptionSelectedOptions<Row, Selected>
 ): void;
-export function useTarstateSubscription<Row, Selected>(
+export function useViewSubscription<Row, Selected>(
   query: Query<Row>,
-  options: UseTarstateSubscriptionOptions<Row> | UseTarstateSubscriptionSelectedOptions<Row, Selected>
+  options: UseViewSubscriptionOptions<Row> | UseViewSubscriptionSelectedOptions<Row, Selected>
 ): void {
   const view = useStoreView(query, options);
   const onChangeRef = useRef(options.onChange);
@@ -192,18 +192,18 @@ export function useRow<Row>(
   }, [keyOrPredicate, relation, viewState]);
 }
 
-export function useQuery<Row>(
+export function useViewSelector<Row>(
   query: Query<Row>,
-  options?: UseViewOptions
-): QueryHookState<Row>;
-export function useQuery<Row, Selected>(
+  options?: UseViewSelectorOptions<Row>
+): ViewSelectorHookState<Row>;
+export function useViewSelector<Row, Selected>(
   query: Query<Row>,
-  options: UseQuerySelectedOptions<Row, Selected>
-): QueryHookState<Row, Selected>;
-export function useQuery<Row, Selected>(
+  options: UseViewSelectorSelectedOptions<Row, Selected>
+): ViewSelectorHookState<Row, Selected>;
+export function useViewSelector<Row, Selected>(
   query: Query<Row>,
-  options?: UseViewOptions | UseQuerySelectedOptions<Row, Selected>
-): QueryHookState<Row, readonly Row[] | Selected> {
+  options?: UseViewSelectorOptions<Row> | UseViewSelectorSelectedOptions<Row, Selected>
+): ViewSelectorHookState<Row, readonly Row[] | Selected> {
   const view = useStoreView(query, options);
   const select = hasSelect(options) ? options.select : undefined;
   const equality = hasEquality<Row, Selected>(options) ? options.equality : undefined;
@@ -215,9 +215,9 @@ export function useQuery<Row, Selected>(
       ) | undefined;
       const read = selectedSnapshotReader(
         () => view.getSnapshot(),
-        (snapshot) => queryHookSnapshot(snapshot, select),
+        (snapshot) => viewSelectorSnapshot(snapshot, select),
         areViewSnapshotsEqual,
-        (left, right) => areQueryHookSnapshotsEqual(left, right, selectedEquality)
+        (left, right) => areViewSelectorSnapshotsEqual(left, right, selectedEquality)
       );
       return () => read().selected;
     },
@@ -244,10 +244,10 @@ function useStoreView<Row>(query: Query<Row>, options: UseViewOptions = {}): Sto
   return useMemo(() => store.view(query), [store, resetKey, canonicalQueryKey]);
 }
 
-function queryHookSnapshot<Row, Selected>(
+function viewSelectorSnapshot<Row, Selected>(
   snapshot: StoreViewSnapshot<Row>,
   select: ((rows: readonly Row[], result: StoreQueryResult<Row>) => Selected) | undefined
-): QueryHookSnapshotState<Row, readonly Row[] | Selected> {
+): ViewSelectorSnapshotState<Row, readonly Row[] | Selected> {
   const result: StoreQueryResult<Row> = {
     rows: snapshot.rows,
     diagnostics: snapshot.diagnostics,
@@ -261,9 +261,9 @@ function queryHookSnapshot<Row, Selected>(
   };
 }
 
-function areQueryHookSnapshotsEqual<Row, Selected>(
-  left: QueryHookSnapshotState<Row, Selected>,
-  right: QueryHookSnapshotState<Row, Selected>,
+function areViewSelectorSnapshotsEqual<Row, Selected>(
+  left: ViewSelectorSnapshotState<Row, Selected>,
+  right: ViewSelectorSnapshotState<Row, Selected>,
   equality: ((left: Selected, right: Selected) => boolean) | undefined
 ): boolean {
   return left.queryKey === right.queryKey
@@ -272,19 +272,21 @@ function areQueryHookSnapshotsEqual<Row, Selected>(
 }
 
 function hasSelect<Row, Selected>(
-  options: UseViewOptions | UseQuerySelectedOptions<Row, Selected> | undefined
-): options is UseQuerySelectedOptions<Row, Selected> {
+  options: UseViewOptions | UseViewSelectorOptions<Row> | UseViewSelectorSelectedOptions<Row, Selected> | undefined
+): options is UseViewSelectorSelectedOptions<Row, Selected> {
   return options !== undefined && 'select' in options && typeof options.select === 'function';
 }
 
 function hasEquality<Row, Selected>(
-  options: UseViewOptions | UseQuerySelectedOptions<Row, Selected> | undefined
-): options is UseQueryOptions<Row, Selected> & { readonly equality: (left: Selected, right: Selected) => boolean } {
+  options: UseViewOptions | UseViewSelectorOptions<Row> | UseViewSelectorSelectedOptions<Row, Selected> | undefined
+): options is (UseViewSelectorOptions<Row> | UseViewSelectorSelectedOptions<Row, Selected>) & {
+  readonly equality: (left: readonly Row[] | Selected, right: readonly Row[] | Selected) => boolean;
+} {
   return options !== undefined && 'equality' in options && typeof options.equality === 'function';
 }
 
 function hasSubscriptionSelect<Row, Selected>(
-  options: UseTarstateSubscriptionOptions<Row> | UseTarstateSubscriptionSelectedOptions<Row, Selected>
-): options is UseTarstateSubscriptionSelectedOptions<Row, Selected> {
+  options: UseViewSubscriptionOptions<Row> | UseViewSubscriptionSelectedOptions<Row, Selected>
+): options is UseViewSubscriptionSelectedOptions<Row, Selected> {
   return 'select' in options && typeof options.select === 'function';
 }

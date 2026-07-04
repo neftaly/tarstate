@@ -27,21 +27,21 @@ export type UseViewOptions = {
   readonly resetKey?: string | number;
 };
 
-export type UseQueryOptions<Row, Selected = readonly Row[]> = UseViewOptions & {
-  readonly select?: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
+export type UseViewSelectorOptions<Row> = UseViewOptions & {
+  readonly equality?: (left: readonly Row[], right: readonly Row[]) => boolean;
+};
+
+export type UseViewSelectorSelectedOptions<Row, Selected> = UseViewOptions & {
+  readonly select: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
   readonly equality?: (left: Selected, right: Selected) => boolean;
 };
 
-export type UseQuerySelectedOptions<Row, Selected> = UseQueryOptions<Row, Selected> & {
-  readonly select: (rows: readonly Row[], result: StoreQueryResult<Row>) => Selected;
-};
-
-export type UseTarstateSubscriptionOptions<Row> = UseViewOptions & {
+export type UseViewSubscriptionOptions<Row> = UseViewOptions & {
   readonly onChange: (snapshot: StoreViewSnapshot<Row>) => void;
   readonly fireImmediately?: boolean;
 };
 
-export type UseTarstateSubscriptionSelectedOptions<Row, Selected> = UseViewOptions & {
+export type UseViewSubscriptionSelectedOptions<Row, Selected> = UseViewOptions & {
   readonly select: (snapshot: StoreViewSnapshot<Row>) => Selected;
   readonly onChange: (selected: Selected, snapshot: StoreViewSnapshot<Row>) => void;
   readonly equality?: (left: Selected, right: Selected) => boolean;
@@ -54,7 +54,7 @@ export type ViewHookState<Row> = ViewHookSnapshotState<Row> & {
   readonly refresh: () => void;
 };
 
-export type QueryHookState<Row, Selected = readonly Row[]> = {
+export type ViewSelectorHookState<Row, Selected = readonly Row[]> = {
   readonly data: Selected;
   readonly diagnostics: readonly TarstateReactDiagnostic[];
   readonly queryKey: string;
@@ -79,7 +79,7 @@ export type TarstateMutationState = {
 };
 
 export type RelationRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
-export type QueryHookSnapshotState<Row, Selected> = Omit<QueryHookState<Row, Selected>, 'refresh'>;
+export type ViewSelectorSnapshotState<Row, Selected> = Omit<ViewSelectorHookState<Row, Selected>, 'refresh'>;
 export type TarstateMutationSnapshot = Pick<TarstateMutationState, 'pending' | 'error' | 'result'>;
 export type ResetKey = string | number | undefined;
 export type OwnedStoreState = {
