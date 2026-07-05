@@ -90,6 +90,13 @@ field meaning MUST mint a new `schemaId`. Changing only `description` or inert
 `metadata` MAY keep the same `schemaId` when the application does not treat
 those changes as generated-artifact changes.
 
+Relation and field names are scoped to one schema node. The same relation or
+field name in two different `schemaId` nodes MUST NOT be treated as compatible
+without an explicit compatibility rule such as a future lens. Tools that catalog
+multiple manifests SHOULD report an error when the same `schemaId` is associated
+with incompatible semantic content. They MUST NOT silently merge different
+relation or field meanings under one `schemaId`.
+
 `description` is documentation. It MUST NOT affect validation, hydration, or
 canonical identity except as data included in canonical output.
 
@@ -129,8 +136,24 @@ key order is significant. A one-element key array is invalid in
 array to the string form before producing a manifest.
 
 A single-field row key is the value of that field. A composite row key is the
-ordered tuple of key-field values in declared key order. The manifest does not
-define a string encoding for composite row keys.
+ordered tuple of key-field values in declared key order.
+
+A hydrated runtime SHOULD model row identity as a logical row-key value:
+
+- for a single-field key, the normalized key scalar
+- for a composite key, an array of normalized key scalars in declared key order
+
+A normalized built-in key scalar is a string, boolean, or finite number with
+`-0` normalized to `0`. `id`, `ref`, and `anchoredPath` keys use their string
+row values. A custom key field uses the runtime codec's `stableKey` string when
+present, otherwise its non-null scalar conversion. A custom `toScalar` result of
+`null`, a non-finite number, or any non-scalar value is invalid for row keying.
+
+Logical row-key equality is equality of normalized row-key values. Composite key
+order is significant. When a layer needs a portable row-key text, it SHOULD use
+the canonical JSON string of the logical row-key value. This text is a
+cross-runtime identity convention for diagnostics, patches, and sidecars; it is
+not a required physical storage encoding for adapters.
 
 Every key field MUST:
 
@@ -146,7 +169,10 @@ strings. A relation MUST contain at least one field.
 
 `ephemeral` marks a relation whose rows are not expected to be durable domain
 facts. Examples include presence, connection state, runtime diagnostics, and
-local UI observations. `ephemeral` defaults to `false`.
+local UI observations. `ephemeral` defaults to `false`. It does not weaken field
+validation, key requirements, ref meaning, or future evolution semantics.
+Persistence and write routing are topology concerns, not relation-schema
+concerns.
 
 `description` and `metadata` have the same semantics as the top-level fields.
 
@@ -210,6 +236,11 @@ Valid row values are finite JavaScript numbers.
 
 `NaN`, positive infinity, and negative infinity are invalid.
 
+`number` is finite JavaScript numeric data. It is not an exact decimal,
+arbitrary-precision integer, currency, or cross-runtime safe-integer guarantee.
+Use string ids, integer minor units, or a domain-specific custom codec when
+exactness matters.
+
 Number fields are keyable.
 
 ### 5.3 `boolean`
@@ -239,6 +270,9 @@ Valid row values are strings.
 with different domains SHOULD NOT be considered interchangeable even though
 both are represented as strings.
 
+Domain names SHOULD be package-qualified or otherwise globally namespaced.
+Tarstate reserves the `tarstate.` prefix for core-defined domains.
+
 Id fields are keyable.
 
 ### 5.5 `ref`
@@ -266,6 +300,10 @@ that key field. The target field MUST be string-valued in v1: `string`, `id`,
 unique fields, and refs to numeric, boolean, JSON, or custom keys are reserved
 for a later format version or constraint layer.
 
+V1 `ref` is a typed scalar reference. It is not a complete referential-integrity
+constraint. Row-existence checks, cascading behavior, composite foreign keys,
+and refs to non-key unique fields belong to future constraint layers.
+
 Ref fields are keyable.
 
 ### 5.6 `anchoredPath`
@@ -280,7 +318,9 @@ Valid row values are strings.
 
 `anchoredPath` is a stable path-like scalar used by existing Tarstate runtime
 features. The schema manifest treats it as an opaque string with path semantics
-defined by the runtime.
+defined by the runtime. Core v1 validation does not parse or normalize it.
+Schema-level equality and keying use exact string equality after ordinary string
+validation.
 
 Anchored path fields are keyable.
 
@@ -310,6 +350,9 @@ Valid row values are defined by the named codec.
 `codec` MUST be a non-empty string. It names a capability supplied by a runtime
 codec registry. The manifest MUST NOT serialize validator, comparator,
 stable-key, scalar-conversion, or hydration functions directly.
+
+Codec names SHOULD be package-qualified or otherwise globally namespaced.
+Tarstate reserves the `tarstate.` prefix for core-defined codecs and domains.
 
 Custom fields are keyable only when their codec supplies at least one stable
 key strategy to the hydration runtime:
@@ -363,6 +406,7 @@ Canonicalization MUST:
 - omit `optional: false`
 - omit `nullable: false`
 - omit `ephemeral: false`
+- omit `keyable: false`
 - preserve meaningful `false` and `null` values inside `metadata`
 - preserve non-empty `metadata` objects
 - preserve `description` exactly when provided
@@ -630,6 +674,10 @@ keyable before using the field as a relation key.
 When a runtime codec provides both `stableKey` and `toScalar`, keying MUST use
 `stableKey`. When it provides only `toScalar`, keying MUST use the scalar value.
 
+For custom key fields, a `toScalar` result used for row keying MUST be a string,
+finite number, or boolean. `null`, non-finite numbers, arrays, objects, and
+other non-scalar values are invalid key scalars.
+
 `toScalar` and `fromScalar` are not required to be perfect inverses for every
 host value, but any lossiness SHOULD be documented in the codec declaration
 metadata or avoided for key fields.
@@ -669,7 +717,12 @@ Given a hydrated relation and row value, row validation MUST apply these rules:
 - optional fields may be absent
 - nullable fields may be null
 - `null` is invalid whenever `nullable` is false, even when `optional` is true
+- field presence is based on own row properties, not inherited properties
+- a present value of `undefined` is invalid even when the field is optional
 - present non-null fields must match their field type
+- `json` fields must contain JSON-compatible values; sparse arrays, `Date`,
+  `BigInt`, `Uint8Array`, `Map`, `Set`, `NaN`, infinity, functions, symbols,
+  and `undefined` are invalid
 - custom fields must pass their codec validator when one is supplied
 - extra row fields are invalid in strict row validation
 
@@ -679,7 +732,10 @@ declared field is invalid. Open-world linking to external data is a later layer.
 Runtime row validation MUST reject extra row fields in strict validation mode.
 Storage adapters MAY preserve extra fields for forward compatibility outside
 the declared relation view, but preserved undeclared fields MUST NOT become
-queryable as declared relation fields.
+queryable as declared relation fields. An adapter that claims to round-trip
+unknown storage data SHOULD either preserve undeclared fields out of band or
+reject writes that would drop them; it SHOULD NOT silently erase data outside
+the declared view.
 
 Strict row validation is new behavior for schema-manifest validation. Existing
 builder-defined relations that do not opt into this manifest validation may
@@ -705,6 +761,13 @@ as arbitrary v1 extension properties:
 - `schemaNodes`
 - `lenses`
 - `contentHash`
+- `relationId`
+- `fieldId`
+- `aliases`
+- `reservedNames`
+- `defaults`
+- `fieldTypes`
+- `rowKeyEncoding`
 
 Tools MAY preserve those names inside `metadata`, but core v1 MUST NOT interpret
 them there.
@@ -739,6 +802,9 @@ Implementations MUST:
 - enumerate only own enumerable string keys
 - inspect manifest values without invoking getters, setters, `toJSON`,
   `valueOf`, or other user-defined conversion hooks
+- reject accessor properties when accepting arbitrary JavaScript objects instead
+  of already-parsed JSON data
+- reject cycles and sparse arrays
 - avoid prototype-chain reads when inspecting manifest objects
 - treat relation, field, codec, and schema ids as data, not object paths
 - reject executable values and source text as behavior
@@ -968,8 +1034,13 @@ The initial implementation should expose these functions:
 toSchemaManifest(schema, options): SchemaManifestV1
 canonicalSchemaManifest(manifest): SchemaManifestV1
 stringifyCanonicalSchemaManifest(manifest): string
-validateSchemaManifest(manifest): SchemaDiagnostic[]
-hydrateSchemaManifest(manifest, options): HydratedSchema
+validateSchemaManifest(manifest): SchemaManifestDiagnosticV1[]
+hydrateSchemaManifest(manifest, options): HydratedSchema | HydrateSchemaManifestResult
+
+type HydrateSchemaManifestResult = {
+  readonly schema?: HydratedSchema;
+  readonly diagnostics: readonly SchemaManifestDiagnosticV1[];
+};
 ```
 
 `toSchemaManifest` exports existing TypeScript builder schemas.
@@ -1013,6 +1084,11 @@ non-empty. If a target string is ambiguous, export MUST fail with
 `schema_manifest.invalid_ref`. The canonical manifest itself does not have this
 ambiguity because it uses structured targets.
 
+Authoring APIs SHOULD provide a structured ref-target form such as
+`refField({ relation, field })` before manifest export is considered complete.
+String shorthand is authoring sugar only and cannot represent every valid v1
+relation or field name.
+
 Export MUST fail with `schema_manifest.invalid_field` if an `idField(...)` has
 an empty domain.
 
@@ -1031,7 +1107,8 @@ does not provide one:
 
 Bare `opaqueField()` exports as codec `"opaque"`. Authors SHOULD prefer
 domain-specific codec names for portable manifests, but `"opaque"` is valid when
-the hydration registry provides that codec.
+the hydration registry provides that codec. Portable tooling SHOULD warn when
+`"opaque"` appears in a manifest intended to cross runtime boundaries.
 
 Export MUST NOT execute custom field functions to infer schema data.
 
@@ -1039,15 +1116,25 @@ The current builder API has no relation-level or field-level `description` or
 `metadata`; `toSchemaManifest` therefore exports only top-level
 `description`/`metadata` supplied through `ToSchemaManifestOptions`.
 
-`canonicalSchemaManifest` validates and normalizes an input manifest.
+`canonicalSchemaManifest` validates and normalizes an input manifest. It MUST
+fail on validation errors and expose `SchemaManifestDiagnosticV1` diagnostics to
+the caller.
 
 `stringifyCanonicalSchemaManifest` serializes canonical output with stable key
-ordering.
+ordering. It MUST canonicalize first or require already-canonical input; invalid
+input MUST fail with diagnostics.
 
 `validateSchemaManifest` returns diagnostics without hydrating runtime refs.
 
 `hydrateSchemaManifest` validates, canonicalizes, resolves codecs, and returns
 runtime relation refs.
+
+For `diagnosticMode: "throw"`, hydration MUST throw or otherwise fail on errors
+with diagnostics available to callers. For `diagnosticMode: "collect"`,
+hydration MUST return `HydrateSchemaManifestResult`; `schema` is omitted when
+errors prevent hydration. For `diagnosticMode: "warn"`, warnings MAY be emitted
+through the surrounding Tarstate diagnostic channel, but errors still fail
+hydration.
 
 `HydratedSchema` means relation refs compatible with the output of
 `defineSchema`.
@@ -1092,9 +1179,17 @@ A v1 implementation conforms to this spec when it can:
 - produce stable canonical strings for semantically identical manifests with
   different object key order
 - sort integer-like object keys lexicographically in canonical strings
+- omit `keyable: false` from canonical codec declarations
+- compute logical row-key values and portable row-key text for single and
+  composite keys without confusing `"1"`, `1`, and `true`
+- reject custom key scalar conversions that return `null`, non-finite numbers,
+  arrays, or objects
 - hydrate built-in field types into the current Tarstate schema API
 - hydrate custom fields only through a supplied runtime codec registry
 - serialize `opaqueField(...)` as `type: "custom"` with a codec name
+- reject present row values of `undefined` even for optional fields
+- reject sparse arrays, cycles, accessors, and non-JSON host objects during
+  manifest or JSON-field validation
 - preserve non-empty inert `metadata` as JSON-compatible data, modulo object key
   order in canonical output
 - produce diagnostics with paths precise enough for authoring tools to point at

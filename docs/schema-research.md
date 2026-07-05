@@ -4,8 +4,9 @@ This note explores a serializable schema format for Tarstate. It is not an API
 commitment. The goal is to make the relation model portable while preserving the
 typed builder DX that currently works well in TypeScript.
 
-The normative v1 draft lives in `docs/schema-spec.md`. This file remains the
-research notebook and pressure-test corpus behind that spec.
+The normative v1 draft lives in `docs/schema-spec.md`. The decomplected core
+pressure pass lives in `docs/schema-core-pressure.md`. This file remains the
+research notebook and scenario corpus behind those specs.
 
 ## Recommendation
 
@@ -537,8 +538,8 @@ Naming stance:
 - `codec` means a named runtime capability used to hydrate custom behavior.
 - `metadata` means inert user/tool data that core preserves but does not
   interpret.
-- `currentSchemaId` means the schema node this manifest considers current when
-  it also carries an evolution graph.
+- `defaultSchemaId` means the schema node tools should prefer when no caller
+  requests a view schema in an evolution graph.
 - `lensId` means one named bidirectional translation edge between two schema
   nodes.
 - `schemaNodes` means the known schema nodes in an evolution graph.
@@ -590,13 +591,13 @@ type FieldManifest = {
 };
 ```
 
-`relationId` and `fieldId` are optional in v1 because the current Tarstate API
-identifies fields by name. They are reserved now because schema evolution
-benefits from stable identity that survives renames. If they are introduced
-later, they should behave more like Protobuf field numbers or Avro aliases than
-like display names. Deleted or renamed fields should be tracked through
-`reservedNames` and lenses so future schemas cannot accidentally reuse an old
-meaning.
+`relationId` and `fieldId` are deferred from core v1 because the current
+Tarstate API identifies fields by name and explicit lenses can represent rename
+intent. They remain reserved because schema evolution may eventually benefit
+from stable identity that survives renames. If they are introduced later, they
+should behave more like Protobuf field numbers or Avro aliases than like display
+names. Deleted or renamed fields should be tracked through `reservedNames` and
+lenses so future schemas cannot accidentally reuse an old meaning.
 
 Ref target:
 
@@ -942,7 +943,7 @@ Top-level shape:
 ```json
 {
   "evolution": {
-    "currentSchemaId": "real-estate@3",
+    "defaultSchemaId": "real-estate@3",
     "schemaNodes": {
       "real-estate@2": { "ref": "./schema-v2.json" },
       "real-estate@3": { "inline": true }
@@ -1216,6 +1217,38 @@ Required behavior:
 
 Design implication: relation schemas describe row meaning; topology describes
 which runtime owns reads and writes.
+
+### Patchpit Apps Publish Schemas Beside Data
+
+Patchpit app manifests and app state documents need schemas as runtime
+contracts. Each app can publish schemas for the state documents it owns, and
+other apps or the shell can use those schemas to query, validate, and route
+writes without relying on private TypeScript types.
+
+Required behavior:
+
+- App manifests can point at schema manifests by stable `schemaId` and by a
+  resolvable `schemaRef`.
+- App state documents can carry the `schemaId` they claim to satisfy beside the
+  data, not inside every relation row.
+- A shared service worker can host Tarstate beside Automerge network sync and
+  act as the validation/query/write boundary for separate app frames.
+- The service worker loads schemas, checks codec availability, validates writes,
+  routes patches to the correct Automerge document, and returns structured
+  diagnostics for rejected writes.
+- Apps can talk to other apps through declared relation schemas instead of
+  importing each other's private runtime types.
+- Bad writes fail before they mutate shared Automerge state.
+- Schema mismatch is explicit: a doc with `schemaId` A opened by an app expecting
+  `schemaId` B either negotiates through an evolution graph or fails with a
+  useful diagnostic.
+
+Design implication: Patchpit is the first concrete consumer of schema manifests
+as interoperability contracts. It pressures core v1 to keep `schemaId`,
+diagnostics, row-key identity, structured refs, custom codecs, and strict row
+validation solid. It does not mean `tarstate.schema` should know about
+Patchpit, service workers, Automerge, app manifests, or permissions; those are
+topology and runtime-boundary layers.
 
 ### Rich Text Has Different Merge Semantics Than Strings
 
@@ -1804,6 +1837,12 @@ inputs.
   types, but the wire format should not.
 - Unknown field and enum preservation is a core semantic requirement for
   collaborative runtimes. Adapters can choose how to store preservation data.
+- Logical row-key values are a core convention for diagnostics, patches,
+  sidecars, and self-hosted tooling; adapter physical key encoding remains out
+  of scope.
+- Patchpit-style service-worker runtimes should compose schema manifests with
+  topology, capabilities, and app permissions instead of folding those runtime
+  boundaries into `tarstate.schema`.
 - Lens evaluation must eventually work for both reads and write patches. Row
   snapshot translation alone is insufficient for local-first collaboration.
 - JSON Schema is generated output, not source of truth.
@@ -1886,7 +1925,7 @@ The broad shape has survived the scenario gauntlet:
 
 What still needs review is mostly naming and boundary-setting, not a new core
 model. The names `SchemaManifest`, `RelationManifest`, `FieldManifest`,
-`schemaId`, `formatVersion`, `currentSchemaId`, `dataSpaces`,
+`schemaId`, `formatVersion`, `defaultSchemaId`, `dataSpaces`,
 `relationBindings`, `extensions`, `requires`, and `capabilities` are
 self-describing enough to start with. The only names that still deserve extra
 scrutiny are `opaque`, because it may be too runtime-specific for portable data,
@@ -1916,7 +1955,7 @@ early instead of silently preserving it as inert metadata.
 ## Review Questions Resolved By The V1 Spec
 
 - Are `SchemaManifest`, `RelationManifest`, `FieldManifest`, `schemaId`,
-  `formatVersion`, `currentSchemaId`, and `lensId` self-documenting enough?
+  `formatVersion`, `defaultSchemaId`, and `lensId` self-documenting enough?
   Yes for v1. The spec uses `SchemaManifestV1`, `RelationManifestV1`,
   `FieldManifestV1`, `schemaId`, and `formatVersion`. Evolution names remain
   reserved rather than implemented.
