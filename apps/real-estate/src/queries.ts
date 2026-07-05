@@ -1,11 +1,9 @@
 import {
   agg,
   and,
-  any,
   as,
   asc,
   avg,
-  btree,
   clauses,
   count,
   desc,
@@ -13,20 +11,15 @@ import {
   field,
   from,
   gte,
-  hash,
   join,
   leftJoin,
-  lookup,
   lte,
   max,
   maybe,
-  min,
   pipe,
   queryKey,
   select,
   sort,
-  sortLimit,
-  uniqueIndex,
   value,
   where,
   type PredicateData,
@@ -34,105 +27,119 @@ import {
 } from '@tarstate/core/query';
 import {
   agent,
+  inquiry,
   listing,
   neighborhood,
   offer,
-  openHouse,
-  inquiry,
-  schema,
+  viewing,
   type Agent,
+  type InquiryStatus,
   type Listing,
   type ListingStatus,
   type Neighborhood,
+  type OfferStatus,
   type PropertyType
 } from './domain';
 
-export type ListingSort = 'price_asc' | 'price_desc' | 'newest';
 export type ListingFilters = {
   readonly status: ListingStatus | 'all';
   readonly neighborhoodId: string;
-  readonly propertyType: PropertyType | 'all';
+  readonly minBeds: number;
   readonly maxPrice: number;
-  readonly minBedrooms: number;
-  readonly sort: ListingSort;
 };
 
-export type ListingResult = {
+export type ListingRow = {
   readonly id: string;
   readonly address: string;
   readonly neighborhoodId: string;
   readonly neighborhoodName: string;
-  readonly borough: string;
+  readonly city: string;
   readonly agentId: string;
   readonly agentName: string;
-  readonly team: string;
+  readonly brokerage: string;
   readonly propertyType: PropertyType;
   readonly price: number;
-  readonly bedrooms: number;
-  readonly bathrooms: number;
+  readonly beds: number;
+  readonly baths: number;
   readonly sqft: number;
   readonly status: ListingStatus;
-  readonly listedAt: string;
 };
 
 export type MarketSummaryRow = {
   readonly neighborhoodId: string;
   readonly neighborhoodName: string;
-  readonly borough: string;
+  readonly city: string;
+  readonly medianPrice: number;
+  readonly walkScore: number;
   readonly listingCount: number | undefined;
   readonly activeCount: number | undefined;
-  readonly underContract: boolean | undefined;
-  readonly avgPrice: number | undefined;
-  readonly minPrice: number | undefined;
-  readonly maxPrice: number | undefined;
-  readonly medianPrice: number;
-  readonly inventory: number;
-  readonly daysOnMarket: number;
-  readonly walkScore: number;
-};
-
-export type OpenHouseScheduleRow = {
-  readonly id: string;
-  readonly listingId: string;
-  readonly address: string;
-  readonly neighborhoodName: string;
-  readonly hostAgent: string;
-  readonly date: string;
-  readonly startsAt: string;
-  readonly expectedVisitors: number;
-  readonly brokerOnly: boolean;
-};
-
-export type TopListingRow = {
-  readonly id: string;
-  readonly address: string;
-  readonly neighborhoodName: string;
-  readonly agentName: string;
-  readonly price: number;
-  readonly bedrooms: number;
-  readonly status: ListingStatus;
+  readonly averagePrice: number | undefined;
+  readonly highestPrice: number | undefined;
 };
 
 export type PipelineRow = {
   readonly listingId: string;
   readonly address: string;
-  readonly price: number;
   readonly agentName: string;
+  readonly status: ListingStatus;
+  readonly price: number;
   readonly inquiryCount: number | undefined;
-  readonly submittedOffers: number | undefined;
+  readonly qualifiedInquiries: number | undefined;
+  readonly offerCount: number | undefined;
   readonly topOffer: number | undefined;
 };
 
-export type ListingIndexRow = {
+export type ViewingScheduleRow = {
   readonly id: string;
+  readonly listingId: string;
+  readonly date: string;
+  readonly time: string;
+  readonly buyerName: string;
   readonly address: string;
-  readonly neighborhoodId: string;
-  readonly price: number;
-  readonly bedrooms: number;
-  readonly status: ListingStatus;
+  readonly neighborhoodName: string;
+  readonly agentName: string;
+  readonly status: string;
+  readonly virtual: boolean;
+};
+
+export type InquiryQueueRow = {
+  readonly id: string;
+  readonly listingId: string;
+  readonly buyerName: string;
+  readonly address: string;
+  readonly agentName: string;
+  readonly budget: number;
+  readonly status: InquiryStatus;
+  readonly createdAt: string;
+};
+
+export type OfferBookRow = {
+  readonly id: string;
+  readonly listingId: string;
+  readonly buyerName: string;
+  readonly address: string;
+  readonly listPrice: number;
+  readonly amount: number;
+  readonly status: OfferStatus;
+  readonly submittedAt: string;
 };
 
 type ListingJoinRow = Listing & Agent & Neighborhood;
+type QueryRow<Input> = Input extends Query<infer Row> ? Row : never;
+
+export const defaultListingFilters: ListingFilters = {
+  status: 'active',
+  neighborhoodId: 'all',
+  minBeds: 2,
+  maxPrice: 900000
+};
+
+export const allListingFilters: ListingFilters = {
+  status: 'all',
+  neighborhoodId: 'all',
+  minBeds: 0,
+  maxPrice: 2000000
+};
 
 const joinedListings = pipe(
   from(listing),
@@ -140,71 +147,38 @@ const joinedListings = pipe(
   join(from(neighborhood), eq(listing.neighborhoodId, neighborhood.id))
 ) as Query<ListingJoinRow>;
 
-export const defaultFilters: ListingFilters = {
-  status: 'active',
-  neighborhoodId: 'all',
-  propertyType: 'all',
-  maxPrice: 1300000,
-  minBedrooms: 1,
-  sort: 'price_asc'
-};
-
-export const allListingsFilters: ListingFilters = {
-  status: 'all',
-  neighborhoodId: 'all',
-  propertyType: 'all',
-  maxPrice: 3000000,
-  minBedrooms: 0,
-  sort: 'price_asc'
-};
-
-export function listingWalkthroughQuery(filters: ListingFilters): Query<ListingResult> {
+export function listingListQuery(filters: ListingFilters): Query<ListingRow> {
   const predicates: PredicateData[] = [
-    lte(listing.price, value(filters.maxPrice)),
-    gte(listing.bedrooms, value(filters.minBedrooms))
+    gte(listing.beds, value(filters.minBeds)),
+    lte(listing.price, value(filters.maxPrice))
   ];
 
   if (filters.status !== 'all') predicates.push(eq(listing.status, value(filters.status)));
   if (filters.neighborhoodId !== 'all') predicates.push(eq(listing.neighborhoodId, value(filters.neighborhoodId)));
-  if (filters.propertyType !== 'all') predicates.push(eq(listing.propertyType, value(filters.propertyType)));
-
-  const filtered = pipe(joinedListings, where(and(...predicates)));
-  const sorted = pipe(
-    filtered,
-    filters.sort === 'price_desc'
-      ? sort(desc(listing.price), asc(listing.id))
-      : filters.sort === 'newest'
-        ? sort(desc(listing.listedAt), asc(listing.id))
-        : sort(asc(listing.price), asc(listing.id))
-  );
 
   return pipe(
-    sorted,
+    pipe(joinedListings, where(and(...predicates))),
+    sort(asc(listing.price), asc(listing.id)),
     select({
       id: listing.id,
       address: listing.address,
       neighborhoodId: listing.neighborhoodId,
       neighborhoodName: neighborhood.$.name,
-      borough: neighborhood.borough,
+      city: neighborhood.city,
       agentId: agent.id,
       agentName: agent.$.name,
-      team: agent.team,
+      brokerage: agent.brokerage,
       propertyType: listing.propertyType,
       price: listing.price,
-      bedrooms: listing.bedrooms,
-      bathrooms: listing.bathrooms,
+      beds: listing.beds,
+      baths: listing.baths,
       sqft: listing.sqft,
-      status: listing.status,
-      listedAt: listing.listedAt
+      status: listing.status
     })
-  ) as Query<ListingResult>;
+  ) as Query<ListingRow>;
 }
 
-export const allListingsQuery = listingWalkthroughQuery(allListingsFilters);
-
-export function listingLookupQuery(id: string): Query<Listing> {
-  return lookup(schema.listings, 'id', id);
-}
+export const allListingsQuery = listingListQuery(allListingFilters);
 
 const listingStatsByNeighborhood = pipe(
   from(listing),
@@ -213,103 +187,51 @@ const listingStatsByNeighborhood = pipe(
     aggregates: {
       listingCount: count(),
       activeCount: count(eq(listing.status, value('active'))),
-      underContract: any(eq(listing.status, value('under_contract'))),
-      avgPrice: avg(listing.price),
-      minPrice: min(listing.price),
-      maxPrice: max(listing.price)
+      averagePrice: avg(listing.price),
+      highestPrice: max(listing.price)
     }
   }),
   select({
     neighborhoodId: field<string>('row', 'neighborhoodId'),
     listingCount: field<number>('row', 'listingCount'),
     activeCount: field<number>('row', 'activeCount'),
-    underContract: field<boolean>('row', 'underContract'),
-    avgPrice: field<number>('row', 'avgPrice'),
-    minPrice: field<number>('row', 'minPrice'),
-    maxPrice: field<number>('row', 'maxPrice')
+    averagePrice: field<number>('row', 'averagePrice'),
+    highestPrice: field<number>('row', 'highestPrice')
   })
 );
 
-const market = as(listingStatsByNeighborhood, 'market');
+const marketStats = as(listingStatsByNeighborhood, 'marketStats');
 
-export const neighborhoodMarketSummaryQuery = pipe(
+export const marketSummaryQuery = pipe(
   from(neighborhood),
-  leftJoin(market, clauses<Neighborhood, QueryRow<typeof listingStatsByNeighborhood>>({ id: 'neighborhoodId' })),
+  leftJoin(marketStats, clauses<Neighborhood, QueryRow<typeof listingStatsByNeighborhood>>({ id: 'neighborhoodId' })),
   sort(asc(neighborhood.$.name), asc(neighborhood.id)),
   select({
     neighborhoodId: neighborhood.id,
     neighborhoodName: neighborhood.$.name,
-    borough: neighborhood.borough,
-    listingCount: maybe(market.listingCount),
-    activeCount: maybe(market.activeCount),
-    underContract: maybe(market.underContract),
-    avgPrice: maybe(market.avgPrice),
-    minPrice: maybe(market.minPrice),
-    maxPrice: maybe(market.maxPrice),
+    city: neighborhood.city,
     medianPrice: neighborhood.medianPrice,
-    inventory: neighborhood.inventory,
-    daysOnMarket: neighborhood.daysOnMarket,
-    walkScore: neighborhood.walkScore
+    walkScore: neighborhood.walkScore,
+    listingCount: maybe(marketStats.listingCount),
+    activeCount: maybe(marketStats.activeCount),
+    averagePrice: maybe(marketStats.averagePrice),
+    highestPrice: maybe(marketStats.highestPrice)
   })
 ) as Query<MarketSummaryRow>;
 
-export const openHouseScheduleQuery = openHouseJoinQuery(false);
-
-export function openHouseJoinQuery(brokerOnly: boolean): Query<OpenHouseScheduleRow> {
-  const joined = pipe(
-    from(openHouse),
-    join(from(listing), eq(openHouse.listingId, listing.id)),
-    join(from(agent), eq(openHouse.hostAgentId, agent.id)),
-    join(from(neighborhood), eq(listing.neighborhoodId, neighborhood.id))
-  );
-  const filtered = brokerOnly ? pipe(joined, where(eq(openHouse.brokerOnly, value(true)))) : joined;
-
-  return pipe(
-    filtered,
-    sort(asc(openHouse.date), asc(openHouse.startsAt), asc(openHouse.id)),
-    select({
-      id: openHouse.id,
-      listingId: openHouse.listingId,
-      address: listing.address,
-      neighborhoodName: neighborhood.$.name,
-      hostAgent: agent.$.name,
-      date: openHouse.date,
-      startsAt: openHouse.startsAt,
-      expectedVisitors: openHouse.expectedVisitors,
-      brokerOnly: openHouse.brokerOnly
-    })
-  ) as Query<OpenHouseScheduleRow>;
-}
-
-export function topPricedListingsQuery(countValue: number, status: ListingStatus | 'all'): Query<TopListingRow> {
-  const filtered = status === 'all'
-    ? joinedListings
-    : pipe(joinedListings, where(eq(listing.status, value(status))));
-
-  return pipe(
-    filtered,
-    sortLimit(countValue, desc(listing.price), asc(listing.id)),
-    select({
-      id: listing.id,
-      address: listing.address,
-      neighborhoodName: neighborhood.$.name,
-      agentName: agent.$.name,
-      price: listing.price,
-      bedrooms: listing.bedrooms,
-      status: listing.status
-    })
-  ) as Query<TopListingRow>;
-}
-
-const inquiryCounts = pipe(
+const inquiryStats = pipe(
   from(inquiry),
   agg({
     groupBy: { listingId: inquiry.listingId },
-    aggregates: { inquiryCount: count() }
+    aggregates: {
+      inquiryCount: count(),
+      qualifiedInquiries: count(eq(inquiry.status, value('qualified')))
+    }
   }),
   select({
     listingId: field<string>('row', 'listingId'),
-    inquiryCount: field<number>('row', 'inquiryCount')
+    inquiryCount: field<number>('row', 'inquiryCount'),
+    qualifiedInquiries: field<number>('row', 'qualifiedInquiries')
   })
 );
 
@@ -318,54 +240,58 @@ const offerStats = pipe(
   agg({
     groupBy: { listingId: offer.listingId },
     aggregates: {
-      submittedOffers: count(),
+      offerCount: count(),
       topOffer: max(offer.amount)
     }
   }),
   select({
     listingId: field<string>('row', 'listingId'),
-    submittedOffers: field<number>('row', 'submittedOffers'),
+    offerCount: field<number>('row', 'offerCount'),
     topOffer: field<number>('row', 'topOffer')
   })
 );
 
-const inquirySummary = as(inquiryCounts, 'inquirySummary');
-const offerSummary = as(offerStats, 'offerSummary');
+const inquiriesByListing = as(inquiryStats, 'inquiriesByListing');
+const offersByListing = as(offerStats, 'offersByListing');
 
 export const pipelineByListingQuery = pipe(
   from(listing),
   join(from(agent), eq(listing.agentId, agent.id)),
-  leftJoin(inquirySummary, clauses<Listing, QueryRow<typeof inquiryCounts>>({ id: 'listingId' })),
-  leftJoin(offerSummary, clauses<Listing, QueryRow<typeof offerStats>>({ id: 'listingId' })),
+  leftJoin(inquiriesByListing, clauses<Listing, QueryRow<typeof inquiryStats>>({ id: 'listingId' })),
+  leftJoin(offersByListing, clauses<Listing, QueryRow<typeof offerStats>>({ id: 'listingId' })),
   sort(desc(listing.price), asc(listing.id)),
   select({
     listingId: listing.id,
     address: listing.address,
-    price: listing.price,
     agentName: agent.$.name,
-    inquiryCount: maybe(inquirySummary.inquiryCount),
-    submittedOffers: maybe(offerSummary.submittedOffers),
-    topOffer: maybe(offerSummary.topOffer)
+    status: listing.status,
+    price: listing.price,
+    inquiryCount: maybe(inquiriesByListing.inquiryCount),
+    qualifiedInquiries: maybe(inquiriesByListing.qualifiedInquiries),
+    offerCount: maybe(offersByListing.offerCount),
+    topOffer: maybe(offersByListing.topOffer)
   })
 ) as Query<PipelineRow>;
 
-export const offerBookQuery = pipe(
-  from(offer),
-  join(from(listing), eq(offer.listingId, listing.id)),
-  sort(desc(offer.submittedAt), asc(offer.id)),
+export const viewingScheduleQuery = pipe(
+  from(viewing),
+  join(from(listing), eq(viewing.listingId, listing.id)),
+  join(from(agent), eq(viewing.agentId, agent.id)),
+  join(from(neighborhood), eq(listing.neighborhoodId, neighborhood.id)),
+  sort(asc(viewing.date), asc(viewing.time), asc(viewing.id)),
   select({
-    id: offer.id,
-    listingId: offer.listingId,
+    id: viewing.id,
+    listingId: viewing.listingId,
+    date: viewing.date,
+    time: viewing.time,
+    buyerName: viewing.buyerName,
     address: listing.address,
-    buyerName: offer.buyerName,
-    amount: offer.amount,
-    financing: offer.financing,
-    contingencies: maybe(offer.contingencies),
-    status: offer.status,
-    submittedAt: offer.submittedAt,
-    listPrice: listing.price
+    neighborhoodName: neighborhood.$.name,
+    agentName: agent.$.name,
+    status: viewing.status,
+    virtual: viewing.virtual
   })
-);
+) as Query<ViewingScheduleRow>;
 
 export const inquiryQueueQuery = pipe(
   from(inquiry),
@@ -375,52 +301,34 @@ export const inquiryQueueQuery = pipe(
   select({
     id: inquiry.id,
     listingId: inquiry.listingId,
+    buyerName: inquiry.buyerName,
     address: listing.address,
     agentName: agent.$.name,
-    buyerName: inquiry.buyerName,
     budget: inquiry.budget,
-    financing: inquiry.financing,
     status: inquiry.status,
-    createdAt: inquiry.createdAt,
-    notes: maybe(inquiry.notes)
+    createdAt: inquiry.createdAt
   })
-);
+) as Query<InquiryQueueRow>;
 
-export const listingIndexRows = pipe(
-  from(listing),
+export const offerBookQuery = pipe(
+  from(offer),
+  join(from(listing), eq(offer.listingId, listing.id)),
+  sort(desc(offer.submittedAt), asc(offer.id)),
   select({
-    id: listing.id,
+    id: offer.id,
+    listingId: offer.listingId,
+    buyerName: offer.buyerName,
     address: listing.address,
-    neighborhoodId: listing.neighborhoodId,
-    price: listing.price,
-    bedrooms: listing.bedrooms,
-    status: listing.status
+    listPrice: listing.price,
+    amount: offer.amount,
+    status: offer.status,
+    submittedAt: offer.submittedAt
   })
-) as Query<ListingIndexRow>;
-
-export const listingsByNeighborhoodIndex = pipe(
-  listingIndexRows,
-  hash(field<string>('row', 'neighborhoodId'))
-) as Query<ListingIndexRow>;
-
-export const listingsByPriceIndex = pipe(
-  listingIndexRows,
-  btree(field<number>('row', 'price'))
-) as Query<ListingIndexRow>;
-
-export const listingsByIdIndex = pipe(
-  listingIndexRows,
-  uniqueIndex(field<string>('row', 'id'))
-) as Query<ListingIndexRow>;
+) as Query<OfferBookRow>;
 
 export const queryLabels = {
-  listings: queryKey(listingWalkthroughQuery(defaultFilters)),
-  allListings: queryKey(allListingsQuery),
-  market: queryKey(neighborhoodMarketSummaryQuery),
-  openHouses: queryKey(openHouseScheduleQuery),
+  listings: queryKey(listingListQuery(defaultListingFilters)),
+  market: queryKey(marketSummaryQuery),
   pipeline: queryKey(pipelineByListingQuery),
-  byNeighborhoodIndex: queryKey(listingsByNeighborhoodIndex),
-  byPriceIndex: queryKey(listingsByPriceIndex)
+  viewings: queryKey(viewingScheduleQuery)
 } as const;
-
-type QueryRow<Input> = Input extends Query<infer Row> ? Row : never;

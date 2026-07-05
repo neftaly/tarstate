@@ -11,6 +11,7 @@
   "scripts": {
     "bench": "pnpm --filter @tarstate/core --filter @tarstate/automerge --filter @tarstate/react bench",
     "build": "pnpm -r build",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "dev": "pnpm -r --filter './apps/*' --parallel dev",
     "lint": "oxlint . --deny-warnings --type-aware",
     "relic:oracle": "TARSTATE_RELIC_ORACLE=1 pnpm --filter @tarstate/core exec vitest run --config ../../vite.config.ts tests/relic-oracle.test.ts",

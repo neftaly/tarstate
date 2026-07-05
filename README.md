@@ -10,6 +10,19 @@ Tarstate is a TypeScript adaptation of
 [wotbrew/relic](https://github.com/wotbrew/relic), after
 [Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf), with an additional schema protocol and IDE/agentic tooling.
 
+## Development
+
+Use Node.js 24.12 or newer and pnpm 10.33.2. With Corepack:
+
+```sh
+corepack enable
+pnpm install
+pnpm dev
+pnpm check
+```
+
+The real estate example lives in `apps/real-estate`.
+
 ## Schemas
 
 Schemas are JSON-compatible manifests that describe the shape of data.
