@@ -198,12 +198,67 @@ const openingDb = createDb({
 });
 
 describe('public API contracts', () => {
-  it('keeps schema JSON validation on JSON-compatible values only', () => {
+  it('keeps schema JSON boundary on JSON-compatible values only', () => {
     expect(isJsonValue({ nested: ['value', 1, true, null] })).toBe(true);
     expect(isJsonValue([1, { ok: false }])).toBe(true);
+    expect(isJsonValue(Number.MAX_SAFE_INTEGER)).toBe(true);
     expect(isJsonValue(() => undefined)).toBe(false);
     expect(isJsonValue({ callback: () => undefined })).toBe(false);
     expect(isJsonValue(undefined)).toBe(false);
+    expect(isJsonValue(Number.NaN)).toBe(false);
+    expect(isJsonValue(Number.POSITIVE_INFINITY)).toBe(false);
+    expect(isJsonValue(Number.NEGATIVE_INFINITY)).toBe(false);
+    expect(isJsonValue(new Date('2026-01-01T00:00:00.000Z'))).toBe(false);
+    expect(isJsonValue(new Map())).toBe(false);
+    expect(isJsonValue(new Set())).toBe(false);
+    expect(isJsonValue(new Uint8Array([1]))).toBe(false);
+
+    const nullPrototypeRecord = Object.create(null) as Record<string, unknown>;
+    nullPrototypeRecord.ok = true;
+    expect(isJsonValue(nullPrototypeRecord)).toBe(true);
+
+    class Box {
+      readonly value = 'not plain JSON';
+    }
+    expect(isJsonValue(new Box())).toBe(false);
+
+    const sparseArray: unknown[] = [];
+    sparseArray[1] = 'present';
+    expect(isJsonValue(sparseArray)).toBe(false);
+
+    const arrayWithExtraProperty = [1] as unknown[] & { extra?: string };
+    arrayWithExtraProperty.extra = 'dropped by JSON.stringify';
+    expect(isJsonValue(arrayWithExtraProperty)).toBe(false);
+
+    const cyclicRecord: Record<string, unknown> = {};
+    cyclicRecord.self = cyclicRecord;
+    expect(isJsonValue(cyclicRecord)).toBe(false);
+
+    let accessorInvoked = false;
+    const recordWithAccessor = {};
+    Object.defineProperty(recordWithAccessor, 'value', {
+      enumerable: true,
+      get() {
+        accessorInvoked = true;
+        return 'not read';
+      }
+    });
+    expect(isJsonValue(recordWithAccessor)).toBe(false);
+    expect(accessorInvoked).toBe(false);
+
+    const hostileRecord = new Proxy({}, {
+      ownKeys() {
+        throw new Error('do not inspect me');
+      }
+    });
+    expect(isJsonValue(hostileRecord)).toBe(false);
+
+    const hostileArray = new Proxy([1], {
+      getOwnPropertyDescriptor() {
+        throw new Error('do not inspect me');
+      }
+    });
+    expect(isJsonValue(hostileArray)).toBe(false);
   });
 
   it('exposes relation deltas from the delta subpath', () => {

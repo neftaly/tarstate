@@ -99,11 +99,65 @@ export const nullable = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | null>
 export const optional = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | undefined> => ({ ...spec, optional: true });
 
 export function isJsonValue(input: unknown): input is JsonValue {
-  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') return true;
-  if (Array.isArray(input)) return input.every(isJsonValue);
-  return isRecord(input) && Object.values(input).every(isJsonValue);
+  return isJsonValueInternal(input, new Set<object>());
 }
 
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
+function isJsonValueInternal(input: unknown, seen: Set<object>): input is JsonValue {
+  if (input === null || typeof input === 'string' || typeof input === 'boolean') return true;
+  if (typeof input === 'number') return Number.isFinite(input);
+  if (Array.isArray(input)) return isJsonArray(input, seen);
+  return isPlainJsonObject(input, seen);
+}
+
+function isJsonArray(input: readonly unknown[], seen: Set<object>): input is readonly JsonValue[] {
+  if (seen.has(input)) return false;
+  seen.add(input);
+  try {
+    const length = input.length;
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, index);
+      if (!descriptor?.enumerable || !('value' in descriptor)) return false;
+      if (!isJsonValueInternal(descriptor.value, seen)) return false;
+    }
+
+    for (const key of Reflect.ownKeys(input)) {
+      if (key === 'length') continue;
+      if (typeof key !== 'string' || !isArrayIndexKey(key) || Number(key) >= length) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    seen.delete(input);
+  }
+}
+
+function isArrayIndexKey(key: string): boolean {
+  const index = Number(key);
+  return Number.isInteger(index) && index >= 0 && String(index) === key;
+}
+
+function isPlainJsonObject(input: unknown, seen: Set<object>): input is { readonly [key: string]: JsonValue } {
+  if (typeof input !== 'object' || input === null) return false;
+
+  if (seen.has(input)) return false;
+
+  try {
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+
+    seen.add(input);
+    for (const key of Reflect.ownKeys(input)) {
+      if (typeof key !== 'string') return false;
+
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (!descriptor?.enumerable || !('value' in descriptor)) return false;
+      if (!isJsonValueInternal(descriptor.value, seen)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    seen.delete(input);
+  }
 }
