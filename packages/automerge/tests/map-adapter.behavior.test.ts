@@ -1775,6 +1775,69 @@ describe('automerge map adapter', () => {
     ]);
   });
 
+  it('queries schemas over rewound Automerge heads and forks edits from old state', async () => {
+    let doc = workspaceDoc([{ id: 'task-1', title: 'Draft', effort: 1 }]);
+    const baseHeads = Automerge.getHeads(doc);
+
+    doc = Automerge.change(doc, (draft) => {
+      (draft.workspace.tasks as TaskRow[]).push({ id: 'task-live', title: 'Live branch', effort: 5 });
+    });
+
+    const liveSource = automergeMapSource(doc, { relations: allMappings });
+    const oldDoc = automergeView(doc, baseHeads);
+    const oldSource = automergeMapSource(oldDoc, { relations: allMappings });
+    const activeTasks = pipe(
+      from(schema.tasks),
+      where(gte(field<number>('tasks', 'effort'), value(2))),
+      project({
+        id: field<string>('tasks', 'id'),
+        title: field<string>('tasks', 'title')
+      })
+    );
+
+    expect(liveSource.version?.()).toEqual(Automerge.getHeads(doc));
+    expect(oldSource.version?.()).toEqual(baseHeads);
+    expect(evaluate(liveSource, activeTasks)).toEqual({
+      rows: [{ id: 'task-live', title: 'Live branch' }],
+      diagnostics: []
+    });
+    expect(evaluate(oldSource, activeTasks)).toEqual({ rows: [], diagnostics: [] });
+    expect(oldSource.rows(schema.labels)).toEqual([{ id: 'label-1', name: 'Urgent' }]);
+
+    const forkAdapter = automergeMapAdapter({
+      doc: automergeFork(oldDoc),
+      relations: allMappings
+    });
+    const forkResult = await forkAdapter.target.apply([
+      write(schema.tasks).insert({ id: 'task-fork', title: 'Fork branch', effort: 3 })
+    ]);
+
+    expect(forkResult).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(evaluate(forkAdapter.source, activeTasks)).toEqual({
+      rows: [{ id: 'task-fork', title: 'Fork branch' }],
+      diagnostics: []
+    });
+    expect(evaluate(liveSource, activeTasks)).toEqual({
+      rows: [{ id: 'task-live', title: 'Live branch' }],
+      diagnostics: []
+    });
+
+    const merged = automergeMerge(doc, forkAdapter.getDoc());
+    const backdated = automergeChangeAt(merged, baseHeads, (draft) => {
+      (draft.workspace.tasks as TaskRow[]).push({ id: 'task-at', title: 'Backdated branch', effort: 4 });
+    }, 'backdated task');
+    const mergedSource = automergeMapSource(backdated.newDoc, { relations: allMappings });
+    const taskIds = mergedSource.rows(schema.tasks)
+      .map((row) => (row as TaskRow).id)
+      .sort();
+
+    expect(backdated.newHeads).not.toBeNull();
+    expect(taskIds).toEqual(['task-1', 'task-at', 'task-fork', 'task-live']);
+    expect(automergeMapSource(automergeView(backdated.newDoc, baseHeads), { relations: allMappings })
+      .rows(schema.tasks))
+      .toEqual([{ id: 'task-1', title: 'Draft', effort: 1 }]);
+  });
+
   it('reports object ids and conflicts at explicit Automerge paths', () => {
     const base = workspaceDoc();
     const left = Automerge.change(automergeFork(base), (draft) => {
