@@ -234,6 +234,16 @@ describe('public API contracts', () => {
     cyclicRecord.self = cyclicRecord;
     expect(isJsonValue(cyclicRecord)).toBe(false);
 
+    let sharedDescriptorReads = 0;
+    const sharedSubtree = new Proxy({ ok: true }, {
+      getOwnPropertyDescriptor(target, property) {
+        sharedDescriptorReads += 1;
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      }
+    });
+    expect(isJsonValue({ left: sharedSubtree, right: sharedSubtree, nested: [sharedSubtree, sharedSubtree] })).toBe(true);
+    expect(sharedDescriptorReads).toBe(1);
+
     let accessorInvoked = false;
     const recordWithAccessor = {};
     Object.defineProperty(recordWithAccessor, 'value', {

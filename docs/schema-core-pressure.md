@@ -29,6 +29,7 @@ Separate these concerns:
 | Schema evolution lenses | No | Evolution connects immutable schema nodes. |
 | EDN/YAML authoring | No | Authoring syntax should compile to the canonical JSON-compatible manifest. |
 | JSON Schema export | No | Generated artifact, not source of truth. |
+| DBML/SQL/GraphQL/Avro/Protobuf/DDlog/Souffle export | No | Interop surfaces should be generated from the manifest, not mixed into row meaning. |
 | Generated TypeScript | No | Generated artifact, not source of truth. |
 | Physical storage layout | No | Adapter concern. |
 
@@ -313,6 +314,63 @@ Assessment:
 These are implementation-surface clarifications. They make the core format
 easier to implement without expanding the manifest shape.
 
+### 2.10 External Format Pressure
+
+Pressure:
+
+- DDlog, Souffle, Flix, Rel, Datomic, Ciao, Mercury, Tutorial D, and typed
+  miniKanren variants all offer useful relational or logic-programming design
+  lessons
+- DBML and SQL DDL closely resemble relation catalogs with fields, keys, and refs
+- JSON Schema, OpenAPI, GraphQL SDL, Avro, Protobuf, and CUE have much stronger
+  existing tooling than a custom Tarstate manifest
+- generated artifacts may want field aliases, reserved names, field numbers,
+  schema-resolution hints, nullability conventions, indexes, foreign keys, or
+  API resolver metadata
+
+Current spec answer:
+
+- `tarstate.schema` is the canonical source format
+- EDN/YAML/CUE/DSL authoring compiles into the canonical manifest
+- JSON Schema, SQL/DBML, GraphQL, Avro, Protobuf, DDlog, Souffle, and similar
+  formats are generated artifacts or import targets
+- the v1 manifest reserves semantic layers for constraints, queries, indexes,
+  topology, capabilities, and evolution rather than embedding target-format
+  concepts directly
+
+Assessment:
+
+Do not adopt an external format as the v1 source of truth. Every surveyed format
+either lacks Tarstate's relation-key-ref-codec-evolution contract, brings a
+storage/API execution model into base row shape, or changes nullability and
+unknown-data semantics. The right design is a narrow canonical core with explicit
+projections.
+
+The survey does add prototype priorities:
+
+- implement manifest import/export/hydration before adding rich field types
+- add structured ref authoring before relying on manifest export
+- treat DBML/SQL/GraphQL/JSON Schema/Avro/Protobuf/DDlog/Souffle as explicit
+  generator APIs, not implicit adapter behavior
+- preserve the difference between Tarstate `ref` and SQL foreign-key constraints
+- keep assertions, query modes, determinism, and integrity constraints outside
+  base field manifests
+
+Pressure scenarios:
+
+- an app wants DBML diagrams or SQL DDL for its Tarstate schema
+- a service wants OpenAPI or GraphQL generated from Tarstate relations
+- a logic-programming experiment wants DDlog or Souffle declarations from the
+  same schema
+- a Clojure-adjacent tool wants EDN authoring without changing the canonical
+  bytes
+- Protobuf/Avro generation wants stable field numbers or aliases that v1 does
+  not carry
+
+The spec survives if generation can be lossy only when the target artifact is
+clearly marked as a projection, and round-tripping is accepted only through
+Tarstate metadata or a target-specific import profile.
+
 ## 3. Pressures That Belong Outside Core
 
 These cases are important, but adding them to `SchemaManifestV1` would complect
@@ -420,6 +478,24 @@ validation diagnostics, logical row-key identity, structured refs, strict row
 validation, and portable custom codec names. It does not require core v1 to know
 about service workers, Automerge, app manifests, or process boundaries.
 
+### 3.7 External Authoring And Generated Artifacts
+
+Examples:
+
+- DDlog-like or DBML-like Tarstate DSL
+- EDN authoring for Relic/Clojure users
+- CUE authoring for constraint-heavy teams
+- JSON Schema validators for relation rows
+- SQL DDL, DBML diagrams, GraphQL SDL, OpenAPI, Avro, Protobuf, DDlog, Souffle,
+  Datomic/DataScript, or XTDB artifacts
+
+Why outside core:
+
+These formats optimize for their own execution models: SQL storage, API
+resolution, record serialization, Datalog programs, CUE constraints, or EAV
+facts. Tarstate can project into them, but core row meaning should not inherit
+their defaults for nullability, identity, refs, indexes, or unknown fields.
+
 ## 4. Scenario Matrix
 
 | Scenario | Core V1 Requirement | Later-Layer Requirement |
@@ -436,6 +512,9 @@ about service workers, Automerge, app manifests, or process boundaries.
 | Knowledge graph bridge | ids, refs, custom semantic ids | open-world linking and semantic extension layer |
 | CRDT rich text | custom codec for text/ranges/object ids | topology, codec capabilities, merge semantics |
 | Stream current state | event rows | derived current-state relation and stream binding |
+| DBML or SQL schema docs | relations, fields, key fields, structured refs | generator profiles, SQL dialects, nullable/default mapping |
+| OpenAPI or GraphQL API | field types, optional/nullable flags, codec scalar names | resolver bindings, endpoint/mutation/query design |
+| DDlog or Souffle experiment | relation names, field types, key metadata as comments or declarations | rule generation, input/output choice, target type restrictions |
 
 ## 5. Core Spec Edits Applied In This Pass
 
@@ -468,6 +547,10 @@ These clarifications were folded back into `docs/schema-spec.md`:
 None of these added a new field type or changed the core manifest's layer
 boundary.
 
+The later external-format survey did not force a core spec change. It reinforced
+the existing boundary: add explicit generators and authoring compilers around the
+manifest instead of widening `SchemaManifestV1`.
+
 ## 6. Pressures Still Open
 
 These are real but not yet accepted as v1 changes:
@@ -491,6 +574,8 @@ High confidence:
 
 - core v1 should stay a small relation catalog
 - canonical JSON-compatible data remains the source format
+- external formats are authoring surfaces, generated artifacts, or import targets,
+  not the core source of truth
 - runtime behavior stays behind named codecs and capabilities
 - topology, constraints, derived relations, and evolution remain separate
 - strict row validation remains closed-world

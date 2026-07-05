@@ -206,6 +206,102 @@ Design lessons:
   and evolution without requiring all consumers to implement every advanced
   feature.
 
+## External Format Survey
+
+A comparison pass against functional-relational, logic, database-schema, and
+data-schema formats reinforces the same boundary: Tarstate's canonical format
+should stay a small JSON-compatible relation catalog. Other formats are useful
+as authoring languages, generated artifacts, or later query/constraint layers,
+but none should replace the v1 manifest as the source of truth.
+
+| Format family | Strongest learning | Fit for Tarstate |
+| --- | --- | --- |
+| DDlog | Typed `input relation` declarations, record-like fields, `primary key`, ADTs, extern types, and rules make it the best textual influence for a future Tarstate DSL. | Borrow syntax and generate to DDlog for rule/materialization experiments; do not adopt its program format as the manifest. |
+| Souffle | `.decl` relation signatures and subtype/union/record/ADT support are good for static analysis and generated Datalog programs. | Generate to Souffle when useful; it lacks native keys, refs, codecs, canonicalization, and evolution semantics. |
+| Flix | First-class, typed Datalog constraint values are a strong model for composable future query and constraint fragments. | Borrow composition ideas for a later rule layer; not a base schema format. |
+| Rel / LogicBlox | Relations are the programming unit; base and derived relations, integrity constraints, and Graph Normal Form clarify the fact/derivation split. | Use as a semantic north star. Tarstate can optionally generate a more atomic fact projection, but v1 should keep ergonomic record-shaped relations. |
+| Datomic / DataScript | Schema as ordinary EDN data with `:db/ident`, value types, cardinality, uniqueness, docs, refs, and query-as-data is the closest Clojure-family authoring model. | Add optional EDN authoring that compiles to the canonical manifest. Do not switch to EAV as the core representation. |
+| XTDB | Dynamic document storage, SQL/XTQL querying, and temporal history are good runtime/storage influences. | Treat as a storage/query target, not a schema source, because it does not require a closed-world relation manifest. |
+| Ciao Prolog assertions | Predicate assertions separate `pred`, `calls`, `success`, `comp`, modes, and reusable regular types from implementation. | Keep base relation shape separate from future assertions, constraints, modes, and compatibility checks. |
+| Mercury | Type declarations, predicate signatures, modes, and determinism are cleanly separated. | If Tarstate grows a typed relational DSL, keep type declarations separate from relation/query signatures; defer modes/determinism. |
+| Tutorial D / relational algebra | Relation headings, domains, relvars, candidate keys, constraints, set semantics, and no SQL null/bag leakage match Tarstate's desired semantics. | Good conceptual model, weak interchange format. |
+| Typed miniKanren, OCanren, Walrus, Curry | Host-language ADTs, typed logic values, generic derivation, reification, and exhaustive matching improve relational-programming ergonomics. | Generate host bindings, reifiers, and exhaustive validators from Tarstate schemas; do not adopt miniKanren/Curry syntax for storage. |
+| DBML / SQL DDL | Tables, columns, primary keys, composite keys, refs, and diagrams map naturally to relation catalogs. | Useful authoring/export surface, but too physical and SQL-shaped to be canonical. SQL null/default/index/FK behavior must not leak into v1. |
+| JSON Schema / OpenAPI | Excellent validator and API-contract ecosystems. | Generate from Tarstate for row validation and HTTP docs. Relation identity, refs, codecs, and lenses need Tarstate semantics, not custom JSON Schema keywords as source of truth. |
+| Avro / Protobuf | Canonical forms, schema resolution, aliases, field numbers, reserved names, unknown-field behavior, and code generation are useful evolution lessons. | Generate artifacts and borrow evolution discipline. Do not add field numbers to v1 solely to mimic Protobuf. |
+| GraphQL SDL | Good public API type surface with custom scalars, `ID`, descriptions, deprecation, and introspection. | Generate API schemas. GraphQL is nullable-by-default and resolver-driven, not a normalized base-state schema. |
+| CUE | Constraint unification and order-independent composition are excellent for authoring and validation. | Consider a Tarstate CUE package that emits canonical JSON. CUE refs and constraints are not relation refs. |
+
+Reference sources for the survey include the DDlog language reference, Souffle
+relations and types docs, Flix fixpoints docs, the Rel paper and Rel base
+relation docs, Datomic schema reference, DataScript README, XTDB overview and
+XTQL docs, Ciao assertions/regtypes/modes docs, Mercury types and modes docs,
+DBML syntax docs, PostgreSQL constraint docs, JSON Schema core/validation docs,
+OpenAPI specification, Avro specification, Protobuf proto3 guide, GraphQL type
+system spec, and the CUE introduction/spec.
+
+### Learnings For The Schema Prototype
+
+The prototype should optimize for a disciplined center plus cheap projections:
+
+- Implement `toSchemaManifest`, `validateSchemaManifest`,
+  `canonicalSchemaManifest`, `stringifyCanonicalSchemaManifest`, and
+  `hydrateSchemaManifest` before adding richer field types. Most external formats
+  become useful only after Tarstate has one reliable center to import/export.
+- Keep JSON-compatible manifest data canonical, but allow authoring frontends:
+  a DDlog/DBML-like Tarstate DSL, EDN for Relic/Clojure users, and possibly CUE
+  for constraint-heavy teams. These must compile to the same canonical manifest.
+- Add structured ref authoring early. String shorthands like `"agents.id"` are
+  convenient, but several surveyed formats show that qualified names and composite
+  keys become ambiguous quickly.
+- Treat DBML, SQL DDL, JSON Schema, Avro, Protobuf, GraphQL SDL, OpenAPI,
+  Souffle, DDlog, and Datomic/DataScript as generated artifacts or import targets.
+  Round-tripping is allowed only when the target can preserve Tarstate semantics
+  or carry explicit Tarstate metadata.
+- Do not make Graph Normal Form or 6NF the canonical model for v1. A generated
+  fact projection may be valuable for provenance, diffs, sync, lenses, or
+  analysis, but authors should not have to split every record field into its own
+  relation.
+- Add an `assertions` or `constraints` layer later rather than growing base field
+  manifests with every useful invariant. Ciao, Mercury, SQL, Rel, and JSON Schema
+  all point to the same split: field shape and integrity predicates evolve at
+  different rates.
+- Borrow Avro/Protobuf evolution discipline without copying their identity model.
+  V1 can keep names-plus-`schemaId` and explicit lenses; `relationId`/`fieldId`
+  remain reserved until real rename histories prove they are needed.
+
+### API And Behavior Implications
+
+External formats should not change the runtime behavior of base Tarstate
+relations by accident.
+
+- Builder APIs should remain the best TypeScript authoring path. Manifest APIs
+  should be explicit import/export/hydration boundaries, not a replacement for
+  `defineSchema` in application code.
+- `refField` should gain a structured overload such as
+  `refField({ relation, field })`. String shorthand can remain authoring sugar,
+  but export must reject ambiguous strings instead of guessing.
+- Custom field APIs should separate portable codec identity from executable
+  behavior. The manifest should name codecs; hydration should resolve runtime
+  validators, key functions, scalar conversions, comparators, and reifiers.
+- Row validation should stay Tarstate-defined: required by default, optional and
+  nullable separate, present `undefined` invalid, extra fields invalid in strict
+  validation. Do not inherit nullable-by-default behavior from SQL, DBML, or
+  GraphQL.
+- `ref` should remain a typed scalar reference in v1, not a full SQL foreign-key
+  constraint. Existence checks, cascades, composite foreign keys, and unique
+  non-key references belong in the later constraints/assertions layer.
+- Generated JSON Schema/OpenAPI/GraphQL/SQL should advertise their semantic loss
+  clearly. For example, a GraphQL `ID!` or SQL `TEXT NOT NULL` column is only a
+  projection of Tarstate `id` semantics unless Tarstate metadata is preserved.
+- Tarstate APIs should eventually expose generators as explicit tools, for
+  example `toJsonSchema`, `toDbml`, `toSqlDdl`, `toGraphqlSdl`, `toAvro`,
+  `toProtobuf`, `toDatalog`, and `toEdn`, rather than making adapters infer these
+  projections ad hoc.
+- Query, derived-relation, assertion, topology, and evolution manifests should
+  compose with schema manifests by `schemaId` and relation names. They should not
+  be hidden inside base relation definitions.
+
 ## Extensions And Capabilities
 
 The manifest needs an extension story because Tarstate is a paradigm surface,
