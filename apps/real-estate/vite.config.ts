@@ -10,6 +10,7 @@ const sourceAlias = (find: string, replacement: string) => ({
 });
 
 export default defineConfig({
+  base: process.env.TARSTATE_SITE_BASE ?? '/',
   clearScreen: false,
   build: {
     target: 'safari17'

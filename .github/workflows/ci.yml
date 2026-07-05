@@ -29,3 +29,45 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
+
+  build-site:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: quality
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      pages: write
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.0.9
+        with:
+          run_install: false
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - uses: actions/configure-pages@v6.0.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @tarstate/example-real-estate build
+        env:
+          TARSTATE_SITE_BASE: /tarstate/
+      - uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: apps/real-estate/dist
+
+  deploy-site:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-site
+    runs-on: ubuntu-26.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5.0.0
