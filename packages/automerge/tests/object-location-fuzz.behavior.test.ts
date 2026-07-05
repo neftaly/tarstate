@@ -281,7 +281,7 @@ function assertObjectLocationInvariants(
         objectId: runtimeLocation.objectId,
         path: runtimeLocation.pathSegments,
         relation: runtimeLocation.relation,
-        key: runtimeLocation.key
+        key: runtimeLocation.$.key
       })
     );
 

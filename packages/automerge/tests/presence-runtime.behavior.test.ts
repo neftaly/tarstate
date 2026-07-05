@@ -171,6 +171,35 @@ describe('automerge presence runtime', () => {
     expect(notifications).toBe(2);
   });
 
+  it('pins presence snapshot sources to captured runtime revision', async () => {
+    const runtime = automergePresenceRuntime({
+      handle: realDocHandle(),
+      relation: schema.presence,
+      fields,
+      localPeerId: 'peer-local',
+      includeLocalRows: true,
+      initialState: { color: 'blue' } satisfies PresenceChannels
+    });
+    runtime.start();
+
+    const snapshot = runtime.snapshot();
+    const result = await runtime.target.apply([
+      write(schema.presence).insertOrReplace({ peer: 'peer-local', topic: 'color', payload: 'red' })
+    ]);
+
+    expect(result).toMatchObject({ status: 'accepted', applied: 1 });
+    expect(snapshot.version).toMatchObject({ revision: 1, localPeerId: 'peer-local' });
+    expect(snapshot.source.version?.()).toEqual(snapshot.version);
+    expect(snapshot.source.rows(schema.presence)).toMatchObject([
+      { peer: 'peer-local', topic: 'color', payload: 'blue', isLocal: true }
+    ]);
+    expect(runtime.source.rows(schema.presence)).toMatchObject([
+      { peer: 'peer-local', topic: 'color', payload: 'red', isLocal: true }
+    ]);
+
+    runtime.stop();
+  });
+
   it('applies writable presence patches to local state only', async () => {
     const runtime = automergePresenceRuntime({
       handle: realDocHandle(),

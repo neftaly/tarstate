@@ -30,6 +30,12 @@ type Account = {
   readonly kind: string;
 };
 
+type KeyedItem = {
+  readonly id: string;
+  readonly key: string;
+  readonly label: string;
+};
+
 type QueryRow<Input> = Input extends Query<infer Row> ? Row : never;
 
 const schema = defineSchema({
@@ -39,6 +45,14 @@ const schema = defineSchema({
       id: stringField(),
       name: stringField(),
       kind: stringField()
+    }
+  }),
+  keyedItems: relation<KeyedItem>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      key: stringField(),
+      label: stringField()
     }
   })
 });
@@ -69,6 +83,30 @@ describe('query API contracts', () => {
     expectTypeOf(named.$.name).toEqualTypeOf<ExprData<string>>();
     // @ts-expect-error Colliding field names must use the namespace.
     expect(named.name).toBeUndefined();
+  });
+
+  it('keeps aliased row fields named key in the $ namespace', () => {
+    const item = as(schema.keyedItems, 'item');
+    const keyedRows = pipe(
+      from(item),
+      project({
+        id: item.id,
+        key: item.$.key,
+        label: item.label
+      })
+    );
+
+    expect(item.key).toBe('id');
+    expect(item.$.key).toEqual(field('item', 'key'));
+    expect(from(item).relations.keyedItems?.key).toBe('id');
+    expect(keyedRows.data).toMatchObject({
+      op: 'project',
+      projection: {
+        key: field('item', 'key')
+      }
+    });
+    expectTypeOf(item.$.key).toEqualTypeOf<ExprData<string>>();
+    expectTypeOf<QueryRow<typeof keyedRows>>().toEqualTypeOf<Pick<KeyedItem, 'id' | 'key' | 'label'>>();
   });
 
   it('tracks row-shape transform types for without, rename, and expand', () => {

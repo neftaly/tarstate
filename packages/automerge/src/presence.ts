@@ -162,10 +162,19 @@ export function automergePresenceRuntime<
     rows,
     version
   };
-  const snapshot = (): AdapterSnapshot<AutomergePresenceVersion> => ({
-    source,
-    version: version()
-  });
+  const snapshot = (): AdapterSnapshot<AutomergePresenceVersion> => {
+    const snapshotVersion = version();
+    const snapshotRows = rows(options.relation);
+
+    return {
+      source: {
+        relationNames: source.relationNames,
+        rows: (relation) => relation.name === options.relation.name ? snapshotRows : [],
+        version: () => snapshotVersion
+      },
+      version: snapshotVersion
+    };
+  };
   const subscribe = (listener: () => void) => {
     listeners.add(listener);
     return () => {

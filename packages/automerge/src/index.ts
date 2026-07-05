@@ -512,11 +512,24 @@ function createAutomergeMapAdapter<
     if (!headsEqual(previousHeads, Automerge.getHeads(driver.getDoc()))) notify();
   };
   const snapshot = (): AdapterSnapshot<Automerge.Heads> => {
-    const version = Automerge.getHeads(driver.getDoc());
-    const diagnostics = source.diagnostics?.() ?? [];
+    const doc = driver.getDoc();
+    const version = Automerge.getHeads(doc);
+    const snapshotDataSource = createAutomergeMapSource(() => doc, options.relations);
+    const snapshotSource = withAutomergeSystemSource(
+      () => doc,
+      snapshotDataSource,
+      options.relations,
+      runtimeId,
+      interests,
+      options.system,
+      createObjectLocationSnapshotCache(() => doc, options.relations, runtimeId),
+      options.handle?.documentId,
+      repoSystem?.state
+    );
+    const diagnostics = snapshotSource.diagnostics?.() ?? [];
 
     return {
-      source,
+      source: snapshotSource,
       version,
       ...(diagnostics.length === 0 ? {} : { diagnostics })
     };

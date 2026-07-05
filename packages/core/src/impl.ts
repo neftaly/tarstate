@@ -169,7 +169,7 @@ type AliasedFieldAccess<Row, Alias extends string> =
   } & AliasedFlatFieldAccess<Row>;
 type RowFieldKeys<Row> = Row extends object ? keyof Row & string : never;
 type LiteralRowFieldKeys<Row> = string extends RowFieldKeys<Row> ? never : RowFieldKeys<Row>;
-type AliasedReservedField = Exclude<keyof RelationRef | keyof Query, 'key'> | 'alias' | '$';
+type AliasedReservedField = keyof RelationRef | keyof Query | 'alias' | '$';
 type AliasFieldNamespace<Row> = string extends RowFieldKeys<Row>
   ? Readonly<Record<string, ExprData<unknown>>>
   : { readonly [Field in RowFieldKeys<Row>]: ExprData<Row[Field]> };
@@ -307,7 +307,7 @@ export function as<Row, Alias extends string>(
   for (const fieldName of aliasedFieldNames(input, alias)) {
     const exprData = field(alias, fieldName);
     defineAliasProperty(namespace, fieldName, exprData);
-    if ((fieldName === 'key' || !(fieldName in target)) && !ALIASED_FIELD_RESERVED_KEYS.has(fieldName)) {
+    if (!(fieldName in target) && !ALIASED_FIELD_RESERVED_KEYS.has(fieldName)) {
       defineAliasProperty(target, fieldName, exprData);
     }
   }
@@ -10004,6 +10004,7 @@ function aggregateCall<Value = unknown>(op: AggregateFunction, ...args: readonly
 const ALIASED_FIELD_RESERVED_KEYS = new Set<string>([
   'kind',
   'name',
+  'key',
   'fields',
   'ephemeral',
   '__row',

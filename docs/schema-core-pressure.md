@@ -25,6 +25,7 @@ Separate these concerns:
 | Constraints and indexes | No | They describe integrity and access intent, not base field shape. |
 | Queries and derived relations | No | They are essential logic over relations, not base facts. |
 | Runtime topology and write routing | No | Same logical schema can be backed by many stores. |
+| Composite snapshot/version vectors | No | They select observations across runtimes; they do not change row meaning. |
 | Schema evolution lenses | No | Evolution connects immutable schema nodes. |
 | EDN/YAML authoring | No | Authoring syntax should compile to the canonical JSON-compatible manifest. |
 | JSON Schema export | No | Generated artifact, not source of truth. |
@@ -426,6 +427,7 @@ about service workers, Automerge, app manifests, or process boundaries.
 | Patchpit apps beside data | `schemaId`, strict validation, diagnostics, custom codecs, row-key identity | app schema registry, service-worker topology, schema refs, write routing |
 | Presence points at game pieces | `ephemeral`, `custom` object refs, ordinary relation schema | topology routes presence writes; evolution rewrites refs |
 | Two documents plus memory drafts | same schema language for all relations | topology/data spaces and explicit commit query |
+| Rewound doc plus live presence | object refs remain ordinary field values | snapshot vector pins document heads and presence/runtime clocks |
 | Blob-backed assets | string/custom blob handles and asset metadata | blob capability and availability constraints |
 | Vendor JSON import | `json` fields and strict diagnostics | import mapping, drift diagnostics, richer object fields |
 | Accounting ledger | finite number or string/custom decimal fields | decimal/integer types, constraints, generated validators |

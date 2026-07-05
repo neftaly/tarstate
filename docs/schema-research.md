@@ -372,6 +372,41 @@ Design consequences:
 - Object ids are data only when a codec gives them stable comparison/key
   behavior.
 
+### Composite Runtime Snapshots
+
+A composed runtime snapshot should identify one coherent observation across all
+data spaces, not just "current app state." For Automerge-backed relations, the
+snapshot coordinate is the selected document heads. For presence, connection,
+and memory spaces, the coordinate may be a runtime sequence, peer clock, session
+id, or local generation. Together these coordinates form a small version vector
+for the mixed runtime state.
+
+The snapshot source should be pinned to that observation. Holding a snapshot and
+reading it later should not silently advance to newer document heads or presence
+generations.
+
+Any runtime that participates in a replayable composite snapshot needs a version
+coordinate. If a component cannot provide one, the composed runtime can still be
+queried live, but tools should not treat its result as a complete replay token.
+
+Object-id presence resolution depends on that vector. A presence row that names
+an Automerge object id is only interpretable against the document heads selected
+for the query or snapshot. At different heads, the object may exist, be deleted,
+or expose different field values; the presence value has not changed, but its
+relation to document state has.
+
+Object ids also need a data-space coordinate. In a composed runtime, presence
+should normally identify the target runtime or document as well as the object
+id. Joining on object id alone can false-match when multiple documents,
+branches, or runtimes are present.
+
+This policy is not part of `RelationManifest`. The base relation schema defines
+row meaning, runtime topology defines which data spaces provide rows, and
+snapshot/version-vector policy defines which observations are selected from
+those spaces. Keeping those layers separate prevents Automerge heads, presence
+clocks, connection generations, or memory draft ids from becoming accidental
+relation fields.
+
 ## Candidate Formats
 
 ### JSON Catalog

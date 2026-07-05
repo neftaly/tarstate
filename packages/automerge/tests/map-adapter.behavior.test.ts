@@ -2,6 +2,7 @@ import * as Automerge from '@automerge/automerge';
 import { Repo, type Chunk, type DocHandle, type StorageAdapterInterface, type StorageKey } from '@automerge/automerge-repo';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
+  and,
   as,
   constRows,
   call,
@@ -102,6 +103,13 @@ type LabelRow = {
   readonly name: string;
 };
 
+type PresenceFocusRow = {
+  readonly peer: string;
+  readonly runtime: string;
+  readonly objectId: string;
+  readonly documentHeads?: JsonValue;
+};
+
 interface WorkspaceDoc {
   readonly workspace: {
     readonly tasks: readonly TaskRow[];
@@ -148,6 +156,15 @@ const schema = defineSchema({
     fields: {
       id: idField('label'),
       name: stringField()
+    }
+  }),
+  presenceFocus: relation<PresenceFocusRow>({
+    key: 'peer',
+    fields: {
+      peer: idField('peer'),
+      runtime: stringField(),
+      objectId: stringField(),
+      documentHeads: optional(jsonField())
     }
   })
 });
@@ -1648,18 +1665,21 @@ describe('automerge map adapter', () => {
         peer: presenceFocus.peer,
         path: objectLocation.pathSegments,
         relation: objectLocation.relation,
-        key: objectLocation.key
+        key: objectLocation.$.key
       })
     );
 
-    expect(evaluate(adapter.source, resolvedFocus).rows).toEqual([
-      {
-        peer: 'peer-remote',
-        path: ['workspace', 'tasks', 0],
-        relation: 'tasks',
-        key: 'task-1'
-      }
-    ]);
+    expect(evaluate(adapter.source, resolvedFocus)).toEqual({
+      rows: [
+        {
+          peer: 'peer-remote',
+          path: ['workspace', 'tasks', 0],
+          relation: 'tasks',
+          key: 'task-1'
+        }
+      ],
+      diagnostics: []
+    });
 
     const result = await adapter.target.apply([
       write(schema.tasks).updateByKey('task-1', { title: 'Edited' }),
@@ -1836,6 +1856,137 @@ describe('automerge map adapter', () => {
     expect(automergeMapSource(automergeView(backdated.newDoc, baseHeads), { relations: allMappings })
       .rows(schema.tasks))
       .toEqual([{ id: 'task-1', title: 'Draft', effort: 1 }]);
+  });
+
+  it('pins Automerge adapter snapshot sources to captured document heads', () => {
+    const adapter = automergeMapAdapter({
+      doc: workspaceDoc([{ id: 'task-1', title: 'Draft', effort: 1 }]),
+      relations: allMappings,
+      runtimeId: 'workspace'
+    });
+    const snapshot = adapter.snapshot();
+    const taskObjectId = adapter.objectIdFor(schema.tasks, 'task-1');
+    if (taskObjectId === null) throw new Error('expected task object id');
+
+    adapter.setDoc(Automerge.change(adapter.getDoc(), (draft) => {
+      (draft.workspace.tasks as TaskRow[]).unshift({ id: 'task-0', title: 'Prep', effort: 2 });
+    }));
+
+    expect(snapshot.version).not.toEqual(Automerge.getHeads(adapter.getDoc()));
+    expect(snapshot.source.version?.()).toEqual(snapshot.version);
+    expect(snapshot.source.rows(schema.tasks)).toEqual([{ id: 'task-1', title: 'Draft', effort: 1 }]);
+    expect(adapter.source.rows(schema.tasks)).toEqual([
+      { id: 'task-0', title: 'Prep', effort: 2 },
+      { id: 'task-1', title: 'Draft', effort: 1 }
+    ]);
+    expect(snapshot.source.rows(runtimeSystemRelations.objectLocations)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        objectId: taskObjectId,
+        pathSegments: ['workspace', 'tasks', 0],
+        relation: 'tasks',
+        key: 'task-1'
+      })
+    ]));
+    expect(adapter.source.rows(runtimeSystemRelations.objectLocations)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        objectId: taskObjectId,
+        pathSegments: ['workspace', 'tasks', 1],
+        relation: 'tasks',
+        key: 'task-1'
+      })
+    ]));
+  });
+
+  it('composes historical document views with separately versioned presence-like state', () => {
+    type PresenceVersion = {
+      readonly kind: 'presence';
+      readonly revision: number;
+    };
+
+    let doc = workspaceDoc([{ id: 'task-1', title: 'Draft', effort: 1 }]);
+    const baseHeads = Automerge.getHeads(doc);
+    const oldDoc = automergeView(doc, baseHeads);
+    const taskObjectId = automergeObjectIdAt(oldDoc, ['workspace', 'tasks', 0]);
+    if (taskObjectId === null) throw new Error('expected task object id');
+
+    doc = Automerge.change(doc, (draft) => {
+      (draft.workspace.tasks as TaskRow[]).unshift({ id: 'task-0', title: 'Prep', effort: 2 });
+    });
+
+    const presenceVersion = { kind: 'presence', revision: 7 } satisfies PresenceVersion;
+    const presenceRows: readonly PresenceFocusRow[] = [{
+      peer: 'peer-remote',
+      runtime: 'workspace',
+      objectId: taskObjectId,
+      documentHeads: [...baseHeads]
+    }];
+    const presenceSource = {
+      relationNames: [schema.presenceFocus.name],
+      version: () => presenceVersion,
+      rows: (relationRef) => relationRef.name === schema.presenceFocus.name ? presenceRows : []
+    } satisfies RelationRuntime<PresenceVersion>['source'];
+    const presenceRuntime = withAutomergeRuntimeRelations({
+      source: presenceSource,
+      snapshot: () => ({ source: presenceSource, version: presenceVersion })
+    } satisfies RelationRuntime<PresenceVersion>, schema.presenceFocus);
+    const historicalRuntime = createAutomergeMapRuntime({
+      doc: oldDoc,
+      relations: allMappings,
+      runtimeId: 'workspace',
+      runtimes: [presenceRuntime]
+    });
+    const liveRuntime = createAutomergeMapRuntime({
+      doc,
+      relations: allMappings,
+      runtimeId: 'workspace',
+      runtimes: [presenceRuntime]
+    });
+    const presenceFocus = as(schema.presenceFocus, 'presenceFocus');
+    const objectLocations = runtimeSystemRelations.objectLocations;
+    const resolvedFocus = pipe(
+      from(presenceFocus),
+      join(
+        from(objectLocations),
+        and(
+          eq(presenceFocus.runtime, field<string>(objectLocations.name, 'runtime')),
+          eq(presenceFocus.objectId, field<string>(objectLocations.name, 'objectId'))
+        )
+      ),
+      project({
+        peer: presenceFocus.peer,
+        runtime: presenceFocus.runtime,
+        documentHeads: presenceFocus.documentHeads,
+        path: field<readonly (string | number)[]>(objectLocations.name, 'pathSegments'),
+        relation: field<string | undefined>(objectLocations.name, 'relation'),
+        key: field<unknown>(objectLocations.name, 'key')
+      })
+    );
+    const historicalSnapshot = historicalRuntime.snapshot?.();
+
+    expect(historicalRuntime.source.version?.()).toEqual([baseHeads, presenceVersion]);
+    expect(historicalSnapshot?.version).toEqual([baseHeads, presenceVersion]);
+    expect(evaluate(historicalSnapshot?.source ?? historicalRuntime.source, resolvedFocus)).toEqual({
+      rows: [{
+        peer: 'peer-remote',
+        runtime: 'workspace',
+        documentHeads: [...baseHeads],
+        path: ['workspace', 'tasks', 0],
+        relation: 'tasks',
+        key: 'task-1'
+      }],
+      diagnostics: []
+    });
+    expect(evaluate(liveRuntime.source, resolvedFocus)).toEqual({
+      rows: [{
+        peer: 'peer-remote',
+        runtime: 'workspace',
+        documentHeads: [...baseHeads],
+        path: ['workspace', 'tasks', 1],
+        relation: 'tasks',
+        key: 'task-1'
+      }],
+      diagnostics: []
+    });
   });
 
   it('reports object ids and conflicts at explicit Automerge paths', () => {

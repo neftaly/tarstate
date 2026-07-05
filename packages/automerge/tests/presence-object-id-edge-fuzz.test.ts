@@ -348,7 +348,7 @@ function resolvePresencePayloads(
         eq(getKey<string>(presenceFocus.payload, value('objectId')), objectLocation.objectId),
         eq(getKey<string>(presenceFocus.payload, value('runtime')), objectLocation.runtime),
         eq(getKey<string>(presenceFocus.payload, value('relation')), objectLocation.relation),
-        eq(getKey<unknown>(presenceFocus.payload, value('key')), objectLocation.key)
+        eq(getKey<unknown>(presenceFocus.payload, value('key')), objectLocation.$.key)
       )
     ),
     project({
@@ -357,7 +357,7 @@ function resolvePresencePayloads(
       runtime: objectLocation.runtime,
       path: objectLocation.pathSegments,
       relation: objectLocation.relation,
-      key: objectLocation.key
+      key: objectLocation.$.key
     })
   );
 
@@ -395,7 +395,7 @@ function resolvePresencePayloadsByObjectIdAndPath(
       runtime: objectLocation.runtime,
       path: objectLocation.pathSegments,
       relation: objectLocation.relation,
-      key: objectLocation.key
+      key: objectLocation.$.key
     })
   );
 
@@ -429,7 +429,7 @@ function resolvePresencePayloadsByObjectId(
       runtime: objectLocation.runtime,
       path: objectLocation.pathSegments,
       relation: objectLocation.relation,
-      key: objectLocation.key
+      key: objectLocation.$.key
     })
   );
 
