@@ -78,6 +78,32 @@ describe('store view snapshot caching', () => {
     store.close();
   });
 
+  it('recomputes an unrelated-skipped view when a later commit touches its dependency', async () => {
+    const store = createStore(makeDb());
+    const view = store.view(accountsById);
+    const first = view.getSnapshot();
+    let calls = 0;
+
+    const unsubscribe = view.subscribe(() => {
+      calls += 1;
+    });
+
+    await store.commit(insert(schema.entries, { id: 'e5', accountId: 'cash', amount: 35, memo: 'top-up', posted: true }));
+
+    expect(calls).toBe(0);
+    expect(view.getSnapshot()).toBe(first);
+
+    await store.commit(insert(schema.accounts, { id: 'bank', name: 'Bank', kind: 'asset' }));
+
+    const next = view.getSnapshot();
+    expect(calls).toBe(1);
+    expect(next).not.toBe(first);
+    expect(next.rows.map((row) => row.id)).toEqual(['bank', 'cash', 'equity', 'fees', 'sales']);
+
+    unsubscribe();
+    store.close();
+  });
+
   it('checks env-dependent views when env changes alongside unrelated relation deltas', async () => {
     const accountByEnvId = pipe(
       from(account),

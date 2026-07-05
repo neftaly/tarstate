@@ -21,6 +21,7 @@ export type AutomergeObjectReference = {
 export type AutomergeObjectReferenceOptions = Omit<AutomergeObjectReference, 'objectId' | 'path'>;
 export type AutomergeTextValue = string | Automerge.ImmutableString;
 export type AutomergeCounterValue = number | Automerge.Counter;
+const automergeNativeFieldKind = Symbol.for('tarstate.automerge.nativeFieldKind');
 
 const bytesToHex = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
@@ -89,8 +90,7 @@ const compareByteArrays = (left: Uint8Array, right: Uint8Array): number => {
 export function automergeTextField(
   options: Partial<CustomFieldSpec<unknown>> = {}
 ): FieldSpec<string> {
-  return customScalarField<string>({
-    kind: 'automerge.text',
+  return customScalarField<string>(automergeCustomSpec('automerge.text', {
     description: 'an Automerge text value',
     validate: (value): value is unknown =>
       typeof value === 'string' || Automerge.isImmutableString(value),
@@ -99,32 +99,28 @@ export function automergeTextField(
       ? value
       : new Automerge.ImmutableString(String(value)),
     stableKey: (value) => String(value),
-    compare: (left, right) => String(left).localeCompare(String(right)),
-    ...options
-  });
+    compare: (left, right) => String(left).localeCompare(String(right))
+  }, options));
 }
 
 export function automergeCounterField(
   options: Partial<CustomFieldSpec<unknown>> = {}
 ): FieldSpec<number> {
-  return customScalarField<number>({
-    kind: 'automerge.counter',
+  return customScalarField<number>(automergeCustomSpec('automerge.counter', {
     description: 'an Automerge counter value',
     validate: (value): value is unknown =>
       typeof value === 'number' && Number.isFinite(value) || Automerge.isCounter(value),
     toScalar: (value) => Number(value),
     fromScalar: scalarToCounter,
     stableKey: (value) => String(Number(value)),
-    compare: (left, right) => Number(left) - Number(right),
-    ...options
-  });
+    compare: (left, right) => Number(left) - Number(right)
+  }, options));
 }
 
 export function automergeBytesField(
   options: Partial<CustomFieldSpec<unknown>> = {}
 ): FieldSpec<string> {
-  return customScalarField<string>({
-    kind: 'automerge.bytes',
+  return customScalarField<string>(automergeCustomSpec('automerge.bytes', {
     description: 'an Automerge bytes value',
     validate: (value): value is unknown => value instanceof Uint8Array || isHexString(value),
     toScalar: bytesScalar,
@@ -134,16 +130,14 @@ export function automergeBytesField(
       const leftBytes = bytesValue(left);
       const rightBytes = bytesValue(right);
       return leftBytes !== undefined && rightBytes !== undefined ? compareByteArrays(leftBytes, rightBytes) : compareValues(left, right);
-    },
-    ...options
-  });
+    }
+  }, options));
 }
 
 export function automergeDateField(
   options: Partial<CustomFieldSpec<unknown>> = {}
 ): FieldSpec<string> {
-  return customScalarField<string>({
-    kind: 'automerge.date',
+  return customScalarField<string>(automergeCustomSpec('automerge.date', {
     description: 'an Automerge date value',
     validate: (value): value is unknown =>
       (value instanceof Date && !Number.isNaN(value.valueOf())) || isValidDateScalar(value),
@@ -154,26 +148,53 @@ export function automergeDateField(
       const leftTime = dateTime(left);
       const rightTime = dateTime(right);
       return leftTime !== undefined && rightTime !== undefined ? leftTime - rightTime : compareValues(left, right);
-    },
-    ...options
-  });
+    }
+  }, options));
 }
 
 export function automergeObjectReferenceField(
   options: Partial<CustomFieldSpec<unknown>> = {}
 ): FieldSpec<AutomergeObjectReference> {
-  return customScalarField<AutomergeObjectReference>({
-    kind: 'automerge.objectReference',
+  return customScalarField<AutomergeObjectReference>(automergeCustomSpec('automerge.objectReference', {
     description: 'an Automerge object reference',
     validate: isAutomergeObjectReference,
     stableKey,
-    compare: (left, right) => stableKey(left).localeCompare(stableKey(right)),
-    ...options
-  });
+    compare: (left, right) => stableKey(left).localeCompare(stableKey(right))
+  }, options));
+}
+
+type AutomergeCustomSpecDefaults = Omit<CustomFieldSpec<unknown>, 'codec'>;
+
+function automergeCustomSpec(
+  defaultCodec: string,
+  defaults: AutomergeCustomSpecDefaults,
+  options: Partial<CustomFieldSpec<unknown>>
+): CustomFieldSpec<unknown> {
+  const merged = { ...defaults, ...options };
+  return withAutomergeNativeFieldKind({ ...merged, codec: options.codec ?? defaultCodec }, defaultCodec);
 }
 
 function customScalarField<Value>(spec: CustomFieldSpec<unknown>): FieldSpec<Value> {
-  return customField<unknown>(spec) as FieldSpec<Value>;
+  const field = customField<unknown>(spec);
+  const nativeKind = (spec as Record<symbol, string | undefined>)[automergeNativeFieldKind];
+  if (nativeKind !== undefined && field.custom !== undefined) {
+    Object.defineProperty(field.custom, automergeNativeFieldKind, {
+      value: nativeKind,
+      enumerable: false
+    });
+  }
+  return field as FieldSpec<Value>;
+}
+
+function withAutomergeNativeFieldKind(
+  spec: CustomFieldSpec<unknown>,
+  nativeKind: string
+): CustomFieldSpec<unknown> {
+  Object.defineProperty(spec, automergeNativeFieldKind, {
+    value: nativeKind,
+    enumerable: false
+  });
+  return spec;
 }
 
 function isAutomergeObjectReference(input: unknown): boolean {

@@ -67,6 +67,12 @@
       "@tarstate/core/write": [
         "./packages/core/src/write.ts"
       ],
+      "@tarstate/schema-tools": [
+        "./packages/schema-tools/src/index.ts"
+      ],
+      "@tarstate/schema-tools/cli": [
+        "./packages/schema-tools/src/cli.ts"
+      ],
       "@tarstate/automerge": [
         "./packages/automerge/src/index.ts"
       ],

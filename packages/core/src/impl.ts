@@ -577,6 +577,7 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
     return diagnostics;
   }
 
+  const invalidFields = new Set<string>();
   for (const [fieldName, spec] of Object.entries(relationRef.fields)) {
     const hasField = Object.prototype.hasOwnProperty.call(rowValue, fieldName);
     const fieldValue = rowValue[fieldName];
@@ -597,6 +598,7 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
 
     if (fieldValue === null) {
       if (!spec.nullable) {
+        invalidFields.add(fieldName);
         diagnostics.push({
           code: 'field_invalid',
           severity: 'error',
@@ -610,6 +612,7 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
     }
 
     if (!fieldValueMatchesSpec(spec, fieldValue)) {
+      invalidFields.add(fieldName);
       diagnostics.push({
         code: 'field_invalid',
         severity: 'error',
@@ -637,6 +640,7 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
     }
 
     const spec = relationRef.fields[keyField];
+    if (invalidFields.has(keyField)) continue;
     if (
       spec?.valueKind === 'custom'
       && spec.custom?.stableKey === undefined
@@ -646,6 +650,21 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
         code: 'field_invalid',
         severity: 'error',
         message: `relation "${relationRef.name}" key field "${keyField}" must define stableKey or toScalar`,
+        relation: relationRef.name,
+        field: keyField,
+        surface: 'validateRelationRow',
+        detail: keyValue
+      });
+    } else if (
+      spec?.valueKind === 'custom'
+      && spec.custom?.stableKey === undefined
+      && spec.custom?.toScalar !== undefined
+      && !isCustomKeyScalar(spec.custom.toScalar(keyValue))
+    ) {
+      diagnostics.push({
+        code: 'field_invalid',
+        severity: 'error',
+        message: `relation "${relationRef.name}" key field "${keyField}" must convert to a string, finite number, or boolean`,
         relation: relationRef.name,
         field: keyField,
         surface: 'validateRelationRow',
@@ -662,7 +681,7 @@ export function rowKey(relationRef: RelationRef, row: Record<string, unknown>): 
   const values: unknown[] = [];
 
   for (const fieldName of fields) {
-    if (!Object.prototype.hasOwnProperty.call(row, fieldName) || row[fieldName] === undefined) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(row, fieldName) || row[fieldName] === undefined || row[fieldName] === null) return undefined;
     const fieldValue = row[fieldName];
     const spec = relationRef.fields[fieldName];
     const keyValue = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
@@ -1680,12 +1699,17 @@ export type DbQueryOptions<Row = unknown, MappedRow = Row, IntoResult = readonly
 };
 type DbQueryIntoOptions<Row, MappedRow, IntoResult> =
   DbQueryOptions<Row, MappedRow, IntoResult> & { readonly into: (rows: readonly MappedRow[]) => IntoResult };
+type RelationKeyScalar = string | number | boolean;
+type RelationKeyFieldScalar<Value> = Extract<Exclude<Value, null | undefined>, RelationKeyScalar>;
+type RelationKeyFieldValue<Value> = [RelationKeyFieldScalar<Value>] extends [never]
+  ? RelationKeyScalar
+  : RelationKeyFieldScalar<Value>;
 export type RelationKeyValue<Relation extends RelationRef> =
   Relation extends RelationRef<infer Row, infer Key>
     ? Key extends readonly (keyof Row & string)[]
-      ? { readonly [Index in keyof Key]: Key[Index] extends keyof Row ? Row[Key[Index]] : never }
+      ? { readonly [Index in keyof Key]: Key[Index] extends keyof Row ? RelationKeyFieldValue<Row[Key[Index]]> : never }
       : Key extends keyof Row
-        ? Row[Key]
+        ? RelationKeyFieldValue<Row[Key]>
         : RelationKeyInput
     : RelationKeyInput;
 export type RowLookupOptions<Row = unknown, MappedRow = Row> = DbQueryOptions<Row, MappedRow>;
@@ -1799,6 +1823,8 @@ export function row<Row>(dbValue: Db, queryValue: Query<Row> | RelationRef, keyO
       .find((rowValue) => isRecord(rowValue) && rowKey(queryValue, rowValue) === key) as Row | undefined;
   }
 
+  if (isRelationRef(queryValue) && isInvalidRelationLookupArgument(keyOrPredicateOrOptions)) return undefined;
+
   if (isPredicateData(keyOrPredicateOrOptions)) {
     const queryObject = pipe(queryForTarget(queryValue), where(keyOrPredicateOrOptions));
     return q(dbValue, queryObject, options as DbQueryOptions<Row>)[0] as Row | undefined;
@@ -1816,26 +1842,45 @@ function directRelationRowByKey(
   keyInput: RelationKeyInput,
   options: DbQueryOptions<any, any> | undefined
 ): { readonly used: true; readonly row: unknown } | { readonly used: false } {
+  const readOptions = options ?? {};
+  if (hasDbQueryRowTransforms(readOptions)) return { used: false };
+
+  const source = querySourceFor(dbValue, { materializedBaseRelationLookup: !hasEvaluateContextOverrides(readOptions) });
+  const rows = indexedRelationRowsForKey(source, relationRef, keyInput) ?? source.rows(relationRef);
+  return {
+    used: true,
+    row: firstRelationRowMatchingKey(rows, relationRef, keyInput)
+  };
+}
+
+function indexedRelationRowsForKey(
+  source: RelationSource,
+  relationRef: RelationRef,
+  keyInput: RelationKeyInput
+): readonly unknown[] | undefined {
   const fields = relationKeyFields(relationRef);
   const fieldName = fields.length === 1 ? fields[0] : undefined;
   if (
     fieldName === undefined
     || Array.isArray(keyInput)
     || !canCompareRelationKeyAtom(keyInput)
-    || hasDbQueryRowTransforms(options ?? {})
+    || relationRef.fields[fieldName]?.custom?.stableKey !== undefined
   ) {
-    return { used: false };
+    return undefined;
   }
 
-  const source = querySourceFor(dbValue, { materializedBaseRelationLookup: !hasEvaluateContextOverrides(options ?? {}) });
   const lookupKey = relationSourceLookupValueForKey(relationRef.fields[fieldName], keyInput);
-  if (lookupKey === undefined) return { used: false };
+  if (lookupKey === undefined) return undefined;
   const lookupValue = { relation: relationRef, field: fieldName, value: lookupKey };
-  const rows = source.lookup?.(lookupValue) ?? scanLookupRows(source.rows(relationRef), lookupValue);
-  return {
-    used: true,
-    row: rows.find((rowValue) => isRecord(rowValue) && relationKeyInputMatchesRow(relationRef, keyInput, rowValue))
-  };
+  return source.lookup?.(lookupValue) ?? scanLookupRows(source.rows(relationRef), lookupValue);
+}
+
+function firstRelationRowMatchingKey(
+  rows: readonly unknown[],
+  relationRef: RelationRef,
+  keyInput: RelationKeyInput
+): unknown {
+  return rows.find((rowValue) => isRecord(rowValue) && relationKeyInputMatchesRow(relationRef, keyInput, rowValue));
 }
 export function exists<Relation extends RelationRef>(_db: Db, _relation: Relation, _key: RelationKeyValue<Relation>, _options?: RowLookupOptions<RelationRow<Relation>>): boolean;
 export function exists<Row>(_db: Db, _query: Query<Row>, _predicate: PredicateData, _options?: RowPredicateOptions<Row>): boolean;
@@ -2065,7 +2110,7 @@ export type RelationRowUpdate<Relation extends RelationRef> = Partial<{
 export type RelationRowUpdateInput<Relation extends RelationRef> =
   | RelationRowUpdate<Relation>
   | ((row: RelationRow<Relation>) => RelationRowUpdate<Relation>);
-export type RelationKeyInput = string | number | readonly unknown[];
+export type RelationKeyInput = RelationKeyScalar | readonly RelationKeyScalar[];
 export type RelationMergeInput<Relation extends RelationRef = RelationRef> =
   | readonly (keyof RelationRow<Relation> & string)[]
   | ((current: RelationRow<Relation>, incoming: RelationRow<Relation>) => RelationRowUpdate<Relation>);
@@ -6333,10 +6378,13 @@ export async function trackRuntimeCommit<Version>(runtime: RelationRuntime<Versi
 function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version> {
   let state = initialState;
   let revision = 0;
+  let latestChangedRelationNames: readonly string[] | undefined;
   let closed = false;
   const listeners = new Set<() => void>();
   const viewCache: StoreViewCache<Version> = new Map();
   const snapshot = (): StoreSnapshot<Version> => ({ db: state, source: dbSource(state), revision, diagnostics: [] });
+  const changedRelationNamesForRevision = (snapshotRevision: number): readonly string[] | undefined =>
+    snapshotRevision === revision ? latestChangedRelationNames : undefined;
   const notify = (): void => {
     if (closed) return;
     for (const listener of listeners) listener();
@@ -6357,7 +6405,7 @@ function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version
       if (isQueryBatch(queryValue)) return addRevisionToBatch(whatIf(state, queryValue, ...inputs), revision);
       return { ...whatIf(state, queryValue, ...inputs), revision };
     }) as StoreWhatIf,
-    view: (queryValue) => createStoreView(queryValue, snapshot, viewCache),
+    view: (queryValue) => createStoreView(queryValue, snapshot, viewCache, undefined, changedRelationNamesForRevision),
     commit: async (inputOrInputs, _options = {}) => {
       if (closed) {
         const closedSnapshot = snapshot();
@@ -6384,6 +6432,7 @@ function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version
           : undefined;
         state = result.db;
         revision += 1;
+        latestChangedRelationNames = changedRelationNames;
         notifyStoreViewSubscribers(viewCache, snapshot(), changedRelationNames);
         notify();
       }
@@ -6412,6 +6461,7 @@ function createDbBackedStore<Version = unknown>(initialState: Db): Store<Version
 
 function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): Store<Version> {
   let revision = 0;
+  let latestChangedRelationNames: readonly string[] | undefined;
   let closed = false;
   const listeners = new Set<() => void>();
   const initialRuntimeSnapshot = input.runtime.snapshot?.();
@@ -6429,6 +6479,8 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
     diagnostics: currentSource.diagnostics?.() ?? [],
     ...(version === undefined ? {} : { version })
   });
+  const changedRelationNamesForRevision = (snapshotRevision: number): readonly string[] | undefined =>
+    snapshotRevision === revision ? latestChangedRelationNames : undefined;
   const refreshFromRuntime = (
     envValue: DbInputEnv | undefined = pendingApplyEnv ?? state.env,
     changedRelationNames?: readonly string[]
@@ -6455,6 +6507,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
     const viewChangedRelationNames = diagnosticsChanged || versionChanged
       ? undefined
       : namesForRefresh;
+    latestChangedRelationNames = viewChangedRelationNames;
     notifyStoreViewSubscribers(viewCache, nextSnapshot, viewChangedRelationNames);
     for (const listener of listeners) listener();
     return nextSnapshot;
@@ -6478,7 +6531,7 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       if (isQueryBatch(queryValue)) return addRevisionToBatch(whatIf(state, queryValue, ...inputs), revision);
       return { ...whatIf(state, queryValue, ...inputs), revision };
     }) as StoreWhatIf,
-    view: (queryValue) => createStoreView(queryValue, snapshot, viewCache, input.runtime.retainInterest),
+    view: (queryValue) => createStoreView(queryValue, snapshot, viewCache, input.runtime.retainInterest, changedRelationNamesForRevision),
     commit: async (inputOrInputs, options = {}) => {
       if (closed) {
         const closedSnapshot = snapshot();
@@ -6569,6 +6622,7 @@ type StoreViewCache<Version> = Map<string, StoreViewCacheEntry<unknown, Version>
 
 type StoreViewCacheEntry<Row, Version> = {
   readonly query: Query<Row>;
+  readonly dependencies: readonly string[];
   cachedSnapshot: StoreViewSnapshot<Row, Version> | undefined;
   cachedStoreRevision: number | undefined;
   cachedSnapshotDiagnosticsKey: string | undefined;
@@ -6603,7 +6657,7 @@ function notifyStoreViewSubscribers<Version>(
     }
 
     const previous = entry.cachedSnapshot;
-    const next = readStoreViewSnapshot(entry, current, key);
+    const next = readStoreViewSnapshot(entry, current, key, changedRelationNames);
     if (previous === next) continue;
 
     const listeners = Array.from(entry.listeners);
@@ -6615,25 +6669,38 @@ function storeViewMayDependOnChangedRelations<Row, Version>(
   entry: StoreViewCacheEntry<Row, Version>,
   changedRelationNames: readonly string[] | undefined
 ): boolean {
-  return relationDependenciesMayDependOnChangedRelations(relationDependencies(entry.query), changedRelationNames);
+  return relationDependenciesMayDependOnChangedRelations(entry.dependencies, changedRelationNames);
 }
 
 function relationDependenciesMayDependOnChangedRelations(
   dependencies: readonly string[],
   changedRelationNames: readonly string[] | undefined
 ): boolean {
-  if (changedRelationNames === undefined || changedRelationNames.length === 0) return true;
-  if (dependencies.length === 0) return true;
+  if (changedRelationNames === undefined) return true;
+  if (changedRelationNames.length === 0 || dependencies.length === 0) return false;
   return dependencies.some((dependency) => changedRelationNames.includes(dependency));
 }
 
 function readStoreViewSnapshot<Row, Version>(
   entry: StoreViewCacheEntry<Row, Version>,
   current: StoreSnapshot<Version>,
-  key: string
+  key: string,
+  changedRelationNames?: readonly string[]
 ): StoreViewSnapshot<Row, Version> {
   const diagnosticsKey = diagnosticsFingerprint(current.diagnostics);
   const versionKey = storeViewVersionFingerprint(current.version);
+  if (
+    entry.cachedSnapshot !== undefined
+    && entry.cachedStoreRevision !== undefined
+    && entry.cachedStoreRevision + 1 === current.revision
+    && entry.cachedSnapshot.queryKey === key
+    && entry.cachedSnapshotDiagnosticsKey === diagnosticsKey
+    && entry.cachedSnapshotVersionKey === versionKey
+    && !storeViewMayDependOnChangedRelations(entry, changedRelationNames)
+  ) {
+    entry.cachedStoreRevision = current.revision;
+    return entry.cachedSnapshot;
+  }
   if (
     entry.cachedSnapshot !== undefined
     && entry.cachedStoreRevision === current.revision
@@ -6696,7 +6763,8 @@ function createStoreView<Row, Version>(
   queryValue: Query<Row>,
   snapshot: () => StoreSnapshot<Version>,
   viewCache: StoreViewCache<Version>,
-  retainInterest?: RelationRuntimeRetainInterest
+  retainInterest?: RelationRuntimeRetainInterest,
+  changedRelationNamesForRevision?: (revision: number) => readonly string[] | undefined
 ): StoreView<Row, Version> {
   const key = queryKey(queryValue);
   const cacheEntry = (): StoreViewCacheEntry<Row, Version> => {
@@ -6705,6 +6773,7 @@ function createStoreView<Row, Version>(
 
     const next: StoreViewCacheEntry<Row, Version> = {
       query: queryValue,
+      dependencies: relationDependencies(queryValue),
       cachedSnapshot: undefined,
       cachedStoreRevision: undefined,
       cachedSnapshotDiagnosticsKey: undefined,
@@ -6721,7 +6790,7 @@ function createStoreView<Row, Version>(
   const viewSnapshot = (): StoreViewSnapshot<Row, Version> => {
     const entry = cacheEntry();
     const current = snapshot();
-    return readStoreViewSnapshot(entry, current, key);
+    return readStoreViewSnapshot(entry, current, key, changedRelationNamesForRevision?.(current.revision));
   };
   const subscribeView = (listener: () => void): (() => void) => {
     const entry = cacheEntry();
@@ -6732,10 +6801,11 @@ function createStoreView<Row, Version>(
         kind: 'view',
         queryKey: key,
         query: entry.query,
-        relationNames: relationDependencies(entry.query)
+        relationNames: entry.dependencies
       });
       entry.releaseInterest = typeof releaseInterest === 'function' ? releaseInterest : undefined;
-      readStoreViewSnapshot(entry, snapshot(), key);
+      const current = snapshot();
+      readStoreViewSnapshot(entry, current, key, changedRelationNamesForRevision?.(current.revision));
     }
     let subscribed = true;
     const subscriptionListener = (): void => {
@@ -7340,17 +7410,35 @@ function joinClauseRowsMatch(plan: JoinClausePlan, left: EvalEntry, right: EvalE
 function joinClauseLeftKey(plan: JoinClausePlan, entry: EvalEntry): string | undefined {
   const rowValue = entry.row;
   if (!isRecord(rowValue)) return undefined;
-  return stableJoinClauseKey(plan.map(([fieldName]) => rowValue[fieldName]));
+  return stableJoinClauseKey(plan, rowValue, 'left');
 }
 
 function joinClauseRightKey(plan: JoinClausePlan, entry: EvalEntry): string | undefined {
   const rowValue = entry.row;
   if (!isRecord(rowValue)) return undefined;
-  return stableJoinClauseKey(plan.map(([, fieldName]) => rowValue[fieldName]));
+  return stableJoinClauseKey(plan, rowValue, 'right');
 }
 
-function stableJoinClauseKey(values: readonly unknown[]): string | undefined {
-  return values.every(canHashJoinClauseValue) ? stableKey(values) : undefined;
+function stableJoinClauseKey(
+  plan: JoinClausePlan,
+  rowValue: Record<string, unknown>,
+  side: 'left' | 'right'
+): string | undefined {
+  if (plan.length === 1) {
+    const fieldName = side === 'left' ? plan[0]?.[0] : plan[0]?.[1];
+    const valueValue = fieldName === undefined ? undefined : rowValue[fieldName];
+    return canHashJoinClauseValue(valueValue) ? stableKey(valueValue) : undefined;
+  }
+
+  let result = '[';
+  for (let index = 0; index < plan.length; index += 1) {
+    const fields = plan[index];
+    const fieldName = side === 'left' ? fields?.[0] : fields?.[1];
+    const valueValue = fieldName === undefined ? undefined : rowValue[fieldName];
+    if (!canHashJoinClauseValue(valueValue)) return undefined;
+    result += `${index === 0 ? '' : ','}${stableKey(valueValue)}`;
+  }
+  return `${result}]`;
 }
 
 function canHashJoinClauseValue(valueValue: unknown): boolean {
@@ -7797,14 +7885,12 @@ function entryForRow(
   const aliases: Record<string, unknown> = { row: rowValue };
   if (alias !== undefined) aliases[alias] = rowValue;
   if (relationName !== undefined) aliases[relationName] = rowValue;
-  const fieldSpecsByAlias = fields === undefined
-    ? undefined
-    : Object.fromEntries(['row', alias, relationName]
-      .filter((name): name is string => name !== undefined)
-      .map((name) => [name, fields]));
-  return fieldSpecsByAlias === undefined
-    ? { row: rowValue, aliases }
-    : { row: rowValue, aliases, fieldSpecsByAlias };
+  if (fields === undefined) return { row: rowValue, aliases };
+
+  const fieldSpecsByAlias: Record<string, RelationFields> = { row: fields };
+  if (alias !== undefined) fieldSpecsByAlias[alias] = fields;
+  if (relationName !== undefined) fieldSpecsByAlias[relationName] = fields;
+  return { row: rowValue, aliases, fieldSpecsByAlias };
 }
 
 function combineEntries(left: EvalEntry, right: EvalEntry, rightAlias?: string): EvalEntry {
@@ -7868,17 +7954,49 @@ function sortEntries(
   diagnostics: TarstateDiagnostic[],
   outer: EvalEntry | undefined
 ): readonly EvalEntry[] {
-  if (order.length === 0) return [...rows];
+  const sortData = order.map(normalizeSortInput);
+  if (sortData.length === 0) return [...rows];
+  if (sortData.every((item) => trustedRowLocalExpr(item.expr))) {
+    return sortEntriesByCachedKeys(rows, sortData, source, relations, options, diagnostics, outer);
+  }
+
   return [...rows].sort((left, right) => {
-    for (const sortInput of order) {
-      const sortData = normalizeSortInput(sortInput);
-      const leftValue = evaluateExpr(sortData.expr, left, source, relations, options, diagnostics, outer);
-      const rightValue = evaluateExpr(sortData.expr, right, source, relations, options, diagnostics, outer);
-      const comparisonValue = compareNullable(leftValue, rightValue, sortData.nulls);
-      if (comparisonValue !== 0) return sortData.direction === 'desc' ? -comparisonValue : comparisonValue;
+    for (const item of sortData) {
+      const leftValue = evaluateExpr(item.expr, left, source, relations, options, diagnostics, outer);
+      const rightValue = evaluateExpr(item.expr, right, source, relations, options, diagnostics, outer);
+      const comparisonValue = compareNullable(leftValue, rightValue, item.nulls);
+      if (comparisonValue !== 0) return item.direction === 'desc' ? -comparisonValue : comparisonValue;
     }
     return 0;
   });
+}
+
+function sortEntriesByCachedKeys(
+  rows: readonly EvalEntry[],
+  order: readonly SortData[],
+  source: RelationSource,
+  relations: Readonly<Record<string, AnyRelationRef>>,
+  options: EvaluateOptions,
+  diagnostics: TarstateDiagnostic[],
+  outer: EvalEntry | undefined
+): readonly EvalEntry[] {
+  return rows
+    .map((entry) => ({
+      entry,
+      keys: order.map((item) => evaluateExpr(item.expr, entry, source, relations, options, diagnostics, outer))
+    }))
+    .sort((left, right) => compareSortKeys(left.keys, right.keys, order))
+    .map(({ entry }) => entry);
+}
+
+function compareSortKeys(left: readonly unknown[], right: readonly unknown[], order: readonly SortData[]): number {
+  for (let index = 0; index < order.length; index += 1) {
+    const item = order[index];
+    if (item === undefined) return 0;
+    const comparisonValue = compareNullable(left[index], right[index], item.nulls);
+    if (comparisonValue !== 0) return item.direction === 'desc' ? -comparisonValue : comparisonValue;
+  }
+  return 0;
 }
 
 function limitEntries(rows: readonly EvalEntry[], countValue: unknown, offsetValue?: unknown): readonly EvalEntry[] {
@@ -8158,7 +8276,26 @@ function sortPlainRows<Row>(rows: readonly Row[], sortValue: DbQuerySort<Row>, d
 }
 
 function isRelationKeyInput(input: unknown): input is RelationKeyInput {
-  return typeof input === 'string' || typeof input === 'number' || Array.isArray(input);
+  return isRelationKeyScalar(input) || (Array.isArray(input) && input.every(isRelationKeyScalar));
+}
+
+function isRelationKeyScalar(input: unknown): input is RelationKeyScalar {
+  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
+}
+
+const dbQueryOptionKeys = new Set(['sort', 'rsort', 'mapRows', 'into', 'env', 'functions', 'diagnosticMode']);
+
+function isInvalidRelationLookupArgument(input: unknown): boolean {
+  return input !== undefined
+    && !isRelationKeyInput(input)
+    && !isPredicateData(input)
+    && !isDbQueryOptions(input);
+}
+
+function isDbQueryOptions(input: unknown): input is DbQueryOptions {
+  return isRecord(input)
+    && !Array.isArray(input)
+    && Object.keys(input).every((key) => dbQueryOptionKeys.has(key));
 }
 
 function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput): string {
@@ -8167,7 +8304,7 @@ function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput
   const keyValues = values.map((valueValue, indexValue) => {
     const fieldName = fields[indexValue];
     const spec = fieldName === undefined ? undefined : relationRef.fields[fieldName];
-    return spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
+    return spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
   });
   return stableKey(keyValues);
 }
@@ -8178,11 +8315,7 @@ function relationKeyInputMatchesRow(
   rowValue: Record<string, unknown>
 ): boolean {
   const fields = relationKeyFields(relationRef);
-  const fieldName = fields.length === 1 ? fields[0] : undefined;
-  if (fieldName !== undefined && !Array.isArray(input) && canCompareRelationKeyAtom(input)) {
-    return relationKeyFieldValueMatches(relationRef, rowValue, fieldName, input);
-  }
-  return rowKey(relationRef, rowValue) === relationKeyInputToKey(relationRef, input);
+  return relationKeyFieldsMatchInput(relationRef, rowValue, fields, input);
 }
 
 function relationRowKeyMatchesRow(
@@ -8213,13 +8346,36 @@ function relationKeyFieldValueMatches(
   if (fieldValue === undefined) return false;
   const spec = relationRef.fields[fieldName];
   const left = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
-  const right = spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
+  const right = spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
   return left !== undefined && right !== undefined && Object.is(left, right);
+}
+
+function relationKeyFieldsMatchInput(
+  relationRef: RelationRef,
+  rowValue: Record<string, unknown>,
+  fields: readonly string[],
+  input: RelationKeyInput
+): boolean {
+  const values = Array.isArray(input) ? input : [input];
+  if (values.length !== fields.length) return false;
+  for (let index = 0; index < fields.length; index += 1) {
+    const fieldName = fields[index];
+    const valueValue = values[index];
+    if (
+      fieldName === undefined
+      || valueValue === undefined
+      || !canCompareRelationKeyAtom(valueValue)
+      || !relationKeyFieldValueMatches(relationRef, rowValue, fieldName, valueValue)
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function relationSourceLookupValueForKey(spec: FieldSpec | undefined, keyInput: unknown): unknown {
   if (spec?.valueKind !== 'custom' || spec.custom?.toScalar === undefined) return keyInput;
-  return fieldKeyValue(spec, keyInput);
+  return fieldKeyInputValue(spec, keyInput);
 }
 
 function canCompareRelationKeyAtom(input: unknown): boolean {
@@ -8371,7 +8527,14 @@ function isUsableRelationRef(input: unknown): input is RelationRef {
 
 function keyArityDiagnostics(relationRef: RelationRef, key: unknown, patch: unknown): readonly TarstateDiagnostic[] {
   const fields = relationKeyFields(relationRef);
-  if (fields.length <= 1) return [];
+  if (!isRelationKeyInput(key)) {
+    return [writePatchInvalidDiagnostic(`relation "${relationRef.name}" key values must be strings, finite numbers, or booleans`, patch, relationRef.name)];
+  }
+  if (fields.length <= 1) {
+    return Array.isArray(key)
+      ? [writePatchInvalidDiagnostic(`relation "${relationRef.name}" single-field key requires one scalar value`, patch, relationRef.name)]
+      : [];
+  }
   return Array.isArray(key) && key.length === fields.length
     ? []
     : [writePatchInvalidDiagnostic(`relation "${relationRef.name}" composite key requires ${fields.length} values`, patch, relationRef.name)];
@@ -9498,9 +9661,28 @@ function fieldReadValue(spec: FieldSpec | undefined, valueValue: unknown): unkno
 function fieldKeyValue(spec: FieldSpec, valueValue: unknown): unknown {
   if (spec.valueKind !== 'custom') return valueValue;
   if (valueValue === null || valueValue === undefined) return valueValue;
+  if (!fieldValueMatchesSpec(spec, valueValue)) return undefined;
   if (spec.custom?.stableKey !== undefined) return spec.custom.stableKey(valueValue);
-  if (spec.custom?.toScalar !== undefined) return spec.custom.toScalar(valueValue);
+  if (spec.custom?.toScalar !== undefined) {
+    const scalar = spec.custom.toScalar(valueValue);
+    return isCustomKeyScalar(scalar) ? scalar : undefined;
+  }
   return undefined;
+}
+
+function fieldKeyInputValue(spec: FieldSpec, valueValue: unknown): unknown {
+  if (spec.valueKind !== 'custom') return valueValue;
+  if (!isRelationKeyScalar(valueValue)) return undefined;
+  if (spec.custom?.stableKey !== undefined) return valueValue;
+  if (spec.custom?.toScalar !== undefined && fieldValueMatchesSpec(spec, valueValue)) {
+    const scalar = spec.custom.toScalar(valueValue);
+    return isCustomKeyScalar(scalar) ? scalar : undefined;
+  }
+  return valueValue;
+}
+
+function isCustomKeyScalar(input: unknown): input is string | number | boolean {
+  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
 }
 
 function fieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
@@ -9546,7 +9728,7 @@ function fieldSpecDescription(spec: FieldSpec): string {
     case 'json':
       return 'a JSON value';
     case 'custom':
-      return spec.custom?.description ?? `a ${spec.custom?.kind ?? 'custom'} value`;
+      return spec.custom?.description ?? `a ${spec.custom?.codec ?? 'custom'} value`;
     default:
       return `a ${spec.valueKind}`;
   }

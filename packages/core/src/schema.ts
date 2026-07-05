@@ -8,14 +8,14 @@ export type RefTarget = {
 type PrimitiveFieldKind = 'string' | 'number' | 'boolean' | 'id' | 'ref' | 'anchoredPath' | 'json' | 'custom';
 
 export type CustomFieldSpec<Value = unknown> = {
-  readonly kind: string;
+  readonly codec: string;
   readonly description?: string;
   readonly validate?: (value: unknown) => boolean;
   readonly stableKey?: (value: unknown) => string;
   readonly compare?: (left: unknown, right: unknown) => number;
   readonly toScalar?: (value: unknown) => string | number | boolean | null;
   readonly fromScalar?: (value: unknown) => unknown;
-  readonly valueType?: Value;
+  readonly __value?: Value;
 };
 
 export type FieldSpec<Value = unknown> = {
@@ -222,12 +222,16 @@ export const idField = (domain: string): FieldSpec<string> => ({ ...fieldSpec<st
 export const refField = (target: string | RefTarget): FieldSpec<string> => ({ ...fieldSpec<string>('ref'), ref: target });
 export const customField = <Value = unknown>(spec: CustomFieldSpec<Value> | string): FieldSpec<Value> => ({
   ...fieldSpec<Value>('custom'),
-  custom: typeof spec === 'string' ? { kind: spec } : spec
+  custom: normalizeCustomFieldSpec(spec)
 });
 export const opaqueField = <Value = unknown>(spec: CustomFieldSpec<Value> | string = 'opaque'): FieldSpec<Value> =>
-  customField<Value>(typeof spec === 'string' ? { kind: spec } : spec);
+  customField<Value>(spec);
 export const nullable = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | null> => ({ ...spec, nullable: true });
 export const optional = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | undefined> => ({ ...spec, optional: true });
+
+function normalizeCustomFieldSpec<Value>(spec: CustomFieldSpec<Value> | string): CustomFieldSpec<Value> {
+  return typeof spec === 'string' ? { codec: spec } : spec;
+}
 
 export function toSchemaManifest(
   schema: Readonly<Record<string, AnyRelationRef>>,
@@ -293,7 +297,14 @@ export function hydrateSchemaManifest(
   manifest: unknown,
   options: HydrateSchemaManifestOptions & { readonly diagnosticMode: 'collect' }
 ): HydrateSchemaManifestResult;
-export function hydrateSchemaManifest(manifest: unknown, options?: HydrateSchemaManifestOptions): HydratedSchema;
+export function hydrateSchemaManifest(
+  manifest: unknown,
+  options?: HydrateSchemaManifestOptions & { readonly diagnosticMode?: 'throw' | 'warn' }
+): HydratedSchema;
+export function hydrateSchemaManifest(
+  manifest: unknown,
+  options: HydrateSchemaManifestOptions
+): HydratedSchema | HydrateSchemaManifestResult;
 export function hydrateSchemaManifest(
   manifest: unknown,
   options: HydrateSchemaManifestOptions = {}
@@ -321,7 +332,9 @@ export function hydrateSchemaManifest(
       name: relationName
     };
   }
-  return defineSchema(runtimeSchema) as HydratedSchema;
+  const schema = defineSchema(runtimeSchema) as HydratedSchema;
+  if (options.diagnosticMode === 'collect') return { schema, diagnostics };
+  return schema;
 }
 
 export function isJsonValue(input: unknown): input is JsonValue {
@@ -737,9 +750,8 @@ function manifestFieldFromSpec(
       return { ...base, type: 'ref', target: target ?? { relation: '', field: '' } };
     }
     case 'custom': {
-      const codec = spec.custom?.kind;
+      const codec = customFieldCodec(spec.custom, [...path, 'codec'], diagnostics);
       if (codec === undefined || codec === '') {
-        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', [...path, 'codec'], 'Custom fields must declare a non-empty codec kind.'));
         return { ...base, type: 'custom', codec: '' };
       }
       if (codecs[codec] === undefined) {
@@ -786,7 +798,7 @@ function fieldSpecFromManifest(
     case 'custom': {
       const runtimeCodec = codecs[field.codec] ?? { codec: field.codec };
       spec = customField({
-        kind: runtimeCodec.codec,
+        codec: runtimeCodec.codec,
         ...(runtimeCodec.description === undefined ? {} : { description: runtimeCodec.description }),
         ...(runtimeCodec.validate === undefined ? {} : { validate: runtimeCodec.validate }),
         ...(runtimeCodec.stableKey === undefined ? {} : { stableKey: runtimeCodec.stableKey }),
@@ -800,6 +812,23 @@ function fieldSpecFromManifest(
   if (field.nullable === true) spec = nullable(spec);
   if (field.optional === true) spec = optional(spec);
   return spec;
+}
+
+function customFieldCodec(
+  spec: CustomFieldSpec | undefined,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): string | undefined {
+  if (spec === undefined) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', path, 'Custom fields must declare a non-empty codec.'));
+    return undefined;
+  }
+  const codec = spec.codec;
+  if (codec === undefined || codec === '') {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', path, 'Custom fields must declare a non-empty codec.'));
+    return undefined;
+  }
+  return codec;
 }
 
 function manifestKeyFromRelation(input: string | readonly string[]): string | readonly [string, string, ...string[]] {
@@ -1142,11 +1171,67 @@ function sortedEntries<T>(record: Readonly<Record<string, T>>): readonly (readon
 }
 
 function stringifyCanonicalJson(input: JsonValue): string {
-  if (input === null || typeof input === 'boolean' || typeof input === 'number' || typeof input === 'string') {
-    return JSON.stringify(input);
+  const nativeStringifyValue = canonicalValueForNativeJsonStringify(input);
+  if (nativeStringifyValue !== undefined) return JSON.stringify(nativeStringifyValue);
+  const jsonChunks: string[] = [];
+  appendManualCanonicalJson(input, jsonChunks, new Map<string, string>());
+  return jsonChunks.join('');
+}
+
+function canonicalValueForNativeJsonStringify(input: JsonValue): JsonValue | undefined {
+  if (input === null || typeof input !== 'object') return input;
+  if (Array.isArray(input)) {
+    const canonicalArray: JsonValue[] = [];
+    for (let index = 0; index < input.length; index += 1) {
+      const value = canonicalValueForNativeJsonStringify(input[index] as JsonValue);
+      if (value === undefined) return undefined;
+      canonicalArray.push(value);
+    }
+    return canonicalArray;
   }
-  if (Array.isArray(input)) return `[${input.map((item) => stringifyCanonicalJson(item)).join(',')}]`;
-  return `{${sortedEntries(input as JsonObject).map(([key, value]) => `${JSON.stringify(key)}:${stringifyCanonicalJson(value)}`).join(',')}}`;
+  const record = input as JsonObject;
+  const canonicalObject: Record<string, JsonValue> = {};
+  for (const key of Object.keys(record).sort(compareCodeUnits)) {
+    if (isArrayIndexKey(key)) return undefined;
+    const value = canonicalValueForNativeJsonStringify(record[key] as JsonValue);
+    if (value === undefined) return undefined;
+    canonicalObject[key] = value;
+  }
+  return canonicalObject;
+}
+
+function appendManualCanonicalJson(input: JsonValue, jsonChunks: string[], encodedObjectKeys: Map<string, string>): void {
+  if (input === null || typeof input === 'boolean' || typeof input === 'number' || typeof input === 'string') {
+    jsonChunks.push(JSON.stringify(input));
+    return;
+  }
+  if (Array.isArray(input)) {
+    jsonChunks.push('[');
+    for (let index = 0; index < input.length; index += 1) {
+      if (index > 0) jsonChunks.push(',');
+      appendManualCanonicalJson(input[index] as JsonValue, jsonChunks, encodedObjectKeys);
+    }
+    jsonChunks.push(']');
+    return;
+  }
+  const record = input as JsonObject;
+  const keys = Object.keys(record).sort(compareCodeUnits);
+  jsonChunks.push('{');
+  for (let index = 0; index < keys.length; index += 1) {
+    if (index > 0) jsonChunks.push(',');
+    const key = keys[index] as string;
+    jsonChunks.push(cachedJsonStringKey(key, encodedObjectKeys), ':');
+    appendManualCanonicalJson(record[key] as JsonValue, jsonChunks, encodedObjectKeys);
+  }
+  jsonChunks.push('}');
+}
+
+function cachedJsonStringKey(key: string, encodedObjectKeys: Map<string, string>): string {
+  const existing = encodedObjectKeys.get(key);
+  if (existing !== undefined) return existing;
+  const encoded = JSON.stringify(key);
+  encodedObjectKeys.set(key, encoded);
+  return encoded;
 }
 
 function hasUnpairedSurrogate(input: string): boolean {

@@ -80,6 +80,23 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
         fileName: (_format, entryName) => entryName + '.js'
       }
     }
+  },
+  '@tarstate/schema-tools': {
+    build: {
+      ...sharedBuildOptions,
+      lib: {
+        entry: {
+          index: 'src/index.ts',
+          cli: 'src/cli.ts'
+        },
+        formats: ['es'],
+        fileName: (_format, entryName) => entryName + '.js'
+      },
+      rollupOptions: {
+        ...sharedBuildOptions.rollupOptions,
+        external: [/^@tarstate\/core(?:\/.*)?$/, /^node:/]
+      }
+    }
   }
 };
 
@@ -92,6 +109,8 @@ const sourceAliases = [
   sourceAlias('@tarstate/automerge/presence', 'packages/automerge/src/presence.ts'),
   sourceAlias('@tarstate/automerge', 'packages/automerge/src/index.ts'),
   sourceAlias('@tarstate/react', 'packages/react/src/index.ts'),
+  sourceAlias('@tarstate/schema-tools/cli', 'packages/schema-tools/src/cli.ts'),
+  sourceAlias('@tarstate/schema-tools', 'packages/schema-tools/src/index.ts'),
   sourceAlias('@tarstate/core', 'packages/core/src/index.ts')
 ];
 

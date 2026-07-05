@@ -210,6 +210,11 @@ export type AutomergeMapRuntime<
 type Row = Record<string, unknown>;
 type MutableRecord = Record<string, unknown>;
 type StorageKind = 'array' | 'map';
+const automergeNativeFieldKind = Symbol.for('tarstate.automerge.nativeFieldKind');
+type RelationKeyLookup = {
+  readonly rowKey: string;
+  readonly storageKey: string;
+};
 type PathLookup =
   | { readonly status: 'found'; readonly value: unknown }
   | { readonly status: 'missing' }
@@ -1249,6 +1254,17 @@ function customSpecForField(spec: FieldSpec | undefined): CustomFieldSpec | unde
     : undefined;
 }
 
+function nativeAutomergeFieldKind(spec: FieldSpec | undefined): string | undefined {
+  const custom = customSpecForField(spec);
+  return custom === undefined
+    ? undefined
+    : (custom as Record<symbol, string | undefined>)[automergeNativeFieldKind] ?? nativeAutomergeFieldKindForCodec(custom.codec);
+}
+
+function nativeAutomergeFieldKindForCodec(codec: string): string | undefined {
+  return codec === 'automerge.text' || codec === 'automerge.counter' ? codec : undefined;
+}
+
 function rowsForRelation<DocumentShape extends object>(
   doc: Automerge.Doc<DocumentShape>,
   relations: readonly AnyMapRelation[],
@@ -1510,8 +1526,8 @@ function objectIdForRelation<DocumentShape extends object>(
   relationRef: RelationRef,
   keyValue: unknown
 ): Automerge.ObjID | null {
-  const key = keyValueFor(relationRef, keyValue);
-  if (key === undefined) return null;
+  const keyLookup = relationKeyLookupFor(relationRef, keyValue);
+  if (keyLookup === undefined) return null;
 
   for (const mapping of relations) {
     if (mapping.relation.name !== relationRef.name) continue;
@@ -1520,7 +1536,7 @@ function objectIdForRelation<DocumentShape extends object>(
     if (lookup.status !== 'found') continue;
 
     if (isRecord(lookup.value)) {
-      const objectId = objectIdForMapKey(mapping.relation, lookup.value, keyValue, key);
+      const objectId = objectIdForMapKey(mapping.relation, lookup.value, keyLookup);
       if (objectId !== undefined) return objectId;
     }
 
@@ -1530,7 +1546,7 @@ function objectIdForRelation<DocumentShape extends object>(
         ? Object.values(lookup.value)
         : [];
     for (const value of values) {
-      if (currentRowKey(mapping.relation, value) === key) return Automerge.getObjectId(value);
+      if (currentRowKey(mapping.relation, value) === keyLookup.rowKey) return Automerge.getObjectId(value);
     }
   }
 
@@ -1540,15 +1556,12 @@ function objectIdForRelation<DocumentShape extends object>(
 function objectIdForMapKey(
   relation: RelationRef,
   values: Record<string, unknown>,
-  keyValue: unknown,
-  normalizedKey: string
+  keyLookup: RelationKeyLookup
 ): Automerge.ObjID | undefined {
-  const property = storageKeyForKeyValue(relation, keyValue);
-  if (property === undefined) return undefined;
-  if (!Object.prototype.hasOwnProperty.call(values, property)) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(values, keyLookup.storageKey)) return undefined;
 
-  const value = values[property];
-  if (currentRowKey(relation, value) !== normalizedKey) return undefined;
+  const value = values[keyLookup.storageKey];
+  if (currentRowKey(relation, value) !== keyLookup.rowKey) return undefined;
 
   return Automerge.getObjectId(value) ?? undefined;
 }
@@ -1985,7 +1998,7 @@ function incrementRowByKey(
       fieldName
     ));
   }
-  if (customSpecForField(fieldSpec)?.kind !== 'automerge.counter') {
+  if (nativeAutomergeFieldKind(fieldSpec) !== 'automerge.counter') {
     return rejected(fieldInvalidDiagnostic(
       relation.name,
       fieldName,
@@ -2734,7 +2747,7 @@ function updateTextFieldValue(
   current: unknown,
   next: unknown
 ): boolean {
-  if (customSpecForField(spec)?.kind !== 'automerge.text') return false;
+  if (nativeAutomergeFieldKind(spec) !== 'automerge.text') return false;
   // Automerge 3.2.6 updateText targets string/text objects by path; ImmutableString is a scalar and throws.
   if (typeof current !== 'string' || typeof next !== 'string') return false;
 
@@ -2788,7 +2801,7 @@ function applyNativeCounterIncrement(
   field: string,
   amount: number
 ): boolean {
-  if (customSpecForField(spec)?.kind !== 'automerge.counter') return false;
+  if (nativeAutomergeFieldKind(spec) !== 'automerge.counter') return false;
   const counter = target[field];
   if (!Automerge.isCounter(counter)) return false;
 
@@ -2829,6 +2842,7 @@ function validatePlanRow(plan: RowPlan, row: Row): readonly TarstateDiagnostic[]
 
 function validateRelationRowForAutomerge(relation: RelationRef, row: Row): readonly TarstateDiagnostic[] {
   const diagnostics: TarstateDiagnostic[] = [];
+  const invalidFields = new Set<string>();
 
   for (const [fieldName, spec] of Object.entries(relation.fields)) {
     const hasField = Object.prototype.hasOwnProperty.call(row, fieldName);
@@ -2850,6 +2864,7 @@ function validateRelationRowForAutomerge(relation: RelationRef, row: Row): reado
     }
 
     if (!fieldValueMatchesSpec(spec, fieldValue)) {
+      invalidFields.add(fieldName);
       diagnostics.push(fieldInvalidDiagnostic(
         relation.name,
         fieldName,
@@ -2867,6 +2882,7 @@ function validateRelationRowForAutomerge(relation: RelationRef, row: Row): reado
     }
 
     const spec = relation.fields[keyField];
+    if (invalidFields.has(keyField)) continue;
     if (
       spec?.valueKind === 'custom'
       && spec.custom?.stableKey === undefined
@@ -2876,6 +2892,18 @@ function validateRelationRowForAutomerge(relation: RelationRef, row: Row): reado
         relation.name,
         keyField,
         `relation "${relation.name}" key field "${keyField}" must define stableKey or toScalar`,
+        keyValue
+      ));
+    } else if (
+      spec?.valueKind === 'custom'
+      && spec.custom?.stableKey === undefined
+      && spec.custom?.toScalar !== undefined
+      && fieldRowKeyValue(spec, keyValue) === undefined
+    ) {
+      diagnostics.push(fieldInvalidDiagnostic(
+        relation.name,
+        keyField,
+        `relation "${relation.name}" key field "${keyField}" must convert to a string, finite number, or boolean`,
         keyValue
       ));
     }
@@ -2907,7 +2935,7 @@ function fieldValueMatchesSpec(spec: RelationRef['fields'][string], value: unkno
 
 function fieldSpecDescription(spec: RelationRef['fields'][string]): string {
   const custom = customSpecForField(spec);
-  if (custom !== undefined) return custom.description ?? `a ${custom.kind ?? 'custom'} value`;
+  if (custom !== undefined) return custom.description ?? `a ${custom.codec} value`;
 
   switch (spec.valueKind) {
     case 'id':
@@ -2943,62 +2971,90 @@ function relationKeyFields(relation: RelationRef): readonly string[] {
 
 function rowKeyFor(relation: RelationRef, row: Row): string | undefined {
   const values = relationKeyFields(relation)
-    .map((field) => fieldKeyValue(relation.fields[field], row[field]));
-  return values.some((value) => value === undefined) ? undefined : stableStringify(values);
+    .map((field) => fieldRowKeyValue(relation.fields[field], row[field]));
+  return values.some((value) => value === undefined) ? undefined : stableKey(values);
 }
 
 function keyValueFor(relation: RelationRef, keyValue: unknown): string | undefined {
-  const fields = relationKeyFields(relation);
-  const inputValues = fields.length === 1 && (!Array.isArray(keyValue) || keyValue.length !== 1)
-    ? [keyValue]
-    : Array.isArray(keyValue)
-      ? keyValue
-      : undefined;
-  const values = inputValues?.map((value, index) => fieldKeyValue(relation.fields[fields[index] as string], value));
+  return relationKeyLookupFor(relation, keyValue)?.rowKey;
+}
 
-  return values !== undefined && values.length === fields.length
-    && values.every((value) => value !== undefined)
-    ? stableStringify(values)
+function relationKeyLookupFor(relation: RelationRef, keyValue: unknown): RelationKeyLookup | undefined {
+  const fields = relationKeyFields(relation);
+  const values = relationKeyValuesForInput(relation, fields, keyValue);
+  if (values === undefined) return undefined;
+
+  return {
+    rowKey: stableKey(values),
+    storageKey: storageKeyForValues(fields, values)
+  };
+}
+
+function relationKeyValuesForInput(
+  relation: RelationRef,
+  fields: readonly string[],
+  keyValue: unknown
+): readonly unknown[] | undefined {
+  const inputValues = relationKeyInputValues(fields, keyValue);
+  const values = inputValues?.map((value, index) =>
+    fieldKeyInputValue(relation.fields[fields[index] as string], value));
+  return values !== undefined && values.length === fields.length && values.every((value) => value !== undefined)
+    ? values
     : undefined;
 }
 
-function storageKeyForKeyValue(relation: RelationRef, keyValue: unknown): string | undefined {
-  const fields = relationKeyFields(relation);
-  const inputValues = fields.length === 1 && (!Array.isArray(keyValue) || keyValue.length !== 1)
-    ? [keyValue]
-    : Array.isArray(keyValue)
-      ? keyValue
-      : undefined;
-  const values = inputValues?.map((value, index) => fieldKeyValue(relation.fields[fields[index] as string], value));
-  if (values === undefined || values.length !== fields.length || values.some((value) => value === undefined)) return undefined;
-
+function storageKeyForValues(fields: readonly string[], values: readonly unknown[]): string {
   if (fields.length === 1) {
     const value = values[0];
     if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
   }
 
-  return stableStringify(values);
+  return stableKey(values);
 }
 
 function storageKeyForRow(relation: RelationRef, row: Row): string {
   const fields = relationKeyFields(relation);
-  const values = fields.map((field) => fieldKeyValue(relation.fields[field], row[field]));
-
-  if (fields.length === 1) {
-    const value = values[0];
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
-  }
-
-  return stableStringify(values);
+  const values = fields.map((field) => fieldRowKeyValue(relation.fields[field], row[field]));
+  return storageKeyForValues(fields, values);
 }
 
-function fieldKeyValue(spec: RelationRef['fields'][string] | undefined, value: unknown): unknown {
+function relationKeyInputValues(fields: readonly string[], keyValue: unknown): readonly unknown[] | undefined {
+  if (fields.length === 1) return isRelationKeyScalar(keyValue) ? [keyValue] : undefined;
+  if (!Array.isArray(keyValue) || keyValue.length !== fields.length) return undefined;
+  return keyValue.every(isRelationKeyScalar) ? keyValue : undefined;
+}
+
+function fieldRowKeyValue(spec: RelationRef['fields'][string] | undefined, value: unknown): unknown {
   const custom = customSpecForField(spec);
   if (custom === undefined) return value;
   if (value === null || value === undefined) return value;
+  if (spec === undefined || !fieldValueMatchesSpec(spec, value)) return undefined;
   if (custom.stableKey !== undefined) return custom.stableKey(value);
-  if (custom.toScalar !== undefined) return custom.toScalar(value);
+  if (custom.toScalar !== undefined) {
+    const scalar = custom.toScalar(value);
+    return isCustomKeyScalar(scalar) ? scalar : undefined;
+  }
   return undefined;
+}
+
+function fieldKeyInputValue(spec: RelationRef['fields'][string] | undefined, value: unknown): unknown {
+  const custom = customSpecForField(spec);
+  if (custom === undefined) return value;
+  if (!isRelationKeyScalar(value)) return undefined;
+  if (custom.stableKey !== undefined) return value;
+  if (custom.toScalar !== undefined && spec !== undefined && fieldValueMatchesSpec(spec, value)) {
+    const scalar = custom.toScalar(value);
+    return isCustomKeyScalar(scalar) ? scalar : undefined;
+  }
+  return value;
+}
+
+function isRelationKeyScalar(input: unknown): input is string | number | boolean {
+  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
+}
+
+function isCustomKeyScalar(input: unknown): input is string | number | boolean {
+  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
 }
 
 function relationNamesFor(relations: readonly { readonly relation: RelationRef }[]): readonly string[] {

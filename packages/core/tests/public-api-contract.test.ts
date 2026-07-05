@@ -54,7 +54,7 @@ import {
   type TarstateDiagnosticSeverity
 } from '@tarstate/core/diagnostics';
 import { relationDeltaNames, relationDeltas, type RelationDelta } from '@tarstate/core/delta';
-import { validateRelationRow, type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
+import { rowKey, validateRelationRow, type EvaluateOptions, type QueryResult } from '@tarstate/core/evaluate';
 import {
   demat,
   index as materializedIndex,
@@ -124,6 +124,9 @@ import {
   toSchemaManifest,
   validateSchemaManifest,
   type CustomFieldSpec,
+  type HydratedSchema,
+  type HydrateSchemaManifestOptions,
+  type HydrateSchemaManifestResult,
   type RuntimeCodec,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
@@ -136,15 +139,20 @@ import {
   type StoreViewSnapshot
 } from '@tarstate/core/store';
 import {
+  deleteByKey,
   deleteExact,
   incrementByKey,
   insert,
   seed,
+  updateByKey,
   write,
+  type DeleteByKeyPatch,
   type IncrementByKeyPatch,
+  type RelationKeyInput,
   type RelationNumericField,
   type SchemaSeedInput,
-  type SchemaSeedPatches
+  type SchemaSeedPatches,
+  type UpdateByKeyPatch
 } from '@tarstate/core/write';
 import {
   diffQuery,
@@ -335,7 +343,7 @@ describe('public API contracts', () => {
         fields: {
           id: idField('food.price'),
           amount: customField<Price['amount']>({
-            kind: 'food.money',
+            codec: 'food.money',
             description: 'Money amount',
             toScalar: moneyCodec.toScalar
           })
@@ -389,8 +397,48 @@ describe('public API contracts', () => {
     const hydrated = hydrateSchemaManifest(manifest, { codecs: { 'food.money': moneyCodec } });
     expect(hydrated.pizzas?.name).toBe('pizzas');
     expect(hydrated.toppings?.fields.pizzaId?.ref).toEqual({ relation: 'pizzas', field: 'id' });
-    expect(hydrated.prices?.fields.amount?.custom?.kind).toBe('food.money');
+    expect(hydrated.prices?.fields.amount?.custom?.codec).toBe('food.money');
+    expect(hydrated.prices?.fields.amount?.custom).not.toHaveProperty('kind');
     expect(hydrated.prices?.fields.amount?.custom?.toScalar?.({ currency: 'NZD', cents: 2400 })).toBe('NZD:2400');
+    const collectedHydration = hydrateSchemaManifest(manifest, {
+      diagnosticMode: 'collect',
+      codecs: { 'food.money': moneyCodec }
+    });
+    expectTypeOf<typeof collectedHydration>().toEqualTypeOf<HydrateSchemaManifestResult>();
+    expect(collectedHydration.diagnostics).toEqual([]);
+    expect(collectedHydration.schema?.prices?.name).toBe('prices');
+    const broadHydrationOptions: HydrateSchemaManifestOptions = {
+      diagnosticMode: 'collect',
+      codecs: { 'food.money': moneyCodec }
+    };
+    const broadHydration = hydrateSchemaManifest(manifest, broadHydrationOptions);
+    expectTypeOf<typeof broadHydration>().toEqualTypeOf<HydratedSchema | HydrateSchemaManifestResult>();
+    expect((broadHydration as HydrateSchemaManifestResult).schema?.prices?.name).toBe('prices');
+
+    const runtimeManifest = toSchemaManifest(runtimeSystemRelations, { schemaId: 'tarstate.runtime@1' });
+    expect(validateSchemaManifest(runtimeManifest)).toEqual([]);
+    expect(runtimeManifest.relations['tarstate.runtime.objectLocations']?.fields.parentObjectId).toEqual({
+      type: 'id',
+      domain: 'tarstate.runtime.object',
+      optional: true
+    });
+
+    const invalidCodecSchema = defineSchema({
+      notes: relation<{ readonly id: string; readonly body: unknown }>({
+        key: 'id',
+        fields: {
+          id: stringField(),
+          body: customField({ codec: '' })
+        }
+      })
+    });
+    try {
+      toSchemaManifest(invalidCodecSchema, { schemaId: 'bad.codec@1' });
+      throw new Error('expected schema manifest export to fail');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SchemaManifestValidationError);
+      expect((error as SchemaManifestValidationError).diagnostics.map((diagnosticValue) => diagnosticValue.code)).toContain('schema_manifest.invalid_codec');
+    }
   });
 
   it('validates schema manifests before canonicalization and hydration', () => {
@@ -685,6 +733,14 @@ describe('public API contracts', () => {
       readonly id: string;
       readonly amount: number;
     };
+    type FlagEntry = {
+      readonly enabled: boolean;
+      readonly label: string;
+    };
+    type NumberKeyEntry = {
+      readonly id: number;
+      readonly label: string;
+    };
     const keyedSchema = defineSchema({
       byId: relation<KeyedEntry, 'id'>({
         key: 'id',
@@ -700,28 +756,75 @@ describe('public API contracts', () => {
           id: stringField(),
           amount: numberField()
         }
+      }),
+      byEnabled: relation<FlagEntry, 'enabled'>({
+        key: 'enabled',
+        fields: {
+          enabled: booleanField(),
+          label: stringField()
+        }
+      }),
+      byNumber: relation<NumberKeyEntry, 'id'>({
+        key: 'id',
+        fields: {
+          id: numberField(),
+          label: stringField()
+        }
       })
     });
 
     const readById = () => row(openingDb, keyedSchema.byId, 'entry-a');
     const readByTenantAndId = () => row(openingDb, keyedSchema.byTenantAndId, ['acme', 'entry-a'] as const);
+    const readByEnabled = () => row(openingDb, keyedSchema.byEnabled, true);
+    const readByNumber = () => row(openingDb, keyedSchema.byNumber, 1);
     const hasById = () => exists(openingDb, keyedSchema.byId, 'entry-a');
+    const hasByEnabled = () => exists(openingDb, keyedSchema.byEnabled, false);
+    const hasByNumber = () => exists(openingDb, keyedSchema.byNumber, 2);
+    const updateFlag = () => updateByKey(keyedSchema.byEnabled, true, { label: 'Enabled' });
+    const deleteFlag = () => deleteByKey(keyedSchema.byEnabled, false);
     const incrementAmount = () => incrementByKey(keyedSchema.byId, 'entry-a', 'amount', 2);
     const rootIncrementAmount = () => rootIncrementByKey(keyedSchema.byId, 'entry-a', 'amount', 2);
     const writerIncrementAmount = () => write(keyedSchema.byTenantAndId).incrementByKey(['acme', 'entry-a'] as const, 'amount', 2);
+    const flagDb = createDb({
+      byEnabled: [
+        { enabled: true, label: 'Enabled' },
+        { enabled: false, label: 'Disabled' }
+      ],
+      byNumber: [
+        { id: 1, label: 'One' },
+        { id: 2, label: 'Two' }
+      ]
+    });
 
     expectTypeOf<ReturnType<typeof readById>>().toEqualTypeOf<KeyedEntry | undefined>();
     expectTypeOf<ReturnType<typeof readByTenantAndId>>().toEqualTypeOf<TenantEntry | undefined>();
+    expectTypeOf<ReturnType<typeof readByEnabled>>().toEqualTypeOf<FlagEntry | undefined>();
+    expectTypeOf<ReturnType<typeof readByNumber>>().toEqualTypeOf<NumberKeyEntry | undefined>();
     expectTypeOf<ReturnType<typeof hasById>>().toEqualTypeOf<boolean>();
+    expectTypeOf<ReturnType<typeof hasByEnabled>>().toEqualTypeOf<boolean>();
+    expectTypeOf<ReturnType<typeof hasByNumber>>().toEqualTypeOf<boolean>();
+    expectTypeOf<ReturnType<typeof updateFlag>>().toEqualTypeOf<UpdateByKeyPatch<typeof keyedSchema.byEnabled>>();
+    expectTypeOf<ReturnType<typeof deleteFlag>>().toEqualTypeOf<DeleteByKeyPatch<typeof keyedSchema.byEnabled>>();
     expectTypeOf<ReturnType<typeof incrementAmount>>().toEqualTypeOf<IncrementByKeyPatch<typeof keyedSchema.byId>>();
     expectTypeOf<ReturnType<typeof rootIncrementAmount>>().toEqualTypeOf<RootIncrementByKeyPatch<typeof keyedSchema.byId>>();
     expectTypeOf<ReturnType<typeof rootIncrementAmount>>().toEqualTypeOf<ReturnType<typeof incrementAmount>>();
     expectTypeOf<ReturnType<typeof writerIncrementAmount>>().toEqualTypeOf<IncrementByKeyPatch<typeof keyedSchema.byTenantAndId>>();
     expectTypeOf<RootRelationNumericField<typeof keyedSchema.byId>>().toEqualTypeOf<RelationNumericField<typeof keyedSchema.byId>>();
+    expectTypeOf<RelationKeyInput>().toEqualTypeOf<string | number | boolean | readonly (string | number | boolean)[]>();
+    expect(row(flagDb, keyedSchema.byEnabled, true)).toEqual({ enabled: true, label: 'Enabled' });
+    expect(exists(flagDb, keyedSchema.byEnabled, false)).toBe(true);
+    expect(row(flagDb, keyedSchema.byNumber, 1)).toEqual({ id: 1, label: 'One' });
+    expect(exists(flagDb, keyedSchema.byNumber, 2)).toBe(true);
 
     const invalidReadById = () =>
       // @ts-expect-error row keys must match the relation key field type.
       row(openingDb, keyedSchema.byId, 1);
+    const invalidReadByEnabled = () =>
+      // @ts-expect-error boolean row keys must use boolean key values.
+      row(openingDb, keyedSchema.byEnabled, 'true');
+    const invalidReadByNumber = () =>
+      // @ts-expect-error numeric row keys must use numeric key values.
+      row(openingDb, keyedSchema.byNumber, '1');
     const invalidHasById = () =>
       // @ts-expect-error exists keys must match the relation key field type.
       exists(openingDb, keyedSchema.byId, 1);
@@ -744,9 +847,13 @@ describe('public API contracts', () => {
       // @ts-expect-error incrementByKey amount must be numeric.
       write(keyedSchema.byId).incrementByKey('entry-a', 'amount', '2');
     void invalidReadById;
+    void invalidReadByEnabled;
+    void invalidReadByNumber;
     void invalidHasById;
     void invalidCompositeRead;
     void invalidCompositeExists;
+    void updateFlag;
+    void deleteFlag;
     void incrementAmount;
     void rootIncrementAmount;
     void writerIncrementAmount;
@@ -762,7 +869,7 @@ describe('public API contracts', () => {
       readonly objectId: string;
     };
     const richTextSpec = {
-      kind: 'automergeText',
+      codec: 'automergeText',
       description: 'an Automerge text value',
       validate: (value: unknown): value is RichText =>
         typeof value === 'object'
@@ -783,6 +890,8 @@ describe('public API contracts', () => {
         }
       })
     });
+    expect(customSchema.notes.fields.body?.custom?.codec).toBe('automergeText');
+    expect(customSchema.notes.fields.body?.custom).not.toHaveProperty('kind');
 
     expect(validateRelationRow(customSchema.notes, {
       id: 'note-1',
@@ -822,7 +931,7 @@ describe('public API contracts', () => {
         key: 'id',
         fields: {
           id: customField<string>({
-            kind: 'caseInsensitiveKey',
+            codec: 'caseInsensitiveKey',
             validate: (value): value is string => typeof value === 'string',
             toScalar: (value) => typeof value === 'string' ? value.toLowerCase() : null
           }),
@@ -833,6 +942,10 @@ describe('public API contracts', () => {
     const normalizedKeyDb = createDb({
       tags: [{ id: 'Hello', label: 'Greeting' }]
     });
+    expect(validateRelationRow(normalizedKeySchema.tags, {
+      id: 'Hello',
+      label: 'Greeting'
+    })).toEqual([]);
     expect(row(normalizedKeyDb, normalizedKeySchema.tags, 'hello')).toEqual({ id: 'Hello', label: 'Greeting' });
     expect(row(normalizedKeyDb, normalizedKeySchema.tags, 'HELLO')).toEqual({ id: 'Hello', label: 'Greeting' });
 
@@ -849,7 +962,7 @@ describe('public API contracts', () => {
         key: 'id',
         fields: {
           id: customField<RichText>({
-            kind: 'automergeText',
+            codec: 'automergeText',
             stableKey: (value) => typeof value === 'object' && value !== null && 'objectId' in value
               ? String(value.objectId)
               : ''
@@ -869,6 +982,117 @@ describe('public API contracts', () => {
     expect(validateRelationRow(safeKeySchema.notes, {
       id: { text: 'hello', objectId: '1@actor' }
     })).toEqual([]);
+    const safeKeyDb = createDb({
+      notes: [
+        { id: { text: 'hello', objectId: '1@actor' } },
+        { id: { text: 'bye', objectId: '2@actor' } }
+      ]
+    });
+    expect(row(safeKeyDb, safeKeySchema.notes, '1@actor')).toEqual({ id: { text: 'hello', objectId: '1@actor' } });
+    expect(exists(safeKeyDb, safeKeySchema.notes, '2@actor')).toBe(true);
+    expect(row(safeKeyDb, safeKeySchema.notes, { text: 'hello', objectId: '1@actor' } as never)).toBeUndefined();
+    expect(tryTransact(
+      safeKeyDb,
+      updateByKey(safeKeySchema.notes, { text: 'hello', objectId: '1@actor' } as never, {})
+    ).diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'write_patch_invalid',
+        relation: 'notes',
+        message: expect.stringContaining('key values')
+      })
+    ]));
+    const invalidSafeKeyRead = () =>
+      // @ts-expect-error object custom key fields are looked up by their scalar stable key.
+      row(safeKeyDb, safeKeySchema.notes, { text: 'hello', objectId: '1@actor' });
+    void invalidSafeKeyRead;
+
+    const scalarObjectKeySchema = defineSchema({
+      notes: relation<{ readonly id: RichText; readonly visits: number }>({
+        key: 'id',
+        fields: {
+          id: customField<RichText>({
+            codec: 'richTextObjectId',
+            validate: (value): value is RichText => typeof value === 'object' && value !== null && 'objectId' in value,
+            toScalar: (value) => typeof value === 'object' && value !== null && 'objectId' in value ? String(value.objectId) : null
+          }),
+          visits: numberField()
+        }
+      })
+    });
+    const scalarObjectKeyDb = createDb({
+      notes: [
+        { id: { text: 'hello', objectId: '1@actor' }, visits: 1 },
+        { id: { text: 'bye', objectId: '2@actor' }, visits: 2 }
+      ]
+    });
+    expect(row(scalarObjectKeyDb, scalarObjectKeySchema.notes, '1@actor')).toEqual({ id: { text: 'hello', objectId: '1@actor' }, visits: 1 });
+    expect(exists(scalarObjectKeyDb, scalarObjectKeySchema.notes, '2@actor')).toBe(true);
+    const scalarObjectUpdate = tryTransact(
+      scalarObjectKeyDb,
+      updateByKey(scalarObjectKeySchema.notes, '1@actor', { visits: 3 })
+    );
+    expect(scalarObjectUpdate.diagnostics).toEqual([]);
+    expect(row(scalarObjectUpdate.db, scalarObjectKeySchema.notes, '1@actor')?.visits).toBe(3);
+    const scalarObjectIncrement = tryTransact(
+      scalarObjectKeyDb,
+      incrementByKey(scalarObjectKeySchema.notes, '1@actor', 'visits', 2)
+    );
+    expect(scalarObjectIncrement.diagnostics).toEqual([]);
+    expect(row(scalarObjectIncrement.db, scalarObjectKeySchema.notes, '1@actor')?.visits).toBe(3);
+    const scalarObjectDelete = tryTransact(
+      scalarObjectKeyDb,
+      deleteByKey(scalarObjectKeySchema.notes, '2@actor')
+    );
+    expect(scalarObjectDelete.diagnostics).toEqual([]);
+    expect(exists(scalarObjectDelete.db, scalarObjectKeySchema.notes, '2@actor')).toBe(false);
+    const invalidScalarObjectRead = () =>
+      // @ts-expect-error object custom key fields with toScalar are looked up by their scalar key.
+      row(scalarObjectKeyDb, scalarObjectKeySchema.notes, { text: 'hello', objectId: '1@actor' });
+    void invalidScalarObjectRead;
+
+    const invalidScalarKeySchema = defineSchema({
+      notes: relation<{ readonly id: RichText }>({
+        key: 'id',
+        fields: {
+          id: customField<RichText>({
+            codec: 'invalidScalarKey',
+            validate: (value): value is RichText => typeof value === 'object' && value !== null && 'objectId' in value,
+            toScalar: () => null
+          })
+        }
+      })
+    });
+    const invalidScalarKeyRow = { id: { text: 'hello', objectId: '1@actor' } };
+    expect(validateRelationRow(invalidScalarKeySchema.notes, invalidScalarKeyRow)).toEqual([
+      expect.objectContaining({
+        code: 'field_invalid',
+        field: 'id',
+        message: expect.stringContaining('string, finite number, or boolean')
+      })
+    ]);
+    expect(rowKey(invalidScalarKeySchema.notes, invalidScalarKeyRow)).toBeUndefined();
+
+    const throwingScalarKeySchema = defineSchema({
+      tags: relation<{ readonly id: string }>({
+        key: 'id',
+        fields: {
+          id: customField<string>({
+            codec: 'throwingScalarKey',
+            validate: (value): value is string => typeof value === 'string',
+            toScalar: (value) => (value as string).toLowerCase()
+          })
+        }
+      })
+    });
+    const invalidThrowingKeyRow = { id: 42 };
+    expect(validateRelationRow(throwingScalarKeySchema.tags, invalidThrowingKeyRow)).toEqual([
+      expect.objectContaining({
+        code: 'field_invalid',
+        field: 'id',
+        message: expect.stringContaining('must be')
+      })
+    ]);
+    expect(rowKey(throwingScalarKeySchema.tags, invalidThrowingKeyRow)).toBeUndefined();
   });
 
   it('installs and removes constraints through materialization inputs', () => {

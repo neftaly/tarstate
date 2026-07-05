@@ -43,6 +43,7 @@ import {
   refField,
   relation,
   stringField,
+  toSchemaManifest,
   type JsonValue
 } from '@tarstate/core/schema';
 import { createRuntimeStore } from '@tarstate/core/store';
@@ -299,6 +300,76 @@ describe('automerge map adapter', () => {
     expectTypeOf(createAutomergeDocHandleRuntime<WorkspaceDoc>).returns
       .toMatchTypeOf<AutomergeDocHandleRuntime<WorkspaceDoc>>();
     expectTypeOf(automergeMapSource<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapSource>();
+  });
+
+  it('exports automerge field helper codec overrides without alias conflicts', () => {
+    const overriddenSchema = defineSchema({
+      notes: relation<{ readonly id: string; readonly body: string; readonly views: number }>({
+        key: 'id',
+        fields: {
+          id: stringField(),
+          body: automergeTextField({ codec: 'app.text' }),
+          views: automergeCounterField({ codec: 'app.counter' })
+        }
+      })
+    });
+
+    expect(overriddenSchema.notes.fields.body?.custom?.codec).toBe('app.text');
+    expect(overriddenSchema.notes.fields.body?.custom).not.toHaveProperty('kind');
+    expect(overriddenSchema.notes.fields.views?.custom?.codec).toBe('app.counter');
+    expect(overriddenSchema.notes.fields.views?.custom).not.toHaveProperty('kind');
+    const manifest = toSchemaManifest(overriddenSchema, { schemaId: 'automerge.codec@1' });
+    expect(manifest.relations.notes?.fields.body).toEqual({ type: 'custom', codec: 'app.text' });
+    expect(manifest.relations.notes?.fields.views).toEqual({ type: 'custom', codec: 'app.counter' });
+    expect(manifest.codecs?.['app.text']).toEqual({ description: 'an Automerge text value', keyable: true });
+    expect(manifest.codecs?.['app.counter']).toEqual({ description: 'an Automerge counter value', keyable: true });
+  });
+
+  it('preserves native Automerge scalar behavior when helper codec names are overridden', async () => {
+    type OverrideRow = {
+      readonly id: string;
+      readonly body: string;
+      readonly views: number;
+    };
+    type OverrideDoc = {
+      readonly notes: readonly {
+        readonly id: string;
+        readonly body: string;
+        readonly views: Automerge.Counter;
+      }[];
+    };
+    const overrideSchema = defineSchema({
+      notes: relation<OverrideRow>({
+        key: 'id',
+        fields: {
+          id: stringField(),
+          body: automergeTextField({ codec: 'app.text' }),
+          views: automergeCounterField({ codec: 'app.counter' })
+        }
+      })
+    });
+    const overrideRelations = defineAutomergeMapRelations<OverrideDoc>()([
+      { relation: overrideSchema.notes, path: ['notes'] }
+    ]);
+    const adapter = automergeMapAdapter({
+      doc: Automerge.from<OverrideDoc>({
+        notes: [{ id: 'note-1', body: 'hello', views: new Automerge.Counter(3) }]
+      }),
+      relations: overrideRelations
+    });
+
+    const result = await adapter.target.apply([
+      write(overrideSchema.notes).updateByKey('note-1', { body: 'hullo' }),
+      write(overrideSchema.notes).incrementByKey('note-1', 'views', 4)
+    ]);
+
+    expect(result.status).toBe('accepted');
+    expect(result.diagnostics).toEqual([]);
+    expect(adapter.source.rows(overrideSchema.notes)).toEqual([{ id: 'note-1', body: 'hullo', views: 7 }]);
+    expect(typeof adapter.getDoc().notes[0]?.body).toBe('string');
+    expect(Automerge.isImmutableString(adapter.getDoc().notes[0]?.body)).toBe(false);
+    expect(Automerge.isCounter(adapter.getDoc().notes[0]?.views)).toBe(true);
+    expect(Number(adapter.getDoc().notes[0]?.views)).toBe(7);
   });
 
   it('publishes Automerge runtime state and active view interests as relation rows', () => {
@@ -1772,7 +1843,7 @@ describe('automerge map adapter', () => {
         key: ['owner', 'localId'],
         fields: {
           owner: customField<OwnerKey>({
-            kind: 'owner-key',
+            codec: 'owner-key',
             stableKey: ownerKey
           }),
           localId: stringField(),
@@ -1800,8 +1871,9 @@ describe('automerge map adapter', () => {
     }
 
     expect(staleObjectId).not.toBe(storedObjectId);
-    expect(adapter.objectIdFor(compositeSchema.routedItems, [ownerAlpha, 'first'])).toBe(storedObjectId);
-    expect(adapter.objectIdFor(compositeSchema.routedItems, [ownerAlpha, 'second'])).toBeNull();
+    expect(adapter.objectIdFor(compositeSchema.routedItems, ['team:alpha', 'first'])).toBe(storedObjectId);
+    expect(adapter.objectIdFor(compositeSchema.routedItems, [ownerAlpha, 'first'])).toBeNull();
+    expect(adapter.objectIdFor(compositeSchema.routedItems, ['team:alpha', 'second'])).toBeNull();
   });
 
   it('wraps stable Automerge view, fork, changeAt, and merge flows', () => {

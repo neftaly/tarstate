@@ -1075,8 +1075,8 @@ follows:
 | `refField("relation.field")` | `{ "type": "ref", "target": { "relation": relation, "field": field } }` |
 | `anchoredPathField()` | `{ "type": "anchoredPath" }` |
 | `jsonField()` | `{ "type": "json" }` |
-| `customField(spec)` / `customField("codec")` | `{ "type": "custom", "codec": spec.kind }` |
-| `opaqueField(spec)` / `opaqueField("codec")` | `{ "type": "custom", "codec": spec.kind }` |
+| `customField(spec)` / `customField("codec")` | `{ "type": "custom", "codec": spec.codec }` |
+| `opaqueField(spec)` / `opaqueField("codec")` | `{ "type": "custom", "codec": spec.codec }` |
 
 Current `refField(...)` stores its target as a string. Export MUST parse
 `"relation.field"` only when it contains exactly one dot and both sides are
@@ -1096,9 +1096,9 @@ Export MUST fail with `schema_manifest.invalid_key` if a key field is `json` or
 is a custom field without `stableKey` or `toScalar`.
 
 When exporting `customField` or `opaqueField`, the codec name MUST come from the
-custom spec `kind`. Export MUST fail with `schema_manifest.invalid_codec` if the
-kind is empty. Export MUST synthesize a codec declaration when `options.codecs`
-does not provide one:
+custom spec `codec`. Export MUST fail with `schema_manifest.invalid_codec` if
+the codec is missing or empty. Export MUST synthesize a codec declaration when
+`options.codecs` does not provide one:
 
 - `description` from `spec.description`
 - `keyable: true` when `spec.stableKey` or `spec.toScalar` is present

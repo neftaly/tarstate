@@ -4,9 +4,14 @@ export function valuesEqual(left: unknown, right: unknown): boolean {
 
 export function stableKey(input: unknown): string {
   if (input === undefined) return '~undefined';
-  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+  if (typeof input === 'number') {
+    if (Number.isNaN(input)) return '~number:NaN';
+    if (input === Infinity) return '~number:Infinity';
+    if (input === -Infinity) return '~number:-Infinity';
+    if (Object.is(input, -0)) return '~number:-0';
     return JSON.stringify(input);
   }
+  if (input === null || typeof input === 'string' || typeof input === 'boolean') return JSON.stringify(input);
   if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
   if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
   if (typeof input === 'function') return `~function:${input.name}`;
