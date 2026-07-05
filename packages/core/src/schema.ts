@@ -177,6 +177,10 @@ type JsonValueValidationContext = {
   readonly active: WeakSet<object>;
   readonly valid: WeakSet<object>;
 };
+type JsonValueCanonicalizationContext = {
+  readonly active: WeakSet<object>;
+  readonly values: WeakMap<object, JsonValue>;
+};
 type NonNullish<Value> = Exclude<Value, null | undefined>;
 type RelationInputField<Value> =
   NonNullish<Value> extends string ? FieldSpec<string | Extract<Value, null | undefined>>
@@ -230,7 +234,7 @@ export function toSchemaManifest(
   options: ToSchemaManifestOptions
 ): SchemaManifestV1 {
   const diagnostics: SchemaManifestDiagnosticV1[] = [];
-  const codecs: Record<string, CodecDeclarationV1> = { ...(options.codecs ?? {}) };
+  const codecs: Record<string, CodecDeclarationV1> = { ...options.codecs };
   const relations: Record<string, RelationManifestV1> = {};
 
   for (const [schemaKey, relationRef] of Object.entries(schema)) {
@@ -317,7 +321,7 @@ export function hydrateSchemaManifest(
       name: relationName
     };
   }
-  return defineSchema(runtimeSchema);
+  return defineSchema(runtimeSchema) as HydratedSchema;
 }
 
 export function isJsonValue(input: unknown): input is JsonValue {
@@ -389,4 +393,776 @@ function isPlainJsonObject(input: unknown, context: JsonValueValidationContext):
   } finally {
     context.active.delete(input);
   }
+}
+
+type SchemaManifestRecord = Record<string, unknown>;
+
+function normalizeSchemaManifest(input: unknown): {
+  readonly manifest?: SchemaManifestV1;
+  readonly diagnostics: readonly SchemaManifestDiagnosticV1[];
+} {
+  const diagnostics: SchemaManifestDiagnosticV1[] = [];
+  const record = plainRecord(input, [], diagnostics, 'schema_manifest.invalid');
+  if (record === undefined) return { diagnostics };
+
+  knownProperties(record, ['kind', 'formatVersion', 'schemaId', 'description', 'relations', 'codecs', 'metadata'], [], diagnostics);
+  requireProperty(record, 'kind', [], diagnostics);
+  requireProperty(record, 'formatVersion', [], diagnostics);
+  requireProperty(record, 'schemaId', [], diagnostics);
+  requireProperty(record, 'relations', [], diagnostics);
+  if (record.kind !== 'tarstate.schema') {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid', ['kind'], 'Expected kind "tarstate.schema".'));
+  }
+  if (record.formatVersion !== 1) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid', ['formatVersion'], 'Expected formatVersion 1.'));
+  }
+  const schemaId = nonEmptyString(record.schemaId, ['schemaId'], diagnostics, 'schema_manifest.invalid_name');
+  const description = optionalString(record, 'description', [], diagnostics);
+  const metadata = optionalMetadata(record, 'metadata', [], diagnostics);
+  const codecs = normalizeCodecDeclarations(record.codecs, ['codecs'], diagnostics);
+  const relations = normalizeRelations(record.relations, codecs, diagnostics);
+
+  const manifest = {
+    kind: 'tarstate.schema',
+    formatVersion: 1,
+    schemaId: schemaId ?? '',
+    ...(description === undefined ? {} : { description }),
+    relations,
+    ...(Object.keys(codecs).length === 0 ? {} : { codecs }),
+    ...(metadata === undefined || Object.keys(metadata).length === 0 ? {} : { metadata })
+  } satisfies SchemaManifestV1;
+  validateRefTargets(manifest, diagnostics);
+  return { manifest, diagnostics };
+}
+
+function normalizeCodecDeclarations(
+  input: unknown,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): Record<string, CodecDeclarationV1> {
+  if (input === undefined) return {};
+  const codecs = plainRecord(input, path, diagnostics, 'schema_manifest.invalid_codec');
+  if (codecs === undefined) return {};
+  const result: Record<string, CodecDeclarationV1> = {};
+  for (const [codecName, codec] of sortedEntries(codecs)) {
+    const codecPath = [...path, codecName];
+    if (!validName(codecName, codecPath, diagnostics, 'schema_manifest.invalid_name')) continue;
+    const declaration = plainRecord(codec, codecPath, diagnostics, 'schema_manifest.invalid_codec');
+    if (declaration === undefined) continue;
+    knownProperties(declaration, ['description', 'scalar', 'keyable', 'metadata'], codecPath, diagnostics);
+    const description = optionalString(declaration, 'description', codecPath, diagnostics);
+    const scalar = optionalScalar(declaration, 'scalar', codecPath, diagnostics);
+    const keyable = optionalBoolean(declaration, 'keyable', codecPath, diagnostics, 'schema_manifest.invalid_codec');
+    const metadata = optionalMetadata(declaration, 'metadata', codecPath, diagnostics);
+    result[codecName] = {
+      ...(description === undefined ? {} : { description }),
+      ...(scalar === undefined ? {} : { scalar }),
+      ...(keyable === true ? { keyable } : {}),
+      ...(metadata === undefined || Object.keys(metadata).length === 0 ? {} : { metadata })
+    };
+  }
+  return result;
+}
+
+function normalizeRelations(
+  input: unknown,
+  codecs: Readonly<Record<string, CodecDeclarationV1>>,
+  diagnostics: SchemaManifestDiagnosticV1[]
+): Record<string, RelationManifestV1> {
+  const relations = plainRecord(input, ['relations'], diagnostics, 'schema_manifest.invalid');
+  if (relations === undefined) return {};
+  const result: Record<string, RelationManifestV1> = {};
+  for (const [relationName, relationInput] of sortedEntries(relations)) {
+    const relationPath = ['relations', relationName];
+    if (!validName(relationName, relationPath, diagnostics, 'schema_manifest.invalid_name')) continue;
+    const relationRecord = plainRecord(relationInput, relationPath, diagnostics, 'schema_manifest.invalid');
+    if (relationRecord === undefined) continue;
+    knownProperties(relationRecord, ['key', 'fields', 'ephemeral', 'description', 'metadata'], relationPath, diagnostics);
+    requireProperty(relationRecord, 'key', relationPath, diagnostics);
+    requireProperty(relationRecord, 'fields', relationPath, diagnostics);
+    const fields = normalizeFields(relationRecord.fields, relationPath, codecs, diagnostics);
+    const keyFields = normalizeKey(relationRecord.key, [...relationPath, 'key'], diagnostics);
+    validateKeyFields(keyFields, fields, relationPath, codecs, diagnostics);
+    const description = optionalString(relationRecord, 'description', relationPath, diagnostics);
+    const ephemeral = optionalBoolean(relationRecord, 'ephemeral', relationPath, diagnostics, 'schema_manifest.invalid');
+    const metadata = optionalMetadata(relationRecord, 'metadata', relationPath, diagnostics);
+    result[relationName] = {
+      key: keyManifest(keyFields),
+      fields,
+      ...(ephemeral === true ? { ephemeral } : {}),
+      ...(description === undefined ? {} : { description }),
+      ...(metadata === undefined || Object.keys(metadata).length === 0 ? {} : { metadata })
+    };
+  }
+  return result;
+}
+
+function normalizeFields(
+  input: unknown,
+  relationPath: readonly (string | number)[],
+  codecs: Readonly<Record<string, CodecDeclarationV1>>,
+  diagnostics: SchemaManifestDiagnosticV1[]
+): Record<string, FieldManifestV1> {
+  const fields = plainRecord(input, [...relationPath, 'fields'], diagnostics, 'schema_manifest.invalid');
+  if (fields === undefined) return {};
+  if (Object.keys(fields).length === 0) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...relationPath, 'fields'], 'A relation must contain at least one field.'));
+  }
+  const result: Record<string, FieldManifestV1> = {};
+  for (const [fieldName, fieldInput] of sortedEntries(fields)) {
+    const fieldPath = [...relationPath, 'fields', fieldName];
+    if (!validName(fieldName, fieldPath, diagnostics, 'schema_manifest.invalid_name')) continue;
+    const field = normalizeField(fieldInput, fieldPath, codecs, diagnostics);
+    if (field !== undefined) result[fieldName] = field;
+  }
+  return result;
+}
+
+function normalizeField(
+  input: unknown,
+  path: readonly (string | number)[],
+  codecs: Readonly<Record<string, CodecDeclarationV1>>,
+  diagnostics: SchemaManifestDiagnosticV1[]
+): FieldManifestV1 | undefined {
+  const record = plainRecord(input, path, diagnostics, 'schema_manifest.invalid_field');
+  if (record === undefined) return undefined;
+  requireProperty(record, 'type', path, diagnostics);
+  const type = record.type;
+  const allowed = ['type', 'optional', 'nullable', 'description', 'metadata'];
+  if (type === 'id') allowed.push('domain');
+  if (type === 'ref') allowed.push('target');
+  if (type === 'custom') allowed.push('codec');
+  knownProperties(record, allowed, path, diagnostics);
+  const base = normalizeFieldBase(record, path, diagnostics);
+
+  switch (type) {
+    case 'string':
+    case 'number':
+    case 'boolean':
+    case 'anchoredPath':
+    case 'json':
+      return { ...base, type };
+    case 'id': {
+      requireProperty(record, 'domain', path, diagnostics);
+      const domain = nonEmptyString(record.domain, [...path, 'domain'], diagnostics, 'schema_manifest.invalid_field');
+      return { ...base, type: 'id', domain: domain ?? '' };
+    }
+    case 'ref': {
+      requireProperty(record, 'target', path, diagnostics);
+      const target = structuredRefTarget(record.target, [...path, 'target'], diagnostics);
+      return { ...base, type: 'ref', target: target ?? { relation: '', field: '' } };
+    }
+    case 'custom': {
+      requireProperty(record, 'codec', path, diagnostics);
+      const codec = nonEmptyString(record.codec, [...path, 'codec'], diagnostics, 'schema_manifest.invalid_codec');
+      if (codec !== undefined && codecs[codec] === undefined) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', [...path, 'codec'], `Codec "${codec}" is not declared.`));
+      }
+      return { ...base, type: 'custom', codec: codec ?? '' };
+    }
+    default:
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...path, 'type'], 'Expected a supported field type.'));
+      return undefined;
+  }
+}
+
+function normalizeFieldBase(
+  record: SchemaManifestRecord,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): FieldBaseV1 {
+  const optionalValue = optionalBoolean(record, 'optional', path, diagnostics, 'schema_manifest.invalid_field');
+  const nullableValue = optionalBoolean(record, 'nullable', path, diagnostics, 'schema_manifest.invalid_field');
+  const description = optionalString(record, 'description', path, diagnostics);
+  const metadata = optionalMetadata(record, 'metadata', path, diagnostics);
+  return {
+    ...(optionalValue === true ? { optional: true } : {}),
+    ...(nullableValue === true ? { nullable: true } : {}),
+    ...(description === undefined ? {} : { description }),
+    ...(metadata === undefined || Object.keys(metadata).length === 0 ? {} : { metadata })
+  };
+}
+
+function normalizeKey(
+  input: unknown,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): readonly string[] {
+  if (typeof input === 'string') {
+    return validName(input, path, diagnostics, 'schema_manifest.invalid_key') ? [input] : [];
+  }
+  if (!Array.isArray(input)) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', path, 'Expected a key field name or composite key array.'));
+    return [];
+  }
+  const fields: string[] = [];
+  try {
+    const length = input.length;
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, index);
+      if (!descriptor?.enumerable || !('value' in descriptor) || typeof descriptor.value !== 'string' || descriptor.value === '') {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', [...path, index], 'Composite key fields must be non-empty strings.'));
+        continue;
+      }
+      fields.push(descriptor.value);
+    }
+    for (const key of Reflect.ownKeys(input)) {
+      if (key === 'length') continue;
+      if (typeof key !== 'string' || !isArrayIndexKey(key) || Number(key) >= length) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', path, 'Composite key arrays must not contain extra properties.'));
+        break;
+      }
+    }
+  } catch {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', path, 'Unable to inspect composite key array.'));
+    return [];
+  }
+  if (fields.length < 2) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', path, 'Composite keys must contain at least two fields.'));
+  }
+  const seen = new Set<string>();
+  for (const fieldName of fields) {
+    if (seen.has(fieldName)) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', path, `Duplicate key field "${fieldName}".`));
+    }
+    seen.add(fieldName);
+  }
+  return fields;
+}
+
+function validateKeyFields(
+  keyFields: readonly string[],
+  fields: Readonly<Record<string, FieldManifestV1>>,
+  relationPath: readonly (string | number)[],
+  codecs: Readonly<Record<string, CodecDeclarationV1>>,
+  diagnostics: SchemaManifestDiagnosticV1[]
+): void {
+  for (const keyField of keyFields) {
+    const field = fields[keyField];
+    if (field === undefined) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', [...relationPath, 'key'], `Key field "${keyField}" does not exist.`));
+      continue;
+    }
+    if (field.optional === true) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', [...relationPath, 'fields', keyField, 'optional'], 'Key fields cannot be optional.'));
+    }
+    if (field.nullable === true) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', [...relationPath, 'fields', keyField, 'nullable'], 'Key fields cannot be nullable.'));
+    }
+    if (!fieldManifestKeyable(field, codecs)) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', [...relationPath, 'fields', keyField], 'Key field is not keyable in schema manifests.'));
+    }
+  }
+}
+
+function validateRefTargets(manifest: SchemaManifestV1, diagnostics: SchemaManifestDiagnosticV1[]): void {
+  for (const [relationName, relationManifest] of Object.entries(manifest.relations)) {
+    for (const [fieldName, field] of Object.entries(relationManifest.fields)) {
+      if (field.type !== 'ref') continue;
+      const path = ['relations', relationName, 'fields', fieldName, 'target'];
+      const targetRelation = manifest.relations[field.target.relation];
+      if (targetRelation === undefined) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_ref', path, `Target relation "${field.target.relation}" does not exist.`));
+        continue;
+      }
+      if (typeof targetRelation.key !== 'string') {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_ref', path, 'Ref targets must use single-field relation keys.'));
+        continue;
+      }
+      if (field.target.field !== targetRelation.key) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_ref', path, 'Ref targets must point at the target relation key field.'));
+        continue;
+      }
+      const targetField = targetRelation.fields[field.target.field];
+      if (targetField === undefined) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_ref', path, `Target field "${field.target.field}" does not exist.`));
+        continue;
+      }
+      if (!fieldManifestStringValued(targetField)) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_ref', path, 'Ref targets must point at a string-valued key field.'));
+      }
+    }
+  }
+}
+
+function validateRuntimeCodecs(
+  manifest: SchemaManifestV1,
+  codecs: Readonly<Record<string, RuntimeCodec>>,
+  diagnostics: SchemaManifestDiagnosticV1[]
+): void {
+  for (const [relationName, relationManifest] of Object.entries(manifest.relations)) {
+    const keyFields = Array.isArray(relationManifest.key) ? relationManifest.key : [relationManifest.key];
+    for (const [fieldName, field] of Object.entries(relationManifest.fields)) {
+      if (field.type !== 'custom') continue;
+      const runtimeCodec = codecs[field.codec];
+      const path = ['relations', relationName, 'fields', fieldName, 'codec'];
+      if (runtimeCodec === undefined) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', path, `Missing runtime codec "${field.codec}".`));
+        continue;
+      }
+      if (runtimeCodec.codec !== field.codec) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', path, `Runtime codec "${runtimeCodec.codec}" does not match manifest codec "${field.codec}".`));
+      }
+      if (keyFields.includes(fieldName) && runtimeCodec.stableKey === undefined && runtimeCodec.toScalar === undefined) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_key', path, `Runtime codec "${field.codec}" cannot key rows.`));
+      }
+    }
+  }
+}
+
+function manifestFieldFromSpec(
+  spec: FieldSpec,
+  path: readonly (string | number)[],
+  codecs: Record<string, CodecDeclarationV1>,
+  diagnostics: SchemaManifestDiagnosticV1[]
+): FieldManifestV1 | undefined {
+  const base = {
+    ...(spec.optional ? { optional: true } : {}),
+    ...(spec.nullable ? { nullable: true } : {})
+  };
+  switch (spec.valueKind) {
+    case 'string':
+    case 'number':
+    case 'boolean':
+    case 'anchoredPath':
+    case 'json':
+      return { ...base, type: spec.valueKind };
+    case 'id':
+      if (spec.idDomain === undefined || spec.idDomain === '') {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...path, 'domain'], 'ID fields must declare a non-empty domain.'));
+      }
+      return { ...base, type: 'id', domain: spec.idDomain ?? '' };
+    case 'ref': {
+      const target = refTargetFromBuilder(spec.ref, [...path, 'target'], diagnostics);
+      return { ...base, type: 'ref', target: target ?? { relation: '', field: '' } };
+    }
+    case 'custom': {
+      const codec = spec.custom?.kind;
+      if (codec === undefined || codec === '') {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', [...path, 'codec'], 'Custom fields must declare a non-empty codec kind.'));
+        return { ...base, type: 'custom', codec: '' };
+      }
+      if (codecs[codec] === undefined) {
+        codecs[codec] = {
+          ...(spec.custom?.description === undefined ? {} : { description: spec.custom.description }),
+          ...(spec.custom?.stableKey !== undefined || spec.custom?.toScalar !== undefined ? { keyable: true } : {})
+        };
+      }
+      return { ...base, type: 'custom', codec };
+    }
+    default:
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...path, 'type'], 'Expected a supported field type.'));
+      return undefined;
+  }
+}
+
+function fieldSpecFromManifest(
+  field: FieldManifestV1,
+  codecs: Readonly<Record<string, RuntimeCodec>>
+): FieldSpec {
+  let spec: FieldSpec;
+  switch (field.type) {
+    case 'string':
+      spec = stringField();
+      break;
+    case 'number':
+      spec = numberField();
+      break;
+    case 'boolean':
+      spec = booleanField();
+      break;
+    case 'id':
+      spec = idField(field.domain);
+      break;
+    case 'ref':
+      spec = refField(field.target);
+      break;
+    case 'anchoredPath':
+      spec = anchoredPathField();
+      break;
+    case 'json':
+      spec = jsonField();
+      break;
+    case 'custom': {
+      const runtimeCodec = codecs[field.codec] ?? { codec: field.codec };
+      spec = customField({
+        kind: runtimeCodec.codec,
+        ...(runtimeCodec.description === undefined ? {} : { description: runtimeCodec.description }),
+        ...(runtimeCodec.validate === undefined ? {} : { validate: runtimeCodec.validate }),
+        ...(runtimeCodec.stableKey === undefined ? {} : { stableKey: runtimeCodec.stableKey }),
+        ...(runtimeCodec.compare === undefined ? {} : { compare: runtimeCodec.compare }),
+        ...(runtimeCodec.toScalar === undefined ? {} : { toScalar: runtimeCodec.toScalar }),
+        ...(runtimeCodec.fromScalar === undefined ? {} : { fromScalar: runtimeCodec.fromScalar })
+      });
+      break;
+    }
+  }
+  if (field.nullable === true) spec = nullable(spec);
+  if (field.optional === true) spec = optional(spec);
+  return spec;
+}
+
+function manifestKeyFromRelation(input: string | readonly string[]): string | readonly [string, string, ...string[]] {
+  if (typeof input === 'string') return input;
+  if (input.length === 1) return input[0] ?? '';
+  return input as readonly [string, string, ...string[]];
+}
+
+function keyManifest(input: readonly string[]): string | readonly [string, string, ...string[]] {
+  if (input.length === 1) return input[0] ?? '';
+  return input as readonly [string, string, ...string[]];
+}
+
+function fieldManifestKeyable(field: FieldManifestV1, codecs: Readonly<Record<string, CodecDeclarationV1>>): boolean {
+  if (field.type === 'json') return false;
+  if (field.type === 'custom') return codecs[field.codec]?.keyable === true;
+  return true;
+}
+
+function fieldManifestStringValued(field: FieldManifestV1): boolean {
+  return field.type === 'string' || field.type === 'id' || field.type === 'ref' || field.type === 'anchoredPath';
+}
+
+function refTargetFromBuilder(
+  input: string | RefTarget | undefined,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): RefTarget | undefined {
+  if (input === undefined) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_ref', path, 'Ref fields must declare a target.'));
+    return undefined;
+  }
+  if (typeof input !== 'string') return structuredRefTarget(input, path, diagnostics);
+  const parts = input.split('.');
+  const relationName = parts[0];
+  const fieldName = parts[1];
+  if (parts.length !== 2 || relationName === undefined || relationName === '' || fieldName === undefined || fieldName === '') {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_ref', path, 'String ref targets must use unambiguous "relation.field" form.'));
+    return undefined;
+  }
+  return { relation: relationName, field: fieldName };
+}
+
+function structuredRefTarget(
+  input: unknown,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): RefTarget | undefined {
+  const record = plainRecord(input, path, diagnostics, 'schema_manifest.invalid_ref');
+  if (record === undefined) return undefined;
+  knownProperties(record, ['relation', 'field'], path, diagnostics);
+  requireProperty(record, 'relation', path, diagnostics);
+  requireProperty(record, 'field', path, diagnostics);
+  const relationValue = nonEmptyString(record.relation, [...path, 'relation'], diagnostics, 'schema_manifest.invalid_ref');
+  const fieldValue = nonEmptyString(record.field, [...path, 'field'], diagnostics, 'schema_manifest.invalid_ref');
+  if (relationValue === undefined || fieldValue === undefined) return undefined;
+  return { relation: relationValue, field: fieldValue };
+}
+
+function optionalString(
+  record: SchemaManifestRecord,
+  fieldName: string,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): string | undefined {
+  if (!(fieldName in record)) return undefined;
+  return stringValue(record[fieldName], [...path, fieldName], diagnostics, 'schema_manifest.invalid');
+}
+
+function optionalBoolean(
+  record: SchemaManifestRecord,
+  fieldName: string,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[],
+  code: SchemaManifestDiagnosticCodeV1
+): boolean | undefined {
+  if (!(fieldName in record)) return undefined;
+  if (typeof record[fieldName] !== 'boolean') {
+    diagnostics.push(schemaManifestDiagnostic(code, [...path, fieldName], 'Expected a boolean.'));
+    return undefined;
+  }
+  return record[fieldName];
+}
+
+function optionalScalar(
+  record: SchemaManifestRecord,
+  fieldName: string,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): 'string' | 'number' | 'boolean' | 'null' | undefined {
+  if (!(fieldName in record)) return undefined;
+  const value = record[fieldName];
+  if (value === 'string' || value === 'number' || value === 'boolean' || value === 'null') return value;
+  diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_codec', [...path, fieldName], 'Expected string, number, boolean, or null.'));
+  return undefined;
+}
+
+function optionalMetadata(
+  record: SchemaManifestRecord,
+  fieldName: string,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): JsonObject | undefined {
+  if (!(fieldName in record)) return undefined;
+  const metadata = plainRecord(record[fieldName], [...path, fieldName], diagnostics, 'schema_manifest.non_json_value');
+  if (metadata === undefined) return undefined;
+  const result: Record<string, JsonValue> = {};
+  const context: JsonValueCanonicalizationContext = {
+    active: new WeakSet<object>(),
+    values: new WeakMap<object, JsonValue>()
+  };
+  for (const [key, value] of sortedEntries(metadata)) {
+    const jsonValue = canonicalJsonValue(value, [...path, fieldName, key], diagnostics, context);
+    if (jsonValue !== undefined) result[key] = jsonValue;
+  }
+  return result;
+}
+
+function canonicalJsonValue(
+  input: unknown,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[],
+  context: JsonValueCanonicalizationContext
+): JsonValue | undefined {
+  if (input === null || typeof input === 'boolean') return input;
+  if (typeof input === 'string') {
+    if (hasUnpairedSurrogate(input)) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Strings must not contain unpaired UTF-16 surrogates.'));
+      return undefined;
+    }
+    return input;
+  }
+  if (typeof input === 'number') {
+    if (!Number.isFinite(input)) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Numbers must be finite.'));
+      return undefined;
+    }
+    return Object.is(input, -0) ? 0 : input;
+  }
+  if (Array.isArray(input)) {
+    const cached = context.values.get(input);
+    if (cached !== undefined) return cached;
+    if (context.active.has(input)) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'JSON values must not contain cycles.'));
+      return undefined;
+    }
+    context.active.add(input);
+    const result: JsonValue[] = [];
+    try {
+      for (let index = 0; index < input.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(input, index);
+        if (!descriptor?.enumerable || !('value' in descriptor)) {
+          diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', [...path, index], 'Arrays must not be sparse.'));
+          continue;
+        }
+        const value = canonicalJsonValue(descriptor.value, [...path, index], diagnostics, context);
+        if (value !== undefined) result.push(value);
+      }
+      for (const key of Reflect.ownKeys(input)) {
+        if (key === 'length') continue;
+        if (typeof key !== 'string' || !isArrayIndexKey(key) || Number(key) >= input.length) {
+          diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Arrays must not contain extra properties.'));
+          break;
+        }
+      }
+      context.values.set(input, result);
+      return result;
+    } catch {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Unable to inspect JSON array.'));
+      return undefined;
+    } finally {
+      context.active.delete(input);
+    }
+  }
+  if (typeof input === 'object' && input !== null) {
+    const cached = context.values.get(input);
+    if (cached !== undefined) return cached;
+    if (context.active.has(input)) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'JSON values must not contain cycles.'));
+      return undefined;
+    }
+  }
+  if (typeof input !== 'object' || input === null) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Expected an object.'));
+    return undefined;
+  }
+  context.active.add(input);
+  const result: Record<string, JsonValue> = {};
+  try {
+    const record = plainRecord(input, path, diagnostics, 'schema_manifest.non_json_value');
+    if (record === undefined) return undefined;
+    for (const [key, value] of sortedEntries(record)) {
+      const jsonValue = canonicalJsonValue(value, [...path, key], diagnostics, context);
+      if (jsonValue !== undefined) result[key] = jsonValue;
+    }
+    context.values.set(input, result);
+    return result;
+  } finally {
+    context.active.delete(input);
+  }
+}
+
+function plainRecord(
+  input: unknown,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[],
+  code: SchemaManifestDiagnosticCodeV1
+): SchemaManifestRecord | undefined {
+  try {
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+      diagnostics.push(schemaManifestDiagnostic(code, path, 'Expected an object.'));
+      return undefined;
+    }
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) {
+      diagnostics.push(schemaManifestDiagnostic(code, path, 'Expected a plain object.'));
+      return undefined;
+    }
+    const result = Object.create(null) as SchemaManifestRecord;
+    for (const key of Reflect.ownKeys(input)) {
+      if (typeof key !== 'string') {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Object keys must be strings.'));
+        return undefined;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', [...path, key], 'Object fields must be enumerable data properties.'));
+        return undefined;
+      }
+      result[key] = descriptor.value;
+    }
+    return result;
+  } catch {
+    diagnostics.push(schemaManifestDiagnostic(code, path, 'Unable to inspect object.'));
+    return undefined;
+  }
+}
+
+function knownProperties(
+  record: SchemaManifestRecord,
+  allowed: readonly string[],
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): void {
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(record)) {
+    if (!allowedSet.has(key)) {
+      diagnostics.push(schemaManifestDiagnostic('schema_manifest.unknown_property', [...path, key], `Unknown property "${key}".`));
+    }
+  }
+}
+
+function requireProperty(
+  record: SchemaManifestRecord,
+  fieldName: string,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): void {
+  if (!(fieldName in record)) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.missing_required', [...path, fieldName], `Missing required property "${fieldName}".`));
+  }
+}
+
+function stringValue(
+  input: unknown,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[],
+  code: SchemaManifestDiagnosticCodeV1
+): string | undefined {
+  if (typeof input !== 'string') {
+    diagnostics.push(schemaManifestDiagnostic(code, path, 'Expected a string.'));
+    return undefined;
+  }
+  if (hasUnpairedSurrogate(input)) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Strings must not contain unpaired UTF-16 surrogates.'));
+    return undefined;
+  }
+  return input;
+}
+
+function nonEmptyString(
+  input: unknown,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[],
+  code: SchemaManifestDiagnosticCodeV1
+): string | undefined {
+  const value = stringValue(input, path, diagnostics, code);
+  if (value === undefined) return undefined;
+  if (value === '') {
+    diagnostics.push(schemaManifestDiagnostic(code, path, 'Expected a non-empty string.'));
+    return undefined;
+  }
+  return value;
+}
+
+function validName(
+  input: string,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[],
+  code: SchemaManifestDiagnosticCodeV1
+): boolean {
+  if (input === '') {
+    diagnostics.push(schemaManifestDiagnostic(code, path, 'Expected a non-empty name.'));
+    return false;
+  }
+  if (hasUnpairedSurrogate(input)) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.non_json_value', path, 'Names must not contain unpaired UTF-16 surrogates.'));
+    return false;
+  }
+  return true;
+}
+
+function schemaManifestDiagnostic(
+  code: SchemaManifestDiagnosticCodeV1,
+  path: readonly (string | number)[],
+  message: string,
+  detail?: JsonValue
+): SchemaManifestDiagnosticV1 {
+  return {
+    code,
+    severity: 'error',
+    message,
+    path,
+    ...(detail === undefined ? {} : { detail })
+  };
+}
+
+function schemaManifestErrorMessage(diagnostics: readonly SchemaManifestDiagnosticV1[]): string {
+  const first = diagnostics[0];
+  if (first === undefined) return 'Invalid schema manifest.';
+  return `Invalid schema manifest at ${schemaManifestPath(first.path)}: ${first.message}`;
+}
+
+function schemaManifestPath(path: readonly (string | number)[]): string {
+  return path.length === 0 ? '<root>' : path.map((item) => typeof item === 'number' ? `[${item}]` : `.${item}`).join('');
+}
+
+function sortedEntries<T>(record: Readonly<Record<string, T>>): readonly (readonly [string, T])[] {
+  return Object.entries(record).sort(([left], [right]) => compareCodeUnits(left, right));
+}
+
+function stringifyCanonicalJson(input: JsonValue): string {
+  if (input === null || typeof input === 'boolean' || typeof input === 'number' || typeof input === 'string') {
+    return JSON.stringify(input);
+  }
+  if (Array.isArray(input)) return `[${input.map((item) => stringifyCanonicalJson(item)).join(',')}]`;
+  return `{${sortedEntries(input as JsonObject).map(([key, value]) => `${JSON.stringify(key)}:${stringifyCanonicalJson(value)}`).join(',')}}`;
+}
+
+function hasUnpairedSurrogate(input: string): boolean {
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = input.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }

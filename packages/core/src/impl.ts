@@ -8,7 +8,6 @@ import {
   numberField,
   opaqueField,
   optional,
-  refField,
   relation,
   stringField
 } from './schema.js';
@@ -35,8 +34,10 @@ export type { RelationDelta } from './delta.js';
 export {
   anchoredPathField,
   booleanField,
+  canonicalSchemaManifest,
   customField,
   defineSchema,
+  hydrateSchemaManifest,
   idField,
   isJsonValue,
   jsonField,
@@ -46,9 +47,41 @@ export {
   optional,
   refField,
   relation,
+  SchemaManifestValidationError,
+  stringifyCanonicalSchemaManifest,
+  toSchemaManifest,
+  validateSchemaManifest,
   stringField
 } from './schema.js';
-export type { CustomFieldSpec, FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
+export type {
+  AnchoredPathFieldManifestV1,
+  BooleanFieldManifestV1,
+  CodecDeclarationV1,
+  CustomFieldManifestV1,
+  CustomFieldSpec,
+  FieldBaseV1,
+  FieldManifestV1,
+  FieldSpec,
+  HydratedSchema,
+  HydrateSchemaManifestOptions,
+  HydrateSchemaManifestResult,
+  IdFieldManifestV1,
+  JsonFieldManifestV1,
+  JsonObject,
+  JsonPrimitive,
+  JsonValue,
+  NumberFieldManifestV1,
+  RefFieldManifestV1,
+  RefTarget,
+  RelationManifestV1,
+  RelationRef,
+  RuntimeCodec,
+  SchemaManifestDiagnosticCodeV1,
+  SchemaManifestDiagnosticV1,
+  SchemaManifestV1,
+  StringFieldManifestV1,
+  ToSchemaManifestOptions
+} from './schema.js';
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -1020,7 +1053,7 @@ export const runtimeSystemRelations = {
         objectId: idField('tarstate.runtime.object'),
         path: stringField(),
         pathSegments: jsonField() as FieldSpec<readonly (string | number)[]>,
-        parentObjectId: optional(refField('tarstate.runtime.object')),
+        parentObjectId: optional(idField('tarstate.runtime.object')),
         prop: optional(jsonField() as FieldSpec<string | number>),
         documentId: optional(stringField()),
         branch: optional(stringField()),

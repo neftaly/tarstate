@@ -11,8 +11,10 @@ export type {
 export {
   anchoredPathField,
   booleanField,
+  canonicalSchemaManifest,
   customField,
   defineSchema,
+  hydrateSchemaManifest,
   idField,
   isJsonValue,
   jsonField,
@@ -22,9 +24,41 @@ export {
   optional,
   refField,
   relation,
+  SchemaManifestValidationError,
+  stringifyCanonicalSchemaManifest,
+  toSchemaManifest,
+  validateSchemaManifest,
   stringField
 } from './schema.js';
-export type { CustomFieldSpec, FieldSpec, JsonPrimitive, JsonValue, RelationRef } from './schema.js';
+export type {
+  AnchoredPathFieldManifestV1,
+  BooleanFieldManifestV1,
+  CodecDeclarationV1,
+  CustomFieldManifestV1,
+  CustomFieldSpec,
+  FieldBaseV1,
+  FieldManifestV1,
+  FieldSpec,
+  HydratedSchema,
+  HydrateSchemaManifestOptions,
+  HydrateSchemaManifestResult,
+  IdFieldManifestV1,
+  JsonFieldManifestV1,
+  JsonObject,
+  JsonPrimitive,
+  JsonValue,
+  NumberFieldManifestV1,
+  RefFieldManifestV1,
+  RefTarget,
+  RelationManifestV1,
+  RelationRef,
+  RuntimeCodec,
+  SchemaManifestDiagnosticCodeV1,
+  SchemaManifestDiagnosticV1,
+  SchemaManifestV1,
+  StringFieldManifestV1,
+  ToSchemaManifestOptions
+} from './schema.js';
 
 export {
   agg,

@@ -4,7 +4,9 @@ import {
   index as rootMaterializedIndex,
   runtimeSystemRelations,
   runtimeSystemSource,
+  toSchemaManifest as rootToSchemaManifest,
   type IncrementByKeyPatch as RootIncrementByKeyPatch,
+  type SchemaManifestV1 as RootSchemaManifestV1,
   type RuntimeHistoryRow,
   type RuntimeObjectLocationRow,
   type RuntimeSystemState,
@@ -104,14 +106,26 @@ import type {
   TrackTransactResult
 } from '@tarstate/core/runtime';
 import {
+  booleanField,
+  canonicalSchemaManifest,
   customField,
   defineSchema,
+  hydrateSchemaManifest,
+  idField,
   isJsonValue,
   numberField,
   opaqueField,
+  optional,
+  refField,
   relation,
+  SchemaManifestValidationError,
   stringField,
-  type CustomFieldSpec
+  stringifyCanonicalSchemaManifest,
+  toSchemaManifest,
+  validateSchemaManifest,
+  type CustomFieldSpec,
+  type RuntimeCodec,
+  type SchemaManifestV1
 } from '@tarstate/core/schema';
 import {
   createStore,
@@ -269,6 +283,212 @@ describe('public API contracts', () => {
       }
     });
     expect(isJsonValue(hostileArray)).toBe(false);
+  });
+
+  it('exports, canonicalizes, and hydrates schema manifests', () => {
+    type Pizza = {
+      readonly id: string;
+      readonly name: string;
+      readonly size: string;
+      readonly notes?: string;
+    };
+    type Topping = {
+      readonly pizzaId: string;
+      readonly name: string;
+      readonly extra: boolean;
+    };
+    type Price = {
+      readonly id: string;
+      readonly amount: { readonly cents: number; readonly currency: string };
+    };
+    const moneyCodec = {
+      codec: 'food.money',
+      description: 'Money amount',
+      toScalar: (value: unknown) =>
+        typeof value === 'object'
+        && value !== null
+        && 'cents' in value
+        && 'currency' in value
+          ? `${String(value.currency)}:${String(value.cents)}`
+          : null
+    } satisfies RuntimeCodec;
+    const menuSchema = defineSchema({
+      pizzas: relation<Pizza>({
+        key: 'id',
+        fields: {
+          id: idField('food.pizza'),
+          name: stringField(),
+          size: stringField(),
+          notes: optional(stringField())
+        }
+      }),
+      toppings: relation<Topping, readonly ['pizzaId', 'name']>({
+        key: ['pizzaId', 'name'] as const,
+        fields: {
+          pizzaId: refField({ relation: 'pizzas', field: 'id' }),
+          name: stringField(),
+          extra: booleanField()
+        }
+      }),
+      prices: relation<Price>({
+        key: 'id',
+        fields: {
+          id: idField('food.price'),
+          amount: customField<Price['amount']>({
+            kind: 'food.money',
+            description: 'Money amount',
+            toScalar: moneyCodec.toScalar
+          })
+        }
+      })
+    });
+
+    const manifest = toSchemaManifest(menuSchema, {
+      schemaId: 'food.menu@1',
+      metadata: { revision: -0, tags: ['dinner'] }
+    });
+
+    expectTypeOf<RootSchemaManifestV1>().toEqualTypeOf<SchemaManifestV1>();
+    expect(rootToSchemaManifest(menuSchema, { schemaId: 'food.menu@1', metadata: { revision: -0, tags: ['dinner'] } })).toEqual(manifest);
+    expect(manifest).toEqual({
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'food.menu@1',
+      relations: {
+        pizzas: {
+          key: 'id',
+          fields: {
+            id: { type: 'id', domain: 'food.pizza' },
+            name: { type: 'string' },
+            notes: { type: 'string', optional: true },
+            size: { type: 'string' }
+          }
+        },
+        prices: {
+          key: 'id',
+          fields: {
+            amount: { type: 'custom', codec: 'food.money' },
+            id: { type: 'id', domain: 'food.price' }
+          }
+        },
+        toppings: {
+          key: ['pizzaId', 'name'],
+          fields: {
+            extra: { type: 'boolean' },
+            name: { type: 'string' },
+            pizzaId: { type: 'ref', target: { relation: 'pizzas', field: 'id' } }
+          }
+        }
+      },
+      codecs: {
+        'food.money': { description: 'Money amount', keyable: true }
+      },
+      metadata: { revision: 0, tags: ['dinner'] }
+    } satisfies SchemaManifestV1);
+
+    const hydrated = hydrateSchemaManifest(manifest, { codecs: { 'food.money': moneyCodec } });
+    expect(hydrated.pizzas?.name).toBe('pizzas');
+    expect(hydrated.toppings?.fields.pizzaId?.ref).toEqual({ relation: 'pizzas', field: 'id' });
+    expect(hydrated.prices?.fields.amount?.custom?.kind).toBe('food.money');
+    expect(hydrated.prices?.fields.amount?.custom?.toScalar?.({ currency: 'NZD', cents: 2400 })).toBe('NZD:2400');
+  });
+
+  it('validates schema manifests before canonicalization and hydration', () => {
+    expect(stringifyCanonicalSchemaManifest({
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'empty@1',
+      relations: {},
+      codecs: {},
+      metadata: {}
+    })).toBe('{"formatVersion":1,"kind":"tarstate.schema","relations":{},"schemaId":"empty@1"}');
+
+    const invalidManifest = {
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'bad@1',
+      unexpected: true,
+      relations: {
+        things: {
+          key: ['id'],
+          fields: {
+            id: { type: 'json' },
+            ownerId: { type: 'ref', target: { relation: 'missing', field: 'id' } }
+          }
+        }
+      }
+    };
+    const diagnostics = validateSchemaManifest(invalidManifest);
+    expect(diagnostics.map((diagnosticValue) => diagnosticValue.code)).toEqual(expect.arrayContaining([
+      'schema_manifest.unknown_property',
+      'schema_manifest.invalid_key',
+      'schema_manifest.invalid_ref'
+    ]));
+    expect(() => canonicalSchemaManifest(invalidManifest)).toThrow(SchemaManifestValidationError);
+
+    const cyclicMetadata: Record<string, unknown> = {};
+    cyclicMetadata.self = cyclicMetadata;
+    expect(validateSchemaManifest({
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'cyclic@1',
+      relations: {},
+      metadata: cyclicMetadata
+    }).map((diagnosticValue) => diagnosticValue.code)).toContain('schema_manifest.non_json_value');
+
+    let proxyGetInvoked = false;
+    const proxyManifest = new Proxy({
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'proxy@1',
+      relations: {}
+    }, {
+      get(target, property, receiver) {
+        proxyGetInvoked = true;
+        return Reflect.get(target, property, receiver);
+      }
+    });
+    expect(validateSchemaManifest(proxyManifest)).toEqual([]);
+    expect(proxyGetInvoked).toBe(false);
+
+    const customManifest = {
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'custom@1',
+      codecs: { 'food.spice': {} },
+      relations: {
+        recipes: {
+          key: 'id',
+          fields: {
+            id: { type: 'id', domain: 'food.recipe' },
+            spice: { type: 'custom', codec: 'food.spice' }
+          }
+        }
+      }
+    } satisfies SchemaManifestV1;
+    const hydrateResult = hydrateSchemaManifest(customManifest, { diagnosticMode: 'collect', codecs: {} });
+    expect(hydrateResult.schema).toBeUndefined();
+    expect(hydrateResult.diagnostics.map((diagnosticValue) => diagnosticValue.code)).toContain('schema_manifest.invalid_codec');
+  });
+
+  it('rejects ambiguous builder refs during manifest export', () => {
+    const ambiguousSchema = defineSchema({
+      objectLocations: relation<{ readonly id: string; readonly parentObjectId?: string }>({
+        key: 'id',
+        fields: {
+          id: idField('tarstate.runtime.objectLocation'),
+          parentObjectId: optional(refField('tarstate.runtime.object'))
+        }
+      })
+    });
+
+    try {
+      toSchemaManifest(ambiguousSchema, { schemaId: 'bad.refs@1' });
+      throw new Error('expected schema manifest export to fail');
+    } catch (error) {
+      expect(error).toBeInstanceOf(SchemaManifestValidationError);
+      expect((error as SchemaManifestValidationError).diagnostics.map((diagnosticValue) => diagnosticValue.code)).toContain('schema_manifest.invalid_ref');
+    }
   });
 
   it('exposes relation deltas from the delta subpath', () => {
