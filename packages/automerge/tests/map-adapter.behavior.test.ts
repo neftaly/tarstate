@@ -86,6 +86,10 @@ import {
   type AutomergeMapSource,
   type AutomergeRelationRuntimeMetadata
 } from '@tarstate/automerge';
+import {
+  automergePresenceRuntime,
+  type AutomergePresenceFieldNames
+} from '@tarstate/automerge/presence';
 
 type TaskRow = {
   readonly id: string;
@@ -109,6 +113,17 @@ type PresenceFocusRow = {
   readonly objectId: string;
   readonly documentHeads?: JsonValue;
 };
+
+type PeerPresenceRow = {
+  readonly peer: string;
+  readonly topic: string;
+  readonly payload?: JsonValue;
+  readonly activeAt?: number;
+  readonly seenAt?: number;
+  readonly isLocal?: boolean;
+};
+
+type PeerPresenceState = Record<string, JsonValue | undefined>;
 
 interface WorkspaceDoc {
   readonly workspace: {
@@ -166,8 +181,29 @@ const schema = defineSchema({
       objectId: stringField(),
       documentHeads: optional(jsonField())
     }
+  }),
+  peerPresence: relation<PeerPresenceRow>({
+    ephemeral: true,
+    key: ['peer', 'topic'] as const,
+    fields: {
+      peer: idField('peer'),
+      topic: stringField(),
+      payload: optional(jsonField()),
+      activeAt: optional(numberField()),
+      seenAt: optional(numberField()),
+      isLocal: optional(booleanField())
+    }
   })
 });
+
+const presenceFields = {
+  peerId: 'peer',
+  channel: 'topic',
+  value: 'payload',
+  lastActiveAt: 'activeAt',
+  lastSeenAt: 'seenAt',
+  local: 'isLocal'
+} satisfies AutomergePresenceFieldNames;
 
 const automergeScalarSchema = defineSchema({
   notes: relation<AutomergeScalarRow>({
@@ -1987,6 +2023,85 @@ describe('automerge map adapter', () => {
       }],
       diagnostics: []
     });
+  });
+
+  it('composes real presence runtime rows with Automerge object locations', () => {
+    const repo = new Repo({ peerId: 'peer-local' as never });
+    const handle = repo.create<WorkspaceDoc>({
+      workspace: {
+        tasks: [{ id: 'task-1', title: 'Draft', effort: 1 }],
+        labelsById: {
+          'label-1': { id: 'label-1', name: 'Urgent' }
+        }
+      }
+    });
+    const doc = handle.doc();
+    const heads = Automerge.getHeads(doc);
+    const objectId = automergeObjectIdAt(doc, ['workspace', 'tasks', 0]);
+    if (objectId === null) throw new Error('expected task object id');
+
+    const presence = automergePresenceRuntime<PeerPresenceState, WorkspaceDoc>({
+      handle,
+      relation: schema.peerPresence,
+      fields: presenceFields,
+      localPeerId: 'peer-local',
+      includeLocalRows: true,
+      initialState: {
+        cursor: {
+          runtime: 'workspace',
+          objectId,
+          heads: [...heads]
+        }
+      }
+    });
+    presence.start();
+
+    const runtime = createAutomergeMapRuntime({
+      doc,
+      relations: allMappings,
+      runtimeId: 'workspace',
+      runtimes: [withAutomergeRuntimeRelations(presence, schema.peerPresence)]
+    });
+    const peerPresence = as(schema.peerPresence, 'peerPresence');
+    const objectLocations = runtimeSystemRelations.objectLocations;
+    const resolvedPresence = pipe(
+      from(peerPresence),
+      join(
+        from(objectLocations),
+        and(
+          eq(getKey<string>(peerPresence.payload, value('runtime')), field<string>(objectLocations.name, 'runtime')),
+          eq(getKey<string>(peerPresence.payload, value('objectId')), field<string>(objectLocations.name, 'objectId'))
+        )
+      ),
+      project({
+        peer: peerPresence.peer,
+        topic: peerPresence.topic,
+        heads: getKey<readonly string[]>(peerPresence.payload, value('heads')),
+        path: field<readonly (string | number)[]>(objectLocations.name, 'pathSegments'),
+        relation: field<string | undefined>(objectLocations.name, 'relation'),
+        key: field<unknown>(objectLocations.name, 'key')
+      })
+    );
+    const version = runtime.source.version?.();
+
+    expect(Array.isArray(version) ? version[0] : undefined).toEqual(heads);
+    expect(Array.isArray(version) ? version[1] : undefined).toMatchObject({
+      revision: 1,
+      localPeerId: 'peer-local'
+    });
+    expect(evaluate(runtime.source, resolvedPresence)).toEqual({
+      rows: [{
+        peer: 'peer-local',
+        topic: 'cursor',
+        heads: [...heads],
+        path: ['workspace', 'tasks', 0],
+        relation: 'tasks',
+        key: 'task-1'
+      }],
+      diagnostics: []
+    });
+
+    presence.stop();
   });
 
   it('reports object ids and conflicts at explicit Automerge paths', () => {
