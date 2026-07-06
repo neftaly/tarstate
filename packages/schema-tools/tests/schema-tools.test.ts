@@ -4,9 +4,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as schemaTools from '@tarstate/schema-tools';
-import { emitSchemaArtifacts } from '@tarstate/schema-tools';
+import {
+  emitSchemaArtifacts,
+  type EmitSchemaArtifactsOptions,
+  type SchemaArtifactKind,
+  type SchemaArtifactSet
+} from '@tarstate/schema-tools';
 import { isDirectCliRun, runCli } from '@tarstate/schema-tools/cli';
 import { emitRelationExamples } from '../src/examples.js';
 import { emitJsonSchemas } from '../src/json-schema.js';
@@ -104,6 +109,15 @@ function isPromptCardUnsafeCharacter(code: number): boolean {
 describe('schema tools artifacts', () => {
   it('keeps the package root API focused on artifact emission', () => {
     expect(Object.keys(schemaTools)).toEqual(['emitSchemaArtifacts']);
+  });
+
+  it('keeps artifact options and results readonly at the type boundary', () => {
+    const selectedArtifacts = ['typescript', 'prompt-card'] as const satisfies readonly SchemaArtifactKind[];
+    const options = { artifacts: selectedArtifacts } satisfies EmitSchemaArtifactsOptions;
+    const artifactSet = emitSchemaArtifacts(shopManifest, options);
+
+    expectTypeOf(artifactSet).toEqualTypeOf<SchemaArtifactSet>();
+    expect(artifactSet.artifacts.map((artifact) => artifact.path)).toEqual(['rows.d.ts', 'agent-card.md']);
   });
 
   it('emits TypeScript row types for IDE and coding-agent feedback', () => {

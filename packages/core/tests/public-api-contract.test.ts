@@ -39,10 +39,15 @@ import {
   row,
   transact,
   tryTransact,
+  type DbQueryOptions,
+  type DbQuerySortKey,
   type DbOptions,
   type DbTransactionResult,
   type QueryBatchResult,
-  type QueryBatchRows
+  type QueryBatchRows,
+  type QueryBatchTargetObject,
+  type QueryBatchTargetOptions,
+  type QueryBatchTargetRow
 } from '@tarstate/core/db';
 import {
   diagnostic,
@@ -188,6 +193,7 @@ type Entry = {
 
 type QueryRow<Input> = Input extends Query<infer Row> ? Row : never;
 type HasKind<Input> = Input extends { readonly kind: unknown } ? true : false;
+type IsAny<Input> = 0 extends (1 & Input) ? true : false;
 
 const schema = defineSchema({
   accounts: relation<Account>({
@@ -701,6 +707,73 @@ describe('public API contracts', () => {
     }>>();
     expectTypeOf<ReturnType<typeof readBatchRows>>().toEqualTypeOf<QueryBatchRows<typeof batch>>();
     expectTypeOf<ReturnType<typeof readBatchResult>>().toEqualTypeOf<QueryBatchResult<typeof batch>>();
+  });
+
+  it('keeps DB query option defaults unknown while constraining known-row sort keys', () => {
+    type DefaultTargetRows = Parameters<NonNullable<QueryBatchTargetOptions['mapRows']>>[0];
+    type DefaultTargetRow = DefaultTargetRows[number];
+    type DefaultTargetObjectQueryRow =
+      Extract<QueryBatchTargetObject['q'], Query<unknown>> extends Query<infer Row> ? Row : never;
+    type PositiveEntry = {
+      readonly id: string;
+      readonly amount: number;
+    };
+
+    const entry = as(schema.entries, 'entry');
+    const positiveEntries = pipe(
+      from(entry),
+      where(gt(entry.amount, value(0))),
+      project({ id: entry.id, amount: entry.amount })
+    );
+
+    const validTargetOptions = {
+      sort: 'amount',
+      rsort: ['id', 'amount']
+    } satisfies QueryBatchTargetOptions<PositiveEntry>;
+    const invalidTargetOptions = {
+      // @ts-expect-error Sort keys must be fields from the typed row.
+      sort: 'missing'
+    } satisfies QueryBatchTargetOptions<PositiveEntry>;
+    const invalidDbOptions = {
+      rsort: [
+        'id',
+        // @ts-expect-error Sort key arrays must also use fields from the typed row.
+        'missing'
+      ]
+    } satisfies DbQueryOptions<PositiveEntry>;
+
+    const readIds = () => q(openingDb, positiveEntries, {
+      sort: 'amount',
+      mapRows: (rows) => rows.map((row) => row.id)
+    });
+    const mappedTarget = {
+      q: positiveEntries,
+      sort: 'amount',
+      mapRows: (rows: readonly PositiveEntry[]) => rows.map((row) => row.id)
+    } satisfies QueryBatchTargetObject<PositiveEntry, string>;
+    const mappedBatch = { ids: mappedTarget };
+    const readBatchIds = () => qMany(openingDb, mappedBatch);
+    const invalidRead = () =>
+      // @ts-expect-error q sort keys must be fields from the inferred query row.
+      q(openingDb, positiveEntries, { sort: 'missing' });
+
+    expectTypeOf<DefaultTargetRows>().toEqualTypeOf<readonly unknown[]>();
+    expectTypeOf<DefaultTargetRow>().toEqualTypeOf<unknown>();
+    expectTypeOf<IsAny<DefaultTargetRow>>().toEqualTypeOf<false>();
+    expectTypeOf<DefaultTargetObjectQueryRow>().toEqualTypeOf<unknown>();
+    expectTypeOf<IsAny<DefaultTargetObjectQueryRow>>().toEqualTypeOf<false>();
+    expectTypeOf<DbQuerySortKey<PositiveEntry>>()
+      .toEqualTypeOf<'id' | 'amount' | ((row: PositiveEntry) => unknown)>();
+    expectTypeOf<ReturnType<typeof readIds>>().toEqualTypeOf<readonly string[]>();
+    expectTypeOf<ReturnType<typeof mappedTarget.mapRows>>().toEqualTypeOf<string[]>();
+    expectTypeOf<QueryBatchTargetRow<typeof mappedTarget>>().toEqualTypeOf<PositiveEntry>();
+    expectTypeOf<QueryBatchRows<typeof mappedBatch>['ids']>().toEqualTypeOf<string[]>();
+    expectTypeOf<ReturnType<typeof readBatchIds>['ids']>().toEqualTypeOf<string[]>();
+
+    void validTargetOptions;
+    void invalidTargetOptions;
+    void invalidDbOptions;
+    void invalidRead;
   });
 
   it('removes duplicated row-only read helpers and the constrained transaction fork from public exports', () => {

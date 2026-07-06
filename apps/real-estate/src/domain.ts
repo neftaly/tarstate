@@ -244,3 +244,5 @@ export const realEstateConstraints = constrain(
 );
 
 export const listingStatuses = ['active', 'under_contract', 'sold'] as const satisfies readonly ListingStatus[];
+export type ListingStatusValue = (typeof listingStatuses)[number];
+export type NeighborhoodId = (typeof neighborhoods)[number]['id'];

@@ -1,4 +1,10 @@
-import { canonicalSchemaManifest, type CodecDeclarationV1, type FieldManifestV1, type RelationManifestV1, type SchemaManifestV1 } from '@tarstate/core/schema';
+import {
+  canonicalSchemaManifest,
+  type CodecDeclarationV1,
+  type FieldManifestV1,
+  type RelationManifestV1,
+  type SchemaManifestV1
+} from '@tarstate/core/schema';
 import { keyFields, sortedEntries } from './names.js';
 
 export type PromptCardOptions = {
@@ -13,44 +19,53 @@ export function emitPromptCardForCanonicalManifest(
   manifest: SchemaManifestV1,
   options: PromptCardOptions = {}
 ): string {
-  const lines: string[] = [
+  return [
     '# Tarstate Schema Card',
     '',
     `Title: ${jsonText(options.title ?? manifest.schemaId)}`,
     `Schema ID: ${jsonText(manifest.schemaId)}`,
     `Description: ${jsonText(manifest.description ?? 'Tarstate schema manifest.')}`,
+    '',
+    '## Relations',
+    ...sortedEntries(manifest.relations).flatMap(([relationName, relation]) => relationLines(relationName, relation)),
+    ...codecLines(manifest.codecs ?? {}),
+    ...ruleLines
+  ].join('\n');
+}
+
+const ruleLines = [
+  '## Rules',
+  '- Fields are required unless marked optional.',
+  '- Nullable is separate from optional; omitted and null are different states.',
+  '- Refs are scalar values pointing at the target relation key field.',
+  '- Custom fields name codecs; portable manifests do not include executable validators.',
+  '- Extra row fields are invalid for strict row/tool validation.',
+  ''
+] as const;
+
+function relationLines(relationName: string, relation: RelationManifestV1): readonly string[] {
+  return [
+    `### Relation ${jsonText(relationName)}`,
+    `Key: ${formatKey(relation.key)}`,
+    ...(relation.description === undefined ? [] : [`Description: ${jsonText(relation.description)}`]),
+    'Fields:',
+    ...sortedEntries(relation.fields).map(([fieldName, field]) =>
+      `- name: ${jsonText(fieldName)}; type: ${jsonText(describeField(field))}; presence: ${jsonText(presenceLabel(field))}`
+    ),
     ''
   ];
+}
 
-  lines.push('## Relations');
-  for (const [relationName, relation] of sortedEntries(manifest.relations)) {
-    lines.push(`### Relation ${jsonText(relationName)}`);
-    lines.push(`Key: ${formatKey(relation.key)}`);
-    if (relation.description !== undefined) lines.push(`Description: ${jsonText(relation.description)}`);
-    lines.push('Fields:');
-    for (const [fieldName, field] of sortedEntries(relation.fields)) {
-      lines.push(`- name: ${jsonText(fieldName)}; type: ${jsonText(describeField(field))}; presence: ${jsonText(presenceLabel(field))}`);
-    }
-    lines.push('');
-  }
-
-  const codecEntries = sortedEntries(manifest.codecs ?? {});
-  if (codecEntries.length > 0) {
-    lines.push('## Custom Codecs');
-    for (const [codecName, codec] of codecEntries) {
-      lines.push(`- codec: ${jsonText(codecName)}; details: ${jsonText(describeCodec(codec))}`);
-    }
-    lines.push('');
-  }
-
-  lines.push('## Rules');
-  lines.push('- Fields are required unless marked optional.');
-  lines.push('- Nullable is separate from optional; omitted and null are different states.');
-  lines.push('- Refs are scalar values pointing at the target relation key field.');
-  lines.push('- Custom fields name codecs; portable manifests do not include executable validators.');
-  lines.push('- Extra row fields are invalid for strict row/tool validation.');
-  lines.push('');
-  return lines.join('\n');
+function codecLines(codecs: Readonly<Record<string, CodecDeclarationV1>>): readonly string[] {
+  const codecEntries = sortedEntries(codecs);
+  if (codecEntries.length === 0) return [];
+  return [
+    '## Custom Codecs',
+    ...codecEntries.map(([codecName, codec]) =>
+      `- codec: ${jsonText(codecName)}; details: ${jsonText(describeCodec(codec))}`
+    ),
+    ''
+  ];
 }
 
 function describeCodec(codec: CodecDeclarationV1): string {
@@ -82,20 +97,19 @@ function describeField(field: FieldManifestV1): string {
 }
 
 function presenceLabel(field: FieldManifestV1): string {
-  const labels = [field.optional === true ? 'optional' : 'required'];
-  if (field.nullable === true) labels.push('nullable');
-  return labels.join(', ');
+  const presence = field.optional === true ? 'optional' : 'required';
+  return field.nullable === true ? `${presence}, nullable` : presence;
 }
 
 function jsonText(input: string | readonly string[]): string {
-  let result = '';
-  for (const char of JSON.stringify(input)) {
-    const code = char.codePointAt(0);
-    result += code !== undefined && shouldEscapePromptCardCharacter(code)
-      ? `\\u${code.toString(16).padStart(4, '0')}`
-      : char;
-  }
-  return result;
+  return Array.from(JSON.stringify(input), escapePromptCardCharacter).join('');
+}
+
+function escapePromptCardCharacter(char: string): string {
+  const code = char.codePointAt(0);
+  return code !== undefined && shouldEscapePromptCardCharacter(code)
+    ? `\\u${code.toString(16).padStart(4, '0')}`
+    : char;
 }
 
 function shouldEscapePromptCardCharacter(code: number): boolean {

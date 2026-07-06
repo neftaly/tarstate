@@ -1,5 +1,11 @@
-export function sortedEntries<T>(record: Readonly<Record<string, T>>): readonly (readonly [string, T])[] {
+export function sortedEntries<const Value>(record: Readonly<Record<string, Value>>): readonly (readonly [string, Value])[] {
   return Object.entries(record).sort(([left], [right]) => compareCodeUnits(left, right));
+}
+
+export function recordFromEntries<const Value>(
+  entries: readonly (readonly [string, Value])[]
+): Readonly<Record<string, Value>> {
+  return Object.fromEntries(entries) as Readonly<Record<string, Value>>;
 }
 
 export function tsPropertyName(input: string): string {

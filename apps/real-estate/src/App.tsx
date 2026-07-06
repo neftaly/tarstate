@@ -70,6 +70,14 @@ function ListingBrowser({
   const listingView = useView(query, { resetKey: JSON.stringify(filters) });
   const update = <Key extends keyof ListingFilters>(key: Key, value: ListingFilters[Key]) =>
     setFilters((current) => ({ ...current, [key]: value }));
+  const updateStatusFilter = (value: string) => {
+    const status = parseListingStatusFilter(value);
+    if (status !== undefined) update('status', status);
+  };
+  const updateNeighborhoodFilter = (value: string) => {
+    const neighborhoodId = parseNeighborhoodFilter(value);
+    if (neighborhoodId !== undefined) update('neighborhoodId', neighborhoodId);
+  };
 
   return (
     <section>
@@ -78,13 +86,13 @@ function ListingBrowser({
       <fieldset>
         <legend>Filters</legend>
         <Labeled label="Status">
-          <select value={filters.status} onChange={(event) => update('status', event.target.value as ListingFilters['status'])}>
+          <select value={filters.status} onChange={(event) => updateStatusFilter(event.target.value)}>
             <option value="all">All</option>
             {listingStatuses.map((status) => <option key={status} value={status}>{formatStatus(status)}</option>)}
           </select>
         </Labeled>
         <Labeled label="Neighborhood">
-          <select value={filters.neighborhoodId} onChange={(event) => update('neighborhoodId', event.target.value)}>
+          <select value={filters.neighborhoodId} onChange={(event) => updateNeighborhoodFilter(event.target.value)}>
             <option value="all">All</option>
             {neighborhoods.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
@@ -367,6 +375,26 @@ function NumberFilter({
 function nextStatus(status: ListingStatus): ListingStatus {
   const index = listingStatuses.indexOf(status);
   return listingStatuses[(index + 1) % listingStatuses.length] ?? 'active';
+}
+
+function isOneOf<const Values extends readonly string[]>(values: Values, value: string): value is Values[number] {
+  return values.some((item) => item === value);
+}
+
+function isListingStatusFilter(value: string): value is ListingFilters['status'] {
+  return value === 'all' || isOneOf(listingStatuses, value);
+}
+
+function isNeighborhoodFilter(value: string): value is ListingFilters['neighborhoodId'] {
+  return value === 'all' || neighborhoods.some((item) => item.id === value);
+}
+
+function parseListingStatusFilter(value: string): ListingFilters['status'] | undefined {
+  return isListingStatusFilter(value) ? value : undefined;
+}
+
+function parseNeighborhoodFilter(value: string): ListingFilters['neighborhoodId'] | undefined {
+  return isNeighborhoodFilter(value) ? value : undefined;
 }
 
 function money(value: number | undefined): string {

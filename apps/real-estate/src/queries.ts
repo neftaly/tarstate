@@ -35,14 +35,17 @@ import {
   type InquiryStatus,
   type Listing,
   type ListingStatus,
+  type ListingStatusValue,
   type Neighborhood,
+  type NeighborhoodId,
   type OfferStatus,
-  type PropertyType
+  type PropertyType,
+  type ViewingStatus
 } from './domain';
 
 export type ListingFilters = {
-  readonly status: ListingStatus | 'all';
-  readonly neighborhoodId: string;
+  readonly status: ListingStatusValue | 'all';
+  readonly neighborhoodId: NeighborhoodId | 'all';
   readonly minBeds: number;
   readonly maxPrice: number;
 };
@@ -97,7 +100,7 @@ export type ViewingScheduleRow = {
   readonly address: string;
   readonly neighborhoodName: string;
   readonly agentName: string;
-  readonly status: string;
+  readonly status: ViewingStatus;
   readonly virtual: boolean;
 };
 
@@ -144,18 +147,21 @@ const joinedListings = pipe(
   from(listing),
   join(from(agent), eq(listing.agentId, agent.id)),
   join(from(neighborhood), eq(listing.neighborhoodId, neighborhood.id))
-) as Query<ListingJoinRow>;
+) satisfies Query<ListingJoinRow>;
+
+function listingFilterPredicates(filters: ListingFilters): readonly PredicateData[] {
+  return [
+    gte(listing.beds, value(filters.minBeds)),
+    lte(listing.price, value(filters.maxPrice)),
+    ...(filters.status === 'all' ? [] : [eq(listing.status, value(filters.status))]),
+    ...(filters.neighborhoodId === 'all' ? [] : [eq(listing.neighborhoodId, value(filters.neighborhoodId))])
+  ];
+}
 
 export function listingListQuery(filters: ListingFilters): Query<ListingRow> {
-  const predicates: PredicateData[] = [
-    gte(listing.beds, value(filters.minBeds)),
-    lte(listing.price, value(filters.maxPrice))
-  ];
+  const predicates = listingFilterPredicates(filters);
 
-  if (filters.status !== 'all') predicates.push(eq(listing.status, value(filters.status)));
-  if (filters.neighborhoodId !== 'all') predicates.push(eq(listing.neighborhoodId, value(filters.neighborhoodId)));
-
-  return pipe(
+  const query = pipe(
     pipe(joinedListings, where(and(...predicates))),
     sort(asc(listing.price), asc(listing.id)),
     select({
@@ -174,7 +180,9 @@ export function listingListQuery(filters: ListingFilters): Query<ListingRow> {
       sqft: listing.sqft,
       status: listing.status
     })
-  ) as Query<ListingRow>;
+  ) satisfies Query<ListingRow>;
+
+  return query;
 }
 
 export const allListingsQuery = listingListQuery(allListingFilters);
@@ -216,7 +224,7 @@ export const marketSummaryQuery = pipe(
     averagePrice: maybe(marketStats.averagePrice),
     highestPrice: maybe(marketStats.highestPrice)
   })
-) as Query<MarketSummaryRow>;
+) satisfies Query<MarketSummaryRow>;
 
 const inquiryStats = pipe(
   from(inquiry),
@@ -270,7 +278,7 @@ export const pipelineByListingQuery = pipe(
     offerCount: maybe(offersByListing.offerCount),
     topOffer: maybe(offersByListing.topOffer)
   })
-) as Query<PipelineRow>;
+) satisfies Query<PipelineRow>;
 
 export const viewingScheduleQuery = pipe(
   from(viewing),
@@ -290,7 +298,7 @@ export const viewingScheduleQuery = pipe(
     status: viewing.status,
     virtual: viewing.virtual
   })
-) as Query<ViewingScheduleRow>;
+) satisfies Query<ViewingScheduleRow>;
 
 export const inquiryQueueQuery = pipe(
   from(inquiry),
@@ -307,7 +315,7 @@ export const inquiryQueueQuery = pipe(
     status: inquiry.status,
     createdAt: inquiry.createdAt
   })
-) as Query<InquiryQueueRow>;
+) satisfies Query<InquiryQueueRow>;
 
 export const offerBookQuery = pipe(
   from(offer),
@@ -323,4 +331,4 @@ export const offerBookQuery = pipe(
     status: offer.status,
     submittedAt: offer.submittedAt
   })
-) as Query<OfferBookRow>;
+) satisfies Query<OfferBookRow>;

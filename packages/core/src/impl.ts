@@ -1236,11 +1236,7 @@ function appendRows(target: unknown[], rows: readonly unknown[]): void {
 
 function composeSourceRelationNames(sources: readonly RelationSource[]): Pick<RelationSource, 'relationNames'> | Record<string, never> {
   if (sources.some((source) => source.relationNames === undefined)) return {};
-  const relationNames = new Set<string>();
-  for (const source of sources) {
-    for (const relationName of source.relationNames ?? []) relationNames.add(relationName);
-  }
-  return { relationNames: Array.from(relationNames) };
+  return { relationNames: uniqueStrings(...sources.map((source) => source.relationNames ?? [])) };
 }
 
 function sourceMayOwnRelation(source: RelationSource, relationName: string): boolean {
@@ -1658,10 +1654,17 @@ export type DbTransactionPlan = {
  */
 export type DbTransactionBuilder = object;
 export type DbTransactionContext = Db & DbTransactionBuilder;
-export type QueryBatchTargetOptions<Row = any, MappedRow = Row, IntoResult = readonly MappedRow[]> = DbQueryOptions<Row, MappedRow, IntoResult>;
-export type QueryBatchTargetObject<Row = any, MappedRow = Row, IntoResult = readonly MappedRow[]> =
+export type QueryBatchTargetOptions<Row = unknown, MappedRow = Row, IntoResult = readonly MappedRow[]> = DbQueryOptions<Row, MappedRow, IntoResult>;
+export type QueryBatchTargetObject<Row = unknown, MappedRow = Row, IntoResult = readonly MappedRow[]> =
   QueryBatchTargetOptions<Row, MappedRow, IntoResult> & { readonly q: Query<Row> | RelationRef };
-export type QueryBatchTarget = Query<unknown> | RelationRef | QueryBatchTargetObject<any, any, any>;
+type QueryBatchTargetAnyObject = EvaluateOptions & {
+  readonly sort?: DbQuerySort<Record<string, unknown>>;
+  readonly rsort?: DbQuerySort<Record<string, unknown>>;
+  readonly mapRows?: (rows: readonly never[]) => readonly unknown[];
+  readonly into?: (rows: readonly never[]) => unknown;
+  readonly q: Query<unknown> | RelationRef;
+};
+export type QueryBatchTarget = Query<unknown> | RelationRef | QueryBatchTargetAnyObject;
 export type QueryBatch = Record<string, QueryBatchTarget>;
 export type QueryBatchTargetRow<Target> = Target extends { readonly q: infer QueryValue }
   ? QueryBatchTargetRow<QueryValue>
@@ -1689,8 +1692,13 @@ export type MappedQueryBatchResult<Queries extends QueryBatch, MappedRow> = { re
 export type QueryBatchRows<Queries extends QueryBatch> = { readonly [Key in keyof Queries]: QueryBatchTargetRows<Queries[Key]> };
 export type MappedQueryBatchRows<Queries extends QueryBatch, MappedRow> = { readonly [Key in keyof Queries]: readonly MappedRow[] };
 export type DbQueryIntoResult<Row, Rows> = Omit<QueryResult<Row>, 'rows'> & { readonly rows: Rows };
+type DbQueryStringSortKey<Row> = unknown extends Row
+  ? string
+  : Row extends object
+    ? keyof Row & string
+    : never;
 export type DbQuerySort<Row = unknown> = DbQuerySortKey<Row> | readonly DbQuerySortKey<Row>[];
-export type DbQuerySortKey<Row = unknown> = string | ((row: Row) => unknown);
+export type DbQuerySortKey<Row = unknown> = DbQueryStringSortKey<Row> | ((row: Row) => unknown);
 export type DbQueryOptions<Row = unknown, MappedRow = Row, IntoResult = readonly MappedRow[]> = EvaluateOptions & {
   readonly sort?: DbQuerySort<Row>;
   readonly rsort?: DbQuerySort<Row>;
@@ -1699,6 +1707,12 @@ export type DbQueryOptions<Row = unknown, MappedRow = Row, IntoResult = readonly
 };
 type DbQueryIntoOptions<Row, MappedRow, IntoResult> =
   DbQueryOptions<Row, MappedRow, IntoResult> & { readonly into: (rows: readonly MappedRow[]) => IntoResult };
+type DbQueryTransformPresenceOptions = EvaluateOptions & {
+  readonly sort?: unknown;
+  readonly rsort?: unknown;
+  readonly mapRows?: unknown;
+  readonly into?: unknown;
+};
 type RelationKeyScalar = string | number | boolean;
 type RelationKeyFieldScalar<Value> = Extract<Exclude<Value, null | undefined>, RelationKeyScalar>;
 type RelationKeyFieldValue<Value> = [RelationKeyFieldScalar<Value>] extends [never]
@@ -1733,34 +1747,42 @@ export const withEnv = (input: Db, envValue: DbInputEnv): Db => ({ ...input, env
 export const getEnv = (input: Db): DbEnv => input.env;
 export const updateEnv = (input: Db, update: (env: DbEnv) => DbInputEnv): Db => withEnv(input, update(input.env));
 export const setEnvTx = (envValue: DbEnvUpdate): SetEnvTransaction => ({ op: 'setEnv', env: envValue });
-export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>, IntoResult = unknown>(_db: Db, _query: Relation, _options: DbQueryIntoOptions<RelationRow<Relation>, MappedRow, IntoResult>): IntoResult;
-export function q<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row>, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): IntoResult;
-export function q<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row> | RelationRef, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): IntoResult;
-export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): readonly MappedRow[];
-export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
-export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): readonly MappedRow[];
-export function q(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): any {
-  return qResult(dbValue, queryValue, options).rows;
+export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>, IntoResult = unknown>(_db: Db, _query: Relation, _options: DbQueryIntoOptions<NoInfer<RelationRow<Relation>>, MappedRow, IntoResult>): IntoResult;
+export function q<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row>, _options: DbQueryIntoOptions<NoInfer<Row>, MappedRow, IntoResult>): IntoResult;
+export function q<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row> | RelationRef, _options: DbQueryIntoOptions<NoInfer<Row>, MappedRow, IntoResult>): IntoResult;
+export function q<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<NoInfer<RelationRow<Relation>>, MappedRow>): readonly MappedRow[];
+export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<NoInfer<Row>, MappedRow>): readonly MappedRow[];
+export function q<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<NoInfer<Row>, MappedRow>): readonly MappedRow[];
+export function q<Row, MappedRow = Row, IntoResult = readonly MappedRow[]>(dbValue: Db, queryValue: Query<Row> | RelationRef, options: DbQueryOptions<Row, MappedRow, IntoResult> = {}): readonly MappedRow[] | IntoResult {
+  return readQueryResult(dbValue, queryValue, options).rows;
 }
-export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>, IntoResult = unknown>(_db: Db, _query: Relation, _options: DbQueryIntoOptions<RelationRow<Relation>, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
-export function qResult<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row>, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
-export function qResult<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row> | RelationRef, _options: DbQueryIntoOptions<Row, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
-export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<RelationRow<Relation>, MappedRow>): QueryResult<MappedRow>;
-export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
-export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<Row, MappedRow>): QueryResult<MappedRow>;
-export function qResult(dbValue: Db, queryValue: Query<any> | RelationRef<any, any>, options: DbQueryOptions<any, any> = {}): QueryResult<any> {
+export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>, IntoResult = unknown>(_db: Db, _query: Relation, _options: DbQueryIntoOptions<NoInfer<RelationRow<Relation>>, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
+export function qResult<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row>, _options: DbQueryIntoOptions<NoInfer<Row>, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
+export function qResult<Row, MappedRow = Row, IntoResult = unknown>(_db: Db, _query: Query<Row> | RelationRef, _options: DbQueryIntoOptions<NoInfer<Row>, MappedRow, IntoResult>): DbQueryIntoResult<MappedRow, IntoResult>;
+export function qResult<Relation extends RelationRef, MappedRow = RelationRow<Relation>>(_db: Db, _query: Relation, _options?: DbQueryOptions<NoInfer<RelationRow<Relation>>, MappedRow>): QueryResult<MappedRow>;
+export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row>, _options?: DbQueryOptions<NoInfer<Row>, MappedRow>): QueryResult<MappedRow>;
+export function qResult<Row, MappedRow = Row>(_db: Db, _query: Query<Row> | RelationRef, _options?: DbQueryOptions<NoInfer<Row>, MappedRow>): QueryResult<MappedRow>;
+export function qResult<Row, MappedRow = Row, IntoResult = readonly MappedRow[]>(dbValue: Db, queryValue: Query<Row> | RelationRef, options: DbQueryOptions<Row, MappedRow, IntoResult> = {}): DbQueryIntoResult<MappedRow, readonly MappedRow[] | IntoResult> {
+  return readQueryResult(dbValue, queryValue, options);
+}
+
+function readQueryResult<Row, MappedRow = Row, IntoResult = readonly MappedRow[]>(
+  dbValue: Db,
+  queryValue: Query<Row> | RelationRef,
+  options: DbQueryOptions<Row, MappedRow, IntoResult>
+): DbQueryIntoResult<MappedRow, readonly MappedRow[] | IntoResult> {
   const queryObject = queryForTarget(queryValue);
   const contextOverrides = hasEvaluateContextOverrides(options);
   const materializedRows = isQuery(queryValue) ? materializedRowsForQuery(dbValue, queryObject) : undefined;
   if (materializedRows !== undefined && !contextOverrides) {
     return {
-      rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(materializedRows, options) : materializedRows,
+      rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(materializedRows, options) : materializedRows as unknown as readonly MappedRow[],
       diagnostics: []
     };
   }
   const result = evaluate(querySourceFor(dbValue, { materializedBaseRelationLookup: !contextOverrides }), queryObject, { ...options, env: options.env ?? dbValue.env });
   return {
-    rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(result.rows, options) : result.rows,
+    rows: hasDbQueryRowTransforms(options) ? applyDbQueryOptions(result.rows, options) : result.rows as unknown as readonly MappedRow[],
     diagnostics: result.diagnostics
   };
 }
@@ -1779,11 +1801,9 @@ function querySourceFor(dbValue: Db, options: QuerySourceOptions = {}): Relation
     : source;
 }
 export function qMany<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchRows<Queries> {
-  const results: Record<string, unknown> = {};
-  for (const [name, result] of Object.entries(qManyResult(dbValue, queries, options))) {
-    results[name] = result.rows;
-  }
-  return results as QueryBatchRows<Queries>;
+  return Object.fromEntries(
+    Object.entries(qManyResult(dbValue, queries, options)).map(([name, result]) => [name, result.rows])
+  ) as QueryBatchRows<Queries>;
 }
 export function qManyResult<Queries extends QueryBatch>(dbValue: Db, queries: Queries, options: DbQueryOptions = {}): QueryBatchResult<Queries> {
   const results: Record<string, QueryResult<unknown>> = {};
@@ -1819,7 +1839,7 @@ export function row<Row>(dbValue: Db, queryValue: Query<Row> | RelationRef, keyO
     const direct = directRelationRowByKey(dbValue, queryValue, keyOrPredicateOrOptions, options as DbQueryOptions<Row> | undefined);
     if (direct.used) return direct.row as Row | undefined;
     const key = relationKeyInputToKey(queryValue, keyOrPredicateOrOptions);
-    return q(dbValue, queryValue, options as DbQueryOptions<Row>)
+    return q(dbValue, queryValue, options as DbQueryOptions<Record<string, unknown>, Row>)
       .find((rowValue) => isRecord(rowValue) && rowKey(queryValue, rowValue) === key) as Row | undefined;
   }
 
@@ -1840,7 +1860,7 @@ function directRelationRowByKey(
   dbValue: Db,
   relationRef: RelationRef,
   keyInput: RelationKeyInput,
-  options: DbQueryOptions<any, any> | undefined
+  options: DbQueryTransformPresenceOptions | undefined
 ): { readonly used: true; readonly row: unknown } | { readonly used: false } {
   const readOptions = options ?? {};
   if (hasDbQueryRowTransforms(readOptions)) return { used: false };
@@ -1903,8 +1923,16 @@ export function whatIf(dbValue: Db, queryValue: Query<unknown> | RelationRef | Q
 export function transact<DbValue extends Db>(inputDb: DbValue, inputs: DbTransactionInputs, options?: DbTransactionOptions): DbValue;
 export function transact<DbValue extends Db>(inputDb: DbValue, input: DbTransactionInput, options?: DbTransactionOptions): DbValue;
 export function transact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbTransactionInputs): DbValue;
-export function transact<DbValue extends Db>(inputDb: DbValue, ...args: any[]): DbValue {
-  const result = tryTransact(inputDb, ...transactionInputsFromArgs(args[0] as DbTransactionInput | DbTransactionInputs | undefined, args.slice(1)));
+export function transact<DbValue extends Db>(
+  inputDb: DbValue,
+  inputOrInputs?: DbTransactionInput | DbTransactionInputs,
+  optionOrInput?: DbTransactionOptions | DbTransactionInput,
+  ...rest: DbTransactionInput[]
+): DbValue {
+  const result = tryTransact(inputDb, ...transactionInputsFromArgs(
+    inputOrInputs,
+    optionOrInput === undefined ? rest : [optionOrInput, ...rest]
+  ));
   if (!result.committed) throw new DbTransactionError(result);
   return result.db;
 }
@@ -2025,6 +2053,7 @@ function transactionInputsFromArgs(
   const values = maybeOptions !== undefined && isDbTransactionOptions(maybeOptions)
     ? args.slice(0, -1)
     : args;
+  if (values.length === 0) return [];
   if (values.length === 1) return normalizeTransactionInputs(values[0] as DbTransactionInput | DbTransactionInputs);
   return values as DbTransactionInputs;
 }
@@ -8234,7 +8263,7 @@ function applyDbQueryOptions<Row, MappedRow, IntoResult>(
   return options.into === undefined ? mapped : options.into(mapped);
 }
 
-function hasDbQueryRowTransforms(options: DbQueryOptions<unknown, unknown>): boolean {
+function hasDbQueryRowTransforms(options: DbQueryTransformPresenceOptions): boolean {
   return options.sort !== undefined || options.rsort !== undefined || options.mapRows !== undefined || options.into !== undefined;
 }
 
@@ -10401,17 +10430,7 @@ function stringArray(input: unknown): readonly string[] {
 }
 
 function uniqueStrings(...groups: readonly (readonly string[])[]): readonly string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const group of groups) {
-    for (const item of group) {
-      if (!seen.has(item)) {
-        seen.add(item);
-        result.push(item);
-      }
-    }
-  }
-  return result;
+  return Array.from(new Set(groups.flat()));
 }
 
 function mergeRelations(inputs: readonly Query[]): Record<string, RelationRef> {

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   defineSchema,
   numberField,
@@ -10,6 +10,7 @@ import {
   parseSingleRelationRow,
   singleRelationInput
 } from '@tarstate/core/relation';
+import type { RelationInputEnvelope } from '@tarstate/core/relation';
 
 type Item = {
   readonly id: string;
@@ -37,6 +38,8 @@ describe('single-row relation inputs', () => {
     const row = { id: 'a', label: 'Alpha', score: 1 };
     const input = singleRelationInput(manifest, schema.items, row);
 
+    expectTypeOf(input).toEqualTypeOf<RelationInputEnvelope<typeof row, 'items'>>();
+
     expect(input).toEqual({
       schemaId: manifest.schemaId,
       relations: { items: [row] }
@@ -49,6 +52,31 @@ describe('single-row relation inputs', () => {
 
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.row).toEqual(row);
+  });
+
+  it('types single-relation envelopes from relation refs and names', () => {
+    const typed = singleRelationInput(manifest, schema.items, {
+      id: 'a',
+      label: 'Alpha',
+      score: 1,
+      source: 'test'
+    });
+    const named = singleRelationInput(manifest, 'items', { id: 'a', label: 'Alpha' });
+
+    expectTypeOf(typed.relations.items).toMatchTypeOf<readonly Item[]>();
+    expectTypeOf(typed.relations.items).toEqualTypeOf<readonly {
+      id: string;
+      label: string;
+      score: number;
+      source: string;
+    }[]>();
+    expectTypeOf(named).toEqualTypeOf<RelationInputEnvelope<{
+      id: string;
+      label: string;
+    }, 'items'>>();
+
+    // @ts-expect-error typed relation refs require rows that satisfy the relation row shape.
+    singleRelationInput(manifest, schema.items, { id: 'a', label: 'Alpha' });
   });
 
   it('reports validation diagnostics for invalid rows', () => {

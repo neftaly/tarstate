@@ -1,5 +1,13 @@
-import { canonicalSchemaManifest, type FieldManifestV1, type JsonObject, type JsonValue, type RefTarget, type SchemaManifestV1 } from '@tarstate/core/schema';
-import { sortedEntries } from './names.js';
+import {
+  canonicalSchemaManifest,
+  type FieldManifestV1,
+  type JsonObject,
+  type JsonValue,
+  type RefTarget,
+  type RelationManifestV1,
+  type SchemaManifestV1
+} from '@tarstate/core/schema';
+import { recordFromEntries, sortedEntries } from './names.js';
 
 export type RelationExampleMap = Readonly<Record<string, JsonObject>>;
 
@@ -8,16 +16,27 @@ export function emitRelationExamples(input: SchemaManifestV1): RelationExampleMa
 }
 
 export function emitRelationExamplesForCanonicalManifest(manifest: SchemaManifestV1): RelationExampleMap {
-  const examples: Record<string, JsonObject> = {};
-  for (const [relationName, relation] of sortedEntries(manifest.relations)) {
-    const row: Record<string, JsonValue> = {};
-    for (const [fieldName, field] of sortedEntries(relation.fields)) {
-      if (field.optional === true) continue;
-      row[fieldName] = exampleValueForField(manifest, relationName, fieldName, field, new Set<string>());
-    }
-    examples[relationName] = row;
-  }
-  return examples;
+  return recordFromEntries(
+    sortedEntries(manifest.relations).map(([relationName, relation]) => [
+      relationName,
+      relationExample(manifest, relationName, relation)
+    ])
+  );
+}
+
+function relationExample(
+  manifest: SchemaManifestV1,
+  relationName: string,
+  relation: RelationManifestV1
+): JsonObject {
+  return recordFromEntries(
+    sortedEntries(relation.fields)
+      .filter(([, field]) => field.optional !== true)
+      .map(([fieldName, field]) => [
+        fieldName,
+        exampleValueForField(manifest, relationName, fieldName, field, new Set<string>())
+      ])
+  );
 }
 
 function exampleValueForField(
@@ -25,7 +44,7 @@ function exampleValueForField(
   relationName: string,
   fieldName: string,
   field: FieldManifestV1,
-  activeRefs: Set<string>
+  activeRefs: ReadonlySet<string>
 ): JsonValue {
   if (field.nullable === true) return null;
   switch (field.type) {
@@ -48,18 +67,25 @@ function exampleValueForField(
   }
 }
 
-function exampleRefValue(manifest: SchemaManifestV1, target: RefTarget, activeRefs: Set<string>): string {
+function exampleRefValue(manifest: SchemaManifestV1, target: RefTarget, activeRefs: ReadonlySet<string>): string {
   const targetId = `${target.relation}.${target.field}`;
   if (activeRefs.has(targetId)) return `${targetId}:example`;
   const targetField = manifest.relations[target.relation]?.fields[target.field];
   if (targetField === undefined) return `${targetId}:example`;
-  activeRefs.add(targetId);
-  const value = exampleValueForField(manifest, target.relation, target.field, targetField, activeRefs);
-  activeRefs.delete(targetId);
+  const value = exampleValueForField(
+    manifest,
+    target.relation,
+    target.field,
+    targetField,
+    new Set([...activeRefs, targetId])
+  );
   return typeof value === 'string' ? value : `${targetId}:example`;
 }
 
-function exampleCustomValue(manifest: SchemaManifestV1, field: Extract<FieldManifestV1, { readonly type: 'custom' }>): JsonValue {
+function exampleCustomValue(
+  manifest: SchemaManifestV1,
+  field: Extract<FieldManifestV1, { readonly type: 'custom' }>
+): JsonValue {
   const scalar = manifest.codecs?.[field.codec]?.scalar;
   switch (scalar) {
     case 'number':

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   composeSources,
   fromObjectSource,
@@ -80,7 +80,12 @@ describe('source API behavior', () => {
   it('wraps relation sets and exposes them as sources', () => {
     const first = { id: 'e1', accountId: 'cash', amount: 10, posted: true };
     const second = { id: 'e2', accountId: 'sales', amount: -10, posted: true };
+    const account = { id: 'cash', name: 'Cash', kind: 'asset' };
     const set = relationSetFromRows({
+      entries: [first, second]
+    });
+    const typedSet = relationSetFromRows({
+      accounts: [account],
       entries: [first, second]
     });
 
@@ -96,6 +101,13 @@ describe('source API behavior', () => {
       zeta: [first],
       alpha: [first, second]
     });
+    expectTypeOf(relationRows(typedSet, 'entries')).toEqualTypeOf<readonly (typeof first)[]>();
+    expectTypeOf(relationRows(typedSet, schema.entries)).toEqualTypeOf<readonly (typeof first)[]>();
+    expectTypeOf(relationRows(typedSet, 'missing')).toEqualTypeOf<readonly (typeof account | typeof first)[]>();
+    expectTypeOf(relationSetNames(typedSet)).toEqualTypeOf<readonly ('accounts' | 'entries')[]>();
+    expectTypeOf(relationRowCounts(typedSet)).toEqualTypeOf<Readonly<Record<'accounts' | 'entries', number>>>();
+    expectTypeOf(relationSetCounts(typedSet)).toEqualTypeOf<Readonly<Record<'accounts' | 'entries', number>>>();
+    expectTypeOf(counts).toEqualTypeOf<Readonly<Record<'alpha' | 'zeta', number>>>();
     expect(Object.keys(counts)).toEqual(['alpha', 'zeta']);
 
     const source = relationSetSource(set);
