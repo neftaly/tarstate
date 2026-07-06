@@ -1,59 +1,6 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "paths": {
-      "@tarstate/core": [
-        "../../packages/core/src/index.ts"
-      ],
-      "@tarstate/core/adapter": [
-        "../../packages/core/src/adapter.ts"
-      ],
-      "@tarstate/core/constraints": [
-        "../../packages/core/src/constraints.ts"
-      ],
-      "@tarstate/core/db": [
-        "../../packages/core/src/db.ts"
-      ],
-      "@tarstate/core/diff": [
-        "../../packages/core/src/diff.ts"
-      ],
-      "@tarstate/core/diagnostics": [
-        "../../packages/core/src/diagnostics.ts"
-      ],
-      "@tarstate/core/evaluate": [
-        "../../packages/core/src/evaluate.ts"
-      ],
-      "@tarstate/core/materialization": [
-        "../../packages/core/src/materialization.ts"
-      ],
-      "@tarstate/core/memory-runtime": [
-        "../../packages/core/src/memory-runtime.ts"
-      ],
-      "@tarstate/core/query": [
-        "../../packages/core/src/query.ts"
-      ],
-      "@tarstate/core/runtime": [
-        "../../packages/core/src/runtime.ts"
-      ],
-      "@tarstate/core/schema": [
-        "../../packages/core/src/schema.ts"
-      ],
-      "@tarstate/core/source": [
-        "../../packages/core/src/source.ts"
-      ],
-      "@tarstate/core/store": [
-        "../../packages/core/src/store.ts"
-      ],
-      "@tarstate/core/watch": [
-        "../../packages/core/src/watch.ts"
-      ],
-      "@tarstate/core/write": [
-        "../../packages/core/src/write.ts"
-      ],
-      "@tarstate/react": [
-        "../../packages/react/src/index.ts"
-      ]
-    },
     "types": [
       "vite/client"
     ]

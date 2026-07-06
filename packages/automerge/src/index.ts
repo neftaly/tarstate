@@ -41,6 +41,22 @@ import {
   type FieldSpec,
   type RelationRef
 } from '@tarstate/core/schema';
+import {
+  relationFieldCompareToBound,
+  relationFieldKeyValue,
+  relationFieldLookupMatches,
+  relationFieldReadValue,
+  relationFieldValueInRange,
+  relationFieldValueMatchesSpec,
+  relationKeyFields,
+  relationKeyInputKey,
+  relationKeyInputMatchesRow,
+  relationKeyInputValues,
+  relationRowKey,
+  relationRowKeyMatchesRow,
+  type RelationKeyInput,
+  validateRelationRow
+} from '@tarstate/core/relation';
 import type { WritePatch } from '@tarstate/core/write';
 
 import type {
@@ -237,7 +253,6 @@ type IndexedRangeRow = {
 };
 type AutomergeMapSourceSnapshot = {
   readonly heads: Automerge.Heads;
-  readonly collections: readonly MappedRelationRows[];
   readonly byRelation: ReadonlyMap<string, MappedRelationRows>;
   readonly diagnostics: readonly TarstateDiagnostic[];
 };
@@ -309,7 +324,6 @@ type AutomergeMapAdapterRuntimeOptions<
 };
 type AutomergeObjectLocationSnapshot = {
   readonly heads: Automerge.Heads;
-  readonly locations: readonly AutomergeObjectLocation[];
   readonly locationByObjectId: ReadonlyMap<Automerge.ObjID, AutomergeObjectLocation>;
   readonly runtimeRows: readonly RuntimeObjectLocationRow[];
 };
@@ -766,9 +780,9 @@ export function withAutomergeRuntimeRelations<Version>(
   runtime: RelationRuntime<Version>,
   relationOrRelations: RelationRef | readonly (RelationRef | AutomergeMapRelation)[]
 ): AutomergeRelationRuntime<Version> {
-  const relations: readonly RelationRef[] = isReadonlyArray(relationOrRelations)
+  const relations: readonly RelationRef[] = Array.isArray(relationOrRelations)
     ? relationOrRelations.map(relationRefFor)
-    : [relationOrRelations];
+    : [relationOrRelations as RelationRef];
 
   return { ...runtime, relations };
 }
@@ -975,16 +989,16 @@ function withAutomergeSystemSource<DocumentShape extends object>(
       : dataSource.rows(relationRef),
     lookup: (lookup) => isSystemRelation(lookup.relation)
       ? systemRows(lookup.relation).filter((row) => isRecord(row)
-        && fieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value))
+        && relationFieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value))
       : dataSource.lookup?.(lookup) ?? dataSource.rows(lookup.relation)
         .filter((row) => isRecord(row)
-          && fieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value)),
+          && relationFieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value)),
     rangeLookup: (lookup) => isSystemRelation(lookup.relation)
       ? systemRows(lookup.relation).filter((row) => isRecord(row)
-        && fieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper))
+        && relationFieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper))
       : dataSource.rangeLookup?.(lookup) ?? dataSource.rows(lookup.relation)
         .filter((row) => isRecord(row)
-          && fieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper)),
+          && relationFieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper)),
     version: () => dataSource.version?.() ?? Automerge.getHeads(getDoc()),
     ...(dataSource.diagnostics === undefined ? {} : { diagnostics: dataSource.diagnostics })
   };
@@ -1203,49 +1217,49 @@ function isRepoStorageMetric(input: unknown): input is AutomergeRepoStorageMetri
 function decodeRelationRow(relation: RelationRef, row: Row): Row {
   const decoded: Row = {};
   for (const [fieldName, value] of Object.entries(row)) {
-    decoded[fieldName] = fieldReadValue(relation.fields[fieldName], cloneValue(value));
+    decoded[fieldName] = relationFieldReadValue(relation.fields[fieldName], cloneValue(value));
   }
   return decoded;
 }
 
-function fieldReadValue(spec: FieldSpec | undefined, value: unknown): unknown {
-  const custom = customSpecForField(spec);
-  if (custom?.toScalar === undefined || value === null || value === undefined) return value;
-  return custom.toScalar(value);
+function decodedFieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
+  if (spec?.valueKind !== 'custom' || spec.custom?.toScalar === undefined) {
+    return relationFieldLookupMatches(spec, fieldValue, lookupValue);
+  }
+  if (Object.is(fieldValue, lookupValue)) return true;
+  if (!relationFieldValueMatchesSpec(spec, lookupValue)) return false;
+  return Object.is(fieldValue, relationFieldReadValue(spec, lookupValue));
 }
 
-function fieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
-  const custom = customSpecForField(spec);
-  if (custom?.compare !== undefined) return custom.compare(fieldValue, lookupValue) === 0;
-  if (custom?.toScalar !== undefined) return Object.is(fieldReadValue(spec, fieldValue), lookupValue);
-  if (custom?.stableKey !== undefined) return custom.stableKey(fieldValue) === custom.stableKey(lookupValue);
-  return Object.is(fieldValue, lookupValue);
-}
-
-function fieldValueInRange(
+function decodedFieldValueInRange(
   spec: FieldSpec | undefined,
-  value: unknown,
-  lower: { readonly value: unknown; readonly inclusive: boolean } | undefined,
-  upper: { readonly value: unknown; readonly inclusive: boolean } | undefined
+  fieldValue: unknown,
+  lower: RelationRangeLookup['lower'],
+  upper: RelationRangeLookup['upper']
 ): boolean {
   if (lower !== undefined) {
-    const compared = compareFieldValueToBound(spec, value, lower.value);
-    if (compared === undefined || compared < 0 || (compared === 0 && !lower.inclusive)) return false;
+    const comparisonValue = decodedFieldCompareToBound(spec, fieldValue, lower.value);
+    if (comparisonValue === undefined || comparisonValue < 0 || (comparisonValue === 0 && !lower.inclusive)) return false;
   }
   if (upper !== undefined) {
-    const compared = compareFieldValueToBound(spec, value, upper.value);
-    if (compared === undefined || compared > 0 || (compared === 0 && !upper.inclusive)) return false;
+    const comparisonValue = decodedFieldCompareToBound(spec, fieldValue, upper.value);
+    if (comparisonValue === undefined || comparisonValue > 0 || (comparisonValue === 0 && !upper.inclusive)) return false;
   }
-
   return true;
 }
 
-function compareFieldValueToBound(spec: FieldSpec | undefined, value: unknown, boundValue: unknown): number | undefined {
-  const custom = customSpecForField(spec);
-  if (custom === undefined) return compareValues(value, boundValue);
-  if (custom.compare !== undefined) return custom.compare(value, boundValue);
-  if (custom.toScalar !== undefined) return compareValues(fieldReadValue(spec, value), boundValue);
-  return undefined;
+function decodedFieldCompareToBound(
+  spec: FieldSpec | undefined,
+  fieldValue: unknown,
+  boundValue: unknown
+): number | undefined {
+  if (spec?.valueKind !== 'custom' || spec.custom?.toScalar === undefined) {
+    return relationFieldCompareToBound(spec, fieldValue, boundValue);
+  }
+  const decodedBoundValue = relationFieldValueMatchesSpec(spec, boundValue)
+    ? relationFieldReadValue(spec, boundValue)
+    : boundValue;
+  return compareValues(fieldValue, decodedBoundValue);
 }
 
 function customSpecForField(spec: FieldSpec | undefined): CustomFieldSpec | undefined {
@@ -1263,17 +1277,6 @@ function nativeAutomergeFieldKind(spec: FieldSpec | undefined): string | undefin
 
 function nativeAutomergeFieldKindForCodec(codec: string): string | undefined {
   return codec === 'automerge.text' || codec === 'automerge.counter' ? codec : undefined;
-}
-
-function rowsForRelation<DocumentShape extends object>(
-  doc: Automerge.Doc<DocumentShape>,
-  relations: readonly AnyMapRelation[],
-  relationRef: RelationRef
-): readonly Row[] {
-  return relations
-    .filter((mapping) => mapping.relation.name === relationRef.name)
-    .flatMap((mapping) => mappedCollection(doc, mapping).rows
-      .map((row) => decodeRelationRow(mapping.relation, row)));
 }
 
 function createMapSourceSnapshotCache<DocumentShape extends object>(
@@ -1327,7 +1330,6 @@ function mapSourceSnapshot<DocumentShape extends object>(
 
   return {
     heads,
-    collections: Array.from(byRelation.values()),
     byRelation,
     diagnostics
   };
@@ -1348,10 +1350,10 @@ function lookupRowsForRelationSnapshot(
   if (relationRows === undefined) return [];
 
   const spec = lookup.relation.fields[lookup.field];
-  const key = equalityIndexKey(spec, lookup.value, 'lookup');
+  const key = equalityIndexKey(spec, lookup.value);
   if (key === undefined) {
     return relationRows.rows.filter((row) =>
-      fieldLookupMatches(spec, row[lookup.field], lookup.value));
+      decodedFieldLookupMatches(spec, row[lookup.field], lookup.value));
   }
 
   return equalityIndexFor(relationRows, lookup.field, spec).get(key) ?? [];
@@ -1367,14 +1369,14 @@ function rangeRowsForRelationSnapshot(
   const spec = lookup.relation.fields[lookup.field];
   if (!canRangeIndex(spec)) {
     return relationRows.rows.filter((row) =>
-      fieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
+      decodedFieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
   }
   if (lookup.lower === undefined && lookup.upper === undefined) return relationRows.rows;
 
   const index = rangeIndexFor(relationRows, lookup.field, spec);
   if (index === undefined) {
     return relationRows.rows.filter((row) =>
-      fieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
+      decodedFieldValueInRange(spec, row[lookup.field], lookup.lower, lookup.upper));
   }
   const lowerIndex = lookup.lower === undefined
     ? 0
@@ -1386,7 +1388,7 @@ function rangeRowsForRelationSnapshot(
   const entries: IndexedRangeRow[] = [];
   for (let indexValue = lowerIndex; indexValue < upperIndex; indexValue += 1) {
     const entry = index[indexValue];
-    if (entry !== undefined && fieldValueInRange(spec, entry.row[lookup.field], lookup.lower, lookup.upper)) {
+    if (entry !== undefined && decodedFieldValueInRange(spec, entry.row[lookup.field], lookup.lower, lookup.upper)) {
       entries.push(entry);
     }
   }
@@ -1411,7 +1413,7 @@ function equalityIndexFor(
 
   const mutable = new Map<string, Row[]>();
   for (const row of relationRows.rows) {
-    const key = equalityIndexKey(spec, row[field], 'row');
+    const key = equalityIndexKey(spec, row[field]);
     if (key === undefined) continue;
 
     const bucket = mutable.get(key);
@@ -1425,14 +1427,11 @@ function equalityIndexFor(
 
 function equalityIndexKey(
   spec: FieldSpec | undefined,
-  value: unknown,
-  position: 'row' | 'lookup'
+  value: unknown
 ): string | undefined {
   const custom = customSpecForField(spec);
   if (custom?.compare !== undefined) return undefined;
-  if (custom?.toScalar !== undefined) {
-    return objectIsIndexKey(position === 'row' ? fieldReadValue(spec, value) : value);
-  }
+  if (custom?.toScalar !== undefined) return objectIsIndexKey(value);
   if (custom?.stableKey !== undefined) return `custom:${custom.stableKey(value)}`;
   return objectIsIndexKey(value);
 }
@@ -1477,12 +1476,12 @@ function rangeIndexFor(
 }
 
 function compareRangeRows(spec: FieldSpec | undefined, left: IndexedRangeRow, right: IndexedRangeRow): number {
-  const compared = compareFieldValueToBound(spec, left.value, right.value) ?? 0;
+  const compared = decodedFieldCompareToBound(spec, left.value, right.value) ?? 0;
   return compared === 0 ? left.ordinal - right.ordinal : compared;
 }
 
 function hasStableRangeComparison(spec: FieldSpec | undefined, value: unknown): boolean {
-  const compared = compareFieldValueToBound(spec, value, value);
+  const compared = decodedFieldCompareToBound(spec, value, value);
   return compared !== undefined && Number.isFinite(compared);
 }
 
@@ -1496,7 +1495,7 @@ function lowerBoundRangeIndex(
   let high = index.length;
   while (low < high) {
     const mid = low + Math.floor((high - low) / 2);
-    const compared = compareFieldValueToBound(spec, index[mid]?.value, value) ?? 0;
+    const compared = decodedFieldCompareToBound(spec, index[mid]?.value, value) ?? 0;
     if (compared < 0 || (compared === 0 && !inclusive)) low = mid + 1;
     else high = mid;
   }
@@ -1513,7 +1512,7 @@ function upperBoundRangeIndex(
   let high = index.length;
   while (low < high) {
     const mid = low + Math.floor((high - low) / 2);
-    const compared = compareFieldValueToBound(spec, index[mid]?.value, value) ?? 0;
+    const compared = decodedFieldCompareToBound(spec, index[mid]?.value, value) ?? 0;
     if (compared < 0 || (compared === 0 && inclusive)) low = mid + 1;
     else high = mid;
   }
@@ -1633,7 +1632,6 @@ function createObjectLocationSnapshotCache<DocumentShape extends object>(
       const locationByObjectId = new Map(locations.map((location) => [location.objectId, location]));
       cached = {
         heads,
-        locations,
         locationByObjectId,
         runtimeRows: runtimeObjectLocationRowsFromLocations(locations, runtimeId)
       };
@@ -1709,7 +1707,7 @@ function runtimeConflictRowsForMappedRelations<DocumentShape extends object>(
           relation: mapping.relation.name,
           field: fieldName,
           conflictCount: conflicts.length,
-          values: conflicts.map((conflict) => fieldReadValue(fieldSpec, conflict.value)),
+          values: conflicts.map((conflict) => relationFieldReadValue(fieldSpec, conflict.value)),
           detail: {
             pathSegments: path,
             ...(key === undefined ? {} : { key }),
@@ -1744,7 +1742,7 @@ function mappedObjectLocation(
 
 function relationKeyValue(relation: RelationRef, row: Row): unknown {
   const keyValues = relationKeyFields(relation)
-    .map((fieldName) => fieldReadValue(relation.fields[fieldName], row[fieldName]));
+    .map((fieldName) => relationFieldKeyValue(relation.fields[fieldName], row[fieldName]));
 
   return keyValues.some((value) => value === undefined || value === null)
     ? undefined
@@ -1765,9 +1763,9 @@ function stagedSourceFor(context: PatchEvaluationContext): AdapterSource<Automer
     relationNames,
     rows: (relationRef) => stagedRowsForRelation(context, relationRef),
     lookup: (lookup) => stagedRowsForRelation(context, lookup.relation)
-      .filter((row) => fieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value)),
+      .filter((row) => decodedFieldLookupMatches(lookup.relation.fields[lookup.field], row[lookup.field], lookup.value)),
     rangeLookup: (lookup) => stagedRowsForRelation(context, lookup.relation)
-      .filter((row) => fieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper)),
+      .filter((row) => decodedFieldValueInRange(lookup.relation.fields[lookup.field], row[lookup.field], lookup.lower, lookup.upper)),
     version: () => Automerge.getHeads(context.doc),
     diagnostics: () => context.relations.flatMap((mapping) =>
       context.plans.has(mapping.relation.name) ? [] : mappedCollection(context.doc, mapping).diagnostics)
@@ -1777,7 +1775,10 @@ function stagedSourceFor(context: PatchEvaluationContext): AdapterSource<Automer
 function stagedRowsForRelation(context: PatchEvaluationContext, relationRef: RelationRef): readonly Row[] {
   const plan = context.plans.get(relationRef.name);
   return plan === undefined
-    ? rowsForRelation(context.doc, context.relations, relationRef)
+    ? context.relations
+      .filter((mapping) => mapping.relation.name === relationRef.name)
+      .flatMap((mapping) => mappedCollection(context.doc, mapping).rows
+        .map((row) => decodeRelationRow(mapping.relation, row)))
     : plan.rows.map((row) => decodeRelationRow(relationRef, row));
 }
 
@@ -1789,14 +1790,7 @@ function mappedCollection<DocumentShape extends object>(
   // need stable ordering must express it in the query, e.g. with ORDER BY.
   const lookup = getPathValue(doc, mapping.path);
 
-  if (lookup.status === 'missing') {
-    return {
-      rows: [],
-      kind: 'map',
-      diagnostics: [invalidPathDiagnostic(mapping, lookup)]
-    };
-  }
-  if (lookup.status === 'invalid') {
+  if (lookup.status !== 'found') {
     return {
       rows: [],
       kind: 'map',
@@ -1888,10 +1882,10 @@ function insertRow(plan: RowPlan, rowValue: unknown, duplicateMode: 'reject' | '
   const rowDiagnostics = validatePlanRow(plan, row);
   if (rowDiagnostics.length > 0) return rejected(...rowDiagnostics);
 
-  const key = rowKeyFor(plan.mapping.relation, row);
+  const key = relationRowKey(plan.mapping.relation, row);
   if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
 
-  if (plan.rows.some((item) => rowKeyFor(plan.mapping.relation, item) === key)) {
+  if (plan.rows.some((item) => relationRowKeyMatchesRow(plan.mapping.relation, item, row))) {
     return duplicateMode === 'ignore'
       ? accepted(false)
       : rejected(uniqueDiagnostic(plan.mapping.relation.name, row));
@@ -1912,10 +1906,10 @@ function upsertRow(
   const rowDiagnostics = validatePlanRow(plan, row);
   if (rowDiagnostics.length > 0) return rejected(...rowDiagnostics);
 
-  const key = rowKeyFor(plan.mapping.relation, row);
+  const key = relationRowKey(plan.mapping.relation, row);
   if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
 
-  const index = plan.rows.findIndex((item) => rowKeyFor(plan.mapping.relation, item) === key);
+  const index = plan.rows.findIndex((item) => relationRowKeyMatchesRow(plan.mapping.relation, item, row));
   if (index === -1) {
     plan.rows = [...plan.rows, row];
     plan.changed = true;
@@ -1939,7 +1933,7 @@ function upsertRow(
   const mergedDiagnostics = validatePlanRow(plan, merged);
   if (mergedDiagnostics.length > 0) return rejected(...expressionDiagnostics, ...mergedDiagnostics);
 
-  const mergedKey = rowKeyFor(plan.mapping.relation, merged);
+  const mergedKey = relationRowKey(plan.mapping.relation, merged);
   if (mergedKey !== key) return rejected(...expressionDiagnostics, rowKeyDiagnostic(plan.mapping.relation.name, merged));
   if (valuesEqual(plan.rows[index], merged)) return accepted(false, expressionDiagnostics);
 
@@ -1949,10 +1943,11 @@ function upsertRow(
 }
 
 function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown, context: PatchEvaluationContext): PatchOutcome {
-  const key = keyValueFor(plan.mapping.relation, keyValue);
+  const key = relationKeyInputKey(plan.mapping.relation, keyValue);
   if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, keyValue));
+  const keyInput = keyValue as RelationKeyInput;
 
-  const index = plan.rows.findIndex((item) => rowKeyFor(plan.mapping.relation, item) === key);
+  const index = plan.rows.findIndex((item) => relationKeyInputMatchesRow(plan.mapping.relation, keyInput, item));
   if (index === -1) return accepted(false);
 
   const current = plan.rows[index];
@@ -1968,7 +1963,7 @@ function updateRowByKey(plan: RowPlan, keyValue: unknown, changes: unknown, cont
   if (updated === undefined) return rejected(...updateResult.diagnostics, rowInvalidDiagnostic(plan.mapping.relation.name, changes));
   const updateDiagnostics = validatePlanRow(plan, updated);
   if (updateDiagnostics.length > 0) return rejected(...updateResult.diagnostics, ...updateDiagnostics);
-  if (rowKeyFor(plan.mapping.relation, updated) !== key) {
+  if (!relationKeyInputMatchesRow(plan.mapping.relation, keyInput, updated)) {
     return rejected(...updateResult.diagnostics, rowKeyDiagnostic(plan.mapping.relation.name, updated));
   }
   if (valuesEqual(current, updated)) return accepted(false, updateResult.diagnostics);
@@ -1986,8 +1981,9 @@ function incrementRowByKey(
   context: PatchEvaluationContext
 ): PatchOutcome {
   const relation = plan.mapping.relation;
-  const key = keyValueFor(relation, keyValue);
+  const key = relationKeyInputKey(relation, keyValue);
   if (key === undefined) return rejected(rowKeyDiagnostic(relation.name, keyValue));
+  const keyInput = keyValue as RelationKeyInput;
 
   const fieldSpec = relation.fields[fieldName];
   if (fieldSpec === undefined) {
@@ -2015,13 +2011,13 @@ function incrementRowByKey(
     ));
   }
 
-  const index = plan.rows.findIndex((item) => rowKeyFor(relation, item) === key);
+  const index = plan.rows.findIndex((item) => relationKeyInputMatchesRow(relation, keyInput, item));
   if (index === -1) return rejected(rowMissingForIncrementDiagnostic(relation, keyValue, fieldName));
 
   const current = plan.rows[index];
   if (current === undefined) return rejected(rowMissingForIncrementDiagnostic(relation, keyValue, fieldName));
   if (!Object.prototype.hasOwnProperty.call(current, fieldName) || current[fieldName] === undefined) {
-    return rejected(fieldMissingDiagnostic(relation.name, fieldName, false));
+    return rejected(fieldMissingDiagnostic(relation.name, fieldName));
   }
 
   const currentValue = current[fieldName];
@@ -2057,7 +2053,7 @@ function incrementRowByKey(
   }
 
   const next = { ...current, [fieldName]: nextValue };
-  if (relationKeyFields(relation).includes(fieldName) && rowKeyFor(relation, next) !== key) {
+  if (relationKeyFields(relation).includes(fieldName) && !relationKeyInputMatchesRow(relation, keyInput, next)) {
     return rejected(fieldInvalidDiagnostic(
       relation.name,
       fieldName,
@@ -2107,7 +2103,7 @@ function updateRowsByPredicate(
     const updated = updateResult.row;
     const updateDiagnostics = validatePlanRow(plan, updated);
     if (updateDiagnostics.length > 0) return rejected(...diagnostics, ...updateDiagnostics);
-    if (rowKeyFor(plan.mapping.relation, updated) !== rowKeyFor(plan.mapping.relation, current)) {
+    if (!relationRowKeyMatchesRow(plan.mapping.relation, updated, current)) {
       return rejected(...diagnostics, rowKeyDiagnostic(plan.mapping.relation.name, updated));
     }
     if (!valuesEqual(current, updated)) {
@@ -2123,10 +2119,11 @@ function updateRowsByPredicate(
 }
 
 function deleteRowByKey(plan: RowPlan, keyValue: unknown): PatchOutcome {
-  const key = keyValueFor(plan.mapping.relation, keyValue);
+  const key = relationKeyInputKey(plan.mapping.relation, keyValue);
   if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, keyValue));
+  const keyInput = keyValue as RelationKeyInput;
 
-  const nextRows = plan.rows.filter((item) => rowKeyFor(plan.mapping.relation, item) !== key);
+  const nextRows = plan.rows.filter((item) => !relationKeyInputMatchesRow(plan.mapping.relation, keyInput, item));
   if (nextRows.length === plan.rows.length) return accepted(false);
 
   plan.rows = nextRows;
@@ -2170,7 +2167,7 @@ function replaceRows(plan: RowPlan, rowsValue: readonly unknown[]): PatchOutcome
     const rowDiagnostics = validatePlanRow(plan, row);
     if (rowDiagnostics.length > 0) return rejected(...rowDiagnostics);
 
-    const key = rowKeyFor(plan.mapping.relation, row);
+    const key = relationRowKey(plan.mapping.relation, row);
     if (key === undefined) return rejected(rowKeyDiagnostic(plan.mapping.relation.name, row));
     if (seenKeys.has(key)) return rejected(uniqueDiagnostic(plan.mapping.relation.name, row));
 
@@ -2356,7 +2353,35 @@ function evaluateTuple(
   relation: RelationRef,
   context: PatchEvaluationContext
 ): ExprEvalResult {
-  if (!Array.isArray(input)) return { supported: false, op: 'tuple' };
+  return evaluateExprList(input, 'tuple', row, relation, context);
+}
+
+function evaluateCall(
+  expr: Record<string, unknown>,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
+  const fn = expr.fn;
+  if (!isHostFunction(fn)) return { supported: false, op: 'call' };
+  const argsResult = evaluateExprList(expr.args, 'call', row, relation, context);
+  if (!argsResult.supported) return argsResult;
+
+  return {
+    supported: true,
+    value: fn.fn(...(argsResult.value as unknown[])),
+    diagnostics: argsResult.diagnostics ?? []
+  };
+}
+
+function evaluateExprList(
+  input: unknown,
+  op: string,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
+  if (!Array.isArray(input)) return { supported: false, op };
 
   const values: unknown[] = [];
   const diagnostics: TarstateDiagnostic[] = [];
@@ -2369,30 +2394,6 @@ function evaluateTuple(
   }
 
   return { supported: true, value: values, diagnostics };
-}
-
-function evaluateCall(
-  expr: Record<string, unknown>,
-  row: Row,
-  relation: RelationRef,
-  context: PatchEvaluationContext
-): ExprEvalResult {
-  const fn = expr.fn;
-  if (!isHostFunction(fn)) return { supported: false, op: 'call' };
-  const argsInput = expr.args;
-  if (!Array.isArray(argsInput)) return { supported: false, op: 'call' };
-
-  const args: unknown[] = [];
-  const diagnostics: TarstateDiagnostic[] = [];
-  for (const arg of argsInput) {
-    const result = evaluateExpr(arg, row, relation, context);
-    diagnostics.push(...(result.diagnostics ?? []));
-    if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedExprResult(exprResultOp(result), diagnostics);
-    if (!result.supported) return result;
-    args.push(result.value);
-  }
-
-  return { supported: true, value: fn.fn(...args), diagnostics };
 }
 
 function evaluateSelectionExpr(expr: Record<string, unknown>, row: Row, context: PatchEvaluationContext): ExprEvalResult {
@@ -2453,18 +2454,7 @@ function evaluateAnd(
   relation: RelationRef,
   context: PatchEvaluationContext
 ): ExprEvalResult {
-  if (!Array.isArray(input)) return { supported: false, op: 'and' };
-
-  const diagnostics: TarstateDiagnostic[] = [];
-  for (const item of input) {
-    const result = evaluateExpr(item, row, relation, context);
-    diagnostics.push(...(result.diagnostics ?? []));
-    if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedExprResult(exprResultOp(result), diagnostics);
-    if (!result.supported) return result;
-    if (result.value !== true) return { supported: true, value: false, diagnostics };
-  }
-
-  return { supported: true, value: true, diagnostics };
+  return evaluateBooleanList(input, 'and', false, row, relation, context);
 }
 
 function evaluateOr(
@@ -2473,7 +2463,18 @@ function evaluateOr(
   relation: RelationRef,
   context: PatchEvaluationContext
 ): ExprEvalResult {
-  if (!Array.isArray(input)) return { supported: false, op: 'or' };
+  return evaluateBooleanList(input, 'or', true, row, relation, context);
+}
+
+function evaluateBooleanList(
+  input: unknown,
+  op: 'and' | 'or',
+  shortCircuitValue: boolean,
+  row: Row,
+  relation: RelationRef,
+  context: PatchEvaluationContext
+): ExprEvalResult {
+  if (!Array.isArray(input)) return { supported: false, op };
 
   const diagnostics: TarstateDiagnostic[] = [];
   for (const item of input) {
@@ -2481,10 +2482,10 @@ function evaluateOr(
     diagnostics.push(...(result.diagnostics ?? []));
     if (hasErrorDiagnostics(result.diagnostics ?? [])) return unsupportedExprResult(exprResultOp(result), diagnostics);
     if (!result.supported) return result;
-    if (result.value === true) return { supported: true, value: true, diagnostics };
+    if ((result.value === true) === shortCircuitValue) return { supported: true, value: shortCircuitValue, diagnostics };
   }
 
-  return { supported: true, value: false, diagnostics };
+  return { supported: true, value: !shortCircuitValue, diagnostics };
 }
 
 function supportedExpr(value: unknown, diagnostics: readonly TarstateDiagnostic[] | undefined): ExprEvalResult {
@@ -2542,7 +2543,7 @@ function relationDelta(relation: RelationRef, before: readonly Row[], after: rea
 }
 
 function keyedRows(relation: RelationRef, rows: readonly Row[]): Map<string, Row> {
-  return new Map(rows.map((row, index) => [rowKeyFor(relation, row) ?? `row:${index}:${stableStringify(row)}`, row]));
+  return new Map(rows.map((row, index) => [relationRowKey(relation, row) ?? `row:${index}:${stableStringify(row)}`, row]));
 }
 
 function getPathValue(root: unknown, path: readonly string[]): PathLookup {
@@ -2671,7 +2672,7 @@ function applyArrayRowsToDraft(root: unknown, collection: unknown[], plan: RowPl
     return;
   }
 
-  const desiredKeys = new Set(plan.rows.map((row) => rowKeyFor(plan.mapping.relation, row)));
+  const desiredKeys = new Set(plan.rows.map((row) => relationRowKey(plan.mapping.relation, row)));
   for (let index = collection.length - 1; index >= 0; index -= 1) {
     const rowKey = currentRowKey(plan.mapping.relation, collection[index]);
     if (rowKey === undefined || !desiredKeys.has(rowKey)) {
@@ -2681,7 +2682,7 @@ function applyArrayRowsToDraft(root: unknown, collection: unknown[], plan: RowPl
 
   for (const [index, row] of plan.rows.entries()) {
     const current = collection[index];
-    if (currentRowKey(plan.mapping.relation, current) !== rowKeyFor(plan.mapping.relation, row)) {
+    if (currentRowKey(plan.mapping.relation, current) !== relationRowKey(plan.mapping.relation, row)) {
       Automerge.insertAt(collection, index, encodeRow(row, plan.mapping.relation));
       continue;
     }
@@ -2696,7 +2697,7 @@ function applyArrayRowsToDraft(root: unknown, collection: unknown[], plan: RowPl
 
 function arrayRowsCanBePatchedWithoutMoving(collection: readonly unknown[], plan: RowPlan): boolean {
   const currentKeys = collection.map((row) => currentRowKey(plan.mapping.relation, row));
-  const desiredKeys = plan.rows.map((row) => rowKeyFor(plan.mapping.relation, row));
+  const desiredKeys = plan.rows.map((row) => relationRowKey(plan.mapping.relation, row));
   const currentKeySet = new Set(currentKeys.filter((key): key is string => key !== undefined));
   const desiredKeySet = new Set(desiredKeys.filter((key): key is string => key !== undefined));
   const keptCurrentKeys = currentKeys.filter((key): key is string => key !== undefined && desiredKeySet.has(key));
@@ -2714,7 +2715,7 @@ function patchRowObject(
   row: Row
 ): void {
   const relation = plan.mapping.relation;
-  const rowKey = rowKeyFor(relation, row);
+  const rowKey = relationRowKey(relation, row);
 
   for (const key of Object.keys(target)) {
     if (!Object.prototype.hasOwnProperty.call(row, key)) delete target[key];
@@ -2737,7 +2738,7 @@ function patchRowObject(
 }
 
 function fieldValuesEqual(spec: FieldSpec | undefined, current: unknown, next: unknown): boolean {
-  return valuesEqual(fieldReadValue(spec, current), next);
+  return valuesEqual(relationFieldReadValue(spec, current), next);
 }
 
 function updateTextFieldValue(
@@ -2756,7 +2757,7 @@ function updateTextFieldValue(
 }
 
 function currentRowKey(relation: RelationRef, input: unknown): string | undefined {
-  return isRecord(input) ? rowKeyFor(relation, input) : undefined;
+  return isRecord(input) ? relationRowKey(relation, input) : undefined;
 }
 
 function nativeRowForPlanKey(doc: unknown, plan: RowPlan, key: string): Record<string, unknown> | undefined {
@@ -2810,7 +2811,7 @@ function applyNativeCounterIncrement(
 }
 
 function validateCollectionRows(relation: RelationRef, rows: readonly Row[]): readonly TarstateDiagnostic[] {
-  return rows.flatMap((row) => validateRelationRowForAutomerge(relation, row));
+  return rows.flatMap((row) => validateRelationRow(relation, row));
 }
 
 function encodeRows(rows: readonly Row[], relation: RelationRef, kind: StorageKind): unknown {
@@ -2837,122 +2838,7 @@ function coerceRow(input: unknown): Row | undefined {
 }
 
 function validatePlanRow(plan: RowPlan, row: Row): readonly TarstateDiagnostic[] {
-  return validateRelationRowForAutomerge(plan.mapping.relation, row);
-}
-
-function validateRelationRowForAutomerge(relation: RelationRef, row: Row): readonly TarstateDiagnostic[] {
-  const diagnostics: TarstateDiagnostic[] = [];
-  const invalidFields = new Set<string>();
-
-  for (const [fieldName, spec] of Object.entries(relation.fields)) {
-    const hasField = Object.prototype.hasOwnProperty.call(row, fieldName);
-    const fieldValue = row[fieldName];
-
-    if (!hasField || fieldValue === undefined) {
-      if (!spec.optional) diagnostics.push(fieldMissingDiagnostic(relation.name, fieldName, false));
-      continue;
-    }
-
-    if (fieldValue === null) {
-      if (!spec.nullable) diagnostics.push(fieldInvalidDiagnostic(
-        relation.name,
-        fieldName,
-        `relation "${relation.name}" field "${fieldName}" must not be null`,
-        fieldValue
-      ));
-      continue;
-    }
-
-    if (!fieldValueMatchesSpec(spec, fieldValue)) {
-      invalidFields.add(fieldName);
-      diagnostics.push(fieldInvalidDiagnostic(
-        relation.name,
-        fieldName,
-        `relation "${relation.name}" field "${fieldName}" must be ${fieldSpecDescription(spec)}`,
-        fieldValue
-      ));
-    }
-  }
-
-  for (const keyField of relationKeyFields(relation)) {
-    const keyValue = row[keyField];
-    if (keyValue === undefined || keyValue === null) {
-      diagnostics.push(fieldMissingDiagnostic(relation.name, keyField, true));
-      continue;
-    }
-
-    const spec = relation.fields[keyField];
-    if (invalidFields.has(keyField)) continue;
-    if (
-      spec?.valueKind === 'custom'
-      && spec.custom?.stableKey === undefined
-      && spec.custom?.toScalar === undefined
-    ) {
-      diagnostics.push(fieldInvalidDiagnostic(
-        relation.name,
-        keyField,
-        `relation "${relation.name}" key field "${keyField}" must define stableKey or toScalar`,
-        keyValue
-      ));
-    } else if (
-      spec?.valueKind === 'custom'
-      && spec.custom?.stableKey === undefined
-      && spec.custom?.toScalar !== undefined
-      && fieldRowKeyValue(spec, keyValue) === undefined
-    ) {
-      diagnostics.push(fieldInvalidDiagnostic(
-        relation.name,
-        keyField,
-        `relation "${relation.name}" key field "${keyField}" must convert to a string, finite number, or boolean`,
-        keyValue
-      ));
-    }
-  }
-
-  return diagnostics;
-}
-
-function fieldValueMatchesSpec(spec: RelationRef['fields'][string], value: unknown): boolean {
-  const custom = customSpecForField(spec);
-  if (custom !== undefined) return custom.validate === undefined || custom.validate(value);
-
-  switch (spec.valueKind) {
-    case 'string':
-    case 'id':
-    case 'ref':
-    case 'anchoredPath':
-      return typeof value === 'string';
-    case 'number':
-      return typeof value === 'number' && Number.isFinite(value);
-    case 'boolean':
-      return typeof value === 'boolean';
-    case 'json':
-      return isJsonValue(value);
-    default:
-      return true;
-  }
-}
-
-function fieldSpecDescription(spec: RelationRef['fields'][string]): string {
-  const custom = customSpecForField(spec);
-  if (custom !== undefined) return custom.description ?? `a ${custom.codec} value`;
-
-  switch (spec.valueKind) {
-    case 'id':
-    case 'ref':
-    case 'anchoredPath':
-      return 'a string';
-    case 'json':
-      return 'a JSON value';
-    default:
-      return `a ${spec.valueKind}`;
-  }
-}
-
-function isJsonValue(input: unknown): boolean {
-  if (input === null || typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') return true;
-  if (Array.isArray(input)) return input.every(isJsonValue);
-  return isRecord(input) && Object.values(input).every(isJsonValue);
+  return validateRelationRow(plan.mapping.relation, row);
 }
 
 function cloneRow(input: Record<string, unknown>): Row {
@@ -2965,46 +2851,21 @@ function cloneValue(input: unknown): unknown {
   return input;
 }
 
-function relationKeyFields(relation: RelationRef): readonly string[] {
-  return typeof relation.key === 'string' ? [relation.key] : relation.key;
-}
-
-function rowKeyFor(relation: RelationRef, row: Row): string | undefined {
-  const values = relationKeyFields(relation)
-    .map((field) => fieldRowKeyValue(relation.fields[field], row[field]));
-  return values.some((value) => value === undefined) ? undefined : stableKey(values);
-}
-
-function keyValueFor(relation: RelationRef, keyValue: unknown): string | undefined {
-  return relationKeyLookupFor(relation, keyValue)?.rowKey;
-}
-
 function relationKeyLookupFor(relation: RelationRef, keyValue: unknown): RelationKeyLookup | undefined {
-  const fields = relationKeyFields(relation);
-  const values = relationKeyValuesForInput(relation, fields, keyValue);
+  const rowKey = relationKeyInputKey(relation, keyValue);
+  if (rowKey === undefined) return undefined;
+
+  const values = relationKeyInputValues(relation, keyValue);
   if (values === undefined) return undefined;
 
   return {
-    rowKey: stableKey(values),
-    storageKey: storageKeyForValues(fields, values)
+    rowKey,
+    storageKey: storageKeyForValues(values)
   };
 }
 
-function relationKeyValuesForInput(
-  relation: RelationRef,
-  fields: readonly string[],
-  keyValue: unknown
-): readonly unknown[] | undefined {
-  const inputValues = relationKeyInputValues(fields, keyValue);
-  const values = inputValues?.map((value, index) =>
-    fieldKeyInputValue(relation.fields[fields[index] as string], value));
-  return values !== undefined && values.length === fields.length && values.every((value) => value !== undefined)
-    ? values
-    : undefined;
-}
-
-function storageKeyForValues(fields: readonly string[], values: readonly unknown[]): string {
-  if (fields.length === 1) {
+function storageKeyForValues(values: readonly unknown[]): string {
+  if (values.length === 1) {
     const value = values[0];
     if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
   }
@@ -3013,48 +2874,8 @@ function storageKeyForValues(fields: readonly string[], values: readonly unknown
 }
 
 function storageKeyForRow(relation: RelationRef, row: Row): string {
-  const fields = relationKeyFields(relation);
-  const values = fields.map((field) => fieldRowKeyValue(relation.fields[field], row[field]));
-  return storageKeyForValues(fields, values);
-}
-
-function relationKeyInputValues(fields: readonly string[], keyValue: unknown): readonly unknown[] | undefined {
-  if (fields.length === 1) return isRelationKeyScalar(keyValue) ? [keyValue] : undefined;
-  if (!Array.isArray(keyValue) || keyValue.length !== fields.length) return undefined;
-  return keyValue.every(isRelationKeyScalar) ? keyValue : undefined;
-}
-
-function fieldRowKeyValue(spec: RelationRef['fields'][string] | undefined, value: unknown): unknown {
-  const custom = customSpecForField(spec);
-  if (custom === undefined) return value;
-  if (value === null || value === undefined) return value;
-  if (spec === undefined || !fieldValueMatchesSpec(spec, value)) return undefined;
-  if (custom.stableKey !== undefined) return custom.stableKey(value);
-  if (custom.toScalar !== undefined) {
-    const scalar = custom.toScalar(value);
-    return isCustomKeyScalar(scalar) ? scalar : undefined;
-  }
-  return undefined;
-}
-
-function fieldKeyInputValue(spec: RelationRef['fields'][string] | undefined, value: unknown): unknown {
-  const custom = customSpecForField(spec);
-  if (custom === undefined) return value;
-  if (!isRelationKeyScalar(value)) return undefined;
-  if (custom.stableKey !== undefined) return value;
-  if (custom.toScalar !== undefined && spec !== undefined && fieldValueMatchesSpec(spec, value)) {
-    const scalar = custom.toScalar(value);
-    return isCustomKeyScalar(scalar) ? scalar : undefined;
-  }
-  return value;
-}
-
-function isRelationKeyScalar(input: unknown): input is string | number | boolean {
-  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
-}
-
-function isCustomKeyScalar(input: unknown): input is string | number | boolean {
-  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
+  const values = relationKeyFields(relation).map((field) => relationFieldKeyValue(relation.fields[field], row[field]));
+  return storageKeyForValues(values);
 }
 
 function relationNamesFor(relations: readonly { readonly relation: RelationRef }[]): readonly string[] {
@@ -3062,11 +2883,7 @@ function relationNamesFor(relations: readonly { readonly relation: RelationRef }
 }
 
 function relationRefFor(input: RelationRef | AutomergeMapRelation): RelationRef {
-  return isMapRelation(input) ? input.relation : input;
-}
-
-function isMapRelation(input: RelationRef | AutomergeMapRelation): input is AutomergeMapRelation {
-  return 'path' in input;
+  return 'path' in input ? input.relation : input;
 }
 
 function uniqueRelationRefs(relations: readonly RelationRef[]): readonly RelationRef[] {
@@ -3089,7 +2906,7 @@ function rowValueForFieldExpr(row: Row, relation: RelationRef, expr: Record<stri
 
   const alias = typeof expr.alias === 'string' ? expr.alias : 'row';
   return rowLocalAliases(relation).includes(alias)
-    ? fieldReadValue(relation.fields[fieldName], row[fieldName])
+    ? relationFieldReadValue(relation.fields[fieldName], row[fieldName])
     : undefined;
 }
 
@@ -3126,10 +2943,6 @@ function hasErrorDiagnostics(diagnostics: readonly TarstateDiagnostic[]): boolea
 
 function exprResultOp(result: ExprEvalResult): string | undefined {
   return result.supported ? undefined : result.op;
-}
-
-function isReadonlyArray<Value>(input: Value | readonly Value[]): input is readonly Value[] {
-  return Array.isArray(input);
 }
 
 function isExprData(input: unknown): input is Record<string, unknown> & { readonly op: string } {
@@ -3274,21 +3087,19 @@ function rowMissingForIncrementDiagnostic(relation: RelationRef, key: unknown, f
     relation: relation.name,
     field,
     surface: 'automergeMapAdapter',
-    message: `relation "${relation.name}" does not contain a row for increment key ${String(keyValueFor(relation, key) ?? '<invalid>')}`,
+    message: `relation "${relation.name}" does not contain a row for increment key ${String(relationKeyInputKey(relation, key) ?? '<invalid>')}`,
     detail: key
   };
 }
 
-function fieldMissingDiagnostic(relation: string, field: string, keyField: boolean): TarstateDiagnostic {
+function fieldMissingDiagnostic(relation: string, field: string): TarstateDiagnostic {
   return {
     code: 'field_missing',
     severity: 'error',
     relation,
     field,
     surface: 'automergeMapAdapter',
-    message: keyField
-      ? `relation "${relation}" key field "${field}" is missing`
-      : `relation "${relation}" row is missing required field "${field}"`
+    message: `relation "${relation}" row is missing required field "${field}"`
   };
 }
 

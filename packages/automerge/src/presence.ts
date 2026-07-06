@@ -13,6 +13,7 @@ import type {
   TarstateDiagnostic
 } from '@tarstate/core/adapter';
 import type { RelationRef } from '@tarstate/core/schema';
+import { relationKeyFields } from '@tarstate/core/relation';
 import type { WritePatch } from '@tarstate/core/write';
 import { isRecord } from './value.js';
 
@@ -303,12 +304,13 @@ function createPresenceTarget<State extends PresenceState>(options: {
     apply: (patches) => {
       const patchList = Array.from(patches);
       const diagnostics: TarstateDiagnostic[] = [];
-      const beforeRows = rowsForState(options.localPeerId, options.presence.getLocalState(), options.fields, {
+      const localRows = () => rowsForState(options.localPeerId, options.presence.getLocalState(), options.fields, {
         local: true,
         lastActiveAt: 0,
         lastSeenAt: 0,
         isClearedValue: options.isClearedValue
       });
+      const beforeRows = localRows();
       let accepted = 0;
       let applied = 0;
 
@@ -326,13 +328,7 @@ function createPresenceTarget<State extends PresenceState>(options: {
 
       if (applied > 0) options.touchLocal();
 
-      const afterRows = rowsForState(options.localPeerId, options.presence.getLocalState(), options.fields, {
-        local: true,
-        lastActiveAt: 0,
-        lastSeenAt: 0,
-        isClearedValue: options.isClearedValue
-      });
-      const deltas = presenceDelta(options.relation, options.fields, beforeRows, afterRows);
+      const deltas = presenceDelta(options.relation, options.fields, beforeRows, localRows());
       const status = applyStatus(patchList.length, accepted);
       const base = {
         patches: patchList.length,
@@ -521,10 +517,6 @@ function presenceKeyFromPatchKey(
   return typeof peerId === 'string' && typeof channel === 'string'
     ? { peerId, channel }
     : undefined;
-}
-
-function relationKeyFields(relation: RelationRef): readonly string[] {
-  return typeof relation.key === 'string' ? [relation.key] : relation.key;
 }
 
 function presenceRow(

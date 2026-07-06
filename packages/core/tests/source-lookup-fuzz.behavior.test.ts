@@ -7,6 +7,7 @@ import {
   type RelationRangeLookup,
   type RelationSource
 } from '@tarstate/core/source';
+import { customField, defineSchema, relation, stringField } from '@tarstate/core/schema';
 import { schema } from './behavior-fixtures.js';
 import { chooseSeeded, createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
@@ -23,10 +24,42 @@ type FuzzSourcePart = {
   };
   readonly source: RelationSource;
 };
+type ComparableKey = {
+  readonly objectId: string;
+  readonly text: string;
+};
 
 const seeds = resolveFuzzSeeds([0x500a, 0x500b, 0x500c, 0x500d] as const);
 const lookupFields = ['amount', 'accountId', 'memo', 'rank', 'missing'] as const;
 const lookupValues = [0, -0, Number.NaN, null, undefined, 'cash', 'fees', true] as const;
+const comparableLookupSchema = defineSchema({
+  notes: relation<{ readonly id: string; readonly marker: ComparableKey }>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      marker: customField<ComparableKey>({
+        codec: 'comparableKey',
+        validate: isComparableKey,
+        toScalar: (value) => isComparableKey(value) ? value.objectId : null,
+        compare: compareComparableKeys
+      })
+    }
+  })
+});
+const stableComparableLookupSchema = defineSchema({
+  notes: relation<{ readonly id: string; readonly marker: ComparableKey }>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      marker: customField<ComparableKey>({
+        codec: 'stableComparableKey',
+        validate: isComparableKey,
+        stableKey: (value) => isComparableKey(value) ? value.objectId : '',
+        compare: () => 0
+      })
+    }
+  })
+});
 
 describe('source lookup fuzz behavior', () => {
   it('fuzzes object-source equality and range lookup against seeded row scans', () => {
@@ -84,7 +117,75 @@ describe('source lookup fuzz behavior', () => {
       }
     }
   });
+
+  it('uses toScalar for scalar custom lookups and compare for host-value custom lookups', () => {
+    const note = { id: 'note-1', marker: { objectId: 'marker-1', text: 'Original' } };
+    const source = fromObjectSource({ notes: [note] });
+
+    expect(source.lookup?.({
+      relation: comparableLookupSchema.notes,
+      field: 'marker',
+      value: 'marker-1'
+    })).toEqual([note]);
+    expect(source.lookup?.({
+      relation: comparableLookupSchema.notes,
+      field: 'marker',
+      value: { objectId: 'marker-1', text: 'Equivalent host value' }
+    })).toEqual([note]);
+  });
+
+  it('uses stableKey rather than compare for custom equality lookups', () => {
+    const note = { id: 'note-1', marker: { objectId: 'marker-1', text: 'Original' } };
+    const source = fromObjectSource({ notes: [note] });
+
+    expect(source.lookup?.({
+      relation: stableComparableLookupSchema.notes,
+      field: 'marker',
+      value: { objectId: 'marker-2', text: 'Coarse comparator collision' }
+    })).toEqual([]);
+    expect(source.lookup?.({
+      relation: stableComparableLookupSchema.notes,
+      field: 'marker',
+      value: { objectId: 'marker-1', text: 'Equivalent host value' }
+    })).toEqual([note]);
+  });
+
+  it('uses toScalar for scalar custom range bounds and compare for host-value bounds', () => {
+    const notes = [
+      { id: 'note-1', marker: { objectId: 'marker-1', text: 'Original' } },
+      { id: 'note-2', marker: { objectId: 'marker-3', text: 'Later' } }
+    ];
+    const source = fromObjectSource({ notes });
+    const expected = [notes[0]];
+
+    expect(source.rangeLookup?.({
+      relation: comparableLookupSchema.notes,
+      field: 'marker',
+      lower: { value: 'marker-1', inclusive: true },
+      upper: { value: 'marker-2', inclusive: false }
+    })).toEqual(expected);
+    expect(source.rangeLookup?.({
+      relation: comparableLookupSchema.notes,
+      field: 'marker',
+      lower: { value: { objectId: 'marker-1', text: 'Lower host value' }, inclusive: true },
+      upper: { value: { objectId: 'marker-2', text: 'Upper host value' }, inclusive: false }
+    })).toEqual(expected);
+  });
 });
+
+function isComparableKey(input: unknown): input is ComparableKey {
+  return typeof input === 'object'
+    && input !== null
+    && 'objectId' in input
+    && typeof input.objectId === 'string'
+    && 'text' in input
+    && typeof input.text === 'string';
+}
+
+function compareComparableKeys(left: unknown, right: unknown): number {
+  if (!isComparableKey(left) || !isComparableKey(right)) throw new Error('compareComparableKeys expects comparable keys');
+  return left.objectId.localeCompare(right.objectId);
+}
 
 function sourceParts(seed: number): FuzzSourcePart[] {
   const lookupModes: readonly HookMode[] = ['handled', 'declined', 'missing'];

@@ -130,22 +130,28 @@ code independent from application schemas, renderers, adapters, and wrappers.
 Advanced examples and integration docs should teach explicit subpath imports:
 
 - `@tarstate/core/adapter`
+- `@tarstate/core/constraints`
+- `@tarstate/core/db`
 - `@tarstate/core/delta`
+- `@tarstate/core/diagnostics`
 - `@tarstate/core/diff`
 - `@tarstate/core/evaluate`
 - `@tarstate/core/materialization`
 - `@tarstate/core/memory-runtime`
+- `@tarstate/core/query`
+- `@tarstate/core/relation`
 - `@tarstate/core/relic`
 - `@tarstate/core/runtime`
+- `@tarstate/core/schema`
 - `@tarstate/core/source`
 - `@tarstate/core/store`
 - `@tarstate/core/watch`
+- `@tarstate/core/write`
 
 The root barrel `@tarstate/core` is the stable starter surface: diagnostics,
 schema, the canonical query DSL, db/query helpers, constraints, materialization,
 watches/change tracking, `createStore`, and write patch builders/types. Advanced
-surfaces also keep explicit subpaths: adapter, runtime, source, delta, diff,
-evaluate, memory-runtime, materialization, relic compatibility, and watch.
+surfaces also keep explicit subpaths matching the list above.
 
 Do not import `packages/core/src/*`, `@tarstate/core/src/*`, or any other
 source-path package internals.

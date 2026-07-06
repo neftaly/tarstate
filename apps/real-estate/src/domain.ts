@@ -244,6 +244,3 @@ export const realEstateConstraints = constrain(
 );
 
 export const listingStatuses = ['active', 'under_contract', 'sold'] as const satisfies readonly ListingStatus[];
-export const propertyTypes = ['condo', 'townhouse', 'single_family'] as const satisfies readonly PropertyType[];
-export const inquiryStatuses = ['new', 'qualified', 'closed'] as const satisfies readonly InquiryStatus[];
-export const offerStatuses = ['draft', 'submitted', 'accepted', 'rejected'] as const satisfies readonly OfferStatus[];

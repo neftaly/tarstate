@@ -2,30 +2,11 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, type UserConfig } from 'vite';
+import { coreSubpathEntryNames, sourceAliasesFor } from './vite.shared.js';
 
 type PackageConfig = {
   readonly build: NonNullable<UserConfig['build']>;
 };
-
-const coreSubpathEntryNames = [
-  'adapter',
-  'constraints',
-  'db',
-  'diagnostics',
-  'delta',
-  'diff',
-  'evaluate',
-  'materialization',
-  'memory-runtime',
-  'query',
-  'relic',
-  'runtime',
-  'schema',
-  'source',
-  'store',
-  'watch',
-  'write'
-] as const;
 
 const packageEntryPath = (entryName: string): string => 'src/' + entryName + '.ts';
 const coreBuildEntries = Object.fromEntries(['index', ...coreSubpathEntryNames].map((entryName) => [entryName, packageEntryPath(entryName)]));
@@ -103,16 +84,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
 const manifest = JSON.parse(readFileSync('package.json', 'utf8')) as { readonly name?: string };
 const packageConfig = manifest.name ? buildConfigsByPackageName[manifest.name] : undefined;
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
-const sourceAlias = (find: string, replacement: string) => ({ find, replacement: path.join(repoRoot, replacement) });
-const sourceAliases = [
-  ...coreSubpathEntryNames.map((entryName) => sourceAlias('@tarstate/core/' + entryName, 'packages/core/src/' + entryName + '.ts')),
-  sourceAlias('@tarstate/automerge/presence', 'packages/automerge/src/presence.ts'),
-  sourceAlias('@tarstate/automerge', 'packages/automerge/src/index.ts'),
-  sourceAlias('@tarstate/react', 'packages/react/src/index.ts'),
-  sourceAlias('@tarstate/schema-tools/cli', 'packages/schema-tools/src/cli.ts'),
-  sourceAlias('@tarstate/schema-tools', 'packages/schema-tools/src/index.ts'),
-  sourceAlias('@tarstate/core', 'packages/core/src/index.ts')
-];
+const sourceAliases = sourceAliasesFor(repoRoot);
 
 export default defineConfig(({ command }): UserConfig => {
   const baseConfig = {

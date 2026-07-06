@@ -10,7 +10,6 @@ import {
   marketSummaryQuery,
   offerBookQuery,
   pipelineByListingQuery,
-  queryLabels,
   viewingScheduleQuery,
   type ListingFilters
 } from './queries';
@@ -53,7 +52,7 @@ function DatabaseOverview() {
     <section>
       <h2>Provider and snapshot</h2>
       <p className="note">TarstateProvider supplies the store. useDb and useTarstateSnapshot read the current revision.</p>
-      <Summary items={[['revision', snapshot.revision], ['relations', rows.length], ['sample query keys', Object.keys(queryLabels).length]]} />
+      <Summary items={[['revision', snapshot.revision], ['relations', rows.length]]} />
       <Table rows={rows} rowKey={(row) => row.name} columns={[['Relation', (row) => row.name], ['Rows', (row) => row.count]]} />
     </section>
   );

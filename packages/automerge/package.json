@@ -7,7 +7,7 @@
   "files": ["src"],
   "exports": {
     ".": "./src/index.ts",
-    "./*": "./src/*.ts"
+    "./presence": "./src/presence.ts"
   },
   "scripts": {
     "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.ts",

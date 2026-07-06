@@ -28,6 +28,9 @@
       "@tarstate/core/db": [
         "./packages/core/src/db.ts"
       ],
+      "@tarstate/core/delta": [
+        "./packages/core/src/delta.ts"
+      ],
       "@tarstate/core/diff": [
         "./packages/core/src/diff.ts"
       ],
@@ -45,6 +48,9 @@
       ],
       "@tarstate/core/query": [
         "./packages/core/src/query.ts"
+      ],
+      "@tarstate/core/relation": [
+        "./packages/core/src/relation.ts"
       ],
       "@tarstate/core/relic": [
         "./packages/core/src/relic.ts"

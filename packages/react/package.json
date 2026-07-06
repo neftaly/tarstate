@@ -6,8 +6,7 @@
   "type": "module",
   "files": ["src"],
   "exports": {
-    ".": "./src/index.ts",
-    "./*": "./src/*.ts"
+    ".": "./src/index.ts"
   },
   "scripts": {
     "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.tsx",

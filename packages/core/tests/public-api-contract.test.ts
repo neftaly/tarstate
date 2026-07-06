@@ -99,6 +99,7 @@ import {
   type PredicateData,
   type Query
 } from '@tarstate/core/query';
+import * as relationApi from '@tarstate/core/relation';
 import type {
   TrackRuntimeCommitResult,
   TrackRuntimeCommitSupportedResult,
@@ -220,6 +221,13 @@ const openingDb = createDb({
 });
 
 describe('public API contracts', () => {
+  it('exports shared relation helpers from the relation subpath', () => {
+    expect(relationApi.relationKeyFields(schema.accounts)).toEqual(['id']);
+    expect(typeof relationApi.relationRowKey).toBe('function');
+    expect(typeof relationApi.relationKeyInputMatchesRow).toBe('function');
+    expect(typeof relationApi.validateRelationRow).toBe('function');
+  });
+
   it('keeps schema JSON boundary on JSON-compatible values only', () => {
     expect(isJsonValue({ nested: ['value', 1, true, null] })).toBe(true);
     expect(isJsonValue([1, { ok: false }])).toBe(true);

@@ -17,7 +17,6 @@ import {
   max,
   maybe,
   pipe,
-  queryKey,
   select,
   sort,
   value,
@@ -325,10 +324,3 @@ export const offerBookQuery = pipe(
     submittedAt: offer.submittedAt
   })
 ) as Query<OfferBookRow>;
-
-export const queryLabels = {
-  listings: queryKey(listingListQuery(defaultListingFilters)),
-  market: queryKey(marketSummaryQuery),
-  pipeline: queryKey(pipelineByListingQuery),
-  viewings: queryKey(viewingScheduleQuery)
-} as const;

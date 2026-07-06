@@ -659,7 +659,7 @@ export function validateRelationRow(relationRef: RelationRef, rowValue: Record<s
       spec?.valueKind === 'custom'
       && spec.custom?.stableKey === undefined
       && spec.custom?.toScalar !== undefined
-      && !isCustomKeyScalar(spec.custom.toScalar(keyValue))
+      && !isRelationKeyScalar(spec.custom.toScalar(keyValue))
     ) {
       diagnostics.push({
         code: 'field_invalid',
@@ -1923,14 +1923,7 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
       items = normalizeTransactionItem(resolveTransactionInput(input, workingDb));
     } catch (error) {
       diagnostics.push(...normalizeDiagnostics(error, transactionFailedDiagnostic('transaction input failed')));
-      return withTransactionWritePatches({
-        db: inputDb,
-        patches: patches.length,
-        applied,
-        deltas,
-        diagnostics,
-        committed: false
-      }, patches);
+      return rejectedTransactionResult(inputDb, patches, diagnostics, applied, deltas);
     }
 
     for (const item of items) {
@@ -1941,14 +1934,7 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
           envDeltas.push(...envDeltasFor(beforeEnv, workingDb.env));
         } catch (error) {
           diagnostics.push(...normalizeDiagnostics(error, transactionFailedDiagnostic('environment transaction failed')));
-          return withTransactionWritePatches({
-            db: inputDb,
-            patches: patches.length,
-            applied,
-            deltas,
-            diagnostics,
-            committed: false
-          }, patches);
+          return rejectedTransactionResult(inputDb, patches, diagnostics, applied, deltas);
         }
         continue;
       }
@@ -1957,14 +1943,7 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
       const patchEnvelopeDiagnostics = validateWritePatchEnvelope(item);
       if (patchEnvelopeDiagnostics.some(isErrorDiagnostic)) {
         diagnostics.push(...patchEnvelopeDiagnostics);
-        return withTransactionWritePatches({
-          db: inputDb,
-          patches: patches.length,
-          applied,
-          deltas,
-          diagnostics,
-          committed: false
-        }, patches);
+        return rejectedTransactionResult(inputDb, patches, diagnostics, applied, deltas);
       }
 
       let patchResult: WriteApplyResult;
@@ -1972,27 +1951,13 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
         patchResult = applyWritePatchToDb(workingDb, item, materializationConstraints);
       } catch (error) {
         diagnostics.push(...normalizeDiagnostics(error, transactionFailedDiagnostic('write patch failed', item.relation.name)));
-        return withTransactionWritePatches({
-          db: inputDb,
-          patches: patches.length,
-          applied,
-          deltas,
-          diagnostics,
-          committed: false
-        }, patches);
+        return rejectedTransactionResult(inputDb, patches, diagnostics, applied, deltas);
       }
       diagnostics.push(...patchResult.diagnostics);
 
       if (patchResult.diagnostics.some(isErrorDiagnostic)) {
         diagnostics.push(...constraintDiagnosticsForInvalidPatch(item, materializationConstraints));
-        return withTransactionWritePatches({
-          db: inputDb,
-          patches: patches.length,
-          applied,
-          deltas,
-          diagnostics,
-          committed: false
-        }, patches);
+        return rejectedTransactionResult(inputDb, patches, diagnostics, applied, deltas);
       }
 
       workingDb = patchResult.db;
@@ -2006,14 +1971,7 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     const validation = validateConstraintsSync(workingDb, materializationConstraints, { env: workingDb.env });
     diagnostics.push(...validation.diagnostics);
     if (!validation.valid) {
-      return withTransactionWritePatches({
-        db: inputDb,
-        patches: patches.length,
-        applied: 0,
-        deltas: [],
-        diagnostics,
-        committed: false
-      }, patches);
+      return rejectedTransactionResult(inputDb, patches, diagnostics);
     }
   }
 
@@ -2035,6 +1993,24 @@ export function tryTransact<DbValue extends Db>(inputDb: DbValue, ...inputs: DbT
     ...(materializations.maintained === 0 ? {} : { materializations })
   }, patches);
 }
+
+function rejectedTransactionResult<DbValue extends Db>(
+  inputDb: DbValue,
+  patches: readonly WritePatch[],
+  diagnostics: readonly TarstateDiagnostic[],
+  applied = 0,
+  deltas: readonly RelationDelta[] = []
+): DbTransactionResult<DbValue> {
+  return withTransactionWritePatches({
+    db: inputDb,
+    patches: patches.length,
+    applied,
+    deltas,
+    diagnostics,
+    committed: false
+  }, patches);
+}
+
 function normalizeTransactionInputs(inputOrInputs: DbTransactionInput | DbTransactionInputs): DbTransactionInputs {
   return (Array.isArray(inputOrInputs) ? inputOrInputs : [inputOrInputs]) as DbTransactionInputs;
 }
@@ -8309,7 +8285,7 @@ function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput
   return stableKey(keyValues);
 }
 
-function relationKeyInputMatchesRow(
+export function relationKeyInputMatchesRow(
   relationRef: RelationRef,
   input: RelationKeyInput,
   rowValue: Record<string, unknown>
@@ -8318,7 +8294,7 @@ function relationKeyInputMatchesRow(
   return relationKeyFieldsMatchInput(relationRef, rowValue, fields, input);
 }
 
-function relationRowKeyMatchesRow(
+export function relationRowKeyMatchesRow(
   relationRef: RelationRef,
   left: Record<string, unknown>,
   right: Record<string, unknown>
@@ -8329,11 +8305,25 @@ function relationRowKeyMatchesRow(
     const valueValue = right[fieldName];
     if (valueValue === undefined) return false;
     if (canCompareRelationKeyAtom(valueValue)) {
-      return relationKeyFieldValueMatches(relationRef, left, fieldName, valueValue);
+      return relationKeyFieldRowValueMatches(relationRef, left, fieldName, valueValue);
     }
   }
   const key = rowKey(relationRef, right);
   return key !== undefined && rowKey(relationRef, left) === key;
+}
+
+function relationKeyFieldRowValueMatches(
+  relationRef: RelationRef,
+  rowValue: Record<string, unknown>,
+  fieldName: string,
+  valueValue: unknown
+): boolean {
+  const fieldValue = rowValue[fieldName];
+  if (fieldValue === undefined) return false;
+  const spec = relationRef.fields[fieldName];
+  const left = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
+  const right = spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
+  return left !== undefined && right !== undefined && Object.is(left, right);
 }
 
 function relationKeyFieldValueMatches(
@@ -9446,29 +9436,19 @@ function queryDataMayNeedMaterializationAux(data: QueryData): boolean {
   return queryDataMayNeedTopNAux(data) || queryDataMayNeedMaterializationIndexes(data);
 }
 
-function queryDataMayNeedTopNAux(data: QueryData): boolean {
-  switch (data.op) {
-    case 'limit':
-    case 'sortLimit':
-      return true;
-    default:
-      break;
-  }
+const topNAuxOps = new Set(['limit', 'sortLimit']);
+const materializationIndexOps = new Set(['hash', 'btree', 'uniqueIndex']);
 
-  return nestedQueryDataMayNeed(data, queryDataMayNeedTopNAux);
+function queryDataMayNeedTopNAux(data: QueryData): boolean {
+  return queryDataMayNeedOp(data, topNAuxOps);
 }
 
 function queryDataMayNeedMaterializationIndexes(data: QueryData): boolean {
-  switch (data.op) {
-    case 'hash':
-    case 'btree':
-    case 'uniqueIndex':
-      return true;
-    default:
-      break;
-  }
+  return queryDataMayNeedOp(data, materializationIndexOps);
+}
 
-  return nestedQueryDataMayNeed(data, queryDataMayNeedMaterializationIndexes);
+function queryDataMayNeedOp(data: QueryData, ops: ReadonlySet<string>): boolean {
+  return ops.has(data.op) || nestedQueryDataMayNeed(data, (nested) => queryDataMayNeedOp(nested, ops));
 }
 
 function nestedQueryDataMayNeed(
@@ -9665,7 +9645,7 @@ function fieldKeyValue(spec: FieldSpec, valueValue: unknown): unknown {
   if (spec.custom?.stableKey !== undefined) return spec.custom.stableKey(valueValue);
   if (spec.custom?.toScalar !== undefined) {
     const scalar = spec.custom.toScalar(valueValue);
-    return isCustomKeyScalar(scalar) ? scalar : undefined;
+    return isRelationKeyScalar(scalar) ? scalar : undefined;
   }
   return undefined;
 }
@@ -9676,21 +9656,29 @@ function fieldKeyInputValue(spec: FieldSpec, valueValue: unknown): unknown {
   if (spec.custom?.stableKey !== undefined) return valueValue;
   if (spec.custom?.toScalar !== undefined && fieldValueMatchesSpec(spec, valueValue)) {
     const scalar = spec.custom.toScalar(valueValue);
-    return isCustomKeyScalar(scalar) ? scalar : undefined;
+    return isRelationKeyScalar(scalar) ? scalar : undefined;
   }
   return valueValue;
 }
 
-function isCustomKeyScalar(input: unknown): input is string | number | boolean {
-  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
-}
-
 function fieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
-  if (spec?.valueKind === 'custom' && spec.custom?.toScalar !== undefined) {
-    return Object.is(fieldReadValue(spec, fieldValue), lookupValue);
-  }
   if (spec?.valueKind === 'custom' && spec.custom?.stableKey !== undefined) {
     return spec.custom.stableKey(fieldValue) === spec.custom.stableKey(lookupValue);
+  }
+  if (
+    spec?.valueKind === 'custom'
+    && spec.custom?.compare !== undefined
+    && fieldValueMatchesSpec(spec, fieldValue)
+    && fieldValueMatchesSpec(spec, lookupValue)
+  ) {
+    return spec.custom.compare(fieldValue, lookupValue) === 0;
+  }
+  if (spec?.valueKind === 'custom' && spec.custom?.toScalar !== undefined) {
+    if (!fieldValueMatchesSpec(spec, fieldValue)) return false;
+    const scalarLookupValue = fieldValueMatchesSpec(spec, lookupValue)
+      ? fieldReadValue(spec, lookupValue)
+      : lookupValue;
+    return Object.is(fieldReadValue(spec, fieldValue), scalarLookupValue);
   }
   return Object.is(fieldValue, lookupValue);
 }
@@ -9714,8 +9702,19 @@ function fieldValueInRange(
 
 function compareFieldValueToBound(spec: FieldSpec | undefined, valueValue: unknown, boundValue: unknown): number | undefined {
   if (spec?.valueKind !== 'custom') return compareValues(valueValue, boundValue);
-  if (spec.custom?.compare !== undefined) return spec.custom.compare(valueValue, boundValue);
-  if (spec.custom?.toScalar !== undefined) return compareValues(fieldReadValue(spec, valueValue), boundValue);
+  if (
+    spec.custom?.compare !== undefined
+    && fieldValueMatchesSpec(spec, valueValue)
+    && fieldValueMatchesSpec(spec, boundValue)
+  ) {
+    return spec.custom.compare(valueValue, boundValue);
+  }
+  if (spec.custom?.toScalar !== undefined && fieldValueMatchesSpec(spec, valueValue)) {
+    const scalarBoundValue = fieldValueMatchesSpec(spec, boundValue)
+      ? fieldReadValue(spec, boundValue)
+      : boundValue;
+    return compareValues(fieldReadValue(spec, valueValue), scalarBoundValue);
+  }
   return undefined;
 }
 
@@ -9734,8 +9733,73 @@ function fieldSpecDescription(spec: FieldSpec): string {
   }
 }
 
-function relationKeyFields(relationRef: RelationRef): readonly string[] {
+export function relationKeyFields(relationRef: RelationRef): readonly string[] {
   return Array.isArray(relationRef.key) ? [...relationRef.key] : [relationRef.key as string];
+}
+
+export function relationKeyInputKey(relationRef: RelationRef, input: unknown): string | undefined {
+  const values = relationKeyInputValues(relationRef, input);
+  return values === undefined ? undefined : stableKey(values);
+}
+
+export function relationKeyInputValues(relationRef: RelationRef, input: unknown): readonly unknown[] | undefined {
+  if (!isRelationKeyInput(input)) return undefined;
+  const fields = relationKeyFields(relationRef);
+  const inputValues = Array.isArray(input)
+    ? input.length === fields.length ? input : undefined
+    : fields.length === 1 ? [input] : undefined;
+  if (inputValues === undefined || !inputValues.every(isRelationKeyScalar)) return undefined;
+
+  const values = inputValues.map((valueValue, indexValue) => {
+    const fieldName = fields[indexValue];
+    const spec = fieldName === undefined ? undefined : relationRef.fields[fieldName];
+    return spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
+  });
+
+  return values.length === fields.length && values.every((valueValue) => valueValue !== undefined)
+    ? values
+    : undefined;
+}
+
+export function relationFieldValueMatchesSpec(spec: FieldSpec | undefined, valueValue: unknown): boolean {
+  return spec === undefined || fieldValueMatchesSpec(spec, valueValue);
+}
+
+export function relationFieldReadValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
+  return fieldReadValue(spec, valueValue);
+}
+
+export function relationFieldKeyValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
+  return spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
+}
+
+export function relationFieldKeyInputValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
+  return spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
+}
+
+export function relationFieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
+  return fieldLookupMatches(spec, fieldValue, lookupValue);
+}
+
+export function relationFieldValueInRange(
+  spec: FieldSpec | undefined,
+  valueValue: unknown,
+  lower: RelationRangeBound | undefined,
+  upper: RelationRangeBound | undefined
+): boolean {
+  return fieldValueInRange(spec, valueValue, lower, upper);
+}
+
+export function relationFieldCompareToBound(
+  spec: FieldSpec | undefined,
+  valueValue: unknown,
+  boundValue: unknown
+): number | undefined {
+  return compareFieldValueToBound(spec, valueValue, boundValue);
+}
+
+export function relationFieldSpecDescription(spec: FieldSpec): string {
+  return fieldSpecDescription(spec);
 }
 
 function isErrorDiagnostic(input: TarstateDiagnostic): boolean {

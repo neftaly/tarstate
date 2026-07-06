@@ -171,7 +171,12 @@ function automergeCustomSpec(
   options: Partial<CustomFieldSpec<unknown>>
 ): CustomFieldSpec<unknown> {
   const merged = { ...defaults, ...options };
-  return withAutomergeNativeFieldKind({ ...merged, codec: options.codec ?? defaultCodec }, defaultCodec);
+  const spec = { ...merged, codec: options.codec ?? defaultCodec };
+  Object.defineProperty(spec, automergeNativeFieldKind, {
+    value: defaultCodec,
+    enumerable: false
+  });
+  return spec;
 }
 
 function customScalarField<Value>(spec: CustomFieldSpec<unknown>): FieldSpec<Value> {
@@ -184,17 +189,6 @@ function customScalarField<Value>(spec: CustomFieldSpec<unknown>): FieldSpec<Val
     });
   }
   return field as FieldSpec<Value>;
-}
-
-function withAutomergeNativeFieldKind(
-  spec: CustomFieldSpec<unknown>,
-  nativeKind: string
-): CustomFieldSpec<unknown> {
-  Object.defineProperty(spec, automergeNativeFieldKind, {
-    value: nativeKind,
-    enumerable: false
-  });
-  return spec;
 }
 
 function isAutomergeObjectReference(input: unknown): boolean {

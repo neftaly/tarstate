@@ -43,6 +43,14 @@ type CompositeRow = {
   readonly label: string;
   readonly visits: number;
 };
+type ComparableMarkerRow = {
+  readonly id: string;
+  readonly marker: RichKey;
+  readonly label: string;
+};
+type ComparableMarkerDoc = {
+  readonly rows: readonly ComparableMarkerRow[];
+};
 
 type RelationKeyProbe = {
   readonly label: string;
@@ -78,6 +86,10 @@ const richKeyStableKey = (value: unknown): string =>
   isRichKey(value) ? value.objectId : '';
 const richKeyScalar = (value: unknown): string | null =>
   isRichKey(value) ? value.objectId : null;
+const compareRichKeysOnly = (left: unknown, right: unknown): number => {
+  if (!isRichKey(left) || !isRichKey(right)) throw new Error('compareRichKeysOnly expects rich keys');
+  return left.objectId.localeCompare(right.objectId);
+};
 
 const keySemanticsSchema = defineSchema({
   strings: relation<KeyedRow<string>>({
@@ -245,6 +257,124 @@ describe('automerge key semantics fuzz', () => {
       assertRowsParity(adapter, expectedDb, relationKeyCase.relation, label);
       assertReadParity(adapter, expectedDb, relationKeyCase, probe, `${label} after`);
     }
+  });
+
+  it('rejects and replaces primitive custom stableKey rows by canonical row identity', async () => {
+    const foldedSchema = defineSchema({
+      rows: relation<KeyedRow<string>>({
+        key: 'id',
+        fields: {
+          id: customField<string>({
+            codec: 'folded.stable',
+            validate: (value): value is string => typeof value === 'string',
+            stableKey: (value) => String(value).toLowerCase()
+          }),
+          label: stringField(),
+          visits: automergeCounterField()
+        }
+      })
+    });
+    const adapter = automergeMapAdapter({
+      doc: Automerge.from({
+        rowsById: {
+          alpha: nativeRow({ id: 'Alpha', label: 'Original', visits: 1 })
+        }
+      }),
+      relations: defineAutomergeMapRelations<{ readonly rowsById: Readonly<Record<string, NativeKeyedRow<string>>> }>()([
+        { relation: foldedSchema.rows, path: ['rowsById'] }
+      ])
+    });
+
+    const duplicate = await adapter.target.apply([
+      write(foldedSchema.rows).insert({ id: 'ALPHA', label: 'Duplicate', visits: 2 })
+    ]);
+    expect(duplicate.status).toBe('rejected');
+    expect(duplicate.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'unique', relation: foldedSchema.rows.name })
+    ]));
+
+    const replace = await adapter.target.apply([
+      write(foldedSchema.rows).insertOrReplace({ id: 'ALPHA', label: 'Replacement', visits: 3 })
+    ]);
+    expect(replace.status).toBe('accepted');
+    expect(adapter.source.rows(foldedSchema.rows)).toEqual([
+      { id: 'ALPHA', label: 'Replacement', visits: 3 }
+    ]);
+  });
+
+  it('looks up and ranges decoded custom toScalar fields by scalar and host values', () => {
+    const adapter = createKeySemanticsAdapter();
+    const expected = [{ id: 'scalar-1', label: 'Scalar Alpha', visits: 11 }];
+
+    expect(adapter.source.lookup?.({
+      relation: keySemanticsSchema.scalarObjects,
+      field: 'id',
+      value: 'scalar-1'
+    })).toEqual(expected);
+    expect(adapter.source.lookup?.({
+      relation: keySemanticsSchema.scalarObjects,
+      field: 'id',
+      value: richKey('scalar-1', 'Equivalent host value')
+    })).toEqual(expected);
+    expect(adapter.source.rangeLookup?.({
+      relation: keySemanticsSchema.scalarObjects,
+      field: 'id',
+      lower: { value: 'scalar-1', inclusive: true },
+      upper: { value: 'scalar-2', inclusive: false }
+    })).toEqual(expected);
+    expect(adapter.source.rangeLookup?.({
+      relation: keySemanticsSchema.scalarObjects,
+      field: 'id',
+      lower: { value: richKey('scalar-1', 'Lower host value'), inclusive: true },
+      upper: { value: richKey('scalar-2', 'Upper host value'), inclusive: false }
+    })).toEqual(expected);
+  });
+
+  it('matches decoded custom toScalar fields with strict host-value comparators', () => {
+    const comparableSchema = defineSchema({
+      rows: relation<ComparableMarkerRow>({
+        key: 'id',
+        fields: {
+          id: stringField(),
+          marker: customField<RichKey>({
+            codec: 'rich.scalar.compare',
+            validate: isRichKey,
+            toScalar: richKeyScalar,
+            compare: compareRichKeysOnly
+          }),
+          label: stringField()
+        }
+      })
+    });
+    const adapter = automergeMapAdapter({
+      doc: Automerge.from<ComparableMarkerDoc>({
+        rows: [
+          { id: 'row-1', marker: richKey('marker-1', 'Original'), label: 'Original' },
+          { id: 'row-2', marker: richKey('marker-3', 'Later'), label: 'Later' }
+        ]
+      }),
+      relations: defineAutomergeMapRelations<ComparableMarkerDoc>()([
+        { relation: comparableSchema.rows, path: ['rows'] }
+      ])
+    });
+    const expected = [{ id: 'row-1', marker: 'marker-1', label: 'Original' }];
+
+    expect(adapter.source.lookup?.({
+      relation: comparableSchema.rows,
+      field: 'marker',
+      value: 'marker-1'
+    })).toEqual(expected);
+    expect(adapter.source.lookup?.({
+      relation: comparableSchema.rows,
+      field: 'marker',
+      value: richKey('marker-1', 'Equivalent host value')
+    })).toEqual(expected);
+    expect(adapter.source.rangeLookup?.({
+      relation: comparableSchema.rows,
+      field: 'marker',
+      lower: { value: richKey('marker-1', 'Lower host value'), inclusive: true },
+      upper: { value: richKey('marker-2', 'Upper host value'), inclusive: false }
+    })).toEqual(expected);
   });
 
   it('rejects custom key toScalar outputs that are not finite scalar values', async () => {

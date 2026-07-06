@@ -7,7 +7,24 @@
   "files": ["src"],
   "exports": {
     ".": "./src/index.ts",
-    "./*": "./src/*.ts"
+    "./adapter": "./src/adapter.ts",
+    "./constraints": "./src/constraints.ts",
+    "./db": "./src/db.ts",
+    "./diagnostics": "./src/diagnostics.ts",
+    "./delta": "./src/delta.ts",
+    "./diff": "./src/diff.ts",
+    "./evaluate": "./src/evaluate.ts",
+    "./materialization": "./src/materialization.ts",
+    "./memory-runtime": "./src/memory-runtime.ts",
+    "./query": "./src/query.ts",
+    "./relation": "./src/relation.ts",
+    "./relic": "./src/relic.ts",
+    "./runtime": "./src/runtime.ts",
+    "./schema": "./src/schema.ts",
+    "./source": "./src/source.ts",
+    "./store": "./src/store.ts",
+    "./watch": "./src/watch.ts",
+    "./write": "./src/write.ts"
   },
   "scripts": {
     "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.ts",

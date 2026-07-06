@@ -138,6 +138,19 @@ const relationKeyFuzzSchema = defineSchema({
       visits: numberField()
     }
   }),
+  scalarComparableObjectKeys: relation<RichKeyRow, 'id'>({
+    key: 'id',
+    fields: {
+      id: customField<RichKey>({
+        codec: 'scalarComparableObjectKey',
+        validate: isRichKey,
+        toScalar: richKeyScalar,
+        compare: compareRichKeysOnly
+      }),
+      label: stringField(),
+      visits: numberField()
+    }
+  }),
   caseFoldedKeys: relation<CaseFoldedKeyRow, 'id'>({
     key: 'id',
     fields: {
@@ -145,6 +158,18 @@ const relationKeyFuzzSchema = defineSchema({
         codec: 'caseFoldedKey',
         validate: (value): value is string => typeof value === 'string',
         toScalar: caseKeyScalar
+      }),
+      label: stringField(),
+      visits: numberField()
+    }
+  }),
+  stableFoldedKeys: relation<CaseFoldedKeyRow, 'id'>({
+    key: 'id',
+    fields: {
+      id: customField<string>({
+        codec: 'stableFoldedKey',
+        validate: (value): value is string => typeof value === 'string',
+        stableKey: caseKeyScalar
       }),
       label: stringField(),
       visits: numberField()
@@ -203,6 +228,33 @@ describe('RelationKeyInput seeded fuzz behavior', () => {
       expect(invalidScalarUpdate.diagnostics, `seed ${seed} scalar object diagnostic`).toEqual(expect.arrayContaining([
         expect.objectContaining({ code: 'write_patch_invalid', relation: relationKeyFuzzSchema.scalarObjectKeys.name })
       ]));
+
+      const stableFoldedRow = customKeyFixture.stableFoldedRows[0];
+      if (stableFoldedRow === undefined) throw new Error('expected stable folded fixture row');
+      const duplicateStableFolded = tryTransact(
+        customKeyFixture.db,
+        write(relationKeyFuzzSchema.stableFoldedKeys).insert({
+          ...stableFoldedRow,
+          id: stableFoldedRow.id.toUpperCase(),
+          label: `duplicate-stable-folded-${seed}`
+        })
+      );
+      expect(duplicateStableFolded.committed, `seed ${seed} stable folded duplicate`).toBe(false);
+
+      const replacedStableFolded = tryTransact(
+        customKeyFixture.db,
+        write(relationKeyFuzzSchema.stableFoldedKeys).insertOrReplace({
+          ...stableFoldedRow,
+          id: stableFoldedRow.id.toUpperCase(),
+          label: `replaced-stable-folded-${seed}`
+        })
+      );
+      expect(replacedStableFolded.committed, `seed ${seed} stable folded replace`).toBe(true);
+      expect(row(replacedStableFolded.db, relationKeyFuzzSchema.stableFoldedKeys, caseKeyScalar(stableFoldedRow.id)), `seed ${seed} stable folded row`).toEqual({
+        ...stableFoldedRow,
+        id: stableFoldedRow.id.toUpperCase(),
+        label: `replaced-stable-folded-${seed}`
+      });
     }
   });
 });
@@ -316,6 +368,7 @@ function makeCustomRelationKeyFixture(seed: number): {
   readonly db: Db;
   readonly scenarios: readonly RelationKeyScenario[];
   readonly objectKeys: readonly RichKey[];
+  readonly stableFoldedRows: readonly CaseFoldedKeyRow[];
 } {
   const random = createSeededRandom(seed ^ 0x9e37);
   const stableObjectRows = Array.from({ length: ROWS_PER_SEED }, (_, index): RichKeyRow => ({
@@ -328,10 +381,20 @@ function makeCustomRelationKeyFixture(seed: number): {
     label: `scalar-${seed}-${index}`,
     visits: index * 2
   }));
+  const scalarComparableRows = Array.from({ length: ROWS_PER_SEED }, (_, index): RichKeyRow => ({
+    id: richKey(seed, index, 'scalar-compare'),
+    label: `scalar-compare-${seed}-${index}`,
+    visits: index * 5
+  }));
   const caseFoldedRows = Array.from({ length: ROWS_PER_SEED }, (_, index): CaseFoldedKeyRow => ({
     id: caseKey(seed, index, random),
     label: `case-${seed}-${index}`,
     visits: index * 3
+  }));
+  const stableFoldedRows = Array.from({ length: ROWS_PER_SEED }, (_, index): CaseFoldedKeyRow => ({
+    id: caseKey(seed + 1, index, random),
+    label: `stable-folded-${seed}-${index}`,
+    visits: index * 6
   }));
   const scaledNumberRows = Array.from({ length: ROWS_PER_SEED }, (_, index): ScaledNumberKeyRow => ({
     id: scaledNumberKey(seed, index),
@@ -343,10 +406,13 @@ function makeCustomRelationKeyFixture(seed: number): {
     db: createDb({
       stableObjectKeys: stableObjectRows,
       scalarObjectKeys: scalarObjectRows,
+      scalarComparableObjectKeys: scalarComparableRows,
       caseFoldedKeys: caseFoldedRows,
+      stableFoldedKeys: stableFoldedRows,
       scaledNumberKeys: scaledNumberRows
     }),
     objectKeys: [stableObjectRows[0]?.id, scalarObjectRows[0]?.id].filter(isRichKey),
+    stableFoldedRows,
     scenarios: [
       ...stableObjectRows.map((rowValue, index): RelationKeyScenario => ({
         label: `stableObject:${index}`,
@@ -362,11 +428,25 @@ function makeCustomRelationKeyFixture(seed: number): {
         missingKey: `${rowValue.id.objectId}:missing`,
         row: rowValue
       })),
+      ...scalarComparableRows.map((rowValue, index): RelationKeyScenario => ({
+        label: `scalarComparableObject:${index}`,
+        relation: relationKeyFuzzSchema.scalarComparableObjectKeys,
+        key: rowValue.id.objectId,
+        missingKey: `${rowValue.id.objectId}:missing`,
+        row: rowValue
+      })),
       ...caseFoldedRows.map((rowValue, index): RelationKeyScenario => ({
         label: `caseFolded:${index}`,
         relation: relationKeyFuzzSchema.caseFoldedKeys,
         key: index % 2 === 0 ? rowValue.id.toUpperCase() : caseKeyScalar(rowValue.id),
         missingKey: `missing-${seed}-${index}`,
+        row: rowValue
+      })),
+      ...stableFoldedRows.map((rowValue, index): RelationKeyScenario => ({
+        label: `stableFolded:${index}`,
+        relation: relationKeyFuzzSchema.stableFoldedKeys,
+        key: caseKeyScalar(rowValue.id),
+        missingKey: `missing-stable-${seed}-${index}`,
         row: rowValue
       })),
       ...scaledNumberRows.map((rowValue, index): RelationKeyScenario => ({
@@ -397,7 +477,7 @@ function missingNumberKey(keyValue: number, index: number): number {
   return keyValue + 0.03125 + index;
 }
 
-function richKey(seed: number, index: number, kind: 'stable' | 'scalar'): RichKey {
+function richKey(seed: number, index: number, kind: 'stable' | 'scalar' | 'scalar-compare'): RichKey {
   return {
     objectId: `${kind}:${seed.toString(36)}:${index}`,
     text: `Text ${seed}.${index}`,
@@ -420,6 +500,11 @@ function richKeyStableKey(value: unknown): string {
 
 function richKeyScalar(value: unknown): string | null {
   return isRichKey(value) ? value.objectId : null;
+}
+
+function compareRichKeysOnly(left: unknown, right: unknown): number {
+  if (!isRichKey(left) || !isRichKey(right)) throw new Error('compareRichKeysOnly expects rich keys');
+  return left.objectId.localeCompare(right.objectId);
 }
 
 function caseKeyScalar(value: unknown): string {

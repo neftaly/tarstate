@@ -1,7 +1,6 @@
 import {
   canonicalSchemaManifest,
   stringifyCanonicalSchemaManifest,
-  type JsonObject,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
 import { emitRelationExamplesForCanonicalManifest } from './examples.js';
@@ -91,8 +90,4 @@ function uniqueArtifactPath(existing: readonly SchemaArtifact[], path: string): 
     candidate = `${base}-${index}${extension}`;
   }
   return candidate;
-}
-
-export function stringifyArtifactJson(input: JsonObject): string {
-  return stringifyStableJsonPretty(input) + '\n';
 }
