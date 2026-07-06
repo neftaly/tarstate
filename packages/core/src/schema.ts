@@ -160,6 +160,24 @@ export type HydrateSchemaManifestResult = {
   readonly diagnostics: readonly SchemaManifestDiagnosticV1[];
 };
 
+export type SchemaManifestCatalog = Readonly<Record<string, SchemaManifestV1>>;
+
+export type SchemaManifestResolverOptions = Omit<HydrateSchemaManifestOptions, 'diagnosticMode'> & {
+  readonly catalog?: SchemaManifestCatalog;
+  readonly diagnosticMode?: 'throw' | 'warn';
+};
+
+export type SchemaManifestResolver = {
+  hydrate(input: SchemaManifestV1 | string): HydratedSchema;
+  relation<
+    Row extends object = Record<string, unknown>,
+    Key extends RelationKeySpec<Row> = RelationKeySpec<Row>
+  >(
+    schema: SchemaManifestV1 | string,
+    relationName: string
+  ): RelationRef<Row, Key>;
+};
+
 export class SchemaManifestValidationError extends Error {
   readonly diagnostics: readonly SchemaManifestDiagnosticV1[];
 
@@ -335,6 +353,53 @@ export function hydrateSchemaManifest(
   const schema = defineSchema(runtimeSchema) as HydratedSchema;
   if (options.diagnosticMode === 'collect') return { schema, diagnostics };
   return schema;
+}
+
+export function createSchemaManifestResolver(
+  options: SchemaManifestResolverOptions = {}
+): SchemaManifestResolver {
+  const cacheById = new Map<string, HydratedSchema>();
+  const cacheByManifest = new WeakMap<SchemaManifestV1, HydratedSchema>();
+
+  const hydrateManifest = (input: SchemaManifestV1 | string): HydratedSchema => {
+    if (typeof input === 'string') {
+      const cached = cacheById.get(input);
+      if (cached !== undefined) return cached;
+
+      const manifest = options.catalog?.[input];
+      if (manifest === undefined) {
+        throw new Error(`Schema manifest "${input}" was not found in the resolver catalog.`);
+      }
+      const schema = hydrateSchemaManifest(manifest, options);
+      cacheById.set(input, schema);
+      cacheByManifest.set(manifest, schema);
+      return schema;
+    }
+
+    const cached = cacheByManifest.get(input);
+    if (cached !== undefined) return cached;
+
+    const schema = hydrateSchemaManifest(input, options);
+    cacheByManifest.set(input, schema);
+    cacheById.set(input.schemaId, schema);
+    return schema;
+  };
+
+  return {
+    hydrate: hydrateManifest,
+    relation<
+      Row extends object = Record<string, unknown>,
+      Key extends RelationKeySpec<Row> = RelationKeySpec<Row>
+    >(schema: SchemaManifestV1 | string, relationName: string): RelationRef<Row, Key> {
+      const hydrated = hydrateManifest(schema);
+      const relationRef = hydrated[relationName];
+      if (relationRef === undefined) {
+        const schemaId = typeof schema === 'string' ? schema : schema.schemaId;
+        throw new Error(`Relation "${relationName}" was not found in schema manifest "${schemaId}".`);
+      }
+      return relationRef as RelationRef<Row, Key>;
+    }
+  };
 }
 
 export function isJsonValue(input: unknown): input is JsonValue {

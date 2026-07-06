@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { composeSources, fromObjectSource } from '@tarstate/core/source';
+import {
+  composeSources,
+  fromObjectSource,
+  relationRowCounts,
+  relationRows,
+  relationSet,
+  relationSetCounts,
+  relationSetFromRows,
+  relationSetFromSource,
+  relationSetNames,
+  relationSetSource
+} from '@tarstate/core/source';
 import { schema } from './behavior-fixtures.js';
 
 describe('source API behavior', () => {
@@ -64,5 +75,35 @@ describe('source API behavior', () => {
     expect(unconstrained.relationNames).toBeUndefined();
     expect(source.relationNames).toBeUndefined();
     expect(source.rows(schema.entries)).toEqual([row]);
+  });
+
+  it('wraps relation sets and exposes them as sources', () => {
+    const first = { id: 'e1', accountId: 'cash', amount: 10, posted: true };
+    const second = { id: 'e2', accountId: 'sales', amount: -10, posted: true };
+    const set = relationSetFromRows({
+      entries: [first, second]
+    });
+
+    expect(relationRows(set, 'entries')).toEqual([first, second]);
+    expect(relationRows(set, schema.entries)).toEqual([first, second]);
+    expect(relationRows(set, 'missing')).toEqual([]);
+    expect(relationSetNames(set)).toEqual(['entries']);
+    expect(relationRowCounts(set)).toEqual({ entries: 2 });
+    expect(relationSetCounts(set)).toEqual({ entries: 2 });
+    expect(relationSet({ entries: [first] }).relations.entries).toEqual([first]);
+
+    const counts = relationRowCounts({
+      zeta: [first],
+      alpha: [first, second]
+    });
+    expect(Object.keys(counts)).toEqual(['alpha', 'zeta']);
+
+    const source = relationSetSource(set);
+    expect(source.relationNames).toEqual(['entries']);
+    expect(source.rows(schema.entries)).toEqual([first, second]);
+    expect(source.lookup?.({ relation: schema.entries, field: 'id', value: 'e2' })).toEqual([second]);
+    expect(relationSetFromSource(source, [schema.entries])).toEqual({
+      relations: { entries: [first, second] }
+    });
   });
 });
