@@ -4,6 +4,7 @@ import { queryKey } from '@tarstate/core/query';
 import type { Query } from '@tarstate/core/query';
 import type { RelationRef } from '@tarstate/core/schema';
 import type {
+  Store,
   StoreCommitOptions,
   StoreCommitResult,
   StoreQueryResult,
@@ -88,7 +89,16 @@ export function useView<Row>(
   query: Query<Row>,
   options: UseViewOptions = {}
 ): ViewHookState<Row> {
-  const view = useStoreView(query, options);
+  const store = useTarstateStore();
+  return useStoreView(store, query, options);
+}
+
+export function useStoreView<Row>(
+  store: Store,
+  query: Query<Row>,
+  options: UseViewOptions = {}
+): ViewHookState<Row> {
+  const view = useStoreViewHandle(store, query, options);
   const subscribe = useCallback((listener: () => void) => view.subscribe(listener), [view]);
   const getSnapshot = useMemo(
     () => stableSnapshotReader(() => view.getSnapshot(), areViewSnapshotsEqual),
@@ -120,7 +130,8 @@ export function useViewSubscription<Row, Selected>(
   query: Query<Row>,
   options: UseViewSubscriptionOptions<Row> | UseViewSubscriptionSelectedOptions<Row, Selected>
 ): void {
-  const view = useStoreView(query, options);
+  const store = useTarstateStore();
+  const view = useStoreViewHandle(store, query, options);
   const onChangeRef = useRef(options.onChange);
   onChangeRef.current = options.onChange;
   const selectedOptions = hasSubscriptionSelect(options) ? options : undefined;
@@ -204,7 +215,8 @@ export function useViewSelector<Row, Selected>(
   query: Query<Row>,
   options?: UseViewSelectorOptions<Row> | UseViewSelectorSelectedOptions<Row, Selected>
 ): ViewSelectorHookState<Row, readonly Row[] | Selected> {
-  const view = useStoreView(query, options);
+  const store = useTarstateStore();
+  const view = useStoreViewHandle(store, query, options);
   const select = hasSelect(options) ? options.select : undefined;
   const equality = hasEquality<Row, Selected>(options) ? options.equality : undefined;
   const subscribe = useCallback((listener: () => void) => view.subscribe(listener), [view]);
@@ -237,8 +249,7 @@ export function useViewSelector<Row, Selected>(
   }), [refresh, snapshot]);
 }
 
-function useStoreView<Row>(query: Query<Row>, options: UseViewOptions = {}): StoreView<Row> {
-  const store = useTarstateStore();
+function useStoreViewHandle<Row>(store: Store, query: Query<Row>, options: UseViewOptions = {}): StoreView<Row> {
   const resetKey = options.resetKey;
   const canonicalQueryKey = useMemo(() => queryKey(query), [query]);
   return useMemo(() => store.view(query), [store, resetKey, canonicalQueryKey]);

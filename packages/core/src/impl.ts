@@ -5904,6 +5904,8 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
   let revision = 0;
   let latestChangedRelationNames: readonly string[] | undefined;
   let closed = false;
+  let runtimeSubscribers = 0;
+  let runtimeUnsubscribe: (() => void) | undefined;
   const listeners = new Set<() => void>();
   const initialRuntimeSnapshot = input.runtime.snapshot?.();
   let currentSource = initialRuntimeSnapshot?.source ?? input.runtime.source;
@@ -5953,17 +5955,40 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
     for (const listener of listeners) listener();
     return nextSnapshot;
   };
-  const runtimeUnsubscribe = input.runtime.subscribe?.((notification) => {
-    if (!closed) refreshFromRuntime(undefined, notification?.relationNames);
-  });
+  const retainRuntimeSubscription = (): (() => void) => {
+    if (closed) return () => {};
+    runtimeSubscribers += 1;
+    if (runtimeSubscribers === 1) {
+      runtimeUnsubscribe = input.runtime.subscribe?.((notification) => {
+        if (!closed) refreshFromRuntime(undefined, notification?.relationNames);
+      });
+    }
+    let retained = true;
+
+    return () => {
+      if (!retained) return;
+      retained = false;
+      if (closed) return;
+      runtimeSubscribers -= 1;
+      if (runtimeSubscribers === 0) {
+        runtimeUnsubscribe?.();
+        runtimeUnsubscribe = undefined;
+      }
+    };
+  };
 
   return {
     getSnapshot: snapshot,
     subscribe: (listener) => {
       if (closed) return () => {};
+      const releaseRuntimeSubscription = retainRuntimeSubscription();
       listeners.add(listener);
+      let subscribed = true;
       return () => {
+        if (!subscribed) return;
+        subscribed = false;
         listeners.delete(listener);
+        releaseRuntimeSubscription();
       };
     },
     query: (queryValue, options) => ({ ...qResult(state, queryValue, options), revision }),
@@ -5972,7 +5997,14 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
       if (isQueryBatch(queryValue)) return addRevisionToBatch(whatIf(state, queryValue, ...inputs), revision);
       return { ...whatIf(state, queryValue, ...inputs), revision };
     }) as StoreWhatIf,
-    view: (queryValue) => createStoreView(queryValue, snapshot, viewCache, input.runtime.retainInterest, changedRelationNamesForRevision),
+    view: (queryValue) => createStoreView(
+      queryValue,
+      snapshot,
+      viewCache,
+      input.runtime.retainInterest,
+      changedRelationNamesForRevision,
+      retainRuntimeSubscription
+    ),
     commit: async (inputOrInputs, options = {}) => {
       if (closed) {
         const closedSnapshot = snapshot();
@@ -6046,6 +6078,8 @@ function createRuntimeBackedStore<Version>(input: StoreRuntimeInput<Version>): S
     close: () => {
       closed = true;
       runtimeUnsubscribe?.();
+      runtimeUnsubscribe = undefined;
+      runtimeSubscribers = 0;
       listeners.clear();
       clearStoreViewCache(viewCache);
     }
@@ -6073,12 +6107,15 @@ type StoreViewCacheEntry<Row, Version> = {
   readonly listeners: Set<() => void>;
   subscribers: number;
   releaseInterest: RelationRuntimeReleaseInterest | undefined;
+  releaseRuntimeSubscription: (() => void) | undefined;
 };
 
 function clearStoreViewCache<Version>(viewCache: StoreViewCache<Version>): void {
   for (const entry of viewCache.values()) {
     entry.releaseInterest?.();
     entry.releaseInterest = undefined;
+    entry.releaseRuntimeSubscription?.();
+    entry.releaseRuntimeSubscription = undefined;
     entry.listeners.clear();
   }
   viewCache.clear();
@@ -6205,7 +6242,8 @@ function createStoreView<Row, Version>(
   snapshot: () => StoreSnapshot<Version>,
   viewCache: StoreViewCache<Version>,
   retainInterest?: RelationRuntimeRetainInterest,
-  changedRelationNamesForRevision?: (revision: number) => readonly string[] | undefined
+  changedRelationNamesForRevision?: (revision: number) => readonly string[] | undefined,
+  retainRuntimeSubscription?: () => () => void
 ): StoreView<Row, Version> {
   const key = queryKey(queryValue);
   const cacheEntry = (): StoreViewCacheEntry<Row, Version> => {
@@ -6223,7 +6261,8 @@ function createStoreView<Row, Version>(
       viewRevision: 0,
       listeners: new Set(),
       subscribers: 0,
-      releaseInterest: undefined
+      releaseInterest: undefined,
+      releaseRuntimeSubscription: undefined
     };
     viewCache.set(key, next as StoreViewCacheEntry<unknown, Version>);
     return next;
@@ -6237,6 +6276,7 @@ function createStoreView<Row, Version>(
     const entry = cacheEntry();
     entry.subscribers += 1;
     if (entry.subscribers === 1) {
+      entry.releaseRuntimeSubscription = retainRuntimeSubscription?.();
       const releaseInterest = retainInterest?.({
         id: key,
         kind: 'view',
@@ -6261,6 +6301,8 @@ function createStoreView<Row, Version>(
       if (entry.subscribers === 0 && viewCache.get(key) === entry) {
         entry.releaseInterest?.();
         entry.releaseInterest = undefined;
+        entry.releaseRuntimeSubscription?.();
+        entry.releaseRuntimeSubscription = undefined;
         entry.listeners.clear();
         viewCache.delete(key);
       }

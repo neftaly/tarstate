@@ -87,7 +87,7 @@ describe('query API contracts', () => {
     expectTypeOf(account.row.name).toEqualTypeOf<ExprData<string>>();
     expectTypeOf(account.row.id).toEqualTypeOf<ExprData<string>>();
     // @ts-expect-error Flat row-field access is not part of the aliased relation API.
-    account.id;
+    void account.id;
 
     const namedRows = pipe(
       from(account),
@@ -127,7 +127,7 @@ describe('query API contracts', () => {
     });
     expectTypeOf(item.row.key).toEqualTypeOf<ExprData<string>>();
     // @ts-expect-error Non-metadata flat row fields are not exposed on aliases.
-    item.label;
+    void item.label;
     expectTypeOf<QueryRow<typeof keyedRows>>().toEqualTypeOf<Pick<KeyedItem, 'id' | 'key' | 'label'>>();
 
     const collision = as(schema.collisionItems, 'collision');

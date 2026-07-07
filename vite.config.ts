@@ -41,6 +41,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       lib: {
         entry: {
           index: 'src/index.ts',
+          react: 'src/react.ts',
           presence: 'src/presence.ts'
         },
         formats: ['es'],
@@ -48,7 +49,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       },
       rollupOptions: {
         ...sharedBuildOptions.rollupOptions,
-        external: [/^@tarstate\/core(?:\/.*)?$/, '@automerge/automerge', '@automerge/automerge-repo']
+        external: [/^@tarstate\/core(?:\/.*)?$/, /^@tarstate\/react(?:\/.*)?$/, '@automerge/automerge', '@automerge/automerge-repo', 'react']
       }
     }
   },

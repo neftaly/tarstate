@@ -776,6 +776,44 @@ describe('watch and store behavior', () => {
     store.close();
   });
 
+  it('subscribes to runtime changes only while the store has active subscribers', async () => {
+    const inner = createMemoryRelationRuntime(makeDb().data);
+    let runtimeListeners = 0;
+    const runtime = {
+      ...inner,
+      subscribe: (listener: () => void) => {
+        runtimeListeners += 1;
+        const unsubscribe = inner.subscribe?.(listener);
+        return () => {
+          runtimeListeners -= 1;
+          unsubscribe?.();
+        };
+      }
+    };
+    const store = createRuntimeStore({
+      runtime,
+      relations: [schema.accounts, schema.entries]
+    });
+
+    expect(runtimeListeners).toBe(0);
+
+    const unsubscribeStore = store.subscribe(() => {});
+    expect(runtimeListeners).toBe(1);
+
+    const entryView = store.view(entryList);
+    const unsubscribeView = entryView.subscribe(() => {});
+    expect(runtimeListeners).toBe(1);
+
+    unsubscribeStore();
+    expect(runtimeListeners).toBe(1);
+
+    unsubscribeView();
+    expect(runtimeListeners).toBe(0);
+
+    store.close();
+    expect(runtimeListeners).toBe(0);
+  });
+
   it('runtime store does not double notify when apply synchronously refreshes from subscription', async () => {
     const runtime = createMemoryRelationRuntime(makeDb().data);
     const store = createRuntimeStore({ runtime, relations: [schema.accounts, schema.entries] });

@@ -6,6 +6,8 @@ import {
   TarstateProvider,
   shallow,
   useCommit,
+  useLocalRuntimeStore,
+  useLocalStore,
   useDb,
   useViewSelector,
   useRow,
@@ -14,6 +16,7 @@ import {
   useViewSubscription,
   useTarstateStore,
   useView,
+  useStoreView,
   type ViewSelectorHookState,
   type RowHookState,
   type TarstateCommit,
@@ -90,9 +93,12 @@ describe('@tarstate/react API contract', () => {
     expect(useTarstateSnapshot).toBeTypeOf('function');
     expect(useDb).toBeTypeOf('function');
     expect(useCommit).toBeTypeOf('function');
+    expect(useLocalStore).toBeTypeOf('function');
+    expect(useLocalRuntimeStore).toBeTypeOf('function');
     expect(useTarstateMutation).toBeTypeOf('function');
     expect(useViewSubscription).toBeTypeOf('function');
     expect(useView).toBeTypeOf('function');
+    expect(useStoreView).toBeTypeOf('function');
     expect(useRow).toBeTypeOf('function');
     expect(useViewSelector).toBeTypeOf('function');
   });

@@ -3,6 +3,8 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { describe, expect, it } from 'vitest';
 import {
   TarstateProvider,
+  useLocalRuntimeStore,
+  useStoreView,
   useViewSelector,
   useRow,
   useTarstateSnapshot,
@@ -51,6 +53,131 @@ const itemQuery = pipe(
 );
 
 describe('@tarstate/react core integration', () => {
+  it('renders a direct store view without a provider', async () => {
+    const store = createStore({
+      items: [
+        { id: 'item-a', label: 'Alpha' },
+        { id: 'item-b', label: 'Beta' }
+      ]
+    });
+    let renderer: ReactTestRenderer | undefined;
+
+    function Probe() {
+      const view = useStoreView(store, itemQuery);
+
+      return createElement(
+        'output',
+        undefined,
+        `${view.revision}:${view.rows.map((row) => row.label).join('|')}`
+      );
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(Probe));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('0:Alpha|Beta'));
+
+      await act(async () => {
+        await store.commit(replaceAll(schema.items, [
+          { id: 'item-c', label: 'Gamma' },
+          { id: 'item-b', label: 'Beta Prime' }
+        ]));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Beta Prime|Gamma'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+      store.close();
+    }
+  });
+
+  it('renders a local runtime store view that follows runtime commits', async () => {
+    const runtime = createMemoryRelationRuntime({
+      items: [
+        { id: 'item-a', label: 'Alpha' },
+        { id: 'item-b', label: 'Beta' }
+      ]
+    });
+    let renderer: ReactTestRenderer | undefined;
+    let capturedCommit: ReturnType<typeof useLocalRuntimeStore>['commit'] | undefined;
+
+    function Probe() {
+      const store = useLocalRuntimeStore(() => ({ runtime, relations: [schema.items] }));
+      const view = useStoreView(store, itemQuery);
+      capturedCommit = store.commit;
+
+      return createElement(
+        'output',
+        undefined,
+        `${view.revision}:${view.rows.map((row) => row.label).join('|')}`
+      );
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(Probe));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('0:Alpha|Beta'));
+
+      await act(async () => {
+        await capturedCommit?.(replaceAll(schema.items, [
+          { id: 'item-c', label: 'Gamma' },
+          { id: 'item-b', label: 'Beta Prime' }
+        ]));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('1:Beta Prime|Gamma'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+    }
+  });
+
+  it('recreates a local runtime store when dependency inputs change', async () => {
+    const firstRuntime = createMemoryRelationRuntime({
+      items: [{ id: 'item-a', label: 'Alpha' }]
+    });
+    const secondRuntime = createMemoryRelationRuntime({
+      items: [{ id: 'item-b', label: 'Beta' }]
+    });
+    let renderer: ReactTestRenderer | undefined;
+
+    function Probe({ runtime }: { readonly runtime: typeof firstRuntime }) {
+      const store = useLocalRuntimeStore(() => ({ runtime, relations: [schema.items] }), [runtime]);
+      const view = useStoreView(store, itemQuery);
+
+      return createElement(
+        'output',
+        undefined,
+        `${view.revision}:${view.rows.map((row) => row.label).join('|')}`
+      );
+    }
+
+    try {
+      await act(async () => {
+        renderer = create(createElement(Probe, { runtime: firstRuntime }));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('0:Alpha'));
+
+      await act(async () => {
+        renderer?.update(createElement(Probe, { runtime: secondRuntime }));
+      });
+
+      expect(renderer?.toJSON()).toEqual(renderedOutput('0:Beta'));
+    } finally {
+      act(() => {
+        renderer?.unmount();
+      });
+    }
+  });
+
   it('renders view, selector, and row hook state from a real createStore provider', async () => {
     const store = createStore({
       items: [

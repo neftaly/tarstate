@@ -9,11 +9,13 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type DependencyList,
   type ReactElement
 } from 'react';
 import type { Db } from '@tarstate/core/db';
-import { createStore } from '@tarstate/core/store';
-import type { Store } from '@tarstate/core/store';
+import type { RelationRuntime } from '@tarstate/core/adapter';
+import { createRuntimeStore, createStore } from '@tarstate/core/store';
+import type { Store, StoreRuntimeInput } from '@tarstate/core/store';
 import { areStoreSnapshotsEqual } from './equality.js';
 import { stableSnapshotReader } from './snapshot.js';
 import type {
@@ -26,6 +28,7 @@ import type {
 } from './types.js';
 
 const TarstateContext = createContext<Store | undefined>(undefined);
+const emptyDependencyList: DependencyList = [];
 
 export function TarstateProvider({ store, initialDb, resetKey, children }: TarstateProviderProps): ReactElement {
   const initialDbRef = useRef<TarstateDbInput | undefined>(initialDb);
@@ -73,6 +76,55 @@ export function useTarstateStore(): Store {
     throw new Error('@tarstate/react hooks must be used within a TarstateProvider');
   }
   return store;
+}
+
+export function useLocalStore(initialDb?: TarstateDbInput): Store {
+  const initialDbRef = useRef<TarstateDbInput | undefined>(initialDb);
+  const storeRef = useRef<Store | undefined>(undefined);
+  if (storeRef.current === undefined) {
+    storeRef.current = initialDbRef.current === undefined ? createStore() : createStore(initialDbRef.current);
+  }
+  const store = storeRef.current;
+
+  useEffect(() => () => {
+    store.close();
+  }, [store]);
+
+  return store;
+}
+
+export function useLocalRuntimeStore<Version>(createInput: () => RelationRuntime<Version>): Store<Version>;
+export function useLocalRuntimeStore<Version>(
+  createInput: () => RelationRuntime<Version>,
+  deps: DependencyList
+): Store<Version>;
+export function useLocalRuntimeStore<Version>(
+  createInput: () => StoreRuntimeInput<Version>
+): Store<Version>;
+export function useLocalRuntimeStore<Version>(
+  createInput: () => StoreRuntimeInput<Version>,
+  deps: DependencyList
+): Store<Version>;
+export function useLocalRuntimeStore<Version>(
+  createInput: () => RelationRuntime<Version> | StoreRuntimeInput<Version>,
+  deps: DependencyList = emptyDependencyList
+): Store<Version> {
+  const store = useMemo(() => {
+    const input = createInput();
+    return createRuntimeStore(isStoreRuntimeInput(input) ? input : { runtime: input });
+  }, deps);
+
+  useEffect(() => () => {
+    store.close();
+  }, [store]);
+
+  return store;
+}
+
+function isStoreRuntimeInput<Version>(
+  input: RelationRuntime<Version> | StoreRuntimeInput<Version>
+): input is StoreRuntimeInput<Version> {
+  return 'runtime' in input;
 }
 
 export function useTarstateSnapshot(): TarstateDbSnapshot {

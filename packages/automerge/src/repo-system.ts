@@ -19,6 +19,8 @@ import { isRecord } from './value.js';
 
 type AutomergeRepoSystemState = {
   readonly state: () => RuntimeSystemState;
+  readonly start: () => void;
+  readonly stop: () => void;
   readonly close: () => void;
 };
 type AutomergeRepoStorageMetric = {
@@ -45,6 +47,8 @@ export function createAutomergeRepoSystemState<DocumentShape extends object>(
   let localStorageId: string | undefined;
   let storageError: string | undefined;
   let lastStorageMetric: AutomergeRepoStorageMetric | undefined;
+  let started = false;
+  let closed = false;
 
   const peerStorageIds = () => {
     const ids: string[] = [];
@@ -81,12 +85,25 @@ export function createAutomergeRepoSystemState<DocumentShape extends object>(
     options.notify({ relationNames: [runtimeSystemRelations.storage.name] });
   };
 
-  for (const storageId of peerStorageIds()) remoteStorageIds.add(storageId);
-  readStorageId();
-  options.handle.on('remote-heads', onRemoteHeads);
-  options.repo.networkSubsystem.on('peer', onPeer);
-  options.repo.networkSubsystem.on('peer-disconnected', onPeer);
-  options.repo.on('doc-metrics', onStorageMetric);
+  const start = () => {
+    if (closed || started) return;
+    started = true;
+    for (const storageId of peerStorageIds()) remoteStorageIds.add(storageId);
+    readStorageId();
+    options.handle.on('remote-heads', onRemoteHeads);
+    options.repo.networkSubsystem.on('peer', onPeer);
+    options.repo.networkSubsystem.on('peer-disconnected', onPeer);
+    options.repo.on('doc-metrics', onStorageMetric);
+  };
+
+  const stop = () => {
+    if (!started) return;
+    started = false;
+    options.handle.off('remote-heads', onRemoteHeads);
+    options.repo.networkSubsystem.off('peer', onPeer);
+    options.repo.networkSubsystem.off('peer-disconnected', onPeer);
+    options.repo.off('doc-metrics', onStorageMetric);
+  };
 
   return {
     state: () => ({
@@ -106,11 +123,11 @@ export function createAutomergeRepoSystemState<DocumentShape extends object>(
         lastStorageMetric
       })
     }),
+    start,
+    stop,
     close: () => {
-      options.handle.off('remote-heads', onRemoteHeads);
-      options.repo.networkSubsystem.off('peer', onPeer);
-      options.repo.networkSubsystem.off('peer-disconnected', onPeer);
-      options.repo.off('doc-metrics', onStorageMetric);
+      closed = true;
+      stop();
     }
   };
 }

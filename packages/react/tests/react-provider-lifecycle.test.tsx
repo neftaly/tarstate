@@ -1,7 +1,7 @@
 import { StrictMode, createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { TarstateProvider, useTarstateStore } from '@tarstate/react';
+import { TarstateProvider, useLocalStore, useTarstateStore } from '@tarstate/react';
 import type { TarstateDiagnostic } from '@tarstate/core';
 import type { Db } from '@tarstate/core/db';
 import type { Query } from '@tarstate/core/query';
@@ -190,6 +190,40 @@ describe('TarstateProvider lifecycle', () => {
     expect(capturedStore).toBe(external.store);
     expect(storeFactory.createStore).not.toHaveBeenCalled();
     expect(external.close).not.toHaveBeenCalled();
+  });
+
+  it('creates and closes local stores from useLocalStore', () => {
+    const seenStores: Store[] = [];
+    const seed = { items: [{ id: 'item-a' }] };
+
+    function Probe() {
+      seenStores.push(useLocalStore(seed));
+      return null;
+    }
+
+    let renderer: ReactTestRenderer | undefined;
+    act(() => {
+      renderer = create(createElement(Probe));
+    });
+
+    const store = seenStores.at(-1);
+    expect(store).toBeDefined();
+    expect(storeFactory.createStore).toHaveBeenCalledTimes(1);
+    expect(storeFactory.records[0]?.input).toBe(seed);
+    expect(activeRecord(store).close).not.toHaveBeenCalled();
+
+    act(() => {
+      renderer?.update(createElement(Probe));
+    });
+
+    expect(seenStores.at(-1)).toBe(store);
+    expect(storeFactory.createStore).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      renderer?.unmount();
+    });
+
+    expect(activeRecord(store).close).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -161,6 +161,9 @@ export type ToSchemaManifestOptions = {
 };
 
 export type HydratedSchema = Readonly<Record<string, RelationRef>>;
+export type SchemaRelations<Rows extends Readonly<Record<string, object>>> = {
+  readonly [Name in keyof Rows & string]: RelationRef<Rows[Name]>;
+};
 
 export type HydrateSchemaManifestOptions = {
   readonly codecs?: Readonly<Record<string, RuntimeCodec>>;
@@ -259,6 +262,12 @@ export function defineSchema<const Schema extends Record<string, AnyRelationRef>
   schema: Schema
 ): { readonly [Key in keyof Schema]: Schema[Key] & { readonly name: Key & string } } {
   return Object.fromEntries(Object.entries(schema).map(([name, ref]) => [name, { ...ref, name }])) as never;
+}
+
+export function schemaRelations<Rows extends Readonly<Record<string, object>>>(
+  schema: HydratedSchema
+): SchemaRelations<Rows> {
+  return schema as SchemaRelations<Rows>;
 }
 
 function fieldSpec<Value>(valueKind: PrimitiveFieldKind): FieldSpec<Value, false> {

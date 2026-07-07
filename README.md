@@ -32,7 +32,7 @@ It writes `src/generated/tarstate/rows.d.ts`. Because that file is under
 ```js
 import { hydrateSchemaManifest } from '@tarstate/core/schema';
 
-const schema = hydrateSchemaManifest({
+export const schema = hydrateSchemaManifest({
   "kind": "tarstate.schema",
   "formatVersion": 1,
   "schemaId": "example.pizza-ordering@1",
@@ -52,23 +52,44 @@ const schema = hydrateSchemaManifest({
       "extra": { "type": "boolean" } } }
   }
 })
+
+export const initialState = {
+  bases: [
+    { name: 'thin', style: 'Neapolitan' },
+    { name: 'pan', style: 'Detroit' }
+  ],
+  pizzas: [
+    { name: 'margherita', base: 'thin', price: 18 },
+    { name: 'pepperoni', base: 'thin', price: 21 }
+  ],
+  toppings: [
+    { pizza: 'margherita', name: 'mozzarella', extra: false },
+    { pizza: 'margherita', name: 'basil', extra: false },
+    { pizza: 'pepperoni', name: 'pepperoni', extra: true }
+  ]
+}
 ```
 
 ## React example
 
-Rendered inside a `TarstateProvider`, this component reads a joined pizza menu
-and commits writes through the same store.
+This component gets its document handle from Automerge Repo's React context.
+Tarstate then subscribes to a query view and persists relation-level updates
+through that handle.
 
 ```tsx
-import { useTarstateMutation, useView } from '@tarstate/react';
+import type { DocHandle } from '@automerge/automerge-repo';
+import { useHandle } from '@automerge/automerge-repo-react-hooks';
+import { type AutomergeRelationDocument } from '@tarstate/automerge';
+import { useAutomergeDocHandleStore } from '@tarstate/automerge/react';
+import { useStoreView } from '@tarstate/react';
 import { as, asc, eq, from, join, pipe, select, sort } from '@tarstate/core/query';
+import { schemaRelations } from '@tarstate/core/schema';
 import { updateByKey } from '@tarstate/core/write';
-import type { RelationRef } from '@tarstate/core/schema';
+import { schema } from './schema';
 import type { SchemaRows } from './generated/tarstate/rows';
 
-const relations = schema as {
-  readonly [Name in keyof SchemaRows]: RelationRef<SchemaRows[Name]>;
-};
+const relations = schemaRelations<SchemaRows>(schema);
+type PizzaDoc = AutomergeRelationDocument<typeof relations>;
 
 const base = as(relations.bases, 'base');
 const pizza = as(relations.pizzas, 'pizza');
@@ -86,18 +107,17 @@ const pizzaMenu = pipe(
   })
 );
 
-export function App() {
-  const menu = useView(pizzaMenu);
-  
-  const mutation = useTarstateMutation();
+export function App({ documentId }: { readonly documentId: string }) {
+  const handle = useHandle<PizzaDoc>(documentId);
+  return handle && <PizzaMenu handle={handle} />;
+}
+
+function PizzaMenu({ handle }: { readonly handle: DocHandle<PizzaDoc> }) {
+  const pizzaStore = useAutomergeDocHandleStore(handle, relations);
+  const menu = useStoreView(pizzaStore, pizzaMenu);
+
   const makeDetroitStyle = (pizzaName: string) =>
-    mutation.commit(
-      updateByKey(
-        relations.pizzas,
-        pizzaName,
-        { base: 'pan' }
-      )
-    );
+    void pizzaStore.commit(updateByKey(relations.pizzas, pizzaName, { base: 'pan' }));
 
   return (
     <section>

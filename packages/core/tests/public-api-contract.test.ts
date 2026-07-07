@@ -128,6 +128,7 @@ import {
   optional,
   refField,
   relation,
+  schemaRelations,
   SchemaManifestValidationError,
   stringEnumField,
   stringField,
@@ -139,8 +140,10 @@ import {
   type HydratedSchema,
   type HydrateSchemaManifestOptions,
   type HydrateSchemaManifestResult,
+  type RelationRef,
   type RelationRefRow,
   type RuntimeCodec,
+  type SchemaRelations,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
 import {
@@ -421,6 +424,18 @@ describe('public API contracts', () => {
     expect(hydrated.prices?.fields.amount?.custom?.codec).toBe('food.money');
     expect(hydrated.prices?.fields.amount?.custom).not.toHaveProperty('kind');
     expect(hydrated.prices?.fields.amount?.custom?.toScalar?.({ currency: 'NZD', cents: 2400 })).toBe('NZD:2400');
+    const typedHydrated = schemaRelations<{
+      readonly pizzas: Pizza;
+      readonly toppings: Topping;
+      readonly prices: Price;
+    }>(hydrated);
+    expect(typedHydrated.pizzas).toBe(hydrated.pizzas);
+    expectTypeOf(typedHydrated).toMatchTypeOf<SchemaRelations<{
+      readonly pizzas: Pizza;
+      readonly toppings: Topping;
+      readonly prices: Price;
+    }>>();
+    expectTypeOf(typedHydrated.pizzas).toEqualTypeOf<RelationRef<Pizza>>();
     const collectedHydration = hydrateSchemaManifest(manifest, {
       diagnosticMode: 'collect',
       codecs: { 'food.money': moneyCodec }

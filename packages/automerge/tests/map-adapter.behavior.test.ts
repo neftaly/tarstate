@@ -44,7 +44,8 @@ import {
   relation,
   stringField,
   toSchemaManifest,
-  type JsonValue
+  type JsonValue,
+  type RelationRef
 } from '@tarstate/core/schema';
 import { createRuntimeStore } from '@tarstate/core/store';
 import { write } from '@tarstate/core/write';
@@ -55,6 +56,7 @@ import {
   automergeBytesField,
   automergeCounterField,
   automergeDateField,
+  automergeMapRelations,
   automergeMapAdapter,
   automergeMapSource,
   automergeDocHandleAdapter,
@@ -72,6 +74,7 @@ import {
   createAutomergeDocHandleRuntime,
   createAutomergeMapRuntime,
   defineAutomergeMapRelations,
+  normalizeAutomergeMapRelations,
   withAutomergeRuntimeRelations,
   type AutomergeConflict,
   type AutomergeDocHandleAdapter,
@@ -82,11 +85,14 @@ import {
   type AutomergeMapAdapterOptions,
   type AutomergeMapPath,
   type AutomergeMapRelation,
+  type AutomergeMapRelationInput,
   type AutomergeMapRuntime,
   type AutomergeMapRuntimeOptions,
   type AutomergeMapSource,
+  type AutomergeRelationDocument,
   type AutomergeRelationRuntimeMetadata
 } from '@tarstate/automerge';
+import { useAutomergeDocHandleStore } from '@tarstate/automerge/react';
 import {
   automergePresenceRuntime,
   type AutomergePresenceFieldNames
@@ -262,6 +268,8 @@ describe('automerge map adapter', () => {
 
     expect(api.automergeMapAdapter).toBe(automergeMapAdapter);
     expect(api.automergeMapSource).toBe(automergeMapSource);
+    expect(api.automergeMapRelations).toBe(automergeMapRelations);
+    expect(api.normalizeAutomergeMapRelations).toBe(normalizeAutomergeMapRelations);
     expect(api.automergeDocHandleAdapter).toBe(automergeDocHandleAdapter);
     expect(api.automergeView).toBe(automergeView);
     expect(api.automergeFork).toBe(automergeFork);
@@ -295,11 +303,35 @@ describe('automerge map adapter', () => {
       })
     ]);
     expect(adapter.snapshot().version).toEqual(Automerge.getHeads(doc));
+    expect(automergeMapRelations({ tasks: schema.tasks, labels: schema.labels })).toEqual([
+      { relation: schema.tasks, path: ['tasks'] },
+      { relation: schema.labels, path: ['labels'] }
+    ]);
+    expect(normalizeAutomergeMapRelations(taskMapping)).toBe(taskMapping);
+    expect(normalizeAutomergeMapRelations({ tasks: schema.tasks })).toEqual([
+      { relation: schema.tasks, path: ['tasks'] }
+    ]);
+    expect(automergeMapSource(Automerge.from<AutomergeRelationDocument<{ readonly tasks: typeof schema.tasks }>>({
+      tasks: [{ id: 'task-root', title: 'Root task' }]
+    }), { relations: { tasks: schema.tasks } }).rows(schema.tasks)).toEqual([
+      { id: 'task-root', title: 'Root task' }
+    ]);
     expectTypeOf(automergeMapAdapter<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapAdapter<WorkspaceDoc>>();
     expectTypeOf(automergeDocHandleAdapter<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeDocHandleAdapter<WorkspaceDoc>>();
     expectTypeOf(createAutomergeDocHandleRuntime<WorkspaceDoc>).returns
       .toMatchTypeOf<AutomergeDocHandleRuntime<WorkspaceDoc>>();
     expectTypeOf(automergeMapSource<WorkspaceDoc>).returns.toMatchTypeOf<AutomergeMapSource>();
+    expectTypeOf<AutomergeMapRelationInput<WorkspaceDoc>>()
+      .toMatchTypeOf<readonly AutomergeMapRelation<RelationRef, WorkspaceDoc>[] | Readonly<Record<string, RelationRef>>>();
+    expectTypeOf<AutomergeRelationDocument<{ readonly tasks: typeof schema.tasks }>>()
+      .toEqualTypeOf<{ readonly tasks: readonly TaskRow[] }>();
+  });
+
+  it('exports the React DocHandle store hook from the React subpath', async () => {
+    const api = await import('@tarstate/automerge/react');
+
+    expect(api.useAutomergeDocHandleStore).toBe(useAutomergeDocHandleStore);
+    expect(useAutomergeDocHandleStore).toBeTypeOf('function');
   });
 
   it('exports automerge field helper codec overrides without alias conflicts', () => {
@@ -650,6 +682,8 @@ describe('automerge map adapter', () => {
     expect(storageRows[0]).not.toHaveProperty('pendingWrites');
     expect(storageRows[0]).not.toHaveProperty('lastFlushAt');
 
+    const unsubscribe = runtime.subscribe(() => {});
+
     repo.emit('doc-metrics', {
       type: 'doc-saved',
       documentId: String(handle.documentId) as never,
@@ -670,6 +704,7 @@ describe('automerge map adapter', () => {
       })
     ]);
 
+    unsubscribe();
     runtime.close();
     await repo.shutdown();
   });
@@ -1703,6 +1738,34 @@ describe('automerge map adapter', () => {
 
     unsubscribe();
     adapter.close();
+  });
+
+  it('attaches DocHandle change listeners only while runtime subscribers are active', () => {
+    const handle = workspaceHandle();
+    const originalOn = handle.on.bind(handle);
+    const originalOff = handle.off.bind(handle);
+    let changeListeners = 0;
+    handle.on = ((eventName, listener) => {
+      if (eventName === 'change') changeListeners += 1;
+      return originalOn(eventName as never, listener as never);
+    }) as typeof handle.on;
+    handle.off = ((eventName, listener) => {
+      if (eventName === 'change') changeListeners -= 1;
+      return originalOff(eventName as never, listener as never);
+    }) as typeof handle.off;
+
+    const adapter = createAutomergeDocHandleRuntime({ handle, relations: taskMapping });
+
+    expect(changeListeners).toBe(0);
+
+    const unsubscribe = adapter.subscribe(() => {});
+    expect(changeListeners).toBe(1);
+
+    unsubscribe();
+    expect(changeListeners).toBe(0);
+
+    adapter.close();
+    expect(changeListeners).toBe(0);
   });
 
   it('preserves mapped row object IDs for ordinary array and map updates', async () => {

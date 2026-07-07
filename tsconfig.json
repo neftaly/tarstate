@@ -85,6 +85,9 @@
       "@tarstate/automerge/presence": [
         "./packages/automerge/src/presence.ts"
       ],
+      "@tarstate/automerge/react": [
+        "./packages/automerge/src/react.ts"
+      ],
       "@tarstate/react": [
         "./packages/react/src/index.ts"
       ]

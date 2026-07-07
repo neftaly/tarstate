@@ -13,7 +13,8 @@
       "@tarstate/core/relation": ["../core/dist/relation.d.ts"],
       "@tarstate/core/schema": ["../core/dist/schema.d.ts"],
       "@tarstate/core/source": ["../core/dist/source.d.ts"],
-      "@tarstate/core/write": ["../core/dist/write.d.ts"]
+      "@tarstate/core/write": ["../core/dist/write.d.ts"],
+      "@tarstate/react": ["../react/dist/index.d.ts"]
     }
   },
   "include": ["src"],
