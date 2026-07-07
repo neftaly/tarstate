@@ -10,7 +10,7 @@
   },
   "scripts": {
     "bench": "pnpm --filter @tarstate/core --filter @tarstate/automerge --filter @tarstate/react bench",
-    "build": "pnpm -r build",
+    "build": "pnpm --filter './packages/*' -r build",
     "check": "pnpm lint && pnpm typecheck && pnpm build && pnpm test",
     "dev": "pnpm -r --filter './apps/*' --parallel dev",
     "lint": "oxlint . --deny-warnings --type-aware",
