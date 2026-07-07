@@ -7,6 +7,7 @@ import {
   type RelationManifestV1,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
+import { stringFieldValues } from './field-conventions.js';
 import { keyFields, recordFromEntries, sortedEntries } from './names.js';
 
 export type JsonSchemaMap = Readonly<Record<string, JsonObject>>;
@@ -78,7 +79,7 @@ function jsonSchemaForField(field: FieldManifestV1, codecs: Readonly<Record<stri
 function fieldBaseSchema(field: FieldManifestV1, codecs: Readonly<Record<string, CodecDeclarationV1>>): JsonObject {
   switch (field.type) {
     case 'string':
-      return { type: 'string' };
+      return compactObject({ type: 'string', enum: stringFieldValues(field) });
     case 'number':
       return { type: 'number' };
     case 'boolean':
@@ -128,10 +129,17 @@ function applyNullable(schema: JsonObject, nullable: boolean): JsonObject {
   if (!nullable) return schema;
   const type = schema.type;
   if (type === 'null') return schema;
-  if (typeof type === 'string') return { ...schema, type: [type, 'null'] };
-  if (Array.isArray(type)) return type.includes('null') ? schema : { ...schema, type: [...type, 'null'] };
+  if (typeof type === 'string') return withNullableEnum({ ...schema, type: [type, 'null'] });
+  if (Array.isArray(type)) return withNullableEnum(type.includes('null') ? schema : { ...schema, type: [...type, 'null'] });
   const { not: _not, ...rest } = schema;
-  return rest;
+  return withNullableEnum(rest);
+}
+
+function withNullableEnum(schema: JsonObject): JsonObject {
+  const values = schema.enum;
+  return Array.isArray(values) && !values.includes(null)
+    ? { ...schema, enum: [...values, null] }
+    : schema;
 }
 
 function compactObject(input: Readonly<Record<string, JsonValue | undefined>>): JsonObject {

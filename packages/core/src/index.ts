@@ -27,6 +27,7 @@ export {
   relation,
   SchemaManifestValidationError,
   stringifyCanonicalSchemaManifest,
+  stringEnumField,
   toSchemaManifest,
   validateSchemaManifest,
   stringField
@@ -56,6 +57,7 @@ export type {
   RefTarget,
   RelationManifestV1,
   RelationRef,
+  RelationRefRow,
   RuntimeCodec,
   SchemaManifestDiagnosticCodeV1,
   SchemaManifestDiagnosticV1,

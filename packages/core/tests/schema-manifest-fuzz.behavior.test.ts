@@ -5,7 +5,12 @@ import {
   customField,
   defineSchema,
   hydrateSchemaManifest,
+  jsonField,
+  nullable,
+  opaqueField,
+  optional,
   relation,
+  stringField,
   stringifyCanonicalSchemaManifest,
   toSchemaManifest,
   validateSchemaManifest,
@@ -94,6 +99,85 @@ describe('schema manifest seeded fuzz behavior', () => {
           expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('field_invalid');
           expect(key).toBeUndefined();
         }
+      }
+    }
+  });
+
+  it('fuzzes optional builder fields through manifest hydration', () => {
+    const optionalFieldCases = [
+      {
+        name: 'string',
+        field: optional(stringField()),
+        presentValue: (seed: number) => `value-${seed}`
+      },
+      {
+        name: 'nullable-string',
+        field: optional(nullable(stringField())),
+        presentValue: (seed: number) => seed % 2 === 0 ? null : `value-${seed}`
+      },
+      {
+        name: 'json',
+        field: optional(jsonField()),
+        presentValue: (seed: number) => ({ seed, values: [seed, `value-${seed}`] })
+      },
+      {
+        name: 'opaque-unknown',
+        field: optional(opaqueField<unknown>({
+          codec: 'fuzz.optional.opaque',
+          validate: () => true
+        })),
+        presentValue: (seed: number) => ({ opaque: seed })
+      },
+      {
+        name: 'custom-unknown',
+        field: optional(customField<unknown>({
+          codec: 'fuzz.optional.custom',
+          validate: () => true
+        })),
+        presentValue: (seed: number) => ({ custom: seed })
+      }
+    ] as const;
+    const manifestCodecs = {
+      'fuzz.optional.opaque': { description: 'Optional opaque fuzz field.' },
+      'fuzz.optional.custom': { description: 'Optional custom fuzz field.' }
+    };
+    const runtimeCodecs = {
+      'fuzz.optional.opaque': { codec: 'fuzz.optional.opaque', validate: () => true },
+      'fuzz.optional.custom': { codec: 'fuzz.optional.custom', validate: () => true }
+    } satisfies Record<string, RuntimeCodec>;
+
+    for (const seed of seeds) {
+      const random = createSeededRandom(seed);
+      for (let index = 0; index < 48; index += 1) {
+        const fieldCase = optionalFieldCases[Math.floor(random() * optionalFieldCases.length)] ?? optionalFieldCases[0];
+        const rows = relation({
+          key: 'id',
+          fields: {
+            id: stringField(),
+            optionalValue: fieldCase.field
+          }
+        });
+        const schema = defineSchema({ rows });
+        const manifest = toSchemaManifest(schema, {
+          schemaId: `fuzz.optional.${fieldCase.name}.${seed}.${index}@1`,
+          codecs: manifestCodecs
+        });
+        const hydrated = hydrateSchemaManifest(manifest, {
+          diagnosticMode: 'collect',
+          codecs: runtimeCodecs
+        });
+        if (hydrated.schema?.rows === undefined) throw new Error('expected hydrated rows relation');
+
+        const omittedRow = { id: `row-${seed}-${index}-omitted` };
+        const presentRow = {
+          id: `row-${seed}-${index}-present`,
+          optionalValue: fieldCase.presentValue(seed + index)
+        };
+
+        expect(validateRelationRow(rows, omittedRow), fieldCase.name).toEqual([]);
+        expect(validateRelationRow(rows, presentRow), fieldCase.name).toEqual([]);
+        expect(validateRelationRow(hydrated.schema.rows, omittedRow), fieldCase.name).toEqual([]);
+        expect(validateRelationRow(hydrated.schema.rows, presentRow), fieldCase.name).toEqual([]);
       }
     }
   });

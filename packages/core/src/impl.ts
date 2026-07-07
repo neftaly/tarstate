@@ -92,6 +92,8 @@ type AnyRelationRef = {
   readonly key: string | readonly string[];
   readonly fields: RelationFields;
   readonly ephemeral: boolean;
+  readonly description?: string;
+  readonly metadata?: unknown;
   readonly __row?: unknown;
 };
 type NonNullish<Value> = Exclude<Value, null | undefined>;
@@ -202,7 +204,8 @@ type AliasedFieldAccess<Row, Alias extends string> =
   } & AliasedFlatFieldAccess<Row>;
 type RowFieldKeys<Row> = Row extends object ? keyof Row & string : never;
 type LiteralRowFieldKeys<Row> = string extends RowFieldKeys<Row> ? never : RowFieldKeys<Row>;
-type AliasedReservedField = keyof RelationRef | keyof Query | 'alias' | '$';
+type AliasedRelationMetadataField = 'kind' | 'name' | 'key' | 'fields' | 'ephemeral' | '__row';
+type AliasedReservedField = AliasedRelationMetadataField | keyof Query | 'alias' | '$';
 type AliasFieldNamespace<Row> = string extends RowFieldKeys<Row>
   ? Readonly<Record<string, ExprData<unknown>>>
   : { readonly [Field in RowFieldKeys<Row>]: ExprData<Row[Field]> };
@@ -9643,6 +9646,7 @@ function dedupeConstraints(constraints: readonly ConstraintData[]): readonly Con
 function fieldValueMatchesSpec(spec: FieldSpec, valueValue: unknown): boolean {
   switch (spec.valueKind) {
     case 'string':
+      return typeof valueValue === 'string' && (spec.values === undefined || spec.values.includes(valueValue));
     case 'id':
     case 'ref':
     case 'anchoredPath':
@@ -9680,6 +9684,7 @@ function fieldKeyValue(spec: FieldSpec, valueValue: unknown): unknown {
 }
 
 function fieldKeyInputValue(spec: FieldSpec, valueValue: unknown): unknown {
+  if (spec.valueKind === 'string' && spec.values !== undefined && !fieldValueMatchesSpec(spec, valueValue)) return undefined;
   if (spec.valueKind !== 'custom') return valueValue;
   if (!isRelationKeyScalar(valueValue)) return undefined;
   if (spec.custom?.stableKey !== undefined) return valueValue;
@@ -9749,6 +9754,10 @@ function compareFieldValueToBound(spec: FieldSpec | undefined, valueValue: unkno
 
 function fieldSpecDescription(spec: FieldSpec): string {
   switch (spec.valueKind) {
+    case 'string':
+      return spec.values === undefined
+        ? 'a string'
+        : `one of ${spec.values.map((valueValue) => JSON.stringify(valueValue)).join(', ')}`;
     case 'id':
     case 'ref':
     case 'anchoredPath':

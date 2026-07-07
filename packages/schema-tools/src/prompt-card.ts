@@ -5,6 +5,7 @@ import {
   type RelationManifestV1,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
+import { stringFieldValues } from './field-conventions.js';
 import { keyFields, sortedEntries } from './names.js';
 
 export type PromptCardOptions = {
@@ -50,7 +51,7 @@ function relationLines(relationName: string, relation: RelationManifestV1): read
     ...(relation.description === undefined ? [] : [`Description: ${jsonText(relation.description)}`]),
     'Fields:',
     ...sortedEntries(relation.fields).map(([fieldName, field]) =>
-      `- name: ${jsonText(fieldName)}; type: ${jsonText(describeField(field))}; presence: ${jsonText(presenceLabel(field))}`
+      `- name: ${jsonText(fieldName)}; type: ${jsonText(describeField(field))}; presence: ${jsonText(presenceLabel(field))}${valueSetLabel(field)}`
     ),
     ''
   ];
@@ -94,6 +95,11 @@ function describeField(field: FieldManifestV1): string {
     default:
       return field.type;
   }
+}
+
+function valueSetLabel(field: FieldManifestV1): string {
+  const values = stringFieldValues(field);
+  return values === undefined ? '' : `; values: ${jsonText(values)}`;
 }
 
 function presenceLabel(field: FieldManifestV1): string {

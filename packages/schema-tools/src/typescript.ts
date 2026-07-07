@@ -4,6 +4,7 @@ import {
   type RelationManifestV1,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
+import { stringFieldValues } from './field-conventions.js';
 import { keyFields, sortedEntries, stringLiteral, tsPropertyName, uniqueTypeName } from './names.js';
 
 export type TypeScriptRowsOptions = {
@@ -120,6 +121,10 @@ function typeScriptFieldType(field: FieldManifestV1, codecNames: ReadonlyMap<str
 
 function typeScriptFieldBaseType(field: FieldManifestV1, codecNames: ReadonlyMap<string, string>): string {
   switch (field.type) {
+    case 'string': {
+      const values = stringFieldValues(field);
+      return values === undefined ? 'string' : values.map(stringLiteral).join(' | ');
+    }
     case 'number':
       return 'number';
     case 'boolean':
@@ -128,7 +133,6 @@ function typeScriptFieldBaseType(field: FieldManifestV1, codecNames: ReadonlyMap
       return 'NonNullJsonValue';
     case 'custom':
       return codecNames.get(field.codec) ?? 'unknown';
-    case 'string':
     case 'id':
     case 'ref':
     case 'anchoredPath':

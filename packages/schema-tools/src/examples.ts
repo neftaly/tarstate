@@ -7,6 +7,7 @@ import {
   type RelationManifestV1,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
+import { stringFieldValues } from './field-conventions.js';
 import { recordFromEntries, sortedEntries } from './names.js';
 
 export type RelationExampleMap = Readonly<Record<string, JsonObject>>;
@@ -49,7 +50,7 @@ function exampleValueForField(
   if (field.nullable === true) return null;
   switch (field.type) {
     case 'string':
-      return `${fieldName}-example`;
+      return stringFieldValues(field)?.[0] ?? `${fieldName}-example`;
     case 'number':
       return 0;
     case 'boolean':

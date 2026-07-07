@@ -4,8 +4,10 @@ import {
   index as rootMaterializedIndex,
   runtimeSystemRelations,
   runtimeSystemSource,
+  stringEnumField as rootStringEnumField,
   toSchemaManifest as rootToSchemaManifest,
   type IncrementByKeyPatch as RootIncrementByKeyPatch,
+  type RelationRefRow as RootRelationRefRow,
   type SchemaManifestV1 as RootSchemaManifestV1,
   type RuntimeHistoryRow,
   type RuntimeObjectLocationRow,
@@ -119,12 +121,14 @@ import {
   hydrateSchemaManifest,
   idField,
   isJsonValue,
+  nullable,
   numberField,
   opaqueField,
   optional,
   refField,
   relation,
   SchemaManifestValidationError,
+  stringEnumField,
   stringField,
   stringifyCanonicalSchemaManifest,
   toSchemaManifest,
@@ -133,6 +137,7 @@ import {
   type HydratedSchema,
   type HydrateSchemaManifestOptions,
   type HydrateSchemaManifestResult,
+  type RelationRefRow,
   type RuntimeCodec,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
@@ -455,6 +460,123 @@ describe('public API contracts', () => {
     }
   });
 
+  it('treats string enum fields as first-class schema semantics', () => {
+    const fsSchema = defineSchema({
+      nodes: relation({
+        key: 'id',
+        description: 'Filesystem nodes.',
+        metadata: { source: 'fs' },
+        fields: {
+          id: idField('fsNodePath'),
+          name: stringField(),
+          kind: {
+            ...stringEnumField(['folder', 'file'] as const),
+            description: 'Node kind.',
+            metadata: { source: 'fs-kind' }
+          }
+        }
+      })
+    });
+
+    type FsRow = RelationRefRow<typeof fsSchema.nodes>;
+    expectTypeOf<FsRow>().toEqualTypeOf<{
+      readonly id: string;
+      readonly name: string;
+      readonly kind: 'folder' | 'file';
+    }>();
+    expectTypeOf<RootRelationRefRow<typeof fsSchema.nodes>>().toEqualTypeOf<FsRow>();
+
+    const folder = { id: '/docs', name: 'docs', kind: 'folder' } as const satisfies FsRow;
+    // @ts-expect-error string enum fields only accept declared values.
+    const invalidKind = { id: '/link', name: 'link', kind: 'shortcut' } as const satisfies FsRow;
+    expect(invalidKind.kind).toBe('shortcut');
+
+    const manifest = toSchemaManifest(fsSchema, { schemaId: 'tarstate.fs@draft' });
+    expect(rootToSchemaManifest(fsSchema, { schemaId: 'tarstate.fs@draft' })).toEqual(manifest);
+    expect(rootStringEnumField(['folder', 'file'] as const).values).toEqual(['folder', 'file']);
+    expect(manifest.relations.nodes?.fields.kind).toEqual({
+      type: 'string',
+      values: ['folder', 'file'],
+      description: 'Node kind.',
+      metadata: { source: 'fs-kind' }
+    });
+    expect(manifest.relations.nodes).toEqual(expect.objectContaining({
+      description: 'Filesystem nodes.',
+      metadata: { source: 'fs' }
+    }));
+
+    const hydrated = hydrateSchemaManifest(manifest);
+    expect(toSchemaManifest(hydrated, { schemaId: 'tarstate.fs@draft' })).toEqual(manifest);
+    expect(hydrated.nodes?.fields.kind?.values).toEqual(['folder', 'file']);
+    expect(hydrated.nodes?.fields.kind?.description).toBe('Node kind.');
+    expect(hydrated.nodes?.fields.kind?.metadata).toEqual({ source: 'fs-kind' });
+    expect(validateRelationRow(fsSchema.nodes, folder)).toEqual([]);
+    expect(validateRelationRow(fsSchema.nodes, {
+      id: '/link',
+      name: 'link',
+      kind: 'shortcut'
+    }).map((diagnosticValue) => diagnosticValue.field)).toContain('kind');
+
+    const kindKeySchema = defineSchema({
+      nodesByKind: relation({
+        key: 'kind',
+        fields: {
+          kind: stringEnumField(['folder', 'file'] as const),
+          label: stringField()
+        }
+      })
+    });
+    expect(relationApi.relationKeyInputKey(kindKeySchema.nodesByKind, 'folder')).toBeDefined();
+    expect(relationApi.relationKeyInputKey(kindKeySchema.nodesByKind, 'shortcut')).toBeUndefined();
+  });
+
+  it('infers optional schema builder fields as optional row properties', () => {
+    const nodes = relation({
+      key: 'id',
+      fields: {
+        id: stringField(),
+        label: stringField(),
+        parentId: nullable(stringField()),
+        src: optional(stringField()),
+        maybeParentId: optional(nullable(stringField())),
+        detail: optional(opaqueField<unknown>('node.detail'))
+      }
+    });
+
+    type NodeRow = RelationRefRow<typeof nodes>;
+    expectTypeOf<RootRelationRefRow<typeof nodes>>().toEqualTypeOf<NodeRow>();
+    expectTypeOf<NodeRow>().toEqualTypeOf<{
+      readonly id: string;
+      readonly label: string;
+      readonly parentId: string | null;
+      readonly src?: string;
+      readonly maybeParentId?: string | null;
+      readonly detail?: unknown;
+    }>();
+
+    const omittedOptional = { id: 'node-1', label: 'Node 1', parentId: null } satisfies NodeRow;
+    const presentOptionalNullable = {
+      id: 'node-2',
+      label: 'Node 2',
+      parentId: 'node-1',
+      maybeParentId: null,
+      detail: { source: 'fuzz' },
+      src: 'src/index.ts'
+    } satisfies NodeRow;
+    // @ts-expect-error required fields cannot be omitted.
+    const missingRequired = { id: 'node-3', parentId: null } satisfies NodeRow;
+    // @ts-expect-error nullable fields remain required.
+    const missingNullable = { id: 'node-4', label: 'Node 4' } satisfies NodeRow;
+    // @ts-expect-error optional properties do not accept undefined when present.
+    const presentUndefined = { id: 'node-5', label: 'Node 5', parentId: null, src: undefined } satisfies NodeRow;
+
+    expect(omittedOptional.id).toBe('node-1');
+    expect(presentOptionalNullable.maybeParentId).toBeNull();
+    expect(missingRequired.id).toBe('node-3');
+    expect(missingNullable.id).toBe('node-4');
+    expect(presentUndefined.id).toBe('node-5');
+  });
+
   it('validates schema manifests before canonicalization and hydration', () => {
     expect(stringifyCanonicalSchemaManifest({
       kind: 'tarstate.schema',
@@ -531,6 +653,42 @@ describe('public API contracts', () => {
     const hydrateResult = hydrateSchemaManifest(customManifest, { diagnosticMode: 'collect', codecs: {} });
     expect(hydrateResult.schema).toBeUndefined();
     expect(hydrateResult.diagnostics.map((diagnosticValue) => diagnosticValue.code)).toContain('schema_manifest.invalid_codec');
+
+    const enumManifest = canonicalSchemaManifest({
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'enum@1',
+      relations: {
+        nodes: {
+          key: 'id',
+          fields: {
+            id: { type: 'string' },
+            kind: { type: 'string', values: ['folder', 'file'] }
+          }
+        }
+      }
+    });
+    expect(enumManifest.relations.nodes?.fields.kind).toEqual({
+      type: 'string',
+      values: ['folder', 'file']
+    });
+
+    const malformedEnumManifest = {
+      kind: 'tarstate.schema',
+      formatVersion: 1,
+      schemaId: 'bad.enum@1',
+      relations: {
+        nodes: {
+          key: 'id',
+          fields: {
+            id: { type: 'string' },
+            kind: { type: 'string', values: ['folder', 7, 'folder'] }
+          }
+        }
+      }
+    };
+    expect(validateSchemaManifest(malformedEnumManifest).map((diagnosticValue) => diagnosticValue.code)).toContain('schema_manifest.invalid_field');
+    expect(() => canonicalSchemaManifest(malformedEnumManifest)).toThrow(SchemaManifestValidationError);
   });
 
   it('rejects ambiguous builder refs during manifest export', () => {

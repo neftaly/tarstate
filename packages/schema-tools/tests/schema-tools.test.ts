@@ -27,6 +27,7 @@ import {
   optional,
   refField,
   relation,
+  stringEnumField,
   stringField,
   toSchemaManifest,
   type FieldSpec,
@@ -42,6 +43,7 @@ type Customer = {
 type Order = {
   readonly id: string;
   readonly customerId: string;
+  readonly status: 'draft' | 'paid';
   readonly total: number;
   readonly attachment: unknown;
   readonly metadata?: readonly string[];
@@ -62,6 +64,7 @@ const shopSchema = defineSchema({
     fields: {
       id: idField('shop.order'),
       customerId: refField({ relation: 'customers', field: 'id' }),
+      status: stringEnumField(['draft', 'paid'] as const),
       total: customField<number>({ codec: 'shop.money', toScalar: (value) => typeof value === 'number' ? value : null }),
       attachment: customField('shop.blob'),
       metadata: optional(jsonField() as FieldSpec<readonly string[]>)
@@ -130,6 +133,7 @@ describe('schema tools artifacts', () => {
     expect(output).toContain('export type ShopBlobValue = unknown;');
     expect(output).toContain('export type ShopMoneyValue = unknown;');
     expect(output).toContain('readonly attachment: ShopBlobValue;');
+    expect(output).toContain('readonly status: "draft" | "paid";');
     expect(output).toContain('readonly total: ShopMoneyValue;');
     expect(output).toContain('readonly metadata?: NonNullJsonValue;');
     expect(output).toContain('export type OrderLinesKey = readonly [OrderLinesRow["orderId"], OrderLinesRow["sku"]];');
@@ -144,7 +148,7 @@ describe('schema tools artifacts', () => {
     const orderSchema = schemas.orders;
 
     expect(orderSchema?.additionalProperties).toBe(false);
-    expect(orderSchema?.required).toEqual(['attachment', 'customerId', 'id', 'total']);
+    expect(orderSchema?.required).toEqual(['attachment', 'customerId', 'id', 'status', 'total']);
     expect(orderSchema?.properties).toEqual(expect.objectContaining({
       attachment: expect.objectContaining({
         not: { type: 'null' },
@@ -154,6 +158,10 @@ describe('schema tools artifacts', () => {
         type: 'string',
         'x-tarstate-ref': 'customers.id',
         'x-tarstate-ref-target': { relation: 'customers', field: 'id' }
+      }),
+      status: expect.objectContaining({
+        type: 'string',
+        enum: ['draft', 'paid']
       }),
       total: expect.objectContaining({
         type: 'number',
@@ -197,6 +205,7 @@ describe('schema tools artifacts', () => {
 
     expect(card).toContain('### Relation "orders"');
     expect(card).toContain('- name: "customerId"; type: "ref(customers.id)"; presence: "required"');
+    expect(card).toContain('- name: "status"; type: "string"; presence: "required"; values: ["draft","paid"]');
     expect(card).toContain('- codec: "shop.money"; details: "scalar number"');
     expect(card).toContain('- Nullable is separate from optional');
     expect(examples.customers).toEqual({
@@ -208,6 +217,7 @@ describe('schema tools artifacts', () => {
       attachment: 'shop.blob:example',
       customerId: 'shop.customer:example',
       id: 'shop.order:example',
+      status: 'draft',
       total: 0
     });
 

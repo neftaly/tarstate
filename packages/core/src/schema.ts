@@ -18,14 +18,17 @@ export type CustomFieldSpec<Value = unknown> = {
   readonly __value?: Value;
 };
 
-export type FieldSpec<Value = unknown> = {
+export type FieldSpec<Value = unknown, Optional extends boolean = boolean> = {
   readonly kind: 'field';
   readonly valueKind: PrimitiveFieldKind;
-  readonly optional: boolean;
+  readonly optional: Optional;
   readonly nullable: boolean;
+  readonly description?: string;
   readonly idDomain?: string;
   readonly ref?: string | RefTarget;
   readonly custom?: CustomFieldSpec<Value>;
+  readonly values?: readonly string[];
+  readonly metadata?: JsonObject;
   readonly __value?: Value;
 };
 
@@ -37,6 +40,8 @@ type AnyRelationRef = {
   readonly key: string | readonly string[];
   readonly fields: RelationFields;
   readonly ephemeral: boolean;
+  readonly description?: string;
+  readonly metadata?: JsonObject;
   readonly __row?: unknown;
 };
 
@@ -49,8 +54,12 @@ export type RelationRef<
   readonly key: Key;
   readonly fields: RelationFields;
   readonly ephemeral: boolean;
+  readonly description?: string;
+  readonly metadata?: JsonObject;
   readonly __row?: Row;
 };
+
+export type RelationRefRow<Relation extends RelationRef> = Relation extends RelationRef<infer Row> ? Row : never;
 
 export type SchemaManifestV1 = {
   readonly kind: 'tarstate.schema';
@@ -77,7 +86,10 @@ export type FieldBaseV1 = {
   readonly metadata?: JsonObject;
 };
 
-export type StringFieldManifestV1 = FieldBaseV1 & { readonly type: 'string' };
+export type StringFieldManifestV1 = FieldBaseV1 & {
+  readonly type: 'string';
+  readonly values?: readonly string[];
+};
 export type NumberFieldManifestV1 = FieldBaseV1 & { readonly type: 'number' };
 export type BooleanFieldManifestV1 = FieldBaseV1 & { readonly type: 'boolean' };
 export type IdFieldManifestV1 = FieldBaseV1 & {
@@ -188,9 +200,19 @@ export class SchemaManifestValidationError extends Error {
   }
 }
 
-type RelationRowFromFields<Fields extends RelationFields> = {
-  readonly [Field in keyof Fields & string]: Fields[Field] extends FieldSpec<infer Value> ? Value : unknown;
-};
+type RelationFieldValue<Spec> = Spec extends FieldSpec<infer Value> ? Value : unknown;
+type RelationFieldOptional<Spec> = Spec extends FieldSpec<unknown, infer Optional> ? Optional : boolean;
+type OptionalRelationField<Fields extends RelationFields> = {
+  readonly [Field in keyof Fields & string]:
+    RelationFieldOptional<Fields[Field]> extends true ? Field : never;
+}[keyof Fields & string];
+type RequiredRelationField<Fields extends RelationFields> = Exclude<keyof Fields & string, OptionalRelationField<Fields>>;
+type SimplifyRelationRow<Row extends object> = { readonly [Field in keyof Row]: Row[Field] };
+type RelationRowFromFields<Fields extends RelationFields> = SimplifyRelationRow<{
+  readonly [Field in RequiredRelationField<Fields>]: RelationFieldValue<Fields[Field]>;
+} & {
+  readonly [Field in OptionalRelationField<Fields>]?: Exclude<RelationFieldValue<Fields[Field]>, undefined>;
+}>;
 type JsonValueValidationContext = {
   readonly active: WeakSet<object>;
   readonly valid: WeakSet<object>;
@@ -209,16 +231,28 @@ type RelationInput<Row extends object, Key extends RelationKeySpec<Row> = Relati
   readonly key: Key;
   readonly fields: { readonly [Field in keyof Row & string]: RelationInputField<Row[Field]> };
   readonly ephemeral?: boolean;
+  readonly description?: string;
+  readonly metadata?: JsonObject;
 };
 
-export function relation<Row extends object, const Key extends RelationKeySpec<Row> = RelationKeySpec<Row>>(input: RelationInput<Row, Key>): RelationRef<Row, Key>;
 export function relation<const Fields extends RelationFields, const Key extends RelationKeySpec<RelationRowFromFields<Fields>>>(input: {
   readonly key: Key;
   readonly fields: Fields;
   readonly ephemeral?: boolean;
+  readonly description?: string;
+  readonly metadata?: JsonObject;
 }): RelationRef<RelationRowFromFields<Fields>, Key>;
+export function relation<Row extends object, const Key extends RelationKeySpec<Row> = RelationKeySpec<Row>>(input: RelationInput<Row, Key>): RelationRef<Row, Key>;
 export function relation<Row extends object, Key extends RelationKeySpec<Row> = RelationKeySpec<Row>>(input: RelationInput<Row, Key>): RelationRef<Row, Key> {
-  return { kind: 'relation', name: '', key: input.key, fields: input.fields, ephemeral: input.ephemeral ?? false };
+  return {
+    kind: 'relation',
+    name: '',
+    key: input.key,
+    fields: input.fields,
+    ephemeral: input.ephemeral ?? false,
+    ...(input.description === undefined ? {} : { description: input.description }),
+    ...(input.metadata === undefined ? {} : { metadata: input.metadata })
+  };
 }
 
 export function defineSchema<const Schema extends Record<string, AnyRelationRef>>(
@@ -227,11 +261,16 @@ export function defineSchema<const Schema extends Record<string, AnyRelationRef>
   return Object.fromEntries(Object.entries(schema).map(([name, ref]) => [name, { ...ref, name }])) as never;
 }
 
-function fieldSpec<Value>(valueKind: PrimitiveFieldKind): FieldSpec<Value> {
+function fieldSpec<Value>(valueKind: PrimitiveFieldKind): FieldSpec<Value, false> {
   return { kind: 'field', valueKind, optional: false, nullable: false };
 }
 
 export const stringField = (): FieldSpec<string> => fieldSpec('string');
+export function stringEnumField<const Values extends readonly [string, ...string[]]>(values: Values): FieldSpec<Values[number]>;
+export function stringEnumField(values: readonly string[]): FieldSpec<string>;
+export function stringEnumField(values: readonly string[]): FieldSpec<string> {
+  return { ...fieldSpec<string>('string'), values: normalizeBuilderStringEnumValues(values) };
+}
 export const numberField = (): FieldSpec<number> => fieldSpec('number');
 export const booleanField = (): FieldSpec<boolean> => fieldSpec('boolean');
 export const anchoredPathField = (): FieldSpec<string> => fieldSpec('anchoredPath');
@@ -244,8 +283,37 @@ export const customField = <Value = unknown>(spec: CustomFieldSpec<Value> | stri
 });
 export const opaqueField = <Value = unknown>(spec: CustomFieldSpec<Value> | string = 'opaque'): FieldSpec<Value> =>
   customField<Value>(spec);
-export const nullable = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | null> => ({ ...spec, nullable: true });
-export const optional = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | undefined> => ({ ...spec, optional: true });
+export const nullable = <Value, Optional extends boolean>(spec: FieldSpec<Value, Optional>): FieldSpec<Value | null, Optional> => ({ ...spec, nullable: true });
+export const optional = <Value>(spec: FieldSpec<Value>): FieldSpec<Value | undefined, true> => ({ ...spec, optional: true });
+
+function normalizeBuilderStringEnumValues(values: readonly string[]): readonly string[] {
+  if (!Array.isArray(values) || values.length === 0) {
+    throw new Error('String enum fields must declare at least one value.');
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (let index = 0; index < values.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(values, index);
+    if (!descriptor?.enumerable || !('value' in descriptor) || typeof descriptor.value !== 'string') {
+      throw new Error(`String enum value at index ${index} must be a string.`);
+    }
+    if (hasUnpairedSurrogate(descriptor.value)) {
+      throw new Error(`String enum value at index ${index} must not contain unpaired UTF-16 surrogates.`);
+    }
+    if (seen.has(descriptor.value)) {
+      throw new Error(`String enum value ${JSON.stringify(descriptor.value)} is duplicated.`);
+    }
+    seen.add(descriptor.value);
+    result.push(descriptor.value);
+  }
+  for (const key of Reflect.ownKeys(values)) {
+    if (key === 'length') continue;
+    if (typeof key !== 'string' || !isArrayIndexKey(key) || Number(key) >= values.length) {
+      throw new Error('String enum value arrays must not contain extra properties.');
+    }
+  }
+  return result;
+}
 
 function normalizeCustomFieldSpec<Value>(spec: CustomFieldSpec<Value> | string): CustomFieldSpec<Value> {
   return typeof spec === 'string' ? { codec: spec } : spec;
@@ -270,7 +338,9 @@ export function toSchemaManifest(
     relations[relationName] = {
       key: manifestKeyFromRelation(relationRef.key),
       fields,
-      ...(relationRef.ephemeral ? { ephemeral: true } : {})
+      ...(relationRef.ephemeral ? { ephemeral: true } : {}),
+      ...(relationRef.description === undefined ? {} : { description: relationRef.description }),
+      ...(relationRef.metadata === undefined ? {} : { metadata: relationRef.metadata })
     };
   }
 
@@ -346,7 +416,13 @@ export function hydrateSchemaManifest(
       fields[fieldName] = fieldSpecFromManifest(fieldManifest, options.codecs ?? {});
     }
     runtimeSchema[relationName] = {
-      ...relation({ key: relationManifest.key, fields, ephemeral: relationManifest.ephemeral ?? false }),
+      ...relation({
+        key: relationManifest.key,
+        fields,
+        ephemeral: relationManifest.ephemeral ?? false,
+        ...(relationManifest.description === undefined ? {} : { description: relationManifest.description }),
+        ...(relationManifest.metadata === undefined ? {} : { metadata: relationManifest.metadata })
+      }),
       name: relationName
     };
   }
@@ -607,6 +683,7 @@ function normalizeField(
   requireProperty(record, 'type', path, diagnostics);
   const type = record.type;
   const allowed = ['type', 'optional', 'nullable', 'description', 'metadata'];
+  if (type === 'string') allowed.push('values');
   if (type === 'id') allowed.push('domain');
   if (type === 'ref') allowed.push('target');
   if (type === 'custom') allowed.push('codec');
@@ -614,7 +691,10 @@ function normalizeField(
   const base = normalizeFieldBase(record, path, diagnostics);
 
   switch (type) {
-    case 'string':
+    case 'string': {
+      const values = optionalStringEnumValues(record, 'values', path, diagnostics);
+      return { ...base, type, ...(values === undefined ? {} : { values }) };
+    }
     case 'number':
     case 'boolean':
     case 'anchoredPath':
@@ -794,12 +874,18 @@ function manifestFieldFromSpec(
   codecs: Record<string, CodecDeclarationV1>,
   diagnostics: SchemaManifestDiagnosticV1[]
 ): FieldManifestV1 | undefined {
+  if (spec.values !== undefined && spec.valueKind !== 'string') {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...path, 'values'], 'String enum values are only valid on string fields.'));
+  }
   const base = {
     ...(spec.optional ? { optional: true } : {}),
-    ...(spec.nullable ? { nullable: true } : {})
+    ...(spec.nullable ? { nullable: true } : {}),
+    ...(spec.description === undefined ? {} : { description: spec.description }),
+    ...(spec.metadata === undefined ? {} : { metadata: spec.metadata })
   };
   switch (spec.valueKind) {
     case 'string':
+      return { ...base, type: spec.valueKind, ...(spec.values === undefined ? {} : { values: normalizeBuilderStringEnumValues(spec.values) }) };
     case 'number':
     case 'boolean':
     case 'anchoredPath':
@@ -840,7 +926,7 @@ function fieldSpecFromManifest(
   let spec: FieldSpec;
   switch (field.type) {
     case 'string':
-      spec = stringField();
+      spec = field.values === undefined ? stringField() : stringEnumField(field.values);
       break;
     case 'number':
       spec = numberField();
@@ -874,9 +960,62 @@ function fieldSpecFromManifest(
       break;
     }
   }
+  if (field.description !== undefined) spec = { ...spec, description: field.description };
+  if (field.metadata !== undefined) spec = { ...spec, metadata: field.metadata };
   if (field.nullable === true) spec = nullable(spec);
   if (field.optional === true) spec = optional(spec);
   return spec;
+}
+
+function optionalStringEnumValues(
+  record: SchemaManifestRecord,
+  fieldName: string,
+  path: readonly (string | number)[],
+  diagnostics: SchemaManifestDiagnosticV1[]
+): readonly string[] | undefined {
+  if (!(fieldName in record)) return undefined;
+  const value = record[fieldName];
+  const valuesPath = [...path, fieldName];
+  if (!Array.isArray(value)) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', valuesPath, 'String enum values must be a non-empty string array.'));
+    return undefined;
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  try {
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (!descriptor?.enumerable || !('value' in descriptor) || typeof descriptor.value !== 'string') {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...valuesPath, index], 'String enum values must be strings.'));
+        continue;
+      }
+      if (hasUnpairedSurrogate(descriptor.value)) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...valuesPath, index], 'String enum values must not contain unpaired UTF-16 surrogates.'));
+        continue;
+      }
+      if (seen.has(descriptor.value)) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', [...valuesPath, index], `Duplicate string enum value ${JSON.stringify(descriptor.value)}.`));
+        continue;
+      }
+      seen.add(descriptor.value);
+      result.push(descriptor.value);
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      if (key === 'length') continue;
+      if (typeof key !== 'string' || !isArrayIndexKey(key) || Number(key) >= value.length) {
+        diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', valuesPath, 'String enum values arrays must not contain extra properties.'));
+        break;
+      }
+    }
+  } catch {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', valuesPath, 'Unable to inspect string enum values.'));
+    return undefined;
+  }
+  if (result.length === 0) {
+    diagnostics.push(schemaManifestDiagnostic('schema_manifest.invalid_field', valuesPath, 'String enum values must contain at least one value.'));
+    return undefined;
+  }
+  return result;
 }
 
 function customFieldCodec(
