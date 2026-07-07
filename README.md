@@ -1,18 +1,29 @@
 # Tarstate
 
-Tarstate is **Alpha quality** software.
-
 Tarstate is a set of hooks for React (and other libs), that lets you query state trees like a database.
 It's a fast, disposable way to glue unrelated data sources together.
 
-It also generates JSON-serializable schemas, describing your data in terms of relationships, that typescript can read as types. This is different from `JSON schema`, which [validates not parses](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/). It is intended to support [schema evolution](https://www.inkandswitch.com/cambria/), i.e. so changing your state tree in the future won't break things.
+Tarstate is **alpha quality** software.
+
+It also generates JSON-serializable schemas, describing your data in terms of relationships, that typescript can read as types. This is different from `json-schema`, and justified by [parse not validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/). It is intended to support [schema evolution](https://www.inkandswitch.com/cambria/), i.e. so changing your state tree in the future won't break things.
 
 Perf and GC targets systems programming and video games.
 Work is shared between queries, and is faster than hand-rolled state management at scale.
 
-Tarstate is a TypeScript adaptation of
+Tarstate is largely a TypeScript adaptation of
 [wotbrew/relic](https://github.com/wotbrew/relic), after
-[Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf), with an additional schema protocol, and IDE/agentic tooling.
+[Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf).
+
+### TS Integration
+
+Run this command when the schema changes:
+
+```sh
+tarstate-schema generate src/schema.manifest.json --out src/generated/tarstate --artifacts typescript
+```
+
+It writes `src/generated/tarstate/rows.d.ts`. Because that file is under
+`src`, TypeScript and most IDEs will see the automatic types.
 
 ## Schemas
 
@@ -42,17 +53,6 @@ const schema = hydrateSchemaManifest({
   }
 })
 ```
-
-### TS Integration
-
-Run this command when the schema changes:
-
-```sh
-tarstate-schema generate src/schema.manifest.json --out src/generated/tarstate --artifacts typescript
-```
-
-It writes `src/generated/tarstate/rows.d.ts`. Because that file is under
-`src`, TypeScript and most IDEs will see the automatic types.
 
 ## React example
 
