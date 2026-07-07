@@ -200,18 +200,12 @@ export class QueryKeyError extends Error {
 type AliasedFieldAccess<Row, Alias extends string> =
   {
     readonly alias: Alias;
-    readonly $: AliasFieldNamespace<Row>;
-  } & AliasedFlatFieldAccess<Row>;
+    readonly row: AliasFieldNamespace<Row>;
+  };
 type RowFieldKeys<Row> = Row extends object ? keyof Row & string : never;
-type LiteralRowFieldKeys<Row> = string extends RowFieldKeys<Row> ? never : RowFieldKeys<Row>;
-type AliasedRelationMetadataField = 'kind' | 'name' | 'key' | 'fields' | 'ephemeral' | '__row';
-type AliasedReservedField = AliasedRelationMetadataField | keyof Query | 'alias' | '$';
 type AliasFieldNamespace<Row> = string extends RowFieldKeys<Row>
   ? Readonly<Record<string, ExprData<unknown>>>
   : { readonly [Field in RowFieldKeys<Row>]: ExprData<Row[Field]> };
-type AliasedFlatFieldAccess<Row> = {
-  readonly [Field in Exclude<LiteralRowFieldKeys<Row>, AliasedReservedField>]: ExprData<Row[Field]>;
-};
 export type AliasedRelationRef<Row extends object, Alias extends string> =
   RelationRef<Row> & AliasedFieldAccess<Row, Alias>;
 type AliasedQueryFieldRow<Row, Alias extends string> =
@@ -343,12 +337,9 @@ export function as<Row, Alias extends string>(
   for (const fieldName of aliasedFieldNames(input, alias)) {
     const exprData = field(alias, fieldName);
     defineAliasProperty(namespace, fieldName, exprData);
-    if (!(fieldName in target) && !ALIASED_FIELD_RESERVED_KEYS.has(fieldName)) {
-      defineAliasProperty(target, fieldName, exprData);
-    }
   }
 
-  defineAliasProperty(target, '$', namespace);
+  defineAliasProperty(target, 'row', namespace);
   return target as AliasedRelationRef<Row & object, Alias> | AliasedQuery<Row, Alias>;
 }
 
@@ -1717,13 +1708,20 @@ type DbQueryTransformPresenceOptions = EvaluateOptions & {
   readonly into?: unknown;
 };
 type RelationKeyScalar = string | number | boolean;
-type RelationKeyFieldScalar<Value> = Extract<Exclude<Value, null | undefined>, RelationKeyScalar>;
-type RelationKeyFieldValue<Value> = [RelationKeyFieldScalar<Value>] extends [never]
+type RelationKeyJsonObject = { readonly [key: string]: RelationKeyJsonValue };
+type RelationKeyJsonValue = RelationKeyScalar | null | readonly RelationKeyJsonValue[] | RelationKeyJsonObject;
+type RelationKeyInputValue = RelationKeyScalar | readonly RelationKeyJsonValue[];
+type RelationKeyFieldInputValue<Value> = Extract<Exclude<Value, null | undefined>, RelationKeyInputValue>;
+type RelationKeyFieldValue<Value> = [RelationKeyFieldInputValue<Value>] extends [never]
   ? RelationKeyScalar
-  : RelationKeyFieldScalar<Value>;
+  : RelationKeyFieldInputValue<Value>;
 export type RelationKeyValue<Relation extends RelationRef> =
   Relation extends RelationRef<infer Row, infer Key>
-    ? Key extends readonly (keyof Row & string)[]
+    ? string extends Key
+      ? RelationKeyInput
+      : readonly string[] extends Key
+        ? RelationKeyInput
+        : Key extends readonly (keyof Row & string)[]
       ? { readonly [Index in keyof Key]: Key[Index] extends keyof Row ? RelationKeyFieldValue<Row[Key[Index]]> : never }
       : Key extends keyof Row
         ? RelationKeyFieldValue<Row[Key]>
@@ -1838,22 +1836,23 @@ export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, 
 export function row<Row>(_db: Db, _query: Query<Row>, _options?: RowLookupOptions<Row>): Row | undefined;
 export function row<Relation extends RelationRef>(_db: Db, _relation: Relation, _options?: RowLookupOptions<RelationRow<Relation>>): RelationRow<Relation> | undefined;
 export function row<Row>(dbValue: Db, queryValue: Query<Row> | RelationRef, keyOrPredicateOrOptions?: RelationKeyInput | PredicateData | RowLookupOptions<Row>, options?: RowLookupOptions<Row>): Row | undefined {
-  if (isRelationRef(queryValue) && isRelationKeyInput(keyOrPredicateOrOptions)) {
-    const direct = directRelationRowByKey(dbValue, queryValue, keyOrPredicateOrOptions, options as DbQueryOptions<Row> | undefined);
+  if (isRelationRef(queryValue) && relationKeyInputValues(queryValue, keyOrPredicateOrOptions) !== undefined) {
+    const keyInput = keyOrPredicateOrOptions as RelationKeyInput;
+    const direct = directRelationRowByKey(dbValue, queryValue, keyInput, options as DbQueryOptions<Row> | undefined);
     if (direct.used) return direct.row as Row | undefined;
-    const key = relationKeyInputToKey(queryValue, keyOrPredicateOrOptions);
+    const key = relationKeyInputToKey(queryValue, keyInput);
     return q(dbValue, queryValue, options as DbQueryOptions<Record<string, unknown>, Row>)
       .find((rowValue) => isRecord(rowValue) && rowKey(queryValue, rowValue) === key) as Row | undefined;
   }
 
-  if (isRelationRef(queryValue) && isInvalidRelationLookupArgument(keyOrPredicateOrOptions)) return undefined;
+  if (isRelationRef(queryValue) && isInvalidRelationLookupArgument(queryValue, keyOrPredicateOrOptions)) return undefined;
 
   if (isPredicateData(keyOrPredicateOrOptions)) {
     const queryObject = pipe(queryForTarget(queryValue), where(keyOrPredicateOrOptions));
     return q(dbValue, queryObject, options as DbQueryOptions<Row>)[0] as Row | undefined;
   }
 
-  const readOptions = (keyOrPredicateOrOptions === undefined || isRelationKeyInput(keyOrPredicateOrOptions))
+  const readOptions = (keyOrPredicateOrOptions === undefined || (isRelationRef(queryValue) && relationKeyInputValues(queryValue, keyOrPredicateOrOptions) !== undefined))
     ? options
     : keyOrPredicateOrOptions;
   return q(dbValue, queryForTarget(queryValue), readOptions as DbQueryOptions<Row>)[0] as Row | undefined;
@@ -1883,16 +1882,19 @@ function indexedRelationRowsForKey(
 ): readonly unknown[] | undefined {
   const fields = relationKeyFields(relationRef);
   const fieldName = fields.length === 1 ? fields[0] : undefined;
+  const keyValues = relationKeyInputValues(relationRef, keyInput);
+  const keyValue = keyValues?.[0];
   if (
     fieldName === undefined
-    || Array.isArray(keyInput)
-    || !canCompareRelationKeyAtom(keyInput)
+    || keyValues?.length !== 1
+    || keyValue === undefined
+    || !canUseScalarSourceLookup(keyValue)
     || relationRef.fields[fieldName]?.custom?.stableKey !== undefined
   ) {
     return undefined;
   }
 
-  const lookupKey = relationSourceLookupValueForKey(relationRef.fields[fieldName], keyInput);
+  const lookupKey = relationSourceLookupValueForKey(relationRef.fields[fieldName], keyValue);
   if (lookupKey === undefined) return undefined;
   const lookupValue = { relation: relationRef, field: fieldName, value: lookupKey };
   return source.lookup?.(lookupValue) ?? scanLookupRows(source.rows(relationRef), lookupValue);
@@ -2118,7 +2120,7 @@ export type RelationRowUpdate<Relation extends RelationRef> = Partial<{
 export type RelationRowUpdateInput<Relation extends RelationRef> =
   | RelationRowUpdate<Relation>
   | ((row: RelationRow<Relation>) => RelationRowUpdate<Relation>);
-export type RelationKeyInput = RelationKeyScalar | readonly RelationKeyScalar[];
+export type RelationKeyInput = RelationKeyInputValue;
 export type RelationMergeInput<Relation extends RelationRef = RelationRef> =
   | readonly (keyof RelationRow<Relation> & string)[]
   | ((current: RelationRow<Relation>, incoming: RelationRow<Relation>) => RelationRowUpdate<Relation>);
@@ -2715,7 +2717,7 @@ function materializedIndexBucketMap<Row, Value>(
   return new Map(buckets.map((bucket) => [stableKey(bucket.value), {
     bucket,
     exactValueOnly: bucket.rows.every((rowValue) =>
-      isRecord(rowValue) && Object.is(rowValue[fieldName], bucket.value))
+      isRecord(rowValue) && relationKeyValuesEqual(rowValue[fieldName], bucket.value))
   }]));
 }
 
@@ -2727,9 +2729,9 @@ function materializedIndexLookupRows<Row, Value>(
   const lookupBucket = buckets.get(stableKey(valueValue));
   if (lookupBucket === undefined) return EMPTY_FROZEN_ARRAY;
   const { bucket } = lookupBucket;
-  if (lookupBucket.exactValueOnly && Object.is(bucket.value, valueValue)) return bucket.rows;
+  if (lookupBucket.exactValueOnly && relationKeyValuesEqual(bucket.value, valueValue)) return bucket.rows;
   return frozenArray(bucket.rows.filter((rowValue) =>
-    isRecord(rowValue) && Object.is(rowValue[fieldName], valueValue)));
+    isRecord(rowValue) && relationKeyValuesEqual(rowValue[fieldName], valueValue)));
 }
 
 function materializedIndexRangeRowsFromBuckets<Row, Value>(
@@ -4337,9 +4339,10 @@ function materializedInternalIndexLookupRows(
 ): readonly unknown[] {
   const bucket = index.buckets.get(stableKey(lookupValue.value));
   if (bucket === undefined) return [];
-  if (Object.is(bucket.value, lookupValue.value)) return bucket.entries.map((entry) => entry.row);
+  const fieldSpec = lookupValue.relation.fields[lookupValue.field];
+  if (fieldLookupMatches(fieldSpec, bucket.value, lookupValue.value)) return bucket.entries.map((entry) => entry.row);
   return bucket.entries
-    .filter((entry) => isRecord(entry.row) && Object.is(entry.row[lookupValue.field], lookupValue.value))
+    .filter((entry) => isRecord(entry.row) && fieldLookupMatches(fieldSpec, entry.row[lookupValue.field], lookupValue.value))
     .map((entry) => entry.row);
 }
 
@@ -7638,9 +7641,15 @@ function evaluateExpr(
     case 'sel1':
       return evaluateSelectionExpr(data, entry, source, relations, options, diagnostics, outer);
     case 'eq':
-      return Object.is(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer));
+      return relationKeyValuesEqual(
+        evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer),
+        evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer)
+      );
     case 'neq':
-      return !Object.is(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer));
+      return !relationKeyValuesEqual(
+        evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer),
+        evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer)
+      );
     case 'lt':
       return compareValues(evaluateExpr(data.left, entry, source, relations, options, diagnostics, outer), evaluateExpr(data.right, entry, source, relations, options, diagnostics, outer)) < 0;
     case 'lte':
@@ -8284,18 +8293,22 @@ function sortPlainRows<Row>(rows: readonly Row[], sortValue: DbQuerySort<Row>, d
 }
 
 function isRelationKeyInput(input: unknown): input is RelationKeyInput {
-  return isRelationKeyScalar(input) || (Array.isArray(input) && input.every(isRelationKeyScalar));
+  return isRelationKeyInputValue(input);
 }
 
 function isRelationKeyScalar(input: unknown): input is RelationKeyScalar {
   return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
 }
 
+function isRelationKeyInputValue(input: unknown): input is RelationKeyInputValue {
+  return isRelationKeyScalar(input) || (Array.isArray(input) && isJsonValue(input));
+}
+
 const dbQueryOptionKeys = new Set(['sort', 'rsort', 'mapRows', 'into', 'env', 'functions', 'diagnosticMode']);
 
-function isInvalidRelationLookupArgument(input: unknown): boolean {
+function isInvalidRelationLookupArgument(relationRef: RelationRef, input: unknown): boolean {
   return input !== undefined
-    && !isRelationKeyInput(input)
+    && relationKeyInputValues(relationRef, input) === undefined
     && !isPredicateData(input)
     && !isDbQueryOptions(input);
 }
@@ -8307,14 +8320,7 @@ function isDbQueryOptions(input: unknown): input is DbQueryOptions {
 }
 
 function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput): string {
-  const fields = relationKeyFields(relationRef);
-  const values = Array.isArray(input) ? input : [input];
-  const keyValues = values.map((valueValue, indexValue) => {
-    const fieldName = fields[indexValue];
-    const spec = fieldName === undefined ? undefined : relationRef.fields[fieldName];
-    return spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
-  });
-  return stableKey(keyValues);
+  return stableKey(relationKeyInputValues(relationRef, input) ?? []);
 }
 
 export function relationKeyInputMatchesRow(
@@ -8355,7 +8361,7 @@ function relationKeyFieldRowValueMatches(
   const spec = relationRef.fields[fieldName];
   const left = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
   const right = spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
-  return left !== undefined && right !== undefined && Object.is(left, right);
+  return left !== undefined && right !== undefined && relationKeyValuesEqual(left, right);
 }
 
 function relationKeyFieldValueMatches(
@@ -8369,7 +8375,15 @@ function relationKeyFieldValueMatches(
   const spec = relationRef.fields[fieldName];
   const left = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
   const right = spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
-  return left !== undefined && right !== undefined && Object.is(left, right);
+  return left !== undefined && right !== undefined && relationKeyValuesEqual(left, right);
+}
+
+function relationKeyValuesEqual(left: unknown, right: unknown): boolean {
+  return Object.is(left, right) || (
+    isRelationKeyInputValue(left)
+    && isRelationKeyInputValue(right)
+    && stableKey(left) === stableKey(right)
+  );
 }
 
 function relationKeyFieldsMatchInput(
@@ -8378,15 +8392,14 @@ function relationKeyFieldsMatchInput(
   fields: readonly string[],
   input: RelationKeyInput
 ): boolean {
-  const values = Array.isArray(input) ? input : [input];
-  if (values.length !== fields.length) return false;
+  const values = relationKeyInputValues(relationRef, input);
+  if (values === undefined || values.length !== fields.length) return false;
   for (let index = 0; index < fields.length; index += 1) {
     const fieldName = fields[index];
     const valueValue = values[index];
     if (
       fieldName === undefined
       || valueValue === undefined
-      || !canCompareRelationKeyAtom(valueValue)
       || !relationKeyFieldValueMatches(relationRef, rowValue, fieldName, valueValue)
     ) {
       return false;
@@ -8401,7 +8414,11 @@ function relationSourceLookupValueForKey(spec: FieldSpec | undefined, keyInput: 
 }
 
 function canCompareRelationKeyAtom(input: unknown): boolean {
-  return input === null || (typeof input !== 'object' && typeof input !== 'function' && typeof input !== 'symbol');
+  return isRelationKeyInputValue(input);
+}
+
+function canUseScalarSourceLookup(input: unknown): boolean {
+  return isRelationKeyScalar(input);
 }
 
 function stageDb(input: Db): Db {
@@ -8550,16 +8567,13 @@ function isUsableRelationRef(input: unknown): input is RelationRef {
 function keyArityDiagnostics(relationRef: RelationRef, key: unknown, patch: unknown): readonly TarstateDiagnostic[] {
   const fields = relationKeyFields(relationRef);
   if (!isRelationKeyInput(key)) {
-    return [writePatchInvalidDiagnostic(`relation "${relationRef.name}" key values must be strings, finite numbers, or booleans`, patch, relationRef.name)];
+    return [writePatchInvalidDiagnostic(`relation "${relationRef.name}" key values must be non-null JSON-compatible values`, patch, relationRef.name)];
   }
+  if (relationKeyInputValues(relationRef, key) !== undefined) return [];
   if (fields.length <= 1) {
-    return Array.isArray(key)
-      ? [writePatchInvalidDiagnostic(`relation "${relationRef.name}" single-field key requires one scalar value`, patch, relationRef.name)]
-      : [];
+    return [writePatchInvalidDiagnostic(`relation "${relationRef.name}" single-field key values must match the key field`, patch, relationRef.name)];
   }
-  return Array.isArray(key) && key.length === fields.length
-    ? []
-    : [writePatchInvalidDiagnostic(`relation "${relationRef.name}" composite key requires ${fields.length} values`, patch, relationRef.name)];
+  return [writePatchInvalidDiagnostic(`relation "${relationRef.name}" composite key requires ${fields.length} matching key values`, patch, relationRef.name)];
 }
 
 function prototypePollutionDiagnostics(input: unknown, label: string, patch: unknown, relationName?: string): readonly TarstateDiagnostic[] {
@@ -9684,7 +9698,8 @@ function fieldKeyValue(spec: FieldSpec, valueValue: unknown): unknown {
 }
 
 function fieldKeyInputValue(spec: FieldSpec, valueValue: unknown): unknown {
-  if (spec.valueKind === 'string' && spec.values !== undefined && !fieldValueMatchesSpec(spec, valueValue)) return undefined;
+  if (spec.valueKind === 'json') return isRelationKeyInputValue(valueValue) ? valueValue : undefined;
+  if (spec.valueKind !== 'custom' && !fieldValueMatchesSpec(spec, valueValue)) return undefined;
   if (spec.valueKind !== 'custom') return valueValue;
   if (!isRelationKeyScalar(valueValue)) return undefined;
   if (spec.custom?.stableKey !== undefined) return valueValue;
@@ -9696,6 +9711,9 @@ function fieldKeyInputValue(spec: FieldSpec, valueValue: unknown): unknown {
 }
 
 function fieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
+  if (spec?.valueKind === 'json') {
+    return relationKeyValuesEqual(fieldValue, lookupValue);
+  }
   if (spec?.valueKind === 'custom' && spec.custom?.stableKey !== undefined) {
     return spec.custom.stableKey(fieldValue) === spec.custom.stableKey(lookupValue);
   }
@@ -9783,10 +9801,10 @@ export function relationKeyInputKey(relationRef: RelationRef, input: unknown): s
 export function relationKeyInputValues(relationRef: RelationRef, input: unknown): readonly unknown[] | undefined {
   if (!isRelationKeyInput(input)) return undefined;
   const fields = relationKeyFields(relationRef);
-  const inputValues = Array.isArray(input)
-    ? input.length === fields.length ? input : undefined
-    : fields.length === 1 ? [input] : undefined;
-  if (inputValues === undefined || !inputValues.every(isRelationKeyScalar)) return undefined;
+  const inputValues = fields.length === 1
+    ? [input]
+    : Array.isArray(input) && input.length === fields.length ? input : undefined;
+  if (inputValues === undefined) return undefined;
 
   const values = inputValues.map((valueValue, indexValue) => {
     const fieldName = fields[indexValue];
@@ -10317,19 +10335,6 @@ function isExpr(input: unknown): input is ExprData {
 function aggregateCall<Value = unknown>(op: AggregateFunction, ...args: readonly unknown[]): AggregateExprData<Value> {
   return { op: 'aggregateCall', fn: op, args } as unknown as AggregateExprData<Value>;
 }
-
-const ALIASED_FIELD_RESERVED_KEYS = new Set<string>([
-  'kind',
-  'name',
-  'key',
-  'fields',
-  'ephemeral',
-  '__row',
-  'data',
-  'relations',
-  'alias',
-  '$'
-]);
 
 function defineAliasProperty(target: Record<string, unknown>, name: string, value: unknown): void {
   Object.defineProperty(target, name, {

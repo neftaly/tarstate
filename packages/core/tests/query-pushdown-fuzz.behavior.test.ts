@@ -110,7 +110,7 @@ describe('query pushdown seeded fuzz behavior', () => {
       const range = rangePredicate(pickSeeded(rangeOps, seed ^ 0x51), pickSeeded(orientations, seed ^ 0x7a), amountThreshold(seed ^ 0x37));
       const posted: PredicateSpec = {
         label: 'posted neq false',
-        predicate: neq(entry.posted, value(false))
+        predicate: neq(entry.row.posted, value(false))
       };
 
       for (const ordered of permutations([equality, range, posted])) {
@@ -155,8 +155,8 @@ function queryFor(predicate: PredicateData): Query<ProjectedEntry> {
   return pipe(
     from(entry),
     where(predicate),
-    sort(asc(entry.id)),
-    project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted })
+    sort(asc(entry.row.id)),
+    project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted })
   );
 }
 
@@ -225,8 +225,8 @@ function lookupPredicate(orientation: PredicateOrientation, lookupValue: string)
   return {
     label: `eq ${orientation}`,
     predicate: orientation === 'direct'
-      ? eq(entry.accountId, value(lookupValue))
-      : eq(value<string>(lookupValue), entry.accountId),
+      ? eq(entry.row.accountId, value(lookupValue))
+      : eq(value<string>(lookupValue), entry.row.accountId),
     pushdown: { kind: 'lookup', field: 'accountId', value: lookupValue }
   };
 }
@@ -242,13 +242,13 @@ function rangePredicate(op: RangeOp, orientation: PredicateOrientation, threshol
 function rangePredicateData(op: RangeOp, orientation: PredicateOrientation, threshold: number): PredicateData {
   switch (op) {
     case 'gt':
-      return orientation === 'direct' ? gt(entry.amount, value(threshold)) : gt(value<number>(threshold), entry.amount);
+      return orientation === 'direct' ? gt(entry.row.amount, value(threshold)) : gt(value<number>(threshold), entry.row.amount);
     case 'gte':
-      return orientation === 'direct' ? gte(entry.amount, value(threshold)) : gte(value<number>(threshold), entry.amount);
+      return orientation === 'direct' ? gte(entry.row.amount, value(threshold)) : gte(value<number>(threshold), entry.row.amount);
     case 'lt':
-      return orientation === 'direct' ? lt(entry.amount, value(threshold)) : lt(value<number>(threshold), entry.amount);
+      return orientation === 'direct' ? lt(entry.row.amount, value(threshold)) : lt(value<number>(threshold), entry.row.amount);
     case 'lte':
-      return orientation === 'direct' ? lte(entry.amount, value(threshold)) : lte(value<number>(threshold), entry.amount);
+      return orientation === 'direct' ? lte(entry.row.amount, value(threshold)) : lte(value<number>(threshold), entry.row.amount);
   }
 }
 

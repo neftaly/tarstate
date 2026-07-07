@@ -57,31 +57,31 @@ const accounts: readonly Account[] = [
 
 const filterProject = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+  where(eq(entry.row.accountId, value('cash'))),
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
 );
 
 const sortedFilterProject = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
-  sort(asc(entry.amount), asc(entry.id)),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+  where(eq(entry.row.accountId, value('cash'))),
+  sort(asc(entry.row.amount), asc(entry.row.id)),
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
 );
 
 const sortedRows = pipe(
   from(entry),
-  sort(asc(entry.amount), asc(entry.id))
+  sort(asc(entry.row.amount), asc(entry.row.id))
 );
 
 const joinedEntryAccounts = pipe(
   from(entry),
   join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    accountName: account.$.name,
-    amount: entry.amount
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    accountName: account.row.name,
+    amount: entry.row.amount
   }),
   sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
 );
@@ -90,11 +90,11 @@ const leftJoinedEntryAccounts = pipe(
   from(entry),
   leftJoin(from(account), clauses<Entry, Account>({ accountId: 'id' })),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    accountName: account.$.name,
-    amount: entry.amount
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    accountName: account.row.name,
+    amount: entry.row.amount
   }),
   sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
 );
@@ -102,10 +102,10 @@ const leftJoinedEntryAccounts = pipe(
 const groupedEntryTotals = pipe(
   from(entry),
   aggregate({
-    groupBy: { accountId: entry.accountId },
+    groupBy: { accountId: entry.row.accountId },
     aggregates: {
       entryCount: count(),
-      total: sum(entry.amount)
+      total: sum(entry.row.amount)
     }
   }),
   sort(asc(field<string>('row', 'accountId')))
@@ -113,29 +113,29 @@ const groupedEntryTotals = pipe(
 
 const topEntriesBySortAndLimit = pipe(
   from(entry),
-  sort(desc(entry.amount), asc(entry.id)),
+  sort(desc(entry.row.amount), asc(entry.row.id)),
   limit(TOP_N_COUNT),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
 );
 
 const topEntriesBySortLimit = pipe(
   from(entry),
-  sortLimit(TOP_N_COUNT, desc(entry.amount), asc(entry.id)),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+  sortLimit(TOP_N_COUNT, desc(entry.row.amount), asc(entry.row.id)),
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
 );
 
 const hashIndexedEntries = pipe(
   from(entry),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount }),
   hash(field<string>('row', 'accountId'))
 );
 
-const entriesByIdUniqueIndex = pipe(from(entry), uniqueIndex(entry.id));
+const entriesByIdUniqueIndex = pipe(from(entry), uniqueIndex(entry.row.id));
 
 const btreeIndexedEntries = pipe(
   from(entry),
-  sort(asc(entry.id)),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
+  sort(asc(entry.row.id)),
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount }),
   btree(field<number>('row', 'amount'))
 );
 

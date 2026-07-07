@@ -16,11 +16,7 @@ const artifactAliases = {
   typescript: 'typescript',
   ts: 'typescript',
   'json-schema': 'json-schema',
-  jsonSchema: 'json-schema',
-  prompt: 'prompt-card',
-  'prompt-card': 'prompt-card',
-  promptCard: 'prompt-card',
-  examples: 'examples'
+  jsonSchema: 'json-schema'
 } as const satisfies Readonly<Record<string, SchemaArtifactKind>>;
 const artifactAliasMap: Readonly<Record<string, SchemaArtifactKind>> = artifactAliases;
 
@@ -82,7 +78,7 @@ function parseArtifacts(input: string): readonly SchemaArtifactKind[] {
 function helpText(): string {
   return [
     'Usage:',
-    '  tarstate-schema generate <schema.manifest.json> --out .tarstate/schema --artifacts manifest,typescript,json-schema,prompt-card,examples'
+    '  tarstate-schema generate <schema.manifest.json> --out .tarstate/schema --artifacts manifest,typescript,json-schema'
   ].join('\n');
 }
 

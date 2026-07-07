@@ -121,6 +121,7 @@ import {
   hydrateSchemaManifest,
   idField,
   isJsonValue,
+  jsonField,
   nullable,
   numberField,
   opaqueField,
@@ -134,6 +135,7 @@ import {
   toSchemaManifest,
   validateSchemaManifest,
   type CustomFieldSpec,
+  type FieldSpec,
   type HydratedSchema,
   type HydrateSchemaManifestOptions,
   type HydrateSchemaManifestResult,
@@ -839,8 +841,8 @@ describe('public API contracts', () => {
     const entry = as(schema.entries, 'entry');
     const positiveEntries = pipe(
       from(entry),
-      where(gt(entry.amount, value(0))),
-      project({ id: entry.id, amount: entry.amount })
+      where(gt(entry.row.amount, value(0))),
+      project({ id: entry.row.id, amount: entry.row.amount })
     );
     const summary = pipe(
       from(entry),
@@ -880,8 +882,8 @@ describe('public API contracts', () => {
     const entry = as(schema.entries, 'entry');
     const positiveEntries = pipe(
       from(entry),
-      where(gt(entry.amount, value(0))),
-      project({ id: entry.id, amount: entry.amount })
+      where(gt(entry.row.amount, value(0))),
+      project({ id: entry.row.id, amount: entry.row.amount })
     );
 
     const validTargetOptions = {
@@ -980,6 +982,22 @@ describe('public API contracts', () => {
       readonly id: number;
       readonly label: string;
     };
+    type ArrayKeyEntry = {
+      readonly key: readonly number[];
+      readonly label: string;
+    };
+    type JsonRelationKeyValue =
+      | string
+      | number
+      | boolean
+      | null
+      | readonly JsonRelationKeyValue[]
+      | { readonly [key: string]: JsonRelationKeyValue };
+    type JsonRelationKeyInput =
+      | string
+      | number
+      | boolean
+      | readonly JsonRelationKeyValue[];
     const keyedSchema = defineSchema({
       byId: relation<KeyedEntry, 'id'>({
         key: 'id',
@@ -1009,6 +1027,13 @@ describe('public API contracts', () => {
           id: numberField(),
           label: stringField()
         }
+      }),
+      byArrayKey: relation<ArrayKeyEntry, 'key'>({
+        key: 'key',
+        fields: {
+          key: jsonField() as FieldSpec<readonly number[]>,
+          label: stringField()
+        }
       })
     });
 
@@ -1016,10 +1041,13 @@ describe('public API contracts', () => {
     const readByTenantAndId = () => row(openingDb, keyedSchema.byTenantAndId, ['acme', 'entry-a'] as const);
     const readByEnabled = () => row(openingDb, keyedSchema.byEnabled, true);
     const readByNumber = () => row(openingDb, keyedSchema.byNumber, 1);
+    const readByArrayKey = () => row(openingDb, keyedSchema.byArrayKey, [1, 2] as const);
     const hasById = () => exists(openingDb, keyedSchema.byId, 'entry-a');
     const hasByEnabled = () => exists(openingDb, keyedSchema.byEnabled, false);
     const hasByNumber = () => exists(openingDb, keyedSchema.byNumber, 2);
+    const hasByArrayKey = () => exists(openingDb, keyedSchema.byArrayKey, [1, 2] as const);
     const updateFlag = () => updateByKey(keyedSchema.byEnabled, true, { label: 'Enabled' });
+    const updateArrayKey = () => updateByKey(keyedSchema.byArrayKey, [1, 2] as const, { label: 'Pair' });
     const deleteFlag = () => deleteByKey(keyedSchema.byEnabled, false);
     const incrementAmount = () => incrementByKey(keyedSchema.byId, 'entry-a', 'amount', 2);
     const rootIncrementAmount = () => rootIncrementByKey(keyedSchema.byId, 'entry-a', 'amount', 2);
@@ -1032,6 +1060,10 @@ describe('public API contracts', () => {
       byNumber: [
         { id: 1, label: 'One' },
         { id: 2, label: 'Two' }
+      ],
+      byArrayKey: [
+        { key: [1, 2], label: 'Pair' },
+        { key: [3, 4], label: 'Other pair' }
       ]
     });
 
@@ -1039,21 +1071,26 @@ describe('public API contracts', () => {
     expectTypeOf<ReturnType<typeof readByTenantAndId>>().toEqualTypeOf<TenantEntry | undefined>();
     expectTypeOf<ReturnType<typeof readByEnabled>>().toEqualTypeOf<FlagEntry | undefined>();
     expectTypeOf<ReturnType<typeof readByNumber>>().toEqualTypeOf<NumberKeyEntry | undefined>();
+    expectTypeOf<ReturnType<typeof readByArrayKey>>().toEqualTypeOf<ArrayKeyEntry | undefined>();
     expectTypeOf<ReturnType<typeof hasById>>().toEqualTypeOf<boolean>();
     expectTypeOf<ReturnType<typeof hasByEnabled>>().toEqualTypeOf<boolean>();
     expectTypeOf<ReturnType<typeof hasByNumber>>().toEqualTypeOf<boolean>();
+    expectTypeOf<ReturnType<typeof hasByArrayKey>>().toEqualTypeOf<boolean>();
     expectTypeOf<ReturnType<typeof updateFlag>>().toEqualTypeOf<UpdateByKeyPatch<typeof keyedSchema.byEnabled>>();
+    expectTypeOf<ReturnType<typeof updateArrayKey>>().toEqualTypeOf<UpdateByKeyPatch<typeof keyedSchema.byArrayKey>>();
     expectTypeOf<ReturnType<typeof deleteFlag>>().toEqualTypeOf<DeleteByKeyPatch<typeof keyedSchema.byEnabled>>();
     expectTypeOf<ReturnType<typeof incrementAmount>>().toEqualTypeOf<IncrementByKeyPatch<typeof keyedSchema.byId>>();
     expectTypeOf<ReturnType<typeof rootIncrementAmount>>().toEqualTypeOf<RootIncrementByKeyPatch<typeof keyedSchema.byId>>();
     expectTypeOf<ReturnType<typeof rootIncrementAmount>>().toEqualTypeOf<ReturnType<typeof incrementAmount>>();
     expectTypeOf<ReturnType<typeof writerIncrementAmount>>().toEqualTypeOf<IncrementByKeyPatch<typeof keyedSchema.byTenantAndId>>();
     expectTypeOf<RootRelationNumericField<typeof keyedSchema.byId>>().toEqualTypeOf<RelationNumericField<typeof keyedSchema.byId>>();
-    expectTypeOf<RelationKeyInput>().toEqualTypeOf<string | number | boolean | readonly (string | number | boolean)[]>();
+    expectTypeOf<RelationKeyInput>().toEqualTypeOf<JsonRelationKeyInput>();
     expect(row(flagDb, keyedSchema.byEnabled, true)).toEqual({ enabled: true, label: 'Enabled' });
     expect(exists(flagDb, keyedSchema.byEnabled, false)).toBe(true);
     expect(row(flagDb, keyedSchema.byNumber, 1)).toEqual({ id: 1, label: 'One' });
     expect(exists(flagDb, keyedSchema.byNumber, 2)).toBe(true);
+    expect(row(flagDb, keyedSchema.byArrayKey, [1, 2] as const)).toEqual({ key: [1, 2], label: 'Pair' });
+    expect(exists(flagDb, keyedSchema.byArrayKey, [3, 4] as const)).toBe(true);
 
     const invalidReadById = () =>
       // @ts-expect-error row keys must match the relation key field type.
@@ -1064,6 +1101,9 @@ describe('public API contracts', () => {
     const invalidReadByNumber = () =>
       // @ts-expect-error numeric row keys must use numeric key values.
       row(openingDb, keyedSchema.byNumber, '1');
+    const invalidReadByArrayKey = () =>
+      // @ts-expect-error array row keys must use the relation key field type.
+      row(openingDb, keyedSchema.byArrayKey, 1);
     const invalidHasById = () =>
       // @ts-expect-error exists keys must match the relation key field type.
       exists(openingDb, keyedSchema.byId, 1);
@@ -1088,10 +1128,12 @@ describe('public API contracts', () => {
     void invalidReadById;
     void invalidReadByEnabled;
     void invalidReadByNumber;
+    void invalidReadByArrayKey;
     void invalidHasById;
     void invalidCompositeRead;
     void invalidCompositeExists;
     void updateFlag;
+    void updateArrayKey;
     void deleteFlag;
     void incrementAmount;
     void rootIncrementAmount;
@@ -1389,9 +1431,9 @@ describe('public API contracts', () => {
     const indexedEntries = pipe(
       from(entry),
       project({
-        id: entry.id,
-        accountId: entry.accountId,
-        amount: entry.amount
+        id: entry.row.id,
+        accountId: entry.row.accountId,
+        amount: entry.row.amount
       }),
       hash(field<string>('row', 'accountId'))
     );
@@ -1420,13 +1462,13 @@ describe('public API contracts', () => {
     const summaryRows = pipe(
       from(entry),
       aggregate({
-        groupBy: { accountId: entry.accountId },
+        groupBy: { accountId: entry.row.accountId },
         aggregates: {
           entryCount: count(),
-          positiveCount: count(gt(entry.amount, value(0))),
-          hasIncome: anyAggregate(gt(entry.amount, value(0))),
-          hasNoMissingMemo: notAny(isMissing(entry.memo)),
-          total: sum(entry.amount)
+          positiveCount: count(gt(entry.row.amount, value(0))),
+          hasIncome: anyAggregate(gt(entry.row.amount, value(0))),
+          hasNoMissingMemo: notAny(isMissing(entry.row.memo)),
+          total: sum(entry.row.amount)
         }
       }),
       project({
@@ -1439,7 +1481,7 @@ describe('public API contracts', () => {
       })
     );
     const summary = as(summaryRows, 'summary');
-    const byPredicate = pipe(from(entry), join(from(account), eq(entry.accountId, account.id)));
+    const byPredicate = pipe(from(entry), join(from(account), eq(entry.row.accountId, account.row.id)));
     const byClause = pipe(
       from(entry),
       join(from(account), clauses<Entry, Account>({ accountId: 'id' }))
@@ -1448,23 +1490,23 @@ describe('public API contracts', () => {
       from(account),
       leftJoin(summaryRows, clauses<Account, QueryRow<typeof summaryRows>>({ id: 'accountId' })),
       project({
-        id: account.id,
-        name: account.$.name,
-        entryCount: maybe(summary.entryCount),
-        total: maybe(summary.total)
+        id: account.row.id,
+        name: account.row.name,
+        entryCount: maybe(summary.row.entryCount),
+        total: maybe(summary.row.total)
       })
     );
     const correlatedRows = sel(from(account), correlate<Entry, Account>({ accountId: 'id' }));
     const correlatedRow = sel1(from(account), correlate<Entry, Account>({ accountId: 'id' }));
     const wholeRow = self<Entry>();
-    const hasPositiveAmount = anyAggregate(gt(entry.amount, value(0)));
-    const hasNoPositiveAmount = notAny(gt(entry.amount, value(0)));
-    const positiveCount = count(gt(entry.amount, value(0)));
+    const hasPositiveAmount = anyAggregate(gt(entry.row.amount, value(0)));
+    const hasNoPositiveAmount = notAny(gt(entry.row.amount, value(0)));
+    const positiveCount = count(gt(entry.row.amount, value(0)));
     const predicates = [
-      isNull(account.id),
-      notNull(account.$.name),
+      isNull(account.row.id),
+      notNull(account.row.name),
       isMissing(field('entry', 'optional')),
-      notMissing(entry.id)
+      notMissing(entry.row.id)
     ];
 
     expectTypeOf<QueryRow<typeof byPredicate>>().toMatchTypeOf<Entry & Account>();

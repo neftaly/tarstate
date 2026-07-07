@@ -103,7 +103,7 @@ describe('constraint enforcement through materialization', () => {
       ]));
     }
 
-    expect(q(constrained, pipe(from(entry), sort(asc(entry.id)), project({ id: entry.id })))).toEqual([
+    expect(q(constrained, pipe(from(entry), sort(asc(entry.row.id)), project({ id: entry.row.id })))).toEqual([
       { id: 'e1' },
       { id: 'e2' },
       { id: 'e3' },

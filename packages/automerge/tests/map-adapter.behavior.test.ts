@@ -1766,13 +1766,13 @@ describe('automerge map adapter', () => {
       presenceFocus,
       join(
         from(objectLocation),
-        eq(getKey<string>(presenceFocus.payload, value('objectId')), objectLocation.objectId)
+        eq(getKey<string>(presenceFocus.row.payload, value('objectId')), objectLocation.row.objectId)
       ),
       project({
-        peer: presenceFocus.peer,
-        path: objectLocation.pathSegments,
-        relation: objectLocation.relation,
-        key: objectLocation.$.key
+        peer: presenceFocus.row.peer,
+        path: objectLocation.row.pathSegments,
+        relation: objectLocation.row.relation,
+        key: objectLocation.row.key
       })
     );
 
@@ -2056,14 +2056,14 @@ describe('automerge map adapter', () => {
       join(
         from(objectLocations),
         and(
-          eq(presenceFocus.runtime, field<string>(objectLocations.name, 'runtime')),
-          eq(presenceFocus.objectId, field<string>(objectLocations.name, 'objectId'))
+          eq(presenceFocus.row.runtime, field<string>(objectLocations.name, 'runtime')),
+          eq(presenceFocus.row.objectId, field<string>(objectLocations.name, 'objectId'))
         )
       ),
       project({
-        peer: presenceFocus.peer,
-        runtime: presenceFocus.runtime,
-        documentHeads: presenceFocus.documentHeads,
+        peer: presenceFocus.row.peer,
+        runtime: presenceFocus.row.runtime,
+        documentHeads: presenceFocus.row.documentHeads,
         path: field<readonly (string | number)[]>(objectLocations.name, 'pathSegments'),
         relation: field<string | undefined>(objectLocations.name, 'relation'),
         key: field<unknown>(objectLocations.name, 'key')
@@ -2141,14 +2141,14 @@ describe('automerge map adapter', () => {
       join(
         from(objectLocations),
         and(
-          eq(getKey<string>(peerPresence.payload, value('runtime')), field<string>(objectLocations.name, 'runtime')),
-          eq(getKey<string>(peerPresence.payload, value('objectId')), field<string>(objectLocations.name, 'objectId'))
+          eq(getKey<string>(peerPresence.row.payload, value('runtime')), field<string>(objectLocations.name, 'runtime')),
+          eq(getKey<string>(peerPresence.row.payload, value('objectId')), field<string>(objectLocations.name, 'objectId'))
         )
       ),
       project({
-        peer: peerPresence.peer,
-        topic: peerPresence.topic,
-        heads: getKey<readonly string[]>(peerPresence.payload, value('heads')),
+        peer: peerPresence.row.peer,
+        topic: peerPresence.row.topic,
+        heads: getKey<readonly string[]>(peerPresence.row.payload, value('heads')),
         path: field<readonly (string | number)[]>(objectLocations.name, 'pathSegments'),
         relation: field<string | undefined>(objectLocations.name, 'relation'),
         key: field<unknown>(objectLocations.name, 'key')

@@ -285,8 +285,8 @@ function makeStoreMetrics(label: string): StoreScenarioMetrics {
 function projectQueryFor(projectId: string): Query<TaskRow> {
   return pipe(
     from(task),
-    where(eq(task.projectId, value(projectId))),
-    sort(asc(task.id))
+    where(eq(task.row.projectId, value(projectId))),
+    sort(asc(task.row.id))
   );
 }
 

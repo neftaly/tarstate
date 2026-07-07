@@ -49,13 +49,13 @@ const constrainedEntries = constrain(
 
 const postedEntriesById = pipe(
   from(entry),
-  where(eq(entry.posted, value(true))),
-  sort(asc(entry.id)),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted })
+  where(eq(entry.row.posted, value(true))),
+  sort(asc(entry.row.id)),
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted })
 );
 const entryRows = pipe(
   from(entry),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted })
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted })
 );
 const entriesByAccount = pipe(entryRows, hash(field<string>('row', 'accountId')));
 
@@ -208,7 +208,7 @@ function fuzzTransaction(db: Db, rng: Random, seed: number, step: number): FuzzT
     }
     case 'delete-account-after-entries': {
       const accountId = usedAccountId(db, rng) ?? existingAccountId(db, rng) ?? 'cash';
-      return { label: action, patches: [deleteRows(schema.entries, eq(entry.accountId, value(accountId))), deleteByKey(schema.accounts, accountId)] };
+      return { label: action, patches: [deleteRows(schema.entries, eq(entry.row.accountId, value(accountId))), deleteByKey(schema.accounts, accountId)] };
     }
     default:
       return action satisfies never;

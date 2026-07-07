@@ -36,6 +36,14 @@ type KeyedItem = {
   readonly label: string;
 };
 
+type CollisionItem = {
+  readonly id: string;
+  readonly key: string;
+  readonly name: string;
+  readonly kind: string;
+  readonly row: string;
+};
+
 type QueryRow<Input> = Input extends Query<infer Row> ? Row : never;
 
 const schema = defineSchema({
@@ -54,50 +62,62 @@ const schema = defineSchema({
       key: stringField(),
       label: stringField()
     }
+  }),
+  collisionItems: relation<CollisionItem>({
+    key: 'id',
+    fields: {
+      id: stringField(),
+      key: stringField(),
+      name: stringField(),
+      kind: stringField(),
+      row: stringField()
+    }
   })
 });
 
 describe('query API contracts', () => {
-  it('keeps colliding alias fields in the $ namespace', () => {
+  it('exposes aliased row fields only through the row namespace', () => {
     const account = as(schema.accounts, 'account');
 
     expect(account.name).toBe('accounts');
-    expect(account.$.name).toEqual(field('account', 'name'));
-    expect(account.id).toEqual(field('account', 'id'));
-    expect(account.$.id).toEqual(account.id);
+    expect(account.row.name).toEqual(field('account', 'name'));
+    expect(account.row.id).toEqual(field('account', 'id'));
+    expect('id' in account).toBe(false);
     expectTypeOf(account.name).toEqualTypeOf<string>();
-    expectTypeOf(account.$.name).toEqualTypeOf<ExprData<string>>();
-    expectTypeOf(account.id).toEqualTypeOf<ExprData<string>>();
+    expectTypeOf(account.row.name).toEqualTypeOf<ExprData<string>>();
+    expectTypeOf(account.row.id).toEqualTypeOf<ExprData<string>>();
+    // @ts-expect-error Flat row-field access is not part of the aliased relation API.
+    account.id;
 
     const namedRows = pipe(
       from(account),
       project({
-        id: account.id,
-        name: account.$.name
+        id: account.row.id,
+        name: account.row.name
       })
     );
     const named = as(namedRows, 'named');
 
     expect('name' in named).toBe(false);
-    expect(named.$.name).toEqual(field('named', 'name'));
-    expectTypeOf(named.$.name).toEqualTypeOf<ExprData<string>>();
-    // @ts-expect-error Colliding field names must use the namespace.
+    expect(named.row.name).toEqual(field('named', 'name'));
+    expectTypeOf(named.row.name).toEqualTypeOf<ExprData<string>>();
+    // @ts-expect-error Query aliases expose projected fields only through .row.
     expect(named.name).toBeUndefined();
   });
 
-  it('keeps aliased row fields named key in the $ namespace', () => {
+  it('supports row fields named key, name, kind, and row in the row namespace', () => {
     const item = as(schema.keyedItems, 'item');
     const keyedRows = pipe(
       from(item),
       project({
-        id: item.id,
-        key: item.$.key,
-        label: item.label
+        id: item.row.id,
+        key: item.row.key,
+        label: item.row.label
       })
     );
 
     expect(item.key).toBe('id');
-    expect(item.$.key).toEqual(field('item', 'key'));
+    expect(item.row.key).toEqual(field('item', 'key'));
     expect(from(item).relations.keyedItems?.key).toBe('id');
     expect(keyedRows.data).toMatchObject({
       op: 'project',
@@ -105,8 +125,21 @@ describe('query API contracts', () => {
         key: field('item', 'key')
       }
     });
-    expectTypeOf(item.$.key).toEqualTypeOf<ExprData<string>>();
+    expectTypeOf(item.row.key).toEqualTypeOf<ExprData<string>>();
+    // @ts-expect-error Non-metadata flat row fields are not exposed on aliases.
+    item.label;
     expectTypeOf<QueryRow<typeof keyedRows>>().toEqualTypeOf<Pick<KeyedItem, 'id' | 'key' | 'label'>>();
+
+    const collision = as(schema.collisionItems, 'collision');
+
+    expect(collision.key).toBe('id');
+    expect(collision.name).toBe('collisionItems');
+    expect(collision.kind).toBe('relation');
+    expect(collision.row.key).toEqual(field('collision', 'key'));
+    expect(collision.row.name).toEqual(field('collision', 'name'));
+    expect(collision.row.kind).toEqual(field('collision', 'kind'));
+    expect(collision.row.row).toEqual(field('collision', 'row'));
+    expectTypeOf(collision.row.row).toEqualTypeOf<ExprData<string>>();
   });
 
   it('tracks row-shape transform types for without, rename, and expand', () => {

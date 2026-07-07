@@ -187,7 +187,7 @@ describe('Relic compatibility parser', () => {
       db,
       pipe(
         fromRelicQuery([[':from', ':entries'], [':select', ':id', ':accountId', ':amount', ':posted']], schema),
-        sort(asc(entry.id))
+        sort(asc(entry.row.id))
       )
     );
 
@@ -248,7 +248,7 @@ describe('Relic compatibility parser', () => {
       db,
       pipe(
         fromRelicQuery([[':from', ':entries'], [':select', ':id', ':accountId', ':amount', ':memo', ':posted']], schema),
-        sort(asc(entry.id))
+        sort(asc(entry.row.id))
       )
     );
 

@@ -57,10 +57,10 @@ const accountIds = accounts.map((row) => row.id);
 const groupedEntryTotals = pipe(
   from(entry),
   aggregate({
-    groupBy: { accountId: entry.accountId },
+    groupBy: { accountId: entry.row.accountId },
     aggregates: {
       entryCount: count(),
-      total: sum(entry.amount)
+      total: sum(entry.row.amount)
     }
   }),
   sort(asc(field<string>('row', 'accountId')))
@@ -68,8 +68,8 @@ const groupedEntryTotals = pipe(
 
 const topEntries = pipe(
   from(entry),
-  sortLimit(TOP_N_COUNT, desc(entry.amount), asc(entry.id)),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+  sortLimit(TOP_N_COUNT, desc(entry.row.amount), asc(entry.row.id)),
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
 );
 
 const curveNotes: CurveNote[] = [];
@@ -163,8 +163,8 @@ function makeScanQueries(): readonly Query<unknown>[] {
     const threshold = -500 + index * 75;
     return pipe(
       from(entry),
-      where(gte(entry.amount, value(threshold))),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      where(gte(entry.row.amount, value(threshold))),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
     ) as Query<unknown>;
   });
 }
@@ -173,8 +173,8 @@ function makeLookupQueries(): readonly Query<unknown>[] {
   return accountIds.slice(0, LOOKUP_VARIANT_COUNT).map((accountId) =>
     pipe(
       from(entry),
-      where(eq(entry.accountId, value(accountId))),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      where(eq(entry.row.accountId, value(accountId))),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
     ) as Query<unknown>
   );
 }

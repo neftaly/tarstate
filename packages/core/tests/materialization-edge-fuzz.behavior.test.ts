@@ -39,14 +39,14 @@ const sortTieFallbackSeeds = resolveFuzzSeeds([0x5011, 0x5012, 0x5013] as const)
 const totalsByAccount = pipe(
   from(entry),
   aggregate({
-    groupBy: { accountId: entry.accountId },
+    groupBy: { accountId: entry.row.accountId },
     aggregates: {
       entryCount: count(),
-      postedCount: count(eq(entry.posted, value(true))),
-      lowest: min(entry.amount),
-      highest: max(entry.amount),
-      average: avg(entry.amount),
-      total: sum(entry.amount)
+      postedCount: count(eq(entry.row.posted, value(true))),
+      lowest: min(entry.row.amount),
+      highest: max(entry.row.amount),
+      average: avg(entry.row.amount),
+      total: sum(entry.row.amount)
     }
   }),
   sort(asc(field<string>('row', 'accountId')))
@@ -54,20 +54,20 @@ const totalsByAccount = pipe(
 
 const topThreeByAmount = pipe(
   from(entry),
-  sort(desc(entry.amount), asc(entry.id)),
+  sort(desc(entry.row.amount), asc(entry.row.id)),
   limit(3),
-  project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted })
+  project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted })
 ) as Query<unknown>;
 
 const joinedEntryAccounts = pipe(
   from(entry),
   join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    amount: entry.amount,
-    accountName: account.$.name
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    amount: entry.row.amount,
+    accountName: account.row.name
   })
 ) as Query<unknown>;
 
@@ -75,11 +75,11 @@ const leftJoinedEntryAccounts = pipe(
   from(entry),
   leftJoin(from(account), clauses<Entry, Account>({ accountId: 'id' })),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    amount: entry.amount,
-    accountName: account.$.name
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    amount: entry.row.amount,
+    accountName: account.row.name
   }),
   sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
 ) as Query<unknown>;
@@ -87,7 +87,7 @@ const leftJoinedEntryAccounts = pipe(
 const postedEntriesByAmountTie = pipe(
   from(entry),
   wherePosted(),
-  sort(asc(entry.amount))
+  sort(asc(entry.row.amount))
 ) as Query<unknown>;
 
 const joinedPostedEntriesByAccountNameTie = pipe(
@@ -95,11 +95,11 @@ const joinedPostedEntriesByAccountNameTie = pipe(
   join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
   wherePosted(),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    amount: entry.amount,
-    accountName: account.$.name
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    amount: entry.row.amount,
+    accountName: account.row.name
   }),
   sort(asc(field<string>('row', 'accountName')))
 ) as Query<unknown>;
@@ -633,7 +633,7 @@ function edgeDb(seed: number): Db {
 const accountIds = ['cash', 'sales', 'fees', 'equity'] as const;
 
 function wherePosted() {
-  return where(eq(entry.posted, value(true)));
+  return where(eq(entry.row.posted, value(true)));
 }
 
 function pathKey(...path: readonly string[]): RowKeySelector<unknown> {

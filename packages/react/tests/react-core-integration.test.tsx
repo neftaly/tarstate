@@ -43,10 +43,10 @@ const schema = defineSchema({
 const item = as(schema.items, 'item');
 const itemQuery = pipe(
   from(item),
-  sort(asc(item.id)),
+  sort(asc(item.row.id)),
   project({
-    id: item.id,
-    label: item.label
+    id: item.row.id,
+    label: item.row.label
   })
 );
 
@@ -139,10 +139,10 @@ describe('@tarstate/react core integration', () => {
   it('does not re-render when a same-relation commit is filtered out of the query', async () => {
     const visibleQuery = pipe(
       from(item),
-      where(eq(item.label, value('Visible'))),
+      where(eq(item.row.label, value('Visible'))),
       project({
-        id: item.id,
-        label: item.label
+        id: item.row.id,
+        label: item.row.label
       })
     );
     const store = createStore({
@@ -332,10 +332,10 @@ describe('@tarstate/react core integration', () => {
     function Probe({ label }: { readonly label: string }) {
       const query = pipe(
         from(item),
-        where(eq(item.label, value(label))),
+        where(eq(item.row.label, value(label))),
         project({
-          id: item.id,
-          label: item.label
+          id: item.row.id,
+          label: item.row.label
         })
       );
       const view = useView(query);

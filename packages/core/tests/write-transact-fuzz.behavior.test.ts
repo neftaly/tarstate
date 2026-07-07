@@ -40,7 +40,7 @@ const fuzzSchema = defineSchema({
 });
 
 const widget = as(fuzzSchema.widgets, 'widget');
-const widgetsById = pipe(from(widget), sort(asc(widget.id)));
+const widgetsById = pipe(from(widget), sort(asc(widget.row.id)));
 
 const COVERAGE_TAGS = [
   'insert:fresh',
@@ -392,7 +392,7 @@ function deleteByKeyWrite(tag: CoverageTag, key: string): GeneratedWrite {
 function deleteWhereWrite(tag: CoverageTag, matches: WidgetPredicate): GeneratedWrite {
   return {
     tag,
-    patch: deleteRows(fuzzSchema.widgets, eq(widget.active, value(true))),
+    patch: deleteRows(fuzzSchema.widgets, eq(widget.row.active, value(true))),
     apply: (model) => {
       const removed = [...model.entries()].filter(([, rowValue]) => matches(rowValue));
       for (const [key] of removed) model.delete(key);
@@ -599,7 +599,7 @@ function makeWriteForTag(generator: GeneratorState, tag: CoverageTag, model: Wid
       });
       return updateWhereWrite(
         tag,
-        update(fuzzSchema.widgets, eq(widget.active, value(active)), (rowValue) => ({
+        update(fuzzSchema.widgets, eq(widget.row.active, value(active)), (rowValue) => ({
           label: `${rowValue.label}-where-${suffix}`,
           rank: rowValue.rank + bump
         })),
@@ -612,7 +612,7 @@ function makeWriteForTag(generator: GeneratorState, tag: CoverageTag, model: Wid
       const changes = { rank: generator.rng.int(1_000) } as const;
       return updateWhereWrite(
         tag,
-        update(fuzzSchema.widgets, eq(widget.label, value(label)), changes),
+        update(fuzzSchema.widgets, eq(widget.row.label, value(label)), changes),
         (rowValue) => rowValue.label === label,
         () => changes
       );
@@ -622,7 +622,7 @@ function makeWriteForTag(generator: GeneratorState, tag: CoverageTag, model: Wid
       const changes = invalidUpdate(generator);
       return updateWhereWrite(
         tag,
-        update(fuzzSchema.widgets, eq(widget.label, value(current.label)), changes as unknown as Partial<Widget>),
+        update(fuzzSchema.widgets, eq(widget.row.label, value(current.label)), changes as unknown as Partial<Widget>),
         (rowValue) => rowValue.label === current.label,
         () => changes
       );
@@ -638,7 +638,7 @@ function makeWriteForTag(generator: GeneratorState, tag: CoverageTag, model: Wid
       const active = current.active;
       return {
         ...deleteWhereWrite(tag, (rowValue) => rowValue.active === active),
-        patch: deleteRows(fuzzSchema.widgets, eq(widget.active, value(active)))
+        patch: deleteRows(fuzzSchema.widgets, eq(widget.row.active, value(active)))
       };
     }
     case 'deleteExact:exact': {

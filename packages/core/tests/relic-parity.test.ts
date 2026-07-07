@@ -13,8 +13,8 @@ describe('Relic public API parity', () => {
       queryApi.from(entry),
       queryApi.join(queryApi.from(account), queryApi.clauses<Entry, Account>({ accountId: 'id' })),
       queryApi.project({
-        id: entry.id,
-        accountName: account.$.name
+        id: entry.row.id,
+        accountName: account.row.name
       })
     );
 

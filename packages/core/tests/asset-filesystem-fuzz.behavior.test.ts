@@ -121,8 +121,8 @@ const assetSchema = defineSchema({
 const asset = as(assetSchema.assets, 'asset');
 const dependency = as(assetSchema.assetDependencies, 'dependency');
 const dependencyTarget = as(assetSchema.assets, 'dependencyTarget');
-const assetsByPath = pipe(from(asset), sort(asc(asset.path), asc(asset.id)));
-const dependenciesBySource = pipe(from(dependency), sort(asc(dependency.fromAssetId), asc(dependency.ordinal), asc(dependency.toAssetId)));
+const assetsByPath = pipe(from(asset), sort(asc(asset.row.path), asc(asset.row.id)));
+const dependenciesBySource = pipe(from(dependency), sort(asc(dependency.row.fromAssetId), asc(dependency.row.ordinal), asc(dependency.row.toAssetId)));
 const ASSET_KINDS = ['bin', 'gltf', 'json', 'svg'] as const satisfies readonly AssetKind[];
 const MUTATION_ACTIONS = ['insert:duplicate-path', 'insert:fresh-path', 'rename', 'deleteByKey', 'deleteExact'] as const;
 
@@ -470,34 +470,34 @@ function pathFields(path: string): Pick<AssetRow, 'path' | 'dir' | 'basename' | 
 function pathQuery(path: string) {
   return pipe(
     from(asset),
-    where(eq(asset.path, value(path))),
-    sort(asc(asset.path), asc(asset.id))
+    where(eq(asset.row.path, value(path))),
+    sort(asc(asset.row.path), asc(asset.row.id))
   );
 }
 
 function dirQuery(dir: string) {
   return pipe(
     from(asset),
-    where(eq(asset.dir, value(dir))),
-    sort(asc(asset.path), asc(asset.id))
+    where(eq(asset.row.dir, value(dir))),
+    sort(asc(asset.row.path), asc(asset.row.id))
   );
 }
 
 function dependencyExpansionQuery(fromAssetId: string) {
   return pipe(
     from(dependency),
-    where(eq(dependency.fromAssetId, value(fromAssetId))),
-    join(from(dependencyTarget), eq(dependency.toAssetId, dependencyTarget.id)),
-    sort(asc(dependency.ordinal), asc(dependencyTarget.path), asc(dependencyTarget.id)),
+    where(eq(dependency.row.fromAssetId, value(fromAssetId))),
+    join(from(dependencyTarget), eq(dependency.row.toAssetId, dependencyTarget.row.id)),
+    sort(asc(dependency.row.ordinal), asc(dependencyTarget.row.path), asc(dependencyTarget.row.id)),
     project({
-      fromAssetId: dependency.fromAssetId,
-      fromPath: dependency.fromPath,
-      toAssetId: dependencyTarget.id,
-      toPath: dependencyTarget.path,
-      dependencyKind: dependency.$.kind,
-      ordinal: dependency.ordinal,
-      targetKind: dependencyTarget.$.kind,
-      targetPackageId: dependencyTarget.packageId
+      fromAssetId: dependency.row.fromAssetId,
+      fromPath: dependency.row.fromPath,
+      toAssetId: dependencyTarget.row.id,
+      toPath: dependencyTarget.row.path,
+      dependencyKind: dependency.row.kind,
+      ordinal: dependency.row.ordinal,
+      targetKind: dependencyTarget.row.kind,
+      targetPackageId: dependencyTarget.row.packageId
     })
   );
 }
@@ -505,15 +505,15 @@ function dependencyExpansionQuery(fromAssetId: string) {
 function kindListingQuery(kind: AssetKind) {
   return pipe(
     from(asset),
-    where(eq(asset.$.kind, value(kind))),
-    sort(asc(asset.path), asc(asset.id)),
+    where(eq(asset.row.kind, value(kind))),
+    sort(asc(asset.row.path), asc(asset.row.id)),
     project({
-      id: asset.id,
-      path: asset.path,
-      basename: asset.basename,
-      packageId: asset.packageId,
-      kind: asset.$.kind,
-      refs: asset.refs
+      id: asset.row.id,
+      path: asset.row.path,
+      basename: asset.row.basename,
+      packageId: asset.row.packageId,
+      kind: asset.row.kind,
+      refs: asset.row.refs
     })
   );
 }
@@ -522,17 +522,17 @@ function manifestListingQuery(packageId: string) {
   return pipe(
     from(asset),
     where(and(
-      eq(asset.packageId, value(packageId)),
-      eq(asset.$.kind, value('json'))
+      eq(asset.row.packageId, value(packageId)),
+      eq(asset.row.kind, value('json'))
     )),
-    sort(asc(asset.path), asc(asset.id)),
+    sort(asc(asset.row.path), asc(asset.row.id)),
     project({
-      id: asset.id,
-      path: asset.path,
-      basename: asset.basename,
-      packageId: asset.packageId,
-      refs: asset.refs,
-      metadata: asset.metadata
+      id: asset.row.id,
+      path: asset.row.path,
+      basename: asset.row.basename,
+      packageId: asset.row.packageId,
+      refs: asset.row.refs,
+      metadata: asset.row.metadata
     })
   );
 }

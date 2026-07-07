@@ -345,19 +345,19 @@ function resolvePresencePayloads(
     join(
       from(objectLocation),
       and(
-        eq(getKey<string>(presenceFocus.payload, value('objectId')), objectLocation.objectId),
-        eq(getKey<string>(presenceFocus.payload, value('runtime')), objectLocation.runtime),
-        eq(getKey<string>(presenceFocus.payload, value('relation')), objectLocation.relation),
-        eq(getKey<unknown>(presenceFocus.payload, value('key')), objectLocation.$.key)
+        eq(getKey<string>(presenceFocus.row.payload, value('objectId')), objectLocation.row.objectId),
+        eq(getKey<string>(presenceFocus.row.payload, value('runtime')), objectLocation.row.runtime),
+        eq(getKey<string>(presenceFocus.row.payload, value('relation')), objectLocation.row.relation),
+        eq(getKey<unknown>(presenceFocus.row.payload, value('key')), objectLocation.row.key)
       )
     ),
     project({
-      peer: presenceFocus.peer,
-      objectId: objectLocation.objectId,
-      runtime: objectLocation.runtime,
-      path: objectLocation.pathSegments,
-      relation: objectLocation.relation,
-      key: objectLocation.$.key
+      peer: presenceFocus.row.peer,
+      objectId: objectLocation.row.objectId,
+      runtime: objectLocation.row.runtime,
+      path: objectLocation.row.pathSegments,
+      relation: objectLocation.row.relation,
+      key: objectLocation.row.key
     })
   );
 
@@ -384,18 +384,18 @@ function resolvePresencePayloadsByObjectIdAndPath(
     join(
       from(objectLocation),
       and(
-        eq(getKey<string>(presenceFocus.payload, value('objectId')), objectLocation.objectId),
-        eq(getKey<string>(presenceFocus.payload, value('runtime')), objectLocation.runtime),
-        eq(getKey<string>(presenceFocus.payload, value('path')), objectLocation.path)
+        eq(getKey<string>(presenceFocus.row.payload, value('objectId')), objectLocation.row.objectId),
+        eq(getKey<string>(presenceFocus.row.payload, value('runtime')), objectLocation.row.runtime),
+        eq(getKey<string>(presenceFocus.row.payload, value('path')), objectLocation.row.path)
       )
     ),
     project({
-      peer: presenceFocus.peer,
-      objectId: objectLocation.objectId,
-      runtime: objectLocation.runtime,
-      path: objectLocation.pathSegments,
-      relation: objectLocation.relation,
-      key: objectLocation.$.key
+      peer: presenceFocus.row.peer,
+      objectId: objectLocation.row.objectId,
+      runtime: objectLocation.row.runtime,
+      path: objectLocation.row.pathSegments,
+      relation: objectLocation.row.relation,
+      key: objectLocation.row.key
     })
   );
 
@@ -421,15 +421,15 @@ function resolvePresencePayloadsByObjectId(
     presenceFocus,
     join(
       from(objectLocation),
-      eq(getKey<string>(presenceFocus.payload, value('objectId')), objectLocation.objectId)
+      eq(getKey<string>(presenceFocus.row.payload, value('objectId')), objectLocation.row.objectId)
     ),
     project({
-      peer: presenceFocus.peer,
-      objectId: objectLocation.objectId,
-      runtime: objectLocation.runtime,
-      path: objectLocation.pathSegments,
-      relation: objectLocation.relation,
-      key: objectLocation.$.key
+      peer: presenceFocus.row.peer,
+      objectId: objectLocation.row.objectId,
+      runtime: objectLocation.row.runtime,
+      path: objectLocation.row.pathSegments,
+      relation: objectLocation.row.relation,
+      key: objectLocation.row.key
     })
   );
 

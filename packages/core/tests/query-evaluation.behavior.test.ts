@@ -1,9 +1,11 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { createDb, q, qMany, qManyResult, qResult } from '@tarstate/core/db';
 import { mat } from '@tarstate/core/materialization';
+import { defineSchema, jsonField, relation } from '@tarstate/core/schema';
 import {
   aggregate,
   any as anyAggregate,
+  as,
   asc,
   bottom,
   bottomBy,
@@ -69,15 +71,15 @@ describe('query evaluation behavior', () => {
     const db = makeDb();
     const positiveEntries = pipe(
       from(entry),
-      where(gt(entry.amount, value(0))),
-      project({ id: entry.id, amount: entry.amount })
+      where(gt(entry.row.amount, value(0))),
+      project({ id: entry.row.id, amount: entry.row.amount })
     );
     const totals = pipe(
       from(entry),
       aggregate({
         aggregates: {
           entryCount: count(),
-          total: sum(entry.amount)
+          total: sum(entry.row.amount)
         }
       })
     );
@@ -110,8 +112,8 @@ describe('query evaluation behavior', () => {
     const amounts = pipe(
       from(entry),
       project({
-        id: entry.id,
-        amount: entry.amount
+        id: entry.row.id,
+        amount: entry.row.amount
       })
     );
 
@@ -169,8 +171,8 @@ describe('query evaluation behavior', () => {
     const amounts = pipe(
       from(entry),
       project({
-        id: entry.id,
-        amount: entry.amount
+        id: entry.row.id,
+        amount: entry.row.amount
       })
     );
     let firstMapCalls = 0;
@@ -221,19 +223,19 @@ describe('query evaluation behavior', () => {
 
   it('distinguishes null from missing fields', () => {
     const db = makeDb();
-    const nullMemo = pipe(from(entry), where(isNull(entry.memo)), project({ id: entry.id }));
-    const missingMemo = pipe(from(entry), where(isMissing(entry.memo)), project({ id: entry.id }));
+    const nullMemo = pipe(from(entry), where(isNull(entry.row.memo)), project({ id: entry.row.id }));
+    const missingMemo = pipe(from(entry), where(isMissing(entry.row.memo)), project({ id: entry.row.id }));
     const presentMemo = pipe(
       from(entry),
-      where(notMissing(entry.memo)),
-      sort(asc(entry.id)),
-      project({ id: entry.id })
+      where(notMissing(entry.row.memo)),
+      sort(asc(entry.row.id)),
+      project({ id: entry.row.id })
     );
     const nonNullMemo = pipe(
       from(entry),
-      where(notNull(entry.memo)),
-      sort(asc(entry.id)),
-      project({ id: entry.id })
+      where(notNull(entry.row.memo)),
+      sort(asc(entry.row.id)),
+      project({ id: entry.row.id })
     );
 
     expect(q(db, nullMemo)).toEqual([{ id: 'e3' }]);
@@ -242,15 +244,41 @@ describe('query evaluation behavior', () => {
     expect(q(db, nonNullMemo)).toEqual([{ id: 'e1' }, { id: 'e2' }]);
   });
 
+  it('compares JSON field values structurally', () => {
+    const jsonSchema = defineSchema({
+      nodes: relation({
+        key: 'key',
+        fields: {
+          key: jsonField(),
+          parentKey: jsonField()
+        }
+      })
+    });
+    const node = as(jsonSchema.nodes, 'node');
+    const db = createDb({
+      nodes: [
+        { key: [], parentKey: null },
+        { key: [0], parentKey: [] },
+        { key: [1], parentKey: [] }
+      ]
+    });
+
+    expect(q(db, pipe(from(node), where(eq(node.row.key, env('key')))), { env: { key: [] } })).toEqual([{ key: [], parentKey: null }]);
+    expect(q(db, pipe(from(node), where(eq(node.row.parentKey, env('key')))), { env: { key: [] } })).toEqual([
+      { key: [0], parentKey: [] },
+      { key: [1], parentKey: [] }
+    ]);
+  });
+
   it('projects, extends, removes, renames, and qualifies rows', () => {
     const rows = q(
       makeDb(),
       pipe(
         from(account),
-        where(eq(account.id, value('cash'))),
+        where(eq(account.row.id, value('cash'))),
         extend({
-          label: account.$.name,
-          stableKind: account.$.kind
+          label: account.row.name,
+          stableKind: account.row.kind
         }),
         without('kind'),
         rename({ label: 'displayName' }),
@@ -300,31 +328,31 @@ describe('query evaluation behavior', () => {
     const byClause = pipe(
       from(entry),
       join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
-      sort(asc(entry.id)),
+      sort(asc(entry.row.id)),
       project({
-        entryId: entry.id,
-        accountName: account.$.name,
-        amount: entry.amount
+        entryId: entry.row.id,
+        accountName: account.row.name,
+        amount: entry.row.amount
       })
     );
     const byPredicate = pipe(
       from(entry),
-      join(from(account), eq(entry.accountId, account.id)),
-      sort(asc(entry.id)),
+      join(from(account), eq(entry.row.accountId, account.row.id)),
+      sort(asc(entry.row.id)),
       project({
-        entryId: entry.id,
-        accountName: account.$.name,
-        amount: entry.amount
+        entryId: entry.row.id,
+        accountName: account.row.name,
+        amount: entry.row.amount
       })
     );
     const withOptionalEntries = pipe(
       from(account),
       leftJoin(from(entry), clauses<Account, Entry>({ id: 'accountId' })),
-      sort(asc(account.id), asc(entry.id, 'last')),
+      sort(asc(account.row.id), asc(entry.row.id, 'last')),
       project({
-        accountId: account.id,
-        accountName: account.$.name,
-        entryId: maybe(entry.id)
+        accountId: account.row.id,
+        accountName: account.row.name,
+        entryId: maybe(entry.row.id)
       })
     );
 
@@ -368,14 +396,14 @@ describe('query evaluation behavior', () => {
   });
 
   it('evaluates correlated selections and single-row selections', () => {
-    const entriesForAccount = pipe(from(entry), sort(asc(entry.id)));
+    const entriesForAccount = pipe(from(entry), sort(asc(entry.row.id)));
     const rows = q(
       makeDb(),
       pipe(
         from(account),
-        where(eq(account.id, value('cash'))),
+        where(eq(account.row.id, value('cash'))),
         project({
-          id: account.id,
+          id: account.row.id,
           entries: sel(entriesForAccount, correlate<Account, Entry>({ id: 'accountId' })),
           firstEntry: sel1(entriesForAccount, correlate<Account, Entry>({ id: 'accountId' }))
         })
@@ -403,12 +431,12 @@ describe('query evaluation behavior', () => {
     });
     const selectedEntries = pipe(
       from(entry),
-      where(eq(entry.accountId, env<string>('selectedAccount'))),
-      where(gte(entry.amount, env<number>('minimumAmount'))),
-      sort(asc(entry.id)),
+      where(eq(entry.row.accountId, env<string>('selectedAccount'))),
+      where(gte(entry.row.amount, env<number>('minimumAmount'))),
+      sort(asc(entry.row.id)),
       project({
-        id: entry.id,
-        amount: entry.amount
+        id: entry.row.id,
+        amount: entry.row.amount
       })
     );
     const summary = pipe(
@@ -432,11 +460,11 @@ describe('query evaluation behavior', () => {
     const summary = pipe(
       from(entry),
       aggregate({
-        groupBy: { accountId: entry.accountId },
+        groupBy: { accountId: entry.row.accountId },
         aggregates: {
           entryCount: count(),
-          total: sum(entry.amount),
-          largest: max(entry.amount)
+          total: sum(entry.row.amount),
+          largest: max(entry.row.amount)
         }
       }),
       sort(asc(field<string>('row', 'accountId'))),
@@ -449,10 +477,10 @@ describe('query evaluation behavior', () => {
     );
     const largestOutflows = pipe(
       from(entry),
-      where(lte(entry.amount, value(0))),
-      sort(asc(entry.amount), desc(entry.id)),
+      where(lte(entry.row.amount, value(0))),
+      sort(asc(entry.row.amount), desc(entry.row.id)),
       limit(2),
-      project({ id: entry.id, amount: entry.amount })
+      project({ id: entry.row.id, amount: entry.row.amount })
     );
 
     expect(q(db, summary)).toEqual([
@@ -472,9 +500,9 @@ describe('query evaluation behavior', () => {
       from(entry),
       aggregate({
         aggregates: {
-          postedCount: count(eq(entry.posted, value(true))),
-          hasDraft: anyAggregate(eq(entry.posted, value(false))),
-          hasNoLargeOutflow: notAny(lte(entry.amount, value(-1_000)))
+          postedCount: count(eq(entry.row.posted, value(true))),
+          hasDraft: anyAggregate(eq(entry.row.posted, value(false))),
+          hasNoLargeOutflow: notAny(lte(entry.row.amount, value(-1_000)))
         }
       })
     );

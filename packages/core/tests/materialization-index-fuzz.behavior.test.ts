@@ -19,10 +19,10 @@ const amountValues = [-80, -21, -5, -1, 0, 1, 7, 7, 18, 42, 95] as const;
 const entryRows = pipe(
   from(entry),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount,
-    posted: entry.posted
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount,
+    posted: entry.row.posted
   })
 );
 

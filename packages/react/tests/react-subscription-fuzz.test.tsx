@@ -50,10 +50,10 @@ const schema = defineSchema({
 const item = as(schema.items, 'item');
 const itemQuery = pipe(
   from(item),
-  sort(asc(item.id)),
+  sort(asc(item.row.id)),
   project({
-    id: item.id,
-    label: item.label
+    id: item.row.id,
+    label: item.row.label
   })
 );
 const seeds = resolveFuzzSeeds([0x7e11, 0x7e12, 0x7e13, 0x7e14] as const);

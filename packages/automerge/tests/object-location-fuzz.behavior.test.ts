@@ -274,14 +274,14 @@ function assertObjectLocationInvariants(
       presenceFocus,
       join(
         from(runtimeLocation),
-        eq(getKey<string>(presenceFocus.payload, value('objectId')), runtimeLocation.objectId)
+        eq(getKey<string>(presenceFocus.row.payload, value('objectId')), runtimeLocation.row.objectId)
       ),
       project({
-        peer: presenceFocus.peer,
-        objectId: runtimeLocation.objectId,
-        path: runtimeLocation.pathSegments,
-        relation: runtimeLocation.relation,
-        key: runtimeLocation.$.key
+        peer: presenceFocus.row.peer,
+        objectId: runtimeLocation.row.objectId,
+        path: runtimeLocation.row.pathSegments,
+        relation: runtimeLocation.row.relation,
+        key: runtimeLocation.row.key
       })
     );
 

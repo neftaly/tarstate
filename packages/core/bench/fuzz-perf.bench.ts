@@ -190,16 +190,16 @@ function makeQuerySpecs(): readonly QuerySpec[] {
     shape: 'lookup' as const,
     query: pipe(
       from(entry),
-      where(eq(entry.accountId, value(accountId))),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      where(eq(entry.row.accountId, value(accountId))),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
     ) as Query<unknown>
   }));
   const scanQueries = [-10_000, -5_000, 0, 5_000].map((threshold) => ({
     shape: 'scan' as const,
     query: pipe(
       from(entry),
-      where(gte(entry.amount, value(threshold))),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      where(gte(entry.row.amount, value(threshold))),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
     ) as Query<unknown>
   }));
   const aggregateQueries = [
@@ -208,10 +208,10 @@ function makeQuerySpecs(): readonly QuerySpec[] {
       query: pipe(
         from(entry),
         aggregate({
-          groupBy: { accountId: entry.accountId },
+          groupBy: { accountId: entry.row.accountId },
           aggregates: {
             entryCount: count(),
-            total: sum(entry.amount)
+            total: sum(entry.row.amount)
           }
         }),
         sort(asc(field<string>('row', 'accountId')))
@@ -223,8 +223,8 @@ function makeQuerySpecs(): readonly QuerySpec[] {
       shape: 'topN' as const,
       query: pipe(
         from(entry),
-        sortLimit(TOP_N_COUNT, desc(entry.amount), asc(entry.id)),
-        project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+        sortLimit(TOP_N_COUNT, desc(entry.row.amount), asc(entry.row.id)),
+        project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
       ) as Query<unknown>
     }
   ];

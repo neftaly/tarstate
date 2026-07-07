@@ -107,8 +107,8 @@ describe('store view snapshot caching', () => {
   it('checks env-dependent views when env changes alongside unrelated relation deltas', async () => {
     const accountByEnvId = pipe(
       from(account),
-      where(eq(account.id, env<string>('accountId'))),
-      sort(asc(account.id))
+      where(eq(account.row.id, env<string>('accountId'))),
+      sort(asc(account.row.id))
     );
     const store = createStore(withEnv(makeDb(), { accountId: 'cash' }));
     const view = store.view(accountByEnvId);

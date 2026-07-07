@@ -174,9 +174,9 @@ function commitAndReadChurnedFanout(): () => Promise<void> {
 function entryQueryFor(accountId: string): Query<unknown> {
   return pipe(
     from(entry),
-    where(eq(entry.accountId, value(accountId))),
-    sort(asc(entry.id)),
-    project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted })
+    where(eq(entry.row.accountId, value(accountId))),
+    sort(asc(entry.row.id)),
+    project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted })
   ) as Query<unknown>;
 }
 

@@ -86,8 +86,8 @@ describe('qMany seeded duplicate cache behavior', () => {
       const marker = hostFn<number>(`qMany.fuzz.marker.${seed}`, () => ++hostCalls);
       const hostQuery = () => pipe(
         from(entry),
-        sort(asc(entry.id)),
-        project({ id: entry.id, marker: call(marker) })
+        sort(asc(entry.row.id)),
+        project({ id: entry.row.id, marker: call(marker) })
       );
       const hostDb = countedEntriesDb();
       const hostResult = qManyResult(hostDb.db, { first: hostQuery(), duplicate: hostQuery() });
@@ -131,35 +131,35 @@ function safeFactoryVariants(seed: number): readonly QueryFactory[] {
       label: `posted:${posted}`,
       make: () => pipe(
         from(entry),
-        where(eq(entry.posted, value(posted))),
-        sort(asc(entry.id)),
-        project({ id: entry.id })
+        where(eq(entry.row.posted, value(posted))),
+        sort(asc(entry.row.id)),
+        project({ id: entry.row.id })
       )
     },
     {
       label: `account:${accountId}`,
       make: () => pipe(
         from(entry),
-        where(eq(entry.accountId, value(accountId))),
-        sort(asc(entry.id)),
-        project({ id: entry.id, accountId: entry.accountId })
+        where(eq(entry.row.accountId, value(accountId))),
+        sort(asc(entry.row.id)),
+        project({ id: entry.row.id, accountId: entry.row.accountId })
       )
     },
     {
       label: `amount:${amount}`,
       make: () => pipe(
         from(entry),
-        where(gt(entry.amount, value(amount))),
-        sort(asc(entry.id)),
-        project({ id: entry.id, amount: entry.amount })
+        where(gt(entry.row.amount, value(amount))),
+        sort(asc(entry.row.id)),
+        project({ id: entry.row.id, amount: entry.row.amount })
       )
     },
     {
       label: 'plain-sort',
       make: () => pipe(
         from(entry),
-        sort(asc(field<string>('row', 'accountId')), asc(entry.id)),
-        project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+        sort(asc(field<string>('row', 'accountId')), asc(entry.row.id)),
+        project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
       )
     }
   ];
@@ -179,7 +179,7 @@ function assertUnsafeDuplicateReads(
 }
 
 function entryIds(): Query<IdRow> {
-  return pipe(from(entry), project({ id: entry.id }));
+  return pipe(from(entry), project({ id: entry.row.id }));
 }
 
 function countedEntriesDb(rows: readonly Entry[] = openingEntries): { readonly db: Db; readonly reads: () => number } {
@@ -219,20 +219,20 @@ function batchCase(seed: number): BatchCase {
   const projected = () => pipe(
     from(entry),
     project({
-      id: entry.id,
-      accountId: entry.accountId,
-      amount: entry.amount,
-      posted: entry.posted
+      id: entry.row.id,
+      accountId: entry.row.accountId,
+      amount: entry.row.amount,
+      posted: entry.row.posted
     })
   );
   const envFiltered = () => pipe(
     from(entry),
-    where(gte(entry.amount, env<number>('minAmount'))),
+    where(gte(entry.row.amount, env<number>('minAmount'))),
     project({
-      id: entry.id,
-      accountId: entry.accountId,
-      amount: entry.amount,
-      posted: entry.posted
+      id: entry.row.id,
+      accountId: entry.row.accountId,
+      amount: entry.row.amount,
+      posted: entry.row.posted
     })
   );
   const materializedQuery = projected();

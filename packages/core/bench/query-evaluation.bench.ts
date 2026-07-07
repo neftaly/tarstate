@@ -25,29 +25,29 @@ const unconstrainedComposed = composedLookupSource(rows, false);
 const equalityQueries = accountIds.slice(0, QUERY_VARIANT_COUNT).map((accountId) =>
   pipe(
     from(entry),
-    where(eq(entry.accountId, value(accountId))),
-    project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+    where(eq(entry.row.accountId, value(accountId))),
+    project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
   )
 ) satisfies readonly Query<unknown>[];
 const rangeQueries = Array.from({ length: QUERY_VARIANT_COUNT }, (_, index) => 46_000 + index * 250).map((lower) =>
   pipe(
     from(entry),
-    where(gte(entry.amount, value(lower))),
-    project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+    where(gte(entry.row.amount, value(lower))),
+    project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
   )
 ) satisfies readonly Query<unknown>[];
 const joinQueries = [
   pipe(
     from(entry),
     join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
-    project({ id: entry.id, accountId: entry.accountId, accountName: account.$.name, amount: entry.amount })
+    project({ id: entry.row.id, accountId: entry.row.accountId, accountName: account.row.name, amount: entry.row.amount })
   )
 ] satisfies readonly Query<unknown>[];
 const predicateJoinQueries = [
   pipe(
     from(entry),
-    join(from(account), eq(entry.accountId, account.id)),
-    project({ id: entry.id, accountId: entry.accountId, accountName: account.$.name, amount: entry.amount })
+    join(from(account), eq(entry.row.accountId, account.row.id)),
+    project({ id: entry.row.id, accountId: entry.row.accountId, accountName: account.row.name, amount: entry.row.amount })
   )
 ] satisfies readonly Query<unknown>[];
 

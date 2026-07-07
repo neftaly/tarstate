@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { createDb, exists, row, tryTransact, type Db } from '@tarstate/core/db';
+import { createDb, exists, q, row, tryTransact, type Db } from '@tarstate/core/db';
+import { lookup } from '@tarstate/core/query';
 import {
   booleanField,
   customField,
   defineSchema,
+  jsonField,
   numberField,
   relation,
   stringField,
+  type FieldSpec,
   type RelationRef
 } from '@tarstate/core/schema';
 import {
@@ -64,6 +67,12 @@ type CaseFoldedKeyRow = {
 
 type ScaledNumberKeyRow = {
   readonly id: number;
+  readonly label: string;
+  readonly visits: number;
+};
+
+type ArrayKeyRow = {
+  readonly key: readonly number[];
   readonly label: string;
   readonly visits: number;
 };
@@ -186,10 +195,48 @@ const relationKeyFuzzSchema = defineSchema({
       label: stringField(),
       visits: numberField()
     }
+  }),
+  arrayKeys: relation<ArrayKeyRow, 'key'>({
+    key: 'key',
+    fields: {
+      key: jsonField() as FieldSpec<readonly number[]>,
+      label: stringField(),
+      visits: numberField()
+    }
   })
 });
 
 describe('RelationKeyInput seeded fuzz behavior', () => {
+  it('reads and writes single-field JSON array keys as one key value', () => {
+    const db = createDb({
+      arrayKeys: [
+        { key: [1, 2, 3], label: 'first', visits: 1 },
+        { key: [2, 3, 4], label: 'second', visits: 2 }
+      ]
+    });
+
+    expect(row(db, relationKeyFuzzSchema.arrayKeys, [1, 2, 3] as const)).toEqual({
+      key: [1, 2, 3],
+      label: 'first',
+      visits: 1
+    });
+    expect(exists(db, relationKeyFuzzSchema.arrayKeys, [2, 3, 4] as const)).toBe(true);
+    expect(q(db, lookup(relationKeyFuzzSchema.arrayKeys, 'key', [1, 2, 3] as const))).toEqual([
+      { key: [1, 2, 3], label: 'first', visits: 1 }
+    ]);
+
+    const updated = tryTransact(
+      db,
+      updateByKey(relationKeyFuzzSchema.arrayKeys, [1, 2, 3] as const, { label: 'updated' })
+    );
+    expect(updated.committed).toBe(true);
+    expect(row(updated.db, relationKeyFuzzSchema.arrayKeys, [1, 2, 3] as const)?.label).toBe('updated');
+
+    const deleted = tryTransact(updated.db, deleteByKey(relationKeyFuzzSchema.arrayKeys, [2, 3, 4] as const));
+    expect(deleted.committed).toBe(true);
+    expect(exists(deleted.db, relationKeyFuzzSchema.arrayKeys, [2, 3, 4] as const)).toBe(false);
+  });
+
   it('reads and writes generated primitive and composite scalar keys', () => {
     for (const seed of fuzzSeeds) {
       const primitiveKeyFixture = makePrimitiveRelationKeyFixture(seed);

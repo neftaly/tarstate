@@ -8,11 +8,11 @@ describe('materialization env behavior', () => {
   it('refreshes materialized query rows when dependent env values change', () => {
     const envFilteredEntries = pipe(
       from(entry),
-      where(eq(entry.accountId, env<string>('accountId'))),
-      sort(asc(entry.id)),
+      where(eq(entry.row.accountId, env<string>('accountId'))),
+      sort(asc(entry.row.id)),
       project({
-        id: entry.id,
-        accountId: entry.accountId
+        id: entry.row.id,
+        accountId: entry.row.accountId
       })
     );
     const db = mat(createDb(makeDb().data, { env: { accountId: 'cash' } }), envFilteredEntries);
@@ -39,9 +39,9 @@ describe('materialization env behavior', () => {
 
     const envProjectedEntry = pipe(
       from(entry),
-      where(eq(entry.id, value('e1'))),
+      where(eq(entry.row.id, value('e1'))),
       project({
-        id: entry.id,
+        id: entry.row.id,
         stamp: env<Date>('stamp'),
         marker: env<EnvMarker>('marker')
       })
@@ -74,11 +74,11 @@ describe('materialization env behavior', () => {
   it('does not throw when setEnvTx touches another key while env contains a cyclic object', () => {
     const envFilteredEntries = pipe(
       from(entry),
-      where(eq(entry.accountId, env<string>('accountId'))),
-      sort(asc(entry.id)),
+      where(eq(entry.row.accountId, env<string>('accountId'))),
+      sort(asc(entry.row.id)),
       project({
-        id: entry.id,
-        accountId: entry.accountId
+        id: entry.row.id,
+        accountId: entry.row.accountId
       })
     );
     const cyclic: Record<string, unknown> = {};
@@ -102,11 +102,11 @@ describe('materialization env behavior', () => {
   it('refreshes materialized query rows when setEnvTx mutates env in place', () => {
     const envFilteredEntries = pipe(
       from(entry),
-      where(eq(entry.accountId, env<string>('accountId'))),
-      sort(asc(entry.id)),
+      where(eq(entry.row.accountId, env<string>('accountId'))),
+      sort(asc(entry.row.id)),
       project({
-        id: entry.id,
-        accountId: entry.accountId
+        id: entry.row.id,
+        accountId: entry.row.accountId
       })
     );
     const db = mat(createDb(makeDb().data, { env: { accountId: 'cash' } }), envFilteredEntries);
@@ -147,9 +147,9 @@ describe('materialization env behavior', () => {
   it('refreshes materialized query rows when setEnvTx mutates Map and Set env internals in place', () => {
     const envProjectedEntry = pipe(
       from(entry),
-      where(eq(entry.id, value('e1'))),
+      where(eq(entry.row.id, value('e1'))),
       project({
-        id: entry.id,
+        id: entry.row.id,
         routing: env<Map<string, string>>('routing'),
         flags: env<Set<string>>('flags')
       })

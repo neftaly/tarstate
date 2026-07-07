@@ -55,20 +55,20 @@ type UnsupportedVariant = {
 
 const cashEntryProjection = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
+  where(eq(entry.row.accountId, value('cash'))),
   project({
-    id: entry.id,
-    amount: entry.amount
+    id: entry.row.id,
+    amount: entry.row.amount
   })
 );
 
 const sortedEntryProjection = pipe(
   from(entry),
-  sort(asc(entry.id)),
+  sort(asc(entry.row.id)),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount
   })
 );
 
@@ -79,7 +79,7 @@ const entryCount = pipe(
 
 const firstTwoEntries = pipe(
   from(entry),
-  sort(asc(entry.id)),
+  sort(asc(entry.row.id)),
   limit(2)
 );
 
@@ -96,15 +96,15 @@ const supportedVariants: readonly SupportedVariant[] = [
   },
   {
     label: 'final sort',
-    query: pipe(from(entry), sort(asc(entry.amount), asc(entry.id))) as Query<unknown>,
+    query: pipe(from(entry), sort(asc(entry.row.amount), asc(entry.row.id))) as Query<unknown>,
     keyBy: pathKey('id')
   },
   {
     label: 'filtered projection',
     query: pipe(
       from(entry),
-      where(gte(entry.amount, value(-75))),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      where(gte(entry.row.amount, value(-75))),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
     ) as Query<unknown>,
     keyBy: pathKey('id')
   },
@@ -112,7 +112,7 @@ const supportedVariants: readonly SupportedVariant[] = [
     label: 'renamed projection key',
     query: pipe(
       from(entry),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount }),
       rename({ id: 'entryId' })
     ) as Query<unknown>,
     keyBy: pathKey('entryId')
@@ -121,9 +121,9 @@ const supportedVariants: readonly SupportedVariant[] = [
     label: 'sort before project preserving sort keys',
     query: pipe(
       from(entry),
-      where(eq(entry.accountId, value('cash'))),
-      sort(asc(entry.amount), asc(entry.id)),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      where(eq(entry.row.accountId, value('cash'))),
+      sort(asc(entry.row.amount), asc(entry.row.id)),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
     ) as Query<unknown>,
     keyBy: pathKey('id')
   },
@@ -131,7 +131,7 @@ const supportedVariants: readonly SupportedVariant[] = [
     label: 'qualified rows',
     query: pipe(
       from(entry),
-      where(eq(entry.posted, value(true))),
+      where(eq(entry.row.posted, value(true))),
       qualify('entry')
     ) as Query<unknown>,
     keyBy: pathKey('entry', 'id')
@@ -155,13 +155,13 @@ const supportedVariants: readonly SupportedVariant[] = [
     query: pipe(
       from(entry),
       aggregate({
-        groupBy: { accountId: entry.accountId },
+        groupBy: { accountId: entry.row.accountId },
         aggregates: {
           entryCount: count(),
-          lowest: min(entry.amount),
-          highest: max(entry.amount),
-          average: avg(entry.amount),
-          total: sum(entry.amount)
+          lowest: min(entry.row.amount),
+          highest: max(entry.row.amount),
+          average: avg(entry.row.amount),
+          total: sum(entry.row.amount)
         }
       }),
       sort(asc(field<string>('row', 'accountId')))
@@ -172,9 +172,9 @@ const supportedVariants: readonly SupportedVariant[] = [
     label: 'top-N sort limit projection',
     query: pipe(
       from(entry),
-      sort(desc(entry.amount), asc(entry.id)),
+      sort(desc(entry.row.amount), asc(entry.row.id)),
       limit(3),
-      project({ id: entry.id, amount: entry.amount })
+      project({ id: entry.row.id, amount: entry.row.amount })
     ) as Query<unknown>,
     keyBy: pathKey('id')
   }
@@ -182,14 +182,14 @@ const supportedVariants: readonly SupportedVariant[] = [
 
 const positiveEntryIds = pipe(
   from(entry),
-  where(gte(entry.amount, value(0))),
-  project({ id: entry.id })
+  where(gte(entry.row.amount, value(0))),
+  project({ id: entry.row.id })
 );
 
 const postedEntryIds = pipe(
   from(entry),
-  where(eq(entry.posted, value(true))),
-  project({ id: entry.id })
+  where(eq(entry.row.posted, value(true))),
+  project({ id: entry.row.id })
 );
 
 type DeclaredIndexVariant = {
@@ -206,7 +206,7 @@ const declaredIndexVariants: readonly DeclaredIndexVariant[] = [
     field: 'accountId',
     query: pipe(
       from(entry),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted }),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted }),
       hash(field<string>('row', 'accountId'))
     ) as Query<unknown>
   },
@@ -216,7 +216,7 @@ const declaredIndexVariants: readonly DeclaredIndexVariant[] = [
     field: 'amount',
     query: pipe(
       from(entry),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted }),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted }),
       btree(field<number>('row', 'amount'))
     ) as Query<unknown>
   },
@@ -226,7 +226,7 @@ const declaredIndexVariants: readonly DeclaredIndexVariant[] = [
     field: 'accountId',
     query: pipe(
       from(entry),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount, posted: entry.posted }),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount, posted: entry.row.posted }),
       uniqueIndex(field<string>('row', 'accountId'))
     ) as Query<unknown>
   }
@@ -236,13 +236,13 @@ const joinedEntryAccounts = pipe(
   from(entry),
   join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    amount: entry.amount,
-    posted: entry.posted,
-    accountName: account.$.name,
-    accountKind: account.$.kind
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    amount: entry.row.amount,
+    posted: entry.row.posted,
+    accountName: account.row.name,
+    accountKind: account.row.kind
   })
 ) as Query<unknown>;
 
@@ -259,16 +259,16 @@ const unsupportedVariants: readonly UnsupportedVariant[] = [
     label: 'non-final sort',
     query: pipe(
       from(entry),
-      sort(asc(entry.amount)),
-      where(eq(entry.posted, value(true)))
+      sort(asc(entry.row.amount)),
+      where(eq(entry.row.posted, value(true)))
     ) as Query<unknown>
   },
   {
     label: 'project drops sort key',
     query: pipe(
       from(entry),
-      sort(asc(entry.amount)),
-      project({ id: entry.id })
+      sort(asc(entry.row.amount)),
+      project({ id: entry.row.id })
     ) as Query<unknown>
   },
   {

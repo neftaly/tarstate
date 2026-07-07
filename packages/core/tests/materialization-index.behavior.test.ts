@@ -22,10 +22,10 @@ type EntryIndexRow = {
 const entryRows = pipe(
   from(entry),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount,
-    posted: entry.posted
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount,
+    posted: entry.row.posted
   })
 );
 
@@ -35,7 +35,7 @@ const entriesByAmount = pipe(entryRows, btree(field<number>('row', 'amount')));
 const entriesById = pipe(entryRows, uniqueIndex(field<string>('row', 'id')));
 const unavailableAccountIndex = pipe(
   from(entry),
-  project({ id: entry.id }),
+  project({ id: entry.row.id }),
   hash(field<string>('row', 'accountId'))
 );
 

@@ -73,5 +73,5 @@ export function makeDb(): Db {
   });
 }
 
-export const accountsById = pipe(from(account), sort(asc(account.id)));
-export const entriesById = pipe(from(entry), sort(asc(entry.id)));
+export const accountsById = pipe(from(account), sort(asc(account.row.id)));
+export const entriesById = pipe(from(entry), sort(asc(entry.row.id)));

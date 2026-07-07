@@ -64,21 +64,21 @@ const expandSchema = defineSchema({
 
 const sortedCashEntryProjection = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
-  sort(asc(entry.amount), asc(entry.id)),
+  where(eq(entry.row.accountId, value('cash'))),
+  sort(asc(entry.row.amount), asc(entry.row.id)),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount
   })
 );
 
 const cashEntryProjection = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
+  where(eq(entry.row.accountId, value('cash'))),
   project({
-    id: entry.id,
-    amount: entry.amount
+    id: entry.row.id,
+    amount: entry.row.amount
   })
 );
 
@@ -90,10 +90,10 @@ const entryCount = pipe(
 const entryTotalsByAccount = pipe(
   from(entry),
   aggregate({
-    groupBy: { accountId: entry.accountId },
+    groupBy: { accountId: entry.row.accountId },
     aggregates: {
       entryCount: count(),
-      total: sum(entry.amount)
+      total: sum(entry.row.amount)
     }
   }),
   sort(asc(field<string>('row', 'accountId')))
@@ -171,7 +171,7 @@ describe('materialization maintenance behavior', () => {
   it('recomputes top-N when the final sort does not include materialized identity', () => {
     const query = pipe(
       from(entry),
-      sort(desc(entry.amount)),
+      sort(desc(entry.row.amount)),
       limit(2)
     );
     const reason = 'top-N incremental maintenance requires final sort to include materialized identity';
@@ -211,7 +211,7 @@ describe('materialization maintenance behavior', () => {
   it('recomputes top-N limits with offsets', () => {
     const query = pipe(
       from(entry),
-      sort(asc(entry.id)),
+      sort(asc(entry.row.id)),
       limit(2, 1)
     );
     const reason = 'top-N incremental maintenance does not support offset';
@@ -251,9 +251,9 @@ describe('materialization maintenance behavior', () => {
   it('recomputes sort-before-project when the projection drops a sort key', () => {
     const query = pipe(
       from(entry),
-      where(eq(entry.accountId, value('cash'))),
-      sort(asc(entry.amount), asc(entry.id)),
-      project({ id: entry.id, accountId: entry.accountId })
+      where(eq(entry.row.accountId, value('cash'))),
+      sort(asc(entry.row.amount), asc(entry.row.id)),
+      project({ id: entry.row.id, accountId: entry.row.accountId })
     );
     const reason = 'sort-before-project requires final projection to preserve sort keys';
     const db = mat(makeDb(), query);
@@ -292,8 +292,8 @@ describe('materialization maintenance behavior', () => {
   it('falls back for non-total final sort ties when an earlier filtered source row enters', () => {
     const query = pipe(
       from(entry),
-      where(eq(entry.posted, value(true))),
-      sort(asc(entry.amount))
+      where(eq(entry.row.posted, value(true))),
+      sort(asc(entry.row.amount))
     );
     const db = mat(createDb({
       accounts: makeDb().data.accounts ?? [],
@@ -481,7 +481,7 @@ describe('materialization maintenance behavior', () => {
   it('falls back with explicit diagnostics for unsupported incremental shapes', () => {
     const projectedEntries = pipe(
       from(entry),
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount })
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount })
     );
     const cases: readonly { readonly label: string; readonly query: Query<unknown>; readonly reason: string }[] = [
       {
@@ -493,7 +493,7 @@ describe('materialization maintenance behavior', () => {
         label: 'aggregate projection',
         query: pipe(
           from(entry),
-          project({ id: entry.id, total: sum(entry.amount) })
+          project({ id: entry.row.id, total: sum(entry.row.amount) })
         ) as Query<unknown>,
         reason: 'aggregate projection is not incrementally maintained'
       },
@@ -501,8 +501,8 @@ describe('materialization maintenance behavior', () => {
         label: 'non-final sort',
         query: pipe(
           from(entry),
-          sort(asc(entry.id)),
-          where(eq(entry.accountId, value('cash')))
+          sort(asc(entry.row.id)),
+          where(eq(entry.row.accountId, value('cash')))
         ) as Query<unknown>,
         reason: 'non-final sort queries are not incrementally maintained'
       },
@@ -513,14 +513,14 @@ describe('materialization maintenance behavior', () => {
       },
       {
         label: 'join',
-        query: pipe(from(entry), join(from(account), eq(entry.accountId, account.id))) as Query<unknown>,
+        query: pipe(from(entry), join(from(account), eq(entry.row.accountId, account.row.id))) as Query<unknown>,
         reason: 'predicate join queries are not incrementally maintained'
       },
       {
         label: 'set operation',
         query: union(
-          pipe(projectedEntries, where(eq(entry.accountId, value('cash')))),
-          pipe(projectedEntries, where(eq(entry.accountId, value('sales'))))
+          pipe(projectedEntries, where(eq(entry.row.accountId, value('cash')))),
+          pipe(projectedEntries, where(eq(entry.row.accountId, value('sales'))))
         ) as Query<unknown>,
         reason: 'set operation queries are not incrementally maintained'
       },
@@ -528,7 +528,7 @@ describe('materialization maintenance behavior', () => {
         label: 'selected subquery',
         query: pipe(
           from(entry),
-          project({ id: entry.id, accounts: sel(from(account)) })
+          project({ id: entry.row.id, accounts: sel(from(account)) })
         ) as Query<unknown>,
         reason: 'correlated or selected subqueries are not incrementally maintained'
       },

@@ -44,7 +44,7 @@ function unsupportedAggregateCases(doubleAmount: ReturnType<typeof hostFn<number
   return [
     {
       label: 'top aggregate',
-      query: pipe(from(entry), aggregate({ groupBy: { accountId: entry.accountId }, aggregates: { amounts: top(entry.amount, 2) } })) as Query<unknown>,
+      query: pipe(from(entry), aggregate({ groupBy: { accountId: entry.row.accountId }, aggregates: { amounts: top(entry.row.amount, 2) } })) as Query<unknown>,
       reason: 'aggregate function "top" is not incrementally maintained'
     },
     {
@@ -52,8 +52,8 @@ function unsupportedAggregateCases(doubleAmount: ReturnType<typeof hostFn<number
       query: pipe(
         from(entry),
         aggregate({
-          groupBy: { accountId: entry.accountId },
-          aggregates: { average: avg(call(doubleAmount, entry.amount)) }
+          groupBy: { accountId: entry.row.accountId },
+          aggregates: { average: avg(call(doubleAmount, entry.row.amount)) }
         }),
         sort(asc(field<string>('row', 'accountId')))
       ) as Query<unknown>,
@@ -64,8 +64,8 @@ function unsupportedAggregateCases(doubleAmount: ReturnType<typeof hostFn<number
       query: pipe(
         from(entry),
         aggregate({
-          groupBy: { accountId: entry.accountId },
-          aggregates: { total: sum(entry.amount) }
+          groupBy: { accountId: entry.row.accountId },
+          aggregates: { total: sum(entry.row.amount) }
         }),
         project({ total: field<number>('row', 'total') })
       ) as Query<unknown>,
@@ -76,8 +76,8 @@ function unsupportedAggregateCases(doubleAmount: ReturnType<typeof hostFn<number
       query: pipe(
         from(entry),
         aggregate({
-          groupBy: { accountId: entry.accountId },
-          aggregates: { total: sum(entry.amount) }
+          groupBy: { accountId: entry.row.accountId },
+          aggregates: { total: sum(entry.row.amount) }
         }),
         sort(asc(field<number>('row', 'total')))
       ) as Query<unknown>,
@@ -88,10 +88,10 @@ function unsupportedAggregateCases(doubleAmount: ReturnType<typeof hostFn<number
       query: pipe(
         from(entry),
         aggregate({
-          groupBy: { accountId: entry.accountId },
+          groupBy: { accountId: entry.row.accountId },
           aggregates: {
             entryCount: count(),
-            total: sum(entry.amount)
+            total: sum(entry.row.amount)
           }
         })
       ) as Query<unknown>,

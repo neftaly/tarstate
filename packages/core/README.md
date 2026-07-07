@@ -109,12 +109,12 @@ const assignment = as(schema.assignments, 'assignment')
 const todoRows = pipe(
   from(todo), // => [{ todo: { id: 'todo-a', ... } }, { todo: { id: 'todo-b', ... } }]
   // leftJoin appends matches from another query.
-  leftJoin(from(assignment), eq(todo.id, assignment.todoId)), // => [{ todo: { id: 'todo-a', ... }, assignment: { assignee: 'Mina', ... } }, { todo: { id: 'todo-b', ... } }]
+  leftJoin(from(assignment), eq(todo.row.id, assignment.row.todoId)), // => [{ todo: { id: 'todo-a', ... }, assignment: { assignee: 'Mina', ... } }, { todo: { id: 'todo-b', ... } }]
   // project formats the results nicely.
   project({
-    id: todo.id,
-    text: todo.text,
-    assignedTo: maybe(assignment.assignee),
+    id: todo.row.id,
+    text: todo.row.text,
+    assignedTo: maybe(assignment.row.assignee),
   }), // => [{ id: 'todo-a', assignedTo: 'Mina', ... }, { id: 'todo-b', assignedTo: undefined, ... }]
 )
 

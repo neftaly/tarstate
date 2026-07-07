@@ -163,8 +163,8 @@ describe('write and transaction behavior', () => {
       makeDb(),
       updateByKey(schema.entries, 'e1', {
         accountId: field('row', 'accountId'),
-        amount: call(add, entry.amount, value(8)),
-        memo: call(memoFromRow, entry.id, entry.accountId),
+        amount: call(add, entry.row.amount, value(8)),
+        memo: call(memoFromRow, entry.row.id, entry.row.accountId),
         posted: field('row', 'posted')
       })
     );
@@ -261,7 +261,7 @@ describe('write and transaction behavior', () => {
   it('applies predicate updates, exact deletes, and relation replacement writes', () => {
     const updated = transact(
       makeDb(),
-      update(schema.entries, eq(entry.accountId, value('cash')), {
+      update(schema.entries, eq(entry.row.accountId, value('cash')), {
         memo: 'cash movement',
         posted: true
       })
@@ -348,7 +348,7 @@ describe('write and transaction behavior', () => {
     expect(invalidResult.diagnostics).toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'field_missing', relation: 'entries', field: 'amount' })
     ]));
-    expect(q(db, pipe(from(entry), sort(asc(entry.id)), project({ id: entry.id })))).toEqual([
+    expect(q(db, pipe(from(entry), sort(asc(entry.row.id)), project({ id: entry.row.id })))).toEqual([
       { id: 'e1' },
       { id: 'e2' },
       { id: 'e3' },

@@ -38,75 +38,75 @@ import { entry, makeDb, schema } from './behavior-fixtures.js';
 
 const cashEntryList = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
-  sort(asc(entry.id)),
+  where(eq(entry.row.accountId, value('cash'))),
+  sort(asc(entry.row.id)),
   project({
-    id: entry.id,
-    amount: entry.amount
+    id: entry.row.id,
+    amount: entry.row.amount
   })
 );
 
 const cashEntryProjection = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
+  where(eq(entry.row.accountId, value('cash'))),
   project({
-    id: entry.id,
-    amount: entry.amount
+    id: entry.row.id,
+    amount: entry.row.amount
   })
 );
 
 const entryRows = pipe(
   from(entry),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount,
-    posted: entry.posted
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount,
+    posted: entry.row.posted
   })
 );
 
 const entryTotalsByAccount = pipe(
   from(entry),
   aggregate({
-    groupBy: { accountId: entry.accountId },
+    groupBy: { accountId: entry.row.accountId },
     aggregates: {
       entryCount: count(),
-      total: sum(entry.amount)
+      total: sum(entry.row.amount)
     }
   })
 );
 
 const entriesByAccount = pipe(entryRows, hash(field<string>('row', 'accountId')));
 const entriesByAmount = pipe(entryRows, btree(field<number>('row', 'amount')));
-const directEntriesByAccount = pipe(from(entry), hash(entry.accountId));
-const directEntriesById = pipe(from(entry), uniqueIndex(entry.id));
+const directEntriesByAccount = pipe(from(entry), hash(entry.row.accountId));
+const directEntriesById = pipe(from(entry), uniqueIndex(entry.row.id));
 
 const cashEntriesByBaseLookup = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
-  sort(asc(entry.id)),
+  where(eq(entry.row.accountId, value('cash'))),
+  sort(asc(entry.row.id)),
   project({
-    id: entry.id,
-    amount: entry.amount
+    id: entry.row.id,
+    amount: entry.row.amount
   })
 );
 
 const entryByIdBaseLookup = pipe(
   from(entry),
-  where(eq(entry.id, value('e2'))),
+  where(eq(entry.row.id, value('e2'))),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount
   })
 );
 
 const filteredProjectedEntriesByAccount = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
+  where(eq(entry.row.accountId, value('cash'))),
   project({
-    id: entry.id,
-    accountId: entry.accountId
+    id: entry.row.id,
+    accountId: entry.row.accountId
   }),
   hash(field<string>('row', 'accountId'))
 );
@@ -174,16 +174,16 @@ describe('materialized source behavior', () => {
   it('bypasses materialized cached rows when query options override env or functions', () => {
     const envFilteredEntries = pipe(
       from(entry),
-      where(eq(entry.accountId, env<string>('accountId'))),
-      sort(asc(entry.id)),
-      project({ id: entry.id, accountId: entry.accountId })
+      where(eq(entry.row.accountId, env<string>('accountId'))),
+      sort(asc(entry.row.id)),
+      project({ id: entry.row.id, accountId: entry.row.accountId })
     );
     const tag = hostFn<string>('test.tag', () => 'base');
     const taggedEntries = pipe(
       from(entry),
-      sort(asc(entry.id)),
+      sort(asc(entry.row.id)),
       project({
-        id: entry.id,
+        id: entry.row.id,
         tag: call(tag)
       })
     );
@@ -267,8 +267,8 @@ describe('materialized source behavior', () => {
 
     expect(q(db, pipe(
       from(entry),
-      where(eq(entry.accountId, value('sales'))),
-      project({ id: entry.id, amount: entry.amount })
+      where(eq(entry.row.accountId, value('sales'))),
+      project({ id: entry.row.id, amount: entry.row.amount })
     ))).toEqual([{ id: 'e2', amount: -120 }]);
   });
 
@@ -299,23 +299,23 @@ describe('materialized source behavior', () => {
     const db = mat(makeDb(), filteredProjectedEntriesByAccount);
     const fullCashEntries = pipe(
       from(entry),
-      where(eq(entry.accountId, value('cash'))),
-      sort(asc(entry.id)),
+      where(eq(entry.row.accountId, value('cash'))),
+      sort(asc(entry.row.id)),
       project({
-        id: entry.id,
-        accountId: entry.accountId,
-        amount: entry.amount,
-        posted: entry.posted
+        id: entry.row.id,
+        accountId: entry.row.accountId,
+        amount: entry.row.amount,
+        posted: entry.row.posted
       })
     );
     const feesEntries = pipe(
       from(entry),
-      where(eq(entry.accountId, value('fees'))),
+      where(eq(entry.row.accountId, value('fees'))),
       project({
-        id: entry.id,
-        accountId: entry.accountId,
-        amount: entry.amount,
-        posted: entry.posted
+        id: entry.row.id,
+        accountId: entry.row.accountId,
+        amount: entry.row.amount,
+        posted: entry.row.posted
       })
     );
 

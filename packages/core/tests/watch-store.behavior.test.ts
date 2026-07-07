@@ -32,31 +32,31 @@ import { createSeededRandom, resolveFuzzSeeds } from './fuzz-helpers.js';
 
 const entryList = pipe(
   from(entry),
-  sort(asc(entry.id)),
+  sort(asc(entry.row.id)),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount
   })
 );
 const watchSeeds = resolveFuzzSeeds([0x4a11, 0x4a12, 0x4a13] as const);
 
 const cashEntryProjection = pipe(
   from(entry),
-  where(eq(entry.accountId, value('cash'))),
+  where(eq(entry.row.accountId, value('cash'))),
   project({
-    id: entry.id,
-    amount: entry.amount
+    id: entry.row.id,
+    amount: entry.row.amount
   })
 );
 
 const envEntryProjection = pipe(
   from(entry),
-  where(eq(entry.accountId, env<string>('accountId'))),
+  where(eq(entry.row.accountId, env<string>('accountId'))),
   project({
-    id: entry.id,
-    accountId: entry.accountId,
-    amount: entry.amount
+    id: entry.row.id,
+    accountId: entry.row.accountId,
+    amount: entry.row.amount
   })
 );
 

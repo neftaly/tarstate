@@ -54,9 +54,9 @@ const cases = [
       makeDb(),
       pipe(
         from(entry),
-        where(gt(entry.amount, value(0))),
-        sort(asc(entry.id)),
-        project({ id: entry.id, amount: entry.amount })
+        where(gt(entry.row.amount, value(0))),
+        sort(asc(entry.row.id)),
+        project({ id: entry.row.id, amount: entry.row.amount })
       )
     )
   },
@@ -73,11 +73,11 @@ const cases = [
       pipe(
         from(entry),
         join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
-        sort(asc(entry.id)),
+        sort(asc(entry.row.id)),
         project({
-          entryId: entry.id,
-          accountName: account.$.name,
-          amount: entry.amount
+          entryId: entry.row.id,
+          accountName: account.row.name,
+          amount: entry.row.amount
         })
       )
     )
@@ -96,11 +96,11 @@ const cases = [
       pipe(
         from(account),
         leftJoin(from(entry), clauses<Account, Entry>({ id: 'accountId' })),
-        sort(asc(account.id), asc(entry.id, 'last')),
+        sort(asc(account.row.id), asc(entry.row.id, 'last')),
         project({
-          accountId: account.id,
-          accountName: account.$.name,
-          entryId: maybe(entry.id)
+          accountId: account.row.id,
+          accountName: account.row.name,
+          entryId: maybe(entry.row.id)
         })
       )
     )
@@ -117,11 +117,11 @@ const cases = [
       pipe(
         from(entry),
         aggregate({
-          groupBy: { accountId: entry.accountId },
+          groupBy: { accountId: entry.row.accountId },
           aggregates: {
             entryCount: count(),
-            total: sum(entry.amount),
-            average: avg(entry.amount)
+            total: sum(entry.row.amount),
+            average: avg(entry.row.amount)
           }
         }),
         sort(asc(field<string>('row', 'accountId')))
@@ -159,12 +159,12 @@ const cases = [
       ]),
       pipe(
         from(entry),
-        sort(asc(entry.id)),
+        sort(asc(entry.row.id)),
         project({
-          id: entry.id,
-          accountId: entry.accountId,
-          amount: entry.amount,
-          posted: entry.posted
+          id: entry.row.id,
+          accountId: entry.row.accountId,
+          amount: entry.row.amount,
+          posted: entry.row.posted
         })
       )
     )

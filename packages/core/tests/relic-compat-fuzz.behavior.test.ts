@@ -115,8 +115,8 @@ function relicQueryCase(seed: number): RelicQueryCase {
         ],
         query: pipe(
           from(entry),
-          where(gte(entry.amount, value(minAmount))),
-          project({ id: entry.id, amount: entry.amount }),
+          where(gte(entry.row.amount, value(minAmount))),
+          project({ id: entry.row.id, amount: entry.row.amount }),
           sort(asc(field<string>('row', 'id')))
         )
       };
@@ -155,10 +155,10 @@ function relicQueryCase(seed: number): RelicQueryCase {
         ],
         query: pipe(
           from(entry),
-          where(eq(entry.posted, value(posted))),
+          where(eq(entry.row.posted, value(posted))),
           extend({
-            entryId: entry.id,
-            bucket: ifElse(gte(entry.amount, value(0)), value('inflow'), value('outflow'))
+            entryId: entry.row.id,
+            bucket: ifElse(gte(entry.row.amount, value(0)), value('inflow'), value('outflow'))
           }),
           sort(asc(field<string>('row', 'entryId'))),
           without('id', 'memo'),
@@ -202,13 +202,13 @@ function relicQueryCase(seed: number): RelicQueryCase {
         ],
         query: pipe(
           from(entry),
-          extend({ entryId: entry.id }),
+          extend({ entryId: entry.row.id }),
           without('id'),
           join(from(account), clauses<Entry, Account>({ accountId: 'id' })),
           project({
             entryId: field<string>('row', 'entryId'),
-            accountName: account.$.name,
-            amount: entry.amount
+            accountName: account.row.name,
+            amount: entry.row.amount
           }),
           sort(asc(field<string>('row', 'entryId')))
         )
@@ -233,12 +233,12 @@ function relicQueryCase(seed: number): RelicQueryCase {
         query: pipe(
           from(account),
           leftJoin(
-            pipe(from(entry), extend({ entryId: entry.id }), without('id')),
+            pipe(from(entry), extend({ entryId: entry.row.id }), without('id')),
             clauses<Account, EntryWithEntryId>({ id: 'accountId' })
           ),
           project({
-            accountId: account.id,
-            accountName: account.$.name,
+            accountId: account.row.id,
+            accountName: account.row.name,
             entryId: field<string>('row', 'entryId')
           }),
           sort(asc(field<string>('row', 'accountId')), asc(field<string>('row', 'entryId'), 'last'))
@@ -261,11 +261,11 @@ function relicQueryCase(seed: number): RelicQueryCase {
         query: pipe(
           from(entry),
           aggregate({
-            groupBy: { accountId: entry.accountId },
+            groupBy: { accountId: entry.row.accountId },
             aggregates: {
               entryCount: count(),
-              postedCount: count(eq(entry.posted, value(true))),
-              total: sum(entry.amount)
+              postedCount: count(eq(entry.row.posted, value(true))),
+              total: sum(entry.row.amount)
             }
           }),
           sort(asc(field<string>('row', 'accountId')))
@@ -285,8 +285,8 @@ function relicQueryCase(seed: number): RelicQueryCase {
         ],
         query: pipe(
           from(entry),
-          sortLimit(limitCount, direction === 'desc' ? desc(entry.amount) : asc(entry.amount), asc(entry.id)),
-          project({ id: entry.id, amount: entry.amount })
+          sortLimit(limitCount, direction === 'desc' ? desc(entry.row.amount) : asc(entry.row.amount), asc(entry.row.id)),
+          project({ id: entry.row.id, amount: entry.row.amount })
         )
       };
     }
@@ -306,14 +306,14 @@ function relicQueryCase(seed: number): RelicQueryCase {
         query: pipe(
           from(entry),
           where(and(
-            or(eq(entry.accountId, value(accountId)), gte(entry.amount, value(minAmount))),
-            not(eq(entry.posted, value(false)))
+            or(eq(entry.row.accountId, value(accountId)), gte(entry.row.amount, value(minAmount))),
+            not(eq(entry.row.posted, value(false)))
           )),
           project({
-            id: entry.id,
-            accountId: entry.accountId,
-            amount: entry.amount,
-            posted: entry.posted
+            id: entry.row.id,
+            accountId: entry.row.accountId,
+            amount: entry.row.amount,
+            posted: entry.row.posted
           }),
           sort(asc(field<string>('row', 'id')))
         )
@@ -330,7 +330,7 @@ function relicQueryCase(seed: number): RelicQueryCase {
           aggregate({
             aggregates: {
               entryCount: count(),
-              total: sum(entry.amount)
+              total: sum(entry.row.amount)
             }
           })
         )
@@ -379,18 +379,18 @@ function indexCase(seed: number): RelicQueryCase {
     ? {
       label: 'hash',
       form: [':hash', ':accountId'],
-      query: hash(entry.accountId)
+      query: hash(entry.row.accountId)
     }
     : variant === 1
       ? {
         label: 'btree',
         form: [':btree', ':amount'],
-        query: btree(entry.amount)
+        query: btree(entry.row.amount)
       }
       : {
         label: 'unique',
         form: [':unique', ':id'],
-        query: uniqueIndex(entry.id)
+        query: uniqueIndex(entry.row.id)
       };
 
   return {
@@ -404,7 +404,7 @@ function indexCase(seed: number): RelicQueryCase {
     query: pipe(
       from(entry),
       indexed.query,
-      project({ id: entry.id, accountId: entry.accountId, amount: entry.amount }),
+      project({ id: entry.row.id, accountId: entry.row.accountId, amount: entry.row.amount }),
       sort(asc(field<string>('row', 'id')))
     )
   };

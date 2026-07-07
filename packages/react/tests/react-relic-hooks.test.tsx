@@ -77,8 +77,8 @@ const item = as(schema.items, 'item');
 const itemQuery = pipe(
   from(item),
   project({
-    id: item.id,
-    label: item.label
+    id: item.row.id,
+    label: item.row.label
   })
 );
 

@@ -214,25 +214,25 @@ export const benchmarkProbabilityWorkloadSize = {
 export function probabilityWorkloadQueries(userId: string) {
   const activeForecastStatsByMarket = pipe(
     from(probabilityForecast),
-    where(eq(probabilityForecast.active, value(true))),
+    where(eq(probabilityForecast.row.active, value(true))),
     aggregateForecastsByMarket()
   );
   const forecastStats = as(activeForecastStatsByMarket, 'forecastStats');
   const activeMarketSummary = pipe(
     from(probabilityMarket),
     leftJoin(forecastStats, clauses<ProbabilityMarketRow, QueryRow<typeof activeForecastStatsByMarket>>({ id: 'marketId' })),
-    where(eq(probabilityMarket.status, value('open'))),
-    sort(desc(probabilityMarket.liquidity), asc(probabilityMarket.id)),
+    where(eq(probabilityMarket.row.status, value('open'))),
+    sort(desc(probabilityMarket.row.liquidity), asc(probabilityMarket.row.id)),
     project({
-      marketId: probabilityMarket.id,
-      topic: probabilityMarket.topic,
-      category: probabilityMarket.category,
-      liquidity: probabilityMarket.liquidity,
-      forecastCount: maybe(forecastStats.forecastCount),
-      avgProbability: maybe(forecastStats.avgProbability),
-      lowProbability: maybe(forecastStats.lowProbability),
-      highProbability: maybe(forecastStats.highProbability),
-      totalWeight: maybe(forecastStats.totalWeight)
+      marketId: probabilityMarket.row.id,
+      topic: probabilityMarket.row.topic,
+      category: probabilityMarket.row.category,
+      liquidity: probabilityMarket.row.liquidity,
+      forecastCount: maybe(forecastStats.row.forecastCount),
+      avgProbability: maybe(forecastStats.row.avgProbability),
+      lowProbability: maybe(forecastStats.row.lowProbability),
+      highProbability: maybe(forecastStats.row.highProbability),
+      totalWeight: maybe(forecastStats.row.totalWeight)
     })
   );
   const userPositionTotals = pipe(
@@ -245,32 +245,32 @@ export function probabilityWorkloadQueries(userId: string) {
   );
   const visibleCommentFeed = pipe(
     from(probabilityComment),
-    where(eq(probabilityComment.hidden, value(false))),
+    where(eq(probabilityComment.row.hidden, value(false))),
     join(from(probabilityUser), clauses<ProbabilityCommentRow, ProbabilityUserRow>({ userId: 'id' })),
     join(from(probabilityMarket), clauses<ProbabilityCommentRow & ProbabilityUserRow, ProbabilityMarketRow>({ marketId: 'id' })),
-    sort(desc(probabilityComment.createdAt), asc(probabilityComment.id)),
+    sort(desc(probabilityComment.row.createdAt), asc(probabilityComment.row.id)),
     limit(40),
     project({
-      commentId: probabilityComment.id,
-      marketId: probabilityMarket.id,
-      topic: probabilityMarket.topic,
-      userId: probabilityUser.id,
-      handle: probabilityUser.handle,
-      body: probabilityComment.body,
-      createdAt: probabilityComment.createdAt
+      commentId: probabilityComment.row.id,
+      marketId: probabilityMarket.row.id,
+      topic: probabilityMarket.row.topic,
+      userId: probabilityUser.row.id,
+      handle: probabilityUser.row.handle,
+      body: probabilityComment.row.body,
+      createdAt: probabilityComment.row.createdAt
     })
   );
   const userWatchlist = pipe(
     from(probabilityWatchlist),
-    where(eq(probabilityWatchlist.userId, value(userId))),
+    where(eq(probabilityWatchlist.row.userId, value(userId))),
     leftJoin(from(probabilityMarket), clauses<ProbabilityWatchlistRow, ProbabilityMarketRow>({ marketId: 'id' })),
-    sort(desc(probabilityWatchlist.pinned), asc(probabilityMarket.closesAt), asc(probabilityWatchlist.marketId)),
+    sort(desc(probabilityWatchlist.row.pinned), asc(probabilityMarket.row.closesAt), asc(probabilityWatchlist.row.marketId)),
     project({
-      userId: probabilityWatchlist.userId,
-      marketId: probabilityWatchlist.marketId,
-      pinned: probabilityWatchlist.pinned,
-      topic: probabilityMarket.topic,
-      status: probabilityMarket.status
+      userId: probabilityWatchlist.row.userId,
+      marketId: probabilityWatchlist.row.marketId,
+      pinned: probabilityWatchlist.row.pinned,
+      topic: probabilityMarket.row.topic,
+      status: probabilityMarket.row.status
     })
   );
 
@@ -384,24 +384,24 @@ export function probabilityWorkloadPatchAt(
 
 function aggregateForecastsByMarket() {
   return aggregate({
-    groupBy: { marketId: probabilityForecast.marketId },
+    groupBy: { marketId: probabilityForecast.row.marketId },
     aggregates: {
       forecastCount: count(),
-      avgProbability: avg(probabilityForecast.probability),
-      lowProbability: min(probabilityForecast.probability),
-      highProbability: max(probabilityForecast.probability),
-      totalWeight: sum(probabilityForecast.weight)
+      avgProbability: avg(probabilityForecast.row.probability),
+      lowProbability: min(probabilityForecast.row.probability),
+      highProbability: max(probabilityForecast.row.probability),
+      totalWeight: sum(probabilityForecast.row.weight)
     }
   });
 }
 
 function aggregatePositionsByUser() {
   return aggregate({
-    groupBy: { userId: probabilityPosition.userId },
+    groupBy: { userId: probabilityPosition.row.userId },
     aggregates: {
       marketCount: count(),
-      totalShares: sum(probabilityPosition.shares),
-      totalExposure: sum(probabilityPosition.exposure)
+      totalShares: sum(probabilityPosition.row.shares),
+      totalExposure: sum(probabilityPosition.row.exposure)
     }
   });
 }

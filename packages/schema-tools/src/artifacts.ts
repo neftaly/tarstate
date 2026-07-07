@@ -3,19 +3,15 @@ import {
   stringifyCanonicalSchemaManifest,
   type SchemaManifestV1
 } from '@tarstate/core/schema';
-import { emitRelationExamplesForCanonicalManifest } from './examples.js';
 import { emitJsonSchemasForCanonicalManifest } from './json-schema.js';
 import { fileStem, sortedEntries } from './names.js';
-import { emitPromptCardForCanonicalManifest } from './prompt-card.js';
 import { stringifyStableJsonPretty } from './stable-json.js';
 import { emitTypeScriptRowsForCanonicalManifest } from './typescript.js';
 
 export type SchemaArtifactKind =
   | 'manifest'
   | 'typescript'
-  | 'json-schema'
-  | 'prompt-card'
-  | 'examples';
+  | 'json-schema';
 
 export type EmitSchemaArtifactsOptions = {
   readonly artifacts?: readonly SchemaArtifactKind[];
@@ -34,9 +30,7 @@ export type SchemaArtifactSet = {
 const defaultArtifacts = [
   'manifest',
   'typescript',
-  'json-schema',
-  'prompt-card',
-  'examples'
+  'json-schema'
 ] as const satisfies readonly SchemaArtifactKind[];
 const validArtifacts: ReadonlySet<SchemaArtifactKind> = new Set(defaultArtifacts);
 
@@ -46,9 +40,7 @@ export function emitSchemaArtifacts(input: unknown, options: EmitSchemaArtifacts
   const artifacts = withUniqueArtifactPaths([
     ...(kinds.has('manifest') ? [manifestArtifact(manifest)] : []),
     ...(kinds.has('typescript') ? [typescriptArtifact(manifest)] : []),
-    ...(kinds.has('json-schema') ? jsonSchemaArtifacts(manifest) : []),
-    ...(kinds.has('prompt-card') ? [promptCardArtifact(manifest)] : []),
-    ...(kinds.has('examples') ? exampleArtifacts(manifest) : [])
+    ...(kinds.has('json-schema') ? jsonSchemaArtifacts(manifest) : [])
   ]);
 
   return { manifest, artifacts };
@@ -72,17 +64,6 @@ function jsonSchemaArtifacts(manifest: SchemaManifestV1): readonly SchemaArtifac
   return sortedEntries(emitJsonSchemasForCanonicalManifest(manifest)).map(([relationName, schema]) => ({
     path: `json-schema/${fileStem(relationName)}.schema.json`,
     content: stringifyStableJsonPretty(schema) + '\n'
-  }));
-}
-
-function promptCardArtifact(manifest: SchemaManifestV1): SchemaArtifact {
-  return { path: 'agent-card.md', content: emitPromptCardForCanonicalManifest(manifest) };
-}
-
-function exampleArtifacts(manifest: SchemaManifestV1): readonly SchemaArtifact[] {
-  return sortedEntries(emitRelationExamplesForCanonicalManifest(manifest)).map(([relationName, example]) => ({
-    path: `examples/${fileStem(relationName)}.json`,
-    content: stringifyStableJsonPretty(example) + '\n'
   }));
 }
 

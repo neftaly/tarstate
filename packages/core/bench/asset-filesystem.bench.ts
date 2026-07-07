@@ -149,26 +149,26 @@ const dependencyTarget = as(schema.assetFiles, 'dependencyTarget');
 const assetFileRows = pipe(
   from(file),
   project({
-    path: file.path,
-    directory: file.directory,
-    name: file.$.name,
-    extension: file.extension,
-    mediaType: file.mediaType,
-    kind: file.$.kind,
-    packageId: file.packageId,
-    byteLength: file.byteLength,
-    sha256: file.sha256,
-    contentRef: file.contentRef
+    path: file.row.path,
+    directory: file.row.directory,
+    name: file.row.name,
+    extension: file.row.extension,
+    mediaType: file.row.mediaType,
+    kind: file.row.kind,
+    packageId: file.row.packageId,
+    byteLength: file.row.byteLength,
+    sha256: file.row.sha256,
+    contentRef: file.row.contentRef
   })
 ) as Query<AssetFile>;
 const dependencyRows = pipe(
   from(dependency),
   project({
-    id: dependency.id,
-    fromPath: dependency.fromPath,
-    toPath: dependency.toPath,
-    kind: dependency.$.kind,
-    ordinal: dependency.ordinal
+    id: dependency.row.id,
+    fromPath: dependency.row.fromPath,
+    toPath: dependency.row.toPath,
+    kind: dependency.row.kind,
+    ordinal: dependency.row.ordinal
   })
 ) as Query<AssetDependency>;
 const filesByPathIndex = pipe(assetFileRows, uniqueIndex(field<string>('row', 'path')));
@@ -179,10 +179,10 @@ const manifestsByPackageIndex = pipe(
   where(eq(field<AssetKind>('row', 'kind'), value('manifest'))),
   hash(field<string>('row', 'packageId'))
 );
-const directFilesByPathIndex = pipe(from(file), uniqueIndex(file.path));
-const directFilesByDirectoryIndex = pipe(from(file), hash(file.directory));
-const directFilesByPackageIndex = pipe(from(file), hash(file.packageId));
-const directDependenciesByFromPathIndex = pipe(from(dependency), hash(dependency.fromPath));
+const directFilesByPathIndex = pipe(from(file), uniqueIndex(file.row.path));
+const directFilesByDirectoryIndex = pipe(from(file), hash(file.row.directory));
+const directFilesByPackageIndex = pipe(from(file), hash(file.row.packageId));
+const directDependenciesByFromPathIndex = pipe(from(dependency), hash(dependency.row.fromPath));
 const fixture = makeFixture();
 const refDb = createDb({
   assetFiles: fixture.files.map((row) => withoutInlineText(row)),
@@ -403,14 +403,14 @@ function makeQueries(input: Fixture): QuerySet {
 function fileQuery(path: string, inlineBody: boolean): Query<unknown> {
   return pipe(
     from(file),
-    where(eq(file.path, value(path))),
+    where(eq(file.row.path, value(path))),
     project({
-      path: file.path,
-      mediaType: file.mediaType,
-      byteLength: file.byteLength,
-      sha256: file.sha256,
-      contentRef: file.contentRef,
-      ...(inlineBody ? { inlineText: file.inlineText } : {})
+      path: file.row.path,
+      mediaType: file.row.mediaType,
+      byteLength: file.row.byteLength,
+      sha256: file.row.sha256,
+      contentRef: file.row.contentRef,
+      ...(inlineBody ? { inlineText: file.row.inlineText } : {})
     })
   ) as Query<unknown>;
 }
@@ -418,15 +418,15 @@ function fileQuery(path: string, inlineBody: boolean): Query<unknown> {
 function directoryQuery(directory: string): Query<unknown> {
   return pipe(
     from(file),
-    where(eq(file.directory, value(directory))),
-    sort(asc(file.$.name)),
+    where(eq(file.row.directory, value(directory))),
+    sort(asc(file.row.name)),
     project({
-      path: file.path,
-      name: file.$.name,
-      kind: file.$.kind,
-      mediaType: file.mediaType,
-      byteLength: file.byteLength,
-      contentRef: file.contentRef
+      path: file.row.path,
+      name: file.row.name,
+      kind: file.row.kind,
+      mediaType: file.row.mediaType,
+      byteLength: file.row.byteLength,
+      contentRef: file.row.contentRef
     })
   ) as Query<unknown>;
 }
@@ -434,15 +434,15 @@ function directoryQuery(directory: string): Query<unknown> {
 function dependencyQuery(fromPath: string): Query<unknown> {
   return pipe(
     from(dependency),
-    where(eq(dependency.fromPath, value(fromPath))),
-    join(from(dependencyTarget), eq(dependency.toPath, dependencyTarget.path)),
-    sort(asc(dependency.ordinal)),
+    where(eq(dependency.row.fromPath, value(fromPath))),
+    join(from(dependencyTarget), eq(dependency.row.toPath, dependencyTarget.row.path)),
+    sort(asc(dependency.row.ordinal)),
     project({
-      path: dependencyTarget.path,
-      kind: dependencyTarget.$.kind,
-      mediaType: dependencyTarget.mediaType,
-      byteLength: dependencyTarget.byteLength,
-      contentRef: dependencyTarget.contentRef
+      path: dependencyTarget.row.path,
+      kind: dependencyTarget.row.kind,
+      mediaType: dependencyTarget.row.mediaType,
+      byteLength: dependencyTarget.row.byteLength,
+      contentRef: dependencyTarget.row.contentRef
     })
   ) as Query<unknown>;
 }
@@ -451,14 +451,14 @@ function manifestQuery(packageId: string): Query<unknown> {
   return pipe(
     from(file),
     where(and(
-      eq(file.packageId, value(packageId)),
-      eq(file.$.kind, value('manifest'))
+      eq(file.row.packageId, value(packageId)),
+      eq(file.row.kind, value('manifest'))
     )),
     project({
-      path: file.path,
-      mediaType: file.mediaType,
-      byteLength: file.byteLength,
-      contentRef: file.contentRef
+      path: file.row.path,
+      mediaType: file.row.mediaType,
+      byteLength: file.row.byteLength,
+      contentRef: file.row.contentRef
     })
   ) as Query<unknown>;
 }

@@ -23,11 +23,11 @@ const joinedEntryAccounts = pipe(
   from(entry),
   join(from(account), clauses({ accountId: 'id' })),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    amount: entry.amount,
-    accountName: account.$.name
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    amount: entry.row.amount,
+    accountName: account.row.name
   })
 );
 
@@ -44,11 +44,11 @@ const leftJoinedEntryAccounts = pipe(
   from(entry),
   leftJoin(from(account), clauses({ accountId: 'id' })),
   project({
-    entryId: entry.id,
-    accountId: account.id,
-    entryAccountId: entry.accountId,
-    amount: entry.amount,
-    accountName: account.$.name
+    entryId: entry.row.id,
+    accountId: account.row.id,
+    entryAccountId: entry.row.accountId,
+    amount: entry.row.amount,
+    accountName: account.row.name
   }),
   sort(asc(field<string>('row', 'entryId')), asc(field<string>('row', 'accountId')))
 );
@@ -189,9 +189,9 @@ describe('materialization join behavior', () => {
       from(entry),
       join(from(account), clauses({ accountId: 'id' })),
       project({
-        accountId: account.id,
-        amount: entry.amount,
-        accountName: account.$.name
+        accountId: account.row.id,
+        amount: entry.row.amount,
+        accountName: account.row.name
       })
     );
     const reason = 'incremental maintenance requires a stable materialized row identity';
@@ -223,9 +223,9 @@ describe('materialization join behavior', () => {
       from(entry),
       join(from(account), clauses({ accountId: 'id' })),
       project({
-        entryId: entry.id,
-        amount: entry.amount,
-        accountName: account.$.name
+        entryId: entry.row.id,
+        amount: entry.row.amount,
+        accountName: account.row.name
       }),
       keyBy('entryId')
     );
@@ -277,13 +277,13 @@ describe('materialization join behavior', () => {
     const query = pipe(
       from(entry),
       join(from(account), clauses({ accountId: 'id' })),
-      where(eq(entry.posted, value(true))),
+      where(eq(entry.row.posted, value(true))),
       project({
-        entryId: entry.id,
-        accountId: account.id,
-        entryAccountId: entry.accountId,
-        amount: entry.amount,
-        accountName: account.$.name
+        entryId: entry.row.id,
+        accountId: account.row.id,
+        entryAccountId: entry.row.accountId,
+        amount: entry.row.amount,
+        accountName: account.row.name
       }),
       sort(asc(field('row', 'accountName')))
     );

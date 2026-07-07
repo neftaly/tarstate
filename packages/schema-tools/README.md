@@ -18,16 +18,15 @@ Default artifact layout:
 schema.manifest.json
 rows.d.ts
 json-schema/<relation>.schema.json
-agent-card.md
-examples/<relation>.json
 ```
 
 Intended consumers:
 
 - TypeScript-aware agents and IDEs use `rows.d.ts`.
-- JSON editors and tool-call boundaries use `json-schema/*.schema.json`.
-- Prompt-building agents use `agent-card.md`.
-- Generation and repair loops use `examples/*.json`.
+- Tarstate schema registries, publishing, and reproducible builds use
+  `schema.manifest.json`.
+- JSON editors and tool-call boundaries use `json-schema/*.schema.json` for
+  relation row validation.
 
 This package does not implement runtime codec behavior, migrations, SQL,
 GraphQL, or storage adapters.
