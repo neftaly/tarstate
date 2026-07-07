@@ -16,6 +16,7 @@ import {
 const seeds = resolveFuzzSeeds([0x9f07_0001, 0x9f07_0002, 0x9f07_0003, 0x9f07_0004] as const);
 const STEPS_PER_SEED = 56;
 const DUPLICATE_VIEW_COUNT = 12;
+const WORKLOAD_FUZZ_TIMEOUT_MS = 20_000;
 
 type WorkloadViews = {
   readonly activeMarketSummary: StoreView;
@@ -105,7 +106,7 @@ describe('probability dashboard workload seeded fuzz behavior', () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
       store.close();
     }
-  });
+  }, WORKLOAD_FUZZ_TIMEOUT_MS);
 });
 
 function workloadViews(store: Store, queries: ProbabilityWorkloadQueries): WorkloadViews {

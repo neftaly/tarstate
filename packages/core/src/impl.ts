@@ -1,23 +1,46 @@
 import { normalizeDiagnostics } from './diagnostics.js';
 import { relationDeltaNames } from './delta.js';
+import { diffRows, rowDiffKey } from './diff.js';
+import { isRecord, stableKey, uniqueStrings } from './internal.js';
 import {
-  booleanField,
-  idField,
-  isJsonValue,
-  jsonField,
-  numberField,
-  opaqueField,
-  optional,
-  relation,
-  stringField
-} from './schema.js';
+  canUseScalarSourceLookup,
+  compareValues,
+  fieldLookupMatches,
+  fieldReadValue,
+  fieldValueInRange,
+  isRelationKeyInput,
+  relationKeyFields,
+  relationKeyInputMatchesRow,
+  relationKeyInputToKey,
+  relationKeyInputValues,
+  relationKeyValuesEqual,
+  relationRowKeyMatchesRow,
+  relationSourceLookupValueForKey,
+  rowKey,
+  validateRelationRow
+} from './relation-helpers.js';
 import type {
   TarstateDiagnostic,
-  TarstateDiagnosticOptions,
-  TarstateDiagnosticSeverity
+  TarstateDiagnosticOptions
 } from './diagnostics.js';
 import type { RelationDelta } from './delta.js';
+import type {
+  RowChange,
+  RowDiffDiagnostic,
+  RowDiffOptions,
+  RowKeySelector
+} from './diff.js';
 import type { FieldSpec, RelationRef } from './schema.js';
+import type {
+  RelationLookup,
+  RelationRangeBound,
+  RelationRangeLookup,
+  RelationSource
+} from './source-types.js';
+import type {
+  RelationKeyInput,
+  RelationKeyValue
+} from './relation-helpers.js';
 
 export { collectDiagnostics, diagnostic, normalizeDiagnostics } from './diagnostics.js';
 export type {
@@ -30,6 +53,65 @@ export type {
 } from './diagnostics.js';
 export { relationDeltaNames, relationDeltas } from './delta.js';
 export type { RelationDelta } from './delta.js';
+export { diffRows, rowDiffKey } from './diff.js';
+export type {
+  RowChange,
+  RowDiff,
+  RowDiffDiagnostic,
+  RowDiffOptions,
+  RowDiffSide,
+  RowKeySelector
+} from './diff.js';
+export {
+  relationFieldCompareToBound,
+  relationFieldKeyInputValue,
+  relationFieldKeyValue,
+  relationFieldLookupMatches,
+  relationFieldReadValue,
+  relationFieldSpecDescription,
+  relationFieldValueInRange,
+  relationFieldValueMatchesSpec,
+  relationKeyFields,
+  relationKeyInputKey,
+  relationKeyInputMatchesRow,
+  relationKeyInputValues,
+  relationRowKeyMatchesRow,
+  rowKey,
+  validateRelationRow
+} from './relation-helpers.js';
+export type {
+  RelationKeyInput,
+  RelationKeyValue
+} from './relation-helpers.js';
+export {
+  runtimeSystemRelationList,
+  runtimeSystemRelations,
+  runtimeSystemSource
+} from './runtime-system.js';
+export type {
+  RuntimeConflictRow,
+  RuntimeDiagnosticRow,
+  RuntimeHistoryRow,
+  RuntimeInterestRow,
+  RuntimeInterestState,
+  RuntimeObjectLocationRow,
+  RuntimePeerRow,
+  RuntimePeerState,
+  RuntimeSourceRow,
+  RuntimeSourceState,
+  RuntimeStorageRow,
+  RuntimeStorageState,
+  RuntimeSyncRow,
+  RuntimeSyncState,
+  RuntimeSystemState,
+  RuntimeSystemStateInput
+} from './runtime-system.js';
+export type {
+  RelationLookup,
+  RelationRangeBound,
+  RelationRangeLookup,
+  RelationSource
+} from './source-types.js';
 
 export {
   anchoredPathField,
@@ -556,637 +638,6 @@ export function evaluate<Row>(source: RelationSource, query: Query<Row>, options
   }
 }
 
-export function validateRelationRow(relationRef: RelationRef, rowValue: Record<string, unknown>): readonly TarstateDiagnostic[] {
-  const diagnostics: TarstateDiagnostic[] = [];
-
-  if (!isRecord(rowValue)) {
-    diagnostics.push({
-      code: 'row_invalid',
-      severity: 'error',
-      message: `row for relation "${relationRef.name}" must be an object`,
-      relation: relationRef.name,
-      surface: 'validateRelationRow',
-      detail: rowValue
-    });
-    return diagnostics;
-  }
-
-  const invalidFields = new Set<string>();
-  for (const [fieldName, spec] of Object.entries(relationRef.fields)) {
-    const hasField = Object.prototype.hasOwnProperty.call(rowValue, fieldName);
-    const fieldValue = rowValue[fieldName];
-
-    if (!hasField || fieldValue === undefined) {
-      if (!spec.optional) {
-        diagnostics.push({
-          code: 'field_missing',
-          severity: 'error',
-          message: `relation "${relationRef.name}" row is missing required field "${fieldName}"`,
-          relation: relationRef.name,
-          field: fieldName,
-          surface: 'validateRelationRow'
-        });
-      }
-      continue;
-    }
-
-    if (fieldValue === null) {
-      if (!spec.nullable) {
-        invalidFields.add(fieldName);
-        diagnostics.push({
-          code: 'field_invalid',
-          severity: 'error',
-          message: `relation "${relationRef.name}" field "${fieldName}" must not be null`,
-          relation: relationRef.name,
-          field: fieldName,
-          surface: 'validateRelationRow'
-        });
-      }
-      continue;
-    }
-
-    if (!fieldValueMatchesSpec(spec, fieldValue)) {
-      invalidFields.add(fieldName);
-      diagnostics.push({
-        code: 'field_invalid',
-        severity: 'error',
-        message: `relation "${relationRef.name}" field "${fieldName}" must be ${fieldSpecDescription(spec)}`,
-        relation: relationRef.name,
-        field: fieldName,
-        surface: 'validateRelationRow',
-        detail: fieldValue
-      });
-    }
-  }
-
-  for (const keyField of relationKeyFields(relationRef)) {
-    const keyValue = rowValue[keyField];
-    if (keyValue === undefined || keyValue === null) {
-      diagnostics.push({
-        code: 'field_missing',
-        severity: 'error',
-        message: `relation "${relationRef.name}" key field "${keyField}" is missing`,
-        relation: relationRef.name,
-        field: keyField,
-        surface: 'validateRelationRow'
-      });
-      continue;
-    }
-
-    const spec = relationRef.fields[keyField];
-    if (invalidFields.has(keyField)) continue;
-    if (
-      spec?.valueKind === 'custom'
-      && spec.custom?.stableKey === undefined
-      && spec.custom?.toScalar === undefined
-    ) {
-      diagnostics.push({
-        code: 'field_invalid',
-        severity: 'error',
-        message: `relation "${relationRef.name}" key field "${keyField}" must define stableKey or toScalar`,
-        relation: relationRef.name,
-        field: keyField,
-        surface: 'validateRelationRow',
-        detail: keyValue
-      });
-    } else if (
-      spec?.valueKind === 'custom'
-      && spec.custom?.stableKey === undefined
-      && spec.custom?.toScalar !== undefined
-      && !isRelationKeyScalar(spec.custom.toScalar(keyValue))
-    ) {
-      diagnostics.push({
-        code: 'field_invalid',
-        severity: 'error',
-        message: `relation "${relationRef.name}" key field "${keyField}" must convert to a string, finite number, or boolean`,
-        relation: relationRef.name,
-        field: keyField,
-        surface: 'validateRelationRow',
-        detail: keyValue
-      });
-    }
-  }
-
-  return diagnostics;
-}
-
-export function rowKey(relationRef: RelationRef, row: Record<string, unknown>): string | undefined {
-  const fields = relationKeyFields(relationRef);
-  const values: unknown[] = [];
-
-  for (const fieldName of fields) {
-    if (!Object.prototype.hasOwnProperty.call(row, fieldName) || row[fieldName] === undefined || row[fieldName] === null) return undefined;
-    const fieldValue = row[fieldName];
-    const spec = relationRef.fields[fieldName];
-    const keyValue = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
-    if (keyValue === undefined) return undefined;
-    values.push(keyValue);
-  }
-
-  return stableKey(values);
-}
-
-export type RowChange<Row = unknown> =
-  | { readonly kind: 'added'; readonly row: Row; readonly key: string }
-  | { readonly kind: 'removed'; readonly row: Row; readonly key: string }
-  | { readonly kind: 'updated'; readonly before: Row; readonly after: Row; readonly key: string };
-export type RowKeySelector<Row = unknown> = (row: Row) => unknown;
-export type RowDiffSide = 'before' | 'after';
-export type RowDiffDiagnostic<Row = unknown> = TarstateDiagnostic & {
-  readonly side?: RowDiffSide;
-  readonly row?: Row;
-};
-export type RowDiffOptions<Row = unknown> = {
-  readonly keyBy?: RowKeySelector<Row> | readonly string[];
-};
-export type RowDiff<Row = unknown> = {
-  readonly changes: readonly RowChange<Row>[];
-  readonly diagnostics: readonly RowDiffDiagnostic<Row>[];
-};
-
-export function diffRows<Row>(before: readonly Row[], after: readonly Row[], options: RowDiffOptions<Row> = {}): RowDiff<Row> {
-  const diagnostics: RowDiffDiagnostic<Row>[] = [];
-  const beforeMap = new Map<string, Row>();
-  const afterMap = new Map<string, Row>();
-  const duplicateBefore = new Set<string>();
-  const duplicateAfter = new Set<string>();
-
-  for (const rowValue of before) {
-    const key = rowDiffKey(rowValue, options);
-    if (beforeMap.has(key)) duplicateBefore.add(key);
-    beforeMap.set(key, rowValue);
-  }
-
-  for (const rowValue of after) {
-    const key = rowDiffKey(rowValue, options);
-    if (afterMap.has(key)) duplicateAfter.add(key);
-    afterMap.set(key, rowValue);
-  }
-
-  for (const key of duplicateBefore) {
-    diagnostics.push({
-      code: 'row_invalid',
-      severity: 'warning',
-      message: `duplicate before row diff key ${key}`,
-      side: 'before',
-      surface: 'diffRows'
-    });
-  }
-
-  for (const key of duplicateAfter) {
-    diagnostics.push({
-      code: 'row_invalid',
-      severity: 'warning',
-      message: `duplicate after row diff key ${key}`,
-      side: 'after',
-      surface: 'diffRows'
-    });
-  }
-
-  const changes: RowChange<Row>[] = [];
-  const keys = new Set<string>([...beforeMap.keys(), ...afterMap.keys()]);
-
-  for (const key of keys) {
-    const beforeRow = beforeMap.get(key);
-    const afterRow = afterMap.get(key);
-
-    if (beforeRow === undefined && afterRow !== undefined) {
-      changes.push({ kind: 'added', row: afterRow, key });
-      continue;
-    }
-
-    if (beforeRow !== undefined && afterRow === undefined) {
-      changes.push({ kind: 'removed', row: beforeRow, key });
-      continue;
-    }
-
-    if (beforeRow !== undefined && afterRow !== undefined && stableKey(beforeRow) !== stableKey(afterRow)) {
-      changes.push({ kind: 'updated', before: beforeRow, after: afterRow, key });
-    }
-  }
-
-  return { changes, diagnostics };
-}
-
-export function rowDiffKey<Row>(row: Row, options: RowDiffOptions<Row> = {}): string {
-  if (typeof options.keyBy === 'function') return stableKey(options.keyBy(row));
-  if (Array.isArray(options.keyBy) && isRecord(row)) return stableKey(options.keyBy.map((fieldName) => row[fieldName]));
-  return stableKey(row);
-}
-
-export type RelationLookup = {
-  readonly relation: RelationRef;
-  readonly field: string;
-  readonly value: unknown;
-};
-export type RelationRangeBound<Value = unknown> = {
-  readonly value: Value;
-  readonly inclusive: boolean;
-};
-export type RelationRangeLookup = {
-  readonly relation: RelationRef;
-  readonly field: string;
-  readonly lower?: RelationRangeBound;
-  readonly upper?: RelationRangeBound;
-};
-export type RelationSource = {
-  readonly relationNames?: readonly string[];
-  readonly rows: (relation: RelationRef) => readonly unknown[];
-  readonly lookup?: (lookup: RelationLookup) => readonly unknown[] | undefined;
-  readonly rangeLookup?: (lookup: RelationRangeLookup) => readonly unknown[] | undefined;
-  readonly version?: () => unknown;
-  readonly diagnostics?: () => readonly TarstateDiagnostic[];
-};
-
-export type RuntimeSourceState =
-  | 'idle'
-  | 'loading'
-  | 'ready'
-  | 'syncing'
-  | 'unavailable'
-  | 'failed'
-  | 'closed';
-export type RuntimeSourceRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly source: string;
-  readonly state: RuntimeSourceState;
-  readonly priority?: number;
-  readonly message?: string;
-  readonly updatedAt?: number;
-  readonly detail?: unknown;
-};
-export type RuntimeDiagnosticRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly code: string;
-  readonly severity: TarstateDiagnosticSeverity;
-  readonly message: string;
-  readonly surface?: string;
-  readonly relation?: string;
-  readonly source?: string;
-  readonly detail?: unknown;
-};
-export type RuntimePeerState = 'connected' | 'connecting' | 'disconnected' | 'unknown';
-export type RuntimePeerRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly peerId: string;
-  readonly state: RuntimePeerState;
-  readonly userId?: string;
-  readonly deviceId?: string;
-  readonly sessionId?: string;
-  readonly connected?: boolean;
-  readonly ephemeral?: boolean;
-  readonly updatedAt?: number;
-  readonly detail?: unknown;
-};
-export type RuntimeSyncState =
-  | 'idle'
-  | 'loading'
-  | 'syncing'
-  | 'synced'
-  | 'diverged'
-  | 'failed'
-  | 'unknown';
-export type RuntimeSyncRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly state: RuntimeSyncState;
-  readonly documentId?: string;
-  readonly peerId?: string;
-  readonly storageId?: string;
-  readonly localHeads?: readonly string[];
-  readonly remoteHeads?: readonly string[];
-  readonly sharedHeads?: readonly string[];
-  readonly updatedAt?: number;
-  readonly detail?: unknown;
-};
-export type RuntimeConflictRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly path: string;
-  readonly documentId?: string;
-  readonly relation?: string;
-  readonly field?: string;
-  readonly conflictCount: number;
-  readonly values?: unknown;
-  readonly detail?: unknown;
-};
-export type RuntimeHistoryRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly documentId?: string;
-  readonly hash: string;
-  readonly actor?: string;
-  readonly message?: string;
-  readonly time?: number;
-  readonly deps?: readonly string[];
-  readonly heads?: readonly string[];
-  readonly detail?: unknown;
-};
-export type RuntimeObjectLocationRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly objectId: string;
-  readonly path: string;
-  readonly pathSegments: readonly (string | number)[];
-  readonly parentObjectId?: string;
-  readonly prop?: string | number;
-  readonly documentId?: string;
-  readonly branch?: string;
-  readonly heads?: readonly string[];
-  readonly relation?: string;
-  readonly key?: unknown;
-  readonly detail?: unknown;
-};
-export type RuntimeStorageState =
-  | 'idle'
-  | 'loading'
-  | 'saving'
-  | 'flushing'
-  | 'synced'
-  | 'failed'
-  | 'closed';
-export type RuntimeStorageRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly storage: string;
-  readonly state: RuntimeStorageState;
-  readonly durability?: RelationApplyDurability;
-  readonly pendingWrites?: number;
-  readonly lastFlushAt?: number;
-  readonly lastError?: string;
-  readonly detail?: unknown;
-};
-export type RuntimeInterestState = 'active' | 'released';
-export type RuntimeInterestRow = {
-  readonly id: string;
-  readonly runtime: string;
-  readonly queryKey: string;
-  readonly state: RuntimeInterestState;
-  readonly relationNames: readonly string[];
-  readonly subscriberCount?: number;
-  readonly retainedAt?: number;
-  readonly releasedAt?: number;
-  readonly detail?: unknown;
-};
-export type RuntimeSystemState = {
-  readonly sources?: readonly RuntimeSourceRow[];
-  readonly diagnostics?: readonly (RuntimeDiagnosticRow | TarstateDiagnostic)[];
-  readonly peers?: readonly RuntimePeerRow[];
-  readonly sync?: readonly RuntimeSyncRow[];
-  readonly conflicts?: readonly RuntimeConflictRow[];
-  readonly history?: readonly RuntimeHistoryRow[];
-  readonly objectLocations?: readonly RuntimeObjectLocationRow[];
-  readonly storage?: readonly RuntimeStorageRow[];
-  readonly interests?: readonly RuntimeInterestRow[];
-};
-export type RuntimeSystemStateInput = RuntimeSystemState | (() => RuntimeSystemState);
-
-export const runtimeSystemRelations = {
-  sources: {
-    ...relation<RuntimeSourceRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.source'),
-        runtime: stringField(),
-        source: stringField(),
-        state: stringField(),
-        priority: optional(numberField()),
-        message: optional(stringField()),
-        updatedAt: optional(numberField()),
-        detail: optional(opaqueField<unknown>('runtime.source.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.sources'
-  },
-  diagnostics: {
-    ...relation<RuntimeDiagnosticRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.diagnostic'),
-        runtime: stringField(),
-        code: stringField(),
-        severity: stringField(),
-        message: stringField(),
-        surface: optional(stringField()),
-        relation: optional(stringField()),
-        source: optional(stringField()),
-        detail: optional(opaqueField<unknown>('runtime.diagnostic.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.diagnostics'
-  },
-  peers: {
-    ...relation<RuntimePeerRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.peer'),
-        runtime: stringField(),
-        peerId: stringField(),
-        state: stringField(),
-        userId: optional(stringField()),
-        deviceId: optional(stringField()),
-        sessionId: optional(stringField()),
-        connected: optional(booleanField()),
-        ephemeral: optional(booleanField()),
-        updatedAt: optional(numberField()),
-        detail: optional(opaqueField<unknown>('runtime.peer.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.peers'
-  },
-  sync: {
-    ...relation<RuntimeSyncRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.sync'),
-        runtime: stringField(),
-        state: stringField(),
-        documentId: optional(stringField()),
-        peerId: optional(stringField()),
-        storageId: optional(stringField()),
-        localHeads: optional(jsonField() as FieldSpec<readonly string[]>),
-        remoteHeads: optional(jsonField() as FieldSpec<readonly string[]>),
-        sharedHeads: optional(jsonField() as FieldSpec<readonly string[]>),
-        updatedAt: optional(numberField()),
-        detail: optional(opaqueField<unknown>('runtime.sync.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.sync'
-  },
-  conflicts: {
-    ...relation<RuntimeConflictRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.conflict'),
-        runtime: stringField(),
-        path: stringField(),
-        documentId: optional(stringField()),
-        relation: optional(stringField()),
-        field: optional(stringField()),
-        conflictCount: numberField(),
-        values: optional(opaqueField<unknown>('runtime.conflict.values')),
-        detail: optional(opaqueField<unknown>('runtime.conflict.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.conflicts'
-  },
-  history: {
-    ...relation<RuntimeHistoryRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.history'),
-        runtime: stringField(),
-        documentId: optional(stringField()),
-        hash: stringField(),
-        actor: optional(stringField()),
-        message: optional(stringField()),
-        time: optional(numberField()),
-        deps: optional(jsonField() as FieldSpec<readonly string[]>),
-        heads: optional(jsonField() as FieldSpec<readonly string[]>),
-        detail: optional(opaqueField<unknown>('runtime.history.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.history'
-  },
-  objectLocations: {
-    ...relation<RuntimeObjectLocationRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.objectLocation'),
-        runtime: stringField(),
-        objectId: idField('tarstate.runtime.object'),
-        path: stringField(),
-        pathSegments: jsonField() as FieldSpec<readonly (string | number)[]>,
-        parentObjectId: optional(idField('tarstate.runtime.object')),
-        prop: optional(jsonField() as FieldSpec<string | number>),
-        documentId: optional(stringField()),
-        branch: optional(stringField()),
-        heads: optional(jsonField() as FieldSpec<readonly string[]>),
-        relation: optional(stringField()),
-        key: optional(opaqueField<unknown>('runtime.objectLocation.key')),
-        detail: optional(opaqueField<unknown>('runtime.objectLocation.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.objectLocations'
-  },
-  storage: {
-    ...relation<RuntimeStorageRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.storage'),
-        runtime: stringField(),
-        storage: stringField(),
-        state: stringField(),
-        durability: optional(stringField()),
-        pendingWrites: optional(numberField()),
-        lastFlushAt: optional(numberField()),
-        lastError: optional(stringField()),
-        detail: optional(opaqueField<unknown>('runtime.storage.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.storage'
-  },
-  interests: {
-    ...relation<RuntimeInterestRow, 'id'>({
-      key: 'id',
-      fields: {
-        id: idField('tarstate.runtime.interest'),
-        runtime: stringField(),
-        queryKey: stringField(),
-        state: stringField(),
-        relationNames: jsonField() as FieldSpec<readonly string[]>,
-        subscriberCount: optional(numberField()),
-        retainedAt: optional(numberField()),
-        releasedAt: optional(numberField()),
-        detail: optional(opaqueField<unknown>('runtime.interest.detail'))
-      },
-      ephemeral: true
-    }),
-    name: 'tarstate.runtime.interests'
-  }
-} as const;
-export const runtimeSystemRelationList: readonly RelationRef[] = Object.values(runtimeSystemRelations);
-
-export function runtimeSystemSource(input: RuntimeSystemStateInput): RelationSource {
-  const readState = (): RuntimeSystemState => typeof input === 'function' ? input() : input;
-  return {
-    relationNames: runtimeSystemRelationList.map((relationRef) => relationRef.name),
-    rows: (relationRef) => runtimeSystemRows(readState(), relationRef),
-    diagnostics: () => runtimeSystemDiagnosticRows(readState()).map(runtimeDiagnosticRowToDiagnostic)
-  };
-}
-
-function runtimeSystemRows(state: RuntimeSystemState, relationRef: RelationRef): readonly unknown[] {
-  switch (relationRef.name) {
-    case runtimeSystemRelations.sources.name:
-      return state.sources ?? [];
-    case runtimeSystemRelations.diagnostics.name:
-      return runtimeSystemDiagnosticRows(state);
-    case runtimeSystemRelations.peers.name:
-      return state.peers ?? [];
-    case runtimeSystemRelations.sync.name:
-      return state.sync ?? [];
-    case runtimeSystemRelations.conflicts.name:
-      return state.conflicts ?? [];
-    case runtimeSystemRelations.history.name:
-      return state.history ?? [];
-    case runtimeSystemRelations.objectLocations.name:
-      return state.objectLocations ?? [];
-    case runtimeSystemRelations.storage.name:
-      return state.storage ?? [];
-    case runtimeSystemRelations.interests.name:
-      return state.interests ?? [];
-    default:
-      return [];
-  }
-}
-
-function runtimeSystemDiagnosticRows(state: RuntimeSystemState): readonly RuntimeDiagnosticRow[] {
-  return (state.diagnostics ?? []).map((diagnosticValue, index) =>
-    isRuntimeDiagnosticRow(diagnosticValue)
-      ? diagnosticValue
-      : runtimeDiagnosticRowFromDiagnostic(diagnosticValue, index));
-}
-
-function isRuntimeDiagnosticRow(input: RuntimeDiagnosticRow | TarstateDiagnostic): input is RuntimeDiagnosticRow {
-  return 'id' in input && 'runtime' in input;
-}
-
-function runtimeDiagnosticRowFromDiagnostic(input: TarstateDiagnostic, index: number): RuntimeDiagnosticRow {
-  return {
-    id: `diagnostic:${index}:${stableKey(input)}`,
-    runtime: typeof input.surface === 'string' ? input.surface : 'runtime',
-    code: input.code,
-    severity: input.severity ?? 'info',
-    message: input.message,
-    ...(typeof input.surface === 'string' ? { surface: input.surface } : {}),
-    ...(typeof input.relation === 'string' ? { relation: input.relation } : {}),
-    ...(input.detail === undefined ? {} : { detail: input.detail })
-  };
-}
-
-function runtimeDiagnosticRowToDiagnostic(row: RuntimeDiagnosticRow): TarstateDiagnostic {
-  return {
-    code: row.code,
-    severity: row.severity,
-    message: row.message,
-    ...(row.surface === undefined ? {} : { surface: row.surface }),
-    ...(row.relation === undefined ? {} : { relation: row.relation }),
-    ...(row.detail === undefined ? {} : { detail: row.detail })
-  };
-}
-
 export function fromObjectSource(data: Record<string, readonly unknown[]>): RelationSource {
   return {
     relationNames: Object.keys(data),
@@ -1707,26 +1158,6 @@ type DbQueryTransformPresenceOptions = EvaluateOptions & {
   readonly mapRows?: unknown;
   readonly into?: unknown;
 };
-type RelationKeyScalar = string | number | boolean;
-type RelationKeyJsonObject = { readonly [key: string]: RelationKeyJsonValue };
-type RelationKeyJsonValue = RelationKeyScalar | null | readonly RelationKeyJsonValue[] | RelationKeyJsonObject;
-type RelationKeyInputValue = RelationKeyScalar | readonly RelationKeyJsonValue[];
-type RelationKeyFieldInputValue<Value> = Extract<Exclude<Value, null | undefined>, RelationKeyInputValue>;
-type RelationKeyFieldValue<Value> = [RelationKeyFieldInputValue<Value>] extends [never]
-  ? RelationKeyScalar
-  : RelationKeyFieldInputValue<Value>;
-export type RelationKeyValue<Relation extends RelationRef> =
-  Relation extends RelationRef<infer Row, infer Key>
-    ? string extends Key
-      ? RelationKeyInput
-      : readonly string[] extends Key
-        ? RelationKeyInput
-        : Key extends readonly (keyof Row & string)[]
-      ? { readonly [Index in keyof Key]: Key[Index] extends keyof Row ? RelationKeyFieldValue<Row[Key[Index]]> : never }
-      : Key extends keyof Row
-        ? RelationKeyFieldValue<Row[Key]>
-        : RelationKeyInput
-    : RelationKeyInput;
 export type RowLookupOptions<Row = unknown, MappedRow = Row> = DbQueryOptions<Row, MappedRow>;
 export type RowPredicateOptions<Row = unknown, MappedRow = Row> = DbQueryOptions<Row, MappedRow>;
 
@@ -2120,7 +1551,6 @@ export type RelationRowUpdate<Relation extends RelationRef> = Partial<{
 export type RelationRowUpdateInput<Relation extends RelationRef> =
   | RelationRowUpdate<Relation>
   | ((row: RelationRow<Relation>) => RelationRowUpdate<Relation>);
-export type RelationKeyInput = RelationKeyInputValue;
 export type RelationMergeInput<Relation extends RelationRef = RelationRef> =
   | readonly (keyof RelationRow<Relation> & string)[]
   | ((current: RelationRow<Relation>, incoming: RelationRow<Relation>) => RelationRowUpdate<Relation>);
@@ -8142,27 +7572,6 @@ function compareNullable(left: unknown, right: unknown, nulls: NullSortOrder | u
   return compareValues(left, right);
 }
 
-function compareValues(left: unknown, right: unknown): number {
-  if (Object.is(left, right)) return 0;
-  if (left === undefined || left === null) return -1;
-  if (right === undefined || right === null) return 1;
-  if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : 1;
-  if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right);
-  if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
-  if (left instanceof Date && right instanceof Date) return left.getTime() < right.getTime() ? -1 : 1;
-  if (left instanceof Uint8Array && right instanceof Uint8Array) return compareBytes(left, right);
-  return stableKey(left).localeCompare(stableKey(right));
-}
-
-function compareBytes(left: Uint8Array, right: Uint8Array): number {
-  const length = Math.min(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const diff = (left[index] ?? 0) - (right[index] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return left.length - right.length;
-}
-
 function sortedValues(values: readonly unknown[], direction: SortDirection): readonly unknown[] {
   return [...values].sort((left, right) => direction === 'desc' ? -compareValues(left, right) : compareValues(left, right));
 }
@@ -8292,18 +7701,6 @@ function sortPlainRows<Row>(rows: readonly Row[], sortValue: DbQuerySort<Row>, d
   });
 }
 
-function isRelationKeyInput(input: unknown): input is RelationKeyInput {
-  return isRelationKeyInputValue(input);
-}
-
-function isRelationKeyScalar(input: unknown): input is RelationKeyScalar {
-  return typeof input === 'string' || typeof input === 'boolean' || (typeof input === 'number' && Number.isFinite(input));
-}
-
-function isRelationKeyInputValue(input: unknown): input is RelationKeyInputValue {
-  return isRelationKeyScalar(input) || (Array.isArray(input) && isJsonValue(input));
-}
-
 const dbQueryOptionKeys = new Set(['sort', 'rsort', 'mapRows', 'into', 'env', 'functions', 'diagnosticMode']);
 
 function isInvalidRelationLookupArgument(relationRef: RelationRef, input: unknown): boolean {
@@ -8317,108 +7714,6 @@ function isDbQueryOptions(input: unknown): input is DbQueryOptions {
   return isRecord(input)
     && !Array.isArray(input)
     && Object.keys(input).every((key) => dbQueryOptionKeys.has(key));
-}
-
-function relationKeyInputToKey(relationRef: RelationRef, input: RelationKeyInput): string {
-  return stableKey(relationKeyInputValues(relationRef, input) ?? []);
-}
-
-export function relationKeyInputMatchesRow(
-  relationRef: RelationRef,
-  input: RelationKeyInput,
-  rowValue: Record<string, unknown>
-): boolean {
-  const fields = relationKeyFields(relationRef);
-  return relationKeyFieldsMatchInput(relationRef, rowValue, fields, input);
-}
-
-export function relationRowKeyMatchesRow(
-  relationRef: RelationRef,
-  left: Record<string, unknown>,
-  right: Record<string, unknown>
-): boolean {
-  const fields = relationKeyFields(relationRef);
-  const fieldName = fields.length === 1 ? fields[0] : undefined;
-  if (fieldName !== undefined) {
-    const valueValue = right[fieldName];
-    if (valueValue === undefined) return false;
-    if (canCompareRelationKeyAtom(valueValue)) {
-      return relationKeyFieldRowValueMatches(relationRef, left, fieldName, valueValue);
-    }
-  }
-  const key = rowKey(relationRef, right);
-  return key !== undefined && rowKey(relationRef, left) === key;
-}
-
-function relationKeyFieldRowValueMatches(
-  relationRef: RelationRef,
-  rowValue: Record<string, unknown>,
-  fieldName: string,
-  valueValue: unknown
-): boolean {
-  const fieldValue = rowValue[fieldName];
-  if (fieldValue === undefined) return false;
-  const spec = relationRef.fields[fieldName];
-  const left = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
-  const right = spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
-  return left !== undefined && right !== undefined && relationKeyValuesEqual(left, right);
-}
-
-function relationKeyFieldValueMatches(
-  relationRef: RelationRef,
-  rowValue: Record<string, unknown>,
-  fieldName: string,
-  valueValue: unknown
-): boolean {
-  const fieldValue = rowValue[fieldName];
-  if (fieldValue === undefined) return false;
-  const spec = relationRef.fields[fieldName];
-  const left = spec === undefined ? fieldValue : fieldKeyValue(spec, fieldValue);
-  const right = spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
-  return left !== undefined && right !== undefined && relationKeyValuesEqual(left, right);
-}
-
-function relationKeyValuesEqual(left: unknown, right: unknown): boolean {
-  return Object.is(left, right) || (
-    isRelationKeyInputValue(left)
-    && isRelationKeyInputValue(right)
-    && stableKey(left) === stableKey(right)
-  );
-}
-
-function relationKeyFieldsMatchInput(
-  relationRef: RelationRef,
-  rowValue: Record<string, unknown>,
-  fields: readonly string[],
-  input: RelationKeyInput
-): boolean {
-  const values = relationKeyInputValues(relationRef, input);
-  if (values === undefined || values.length !== fields.length) return false;
-  for (let index = 0; index < fields.length; index += 1) {
-    const fieldName = fields[index];
-    const valueValue = values[index];
-    if (
-      fieldName === undefined
-      || valueValue === undefined
-      || !relationKeyFieldValueMatches(relationRef, rowValue, fieldName, valueValue)
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function relationSourceLookupValueForKey(spec: FieldSpec | undefined, keyInput: unknown): unknown {
-  if (spec?.valueKind !== 'custom' || spec.custom?.toScalar === undefined) return keyInput;
-  return fieldKeyInputValue(spec, keyInput);
-}
-
-function canCompareRelationKeyAtom(input: unknown): boolean {
-  return isRelationKeyInputValue(input);
-}
-
-function canUseScalarSourceLookup(input: unknown): boolean {
-  return isRelationKeyScalar(input);
 }
 
 function stageDb(input: Db): Db {
@@ -9657,229 +8952,8 @@ function dedupeConstraints(constraints: readonly ConstraintData[]): readonly Con
   return result;
 }
 
-function fieldValueMatchesSpec(spec: FieldSpec, valueValue: unknown): boolean {
-  switch (spec.valueKind) {
-    case 'string':
-      return typeof valueValue === 'string' && (spec.values === undefined || spec.values.includes(valueValue));
-    case 'id':
-    case 'ref':
-    case 'anchoredPath':
-      return typeof valueValue === 'string';
-    case 'number':
-      return typeof valueValue === 'number' && Number.isFinite(valueValue);
-    case 'boolean':
-      return typeof valueValue === 'boolean';
-    case 'json':
-      return isJsonValue(valueValue);
-    case 'custom':
-      return spec.custom?.validate === undefined || spec.custom.validate(valueValue);
-    default:
-      return true;
-  }
-}
-
-function fieldReadValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
-  if (spec?.valueKind !== 'custom' || spec.custom?.toScalar === undefined || valueValue === null || valueValue === undefined) {
-    return valueValue;
-  }
-  return spec.custom.toScalar(valueValue);
-}
-
-function fieldKeyValue(spec: FieldSpec, valueValue: unknown): unknown {
-  if (spec.valueKind !== 'custom') return valueValue;
-  if (valueValue === null || valueValue === undefined) return valueValue;
-  if (!fieldValueMatchesSpec(spec, valueValue)) return undefined;
-  if (spec.custom?.stableKey !== undefined) return spec.custom.stableKey(valueValue);
-  if (spec.custom?.toScalar !== undefined) {
-    const scalar = spec.custom.toScalar(valueValue);
-    return isRelationKeyScalar(scalar) ? scalar : undefined;
-  }
-  return undefined;
-}
-
-function fieldKeyInputValue(spec: FieldSpec, valueValue: unknown): unknown {
-  if (spec.valueKind === 'json') return isRelationKeyInputValue(valueValue) ? valueValue : undefined;
-  if (spec.valueKind !== 'custom' && !fieldValueMatchesSpec(spec, valueValue)) return undefined;
-  if (spec.valueKind !== 'custom') return valueValue;
-  if (!isRelationKeyScalar(valueValue)) return undefined;
-  if (spec.custom?.stableKey !== undefined) return valueValue;
-  if (spec.custom?.toScalar !== undefined && fieldValueMatchesSpec(spec, valueValue)) {
-    const scalar = spec.custom.toScalar(valueValue);
-    return isRelationKeyScalar(scalar) ? scalar : undefined;
-  }
-  return valueValue;
-}
-
-function fieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
-  if (spec?.valueKind === 'json') {
-    return relationKeyValuesEqual(fieldValue, lookupValue);
-  }
-  if (spec?.valueKind === 'custom' && spec.custom?.stableKey !== undefined) {
-    return spec.custom.stableKey(fieldValue) === spec.custom.stableKey(lookupValue);
-  }
-  if (
-    spec?.valueKind === 'custom'
-    && spec.custom?.compare !== undefined
-    && fieldValueMatchesSpec(spec, fieldValue)
-    && fieldValueMatchesSpec(spec, lookupValue)
-  ) {
-    return spec.custom.compare(fieldValue, lookupValue) === 0;
-  }
-  if (spec?.valueKind === 'custom' && spec.custom?.toScalar !== undefined) {
-    if (!fieldValueMatchesSpec(spec, fieldValue)) return false;
-    const scalarLookupValue = fieldValueMatchesSpec(spec, lookupValue)
-      ? fieldReadValue(spec, lookupValue)
-      : lookupValue;
-    return Object.is(fieldReadValue(spec, fieldValue), scalarLookupValue);
-  }
-  return Object.is(fieldValue, lookupValue);
-}
-
-function fieldValueInRange(
-  spec: FieldSpec | undefined,
-  valueValue: unknown,
-  lower: RelationRangeBound | undefined,
-  upper: RelationRangeBound | undefined
-): boolean {
-  if (lower !== undefined) {
-    const comparisonValue = compareFieldValueToBound(spec, valueValue, lower.value);
-    if (comparisonValue === undefined || comparisonValue < 0 || (comparisonValue === 0 && !lower.inclusive)) return false;
-  }
-  if (upper !== undefined) {
-    const comparisonValue = compareFieldValueToBound(spec, valueValue, upper.value);
-    if (comparisonValue === undefined || comparisonValue > 0 || (comparisonValue === 0 && !upper.inclusive)) return false;
-  }
-  return true;
-}
-
-function compareFieldValueToBound(spec: FieldSpec | undefined, valueValue: unknown, boundValue: unknown): number | undefined {
-  if (spec?.valueKind !== 'custom') return compareValues(valueValue, boundValue);
-  if (
-    spec.custom?.compare !== undefined
-    && fieldValueMatchesSpec(spec, valueValue)
-    && fieldValueMatchesSpec(spec, boundValue)
-  ) {
-    return spec.custom.compare(valueValue, boundValue);
-  }
-  if (spec.custom?.toScalar !== undefined && fieldValueMatchesSpec(spec, valueValue)) {
-    const scalarBoundValue = fieldValueMatchesSpec(spec, boundValue)
-      ? fieldReadValue(spec, boundValue)
-      : boundValue;
-    return compareValues(fieldReadValue(spec, valueValue), scalarBoundValue);
-  }
-  return undefined;
-}
-
-function fieldSpecDescription(spec: FieldSpec): string {
-  switch (spec.valueKind) {
-    case 'string':
-      return spec.values === undefined
-        ? 'a string'
-        : `one of ${spec.values.map((valueValue) => JSON.stringify(valueValue)).join(', ')}`;
-    case 'id':
-    case 'ref':
-    case 'anchoredPath':
-      return 'a string';
-    case 'json':
-      return 'a JSON value';
-    case 'custom':
-      return spec.custom?.description ?? `a ${spec.custom?.codec ?? 'custom'} value`;
-    default:
-      return `a ${spec.valueKind}`;
-  }
-}
-
-export function relationKeyFields(relationRef: RelationRef): readonly string[] {
-  return Array.isArray(relationRef.key) ? [...relationRef.key] : [relationRef.key as string];
-}
-
-export function relationKeyInputKey(relationRef: RelationRef, input: unknown): string | undefined {
-  const values = relationKeyInputValues(relationRef, input);
-  return values === undefined ? undefined : stableKey(values);
-}
-
-export function relationKeyInputValues(relationRef: RelationRef, input: unknown): readonly unknown[] | undefined {
-  if (!isRelationKeyInput(input)) return undefined;
-  const fields = relationKeyFields(relationRef);
-  const inputValues = fields.length === 1
-    ? [input]
-    : Array.isArray(input) && input.length === fields.length ? input : undefined;
-  if (inputValues === undefined) return undefined;
-
-  const values = inputValues.map((valueValue, indexValue) => {
-    const fieldName = fields[indexValue];
-    const spec = fieldName === undefined ? undefined : relationRef.fields[fieldName];
-    return spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
-  });
-
-  return values.length === fields.length && values.every((valueValue) => valueValue !== undefined)
-    ? values
-    : undefined;
-}
-
-export function relationFieldValueMatchesSpec(spec: FieldSpec | undefined, valueValue: unknown): boolean {
-  return spec === undefined || fieldValueMatchesSpec(spec, valueValue);
-}
-
-export function relationFieldReadValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
-  return fieldReadValue(spec, valueValue);
-}
-
-export function relationFieldKeyValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
-  return spec === undefined ? valueValue : fieldKeyValue(spec, valueValue);
-}
-
-export function relationFieldKeyInputValue(spec: FieldSpec | undefined, valueValue: unknown): unknown {
-  return spec === undefined ? valueValue : fieldKeyInputValue(spec, valueValue);
-}
-
-export function relationFieldLookupMatches(spec: FieldSpec | undefined, fieldValue: unknown, lookupValue: unknown): boolean {
-  return fieldLookupMatches(spec, fieldValue, lookupValue);
-}
-
-export function relationFieldValueInRange(
-  spec: FieldSpec | undefined,
-  valueValue: unknown,
-  lower: RelationRangeBound | undefined,
-  upper: RelationRangeBound | undefined
-): boolean {
-  return fieldValueInRange(spec, valueValue, lower, upper);
-}
-
-export function relationFieldCompareToBound(
-  spec: FieldSpec | undefined,
-  valueValue: unknown,
-  boundValue: unknown
-): number | undefined {
-  return compareFieldValueToBound(spec, valueValue, boundValue);
-}
-
-export function relationFieldSpecDescription(spec: FieldSpec): string {
-  return fieldSpecDescription(spec);
-}
-
 function isErrorDiagnostic(input: TarstateDiagnostic): boolean {
   return input.severity === 'error';
-}
-
-function stableKey(input: unknown): string {
-  if (input === undefined) return '~undefined';
-  if (typeof input === 'number') {
-    if (Number.isNaN(input)) return '~number:NaN';
-    if (input === Infinity) return '~number:Infinity';
-    if (input === -Infinity) return '~number:-Infinity';
-    if (Object.is(input, -0)) return '~number:-0';
-    return JSON.stringify(input);
-  }
-  if (input === null || typeof input === 'string' || typeof input === 'boolean') return JSON.stringify(input);
-  if (typeof input === 'bigint') return `~bigint:${input.toString()}`;
-  if (typeof input === 'symbol') return `~symbol:${String(input.description)}`;
-  if (typeof input === 'function') return `~function:${input.name}`;
-  if (Array.isArray(input)) return `[${input.map(stableKey).join(',')}]`;
-  if (isRecord(input)) {
-    return `{${Object.keys(input).sort().map((key) => `${JSON.stringify(key)}:${stableKey(input[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(String(input as string | number | boolean | bigint | null | undefined));
 }
 
 function hexFromBytes(input: Uint8Array): string {
@@ -10443,10 +9517,6 @@ function stringArray(input: unknown): readonly string[] {
   return Array.isArray(input) && input.every((item) => typeof item === 'string') ? input : [];
 }
 
-function uniqueStrings(...groups: readonly (readonly string[])[]): readonly string[] {
-  return Array.from(new Set(groups.flat()));
-}
-
 function mergeRelations(inputs: readonly Query[]): Record<string, RelationRef> {
   return Object.assign({}, ...inputs.map((input) => input.relations));
 }
@@ -10502,10 +9572,6 @@ function isHostFunction(input: unknown): input is HostFunction {
 
 function isPlainRecord(input: unknown): input is Record<string, unknown> {
   return isRecord(input) && Object.getPrototypeOf(input) === Object.prototype;
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
 function watchDiagnostic(label: string): WatchDiagnostic {

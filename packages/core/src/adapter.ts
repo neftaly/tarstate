@@ -2,11 +2,13 @@ export {
   composeSources,
   composeRelationRuntimes,
   isRelationRuntime,
-  runtimeSystemRelationList,
-  runtimeSystemRelations,
-  runtimeSystemSource,
   tryApplyRelationPatches
 } from './impl.js';
+export {
+  runtimeSystemRelationList,
+  runtimeSystemRelations,
+  runtimeSystemSource
+} from './runtime-system.js';
 export type {
   AdapterSnapshot,
   AdapterSource,
@@ -36,6 +38,10 @@ export type {
   RelationRuntimeRetainInterest,
   RelationRuntimeVersion,
   RelationSource,
+  TarstateDiagnostic,
+  WritePatch
+} from './impl.js';
+export type {
   RuntimeConflictRow,
   RuntimeDiagnosticRow,
   RuntimeHistoryRow,
@@ -51,7 +57,5 @@ export type {
   RuntimeSyncRow,
   RuntimeSyncState,
   RuntimeSystemState,
-  RuntimeSystemStateInput,
-  TarstateDiagnostic,
-  WritePatch
-} from './impl.js';
+  RuntimeSystemStateInput
+} from './runtime-system.js';

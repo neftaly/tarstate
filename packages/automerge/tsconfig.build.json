@@ -8,6 +8,8 @@
     "paths": {
       "@tarstate/core": ["../core/dist/index.d.ts"],
       "@tarstate/core/adapter": ["../core/dist/adapter.d.ts"],
+      "@tarstate/core/evaluate": ["../core/dist/evaluate.d.ts"],
+      "@tarstate/core/query": ["../core/dist/query.d.ts"],
       "@tarstate/core/relation": ["../core/dist/relation.d.ts"],
       "@tarstate/core/schema": ["../core/dist/schema.d.ts"],
       "@tarstate/core/source": ["../core/dist/source.d.ts"],
