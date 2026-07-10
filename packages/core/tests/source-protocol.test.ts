@@ -67,7 +67,7 @@ describe('generic source commit coordinator', () => {
     expect(observed).toEqual(['0', '1', 'a', 'z']);
   });
 
-  it.each(['contains', 'overlaps', 'unknown'] as const)('rejects %s where containment proof is required', async (relation) => {
+  it.each(['disjoint', 'contains', 'overlaps', 'unknown'] as const)('rejects %s where containment proof is required', async (relation) => {
     const commit = vi.fn(async () => ({ outcome: 'committed' as const, issues: [] }));
     const value = source(commit, () => relation);
     const result = await coordinateSourceCommit({ source: value, bindings: [binding('bad', { readFootprint: ['outside'], writeFootprint: [], intents: [], issues: [] })], edits: [], commit: commitInput });

@@ -95,6 +95,8 @@ export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly datasets: readonly DatasetMembership[];
   readonly canRead: (viewAuthorityScope: string, attachmentAuthorityScope: string, attachmentId: string) => boolean;
   readonly evaluate: (input: DatabaseEvaluationInput<Query, Projection>) => DatabaseEvaluation<Row>;
+  /** Already authority-filtered portable input consumed by optional tooling. */
+  readonly describeAuthorityView?: () => JsonValue;
 };
 
 export type ObserveRequest<Query> = {
@@ -112,6 +114,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   readonly #datasets: ReadonlyMap<string, DatasetMembership>;
   readonly #canRead: DatabaseViewOptions<Query, Row, Projection>['canRead'];
   readonly #evaluate: DatabaseViewOptions<Query, Row, Projection>['evaluate'];
+  readonly #describeAuthorityView: (() => JsonValue) | undefined;
   readonly #cache = new Map<string, SharedObservation<Query, Row, Projection>>();
   #closed = false;
 
@@ -123,6 +126,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     this.#datasets = new Map(options.datasets.map((dataset) => [dataset.datasetId, dataset]));
     this.#canRead = options.canRead;
     this.#evaluate = options.evaluate;
+    this.#describeAuthorityView = options.describeAuthorityView;
   }
 
   observe(request: ObserveRequest<Query>): QueryObserver<Row> {
@@ -162,6 +166,10 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   }
 
   activeMaintenanceCount(): number { return this.#cache.size; }
+
+  databaseDescriptionInput(): JsonValue | undefined {
+    return this.#describeAuthorityView?.();
+  }
 
   close(): void {
     if (this.#closed) return;

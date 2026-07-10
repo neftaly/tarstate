@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { executePresence, executeSequence, safeParseReceipt, type SourceLifecycleReceipt } from '../src/index.js';
+import { executePresence, executeSequence, safeParseReceipt, safeParseReceiptText, type SourceLifecycleReceipt } from '../src/index.js';
 
 const hash = `sha256:${'a'.repeat(64)}` as const;
 const lifecycle = (outcome: 'committed' | 'rejected' | 'unknown', sourceId = 'source:new'): SourceLifecycleReceipt => ({
@@ -10,6 +10,11 @@ describe('receipt forwarding and shell sequences', () => {
   it('forwards unknown future receipt kinds without inferring success', () => {
     const result = safeParseReceipt({ kind: 'future-workflow', receiptVersion: 8, outcome: 'committed', issues: [], payload: { retained: true } });
     expect(result).toMatchObject({ success: true, value: { kind: 'unknown_receipt', original: { kind: 'future-workflow', payload: { retained: true } }, issues: [{ code: 'receipt.unknown_kind_version', retry: 'never' }] } });
+  });
+
+  it('rejects malformed known receipts and duplicate JSON members before casting', () => {
+    expect(safeParseReceipt({ kind: 'commit', receiptVersion: 1, issues: [] })).toMatchObject({ success: false, issues: [{ code: 'receipt.invalid' }] });
+    expect(safeParseReceiptText('{"kind":"presence","kind":"presence","receiptVersion":1,"operationId":"one","attachmentId":"a","outcome":"accepted","issues":[]}')).toMatchObject({ success: false, issues: [{ code: 'artifact.duplicate_member' }] });
   });
 
   it('retains successful creation and reports its source as orphaned after a later failure', async () => {

@@ -15,6 +15,7 @@ import {
   safeParseDatabaseDescriptionText,
   safeParseIssueCodeCatalog,
   safePrepareSchemaArtifact,
+  schemaToolsIssueDeclarations,
   type AuthorityFilteredDatabaseDescriptionInput,
   type DatabaseDescriptionBudget
 } from '../src/index.js';
@@ -117,7 +118,7 @@ describe('issue catalog', () => {
     const first = await createIssueCodeCatalogArtifact({ descriptions: { 'artifact.invalid_json': 'Malformed JSON text.' } });
     const second = await createIssueCodeCatalogArtifact({ descriptions: { 'artifact.invalid_json': 'Malformed JSON text.' } });
     expect(first).toEqual(second);
-    expect(Object.keys(first.body.codes)).toEqual([...issueCatalog.keys()].sort());
+    expect(Object.keys(first.body.codes)).toEqual([...new Set([...issueCatalog.keys(), ...schemaToolsIssueDeclarations.map(({ code }) => code)])].sort());
     expect(first.body.codes['artifact.invalid_json']).toMatchObject({ phase: 'parse', retry: ['after_input'], description: 'Malformed JSON text.' });
     await expect(safeParseIssueCodeCatalog(first)).resolves.toMatchObject({ success: true, value: first });
     await expect(safeParseIssueCodeCatalog({ ...first, contentHash: hash('f') })).resolves.toMatchObject({ success: false, issues: [{ code: 'schema_tools.issue_catalog_hash_mismatch' }] });
@@ -136,6 +137,13 @@ describe('database descriptions', () => {
 
     const changed = await describeDatabase({ ...(await databaseInput()), basis: { dataset: { datasetId: 'dataset:visible', revision: 4 }, attachments: [] } });
     expect(changed.databaseFingerprint).not.toBe(description.databaseFingerprint);
+  });
+
+  it('describes a database through its explicit authority-filtered snapshot seam', async () => {
+    const input = await databaseInput();
+    const description = await describeDatabase({ databaseDescriptionInput: () => input });
+    expect(description).toMatchObject({ kind: 'tarstate.database-description', basis: input.basis });
+    await expect(describeDatabase({ databaseDescriptionInput: () => undefined })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
   });
 
   it('rejects tampering, hidden physical fields, duplicate JSON members, and bounded overflow', async () => {

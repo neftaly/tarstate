@@ -1,6 +1,6 @@
 import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
-import type { ArtifactRef, ContentHash } from './artifacts.js';
+import { isContentHash, safeParseJsonText, type ArtifactParseBudget, type ArtifactRef, type ContentHash } from './artifacts.js';
 import type { SourceBasis } from './maintenance.js';
 import type { CommitReceipt, NonAtomicBatchReceipt } from './transaction.js';
 
@@ -87,11 +87,17 @@ export const safeParseReceipt = (input: unknown): ParseResult<ForwardableReceipt
   if (!isRecord(parsed.value)) return receiptFailure('receipt.invalid', { reason: 'not_record' });
   const kind = parsed.value.kind;
   const version = parsed.value.receiptVersion;
-  if (typeof kind === 'string' && knownReceiptKinds.has(kind) && version === 1 && Array.isArray(parsed.value.issues)) {
+  if (typeof kind === 'string' && knownReceiptKinds.has(kind) && version === 1) {
+    if (!isKnownReceiptShape(parsed.value, 0)) return receiptFailure('receipt.invalid', { reason: 'known_shape', kind });
     return { success: true, value: parsed.value as unknown as KnownReceipt, issues: [] };
   }
   const issue = createIssue({ code: 'receipt.unknown_kind_version', phase: 'parse', severity: 'warning', retry: 'never', details: { kind: typeof kind === 'string' ? kind : null, version: typeof version === 'number' ? version : null } });
   return { success: true, value: { kind: 'unknown_receipt', receiptVersion: 1, original: parsed.value, issues: [issue] }, issues: [issue] };
+};
+
+export const safeParseReceiptText = (text: string, budget?: ArtifactParseBudget): ParseResult<ForwardableReceipt> => {
+  const parsed = safeParseJsonText(text, budget);
+  return parsed.success ? safeParseReceipt(parsed.value) : parsed;
 };
 
 export const executeSequence = async (input: {
@@ -149,3 +155,33 @@ export type DocumentDeclaration = {
 const knownReceiptKinds = new Set(['commit', 'non-atomic-batch', 'source-lifecycle', 'governance', 'sequence', 'presence']);
 const receiptFailure = (code: string, details: JsonValue): ParseResult<never> => ({ success: false, issues: [createIssue({ code, phase: 'parse', severity: 'error', retry: 'after_input', details })] });
 const isRecord = (value: JsonValue): value is Readonly<Record<string, JsonValue>> => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const isKnownReceiptShape = (value: Readonly<Record<string, JsonValue>>, depth: number): boolean => {
+  if (depth > 8 || value.receiptVersion !== 1 || !isIssueArray(value.issues)) return false;
+  if (value.kind === 'commit') {
+    return strings(value, ['operationEpoch', 'operationId', 'attachmentId', 'sourceId']) && hashes(value, ['transactionHash', 'intentHash', 'attachmentFingerprint']) && includes(value.outcome, ['committed', 'rejected', 'unknown']) && Array.isArray(value.statementResults) && value.statementResults.every(isStatementResult) && optionalArray(value.returning) && optionalDurability(value.durability);
+  }
+  if (value.kind === 'non-atomic-batch') {
+    return typeof value.batchId === 'string' && includes(value.outcome, ['complete', 'partial', 'failed', 'unknown']) && Array.isArray(value.steps) && value.steps.every((step) => isBatchStep(step, depth));
+  }
+  if (value.kind === 'source-lifecycle') {
+    return strings(value, ['lifecycleCoordinatorId', 'operationEpoch', 'operationId']) && isContentHash(value.commandHash) && includes(value.action, ['create', 'delete']) && includes(value.outcome, ['committed', 'rejected', 'unknown']) && (value.sourceId === undefined || typeof value.sourceId === 'string') && optionalDurability(value.durability);
+  }
+  if (value.kind === 'governance') {
+    return strings(value, ['operationEpoch', 'operationId', 'sourceId']) && isContentHash(value.commandHash) && includes(value.action, ['initialize_declaration', 'repair_declaration', 'activate_constraints']) && includes(value.outcome, ['committed', 'rejected', 'unknown']) && Array.isArray(value.selectedArtifactHashes) && value.selectedArtifactHashes.every(isContentHash) && optionalDurability(value.durability);
+  }
+  if (value.kind === 'sequence') {
+    return typeof value.sequenceId === 'string' && includes(value.outcome, ['complete', 'partial', 'failed', 'unknown']) && Array.isArray(value.orphanedSourceIds) && value.orphanedSourceIds.every((item) => typeof item === 'string') && Array.isArray(value.steps) && value.steps.every((step) => isSequenceStep(step, depth));
+  }
+  return value.kind === 'presence' && strings(value, ['operationId', 'attachmentId']) && includes(value.outcome, ['accepted', 'rejected']);
+};
+
+const isStatementResult = (value: JsonValue): boolean => isRecord(value) && Number.isSafeInteger(value.statementIndex) && ['matched', 'logicallyChanged', 'inserted', 'deleted'].every((field) => typeof value[field] === 'number' && Number.isSafeInteger(value[field]) && value[field] >= 0) && Array.isArray(value.editOutcomes) && isIssueArray(value.issues);
+const isBatchStep = (value: JsonValue, depth: number): boolean => isRecord(value) && strings(value, ['stepId', 'attachmentId', 'sourceId']) && includes(value.outcome, ['applied', 'failed', 'unattempted', 'unknown']) && (value.receipt === undefined || (isRecord(value.receipt) && isKnownReceiptShape(value.receipt, depth + 1)));
+const isSequenceStep = (value: JsonValue, depth: number): boolean => isRecord(value) && typeof value.stepId === 'string' && includes(value.outcome, ['applied', 'failed', 'unattempted', 'unknown']) && (value.receipt === undefined || (isRecord(value.receipt) && isKnownReceiptShape(value.receipt, depth + 1)));
+const isIssueArray = (value: JsonValue | undefined): boolean => Array.isArray(value) && value.every((item) => isRecord(item) && strings(item, ['id', 'code', 'severity', 'phase']));
+const strings = (value: Readonly<Record<string, JsonValue>>, fields: readonly string[]): boolean => fields.every((field) => typeof value[field] === 'string' && value[field].length > 0);
+const hashes = (value: Readonly<Record<string, JsonValue>>, fields: readonly string[]): boolean => fields.every((field) => isContentHash(value[field]));
+const includes = <Value extends string>(value: JsonValue | undefined, allowed: readonly Value[]): value is Value => typeof value === 'string' && allowed.includes(value as Value);
+const optionalArray = (value: JsonValue | undefined): boolean => value === undefined || Array.isArray(value);
+const optionalDurability = (value: JsonValue | undefined): boolean => value === undefined || includes(value, ['memory', 'local', 'persisted', 'unknown']);

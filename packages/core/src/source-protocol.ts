@@ -7,12 +7,41 @@ import type { JsonValue } from './value.js';
 export type Footprint = JsonValue;
 export type FootprintRelation = 'disjoint' | 'equal' | 'contains' | 'contained_by' | 'overlaps' | 'unknown';
 
-export type LogicalEdit = {
+export type LogicalEditTarget = {
   readonly relationId: string;
   readonly key: JsonValue;
   readonly locator: JsonValue;
+};
+
+type LogicalFieldsEdit = LogicalEditTarget & {
   readonly fields: Readonly<Record<string, JsonValue>>;
 };
+
+/** Existing callers without `kind` retain field-patch replacement semantics. */
+export type LogicalLegacyReplaceFieldsEdit = LogicalFieldsEdit & { readonly kind?: undefined };
+export type LogicalReplaceFieldsEdit = LogicalFieldsEdit & { readonly kind: 'replace-fields' };
+
+export type LogicalSemanticEdit =
+  | LogicalReplaceFieldsEdit
+  | {
+      readonly kind: 'insert';
+      readonly relationId: string;
+      readonly key: JsonValue;
+      readonly fields: Readonly<Record<string, JsonValue>>;
+    }
+  | (LogicalEditTarget & { readonly kind: 'delete' })
+  | (LogicalEditTarget & { readonly kind: 'counter-increment'; readonly field: string; readonly by: number })
+  | (LogicalEditTarget & { readonly kind: 'text-splice'; readonly field: string; readonly index: number; readonly deleteCount: number; readonly value: string })
+  | (LogicalEditTarget & { readonly kind: 'list-splice'; readonly field: string; readonly index: number; readonly deleteCount: number; readonly values: readonly JsonValue[] })
+  | (LogicalEditTarget & { readonly kind: 'conflict-resolve'; readonly field?: string; readonly observedChangeHashes: readonly string[]; readonly selectedChangeHash: string })
+  | (LogicalEditTarget & { readonly kind: 'rekey'; readonly newKey: JsonValue })
+  | (LogicalEditTarget & {
+      readonly kind: 'move-relocate';
+      readonly destination: { readonly relationId: string; readonly key: JsonValue; readonly locator?: JsonValue };
+      readonly mode: 'identity-preserving' | 'copy-relocate';
+    });
+
+export type LogicalEdit = LogicalLegacyReplaceFieldsEdit | LogicalSemanticEdit;
 
 export type StorageIntent<Command> = {
   readonly footprint: Footprint;

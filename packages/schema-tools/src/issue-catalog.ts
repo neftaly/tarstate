@@ -6,6 +6,7 @@ import {
   type ArtifactRef,
   type ContentHash,
   type Issue,
+  type IssueDeclaration,
   type IssuePhase,
   type IssueRetry,
   type JsonValue,
@@ -33,14 +34,30 @@ export type IssueCodeCatalogArtifact = {
   readonly body: IssueCodeCatalogBody;
 };
 
+export const schemaToolsIssueDeclarations: readonly IssueDeclaration[] = [
+  { code: 'schema_tools.artifact_kind', phase: 'parse', severity: 'error', retries: ['after_input'] },
+  { code: 'schema_tools.database_description_hash_mismatch', phase: 'parse', severity: 'error', retries: ['after_input'] },
+  { code: 'schema_tools.database_description_invalid', phase: 'parse', severity: 'error', retries: ['after_input'] },
+  { code: 'schema_tools.database_description_unavailable', phase: 'resolve', severity: 'error', retries: ['after_authority', 'after_refresh'] },
+  { code: 'schema_tools.issue_catalog_hash_mismatch', phase: 'parse', severity: 'error', retries: ['after_input'] },
+  { code: 'schema_tools.issue_catalog_invalid', phase: 'parse', severity: 'error', retries: ['after_input'] }
+];
+
 export const createIssueCodeCatalogArtifact = async (options: {
   readonly id?: string;
   readonly descriptions?: Readonly<Record<string, string>>;
+  readonly declarations?: readonly IssueDeclaration[];
 } = {}): Promise<IssueCodeCatalogArtifact> => {
   const id = options.id ?? 'urn:tarstate:issue-code-catalog:v1';
   const descriptions = options.descriptions ?? {};
   const codes: Record<string, IssueCodeCatalogEntry> = {};
-  for (const [code, declaration] of [...issueCatalog.entries()].sort(([left], [right]) => compare(left, right))) {
+  const declarations = new Map(issueCatalog);
+  for (const declaration of [...schemaToolsIssueDeclarations, ...(options.declarations ?? [])]) {
+    const previous = declarations.get(declaration.code);
+    if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(declaration)) throw new Error('Conflicting issue declaration: ' + declaration.code);
+    declarations.set(declaration.code, declaration);
+  }
+  for (const [code, declaration] of [...declarations.entries()].sort(([left], [right]) => compare(left, right))) {
     const description = descriptions[code];
     codes[code] = {
       phase: declaration.phase,

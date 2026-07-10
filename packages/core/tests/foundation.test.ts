@@ -48,6 +48,25 @@ describe('production foundation', () => {
     expect(logicalNot(logicalUnknown)).toBe(logicalUnknown);
   });
 
+  it('implements the complete strong Kleene truth tables', () => {
+    const values = [true, false, logicalUnknown] as const;
+    const andTable = [
+      [true, false, logicalUnknown],
+      [false, false, false],
+      [logicalUnknown, false, logicalUnknown]
+    ];
+    const orTable = [
+      [true, true, true],
+      [true, false, logicalUnknown],
+      [true, logicalUnknown, logicalUnknown]
+    ];
+    values.forEach((left, leftIndex) => values.forEach((right, rightIndex) => {
+      expect(logicalAnd([left, right])).toBe(andTable[leftIndex]?.[rightIndex]);
+      expect(logicalOr([left, right])).toBe(orTable[leftIndex]?.[rightIndex]);
+    }));
+    expect(values.map(logicalNot)).toEqual([false, true, logicalUnknown]);
+  });
+
   it('canonicalizes JSON deterministically and normalizes negative zero', () => {
     expect(canonicalizeJson({ z: -0, a: ['x', { b: true, a: null }] })).toBe('{"a":["x",{"a":null,"b":true}],"z":0}');
     expect(() => canonicalizeJson('\ud800')).toThrow(/Lone surrogate/);
@@ -118,6 +137,26 @@ describe('production foundation', () => {
     expect(close).not.toHaveBeenCalled();
     second.release();
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps capability upgrades and downgrades exact rather than version-ordered', async () => {
+    const v1: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:versioned', version: '1', class: 'function', contract: { operation: 'versioned-1' }, implies: [] };
+    const v2: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:versioned', version: '2', class: 'function', contract: { operation: 'versioned-2' }, implies: [] };
+    const v1Ref = await capabilityRefFor(v1);
+    const v2Ref = await capabilityRefFor(v2);
+    const upgraded = new CapabilityRegistry('trust:versions');
+    await upgraded.registerDeclaration(v1);
+    await upgraded.registerDeclaration(v2);
+    upgraded.registerImplementation({ ref: v2Ref, integrity: 'sha256:v2', implementation: {} });
+    expect(upgraded.satisfies(v2Ref)).toBe(true);
+    expect(upgraded.satisfies(v1Ref)).toBe(false);
+
+    const downgraded = new CapabilityRegistry('trust:versions');
+    await downgraded.registerDeclaration(v1);
+    downgraded.registerImplementation({ ref: v1Ref, integrity: 'sha256:v1', implementation: {} });
+    expect(downgraded.satisfies(v1Ref)).toBe(true);
+    expect(downgraded.satisfies(v2Ref)).toBe(false);
+    expect(await downgraded.fingerprint()).not.toBe(await upgraded.fingerprint());
   });
 
   it('routes full recomputation through the same maintenance session seam', () => {

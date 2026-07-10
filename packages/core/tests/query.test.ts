@@ -107,11 +107,19 @@ describe('production query oracle', () => {
       groupBy: {},
       measures: {
         count: { kind: 'aggregate', op: 'count' },
+        countDistinct: { kind: 'aggregate', op: 'count-distinct', value: { kind: 'field', alias: 'item', name: 'score' } },
         sum: { kind: 'aggregate', op: 'sum', value: { kind: 'field', alias: 'item', name: 'score' } },
-        every: { kind: 'aggregate', op: 'every', value: { kind: 'field', alias: 'item', name: 'ok' } }
+        average: { kind: 'aggregate', op: 'average', value: { kind: 'field', alias: 'item', name: 'score' } },
+        minimum: { kind: 'aggregate', op: 'minimum', value: { kind: 'field', alias: 'item', name: 'score' } },
+        maximum: { kind: 'aggregate', op: 'maximum', value: { kind: 'field', alias: 'item', name: 'score' } },
+        any: { kind: 'aggregate', op: 'any', value: { kind: 'field', alias: 'item', name: 'ok' } },
+        every: { kind: 'aggregate', op: 'every', value: { kind: 'field', alias: 'item', name: 'ok' } },
+        collect: { kind: 'aggregate', op: 'collect', value: { kind: 'field', alias: 'item', name: 'score' } },
+        first: { kind: 'aggregate', op: 'first', value: { kind: 'field', alias: 'item', name: 'score' } },
+        last: { kind: 'aggregate', op: 'last', value: { kind: 'field', alias: 'item', name: 'score' } }
       }
     };
-    expect(evaluateQuery({ root: aggregate, relations: [relation('empty', [])] }).rows).toEqual([{ count: 0, sum: null, every: true }]);
+    expect(evaluateQuery({ root: aggregate, relations: [relation('empty', [])] }).rows).toEqual([{ count: 0, countDistinct: 0, sum: null, average: null, minimum: null, maximum: null, any: false, every: true, collect: [], first: null, last: null }]);
 
     const window: QueryNode = {
       kind: 'window',
@@ -203,6 +211,7 @@ describe('production query oracle', () => {
     const cursor = { order: [1], resultKey: ordered.resultKeys[0] as string, basis: { revision: 4 }, membershipRevision: 9, mode: 'live' as const };
     expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 4 }, membershipRevision: 9 }).rows).toEqual([{ id: 2 }, { id: 3 }]);
     expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 5 }, membershipRevision: 9 })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.cursor_stale' }] });
+    expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 4 }, membershipRevision: 10 })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.cursor_stale' }] });
   });
 
   it('orders ordinary values before null then missing regardless of direction', () => {
@@ -219,5 +228,23 @@ describe('production query oracle', () => {
     const reincarnated = evaluateQuery({ root, relations: [{ ...base, attachmentId: 'attachment:new', occurrenceIds: ['source:row:incarnation:2'] }] });
     expect(replacement.resultKeys).toEqual(first.resultKeys);
     expect(reincarnated.resultKeys).not.toEqual(first.resultKeys);
+  });
+
+  it('keeps aliases and occurrence lineage distinct in a self join', () => {
+    const root: QueryNode = {
+      kind: 'join', join: 'inner', left: from('people', 'left'), right: from('people', 'right'),
+      on: { kind: 'compare', op: 'lt', left: { kind: 'field', alias: 'left', name: 'id' }, right: { kind: 'field', alias: 'right', name: 'id' } }
+    };
+    const result = evaluateQuery({ root, relations: [{ ...relation('people', [{ id: 1 }, { id: 2 }]), occurrenceIds: ['person:1', 'person:2'] }] });
+    expect(result.rows).toEqual([{ left: { id: 1 }, right: { id: 2 } }]);
+    expect(result.resultKeys[0]).toContain('left=person:1');
+    expect(result.resultKeys[0]).toContain('right=person:2');
+  });
+
+  it('turns a throwing named function into unavailable completeness', () => {
+    const capability: CapabilityRef = { id: 'urn:test:throwing', version: '1', contractHash: `sha256:${'c'.repeat(64)}` };
+    const functions = new Map([[capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash, () => { throw new Error('boom'); }]]);
+    const result = evaluateQuery({ root: { kind: 'select', input: { kind: 'values', alias: 'v', rows: [{}] }, alias: 'out', fields: { value: { kind: 'call', capability, args: [] } } }, relations: [], functions });
+    expect(result).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.function_failed' }] });
   });
 });

@@ -68,6 +68,10 @@ export type DatabaseDescription = {
 
 export type AuthorityFilteredDatabaseDescriptionInput = Omit<DatabaseDescription, 'kind' | 'formatVersion' | 'databaseFingerprint'>;
 
+export type DescribableDatabase = {
+  readonly databaseDescriptionInput: () => unknown;
+};
+
 export type DatabaseDescriptionBudget = ArtifactParseBudget & {
   readonly maxDatasets: number;
   readonly maxRelations: number;
@@ -87,7 +91,9 @@ export const defaultDatabaseDescriptionBudget: DatabaseDescriptionBudget = {
 };
 
 /** Consumes an already authority-filtered shell snapshot; it performs no grant widening. */
-export const describeDatabase = async (input: AuthorityFilteredDatabaseDescriptionInput, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<DatabaseDescription> => {
+export const describeDatabase = async (source: AuthorityFilteredDatabaseDescriptionInput | DescribableDatabase, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<DatabaseDescription> => {
+  const input = isDescribableDatabase(source) ? source.databaseDescriptionInput() : source;
+  if (!isDescriptionInput(input)) throw new TarstateParseError([toolIssue('schema_tools.database_description_unavailable', { reason: 'authority_filtered_snapshot_unavailable' })]);
   const normalized = normalizeDescriptionInput(input);
   const provisional = { kind: 'tarstate.database-description', formatVersion: 1, ...normalized } as const;
   const portable = safeParseJsonValue(provisional, budget);
@@ -162,6 +168,9 @@ const normalizeDescriptionInput = (input: AuthorityFilteredDatabaseDescriptionIn
   capabilityImplications: [...input.capabilityImplications].map((item) => ({ provided: normalizeCapability(item.provided), implies: normalizeCapability(item.implies) })).sort((left, right) => compare(capabilityKey(left.provided), capabilityKey(right.provided)) || compare(capabilityKey(left.implies), capabilityKey(right.implies))),
   issueCodeCatalog: normalizeRef(input.issueCodeCatalog)
 });
+
+const isDescribableDatabase = (value: unknown): value is DescribableDatabase => value !== null && typeof value === 'object' && typeof (value as { readonly databaseDescriptionInput?: unknown }).databaseDescriptionInput === 'function';
+const isDescriptionInput = (value: unknown): value is AuthorityFilteredDatabaseDescriptionInput => value !== null && typeof value === 'object' && 'registryFingerprint' in value && 'basis' in value && 'datasets' in value && 'relations' in value && 'commands' in value && 'capabilityImplications' in value && 'issueCodeCatalog' in value;
 
 const parseBasis = (value: unknown): ParseResult<DescriptionObservationBasis> => {
   if (!isRecord(value) || !exactKeys(value, ['attachments', 'dataset']) || !isRecord(value.dataset) || !exactKeys(value.dataset, ['datasetId', 'revision']) || typeof value.dataset.datasetId !== 'string' || !isRevision(value.dataset.revision) || !Array.isArray(value.attachments)) return invalid(['basis']);

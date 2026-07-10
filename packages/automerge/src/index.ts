@@ -1,3 +1,4 @@
+export * from './core-adapter.js';
 export * from './move.js';
 export * from './projection.js';
 export * from './source.js';
