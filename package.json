@@ -16,6 +16,7 @@
     "check:release": "pnpm check && pnpm bench && tsc -p tsconfig.release.json && node scripts/verify-release.mjs",
     "lint": "oxlint . --deny-warnings --type-aware",
     "test": "pnpm --filter './packages/*' test",
+    "test:fuzz": "pnpm --filter './packages/*' --if-present test:fuzz",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "typecheck:budget": "pnpm --filter @tarstate/core typecheck:budget"
   },

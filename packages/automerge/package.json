@@ -19,6 +19,7 @@
   "scripts": {
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
+    "test:fuzz": "vitest run --config ../../vite.config.ts tests/fuzz-properties.test.ts",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
