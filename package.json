@@ -9,7 +9,8 @@
     "node": ">=24.12.0"
   },
   "scripts": {
-    "bench": "pnpm --filter @tarstate/core --filter @tarstate/automerge --filter @tarstate/react bench",
+    "bench": "pnpm --filter './packages/*' --if-present bench",
+    "bench:legacy": "node scripts/legacy-benchmark.mjs",
     "build": "pnpm --filter './packages/*' -r build",
     "check": "pnpm lint && pnpm typecheck && pnpm build && pnpm test",
     "dev": "pnpm -r --filter './apps/*' --parallel dev",
