@@ -1,138 +1,25 @@
 # Tarstate
 
-Tarstate is a set of hooks for React (and other libs), that lets you query state trees like a database.
-It's a fast, disposable way to glue unrelated data sources together.
+Tarstate is being redesigned as a functional, reactive relational interface
+over authority-scoped local-first sources. Automerge documents are the primary
+durable source of truth; Zustand, TanStack Store, and similar stores attach
+through a generic atomic-source protocol.
 
-Tarstate is **alpha quality** software.
+The existing implementation is archived evidence, not the next public API.
+Production rewrite work has not started. The current source of truth is the
+[Tarstate v1 normative design packet](docs/v1/README.md), including its required
+executable spikes and conformance gates.
 
-It also generates JSON-serializable schemas, describing your data in terms of relationships, that typescript can read as types. This is different from `json-schema`, and justified by [parse not validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/). It is intended to support [schema evolution](https://www.inkandswitch.com/cambria/), i.e. so changing your state tree in the future won't break things.
+Key boundaries:
 
-Perf and GC targets systems programming and video games.
-Work is shared between queries, and is faster than hand-rolled state management at scale.
+- portable schemas, queries, constraints, transactions, mappings, and lenses;
+- a pure functional core with an imperative source/React/network shell;
+- multi-source reads with explicit evidence, but atomic writes only within one
+  source;
+- functional `pipe` authoring rather than fluent query chains;
+- structured parse results, capability gaps, and receipts suitable for people,
+  applications, and agents.
 
-Tarstate is largely a TypeScript adaptation of
-[wotbrew/relic](https://github.com/wotbrew/relic), after
-[Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf).
-
-### TS Integration
-
-Run this command when the schema changes:
-
-```sh
-tarstate-schema generate src/schema.manifest.json --out src/generated/tarstate --artifacts typescript
-```
-
-It writes `src/generated/tarstate/rows.d.ts`. Because that file is under
-`src`, TypeScript and most IDEs will see the automatic types.
-
-## Schemas
-
-[Schemas](./docs/schema-spec.md) are JSON-compatible manifests that describe the shape of data.
-
-```js
-import { hydrateSchemaManifest } from '@tarstate/core/schema';
-
-export const schema = hydrateSchemaManifest({
-  "kind": "tarstate.schema",
-  "formatVersion": 1,
-  "schemaId": "example.pizza-ordering@1",
-  "relations": {
-    "bases": { "key": "name", "fields": {
-      "name": { "type": "string" },
-      "style": { "type": "string" }
-    } },
-    "pizzas": { "key": "name", "fields": {
-      "name": { "type": "string" },
-      "base": { "type": "ref", "target": { "relation": "bases", "field": "name" } },
-      "price": { "type": "number" }
-    } },
-    "toppings": { "key": ["pizza", "name"], "fields": {
-      "pizza": { "type": "ref", "target": { "relation": "pizzas", "field": "name" } },
-      "name": { "type": "string" },
-      "extra": { "type": "boolean" } } }
-  }
-})
-
-export const initialState = {
-  bases: [
-    { name: 'thin', style: 'Neapolitan' },
-    { name: 'pan', style: 'Detroit' }
-  ],
-  pizzas: [
-    { name: 'margherita', base: 'thin', price: 18 },
-    { name: 'pepperoni', base: 'thin', price: 21 }
-  ],
-  toppings: [
-    { pizza: 'margherita', name: 'mozzarella', extra: false },
-    { pizza: 'margherita', name: 'basil', extra: false },
-    { pizza: 'pepperoni', name: 'pepperoni', extra: true }
-  ]
-}
-```
-
-## React example
-
-This component gets its document handle from Automerge Repo's React context.
-Tarstate then subscribes to a query view and persists relation-level updates
-through that handle.
-
-```tsx
-import type { DocHandle } from '@automerge/automerge-repo';
-import { useHandle } from '@automerge/automerge-repo-react-hooks';
-import { type AutomergeRelationDocument } from '@tarstate/automerge';
-import { useAutomergeDocHandleStore } from '@tarstate/automerge/react';
-import { useStoreView } from '@tarstate/react';
-import { as, asc, eq, from, join, pipe, select, sort } from '@tarstate/core/query';
-import { schemaRelations } from '@tarstate/core/schema';
-import { updateByKey } from '@tarstate/core/write';
-import { schema } from './schema';
-import type { SchemaRows } from './generated/tarstate/rows';
-
-const relations = schemaRelations<SchemaRows>(schema);
-type PizzaDoc = AutomergeRelationDocument<typeof relations>;
-
-const base = as(relations.bases, 'base');
-const pizza = as(relations.pizzas, 'pizza');
-
-// Read pizzas with their base style and price.
-const pizzaMenu = pipe(
-  from(pizza),
-  join(from(base), eq(pizza.row.base, base.row.name)),
-  sort(asc(pizza.row.name)),
-  select({
-    base: pizza.row.base,
-    name: pizza.row.name,
-    style: base.row.style,
-    price: pizza.row.price
-  })
-);
-
-export function App({ documentId }: { readonly documentId: string }) {
-  const handle = useHandle<PizzaDoc>(documentId);
-  return handle && <PizzaMenu handle={handle} />;
-}
-
-function PizzaMenu({ handle }: { readonly handle: DocHandle<PizzaDoc> }) {
-  const pizzaStore = useAutomergeDocHandleStore(handle, relations);
-  const menu = useStoreView(pizzaStore, pizzaMenu);
-
-  const makeDetroitStyle = (pizzaName: string) =>
-    void pizzaStore.commit(updateByKey(relations.pizzas, pizzaName, { base: 'pan' }));
-
-  return (
-    <section>
-      <h2>Pizza menu</h2>
-      <ul>
-        {menu.rows.map((row) => (
-          <li key={row.name}>
-            {row.name} ({row.style}) - ${row.price}
-            <button type="button" onClick={() => makeDetroitStyle(row.name)}>
-              make Detroit style
-            </button>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-```
+Legacy code and tests remain temporarily because they are useful behavioral
+oracles for the spikes. They may be deleted only after the replacement evidence
+required by the design packet exists.
