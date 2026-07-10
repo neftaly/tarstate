@@ -52,9 +52,49 @@ export type MutationState = {
   readonly mutations: readonly MutationEntry[];
 };
 
+export type OptimisticProjection<Row> = {
+  readonly rows: readonly Row[];
+  readonly resultKeys: readonly string[];
+};
+
+export type OptimisticOverlayInput<Query, Row> = {
+  readonly request: ObserveRequest<Query>;
+  readonly authoritative: ObserverSnapshot<Row>;
+  readonly rows: readonly Row[];
+  readonly resultKeys: readonly string[];
+  readonly sourceBasis: JsonValue;
+  readonly observedBasis: JsonValue;
+  readonly rebased: boolean;
+};
+
+/** Host-authored UI projection. It grants no write authority and is never a transaction guard. */
+export type OptimisticOverlay<Query, Row> = {
+  readonly sourceId: string;
+  readonly sourceBasis: JsonValue;
+  appliesTo?(request: ObserveRequest<Query>): boolean;
+  project(input: OptimisticOverlayInput<Query, Row>): OptimisticProjection<Row>;
+};
+
+export type OptimisticOverlayFactory<Query, Row> = (attempt: TransactionAttempt) => OptimisticOverlay<Query, Row> | undefined;
+
+export type OptimisticOperationEvidence = {
+  readonly operationEpoch: string;
+  readonly operationId: string;
+  readonly attachmentId: string;
+  readonly sourceId: string;
+  readonly sourceBasis: JsonValue;
+  readonly observedBasis: JsonValue;
+  readonly rebased: boolean;
+};
+
+export type ReactObserverSnapshot<Row> = ObserverSnapshot<Row> & {
+  readonly optimistic?: { readonly operations: readonly OptimisticOperationEvidence[] };
+};
+
 export type TarstateProviderProps<Query = unknown, Row = unknown> = {
   readonly database: ObservableDatabase<Query, Row>;
   readonly commit?: (attempt: TransactionAttempt) => Promise<CommitReceipt>;
+  readonly optimisticOverlay?: OptimisticOverlayFactory<Query, Row>;
   readonly serverObservations?: readonly ServerObservation<Query, Row>[];
   readonly children?: ReactNode;
 };
@@ -63,46 +103,51 @@ type Runtime = {
   readonly database: ErasedDatabase;
   readonly serverObservations: ReadonlyMap<string, ObserverSnapshot<unknown>>;
   readonly mutationStore: MutationStore;
+  readonly overlayStore: OptimisticOverlayStore;
+  readonly acquire: () => () => void;
 };
 
 const TarstateContext = createContext<Runtime | undefined>(undefined);
 
 /** Borrows a database. Unmounting never closes the database or its sources. */
-export const TarstateProvider = <Query, Row>({ database, commit, serverObservations = emptyServerObservations as readonly ServerObservation<Query, Row>[], children }: TarstateProviderProps<Query, Row>): ReactNode => {
-  const runtime = useMemo<Runtime>(() => ({
-    database: database as unknown as ErasedDatabase,
-    serverObservations: normalizeServerObservations(database, serverObservations),
-    mutationStore: new MutationStore(commit)
-  }), [database, commit, serverObservations]);
+export const TarstateProvider = <Query, Row>({ database, commit, optimisticOverlay, serverObservations = emptyServerObservations as readonly ServerObservation<Query, Row>[], children }: TarstateProviderProps<Query, Row>): ReactNode => {
+  const runtime = useMemo<Runtime>(() => createRuntime(
+    database as unknown as ErasedDatabase,
+    normalizeServerObservations(database, serverObservations),
+    commit,
+    optimisticOverlay as unknown as ErasedOptimisticOverlayFactory | undefined
+  ), [database, commit, optimisticOverlay, serverObservations]);
+  useEffect(() => runtime.acquire(), [runtime]);
   return createElement(TarstateContext.Provider, { value: runtime }, children);
 };
 
 export const useDatabase = <Query = unknown, Row = unknown>(): ObservableDatabase<Query, Row> =>
   useRuntime().database as unknown as ObservableDatabase<Query, Row>;
 
-export type QueryHookOptions<Row, Selected = ObserverSnapshot<Row>> = {
+export type QueryHookOptions<Row, Selected = ReactObserverSnapshot<Row>> = {
   readonly parameters?: Readonly<Record<string, JsonValue>>;
   readonly allowPartial?: boolean;
-  readonly select?: (snapshot: ObserverSnapshot<Row>) => Selected;
+  readonly select?: (snapshot: ReactObserverSnapshot<Row>) => Selected;
   readonly isEqual?: (left: Selected, right: Selected) => boolean;
 };
 
 export function useQuery<Query, Row, Selected>(
   plan: ReactPreparedPlan<Query, Row>,
-  options: QueryHookOptions<Row, Selected> & { readonly select: (snapshot: ObserverSnapshot<Row>) => Selected }
+  options: QueryHookOptions<Row, Selected> & { readonly select: (snapshot: ReactObserverSnapshot<Row>) => Selected }
 ): Selected;
 export function useQuery<Query, Row>(
   plan: ReactPreparedPlan<Query, Row>,
   options?: Omit<QueryHookOptions<Row>, 'select'>
-): ObserverSnapshot<Row>;
-export function useQuery<Query, Row, Selected = ObserverSnapshot<Row>>(
+): ReactObserverSnapshot<Row>;
+export function useQuery<Query, Row, Selected = ReactObserverSnapshot<Row>>(
   plan: ReactPreparedPlan<Query, Row>,
   options: QueryHookOptions<Row, Selected> = {}
 ): Selected {
   const runtime = useRuntime();
   const request = queryRequest(plan, options);
   const key = queryObservationKey(runtime.database, request);
-  const store = queryStore<Query, Row>(runtime.database, request, key);
+  const baseStore = queryStore<Query, Row>(runtime.database, request, key);
+  const store = runtime.overlayStore.view<Query, Row>(baseStore, request, key);
   const serverSnapshot = runtime.serverObservations.get(key) as ObserverSnapshot<Row> | undefined;
   const select = options.select ?? identitySnapshot<Row, Selected>;
   return useExternalStoreWithSelector(
@@ -196,7 +241,54 @@ const normalizeServerObservations = <Query, Row>(database: ObservableDatabase<Qu
 };
 
 type ErasedDatabase = ObservableDatabase<unknown, unknown>;
+type ErasedOptimisticOverlayFactory = OptimisticOverlayFactory<unknown, unknown>;
+type ActiveOptimisticOverlay = {
+  readonly mutationId: number;
+  readonly operationEpoch: string;
+  readonly operationId: string;
+  readonly attachmentId: string;
+  readonly sourceId: string;
+  readonly sourceBasis: JsonValue;
+  readonly definition: OptimisticOverlay<unknown, unknown>;
+};
 const storesByDatabase = new WeakMap<object, Map<string, QueryStore<unknown>>>();
+
+const createRuntime = (
+  database: ErasedDatabase,
+  serverObservations: ReadonlyMap<string, ObserverSnapshot<unknown>>,
+  commit: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined,
+  optimisticOverlay: ErasedOptimisticOverlayFactory | undefined
+): Runtime => {
+  const overlayStore = new OptimisticOverlayStore();
+  const mutationStore = new MutationStore(commit, overlayStore, optimisticOverlay);
+  let acquisitions = 0;
+  let closeGeneration = 0;
+  let closed = false;
+  return {
+    database,
+    serverObservations,
+    mutationStore,
+    overlayStore,
+    acquire: () => {
+      if (closed) throw new Error('Tarstate provider runtime is closed');
+      acquisitions += 1;
+      closeGeneration += 1;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        acquisitions -= 1;
+        const generation = ++closeGeneration;
+        queueMicrotask(() => {
+          if (closed || acquisitions !== 0 || generation !== closeGeneration) return;
+          closed = true;
+          mutationStore.close();
+          overlayStore.close();
+        });
+      };
+    }
+  };
+};
 
 const queryStore = <Query, Row>(database: ErasedDatabase, request: ObserveRequest<Query>, key: string): QueryStore<Row> => {
   let stores = storesByDatabase.get(database);
@@ -268,14 +360,192 @@ class QueryStore<Row> {
   }
 }
 
+class OptimisticOverlayStore {
+  readonly #overlays = new Map<number, ActiveOptimisticOverlay>();
+  readonly #views = new Map<string, OptimisticQueryView<unknown, unknown>>();
+  #revision = 0;
+  #closed = false;
+
+  get revision(): number { return this.#revision; }
+
+  view<Query, Row>(base: QueryStore<Row>, request: ObserveRequest<Query>, key: string): OptimisticQueryView<Query, Row> {
+    const existing = this.#views.get(key);
+    if (existing !== undefined) return existing as OptimisticQueryView<Query, Row>;
+    const view = new OptimisticQueryView(this, base, request, () => {
+      if (this.#views.get(key) === view) this.#views.delete(key);
+    });
+    this.#views.set(key, view as OptimisticQueryView<unknown, unknown>);
+    return view;
+  }
+
+  add(mutationId: number, attempt: TransactionAttempt, definition: OptimisticOverlay<unknown, unknown>): void {
+    if (this.#closed) return;
+    // Validate the opaque basis now so projection callbacks never receive a
+    // host-only or non-canonical value disguised as source evidence.
+    canonicalizeJson(definition.sourceBasis);
+    const sourceBasis = deepFreezeClone(definition.sourceBasis);
+    this.#overlays.set(mutationId, {
+      mutationId,
+      operationEpoch: attempt.operationEpoch,
+      operationId: attempt.operationId,
+      attachmentId: attempt.attachmentId,
+      sourceId: definition.sourceId,
+      sourceBasis,
+      definition
+    });
+    this.#changed();
+  }
+
+  resolve(mutationId: number, receipt: CommitReceipt): void {
+    const overlay = this.#overlays.get(mutationId);
+    if (overlay === undefined || overlay.operationEpoch !== receipt.operationEpoch || overlay.operationId !== receipt.operationId) return;
+    this.#overlays.delete(mutationId);
+    this.#changed();
+  }
+
+  project<Query, Row>(authoritative: ObserverSnapshot<Row>, request: ObserveRequest<Query>): ReactObserverSnapshot<Row> {
+    if (authoritative.state === 'closed' || authoritative.current.completeness === 'unknown' || this.#overlays.size === 0) return authoritative;
+    let rows = authoritative.current.rows;
+    let resultKeys = authoritative.current.resultKeys;
+    const operations: OptimisticOperationEvidence[] = [];
+    for (const overlay of this.#overlays.values()) {
+      const definition = overlay.definition as OptimisticOverlay<Query, Row>;
+      if (definition.appliesTo !== undefined) {
+        let applies = false;
+        try { applies = definition.appliesTo(request); } catch { applies = false; }
+        if (!applies) continue;
+      }
+      const source = authoritative.current.basis.attachments.find((candidate) => candidate.attachmentId === overlay.attachmentId && candidate.sourceId === overlay.sourceId);
+      if (source === undefined) continue;
+      const observedBasis = source.basis;
+      const rebased = canonicalizeJson(observedBasis) !== canonicalizeJson(overlay.sourceBasis);
+      let projection: OptimisticProjection<Row>;
+      try {
+        projection = definition.project({ request, authoritative, rows, resultKeys, sourceBasis: overlay.sourceBasis, observedBasis, rebased });
+      } catch {
+        continue;
+      }
+      if (projection.rows.length !== projection.resultKeys.length || new Set(projection.resultKeys).size !== projection.resultKeys.length) continue;
+      rows = projection.rows;
+      resultKeys = projection.resultKeys;
+      operations.push({
+        operationEpoch: overlay.operationEpoch,
+        operationId: overlay.operationId,
+        attachmentId: overlay.attachmentId,
+        sourceId: overlay.sourceId,
+        sourceBasis: overlay.sourceBasis,
+        observedBasis,
+        rebased
+      });
+    }
+    if (operations.length === 0) return authoritative;
+    return deepFreezeClone({
+      ...authoritative,
+      current: { ...authoritative.current, rows, resultKeys },
+      optimistic: { operations }
+    });
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#overlays.clear();
+    for (const view of Array.from(this.#views.values())) view.close();
+    this.#views.clear();
+  }
+
+  #changed(): void {
+    this.#revision += 1;
+    for (const view of this.#views.values()) view.overlayChanged();
+  }
+}
+
+class OptimisticQueryView<Query, Row> {
+  readonly #overlays: OptimisticOverlayStore;
+  readonly #base: QueryStore<Row>;
+  readonly #request: ObserveRequest<Query>;
+  readonly #collect: () => void;
+  readonly #listeners = new Set<() => void>();
+  #unsubscribeBase: (() => void) | undefined;
+  #baseSnapshot: ObserverSnapshot<Row> | undefined;
+  #overlayRevision = -1;
+  #snapshot: ReactObserverSnapshot<Row> | undefined;
+  #closeGeneration = 0;
+  #closed = false;
+
+  constructor(overlays: OptimisticOverlayStore, base: QueryStore<Row>, request: ObserveRequest<Query>, collect: () => void) {
+    this.#overlays = overlays;
+    this.#base = base;
+    this.#request = request;
+    this.#collect = collect;
+    this.#scheduleClose();
+  }
+
+  readonly getSnapshot = (): ReactObserverSnapshot<Row> => this.#recompute();
+
+  readonly subscribe = (listener: () => void): (() => void) => {
+    if (this.#closed) return () => undefined;
+    this.#listeners.add(listener);
+    this.#closeGeneration += 1;
+    if (this.#unsubscribeBase === undefined) this.#unsubscribeBase = this.#base.subscribe(() => this.#refresh());
+    return () => {
+      if (!this.#listeners.delete(listener)) return;
+      if (this.#listeners.size === 0) this.#scheduleClose();
+    };
+  };
+
+  overlayChanged(): void { this.#refresh(); }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#unsubscribeBase?.();
+    this.#unsubscribeBase = undefined;
+    this.#listeners.clear();
+    this.#snapshot = undefined;
+    this.#baseSnapshot = undefined;
+    this.#collect();
+  }
+
+  #refresh(): void {
+    if (this.#closed) return;
+    const previous = this.#snapshot;
+    const next = this.#recompute();
+    if (previous === next) return;
+    for (const listener of Array.from(this.#listeners)) listener();
+  }
+
+  #recompute(): ReactObserverSnapshot<Row> {
+    const baseSnapshot = this.#base.getSnapshot();
+    if (this.#snapshot !== undefined && this.#baseSnapshot === baseSnapshot && this.#overlayRevision === this.#overlays.revision) return this.#snapshot;
+    this.#baseSnapshot = baseSnapshot;
+    this.#overlayRevision = this.#overlays.revision;
+    this.#snapshot = this.#overlays.project(baseSnapshot, this.#request);
+    return this.#snapshot;
+  }
+
+  #scheduleClose(): void {
+    const generation = ++this.#closeGeneration;
+    queueMicrotask(() => {
+      if (this.#closed || generation !== this.#closeGeneration || this.#listeners.size !== 0) return;
+      this.close();
+    });
+  }
+}
+
 class MutationStore {
   readonly #commitImplementation: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined;
+  readonly #overlayStore: OptimisticOverlayStore;
+  readonly #optimisticOverlay: ErasedOptimisticOverlayFactory | undefined;
   readonly #listeners = new Set<() => void>();
   #snapshot: MutationState = emptyMutationState;
   #nextMutationId = 1;
+  #closed = false;
 
-  constructor(commit: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined) {
+  constructor(commit: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined, overlayStore: OptimisticOverlayStore, optimisticOverlay: ErasedOptimisticOverlayFactory | undefined) {
     this.#commitImplementation = commit;
+    this.#overlayStore = overlayStore;
+    this.#optimisticOverlay = optimisticOverlay;
   }
 
   readonly getSnapshot = (): MutationState => this.#snapshot;
@@ -286,8 +556,15 @@ class MutationStore {
   };
 
   readonly commit: Commit = async (attempt) => {
+    if (this.#closed) throw new Error('Tarstate provider runtime is closed');
     if (this.#commitImplementation === undefined) throw new Error('TarstateProvider has no commit implementation');
     const mutationId = this.#nextMutationId++;
+    if (this.#optimisticOverlay !== undefined) {
+      try {
+        const overlay = this.#optimisticOverlay(attempt);
+        if (overlay !== undefined) this.#overlayStore.add(mutationId, attempt, overlay);
+      } catch { /* an advisory projection cannot block the real commit */ }
+    }
     this.#replace({
       mutationId,
       operationEpoch: attempt.operationEpoch,
@@ -297,6 +574,7 @@ class MutationStore {
     });
     try {
       const receipt = await this.#commitImplementation(attempt);
+      this.#overlayStore.resolve(mutationId, receipt);
       this.#replace({
         mutationId,
         operationEpoch: attempt.operationEpoch,
@@ -320,6 +598,7 @@ class MutationStore {
   };
 
   #replace(entry: MutationEntry): void {
+    if (this.#closed) return;
     const replaced = [...this.#snapshot.mutations.filter(({ mutationId }) => mutationId !== entry.mutationId), deepFreezeClone(entry)];
     const pending = replaced.filter(({ state }) => state === 'pending');
     const settled = replaced.filter(({ state }) => state !== 'pending').slice(-100);
@@ -330,11 +609,18 @@ class MutationStore {
     });
     for (const listener of Array.from(this.#listeners)) listener();
   }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#listeners.clear();
+    this.#snapshot = emptyMutationState;
+  }
 }
 
 const emptyMutationState: MutationState = Object.freeze({ pendingCount: 0, mutations: Object.freeze([]) });
 
-const identitySnapshot = <Row, Selected>(snapshot: ObserverSnapshot<Row>): Selected => snapshot as Selected;
+const identitySnapshot = <Row, Selected>(snapshot: ReactObserverSnapshot<Row>): Selected => snapshot as Selected;
 const identityMutationState = <Selected>(state: MutationState): Selected => state as Selected;
 
 const useExternalStoreWithSelector = <Snapshot, Selected>(

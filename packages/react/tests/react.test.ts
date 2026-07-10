@@ -21,6 +21,8 @@ import {
   useRow,
   type MutationState,
   type ObservableDatabase,
+  type OptimisticOverlayFactory,
+  type ReactObserverSnapshot,
   type ReactPreparedPlan
 } from '../src/index.js';
 
@@ -257,6 +259,118 @@ describe('@tarstate/react', () => {
     expect(pendingCounts.at(-1)).toBe(0);
     expect(Object.isFrozen(states.at(-1))).toBe(true);
   });
+
+  it('applies an immutable optimistic projection tagged by operation and source basis', async () => {
+    const database = new TestDatabase();
+    let resolveCommit: ((receipt: CommitReceipt) => void) | undefined;
+    const commitImplementation = () => new Promise<CommitReceipt>((resolve) => { resolveCommit = resolve; });
+    const snapshots: ReactObserverSnapshot<Row>[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => {
+      commit = useCommit();
+      snapshots.push(useQuery(plan));
+      return null;
+    };
+    await mount(createElement(TarstateProvider, {
+      database,
+      commit: commitImplementation,
+      optimisticOverlay: optimisticNames('pending')
+    }, createElement(Consumer)));
+
+    let result: Promise<CommitReceipt> | undefined;
+    await act(() => { result = commit?.(transactionAttempt()); });
+    const optimistic = snapshots.at(-1);
+    expect(optimistic).toMatchObject({
+      state: 'open',
+      current: { rows: [{ id: 1, name: 'one+pending' }] },
+      lastExact: { rows: [{ id: 1, name: 'one' }] },
+      optimistic: { operations: [{ operationEpoch: 'epoch:one', operationId: 'operation:one', sourceId: 'source:one', sourceBasis: { revision: 0 }, observedBasis: { revision: 0 }, rebased: false }] }
+    });
+    expect(Object.isFrozen(optimistic)).toBe(true);
+    expect(Object.isFrozen(optimistic?.state === 'open' ? optimistic.current.rows[0] : undefined)).toBe(true);
+
+    await act(async () => {
+      resolveCommit?.(commitReceipt());
+      await result;
+    });
+  });
+
+  it('recomputes the overlay as a rebase when a newer source basis arrives', async () => {
+    const database = new TestDatabase();
+    const commitImplementation = () => new Promise<CommitReceipt>(() => undefined);
+    const snapshots: ReactObserverSnapshot<Row>[] = [];
+    const rebases: boolean[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const overlay: OptimisticOverlayFactory<Query, Row> = () => ({
+      sourceId: 'source:one',
+      sourceBasis: { incarnation: 'one', revision: 0 },
+      project: ({ rows, rebased }) => {
+        rebases.push(rebased);
+        return { rows: rows.map((row) => ({ ...row, name: row.name + (rebased ? '+rebased' : '+pending') })), resultKeys: rows.map(({ id }) => 'row:' + id) };
+      }
+    });
+    const Consumer = () => { commit = useCommit(); snapshots.push(useQuery(plan)); return null; };
+    await mount(createElement(TarstateProvider, { database, commit: commitImplementation, optimisticOverlay: overlay }, createElement(Consumer)));
+    await act(() => { void commit?.(transactionAttempt()); });
+    expect(snapshots.at(-1)).toMatchObject({ current: { rows: [{ name: 'one+pending' }] }, optimistic: { operations: [{ rebased: false }] } });
+
+    await act(() => { database.observers[0]?.publish(openSnapshot([{ id: 1, name: 'server' }], 1)); });
+    expect(snapshots.at(-1)).toMatchObject({
+      current: { rows: [{ id: 1, name: 'server+rebased' }], basis: { attachments: [{ basis: { revision: 1 } }] } },
+      optimistic: { operations: [{ sourceBasis: { revision: 0 }, observedBasis: { revision: 1 }, rebased: true }] }
+    });
+    expect(rebases).toContain(false);
+    expect(rebases).toContain(true);
+  });
+
+  it.each(['committed', 'rejected', 'unknown'] as const)('discards the overlay on a %s receipt without rewriting authoritative evidence', async (outcome) => {
+    const database = new TestDatabase();
+    let resolveCommit: ((receipt: CommitReceipt) => void) | undefined;
+    const commitImplementation = () => new Promise<CommitReceipt>((resolve) => { resolveCommit = resolve; });
+    const snapshots: ReactObserverSnapshot<Row>[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); snapshots.push(useQuery(plan)); return null; };
+    await mount(createElement(TarstateProvider, { database, commit: commitImplementation, optimisticOverlay: optimisticNames('pending') }, createElement(Consumer)));
+    let result: Promise<CommitReceipt> | undefined;
+    await act(() => { result = commit?.(transactionAttempt()); });
+    expect(snapshots.at(-1)).toHaveProperty('optimistic');
+
+    await act(async () => {
+      resolveCommit?.(commitReceipt(outcome));
+      await result;
+    });
+    expect(snapshots.at(-1)).toMatchObject({ state: 'open', current: { rows: [{ id: 1, name: 'one' }] } });
+    expect(snapshots.at(-1)).not.toHaveProperty('optimistic');
+    expect(database.observers[0]?.getSnapshot()).toBe(database.snapshot);
+  });
+
+  it('drops overlays with the owning provider runtime without owning observer or database lifecycle', async () => {
+    const database = new TestDatabase();
+    const project = vi.fn(({ rows }: { readonly rows: readonly Row[] }) => ({ rows: rows.map((row) => ({ ...row, name: row.name + '+pending' })), resultKeys: rows.map(({ id }) => 'row:' + id) }));
+    const overlay: OptimisticOverlayFactory<Query, Row> = () => ({ sourceId: 'source:one', sourceBasis: { incarnation: 'one', revision: 0 }, project });
+    let commit: ReturnType<typeof useCommit> | undefined;
+    let latest: ReactObserverSnapshot<Row> | undefined;
+    const Consumer = () => { commit = useCommit(); latest = useQuery(plan); return null; };
+    const renderer = await mount(createElement(TarstateProvider, { database, commit: () => new Promise<CommitReceipt>(() => undefined), optimisticOverlay: overlay }, createElement(Consumer)));
+    await act(() => { void commit?.(transactionAttempt()); });
+    expect(latest).toHaveProperty('optimistic');
+    const oldObserver = database.observers[0];
+    const callsBeforeClose = project.mock.calls.length;
+
+    await act(() => { renderer.unmount(); });
+    await act(async () => { await Promise.resolve(); });
+    expect(database.closeCount).toBe(0);
+    expect(oldObserver?.closeCount).toBe(1);
+    oldObserver?.publish(openSnapshot([{ id: 1, name: 'late' }], 2));
+    expect(project).toHaveBeenCalledTimes(callsBeforeClose);
+
+    let remounted: ReactObserverSnapshot<Row> | undefined;
+    const Remounted = () => { remounted = useQuery(plan); return null; };
+    await mount(createElement(TarstateProvider, { database, optimisticOverlay: overlay }, createElement(Remounted)));
+    expect(remounted).toMatchObject({ state: 'open', current: { rows: [{ id: 1, name: 'one' }] } });
+    expect(remounted).not.toHaveProperty('optimistic');
+    expect(database.closeCount).toBe(0);
+  });
 });
 
 const transactionAttempt = (): TransactionAttempt => ({
@@ -266,7 +380,7 @@ const transactionAttempt = (): TransactionAttempt => ({
   transaction: { id: 'transaction:one', contentHash: 'sha256:transaction' }
 });
 
-const commitReceipt = (): CommitReceipt => ({
+const commitReceipt = (outcome: CommitReceipt['outcome'] = 'committed'): CommitReceipt => ({
   kind: 'commit',
   receiptVersion: 1,
   operationEpoch: 'epoch:one',
@@ -276,10 +390,17 @@ const commitReceipt = (): CommitReceipt => ({
   attachmentId: 'attachment:one',
   attachmentFingerprint: 'sha256:attachment',
   sourceId: 'source:one',
-  outcome: 'committed',
+  outcome,
   beforeBasis: { incarnation: 'one', revision: 0 },
-  afterBasis: { incarnation: 'one', revision: 1 },
+  ...(outcome === 'committed' ? { afterBasis: { incarnation: 'one', revision: 1 }, durability: 'memory' as const } : {}),
+  ...(outcome === 'unknown' ? { durability: 'unknown' as const } : {}),
   statementResults: [],
-  issues: [],
-  durability: 'memory'
+  issues: []
+});
+
+const optimisticNames = (suffix: string): OptimisticOverlayFactory<Query, Row> => () => ({
+  sourceId: 'source:one',
+  sourceBasis: { incarnation: 'one', revision: 0 },
+  appliesTo: ({ plan: candidate }) => candidate.planId === plan.planId,
+  project: ({ rows, resultKeys }) => ({ rows: rows.map((row) => ({ ...row, name: row.name + '+' + suffix })), resultKeys })
 });

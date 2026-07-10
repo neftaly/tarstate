@@ -75,4 +75,44 @@ describe('generic source commit coordinator', () => {
     expect(result.issues.some((issue) => issue.code === 'binding.footprint_out_of_bounds' && (issue.details as { relation?: string }).relation === relation)).toBe(true);
     expect(commit).not.toHaveBeenCalled();
   });
+
+  it.each(['equal', 'contained_by'] as const)('accepts the proven %s footprint relation', async (relation) => {
+    const commit = vi.fn(async () => ({ outcome: 'committed' as const, beforeBasis: 0, afterBasis: 1, issues: [] }));
+    const value = source(commit, () => relation);
+    const result = await coordinateSourceCommit({
+      source: value,
+      bindings: [binding('bounded', { readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'a', value: 1 } }], issues: [] })],
+      edits: [],
+      commit: commitInput
+    });
+    expect(result.outcome).toBe('committed');
+    expect(commit).toHaveBeenCalledOnce();
+  });
+
+  it('makes n-ary merge input independent of caller binding order', async () => {
+    const orders = [
+      ['c', 'a', 'b'],
+      ['b', 'c', 'a'],
+      ['a', 'b', 'c']
+    ] as const;
+    const committedCommands: Command[][] = [];
+    for (const order of orders) {
+      const commit = vi.fn(async (input: Parameters<AtomicSource<Storage, Command>['commit']>[0]) => {
+        committedCommands.push([...input.commands]);
+        return { outcome: 'committed' as const, beforeBasis: 0, afterBasis: 1, issues: [] };
+      });
+      const bindings = order.map((id, index) => binding(id, {
+        readFootprint: [id],
+        writeFootprint: [id],
+        intents: [{ footprint: [id], command: { path: id, value: index } }],
+        issues: []
+      }, [id]));
+      await coordinateSourceCommit({ source: source(commit), bindings, edits: [], commit: commitInput });
+    }
+    expect(committedCommands.map((commands) => commands.map(({ path }) => path))).toEqual([
+      ['a', 'b', 'c'],
+      ['a', 'b', 'c'],
+      ['a', 'b', 'c']
+    ]);
+  });
 });

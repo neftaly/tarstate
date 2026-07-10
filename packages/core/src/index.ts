@@ -26,4 +26,5 @@ export * from './semantic-artifact-parsers.js';
 export * from './source-protocol.js';
 export * from './system-relations.js';
 export * from './transaction.js';
+export * from './type-authoring.js';
 export * from './value.js';
