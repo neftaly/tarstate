@@ -144,6 +144,7 @@ export class AutomergeSourceRuntime<T extends object> {
 
   merge(remote: Automerge.Doc<T>): AutomergeSnapshot<T> {
     this.#assertOpen();
+    if (this.#applying) throw new Error('Cannot merge while an Automerge command is applying');
     const beforeBasis = automergeBasis(this.#doc);
     const merged = Automerge.merge(this.#doc, remote);
     const afterBasis = automergeBasis(merged);
@@ -154,6 +155,7 @@ export class AutomergeSourceRuntime<T extends object> {
 
   replace(doc: Automerge.Doc<T>): AutomergeSnapshot<T> {
     this.#assertOpen();
+    if (this.#applying) throw new Error('Cannot replace while an Automerge command is applying');
     const beforeBasis = automergeBasis(this.#doc);
     const afterBasis = automergeBasis(doc);
     this.#doc = doc;

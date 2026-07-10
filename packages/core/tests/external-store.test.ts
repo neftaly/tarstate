@@ -76,6 +76,24 @@ describe('production external-store runtime', () => {
     lease.release();
   });
 
+  it('keeps committed storage and revision coherent when a subscriber throws', () => {
+    const atomic = createAtomicStore<CounterState>({ count: 0 });
+    const lease = acquireExternalStoreRuntime({
+      registry: host(),
+      sourceId: 'source:throwing-subscriber',
+      store: atomic.store,
+      storeIdentity: atomic
+    });
+    const healthy = vi.fn();
+    lease.runtime.subscribe(() => { throw new Error('consumer failure'); });
+    lease.runtime.subscribe(healthy);
+    const result = lease.runtime.commit(lease.runtime.snapshot().basis, () => ({ state: { count: 1 }, changed: true, result: 'updated' as const }));
+    expect(result).toMatchObject({ outcome: 'committed', afterBasis: { revision: 1 } });
+    expect(lease.runtime.snapshot()).toMatchObject({ basis: { revision: 1 }, storage: { count: 1 } });
+    expect(healthy).toHaveBeenCalledOnce();
+    lease.release();
+  });
+
   it('observes legitimate external updates and rejects an exact stale basis', () => {
     const atomic = createAtomicStore<CounterState>({ count: 0 });
     const lease = acquireExternalStoreRuntime({

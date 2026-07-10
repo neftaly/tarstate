@@ -21,6 +21,24 @@ const taskBase = (): Automerge.Doc<TaskDoc> => Automerge.from(
 );
 
 describe('production Automerge adapter', () => {
+  it('rejects reentrant document replacement without losing either document', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: taskBase() });
+    const before = runtime.snapshot();
+    const remote = Automerge.change(before.storage, { time: 0 }, (draft) => { draft.metadata.schema = 'remote'; });
+    const result = await runtime.commit({
+      operationEpoch: 'epoch:1',
+      operationId: 'reentrant-replace',
+      intentHash: hash('f'),
+      expectedBasis: before.basis,
+      commands: [{ apply: (draft) => {
+        runtime.replace(remote);
+        draft.metadata.schema = 'local';
+      } }]
+    });
+    expect(result).toMatchObject({ outcome: 'rejected', issues: [{ code: 'automerge.command_failed' }] });
+    expect(runtime.snapshot().storage).toEqual(before.storage);
+  });
+
   it('uses sorted exact heads as basis and retains exact historical views', () => {
     const base = taskBase();
     const changed = Automerge.change(base, { time: 0 }, (draft) => { draft.metadata.schema = 'v2'; });

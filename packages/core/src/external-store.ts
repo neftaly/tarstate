@@ -252,7 +252,9 @@ export class ExternalStoreRuntime<State> {
   }
 
   #notify(): void {
-    for (const listener of this.#listeners) listener();
+    for (const listener of Array.from(this.#listeners)) {
+      try { listener(); } catch { /* source state must not depend on observers */ }
+    }
   }
 }
 
