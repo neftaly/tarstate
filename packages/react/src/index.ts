@@ -6,6 +6,7 @@ import {
   type ObserverSnapshot,
   type PreparedPlan,
   type QueryObserver,
+  type TypedPreparedPlan,
   type TransactionAttempt
 } from '@tarstate/core';
 import {
@@ -27,10 +28,12 @@ export type ObservableDatabase<Query = unknown, Row = unknown> = {
   observe(request: ObserveRequest<Query>): QueryObserver<Row>;
 };
 
-/** Optional phantom row type carried by generated/prepared query declarations. */
-export type ReactPreparedPlan<Query, Row> = PreparedPlan<Query> & {
-  readonly __tarstateRowType?: (row: Row) => Row;
-};
+/** Exact row and parameter types carried by a prepared typed query. */
+export type ReactPreparedPlan<
+  Query,
+  Row,
+  Parameters extends Readonly<Record<string, JsonValue>> = Readonly<Record<string, JsonValue>>
+> = TypedPreparedPlan<Query, Row, Parameters>;
 
 export type ServerObservation<Query = unknown, Row = unknown> = {
   readonly request: ObserveRequest<Query>;
@@ -124,24 +127,28 @@ export const TarstateProvider = <Query, Row>({ database, commit, optimisticOverl
 export const useDatabase = <Query = unknown, Row = unknown>(): ObservableDatabase<Query, Row> =>
   useRuntime().database as unknown as ObservableDatabase<Query, Row>;
 
-export type QueryHookOptions<Row, Selected = ReactObserverSnapshot<Row>> = {
-  readonly parameters?: Readonly<Record<string, JsonValue>>;
+export type QueryHookOptions<
+  Row,
+  Selected = ReactObserverSnapshot<Row>,
+  Parameters extends Readonly<Record<string, JsonValue>> = Readonly<Record<string, JsonValue>>
+> = {
+  readonly parameters?: Parameters;
   readonly allowPartial?: boolean;
   readonly select?: (snapshot: ReactObserverSnapshot<Row>) => Selected;
   readonly isEqual?: (left: Selected, right: Selected) => boolean;
 };
 
-export function useQuery<Query, Row, Selected>(
-  plan: ReactPreparedPlan<Query, Row>,
-  options: QueryHookOptions<Row, Selected> & { readonly select: (snapshot: ReactObserverSnapshot<Row>) => Selected }
+export function useQuery<Query, Row, Parameters extends Readonly<Record<string, JsonValue>>, Selected>(
+  plan: ReactPreparedPlan<Query, Row, Parameters>,
+  options: QueryHookOptions<Row, Selected, NoInfer<Parameters>> & { readonly select: (snapshot: ReactObserverSnapshot<Row>) => Selected }
 ): Selected;
-export function useQuery<Query, Row>(
-  plan: ReactPreparedPlan<Query, Row>,
-  options?: Omit<QueryHookOptions<Row>, 'select'>
+export function useQuery<Query, Row, Parameters extends Readonly<Record<string, JsonValue>>>(
+  plan: ReactPreparedPlan<Query, Row, Parameters>,
+  options?: Omit<QueryHookOptions<Row, ReactObserverSnapshot<Row>, NoInfer<Parameters>>, 'select'>
 ): ReactObserverSnapshot<Row>;
-export function useQuery<Query, Row, Selected = ReactObserverSnapshot<Row>>(
-  plan: ReactPreparedPlan<Query, Row>,
-  options: QueryHookOptions<Row, Selected> = {}
+export function useQuery<Query, Row, Parameters extends Readonly<Record<string, JsonValue>>, Selected = ReactObserverSnapshot<Row>>(
+  plan: ReactPreparedPlan<Query, Row, Parameters>,
+  options: QueryHookOptions<Row, Selected, Parameters> = {}
 ): Selected {
   const runtime = useRuntime();
   const request = queryRequest(plan, options);
@@ -159,15 +166,15 @@ export function useQuery<Query, Row, Selected = ReactObserverSnapshot<Row>>(
   );
 }
 
-export type RowHookOptions<Row> = Omit<QueryHookOptions<Row, Row | undefined>, 'select'> & {
+export type RowHookOptions<Row, Parameters extends Readonly<Record<string, JsonValue>> = Readonly<Record<string, JsonValue>>> = Omit<QueryHookOptions<Row, Row | undefined, Parameters>, 'select'> & {
   /** Retained exact rows must be requested explicitly while current is unknown. */
   readonly evidence?: 'current' | 'last-exact';
 };
 
-export const useRow = <Query, Row>(
-  plan: ReactPreparedPlan<Query, Row>,
+export const useRow = <Query, Row, Parameters extends Readonly<Record<string, JsonValue>>>(
+  plan: ReactPreparedPlan<Query, Row, Parameters>,
   resultKey: string,
-  options: RowHookOptions<Row> = {}
+  options: RowHookOptions<Row, NoInfer<Parameters>> = {}
 ): Row | undefined => {
   const select = useMemo(() => (snapshot: ObserverSnapshot<Row>): Row | undefined => {
     if (snapshot.state === 'closed') return undefined;
@@ -218,7 +225,10 @@ const queryObservationKey = <Query>(
 
 const emptyServerObservations: readonly ServerObservation[] = Object.freeze([]);
 
-const queryRequest = <Query>(plan: PreparedPlan<Query>, options: Pick<QueryHookOptions<unknown, unknown>, 'parameters' | 'allowPartial'>): ObserveRequest<Query> => ({
+const queryRequest = <Query, Parameters extends Readonly<Record<string, JsonValue>>>(
+  plan: PreparedPlan<Query>,
+  options: { readonly parameters?: Parameters; readonly allowPartial?: boolean }
+): ObserveRequest<Query> => ({
   plan,
   ...(options.parameters === undefined ? {} : { parameters: options.parameters }),
   ...(options.allowPartial === undefined ? {} : { allowPartial: options.allowPartial })

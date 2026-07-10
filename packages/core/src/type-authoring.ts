@@ -3,6 +3,7 @@ import type { ScalarDeclaration } from './codec.js';
 import type { CapabilityRef } from './issues.js';
 import type { Expr, QueryNode } from './query.js';
 import type { QueryArtifact, QueryArtifactBody, ValueDeclaration } from './query-builder.js';
+import type { PreparedPlan } from './maintenance.js';
 import type { FieldDeclaration, RelationDeclaration, SchemaBody } from './schema.js';
 import type { JsonValue, PortableValue, TaggedValue } from './value.js';
 
@@ -21,8 +22,41 @@ type OptionalFieldKeys<Fields> = {
 }[keyof Fields];
 type RequiredFieldKeys<Fields> = Exclude<keyof Fields, OptionalFieldKeys<Fields>>;
 
+declare const customScalarValue: unique symbol;
+declare const referenceKey: unique symbol;
+
+/** A portable custom declaration paired with its exact decoded app value. */
+export type CustomScalarDeclaration<Value extends TaggedValue> = {
+  readonly kind: 'custom';
+  readonly codec: CapabilityRef;
+  readonly [customScalarValue]: Value;
+};
+
+/** Adds only compile-time codec evidence; the returned declaration stays portable. */
+export const customScalar = <Value extends TaggedValue>(codec: CapabilityRef): CustomScalarDeclaration<Value> =>
+  ({ kind: 'custom', codec }) as CustomScalarDeclaration<Value>;
+
+export type RelationKey<Relation> = Relation extends { readonly key: infer Names extends readonly string[] }
+  ? KeyTuple<Relation, Names>
+  : never;
+
+export type ReferenceScalarDeclaration<Target extends RelationDeclaration> = {
+  readonly kind: 'ref';
+  readonly target: { readonly relationId: Target['relationId'] };
+  readonly [referenceKey]: RelationKey<Target>;
+};
+
+/** Identity helper used when another literal relation needs to reference this one. */
+export const relationDeclaration = <const Relation extends RelationDeclaration>(relation: Relation): Relation => relation;
+
+/** Builds a portable reference whose app value is the target's exact key tuple. */
+export const referenceTo = <const Target extends RelationDeclaration>(target: Target): ReferenceScalarDeclaration<Target> =>
+  ({ kind: 'ref', target: { relationId: target.relationId } }) as ReferenceScalarDeclaration<Target>;
+
 export type ScalarValueOf<Declaration> =
-  Declaration extends { readonly kind: 'string'; readonly values: readonly (infer Value extends string)[] } ? Value
+  Declaration extends CustomScalarDeclaration<infer Value> ? Value
+    : Declaration extends ReferenceScalarDeclaration<infer Target> ? RelationKey<Target>
+      : Declaration extends { readonly kind: 'string'; readonly values: readonly (infer Value extends string)[] } ? Value
     : Declaration extends { readonly kind: 'string' } ? string
       : Declaration extends { readonly kind: 'boolean' } ? boolean
         : Declaration extends { readonly kind: 'number' | 'integer' } ? number
@@ -149,11 +183,10 @@ export const typedCompare = <Left, Right, LeftParameters extends Readonly<Record
   parameterDeclarations: { ...left.parameterDeclarations, ...right.parameterDeclarations } as Simplify<LeftParameters & RightParameters>
 });
 
-export const typedWhere = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
+const applyTypedWhere = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
   query: TypedQuery<Aliases, QueryParameters, Row>,
-  predicate: (aliases: Aliases) => TypedExpression<boolean, PredicateParameters>
+  expression: TypedExpression<boolean, PredicateParameters>
 ): TypedQuery<Aliases, Simplify<QueryParameters & PredicateParameters>, Row> => {
-  const expression = predicate(query.aliases);
   return {
     ...query,
     root: { kind: 'where', input: query.root, predicate: expression.expression },
@@ -161,16 +194,32 @@ export const typedWhere = <Aliases extends TypedAliases, QueryParameters extends
   };
 };
 
+export function typedWhere<PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
+  predicate: TypedExpression<boolean, PredicateParameters>
+): <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row>(
+  query: TypedQuery<Aliases, QueryParameters, Row>
+) => TypedQuery<Aliases, Simplify<QueryParameters & PredicateParameters>, Row>;
+export function typedWhere<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
+  query: TypedQuery<Aliases, QueryParameters, Row>,
+  predicate: (aliases: Aliases) => TypedExpression<boolean, PredicateParameters>
+): TypedQuery<Aliases, Simplify<QueryParameters & PredicateParameters>, Row>;
+export function typedWhere(
+  queryOrPredicate: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown> | TypedExpression<boolean, Readonly<Record<string, ValueDeclaration>>>,
+  predicate?: (aliases: TypedAliases) => TypedExpression<boolean, Readonly<Record<string, ValueDeclaration>>>
+): unknown {
+  if ('root' in queryOrPredicate) return applyTypedWhere(queryOrPredicate, predicate!(queryOrPredicate.aliases));
+  return (query: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>) => applyTypedWhere(query, queryOrPredicate);
+}
+
 type FieldExpressionRecord = Readonly<Record<string, TypedExpression<unknown, Readonly<Record<string, ValueDeclaration>>>>>;
 type ResultOfFields<Fields extends FieldExpressionRecord> = { readonly [Name in keyof Fields]: ExpressionValue<Fields[Name]> };
 type ParametersOfFields<Fields extends FieldExpressionRecord> = Simplify<UnionToIntersection<ExpressionParameters<Fields[keyof Fields]>>>;
 
-export const typedSelect = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, const Alias extends string, const Fields extends FieldExpressionRecord>(
+const applyTypedSelect = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, const Alias extends string, const Fields extends FieldExpressionRecord>(
   query: TypedQuery<Aliases, QueryParameters, unknown>,
   alias: Alias,
-  select: (aliases: Aliases) => Fields
+  fields: Fields
 ): TypedQuery<{ readonly [Name in Alias]: TypedAlias<Alias, ResultOfFields<Fields>> }, Simplify<QueryParameters & ParametersOfFields<Fields>>, ResultOfFields<Fields>> => {
-  const fields = select(query.aliases);
   const parameterDeclarations = Object.assign({}, query.parameterDeclarations, ...Object.values(fields).map(({ parameterDeclarations }) => parameterDeclarations)) as Simplify<QueryParameters & ParametersOfFields<Fields>>;
   const resultFields = Object.fromEntries(Object.entries(fields).map(([name, expression]) => [name, expression.expression]));
   return {
@@ -180,6 +229,28 @@ export const typedSelect = <Aliases extends TypedAliases, QueryParameters extend
     schemaViews: query.schemaViews
   };
 };
+
+export function typedSelect<const Alias extends string, const Fields extends FieldExpressionRecord>(
+  alias: Alias,
+  fields: Fields
+): <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>>(
+  query: TypedQuery<Aliases, QueryParameters, unknown>
+) => TypedQuery<{ readonly [Name in Alias]: TypedAlias<Alias, ResultOfFields<Fields>> }, Simplify<QueryParameters & ParametersOfFields<Fields>>, ResultOfFields<Fields>>;
+export function typedSelect<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, const Alias extends string, const Fields extends FieldExpressionRecord>(
+  query: TypedQuery<Aliases, QueryParameters, unknown>,
+  alias: Alias,
+  select: (aliases: Aliases) => Fields
+): TypedQuery<{ readonly [Name in Alias]: TypedAlias<Alias, ResultOfFields<Fields>> }, Simplify<QueryParameters & ParametersOfFields<Fields>>, ResultOfFields<Fields>>;
+export function typedSelect(
+  queryOrAlias: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown> | string,
+  aliasOrFields: string | FieldExpressionRecord,
+  select?: (aliases: TypedAliases) => FieldExpressionRecord
+): unknown {
+  if (typeof queryOrAlias === 'string') {
+    return (query: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>) => applyTypedSelect(query, queryOrAlias, aliasOrFields as FieldExpressionRecord);
+  }
+  return applyTypedSelect(queryOrAlias, aliasOrFields as string, select!(queryOrAlias.aliases));
+}
 
 type JoinedAliases<Left extends TypedAliases, Right extends TypedAliases> = Simplify<Left & Right>;
 type JoinedRows<Aliases extends TypedAliases> = { readonly [Name in keyof Aliases]: Aliases[Name] extends TypedAlias<string, infer Row> ? Row : never };
@@ -203,6 +274,25 @@ export const typedQueryBody = <Aliases extends TypedAliases, Parameters extends 
   query: TypedQuery<Aliases, Parameters, Row>,
   requiredCapabilities: readonly CapabilityRef[] = []
 ): QueryArtifactBody => ({ schemaViews: query.schemaViews, parameters: query.parameterDeclarations, root: query.root, requiredCapabilities });
+
+/** Prepared-plan carrier consumed by adapters without changing the plan wire shape. */
+export type TypedPreparedPlan<Query, Row, Parameters extends Readonly<Record<string, unknown>>> = PreparedPlan<Query> & {
+  readonly __tarstateRowType?: (row: Row) => Row;
+  readonly __tarstateParameterType?: (parameters: Parameters) => Parameters;
+};
+
+/** Attaches query inference to the exact plan that was prepared from its root. */
+export const typedPreparedPlan = <
+  Aliases extends TypedAliases,
+  Parameters extends Readonly<Record<string, ValueDeclaration>>,
+  Row
+>(
+  plan: PreparedPlan<QueryNode>,
+  query: TypedQuery<Aliases, Parameters, Row>
+): TypedPreparedPlan<QueryNode, Row, { readonly [Name in keyof Parameters]: ValueOfDeclaration<Parameters[Name]> }> => {
+  if (plan.query !== query.root) throw new Error('Prepared plan root does not match the typed query');
+  return plan;
+};
 
 export type TypedReturning<Name extends string, Query extends TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>> = {
   readonly name: Name;

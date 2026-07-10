@@ -1,8 +1,12 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
+import { pipe } from '../src/query-builder.js';
 import {
+  customScalar,
   relationAccess,
+  relationDeclaration,
   relationLiteral,
+  referenceTo,
   schemaLiteral,
   typedCompare,
   typedFieldEdit,
@@ -10,6 +14,7 @@ import {
   typedJoin,
   typedMove,
   typedParameter,
+  typedPreparedPlan,
   typedQueryBody,
   typedRekey,
   typedReturning,
@@ -31,6 +36,7 @@ const replace = { id: 'urn:tarstate:capability:field/replace', version: '1', con
 const move = { id: 'urn:tarstate:capability:entity/move', version: '1', contractHash: hash('c') } as const;
 const rekey = { id: 'urn:tarstate:capability:entity/rekey', version: '1', contractHash: hash('d') } as const;
 const customCodec = { id: 'urn:test:codec:slug', version: '1', contractHash: hash('e') } as const;
+type SlugValue = TaggedValue & { readonly type: 'slug'; readonly value: string };
 
 const schema = schemaLiteral({
   relations: {
@@ -44,7 +50,7 @@ const schema = schemaLiteral({
         nickname: { type: { kind: 'string' }, optional: true },
         biography: { type: { kind: 'string' }, nullable: true },
         score: { type: { kind: 'integer' } },
-        slug: { type: { kind: 'custom', codec: customCodec } }
+        slug: { type: customScalar<SlugValue>(customCodec) }
       }
     },
     audit: {
@@ -87,7 +93,7 @@ describe('literal-schema and query type authoring', () => {
       readonly nickname?: string;
       readonly biography: string | null;
       readonly score: number;
-      readonly slug: TaggedValue;
+      readonly slug: SlugValue;
     }>();
     expectTypeOf<AuditRow['event']>().toEqualTypeOf<'created' | 'deleted'>();
     expectTypeOf<SchemaKey<typeof schema, 'people'>>().toEqualTypeOf<readonly [string]>();
@@ -96,6 +102,55 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<QueryParametersOf<typeof projected>>().toEqualTypeOf<{ readonly minimumScore: number }>();
     expectTypeOf<QueryResultRowOf<typeof projected>>().toEqualTypeOf<{ readonly author: string; readonly manager: string }>();
     expectTypeOf<ReturningRowOf<typeof returning>>().toEqualTypeOf<{ readonly author: string; readonly manager: string }>();
+  });
+
+  it('ties reference values to target key tuples and keeps typed operators pipe-compatible', () => {
+    const accounts = relationDeclaration({
+      relationId: 'example.account',
+      key: ['tenant', 'accountId'],
+      fields: {
+        tenant: { type: { kind: 'string' } },
+        accountId: { type: { kind: 'integer' } }
+      }
+    });
+    const referenceSchema = schemaLiteral({
+      relations: {
+        accounts,
+        events: {
+          relationId: 'example.event',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string' } },
+            account: { type: referenceTo(accounts) }
+          }
+        }
+      }
+    });
+    const events = relationLiteral(schemaRef, referenceSchema, 'events');
+    const base = typedFrom(events, 'event');
+    const parameter = typedParameter('account', referenceTo(accounts));
+    const query = pipe(
+      base,
+      typedWhere(typedCompare('eq', base.aliases.event.row.account, parameter)),
+      typedSelect('result', { id: base.aliases.event.row.id, account: base.aliases.event.row.account })
+    );
+    const plan = {
+      planId: 'plan:events',
+      rootNodeId: 'plan:events:root',
+      query: query.root,
+      registryFingerprint: 'registry:one',
+      authorityFingerprint: 'authority:one',
+      datasetId: 'dataset:one'
+    };
+    const prepared = typedPreparedPlan(plan, query);
+
+    expect(referenceTo(accounts)).toEqual({ kind: 'ref', target: { relationId: 'example.account' } });
+    expect(prepared).toBe(plan);
+    expectTypeOf<SchemaKey<typeof referenceSchema, 'accounts'>>().toEqualTypeOf<readonly [string, number]>();
+    expectTypeOf<SchemaRow<typeof referenceSchema, 'events'>['account']>().toEqualTypeOf<readonly [string, number]>();
+    expectTypeOf<QueryParametersOf<typeof query>>().toEqualTypeOf<{ readonly account: readonly [string, number] }>();
+    expectTypeOf<QueryResultRowOf<typeof query>>().toEqualTypeOf<{ readonly id: string; readonly account: readonly [string, number] }>();
+    expectTypeOf(prepared.__tarstateParameterType).toEqualTypeOf<((parameters: { readonly account: readonly [string, number] }) => { readonly account: readonly [string, number] }) | undefined>();
   });
 
   it('keeps self-join aliases collision-safe at the responsible operator', () => {
