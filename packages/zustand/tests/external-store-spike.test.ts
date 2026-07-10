@@ -1,5 +1,5 @@
 import { Store as TanStackStore, type StoreActionMap } from '@tanstack/store';
-import { acquireExternalStoreRuntime, type AtomicExternalStore } from '@tarstate/core/v1-spike';
+import { acquireExternalStoreRuntime, HostRuntimeRegistry, type AtomicExternalStore } from '@tarstate/core';
 import { createStore as createZustandStore } from 'zustand/vanilla';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { describe, expect, it, vi } from 'vitest';
@@ -28,6 +28,8 @@ const createPersistedZustand = () => {
   return store;
 };
 
+const host = () => new HostRuntimeRegistry({ trustPolicyId: 'test:zustand' });
+
 const tanStackAtomicStore = <State, Actions extends StoreActionMap>(store: TanStackStore<State, Actions>): AtomicExternalStore<State> => ({
   getState: () => store.get(),
   subscribe: (listener) => {
@@ -46,10 +48,25 @@ const tanStackAtomicStore = <State, Actions extends StoreActionMap>(store: TanSt
 });
 
 describe('v1 external-store spike', () => {
+  it('re-reads hasHydrated after adapter creation', () => {
+    const store = createPersistedZustand();
+    let hydrated = false;
+    const external = zustandAtomicExternalStore(store, {
+      hydration: {
+        hasHydrated: () => hydrated,
+        onHydrate: () => () => undefined,
+        onFinishHydration: () => () => undefined
+      }
+    });
+    expect(external.hydration?.getState()).toBe('loading');
+    hydrated = true;
+    expect(external.hydration?.getState()).toBe('ready');
+  });
+
   it('tracks real Zustand persistence hydration even when hydrated data equals initial state', async () => {
     const store = createPersistedZustand();
     const external = zustandAtomicExternalStore(store, { hydration: store.persist });
-    const lease = acquireExternalStoreRuntime({ sourceId: 'source:zustand:hydration', store: external, storeIdentity: store });
+    const lease = acquireExternalStoreRuntime({ registry: host(), sourceId: 'source:zustand:hydration', store: external, storeIdentity: store });
     const listener = vi.fn();
     lease.runtime.subscribe(listener);
     expect(lease.runtime.snapshot()).toMatchObject({ state: 'loading', freshness: 'none', basis: { revision: 0 } });
@@ -64,7 +81,7 @@ describe('v1 external-store spike', () => {
     const external = zustandAtomicExternalStore(store);
     const storeListener = vi.fn();
     store.subscribe(storeListener);
-    const lease = acquireExternalStoreRuntime({ sourceId: 'source:zustand:commit', store: external, storeIdentity: store });
+    const lease = acquireExternalStoreRuntime({ registry: host(), sourceId: 'source:zustand:commit', store: external, storeIdentity: store });
     const runtimeListener = vi.fn();
     lease.runtime.subscribe(runtimeListener);
     const before = lease.runtime.snapshot().basis;
@@ -79,7 +96,7 @@ describe('v1 external-store spike', () => {
 
   it('observes external Zustand actions synchronously and rejects stale commits', () => {
     const store = createPersistedZustand();
-    const lease = acquireExternalStoreRuntime({ sourceId: 'source:zustand:external', store: zustandAtomicExternalStore(store), storeIdentity: store });
+    const lease = acquireExternalStoreRuntime({ registry: host(), sourceId: 'source:zustand:external', store: zustandAtomicExternalStore(store), storeIdentity: store });
     const stale = lease.runtime.snapshot().basis;
     store.getState().select('piece:queen');
     expect(lease.runtime.snapshot()).toMatchObject({ basis: { revision: 1 }, storage: { selected: 'piece:queen' } });
@@ -93,7 +110,7 @@ describe('v1 external-store spike', () => {
       { scene: 'origin', moves: 0 },
       ({ setState }) => ({ move: (scene) => setState((state) => ({ scene, moves: state.moves + 1 })) })
     );
-    const lease = acquireExternalStoreRuntime({ sourceId: 'source:tanstack:probability', store: tanStackAtomicStore(store), storeIdentity: store });
+    const lease = acquireExternalStoreRuntime({ registry: host(), sourceId: 'source:tanstack:probability', store: tanStackAtomicStore(store), storeIdentity: store });
     const listener = vi.fn();
     lease.runtime.subscribe(listener);
     store.actions.move('tableau');
@@ -110,6 +127,7 @@ describe('v1 external-store spike', () => {
   it('shares one runtime/subscription across databases and rotates incarnation after last release', () => {
     const store = createPersistedZustand();
     const external = zustandAtomicExternalStore(store);
+    const registry = host();
     let activeSubscriptions = 0;
     const counted: AtomicExternalStore<SceneState> = {
       ...external,
@@ -119,8 +137,8 @@ describe('v1 external-store spike', () => {
         return () => { activeSubscriptions -= 1; unsubscribe(); };
       }
     };
-    const first = acquireExternalStoreRuntime({ sourceId: 'source:shared', store: counted, storeIdentity: store });
-    const second = acquireExternalStoreRuntime({ sourceId: 'source:shared', store: counted, storeIdentity: store });
+    const first = acquireExternalStoreRuntime({ registry, sourceId: 'source:shared', store: counted, storeIdentity: store });
+    const second = acquireExternalStoreRuntime({ registry, sourceId: 'source:shared', store: counted, storeIdentity: store });
     expect(second.runtime).toBe(first.runtime);
     expect(first.runtime.leaseCount).toBe(2);
     expect(activeSubscriptions).toBe(1);
@@ -129,7 +147,7 @@ describe('v1 external-store spike', () => {
     expect(activeSubscriptions).toBe(1);
     second.release();
     expect(activeSubscriptions).toBe(0);
-    const reattached = acquireExternalStoreRuntime({ sourceId: 'source:shared', store: counted, storeIdentity: store });
+    const reattached = acquireExternalStoreRuntime({ registry, sourceId: 'source:shared', store: counted, storeIdentity: store });
     expect(reattached.runtime.incarnation).not.toBe(incarnation);
     reattached.release();
   });
@@ -137,8 +155,9 @@ describe('v1 external-store spike', () => {
   it('rejects a second live store for one source ID and never closes borrowed stores', () => {
     const firstStore = createPersistedZustand();
     const secondStore = createPersistedZustand();
-    const first = acquireExternalStoreRuntime({ sourceId: 'source:identity', store: zustandAtomicExternalStore(firstStore), storeIdentity: firstStore });
-    expect(() => acquireExternalStoreRuntime({ sourceId: 'source:identity', store: zustandAtomicExternalStore(secondStore), storeIdentity: secondStore })).toThrow(/different live store/);
+    const registry = host();
+    const first = acquireExternalStoreRuntime({ registry, sourceId: 'source:identity', store: zustandAtomicExternalStore(firstStore), storeIdentity: firstStore });
+    expect(() => acquireExternalStoreRuntime({ registry, sourceId: 'source:identity', store: zustandAtomicExternalStore(secondStore), storeIdentity: secondStore })).toThrow(/different live source identity/);
     first.release();
     firstStore.getState().select('still-owned');
     expect(firstStore.getState().selected).toBe('still-owned');
@@ -146,7 +165,7 @@ describe('v1 external-store spike', () => {
 
   it('makes direct mutation visibly outside the protocol rather than inventing a revision', () => {
     const store = createPersistedZustand();
-    const lease = acquireExternalStoreRuntime({ sourceId: 'source:invalid-mutation', store: zustandAtomicExternalStore(store), storeIdentity: store });
+    const lease = acquireExternalStoreRuntime({ registry: host(), sourceId: 'source:invalid-mutation', store: zustandAtomicExternalStore(store), storeIdentity: store });
     const state = store.getState() as { selected: string | null; moves: number; select: (id: string) => void };
     state.moves = 99;
     expect(lease.runtime.snapshot()).toMatchObject({ basis: { revision: 0 }, storage: { moves: 99 } });
@@ -155,7 +174,7 @@ describe('v1 external-store spike', () => {
 
   it('does not notify or advance basis for changed:false', () => {
     const store = createPersistedZustand();
-    const lease = acquireExternalStoreRuntime({ sourceId: 'source:no-op', store: zustandAtomicExternalStore(store), storeIdentity: store });
+    const lease = acquireExternalStoreRuntime({ registry: host(), sourceId: 'source:no-op', store: zustandAtomicExternalStore(store), storeIdentity: store });
     const listener = vi.fn();
     lease.runtime.subscribe(listener);
     const receipt = lease.runtime.commit(lease.runtime.snapshot().basis, (state) => ({ state, changed: false, result: 'same' }));

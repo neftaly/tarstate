@@ -1,4 +1,4 @@
-import type { AtomicExternalStore, HydrationState } from '@tarstate/core/v1-spike';
+import type { AtomicExternalStore, HydrationState } from '@tarstate/core';
 import type { StoreApi } from 'zustand/vanilla';
 
 export type ZustandHydration = {
@@ -26,7 +26,12 @@ export const zustandAtomicExternalStore = <State>(
     },
     ...(options.hydration === undefined ? {} : {
       hydration: {
-        getState: () => hydrationState,
+        getState: () => {
+          // Persistence can finish between adapter creation and subscription.
+          // Re-read the authoritative positive signal on every observation.
+          if (options.hydration?.hasHydrated()) hydrationState = 'ready';
+          return hydrationState;
+        },
         subscribe: (listener: () => void) => {
           const stopStart = options.hydration?.onHydrate(() => { hydrationState = 'loading'; listener(); });
           const stopFinish = options.hydration?.onFinishHydration(() => { hydrationState = 'ready'; listener(); });
