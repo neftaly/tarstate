@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/core" },
   "type": "module",
-  "files": ["dist"],
+  "files": ["dist", "!dist/golden-workloads.*"],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

@@ -1,4 +1,5 @@
-import { canonicalizeJson, sealArtifact, type Artifact, type ArtifactRef } from './artifacts.js';
+import { canonicalizeJson, type ArtifactRef } from './artifacts.js';
+import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { JsonValue } from './value.js';
 import type { ConstraintEvaluation, ConstraintFailure, SourceConstraint } from './constraints.js';
@@ -17,12 +18,12 @@ export type ConstraintSetBody = {
   readonly requiredCapabilities: readonly CapabilityRef[];
 };
 
-export type ConstraintSetArtifact = Artifact & { readonly kind: 'constraint-set'; readonly body: ConstraintSetBody };
+export type ConstraintSetArtifact = TypedArtifact<'constraint-set', ConstraintSetBody>;
 
-export const sealConstraintSet = async (input: { readonly id?: string; readonly dependencies?: readonly ArtifactRef[]; readonly body: ConstraintSetBody }): Promise<ConstraintSetArtifact> => {
+export const sealConstraintSet = (input: TypedArtifactInput<ConstraintSetBody>): Promise<ConstraintSetArtifact> => {
   const ids = input.body.constraints.map(({ id }) => id);
   if (new Set(ids).size !== ids.length) throw new Error('Constraint IDs must be unique within a set');
-  return sealArtifact({ kind: 'constraint-set', ...(input.id === undefined ? {} : { id: input.id }), ...(input.dependencies === undefined ? {} : { dependencies: input.dependencies }), body: input.body as unknown as JsonValue }) as Promise<ConstraintSetArtifact>;
+  return sealTypedArtifact('constraint-set', input);
 };
 
 export type ConstraintQueryOutcome = {

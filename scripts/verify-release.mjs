@@ -16,6 +16,7 @@ try {
     const manifest = JSON.parse(readFileSync(path.join(packageDirectory, 'package.json'), 'utf8'));
     if (manifest.version !== '0.1.0') fail(`${manifest.name}: expected version 0.1.0`);
     if (manifest.private === true) fail(`${manifest.name}: package remains private`);
+    if (Object.keys(manifest.exports ?? {}).some((name) => name !== '.')) fail(`${manifest.name}: unexpected public subpath export`);
     if (manifest.exports?.['.']?.types !== './dist/index.d.ts' || manifest.exports?.['.']?.import !== './dist/index.js') {
       fail(`${manifest.name}: exports do not resolve to dist`);
     }
@@ -31,6 +32,7 @@ try {
       if (!entries.includes(required)) fail(`${manifest.name}: tarball is missing ${required}`);
     }
     verifyDeclarationReachability(manifest.name, tarball, entries);
+    if (entries.some((entry) => entry.includes('golden-workloads'))) fail(`${manifest.name}: tarball contains conformance fixtures`);
     if (entries.some((entry) => entry.includes('/src/') || entry.endsWith('.tsbuildinfo'))) {
       fail(`${manifest.name}: tarball contains source or build-state files`);
     }

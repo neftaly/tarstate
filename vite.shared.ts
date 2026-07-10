@@ -1,6 +1,7 @@
 import path from 'node:path';
 
-export const coreSubpathEntryNames = [] as const;
+/** Build-only core modules used by repository tooling; package exports remain explicit. */
+export const coreInternalEntryNames = ['golden-workloads'] as const;
 
 const sourceAlias = (repoRoot: string, find: string, replacement: string) => ({
   find,

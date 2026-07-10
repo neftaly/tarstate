@@ -1,6 +1,8 @@
-import { sealArtifact, type Artifact, type ArtifactRef, type ContentHash } from './artifacts.js';
+import type { ArtifactRef, ContentHash } from './artifacts.js';
+import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
+import type { QueryNode } from './query.js';
 import type { JsonValue } from './value.js';
 
 /** Portable expression subset used by source-local writes. */
@@ -41,7 +43,7 @@ export type FieldEdit =
 
 export type WriteStatement =
   | { readonly kind: 'statement.insert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
-  | { readonly kind: 'statement.insert-from-query'; readonly relation: WriteRelation; readonly root: JsonValue }
+  | { readonly kind: 'statement.insert-from-query'; readonly relation: WriteRelation; readonly root: QueryNode }
   | { readonly kind: 'statement.upsert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[]; readonly onConflict: InsertConflictPolicy }
   | { readonly kind: 'statement.replace-all'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
   | { readonly kind: 'statement.update'; readonly target: WriteTarget; readonly edits: Readonly<Record<string, FieldEdit>> }
@@ -52,7 +54,7 @@ export type WriteStatement =
 
 export type TransactionGuard =
   | { readonly kind: 'guard.affected-count'; readonly statementIndex: number; readonly count: 'matched' | 'logicallyChanged' | 'inserted' | 'deleted'; readonly op: 'eq' | 'gte' | 'lte'; readonly value: number }
-  | { readonly kind: 'guard.query'; readonly root: JsonValue; readonly expect: 'exists' | 'empty' }
+  | { readonly kind: 'guard.query'; readonly root: QueryNode; readonly expect: 'exists' | 'empty' }
   | { readonly kind: 'extension'; readonly capability: CapabilityRef; readonly payload: JsonValue };
 
 export type TransactionBody = {
@@ -60,11 +62,11 @@ export type TransactionBody = {
   readonly parameters: Readonly<Record<string, JsonValue>>;
   readonly statements: readonly WriteStatement[];
   readonly guards: readonly TransactionGuard[];
-  readonly returning?: readonly { readonly name: string; readonly root: JsonValue }[];
+  readonly returning?: readonly { readonly name: string; readonly root: QueryNode }[];
   readonly requiredCapabilities: readonly CapabilityRef[];
 };
 
-export type Transaction = Artifact & { readonly kind: 'transaction'; readonly body: TransactionBody };
+export type Transaction = TypedArtifact<'transaction', TransactionBody>;
 
 /** Host-only attempt fields select a source attachment; bound values remain in Transaction.body. */
 export type TransactionAttempt = {
@@ -241,23 +243,4 @@ export const executeNonAtomicBatch = async (
   return { kind: 'non-atomic-batch', receiptVersion: 1, batchId: batch.batchId, outcome, steps, issues };
 };
 
-export const sealTransaction = async (input: {
-  readonly id?: string;
-  readonly dependencies?: readonly ArtifactRef[];
-  readonly body: TransactionBody;
-}): Promise<Transaction> => sealArtifact({
-  kind: 'transaction',
-  ...(input.id === undefined ? {} : { id: input.id }),
-  ...(input.dependencies === undefined ? {} : { dependencies: input.dependencies }),
-  body: input.body as unknown as JsonValue
-}) as Promise<Transaction>;
-
-export const emptyStatementResult = (statementIndex: number): StatementResult => ({
-  statementIndex,
-  matched: 0,
-  logicallyChanged: 0,
-  inserted: 0,
-  deleted: 0,
-  editOutcomes: [],
-  issues: []
-});
+export const sealTransaction = (input: TypedArtifactInput<TransactionBody>): Promise<Transaction> => sealTypedArtifact('transaction', input);

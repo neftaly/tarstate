@@ -69,6 +69,11 @@ export class ResourceResolver {
     };
   }
 
+  /**
+   * Signal-bound resolutions bypass shared cache reads, writes, and in-flight
+   * deduplication so one caller cannot cancel another. Other terminal results
+   * remain in the bounded LRU until eviction, registration, or `invalidate()`.
+   */
   resolve<Value = unknown>(reference: ResourceRef, options: {
     readonly authorityScope: string;
     readonly signal?: AbortSignal;

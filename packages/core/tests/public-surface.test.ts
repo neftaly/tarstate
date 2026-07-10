@@ -28,12 +28,15 @@ describe('clean rewrite core surface', () => {
     expect(core.GovernanceCoordinator).toBeTypeOf('function');
     expect(core.safeParseReceipt).toBeTypeOf('function');
     expect(core.createSystemSchemaArtifact).toBeTypeOf('function');
-    expect(core.runGoldenConformanceWorkloads).toBeTypeOf('function');
     expect(core.verifyBuiltInCapabilities).toBeTypeOf('function');
   });
 
+  it('matches the curated runtime export surface', () => {
+    expect(Object.keys(core).sort()).toMatchSnapshot();
+  });
+
   it('does not retain legacy API names', () => {
-    for (const name of ['createDb', 'defineSchema', 'mat', 'project', 'relicChanges', 'transact', 'watch', 'write', 'InMemorySpikeSource']) {
+    for (const name of ['createDb', 'defineSchema', 'emptyStatementResult', 'mat', 'project', 'relicChanges', 'runGoldenConformanceWorkloads', 'sealTypedArtifact', 'transact', 'watch', 'write', 'InMemorySpikeSource']) {
       expect(name in core, name).toBe(false);
     }
   });

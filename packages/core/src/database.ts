@@ -86,6 +86,7 @@ export class DatasetMembership {
   }
 
   reopen(): DatasetSnapshot {
+    if (this.#snapshot.state === 'open') return this.#snapshot;
     return this.#publish('open', this.#snapshot.members);
   }
 

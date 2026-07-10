@@ -18,7 +18,8 @@ import {
   safePrepareConstraintSetArtifact,
   safePrepareQueryArtifact,
   safePrepareSchemaLensArtifact,
-  safePrepareStorageMappingArtifact
+  safePrepareStorageMappingArtifact,
+  safePrepareTransactionArtifact
 } from '../src/semantic-artifact-parsers.js';
 import type { TransactionBody } from '../src/transaction.js';
 import type { JsonValue } from '../src/value.js';
@@ -151,7 +152,9 @@ describe('semantic artifact safe parsers', () => {
   });
 
   it('validates all transaction statement/edit/guard families and bound parameter references', async () => {
-    expect(await safeParseTransactionArtifact(await seal('transaction', transactionBody()))).toMatchObject({ success: true });
+    const artifact = await seal('transaction', transactionBody());
+    expect(await safeParseTransactionArtifact(artifact)).toMatchObject({ success: true });
+    expect(await safePrepareTransactionArtifact(artifact)).toMatchObject({ success: true, value: { kind: 'transaction', body: transactionBody() } });
     const missingParameter = mutate(transactionBody(), (body) => { body.statements[0].rows[0].name.name = 'missing'; });
     expect(await safeParseTransactionArtifact(await seal('transaction', missingParameter)))
       .toMatchObject({ success: false, issues: [{ details: { reason: 'undeclared_parameter' } }] });

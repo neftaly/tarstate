@@ -7,7 +7,6 @@ export * from './constraint-artifact.js';
 export * from './constraints.js';
 export * from './database.js';
 export * from './external-store.js';
-export * from './golden-workloads.js';
 export * from './host.js';
 export * from './issues.js';
 export * from './lens.js';

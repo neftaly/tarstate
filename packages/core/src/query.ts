@@ -65,7 +65,7 @@ export type WindowExpr = {
 /** Portable relational query AST with bag semantics and hidden occurrence identity. */
 export type QueryNode =
   | { readonly kind: 'from'; readonly relation: RelationUse; readonly alias: string }
-  | { readonly kind: 'values'; readonly alias: string; readonly rows: readonly QueryRecord[] }
+  | { readonly kind: 'values'; readonly alias: string; readonly rows: readonly Readonly<Record<string, JsonValue>>[] }
   | { readonly kind: 'where'; readonly input: QueryNode; readonly predicate: Expr }
   | { readonly kind: 'select'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, Expr>> }
   | { readonly kind: 'with-fields'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, Expr>> }

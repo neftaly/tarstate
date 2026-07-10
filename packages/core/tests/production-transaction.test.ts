@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { checkFinalConstraints, type SourceConstraint } from '../src/constraints.js';
 import { InMemoryAtomicSource, type MemoryQueryResult, type MemoryRelation, type MemoryState } from '../src/memory-source.js';
+import type { QueryNode } from '../src/query.js';
+import { safeParseReceipt } from '../src/receipts.js';
 import { executeNonAtomicBatch, sealTransaction, type NonAtomicBatch, type Transaction, type TransactionBody, type WriteStatement } from '../src/transaction.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
@@ -10,6 +12,7 @@ const literal = (value: null | boolean | number | string) => ({ kind: 'literal' 
 const parameter = (name: string) => ({ kind: 'parameter' as const, name });
 const field = (name: string) => ({ kind: 'field' as const, alias: 'item', name });
 const lessThan = (name: string, value: number) => ({ kind: 'compare' as const, op: 'lt' as const, left: field(name), right: literal(value) });
+const queryRoot = (alias: string): QueryNode => ({ kind: 'values', alias, rows: [] });
 const listCapability = { id: 'urn:test:capability:list-splice', version: '1', contractHash: hash('d') };
 const rekeyCapability = { id: 'urn:test:capability:rekey', version: '1', contractHash: hash('e') };
 
@@ -76,7 +79,7 @@ describe('production in-memory transaction coordinator', () => {
       state: { items: [{ id: 1 }] },
       evaluateQuery: (_root, state) => ({ rows: state.items?.map((row) => ({ ...row, id: (row.id as number) + 10 })) ?? [], resultKeys: ['derived'], completeness: 'exact', issues: [] })
     });
-    const value = await transaction([{ kind: 'statement.insert-from-query', relation, root: { kind: 'derived' } }]);
+    const value = await transaction([{ kind: 'statement.insert-from-query', relation, root: queryRoot('derived') }]);
     expect(await exact.commit(attempt('insert-query', value))).toMatchObject({ outcome: 'committed', statementResults: [{ inserted: 1, logicallyChanged: 1 }] });
     expect(exact.snapshot().state.items).toEqual([{ id: 1 }, { id: 11 }]);
 
@@ -121,7 +124,7 @@ describe('production in-memory transaction coordinator', () => {
     });
     const value = await sealTransaction({ body: {
       schemaView, parameters: {}, statements: [{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }], guards: [], requiredCapabilities: [],
-      returning: [{ name: 'all', root: { kind: 'all' } }]
+      returning: [{ name: 'all', root: queryRoot('all') }]
     } });
     expect(await memory.commit(attempt('returning', value))).toMatchObject({
       outcome: 'committed', afterBasis: { revision: 1 },
@@ -130,7 +133,7 @@ describe('production in-memory transaction coordinator', () => {
 
     const duplicate = await sealTransaction({ body: {
       schemaView, parameters: {}, statements: value.body.statements, guards: [], requiredCapabilities: [],
-      returning: [{ name: 'same', root: {} }, { name: 'same', root: {} }]
+      returning: [{ name: 'same', root: queryRoot('same') }, { name: 'same', root: queryRoot('same') }]
     } });
     expect(await memory.commit(attempt('returning-duplicate', duplicate))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.returning_name_duplicate' }] });
   });
@@ -327,6 +330,7 @@ describe('non-atomic batch execution', () => {
       steps: [{ stepId: 'same', attempt: attempt('duplicate:one', value) }, { stepId: 'same', attempt: attempt('duplicate:two', value) }]
     }, { sourceIdFor: () => 'source:one', commit: () => Promise.reject(new Error('must not execute')) });
     expect(receipt).toMatchObject({ outcome: 'failed', steps: [{ outcome: 'unattempted' }, { outcome: 'unattempted' }], issues: [{ code: 'transaction.batch_step_id_duplicate' }] });
+    expect(safeParseReceipt(receipt)).toMatchObject({ success: true, value: receipt });
   });
 
   it('aggregates all-applied as complete and no-applied known rejection as failed', async () => {
@@ -396,6 +400,7 @@ describe('non-atomic batch execution', () => {
     }, { sourceIdFor: () => { throw new Error('membership unavailable'); }, commit: () => Promise.reject(new Error('must not execute')) });
     expect(receipt).toMatchObject({ outcome: 'unknown', steps: [{ outcome: 'unknown' }], issues: [{ code: 'transaction.batch_step_outcome_unknown', details: { reason: 'source_resolution_failed' } }] });
     expect(receipt.steps[0]).not.toHaveProperty('sourceId');
+    expect(safeParseReceipt(receipt)).toMatchObject({ success: true, value: receipt });
   });
 });
 

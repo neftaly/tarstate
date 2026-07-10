@@ -99,6 +99,11 @@ describe('production foundation', () => {
     expect(safeParseJsonValue(hostile)).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
   });
 
+  it('accepts ordinary JSON records that happen to have issue-shaped fields', () => {
+    const value = { code: 'application.code', severity: 'error', nested: [{ code: 'nested.code', severity: 'warning' }] };
+    expect(safeParseJsonValue(value)).toEqual({ success: true, value, issues: [] });
+  });
+
   it('enforces text and structural budgets', () => {
     expect(safeParseJsonText('[]', { maxBytes: 1, maxDepth: 1, maxArrayMembers: 1, maxObjectMembers: 1, maxTotalMembers: 1, maxDependencies: 1 })).toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded' }] });
     expect(safeParseJsonText('[[0]]', { maxBytes: 10, maxDepth: 1, maxArrayMembers: 2, maxObjectMembers: 1, maxTotalMembers: 3, maxDependencies: 1 })).toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded' }] });

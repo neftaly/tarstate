@@ -173,6 +173,25 @@ const relationalPlan = (): PreparedPlan<QueryNode> => ({
 });
 
 describe('database membership and observation', () => {
+  it('publishes membership only when its semantic state changes', () => {
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'open' });
+    const listener = vi.fn();
+    dataset.subscribe(listener);
+    const open = dataset.snapshot();
+    expect(dataset.reopen()).toBe(open);
+    expect(listener).not.toHaveBeenCalled();
+
+    const settled = dataset.settle();
+    expect(settled.revision).toBe(1);
+    expect(dataset.settle()).toBe(settled);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    const reopened = dataset.reopen();
+    expect(reopened.revision).toBe(2);
+    expect(dataset.reopen()).toBe(reopened);
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
   it('routes observer updates through the incremental query-maintenance factory', () => {
     const source = new TestSource('source:incremental', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
     const catalog = new AttachmentCatalog();

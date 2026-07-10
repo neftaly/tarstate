@@ -1,6 +1,7 @@
-import { sealArtifact, type Artifact, type ArtifactRef } from './artifacts.js';
+import type { ArtifactRef } from './artifacts.js';
 import { parseScalarValue, type ScalarDeclaration } from './codec.js';
 import type { PipeApplication, PipeOperator } from './internal-pipe.js';
+import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import type { CapabilityRegistry } from './registry.js';
 import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
@@ -19,18 +20,9 @@ export type QueryArtifactBody = {
   readonly requiredCapabilities: readonly CapabilityRef[];
 };
 
-export type QueryArtifact = Artifact & { readonly kind: 'query'; readonly body: QueryArtifactBody };
+export type QueryArtifact = TypedArtifact<'query', QueryArtifactBody>;
 
-export const sealQuery = async (input: {
-  readonly id?: string;
-  readonly dependencies?: readonly ArtifactRef[];
-  readonly body: QueryArtifactBody;
-}): Promise<QueryArtifact> => sealArtifact({
-  kind: 'query',
-  ...(input.id === undefined ? {} : { id: input.id }),
-  ...(input.dependencies === undefined ? {} : { dependencies: input.dependencies }),
-  body: input.body as unknown as JsonValue
-}) as Promise<QueryArtifact>;
+export const sealQuery = (input: TypedArtifactInput<QueryArtifactBody>): Promise<QueryArtifact> => sealTypedArtifact('query', input);
 
 type AppliedOperator<Operator, Input> = Operator extends PipeOperator<infer _Type>
   ? PipeApplication<Operator, Input>['output']
@@ -50,6 +42,7 @@ export function pipe(value: unknown, ...operators: readonly ((value: never) => u
   return operators.reduce((current, operator) => operator(current as never), value);
 }
 
+/** Common functional builders; `Expr` and `QueryNode` remain the exhaustive advanced-authoring API. */
 export const from = (relation: { readonly schemaView: ArtifactRef; readonly relationId: string }, alias: string): QueryNode => ({ kind: 'from', relation, alias });
 export const constantValues = (alias: string, rows: readonly Readonly<Record<string, JsonValue>>[]): QueryNode => ({ kind: 'values', alias, rows });
 export const where = (predicate: Expr) => (input: QueryNode): QueryNode => ({ kind: 'where', input, predicate });

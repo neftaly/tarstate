@@ -1,5 +1,5 @@
 import { performance } from 'node:perf_hooks';
-import { runGoldenConformanceWorkloads } from '../packages/core/dist/index.js';
+import { runGoldenConformanceWorkloads } from '../packages/core/dist/golden-workloads.js';
 
 const requestedIterations = Number.parseInt(process.env.TARSTATE_BENCH_ITERATIONS ?? '250', 10);
 const iterations = Number.isSafeInteger(requestedIterations) && requestedIterations > 0 ? requestedIterations : 250;

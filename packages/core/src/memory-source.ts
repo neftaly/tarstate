@@ -2,8 +2,8 @@ import { artifactSemanticValue, safeParseArtifactValue, sha256Json, type Artifac
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
+import type { QueryNode } from './query.js';
 import {
-  emptyStatementResult,
   type CommitReceipt,
   type FieldEdit,
   type ReturningResult,
@@ -90,6 +90,16 @@ const builtinMechanisms = {
   conflict: capability('field/conflict-resolve', 'd2f90f3c1fcda78718037d6c4c1d27b7155e276c92c14fd2c2d4fb08aa9729d3')
 } as const;
 
+const emptyStatementResult = (statementIndex: number): StatementResult => ({
+  statementIndex,
+  matched: 0,
+  logicallyChanged: 0,
+  inserted: 0,
+  deleted: 0,
+  editOutcomes: [],
+  issues: []
+});
+
 export class InMemoryAtomicSource {
   readonly sourceId: string;
   readonly incarnation: string;
@@ -97,7 +107,7 @@ export class InMemoryAtomicSource {
   readonly #attachments: ReadonlyMap<string, MemoryAttachment>;
   readonly #constraints: readonly SourceConstraint<MemoryState>[];
   readonly #resolveArtifact: ((ref: ArtifactRef) => Promise<Transaction | undefined> | Transaction | undefined) | undefined;
-  readonly #evaluateQuery: ((root: JsonValue, state: MemoryState, parameters: Readonly<Record<string, JsonValue>>) => MemoryQueryResult) | undefined;
+  readonly #evaluateQuery: ((root: QueryNode, state: MemoryState, parameters: Readonly<Record<string, JsonValue>>) => MemoryQueryResult) | undefined;
   readonly #satisfiesCapability: (capability: CapabilityRef) => boolean;
   readonly #listeners = new Set<() => void>();
   readonly #ledger = new Map<string, LedgerEntry>();
@@ -116,7 +126,7 @@ export class InMemoryAtomicSource {
     readonly attachments: readonly MemoryAttachment[];
     readonly constraints?: readonly SourceConstraint<MemoryState>[];
     readonly resolveArtifact?: (ref: ArtifactRef) => Promise<Transaction | undefined> | Transaction | undefined;
-    readonly evaluateQuery?: (root: JsonValue, state: MemoryState, parameters: Readonly<Record<string, JsonValue>>) => MemoryQueryResult;
+    readonly evaluateQuery?: (root: QueryNode, state: MemoryState, parameters: Readonly<Record<string, JsonValue>>) => MemoryQueryResult;
     readonly satisfiesCapability?: (capability: CapabilityRef) => boolean;
   }) {
     this.sourceId = options.sourceId;
