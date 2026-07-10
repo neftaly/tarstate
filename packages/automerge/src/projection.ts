@@ -8,6 +8,7 @@ import {
   type AutomergeMoveRecordV1
 } from './move.js';
 import { automergeBasis, type AutomergeBasis } from './source.js';
+import { isAutomergeReservedRootProperty } from './reserved.js';
 
 export type AutomergeFactValue = JsonValue;
 
@@ -109,7 +110,7 @@ export const projectAutomergeFacts = <T extends object>(
     objects.push({ kind: 'automerge.object', objectId, path: [...path], objectKind: Array.isArray(value) ? 'list' : 'map' });
     for (const [rawProperty, child] of Object.entries(value)) {
       const property = Array.isArray(value) ? Number(rawProperty) : rawProperty;
-      if (path.length === 0 && property === automergeMoveMetadataProperty) continue;
+      if (path.length === 0 && (property === automergeMoveMetadataProperty || (typeof property === 'string' && isAutomergeReservedRootProperty(property)))) continue;
       if (properties.length >= budget.maxProperties) {
         incomplete = true;
         issues.push({ code: 'automerge.projection_budget_exceeded', path: [...path, property], details: { budget: 'maxProperties', limit: budget.maxProperties } });
@@ -234,6 +235,9 @@ const inspectMoveLineage = (moves: readonly AutomergeMoveFact[]): readonly Autom
   }
   for (const [oldRootObjectId, next] of targets) {
     if (next.size > 1) issues.push({ code: 'automerge.move_fork_history', details: { oldRootObjectId, newRootObjectIds: [...next].sort() } });
+    for (const middle of next) {
+      for (const end of targets.get(middle) ?? []) issues.push({ code: 'automerge.move_chain_history', details: { objectIds: [oldRootObjectId, middle, end] } });
+    }
   }
   const visit = (start: string, current: string, path: readonly string[]): void => {
     for (const next of targets.get(current) ?? []) {

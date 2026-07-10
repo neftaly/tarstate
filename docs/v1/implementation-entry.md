@@ -343,13 +343,25 @@ the legacy dependency graph to coexist with the rewrite.
 13. Agent database-description/system-relation discovery, safe query/transaction
     parsing, stable issue-code/retry catalogs, simulation, missing capability
     escalation, authority denial, and structured receipts.
-14. Type inference/error fixtures, generated-declaration hash checks, compiler
-    budgets, cold/incremental runtime measurements, cache bounds, and full-oracle
-    equivalence when change hints are absent, stale, or rejected.
+14. Type inference/error fixtures, generated-declaration hash checks, structural
+    compiler budgets, the coarse golden-runtime smoke required by the performance
+    contract, explicit cache/refcount bounds, and full-oracle equivalence when
+    change hints are absent, stale, or rejected. Microbenchmarks, GC profiling,
+    and per-operator latency budgets are not v1 release gates unless the coarse
+    smoke exposes a gross regression.
 15. Exact capability refs and implication graphs, registry upgrade/downgrade,
-    unknown future receipt forwarding, adapter-private move metadata across old
-    and native adapters, and identical portable move results apart from the
-    honestly reported mechanism/identity guarantees.
+    unknown future receipt forwarding, and adapter-private move metadata across
+    legacy and current copy-relocation readers. A future native-move adapter must
+    produce identical portable move results apart from the honestly reported
+    mechanism/identity guarantees; v1 does not require an adapter for an
+    Automerge operation that the measured library does not provide.
+
+The gate-14 wording above reconciles this checklist with the normative
+performance policy in `08-dx-and-performance.md`: simplicity and semantic
+structure come first, with measurement used as a gross-regression signal. The
+gate-15 wording records the Automerge 3.2.6 spike evidence: no public native
+identity-preserving subtree move exists, so the v1 adapter withholds that exact
+capability instead of approximating or fabricating a native implementation.
 
 ## Required spikes before broad implementation
 

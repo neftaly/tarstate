@@ -1,4 +1,6 @@
 export * from './core-adapter.js';
+export * from './issues.js';
+export * from './metadata.js';
 export * from './move.js';
 export * from './projection.js';
 export * from './source.js';

@@ -24,10 +24,17 @@ export type MemoryBasis = { readonly incarnation: string; readonly revision: num
 export type MemoryRow = Readonly<Record<string, JsonValue>>;
 export type MemoryState = Readonly<Record<string, readonly MemoryRow[]>>;
 
+export type MemoryReferenceField = {
+  readonly field: string;
+  readonly targetRelationId: string;
+};
+
 export type MemoryRelation = {
   readonly relationId: string;
   readonly schemaView: ArtifactRef;
   readonly keyFields: readonly string[];
+  /** Schema-declared same-source refs. Ref values are the target's complete key tuple. */
+  readonly referenceFields?: readonly MemoryReferenceField[];
 };
 
 export type MemoryAttachment = {
@@ -289,6 +296,7 @@ export class InMemoryAtomicSource {
     const blockingIssues: Issue[] = [];
     const statementAuditIssues: Issue[] = [];
     for (const [statementIndex, statement] of transaction.body.statements.entries()) {
+      const beforeRekey = statement.kind === 'statement.rekey' ? cloneState(staged) : undefined;
       const result = this.#applyStatement(statement, statementIndex, staged, transaction.body.parameters);
       statementResults.push(result);
       const statementBlockingIssues = result.issues.filter(({ severity }) => severity === 'error');
@@ -296,6 +304,11 @@ export class InMemoryAtomicSource {
       statementAuditIssues.push(...result.issues.filter(({ severity }) => severity !== 'error'));
       const relationId = statementRelation(statement)?.relationId;
       if (relationId !== undefined) touched.add(relationId);
+      if (beforeRekey !== undefined && statementBlockingIssues.length === 0) {
+        for (const candidateRelationId of new Set([...Object.keys(beforeRekey), ...Object.keys(staged)])) {
+          if (!sameJson(beforeRekey[candidateRelationId] ?? [], staged[candidateRelationId] ?? [])) touched.add(candidateRelationId);
+        }
+      }
       if (statementBlockingIssues.length > 0) break;
     }
     if (blockingIssues.length === 0) blockingIssues.push(...this.#evaluateGuards(transaction.body.guards, staged, transaction.body.parameters, statementResults, attempt));
@@ -416,28 +429,121 @@ export class InMemoryAtomicSource {
       return { ...empty, matched: matches.length, logicallyChanged: matches.length, deleted: matches.length };
     }
     if (statement.kind === 'statement.move') return { ...empty, matched: matches.length, issues: [txIssue('transaction.capability_unavailable', 'plan', { capability: statement.requires })] };
+    if (statement.kind === 'statement.rekey') return this.#applyRekey(statement, statementIndex, state, rows, matches, parameters);
     const next = [...rows];
     let changed = 0;
     const outcomes: SemanticEditOutcome[] = [];
     for (const { index, row } of matches) {
       const scope = { [statement.target.alias]: row };
-      let replacement: MemoryRow;
-      if (statement.kind === 'statement.rekey') {
-        const key = evaluateFields(statement.key, scope, parameters);
-        if (!key.success) return { ...empty, matched: matches.length, issues: [key.issue] };
-        replacement = { ...row, ...key.value };
-        outcomes.push({ edit: 'rekey', mechanism: statement.requires, preservationLosses: [] });
-      } else {
-        const edited = applyFieldEdits(row, statement.edits, scope, parameters);
-        if (!edited.success) return { ...empty, matched: matches.length, issues: [edited.issue] };
-        replacement = edited.value.row;
-        outcomes.push(...edited.value.outcomes);
-      }
+      const edited = applyFieldEdits(row, statement.edits, scope, parameters);
+      if (!edited.success) return { ...empty, matched: matches.length, issues: [edited.issue] };
+      const replacement = edited.value.row;
+      outcomes.push(...edited.value.outcomes);
       if (!sameJson(row, replacement)) changed += 1;
       next[index] = replacement;
     }
     state[relationId] = next;
     return { ...empty, matched: matches.length, logicallyChanged: changed, editOutcomes: uniqueOutcomes(outcomes) };
+  }
+
+  #applyRekey(
+    statement: Extract<WriteStatement, { readonly kind: 'statement.rekey' }>,
+    statementIndex: number,
+    state: Record<string, readonly MemoryRow[]>,
+    rows: readonly MemoryRow[],
+    matches: readonly { readonly index: number; readonly row: MemoryRow }[],
+    parameters: Readonly<Record<string, JsonValue>>
+  ): StatementResult {
+    const empty = emptyStatementResult(statementIndex);
+    const relation = this.#relations.get(statement.target.relation.relationId) as MemoryRelation;
+    const declaredKeyFields = [...relation.keyFields].sort();
+    const suppliedKeyFields = Object.keys(statement.key).sort();
+    if (declaredKeyFields.length === 0 || !sameStringArray(declaredKeyFields, suppliedKeyFields)) {
+      return { ...empty, matched: matches.length, issues: [txIssue('transaction.rekey_key_invalid', 'plan', { relationId: relation.relationId, expected: declaredKeyFields, actual: suppliedKeyFields })] };
+    }
+
+    const indexesByOldKey = new Map<string, number[]>();
+    for (const [index, row] of rows.entries()) {
+      if (!hasFields(row, relation.keyFields)) continue;
+      const key = canonical(keyTuple(row, relation.keyFields));
+      const indexes = indexesByOldKey.get(key) ?? [];
+      indexes.push(index);
+      indexesByOldKey.set(key, indexes);
+    }
+    for (const { row } of matches) {
+      if (!hasFields(row, relation.keyFields) || (indexesByOldKey.get(canonical(keyTuple(row, relation.keyFields)))?.length ?? 0) !== 1) {
+        return { ...empty, matched: matches.length, issues: [txIssue('transaction.rekey_target_ambiguous', 'plan', { relationId: relation.relationId })] };
+      }
+    }
+
+    const targetIndexes = new Set(matches.map(({ index }) => index));
+    const replacements = new Map<number, MemoryRow>();
+    const oldToNew = new Map<string, readonly JsonValue[]>();
+    const candidateKeys = new Set<string>();
+    for (const { index, row } of matches) {
+      const evaluated = evaluateFields(statement.key, { [statement.target.alias]: row }, parameters);
+      if (!evaluated.success) return { ...empty, matched: matches.length, issues: [evaluated.issue] };
+      if (!hasFields(evaluated.value, relation.keyFields)) {
+        return { ...empty, matched: matches.length, issues: [txIssue('transaction.rekey_key_invalid', 'plan', { relationId: relation.relationId, expected: declaredKeyFields })] };
+      }
+      const oldTuple = keyTuple(row, relation.keyFields);
+      const newTuple = keyTuple(evaluated.value, relation.keyFields);
+      const newKey = canonical(newTuple);
+      if (candidateKeys.has(newKey)) {
+        return { ...empty, matched: matches.length, issues: [txIssue('transaction.rekey_collision', 'plan', { relationId: relation.relationId, key: newTuple })] };
+      }
+      candidateKeys.add(newKey);
+      if (rows.some((candidate, candidateIndex) => !targetIndexes.has(candidateIndex) && hasFields(candidate, relation.keyFields) && canonical(keyTuple(candidate, relation.keyFields)) === newKey)) {
+        return { ...empty, matched: matches.length, issues: [txIssue('transaction.rekey_collision', 'plan', { relationId: relation.relationId, key: newTuple })] };
+      }
+      replacements.set(index, { ...row, ...evaluated.value });
+      if (!sameJson(oldTuple, newTuple)) oldToNew.set(canonical(oldTuple), newTuple);
+    }
+
+    const declaredReferences = [...this.#relations.values()].flatMap((candidate) =>
+      (candidate.referenceFields ?? [])
+        .filter(({ targetRelationId }) => targetRelationId === relation.relationId)
+        .map((reference) => ({ relation: candidate, reference }))
+    );
+    if (statement.references === 'reject-if-referenced' && oldToNew.size > 0) {
+      const referenced = declaredReferences.some(({ relation: referencingRelation, reference }) =>
+        (state[referencingRelation.relationId] ?? []).some((row) => Object.hasOwn(row, reference.field) && oldToNew.has(canonical(row[reference.field] as JsonValue)))
+      );
+      if (referenced) return { ...empty, matched: matches.length, issues: [txIssue('transaction.rekey_referenced', 'plan', { relationId: relation.relationId })] };
+    }
+
+    const plannedRelations = new Map<string, MemoryRow[]>();
+    const targetRows = [...rows];
+    for (const [index, replacement] of replacements) targetRows[index] = replacement;
+    plannedRelations.set(relation.relationId, targetRows);
+    const changedRows = new Set<string>();
+    for (const [index, replacement] of replacements) if (!sameJson(rows[index] as MemoryRow, replacement)) changedRows.add(relation.relationId + '\u0000' + index);
+
+    if (statement.references === 'source-local-declared' && oldToNew.size > 0) {
+      for (const { relation: referencingRelation, reference } of declaredReferences) {
+        const originalRows = state[referencingRelation.relationId] ?? [];
+        const nextRows = plannedRelations.get(referencingRelation.relationId) ?? [...originalRows];
+        let relationChanged = plannedRelations.has(referencingRelation.relationId);
+        for (const [index, originalRow] of originalRows.entries()) {
+          if (!Object.hasOwn(originalRow, reference.field)) continue;
+          const replacementTuple = oldToNew.get(canonical(originalRow[reference.field] as JsonValue));
+          if (replacementTuple === undefined) continue;
+          const current = nextRows[index] as MemoryRow;
+          nextRows[index] = { ...current, [reference.field]: replacementTuple };
+          changedRows.add(referencingRelation.relationId + '\u0000' + index);
+          relationChanged = true;
+        }
+        if (relationChanged) plannedRelations.set(referencingRelation.relationId, nextRows);
+      }
+    }
+
+    for (const [relationId, planned] of plannedRelations) state[relationId] = planned;
+    return {
+      ...empty,
+      matched: matches.length,
+      logicallyChanged: changedRows.size,
+      editOutcomes: matches.length === 0 ? [] : [{ edit: 'rekey', mechanism: statement.requires, preservationLosses: [] }]
+    };
   }
 
   #evaluateGuards(guards: readonly TransactionGuard[], state: MemoryState, parameters: Readonly<Record<string, JsonValue>>, results: readonly StatementResult[], attempt: TransactionAttempt): Issue[] {
@@ -661,6 +767,9 @@ const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
 const isJsonValue = (value: unknown): value is JsonValue => value === null || typeof value === 'boolean' || typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) || (Array.isArray(value) && value.every(isJsonValue)) || (isRecord(value) && Object.values(value).every(isJsonValue));
 const isMemoryRow = (value: unknown): value is MemoryRow => isRecord(value) && Object.values(value).every(isJsonValue);
 const rowKey = (row: MemoryRow, fields: readonly string[]): string => canonical(fields.map((field) => Object.hasOwn(row, field) ? row[field] as JsonValue : { missing: field }));
+const hasFields = (row: MemoryRow, fields: readonly string[]): boolean => fields.every((field) => Object.hasOwn(row, field));
+const keyTuple = (row: MemoryRow, fields: readonly string[]): readonly JsonValue[] => fields.map((field) => row[field] as JsonValue);
+const sameStringArray = (left: readonly string[], right: readonly string[]): boolean => left.length === right.length && left.every((value, index) => value === right[index]);
 const isIndex = (value: JsonValue): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const uniqueOutcomes = (outcomes: readonly SemanticEditOutcome[]): readonly SemanticEditOutcome[] => [...new Map(outcomes.map((outcome) => [canonical(outcome as unknown as JsonValue), outcome])).values()];
 function capability(suffix: string, hash: string): CapabilityRef { return { id: 'urn:tarstate:capability:' + suffix, version: '1', contractHash: `sha256:${hash}` }; }

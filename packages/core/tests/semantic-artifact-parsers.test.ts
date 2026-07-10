@@ -5,6 +5,7 @@ import type { SchemaLensBody } from '../src/lens.js';
 import type { StorageMappingBody } from '../src/mapping.js';
 import type { QueryArtifactBody } from '../src/query-builder.js';
 import { prepareSchema } from '../src/schema.js';
+import { capabilityRefFor, CapabilityRegistry } from '../src/registry.js';
 import {
   defaultSemanticArtifactParseBudget,
   parseQueryArtifact,
@@ -165,6 +166,28 @@ describe('semantic artifact safe parsers', () => {
       .toMatchObject({ success: false, issues: [{ details: { reason: 'duplicate_constraint_id' } }] });
     const malformed = mutate(constraintBody(), (body) => { body.constraints[0].violationQuery = { kind: 'where', input: 4, predicate: true }; });
     expect(await safeParseConstraintSetArtifact(await seal('constraint-set', malformed))).toMatchObject({ success: false });
+  });
+
+  it('keeps required constraint sets inactive for old executors missing an exact capability', async () => {
+    const declaration = {
+      kind: 'tarstate.capability-contract' as const,
+      formatVersion: 1 as const,
+      id: 'urn:test:constraint-executor',
+      version: '1',
+      class: 'executor' as const,
+      contract: { constraintLanguage: 1 },
+      implies: []
+    };
+    const required = await capabilityRefFor(declaration);
+    const artifact = await seal('constraint-set', { ...constraintBody(), requiredCapabilities: [required] });
+    const evaluateQuery = () => ({ rows: [], completeness: 'exact' as const, issues: [] });
+    expect(await safePrepareConstraintSetArtifact(artifact, { mode: 'required', evaluateQuery }))
+      .toMatchObject({ success: false, issues: [{ code: 'capability.missing', retry: 'after_capability', requiredCapabilities: [required] }] });
+
+    const registry = new CapabilityRegistry('trusted:test');
+    expect(await registry.registerDeclaration(declaration)).toMatchObject({ success: true });
+    expect(registry.registerImplementation({ ref: required, integrity: 'test:implementation', implementation: {} })).toMatchObject({ success: true });
+    expect(await safePrepareConstraintSetArtifact(artifact, { mode: 'required', registry, evaluateQuery })).toMatchObject({ success: true });
   });
 
   it('parses exact storage mappings and safely invokes existing schema-aware compilation', async () => {

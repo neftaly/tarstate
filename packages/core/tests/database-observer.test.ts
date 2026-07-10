@@ -101,14 +101,14 @@ const evaluate = ({ attachments }: DatabaseEvaluationInput<Query, readonly Row[]
   };
 };
 
-const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[], authorityScope = 'public', authorityFingerprint = 'authority:public') => new DatabaseView<Query, Row, readonly Row[]>({
+const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[], authorityScope = 'public', authorityFingerprint = 'authority:public', evaluation = evaluate) => new DatabaseView<Query, Row, readonly Row[]>({
   authorityScope,
   authorityFingerprint,
   registryFingerprint: 'registry:one',
   attachments: catalog,
   datasets,
   canRead: (viewScope, attachmentScope) => viewScope === 'admin' || viewScope === attachmentScope,
-  evaluate
+  evaluate: evaluation
 });
 
 describe('database membership and observation', () => {
@@ -285,6 +285,29 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
+  it('never exposes a negative result while dataset membership remains open', () => {
+    const catalog = new AttachmentCatalog();
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one',
+      state: 'open',
+      members: [member('attachment:optional-pending', 'source:pending', 'optional')]
+    });
+    const negativeEvaluation = (): DatabaseEvaluation<Row> => ({
+      rows: [{ id: 99, value: 'inferred-absence' }],
+      resultKeys: ['negative:99'],
+      completeness: 'exact',
+      issues: []
+    });
+    const database = view(catalog, [dataset], 'public', 'authority:public', negativeEvaluation);
+    const observer = database.observe({ plan: plan() });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown', issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.membership_open' })]) } });
+
+    dataset.settle();
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 99, value: 'inferred-absence' }], completeness: 'exact' } });
+    observer.close();
+    database.close();
+  });
+
   it('queues reentrant source changes and isolates failing listeners', () => {
     const source = new TestSource('source:one', [{ id: 1, value: 'one' }]);
     const catalog = new AttachmentCatalog();
@@ -337,5 +360,105 @@ describe('resource resolver', () => {
     expect(await resolver.resolve({ uri: 'mem:secret', kind: 'data' }, { authorityScope: 'public' })).toMatchObject({ state: 'denied', issues: [{ code: 'resolver.authority_denied' }] });
     expect(calls).toHaveBeenCalledTimes(beforeDenied);
     expect(await resolver.resolve({ uri: 'mem:cycle-a', kind: 'data' }, { authorityScope: 'admin' })).toMatchObject({ state: 'failed', issues: [{ code: 'resolver.cycle' }] });
+  });
+
+  it('keeps missing, stale, denied, failed, and deleted resource evidence distinct across alias chains', async () => {
+    const resolver = new ResourceResolver({ authority: { permits: (_scope, reference) => reference.uri !== 'mem:denied' } });
+    resolver.register('mem', {
+      resolve: async (reference) => {
+        if (reference.uri === 'mem:alias-a') return { state: 'redirect', target: { ...reference, uri: 'mem:alias-b' } };
+        if (reference.uri === 'mem:alias-b') return { state: 'redirect', target: { ...reference, uri: 'mem:stale' } };
+        if (reference.uri === 'mem:stale') return { state: 'ready', freshness: 'stale', value: { cached: true } };
+        if (reference.uri === 'mem:missing') return { state: 'missing', freshness: 'none' };
+        if (reference.uri === 'mem:deleted') return { state: 'deleted', freshness: 'none' };
+        return { state: 'failed', freshness: 'none' };
+      }
+    });
+
+    expect(await resolver.resolve({ uri: 'mem:alias-a', kind: 'data' }, { authorityScope: 'public' })).toMatchObject({
+      state: 'ready',
+      freshness: 'stale',
+      redirects: ['mem:alias-a', 'mem:alias-b'],
+      resolved: { uri: 'mem:stale' },
+      value: { cached: true }
+    });
+    expect(await resolver.resolve({ uri: 'mem:missing', kind: 'document' }, { authorityScope: 'public' })).toMatchObject({ state: 'missing', freshness: 'none' });
+    expect(await resolver.resolve({ uri: 'mem:deleted', kind: 'document' }, { authorityScope: 'public' })).toMatchObject({ state: 'deleted', freshness: 'none' });
+    expect(await resolver.resolve({ uri: 'mem:failed', kind: 'document' }, { authorityScope: 'public' })).toMatchObject({ state: 'failed', freshness: 'none' });
+    expect(await resolver.resolve({ uri: 'mem:denied', kind: 'document' }, { authorityScope: 'public' })).toMatchObject({ state: 'denied', freshness: 'none' });
+  });
+
+  it('evicts completed entries by deterministic least-recently-used order', async () => {
+    const calls = new Map<string, number>();
+    const resolver = new ResourceResolver({ authority: { permits: () => true }, maxCacheEntries: 2 });
+    resolver.register('mem', {
+      resolve: async (reference) => {
+        calls.set(reference.uri, (calls.get(reference.uri) ?? 0) + 1);
+        return { state: 'ready', value: reference.uri };
+      }
+    });
+    const resolve = (uri: string) => resolver.resolve({ uri, kind: 'data' }, { authorityScope: 'public' });
+
+    await resolve('mem:a');
+    await resolve('mem:b');
+    await resolve('mem:a'); // touch A, making B least-recently used
+    await resolve('mem:c'); // evict B
+    await resolve('mem:b');
+
+    expect(Object.fromEntries(calls)).toEqual({ 'mem:a': 1, 'mem:b': 2, 'mem:c': 1 });
+    expect(() => new ResourceResolver({ authority: { permits: () => true }, maxCacheEntries: -1 })).toThrow(/non-negative safe integer/);
+  });
+
+  it('shares in-flight work independently of completed-cache capacity', async () => {
+    let finish: ((value: { readonly state: 'ready'; readonly value: string }) => void) | undefined;
+    const calls = vi.fn();
+    const resolver = new ResourceResolver({ authority: { permits: () => true }, maxCacheEntries: 0 });
+    resolver.register('mem', {
+      resolve: (reference) => {
+        calls(reference.uri);
+        return new Promise((resolve) => { finish = resolve; });
+      }
+    });
+    const reference: ResourceRef = { uri: 'mem:pending', kind: 'data' };
+    const first = resolver.resolve(reference, { authorityScope: 'public' });
+    const shared = resolver.resolve(reference, { authorityScope: 'public' });
+    expect(shared).toBe(first);
+    expect(calls).toHaveBeenCalledOnce();
+    finish?.({ state: 'ready', value: 'first' });
+    await expect(first).resolves.toMatchObject({ value: 'first' });
+
+    const second = resolver.resolve(reference, { authorityScope: 'public' });
+    expect(calls).toHaveBeenCalledTimes(2);
+    finish?.({ state: 'ready', value: 'second' });
+    await expect(second).resolves.toMatchObject({ value: 'second' });
+  });
+
+  it('invalidates one authority scope and prevents detached in-flight completions from repopulating it', async () => {
+    const completions: ((value: { readonly state: 'ready'; readonly value: string }) => void)[] = [];
+    const calls = vi.fn();
+    const resolver = new ResourceResolver({ authority: { permits: () => true }, maxCacheEntries: 4 });
+    resolver.register('mem', {
+      resolve: (reference, context) => {
+        calls(context.authorityScope, reference.uri);
+        return new Promise((resolve) => { completions.push(resolve); });
+      }
+    });
+    const reference: ResourceRef = { uri: 'mem:value', kind: 'data' };
+    const stalePublic = resolver.resolve(reference, { authorityScope: 'public' });
+    const admin = resolver.resolve(reference, { authorityScope: 'admin' });
+    resolver.invalidate('public');
+    const currentPublic = resolver.resolve(reference, { authorityScope: 'public' });
+    expect(calls).toHaveBeenCalledTimes(3);
+
+    completions[0]?.({ state: 'ready', value: 'stale-public' });
+    completions[1]?.({ state: 'ready', value: 'admin' });
+    completions[2]?.({ state: 'ready', value: 'current-public' });
+    await expect(stalePublic).resolves.toMatchObject({ value: 'stale-public' });
+    await expect(admin).resolves.toMatchObject({ value: 'admin' });
+    await expect(currentPublic).resolves.toMatchObject({ value: 'current-public' });
+
+    expect(await resolver.resolve(reference, { authorityScope: 'public' })).toMatchObject({ value: 'current-public' });
+    expect(await resolver.resolve(reference, { authorityScope: 'admin' })).toMatchObject({ value: 'admin' });
+    expect(calls).toHaveBeenCalledTimes(3);
   });
 });

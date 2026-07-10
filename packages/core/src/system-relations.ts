@@ -56,7 +56,7 @@ export type ResourceSystemRow = BasisBearing & {
   readonly kind: 'bytes' | 'document' | 'schema' | 'constraint' | 'storage-mapping' | 'executable' | 'unknown';
   readonly requestedRef: string;
   readonly resolvedRef?: string;
-  readonly lifecycle: 'loading' | 'ready' | 'failed' | 'denied' | 'deleted';
+  readonly lifecycle: 'loading' | 'ready' | 'missing' | 'failed' | 'denied' | 'deleted';
   readonly freshness: 'current' | 'stale' | 'none';
   readonly redirects: readonly string[];
   readonly mediaType?: string;
@@ -184,7 +184,7 @@ export const systemSchemaBody: SchemaBody = deepFreeze({
     }),
     resources: relation(SYSTEM_RELATION_IDS.resources, ['resourceId'], {
       resourceId: stringField(), kind: stringField(['bytes', 'document', 'schema', 'constraint', 'storage-mapping', 'executable', 'unknown']), requestedRef: stringField(), resolvedRef: stringField(undefined, true),
-      lifecycle: stringField(['loading', 'ready', 'failed', 'denied', 'deleted']), freshness: stringField(['current', 'stale', 'none']), redirects: jsonField(), mediaType: stringField(undefined, true), etag: stringField(undefined, true), contentHash: stringField(undefined, true), cacheState: stringField(['miss', 'memory', 'local', 'revalidated'], true), bytes: bytesField(), basis: basisField
+      lifecycle: stringField(['loading', 'ready', 'missing', 'failed', 'denied', 'deleted']), freshness: stringField(['current', 'stale', 'none']), redirects: jsonField(), mediaType: stringField(undefined, true), etag: stringField(undefined, true), contentHash: stringField(undefined, true), cacheState: stringField(['miss', 'memory', 'local', 'revalidated'], true), bytes: bytesField(), basis: basisField
     }),
     discoveryEdges: relation(SYSTEM_RELATION_IDS.discoveryEdges, ['edgeId'], {
       edgeId: stringField(), datasetId: stringField(), revision: integerField(), originAttachmentId: stringField(undefined, true), originResourceId: stringField(undefined, true), path: jsonField(), declaredRef: stringField(), expectation: stringField(['required', 'optional']),

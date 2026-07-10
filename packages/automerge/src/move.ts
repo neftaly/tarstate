@@ -1,6 +1,8 @@
 import * as Automerge from '@automerge/automerge';
 import type { CapabilityRef, JsonValue } from '@tarstate/core';
 import { canonicalAutomergeJson, sha256AutomergeJson } from './wire.js';
+import { isAutomergeReservedRootProperty } from './reserved.js';
+import { automergeBasis, exactAutomergeBasisEqual, type AutomergeBasis } from './source.js';
 
 export type AutomergeMovePath = readonly (string | number)[];
 
@@ -78,6 +80,33 @@ export type AutomergeCopyRelocateInput = {
   readonly statementIndex: number;
   readonly fromPath: AutomergeMovePath;
   readonly toPath: AutomergeMovePath;
+};
+
+export type AutomergeMoveReferenceResolution =
+  | { readonly status: 'resolved'; readonly fromObjectId: string; readonly toObjectId: string; readonly relativePath: AutomergeMovePath }
+  | { readonly status: 'unresolved'; readonly fromObjectId: string; readonly reason: 'mapping-incomplete' | 'not-recorded' | 'ambiguous'; readonly preservationLosses: readonly AutomergeCopyRelocateLossCode[] };
+
+export type AutomergeLiveForkAlternative = {
+  readonly recordId: string;
+  readonly newRootObjectId: string;
+  readonly toPath: AutomergeMovePath;
+};
+
+export type AutomergeLiveForkRepairInput = {
+  readonly governanceAuthorized: boolean;
+  readonly expectedBasis: AutomergeBasis;
+  readonly oldRootObjectId: string;
+  readonly observedAlternatives: readonly AutomergeLiveForkAlternative[];
+  readonly selectedRecordId: string;
+};
+
+export type AutomergeLiveForkRepairResult<T extends object> = {
+  readonly doc: Automerge.Doc<T>;
+  readonly beforeBasis: AutomergeBasis;
+  readonly afterBasis: AutomergeBasis;
+  readonly selected: AutomergeLiveForkAlternative;
+  readonly removed: readonly AutomergeLiveForkAlternative[];
+  readonly retainedRecordIds: readonly string[];
 };
 
 export class AutomergeMoveError extends Error {
@@ -219,6 +248,90 @@ export const readMoveRecord = (doc: object, recordId: string): AutomergeMoveReco
   return isMoveRecordV1(candidate) ? candidate : undefined;
 };
 
+export const readAutomergeMoveRecords = (doc: object): readonly { readonly recordId: string; readonly record: AutomergeMoveRecordV1 }[] => {
+  const metadata = (doc as Record<string, unknown>)[automergeMoveMetadataProperty];
+  if (!isPlainRecord(metadata)) return Object.freeze([]);
+  return Object.freeze(Object.keys(metadata).sort().flatMap((recordId) => {
+    const record = readMoveRecord(doc, recordId);
+    return record === undefined ? [] : [{ recordId, record }];
+  }));
+};
+
+/** Resolves only mappings explicitly frozen in one completed move record. */
+export const resolveAutomergeMoveReference = (
+  record: AutomergeMoveRecordV1,
+  fromObjectId: string
+): AutomergeMoveReferenceResolution => {
+  const candidates = [
+    ...(record.oldRootObjectId === fromObjectId ? [{ toObjectId: record.newRootObjectId, relativePath: [] as AutomergeMovePath }] : []),
+    ...record.descendants.filter((candidate) => candidate.fromObjectId === fromObjectId).map(({ toObjectId, relativePath }) => ({ toObjectId, relativePath }))
+  ];
+  const unique = new Map(candidates.map((candidate) => [candidate.toObjectId + '\u0000' + canonicalAutomergeJson(candidate.relativePath as JsonValue), candidate]));
+  if (unique.size === 1) {
+    const selected = [...unique.values()][0]!;
+    return { status: 'resolved', fromObjectId, toObjectId: selected.toObjectId, relativePath: selected.relativePath };
+  }
+  return {
+    status: 'unresolved',
+    fromObjectId,
+    reason: unique.size > 1 ? 'ambiguous' : record.preservationLosses.includes('automerge.descendant_mapping_incomplete') ? 'mapping-incomplete' : 'not-recorded',
+    preservationLosses: record.preservationLosses
+  };
+};
+
+/**
+ * Explicit governance repair for a currently live copy-relocation fork.
+ * Historical move records are immutable and are never removed or rewritten.
+ */
+export const repairAutomergeLiveFork = <T extends object>(
+  doc: Automerge.Doc<T>,
+  input: AutomergeLiveForkRepairInput
+): AutomergeLiveForkRepairResult<T> => {
+  const beforeBasis = automergeBasis(doc);
+  if (!input.governanceAuthorized) throw new AutomergeMoveError('automerge.move_repair_governance_required', 'Live fork repair requires explicit governance authority');
+  if (!exactAutomergeBasisEqual(beforeBasis, input.expectedBasis)) throw new AutomergeMoveError('automerge.move_repair_basis_stale', 'Live fork repair basis is stale');
+  const records = readAutomergeMoveRecords(doc);
+  const live = records
+    .filter(({ record }) => record.oldRootObjectId === input.oldRootObjectId)
+    .flatMap(({ recordId, record }): AutomergeLiveForkAlternative[] => {
+      const value = valueAt(doc, record.toPath);
+      const objectId = isObjectValue(value) ? Automerge.getObjectId(value) : null;
+      return objectId === record.newRootObjectId ? [{ recordId, newRootObjectId: record.newRootObjectId, toPath: [...record.toPath] }] : [];
+    })
+    .sort((left, right) => left.recordId.localeCompare(right.recordId));
+  if (new Set(live.map(({ newRootObjectId }) => newRootObjectId)).size < 2) throw new AutomergeMoveError('automerge.move_repair_not_live_fork', 'Observed lineage is not a currently live fork');
+  if (new Set(live.map(({ newRootObjectId }) => newRootObjectId)).size !== live.length) throw new AutomergeMoveError('automerge.move_repair_path_ambiguous', 'Several records claim the same live fork object');
+  if (live.some(({ toPath }) => typeof toPath[0] === 'string' && isAutomergeReservedRootProperty(toPath[0]))) {
+    throw new AutomergeMoveError('automerge.reserved_metadata_write', 'Live fork repair cannot touch reserved bootstrap metadata');
+  }
+  const observed = normalizeForkAlternatives(input.observedAlternatives);
+  if (canonicalAutomergeJson(live as unknown as JsonValue) !== canonicalAutomergeJson(observed as unknown as JsonValue)) {
+    throw new AutomergeMoveError('automerge.move_repair_alternatives_changed', 'Live fork alternatives changed after observation');
+  }
+  const selected = live.find(({ recordId }) => recordId === input.selectedRecordId);
+  if (selected === undefined) throw new AutomergeMoveError('automerge.move_repair_selection_invalid', 'Selected fork alternative was not observed live');
+  if (live.some((left) => live.some((right) => left !== right && (isPathPrefixOrEqual(left.toPath, right.toPath) || isPathPrefixOrEqual(right.toPath, left.toPath))))) {
+    throw new AutomergeMoveError('automerge.move_repair_path_ambiguous', 'Nested live fork paths cannot be repaired safely');
+  }
+  const removed = live.filter(({ recordId }) => recordId !== selected.recordId);
+  const changed = Automerge.change(doc, { message: 'tarstate governance live fork repair', time: 0 }, (draft) => {
+    for (const alternative of removed) {
+      const current = valueAt(draft, alternative.toPath);
+      const objectId = isObjectValue(current) ? Automerge.getObjectId(current) : null;
+      if (objectId !== alternative.newRootObjectId) throw new AutomergeMoveError('automerge.move_repair_alternatives_changed', 'Live fork changed during repair');
+      deleteAt(draft, alternative.toPath);
+    }
+  });
+  return {
+    doc: changed,
+    beforeBasis,
+    afterBasis: automergeBasis(changed),
+    selected,
+    removed,
+    retainedRecordIds: readAutomergeMoveRecords(changed).map(({ recordId }) => recordId)
+  };
+};
+
 const sameIntent = (record: AutomergeMoveRecordV1, input: AutomergeCopyRelocateInput): boolean =>
   record.operationEpoch === input.operationEpoch &&
   record.operationId === input.operationId &&
@@ -228,6 +341,9 @@ const sameIntent = (record: AutomergeMoveRecordV1, input: AutomergeCopyRelocateI
 
 const validateMovePaths = (fromPath: AutomergeMovePath, toPath: AutomergeMovePath): void => {
   if (fromPath.length === 0 || toPath.length === 0) throw new AutomergeMoveError('automerge.move_root_unsupported', 'copyRelocate cannot replace the document root');
+  if ([fromPath[0], toPath[0]].some((property) => typeof property === 'string' && isAutomergeReservedRootProperty(property))) {
+    throw new AutomergeMoveError('automerge.reserved_metadata_write', 'copyRelocate cannot read or write reserved bootstrap metadata');
+  }
   if (samePath(fromPath, toPath)) throw new AutomergeMoveError('automerge.move_same_path', 'Move source and destination are identical');
   if (isPathPrefix(fromPath, toPath)) throw new AutomergeMoveError('automerge.move_destination_inside_source', 'Move destination cannot be inside the source subtree');
   if ([...fromPath, ...toPath].some((part) => typeof part === 'number' && (!Number.isInteger(part) || part < 0))) {
@@ -240,6 +356,12 @@ const samePath = (left: AutomergeMovePath, right: AutomergeMovePath): boolean =>
 
 const isPathPrefix = (prefix: AutomergeMovePath, path: AutomergeMovePath): boolean =>
   prefix.length < path.length && prefix.every((part, index) => part === path[index]);
+
+const isPathPrefixOrEqual = (prefix: AutomergeMovePath, path: AutomergeMovePath): boolean =>
+  prefix.length <= path.length && prefix.every((part, index) => part === path[index]);
+
+const normalizeForkAlternatives = (alternatives: readonly AutomergeLiveForkAlternative[]): readonly AutomergeLiveForkAlternative[] =>
+  alternatives.map((alternative) => ({ ...alternative, toPath: [...alternative.toPath] })).sort((left, right) => left.recordId.localeCompare(right.recordId));
 
 const preservationLosses = (root: object): readonly AutomergeCopyRelocateLossCode[] => {
   const losses = new Set<AutomergeCopyRelocateLossCode>([

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   coordinateSourceCommit,
+  createIssue,
   type AtomicSource,
   type Footprint,
   type FootprintRelation,
@@ -114,5 +115,22 @@ describe('generic source commit coordinator', () => {
       ['a', 'b', 'c'],
       ['a', 'b', 'c']
     ]);
+  });
+
+  it('retains a durable source crash-after-handoff as unknown until exact outcome lookup resolves it', async () => {
+    const unknownIssue = createIssue({ code: 'transaction.outcome_unavailable', retry: 'query_outcome', operationId: commitInput.operationId });
+    const committed = { outcome: 'committed' as const, beforeBasis: 0, afterBasis: 1, issues: [] };
+    const durable: AtomicSource<Storage, Command> = {
+      ...source(async () => ({ outcome: 'unknown', beforeBasis: 0, issues: [unknownIssue] })),
+      queryOutcome: async (identity) => identity.operationEpoch === commitInput.operationEpoch && identity.operationId === commitInput.operationId && identity.intentHash === commitInput.intentHash
+        ? { status: 'known', result: committed }
+        : { status: 'ambiguous' }
+    };
+    const handedOff = await coordinateSourceCommit({ source: durable, bindings: [], edits: [], commit: commitInput });
+    expect(handedOff).toMatchObject({ outcome: 'unknown', beforeBasis: 0, issues: [{ code: 'transaction.outcome_unavailable', retry: 'query_outcome' }] });
+    const lookup = durable.queryOutcome;
+    if (lookup === undefined) throw new Error('durable test source must provide outcome lookup');
+    await expect(lookup({ operationEpoch: commitInput.operationEpoch, operationId: commitInput.operationId, intentHash: commitInput.intentHash }))
+      .resolves.toEqual({ status: 'known', result: committed });
   });
 });

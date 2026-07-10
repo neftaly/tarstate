@@ -136,6 +136,8 @@ export const safePrepareSchemaLensArtifact = async (input: unknown, budget?: Sem
 
 export const safePrepareConstraintSetArtifact = async <State>(input: unknown, options: {
   readonly mode: 'audit' | 'required';
+  /** Required executor capabilities must be present before a set can become active. */
+  readonly registry?: CapabilityRegistry;
   readonly evaluateQuery: (query: JsonValue, state: State, basis: SourceBasis) => {
     readonly rows: readonly { readonly subject: JsonValue; readonly evidence?: JsonValue; readonly details?: JsonValue }[];
     readonly completeness: 'exact' | 'lower-bound' | 'unknown';
@@ -145,6 +147,10 @@ export const safePrepareConstraintSetArtifact = async <State>(input: unknown, op
 }): Promise<ParseResult<{ readonly artifact: ConstraintSetArtifact; readonly constraints: readonly SourceConstraint<State>[] }>> => {
   const parsed = await safeParseConstraintSetArtifact(input, options.budget);
   if (!parsed.success) return parsed;
+  const missing = options.registry === undefined
+    ? parsed.value.body.requiredCapabilities.map((required) => createIssue({ code: 'capability.missing', retry: 'after_capability', requiredCapabilities: [required] }))
+    : options.registry.missing(parsed.value.body.requiredCapabilities);
+  if (missing.length > 0) return { success: false, issues: missing };
   return { success: true, value: { artifact: parsed.value, constraints: compileSourceConstraints({ set: parsed.value, mode: options.mode, evaluateQuery: options.evaluateQuery }) }, issues: [] };
 };
 

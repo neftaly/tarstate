@@ -1,7 +1,7 @@
 import { createIssue, type Issue } from './issues.js';
 
 export type ResourceKind = 'bytes' | 'data' | 'schema' | 'constraint' | 'document' | 'executable-code';
-export type ResourceLifecycleState = 'loading' | 'ready' | 'failed' | 'denied' | 'deleted' | 'unsupported';
+export type ResourceLifecycleState = 'loading' | 'ready' | 'missing' | 'failed' | 'denied' | 'deleted' | 'unsupported';
 
 export type ResourceRef = {
   readonly uri: string;
@@ -22,7 +22,7 @@ export type ResolvedResource<Value = unknown> = {
 
 export type ResolverDriverResult<Value = unknown> =
   | { readonly state: 'ready'; readonly resolved?: ResourceRef; readonly freshness?: 'current' | 'stale'; readonly value: Value; readonly contentHash?: `sha256:${string}`; readonly issues?: readonly Issue[] }
-  | { readonly state: 'loading' | 'failed' | 'deleted' | 'unsupported'; readonly resolved?: ResourceRef; readonly freshness?: 'stale' | 'none'; readonly issues?: readonly Issue[] }
+  | { readonly state: 'loading' | 'missing' | 'failed' | 'deleted' | 'unsupported'; readonly resolved?: ResourceRef; readonly freshness?: 'stale' | 'none'; readonly issues?: readonly Issue[] }
   | { readonly state: 'redirect'; readonly target: ResourceRef; readonly issues?: readonly Issue[] };
 
 export type ResolverDriver = {
@@ -44,20 +44,28 @@ export type ResolverAuthority = {
 export class ResourceResolver {
   readonly #authority: ResolverAuthority;
   readonly #drivers = new Map<string, ResolverDriver>();
-  readonly #cache = new Map<string, Promise<ResolvedResource>>();
+  readonly #cache = new Map<string, ResolvedResource>();
+  readonly #inflight = new Map<string, Promise<ResolvedResource>>();
   readonly #maxRedirects: number;
+  readonly #maxCacheEntries: number;
 
-  constructor(options: { readonly authority: ResolverAuthority; readonly maxRedirects?: number }) {
+  constructor(options: { readonly authority: ResolverAuthority; readonly maxRedirects?: number; readonly maxCacheEntries?: number }) {
     this.#authority = options.authority;
     this.#maxRedirects = options.maxRedirects ?? 16;
+    this.#maxCacheEntries = options.maxCacheEntries ?? 256;
+    if (!Number.isSafeInteger(this.#maxCacheEntries) || this.#maxCacheEntries < 0) throw new TypeError('maxCacheEntries must be a non-negative safe integer');
   }
 
   register(scheme: string, driver: ResolverDriver): () => void {
     const normalized = scheme.toLowerCase().replace(/:$/, '');
     if (this.#drivers.has(normalized)) throw new Error('A resolver driver is already registered for ' + normalized);
     this.#drivers.set(normalized, driver);
+    // A previously cached unsupported result may now be resolvable.
+    this.invalidate();
     return () => {
-      if (this.#drivers.get(normalized) === driver) this.#drivers.delete(normalized);
+      if (this.#drivers.get(normalized) !== driver) return;
+      this.#drivers.delete(normalized);
+      this.invalidate();
     };
   }
 
@@ -70,20 +78,51 @@ export class ResourceResolver {
     const useCache = options.bypassCache !== true && options.signal === undefined;
     if (useCache) {
       const cached = this.#cache.get(key);
-      if (cached !== undefined) return cached as Promise<ResolvedResource<Value>>;
+      if (cached !== undefined) {
+        this.#cache.delete(key);
+        this.#cache.set(key, cached);
+        return Promise.resolve(cached as ResolvedResource<Value>);
+      }
+      const inflight = this.#inflight.get(key);
+      if (inflight !== undefined) return inflight as Promise<ResolvedResource<Value>>;
     }
     const pending = this.#resolve(reference, options);
-    if (useCache) this.#cache.set(key, pending);
+    if (useCache) {
+      this.#inflight.set(key, pending);
+      void pending.then(
+        (resolved) => {
+          if (this.#inflight.get(key) !== pending) return;
+          this.#inflight.delete(key);
+          this.#remember(key, resolved);
+        },
+        () => {
+          if (this.#inflight.get(key) === pending) this.#inflight.delete(key);
+        }
+      );
+    }
     return pending as Promise<ResolvedResource<Value>>;
   }
 
   invalidate(authorityScope?: string): void {
     if (authorityScope === undefined) {
       this.#cache.clear();
+      this.#inflight.clear();
       return;
     }
     const prefix = authorityScope + '\u0000';
     for (const key of this.#cache.keys()) if (key.startsWith(prefix)) this.#cache.delete(key);
+    for (const key of this.#inflight.keys()) if (key.startsWith(prefix)) this.#inflight.delete(key);
+  }
+
+  #remember(key: string, resolved: ResolvedResource): void {
+    if (this.#maxCacheEntries === 0) return;
+    this.#cache.delete(key);
+    this.#cache.set(key, resolved);
+    while (this.#cache.size > this.#maxCacheEntries) {
+      const oldest = this.#cache.keys().next().value as string | undefined;
+      if (oldest === undefined) return;
+      this.#cache.delete(oldest);
+    }
   }
 
   async #resolve(reference: ResourceRef, options: { readonly authorityScope: string; readonly signal?: AbortSignal }): Promise<ResolvedResource> {

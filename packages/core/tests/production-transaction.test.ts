@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { checkFinalConstraints, type SourceConstraint } from '../src/constraints.js';
-import { InMemoryAtomicSource, type MemoryQueryResult, type MemoryState } from '../src/memory-source.js';
+import { InMemoryAtomicSource, type MemoryQueryResult, type MemoryRelation, type MemoryState } from '../src/memory-source.js';
 import { executeNonAtomicBatch, sealTransaction, type NonAtomicBatch, type Transaction, type TransactionBody, type WriteStatement } from '../src/transaction.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
@@ -11,17 +11,18 @@ const parameter = (name: string) => ({ kind: 'parameter' as const, name });
 const field = (name: string) => ({ kind: 'field' as const, alias: 'item', name });
 const lessThan = (name: string, value: number) => ({ kind: 'compare' as const, op: 'lt' as const, left: field(name), right: literal(value) });
 const listCapability = { id: 'urn:test:capability:list-splice', version: '1', contractHash: hash('d') };
+const rekeyCapability = { id: 'urn:test:capability:rekey', version: '1', contractHash: hash('e') };
 
 const transaction = (statements: readonly WriteStatement[], parameters: TransactionBody['parameters'] = {}, guards: TransactionBody['guards'] = []): Promise<Transaction> => sealTransaction({
   body: { schemaView, parameters, statements, guards, requiredCapabilities: [] }
 });
 
-const source = (options: { state?: MemoryState; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult } = {}) => new InMemoryAtomicSource({
+const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult } = {}) => new InMemoryAtomicSource({
   sourceId: 'source:one',
   incarnation: 'incarnation:one',
   operationEpoch: 'epoch:one',
   state: options.state ?? { items: [] },
-  relations: [{ relationId: 'items', schemaView, keyFields: ['id'] }],
+  relations: options.relations ?? [{ relationId: 'items', schemaView, keyFields: ['id'] }],
   attachments: [{ attachmentId: 'attachment:one', fingerprint: hash('b'), authorityViewFingerprint: hash('c'), schemaView, writable: true }],
   ...(options.constraints === undefined ? {} : { constraints: options.constraints }),
   ...(options.evaluateQuery === undefined ? {} : { evaluateQuery: options.evaluateQuery })
@@ -153,6 +154,71 @@ describe('production in-memory transaction coordinator', () => {
     }]);
     expect(await memory.commit(attempt('move-unsupported', value))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.capability_unavailable' }] });
     expect(memory.snapshot().basis.revision).toBe(0);
+  });
+
+  it('rekeys an exact target and reports exact affected counts', async () => {
+    const one = source({ state: { items: [{ id: 1, name: 'one' }] } });
+    const rekey = await transaction([{
+      kind: 'statement.rekey', target: { relation, alias: 'item', where: { kind: 'compare', op: 'eq', left: field('id'), right: literal(1) } },
+      key: { id: literal(7) }, references: 'source-local-declared', requires: rekeyCapability
+    }], {}, [{ kind: 'guard.affected-count', statementIndex: 0, count: 'logicallyChanged', op: 'eq', value: 1 }]);
+    expect(await one.commit(attempt('rekey-success', rekey))).toMatchObject({
+      outcome: 'committed', statementResults: [{ matched: 1, logicallyChanged: 1, editOutcomes: [{ edit: 'rekey', mechanism: rekeyCapability, preservationLosses: [] }] }]
+    });
+    expect(one.snapshot().state.items).toEqual([{ id: 7, name: 'one' }]);
+  });
+
+  it('rejects rekey collisions and ambiguous target identities without partial mutation', async () => {
+    const collisionSource = source({ state: { items: [{ id: 1 }, { id: 2 }] } });
+    const collision = await transaction([{
+      kind: 'statement.rekey', target: { relation, alias: 'item', where: { kind: 'compare', op: 'eq', left: field('id'), right: literal(1) } },
+      key: { id: literal(2) }, references: 'source-local-declared', requires: rekeyCapability
+    }]);
+    expect(await collisionSource.commit(attempt('rekey-collision', collision))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.rekey_collision' }] });
+    expect(collisionSource.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [{ id: 1 }, { id: 2 }] } });
+
+    const ambiguousSource = source({ state: { items: [{ id: 1, copy: 'a' }, { id: 1, copy: 'b' }] } });
+    const ambiguous = await transaction([{
+      kind: 'statement.rekey', target: { relation, alias: 'item', where: { kind: 'compare', op: 'eq', left: field('id'), right: literal(1) } },
+      key: { id: literal(3) }, references: 'source-local-declared', requires: rekeyCapability
+    }]);
+    expect(await ambiguousSource.commit(attempt('rekey-ambiguous', ambiguous))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 2 }], issues: [{ code: 'transaction.rekey_target_ambiguous' }] });
+    expect(ambiguousSource.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [{ id: 1 }, { id: 1 }] } });
+  });
+
+  it('rejects referenced rekeys and rewrites only declared same-source tuple refs atomically', async () => {
+    const parentRelation = { relationId: 'parents', schemaView };
+    const relations: readonly MemoryRelation[] = [
+      { relationId: 'parents', schemaView, keyFields: ['tenantId', 'id'] },
+      { relationId: 'children', schemaView, keyFields: ['id'], referenceFields: [{ field: 'parentRef', targetRelationId: 'parents' }] }
+    ];
+    const initial: MemoryState = {
+      parents: [{ tenantId: 'a', id: 1, name: 'parent' }],
+      children: [
+        { id: 'c1', parentRef: ['a', 1], looksLikeARef: ['a', 1] },
+        { id: 'c2', parentRef: ['a', 1], looksLikeARef: ['a', 1] }
+      ]
+    };
+    const target = { relation: parentRelation, alias: 'parent', where: { kind: 'compare' as const, op: 'eq' as const, left: { kind: 'field' as const, alias: 'parent', name: 'id' }, right: literal(1) } };
+    const reject = await transaction([{
+      kind: 'statement.rekey', target, key: { tenantId: literal('b'), id: literal(2) }, references: 'reject-if-referenced', requires: rekeyCapability
+    }]);
+    const blocked = source({ state: initial, relations });
+    expect(await blocked.commit(attempt('rekey-referenced', reject))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.rekey_referenced' }] });
+    expect(blocked.snapshot()).toMatchObject({ basis: { revision: 0 }, state: initial });
+
+    const rewrite = await transaction([{
+      kind: 'statement.rekey', target, key: { tenantId: literal('b'), id: literal(2) }, references: 'source-local-declared', requires: rekeyCapability
+    }], {}, [{ kind: 'guard.affected-count', statementIndex: 0, count: 'logicallyChanged', op: 'eq', value: 3 }]);
+    const rewritten = source({ state: initial, relations });
+    expect(await rewritten.commit(attempt('rekey-rewrite', rewrite))).toMatchObject({ outcome: 'committed', statementResults: [{ matched: 1, logicallyChanged: 3 }] });
+    expect(rewritten.snapshot().state).toEqual({
+      parents: [{ tenantId: 'b', id: 2, name: 'parent' }],
+      children: [
+        { id: 'c1', parentRef: ['b', 2], looksLikeARef: ['a', 1] },
+        { id: 'c2', parentRef: ['b', 2], looksLikeARef: ['a', 1] }
+      ]
+    });
   });
 
   it('checks constraints only on final state and rejects violated or indeterminate outcomes atomically', async () => {

@@ -339,7 +339,7 @@ type ResourceSystemRow = {
     | 'unknown'
   requestedRef: string
   resolvedRef?: string
-  lifecycle: 'loading' | 'ready' | 'failed' | 'denied' | 'deleted'
+  lifecycle: 'loading' | 'ready' | 'missing' | 'failed' | 'denied' | 'deleted'
   freshness: 'current' | 'stale' | 'none'
   redirects: readonly string[]
   mediaType?: string

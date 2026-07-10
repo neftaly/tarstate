@@ -172,6 +172,19 @@ describe('production schema lenses', () => {
     expect(translated).toEqual({ success: true, value: { name: 'Renamed' }, issues: [] });
   });
 
+  it('rejects ambiguous inverse derivation instead of choosing a write path by order', () => {
+    const task = body.relations[0]!;
+    const ambiguous: SchemaLensBody = {
+      ...body,
+      relations: [{
+        ...task,
+        steps: [...task.steps, { kind: 'lens.field', from: 'legacyName', to: 'title', write: 'invertible' }]
+      }, ...body.relations.slice(1)]
+    };
+    expect(translateLensEdits(ambiguous, 'test.task', { name: 'A', legacyName: 'Old' }, { title: 'Renamed' }, {}))
+      .toMatchObject({ success: false, issues: [{ code: 'lens.inverse_ambiguous', path: ['title'] }] });
+  });
+
   it('resolves only a single unambiguous exact path', () => {
     expect(validateLens(body)).toMatchObject({ success: true });
     const first: LensArtifact = { ref: { id: 'urn:test:lens:first', contentHash: hash('5') }, body };
