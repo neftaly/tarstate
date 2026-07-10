@@ -34,6 +34,7 @@ export const sourceAliasesFor = (repoRoot: string) => [
   sourceAlias(repoRoot, '@tarstate/automerge/react', 'packages/automerge/src/react.ts'),
   sourceAlias(repoRoot, '@tarstate/automerge/v1-spike', 'packages/automerge/src/v1-spike.ts'),
   sourceAlias(repoRoot, '@tarstate/automerge', 'packages/automerge/src/index.ts'),
+  sourceAlias(repoRoot, '@tarstate/zustand', 'packages/zustand/src/index.ts'),
   sourceAlias(repoRoot, '@tarstate/react', 'packages/react/src/index.ts'),
   sourceAlias(repoRoot, '@tarstate/schema-tools/cli', 'packages/schema-tools/src/cli.ts'),
   sourceAlias(repoRoot, '@tarstate/schema-tools', 'packages/schema-tools/src/index.ts'),

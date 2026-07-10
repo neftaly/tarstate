@@ -1,0 +1,26 @@
+{
+  "name": "@tarstate/zustand",
+  "private": true,
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "files": ["src"],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
+    "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
+    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@tarstate/core": "workspace:*",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@tanstack/store": "^0.11.0",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

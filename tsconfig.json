@@ -88,6 +88,9 @@
       "@tarstate/automerge/v1-spike": [
         "./packages/automerge/src/v1-spike.ts"
       ],
+      "@tarstate/zustand": [
+        "./packages/zustand/src/index.ts"
+      ],
       "@tarstate/automerge/presence": [
         "./packages/automerge/src/presence.ts"
       ],

@@ -19,6 +19,20 @@ const failOnRollupWarning = (warning: string | { readonly message?: string }): n
 const sharedBuildOptions = { target: 'safari17', sourcemap: true, rollupOptions: { onwarn: failOnRollupWarning } } satisfies NonNullable<UserConfig['build']>;
 
 const buildConfigsByPackageName: Record<string, PackageConfig> = {
+  '@tarstate/zustand': {
+    build: {
+      ...sharedBuildOptions,
+      lib: {
+        entry: { index: 'src/index.ts' },
+        formats: ['es'],
+        fileName: (_format, entryName) => entryName + '.js'
+      },
+      rollupOptions: {
+        ...sharedBuildOptions.rollupOptions,
+        external: [/^@tarstate\/core(?:\/.*)?$/, /^zustand(?:\/.*)?$/]
+      }
+    }
+  },
   '@tarstate/react': {
     build: {
       ...sharedBuildOptions,
