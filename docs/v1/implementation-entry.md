@@ -360,12 +360,16 @@ Implement a temporary or isolated reference evaluator for values/from/where/
 select/inner-join/anti-join/aggregate with exact versus incomplete inputs. It
 must prove the truth and completeness tables without adapters.
 
+Executable evidence: [pure semantic spike report](spikes/pure-semantic.md).
+
 ### Source transaction slice
 
 Implement one in-memory source with two overlapping storage bindings,
 simulation, final
 constraints, exact basis, operation epoch/ID, and receipt. It must reject ambiguous
 footprints and cross-source guards.
+
+Executable evidence: [source transaction spike report](spikes/source-transaction.md).
 
 ### Automerge slice
 
@@ -387,10 +391,19 @@ Adapt one Zustand and the current Probability TanStack store through the generic
 protocol. Prove hydration state, external subscription, atomic updater, actions
 preservation, and one coherent notification.
 
+Executable evidence: [external-store spike report](spikes/external-store.md).
+
 ### Lens slice
 
 Execute the complete v1/v200 trace, including unknown fields, changed key/ref,
 newer constraints, lossy reverse rejection, and ambiguous paths.
+
+Executable evidence: [schema lens spike report](spikes/lens.md).
+
+All five required slices have executable evidence as of 2026-07-10. The
+Automerge evidence amended the fallback preservation and Repo identity claims;
+the other four slices found no normative contradiction. This satisfies the
+pre-broad-implementation spike gate, not the broader conformance gates above.
 
 ## Build order after spikes
 

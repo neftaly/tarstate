@@ -50,6 +50,14 @@ Required end-to-end traces:
 - [Probability nested move](traces/probability-move.md)
 - [v1 app editing v200 data](traces/schema-v1-v200.md)
 
+Executable initial spike evidence:
+
+- [pure semantic evaluator](spikes/pure-semantic.md)
+- [source transaction coordinator](spikes/source-transaction.md)
+- [Automerge behavior and fallback](spikes/automerge.md)
+- [Zustand and TanStack external stores](spikes/external-store.md)
+- [v1/v200 schema lens](spikes/lens.md)
+
 ## Layer model
 
 | Layer | Responsibility |
