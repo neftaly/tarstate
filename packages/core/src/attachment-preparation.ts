@@ -73,7 +73,10 @@ export type PrepareDatabaseAttachmentInput<State = unknown> = {
   readonly resolveStorageBinding?: (reference: CapabilityRef) => StorageBinding<unknown, unknown, unknown> | undefined;
 };
 
-/** Pure semantic preparation. It resolves no source handles and mutates no catalog state. */
+/**
+ * Effect-isolated preparation shell: host I/O enters only through the artifact
+ * resolver; semantic derivation is pure and no source handle or catalog mutates.
+ */
 export const prepareDatabaseAttachment = async <State = unknown>(
   input: PrepareDatabaseAttachmentInput<State>
 ): Promise<AttachmentPreparationResult<unknown, BindingProjection | ProjectionResult, State>> => {

@@ -17,8 +17,6 @@ type LogicalFieldsEdit = LogicalEditTarget & {
   readonly fields: Readonly<Record<string, JsonValue>>;
 };
 
-/** Existing callers without `kind` retain field-patch replacement semantics. */
-export type LogicalLegacyReplaceFieldsEdit = LogicalFieldsEdit & { readonly kind?: undefined };
 export type LogicalReplaceFieldsEdit = LogicalFieldsEdit & { readonly kind: 'replace-fields' };
 
 export type LogicalSemanticEdit =
@@ -41,7 +39,7 @@ export type LogicalSemanticEdit =
       readonly mode: 'identity-preserving' | 'copy-relocate';
     });
 
-export type LogicalEdit = LogicalLegacyReplaceFieldsEdit | LogicalSemanticEdit;
+export type LogicalEdit = LogicalSemanticEdit;
 
 export type StorageIntent<Command> = {
   readonly footprint: Footprint;

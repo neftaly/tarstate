@@ -356,12 +356,12 @@ the legacy dependency graph to coexist with the rewrite.
     mechanism/identity guarantees; v1 does not require an adapter for an
     Automerge operation that the measured library does not provide.
 
-The gate-14 wording above reconciles this checklist with the normative
-performance policy in `08-dx-and-performance.md`: simplicity and semantic
-structure come first, with measurement used as a gross-regression signal. The
-gate-15 wording records the Automerge 3.2.6 spike evidence: no public native
-identity-preserving subtree move exists, so the v1 adapter withholds that exact
-capability instead of approximating or fabricating a native implementation.
+Gate 14 is an explicit owner-selected scope change, recorded as D-002 in
+`decisions.md`; it is not presented as contradictory spike evidence. Gate 15
+records both the Automerge 3.2.6 spike evidence and the accepted D-003 product
+decision: no public native identity-preserving subtree move exists, so the v1
+adapter withholds that exact capability instead of approximating or fabricating
+a native implementation. The legacy purge is separately recorded as D-001.
 
 ## Required spikes before broad implementation
 

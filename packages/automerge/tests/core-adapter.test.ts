@@ -43,7 +43,7 @@ const selectedEdit = (
   const projection = binding.project(source.snapshot());
   const row = projection.rows.find((candidate) => candidate.key[0] === 'first');
   if (row === undefined) throw new Error('fixture row missing');
-  return { relationId: 'relation:tasks', key: row.key as JsonValue, locator: row.locator as unknown as JsonValue, fields };
+  return { kind: 'replace-fields', relationId: 'relation:tasks', key: row.key as JsonValue, locator: row.locator as unknown as JsonValue, fields };
 };
 
 const selectedTarget = (

@@ -207,30 +207,20 @@ Eviction may cause recomputation, never semantic loss. Retention policies and
 reference counts are observable through development diagnostics, without
 exposing hidden row data.
 
-## Measurements before API freeze
+## V1 structural performance gate
 
-The clean-slate implementation begins with simple full recomputation and coarse
-golden-workload comparisons against `legacy-v0-final`. Microbenchmarks, GC
-profiling, and specialized incremental structures are deferred unless a gross
-latency, scaling, or retention regression appears. Such a regression is first a
-signal to simplify or decompose the design; optimization follows only when the
-semantic structure is sound.
+The clean-slate implementation uses simple full recomputation and the five
+golden workloads as a coarse structural smoke. `pnpm bench` fails only when the
+whole staged workload exceeds a deliberately loose per-iteration ceiling; the
+ceiling can be overridden for constrained CI hosts. This detects gross runaway
+work without presenting one machine's elapsed time as a portable API promise.
 
-The spikes and golden workloads record both latency and scaling slope for:
+V1 does not require microbenchmarks, GC profiles, per-operator latency targets,
+or legacy performance parity. Compiler/declaration budgets and executable
+cache, lease, and subscription-lifetime tests remain release gates. A material
+workload regression calls for ownership/data-flow simplification first and
+focused profiling second; it never permits weaker rows, identities, ordering,
+completeness, issues, or receipts.
 
-- artifact parse/hash and schema/lens preparation;
-- cold attachment projection and first exact query;
-- one-row insert, update, delete, rekey, and move observation;
-- join, anti-join, group, window, recursion, and membership changes;
-- simulation, constraint checking, source commit, and receipt construction;
-- Automerge change/sync and external-store notification fan-out;
-- React snapshot/render suppression;
-- steady-state and churn memory;
-- retained heap after observer/dataset/database close, allocation rate, and GC
-  pause distribution;
-- TypeScript compiler and editor behavior.
-
-Measurements use named fixture sizes, warm/cold state, p50/p95 latency, peak
-memory, and a recorded environment. Numeric budgets are set from these spikes
-before freezing the public constructors. Regressions may fall back to correct
-full recomputation, but they cannot be hidden by weakening semantics.
+This scope is the explicit owner decision recorded as D-002 in
+`decisions.md`, not a contradiction discovered by a spike.

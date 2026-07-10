@@ -46,6 +46,8 @@ set of local-first sources.
 
 Production evidence is mapped gate by gate in the
 [v1 conformance matrix](conformance-matrix.md).
+Owner-selected scope changes are recorded separately from measured spike
+contradictions in the [v1 decision log](decisions.md).
 
 Required end-to-end traces:
 

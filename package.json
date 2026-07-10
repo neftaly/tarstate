@@ -13,7 +13,7 @@
     "bench:legacy": "node scripts/legacy-benchmark.mjs",
     "build": "pnpm --filter './packages/*' -r build",
     "check": "pnpm lint && pnpm typecheck && pnpm typecheck:budget && pnpm build && pnpm test",
-    "check:release": "pnpm check && tsc -p tsconfig.release.json && node scripts/verify-release.mjs",
+    "check:release": "pnpm check && pnpm bench && tsc -p tsconfig.release.json && node scripts/verify-release.mjs",
     "lint": "oxlint . --deny-warnings --type-aware",
     "test": "pnpm --filter './packages/*' test",
     "typecheck": "tsc -p tsconfig.json --noEmit",

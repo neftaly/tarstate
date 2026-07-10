@@ -53,8 +53,9 @@ A remote peer concurrently edits `O2` from a branch based on `H1`.
 When it merges after the local relocation:
 
 - the edit is not silently copied into `N2`;
-- the old edited branch/orphan remains inspectable through move/conflict issue
-  relations;
+- the old edit remains inspectable through retained Automerge history and move
+  diagnostics, but deletion wins the merged live parent reference and no live
+  orphan row is claimed;
 - hard identity-sensitive operations become indeterminate;
 - the app must explicitly reconcile the old edit with the relocated entity.
 

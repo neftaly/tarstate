@@ -360,7 +360,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, never, Au
         issues.push(adapterIssue('mapping.locator_stale', 'plan', snapshot.sourceId, this.#relationId, undefined, { reason: 'logical_key_changed' }));
         continue;
       }
-      if (edit.kind === undefined || edit.kind === 'replace-fields') {
+      if (edit.kind === 'replace-fields') {
         if (typeof this.#keySource !== 'string' && Object.hasOwn(edit.fields, this.#keySource.field) && !samePortable(edit.fields[this.#keySource.field], row.fields[this.#keySource.field])) {
           issues.push(createIssue({ code: 'mapping.rekey_required', sourceId: snapshot.sourceId, relationId: this.#relationId, path: [...row.storagePath, this.#keySource.field], retry: 'after_input' }));
           continue;
