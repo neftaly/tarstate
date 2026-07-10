@@ -1,7 +1,11 @@
 import type { ArtifactRef } from './artifacts.js';
 import { ExternalStoreRuntime, type AtomicExternalStore } from './external-store.js';
+import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, type LensRows, type SchemaLensBody } from './lens.js';
+import { InMemoryAtomicSource } from './memory-source.js';
 import { evaluateQuery, type QueryNode, type QueryRecord, type RelationInput } from './query.js';
+import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
+import { sealTransaction } from './transaction.js';
 
 export type GoldenFixtureStatus = 'synthetic' | 'migrated-synthetic';
 export type GoldenWorkloadLabel =
@@ -185,6 +189,78 @@ export const runPatchpitFolderGolden = (): GoldenWorkloadTrace => {
       identityModel: 'stable-entry-id'
     }
   };
+};
+
+/**
+ * Executes Patchpit's non-atomic create-then-link shell workflow. The source
+ * creation and folder transaction use the real coordinators; the stale folder
+ * basis makes the second step fail without pretending the first can roll back.
+ */
+export const runPatchpitCreationFailureGolden = async (): Promise<SequenceReceipt> => {
+  const sourceCapability = { id: 'urn:tarstate:golden:automerge-source', version: '1', contractHash: hash('d') };
+  const lifecycle = new SourceLifecycleCoordinator({
+    lifecycleCoordinatorId: 'golden:patchpit:lifecycle',
+    operationEpoch: 'golden:patchpit:lifecycle:1',
+    authorityViewFingerprint: hash('e'),
+    authorize: () => ({ allowed: true }),
+    adapter: {
+      allocateSourceId: () => 'golden:folder:C',
+      create: ({ context }) => {
+        context.markMutationPossible();
+        return { outcome: 'committed', durability: 'memory', issues: [] };
+      },
+      delete: () => ({ outcome: 'committed', durability: 'memory', issues: [] })
+    }
+  });
+  const create: SourceLifecycleCommand = {
+    lifecycleCoordinatorId: lifecycle.lifecycleCoordinatorId,
+    operationEpoch: lifecycle.ledger.activeEpoch,
+    operationId: 'golden:create:C',
+    request: { action: 'create', sourceCapability, input: { kind: 'folder', title: 'C' } }
+  };
+  const folder = new InMemoryAtomicSource({
+    sourceId: 'golden:folder:A',
+    incarnation: 'golden:folder:A:1',
+    operationEpoch: 'golden:folder:A:operations:1',
+    state: { entries: [] },
+    relations: [{ relationId: 'golden.folder-entry', schemaView, keyFields: ['entryId'] }],
+    attachments: [{
+      attachmentId: 'golden:folder:A:attachment',
+      fingerprint: hash('f'),
+      authorityViewFingerprint: hash('e'),
+      schemaView,
+      writable: true
+    }]
+  });
+  const link = await sealTransaction({ body: {
+    schemaView,
+    parameters: {},
+    guards: [],
+    requiredCapabilities: [],
+    statements: [{
+      kind: 'statement.insert',
+      relation: { relationId: 'golden.folder-entry', schemaView },
+      rows: [{
+        entryId: { kind: 'literal', value: 'a-folder-c' },
+        kind: { kind: 'literal', value: 'folder' },
+        targetId: { kind: 'literal', value: 'C' },
+        ref: { kind: 'literal', value: 'automerge:C' }
+      }]
+    }]
+  } });
+  return executeSequence({
+    sequenceId: 'golden:patchpit:create-and-link:C',
+    steps: [
+      { stepId: 'create-source', run: () => lifecycle.execute(create) },
+      { stepId: 'link-folder-entry', run: () => folder.commit({
+        operationEpoch: 'golden:folder:A:operations:1',
+        operationId: 'golden:link:C',
+        attachmentId: 'golden:folder:A:attachment',
+        expectedBasis: { incarnation: 'stale-folder-incarnation', revision: 0 },
+        transaction: link
+      }) }
+    ]
+  });
 };
 
 export const runProbabilityGolden = (): GoldenWorkloadTrace => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   runGoldenConformanceWorkloads,
   runLeaderboardGolden,
+  runPatchpitCreationFailureGolden,
   runPatchpitFolderGolden,
   runProbabilityGolden,
   runRealEstateGolden,
@@ -47,6 +48,19 @@ describe('small labeled golden conformance workloads', () => {
     expect(trace.evidence.visitedFolders).toEqual([{ id: 'A' }, { id: 'B' }]);
     expect(trace.evidence.tigerResource).toEqual({ kind: 'bytes', mediaType: 'image/svg+xml', relationalSource: false });
     expect(trace.evidence).toMatchObject({ completeness: 'exact', identityModel: 'stable-entry-id' });
+  });
+
+  it('executes the Patchpit create-then-link failure and names the orphan', async () => {
+    const receipt = await runPatchpitCreationFailureGolden();
+    expect(receipt).toMatchObject({
+      sequenceId: 'golden:patchpit:create-and-link:C',
+      outcome: 'partial',
+      orphanedSourceIds: ['golden:folder:C'],
+      steps: [
+        { stepId: 'create-source', outcome: 'applied', receipt: { kind: 'source-lifecycle', outcome: 'committed', sourceId: 'golden:folder:C' } },
+        { stepId: 'link-folder-entry', outcome: 'failed', receipt: { kind: 'commit', outcome: 'rejected', issues: [{ code: 'transaction.expected_basis_stale' }] } }
+      ]
+    });
   });
 
   it('runs the migrated/synthetic Probability scene, move, and external-store trace', () => {
