@@ -431,7 +431,7 @@ const coreCommitResult = (result: AutomergeSourceCommitResult): SourceCommitResu
   ...(result.beforeBasis === undefined ? {} : { beforeBasis: result.beforeBasis }),
   ...(result.afterBasis === undefined ? {} : { afterBasis: result.afterBasis }),
   issues: result.issues.map((issue) => adapterIssue(
-    issue.code === 'transaction.stale_basis' ? 'transaction.expected_basis_stale' : issue.code,
+    issue.code,
     issue.phase,
     issue.sourceId,
     undefined,

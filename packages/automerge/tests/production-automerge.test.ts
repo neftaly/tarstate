@@ -76,7 +76,7 @@ describe('production Automerge adapter', () => {
     const result = await runtime.commit({
       operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d'), expectedBasis: automergeBasis(base), commands: [{ apply: command }]
     });
-    expect(result).toMatchObject({ outcome: 'rejected', changed: false, issues: [{ code: 'transaction.stale_basis' }] });
+    expect(result).toMatchObject({ outcome: 'rejected', changed: false, issues: [{ code: 'transaction.expected_basis_stale' }] });
     expect(command).not.toHaveBeenCalled();
     expect(runtime.queryOutcome({ operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d') })).toMatchObject({ status: 'known' });
   });

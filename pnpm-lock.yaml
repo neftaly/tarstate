@@ -54,7 +54,7 @@ importers:
         specifier: 3.2.6
         version: 3.2.6
       '@tarstate/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
     devDependencies:
       '@automerge/automerge-repo':
@@ -85,7 +85,7 @@ importers:
   packages/react:
     dependencies:
       '@tarstate/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
     devDependencies:
       '@types/react':
@@ -116,13 +116,13 @@ importers:
   packages/schema-tools:
     dependencies:
       '@tarstate/core':
-        specifier: workspace:0.0.0
+        specifier: workspace:^
         version: link:../core
 
   packages/zustand:
     dependencies:
       '@tarstate/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../core
       zustand:
         specifier: 5.0.14

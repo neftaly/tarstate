@@ -50,6 +50,26 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
         external: [/^@tarstate\/core(?:\/.*)?$/, /^zustand(?:\/.*)?$/]
       }
     }
+  },
+  '@tarstate/react': {
+    build: {
+      ...sharedBuildOptions,
+      lib: { entry: { index: 'src/index.ts' }, formats: ['es'], fileName: (_format, entryName) => entryName + '.js' },
+      rollupOptions: {
+        ...sharedBuildOptions.rollupOptions,
+        external: [/^@tarstate\/core(?:\/.*)?$/, /^react(?:\/.*)?$/]
+      }
+    }
+  },
+  '@tarstate/schema-tools': {
+    build: {
+      ...sharedBuildOptions,
+      lib: { entry: { index: 'src/index.ts' }, formats: ['es'], fileName: (_format, entryName) => entryName + '.js' },
+      rollupOptions: {
+        ...sharedBuildOptions.rollupOptions,
+        external: [/^@tarstate\/core(?:\/.*)?$/]
+      }
+    }
   }
 };
 

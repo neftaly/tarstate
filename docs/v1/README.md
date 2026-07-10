@@ -1,6 +1,6 @@
 # Tarstate v1 Normative Design Packet
 
-Status: normative pre-implementation specification.
+Status: normative v1.0 specification.
 
 This directory is the source of truth for the Tarstate rewrite. Documents
 outside `docs/v1/` are historical research unless this packet explicitly
@@ -43,6 +43,9 @@ set of local-first sources.
 9. [Query artifacts and execution](09-query-artifacts-and-execution.md)
 10. [Spike wire contract](10-spike-wire-contract.md)
 11. [Implementation entry contract](implementation-entry.md)
+
+Production evidence is mapped gate by gate in the
+[v1 conformance matrix](conformance-matrix.md).
 
 Required end-to-end traces:
 

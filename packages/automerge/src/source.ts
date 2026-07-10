@@ -186,7 +186,7 @@ export class AutomergeSourceRuntime<T extends object> {
     const beforeBasis = automergeBasis(this.#doc);
     if (!exactAutomergeBasisEqual(beforeBasis, input.expectedBasis)) {
       const rejected = this.#rejected(input, beforeBasis, [{
-        code: 'transaction.stale_basis',
+        code: 'transaction.expected_basis_stale',
         phase: 'commit',
         sourceId: this.sourceId,
         operationId: input.operationId,

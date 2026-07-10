@@ -1,17 +1,26 @@
 {
   "name": "@tarstate/core",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Portable relational semantics and source protocols for Tarstate",
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/core" },
   "type": "module",
-  "files": ["src"],
+  "files": ["dist"],
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "publishConfig": { "access": "public" },
+  "engines": { "node": ">=24.12.0" },
   "scripts": {
     "bench": "node ../../scripts/v1-coarse-benchmark.mjs",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
+    "typecheck:budget": "node scripts/check-type-budget.mjs",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "devDependencies": {

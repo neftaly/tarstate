@@ -1,7 +1,7 @@
 {
   "name": "tarstate",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@10.33.2",
@@ -12,10 +12,12 @@
     "bench": "pnpm --filter './packages/*' --if-present bench",
     "bench:legacy": "node scripts/legacy-benchmark.mjs",
     "build": "pnpm --filter './packages/*' -r build",
-    "check": "pnpm lint && pnpm typecheck && pnpm build && pnpm test",
+    "check": "pnpm lint && pnpm typecheck && pnpm typecheck:budget && pnpm build && pnpm test",
+    "check:release": "pnpm check && tsc -p tsconfig.release.json && node scripts/verify-release.mjs",
     "lint": "oxlint . --deny-warnings --type-aware",
     "test": "pnpm --filter './packages/*' test",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:budget": "pnpm --filter @tarstate/core typecheck:budget"
   },
   "devDependencies": {
     "@types/node": "catalog:",

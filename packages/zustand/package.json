@@ -1,20 +1,28 @@
 {
   "name": "@tarstate/zustand",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Zustand adapter for Tarstate's atomic external-store protocol",
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/zustand" },
   "type": "module",
-  "files": ["src"],
+  "files": ["dist"],
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "publishConfig": { "access": "public" },
+  "engines": { "node": ">=24.12.0" },
   "scripts": {
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@tarstate/core": "workspace:*",
+    "@tarstate/core": "workspace:^",
     "zustand": "5.0.14"
   },
   "devDependencies": {

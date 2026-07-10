@@ -1,6 +1,6 @@
 # Tarstate
 
-Tarstate is a clean-slate v1 rewrite of a functional, reactive relational
+Tarstate 1.0 is a clean-slate rewrite of a functional, reactive relational
 interface over authority-scoped local-first sources.
 
 The legacy implementation was removed from `main`. It remains available at the
@@ -22,8 +22,13 @@ evidence remains in the design packet; the production surfaces are the only
 runtime implementation.
 
 ```sh
-pnpm check
+pnpm check:release
 ```
+
+The release check builds and tests the workspace, enforces the TypeScript
+complexity budget, consumes the emitted declarations, and verifies all five
+dist-only package tarballs. The gate-by-gate record is in
+[docs/v1/conformance-matrix.md](docs/v1/conformance-matrix.md).
 
 Legacy performance is intentionally only a gross-regression signal. See
 [benchmarks/README.md](benchmarks/README.md) for the isolated baseline runner.
