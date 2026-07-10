@@ -1,5 +1,5 @@
 import { sealArtifact, type Artifact, type ArtifactRef, type ContentHash } from './artifacts.js';
-import type { CapabilityRef, Issue } from './issues.js';
+import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
 import type { JsonValue } from './value.js';
 
@@ -23,6 +23,14 @@ export type WriteTarget = {
   readonly where?: WriteExpression;
 };
 
+export type InsertConflictPolicy = 'reject' | 'keep-existing' | 'replace';
+
+export type MovePosition =
+  | { readonly kind: 'beginning' }
+  | { readonly kind: 'end' }
+  | { readonly kind: 'before'; readonly anchor: WriteExpression }
+  | { readonly kind: 'after'; readonly anchor: WriteExpression };
+
 export type FieldEdit =
   | { readonly kind: 'edit.replace'; readonly value: WriteExpression }
   | { readonly kind: 'edit.counter-increment'; readonly amount: WriteExpression }
@@ -33,10 +41,13 @@ export type FieldEdit =
 
 export type WriteStatement =
   | { readonly kind: 'statement.insert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
+  | { readonly kind: 'statement.insert-from-query'; readonly relation: WriteRelation; readonly root: JsonValue }
+  | { readonly kind: 'statement.upsert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[]; readonly onConflict: InsertConflictPolicy }
+  | { readonly kind: 'statement.replace-all'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
   | { readonly kind: 'statement.update'; readonly target: WriteTarget; readonly edits: Readonly<Record<string, FieldEdit>> }
   | { readonly kind: 'statement.delete'; readonly target: WriteTarget }
   | { readonly kind: 'statement.rekey'; readonly target: WriteTarget; readonly key: Readonly<Record<string, WriteExpression>>; readonly references: 'source-local-declared' | 'reject-if-referenced'; readonly requires: CapabilityRef }
-  | { readonly kind: 'statement.move'; readonly target: WriteTarget; readonly parent: WriteExpression; readonly requires: CapabilityRef }
+  | { readonly kind: 'statement.move'; readonly target: WriteTarget; readonly parent: WriteExpression; readonly position: MovePosition; readonly missingAnchor: 'reject' | 'beginning' | 'end'; readonly requires: CapabilityRef }
   | { readonly kind: 'extension'; readonly capability: CapabilityRef; readonly payload: JsonValue };
 
 export type TransactionGuard =
@@ -113,6 +124,104 @@ export type SimulationReceipt = Omit<CommitReceipt, 'kind' | 'outcome' | 'durabi
   readonly kind: 'simulation';
   readonly outcome: 'would-commit' | 'rejected';
   readonly stagedState?: unknown;
+};
+
+export type NonAtomicBatch = {
+  readonly batchId: string;
+  readonly failurePolicy: 'stop' | 'continue';
+  readonly steps: readonly {
+    readonly stepId: string;
+    readonly attempt: TransactionAttempt;
+  }[];
+};
+
+export type NonAtomicBatchStepReceipt = {
+  readonly stepId: string;
+  readonly attachmentId: string;
+  readonly sourceId: string;
+  readonly capturedBasis?: SourceBasis;
+  readonly outcome: 'applied' | 'failed' | 'unattempted' | 'unknown';
+  readonly receipt?: CommitReceipt;
+};
+
+export type NonAtomicBatchReceipt = {
+  readonly kind: 'non-atomic-batch';
+  readonly receiptVersion: 1;
+  readonly batchId: string;
+  readonly outcome: 'complete' | 'partial' | 'failed' | 'unknown';
+  readonly steps: readonly NonAtomicBatchStepReceipt[];
+  readonly issues: readonly Issue[];
+};
+
+export type NonAtomicBatchExecutor = {
+  /** Resolves shell-owned attachment membership before a step is attempted. */
+  readonly sourceIdFor: (attempt: TransactionAttempt) => string;
+  readonly commit: (attempt: TransactionAttempt) => Promise<CommitReceipt>;
+};
+
+/**
+ * Sequential, deliberately non-atomic shell orchestration. Known nested
+ * receipts are retained verbatim; this function performs no rollback or retry.
+ */
+export const executeNonAtomicBatch = async (
+  batch: NonAtomicBatch,
+  executor: NonAtomicBatchExecutor
+): Promise<NonAtomicBatchReceipt> => {
+  if (new Set(batch.steps.map(({ stepId }) => stepId)).size !== batch.steps.length) {
+    const issue = createIssue({ code: 'transaction.batch_step_id_duplicate', phase: 'commit', severity: 'error', retry: 'after_input', details: { batchId: batch.batchId } });
+    return {
+      kind: 'non-atomic-batch',
+      receiptVersion: 1,
+      batchId: batch.batchId,
+      outcome: 'failed',
+      steps: batch.steps.map((step) => ({ stepId: step.stepId, attachmentId: step.attempt.attachmentId, sourceId: executor.sourceIdFor(step.attempt), ...(step.attempt.expectedBasis === undefined ? {} : { capturedBasis: step.attempt.expectedBasis }), outcome: 'unattempted' })),
+      issues: [issue]
+    };
+  }
+  const steps: NonAtomicBatchStepReceipt[] = [];
+  const issues: Issue[] = [];
+  let stopped = false;
+  for (const step of batch.steps) {
+    const sourceId = executor.sourceIdFor(step.attempt);
+    const common = {
+      stepId: step.stepId,
+      attachmentId: step.attempt.attachmentId,
+      sourceId,
+      ...(step.attempt.expectedBasis === undefined ? {} : { capturedBasis: step.attempt.expectedBasis })
+    };
+    if (stopped) {
+      steps.push({ ...common, outcome: 'unattempted' });
+      continue;
+    }
+    try {
+      const receipt = await executor.commit(step.attempt);
+      const outcome = receipt.outcome === 'committed' ? 'applied' : receipt.outcome === 'rejected' ? 'failed' : 'unknown';
+      steps.push({ ...common, outcome, receipt });
+      issues.push(...receipt.issues);
+      if (batch.failurePolicy === 'stop' && outcome !== 'applied') stopped = true;
+    } catch (error) {
+      const issue = createIssue({
+        code: 'transaction.batch_step_outcome_unknown',
+        phase: 'commit',
+        severity: 'error',
+        retry: 'query_outcome',
+        operationId: step.attempt.operationId,
+        details: { stepId: step.stepId, error: error instanceof Error ? error.name : typeof error }
+      });
+      steps.push({ ...common, outcome: 'unknown' });
+      issues.push(issue);
+      if (batch.failurePolicy === 'stop') stopped = true;
+    }
+  }
+  const outcomes = steps.map(({ outcome }) => outcome);
+  const outcome = outcomes.includes('unknown')
+    ? 'unknown'
+    : outcomes.every((stepOutcome) => stepOutcome === 'applied')
+      ? 'complete'
+      : outcomes.includes('applied')
+        ? 'partial'
+        : 'failed';
+  return { kind: 'non-atomic-batch', receiptVersion: 1, batchId: batch.batchId, outcome, steps, issues };
 };
 
 export const sealTransaction = async (input: {

@@ -1,15 +1,18 @@
 import { canonicalizeJson, sha256Json, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
-import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth } from './value.js';
+import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
 import { FullRecomputeStrategy, type PreparedPlan } from './maintenance.js';
 
 export type Completeness = 'exact' | 'lower-bound' | 'unknown';
-export type QueryRecord = Readonly<Record<string, JsonValue>>;
+export type QueryLogicalValue = null | boolean | number | string | LogicalUnknown | readonly QueryLogicalValue[] | { readonly [key: string]: QueryLogicalValue };
+export type QueryRecord = Readonly<Record<string, QueryLogicalValue>>;
 
 export type RelationUse = { readonly schemaView: ArtifactRef; readonly relationId: string };
 export type RelationInput = {
   readonly relation: RelationUse;
   readonly rows: readonly QueryRecord[];
+  /** Stable base-row occurrence identities; attachment view identity is deliberately excluded. */
+  readonly occurrenceIds?: readonly string[];
   readonly completeness: Completeness;
   readonly sourceId?: string;
   readonly attachmentId?: string;
@@ -158,10 +161,14 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
       context.issues.push(createIssue({ code: 'query.parameter_invalid', phase: 'query', severity: 'error', retry: 'after_refresh', relationId: node.relation.relationId, details: { reason: 'input_unavailable' } }));
       return { rows: [], completeness: 'unknown' };
     }
+    if (input.occurrenceIds !== undefined && input.occurrenceIds.length !== input.rows.length) {
+      context.issues.push(createIssue({ code: 'query.input_identity_invalid', phase: 'query', severity: 'error', retry: 'after_input', relationId: node.relation.relationId }));
+      return { rows: [], completeness: 'unknown' };
+    }
     return {
       rows: input.rows.map((fields, index) => ({
         scope: { ...context.outer?.scope, [node.alias]: fields },
-        provenance: { ...context.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: relationKey(node.relation) + ':' + index } }
+        provenance: { ...context.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: input.occurrenceIds?.[index] ?? relationKey(node.relation) + ':' + index } }
       })),
       completeness: input.completeness
     };
@@ -215,7 +222,7 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
   if (node.kind === 'distinct') {
     const inner = evaluateNode(node.input, context);
     const seen = new Set<string>();
-    return { rows: inner.rows.filter((row) => { const key = canonicalizeJson(visibleRow(row)); if (seen.has(key)) return false; seen.add(key); return true; }), completeness: inner.completeness };
+    return { rows: inner.rows.filter((row) => { const key = canonicalizeQueryValue(visibleRow(row)); if (seen.has(key)) return false; seen.add(key); return true; }), completeness: inner.completeness };
   }
   if (node.kind === 'set') return evaluateSet(node, context);
   if (node.kind === 'order') {
@@ -264,21 +271,21 @@ const evaluateAggregate = (node: Extract<QueryNode, { readonly kind: 'aggregate'
   const groups = new Map<string, { readonly key: QueryRecord; readonly rows: ScopedRow[] }>();
   for (const row of inner.rows) {
     const key = projectFields(node.groupBy, exprContext(row, context));
-    const canonical = canonicalizeJson(key);
+    const canonical = canonicalizeQueryValue(key);
     const existing = groups.get(canonical);
     if (existing === undefined) groups.set(canonical, { key, rows: [row] });
     else existing.rows.push(row);
   }
   if (groups.size === 0 && Object.keys(node.groupBy).length === 0) groups.set('{}', { key: {}, rows: [] });
   const rows = [...groups.values()].map(({ key, rows: members }, index): ScopedRow => {
-    const output: Record<string, JsonValue> = { ...key };
+    const output: Record<string, QueryLogicalValue> = { ...key };
     for (const [name, aggregate] of Object.entries(node.measures)) output[name] = aggregateValue(aggregate, members, context);
-    return { scope: { [node.alias]: output }, provenance: { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + index + ':' + canonicalizeJson(key) } } };
+    return { scope: { [node.alias]: output }, provenance: { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + index + ':' + canonicalizeQueryValue(key) } } };
   });
   return { rows, completeness: 'exact' };
 };
 
-const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], context: QueryContext): JsonValue => {
+const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], context: QueryContext): QueryLogicalValue => {
   const ordered = aggregate.orderBy === undefined ? rows : [...rows].sort((left, right) => compareOrder(left, right, aggregate.orderBy ?? [], context));
   const values = aggregate.value === undefined ? ordered.map(() => known(1)) : ordered.map((row) => evaluateExpr(aggregate.value as Expr, exprContext(row, context)));
   const knownValues = values.filter((result): result is { readonly status: 'known'; readonly value: JsonValue } => result.status === 'known' && result.value !== null).map((result) => result.value);
@@ -290,7 +297,7 @@ const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], co
   if (aggregate.op === 'any' || aggregate.op === 'every') {
     const truths = values.map((result): LogicalTruth => result.status === 'known' && typeof result.value === 'boolean' ? result.value : logicalUnknown);
     const truth = aggregate.op === 'any' ? logicalOr(truths) : logicalAnd(truths);
-    return truth === logicalUnknown ? null : truth;
+    return truth;
   }
   const numbers = knownValues.filter((value): value is number => typeof value === 'number');
   if (aggregate.op === 'sum') return numbers.length === 0 ? null : numbers.reduce((sum, value) => sum + value, 0);
@@ -431,7 +438,9 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   if (expression.kind === 'parameter') return Object.hasOwn(context.parameters, expression.name) ? known(context.parameters[expression.name] as JsonValue) : { status: 'missing' };
   if (expression.kind === 'field') {
     const record = context.row.scope[expression.alias];
-    return record !== undefined && Object.hasOwn(record, expression.name) ? known(record[expression.name] as JsonValue) : { status: 'missing' };
+    if (record === undefined || !Object.hasOwn(record, expression.name)) return { status: 'missing' };
+    const value = record[expression.name] as QueryLogicalValue;
+    return value === logicalUnknown ? { status: 'unknown' } : known(value as JsonValue);
   }
   if (expression.kind === 'key-of' || expression.kind === 'source-of') {
     const provenance = context.row.provenance[expression.alias];
@@ -493,7 +502,10 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     if (values.some((value) => value.status !== 'known')) return { status: 'unknown' };
     return known(values.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value));
   }
-  if (expression.kind === 'record') return known(projectFields(expression.fields, context));
+  if (expression.kind === 'record') {
+    const fields = projectFields(expression.fields, context);
+    return Object.values(fields).some((value) => containsLogicalUnknown(value)) ? { status: 'unknown' } : known(fields as JsonValue);
+  }
   if (expression.kind === 'case') {
     for (const branch of expression.branches) {
       const condition = evaluateExpr(branch.when, context);
@@ -559,10 +571,12 @@ const propagate = (...values: readonly ExpressionResult[]): ExpressionResult | u
 const expressionJson = (result: ExpressionResult): JsonValue => result.status === 'known' ? result.value : null;
 
 const projectFields = (fields: Readonly<Record<string, Expr>>, context: EvalContext): QueryRecord => {
-  const output: Record<string, JsonValue> = {};
+  const output: Record<string, QueryLogicalValue> = {};
   for (const [name, expression] of Object.entries(fields)) {
     const result = evaluateExpr(expression, context);
     if (result.status === 'known') output[name] = result.value;
+    else if (result.status === 'unknown') output[name] = logicalUnknown;
+    else if (result.status === 'unavailable' && context.query !== undefined) context.query.unavailable = true;
   }
   return output;
 };
@@ -581,7 +595,7 @@ const visibleRow = (row: ScopedRow): QueryRecord => {
 const resultKey = (row: ScopedRow): string => Object.entries(row.provenance).sort(([left], [right]) => left.localeCompare(right)).map(([alias, provenance]) => alias + '=' + provenance.occurrence).join('|');
 const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => Object.fromEntries(Object.entries(record).map(([name, value]) => [fields[name] ?? name, value]));
 const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => Object.fromEntries(Object.entries(record).filter(([name]) => !fields.has(name)));
-const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeJson(visibleRow(row)), row]));
+const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));
 const compareOrder = (left: ScopedRow, right: ScopedRow, terms: readonly OrderTerm[], context: QueryContext): number => {
   for (const term of terms) {
     const leftValue = evaluateExpr(term.value, exprContext(left, context));
@@ -631,6 +645,24 @@ const compareJsonValuesTotal = (left: JsonValue, right: JsonValue): number => {
   const leftCanonical = canonicalizeJson(left);
   const rightCanonical = canonicalizeJson(right);
   return leftCanonical < rightCanonical ? -1 : leftCanonical > rightCanonical ? 1 : 0;
+};
+
+const containsLogicalUnknown = (value: QueryLogicalValue): boolean => {
+  if (value === logicalUnknown) return true;
+  if (Array.isArray(value)) return value.some(containsLogicalUnknown);
+  if (value !== null && typeof value === 'object') return Object.values(value).some(containsLogicalUnknown);
+  return false;
+};
+
+/** Canonical internal equality key; tags keep logical unknown disjoint from every JSON value. */
+const canonicalizeQueryValue = (value: QueryLogicalValue): string => {
+  if (value === logicalUnknown) return 'u';
+  if (Array.isArray(value)) return 'a[' + value.map(canonicalizeQueryValue).join(',') + ']';
+  if (value !== null && typeof value === 'object') {
+    const record = value as Readonly<Record<string, QueryLogicalValue>>;
+    return 'o{' + Object.keys(record).sort().map((key) => JSON.stringify(key) + ':' + canonicalizeQueryValue(record[key] as QueryLogicalValue)).join(',') + '}';
+  }
+  return 'j' + canonicalizeJson(value);
 };
 
 const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult => {

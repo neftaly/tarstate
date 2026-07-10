@@ -287,13 +287,16 @@ export class InMemoryAtomicSource {
     const touched = new Set<string>();
     const statementResults: StatementResult[] = [];
     const blockingIssues: Issue[] = [];
+    const statementAuditIssues: Issue[] = [];
     for (const [statementIndex, statement] of transaction.body.statements.entries()) {
       const result = this.#applyStatement(statement, statementIndex, staged, transaction.body.parameters);
       statementResults.push(result);
-      blockingIssues.push(...result.issues);
-      const relationId = statement.kind === 'statement.insert' ? statement.relation.relationId : statement.kind === 'extension' ? undefined : statement.target.relation.relationId;
+      const statementBlockingIssues = result.issues.filter(({ severity }) => severity === 'error');
+      blockingIssues.push(...statementBlockingIssues);
+      statementAuditIssues.push(...result.issues.filter(({ severity }) => severity !== 'error'));
+      const relationId = statementRelation(statement)?.relationId;
       if (relationId !== undefined) touched.add(relationId);
-      if (result.issues.length > 0) break;
+      if (statementBlockingIssues.length > 0) break;
     }
     if (blockingIssues.length === 0) blockingIssues.push(...this.#evaluateGuards(transaction.body.guards, staged, transaction.body.parameters, statementResults, attempt));
     const logicallyChanged = !sameJson(sourceState, staged);
@@ -310,14 +313,15 @@ export class InMemoryAtomicSource {
       touchedRelations: touched,
       statementResults,
       blockingIssues,
-      issues: [...blockingIssues, ...auditIssues]
+      issues: [...blockingIssues, ...statementAuditIssues, ...auditIssues]
     };
   }
 
   #applyStatement(statement: WriteStatement, statementIndex: number, state: Record<string, readonly MemoryRow[]>, parameters: Readonly<Record<string, JsonValue>>): StatementResult {
     const empty = emptyStatementResult(statementIndex);
     if (statement.kind === 'extension') return { ...empty, issues: [txIssue('transaction.capability_unavailable', 'plan', { capability: statement.capability })] };
-    const relation = statement.kind === 'statement.insert' ? statement.relation : statement.target.relation;
+    const relation = statementRelation(statement);
+    if (relation === undefined) return { ...empty, issues: [txIssue('transaction.statement_invalid', 'parse')] };
     const relationIssue = this.#relationIssue(relation);
     if (relationIssue !== undefined) return { ...empty, issues: [relationIssue] };
     const relationId = relation.relationId;
@@ -331,6 +335,77 @@ export class InMemoryAtomicSource {
       }
       state[relationId] = [...rows, ...inserted];
       return { ...empty, inserted: inserted.length, logicallyChanged: inserted.length };
+    }
+    if (statement.kind === 'statement.insert-from-query') {
+      if (this.#evaluateQuery === undefined) return { ...empty, issues: [txIssue('transaction.capability_unavailable', 'plan', { capability: 'query-evaluator' })] };
+      let evaluated: MemoryQueryResult;
+      try {
+        evaluated = this.#evaluateQuery(statement.root, state, parameters);
+      } catch (error) {
+        return { ...empty, issues: [txIssue('transaction.insert_query_failed', 'query', { error: error instanceof Error ? error.name : typeof error })] };
+      }
+      if (evaluated.completeness !== 'exact') {
+        return { ...empty, issues: [...evaluated.issues, txIssue('transaction.insert_query_incomplete', 'query', { completeness: evaluated.completeness })] };
+      }
+      const inserted: MemoryRow[] = [];
+      for (const candidate of evaluated.rows) {
+        if (!isMemoryRow(candidate)) return { ...empty, issues: [txIssue('transaction.insert_query_row_invalid', 'parse', { rowType: Array.isArray(candidate) ? 'array' : typeof candidate })] };
+        inserted.push({ ...candidate });
+      }
+      state[relationId] = [...rows, ...inserted];
+      return { ...empty, inserted: inserted.length, logicallyChanged: inserted.length, issues: evaluated.issues };
+    }
+    if (statement.kind === 'statement.replace-all') {
+      const replacement: MemoryRow[] = [];
+      for (const fields of statement.rows) {
+        const evaluated = evaluateFields(fields, {}, parameters);
+        if (!evaluated.success) return { ...empty, issues: [evaluated.issue] };
+        replacement.push(evaluated.value);
+      }
+      if (sameJson(rows as unknown as JsonValue, replacement as unknown as JsonValue)) return { ...empty, matched: rows.length };
+      state[relationId] = replacement;
+      return { ...empty, matched: rows.length, inserted: replacement.length, deleted: rows.length, logicallyChanged: rows.length + replacement.length };
+    }
+    if (statement.kind === 'statement.upsert') {
+      const relationDeclaration = this.#relations.get(relationId) as MemoryRelation;
+      if (relationDeclaration.keyFields.length === 0) return { ...empty, issues: [txIssue('transaction.upsert_key_unavailable', 'plan', { relationId })] };
+      const candidates: MemoryRow[] = [];
+      for (const fields of statement.rows) {
+        const evaluated = evaluateFields(fields, {}, parameters);
+        if (!evaluated.success) return { ...empty, issues: [evaluated.issue] };
+        if (relationDeclaration.keyFields.some((field) => !Object.hasOwn(evaluated.value, field))) {
+          return { ...empty, issues: [txIssue('transaction.upsert_key_missing', 'plan', { relationId, keyFields: relationDeclaration.keyFields })] };
+        }
+        candidates.push(evaluated.value);
+      }
+      const candidateKeys = candidates.map((row) => rowKey(row, relationDeclaration.keyFields));
+      if (new Set(candidateKeys).size !== candidateKeys.length) return { ...empty, issues: [txIssue('transaction.upsert_input_ambiguous', 'plan', { relationId })] };
+      const existingByKey = new Map<string, number[]>();
+      for (const [index, row] of rows.entries()) {
+        const key = rowKey(row, relationDeclaration.keyFields);
+        const indexes = existingByKey.get(key) ?? [];
+        indexes.push(index);
+        existingByKey.set(key, indexes);
+      }
+      const conflicts = candidateKeys.filter((key) => (existingByKey.get(key)?.length ?? 0) > 0);
+      if (conflicts.some((key) => (existingByKey.get(key)?.length ?? 0) > 1)) return { ...empty, issues: [txIssue('transaction.upsert_target_ambiguous', 'plan', { relationId })] };
+      if (statement.onConflict === 'reject' && conflicts.length > 0) return { ...empty, matched: conflicts.length, issues: [txIssue('transaction.upsert_conflict', 'plan', { relationId, conflicts: conflicts.length })] };
+      const next = [...rows];
+      let inserted = 0;
+      let changed = 0;
+      for (const [candidateIndex, candidate] of candidates.entries()) {
+        const existing = existingByKey.get(candidateKeys[candidateIndex] as string);
+        if (existing === undefined) {
+          next.push(candidate);
+          inserted += 1;
+        } else if (statement.onConflict === 'replace') {
+          const targetIndex = existing[0] as number;
+          if (!sameJson(next[targetIndex] as MemoryRow, candidate)) changed += 1;
+          next[targetIndex] = candidate;
+        }
+      }
+      state[relationId] = next;
+      return { ...empty, matched: conflicts.length, inserted, logicallyChanged: inserted + changed };
     }
     const selected = selectTargets(statement.target, rows, parameters);
     if (!selected.success) return { ...empty, issues: [selected.issue] };
@@ -574,10 +649,18 @@ const validTransactionBody = (body: Transaction['body']): boolean => isRecord(bo
 const isTransaction = (value: Transaction | ArtifactRef): value is Transaction => 'kind' in value && value.kind === 'transaction' && 'body' in value;
 
 const operationKey = (operationEpoch: string, operationId: string): string => operationEpoch + '\u0000' + operationId;
+const statementRelation = (statement: WriteStatement): WriteRelation | undefined => {
+  if (statement.kind === 'extension') return undefined;
+  if (statement.kind === 'statement.insert' || statement.kind === 'statement.insert-from-query' || statement.kind === 'statement.upsert' || statement.kind === 'statement.replace-all') return statement.relation;
+  return statement.target.relation;
+};
 const cloneState = (state: MemoryState): MemoryState => Object.fromEntries(Object.entries(state).map(([relationId, rows]) => [relationId, rows.map((row) => ({ ...row }))]));
 const canonical = (value: JsonValue): string => JSON.stringify(value, (_key, candidate: unknown) => isRecord(candidate) ? Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => left.localeCompare(right))) : candidate);
 const sameJson = (left: JsonValue | MemoryState, right: JsonValue | MemoryState): boolean => canonical(left as JsonValue) === canonical(right as JsonValue);
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => typeof value === 'object' && value !== null && !Array.isArray(value);
+const isJsonValue = (value: unknown): value is JsonValue => value === null || typeof value === 'boolean' || typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) || (Array.isArray(value) && value.every(isJsonValue)) || (isRecord(value) && Object.values(value).every(isJsonValue));
+const isMemoryRow = (value: unknown): value is MemoryRow => isRecord(value) && Object.values(value).every(isJsonValue);
+const rowKey = (row: MemoryRow, fields: readonly string[]): string => canonical(fields.map((field) => Object.hasOwn(row, field) ? row[field] as JsonValue : { missing: field }));
 const isIndex = (value: JsonValue): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const uniqueOutcomes = (outcomes: readonly SemanticEditOutcome[]): readonly SemanticEditOutcome[] => [...new Map(outcomes.map((outcome) => [canonical(outcome as unknown as JsonValue), outcome])).values()];
 function capability(suffix: string, hash: string): CapabilityRef { return { id: 'urn:tarstate:capability:' + suffix, version: '1', contractHash: `sha256:${hash}` }; }

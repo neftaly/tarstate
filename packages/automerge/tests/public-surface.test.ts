@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import * as automerge from '../src/index.js';
-import * as spike from '../src/v1-spike.js';
 
-describe('clean rewrite Automerge surface', () => {
-  it('promotes exactly the measured v1 seed at the package root', () => {
-    expect(Object.keys(automerge).sort()).toEqual(Object.keys(spike).sort());
-    expect(automerge.copyRelocateAutomerge).toBe(spike.copyRelocateAutomerge);
+describe('production Automerge surface', () => {
+  it('exports source, projection, binding, and fallback move implementations', () => {
+    expect(automerge.AutomergeSourceRuntime).toBeTypeOf('function');
+    expect(automerge.AutomergeMapStorageBinding).toBeTypeOf('function');
+    expect(automerge.projectAutomergeFacts).toBeTypeOf('function');
+    expect(automerge.copyRelocateAutomerge).toBeTypeOf('function');
   });
 
   it('does not retain legacy adapter or React names', () => {

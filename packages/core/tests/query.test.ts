@@ -38,6 +38,11 @@ describe('production query oracle', () => {
       left: { kind: 'compare', op: 'eq', left: { kind: 'literal', value: null }, right: { kind: 'literal', value: 1 } },
       right: { kind: 'literal', value: true }
     }, {})).toBe(logicalUnknown);
+    const projected = evaluateQuery({
+      root: { kind: 'select', input: { kind: 'values', alias: 'v', rows: [{ value: null }] }, alias: 'out', fields: { comparison: { kind: 'compare', op: 'eq', left: { kind: 'field', alias: 'v', name: 'value' }, right: { kind: 'literal', value: 1 } } } },
+      relations: []
+    });
+    expect(projected.rows[0]?.comparison).toBe(logicalUnknown);
   });
 
   it('evaluates filtering and projection with bag multiplicity', () => {
@@ -183,5 +188,15 @@ describe('production query oracle', () => {
     const input: QueryNode = { kind: 'values', alias: 'v', rows: [{ id: 'missing' }, { id: 'null', value: null }, { id: 'ordinary', value: 1 }] };
     const result = evaluateQuery({ root: { kind: 'order', input, by: [{ value: { kind: 'field', alias: 'v', name: 'value' }, direction: 'desc' }] }, relations: [] });
     expect(result.rows.map((row) => row.id)).toEqual(['ordinary', 'null', 'missing']);
+  });
+
+  it('keeps result identity across attachment replacement and changes it on proven reincarnation', () => {
+    const root = from('items', 'item');
+    const base = relation('items', [{ id: 1 }]);
+    const first = evaluateQuery({ root, relations: [{ ...base, attachmentId: 'attachment:old', occurrenceIds: ['source:row:incarnation:1'] }] });
+    const replacement = evaluateQuery({ root, relations: [{ ...base, attachmentId: 'attachment:new', occurrenceIds: ['source:row:incarnation:1'] }] });
+    const reincarnated = evaluateQuery({ root, relations: [{ ...base, attachmentId: 'attachment:new', occurrenceIds: ['source:row:incarnation:2'] }] });
+    expect(replacement.resultKeys).toEqual(first.resultKeys);
+    expect(reincarnated.resultKeys).not.toEqual(first.resultKeys);
   });
 });

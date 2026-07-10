@@ -13,6 +13,9 @@ describe('clean rewrite core surface', () => {
     expect(core.resolveLensPath).toBeTypeOf('function');
     expect(core.InMemoryAtomicSource).toBeTypeOf('function');
     expect(core.sealTransaction).toBeTypeOf('function');
+    expect(core.ResourceResolver).toBeTypeOf('function');
+    expect(core.DatabaseView).toBeTypeOf('function');
+    expect(core.coordinateSourceCommit).toBeTypeOf('function');
   });
 
   it('does not retain legacy API names', () => {

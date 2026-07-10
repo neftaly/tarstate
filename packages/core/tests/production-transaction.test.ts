@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { checkFinalConstraints, type SourceConstraint } from '../src/constraints.js';
-import { InMemoryAtomicSource, type MemoryState } from '../src/memory-source.js';
-import { sealTransaction, type Transaction, type TransactionBody, type WriteStatement } from '../src/transaction.js';
+import { InMemoryAtomicSource, type MemoryQueryResult, type MemoryState } from '../src/memory-source.js';
+import { executeNonAtomicBatch, sealTransaction, type NonAtomicBatch, type Transaction, type TransactionBody, type WriteStatement } from '../src/transaction.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 const schemaView = { id: 'urn:test:schema', contentHash: hash('a') };
@@ -16,14 +16,15 @@ const transaction = (statements: readonly WriteStatement[], parameters: Transact
   body: { schemaView, parameters, statements, guards, requiredCapabilities: [] }
 });
 
-const source = (options: { state?: MemoryState; constraints?: readonly SourceConstraint<MemoryState>[] } = {}) => new InMemoryAtomicSource({
+const source = (options: { state?: MemoryState; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult } = {}) => new InMemoryAtomicSource({
   sourceId: 'source:one',
   incarnation: 'incarnation:one',
   operationEpoch: 'epoch:one',
   state: options.state ?? { items: [] },
   relations: [{ relationId: 'items', schemaView, keyFields: ['id'] }],
   attachments: [{ attachmentId: 'attachment:one', fingerprint: hash('b'), authorityViewFingerprint: hash('c'), schemaView, writable: true }],
-  ...(options.constraints === undefined ? {} : { constraints: options.constraints })
+  ...(options.constraints === undefined ? {} : { constraints: options.constraints }),
+  ...(options.evaluateQuery === undefined ? {} : { evaluateQuery: options.evaluateQuery })
 });
 
 const attempt = (operationId: string, value: Transaction, extra: Partial<{ expectedBasis: { incarnation: string; revision: number }; signal: AbortSignal }> = {}) => ({
@@ -67,6 +68,91 @@ describe('production in-memory transaction coordinator', () => {
       ]
     });
     expect(memory.snapshot().state.items).toEqual([{ id: 1, n: 2 }, { id: 2, n: 3 }, { id: 3, n: 3 }, { id: 4, n: 1 }]);
+  });
+
+  it('inserts exact source-local query rows and rejects incomplete query input atomically', async () => {
+    const exact = source({
+      state: { items: [{ id: 1 }] },
+      evaluateQuery: (_root, state) => ({ rows: state.items?.map((row) => ({ ...row, id: (row.id as number) + 10 })) ?? [], resultKeys: ['derived'], completeness: 'exact', issues: [] })
+    });
+    const value = await transaction([{ kind: 'statement.insert-from-query', relation, root: { kind: 'derived' } }]);
+    expect(await exact.commit(attempt('insert-query', value))).toMatchObject({ outcome: 'committed', statementResults: [{ inserted: 1, logicallyChanged: 1 }] });
+    expect(exact.snapshot().state.items).toEqual([{ id: 1 }, { id: 11 }]);
+
+    const incomplete = source({
+      state: { items: [{ id: 1 }] },
+      evaluateQuery: () => ({ rows: [{ id: 2 }], resultKeys: ['lower'], completeness: 'lower-bound', issues: [] })
+    });
+    expect(await incomplete.commit(attempt('insert-incomplete', value))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.insert_query_incomplete' }] });
+    expect(incomplete.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [{ id: 1 }] } });
+  });
+
+  it('upserts by declared relation keys with explicit reject, keep, and replace policies', async () => {
+    const memory = source({ state: { items: [{ id: 1, title: 'old' }] } });
+    const rows = [{ id: literal(1), title: literal('new') }, { id: literal(2), title: literal('second') }];
+    const reject = await transaction([{ kind: 'statement.upsert', relation, rows, onConflict: 'reject' }]);
+    expect(await memory.commit(attempt('upsert-reject', reject))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.upsert_conflict' }] });
+    expect(memory.snapshot().state.items).toEqual([{ id: 1, title: 'old' }]);
+
+    const keep = await transaction([{ kind: 'statement.upsert', relation, rows, onConflict: 'keep-existing' }]);
+    expect(await memory.commit(attempt('upsert-keep', keep))).toMatchObject({ outcome: 'committed', statementResults: [{ matched: 1, inserted: 1, logicallyChanged: 1 }] });
+    expect(memory.snapshot().state.items).toEqual([{ id: 1, title: 'old' }, { id: 2, title: 'second' }]);
+
+    const replace = await transaction([{ kind: 'statement.upsert', relation, rows, onConflict: 'replace' }]);
+    expect(await memory.commit(attempt('upsert-replace', replace))).toMatchObject({ outcome: 'committed', statementResults: [{ matched: 2, inserted: 0, logicallyChanged: 1 }] });
+    expect(memory.snapshot().state.items).toEqual([{ id: 1, title: 'new' }, { id: 2, title: 'second' }]);
+
+    const ambiguous = await transaction([{ kind: 'statement.upsert', relation, rows: [{ id: literal(3) }, { id: literal(3) }], onConflict: 'replace' }]);
+    expect(await memory.commit(attempt('upsert-ambiguous', ambiguous))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.upsert_input_ambiguous' }] });
+  });
+
+  it('replace-all reports replacement counts and preserves basis for an identical replacement', async () => {
+    const memory = source({ state: { items: [{ id: 1 }, { id: 2 }] } });
+    const replace = await transaction([{ kind: 'statement.replace-all', relation, rows: [{ id: literal(3) }] }]);
+    expect(await memory.commit(attempt('replace-all', replace))).toMatchObject({ outcome: 'committed', statementResults: [{ matched: 2, inserted: 1, deleted: 2, logicallyChanged: 3 }], afterBasis: { revision: 1 } });
+    const identical = await transaction([{ kind: 'statement.replace-all', relation, rows: [{ id: literal(3) }] }]);
+    expect(await memory.commit(attempt('replace-identical', identical))).toMatchObject({ outcome: 'committed', statementResults: [{ matched: 1, inserted: 0, deleted: 0, logicallyChanged: 0 }], beforeBasis: { revision: 1 }, afterBasis: { revision: 1 } });
+  });
+
+  it('evaluates uniquely named returning queries against final staged state and committed basis', async () => {
+    const memory = source({
+      evaluateQuery: (_root, state) => ({ rows: state.items ?? [], resultKeys: (state.items ?? []).map((row) => JSON.stringify(row.id)), completeness: 'exact', issues: [] })
+    });
+    const value = await sealTransaction({ body: {
+      schemaView, parameters: {}, statements: [{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }], guards: [], requiredCapabilities: [],
+      returning: [{ name: 'all', root: { kind: 'all' } }]
+    } });
+    expect(await memory.commit(attempt('returning', value))).toMatchObject({
+      outcome: 'committed', afterBasis: { revision: 1 },
+      returning: [{ name: 'all', rows: [{ id: 1 }], resultKeys: ['1'], sourceId: 'source:one', basis: { revision: 1 } }]
+    });
+
+    const duplicate = await sealTransaction({ body: {
+      schemaView, parameters: {}, statements: value.body.statements, guards: [], requiredCapabilities: [],
+      returning: [{ name: 'same', root: {} }, { name: 'same', root: {} }]
+    } });
+    expect(await memory.commit(attempt('returning-duplicate', duplicate))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.returning_name_duplicate' }] });
+  });
+
+  it('uses explicit conflict observations and fails stale resolutions without mutation', async () => {
+    const memory = source({ state: { items: [{ id: 1, title: 'left' }] } });
+    const resolve = (observed: readonly string[], value: string) => transaction([{
+      kind: 'statement.update', target: { relation, alias: 'item' },
+      edits: { title: { kind: 'edit.conflict-resolve', observed, value: literal(value) } }
+    }]);
+    expect(await memory.commit(attempt('resolve', await resolve(['left', 'right'], 'chosen')))).toMatchObject({ outcome: 'committed', statementResults: [{ logicallyChanged: 1, editOutcomes: [{ edit: 'custom' }] }] });
+    expect(await memory.commit(attempt('resolve-stale', await resolve(['left', 'right'], 'other')))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.conflict_changed' }] });
+    expect(memory.snapshot().state.items).toEqual([{ id: 1, title: 'chosen' }]);
+  });
+
+  it('retains the full portable move intent when a source cannot supply relocation semantics', async () => {
+    const memory = source({ state: { items: [{ id: 1, parentId: null }] } });
+    const moveCapability = { id: 'urn:test:capability:move', version: '1', contractHash: hash('e') };
+    const value = await transaction([{
+      kind: 'statement.move', target: { relation, alias: 'item' }, parent: literal('archive'), position: { kind: 'end' }, missingAnchor: 'reject', requires: moveCapability
+    }]);
+    expect(await memory.commit(attempt('move-unsupported', value))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.capability_unavailable' }] });
+    expect(memory.snapshot().basis.revision).toBe(0);
   });
 
   it('checks constraints only on final state and rejects violated or indeterminate outcomes atomically', async () => {
@@ -162,6 +248,76 @@ describe('production in-memory transaction coordinator', () => {
     memory.rotateOperationEpoch('epoch:two');
     expect(memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'old', intentHash: receipt.intentHash })).toEqual({ status: 'expired' });
     expect(await memory.commit(attempt('after-retire', value))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.operation_epoch_expired' }] });
+  });
+});
+
+describe('non-atomic batch execution', () => {
+  it('returns a structured failed receipt for duplicate step IDs', async () => {
+    const value = await transaction([]);
+    const receipt = await executeNonAtomicBatch({
+      batchId: 'batch:duplicate', failurePolicy: 'stop',
+      steps: [{ stepId: 'same', attempt: attempt('duplicate:one', value) }, { stepId: 'same', attempt: attempt('duplicate:two', value) }]
+    }, { sourceIdFor: () => 'source:one', commit: () => Promise.reject(new Error('must not execute')) });
+    expect(receipt).toMatchObject({ outcome: 'failed', steps: [{ outcome: 'unattempted' }, { outcome: 'unattempted' }], issues: [{ code: 'transaction.batch_step_id_duplicate' }] });
+  });
+
+  it('aggregates all-applied as complete and no-applied known rejection as failed', async () => {
+    const completeSource = source();
+    const applied = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
+    const complete = await executeNonAtomicBatch({
+      batchId: 'batch:complete', failurePolicy: 'stop', steps: [{ stepId: 'one', attempt: attempt('complete:one', applied) }]
+    }, { sourceIdFor: () => 'source:one', commit: (candidate) => completeSource.commit(candidate) });
+    expect(complete).toMatchObject({ outcome: 'complete', steps: [{ outcome: 'applied', receipt: { outcome: 'committed' } }] });
+
+    const failedSource = source();
+    const rejected = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: parameter('missing') }] }]);
+    const failed = await executeNonAtomicBatch({
+      batchId: 'batch:failed', failurePolicy: 'stop',
+      steps: [{ stepId: 'one', attempt: attempt('failed:one', rejected) }, { stepId: 'two', attempt: attempt('failed:two', applied) }]
+    }, { sourceIdFor: () => 'source:one', commit: (candidate) => failedSource.commit(candidate) });
+    expect(failed).toMatchObject({ outcome: 'failed', steps: [{ outcome: 'failed', receipt: { outcome: 'rejected' } }, { outcome: 'unattempted' }] });
+  });
+
+  it('stops after a known failure, retains nested receipts, and reports partial progress', async () => {
+    const memory = source();
+    const applied = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
+    const rejected = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: parameter('missing') }] }]);
+    const batch: NonAtomicBatch = {
+      batchId: 'batch:stop', failurePolicy: 'stop',
+      steps: [
+        { stepId: 'one', attempt: attempt('batch:one', applied, { expectedBasis: { incarnation: 'incarnation:one', revision: 0 } }) },
+        { stepId: 'two', attempt: attempt('batch:two', rejected) },
+        { stepId: 'three', attempt: attempt('batch:three', applied) }
+      ]
+    };
+    const receipt = await executeNonAtomicBatch(batch, { sourceIdFor: () => 'source:one', commit: (candidate) => memory.commit(candidate) });
+    expect(receipt).toMatchObject({
+      kind: 'non-atomic-batch', outcome: 'partial',
+      steps: [
+        { stepId: 'one', outcome: 'applied', capturedBasis: { revision: 0 }, receipt: { outcome: 'committed' } },
+        { stepId: 'two', outcome: 'failed', receipt: { outcome: 'rejected' } },
+        { stepId: 'three', outcome: 'unattempted' }
+      ]
+    });
+    expect(receipt.steps[2]).not.toHaveProperty('receipt');
+  });
+
+  it('continues explicitly after failure and fails closed on a lost step result', async () => {
+    const memory = source();
+    const applied = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
+    const rejected = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: parameter('missing') }] }]);
+    const continued = await executeNonAtomicBatch({
+      batchId: 'batch:continue', failurePolicy: 'continue',
+      steps: [{ stepId: 'fail', attempt: attempt('continue:fail', rejected) }, { stepId: 'apply', attempt: attempt('continue:apply', applied) }]
+    }, { sourceIdFor: () => 'source:one', commit: (candidate) => memory.commit(candidate) });
+    expect(continued).toMatchObject({ outcome: 'partial', steps: [{ outcome: 'failed' }, { outcome: 'applied' }] });
+
+    const lost = await executeNonAtomicBatch({
+      batchId: 'batch:unknown', failurePolicy: 'stop',
+      steps: [{ stepId: 'lost', attempt: attempt('lost', applied) }, { stepId: 'later', attempt: attempt('later', applied) }]
+    }, { sourceIdFor: () => 'source:one', commit: () => Promise.reject(new Error('lost result')) });
+    expect(lost).toMatchObject({ outcome: 'unknown', steps: [{ outcome: 'unknown' }, { outcome: 'unattempted' }], issues: [{ code: 'transaction.batch_step_outcome_unknown', retry: 'query_outcome' }] });
+    expect(lost.steps[0]).not.toHaveProperty('receipt');
   });
 });
 

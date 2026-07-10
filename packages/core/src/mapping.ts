@@ -50,7 +50,7 @@ export type BindingProjection = {
   readonly completeness: 'exact' | 'unknown';
 };
 
-export type StorageIntent = {
+export type MappedStorageIntent = {
   readonly kind: 'replace';
   readonly path: StoragePath;
   readonly value: PortableValue;
@@ -61,7 +61,7 @@ export type StorageEditPlan = {
   readonly locator: MappingLocator;
   readonly readFootprint: readonly StoragePath[];
   readonly writeFootprint: readonly StoragePath[];
-  readonly intents: readonly StorageIntent[];
+  readonly intents: readonly MappedStorageIntent[];
   readonly nextSnapshot: unknown;
 };
 
@@ -150,7 +150,7 @@ export const planStoragePatch = (
   if (compiled === undefined) return mappingFailure('mapping.relation_missing', [], { relationId });
   const located = locateCandidate(snapshot, compiled.mapping.collection, locator);
   if (!located.success) return located;
-  const intents: StorageIntent[] = [];
+  const intents: MappedStorageIntent[] = [];
   const issues: Issue[] = [];
   let nextCandidate = located.value.candidate;
   for (const [field, input] of Object.entries(edits)) {
