@@ -2,10 +2,11 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AttachmentCatalog,
   DatasetMembership,
-  type DatabaseAttachment,
+  type DatabaseAttachmentInput,
   type DatasetMember,
   type SourceSnapshot
 } from '../src/database.js';
+import { prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
 import {
   DatabaseView,
   type DatabaseEvaluation,
@@ -26,6 +27,7 @@ class TestSource {
   #state: SourceSnapshot<{ readonly rows: readonly Row[] }>['state'] = 'ready';
   #freshness: SourceSnapshot<unknown>['freshness'] = 'current';
   #rows: readonly Row[];
+  #subscriptionCount = 0;
 
   constructor(sourceId: string, rows: readonly Row[]) {
     this.sourceId = sourceId;
@@ -46,6 +48,7 @@ class TestSource {
   }
 
   subscribe(listener: () => void): () => void {
+    this.#subscriptionCount += 1;
     this.#listeners.add(listener);
     return () => { this.#listeners.delete(listener); };
   }
@@ -59,20 +62,22 @@ class TestSource {
   }
 
   listenerCount(): number { return this.#listeners.size; }
+  subscriptionCount(): number { return this.#subscriptionCount; }
 }
 
-const attachment = (attachmentId: string, source: TestSource, authorityScope = 'public'): DatabaseAttachment<{ readonly rows: readonly Row[] }, readonly Row[]> => ({
+const attachment = (attachmentId: string, source: TestSource, authorityScope = 'public'): DatabaseAttachmentInput<{ readonly rows: readonly Row[] }, readonly Row[]> => ({
   attachmentId,
   incarnation: attachmentId + ':one',
   sourceId: source.sourceId,
   source,
   authorityScope,
-  writable: false,
-  schemaViewIds: ['schema:rows'],
   discoveryEdges: ['edge:' + attachmentId],
-  project: (snapshot) => snapshot.storage === undefined
-    ? { state: snapshot.state === 'ready' ? 'failed' : snapshot.state, issues: [] }
-    : { state: 'ready', value: snapshot.storage.rows, issues: [] }
+  preparation: prepareManualReadOnlyAttachment({
+    schemaViewIds: ['schema:rows'],
+    project: (snapshot) => snapshot.storage === undefined
+      ? { state: snapshot.state === 'ready' ? 'failed' : snapshot.state, issues: [] }
+      : { state: 'ready', value: snapshot.storage.rows, issues: [] }
+  })
 });
 
 const member = (attachmentId: string, sourceId: string, expectation: DatasetMember['expectation'] = 'required'): DatasetMember => ({
@@ -191,6 +196,8 @@ describe('database membership and observation', () => {
     unsubscribe();
     source.publish({ rows: [{ id: 2, value: 'two' }] });
     expect(listener).not.toHaveBeenCalled();
+    expect(source.listenerCount()).toBe(1);
+    expect(source.subscriptionCount()).toBe(1);
     expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
 
     second.close();

@@ -1,4 +1,5 @@
 import { canonicalizeJson } from './artifacts.js';
+import type { ReadyAttachmentPreparation } from './attachment-preparation.js';
 import type { Issue } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
 
@@ -112,6 +113,16 @@ export type AttachmentLease<Storage = unknown, Projection = unknown> = {
   readonly close: () => void;
 };
 
+export type DatabaseAttachmentInput<Storage = unknown, Projection = unknown> = {
+  readonly attachmentId: string;
+  readonly incarnation: string;
+  readonly sourceId: string;
+  readonly source: ObservableSource<Storage>;
+  readonly authorityScope: string;
+  readonly discoveryEdges: readonly string[];
+  readonly preparation: ReadyAttachmentPreparation<Storage, Projection>;
+};
+
 /**
  * Deduplicates live sources without merging their attachment authority views.
  * Every registration remains a separately closeable attachment lease.
@@ -121,7 +132,18 @@ export class AttachmentCatalog {
   readonly #sources = new Map<string, ObservableSource<unknown>>();
   readonly #listeners = new Set<() => void>();
 
-  attach<Storage, Projection>(attachment: DatabaseAttachment<Storage, Projection>, releaseSource?: () => void): AttachmentLease<Storage, Projection> {
+  attach<Storage, Projection>(input: DatabaseAttachmentInput<Storage, Projection>, releaseSource?: () => void): AttachmentLease<Storage, Projection> {
+    const attachment: DatabaseAttachment<Storage, Projection> = Object.freeze({
+      attachmentId: input.attachmentId,
+      incarnation: input.incarnation,
+      sourceId: input.sourceId,
+      source: input.source,
+      authorityScope: input.authorityScope,
+      writable: input.preparation.writable,
+      schemaViewIds: input.preparation.schemaViewIds,
+      discoveryEdges: input.discoveryEdges,
+      project: input.preparation.project
+    });
     if (attachment.sourceId !== attachment.source.sourceId) throw new Error('Attachment source ID does not match its source');
     const liveSource = this.#sources.get(attachment.sourceId);
     if (liveSource !== undefined && liveSource !== attachment.source) throw new Error('A different live source is registered for ' + attachment.sourceId);

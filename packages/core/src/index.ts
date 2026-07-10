@@ -1,4 +1,5 @@
 export * from './artifacts.js';
+export * from './attachment-preparation.js';
 export * from './builtins.js';
 export * from './codec.js';
 export * from './commit-coordinator.js';

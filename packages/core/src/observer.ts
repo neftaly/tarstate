@@ -225,8 +225,12 @@ class SharedObservation<Query, Row, Projection> {
     this.#session = strategy.open(options.plan, { snapshot: captured });
     this.#snapshot = this.#observerSnapshot(this.#result(this.#session.current(), captured), undefined);
     this.#refreshSourceSubscriptions();
-    this.#unsubscribeDataset = options.dataset.subscribe(() => this.#requestRefresh());
-    this.#unsubscribeCatalog = options.attachments.subscribe(() => this.#requestRefresh());
+    const refreshTopology = () => {
+      this.#refreshSourceSubscriptions();
+      this.#requestRefresh();
+    };
+    this.#unsubscribeDataset = options.dataset.subscribe(refreshTopology);
+    this.#unsubscribeCatalog = options.attachments.subscribe(refreshTopology);
   }
 
   acquire(): QueryObserver<Row> {
@@ -267,7 +271,6 @@ class SharedObservation<Query, Row, Projection> {
     try {
       while (this.#pending && !this.#closed) {
         this.#pending = false;
-        this.#refreshSourceSubscriptions();
         const captured = this.#capture();
         const session = this.#session;
         if (session === undefined) continue;
