@@ -4,7 +4,7 @@ import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, type LensRows, type SchemaLensBody } from './lens.js';
 import { InMemoryAtomicSource } from './memory-source.js';
 import type { PreparedPlan } from './maintenance.js';
-import { deriveQueryMaintenanceUpdate, openIncrementalQueryMaintenance, type QueryMaintenanceSnapshot, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
+import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance, type QueryMaintenanceSnapshot, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
 import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
 import { sealTransaction } from './transaction.js';
 
@@ -307,7 +307,7 @@ export const runProbabilityGolden = (): GoldenWorkloadTrace => {
   const movedScene = beforeScene.map((row) => row.id === 'panel-1' ? { ...row, parentId: 'column-2' } : row);
   const afterSnapshot = runtime.snapshot();
   const afterQuery: QueryMaintenanceSnapshot = { relations: [relation('golden.scene-entity', movedScene), relation('golden.geometry', afterSnapshot.storage?.rows ?? [])] };
-  const { state: _afterState, ...after } = maintenance.applyUpdate(deriveQueryMaintenanceUpdate(beforeQuery, afterQuery));
+  const { state: _afterState, ...after } = maintenance.applyUpdate(diffQueryMaintenanceSnapshots(beforeQuery, afterQuery));
   maintenance.close();
   runtime.close();
   return {

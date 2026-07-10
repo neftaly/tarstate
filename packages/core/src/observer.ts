@@ -13,7 +13,7 @@ import {
 import { createIssue, type Issue } from './issues.js';
 import type { PreparedPlan, SourceBasis } from './maintenance.js';
 import {
-  deriveQueryMaintenanceUpdate,
+  diffQueryMaintenanceSnapshots,
   openIncrementalQueryMaintenance,
   type FunctionRegistry,
   type IncrementalQueryResult,
@@ -434,9 +434,9 @@ export const createIncrementalDatabaseQueryMaintenance = (
   return {
     getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult()),
     updateInput: (input) => {
-      const next = queryMaintenanceSnapshot(input as DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>, functions);
+      const next = queryMaintenanceSnapshot(input, functions);
       const rejectedBefore = session.getCurrentResult().state.rejectedUpdateCount;
-      const result = session.applyUpdate(deriveQueryMaintenanceUpdate(accepted, next));
+      const result = session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
       if (result.state.rejectedUpdateCount === rejectedBefore) accepted = next;
       return databaseResultFromMaintained(result);
     },

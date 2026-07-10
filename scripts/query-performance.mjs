@@ -1,6 +1,6 @@
 import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
-import { deriveQueryMaintenanceUpdate, evaluateQuery, openIncrementalQueryMaintenance } from '../packages/core/dist/index.js';
+import { diffQueryMaintenanceSnapshots, evaluateQuery, openIncrementalQueryMaintenance } from '../packages/core/dist/index.js';
 
 const schemaView = { id: 'urn:tarstate:benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
 const use = (relationId) => ({ schemaView, relationId });
@@ -61,10 +61,19 @@ for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
   const first = { relations: [relation] };
   const second = { relations: [input('item', linearRows(count, true))] };
   const session = openIncrementalQueryMaintenance(plan('linear-' + count, linearQuery), first);
-  const forward = deriveQueryMaintenanceUpdate(first, second);
-  const backward = deriveQueryMaintenanceUpdate(second, first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
   measurements.push(benchmark('linear-one-row-update', count, iterations, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
   session.close();
+  let accepted = first;
+  const endToEnd = openIncrementalQueryMaintenance(plan('linear-end-to-end-' + count, linearQuery), accepted);
+  measurements.push(benchmark('linear-snapshot-diff-and-update', count, iterations, (index) => {
+    const next = index % 2 === 0 ? second : first;
+    const result = endToEnd.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+    accepted = next;
+    return result;
+  }));
+  endToEnd.close();
 }
 
 for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 2]]) {
@@ -73,8 +82,8 @@ for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 2]]) {
   const changed = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
   const initial = { relations };
   const session = openIncrementalQueryMaintenance(plan('join-' + count, joinQuery), initial);
-  const forward = deriveQueryMaintenanceUpdate(initial, changed);
-  const backward = deriveQueryMaintenanceUpdate(changed, initial);
+  const forward = diffQueryMaintenanceSnapshots(initial, changed);
+  const backward = diffQueryMaintenanceSnapshots(changed, initial);
   measurements.push(benchmark('equijoin-one-row-update', count * 2, Math.max(10, iterations), (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
   session.close();
 }
@@ -129,9 +138,12 @@ await post(allocationSession, 'HeapProfiler.startSampling', { samplingInterval: 
   const first = { relations: [input('item', linearRows(1_000))] };
   const second = { relations: [input('item', linearRows(1_000, true))] };
   const session = openIncrementalQueryMaintenance(plan('allocation-sample', linearQuery), first);
-  const forward = deriveQueryMaintenanceUpdate(first, second);
-  const backward = deriveQueryMaintenanceUpdate(second, first);
-  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
+  let accepted = first;
+  for (let index = 0; index < 100; index += 1) {
+    const next = index % 2 === 0 ? second : first;
+    consumedRows += session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next)).rows.length;
+    accepted = next;
+  }
   session.close();
 }
 const { profile } = await post(allocationSession, 'HeapProfiler.stopSampling');
@@ -143,7 +155,7 @@ process.stdout.write(JSON.stringify({
   note: 'Diagnostic evidence only; timings are not release thresholds.',
   measurements,
   allocationSample: {
-    workload: '100 one-row updates over a 1,000-row linear query',
+    workload: '100 snapshot diffs plus one-row updates over a 1,000-row linear query',
     sampledBytes: sampledAllocationBytes,
     sampledBytesPerUpdate: Math.round(sampledAllocationBytes / 100)
   },

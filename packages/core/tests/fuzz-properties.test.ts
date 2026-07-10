@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  deriveQueryMaintenanceUpdate,
+  diffQueryMaintenanceSnapshots,
   evaluateQuery,
   openIncrementalQueryMaintenance,
   resolveLensPath,
@@ -75,7 +75,7 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         }
         source.revision += 1;
         const next = snapshot();
-        const maintained = session.applyUpdate(deriveQueryMaintenanceUpdate(accepted, next));
+        const maintained = session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
         accepted = next;
         expect(withoutState(maintained), 'run ' + run + ', step ' + step).toEqual(evaluateQuery({
           root: query,
@@ -87,6 +87,74 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         const current = identityMap(maintained);
         for (const [identity, key] of previous) if (current.has(identity)) expect(current.get(identity), identity).toBe(key);
         previous = current;
+      }
+      session.close();
+    }
+  });
+
+  it('keeps every maintained operator oracle-equivalent across two-sided row changes and reordering', () => {
+    const itemUse = { schemaView, relationId: 'fuzz.items' } as const;
+    const groupUse = { schemaView, relationId: 'fuzz.groups' } as const;
+    const from = (relation: typeof itemUse | typeof groupUse, alias: string): QueryNode => ({ kind: 'from', relation, alias });
+    const field = (alias: string, name: string) => ({ kind: 'field', alias, name } as const);
+    const items = from(itemUse, 'item');
+    const groups = from(groupUse, 'group');
+    const equality = { kind: 'compare', op: 'eq', left: field('item', 'groupId'), right: field('group', 'id') } as const;
+    const joined = (join: 'inner' | 'left'): QueryNode => ({ kind: 'join', join, left: items, right: groups, on: equality });
+    const queries: readonly QueryNode[] = [
+      { kind: 'select', alias: 'result', input: { kind: 'where', input: items, predicate: field('item', 'active') }, fields: { id: field('item', 'id'), score: field('item', 'score') } },
+      joined('inner'),
+      joined('left'),
+      { kind: 'aggregate', input: items, alias: 'summary', groupBy: { groupId: field('item', 'groupId') }, measures: { count: { kind: 'aggregate', op: 'count' }, sum: { kind: 'aggregate', op: 'sum', value: field('item', 'score') } } },
+      { kind: 'distinct', input: { kind: 'select', alias: 'result', input: items, fields: { groupId: field('item', 'groupId') } } },
+      { kind: 'set', op: 'union-all', left: items, right: { kind: 'values', alias: 'item', rows: [{ id: 'constant', groupId: 'g0', score: 0, active: true }] } },
+      { kind: 'order', input: items, by: [{ value: field('item', 'score'), direction: 'desc' }] },
+      { kind: 'window', input: items, alias: 'item', fields: { rank: { kind: 'window', op: 'rank', partitionBy: [field('item', 'groupId')], orderBy: [{ value: field('item', 'score'), direction: 'desc' }] } } }
+    ];
+    const makeInput = (relation: typeof itemUse | typeof groupUse, rows: readonly FuzzRow[], revision: number): RelationInput => ({
+      relation,
+      rows: rows.map(({ row }) => row),
+      occurrenceIds: rows.map(({ occurrenceId }) => occurrenceId),
+      completeness: 'exact',
+      sourceId: 'source:' + relation.relationId,
+      attachmentId: 'attachment:' + relation.relationId,
+      basis: revision
+    });
+    for (let run = 0; run < runs; run += 1) {
+      let itemRevision = 0;
+      let groupRevision = 0;
+      let nextItem = 4;
+      let itemRows: FuzzRow[] = Array.from({ length: 4 }, (_, id) => ({ occurrenceId: 'item:' + id, row: { id, groupId: 'g' + id % 2, score: integer(100), active: id % 2 === 0 } }));
+      let groupRows: FuzzRow[] = [
+        { occurrenceId: 'group:0', row: { id: 'g0', label: 'zero' } },
+        { occurrenceId: 'group:1', row: { id: 'g1', label: 'one' } }
+      ];
+      const snapshot = (): QueryMaintenanceSnapshot => ({ relations: [makeInput(itemUse, itemRows, itemRevision), makeInput(groupUse, groupRows, groupRevision)], basis: { itemRevision, groupRevision } });
+      const selectedQuery = queries[run % queries.length] as QueryNode;
+      let accepted = snapshot();
+      const session = openIncrementalQueryMaintenance({ ...plan, planId: 'operator:' + run, query: selectedQuery }, accepted);
+      for (let step = 0; step < 12; step += 1) {
+        const mutateItems = integer(3) !== 0;
+        const target = mutateItems ? itemRows : groupRows;
+        const operation = integer(4);
+        if (operation === 0 && target.length > 1) {
+          const first = integer(target.length);
+          const second = integer(target.length);
+          [target[first], target[second]] = [target[second] as FuzzRow, target[first] as FuzzRow];
+        } else if (operation === 1 && target.length > 0) {
+          const index = integer(target.length);
+          const current = target[index] as FuzzRow;
+          target[index] = { ...current, row: mutateItems ? { ...current.row, score: integer(1_000), active: random() < 0.5 } : { ...current.row, label: 'label:' + integer(1_000) } };
+        } else if (operation === 2 && mutateItems) {
+          const id = nextItem++;
+          target.push({ occurrenceId: 'item:' + id, row: { id, groupId: 'g' + integer(2), score: integer(1_000), active: random() < 0.5 } });
+        } else if (target.length > 1) target.splice(integer(target.length), 1);
+        if (mutateItems) itemRevision += 1;
+        else groupRevision += 1;
+        const next = snapshot();
+        const maintained = session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+        expect(withoutState(maintained), 'operator run ' + run + ', step ' + step).toEqual(evaluateQuery({ root: selectedQuery, relations: next.relations, ...(next.basis === undefined ? {} : { basis: next.basis }) }));
+        accepted = next;
       }
       session.close();
     }
