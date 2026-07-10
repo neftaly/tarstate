@@ -41,6 +41,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       lib: {
         entry: {
           index: 'src/index.ts',
+          'v1-spike': 'src/v1-spike.ts',
           react: 'src/react.ts',
           presence: 'src/presence.ts'
         },

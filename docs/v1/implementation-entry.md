@@ -376,6 +376,11 @@ old-subtree edits. Also record peer, connection, sync, and presence event
 identity/lifecycle needed to freeze the built-in system-relation schema.
 Findings amend capability tiers; they do not weaken them silently.
 
+Executable evidence is recorded in [the Automerge spike report](spikes/automerge.md).
+The measured fallback is `copyRelocate`, with a closed loss catalog; it does not
+advertise `identityPreservingMove`. Repo event identity and the fallback record
+amendments are incorporated into the discovery and move specifications.
+
 ### External-store slice
 
 Adapt one Zustand and the current Probability TanStack store through the generic

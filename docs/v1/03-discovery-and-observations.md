@@ -307,16 +307,22 @@ fields:
 | `tarstate.system.issues` | issue ID | code, severity, phase, authorized subject fields |
 | `tarstate.system.constraints` | violation ID | set/constraint IDs, status, subject, code |
 | `tarstate.system.repair_candidates` | attachment/candidate | source/relation, logical key when parseable, candidate kind/live state, related issue IDs |
-| `tarstate.automerge.peers` | attachment/peer | observed peer/session state |
-| `tarstate.automerge.connections` | attachment/connection | peer when known and connection lifecycle |
-| `tarstate.automerge.sync` | attachment/peer | normalized offline/idle/syncing/synced/error state and available progress evidence |
+| `tarstate.automerge.peers` | attachment/peer ID | observed peer state, storage ID and ephemeral metadata when reported |
+| `tarstate.automerge.connections` | attachment/peer ID | connected/disconnected lifecycle; no generic connection ID is asserted |
+| `tarstate.automerge.sync` | attachment/document/storage ID | normalized offline/idle/syncing/synced/error state, heads and timestamp evidence; peer ID when correlated through storage metadata |
 | `tarstate.automerge.conflicts` | issue ID | authorized logical row/path and bounded alternative evidence |
-| `tarstate.automerge.presence` | attachment/session | peer when known, JSON payload, observed/local state, expiry evidence |
+| `tarstate.automerge.presence` | attachment/peer ID/channel | JSON payload, observed/local state, activity/expiry evidence |
 
 Exact field declarations live in an immutable built-in schema artifact and are
 covered by generated types/conformance tests. Adapters may publish new schema
 versions or additional namespaced relations; they do not silently add meaning
 to an existing version. All rows remain authority-filtered and basis-bearing.
+
+These Automerge keys reflect Repo 2.5.6 evidence. Network peer and disconnect
+events identify only a peer; `remote-heads` identifies a document observation
+by storage ID, heads, and timestamp; Presence identifies updates by peer and
+channel. An adapter-specific transport may expose a connection ID as additional
+versioned evidence, but the built-in minimum cannot manufacture one.
 
 The resource/discovery minimum rows are:
 

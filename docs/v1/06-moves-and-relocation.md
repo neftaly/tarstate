@@ -59,15 +59,9 @@ failure handling.
 
 ## Automerge fallback metadata (adapter-private)
 
-Until Automerge supplies native identity-preserving move, `__tarstateMovesV1`
-is the reserved candidate root property for relocation evidence. Its exact
-record encoding is deliberately not frozen before the Automerge spike measures
-object IDs, conflicts, descendant identity, and path/anchor behavior. No v1
-implementation or spike fixture may write that key until the spike amends this
-document with an exact schema, canonical encodings, conflict-reading rules,
-golden bytes, and a closed preservation-loss code catalog. Disposable spike
-evidence uses an explicitly provisional fixture key and makes no compatibility
-claim. Writers MUST NOT place any new record shape in legacy
+The Automerge 3.2.6 spike found no public identity-preserving relocation
+operation. `__tarstateMovesV1` is therefore the reserved root property for
+copy-relocation evidence. Writers MUST NOT place any new record shape in legacy
 `__automergeMoves`.
 
 No portable schema, mapping, query, constraint, reference, transaction, or app
@@ -77,23 +71,61 @@ normalized move capabilities, receipts, lineage, and issues. A future native
 move can therefore replace the write mechanism without changing portable app
 artifacts.
 
-Once frozen, the property is reserved only for an attachment that enables this fallback. If
+The property is reserved only for an attachment that enables this fallback. If
 an existing document contains an incompatible value at that key, the adapter
 reports a metadata collision and withholds `copyRelocate`; it never overwrites
 application data or guesses ownership of the key.
 
-The format to be frozen MUST be a map of immutable completed records keyed by a
-digest that includes `{operationEpoch, operationId, statementIndex}`. This
-allows one transaction to carry several move statements without collision. A
-record is created atomically with relocation; an aborted attempt writes no
-pending record. Its exact frozen record MUST include at least:
+The value is a map of immutable completed records. Its key is the SHA-256 hash
+over RFC-8785 canonical
+`{operationEpoch,operationId,statementIndex}`. A record is created in the same
+Automerge change as relocation; an aborted attempt writes no pending record.
+The frozen v1 record is:
 
-- `formatVersion: 1`, the original operation epoch/ID, statement index, and exact
-  pre-move basis;
-- source and destination paths/anchors;
-- root old/new object IDs;
-- a sorted list of every discoverable descendant old/new ID pair;
-- the actual `copyRelocate` mechanism and bounded preservation-loss codes.
+```ts
+type AutomergeMoveRecordV1 = {
+  formatVersion: 1
+  operationEpoch: string
+  operationId: string
+  statementIndex: number
+  beforeHeads: readonly string[] // sorted exact heads
+  fromPath: readonly (string | number)[]
+  toPath: readonly (string | number)[]
+  oldRootObjectId: string
+  newRootObjectId: string
+  descendants: readonly {
+    fromObjectId: string
+    toObjectId: string
+    relativePath: readonly (string | number)[]
+  }[]
+  mechanism: CapabilityRef // exact entity/copy-relocate v1 ref
+  preservationLosses: readonly AutomergeCopyRelocateLossCode[]
+}
+```
+
+`descendants` is sorted by canonical `relativePath` and contains every old/new
+pair exposed by the public API inside the atomic change. Automerge 3.2.6 returns
+no object ID for a newly assigned list inside that callback even though the ID
+is observable after the change. Such a record includes
+`automerge.descendant_mapping_incomplete`; a later observer never mutates the
+completed record to fill the gap. This measured limitation contradicts the
+earlier requirement to atomically record every post-change-discoverable pair.
+
+The closed v1 preservation-loss catalog is:
+
+- `automerge.conflicts_not_copied`;
+- `automerge.concurrent_old_subtree_edits_not_forwarded`;
+- `automerge.counter_identity_changed`;
+- `automerge.descendant_mapping_incomplete`;
+- `automerge.descendant_object_identity_changed`;
+- `automerge.list_element_identity_changed`;
+- `automerge.root_object_identity_changed`; and
+- `automerge.text_identity_changed`.
+
+The deterministic fixture with actor `aa…aa`, timestamp zero, operation
+`epoch:golden`/`operation:golden`, statement 7, and path
+`active.item -> archive.item` has saved-document SHA-256
+`85776c89abd082ae4d29e4b72bc19732089931b348e0083b95abc3d99c4e93e6`.
 
 Object IDs are values, never map-property names. Unknown record fields and
 unknown sibling metadata are preserved through unrelated writes. Reusing one
@@ -142,9 +174,12 @@ path (`tarstate.system.repair_candidates`) as duplicate keys; after only one
 valid target survives, the fork remains
 diagnostic history but no longer active ambiguity.
 
-For `copyRelocate`, an edit arriving later on the old subtree remains observable
-as a concurrent orphan/branch; it is not silently discarded or copied into the
-new subtree.
+For `copyRelocate`, a concurrent edit based on the old subtree is not copied
+into the new subtree. Automerge 3.2.6 preserves its changes and historical view,
+but deletion of the old parent reference wins in merged live state, so the old
+subtree is not a live orphan row. Diagnostics that need this evidence must read
+retained history; live object-location traversal alone cannot expose it. This
+amends the pre-spike claim that the old branch remains live-observable.
 
 V1 does not compact relocation records: safe compaction depends on reference,
 history, and peer-retention policy that v1 does not possess. Bindings surface a
@@ -158,7 +193,7 @@ retained historical view, or expected peer still needs it. Writing a newer
 format never changes the meaning of v1 records, and old writers preserve the
 unknown sibling key.
 
-After the spike freezes it, the adapter-private wire format exists only so
+The adapter-private wire format exists only so
 durable documents remain readable across adapter versions. It is not promoted
 into Tarstate's public compatibility surface.
 
