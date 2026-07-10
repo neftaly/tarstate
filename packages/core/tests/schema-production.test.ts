@@ -198,5 +198,6 @@ describe('production schema lenses', () => {
     expect(resolveLensPath(from, to, [first])).toMatchObject({ outcome: 'resolved', path: [{ ref: first.ref }] });
     expect(resolveLensPath(from, to, [first, second])).toMatchObject({ outcome: 'rejected', issues: [{ code: 'lens.path_ambiguous' }] });
     expect(resolveLensPath(from, to, [first, second], [first.ref])).toMatchObject({ outcome: 'resolved', path: [{ ref: first.ref }] });
+    expect(resolveLensPath(from, to, [first], undefined, { maxVisitedNodes: 1 })).toMatchObject({ outcome: 'rejected', issues: [{ code: 'lens.path_budget_exceeded' }] });
   });
 });

@@ -63,7 +63,7 @@ export type WindowExpr = {
   readonly orderBy: readonly OrderTerm[];
 };
 
-/** Portable relational query AST with bag semantics and hidden occurrence identity. */
+/** Portable relational query AST with bag semantics and hidden occurrence identity. Unmatched left-join fields are missing, never synthesized as null. */
 export type QueryNode =
   | { readonly kind: 'from'; readonly relation: RelationUse; readonly alias: string }
   | { readonly kind: 'values'; readonly alias: string; readonly rows: readonly Readonly<Record<string, JsonValue>>[] }
@@ -170,7 +170,7 @@ type MaterializedQueryNode = {
 };
 
 const relationKey = (relation: RelationUse): string => relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
-const relationInputKey = (input: RelationInput): string => relationKey(input.relation) + '\u0000' + (input.attachmentId ?? '');
+const relationInputKey = (input: RelationInput): string => relationKey(input.relation) + '\u0000' + (input.attachmentId ?? input.sourceId ?? '');
 const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyMap<string, readonly RelationInput[]> => {
   const grouped = new Map<string, RelationInput[]>();
   for (const input of inputs) {
@@ -376,9 +376,10 @@ const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], co
   const ordered = aggregate.orderBy === undefined ? rows : [...rows].sort((left, right) => compareOrder(left, right, aggregate.orderBy ?? [], context));
   const values = aggregate.value === undefined ? ordered.map(() => known(1)) : ordered.map((row) => evaluateExpr(aggregate.value as Expr, exprContext(row, context)));
   if (values.some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
-  const knownValues = values.filter((result): result is { readonly status: 'known'; readonly value: JsonValue } => result.status === 'known' && result.value !== null).map((result) => result.value);
-  if (aggregate.op === 'count') return knownValues.length;
-  if (aggregate.op === 'count-distinct') return new Set(knownValues.map(canonicalizeJson)).size;
+  const knownValues = values.filter((result): result is { readonly status: 'known'; readonly value: JsonValue } => result.status === 'known').map((result) => result.value);
+  const nonNullValues = knownValues.filter((value) => value !== null);
+  if (aggregate.op === 'count') return nonNullValues.length;
+  if (aggregate.op === 'count-distinct') return new Set(nonNullValues.map(canonicalizeJson)).size;
   if (aggregate.op === 'collect') return knownValues;
   if (aggregate.op === 'first') return knownValues[0] ?? null;
   if (aggregate.op === 'last') return knownValues.at(-1) ?? null;
@@ -387,7 +388,7 @@ const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], co
     const truth = aggregate.op === 'any' ? logicalOr(truths) : logicalAnd(truths);
     return truth;
   }
-  const numbers = knownValues.filter((value): value is number => typeof value === 'number');
+  const numbers = nonNullValues.filter((value): value is number => typeof value === 'number');
   if (aggregate.op === 'sum') return numbers.length === 0 ? null : numbers.reduce((sum, value) => sum + value, 0);
   if (aggregate.op === 'average') return numbers.length === 0 ? null : numbers.reduce((sum, value) => sum + value, 0) / numbers.length;
   if (knownValues.length === 0) return null;

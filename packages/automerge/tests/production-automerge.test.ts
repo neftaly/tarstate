@@ -29,6 +29,19 @@ describe('production Automerge adapter', () => {
       .resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'source.closed' }] });
   });
 
+  it('retires operation epochs without evicting live epoch evidence', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:epochs', doc: taskBase() });
+    const basis = runtime.snapshot().basis;
+    const first = { operationEpoch: 'epoch:old', operationId: 'one', intentHash: hash('1'), expectedBasis: basis, commands: [] };
+    const current = { operationEpoch: 'epoch:current', operationId: 'two', intentHash: hash('2'), expectedBasis: basis, commands: [] };
+    await runtime.commit(first);
+    await runtime.commit(current);
+    await runtime.retireOperationEpoch('epoch:old');
+    expect(runtime.queryOutcome(first)).toEqual({ status: 'expired' });
+    expect(runtime.queryOutcome(current)).toMatchObject({ status: 'known' });
+    await expect(runtime.commit(first)).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.operation_epoch_expired' }] });
+  });
+
   it('rejects reentrant document replacement without losing either document', async () => {
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: taskBase() });
     const before = runtime.snapshot();

@@ -113,7 +113,6 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
       });
     }
     const current = this.#runtime.snapshot();
-    this.#lastReady = { basis: current.basis, storage: current.storage };
     return Object.freeze({
       sourceId: this.sourceId,
       operationEpoch: this.operationEpoch,

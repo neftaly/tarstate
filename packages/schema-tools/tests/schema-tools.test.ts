@@ -111,6 +111,32 @@ describe('schema outputs', () => {
     const definitions = root.$defs as Readonly<Record<string, JsonValue>>;
     expect(definitions.PlayersRow).toMatchObject({ required: ['id', 'joinedAt', 'status'] });
   });
+
+  it('escapes generated comments and markdown without inventing impossible enum types', async () => {
+    const artifact = await sealSchema({ id: 'urn:test:hostile-docs', body: {
+      description: 'Title # <tag>\nnext',
+      relations: {
+        'odd#name': {
+          relationId: 'urn:test:`players|x',
+          description: 'Break */ then **format**',
+          key: ['id`'],
+          fields: { 'id`': { type: { kind: 'string' }, description: 'a | b' } }
+        }
+      }
+    } });
+    const generated = await generateSchemaOutputs(artifact);
+    if (!generated.success) throw new Error('generation failed');
+    expect(generated.value.typescript).toContain('Break * / then **format**');
+    expect(generated.value.markdown).toContain('# Title \\# \\<tag\\> next');
+    expect(generated.value.markdown).toContain('## odd\\#name');
+    expect(generated.value.markdown).toContain('`` id` ``');
+    expect(generated.value.markdown).toContain('a \\| b');
+
+    const emptyEnum = await sealSchema({ id: 'urn:test:empty-enum', body: {
+      relations: { invalid: { relationId: 'urn:test:invalid', key: ['id'], fields: { id: { type: { kind: 'string', values: [] } } } } }
+    } });
+    await expect(safePrepareSchemaArtifact(emptyEnum)).resolves.toMatchObject({ success: false, issues: [{ code: 'schema.field_invalid', details: { reason: 'empty_enum' } }] });
+  });
 });
 
 describe('issue catalog', () => {

@@ -353,6 +353,12 @@ describe('incremental query maintenance', () => {
       completeness: 'unknown',
       issues: [{ code: 'query.input_identity_invalid', details: { reason: 'duplicate_attachment_input' } }]
     });
+    const { attachmentId: _personalAttachment, ...sourceOnlyPersonal } = personal;
+    const { attachmentId: _sharedAttachment, ...sourceOnlyShared } = shared;
+    expect(evaluateQuery({ root: query, relations: [sourceOnlyPersonal, sourceOnlyShared] })).toMatchObject({
+      completeness: 'exact',
+      rows: [{ source: 'source:personal' }, { source: 'source:shared' }]
+    });
   });
 
   it('does not recompute a graph whose relation dependencies did not change', () => {

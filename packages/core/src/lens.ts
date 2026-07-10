@@ -55,16 +55,30 @@ export type LensProjection = {
   readonly issues: readonly Issue[];
   readonly completeness: 'exact' | 'unknown';
 };
+export type LensPathBudget = { readonly maxVisitedNodes?: number; readonly maxDepth?: number };
 
 export const resolveLensPath = (
   from: ArtifactRef,
   to: ArtifactRef,
   candidates: readonly LensArtifact[],
-  selected?: readonly ArtifactRef[]
+  selected?: readonly ArtifactRef[],
+  budget: LensPathBudget = {}
 ): LensResolution => {
-  const conflict = candidates.find((candidate, index) => candidates.some((other, otherIndex) => index !== otherIndex && candidate.ref.id === other.ref.id && candidate.ref.contentHash !== other.ref.contentHash));
-  if (conflict !== undefined) return rejected('lens.metadata_conflict', 'plan', { lensId: conflict.ref.id });
+  const maxVisitedNodes = budget.maxVisitedNodes ?? 10_000;
+  const maxDepth = budget.maxDepth ?? 64;
+  if (!Number.isSafeInteger(maxVisitedNodes) || maxVisitedNodes <= 0 || !Number.isSafeInteger(maxDepth) || maxDepth <= 0) return rejected('lens.path_budget_exceeded', 'plan', { reason: 'invalid_budget' });
+  const hashes = new Map<string, string>();
+  const outgoing = new Map<string, LensArtifact[]>();
+  for (const candidate of candidates) {
+    const hash = hashes.get(candidate.ref.id);
+    if (hash !== undefined && hash !== candidate.ref.contentHash) return rejected('lens.metadata_conflict', 'plan', { lensId: candidate.ref.id });
+    hashes.set(candidate.ref.id, candidate.ref.contentHash);
+    const key = refKey(candidate.body.from);
+    const edges = outgoing.get(key);
+    if (edges === undefined) outgoing.set(key, [candidate]); else edges.push(candidate);
+  }
   if (selected !== undefined) {
+    if (selected.length > maxDepth || selected.length > maxVisitedNodes) return rejected('lens.path_budget_exceeded', 'plan', { maxVisitedNodes, maxDepth });
     const path: LensArtifact[] = [];
     let cursor = from;
     for (const ref of selected) {
@@ -77,16 +91,21 @@ export const resolveLensPath = (
     return sameRef(cursor, to) ? { outcome: 'resolved', path, issues: [] } : rejected('lens.path_missing', 'plan', { reason: 'selected_path_target' });
   }
   const paths: LensArtifact[][] = [];
+  let visitedNodes = 0;
+  let exhausted = false;
   const visit = (cursor: ArtifactRef, path: readonly LensArtifact[], visited: ReadonlySet<string>): void => {
-    if (paths.length > 1) return;
+    visitedNodes += 1;
+    if (visitedNodes > maxVisitedNodes || path.length > maxDepth) { exhausted = true; return; }
+    if (paths.length > 1 || exhausted) return;
     if (sameRef(cursor, to)) { paths.push([...path]); return; }
-    for (const lens of candidates) {
+    for (const lens of outgoing.get(refKey(cursor)) ?? []) {
       const nextKey = refKey(lens.body.to);
-      if (!sameRef(lens.body.from, cursor) || visited.has(nextKey)) continue;
+      if (visited.has(nextKey)) continue;
       visit(lens.body.to, [...path, lens], new Set([...visited, nextKey]));
     }
   };
   visit(from, [], new Set([refKey(from)]));
+  if (exhausted) return rejected('lens.path_budget_exceeded', 'plan', { maxVisitedNodes, maxDepth });
   if (paths.length === 0) return rejected('lens.path_missing', 'plan');
   if (paths.length > 1) return rejected('lens.path_ambiguous', 'plan', { candidates: paths.length });
   return { outcome: 'resolved', path: paths[0] as LensArtifact[], issues: [] };

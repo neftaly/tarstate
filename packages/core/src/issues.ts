@@ -95,6 +95,7 @@ const declarations = [
   ['lens.lossy_value', 'query', 'warning', ['after_input']],
   ['lens.metadata_conflict', 'plan', 'error', ['manual_repair']],
   ['lens.path_ambiguous', 'plan', 'error', ['after_input']],
+  ['lens.path_budget_exceeded', 'plan', 'error', ['after_input']],
   ['lens.path_missing', 'plan', 'error', ['after_input']],
   ['lens.relation_invalid', 'parse', 'error', ['after_input']],
   ['lens.relation_missing', 'query', 'error', ['after_input']],

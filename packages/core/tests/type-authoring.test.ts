@@ -171,7 +171,7 @@ describe('literal-schema and query type authoring', () => {
 
     expect(result.root).toMatchObject({ kind: 'select', input: { kind: 'order', input: { kind: 'where' } } });
     expectTypeOf<QueryParametersOf<typeof result>>().toEqualTypeOf<{ readonly minimum: number }>();
-    expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly source: string }>();
+    expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly source: string | undefined }>();
   });
 
   it('preserves exact query evidence through more than ten pipeline operators', () => {

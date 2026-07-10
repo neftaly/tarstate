@@ -203,6 +203,7 @@ export class ResourceResolver {
   }
 }
 
+/** Resolves through the platform URL grammar and throws `TypeError` for malformed references. */
 export const resolveRelativeResourceRef = (reference: ResourceRef, base: ResourceRef): ResourceRef => ({
   ...reference,
   uri: new URL(reference.uri, base.uri).toString()

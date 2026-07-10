@@ -235,6 +235,19 @@ describe('production query oracle', () => {
     expect(result.rows.map((row) => row.id)).toEqual(['ordinary', 'null', 'missing']);
   });
 
+  it('retains explicit nulls in value-preserving aggregates while excluding missing values', () => {
+    const input: QueryNode = { kind: 'values', alias: 'item', rows: [{ score: null }, { score: 2 }, {}] };
+    const root: QueryNode = {
+      kind: 'aggregate', input, alias: 'summary', groupBy: {}, measures: {
+        count: { kind: 'aggregate', op: 'count', value: { kind: 'field', alias: 'item', name: 'score' } },
+        collect: { kind: 'aggregate', op: 'collect', value: { kind: 'field', alias: 'item', name: 'score' } },
+        first: { kind: 'aggregate', op: 'first', value: { kind: 'field', alias: 'item', name: 'score' } },
+        last: { kind: 'aggregate', op: 'last', value: { kind: 'field', alias: 'item', name: 'score' } }
+      }
+    };
+    expect(evaluateQuery({ root, relations: [] }).rows).toEqual([{ count: 1, collect: [null, 2], first: null, last: 2 }]);
+  });
+
   it('keeps result identity across attachment replacement and changes it on proven reincarnation', () => {
     const root = from('items', 'item');
     const base = relation('items', [{ id: 1 }]);

@@ -9,7 +9,7 @@
     "node": ">=24.12.0"
   },
   "scripts": {
-    "bench": "pnpm --filter './packages/*' --if-present bench",
+    "bench": "pnpm --filter @tarstate/core build && pnpm --filter './packages/*' --if-present bench",
     "bench:legacy": "node scripts/legacy-benchmark.mjs",
     "build": "pnpm --filter './packages/*' -r build",
     "check": "pnpm lint && pnpm typecheck && pnpm typecheck:budget && pnpm build && pnpm test",

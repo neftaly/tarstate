@@ -50,7 +50,7 @@ export type AutomergeSourceIssue = {
 export type AutomergeSourceOutcomeLookup =
   | { readonly status: 'known'; readonly result: AutomergeSourceCommitResult }
   | { readonly status: 'not_seen' }
-  | { readonly status: 'ambiguous' };
+  | { readonly status: 'ambiguous' | 'expired' };
 
 type LedgerEntry = {
   readonly intentHash: `sha256:${string}`;
@@ -85,6 +85,7 @@ export class AutomergeSourceRuntime<T extends object> {
   #queue: Promise<void> = Promise.resolve();
   readonly #listeners = new Set<(change: AutomergeSourceChange) => void>();
   readonly #ledger = new Map<string, LedgerEntry>();
+  readonly #retiredEpochs = new Set<string>();
 
   constructor(options: { readonly sourceId: string; readonly doc: Automerge.Doc<T> }) {
     if (options.sourceId.length === 0) throw new Error('Automerge sourceId must not be empty');
@@ -136,10 +137,22 @@ export class AutomergeSourceRuntime<T extends object> {
     readonly operationId: string;
     readonly intentHash: `sha256:${string}`;
   }): AutomergeSourceOutcomeLookup {
+    if (this.#retiredEpochs.has(input.operationEpoch)) return { status: 'expired' };
     const entry = this.#ledger.get(ledgerKey(input.operationEpoch, input.operationId));
     if (entry === undefined) return { status: 'not_seen' };
     if (entry.intentHash !== input.intentHash) return { status: 'ambiguous' };
     return { status: 'known', result: entry.result };
+  }
+
+  /** Retires one application-owned operation epoch after its in-flight work. */
+  retireOperationEpoch(operationEpoch: string): Promise<void> {
+    if (operationEpoch.length === 0) return Promise.reject(new TypeError('operationEpoch must not be empty'));
+    const result = this.#queue.then(() => {
+      this.#retiredEpochs.add(operationEpoch);
+      for (const key of this.#ledger.keys()) if (key.startsWith(operationEpoch + '\u0000')) this.#ledger.delete(key);
+    });
+    this.#queue = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   merge(remote: Automerge.Doc<T>): AutomergeSnapshot<T> {
@@ -178,6 +191,7 @@ export class AutomergeSourceRuntime<T extends object> {
     readonly message?: string;
   }): Promise<AutomergeSourceCommitResult> {
     if (this.#closed) return this.#rejected(input, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
+    if (this.#retiredEpochs.has(input.operationEpoch)) return this.#rejected(input, undefined, [{ code: 'transaction.operation_epoch_expired', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
     const key = ledgerKey(input.operationEpoch, input.operationId);
     const known = this.#ledger.get(key);
     if (known !== undefined) {

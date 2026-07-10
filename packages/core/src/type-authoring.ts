@@ -206,7 +206,7 @@ export const typedOr = <const Expressions extends readonly [BooleanExpression, .
 export const typedNot = <Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<boolean, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'boolean', op: 'not', arg: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
 export const typedIsNull = <Value, Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<Value, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'is-null', value: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
 export const typedIsMissing = <Value, Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<Value, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'is-missing', value: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
-export const typedSourceOf = <Name extends string, Row>(alias: TypedAlias<Name, Row>): TypedExpression<string> => ({ expression: { kind: 'source-of', alias: alias.name }, parameterDeclarations: {} });
+export const typedSourceOf = <Name extends string, Row>(alias: TypedAlias<Name, Row>): TypedExpression<string | undefined> => ({ expression: { kind: 'source-of', alias: alias.name }, parameterDeclarations: {} });
 
 const applyTypedWhere = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
   query: TypedQuery<Aliases, QueryParameters, Row>,

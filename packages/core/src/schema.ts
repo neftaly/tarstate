@@ -109,8 +109,8 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
         issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName]));
         continue;
       }
-      if (field.type.kind === 'string' && field.type.values !== undefined && new Set(field.type.values).size !== field.type.values.length) {
-        issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName, 'type', 'values'], { reason: 'duplicate_enum_value' }));
+      if (field.type.kind === 'string' && field.type.values !== undefined && (field.type.values.length === 0 || new Set(field.type.values).size !== field.type.values.length)) {
+        issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName, 'type', 'values'], { reason: field.type.values.length === 0 ? 'empty_enum' : 'duplicate_enum_value' }));
       }
     }
     const prepared = { name, declaration, keyFields } satisfies PreparedRelation;
@@ -133,6 +133,7 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
   return { success: true, value: { body, relationsByName, relationsById }, issues: [] };
 };
 
+/** Projects declared logical fields; undeclared storage fields remain outside the row so preserving writers can round-trip them. */
 export const parseRelationCandidate = (
   schema: PreparedSchema,
   relation: RelationId | PreparedRelation,

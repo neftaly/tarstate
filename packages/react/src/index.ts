@@ -699,6 +699,7 @@ class MutationStore {
   #replace(entry: MutationEntry): void {
     if (this.#closed) return;
     const replaced = [...this.#snapshot.mutations.filter(({ mutationId }) => mutationId !== entry.mutationId), deepFreezeClone(entry)];
+    // Pending operations are evidence, not history: retain them until their promise settles.
     const pending = replaced.filter(({ state }) => state === 'pending');
     const settled = replaced.filter(({ state }) => state !== 'pending').slice(-maxRetainedMutations);
     const mutations = [...settled, ...pending].sort((left, right) => left.mutationId - right.mutationId);

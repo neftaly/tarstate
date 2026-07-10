@@ -130,20 +130,20 @@ export const generateJsonSchema = ({ artifact, schema }: PreparedSchemaTooling):
 
 export const renderSchemaMarkdown = ({ artifact, schema }: PreparedSchemaTooling): string => {
   const lines = [
-    '# ' + (artifact.body.description ?? artifact.id),
+    '# ' + markdownText(artifact.body.description ?? artifact.id),
     '',
-    '- Schema ID: `' + markdownCode(artifact.id) + '`',
-    '- Content hash: `' + artifact.contentHash + '`',
+    '- Schema ID: ' + markdownCode(artifact.id),
+    '- Content hash: ' + markdownCode(artifact.contentHash),
     ''
   ];
   for (const relation of sortedRelations(schema)) {
-    lines.push('## ' + relation.name, '');
-    if (relation.declaration.description !== undefined) lines.push(relation.declaration.description, '');
-    lines.push('- Relation ID: `' + markdownCode(relation.declaration.relationId) + '`');
-    lines.push('- Logical key: ' + relation.declaration.key.map((field) => '`' + markdownCode(field) + '`').join(', '), '');
+    lines.push('## ' + markdownText(relation.name), '');
+    if (relation.declaration.description !== undefined) lines.push(markdownText(relation.declaration.description), '');
+    lines.push('- Relation ID: ' + markdownCode(relation.declaration.relationId));
+    lines.push('- Logical key: ' + relation.declaration.key.map(markdownCode).join(', '), '');
     lines.push('| Field | Type | Optional | Nullable | Description |', '| --- | --- | --- | --- | --- |');
     for (const [fieldName, field] of sortedEntries(relation.declaration.fields)) {
-      lines.push('| `' + markdownCode(fieldName) + '` | `' + markdownCode(scalarLabel(field.type)) + '` | ' + yesNo(field.optional) + ' | ' + yesNo(field.nullable) + ' | ' + markdownText(field.description ?? '') + ' |');
+      lines.push('| ' + markdownCode(fieldName) + ' | ' + markdownCode(scalarLabel(field.type)) + ' | ' + yesNo(field.optional) + ' | ' + yesNo(field.nullable) + ' | ' + markdownText(field.description ?? '') + ' |');
     }
     lines.push('');
   }
@@ -179,7 +179,7 @@ const scalarJsonSchema = (scalar: ScalarDeclaration, names: ReadonlyMap<string, 
 };
 
 const scalarTypeScript = (scalar: ScalarDeclaration, names: ReadonlyMap<string, string>): string => {
-  if (scalar.kind === 'string') return scalar.values === undefined ? 'string' : scalar.values.length === 0 ? 'never' : scalar.values.map((value) => JSON.stringify(value)).join(' | ');
+  if (scalar.kind === 'string') return scalar.values === undefined ? 'string' : scalar.values.map((value) => JSON.stringify(value)).join(' | ');
   if (scalar.kind === 'boolean') return 'boolean';
   if (scalar.kind === 'number' || scalar.kind === 'integer') return 'number';
   if (scalar.kind === 'json') return 'JsonValue';
@@ -224,6 +224,11 @@ const compare = (left: string, right: string): number => left < right ? -1 : lef
 const pascalIdentifier = (value: string): string => value.split(/[^A-Za-z0-9]+/u).filter(Boolean).map((part) => part[0]!.toUpperCase() + part.slice(1)).join('').replace(/^[0-9]/u, '_$&');
 const propertyName = (value: string): string => /^[$A-Z_a-z][$\w]*$/u.test(value) ? value : JSON.stringify(value);
 const safeComment = (value: string): string => value.replaceAll('*/', '* /').replaceAll(/\s+/gu, ' ').trim();
-const markdownCode = (value: string): string => value.replaceAll('`', '\\`');
-const markdownText = (value: string): string => value.replaceAll('|', '\\|').replaceAll(/\r?\n/gu, ' ');
+const markdownCode = (value: string): string => {
+  const longestFence = Math.max(0, ...[...value.matchAll(/`+/gu)].map(([ticks]) => ticks.length));
+  const fence = '`'.repeat(longestFence + 1);
+  const padding = /^[ `]|[ `]$/u.test(value) ? ' ' : '';
+  return fence + padding + value.replaceAll('|', '\\|') + padding + fence;
+};
+const markdownText = (value: string): string => value.replaceAll(/\r?\n/gu, ' ').replaceAll('\\', '\\\\').replaceAll(/([#&*<>_`|]|\[|\])/gu, '\\$1');
 const yesNo = (value: boolean | undefined): string => value === true ? 'yes' : 'no';
