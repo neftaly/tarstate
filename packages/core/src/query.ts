@@ -33,6 +33,7 @@ export type Expr =
   | { readonly kind: 'case'; readonly branches: readonly { readonly when: Expr; readonly then: Expr }[]; readonly otherwise: Expr }
   | { readonly kind: 'coalesce'; readonly args: readonly Expr[] }
   | { readonly kind: 'call'; readonly capability: CapabilityRef; readonly args: readonly Expr[] }
+  | { readonly kind: 'subquery'; readonly mode: 'scalar' | 'exists'; readonly query: QueryNode }
   | { readonly kind: 'is-null' | 'is-missing'; readonly value: Expr }
   | { readonly kind: 'key-of' | 'source-of'; readonly alias: string };
 
@@ -69,13 +70,26 @@ export type QueryNode =
   | { readonly kind: 'set'; readonly op: 'union' | 'union-all' | 'intersect' | 'except'; readonly left: QueryNode; readonly right: QueryNode }
   | { readonly kind: 'order'; readonly input: QueryNode; readonly by: readonly OrderTerm[] }
   | { readonly kind: 'slice'; readonly input: QueryNode; readonly offset?: number; readonly limit?: number }
-  | { readonly kind: 'window'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, WindowExpr>> };
+  | { readonly kind: 'window'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, WindowExpr>> }
+  | { readonly kind: 'seek'; readonly input: QueryNode; readonly by: readonly OrderTerm[]; readonly after: QueryCursor }
+  | { readonly kind: 'recursion-ref'; readonly name: string }
+  | { readonly kind: 'recursive'; readonly name: string; readonly seed: QueryNode; readonly step: QueryNode; readonly key: readonly Expr[]; readonly maxIterations?: number; readonly maxRows?: number };
+
+export type QueryCursor = {
+  readonly order: readonly JsonValue[];
+  readonly resultKey: string;
+  readonly basis: JsonValue;
+  readonly membershipRevision: number;
+  readonly mode: 'live' | 'pinned';
+};
 
 export type QueryRequest = {
   readonly root: QueryNode;
   readonly relations: readonly RelationInput[];
   readonly parameters?: Readonly<Record<string, JsonValue>>;
   readonly functions?: FunctionRegistry;
+  readonly basis?: JsonValue;
+  readonly membershipRevision?: number;
 };
 
 export type QueryResult = {
@@ -89,8 +103,18 @@ type Provenance = { readonly sourceId?: string; readonly attachmentId?: string; 
 type ScopedRow = { readonly scope: Readonly<Record<string, QueryRecord>>; readonly provenance: Readonly<Record<string, Provenance>> };
 type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: Completeness };
 type ExpressionResult = { readonly status: 'known'; readonly value: JsonValue } | { readonly status: 'missing' | 'unknown' | 'unavailable' };
-type EvalContext = { readonly row: ScopedRow; readonly parameters: Readonly<Record<string, JsonValue>>; readonly functions: FunctionRegistry; readonly issues: Issue[] };
-type QueryContext = { readonly relations: ReadonlyMap<string, RelationInput>; readonly parameters: Readonly<Record<string, JsonValue>>; readonly functions: FunctionRegistry; readonly issues: Issue[]; unavailable: boolean };
+type EvalContext = { readonly row: ScopedRow; readonly parameters: Readonly<Record<string, JsonValue>>; readonly functions: FunctionRegistry; readonly issues: Issue[]; readonly query?: QueryContext };
+type QueryContext = {
+  readonly relations: ReadonlyMap<string, RelationInput>;
+  readonly parameters: Readonly<Record<string, JsonValue>>;
+  readonly functions: FunctionRegistry;
+  readonly issues: Issue[];
+  readonly recursions: Map<string, readonly ScopedRow[]>;
+  readonly basis?: JsonValue;
+  readonly membershipRevision?: number;
+  readonly outer?: ScopedRow;
+  unavailable: boolean;
+};
 
 const relationKey = (relation: RelationUse): string => relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
 const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
@@ -102,6 +126,9 @@ export const evaluateQuery = (request: QueryRequest): QueryResult => {
     parameters: request.parameters ?? {},
     functions: request.functions ?? new Map(),
     issues,
+    recursions: new Map(),
+    ...(request.basis === undefined ? {} : { basis: request.basis }),
+    ...(request.membershipRevision === undefined ? {} : { membershipRevision: request.membershipRevision }),
     unavailable: false
   };
   const result = evaluateNode(request.root, context);
@@ -133,13 +160,15 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     }
     return {
       rows: input.rows.map((fields, index) => ({
-        scope: { [node.alias]: fields },
-        provenance: { [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: relationKey(node.relation) + ':' + index } }
+        scope: { ...context.outer?.scope, [node.alias]: fields },
+        provenance: { ...context.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: relationKey(node.relation) + ':' + index } }
       })),
       completeness: input.completeness
     };
   }
-  if (node.kind === 'values') return { rows: node.rows.map((fields, index) => ({ scope: { [node.alias]: fields }, provenance: { [node.alias]: { relationId: 'values', occurrence: 'values:' + index } } })), completeness: 'exact' };
+  if (node.kind === 'values') return { rows: node.rows.map((fields, index) => ({ scope: { ...context.outer?.scope, [node.alias]: fields }, provenance: { ...context.outer?.provenance, [node.alias]: { relationId: 'values', occurrence: 'values:' + index } } })), completeness: 'exact' };
+  if (node.kind === 'recursion-ref') return { rows: context.recursions.get(node.name) ?? [], completeness: 'exact' };
+  if (node.kind === 'recursive') return evaluateRecursive(node, context);
   if (node.kind === 'where') {
     const inner = evaluateNode(node.input, context);
     if (inner.completeness === 'unknown') return inner;
@@ -201,7 +230,8 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     const end = node.limit === undefined ? undefined : offset + Math.max(0, node.limit);
     return { rows: inner.rows.slice(offset, end), completeness: 'exact' };
   }
-  return evaluateWindow(node, context);
+  if (node.kind === 'window') return evaluateWindow(node, context);
+  return evaluateSeek(node, context);
 };
 
 const evaluateJoin = (node: Extract<QueryNode, { readonly kind: 'join' }>, context: QueryContext): NodeResult => {
@@ -317,6 +347,75 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
   return { rows: output, completeness: 'exact' };
 };
 
+const evaluateSeek = (node: Extract<QueryNode, { readonly kind: 'seek' }>, context: QueryContext): NodeResult => {
+  const inner = evaluateNode(node.input, context);
+  if (inner.completeness !== 'exact') return nonMonotoneUnknown(context, 'seek');
+  if (context.basis === undefined || context.membershipRevision === undefined || canonicalizeJson(context.basis) !== canonicalizeJson(node.after.basis) || context.membershipRevision !== node.after.membershipRevision) {
+    context.issues.push(createIssue({ code: 'query.cursor_stale', phase: 'query', severity: 'error', retry: 'after_refresh', details: { mode: node.after.mode } }));
+    return { rows: [], completeness: 'unknown' };
+  }
+  const rows = [...inner.rows].sort((left, right) => compareOrder(left, right, node.by, context)).filter((row) => compareRowToCursor(row, node.by, node.after, context) > 0);
+  return { rows, completeness: 'exact' };
+};
+
+const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive' }>, context: QueryContext): NodeResult => {
+  if (!isMonotoneRecursiveBody(node.step)) {
+    context.issues.push(createIssue({ code: 'query.recursion_non_monotone', phase: 'query', severity: 'error', retry: 'after_input' }));
+    return { rows: [], completeness: 'unknown' };
+  }
+  const seed = evaluateNode(node.seed, context);
+  if (seed.completeness !== 'exact') return nonMonotoneUnknown(context, 'recursive');
+  const maxIterations = node.maxIterations ?? 100;
+  const maxRows = node.maxRows ?? 100_000;
+  const previous = context.recursions.get(node.name);
+  const rows: ScopedRow[] = [];
+  const keys = new Set<string>();
+  const add = (candidate: ScopedRow): boolean => {
+    const parts = node.key.map((expression) => evaluateExpr(expression, exprContext(candidate, context)));
+    if (parts.some((part) => part.status === 'unavailable')) context.unavailable = true;
+    if (parts.some((part) => part.status !== 'known')) return false;
+    const key = canonicalizeJson(parts.map((part) => (part as { readonly status: 'known'; readonly value: JsonValue }).value));
+    if (keys.has(key)) return false;
+    keys.add(key);
+    rows.push(candidate);
+    return true;
+  };
+  try {
+    seed.rows.forEach(add);
+    if (rows.length > maxRows) return recursionBudgetUnknown(context, 'rows', maxRows);
+    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+      context.recursions.set(node.name, [...rows]);
+      const step = evaluateNode(node.step, context);
+      if (step.completeness !== 'exact' || context.unavailable) return { rows: [], completeness: 'unknown' };
+      let changed = false;
+      for (const candidate of step.rows) {
+        changed = add(candidate) || changed;
+        if (rows.length > maxRows) return recursionBudgetUnknown(context, 'rows', maxRows);
+      }
+      if (!changed) return { rows, completeness: 'exact' };
+    }
+    return recursionBudgetUnknown(context, 'iterations', maxIterations);
+  } finally {
+    if (previous === undefined) context.recursions.delete(node.name);
+    else context.recursions.set(node.name, previous);
+  }
+};
+
+const recursionBudgetUnknown = (context: QueryContext, budget: 'rows' | 'iterations', limit: number): NodeResult => {
+  context.issues.push(createIssue({ code: 'query.recursion_budget_exceeded', phase: 'query', severity: 'error', retry: 'after_input', details: { budget, limit } }));
+  return { rows: [], completeness: 'unknown' };
+};
+
+const isMonotoneRecursiveBody = (node: QueryNode): boolean => {
+  if (node.kind === 'aggregate' || node.kind === 'distinct' || node.kind === 'order' || node.kind === 'slice' || node.kind === 'window' || node.kind === 'seek') return false;
+  if (node.kind === 'join' && (node.join === 'anti' || node.join === 'left')) return false;
+  if (node.kind === 'set' && node.op !== 'union-all' && node.op !== 'union') return false;
+  if (node.kind === 'where' || node.kind === 'select' || node.kind === 'with-fields' || node.kind === 'rename' || node.kind === 'omit' || node.kind === 'unnest') return isMonotoneRecursiveBody(node.input);
+  if (node.kind === 'join' || node.kind === 'set') return isMonotoneRecursiveBody(node.left) && isMonotoneRecursiveBody(node.right);
+  if (node.kind === 'recursive') return isMonotoneRecursiveBody(node.seed) && isMonotoneRecursiveBody(node.step);
+  return true;
+};
+
 export const evaluateExpression = (expression: Expr, row: Readonly<Record<string, QueryRecord>>, options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}): EvaluationValue => {
   const issues: Issue[] = [];
   const scoped: ScopedRow = { scope: row, provenance: {} };
@@ -411,6 +510,35 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     }
     return known(null);
   }
+  if (expression.kind === 'subquery') {
+    if (context.query === undefined) return { status: 'unavailable' };
+    const child: QueryContext = {
+      relations: context.query.relations,
+      parameters: context.parameters,
+      functions: context.functions,
+      issues: context.issues,
+      recursions: context.query.recursions,
+      ...(context.query.basis === undefined ? {} : { basis: context.query.basis }),
+      ...(context.query.membershipRevision === undefined ? {} : { membershipRevision: context.query.membershipRevision }),
+      outer: context.row,
+      unavailable: false
+    };
+    const result = evaluateNode(expression.query, child);
+    if (child.unavailable) { context.query.unavailable = true; return { status: 'unavailable' }; }
+    if (result.completeness === 'unknown') return { status: 'unknown' };
+    if (expression.mode === 'exists') return known(result.rows.length > 0);
+    if (result.rows.length !== 1) {
+      context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { rows: result.rows.length } }));
+      return { status: 'unknown' };
+    }
+    const record = visibleRow(result.rows[0] as ScopedRow);
+    const values = Object.values(record);
+    if (values.length !== 1) {
+      context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { fields: values.length } }));
+      return { status: 'unknown' };
+    }
+    return known(values[0] as JsonValue);
+  }
   if (expression.kind === 'call') {
     const fn = context.functions.get(capabilityKey(expression.capability));
     if (fn === undefined) {
@@ -425,7 +553,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   return { status: 'unknown' };
 };
 
-const exprContext = (row: ScopedRow, context: QueryContext): EvalContext => ({ row, parameters: context.parameters, functions: context.functions, issues: context.issues });
+const exprContext = (row: ScopedRow, context: QueryContext): EvalContext => ({ row, parameters: context.parameters, functions: context.functions, issues: context.issues, query: context });
 const known = (value: JsonValue): ExpressionResult => ({ status: 'known', value });
 const propagate = (...values: readonly ExpressionResult[]): ExpressionResult | undefined => values.some((value) => value.status === 'unavailable') ? { status: 'unavailable' } : values.some((value) => value.status === 'unknown') ? { status: 'unknown' } : undefined;
 const expressionJson = (result: ExpressionResult): JsonValue => result.status === 'known' ? result.value : null;
@@ -458,15 +586,34 @@ const compareOrder = (left: ScopedRow, right: ScopedRow, terms: readonly OrderTe
   for (const term of terms) {
     const leftValue = evaluateExpr(term.value, exprContext(left, context));
     const rightValue = evaluateExpr(term.value, exprContext(right, context));
-    const leftJson = leftValue.status === 'known' ? leftValue.value : null;
-    const rightJson = rightValue.status === 'known' ? rightValue.value : null;
-    let comparison = compareJsonValues(leftJson, rightJson) ?? 0;
-    if (comparison !== 0) {
-      if (leftJson === null || rightJson === null) comparison = leftJson === null ? (term.nulls === 'first' ? -1 : 1) : (term.nulls === 'first' ? 1 : -1);
-      return term.direction === 'asc' ? comparison : -comparison;
-    }
+    const comparison = compareOrderedExpressions(leftValue, rightValue, term);
+    if (comparison !== 0) return comparison;
   }
   return resultKey(left).localeCompare(resultKey(right));
+};
+
+const compareRowToCursor = (row: ScopedRow, terms: readonly OrderTerm[], cursor: QueryCursor, context: QueryContext): number => {
+  for (let index = 0; index < terms.length; index += 1) {
+    const term = terms[index] as OrderTerm;
+    const rowValue = evaluateExpr(term.value, exprContext(row, context));
+    const cursorValue = known(cursor.order[index] ?? null);
+    const comparison = compareOrderedExpressions(rowValue, cursorValue, term);
+    if (comparison !== 0) return comparison;
+  }
+  return resultKey(row).localeCompare(cursor.resultKey);
+};
+
+const compareOrderedExpressions = (left: ExpressionResult, right: ExpressionResult, term: OrderTerm): number => {
+  const leftRank = left.status === 'missing' ? 2 : left.status !== 'known' || left.value === null ? 1 : 0;
+  const rightRank = right.status === 'missing' ? 2 : right.status !== 'known' || right.value === null ? 1 : 0;
+  if (leftRank !== rightRank) {
+    if (leftRank > 0 && rightRank > 0) return leftRank < rightRank ? -1 : 1;
+    const specialIsLeft = leftRank > 0;
+    return term.nulls === 'first' ? (specialIsLeft ? -1 : 1) : (specialIsLeft ? 1 : -1);
+  }
+  if (leftRank > 0 || left.status !== 'known' || right.status !== 'known') return 0;
+  const comparison = compareJsonValuesTotal(left.value, right.value);
+  return term.direction === 'asc' ? comparison : -comparison;
 };
 
 const compareJsonValues = (left: JsonValue, right: JsonValue): number | undefined => {

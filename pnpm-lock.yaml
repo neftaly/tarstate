@@ -51,14 +51,14 @@ importers:
   packages/automerge:
     dependencies:
       '@automerge/automerge':
-        specifier: ^3.2.6
+        specifier: 3.2.6
         version: 3.2.6
       '@tarstate/core':
         specifier: workspace:*
         version: link:../core
     devDependencies:
       '@automerge/automerge-repo':
-        specifier: ^2.5.6
+        specifier: 2.5.6
         version: 2.5.6
       typescript:
         specifier: 'catalog:'
@@ -88,11 +88,11 @@ importers:
         specifier: workspace:*
         version: link:../core
       zustand:
-        specifier: ^5.0.14
+        specifier: 5.0.14
         version: 5.0.14
     devDependencies:
       '@tanstack/store':
-        specifier: ^0.11.0
+        specifier: 0.11.0
         version: 0.11.0
       typescript:
         specifier: 'catalog:'

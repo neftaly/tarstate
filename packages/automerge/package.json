@@ -15,11 +15,11 @@
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@automerge/automerge": "^3.2.6",
+    "@automerge/automerge": "3.2.6",
     "@tarstate/core": "workspace:*"
   },
   "devDependencies": {
-    "@automerge/automerge-repo": "^2.5.6",
+    "@automerge/automerge-repo": "2.5.6",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vitest": "catalog:"

@@ -120,4 +120,68 @@ describe('production query oracle', () => {
     const result = evaluateQuery({ root: { kind: 'slice', input: from('partial'), limit: 1 }, relations: [relation('partial', [{ id: 1 }], 'lower-bound')] });
     expect(result).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ details: { reason: 'incomplete_non_monotone', operator: 'slice' } }] });
   });
+
+  it('evaluates correlated exists and scalar subqueries', () => {
+    const petsForPerson: QueryNode = {
+      kind: 'where',
+      input: from('pets', 'pet'),
+      predicate: { kind: 'compare', op: 'eq', left: { kind: 'field', alias: 'pet', name: 'ownerId' }, right: { kind: 'field', alias: 'person', name: 'id' } }
+    };
+    const countPets: QueryNode = {
+      kind: 'aggregate',
+      input: petsForPerson,
+      alias: 'summary',
+      groupBy: {},
+      measures: { count: { kind: 'aggregate', op: 'count' } }
+    };
+    const root: QueryNode = {
+      kind: 'select',
+      alias: 'result',
+      input: { kind: 'where', input: from('people', 'person'), predicate: { kind: 'subquery', mode: 'exists', query: petsForPerson } },
+      fields: {
+        id: { kind: 'field', alias: 'person', name: 'id' },
+        pets: { kind: 'subquery', mode: 'scalar', query: countPets }
+      }
+    };
+    const result = evaluateQuery({ root, relations: [relation('people', [{ id: 1 }, { id: 2 }]), relation('pets', [{ id: 'a', ownerId: 1 }, { id: 'b', ownerId: 1 }])] });
+    expect(result.rows).toEqual([{ id: 1, pets: 2 }]);
+  });
+
+  it('computes a keyed least fixpoint and enforces recursion budgets', () => {
+    const step: QueryNode = {
+      kind: 'select',
+      alias: 'n',
+      input: {
+        kind: 'where',
+        input: { kind: 'recursion-ref', name: 'numbers' },
+        predicate: { kind: 'compare', op: 'lt', left: { kind: 'field', alias: 'n', name: 'value' }, right: { kind: 'literal', value: 3 } }
+      },
+      fields: { value: { kind: 'arithmetic', op: 'add', left: { kind: 'field', alias: 'n', name: 'value' }, right: { kind: 'literal', value: 1 } } }
+    };
+    const recursive = (maxIterations?: number): QueryNode => ({
+      kind: 'recursive',
+      name: 'numbers',
+      seed: { kind: 'values', alias: 'n', rows: [{ value: 1 }] },
+      step,
+      key: [{ kind: 'field', alias: 'n', name: 'value' }],
+      ...(maxIterations === undefined ? {} : { maxIterations })
+    });
+    expect(evaluateQuery({ root: recursive(), relations: [] }).rows).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
+    expect(evaluateQuery({ root: recursive(1), relations: [] })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.recursion_budget_exceeded' }] });
+  });
+
+  it('binds keyset seek to basis and membership revision', () => {
+    const by = [{ value: { kind: 'field', alias: 'item', name: 'id' } as const, direction: 'asc' as const }];
+    const relations = [relation('items', [{ id: 1 }, { id: 2 }, { id: 3 }])];
+    const ordered = evaluateQuery({ root: { kind: 'order', input: from('items', 'item'), by }, relations });
+    const cursor = { order: [1], resultKey: ordered.resultKeys[0] as string, basis: { revision: 4 }, membershipRevision: 9, mode: 'live' as const };
+    expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 4 }, membershipRevision: 9 }).rows).toEqual([{ id: 2 }, { id: 3 }]);
+    expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 5 }, membershipRevision: 9 })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.cursor_stale' }] });
+  });
+
+  it('orders ordinary values before null then missing regardless of direction', () => {
+    const input: QueryNode = { kind: 'values', alias: 'v', rows: [{ id: 'missing' }, { id: 'null', value: null }, { id: 'ordinary', value: 1 }] };
+    const result = evaluateQuery({ root: { kind: 'order', input, by: [{ value: { kind: 'field', alias: 'v', name: 'value' }, direction: 'desc' }] }, relations: [] });
+    expect(result.rows.map((row) => row.id)).toEqual(['ordinary', 'null', 'missing']);
+  });
 });

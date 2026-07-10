@@ -9,6 +9,10 @@ describe('clean rewrite core surface', () => {
     expect(core.FullRecomputeStrategy).toBeTypeOf('function');
     expect(core.evaluateQuery).toBeTypeOf('function');
     expect(core.acquireExternalStoreRuntime).toBeTypeOf('function');
+    expect(core.prepareSchema).toBeTypeOf('function');
+    expect(core.resolveLensPath).toBeTypeOf('function');
+    expect(core.InMemoryAtomicSource).toBeTypeOf('function');
+    expect(core.sealTransaction).toBeTypeOf('function');
   });
 
   it('does not retain legacy API names', () => {
