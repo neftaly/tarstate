@@ -54,16 +54,14 @@ an interoperability promise. Adding movement to the built-in Automerge adapter
 requires a new owner decision and evidence; it is not an automatic upgrade when
 a library primitive appears.
 
-## D-004: ship one evaluator and one production path
+## D-004: revoked — full recomputation is not v1 completion
 
-The owner selected simplicity over speculative incremental-maintenance and
-cache machinery. V1 therefore ships the pure full evaluator directly. The
-former differential wrapper was not an incremental engine: it always ran the
-full evaluator while reporting recomputation telemetry, so it and its hint
-protocol were removed rather than retained as a second production path.
+An earlier implementation pass incorrectly treated a fake differential wrapper
+as evidence that incremental maintenance could be removed. The wrapper always
+ran the full evaluator and was correctly deleted, but the original IVM
+acceptance criterion remains mandatory.
 
-Test-only restart and fault-injection sources live under test support and are
-not exported or packed. A receipt ledger has no separate no-op eviction API.
-Future optimized evaluators or caches require a measured need, an explicit
-ownership boundary, and equivalence/lifetime evidence before entering the
-runtime surface; they must not arrive as silent fallback paths.
+V1 keeps the pure evaluator as a test oracle and uses one real incremental
+production path. It must not retain speculative delta hooks or silently fall
+back to full-query recomputation. The executable requirements are locked in
+[acceptance.md](acceptance.md).

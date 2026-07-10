@@ -10,6 +10,9 @@ must be amended by an explicit entry in [decisions.md](decisions.md).
 Release evidence is indexed in
 [conformance-matrix.md](conformance-matrix.md). Documents outside `docs/v1/`
 are historical or explanatory unless this specification incorporates them.
+The original implementation gates are preserved in
+[acceptance.md](acceptance.md); that ledger cannot be weakened by an
+implementation convenience.
 
 ## Product boundary
 
@@ -97,9 +100,11 @@ Queries are immutable portable templates with declared parameters, schema
 views, a root relational expression, and exact capability requirements. A
 request selects exactly one dataset. Preparation resolves artifacts, lenses,
 codecs, functions, collations, and capabilities against one database authority
-view. V1 ships one pure full evaluator. A future incremental evaluator MUST be
-differentially equivalent before it replaces that path; v1 contains no runtime
-fallback between evaluators.
+view. The pure full evaluator is the semantic oracle. Production observers use
+stateful incremental view maintenance that is differentially equivalent for
+the complete v1 algebra. The operator graph rematerializes only nodes reached
+by changed relation or session evidence and stops propagation when an operator
+materialization is unchanged. The oracle is not a production fallback.
 
 ## Identity, storage, and compatibility
 
