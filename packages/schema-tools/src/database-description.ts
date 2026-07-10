@@ -16,12 +16,12 @@ import {
   type ValueDeclaration
 } from '@tarstate/core';
 
-export type DescriptionObservationBasis = {
+export type DatabaseDescriptionBasis = {
   readonly dataset: { readonly datasetId: string; readonly revision: number };
   readonly attachments: readonly { readonly attachmentId: string; readonly sourceId: string; readonly basis: JsonValue }[];
 };
 
-export const databaseCommandIds = [
+export const supportedDatabaseCommandIds = [
   'tarstate.command.commit',
   'tarstate.command.non_atomic_batch',
   'tarstate.command.simulate',
@@ -30,14 +30,14 @@ export const databaseCommandIds = [
   'tarstate.command.governance'
 ] as const;
 
-export type DatabaseCommandId = typeof databaseCommandIds[number];
+export type SupportedDatabaseCommandId = typeof supportedDatabaseCommandIds[number];
 
 export type DatabaseDescription = {
   readonly kind: 'tarstate.database-description';
   readonly formatVersion: 1;
   readonly databaseFingerprint: ContentHash;
   readonly registryFingerprint: ContentHash;
-  readonly basis: DescriptionObservationBasis;
+  readonly basis: DatabaseDescriptionBasis;
   readonly datasets: readonly {
     readonly datasetId: string;
     readonly revision: number;
@@ -54,7 +54,7 @@ export type DatabaseDescription = {
     readonly missingCapabilities: readonly CapabilityRef[];
   }[];
   readonly commands: readonly {
-    readonly id: DatabaseCommandId;
+    readonly id: SupportedDatabaseCommandId;
     readonly input: ValueDeclaration;
     readonly resultKind: string;
     readonly resultVersion: number;
@@ -66,10 +66,10 @@ export type DatabaseDescription = {
   readonly issueCodeCatalog: ArtifactRef;
 };
 
-export type AuthorityFilteredDatabaseDescriptionInput = Omit<DatabaseDescription, 'kind' | 'formatVersion' | 'databaseFingerprint'>;
+export type DatabaseDescriptionSnapshot = Omit<DatabaseDescription, 'kind' | 'formatVersion' | 'databaseFingerprint'>;
 
-export type DescribableDatabase = {
-  readonly databaseDescriptionInput: () => unknown;
+export type DatabaseDescriptionSnapshotProvider = {
+  readonly getDatabaseDescriptionSnapshot: () => unknown;
 };
 
 export type DatabaseDescriptionBudget = ArtifactParseBudget & {
@@ -77,7 +77,7 @@ export type DatabaseDescriptionBudget = ArtifactParseBudget & {
   readonly maxRelations: number;
   readonly maxCommands: number;
   readonly maxCapabilities: number;
-  readonly maxAttachmentIds: number;
+  readonly maxAttachmentReferences: number;
 };
 
 export const defaultDatabaseDescriptionBudget: DatabaseDescriptionBudget = {
@@ -87,14 +87,14 @@ export const defaultDatabaseDescriptionBudget: DatabaseDescriptionBudget = {
   maxRelations: 100_000,
   maxCommands: 64,
   maxCapabilities: 100_000,
-  maxAttachmentIds: 100_000
+  maxAttachmentReferences: 100_000
 };
 
 /** Consumes an already authority-filtered shell snapshot; it performs no grant widening. */
-export const describeDatabase = async (source: AuthorityFilteredDatabaseDescriptionInput | DescribableDatabase, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<DatabaseDescription> => {
+export const describeDatabase = async (source: DatabaseDescriptionSnapshot | DatabaseDescriptionSnapshotProvider, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<DatabaseDescription> => {
   let input: unknown;
   try {
-    input = isDescribableDatabase(source) ? source.databaseDescriptionInput() : source;
+    input = isDatabaseDescriptionSnapshotProvider(source) ? source.getDatabaseDescriptionSnapshot() : source;
   } catch (error) {
     throw new TarstateParseError([toolIssue('schema_tools.database_description_unavailable', {
       reason: 'authority_filtered_snapshot_failed',
@@ -161,7 +161,7 @@ export const safeParseDatabaseDescription = async (input: unknown, budget: Datab
   return { success: true, value: deepFreeze(parsed), issues: [] };
 };
 
-const normalizeDescriptionInput = (input: AuthorityFilteredDatabaseDescriptionInput): AuthorityFilteredDatabaseDescriptionInput => ({
+const normalizeDescriptionInput = (input: DatabaseDescriptionSnapshot): DatabaseDescriptionSnapshot => ({
   registryFingerprint: input.registryFingerprint,
   basis: {
     dataset: { ...input.basis.dataset },
@@ -179,9 +179,9 @@ const normalizeDescriptionInput = (input: AuthorityFilteredDatabaseDescriptionIn
   issueCodeCatalog: normalizeRef(input.issueCodeCatalog)
 });
 
-const isDescribableDatabase = (value: unknown): value is DescribableDatabase => value !== null && typeof value === 'object' && typeof (value as { readonly databaseDescriptionInput?: unknown }).databaseDescriptionInput === 'function';
+const isDatabaseDescriptionSnapshotProvider = (value: unknown): value is DatabaseDescriptionSnapshotProvider => value !== null && typeof value === 'object' && typeof (value as { readonly getDatabaseDescriptionSnapshot?: unknown }).getDatabaseDescriptionSnapshot === 'function';
 
-const safeParseDescriptionInput = (input: unknown, budget: DatabaseDescriptionBudget): ParseResult<AuthorityFilteredDatabaseDescriptionInput> => {
+const safeParseDescriptionInput = (input: unknown, budget: DatabaseDescriptionBudget): ParseResult<DatabaseDescriptionSnapshot> => {
   const portable = safeParseJsonValue(input, budget);
   if (!portable.success) return portable;
   const value = portable.value;
@@ -189,7 +189,7 @@ const safeParseDescriptionInput = (input: unknown, budget: DatabaseDescriptionBu
   if (!Array.isArray(value.datasets) || !Array.isArray(value.relations) || !Array.isArray(value.commands) || !Array.isArray(value.capabilityImplications)) return invalid([], 'collections');
   const basis = parseBasis(value.basis);
   if (!basis.success) return basis;
-  const datasets = parseDatasets(value.datasets);
+  const datasets = parseDatasets(value.datasets, true);
   if (!datasets.success) return datasets;
   const relations = parseRelations(value.relations, true);
   if (!relations.success) return relations;
@@ -199,7 +199,7 @@ const safeParseDescriptionInput = (input: unknown, budget: DatabaseDescriptionBu
   if (!implications.success) return implications;
   const issueCodeCatalog = parseArtifactRef(value.issueCodeCatalog, ['issueCodeCatalog'], true);
   if (!issueCodeCatalog.success) return issueCodeCatalog;
-  const parsed: AuthorityFilteredDatabaseDescriptionInput = {
+  const parsed: DatabaseDescriptionSnapshot = {
     registryFingerprint: value.registryFingerprint,
     basis: basis.value,
     datasets: datasets.value,
@@ -212,9 +212,9 @@ const safeParseDescriptionInput = (input: unknown, budget: DatabaseDescriptionBu
   return budgetIssue === undefined ? { success: true, value: parsed, issues: [] } : { success: false, issues: [budgetIssue] };
 };
 
-const parseBasis = (value: unknown): ParseResult<DescriptionObservationBasis> => {
+const parseBasis = (value: unknown): ParseResult<DatabaseDescriptionBasis> => {
   if (!isRecord(value) || !exactKeys(value, ['attachments', 'dataset']) || !isRecord(value.dataset) || !exactKeys(value.dataset, ['datasetId', 'revision']) || typeof value.dataset.datasetId !== 'string' || !isRevision(value.dataset.revision) || !Array.isArray(value.attachments)) return invalid(['basis']);
-  const attachments: DescriptionObservationBasis['attachments'][number][] = [];
+  const attachments: DatabaseDescriptionBasis['attachments'][number][] = [];
   const identities = new Set<string>();
   for (let index = 0; index < value.attachments.length; index += 1) {
     const item = value.attachments[index];
@@ -227,14 +227,14 @@ const parseBasis = (value: unknown): ParseResult<DescriptionObservationBasis> =>
   return { success: true, value: { dataset: { datasetId: value.dataset.datasetId, revision: value.dataset.revision }, attachments }, issues: [] };
 };
 
-const parseDatasets = (values: readonly JsonValue[]): ParseResult<DatabaseDescription['datasets']> => {
+const parseDatasets = (values: readonly JsonValue[], acceptNormalizableInput = false): ParseResult<DatabaseDescription['datasets']> => {
   const output: DatabaseDescription['datasets'][number][] = [];
   const identities = new Set<string>();
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
     if (!isRecord(value) || !exactKeys(value, ['attachmentIds', 'datasetId', 'revision', 'state']) || typeof value.datasetId !== 'string' || value.datasetId.length === 0 || !isRevision(value.revision) || (value.state !== 'open' && value.state !== 'settled') || !Array.isArray(value.attachmentIds) || !value.attachmentIds.every((item) => typeof item === 'string' && item.length > 0)) return invalid(['datasets', index]);
     const identity = value.datasetId + '\u0000' + value.revision;
-    if (identities.has(identity) || new Set(value.attachmentIds).size !== value.attachmentIds.length) return invalid(['datasets', index], 'duplicate');
+    if (identities.has(identity) || (!acceptNormalizableInput && new Set(value.attachmentIds).size !== value.attachmentIds.length)) return invalid(['datasets', index], 'duplicate');
     identities.add(identity);
     output.push({ datasetId: value.datasetId, revision: value.revision, state: value.state, attachmentIds: value.attachmentIds });
   }
@@ -266,9 +266,9 @@ const parseCommands = (values: readonly JsonValue[]): ParseResult<DatabaseDescri
   const ids = new Set<string>();
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
-    if (!isRecord(value) || !exactKeys(value, ['id', 'input', 'resultKind', 'resultVersion']) || typeof value.id !== 'string' || !databaseCommandIds.includes(value.id as DatabaseCommandId) || typeof value.resultKind !== 'string' || !isRevision(value.resultVersion) || !isValueDeclaration(value.input) || ids.has(value.id)) return invalid(['commands', index]);
+    if (!isRecord(value) || !exactKeys(value, ['id', 'input', 'resultKind', 'resultVersion']) || typeof value.id !== 'string' || !supportedDatabaseCommandIds.includes(value.id as SupportedDatabaseCommandId) || typeof value.resultKind !== 'string' || !isRevision(value.resultVersion) || !isValueDeclaration(value.input) || ids.has(value.id)) return invalid(['commands', index]);
     ids.add(value.id);
-    output.push({ id: value.id as DatabaseCommandId, input: value.input, resultKind: value.resultKind, resultVersion: value.resultVersion });
+    output.push({ id: value.id as SupportedDatabaseCommandId, input: value.input, resultKind: value.resultKind, resultVersion: value.resultVersion });
   }
   return { success: true, value: output, issues: [] };
 };
@@ -325,7 +325,7 @@ const isValueDeclaration = (value: unknown, depth = 0): value is ValueDeclaratio
   return value.kind === 'custom' && exactKeys(value, ['codec', 'kind']) && parseCapability(value.codec, []).success;
 };
 
-const descriptionBudgetIssue = (value: AuthorityFilteredDatabaseDescriptionInput | DatabaseDescription, budget: DatabaseDescriptionBudget): Issue | undefined => {
+const descriptionBudgetIssue = (value: DatabaseDescriptionSnapshot | DatabaseDescription, budget: DatabaseDescriptionBudget): Issue | undefined => {
   const capabilityCount = value.relations.reduce((count, relation) => count + relation.editCapabilities.length + relation.missingCapabilities.length, 0) + value.capabilityImplications.length * 2;
   const attachmentCount = value.basis.attachments.length + value.datasets.reduce((count, dataset) => count + dataset.attachmentIds.length, 0);
   const byteLength = new TextEncoder().encode(canonicalizeJson(value as unknown as JsonValue)).byteLength;
@@ -334,7 +334,7 @@ const descriptionBudgetIssue = (value: AuthorityFilteredDatabaseDescriptionInput
   if (value.relations.length > budget.maxRelations) return budgetExceeded('maxRelations', budget.maxRelations);
   if (value.commands.length > budget.maxCommands) return budgetExceeded('maxCommands', budget.maxCommands);
   if (capabilityCount > budget.maxCapabilities) return budgetExceeded('maxCapabilities', budget.maxCapabilities);
-  if (attachmentCount > budget.maxAttachmentIds) return budgetExceeded('maxAttachmentIds', budget.maxAttachmentIds);
+  if (attachmentCount > budget.maxAttachmentReferences) return budgetExceeded('maxAttachmentReferences', budget.maxAttachmentReferences);
   return undefined;
 };
 

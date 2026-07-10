@@ -21,7 +21,7 @@ import {
   useRow,
   type MutationState,
   type ObservableDatabase,
-  type OptimisticOverlayFactory,
+  type CreateOptimisticOverlay,
   type ReactObserverSnapshot,
   type ReactPreparedPlan
 } from '../src/index.js';
@@ -174,7 +174,7 @@ describe('@tarstate/react', () => {
     const full: ObserverSnapshot<Row>[] = [];
     const Selected = () => {
       selected.push(useQuery(plan, {
-        select: (snapshot) => snapshot.state === 'open' ? snapshot.current.rows.map(({ name }) => name).join(',') : 'closed'
+        selectSnapshot: (snapshot) => snapshot.state === 'open' ? snapshot.current.rows.map(({ name }) => name).join(',') : 'closed'
       }));
       return null;
     };
@@ -214,7 +214,7 @@ describe('@tarstate/react', () => {
     let retained: Row | undefined;
     const Consumer = () => {
       current = useRow(plan, 'row:1');
-      retained = useRow(plan, 'row:1', { evidence: 'last-exact' });
+      retained = useRow(plan, 'row:1', { readFrom: 'last-exact' });
       return null;
     };
     await mount(createElement(TarstateProvider, { database }, createElement(Consumer)));
@@ -232,7 +232,7 @@ describe('@tarstate/react', () => {
     expect(() => renderToString(createElement(TarstateProvider, { database }, createElement(Consumer)))).toThrow(/server snapshot|getServerSnapshot/i);
     const html = renderToString(createElement(
       TarstateProvider,
-      { database, serverObservations: [{ request, snapshot: openSnapshot([{ id: 7, name: 'server' }]) }] },
+      { database, serverQueryObservations: [{ request, snapshot: openSnapshot([{ id: 7, name: 'server' }]) }] },
       createElement(Consumer)
     ));
     expect(html).toContain('server');
@@ -249,10 +249,10 @@ describe('@tarstate/react', () => {
     const Consumer = () => {
       commit = useCommit();
       states.push(useMutationState());
-      pendingCounts.push(useMutationState({ select: ({ pendingCount }) => pendingCount }));
+      pendingCounts.push(useMutationState({ selectState: ({ pendingCount }) => pendingCount }));
       return null;
     };
-    await mount(createElement(TarstateProvider, { database, commit: commitImplementation }, createElement(Consumer)));
+    await mount(createElement(TarstateProvider, { database, executeCommit: commitImplementation }, createElement(Consumer)));
     const attempt = transactionAttempt();
     let result: Promise<CommitReceipt> | undefined;
     await act(() => { result = commit?.(attempt); });
@@ -282,8 +282,8 @@ describe('@tarstate/react', () => {
     };
     await mount(createElement(TarstateProvider, {
       database,
-      commit: commitImplementation,
-      optimisticOverlay: optimisticNames('pending')
+      executeCommit: commitImplementation,
+      createOptimisticOverlay: optimisticNames('pending')
     }, createElement(Consumer)));
 
     let result: Promise<CommitReceipt> | undefined;
@@ -312,44 +312,49 @@ describe('@tarstate/react', () => {
     const Consumer = () => { commit = useCommit(); states.push(useMutationState()); return null; };
     await mount(createElement(TarstateProvider, {
       database,
-      commit: commitImplementation,
-      optimisticOverlay: () => { throw new TypeError('cannot project this attempt'); }
+      executeCommit: commitImplementation,
+      createOptimisticOverlay: () => { throw new TypeError('cannot project this attempt'); }
     }, createElement(Consumer)));
 
     await act(async () => { await commit?.(transactionAttempt()); });
     expect(commitImplementation).toHaveBeenCalledTimes(1);
     expect(states.at(-1)).toMatchObject({
       pendingCount: 0,
-      mutations: [{ state: 'settled', optimisticError: { phase: 'factory', name: 'TypeError', message: 'cannot project this attempt' } }]
+      mutations: [{ state: 'settled', optimisticError: { phase: 'create-overlay', name: 'TypeError', message: 'cannot project this attempt' } }]
     });
   });
 
   it.each([
-    ['appliesTo', (() => ({
+    ['applies-to-query', (() => ({
       sourceId: 'source:one', sourceBasis: { revision: 0 },
-      appliesTo: () => { throw new Error('broken applicability'); },
-      project: ({ rows, resultKeys }) => ({ rows, resultKeys })
-    })) satisfies OptimisticOverlayFactory<Query, Row>],
-    ['project', (() => ({
+      appliesToQuery: () => { throw new Error('broken applicability'); },
+      projectRows: ({ currentRows, currentResultKeys }) => ({ rows: currentRows, resultKeys: currentResultKeys })
+    })) satisfies CreateOptimisticOverlay<Query, Row>],
+    ['project-rows', (() => ({
       sourceId: 'source:one', sourceBasis: { revision: 0 },
-      project: () => { throw new Error('broken projection'); }
-    })) satisfies OptimisticOverlayFactory<Query, Row>],
-    ['result', (() => ({
+      projectRows: () => { throw new Error('broken projection'); }
+    })) satisfies CreateOptimisticOverlay<Query, Row>],
+    ['projection-result', (() => ({
       sourceId: 'source:one', sourceBasis: { revision: 0 },
-      project: () => ({ rows: [], resultKeys: ['orphan'] })
-    })) satisfies OptimisticOverlayFactory<Query, Row>]
-  ] as const)('throws explicit optimistic %s failures and rolls back the overlay', async (phase, optimisticOverlay) => {
+      projectRows: () => ({ rows: [], resultKeys: ['orphan'] })
+    })) satisfies CreateOptimisticOverlay<Query, Row>]
+  ] as const)('records optimistic %s failures without blocking the authoritative commit', async (phase, createOptimisticOverlay) => {
     const database = new TestDatabase();
     const commitImplementation = vi.fn(async () => commitReceipt());
+    const states: MutationState[] = [];
     let commit: ReturnType<typeof useCommit> | undefined;
     let latest: ReactObserverSnapshot<Row> | undefined;
-    const Consumer = () => { commit = useCommit(); latest = useQuery(plan); return null; };
-    await mount(createElement(TarstateProvider, { database, commit: commitImplementation, optimisticOverlay }, createElement(Consumer)));
+    const Consumer = () => { commit = useCommit(); latest = useQuery(plan); states.push(useMutationState()); return null; };
+    await mount(createElement(TarstateProvider, { database, executeCommit: commitImplementation, createOptimisticOverlay }, createElement(Consumer)));
 
     await act(async () => {
-      await expect(commit?.(transactionAttempt())).rejects.toThrow('Optimistic overlay ' + phase + ' failed');
+      await expect(commit?.(transactionAttempt())).resolves.toMatchObject({ outcome: 'committed' });
     });
-    expect(commitImplementation).not.toHaveBeenCalled();
+    expect(commitImplementation).toHaveBeenCalledTimes(1);
+    expect(states.at(-1)).toMatchObject({
+      pendingCount: 0,
+      mutations: [{ state: 'settled', optimisticError: { phase } }]
+    });
     expect(latest).not.toHaveProperty('optimistic');
   });
 
@@ -359,16 +364,16 @@ describe('@tarstate/react', () => {
     const snapshots: ReactObserverSnapshot<Row>[] = [];
     const rebases: boolean[] = [];
     let commit: ReturnType<typeof useCommit> | undefined;
-    const overlay: OptimisticOverlayFactory<Query, Row> = () => ({
+    const overlay: CreateOptimisticOverlay<Query, Row> = () => ({
       sourceId: 'source:one',
       sourceBasis: { incarnation: 'one', revision: 0 },
-      project: ({ rows, rebased }) => {
+      projectRows: ({ currentRows, rebased }) => {
         rebases.push(rebased);
-        return { rows: rows.map((row) => ({ ...row, name: row.name + (rebased ? '+rebased' : '+pending') })), resultKeys: rows.map(({ id }) => 'row:' + id) };
+        return { rows: currentRows.map((row) => ({ ...row, name: row.name + (rebased ? '+rebased' : '+pending') })), resultKeys: currentRows.map(({ id }) => 'row:' + id) };
       }
     });
     const Consumer = () => { commit = useCommit(); snapshots.push(useQuery(plan)); return null; };
-    await mount(createElement(TarstateProvider, { database, commit: commitImplementation, optimisticOverlay: overlay }, createElement(Consumer)));
+    await mount(createElement(TarstateProvider, { database, executeCommit: commitImplementation, createOptimisticOverlay: overlay }, createElement(Consumer)));
     await act(() => { void commit?.(transactionAttempt()); });
     expect(snapshots.at(-1)).toMatchObject({ current: { rows: [{ name: 'one+pending' }] }, optimistic: { operations: [{ rebased: false }] } });
 
@@ -388,7 +393,7 @@ describe('@tarstate/react', () => {
     const snapshots: ReactObserverSnapshot<Row>[] = [];
     let commit: ReturnType<typeof useCommit> | undefined;
     const Consumer = () => { commit = useCommit(); snapshots.push(useQuery(plan)); return null; };
-    await mount(createElement(TarstateProvider, { database, commit: commitImplementation, optimisticOverlay: optimisticNames('pending') }, createElement(Consumer)));
+    await mount(createElement(TarstateProvider, { database, executeCommit: commitImplementation, createOptimisticOverlay: optimisticNames('pending') }, createElement(Consumer)));
     let result: Promise<CommitReceipt> | undefined;
     await act(() => { result = commit?.(transactionAttempt()); });
     expect(snapshots.at(-1)).toHaveProperty('optimistic');
@@ -411,8 +416,8 @@ describe('@tarstate/react', () => {
     const Consumer = () => { commit = useCommit(); states.push(useMutationState()); snapshots.push(useQuery(plan)); return null; };
     await mount(createElement(TarstateProvider, {
       database,
-      commit: () => new Promise<CommitReceipt>((_resolve, reject) => { rejectCommit = reject; }),
-      optimisticOverlay: optimisticNames('pending')
+      executeCommit: () => new Promise<CommitReceipt>((_resolve, reject) => { rejectCommit = reject; }),
+      createOptimisticOverlay: optimisticNames('pending')
     }, createElement(Consumer)));
     let result: Promise<CommitReceipt> | undefined;
     await act(() => { result = commit?.(transactionAttempt()); });
@@ -434,8 +439,8 @@ describe('@tarstate/react', () => {
     const Consumer = () => { commit = useCommit(); states.push(useMutationState()); snapshots.push(useQuery(plan)); return null; };
     await mount(createElement(TarstateProvider, {
       database,
-      commit: async () => ({ ...commitReceipt(), operationId: 'operation:other' }),
-      optimisticOverlay: optimisticNames('pending')
+      executeCommit: async () => ({ ...commitReceipt(), operationId: 'operation:other' }),
+      createOptimisticOverlay: optimisticNames('pending')
     }, createElement(Consumer)));
 
     await act(async () => {
@@ -447,12 +452,12 @@ describe('@tarstate/react', () => {
 
   it('drops overlays with the owning provider runtime without owning observer or database lifecycle', async () => {
     const database = new TestDatabase();
-    const project = vi.fn(({ rows }: { readonly rows: readonly Row[] }) => ({ rows: rows.map((row) => ({ ...row, name: row.name + '+pending' })), resultKeys: rows.map(({ id }) => 'row:' + id) }));
-    const overlay: OptimisticOverlayFactory<Query, Row> = () => ({ sourceId: 'source:one', sourceBasis: { incarnation: 'one', revision: 0 }, project });
+    const project = vi.fn(({ currentRows }: { readonly currentRows: readonly Row[] }) => ({ rows: currentRows.map((row) => ({ ...row, name: row.name + '+pending' })), resultKeys: currentRows.map(({ id }) => 'row:' + id) }));
+    const overlay: CreateOptimisticOverlay<Query, Row> = () => ({ sourceId: 'source:one', sourceBasis: { incarnation: 'one', revision: 0 }, projectRows: project });
     let commit: ReturnType<typeof useCommit> | undefined;
     let latest: ReactObserverSnapshot<Row> | undefined;
     const Consumer = () => { commit = useCommit(); latest = useQuery(plan); return null; };
-    const renderer = await mount(createElement(TarstateProvider, { database, commit: () => new Promise<CommitReceipt>(() => undefined), optimisticOverlay: overlay }, createElement(Consumer)));
+    const renderer = await mount(createElement(TarstateProvider, { database, executeCommit: () => new Promise<CommitReceipt>(() => undefined), createOptimisticOverlay: overlay }, createElement(Consumer)));
     await act(() => { void commit?.(transactionAttempt()); });
     expect(latest).toHaveProperty('optimistic');
     const oldObserver = database.observers[0];
@@ -467,7 +472,7 @@ describe('@tarstate/react', () => {
 
     let remounted: ReactObserverSnapshot<Row> | undefined;
     const Remounted = () => { remounted = useQuery(plan); return null; };
-    await mount(createElement(TarstateProvider, { database, optimisticOverlay: overlay }, createElement(Remounted)));
+    await mount(createElement(TarstateProvider, { database, createOptimisticOverlay: overlay }, createElement(Remounted)));
     expect(remounted).toMatchObject({ state: 'open', current: { rows: [{ id: 1, name: 'one' }] } });
     expect(remounted).not.toHaveProperty('optimistic');
     expect(database.closeCount).toBe(0);
@@ -499,9 +504,9 @@ const commitReceipt = (outcome: CommitReceipt['outcome'] = 'committed'): CommitR
   issues: []
 });
 
-const optimisticNames = (suffix: string): OptimisticOverlayFactory<Query, Row> => () => ({
+const optimisticNames = (suffix: string): CreateOptimisticOverlay<Query, Row> => () => ({
   sourceId: 'source:one',
   sourceBasis: { incarnation: 'one', revision: 0 },
-  appliesTo: ({ plan: candidate }) => candidate.planId === plan.planId,
-  project: ({ rows, resultKeys }) => ({ rows: rows.map((row) => ({ ...row, name: row.name + '+' + suffix })), resultKeys })
+  appliesToQuery: ({ plan: candidate }) => candidate.planId === plan.planId,
+  projectRows: ({ currentRows, currentResultKeys }) => ({ rows: currentRows.map((row) => ({ ...row, name: row.name + '+' + suffix })), resultKeys: currentResultKeys })
 });

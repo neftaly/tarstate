@@ -27,8 +27,8 @@ describe('Automerge system relations', () => {
     const state = new AutomergeSystemRelationState('attachment:one');
     const listener = vi.fn();
     state.subscribe(listener);
-    state.apply({ kind: 'remote-heads', documentId: 'document:one', storageId: 'storage:one', heads: ['b', 'a', 'a'], timestamp: 1 });
-    expect(state.getSnapshot().sync).toEqual([expect.objectContaining({ heads: ['a', 'b'], state: 'synced' })]);
+    state.apply({ kind: 'remote-heads-observed', documentId: 'document:one', storageId: 'storage:one', heads: ['b', 'a', 'a'], observedAt: 1 });
+    expect(state.getSnapshot().sync).toEqual([expect.objectContaining({ heads: ['a', 'b'], state: 'observed' })]);
     expect(state.getSnapshot().sync[0]).not.toHaveProperty('peerId');
 
     state.apply({
@@ -55,7 +55,7 @@ describe('Automerge system relations', () => {
   });
 
   it('retains explicit peer correlation and all normalized sync lifecycle states', () => {
-    const states = ['offline', 'idle', 'syncing', 'synced', 'error'] as const;
+    const states = ['observed', 'offline', 'idle', 'syncing', 'synced', 'error'] as const;
     for (const [index, syncState] of states.entries()) {
       const row = materializeAutomergeSyncRow({
         attachmentId: 'attachment:one',
@@ -76,6 +76,26 @@ describe('Automerge system relations', () => {
     expect(state.getSnapshot().sync[0]).toMatchObject({ state: 'syncing', peerId: 'peer:explicit' });
     state.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'idle', observedAt: 9 });
     expect(state.getSnapshot().sync[0]).toMatchObject({ state: 'syncing', observedAt: 10 });
+  });
+
+  it('rejects contradictory equal-time evidence instead of depending on arrival order', () => {
+    const first = new AutomergeSystemRelationState('attachment:one');
+    first.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'syncing', observedAt: 10 });
+    expect(() => first.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'synced', observedAt: 10 })).toThrow(/Ambiguous sync.*observedAt 10/);
+    expect(first.getSnapshot().sync[0]).toMatchObject({ state: 'syncing' });
+
+    const reversed = new AutomergeSystemRelationState('attachment:one');
+    reversed.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'synced', observedAt: 10 });
+    expect(() => reversed.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'syncing', observedAt: 10 })).toThrow(/Ambiguous sync.*observedAt 10/);
+    expect(reversed.getSnapshot().sync[0]).toMatchObject({ state: 'synced' });
+
+    const peer = new AutomergeSystemRelationState('attachment:one');
+    peer.apply({ kind: 'peer-observed', peerId: 'peer:one', observedAt: 3 });
+    expect(() => peer.apply({ kind: 'peer-disconnected', peerId: 'peer:one', observedAt: 3 })).toThrow(/Ambiguous peer.*observedAt 3/);
+
+    const presence = new AutomergeSystemRelationState('attachment:one');
+    presence.apply({ kind: 'presence-set', peerId: 'peer:one', channel: 'cursor', origin: 'observed', value: null, observedAt: 4 });
+    expect(() => presence.apply({ kind: 'presence-stop', peerId: 'peer:one', observedAt: 4, reason: 'goodbye' })).toThrow(/Ambiguous presence.*observedAt 4/);
   });
 
   it('tracks presence by peer and channel with explicit local/observed and stop/expiry evidence', () => {

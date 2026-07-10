@@ -1,7 +1,7 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  AutomergeMapStorageBinding,
+  AutomergeMapProjectionPlanner,
   AutomergeSourceRuntime,
   automergeBasis,
   exactAutomergeBasisEqual,
@@ -85,7 +85,7 @@ describe('production Automerge adapter', () => {
     right = Automerge.change(right, { time: 0 }, (draft) => { draft.tasks.same = { title: 'Right' }; });
     const merged = Automerge.merge(left, right);
     const snapshot = snapshotAutomergeDocument('source:tasks', merged);
-    const binding = new AutomergeMapStorageBinding<TaskDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>({
+    const binding = new AutomergeMapProjectionPlanner<TaskDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>({
       relationId: 'relation:tasks', collectionPath: ['tasks'], missingCollection: 'invalid', keySource: 'map-key'
     });
     const projection = binding.project(snapshot);

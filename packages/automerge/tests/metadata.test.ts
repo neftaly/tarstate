@@ -16,7 +16,7 @@ import {
   readAutomergeMetadata
 } from '../src/metadata.js';
 import { AutomergeSourceRuntime, automergeBasis } from '../src/source.js';
-import { AutomergeMapStorageBinding, snapshotAutomergeDocument } from '../src/storage-binding.js';
+import { AutomergeMapProjectionPlanner, snapshotAutomergeDocument } from '../src/storage-binding.js';
 import { projectAutomergeFacts } from '../src/projection.js';
 
 type MetadataDoc = {
@@ -214,7 +214,7 @@ describe('Automerge bootstrap metadata', () => {
 
   it('keeps reserved metadata out of bindings and facts and rejects direct writes', () => {
     const doc = docFrom({ app: { value: 'visible' }, __tarstateMetaV1: carrier(), __tarstateMetaV2: { future: true } });
-    const binding = new AutomergeMapStorageBinding<MetadataDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>({
+    const binding = new AutomergeMapProjectionPlanner<MetadataDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>({
       relationId: 'relation:root', collectionPath: [], missingCollection: 'invalid', keySource: 'map-key'
     });
     const snapshot = snapshotAutomergeDocument('source:metadata', doc);

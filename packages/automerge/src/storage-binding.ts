@@ -26,7 +26,7 @@ export type AutomergeRelationProjection<Row extends Readonly<Record<string, Json
   readonly issues: readonly AutomergeProjectionIssue[];
 };
 
-export type AutomergeMapBindingOptions<Row extends Readonly<Record<string, JsonValue>>> = {
+export type AutomergeMapProjectionPlannerOptions<Row extends Readonly<Record<string, JsonValue>>> = {
   readonly relationId: string;
   readonly collectionPath: AutomergePath;
   readonly missingCollection: 'empty' | 'invalid';
@@ -57,11 +57,11 @@ export type AutomergeEditPlan<T extends object> = {
 };
 
 /** A pure map-collection binding. It never subscribes or commits. */
-export class AutomergeMapStorageBinding<T extends object, Row extends Readonly<Record<string, JsonValue>>> {
+export class AutomergeMapProjectionPlanner<T extends object, Row extends Readonly<Record<string, JsonValue>>> {
   readonly relationId: string;
-  readonly #options: AutomergeMapBindingOptions<Row>;
+  readonly #options: AutomergeMapProjectionPlannerOptions<Row>;
 
-  constructor(options: AutomergeMapBindingOptions<Row>) {
+  constructor(options: AutomergeMapProjectionPlannerOptions<Row>) {
     this.relationId = options.relationId;
     this.#options = options;
   }

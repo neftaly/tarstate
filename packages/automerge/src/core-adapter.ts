@@ -30,8 +30,8 @@ import {
   type AutomergeSourceCommitResult
 } from './source.js';
 import {
-  AutomergeMapStorageBinding,
-  type AutomergeMapBindingOptions,
+  AutomergeMapProjectionPlanner,
+  type AutomergeMapProjectionPlannerOptions,
   type AutomergeProjectedRow,
   type AutomergePropertyEdit,
   valueAtAutomergePath
@@ -260,35 +260,35 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   }
 }
 
-export type AutomergeCoreMapBindingOptions<Row extends Readonly<Record<string, JsonValue>>> = AutomergeMapBindingOptions<Row> & {
+export type AutomergeMapStorageBindingOptions<Row extends Readonly<Record<string, JsonValue>>> = AutomergeMapProjectionPlannerOptions<Row> & {
   readonly id?: string;
 };
 
 /** Core StorageBinding facade over the proven pure Automerge map binding. */
-export class AutomergeCoreMapStorageBinding<T extends object, Row extends Readonly<Record<string, JsonValue>>>
-implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, never, AutomergeProjectedRow<Row>> {
+export class AutomergeMapStorageBinding<T extends object, Row extends Readonly<Record<string, JsonValue>>>
+implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, AutomergeProjectedRow<Row>> {
   readonly id: string;
   readonly declaredReadFootprint: AutomergePathFootprint;
   readonly declaredWriteFootprint: AutomergePathFootprint;
   readonly #relationId: string;
   readonly #collectionPath: AutomergePath;
-  readonly #keySource: AutomergeCoreMapBindingOptions<Row>['keySource'];
-  readonly #binding: AutomergeMapStorageBinding<T, Row>;
+  readonly #keySource: AutomergeMapStorageBindingOptions<Row>['keySource'];
+  readonly #projectionPlanner: AutomergeMapProjectionPlanner<T, Row>;
 
-  constructor(options: AutomergeCoreMapBindingOptions<Row>) {
+  constructor(options: AutomergeMapStorageBindingOptions<Row>) {
     this.id = options.id ?? 'automerge-map:' + options.relationId;
     this.#relationId = options.relationId;
     this.#collectionPath = Object.freeze([...options.collectionPath]);
     this.#keySource = options.keySource;
     this.declaredReadFootprint = automergePathFootprint([{ scope: 'subtree', path: this.#collectionPath }]);
     this.declaredWriteFootprint = this.declaredReadFootprint;
-    this.#binding = new AutomergeMapStorageBinding(options);
+    this.#projectionPlanner = new AutomergeMapProjectionPlanner(options);
   }
 
   project = (snapshot: SourceSnapshot<Automerge.Doc<T>>): ProjectionResult<AutomergeProjectedRow<Row>> => {
     const adapted = readyAutomergeSnapshot(snapshot);
     if (adapted === undefined) return { rows: [], completeness: 'unknown', issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
-    const projection = this.#binding.project(adapted);
+    const projection = this.#projectionPlanner.project(adapted);
     return {
       rows: projection.rows,
       completeness: projection.completeness,
@@ -302,19 +302,19 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, never, Au
     if (relevant.length === 0) return { readFootprint: empty, writeFootprint: empty, intents: [], issues: [] };
     const adapted = readyAutomergeSnapshot(snapshot);
     if (adapted === undefined) return { readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
-    const projection = this.#binding.project(adapted);
+    const projection = this.#projectionPlanner.project(adapted);
     const resolvesOnly = relevant.every(({ kind }) => kind === 'conflict-resolve');
     const issues: Issue[] = projection.issues
       .filter((issue) => !resolvesOnly || (issue.code !== 'automerge.map_key_conflict' && issue.code !== 'automerge.logical_key_ambiguous'))
       .map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'plan'));
     const intents: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> }[] = [];
     const addPropertyEdit = (edit: AutomergePropertyEdit): void => {
-      const planned = this.#binding.plan(adapted, [edit]);
+      const planned = this.#projectionPlanner.plan(adapted, [edit]);
       issues.push(...planned.issues.map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'plan')));
       if (planned.issues.length === 0 && planned.commands[0] !== undefined && planned.footprints[0] !== undefined) {
         intents.push({ footprint: automergePathFootprint([{ scope: 'exact', path: planned.footprints[0].path }]), command: planned.commands[0] });
       } else if (planned.issues.length === 0) {
-        issues.push(adapterIssue('automerge.planner_invariant_failed', 'plan', snapshot.sourceId, this.#relationId, undefined, { edit: edit.kind }));
+        throw new TypeError('Automerge property planner returned no command or footprint for ' + edit.kind);
       }
     };
     for (const edit of relevant) {

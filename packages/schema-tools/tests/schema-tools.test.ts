@@ -16,7 +16,7 @@ import {
   safeParseIssueCodeCatalog,
   safePrepareSchemaArtifact,
   schemaToolsIssueDeclarations,
-  type AuthorityFilteredDatabaseDescriptionInput,
+  type DatabaseDescriptionSnapshot,
   type DatabaseDescriptionBudget
 } from '../src/index.js';
 
@@ -53,7 +53,7 @@ const schemaBody = (reverse = false): SchemaBody => {
 
 const schemaArtifact = async (reverse = false) => sealArtifact({ kind: 'schema', id: 'urn:test:leaderboard', body: schemaBody(reverse) as unknown as JsonValue });
 
-const databaseInput = async (): Promise<AuthorityFilteredDatabaseDescriptionInput> => {
+const databaseInput = async (): Promise<DatabaseDescriptionSnapshot> => {
   const schema = await schemaArtifact();
   const catalog = await createIssueCodeCatalogArtifact();
   return {
@@ -62,7 +62,7 @@ const databaseInput = async (): Promise<AuthorityFilteredDatabaseDescriptionInpu
       dataset: { datasetId: 'dataset:visible', revision: 3 },
       attachments: [{ attachmentId: 'attachment:visible', sourceId: 'source:visible', basis: { incarnation: 'one', revision: 8 } }]
     },
-    datasets: [{ datasetId: 'dataset:visible', revision: 3, state: 'settled', attachmentIds: ['attachment:visible'] }],
+    datasets: [{ datasetId: 'dataset:visible', revision: 3, state: 'settled', attachmentIds: ['attachment:visible', 'attachment:visible'] }],
     relations: [{
       schema: { id: schema.id, contentHash: schema.contentHash, locations: ['https://physical.example/schema'] },
       relationId: 'urn:test:players',
@@ -136,6 +136,7 @@ describe('database descriptions', () => {
   it('normalizes visible facts, strips locations, computes an exact fingerprint, and round-trips', async () => {
     const description = await describeDatabase(await databaseInput());
     expect(description.kind).toBe('tarstate.database-description');
+    expect(description.datasets[0]?.attachmentIds).toEqual(['attachment:visible']);
     expect(description.relations[0]).toMatchObject({ schema: { id: 'urn:test:leaderboard' }, editCapabilities: [edit] });
     expect(description.relations[0]?.schema).not.toHaveProperty('locations');
     expect(Object.isFrozen(description)).toBe(true);
@@ -148,11 +149,11 @@ describe('database descriptions', () => {
 
   it('describes a database through its explicit authority-filtered snapshot seam', async () => {
     const input = await databaseInput();
-    const description = await describeDatabase({ databaseDescriptionInput: () => input });
+    const description = await describeDatabase({ getDatabaseDescriptionSnapshot: () => input });
     expect(description).toMatchObject({ kind: 'tarstate.database-description', basis: input.basis });
-    await expect(describeDatabase({ databaseDescriptionInput: () => undefined })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
-    await expect(describeDatabase({ databaseDescriptionInput: () => { throw new Error('host failed'); } })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
-    await expect(describeDatabase({ databaseDescriptionInput: () => ({ ...input, basis: null }) })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_invalid' }] });
+    await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => undefined })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
+    await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => { throw new Error('host failed'); } })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
+    await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => ({ ...input, basis: null }) })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_invalid' }] });
   });
 
   it('rejects tampering, hidden physical fields, duplicate JSON members, and bounded overflow', async () => {
@@ -174,7 +175,7 @@ describe('database descriptions', () => {
       maxRelations: 100,
       maxCommands: 10,
       maxCapabilities: 100,
-      maxAttachmentIds: 100
+      maxAttachmentReferences: 100
     };
     await expect(safeParseDatabaseDescription(description, budget)).resolves.toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded', details: { budget: 'maxDatasets' } }] });
   });

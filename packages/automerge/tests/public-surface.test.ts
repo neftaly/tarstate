@@ -5,8 +5,8 @@ describe('production Automerge surface', () => {
   it('exports source, projection, binding, and metadata implementations', () => {
     expect(automerge.AutomergeSourceRuntime).toBeTypeOf('function');
     expect(automerge.AutomergeAtomicSource).toBeTypeOf('function');
+    expect(automerge.AutomergeMapProjectionPlanner).toBeTypeOf('function');
     expect(automerge.AutomergeMapStorageBinding).toBeTypeOf('function');
-    expect(automerge.AutomergeCoreMapStorageBinding).toBeTypeOf('function');
     expect(automerge.readAutomergeMetadata).toBeTypeOf('function');
     expect(automerge.planAutomergeMetadataMutation).toBeTypeOf('function');
     expect(automerge.automergeIssueDeclarations.length).toBeGreaterThan(0);

@@ -8,7 +8,7 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource,
-  AutomergeCoreMapStorageBinding,
+  AutomergeMapStorageBinding,
   AutomergeSourceRuntime,
   automergePathFootprint,
   exactAutomergeBasisEqual,
@@ -25,7 +25,7 @@ const baseDoc = (): Automerge.Doc<TaskDoc> => Automerge.from({ tasks: { first: {
 const fixture = (doc = baseDoc()) => {
   const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc });
   const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:one' });
-  const binding = new AutomergeCoreMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>({
+  const binding = new AutomergeMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>({
     id: 'binding:tasks',
     relationId: 'relation:tasks',
     collectionPath: ['tasks'],
@@ -37,7 +37,7 @@ const fixture = (doc = baseDoc()) => {
 
 const selectedEdit = (
   source: AutomergeAtomicSource<TaskDoc>,
-  binding: AutomergeCoreMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>,
+  binding: AutomergeMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>,
   fields: Readonly<Record<string, JsonValue>>
 ): LogicalEdit => {
   const projection = binding.project(source.snapshot());
@@ -48,7 +48,7 @@ const selectedEdit = (
 
 const selectedTarget = (
   source: AutomergeAtomicSource<TaskDoc>,
-  binding: AutomergeCoreMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>,
+  binding: AutomergeMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>,
   key = 'first'
 ) => {
   const projection = binding.project(source.snapshot());
@@ -102,7 +102,7 @@ describe('Automerge core source protocols', () => {
 
   it('rejects overlapping binding plans deterministically before the runtime commit', async () => {
     const { runtime, source, binding } = fixture();
-    const overlapping = new AutomergeCoreMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>({
+    const overlapping = new AutomergeMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>({
       id: 'binding:overlapping', relationId: 'relation:tasks', collectionPath: ['tasks'], missingCollection: 'invalid', keySource: 'map-key'
     });
     const runtimeCommit = vi.spyOn(runtime, 'commit');
