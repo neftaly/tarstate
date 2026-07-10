@@ -22,8 +22,7 @@ import {
   type SourceSnapshot,
   type StorageBinding
 } from '@tarstate/core';
-import { valueAtAutomergePath, type AutomergeMovePath } from './move.js';
-import { conflictsAt, type AutomergeProjectionIssue } from './projection.js';
+import { conflictsAt, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import {
   AutomergeSourceRuntime,
   type AutomergeBasis,
@@ -34,12 +33,13 @@ import {
   AutomergeMapStorageBinding,
   type AutomergeMapBindingOptions,
   type AutomergeProjectedRow,
-  type AutomergePropertyEdit
+  type AutomergePropertyEdit,
+  valueAtAutomergePath
 } from './storage-binding.js';
 
 export type AutomergePathFootprintEntry = {
   readonly scope: 'exact' | 'subtree';
-  readonly path: AutomergeMovePath;
+  readonly path: AutomergePath;
 };
 
 export type AutomergePathFootprint = {
@@ -96,8 +96,6 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     this.#unsubscribeRuntime = options.runtime.subscribe((change) => {
       const latest = this.#runtime.snapshot();
       this.#lastReady = { basis: latest.basis, storage: latest.storage };
-      this.#lifecycle = 'ready';
-      this.#lifecycleIssues = Object.freeze([]);
       this.#publish({ beforeBasis: change.beforeBasis, afterBasis: change.afterBasis });
     });
   }
@@ -200,7 +198,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   };
 
   stage = (snapshot: SourceSnapshot<Automerge.Doc<T>>, commands: readonly AutomergeSourceCommand<T>[]): { readonly storage: Automerge.Doc<T>; readonly issues: readonly Issue[] } => {
-    if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { storage: this.#lastReady.storage, issues: [sourceStateIssue(this.sourceId, snapshot.state)] };
+    if (snapshot.state !== 'ready' || snapshot.storage === undefined) throw new TypeError('Cannot stage a non-ready Automerge snapshot');
     try {
       const storage = commands.length === 0
         ? snapshot.storage
@@ -273,7 +271,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, never, Au
   readonly declaredReadFootprint: AutomergePathFootprint;
   readonly declaredWriteFootprint: AutomergePathFootprint;
   readonly #relationId: string;
-  readonly #collectionPath: AutomergeMovePath;
+  readonly #collectionPath: AutomergePath;
   readonly #keySource: AutomergeCoreMapBindingOptions<Row>['keySource'];
   readonly #binding: AutomergeMapStorageBinding<T, Row>;
 
@@ -315,6 +313,8 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, never, Au
       issues.push(...planned.issues.map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'plan')));
       if (planned.issues.length === 0 && planned.commands[0] !== undefined && planned.footprints[0] !== undefined) {
         intents.push({ footprint: automergePathFootprint([{ scope: 'exact', path: planned.footprints[0].path }]), command: planned.commands[0] });
+      } else if (planned.issues.length === 0) {
+        issues.push(adapterIssue('automerge.planner_invariant_failed', 'plan', snapshot.sourceId, this.#relationId, undefined, { edit: edit.kind }));
       }
     };
     for (const edit of relevant) {
@@ -407,7 +407,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, never, Au
         issues.push(unsupportedEditIssue(snapshot.sourceId, this.#relationId, builtInCapabilityRefs.rekey, 'rekey_requires_reference_aware_lowering'));
       } else if (edit.kind === 'move-relocate') {
         const capability = edit.mode === 'identity-preserving' ? builtInCapabilityRefs.identityPreservingMove : builtInCapabilityRefs.copyRelocate;
-        issues.push(unsupportedEditIssue(snapshot.sourceId, this.#relationId, capability, 'move_requires_auditable_operation_identity_and_receipt'));
+        issues.push(unsupportedEditIssue(snapshot.sourceId, this.#relationId, capability, 'automerge_move_unsupported'));
+      } else {
+        assertNever(edit);
       }
     }
     const writeFootprint = automergePathFootprint(intents.flatMap(({ footprint }) => footprint.entries));
@@ -488,7 +490,7 @@ const parseFootprint = (value: Footprint): readonly AutomergePathFootprintEntry[
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
     const entry = raw as { readonly scope?: unknown; readonly path?: unknown };
     if ((entry.scope !== 'exact' && entry.scope !== 'subtree') || !Array.isArray(entry.path) || entry.path.some((part) => typeof part !== 'string' && typeof part !== 'number')) return undefined;
-    entries.push({ scope: entry.scope, path: entry.path as AutomergeMovePath });
+    entries.push({ scope: entry.scope, path: entry.path as AutomergePath });
   }
   return normalizeFootprintEntries(entries);
 };
@@ -515,10 +517,10 @@ const entriesIntersect = (left: AutomergePathFootprintEntry, right: AutomergePat
   return pathStartsWith(exact.path, subtree.path);
 };
 
-const pathStartsWith = (path: AutomergeMovePath, prefix: AutomergeMovePath): boolean =>
+const pathStartsWith = (path: AutomergePath, prefix: AutomergePath): boolean =>
   prefix.length <= path.length && prefix.every((part, index) => Object.is(part, path[index]));
 
-const samePath = (left: AutomergeMovePath, right: AutomergeMovePath): boolean =>
+const samePath = (left: AutomergePath, right: AutomergePath): boolean =>
   left.length === right.length && pathStartsWith(left, right);
 
 const samePortable = (left: unknown, right: unknown): boolean => {
@@ -533,10 +535,11 @@ const mapKeyFromLogicalKey = (key: JsonValue): string | undefined =>
 const validSplice = (index: number, deleteCount: number, length: number): boolean =>
   Number.isSafeInteger(index) && Number.isSafeInteger(deleteCount) && index >= 0 && deleteCount >= 0 && index <= length && index + deleteCount <= length;
 
-const firstConflictPath = (doc: object, path: AutomergeMovePath): AutomergeMovePath | undefined => {
+const firstConflictPath = (doc: object, path: AutomergePath): AutomergePath | undefined => {
   for (let index = 0; index < path.length; index += 1) {
     const owner = valueAtAutomergePath(doc, path.slice(0, index));
     if (owner === null || typeof owner !== 'object') return undefined;
+    if (Array.isArray(owner)) continue;
     if (conflictsAt(owner, path[index]!).length > 1) return path.slice(0, index + 1);
   }
   return undefined;
@@ -556,6 +559,8 @@ const copyPortableValue = (value: JsonValue): JsonValue => {
   if (Array.isArray(value)) return value.map(copyPortableValue);
   return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, copyPortableValue(child)]));
 };
+
+const assertNever = (value: never): never => { throw new TypeError('Unsupported Automerge edit: ' + String(value)); };
 
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 

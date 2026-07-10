@@ -304,7 +304,7 @@ export const runProbabilityGolden = (): GoldenWorkloadTrace => {
       beforeRows: before.rows,
       afterRows: after.rows,
       sceneParent: 'column-2',
-      moveMechanism: 'copyRelocate',
+      moveMechanism: 'application-parent-field',
       stableLogicalReference: 'label-1',
       externalStoreRevision: committed.outcome === 'committed' ? committed.afterBasis.revision : null,
       crossSourceAtomic: false

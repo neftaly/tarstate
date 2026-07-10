@@ -159,6 +159,15 @@ describe('@tarstate/react', () => {
     expect(database.closeCount).toBe(0);
   });
 
+  it('uses collision-safe canonical observation keys', async () => {
+    const database = new TestDatabase();
+    const first = { ...plan, planId: 'query\u0000all', rootNodeId: 'root' };
+    const second = { ...plan, planId: 'query', rootNodeId: 'all\u0000root' };
+    const Consumer = () => { useQuery(first); useQuery(second); return null; };
+    await mount(createElement(TarstateProvider, { database }, createElement(Consumer)));
+    expect(database.observers).toHaveLength(2);
+  });
+
   it('suppresses selected renders on basis-only changes while full snapshots still update', async () => {
     const database = new TestDatabase();
     const selected: string[] = [];
@@ -295,6 +304,55 @@ describe('@tarstate/react', () => {
     });
   });
 
+  it('retains optimistic factory errors without blocking the real commit', async () => {
+    const database = new TestDatabase();
+    const commitImplementation = vi.fn(async () => commitReceipt());
+    const states: MutationState[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); states.push(useMutationState()); return null; };
+    await mount(createElement(TarstateProvider, {
+      database,
+      commit: commitImplementation,
+      optimisticOverlay: () => { throw new TypeError('cannot project this attempt'); }
+    }, createElement(Consumer)));
+
+    await act(async () => { await commit?.(transactionAttempt()); });
+    expect(commitImplementation).toHaveBeenCalledTimes(1);
+    expect(states.at(-1)).toMatchObject({
+      pendingCount: 0,
+      mutations: [{ state: 'settled', optimisticError: { phase: 'factory', name: 'TypeError', message: 'cannot project this attempt' } }]
+    });
+  });
+
+  it.each([
+    ['appliesTo', (() => ({
+      sourceId: 'source:one', sourceBasis: { revision: 0 },
+      appliesTo: () => { throw new Error('broken applicability'); },
+      project: ({ rows, resultKeys }) => ({ rows, resultKeys })
+    })) satisfies OptimisticOverlayFactory<Query, Row>],
+    ['project', (() => ({
+      sourceId: 'source:one', sourceBasis: { revision: 0 },
+      project: () => { throw new Error('broken projection'); }
+    })) satisfies OptimisticOverlayFactory<Query, Row>],
+    ['result', (() => ({
+      sourceId: 'source:one', sourceBasis: { revision: 0 },
+      project: () => ({ rows: [], resultKeys: ['orphan'] })
+    })) satisfies OptimisticOverlayFactory<Query, Row>]
+  ] as const)('throws explicit optimistic %s failures and rolls back the overlay', async (phase, optimisticOverlay) => {
+    const database = new TestDatabase();
+    const commitImplementation = vi.fn(async () => commitReceipt());
+    let commit: ReturnType<typeof useCommit> | undefined;
+    let latest: ReactObserverSnapshot<Row> | undefined;
+    const Consumer = () => { commit = useCommit(); latest = useQuery(plan); return null; };
+    await mount(createElement(TarstateProvider, { database, commit: commitImplementation, optimisticOverlay }, createElement(Consumer)));
+
+    await act(async () => {
+      await expect(commit?.(transactionAttempt())).rejects.toThrow('Optimistic overlay ' + phase + ' failed');
+    });
+    expect(commitImplementation).not.toHaveBeenCalled();
+    expect(latest).not.toHaveProperty('optimistic');
+  });
+
   it('recomputes the overlay as a rebase when a newer source basis arrives', async () => {
     const database = new TestDatabase();
     const commitImplementation = () => new Promise<CommitReceipt>(() => undefined);
@@ -342,6 +400,49 @@ describe('@tarstate/react', () => {
     expect(snapshots.at(-1)).toMatchObject({ state: 'open', current: { rows: [{ id: 1, name: 'one' }] } });
     expect(snapshots.at(-1)).not.toHaveProperty('optimistic');
     expect(database.observers[0]?.getSnapshot()).toBe(database.snapshot);
+  });
+
+  it('discards the overlay when commit throws and records the failed mutation', async () => {
+    const database = new TestDatabase();
+    let rejectCommit: ((error: Error) => void) | undefined;
+    const states: MutationState[] = [];
+    const snapshots: ReactObserverSnapshot<Row>[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); states.push(useMutationState()); snapshots.push(useQuery(plan)); return null; };
+    await mount(createElement(TarstateProvider, {
+      database,
+      commit: () => new Promise<CommitReceipt>((_resolve, reject) => { rejectCommit = reject; }),
+      optimisticOverlay: optimisticNames('pending')
+    }, createElement(Consumer)));
+    let result: Promise<CommitReceipt> | undefined;
+    await act(() => { result = commit?.(transactionAttempt()); });
+    expect(snapshots.at(-1)).toHaveProperty('optimistic');
+
+    await act(async () => {
+      rejectCommit?.(new Error('commit transport failed'));
+      await expect(result).rejects.toThrow('commit transport failed');
+    });
+    expect(snapshots.at(-1)).not.toHaveProperty('optimistic');
+    expect(states.at(-1)).toMatchObject({ pendingCount: 0, mutations: [{ state: 'failed', error: { message: 'commit transport failed' } }] });
+  });
+
+  it('rejects mismatched receipt identity and discards the overlay', async () => {
+    const database = new TestDatabase();
+    const states: MutationState[] = [];
+    const snapshots: ReactObserverSnapshot<Row>[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); states.push(useMutationState()); snapshots.push(useQuery(plan)); return null; };
+    await mount(createElement(TarstateProvider, {
+      database,
+      commit: async () => ({ ...commitReceipt(), operationId: 'operation:other' }),
+      optimisticOverlay: optimisticNames('pending')
+    }, createElement(Consumer)));
+
+    await act(async () => {
+      await expect(commit?.(transactionAttempt())).rejects.toThrow('Commit receipt identity does not match');
+    });
+    expect(snapshots.at(-1)).not.toHaveProperty('optimistic');
+    expect(states.at(-1)).toMatchObject({ pendingCount: 0, mutations: [{ state: 'failed', error: { message: 'Commit receipt identity does not match its transaction attempt' } }] });
   });
 
   it('drops overlays with the owning provider runtime without owning observer or database lifecycle', async () => {

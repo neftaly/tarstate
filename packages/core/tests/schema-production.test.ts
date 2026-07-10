@@ -119,6 +119,11 @@ describe('production JSON-tree storage mappings', () => {
     expect(projection.relations.get('test.note')?.rows).toHaveLength(2);
     expect(projection.completeness).toBe('unknown');
 
+    const hostile = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error('inspection failed'); } });
+    const hostileProjection = projectStorage(compiled.value, hostile, registry, 'source:test');
+    expect(hostileProjection.completeness).toBe('unknown');
+    expect(hostileProjection.issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'mapping.collection_invalid', details: { reason: 'inspection_failed', error: 'Error' } })]));
+
     const plan = planStoragePatch(compiled.value, snapshot, 'test.user', { kind: 'object-map-key', key: 'alice' }, { nickname: 'Al' }, undefined, 'source:test');
     expect(plan).toMatchObject({ success: true, value: { intents: [{ path: ['users', 'alice', 'profile', 'nickname'] }] } });
     if (!plan.success) throw new Error('plan failed');

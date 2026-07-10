@@ -1,10 +1,8 @@
 import * as Automerge from '@automerge/automerge';
-import type { JsonValue } from '@tarstate/core';
-import { conflictsAt, normalizeAutomergeValue, type AutomergeProjectionIssue } from './projection.js';
-import { valueAtAutomergePath, type AutomergeMovePath } from './move.js';
+import { canonicalizeJson, type JsonValue } from '@tarstate/core';
+import { conflictsAt, normalizeAutomergeValue, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import { isAutomergeReservedRootProperty } from './reserved.js';
 import { automergeBasis, type AutomergeBasis, type AutomergeSnapshot, type AutomergeSourceCommand } from './source.js';
-import { canonicalAutomergeJson } from './wire.js';
 
 export type AutomergeRowLocator = {
   readonly namespace: string;
@@ -17,7 +15,7 @@ export type AutomergeProjectedRow<Row extends Readonly<Record<string, JsonValue>
   readonly key: readonly [JsonValue, ...JsonValue[]];
   readonly fields: Row;
   readonly locator: AutomergeRowLocator;
-  readonly storagePath: AutomergeMovePath;
+  readonly storagePath: AutomergePath;
   readonly conflictChangeHash?: string;
 };
 
@@ -30,23 +28,23 @@ export type AutomergeRelationProjection<Row extends Readonly<Record<string, Json
 
 export type AutomergeMapBindingOptions<Row extends Readonly<Record<string, JsonValue>>> = {
   readonly relationId: string;
-  readonly collectionPath: AutomergeMovePath;
+  readonly collectionPath: AutomergePath;
   readonly missingCollection: 'empty' | 'invalid';
   readonly keySource: 'map-key' | { readonly field: string };
   readonly locatorNamespace?: string;
-  readonly parse?: (candidate: unknown, context: { readonly mapKey: string; readonly path: AutomergeMovePath }) =>
+  readonly parse?: (candidate: unknown, context: { readonly mapKey: string; readonly path: AutomergePath }) =>
     | { readonly success: true; readonly row: Row }
     | { readonly success: false; readonly issue: AutomergeProjectionIssue };
 };
 
 export type AutomergePropertyEdit =
-  | { readonly kind: 'replace'; readonly path: AutomergeMovePath; readonly value: unknown }
-  | { readonly kind: 'delete'; readonly path: AutomergeMovePath }
-  | { readonly kind: 'counter-increment'; readonly path: AutomergeMovePath; readonly by: number }
-  | { readonly kind: 'text-splice'; readonly path: AutomergeMovePath; readonly index: number; readonly deleteCount: number; readonly value: string }
+  | { readonly kind: 'replace'; readonly path: AutomergePath; readonly value: unknown }
+  | { readonly kind: 'delete'; readonly path: AutomergePath }
+  | { readonly kind: 'counter-increment'; readonly path: AutomergePath; readonly by: number }
+  | { readonly kind: 'text-splice'; readonly path: AutomergePath; readonly index: number; readonly deleteCount: number; readonly value: string }
   | {
       readonly kind: 'conflict-resolve';
-      readonly path: AutomergeMovePath;
+      readonly path: AutomergePath;
       readonly observedChangeHashes: readonly string[];
       readonly selectedChangeHash: string;
     };
@@ -54,7 +52,7 @@ export type AutomergePropertyEdit =
 export type AutomergeEditPlan<T extends object> = {
   readonly basis: AutomergeBasis;
   readonly commands: readonly AutomergeSourceCommand<T>[];
-  readonly footprints: readonly { readonly kind: 'exact-path'; readonly path: AutomergeMovePath }[];
+  readonly footprints: readonly { readonly kind: 'exact-path'; readonly path: AutomergePath }[];
   readonly issues: readonly AutomergeProjectionIssue[];
 };
 
@@ -103,11 +101,17 @@ export class AutomergeMapStorageBinding<T extends object, Row extends Readonly<R
           issues.push({ code: 'automerge.row_key_invalid', path });
           continue;
         }
+        const locator = locatorFor(collection, mapKey, candidate, changeHash, this.#options.locatorNamespace ?? 'automerge-object');
+        if (locator === undefined) {
+          incomplete = true;
+          issues.push({ code: 'automerge.row_identity_unavailable', path });
+          continue;
+        }
         rows.push({
           relationId: this.relationId,
           key: [key],
           fields: parsed.row,
-          locator: locatorFor(collection, mapKey, candidate, changeHash, this.#options.locatorNamespace ?? 'automerge-object'),
+          locator,
           storagePath: path,
           ...(changeHash === '' ? {} : { conflictChangeHash: changeHash })
         });
@@ -127,7 +131,7 @@ export class AutomergeMapStorageBinding<T extends object, Row extends Readonly<R
   plan(snapshot: AutomergeSnapshot<T>, edits: readonly AutomergePropertyEdit[]): AutomergeEditPlan<T> {
     const commands: AutomergeSourceCommand<T>[] = [];
     const issues: AutomergeProjectionIssue[] = [];
-    const footprints: { readonly kind: 'exact-path'; readonly path: AutomergeMovePath }[] = [];
+    const footprints: { readonly kind: 'exact-path'; readonly path: AutomergePath }[] = [];
     for (const edit of edits) {
       footprints.push({ kind: 'exact-path', path: [...edit.path] });
       const rootProperty = edit.path[0];
@@ -142,7 +146,7 @@ export class AutomergeMapStorageBinding<T extends object, Row extends Readonly<R
     return { basis: snapshot.basis, commands: issues.length === 0 ? commands : [], footprints, issues };
   }
 
-  #parse(candidate: unknown, mapKey: string, path: AutomergeMovePath):
+  #parse(candidate: unknown, mapKey: string, path: AutomergePath):
     | { readonly success: true; readonly row: Row }
     | { readonly success: false; readonly issue: AutomergeProjectionIssue } {
     if (this.#options.parse !== undefined) {
@@ -178,12 +182,12 @@ export const planPropertyEdit = <T extends object>(
   const property = edit.path[edit.path.length - 1] as string | number;
   const parent = valueAtAutomergePath(doc, parentPath);
   if (parent === null || typeof parent !== 'object') return { issue: { code: 'automerge.edit_parent_missing', path: parentPath } };
-  const alternatives = conflictsAt(parent, property);
+  const alternatives = Array.isArray(parent) ? [] : conflictsAt(parent, property);
 
   if (edit.kind === 'conflict-resolve') {
     const observed = [...edit.observedChangeHashes].sort();
     const actual = alternatives.map(([changeHash]) => changeHash).sort();
-    if (actual.length < 2 || canonicalAutomergeJson(actual) !== canonicalAutomergeJson(observed)) {
+    if (actual.length < 2 || canonicalizeJson(actual) !== canonicalizeJson(observed)) {
       return { issue: { code: 'transaction.conflict_observation_stale', path: edit.path, details: { observed, actual } } };
     }
     const selected = alternatives.find(([changeHash]) => changeHash === edit.selectedChangeHash);
@@ -224,8 +228,9 @@ export const planPropertyEdit = <T extends object>(
       }
     };
   }
+  if (edit.kind !== 'text-splice') return assertNever(edit);
   const current = valueAtAutomergePath(doc, edit.path);
-  if (typeof current !== 'string' || edit.index < 0 || edit.deleteCount < 0) return { issue: { code: 'automerge.text_edit_invalid', path: edit.path } };
+  if (typeof current !== 'string' || !validSplice(edit.index, edit.deleteCount, current.length)) return { issue: { code: 'automerge.text_edit_invalid', path: edit.path } };
   return {
     command: {
       description: 'splice text',
@@ -236,11 +241,12 @@ export const planPropertyEdit = <T extends object>(
 
 const firstConflictAlongPath = (
   doc: object,
-  path: AutomergeMovePath
-): { readonly path: AutomergeMovePath; readonly alternatives: readonly (readonly [string, unknown])[] } | undefined => {
+  path: AutomergePath
+): { readonly path: AutomergePath; readonly alternatives: readonly (readonly [string, unknown])[] } | undefined => {
   for (let index = 0; index < path.length; index += 1) {
     const owner = valueAtAutomergePath(doc, path.slice(0, index));
     if (owner === null || typeof owner !== 'object') return undefined;
+    if (Array.isArray(owner)) continue;
     const alternatives = conflictsAt(owner, path[index] as string | number);
     if (alternatives.length > 1) return { path: path.slice(0, index + 1), alternatives };
   }
@@ -253,16 +259,18 @@ const locatorFor = (
   candidate: unknown,
   changeHash: string,
   namespace: string
-): AutomergeRowLocator => {
+): AutomergeRowLocator | undefined => {
   const objectId = candidate !== null && typeof candidate === 'object' ? Automerge.getObjectId(candidate) : null;
   if (typeof objectId === 'string') return { namespace, token: objectId, rowIncarnation: objectId };
-  const collectionObjectId = Automerge.getObjectId(collection) ?? '_root';
-  const incarnation = changeHash === '' ? 'visible:' + mapKey : 'change:' + changeHash;
-  return {
-    namespace: namespace + ':map-slot',
-    token: { collectionObjectId, mapKey, candidate: incarnation },
-    rowIncarnation: incarnation
-  };
+  const collectionObjectId = Automerge.getObjectId(collection);
+  if (changeHash !== '' && typeof collectionObjectId === 'string') {
+    return {
+      namespace: namespace + ':conflict',
+      token: { collectionObjectId, mapKey, changeHash },
+      rowIncarnation: changeHash
+    };
+  }
+  return undefined;
 };
 
 const duplicateKeyIssues = <Row extends Readonly<Record<string, JsonValue>>>(
@@ -270,7 +278,7 @@ const duplicateKeyIssues = <Row extends Readonly<Record<string, JsonValue>>>(
 ): readonly AutomergeProjectionIssue[] => {
   const byKey = new Map<string, AutomergeProjectedRow<Row>[]>();
   for (const row of rows) {
-    const key = canonicalAutomergeJson(row.key as JsonValue);
+    const key = canonicalizeJson(row.key as JsonValue);
     const group = byKey.get(key) ?? [];
     group.push(row);
     byKey.set(key, group);
@@ -281,14 +289,14 @@ const duplicateKeyIssues = <Row extends Readonly<Record<string, JsonValue>>>(
   }]);
 };
 
-const setAtPath = (root: unknown, path: AutomergeMovePath, value: unknown): void => {
+const setAtPath = (root: unknown, path: AutomergePath, value: unknown): void => {
   const parent = valueAtAutomergePath(root, path.slice(0, -1));
   if (parent === null || typeof parent !== 'object') throw new Error('Edit parent is missing');
   const property = path[path.length - 1] as string | number;
   (parent as Record<string | number, unknown>)[property] = value;
 };
 
-const deleteAtPath = (root: unknown, path: AutomergeMovePath): void => {
+const deleteAtPath = (root: unknown, path: AutomergePath): void => {
   const parent = valueAtAutomergePath(root, path.slice(0, -1));
   if (parent === null || typeof parent !== 'object') throw new Error('Edit parent is missing');
   const property = path[path.length - 1] as string | number;
@@ -305,4 +313,18 @@ const copyAutomergeValue = (value: unknown): unknown => {
   return value;
 };
 
+export const valueAtAutomergePath = (root: unknown, path: AutomergePath): unknown => {
+  let current = root;
+  for (const part of path) {
+    if (current === null || typeof current !== 'object') return undefined;
+    current = (current as Record<string | number, unknown>)[part];
+  }
+  return current;
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const validSplice = (index: number, deleteCount: number, length: number): boolean =>
+  Number.isSafeInteger(index) && Number.isSafeInteger(deleteCount) && index >= 0 && deleteCount >= 0 && index <= length && index + deleteCount <= length;
+
+const assertNever = (value: never): never => { throw new TypeError('Unsupported Automerge property edit: ' + String(value)); };

@@ -1,6 +1,6 @@
-import { createIssue } from './issues.js';
-import type { SourceSnapshot } from './database.js';
-import type { ContentHash } from './artifacts.js';
+import { createIssue } from '../../src/issues.js';
+import type { SourceSnapshot } from '../../src/database.js';
+import type { ContentHash } from '../../src/artifacts.js';
 import type {
   AtomicSource,
   Footprint,
@@ -10,7 +10,7 @@ import type {
   SourceCommitInput,
   SourceCommitResult,
   SourceOutcomeLookup
-} from './source-protocol.js';
+} from '../../src/source-protocol.js';
 
 export type RestartableBasis = { readonly incarnation: string; readonly revision: number };
 

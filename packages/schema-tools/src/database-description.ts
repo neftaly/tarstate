@@ -92,9 +92,19 @@ export const defaultDatabaseDescriptionBudget: DatabaseDescriptionBudget = {
 
 /** Consumes an already authority-filtered shell snapshot; it performs no grant widening. */
 export const describeDatabase = async (source: AuthorityFilteredDatabaseDescriptionInput | DescribableDatabase, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<DatabaseDescription> => {
-  const input = isDescribableDatabase(source) ? source.databaseDescriptionInput() : source;
-  if (!isDescriptionInput(input)) throw new TarstateParseError([toolIssue('schema_tools.database_description_unavailable', { reason: 'authority_filtered_snapshot_unavailable' })]);
-  const normalized = normalizeDescriptionInput(input);
+  let input: unknown;
+  try {
+    input = isDescribableDatabase(source) ? source.databaseDescriptionInput() : source;
+  } catch (error) {
+    throw new TarstateParseError([toolIssue('schema_tools.database_description_unavailable', {
+      reason: 'authority_filtered_snapshot_failed',
+      error: error instanceof Error ? error.name : typeof error
+    })]);
+  }
+  if (input === undefined) throw new TarstateParseError([toolIssue('schema_tools.database_description_unavailable', { reason: 'authority_filtered_snapshot_unavailable' })]);
+  const parsedInput = safeParseDescriptionInput(input, budget);
+  if (!parsedInput.success) throw new TarstateParseError(parsedInput.issues);
+  const normalized = normalizeDescriptionInput(parsedInput.value);
   const provisional = { kind: 'tarstate.database-description', formatVersion: 1, ...normalized } as const;
   const portable = safeParseJsonValue(provisional, budget);
   if (!portable.success) throw new TarstateParseError(portable.issues);
@@ -170,7 +180,37 @@ const normalizeDescriptionInput = (input: AuthorityFilteredDatabaseDescriptionIn
 });
 
 const isDescribableDatabase = (value: unknown): value is DescribableDatabase => value !== null && typeof value === 'object' && typeof (value as { readonly databaseDescriptionInput?: unknown }).databaseDescriptionInput === 'function';
-const isDescriptionInput = (value: unknown): value is AuthorityFilteredDatabaseDescriptionInput => value !== null && typeof value === 'object' && 'registryFingerprint' in value && 'basis' in value && 'datasets' in value && 'relations' in value && 'commands' in value && 'capabilityImplications' in value && 'issueCodeCatalog' in value;
+
+const safeParseDescriptionInput = (input: unknown, budget: DatabaseDescriptionBudget): ParseResult<AuthorityFilteredDatabaseDescriptionInput> => {
+  const portable = safeParseJsonValue(input, budget);
+  if (!portable.success) return portable;
+  const value = portable.value;
+  if (!isRecord(value) || !exactKeys(value, ['basis', 'capabilityImplications', 'commands', 'datasets', 'issueCodeCatalog', 'registryFingerprint', 'relations']) || !isContentHash(value.registryFingerprint)) return invalid([]);
+  if (!Array.isArray(value.datasets) || !Array.isArray(value.relations) || !Array.isArray(value.commands) || !Array.isArray(value.capabilityImplications)) return invalid([], 'collections');
+  const basis = parseBasis(value.basis);
+  if (!basis.success) return basis;
+  const datasets = parseDatasets(value.datasets);
+  if (!datasets.success) return datasets;
+  const relations = parseRelations(value.relations, true);
+  if (!relations.success) return relations;
+  const commands = parseCommands(value.commands);
+  if (!commands.success) return commands;
+  const implications = parseImplications(value.capabilityImplications);
+  if (!implications.success) return implications;
+  const issueCodeCatalog = parseArtifactRef(value.issueCodeCatalog, ['issueCodeCatalog'], true);
+  if (!issueCodeCatalog.success) return issueCodeCatalog;
+  const parsed: AuthorityFilteredDatabaseDescriptionInput = {
+    registryFingerprint: value.registryFingerprint,
+    basis: basis.value,
+    datasets: datasets.value,
+    relations: relations.value,
+    commands: commands.value,
+    capabilityImplications: implications.value,
+    issueCodeCatalog: issueCodeCatalog.value
+  };
+  const budgetIssue = descriptionBudgetIssue(parsed, budget);
+  return budgetIssue === undefined ? { success: true, value: parsed, issues: [] } : { success: false, issues: [budgetIssue] };
+};
 
 const parseBasis = (value: unknown): ParseResult<DescriptionObservationBasis> => {
   if (!isRecord(value) || !exactKeys(value, ['attachments', 'dataset']) || !isRecord(value.dataset) || !exactKeys(value.dataset, ['datasetId', 'revision']) || typeof value.dataset.datasetId !== 'string' || !isRevision(value.dataset.revision) || !Array.isArray(value.attachments)) return invalid(['basis']);
@@ -201,17 +241,17 @@ const parseDatasets = (values: readonly JsonValue[]): ParseResult<DatabaseDescri
   return { success: true, value: output, issues: [] };
 };
 
-const parseRelations = (values: readonly JsonValue[]): ParseResult<DatabaseDescription['relations']> => {
+const parseRelations = (values: readonly JsonValue[], acceptNormalizableInput = false): ParseResult<DatabaseDescription['relations']> => {
   const output: DatabaseDescription['relations'][number][] = [];
   const identities = new Set<string>();
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
     if (!isRecord(value) || !exactKeys(value, ['attachmentId', 'editCapabilities', 'localName', 'missingCapabilities', 'readable', 'relationId', 'schema']) || typeof value.attachmentId !== 'string' || value.attachmentId.length === 0 || typeof value.localName !== 'string' || value.localName.length === 0 || typeof value.relationId !== 'string' || value.relationId.length === 0 || typeof value.readable !== 'boolean' || !Array.isArray(value.editCapabilities) || !Array.isArray(value.missingCapabilities)) return invalid(['relations', index]);
-    const schema = parseArtifactRef(value.schema, ['relations', index, 'schema']);
+    const schema = parseArtifactRef(value.schema, ['relations', index, 'schema'], acceptNormalizableInput);
     if (!schema.success) return schema;
-    const editCapabilities = parseCapabilities(value.editCapabilities, ['relations', index, 'editCapabilities']);
+    const editCapabilities = parseCapabilities(value.editCapabilities, ['relations', index, 'editCapabilities'], acceptNormalizableInput);
     if (!editCapabilities.success) return editCapabilities;
-    const missingCapabilities = parseCapabilities(value.missingCapabilities, ['relations', index, 'missingCapabilities']);
+    const missingCapabilities = parseCapabilities(value.missingCapabilities, ['relations', index, 'missingCapabilities'], acceptNormalizableInput);
     if (!missingCapabilities.success) return missingCapabilities;
     const identity = schema.value.id + '\u0000' + schema.value.contentHash + '\u0000' + value.relationId + '\u0000' + value.attachmentId;
     if (identities.has(identity)) return invalid(['relations', index], 'duplicate');
@@ -251,14 +291,14 @@ const parseImplications = (values: readonly JsonValue[]): ParseResult<DatabaseDe
   return { success: true, value: output, issues: [] };
 };
 
-const parseCapabilities = (values: readonly JsonValue[], path: readonly JsonValue[]): ParseResult<readonly CapabilityRef[]> => {
+const parseCapabilities = (values: readonly JsonValue[], path: readonly JsonValue[], allowDuplicates = false): ParseResult<readonly CapabilityRef[]> => {
   const output: CapabilityRef[] = [];
   const identities = new Set<string>();
   for (let index = 0; index < values.length; index += 1) {
     const parsed = parseCapability(values[index] as JsonValue, [...path, index]);
     if (!parsed.success) return parsed;
     const identity = capabilityKey(parsed.value);
-    if (identities.has(identity)) return invalid([...path, index], 'duplicate');
+    if (!allowDuplicates && identities.has(identity)) return invalid([...path, index], 'duplicate');
     identities.add(identity);
     output.push(parsed.value);
   }
@@ -269,7 +309,7 @@ const parseCapability = (value: unknown, path: readonly JsonValue[]): ParseResul
   ? { success: true, value: { id: value.id, version: value.version, contractHash: value.contractHash }, issues: [] }
   : invalid(path);
 
-const parseArtifactRef = (value: unknown, path: readonly JsonValue[]): ParseResult<ArtifactRef> => isRecord(value) && exactKeys(value, ['contentHash', 'id']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash)
+const parseArtifactRef = (value: unknown, path: readonly JsonValue[], allowLocations = false): ParseResult<ArtifactRef> => isRecord(value) && exactKeys(value, ['contentHash', 'id'], allowLocations ? ['locations'] : []) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string')))
   ? { success: true, value: { id: value.id, contentHash: value.contentHash }, issues: [] }
   : invalid(path);
 

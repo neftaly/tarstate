@@ -1,14 +1,10 @@
-import { createHash } from 'node:crypto';
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeMapStorageBinding,
-  AutomergeMoveError,
   AutomergeSourceRuntime,
   automergeBasis,
-  copyRelocateAutomerge,
   exactAutomergeBasisEqual,
-  initializeAutomergeMoveMetadata,
   projectAutomergeFacts,
   snapshotAutomergeDocument
 } from '../src/index.js';
@@ -17,7 +13,7 @@ const actor = (digit: string): string => digit.repeat(64);
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;
 
 type Task = { title: string; count?: Automerge.Counter };
-type TaskDoc = { tasks: Record<string, Task>; metadata: { schema: string }; __tarstateMovesV1?: Record<string, unknown> };
+type TaskDoc = { tasks: Record<string, Task>; metadata: { schema: string } };
 
 const taskBase = (): Automerge.Doc<TaskDoc> => Automerge.from(
   { tasks: { first: { title: 'First' } }, metadata: { schema: 'v1' } },
@@ -122,88 +118,26 @@ describe('production Automerge adapter', () => {
     expect(Automerge.getConflicts(runtime.snapshot().storage.tasks, 'same')).toBeUndefined();
   });
 
-  it('normalizes object, conflict, and adapter-private move facts without leaking the reserved map as a normal property', async () => {
+  it('normalizes object and conflict facts while hiding reserved metadata', () => {
     const base = taskBase();
     let left = Automerge.clone(base, { actor: actor('4') });
     let right = Automerge.clone(base, { actor: actor('5') });
     left = Automerge.change(left, { time: 0 }, (draft) => { draft.metadata.schema = 'left'; });
     right = Automerge.change(right, { time: 0 }, (draft) => { draft.metadata.schema = 'right'; });
-    const moved = await copyRelocateAutomerge(Automerge.merge(left, right), {
-      operationEpoch: 'epoch:move', operationId: 'operation:move', statementIndex: 0, fromPath: ['tasks', 'first'], toPath: ['tasks', 'moved']
-    });
-    const facts = projectAutomergeFacts(moved.doc);
-    expect(facts.basis).toEqual(automergeBasis(moved.doc));
+    const merged = Automerge.merge(left, right);
+    const facts = projectAutomergeFacts(merged);
+    expect(facts.basis).toEqual(automergeBasis(merged));
     expect(facts.conflicts).toContainEqual(expect.objectContaining({ path: ['metadata', 'schema'] }));
-    expect(facts.moves).toContainEqual(expect.objectContaining({ recordId: moved.recordId }));
-    expect(facts.properties.some((fact) => fact.path[0] === '__tarstateMovesV1')).toBe(false);
+    expect(facts.properties.some((fact) => fact.path[0] === '__tarstateMetaV1')).toBe(false);
   });
 
-  it('records the frozen copyRelocate losses and golden bytes, and is idempotent for the same move identity', async () => {
-    type MoveDoc = {
-      active: { item?: { title: string; count: Automerge.Counter; text: string; nested: { flag: boolean }; list: string[] } };
-      archive: { item?: { title: string; count: Automerge.Counter; text: string; nested: { flag: boolean }; list: string[] } };
-      __tarstateMovesV1?: Record<string, unknown>;
-    };
-    let base = Automerge.init<MoveDoc>({ actor: actor('a') });
-    base = Automerge.change(base, { time: 0, message: 'fixture' }, (draft) => {
-      draft.active = { item: { title: 'Original', count: new Automerge.Counter(2), text: 'hello', nested: { flag: true }, list: ['a', 'b'] } };
-      draft.archive = {};
+  it('treats application move-looking records as ordinary uninterpreted data', () => {
+    const doc = Automerge.from({
+      __automergeMoves: { old: { from: ['a'], to: ['b'] } },
+      __tarstateMovesV1: { proposed: { mechanism: 'application-owned' } }
     });
-    const input = { operationEpoch: 'epoch:golden', operationId: 'operation:golden', statementIndex: 7, fromPath: ['active', 'item'] as const, toPath: ['archive', 'item'] as const };
-    const first = await copyRelocateAutomerge(base, input);
-    expect(first.record.preservationLosses).toEqual(expect.arrayContaining([
-      'automerge.conflicts_not_copied',
-      'automerge.concurrent_old_subtree_edits_not_forwarded',
-      'automerge.counter_identity_changed',
-      'automerge.descendant_mapping_incomplete',
-      'automerge.descendant_object_identity_changed',
-      'automerge.list_element_identity_changed',
-      'automerge.root_object_identity_changed',
-      'automerge.text_identity_changed'
-    ]));
-    expect(createHash('sha256').update(Automerge.save(first.doc)).digest('hex')).toBe('85776c89abd082ae4d29e4b72bc19732089931b348e0083b95abc3d99c4e93e6');
-    const replay = await copyRelocateAutomerge(first.doc, input);
-    expect(replay).toMatchObject({ changed: false, recordId: first.recordId, record: first.record });
-    expect(replay.doc).toBe(first.doc);
-  });
-
-  it('converges concurrent relocation records in a preinitialized metadata map and exposes the fork history', async () => {
-    type ForkDoc = {
-      active: { item?: { title: string } };
-      left: { item?: { title: string } };
-      right: { item?: { title: string } };
-      __tarstateMovesV1?: Record<string, unknown>;
-    };
-    let base = Automerge.from<ForkDoc>({ active: { item: { title: 'shared' } }, left: {}, right: {} }, { actor: actor('7') });
-    base = initializeAutomergeMoveMetadata(base);
-    const leftPeer = Automerge.clone(base, { actor: actor('8') });
-    const rightPeer = Automerge.clone(base, { actor: actor('9') });
-    const leftMove = await copyRelocateAutomerge(leftPeer, {
-      operationEpoch: 'epoch:fork', operationId: 'operation:left', statementIndex: 0, fromPath: ['active', 'item'], toPath: ['left', 'item']
-    });
-    const rightMove = await copyRelocateAutomerge(rightPeer, {
-      operationEpoch: 'epoch:fork', operationId: 'operation:right', statementIndex: 0, fromPath: ['active', 'item'], toPath: ['right', 'item']
-    });
-    const mergedLeftRight = Automerge.merge(leftMove.doc, rightMove.doc);
-    const mergedRightLeft = Automerge.merge(rightMove.doc, leftMove.doc);
-    expect(Automerge.equals(mergedLeftRight, mergedRightLeft)).toBe(true);
-    expect(exactAutomergeBasisEqual(automergeBasis(mergedLeftRight), automergeBasis(mergedRightLeft))).toBe(true);
-    expect(mergedLeftRight).toMatchObject({ active: {}, left: { item: { title: 'shared' } }, right: { item: { title: 'shared' } } });
-    const facts = projectAutomergeFacts(mergedLeftRight);
-    expect(facts.moves.map((move) => move.recordId).sort((left, right) => left.localeCompare(right))).toEqual(
-      [leftMove.recordId, rightMove.recordId].sort((left, right) => left.localeCompare(right))
-    );
-    expect(facts.issues).toContainEqual(expect.objectContaining({ code: 'automerge.move_fork_history' }));
-  });
-
-  it('withholds copyRelocate on reserved metadata collision and invalid nested destinations', async () => {
-    type CollisionDoc = { source: { value: string }; target: Record<string, unknown>; __tarstateMovesV1: string };
-    const collision = Automerge.from<CollisionDoc>({ source: { value: 'x' }, target: {}, __tarstateMovesV1: 'application-data' }, { actor: actor('6') });
-    await expect(copyRelocateAutomerge(collision, {
-      operationEpoch: 'epoch', operationId: 'operation', statementIndex: 0, fromPath: ['source'], toPath: ['target', 'copy']
-    })).rejects.toMatchObject({ code: 'automerge.move_metadata_collision' });
-    await expect(copyRelocateAutomerge(collision, {
-      operationEpoch: 'epoch', operationId: 'nested', statementIndex: 0, fromPath: ['source'], toPath: ['source', 'child']
-    })).rejects.toBeInstanceOf(AutomergeMoveError);
+    const paths = projectAutomergeFacts(doc).properties.map(({ path }) => path);
+    expect(paths).toContainEqual(['__automergeMoves']);
+    expect(paths).toContainEqual(['__tarstateMovesV1']);
   });
 });

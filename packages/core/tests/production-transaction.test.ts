@@ -266,7 +266,6 @@ describe('production in-memory transaction coordinator', () => {
     const stale = await memory.commit(attempt('stale', noMatch, { expectedBasis: { incarnation: 'incarnation:one', revision: 99 } }));
     expect(stale).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.expected_basis_stale' }] });
     expect(memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'stale', intentHash: stale.intentHash })).toMatchObject({ status: 'known' });
-    memory.evictReceiptCache();
     expect(memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'stale', intentHash: stale.intentHash })).toMatchObject({ status: 'known', receipt: stale });
     expect(await memory.commit(attempt('stale', noMatch, { expectedBasis: { incarnation: 'incarnation:one', revision: 99 } }))).toBe(stale);
   });

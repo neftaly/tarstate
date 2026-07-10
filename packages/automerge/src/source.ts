@@ -257,7 +257,9 @@ export class AutomergeSourceRuntime<T extends object> {
   }
 
   #notify(change: AutomergeSourceChange): void {
-    for (const listener of Array.from(this.#listeners)) listener(change);
+    for (const listener of Array.from(this.#listeners)) {
+      try { listener(change); } catch { /* committed source state cannot depend on observers */ }
+    }
   }
 
   #assertOpen(): void {

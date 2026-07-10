@@ -1,142 +1,303 @@
-# Tarstate v1 Normative Design Packet
+# Tarstate v1
 
 Status: normative v1.0 specification.
 
-This directory is the source of truth for the Tarstate rewrite. Documents
-outside `docs/v1/` are historical research unless this packet explicitly
-incorporates them. If implementation and this packet disagree, implementation
-is wrong or this packet must be amended by an explicit decision record.
+This directory is the source of truth for the Tarstate rewrite. The terms MUST,
+MUST NOT, SHOULD, SHOULD NOT, and MAY are normative. When implementation and
+this specification disagree, the implementation is wrong or the specification
+must be amended by an explicit entry in [decisions.md](decisions.md).
 
-The terms MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are normative.
+Release evidence is indexed in
+[conformance-matrix.md](conformance-matrix.md). Documents outside `docs/v1/`
+are historical or explanatory unless this specification incorporates them.
 
-## Product contract
+## Product boundary
 
-Tarstate is a reactive relational database interface over an authority-scoped
-set of local-first sources.
+Tarstate is a reactive relational interface over an authority-scoped set of
+local-first sources.
 
-- Automerge documents are the primary durable source of truth.
-- Zustand, TanStack Store, and similar external stores are local/app-state
-  sources behind one generic atomic-store protocol.
-- Queries may span sources. No composite observation pretends to be a
-  distributed atomic snapshot.
-- One source is the maximum atomic write boundary. A source is one Automerge
-  document, one external store, or one custom source with an equivalent atomic
-  coordinator.
-- Schemas, queries, constraints, transactions, storage mappings, and schema
-  lenses are immutable portable artifacts. Executable capabilities are trusted
-  host registrations, never implicitly downloaded code.
-- The core is pure. Source loading, subscriptions, commits, React, networking,
-  storage, presence, and effects form the imperative shell.
-- The JavaScript query API is functional and uses `pipe`. Fluent query chains
-  and `compose` are not part of v1.
+- Automerge documents are the primary durable source type.
+- Zustand, TanStack Store, and equivalent app stores use one generic atomic
+  external-store protocol.
+- A source is the maximum atomic write boundary: one Automerge document, one
+  external store, or one custom source with an equivalent coordinator.
+- Queries may span sources, but a composite basis records snapshots that were
+  used; it never claims distributed snapshot isolation.
+- Schemas, queries, transactions, constraints, storage mappings, and schema
+  lenses are immutable portable artifacts.
+- Codecs, functions, source drivers, and storage bindings are trusted host
+  registrations. Data or a URL never authorizes code execution.
+- Semantic evaluation, projection, and planning are pure. Resolution, loading,
+  subscriptions, commits, persistence, networking, React, presence, and other
+  effects are explicit imperative shells.
+- The public query authoring API is functional and uses `pipe`. Fluent query
+  chains and mutable builders are outside v1.
 
-## Normative documents
-
-1. [Artifacts and values](01-artifacts-and-values.md)
-2. [Identity and lineage](02-identity-and-lineage.md)
-3. [Discovery and observations](03-discovery-and-observations.md)
-4. [Transactions and receipts](04-transactions-and-receipts.md)
-5. [Constraints and authority](05-constraints-and-authority.md)
-6. [Moves and relocation](06-moves-and-relocation.md)
-7. [Schemas, schema lenses, storage mappings, and storage bindings](07-schemas-lenses-mappings-bindings.md)
-8. [Developer experience and performance](08-dx-and-performance.md)
-9. [Query artifacts and execution](09-query-artifacts-and-execution.md)
-10. [Spike wire contract](10-spike-wire-contract.md)
-11. [Implementation entry contract](implementation-entry.md)
-
-Production evidence is mapped gate by gate in the
-[v1 conformance matrix](conformance-matrix.md).
-Owner-selected scope changes are recorded separately from measured spike
-contradictions in the [v1 decision log](decisions.md).
-
-Required end-to-end traces:
-
-- [Patchpit recursive folder and HTTPS resource](traces/patchpit-folder.md)
-- [Probability nested move](traces/probability-move.md)
-- [v1 app editing v200 data](traces/schema-v1-v200.md)
-
-Executable initial spike evidence:
-
-- [pure semantic evaluator](spikes/pure-semantic.md)
-- [source transaction coordinator](spikes/source-transaction.md)
-- [Automerge behavior and fallback](spikes/automerge.md)
-- [Zustand and TanStack external stores](spikes/external-store.md)
-- [v1/v200 schema lens](spikes/lens.md)
-
-## Layer model
+## Architecture
 
 | Layer | Responsibility |
 | --- | --- |
-| Schema | Logical relation and field meaning, stable relation identity, logical keys, refs, value domains, promised edit semantics |
-| Storage mapping | Portable description of how storage candidates correspond to logical relations |
-| Storage binding | Trusted pure projection and edit-planning implementation |
-| Source | Imperative snapshots, lifecycle, basis, subscription, and atomic commit |
-| Attachment | Source + storage bindings + schema views + authority |
-| Dataset | Versioned expected attachment membership used by multi-source queries |
-| Database | One authority-scoped view of attachments, capability registry, query cache, and commit coordinators |
-| React | Cached immutable observation consumption only |
+| Schema | Logical relation and field meaning, stable relation identity, keys, refs, value domains, and promised edit semantics |
+| Storage mapping | Optional portable description of storage candidates and field destinations |
+| Storage binding | Trusted pure projection and edit planning over an immutable source snapshot |
+| Source | Snapshot lifecycle, basis, subscription, and atomic compare-and-apply |
+| Attachment | Source plus selected bindings, schema views, lenses, and authority |
+| Dataset | Versioned expected attachment membership for a query universe |
+| Database | One authority-filtered view, capability registry, caches, observers, and commit coordinators |
+| React | Consumption of cached immutable observer snapshots |
 
-Schemas do not define storage topology, permissions, indexes, React behavior,
-source lifecycle, or network state.
+Schemas MUST NOT define physical paths, source lifecycle, authority, indexes,
+network state, or React behavior. Source adapters and storage bindings depend
+inward on generic core protocols. Public schema and query vocabulary MUST NOT
+expose Automerge object layouts, external-store action conventions, or
+adapter-private metadata.
 
-## Coupling rule
+## Portable artifacts and capabilities
 
-Portable artifacts depend on semantic contracts, never a library's object
-model, event shape, storage path, or fallback metadata. Core depends on source,
-storage-binding, and capability protocols; Automerge, Zustand, TanStack, React, and
-future adapters depend inward on those protocols.
+Every portable artifact has a semantic kind, format version, immutable ID,
+content hash, exact dependency references, and a body. Its hash is computed
+from canonical JSON over semantic content. Locations are resolution hints, not
+identity. Reusing one ID for different content, resolving two hashes for one
+dependency ID, or silently choosing between valid artifacts is an error.
 
-Source-specific details may exist inside an adapter, but are not public query or
-schema vocabulary. System relations expose normalized facts rather than raw
-adapter metadata. Replacing an adapter mechanism with a stronger native one
-must not require changing an app's schema or query when its semantic guarantees
-still hold.
+Ad-hoc builders MAY derive deterministic inline IDs from normalized content.
+Callers never hand-author a claimed hash. Parsers are total and budgeted,
+reject duplicate JSON members before ordinary JSON materialization, and return
+structured issues for expected failures. They reject hostile object shapes,
+unsupported host values, cycles, and prototype-pollution keys before trusted
+code sees them.
 
-This does not promise that every implementation is interchangeable: artifacts
-declare exact minimum capabilities, and missing capabilities fail explicitly.
-The goal is substitutable contracts, not a lowest-common-denominator API.
+Executable requirements use exact capability references. Capability
+substitution exists only through an explicit, immutable implication graph;
+names, version order, and semantic-version ranges imply nothing. Missing or
+unknown capabilities fail explicitly, do not trigger dynamic code loading, and
+participate in observer/writeability state and cache fingerprints.
 
-## Stable compatibility boundary
+## Values and relational semantics
 
-The long-lived compatibility boundary is the portable artifact formats and
-their semantics. TypeScript constructors are convenience APIs and may evolve
-more freely, while remaining functional and producing the same artifacts.
+Portable values are canonical JSON plus versioned tagged domains such as exact
+decimal, instant, bytes, and registered custom codec values. Numbers are finite
+binary64 values; integers are safe JavaScript integers. Every scalar domain
+defines canonical equality and hashing, and operators requiring order reject a
+domain that supplies no deterministic ordering.
 
-A self-describing document carries immutable schema, projection, and constraint
-artifact references through adapter-private bootstrap metadata; a trusted host
-may instead supply the same declaration out of band. A host may expose an older
-or newer schema view only through an explicitly selected compatibility lens.
-Compatibility is never inferred from version numbers.
+`null` is a value. Missing means an optional field is absent. `undefined`
+represents neither. Comparisons involving null or missing yield logical unknown
+except for explicit null/missing predicates. Predicates use strong Kleene
+logic, and `where` retains only true. Capability-unavailable, logical unknown,
+missing, and application data are distinct states.
 
-## Explicit v1 exclusions
+Relations are bags. Equal visible rows retain distinct hidden occurrences.
+`unionAll` adds multiplicities; `union` and `distinct` use canonical visible
+equality. Ordering is deterministic and uses hidden result identity as the
+final tie-breaker. Recursion is a monotone keyed least fixpoint with explicit
+row and iteration budgets.
 
-- distributed atomic transactions or global serializability;
+Queries are immutable portable templates with declared parameters, schema
+views, a root relational expression, and exact capability requirements. A
+request selects exactly one dataset. Preparation resolves artifacts, lenses,
+codecs, functions, collations, and capabilities against one database authority
+view. V1 ships one pure full evaluator. A future incremental evaluator MUST be
+differentially equivalent before it replaces that path; v1 contains no runtime
+fallback between evaluators.
+
+## Identity, storage, and compatibility
+
+Source identity, attachment identity, stable relation ID, logical key, row
+locator/incarnation, and derived result key are different concepts.
+
+- A source is the unit of atomic ownership.
+- An attachment is one live, pinned, bound, and authorized view of a source.
+- A relation ID is stable logical identity; display and local schema names are
+  not.
+- A logical key supports lookup and refs but is not physical or stable entity
+  identity.
+- A binding-owned locator plus row incarnation identifies one storage entity.
+  Mutable indexes and paths are not durable locators.
+- A result key supports diffs and UI identity but grants no write authority.
+
+Duplicate logical keys remain visible as diagnostic candidates; keyed reads and
+writes are ambiguous until explicitly repaired. No adapter chooses a winner.
+Writes through query results require one proven writable base handle or a named
+inverse binding. Aggregates, distinct results, windows, recursive outputs, and
+ambiguous joins are read-only by default.
+
+Schemas describe logical relations, types, optionality, nullability, key fields,
+refs, and semantic edit capabilities. Optional and nullable are independent.
+Storage bindings locate candidates, project total logical rows, preserve
+unknown physical fields, declare conservative footprints, and plan complete
+field-level intents without subscribing or committing.
+
+Schema lenses declare exact from/to schema references and separate read and
+write transforms. Lens selection is explicit or unambiguous; version numbers
+and shortest paths do not select compatibility. Reads parse stored meaning
+before applying a lens. Writes translate field intents back and reject when
+touched meaning or unknown storage cannot be preserved. Lenses are views, not
+migrations.
+
+## Sources, discovery, and observations
+
+Resolvers operate only on authority-approved references and never execute code.
+They normalize aliases, cycles, redirects, loading, missing, failed, denied,
+deleted, and unsupported resources into observable evidence. A byte or HTTPS
+resource becomes relational only through an explicit trusted attachment.
+
+A self-describing document MAY carry an adapter-private bootstrap declaration
+that references its storage schema, projection, and constraint activation. The
+declaration grants neither authority nor executable code. Malformed or
+conflicted recognized bootstrap data disables automatic writable attachment
+until an authority-gated governance repair. Unknown document fields and future
+metadata are preserved.
+
+A dataset is a versioned expected set of attachments. Required members must be
+ready for an exact result. Unavailable optional members contribute no rows and
+do not block exactness, but their absence remains evidence. A settled revision
+means declared traversal has completed, not that membership can never change.
+
+Every query result reports rows, result keys, completeness, freshness, basis,
+source evidence, and issues:
+
+- `exact` means all evidence required by the query is available.
+- `lower-bound` is allowed only for proven positive monotone evaluation.
+- `unknown` means no current answer can be asserted; current rows and keys are
+  empty and MUST NOT be interpreted as an empty relation.
+
+Observers expose immutable current evidence and MAY retain the prior exact
+answer separately as `lastExact` with its original basis and stale freshness.
+A transition to unknown is invalidation, not a removal diff. Observer leases
+are independent, close idempotently, and release shared subscriptions, caches,
+projections, and retained snapshots when the last lease closes.
+
+Presence, connectivity, sync, lifecycle, capability, issue, and constraint
+facts are explicit authority-filtered system relations. Presence is ephemeral
+and is neither durable transaction data nor valid input to a hard constraint.
+
+## Transactions and receipts
+
+A transaction is immutable portable intent attempted against exactly one
+writable attachment and therefore one source. Time, randomness, and generated
+IDs are captured as fixed parameters before the attempt. Cross-source work is
+an explicitly non-atomic batch or shell sequence.
+
+Statements run in order. Later statements see earlier staged effects. Within
+one set-based statement, the target set and expression inputs are fixed from
+that statement's starting staged state, preventing iteration-order and
+Halloween effects.
+
+The source coordinator:
+
+1. captures one snapshot, basis, attachment incarnation, authority, and active
+   artifacts;
+2. projects and parses every participating binding;
+3. evaluates ordered logical statements and same-source referential actions;
+4. plans the complete edit set and checks exact footprints;
+5. merges compatible intents without binding-order or last-writer-wins rules;
+6. applies intents to immutable staged storage and reprojects touched data;
+7. evaluates hard constraints on the final logical state; and
+8. performs exactly one atomic compare-and-apply.
+
+Expected-basis mismatch rejects. Without an expected basis, a safe pre-handoff
+replan MAY occur against a newer local basis. Nothing replans after handoff.
+Cancellation before handoff rejects without mutation; cancellation afterward
+cannot undo a commit.
+
+Every attempt has stable operation epoch and operation ID plus an intent hash.
+Reusing that pair for different intent is ambiguous. Receipts report committed,
+rejected, or—only with durable deduplication and outcome lookup—unknown. A
+caller MUST NOT retry an unresolved unknown non-idempotent operation. No-op
+commits are committed at the same basis and emit no source notification.
+
+Non-atomic batches and shell sequences retain each nested receipt and report
+complete, partial, failed, or unknown without claiming rollback, compensation,
+or atomicity. Unknown future receipt kinds are preserved as bounded opaque
+portable data; older consumers infer neither success nor retry safety.
+
+## Constraints, authority, and repair
+
+Parsing, constraints, guards, authority, referential actions, and workflows are
+separate mechanisms. Constraint sets are immutable artifacts activated per
+source as audit or required. Constraint evaluation is satisfied, violated, or
+indeterminate. Required constraints reject both newly violated and newly
+indeterminate final states.
+
+Hard constraints run on the complete authoritative staged state of one source
+and deterministic registered functions only. Cross-source, presence,
+connectivity, time, randomness, and network reachability are audit-only unless
+captured as durable source facts. Concurrently valid Automerge changes may
+merge into a violating state; Tarstate exposes the violation and requires an
+authorized repair rather than rewriting history.
+
+Read and write authority are distinct and applied before query evaluation and
+caching. Cache identity includes authority and capability fingerprints.
+Diagnostics MUST NOT leak hidden contributors, values, or counts. Opaque
+handles are scoped to a database view and rechecked at commit.
+
+Recognized bootstrap or constraint-activation conflicts make ordinary writes
+read-only. A narrowly authority-gated governance operation MAY repair only that
+metadata at an exact basis and MUST emit an auditable receipt. It does not
+permit arbitrary application-data edits or bypass constraints.
+
+## Move semantics
+
+Move is a generic semantic edit family, not a promise made by every source.
+Capabilities form three explicit contracts:
+
+- `move` is the minimum relocation requirement.
+- `identityPreservingMove` keeps the same storage entities and descendant
+  identities while parent/order changes.
+- `copyRelocate` copies logical data and deletes or tombstones the old entities;
+  locators, CRDT identity, conflicts, and concurrent old-location edits may be
+  lost.
+
+The two mechanisms MAY explicitly imply `move`. `copyRelocate` never satisfies
+`identityPreservingMove`. Receipts report the actual mechanism and bounded
+preservation losses.
+
+A move intent is source-local transaction intent with a logical target,
+destination parent, stable before/after anchor or boundary position, required
+minimum capability, and missing-anchor policy. Mutable indexes are not anchors.
+Cross-source relocation is an explicit non-atomic copy/create and delete
+workflow.
+
+The built-in Automerge adapter advertises none of `move`,
+`copyRelocate`, or `identityPreservingMove` and rejects a requirement for them
+before mutation. Tarstate reserves, reads, writes, migrates, compacts, or
+interprets no Automerge move metadata. Names such as `__automergeMoves` and
+`__tarstateMovesV1` are ordinary application data and are preserved without
+Tarstate meaning.
+
+An app may model parent and order as ordinary fields through its own schema and
+binding. A custom source or binding MAY implement generic movement, but then it
+owns record namespaces, migration, conflict/concurrency behavior, retention,
+reference translation, repair, and capability claims. Those records are not a
+built-in Tarstate wire format or interoperability promise.
+
+## Explicit exclusions
+
+V1 excludes:
+
+- distributed atomic transactions and global serializability;
 - globally convergent constraint enforcement;
-- automatic migrations, compensation, or conflict repair;
-- general triggers, durable workflows, and sagas;
-- arbitrary host closures in portable artifacts;
+- automatic migrations, compensation, conflict repair, durable workflows, and
+  general triggers;
 - implicit execution of code discovered through a document or URL;
-- public physical index/materialization controls;
-- full outer or lateral join primitives when specified compositions cover the
-  required workloads;
-- native identity-preserving moves until a source advertises that capability.
+- arbitrary host closures in portable artifacts;
+- public physical index or materialization controls;
+- Tarstate-owned Automerge movement and move metadata;
+- Suspense and source ownership hidden inside React.
 
-These exclusions are safe only because v1 includes structured observation
-diffs, commit and explicitly non-atomic batch receipts, named capability gaps,
-and extension points for sources, storage bindings, codecs, functions, and edit
-semantics.
+Future features require additive capabilities and receipt kinds. They MUST NOT
+reinterpret v1 results, upgrade unknown or partial outcomes, broaden authority,
+or imply stronger atomicity.
 
-Future additions remain additive:
+## Release posture
 
-- distributed commit or global enforcement requires a new coordinator
-  capability and receipt/activation mode; it cannot reinterpret a v1
-  `NonAtomicBatch` or audit constraint as atomic;
-- migration, durable-workflow, and effect orchestration use new receipt kinds
-  that retain nested v1 outcomes; v1 source-lifecycle and sequence receipts
-  remain unchanged;
-- physical tuning uses private planning or a future separate hint artifact and
-  cannot change query meaning;
-- native source operations satisfy existing semantic minimum contracts while
-  reporting their actual stronger mechanism;
-- React features remain consumers of observers and do not alter core query or
-  transaction artifacts.
+V1 favors semantic clarity and explicit lifetime ownership over microbenchmark
+and GC targets. Release checks retain compiler/declaration budgets, explicit
+cache/lease/subscription lifetime tests, and a loose coarse runtime ceiling for
+gross regressions. A material failure is a signal to simplify ownership and
+data flow before adding benchmark-specific paths.
+
+The legacy implementation remains immutable at tag `legacy-v0-final`, commit
+`25f707c`, for archaeology and optional coarse comparison only. It is not a
+runtime dependency or conformance authority.

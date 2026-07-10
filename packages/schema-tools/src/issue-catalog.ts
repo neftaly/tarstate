@@ -57,6 +57,8 @@ export const createIssueCodeCatalogArtifact = async (options: {
     if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(declaration)) throw new Error('Conflicting issue declaration: ' + declaration.code);
     declarations.set(declaration.code, declaration);
   }
+  if (id.length === 0) throw new TypeError('Issue catalog ID must not be empty');
+  for (const code of Object.keys(descriptions)) if (!declarations.has(code)) throw new TypeError('Description names an unknown issue code: ' + code);
   for (const [code, declaration] of [...declarations.entries()].sort(([left], [right]) => compare(left, right))) {
     const description = descriptions[code];
     codes[code] = {
@@ -83,10 +85,10 @@ export const safeParseIssueCodeCatalog = async (input: unknown, budget?: ValuePa
   const portable = budget === undefined ? safeParseJsonValue(input) : safeParseJsonValue(input, budget);
   if (!portable.success) return portable;
   const value = portable.value;
-  if (!isRecord(value) || !exactKeys(value, ['body', 'contentHash', 'dependencies', 'formatVersion', 'id', 'kind']) || value.kind !== 'issue-code-catalog' || value.formatVersion !== 1 || typeof value.id !== 'string' || !isContentHash(value.contentHash) || !Array.isArray(value.dependencies) || value.dependencies.length !== 0 || !isRecord(value.body) || !exactKeys(value.body, ['codes']) || !isRecord(value.body.codes)) return failure('schema_tools.issue_catalog_invalid', { reason: 'shape' });
+  if (!isRecord(value) || !exactKeys(value, ['body', 'contentHash', 'dependencies', 'formatVersion', 'id', 'kind']) || value.kind !== 'issue-code-catalog' || value.formatVersion !== 1 || typeof value.id !== 'string' || value.id.length === 0 || !isContentHash(value.contentHash) || !Array.isArray(value.dependencies) || value.dependencies.length !== 0 || !isRecord(value.body) || !exactKeys(value.body, ['codes']) || !isRecord(value.body.codes)) return failure('schema_tools.issue_catalog_invalid', { reason: 'shape' });
   const codes: Record<string, IssueCodeCatalogEntry> = {};
   for (const [code, candidate] of Object.entries(value.body.codes)) {
-    if (!isRecord(candidate) || !exactKeys(candidate, ['phase', 'requiredCapabilityFields', 'retry'], ['description']) || !isIssuePhase(candidate.phase) || !Array.isArray(candidate.retry) || !candidate.retry.every(isIssueRetry) || !Array.isArray(candidate.requiredCapabilityFields) || !candidate.requiredCapabilityFields.every((field) => typeof field === 'string') || (candidate.description !== undefined && typeof candidate.description !== 'string')) return failure('schema_tools.issue_catalog_invalid', { reason: 'entry', code });
+    if (code.length === 0 || !isRecord(candidate) || !exactKeys(candidate, ['phase', 'requiredCapabilityFields', 'retry'], ['description']) || !isIssuePhase(candidate.phase) || !Array.isArray(candidate.retry) || !candidate.retry.every(isIssueRetry) || new Set(candidate.retry).size !== candidate.retry.length || !Array.isArray(candidate.requiredCapabilityFields) || !candidate.requiredCapabilityFields.every((field) => typeof field === 'string' && field.length > 0) || new Set(candidate.requiredCapabilityFields).size !== candidate.requiredCapabilityFields.length || (candidate.description !== undefined && (typeof candidate.description !== 'string' || candidate.description.length === 0))) return failure('schema_tools.issue_catalog_invalid', { reason: 'entry', code });
     codes[code] = {
       phase: candidate.phase,
       retry: candidate.retry,

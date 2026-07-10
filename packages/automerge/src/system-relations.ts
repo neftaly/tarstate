@@ -297,14 +297,17 @@ export class AutomergeSystemRelationState {
   apply(event: AutomergeSystemEvent): AutomergeSystemRelationSnapshot {
     if (this.#closed) throw new Error('Automerge system relation state is closed');
     validateEventTime(event);
-    if (event.kind === 'peer-observed') this.#observePeer(event);
-    else if (event.kind === 'peer-disconnected') this.#disconnectPeer(event);
-    else if (event.kind === 'sync-state') this.#setSync(event);
-    else if (event.kind === 'remote-heads') this.#setRemoteHeads(event);
-    else if (event.kind === 'presence-set') this.#setPresence(event);
-    else if (event.kind === 'presence-heartbeat') this.#heartbeat(event);
-    else if (event.kind === 'presence-stop') this.#stopPresence(event);
-    else this.#replaceConflicts(event.rows);
+    switch (event.kind) {
+      case 'peer-observed': this.#observePeer(event); break;
+      case 'peer-disconnected': this.#disconnectPeer(event); break;
+      case 'sync-state': this.#setSync(event); break;
+      case 'remote-heads': this.#setRemoteHeads(event); break;
+      case 'presence-set': this.#setPresence(event); break;
+      case 'presence-heartbeat': this.#heartbeat(event); break;
+      case 'presence-stop': this.#stopPresence(event); break;
+      case 'conflicts-replaced': this.#replaceConflicts(event.rows); break;
+      default: assertNever(event);
+    }
     return this.#publishIfChanged();
   }
 
@@ -476,6 +479,8 @@ export class AutomergeSystemRelationState {
     return candidate;
   }
 }
+
+const assertNever = (value: never): never => { throw new TypeError('Unsupported Automerge system event: ' + String(value)); };
 
 const materializeConflictRow = (row: AutomergeConflictSystemRow): AutomergeConflictSystemRow => deepFreezeClone(row);
 const syncKey = (documentId: string, storageId: string): string => documentId + '\u0000' + storageId;

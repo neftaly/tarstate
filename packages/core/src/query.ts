@@ -1,7 +1,7 @@
 import { canonicalizeJson, sha256Json, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
-import { FullRecomputeStrategy, type PreparedPlan } from './maintenance.js';
+import type { PreparedPlan } from './maintenance.js';
 
 export type Completeness = 'exact' | 'lower-bound' | 'unknown';
 export type QueryLogicalValue = null | boolean | number | string | LogicalUnknown | readonly QueryLogicalValue[] | { readonly [key: string]: QueryLogicalValue };
@@ -37,8 +37,10 @@ export type Expr =
   | { readonly kind: 'coalesce'; readonly args: readonly Expr[] }
   | { readonly kind: 'call'; readonly capability: CapabilityRef; readonly args: readonly Expr[] }
   | { readonly kind: 'subquery'; readonly mode: 'scalar' | 'exists'; readonly query: QueryNode }
-  | { readonly kind: 'is-null' | 'is-missing'; readonly value: Expr }
-  | { readonly kind: 'key-of' | 'source-of'; readonly alias: string };
+  | { readonly kind: 'is-null'; readonly value: Expr }
+  | { readonly kind: 'is-missing'; readonly value: Expr }
+  | { readonly kind: 'key-of'; readonly alias: string }
+  | { readonly kind: 'source-of'; readonly alias: string };
 
 export type AggregateExpr = {
   readonly kind: 'aggregate';
@@ -151,9 +153,6 @@ export const prepareQuery = async (input: {
   return { planId, rootNodeId: planId + ':root', query: input.root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId };
 };
 
-export const queryMaintenanceEvaluator = (relations: readonly RelationInput[], parameters?: Readonly<Record<string, JsonValue>>, functions?: FunctionRegistry) =>
-  (plan: PreparedPlan<QueryNode>): Omit<import('./maintenance.js').MaintainedResult<QueryRecord>, 'state'> => evaluateQuery({ root: plan.query, relations, ...(parameters === undefined ? {} : { parameters }), ...(functions === undefined ? {} : { functions }) });
-
 const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
   if (node.kind === 'from') {
     const input = context.relations.get(relationKey(node.relation));
@@ -174,7 +173,12 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     };
   }
   if (node.kind === 'values') return { rows: node.rows.map((fields, index) => ({ scope: { ...context.outer?.scope, [node.alias]: fields }, provenance: { ...context.outer?.provenance, [node.alias]: { relationId: 'values', occurrence: 'values:' + index } } })), completeness: 'exact' };
-  if (node.kind === 'recursion-ref') return { rows: context.recursions.get(node.name) ?? [], completeness: 'exact' };
+  if (node.kind === 'recursion-ref') {
+    const rows = context.recursions.get(node.name);
+    if (rows !== undefined) return { rows, completeness: 'exact' };
+    context.issues.push(createIssue({ code: 'query.recursion_reference_missing', details: { name: node.name } }));
+    return { rows: [], completeness: 'unknown' };
+  }
   if (node.kind === 'recursive') return evaluateRecursive(node, context);
   if (node.kind === 'where') {
     const inner = evaluateNode(node.input, context);
@@ -193,7 +197,8 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
   if (node.kind === 'with-fields') {
     const inner = evaluateNode(node.input, context);
     const rows = inner.rows.map((row) => {
-      const base = row.scope[node.alias] ?? {};
+      const base = requiredAlias(row, node.alias, context);
+      if (base === undefined) return row;
       const additions = projectFields(node.fields, exprContext(row, context));
       return { scope: { ...row.scope, [node.alias]: { ...base, ...additions } }, provenance: row.provenance };
     });
@@ -201,11 +206,19 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
   }
   if (node.kind === 'rename') {
     const inner = evaluateNode(node.input, context);
-    return { rows: inner.rows.map((row) => ({ ...row, scope: { ...row.scope, [node.alias]: renameFields(row.scope[node.alias] ?? {}, node.fields) } })), completeness: inner.completeness };
+    const rows = inner.rows.map((row) => {
+      const record = requiredAlias(row, node.alias, context);
+      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: renameFields(record, node.fields) } };
+    });
+    return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
   if (node.kind === 'omit') {
     const inner = evaluateNode(node.input, context);
-    return { rows: inner.rows.map((row) => ({ ...row, scope: { ...row.scope, [node.alias]: omitFields(row.scope[node.alias] ?? {}, new Set(node.fields)) } })), completeness: inner.completeness };
+    const rows = inner.rows.map((row) => {
+      const record = requiredAlias(row, node.alias, context);
+      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: omitFields(record, new Set(node.fields)) } };
+    });
+    return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
   if (node.kind === 'unnest') {
     const inner = evaluateNode(node.input, context);
@@ -357,7 +370,8 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
           if (lagged?.status === 'unavailable' || lagged?.status === 'indeterminate') context.unavailable = true;
           value = lagged === undefined ? null : expressionJson(lagged);
         }
-        const aliasFields = row.scope[node.alias] ?? {};
+        const aliasFields = requiredAlias(row, node.alias, context);
+        if (aliasFields === undefined) return;
         const rowIndex = output.indexOf(row);
         output[rowIndex] = { ...row, scope: { ...row.scope, [node.alias]: { ...aliasFields, [field]: value } } };
       });
@@ -522,7 +536,10 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     if (args.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
     if (args.some((value) => value.status !== 'known' || typeof value.value !== 'string')) return { status: 'unknown' };
     const strings = args.map((value) => (value as { readonly status: 'known'; readonly value: string }).value);
-    return known(expression.op === 'concat' ? strings.join('') : expression.op === 'lower' ? (strings[0] ?? '').toLowerCase() : expression.op === 'upper' ? (strings[0] ?? '').toUpperCase() : Array.from(strings[0] ?? '').length);
+    if (expression.op === 'concat') return known(strings.join(''));
+    const value = strings[0];
+    if (value === undefined) throw new TypeError('Unary string expression has no argument');
+    return known(expression.op === 'lower' ? value.toLowerCase() : expression.op === 'upper' ? value.toUpperCase() : Array.from(value).length);
   }
   if (expression.kind === 'array') {
     const values = expression.items.map((item) => evaluateExpr(item, context));
@@ -598,13 +615,14 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
       return { status: 'unavailable' };
     }
   }
-  return { status: 'unknown' };
+  return assertNever(expression);
 };
 
 const exprContext = (row: ScopedRow, context: QueryContext): EvalContext => ({ row, parameters: context.parameters, functions: context.functions, issues: context.issues, query: context });
 const known = (value: JsonValue): ExpressionResult => ({ status: 'known', value });
 const propagate = (...values: readonly ExpressionResult[]): ExpressionResult | undefined => values.some((value) => value.status === 'unavailable') ? { status: 'unavailable' } : values.some((value) => value.status === 'indeterminate') ? { status: 'indeterminate' } : values.some((value) => value.status === 'unknown') ? { status: 'unknown' } : undefined;
 const expressionJson = (result: ExpressionResult): JsonValue => result.status === 'known' ? result.value : null;
+const assertNever = (value: never): never => { throw new TypeError('Unsupported query expression: ' + String(value)); };
 
 const projectFields = (fields: Readonly<Record<string, Expr>>, context: EvalContext): QueryRecord => {
   const output: Record<string, QueryLogicalValue> = {};
@@ -624,8 +642,18 @@ const mapProjection = (inner: NodeResult, alias: string, project: (row: ScopedRo
 
 const visibleRow = (row: ScopedRow): QueryRecord => {
   const aliases = Object.keys(row.scope);
-  if (aliases.length === 1) return row.scope[aliases[0] as string] ?? {};
+  if (aliases.length === 1) return row.scope[aliases[0] as string] as QueryRecord;
   return row.scope as unknown as QueryRecord;
+};
+
+const requiredAlias = (row: ScopedRow, alias: string, context: QueryContext): QueryRecord | undefined => {
+  const record = row.scope[alias];
+  if (record !== undefined) return record;
+  context.unavailable = true;
+  if (!context.issues.some(({ code, details }) => code === 'query.alias_missing' && (details as { alias?: unknown } | undefined)?.alias === alias)) {
+    context.issues.push(createIssue({ code: 'query.alias_missing', details: { alias } }));
+  }
+  return undefined;
 };
 
 const resultKey = (row: ScopedRow): string => Object.entries(row.provenance).sort(([left], [right]) => left.localeCompare(right)).map(([alias, provenance]) => alias + '=' + provenance.occurrence).join('|');
@@ -706,8 +734,4 @@ const canonicalizeQueryValue = (value: QueryLogicalValue): string => {
 const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult => {
   context.issues.push(createIssue({ code: 'query.parameter_invalid', phase: 'query', severity: 'error', retry: 'after_refresh', details: { reason: 'incomplete_non_monotone', operator } }));
   return { rows: [], completeness: 'unknown' };
-};
-
-export const createQueryMaintenanceStrategy = <Snapshot extends { readonly relations: readonly RelationInput[] }>(parameters?: Readonly<Record<string, JsonValue>>, functions?: FunctionRegistry): FullRecomputeStrategy<QueryNode, QueryRecord, Snapshot, unknown> => {
-  return new FullRecomputeStrategy((plan, snapshot) => evaluateQuery({ root: plan.query, relations: snapshot.relations, ...(parameters === undefined ? {} : { parameters }), ...(functions === undefined ? {} : { functions }) }));
 };

@@ -8,7 +8,6 @@ import {
 } from '@tarstate/core';
 import { describe, expect, it } from 'vitest';
 import { automergeIssueDeclarations } from '../src/issues.js';
-import { copyRelocateAutomerge } from '../src/move.js';
 import {
   applyAutomergeMetadataPlan,
   automergeGovernanceSourceAdapter,
@@ -213,7 +212,7 @@ describe('Automerge bootstrap metadata', () => {
     expect(await coordinator.execute(stale)).toBe(staleReceipt);
   });
 
-  it('keeps reserved metadata out of bindings and facts and rejects direct writes or relocation', async () => {
+  it('keeps reserved metadata out of bindings and facts and rejects direct writes', () => {
     const doc = docFrom({ app: { value: 'visible' }, __tarstateMetaV1: carrier(), __tarstateMetaV2: { future: true } });
     const binding = new AutomergeMapStorageBinding<MetadataDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>({
       relationId: 'relation:root', collectionPath: [], missingCollection: 'invalid', keySource: 'map-key'
@@ -229,15 +228,11 @@ describe('Automerge bootstrap metadata', () => {
     const facts = projectAutomergeFacts(doc);
     expect(facts.properties.some(({ path }) => typeof path[0] === 'string' && path[0].startsWith('__tarstateMetaV'))).toBe(false);
     expect(facts.objects.some(({ path }) => typeof path[0] === 'string' && path[0].startsWith('__tarstateMetaV'))).toBe(false);
-    await expect(copyRelocateAutomerge(doc, {
-      operationEpoch: 'epoch:reserved', operationId: 'operation:reserved', statementIndex: 0,
-      fromPath: ['app'], toPath: ['__tarstateMetaV2']
-    })).rejects.toMatchObject({ code: 'automerge.reserved_metadata_write' });
   });
 
   it('publishes a unique declaration for every emitted public Automerge issue code', () => {
     const sourceDirectory = new URL('../src/', import.meta.url);
-    const patterns = [/(?:code|issueCode):\s*['"](automerge\.[a-z0-9_.-]+)['"]/g, /AutomergeMoveError\(\s*['"](automerge\.[a-z0-9_.-]+)['"]/g, /metadataIssue\(\s*['"](automerge\.[a-z0-9_.-]+)['"]/g];
+    const patterns = [/(?:code|issueCode):\s*['"](automerge\.[a-z0-9_.-]+)['"]/g, /metadataIssue\(\s*['"](automerge\.[a-z0-9_.-]+)['"]/g];
     const emitted = new Set<string>();
     for (const file of readdirSync(sourceDirectory).filter((name) => name.endsWith('.ts') && name !== 'issues.ts')) {
       const text = readFileSync(new URL(file, sourceDirectory), 'utf8');

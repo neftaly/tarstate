@@ -22,7 +22,6 @@ describe('clean rewrite core surface', () => {
     expect(core.coordinateSourceCommit).toBeTypeOf('function');
     expect(core.SourceLifecycleCoordinator).toBeTypeOf('function');
     expect(core.GovernanceCoordinator).toBeTypeOf('function');
-    expect(core.createDifferentialQueryMaintenanceStrategy).toBeTypeOf('function');
     expect(core.safeParseReceipt).toBeTypeOf('function');
     expect(core.createSystemSchemaArtifact).toBeTypeOf('function');
     expect(core.runGoldenConformanceWorkloads).toBeTypeOf('function');

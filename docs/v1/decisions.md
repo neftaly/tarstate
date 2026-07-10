@@ -32,11 +32,38 @@ not authorize weakened semantics, hidden mutable caches, or benchmark-specific
 fast paths. Focused profiling and numeric budgets should be introduced only
 when a real workload shows a material problem.
 
-## D-003: withhold unsupported native Automerge movement
+## D-003: remove Tarstate-owned Automerge movement
 
 The Automerge 3.2.6 spike found no public identity-preserving subtree-move
-operation. The owner accepted a v1 `copyRelocate` adapter with explicit losses,
-legacy/current metadata readers, and an honestly withheld
-`identityPreservingMove` capability. A future native adapter remains obligated
-to produce the same portable move meaning apart from its stronger mechanism and
-identity guarantees.
+operation and showed that a copy/delete fallback changes object, descendant,
+text, counter, and list-element identity while failing to forward concurrent
+old-subtree edits. The owner therefore rejected the previously proposed
+Tarstate `copyRelocate` fallback instead of productizing its loss catalog.
+
+The built-in Automerge adapter advertises no `move`, `copyRelocate`, or
+`identityPreservingMove` capability. It reserves, writes, reads, migrates, or
+interprets no Tarstate move-metadata key. Existing `__automergeMoves`,
+`__tarstateMovesV1`, or similar values are application data: the adapter
+preserves them as unknown storage but assigns them no Tarstate meaning.
+
+Portable move tiers remain valid generic contracts for non-Automerge sources
+and explicit custom bindings. An application or custom binding that implements
+movement owns its record namespace, migration, conflict behavior, retention,
+and capability claims. Those records are not a built-in Tarstate wire format or
+an interoperability promise. Adding movement to the built-in Automerge adapter
+requires a new owner decision and evidence; it is not an automatic upgrade when
+a library primitive appears.
+
+## D-004: ship one evaluator and one production path
+
+The owner selected simplicity over speculative incremental-maintenance and
+cache machinery. V1 therefore ships the pure full evaluator directly. The
+former differential wrapper was not an incremental engine: it always ran the
+full evaluator while reporting recomputation telemetry, so it and its hint
+protocol were removed rather than retained as a second production path.
+
+Test-only restart and fault-injection sources live under test support and are
+not exported or packed. A receipt ledger has no separate no-op eviction API.
+Future optimized evaluators or caches require a measured need, an explicit
+ownership boundary, and equivalence/lifetime evidence before entering the
+runtime surface; they must not arrive as silent fallback paths.

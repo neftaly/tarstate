@@ -195,21 +195,18 @@ export class InMemoryAtomicSource {
     this.#activeEpoch = nextEpoch;
   }
 
-  /** Decoded receipt eviction cannot erase the authoritative ledger outcome. */
-  evictReceiptCache(): void {}
-
   async #prepare(attempt: TransactionAttempt): Promise<PreparedAttempt | { readonly receipt: CommitReceipt }> {
     const attachment = this.#attachments.get(attempt.attachmentId);
     const transactionHash = attempt.transaction.contentHash;
-    const fallbackAttachment = attachment ?? {
+    const rejectionAttachment = attachment ?? {
       attachmentId: attempt.attachmentId,
-      fingerprint: unknownHash,
-      authorityViewFingerprint: unknownHash,
-      schemaView: { id: 'urn:tarstate:unavailable', contentHash: unknownHash },
+      fingerprint: unavailableAttachmentHash,
+      authorityViewFingerprint: unavailableAttachmentHash,
+      schemaView: { id: 'urn:tarstate:unavailable', contentHash: unavailableAttachmentHash },
       writable: false
     };
-    const intentHash = await intentHashFor(attempt, transactionHash, fallbackAttachment);
-    const reject = (issues: readonly Issue[]) => ({ receipt: this.#rejectRaw(attempt, transactionHash, intentHash, fallbackAttachment.fingerprint, [], issues) });
+    const intentHash = await intentHashFor(attempt, transactionHash, rejectionAttachment);
+    const reject = (issues: readonly Issue[]) => ({ receipt: this.#rejectRaw(attempt, transactionHash, intentHash, rejectionAttachment.fingerprint, [], issues) });
     if (attempt.operationEpoch !== this.#activeEpoch) return reject([txIssue('transaction.operation_epoch_expired', 'commit', { operationEpoch: attempt.operationEpoch }, attempt, 'never')]);
     if (attachment === undefined) return reject([txIssue('transaction.attachment_unavailable', 'resolve', { attachmentId: attempt.attachmentId }, attempt, 'after_refresh')]);
     if (!attachment.writable) return reject([txIssue('transaction.authority_denied', 'commit', { attachmentId: attempt.attachmentId }, attempt, 'after_authority')]);
@@ -773,7 +770,7 @@ const sameStringArray = (left: readonly string[], right: readonly string[]): boo
 const isIndex = (value: JsonValue): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const uniqueOutcomes = (outcomes: readonly SemanticEditOutcome[]): readonly SemanticEditOutcome[] => [...new Map(outcomes.map((outcome) => [canonical(outcome as unknown as JsonValue), outcome])).values()];
 function capability(suffix: string, hash: string): CapabilityRef { return { id: 'urn:tarstate:capability:' + suffix, version: '1', contractHash: `sha256:${hash}` }; }
-const unknownHash = `sha256:${'0'.repeat(64)}` as const;
+const unavailableAttachmentHash = `sha256:${'0'.repeat(64)}` as const;
 
 const txIssue = (
   code: string,

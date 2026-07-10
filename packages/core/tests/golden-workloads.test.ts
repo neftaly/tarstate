@@ -66,7 +66,7 @@ describe('small labeled golden conformance workloads', () => {
   it('runs the migrated/synthetic Probability scene, move, and external-store trace', () => {
     const trace = runProbabilityGolden();
     expect(trace).toMatchObject({ label: 'probability-scene-move-external-store', fixtureStatus: 'migrated-synthetic' });
-    expect(trace.evidence).toMatchObject({ sceneParent: 'column-2', moveMechanism: 'copyRelocate', stableLogicalReference: 'label-1', externalStoreRevision: 1, crossSourceAtomic: false });
+    expect(trace.evidence).toMatchObject({ sceneParent: 'column-2', moveMechanism: 'application-parent-field', stableLogicalReference: 'label-1', externalStoreRevision: 1, crossSourceAtomic: false });
     expect(trace.evidence.afterRows).toEqual([
       { entity: { id: 'panel-1', parentId: 'column-2', kind: 'panel' }, geometry: { entityId: 'panel-1', x: 40, y: 20 } },
       { entity: { id: 'label-1', parentId: 'panel-1', kind: 'label' }, geometry: { entityId: 'label-1', x: 12, y: 24 } }

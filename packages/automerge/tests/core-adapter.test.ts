@@ -208,12 +208,27 @@ describe('Automerge core source protocols', () => {
     source.setLifecycle('loading');
     expect(source.snapshot()).toMatchObject({ state: 'loading', freshness: 'stale' });
     expect(source.snapshot()).not.toHaveProperty('storage');
-    source.markReady();
     runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => { draft.tasks.second = { title: 'Second' }; }));
+    expect(source.snapshot()).toMatchObject({ state: 'loading', freshness: 'stale' });
+    expect(() => source.stage(source.snapshot(), [])).toThrow(/non-ready/);
+    source.markReady();
     source.close();
-    expect(snapshots.map(({ state }) => state)).toEqual(['ready', 'loading', 'ready', 'ready', 'closed']);
+    expect(snapshots.map(({ state }) => state)).toEqual(['ready', 'loading', 'loading', 'ready', 'closed']);
     expect(source.snapshot()).toMatchObject({ state: 'closed', freshness: 'none', issues: [{ code: 'source.closed' }] });
     expect(() => runtime.snapshot()).not.toThrow();
+  });
+
+  it('does not let an observer make an applied runtime commit appear rejected', async () => {
+    const { runtime } = fixture();
+    runtime.subscribe(() => { throw new Error('observer failed'); });
+    const before = runtime.snapshot();
+    const result = await runtime.commit({
+      ...commitInput(before.basis as JsonValue, 'operation:throwing-observer', '5'),
+      expectedBasis: before.basis,
+      commands: [{ apply: (draft) => { draft.tasks.first!.title = 'Committed'; } }]
+    });
+    expect(result).toMatchObject({ outcome: 'committed', changed: true });
+    expect(runtime.snapshot().storage.tasks.first?.title).toBe('Committed');
   });
 
   it('resolves an exactly observed concurrent map conflict through the coordinator', async () => {
@@ -247,25 +262,10 @@ describe('Automerge core source protocols', () => {
     expect(Automerge.getConflicts(runtime.snapshot().storage.tasks, 'same')).toBeUndefined();
   });
 
-  it('rejects generic move and rekey lowering with exact capability evidence instead of approximating replacement', async () => {
+  it('rejects generic rekey lowering with exact capability evidence instead of approximating replacement', async () => {
     const { runtime, source, binding } = fixture();
     const target = selectedTarget(source, binding);
     const before = source.snapshot();
-    const moved = await coordinateSourceCommit({
-      source,
-      bindings: [binding],
-      edits: [{ ...target, kind: 'move-relocate', destination: { relationId: 'relation:tasks', key: ['moved'] }, mode: 'copy-relocate' }],
-      commit: commitInput(before.basis as JsonValue, 'operation:move', '8')
-    });
-    expect(moved).toMatchObject({
-      outcome: 'rejected',
-      issues: [{
-        code: 'transaction.capability_unavailable',
-        retry: 'after_capability',
-        requiredCapabilities: [{ id: 'urn:tarstate:capability:entity/copy-relocate' }],
-        details: { reason: 'move_requires_auditable_operation_identity_and_receipt' }
-      }]
-    });
     const rekeyed = await coordinateSourceCommit({
       source,
       bindings: [binding],
@@ -275,6 +275,21 @@ describe('Automerge core source protocols', () => {
     expect(rekeyed).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.capability_unavailable', requiredCapabilities: [{ id: 'urn:tarstate:capability:entity/rekey' }] }] });
     expect(runtime.snapshot().storage.tasks).toEqual({ first: { title: 'First', priority: 1 } });
     expect(exactAutomergeBasisEqual(before.basis as import('../src/index.js').AutomergeBasis, source.snapshot().basis as import('../src/index.js').AutomergeBasis)).toBe(true);
+  });
+
+  it('rejects generic move intent without writing or interpreting move metadata', async () => {
+    const { runtime, source, binding } = fixture();
+    const target = selectedTarget(source, binding);
+    const before = source.snapshot();
+    const moved = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{ ...target, kind: 'move-relocate', destination: { relationId: 'relation:tasks', key: ['elsewhere'] }, mode: 'copy-relocate' }],
+      commit: commitInput(before.basis as JsonValue, 'operation:move', '8')
+    });
+    expect(moved).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.capability_unavailable', requiredCapabilities: [{ id: 'urn:tarstate:capability:entity/copy-relocate' }] }] });
+    expect(runtime.snapshot().storage.tasks).toEqual({ first: { title: 'First', priority: 1 } });
+    expect(Object.hasOwn(runtime.snapshot().storage, '__tarstateMovesV1')).toBe(false);
   });
 
   it('relates exact and subtree footprints without accepting foreign footprint formats', () => {

@@ -191,6 +191,7 @@ type ExtractedCandidate = { readonly candidate: unknown; readonly locator: Mappi
 const extractCandidates = (snapshot: unknown, collection: CollectionMapping, relationId: RelationId, sourceId?: string): { candidates: readonly ExtractedCandidate[]; issues: readonly Issue[]; complete: boolean } => {
   const resolved = readPath(snapshot, collection.path);
   if (!resolved.present) {
+    if (resolved.reason === 'inspection_failed') return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: resolved.reason, error: resolved.error }, undefined, sourceId, relationId)], complete: false };
     if (collection.absent === 'empty' || collection.absent === 'creatable') return { candidates: [], issues: [], complete: true };
     return { candidates: [], issues: [mappingIssue('mapping.collection_absent', collection.path, { relationId }, undefined, sourceId, relationId)], complete: false };
   }
@@ -221,16 +222,19 @@ const projectCandidate = (candidate: ExtractedCandidate, mapping: RelationStorag
       const storageKey = candidate.storageKey as string;
       if (keyMapping.mirrorPath !== undefined) {
         const mirror = readPath(candidate.candidate, keyMapping.mirrorPath);
+        if (!mirror.present && mirror.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...keyMapping.mirrorPath], { reason: mirror.reason, error: mirror.error, locator: candidate.locator }, sourceId, relationId);
         if (!mirror.present || !samePortableCandidate(mirror.value, storageKey)) return mappingFailure('mapping.map_key_mismatch', [...candidate.absolutePath, ...keyMapping.mirrorPath], { field, mapKey: storageKey, mirror: mirror.present ? mirror.value : 'missing', locator: candidate.locator }, sourceId, relationId, 'manual_repair');
       }
       output[field] = storageKey;
     } else {
       const value = readPath(candidate.candidate, keyMapping.path);
+      if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...keyMapping.path], { reason: value.reason, error: value.error, locator: candidate.locator }, sourceId, relationId);
       if (value.present) output[field] = value.value as PortableValue;
     }
   }
   for (const [field, fieldMapping] of Object.entries(mapping.fields)) {
     const value = readPath(candidate.candidate, fieldMapping.path);
+    if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...fieldMapping.path], { reason: value.reason, error: value.error, locator: candidate.locator }, sourceId, relationId);
     if (value.present) output[field] = value.value as PortableValue;
   }
   return { success: true, value: output, issues: [] };
@@ -241,20 +245,30 @@ const locateCandidate = (snapshot: unknown, collection: CollectionMapping, locat
   const member = locator.kind === 'object-map-key' ? locator.key : locator.index;
   const absolutePath = [...collection.path, member];
   const found = readPath(snapshot, absolutePath);
-  return found.present ? { success: true, value: { candidate: found.value, absolutePath }, issues: [] } : mappingFailure('mapping.locator_stale', absolutePath);
+  if (found.present) return { success: true, value: { candidate: found.value, absolutePath }, issues: [] };
+  return found.reason === 'inspection_failed'
+    ? mappingFailure('mapping.locator_invalid', absolutePath, { reason: found.reason, error: found.error })
+    : mappingFailure('mapping.locator_stale', absolutePath);
 };
 
-const readPath = (root: unknown, path: StoragePath): { readonly present: true; readonly value: unknown } | { readonly present: false } => {
+type PathRead =
+  | { readonly present: true; readonly value: unknown }
+  | { readonly present: false; readonly reason: 'absent' }
+  | { readonly present: false; readonly reason: 'inspection_failed'; readonly error: string };
+
+const readPath = (root: unknown, path: StoragePath): PathRead => {
   let value = root;
   try {
     for (const member of path) {
-      if ((typeof member === 'number' && !Array.isArray(value)) || (typeof member === 'string' && !isRecord(value)) || !Object.hasOwn(value as object, member)) return { present: false };
+      if ((typeof member === 'number' && !Array.isArray(value)) || (typeof member === 'string' && !isRecord(value)) || !Object.hasOwn(value as object, member)) return { present: false, reason: 'absent' };
       const descriptor = Object.getOwnPropertyDescriptor(value as object, member);
-      if (descriptor === undefined || !('value' in descriptor)) return { present: false };
+      if (descriptor === undefined || !('value' in descriptor)) return { present: false, reason: 'absent' };
       value = descriptor.value;
     }
     return { present: true, value };
-  } catch { return { present: false }; }
+  } catch (error) {
+    return { present: false, reason: 'inspection_failed', error: error instanceof Error ? error.name : typeof error };
+  }
 };
 
 const setPath = (root: unknown, path: StoragePath, value: unknown): ParseResult<unknown> => {

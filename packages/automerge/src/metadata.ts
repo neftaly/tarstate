@@ -15,7 +15,7 @@ import {
   type JsonValue
 } from '@tarstate/core';
 import { automergeIssueDeclarations } from './issues.js';
-import { normalizeAutomergeValue } from './projection.js';
+import { conflictsAt, normalizeAutomergeValue } from './projection.js';
 import { automergeMetadataProperty } from './reserved.js';
 import {
   AutomergeSourceRuntime,
@@ -292,9 +292,7 @@ const problemResult = (status: 'malformed' | 'name-collision', raw: JsonValue | 
 });
 
 const conflictEntries = (owner: object, property: string): readonly (readonly [string, unknown])[] => {
-  try {
-    return Object.entries(Automerge.getConflicts(owner as Record<string, unknown>, property) ?? {}).sort(([left], [right]) => left.localeCompare(right));
-  } catch { return []; }
+  return conflictsAt(owner, property);
 };
 
 const parseMetadataCarrier = (value: unknown): AutomergeMetadataV1 | undefined => {

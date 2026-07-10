@@ -241,6 +241,17 @@ describe('production query oracle', () => {
     expect(result.resultKeys[0]).toContain('right=person:2');
   });
 
+  it('rejects missing transformation aliases and recursion references instead of inventing empty inputs', () => {
+    const missingAlias = evaluateQuery({
+      root: { kind: 'with-fields', input: { kind: 'values', alias: 'actual', rows: [{ id: 1 }] }, alias: 'missing', fields: { added: { kind: 'literal', value: true } } },
+      relations: []
+    });
+    expect(missingAlias).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.alias_missing', details: { alias: 'missing' } }] });
+
+    const missingRecursion = evaluateQuery({ root: { kind: 'recursion-ref', name: 'outside-recursion' }, relations: [] });
+    expect(missingRecursion).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.recursion_reference_missing' }] });
+  });
+
   it('turns a throwing named function into unavailable completeness', () => {
     const capability: CapabilityRef = { id: 'urn:test:throwing', version: '1', contractHash: `sha256:${'c'.repeat(64)}` };
     const functions = new Map([[capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash, () => { throw new Error('boom'); }]]);

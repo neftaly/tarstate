@@ -122,6 +122,13 @@ describe('issue catalog', () => {
     expect(first.body.codes['artifact.invalid_json']).toMatchObject({ phase: 'parse', retry: ['after_input'], description: 'Malformed JSON text.' });
     await expect(safeParseIssueCodeCatalog(first)).resolves.toMatchObject({ success: true, value: first });
     await expect(safeParseIssueCodeCatalog({ ...first, contentHash: hash('f') })).resolves.toMatchObject({ success: false, issues: [{ code: 'schema_tools.issue_catalog_hash_mismatch' }] });
+    await expect(createIssueCodeCatalogArtifact({ descriptions: { 'typo.unknown': 'Ignored before this boundary was strict.' } })).rejects.toThrow(/unknown issue code/);
+    await expect(createIssueCodeCatalogArtifact({ id: '' })).rejects.toThrow(/must not be empty/);
+
+    const entry = first.body.codes['artifact.invalid_json'];
+    if (entry === undefined) throw new Error('fixture issue missing');
+    const duplicateRetry = { ...first, body: { codes: { ...first.body.codes, 'artifact.invalid_json': { ...entry, retry: ['after_input', 'after_input'] } } } };
+    await expect(safeParseIssueCodeCatalog(duplicateRetry)).resolves.toMatchObject({ success: false, issues: [{ code: 'schema_tools.issue_catalog_invalid' }] });
   });
 });
 
@@ -144,6 +151,8 @@ describe('database descriptions', () => {
     const description = await describeDatabase({ databaseDescriptionInput: () => input });
     expect(description).toMatchObject({ kind: 'tarstate.database-description', basis: input.basis });
     await expect(describeDatabase({ databaseDescriptionInput: () => undefined })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
+    await expect(describeDatabase({ databaseDescriptionInput: () => { throw new Error('host failed'); } })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
+    await expect(describeDatabase({ databaseDescriptionInput: () => ({ ...input, basis: null }) })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_invalid' }] });
   });
 
   it('rejects tampering, hidden physical fields, duplicate JSON members, and bounded overflow', async () => {

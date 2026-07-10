@@ -44,7 +44,7 @@ export const generateSchemaOutputs = async (input: unknown, budget?: ArtifactPar
     value: {
       typescript: renderTypeScriptDeclarations(prepared.value),
       jsonSchema,
-      jsonSchemaText: JSON.stringify(jsonSchema, undefined, 2) + '\n',
+      jsonSchemaText: renderJson(jsonSchema),
       markdown: renderSchemaMarkdown(prepared.value)
     },
     issues: []
@@ -127,8 +127,6 @@ export const generateJsonSchema = ({ artifact, schema }: PreparedSchemaTooling):
   };
 };
 
-export const renderJsonSchema = (prepared: PreparedSchemaTooling): string => JSON.stringify(generateJsonSchema(prepared), undefined, 2) + '\n';
-
 export const renderSchemaMarkdown = ({ artifact, schema }: PreparedSchemaTooling): string => {
   const lines = [
     '# ' + (artifact.body.description ?? artifact.id),
@@ -163,10 +161,7 @@ const scalarJsonSchema = (scalar: ScalarDeclaration, names: ReadonlyMap<string, 
   if (scalar.kind === 'number') return { type: 'number' };
   if (scalar.kind === 'integer') return { type: 'integer', minimum: Number.MIN_SAFE_INTEGER, maximum: Number.MAX_SAFE_INTEGER };
   if (scalar.kind === 'json') return {};
-  if (scalar.kind === 'ref') {
-    const target = names.get(scalar.target.relationId);
-    return target === undefined ? { type: 'array' } : { $ref: '#/$defs/' + target + 'Key' };
-  }
+  if (scalar.kind === 'ref') return { $ref: '#/$defs/' + requiredRelationTypeName(names, scalar.target.relationId) + 'Key' };
   const type = scalar.kind === 'custom' ? undefined : scalar.kind;
   const taggedProperties: Record<string, JsonValue> = {
     kind: { const: 'tarstate.value' },
@@ -187,7 +182,7 @@ const scalarTypeScript = (scalar: ScalarDeclaration, names: ReadonlyMap<string, 
   if (scalar.kind === 'boolean') return 'boolean';
   if (scalar.kind === 'number' || scalar.kind === 'integer') return 'number';
   if (scalar.kind === 'json') return 'JsonValue';
-  if (scalar.kind === 'ref') return (names.get(scalar.target.relationId) ?? 'ReadonlyArray<JsonValue>') + (names.has(scalar.target.relationId) ? 'Key' : '');
+  if (scalar.kind === 'ref') return requiredRelationTypeName(names, scalar.target.relationId) + 'Key';
   if (scalar.kind === 'custom') return 'TarstateTaggedValue';
   return "Readonly<{ kind: 'tarstate.value'; type: " + JSON.stringify(scalar.kind) + '; value: string }>';
 };
@@ -199,6 +194,14 @@ const scalarLabel = (scalar: ScalarDeclaration): string => {
   if (scalar.kind === 'custom') return 'custom(' + scalar.codec.id + '@' + scalar.codec.version + ')';
   return scalar.kind;
 };
+
+const requiredRelationTypeName = (names: ReadonlyMap<string, string>, relationId: string): string => {
+  const name = names.get(relationId);
+  if (name === undefined) throw new Error('Prepared schema contains an unresolved relation reference: ' + relationId);
+  return name;
+};
+
+const renderJson = (value: JsonValue): string => JSON.stringify(value, undefined, 2) + '\n';
 
 const relationTypeNames = (schema: PreparedSchema): ReadonlyMap<string, string> => {
   const output = new Map<string, string>();

@@ -63,6 +63,34 @@ describe('production external-store adapter', () => {
     expect(external.hydration?.getState()).toBe('ready');
   });
 
+  it('derives restarted hydration directly from the persistence source', () => {
+    const store = createPersistedZustand();
+    let hydrated = true;
+    const starts = new Set<() => void>();
+    const finishes = new Set<() => void>();
+    const external = zustandAtomicExternalStore(store, {
+      hydration: {
+        hasHydrated: () => hydrated,
+        onHydrate: (listener) => { starts.add(listener); return () => { starts.delete(listener); }; },
+        onFinishHydration: (listener) => { finishes.add(listener); return () => { finishes.delete(listener); }; }
+      }
+    });
+    const listener = vi.fn();
+    const unsubscribe = external.hydration?.subscribe(listener);
+    expect(external.hydration?.getState()).toBe('ready');
+
+    hydrated = false;
+    for (const notify of starts) notify();
+    expect(external.hydration?.getState()).toBe('loading');
+    hydrated = true;
+    for (const notify of finishes) notify();
+    expect(external.hydration?.getState()).toBe('ready');
+    expect(listener).toHaveBeenCalledTimes(2);
+    unsubscribe?.();
+    expect(starts.size).toBe(0);
+    expect(finishes.size).toBe(0);
+  });
+
   it('tracks real Zustand persistence hydration even when hydrated data equals initial state', async () => {
     const store = createPersistedZustand();
     const external = zustandAtomicExternalStore(store, { hydration: store.persist });

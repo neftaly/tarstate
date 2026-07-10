@@ -10,16 +10,15 @@ rewrite.
 
 The current repository contains:
 
-- the [normative v1 design packet](docs/v1/README.md);
+- the [normative v1 contract](docs/v1/README.md);
 - the portable semantic oracle, source coordinator, resolver, database,
-  observers, receipts, and maintenance strategies in `@tarstate/core`;
+  observers, and receipts in `@tarstate/core`;
 - production Automerge and generic external-store/Zustand adapters;
 - the small observer-only `@tarstate/react` package; and
 - deterministic schema, issue-catalog, and agent-description tooling.
 
-The temporary spike implementations and tests have been removed. Their written
-evidence remains in the design packet; the production surfaces are the only
-runtime implementation.
+Historical design and spike material remains available in Git history. The
+retained contract and executable production tests are the authority for v1.
 
 ```sh
 pnpm check:release

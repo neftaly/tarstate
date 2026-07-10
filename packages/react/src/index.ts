@@ -48,6 +48,7 @@ export type MutationEntry = {
   readonly state: 'pending' | 'settled' | 'failed';
   readonly receipt?: CommitReceipt;
   readonly error?: { readonly name: string; readonly message: string };
+  readonly optimisticError?: { readonly phase: 'factory'; readonly name: string; readonly message: string };
 };
 
 export type MutationState = {
@@ -212,16 +213,16 @@ export function useMutationState<Selected = MutationState>(options?: MutationSta
 const queryObservationKey = <Query>(
   database: Pick<ObservableDatabase, 'authorityScope' | 'authorityFingerprint' | 'registryFingerprint'>,
   request: ObserveRequest<Query>
-): string => [
+): string => canonicalizeJson([
   request.plan.planId,
   request.plan.rootNodeId,
-  canonicalizeJson((request.parameters ?? {}) as JsonValue),
+  request.parameters ?? {},
   database.authorityScope,
   database.authorityFingerprint,
   database.registryFingerprint,
   request.plan.datasetId,
-  request.allowPartial === true ? 'partial' : 'exact'
-].join('\u0000');
+  request.allowPartial === true
+]);
 
 const emptyServerObservations: readonly ServerObservation[] = Object.freeze([]);
 
@@ -261,6 +262,24 @@ type ActiveOptimisticOverlay = {
   readonly sourceBasis: JsonValue;
   readonly definition: OptimisticOverlay<unknown, unknown>;
 };
+
+const optimisticOverlayError = (
+  phase: 'appliesTo' | 'project' | 'result',
+  overlay: ActiveOptimisticOverlay,
+  cause: unknown
+): Error => new Error('Optimistic overlay ' + phase + ' failed for operation ' + overlay.operationId, { cause });
+
+const errorDetails = (error: unknown): { readonly name: string; readonly message: string } =>
+  error instanceof Error ? { name: error.name, message: error.message } : { name: typeof error, message: String(error) };
+
+const receiptIdentityMatches = (attempt: TransactionAttempt, receipt: CommitReceipt): boolean =>
+  receipt.kind === 'commit'
+  && receipt.receiptVersion === 1
+  && receipt.operationEpoch === attempt.operationEpoch
+  && receipt.operationId === attempt.operationId
+  && receipt.attachmentId === attempt.attachmentId
+  && receipt.transactionHash === attempt.transaction.contentHash;
+
 const storesByDatabase = new WeakMap<object, Map<string, QueryStore<unknown>>>();
 
 const createRuntime = (
@@ -403,13 +422,17 @@ class OptimisticOverlayStore {
       sourceBasis,
       definition
     });
-    this.#changed();
+    try {
+      this.#changed();
+    } catch (error) {
+      this.#overlays.delete(mutationId);
+      this.#changed();
+      throw error;
+    }
   }
 
-  resolve(mutationId: number, receipt: CommitReceipt): void {
-    const overlay = this.#overlays.get(mutationId);
-    if (overlay === undefined || overlay.operationEpoch !== receipt.operationEpoch || overlay.operationId !== receipt.operationId) return;
-    this.#overlays.delete(mutationId);
+  discard(mutationId: number): void {
+    if (!this.#overlays.delete(mutationId)) return;
     this.#changed();
   }
 
@@ -421,8 +444,12 @@ class OptimisticOverlayStore {
     for (const overlay of this.#overlays.values()) {
       const definition = overlay.definition as OptimisticOverlay<Query, Row>;
       if (definition.appliesTo !== undefined) {
-        let applies = false;
-        try { applies = definition.appliesTo(request); } catch { applies = false; }
+        let applies: boolean;
+        try {
+          applies = definition.appliesTo(request);
+        } catch (error) {
+          throw optimisticOverlayError('appliesTo', overlay, error);
+        }
         if (!applies) continue;
       }
       const source = authoritative.current.basis.attachments.find((candidate) => candidate.attachmentId === overlay.attachmentId && candidate.sourceId === overlay.sourceId);
@@ -432,10 +459,12 @@ class OptimisticOverlayStore {
       let projection: OptimisticProjection<Row>;
       try {
         projection = definition.project({ request, authoritative, rows, resultKeys, sourceBasis: overlay.sourceBasis, observedBasis, rebased });
-      } catch {
-        continue;
+      } catch (error) {
+        throw optimisticOverlayError('project', overlay, error);
       }
-      if (projection.rows.length !== projection.resultKeys.length || new Set(projection.resultKeys).size !== projection.resultKeys.length) continue;
+      if (projection === null || typeof projection !== 'object' || !Array.isArray(projection.rows) || !Array.isArray(projection.resultKeys) || projection.rows.length !== projection.resultKeys.length || projection.resultKeys.some((key) => typeof key !== 'string') || new Set(projection.resultKeys).size !== projection.resultKeys.length) {
+        throw optimisticOverlayError('result', overlay, new TypeError('rows and unique string resultKeys must have equal lengths'));
+      }
       rows = projection.rows;
       resultKeys = projection.resultKeys;
       operations.push({
@@ -569,39 +598,48 @@ class MutationStore {
     if (this.#closed) throw new Error('Tarstate provider runtime is closed');
     if (this.#commitImplementation === undefined) throw new Error('TarstateProvider has no commit implementation');
     const mutationId = this.#nextMutationId++;
+    let optimisticError: MutationEntry['optimisticError'];
+    let overlay: OptimisticOverlay<unknown, unknown> | undefined;
     if (this.#optimisticOverlay !== undefined) {
       try {
-        const overlay = this.#optimisticOverlay(attempt);
-        if (overlay !== undefined) this.#overlayStore.add(mutationId, attempt, overlay);
-      } catch { /* an advisory projection cannot block the real commit */ }
+        overlay = this.#optimisticOverlay(attempt);
+      } catch (error) {
+        optimisticError = { phase: 'factory', ...errorDetails(error) };
+      }
     }
+    if (overlay !== undefined) this.#overlayStore.add(mutationId, attempt, overlay);
     this.#replace({
       mutationId,
       operationEpoch: attempt.operationEpoch,
       operationId: attempt.operationId,
       attachmentId: attempt.attachmentId,
-      state: 'pending'
+      state: 'pending',
+      ...(optimisticError === undefined ? {} : { optimisticError })
     });
     try {
       const receipt = await this.#commitImplementation(attempt);
-      this.#overlayStore.resolve(mutationId, receipt);
+      if (!receiptIdentityMatches(attempt, receipt)) throw new Error('Commit receipt identity does not match its transaction attempt');
+      this.#overlayStore.discard(mutationId);
       this.#replace({
         mutationId,
         operationEpoch: attempt.operationEpoch,
         operationId: attempt.operationId,
         attachmentId: attempt.attachmentId,
         state: 'settled',
-        receipt
+        receipt,
+        ...(optimisticError === undefined ? {} : { optimisticError })
       });
       return receipt;
     } catch (error) {
+      this.#overlayStore.discard(mutationId);
       this.#replace({
         mutationId,
         operationEpoch: attempt.operationEpoch,
         operationId: attempt.operationId,
         attachmentId: attempt.attachmentId,
         state: 'failed',
-        error: error instanceof Error ? { name: error.name, message: error.message } : { name: typeof error, message: String(error) }
+        error: errorDetails(error),
+        ...(optimisticError === undefined ? {} : { optimisticError })
       });
       throw error;
     }
@@ -611,7 +649,7 @@ class MutationStore {
     if (this.#closed) return;
     const replaced = [...this.#snapshot.mutations.filter(({ mutationId }) => mutationId !== entry.mutationId), deepFreezeClone(entry)];
     const pending = replaced.filter(({ state }) => state === 'pending');
-    const settled = replaced.filter(({ state }) => state !== 'pending').slice(-100);
+    const settled = replaced.filter(({ state }) => state !== 'pending').slice(-maxRetainedMutations);
     const mutations = [...settled, ...pending].sort((left, right) => left.mutationId - right.mutationId);
     this.#snapshot = Object.freeze({
       pendingCount: mutations.filter(({ state }) => state === 'pending').length,
@@ -629,6 +667,7 @@ class MutationStore {
 }
 
 const emptyMutationState: MutationState = Object.freeze({ pendingCount: 0, mutations: Object.freeze([]) });
+const maxRetainedMutations = 100;
 
 const identitySnapshot = <Row, Selected>(snapshot: ReactObserverSnapshot<Row>): Selected => snapshot as Selected;
 const identityMutationState = <Selected>(state: MutationState): Selected => state as Selected;
@@ -640,7 +679,7 @@ const useExternalStoreWithSelector = <Snapshot, Selected>(
   selector: (snapshot: Snapshot) => Selected,
   isEqual: (left: Selected, right: Selected) => boolean
 ): Selected => {
-  const selectedRef = useRef<{ hasValue: boolean; value: Selected }>({ hasValue: false, value: undefined as Selected });
+  const selectedRef = useRef<{ readonly hasValue: false } | { readonly hasValue: true; readonly value: Selected }>({ hasValue: false });
   const [getSelectedSnapshot, getSelectedServerSnapshot] = useMemo(() => {
     let hasMemo = false;
     let memoSnapshot: Snapshot;

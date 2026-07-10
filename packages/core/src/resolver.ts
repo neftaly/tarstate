@@ -21,8 +21,8 @@ export type ResolvedResource<Value = unknown> = {
 };
 
 export type ResolverDriverResult<Value = unknown> =
-  | { readonly state: 'ready'; readonly resolved?: ResourceRef; readonly freshness?: 'current' | 'stale'; readonly value: Value; readonly contentHash?: `sha256:${string}`; readonly issues?: readonly Issue[] }
-  | { readonly state: 'loading' | 'missing' | 'failed' | 'deleted' | 'unsupported'; readonly resolved?: ResourceRef; readonly freshness?: 'stale' | 'none'; readonly issues?: readonly Issue[] }
+  | { readonly state: 'ready'; readonly resolved?: ResourceRef; readonly freshness: 'current' | 'stale'; readonly value: Value; readonly contentHash?: `sha256:${string}`; readonly issues?: readonly Issue[] }
+  | { readonly state: 'loading' | 'missing' | 'failed' | 'deleted' | 'unsupported'; readonly resolved?: ResourceRef; readonly freshness: 'stale' | 'none'; readonly issues?: readonly Issue[] }
   | { readonly state: 'redirect'; readonly target: ResourceRef; readonly issues?: readonly Issue[] };
 
 export type ResolverDriver = {
@@ -152,6 +152,7 @@ export class ResourceResolver {
       } catch (error) {
         result = {
           state: 'failed',
+          freshness: 'none',
           issues: [resolverIssue('resolver.failed', 'after_refresh', { uri: current.uri, error: error instanceof Error ? error.name : typeof error })]
         };
       }
@@ -174,7 +175,7 @@ export class ResourceResolver {
         resolved,
         redirects,
         result.state,
-        result.freshness ?? (result.state === 'ready' ? 'current' : 'none'),
+        result.freshness,
         result.state === 'ready' ? result.value : undefined,
         [...accumulatedIssues, ...(result.issues ?? [])]
       );

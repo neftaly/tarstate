@@ -7,7 +7,7 @@ import {
   type PlanResult,
   type StorageBinding
 } from '../src/index.js';
-import { RestartableReferenceSource, SerializedRestartableStateStore } from '../src/restartable-source.js';
+import { RestartableReferenceSource, SerializedRestartableStateStore } from './support/restartable-source.js';
 
 type Storage = Readonly<Record<string, number>>;
 type Command = { readonly path: string; readonly value: number };

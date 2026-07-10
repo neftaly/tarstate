@@ -181,7 +181,7 @@ export const prepareDatabaseAttachment = async <State = unknown>(
   });
 };
 
-/** Explicit escape hatch for already-bound read-only observations and test sources. */
+/** Branded preparation for an already-bound projection that can never write. */
 export const prepareManualReadOnlyAttachment = <Storage, Projection>(input: {
   readonly schemaViewIds: readonly string[];
   readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
@@ -206,10 +206,10 @@ const selectDeclaration = (
     const parsed = parseDocumentDeclaration(bootstrap.declaration);
     if (parsed.success) return { success: true, value: { declaration: parsed.value, origin: 'bootstrap', writable: true, issues: [] }, issues: [] };
     if (outOfBand === undefined) return parsed;
-    const fallback = parseDocumentDeclaration(outOfBand);
-    return fallback.success
-      ? { success: true, value: { declaration: fallback.value, origin: 'out-of-band', writable: false, issues: parsed.issues }, issues: [] }
-      : { success: false, issues: [...parsed.issues, ...fallback.issues] };
+    const override = parseDocumentDeclaration(outOfBand);
+    return override.success
+      ? { success: true, value: { declaration: override.value, origin: 'out-of-band', writable: false, issues: parsed.issues }, issues: [] }
+      : { success: false, issues: [...parsed.issues, ...override.issues] };
   }
   if (outOfBand !== undefined) {
     const parsed = parseDocumentDeclaration(outOfBand);

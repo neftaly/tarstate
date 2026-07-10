@@ -1,4 +1,4 @@
-import type { AtomicExternalStore, HydrationState } from '@tarstate/core';
+import type { AtomicExternalStore } from '@tarstate/core';
 import type { StoreApi } from 'zustand/vanilla';
 
 export type ZustandHydration = {
@@ -11,7 +11,7 @@ export const zustandAtomicExternalStore = <State>(
   store: StoreApi<State>,
   options: { readonly hydration?: ZustandHydration } = {}
 ): AtomicExternalStore<State> => {
-  let hydrationState: HydrationState = options.hydration === undefined || options.hydration.hasHydrated() ? 'ready' : 'loading';
+  const hydration = options.hydration;
   return {
     getState: store.getState,
     subscribe: (listener) => store.subscribe(listener),
@@ -24,18 +24,13 @@ export const zustandAtomicExternalStore = <State>(
       if (output === undefined) throw new Error('Zustand did not execute its functional setter synchronously');
       return output.result;
     },
-    ...(options.hydration === undefined ? {} : {
+    ...(hydration === undefined ? {} : {
       hydration: {
-        getState: () => {
-          // Persistence can finish between adapter creation and subscription.
-          // Re-read the authoritative positive signal on every observation.
-          if (options.hydration?.hasHydrated()) hydrationState = 'ready';
-          return hydrationState;
-        },
+        getState: () => hydration.hasHydrated() ? 'ready' : 'loading',
         subscribe: (listener: () => void) => {
-          const stopStart = options.hydration?.onHydrate(() => { hydrationState = 'loading'; listener(); });
-          const stopFinish = options.hydration?.onFinishHydration(() => { hydrationState = 'ready'; listener(); });
-          return () => { stopStart?.(); stopFinish?.(); };
+          const stopStart = hydration.onHydrate(listener);
+          const stopFinish = hydration.onFinishHydration(listener);
+          return () => { stopStart(); stopFinish(); };
         }
       }
     })

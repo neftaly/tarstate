@@ -351,7 +351,7 @@ describe('resource resolver', () => {
         if (reference.uri === 'mem:start') return { state: 'redirect', target: { ...reference, uri: 'mem:value' } };
         if (reference.uri === 'mem:cycle-a') return { state: 'redirect', target: { ...reference, uri: 'mem:cycle-b' } };
         if (reference.uri === 'mem:cycle-b') return { state: 'redirect', target: { ...reference, uri: 'mem:cycle-a' } };
-        return { state: 'ready', value: { inert: true } };
+        return { state: 'ready', freshness: 'current', value: { inert: true } };
       }
     });
     const executable: ResourceRef = { uri: 'mem:start', kind: 'executable-code' };
@@ -401,7 +401,7 @@ describe('resource resolver', () => {
     resolver.register('mem', {
       resolve: async (reference) => {
         calls.set(reference.uri, (calls.get(reference.uri) ?? 0) + 1);
-        return { state: 'ready', value: reference.uri };
+        return { state: 'ready', freshness: 'current', value: reference.uri };
       }
     });
     const resolve = (uri: string) => resolver.resolve({ uri, kind: 'data' }, { authorityScope: 'public' });
@@ -417,7 +417,7 @@ describe('resource resolver', () => {
   });
 
   it('shares in-flight work independently of completed-cache capacity', async () => {
-    let finish: ((value: { readonly state: 'ready'; readonly value: string }) => void) | undefined;
+    let finish: ((value: { readonly state: 'ready'; readonly freshness: 'current'; readonly value: string }) => void) | undefined;
     const calls = vi.fn();
     const resolver = new ResourceResolver({ authority: { permits: () => true }, maxCacheEntries: 0 });
     resolver.register('mem', {
@@ -431,17 +431,17 @@ describe('resource resolver', () => {
     const shared = resolver.resolve(reference, { authorityScope: 'public' });
     expect(shared).toBe(first);
     expect(calls).toHaveBeenCalledOnce();
-    finish?.({ state: 'ready', value: 'first' });
+    finish?.({ state: 'ready', freshness: 'current', value: 'first' });
     await expect(first).resolves.toMatchObject({ value: 'first' });
 
     const second = resolver.resolve(reference, { authorityScope: 'public' });
     expect(calls).toHaveBeenCalledTimes(2);
-    finish?.({ state: 'ready', value: 'second' });
+    finish?.({ state: 'ready', freshness: 'current', value: 'second' });
     await expect(second).resolves.toMatchObject({ value: 'second' });
   });
 
   it('invalidates one authority scope and prevents detached in-flight completions from repopulating it', async () => {
-    const completions: ((value: { readonly state: 'ready'; readonly value: string }) => void)[] = [];
+    const completions: ((value: { readonly state: 'ready'; readonly freshness: 'current'; readonly value: string }) => void)[] = [];
     const calls = vi.fn();
     const resolver = new ResourceResolver({ authority: { permits: () => true }, maxCacheEntries: 4 });
     resolver.register('mem', {
@@ -457,9 +457,9 @@ describe('resource resolver', () => {
     const currentPublic = resolver.resolve(reference, { authorityScope: 'public' });
     expect(calls).toHaveBeenCalledTimes(3);
 
-    completions[0]?.({ state: 'ready', value: 'stale-public' });
-    completions[1]?.({ state: 'ready', value: 'admin' });
-    completions[2]?.({ state: 'ready', value: 'current-public' });
+    completions[0]?.({ state: 'ready', freshness: 'current', value: 'stale-public' });
+    completions[1]?.({ state: 'ready', freshness: 'current', value: 'admin' });
+    completions[2]?.({ state: 'ready', freshness: 'current', value: 'current-public' });
     await expect(stalePublic).resolves.toMatchObject({ value: 'stale-public' });
     await expect(admin).resolves.toMatchObject({ value: 'admin' });
     await expect(currentPublic).resolves.toMatchObject({ value: 'current-public' });
