@@ -5,7 +5,6 @@ import {
   sha256Json,
   type ArtifactRef,
   type ContentHash,
-  type Issue,
   type IssueDeclaration,
   type IssuePhase,
   type IssueRetry,
@@ -13,6 +12,9 @@ import {
   type ParseResult,
   type ValueParseBudget
 } from '@tarstate/core';
+import { schemaToolsFailure, schemaToolsIssueDeclarations } from './internal-issues.js';
+
+export { schemaToolsIssueDeclarations } from './internal-issues.js';
 
 export type IssueCodeCatalogEntry = {
   readonly phase: IssuePhase;
@@ -33,15 +35,6 @@ export type IssueCodeCatalogArtifact = {
   readonly dependencies: readonly [];
   readonly body: IssueCodeCatalogBody;
 };
-
-export const schemaToolsIssueDeclarations: readonly IssueDeclaration[] = [
-  { code: 'schema_tools.artifact_kind', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.database_description_hash_mismatch', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.database_description_invalid', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.database_description_unavailable', phase: 'resolve', severity: 'error', retries: ['after_authority', 'after_refresh'] },
-  { code: 'schema_tools.issue_catalog_hash_mismatch', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.issue_catalog_invalid', phase: 'parse', severity: 'error', retries: ['after_input'] }
-];
 
 export const createIssueCodeCatalogArtifact = async (options: {
   readonly id?: string;
@@ -85,10 +78,10 @@ export const safeParseIssueCodeCatalog = async (input: unknown, budget?: ValuePa
   const portable = budget === undefined ? safeParseJsonValue(input) : safeParseJsonValue(input, budget);
   if (!portable.success) return portable;
   const value = portable.value;
-  if (!isRecord(value) || !exactKeys(value, ['body', 'contentHash', 'dependencies', 'formatVersion', 'id', 'kind']) || value.kind !== 'issue-code-catalog' || value.formatVersion !== 1 || typeof value.id !== 'string' || value.id.length === 0 || !isContentHash(value.contentHash) || !Array.isArray(value.dependencies) || value.dependencies.length !== 0 || !isRecord(value.body) || !exactKeys(value.body, ['codes']) || !isRecord(value.body.codes)) return failure('schema_tools.issue_catalog_invalid', { reason: 'shape' });
+  if (!isRecord(value) || !exactKeys(value, ['body', 'contentHash', 'dependencies', 'formatVersion', 'id', 'kind']) || value.kind !== 'issue-code-catalog' || value.formatVersion !== 1 || typeof value.id !== 'string' || value.id.length === 0 || !isContentHash(value.contentHash) || !Array.isArray(value.dependencies) || value.dependencies.length !== 0 || !isRecord(value.body) || !exactKeys(value.body, ['codes']) || !isRecord(value.body.codes)) return schemaToolsFailure('schema_tools.issue_catalog_invalid', { reason: 'shape' });
   const codes: Record<string, IssueCodeCatalogEntry> = {};
   for (const [code, candidate] of Object.entries(value.body.codes)) {
-    if (code.length === 0 || !isRecord(candidate) || !exactKeys(candidate, ['phase', 'requiredCapabilityFields', 'retry'], ['description']) || !isIssuePhase(candidate.phase) || !Array.isArray(candidate.retry) || !candidate.retry.every(isIssueRetry) || new Set(candidate.retry).size !== candidate.retry.length || !Array.isArray(candidate.requiredCapabilityFields) || !candidate.requiredCapabilityFields.every((field) => typeof field === 'string' && field.length > 0) || new Set(candidate.requiredCapabilityFields).size !== candidate.requiredCapabilityFields.length || (candidate.description !== undefined && (typeof candidate.description !== 'string' || candidate.description.length === 0))) return failure('schema_tools.issue_catalog_invalid', { reason: 'entry', code });
+    if (code.length === 0 || !isRecord(candidate) || !exactKeys(candidate, ['phase', 'requiredCapabilityFields', 'retry'], ['description']) || !isIssuePhase(candidate.phase) || !Array.isArray(candidate.retry) || !candidate.retry.every(isIssueRetry) || new Set(candidate.retry).size !== candidate.retry.length || !Array.isArray(candidate.requiredCapabilityFields) || !candidate.requiredCapabilityFields.every((field) => typeof field === 'string' && field.length > 0) || new Set(candidate.requiredCapabilityFields).size !== candidate.requiredCapabilityFields.length || (candidate.description !== undefined && (typeof candidate.description !== 'string' || candidate.description.length === 0))) return schemaToolsFailure('schema_tools.issue_catalog_invalid', { reason: 'entry', code });
     codes[code] = {
       phase: candidate.phase,
       retry: candidate.retry,
@@ -98,7 +91,7 @@ export const safeParseIssueCodeCatalog = async (input: unknown, budget?: ValuePa
   }
   const catalog: IssueCodeCatalogArtifact = { kind: 'issue-code-catalog', formatVersion: 1, id: value.id, contentHash: value.contentHash, dependencies: [], body: { codes } };
   const expected = await sha256Json({ kind: catalog.kind, formatVersion: catalog.formatVersion, id: catalog.id, dependencies: [], body: catalog.body } as unknown as JsonValue);
-  if (expected !== catalog.contentHash) return failure('schema_tools.issue_catalog_hash_mismatch', { expected, actual: catalog.contentHash });
+  if (expected !== catalog.contentHash) return schemaToolsFailure('schema_tools.issue_catalog_hash_mismatch', { expected, actual: catalog.contentHash });
   return { success: true, value: catalog, issues: [] };
 };
 
@@ -112,5 +105,3 @@ const exactKeys = (value: Readonly<Record<string, JsonValue>>, required: readonl
   return required.every((key) => Object.hasOwn(value, key)) && keys.every((key) => required.includes(key) || optional.includes(key));
 };
 const compare = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
-const failure = (code: string, details: JsonValue): ParseResult<never> => ({ success: false, issues: [toolIssue(code, details)] });
-const toolIssue = (code: string, details: JsonValue): Issue => ({ id: code + ':' + JSON.stringify(details), code, phase: 'parse', severity: 'error', retry: 'after_input', details });

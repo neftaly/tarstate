@@ -21,8 +21,9 @@ await writeOutputs({
 `describeDatabase` accepts either an already authority-filtered
 `DatabaseDescriptionSnapshot` or an object with
 `getDatabaseDescriptionSnapshot()`. It normalizes ordering and duplicate
-references before hashing. `safeParseDatabaseDescription` validates an already
-sealed description strictly, including its fingerprint and parse budget.
+references before hashing and throws `TarstateParseError` for unavailable or
+invalid input. `safeParseDatabaseDescription` validates an already sealed
+description without throwing, including its fingerprint and parse budget.
 
 Generated declarations embed the exact schema ID and content hash. Generation
 returns a `ParseResult`; invalid or over-budget input does not emit partial

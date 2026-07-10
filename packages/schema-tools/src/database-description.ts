@@ -10,11 +10,11 @@ import {
   type ArtifactRef,
   type CapabilityRef,
   type ContentHash,
-  type Issue,
   type JsonValue,
   type ParseResult,
   type ValueDeclaration
 } from '@tarstate/core';
+import { schemaToolsFailure, schemaToolsIssue } from './internal-issues.js';
 
 export type DatabaseDescriptionBasis = {
   readonly dataset: { readonly datasetId: string; readonly revision: number };
@@ -96,12 +96,12 @@ export const describeDatabase = async (source: DatabaseDescriptionSnapshot | Dat
   try {
     input = isDatabaseDescriptionSnapshotProvider(source) ? source.getDatabaseDescriptionSnapshot() : source;
   } catch (error) {
-    throw new TarstateParseError([toolIssue('schema_tools.database_description_unavailable', {
+    throw new TarstateParseError([schemaToolsIssue('schema_tools.database_description_unavailable', {
       reason: 'authority_filtered_snapshot_failed',
       error: error instanceof Error ? error.name : typeof error
-    })]);
+    }, 'after_refresh')]);
   }
-  if (input === undefined) throw new TarstateParseError([toolIssue('schema_tools.database_description_unavailable', { reason: 'authority_filtered_snapshot_unavailable' })]);
+  if (input === undefined) throw new TarstateParseError([schemaToolsIssue('schema_tools.database_description_unavailable', { reason: 'authority_filtered_snapshot_unavailable' }, 'after_refresh')]);
   const parsedInput = safeParseDescriptionInput(input, budget);
   if (!parsedInput.success) throw new TarstateParseError(parsedInput.issues);
   const normalized = normalizeDescriptionInput(parsedInput.value);
@@ -126,10 +126,10 @@ export const safeParseDatabaseDescription = async (input: unknown, budget: Datab
   const portable = safeParseJsonValue(input, budget);
   if (!portable.success) return portable;
   const value = portable.value;
-  if (!isRecord(value) || !exactKeys(value, ['basis', 'capabilityImplications', 'commands', 'databaseFingerprint', 'datasets', 'formatVersion', 'issueCodeCatalog', 'kind', 'registryFingerprint', 'relations']) || value.kind !== 'tarstate.database-description' || value.formatVersion !== 1 || !isContentHash(value.databaseFingerprint) || !isContentHash(value.registryFingerprint)) return failure('schema_tools.database_description_invalid', { path: [], reason: 'shape' });
+  if (!isRecord(value) || !exactKeys(value, ['basis', 'capabilityImplications', 'commands', 'databaseFingerprint', 'datasets', 'formatVersion', 'issueCodeCatalog', 'kind', 'registryFingerprint', 'relations']) || value.kind !== 'tarstate.database-description' || value.formatVersion !== 1 || !isContentHash(value.databaseFingerprint) || !isContentHash(value.registryFingerprint)) return schemaToolsFailure('schema_tools.database_description_invalid', { path: [], reason: 'shape' });
   const basis = parseBasis(value.basis);
   if (!basis.success) return basis;
-  if (!Array.isArray(value.datasets) || !Array.isArray(value.relations) || !Array.isArray(value.commands) || !Array.isArray(value.capabilityImplications)) return failure('schema_tools.database_description_invalid', { path: [], reason: 'collections' });
+  if (!Array.isArray(value.datasets) || !Array.isArray(value.relations) || !Array.isArray(value.commands) || !Array.isArray(value.capabilityImplications)) return schemaToolsFailure('schema_tools.database_description_invalid', { path: [], reason: 'collections' });
   const issueCodeCatalog = parseArtifactRef(value.issueCodeCatalog, ['issueCodeCatalog']);
   if (!issueCodeCatalog.success) return issueCodeCatalog;
   const datasets = parseDatasets(value.datasets);
@@ -157,7 +157,7 @@ export const safeParseDatabaseDescription = async (input: unknown, budget: Datab
   const semantic = { ...parsed, databaseFingerprint: undefined };
   const withoutFingerprint = Object.fromEntries(Object.entries(semantic).filter(([, item]) => item !== undefined)) as unknown as JsonValue;
   const expected = await sha256Json(withoutFingerprint);
-  if (expected !== parsed.databaseFingerprint) return failure('schema_tools.database_description_hash_mismatch', { expected, actual: parsed.databaseFingerprint });
+  if (expected !== parsed.databaseFingerprint) return schemaToolsFailure('schema_tools.database_description_hash_mismatch', { expected, actual: parsed.databaseFingerprint });
   return { success: true, value: deepFreeze(parsed), issues: [] };
 };
 
@@ -325,7 +325,7 @@ const isValueDeclaration = (value: unknown, depth = 0): value is ValueDeclaratio
   return value.kind === 'custom' && exactKeys(value, ['codec', 'kind']) && parseCapability(value.codec, []).success;
 };
 
-const descriptionBudgetIssue = (value: DatabaseDescriptionSnapshot | DatabaseDescription, budget: DatabaseDescriptionBudget): Issue | undefined => {
+const descriptionBudgetIssue = (value: DatabaseDescriptionSnapshot | DatabaseDescription, budget: DatabaseDescriptionBudget) => {
   const capabilityCount = value.relations.reduce((count, relation) => count + relation.editCapabilities.length + relation.missingCapabilities.length, 0) + value.capabilityImplications.length * 2;
   const attachmentCount = value.basis.attachments.length + value.datasets.reduce((count, dataset) => count + dataset.attachmentIds.length, 0);
   const byteLength = new TextEncoder().encode(canonicalizeJson(value as unknown as JsonValue)).byteLength;
@@ -346,10 +346,8 @@ const isRecord = (value: unknown): value is Readonly<Record<string, JsonValue | 
 const exactKeys = (value: Readonly<Record<string, unknown>>, required: readonly string[], optional: readonly string[] = []): boolean => Object.keys(value).every((key) => required.includes(key) || optional.includes(key)) && required.every((key) => Object.hasOwn(value, key));
 const isRevision = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const compare = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
-const invalid = <Value = never>(path: readonly JsonValue[], reason = 'shape'): ParseResult<Value> => failure('schema_tools.database_description_invalid', { path, reason });
-const failure = <Value = never>(code: string, details: JsonValue): ParseResult<Value> => ({ success: false, issues: [toolIssue(code, details)] });
-const budgetExceeded = (name: string, limit: number): Issue => toolIssue('artifact.budget_exceeded', { budget: name, limit });
-const toolIssue = (code: string, details: JsonValue): Issue => ({ id: code + ':' + canonicalizeJson(details), code, phase: 'parse', severity: 'error', retry: 'after_input', details });
+const invalid = <Value = never>(path: readonly JsonValue[], reason = 'shape'): ParseResult<Value> => schemaToolsFailure('schema_tools.database_description_invalid', { path, reason });
+const budgetExceeded = (name: string, limit: number) => schemaToolsIssue('artifact.budget_exceeded', { budget: name, limit });
 
 const deepFreeze = <Value>(value: Value): Value => {
   if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;

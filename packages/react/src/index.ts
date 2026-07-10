@@ -1,5 +1,6 @@
 import {
   canonicalizeJson,
+  queryObservationKey,
   type CommitReceipt,
   type JsonValue,
   type ObserveRequest,
@@ -12,6 +13,7 @@ import {
 import {
   createContext,
   createElement,
+  useCallback,
   useContext,
   useDebugValue,
   useEffect,
@@ -118,17 +120,21 @@ type Runtime = {
 };
 
 const TarstateContext = createContext<Runtime | undefined>(undefined);
+type CommitActions = {
+  readonly executeCommit: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined;
+  readonly createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined;
+};
+const CommitActionsContext = createContext<CommitActions | undefined>(undefined);
 
 /** Borrows a database. Unmounting never closes the database or its sources. */
 export const TarstateProvider = <Query, Row>({ database, executeCommit, createOptimisticOverlay, serverQueryObservations = emptyServerQueryObservations as readonly ServerQueryObservation<Query, Row>[], children }: TarstateProviderProps<Query, Row>): ReactNode => {
   const runtime = useMemo<Runtime>(() => createRuntime(
     database as unknown as ErasedDatabase,
-    normalizeServerQueryObservations(database, serverQueryObservations),
-    executeCommit,
-    createOptimisticOverlay as unknown as ErasedCreateOptimisticOverlay | undefined
-  ), [database, executeCommit, createOptimisticOverlay, serverQueryObservations]);
+    normalizeServerQueryObservations(database, serverQueryObservations)
+  ), [database, serverQueryObservations]);
+  const actions = useMemo(() => ({ executeCommit, createOptimisticOverlay: createOptimisticOverlay as ErasedCreateOptimisticOverlay | undefined }), [executeCommit, createOptimisticOverlay]);
   useEffect(() => runtime.acquire(), [runtime]);
-  return createElement(TarstateContext.Provider, { value: runtime }, children);
+  return createElement(TarstateContext.Provider, { value: runtime }, createElement(CommitActionsContext.Provider, { value: actions }, children));
 };
 
 export const useDatabase = <Query = unknown, Row = unknown>(): ObservableDatabase<Query, Row> =>
@@ -195,7 +201,13 @@ export const useRow = <Query, Row, Parameters extends Readonly<Record<string, Js
 
 export type CommitFunction = (attempt: TransactionAttempt) => Promise<CommitReceipt>;
 
-export const useCommit = (): CommitFunction => useRuntime().mutationStore.commit;
+export const useCommit = (): CommitFunction => {
+  const store = useRuntime().mutationStore;
+  const actions = useContext(CommitActionsContext);
+  const commit = useCallback((attempt: TransactionAttempt) => store.commit(attempt, actions?.executeCommit, actions?.createOptimisticOverlay), [actions?.createOptimisticOverlay, actions?.executeCommit, store]);
+  if (actions === undefined) throw new Error('Tarstate hooks require a TarstateProvider');
+  return commit;
+};
 
 export type MutationStateOptions<Selected> = {
   readonly selectState: (state: MutationState) => Selected;
@@ -215,20 +227,6 @@ export function useMutationState<Selected = MutationState>(options?: MutationSta
     options?.areSelectionsEqual ?? Object.is
   );
 }
-
-const queryObservationKey = <Query>(
-  database: Pick<ObservableDatabase, 'authorityScope' | 'authorityFingerprint' | 'registryFingerprint'>,
-  request: ObserveRequest<Query>
-): string => canonicalizeJson([
-  request.plan.planId,
-  request.plan.rootNodeId,
-  request.parameters ?? {},
-  database.authorityScope,
-  database.authorityFingerprint,
-  database.registryFingerprint,
-  request.plan.datasetId,
-  request.allowPartial === true
-]);
 
 const emptyServerQueryObservations: readonly ServerQueryObservation[] = Object.freeze([]);
 
@@ -271,7 +269,6 @@ type ActiveOptimisticOverlay = {
 
 const optimisticOverlayError = (
   phase: OptimisticUpdateError['phase'],
-  _overlay: ActiveOptimisticOverlay,
   cause: unknown
 ): OptimisticUpdateError => ({ phase, ...errorDetails(cause) });
 
@@ -290,13 +287,11 @@ const storesByDatabase = new WeakMap<object, Map<string, QueryStore<unknown>>>()
 
 const createRuntime = (
   database: ErasedDatabase,
-  serverQuerySnapshots: ReadonlyMap<string, ObserverSnapshot<unknown>>,
-  commit: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined,
-  createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined
+  serverQuerySnapshots: ReadonlyMap<string, ObserverSnapshot<unknown>>
 ): Runtime => {
   let mutationStore: MutationStore | undefined;
   const overlayStore = new OptimisticOverlayStore((mutationId, error) => mutationStore?.recordOptimisticError(mutationId, error));
-  mutationStore = new MutationStore(commit, overlayStore, createOptimisticOverlay);
+  mutationStore = new MutationStore(overlayStore);
   let acquisitions = 0;
   let closeGeneration = 0;
   let closed = false;
@@ -400,8 +395,7 @@ class OptimisticOverlayStore {
   readonly #overlays = new Map<number, ActiveOptimisticOverlay>();
   readonly #views = new Map<string, OptimisticQueryView<unknown, unknown>>();
   readonly #reportError: (mutationId: number, error: OptimisticUpdateError) => void;
-  #addingMutationId: number | undefined;
-  #addFailure: OptimisticUpdateError | undefined;
+  readonly #pendingFailures = new Map<number, OptimisticUpdateError>();
   #revision = 0;
   #closed = false;
 
@@ -441,13 +435,8 @@ class OptimisticOverlayStore {
       sourceBasis,
       definition
     });
-    this.#addingMutationId = mutationId;
-    this.#addFailure = undefined;
     this.#changed();
-    this.#addingMutationId = undefined;
-    const failure = this.#addFailure;
-    this.#addFailure = undefined;
-    return failure;
+    return undefined;
   }
 
   discard(mutationId: number): void {
@@ -460,6 +449,7 @@ class OptimisticOverlayStore {
     let rows = authoritative.current.rows;
     let resultKeys = authoritative.current.resultKeys;
     const operations: OptimisticOperationEvidence[] = [];
+    const failures: [ActiveOptimisticOverlay, OptimisticUpdateError][] = [];
     for (const overlay of this.#overlays.values()) {
       const definition = overlay.definition as OptimisticOverlay<Query, Row>;
       if (definition.appliesToQuery !== undefined) {
@@ -467,7 +457,7 @@ class OptimisticOverlayStore {
         try {
           applies = definition.appliesToQuery(request);
         } catch (error) {
-          this.#failOverlay(overlay, optimisticOverlayError('applies-to-query', overlay, error));
+          failures.push([overlay, optimisticOverlayError('applies-to-query', error)]);
           continue;
         }
         if (!applies) continue;
@@ -480,11 +470,11 @@ class OptimisticOverlayStore {
       try {
         projection = definition.projectRows({ request, authoritativeSnapshot: authoritative, currentRows: rows, currentResultKeys: resultKeys, sourceBasis: overlay.sourceBasis, observedBasis, rebased });
       } catch (error) {
-        this.#failOverlay(overlay, optimisticOverlayError('project-rows', overlay, error));
+        failures.push([overlay, optimisticOverlayError('project-rows', error)]);
         continue;
       }
       if (projection === null || typeof projection !== 'object' || !Array.isArray(projection.rows) || !Array.isArray(projection.resultKeys) || projection.rows.length !== projection.resultKeys.length || projection.resultKeys.some((key) => typeof key !== 'string') || new Set(projection.resultKeys).size !== projection.resultKeys.length) {
-        this.#failOverlay(overlay, optimisticOverlayError('projection-result', overlay, new TypeError('rows and unique string resultKeys must have equal lengths')));
+        failures.push([overlay, optimisticOverlayError('projection-result', new TypeError('rows and unique string resultKeys must have equal lengths'))]);
         continue;
       }
       rows = projection.rows;
@@ -499,8 +489,8 @@ class OptimisticOverlayStore {
         rebased
       });
     }
-    if (operations.length === 0) return authoritative;
-    return deepFreezeClone({
+    for (const [overlay, error] of failures) this.#scheduleFailure(overlay, error);
+    return operations.length === 0 ? authoritative : deepFreezeClone({
       ...authoritative,
       current: { ...authoritative.current, rows, resultKeys },
       optimistic: { operations }
@@ -511,6 +501,7 @@ class OptimisticOverlayStore {
     if (this.#closed) return;
     this.#closed = true;
     this.#overlays.clear();
+    this.#pendingFailures.clear();
     for (const view of Array.from(this.#views.values())) view.close();
     this.#views.clear();
   }
@@ -520,11 +511,22 @@ class OptimisticOverlayStore {
     for (const view of this.#views.values()) view.overlayChanged();
   }
 
-  #failOverlay(overlay: ActiveOptimisticOverlay, error: OptimisticUpdateError): void {
-    this.#overlays.delete(overlay.mutationId);
-    this.#revision += 1;
-    if (this.#addingMutationId === overlay.mutationId) this.#addFailure = error;
-    else this.#reportError(overlay.mutationId, error);
+  #scheduleFailure(overlay: ActiveOptimisticOverlay, error: OptimisticUpdateError): void {
+    if (this.#pendingFailures.has(overlay.mutationId)) return;
+    this.#pendingFailures.set(overlay.mutationId, error);
+    queueMicrotask(() => this.#flushFailures());
+  }
+
+  #flushFailures(): void {
+    if (this.#closed) { this.#pendingFailures.clear(); return; }
+    let changed = false;
+    for (const [mutationId, error] of this.#pendingFailures) {
+      if (!this.#overlays.delete(mutationId)) continue;
+      this.#reportError(mutationId, error);
+      changed = true;
+    }
+    this.#pendingFailures.clear();
+    if (changed) this.#changed();
   }
 }
 
@@ -604,19 +606,13 @@ class OptimisticQueryView<Query, Row> {
 }
 
 class MutationStore {
-  readonly #commitImplementation: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined;
   readonly #overlayStore: OptimisticOverlayStore;
-  readonly #createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined;
   readonly #listeners = new Set<() => void>();
   #snapshot: MutationState = emptyMutationState;
   #nextMutationId = 1;
   #closed = false;
 
-  constructor(commit: ((attempt: TransactionAttempt) => Promise<CommitReceipt>) | undefined, overlayStore: OptimisticOverlayStore, createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined) {
-    this.#commitImplementation = commit;
-    this.#overlayStore = overlayStore;
-    this.#createOptimisticOverlay = createOptimisticOverlay;
-  }
+  constructor(overlayStore: OptimisticOverlayStore) { this.#overlayStore = overlayStore; }
 
   readonly getSnapshot = (): MutationState => this.#snapshot;
 
@@ -625,15 +621,15 @@ class MutationStore {
     return () => { this.#listeners.delete(listener); };
   };
 
-  readonly commit: CommitFunction = async (attempt) => {
+  readonly commit = async (attempt: TransactionAttempt, commitImplementation: CommitFunction | undefined, createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined): Promise<CommitReceipt> => {
     if (this.#closed) throw new Error('Tarstate provider runtime is closed');
-    if (this.#commitImplementation === undefined) throw new Error('TarstateProvider has no commit implementation');
+    if (commitImplementation === undefined) throw new Error('TarstateProvider has no commit implementation');
     const mutationId = this.#nextMutationId++;
     let optimisticError: MutationEntry['optimisticError'];
     let overlay: OptimisticOverlay<unknown, unknown> | undefined;
-    if (this.#createOptimisticOverlay !== undefined) {
+    if (createOptimisticOverlay !== undefined) {
       try {
-        overlay = this.#createOptimisticOverlay(attempt);
+        overlay = createOptimisticOverlay(attempt);
       } catch (error) {
         optimisticError = { phase: 'create-overlay', ...errorDetails(error) };
       }
@@ -649,7 +645,7 @@ class MutationStore {
     });
     let receipt: CommitReceipt;
     try {
-      receipt = await this.#commitImplementation(attempt);
+      receipt = await commitImplementation(attempt);
       if (!receiptIdentityMatches(attempt, receipt)) throw new Error('Commit receipt identity does not match its transaction attempt');
     } catch (error) {
       this.#overlayStore.discard(mutationId);

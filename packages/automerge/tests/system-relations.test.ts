@@ -5,7 +5,6 @@ import {
   automergeSystemRelationIds,
   automergeSystemSchema,
   materializeAutomergeConflictRows,
-  materializeAutomergeSyncRow,
   type AutomergeConflictFact
 } from '../src/index.js';
 
@@ -57,8 +56,9 @@ describe('Automerge system relations', () => {
   it('retains explicit peer correlation and all normalized sync lifecycle states', () => {
     const states = ['observed', 'offline', 'idle', 'syncing', 'synced', 'error'] as const;
     for (const [index, syncState] of states.entries()) {
-      const row = materializeAutomergeSyncRow({
-        attachmentId: 'attachment:one',
+      const state = new AutomergeSystemRelationState('attachment:one');
+      state.apply({
+        kind: 'sync-state',
         documentId: 'document:' + index,
         storageId: 'storage:shared',
         state: syncState,
@@ -66,8 +66,8 @@ describe('Automerge system relations', () => {
         peerId: 'peer:explicit',
         ...(syncState === 'error' ? { errorCode: 'transport_failed' } : {})
       });
-      expect(row.state).toBe(syncState);
-      expect(Object.isFrozen(row)).toBe(true);
+      expect(state.getSnapshot().sync[0]?.state).toBe(syncState);
+      expect(Object.isFrozen(state.getSnapshot().sync[0])).toBe(true);
     }
 
     const state = new AutomergeSystemRelationState('attachment:one');

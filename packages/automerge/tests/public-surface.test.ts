@@ -13,8 +13,8 @@ describe('production Automerge surface', () => {
     expect(automerge.projectAutomergeFacts).toBeTypeOf('function');
   });
 
-  it('does not retain legacy adapter, React, or move-metadata names', () => {
-    for (const name of ['automergeMapAdapter', 'automergeMapSource', 'automergePresenceRuntime', 'useAutomergeStore', 'copyRelocateAutomerge', 'readAutomergeMoveRecords', 'repairAutomergeLiveFork']) {
+  it('does not expose legacy names, move metadata, or internal row materializers', () => {
+    for (const name of ['automergeMapAdapter', 'automergeMapSource', 'automergePresenceRuntime', 'useAutomergeStore', 'copyRelocateAutomerge', 'readAutomergeMoveRecords', 'repairAutomergeLiveFork', 'materializeAutomergePeerRow', 'materializeAutomergeConnectionRow', 'materializeAutomergeSyncRow', 'materializeAutomergePresenceRow']) {
       expect(name in automerge, name).toBe(false);
     }
   });

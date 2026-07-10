@@ -163,18 +163,18 @@ export type AutomergeSystemRelationSnapshot = AutomergeSystemRows & {
   readonly revision: number;
 };
 
-export const materializeAutomergePeerRow = (input: AutomergePeerSystemRow): AutomergePeerSystemRow =>
+const materializeAutomergePeerRow = (input: AutomergePeerSystemRow): AutomergePeerSystemRow =>
   deepFreezeClone(input);
 
-export const materializeAutomergeConnectionRow = (input: AutomergeConnectionSystemRow): AutomergeConnectionSystemRow =>
+const materializeAutomergeConnectionRow = (input: AutomergeConnectionSystemRow): AutomergeConnectionSystemRow =>
   deepFreezeClone(input);
 
-export const materializeAutomergeSyncRow = (input: AutomergeSyncSystemRow): AutomergeSyncSystemRow => deepFreezeClone({
+const materializeAutomergeSyncRow = (input: AutomergeSyncSystemRow): AutomergeSyncSystemRow => deepFreezeClone({
   ...input,
   ...(input.heads === undefined ? {} : { heads: [...new Set(input.heads)].sort() })
 });
 
-export const materializeAutomergePresenceRow = (input: AutomergePresenceSystemRow): AutomergePresenceSystemRow =>
+const materializeAutomergePresenceRow = (input: AutomergePresenceSystemRow): AutomergePresenceSystemRow =>
   deepFreezeClone(input);
 
 export type ConflictLogicalEvidence = {

@@ -269,6 +269,24 @@ describe('@tarstate/react', () => {
     expect(Object.isFrozen(states.at(-1))).toBe(true);
   });
 
+  it('updates commit actions without replacing the query runtime', async () => {
+    const database = new TestDatabase();
+    const firstCommit = vi.fn(async () => commitReceipt());
+    const secondCommit = vi.fn(async () => commitReceipt());
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); useQuery(plan); return null; };
+    const renderer = await mount(createElement(TarstateProvider, { database, executeCommit: firstCommit }, createElement(Consumer)));
+    const observer = database.observers[0];
+
+    await act(() => { renderer.update(createElement(TarstateProvider, { database, executeCommit: secondCommit }, createElement(Consumer))); });
+    await act(async () => { await commit?.(transactionAttempt()); });
+
+    expect(database.observers).toHaveLength(1);
+    expect(observer?.closeCount).toBe(0);
+    expect(firstCommit).not.toHaveBeenCalled();
+    expect(secondCommit).toHaveBeenCalledTimes(1);
+  });
+
   it('applies an immutable optimistic projection tagged by operation and source basis', async () => {
     const database = new TestDatabase();
     let resolveCommit: ((receipt: CommitReceipt) => void) | undefined;
@@ -476,6 +494,44 @@ describe('@tarstate/react', () => {
     expect(remounted).toMatchObject({ state: 'open', current: { rows: [{ id: 1, name: 'one' }] } });
     expect(remounted).not.toHaveProperty('optimistic');
     expect(database.closeCount).toBe(0);
+  });
+
+  it('removes a failed overlay from every query view after a pure snapshot pass', async () => {
+    const database = new TestDatabase();
+    const states: MutationState[] = [];
+    const snapshots: ReactObserverSnapshot<Row>[][] = [];
+    const secondPlan = { ...plan, planId: 'query:second', rootNodeId: 'query:second:root' };
+    const createOptimisticOverlay: CreateOptimisticOverlay<Query, Row> = () => ({
+      sourceId: 'source:one',
+      sourceBasis: { incarnation: 'one', revision: 0 },
+      projectRows: ({ request, currentRows, currentResultKeys }) => {
+        if (request.plan.planId === secondPlan.planId) throw new Error('second query cannot be projected');
+        return { rows: currentRows.map((row) => ({ ...row, name: row.name + '+pending' })), resultKeys: currentResultKeys };
+      }
+    });
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => {
+      commit = useCommit();
+      states.push(useMutationState());
+      snapshots.push([useQuery(plan), useQuery(secondPlan)]);
+      return null;
+    };
+    await mount(createElement(TarstateProvider, {
+      database,
+      executeCommit: () => new Promise<CommitReceipt>(() => undefined),
+      createOptimisticOverlay
+    }, createElement(Consumer)));
+
+    await act(async () => {
+      void commit?.(transactionAttempt());
+      await Promise.resolve();
+    });
+
+    expect(snapshots.at(-1)?.every((snapshot) => !Object.hasOwn(snapshot, 'optimistic'))).toBe(true);
+    expect(states.at(-1)).toMatchObject({
+      pendingCount: 1,
+      mutations: [{ state: 'pending', optimisticError: { phase: 'project-rows', message: 'second query cannot be projected' } }]
+    });
   });
 });
 

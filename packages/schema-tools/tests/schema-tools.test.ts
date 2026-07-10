@@ -151,8 +151,8 @@ describe('database descriptions', () => {
     const input = await databaseInput();
     const description = await describeDatabase({ getDatabaseDescriptionSnapshot: () => input });
     expect(description).toMatchObject({ kind: 'tarstate.database-description', basis: input.basis });
-    await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => undefined })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
-    await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => { throw new Error('host failed'); } })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable' }] });
+    await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => undefined })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable', phase: 'resolve', retry: 'after_refresh' }] });
+    await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => { throw new Error('host failed'); } })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_unavailable', phase: 'resolve', retry: 'after_refresh' }] });
     await expect(describeDatabase({ getDatabaseDescriptionSnapshot: () => ({ ...input, basis: null }) })).rejects.toMatchObject({ issues: [{ code: 'schema_tools.database_description_invalid' }] });
   });
 

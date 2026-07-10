@@ -4,13 +4,13 @@ import {
   type Artifact,
   type ArtifactParseBudget,
   type FieldDeclaration,
-  type Issue,
   type JsonValue,
   type ParseResult,
   type PreparedSchema,
   type ScalarDeclaration,
   type SchemaBody
 } from '@tarstate/core';
+import { schemaToolsFailure } from './internal-issues.js';
 
 export type SchemaArtifact = Omit<Artifact, 'body' | 'kind'> & { readonly kind: 'schema'; readonly body: SchemaBody };
 
@@ -29,7 +29,7 @@ export type GeneratedSchemaOutputs = {
 export const safePrepareSchemaArtifact = async (input: unknown, budget?: ArtifactParseBudget): Promise<ParseResult<PreparedSchemaTooling>> => {
   const parsed = await safeParseArtifactValue(input, budget);
   if (!parsed.success) return parsed;
-  if (parsed.value.kind !== 'schema') return failure('schema_tools.artifact_kind', { expected: 'schema', actual: parsed.value.kind });
+  if (parsed.value.kind !== 'schema') return schemaToolsFailure('schema_tools.artifact_kind', { expected: 'schema', actual: parsed.value.kind });
   const prepared = prepareSchema(parsed.value.body);
   if (!prepared.success) return prepared;
   return { success: true, value: { artifact: parsed.value as SchemaArtifact, schema: prepared.value }, issues: [] };
@@ -226,17 +226,3 @@ const safeComment = (value: string): string => value.replaceAll('*/', '* /').rep
 const markdownCode = (value: string): string => value.replaceAll('`', '\\`');
 const markdownText = (value: string): string => value.replaceAll('|', '\\|').replaceAll(/\r?\n/gu, ' ');
 const yesNo = (value: boolean | undefined): string => value === true ? 'yes' : 'no';
-
-const failure = (code: string, details: JsonValue): ParseResult<never> => ({
-  success: false,
-  issues: [toolIssue(code, details)]
-});
-
-const toolIssue = (code: string, details: JsonValue): Issue => ({
-  id: code + ':' + JSON.stringify(details),
-  code,
-  phase: 'parse',
-  severity: 'error',
-  retry: 'after_input',
-  details
-});
