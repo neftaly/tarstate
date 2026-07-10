@@ -290,10 +290,13 @@ Issue codes are registered, stable, lowercase namespaced identifiers such as
 or free-form details. Every public code has a machine-readable catalog entry
 describing its phase, possible retry classes, and relevant capability fields.
 
-## Conformance gates
+## Production conformance gates
 
-Legacy tests may be deleted only after replacement coverage exists for the
-semantics they protect:
+The legacy implementation and tests were deliberately removed from `main` on
+2026-07-10 as a clean-slate rewrite decision. They remain immutable at the
+`legacy-v0-final` tag for historical and coarse benchmark comparison. The gates
+below are production acceptance requirements for v1; they no longer require
+the legacy dependency graph to coexist with the rewrite.
 
 1. Canonical artifact round-trip, hash mismatch, dependency ambiguity, registry
    fingerprint, duplicate JSON members before materialization, hostile shapes,
@@ -333,8 +336,8 @@ semantics they protect:
     Real Estate, migrated/synthetic Patchpit Ghostscript Tiger, migrated/synthetic
     Probability scene/move plus external-store, leaderboard windows, and v1/v200
     fixtures. Rewritten CljIdle, RealWorld, and collaborative-feed app ports gate
-    deletion of their own legacy coverage and broader compatibility claims, not
-    the core vertical slice. Fixtures MUST label migrations and synthetic data;
+    broader compatibility claims, not the core vertical slice. Fixtures MUST
+    label migrations and synthetic data;
     they cannot claim to describe the current external apps. Patchpit creation
     failure proves source-lifecycle plus partial sequence/orphan receipts.
 13. Agent database-description/system-relation discovery, safe query/transaction

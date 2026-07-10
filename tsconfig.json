@@ -1,11 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable"
-    ],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "skipLibCheck": true,
     "strict": true,
     "exactOptionalPropertyTypes": true,
@@ -16,108 +12,21 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "paths": {
-      "@tarstate/core": [
-        "./packages/core/src/index.ts"
-      ],
-      "@tarstate/core/adapter": [
-        "./packages/core/src/adapter.ts"
-      ],
-      "@tarstate/core/constraints": [
-        "./packages/core/src/constraints.ts"
-      ],
-      "@tarstate/core/db": [
-        "./packages/core/src/db.ts"
-      ],
-      "@tarstate/core/delta": [
-        "./packages/core/src/delta.ts"
-      ],
-      "@tarstate/core/diff": [
-        "./packages/core/src/diff.ts"
-      ],
-      "@tarstate/core/diagnostics": [
-        "./packages/core/src/diagnostics.ts"
-      ],
-      "@tarstate/core/evaluate": [
-        "./packages/core/src/evaluate.ts"
-      ],
-      "@tarstate/core/materialization": [
-        "./packages/core/src/materialization.ts"
-      ],
-      "@tarstate/core/memory-runtime": [
-        "./packages/core/src/memory-runtime.ts"
-      ],
-      "@tarstate/core/query": [
-        "./packages/core/src/query.ts"
-      ],
-      "@tarstate/core/relation": [
-        "./packages/core/src/relation.ts"
-      ],
-      "@tarstate/core/relic": [
-        "./packages/core/src/relic.ts"
-      ],
-      "@tarstate/core/runtime": [
-        "./packages/core/src/runtime.ts"
-      ],
-      "@tarstate/core/schema": [
-        "./packages/core/src/schema.ts"
-      ],
-      "@tarstate/core/source": [
-        "./packages/core/src/source.ts"
-      ],
-      "@tarstate/core/store": [
-        "./packages/core/src/store.ts"
-      ],
-      "@tarstate/core/v1-spike": [
-        "./packages/core/src/v1-spike.ts"
-      ],
-      "@tarstate/core/watch": [
-        "./packages/core/src/watch.ts"
-      ],
-      "@tarstate/core/write": [
-        "./packages/core/src/write.ts"
-      ],
-      "@tarstate/schema-tools": [
-        "./packages/schema-tools/src/index.ts"
-      ],
-      "@tarstate/schema-tools/cli": [
-        "./packages/schema-tools/src/cli.ts"
-      ],
-      "@tarstate/automerge": [
-        "./packages/automerge/src/index.ts"
-      ],
-      "@tarstate/automerge/v1-spike": [
-        "./packages/automerge/src/v1-spike.ts"
-      ],
-      "@tarstate/zustand": [
-        "./packages/zustand/src/index.ts"
-      ],
-      "@tarstate/automerge/presence": [
-        "./packages/automerge/src/presence.ts"
-      ],
-      "@tarstate/automerge/react": [
-        "./packages/automerge/src/react.ts"
-      ],
-      "@tarstate/react": [
-        "./packages/react/src/index.ts"
-      ]
+      "@tarstate/core": ["./packages/core/src/index.ts"],
+      "@tarstate/core/v1-spike": ["./packages/core/src/v1-spike.ts"],
+      "@tarstate/automerge": ["./packages/automerge/src/index.ts"],
+      "@tarstate/automerge/v1-spike": ["./packages/automerge/src/v1-spike.ts"],
+      "@tarstate/zustand": ["./packages/zustand/src/index.ts"]
     },
     "moduleDetection": "force",
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
-    "jsx": "react-jsx",
     "noEmit": true,
-    "types": [
-      "node",
-      "vitest/globals"
-    ]
+    "types": ["node", "vitest/globals"]
   },
   "include": [
-    "packages/*/bench",
     "packages/*/src",
     "packages/*/tests",
-    "scripts/*.ts",
-    "tests/*.ts",
-    "types/*.d.ts",
     "vite.config.ts"
   ]
 }

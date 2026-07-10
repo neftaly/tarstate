@@ -1,7 +1,7 @@
 lockfileVersion: '9.0'
 
 settings:
-  autoInstallPeers: true
+  autoInstallPeers: false
   excludeLinksFromLockfile: false
 
 catalogs:
@@ -9,24 +9,12 @@ catalogs:
     '@types/node':
       specifier: ^24.10.3
       version: 24.13.2
-    '@types/react':
-      specifier: ^19.2.17
-      version: 19.2.17
-    '@types/react-test-renderer':
-      specifier: ^19.1.0
-      version: 19.1.0
     oxlint:
       specifier: 1.70.0
       version: 1.70.0
     oxlint-tsgolint:
       specifier: ^0.23.0
       version: 0.23.0
-    react:
-      specifier: ^19.2.7
-      version: 19.2.7
-    react-test-renderer:
-      specifier: ^19.2.7
-      version: 19.2.7
     typescript:
       specifier: ^6.0.3
       version: 6.0.3
@@ -65,19 +53,13 @@ importers:
       '@automerge/automerge':
         specifier: ^3.2.6
         version: 3.2.6
-      '@automerge/automerge-repo':
-        specifier: ^2.5.6
-        version: 2.5.6
       '@tarstate/core':
         specifier: workspace:*
         version: link:../core
-      react:
-        specifier: '>=18.2.0'
-        version: 19.2.7
     devDependencies:
-      '@tarstate/react':
-        specifier: workspace:*
-        version: link:../react
+      '@automerge/automerge-repo':
+        specifier: ^2.5.6
+        version: 2.5.6
       typescript:
         specifier: 'catalog:'
         version: 6.0.3
@@ -100,50 +82,6 @@ importers:
         specifier: 'catalog:'
         version: 4.1.9(@types/node@24.13.2)(vite@8.1.0(@types/node@24.13.2))
 
-  packages/react:
-    dependencies:
-      '@tarstate/core':
-        specifier: workspace:*
-        version: link:../core
-    devDependencies:
-      '@types/react':
-        specifier: 'catalog:'
-        version: 19.2.17
-      '@types/react-test-renderer':
-        specifier: 'catalog:'
-        version: 19.1.0
-      react:
-        specifier: 'catalog:'
-        version: 19.2.7
-      react-test-renderer:
-        specifier: 'catalog:'
-        version: 19.2.7(react@19.2.7)
-      typescript:
-        specifier: 'catalog:'
-        version: 6.0.3
-      vite:
-        specifier: 'catalog:'
-        version: 8.1.0(@types/node@24.13.2)
-      vitest:
-        specifier: 'catalog:'
-        version: 4.1.9(@types/node@24.13.2)(vite@8.1.0(@types/node@24.13.2))
-
-  packages/schema-tools:
-    dependencies:
-      '@tarstate/core':
-        specifier: workspace:*
-        version: link:../core
-    devDependencies:
-      typescript:
-        specifier: 'catalog:'
-        version: 6.0.3
-      vite:
-        specifier: 'catalog:'
-        version: 8.1.0(@types/node@24.13.2)
-      vitest:
-        specifier: 'catalog:'
-        version: 4.1.9(@types/node@24.13.2)(vite@8.1.0(@types/node@24.13.2))
-
   packages/zustand:
     dependencies:
       '@tarstate/core':
@@ -151,7 +89,7 @@ importers:
         version: link:../core
       zustand:
         specifier: ^5.0.14
-        version: 5.0.14(@types/react@19.2.17)(react@19.2.7)
+        version: 5.0.14
     devDependencies:
       '@tanstack/store':
         specifier: ^0.11.0
@@ -500,12 +438,6 @@ packages:
   '@types/node@24.13.2':
     resolution: {integrity: sha512-fRa09kZTgu8o71KFcDjUFuc7F+dEbZYZmkI0mg5YBTRs0yMKjYHsq/c0urDKeDb+D5qVgXOdFcuu+DZPKOITwA==}
 
-  '@types/react-test-renderer@19.1.0':
-    resolution: {integrity: sha512-XD0WZrHqjNrxA/MaR9O22w/RNidWR9YZmBdRGI7wcnWGrv/3dA8wKCJ8m63Sn+tLJhcjmuhOi629N66W6kgWzQ==}
-
-  '@types/react@19.2.17':
-    resolution: {integrity: sha512-MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw==}
-
   '@vitest/expect@4.1.9':
     resolution: {integrity: sha512-vl/rYsUKcBr3SnQn166+XR5ZQcgMx3DQhFWdfli/cWpLnLUmbxZvyrJZotLFUryib+LtArYMSTJ5RbQ57ZqrlA==}
 
@@ -561,9 +493,6 @@ packages:
 
   convert-source-map@2.0.0:
     resolution: {integrity: sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==}
-
-  csstype@3.2.3:
-    resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
 
   debug@4.4.3:
     resolution: {integrity: sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==}
@@ -732,25 +661,10 @@ packages:
     resolution: {integrity: sha512-vuwillviilfKZsg0VGj5R/YwwcHx4SLsIOI/7K6mQkWx+l5cUHTjj5g0AasTBcyXsbfTgrwsUNmVUb5xVwyPwg==}
     engines: {node: ^10 || ^12 || >=14}
 
-  react-is@19.2.7:
-    resolution: {integrity: sha512-kZFnouyVv7eP/Phmrlo9FK+zcAdriZJvzxXHF1Sl1P377WSGe2G/JxVolhTrB/jeV47lKImhNUsijjHAAbcl/A==}
-
-  react-test-renderer@19.2.7:
-    resolution: {integrity: sha512-U4TyPDJ9MsC8rFimXuJum8w40aPc9kbOZYO8Pc2/4A884i8hwJsMNA/JNyuOc/f2/37wHvk7HjpVl1V4re7Dig==}
-    peerDependencies:
-      react: ^19.2.7
-
-  react@19.2.7:
-    resolution: {integrity: sha512-HNe9WslTbXmFK8o8cmwgAeJFSBvt1bPdHCVKtaaV+WlAN36mpT4hcRpwbf3fY56ar2oIXzsBpOAiIRHAdY0OlQ==}
-    engines: {node: '>=0.10.0'}
-
   rolldown@1.1.3:
     resolution: {integrity: sha512-1F1eEtUBtFvcGm1HQ9TiUIUHPQG7mSAODrhIzjxoUEFuo8OcbrGLiVLkevNgj84TE4lnHvnumwFjhJO5Eu135g==}
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
-
-  scheduler@0.27.0:
-    resolution: {integrity: sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==}
 
   siginfo@2.0.0:
     resolution: {integrity: sha512-ybx0WO1/8bSBLEWXZvEd7gMW3Sn3JFlW3TvX1nREbDLRNQNaeNN8WK0meBwPdAaOI7TtRRRJn/Es1zhrrCHu7g==}
@@ -1118,14 +1032,6 @@ snapshots:
     dependencies:
       undici-types: 7.18.2
 
-  '@types/react-test-renderer@19.1.0':
-    dependencies:
-      '@types/react': 19.2.17
-
-  '@types/react@19.2.17':
-    dependencies:
-      csstype: 3.2.3
-
   '@vitest/expect@4.1.9':
     dependencies:
       '@standard-schema/spec': 1.1.0
@@ -1199,8 +1105,6 @@ snapshots:
   chai@6.2.2: {}
 
   convert-source-map@2.0.0: {}
-
-  csstype@3.2.3: {}
 
   debug@4.4.3:
     dependencies:
@@ -1335,16 +1239,6 @@ snapshots:
       picocolors: 1.1.1
       source-map-js: 1.2.1
 
-  react-is@19.2.7: {}
-
-  react-test-renderer@19.2.7(react@19.2.7):
-    dependencies:
-      react: 19.2.7
-      react-is: 19.2.7
-      scheduler: 0.27.0
-
-  react@19.2.7: {}
-
   rolldown@1.1.3:
     dependencies:
       '@oxc-project/types': 0.137.0
@@ -1365,8 +1259,6 @@ snapshots:
       '@rolldown/binding-wasm32-wasi': 1.1.3
       '@rolldown/binding-win32-arm64-msvc': 1.1.3
       '@rolldown/binding-win32-x64-msvc': 1.1.3
-
-  scheduler@0.27.0: {}
 
   siginfo@2.0.0: {}
 
@@ -1441,7 +1333,4 @@ snapshots:
 
   xstate@5.32.2: {}
 
-  zustand@5.0.14(@types/react@19.2.17)(react@19.2.7):
-    optionalDependencies:
-      '@types/react': 19.2.17
-      react: 19.2.7
+  zustand@5.0.14: {}

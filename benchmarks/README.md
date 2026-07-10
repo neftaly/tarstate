@@ -22,3 +22,9 @@ pnpm bench:legacy ../tarstate-legacy-bench
 Replacement benchmarks should reconstruct the same portable workload inputs
 from `legacy-v0.json` and report their own implementation and commit. Old and
 new packages do not need to coexist in one dependency graph.
+
+The benchmark policy favors semantic simplicity over hot-path tuning. Retain a
+small number of representative workloads and investigate only large
+regressions. A large gap is primarily a signal to simplify boundaries, remove
+duplicated work, or decomplect the design; it is not a mandate to preserve the
+legacy implementation or its micro-optimizations.

@@ -1,25 +1,27 @@
 # Tarstate
 
-Tarstate is being redesigned as a functional, reactive relational interface
-over authority-scoped local-first sources. Automerge documents are the primary
-durable source of truth; Zustand, TanStack Store, and similar stores attach
-through a generic atomic-source protocol.
+Tarstate is a clean-slate v1 rewrite of a functional, reactive relational
+interface over authority-scoped local-first sources.
 
-The existing implementation is archived evidence, not the next public API.
-Production rewrite work has not started. The current source of truth is the
-[Tarstate v1 normative design packet](docs/v1/README.md), including its required
-executable spikes and conformance gates.
+The legacy implementation was removed from `main`. It remains available at the
+annotated Git tag `legacy-v0-final` (commit `25f707c`) for coarse benchmark and
+historical comparisons. It is not a compatibility target or dependency of the
+rewrite.
 
-Key boundaries:
+The current repository contains:
 
-- portable schemas, queries, constraints, transactions, mappings, and lenses;
-- a pure functional core with an imperative source/React/network shell;
-- multi-source reads with explicit evidence, but atomic writes only within one
-  source;
-- functional `pipe` authoring rather than fluent query chains;
-- structured parse results, capability gaps, and receipts suitable for people,
-  applications, and agents.
+- the [normative v1 design packet](docs/v1/README.md);
+- isolated executable semantic seeds in `@tarstate/core`;
+- measured Automerge copy-relocation evidence in `@tarstate/automerge`; and
+- the generic external-store runtime plus Zustand/TanStack evidence.
 
-Legacy code and tests remain temporarily because they are useful behavioral
-oracles for the spikes. They may be deleted only after the replacement evidence
-required by the design packet exists.
+These seeds prove the five entry spikes. They are now the only implementation
+surface and will be replaced or promoted as the production build order
+advances.
+
+```sh
+pnpm check
+```
+
+Legacy performance is intentionally only a gross-regression signal. See
+[benchmarks/README.md](benchmarks/README.md) for the isolated baseline runner.

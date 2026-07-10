@@ -7,36 +7,19 @@
   "files": ["src"],
   "exports": {
     ".": "./src/index.ts",
-    "./v1-spike": "./src/v1-spike.ts",
-    "./react": "./src/react.ts",
-    "./presence": "./src/presence.ts"
+    "./v1-spike": "./src/v1-spike.ts"
   },
   "scripts": {
-    "bench": "vitest bench --run --config ../../vite.config.ts bench/*.bench.ts",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
-    "test:fuzz": "vitest run --config ../../vite.config.ts tests/*fuzz*.test.ts",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
     "@automerge/automerge": "^3.2.6",
-    "@automerge/automerge-repo": "^2.5.6",
     "@tarstate/core": "workspace:*"
   },
-  "peerDependencies": {
-    "@tarstate/react": "workspace:*",
-    "react": ">=18.2.0"
-  },
-  "peerDependenciesMeta": {
-    "@tarstate/react": {
-      "optional": true
-    },
-    "react": {
-      "optional": true
-    }
-  },
   "devDependencies": {
-    "@tarstate/react": "workspace:*",
+    "@automerge/automerge-repo": "^2.5.6",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vitest": "catalog:"
