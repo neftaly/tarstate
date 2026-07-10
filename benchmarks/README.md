@@ -23,6 +23,18 @@ Replacement benchmarks should reconstruct the same portable workload inputs
 from `legacy-v0.json` and report their own implementation and commit. Old and
 new packages do not need to coexist in one dependency graph.
 
+The production tree also has one deliberately coarse smoke benchmark over its
+five staged golden workloads. Build first, then run:
+
+```sh
+pnpm build
+pnpm bench
+```
+
+Set `TARSTATE_BENCH_ITERATIONS` only when a longer gross-regression sample is
+useful. This is a structural signal, not a microbenchmark or a parity claim for
+the archived legacy scenarios.
+
 The benchmark policy favors semantic simplicity over hot-path tuning. Retain a
 small number of representative workloads and investigate only large
 regressions. A large gap is primarily a signal to simplify boundaries, remove

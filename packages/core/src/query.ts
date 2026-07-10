@@ -105,7 +105,7 @@ export type QueryResult = {
 type Provenance = { readonly sourceId?: string; readonly attachmentId?: string; readonly relationId: string; readonly key?: JsonValue; readonly occurrence: string };
 type ScopedRow = { readonly scope: Readonly<Record<string, QueryRecord>>; readonly provenance: Readonly<Record<string, Provenance>> };
 type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: Completeness };
-type ExpressionResult = { readonly status: 'known'; readonly value: JsonValue } | { readonly status: 'missing' | 'unknown' | 'unavailable' };
+type ExpressionResult = { readonly status: 'known'; readonly value: JsonValue } | { readonly status: 'missing' | 'unknown' | 'indeterminate' | 'unavailable' };
 type EvalContext = { readonly row: ScopedRow; readonly parameters: Readonly<Record<string, JsonValue>>; readonly functions: FunctionRegistry; readonly issues: Issue[]; readonly query?: QueryContext };
 type QueryContext = {
   readonly relations: ReadonlyMap<string, RelationInput>;
@@ -181,7 +181,7 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     if (inner.completeness === 'unknown') return inner;
     const rows = inner.rows.filter((row) => {
       const result = evaluateExpr(node.predicate, exprContext(row, context));
-      if (result.status === 'unavailable') context.unavailable = true;
+      if (result.status === 'unavailable' || result.status === 'indeterminate') context.unavailable = true;
       return result.status === 'known' && result.value === true;
     });
     return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
@@ -212,10 +212,11 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     const rows: ScopedRow[] = [];
     for (const row of inner.rows) {
       const value = evaluateExpr(node.expression, exprContext(row, context));
+      if (value.status === 'unavailable' || value.status === 'indeterminate') context.unavailable = true;
       if (value.status !== 'known' || !Array.isArray(value.value)) continue;
       value.value.forEach((item, index) => rows.push({ scope: { ...row.scope, [node.alias]: { [node.field]: item } }, provenance: { ...row.provenance, [node.alias]: { relationId: 'unnest', occurrence: resultKey(row) + ':' + index } } }));
     }
-    return { rows, completeness: inner.completeness };
+    return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
   if (node.kind === 'join') return evaluateJoin(node, context);
   if (node.kind === 'aggregate') return evaluateAggregate(node, context);
@@ -228,7 +229,8 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
   if (node.kind === 'order') {
     const inner = evaluateNode(node.input, context);
     if (inner.completeness !== 'exact') return nonMonotoneUnknown(context, 'order');
-    return { rows: [...inner.rows].sort((left, right) => compareOrder(left, right, node.by, context)), completeness: 'exact' };
+    const rows = [...inner.rows].sort((left, right) => compareOrder(left, right, node.by, context));
+    return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: 'exact' };
   }
   if (node.kind === 'slice') {
     const inner = evaluateNode(node.input, context);
@@ -245,21 +247,24 @@ const evaluateJoin = (node: Extract<QueryNode, { readonly kind: 'join' }>, conte
   const left = evaluateNode(node.left, context);
   const right = evaluateNode(node.right, context);
   if (left.completeness === 'unknown' || right.completeness === 'unknown') return { rows: [], completeness: 'unknown' };
-  if ((node.join === 'anti' || node.join === 'left') && (left.completeness !== 'exact' || right.completeness !== 'exact')) return nonMonotoneUnknown(context, node.join);
+  if ((node.join === 'anti' || node.join === 'left') && right.completeness !== 'exact') return nonMonotoneUnknown(context, node.join);
   const rows: ScopedRow[] = [];
   for (const leftRow of left.rows) {
     let matched = false;
     for (const rightRow of right.rows) {
       const combined = { scope: { ...leftRow.scope, ...rightRow.scope }, provenance: { ...leftRow.provenance, ...rightRow.provenance } };
       const result = node.join === 'cross' || node.on === undefined ? known(true) : evaluateExpr(node.on, exprContext(combined, context));
-      if (result.status === 'unavailable') context.unavailable = true;
+      if (result.status === 'unavailable' || result.status === 'indeterminate') context.unavailable = true;
       if (result.status !== 'known' || result.value !== true) continue;
       matched = true;
       if (node.join === 'inner' || node.join === 'cross' || node.join === 'left') rows.push(combined);
     }
     if (node.join === 'semi' && matched) rows.push(leftRow);
     if (node.join === 'anti' && !matched) rows.push(leftRow);
-    if (node.join === 'left' && !matched) rows.push(leftRow);
+    if (node.join === 'left' && !matched) {
+      const missingRight = Object.fromEntries([...queryAliases(node.right)].map((alias) => [alias, {}]));
+      rows.push({ scope: { ...leftRow.scope, ...missingRight }, provenance: leftRow.provenance });
+    }
   }
   if (context.unavailable) return { rows: [], completeness: 'unknown' };
   return { rows, completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
@@ -282,12 +287,13 @@ const evaluateAggregate = (node: Extract<QueryNode, { readonly kind: 'aggregate'
     for (const [name, aggregate] of Object.entries(node.measures)) output[name] = aggregateValue(aggregate, members, context);
     return { scope: { [node.alias]: output }, provenance: { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + index + ':' + canonicalizeQueryValue(key) } } };
   });
-  return { rows, completeness: 'exact' };
+  return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: 'exact' };
 };
 
 const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], context: QueryContext): QueryLogicalValue => {
   const ordered = aggregate.orderBy === undefined ? rows : [...rows].sort((left, right) => compareOrder(left, right, aggregate.orderBy ?? [], context));
   const values = aggregate.value === undefined ? ordered.map(() => known(1)) : ordered.map((row) => evaluateExpr(aggregate.value as Expr, exprContext(row, context)));
+  if (values.some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
   const knownValues = values.filter((result): result is { readonly status: 'known'; readonly value: JsonValue } => result.status === 'known' && result.value !== null).map((result) => result.value);
   if (aggregate.op === 'count') return knownValues.length;
   if (aggregate.op === 'count-distinct') return new Set(knownValues.map(canonicalizeJson)).size;
@@ -311,13 +317,13 @@ const evaluateSet = (node: Extract<QueryNode, { readonly kind: 'set' }>, context
   const left = evaluateNode(node.left, context);
   const right = evaluateNode(node.right, context);
   if (left.completeness === 'unknown' || right.completeness === 'unknown') return { rows: [], completeness: 'unknown' };
-  if ((node.op === 'intersect' || node.op === 'except') && (left.completeness !== 'exact' || right.completeness !== 'exact')) return nonMonotoneUnknown(context, node.op);
+  if (node.op === 'except' && right.completeness !== 'exact') return nonMonotoneUnknown(context, node.op);
   if (node.op === 'union-all') return { rows: [...left.rows, ...right.rows], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
   const leftMap = uniqueRows(left.rows);
   const rightMap = uniqueRows(right.rows);
   if (node.op === 'union') return { rows: [...new Map([...leftMap, ...rightMap]).values()], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
-  if (node.op === 'intersect') return { rows: [...leftMap].filter(([key]) => rightMap.has(key)).map(([, row]) => row), completeness: 'exact' };
-  return { rows: [...leftMap].filter(([key]) => !rightMap.has(key)).map(([, row]) => row), completeness: 'exact' };
+  if (node.op === 'intersect') return { rows: [...leftMap].filter(([key]) => rightMap.has(key)).map(([, row]) => row), completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
+  return { rows: [...leftMap].filter(([key]) => !rightMap.has(key)).map(([, row]) => row), completeness: left.completeness };
 };
 
 const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, context: QueryContext): NodeResult => {
@@ -327,7 +333,9 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
   for (const [field, window] of Object.entries(node.fields)) {
     const partitions = new Map<string, ScopedRow[]>();
     for (const row of output) {
-      const key = canonicalizeJson((window.partitionBy ?? []).map((expr) => expressionJson(evaluateExpr(expr, exprContext(row, context)))));
+      const partitionValues = (window.partitionBy ?? []).map((expr) => evaluateExpr(expr, exprContext(row, context)));
+      if (partitionValues.some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
+      const key = canonicalizeJson(partitionValues.map(expressionJson));
       const rows = partitions.get(key) ?? [];
       rows.push(row);
       partitions.set(key, rows);
@@ -337,13 +345,17 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
       let rank = 1;
       let previousOrder: string | undefined;
       partition.forEach((row, index) => {
-        const orderKey = canonicalizeJson(window.orderBy.map((term) => expressionJson(evaluateExpr(term.value, exprContext(row, context)))));
+        const orderValues = window.orderBy.map((term) => evaluateExpr(term.value, exprContext(row, context)));
+        if (orderValues.some((item) => item.status === 'unavailable' || item.status === 'indeterminate')) context.unavailable = true;
+        const orderKey = canonicalizeJson(orderValues.map(expressionJson));
         if (previousOrder !== undefined && previousOrder !== orderKey) rank = index + 1;
         previousOrder = orderKey;
         let value: JsonValue = window.op === 'row-number' ? index + 1 : rank;
         if (window.op === 'lag') {
           const previous = partition[index - (window.offset ?? 1)];
-          value = previous === undefined || window.value === undefined ? null : expressionJson(evaluateExpr(window.value, exprContext(previous, context)));
+          const lagged = previous === undefined || window.value === undefined ? undefined : evaluateExpr(window.value, exprContext(previous, context));
+          if (lagged?.status === 'unavailable' || lagged?.status === 'indeterminate') context.unavailable = true;
+          value = lagged === undefined ? null : expressionJson(lagged);
         }
         const aliasFields = row.scope[node.alias] ?? {};
         const rowIndex = output.indexOf(row);
@@ -351,7 +363,7 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
       });
     }
   }
-  return { rows: output, completeness: 'exact' };
+  return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows: output, completeness: 'exact' };
 };
 
 const evaluateSeek = (node: Extract<QueryNode, { readonly kind: 'seek' }>, context: QueryContext): NodeResult => {
@@ -362,7 +374,7 @@ const evaluateSeek = (node: Extract<QueryNode, { readonly kind: 'seek' }>, conte
     return { rows: [], completeness: 'unknown' };
   }
   const rows = [...inner.rows].sort((left, right) => compareOrder(left, right, node.by, context)).filter((row) => compareRowToCursor(row, node.by, node.after, context) > 0);
-  return { rows, completeness: 'exact' };
+  return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: 'exact' };
 };
 
 const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive' }>, context: QueryContext): NodeResult => {
@@ -379,7 +391,7 @@ const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive'
   const keys = new Set<string>();
   const add = (candidate: ScopedRow): boolean => {
     const parts = node.key.map((expression) => evaluateExpr(expression, exprContext(candidate, context)));
-    if (parts.some((part) => part.status === 'unavailable')) context.unavailable = true;
+    if (parts.some((part) => part.status === 'unavailable' || part.status === 'indeterminate')) context.unavailable = true;
     if (parts.some((part) => part.status !== 'known')) return false;
     const key = canonicalizeJson(parts.map((part) => (part as { readonly status: 'known'; readonly value: JsonValue }).value));
     if (keys.has(key)) return false;
@@ -423,13 +435,24 @@ const isMonotoneRecursiveBody = (node: QueryNode): boolean => {
   return true;
 };
 
+const queryAliases = (node: QueryNode): ReadonlySet<string> => {
+  if (node.kind === 'from' || node.kind === 'values') return new Set([node.alias]);
+  if (node.kind === 'select' || node.kind === 'aggregate') return new Set([node.alias]);
+  if (node.kind === 'recursion-ref') return new Set();
+  if (node.kind === 'recursive') return queryAliases(node.seed);
+  if (node.kind === 'join') return node.join === 'semi' || node.join === 'anti' ? queryAliases(node.left) : new Set([...queryAliases(node.left), ...queryAliases(node.right)]);
+  if (node.kind === 'set') return new Set([...queryAliases(node.left), ...queryAliases(node.right)]);
+  if (node.kind === 'unnest') return new Set([...queryAliases(node.input), node.alias]);
+  return queryAliases(node.input);
+};
+
 export const evaluateExpression = (expression: Expr, row: Readonly<Record<string, QueryRecord>>, options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}): EvaluationValue => {
   const issues: Issue[] = [];
   const scoped: ScopedRow = { scope: row, provenance: {} };
   const result = evaluateExpr(expression, { row: scoped, parameters: options.parameters ?? {}, functions: options.functions ?? new Map(), issues });
   if (result.status === 'known') return result.value;
   if (result.status === 'missing') return missingValue;
-  if (result.status === 'unknown') return logicalUnknown;
+  if (result.status === 'unknown' || result.status === 'indeterminate') return logicalUnknown;
   return capabilityUnavailable;
 };
 
@@ -445,11 +468,15 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   if (expression.kind === 'key-of' || expression.kind === 'source-of') {
     const provenance = context.row.provenance[expression.alias];
     if (provenance === undefined) return { status: 'missing' };
-    return known(expression.kind === 'key-of' ? provenance.key ?? null : provenance.sourceId ?? null);
+    const value = expression.kind === 'key-of' ? provenance.key : provenance.sourceId;
+    return value === undefined ? { status: 'missing' } : known(value);
   }
   if (expression.kind === 'is-null' || expression.kind === 'is-missing') {
     const value = evaluateExpr(expression.value, context);
-    return known(expression.kind === 'is-null' ? value.status === 'known' && value.value === null : value.status === 'missing');
+    if (value.status === 'unavailable' || value.status === 'indeterminate') return value;
+    if (expression.kind === 'is-missing') return known(value.status === 'missing');
+    if (value.status === 'unknown') return value;
+    return known(value.status === 'known' && value.value === null);
   }
   if (expression.kind === 'compare') {
     const left = evaluateExpr(expression.left, context);
@@ -468,7 +495,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   if (expression.kind === 'boolean') {
     if (expression.op === 'not') {
       const value = evaluateExpr(expression.arg, context);
-      if (value.status === 'unavailable') return value;
+      if (value.status === 'unavailable' || value.status === 'indeterminate') return value;
       const truth = value.status === 'known' && typeof value.value === 'boolean' ? value.value : logicalUnknown;
       const result = logicalNot(truth);
       return result === logicalUnknown ? { status: 'unknown' } : known(result);
@@ -477,7 +504,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     if (values.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
     const truths = values.map((value): LogicalTruth => value.status === 'known' && typeof value.value === 'boolean' ? value.value : logicalUnknown);
     const result = expression.op === 'and' ? logicalAnd(truths) : logicalOr(truths);
-    return result === logicalUnknown ? { status: 'unknown' } : known(result);
+    return result === logicalUnknown ? values.some((value) => value.status === 'indeterminate') ? { status: 'indeterminate' } : { status: 'unknown' } : known(result);
   }
   if (expression.kind === 'arithmetic') {
     const left = evaluateExpr(expression.left, context);
@@ -492,6 +519,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   if (expression.kind === 'string') {
     const args = expression.args.map((argument) => evaluateExpr(argument, context));
     if (args.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
+    if (args.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
     if (args.some((value) => value.status !== 'known' || typeof value.value !== 'string')) return { status: 'unknown' };
     const strings = args.map((value) => (value as { readonly status: 'known'; readonly value: string }).value);
     return known(expression.op === 'concat' ? strings.join('') : expression.op === 'lower' ? (strings[0] ?? '').toLowerCase() : expression.op === 'upper' ? (strings[0] ?? '').toUpperCase() : Array.from(strings[0] ?? '').length);
@@ -499,6 +527,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   if (expression.kind === 'array') {
     const values = expression.items.map((item) => evaluateExpr(item, context));
     if (values.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
+    if (values.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
     if (values.some((value) => value.status !== 'known')) return { status: 'unknown' };
     return known(values.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value));
   }
@@ -509,7 +538,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   if (expression.kind === 'case') {
     for (const branch of expression.branches) {
       const condition = evaluateExpr(branch.when, context);
-      if (condition.status === 'unavailable') return condition;
+      if (condition.status === 'unavailable' || condition.status === 'indeterminate') return condition;
       if (condition.status === 'known' && condition.value === true) return evaluateExpr(branch.then, context);
     }
     return evaluateExpr(expression.otherwise, context);
@@ -517,7 +546,8 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   if (expression.kind === 'coalesce') {
     for (const argument of expression.args) {
       const value = evaluateExpr(argument, context);
-      if (value.status === 'unavailable') return value;
+      if (value.status === 'unavailable' || value.status === 'indeterminate') return value;
+      if (value.status === 'unknown') return value;
       if (value.status === 'known' && value.value !== null) return value;
     }
     return known(null);
@@ -537,8 +567,9 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     };
     const result = evaluateNode(expression.query, child);
     if (child.unavailable) { context.query.unavailable = true; return { status: 'unavailable' }; }
-    if (result.completeness === 'unknown') return { status: 'unknown' };
-    if (expression.mode === 'exists') return known(result.rows.length > 0);
+    if (result.completeness === 'unknown') return { status: 'indeterminate' };
+    if (expression.mode === 'exists') return result.rows.length > 0 ? known(true) : result.completeness === 'exact' ? known(false) : { status: 'indeterminate' };
+    if (result.completeness !== 'exact') return { status: 'indeterminate' };
     if (result.rows.length !== 1) {
       context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { rows: result.rows.length } }));
       return { status: 'unknown' };
@@ -549,7 +580,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
       context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { fields: values.length } }));
       return { status: 'unknown' };
     }
-    return known(values[0] as JsonValue);
+    return values[0] === logicalUnknown ? { status: 'unknown' } : known(values[0] as JsonValue);
   }
   if (expression.kind === 'call') {
     const fn = context.functions.get(capabilityKey(expression.capability));
@@ -560,14 +591,19 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     const args = expression.args.map((argument) => evaluateExpr(argument, context));
     if (args.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
     if (args.some((value) => value.status !== 'known')) return { status: 'unknown' };
-    return known(fn(args.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value)));
+    try {
+      return known(fn(args.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value)));
+    } catch (error) {
+      context.issues.push(createIssue({ code: 'query.function_failed', phase: 'query', severity: 'error', retry: 'after_input', requiredCapabilities: [expression.capability], details: { error: error instanceof Error ? error.name : typeof error } }));
+      return { status: 'unavailable' };
+    }
   }
   return { status: 'unknown' };
 };
 
 const exprContext = (row: ScopedRow, context: QueryContext): EvalContext => ({ row, parameters: context.parameters, functions: context.functions, issues: context.issues, query: context });
 const known = (value: JsonValue): ExpressionResult => ({ status: 'known', value });
-const propagate = (...values: readonly ExpressionResult[]): ExpressionResult | undefined => values.some((value) => value.status === 'unavailable') ? { status: 'unavailable' } : values.some((value) => value.status === 'unknown') ? { status: 'unknown' } : undefined;
+const propagate = (...values: readonly ExpressionResult[]): ExpressionResult | undefined => values.some((value) => value.status === 'unavailable') ? { status: 'unavailable' } : values.some((value) => value.status === 'indeterminate') ? { status: 'indeterminate' } : values.some((value) => value.status === 'unknown') ? { status: 'unknown' } : undefined;
 const expressionJson = (result: ExpressionResult): JsonValue => result.status === 'known' ? result.value : null;
 
 const projectFields = (fields: Readonly<Record<string, Expr>>, context: EvalContext): QueryRecord => {
@@ -576,7 +612,7 @@ const projectFields = (fields: Readonly<Record<string, Expr>>, context: EvalCont
     const result = evaluateExpr(expression, context);
     if (result.status === 'known') output[name] = result.value;
     else if (result.status === 'unknown') output[name] = logicalUnknown;
-    else if (result.status === 'unavailable' && context.query !== undefined) context.query.unavailable = true;
+    else if ((result.status === 'unavailable' || result.status === 'indeterminate') && context.query !== undefined) context.query.unavailable = true;
   }
   return output;
 };
@@ -600,6 +636,7 @@ const compareOrder = (left: ScopedRow, right: ScopedRow, terms: readonly OrderTe
   for (const term of terms) {
     const leftValue = evaluateExpr(term.value, exprContext(left, context));
     const rightValue = evaluateExpr(term.value, exprContext(right, context));
+    if (leftValue.status === 'unavailable' || leftValue.status === 'indeterminate' || rightValue.status === 'unavailable' || rightValue.status === 'indeterminate') context.unavailable = true;
     const comparison = compareOrderedExpressions(leftValue, rightValue, term);
     if (comparison !== 0) return comparison;
   }
@@ -610,6 +647,7 @@ const compareRowToCursor = (row: ScopedRow, terms: readonly OrderTerm[], cursor:
   for (let index = 0; index < terms.length; index += 1) {
     const term = terms[index] as OrderTerm;
     const rowValue = evaluateExpr(term.value, exprContext(row, context));
+    if (rowValue.status === 'unavailable' || rowValue.status === 'indeterminate') context.unavailable = true;
     const cursorValue = known(cursor.order[index] ?? null);
     const comparison = compareOrderedExpressions(rowValue, cursorValue, term);
     if (comparison !== 0) return comparison;

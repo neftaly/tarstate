@@ -5,6 +5,8 @@ import {
   HostRuntimeRegistry,
   TarstateParseError,
   artifactSemanticValue,
+  builtInCapabilityDeclarations,
+  builtInCapabilityRefs,
   canonicalizeJson,
   capabilityRefFor,
   capabilityUnavailable,
@@ -19,6 +21,7 @@ import {
   safeParseJsonValue,
   sealArtifact,
   sha256Json,
+  verifyBuiltInCapabilities,
   type CapabilityDeclaration,
   type JsonValue,
   type PreparedPlan
@@ -27,6 +30,14 @@ import {
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 
 describe('production foundation', () => {
+  it('reconstructs every frozen built-in capability reference and implication', async () => {
+    expect(await verifyBuiltInCapabilities()).toBe(true);
+    const refs = await Promise.all(builtInCapabilityDeclarations.map(capabilityRefFor));
+    expect(refs).toHaveLength(10);
+    expect(builtInCapabilityDeclarations.find(({ id }) => id.endsWith('copy-relocate'))?.implies).toEqual([builtInCapabilityRefs.move]);
+    expect(refs).toContainEqual(builtInCapabilityRefs.durableOperationReceipts);
+  });
+
   it('keeps logical unknown, missing, unavailable, and the string unknown disjoint', () => {
     expect(logicalUnknown).not.toBe(missingValue);
     expect(logicalUnknown).not.toBe(capabilityUnavailable);

@@ -1,5 +1,5 @@
 {
-  "name": "@tarstate/core",
+  "name": "@tarstate/schema-tools",
   "private": true,
   "version": "0.0.0",
   "license": "MIT",
@@ -9,14 +9,11 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "bench": "node ../../scripts/v1-coarse-benchmark.mjs",
-    "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
-  "devDependencies": {
-    "typescript": "catalog:",
-    "vite": "catalog:",
-    "vitest": "catalog:"
+  "dependencies": {
+    "@tarstate/core": "workspace:0.0.0"
   }
 }

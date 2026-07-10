@@ -13,10 +13,10 @@
     "moduleResolution": "Bundler",
     "paths": {
       "@tarstate/core": ["./packages/core/src/index.ts"],
-      "@tarstate/core/v1-spike": ["./packages/core/src/v1-spike.ts"],
       "@tarstate/automerge": ["./packages/automerge/src/index.ts"],
-      "@tarstate/automerge/v1-spike": ["./packages/automerge/src/v1-spike.ts"],
-      "@tarstate/zustand": ["./packages/zustand/src/index.ts"]
+      "@tarstate/zustand": ["./packages/zustand/src/index.ts"],
+      "@tarstate/react": ["./packages/react/src/index.ts"],
+      "@tarstate/schema-tools": ["./packages/schema-tools/src/index.ts"]
     },
     "moduleDetection": "force",
     "isolatedModules": true,

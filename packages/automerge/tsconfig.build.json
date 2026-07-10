@@ -6,8 +6,7 @@
     "rootDir": "src",
     "tsBuildInfoFile": "dist/.tsbuildinfo",
     "paths": {
-      "@tarstate/core": ["../core/dist/index.d.ts"],
-      "@tarstate/core/v1-spike": ["../core/dist/v1-spike.d.ts"]
+      "@tarstate/core": ["../core/dist/index.d.ts"]
     }
   },
   "include": ["src"],

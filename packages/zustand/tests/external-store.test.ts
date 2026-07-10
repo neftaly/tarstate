@@ -47,7 +47,7 @@ const tanStackAtomicStore = <State, Actions extends StoreActionMap>(store: TanSt
   }
 });
 
-describe('v1 external-store spike', () => {
+describe('production external-store adapter', () => {
   it('re-reads hasHydrated after adapter creation', () => {
     const store = createPersistedZustand();
     let hydrated = false;

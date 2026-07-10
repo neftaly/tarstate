@@ -92,7 +92,11 @@ describe('production query oracle', () => {
     expect(evaluateQuery({ root: join('inner'), relations }).rows).toHaveLength(2);
     expect(evaluateQuery({ root: join('semi'), relations }).rows).toEqual([{ id: 1 }]);
     expect(evaluateQuery({ root: join('anti'), relations }).rows).toEqual([{ id: 2 }]);
-    expect(evaluateQuery({ root: join('left'), relations }).rows).toHaveLength(3);
+    expect(evaluateQuery({ root: join('left'), relations }).rows).toEqual([
+      { l: { id: 1 }, r: { leftId: 1, value: 'x' } },
+      { l: { id: 1 }, r: { leftId: 1, value: 'y' } },
+      { l: { id: 2 }, r: {} }
+    ]);
   });
 
   it('defines empty aggregates and preserves deterministic ordered windows', () => {
@@ -124,6 +128,23 @@ describe('production query oracle', () => {
   it('rejects non-monotone operators over lower-bound inputs', () => {
     const result = evaluateQuery({ root: { kind: 'slice', input: from('partial'), limit: 1 }, relations: [relation('partial', [{ id: 1 }], 'lower-bound')] });
     expect(result).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ details: { reason: 'incomplete_non_monotone', operator: 'slice' } }] });
+  });
+
+  it('keeps valid lower bounds for anti/left with an exact right side and for intersect/except', () => {
+    const inputs = [relation('left', [{ id: 1 }, { id: 2 }], 'lower-bound'), relation('right', [{ id: 1 }])];
+    const on = { kind: 'compare' as const, op: 'eq' as const, left: { kind: 'field' as const, alias: 'l', name: 'id' }, right: { kind: 'field' as const, alias: 'r', name: 'id' } };
+    expect(evaluateQuery({ root: { kind: 'join', join: 'anti', left: from('left', 'l'), right: from('right', 'r'), on }, relations: inputs })).toMatchObject({ completeness: 'lower-bound', rows: [{ id: 2 }] });
+    expect(evaluateQuery({ root: { kind: 'join', join: 'left', left: from('left', 'l'), right: from('right', 'r'), on }, relations: inputs }).completeness).toBe('lower-bound');
+    expect(evaluateQuery({ root: { kind: 'set', op: 'intersect', left: from('left'), right: from('right') }, relations: inputs })).toMatchObject({ completeness: 'lower-bound', rows: [{ id: 1 }] });
+    expect(evaluateQuery({ root: { kind: 'set', op: 'except', left: from('left'), right: from('right') }, relations: inputs })).toMatchObject({ completeness: 'lower-bound', rows: [{ id: 2 }] });
+  });
+
+  it('does not infer false/cardinality from an empty lower-bound subquery', () => {
+    const lower = from('partial', 'p');
+    expect(evaluateExpression({ kind: 'coalesce', args: [{ kind: 'compare', op: 'eq', left: { kind: 'literal', value: null }, right: { kind: 'literal', value: 1 } }, { kind: 'literal', value: 'fallback' }] }, {})).toBe(logicalUnknown);
+    const existsResult = evaluateQuery({ root: { kind: 'where', input: { kind: 'values', alias: 'outer', rows: [{ id: 1 }] }, predicate: { kind: 'subquery', mode: 'exists', query: lower } }, relations: [relation('partial', [], 'lower-bound')] });
+    expect(existsResult.rows).toEqual([]);
+    expect(evaluateExpression({ kind: 'is-null', value: { kind: 'compare', op: 'eq', left: { kind: 'literal', value: null }, right: { kind: 'literal', value: 1 } } }, {})).toBe(logicalUnknown);
   });
 
   it('evaluates correlated exists and scalar subqueries', () => {

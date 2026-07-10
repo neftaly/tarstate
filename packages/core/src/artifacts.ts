@@ -1,7 +1,7 @@
 import { createIssue, TarstateParseError, type Issue, type ParseResult } from './issues.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
 
-export const artifactKinds = ['schema', 'query', 'transaction', 'constraint-set', 'storage-mapping', 'schema-lens'] as const;
+export const artifactKinds = ['schema', 'query', 'transaction', 'constraint-set', 'storage-mapping', 'schema-lens', 'issue-code-catalog'] as const;
 export type ArtifactKind = typeof artifactKinds[number];
 export type ContentHash = `sha256:${string}`;
 

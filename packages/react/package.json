@@ -1,5 +1,5 @@
 {
-  "name": "@tarstate/automerge",
+  "name": "@tarstate/react",
   "private": true,
   "version": "0.0.0",
   "license": "MIT",
@@ -9,18 +9,24 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
-    "typecheck": "tsc -p ../../tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@automerge/automerge": "3.2.6",
     "@tarstate/core": "workspace:*"
   },
+  "peerDependencies": {
+    "react": ">=18.3.0 <20"
+  },
   "devDependencies": {
-    "@automerge/automerge-repo": "2.5.6",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@types/react-test-renderer": "19.1.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-test-renderer": "19.2.7",
     "typescript": "catalog:",
-    "vite": "catalog:",
     "vitest": "catalog:"
   }
 }

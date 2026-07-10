@@ -11,13 +11,15 @@ rewrite.
 The current repository contains:
 
 - the [normative v1 design packet](docs/v1/README.md);
-- isolated executable semantic seeds in `@tarstate/core`;
-- measured Automerge copy-relocation evidence in `@tarstate/automerge`; and
-- the generic external-store runtime plus Zustand/TanStack evidence.
+- the portable semantic oracle, source coordinator, resolver, database,
+  observers, receipts, and maintenance strategies in `@tarstate/core`;
+- production Automerge and generic external-store/Zustand adapters;
+- the small observer-only `@tarstate/react` package; and
+- deterministic schema, issue-catalog, and agent-description tooling.
 
-These seeds prove the five entry spikes. They are now the only implementation
-surface and will be replaced or promoted as the production build order
-advances.
+The temporary spike implementations and tests have been removed. Their written
+evidence remains in the design packet; the production surfaces are the only
+runtime implementation.
 
 ```sh
 pnpm check
