@@ -70,7 +70,7 @@ export type PrepareDatabaseAttachmentInput<State = unknown> = {
   readonly resolveArtifact: AttachmentArtifactResolver;
   readonly registry: CapabilityRegistry;
   readonly evaluateConstraintQuery?: AttachmentConstraintQuery<State>;
-  readonly resolveStorageBinding?: (reference: CapabilityRef) => StorageBinding<unknown, unknown, unknown> | undefined;
+  readonly resolveStorageBinding?: (reference: CapabilityRef) => StorageBinding<unknown, unknown> | undefined;
 };
 
 /**

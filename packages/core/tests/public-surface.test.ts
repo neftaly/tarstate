@@ -8,8 +8,8 @@ describe('clean rewrite core surface', () => {
     expect(core.safePrepareTransactionArtifact).toBeTypeOf('function');
     expect(core.CapabilityRegistry).toBeTypeOf('function');
     expect(core.HostRuntimeRegistry).toBeTypeOf('function');
-    expect(core.FullRecomputeStrategy).toBeTypeOf('function');
     expect(core.evaluateQuery).toBeTypeOf('function');
+    expect(core.openIncrementalQueryMaintenance).toBeTypeOf('function');
     expect(core.acquireExternalStoreRuntime).toBeTypeOf('function');
     expect(core.prepareSchema).toBeTypeOf('function');
     expect(core.schemaLiteral).toBeTypeOf('function');

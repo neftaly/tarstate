@@ -63,13 +63,12 @@ export type IntentMergeResult<Command> =
   | { readonly outcome: 'merged'; readonly commands: readonly Command[] }
   | { readonly outcome: 'conflict' | 'unknown'; readonly issues: readonly Issue[] };
 
-export type StorageBinding<Storage, Command, Delta = never, Row = unknown> = {
+export type StorageBinding<Storage, Command, Row = unknown> = {
   readonly id: string;
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
   readonly project: (snapshot: SourceSnapshot<Storage>) => ProjectionResult<Row>;
   readonly plan: (snapshot: SourceSnapshot<Storage>, edits: readonly LogicalEdit[]) => PlanResult<Command>;
-  readonly updateProjection?: (previous: ProjectionResult<Row>, snapshot: SourceSnapshot<Storage>, delta: Delta) => ProjectionResult<Row>;
 };
 
 export type SourceCommitInput<Command> = {
@@ -93,10 +92,10 @@ export type SourceOutcomeLookup<Result> =
   | { readonly status: 'ambiguous' | 'expired' }
   | { readonly status: 'unavailable'; readonly issues: readonly Issue[] };
 
-export type AtomicSource<Storage, Command, Delta = never> = {
+export type AtomicSource<Storage, Command> = {
   readonly sourceId: string;
   readonly snapshot: () => SourceSnapshot<Storage>;
-  readonly subscribe: (listener: (change?: { readonly beforeBasis?: SourceBasis; readonly afterBasis: SourceBasis; readonly delta?: Delta }) => void) => () => void;
+  readonly subscribe: (listener: (change?: { readonly beforeBasis?: SourceBasis; readonly afterBasis: SourceBasis }) => void) => () => void;
   readonly commit: (input: SourceCommitInput<Command>) => Promise<SourceCommitResult>;
   readonly relateFootprints: (left: Footprint, right: Footprint) => FootprintRelation;
   readonly mergeIntents: (plans: readonly PlanResult<Command>[]) => IntentMergeResult<Command>;
@@ -104,12 +103,12 @@ export type AtomicSource<Storage, Command, Delta = never> = {
   readonly queryOutcome?: (input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash }) => Promise<SourceOutcomeLookup<SourceCommitResult>>;
 };
 
-export type Attachment<Storage = unknown, Command = unknown, Delta = never> = {
+export type Attachment<Storage = unknown, Command = unknown> = {
   readonly attachmentId: string;
   readonly incarnation: string;
   readonly sourceId: string;
-  readonly source: AtomicSource<Storage, Command, Delta>;
-  readonly storageBindings: readonly StorageBinding<Storage, Command, Delta>[];
+  readonly source: AtomicSource<Storage, Command>;
+  readonly storageBindings: readonly StorageBinding<Storage, Command>[];
   readonly schemaViews: readonly ArtifactRef[];
   readonly authorityScope: string;
   readonly capabilities?: readonly CapabilityRef[];

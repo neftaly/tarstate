@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   CapabilityRegistry,
-  FullRecomputeStrategy,
   HostRuntimeRegistry,
   TarstateParseError,
   artifactSemanticValue,
@@ -23,8 +22,7 @@ import {
   sha256Json,
   verifyBuiltInCapabilities,
   type CapabilityDeclaration,
-  type JsonValue,
-  type PreparedPlan
+  type JsonValue
 } from '../src/index.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
@@ -159,16 +157,6 @@ describe('production foundation', () => {
     expect(await downgraded.fingerprint()).not.toBe(await upgraded.fingerprint());
   });
 
-  it('routes full recomputation through the same maintenance session seam', () => {
-    type Snapshot = { readonly rows: readonly number[] };
-    const plan: PreparedPlan<string> = { planId: 'plan', rootNodeId: 'root', query: 'numbers', registryFingerprint: 'registry', authorityFingerprint: 'authority', datasetId: 'dataset' };
-    const strategy = new FullRecomputeStrategy<string, number, Snapshot, unknown>((_plan, snapshot) => ({ rows: snapshot.rows, resultKeys: snapshot.rows.map(String), completeness: 'exact', issues: [] }));
-    const session = strategy.open(plan, { snapshot: { rows: [1] } });
-    expect(session.current().rows).toEqual([1]);
-    expect(session.update({ snapshot: { rows: [2, 3] }, change: { stale: true } }).rows).toEqual([2, 3]);
-    session.close();
-    expect(() => session.update({ snapshot: { rows: [] } })).toThrow(/closed/);
-  });
 });
 
 const _jsonValueFixture: JsonValue = { ok: true };

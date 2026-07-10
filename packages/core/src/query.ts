@@ -30,7 +30,8 @@ export type Expr =
   | { readonly kind: 'boolean'; readonly op: 'and' | 'or'; readonly args: readonly Expr[] }
   | { readonly kind: 'boolean'; readonly op: 'not'; readonly arg: Expr }
   | { readonly kind: 'arithmetic'; readonly op: 'add' | 'subtract' | 'multiply' | 'divide' | 'modulo'; readonly left: Expr; readonly right: Expr }
-  | { readonly kind: 'string'; readonly op: 'concat' | 'lower' | 'upper' | 'length'; readonly args: readonly Expr[] }
+  | { readonly kind: 'string'; readonly op: 'concat'; readonly args: readonly Expr[] }
+  | { readonly kind: 'string'; readonly op: 'lower' | 'upper' | 'length'; readonly args: readonly [Expr] }
   | { readonly kind: 'array'; readonly items: readonly Expr[] }
   | { readonly kind: 'record'; readonly fields: Readonly<Record<string, Expr>> }
   | { readonly kind: 'case'; readonly branches: readonly { readonly when: Expr; readonly then: Expr }[]; readonly otherwise: Expr }
@@ -104,6 +105,39 @@ export type QueryResult = {
   readonly issues: readonly Issue[];
 };
 
+export type QueryMaintenanceSnapshot = {
+  readonly relations: readonly RelationInput[];
+  readonly parameters?: Readonly<Record<string, JsonValue>>;
+  readonly functions?: FunctionRegistry;
+  readonly basis?: JsonValue;
+  readonly membershipRevision?: number;
+};
+
+export type IncrementalQueryResultDelta = {
+  readonly addedResultKeys: readonly string[];
+  readonly removedResultKeys: readonly string[];
+  readonly updatedResultKeys: readonly string[];
+};
+
+export type IncrementalQueryMaintenanceState = {
+  readonly strategy: 'incremental-operator-graph';
+  readonly revision: number;
+  readonly materializedNodeCount: number;
+  readonly recomputedNodeCount: number;
+  readonly changedNodeCount: number;
+  readonly changedRelationIds: readonly string[];
+  readonly resultDelta: IncrementalQueryResultDelta;
+  readonly rejectedUpdateCount: number;
+};
+
+export type IncrementalQueryResult = QueryResult & { readonly state: IncrementalQueryMaintenanceState };
+
+export interface IncrementalQueryMaintenanceSession {
+  getCurrentResult(): IncrementalQueryResult;
+  updateSnapshot(snapshot: QueryMaintenanceSnapshot): IncrementalQueryResult;
+  close(): void;
+}
+
 type Provenance = { readonly sourceId?: string; readonly attachmentId?: string; readonly relationId: string; readonly key?: JsonValue; readonly occurrence: string };
 type ScopedRow = { readonly scope: Readonly<Record<string, QueryRecord>>; readonly provenance: Readonly<Record<string, Provenance>> };
 type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: Completeness };
@@ -118,7 +152,15 @@ type QueryContext = {
   readonly basis?: JsonValue;
   readonly membershipRevision?: number;
   readonly outer?: ScopedRow;
+  readonly materializedNodes?: ReadonlyMap<QueryNode, MaterializedQueryNode>;
+  readonly activeNode?: QueryNode;
   unavailable: boolean;
+};
+
+type MaterializedQueryNode = {
+  readonly result: NodeResult;
+  readonly issues: readonly Issue[];
+  readonly unavailable: boolean;
 };
 
 const relationKey = (relation: RelationUse): string => relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
@@ -154,6 +196,12 @@ export const prepareQuery = async (input: {
 };
 
 const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
+  const materialized = context.outer === undefined && node !== context.activeNode ? context.materializedNodes?.get(node) : undefined;
+  if (materialized !== undefined) {
+    context.issues.push(...materialized.issues);
+    context.unavailable = context.unavailable || materialized.unavailable;
+    return materialized.result;
+  }
   if (node.kind === 'from') {
     const input = context.relations.get(relationKey(node.relation));
     if (input === undefined || input.completeness === 'unknown') {
@@ -537,8 +585,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     if (args.some((value) => value.status !== 'known' || typeof value.value !== 'string')) return { status: 'unknown' };
     const strings = args.map((value) => (value as { readonly status: 'known'; readonly value: string }).value);
     if (expression.op === 'concat') return known(strings.join(''));
-    const value = strings[0];
-    if (value === undefined) throw new TypeError('Unary string expression has no argument');
+    const value = strings[0]!;
     return known(expression.op === 'lower' ? value.toLowerCase() : expression.op === 'upper' ? value.toUpperCase() : Array.from(value).length);
   }
   if (expression.kind === 'array') {
@@ -735,3 +782,356 @@ const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult
   context.issues.push(createIssue({ code: 'query.parameter_invalid', phase: 'query', severity: 'error', retry: 'after_refresh', details: { reason: 'incomplete_non_monotone', operator } }));
   return { rows: [], completeness: 'unknown' };
 };
+
+/**
+ * Opens the production stateful query-maintenance path. The pure
+ * `evaluateQuery` function remains an independent semantic oracle; updates here
+ * rematerialize only query nodes whose relation dependencies changed.
+ */
+export const openIncrementalQueryMaintenance = (
+  plan: PreparedPlan<QueryNode>,
+  initialSnapshot: QueryMaintenanceSnapshot
+): IncrementalQueryMaintenanceSession => {
+  const graph = compileQueryGraph(plan.query);
+  const materialized = new Map<QueryNode, MaterializedQueryNode>();
+  let acceptedSnapshot = initialSnapshot;
+  let closed = false;
+  let revision = 0;
+  let rejectedUpdateCount = 0;
+
+  const initialIssues = validateMaintenanceSnapshot(initialSnapshot);
+  if (initialIssues.length === 0) {
+    for (const node of graph.nodes) materialized.set(node, materializeQueryNode(node, initialSnapshot, materialized));
+  }
+  let current = maintainedQueryResult(
+    initialIssues.length === 0 ? materialized.get(plan.query) : undefined,
+    initialIssues,
+    maintenanceState(graph.nodes.length, graph.nodes.length, graph.nodes.length, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+  );
+
+  return {
+    getCurrentResult: () => current,
+    updateSnapshot: (nextSnapshot) => {
+      if (closed) throw new Error('Incremental query maintenance session is closed');
+      revision += 1;
+      const updateIssues = validateMaintenanceUpdate(acceptedSnapshot, nextSnapshot);
+      if (updateIssues.length > 0) {
+        rejectedUpdateCount += 1;
+        const previous = current;
+        current = maintainedQueryResult(
+          undefined,
+          updateIssues,
+          maintenanceState(graph.nodes.length, 0, 0, [], diffMaintainedResults(previous, undefined), revision, rejectedUpdateCount)
+        );
+        return current;
+      }
+
+      const changedRelations = changedRelationKeys(acceptedSnapshot, nextSnapshot);
+      const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
+        || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
+      let recomputedNodeCount = 0;
+      const changedNodes = new Set<QueryNode>();
+      for (const node of graph.nodes) {
+        const children = graph.children.get(node) as readonly QueryNode[];
+        const externalDependencies = graph.externalDependencies.get(node) as ReadonlySet<string>;
+        const childChanged = children.some((child) => changedNodes.has(child));
+        const externalInputChanged = [...externalDependencies].some((key) => changedRelations.has(key));
+        if (!sessionEvidenceChanged && !childChanged && !externalInputChanged) continue;
+        const previousNode = materialized.get(node);
+        const nextNode = materializeQueryNode(node, nextSnapshot, materialized);
+        materialized.set(node, nextNode);
+        recomputedNodeCount += 1;
+        if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode)) changedNodes.add(node);
+      }
+      acceptedSnapshot = nextSnapshot;
+      const previous = current;
+      const root = materialized.get(plan.query);
+      current = maintainedQueryResult(
+        root,
+        [],
+        maintenanceState(
+          graph.nodes.length,
+          recomputedNodeCount,
+          changedNodes.size,
+          changedRelationIds(nextSnapshot, changedRelations),
+          diffMaintainedResults(previous, root),
+          revision,
+          rejectedUpdateCount
+        )
+      );
+      return current;
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      materialized.clear();
+    }
+  };
+};
+
+type CompiledQueryGraph = {
+  readonly nodes: readonly QueryNode[];
+  readonly children: ReadonlyMap<QueryNode, readonly QueryNode[]>;
+  readonly externalDependencies: ReadonlyMap<QueryNode, ReadonlySet<string>>;
+};
+
+const compileQueryGraph = (root: QueryNode): CompiledQueryGraph => {
+  const nodes: QueryNode[] = [];
+  const visited = new Set<QueryNode>();
+  const visit = (node: QueryNode): void => {
+    if (visited.has(node)) return;
+    visited.add(node);
+    for (const child of directQueryChildren(node)) visit(child);
+    nodes.push(node);
+  };
+  visit(root);
+  const children = new Map(nodes.map((node) => [node, directQueryChildren(node)]));
+  const dependencies = new Map(nodes.map((node) => [node, relationDependencies(node)]));
+  return {
+    nodes: Object.freeze(nodes),
+    children,
+    externalDependencies: new Map(nodes.map((node) => {
+      const childDependencies = new Set((children.get(node) ?? []).flatMap((child) => [...(dependencies.get(child) ?? [])]));
+      return [node, new Set([...(dependencies.get(node) ?? [])].filter((identity) => !childDependencies.has(identity)))] as const;
+    }))
+  };
+};
+
+const directQueryChildren = (node: QueryNode): readonly QueryNode[] => {
+  if (node.kind === 'join' || node.kind === 'set') return [node.left, node.right];
+  if (node.kind === 'where' || node.kind === 'select' || node.kind === 'with-fields' || node.kind === 'rename' || node.kind === 'omit' || node.kind === 'unnest' || node.kind === 'aggregate' || node.kind === 'distinct' || node.kind === 'order' || node.kind === 'slice' || node.kind === 'window' || node.kind === 'seek') return [node.input];
+  // Recursion owns a cyclic local fixpoint and is one incremental operator.
+  return [];
+};
+
+const relationDependencies = (node: QueryNode): ReadonlySet<string> => {
+  const dependencies = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) { for (const item of value) visit(item); return; }
+    if (value === null || typeof value !== 'object') return;
+    const candidate = value as Readonly<Record<string, unknown>>;
+    if (candidate.kind === 'from' && isRelationUse(candidate.relation)) dependencies.add(relationKey(candidate.relation));
+    for (const child of Object.values(candidate)) visit(child);
+  };
+  visit(node);
+  return dependencies;
+};
+
+const isRelationUse = (value: unknown): value is RelationUse => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as { readonly schemaView?: unknown; readonly relationId?: unknown };
+  return typeof candidate.relationId === 'string' && candidate.schemaView !== null && typeof candidate.schemaView === 'object';
+};
+
+const materializeQueryNode = (
+  node: QueryNode,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>
+): MaterializedQueryNode => {
+  const issues: Issue[] = [];
+  const context: QueryContext = {
+    relations: new Map(snapshot.relations.map((input) => [relationKey(input.relation), input])),
+    parameters: snapshot.parameters ?? {},
+    functions: snapshot.functions ?? new Map(),
+    issues,
+    recursions: new Map(),
+    ...(snapshot.basis === undefined ? {} : { basis: snapshot.basis }),
+    ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision }),
+    materializedNodes,
+    activeNode: node,
+    unavailable: false
+  };
+  const result = evaluateNode(node, context);
+  return { result, issues: deduplicateQueryIssues(issues), unavailable: context.unavailable };
+};
+
+const maintainedQueryResult = (
+  root: MaterializedQueryNode | undefined,
+  additionalIssues: readonly Issue[],
+  state: IncrementalQueryMaintenanceState
+): IncrementalQueryResult => {
+  const issues = deduplicateQueryIssues([...(root?.issues ?? []), ...additionalIssues]);
+  if (root === undefined || root.unavailable || root.result.completeness === 'unknown') {
+    return { rows: [], resultKeys: [], completeness: 'unknown', issues, state };
+  }
+  return {
+    rows: root.result.rows.map(visibleRow),
+    resultKeys: root.result.rows.map(resultKey),
+    completeness: root.result.completeness,
+    issues,
+    state
+  };
+};
+
+const maintenanceState = (
+  materializedNodeCount: number,
+  recomputedNodeCount: number,
+  changedNodeCount: number,
+  changedRelationIds: readonly string[],
+  resultDelta: IncrementalQueryResultDelta,
+  revision: number,
+  rejectedUpdateCount: number
+): IncrementalQueryMaintenanceState => ({
+  strategy: 'incremental-operator-graph',
+  revision,
+  materializedNodeCount,
+  recomputedNodeCount,
+  changedNodeCount,
+  changedRelationIds,
+  resultDelta,
+  rejectedUpdateCount
+});
+
+const emptyIncrementalQueryResultDelta: IncrementalQueryResultDelta = Object.freeze({ addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] });
+
+const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: MaterializedQueryNode): boolean => {
+  if (left.unavailable !== right.unavailable || left.result.completeness !== right.result.completeness) return false;
+  if (left.issues.length !== right.issues.length || left.issues.some((issue, index) => issue.id !== right.issues[index]?.id)) return false;
+  if (left.result.rows.length !== right.result.rows.length) return false;
+  return left.result.rows.every((row, index) => scopedRowIdentity(row) === scopedRowIdentity(right.result.rows[index] as ScopedRow));
+};
+
+const scopedRowIdentity = (row: ScopedRow): string => resultKey(row) + '\u0000' + canonicalizeQueryValue(visibleRow(row));
+
+const validateMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): readonly Issue[] => {
+  const identities = new Set<string>();
+  const issues: Issue[] = [];
+  for (const input of snapshot.relations) {
+    const identity = relationKey(input.relation);
+    if (identities.has(identity)) {
+      issues.push(incrementalQueryIssue('query.incremental_relation_ambiguous', { relationId: input.relation.relationId }));
+      continue;
+    }
+    identities.add(identity);
+    if (input.occurrenceIds !== undefined && (input.occurrenceIds.length !== input.rows.length || new Set(input.occurrenceIds).size !== input.occurrenceIds.length)) {
+      issues.push(incrementalQueryIssue('query.incremental_identity_invalid', { relationId: input.relation.relationId }));
+    }
+  }
+  return issues;
+};
+
+const validateMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): readonly Issue[] => {
+  const issues = [...validateMaintenanceSnapshot(next)];
+  if (!sameOptionalJson(previous.parameters, next.parameters) || !sameFunctionRegistry(previous.functions, next.functions)) {
+    issues.push(incrementalQueryIssue('query.incremental_session_input_changed', { reason: 'parameters_or_functions' }));
+    return issues;
+  }
+  const previousRelations = uniqueRelationMap(previous.relations);
+  const nextRelations = uniqueRelationMap(next.relations);
+  if (previousRelations === undefined || nextRelations === undefined) return issues;
+  const identities = new Set([...previousRelations.keys(), ...nextRelations.keys()]);
+  for (const identity of identities) {
+    const before = previousRelations.get(identity);
+    const after = nextRelations.get(identity);
+    if (before === undefined || after === undefined) {
+      const candidate = before ?? after;
+      if (candidate !== undefined && candidate.rows.length > 0 && candidate.occurrenceIds === undefined && candidate.completeness !== 'unknown') {
+        issues.push(incrementalQueryIssue('query.incremental_identity_invalid', { relationId: candidate.relation.relationId, reason: 'relation_membership_changed' }));
+      }
+      continue;
+    }
+    if (relationRowsEqual(before, after) || before.completeness === 'unknown' || after.completeness === 'unknown') continue;
+    if (before.occurrenceIds === undefined || after.occurrenceIds === undefined) {
+      issues.push(incrementalQueryIssue('query.incremental_identity_invalid', { relationId: before.relation.relationId, reason: 'changed_rows_require_occurrence_ids' }));
+    }
+  }
+  return deduplicateQueryIssues(issues);
+};
+
+const uniqueRelationMap = (relations: readonly RelationInput[]): ReadonlyMap<string, RelationInput> | undefined => {
+  const output = new Map<string, RelationInput>();
+  for (const relation of relations) {
+    const identity = relationKey(relation.relation);
+    if (output.has(identity)) return undefined;
+    output.set(identity, relation);
+  }
+  return output;
+};
+
+const changedRelationKeys = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): ReadonlySet<string> => {
+  const before = uniqueRelationMap(previous.relations) ?? new Map();
+  const after = uniqueRelationMap(next.relations) ?? new Map();
+  const changed = new Set<string>();
+  for (const identity of new Set([...before.keys(), ...after.keys()])) {
+    const left = before.get(identity);
+    const right = after.get(identity);
+    if (left === undefined || right === undefined || !relationInputEqual(left, right)) changed.add(identity);
+  }
+  return changed;
+};
+
+const changedRelationIds = (snapshot: QueryMaintenanceSnapshot, identities: ReadonlySet<string>): readonly string[] => {
+  const byIdentity = uniqueRelationMap(snapshot.relations) ?? new Map();
+  return [...new Set([...identities].map((identity) => byIdentity.get(identity)?.relation.relationId ?? identity.split('\u0000').at(-1) as string))].sort((left, right) => left.localeCompare(right));
+};
+
+const relationInputEqual = (left: RelationInput, right: RelationInput): boolean =>
+  left.completeness === right.completeness
+  && left.sourceId === right.sourceId
+  && left.attachmentId === right.attachmentId
+  && sameOptionalJson(left.basis, right.basis)
+  && relationRowsEqual(left, right);
+
+const relationRowsEqual = (left: RelationInput, right: RelationInput): boolean =>
+  sameStringList(left.occurrenceIds, right.occurrenceIds)
+  && left.rows.length === right.rows.length
+  && left.rows.every((row, index) => canonicalizeQueryValue(row) === canonicalizeQueryValue(right.rows[index] as QueryRecord));
+
+const sameStringList = (left: readonly string[] | undefined, right: readonly string[] | undefined): boolean =>
+  left === undefined || right === undefined ? left === right : left.length === right.length && left.every((value, index) => value === right[index]);
+
+const sameOptionalJson = (left: unknown, right: unknown): boolean => {
+  if (left === undefined || right === undefined) return left === right;
+  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
+};
+
+const sameFunctionRegistry = (left: FunctionRegistry | undefined, right: FunctionRegistry | undefined): boolean => {
+  if (left === right) return true;
+  const leftEntries = [...(left ?? new Map()).entries()];
+  const rightMap = right ?? new Map();
+  return leftEntries.length === rightMap.size && leftEntries.every(([key, implementation]) => rightMap.get(key) === implementation);
+};
+
+const diffMaintainedResults = (
+  previous: IncrementalQueryResult,
+  nextRoot: MaterializedQueryNode | undefined
+): IncrementalQueryResultDelta => {
+  // Invalidation withdraws the current assertion; it does not prove removals.
+  if (nextRoot === undefined || nextRoot.unavailable || nextRoot.result.completeness === 'unknown') return emptyIncrementalQueryResultDelta;
+  const nextRows = nextRoot.result.rows.map(visibleRow);
+  const nextKeys = nextRoot.result.rows.map(resultKey);
+  const previousBuckets = resultBuckets(previous.resultKeys, previous.rows);
+  const nextBuckets = resultBuckets(nextKeys, nextRows);
+  const added: string[] = [];
+  const removed: string[] = [];
+  const updated: string[] = [];
+  for (const key of new Set([...previousBuckets.keys(), ...nextBuckets.keys()])) {
+    const before = previousBuckets.get(key) ?? [];
+    const after = nextBuckets.get(key) ?? [];
+    if (after.length > before.length) added.push(key);
+    if (before.length > after.length) removed.push(key);
+    if (before.length === after.length && before.some((value, index) => value !== after[index])) updated.push(key);
+  }
+  return { addedResultKeys: added.sort(), removedResultKeys: removed.sort(), updatedResultKeys: updated.sort() };
+};
+
+const resultBuckets = (keys: readonly string[], rows: readonly QueryRecord[]): ReadonlyMap<string, readonly string[]> => {
+  const output = new Map<string, string[]>();
+  keys.forEach((key, index) => {
+    const values = output.get(key) ?? [];
+    values.push(canonicalizeQueryValue(rows[index] as QueryRecord));
+    output.set(key, values);
+  });
+  for (const values of output.values()) values.sort();
+  return output;
+};
+
+const deduplicateQueryIssues = (issues: readonly Issue[]): readonly Issue[] => [...new Map(issues.map((issue) => [issue.id, issue])).values()];
+
+const incrementalQueryIssue = (code: string, details: JsonValue): Issue => createIssue({
+  code,
+  phase: 'query',
+  severity: 'error',
+  retry: code === 'query.incremental_session_input_changed' ? 'after_input' : 'after_refresh',
+  details
+});

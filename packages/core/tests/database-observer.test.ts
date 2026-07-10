@@ -8,11 +8,13 @@ import {
 } from '../src/database.js';
 import { prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
 import {
+  createIncrementalDatabaseQueryMaintenance,
   DatabaseView,
-  type DatabaseEvaluation,
-  type DatabaseEvaluationInput,
+  type MaintainedDatabaseQueryResult,
+  type DatabaseQueryMaintenanceInput,
   type ObserverChange
 } from '../src/observer.js';
+import type { QueryNode, QueryRecord, RelationInput } from '../src/query.js';
 import { ResourceResolver, type ResourceRef } from '../src/resolver.js';
 import type { PreparedPlan } from '../src/maintenance.js';
 
@@ -96,13 +98,25 @@ const plan = (datasetId = 'dataset:one', authorityFingerprint = 'authority:publi
   datasetId
 });
 
-const evaluate = ({ attachments }: DatabaseEvaluationInput<Query, readonly Row[]>): DatabaseEvaluation<Row> => {
+const evaluate = ({ attachments }: DatabaseQueryMaintenanceInput<Query, readonly Row[]>): MaintainedDatabaseQueryResult<Row> => {
   const rows = attachments.flatMap(({ projection }) => projection);
   return {
     rows,
     resultKeys: attachments.flatMap(({ member: inputMember, projection }) => projection.map((row) => inputMember.attachmentId + ':' + row.id)),
     completeness: 'exact',
     issues: []
+  };
+};
+
+const createMaintenance = (evaluation: typeof evaluate): import('../src/observer.js').CreateDatabaseQueryMaintenance<Query, Row, readonly Row[]> => ({ initialInput }) => {
+  let current = evaluation(initialInput);
+  return {
+    getCurrentResult: () => current,
+    updateInput: (input) => {
+      current = evaluation(input as DatabaseQueryMaintenanceInput<Query, readonly Row[]>);
+      return current;
+    },
+    close: () => undefined
   };
 };
 
@@ -113,10 +127,87 @@ const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[]
   attachments: catalog,
   datasets,
   canRead: (viewScope, attachmentScope) => viewScope === 'admin' || viewScope === attachmentScope,
-  evaluate: evaluation
+  createQueryMaintenance: createMaintenance(evaluation)
+});
+
+const querySchemaView = { id: 'urn:test:observer-schema', contentHash: `sha256:${'a'.repeat(64)}` } as const;
+
+const relationalAttachment = (attachmentId: string, source: TestSource): DatabaseAttachmentInput<{ readonly rows: readonly Row[] }, readonly RelationInput[]> => ({
+  attachmentId,
+  incarnation: attachmentId + ':one',
+  sourceId: source.sourceId,
+  source,
+  authorityScope: 'public',
+  discoveryEdges: ['edge:' + attachmentId],
+  preparation: prepareManualReadOnlyAttachment({
+    schemaViewIds: [querySchemaView.id],
+    project: (snapshot) => snapshot.storage === undefined
+      ? { state: snapshot.state === 'ready' ? 'failed' : snapshot.state, issues: [] }
+      : {
+          state: 'ready',
+          value: [{
+            relation: { schemaView: querySchemaView, relationId: 'test.rows' },
+            rows: snapshot.storage.rows,
+            occurrenceIds: snapshot.storage.rows.map(({ id }) => 'row:' + id),
+            completeness: 'exact',
+            sourceId: source.sourceId,
+            attachmentId,
+            basis: snapshot.basis
+          }],
+          issues: []
+        }
+  })
+});
+
+const relationalPlan = (): PreparedPlan<QueryNode> => ({
+  planId: 'query:incremental-observer',
+  rootNodeId: 'query:incremental-observer:root',
+  query: {
+    kind: 'where',
+    input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
+    predicate: { kind: 'compare', op: 'gte', left: { kind: 'field', alias: 'row', name: 'id' }, right: { kind: 'literal', value: 2 } }
+  },
+  registryFingerprint: 'registry:one',
+  authorityFingerprint: 'authority:public',
+  datasetId: 'dataset:one'
 });
 
 describe('database membership and observation', () => {
+  it('routes observer updates through the incremental query-maintenance factory', () => {
+    const source = new TestSource('source:incremental', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:incremental', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:incremental', source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public',
+      authorityFingerprint: 'authority:public',
+      registryFingerprint: 'registry:one',
+      attachments: catalog,
+      datasets: [dataset],
+      canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const observer = database.observe({ plan: relationalPlan() });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }], resultKeys: ['row=row:2'] } });
+
+    source.publish({ rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }] });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], resultKeys: ['row=row:2', 'row=row:3'] } });
+
+    source.publish({ state: 'failed', freshness: 'none' });
+    expect(observer.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { rows: [], resultKeys: [], completeness: 'unknown', sourceStates: [{ state: 'failed' }] },
+      lastExact: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], freshness: 'stale' }
+    });
+
+    source.publish({ state: 'ready', freshness: 'current', rows: [{ id: 4, value: 'recovered' }] });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], resultKeys: ['row=row:4'], completeness: 'exact' } });
+
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
   it('uses exactly one dataset, deduplicates source runtimes, and preserves separate attachment authority', () => {
     const source = new TestSource('source:shared', [{ id: 1, value: 'one' }]);
     const unrelated = new TestSource('source:unrelated', [{ id: 9, value: 'outside' }]);
@@ -180,7 +271,7 @@ describe('database membership and observation', () => {
     const first = database.observe({ plan: plan(), parameters: { selected: 1 } });
     const second = database.observe({ plan: plan(), parameters: { selected: 1 } });
     expect(first).not.toBe(second);
-    expect(database.activeMaintenanceCount()).toBe(1);
+    expect(database.getActiveMaintenanceCount()).toBe(1);
     expect(source.listenerCount()).toBe(1);
     expect(first.getSnapshot()).toBe(first.getSnapshot());
 
@@ -202,7 +293,7 @@ describe('database membership and observation', () => {
 
     second.close();
     second.close();
-    expect(database.activeMaintenanceCount()).toBe(0);
+    expect(database.getActiveMaintenanceCount()).toBe(0);
     expect(source.listenerCount()).toBe(0);
 
     const later = database.observe({ plan: plan(), parameters: { selected: 1 } });
@@ -282,7 +373,7 @@ describe('database membership and observation', () => {
     dataset.reopen();
     expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown', basis: { dataset: { revision: 1 } } } });
     const second = database.observe({ plan: plan() });
-    expect(database.activeMaintenanceCount()).toBe(1);
+    expect(database.getActiveMaintenanceCount()).toBe(1);
     expect(second.getSnapshot()).toBe(first.getSnapshot());
     dataset.settle();
     expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'exact', basis: { dataset: { revision: 2 } } } });
@@ -299,7 +390,7 @@ describe('database membership and observation', () => {
       state: 'open',
       members: [member('attachment:optional-pending', 'source:pending', 'optional')]
     });
-    const negativeEvaluation = (): DatabaseEvaluation<Row> => ({
+    const negativeEvaluation = (): MaintainedDatabaseQueryResult<Row> => ({
       rows: [{ id: 99, value: 'inferred-absence' }],
       resultKeys: ['negative:99'],
       completeness: 'exact',

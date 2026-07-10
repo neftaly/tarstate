@@ -3,7 +3,8 @@ import { ExternalStoreRuntime, type AtomicExternalStore } from './external-store
 import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, type LensRows, type SchemaLensBody } from './lens.js';
 import { InMemoryAtomicSource } from './memory-source.js';
-import { evaluateQuery, type QueryNode, type QueryRecord, type RelationInput } from './query.js';
+import type { PreparedPlan } from './maintenance.js';
+import { openIncrementalQueryMaintenance, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
 import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
 import { sealTransaction } from './transaction.js';
 
@@ -36,6 +37,23 @@ const relation = (relationId: string, rows: readonly QueryRecord[]): RelationInp
 const from = (relationId: string, alias: string): QueryNode => ({ kind: 'from', relation: { schemaView, relationId }, alias });
 const field = (alias: string, name: string) => ({ kind: 'field', alias, name } as const);
 
+const openGoldenMaintenance = (label: GoldenWorkloadLabel, root: QueryNode, relations: readonly RelationInput[]) =>
+  openIncrementalQueryMaintenance({
+    planId: 'golden:' + label,
+    rootNodeId: 'golden:' + label + ':root',
+    query: root,
+    registryFingerprint: 'golden:registry',
+    authorityFingerprint: 'golden:authority',
+    datasetId: 'golden:dataset'
+  } satisfies PreparedPlan<QueryNode>, { relations });
+
+const runGoldenQuery = (label: GoldenWorkloadLabel, root: QueryNode, relations: readonly RelationInput[]): QueryResult => {
+  const session = openGoldenMaintenance(label, root, relations);
+  const { state: _state, ...result } = session.getCurrentResult();
+  session.close();
+  return result;
+};
+
 export const runLeaderboardGolden = (): GoldenWorkloadTrace => {
   const input = from('golden.leaderboard', 'score');
   const root: QueryNode = {
@@ -52,15 +70,12 @@ export const runLeaderboardGolden = (): GoldenWorkloadTrace => {
     },
     by: [{ value: field('score', 'points'), direction: 'desc' }]
   };
-  const result = evaluateQuery({
-    root,
-    relations: [relation('golden.leaderboard', [
+  const result = runGoldenQuery('leaderboard-windows', root, [relation('golden.leaderboard', [
       { player: 'Ada', points: 12 },
       { player: 'Bob', points: 8 },
       { player: 'Cy', points: 8 },
       { player: 'Dee', points: 3 }
-    ])]
-  });
+    ])]);
   return { label: 'leaderboard-windows', fixtureStatus: 'synthetic', evidence: { rows: result.rows, resultKeys: result.resultKeys, completeness: result.completeness } };
 };
 
@@ -132,17 +147,14 @@ export const runRealEstateGolden = (): GoldenWorkloadTrace => {
     },
     by: [{ value: field('summary', 'totalPrice'), direction: 'desc' }]
   };
-  const result = evaluateQuery({
-    root,
-    relations: [
+  const result = runGoldenQuery('real-estate-join-aggregate', root, [
       relation('golden.agent', [{ id: 'agent-a', name: 'Aroha' }, { id: 'agent-b', name: 'Ben' }]),
       relation('golden.listing', [
         { id: 'home-1', agentId: 'agent-a', price: 900_000 },
         { id: 'home-2', agentId: 'agent-a', price: 700_000 },
         { id: 'home-3', agentId: 'agent-b', price: 500_000 }
       ])
-    ]
-  });
+    ]);
   return { label: 'real-estate-join-aggregate', fixtureStatus: 'synthetic', evidence: { rows: result.rows, completeness: result.completeness } };
 };
 
@@ -169,15 +181,12 @@ export const runPatchpitFolderGolden = (): GoldenWorkloadTrace => {
     },
     key: [field('folder', 'id')]
   };
-  const result = evaluateQuery({
-    root: recursive,
-    relations: [relation('golden.folder-entry', [
+  const result = runGoldenQuery('patchpit-folder-recursion', recursive, [relation('golden.folder-entry', [
       { entryId: 'a-app', parentId: 'A', kind: 'folder', targetId: 'B', ref: 'automerge:B' },
       { entryId: 'a-tiger', parentId: 'A', kind: 'resource', targetId: 'tiger', ref: 'https://example.test/Ghostscript_Tiger.svg' },
       { entryId: 'a-missing', parentId: 'A', kind: 'unavailable', targetId: 'C', ref: 'automerge:C' },
       { entryId: 'b-cycle', parentId: 'B', kind: 'folder', targetId: 'A', ref: 'automerge:A' }
-    ])]
-  });
+    ])]);
   return {
     label: 'patchpit-folder-recursion',
     fixtureStatus: 'migrated-synthetic',
@@ -287,7 +296,8 @@ export const runProbabilityGolden = (): GoldenWorkloadTrace => {
   };
   const beforeScene = [{ id: 'panel-1', parentId: 'root', kind: 'panel' }, { id: 'label-1', parentId: 'panel-1', kind: 'label' }];
   const beforeSnapshot = runtime.snapshot();
-  const before = evaluateQuery({ root: query, relations: [relation('golden.scene-entity', beforeScene), relation('golden.geometry', beforeSnapshot.storage?.rows ?? [])] });
+  const maintenance = openGoldenMaintenance('probability-scene-move-external-store', query, [relation('golden.scene-entity', beforeScene), relation('golden.geometry', beforeSnapshot.storage?.rows ?? [])]);
+  const { state: _beforeState, ...before } = maintenance.getCurrentResult();
   const committed = runtime.commit(beforeSnapshot.basis, (current) => ({
     state: { rows: current.rows.map((row) => row.entityId === 'panel-1' ? { ...row, x: 40 } : row) },
     changed: true,
@@ -295,7 +305,8 @@ export const runProbabilityGolden = (): GoldenWorkloadTrace => {
   }));
   const movedScene = beforeScene.map((row) => row.id === 'panel-1' ? { ...row, parentId: 'column-2' } : row);
   const afterSnapshot = runtime.snapshot();
-  const after = evaluateQuery({ root: query, relations: [relation('golden.scene-entity', movedScene), relation('golden.geometry', afterSnapshot.storage?.rows ?? [])] });
+  const { state: _afterState, ...after } = maintenance.updateSnapshot({ relations: [relation('golden.scene-entity', movedScene), relation('golden.geometry', afterSnapshot.storage?.rows ?? [])] });
+  maintenance.close();
   runtime.close();
   return {
     label: 'probability-scene-move-external-store',

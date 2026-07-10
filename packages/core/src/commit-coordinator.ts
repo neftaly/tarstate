@@ -17,9 +17,9 @@ export type CoordinatedCommitResult =
  * Generic one-source coordinator. Bindings remain pure planners; the source is
  * the only component allowed to compare-and-apply commands atomically.
  */
-export const coordinateSourceCommit = async <Storage, Command, Delta>(input: {
-  readonly source: AtomicSource<Storage, Command, Delta>;
-  readonly bindings: readonly StorageBinding<Storage, Command, Delta>[];
+export const coordinateSourceCommit = async <Storage, Command>(input: {
+  readonly source: AtomicSource<Storage, Command>;
+  readonly bindings: readonly StorageBinding<Storage, Command>[];
   readonly edits: readonly LogicalEdit[];
   readonly commit: Omit<SourceCommitInput<Command>, 'commands'>;
   readonly validate?: (staged: { readonly snapshot: SourceSnapshot<Storage>; readonly plans: readonly PlanResult<Command>[] }) => readonly Issue[];
@@ -50,8 +50,8 @@ export const coordinateSourceCommit = async <Storage, Command, Delta>(input: {
   return result.outcome === 'rejected' ? { outcome: 'rejected', issues: result.issues } : result;
 };
 
-const requireContained = <Storage, Command, Delta>(
-  source: AtomicSource<Storage, Command, Delta>,
+const requireContained = <Storage, Command>(
+  source: AtomicSource<Storage, Command>,
   bindingId: string,
   kind: 'read' | 'write' | 'intent',
   actual: import('./source-protocol.js').Footprint,

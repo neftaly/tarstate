@@ -11,7 +11,16 @@ import {
   type SourceSnapshot
 } from './database.js';
 import { createIssue, type Issue } from './issues.js';
-import { FullRecomputeStrategy, type MaintenanceSession, type PreparedPlan, type SourceBasis } from './maintenance.js';
+import type { PreparedPlan, SourceBasis } from './maintenance.js';
+import {
+  openIncrementalQueryMaintenance,
+  type FunctionRegistry,
+  type IncrementalQueryResult,
+  type QueryMaintenanceSnapshot,
+  type QueryNode,
+  type QueryRecord,
+  type RelationInput
+} from './query.js';
 import type { JsonValue } from './value.js';
 
 export type ObservationBasis = {
@@ -66,26 +75,37 @@ export interface QueryObserver<Row> {
   close(): void;
 }
 
-export type AvailableAttachment<Projection> = {
+export type AvailableQueryAttachment<Projection> = {
   readonly member: DatasetMember;
   readonly attachment: DatabaseAttachment<unknown, Projection>;
   readonly snapshot: SourceSnapshot<unknown>;
   readonly projection: Projection;
 };
 
-export type DatabaseEvaluationInput<Query, Projection> = {
+export type DatabaseQueryMaintenanceInput<Query, Projection> = {
   readonly query: Query;
   readonly parameters: Readonly<Record<string, JsonValue>>;
   readonly dataset: DatasetSnapshot;
-  readonly attachments: readonly AvailableAttachment<Projection>[];
+  readonly attachments: readonly AvailableQueryAttachment<Projection>[];
 };
 
-export type DatabaseEvaluation<Row> = {
+export type MaintainedDatabaseQueryResult<Row> = {
   readonly rows: readonly Row[];
   readonly resultKeys: readonly string[];
   readonly completeness: 'exact' | 'lower-bound' | 'unknown';
   readonly issues: readonly Issue[];
 };
+
+export interface DatabaseQueryMaintenanceSession<Query, Row, Projection> {
+  getCurrentResult(): MaintainedDatabaseQueryResult<Row>;
+  updateInput(input: DatabaseQueryMaintenanceInput<Query, Projection>): MaintainedDatabaseQueryResult<Row>;
+  close(): void;
+}
+
+export type CreateDatabaseQueryMaintenance<Query, Row, Projection> = (input: {
+  readonly plan: PreparedPlan<Query>;
+  readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
+}) => DatabaseQueryMaintenanceSession<Query, Row, Projection>;
 
 export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly authorityScope: string;
@@ -94,9 +114,9 @@ export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly attachments: AttachmentCatalog;
   readonly datasets: readonly DatasetMembership[];
   readonly canRead: (viewAuthorityScope: string, attachmentAuthorityScope: string, attachmentId: string) => boolean;
-  readonly evaluate: (input: DatabaseEvaluationInput<Query, Projection>) => DatabaseEvaluation<Row>;
+  readonly createQueryMaintenance: CreateDatabaseQueryMaintenance<Query, Row, Projection>;
   /** Already authority-filtered portable input consumed by optional tooling. */
-  readonly describeAuthorityView?: () => JsonValue;
+  readonly getDatabaseDescriptionSnapshot?: () => JsonValue;
 };
 
 export type ObserveRequest<Query> = {
@@ -105,7 +125,7 @@ export type ObserveRequest<Query> = {
   readonly allowPartial?: boolean;
 };
 
-/** Authority-filtered database shell with shared, full-recompute maintenance. */
+/** Authority-filtered database shell with one shared maintenance session per observation identity. */
 export class DatabaseView<Query, Row, Projection = unknown> {
   readonly authorityScope: string;
   readonly authorityFingerprint: string;
@@ -113,8 +133,8 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   readonly #attachments: AttachmentCatalog;
   readonly #datasets: ReadonlyMap<string, DatasetMembership>;
   readonly #canRead: DatabaseViewOptions<Query, Row, Projection>['canRead'];
-  readonly #evaluate: DatabaseViewOptions<Query, Row, Projection>['evaluate'];
-  readonly #describeAuthorityView: (() => JsonValue) | undefined;
+  readonly #createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
+  readonly #getDatabaseDescriptionSnapshot: (() => JsonValue) | undefined;
   readonly #cache = new Map<string, SharedObservation<Query, Row, Projection>>();
   #closed = false;
 
@@ -125,8 +145,8 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     this.#attachments = options.attachments;
     this.#datasets = new Map(options.datasets.map((dataset) => [dataset.datasetId, dataset]));
     this.#canRead = options.canRead;
-    this.#evaluate = options.evaluate;
-    this.#describeAuthorityView = options.describeAuthorityView;
+    this.#createQueryMaintenance = options.createQueryMaintenance;
+    this.#getDatabaseDescriptionSnapshot = options.getDatabaseDescriptionSnapshot;
   }
 
   observe(request: ObserveRequest<Query>): QueryObserver<Row> {
@@ -155,7 +175,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
         attachments: this.#attachments,
         authorityScope: this.authorityScope,
         canRead: this.#canRead,
-        evaluate: this.#evaluate,
+        createQueryMaintenance: this.#createQueryMaintenance,
         collect: () => {
           if (this.#cache.get(key) === shared) this.#cache.delete(key);
         }
@@ -165,10 +185,10 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     return shared.acquire();
   }
 
-  activeMaintenanceCount(): number { return this.#cache.size; }
+  getActiveMaintenanceCount(): number { return this.#cache.size; }
 
-  databaseDescriptionInput(): JsonValue | undefined {
-    return this.#describeAuthorityView?.();
+  getDatabaseDescriptionSnapshot(): JsonValue | undefined {
+    return this.#getDatabaseDescriptionSnapshot?.();
   }
 
   close(): void {
@@ -201,7 +221,7 @@ type SharedOptions<Query, Row, Projection> = {
   readonly attachments: AttachmentCatalog;
   readonly authorityScope: string;
   readonly canRead: DatabaseViewOptions<Query, Row, Projection>['canRead'];
-  readonly evaluate: DatabaseViewOptions<Query, Row, Projection>['evaluate'];
+  readonly createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
   readonly collect: () => void;
 };
 
@@ -211,7 +231,7 @@ class SharedObservation<Query, Row, Projection> {
   readonly #unsubscribeDataset: () => void;
   readonly #unsubscribeCatalog: () => void;
   #sourceUnsubscribes: readonly (() => void)[] = [];
-  #session: MaintenanceSession<Row, EvaluationSnapshot<Projection>, unknown> | undefined;
+  #session: DatabaseQueryMaintenanceSession<Query, Row, Projection> | undefined;
   #snapshot: ObserverSnapshot<Row>;
   #leaseCount = 0;
   #refreshing = false;
@@ -221,9 +241,8 @@ class SharedObservation<Query, Row, Projection> {
   constructor(options: SharedOptions<Query, Row, Projection>) {
     this.#options = options;
     const captured = this.#capture();
-    const strategy = new FullRecomputeStrategy<Query, Row, EvaluationSnapshot<Projection>, unknown>((plan, snapshot) => this.#evaluate(plan, snapshot));
-    this.#session = strategy.open(options.plan, { snapshot: captured });
-    this.#snapshot = this.#observerSnapshot(this.#result(this.#session.current(), captured), undefined);
+    this.#session = this.#openMaintenance(captured);
+    this.#snapshot = this.#observerSnapshot(this.#result(this.#session.getCurrentResult(), captured), undefined);
     this.#refreshSourceSubscriptions();
     const refreshTopology = () => {
       this.#refreshSourceSubscriptions();
@@ -274,7 +293,7 @@ class SharedObservation<Query, Row, Projection> {
         const captured = this.#capture();
         const session = this.#session;
         if (session === undefined) continue;
-        const maintained = session.update({ snapshot: captured });
+        const maintained = this.#updateMaintenance(session, captured);
         const current = this.#result(maintained, captured);
         const previousSnapshot = this.#snapshot;
         if (previousSnapshot.state !== 'open') continue;
@@ -326,25 +345,32 @@ class SharedObservation<Query, Row, Projection> {
     return { dataset, members };
   }
 
-  #evaluate(plan: PreparedPlan<Query>, captured: EvaluationSnapshot<Projection>): DatabaseEvaluation<Row> {
-    const available: AvailableAttachment<Projection>[] = [];
+  #maintenanceInput(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceInput<Query, Projection> {
+    const available: AvailableQueryAttachment<Projection>[] = [];
     for (const candidate of captured.members) {
       if (candidate.attachment === undefined || candidate.snapshot === undefined || candidate.projection?.state !== 'ready') continue;
       available.push({ member: candidate.member, attachment: candidate.attachment, snapshot: candidate.snapshot, projection: candidate.projection.value });
     }
+    return { query: this.#options.plan.query, parameters: this.#options.parameters, dataset: captured.dataset, attachments: available };
+  }
+
+  #openMaintenance(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceSession<Query, Row, Projection> {
     try {
-      return this.#options.evaluate({ query: plan.query, parameters: this.#options.parameters, dataset: captured.dataset, attachments: available });
+      return this.#options.createQueryMaintenance({ plan: this.#options.plan, initialInput: this.#maintenanceInput(captured) });
     } catch (error) {
-      return {
-        rows: [],
-        resultKeys: [],
-        completeness: 'unknown',
-        issues: [observationIssue('observer.evaluation_failed', 'after_refresh', { error: error instanceof Error ? error.name : typeof error })]
-      };
+      return failedMaintenanceSession<Query, Row, Projection>(error);
     }
   }
 
-  #result(maintained: DatabaseEvaluation<Row>, captured: EvaluationSnapshot<Projection>): ObservedQueryResult<Row> {
+  #updateMaintenance(session: DatabaseQueryMaintenanceSession<Query, Row, Projection>, captured: EvaluationSnapshot<Projection>): MaintainedDatabaseQueryResult<Row> {
+    try {
+      return session.updateInput(this.#maintenanceInput(captured));
+    } catch (error) {
+      return failedEvaluation(error);
+    }
+  }
+
+  #result(maintained: MaintainedDatabaseQueryResult<Row>, captured: EvaluationSnapshot<Projection>): ObservedQueryResult<Row> {
     const evidence = captured.members.map(sourceEvidence);
     const evidenceIssues = evidence.flatMap(({ issues }) => issues);
     const membershipIssue = captured.dataset.state === 'open'
@@ -382,6 +408,46 @@ class SharedObservation<Query, Row, Projection> {
     return Object.freeze({ state: 'open', current, ...(lastExact === undefined ? {} : { lastExact }) });
   }
 }
+
+/** Bridges relation projections into the production incremental query graph. */
+export const createIncrementalDatabaseQueryMaintenance = (
+  functions?: FunctionRegistry
+): CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> => ({ plan, initialInput }) => {
+  const session = openIncrementalQueryMaintenance(plan, queryMaintenanceSnapshot(initialInput, functions));
+  return {
+    getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult()),
+    updateInput: (input) => databaseResultFromMaintained(session.updateSnapshot(queryMaintenanceSnapshot(input as DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>, functions))),
+    close: () => session.close()
+  };
+};
+
+const queryMaintenanceSnapshot = (
+  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
+  functions: FunctionRegistry | undefined
+): QueryMaintenanceSnapshot => ({
+  relations: input.attachments.flatMap(({ projection }) => projection),
+  parameters: input.parameters,
+  ...(functions === undefined ? {} : { functions }),
+  basis: {
+    dataset: { datasetId: input.dataset.datasetId, revision: input.dataset.revision },
+    attachments: input.attachments.map(({ member, snapshot }) => ({ attachmentId: member.attachmentId, sourceId: member.sourceId, basis: snapshot.basis }))
+  },
+  membershipRevision: input.dataset.revision
+});
+
+const databaseResultFromMaintained = ({ state: _state, ...result }: IncrementalQueryResult): MaintainedDatabaseQueryResult<QueryRecord> => result;
+
+const failedMaintenanceSession = <Query, Row, Projection>(error: unknown): DatabaseQueryMaintenanceSession<Query, Row, Projection> => {
+  const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<Row>;
+  return { getCurrentResult: () => result, updateInput: () => result, close: () => undefined };
+};
+
+const failedEvaluation = (error: unknown): MaintainedDatabaseQueryResult<never> => ({
+  rows: [],
+  resultKeys: [],
+  completeness: 'unknown',
+  issues: [observationIssue('observer.evaluation_failed', 'after_refresh', { error: error instanceof Error ? error.name : typeof error })]
+});
 
 const closedSnapshot: ObserverSnapshot<never> = Object.freeze({ state: 'closed' });
 
