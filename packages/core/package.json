@@ -20,7 +20,7 @@
     "bench": "node ../../scripts/v1-coarse-benchmark.mjs",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
-    "typecheck:budget": "node scripts/check-type-budget.mjs",
+    "typecheck:budget": "tsc -p type-fixtures/tsconfig.json --extendedDiagnostics --pretty false | node scripts/check-type-budget.mjs",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "devDependencies": {
