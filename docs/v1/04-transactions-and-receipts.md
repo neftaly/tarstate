@@ -47,6 +47,9 @@ Move and rekey statements inherit the enclosing transaction attempt's operation
 epoch/ID, source, basis policy, and replan discipline; they do not contain nested
 commit envelopes.
 
+A missing or unparseable bound parameter is an expected planning rejection with
+a structured issue. It never escapes as a thrown host error.
+
 ## Source-local dependency rule
 
 An atomic transaction attempt names exactly one attachment and source. Every
@@ -251,6 +254,12 @@ never by re-evaluating against current source state. Decoded/rendered receipt
 objects are evictable only when the authoritative outcome remains exactly
 reconstructable. No-op and rejected handed-off attempts are ledger entries too.
 
+The shell may reject malformed artifacts, denied authority, unavailable
+attachments, or cancellation before source handoff without creating a source
+ledger entry. Source handoff begins by reserving the operation identity and
+intent hash; every later known rejection, no-op, or commit is retained against
+that reservation. No evaluation that can mutate source state precedes it.
+
 Outcome lookup returns `known`, `not_seen`, `ambiguous`, `expired`, or
 `unavailable`. `not_seen` is allowed only when the active epoch durably proves
 handoff never began, and only that result permits retry. The other unresolved
@@ -266,6 +275,12 @@ governance commands that claim operation-ID deduplication.
 Counter increments, text/list edits, maps, moves, and named future CRDT edits
 remain semantic intents until binding planning. They are never lowered to
 replacement merely to simplify retries.
+
+Plain `edit.replace` is the baseline field assignment and therefore contributes
+affected counts but no `SemanticEditOutcome`. That array reports mechanisms
+whose semantics or preservation guarantees matter beyond baseline replacement,
+including counter, text, list, rekey, move, conflict-resolution, and custom
+edits.
 
 An ordinary field set against an observed Automerge multi-value conflict fails
 with `transaction.conflict_requires_resolution`. An explicit resolve edit

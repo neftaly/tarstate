@@ -84,6 +84,12 @@ membership snapshot, projected logical rows, and registry fingerprint. Its
 output is `QueryResult`; observers add lifecycle, caching, `lastExact`, diffs,
 and subscriptions without changing query meaning.
 
+Data null or missing may make an individual predicate logically unknown while
+the evaluated relation remains exact. A required named function, codec,
+collation, or extension that cannot execute is different: it makes the affected
+query result completeness `unknown`, with empty current rows and a capability
+issue. The evaluator never labels an unevaluable result exact.
+
 Queries never discover resources, commit writes, read ambient time/randomness,
 or silently change dataset membership. Durable time and random facts are
 ordinary stored/parameter values. Presence and connection state are explicit

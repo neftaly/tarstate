@@ -209,6 +209,13 @@ exposing hidden row data.
 
 ## Measurements before API freeze
 
+The clean-slate implementation begins with simple full recomputation and coarse
+golden-workload comparisons against `legacy-v0-final`. Microbenchmarks, GC
+profiling, and specialized incremental structures are deferred unless a gross
+latency, scaling, or retention regression appears. Such a regression is first a
+signal to simplify or decompose the design; optimization follows only when the
+semantic structure is sound.
+
 The spikes and golden workloads record both latency and scaling slope for:
 
 - artifact parse/hash and schema/lens preparation;

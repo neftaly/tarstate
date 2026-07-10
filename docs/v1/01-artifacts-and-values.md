@@ -212,6 +212,12 @@ Comparisons involving null or missing produce logical unknown, except explicit
 Boolean operators use strong Kleene semantics: false dominates `and`, true
 dominates `or`, and `not unknown` is unknown.
 
+Logical unknown, missing, and capability-unavailable are disjoint internal
+evaluation states outside `JsonValue`. In particular, none is represented by
+the ordinary data string `"unknown"`. Nested expressions preserve these states
+until an operator resolves or propagates them; portable output never encodes an
+internal state as a colliding application value.
+
 Outer joins introduce missing fields, not null fields. Projection omits missing
 properties and preserves explicit nulls. Grouping treats all nulls as one group
 and all missing values as a distinct group.

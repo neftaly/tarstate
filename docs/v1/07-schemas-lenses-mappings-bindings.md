@@ -188,5 +188,10 @@ Writes target current row locators, translate field-level edits backward, and
 run current source constraints after translation. A write that cannot preserve
 unknown data or round-trip its touched meaning rejects.
 
+For a value-map or lookup step whose policy is `reject`, failure rejects the
+entire candidate projection. The lens never publishes a partial row with the
+unmapped field omitted as exact data. Tuple-backed lookups require exact arity;
+a scalar is accepted only for a one-field tuple.
+
 Lenses translate views and write intent; they do not mutate stored documents or
 serve as migrations.
