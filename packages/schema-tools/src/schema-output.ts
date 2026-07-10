@@ -1,18 +1,17 @@
 import {
   prepareSchema,
   safeParseArtifactValue,
-  type Artifact,
   type ArtifactParseBudget,
   type FieldDeclaration,
   type JsonValue,
   type ParseResult,
   type PreparedSchema,
   type ScalarDeclaration,
-  type SchemaBody
+  type SchemaArtifact
 } from '@tarstate/core';
 import { schemaToolsFailure } from './internal-issues.js';
 
-export type SchemaArtifact = Omit<Artifact, 'body' | 'kind'> & { readonly kind: 'schema'; readonly body: SchemaBody };
+export type { SchemaArtifact } from '@tarstate/core';
 
 export type PreparedSchemaTooling = {
   readonly artifact: SchemaArtifact;
@@ -26,6 +25,7 @@ export type GeneratedSchemaOutputs = {
   readonly markdown: string;
 };
 
+/** Parses and resolves a schema artifact for deterministic tooling output. */
 export const safePrepareSchemaArtifact = async (input: unknown, budget?: ArtifactParseBudget): Promise<ParseResult<PreparedSchemaTooling>> => {
   const parsed = await safeParseArtifactValue(input, budget);
   if (!parsed.success) return parsed;
@@ -35,6 +35,7 @@ export const safePrepareSchemaArtifact = async (input: unknown, budget?: Artifac
   return { success: true, value: { artifact: parsed.value as SchemaArtifact, schema: prepared.value }, issues: [] };
 };
 
+/** Generates matching TypeScript, JSON Schema, and Markdown from one validated artifact. */
 export const generateSchemaOutputs = async (input: unknown, budget?: ArtifactParseBudget): Promise<ParseResult<GeneratedSchemaOutputs>> => {
   const prepared = await safePrepareSchemaArtifact(input, budget);
   if (!prepared.success) return prepared;

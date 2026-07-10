@@ -44,6 +44,7 @@ export type SourceEvidence = {
   readonly issues: readonly Issue[];
 };
 
+/** Immutable query evidence at one database/attachment basis. Result keys are opaque UI/diff identities, not write locators. */
 export type ObservedQueryResult<Row> = {
   readonly rows: readonly Row[];
   readonly resultKeys: readonly string[];
@@ -54,6 +55,7 @@ export type ObservedQueryResult<Row> = {
   readonly issues: readonly Issue[];
 };
 
+/** Current observer state; `lastExact` is retained evidence and must be requested explicitly by consumers. */
 export type ObserverSnapshot<Row> =
   | { readonly state: 'open'; readonly current: ObservedQueryResult<Row>; readonly lastExact?: ObservedQueryResult<Row> }
   | { readonly state: 'closed' };
@@ -64,11 +66,13 @@ export type ResultDiff<Row> = {
   readonly updated: readonly { readonly key: string; readonly before: Row; readonly after: Row }[];
 };
 
+/** A proven row diff, an evidence withdrawal, or a full reset. */
 export type ObserverChange<Row> =
   | { readonly kind: 'diff'; readonly diff: ResultDiff<Row>; readonly snapshot: ObserverSnapshot<Row> }
   | { readonly kind: 'invalidation'; readonly snapshot: ObserverSnapshot<Row> }
   | { readonly kind: 'reset'; readonly snapshot: ObserverSnapshot<Row> };
 
+/** Closeable synchronous snapshot source. Closing an observer does not close its database or sources. */
 export interface QueryObserver<Row> {
   getSnapshot(): ObserverSnapshot<Row>;
   subscribe(listener: (change: ObserverChange<Row>) => void): () => void;
@@ -119,12 +123,14 @@ export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly getDatabaseDescriptionSnapshot?: () => JsonValue;
 };
 
+/** Prepared query identity plus bound parameters and an explicit partial-evidence opt-in. */
 export type ObserveRequest<Query> = {
   readonly plan: PreparedPlan<Query>;
   readonly parameters?: Readonly<Record<string, JsonValue>>;
   readonly allowPartial?: boolean;
 };
 
+/** Canonical cache key for every field that changes observation semantics. */
 export const queryObservationKey = <Query>(
   database: { readonly authorityScope: string; readonly authorityFingerprint: string; readonly registryFingerprint: string },
   request: ObserveRequest<Query>

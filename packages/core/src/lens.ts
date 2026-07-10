@@ -1,5 +1,6 @@
 import { canonicalizeJson, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import type { RelationId, RelationRow } from './schema.js';
 import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
 
@@ -38,6 +39,10 @@ export type SchemaLensBody = {
   readonly to: ArtifactRef;
   readonly relations: readonly LensRelation[];
 };
+/** Sealed portable schema-lens artifact with its typed body preserved. */
+export type SchemaLensArtifact = TypedArtifact<'schema-lens', SchemaLensBody>;
+/** Seals a typed schema lens without a `JsonValue` assertion at the call site. */
+export const sealSchemaLens = (input: TypedArtifactInput<SchemaLensBody>): Promise<SchemaLensArtifact> => sealTypedArtifact('schema-lens', input);
 export type LensArtifact = { readonly ref: ArtifactRef; readonly body: SchemaLensBody };
 export type LensRows = Readonly<Record<RelationId, readonly RelationRow[]>>;
 

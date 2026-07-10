@@ -159,7 +159,12 @@ const isRecord = (value: JsonValue): value is Readonly<Record<string, JsonValue>
 const isKnownReceiptShape = (value: Readonly<Record<string, JsonValue>>, depth: number): boolean => {
   if (depth > 8 || value.receiptVersion !== 1 || !isIssueArray(value.issues)) return false;
   if (value.kind === 'commit') {
-    return strings(value, ['operationEpoch', 'operationId', 'attachmentId', 'sourceId']) && hashes(value, ['transactionHash', 'intentHash', 'attachmentFingerprint']) && includes(value.outcome, ['committed', 'rejected', 'unknown']) && Array.isArray(value.statementResults) && value.statementResults.every(isStatementResult) && optionalArray(value.returning) && optionalDurability(value.durability);
+    const outcomeShape = value.outcome === 'committed'
+      ? value.beforeBasis !== undefined && value.afterBasis !== undefined && includes(value.durability, ['memory', 'local', 'persisted'])
+      : value.outcome === 'rejected'
+        ? value.afterBasis === undefined && value.durability === undefined
+        : value.outcome === 'unknown' && value.afterBasis === undefined && value.durability === 'unknown';
+    return strings(value, ['operationEpoch', 'operationId', 'attachmentId', 'sourceId']) && hashes(value, ['transactionHash', 'intentHash', 'attachmentFingerprint']) && outcomeShape && Array.isArray(value.statementResults) && value.statementResults.every(isStatementResult) && optionalArray(value.returning);
   }
   if (value.kind === 'non-atomic-batch') {
     return typeof value.batchId === 'string' && includes(value.outcome, ['complete', 'partial', 'failed', 'unknown']) && Array.isArray(value.steps) && value.steps.every((step) => isBatchStep(step, depth));

@@ -387,6 +387,16 @@ describe('non-atomic batch execution', () => {
     expect(lost).toMatchObject({ outcome: 'unknown', steps: [{ outcome: 'unknown' }, { outcome: 'unattempted' }], issues: [{ code: 'transaction.batch_step_outcome_unknown', retry: 'query_outcome' }] });
     expect(lost.steps[0]).not.toHaveProperty('receipt');
   });
+
+  it('retains an unknown receipt when shell membership resolution throws', async () => {
+    const value = await transaction([]);
+    const receipt = await executeNonAtomicBatch({
+      batchId: 'batch:source-resolution', failurePolicy: 'stop',
+      steps: [{ stepId: 'lost-source', attempt: attempt('lost-source', value) }]
+    }, { sourceIdFor: () => { throw new Error('membership unavailable'); }, commit: () => Promise.reject(new Error('must not execute')) });
+    expect(receipt).toMatchObject({ outcome: 'unknown', steps: [{ outcome: 'unknown' }], issues: [{ code: 'transaction.batch_step_outcome_unknown', details: { reason: 'source_resolution_failed' } }] });
+    expect(receipt.steps[0]).not.toHaveProperty('sourceId');
+  });
 });
 
 describe('production constraint dirty-state rules', () => {

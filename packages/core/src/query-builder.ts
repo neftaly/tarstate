@@ -31,10 +31,18 @@ export const sealQuery = async (input: {
   body: input.body as unknown as JsonValue
 }) as Promise<QueryArtifact>;
 
+/** Applies left-to-right authoring operators while preserving each intermediate type. */
 export function pipe<A>(value: A): A;
 export function pipe<A, B>(value: A, first: (value: A) => B): B;
 export function pipe<A, B, C>(value: A, first: (value: A) => B, second: (value: B) => C): C;
 export function pipe<A, B, C, D>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D): D;
+export function pipe<A, B, C, D, E>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E): E;
+export function pipe<A, B, C, D, E, F>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F): F;
+export function pipe<A, B, C, D, E, F, G>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G): G;
+export function pipe<A, B, C, D, E, F, G, H>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H): H;
+export function pipe<A, B, C, D, E, F, G, H, I>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H, eighth: (value: H) => I): I;
+export function pipe<A, B, C, D, E, F, G, H, I, J>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H, eighth: (value: H) => I, ninth: (value: I) => J): J;
+export function pipe<A, B, C, D, E, F, G, H, I, J, K>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H, eighth: (value: H) => I, ninth: (value: I) => J, tenth: (value: J) => K): K;
 export function pipe(value: unknown, ...operators: readonly ((value: never) => unknown)[]): unknown {
   return operators.reduce((current, operator) => operator(current as never), value);
 }

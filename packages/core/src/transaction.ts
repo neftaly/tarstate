@@ -101,7 +101,7 @@ export type ReturningResult = {
   readonly issues: readonly Issue[];
 };
 
-export type CommitReceipt = {
+type CommitReceiptEvidence = {
   readonly kind: 'commit';
   readonly receiptVersion: 1;
   readonly operationEpoch: string;
@@ -111,18 +111,27 @@ export type CommitReceipt = {
   readonly attachmentId: string;
   readonly attachmentFingerprint: ContentHash;
   readonly sourceId: string;
-  readonly outcome: 'committed' | 'rejected' | 'unknown';
-  readonly beforeBasis?: SourceBasis;
-  readonly afterBasis?: SourceBasis;
   readonly statementResults: readonly StatementResult[];
   readonly returning?: readonly ReturningResult[];
   readonly issues: readonly Issue[];
-  readonly durability?: 'memory' | 'local' | 'persisted' | 'unknown';
 };
 
-export type SimulationReceipt = Omit<CommitReceipt, 'kind' | 'outcome' | 'durability'> & {
+/**
+ * Authoritative transaction outcome. Committed receipts prove both bases and
+ * known durability; rejected and unknown outcomes make no after-basis claim.
+ */
+export type CommitReceipt = CommitReceiptEvidence & (
+  | { readonly outcome: 'committed'; readonly beforeBasis: SourceBasis; readonly afterBasis: SourceBasis; readonly durability: 'memory' | 'local' | 'persisted' }
+  | { readonly outcome: 'rejected'; readonly beforeBasis?: SourceBasis }
+  | { readonly outcome: 'unknown'; readonly beforeBasis?: SourceBasis; readonly durability: 'unknown' }
+);
+
+/** Pure preflight evidence; it never claims durability or mutates a source. */
+export type SimulationReceipt = Omit<CommitReceiptEvidence, 'kind'> & {
   readonly kind: 'simulation';
   readonly outcome: 'would-commit' | 'rejected';
+  readonly beforeBasis?: SourceBasis;
+  readonly afterBasis?: SourceBasis;
   readonly stagedState?: unknown;
 };
 
@@ -138,7 +147,8 @@ export type NonAtomicBatch = {
 export type NonAtomicBatchStepReceipt = {
   readonly stepId: string;
   readonly attachmentId: string;
-  readonly sourceId: string;
+  /** Absent only when shell-owned membership resolution itself failed. */
+  readonly sourceId?: string;
   readonly capturedBasis?: SourceBasis;
   readonly outcome: 'applied' | 'failed' | 'unattempted' | 'unknown';
   readonly receipt?: CommitReceipt;
@@ -174,7 +184,7 @@ export const executeNonAtomicBatch = async (
       receiptVersion: 1,
       batchId: batch.batchId,
       outcome: 'failed',
-      steps: batch.steps.map((step) => ({ stepId: step.stepId, attachmentId: step.attempt.attachmentId, sourceId: executor.sourceIdFor(step.attempt), ...(step.attempt.expectedBasis === undefined ? {} : { capturedBasis: step.attempt.expectedBasis }), outcome: 'unattempted' })),
+      steps: batch.steps.map((step) => ({ stepId: step.stepId, attachmentId: step.attempt.attachmentId, ...(step.attempt.expectedBasis === undefined ? {} : { capturedBasis: step.attempt.expectedBasis }), outcome: 'unattempted' })),
       issues: [issue]
     };
   }
@@ -182,17 +192,24 @@ export const executeNonAtomicBatch = async (
   const issues: Issue[] = [];
   let stopped = false;
   for (const step of batch.steps) {
-    const sourceId = executor.sourceIdFor(step.attempt);
+    const unresolved = { stepId: step.stepId, attachmentId: step.attempt.attachmentId, ...(step.attempt.expectedBasis === undefined ? {} : { capturedBasis: step.attempt.expectedBasis }) };
+    if (stopped) { steps.push({ ...unresolved, outcome: 'unattempted' }); continue; }
+    let sourceId: string;
+    try {
+      sourceId = executor.sourceIdFor(step.attempt);
+    } catch (error) {
+      const issue = createIssue({ code: 'transaction.batch_step_outcome_unknown', phase: 'commit', severity: 'error', retry: 'query_outcome', details: { stepId: step.stepId, reason: 'source_resolution_failed', error: error instanceof Error ? error.name : typeof error } });
+      steps.push({ ...unresolved, outcome: 'unknown' });
+      issues.push(issue);
+      if (batch.failurePolicy === 'stop') stopped = true;
+      continue;
+    }
     const common = {
       stepId: step.stepId,
       attachmentId: step.attempt.attachmentId,
       sourceId,
       ...(step.attempt.expectedBasis === undefined ? {} : { capturedBasis: step.attempt.expectedBasis })
     };
-    if (stopped) {
-      steps.push({ ...common, outcome: 'unattempted' });
-      continue;
-    }
     try {
       const receipt = await executor.commit(step.attempt);
       const outcome = receipt.outcome === 'committed' ? 'applied' : receipt.outcome === 'rejected' ? 'failed' : 'unknown';

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   issueCatalog,
-  sealArtifact,
+  sealSchema,
   type CapabilityRef,
   type JsonValue,
   type SchemaBody
@@ -51,7 +51,7 @@ const schemaBody = (reverse = false): SchemaBody => {
   return { description: 'Leaderboard', relations: Object.fromEntries(reverse ? [...entries].reverse() : entries) };
 };
 
-const schemaArtifact = async (reverse = false) => sealArtifact({ kind: 'schema', id: 'urn:test:leaderboard', body: schemaBody(reverse) as unknown as JsonValue });
+const schemaArtifact = async (reverse = false) => sealSchema({ id: 'urn:test:leaderboard', body: schemaBody(reverse) });
 
 const databaseInput = async (): Promise<DatabaseDescriptionSnapshot> => {
   const schema = await schemaArtifact();

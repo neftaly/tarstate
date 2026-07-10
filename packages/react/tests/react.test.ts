@@ -132,8 +132,8 @@ describe('@tarstate/react', () => {
 
   it('provides the externally owned database without closing it', async () => {
     const database = new TestDatabase();
-    let received: ObservableDatabase<Query, Row> | undefined;
-    const Consumer = () => { received = useDatabase<Query, Row>(); return null; };
+    let received: ObservableDatabase | undefined;
+    const Consumer = () => { received = useDatabase(); return null; };
     const renderer = await mount(createElement(TarstateProvider, { database }, createElement(Consumer)));
     expect(received).toBe(database);
     await act(() => { renderer.unmount(); });
@@ -542,9 +542,9 @@ const transactionAttempt = (): TransactionAttempt => ({
   transaction: { id: 'transaction:one', contentHash: 'sha256:transaction' }
 });
 
-const commitReceipt = (outcome: CommitReceipt['outcome'] = 'committed'): CommitReceipt => ({
+const commitReceiptEvidence = {
   kind: 'commit',
-  receiptVersion: 1,
+  receiptVersion: 1 as const,
   operationEpoch: 'epoch:one',
   operationId: 'operation:one',
   transactionHash: 'sha256:transaction',
@@ -552,13 +552,16 @@ const commitReceipt = (outcome: CommitReceipt['outcome'] = 'committed'): CommitR
   attachmentId: 'attachment:one',
   attachmentFingerprint: 'sha256:attachment',
   sourceId: 'source:one',
-  outcome,
-  beforeBasis: { incarnation: 'one', revision: 0 },
-  ...(outcome === 'committed' ? { afterBasis: { incarnation: 'one', revision: 1 }, durability: 'memory' as const } : {}),
-  ...(outcome === 'unknown' ? { durability: 'unknown' as const } : {}),
   statementResults: [],
   issues: []
-});
+} as const;
+
+const commitReceipt = (outcome: CommitReceipt['outcome'] = 'committed'): CommitReceipt => {
+  const beforeBasis = { incarnation: 'one', revision: 0 };
+  if (outcome === 'committed') return { ...commitReceiptEvidence, outcome, beforeBasis, afterBasis: { incarnation: 'one', revision: 1 }, durability: 'memory' };
+  if (outcome === 'unknown') return { ...commitReceiptEvidence, outcome, beforeBasis, durability: 'unknown' };
+  return { ...commitReceiptEvidence, outcome, beforeBasis };
+};
 
 const optimisticNames = (suffix: string): CreateOptimisticOverlay<Query, Row> => () => ({
   sourceId: 'source:one',

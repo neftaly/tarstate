@@ -28,6 +28,7 @@ export type CapabilityRef = {
   readonly contractHash: `sha256:${string}`;
 };
 
+/** Stable, portable diagnostic with an explicit phase and retry policy. */
 export type Issue = {
   readonly id: string;
   readonly code: string;
@@ -40,6 +41,7 @@ export type Issue = {
   readonly operationId?: string;
   readonly requiredCapabilities?: readonly CapabilityRef[];
   readonly retry?: IssueRetry;
+  /** Must be JSON-serializable; non-portable host values are programmer errors in `createIssue`. */
   readonly details?: unknown;
 };
 
@@ -297,10 +299,12 @@ const stableIssueIdentity = (input: Record<string, unknown>): string => {
   });
 };
 
+/** Non-throwing validation result used at portable-data boundaries. */
 export type ParseResult<Value> =
   | { readonly success: true; readonly value: Value; readonly issues: readonly Issue[] }
   | { readonly success: false; readonly issues: readonly Issue[] };
 
+/** Throwing shell form for APIs that cannot return a `ParseResult`. */
 export class TarstateParseError extends Error {
   readonly issues: readonly Issue[];
 

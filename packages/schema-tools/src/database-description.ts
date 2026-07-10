@@ -69,6 +69,7 @@ export type DatabaseDescription = {
 export type DatabaseDescriptionSnapshot = Omit<DatabaseDescription, 'kind' | 'formatVersion' | 'databaseFingerprint'>;
 
 export type DatabaseDescriptionSnapshotProvider = {
+  /** Unknown is intentional: provider output is validated before it crosses the tooling boundary. */
   readonly getDatabaseDescriptionSnapshot: () => unknown;
 };
 
@@ -117,11 +118,13 @@ export const describeDatabase = async (source: DatabaseDescriptionSnapshot | Dat
   return validated.value;
 };
 
+/** Validates serialized JSON, semantic shape, budgets, and database fingerprint without throwing. */
 export const safeParseDatabaseDescriptionText = (text: string, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<ParseResult<DatabaseDescription>> => {
   const parsed = safeParseJsonText(text, budget);
   return parsed.success ? safeParseDatabaseDescription(parsed.value, budget) : Promise.resolve(parsed);
 };
 
+/** Validates an already sealed authority-filtered description without normalizing it. */
 export const safeParseDatabaseDescription = async (input: unknown, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<ParseResult<DatabaseDescription>> => {
   const portable = safeParseJsonValue(input, budget);
   if (!portable.success) return portable;

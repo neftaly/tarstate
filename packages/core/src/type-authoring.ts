@@ -90,12 +90,14 @@ export type RowOfRelation<Relation> = Relation extends RelationDeclaration
     >
   : never;
 
+/** Exact application row inferred from a literal schema relation. */
 export type SchemaRow<Body, Name extends StringKey<RelationsOf<Body>>> = RowOfRelation<RelationOf<Body, Name>>;
 
 type KeyTuple<Relation, Names extends readonly unknown[]> = {
   readonly [Index in keyof Names]: Names[Index] extends keyof FieldsOf<Relation> ? FieldValue<FieldsOf<Relation>[Names[Index]]> : never
 };
 
+/** Ordered logical-key tuple inferred from a literal schema relation. */
 export type SchemaKey<Body, Name extends StringKey<RelationsOf<Body>>> = RelationOf<Body, Name> extends { readonly key: infer Names extends readonly string[] }
   ? KeyTuple<RelationOf<Body, Name>, Names>
   : never;
@@ -118,6 +120,10 @@ export const relationLiteral = <const Body extends SchemaBody, const Name extend
 
 declare const expressionValue: unique symbol;
 declare const expressionParameters: unique symbol;
+declare const queryResultRow: unique symbol;
+declare const preparedPlanRow: unique symbol;
+declare const preparedPlanParameters: unique symbol;
+declare const returningRow: unique symbol;
 export type TypedExpression<Value, Parameters extends Readonly<Record<string, ValueDeclaration>> = {}> = {
   readonly expression: Expr;
   readonly parameterDeclarations: Parameters;
@@ -139,7 +145,7 @@ export type TypedQuery<Aliases extends TypedAliases, Parameters extends Readonly
   readonly aliases: Aliases;
   readonly parameterDeclarations: Parameters;
   readonly schemaViews: readonly ArtifactRef[];
-  readonly _result?: ResultRow;
+  readonly [queryResultRow]?: ResultRow;
 };
 
 export type QueryParametersOf<Query> = Query extends TypedQuery<TypedAliases, infer Parameters, unknown>
@@ -154,6 +160,7 @@ const makeAlias = <Name extends string, Row>(name: Name, fields: readonly string
   return { name, row };
 };
 
+/** Starts a typed query while preserving the relation's exact row and alias. */
 export const typedFrom = <const Body extends SchemaBody, const RelationName extends StringKey<Body['relations']>, const Alias extends string>(
   relation: LiteralRelation<Body, RelationName>,
   alias: Alias
@@ -166,6 +173,7 @@ export const typedFrom = <const Body extends SchemaBody, const RelationName exte
 
 export const typedLiteral = <const Value extends JsonValue>(value: Value): TypedExpression<Value> => ({ expression: { kind: 'literal', value }, parameterDeclarations: {} });
 
+/** Declares one portable parameter and carries its decoded application type. */
 export const typedParameter = <const Name extends string, const Declaration extends ValueDeclaration>(
   name: Name,
   declaration: Declaration
@@ -174,10 +182,11 @@ export const typedParameter = <const Name extends string, const Declaration exte
   parameterDeclarations: { [name]: declaration } as { readonly [Key in Name]: Declaration }
 });
 
+type ComparableExpressionValues<Left, Right> = [Left] extends [Right] ? unknown : [Right] extends [Left] ? unknown : never;
 export const typedCompare = <Left, Right, LeftParameters extends Readonly<Record<string, ValueDeclaration>>, RightParameters extends Readonly<Record<string, ValueDeclaration>>>(
   op: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte',
   left: TypedExpression<Left, LeftParameters>,
-  right: TypedExpression<Right, RightParameters>
+  right: TypedExpression<Right, RightParameters> & ComparableExpressionValues<Left, Right>
 ): TypedExpression<boolean, Simplify<LeftParameters & RightParameters>> => ({
   expression: { kind: 'compare', op, left: left.expression, right: right.expression },
   parameterDeclarations: { ...left.parameterDeclarations, ...right.parameterDeclarations } as Simplify<LeftParameters & RightParameters>
@@ -230,6 +239,7 @@ const applyTypedSelect = <Aliases extends TypedAliases, QueryParameters extends 
   };
 };
 
+/** Projects an exact result-row type; supports both pipeline and callback forms. */
 export function typedSelect<const Alias extends string, const Fields extends FieldExpressionRecord>(
   alias: Alias,
   fields: Fields
@@ -255,6 +265,7 @@ export function typedSelect(
 type JoinedAliases<Left extends TypedAliases, Right extends TypedAliases> = Simplify<Left & Right>;
 type JoinedRows<Aliases extends TypedAliases> = { readonly [Name in keyof Aliases]: Aliases[Name] extends TypedAlias<string, infer Row> ? Row : never };
 
+/** Inner-joins disjoint alias scopes and rejects duplicate aliases at compile time. */
 export const typedJoin = <LeftAliases extends TypedAliases, LeftParameters extends Readonly<Record<string, ValueDeclaration>>, RightAliases extends TypedAliases, RightParameters extends Readonly<Record<string, ValueDeclaration>>, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
   left: TypedQuery<LeftAliases, LeftParameters, unknown>,
   right: keyof LeftAliases & keyof RightAliases extends never ? TypedQuery<RightAliases, RightParameters, unknown> : never,
@@ -277,9 +288,14 @@ export const typedQueryBody = <Aliases extends TypedAliases, Parameters extends 
 
 /** Prepared-plan carrier consumed by adapters without changing the plan wire shape. */
 export type TypedPreparedPlan<Query, Row, Parameters extends Readonly<Record<string, unknown>>> = PreparedPlan<Query> & {
-  readonly __tarstateRowType?: (row: Row) => Row;
-  readonly __tarstateParameterType?: (parameters: Parameters) => Parameters;
+  readonly [preparedPlanRow]?: (row: Row) => Row;
+  readonly [preparedPlanParameters]?: (parameters: Parameters) => Parameters;
 };
+
+/** Exact result row inferred from a typed prepared plan. */
+export type PreparedPlanRow<Plan> = Plan extends { readonly [preparedPlanRow]?: (row: infer Row) => unknown } ? Row : never;
+/** Exact parameter object inferred from a typed prepared plan. */
+export type PreparedPlanParameters<Plan> = Plan extends { readonly [preparedPlanParameters]?: (parameters: infer Parameters) => unknown } ? Parameters : never;
 
 /** Attaches query inference to the exact plan that was prepared from its root. */
 export const typedPreparedPlan = <
@@ -297,7 +313,7 @@ export const typedPreparedPlan = <
 export type TypedReturning<Name extends string, Query extends TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>> = {
   readonly name: Name;
   readonly root: QueryNode;
-  readonly _row?: QueryResultRowOf<Query>;
+  readonly [returningRow]?: QueryResultRowOf<Query>;
 };
 export const typedReturning = <const Name extends string, Query extends TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>>(
   name: Name,
@@ -318,11 +334,13 @@ type EntityCapabilities<Relation> = Relation extends { readonly entityEditCapabi
 type MoveCapability<References> = HasCapability<References, 'urn:tarstate:capability:entity/move'> extends true ? true
   : HasCapability<References, 'urn:tarstate:capability:entity/copy-relocate'> extends true ? true
     : HasCapability<References, 'urn:tarstate:capability:entity/identity-preserving-move'>;
-type FieldAccess<Fields> = { readonly [Field in keyof Fields]: Fields[Field] extends FieldDeclaration ? FieldEditKind<Fields[Field]['editCapabilities']> : never };
-type EditableFieldNames<Access> = Access extends { readonly fields: infer Fields } ? { [Field in keyof Fields]-?: Fields[Field] extends never ? never : Field }[keyof Fields] : never;
+type FieldAccess<Fields> = { readonly [Field in keyof Fields]: Fields[Field] extends FieldDeclaration ? readonly FieldEditKind<Fields[Field]['editCapabilities']>[] : readonly never[] };
+type EditableFieldNames<Access> = Access extends { readonly fields: infer Fields } ? { [Field in keyof Fields]-?: Fields[Field] extends readonly (infer Kind)[] ? [Kind] extends [never] ? never : Field : never }[keyof Fields] : never;
 
+/** Compile-time edit capabilities inferred from one literal relation declaration. */
 export type RelationAccessOf<Body, Name extends StringKey<RelationsOf<Body>>> = RelationOf<Body, Name> extends infer Relation
   ? {
+      readonly declaration: Relation;
       readonly readable: true;
       readonly writable: EditableFieldNames<{ fields: FieldAccess<FieldsOf<Relation>> }> extends never
         ? CapabilityIds<EntityCapabilities<Relation>> extends never ? false : true
@@ -330,8 +348,6 @@ export type RelationAccessOf<Body, Name extends StringKey<RelationsOf<Body>>> = 
       readonly rekey: HasCapability<EntityCapabilities<Relation>, 'urn:tarstate:capability:entity/rekey'>;
       readonly move: MoveCapability<EntityCapabilities<Relation>>;
       readonly fields: FieldAccess<FieldsOf<Relation>>;
-      readonly _row?: RowOfRelation<Relation>;
-      readonly _key?: SchemaKey<Body, Name>;
     }
   : never;
 
@@ -344,6 +360,7 @@ export const relationAccess = <const Body extends SchemaBody, const Name extends
   const fields = Object.fromEntries(Object.entries(relation.fields).map(([fieldName, declaration]) => [fieldName, (declaration.editCapabilities ?? []).map(({ id }) => fieldEditKind(id))]));
   const writable = Object.values(fields).some((kinds) => kinds.length > 0) || entityIds.size > 0;
   return {
+    declaration: relation,
     readable: true,
     writable,
     rekey: entityIds.has('urn:tarstate:capability:entity/rekey'),
@@ -352,8 +369,8 @@ export const relationAccess = <const Body extends SchemaBody, const Name extends
   } as RelationAccessOf<Body, Name>;
 };
 
-type AccessRow<Access> = Access extends { readonly _row?: infer Row } ? Row : never;
-type AccessKey<Access> = Access extends { readonly _key?: infer Key } ? Key : never;
+type AccessRow<Access> = Access extends { readonly declaration: infer Relation } ? RowOfRelation<Relation> : never;
+type AccessKey<Access> = Access extends { readonly declaration: infer Relation } ? RelationKey<Relation> : never;
 
 export const typedFieldEdit = <Access, Field extends EditableFieldNames<Access>>(access: Access, field: Field, value: Field extends keyof AccessRow<Access> ? AccessRow<Access>[Field] : never): { readonly field: Field; readonly value: Field extends keyof AccessRow<Access> ? AccessRow<Access>[Field] : never } => {
   void access;

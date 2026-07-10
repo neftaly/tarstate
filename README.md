@@ -14,7 +14,7 @@ The current repository contains:
 - the portable semantic oracle, source coordinator, resolver, database,
   observers, and receipts in `@tarstate/core`;
 - production Automerge and generic external-store/Zustand adapters;
-- the small observer-only `@tarstate/react` package; and
+- the small React observer, commit, mutation-state, and optimistic-display adapter; and
 - deterministic schema, issue-catalog, and agent-description tooling.
 
 Historical design and spike material remains available in Git history. The

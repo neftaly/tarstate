@@ -1,6 +1,7 @@
 import { canonicalizeJson } from './artifacts.js';
 import { parseScalarValue, type ScalarDeclaration } from './codec.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
 import type { JsonValue, PortableValue } from './value.js';
 
@@ -14,6 +15,12 @@ export type SchemaBody = {
   readonly description?: string;
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 };
+
+/** Sealed portable schema artifact with its typed body preserved. */
+export type SchemaArtifact = TypedArtifact<'schema', SchemaBody>;
+
+/** Seals a typed schema body without requiring a `JsonValue` assertion at the call site. */
+export const sealSchema = (input: TypedArtifactInput<SchemaBody>): Promise<SchemaArtifact> => sealTypedArtifact('schema', input);
 
 export type RelationDeclaration = {
   readonly relationId: RelationId;

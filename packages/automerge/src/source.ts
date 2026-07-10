@@ -1,5 +1,6 @@
 import * as Automerge from '@automerge/automerge';
 
+/** Exact, order-insensitive Automerge head set used for optimistic concurrency. */
 export type AutomergeBasis = {
   readonly kind: 'automerge-heads';
   readonly heads: readonly string[];
@@ -22,18 +23,21 @@ export type AutomergeSourceCommand<T extends object> = {
   readonly apply: Automerge.ChangeFn<T>;
 };
 
-export type AutomergeSourceCommitResult = {
+type AutomergeSourceCommitEvidence = {
   readonly kind: 'source-commit';
-  readonly outcome: 'committed' | 'rejected';
   readonly operationEpoch: string;
   readonly operationId: string;
   readonly intentHash: `sha256:${string}`;
-  readonly beforeBasis?: AutomergeBasis;
-  readonly afterBasis?: AutomergeBasis;
-  readonly changed: boolean;
   readonly durability: 'local';
   readonly issues: readonly AutomergeSourceIssue[];
 };
+
+/** Exact-head commit evidence; rejected attempts either expose both equal bases or neither. */
+export type AutomergeSourceCommitResult = AutomergeSourceCommitEvidence & (
+  | { readonly outcome: 'committed'; readonly beforeBasis: AutomergeBasis; readonly afterBasis: AutomergeBasis; readonly changed: boolean }
+  | { readonly outcome: 'rejected'; readonly beforeBasis: AutomergeBasis; readonly afterBasis: AutomergeBasis; readonly changed: false }
+  | { readonly outcome: 'rejected'; readonly changed: false }
+);
 
 export type AutomergeSourceIssue = {
   readonly code: string;
@@ -53,6 +57,7 @@ type LedgerEntry = {
   readonly result: AutomergeSourceCommitResult;
 };
 
+/** Captures the document's current exact-head basis. */
 export const automergeBasis = (doc: Automerge.Doc<unknown>): AutomergeBasis => ({
   kind: 'automerge-heads',
   heads: [...Automerge.getHeads(doc)].sort()

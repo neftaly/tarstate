@@ -430,8 +430,7 @@ const readyAutomergeSnapshot = <T extends object>(snapshot: SourceSnapshot<Autom
 
 const coreCommitResult = (result: AutomergeSourceCommitResult): SourceCommitResult => ({
   outcome: result.outcome,
-  ...(result.beforeBasis === undefined ? {} : { beforeBasis: result.beforeBasis }),
-  ...(result.afterBasis === undefined ? {} : { afterBasis: result.afterBasis }),
+  ...('beforeBasis' in result ? { beforeBasis: result.beforeBasis, afterBasis: result.afterBasis } : {}),
   issues: result.issues.map((issue) => adapterIssue(
     issue.code,
     issue.phase,

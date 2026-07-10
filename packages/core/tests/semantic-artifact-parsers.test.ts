@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { sealArtifact, type ArtifactRef } from '../src/artifacts.js';
 import type { ConstraintSetBody } from '../src/constraint-artifact.js';
-import type { SchemaLensBody } from '../src/lens.js';
-import type { StorageMappingBody } from '../src/mapping.js';
+import { sealSchemaLens, type SchemaLensBody } from '../src/lens.js';
+import { sealStorageMapping, type StorageMappingBody } from '../src/mapping.js';
 import type { QueryArtifactBody } from '../src/query-builder.js';
-import { prepareSchema } from '../src/schema.js';
+import { prepareSchema, sealSchema, type SchemaBody } from '../src/schema.js';
 import { capabilityRefFor, CapabilityRegistry } from '../src/registry.js';
 import {
   defaultSemanticArtifactParseBudget,
@@ -129,6 +129,13 @@ const mutate = <Value>(value: Value, update: (copy: any) => void): Value => {
 };
 
 describe('semantic artifact safe parsers', () => {
+  it('seals typed schema, mapping, and lens bodies without caller casts', async () => {
+    const schemaBody = { relations: {} } satisfies SchemaBody;
+    await expect(sealSchema({ body: schemaBody })).resolves.toMatchObject({ kind: 'schema', body: schemaBody });
+    await expect(sealStorageMapping({ body: mappingBody() })).resolves.toMatchObject({ kind: 'storage-mapping', body: mappingBody() });
+    await expect(sealSchemaLens({ body: lensBody() })).resolves.toMatchObject({ kind: 'schema-lens', body: lensBody() });
+  });
+
   it('accepts complete query ASTs, prepares plans, parses declared parameters, and evaluates safely', async () => {
     const artifact = await seal('query', queryBody());
     expect(await safeParseQueryArtifact(artifact)).toMatchObject({ success: true, value: { kind: 'query' } });

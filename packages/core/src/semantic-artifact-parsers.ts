@@ -9,8 +9,8 @@ import {
 import { compileSourceConstraints, type ConstraintSetArtifact } from './constraint-artifact.js';
 import type { SourceConstraint } from './constraints.js';
 import { createIssue, TarstateParseError, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
-import { validateLens, type SchemaLensBody } from './lens.js';
-import { compileStorageMapping, type CompiledStorageMapping, type StorageMappingBody } from './mapping.js';
+import { validateLens, type SchemaLensArtifact } from './lens.js';
+import { compileStorageMapping, type CompiledStorageMapping, type StorageMappingArtifact } from './mapping.js';
 import type { SourceBasis } from './maintenance.js';
 import { evaluateQuery, prepareQuery, type FunctionRegistry, type QueryResult, type RelationInput } from './query.js';
 import { safeParseQueryParameters, type QueryArtifact } from './query-builder.js';
@@ -34,8 +34,8 @@ export const defaultSemanticArtifactParseBudget: SemanticArtifactParseBudget = {
   maxNames: 10_000
 };
 
-export type StorageMappingArtifact = Artifact & { readonly kind: 'storage-mapping'; readonly body: StorageMappingBody };
-export type SchemaLensArtifact = Artifact & { readonly kind: 'schema-lens'; readonly body: SchemaLensBody };
+export type { StorageMappingArtifact } from './mapping.js';
+export type { SchemaLensArtifact } from './lens.js';
 
 type SemanticKind = 'query' | 'transaction' | 'constraint-set' | 'storage-mapping' | 'schema-lens';
 type RecordValue = Readonly<Record<string, JsonValue>>;

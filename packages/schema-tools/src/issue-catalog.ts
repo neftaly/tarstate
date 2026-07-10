@@ -36,6 +36,7 @@ export type IssueCodeCatalogArtifact = {
   readonly body: IssueCodeCatalogBody;
 };
 
+/** Builds the deterministic catalog consumed by agents and schema tooling. */
 export const createIssueCodeCatalogArtifact = async (options: {
   readonly id?: string;
   readonly descriptions?: Readonly<Record<string, string>>;
@@ -74,6 +75,7 @@ export const createIssueCodeCatalogArtifact = async (options: {
 
 export const issueCodeCatalogRef = (catalog: IssueCodeCatalogArtifact): ArtifactRef => ({ id: catalog.id, contentHash: catalog.contentHash });
 
+/** Strictly validates catalog shape, entries, and content hash without throwing. */
 export const safeParseIssueCodeCatalog = async (input: unknown, budget?: ValueParseBudget): Promise<ParseResult<IssueCodeCatalogArtifact>> => {
   const portable = budget === undefined ? safeParseJsonValue(input) : safeParseJsonValue(input, budget);
   if (!portable.success) return portable;

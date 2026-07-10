@@ -3,6 +3,7 @@ import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
 import type { PreparedPlan } from './maintenance.js';
 
+/** `lower-bound` contains only proven rows; `unknown` withdraws the current row assertion. */
 export type Completeness = 'exact' | 'lower-bound' | 'unknown';
 export type QueryLogicalValue = null | boolean | number | string | LogicalUnknown | readonly QueryLogicalValue[] | { readonly [key: string]: QueryLogicalValue };
 export type QueryRecord = Readonly<Record<string, QueryLogicalValue>>;
@@ -61,6 +62,7 @@ export type WindowExpr = {
   readonly orderBy: readonly OrderTerm[];
 };
 
+/** Portable relational query AST with bag semantics and hidden occurrence identity. */
 export type QueryNode =
   | { readonly kind: 'from'; readonly relation: RelationUse; readonly alias: string }
   | { readonly kind: 'values'; readonly alias: string; readonly rows: readonly QueryRecord[] }
@@ -81,6 +83,7 @@ export type QueryNode =
   | { readonly kind: 'recursion-ref'; readonly name: string }
   | { readonly kind: 'recursive'; readonly name: string; readonly seed: QueryNode; readonly step: QueryNode; readonly key: readonly Expr[]; readonly maxIterations?: number; readonly maxRows?: number };
 
+/** Basis-bound seek position. Live cursors reject basis drift; pinned cursors retain their captured basis. */
 export type QueryCursor = {
   readonly order: readonly JsonValue[];
   readonly resultKey: string;
@@ -98,6 +101,7 @@ export type QueryRequest = {
   readonly membershipRevision?: number;
 };
 
+/** Pure query result. `resultKeys` are stable occurrence identities and grant no write authority. */
 export type QueryResult = {
   readonly rows: readonly QueryRecord[];
   readonly resultKeys: readonly string[];
@@ -119,6 +123,7 @@ export type IncrementalQueryResultDelta = {
   readonly updatedResultKeys: readonly string[];
 };
 
+/** Observable evidence that the stateful operator graph handled an update incrementally. */
 export type IncrementalQueryMaintenanceState = {
   readonly strategy: 'incremental-operator-graph';
   readonly revision: number;
@@ -166,6 +171,7 @@ type MaterializedQueryNode = {
 const relationKey = (relation: RelationUse): string => relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
 const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
 
+/** Evaluates the independent, deterministic semantic oracle. */
 export const evaluateQuery = (request: QueryRequest): QueryResult => {
   const issues: Issue[] = [];
   const context: QueryContext = {
@@ -184,6 +190,7 @@ export const evaluateQuery = (request: QueryRequest): QueryResult => {
   return { rows, resultKeys: result.rows.map(resultKey), completeness: result.completeness, issues };
 };
 
+/** Seals query and authority identities into a prepared execution plan. */
 export const prepareQuery = async (input: {
   readonly root: QueryNode;
   readonly registryFingerprint: string;
@@ -507,6 +514,7 @@ const queryAliases = (node: QueryNode): ReadonlySet<string> => {
   return queryAliases(node.input);
 };
 
+/** Evaluates one expression using Tarstate missing/unknown three-valued semantics. */
 export const evaluateExpression = (expression: Expr, row: Readonly<Record<string, QueryRecord>>, options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}): EvaluationValue => {
   const issues: Issue[] = [];
   const scoped: ScopedRow = { scope: row, provenance: {} };

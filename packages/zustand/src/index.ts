@@ -7,6 +7,7 @@ export type ZustandHydration = {
   readonly onFinishHydration: (listener: () => void) => () => void;
 };
 
+/** Adapts one vanilla Zustand store to Tarstate's atomic external-store lease contract. */
 export const zustandAtomicExternalStore = <State>(
   store: StoreApi<State>,
   options: { readonly hydration?: ZustandHydration } = {}

@@ -20,6 +20,7 @@ import {
   typedReturning,
   typedSelect,
   typedWhere,
+  type PreparedPlanParameters,
   type QueryParametersOf,
   type QueryResultRowOf,
   type RelationAccessOf,
@@ -150,13 +151,15 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<SchemaRow<typeof referenceSchema, 'events'>['account']>().toEqualTypeOf<readonly [string, number]>();
     expectTypeOf<QueryParametersOf<typeof query>>().toEqualTypeOf<{ readonly account: readonly [string, number] }>();
     expectTypeOf<QueryResultRowOf<typeof query>>().toEqualTypeOf<{ readonly id: string; readonly account: readonly [string, number] }>();
-    expectTypeOf(prepared.__tarstateParameterType).toEqualTypeOf<((parameters: { readonly account: readonly [string, number] }) => { readonly account: readonly [string, number] }) | undefined>();
+    expectTypeOf<PreparedPlanParameters<typeof prepared>>().toEqualTypeOf<{ readonly account: readonly [string, number] }>();
   });
 
   it('keeps self-join aliases collision-safe at the responsible operator', () => {
     const duplicate = typedFrom(people, 'author');
     // @ts-expect-error duplicate aliases cannot be joined because field scope would be ambiguous
     typedJoin(author, duplicate, (aliases) => typedCompare('eq', aliases.author.row.id, aliases.author.row.id));
+    // @ts-expect-error comparisons reject unrelated decoded value types
+    typedCompare('eq', author.aliases.author.row.id, author.aliases.author.row.score);
   });
 
   it('distinguishes readable, writable, field-edit, rekey, and move evidence', () => {
@@ -168,10 +171,12 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf(peopleAccess.writable).toEqualTypeOf<true>();
     expectTypeOf(peopleAccess.rekey).toEqualTypeOf<true>();
     expectTypeOf(peopleAccess.move).toEqualTypeOf<true>();
-    expectTypeOf(peopleAccess.fields.name).toEqualTypeOf<'replace'>();
-    expectTypeOf(peopleAccess.fields.score).toEqualTypeOf<never>();
+    expectTypeOf(peopleAccess.fields.name).toEqualTypeOf<readonly 'replace'[]>();
+    expectTypeOf(peopleAccess.fields.score).toEqualTypeOf<readonly never[]>();
     expectTypeOf(auditAccess.readable).toEqualTypeOf<true>();
     expectTypeOf(auditAccess.writable).toEqualTypeOf<false>();
+    expect(peopleAccess.fields.name).toEqual(['replace']);
+    expect(peopleAccess.declaration).toBe(schema.relations.people);
 
     typedFieldEdit(peopleAccess, 'name', 'Renamed');
     typedRekey(peopleAccess, ['new-id'] as const);

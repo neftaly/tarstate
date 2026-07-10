@@ -10,11 +10,12 @@ import {
   typedParameter,
   typedPreparedPlan,
   typedWhere,
+  type CommitReceipt,
   type QueryNode,
   type TaggedValue
 } from '@tarstate/core';
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { useMutationState, useQuery, useRow, type ReactPreparedPlan } from '../src/index.js';
+import { useDatabase, useMutationState, useQuery, useRow, type MutationEntry, type ReactPreparedPlan } from '../src/index.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 const schemaView = { id: 'urn:test:react-types', contentHash: hash('a') } as const;
@@ -81,6 +82,9 @@ const typeFixture = (): void => {
   })).toEqualTypeOf<number>();
   expectTypeOf(useRow(reactPlan, 'entry:one', { parameters: { owner: ['tenant', 7], slug } })).toEqualTypeOf<Row | undefined>();
   expectTypeOf(useMutationState({ selectState: ({ pendingCount }) => pendingCount })).toEqualTypeOf<number>();
+  const mutation = useMutationState().mutations[0];
+  if (mutation?.state === 'settled') expectTypeOf(mutation.receipt).toEqualTypeOf<CommitReceipt>();
+  if (mutation?.state === 'failed') expectTypeOf(mutation.error.message).toEqualTypeOf<string>();
 
   // @ts-expect-error reference parameters preserve target tuple arity
   useQuery(reactPlan, { parameters: { owner: ['tenant'], slug } });
@@ -92,8 +96,14 @@ const typeFixture = (): void => {
   useQuery(reactPlan, { parameters: { owner: ['tenant', 7], slug, extra: true } });
   // @ts-expect-error selector props use their self-documenting v1 names
   useQuery(reactPlan, { parameters: { owner: ['tenant', 7], slug }, select: () => 0 });
+  // @ts-expect-error the borrowed database hook does not accept caller-selected type assertions
+  useDatabase<QueryNode, Row>();
 };
 void typeFixture;
+
+// @ts-expect-error pending mutations cannot contain terminal receipt evidence
+const invalidPendingMutation: MutationEntry = { mutationId: 1, operationEpoch: 'epoch', operationId: 'operation', attachmentId: 'attachment', state: 'pending', receipt: {} as CommitReceipt };
+void invalidPendingMutation;
 
 describe('React typed-query contract', () => {
   it('keeps type evidence phantom and the prepared plan unchanged', () => {

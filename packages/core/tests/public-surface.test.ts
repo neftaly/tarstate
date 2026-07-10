@@ -12,6 +12,9 @@ describe('clean rewrite core surface', () => {
     expect(core.openIncrementalQueryMaintenance).toBeTypeOf('function');
     expect(core.acquireExternalStoreRuntime).toBeTypeOf('function');
     expect(core.prepareSchema).toBeTypeOf('function');
+    expect(core.sealSchema).toBeTypeOf('function');
+    expect(core.sealStorageMapping).toBeTypeOf('function');
+    expect(core.sealSchemaLens).toBeTypeOf('function');
     expect(core.schemaLiteral).toBeTypeOf('function');
     expect(core.typedFrom).toBeTypeOf('function');
     expect(core.resolveLensPath).toBeTypeOf('function');

@@ -1,5 +1,6 @@
 import { canonicalizeJson, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
 import { parseRelationCandidates, parseScalarValueForField, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
 import type { JsonValue, PortableValue } from './value.js';
@@ -25,6 +26,12 @@ export type StorageMappingBody = {
   readonly model: 'json-tree-v1';
   readonly relations: Readonly<Record<RelationId, RelationStorageMapping>>;
 };
+
+/** Sealed portable storage-mapping artifact with its typed body preserved. */
+export type StorageMappingArtifact = TypedArtifact<'storage-mapping', StorageMappingBody>;
+
+/** Seals a typed storage mapping without a `JsonValue` assertion at the call site. */
+export const sealStorageMapping = (input: TypedArtifactInput<StorageMappingBody>): Promise<StorageMappingArtifact> => sealTypedArtifact('storage-mapping', input);
 
 export type CompiledStorageMapping = {
   readonly body: StorageMappingBody;

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   compare,
   evaluateQuery,
@@ -17,6 +17,12 @@ import {
 const schemaView: ArtifactRef = { id: 'urn:test:schema', contentHash: `sha256:${'a'.repeat(64)}` };
 
 describe('functional query authoring', () => {
+  it('preserves types through ordinary pipelines longer than three operators', () => {
+    const result = pipe(1, (value) => String(value), (value) => value.length, (value) => value > 0, (value) => value ? ['yes'] : [], (value) => value[0]);
+    expectTypeOf(result).toEqualTypeOf<string | undefined>();
+    expect(result).toBe('yes');
+  });
+
   it('builds the canonical immutable algebra and seals the same portable tree', async () => {
     const root = pipe(
       from({ schemaView, relationId: 'items' }, 'item'),

@@ -23,6 +23,7 @@ import {
   type ReactNode
 } from 'react';
 
+/** Minimal borrowed database contract consumed by the React adapter. */
 export type ObservableDatabase<Query = unknown, Row = unknown> = {
   readonly authorityScope: string;
   readonly authorityFingerprint: string;
@@ -37,21 +38,26 @@ export type ReactPreparedPlan<
   Parameters extends Readonly<Record<string, JsonValue>> = Readonly<Record<string, JsonValue>>
 > = TypedPreparedPlan<Query, Row, Parameters>;
 
+/** Request/snapshot pair used as the exact server-render snapshot for one query identity. */
 export type ServerQueryObservation<Query = unknown, Row = unknown> = {
   readonly request: ObserveRequest<Query>;
   readonly snapshot: ObserverSnapshot<Row>;
 };
 
-export type MutationEntry = {
+type MutationIdentity = {
   readonly mutationId: number;
   readonly operationEpoch: string;
   readonly operationId: string;
   readonly attachmentId: string;
-  readonly state: 'pending' | 'settled' | 'failed';
-  readonly receipt?: CommitReceipt;
-  readonly error?: { readonly name: string; readonly message: string };
   readonly optimisticError?: OptimisticUpdateError;
 };
+
+/** One attempted commit; `state` determines which terminal evidence is present. */
+export type MutationEntry = MutationIdentity & (
+  | { readonly state: 'pending' }
+  | { readonly state: 'settled'; readonly receipt: CommitReceipt }
+  | { readonly state: 'failed'; readonly error: { readonly name: string; readonly message: string } }
+);
 
 export type OptimisticUpdateError = {
   readonly phase: 'create-overlay' | 'source-basis' | 'applies-to-query' | 'project-rows' | 'projection-result';
@@ -59,6 +65,7 @@ export type OptimisticUpdateError = {
   readonly message: string;
 };
 
+/** Immutable bounded commit history exposed by `useMutationState`. */
 export type MutationState = {
   readonly pendingCount: number;
   readonly mutations: readonly MutationEntry[];
@@ -99,10 +106,12 @@ export type OptimisticOperationEvidence = {
   readonly rebased: boolean;
 };
 
+/** Authoritative observer evidence plus optional display-only optimistic operations. */
 export type ReactObserverSnapshot<Row> = ObserverSnapshot<Row> & {
   readonly optimistic?: { readonly operations: readonly OptimisticOperationEvidence[] };
 };
 
+/** Provider inputs; the database remains externally owned. */
 export type TarstateProviderProps<Query = unknown, Row = unknown> = {
   readonly database: ObservableDatabase<Query, Row>;
   readonly executeCommit?: (attempt: TransactionAttempt) => Promise<CommitReceipt>;
@@ -137,20 +146,23 @@ export const TarstateProvider = <Query, Row>({ database, executeCommit, createOp
   return createElement(TarstateContext.Provider, { value: runtime }, createElement(CommitActionsContext.Provider, { value: actions }, children));
 };
 
-export const useDatabase = <Query = unknown, Row = unknown>(): ObservableDatabase<Query, Row> =>
-  useRuntime().database as unknown as ObservableDatabase<Query, Row>;
+/** Returns the borrowed database without asserting an application-selected query or row type. */
+export const useDatabase = (): ObservableDatabase => useRuntime().database;
 
+/** Observation identity, selection, and partial-evidence policy for `useQuery`. */
 export type QueryHookOptions<
   Row,
   Selected = ReactObserverSnapshot<Row>,
   Parameters extends Readonly<Record<string, JsonValue>> = Readonly<Record<string, JsonValue>>
 > = {
   readonly parameters?: Parameters;
+  /** Preserve a proven lower bound when incomplete inputs prevent an exact result. */
   readonly allowPartial?: boolean;
   readonly selectSnapshot?: (snapshot: ReactObserverSnapshot<Row>) => Selected;
   readonly areSelectionsEqual?: (left: Selected, right: Selected) => boolean;
 };
 
+/** Observes a prepared plan and infers its exact parameter, row, and selected-result types. */
 export function useQuery<Query, Row, Parameters extends Readonly<Record<string, JsonValue>>, Selected>(
   plan: ReactPreparedPlan<Query, Row, Parameters>,
   options: QueryHookOptions<Row, Selected, NoInfer<Parameters>> & { readonly selectSnapshot: (snapshot: ReactObserverSnapshot<Row>) => Selected }
@@ -184,6 +196,7 @@ export type RowHookOptions<Row, Parameters extends Readonly<Record<string, JsonV
   readonly readFrom?: 'current' | 'last-exact';
 };
 
+/** Selects one occurrence by opaque result key without subscribing to unrelated row changes. */
 export const useRow = <Query, Row, Parameters extends Readonly<Record<string, JsonValue>>>(
   plan: ReactPreparedPlan<Query, Row, Parameters>,
   resultKey: string,
@@ -201,6 +214,7 @@ export const useRow = <Query, Row, Parameters extends Readonly<Record<string, Js
 
 export type CommitFunction = (attempt: TransactionAttempt) => Promise<CommitReceipt>;
 
+/** Returns the current provider commit action without replacing the query runtime. */
 export const useCommit = (): CommitFunction => {
   const store = useRuntime().mutationStore;
   const actions = useContext(CommitActionsContext);
@@ -214,6 +228,7 @@ export type MutationStateOptions<Selected> = {
   readonly areSelectionsEqual?: (left: Selected, right: Selected) => boolean;
 };
 
+/** Observes immutable bounded mutation history, optionally through a render-suppressing selector. */
 export function useMutationState(): MutationState;
 export function useMutationState<Selected>(options: MutationStateOptions<Selected>): Selected;
 export function useMutationState<Selected = MutationState>(options?: MutationStateOptions<Selected>): Selected {
