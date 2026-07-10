@@ -218,4 +218,3 @@ const compareJson = (left: JsonValue, right: JsonValue): number | undefined => {
   if (typeof left === 'boolean' && typeof right === 'boolean') return left === right ? 0 : left ? 1 : -1;
   return undefined;
 };
-

@@ -147,4 +147,3 @@ describe('v1/v200 lens spike', () => {
     expect(commitLensUpdate({ lens: lensBody, relationId: comments, rows: ambiguousRows, viewKey: { id: 'comment:1' }, edits: { taskSlug: 'done-plan' } })).toMatchObject({ outcome: 'rejected', issues: [{ code: 'lens.lookup_ambiguous' }] });
   });
 });
-
