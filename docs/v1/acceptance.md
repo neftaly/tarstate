@@ -27,7 +27,7 @@ Acceptance requires exact maintenance for:
 - aggregate, distinct, union, union-all, intersect, and except with bag
   multiplicity;
 - deterministic order, slice, basis-aware seek, rank, row-number, and lag;
-- keyed monotone recursion with row and iteration budgets;
+- keyed linear monotone recursion with row and iteration budgets;
 - every expression and aggregate family in the v1 query algebra;
 - exact, lower-bound, unknown, invalidation, and recovery transitions.
 

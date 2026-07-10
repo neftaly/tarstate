@@ -309,6 +309,16 @@ describe('incremental query maintenance', () => {
     expect(recovered.state).toMatchObject({ rejectedUpdateCount: 1 });
   });
 
+  it('requires occurrence identity when opening maintenance over non-empty relations', () => {
+    const input = relation('people', basePeople, 1);
+    const { occurrenceIds: _occurrenceIds, ...unidentified } = input;
+    expect(openIncrementalQueryMaintenance(plan(people), { relations: [unidentified] }).getCurrentResult()).toMatchObject({
+      rows: [],
+      completeness: 'unknown',
+      issues: [{ code: 'query.incremental_identity_invalid' }]
+    });
+  });
+
   it('rejects duplicate relation changes without mutating accepted maintenance state', () => {
     const initial = snapshot(basePeople, 1);
     const recovered = snapshot(middlePeople, 2);

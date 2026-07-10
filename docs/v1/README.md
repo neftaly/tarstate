@@ -102,9 +102,11 @@ request selects exactly one dataset. Preparation resolves artifacts, lenses,
 codecs, functions, collations, and capabilities against one database authority
 view. The pure full evaluator is the semantic oracle. Production observers use
 stateful incremental view maintenance that is differentially equivalent for
-the complete v1 algebra. The operator graph rematerializes only nodes reached
-by changed relation or session evidence and stops propagation when an operator
-materialization is unchanged. The oracle is not a production fallback.
+the complete v1 algebra. The operator graph consumes occurrence-keyed changes,
+reuses unchanged tuple segments, indexes equijoins, and stops propagation when
+an operator result is unchanged. Global operators update only after an input
+change reaches them. Recursion is linear, monotone, and semi-naive. The oracle
+is not a production fallback.
 
 ## Identity, storage, and compatibility
 

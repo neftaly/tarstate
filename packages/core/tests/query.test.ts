@@ -217,6 +217,14 @@ describe('production query oracle', () => {
     });
     expect(evaluateQuery({ root: recursive(), relations: [] }).rows).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
     expect(evaluateQuery({ root: recursive(1), relations: [] })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.recursion_budget_exceeded' }] });
+    const nonlinear: QueryNode = {
+      kind: 'recursive',
+      name: 'numbers',
+      seed: { kind: 'values', alias: 'n', rows: [{ value: 1 }] },
+      step: { kind: 'set', op: 'union-all', left: { kind: 'recursion-ref', name: 'numbers' }, right: { kind: 'recursion-ref', name: 'numbers' } },
+      key: [{ kind: 'field', alias: 'n', name: 'value' }]
+    };
+    expect(evaluateQuery({ root: nonlinear, relations: [] })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.recursion_non_monotone', details: { reason: 'recursion_must_be_linear_and_monotone' } }] });
   });
 
   it('binds keyset seek to basis and membership revision', () => {

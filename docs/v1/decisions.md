@@ -64,4 +64,8 @@ acceptance criterion remains mandatory.
 V1 keeps the pure evaluator as a test oracle and uses one real incremental
 production path. It must not retain speculative delta hooks or silently fall
 back to full-query recomputation. The executable requirements are locked in
-[acceptance.md](acceptance.md).
+[acceptance.md](acceptance.md). V0.2 accepts occurrence-keyed changes, reuses
+unchanged tuple segments, indexes equijoins, and evaluates recursion
+semi-naively. Recursive bodies are explicitly linear: nonlinear recursion
+requires multi-variant delta substitution and is rejected rather than executed
+with unsound frontier semantics.
