@@ -4,6 +4,7 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "paths": {},
+    "skipLibCheck": false,
     "noEmit": true
   },
   "files": ["scripts/release-smoke.mts"],

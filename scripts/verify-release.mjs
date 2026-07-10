@@ -30,6 +30,7 @@ try {
     for (const required of ['package/package.json', 'package/README.md', 'package/LICENSE', 'package/dist/index.js', 'package/dist/index.d.ts']) {
       if (!entries.includes(required)) fail(`${manifest.name}: tarball is missing ${required}`);
     }
+    verifyDeclarationReachability(manifest.name, tarball, entries);
     if (entries.some((entry) => entry.includes('/src/') || entry.endsWith('.tsbuildinfo'))) {
       fail(`${manifest.name}: tarball contains source or build-state files`);
     }
@@ -43,4 +44,20 @@ try {
   console.log(`Verified ${packageDirectories.length} v0.1.0 tarballs and runtime entry points.`);
 } finally {
   rmSync(temporaryDirectory, { recursive: true, force: true });
+}
+
+function verifyDeclarationReachability(packageName, tarball, entries) {
+  const packedDeclarations = new Set(entries.filter((entry) => entry.startsWith('package/dist/') && entry.endsWith('.d.ts')));
+  for (const declaration of packedDeclarations) {
+    const source = execFileSync('tar', ['-xOf', tarball, declaration], { encoding: 'utf8' });
+    for (const match of source.matchAll(/(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["'](\.[^"']+)["']/g)) {
+      const dependency = path.posix.normalize(path.posix.join(path.posix.dirname(declaration), match[1]));
+      const candidates = dependency.endsWith('.js')
+        ? [dependency.slice(0, -3) + '.d.ts']
+        : [dependency + '.d.ts', path.posix.join(dependency, 'index.d.ts')];
+      if (!candidates.some((candidate) => packedDeclarations.has(candidate))) {
+        fail(`${packageName}: ${declaration} references missing declaration ${match[1]}`);
+      }
+    }
+  }
 }

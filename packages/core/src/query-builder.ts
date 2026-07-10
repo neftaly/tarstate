@@ -1,5 +1,6 @@
 import { sealArtifact, type Artifact, type ArtifactRef } from './artifacts.js';
 import { parseScalarValue, type ScalarDeclaration } from './codec.js';
+import type { PipeApplication, PipeOperator } from './internal-pipe.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import type { CapabilityRegistry } from './registry.js';
 import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
@@ -31,18 +32,20 @@ export const sealQuery = async (input: {
   body: input.body as unknown as JsonValue
 }) as Promise<QueryArtifact>;
 
-/** Applies left-to-right authoring operators while preserving each intermediate type. */
-export function pipe<A>(value: A): A;
-export function pipe<A, B>(value: A, first: (value: A) => B): B;
-export function pipe<A, B, C>(value: A, first: (value: A) => B, second: (value: B) => C): C;
-export function pipe<A, B, C, D>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D): D;
-export function pipe<A, B, C, D, E>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E): E;
-export function pipe<A, B, C, D, E, F>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F): F;
-export function pipe<A, B, C, D, E, F, G>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G): G;
-export function pipe<A, B, C, D, E, F, G, H>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H): H;
-export function pipe<A, B, C, D, E, F, G, H, I>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H, eighth: (value: H) => I): I;
-export function pipe<A, B, C, D, E, F, G, H, I, J>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H, eighth: (value: H) => I, ninth: (value: I) => J): J;
-export function pipe<A, B, C, D, E, F, G, H, I, J, K>(value: A, first: (value: A) => B, second: (value: B) => C, third: (value: C) => D, fourth: (value: D) => E, fifth: (value: E) => F, sixth: (value: F) => G, seventh: (value: G) => H, eighth: (value: H) => I, ninth: (value: I) => J, tenth: (value: J) => K): K;
+type AppliedOperator<Operator, Input> = Operator extends PipeOperator<infer _Type>
+  ? PipeApplication<Operator, Input>['output']
+  : Operator extends (value: Input) => infer Output ? Output : never;
+type PipeResult<Input, Operators extends readonly unknown[]> = Operators extends readonly [infer First, ...infer Rest]
+  ? PipeResult<AppliedOperator<First, Input>, Rest>
+  : Input;
+type ValidPipe<Input, Operators extends readonly unknown[]> = Operators extends readonly [infer First, ...infer Rest]
+  ? First extends PipeOperator<infer _Type>
+    ? PipeApplication<First, Input>['accepts'] extends true ? readonly [First, ...ValidPipe<AppliedOperator<First, Input>, Rest>] : never
+    : First extends (value: Input) => infer Output ? readonly [First, ...ValidPipe<Output, Rest>] : never
+  : readonly [];
+
+/** Applies an unbounded sequence of typed operators left-to-right; inline callbacks must annotate their input. */
+export function pipe<Input, const Operators extends readonly unknown[]>(value: Input, ...operators: Operators & ValidPipe<Input, Operators>): PipeResult<Input, Operators>;
 export function pipe(value: unknown, ...operators: readonly ((value: never) => unknown)[]): unknown {
   return operators.reduce((current, operator) => operator(current as never), value);
 }

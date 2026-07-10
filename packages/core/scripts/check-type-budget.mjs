@@ -8,6 +8,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const packageRoot = dirname(here);
 const require = createRequire(import.meta.url);
 const ts = require('typescript');
+if (!ts.version.startsWith('6.') || typeof ts.createProgram !== 'function') {
+  throw new Error('The type-budget checker requires the TypeScript 6 compatibility compiler API');
+}
 const outDir = mkdtempSync(join(tmpdir(), 'tarstate-type-budget-'));
 
 const thresholds = {
@@ -47,7 +50,7 @@ try {
   if (failures.length > 0) {
     throw new Error(`Type budget exceeded: ${failures.map(([name, value]) => `${name}=${value} > ${thresholds[name]}`).join(', ')}`);
   }
-  process.stdout.write(`${JSON.stringify({ fixture: 'core/type-fixtures/authoring-budget.ts', counterSource: 'tsc --extendedDiagnostics Program counters', measured, thresholds })}\n`);
+  process.stdout.write(`${JSON.stringify({ fixture: 'core/type-fixtures/authoring-budget.ts', compilerVersion: ts.version, counterSource: 'TypeScript 6 Program counters', measured, thresholds })}\n`);
 } finally {
   rmSync(outDir, { recursive: true, force: true });
 }

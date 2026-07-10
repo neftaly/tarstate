@@ -1,6 +1,7 @@
 import type { ArtifactRef } from './artifacts.js';
 import type { ScalarDeclaration } from './codec.js';
 import type { CapabilityRef } from './issues.js';
+import type { PipeOperator, PipeType } from './internal-pipe.js';
 import type { Expr, QueryNode } from './query.js';
 import type { QueryArtifact, QueryArtifactBody, ValueDeclaration } from './query-builder.js';
 import type { PreparedPlan } from './maintenance.js';
@@ -203,11 +204,18 @@ const applyTypedWhere = <Aliases extends TypedAliases, QueryParameters extends R
   };
 };
 
+interface TypedWherePipe<PredicateParameters extends Readonly<Record<string, ValueDeclaration>>> extends PipeType {
+  readonly accepts: this['input'] extends TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown> ? true : false;
+  readonly output: this['input'] extends TypedQuery<infer Aliases, infer QueryParameters, infer Row>
+    ? TypedQuery<Aliases, Simplify<QueryParameters & PredicateParameters>, Row>
+    : never;
+}
+
 export function typedWhere<PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
   predicate: TypedExpression<boolean, PredicateParameters>
-): <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row>(
+): (<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row>(
   query: TypedQuery<Aliases, QueryParameters, Row>
-) => TypedQuery<Aliases, Simplify<QueryParameters & PredicateParameters>, Row>;
+) => TypedQuery<Aliases, Simplify<QueryParameters & PredicateParameters>, Row>) & PipeOperator<TypedWherePipe<PredicateParameters>>;
 export function typedWhere<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
   query: TypedQuery<Aliases, QueryParameters, Row>,
   predicate: (aliases: Aliases) => TypedExpression<boolean, PredicateParameters>
@@ -239,13 +247,20 @@ const applyTypedSelect = <Aliases extends TypedAliases, QueryParameters extends 
   };
 };
 
+interface TypedSelectPipe<Alias extends string, Fields extends FieldExpressionRecord> extends PipeType {
+  readonly accepts: this['input'] extends TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown> ? true : false;
+  readonly output: this['input'] extends TypedQuery<TypedAliases, infer QueryParameters, unknown>
+    ? TypedQuery<{ readonly [Name in Alias]: TypedAlias<Alias, ResultOfFields<Fields>> }, Simplify<QueryParameters & ParametersOfFields<Fields>>, ResultOfFields<Fields>>
+    : never;
+}
+
 /** Projects an exact result-row type; supports both pipeline and callback forms. */
 export function typedSelect<const Alias extends string, const Fields extends FieldExpressionRecord>(
   alias: Alias,
   fields: Fields
-): <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>>(
+): (<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>>(
   query: TypedQuery<Aliases, QueryParameters, unknown>
-) => TypedQuery<{ readonly [Name in Alias]: TypedAlias<Alias, ResultOfFields<Fields>> }, Simplify<QueryParameters & ParametersOfFields<Fields>>, ResultOfFields<Fields>>;
+) => TypedQuery<{ readonly [Name in Alias]: TypedAlias<Alias, ResultOfFields<Fields>> }, Simplify<QueryParameters & ParametersOfFields<Fields>>, ResultOfFields<Fields>>) & PipeOperator<TypedSelectPipe<Alias, Fields>>;
 export function typedSelect<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, const Alias extends string, const Fields extends FieldExpressionRecord>(
   query: TypedQuery<Aliases, QueryParameters, unknown>,
   alias: Alias,

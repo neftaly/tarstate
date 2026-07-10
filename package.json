@@ -20,6 +20,7 @@
     "typecheck:budget": "pnpm --filter @tarstate/core typecheck:budget"
   },
   "devDependencies": {
+    "@typescript/native": "catalog:",
     "@types/node": "catalog:",
     "oxlint": "catalog:",
     "oxlint-tsgolint": "catalog:",

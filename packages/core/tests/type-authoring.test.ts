@@ -154,6 +154,46 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<PreparedPlanParameters<typeof prepared>>().toEqualTypeOf<{ readonly account: readonly [string, number] }>();
   });
 
+  it('preserves exact query evidence through more than ten pipeline operators', () => {
+    const query = pipe(
+      author,
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum0', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum1', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum2', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum3', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum4', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum5', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum6', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum7', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum8', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum9', { kind: 'integer' }))),
+      typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum10', { kind: 'integer' }))),
+      typedSelect('result', { name: author.aliases.author.row.name })
+    );
+
+    expectTypeOf(query.aliases.result.name).toEqualTypeOf<'result'>();
+    expectTypeOf<QueryResultRowOf<typeof query>>().toEqualTypeOf<{ readonly name: string }>();
+    expectTypeOf<QueryParametersOf<typeof query>>().toEqualTypeOf<{
+      readonly minimum0: number;
+      readonly minimum1: number;
+      readonly minimum2: number;
+      readonly minimum3: number;
+      readonly minimum4: number;
+      readonly minimum5: number;
+      readonly minimum6: number;
+      readonly minimum7: number;
+      readonly minimum8: number;
+      readonly minimum9: number;
+      readonly minimum10: number;
+    }>();
+  });
+
+  it('rejects typed query operators outside a typed query pipeline', () => {
+    const filter = typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum', { kind: 'integer' })));
+    // @ts-expect-error typed query operators do not accept primitive pipeline values
+    pipe(1, filter);
+  });
+
   it('keeps self-join aliases collision-safe at the responsible operator', () => {
     const duplicate = typedFrom(people, 'author');
     // @ts-expect-error duplicate aliases cannot be joined because field scope would be ambiguous

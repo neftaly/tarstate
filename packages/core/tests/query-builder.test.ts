@@ -17,10 +17,27 @@ import {
 const schemaView: ArtifactRef = { id: 'urn:test:schema', contentHash: `sha256:${'a'.repeat(64)}` };
 
 describe('functional query authoring', () => {
-  it('preserves types through ordinary pipelines longer than three operators', () => {
-    const result = pipe(1, (value) => String(value), (value) => value.length, (value) => value > 0, (value) => value ? ['yes'] : [], (value) => value[0]);
-    expectTypeOf(result).toEqualTypeOf<string | undefined>();
+  it('preserves types through an unbounded sequence of typed operators', () => {
+    const stringify = (value: number): string => String(value);
+    const length = (value: string): number => value.length;
+    const positive = (value: number): boolean => value > 0;
+    const choose = (value: boolean): string => value ? 'yes' : 'no';
+    const result = pipe(
+      1,
+      stringify, length, positive, choose,
+      length, positive, choose,
+      length, positive, choose,
+      length, positive, choose
+    );
+    expectTypeOf(result).toEqualTypeOf<string>();
     expect(result).toBe('yes');
+  });
+
+  it('rejects adjacent operators whose input and output types do not meet', () => {
+    const stringify = (value: number): string => String(value);
+    const negate = (value: boolean): boolean => !value;
+    // @ts-expect-error negate cannot consume stringify's string output
+    pipe(1, stringify, negate);
   });
 
   it('builds the canonical immutable algebra and seals the same portable tree', async () => {
