@@ -23,6 +23,7 @@
     "./schema": "./src/schema.ts",
     "./source": "./src/source.ts",
     "./store": "./src/store.ts",
+    "./v1-spike": "./src/v1-spike.ts",
     "./watch": "./src/watch.ts",
     "./write": "./src/write.ts"
   },

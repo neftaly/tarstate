@@ -17,6 +17,7 @@ export const coreSubpathEntryNames = [
   'schema',
   'source',
   'store',
+  'v1-spike',
   'watch',
   'write'
 ] as const;

@@ -67,6 +67,9 @@
       "@tarstate/core/store": [
         "./packages/core/src/store.ts"
       ],
+      "@tarstate/core/v1-spike": [
+        "./packages/core/src/v1-spike.ts"
+      ],
       "@tarstate/core/watch": [
         "./packages/core/src/watch.ts"
       ],
