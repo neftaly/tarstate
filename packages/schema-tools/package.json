@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/schema-tools",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Deterministic schema and agent artifacts for Tarstate",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/schema-tools" },

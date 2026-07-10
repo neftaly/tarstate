@@ -1,6 +1,6 @@
 # Tarstate v1 conformance matrix
 
-Status: v0.1.0 release evidence. Date: 2026-07-10.
+Status: v0.2.0 release evidence. Date: 2026-07-11.
 
 This matrix is the self-contained index of production release gates and their
 executable evidence. A complete gate means the in-repository contract in
