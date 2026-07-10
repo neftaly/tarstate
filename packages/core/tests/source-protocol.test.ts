@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   coordinateSourceCommit,
-  createIssue,
   type AtomicSource,
   type Footprint,
   type FootprintRelation,
   type PlanResult,
   type StorageBinding
 } from '../src/index.js';
+import { RestartableReferenceSource, SerializedRestartableStateStore } from '../src/restartable-source.js';
 
 type Storage = Readonly<Record<string, number>>;
 type Command = { readonly path: string; readonly value: number };
@@ -117,20 +117,63 @@ describe('generic source commit coordinator', () => {
     ]);
   });
 
-  it('retains a durable source crash-after-handoff as unknown until exact outcome lookup resolves it', async () => {
-    const unknownIssue = createIssue({ code: 'transaction.outcome_unavailable', retry: 'query_outcome', operationId: commitInput.operationId });
-    const committed = { outcome: 'committed' as const, beforeBasis: 0, afterBasis: 1, issues: [] };
-    const durable: AtomicSource<Storage, Command> = {
-      ...source(async () => ({ outcome: 'unknown', beforeBasis: 0, issues: [unknownIssue] })),
-      queryOutcome: async (identity) => identity.operationEpoch === commitInput.operationEpoch && identity.operationId === commitInput.operationId && identity.intentHash === commitInput.intentHash
-        ? { status: 'known', result: committed }
-        : { status: 'ambiguous' }
+  it('recovers the exact durable result after mutation, lost return, and source/coordinator recreation', async () => {
+    const store = new SerializedRestartableStateStore<Storage>({
+      sourceId: 'source:restartable',
+      incarnation: 'incarnation:one',
+      operationEpoch: 'epoch',
+      revision: 0,
+      storage: {},
+      ledger: []
+    });
+    const apply = (storage: Storage, commands: readonly Command[]) => {
+      const next = { ...storage, ...Object.fromEntries(commands.map((command) => [command.path, command.value])) };
+      return { storage: next, changed: JSON.stringify(next) !== JSON.stringify(storage) };
     };
-    const handedOff = await coordinateSourceCommit({ source: durable, bindings: [], edits: [], commit: commitInput });
-    expect(handedOff).toMatchObject({ outcome: 'unknown', beforeBasis: 0, issues: [{ code: 'transaction.outcome_unavailable', retry: 'query_outcome' }] });
-    const lookup = durable.queryOutcome;
-    if (lookup === undefined) throw new Error('durable test source must provide outcome lookup');
-    await expect(lookup({ operationEpoch: commitInput.operationEpoch, operationId: commitInput.operationId, intentHash: commitInput.intentHash }))
-      .resolves.toEqual({ status: 'known', result: committed });
+    const firstRuntime = new RestartableReferenceSource({ store, apply, relateFootprints: relate, loseNextCommitResult: true });
+    const write = binding('restartable', {
+      readFootprint: ['a'],
+      writeFootprint: ['a'],
+      intents: [{ footprint: ['a'], command: { path: 'a', value: 1 } }],
+      issues: []
+    }, ['a']);
+    const identity = {
+      operationEpoch: 'epoch',
+      operationId: 'operation:restartable',
+      intentHash: `sha256:${'d'.repeat(64)}` as const,
+      expectedBasis: { incarnation: 'incarnation:one', revision: 0 }
+    };
+
+    const handedOff = await coordinateSourceCommit({ source: firstRuntime, bindings: [write], edits: [], commit: identity });
+    expect(handedOff).toMatchObject({ outcome: 'unknown', beforeBasis: identity.expectedBasis, issues: [{ code: 'transaction.outcome_unavailable', retry: 'query_outcome' }] });
+    expect(store.read()).toMatchObject({
+      revision: 1,
+      storage: { a: 1 },
+      ledger: [{ operationEpoch: identity.operationEpoch, operationId: identity.operationId, intentHash: identity.intentHash, result: { outcome: 'committed' } }]
+    });
+
+    // Recreate both the persistence and source objects from the serialized
+    // durable record. The commit coordinator itself is stateless shell code.
+    const recoveredStore = new SerializedRestartableStateStore(store.read());
+    const recoveredRuntime = new RestartableReferenceSource({ store: recoveredStore, apply, relateFootprints: relate });
+    const lookup = await recoveredRuntime.queryOutcome(identity);
+    expect(lookup).toMatchObject({
+      status: 'known',
+      result: { outcome: 'committed', beforeBasis: identity.expectedBasis, afterBasis: { incarnation: 'incarnation:one', revision: 1 }, issues: [] }
+    });
+    if (lookup.status !== 'known') throw new Error('restartable result must be recoverable');
+
+    // An exact retry returns the persisted result before stale-basis checking
+    // and does not apply the command again.
+    const retried = await coordinateSourceCommit({ source: recoveredRuntime, bindings: [write], edits: [], commit: identity });
+    expect(retried).toEqual(lookup.result);
+    expect(recoveredStore.read().storage).toEqual({ a: 1 });
+    expect(recoveredStore.read().revision).toBe(1);
+
+    const differentIntent = { ...identity, intentHash: `sha256:${'e'.repeat(64)}` as const, expectedBasis: { incarnation: 'incarnation:one', revision: 1 } };
+    await expect(recoveredRuntime.queryOutcome(differentIntent)).resolves.toEqual({ status: 'ambiguous' });
+    const ambiguous = await coordinateSourceCommit({ source: recoveredRuntime, bindings: [write], edits: [], commit: differentIntent });
+    expect(ambiguous).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.operation_id_ambiguous', retry: 'never' }] });
+    expect(recoveredStore.read()).toMatchObject({ revision: 1, storage: { a: 1 } });
   });
 });
