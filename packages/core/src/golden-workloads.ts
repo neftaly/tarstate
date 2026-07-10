@@ -4,7 +4,7 @@ import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, type LensRows, type SchemaLensBody } from './lens.js';
 import { InMemoryAtomicSource } from './memory-source.js';
 import type { PreparedPlan } from './maintenance.js';
-import { openIncrementalQueryMaintenance, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
+import { deriveQueryMaintenanceUpdate, openIncrementalQueryMaintenance, type QueryMaintenanceSnapshot, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
 import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
 import { sealTransaction } from './transaction.js';
 
@@ -296,7 +296,8 @@ export const runProbabilityGolden = (): GoldenWorkloadTrace => {
   };
   const beforeScene = [{ id: 'panel-1', parentId: 'root', kind: 'panel' }, { id: 'label-1', parentId: 'panel-1', kind: 'label' }];
   const beforeSnapshot = runtime.snapshot();
-  const maintenance = openGoldenMaintenance('probability-scene-move-external-store', query, [relation('golden.scene-entity', beforeScene), relation('golden.geometry', beforeSnapshot.storage?.rows ?? [])]);
+  const beforeQuery: QueryMaintenanceSnapshot = { relations: [relation('golden.scene-entity', beforeScene), relation('golden.geometry', beforeSnapshot.storage?.rows ?? [])] };
+  const maintenance = openGoldenMaintenance('probability-scene-move-external-store', query, beforeQuery.relations);
   const { state: _beforeState, ...before } = maintenance.getCurrentResult();
   const committed = runtime.commit(beforeSnapshot.basis, (current) => ({
     state: { rows: current.rows.map((row) => row.entityId === 'panel-1' ? { ...row, x: 40 } : row) },
@@ -305,7 +306,8 @@ export const runProbabilityGolden = (): GoldenWorkloadTrace => {
   }));
   const movedScene = beforeScene.map((row) => row.id === 'panel-1' ? { ...row, parentId: 'column-2' } : row);
   const afterSnapshot = runtime.snapshot();
-  const { state: _afterState, ...after } = maintenance.updateSnapshot({ relations: [relation('golden.scene-entity', movedScene), relation('golden.geometry', afterSnapshot.storage?.rows ?? [])] });
+  const afterQuery: QueryMaintenanceSnapshot = { relations: [relation('golden.scene-entity', movedScene), relation('golden.geometry', afterSnapshot.storage?.rows ?? [])] };
+  const { state: _afterState, ...after } = maintenance.applyUpdate(deriveQueryMaintenanceUpdate(beforeQuery, afterQuery));
   maintenance.close();
   runtime.close();
   return {

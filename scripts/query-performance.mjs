@@ -1,6 +1,6 @@
 import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
-import { evaluateQuery, openIncrementalQueryMaintenance } from '../packages/core/dist/index.js';
+import { deriveQueryMaintenanceUpdate, evaluateQuery, openIncrementalQueryMaintenance } from '../packages/core/dist/index.js';
 
 const schemaView = { id: 'urn:tarstate:benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
 const use = (relationId) => ({ schemaView, relationId });
@@ -61,13 +61,22 @@ for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
   const first = { relations: [relation] };
   const second = { relations: [input('item', linearRows(count, true))] };
   const session = openIncrementalQueryMaintenance(plan('linear-' + count, linearQuery), first);
-  measurements.push(benchmark('linear-one-row-update', count, iterations, (index) => session.updateSnapshot(index % 2 === 0 ? second : first)));
+  const forward = deriveQueryMaintenanceUpdate(first, second);
+  const backward = deriveQueryMaintenanceUpdate(second, first);
+  measurements.push(benchmark('linear-one-row-update', count, iterations, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
   session.close();
 }
 
 for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 2]]) {
   const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
   measurements.push(benchmark('equijoin-pure', count * 2, iterations, () => evaluateQuery({ root: joinQuery, relations })));
+  const changed = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
+  const initial = { relations };
+  const session = openIncrementalQueryMaintenance(plan('join-' + count, joinQuery), initial);
+  const forward = deriveQueryMaintenanceUpdate(initial, changed);
+  const backward = deriveQueryMaintenanceUpdate(changed, initial);
+  measurements.push(benchmark('equijoin-one-row-update', count * 2, Math.max(10, iterations), (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
+  session.close();
 }
 
 for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 3]]) {
@@ -120,7 +129,9 @@ await post(allocationSession, 'HeapProfiler.startSampling', { samplingInterval: 
   const first = { relations: [input('item', linearRows(1_000))] };
   const second = { relations: [input('item', linearRows(1_000, true))] };
   const session = openIncrementalQueryMaintenance(plan('allocation-sample', linearQuery), first);
-  for (let index = 0; index < 100; index += 1) consumedRows += session.updateSnapshot(index % 2 === 0 ? second : first).rows.length;
+  const forward = deriveQueryMaintenanceUpdate(first, second);
+  const backward = deriveQueryMaintenanceUpdate(second, first);
+  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
   session.close();
 }
 const { profile } = await post(allocationSession, 'HeapProfiler.stopSampling');

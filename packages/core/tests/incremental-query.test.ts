@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  deriveQueryMaintenanceUpdate,
   evaluateQuery,
   openIncrementalQueryMaintenance,
   type IncrementalQueryResult,
@@ -180,6 +181,8 @@ const oracle = (query: QueryNode, input: QueryMaintenanceSnapshot) => evaluateQu
 });
 
 const semanticResult = ({ state: _state, ...result }: IncrementalQueryResult) => result;
+const applySnapshot = (session: ReturnType<typeof openIncrementalQueryMaintenance>, before: QueryMaintenanceSnapshot, after: QueryMaintenanceSnapshot): IncrementalQueryResult =>
+  session.applyUpdate(deriveQueryMaintenanceUpdate(before, after));
 
 describe('incremental query maintenance', () => {
   it('matches the independent pure oracle for every query node across insert, update, and delete sequences', () => {
@@ -191,11 +194,11 @@ describe('incremental query maintenance', () => {
       const session = openIncrementalQueryMaintenance(plan(query), initial);
       expect(semanticResult(session.getCurrentResult()), `${operator}: initial`).toEqual(oracle(query, initial));
 
-      const middleResult = session.updateSnapshot(middle);
+      const middleResult = applySnapshot(session, initial, middle);
       expect(semanticResult(middleResult), `${operator}: insert/update`).toEqual(oracle(query, middle));
       expect(middleResult.state).toMatchObject({ strategy: 'incremental-operator-graph', revision: 1, rejectedUpdateCount: 0 });
 
-      const finalResult = session.updateSnapshot(final);
+      const finalResult = applySnapshot(session, middle, final);
       expect(semanticResult(finalResult), `${operator}: delete/update`).toEqual(oracle(query, final));
       expect(finalResult.state).toMatchObject({ strategy: 'incremental-operator-graph', revision: 2, rejectedUpdateCount: 0 });
       session.close();
@@ -238,7 +241,7 @@ describe('incremental query maintenance', () => {
     const next = { ...snapshot(middlePeople, 2), functions };
     const session = openIncrementalQueryMaintenance(plan(query), initial);
     expect(semanticResult(session.getCurrentResult())).toEqual(oracle(query, initial));
-    expect(semanticResult(session.updateSnapshot(next))).toEqual(oracle(query, next));
+    expect(semanticResult(applySnapshot(session, initial, next))).toEqual(oracle(query, next));
   });
 
   it('preserves bag occurrences and reports reincarnation as removal plus insertion', () => {
@@ -247,16 +250,19 @@ describe('incremental query maintenance', () => {
       { occurrenceId: 'person:second', row: { id: 1, name: 'same' } }
     ];
     const oneRemaining: readonly QueryRowOccurrence[] = [duplicates[1] as QueryRowOccurrence];
-    const session = openIncrementalQueryMaintenance(plan(people), snapshot(duplicates, 1));
+    const initial = snapshot(duplicates, 1);
+    const session = openIncrementalQueryMaintenance(plan(people), initial);
     const [firstKey, secondKey] = session.getCurrentResult().resultKeys;
     expect(new Set([firstKey, secondKey]).size).toBe(2);
-    const removed = session.updateSnapshot(snapshot(oneRemaining, 2));
-    expect(semanticResult(removed)).toEqual(oracle(people, snapshot(oneRemaining, 2)));
+    const remaining = snapshot(oneRemaining, 2);
+    const removed = applySnapshot(session, initial, remaining);
+    expect(semanticResult(removed)).toEqual(oracle(people, remaining));
     expect(removed.state.resultDelta).toEqual({ addedResultKeys: [], removedResultKeys: [firstKey], updatedResultKeys: [] });
 
     const reincarnated: readonly QueryRowOccurrence[] = [{ occurrenceId: 'person:third', row: { id: 1, name: 'same' } }];
-    const replacement = session.updateSnapshot(snapshot(reincarnated, 3));
-    expect(semanticResult(replacement)).toEqual(oracle(people, snapshot(reincarnated, 3)));
+    const replaced = snapshot(reincarnated, 3);
+    const replacement = applySnapshot(session, remaining, replaced);
+    expect(semanticResult(replacement)).toEqual(oracle(people, replaced));
     expect(replacement.state.resultDelta).toMatchObject({ removedResultKeys: [secondKey], updatedResultKeys: [] });
     expect(replacement.state.resultDelta.addedResultKeys).toHaveLength(1);
   });
@@ -278,37 +284,38 @@ describe('incremental query maintenance', () => {
     const recovered = { ...snapshot(finalPeople, 4), basis: { dataset: 'new-basis' }, membershipRevision: 2 };
     const basisOnly = { ...recovered, basis: { dataset: 'newer-basis' } };
     const session = openIncrementalQueryMaintenance(plan(query), initial);
+    let accepted = initial;
     for (const transition of [lower, unknown, recovered, basisOnly]) {
-      const result = session.updateSnapshot(transition);
+      const result = applySnapshot(session, accepted, transition);
       expect(semanticResult(result)).toEqual(oracle(query, transition));
+      accepted = transition;
     }
     expect(session.getCurrentResult()).toMatchObject({ completeness: 'exact', state: { revision: 4, rejectedUpdateCount: 0 } });
   });
 
-  it('rejects insufficient occurrence identity without invoking a full-query fallback and can recover', () => {
+  it('rejects malformed occurrence deltas without invoking rematerialization and can recover', () => {
     const query = operatorQueries.where as QueryNode;
     const initial = snapshot(basePeople, 1);
     const middle = snapshot(middlePeople, 2);
-    const invalid: QueryMaintenanceSnapshot = {
-      ...middle,
-      relations: middle.relations.map((input) => input.relation.relationId === 'people'
-        ? Object.fromEntries(Object.entries(input).filter(([key]) => key !== 'occurrenceIds')) as RelationInput
-        : input)
-    };
     const session = openIncrementalQueryMaintenance(plan(query), initial);
-    expect(session.updateSnapshot(invalid)).toMatchObject({ completeness: 'unknown', issues: [{ code: 'query.incremental_identity_invalid' }], state: { recomputedNodeCount: 0, rejectedUpdateCount: 1, resultDelta: { addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] } } });
-    const recovered = session.updateSnapshot(snapshot(finalPeople, 3));
-    expect(semanticResult(recovered)).toEqual(oracle(query, snapshot(finalPeople, 3)));
+    const valid = deriveQueryMaintenanceUpdate(initial, middle);
+    const peopleChange = valid.relations.find(({ relation }) => relation.relationId === 'people') as NonNullable<typeof valid.relations[number]>;
+    const invalid = { ...valid, relations: [{ ...peopleChange, rows: [{ occurrenceId: 'person:missing', after: { index: 0, row: { id: 9 } } }] }] };
+    expect(session.applyUpdate(invalid)).toMatchObject({ completeness: 'unknown', issues: [{ code: 'query.incremental_identity_invalid' }], state: { recomputedNodeCount: 0, rejectedUpdateCount: 1, resultDelta: { addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] } } });
+    const final = snapshot(finalPeople, 3);
+    const recovered = applySnapshot(session, initial, final);
+    expect(semanticResult(recovered)).toEqual(oracle(query, final));
     expect(recovered.state).toMatchObject({ rejectedUpdateCount: 1 });
   });
 
-  it('rejects ambiguous relation identity without mutating accepted maintenance state', () => {
+  it('rejects duplicate relation changes without mutating accepted maintenance state', () => {
     const initial = snapshot(basePeople, 1);
-    const duplicate = { ...initial, relations: [...initial.relations, initial.relations[0] as RelationInput] };
-    const session = openIncrementalQueryMaintenance(plan(people), initial);
-    expect(session.updateSnapshot(duplicate)).toMatchObject({ completeness: 'unknown', issues: [{ code: 'query.incremental_relation_ambiguous' }], state: { recomputedNodeCount: 0, rejectedUpdateCount: 1 } });
     const recovered = snapshot(middlePeople, 2);
-    expect(semanticResult(session.updateSnapshot(recovered))).toEqual(oracle(people, recovered));
+    const valid = deriveQueryMaintenanceUpdate(initial, recovered);
+    const duplicate = { ...valid, relations: [valid.relations[0] as NonNullable<typeof valid.relations[number]>, valid.relations[0] as NonNullable<typeof valid.relations[number]>] };
+    const session = openIncrementalQueryMaintenance(plan(people), initial);
+    expect(session.applyUpdate(duplicate)).toMatchObject({ completeness: 'unknown', issues: [{ code: 'query.incremental_identity_invalid' }], state: { recomputedNodeCount: 0, rejectedUpdateCount: 1 } });
+    expect(semanticResult(applySnapshot(session, initial, recovered))).toEqual(oracle(people, recovered));
   });
 
   it('compares logical unknown without JSON coercion', () => {
@@ -318,7 +325,7 @@ describe('incremental query maintenance', () => {
     const second: QueryMaintenanceSnapshot = { relations: [relation('people', unknownNext, 2)] };
     const session = openIncrementalQueryMaintenance(plan(people), first);
     const [resultKey] = session.getCurrentResult().resultKeys;
-    const maintained = session.updateSnapshot(second);
+    const maintained = applySnapshot(session, first, second);
     expect(semanticResult(maintained)).toEqual(oracle(people, second));
     expect(maintained.state.resultDelta.updatedResultKeys).toEqual([resultKey]);
   });
@@ -339,12 +346,14 @@ describe('incremental query maintenance', () => {
     expect(new Set(first.resultKeys).size).toBe(2);
 
     const changedShared = { ...shared, rows: [{ id: 1, name: 'shared updated' }], basis: 2 };
-    const updated = session.updateSnapshot({ ...initial, relations: [personal, changedShared], basis: { dataset: 2 } });
+    const changed: QueryMaintenanceSnapshot = { ...initial, relations: [personal, changedShared], basis: { dataset: 2 } };
+    const updated = applySnapshot(session, initial, changed);
     expect(updated.rows).toEqual([{ name: 'personal', source: 'source:personal' }, { name: 'shared updated', source: 'source:shared' }]);
     expect(updated.resultKeys).toEqual(first.resultKeys);
     expect(updated.state.resultDelta.updatedResultKeys).toHaveLength(1);
 
-    const removed = session.updateSnapshot({ ...initial, relations: [personal], basis: { dataset: 3 }, membershipRevision: 2 });
+    const personalOnly: QueryMaintenanceSnapshot = { ...initial, relations: [personal], basis: { dataset: 3 }, membershipRevision: 2 };
+    const removed = applySnapshot(session, changed, personalOnly);
     expect(removed.rows).toEqual([{ name: 'personal', source: 'source:personal' }]);
     expect(removed.resultKeys).toEqual([first.resultKeys[0]]);
     expect(removed.state.resultDelta.removedResultKeys).toEqual([first.resultKeys[1]]);
@@ -361,13 +370,45 @@ describe('incremental query maintenance', () => {
     });
   });
 
+  it('updates and reorders right-side equijoin matches without stale indexed segments', () => {
+    const left = relation('people', [{ occurrenceId: 'person:a', row: { id: 1, group: 'x' } }], 1);
+    const firstRight = relation('groups', [
+      { occurrenceId: 'group:x:first', row: { id: 'x', label: 'first' } },
+      { occurrenceId: 'group:x:second', row: { id: 'x', label: 'second' } }
+    ], 1);
+    const query: QueryNode = {
+      kind: 'select',
+      alias: 'result',
+      input: groupJoin('inner'),
+      fields: { label: field('g', 'label') }
+    };
+    const initial: QueryMaintenanceSnapshot = { relations: [left, firstRight] };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    expect(session.getCurrentResult().rows).toEqual([{ label: 'first' }, { label: 'second' }]);
+
+    const updatedRight = { ...firstRight, rows: [{ id: 'x', label: 'updated' }, firstRight.rows[1] as QueryRecord], basis: 2 };
+    const updated: QueryMaintenanceSnapshot = { relations: [left, updatedRight] };
+    expect(semanticResult(applySnapshot(session, initial, updated))).toEqual(oracle(query, updated));
+
+    const reorderedRight = {
+      ...updatedRight,
+      rows: [updatedRight.rows[1] as QueryRecord, updatedRight.rows[0] as QueryRecord],
+      occurrenceIds: [updatedRight.occurrenceIds?.[1] as string, updatedRight.occurrenceIds?.[0] as string],
+      basis: 3
+    };
+    const reordered: QueryMaintenanceSnapshot = { relations: [left, reorderedRight] };
+    const result = applySnapshot(session, updated, reordered);
+    expect(result.rows).toEqual([{ label: 'second' }, { label: 'updated' }]);
+    expect(semanticResult(result)).toEqual(oracle(query, reordered));
+  });
+
   it('does not recompute a graph whose relation dependencies did not change', () => {
     const initial = snapshot(basePeople, 1);
     const unrelated = relation('unrelated', [{ occurrenceId: 'unrelated:1', row: { id: 1 } }], 1);
     const first = { ...initial, relations: [...initial.relations, unrelated] };
     const second = { ...first, relations: [...initial.relations, relation('unrelated', [{ occurrenceId: 'unrelated:1', row: { id: 2 } }], 2)] };
     const session = openIncrementalQueryMaintenance(plan(operatorQueries.where as QueryNode), first);
-    const result = session.updateSnapshot(second);
+    const result = applySnapshot(session, first, second);
     expect(result.state).toMatchObject({ changedRelationIds: ['unrelated'], recomputedNodeCount: 0 });
     expect(semanticResult(result)).toEqual(oracle(operatorQueries.where as QueryNode, second));
   });
@@ -376,7 +417,7 @@ describe('incremental query maintenance', () => {
     const initial = snapshot(basePeople, 1);
     const next = { ...initial, basis: { dataset: 'new-evidence' } };
     const session = openIncrementalQueryMaintenance(plan(operatorQueries.where as QueryNode), initial);
-    const result = session.updateSnapshot(next);
+    const result = applySnapshot(session, initial, next);
     expect(result.state).toMatchObject({ recomputedNodeCount: 0, changedNodeCount: 0 });
     expect(semanticResult(result)).toEqual(oracle(operatorQueries.where as QueryNode, next));
   });
@@ -395,7 +436,7 @@ describe('incremental query maintenance', () => {
     ];
     const next = { ...snapshot(changedFilteredOutRow, 2), basis: { dataset: 'changed-source-basis' } };
     const session = openIncrementalQueryMaintenance(plan(filtered), initial);
-    const result = session.updateSnapshot(next);
+    const result = applySnapshot(session, initial, next);
     expect(result.state).toMatchObject({ materializedNodeCount: 3, recomputedNodeCount: 2, changedNodeCount: 1, resultDelta: { addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] } });
     expect(semanticResult(result)).toEqual(oracle(filtered, next));
   });
@@ -405,6 +446,6 @@ describe('incremental query maintenance', () => {
     const session = openIncrementalQueryMaintenance(plan(people), initial);
     session.close();
     session.close();
-    expect(() => session.updateSnapshot(initial)).toThrow('Incremental query maintenance session is closed');
+    expect(() => session.applyUpdate(deriveQueryMaintenanceUpdate(initial, initial))).toThrow('Incremental query maintenance session is closed');
   });
 });

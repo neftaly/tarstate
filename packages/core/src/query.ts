@@ -118,6 +118,30 @@ export type QueryMaintenanceSnapshot = {
   readonly membershipRevision?: number;
 };
 
+export type RelationRowChange = {
+  readonly occurrenceId: string;
+  readonly before?: { readonly index: number; readonly row: QueryRecord };
+  readonly after?: { readonly index: number; readonly row: QueryRecord };
+};
+
+export type RelationInputChange = {
+  readonly relation: RelationUse;
+  readonly sourceId?: string;
+  readonly attachmentId?: string;
+  readonly before?: { readonly index: number; readonly completeness: Completeness; readonly basis?: JsonValue };
+  readonly after?: { readonly index: number; readonly completeness: Completeness; readonly basis?: JsonValue };
+  readonly rows: readonly RelationRowChange[];
+};
+
+/** Exact occurrence-keyed change from one accepted maintenance basis to the next. */
+export type QueryMaintenanceUpdate = {
+  readonly expectedBasis?: JsonValue;
+  readonly basis?: JsonValue;
+  readonly expectedMembershipRevision?: number;
+  readonly membershipRevision?: number;
+  readonly relations: readonly RelationInputChange[];
+};
+
 export type IncrementalQueryResultDelta = {
   readonly addedResultKeys: readonly string[];
   readonly removedResultKeys: readonly string[];
@@ -140,12 +164,12 @@ export type IncrementalQueryResult = QueryResult & { readonly state: Incremental
 
 export interface IncrementalQueryMaintenanceSession {
   getCurrentResult(): IncrementalQueryResult;
-  updateSnapshot(snapshot: QueryMaintenanceSnapshot): IncrementalQueryResult;
+  applyUpdate(update: QueryMaintenanceUpdate): IncrementalQueryResult;
   close(): void;
 }
 
 type Provenance = { readonly sourceId?: string; readonly attachmentId?: string; readonly relationId: string; readonly key?: JsonValue; readonly occurrence: string };
-type ScopedRow = { readonly scope: Readonly<Record<string, QueryRecord>>; readonly provenance: Readonly<Record<string, Provenance>> };
+type ScopedRow = { readonly scope: Readonly<Record<string, QueryRecord>>; readonly provenance: Readonly<Record<string, Provenance>>; readonly identity?: string; readonly origin?: string };
 type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: Completeness };
 type ExpressionResult = { readonly status: 'known'; readonly value: JsonValue } | { readonly status: 'missing' | 'unknown' | 'indeterminate' | 'unavailable' };
 type EvalContext = { readonly row: ScopedRow; readonly parameters: Readonly<Record<string, JsonValue>>; readonly functions: FunctionRegistry; readonly issues: Issue[]; readonly query?: QueryContext };
@@ -155,6 +179,8 @@ type QueryContext = {
   readonly functions: FunctionRegistry;
   readonly issues: Issue[];
   readonly recursions: Map<string, readonly ScopedRow[]>;
+  readonly recursionConstants: Map<QueryNode, NodeResult>;
+  readonly joinIndexes: Map<QueryNode, ReadonlyMap<string, readonly ScopedRow[]>>;
   readonly basis?: JsonValue;
   readonly membershipRevision?: number;
   readonly outer?: ScopedRow;
@@ -167,6 +193,16 @@ type MaterializedQueryNode = {
   readonly result: NodeResult;
   readonly issues: readonly Issue[];
   readonly unavailable: boolean;
+  readonly local?: {
+    readonly inputs: readonly ScopedRow[];
+    readonly segments: readonly (readonly ScopedRow[])[];
+  };
+  readonly join?: {
+    readonly leftInputs: readonly ScopedRow[];
+    readonly rightInputs: readonly ScopedRow[];
+    readonly segments: readonly (readonly ScopedRow[])[];
+    readonly rightIndex?: Map<string, ScopedRow[]>;
+  };
 };
 
 const relationKey = (relation: RelationUse): string => relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
@@ -198,6 +234,8 @@ export const evaluateQuery = (request: QueryRequest): QueryResult => {
     functions: request.functions ?? new Map(),
     issues,
     recursions: new Map(),
+    recursionConstants: new Map(),
+    joinIndexes: new Map(),
     ...(request.basis === undefined ? {} : { basis: request.basis }),
     ...(request.membershipRevision === undefined ? {} : { membershipRevision: request.membershipRevision }),
     unavailable: false
@@ -227,6 +265,15 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     context.unavailable = context.unavailable || materialized.unavailable;
     return materialized.result;
   }
+  const cacheable = context.outer === undefined && context.recursions.size > 0 && !containsRecursionReference(node);
+  const cached = cacheable ? context.recursionConstants.get(node) : undefined;
+  if (cached !== undefined) return cached;
+  const result = evaluateNodeUncached(node, context);
+  if (cacheable) context.recursionConstants.set(node, result);
+  return result;
+};
+
+const evaluateNodeUncached = (node: QueryNode, context: QueryContext): NodeResult => {
   if (node.kind === 'from') {
     const inputs = context.relations.get(relationKey(node.relation));
     if (inputs === undefined || inputs.some(({ completeness }) => completeness === 'unknown')) {
@@ -234,14 +281,14 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
       return { rows: [], completeness: 'unknown' };
     }
     return {
-      rows: inputs.flatMap((input) => input.rows.map((fields, index) => ({
-        scope: { ...context.outer?.scope, [node.alias]: fields },
-        provenance: { ...context.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: relationOccurrence(input, index) } }
-      }))),
+      rows: inputs.flatMap((input) => input.rows.map((fields, index) => scopedRow(
+        { ...context.outer?.scope, [node.alias]: fields },
+        { ...context.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: relationOccurrence(input, index) } }
+      ))),
       completeness: inputs.some(({ completeness }) => completeness === 'lower-bound') ? 'lower-bound' : 'exact'
     };
   }
-  if (node.kind === 'values') return { rows: node.rows.map((fields, index) => ({ scope: { ...context.outer?.scope, [node.alias]: fields }, provenance: { ...context.outer?.provenance, [node.alias]: { relationId: 'values', occurrence: 'values:' + index } } })), completeness: 'exact' };
+  if (node.kind === 'values') return { rows: node.rows.map((fields, index) => scopedRow({ ...context.outer?.scope, [node.alias]: fields }, { ...context.outer?.provenance, [node.alias]: { relationId: 'values', occurrence: 'values:' + index } })), completeness: 'exact' };
   if (node.kind === 'recursion-ref') {
     const rows = context.recursions.get(node.name);
     if (rows !== undefined) return { rows, completeness: 'exact' };
@@ -269,7 +316,7 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
       const base = requiredAlias(row, node.alias, context);
       if (base === undefined) return row;
       const additions = projectFields(node.fields, exprContext(row, context));
-      return { scope: { ...row.scope, [node.alias]: { ...base, ...additions } }, provenance: row.provenance };
+      return { scope: { ...row.scope, [node.alias]: { ...base, ...additions } }, provenance: row.provenance, origin: resultKey(row) };
     });
     return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
@@ -277,15 +324,16 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     const inner = evaluateNode(node.input, context);
     const rows = inner.rows.map((row) => {
       const record = requiredAlias(row, node.alias, context);
-      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: renameFields(record, node.fields) } };
+      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: renameFields(record, node.fields) }, origin: resultKey(row) };
     });
     return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
   if (node.kind === 'omit') {
     const inner = evaluateNode(node.input, context);
+    const omitted = new Set(node.fields);
     const rows = inner.rows.map((row) => {
       const record = requiredAlias(row, node.alias, context);
-      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: omitFields(record, new Set(node.fields)) } };
+      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: omitFields(record, omitted) }, origin: resultKey(row) };
     });
     return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
@@ -296,7 +344,8 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
       const value = evaluateExpr(node.expression, exprContext(row, context));
       if (value.status === 'unavailable' || value.status === 'indeterminate') context.unavailable = true;
       if (value.status !== 'known' || !Array.isArray(value.value)) continue;
-      value.value.forEach((item, index) => rows.push({ scope: { ...row.scope, [node.alias]: { [node.field]: item } }, provenance: { ...row.provenance, [node.alias]: { relationId: 'unnest', occurrence: resultKey(row) + ':' + index } } }));
+      const origin = resultKey(row);
+      value.value.forEach((item, index) => rows.push(scopedRow({ ...row.scope, [node.alias]: { [node.field]: item } }, { ...row.provenance, [node.alias]: { relationId: 'unnest', occurrence: origin + ':' + index } }, origin)));
     }
     return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
@@ -331,25 +380,96 @@ const evaluateJoin = (node: Extract<QueryNode, { readonly kind: 'join' }>, conte
   if (left.completeness === 'unknown' || right.completeness === 'unknown') return { rows: [], completeness: 'unknown' };
   if ((node.join === 'anti' || node.join === 'left') && right.completeness !== 'exact') return nonMonotoneUnknown(context, node.join);
   const rows: ScopedRow[] = [];
+  const equality = equijoinFields(node);
+  const rightIndex = equality === undefined ? undefined : indexedRows(node, right.rows, equality.right, context);
   for (const leftRow of left.rows) {
-    let matched = false;
-    for (const rightRow of right.rows) {
-      const combined = { scope: { ...leftRow.scope, ...rightRow.scope }, provenance: { ...leftRow.provenance, ...rightRow.provenance } };
-      const result = node.join === 'cross' || node.on === undefined ? known(true) : evaluateExpr(node.on, exprContext(combined, context));
-      if (result.status === 'unavailable' || result.status === 'indeterminate') context.unavailable = true;
-      if (result.status !== 'known' || result.value !== true) continue;
-      matched = true;
-      if (node.join === 'inner' || node.join === 'cross' || node.join === 'left') rows.push(combined);
-    }
-    if (node.join === 'semi' && matched) rows.push(leftRow);
-    if (node.join === 'anti' && !matched) rows.push(leftRow);
-    if (node.join === 'left' && !matched) {
-      const missingRight = Object.fromEntries([...queryAliases(node.right)].map((alias) => [alias, {}]));
-      rows.push({ scope: { ...leftRow.scope, ...missingRight }, provenance: leftRow.provenance });
-    }
+    const candidates = rightIndex === undefined || equality === undefined ? right.rows : lookupIndexedRows(rightIndex, equality.left, leftRow, context);
+    rows.push(...joinLeftRow(node, leftRow, candidates, rightIndex !== undefined, context));
   }
   if (context.unavailable) return { rows: [], completeness: 'unknown' };
   return { rows, completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
+};
+
+const joinLeftRow = (
+  node: Extract<QueryNode, { readonly kind: 'join' }>,
+  leftRow: ScopedRow,
+  candidates: readonly ScopedRow[],
+  indexed: boolean,
+  context: QueryContext
+): readonly ScopedRow[] => {
+  const rows: ScopedRow[] = [];
+  let matched = false;
+  const origin = resultKey(leftRow);
+  for (const rightRow of candidates) {
+    const combined = scopedRow({ ...leftRow.scope, ...rightRow.scope }, { ...leftRow.provenance, ...rightRow.provenance }, origin);
+    const result = indexed || node.join === 'cross' || node.on === undefined ? known(true) : evaluateExpr(node.on, exprContext(combined, context));
+    if (result.status === 'unavailable' || result.status === 'indeterminate') context.unavailable = true;
+    if (result.status !== 'known' || result.value !== true) continue;
+    matched = true;
+    if (node.join === 'inner' || node.join === 'cross' || node.join === 'left') rows.push(combined);
+  }
+  if (node.join === 'semi' && matched || node.join === 'anti' && !matched) rows.push(leftRow);
+  if (node.join === 'left' && !matched) {
+    const missingRight = Object.fromEntries([...queryAliases(node.right)].map((alias) => [alias, {}]));
+    rows.push({ scope: { ...leftRow.scope, ...missingRight }, provenance: leftRow.provenance, identity: origin, origin });
+  }
+  return rows;
+};
+
+type FieldExpression = Extract<Expr, { readonly kind: 'field' }>;
+type EquijoinFields = { readonly left: FieldExpression; readonly right: FieldExpression };
+
+const equijoinFields = (node: Extract<QueryNode, { readonly kind: 'join' }>): EquijoinFields | undefined => {
+  if (node.on?.kind !== 'compare' || node.on.op !== 'eq' || node.on.left.kind !== 'field' || node.on.right.kind !== 'field') return undefined;
+  const leftAliases = queryAliases(node.left);
+  const rightAliases = queryAliases(node.right);
+  if (leftAliases.has(node.on.left.alias) && rightAliases.has(node.on.right.alias)) return { left: node.on.left, right: node.on.right };
+  if (leftAliases.has(node.on.right.alias) && rightAliases.has(node.on.left.alias)) return { left: node.on.right, right: node.on.left };
+  return undefined;
+};
+
+const indexedRows = (node: QueryNode, rows: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlyMap<string, readonly ScopedRow[]> => {
+  const cacheable = context.outer === undefined && !containsRecursionReference(node.kind === 'join' ? node.right : node);
+  const cached = cacheable ? context.joinIndexes.get(node) : undefined;
+  if (cached !== undefined) return cached;
+  const index = buildIndexedRows(rows, expression, context);
+  if (cacheable) context.joinIndexes.set(node, index);
+  return index;
+};
+
+const buildIndexedRows = (rows: readonly ScopedRow[], expression: Expr, context: QueryContext): Map<string, ScopedRow[]> => {
+  const index = new Map<string, ScopedRow[]>();
+  for (const row of rows) {
+    const key = indexKey(expression, row, context);
+    if (key === undefined) continue;
+    const bucket = index.get(key);
+    if (bucket === undefined) index.set(key, [row]);
+    else bucket.push(row);
+  }
+  return index;
+};
+
+const lookupIndexedRows = (index: ReadonlyMap<string, readonly ScopedRow[]>, expression: Expr, row: ScopedRow, context: QueryContext): readonly ScopedRow[] => {
+  const key = indexKey(expression, row, context);
+  return key === undefined ? [] : index.get(key) ?? [];
+};
+
+const indexKey = (expression: Expr, row: ScopedRow, context: QueryContext): string | undefined => {
+  const result = evaluateExpr(expression, exprContext(row, context));
+  if (result.status === 'unavailable' || result.status === 'indeterminate') context.unavailable = true;
+  return result.status === 'known' && result.value !== null ? canonicalizeJson(result.value) : undefined;
+};
+
+const containsRecursionReference = (node: QueryNode): boolean => {
+  const visit = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(visit);
+    if (value === null || typeof value !== 'object') return false;
+    const candidate = value as Readonly<Record<string, unknown>>;
+    if (candidate.kind === 'recursion-ref') return true;
+    if (candidate.kind === 'recursive') return false;
+    return Object.values(candidate).some(visit);
+  };
+  return visit(node);
 };
 
 const evaluateAggregate = (node: Extract<QueryNode, { readonly kind: 'aggregate' }>, context: QueryContext): NodeResult => {
@@ -367,7 +487,7 @@ const evaluateAggregate = (node: Extract<QueryNode, { readonly kind: 'aggregate'
   const rows = [...groups.values()].map(({ key, rows: members }): ScopedRow => {
     const output: Record<string, QueryLogicalValue> = { ...key };
     for (const [name, aggregate] of Object.entries(node.measures)) output[name] = aggregateValue(aggregate, members, context);
-    return { scope: { [node.alias]: output }, provenance: { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + canonicalizeQueryValue(key) } } };
+    return scopedRow({ [node.alias]: output }, { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + canonicalizeQueryValue(key) } });
   });
   return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: 'exact' };
 };
@@ -392,8 +512,10 @@ const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], co
   if (aggregate.op === 'sum') return numbers.length === 0 ? null : numbers.reduce((sum, value) => sum + value, 0);
   if (aggregate.op === 'average') return numbers.length === 0 ? null : numbers.reduce((sum, value) => sum + value, 0) / numbers.length;
   if (knownValues.length === 0) return null;
-  const sorted = [...knownValues].sort(compareJsonValuesTotal);
-  return aggregate.op === 'minimum' ? sorted[0] as JsonValue : sorted.at(-1) as JsonValue;
+  return knownValues.reduce((selected, value) => {
+    const comparison = compareJsonValuesTotal(value, selected);
+    return aggregate.op === 'minimum' ? (comparison < 0 ? value : selected) : (comparison > 0 ? value : selected);
+  });
 };
 
 const evaluateSet = (node: Extract<QueryNode, { readonly kind: 'set' }>, context: QueryContext): NodeResult => {
@@ -461,8 +583,8 @@ const evaluateSeek = (node: Extract<QueryNode, { readonly kind: 'seek' }>, conte
 };
 
 const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive' }>, context: QueryContext): NodeResult => {
-  if (!isMonotoneRecursiveBody(node.step)) {
-    context.issues.push(createIssue({ code: 'query.recursion_non_monotone', phase: 'query', severity: 'error', retry: 'after_input' }));
+  if (!isMonotoneRecursiveBody(node.step) || countRecursionReferences(node.step, node.name) !== 1) {
+    context.issues.push(createIssue({ code: 'query.recursion_non_monotone', phase: 'query', severity: 'error', retry: 'after_input', details: { reason: 'recursion_must_be_linear_and_monotone' } }));
     return { rows: [], completeness: 'unknown' };
   }
   const seed = evaluateNode(node.seed, context);
@@ -485,22 +607,36 @@ const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive'
   try {
     seed.rows.forEach(add);
     if (rows.length > maxRows) return recursionBudgetUnknown(context, 'rows', maxRows);
+    let frontier = [...rows];
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      context.recursions.set(node.name, [...rows]);
+      context.recursions.set(node.name, frontier);
       const step = evaluateNode(node.step, context);
       if (step.completeness !== 'exact' || context.unavailable) return { rows: [], completeness: 'unknown' };
-      let changed = false;
+      const next: ScopedRow[] = [];
       for (const candidate of step.rows) {
-        changed = add(candidate) || changed;
+        if (add(candidate)) next.push(candidate);
         if (rows.length > maxRows) return recursionBudgetUnknown(context, 'rows', maxRows);
       }
-      if (!changed) return { rows, completeness: 'exact' };
+      if (next.length === 0) return { rows, completeness: 'exact' };
+      frontier = next;
     }
     return recursionBudgetUnknown(context, 'iterations', maxIterations);
   } finally {
     if (previous === undefined) context.recursions.delete(node.name);
     else context.recursions.set(node.name, previous);
   }
+};
+
+const countRecursionReferences = (node: QueryNode, name: string): number => {
+  const visit = (value: unknown): number => {
+    if (Array.isArray(value)) return value.reduce((sum, child) => sum + visit(child), 0);
+    if (value === null || typeof value !== 'object') return 0;
+    const candidate = value as Readonly<Record<string, unknown>>;
+    if (candidate.kind === 'recursion-ref') return candidate.name === name ? 1 : 0;
+    if (candidate.kind === 'recursive') return 0;
+    return Object.values(candidate).reduce<number>((sum, child) => sum + visit(child), 0);
+  };
+  return visit(node);
 };
 
 const recursionBudgetUnknown = (context: QueryContext, budget: 'rows' | 'iterations', limit: number): NodeResult => {
@@ -646,6 +782,8 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
       functions: context.functions,
       issues: context.issues,
       recursions: context.query.recursions,
+      recursionConstants: context.query.recursionConstants,
+      joinIndexes: context.query.joinIndexes,
       ...(context.query.basis === undefined ? {} : { basis: context.query.basis }),
       ...(context.query.membershipRevision === undefined ? {} : { membershipRevision: context.query.membershipRevision }),
       outer: context.row,
@@ -705,7 +843,10 @@ const projectFields = (fields: Readonly<Record<string, Expr>>, context: EvalCont
 };
 
 const mapProjection = (inner: NodeResult, alias: string, project: (row: ScopedRow) => QueryRecord, context: QueryContext): NodeResult => {
-  const rows = inner.rows.map((row) => ({ scope: { [alias]: project(row) }, provenance: { [alias]: { relationId: 'select', occurrence: resultKey(row) + ':select' } } }));
+  const rows = inner.rows.map((row) => {
+    const origin = resultKey(row);
+    return scopedRow({ [alias]: project(row) }, { [alias]: { relationId: 'select', occurrence: origin + ':select' } }, origin);
+  });
   return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
 };
 
@@ -725,14 +866,16 @@ const requiredAlias = (row: ScopedRow, alias: string, context: QueryContext): Qu
   return undefined;
 };
 
-const resultKey = (row: ScopedRow): string => Object.entries(row.provenance).sort(([left], [right]) => comparePortableStrings(left, right)).map(([alias, provenance]) => alias.length + ':' + alias + provenance.occurrence.length + ':' + provenance.occurrence).join('');
+const resultKey = (row: ScopedRow): string => row.identity ?? provenanceIdentity(row.provenance);
+const provenanceIdentity = (provenance: ScopedRow['provenance']): string => Object.entries(provenance).sort(([left], [right]) => comparePortableStrings(left, right)).map(([alias, value]) => alias.length + ':' + alias + value.occurrence.length + ':' + value.occurrence).join('');
+const scopedRow = (scope: ScopedRow['scope'], provenance: ScopedRow['provenance'], origin?: string): ScopedRow => ({ scope, provenance, identity: provenanceIdentity(provenance), ...(origin === undefined ? {} : { origin }) });
 const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => Object.fromEntries(Object.entries(record).map(([name, value]) => [fields[name] ?? name, value]));
 const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => Object.fromEntries(Object.entries(record).filter(([name]) => !fields.has(name)));
 const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));
-const tagSetBranch = (rows: readonly ScopedRow[], branch: 'left' | 'right'): readonly ScopedRow[] => rows.map((row) => ({
-  ...row,
-  provenance: Object.fromEntries(Object.entries(row.provenance).map(([alias, value]) => [alias, { ...value, occurrence: branch + ':' + value.occurrence }]))
-}));
+const tagSetBranch = (rows: readonly ScopedRow[], branch: 'left' | 'right'): readonly ScopedRow[] => rows.map((row) => scopedRow(
+  row.scope,
+  Object.fromEntries(Object.entries(row.provenance).map(([alias, value]) => [alias, { ...value, occurrence: branch + ':' + value.occurrence }]))
+));
 const compareOrder = (left: ScopedRow, right: ScopedRow, terms: readonly OrderTerm[], context: QueryContext): number => {
   for (const term of terms) {
     const leftValue = evaluateExpr(term.value, exprContext(left, context));
@@ -774,7 +917,11 @@ const compareJsonValues = (left: JsonValue, right: JsonValue): number | undefine
   if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : left > right ? 1 : 0;
   if (typeof left === 'string' && typeof right === 'string') return left < right ? -1 : left > right ? 1 : 0;
   if (typeof left === 'boolean' && typeof right === 'boolean') return left === right ? 0 : left ? 1 : -1;
-  if (typeof left === 'object' && typeof right === 'object') return canonicalizeJson(left) < canonicalizeJson(right) ? -1 : canonicalizeJson(left) > canonicalizeJson(right) ? 1 : 0;
+  if (typeof left === 'object' && typeof right === 'object') {
+    const leftCanonical = canonicalizeJson(left);
+    const rightCanonical = canonicalizeJson(right);
+    return leftCanonical < rightCanonical ? -1 : leftCanonical > rightCanonical ? 1 : 0;
+  }
   return undefined;
 };
 
@@ -809,6 +956,77 @@ const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult
   return { rows: [], completeness: 'unknown' };
 };
 
+/** Pure shell adapter from two snapshots to the exact update consumed by maintenance. */
+export const deriveQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): QueryMaintenanceUpdate => {
+  if (!sameOptionalJson(previous.parameters, next.parameters) || !sameFunctionRegistry(previous.functions, next.functions)) {
+    throw new TypeError('Query maintenance parameters and functions are fixed for the session');
+  }
+  const previousInputs = indexedRelationInputs(previous.relations);
+  const nextInputs = indexedRelationInputs(next.relations);
+  const identities = [...new Set([...previousInputs.keys(), ...nextInputs.keys()])].sort(comparePortableStrings);
+  const relations: RelationInputChange[] = [];
+  for (const identity of identities) {
+    const before = previousInputs.get(identity);
+    const after = nextInputs.get(identity);
+    if (before !== undefined && after !== undefined && before.index === after.index && relationInputEqual(before.input, after.input)) continue;
+    const beforeRows = before === undefined ? new Map<string, { readonly index: number; readonly row: QueryRecord }>() : indexedRelationRows(before.input);
+    const afterRows = after === undefined ? new Map<string, { readonly index: number; readonly row: QueryRecord }>() : indexedRelationRows(after.input);
+    const rows: RelationRowChange[] = [];
+    for (const occurrenceId of [...new Set([...beforeRows.keys(), ...afterRows.keys()])].sort(comparePortableStrings)) {
+      const previousRow = beforeRows.get(occurrenceId);
+      const nextRow = afterRows.get(occurrenceId);
+      if (previousRow !== undefined && nextRow !== undefined && previousRow.index === nextRow.index && canonicalizeQueryValue(previousRow.row) === canonicalizeQueryValue(nextRow.row)) continue;
+      rows.push({ occurrenceId, ...(previousRow === undefined ? {} : { before: previousRow }), ...(nextRow === undefined ? {} : { after: nextRow }) });
+    }
+    const input = after?.input ?? before?.input;
+    if (input === undefined) continue;
+    relations.push({
+      relation: input.relation,
+      ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
+      ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }),
+      ...(before === undefined ? {} : { before: relationChangeState(before) }),
+      ...(after === undefined ? {} : { after: relationChangeState(after) }),
+      rows
+    });
+  }
+  return {
+    ...(previous.basis === undefined ? {} : { expectedBasis: previous.basis }),
+    ...(next.basis === undefined ? {} : { basis: next.basis }),
+    ...(previous.membershipRevision === undefined ? {} : { expectedMembershipRevision: previous.membershipRevision }),
+    ...(next.membershipRevision === undefined ? {} : { membershipRevision: next.membershipRevision }),
+    relations
+  };
+};
+
+const relationChangeState = ({ input, index }: IndexedRelationInput): NonNullable<RelationInputChange['before']> => ({
+  index,
+  completeness: input.completeness,
+  ...(input.basis === undefined ? {} : { basis: input.basis })
+});
+
+type IndexedRelationInput = { readonly input: RelationInput; readonly index: number };
+
+const indexedRelationInputs = (relations: readonly RelationInput[]): ReadonlyMap<string, IndexedRelationInput> => {
+  const output = new Map<string, IndexedRelationInput>();
+  relations.forEach((input, index) => {
+    const identity = relationInputKey(input);
+    if (output.has(identity)) throw new TypeError('Duplicate relation input identity: ' + input.relation.relationId);
+    output.set(identity, { input, index });
+  });
+  return output;
+};
+
+const indexedRelationRows = (input: RelationInput): ReadonlyMap<string, { readonly index: number; readonly row: QueryRecord }> => {
+  if (input.rows.length > 0 && input.occurrenceIds === undefined) throw new TypeError('Relation changes require occurrence IDs: ' + input.relation.relationId);
+  const output = new Map<string, { readonly index: number; readonly row: QueryRecord }>();
+  input.rows.forEach((row, index) => {
+    const occurrenceId = input.occurrenceIds?.[index];
+    if (occurrenceId === undefined || output.has(occurrenceId)) throw new TypeError('Invalid occurrence identity: ' + input.relation.relationId);
+    output.set(occurrenceId, { index, row });
+  });
+  return output;
+};
+
 /**
  * Opens the production stateful query-maintenance path. The pure
  * `evaluateQuery` function remains an independent semantic oracle; updates here
@@ -824,6 +1042,7 @@ export const openIncrementalQueryMaintenance = (
   let closed = false;
   let revision = 0;
   let rejectedUpdateCount = 0;
+  const valueIdentities = new WeakMap<ScopedRow, string>();
 
   const initialIssues = validateMaintenanceSnapshot(initialSnapshot);
   if (initialIssues.length === 0) {
@@ -834,25 +1053,27 @@ export const openIncrementalQueryMaintenance = (
     initialIssues,
     maintenanceState(graph.nodes.length, graph.nodes.length, graph.nodes.length, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
   );
+  let assertedRoot = initialIssues.length === 0 ? materialized.get(plan.query) : undefined;
 
   return {
     getCurrentResult: () => current,
-    updateSnapshot: (nextSnapshot) => {
+    applyUpdate: (update) => {
       if (closed) throw new Error('Incremental query maintenance session is closed');
       revision += 1;
-      const updateIssues = validateMaintenanceUpdate(acceptedSnapshot, nextSnapshot);
-      if (updateIssues.length > 0) {
+      const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
+      if (!applied.success) {
         rejectedUpdateCount += 1;
-        const previous = current;
         current = maintainedQueryResult(
           undefined,
-          updateIssues,
-          maintenanceState(graph.nodes.length, 0, 0, [], diffMaintainedResults(previous, undefined), revision, rejectedUpdateCount)
+          applied.issues,
+          maintenanceState(graph.nodes.length, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
         );
+        assertedRoot = undefined;
         return current;
       }
 
-      const changedRelations = changedRelationKeys(acceptedSnapshot, nextSnapshot);
+      const nextSnapshot = applied.value;
+      const changedRelations = new Set(update.relations.map(({ relation }) => relationKey(relation)));
       const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
         || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
       let recomputedNodeCount = 0;
@@ -865,13 +1086,18 @@ export const openIncrementalQueryMaintenance = (
         const evidenceInputChanged = sessionEvidenceChanged && graph.sessionEvidenceDependencies.get(node) === true;
         if (!evidenceInputChanged && !childChanged && !externalInputChanged) continue;
         const previousNode = materialized.get(node);
-        const nextNode = materializeQueryNode(node, nextSnapshot, materialized);
+        const nextNode = node.kind === 'from'
+          ? incrementallyMaterializeFrom(node, nextSnapshot, update, previousNode)
+          : node.kind === 'join'
+            ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
+          : isLocallyMaintainedNode(node)
+            ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
+            : materializeQueryNode(node, nextSnapshot, materialized);
         materialized.set(node, nextNode);
         recomputedNodeCount += 1;
-        if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode)) changedNodes.add(node);
+        if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
       }
       acceptedSnapshot = nextSnapshot;
-      const previous = current;
       const root = materialized.get(plan.query);
       current = maintainedQueryResult(
         root,
@@ -881,11 +1107,12 @@ export const openIncrementalQueryMaintenance = (
           recomputedNodeCount,
           changedNodes.size,
           changedRelationIds(nextSnapshot, changedRelations),
-          diffMaintainedResults(previous, root),
+          diffMaintainedResults(assertedRoot, root, valueIdentities),
           revision,
           rejectedUpdateCount
         )
       );
+      assertedRoot = root;
       return current;
     },
     close: () => {
@@ -965,21 +1192,247 @@ const materializeQueryNode = (
   snapshot: QueryMaintenanceSnapshot,
   materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>
 ): MaterializedQueryNode => {
+  const materialized = evaluateMaterializedQueryNode(node, snapshot, materializedNodes);
+  if (node.kind === 'join' && equijoinFields(node) !== undefined && !materialized.unavailable && materialized.issues.length === 0) {
+    const left = materializedNodes.get(node.left);
+    const right = materializedNodes.get(node.right);
+    if (left !== undefined && right !== undefined && !left.unavailable && !right.unavailable) return { ...materialized, join: indexJoinSegments(node, left.result.rows, right.result.rows, materialized.result.rows) };
+  }
+  if (!isLocallyMaintainedNode(node) || materialized.unavailable || materialized.issues.length > 0) return materialized;
+  const child = materializedNodes.get(node.input);
+  if (child === undefined || child.unavailable || child.result.completeness === 'unknown') return materialized;
+  return { ...materialized, local: indexLocalSegments(node, child.result.rows, materialized.result.rows) };
+};
+
+const evaluateMaterializedQueryNode = (
+  node: QueryNode,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>
+): MaterializedQueryNode => {
   const issues: Issue[] = [];
-  const context: QueryContext = {
+  const context = materializationContext(snapshot, materializedNodes, node, issues);
+  const result = evaluateNode(node, context);
+  return { result, issues: deduplicateQueryIssues(issues), unavailable: context.unavailable };
+};
+
+const materializationContext = (
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  activeNode: QueryNode,
+  issues: Issue[]
+): QueryContext => ({
     relations: groupRelationInputs(snapshot.relations),
     parameters: snapshot.parameters ?? {},
     functions: snapshot.functions ?? new Map(),
     issues,
     recursions: new Map(),
+    recursionConstants: new Map(),
+    joinIndexes: new Map(),
     ...(snapshot.basis === undefined ? {} : { basis: snapshot.basis }),
     ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision }),
     materializedNodes,
-    activeNode: node,
+    activeNode,
     unavailable: false
+  });
+
+const incrementallyMaterializeJoin = (
+  node: Extract<QueryNode, { readonly kind: 'join' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const equality = equijoinFields(node);
+  const left = materializedNodes.get(node.left);
+  const right = materializedNodes.get(node.right);
+  if (equality === undefined || previous?.join === undefined || left === undefined || right === undefined || left.unavailable || right.unavailable || left.issues.length > 0 || right.issues.length > 0 || left.result.completeness === 'unknown' || right.result.completeness === 'unknown') {
+    return materializeQueryNode(node, snapshot, materializedNodes);
+  }
+  if ((node.join === 'anti' || node.join === 'left') && right.result.completeness !== 'exact') return materializeQueryNode(node, snapshot, materializedNodes);
+  const issues: Issue[] = [];
+  const context = materializationContext(snapshot, materializedNodes, node, issues);
+  const rightUnchanged = previous.join.rightInputs.length === right.result.rows.length && previous.join.rightInputs.every((row, index) => row === right.result.rows[index]);
+  const rightIndex = rightUnchanged && previous.join.rightIndex !== undefined ? previous.join.rightIndex : buildIndexedRows(right.result.rows, equality.right, context);
+  const affectedRightKeys = rightUnchanged ? new Set<string>() : changedExpressionKeys(previous.join.rightInputs, right.result.rows, equality.right, context);
+  const segments: (readonly ScopedRow[])[] = [];
+  const output: ScopedRow[] = [];
+  let previousPositions: ReadonlyMap<string, number> | undefined;
+  for (let index = 0; index < left.result.rows.length; index += 1) {
+    const row = left.result.rows[index] as ScopedRow;
+    const identity = resultKey(row);
+    const aligned = previous.join.leftInputs[index];
+    let previousIndex = index;
+    if (aligned === undefined || resultKey(aligned) !== identity) {
+      previousPositions ??= new Map(previous.join.leftInputs.map((input, position) => [resultKey(input), position]));
+      previousIndex = previousPositions.get(identity) ?? -1;
+    }
+    const previousInput = previous.join.leftInputs[previousIndex];
+    const leftKey = indexKey(equality.left, row, context);
+    const retained = previousInput === row && (leftKey === undefined || !affectedRightKeys.has(leftKey)) ? previous.join.segments[previousIndex] : undefined;
+    const segment = retained ?? joinLeftRow(node, row, leftKey === undefined ? [] : rightIndex.get(leftKey) ?? [], true, context);
+    segments.push(segment);
+    output.push(...segment);
+  }
+  if (context.unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+  return {
+    result: { rows: output, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
+    issues: [],
+    unavailable: false,
+    join: { leftInputs: left.result.rows, rightInputs: right.result.rows, segments, rightIndex }
   };
-  const result = evaluateNode(node, context);
-  return { result, issues: deduplicateQueryIssues(issues), unavailable: context.unavailable };
+};
+
+const changedExpressionKeys = (before: readonly ScopedRow[], after: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlySet<string> => {
+  const changed = new Set<string>();
+  const beforeByIdentity = new Map(before.map((row, index) => [resultKey(row), { row, index }]));
+  const afterByIdentity = new Map(after.map((row, index) => [resultKey(row), { row, index }]));
+  for (const identity of new Set([...beforeByIdentity.keys(), ...afterByIdentity.keys()])) {
+    const previous = beforeByIdentity.get(identity);
+    const next = afterByIdentity.get(identity);
+    if (previous?.row === next?.row && previous?.index === next?.index) continue;
+    if (previous !== undefined) { const key = indexKey(expression, previous.row, context); if (key !== undefined) changed.add(key); }
+    if (next !== undefined) { const key = indexKey(expression, next.row, context); if (key !== undefined) changed.add(key); }
+  }
+  return changed;
+};
+
+const indexJoinSegments = (
+  node: Extract<QueryNode, { readonly kind: 'join' }>,
+  leftInputs: readonly ScopedRow[],
+  rightInputs: readonly ScopedRow[],
+  outputs: readonly ScopedRow[]
+): NonNullable<MaterializedQueryNode['join']> => {
+  const positions = new Map(leftInputs.map((row, index) => [resultKey(row), index]));
+  const segments = leftInputs.map(() => [] as ScopedRow[]);
+  for (const row of outputs) {
+    const key = node.join === 'semi' || node.join === 'anti' ? resultKey(row) : row.origin;
+    const index = key === undefined ? undefined : positions.get(key);
+    if (index !== undefined) (segments[index] as ScopedRow[]).push(row);
+  }
+  return { leftInputs, rightInputs, segments };
+};
+
+const incrementallyMaterializeFrom = (
+  node: Extract<QueryNode, { readonly kind: 'from' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  update: QueryMaintenanceUpdate,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const inputs = groupRelationInputs(snapshot.relations).get(relationKey(node.relation));
+  if (inputs === undefined || inputs.some(({ completeness }) => completeness === 'unknown') || previous === undefined || previous.unavailable) {
+    return evaluateMaterializedQueryNode(node, snapshot, new Map());
+  }
+  const changed = changedOccurrences(update, node.relation);
+  const rows: ScopedRow[] = [];
+  let previousByIdentity: ReadonlyMap<string, ScopedRow> | undefined;
+  let outputIndex = 0;
+  for (const input of inputs) input.rows.forEach((fields, index) => {
+    const occurrence = relationOccurrence(input, index);
+    const key = singleAliasResultKey(node.alias, occurrence);
+    const aligned = previous.result.rows[outputIndex];
+    if (aligned !== undefined && resultKey(aligned) !== key && previousByIdentity === undefined) previousByIdentity = new Map(previous.result.rows.map((row) => [resultKey(row), row]));
+    const retained = changed.has(occurrence) ? undefined : aligned !== undefined && resultKey(aligned) === key ? aligned : previousByIdentity?.get(key);
+    rows.push(retained ?? scopedRow(
+      { [node.alias]: fields },
+      { [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence } }
+    ));
+    outputIndex += 1;
+  });
+  return { result: { rows, completeness: inputs.some(({ completeness }) => completeness === 'lower-bound') ? 'lower-bound' : 'exact' }, issues: [], unavailable: false };
+};
+
+const changedOccurrences = (update: QueryMaintenanceUpdate, relation: RelationUse): ReadonlySet<string> => {
+  const changed = new Set<string>();
+  for (const input of update.relations) {
+    if (relationKey(input.relation) !== relationKey(relation)) continue;
+    const namespace = input.sourceId ?? input.attachmentId;
+    for (const row of input.rows) {
+      if (row.before !== undefined && row.after !== undefined && canonicalizeQueryValue(row.before.row) === canonicalizeQueryValue(row.after.row)) continue;
+      const occurrence = namespace === undefined ? row.occurrenceId : namespace.length + ':' + namespace + row.occurrenceId.length + ':' + row.occurrenceId;
+      changed.add(occurrence);
+    }
+  }
+  return changed;
+};
+
+const singleAliasResultKey = (alias: string, occurrence: string): string => alias.length + ':' + alias + occurrence.length + ':' + occurrence;
+
+const incrementallyMaterializeLocal = (
+  node: Extract<QueryNode, { readonly kind: 'where' | 'select' | 'with-fields' | 'rename' | 'omit' | 'unnest' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const child = materializedNodes.get(node.input);
+  if (child === undefined || child.unavailable || child.result.completeness === 'unknown' || child.issues.length > 0 || previous?.local === undefined) {
+    return materializeQueryNode(node, snapshot, materializedNodes);
+  }
+  const segments: (readonly ScopedRow[])[] = [];
+  const inputs: ScopedRow[] = [];
+  const output: ScopedRow[] = [];
+  const issues: Issue[] = [];
+  let unavailable = false;
+  let previousPositions: ReadonlyMap<string, number> | undefined;
+  for (let index = 0; index < child.result.rows.length; index += 1) {
+    const row = child.result.rows[index] as ScopedRow;
+    const key = resultKey(row);
+    inputs.push(row);
+    let previousIndex = index;
+    const aligned = previous.local.inputs[index];
+    if (aligned === undefined || resultKey(aligned) !== key) {
+      previousPositions ??= new Map(previous.local.inputs.map((input, position) => [resultKey(input), position]));
+      previousIndex = previousPositions.get(key) ?? -1;
+    }
+    const retained = previousIndex >= 0 && previous.local.inputs[previousIndex] === row ? previous.local.segments[previousIndex] : undefined;
+    if (retained !== undefined) { segments.push(retained); output.push(...retained); continue; }
+    const overrides = new Map(materializedNodes);
+    overrides.set(node.input, { result: { rows: [row], completeness: child.result.completeness }, issues: [], unavailable: false });
+    const segment = evaluateMaterializedQueryNode(node, snapshot, overrides);
+    issues.push(...segment.issues);
+    unavailable = unavailable || segment.unavailable;
+    segments.push(segment.result.rows);
+    output.push(...segment.result.rows);
+  }
+  if (unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+  return {
+    result: { rows: output, completeness: child.result.completeness },
+    issues: [],
+    unavailable: false,
+    local: { inputs, segments }
+  };
+};
+
+const indexLocalSegments = (
+  node: Extract<QueryNode, { readonly kind: 'where' | 'select' | 'with-fields' | 'rename' | 'omit' | 'unnest' }>,
+  inputs: readonly ScopedRow[],
+  outputs: readonly ScopedRow[]
+): NonNullable<MaterializedQueryNode['local']> => {
+  const positions = new Map(inputs.map((row, index) => [resultKey(row), index]));
+  const segments = inputs.map(() => [] as ScopedRow[]);
+  for (const row of outputs) {
+    const key = node.kind === 'where' ? resultKey(row) : row.origin;
+    const index = key === undefined ? undefined : positions.get(key);
+    if (index !== undefined) (segments[index] as ScopedRow[]).push(row);
+  }
+  return { inputs, segments };
+};
+
+const isLocallyMaintainedNode = (node: QueryNode): node is Extract<QueryNode, { readonly kind: 'where' | 'select' | 'with-fields' | 'rename' | 'omit' | 'unnest' }> => {
+  if (node.kind === 'rename' || node.kind === 'omit') return true;
+  if (node.kind === 'where') return !containsSubquery(node.predicate);
+  if (node.kind === 'select' || node.kind === 'with-fields') return !Object.values(node.fields).some(containsSubquery);
+  return node.kind === 'unnest' && !containsSubquery(node.expression);
+};
+
+const containsSubquery = (expression: Expr): boolean => {
+  if (expression.kind === 'subquery') return true;
+  if (expression.kind === 'literal' || expression.kind === 'parameter' || expression.kind === 'field' || expression.kind === 'key-of' || expression.kind === 'source-of') return false;
+  if (expression.kind === 'compare' || expression.kind === 'arithmetic') return containsSubquery(expression.left) || containsSubquery(expression.right);
+  if (expression.kind === 'is-null' || expression.kind === 'is-missing') return containsSubquery(expression.value);
+  if (expression.kind === 'boolean') return expression.op === 'not' ? containsSubquery(expression.arg) : expression.args.some(containsSubquery);
+  if (expression.kind === 'case') return expression.branches.some(({ when, then }) => containsSubquery(when) || containsSubquery(then)) || containsSubquery(expression.otherwise);
+  if (expression.kind === 'record') return Object.values(expression.fields).some(containsSubquery);
+  const expressions = expression.kind === 'array' ? expression.items : expression.args;
+  return expressions.some(containsSubquery);
 };
 
 const maintainedQueryResult = (
@@ -1021,14 +1474,24 @@ const maintenanceState = (
 
 const emptyIncrementalQueryResultDelta: IncrementalQueryResultDelta = Object.freeze({ addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] });
 
-const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: MaterializedQueryNode): boolean => {
+const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: MaterializedQueryNode, values: WeakMap<ScopedRow, string>): boolean => {
   if (left.unavailable !== right.unavailable || left.result.completeness !== right.result.completeness) return false;
   if (left.issues.length !== right.issues.length || left.issues.some((issue, index) => issue.id !== right.issues[index]?.id)) return false;
   if (left.result.rows.length !== right.result.rows.length) return false;
-  return left.result.rows.every((row, index) => scopedRowIdentity(row) === scopedRowIdentity(right.result.rows[index] as ScopedRow));
+  return left.result.rows.every((row, index) => {
+    const candidate = right.result.rows[index] as ScopedRow;
+    return row === candidate || scopedRowIdentity(row, values) === scopedRowIdentity(candidate, values);
+  });
 };
 
-const scopedRowIdentity = (row: ScopedRow): string => resultKey(row) + '\u0000' + canonicalizeQueryValue(visibleRow(row));
+const scopedRowIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => resultKey(row) + '\u0000' + rowValueIdentity(row, values);
+const rowValueIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => {
+  const cached = values.get(row);
+  if (cached !== undefined) return cached;
+  const identity = canonicalizeQueryValue(visibleRow(row));
+  values.set(row, identity);
+  return identity;
+};
 
 const validateMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): readonly Issue[] => {
   return validateRelationInputs(snapshot.relations, 'incremental');
@@ -1055,56 +1518,107 @@ const validateRelationInputs = (inputs: readonly RelationInput[], mode: 'query' 
   return issues;
 };
 
-const validateMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): readonly Issue[] => {
-  const issues = [...validateMaintenanceSnapshot(next)];
-  if (!sameOptionalJson(previous.parameters, next.parameters) || !sameFunctionRegistry(previous.functions, next.functions)) {
-    issues.push(incrementalQueryIssue('query.incremental_session_input_changed', { reason: 'parameters_or_functions' }));
-    return issues;
+type AppliedMaintenanceUpdate = { readonly success: true; readonly value: QueryMaintenanceSnapshot } | { readonly success: false; readonly issues: readonly Issue[] };
+
+const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, update: QueryMaintenanceUpdate): AppliedMaintenanceUpdate => {
+  if (!sameOptionalJson(previous.basis, update.expectedBasis) || previous.membershipRevision !== update.expectedMembershipRevision) {
+    return rejectedMaintenanceUpdate('stale_update_basis');
   }
-  const previousRelations = relationInputMap(previous.relations);
-  const nextRelations = relationInputMap(next.relations);
-  if (previousRelations === undefined || nextRelations === undefined) return issues;
-  const identities = new Set([...previousRelations.keys(), ...nextRelations.keys()]);
-  for (const identity of identities) {
-    const before = previousRelations.get(identity);
-    const after = nextRelations.get(identity);
-    if (before === undefined || after === undefined) {
-      const candidate = before ?? after;
-      if (candidate !== undefined && candidate.rows.length > 0 && candidate.occurrenceIds === undefined && candidate.completeness !== 'unknown') {
-        issues.push(incrementalQueryIssue('query.incremental_identity_invalid', { relationId: candidate.relation.relationId, reason: 'relation_membership_changed' }));
+  let current: Map<string, IndexedRelationInput>;
+  try { current = new Map(indexedRelationInputs(previous.relations)); } catch { return rejectedMaintenanceUpdate('ambiguous_relation_input'); }
+  const changedInputs = new Set<string>();
+  for (const change of update.relations) {
+    const identity = relationInputKey({ relation: change.relation, rows: [], completeness: 'exact', ...(change.sourceId === undefined ? {} : { sourceId: change.sourceId }), ...(change.attachmentId === undefined ? {} : { attachmentId: change.attachmentId }) });
+    if (changedInputs.has(identity)) return rejectedMaintenanceUpdate('duplicate_relation_change', change.relation.relationId);
+    changedInputs.add(identity);
+    const existing = current.get(identity);
+    if (!sameRelationChangeState(existing, change.before)) return rejectedMaintenanceUpdate('stale_relation_change', change.relation.relationId);
+    const existingRows = existing?.input.rows ?? [];
+    const existingOccurrences = existing?.input.occurrenceIds ?? [];
+    if (existingRows.length !== existingOccurrences.length) return rejectedMaintenanceUpdate('invalid_occurrence_ids', change.relation.relationId);
+    const rowChanges = new Map<string, RelationRowChange>();
+    for (const rowChange of change.rows) {
+      if (rowChanges.has(rowChange.occurrenceId)) return rejectedMaintenanceUpdate('duplicate_occurrence_change', change.relation.relationId);
+      rowChanges.set(rowChange.occurrenceId, rowChange);
+    }
+    const inserted = change.rows.filter(({ before, after }) => before === undefined && after !== undefined).length;
+    const removed = change.rows.filter(({ before, after }) => before !== undefined && after === undefined).length;
+    const nextRows = new Array<QueryRecord | undefined>(existingRows.length + inserted - removed);
+    const nextOccurrences = new Array<string | undefined>(nextRows.length);
+    const consumedChanges = new Set<string>();
+    for (let index = 0; index < existingRows.length; index += 1) {
+      const occurrenceId = existingOccurrences[index] as string;
+      const row = existingRows[index] as QueryRecord;
+      const rowChange = rowChanges.get(occurrenceId);
+      if (rowChange === undefined) {
+        nextRows[index] = row;
+        nextOccurrences[index] = occurrenceId;
+        continue;
       }
+      consumedChanges.add(occurrenceId);
+      if (!sameIndexedRow({ index, row }, rowChange.before)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
+      if (rowChange.after !== undefined && !placeChangedRow(nextRows, nextOccurrences, occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('invalid_row_order', change.relation.relationId);
+    }
+    for (const rowChange of change.rows) {
+      if (consumedChanges.has(rowChange.occurrenceId)) continue;
+      if (rowChange.before !== undefined || rowChange.after === undefined || !placeChangedRow(nextRows, nextOccurrences, rowChange.occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
+    }
+    if (nextRows.some((row) => row === undefined) || nextOccurrences.some((occurrence) => occurrence === undefined)) return rejectedMaintenanceUpdate('invalid_row_order', change.relation.relationId);
+    if (change.after === undefined) {
+      if (nextRows.length > 0) return rejectedMaintenanceUpdate('relation_removal_incomplete', change.relation.relationId);
+      current.delete(identity);
       continue;
     }
-    if (relationRowsEqual(before, after) || before.completeness === 'unknown' || after.completeness === 'unknown') continue;
-    if (before.occurrenceIds === undefined || after.occurrenceIds === undefined) {
-      issues.push(incrementalQueryIssue('query.incremental_identity_invalid', { relationId: before.relation.relationId, reason: 'changed_rows_require_occurrence_ids' }));
-    }
+    const input: RelationInput = {
+      relation: change.relation,
+      rows: nextRows as QueryRecord[],
+      occurrenceIds: nextOccurrences as string[],
+      completeness: change.after.completeness,
+      ...(change.sourceId === undefined ? {} : { sourceId: change.sourceId }),
+      ...(change.attachmentId === undefined ? {} : { attachmentId: change.attachmentId }),
+      ...(change.after.basis === undefined ? {} : { basis: change.after.basis })
+    };
+    current.set(identity, { input, index: change.after.index });
   }
-  return deduplicateQueryIssues(issues);
+  const orderedInputs = [...current.values()].sort((left, right) => left.index - right.index);
+  if (orderedInputs.some(({ index }, expected) => index !== expected)) return rejectedMaintenanceUpdate('invalid_relation_order');
+  const value: QueryMaintenanceSnapshot = {
+    relations: orderedInputs.map(({ input }) => input),
+    ...(previous.parameters === undefined ? {} : { parameters: previous.parameters }),
+    ...(previous.functions === undefined ? {} : { functions: previous.functions }),
+    ...(update.basis === undefined ? {} : { basis: update.basis }),
+    ...(update.membershipRevision === undefined ? {} : { membershipRevision: update.membershipRevision })
+  };
+  const issues = validateMaintenanceSnapshot(value);
+  return issues.length === 0 ? { success: true, value } : { success: false, issues };
 };
 
-const relationInputMap = (relations: readonly RelationInput[]): ReadonlyMap<string, RelationInput> | undefined => {
-  const output = new Map<string, RelationInput>();
-  for (const relation of relations) {
-    const identity = relationInputKey(relation);
-    if (output.has(identity)) return undefined;
-    output.set(identity, relation);
-  }
-  return output;
+const sameRelationChangeState = (current: IndexedRelationInput | undefined, expected: RelationInputChange['before']): boolean => {
+  if (current === undefined || expected === undefined) return current === undefined && expected === undefined;
+  return current.index === expected.index && current.input.completeness === expected.completeness && sameOptionalJson(current.input.basis, expected.basis);
 };
 
-const changedRelationKeys = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): ReadonlySet<string> => {
-  const before = relationInputMap(previous.relations) ?? new Map();
-  const after = relationInputMap(next.relations) ?? new Map();
-  const changed = new Set<string>();
-  for (const identity of new Set([...before.keys(), ...after.keys()])) {
-    const left = before.get(identity);
-    const right = after.get(identity);
-    const input = left ?? right;
-    if (input !== undefined && (left === undefined || right === undefined || !relationInputEqual(left, right))) changed.add(relationKey(input.relation));
-  }
-  return changed;
+const sameIndexedRow = (current: { readonly index: number; readonly row: QueryRecord } | undefined, expected: RelationRowChange['before']): boolean => {
+  if (current === undefined || expected === undefined) return current === undefined && expected === undefined;
+  return current.index === expected.index && canonicalizeQueryValue(current.row) === canonicalizeQueryValue(expected.row);
 };
+
+const placeChangedRow = (
+  rows: (QueryRecord | undefined)[],
+  occurrences: (string | undefined)[],
+  occurrenceId: string,
+  changed: NonNullable<RelationRowChange['after']>
+): boolean => {
+  if (changed.index < 0 || changed.index >= rows.length || rows[changed.index] !== undefined || occurrences[changed.index] !== undefined) return false;
+  rows[changed.index] = changed.row;
+  occurrences[changed.index] = occurrenceId;
+  return true;
+};
+
+const rejectedMaintenanceUpdate = (reason: string, relationId?: string): AppliedMaintenanceUpdate => ({
+  success: false,
+  issues: [incrementalQueryIssue('query.incremental_identity_invalid', { reason, ...(relationId === undefined ? {} : { relationId }) })]
+});
 
 const changedRelationIds = (snapshot: QueryMaintenanceSnapshot, identities: ReadonlySet<string>): readonly string[] => {
   const byIdentity = groupRelationInputs(snapshot.relations);
@@ -1139,38 +1653,38 @@ const sameFunctionRegistry = (left: FunctionRegistry | undefined, right: Functio
 };
 
 const diffMaintainedResults = (
-  previous: IncrementalQueryResult,
-  nextRoot: MaterializedQueryNode | undefined
+  previousRoot: MaterializedQueryNode | undefined,
+  nextRoot: MaterializedQueryNode | undefined,
+  values: WeakMap<ScopedRow, string>
 ): IncrementalQueryResultDelta => {
   // Invalidation withdraws the current assertion; it does not prove removals.
   if (nextRoot === undefined || nextRoot.unavailable || nextRoot.result.completeness === 'unknown') return emptyIncrementalQueryResultDelta;
-  const nextRows = nextRoot.result.rows.map(visibleRow);
-  const nextKeys = nextRoot.result.rows.map(resultKey);
-  const previousBuckets = resultBuckets(previous.resultKeys, previous.rows);
-  const nextBuckets = resultBuckets(nextKeys, nextRows);
+  const beforeRows = previousRoot?.result.rows ?? [];
+  const afterRows = nextRoot.result.rows;
+  if (beforeRows.length === afterRows.length && beforeRows.every((row, index) => resultKey(row) === resultKey(afterRows[index] as ScopedRow))) {
+    const updatedResultKeys = beforeRows.flatMap((row, index) => {
+      const after = afterRows[index] as ScopedRow;
+      return row === after || rowValueIdentity(row, values) === rowValueIdentity(after, values) ? [] : [resultKey(row)];
+    });
+    return updatedResultKeys.length === 0 ? emptyIncrementalQueryResultDelta : { addedResultKeys: [], removedResultKeys: [], updatedResultKeys };
+  }
+  const previousRows = resultIdentityMap(beforeRows, values);
+  const nextRows = resultIdentityMap(afterRows, values);
   const added: string[] = [];
   const removed: string[] = [];
   const updated: string[] = [];
-  for (const key of new Set([...previousBuckets.keys(), ...nextBuckets.keys()])) {
-    const before = previousBuckets.get(key) ?? [];
-    const after = nextBuckets.get(key) ?? [];
-    if (after.length > before.length) added.push(key);
-    if (before.length > after.length) removed.push(key);
-    if (before.length === after.length && before.some((value, index) => value !== after[index])) updated.push(key);
+  for (const key of new Set([...previousRows.keys(), ...nextRows.keys()])) {
+    const before = previousRows.get(key);
+    const after = nextRows.get(key);
+    if (before === undefined) added.push(key);
+    else if (after === undefined) removed.push(key);
+    else if (before !== after) updated.push(key);
   }
   return { addedResultKeys: added.sort(), removedResultKeys: removed.sort(), updatedResultKeys: updated.sort() };
 };
 
-const resultBuckets = (keys: readonly string[], rows: readonly QueryRecord[]): ReadonlyMap<string, readonly string[]> => {
-  const output = new Map<string, string[]>();
-  keys.forEach((key, index) => {
-    const values = output.get(key) ?? [];
-    values.push(canonicalizeQueryValue(rows[index] as QueryRecord));
-    output.set(key, values);
-  });
-  for (const values of output.values()) values.sort();
-  return output;
-};
+const resultIdentityMap = (rows: readonly ScopedRow[], values: WeakMap<ScopedRow, string>): ReadonlyMap<string, string> =>
+  new Map(rows.map((row) => [resultKey(row), rowValueIdentity(row, values)]));
 
 const deduplicateQueryIssues = (issues: readonly Issue[]): readonly Issue[] => [...new Map(issues.map((issue) => [issue.id, issue])).values()];
 

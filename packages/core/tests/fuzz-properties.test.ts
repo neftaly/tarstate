@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  deriveQueryMaintenanceUpdate,
   evaluateQuery,
   openIncrementalQueryMaintenance,
   resolveLensPath,
@@ -56,7 +57,8 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         basis: { revisions: sources.map(({ revision }) => revision) },
         membershipRevision: 0
       });
-      const session = openIncrementalQueryMaintenance(plan, snapshot());
+      let accepted = snapshot();
+      const session = openIncrementalQueryMaintenance(plan, accepted);
       let previous = identityMap(session.getCurrentResult());
       for (let step = 0; step < 16; step += 1) {
         const source = sources[integer(sources.length)] as FuzzSource;
@@ -73,7 +75,8 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         }
         source.revision += 1;
         const next = snapshot();
-        const maintained = session.updateSnapshot(next);
+        const maintained = session.applyUpdate(deriveQueryMaintenanceUpdate(accepted, next));
+        accepted = next;
         expect(withoutState(maintained), 'run ' + run + ', step ' + step).toEqual(evaluateQuery({
           root: query,
           relations: next.relations,

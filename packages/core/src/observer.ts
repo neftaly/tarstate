@@ -13,6 +13,7 @@ import {
 import { createIssue, type Issue } from './issues.js';
 import type { PreparedPlan, SourceBasis } from './maintenance.js';
 import {
+  deriveQueryMaintenanceUpdate,
   openIncrementalQueryMaintenance,
   type FunctionRegistry,
   type IncrementalQueryResult,
@@ -428,10 +429,17 @@ class SharedObservation<Query, Row, Projection> {
 export const createIncrementalDatabaseQueryMaintenance = (
   functions?: FunctionRegistry
 ): CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> => ({ plan, initialInput }) => {
-  const session = openIncrementalQueryMaintenance(plan, queryMaintenanceSnapshot(initialInput, functions));
+  let accepted = queryMaintenanceSnapshot(initialInput, functions);
+  const session = openIncrementalQueryMaintenance(plan, accepted);
   return {
     getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult()),
-    updateInput: (input) => databaseResultFromMaintained(session.updateSnapshot(queryMaintenanceSnapshot(input as DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>, functions))),
+    updateInput: (input) => {
+      const next = queryMaintenanceSnapshot(input as DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>, functions);
+      const rejectedBefore = session.getCurrentResult().state.rejectedUpdateCount;
+      const result = session.applyUpdate(deriveQueryMaintenanceUpdate(accepted, next));
+      if (result.state.rejectedUpdateCount === rejectedBefore) accepted = next;
+      return databaseResultFromMaintained(result);
+    },
     close: () => session.close()
   };
 };
