@@ -1,8 +1,9 @@
-import { artifactSemanticValue, safeParseArtifactValue, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
+import { sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
 import type { QueryNode } from './query.js';
+import { safeParseTransactionArtifact } from './semantic-artifact-parsers.js';
 import {
   type CommitReceipt,
   type FieldEdit,
@@ -222,22 +223,27 @@ export class InMemoryAtomicSource {
     if (!attachment.writable) return reject([txIssue('transaction.authority_denied', 'commit', { attachmentId: attempt.attachmentId }, attempt, 'after_authority')]);
     let transaction: Transaction | undefined;
     if (isTransaction(attempt.transaction)) {
-      const parsed = await safeParseArtifactValue(attempt.transaction);
-      if (!parsed.success) return reject(parsed.issues);
       transaction = attempt.transaction;
     } else {
       transaction = await this.#resolveArtifact?.(attempt.transaction);
       if (transaction === undefined) return reject([txIssue('transaction.artifact_unavailable', 'resolve', { transactionHash }, attempt, 'after_refresh')]);
       if (transaction.contentHash !== attempt.transaction.contentHash || transaction.id !== attempt.transaction.id) return reject([txIssue('artifact.dependency_mismatch', 'resolve', { expected: attempt.transaction, actual: { id: transaction.id, contentHash: transaction.contentHash } }, attempt, 'after_input')]);
     }
-    const computedHash = await sha256Json(artifactSemanticValue(transaction));
-    if (computedHash !== transaction.contentHash) return reject([txIssue('artifact.hash_mismatch', 'parse', { expected: transaction.contentHash, actual: computedHash }, attempt, 'after_input')]);
-    if (!validTransactionBody(transaction.body)) return reject([txIssue('artifact.invalid_envelope', 'parse', { member: 'transaction.body' }, attempt, 'after_input')]);
+    const parsed = await safeParseTransactionArtifact(transaction);
+    if (!parsed.success) {
+      const parseReason = (issue: Issue): string | undefined => isRecord(issue.details) && typeof issue.details.reason === 'string' ? issue.details.reason : undefined;
+      if (!parsed.issues.every((issue) => parseReason(issue) === 'undeclared_parameter')) {
+        const issues = parsed.issues.map((issue) => parseReason(issue) === 'duplicate_returning_name'
+          ? txIssue('transaction.returning_name_duplicate', 'parse', { reason: 'duplicate_returning_name' }, attempt, 'after_input')
+          : issue);
+        return reject(issues);
+      }
+    } else {
+      transaction = parsed.value;
+    }
     if (transaction.body.schemaView.id !== attachment.schemaView.id || transaction.body.schemaView.contentHash !== attachment.schemaView.contentHash) return reject([txIssue('transaction.schema_view_unavailable', 'resolve', { schemaView: transaction.body.schemaView }, attempt, 'after_refresh')]);
     const unavailable = transaction.body.requiredCapabilities.filter((capabilityRef) => !this.#satisfiesCapability(capabilityRef));
     if (unavailable.length > 0) return reject([txIssue('transaction.capability_unavailable', 'resolve', { capabilities: unavailable }, attempt, 'after_capability')]);
-    const returningNames = transaction.body.returning?.map(({ name }) => name) ?? [];
-    if (new Set(returningNames).size !== returningNames.length) return reject([txIssue('transaction.returning_name_duplicate', 'parse', { names: returningNames }, attempt, 'after_input')]);
     return { attempt, transaction, attachment, intentHash };
   }
 
@@ -756,8 +762,6 @@ const intentHashFor = (attempt: TransactionAttempt, transactionHash: ContentHash
   ...(attempt.expectedBasis === undefined ? {} : { expectedBasis: attempt.expectedBasis }),
   authorityViewFingerprint: attachment.authorityViewFingerprint
 });
-
-const validTransactionBody = (body: Transaction['body']): boolean => isRecord(body) && isRecord(body.parameters) && Array.isArray(body.statements) && Array.isArray(body.guards) && Array.isArray(body.requiredCapabilities) && isRecord(body.schemaView);
 
 const isTransaction = (value: Transaction | ArtifactRef): value is Transaction => 'kind' in value && value.kind === 'transaction' && 'body' in value;
 

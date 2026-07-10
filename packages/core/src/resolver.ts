@@ -98,7 +98,7 @@ export class ResourceResolver {
         (resolved) => {
           if (this.#inflight.get(key) !== pending) return;
           this.#inflight.delete(key);
-          this.#remember(key, resolved);
+          if (resolved.state !== 'loading') this.#remember(key, resolved);
         },
         () => {
           if (this.#inflight.get(key) === pending) this.#inflight.delete(key);
@@ -164,10 +164,24 @@ export class ResourceResolver {
       if (result.state === 'redirect') {
         accumulatedIssues.push(...(result.issues ?? []));
         redirects.push(current.uri);
-        current = result.target;
+        if (current.integrity !== undefined && result.target.integrity !== undefined && current.integrity !== result.target.integrity) {
+          return resolution(reference, current, redirects, 'failed', 'none', undefined, [
+            ...accumulatedIssues,
+            resolverIssue('resolver.integrity_mismatch', 'after_refresh', { expected: current.integrity, actual: result.target.integrity })
+          ]);
+        }
+        current = current.integrity === undefined ? result.target : { ...result.target, integrity: current.integrity };
         continue;
       }
-      const resolved = result.resolved ?? current;
+      const driverResolved = result.resolved ?? current;
+      if (current.integrity !== undefined && driverResolved.integrity !== undefined && current.integrity !== driverResolved.integrity) {
+        return resolution(reference, current, redirects, 'failed', 'none', undefined, [
+          ...accumulatedIssues,
+          ...(result.issues ?? []),
+          resolverIssue('resolver.integrity_mismatch', 'after_refresh', { expected: current.integrity, actual: driverResolved.integrity })
+        ]);
+      }
+      const resolved = current.integrity === undefined ? driverResolved : { ...driverResolved, integrity: current.integrity };
       if (result.state === 'ready' && resolved.integrity !== undefined && result.contentHash !== resolved.integrity) {
         return resolution(reference, resolved, redirects, 'failed', 'none', undefined, [
           ...accumulatedIssues,

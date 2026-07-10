@@ -159,7 +159,7 @@ export class AttachmentCatalog {
     entry.leases += 1;
     let closed = false;
     return {
-      attachment,
+      attachment: entry.attachment as DatabaseAttachment<Storage, Projection>,
       close: () => {
         if (closed) return;
         closed = true;
@@ -211,23 +211,30 @@ const freezeDataset = (snapshot: DatasetSnapshot): DatasetSnapshot => Object.fre
   members: Object.freeze([...snapshot.members])
 });
 
-const sameAttachment = (left: {
+type ComparableAttachment = {
   readonly attachmentId: string;
   readonly incarnation: string;
   readonly sourceId: string;
   readonly source: object;
   readonly authorityScope: string;
-}, right: {
-  readonly attachmentId: string;
-  readonly incarnation: string;
-  readonly sourceId: string;
-  readonly source: object;
-  readonly authorityScope: string;
-}): boolean =>
+  readonly writable: boolean;
+  readonly schemaViewIds: readonly string[];
+  readonly discoveryEdges: readonly string[];
+  readonly project: unknown;
+};
+
+const sameAttachment = (left: ComparableAttachment, right: ComparableAttachment): boolean =>
   left === right || (
     left.attachmentId === right.attachmentId &&
     left.incarnation === right.incarnation &&
     left.sourceId === right.sourceId &&
     left.source === right.source &&
-    left.authorityScope === right.authorityScope
+    left.authorityScope === right.authorityScope &&
+    left.writable === right.writable &&
+    sameStrings(left.schemaViewIds, right.schemaViewIds) &&
+    sameStrings(left.discoveryEdges, right.discoveryEdges) &&
+    left.project === right.project
   );
+
+const sameStrings = (left: readonly string[], right: readonly string[]): boolean =>
+  left.length === right.length && left.every((value, index) => value === right[index]);

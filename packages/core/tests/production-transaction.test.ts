@@ -16,8 +16,8 @@ const queryRoot = (alias: string): QueryNode => ({ kind: 'values', alias, rows: 
 const listCapability = { id: 'urn:test:capability:list-splice', version: '1', contractHash: hash('d') };
 const rekeyCapability = { id: 'urn:test:capability:rekey', version: '1', contractHash: hash('e') };
 
-const transaction = (statements: readonly WriteStatement[], parameters: TransactionBody['parameters'] = {}, guards: TransactionBody['guards'] = []): Promise<Transaction> => sealTransaction({
-  body: { schemaView, parameters, statements, guards, requiredCapabilities: [] }
+const transaction = (statements: readonly WriteStatement[], parameters: TransactionBody['parameters'] = {}, guards: TransactionBody['guards'] = [], requiredCapabilities: TransactionBody['requiredCapabilities'] = []): Promise<Transaction> => sealTransaction({
+  body: { schemaView, parameters, statements, guards, requiredCapabilities }
 });
 
 const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult } = {}) => new InMemoryAtomicSource({
@@ -154,9 +154,29 @@ describe('production in-memory transaction coordinator', () => {
     const moveCapability = { id: 'urn:test:capability:move', version: '1', contractHash: hash('e') };
     const value = await transaction([{
       kind: 'statement.move', target: { relation, alias: 'item' }, parent: literal('archive'), position: { kind: 'end' }, missingAnchor: 'reject', requires: moveCapability
-    }]);
+    }], {}, [], [moveCapability]);
     expect(await memory.commit(attempt('move-unsupported', value))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.capability_unavailable' }] });
     expect(memory.snapshot().basis.revision).toBe(0);
+  });
+
+  it('rejects embedded capability use omitted from required capabilities', async () => {
+    const memory = source({ state: { items: [{ id: 1, tags: [] }] } });
+    const undeclared = await sealTransaction({ body: {
+      schemaView,
+      parameters: {},
+      statements: [{
+        kind: 'statement.update',
+        target: { relation, alias: 'item' },
+        edits: { tags: { kind: 'edit.list-splice', index: literal(0), deleteCount: literal(0), values: [literal('injected')], requires: listCapability } }
+      }],
+      guards: [],
+      requiredCapabilities: []
+    } });
+    expect(await memory.commit(attempt('undeclared-capability', undeclared))).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'transaction.artifact_invalid', details: { reason: 'undeclared_capability' } }]
+    });
+    expect(memory.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [{ id: 1, tags: [] }] } });
   });
 
   it('rekeys an exact target and reports exact affected counts', async () => {
@@ -164,7 +184,7 @@ describe('production in-memory transaction coordinator', () => {
     const rekey = await transaction([{
       kind: 'statement.rekey', target: { relation, alias: 'item', where: { kind: 'compare', op: 'eq', left: field('id'), right: literal(1) } },
       key: { id: literal(7) }, references: 'source-local-declared', requires: rekeyCapability
-    }], {}, [{ kind: 'guard.affected-count', statementIndex: 0, count: 'logicallyChanged', op: 'eq', value: 1 }]);
+    }], {}, [{ kind: 'guard.affected-count', statementIndex: 0, count: 'logicallyChanged', op: 'eq', value: 1 }], [rekeyCapability]);
     expect(await one.commit(attempt('rekey-success', rekey))).toMatchObject({
       outcome: 'committed', statementResults: [{ matched: 1, logicallyChanged: 1, editOutcomes: [{ edit: 'rekey', mechanism: rekeyCapability, preservationLosses: [] }] }]
     });
@@ -176,7 +196,7 @@ describe('production in-memory transaction coordinator', () => {
     const collision = await transaction([{
       kind: 'statement.rekey', target: { relation, alias: 'item', where: { kind: 'compare', op: 'eq', left: field('id'), right: literal(1) } },
       key: { id: literal(2) }, references: 'source-local-declared', requires: rekeyCapability
-    }]);
+    }], {}, [], [rekeyCapability]);
     expect(await collisionSource.commit(attempt('rekey-collision', collision))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.rekey_collision' }] });
     expect(collisionSource.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [{ id: 1 }, { id: 2 }] } });
 
@@ -184,7 +204,7 @@ describe('production in-memory transaction coordinator', () => {
     const ambiguous = await transaction([{
       kind: 'statement.rekey', target: { relation, alias: 'item', where: { kind: 'compare', op: 'eq', left: field('id'), right: literal(1) } },
       key: { id: literal(3) }, references: 'source-local-declared', requires: rekeyCapability
-    }]);
+    }], {}, [], [rekeyCapability]);
     expect(await ambiguousSource.commit(attempt('rekey-ambiguous', ambiguous))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 2 }], issues: [{ code: 'transaction.rekey_target_ambiguous' }] });
     expect(ambiguousSource.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [{ id: 1 }, { id: 1 }] } });
   });
@@ -205,14 +225,14 @@ describe('production in-memory transaction coordinator', () => {
     const target = { relation: parentRelation, alias: 'parent', where: { kind: 'compare' as const, op: 'eq' as const, left: { kind: 'field' as const, alias: 'parent', name: 'id' }, right: literal(1) } };
     const reject = await transaction([{
       kind: 'statement.rekey', target, key: { tenantId: literal('b'), id: literal(2) }, references: 'reject-if-referenced', requires: rekeyCapability
-    }]);
+    }], {}, [], [rekeyCapability]);
     const blocked = source({ state: initial, relations });
     expect(await blocked.commit(attempt('rekey-referenced', reject))).toMatchObject({ outcome: 'rejected', statementResults: [{ matched: 1 }], issues: [{ code: 'transaction.rekey_referenced' }] });
     expect(blocked.snapshot()).toMatchObject({ basis: { revision: 0 }, state: initial });
 
     const rewrite = await transaction([{
       kind: 'statement.rekey', target, key: { tenantId: literal('b'), id: literal(2) }, references: 'source-local-declared', requires: rekeyCapability
-    }], {}, [{ kind: 'guard.affected-count', statementIndex: 0, count: 'logicallyChanged', op: 'eq', value: 3 }]);
+    }], {}, [{ kind: 'guard.affected-count', statementIndex: 0, count: 'logicallyChanged', op: 'eq', value: 3 }], [rekeyCapability]);
     const rewritten = source({ state: initial, relations });
     expect(await rewritten.commit(attempt('rekey-rewrite', rewrite))).toMatchObject({ outcome: 'committed', statementResults: [{ matched: 1, logicallyChanged: 3 }] });
     expect(rewritten.snapshot().state).toEqual({
@@ -292,7 +312,7 @@ describe('production in-memory transaction coordinator', () => {
     const list = await transaction([{
       kind: 'statement.update', target: { relation, alias: 'item' },
       edits: { tags: { kind: 'edit.list-splice', index: literal(1), deleteCount: literal(0), values: [literal('b')], requires: listCapability } }
-    }]);
+    }], {}, [], [listCapability]);
     expect(await memory.commit(attempt('list', list))).toMatchObject({ outcome: 'committed', statementResults: [{ editOutcomes: [{ edit: 'list' }] }] });
     expect(memory.snapshot().state.items?.[0]?.tags).toEqual(['a', 'b']);
   });

@@ -173,6 +173,22 @@ const relationalPlan = (): PreparedPlan<QueryNode> => ({
 });
 
 describe('database membership and observation', () => {
+  it('rejects duplicate attachment IDs whose authority view or projection differs', () => {
+    const source = new TestSource('source:one', []);
+    const catalog = new AttachmentCatalog();
+    const firstInput = attachment('attachment:one', source);
+    const first = catalog.attach(firstInput);
+    const duplicate = catalog.attach(firstInput);
+    expect(duplicate.attachment).toBe(first.attachment);
+    expect(() => catalog.attach({
+      ...firstInput,
+      preparation: { ...firstInput.preparation, writable: !firstInput.preparation.writable }
+    })).toThrow(/different live attachment/);
+    expect(() => catalog.attach(attachment('attachment:one', source))).toThrow(/different live attachment/);
+    duplicate.close();
+    first.close();
+  });
+
   it('publishes membership only when its semantic state changes', () => {
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'open' });
     const listener = vi.fn();
@@ -472,6 +488,32 @@ describe('database membership and observation', () => {
 });
 
 describe('resource resolver', () => {
+  it('preserves integrity pins across driver aliases and does not cache loading results', async () => {
+    const calls = vi.fn();
+    const resolver = new ResourceResolver({ authority: { permits: () => true } });
+    resolver.register('mem', {
+      resolve: async (reference) => {
+        calls(reference.uri);
+        if (reference.uri === 'mem:loading') return { state: 'loading', freshness: 'none' };
+        return {
+          state: 'ready',
+          resolved: { uri: reference.uri, kind: reference.kind },
+          freshness: 'current',
+          value: 'unverified',
+          contentHash: `sha256:${'b'.repeat(64)}`
+        };
+      }
+    });
+    const pinned: ResourceRef = { uri: 'mem:pinned', kind: 'data', integrity: `sha256:${'a'.repeat(64)}` };
+    expect(await resolver.resolve(pinned, { authorityScope: 'public' })).toMatchObject({
+      state: 'failed',
+      issues: [{ code: 'resolver.integrity_mismatch' }]
+    });
+    await resolver.resolve({ uri: 'mem:loading', kind: 'data' }, { authorityScope: 'public' });
+    await resolver.resolve({ uri: 'mem:loading', kind: 'data' }, { authorityScope: 'public' });
+    expect(calls.mock.calls.filter(([uri]) => uri === 'mem:loading')).toHaveLength(2);
+  });
+
   it('scopes caches by authority, follows redirects, detects cycles, and never invokes denied drivers', async () => {
     const calls = vi.fn();
     const resolver = new ResourceResolver({ authority: { permits: (scope, reference) => scope === 'admin' || !reference.uri.includes('secret') } });
