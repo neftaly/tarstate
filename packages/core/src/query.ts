@@ -84,13 +84,13 @@ export type QueryNode =
   | { readonly kind: 'recursion-ref'; readonly name: string }
   | { readonly kind: 'recursive'; readonly name: string; readonly seed: QueryNode; readonly step: QueryNode; readonly key: readonly Expr[]; readonly maxIterations?: number; readonly maxRows?: number };
 
-/** Basis-bound seek position. Live cursors reject basis drift; pinned cursors retain their captured basis. */
+/** Basis-bound seek position. Cursors reject basis or dataset-membership drift. */
 export type QueryCursor = {
   readonly order: readonly JsonValue[];
   readonly resultKey: string;
   readonly basis: JsonValue;
   readonly membershipRevision: number;
-  readonly mode: 'live' | 'pinned';
+  readonly mode: 'live';
 };
 
 export type QueryRequest = {

@@ -27,4 +27,27 @@ describe('portable constraints and referential actions', () => {
     expect(cascade).toMatchObject({ edits: [{ handle: 'child:1', kind: 'delete' }, { handle: 'note:1', kind: 'set-null' }], issues: [] });
     expect(expandReferentialDeletes({ deleted: [rows[0] as typeof rows[number]], rows, actions: [{ id: 'restrict', parentRelationId: 'parents', childRelationId: 'children', policy: 'restrict', childFields: ['parentId'] }] })).toMatchObject({ edits: [], issues: [{ code: 'constraint.delete_restricted' }] });
   });
+
+  it('matches composite referential keys and rejects invalid or partially blocked expansion', () => {
+    const parent = { handle: 'parent:composite', relationId: 'parents', key: ['tenant', 1], fields: {} };
+    const child = { handle: 'child:composite', relationId: 'children', key: 2, fields: { tenantId: 'tenant', parentId: 1 } };
+    expect(expandReferentialDeletes({
+      deleted: [parent],
+      rows: [parent, child],
+      actions: [{ id: 'composite', parentRelationId: 'parents', childRelationId: 'children', policy: 'cascade', childFields: ['tenantId', 'parentId'] }]
+    })).toMatchObject({ edits: [{ handle: 'child:composite', kind: 'delete' }], issues: [] });
+    expect(expandReferentialDeletes({
+      deleted: [parent],
+      rows: [parent, child],
+      actions: [{ id: 'empty', parentRelationId: 'parents', childRelationId: 'children', policy: 'cascade', childFields: [] }]
+    })).toMatchObject({ edits: [], issues: [{ code: 'constraint.referential_action_invalid' }] });
+    expect(expandReferentialDeletes({
+      deleted: [parent],
+      rows: [parent, child],
+      actions: [
+        { id: 'cascade', parentRelationId: 'parents', childRelationId: 'children', policy: 'cascade', childFields: ['tenantId', 'parentId'] },
+        { id: 'restrict', parentRelationId: 'parents', childRelationId: 'children', policy: 'restrict', childFields: ['tenantId', 'parentId'] }
+      ]
+    })).toMatchObject({ edits: [], issues: [{ code: 'constraint.delete_restricted' }] });
+  });
 });

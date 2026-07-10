@@ -162,6 +162,17 @@ describe('production foundation', () => {
     expect(await downgraded.fingerprint()).not.toBe(await upgraded.fingerprint());
   });
 
+  it('closes host runtimes once and cannot be resurrected by stale leases', () => {
+    const host = new HostRuntimeRegistry({ trustPolicyId: 'host:closed' });
+    const close = vi.fn();
+    const lease = host.acquire({ sourceId: 'source:closed', identity: {}, create: () => ({ runtime: {}, close }) });
+    host.close();
+    host.close();
+    lease.release();
+    expect(close).toHaveBeenCalledOnce();
+    expect(() => host.acquire({ sourceId: 'source:new', identity: {}, create: () => ({ runtime: {}, close }) })).toThrow(/closed/);
+  });
+
 });
 
 const _jsonValueFixture: JsonValue = { ok: true };

@@ -8,10 +8,13 @@ import {
   relationLiteral,
   referenceTo,
   schemaLiteral,
+  typedAnd,
   typedCompare,
   typedFieldEdit,
   typedFrom,
   typedJoin,
+  typedIsNull,
+  typedOrderBy,
   typedMove,
   typedParameter,
   typedPreparedPlan,
@@ -19,6 +22,7 @@ import {
   typedRekey,
   typedReturning,
   typedSelect,
+  typedSourceOf,
   typedWhere,
   type PreparedPlanParameters,
   type QueryParametersOf,
@@ -152,6 +156,22 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<QueryParametersOf<typeof query>>().toEqualTypeOf<{ readonly account: readonly [string, number] }>();
     expectTypeOf<QueryResultRowOf<typeof query>>().toEqualTypeOf<{ readonly id: string; readonly account: readonly [string, number] }>();
     expectTypeOf<PreparedPlanParameters<typeof prepared>>().toEqualTypeOf<{ readonly account: readonly [string, number] }>();
+  });
+
+  it('authors nullable filters, boolean composition, ordering, and source provenance without losing types', () => {
+    const query = typedWhere(author, (aliases) => typedAnd(
+      typedIsNull(aliases.author.row.biography),
+      typedCompare('gte', aliases.author.row.score, typedParameter('minimum', { kind: 'integer' }))
+    ));
+    const ordered = typedOrderBy(query, (aliases) => [{ value: aliases.author.row.name, direction: 'asc' }]);
+    const result = typedSelect(ordered, 'result', (aliases) => ({
+      name: aliases.author.row.name,
+      source: typedSourceOf(aliases.author)
+    }));
+
+    expect(result.root).toMatchObject({ kind: 'select', input: { kind: 'order', input: { kind: 'where' } } });
+    expectTypeOf<QueryParametersOf<typeof result>>().toEqualTypeOf<{ readonly minimum: number }>();
+    expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly source: string }>();
   });
 
   it('preserves exact query evidence through more than ten pipeline operators', () => {

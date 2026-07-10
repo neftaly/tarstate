@@ -18,7 +18,7 @@ export type ConstraintFailure = {
 export type ConstraintEvaluation =
   | { readonly status: 'satisfied' }
   | { readonly status: 'violated'; readonly violations: readonly ConstraintFailure[] }
-  | { readonly status: 'indeterminate'; readonly failures: readonly ConstraintFailure[]; readonly issues?: readonly Issue[] };
+  | { readonly status: 'indeterminate'; readonly failures: readonly [ConstraintFailure, ...ConstraintFailure[]]; readonly issues?: readonly Issue[] };
 
 export type SourceConstraint<State> = {
   readonly id: string;
@@ -61,8 +61,8 @@ export const checkFinalConstraints = <State>(input: {
         issues: [constraintIssue('constraint.evaluation_failed', constraint.id, 'error', { error: error instanceof Error ? error.name : typeof error }, constraint.id + ':evaluation')]
       };
     }
-    const previous = new Map(failuresOf(before).map((failure) => [failure.id, failure]));
-    const current = failuresOf(after);
+    const previous = new Map(failuresOf(before, constraint.id).map((failure) => [failure.id, failure]));
+    const current = failuresOf(after, constraint.id);
     const dependencyTouched = constraint.dependencyRelations.some((relationId) => input.touchedRelations.has(relationId));
     const rejected = current.filter((failure) => {
       const wasPresent = previous.has(failure.id);
@@ -85,11 +85,12 @@ export const checkFinalConstraints = <State>(input: {
   return { blockingIssues, auditIssues };
 };
 
-const failuresOf = (evaluation: ConstraintEvaluation): readonly ConstraintFailure[] => evaluation.status === 'satisfied'
-  ? []
-  : evaluation.status === 'violated'
-    ? evaluation.violations
-    : evaluation.failures;
+const failuresOf = (evaluation: ConstraintEvaluation, constraintId: string): readonly ConstraintFailure[] => {
+  if (evaluation.status === 'satisfied') return [];
+  if (evaluation.status === 'violated') return evaluation.violations;
+  const failures = evaluation.failures as readonly ConstraintFailure[];
+  return failures.length > 0 ? failures : [{ id: constraintId + ':indeterminate', subject: { scopeId: constraintId }, code: 'constraint.indeterminate' }];
+};
 
 const constraintIssue = (code: string, constraintId: string, severity: IssueSeverity, details: JsonValue, stableFailureId: string): Issue => {
   const issue = createIssue({

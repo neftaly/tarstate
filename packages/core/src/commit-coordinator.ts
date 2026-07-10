@@ -30,26 +30,40 @@ export const coordinateSourceCommit = async <Storage, Command>(input: {
     return { outcome: 'rejected', issues: [createIssue({ code: 'source.not_ready', phase: 'load', severity: 'error', retry: 'after_refresh', sourceId: input.source.sourceId, details: { state: snapshot.state } })] };
   }
   const issues: Issue[] = [];
-  const plans = [...input.bindings].sort((left, right) => comparePortableStrings(left.id, right.id)).map((binding) => {
-    const plan = binding.plan(snapshot, input.edits);
+  const plans: PlanResult<Command>[] = [];
+  for (const binding of [...input.bindings].sort((left, right) => comparePortableStrings(left.id, right.id))) {
+    let plan: PlanResult<Command>;
+    try {
+      plan = binding.plan(snapshot, input.edits);
+    } catch (error) {
+      return { outcome: 'rejected', issues: [createIssue({ code: 'binding.plan_failed', sourceId: input.source.sourceId, details: { bindingId: binding.id, error: error instanceof Error ? error.name : typeof error } })] };
+    }
     issues.push(...plan.issues);
     requireContained(input.source, binding.id, 'read', plan.readFootprint, binding.declaredReadFootprint, issues);
     requireContained(input.source, binding.id, 'write', plan.writeFootprint, binding.declaredWriteFootprint, issues);
     for (const intent of plan.intents) requireContained(input.source, binding.id, 'intent', intent.footprint, plan.writeFootprint, issues);
-    return plan;
-  });
-  if (issues.length > 0) return { outcome: 'rejected', issues };
+    plans.push(plan);
+  }
+  if (hasErrors(issues)) return { outcome: 'rejected', issues };
   const merged = input.source.mergeIntents(plans);
   if (merged.outcome !== 'merged') return { outcome: 'rejected', issues: merged.issues };
-  const staged = input.source.stage(snapshot, merged.commands);
+  let staged: ReturnType<AtomicSource<Storage, Command>['stage']>;
+  try {
+    staged = input.source.stage(snapshot, merged.commands);
+  } catch (error) {
+    return { outcome: 'rejected', issues: [...issues, createIssue({ code: 'binding.stage_failed', sourceId: input.source.sourceId, details: { error: error instanceof Error ? error.name : typeof error } })] };
+  }
   issues.push(...staged.issues);
-  if (issues.length === 0 && input.validate !== undefined) {
+  if (!hasErrors(issues) && input.validate !== undefined) {
     issues.push(...input.validate({ snapshot: { ...snapshot, storage: staged.storage }, plans }));
   }
-  if (issues.length > 0) return { outcome: 'rejected', issues };
+  if (hasErrors(issues)) return { outcome: 'rejected', issues };
   const result = await input.source.commit({ ...input.commit, commands: merged.commands });
-  return result.outcome === 'rejected' ? { outcome: 'rejected', issues: result.issues } : result;
+  const combined = issues.length === 0 ? result : { ...result, issues: [...issues, ...result.issues] };
+  return combined.outcome === 'rejected' ? { outcome: 'rejected', issues: combined.issues } : combined;
 };
+
+const hasErrors = (issues: readonly Issue[]): boolean => issues.some(({ severity }) => severity === 'error');
 
 const requireContained = <Storage, Command>(
   source: AtomicSource<Storage, Command>,

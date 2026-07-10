@@ -195,13 +195,15 @@ export const parseRelationCandidates = (
     group.push(row);
     byKey.set(fingerprint, group);
   }
+  let duplicateKeys = false;
   for (const duplicates of byKey.values()) {
     if (duplicates.length < 2) continue;
+    duplicateKeys = true;
     for (const duplicate of duplicates) {
       issues.push(contextualIssue('schema.duplicate_key', prepared.declaration.relationId, { ...context, locator: duplicate.locator }, [], { count: duplicates.length }, duplicate.key));
     }
   }
-  return { rows, rejected, issues, completeness: rejected.length === 0 ? 'exact' : 'unknown' };
+  return { rows, rejected, issues, completeness: rejected.length === 0 && !duplicateKeys ? 'exact' : 'unknown' };
 };
 
 export const parseLogicalKey = (

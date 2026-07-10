@@ -134,6 +134,9 @@ export type TypedExpression<Value, Parameters extends Readonly<Record<string, Va
 
 type ExpressionValue<Expression> = Expression extends TypedExpression<infer Value, Readonly<Record<string, ValueDeclaration>>> ? Value : never;
 type ExpressionParameters<Expression> = Expression extends TypedExpression<unknown, infer Parameters> ? Parameters : {};
+type AnyTypedExpression = TypedExpression<unknown, Readonly<Record<string, ValueDeclaration>>>;
+type ParameterRecord<Value> = Value extends Readonly<Record<string, ValueDeclaration>> ? Value : never;
+type ParametersOfExpressions<Expressions extends readonly AnyTypedExpression[]> = ParameterRecord<Simplify<UnionToIntersection<ExpressionParameters<Expressions[number]>>>>;
 
 export type TypedAlias<Name extends string, Row> = {
   readonly name: Name;
@@ -193,6 +196,18 @@ export const typedCompare = <Left, Right, LeftParameters extends Readonly<Record
   parameterDeclarations: { ...left.parameterDeclarations, ...right.parameterDeclarations } as Simplify<LeftParameters & RightParameters>
 });
 
+type BooleanExpression = TypedExpression<boolean, Readonly<Record<string, ValueDeclaration>>>;
+const typedBoolean = <const Expressions extends readonly [BooleanExpression, ...BooleanExpression[]]>(op: 'and' | 'or', expressions: Expressions): TypedExpression<boolean, ParametersOfExpressions<Expressions>> => ({
+  expression: { kind: 'boolean', op, args: expressions.map(({ expression }) => expression) },
+  parameterDeclarations: Object.assign({}, ...expressions.map(({ parameterDeclarations }) => parameterDeclarations)) as ParametersOfExpressions<Expressions>
+});
+export const typedAnd = <const Expressions extends readonly [BooleanExpression, ...BooleanExpression[]]>(...expressions: Expressions): TypedExpression<boolean, ParametersOfExpressions<Expressions>> => typedBoolean('and', expressions);
+export const typedOr = <const Expressions extends readonly [BooleanExpression, ...BooleanExpression[]]>(...expressions: Expressions): TypedExpression<boolean, ParametersOfExpressions<Expressions>> => typedBoolean('or', expressions);
+export const typedNot = <Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<boolean, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'boolean', op: 'not', arg: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
+export const typedIsNull = <Value, Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<Value, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'is-null', value: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
+export const typedIsMissing = <Value, Parameters extends Readonly<Record<string, ValueDeclaration>>>(expression: TypedExpression<Value, Parameters>): TypedExpression<boolean, Parameters> => ({ expression: { kind: 'is-missing', value: expression.expression }, parameterDeclarations: expression.parameterDeclarations });
+export const typedSourceOf = <Name extends string, Row>(alias: TypedAlias<Name, Row>): TypedExpression<string> => ({ expression: { kind: 'source-of', alias: alias.name }, parameterDeclarations: {} });
+
 const applyTypedWhere = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, PredicateParameters extends Readonly<Record<string, ValueDeclaration>>>(
   query: TypedQuery<Aliases, QueryParameters, Row>,
   expression: TypedExpression<boolean, PredicateParameters>
@@ -226,6 +241,44 @@ export function typedWhere(
 ): unknown {
   if ('root' in queryOrPredicate) return applyTypedWhere(queryOrPredicate, predicate!(queryOrPredicate.aliases));
   return (query: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>) => applyTypedWhere(query, queryOrPredicate);
+}
+
+export type TypedOrderTerm<Parameters extends Readonly<Record<string, ValueDeclaration>> = Readonly<Record<string, ValueDeclaration>>> = {
+  readonly value: TypedExpression<unknown, Parameters>;
+  readonly direction: 'asc' | 'desc';
+  readonly nulls?: 'first' | 'last';
+};
+type AnyTypedOrderTerm = TypedOrderTerm<Readonly<Record<string, ValueDeclaration>>>;
+type ParametersOfOrder<Terms extends readonly AnyTypedOrderTerm[]> = ParametersOfExpressions<{ readonly [Index in keyof Terms]: Terms[Index]['value'] }>;
+const applyTypedOrderBy = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, const Terms extends readonly [AnyTypedOrderTerm, ...AnyTypedOrderTerm[]]>(
+  query: TypedQuery<Aliases, QueryParameters, Row>,
+  terms: Terms
+): TypedQuery<Aliases, Simplify<QueryParameters & ParametersOfOrder<Terms>>, Row> => ({
+  ...query,
+  root: { kind: 'order', input: query.root, by: terms.map(({ value, direction, nulls }) => ({ value: value.expression, direction, ...(nulls === undefined ? {} : { nulls }) })) },
+  parameterDeclarations: Object.assign({}, query.parameterDeclarations, ...terms.map(({ value }) => value.parameterDeclarations)) as Simplify<QueryParameters & ParametersOfOrder<Terms>>
+});
+
+interface TypedOrderByPipe<Terms extends readonly [AnyTypedOrderTerm, ...AnyTypedOrderTerm[]]> extends PipeType {
+  readonly accepts: this['input'] extends TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown> ? true : false;
+  readonly output: this['input'] extends TypedQuery<infer Aliases, infer QueryParameters, infer Row>
+    ? TypedQuery<Aliases, Simplify<QueryParameters & ParametersOfOrder<Terms>>, Row>
+    : never;
+}
+
+export function typedOrderBy<const Terms extends readonly [AnyTypedOrderTerm, ...AnyTypedOrderTerm[]]>(
+  terms: Terms
+): (<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row>(query: TypedQuery<Aliases, QueryParameters, Row>) => TypedQuery<Aliases, Simplify<QueryParameters & ParametersOfOrder<Terms>>, Row>) & PipeOperator<TypedOrderByPipe<Terms>>;
+export function typedOrderBy<Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, Row, const Terms extends readonly [AnyTypedOrderTerm, ...AnyTypedOrderTerm[]]>(
+  query: TypedQuery<Aliases, QueryParameters, Row>,
+  order: (aliases: Aliases) => Terms
+): TypedQuery<Aliases, Simplify<QueryParameters & ParametersOfOrder<Terms>>, Row>;
+export function typedOrderBy(
+  queryOrTerms: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown> | readonly [AnyTypedOrderTerm, ...AnyTypedOrderTerm[]],
+  order?: (aliases: TypedAliases) => readonly [AnyTypedOrderTerm, ...AnyTypedOrderTerm[]]
+): unknown {
+  if ('root' in queryOrTerms) return applyTypedOrderBy(queryOrTerms, order!(queryOrTerms.aliases));
+  return (query: TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>) => applyTypedOrderBy(query, queryOrTerms);
 }
 
 type FieldExpressionRecord = Readonly<Record<string, TypedExpression<unknown, Readonly<Record<string, ValueDeclaration>>>>>;

@@ -83,7 +83,17 @@ export const expandReferentialDeletes = (input: {
   while (queue.length > 0) {
     const parent = queue.shift() as ReferentialRow;
     for (const action of input.actions.filter(({ parentRelationId }) => parentRelationId === parent.relationId)) {
-      const children = input.rows.filter((row) => row.relationId === action.childRelationId && action.childFields.length === 1 && canonicalizeJson(row.fields[action.childFields[0] as string] ?? null) === canonicalizeJson(parent.key));
+      if (action.childFields.length === 0) {
+        issues.push(createIssue({ code: 'constraint.referential_action_invalid', relationId: action.childRelationId, details: { actionId: action.id, reason: 'child_fields_empty' } }));
+        continue;
+      }
+      const children = input.rows.filter((row) => {
+        if (row.relationId !== action.childRelationId) return false;
+        const childKey = action.childFields.length === 1
+          ? row.fields[action.childFields[0] as string] ?? null
+          : action.childFields.map((field) => row.fields[field] ?? null);
+        return canonicalizeJson(childKey) === canonicalizeJson(parent.key);
+      });
       if (children.length > 0 && action.policy === 'restrict') {
         issues.push(createIssue({ code: 'constraint.delete_restricted', phase: 'constraint', severity: 'error', retry: 'after_input', relationId: parent.relationId, key: parent.key, details: { actionId: action.id } }));
         continue;
@@ -99,7 +109,7 @@ export const expandReferentialDeletes = (input: {
       }
     }
   }
-  return { edits, issues };
+  return { edits: issues.length === 0 ? edits : [], issues };
 };
 
 const stableFailureId = (setId: string, constraintId: string, subject: JsonValue, code: string): string => [setId, constraintId, code, canonicalizeJson(subject)].join(':');

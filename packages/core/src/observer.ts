@@ -388,8 +388,11 @@ class SharedObservation<Query, Row, Projection> {
     const membershipIssue = captured.dataset.state === 'open'
       ? [observationIssue('observer.membership_open', 'after_refresh', { datasetId: captured.dataset.datasetId, revision: captured.dataset.revision })]
       : [];
+    const resultIdentityIssue = maintained.rows.length === maintained.resultKeys.length && new Set(maintained.resultKeys).size === maintained.resultKeys.length
+      ? []
+      : [observationIssue('observer.evaluation_failed', 'after_refresh', { reason: 'invalid_result_identity' })];
     const requiredUnavailable = evidence.some((item) => item.expectation === 'required' && (item.state !== 'ready' || !item.authorized));
-    const inputsIncomplete = captured.dataset.state !== 'settled' || requiredUnavailable;
+    const inputsIncomplete = captured.dataset.state !== 'settled' || requiredUnavailable || resultIdentityIssue.length > 0;
     let completeness = maintained.completeness;
     if (inputsIncomplete && !(this.#options.allowPartial && completeness === 'lower-bound')) completeness = 'unknown';
     const rows = completeness === 'unknown' ? [] : maintained.rows;
@@ -409,7 +412,7 @@ class SharedObservation<Query, Row, Projection> {
         attachments: basisAttachments
       },
       sourceStates: evidence,
-      issues: [...evidenceIssues, ...membershipIssue, ...maintained.issues]
+      issues: [...evidenceIssues, ...membershipIssue, ...resultIdentityIssue, ...maintained.issues]
     });
   }
 

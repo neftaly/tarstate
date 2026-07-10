@@ -117,6 +117,7 @@ describe('production JSON-tree storage mappings', () => {
     expect(projection.relations.get('test.user')?.rows).toMatchObject([{ row: { id: 'alice', nickname: null, code: { type: 'urn:test:upper' } } }]);
     expect(projection.issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'mapping.map_key_mismatch' }), expect.objectContaining({ code: 'schema.duplicate_key' })]));
     expect(projection.relations.get('test.note')?.rows).toHaveLength(2);
+    expect(projection.relations.get('test.note')?.completeness).toBe('unknown');
     expect(projection.completeness).toBe('unknown');
 
     const hostile = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error('inspection failed'); } });

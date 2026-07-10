@@ -176,16 +176,17 @@ export function useQuery<Query, Row, Parameters extends Readonly<Record<string, 
   options: QueryHookOptions<Row, Selected, Parameters> = {}
 ): Selected {
   const runtime = useRuntime();
-  const request = queryRequest(plan, options);
-  const key = queryObservationKey(runtime.database, request);
+  const request = useMemo(() => queryRequest(plan, options), [plan, options.parameters, options.allowPartial]);
+  const key = useMemo(() => queryObservationKey(runtime.database, request), [runtime.database, request]);
   const baseStore = queryStore<Query, Row>(runtime.database, request, key);
   const store = runtime.overlayStore.view<Query, Row>(baseStore, request, key);
   const serverSnapshot = runtime.serverQuerySnapshots.get(key) as ObserverSnapshot<Row> | undefined;
+  const getServerSnapshot = useMemo(() => serverSnapshot === undefined ? undefined : () => serverSnapshot, [serverSnapshot]);
   const selectSnapshot = options.selectSnapshot ?? identitySnapshot<Row, Selected>;
   return useExternalStoreWithSelector(
     store.subscribe,
     store.getSnapshot,
-    serverSnapshot === undefined ? undefined : () => serverSnapshot,
+    getServerSnapshot,
     selectSnapshot,
     options.areSelectionsEqual ?? Object.is
   );

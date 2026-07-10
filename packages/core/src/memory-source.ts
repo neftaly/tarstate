@@ -1,5 +1,6 @@
 import { sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
+import { builtInCapabilityRefs } from './builtins.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
 import { comparePortableStrings } from './portable-order.js';
@@ -85,12 +86,6 @@ type EvaluatedAttempt = {
 type ExpressionResult =
   | { readonly success: true; readonly value: JsonValue | typeof logicalUnknown }
   | { readonly success: false; readonly issue: Issue };
-
-const builtinMechanisms = {
-  counter: capability('field/counter-increment', '9df5e2507b3d10ca1d40c3e7b0b42c9c6de272a02ebaee8b69a838206f881963'),
-  text: capability('field/text-splice', '9a9cc22f2768d5de353a390682e17430952614e8e30eb8fc12992170d4c5d0fc'),
-  conflict: capability('field/conflict-resolve', 'd2f90f3c1fcda78718037d6c4c1d27b7155e276c92c14fd2c2d4fb08aa9729d3')
-} as const;
 
 const emptyStatementResult = (statementIndex: number): StatementResult => ({
   statementIndex,
@@ -639,7 +634,7 @@ const applyFieldEdits = (
       if (!amount.success) return amount;
       if (typeof next[field] !== 'number' || typeof amount.value !== 'number') return expressionIssue('transaction.edit_type_mismatch', { field, edit: edit.kind });
       next[field] += amount.value;
-      outcomes.push({ edit: 'counter', mechanism: builtinMechanisms.counter, preservationLosses: [] });
+      outcomes.push({ edit: 'counter', mechanism: builtInCapabilityRefs.counterIncrement, preservationLosses: [] });
       continue;
     }
     if (edit.kind === 'edit.text-splice') {
@@ -651,7 +646,7 @@ const applyFieldEdits = (
       if (!insert.success) return insert;
       if (typeof next[field] !== 'string' || !isIndex(index.value) || !isIndex(deleteCount.value) || typeof insert.value !== 'string') return expressionIssue('transaction.edit_type_mismatch', { field, edit: edit.kind });
       next[field] = next[field].slice(0, index.value) + insert.value + next[field].slice(index.value + deleteCount.value);
-      outcomes.push({ edit: 'text', mechanism: builtinMechanisms.text, preservationLosses: [] });
+      outcomes.push({ edit: 'text', mechanism: builtInCapabilityRefs.textSplice, preservationLosses: [] });
       continue;
     }
     if (edit.kind === 'edit.list-splice') {
@@ -676,7 +671,7 @@ const applyFieldEdits = (
     const current = next[field];
     if (current === undefined || !edit.observed.some((candidate) => sameJson(candidate, current))) return expressionIssue('transaction.conflict_changed', { field });
     next[field] = value.value;
-    outcomes.push({ edit: 'custom', mechanism: builtinMechanisms.conflict, preservationLosses: [] });
+    outcomes.push({ edit: 'custom', mechanism: builtInCapabilityRefs.conflictResolve, preservationLosses: [] });
   }
   return { success: true, value: { row: next, outcomes } };
 };
@@ -784,7 +779,6 @@ const keyTuple = (row: MemoryRow, fields: readonly string[]): readonly JsonValue
 const sameStringArray = (left: readonly string[], right: readonly string[]): boolean => left.length === right.length && left.every((value, index) => value === right[index]);
 const isIndex = (value: JsonValue): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const uniqueOutcomes = (outcomes: readonly SemanticEditOutcome[]): readonly SemanticEditOutcome[] => [...new Map(outcomes.map((outcome) => [canonical(outcome as unknown as JsonValue), outcome])).values()];
-function capability(suffix: string, hash: string): CapabilityRef { return { id: 'urn:tarstate:capability:' + suffix, version: '1', contractHash: `sha256:${hash}` }; }
 const unavailableAttachmentHash = `sha256:${'0'.repeat(64)}` as const;
 
 const txIssue = (

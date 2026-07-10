@@ -262,7 +262,8 @@ const validateQueryNode = (
     shape(context, node, ['kind', 'op', 'left', 'right'], [], path);
     enumValue(context, node.op, ['union', 'union-all', 'intersect', 'except'], [...path, 'op']);
     const left = validateQueryNode(context, node.left, [...path, 'left'], outer, state, depth + 1);
-    validateQueryNode(context, node.right, [...path, 'right'], outer, state, depth + 1);
+    const right = validateQueryNode(context, node.right, [...path, 'right'], outer, state, depth + 1);
+    if (!setEqual(left, right)) invalid(context, [...path, 'right'], 'set_alias_shape_mismatch');
     return left;
   }
   if (!['where', 'select', 'with-fields', 'rename', 'omit', 'unnest', 'aggregate', 'distinct', 'order', 'slice', 'window', 'seek'].includes(node.kind as string)) {
@@ -410,7 +411,7 @@ const validateOrder = (context: ValidationContext, input: JsonValue | undefined,
 
 const validateCursor = (context: ValidationContext, input: JsonValue | undefined, path: readonly unknown[]): void => {
   if (!shape(context, input, ['order', 'resultKey', 'basis', 'membershipRevision', 'mode'], [], path)) return;
-  const cursor = input as RecordValue; if (!Array.isArray(cursor.order)) invalid(context, [...path, 'order'], 'array_required'); nonEmptyString(context, cursor.resultKey, [...path, 'resultKey']); nonNegativeInteger(context, cursor.membershipRevision, [...path, 'membershipRevision']); enumValue(context, cursor.mode, ['live', 'pinned'], [...path, 'mode']);
+  const cursor = input as RecordValue; if (!Array.isArray(cursor.order)) invalid(context, [...path, 'order'], 'array_required'); nonEmptyString(context, cursor.resultKey, [...path, 'resultKey']); nonNegativeInteger(context, cursor.membershipRevision, [...path, 'membershipRevision']); enumValue(context, cursor.mode, ['live'], [...path, 'mode']);
 };
 
 const validateTransactionBody = (context: ValidationContext, body: JsonValue): boolean => {

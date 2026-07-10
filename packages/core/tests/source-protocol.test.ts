@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   coordinateSourceCommit,
+  createIssue,
   type AtomicSource,
   type Footprint,
   type FootprintRelation,
@@ -87,6 +88,28 @@ describe('generic source commit coordinator', () => {
       commit: commitInput
     });
     expect(result.outcome).toBe('committed');
+    expect(commit).toHaveBeenCalledOnce();
+  });
+
+  it('preserves planner warnings without blocking and converts planner exceptions to rejection evidence', async () => {
+    const commit = vi.fn(defaultCommit);
+    const warning = createIssue({ code: 'lens.lossy_value', details: { field: 'title' } });
+    const warned = await coordinateSourceCommit({
+      source: source(commit),
+      bindings: [binding('warning', { readFootprint: [], writeFootprint: [], intents: [], issues: [warning] })],
+      edits: [],
+      commit: commitInput
+    });
+    expect(warned).toMatchObject({ outcome: 'committed', issues: [{ code: 'lens.lossy_value', severity: 'warning' }] });
+    expect(commit).toHaveBeenCalledOnce();
+
+    const failed = await coordinateSourceCommit({
+      source: source(commit),
+      bindings: [{ ...binding('throwing', { readFootprint: [], writeFootprint: [], intents: [], issues: [] }), plan: () => { throw new TypeError('planner failed'); } }],
+      edits: [],
+      commit: { ...commitInput, operationId: 'planner-failed' }
+    });
+    expect(failed).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.plan_failed' }] });
     expect(commit).toHaveBeenCalledOnce();
   });
 

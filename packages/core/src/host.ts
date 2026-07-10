@@ -7,12 +7,14 @@ type RuntimeEntry<Runtime> = {
   readonly identity: object;
   readonly runtime: Runtime;
   leases: number;
+  closed: boolean;
   readonly close: () => void;
 };
 
 export class HostRuntimeRegistry {
   readonly capabilities: CapabilityRegistry;
   readonly #sourceRuntimes = new Map<string, RuntimeEntry<unknown>>();
+  #closed = false;
 
   constructor(options: { readonly trustPolicyId: string }) {
     this.capabilities = new CapabilityRegistry(options.trustPolicyId);
@@ -23,11 +25,12 @@ export class HostRuntimeRegistry {
     readonly identity: object;
     readonly create: () => { readonly runtime: Runtime; readonly close: () => void };
   }): RuntimeLease<Runtime> {
+    if (this.#closed) throw new Error('Host runtime registry is closed');
     const existing = this.#sourceRuntimes.get(options.sourceId);
     if (existing !== undefined && existing.identity !== options.identity) throw new Error('A different live source identity is registered for ' + options.sourceId);
     const entry = existing ?? (() => {
       const created = options.create();
-      const next: RuntimeEntry<Runtime> = { identity: options.identity, runtime: created.runtime, close: created.close, leases: 0 };
+      const next: RuntimeEntry<Runtime> = { identity: options.identity, runtime: created.runtime, close: created.close, leases: 0, closed: false };
       this.#sourceRuntimes.set(options.sourceId, next as RuntimeEntry<unknown>);
       return next as RuntimeEntry<unknown>;
     })();
@@ -40,7 +43,10 @@ export class HostRuntimeRegistry {
         released = true;
         entry.leases -= 1;
         if (entry.leases > 0) return;
-        entry.close();
+        if (!entry.closed) {
+          entry.closed = true;
+          entry.close();
+        }
         if (this.#sourceRuntimes.get(options.sourceId) === entry) this.#sourceRuntimes.delete(options.sourceId);
       }
     };
@@ -49,7 +55,12 @@ export class HostRuntimeRegistry {
   activeSourceIds(): readonly string[] { return [...this.#sourceRuntimes.keys()].sort(comparePortableStrings); }
 
   close(): void {
-    for (const entry of this.#sourceRuntimes.values()) entry.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const entry of this.#sourceRuntimes.values()) {
+      entry.closed = true;
+      entry.close();
+    }
     this.#sourceRuntimes.clear();
   }
 }

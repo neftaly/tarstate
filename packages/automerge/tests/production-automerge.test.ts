@@ -21,6 +21,14 @@ const taskBase = (): Automerge.Doc<TaskDoc> => Automerge.from(
 );
 
 describe('production Automerge adapter', () => {
+  it('returns rejection evidence when a queued commit reaches a closed source', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:closed', doc: taskBase() });
+    const before = runtime.snapshot().basis;
+    runtime.close();
+    await expect(runtime.commit({ operationEpoch: 'epoch:1', operationId: 'closed', intentHash: hash('0'), expectedBasis: before, commands: [] }))
+      .resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'source.closed' }] });
+  });
+
   it('rejects reentrant document replacement without losing either document', async () => {
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: taskBase() });
     const before = runtime.snapshot();

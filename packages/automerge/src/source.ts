@@ -117,7 +117,7 @@ export class AutomergeSourceRuntime<T extends object> {
     readonly commands: readonly AutomergeSourceCommand<T>[];
     readonly message?: string;
   }): Promise<AutomergeSourceCommitResult> {
-    this.#assertOpen();
+    if (this.#closed) return Promise.resolve(this.#rejected(input, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]));
     if (this.#applying) {
       return Promise.resolve(this.#rejected(input, undefined, [{
         code: 'automerge.reentrant_commit',
@@ -177,7 +177,7 @@ export class AutomergeSourceRuntime<T extends object> {
     readonly commands: readonly AutomergeSourceCommand<T>[];
     readonly message?: string;
   }): Promise<AutomergeSourceCommitResult> {
-    this.#assertOpen();
+    if (this.#closed) return this.#rejected(input, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
     const key = ledgerKey(input.operationEpoch, input.operationId);
     const known = this.#ledger.get(key);
     if (known !== undefined) {

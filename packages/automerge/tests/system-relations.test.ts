@@ -78,24 +78,23 @@ describe('Automerge system relations', () => {
     expect(state.getSnapshot().sync[0]).toMatchObject({ state: 'syncing', observedAt: 10 });
   });
 
-  it('rejects contradictory equal-time evidence instead of depending on arrival order', () => {
+  it('resolves contradictory equal-time evidence independently of arrival order', () => {
     const first = new AutomergeSystemRelationState('attachment:one');
     first.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'syncing', observedAt: 10 });
-    expect(() => first.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'synced', observedAt: 10 })).toThrow(/Ambiguous sync.*observedAt 10/);
-    expect(first.getSnapshot().sync[0]).toMatchObject({ state: 'syncing' });
+    first.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'synced', observedAt: 10 });
 
     const reversed = new AutomergeSystemRelationState('attachment:one');
     reversed.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'synced', observedAt: 10 });
-    expect(() => reversed.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'syncing', observedAt: 10 })).toThrow(/Ambiguous sync.*observedAt 10/);
-    expect(reversed.getSnapshot().sync[0]).toMatchObject({ state: 'synced' });
+    reversed.apply({ kind: 'sync-state', documentId: 'document:one', storageId: 'storage:one', state: 'syncing', observedAt: 10 });
+    expect(reversed.getSnapshot().sync).toEqual(first.getSnapshot().sync);
 
     const peer = new AutomergeSystemRelationState('attachment:one');
     peer.apply({ kind: 'peer-observed', peerId: 'peer:one', observedAt: 3 });
-    expect(() => peer.apply({ kind: 'peer-disconnected', peerId: 'peer:one', observedAt: 3 })).toThrow(/Ambiguous peer.*observedAt 3/);
+    expect(() => peer.apply({ kind: 'peer-disconnected', peerId: 'peer:one', observedAt: 3 })).not.toThrow();
 
     const presence = new AutomergeSystemRelationState('attachment:one');
     presence.apply({ kind: 'presence-set', peerId: 'peer:one', channel: 'cursor', origin: 'observed', value: null, observedAt: 4 });
-    expect(() => presence.apply({ kind: 'presence-stop', peerId: 'peer:one', observedAt: 4, reason: 'goodbye' })).toThrow(/Ambiguous presence.*observedAt 4/);
+    expect(() => presence.apply({ kind: 'presence-stop', peerId: 'peer:one', observedAt: 4, reason: 'goodbye' })).not.toThrow();
   });
 
   it('tracks presence by peer and channel with explicit local/observed and stop/expiry evidence', () => {

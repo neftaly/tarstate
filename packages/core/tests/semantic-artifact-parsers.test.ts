@@ -232,9 +232,10 @@ describe('semantic artifact safe parsers', () => {
       mutate(queryBody(), (body) => { body.root.input.relation.schemaView = otherSchemaRef; }),
       mutate(queryBody(), (body) => { body.root = { kind: 'where', input: values(), predicate: { kind: 'call', capability, args: [] } }; }),
       mutate(queryBody(), (body) => { body.root = { kind: 'join', join: 'inner', left: values('same'), right: values('same'), on: literal(true) }; }),
+      mutate(queryBody(), (body) => { body.root = { kind: 'set', op: 'union-all', left: values('left'), right: values('right') }; }),
       mutate(queryBody(), (body) => { body.ambientAuthority = true; })
     ];
-    const reasons = ['undeclared_parameter', 'undeclared_schema_view', 'undeclared_capability', 'duplicate_join_alias', 'unknown_member'];
+    const reasons = ['undeclared_parameter', 'undeclared_schema_view', 'undeclared_capability', 'duplicate_join_alias', 'set_alias_shape_mismatch', 'unknown_member'];
     for (let index = 0; index < cases.length; index += 1) {
       expect(await safeParseQueryArtifact(await seal('query', cases[index])), reasons[index]).toMatchObject({ success: false, issues: expect.arrayContaining([expect.objectContaining({ details: expect.objectContaining({ reason: reasons[index] }) })]) });
     }

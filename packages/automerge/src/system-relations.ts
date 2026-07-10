@@ -337,7 +337,7 @@ export class AutomergeSystemRelationState {
       ...(metadata?.isEphemeral === undefined ? {} : { isEphemeral: metadata.isEphemeral }),
       ...(metadata?.metadata === undefined ? {} : { metadata: metadata.metadata })
     });
-    if (observationDecision(prior, next, (row) => row.observedAt, 'peer ' + event.peerId) === 'ignore') return;
+    if (observationDecision(prior, next, (row) => row.observedAt) === 'ignore') return;
     this.#peers.set(event.peerId, next);
     this.#connections.set(event.peerId, materializeAutomergeConnectionRow({
       attachmentId: this.attachmentId,
@@ -360,7 +360,7 @@ export class AutomergeSystemRelationState {
       ...(previous?.isEphemeral === undefined ? {} : { isEphemeral: previous.isEphemeral }),
       ...(previous?.metadata === undefined ? {} : { metadata: previous.metadata })
     });
-    if (observationDecision(previous, next, (row) => row.observedAt, 'peer ' + event.peerId) === 'ignore') return;
+    if (observationDecision(previous, next, (row) => row.observedAt) === 'ignore') return;
     this.#peers.set(event.peerId, next);
     this.#connections.set(event.peerId, materializeAutomergeConnectionRow({
       attachmentId: this.attachmentId,
@@ -388,7 +388,7 @@ export class AutomergeSystemRelationState {
       ...(event.peerId === undefined ? {} : { peerId: event.peerId }),
       ...(event.errorCode === undefined ? {} : { errorCode: event.errorCode })
     });
-    if (observationDecision(comparablePrevious, next, (row) => row.observedAt, 'sync ' + event.documentId + '/' + event.storageId) === 'ignore') return;
+    if (observationDecision(comparablePrevious, next, (row) => row.observedAt) === 'ignore') return;
     if (event.peerId === undefined) this.#explicitSyncPeers.delete(key);
     else this.#explicitSyncPeers.add(key);
     this.#sync.set(key, next);
@@ -420,7 +420,7 @@ export class AutomergeSystemRelationState {
       lastActiveAt: event.observedAt,
       lastSeenAt: event.observedAt
     });
-    if (observationDecision(previous, next, (row) => row.lastSeenAt, 'presence ' + event.peerId + '/' + event.channel) === 'ignore') return;
+    if (observationDecision(previous, next, (row) => row.lastSeenAt) === 'ignore') return;
     this.#presence.set(key, next);
   }
 
@@ -442,7 +442,7 @@ export class AutomergeSystemRelationState {
         lastSeenAt: event.observedAt,
         expiresAt: event.observedAt
       });
-      if (observationDecision(row, next, (candidate) => candidate.lastSeenAt, 'presence ' + row.peerId + '/' + row.channel) === 'replace') updates.push([key, next]);
+      if (observationDecision(row, next, (candidate) => candidate.lastSeenAt) === 'replace') updates.push([key, next]);
     }
     for (const [key, row] of updates) this.#presence.set(key, row);
   }
@@ -453,10 +453,9 @@ export class AutomergeSystemRelationState {
       if (input.attachmentId !== this.attachmentId) throw new TypeError('Conflict row belongs to a different attachment');
       const row = materializeConflictRow(input);
       const previous = byIssue.get(row.issueId);
-      if (previous !== undefined && canonicalizeJson(previous as unknown as JsonValue) !== canonicalizeJson(row as unknown as JsonValue)) {
-        throw new TypeError('Ambiguous conflict issue ID: ' + row.issueId);
-      }
-      byIssue.set(row.issueId, row);
+      const previousValue = previous === undefined ? undefined : canonicalizeJson(previous as unknown as JsonValue);
+      const nextValue = canonicalizeJson(row as unknown as JsonValue);
+      if (previousValue === undefined || comparePortableStrings(previousValue, nextValue) < 0) byIssue.set(row.issueId, row);
     }
     this.#conflicts = Object.freeze([...byIssue.values()].sort((left, right) => comparePortableStrings(left.issueId, right.issueId)));
   }
@@ -502,16 +501,14 @@ const omitPeerId = (row: AutomergeSyncSystemRow): AutomergeSyncSystemRow => {
 const observationDecision = <Row>(
   previous: Row | undefined,
   next: Row,
-  observedAt: (row: Row) => number,
-  subject: string
+  observedAt: (row: Row) => number
 ): 'ignore' | 'replace' => {
   if (previous === undefined) return 'replace';
   const previousTime = observedAt(previous);
   const nextTime = observedAt(next);
   if (previousTime > nextTime) return 'ignore';
   if (previousTime < nextTime) return 'replace';
-  if (canonicalizeJson(previous as unknown as JsonValue) === canonicalizeJson(next as unknown as JsonValue)) return 'ignore';
-  throw new TypeError('Ambiguous ' + subject + ' evidence at observedAt ' + nextTime);
+  return comparePortableStrings(canonicalizeJson(previous as unknown as JsonValue), canonicalizeJson(next as unknown as JsonValue)) < 0 ? 'replace' : 'ignore';
 };
 const syncKey = (documentId: string, storageId: string): string => documentId + '\u0000' + storageId;
 const presenceKey = (peerId: string, channel: string): string => peerId + '\u0000' + channel;

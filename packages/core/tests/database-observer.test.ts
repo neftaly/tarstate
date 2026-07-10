@@ -208,6 +208,27 @@ describe('database membership and observation', () => {
     expect(listener).toHaveBeenCalledTimes(2);
   });
 
+  it('withdraws adapter results whose occurrence identities are not unique', () => {
+    const source = new TestSource('source:duplicates', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    const lease = catalog.attach(attachment('attachment:duplicates', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:duplicates', source.sourceId)] });
+    const database = view(catalog, [dataset], 'public', 'authority:public', (input) => {
+      const result = evaluate(input);
+      return { ...result, resultKeys: result.rows.map(() => 'duplicate') };
+    });
+    const observer = database.observe({ plan: plan() });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      rows: [],
+      resultKeys: [],
+      completeness: 'unknown',
+      issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.evaluation_failed', details: { reason: 'invalid_result_identity' } })])
+    } });
+    observer.close();
+    database.close();
+    lease.close();
+  });
+
   it('routes observer updates through the incremental query-maintenance factory', () => {
     const source = new TestSource('source:incremental', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
     const catalog = new AttachmentCatalog();

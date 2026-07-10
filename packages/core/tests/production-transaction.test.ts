@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { checkFinalConstraints, type SourceConstraint } from '../src/constraints.js';
+import { checkFinalConstraints, type ConstraintEvaluation, type SourceConstraint } from '../src/constraints.js';
 import { InMemoryAtomicSource, type MemoryQueryResult, type MemoryRelation, type MemoryState } from '../src/memory-source.js';
 import type { QueryNode } from '../src/query.js';
 import { safeParseReceipt } from '../src/receipts.js';
@@ -275,6 +275,13 @@ describe('production in-memory transaction coordinator', () => {
     };
     const blocked = source({ constraints: [indeterminate] });
     expect(await blocked.commit(attempt('unknown', valid))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'constraint.indeterminate' }] });
+
+    const malformed: SourceConstraint<MemoryState> = {
+      id: 'constraint:empty-indeterminate', mode: 'required', dependencyRelations: ['items'],
+      evaluate: () => ({ status: 'indeterminate', failures: [] } as unknown as ConstraintEvaluation)
+    };
+    expect(checkFinalConstraints({ constraints: [malformed], before: { items: [] }, after: { items: [] }, beforeBasis: 0, afterBasis: 1, touchedRelations: new Set(['items']) }))
+      .toMatchObject({ blockingIssues: [{ code: 'constraint.indeterminate' }] });
   });
 
   it('enforces exact bases, commits no-ops without advancing or notifying, and keeps handed-off stale outcomes', async () => {
