@@ -1,4 +1,5 @@
 import { CapabilityRegistry } from './registry.js';
+import { comparePortableStrings } from './portable-order.js';
 
 export type RuntimeLease<Runtime> = { readonly runtime: Runtime; readonly release: () => void };
 
@@ -45,7 +46,7 @@ export class HostRuntimeRegistry {
     };
   }
 
-  activeSourceIds(): readonly string[] { return [...this.#sourceRuntimes.keys()].sort((left, right) => left.localeCompare(right)); }
+  activeSourceIds(): readonly string[] { return [...this.#sourceRuntimes.keys()].sort(comparePortableStrings); }
 
   close(): void {
     for (const entry of this.#sourceRuntimes.values()) entry.close();

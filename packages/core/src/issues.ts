@@ -1,3 +1,5 @@
+import { comparePortableStrings } from './portable-order.js';
+
 export type IssuePhase =
   | 'resolve'
   | 'load'
@@ -290,10 +292,10 @@ export const createIssue = (input: IssueInput): Issue => {
 };
 
 const stableIssueIdentity = (input: Record<string, unknown>): string => {
-  const entries = Object.entries(input).filter(([, value]) => value !== undefined).sort(([left], [right]) => left.localeCompare(right));
+  const entries = Object.entries(input).filter(([, value]) => value !== undefined).sort(([left], [right]) => comparePortableStrings(left, right));
   return JSON.stringify(Object.fromEntries(entries), (_key, value: unknown) => {
     if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-      return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)));
+      return Object.fromEntries(Object.entries(value).sort(([left], [right]) => comparePortableStrings(left, right)));
     }
     return value;
   });

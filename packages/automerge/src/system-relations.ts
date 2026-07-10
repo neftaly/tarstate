@@ -6,6 +6,7 @@ import {
 } from '@tarstate/core';
 import type { AutomergeConflictFact } from './projection.js';
 import type { AutomergeBasis } from './source.js';
+import { comparePortableStrings } from './portable-order.js';
 
 export const automergeSystemRelationIds = Object.freeze({
   peers: 'tarstate.automerge.peers',
@@ -199,7 +200,7 @@ export const materializeAutomergeConflictRows = (input: {
   const basis = { kind: input.basis.kind, heads: [...new Set(input.basis.heads)].sort() } satisfies AutomergeBasis;
   return Object.freeze(input.conflicts.map((conflict) => {
     const logical = input.logicalEvidence?.(conflict);
-    const alternatives = [...conflict.alternatives].sort((left, right) => left.changeHash.localeCompare(right.changeHash));
+    const alternatives = [...conflict.alternatives].sort((left, right) => comparePortableStrings(left.changeHash, right.changeHash));
     const issue = createIssue({
       code: 'automerge.conflict_observed',
       phase: 'query',
@@ -226,7 +227,7 @@ export const materializeAutomergeConflictRows = (input: {
       alternativeCount: alternatives.length,
       alternativesTruncated: alternatives.length > limit
     });
-  }).sort((left, right) => left.issueId.localeCompare(right.issueId)));
+  }).sort((left, right) => comparePortableStrings(left.issueId, right.issueId)));
 };
 
 export type AutomergeSystemEvent =
@@ -457,7 +458,7 @@ export class AutomergeSystemRelationState {
       }
       byIssue.set(row.issueId, row);
     }
-    this.#conflicts = Object.freeze([...byIssue.values()].sort((left, right) => left.issueId.localeCompare(right.issueId)));
+    this.#conflicts = Object.freeze([...byIssue.values()].sort((left, right) => comparePortableStrings(left.issueId, right.issueId)));
   }
 
   #correlateStorage(storageId: string): void {
@@ -516,7 +517,7 @@ const syncKey = (documentId: string, storageId: string): string => documentId + 
 const presenceKey = (peerId: string, channel: string): string => peerId + '\u0000' + channel;
 
 const sortedValues = <Row>(rows: ReadonlyMap<string, Row>, key: (row: Row) => string): readonly Row[] =>
-  Object.freeze([...rows.values()].sort((left, right) => key(left).localeCompare(key(right))));
+  Object.freeze([...rows.values()].sort((left, right) => comparePortableStrings(key(left), key(right))));
 
 const sameRows = (left: AutomergeSystemRelationSnapshot, right: AutomergeSystemRelationSnapshot): boolean =>
   canonicalizeJson({ peers: left.peers, connections: left.connections, sync: left.sync, conflicts: left.conflicts, presence: left.presence } as unknown as JsonValue) ===

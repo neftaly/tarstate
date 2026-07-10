@@ -1,4 +1,5 @@
 import * as Automerge from '@automerge/automerge';
+import { comparePortableStrings } from './portable-order.js';
 import {
   canonicalizeJson,
   createIssue,
@@ -174,7 +175,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   relateFootprints = relateAutomergeFootprints;
 
   mergeIntents = (plans: readonly PlanResult<AutomergeSourceCommand<T>>[]): IntentMergeResult<AutomergeSourceCommand<T>> => {
-    const intents = plans.flatMap(({ intents }) => intents).sort((left, right) => canonicalizeJson(left.footprint).localeCompare(canonicalizeJson(right.footprint)));
+    const intents = plans.flatMap(({ intents }) => intents).sort((left, right) => comparePortableStrings(canonicalizeJson(left.footprint), canonicalizeJson(right.footprint)));
     for (let leftIndex = 0; leftIndex < intents.length; leftIndex += 1) {
       for (let rightIndex = leftIndex + 1; rightIndex < intents.length; rightIndex += 1) {
         const left = intents[leftIndex]!;
@@ -365,7 +366,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           issues.push(createIssue({ code: 'mapping.rekey_required', sourceId: snapshot.sourceId, relationId: this.#relationId, path: [...row.storagePath, this.#keySource.field], retry: 'after_input' }));
           continue;
         }
-        for (const [field, value] of Object.entries(edit.fields).sort(([left], [right]) => left.localeCompare(right))) {
+        for (const [field, value] of Object.entries(edit.fields).sort(([left], [right]) => comparePortableStrings(left, right))) {
           if (!samePortable(row.fields[field], value)) addPropertyEdit({ kind: 'replace', path: [...row.storagePath, field], value });
         }
       } else if (edit.kind === 'delete') {
@@ -500,7 +501,7 @@ const normalizeFootprintEntries = (entries: readonly AutomergePathFootprintEntry
     const normalized = { scope: entry.scope, path: Object.freeze([...entry.path]) } satisfies AutomergePathFootprintEntry;
     byIdentity.set(canonicalizeJson(normalized as unknown as JsonValue), Object.freeze(normalized));
   }
-  return [...byIdentity.values()].sort((left, right) => canonicalizeJson(left as unknown as JsonValue).localeCompare(canonicalizeJson(right as unknown as JsonValue)));
+  return [...byIdentity.values()].sort((left, right) => comparePortableStrings(canonicalizeJson(left as unknown as JsonValue), canonicalizeJson(right as unknown as JsonValue)));
 };
 
 const entryContainedBy = (candidate: AutomergePathFootprintEntry, bound: AutomergePathFootprintEntry): boolean => {

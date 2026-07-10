@@ -2,6 +2,7 @@ import { sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
+import { comparePortableStrings } from './portable-order.js';
 import type { QueryNode } from './query.js';
 import { safeParseTransactionArtifact } from './semantic-artifact-parsers.js';
 import {
@@ -746,9 +747,9 @@ const asTruth = (value: JsonValue | typeof logicalUnknown): LogicalTruth => valu
 
 const compareValues = (left: JsonValue, right: JsonValue): number | undefined => {
   if (typeof left === 'number' && typeof right === 'number') return left - right;
-  if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right);
+  if (typeof left === 'string' && typeof right === 'string') return comparePortableStrings(left, right);
   if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
-  if ((Array.isArray(left) && Array.isArray(right)) || (isRecord(left) && isRecord(right))) return canonical(left).localeCompare(canonical(right));
+  if ((Array.isArray(left) && Array.isArray(right)) || (isRecord(left) && isRecord(right))) return comparePortableStrings(canonical(left), canonical(right));
   return undefined;
 };
 
@@ -772,7 +773,7 @@ const statementRelation = (statement: WriteStatement): WriteRelation | undefined
   return statement.target.relation;
 };
 const cloneState = (state: MemoryState): MemoryState => Object.fromEntries(Object.entries(state).map(([relationId, rows]) => [relationId, rows.map((row) => ({ ...row }))]));
-const canonical = (value: JsonValue): string => JSON.stringify(value, (_key, candidate: unknown) => isRecord(candidate) ? Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => left.localeCompare(right))) : candidate);
+const canonical = (value: JsonValue): string => JSON.stringify(value, (_key, candidate: unknown) => isRecord(candidate) ? Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => comparePortableStrings(left, right))) : candidate);
 const sameJson = (left: JsonValue | MemoryState, right: JsonValue | MemoryState): boolean => canonical(left as JsonValue) === canonical(right as JsonValue);
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const isJsonValue = (value: unknown): value is JsonValue => value === null || typeof value === 'boolean' || typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) || (Array.isArray(value) && value.every(isJsonValue)) || (isRecord(value) && Object.values(value).every(isJsonValue));

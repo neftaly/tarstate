@@ -248,15 +248,17 @@ describe('incremental query maintenance', () => {
     ];
     const oneRemaining: readonly QueryRowOccurrence[] = [duplicates[1] as QueryRowOccurrence];
     const session = openIncrementalQueryMaintenance(plan(people), snapshot(duplicates, 1));
-    expect(session.getCurrentResult().resultKeys).toEqual(['1:p12:person:first', '1:p13:person:second']);
+    const [firstKey, secondKey] = session.getCurrentResult().resultKeys;
+    expect(new Set([firstKey, secondKey]).size).toBe(2);
     const removed = session.updateSnapshot(snapshot(oneRemaining, 2));
     expect(semanticResult(removed)).toEqual(oracle(people, snapshot(oneRemaining, 2)));
-    expect(removed.state.resultDelta).toEqual({ addedResultKeys: [], removedResultKeys: ['1:p12:person:first'], updatedResultKeys: [] });
+    expect(removed.state.resultDelta).toEqual({ addedResultKeys: [], removedResultKeys: [firstKey], updatedResultKeys: [] });
 
     const reincarnated: readonly QueryRowOccurrence[] = [{ occurrenceId: 'person:third', row: { id: 1, name: 'same' } }];
     const replacement = session.updateSnapshot(snapshot(reincarnated, 3));
     expect(semanticResult(replacement)).toEqual(oracle(people, snapshot(reincarnated, 3)));
-    expect(replacement.state.resultDelta).toEqual({ addedResultKeys: ['1:p12:person:third'], removedResultKeys: ['1:p13:person:second'], updatedResultKeys: [] });
+    expect(replacement.state.resultDelta).toMatchObject({ removedResultKeys: [secondKey], updatedResultKeys: [] });
+    expect(replacement.state.resultDelta.addedResultKeys).toHaveLength(1);
   });
 
   it('maintains exact, lower-bound, unknown, basis, membership, and recovery transitions', () => {
@@ -315,9 +317,42 @@ describe('incremental query maintenance', () => {
     const first: QueryMaintenanceSnapshot = { relations: [relation('people', unknownBase, 1)] };
     const second: QueryMaintenanceSnapshot = { relations: [relation('people', unknownNext, 2)] };
     const session = openIncrementalQueryMaintenance(plan(people), first);
+    const [resultKey] = session.getCurrentResult().resultKeys;
     const maintained = session.updateSnapshot(second);
     expect(semanticResult(maintained)).toEqual(oracle(people, second));
-    expect(maintained.state.resultDelta.updatedResultKeys).toEqual(['1:p14:person:unknown']);
+    expect(maintained.state.resultDelta.updatedResultKeys).toEqual([resultKey]);
+  });
+
+  it('unions distinct attachment inputs with bag semantics and stable source provenance', () => {
+    const personal = { ...relation('people', [{ occurrenceId: 'entry:1', row: { id: 1, name: 'personal' } }], 1), sourceId: 'source:personal', attachmentId: 'attachment:personal' };
+    const shared = { ...relation('people', [{ occurrenceId: 'entry:1', row: { id: 1, name: 'shared' } }], 1), sourceId: 'source:shared', attachmentId: 'attachment:shared' };
+    const query: QueryNode = {
+      kind: 'select',
+      alias: 'result',
+      input: people,
+      fields: { name: field('p', 'name'), source: { kind: 'source-of', alias: 'p' } }
+    };
+    const initial: QueryMaintenanceSnapshot = { relations: [personal, shared], basis: { dataset: 1 }, membershipRevision: 1 };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const first = session.getCurrentResult();
+    expect(first.rows).toEqual([{ name: 'personal', source: 'source:personal' }, { name: 'shared', source: 'source:shared' }]);
+    expect(new Set(first.resultKeys).size).toBe(2);
+
+    const changedShared = { ...shared, rows: [{ id: 1, name: 'shared updated' }], basis: 2 };
+    const updated = session.updateSnapshot({ ...initial, relations: [personal, changedShared], basis: { dataset: 2 } });
+    expect(updated.rows).toEqual([{ name: 'personal', source: 'source:personal' }, { name: 'shared updated', source: 'source:shared' }]);
+    expect(updated.resultKeys).toEqual(first.resultKeys);
+    expect(updated.state.resultDelta.updatedResultKeys).toHaveLength(1);
+
+    const removed = session.updateSnapshot({ ...initial, relations: [personal], basis: { dataset: 3 }, membershipRevision: 2 });
+    expect(removed.rows).toEqual([{ name: 'personal', source: 'source:personal' }]);
+    expect(removed.resultKeys).toEqual([first.resultKeys[0]]);
+    expect(removed.state.resultDelta.removedResultKeys).toEqual([first.resultKeys[1]]);
+
+    expect(evaluateQuery({ root: query, relations: [personal, personal] })).toMatchObject({
+      completeness: 'unknown',
+      issues: [{ code: 'query.input_identity_invalid', details: { reason: 'duplicate_attachment_input' } }]
+    });
   });
 
   it('does not recompute a graph whose relation dependencies did not change', () => {
@@ -329,6 +364,15 @@ describe('incremental query maintenance', () => {
     const result = session.updateSnapshot(second);
     expect(result.state).toMatchObject({ changedRelationIds: ['unrelated'], recomputedNodeCount: 0 });
     expect(semanticResult(result)).toEqual(oracle(operatorQueries.where as QueryNode, second));
+  });
+
+  it('does not recompute non-seek operators for basis evidence alone', () => {
+    const initial = snapshot(basePeople, 1);
+    const next = { ...initial, basis: { dataset: 'new-evidence' } };
+    const session = openIncrementalQueryMaintenance(plan(operatorQueries.where as QueryNode), initial);
+    const result = session.updateSnapshot(next);
+    expect(result.state).toMatchObject({ recomputedNodeCount: 0, changedNodeCount: 0 });
+    expect(semanticResult(result)).toEqual(oracle(operatorQueries.where as QueryNode, next));
   });
 
   it('stops delta propagation when an operator materialization does not change', () => {
@@ -343,7 +387,7 @@ describe('incremental query maintenance', () => {
       { occurrenceId: 'person:a', row: { ...basePeople[0]!.row, name: 'Ada changed outside the result' } },
       basePeople[1] as QueryRowOccurrence
     ];
-    const next = snapshot(changedFilteredOutRow, 2);
+    const next = { ...snapshot(changedFilteredOutRow, 2), basis: { dataset: 'changed-source-basis' } };
     const session = openIncrementalQueryMaintenance(plan(filtered), initial);
     const result = session.updateSnapshot(next);
     expect(result.state).toMatchObject({ materializedNodeCount: 3, recomputedNodeCount: 2, changedNodeCount: 1, resultDelta: { addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] } });

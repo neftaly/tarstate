@@ -2,6 +2,7 @@ import { canonicalizeJson, sha256Json, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
 import type { PreparedPlan } from './maintenance.js';
+import { comparePortableStrings } from './portable-order.js';
 
 /** `lower-bound` contains only proven rows; `unknown` withdraws the current row assertion. */
 export type Completeness = 'exact' | 'lower-bound' | 'unknown';
@@ -12,7 +13,7 @@ export type RelationUse = { readonly schemaView: ArtifactRef; readonly relationI
 export type RelationInput = {
   readonly relation: RelationUse;
   readonly rows: readonly QueryRecord[];
-  /** Stable base-row occurrence identities; attachment view identity is deliberately excluded. */
+  /** Stable base-row occurrence identities within this attachment input. */
   readonly occurrenceIds?: readonly string[];
   readonly completeness: Completeness;
   readonly sourceId?: string;
@@ -149,7 +150,7 @@ type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: 
 type ExpressionResult = { readonly status: 'known'; readonly value: JsonValue } | { readonly status: 'missing' | 'unknown' | 'indeterminate' | 'unavailable' };
 type EvalContext = { readonly row: ScopedRow; readonly parameters: Readonly<Record<string, JsonValue>>; readonly functions: FunctionRegistry; readonly issues: Issue[]; readonly query?: QueryContext };
 type QueryContext = {
-  readonly relations: ReadonlyMap<string, RelationInput>;
+  readonly relations: ReadonlyMap<string, readonly RelationInput[]>;
   readonly parameters: Readonly<Record<string, JsonValue>>;
   readonly functions: FunctionRegistry;
   readonly issues: Issue[];
@@ -169,13 +170,30 @@ type MaterializedQueryNode = {
 };
 
 const relationKey = (relation: RelationUse): string => relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
+const relationInputKey = (input: RelationInput): string => relationKey(input.relation) + '\u0000' + (input.attachmentId ?? '');
+const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyMap<string, readonly RelationInput[]> => {
+  const grouped = new Map<string, RelationInput[]>();
+  for (const input of inputs) {
+    const key = relationKey(input.relation);
+    const group = grouped.get(key);
+    if (group === undefined) grouped.set(key, [input]);
+    else group.push(input);
+  }
+  return grouped;
+};
+const relationOccurrence = (input: RelationInput, index: number): string => {
+  const occurrence = input.occurrenceIds?.[index] ?? relationKey(input.relation) + ':' + index;
+  const namespace = input.sourceId ?? input.attachmentId;
+  return namespace === undefined ? occurrence : namespace.length + ':' + namespace + occurrence.length + ':' + occurrence;
+};
 const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
 
 /** Evaluates the independent, deterministic semantic oracle. */
 export const evaluateQuery = (request: QueryRequest): QueryResult => {
-  const issues: Issue[] = [];
+  const issues = [...validateRelationInputs(request.relations, 'query')];
+  if (issues.length > 0) return { rows: [], resultKeys: [], completeness: 'unknown', issues };
   const context: QueryContext = {
-    relations: new Map(request.relations.map((input) => [relationKey(input.relation), input])),
+    relations: groupRelationInputs(request.relations),
     parameters: request.parameters ?? {},
     functions: request.functions ?? new Map(),
     issues,
@@ -210,21 +228,17 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     return materialized.result;
   }
   if (node.kind === 'from') {
-    const input = context.relations.get(relationKey(node.relation));
-    if (input === undefined || input.completeness === 'unknown') {
+    const inputs = context.relations.get(relationKey(node.relation));
+    if (inputs === undefined || inputs.some(({ completeness }) => completeness === 'unknown')) {
       context.issues.push(createIssue({ code: 'query.parameter_invalid', phase: 'query', severity: 'error', retry: 'after_refresh', relationId: node.relation.relationId, details: { reason: 'input_unavailable' } }));
       return { rows: [], completeness: 'unknown' };
     }
-    if (input.occurrenceIds !== undefined && input.occurrenceIds.length !== input.rows.length) {
-      context.issues.push(createIssue({ code: 'query.input_identity_invalid', phase: 'query', severity: 'error', retry: 'after_input', relationId: node.relation.relationId }));
-      return { rows: [], completeness: 'unknown' };
-    }
     return {
-      rows: input.rows.map((fields, index) => ({
+      rows: inputs.flatMap((input) => input.rows.map((fields, index) => ({
         scope: { ...context.outer?.scope, [node.alias]: fields },
-        provenance: { ...context.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: input.occurrenceIds?.[index] ?? relationKey(node.relation) + ':' + index } }
-      })),
-      completeness: input.completeness
+        provenance: { ...context.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: relationOccurrence(input, index) } }
+      }))),
+      completeness: inputs.some(({ completeness }) => completeness === 'lower-bound') ? 'lower-bound' : 'exact'
     };
   }
   if (node.kind === 'values') return { rows: node.rows.map((fields, index) => ({ scope: { ...context.outer?.scope, [node.alias]: fields }, provenance: { ...context.outer?.provenance, [node.alias]: { relationId: 'values', occurrence: 'values:' + index } } })), completeness: 'exact' };
@@ -710,7 +724,7 @@ const requiredAlias = (row: ScopedRow, alias: string, context: QueryContext): Qu
   return undefined;
 };
 
-const resultKey = (row: ScopedRow): string => Object.entries(row.provenance).sort(([left], [right]) => left.localeCompare(right)).map(([alias, provenance]) => alias.length + ':' + alias + provenance.occurrence.length + ':' + provenance.occurrence).join('');
+const resultKey = (row: ScopedRow): string => Object.entries(row.provenance).sort(([left], [right]) => comparePortableStrings(left, right)).map(([alias, provenance]) => alias.length + ':' + alias + provenance.occurrence.length + ':' + provenance.occurrence).join('');
 const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => Object.fromEntries(Object.entries(record).map(([name, value]) => [fields[name] ?? name, value]));
 const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => Object.fromEntries(Object.entries(record).filter(([name]) => !fields.has(name)));
 const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));
@@ -726,7 +740,7 @@ const compareOrder = (left: ScopedRow, right: ScopedRow, terms: readonly OrderTe
     const comparison = compareOrderedExpressions(leftValue, rightValue, term);
     if (comparison !== 0) return comparison;
   }
-  return resultKey(left).localeCompare(resultKey(right));
+  return comparePortableStrings(resultKey(left), resultKey(right));
 };
 
 const compareRowToCursor = (row: ScopedRow, terms: readonly OrderTerm[], cursor: QueryCursor, context: QueryContext): number => {
@@ -738,7 +752,7 @@ const compareRowToCursor = (row: ScopedRow, terms: readonly OrderTerm[], cursor:
     const comparison = compareOrderedExpressions(rowValue, cursorValue, term);
     if (comparison !== 0) return comparison;
   }
-  return resultKey(row).localeCompare(cursor.resultKey);
+  return comparePortableStrings(resultKey(row), cursor.resultKey);
 };
 
 const compareOrderedExpressions = (left: ExpressionResult, right: ExpressionResult, term: OrderTerm): number => {
@@ -847,7 +861,8 @@ export const openIncrementalQueryMaintenance = (
         const externalDependencies = graph.externalDependencies.get(node) as ReadonlySet<string>;
         const childChanged = children.some((child) => changedNodes.has(child));
         const externalInputChanged = [...externalDependencies].some((key) => changedRelations.has(key));
-        if (!sessionEvidenceChanged && !childChanged && !externalInputChanged) continue;
+        const evidenceInputChanged = sessionEvidenceChanged && graph.sessionEvidenceDependencies.get(node) === true;
+        if (!evidenceInputChanged && !childChanged && !externalInputChanged) continue;
         const previousNode = materialized.get(node);
         const nextNode = materializeQueryNode(node, nextSnapshot, materialized);
         materialized.set(node, nextNode);
@@ -884,6 +899,7 @@ type CompiledQueryGraph = {
   readonly nodes: readonly QueryNode[];
   readonly children: ReadonlyMap<QueryNode, readonly QueryNode[]>;
   readonly externalDependencies: ReadonlyMap<QueryNode, ReadonlySet<string>>;
+  readonly sessionEvidenceDependencies: ReadonlyMap<QueryNode, boolean>;
 };
 
 const compileQueryGraph = (root: QueryNode): CompiledQueryGraph => {
@@ -900,7 +916,8 @@ const compileQueryGraph = (root: QueryNode): CompiledQueryGraph => {
   return {
     nodes: Object.freeze(nodes),
     children,
-    externalDependencies: new Map(nodes.map((node) => [node, relationDependencies(node, children.get(node))]))
+    externalDependencies: new Map(nodes.map((node) => [node, relationDependencies(node, children.get(node))])),
+    sessionEvidenceDependencies: new Map(nodes.map((node) => [node, containsSeek(node, children.get(node))]))
   };
 };
 
@@ -925,6 +942,17 @@ const relationDependencies = (node: QueryNode, excludedChildren: readonly QueryN
   return dependencies;
 };
 
+const containsSeek = (node: QueryNode, excludedChildren: readonly QueryNode[] = []): boolean => {
+  const excluded = new Set<unknown>(excludedChildren);
+  const visit = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(visit);
+    if (value === null || typeof value !== 'object' || excluded.has(value)) return false;
+    const candidate = value as Readonly<Record<string, unknown>>;
+    return candidate.kind === 'seek' || Object.values(candidate).some(visit);
+  };
+  return visit(node);
+};
+
 const isRelationUse = (value: unknown): value is RelationUse => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const candidate = value as { readonly schemaView?: unknown; readonly relationId?: unknown };
@@ -938,7 +966,7 @@ const materializeQueryNode = (
 ): MaterializedQueryNode => {
   const issues: Issue[] = [];
   const context: QueryContext = {
-    relations: new Map(snapshot.relations.map((input) => [relationKey(input.relation), input])),
+    relations: groupRelationInputs(snapshot.relations),
     parameters: snapshot.parameters ?? {},
     functions: snapshot.functions ?? new Map(),
     issues,
@@ -1002,17 +1030,25 @@ const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: Material
 const scopedRowIdentity = (row: ScopedRow): string => resultKey(row) + '\u0000' + canonicalizeQueryValue(visibleRow(row));
 
 const validateMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): readonly Issue[] => {
+  return validateRelationInputs(snapshot.relations, 'incremental');
+};
+
+const validateRelationInputs = (inputs: readonly RelationInput[], mode: 'query' | 'incremental'): readonly Issue[] => {
   const identities = new Set<string>();
   const issues: Issue[] = [];
-  for (const input of snapshot.relations) {
-    const identity = relationKey(input.relation);
+  for (const input of inputs) {
+    const identity = relationInputKey(input);
     if (identities.has(identity)) {
-      issues.push(incrementalQueryIssue('query.incremental_relation_ambiguous', { relationId: input.relation.relationId }));
+      issues.push(mode === 'incremental'
+        ? incrementalQueryIssue('query.incremental_relation_ambiguous', { relationId: input.relation.relationId, attachmentId: input.attachmentId ?? null })
+        : createIssue({ code: 'query.input_identity_invalid', relationId: input.relation.relationId, details: { reason: 'duplicate_attachment_input', attachmentId: input.attachmentId ?? null } }));
       continue;
     }
     identities.add(identity);
     if (input.occurrenceIds !== undefined && (input.occurrenceIds.length !== input.rows.length || new Set(input.occurrenceIds).size !== input.occurrenceIds.length)) {
-      issues.push(incrementalQueryIssue('query.incremental_identity_invalid', { relationId: input.relation.relationId }));
+      issues.push(mode === 'incremental'
+        ? incrementalQueryIssue('query.incremental_identity_invalid', { relationId: input.relation.relationId, attachmentId: input.attachmentId ?? null })
+        : createIssue({ code: 'query.input_identity_invalid', relationId: input.relation.relationId, details: { reason: 'invalid_occurrence_ids', attachmentId: input.attachmentId ?? null } }));
     }
   }
   return issues;
@@ -1024,8 +1060,8 @@ const validateMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, next: Que
     issues.push(incrementalQueryIssue('query.incremental_session_input_changed', { reason: 'parameters_or_functions' }));
     return issues;
   }
-  const previousRelations = uniqueRelationMap(previous.relations);
-  const nextRelations = uniqueRelationMap(next.relations);
+  const previousRelations = relationInputMap(previous.relations);
+  const nextRelations = relationInputMap(next.relations);
   if (previousRelations === undefined || nextRelations === undefined) return issues;
   const identities = new Set([...previousRelations.keys(), ...nextRelations.keys()]);
   for (const identity of identities) {
@@ -1046,10 +1082,10 @@ const validateMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, next: Que
   return deduplicateQueryIssues(issues);
 };
 
-const uniqueRelationMap = (relations: readonly RelationInput[]): ReadonlyMap<string, RelationInput> | undefined => {
+const relationInputMap = (relations: readonly RelationInput[]): ReadonlyMap<string, RelationInput> | undefined => {
   const output = new Map<string, RelationInput>();
   for (const relation of relations) {
-    const identity = relationKey(relation.relation);
+    const identity = relationInputKey(relation);
     if (output.has(identity)) return undefined;
     output.set(identity, relation);
   }
@@ -1057,20 +1093,21 @@ const uniqueRelationMap = (relations: readonly RelationInput[]): ReadonlyMap<str
 };
 
 const changedRelationKeys = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): ReadonlySet<string> => {
-  const before = uniqueRelationMap(previous.relations) ?? new Map();
-  const after = uniqueRelationMap(next.relations) ?? new Map();
+  const before = relationInputMap(previous.relations) ?? new Map();
+  const after = relationInputMap(next.relations) ?? new Map();
   const changed = new Set<string>();
   for (const identity of new Set([...before.keys(), ...after.keys()])) {
     const left = before.get(identity);
     const right = after.get(identity);
-    if (left === undefined || right === undefined || !relationInputEqual(left, right)) changed.add(identity);
+    const input = left ?? right;
+    if (input !== undefined && (left === undefined || right === undefined || !relationInputEqual(left, right))) changed.add(relationKey(input.relation));
   }
   return changed;
 };
 
 const changedRelationIds = (snapshot: QueryMaintenanceSnapshot, identities: ReadonlySet<string>): readonly string[] => {
-  const byIdentity = uniqueRelationMap(snapshot.relations) ?? new Map();
-  return [...new Set([...identities].map((identity) => byIdentity.get(identity)?.relation.relationId ?? identity.split('\u0000').at(-1) as string))].sort((left, right) => left.localeCompare(right));
+  const byIdentity = groupRelationInputs(snapshot.relations);
+  return [...new Set([...identities].map((identity) => byIdentity.get(identity)?.[0]?.relation.relationId ?? identity.split('\u0000').at(-1) as string))].sort(comparePortableStrings);
 };
 
 const relationInputEqual = (left: RelationInput, right: RelationInput): boolean =>

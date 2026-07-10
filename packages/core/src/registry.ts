@@ -1,5 +1,6 @@
 import { canonicalizeJson, sha256Json, type ContentHash } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { comparePortableStrings } from './portable-order.js';
 import type { JsonValue } from './value.js';
 
 export type CapabilityClass = 'edit' | 'executor' | 'source' | 'function' | 'codec' | 'collation';
@@ -79,8 +80,8 @@ export class CapabilityRegistry {
   }
 
   async fingerprint(resourceBudgets: JsonValue = {}): Promise<ContentHash> {
-    const declarations = [...this.#declarations.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([key, declaration]) => ({ key, declaration }));
-    const implementations = [...this.#implementations.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([key, implementation]) => ({ key, integrity: implementation.integrity }));
+    const declarations = [...this.#declarations.entries()].sort(([left], [right]) => comparePortableStrings(left, right)).map(([key, declaration]) => ({ key, declaration }));
+    const implementations = [...this.#implementations.entries()].sort(([left], [right]) => comparePortableStrings(left, right)).map(([key, implementation]) => ({ key, integrity: implementation.integrity }));
     return sha256Json({ trustPolicyId: this.trustPolicyId, declarations, implementations, resourceBudgets } as unknown as JsonValue);
   }
 

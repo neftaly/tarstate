@@ -437,7 +437,12 @@ const queryMaintenanceSnapshot = (
   input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
   functions: FunctionRegistry | undefined
 ): QueryMaintenanceSnapshot => ({
-  relations: input.attachments.flatMap(({ projection }) => projection),
+  relations: input.attachments.flatMap(({ member, snapshot, projection }) => projection.map((relation) => ({
+    ...relation,
+    sourceId: member.sourceId,
+    attachmentId: member.attachmentId,
+    basis: snapshot.basis
+  }))),
   parameters: input.parameters,
   ...(functions === undefined ? {} : { functions }),
   basis: {

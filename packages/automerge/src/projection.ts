@@ -2,6 +2,7 @@ import * as Automerge from '@automerge/automerge';
 import type { JsonValue } from '@tarstate/core';
 import { automergeBasis, type AutomergeBasis } from './source.js';
 import { isAutomergeReservedRootProperty } from './reserved.js';
+import { comparePortableStrings } from './portable-order.js';
 
 export type AutomergeFactValue = JsonValue;
 export type AutomergePath = readonly (string | number)[];
@@ -146,7 +147,7 @@ export const normalizeAutomergeValue = (value: unknown): AutomergeFactValue => {
 
 export const conflictsAt = (owner: object, property: string | number): readonly (readonly [string, unknown])[] => {
   const conflicts = Automerge.getConflicts(owner as Record<string, unknown>, String(property));
-  return Object.entries(conflicts ?? {}).sort(([left], [right]) => left.localeCompare(right));
+  return Object.entries(conflicts ?? {}).sort(([left], [right]) => comparePortableStrings(left, right));
 };
 
 const objectIdOf = (value: unknown): string | undefined => {

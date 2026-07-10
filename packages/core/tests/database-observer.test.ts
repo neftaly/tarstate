@@ -223,10 +223,12 @@ describe('database membership and observation', () => {
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
     const observer = database.observe({ plan: relationalPlan() });
-    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }], resultKeys: ['3:row5:row:2'] } });
+    const initial = observer.getSnapshot();
+    expect(initial).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+    const initialKey = initial.state === 'open' ? initial.current.resultKeys[0] : undefined;
 
     source.publish({ rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }] });
-    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], resultKeys: ['3:row5:row:2', '3:row5:row:3'] } });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], resultKeys: [initialKey, expect.any(String)] } });
 
     source.publish({ state: 'failed', freshness: 'none' });
     expect(observer.getSnapshot()).toMatchObject({
@@ -236,11 +238,69 @@ describe('database membership and observation', () => {
     });
 
     source.publish({ state: 'ready', freshness: 'current', rows: [{ id: 4, value: 'recovered' }] });
-    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], resultKeys: ['3:row5:row:4'], completeness: 'exact' } });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], resultKeys: [expect.any(String)], completeness: 'exact' } });
 
     observer.close();
     database.close();
     attachmentLease.close();
+  });
+
+  it('unions the same relation from two real attachments with source provenance', () => {
+    const personal = new TestSource('source:personal', [{ id: 1, value: 'personal' }]);
+    const shared = new TestSource('source:shared', [{ id: 1, value: 'shared' }]);
+    const catalog = new AttachmentCatalog();
+    const personalLease = catalog.attach(relationalAttachment('attachment:personal', personal));
+    const sharedLease = catalog.attach(relationalAttachment('attachment:shared', shared));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one',
+      state: 'settled',
+      members: [member('attachment:personal', personal.sourceId), member('attachment:shared', shared.sourceId)]
+    });
+    const query: QueryNode = {
+      kind: 'select',
+      alias: 'result',
+      input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
+      fields: {
+        id: { kind: 'field', alias: 'row', name: 'id' },
+        value: { kind: 'field', alias: 'row', name: 'value' },
+        source: { kind: 'source-of', alias: 'row' }
+      }
+    };
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public',
+      authorityFingerprint: 'authority:public',
+      registryFingerprint: 'registry:one',
+      attachments: catalog,
+      datasets: [dataset],
+      canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const observer = database.observe({ plan: { ...relationalPlan(), query } });
+    const initial = observer.getSnapshot();
+    expect(initial).toMatchObject({ state: 'open', current: { rows: [
+      { id: 1, value: 'personal', source: 'source:personal' },
+      { id: 1, value: 'shared', source: 'source:shared' }
+    ] } });
+    const initialKeys = initial.state === 'open' ? initial.current.resultKeys : [];
+    expect(new Set(initialKeys).size).toBe(2);
+
+    shared.publish({ rows: [{ id: 1, value: 'shared updated' }] });
+    const updated = observer.getSnapshot();
+    expect(updated).toMatchObject({ state: 'open', current: { rows: [
+      { id: 1, value: 'personal', source: 'source:personal' },
+      { id: 1, value: 'shared updated', source: 'source:shared' }
+    ], resultKeys: initialKeys } });
+
+    dataset.replaceMembers([member('attachment:personal', personal.sourceId)], 'settled');
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      rows: [{ id: 1, value: 'personal', source: 'source:personal' }],
+      resultKeys: [initialKeys[0]]
+    } });
+
+    observer.close();
+    database.close();
+    sharedLease.close();
+    personalLease.close();
   });
 
   it('uses exactly one dataset, deduplicates source runtimes, and preserves separate attachment authority', () => {

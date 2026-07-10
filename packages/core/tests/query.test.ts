@@ -252,7 +252,7 @@ describe('production query oracle', () => {
     };
     const result = evaluateQuery({ root, relations: [{ ...relation('people', [{ id: 1 }, { id: 2 }]), occurrenceIds: ['person:1', 'person:2'] }] });
     expect(result.rows).toEqual([{ left: { id: 1 }, right: { id: 2 } }]);
-    expect(result.resultKeys[0]).toBe('4:left8:person:15:right8:person:2');
+    expect(result.resultKeys[0]).toBe('4:left24:11:source:test8:person:15:right24:11:source:test8:person:2');
   });
 
   it('encodes result lineage without delimiter collisions', () => {

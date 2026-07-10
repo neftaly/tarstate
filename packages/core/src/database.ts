@@ -2,6 +2,7 @@ import { canonicalizeJson } from './artifacts.js';
 import type { ReadyAttachmentPreparation } from './attachment-preparation.js';
 import type { Issue } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
+import { comparePortableStrings } from './portable-order.js';
 
 export type SourceLifecycleState = 'loading' | 'ready' | 'failed' | 'denied' | 'deleted' | 'closed';
 export type SourceFreshness = 'current' | 'stale' | 'none';
@@ -176,7 +177,7 @@ export class AttachmentCatalog {
   get(attachmentId: string): DatabaseAttachment | undefined { return this.#attachments.get(attachmentId)?.attachment; }
 
   list(): readonly DatabaseAttachment[] {
-    return [...this.#attachments.values()].map(({ attachment }) => attachment).sort((left, right) => left.attachmentId.localeCompare(right.attachmentId));
+    return [...this.#attachments.values()].map(({ attachment }) => attachment).sort((left, right) => comparePortableStrings(left.attachmentId, right.attachmentId));
   }
 
   sourceCount(): number { return this.#sources.size; }
@@ -201,7 +202,7 @@ const normalizeMembers = (members: readonly DatasetMember[]): readonly DatasetMe
     if (existing !== undefined && canonicalizeJson(existing as never) !== canonicalizeJson(normalized as never)) throw new Error('Ambiguous dataset member ' + member.attachmentId);
     byAttachment.set(member.attachmentId, normalized);
   }
-  return Object.freeze([...byAttachment.values()].sort((left, right) => left.attachmentId.localeCompare(right.attachmentId)));
+  return Object.freeze([...byAttachment.values()].sort((left, right) => comparePortableStrings(left.attachmentId, right.attachmentId)));
 };
 
 const sameMembers = (left: readonly DatasetMember[], right: readonly DatasetMember[]): boolean => canonicalizeJson(left as never) === canonicalizeJson(right as never);

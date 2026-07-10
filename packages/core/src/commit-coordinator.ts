@@ -1,4 +1,5 @@
 import { createIssue, type Issue } from './issues.js';
+import { comparePortableStrings } from './portable-order.js';
 import type { SourceSnapshot } from './database.js';
 import type {
   AtomicSource,
@@ -29,7 +30,7 @@ export const coordinateSourceCommit = async <Storage, Command>(input: {
     return { outcome: 'rejected', issues: [createIssue({ code: 'source.not_ready', phase: 'load', severity: 'error', retry: 'after_refresh', sourceId: input.source.sourceId, details: { state: snapshot.state } })] };
   }
   const issues: Issue[] = [];
-  const plans = [...input.bindings].sort((left, right) => left.id.localeCompare(right.id)).map((binding) => {
+  const plans = [...input.bindings].sort((left, right) => comparePortableStrings(left.id, right.id)).map((binding) => {
     const plan = binding.plan(snapshot, input.edits);
     issues.push(...plan.issues);
     requireContained(input.source, binding.id, 'read', plan.readFootprint, binding.declaredReadFootprint, issues);

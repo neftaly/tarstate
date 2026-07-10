@@ -2,6 +2,7 @@ import * as Automerge from '@automerge/automerge';
 import { canonicalizeJson, type JsonValue } from '@tarstate/core';
 import { conflictsAt, normalizeAutomergeValue, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import { isAutomergeReservedRootProperty } from './reserved.js';
+import { comparePortableStrings } from './portable-order.js';
 import { automergeBasis, type AutomergeBasis, type AutomergeSnapshot, type AutomergeSourceCommand } from './source.js';
 
 export type AutomergeRowLocator = {
@@ -83,7 +84,7 @@ export class AutomergeMapProjectionPlanner<T extends object, Row extends Readonl
     const rows: AutomergeProjectedRow<Row>[] = [];
     const issues: AutomergeProjectionIssue[] = [];
     let incomplete = false;
-    for (const [mapKey, visible] of Object.entries(collection).sort(([left], [right]) => left.localeCompare(right))) {
+    for (const [mapKey, visible] of Object.entries(collection).sort(([left], [right]) => comparePortableStrings(left, right))) {
       if (this.#options.collectionPath.length === 0 && isAutomergeReservedRootProperty(mapKey)) continue;
       const conflictAlternatives = conflictsAt(collection, mapKey);
       const candidates = conflictAlternatives.length > 1 ? conflictAlternatives : [['', visible] as const];
