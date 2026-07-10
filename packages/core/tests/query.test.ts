@@ -68,6 +68,21 @@ describe('production query oracle', () => {
     expect(new Set(result.resultKeys).size).toBe(2);
   });
 
+  it('keeps projected identities stable and union-all branch identities unique', () => {
+    const base = from('people', 'person');
+    const projection: QueryNode = { kind: 'select', input: base, alias: 'result', fields: { id: { kind: 'field', alias: 'person', name: 'id' } } };
+    const initial = evaluateQuery({ root: projection, relations: [{ ...relation('people', [{ id: 1 }, { id: 2 }]), occurrenceIds: ['person:1', 'person:2'] }] });
+    const insertedBefore = evaluateQuery({ root: projection, relations: [{ ...relation('people', [{ id: 0 }, { id: 1 }, { id: 2 }]), occurrenceIds: ['person:0', 'person:1', 'person:2'] }] });
+    expect(insertedBefore.resultKeys.slice(1)).toEqual(initial.resultKeys);
+
+    const duplicated = evaluateQuery({ root: { kind: 'set', op: 'union-all', left: base, right: base }, relations: [{ ...relation('people', [{ id: 1 }]), occurrenceIds: ['person:1'] }] });
+    expect(duplicated.rows).toEqual([{ id: 1 }, { id: 1 }]);
+    expect(new Set(duplicated.resultKeys).size).toBe(2);
+
+    const windowed: QueryNode = { kind: 'window', input: { kind: 'set', op: 'union-all', left: base, right: base }, alias: 'person', fields: { rowNumber: { kind: 'window', op: 'row-number', orderBy: [{ value: { kind: 'field', alias: 'person', name: 'id' }, direction: 'asc' }] } } };
+    expect(evaluateQuery({ root: windowed, relations: [{ ...relation('people', [{ id: 1 }]), occurrenceIds: ['person:1'] }] }).rows).toEqual([{ id: 1, rowNumber: 1 }, { id: 1, rowNumber: 2 }]);
+  });
+
   it('poisons completeness when a required named call is unavailable', () => {
     const capability: CapabilityRef = { id: 'urn:test:function', version: '1', contractHash: `sha256:${'b'.repeat(64)}` };
     const result = evaluateQuery({
@@ -237,8 +252,22 @@ describe('production query oracle', () => {
     };
     const result = evaluateQuery({ root, relations: [{ ...relation('people', [{ id: 1 }, { id: 2 }]), occurrenceIds: ['person:1', 'person:2'] }] });
     expect(result.rows).toEqual([{ left: { id: 1 }, right: { id: 2 } }]);
-    expect(result.resultKeys[0]).toContain('left=person:1');
-    expect(result.resultKeys[0]).toContain('right=person:2');
+    expect(result.resultKeys[0]).toBe('4:left8:person:15:right8:person:2');
+  });
+
+  it('encodes result lineage without delimiter collisions', () => {
+    const root: QueryNode = {
+      kind: 'join', join: 'inner', left: from('left-people', 'left'), right: from('right-people', 'right'),
+      on: { kind: 'compare', op: 'eq', left: { kind: 'field', alias: 'left', name: 'pair' }, right: { kind: 'field', alias: 'right', name: 'pair' } }
+    };
+    const result = evaluateQuery({
+      root,
+      relations: [
+        { ...relation('left-people', [{ pair: 1 }, { pair: 2 }]), occurrenceIds: ['x|right=y', 'x'] },
+        { ...relation('right-people', [{ pair: 1 }, { pair: 2 }]), occurrenceIds: ['z', 'y|right=z'] }
+      ]
+    });
+    expect(new Set(result.resultKeys).size).toBe(2);
   });
 
   it('rejects missing transformation aliases and recursion references instead of inventing empty inputs', () => {

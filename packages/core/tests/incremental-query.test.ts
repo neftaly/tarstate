@@ -147,7 +147,7 @@ const operatorQueries: Readonly<Record<string, QueryNode>> = {
     kind: 'seek',
     input: people,
     by: [{ value: field('p', 'id'), direction: 'asc' }],
-    after: { order: [1], resultKey: 'p=person:a', basis: { dataset: 'stable-for-seek' }, membershipRevision: 1, mode: 'live' }
+    after: { order: [1], resultKey: '1:p8:person:a', basis: { dataset: 'stable-for-seek' }, membershipRevision: 1, mode: 'live' }
   },
   subquery: {
     kind: 'where',
@@ -248,15 +248,15 @@ describe('incremental query maintenance', () => {
     ];
     const oneRemaining: readonly QueryRowOccurrence[] = [duplicates[1] as QueryRowOccurrence];
     const session = openIncrementalQueryMaintenance(plan(people), snapshot(duplicates, 1));
-    expect(session.getCurrentResult().resultKeys).toEqual(['p=person:first', 'p=person:second']);
+    expect(session.getCurrentResult().resultKeys).toEqual(['1:p12:person:first', '1:p13:person:second']);
     const removed = session.updateSnapshot(snapshot(oneRemaining, 2));
     expect(semanticResult(removed)).toEqual(oracle(people, snapshot(oneRemaining, 2)));
-    expect(removed.state.resultDelta).toEqual({ addedResultKeys: [], removedResultKeys: ['p=person:first'], updatedResultKeys: [] });
+    expect(removed.state.resultDelta).toEqual({ addedResultKeys: [], removedResultKeys: ['1:p12:person:first'], updatedResultKeys: [] });
 
     const reincarnated: readonly QueryRowOccurrence[] = [{ occurrenceId: 'person:third', row: { id: 1, name: 'same' } }];
     const replacement = session.updateSnapshot(snapshot(reincarnated, 3));
     expect(semanticResult(replacement)).toEqual(oracle(people, snapshot(reincarnated, 3)));
-    expect(replacement.state.resultDelta).toEqual({ addedResultKeys: ['p=person:third'], removedResultKeys: ['p=person:second'], updatedResultKeys: [] });
+    expect(replacement.state.resultDelta).toEqual({ addedResultKeys: ['1:p12:person:third'], removedResultKeys: ['1:p13:person:second'], updatedResultKeys: [] });
   });
 
   it('maintains exact, lower-bound, unknown, basis, membership, and recovery transitions', () => {
@@ -317,7 +317,7 @@ describe('incremental query maintenance', () => {
     const session = openIncrementalQueryMaintenance(plan(people), first);
     const maintained = session.updateSnapshot(second);
     expect(semanticResult(maintained)).toEqual(oracle(people, second));
-    expect(maintained.state.resultDelta.updatedResultKeys).toEqual(['p=person:unknown']);
+    expect(maintained.state.resultDelta.updatedResultKeys).toEqual(['1:p14:person:unknown']);
   });
 
   it('does not recompute a graph whose relation dependencies did not change', () => {

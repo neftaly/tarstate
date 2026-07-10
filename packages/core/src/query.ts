@@ -343,10 +343,10 @@ const evaluateAggregate = (node: Extract<QueryNode, { readonly kind: 'aggregate'
     else existing.rows.push(row);
   }
   if (groups.size === 0 && Object.keys(node.groupBy).length === 0) groups.set('{}', { key: {}, rows: [] });
-  const rows = [...groups.values()].map(({ key, rows: members }, index): ScopedRow => {
+  const rows = [...groups.values()].map(({ key, rows: members }): ScopedRow => {
     const output: Record<string, QueryLogicalValue> = { ...key };
     for (const [name, aggregate] of Object.entries(node.measures)) output[name] = aggregateValue(aggregate, members, context);
-    return { scope: { [node.alias]: output }, provenance: { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + index + ':' + canonicalizeQueryValue(key) } } };
+    return { scope: { [node.alias]: output }, provenance: { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + canonicalizeQueryValue(key) } } };
   });
   return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: 'exact' };
 };
@@ -379,7 +379,7 @@ const evaluateSet = (node: Extract<QueryNode, { readonly kind: 'set' }>, context
   const right = evaluateNode(node.right, context);
   if (left.completeness === 'unknown' || right.completeness === 'unknown') return { rows: [], completeness: 'unknown' };
   if (node.op === 'except' && right.completeness !== 'exact') return nonMonotoneUnknown(context, node.op);
-  if (node.op === 'union-all') return { rows: [...left.rows, ...right.rows], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
+  if (node.op === 'union-all') return { rows: [...tagSetBranch(left.rows, 'left'), ...tagSetBranch(right.rows, 'right')], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
   const leftMap = uniqueRows(left.rows);
   const rightMap = uniqueRows(right.rows);
   if (node.op === 'union') return { rows: [...new Map([...leftMap, ...rightMap]).values()], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
@@ -392,20 +392,20 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
   if (inner.completeness !== 'exact') return nonMonotoneUnknown(context, 'window');
   const output = [...inner.rows];
   for (const [field, window] of Object.entries(node.fields)) {
-    const partitions = new Map<string, ScopedRow[]>();
-    for (const row of output) {
+    const partitions = new Map<string, { readonly row: ScopedRow; readonly outputIndex: number }[]>();
+    for (const [outputIndex, row] of output.entries()) {
       const partitionValues = (window.partitionBy ?? []).map((expr) => evaluateExpr(expr, exprContext(row, context)));
       if (partitionValues.some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
       const key = canonicalizeJson(partitionValues.map(expressionJson));
       const rows = partitions.get(key) ?? [];
-      rows.push(row);
+      rows.push({ row, outputIndex });
       partitions.set(key, rows);
     }
     for (const partition of partitions.values()) {
-      partition.sort((left, right) => compareOrder(left, right, window.orderBy, context));
+      partition.sort((left, right) => compareOrder(left.row, right.row, window.orderBy, context));
       let rank = 1;
       let previousOrder: string | undefined;
-      partition.forEach((row, index) => {
+      partition.forEach(({ row, outputIndex }, index) => {
         const orderValues = window.orderBy.map((term) => evaluateExpr(term.value, exprContext(row, context)));
         if (orderValues.some((item) => item.status === 'unavailable' || item.status === 'indeterminate')) context.unavailable = true;
         const orderKey = canonicalizeJson(orderValues.map(expressionJson));
@@ -413,15 +413,14 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
         previousOrder = orderKey;
         let value: JsonValue = window.op === 'row-number' ? index + 1 : rank;
         if (window.op === 'lag') {
-          const previous = partition[index - (window.offset ?? 1)];
+          const previous = partition[index - (window.offset ?? 1)]?.row;
           const lagged = previous === undefined || window.value === undefined ? undefined : evaluateExpr(window.value, exprContext(previous, context));
           if (lagged?.status === 'unavailable' || lagged?.status === 'indeterminate') context.unavailable = true;
           value = lagged === undefined ? null : expressionJson(lagged);
         }
         const aliasFields = requiredAlias(row, node.alias, context);
         if (aliasFields === undefined) return;
-        const rowIndex = output.indexOf(row);
-        output[rowIndex] = { ...row, scope: { ...row.scope, [node.alias]: { ...aliasFields, [field]: value } } };
+        output[outputIndex] = { ...row, scope: { ...row.scope, [node.alias]: { ...aliasFields, [field]: value } } };
       });
     }
   }
@@ -683,7 +682,7 @@ const projectFields = (fields: Readonly<Record<string, Expr>>, context: EvalCont
 };
 
 const mapProjection = (inner: NodeResult, alias: string, project: (row: ScopedRow) => QueryRecord, context: QueryContext): NodeResult => {
-  const rows = inner.rows.map((row, index) => ({ scope: { [alias]: project(row) }, provenance: { [alias]: { relationId: 'select', occurrence: resultKey(row) + ':select:' + index } } }));
+  const rows = inner.rows.map((row) => ({ scope: { [alias]: project(row) }, provenance: { [alias]: { relationId: 'select', occurrence: resultKey(row) + ':select' } } }));
   return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
 };
 
@@ -703,10 +702,14 @@ const requiredAlias = (row: ScopedRow, alias: string, context: QueryContext): Qu
   return undefined;
 };
 
-const resultKey = (row: ScopedRow): string => Object.entries(row.provenance).sort(([left], [right]) => left.localeCompare(right)).map(([alias, provenance]) => alias + '=' + provenance.occurrence).join('|');
+const resultKey = (row: ScopedRow): string => Object.entries(row.provenance).sort(([left], [right]) => left.localeCompare(right)).map(([alias, provenance]) => alias.length + ':' + alias + provenance.occurrence.length + ':' + provenance.occurrence).join('');
 const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => Object.fromEntries(Object.entries(record).map(([name, value]) => [fields[name] ?? name, value]));
 const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => Object.fromEntries(Object.entries(record).filter(([name]) => !fields.has(name)));
 const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));
+const tagSetBranch = (rows: readonly ScopedRow[], branch: 'left' | 'right'): readonly ScopedRow[] => rows.map((row) => ({
+  ...row,
+  provenance: Object.fromEntries(Object.entries(row.provenance).map(([alias, value]) => [alias, { ...value, occurrence: branch + ':' + value.occurrence }]))
+}));
 const compareOrder = (left: ScopedRow, right: ScopedRow, terms: readonly OrderTerm[], context: QueryContext): number => {
   for (const term of terms) {
     const leftValue = evaluateExpr(term.value, exprContext(left, context));
@@ -886,14 +889,10 @@ const compileQueryGraph = (root: QueryNode): CompiledQueryGraph => {
   };
   visit(root);
   const children = new Map(nodes.map((node) => [node, directQueryChildren(node)]));
-  const dependencies = new Map(nodes.map((node) => [node, relationDependencies(node)]));
   return {
     nodes: Object.freeze(nodes),
     children,
-    externalDependencies: new Map(nodes.map((node) => {
-      const childDependencies = new Set((children.get(node) ?? []).flatMap((child) => [...(dependencies.get(child) ?? [])]));
-      return [node, new Set([...(dependencies.get(node) ?? [])].filter((identity) => !childDependencies.has(identity)))] as const;
-    }))
+    externalDependencies: new Map(nodes.map((node) => [node, relationDependencies(node, children.get(node))]))
   };
 };
 
@@ -904,11 +903,12 @@ const directQueryChildren = (node: QueryNode): readonly QueryNode[] => {
   return [];
 };
 
-const relationDependencies = (node: QueryNode): ReadonlySet<string> => {
+const relationDependencies = (node: QueryNode, excludedChildren: readonly QueryNode[] = []): ReadonlySet<string> => {
   const dependencies = new Set<string>();
+  const excluded = new Set<unknown>(excludedChildren);
   const visit = (value: unknown): void => {
     if (Array.isArray(value)) { for (const item of value) visit(item); return; }
-    if (value === null || typeof value !== 'object') return;
+    if (value === null || typeof value !== 'object' || excluded.has(value)) return;
     const candidate = value as Readonly<Record<string, unknown>>;
     if (candidate.kind === 'from' && isRelationUse(candidate.relation)) dependencies.add(relationKey(candidate.relation));
     for (const child of Object.values(candidate)) visit(child);

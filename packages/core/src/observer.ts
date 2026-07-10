@@ -125,6 +125,20 @@ export type ObserveRequest<Query> = {
   readonly allowPartial?: boolean;
 };
 
+export const queryObservationKey = <Query>(
+  database: { readonly authorityScope: string; readonly authorityFingerprint: string; readonly registryFingerprint: string },
+  request: ObserveRequest<Query>
+): string => canonicalizeJson([
+  request.plan.planId,
+  request.plan.rootNodeId,
+  request.parameters ?? {},
+  database.authorityScope,
+  database.authorityFingerprint,
+  database.registryFingerprint,
+  request.plan.datasetId,
+  request.allowPartial === true
+] as JsonValue);
+
 /** Authority-filtered database shell with one shared maintenance session per observation identity. */
 export class DatabaseView<Query, Row, Projection = unknown> {
   readonly authorityScope: string;
@@ -156,15 +170,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     const dataset = this.#datasets.get(request.plan.datasetId);
     if (dataset === undefined) throw new Error('Dataset is not part of this database view: ' + request.plan.datasetId);
     const parameters = deepFreezeClone(request.parameters ?? {}) as Readonly<Record<string, JsonValue>>;
-    const key = [
-      request.plan.planId,
-      canonicalizeJson(parameters as JsonValue),
-      this.authorityScope,
-      this.authorityFingerprint,
-      this.registryFingerprint,
-      request.plan.datasetId,
-      request.allowPartial === true ? 'partial' : 'exact'
-    ].join('\u0000');
+    const key = queryObservationKey(this, { ...request, parameters });
     let shared = this.#cache.get(key);
     if (shared === undefined) {
       shared = new SharedObservation({

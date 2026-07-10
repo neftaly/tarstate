@@ -188,10 +188,10 @@ describe('database membership and observation', () => {
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
     const observer = database.observe({ plan: relationalPlan() });
-    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }], resultKeys: ['row=row:2'] } });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }], resultKeys: ['3:row5:row:2'] } });
 
     source.publish({ rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }] });
-    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], resultKeys: ['row=row:2', 'row=row:3'] } });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], resultKeys: ['3:row5:row:2', '3:row5:row:3'] } });
 
     source.publish({ state: 'failed', freshness: 'none' });
     expect(observer.getSnapshot()).toMatchObject({
@@ -201,7 +201,7 @@ describe('database membership and observation', () => {
     });
 
     source.publish({ state: 'ready', freshness: 'current', rows: [{ id: 4, value: 'recovered' }] });
-    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], resultKeys: ['row=row:4'], completeness: 'exact' } });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], resultKeys: ['3:row5:row:4'], completeness: 'exact' } });
 
     observer.close();
     database.close();
@@ -299,6 +299,26 @@ describe('database membership and observation', () => {
     const later = database.observe({ plan: plan(), parameters: { selected: 1 } });
     expect(later.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
     later.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('keeps distinct prepared roots in collision-safe maintenance cache entries', () => {
+    const source = new TestSource('source:one', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:one', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
+    const database = view(catalog, [dataset]);
+    const firstPlan = { ...plan(), planId: 'query\u0000all', rootNodeId: 'root' };
+    const secondPlan = { ...plan(), planId: 'query', rootNodeId: 'all\u0000root' };
+    const first = database.observe({ plan: firstPlan });
+    const second = database.observe({ plan: secondPlan });
+
+    expect(database.getActiveMaintenanceCount()).toBe(2);
+    expect(first.getSnapshot()).not.toBe(second.getSnapshot());
+
+    first.close();
+    second.close();
     database.close();
     attachmentLease.close();
   });
