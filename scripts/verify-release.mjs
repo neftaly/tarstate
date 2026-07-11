@@ -14,7 +14,7 @@ try {
   for (const directory of packageDirectories) {
     const packageDirectory = path.join(root, 'packages', directory);
     const manifest = JSON.parse(readFileSync(path.join(packageDirectory, 'package.json'), 'utf8'));
-    if (manifest.version !== '0.2.0') fail(`${manifest.name}: expected version 0.2.0`);
+    if (manifest.version !== '0.2.1') fail(`${manifest.name}: expected version 0.2.1`);
     if (manifest.private === true) fail(`${manifest.name}: package remains private`);
     if (Object.keys(manifest.exports ?? {}).some((name) => name !== '.')) fail(`${manifest.name}: unexpected public subpath export`);
     if (manifest.exports?.['.']?.types !== './dist/index.d.ts' || manifest.exports?.['.']?.import !== './dist/index.js') {
@@ -43,7 +43,7 @@ try {
 
     await import(pathToFileURL(path.join(packageDirectory, 'dist', 'index.js')).href);
   }
-  console.log(`Verified ${packageDirectories.length} v0.2.0 tarballs and runtime entry points.`);
+  console.log(`Verified ${packageDirectories.length} v0.2.1 tarballs and runtime entry points.`);
 } finally {
   rmSync(temporaryDirectory, { recursive: true, force: true });
 }
