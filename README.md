@@ -1,33 +1,131 @@
 # Tarstate
 
-Tarstate 1.0 is a clean-slate rewrite of a functional, reactive relational
-interface over authority-scoped local-first sources.
+Tarstate is a relational interface for React (and other libraries) that lets
+you query local-first state trees like a database. It's a way to glue unrelated
+data sources together without hiding their ownership or atomic boundaries.
 
-The legacy implementation was removed from `main`. It remains available at the
-annotated Git tag `legacy-v0-final` (commit `25f707c`) for coarse benchmark and
-historical comparisons. It is not a compatibility target or dependency of the
-rewrite.
+Tarstate is **alpha quality** software.
 
-The current repository contains:
+It uses JSON-serializable schemas to describe data in terms of relationships
+and can generate TypeScript declarations and other deterministic artifacts.
+Schemas describe logical data rather than physical storage, which allows
+storage mappings and schema lenses to evolve independently.
 
-- the [normative v1 contract](docs/v1/README.md);
-- the portable semantic oracle, source coordinator, resolver, database,
-  observers, and receipts in `@tarstate/core`;
-- production Automerge and generic external-store/Zustand adapters;
-- the small React observer, commit, mutation-state, and optimistic-display adapter; and
-- deterministic schema, issue-catalog, and agent-description tooling.
+Incremental maintenance shares work between observers. Performance and GC are
+tracked with the repository benchmarks.
 
-Historical design and spike material remains available in Git history. The
-retained contract and executable production tests are the authority for v1.
+Tarstate is inspired by [wotbrew/relic](https://github.com/wotbrew/relic) and
+[Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf).
 
-```sh
-pnpm check:release
+## TS integration
+
+`@tarstate/schema-tools` generates TypeScript, JSON Schema, and Markdown from a
+prepared schema artifact:
+
+```ts
+import { generateSchemaOutputs } from '@tarstate/schema-tools'
+
+const generated = await generateSchemaOutputs(schemaArtifact)
+if (!generated.success) throw new Error(generated.issues[0]?.code)
+
+await writeOutputs({
+  'schema.d.ts': generated.value.typescript,
+  'schema.json': generated.value.jsonSchemaText,
+  'schema.md': generated.value.markdown,
+})
 ```
 
-The release check builds and tests the workspace, enforces the TypeScript
-complexity budget, consumes the emitted declarations, and verifies all five
-dist-only package tarballs. The gate-by-gate record is in
-[docs/v1/conformance-matrix.md](docs/v1/conformance-matrix.md).
+Generated declarations include the exact schema ID and content hash.
 
-Legacy performance is intentionally only a gross-regression signal. See
-[benchmarks/README.md](benchmarks/README.md) for the isolated baseline runner.
+## Schemas
+
+Schemas are portable artifacts containing stable relation identities, keys,
+references, value domains, and promised edit capabilities.
+
+```ts
+import { referenceTo, relationDeclaration, schemaLiteral } from '@tarstate/core'
+
+const bases = relationDeclaration({
+  relationId: 'example.base',
+  key: ['name'],
+  fields: {
+    name: { type: { kind: 'string' } },
+    style: { type: { kind: 'string' } },
+  },
+})
+
+export const schema = schemaLiteral({
+  relations: {
+    bases,
+    pizzas: {
+      relationId: 'example.pizza',
+      key: ['name'],
+      fields: {
+        name: { type: { kind: 'string' } },
+        base: { type: referenceTo(bases) },
+        price: { type: { kind: 'integer' } },
+      },
+    },
+  },
+})
+```
+
+Sources attach to these logical relations through trusted storage bindings.
+Automerge documents are the primary durable source; Zustand and similar stores
+attach through the generic atomic external-store protocol.
+
+## React example
+
+The React provider borrows a prepared database from the application. Tarstate
+then subscribes to immutable query observations from that database.
+
+```tsx
+import { TarstateProvider, useQuery } from '@tarstate/react'
+
+function PizzaMenu() {
+  const menu = useQuery(pizzaMenuPlan, {
+    parameters: { maximumPrice: 25 },
+    selectSnapshot: snapshot =>
+      snapshot.state === 'open' ? snapshot.current.rows : [],
+  })
+
+  return (
+    <section>
+      <h2>Pizza menu</h2>
+      <ul>
+        {menu.map(row => (
+          <li key={row.name}>
+            {row.name} ({row.style}) — ${row.price}
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
+root.render(
+  <TarstateProvider database={database} executeCommit={executeCommit}>
+    <PizzaMenu />
+  </TarstateProvider>,
+)
+```
+
+Queries may span sources, but writes are atomic within one source. Query
+observations distinguish exact, lower-bound, and unknown results; commits
+return structured receipts instead of hiding conflicts or uncertain outcomes.
+
+## Development
+
+Tarstate requires Node.js 24.12 or newer and uses pnpm.
+
+```sh
+pnpm install
+pnpm check
+```
+
+The [v1 specification](docs/v1/README.md) is the source of truth. Package guides
+cover [core](packages/core/README.md),
+[Automerge](packages/automerge/README.md),
+[Zustand](packages/zustand/README.md),
+[React](packages/react/README.md), and
+[schema tooling](packages/schema-tools/README.md).
