@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AttachmentCatalog,
   DatasetMembership,
+  type DatabaseAttachment,
   type DatabaseAttachmentInput,
   type DatasetMember,
   type SourceSnapshot
@@ -60,6 +61,10 @@ class TestSource {
     if (options.state !== undefined) this.#state = options.state;
     if (options.freshness !== undefined) this.#freshness = options.freshness;
     this.#revision += 1;
+    for (const listener of Array.from(this.#listeners)) listener();
+  }
+
+  notify(): void {
     for (const listener of Array.from(this.#listeners)) listener();
   }
 
@@ -266,6 +271,250 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
+  it('pools cloned common prefixes, advances the physical DAG once, and evicts it on close', () => {
+    const source = new TestSource('source:pooled', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:pooled', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:pooled', source.sourceId)] });
+    const commonPrefix = (): QueryNode => ({
+      kind: 'where',
+      input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
+      predicate: { kind: 'compare', op: 'gte', left: { kind: 'field', alias: 'row', name: 'id' }, right: { kind: 'literal', value: 1 } }
+    });
+    const ids: QueryNode = { kind: 'select', input: commonPrefix(), alias: 'result', fields: { id: { kind: 'field', alias: 'row', name: 'id' } } };
+    const values: QueryNode = { kind: 'select', input: commonPrefix(), alias: 'result', fields: { value: { kind: 'field', alias: 'row', name: 'value' } } };
+    const factory = createIncrementalDatabaseQueryMaintenance();
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
+    });
+    const first = database.observe({ plan: { ...relationalPlan(), planId: 'query:ids', rootNodeId: 'query:ids:root', query: ids } });
+    const second = database.observe({ plan: { ...relationalPlan(), planId: 'query:values', rootNodeId: 'query:values:root', query: values } });
+
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
+      runtimeIdentity: expect.stringMatching(/^cohort:\d+$/),
+      activeRootCount: 2,
+      physicalNodeCount: 4,
+      sharedPhysicalNodeCount: 2
+    })]);
+    source.publish({ rows: [{ id: 2, value: 'changed' }, { id: 3, value: 'three' }] });
+    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2 }, { id: 3 }] } });
+    expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'changed' }, { value: 'three' }] } });
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
+      revision: 1,
+      updatedPhysicalNodeCount: 4,
+      changedPhysicalNodeCount: 4
+    })]);
+
+    first.close();
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
+      activeRootCount: 1,
+      physicalNodeCount: 3,
+      collectedPhysicalNodeCount: 1
+    })]);
+    second.close();
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([]);
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('isolates pooled maintenance by full parameters and dataset runtime', () => {
+    const source = new TestSource('source:isolated', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:isolated', source));
+    const firstDataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:isolated', source.sourceId)] });
+    const secondDataset = new DatasetMembership({ datasetId: 'dataset:two', state: 'settled', members: [member('attachment:isolated', source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [firstDataset, secondDataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const first = database.observe({ plan: relationalPlan(), parameters: { selected: 1 } });
+    const second = database.observe({ plan: { ...relationalPlan(), planId: 'query:param-two', rootNodeId: 'query:param-two:root' }, parameters: { selected: 2 } });
+    const third = database.observe({ plan: { ...relationalPlan(), planId: 'query:dataset-two', rootNodeId: 'query:dataset-two:root', datasetId: 'dataset:two' }, parameters: { selected: 1 } });
+
+    const diagnostics = database.getQueryMaintenanceDiagnostics();
+    expect(diagnostics).toHaveLength(3);
+    expect(diagnostics.map(({ runtimeIdentity }) => runtimeIdentity)).toEqual([
+      expect.stringMatching(/^cohort:\d+$/), expect.stringMatching(/^cohort:\d+$/), expect.stringMatching(/^cohort:\d+$/)
+    ]);
+    expect(new Set(diagnostics.map(({ runtimeIdentity }) => runtimeIdentity)).size).toBe(3);
+    expect(diagnostics.every(({ activeRootCount, physicalNodeCount }) => activeRootCount === 1 && physicalNodeCount === 2)).toBe(true);
+
+    first.close();
+    second.close();
+    third.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('keeps excluded query graphs on private maintenance sessions', () => {
+    const source = new TestSource('source:private', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:private', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:private', source.sourceId)] });
+    const query: QueryNode = {
+      kind: 'where',
+      input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
+      predicate: { kind: 'subquery', mode: 'exists', query: { kind: 'values', alias: 'constant', rows: [{ value: true }] } }
+    };
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const observer = database.observe({ plan: { ...relationalPlan(), planId: 'query:subquery', rootNodeId: 'query:subquery:root', query } });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 1, value: 'one' }] } });
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([]);
+
+    source.publish({ rows: [{ id: 2, value: 'two' }] });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('shares physical maintenance across allowPartial policy variants', () => {
+    const source = new TestSource('source:partial', [{ id: 2, value: 'proven' }]);
+    const catalog = new AttachmentCatalog();
+    const partialAttachment: DatabaseAttachmentInput<{ readonly rows: readonly Row[] }, readonly RelationInput[]> = {
+      attachmentId: 'attachment:partial', incarnation: 'attachment:partial:one', sourceId: source.sourceId, source,
+      authorityScope: 'public', discoveryEdges: ['edge:attachment:partial'],
+      preparation: prepareManualReadOnlyAttachment({
+        schemaViewIds: [querySchemaView.id],
+        project: (snapshot) => snapshot.storage === undefined
+          ? { state: snapshot.state === 'ready' ? 'failed' : snapshot.state, issues: [] }
+          : {
+              state: 'ready',
+              value: [{
+                relation: { schemaView: querySchemaView, relationId: 'test.rows' },
+                rows: snapshot.storage.rows,
+                occurrenceIds: snapshot.storage.rows.map(({ id }) => 'row:' + id),
+                completeness: 'lower-bound', sourceId: source.sourceId,
+                attachmentId: 'attachment:partial', basis: snapshot.basis
+              }],
+              issues: []
+            }
+      })
+    };
+    const attachmentLease = catalog.attach(partialAttachment);
+    const dataset = new DatasetMembership({ state: 'open', datasetId: 'dataset:one', members: [member('attachment:partial', source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const conservative = database.observe({ plan: relationalPlan() });
+    const partial = database.observe({ plan: relationalPlan(), allowPartial: true });
+
+    expect(conservative.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
+    expect(partial.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'proven' }], completeness: 'lower-bound' } });
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
+      activeRootCount: 2,
+      physicalNodeCount: 2,
+      sharedPhysicalNodeCount: 2
+    })]);
+
+    conservative.close();
+    partial.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('falls back to a private session when an initial input diverges within one cohort', () => {
+    const source = new TestSource('source:divergent', [{ id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:divergent', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:divergent', source.sourceId)] });
+    const input = (row: Row): DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]> => ({
+      query: relationalPlan().query,
+      parameters: {},
+      dataset: dataset.snapshot(),
+      attachments: [{
+        member: member('attachment:divergent', source.sourceId),
+        attachment: attachmentLease.attachment as unknown as DatabaseAttachment<unknown, readonly RelationInput[]>,
+        snapshot: source.snapshot(),
+        projection: [{
+          relation: { schemaView: querySchemaView, relationId: 'test.rows' },
+          rows: [row], occurrenceIds: ['row:' + row.id], completeness: 'exact',
+          sourceId: source.sourceId, attachmentId: 'attachment:divergent', basis: source.snapshot().basis
+        }]
+      }]
+    });
+    const factory = createIncrementalDatabaseQueryMaintenance();
+    const runtimeIdentity = {};
+    const first = factory({ plan: relationalPlan(), initialInput: input({ id: 2, value: 'two' }), runtimeIdentity });
+    const second = factory({
+      plan: { ...relationalPlan(), planId: 'query:divergent', rootNodeId: 'query:divergent:root' },
+      initialInput: input({ id: 9, value: 'private' }),
+      runtimeIdentity
+    });
+
+    expect(first.getCurrentResult().rows).toEqual([{ id: 2, value: 'two' }]);
+    expect(second.getCurrentResult().rows).toEqual([{ id: 9, value: 'private' }]);
+    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([expect.objectContaining({ activeRootCount: 1, physicalNodeCount: 2 })]);
+    second.close();
+    expect(factory.getDiagnostics(runtimeIdentity)).toHaveLength(1);
+    first.close();
+    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([]);
+    attachmentLease.close();
+  });
+
+  it('recovers every pooled production root when rejected input returns to the accepted snapshot', () => {
+    const original: Row = { id: 2, value: 'accepted' };
+    const acceptedRows: Row[] = [original];
+    const source = new TestSource('source:rejected-recovery', acceptedRows);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:rejected-recovery', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:rejected-recovery', source.sourceId)] });
+    const input = (rows: readonly Row[]): DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]> => ({
+      query: relationalPlan().query,
+      parameters: {},
+      dataset: dataset.snapshot(),
+      attachments: [{
+        member: member('attachment:rejected-recovery', source.sourceId),
+        attachment: attachmentLease.attachment as unknown as DatabaseAttachment<unknown, readonly RelationInput[]>,
+        snapshot: source.snapshot(),
+        projection: [{
+          relation: { schemaView: querySchemaView, relationId: 'test.rows' },
+          rows, occurrenceIds: ['row:stable'], completeness: 'exact',
+          sourceId: source.sourceId, attachmentId: 'attachment:rejected-recovery', basis: source.snapshot().basis
+        }]
+      }]
+    });
+    const factory = createIncrementalDatabaseQueryMaintenance();
+    const runtimeIdentity = {};
+    const first = factory({ plan: relationalPlan(), initialInput: input(acceptedRows), runtimeIdentity });
+    const second = factory({
+      plan: { ...relationalPlan(), planId: 'query:recovery-second', rootNodeId: 'query:recovery-second:root' },
+      initialInput: input(acceptedRows), runtimeIdentity
+    });
+    const malformedRows: Row[] = [];
+    let malformedReadCount = 0;
+    Object.defineProperty(malformedRows, 0, {
+      enumerable: true,
+      get: () => {
+        // Mutating the previously accepted proof between diff construction and
+        // validation simulates an adversarial stale/malformed source delta.
+        malformedReadCount += 1;
+        if (malformedReadCount > 1) acceptedRows[0] = { id: 99, value: 'stale-proof' };
+        return { id: 3, value: 'malformed' };
+      }
+    });
+
+    expect(first.updateInput(input(malformedRows))).toMatchObject({ completeness: 'unknown' });
+    expect(second.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
+    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([expect.objectContaining({ revision: 1, rejectedUpdateCount: 1 })]);
+
+    acceptedRows[0] = original;
+    expect(first.updateInput(input(acceptedRows))).toMatchObject({ rows: [original], completeness: 'exact' });
+    expect(second.getCurrentResult()).toMatchObject({ rows: [original], completeness: 'exact' });
+    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([expect.objectContaining({ revision: 2, rejectedUpdateCount: 1 })]);
+    first.close();
+    second.close();
+    attachmentLease.close();
+  });
+
   it('unions the same relation from two real attachments with source provenance', () => {
     const personal = new TestSource('source:personal', [{ id: 1, value: 'personal' }]);
     const shared = new TestSource('source:shared', [{ id: 1, value: 'shared' }]);
@@ -415,6 +664,104 @@ describe('database membership and observation', () => {
     const later = database.observe({ plan: plan(), parameters: { selected: 1 } });
     expect(later.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
     later.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('shares one dataset subscription runtime across distinct query roots', () => {
+    const source = new TestSource('source:one', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:one', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
+    const database = view(catalog, [dataset]);
+    const first = database.observe({ plan: plan() });
+    const second = database.observe({ plan: { ...plan(), planId: 'query:other', rootNodeId: 'query:other:root' } });
+
+    expect(database.getActiveMaintenanceCount()).toBe(2);
+    expect(source.listenerCount()).toBe(1);
+    expect(source.subscriptionCount()).toBe(1);
+
+    first.close();
+    expect(source.listenerCount()).toBe(1);
+    source.publish({ rows: [{ id: 2, value: 'two' }] });
+    expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+
+    second.close();
+    expect(source.listenerCount()).toBe(0);
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('stages every active root before publishing observer callbacks', () => {
+    const source = new TestSource('source:one', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:one', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
+    const database = view(catalog, [dataset]);
+    const first = database.observe({ plan: plan() });
+    const second = database.observe({ plan: { ...plan(), planId: 'query:other', rootNodeId: 'query:other:root' } });
+    const seenFromFirstCallback: Row[][] = [];
+    first.subscribe(() => {
+      const snapshot = second.getSnapshot();
+      if (snapshot.state === 'open') seenFromFirstCallback.push([...snapshot.current.rows]);
+    });
+
+    source.publish({ rows: [{ id: 2, value: 'two' }] });
+
+    expect(seenFromFirstCallback).toEqual([[{ id: 2, value: 'two' }]]);
+    first.close();
+    second.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('retains snapshot identity when a refresh changes no observed evidence', () => {
+    const source = new TestSource('source:one', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:one', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
+    const database = view(catalog, [dataset]);
+    const observer = database.observe({ plan: plan() });
+    const initial = observer.getSnapshot();
+    const listener = vi.fn();
+    observer.subscribe(listener);
+
+    source.notify();
+
+    expect(observer.getSnapshot()).toBe(initial);
+    expect(listener).not.toHaveBeenCalled();
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('diffs a coalesced nested refresh from the last published snapshot', () => {
+    const source = new TestSource('source:one', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:one', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
+    let publishedNestedUpdate = false;
+    const database = view(catalog, [dataset], 'public', 'authority:public', (input) => {
+      const result = evaluate(input);
+      if (!publishedNestedUpdate && result.rows[0]?.value === 'two') {
+        publishedNestedUpdate = true;
+        source.publish({ rows: [{ id: 1, value: 'three' }] });
+      }
+      return result;
+    });
+    const observer = database.observe({ plan: plan() });
+    const changes: ObserverChange<Row>[] = [];
+    observer.subscribe((change) => { changes.push(change); });
+
+    source.publish({ rows: [{ id: 1, value: 'two' }] });
+
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({
+      kind: 'diff',
+      diff: { updated: [{ before: { id: 1, value: 'one' }, after: { id: 1, value: 'three' } }] }
+    });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 1, value: 'three' }] } });
+    observer.close();
     database.close();
     attachmentLease.close();
   });

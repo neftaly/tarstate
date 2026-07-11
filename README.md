@@ -85,7 +85,7 @@ Queries are portable values composed with `pipe`. This one joins pizzas to
 their bases, sorts the menu by name, and selects the fields the UI needs.
 
 ```ts
-import { compare, field, from, join, orderBy, pipe, select } from '@tarstate/core';
+import { aggregate, compare, field, from, join, orderBy, pipe, select } from '@tarstate/core';
 import { schema } from './schema';
 
 const base = from({ schemaView: schema, relationId: 'example.base' }, 'base');
@@ -113,7 +113,23 @@ When data changes, it updates only affected operators; joins reuse indexes and
 propagation stops when an operator's result is unchanged.
 
 ```ts
-// Shared-subplan example goes here.
+export const menuSummaryQuery = pipe(
+  pizza,
+  join(base, 'inner', compare(
+    'eq',
+    field('pizza', 'base'),
+    { kind: 'array', items: [field('base', 'name')] }
+  )),
+  // Before this line, this query is free
+  aggregate('summary', {}, {
+    pizzaCount: { kind: 'aggregate', op: 'count' },
+    averagePrice: {
+      kind: 'aggregate',
+      op: 'average',
+      value: field('pizza', 'price')
+    }
+  })
+);
 ```
 
 ## React example

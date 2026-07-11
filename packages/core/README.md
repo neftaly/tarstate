@@ -47,3 +47,14 @@ Use `prepareManualReadOnlyAttachment` for an already trusted projection, or
 The host closes the observer, database, and attachment lease; none owns the
 others. Registries and authority checks remain explicit because they are policy,
 not construction defaults.
+
+## Shared maintenance
+
+`createIncrementalDatabaseQueryMaintenance` structurally interns exact shared
+subplans across live queries in the same database, dataset, authority, registry,
+and parameter cohort. One dataset runtime captures each source transition, then
+updates the shared operator DAG once before publishing observer callbacks.
+
+`DatabaseView.getQueryMaintenanceDiagnostics()` exposes frozen physical reuse
+and lifecycle counters. Seek, recursion, expression subqueries, divergent input
+streams, and incompatible cohorts remain on isolated maintenance sessions.

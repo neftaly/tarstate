@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  createPooledIncrementalQueryRuntime,
   diffQueryMaintenanceSnapshots,
   evaluateQuery,
   openIncrementalQueryMaintenance,
@@ -458,5 +459,165 @@ describe('incremental query maintenance', () => {
     session.close();
     session.close();
     expect(() => session.applyUpdate(diffQueryMaintenanceSnapshots(initial, initial))).toThrow('Incremental query maintenance session is closed');
+  });
+
+  it('shares exact physical prefixes across independently authored roots and collects them by reference', () => {
+    const activePeople = (): QueryNode => ({
+      kind: 'where',
+      input: from('people', 'p'),
+      predicate: { kind: 'compare', op: 'eq', left: field('p', 'active'), right: { kind: 'literal', value: true } }
+    });
+    const idQuery: QueryNode = { kind: 'select', input: activePeople(), alias: 'ids', fields: { id: field('p', 'id') } };
+    const nameQuery: QueryNode = { kind: 'select', input: activePeople(), alias: 'names', fields: { name: field('p', 'name') } };
+    const initial = snapshot(basePeople, 1);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/dataset:test/parameters:minimum-6',
+        registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test',
+        datasetId: 'dataset:test',
+        parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+
+    const idsRoot = runtime.attach(plan(idQuery));
+    const namesRoot = runtime.attach(plan(nameQuery));
+    expect(semanticResult(idsRoot.getCurrentResult())).toEqual(oracle(idQuery, initial));
+    expect(semanticResult(namesRoot.getCurrentResult())).toEqual(oracle(nameQuery, initial));
+    expect(runtime.getDiagnostics()).toMatchObject({
+      strategy: 'pooled-differential-operator-dag',
+      activeRootCount: 2,
+      physicalNodeCount: 4,
+      sharedPhysicalNodeCount: 2
+    });
+    expect(Object.isFrozen(runtime.getDiagnostics())).toBe(true);
+
+    const next = snapshot(middlePeople, 2);
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+    expect(semanticResult(idsRoot.getCurrentResult())).toEqual(oracle(idQuery, next));
+    expect(semanticResult(namesRoot.getCurrentResult())).toEqual(oracle(nameQuery, next));
+    expect(idsRoot.getCurrentResult().state).toMatchObject({ materializedNodeCount: 3, updatedNodeCount: 3 });
+    expect(namesRoot.getCurrentResult().state).toMatchObject({ materializedNodeCount: 3, updatedNodeCount: 3 });
+    expect(runtime.getDiagnostics()).toMatchObject({
+      revision: 1,
+      updatedPhysicalNodeCount: 4,
+      changedPhysicalNodeCount: 4
+    });
+
+    idsRoot.close();
+    idsRoot.close();
+    expect(runtime.getDiagnostics()).toMatchObject({
+      activeRootCount: 1,
+      physicalNodeCount: 3,
+      sharedPhysicalNodeCount: 0,
+      collectedPhysicalNodeCount: 1
+    });
+    namesRoot.close();
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, collectedPhysicalNodeCount: 3 });
+    runtime.close();
+  });
+
+  it('shares a join prefix across projection and aggregate roots through insert, update, and delete', () => {
+    const joinedPeople = (): QueryNode => ({
+      kind: 'join',
+      join: 'inner',
+      left: from('people', 'p'),
+      right: from('groups', 'g'),
+      on: { kind: 'compare', op: 'eq', left: field('p', 'group'), right: field('g', 'id') }
+    });
+    const projected: QueryNode = {
+      kind: 'select', input: joinedPeople(), alias: 'result',
+      fields: { name: field('p', 'name'), group: field('g', 'label') }
+    };
+    const summarized: QueryNode = {
+      kind: 'aggregate', input: joinedPeople(), alias: 'summary', groupBy: {},
+      measures: {
+        count: { kind: 'aggregate', op: 'count' },
+        averageScore: { kind: 'aggregate', op: 'average', value: field('p', 'score') }
+      }
+    };
+    const initial = snapshot(basePeople, 1);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/shared-join', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const projectionRoot = runtime.attach(plan(projected));
+    const summaryRoot = runtime.attach(plan(summarized));
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 2, physicalNodeCount: 5, sharedPhysicalNodeCount: 3 });
+
+    let before = initial;
+    for (const after of [snapshot(middlePeople, 2), snapshot(finalPeople, 3)]) {
+      runtime.applyUpdate(diffQueryMaintenanceSnapshots(before, after));
+      expect(semanticResult(projectionRoot.getCurrentResult())).toEqual(oracle(projected, after));
+      expect(semanticResult(summaryRoot.getCurrentResult())).toEqual(oracle(summarized, after));
+      // The unchanged groups branch is retained; people, join, projection, and
+      // aggregate update once each across both roots.
+      expect(runtime.getDiagnostics()).toMatchObject({ updatedPhysicalNodeCount: 4 });
+      before = after;
+    }
+
+    projectionRoot.close();
+    summaryRoot.close();
+    runtime.close();
+  });
+
+  it('conservatively excludes stateful and nested query graph forms from pooling', () => {
+    const initial = snapshot(basePeople, 1);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/exclusions',
+        registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test',
+        datasetId: 'dataset:test',
+        parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    expect(() => runtime.attach(plan(operatorQueries.seek as QueryNode))).toThrow(/do not support seek/);
+    expect(() => runtime.attach(plan(operatorQueries.subquery as QueryNode))).toThrow(/do not support subquery/);
+    expect(() => runtime.attach(plan(operatorQueries.recursive as QueryNode))).toThrow(/do not support recursive/);
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0 });
+    runtime.close();
+  });
+
+  it('materializes roots attached while rejected and recovers every root on an exact no-op transition', () => {
+    const initial = snapshot(basePeople, 1);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/recovery', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const filteredQuery = operatorQueries.where as QueryNode;
+    const filtered = runtime.attach(plan(filteredQuery));
+    const valid = diffQueryMaintenanceSnapshots(initial, snapshot(middlePeople, 2));
+    const peopleChange = valid.relations.find(({ relation }) => relation.relationId === 'people') as NonNullable<typeof valid.relations[number]>;
+    runtime.applyUpdate({
+      ...valid,
+      relations: [{ ...peopleChange, rows: [{ occurrenceId: 'person:missing', after: { index: 0, row: { id: 9 } } }] }]
+    });
+    expect(filtered.getCurrentResult()).toMatchObject({ completeness: 'unknown', state: { rejectedUpdateCount: 1 } });
+
+    const constantQuery: QueryNode = { kind: 'values', alias: 'constant', rows: [{ value: 'available-after-recovery' }] };
+    const constant = runtime.attach(plan(constantQuery));
+    expect(constant.getCurrentResult()).toMatchObject({ completeness: 'unknown', state: { rejectedUpdateCount: 1 } });
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, initial));
+
+    expect(semanticResult(filtered.getCurrentResult())).toEqual(oracle(filteredQuery, initial));
+    expect(semanticResult(constant.getCurrentResult())).toEqual(oracle(constantQuery, initial));
+    expect(runtime.getDiagnostics()).toMatchObject({
+      revision: 2,
+      rejectedUpdateCount: 1,
+      updatedPhysicalNodeCount: 1,
+      changedPhysicalNodeCount: 1
+    });
+    filtered.close();
+    constant.close();
+    runtime.close();
   });
 });

@@ -175,6 +175,46 @@ export interface IncrementalQueryMaintenanceSession {
   close(): void;
 }
 
+/** Fixed execution environment for one conservative shared physical query DAG. */
+export type PooledIncrementalQueryEnvironment = {
+  readonly runtimeIdentity: string;
+  readonly registryFingerprint: string;
+  readonly authorityFingerprint: string;
+  readonly datasetId: string;
+  readonly parameters?: Readonly<Record<string, JsonValue>>;
+  readonly functions?: FunctionRegistry;
+};
+
+/** Frozen physical counters for the pooled DAG, independent of any logical root. */
+export type PooledIncrementalQueryDiagnostics = {
+  readonly strategy: 'pooled-differential-operator-dag';
+  readonly runtimeIdentity: string;
+  readonly revision: number;
+  readonly activeRootCount: number;
+  readonly physicalNodeCount: number;
+  readonly sharedPhysicalNodeCount: number;
+  readonly updatedPhysicalNodeCount: number;
+  readonly changedPhysicalNodeCount: number;
+  readonly collectedPhysicalNodeCount: number;
+  readonly rejectedUpdateCount: number;
+};
+
+export interface PooledIncrementalQueryRoot {
+  getCurrentResult(): IncrementalQueryResult;
+  close(): void;
+}
+
+/**
+ * Explicit multi-root runtime. Exact portable subtrees are interned; seek,
+ * recursion, and expression-subquery graphs remain isolated in v1.
+ */
+export interface PooledIncrementalQueryRuntime {
+  attach(plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot;
+  applyUpdate(update: QueryMaintenanceUpdate): void;
+  getDiagnostics(): PooledIncrementalQueryDiagnostics;
+  close(): void;
+}
+
 type Provenance = { readonly sourceId?: string; readonly attachmentId?: string; readonly relationId: string; readonly key?: JsonValue; readonly occurrence: string };
 type ScopedRow = { readonly scope: Readonly<Record<string, QueryRecord>>; readonly provenance: Readonly<Record<string, Provenance>>; readonly identity: string; readonly origin?: string };
 type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: Completeness };
@@ -1169,6 +1209,284 @@ export const openIncrementalQueryMaintenance = (
       materialized.clear();
     }
   };
+};
+
+type PooledPhysicalNode = {
+  readonly key: string;
+  readonly children: readonly QueryNode[];
+  readonly externalDependencies: ReadonlySet<string>;
+  readonly sessionEvidenceDependency: boolean;
+  references: number;
+};
+
+type PooledRootState = {
+  readonly root: QueryNode;
+  readonly reachable: ReadonlySet<QueryNode>;
+  current: IncrementalQueryResult;
+  asserted: MaterializedQueryNode | undefined;
+  closed: boolean;
+};
+
+/** Creates an explicitly scoped multi-root physical runtime. */
+export const createPooledIncrementalQueryRuntime = (input: {
+  readonly environment: PooledIncrementalQueryEnvironment;
+  readonly initialSnapshot: QueryMaintenanceSnapshot;
+}): PooledIncrementalQueryRuntime => {
+  const environment = input.environment;
+  if (!sameOptionalJson(environment.parameters, input.initialSnapshot.parameters)) {
+    throw new TypeError('Pooled query environment parameters do not match the initial snapshot');
+  }
+  if (!sameFunctionRegistry(environment.functions, input.initialSnapshot.functions)) {
+    throw new TypeError('Pooled query environment functions do not match the initial snapshot');
+  }
+
+  const interned = new Map<string, QueryNode>();
+  const physical = new Map<QueryNode, PooledPhysicalNode>();
+  let physicalOrder: QueryNode[] = [];
+  const materialized = new Map<QueryNode, MaterializedQueryNode>();
+  const roots = new Set<PooledRootState>();
+  const valueIdentities = new WeakMap<ScopedRow, string>();
+  let acceptedSnapshot = input.initialSnapshot;
+  let runtimeIssues = validateMaintenanceSnapshot(input.initialSnapshot);
+  let revision = 0;
+  let rejectedUpdateCount = 0;
+  let closed = false;
+  let diagnostics = pooledDiagnostics(environment.runtimeIdentity, 0, 0, 0, 0, 0, 0, 0, 0);
+
+  const refreshDiagnostics = (updated: number, changed: number, collected: number): void => {
+    let shared = 0;
+    for (const node of physical.values()) if (node.references > 1) shared += 1;
+    diagnostics = pooledDiagnostics(
+      environment.runtimeIdentity,
+      revision,
+      roots.size,
+      physical.size,
+      shared,
+      updated,
+      changed,
+      collected,
+      rejectedUpdateCount
+    );
+  };
+
+  const release = (root: PooledRootState): void => {
+    if (root.closed) return;
+    root.closed = true;
+    roots.delete(root);
+    let collected = 0;
+    for (const node of root.reachable) {
+      const record = physical.get(node);
+      if (record === undefined) continue;
+      record.references -= 1;
+      if (record.references !== 0) continue;
+      physical.delete(node);
+      materialized.delete(node);
+      if (interned.get(record.key) === node) interned.delete(record.key);
+      collected += 1;
+    }
+    if (collected > 0) physicalOrder = physicalOrder.filter((node) => physical.has(node));
+    refreshDiagnostics(0, 0, collected);
+  };
+
+  const attach = (plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot => {
+    if (closed) throw new Error('Pooled incremental query runtime is closed');
+    if (plan.registryFingerprint !== environment.registryFingerprint) throw new TypeError('Prepared plan registry fingerprint does not match pooled query environment');
+    if (plan.authorityFingerprint !== environment.authorityFingerprint) throw new TypeError('Prepared plan authority fingerprint does not match pooled query environment');
+    if (plan.datasetId !== environment.datasetId) throw new TypeError('Prepared plan dataset does not match pooled query environment');
+    assertPoolableQuery(plan.query);
+    const canonicalRoot = internPooledQueryNode(plan.query, interned);
+    const graph = compileQueryGraph(canonicalRoot);
+    const reachable = new Set(graph.nodes);
+    let added = 0;
+    for (const node of graph.nodes) {
+      const existing = physical.get(node);
+      if (existing !== undefined) {
+        existing.references += 1;
+        continue;
+      }
+      const key = canonicalizeJson(node as unknown as JsonValue);
+      physical.set(node, {
+        key,
+        children: graph.children.get(node) as readonly QueryNode[],
+        externalDependencies: graph.externalDependencies.get(node) as ReadonlySet<string>,
+        sessionEvidenceDependency: graph.sessionEvidenceDependencies.get(node) === true,
+        references: 1
+      });
+      physicalOrder.push(node);
+      if (runtimeIssues.length === 0) materialized.set(node, materializeQueryNode(node, acceptedSnapshot, materialized));
+      added += 1;
+    }
+    const rootMaterialized = runtimeIssues.length === 0 ? materialized.get(canonicalRoot) : undefined;
+    const state: PooledRootState = {
+      root: canonicalRoot,
+      reachable,
+      current: maintainedQueryResult(
+        rootMaterialized,
+        runtimeIssues,
+        maintenanceState(reachable.size, reachable.size, reachable.size, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+      ),
+      asserted: rootMaterialized,
+      closed: false
+    };
+    roots.add(state);
+    refreshDiagnostics(added, added, 0);
+    return {
+      getCurrentResult: () => state.current,
+      close: () => release(state)
+    };
+  };
+
+  const applyUpdate = (update: QueryMaintenanceUpdate): void => {
+    if (closed) throw new Error('Pooled incremental query runtime is closed');
+    revision += 1;
+    const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
+    if (!applied.success) {
+      rejectedUpdateCount += 1;
+      runtimeIssues = applied.issues;
+      for (const root of roots) {
+        root.current = maintainedQueryResult(
+          undefined,
+          runtimeIssues,
+          maintenanceState(root.reachable.size, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+        );
+        root.asserted = undefined;
+      }
+      refreshDiagnostics(0, 0, 0);
+      return;
+    }
+
+    const nextSnapshot = applied.value;
+    runtimeIssues = [];
+    const changedRelations = new Set(update.relations.map(({ relation }) => relationKey(relation)));
+    const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
+      || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
+    const updatedNodes = new Set<QueryNode>();
+    const changedNodes = new Set<QueryNode>();
+    for (const node of physicalOrder) {
+      const record = physical.get(node) as PooledPhysicalNode;
+      const previousNode = materialized.get(node);
+      const childChanged = record.children.some((child) => changedNodes.has(child));
+      const externalInputChanged = [...record.externalDependencies].some((key) => changedRelations.has(key));
+      const evidenceInputChanged = sessionEvidenceChanged && record.sessionEvidenceDependency;
+      // Roots may attach while the runtime is invalidated. A successful
+      // transition, including an A -> A recovery, must initialize every
+      // missing physical node before results can be asserted again.
+      if (previousNode !== undefined && !evidenceInputChanged && !childChanged && !externalInputChanged) continue;
+      const nextNode = node.kind === 'from'
+        ? incrementallyMaterializeFrom(node, nextSnapshot, update, previousNode)
+        : node.kind === 'join'
+          ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
+        : isLocallyMaintainedNode(node)
+          ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
+          : materializeQueryNode(node, nextSnapshot, materialized);
+      materialized.set(node, nextNode);
+      updatedNodes.add(node);
+      if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
+    }
+    acceptedSnapshot = nextSnapshot;
+    const changedIds = changedRelationIds(nextSnapshot, changedRelations);
+    for (const root of roots) {
+      const nextRoot = materialized.get(root.root);
+      let updated = 0;
+      let changed = 0;
+      for (const node of root.reachable) {
+        if (updatedNodes.has(node)) updated += 1;
+        if (changedNodes.has(node)) changed += 1;
+      }
+      root.current = maintainedQueryResult(
+        nextRoot,
+        [],
+        maintenanceState(
+          root.reachable.size,
+          updated,
+          changed,
+          changedIds,
+          diffMaintainedResults(root.asserted, nextRoot, valueIdentities),
+          revision,
+          rejectedUpdateCount
+        )
+      );
+      root.asserted = nextRoot;
+    }
+    refreshDiagnostics(updatedNodes.size, changedNodes.size, 0);
+  };
+
+  return {
+    attach,
+    applyUpdate,
+    getDiagnostics: () => diagnostics,
+    close: () => {
+      if (closed) return;
+      closed = true;
+      const collected = physical.size;
+      for (const root of Array.from(roots)) release(root);
+      interned.clear();
+      physical.clear();
+      physicalOrder = [];
+      materialized.clear();
+      refreshDiagnostics(0, 0, collected);
+    }
+  };
+};
+
+const pooledDiagnostics = (
+  runtimeIdentity: string,
+  revision: number,
+  activeRootCount: number,
+  physicalNodeCount: number,
+  sharedPhysicalNodeCount: number,
+  updatedPhysicalNodeCount: number,
+  changedPhysicalNodeCount: number,
+  collectedPhysicalNodeCount: number,
+  rejectedUpdateCount: number
+): PooledIncrementalQueryDiagnostics => Object.freeze({
+  strategy: 'pooled-differential-operator-dag',
+  runtimeIdentity,
+  revision,
+  activeRootCount,
+  physicalNodeCount,
+  sharedPhysicalNodeCount,
+  updatedPhysicalNodeCount,
+  changedPhysicalNodeCount,
+  collectedPhysicalNodeCount,
+  rejectedUpdateCount
+});
+
+const assertPoolableQuery = (root: QueryNode): void => {
+  const visiting = new Set<object>();
+  const visited = new Set<object>();
+  const visit = (value: unknown): void => {
+    if (value === null || typeof value !== 'object') return;
+    if (visited.has(value)) return;
+    if (visiting.has(value)) throw new TypeError('Pooled query graphs must be acyclic');
+    visiting.add(value);
+    if (!Array.isArray(value)) {
+      const kind = (value as { readonly kind?: unknown }).kind;
+      if (kind === 'seek' || kind === 'recursive' || kind === 'recursion-ref' || kind === 'subquery') {
+        throw new TypeError('Pooled query graphs do not support ' + String(kind));
+      }
+    }
+    for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child);
+    visiting.delete(value);
+    visited.add(value);
+  };
+  visit(root);
+};
+
+const internPooledQueryNode = (node: QueryNode, interned: Map<string, QueryNode>): QueryNode => {
+  let canonical: QueryNode;
+  if (node.kind === 'join' || node.kind === 'set') {
+    canonical = { ...node, left: internPooledQueryNode(node.left, interned), right: internPooledQueryNode(node.right, interned) };
+  } else if (node.kind === 'where' || node.kind === 'select' || node.kind === 'with-fields' || node.kind === 'rename' || node.kind === 'omit' || node.kind === 'unnest' || node.kind === 'aggregate' || node.kind === 'distinct' || node.kind === 'order' || node.kind === 'slice' || node.kind === 'window') {
+    canonical = { ...node, input: internPooledQueryNode(node.input, interned) };
+  } else {
+    canonical = node;
+  }
+  const key = canonicalizeJson(canonical as unknown as JsonValue);
+  const existing = interned.get(key);
+  if (existing !== undefined) return existing;
+  interned.set(key, canonical);
+  return canonical;
 };
 
 type CompiledQueryGraph = {

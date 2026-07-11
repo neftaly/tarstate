@@ -14,9 +14,13 @@ import { createIssue, type Issue } from './issues.js';
 import type { PreparedPlan, SourceBasis } from './maintenance.js';
 import {
   diffQueryMaintenanceSnapshots,
+  createPooledIncrementalQueryRuntime,
   openIncrementalQueryMaintenance,
   type FunctionRegistry,
   type IncrementalQueryResult,
+  type PooledIncrementalQueryDiagnostics,
+  type PooledIncrementalQueryRoot,
+  type PooledIncrementalQueryRuntime,
   type QueryMaintenanceSnapshot,
   type QueryNode,
   type QueryRecord,
@@ -110,7 +114,13 @@ export interface DatabaseQueryMaintenanceSession<Query, Row, Projection> {
 export type CreateDatabaseQueryMaintenance<Query, Row, Projection> = (input: {
   readonly plan: PreparedPlan<Query>;
   readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
+  /** Stable identity for one database/dataset capture stream. */
+  readonly runtimeIdentity: object;
 }) => DatabaseQueryMaintenanceSession<Query, Row, Projection>;
+
+export type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
+  getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
+};
 
 export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly authorityScope: string;
@@ -157,6 +167,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   readonly #createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
   readonly #getDatabaseDescriptionSnapshot: (() => JsonValue) | undefined;
   readonly #cache = new Map<string, SharedObservation<Query, Row, Projection>>();
+  readonly #datasetRuntimes = new Map<string, DatasetExecutionRuntime<Projection>>();
   #closed = false;
 
   constructor(options: DatabaseViewOptions<Query, Row, Projection>) {
@@ -180,14 +191,24 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     const key = queryObservationKey(this, { ...request, parameters });
     let shared = this.#cache.get(key);
     if (shared === undefined) {
+      let runtime = this.#datasetRuntimes.get(dataset.datasetId);
+      if (runtime === undefined) {
+        runtime = new DatasetExecutionRuntime({
+          dataset,
+          attachments: this.#attachments,
+          authorityScope: this.authorityScope,
+          canRead: this.#canRead,
+          collect: () => {
+            if (this.#datasetRuntimes.get(dataset.datasetId) === runtime) this.#datasetRuntimes.delete(dataset.datasetId);
+          }
+        });
+        this.#datasetRuntimes.set(dataset.datasetId, runtime);
+      }
       shared = new SharedObservation({
         plan: request.plan,
         parameters,
         allowPartial: request.allowPartial === true,
-        dataset,
-        attachments: this.#attachments,
-        authorityScope: this.authorityScope,
-        canRead: this.#canRead,
+        runtime,
         createQueryMaintenance: this.#createQueryMaintenance,
         collect: () => {
           if (this.#cache.get(key) === shared) this.#cache.delete(key);
@@ -200,6 +221,13 @@ export class DatabaseView<Query, Row, Projection = unknown> {
 
   getActiveMaintenanceCount(): number { return this.#cache.size; }
 
+  /** Optional physical IVM counters; custom maintenance factories return no entries. */
+  getQueryMaintenanceDiagnostics(): readonly PooledIncrementalQueryDiagnostics[] {
+    const diagnostics = (this.#createQueryMaintenance as Partial<IncrementalDatabaseQueryMaintenanceFactory>).getDiagnostics;
+    if (diagnostics === undefined) return [];
+    return Object.freeze([...this.#datasetRuntimes.values()].flatMap((runtime) => diagnostics(runtime.identity)));
+  }
+
   getDatabaseDescriptionSnapshot(): JsonValue | undefined {
     return this.#getDatabaseDescriptionSnapshot?.();
   }
@@ -209,6 +237,8 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     this.#closed = true;
     for (const shared of Array.from(this.#cache.values())) shared.close();
     this.#cache.clear();
+    for (const runtime of Array.from(this.#datasetRuntimes.values())) runtime.close();
+    this.#datasetRuntimes.clear();
   }
 }
 
@@ -226,57 +256,54 @@ type EvaluationSnapshot<Projection> = {
   readonly members: readonly CapturedMember<Projection>[];
 };
 
-type SharedOptions<Query, Row, Projection> = {
-  readonly plan: PreparedPlan<Query>;
-  readonly parameters: Readonly<Record<string, JsonValue>>;
-  readonly allowPartial: boolean;
+type DatasetExecutionConsumer<Projection> = {
+  readonly stage: (captured: EvaluationSnapshot<Projection>) => void;
+  readonly preparePublish: () => void;
+  readonly publish: () => void;
+};
+
+type DatasetExecutionRuntimeOptions = {
   readonly dataset: DatasetMembership;
   readonly attachments: AttachmentCatalog;
   readonly authorityScope: string;
-  readonly canRead: DatabaseViewOptions<Query, Row, Projection>['canRead'];
-  readonly createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
+  readonly canRead: (viewAuthorityScope: string, attachmentAuthorityScope: string, attachmentId: string) => boolean;
   readonly collect: () => void;
 };
 
-class SharedObservation<Query, Row, Projection> {
-  readonly #options: SharedOptions<Query, Row, Projection>;
-  readonly #leases = new Set<ObserverLease<Row>>();
+/** One authority-filtered capture and subscription topology shared by every active root in a dataset. */
+class DatasetExecutionRuntime<Projection> {
+  readonly #options: DatasetExecutionRuntimeOptions;
+  readonly #consumers = new Set<DatasetExecutionConsumer<Projection>>();
   readonly #unsubscribeDataset: () => void;
   readonly #unsubscribeCatalog: () => void;
   #sourceUnsubscribes: readonly (() => void)[] = [];
-  #session: DatabaseQueryMaintenanceSession<Query, Row, Projection> | undefined;
-  #snapshot: ObserverSnapshot<Row>;
-  #leaseCount = 0;
+  #snapshot: EvaluationSnapshot<Projection>;
   #refreshing = false;
   #pending = false;
+  #topologyPending = false;
   #closed = false;
+  readonly #identity = Object.freeze({});
 
-  constructor(options: SharedOptions<Query, Row, Projection>) {
+  constructor(options: DatasetExecutionRuntimeOptions) {
     this.#options = options;
-    const captured = this.#capture();
-    this.#session = this.#openMaintenance(captured);
-    this.#snapshot = this.#observerSnapshot(this.#result(this.#session.getCurrentResult(), captured), undefined);
-    this.#refreshSourceSubscriptions();
-    const refreshTopology = () => {
-      this.#refreshSourceSubscriptions();
-      this.#requestRefresh();
-    };
+    const refreshTopology = () => this.#requestRefresh(true);
     this.#unsubscribeDataset = options.dataset.subscribe(refreshTopology);
     this.#unsubscribeCatalog = options.attachments.subscribe(refreshTopology);
+    this.#refreshSourceSubscriptions();
+    this.#snapshot = this.#capture();
   }
 
-  acquire(): QueryObserver<Row> {
-    if (this.#closed) throw new Error('Shared observation is closed');
-    this.#leaseCount += 1;
-    const lease = new ObserverLease(this, this.#snapshot);
-    this.#leases.add(lease);
-    return lease;
+  snapshot(): EvaluationSnapshot<Projection> { return this.#snapshot; }
+  get identity(): object { return this.#identity; }
+
+  add(consumer: DatasetExecutionConsumer<Projection>): void {
+    if (this.#closed) throw new Error('Dataset execution runtime is closed');
+    this.#consumers.add(consumer);
   }
 
-  release(lease: ObserverLease<Row>): void {
-    if (!this.#leases.delete(lease)) return;
-    this.#leaseCount -= 1;
-    if (this.#leaseCount === 0) this.close();
+  remove(consumer: DatasetExecutionConsumer<Projection>): void {
+    if (!this.#consumers.delete(consumer)) return;
+    if (this.#consumers.size === 0) this.close();
   }
 
   close(): void {
@@ -286,35 +313,39 @@ class SharedObservation<Query, Row, Projection> {
     this.#unsubscribeCatalog();
     for (const unsubscribe of this.#sourceUnsubscribes) unsubscribe();
     this.#sourceUnsubscribes = [];
-    this.#session?.close();
-    this.#session = undefined;
-    this.#snapshot = closedSnapshot as ObserverSnapshot<Row>;
-    for (const lease of Array.from(this.#leases)) lease.closeFromShared();
-    this.#leases.clear();
-    this.#leaseCount = 0;
+    this.#consumers.clear();
     this.#options.collect();
   }
 
-  #requestRefresh(): void {
+  #requestRefresh(topologyChanged = false): void {
     if (this.#closed) return;
     this.#pending = true;
+    this.#topologyPending = this.#topologyPending || topologyChanged;
     if (this.#refreshing) return;
     this.#refreshing = true;
     try {
       while (this.#pending && !this.#closed) {
         this.#pending = false;
+        if (this.#topologyPending) {
+          this.#topologyPending = false;
+          this.#refreshSourceSubscriptions();
+        }
         const captured = this.#capture();
-        const session = this.#session;
-        if (session === undefined) continue;
-        const maintained = this.#updateMaintenance(session, captured);
-        const current = this.#result(maintained, captured);
-        const previousSnapshot = this.#snapshot;
-        if (previousSnapshot.state !== 'open') continue;
-        const nextSnapshot = this.#observerSnapshot(current, previousSnapshot);
-        if (samePortable(previousSnapshot, nextSnapshot)) continue;
-        const change = observerChange(previousSnapshot, nextSnapshot);
-        this.#snapshot = nextSnapshot;
-        for (const lease of Array.from(this.#leases)) lease.publish(nextSnapshot, change);
+        this.#snapshot = captured;
+        const consumers = Array.from(this.#consumers);
+        for (const consumer of consumers) {
+          if (this.#consumers.has(consumer)) consumer.stage(captured);
+        }
+        // A nested input change supersedes this staged pass before consumers
+        // are notified. Their maintenance sessions can safely accept both
+        // snapshots, but observers see only the newest coherent basis.
+        if (this.#pending) continue;
+        for (const consumer of consumers) {
+          if (this.#consumers.has(consumer)) consumer.preparePublish();
+        }
+        for (const consumer of consumers) {
+          if (this.#consumers.has(consumer)) consumer.publish();
+        }
       }
     } finally {
       this.#refreshing = false;
@@ -357,6 +388,93 @@ class SharedObservation<Query, Row, Projection> {
     });
     return { dataset, members };
   }
+}
+
+type SharedOptions<Query, Row, Projection> = {
+  readonly plan: PreparedPlan<Query>;
+  readonly parameters: Readonly<Record<string, JsonValue>>;
+  readonly allowPartial: boolean;
+  readonly runtime: DatasetExecutionRuntime<Projection>;
+  readonly createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
+  readonly collect: () => void;
+};
+
+class SharedObservation<Query, Row, Projection> {
+  readonly #options: SharedOptions<Query, Row, Projection>;
+  readonly #leases = new Set<ObserverLease<Row>>();
+  #session: DatabaseQueryMaintenanceSession<Query, Row, Projection> | undefined;
+  #snapshot: ObserverSnapshot<Row>;
+  #publishedSnapshot: ObserverSnapshot<Row>;
+  #stagedChange: ObserverChange<Row> | undefined;
+  #leaseCount = 0;
+  #closed = false;
+
+  constructor(options: SharedOptions<Query, Row, Projection>) {
+    this.#options = options;
+    const captured = options.runtime.snapshot();
+    this.#session = this.#openMaintenance(captured);
+    this.#snapshot = this.#observerSnapshot(this.#result(this.#session.getCurrentResult(), captured), undefined);
+    this.#publishedSnapshot = this.#snapshot;
+    options.runtime.add(this);
+  }
+
+  acquire(): QueryObserver<Row> {
+    if (this.#closed) throw new Error('Shared observation is closed');
+    this.#leaseCount += 1;
+    const lease = new ObserverLease(this, this.#publishedSnapshot);
+    this.#leases.add(lease);
+    return lease;
+  }
+
+  release(lease: ObserverLease<Row>): void {
+    if (!this.#leases.delete(lease)) return;
+    this.#leaseCount -= 1;
+    if (this.#leaseCount === 0) this.close();
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#session?.close();
+    this.#session = undefined;
+    this.#options.runtime.remove(this);
+    this.#snapshot = closedSnapshot as ObserverSnapshot<Row>;
+    for (const lease of Array.from(this.#leases)) lease.closeFromShared();
+    this.#leases.clear();
+    this.#leaseCount = 0;
+    this.#options.collect();
+  }
+
+  stage(captured: EvaluationSnapshot<Projection>): void {
+    this.#stagedChange = undefined;
+    if (this.#closed) return;
+    const session = this.#session;
+    if (session === undefined) return;
+    const maintained = this.#updateMaintenance(session, captured);
+    const current = this.#result(maintained, captured);
+    const previousSnapshot = this.#snapshot;
+    if (previousSnapshot.state !== 'open') return;
+    const nextSnapshot = this.#observerSnapshot(current, previousSnapshot);
+    if (samePortable(this.#publishedSnapshot, nextSnapshot)) {
+      this.#snapshot = this.#publishedSnapshot;
+      return;
+    }
+    this.#snapshot = nextSnapshot;
+    this.#stagedChange = observerChange(this.#publishedSnapshot, nextSnapshot);
+  }
+
+  preparePublish(): void {
+    if (this.#closed || this.#stagedChange === undefined) return;
+    for (const lease of Array.from(this.#leases)) lease.stage(this.#snapshot);
+  }
+
+  publish(): void {
+    const change = this.#stagedChange;
+    this.#stagedChange = undefined;
+    if (this.#closed || change === undefined) return;
+    this.#publishedSnapshot = this.#snapshot;
+    for (const lease of Array.from(this.#leases)) lease.publish(change);
+  }
 
   #maintenanceInput(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceInput<Query, Projection> {
     const available: AvailableQueryAttachment<Projection>[] = [];
@@ -369,7 +487,11 @@ class SharedObservation<Query, Row, Projection> {
 
   #openMaintenance(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceSession<Query, Row, Projection> {
     try {
-      return this.#options.createQueryMaintenance({ plan: this.#options.plan, initialInput: this.#maintenanceInput(captured) });
+      return this.#options.createQueryMaintenance({
+        plan: this.#options.plan,
+        initialInput: this.#maintenanceInput(captured),
+        runtimeIdentity: this.#options.runtime.identity
+      });
     } catch (error) {
       return failedMaintenanceSession<Query, Row, Projection>(error);
     }
@@ -428,13 +550,142 @@ class SharedObservation<Query, Row, Projection> {
 /** Bridges relation projections into the production incremental query graph. */
 export const createIncrementalDatabaseQueryMaintenance = (
   functions?: FunctionRegistry
-): CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> => ({ plan, initialInput }) => {
-  let accepted = queryMaintenanceSnapshot(initialInput, functions);
+): IncrementalDatabaseQueryMaintenanceFactory => {
+  const scopes = new WeakMap<object, Map<string, PooledDatabaseMaintenanceCohort>>();
+  let nextCohortIdentity = 0;
+  const factory = (({ plan, initialInput, runtimeIdentity }) => {
+    const initial = queryMaintenanceSnapshot(initialInput, functions);
+    let cohorts = scopes.get(runtimeIdentity);
+    if (cohorts === undefined) {
+      cohorts = new Map();
+      scopes.set(runtimeIdentity, cohorts);
+    }
+    const key = pooledDatabaseCohortKey(plan, initialInput.parameters);
+    let cohort = cohorts.get(key);
+    if (cohort !== undefined && !sameQueryMaintenanceSnapshot(cohort.accepted, initial)) {
+      return openPrivateDatabaseMaintenance(plan, initial);
+    }
+    if (cohort === undefined) {
+      const runtime = createPooledIncrementalQueryRuntime({
+        environment: {
+          runtimeIdentity: 'cohort:' + String(nextCohortIdentity += 1),
+          registryFingerprint: plan.registryFingerprint,
+          authorityFingerprint: plan.authorityFingerprint,
+          datasetId: plan.datasetId,
+          parameters: initialInput.parameters,
+          ...(functions === undefined ? {} : { functions })
+        },
+        initialSnapshot: initial
+      });
+      try {
+        const root = runtime.attach(plan);
+        cohort = { key, runtime, accepted: initial, roots: 1 };
+        cohorts.set(key, cohort);
+        return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts });
+      } catch (error) {
+        runtime.close();
+        if (!isNonPoolableQueryError(error)) throw error;
+        return openPrivateDatabaseMaintenance(plan, initial);
+      }
+    }
+    try {
+      const root = cohort.runtime.attach(plan);
+      cohort.roots += 1;
+      return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts });
+    } catch (error) {
+      if (!isNonPoolableQueryError(error)) throw error;
+      return openPrivateDatabaseMaintenance(plan, initial);
+    }
+  }) as IncrementalDatabaseQueryMaintenanceFactory;
+  factory.getDiagnostics = (runtimeIdentity) => Object.freeze(
+    [...(scopes.get(runtimeIdentity)?.values() ?? [])].map(({ runtime }) => runtime.getDiagnostics())
+  );
+  return factory;
+};
+
+const isNonPoolableQueryError = (error: unknown): boolean => error instanceof TypeError
+  && (error.message === 'Pooled query graphs must be acyclic' || error.message.startsWith('Pooled query graphs do not support '));
+
+type PooledDatabaseMaintenanceCohort = {
+  readonly key: string;
+  readonly runtime: PooledIncrementalQueryRuntime;
+  accepted: QueryMaintenanceSnapshot;
+  lastRejected?: QueryMaintenanceSnapshot;
+  roots: number;
+};
+
+const openPooledDatabaseMaintenance = (options: {
+  readonly plan: PreparedPlan<QueryNode>;
+  readonly initial: QueryMaintenanceSnapshot;
+  readonly root: PooledIncrementalQueryRoot;
+  readonly cohort: PooledDatabaseMaintenanceCohort;
+  readonly cohorts: Map<string, PooledDatabaseMaintenanceCohort>;
+}): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
+  let localAccepted = options.initial;
+  let root: PooledIncrementalQueryRoot | undefined = options.root;
+  let privateSession: DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
+  let closed = false;
+
+  const detach = (): void => {
+    if (root === undefined) return;
+    root.close();
+    root = undefined;
+    options.cohort.roots -= 1;
+    if (options.cohort.roots !== 0) return;
+    options.cohort.runtime.close();
+    if (options.cohorts.get(options.cohort.key) === options.cohort) options.cohorts.delete(options.cohort.key);
+  };
+
+  return {
+    getCurrentResult: () => privateSession === undefined
+      ? databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult())
+      : privateSession.getCurrentResult(),
+    updateInput: (input) => {
+      const normalizedNext = queryMaintenanceSnapshot(input, options.initial.functions);
+      if (privateSession !== undefined) return privateSession.updateInput(input);
+      const returnsToAccepted = sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.accepted);
+      if (returnsToAccepted && options.cohort.lastRejected === undefined) {
+        localAccepted = normalizedNext;
+        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult());
+      }
+      if (!returnsToAccepted && options.cohort.lastRejected !== undefined && sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.lastRejected)) {
+        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult());
+      }
+      if (!sameQueryMaintenanceSnapshot(localAccepted, options.cohort.accepted)) {
+        detach();
+        privateSession = openPrivateDatabaseMaintenance(options.plan, localAccepted);
+        return privateSession.updateInput(input);
+      }
+      const rejectedBefore = options.cohort.runtime.getDiagnostics().rejectedUpdateCount;
+      options.cohort.runtime.applyUpdate(diffQueryMaintenanceSnapshots(options.cohort.accepted, normalizedNext));
+      if (options.cohort.runtime.getDiagnostics().rejectedUpdateCount === rejectedBefore) {
+        options.cohort.accepted = normalizedNext;
+        delete options.cohort.lastRejected;
+        localAccepted = normalizedNext;
+      } else {
+        options.cohort.lastRejected = normalizedNext;
+      }
+      return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult());
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      privateSession?.close();
+      detach();
+    }
+  };
+};
+
+const openPrivateDatabaseMaintenance = (
+  plan: PreparedPlan<QueryNode>,
+  initial: QueryMaintenanceSnapshot
+): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
+  let accepted = initial;
   const session = openIncrementalQueryMaintenance(plan, accepted);
   return {
     getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult()),
     updateInput: (input) => {
-      const next = queryMaintenanceSnapshot(input, functions);
+      const next = queryMaintenanceSnapshot(input, accepted.functions);
       const rejectedBefore = session.getCurrentResult().state.rejectedUpdateCount;
       const result = session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
       if (result.state.rejectedUpdateCount === rejectedBefore) accepted = next;
@@ -443,6 +694,21 @@ export const createIncrementalDatabaseQueryMaintenance = (
     close: () => session.close()
   };
 };
+
+const pooledDatabaseCohortKey = (
+  plan: PreparedPlan<QueryNode>,
+  parameters: Readonly<Record<string, JsonValue>>
+): string => canonicalizeJson([
+  plan.datasetId,
+  plan.authorityFingerprint,
+  plan.registryFingerprint,
+  parameters
+] as JsonValue);
+
+const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => samePortable(
+  { relations: left.relations, parameters: left.parameters, basis: left.basis, membershipRevision: left.membershipRevision },
+  { relations: right.relations, parameters: right.parameters, basis: right.basis, membershipRevision: right.membershipRevision }
+);
 
 const queryMaintenanceSnapshot = (
   input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
@@ -518,9 +784,13 @@ class ObserverLease<Row> implements QueryObserver<Row> {
     this.#shared = undefined;
   }
 
-  publish(snapshot: ObserverSnapshot<Row>, change: ObserverChange<Row>): void {
+  stage(snapshot: ObserverSnapshot<Row>): void {
     if (this.#closed) return;
     this.#snapshot = snapshot;
+  }
+
+  publish(change: ObserverChange<Row>): void {
+    if (this.#closed) return;
     for (const listener of Array.from(this.#listeners)) {
       try { listener(change); } catch { /* one consumer cannot break observation */ }
     }
