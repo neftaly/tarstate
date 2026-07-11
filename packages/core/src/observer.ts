@@ -15,6 +15,8 @@ import type { PreparedPlan, SourceBasis } from './maintenance.js';
 import {
   diffQueryMaintenanceSnapshots,
   createPooledIncrementalQueryRuntime,
+  isNonPoolableQueryError,
+  isPooledQueryRuntimeBusyError,
   openIncrementalQueryMaintenance,
   type FunctionRegistry,
   type IncrementalQueryResult,
@@ -114,12 +116,18 @@ export interface DatabaseQueryMaintenanceSession<Query, Row, Projection> {
 export type CreateDatabaseQueryMaintenance<Query, Row, Projection> = (input: {
   readonly plan: PreparedPlan<Query>;
   readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
-  /** Stable identity for one database/dataset capture stream. */
-  readonly runtimeIdentity: object;
+  /** Opaque identity shared by observations of one captured dataset stream. Custom factories may ignore it. */
+  readonly runtimeIdentity?: object;
 }) => DatabaseQueryMaintenanceSession<Query, Row, Projection>;
 
-export type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
-  getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
+/** Frozen physical counters for one active shared query-maintenance cohort. */
+export type QueryMaintenanceDiagnostics = PooledIncrementalQueryDiagnostics;
+
+const incrementalMaintenanceFactoryBrand = Symbol('tarstate.incremental-maintenance-factory');
+type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
+  readonly [incrementalMaintenanceFactoryBrand]: {
+    readonly getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
+  };
 };
 
 export type DatabaseViewOptions<Query, Row, Projection> = {
@@ -167,7 +175,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   readonly #createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
   readonly #getDatabaseDescriptionSnapshot: (() => JsonValue) | undefined;
   readonly #cache = new Map<string, SharedObservation<Query, Row, Projection>>();
-  readonly #datasetRuntimes = new Map<string, DatasetExecutionRuntime<Projection>>();
+  readonly #datasetRuntimes = new Map<string, DatasetCaptureRuntime<Projection>>();
   #closed = false;
 
   constructor(options: DatabaseViewOptions<Query, Row, Projection>) {
@@ -193,7 +201,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     if (shared === undefined) {
       let runtime = this.#datasetRuntimes.get(dataset.datasetId);
       if (runtime === undefined) {
-        runtime = new DatasetExecutionRuntime({
+        runtime = new DatasetCaptureRuntime({
           dataset,
           attachments: this.#attachments,
           authorityScope: this.authorityScope,
@@ -222,10 +230,10 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   getActiveMaintenanceCount(): number { return this.#cache.size; }
 
   /** Optional physical IVM counters; custom maintenance factories return no entries. */
-  getQueryMaintenanceDiagnostics(): readonly PooledIncrementalQueryDiagnostics[] {
-    const diagnostics = (this.#createQueryMaintenance as Partial<IncrementalDatabaseQueryMaintenanceFactory>).getDiagnostics;
-    if (diagnostics === undefined) return [];
-    return Object.freeze([...this.#datasetRuntimes.values()].flatMap((runtime) => diagnostics(runtime.identity)));
+  getQueryMaintenanceDiagnostics(): readonly QueryMaintenanceDiagnostics[] {
+    const branded = (this.#createQueryMaintenance as Partial<IncrementalDatabaseQueryMaintenanceFactory>)[incrementalMaintenanceFactoryBrand];
+    if (branded === undefined || typeof branded.getDiagnostics !== 'function') return [];
+    return Object.freeze([...this.#datasetRuntimes.values()].flatMap((runtime) => branded.getDiagnostics(runtime.identity)));
   }
 
   getDatabaseDescriptionSnapshot(): JsonValue | undefined {
@@ -235,10 +243,17 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    for (const shared of Array.from(this.#cache.values())) shared.close();
-    this.#cache.clear();
-    for (const runtime of Array.from(this.#datasetRuntimes.values())) runtime.close();
-    this.#datasetRuntimes.clear();
+    try {
+      for (const shared of Array.from(this.#cache.values())) {
+        try { shared.close(); } catch { /* one maintenance implementation cannot prevent database cleanup */ }
+      }
+    } finally {
+      this.#cache.clear();
+      for (const runtime of Array.from(this.#datasetRuntimes.values())) {
+        try { runtime.close(); } catch { /* one source runtime cannot prevent database cleanup */ }
+      }
+      this.#datasetRuntimes.clear();
+    }
   }
 }
 
@@ -252,17 +267,19 @@ type CapturedMember<Projection> = {
 };
 
 type EvaluationSnapshot<Projection> = {
+  readonly identity: object;
   readonly dataset: DatasetSnapshot;
   readonly members: readonly CapturedMember<Projection>[];
+  readonly available: readonly AvailableQueryAttachment<Projection>[];
 };
 
-type DatasetExecutionConsumer<Projection> = {
+type DatasetCaptureConsumer<Projection> = {
   readonly stage: (captured: EvaluationSnapshot<Projection>) => void;
   readonly preparePublish: () => void;
   readonly publish: () => void;
 };
 
-type DatasetExecutionRuntimeOptions = {
+type DatasetCaptureRuntimeOptions = {
   readonly dataset: DatasetMembership;
   readonly attachments: AttachmentCatalog;
   readonly authorityScope: string;
@@ -271,12 +288,12 @@ type DatasetExecutionRuntimeOptions = {
 };
 
 /** One authority-filtered capture and subscription topology shared by every active root in a dataset. */
-class DatasetExecutionRuntime<Projection> {
-  readonly #options: DatasetExecutionRuntimeOptions;
-  readonly #consumers = new Set<DatasetExecutionConsumer<Projection>>();
+class DatasetCaptureRuntime<Projection> {
+  readonly #options: DatasetCaptureRuntimeOptions;
+  readonly #consumers = new Set<DatasetCaptureConsumer<Projection>>();
   readonly #unsubscribeDataset: () => void;
   readonly #unsubscribeCatalog: () => void;
-  #sourceUnsubscribes: readonly (() => void)[] = [];
+  readonly #sourceUnsubscribes = new Map<object, () => void>();
   #snapshot: EvaluationSnapshot<Projection>;
   #refreshing = false;
   #pending = false;
@@ -284,7 +301,7 @@ class DatasetExecutionRuntime<Projection> {
   #closed = false;
   readonly #identity = Object.freeze({});
 
-  constructor(options: DatasetExecutionRuntimeOptions) {
+  constructor(options: DatasetCaptureRuntimeOptions) {
     this.#options = options;
     const refreshTopology = () => this.#requestRefresh(true);
     this.#unsubscribeDataset = options.dataset.subscribe(refreshTopology);
@@ -296,12 +313,12 @@ class DatasetExecutionRuntime<Projection> {
   snapshot(): EvaluationSnapshot<Projection> { return this.#snapshot; }
   get identity(): object { return this.#identity; }
 
-  add(consumer: DatasetExecutionConsumer<Projection>): void {
-    if (this.#closed) throw new Error('Dataset execution runtime is closed');
+  add(consumer: DatasetCaptureConsumer<Projection>): void {
+    if (this.#closed) throw new Error('Dataset capture runtime is closed');
     this.#consumers.add(consumer);
   }
 
-  remove(consumer: DatasetExecutionConsumer<Projection>): void {
+  remove(consumer: DatasetCaptureConsumer<Projection>): void {
     if (!this.#consumers.delete(consumer)) return;
     if (this.#consumers.size === 0) this.close();
   }
@@ -309,10 +326,12 @@ class DatasetExecutionRuntime<Projection> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#unsubscribeDataset();
-    this.#unsubscribeCatalog();
-    for (const unsubscribe of this.#sourceUnsubscribes) unsubscribe();
-    this.#sourceUnsubscribes = [];
+    try { this.#unsubscribeDataset(); } catch { /* lifecycle cleanup is best effort */ }
+    try { this.#unsubscribeCatalog(); } catch { /* lifecycle cleanup is best effort */ }
+    for (const unsubscribe of this.#sourceUnsubscribes.values()) {
+      try { unsubscribe(); } catch { /* one source cannot prevent runtime cleanup */ }
+    }
+    this.#sourceUnsubscribes.clear();
     this.#consumers.clear();
     this.#options.collect();
   }
@@ -353,22 +372,28 @@ class DatasetExecutionRuntime<Projection> {
   }
 
   #refreshSourceSubscriptions(): void {
-    for (const unsubscribe of this.#sourceUnsubscribes) unsubscribe();
-    const subscribed = new Set<object>();
-    const unsubscribes: (() => void)[] = [];
+    const desired = new Map<object, DatabaseAttachment['source']>();
     for (const member of this.#options.dataset.snapshot().members) {
       const attachment = this.#options.attachments.get(member.attachmentId);
-      if (attachment === undefined || subscribed.has(attachment.source)) continue;
+      if (attachment === undefined || desired.has(attachment.source)) continue;
       if (attachment.sourceId !== member.sourceId) continue;
       if (!this.#options.canRead(this.#options.authorityScope, attachment.authorityScope, attachment.attachmentId)) continue;
-      subscribed.add(attachment.source);
-      unsubscribes.push(attachment.source.subscribe(() => this.#requestRefresh()));
+      desired.set(attachment.source, attachment.source);
     }
-    this.#sourceUnsubscribes = unsubscribes;
+    for (const [source, unsubscribe] of this.#sourceUnsubscribes) {
+      if (desired.has(source)) continue;
+      try { unsubscribe(); } catch { /* topology refresh continues for other sources */ }
+      this.#sourceUnsubscribes.delete(source);
+    }
+    for (const [source, observable] of desired) {
+      if (this.#sourceUnsubscribes.has(source)) continue;
+      this.#sourceUnsubscribes.set(source, observable.subscribe(() => this.#requestRefresh()));
+    }
   }
 
   #capture(): EvaluationSnapshot<Projection> {
     const dataset = this.#options.dataset.snapshot();
+    const snapshots = new Map<object, SourceSnapshot<unknown>>();
     const members = dataset.members.map((member): CapturedMember<Projection> => {
       const raw = this.#options.attachments.get(member.attachmentId);
       if (raw === undefined) return { member, authorized: true };
@@ -376,7 +401,11 @@ class DatasetExecutionRuntime<Projection> {
       const authorized = this.#options.canRead(this.#options.authorityScope, raw.authorityScope, raw.attachmentId);
       if (!authorized) return { member, authorized: false };
       const attachment = raw as DatabaseAttachment<unknown, Projection>;
-      const snapshot = attachment.source.snapshot() as SourceSnapshot<unknown>;
+      let snapshot = snapshots.get(attachment.source);
+      if (snapshot === undefined) {
+        snapshot = attachment.source.snapshot() as SourceSnapshot<unknown>;
+        snapshots.set(attachment.source, snapshot);
+      }
       const projection = snapshot.state === 'ready' ? attachment.project(snapshot) : undefined;
       return {
         member,
@@ -385,16 +414,36 @@ class DatasetExecutionRuntime<Projection> {
         ...(projection === undefined ? {} : { projection }),
         authorized: true
       };
+    }).map((member) => Object.freeze(member));
+    const available = members.flatMap((candidate): readonly AvailableQueryAttachment<Projection>[] => {
+      if (candidate.attachment === undefined || candidate.snapshot === undefined || candidate.projection?.state !== 'ready') return [];
+      return [Object.freeze({
+        member: candidate.member,
+        attachment: candidate.attachment,
+        snapshot: candidate.snapshot,
+        projection: candidate.projection.value
+      })];
     });
-    return { dataset, members };
+    return Object.freeze({
+      identity: Object.freeze({}),
+      dataset,
+      members: Object.freeze(members),
+      available: Object.freeze(available)
+    });
   }
 }
+
+const captureFrameMetadata = Symbol('tarstate.capture-frame');
+type CaptureFrameMetadata = { readonly frameIdentity: object; readonly parameterKey: string };
+type InternalDatabaseQueryMaintenanceInput<Query, Projection> = DatabaseQueryMaintenanceInput<Query, Projection> & {
+  readonly [captureFrameMetadata]: CaptureFrameMetadata;
+};
 
 type SharedOptions<Query, Row, Projection> = {
   readonly plan: PreparedPlan<Query>;
   readonly parameters: Readonly<Record<string, JsonValue>>;
   readonly allowPartial: boolean;
-  readonly runtime: DatasetExecutionRuntime<Projection>;
+  readonly runtime: DatasetCaptureRuntime<Projection>;
   readonly createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
   readonly collect: () => void;
 };
@@ -406,21 +455,27 @@ class SharedObservation<Query, Row, Projection> {
   #snapshot: ObserverSnapshot<Row>;
   #publishedSnapshot: ObserverSnapshot<Row>;
   #stagedChange: ObserverChange<Row> | undefined;
-  #leaseCount = 0;
+  readonly #parameterKey: string;
   #closed = false;
 
   constructor(options: SharedOptions<Query, Row, Projection>) {
     this.#options = options;
+    this.#parameterKey = canonicalizeJson(options.parameters as JsonValue);
     const captured = options.runtime.snapshot();
     this.#session = this.#openMaintenance(captured);
     this.#snapshot = this.#observerSnapshot(this.#result(this.#session.getCurrentResult(), captured), undefined);
     this.#publishedSnapshot = this.#snapshot;
     options.runtime.add(this);
+    const latest = options.runtime.snapshot();
+    if (latest !== captured) {
+      this.stage(latest);
+      this.#publishedSnapshot = this.#snapshot;
+      this.#stagedChange = undefined;
+    }
   }
 
   acquire(): QueryObserver<Row> {
     if (this.#closed) throw new Error('Shared observation is closed');
-    this.#leaseCount += 1;
     const lease = new ObserverLease(this, this.#publishedSnapshot);
     this.#leases.add(lease);
     return lease;
@@ -428,21 +483,23 @@ class SharedObservation<Query, Row, Projection> {
 
   release(lease: ObserverLease<Row>): void {
     if (!this.#leases.delete(lease)) return;
-    this.#leaseCount -= 1;
-    if (this.#leaseCount === 0) this.close();
+    if (this.#leases.size === 0) this.close();
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#session?.close();
+    const session = this.#session;
     this.#session = undefined;
-    this.#options.runtime.remove(this);
-    this.#snapshot = closedSnapshot as ObserverSnapshot<Row>;
-    for (const lease of Array.from(this.#leases)) lease.closeFromShared();
-    this.#leases.clear();
-    this.#leaseCount = 0;
-    this.#options.collect();
+    try { session?.close(); } catch { /* maintenance cleanup cannot retain observation lifecycle */ }
+    try {
+      this.#options.runtime.remove(this);
+    } finally {
+      this.#snapshot = closedSnapshot as ObserverSnapshot<Row>;
+      for (const lease of Array.from(this.#leases)) lease.closeFromShared();
+      this.#leases.clear();
+      this.#options.collect();
+    }
   }
 
   stage(captured: EvaluationSnapshot<Projection>): void {
@@ -473,16 +530,21 @@ class SharedObservation<Query, Row, Projection> {
     this.#stagedChange = undefined;
     if (this.#closed || change === undefined) return;
     this.#publishedSnapshot = this.#snapshot;
+    // Leases can be acquired after the dataset-wide prepare phase by an
+    // earlier root's listener. Bring every current lease to this publication
+    // before notifying any of them.
+    for (const lease of Array.from(this.#leases)) lease.stage(this.#snapshot);
     for (const lease of Array.from(this.#leases)) lease.publish(change);
   }
 
   #maintenanceInput(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceInput<Query, Projection> {
-    const available: AvailableQueryAttachment<Projection>[] = [];
-    for (const candidate of captured.members) {
-      if (candidate.attachment === undefined || candidate.snapshot === undefined || candidate.projection?.state !== 'ready') continue;
-      available.push({ member: candidate.member, attachment: candidate.attachment, snapshot: candidate.snapshot, projection: candidate.projection.value });
-    }
-    return { query: this.#options.plan.query, parameters: this.#options.parameters, dataset: captured.dataset, attachments: available };
+    return {
+      query: this.#options.plan.query,
+      parameters: this.#options.parameters,
+      dataset: captured.dataset,
+      attachments: captured.available,
+      [captureFrameMetadata]: Object.freeze({ frameIdentity: captured.identity, parameterKey: this.#parameterKey })
+    } as InternalDatabaseQueryMaintenanceInput<Query, Projection>;
   }
 
   #openMaintenance(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceSession<Query, Row, Projection> {
@@ -550,11 +612,13 @@ class SharedObservation<Query, Row, Projection> {
 /** Bridges relation projections into the production incremental query graph. */
 export const createIncrementalDatabaseQueryMaintenance = (
   functions?: FunctionRegistry
-): IncrementalDatabaseQueryMaintenanceFactory => {
+): CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> => {
   const scopes = new WeakMap<object, Map<string, PooledDatabaseMaintenanceCohort>>();
+  const normalize = createQueryMaintenanceSnapshotNormalizer(functions);
   let nextCohortIdentity = 0;
   const factory = (({ plan, initialInput, runtimeIdentity }) => {
-    const initial = queryMaintenanceSnapshot(initialInput, functions);
+    const initial = normalize(initialInput);
+    if (runtimeIdentity === undefined) return openPrivateDatabaseMaintenance(plan, initial, normalize);
     let cohorts = scopes.get(runtimeIdentity);
     if (cohorts === undefined) {
       cohorts = new Map();
@@ -562,8 +626,10 @@ export const createIncrementalDatabaseQueryMaintenance = (
     }
     const key = pooledDatabaseCohortKey(plan, initialInput.parameters);
     let cohort = cohorts.get(key);
-    if (cohort !== undefined && !sameQueryMaintenanceSnapshot(cohort.accepted, initial)) {
-      return openPrivateDatabaseMaintenance(plan, initial);
+    const attachesToRejected = cohort?.lastRejected !== undefined
+      && sameQueryMaintenanceSnapshot(cohort.lastRejected, initial);
+    if (cohort !== undefined && !sameQueryMaintenanceSnapshot(cohort.accepted, initial) && !attachesToRejected) {
+      return openPrivateDatabaseMaintenance(plan, initial, normalize);
     }
     if (cohort === undefined) {
       const runtime = createPooledIncrementalQueryRuntime({
@@ -581,30 +647,31 @@ export const createIncrementalDatabaseQueryMaintenance = (
         const root = runtime.attach(plan);
         cohort = { key, runtime, accepted: initial, roots: 1 };
         cohorts.set(key, cohort);
-        return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts });
+        return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts, normalize });
       } catch (error) {
         runtime.close();
         if (!isNonPoolableQueryError(error)) throw error;
-        return openPrivateDatabaseMaintenance(plan, initial);
+        return openPrivateDatabaseMaintenance(plan, initial, normalize);
       }
     }
     try {
       const root = cohort.runtime.attach(plan);
       cohort.roots += 1;
-      return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts });
+      return openPooledDatabaseMaintenance({ plan, initial: attachesToRejected ? cohort.accepted : initial, root, cohort, cohorts, normalize });
     } catch (error) {
-      if (!isNonPoolableQueryError(error)) throw error;
-      return openPrivateDatabaseMaintenance(plan, initial);
+      if (!isNonPoolableQueryError(error) && !isPooledQueryRuntimeBusyError(error)) throw error;
+      return openPrivateDatabaseMaintenance(plan, initial, normalize);
     }
   }) as IncrementalDatabaseQueryMaintenanceFactory;
-  factory.getDiagnostics = (runtimeIdentity) => Object.freeze(
-    [...(scopes.get(runtimeIdentity)?.values() ?? [])].map(({ runtime }) => runtime.getDiagnostics())
-  );
+  Object.defineProperty(factory, incrementalMaintenanceFactoryBrand, {
+    value: Object.freeze({
+      getDiagnostics: (runtimeIdentity: object) => Object.freeze(
+        [...(scopes.get(runtimeIdentity)?.values() ?? [])].map(({ runtime }) => runtime.getDiagnostics())
+      )
+    })
+  });
   return factory;
 };
-
-const isNonPoolableQueryError = (error: unknown): boolean => error instanceof TypeError
-  && (error.message === 'Pooled query graphs must be acyclic' || error.message.startsWith('Pooled query graphs do not support '));
 
 type PooledDatabaseMaintenanceCohort = {
   readonly key: string;
@@ -620,6 +687,7 @@ const openPooledDatabaseMaintenance = (options: {
   readonly root: PooledIncrementalQueryRoot;
   readonly cohort: PooledDatabaseMaintenanceCohort;
   readonly cohorts: Map<string, PooledDatabaseMaintenanceCohort>;
+  readonly normalize: QueryMaintenanceSnapshotNormalizer;
 }): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
   let localAccepted = options.initial;
   let root: PooledIncrementalQueryRoot | undefined = options.root;
@@ -638,10 +706,10 @@ const openPooledDatabaseMaintenance = (options: {
 
   return {
     getCurrentResult: () => privateSession === undefined
-      ? databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult())
+      ? databaseResultFromMaintained((root ?? options.root).getCurrentResult())
       : privateSession.getCurrentResult(),
     updateInput: (input) => {
-      const normalizedNext = queryMaintenanceSnapshot(input, options.initial.functions);
+      const normalizedNext = options.normalize(input);
       if (privateSession !== undefined) return privateSession.updateInput(input);
       const returnsToAccepted = sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.accepted);
       if (returnsToAccepted && options.cohort.lastRejected === undefined) {
@@ -653,9 +721,10 @@ const openPooledDatabaseMaintenance = (options: {
       }
       if (!sameQueryMaintenanceSnapshot(localAccepted, options.cohort.accepted)) {
         detach();
-        privateSession = openPrivateDatabaseMaintenance(options.plan, localAccepted);
+        privateSession = openPrivateDatabaseMaintenance(options.plan, localAccepted, options.normalize);
         return privateSession.updateInput(input);
       }
+      const updatingRoot = root ?? options.root;
       const rejectedBefore = options.cohort.runtime.getDiagnostics().rejectedUpdateCount;
       options.cohort.runtime.applyUpdate(diffQueryMaintenanceSnapshots(options.cohort.accepted, normalizedNext));
       if (options.cohort.runtime.getDiagnostics().rejectedUpdateCount === rejectedBefore) {
@@ -665,7 +734,7 @@ const openPooledDatabaseMaintenance = (options: {
       } else {
         options.cohort.lastRejected = normalizedNext;
       }
-      return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult());
+      return databaseResultFromMaintained(updatingRoot.getCurrentResult());
     },
     close: () => {
       if (closed) return;
@@ -678,16 +747,29 @@ const openPooledDatabaseMaintenance = (options: {
 
 const openPrivateDatabaseMaintenance = (
   plan: PreparedPlan<QueryNode>,
-  initial: QueryMaintenanceSnapshot
+  initial: QueryMaintenanceSnapshot,
+  normalize: QueryMaintenanceSnapshotNormalizer
 ): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
   let accepted = initial;
-  const session = openIncrementalQueryMaintenance(plan, accepted);
+  let session = openIncrementalQueryMaintenance(plan, accepted);
   return {
     getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult()),
     updateInput: (input) => {
-      const next = queryMaintenanceSnapshot(input, accepted.functions);
+      const next = normalize(input);
+      let update: ReturnType<typeof diffQueryMaintenanceSnapshots>;
+      try {
+        update = diffQueryMaintenanceSnapshots(accepted, next);
+      } catch {
+        // An invalid initial snapshot can make an exact delta impossible to
+        // construct. Rebase the private fallback so a later valid source
+        // snapshot can recover instead of remaining pinned to malformed input.
+        try { session.close(); } catch { /* replacement must not depend on cleanup */ }
+        accepted = next;
+        session = openIncrementalQueryMaintenance(plan, accepted);
+        return databaseResultFromMaintained(session.getCurrentResult());
+      }
       const rejectedBefore = session.getCurrentResult().state.rejectedUpdateCount;
-      const result = session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+      const result = session.applyUpdate(update);
       if (result.state.rejectedUpdateCount === rejectedBefore) accepted = next;
       return databaseResultFromMaintained(result);
     },
@@ -705,23 +787,58 @@ const pooledDatabaseCohortKey = (
   parameters
 ] as JsonValue);
 
-const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => samePortable(
+const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => left === right || samePortable(
   { relations: left.relations, parameters: left.parameters, basis: left.basis, membershipRevision: left.membershipRevision },
   { relations: right.relations, parameters: right.parameters, basis: right.basis, membershipRevision: right.membershipRevision }
 );
 
-const queryMaintenanceSnapshot = (
+type QueryMaintenanceSnapshotNormalizer = (
+  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>
+) => QueryMaintenanceSnapshot;
+
+const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | undefined): QueryMaintenanceSnapshotNormalizer => {
+  const frames = new WeakMap<object, {
+    readonly normalized: Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'>;
+    readonly parameters: Map<string, QueryMaintenanceSnapshot>;
+  }>();
+  return (input) => {
+    const metadata = (input as Partial<InternalDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[captureFrameMetadata];
+    if (metadata === undefined) return normalizeQueryMaintenanceSnapshot(input, functions);
+    let frame = frames.get(metadata.frameIdentity);
+    if (frame === undefined) {
+      frame = { normalized: normalizeQueryMaintenanceFrame(input), parameters: new Map() };
+      frames.set(metadata.frameIdentity, frame);
+    }
+    const cached = frame.parameters.get(metadata.parameterKey);
+    if (cached !== undefined) return cached;
+    const normalized: QueryMaintenanceSnapshot = {
+      ...frame.normalized,
+      parameters: input.parameters,
+      ...(functions === undefined ? {} : { functions })
+    };
+    frame.parameters.set(metadata.parameterKey, normalized);
+    return normalized;
+  };
+};
+
+const normalizeQueryMaintenanceSnapshot = (
   input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
   functions: FunctionRegistry | undefined
 ): QueryMaintenanceSnapshot => ({
+  ...normalizeQueryMaintenanceFrame(input),
+  parameters: input.parameters,
+  ...(functions === undefined ? {} : { functions })
+});
+
+const normalizeQueryMaintenanceFrame = (
+  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>
+): Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'> => ({
   relations: input.attachments.flatMap(({ member, snapshot, projection }) => projection.map((relation) => ({
     ...relation,
     sourceId: member.sourceId,
     attachmentId: member.attachmentId,
     basis: snapshot.basis
   }))),
-  parameters: input.parameters,
-  ...(functions === undefined ? {} : { functions }),
   basis: {
     dataset: { datasetId: input.dataset.datasetId, revision: input.dataset.revision },
     attachments: input.attachments.map(({ member, snapshot }) => ({ attachmentId: member.attachmentId, sourceId: member.sourceId, basis: snapshot.basis }))

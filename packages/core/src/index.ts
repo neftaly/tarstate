@@ -15,7 +15,38 @@ export * from './maintenance.js';
 export * from './mapping.js';
 export * from './memory-source.js';
 export * from './observer.js';
-export * from './query.js';
+export {
+  diffQueryMaintenanceSnapshots,
+  evaluateExpression,
+  evaluateQuery,
+  openIncrementalQueryMaintenance,
+  prepareQuery
+} from './query.js';
+export type {
+  AggregateExpr,
+  Completeness,
+  Expr,
+  FunctionRegistry,
+  IncrementalQueryMaintenanceSession,
+  IncrementalQueryMaintenanceState,
+  IncrementalQueryResult,
+  IncrementalQueryResultDelta,
+  OrderTerm,
+  QueryCursor,
+  QueryFunction,
+  QueryLogicalValue,
+  QueryMaintenanceSnapshot,
+  QueryMaintenanceUpdate,
+  QueryNode,
+  QueryRecord,
+  QueryRequest,
+  QueryResult,
+  RelationInput,
+  RelationInputChange,
+  RelationRowChange,
+  RelationUse,
+  WindowExpr
+} from './query.js';
 export * from './query-builder.js';
 export * from './receipts.js';
 export * from './registry.js';

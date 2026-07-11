@@ -193,14 +193,15 @@ export type PooledIncrementalQueryDiagnostics = {
   readonly activeRootCount: number;
   readonly physicalNodeCount: number;
   readonly sharedPhysicalNodeCount: number;
-  readonly updatedPhysicalNodeCount: number;
-  readonly changedPhysicalNodeCount: number;
-  readonly collectedPhysicalNodeCount: number;
+  readonly lastUpdatedPhysicalNodeCount: number;
+  readonly lastChangedPhysicalNodeCount: number;
+  readonly lastCollectedPhysicalNodeCount: number;
   readonly rejectedUpdateCount: number;
 };
 
 export interface PooledIncrementalQueryRoot {
   getCurrentResult(): IncrementalQueryResult;
+  /** Idempotent; closure requested during an update is applied after that update completes. */
   close(): void;
 }
 
@@ -209,9 +210,12 @@ export interface PooledIncrementalQueryRoot {
  * recursion, and expression-subquery graphs remain isolated in v1.
  */
 export interface PooledIncrementalQueryRuntime {
+  /** Attaches a root while idle; attachment during an update is rejected. */
   attach(plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot;
+  /** Applies one update synchronously; recursive application is rejected. */
   applyUpdate(update: QueryMaintenanceUpdate): void;
   getDiagnostics(): PooledIncrementalQueryDiagnostics;
+  /** Idempotent; closure requested during an update is applied after that update completes. */
   close(): void;
 }
 
@@ -1219,6 +1223,12 @@ type PooledPhysicalNode = {
   references: number;
 };
 
+type InternedPooledNode = {
+  readonly id: number;
+  readonly key: string;
+  readonly node: QueryNode;
+};
+
 type PooledRootState = {
   readonly root: QueryNode;
   readonly reachable: ReadonlySet<QueryNode>;
@@ -1240,7 +1250,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
     throw new TypeError('Pooled query environment functions do not match the initial snapshot');
   }
 
-  const interned = new Map<string, QueryNode>();
+  const interned = new Map<string, InternedPooledNode>();
+  const internedByNode = new Map<QueryNode, InternedPooledNode>();
+  let nextInternedNodeId = 0;
   const physical = new Map<QueryNode, PooledPhysicalNode>();
   let physicalOrder: QueryNode[] = [];
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
@@ -1251,6 +1263,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
   let revision = 0;
   let rejectedUpdateCount = 0;
   let closed = false;
+  let executionPhase: 'idle' | 'attaching' | 'updating' = 'idle';
+  let closeRequested = false;
+  const deferredReleases = new Set<PooledRootState>();
   let diagnostics = pooledDiagnostics(environment.runtimeIdentity, 0, 0, 0, 0, 0, 0, 0, 0);
 
   const refreshDiagnostics = (updated: number, changed: number, collected: number): void => {
@@ -1269,7 +1284,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
     );
   };
 
-  const release = (root: PooledRootState): void => {
+  const releaseNow = (root: PooledRootState): void => {
     if (root.closed) return;
     root.closed = true;
     roots.delete(root);
@@ -1281,62 +1296,127 @@ export const createPooledIncrementalQueryRuntime = (input: {
       if (record.references !== 0) continue;
       physical.delete(node);
       materialized.delete(node);
-      if (interned.get(record.key) === node) interned.delete(record.key);
+      if (interned.get(record.key)?.node === node) interned.delete(record.key);
+      internedByNode.delete(node);
       collected += 1;
     }
     if (collected > 0) physicalOrder = physicalOrder.filter((node) => physical.has(node));
     refreshDiagnostics(0, 0, collected);
   };
 
-  const attach = (plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot => {
-    if (closed) throw new Error('Pooled incremental query runtime is closed');
+  const release = (root: PooledRootState): void => {
+    if (root.closed || deferredReleases.has(root)) return;
+    if (executionPhase !== 'idle') {
+      deferredReleases.add(root);
+      return;
+    }
+    releaseNow(root);
+  };
+
+  const closeNow = (): void => {
+    if (closed) return;
+    closed = true;
+    const collected = physical.size;
+    for (const root of Array.from(roots)) releaseNow(root);
+    deferredReleases.clear();
+    interned.clear();
+    internedByNode.clear();
+    physical.clear();
+    physicalOrder = [];
+    materialized.clear();
+    refreshDiagnostics(0, 0, collected);
+  };
+
+  const flushDeferredLifecycle = (): void => {
+    if (closeRequested) {
+      closeNow();
+      return;
+    }
+    for (const root of Array.from(deferredReleases)) releaseNow(root);
+    deferredReleases.clear();
+  };
+
+  const attachNow = (plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot => {
     if (plan.registryFingerprint !== environment.registryFingerprint) throw new TypeError('Prepared plan registry fingerprint does not match pooled query environment');
     if (plan.authorityFingerprint !== environment.authorityFingerprint) throw new TypeError('Prepared plan authority fingerprint does not match pooled query environment');
     if (plan.datasetId !== environment.datasetId) throw new TypeError('Prepared plan dataset does not match pooled query environment');
     assertPoolableQuery(plan.query);
-    const canonicalRoot = internPooledQueryNode(plan.query, interned);
-    const graph = compileQueryGraph(canonicalRoot);
-    const reachable = new Set(graph.nodes);
-    let added = 0;
-    for (const node of graph.nodes) {
-      const existing = physical.get(node);
-      if (existing !== undefined) {
-        existing.references += 1;
-        continue;
+    const detachedRoot = cloneAndFreezeQueryAst(plan.query);
+    const createdInterned: InternedPooledNode[] = [];
+    const stagedMaterialized: QueryNode[] = [];
+    try {
+      const canonicalRoot = internPooledQueryNode(detachedRoot, interned, internedByNode, createdInterned, () => nextInternedNodeId += 1);
+      const graph = compileQueryGraph(canonicalRoot);
+      const reachable = new Set(graph.nodes);
+      const newNodes = graph.nodes.filter((node) => !physical.has(node));
+      if (runtimeIssues.length === 0) {
+        for (const node of newNodes) {
+          materialized.set(node, materializeQueryNode(node, acceptedSnapshot, materialized));
+          stagedMaterialized.push(node);
+        }
       }
-      const key = canonicalizeJson(node as unknown as JsonValue);
-      physical.set(node, {
-        key,
-        children: graph.children.get(node) as readonly QueryNode[],
-        externalDependencies: graph.externalDependencies.get(node) as ReadonlySet<string>,
-        sessionEvidenceDependency: graph.sessionEvidenceDependencies.get(node) === true,
-        references: 1
-      });
-      physicalOrder.push(node);
-      if (runtimeIssues.length === 0) materialized.set(node, materializeQueryNode(node, acceptedSnapshot, materialized));
-      added += 1;
+      const rootMaterialized = runtimeIssues.length === 0 ? materialized.get(canonicalRoot) : undefined;
+      const state: PooledRootState = {
+        root: canonicalRoot,
+        reachable,
+        current: maintainedQueryResult(
+          rootMaterialized,
+          runtimeIssues,
+          maintenanceState(reachable.size, reachable.size, reachable.size, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+        ),
+        asserted: rootMaterialized,
+        closed: false
+      };
+      for (const node of graph.nodes) {
+        const existing = physical.get(node);
+        if (existing !== undefined) {
+          existing.references += 1;
+          continue;
+        }
+        const identity = internedByNode.get(node) as InternedPooledNode;
+        physical.set(node, {
+          key: identity.key,
+          children: graph.children.get(node) as readonly QueryNode[],
+          externalDependencies: graph.externalDependencies.get(node) as ReadonlySet<string>,
+          sessionEvidenceDependency: graph.sessionEvidenceDependencies.get(node) === true,
+          references: 1
+        });
+        physicalOrder.push(node);
+      }
+      roots.add(state);
+      refreshDiagnostics(newNodes.length, newNodes.length, 0);
+      return {
+        getCurrentResult: () => state.current,
+        close: () => release(state)
+      };
+    } catch (error) {
+      for (const node of stagedMaterialized) materialized.delete(node);
+      for (const identity of createdInterned.reverse()) {
+        if (physical.has(identity.node)) continue;
+        if (interned.get(identity.key) === identity) interned.delete(identity.key);
+        internedByNode.delete(identity.node);
+      }
+      throw error;
     }
-    const rootMaterialized = runtimeIssues.length === 0 ? materialized.get(canonicalRoot) : undefined;
-    const state: PooledRootState = {
-      root: canonicalRoot,
-      reachable,
-      current: maintainedQueryResult(
-        rootMaterialized,
-        runtimeIssues,
-        maintenanceState(reachable.size, reachable.size, reachable.size, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
-      ),
-      asserted: rootMaterialized,
-      closed: false
-    };
-    roots.add(state);
-    refreshDiagnostics(added, added, 0);
-    return {
-      getCurrentResult: () => state.current,
-      close: () => release(state)
-    };
   };
 
-  const applyUpdate = (update: QueryMaintenanceUpdate): void => {
+  const attach = (plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot => {
+    if (closed) throw new Error('Pooled incremental query runtime is closed');
+    if (executionPhase !== 'idle') throw new PooledQueryRuntimeBusyError(
+      executionPhase === 'updating'
+        ? 'Cannot attach a pooled query root during an update'
+        : 'Cannot attach a pooled query root during another attachment'
+    );
+    executionPhase = 'attaching';
+    try {
+      return attachNow(plan);
+    } finally {
+      executionPhase = 'idle';
+      flushDeferredLifecycle();
+    }
+  };
+
+  const applyUpdateNow = (update: QueryMaintenanceUpdate): void => {
     if (closed) throw new Error('Pooled incremental query runtime is closed');
     revision += 1;
     const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
@@ -1411,20 +1491,30 @@ export const createPooledIncrementalQueryRuntime = (input: {
     refreshDiagnostics(updatedNodes.size, changedNodes.size, 0);
   };
 
+  const applyUpdate = (update: QueryMaintenanceUpdate): void => {
+    if (closed) throw new Error('Pooled incremental query runtime is closed');
+    if (executionPhase === 'updating') throw new Error('Recursive pooled query updates are not supported');
+    if (executionPhase === 'attaching') throw new Error('Cannot update a pooled query runtime during root attachment');
+    executionPhase = 'updating';
+    try {
+      applyUpdateNow(update);
+    } finally {
+      executionPhase = 'idle';
+      flushDeferredLifecycle();
+    }
+  };
+
   return {
     attach,
     applyUpdate,
     getDiagnostics: () => diagnostics,
     close: () => {
       if (closed) return;
-      closed = true;
-      const collected = physical.size;
-      for (const root of Array.from(roots)) release(root);
-      interned.clear();
-      physical.clear();
-      physicalOrder = [];
-      materialized.clear();
-      refreshDiagnostics(0, 0, collected);
+      if (executionPhase !== 'idle') {
+        closeRequested = true;
+        return;
+      }
+      closeNow();
     }
   };
 };
@@ -1435,9 +1525,9 @@ const pooledDiagnostics = (
   activeRootCount: number,
   physicalNodeCount: number,
   sharedPhysicalNodeCount: number,
-  updatedPhysicalNodeCount: number,
-  changedPhysicalNodeCount: number,
-  collectedPhysicalNodeCount: number,
+  lastUpdatedPhysicalNodeCount: number,
+  lastChangedPhysicalNodeCount: number,
+  lastCollectedPhysicalNodeCount: number,
   rejectedUpdateCount: number
 ): PooledIncrementalQueryDiagnostics => Object.freeze({
   strategy: 'pooled-differential-operator-dag',
@@ -1446,46 +1536,142 @@ const pooledDiagnostics = (
   activeRootCount,
   physicalNodeCount,
   sharedPhysicalNodeCount,
-  updatedPhysicalNodeCount,
-  changedPhysicalNodeCount,
-  collectedPhysicalNodeCount,
+  lastUpdatedPhysicalNodeCount,
+  lastChangedPhysicalNodeCount,
+  lastCollectedPhysicalNodeCount,
   rejectedUpdateCount
 });
+
+class NonPoolableQueryError extends TypeError {
+  readonly code = 'query.pool.nonpoolable';
+}
+
+class PooledQueryRuntimeBusyError extends Error {
+  readonly code = 'query.pool.busy';
+}
+
+export const isNonPoolableQueryError = (error: unknown): boolean => error instanceof NonPoolableQueryError;
+export const isPooledQueryRuntimeBusyError = (error: unknown): boolean => error instanceof PooledQueryRuntimeBusyError;
 
 const assertPoolableQuery = (root: QueryNode): void => {
   const visiting = new Set<object>();
   const visited = new Set<object>();
-  const visit = (value: unknown): void => {
-    if (value === null || typeof value !== 'object') return;
+  const visitObject = (value: object, children: () => void): void => {
     if (visited.has(value)) return;
-    if (visiting.has(value)) throw new TypeError('Pooled query graphs must be acyclic');
+    if (visiting.has(value)) throw new NonPoolableQueryError('Pooled query graphs must be acyclic');
     visiting.add(value);
-    if (!Array.isArray(value)) {
-      const kind = (value as { readonly kind?: unknown }).kind;
-      if (kind === 'seek' || kind === 'recursive' || kind === 'recursion-ref' || kind === 'subquery') {
-        throw new TypeError('Pooled query graphs do not support ' + String(kind));
-      }
-    }
-    for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child);
+    children();
     visiting.delete(value);
     visited.add(value);
   };
-  visit(root);
+  const visitList = <Value extends object>(values: readonly Value[], visit: (value: Value) => void): void => visitObject(values, () => {
+    for (const value of values) visit(value);
+  });
+  const visitExpressions = (values: Readonly<Record<string, Expr>>): void => visitObject(values, () => {
+    for (const expression of Object.values(values)) visitExpression(expression);
+  });
+  const visitOrder = (terms: readonly OrderTerm[]): void => visitList(terms, (term) => visitObject(term, () => visitExpression(term.value)));
+  const visitExpression = (expression: Expr): void => visitObject(expression, () => {
+    if (expression.kind === 'literal' || expression.kind === 'parameter' || expression.kind === 'field' || expression.kind === 'key-of' || expression.kind === 'source-of') return;
+    if (expression.kind === 'subquery') throw new NonPoolableQueryError('Pooled query graphs do not support subquery');
+    if (expression.kind === 'compare' || expression.kind === 'arithmetic') { visitExpression(expression.left); visitExpression(expression.right); return; }
+    if (expression.kind === 'is-null' || expression.kind === 'is-missing') { visitExpression(expression.value); return; }
+    if (expression.kind === 'boolean') {
+      if (expression.op === 'not') visitExpression(expression.arg);
+      else visitList(expression.args, visitExpression);
+      return;
+    }
+    if (expression.kind === 'case') {
+      visitList(expression.branches, (branch) => visitObject(branch, () => { visitExpression(branch.when); visitExpression(branch.then); }));
+      visitExpression(expression.otherwise);
+      return;
+    }
+    if (expression.kind === 'record') { visitExpressions(expression.fields); return; }
+    visitList(expression.kind === 'array' ? expression.items : expression.args, visitExpression);
+  });
+  const visitAggregate = (aggregate: AggregateExpr): void => visitObject(aggregate, () => {
+    if (aggregate.value !== undefined) visitExpression(aggregate.value);
+    if (aggregate.orderBy !== undefined) visitOrder(aggregate.orderBy);
+  });
+  const visitWindow = (window: WindowExpr): void => visitObject(window, () => {
+    if (window.value !== undefined) visitExpression(window.value);
+    if (window.partitionBy !== undefined) visitList(window.partitionBy, visitExpression);
+    visitOrder(window.orderBy);
+  });
+  const visitQuery = (node: QueryNode): void => visitObject(node, () => {
+    if (node.kind === 'seek' || node.kind === 'recursive' || node.kind === 'recursion-ref') {
+      throw new NonPoolableQueryError('Pooled query graphs do not support ' + node.kind);
+    }
+    if (node.kind === 'from' || node.kind === 'values') return;
+    if (node.kind === 'join' || node.kind === 'set') {
+      visitQuery(node.left);
+      visitQuery(node.right);
+      if (node.kind === 'join' && node.on !== undefined) visitExpression(node.on);
+      return;
+    }
+    visitQuery(node.input);
+    if (node.kind === 'where') visitExpression(node.predicate);
+    else if (node.kind === 'select' || node.kind === 'with-fields') visitExpressions(node.fields);
+    else if (node.kind === 'unnest') visitExpression(node.expression);
+    else if (node.kind === 'aggregate') {
+      visitExpressions(node.groupBy);
+      visitObject(node.measures, () => { for (const measure of Object.values(node.measures)) visitAggregate(measure); });
+    } else if (node.kind === 'order') visitOrder(node.by);
+    else if (node.kind === 'window') visitObject(node.fields, () => { for (const window of Object.values(node.fields)) visitWindow(window); });
+  });
+  visitQuery(root);
 };
 
-const internPooledQueryNode = (node: QueryNode, interned: Map<string, QueryNode>): QueryNode => {
+const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
+  const clones = new WeakMap<object, object>();
+  const clone = (value: unknown): unknown => {
+    if (value === null || typeof value !== 'object') return value;
+    const prior = clones.get(value);
+    if (prior !== undefined) return prior;
+    if (Array.isArray(value)) {
+      const output: unknown[] = [];
+      clones.set(value, output);
+      for (const item of value) output.push(clone(item));
+      return Object.freeze(output);
+    }
+    const output: Record<string, unknown> = {};
+    clones.set(value, output);
+    for (const [key, item] of Object.entries(value)) output[key] = clone(item);
+    return Object.freeze(output);
+  };
+  return clone(root) as QueryNode;
+};
+
+const internPooledQueryNode = (
+  node: QueryNode,
+  interned: Map<string, InternedPooledNode>,
+  byNode: Map<QueryNode, InternedPooledNode>,
+  created: InternedPooledNode[],
+  nextId: () => number
+): QueryNode => {
   let canonical: QueryNode;
+  let key: string;
   if (node.kind === 'join' || node.kind === 'set') {
-    canonical = { ...node, left: internPooledQueryNode(node.left, interned), right: internPooledQueryNode(node.right, interned) };
+    const left = internPooledQueryNode(node.left, interned, byNode, created, nextId);
+    const right = internPooledQueryNode(node.right, interned, byNode, created, nextId);
+    canonical = Object.freeze({ ...node, left, right });
+    const { left: _left, right: _right, ...payload } = canonical;
+    key = canonicalizeJson(['binary', payload, (byNode.get(left) as InternedPooledNode).id, (byNode.get(right) as InternedPooledNode).id] as unknown as JsonValue);
   } else if (node.kind === 'where' || node.kind === 'select' || node.kind === 'with-fields' || node.kind === 'rename' || node.kind === 'omit' || node.kind === 'unnest' || node.kind === 'aggregate' || node.kind === 'distinct' || node.kind === 'order' || node.kind === 'slice' || node.kind === 'window') {
-    canonical = { ...node, input: internPooledQueryNode(node.input, interned) };
+    const child = internPooledQueryNode(node.input, interned, byNode, created, nextId);
+    canonical = Object.freeze({ ...node, input: child });
+    const { input: _input, ...payload } = canonical;
+    key = canonicalizeJson(['unary', payload, (byNode.get(child) as InternedPooledNode).id] as unknown as JsonValue);
   } else {
     canonical = node;
+    key = canonicalizeJson(['leaf', canonical] as unknown as JsonValue);
   }
-  const key = canonicalizeJson(canonical as unknown as JsonValue);
   const existing = interned.get(key);
-  if (existing !== undefined) return existing;
-  interned.set(key, canonical);
+  if (existing !== undefined) return existing.node;
+  const identity = { id: nextId(), key, node: canonical };
+  interned.set(key, identity);
+  byNode.set(canonical, identity);
+  created.push(identity);
   return canonical;
 };
 

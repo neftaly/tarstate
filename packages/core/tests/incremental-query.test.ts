@@ -4,6 +4,8 @@ import {
   diffQueryMaintenanceSnapshots,
   evaluateQuery,
   openIncrementalQueryMaintenance,
+  isNonPoolableQueryError,
+  isPooledQueryRuntimeBusyError,
   type IncrementalQueryResult,
   type QueryNode,
   type QueryRecord,
@@ -501,8 +503,8 @@ describe('incremental query maintenance', () => {
     expect(namesRoot.getCurrentResult().state).toMatchObject({ materializedNodeCount: 3, updatedNodeCount: 3 });
     expect(runtime.getDiagnostics()).toMatchObject({
       revision: 1,
-      updatedPhysicalNodeCount: 4,
-      changedPhysicalNodeCount: 4
+      lastUpdatedPhysicalNodeCount: 4,
+      lastChangedPhysicalNodeCount: 4
     });
 
     idsRoot.close();
@@ -511,10 +513,10 @@ describe('incremental query maintenance', () => {
       activeRootCount: 1,
       physicalNodeCount: 3,
       sharedPhysicalNodeCount: 0,
-      collectedPhysicalNodeCount: 1
+      lastCollectedPhysicalNodeCount: 1
     });
     namesRoot.close();
-    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, collectedPhysicalNodeCount: 3 });
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, lastCollectedPhysicalNodeCount: 3 });
     runtime.close();
   });
 
@@ -556,12 +558,96 @@ describe('incremental query maintenance', () => {
       expect(semanticResult(summaryRoot.getCurrentResult())).toEqual(oracle(summarized, after));
       // The unchanged groups branch is retained; people, join, projection, and
       // aggregate update once each across both roots.
-      expect(runtime.getDiagnostics()).toMatchObject({ updatedPhysicalNodeCount: 4 });
+      expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 4 });
       before = after;
     }
 
     projectionRoot.close();
     summaryRoot.close();
+    runtime.close();
+  });
+
+  it('detaches and freezes canonical query payloads from caller mutation', () => {
+    const row = { value: 'before', nested: { label: 'before' } };
+    const query = { kind: 'values', alias: 'constant', rows: [row] } as QueryNode;
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/frozen-query', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: snapshot(basePeople, 1)
+    });
+    const root = runtime.attach(plan(query));
+    row.value = 'after';
+    row.nested.label = 'after';
+    (query as { alias: string }).alias = 'mutated';
+
+    expect(root.getCurrentResult().rows).toEqual([{ value: 'before', nested: { label: 'before' } }]);
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(snapshot(basePeople, 1), snapshot(basePeople, 1)));
+    expect(root.getCurrentResult().rows).toEqual([{ value: 'before', nested: { label: 'before' } }]);
+    root.close();
+    runtime.close();
+  });
+
+  it('treats kind-like literal and values JSON as opaque poolable data', () => {
+    const query: QueryNode = {
+      kind: 'values', alias: 'data',
+      rows: [{ kind: 'subquery', nested: { kind: 'recursive' }, literal: { kind: 'seek' } }]
+    };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/opaque-values', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: snapshot(basePeople, 1)
+    });
+    const root = runtime.attach(plan(query));
+    expect(root.getCurrentResult()).toMatchObject({ completeness: 'exact', rows: query.rows });
+    root.close();
+    runtime.close();
+  });
+
+  it('rolls back interning and staged materialization when attachment fails unexpectedly', () => {
+    const throwingRow: Record<string, import('../src/query.js').QueryLogicalValue> = { id: 1 };
+    Object.defineProperty(throwingRow, 'name', { configurable: true, enumerable: true, get: () => { throw new Error('row getter failed'); } });
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('people', [{ occurrenceId: 'person:throwing', row: throwingRow }], 1)] };
+    const query: QueryNode = { kind: 'select', input: from('people', 'p'), alias: 'result', fields: { name: field('p', 'name') } };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/rollback', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test'
+      },
+      initialSnapshot: initial
+    });
+
+    expect(() => runtime.attach(plan(query))).toThrow('row getter failed');
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0 });
+    Object.defineProperty(throwingRow, 'name', { configurable: true, enumerable: true, value: 'recovered' });
+    const root = runtime.attach(plan(query));
+    expect(root.getCurrentResult()).toMatchObject({ completeness: 'exact', rows: [{ name: 'recovered' }] });
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 1, physicalNodeCount: 2 });
+    root.close();
+    runtime.close();
+  });
+
+  it('interns deep cloned pipelines exactly without retaining full-subtree keys', () => {
+    const pipeline = (): QueryNode => {
+      let query = from('people', 'p');
+      for (let index = 0; index < 256; index += 1) query = { kind: 'where', input: query, predicate: { kind: 'literal', value: true } };
+      return query;
+    };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/deep-pipeline', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: snapshot(basePeople, 1)
+    });
+    const first = runtime.attach(plan(pipeline()));
+    const second = runtime.attach(plan(pipeline()));
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 2, physicalNodeCount: 257, sharedPhysicalNodeCount: 257 });
+    first.close();
+    second.close();
     runtime.close();
   });
 
@@ -577,7 +663,10 @@ describe('incremental query maintenance', () => {
       },
       initialSnapshot: initial
     });
-    expect(() => runtime.attach(plan(operatorQueries.seek as QueryNode))).toThrow(/do not support seek/);
+    let excluded: unknown;
+    try { runtime.attach(plan(operatorQueries.seek as QueryNode)); } catch (error) { excluded = error; }
+    expect(isNonPoolableQueryError(excluded)).toBe(true);
+    expect(excluded).toMatchObject({ code: 'query.pool.nonpoolable' });
     expect(() => runtime.attach(plan(operatorQueries.subquery as QueryNode))).toThrow(/do not support subquery/);
     expect(() => runtime.attach(plan(operatorQueries.recursive as QueryNode))).toThrow(/do not support recursive/);
     expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0 });
@@ -613,11 +702,108 @@ describe('incremental query maintenance', () => {
     expect(runtime.getDiagnostics()).toMatchObject({
       revision: 2,
       rejectedUpdateCount: 1,
-      updatedPhysicalNodeCount: 1,
-      changedPhysicalNodeCount: 1
+      lastUpdatedPhysicalNodeCount: 1,
+      lastChangedPhysicalNodeCount: 1
     });
     filtered.close();
     constant.close();
+    runtime.close();
+  });
+
+  it('defers root closure during updates and rejects recursive updates and attachment', () => {
+    const callable = { id: 'urn:test:pooled-reentrant', version: '1', contractHash: `sha256:${'f'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const initial = snapshot(basePeople, 1);
+    const middle = snapshot(middlePeople, 2);
+    const final = snapshot(finalPeople, 3);
+    let runtime: ReturnType<typeof createPooledIncrementalQueryRuntime>;
+    let victim: ReturnType<typeof runtime.attach> | undefined;
+    let active: ReturnType<typeof runtime.attach> | undefined;
+    let action: 'none' | 'close-victim' | 'close-self' | 'reenter' = 'none';
+    let recursiveError: unknown;
+    let attachError: unknown;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      const currentAction = action;
+      action = 'none';
+      if (currentAction === 'close-victim') victim?.close();
+      if (currentAction === 'close-self') active?.close();
+      if (currentAction === 'reenter') {
+        try { runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, initial)); } catch (error) { recursiveError = error; }
+        try { runtime.attach(plan({ kind: 'values', alias: 'late', rows: [{ value: 1 }] })); } catch (error) { attachError = error; }
+      }
+      return args[0] ?? null;
+    }]]);
+    const query: QueryNode = {
+      kind: 'select', input: people, alias: 'result',
+      fields: { value: { kind: 'call', capability: callable, args: [field('p', 'name')] } }
+    };
+    runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/reentrant', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }, functions
+      },
+      initialSnapshot: { ...initial, functions }
+    });
+    victim = runtime.attach(plan({ kind: 'values', alias: 'victim', rows: [{ value: 'kept-until-update-finishes' }] }));
+    active = runtime.attach(plan(query));
+
+    action = 'close-victim';
+    expect(() => runtime.applyUpdate(diffQueryMaintenanceSnapshots({ ...initial, functions }, { ...middle, functions }))).not.toThrow();
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 1 });
+    expect(active.getCurrentResult()).toMatchObject({ completeness: 'exact' });
+
+    action = 'reenter';
+    expect(() => runtime.applyUpdate(diffQueryMaintenanceSnapshots({ ...middle, functions }, { ...final, functions }))).not.toThrow();
+    expect(recursiveError).toMatchObject({ message: 'Recursive pooled query updates are not supported' });
+    expect(attachError).toMatchObject({ message: 'Cannot attach a pooled query root during an update' });
+    expect(isPooledQueryRuntimeBusyError(attachError)).toBe(true);
+
+    action = 'close-self';
+    expect(() => runtime.applyUpdate(diffQueryMaintenanceSnapshots({ ...final, functions }, { ...middle, functions }))).not.toThrow();
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0 });
+    runtime.close();
+  });
+
+  it('defers closure and rejects graph reentrancy while attaching a root', () => {
+    const callable = { id: 'urn:test:pooled-attach-reentrant', version: '1', contractHash: `sha256:${'e'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    let runtime: ReturnType<typeof createPooledIncrementalQueryRuntime>;
+    let victim: ReturnType<typeof runtime.attach>;
+    let updateError: unknown;
+    let attachError: unknown;
+    let reentered = false;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      if (!reentered) {
+        reentered = true;
+        victim.close();
+        try { runtime.applyUpdate(diffQueryMaintenanceSnapshots({ ...initial, functions }, { ...next, functions })); } catch (error) { updateError = error; }
+        try { runtime.attach(plan({ kind: 'values', alias: 'nested', rows: [{ value: 1 }] })); } catch (error) { attachError = error; }
+      }
+      return args[0] ?? null;
+    }]]);
+    runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/attach-reentrant', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }, functions
+      },
+      initialSnapshot: { ...initial, functions }
+    });
+    victim = runtime.attach(plan(people));
+    const attached = runtime.attach(plan({
+      kind: 'select', input: people, alias: 'result',
+      fields: { value: { kind: 'call', capability: callable, args: [field('p', 'name')] } }
+    }));
+
+    expect(updateError).toMatchObject({ message: 'Cannot update a pooled query runtime during root attachment' });
+    expect(attachError).toMatchObject({ message: 'Cannot attach a pooled query root during another attachment' });
+    expect(isPooledQueryRuntimeBusyError(attachError)).toBe(true);
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 1, physicalNodeCount: 2 });
+    expect(attached.getCurrentResult()).toMatchObject({ completeness: 'exact' });
+    expect(() => runtime.applyUpdate(diffQueryMaintenanceSnapshots({ ...initial, functions }, { ...next, functions }))).not.toThrow();
+    expect(attached.getCurrentResult()).toMatchObject({ completeness: 'exact', state: { revision: 1 } });
+    attached.close();
     runtime.close();
   });
 });

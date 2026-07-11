@@ -1,7 +1,7 @@
 import path from 'node:path';
 
 /** Build-only core modules used by repository tooling; package exports remain explicit. */
-export const coreInternalEntryNames = ['golden-workloads'] as const;
+export const coreInternalEntryNames = ['golden-workloads', 'query'] as const;
 
 const sourceAlias = (repoRoot: string, find: string, replacement: string) => ({
   find,

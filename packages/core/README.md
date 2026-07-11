@@ -50,11 +50,14 @@ not construction defaults.
 
 ## Shared maintenance
 
-`createIncrementalDatabaseQueryMaintenance` structurally interns exact shared
-subplans across live queries in the same database, dataset, authority, registry,
-and parameter cohort. One dataset runtime captures each source transition, then
-updates the shared operator DAG once before publishing observer callbacks.
+`createIncrementalDatabaseQueryMaintenance` automatically reuses exact shared
+subplans across live queries in the same database and dataset. Sharing is
+conservatively isolated by authority, registry, and the complete bound parameter
+set; parameter values are never exposed through diagnostics. One dataset capture
+updates the shared work before observer callbacks run.
 
 `DatabaseView.getQueryMaintenanceDiagnostics()` exposes frozen physical reuse
-and lifecycle counters. Seek, recursion, expression subqueries, divergent input
-streams, and incompatible cohorts remain on isolated maintenance sessions.
+and lifecycle counters when the built-in maintenance factory is active. An empty
+list can also mean there are no active shared cohorts. Seek, recursion,
+expression subqueries, divergent input streams, custom factories, and
+incompatible cohorts safely use isolated maintenance sessions.

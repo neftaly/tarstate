@@ -36,7 +36,6 @@ exports[`clean rewrite core surface > matches the curated runtime export surface
   "coordinateSourceCommit",
   "createIncrementalDatabaseQueryMaintenance",
   "createIssue",
-  "createPooledIncrementalQueryRuntime",
   "createSystemSchemaArtifact",
   "customScalar",
   "defaultArtifactParseBudget",

@@ -13,11 +13,14 @@ import {
   DatabaseView,
   type MaintainedDatabaseQueryResult,
   type DatabaseQueryMaintenanceInput,
-  type ObserverChange
+  type CreateDatabaseQueryMaintenance,
+  type ObserverChange,
+  type QueryObserver
 } from '../src/observer.js';
 import type { QueryNode, QueryRecord, RelationInput } from '../src/query.js';
 import { ResourceResolver, type ResourceRef } from '../src/resolver.js';
 import type { PreparedPlan } from '../src/maintenance.js';
+import type { JsonValue } from '../src/value.js';
 
 type Row = { readonly id: number; readonly value: string };
 type Query = { readonly kind: 'all' };
@@ -31,6 +34,7 @@ class TestSource {
   #freshness: SourceSnapshot<unknown>['freshness'] = 'current';
   #rows: readonly Row[];
   #subscriptionCount = 0;
+  #snapshotCount = 0;
 
   constructor(sourceId: string, rows: readonly Row[]) {
     this.sourceId = sourceId;
@@ -39,6 +43,7 @@ class TestSource {
   }
 
   snapshot(): SourceSnapshot<{ readonly rows: readonly Row[] }> {
+    this.#snapshotCount += 1;
     return {
       sourceId: this.sourceId,
       operationEpoch: 'epoch:one',
@@ -70,6 +75,7 @@ class TestSource {
 
   listenerCount(): number { return this.#listeners.size; }
   subscriptionCount(): number { return this.#subscriptionCount; }
+  snapshotCount(): number { return this.#snapshotCount; }
 }
 
 const attachment = (attachmentId: string, source: TestSource, authorityScope = 'public'): DatabaseAttachmentInput<{ readonly rows: readonly Row[] }, readonly Row[]> => ({
@@ -137,7 +143,7 @@ const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[]
 
 const querySchemaView = { id: 'urn:test:observer-schema', contentHash: `sha256:${'a'.repeat(64)}` } as const;
 
-const relationalAttachment = (attachmentId: string, source: TestSource): DatabaseAttachmentInput<{ readonly rows: readonly Row[] }, readonly RelationInput[]> => ({
+const relationalAttachment = (attachmentId: string, source: TestSource, onNormalize?: () => void): DatabaseAttachmentInput<{ readonly rows: readonly Row[] }, readonly RelationInput[]> => ({
   attachmentId,
   incarnation: attachmentId + ':one',
   sourceId: source.sourceId,
@@ -148,9 +154,8 @@ const relationalAttachment = (attachmentId: string, source: TestSource): Databas
     schemaViewIds: [querySchemaView.id],
     project: (snapshot) => snapshot.storage === undefined
       ? { state: snapshot.state === 'ready' ? 'failed' : snapshot.state, issues: [] }
-      : {
-          state: 'ready',
-          value: [{
+      : (() => {
+          const relation: RelationInput = {
             relation: { schemaView: querySchemaView, relationId: 'test.rows' },
             rows: snapshot.storage.rows,
             occurrenceIds: snapshot.storage.rows.map(({ id }) => 'row:' + id),
@@ -158,9 +163,19 @@ const relationalAttachment = (attachmentId: string, source: TestSource): Databas
             sourceId: source.sourceId,
             attachmentId,
             basis: snapshot.basis
-          }],
-          issues: []
-        }
+          };
+          const observable = onNormalize === undefined ? relation : new Proxy(relation, {
+            ownKeys: (target) => {
+              onNormalize();
+              return Reflect.ownKeys(target);
+            }
+          });
+          return {
+            state: 'ready',
+            value: [observable],
+            issues: []
+          };
+        })()
   })
 });
 
@@ -178,6 +193,25 @@ const relationalPlan = (): PreparedPlan<QueryNode> => ({
 });
 
 describe('database membership and observation', () => {
+  it('keeps maintenance factory calls source-compatible without a runtime identity', () => {
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled' });
+    const initialInput: DatabaseQueryMaintenanceInput<Query, readonly Row[]> = {
+      query: { kind: 'all' }, parameters: {}, dataset: dataset.snapshot(), attachments: []
+    };
+    const custom: CreateDatabaseQueryMaintenance<Query, Row, readonly Row[]> = createMaintenance(evaluate);
+    const customSession = custom({ plan: plan(), initialInput });
+    expect(customSession.getCurrentResult()).toMatchObject({ rows: [], completeness: 'exact' });
+    customSession.close();
+
+    const builtIn = createIncrementalDatabaseQueryMaintenance();
+    const builtInSession = builtIn({
+      plan: relationalPlan(),
+      initialInput: { query: relationalPlan().query, parameters: {}, dataset: dataset.snapshot(), attachments: [] }
+    });
+    expect(builtInSession.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
+    builtInSession.close();
+  });
+
   it('rejects duplicate attachment IDs whose authority view or projection differs', () => {
     const source = new TestSource('source:one', []);
     const catalog = new AttachmentCatalog();
@@ -274,7 +308,8 @@ describe('database membership and observation', () => {
   it('pools cloned common prefixes, advances the physical DAG once, and evicts it on close', () => {
     const source = new TestSource('source:pooled', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
     const catalog = new AttachmentCatalog();
-    const attachmentLease = catalog.attach(relationalAttachment('attachment:pooled', source));
+    let normalizationCount = 0;
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:pooled', source, () => { normalizationCount += 1; }));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:pooled', source.sourceId)] });
     const commonPrefix = (): QueryNode => ({
       kind: 'where',
@@ -291,6 +326,7 @@ describe('database membership and observation', () => {
     const first = database.observe({ plan: { ...relationalPlan(), planId: 'query:ids', rootNodeId: 'query:ids:root', query: ids } });
     const second = database.observe({ plan: { ...relationalPlan(), planId: 'query:values', rootNodeId: 'query:values:root', query: values } });
 
+    expect(normalizationCount).toBe(1);
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
       runtimeIdentity: expect.stringMatching(/^cohort:\d+$/),
       activeRootCount: 2,
@@ -298,22 +334,143 @@ describe('database membership and observation', () => {
       sharedPhysicalNodeCount: 2
     })]);
     source.publish({ rows: [{ id: 2, value: 'changed' }, { id: 3, value: 'three' }] });
+    expect(normalizationCount).toBe(2);
     expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2 }, { id: 3 }] } });
     expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'changed' }, { value: 'three' }] } });
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
       revision: 1,
-      updatedPhysicalNodeCount: 4,
-      changedPhysicalNodeCount: 4
+      lastUpdatedPhysicalNodeCount: 4,
+      lastChangedPhysicalNodeCount: 4
     })]);
 
     first.close();
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
       activeRootCount: 1,
       physicalNodeCount: 3,
-      collectedPhysicalNodeCount: 1
+      lastCollectedPhysicalNodeCount: 1
     })]);
     second.close();
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([]);
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('opens a usable private observer when observe is called during a pooled update', () => {
+    const source = new TestSource('source:reentrant-observe', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:reentrant-observe', source));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled', members: [member('attachment:reentrant-observe', source.sourceId)]
+    });
+    const callable = { id: 'urn:test:observe-during-update', version: '1', contractHash: `sha256:${'d'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    let database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>;
+    let late: QueryObserver<QueryRecord> | undefined;
+    let openLate = false;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      if (openLate) {
+        openLate = false;
+        late = database.observe({
+          plan: { ...relationalPlan(), planId: 'query:opened-during-update', rootNodeId: 'query:opened-during-update:root' }
+        });
+      }
+      return args[0] ?? null;
+    }]]);
+    database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
+    });
+    const active = database.observe({
+      plan: {
+        ...relationalPlan(),
+        planId: 'query:reentrant-trigger',
+        rootNodeId: 'query:reentrant-trigger:root',
+        query: {
+          kind: 'select',
+          input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
+          alias: 'result',
+          fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
+        }
+      }
+    });
+
+    openLate = true;
+    source.publish({ rows: [{ id: 2, value: 'changed' }, { id: 3, value: 'three' }] });
+    expect(late?.getSnapshot()).toMatchObject({
+      state: 'open', current: { completeness: 'exact', rows: [{ id: 2, value: 'changed' }, { id: 3, value: 'three' }] }
+    });
+
+    source.publish({ rows: [{ id: 4, value: 'later' }] });
+    expect(late?.getSnapshot()).toMatchObject({
+      state: 'open', current: { completeness: 'exact', rows: [{ id: 4, value: 'later' }] }
+    });
+    late?.close();
+    active.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('reuses one normalized frame across conservative full-parameter cohorts', () => {
+    const source = new TestSource('source:parameter-frames', [{ id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    let normalizationCount = 0;
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:parameter-frames', source, () => { normalizationCount += 1; }));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-frames', source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const first = database.observe({ plan: relationalPlan(), parameters: { selected: 1 } });
+    const second = database.observe({
+      plan: { ...relationalPlan(), planId: 'query:parameter-frame-two', rootNodeId: 'query:parameter-frame-two:root' },
+      parameters: { selected: 2 }
+    });
+
+    expect(normalizationCount).toBe(1);
+    first.close();
+    second.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('safely closes the last pooled observer from a query function during update', () => {
+    const source = new TestSource('source:self-closing-query', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:self-closing-query', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:self-closing-query', source.sourceId)] });
+    const callable = { id: 'urn:test:self-closing-query', version: '1', contractHash: `sha256:${'c'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    let closeDuringCall = false;
+    let closeObserver = (): void => undefined;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      if (closeDuringCall) {
+        closeDuringCall = false;
+        closeObserver();
+      }
+      return args[0] ?? null;
+    }]]);
+    const query: QueryNode = {
+      kind: 'select',
+      input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
+      alias: 'result',
+      fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
+    };
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
+    });
+    const observer = database.observe({ plan: { ...relationalPlan(), planId: 'query:self-closing', rootNodeId: 'query:self-closing:root', query } });
+    closeObserver = () => observer.close();
+    closeDuringCall = true;
+
+    expect(() => source.publish({ rows: [{ id: 2, value: 'two' }] })).not.toThrow();
+    expect(observer.getSnapshot()).toEqual({ state: 'closed' });
+    expect(database.getActiveMaintenanceCount()).toBe(0);
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([]);
+    expect(source.listenerCount()).toBe(0);
     database.close();
     attachmentLease.close();
   });
@@ -452,11 +609,8 @@ describe('database membership and observation', () => {
 
     expect(first.getCurrentResult().rows).toEqual([{ id: 2, value: 'two' }]);
     expect(second.getCurrentResult().rows).toEqual([{ id: 9, value: 'private' }]);
-    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([expect.objectContaining({ activeRootCount: 1, physicalNodeCount: 2 })]);
     second.close();
-    expect(factory.getDiagnostics(runtimeIdentity)).toHaveLength(1);
     first.close();
-    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([]);
     attachmentLease.close();
   });
 
@@ -504,14 +658,40 @@ describe('database membership and observation', () => {
 
     expect(first.updateInput(input(malformedRows))).toMatchObject({ completeness: 'unknown' });
     expect(second.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
-    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([expect.objectContaining({ revision: 1, rejectedUpdateCount: 1 })]);
 
     acceptedRows[0] = original;
     expect(first.updateInput(input(acceptedRows))).toMatchObject({ rows: [original], completeness: 'exact' });
     expect(second.getCurrentResult()).toMatchObject({ rows: [original], completeness: 'exact' });
-    expect(factory.getDiagnostics(runtimeIdentity)).toEqual([expect.objectContaining({ revision: 2, rejectedUpdateCount: 1 })]);
     first.close();
     second.close();
+    attachmentLease.close();
+  });
+
+  it('recovers a pooled root opened while the cohort input is malformed', () => {
+    const accepted = [{ id: 2, value: 'accepted' }];
+    const source = new TestSource('source:late-rejected', accepted);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:late-rejected', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:late-rejected', source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const first = database.observe({ plan: relationalPlan() });
+    source.publish({ rows: [{ id: 9, value: 'duplicate-a' }, { id: 9, value: 'duplicate-b' }] });
+    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
+
+    const late = database.observe({ plan: { ...relationalPlan(), planId: 'query:late-rejected', rootNodeId: 'query:late-rejected:root' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({ activeRootCount: 1 })]);
+
+    source.publish({ rows: accepted });
+    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { rows: accepted, completeness: 'exact' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: accepted, completeness: 'exact' } });
+    first.close();
+    late.close();
+    database.close();
     attachmentLease.close();
   });
 
@@ -612,6 +792,27 @@ describe('database membership and observation', () => {
     unrelatedLease.close();
   });
 
+  it('captures one source snapshot for multiple authorized attachments', () => {
+    const source = new TestSource('source:shared-capture', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const firstLease = catalog.attach(attachment('attachment:first', source));
+    const secondLease = catalog.attach(attachment('attachment:second', source));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one',
+      state: 'settled',
+      members: [member('attachment:first', source.sourceId), member('attachment:second', source.sourceId)]
+    });
+    const database = view(catalog, [dataset]);
+    const observer = database.observe({ plan: plan() });
+
+    expect(source.snapshotCount()).toBe(1);
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 1 }, { id: 1 }] } });
+    observer.close();
+    database.close();
+    secondLease.close();
+    firstLease.close();
+  });
+
   it('does not subscribe to or leak a required source denied by this authority view', () => {
     const privateSource = new TestSource('source:private', [{ id: 7, value: 'secret' }]);
     const catalog = new AttachmentCatalog();
@@ -680,6 +881,11 @@ describe('database membership and observation', () => {
     expect(database.getActiveMaintenanceCount()).toBe(2);
     expect(source.listenerCount()).toBe(1);
     expect(source.subscriptionCount()).toBe(1);
+    const unrelatedSource = new TestSource('source:unrelated-topology', []);
+    const unrelatedLease = catalog.attach(attachment('attachment:unrelated-topology', unrelatedSource));
+    expect(source.subscriptionCount()).toBe(1);
+    unrelatedLease.close();
+    expect(source.subscriptionCount()).toBe(1);
 
     first.close();
     expect(source.listenerCount()).toBe(1);
@@ -712,6 +918,91 @@ describe('database membership and observation', () => {
     first.close();
     second.close();
     database.close();
+    attachmentLease.close();
+  });
+
+  it('stages a lease acquired for a later root during an earlier root callback', () => {
+    const source = new TestSource('source:late-lease', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:late-lease', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:late-lease', source.sourceId)] });
+    const database = view(catalog, [dataset]);
+    const first = database.observe({ plan: plan() });
+    const secondPlan = { ...plan(), planId: 'query:late-lease-second', rootNodeId: 'query:late-lease-second:root' };
+    const second = database.observe({ plan: secondPlan });
+    let late: ReturnType<typeof database.observe> | undefined;
+    const lateListener = vi.fn();
+    first.subscribe(() => {
+      late = database.observe({ plan: secondPlan });
+      late.subscribe(lateListener);
+    });
+
+    source.publish({ rows: [{ id: 2, value: 'two' }] });
+
+    expect(lateListener).toHaveBeenCalledOnce();
+    expect(late?.getSnapshot()).toBe(second.getSnapshot());
+    expect(late?.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+    first.close();
+    second.close();
+    late?.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('reconciles a synchronous source change caused by maintenance construction', () => {
+    const source = new TestSource('source:construction-refresh', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:construction-refresh', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:construction-refresh', source.sourceId)] });
+    let constructed = false;
+    const factory: import('../src/observer.js').CreateDatabaseQueryMaintenance<Query, Row, readonly Row[]> = ({ initialInput }) => {
+      let current = evaluate(initialInput);
+      if (!constructed) {
+        constructed = true;
+        source.publish({ rows: [{ id: 2, value: 'two' }] });
+      }
+      return {
+        getCurrentResult: () => current,
+        updateInput: (input) => { current = evaluate(input); return current; },
+        close: () => undefined
+      };
+    };
+    const database = new DatabaseView<Query, Row, readonly Row[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
+    });
+
+    const observer = database.observe({ plan: plan() });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('contains throwing maintenance cleanup and closes every observation', () => {
+    const source = new TestSource('source:throwing-close', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:throwing-close', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:throwing-close', source.sourceId)] });
+    const close = vi.fn(() => { throw new Error('close failed'); });
+    const factory: import('../src/observer.js').CreateDatabaseQueryMaintenance<Query, Row, readonly Row[]> = ({ initialInput }) => {
+      let current = evaluate(initialInput);
+      return { getCurrentResult: () => current, updateInput: (input) => { current = evaluate(input); return current; }, close };
+    };
+    const database = new DatabaseView<Query, Row, readonly Row[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
+    });
+    const first = database.observe({ plan: plan() });
+    const second = database.observe({ plan: { ...plan(), planId: 'query:throwing-close-second', rootNodeId: 'query:throwing-close-second:root' } });
+
+    expect(() => first.close()).not.toThrow();
+    expect(() => database.close()).not.toThrow();
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(first.getSnapshot()).toEqual({ state: 'closed' });
+    expect(second.getSnapshot()).toEqual({ state: 'closed' });
+    expect(source.listenerCount()).toBe(0);
+    expect(database.getActiveMaintenanceCount()).toBe(0);
     attachmentLease.close();
   });
 
