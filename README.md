@@ -1,131 +1,121 @@
 # Tarstate
 
-Tarstate is a relational interface for React (and other libraries) that lets
-you query local-first state trees like a database. It's a way to glue unrelated
-data sources together without hiding their ownership or atomic boundaries.
+Tarstate is a set of hooks for React (and other libs), that lets you query state trees like a database.
+It's a fast, disposable way to glue unrelated data sources together.
 
 Tarstate is **alpha quality** software.
 
-It uses JSON-serializable schemas to describe data in terms of relationships
-and can generate TypeScript declarations and other deterministic artifacts.
-Schemas describe logical data rather than physical storage, which allows
-storage mappings and schema lenses to evolve independently.
+It also generates JSON-serializable schemas, describing your data in terms of relationships, that typescript can read as types. This is different from `json-schema`, and justified by [parse not validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/). It is intended to support [schema evolution](https://www.inkandswitch.com/cambria/), i.e. so changing your state tree in the future won't break things.
 
-Incremental maintenance shares work between observers. Performance and GC are
-tracked with the repository benchmarks.
+Perf and GC targets systems programming and video games.
+Work is shared between queries, and aims to be faster than hand-rolled state management at scale.
 
-Tarstate is inspired by [wotbrew/relic](https://github.com/wotbrew/relic) and
+Tarstate is largely a TypeScript adaptation of
+[wotbrew/relic](https://github.com/wotbrew/relic), after
 [Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf).
 
-## TS integration
+### TS Integration
 
-`@tarstate/schema-tools` generates TypeScript, JSON Schema, and Markdown from a
-prepared schema artifact:
+Generate TypeScript declarations when the schema changes:
 
 ```ts
-import { generateSchemaOutputs } from '@tarstate/schema-tools'
+import { writeFile } from 'node:fs/promises';
+import { generateSchemaOutputs } from '@tarstate/schema-tools';
+import { schema } from './schema';
 
-const generated = await generateSchemaOutputs(schemaArtifact)
-if (!generated.success) throw new Error(generated.issues[0]?.code)
+const generated = await generateSchemaOutputs(schema);
+if (!generated.success) throw new Error(generated.issues[0]?.code);
 
-await writeOutputs({
-  'schema.d.ts': generated.value.typescript,
-  'schema.json': generated.value.jsonSchemaText,
-  'schema.md': generated.value.markdown,
-})
+await writeFile('src/generated/tarstate/rows.d.ts', generated.value.typescript);
 ```
 
-Generated declarations include the exact schema ID and content hash.
+It writes `src/generated/tarstate/rows.d.ts`. Because that file is under
+`src`, TypeScript and most IDEs will see the automatic types.
 
 ## Schemas
 
-Schemas are portable artifacts containing stable relation identities, keys,
-references, value domains, and promised edit capabilities.
+[Schemas](./docs/v1/README.md#identity-storage-and-compatibility) are JSON-compatible manifests that describe the shape of data.
 
 ```ts
-import { referenceTo, relationDeclaration, schemaLiteral } from '@tarstate/core'
+import { sealSchema, type SchemaBody } from '@tarstate/core';
 
-const bases = relationDeclaration({
-  relationId: 'example.base',
-  key: ['name'],
-  fields: {
-    name: { type: { kind: 'string' } },
-    style: { type: { kind: 'string' } },
-  },
-})
+export const schemaDefinition = {
+  "id": "example.pizza-ordering@1",
+  "body": {
+    "relations": {
+    "bases": { "relationId": "example.base", "key": ["name"], "fields": {
+      "name": { "type": { "kind": "string" } },
+      "style": { "type": { "kind": "string" } }
+    } },
+    "pizzas": { "relationId": "example.pizza", "key": ["name"], "fields": {
+      "name": { "type": { "kind": "string" } },
+      "base": { "type": { "kind": "ref", "target": { "relationId": "example.base" } } },
+      "price": { "type": { "kind": "number" } }
+    } },
+    "toppings": { "relationId": "example.topping", "key": ["pizza", "name"], "fields": {
+      "pizza": { "type": { "kind": "ref", "target": { "relationId": "example.pizza" } } },
+      "name": { "type": { "kind": "string" } },
+      "extra": { "type": { "kind": "boolean" } } } }
+    }
+  }
+} satisfies { id: string; body: SchemaBody };
 
-export const schema = schemaLiteral({
-  relations: {
-    bases,
-    pizzas: {
-      relationId: 'example.pizza',
-      key: ['name'],
-      fields: {
-        name: { type: { kind: 'string' } },
-        base: { type: referenceTo(bases) },
-        price: { type: { kind: 'integer' } },
-      },
-    },
-  },
-})
+export const schema = await sealSchema(schemaDefinition);
+
+export const initialState = {
+  bases: [
+    { name: 'thin', style: 'Neapolitan' },
+    { name: 'pan', style: 'Detroit' }
+  ],
+  pizzas: [
+    { name: 'margherita', base: 'thin', price: 18 },
+    { name: 'pepperoni', base: 'thin', price: 21 }
+  ],
+  toppings: [
+    { pizza: 'margherita', name: 'mozzarella', extra: false },
+    { pizza: 'margherita', name: 'basil', extra: false },
+    { pizza: 'pepperoni', name: 'pepperoni', extra: true }
+  ]
+}
 ```
-
-Sources attach to these logical relations through trusted storage bindings.
-Automerge documents are the primary durable source; Zustand and similar stores
-attach through the generic atomic external-store protocol.
 
 ## React example
 
-The React provider borrows a prepared database from the application. Tarstate
-then subscribes to immutable query observations from that database.
+This component gets its prepared database from the application. Tarstate then
+subscribes to a query view and sends commits through the application's source
+coordinator.
 
 ```tsx
-import { TarstateProvider, useQuery } from '@tarstate/react'
+import { TarstateProvider, useCommit, useQuery } from '@tarstate/react';
+import { database, executeCommit, makeDetroitStyle, pizzaMenu } from './tarstate';
+
+export function App() {
+  return (
+    <TarstateProvider database={database} executeCommit={executeCommit}>
+      <PizzaMenu />
+    </TarstateProvider>
+  );
+}
 
 function PizzaMenu() {
-  const menu = useQuery(pizzaMenuPlan, {
-    parameters: { maximumPrice: 25 },
-    selectSnapshot: snapshot =>
-      snapshot.state === 'open' ? snapshot.current.rows : [],
-  })
+  const menu = useQuery(pizzaMenu);
+  const commit = useCommit();
+  if (menu.state !== 'open') return null;
 
   return (
     <section>
       <h2>Pizza menu</h2>
       <ul>
-        {menu.map(row => (
-          <li key={row.name}>
-            {row.name} ({row.style}) — ${row.price}
+        {menu.current.rows.map((row, index) => (
+          <li key={menu.current.resultKeys[index]}>
+            {row.name} ({row.style}) - ${row.price}
+            <button type="button" onClick={() => void commit(makeDetroitStyle(row.name))}>
+              make Detroit style
+            </button>
           </li>
         ))}
       </ul>
     </section>
-  )
+  );
 }
-
-root.render(
-  <TarstateProvider database={database} executeCommit={executeCommit}>
-    <PizzaMenu />
-  </TarstateProvider>,
-)
 ```
-
-Queries may span sources, but writes are atomic within one source. Query
-observations distinguish exact, lower-bound, and unknown results; commits
-return structured receipts instead of hiding conflicts or uncertain outcomes.
-
-## Development
-
-Tarstate requires Node.js 24.12 or newer and uses pnpm.
-
-```sh
-pnpm install
-pnpm check
-```
-
-The [v1 specification](docs/v1/README.md) is the source of truth. Package guides
-cover [core](packages/core/README.md),
-[Automerge](packages/automerge/README.md),
-[Zustand](packages/zustand/README.md),
-[React](packages/react/README.md), and
-[schema tooling](packages/schema-tools/README.md).
