@@ -35,6 +35,8 @@ It writes `src/generated/tarstate/rows.d.ts`. Because that file is under
 ## Schemas
 
 [Schemas](./docs/v1/README.md#identity-storage-and-compatibility) are JSON-compatible manifests that describe the shape of data.
+This example models a pizza menu: each pizza references a base style, while its
+toppings are separate records that can be marked as extras.
 
 ```ts
 import { sealSchema, type SchemaBody } from '@tarstate/core';
@@ -68,13 +70,13 @@ export const initialState = {
     { name: 'pan', style: 'Detroit' }
   ],
   pizzas: [
-    { name: 'margherita', base: 'thin', price: 18 },
-    { name: 'pepperoni', base: 'thin', price: 21 }
+    { name: 'margherita', base: ['thin'], price: 18 },
+    { name: 'pepperoni', base: ['thin'], price: 21 }
   ],
   toppings: [
-    { pizza: 'margherita', name: 'mozzarella', extra: false },
-    { pizza: 'margherita', name: 'basil', extra: false },
-    { pizza: 'pepperoni', name: 'pepperoni', extra: true }
+    { pizza: ['margherita'], name: 'mozzarella', extra: false },
+    { pizza: ['margherita'], name: 'basil', extra: false },
+    { pizza: ['pepperoni'], name: 'pepperoni', extra: true }
   ]
 }
 ```

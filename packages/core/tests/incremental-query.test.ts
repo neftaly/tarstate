@@ -64,7 +64,7 @@ const snapshot = (people: readonly QueryRowOccurrence[], revision: number): Quer
   membershipRevision: 1
 });
 
-const from = (relationId: 'people' | 'groups', alias: string): QueryNode => ({
+const from = (relationId: string, alias: string): QueryNode => ({
   kind: 'from',
   relation: { schemaView, relationId },
   alias
@@ -414,6 +414,94 @@ describe('incremental query maintenance', () => {
     const result = applySnapshot(session, updated, reordered);
     expect(result.rows).toEqual([{ label: 'second' }, { label: 'updated' }]);
     expect(semanticResult(result)).toEqual(oracle(query, reordered));
+  });
+
+  it('incrementally maintains singleton-tuple reference joins in either operand order', () => {
+    const pizzas = relation('pizzas', [
+      { occurrenceId: 'pizza:one', row: { name: 'Margherita', base: ['thin'] } },
+      { occurrenceId: 'pizza:two', row: { name: 'Deep dish', base: ['deep'] } }
+    ], 1);
+    const bases = relation('bases', [
+      { occurrenceId: 'base:thin', row: { name: 'thin', style: 'crisp' } },
+      { occurrenceId: 'base:deep', row: { name: 'deep', style: 'soft' } }
+    ], 1);
+    const updatedBases = { ...bases, rows: [{ name: 'thin', style: 'cracker' }, bases.rows[1] as QueryRecord], basis: 2 };
+    const initial: QueryMaintenanceSnapshot = { relations: [pizzas, bases] };
+    const next: QueryMaintenanceSnapshot = { relations: [pizzas, updatedBases] };
+    const reference = field('pizza', 'base');
+    const keyTuple = { kind: 'array', items: [field('base', 'name')] } as const;
+    const query = (reversed: boolean): QueryNode => ({
+      kind: 'select', alias: 'result',
+      input: {
+        kind: 'join', join: 'inner', left: from('pizzas', 'pizza'), right: from('bases', 'base'),
+        on: { kind: 'compare', op: 'eq', left: reversed ? keyTuple : reference, right: reversed ? reference : keyTuple }
+      },
+      fields: { pizza: field('pizza', 'name'), style: field('base', 'style') }
+    });
+
+    for (const reversed of [false, true]) {
+      const root = query(reversed);
+      const session = openIncrementalQueryMaintenance(plan(root), initial);
+      const result = applySnapshot(session, initial, next);
+      expect(result.rows).toEqual([{ pizza: 'Margherita', style: 'cracker' }, { pizza: 'Deep dish', style: 'soft' }]);
+      expect(semanticResult(result)).toEqual(oracle(root, next));
+      expect(result.state).toMatchObject({ updatedNodeCount: 3, changedNodeCount: 3 });
+      session.close();
+    }
+  });
+
+  it('reuses one local overlay across multiple changed rows without cross-row leakage', () => {
+    const query: QueryNode = { kind: 'select', input: from('people', 'p'), alias: 'result', fields: { id: field('p', 'id'), name: field('p', 'name') } };
+    const initial = snapshot(basePeople, 1);
+    const changedRows: readonly QueryRowOccurrence[] = basePeople.map(({ occurrenceId, row }, index) => ({
+      occurrenceId,
+      row: { ...row, name: index === 0 ? 'Ada changed' : 'Bob changed' }
+    }));
+    const next = snapshot(changedRows, 2);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    const result = applySnapshot(session, initial, next);
+
+    expect(result.rows).toEqual([{ id: 1, name: 'Ada changed' }, { id: 2, name: 'Bob changed' }]);
+    expect(semanticResult(result)).toEqual(oracle(query, next));
+    session.close();
+  });
+
+  it('rolls back a private session after a later branch throws and accepts a retry from the prior snapshot', () => {
+    const callable = { id: 'urn:test:private-rollback', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => args[0] === 2 ? cyclic as unknown as JsonValue : args[0] ?? null]]);
+    const branch = (relationId: string, alias: string, transform: boolean): QueryNode => ({
+      kind: 'select', input: from(relationId, alias), alias: 'result', fields: {
+        source: { kind: 'literal', value: relationId },
+        value: transform ? { kind: 'call', capability: callable, args: [field(alias, 'value')] } : field(alias, 'value')
+      }
+    });
+    const query: QueryNode = { kind: 'set', op: 'union-all', left: branch('alpha', 'a', false), right: branch('beta', 'b', true) };
+    const input = (alpha: number, beta: number): QueryMaintenanceSnapshot => ({
+      relations: [
+        relation('alpha', [{ occurrenceId: 'alpha:one', row: { value: alpha } }], alpha),
+        relation('beta', [{ occurrenceId: 'beta:one', row: { value: beta } }], beta)
+      ],
+      functions
+    });
+    const initial = input(1, 1);
+    const failing = input(2, 2);
+    const recovered = input(1, 3);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const before = session.getCurrentResult();
+
+    expect(() => session.applyUpdate(diffQueryMaintenanceSnapshots(initial, failing))).toThrow();
+    expect(session.getCurrentResult()).toBe(before);
+    expect(session.getCurrentResult().state).toMatchObject({ revision: 0, rejectedUpdateCount: 0 });
+
+    const result = session.applyUpdate(diffQueryMaintenanceSnapshots(initial, recovered));
+    expect(result.rows).toEqual([{ source: 'alpha', value: 1 }, { source: 'beta', value: 3 }]);
+    expect(semanticResult(result)).toEqual(oracle(query, recovered));
+    expect(result.state).toMatchObject({ revision: 1, rejectedUpdateCount: 0 });
+    session.close();
   });
 
   it('does not recompute a graph whose relation dependencies did not change', () => {

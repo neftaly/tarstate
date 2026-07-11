@@ -471,14 +471,23 @@ const joinLeftRow = (
 };
 
 type FieldExpression = Extract<Expr, { readonly kind: 'field' }>;
-type EquijoinFields = { readonly left: FieldExpression; readonly right: FieldExpression };
+type EquijoinExpressions = { readonly left: Expr; readonly right: Expr };
 
-const equijoinFields = (node: Extract<QueryNode, { readonly kind: 'join' }>): EquijoinFields | undefined => {
-  if (node.on?.kind !== 'compare' || node.on.op !== 'eq' || node.on.left.kind !== 'field' || node.on.right.kind !== 'field') return undefined;
+const equijoinField = (expression: Expr): FieldExpression | undefined => expression.kind === 'field'
+  ? expression
+  : expression.kind === 'array' && expression.items.length === 1 && expression.items[0]?.kind === 'field'
+    ? expression.items[0]
+    : undefined;
+
+const equijoinFields = (node: Extract<QueryNode, { readonly kind: 'join' }>): EquijoinExpressions | undefined => {
+  if (node.on?.kind !== 'compare' || node.on.op !== 'eq') return undefined;
+  const leftField = equijoinField(node.on.left);
+  const rightField = equijoinField(node.on.right);
+  if (leftField === undefined || rightField === undefined) return undefined;
   const leftAliases = queryAliases(node.left);
   const rightAliases = queryAliases(node.right);
-  if (leftAliases.has(node.on.left.alias) && rightAliases.has(node.on.right.alias)) return { left: node.on.left, right: node.on.right };
-  if (leftAliases.has(node.on.right.alias) && rightAliases.has(node.on.left.alias)) return { left: node.on.right, right: node.on.left };
+  if (leftAliases.has(leftField.alias) && rightAliases.has(rightField.alias)) return { left: node.on.left, right: node.on.right };
+  if (leftAliases.has(rightField.alias) && rightAliases.has(leftField.alias)) return { left: node.on.right, right: node.on.left };
   return undefined;
 };
 
@@ -977,20 +986,53 @@ const compareJsonValues = (left: JsonValue, right: JsonValue): number | undefine
   if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : left > right ? 1 : 0;
   if (typeof left === 'string' && typeof right === 'string') return left < right ? -1 : left > right ? 1 : 0;
   if (typeof left === 'boolean' && typeof right === 'boolean') return left === right ? 0 : left ? 1 : -1;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const length = Math.min(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const comparison = compareJsonValuesTotal(left[index] as JsonValue, right[index] as JsonValue);
+      if (comparison !== 0) return comparison;
+    }
+    return left.length < right.length ? -1 : left.length > right.length ? 1 : 0;
+  }
+  if (Array.isArray(left) && typeof right === 'object') return -1;
+  if (typeof left === 'object' && Array.isArray(right)) return 1;
   if (typeof left === 'object' && typeof right === 'object') {
-    const leftCanonical = canonicalizeJson(left);
-    const rightCanonical = canonicalizeJson(right);
-    return leftCanonical < rightCanonical ? -1 : leftCanonical > rightCanonical ? 1 : 0;
+    const leftRecord = left as Readonly<Record<string, JsonValue>>;
+    const rightRecord = right as Readonly<Record<string, JsonValue>>;
+    const leftKeys = Object.keys(leftRecord).sort(comparePortableStrings);
+    const rightKeys = Object.keys(rightRecord).sort(comparePortableStrings);
+    const length = Math.min(leftKeys.length, rightKeys.length);
+    for (let index = 0; index < length; index += 1) {
+      const leftKey = leftKeys[index] as string;
+      const rightKey = rightKeys[index] as string;
+      const keyComparison = comparePortableStrings(leftKey, rightKey);
+      if (keyComparison !== 0) return keyComparison;
+      const valueComparison = compareJsonValuesTotal(leftRecord[leftKey] as JsonValue, rightRecord[rightKey] as JsonValue);
+      if (valueComparison !== 0) return valueComparison;
+    }
+    return leftKeys.length < rightKeys.length ? -1 : leftKeys.length > rightKeys.length ? 1 : 0;
   }
   return undefined;
 };
 
+const jsonValueOrder = (value: JsonValue): number => value === null
+  ? 0
+  : typeof value === 'string'
+    ? 1
+    : typeof value === 'number'
+      ? 2
+      : typeof value === 'boolean'
+        ? 3
+        : Array.isArray(value)
+          ? 4
+          : 5;
+
 const compareJsonValuesTotal = (left: JsonValue, right: JsonValue): number => {
   const comparable = compareJsonValues(left, right);
   if (comparable !== undefined) return comparable;
-  const leftCanonical = canonicalizeJson(left);
-  const rightCanonical = canonicalizeJson(right);
-  return leftCanonical < rightCanonical ? -1 : leftCanonical > rightCanonical ? 1 : 0;
+  const leftOrder = jsonValueOrder(left);
+  const rightOrder = jsonValueOrder(right);
+  return leftOrder < rightOrder ? -1 : leftOrder > rightOrder ? 1 : 0;
 };
 
 const containsLogicalUnknown = (value: QueryLogicalValue): boolean => {
@@ -1134,7 +1176,7 @@ export const openIncrementalQueryMaintenance = (
   let closed = false;
   let revision = 0;
   let rejectedUpdateCount = 0;
-  const valueIdentities = new WeakMap<ScopedRow, string>();
+  let valueIdentities = new WeakMap<ScopedRow, string>();
 
   const initialIssues = validateMaintenanceSnapshot(initialSnapshot);
   if (initialIssues.length === 0) {
@@ -1151,61 +1193,78 @@ export const openIncrementalQueryMaintenance = (
     getCurrentResult: () => current,
     applyUpdate: (update) => {
       if (closed) throw new Error('Incremental query maintenance session is closed');
-      revision += 1;
-      const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
-      if (!applied.success) {
-        rejectedUpdateCount += 1;
-        current = maintainedQueryResult(
-          undefined,
-          applied.issues,
-          maintenanceState(graph.nodes.length, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
-        );
-        assertedRoot = undefined;
-        return current;
-      }
+      const checkpoint = { acceptedSnapshot, revision, rejectedUpdateCount, current, assertedRoot };
+      const journal = new Map<QueryNode, MaterializedQueryNode | undefined>();
+      try {
+        revision += 1;
+        const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
+        if (!applied.success) {
+          rejectedUpdateCount += 1;
+          current = maintainedQueryResult(
+            undefined,
+            applied.issues,
+            maintenanceState(graph.nodes.length, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+          );
+          assertedRoot = undefined;
+          return current;
+        }
 
-      const nextSnapshot = applied.value;
-      const changedRelations = new Set(update.relations.map(({ relation }) => relationKey(relation)));
-      const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
-        || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
-      let updatedNodeCount = 0;
-      const changedNodes = new Set<QueryNode>();
-      for (const node of graph.nodes) {
-        const children = graph.children.get(node) as readonly QueryNode[];
-        const externalDependencies = graph.externalDependencies.get(node) as ReadonlySet<string>;
-        const childChanged = children.some((child) => changedNodes.has(child));
-        const externalInputChanged = [...externalDependencies].some((key) => changedRelations.has(key));
-        const evidenceInputChanged = sessionEvidenceChanged && graph.sessionEvidenceDependencies.get(node) === true;
-        if (!evidenceInputChanged && !childChanged && !externalInputChanged) continue;
-        const previousNode = materialized.get(node);
-        const nextNode = node.kind === 'from'
-          ? incrementallyMaterializeFrom(node, nextSnapshot, update, previousNode)
-          : node.kind === 'join'
-            ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
-          : isLocallyMaintainedNode(node)
-            ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
-            : materializeQueryNode(node, nextSnapshot, materialized);
-        materialized.set(node, nextNode);
-        updatedNodeCount += 1;
-        if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
+        const nextSnapshot = applied.value;
+        const changedRelations = new Set(update.relations.map(({ relation }) => relationKey(relation)));
+        const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
+          || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
+        let updatedNodeCount = 0;
+        const changedNodes = new Set<QueryNode>();
+        for (const node of graph.nodes) {
+          const children = graph.children.get(node) as readonly QueryNode[];
+          const externalDependencies = graph.externalDependencies.get(node) as ReadonlySet<string>;
+          const childChanged = children.some((child) => changedNodes.has(child));
+          const externalInputChanged = [...externalDependencies].some((key) => changedRelations.has(key));
+          const evidenceInputChanged = sessionEvidenceChanged && graph.sessionEvidenceDependencies.get(node) === true;
+          if (!evidenceInputChanged && !childChanged && !externalInputChanged) continue;
+          const previousNode = materialized.get(node);
+          const nextNode = node.kind === 'from'
+            ? incrementallyMaterializeFrom(node, nextSnapshot, update, previousNode)
+            : node.kind === 'join'
+              ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
+            : isLocallyMaintainedNode(node)
+              ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
+              : materializeQueryNode(node, nextSnapshot, materialized);
+          journal.set(node, previousNode);
+          materialized.set(node, nextNode);
+          updatedNodeCount += 1;
+          if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
+        }
+        acceptedSnapshot = nextSnapshot;
+        const root = materialized.get(plan.query);
+        current = maintainedQueryResult(
+          root,
+          [],
+          maintenanceState(
+            graph.nodes.length,
+            updatedNodeCount,
+            changedNodes.size,
+            changedRelationIds(nextSnapshot, changedRelations),
+            diffMaintainedResults(assertedRoot, root, valueIdentities),
+            revision,
+            rejectedUpdateCount
+          )
+        );
+        assertedRoot = root;
+        return current;
+      } catch (error) {
+        acceptedSnapshot = checkpoint.acceptedSnapshot;
+        revision = checkpoint.revision;
+        rejectedUpdateCount = checkpoint.rejectedUpdateCount;
+        current = checkpoint.current;
+        assertedRoot = checkpoint.assertedRoot;
+        for (const [node, previous] of journal) {
+          if (previous === undefined) materialized.delete(node);
+          else materialized.set(node, previous);
+        }
+        valueIdentities = new WeakMap();
+        throw error;
       }
-      acceptedSnapshot = nextSnapshot;
-      const root = materialized.get(plan.query);
-      current = maintainedQueryResult(
-        root,
-        [],
-        maintenanceState(
-          graph.nodes.length,
-          updatedNodeCount,
-          changedNodes.size,
-          changedRelationIds(nextSnapshot, changedRelations),
-          diffMaintainedResults(assertedRoot, root, valueIdentities),
-          revision,
-          rejectedUpdateCount
-        )
-      );
-      assertedRoot = root;
-      return current;
     },
     close: () => {
       if (closed) return;
@@ -2074,6 +2133,10 @@ const incrementallyMaterializeLocal = (
   const issues: Issue[] = [];
   let unavailable = false;
   let previousPositions: ReadonlyMap<string, number> | undefined;
+  // Reuse one lazily created overlay map for every changed child row. The
+  // single overridden entry is replaced before each evaluation, so row-local
+  // state cannot leak and an all-retained update allocates no overlay.
+  let overrides: Map<QueryNode, MaterializedQueryNode> | undefined;
   for (let index = 0; index < child.result.rows.length; index += 1) {
     const row = child.result.rows[index] as ScopedRow;
     const key = resultKey(row);
@@ -2091,7 +2154,7 @@ const incrementallyMaterializeLocal = (
       appendLocalSegment(output, retained);
       continue;
     }
-    const overrides = new Map(materializedNodes);
+    overrides ??= new Map(materializedNodes);
     overrides.set(node.input, { result: { rows: [row], completeness: child.result.completeness }, issues: [], unavailable: false });
     const segment = evaluateMaterializedQueryNode(node, snapshot, overrides);
     issues.push(...segment.issues);

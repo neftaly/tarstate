@@ -114,6 +114,24 @@ describe('production query oracle', () => {
     ]);
   });
 
+  it('evaluates singleton-tuple reference joins in either operand order', () => {
+    const reference = { kind: 'field', alias: 'pizza', name: 'base' } as const;
+    const keyTuple = { kind: 'array', items: [{ kind: 'field', alias: 'base', name: 'name' } as const] } as const;
+    const join = (reversed: boolean): QueryNode => ({
+      kind: 'join', join: 'inner', left: from('pizzas', 'pizza'), right: from('bases', 'base'),
+      on: { kind: 'compare', op: 'eq', left: reversed ? keyTuple : reference, right: reversed ? reference : keyTuple }
+    });
+    const relations = [
+      relation('pizzas', [{ name: 'Margherita', base: ['thin'] }, { name: 'Deep dish', base: ['deep'] }]),
+      relation('bases', [{ name: 'thin', style: 'crisp' }, { name: 'deep', style: 'soft' }])
+    ];
+
+    for (const reversed of [false, true]) expect(evaluateQuery({ root: join(reversed), relations }).rows).toEqual([
+      { pizza: { name: 'Margherita', base: ['thin'] }, base: { name: 'thin', style: 'crisp' } },
+      { pizza: { name: 'Deep dish', base: ['deep'] }, base: { name: 'deep', style: 'soft' } }
+    ]);
+  });
+
   it('defines empty aggregates and preserves deterministic ordered windows', () => {
     const aggregate: QueryNode = {
       kind: 'aggregate',
@@ -235,6 +253,53 @@ describe('production query oracle', () => {
     expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 4 }, membershipRevision: 9 }).rows).toEqual([{ id: 2 }, { id: 3 }]);
     expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 5 }, membershipRevision: 9 })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.cursor_stale' }] });
     expect(evaluateQuery({ root: { kind: 'seek', input: from('items', 'item'), by, after: cursor }, relations, basis: { revision: 4 }, membershipRevision: 10 })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.cursor_stale' }] });
+  });
+
+  it('orders arrays and objects structurally with numeric nested values', () => {
+    const input: QueryNode = {
+      kind: 'values', alias: 'item', rows: [
+        { id: 'object-10', value: { a: [10] } },
+        { id: 'array-10', value: [10] },
+        { id: 'object-b', value: { b: 0 } },
+        { id: 'array-9', value: [9] },
+        { id: 'object-9', value: { a: [9] } }
+      ]
+    };
+    const by = [{ value: { kind: 'field', alias: 'item', name: 'value' } as const, direction: 'asc' as const }];
+    const ordered = evaluateQuery({ root: { kind: 'order', input, by }, relations: [] });
+    expect(ordered.rows.map((row) => row.id)).toEqual(['array-9', 'array-10', 'object-9', 'object-10', 'object-b']);
+
+    const belowTen = evaluateQuery({
+      root: {
+        kind: 'where',
+        input: { kind: 'values', alias: 'tuple', rows: [{ id: 'nine', value: [9] }, { id: 'ten', value: [10] }] },
+        predicate: {
+          kind: 'compare', op: 'lt',
+          left: { kind: 'field', alias: 'tuple', name: 'value' },
+          right: { kind: 'literal', value: [10] }
+        }
+      },
+      relations: []
+    });
+    expect(belowTen.rows).toEqual([{ id: 'nine', value: [9] }]);
+
+    const aggregate: QueryNode = {
+      kind: 'aggregate', input, alias: 'summary', groupBy: {}, measures: {
+        minimum: { kind: 'aggregate', op: 'minimum', value: { kind: 'field', alias: 'item', name: 'value' } },
+        maximum: { kind: 'aggregate', op: 'maximum', value: { kind: 'field', alias: 'item', name: 'value' } }
+      }
+    };
+    expect(evaluateQuery({ root: aggregate, relations: [] }).rows).toEqual([{ minimum: [9], maximum: { b: 0 } }]);
+  });
+
+  it('seeks numerically through tuple-valued order keys', () => {
+    const input: QueryNode = { kind: 'values', alias: 'item', rows: [{ id: 'nine', key: [9] }, { id: 'ten', key: [10] }] };
+    const by = [{ value: { kind: 'field', alias: 'item', name: 'key' } as const, direction: 'asc' as const }];
+    const ordered = evaluateQuery({ root: { kind: 'order', input, by }, relations: [] });
+    const cursor = { order: [[9]], resultKey: ordered.resultKeys[0] as string, basis: { revision: 1 }, membershipRevision: 1, mode: 'live' as const };
+    expect(ordered.rows.map((row) => row.id)).toEqual(['nine', 'ten']);
+    expect(evaluateQuery({ root: { kind: 'seek', input, by, after: cursor }, relations: [], basis: { revision: 1 }, membershipRevision: 1 }).rows)
+      .toEqual([{ id: 'ten', key: [10] }]);
   });
 
   it('orders ordinary values before null then missing regardless of direction', () => {

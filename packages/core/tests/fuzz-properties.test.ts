@@ -407,6 +407,87 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
     }
   });
 
+  it('orders nested JSON structurally with deterministic, transitive seek boundaries', () => {
+    const orderingRelation = { schemaView, relationId: 'fuzz.structural-order' } as const;
+    const input: QueryNode = { kind: 'from', relation: orderingRelation, alias: 'item' };
+    const by = [{ value: { kind: 'field', alias: 'item', name: 'value' } as const, direction: 'asc' as const }];
+    const ordered: QueryNode = { kind: 'order', input, by };
+    const fixtures: readonly JsonValue[] = [
+      [9], [10], [1], [1, 0],
+      { a: 9 }, { a: 10 }, { a: [9] }, { a: [10] },
+      { a: 1 }, { a: 1, b: 0 }, { b: 0 },
+      [[9]], [[10]], { nested: { values: [9, { edge: 10 }] } }
+    ];
+    const orderInput = (values: readonly JsonValue[]): RelationInput => ({
+      relation: orderingRelation,
+      rows: values.map((value, index) => ({ id: 'value:' + index, value })),
+      occurrenceIds: values.map((_value, index) => 'value:' + index),
+      completeness: 'exact',
+      sourceId: 'source:structural-order',
+      attachmentId: 'attachment:structural-order'
+    });
+    const observedCompare = (left: JsonValue, right: JsonValue): -1 | 1 => {
+      const relationInput = orderInput([left, right]);
+      const result = evaluateQuery({ root: ordered, relations: [relationInput] });
+      expect(result.completeness).toBe('exact');
+      return result.rows[0]?.id === 'value:0' ? -1 : 1;
+    };
+
+    for (let run = 0; run < Math.min(runs, 48); run += 1) {
+      const unique = new Map(fixtures.map((value) => [referenceCanonicalJson(value), value]));
+      for (let attempt = 0; attempt < 32 && unique.size < fixtures.length + 12; attempt += 1) {
+        const value = randomJson(0);
+        // Top-level null placement is controlled by OrderTerm.nulls rather
+        // than the structural JSON comparator; nested nulls remain covered.
+        if (value !== null) unique.set(referenceCanonicalJson(value), value);
+      }
+      const values = [...unique.values()];
+      const expected = [...values].sort(referenceJsonCompare);
+      const shuffled = [...values];
+      for (let index = shuffled.length - 1; index > 0; index -= 1) {
+        const swap = integer(index + 1);
+        [shuffled[index], shuffled[swap]] = [shuffled[swap] as JsonValue, shuffled[index] as JsonValue];
+      }
+      const relationInput = orderInput(shuffled);
+      const basis = { revision: run };
+      const membershipRevision = run;
+      const result = evaluateQuery({ root: ordered, relations: [relationInput], basis, membershipRevision });
+      expect(result, 'structural order run ' + run).toMatchObject({ completeness: 'exact', issues: [] });
+      expect(result.rows.map(({ value }) => value), 'structural oracle run ' + run).toEqual(expected);
+
+      const reversedInput = orderInput([...shuffled].reverse());
+      const reversedResult = evaluateQuery({ root: ordered, relations: [reversedInput], basis, membershipRevision });
+      expect(reversedResult.rows.map(({ value }) => value), 'deterministic order run ' + run).toEqual(expected);
+
+      for (let index = 0; index + 2 < Math.min(expected.length, 8); index += 1) {
+        const first = expected[index] as JsonValue;
+        const second = expected[index + 1] as JsonValue;
+        const third = expected[index + 2] as JsonValue;
+        expect(observedCompare(first, second), 'forward pair run ' + run + ', index ' + index).toBe(-1);
+        expect(observedCompare(second, first), 'reverse pair run ' + run + ', index ' + index).toBe(1);
+        expect(observedCompare(second, third), 'second pair run ' + run + ', index ' + index).toBe(-1);
+        expect(observedCompare(first, third), 'transitive pair run ' + run + ', index ' + index).toBe(-1);
+      }
+
+      const cursorIndex = integer(result.rows.length - 1);
+      const cursorRow = result.rows[cursorIndex] as QueryRecord;
+      const seek: QueryNode = {
+        kind: 'seek', input, by,
+        after: {
+          order: [cursorRow.value as JsonValue],
+          resultKey: result.resultKeys[cursorIndex] as string,
+          basis,
+          membershipRevision,
+          mode: 'live'
+        }
+      };
+      const sought = evaluateQuery({ root: seek, relations: [relationInput], basis, membershipRevision });
+      expect(sought, 'seek run ' + run).toMatchObject({ completeness: 'exact', issues: [] });
+      expect(sought.rows, 'seek suffix run ' + run).toEqual(result.rows.slice(cursorIndex + 1));
+      expect(sought.resultKeys, 'seek keys run ' + run).toEqual(result.resultKeys.slice(cursorIndex + 1));
+    }
+  });
+
   it('is total over generated portable receipt inputs', () => {
     for (let run = 0; run < runs * 8; run += 1) {
       const input = randomJson(0);
@@ -475,3 +556,51 @@ function randomJson(depth: number): JsonValue {
   if (kind === 4) return Array.from({ length: integer(5) }, () => randomJson(depth + 1));
   return Object.fromEntries(Array.from({ length: integer(5) }, (_, index) => ['key:' + index, randomJson(depth + 1)]));
 }
+
+const referenceJsonCompare = (left: JsonValue, right: JsonValue): number => {
+  const leftRank = referenceJsonRank(left);
+  const rightRank = referenceJsonRank(right);
+  if (leftRank !== rightRank) return leftRank - rightRank;
+  if (left === null || right === null) return 0;
+  if (typeof left === 'string' && typeof right === 'string') return left < right ? -1 : left > right ? 1 : 0;
+  if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : left > right ? 1 : 0;
+  if (typeof left === 'boolean' && typeof right === 'boolean') return left === right ? 0 : left ? 1 : -1;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+      const comparison = referenceJsonCompare(left[index] as JsonValue, right[index] as JsonValue);
+      if (comparison !== 0) return comparison;
+    }
+    return left.length - right.length;
+  }
+  const leftRecord = left as Readonly<Record<string, JsonValue>>;
+  const rightRecord = right as Readonly<Record<string, JsonValue>>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  for (let index = 0; index < Math.min(leftKeys.length, rightKeys.length); index += 1) {
+    const leftKey = leftKeys[index] as string;
+    const rightKey = rightKeys[index] as string;
+    if (leftKey !== rightKey) return leftKey < rightKey ? -1 : 1;
+    const comparison = referenceJsonCompare(leftRecord[leftKey] as JsonValue, rightRecord[rightKey] as JsonValue);
+    if (comparison !== 0) return comparison;
+  }
+  return leftKeys.length - rightKeys.length;
+};
+
+const referenceJsonRank = (value: JsonValue): number => value === null
+  ? 0
+  : typeof value === 'string'
+    ? 1
+    : typeof value === 'number'
+      ? 2
+      : typeof value === 'boolean'
+        ? 3
+        : Array.isArray(value)
+          ? 4
+          : 5;
+
+const referenceCanonicalJson = (value: JsonValue): string => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return '[' + value.map(referenceCanonicalJson).join(',') + ']';
+  const record = value as Readonly<Record<string, JsonValue>>;
+  return '{' + Object.keys(record).sort().map((key) => JSON.stringify(key) + ':' + referenceCanonicalJson(record[key] as JsonValue)).join(',') + '}';
+};
