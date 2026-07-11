@@ -10,7 +10,7 @@ It also generates JSON-serializable schemas, describing your data in terms of re
 Perf and GC targets systems programming and video games.
 Work is shared between queries, and aims to be faster than hand-rolled state management at scale.
 
-Tarstate is largely a TypeScript adaptation of
+Tarstate was heavily inspired by
 [wotbrew/relic](https://github.com/wotbrew/relic), after
 [Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf).
 
@@ -79,15 +79,59 @@ export const initialState = {
 }
 ```
 
-## React example
+## Queries
 
-This component gets its prepared database from the application. Tarstate then
-subscribes to a query view and sends commits through the application's source
-coordinator.
+Queries are portable values composed with `pipe`. This one joins pizzas to
+their bases, sorts the menu by name, and selects the fields the UI needs.
+
+```ts
+import { aggregate, compare, field, from, join, orderBy, pipe, select } from '@tarstate/core';
+import { schema } from './schema';
+
+const base = from({ schemaView: schema, relationId: 'example.base' }, 'base');
+const pizza = from({ schemaView: schema, relationId: 'example.pizza' }, 'pizza');
+
+export const pizzaMenuQuery = pipe(
+  pizza,
+  join(base, 'inner', compare(
+    'eq',
+    field('pizza', 'base'),
+    { kind: 'array', items: [field('base', 'name')] }
+  )),
+  orderBy([{ value: field('pizza', 'name'), direction: 'asc' }]),
+  select('menu', {
+    name: field('pizza', 'name'),
+    style: field('base', 'style'),
+    price: field('pizza', 'price')
+  })
+);
+```
+
+Tarstate compiles queries into an incremental view maintenance (IVM) graph, so
+that work is shared.
+When data changes, it updates only affected operators; joins reuse indexes and
+propagation stops when an operator's result is unchanged.
+
+```ts
+export const menuSummaryQuery = pipe(
+  pizzaMenuQuery,
+  // Before this line, this query is free
+  aggregate('summary', {}, {
+    pizzaCount: { kind: 'aggregate', op: 'count' },
+    averagePrice: {
+      kind: 'aggregate',
+      op: 'average',
+      value: field('menu', 'price')
+    }
+  })
+);
+```
+
+## React example
 
 ```tsx
 import { TarstateProvider, useCommit, useQuery } from '@tarstate/react';
-import { database, executeCommit, makeDetroitStyle, pizzaMenu } from './tarstate';
+import { database, executeCommit, makeDetroitStyle, pizzaMenuPlan } from './tarstate';
 
 export function App() {
   return (
@@ -98,7 +142,7 @@ export function App() {
 }
 
 function PizzaMenu() {
-  const menu = useQuery(pizzaMenu);
+  const menu = useQuery(pizzaMenuPlan);
   const commit = useCommit();
   if (menu.state !== 'open') return null;
 
