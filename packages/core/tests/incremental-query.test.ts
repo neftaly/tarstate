@@ -504,6 +504,44 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
+  it('rejects recursive private updates and defers closure until the active update finishes', () => {
+    const callable = { id: 'urn:test:private-reentrant', version: '1', contractHash: `sha256:${'8'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    let session: ReturnType<typeof openIncrementalQueryMaintenance>;
+    let action: 'none' | 'reenter' | 'close' = 'none';
+    let recursiveError: unknown;
+    let initial: QueryMaintenanceSnapshot;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      const currentAction = action;
+      action = 'none';
+      if (currentAction === 'reenter') {
+        try { session.applyUpdate(diffQueryMaintenanceSnapshots(initial, initial)); } catch (error) { recursiveError = error; }
+      }
+      if (currentAction === 'close') session.close();
+      return args[0] ?? null;
+    }]]);
+    const query: QueryNode = {
+      kind: 'select', input: people, alias: 'result',
+      fields: { name: { kind: 'call', capability: callable, args: [field('p', 'name')] } }
+    };
+    initial = { ...snapshot(basePeople, 1), functions };
+    const middle = { ...snapshot(middlePeople, 2), functions };
+    const final = { ...snapshot(finalPeople, 3), functions };
+    session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    action = 'reenter';
+    const middleResult = session.applyUpdate(diffQueryMaintenanceSnapshots(initial, middle));
+    expect(recursiveError).toMatchObject({ message: 'Recursive incremental query updates are not supported' });
+    expect(semanticResult(middleResult)).toEqual(oracle(query, middle));
+
+    action = 'close';
+    const finalResult = session.applyUpdate(diffQueryMaintenanceSnapshots(middle, final));
+    expect(semanticResult(finalResult)).toEqual(oracle(query, final));
+    expect(session.getCurrentResult()).toBe(finalResult);
+    expect(() => session.applyUpdate(diffQueryMaintenanceSnapshots(final, final))).toThrow('Incremental query maintenance session is closed');
+    session.close();
+  });
+
   it('does not recompute a graph whose relation dependencies did not change', () => {
     const initial = snapshot(basePeople, 1);
     const unrelated = relation('unrelated', [{ occurrenceId: 'unrelated:1', row: { id: 1 } }], 1);

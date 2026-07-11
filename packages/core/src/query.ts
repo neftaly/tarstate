@@ -172,6 +172,7 @@ export interface IncrementalQueryMaintenanceSession {
   getCurrentResult(): IncrementalQueryResult;
   /** Applies one exact change against the last accepted basis; malformed or stale changes are rejected without mutating accepted state. */
   applyUpdate(update: QueryMaintenanceUpdate): IncrementalQueryResult;
+  /** Idempotent; closure requested during an update is applied after that update completes. */
   close(): void;
 }
 
@@ -1177,6 +1178,8 @@ export const openIncrementalQueryMaintenance = (
   let revision = 0;
   let rejectedUpdateCount = 0;
   let valueIdentities = new WeakMap<ScopedRow, string>();
+  let executionPhase: 'idle' | 'updating' = 'idle';
+  let closeRequested = false;
 
   const initialIssues = validateMaintenanceSnapshot(initialSnapshot);
   if (initialIssues.length === 0) {
@@ -1189,12 +1192,20 @@ export const openIncrementalQueryMaintenance = (
   );
   let assertedRoot = initialIssues.length === 0 ? materialized.get(plan.query) : undefined;
 
+  const closeNow = (): void => {
+    if (closed) return;
+    closed = true;
+    materialized.clear();
+  };
+
   return {
     getCurrentResult: () => current,
     applyUpdate: (update) => {
       if (closed) throw new Error('Incremental query maintenance session is closed');
+      if (executionPhase === 'updating') throw new Error('Recursive incremental query updates are not supported');
       const checkpoint = { acceptedSnapshot, revision, rejectedUpdateCount, current, assertedRoot };
       const journal = new Map<QueryNode, MaterializedQueryNode | undefined>();
+      executionPhase = 'updating';
       try {
         revision += 1;
         const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
@@ -1264,12 +1275,18 @@ export const openIncrementalQueryMaintenance = (
         }
         valueIdentities = new WeakMap();
         throw error;
+      } finally {
+        executionPhase = 'idle';
+        if (closeRequested) closeNow();
       }
     },
     close: () => {
       if (closed) return;
-      closed = true;
-      materialized.clear();
+      if (executionPhase !== 'idle') {
+        closeRequested = true;
+        return;
+      }
+      closeNow();
     }
   };
 };
