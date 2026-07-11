@@ -520,6 +520,121 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
+  it('visits only roots owned by the changed relation while every root advances revision', () => {
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    const peopleQuery: QueryNode = { kind: 'select', input: from('people', 'p'), alias: 'result', fields: { id: field('p', 'id') } };
+    const groupsQuery: QueryNode = { kind: 'select', input: from('groups', 'g'), alias: 'result', fields: { id: field('g', 'id') } };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/selective-worklist', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const peopleRoot = runtime.attach(plan(peopleQuery));
+    const groupsRoot = runtime.attach(plan(groupsQuery));
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+
+    expect(peopleRoot.getCurrentResult().state).toMatchObject({ revision: 1, updatedNodeCount: 2, changedNodeCount: 2 });
+    expect(groupsRoot.getCurrentResult().state).toMatchObject({ revision: 1, updatedNodeCount: 0, changedNodeCount: 0 });
+    expect(semanticResult(groupsRoot.getCurrentResult())).toEqual(oracle(groupsQuery, next));
+    expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 2, lastChangedPhysicalNodeCount: 2 });
+    peopleRoot.close();
+    groupsRoot.close();
+    runtime.close();
+  });
+
+  it('removes dependency consumers when an unrelated root closes', () => {
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/closed-consumer', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const removed = runtime.attach(plan({ kind: 'select', input: from('people', 'p'), alias: 'result', fields: { id: field('p', 'id') } }));
+    const remaining = runtime.attach(plan({ kind: 'select', input: from('groups', 'g'), alias: 'result', fields: { id: field('g', 'id') } }));
+    removed.close();
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+
+    expect(remaining.getCurrentResult().state).toMatchObject({ revision: 1, updatedNodeCount: 0, changedNodeCount: 0 });
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 1, physicalNodeCount: 2, lastUpdatedPhysicalNodeCount: 0 });
+    remaining.close();
+    runtime.close();
+  });
+
+  it('evaluates a diamond parent once after both changed branches in topological order', () => {
+    const sharedInput = (): QueryNode => from('people', 'p');
+    const query: QueryNode = {
+      kind: 'set', op: 'union-all',
+      left: {
+        kind: 'where', input: sharedInput(),
+        predicate: { kind: 'compare', op: 'gte', left: field('p', 'id'), right: { kind: 'literal', value: 1 } }
+      },
+      right: {
+        kind: 'where', input: sharedInput(),
+        predicate: { kind: 'compare', op: 'lte', left: field('p', 'id'), right: { kind: 'literal', value: 3 } }
+      }
+    };
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/diamond-worklist', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(query));
+    expect(runtime.getDiagnostics()).toMatchObject({ physicalNodeCount: 4 });
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, next));
+    expect(root.getCurrentResult().state).toMatchObject({ updatedNodeCount: 4, changedNodeCount: 4 });
+    expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 4, lastChangedPhysicalNodeCount: 4 });
+    root.close();
+    runtime.close();
+  });
+
+  it('stops pooled parent propagation when a changed input is filtered out', () => {
+    const query: QueryNode = {
+      kind: 'select', alias: 'result',
+      input: {
+        kind: 'where', input: from('people', 'p'),
+        predicate: { kind: 'compare', op: 'gte', left: field('p', 'id'), right: { kind: 'literal', value: 2 } }
+      },
+      fields: { id: field('p', 'id') }
+    };
+    const initial = snapshot(basePeople, 1);
+    const changedFilteredOutRow: readonly QueryRowOccurrence[] = [
+      { occurrenceId: 'person:a', row: { ...basePeople[0]!.row, name: 'not visible' } },
+      basePeople[1] as QueryRowOccurrence
+    ];
+    const next = snapshot(changedFilteredOutRow, 2);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/pooled-propagation-stop', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(query));
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, next));
+    expect(root.getCurrentResult().state).toMatchObject({ updatedNodeCount: 2, changedNodeCount: 1 });
+    expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 2, lastChangedPhysicalNodeCount: 1 });
+    root.close();
+    runtime.close();
+  });
+
   it('maintains shared-node diagnostics through arbitrary reference transitions', () => {
     const query = (): QueryNode => ({
       kind: 'where', input: from('people', 'p'),

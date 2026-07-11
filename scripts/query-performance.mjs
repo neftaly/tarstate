@@ -224,7 +224,7 @@ for (const [depth, iterations] of [[10, 30], [25, 20], [50, 10], [100, 5]]) {
   });
 }
 
-for (const rootCount of [10, 50, 100]) {
+for (const rootCount of [10, 50, 100, 1_000]) {
   const relations = Array.from({ length: rootCount }, (_, index) => input('unrelated-' + index, linearRows(10)));
   const changedRelations = [...relations];
   changedRelations[0] = input('unrelated-0', linearRows(10, true));
@@ -244,9 +244,13 @@ for (const rootCount of [10, 50, 100]) {
     runtime.applyUpdate(update++ % 2 === 0 ? forward : backward);
     return roots[0].getCurrentResult().rows.length;
   });
+  const afterUpdate = physicalDiagnostics(runtime.getDiagnostics());
   pooledMeasurements.push({
     scenario: 'unrelated-relation-union-dag', rootCount, inputRows: rootCount * 10, iterations: 50,
-    millisecondsPerUpdate, afterUpdate: physicalDiagnostics(runtime.getDiagnostics())
+    millisecondsPerUpdate,
+    selectiveVisitedPhysicalNodeCount: afterUpdate.lastUpdatedPhysicalNodeCount,
+    selectiveChangedPhysicalNodeCount: afterUpdate.lastChangedPhysicalNodeCount,
+    afterUpdate
   });
   for (const root of roots) root.close();
   runtime.close();

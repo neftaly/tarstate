@@ -161,52 +161,85 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
     }
   });
 
-  it('keeps pooled multi-root lifecycle and rejection recovery oracle-equivalent', () => {
+  it('keeps a two-relation pooled state machine oracle-equivalent and relation-local', () => {
     const stateRandom = seededRandom(initialSeed ^ 0x51A7_EF01);
     const stateInteger = (limit: number): number => Math.floor(stateRandom() * limit);
     const stateRuns = Math.min(runs, 48);
     const stateSteps = 24;
-    const fromRows = (): QueryNode => ({ kind: 'from', relation, alias: 'row' });
-    const field = (name: string) => ({ kind: 'field', alias: 'row', name } as const);
-    const sharedPrefix = (): QueryNode => ({
+    const relationA = { schemaView, relationId: 'fuzz.pool.a' } as const;
+    const relationB = { schemaView, relationId: 'fuzz.pool.b' } as const;
+    const field = (alias: string, name: string) => ({ kind: 'field', alias, name } as const);
+    const prefixA = (): QueryNode => ({
       kind: 'where',
-      input: fromRows(),
-      predicate: { kind: 'compare', op: 'gte', left: field('score'), right: { kind: 'literal', value: 0 } }
+      input: { kind: 'from', relation: relationA, alias: 'a' },
+      predicate: { kind: 'compare', op: 'gte', left: field('a', 'score'), right: { kind: 'literal', value: 0 } }
+    });
+    const prefixB = (): QueryNode => ({
+      kind: 'where',
+      input: { kind: 'from', relation: relationB, alias: 'b' },
+      predicate: { kind: 'compare', op: 'gte', left: field('b', 'score'), right: { kind: 'literal', value: 0 } }
     });
     const queryVariant = (variant: number): QueryNode => {
       if (variant === 0) return {
-        kind: 'select', input: sharedPrefix(), alias: 'result',
-        fields: { id: field('id'), value: field('value') }
+        kind: 'select', input: prefixA(), alias: 'result',
+        fields: { id: field('a', 'id'), value: field('a', 'value') }
       };
       if (variant === 1) return {
-        kind: 'aggregate', input: sharedPrefix(), alias: 'summary', groupBy: {},
+        kind: 'select', input: prefixB(), alias: 'result',
+        fields: { id: field('b', 'id'), value: field('b', 'value') }
+      };
+      if (variant === 2) return {
+        kind: 'aggregate', input: prefixA(), alias: 'summary', groupBy: {},
         measures: {
           count: { kind: 'aggregate', op: 'count' },
-          total: { kind: 'aggregate', op: 'sum', value: field('score') }
+          total: { kind: 'aggregate', op: 'sum', value: field('a', 'score') }
         }
       };
-      return { kind: 'order', input: sharedPrefix(), by: [{ value: field('score'), direction: 'desc' }] };
+      if (variant === 3) return {
+        kind: 'join', join: 'inner', left: prefixA(), right: prefixB(),
+        on: { kind: 'compare', op: 'eq', left: field('a', 'joinId'), right: field('b', 'joinId') }
+      };
+      return {
+        kind: 'set', op: 'union-all',
+        left: { kind: 'select', input: prefixA(), alias: 'entry', fields: { id: field('a', 'id'), value: field('a', 'value') } },
+        right: { kind: 'select', input: prefixB(), alias: 'entry', fields: { id: field('b', 'id'), value: field('b', 'value') } }
+      };
     };
     type LiveRoot = { readonly root: PooledIncrementalQueryRoot; readonly query: QueryNode; readonly variant: number };
 
     for (let run = 0; run < stateRuns; run += 1) {
-      let revision = 0;
-      let nextId = 3;
-      let rows: FuzzRow[] = Array.from({ length: 3 }, (_, id) => ({
-        occurrenceId: 'pooled:' + id,
-        row: { id, value: 'value:' + id, score: stateInteger(100) }
+      let revisionA = 0;
+      let revisionB = 0;
+      let nextA = 3;
+      let nextB = 3;
+      let rowsA: FuzzRow[] = Array.from({ length: 3 }, (_, id) => ({
+        occurrenceId: 'a:' + id,
+        row: { id: 'a' + id, joinId: id % 2, value: 'a:' + id, score: stateInteger(100) }
       }));
-      const snapshot = (items: readonly FuzzRow[] = rows, basis = revision): QueryMaintenanceSnapshot => ({
-        relations: [{
-          relation,
-          rows: items.map(({ row }) => row),
-          occurrenceIds: items.map(({ occurrenceId }) => occurrenceId),
-          completeness: 'exact',
-          sourceId: 'source:pooled',
-          attachmentId: 'attachment:pooled',
-          basis
-        }],
-        basis: { revision: basis },
+      let rowsB: FuzzRow[] = Array.from({ length: 3 }, (_, id) => ({
+        occurrenceId: 'b:' + id,
+        row: { id: 'b' + id, joinId: id % 2, value: 'b:' + id, score: stateInteger(100) }
+      }));
+      const relationSnapshot = (use: typeof relationA | typeof relationB, items: readonly FuzzRow[], revision: number): RelationInput => ({
+        relation: use,
+        rows: items.map(({ row }) => row),
+        occurrenceIds: items.map(({ occurrenceId }) => occurrenceId),
+        completeness: 'exact',
+        sourceId: 'source:' + use.relationId,
+        attachmentId: 'attachment:' + use.relationId,
+        basis: revision
+      });
+      const snapshot = (
+        nextRowsA: readonly FuzzRow[] = rowsA,
+        nextRowsB: readonly FuzzRow[] = rowsB,
+        nextRevisionA = revisionA,
+        nextRevisionB = revisionB
+      ): QueryMaintenanceSnapshot => ({
+        relations: [
+          relationSnapshot(relationA, nextRowsA, nextRevisionA),
+          relationSnapshot(relationB, nextRowsB, nextRevisionB)
+        ],
+        basis: { revisionA: nextRevisionA, revisionB: nextRevisionB },
         membershipRevision: 0
       });
       let accepted = snapshot();
@@ -215,10 +248,12 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         initialSnapshot: accepted
       });
       const live: LiveRoot[] = [];
-      const attach = (variant = stateInteger(3)): void => {
+      let nextRootId = 0;
+      const attach = (variant = stateInteger(5)): void => {
         const rootQuery = queryVariant(variant);
+        const rootId = nextRootId++;
         live.push({
-          root: runtime.attach({ ...plan, planId: 'pooled:' + run + ':' + live.length + ':' + variant, rootNodeId: 'pooled:root', query: rootQuery }),
+          root: runtime.attach({ ...plan, planId: 'pooled:' + run + ':' + rootId + ':' + variant, rootNodeId: 'pooled:root:' + rootId, query: rootQuery }),
           query: rootQuery,
           variant
         });
@@ -237,73 +272,134 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         expect(diagnostics.sharedPhysicalNodeCount, label).toBeLessThanOrEqual(diagnostics.physicalNodeCount);
         if (live.length === 0) expect(diagnostics.physicalNodeCount, label).toBe(0);
         else expect(diagnostics.physicalNodeCount, label).toBeGreaterThan(0);
-        if (live.length > 1) expect(diagnostics.sharedPhysicalNodeCount, label).toBeGreaterThanOrEqual(2);
       };
-      const applyRows = (nextRows: FuzzRow[]): void => {
-        revision += 1;
-        const next = snapshot(nextRows, revision);
-        runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
-        rows = nextRows;
-        accepted = next;
+      const assertLocalWork = (changed: 'a' | 'b' | 'none', label: string): void => {
+        const diagnostics = runtime.getDiagnostics();
+        if (changed === 'none') {
+          expect(diagnostics.lastUpdatedPhysicalNodeCount, label).toBe(0);
+          return;
+        }
+        const unrelatedVariant = changed === 'a'
+          ? live.some(({ variant }) => variant === 1)
+          : live.some(({ variant }) => variant === 0 || variant === 2);
+        if (unrelatedVariant) {
+          expect(diagnostics.lastUpdatedPhysicalNodeCount, label).toBeLessThan(diagnostics.physicalNodeCount);
+        }
+      };
+      const mutate = (target: 'a' | 'b', mode = stateInteger(3)): void => {
+        const current = target === 'a' ? rowsA : rowsB;
+        const nextRows = current.map((item) => ({ ...item, row: { ...item.row } }));
+        if (mode === 0 && nextRows.length > 0) {
+          const index = stateInteger(nextRows.length);
+          const item = nextRows[index] as FuzzRow;
+          nextRows[index] = { ...item, row: { ...item.row, value: target + ':changed:' + stateInteger(1_000), score: stateInteger(1_000) } };
+        } else if (mode === 1 && nextRows.length > 1) {
+          nextRows.splice(stateInteger(nextRows.length), 1);
+        } else {
+          const id = target === 'a' ? nextA++ : nextB++;
+          nextRows.push({
+            occurrenceId: target + ':' + id,
+            row: { id: target + id, joinId: stateInteger(3), value: target + ':inserted:' + id, score: stateInteger(1_000) }
+          });
+        }
+        if (target === 'a') {
+          const next = snapshot(nextRows, rowsB, revisionA + 1, revisionB);
+          runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+          rowsA = nextRows;
+          revisionA += 1;
+          accepted = next;
+        } else {
+          const next = snapshot(rowsA, nextRows, revisionA, revisionB + 1);
+          runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+          rowsB = nextRows;
+          revisionB += 1;
+          accepted = next;
+        }
+      };
+      const reorder = (target: 'a' | 'b'): void => {
+        const current = target === 'a' ? rowsA : rowsB;
+        const nextRows = [...current];
+        if (nextRows.length > 1) {
+          const first = stateInteger(nextRows.length);
+          let second = stateInteger(nextRows.length - 1);
+          if (second >= first) second += 1;
+          [nextRows[first], nextRows[second]] = [nextRows[second] as FuzzRow, nextRows[first] as FuzzRow];
+        }
+        if (target === 'a') {
+          const next = snapshot(nextRows, rowsB, revisionA + 1, revisionB);
+          runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+          rowsA = nextRows;
+          revisionA += 1;
+          accepted = next;
+        } else {
+          const next = snapshot(rowsA, nextRows, revisionA, revisionB + 1);
+          runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+          rowsB = nextRows;
+          revisionB += 1;
+          accepted = next;
+        }
+      };
+      const rejectAndRecover = (target: 'a' | 'b'): void => {
+        const nextRowsA = rowsA.map((item) => ({ ...item, row: { ...item.row } }));
+        const nextRowsB = rowsB.map((item) => ({ ...item, row: { ...item.row } }));
+        const targetRows = target === 'a' ? nextRowsA : nextRowsB;
+        if (targetRows.length === 0) {
+          const id = target === 'a' ? nextA++ : nextB++;
+          targetRows.push({ occurrenceId: target + ':' + id, row: { id: target + id, joinId: 0, value: 'recovery:' + id, score: 1 } });
+        } else {
+          const index = stateInteger(targetRows.length);
+          const item = targetRows[index] as FuzzRow;
+          targetRows[index] = { ...item, row: { ...item.row, score: stateInteger(1_000) } };
+        }
+        const nextRevisionA = revisionA + (target === 'a' ? 1 : 0);
+        const nextRevisionB = revisionB + (target === 'b' ? 1 : 0);
+        const recovery = snapshot(nextRowsA, nextRowsB, nextRevisionA, nextRevisionB);
+        const valid = diffQueryMaintenanceSnapshots(accepted, recovery);
+        const changedRelationId = target === 'a' ? relationA.relationId : relationB.relationId;
+        const changed = valid.relations.find(({ relation: use }) => use.relationId === changedRelationId);
+        expect(changed, 'malformed update requires the targeted relation change').toBeDefined();
+        runtime.applyUpdate({
+          ...valid,
+          relations: [{
+            ...(changed as NonNullable<typeof changed>),
+            rows: [{ occurrenceId: target + ':missing', after: { index: 0, row: { id: 'malformed', joinId: -1, value: 'malformed', score: -1 } } }]
+          }]
+        });
+        for (const candidate of live) expect(candidate.root.getCurrentResult()).toMatchObject({ rows: [], completeness: 'unknown' });
+        runtime.applyUpdate(valid);
+        rowsA = nextRowsA;
+        rowsB = nextRowsB;
+        revisionA = nextRevisionA;
+        revisionB = nextRevisionB;
+        accepted = recovery;
       };
 
-      attach(run % 3);
+      // Always cover every dependency shape before random lifecycle churn.
+      for (let variant = 0; variant < 5; variant += 1) attach(variant);
       assertState('pool run ' + run + ', initial');
       for (let step = 0; step < stateSteps; step += 1) {
-        const action = stateInteger(6);
-        if (action === 0) {
-          const nextRows = rows.map((item) => ({ ...item, row: { ...item.row } }));
-          const mutation = stateInteger(4);
-          if (mutation === 0 && nextRows.length > 0) {
-            const index = stateInteger(nextRows.length);
-            const current = nextRows[index] as FuzzRow;
-            nextRows[index] = { ...current, row: { ...current.row, value: 'changed:' + stateInteger(1_000), score: stateInteger(1_000) } };
-          } else if (mutation === 1) {
-            const id = nextId++;
-            nextRows.push({ occurrenceId: 'pooled:' + id, row: { id, value: 'inserted:' + id, score: stateInteger(1_000) } });
-          } else if (mutation === 2 && nextRows.length > 1) nextRows.splice(stateInteger(nextRows.length), 1);
-          else if (nextRows.length > 1) {
-            const first = stateInteger(nextRows.length);
-            const second = stateInteger(nextRows.length);
-            [nextRows[first], nextRows[second]] = [nextRows[second] as FuzzRow, nextRows[first] as FuzzRow];
-          }
-          applyRows(nextRows);
-        } else if (action === 1) attach();
-        else if (action === 2 && live.length > 1) {
-          const index = stateInteger(live.length);
-          const [removed] = live.splice(index, 1);
+        const action = stateInteger(7);
+        const label = 'pool run ' + run + ', step ' + step + ', action ' + action;
+        let changed: 'a' | 'b' | 'none' | undefined;
+        if (action === 0 || action === 1) {
+          changed = action === 0 ? 'a' : 'b';
+          mutate(changed);
+        } else if (action === 2) {
+          changed = stateInteger(2) === 0 ? 'a' : 'b';
+          reorder(changed);
+        } else if (action === 3) attach();
+        else if (action === 4 && live.length > 1) {
+          const [removed] = live.splice(stateInteger(live.length), 1);
           removed?.root.close();
-        } else if (action === 3) {
-          const recoveryRows = rows.map((item) => ({ ...item, row: { ...item.row } }));
-          const index = recoveryRows.length === 0 ? -1 : stateInteger(recoveryRows.length);
-          if (index >= 0) {
-            const current = recoveryRows[index] as FuzzRow;
-            recoveryRows[index] = { ...current, row: { ...current.row, score: stateInteger(1_000) } };
-          } else {
-            const id = nextId++;
-            recoveryRows.push({ occurrenceId: 'pooled:' + id, row: { id, value: 'recovery:' + id, score: stateInteger(1_000) } });
-          }
-          const recovery = snapshot(recoveryRows, revision + 1);
-          const valid = diffQueryMaintenanceSnapshots(accepted, recovery);
-          const changed = valid.relations[0];
-          expect(changed, 'malformed update requires one relation change').toBeDefined();
-          runtime.applyUpdate({
-            ...valid,
-            relations: [{
-              ...(changed as NonNullable<typeof changed>),
-              rows: [{ occurrenceId: 'pooled:missing', after: { index: 0, row: { id: -1, value: 'malformed', score: -1 } } }]
-            }]
-          });
-          for (const candidate of live) expect(candidate.root.getCurrentResult()).toMatchObject({ rows: [], completeness: 'unknown' });
-          expect(runtime.getDiagnostics().activeRootCount).toBe(live.length);
-          runtime.applyUpdate(valid);
-          revision += 1;
-          rows = recoveryRows;
-          accepted = recovery;
+        } else if (action === 5) {
+          changed = stateInteger(2) === 0 ? 'a' : 'b';
+          rejectAndRecover(changed);
         } else {
           runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, accepted));
+          changed = 'none';
         }
-        assertState('pool run ' + run + ', step ' + step + ', action ' + action);
+        assertState(label);
+        if (changed !== undefined) assertLocalWork(changed, label);
       }
       while (live.length > 0) live.splice(stateInteger(live.length), 1)[0]?.root.close();
       expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, sharedPhysicalNodeCount: 0 });

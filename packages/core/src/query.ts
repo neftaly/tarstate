@@ -1218,10 +1218,11 @@ export const openIncrementalQueryMaintenance = (
 type PooledPhysicalNode = {
   readonly key: string;
   readonly children: readonly QueryNode[];
+  readonly parents: Set<QueryNode>;
   readonly externalDependencies: ReadonlySet<string>;
   readonly sessionEvidenceDependency: boolean;
   orderIndex: number;
-  references: number;
+  readonly owners: Set<PooledRootState>;
 };
 
 type InternedPooledNode = {
@@ -1262,6 +1263,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
   const physical = new Map<QueryNode, PooledPhysicalNode>();
   let physicalOrder: (QueryNode | undefined)[] = [];
   let physicalOrderTombstones = 0;
+  const relationConsumers = new Map<string, Set<QueryNode>>();
+  const evidenceConsumers = new Set<QueryNode>();
+  const unmaterializedNodes = new Set<QueryNode>();
   let sharedPhysicalNodeCount = 0;
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
   const roots = new Set<PooledRootState>();
@@ -1302,25 +1306,38 @@ export const createPooledIncrementalQueryRuntime = (input: {
     physicalOrderTombstones = 0;
   };
 
+  const removePhysicalNode = (node: QueryNode, record: PooledPhysicalNode): void => {
+    physical.delete(node);
+    materialized.delete(node);
+    unmaterializedNodes.delete(node);
+    for (const child of record.children) physical.get(child)?.parents.delete(node);
+    for (const dependency of record.externalDependencies) {
+      const consumers = relationConsumers.get(dependency);
+      consumers?.delete(node);
+      if (consumers?.size === 0) relationConsumers.delete(dependency);
+    }
+    if (record.sessionEvidenceDependency) evidenceConsumers.delete(node);
+    if (interned.get(record.key)?.node === node) interned.delete(record.key);
+    internedByNode.delete(node);
+    if (physicalOrder[record.orderIndex] === node) {
+      physicalOrder[record.orderIndex] = undefined;
+      physicalOrderTombstones += 1;
+    }
+  };
+
   const releaseNow = (root: PooledRootState): void => {
     if (root.closed) return;
     root.closed = true;
     roots.delete(root);
     let collected = 0;
-    for (const node of root.reachable) {
+    for (const node of [...root.reachable].reverse()) {
       const record = physical.get(node);
       if (record === undefined) continue;
-      if (record.references === 2) sharedPhysicalNodeCount -= 1;
-      record.references -= 1;
-      if (record.references !== 0) continue;
-      physical.delete(node);
-      materialized.delete(node);
-      if (interned.get(record.key)?.node === node) interned.delete(record.key);
-      internedByNode.delete(node);
-      if (physicalOrder[record.orderIndex] === node) {
-        physicalOrder[record.orderIndex] = undefined;
-        physicalOrderTombstones += 1;
-      }
+      const ownerCount = record.owners.size;
+      if (!record.owners.delete(root)) continue;
+      if (ownerCount === 2) sharedPhysicalNodeCount -= 1;
+      if (record.owners.size !== 0) continue;
+      removePhysicalNode(node, record);
       collected += 1;
     }
     if (!closed) compactPhysicalOrderIfNeeded();
@@ -1347,6 +1364,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
     physical.clear();
     physicalOrder = [];
     physicalOrderTombstones = 0;
+    relationConsumers.clear();
+    evidenceConsumers.clear();
+    unmaterializedNodes.clear();
     sharedPhysicalNodeCount = 0;
     materialized.clear();
     refreshDiagnostics(0, 0, collected);
@@ -1369,6 +1389,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
     const detachedRoot = cloneAndFreezeQueryAst(plan.query);
     const createdInterned: InternedPooledNode[] = [];
     const stagedMaterialized: QueryNode[] = [];
+    let state: PooledRootState | undefined;
     try {
       const canonicalRoot = internPooledQueryNode(detachedRoot, interned, internedByNode, createdInterned, () => nextInternedNodeId += 1);
       const graph = compileQueryGraph(canonicalRoot);
@@ -1381,7 +1402,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
         }
       }
       const rootMaterialized = runtimeIssues.length === 0 ? materialized.get(canonicalRoot) : undefined;
-      const state: PooledRootState = {
+      state = {
         root: canonicalRoot,
         reachable,
         current: maintainedQueryResult(
@@ -1395,8 +1416,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
       for (const node of graph.nodes) {
         const existing = physical.get(node);
         if (existing !== undefined) {
-          if (existing.references === 1) sharedPhysicalNodeCount += 1;
-          existing.references += 1;
+          if (existing.owners.size === 1) sharedPhysicalNodeCount += 1;
+          existing.owners.add(state);
           continue;
         }
         const identity = internedByNode.get(node) as InternedPooledNode;
@@ -1404,20 +1425,46 @@ export const createPooledIncrementalQueryRuntime = (input: {
         physical.set(node, {
           key: identity.key,
           children: graph.children.get(node) as readonly QueryNode[],
+          parents: new Set(),
           externalDependencies: graph.externalDependencies.get(node) as ReadonlySet<string>,
           sessionEvidenceDependency: graph.sessionEvidenceDependencies.get(node) === true,
           orderIndex,
-          references: 1
+          owners: new Set([state])
         });
         physicalOrder.push(node);
+        if (!materialized.has(node)) unmaterializedNodes.add(node);
+        for (const dependency of graph.externalDependencies.get(node) as ReadonlySet<string>) {
+          let consumers = relationConsumers.get(dependency);
+          if (consumers === undefined) {
+            consumers = new Set();
+            relationConsumers.set(dependency, consumers);
+          }
+          consumers.add(node);
+        }
+        if (graph.sessionEvidenceDependencies.get(node) === true) evidenceConsumers.add(node);
       }
-      roots.add(state);
+      for (const node of graph.nodes) {
+        for (const child of graph.children.get(node) as readonly QueryNode[]) (physical.get(child) as PooledPhysicalNode).parents.add(node);
+      }
+      const registeredState = state;
+      roots.add(registeredState);
       refreshDiagnostics(newNodes.length, newNodes.length, 0);
       return {
-        getCurrentResult: () => state.current,
-        close: () => release(state)
+        getCurrentResult: () => registeredState.current,
+        close: () => release(registeredState)
       };
     } catch (error) {
+      if (state !== undefined) {
+        roots.delete(state);
+        for (const node of [...state.reachable].reverse()) {
+          const record = physical.get(node);
+          if (record === undefined) continue;
+          const ownerCount = record.owners.size;
+          if (!record.owners.delete(state)) continue;
+          if (ownerCount === 2) sharedPhysicalNodeCount -= 1;
+          if (record.owners.size === 0) removePhysicalNode(node, record);
+        }
+      }
       for (const node of stagedMaterialized) materialized.delete(node);
       for (const identity of createdInterned.reverse()) {
         if (physical.has(identity.node)) continue;
@@ -1471,17 +1518,56 @@ export const createPooledIncrementalQueryRuntime = (input: {
       || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
     const updatedNodes = new Set<QueryNode>();
     const changedNodes = new Set<QueryNode>();
-    for (const node of physicalOrder) {
-      if (node === undefined) continue;
+    const rootUpdatedCounts = new Map<PooledRootState, number>();
+    const rootChangedCounts = new Map<PooledRootState, number>();
+    const candidates: QueryNode[] = [];
+    const enqueued = new Set<QueryNode>();
+    const evaluated = new Set<QueryNode>();
+    const candidateOrder = (node: QueryNode): number => (physical.get(node) as PooledPhysicalNode).orderIndex;
+    const enqueue = (node: QueryNode): void => {
+      if (enqueued.has(node) || evaluated.has(node) || !physical.has(node)) return;
+      enqueued.add(node);
+      candidates.push(node);
+      let index = candidates.length - 1;
+      while (index > 0) {
+        const parent = Math.floor((index - 1) / 2);
+        if (candidateOrder(candidates[parent] as QueryNode) <= candidateOrder(node)) break;
+        candidates[index] = candidates[parent] as QueryNode;
+        index = parent;
+      }
+      candidates[index] = node;
+    };
+    const dequeue = (): QueryNode | undefined => {
+      const first = candidates[0];
+      const last = candidates.pop();
+      if (first === undefined) return undefined;
+      enqueued.delete(first);
+      if (candidates.length !== 0 && last !== undefined) {
+        let index = 0;
+        while (true) {
+          const left = index * 2 + 1;
+          if (left >= candidates.length) break;
+          const right = left + 1;
+          const child = right < candidates.length
+            && candidateOrder(candidates[right] as QueryNode) < candidateOrder(candidates[left] as QueryNode)
+            ? right
+            : left;
+          if (candidateOrder(last) <= candidateOrder(candidates[child] as QueryNode)) break;
+          candidates[index] = candidates[child] as QueryNode;
+          index = child;
+        }
+        candidates[index] = last;
+      }
+      return first;
+    };
+    for (const relation of changedRelations) for (const node of relationConsumers.get(relation) ?? []) enqueue(node);
+    if (sessionEvidenceChanged) for (const node of evidenceConsumers) enqueue(node);
+    for (const node of unmaterializedNodes) enqueue(node);
+
+    for (let node = dequeue(); node !== undefined; node = dequeue()) {
+      evaluated.add(node);
       const record = physical.get(node) as PooledPhysicalNode;
       const previousNode = materialized.get(node);
-      const childChanged = record.children.some((child) => changedNodes.has(child));
-      const externalInputChanged = [...record.externalDependencies].some((key) => changedRelations.has(key));
-      const evidenceInputChanged = sessionEvidenceChanged && record.sessionEvidenceDependency;
-      // Roots may attach while the runtime is invalidated. A successful
-      // transition, including an A -> A recovery, must initialize every
-      // missing physical node before results can be asserted again.
-      if (previousNode !== undefined && !evidenceInputChanged && !childChanged && !externalInputChanged) continue;
       const nextNode = node.kind === 'from'
         ? incrementallyMaterializeFrom(node, nextSnapshot, update, previousNode)
         : node.kind === 'join'
@@ -1491,26 +1577,26 @@ export const createPooledIncrementalQueryRuntime = (input: {
           : materializeQueryNode(node, nextSnapshot, materialized);
       if (!journal.materialized.has(node)) journal.materialized.set(node, previousNode);
       materialized.set(node, nextNode);
+      unmaterializedNodes.delete(node);
       updatedNodes.add(node);
-      if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
+      for (const owner of record.owners) rootUpdatedCounts.set(owner, (rootUpdatedCounts.get(owner) ?? 0) + 1);
+      if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) {
+        changedNodes.add(node);
+        for (const owner of record.owners) rootChangedCounts.set(owner, (rootChangedCounts.get(owner) ?? 0) + 1);
+        for (const parent of record.parents) enqueue(parent);
+      }
     }
     acceptedSnapshot = nextSnapshot;
     const changedIds = changedRelationIds(nextSnapshot, changedRelations);
     for (const root of roots) {
       const nextRoot = materialized.get(root.root);
-      let updated = 0;
-      let changed = 0;
-      for (const node of root.reachable) {
-        if (updatedNodes.has(node)) updated += 1;
-        if (changedNodes.has(node)) changed += 1;
-      }
       const nextCurrent = maintainedQueryResult(
         nextRoot,
         [],
         maintenanceState(
           root.reachable.size,
-          updated,
-          changed,
+          rootUpdatedCounts.get(root) ?? 0,
+          rootChangedCounts.get(root) ?? 0,
           changedIds,
           diffMaintainedResults(root.asserted, nextRoot, valueIdentities),
           revision,
@@ -1546,8 +1632,13 @@ export const createPooledIncrementalQueryRuntime = (input: {
       rejectedUpdateCount = checkpoint.rejectedUpdateCount;
       diagnostics = checkpoint.diagnostics;
       for (const [node, value] of journal.materialized) {
-        if (value === undefined) materialized.delete(node);
-        else materialized.set(node, value);
+        if (value === undefined) {
+          materialized.delete(node);
+          if (physical.has(node)) unmaterializedNodes.add(node);
+        } else {
+          materialized.set(node, value);
+          unmaterializedNodes.delete(node);
+        }
       }
       for (const [root, state] of journal.roots) {
         root.current = state.current;
