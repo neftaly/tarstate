@@ -61,3 +61,5 @@ and lifecycle counters when the built-in maintenance factory is active. An empty
 list can also mean there are no active shared cohorts. Seek, recursion,
 expression subqueries, divergent input streams, custom factories, and
 incompatible cohorts safely use isolated maintenance sessions.
+`getQueryMaintenanceReuseDiagnostics()` reports how often active runtimes computed
+or reused relation deltas across parameter cohorts; custom factories report zeroes.

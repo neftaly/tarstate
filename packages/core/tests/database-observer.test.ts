@@ -233,6 +233,16 @@ describe('database membership and observation', () => {
     });
     expect(builtInSession.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
     builtInSession.close();
+
+    const catalog = new AttachmentCatalog();
+    const customView = view(catalog, [dataset]);
+    const observer = customView.observe({ plan: plan() });
+    dataset.replaceMembers([], 'settled');
+    expect(customView.getQueryMaintenanceReuseDiagnostics()).toEqual({
+      computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0
+    });
+    observer.close();
+    customView.close();
   });
 
   it('rolls back a partially constructed dataset capture runtime', () => {
@@ -518,12 +528,16 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
-  it('reuses one normalized frame across conservative full-parameter cohorts', () => {
+  it('reuses one relation delta across parameter cohorts, identical frames, membership changes, and reorder', () => {
     const source = new TestSource('source:parameter-frames', [{ id: 2, value: 'two' }]);
+    const secondary = new TestSource('source:parameter-frames-secondary', [{ id: 3, value: 'three' }]);
     const catalog = new AttachmentCatalog();
     let normalizationCount = 0;
     const attachmentLease = catalog.attach(relationalAttachment('attachment:parameter-frames', source, () => { normalizationCount += 1; }));
-    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-frames', source.sourceId)] });
+    const secondaryLease = catalog.attach(relationalAttachment('attachment:parameter-frames-secondary', secondary, () => { normalizationCount += 1; }));
+    const primaryMember = member('attachment:parameter-frames', source.sourceId);
+    const secondaryMember = member('attachment:parameter-frames-secondary', secondary.sourceId);
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [primaryMember, secondaryMember] });
     const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
@@ -534,8 +548,148 @@ describe('database membership and observation', () => {
       plan: { ...relationalPlan(), planId: 'query:parameter-frame-two', rootNodeId: 'query:parameter-frame-two:root' },
       parameters: { selected: 2 }
     });
+    const third = database.observe({
+      plan: { ...relationalPlan(), planId: 'query:parameter-frame-three', rootNodeId: 'query:parameter-frame-three:root' },
+      parameters: { selected: 3 }
+    });
 
-    expect(normalizationCount).toBe(1);
+    expect(normalizationCount).toBe(2);
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 });
+    source.publish({ rows: [{ id: 2, value: 'changed' }] });
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 1, reusedFrameDeltaCount: 2 });
+
+    // A distinct capture with identical portable input is still a fresh,
+    // reusable frame transition.
+    source.notify();
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 1, reusedFrameDeltaCount: 2 });
+
+    dataset.replaceMembers([secondaryMember, primaryMember], 'settled');
+    // Membership is canonicalized, so a pure declaration reorder is a no-op.
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 1, reusedFrameDeltaCount: 2 });
+    dataset.replaceMembers([primaryMember], 'settled');
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 2, reusedFrameDeltaCount: 4 });
+    for (const observer of [first, second, third]) {
+      expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'changed' }], completeness: 'exact' } });
+    }
+    first.close();
+    second.close();
+    third.close();
+    database.close();
+    attachmentLease.close();
+    secondaryLease.close();
+  });
+
+  it('detaches a reused relation delta from source-owned nested row values', () => {
+    const source = new TestSource('source:parameter-detached-delta', [{ id: 2, value: 'initial' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:parameter-detached-delta', source));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-detached-delta', source.sourceId)]
+    });
+    const callable = { id: 'urn:test:mutate-source-after-delta', version: '1', contractHash: `sha256:${'7'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const nextPayload = { label: 'detached' };
+    let mutateDuringUpdate = false;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      if (mutateDuringUpdate) {
+        mutateDuringUpdate = false;
+        nextPayload.label = 'mutated-by-first-cohort';
+      }
+      return args[0] ?? null;
+    }]]);
+    const mutatingPlan: PreparedPlan<QueryNode> = {
+      ...relationalPlan(), planId: 'query:parameter-detached-mutating', rootNodeId: 'query:parameter-detached-mutating:root',
+      query: {
+        kind: 'select', input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' }, alias: 'result',
+        fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
+      }
+    };
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
+    });
+    // Capture consumers retain registration order, so the mutating cohort is
+    // the first physical application and the reader consumes the cached delta.
+    const first = database.observe({ plan: mutatingPlan, parameters: { cohort: 1 } });
+    const second = database.observe({
+      plan: { ...relationalPlan(), planId: 'query:parameter-detached-reader', rootNodeId: 'query:parameter-detached-reader:root' },
+      parameters: { cohort: 2 }
+    });
+
+    mutateDuringUpdate = true;
+    source.publish({ rows: [{ id: 2, value: nextPayload } as unknown as Row] });
+
+    expect(nextPayload.label).toBe('mutated-by-first-cohort');
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 1, reusedFrameDeltaCount: 1 });
+    expect(second.getSnapshot()).toMatchObject({
+      state: 'open', current: { rows: [{ id: 2, value: { label: 'detached' } }], completeness: 'exact' }
+    });
+    first.close();
+    second.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('does not cache a rejected frame delta before parameter cohorts recover', () => {
+    const source = new TestSource('source:parameter-rejected-delta', [{ id: 2, value: 'accepted' }]);
+    const catalog = new AttachmentCatalog();
+    let rejectAcceptedIdentity = false;
+    let acceptedIdentityReads = 0;
+    const attachmentId = 'attachment:parameter-rejected-delta';
+    const attachmentLease = catalog.attach({
+      ...relationalAttachment(attachmentId, source),
+      preparation: prepareManualReadOnlyAttachment({
+        schemaViewIds: [querySchemaView.id],
+        project: (snapshot: SourceSnapshot<{ readonly rows: readonly Row[] }>) => {
+          if (snapshot.storage === undefined) return { state: snapshot.state === 'ready' ? 'failed' as const : snapshot.state, issues: [] };
+          const occurrenceIds = snapshot.storage.rows.map(({ id }) => 'row:' + id);
+          const observedIds = snapshot.storage.rows[0]?.id === 2
+            ? new Proxy(occurrenceIds, {
+                get: (target, property, receiver) => {
+                  if (property === '0' && rejectAcceptedIdentity) {
+                    acceptedIdentityReads += 1;
+                    if (acceptedIdentityReads % 3 === 0) return 'row:stale';
+                  }
+                  return Reflect.get(target, property, receiver);
+                }
+              })
+            : occurrenceIds;
+          return { state: 'ready' as const, value: [{
+            relation: { schemaView: querySchemaView, relationId: 'test.rows' },
+            rows: snapshot.storage.rows, occurrenceIds: observedIds, completeness: 'exact' as const,
+            sourceId: source.sourceId, attachmentId, basis: snapshot.basis
+          }], issues: [] };
+        }
+      })
+    });
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-rejected-delta', source.sourceId)]
+    });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const first = database.observe({ plan: relationalPlan(), parameters: { cohort: 1 } });
+    const second = database.observe({
+      plan: { ...relationalPlan(), planId: 'query:parameter-rejected-delta-two', rootNodeId: 'query:parameter-rejected-delta-two:root' },
+      parameters: { cohort: 2 }
+    });
+    rejectAcceptedIdentity = true;
+    source.publish({ rows: [{ id: 9, value: 'rejected' }] });
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 2, reusedFrameDeltaCount: 0 });
+    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
+    expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'exact' } });
+
+    rejectAcceptedIdentity = false;
+    source.publish({ rows: [{ id: 4, value: 'recovered' }] });
+    // The cohorts accepted different prior frames, so recovery also computes
+    // two distinct deltas rather than reusing an invalid transition.
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 4, reusedFrameDeltaCount: 0 });
+    for (const observer of [first, second]) expect(observer.getSnapshot()).toMatchObject({
+      state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], completeness: 'exact' }
+    });
     first.close();
     second.close();
     database.close();
@@ -582,7 +736,7 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
-  it('memoizes one transient cohort failure across sibling and late roots until a new frame', () => {
+  it('detaches projected getter values before maintaining sibling and late roots', () => {
     const source = new TestSource('source:cohort-transition-failure', [{ id: 2, value: 'initial' }]);
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(relationalAttachment('attachment:cohort-transition-failure', source));
@@ -602,19 +756,20 @@ describe('database membership and observation', () => {
     let valueReads = 0;
     const transientRow: Row = { id: 3, get value() {
       valueReads += 1;
-      if (valueReads === 2) throw new Error('transient transition failure');
-      return 'failed-frame';
+      return 'detached-frame';
     } };
     source.publish({ rows: [transientRow] });
     const late = database.observe({ plan: { ...relationalPlan(), planId: 'query:cohort-late', rootNodeId: 'query:cohort-late:root' } });
-    for (const observer of [failing, sibling, late]) {
-      expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
-    }
+    expect(valueReads).toBeGreaterThan(0);
+    expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'detached-frame' }], completeness: 'exact' } });
+    for (const observer of [sibling, late]) expect(observer.getSnapshot()).toMatchObject({
+      state: 'open', current: { rows: [{ id: 3, value: 'detached-frame' }], completeness: 'exact' }
+    });
 
     source.notify();
-    expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'failed-frame' }], completeness: 'exact' } });
-    expect(sibling.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'failed-frame' }], completeness: 'exact' } });
-    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'failed-frame' }], completeness: 'exact' } });
+    expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'detached-frame' }], completeness: 'exact' } });
+    expect(sibling.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'detached-frame' }], completeness: 'exact' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'detached-frame' }], completeness: 'exact' } });
 
     source.publish({ rows: [{ id: 2, value: 'initial' }] });
     expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'initial' }], completeness: 'exact' } });

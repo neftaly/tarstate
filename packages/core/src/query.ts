@@ -1220,6 +1220,7 @@ type PooledPhysicalNode = {
   readonly children: readonly QueryNode[];
   readonly externalDependencies: ReadonlySet<string>;
   readonly sessionEvidenceDependency: boolean;
+  orderIndex: number;
   references: number;
 };
 
@@ -1259,7 +1260,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
   const internedByNode = new Map<QueryNode, InternedPooledNode>();
   let nextInternedNodeId = 0;
   const physical = new Map<QueryNode, PooledPhysicalNode>();
-  let physicalOrder: QueryNode[] = [];
+  let physicalOrder: (QueryNode | undefined)[] = [];
+  let physicalOrderTombstones = 0;
+  let sharedPhysicalNodeCount = 0;
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
   const roots = new Set<PooledRootState>();
   let valueIdentities = new WeakMap<ScopedRow, string>();
@@ -1274,19 +1277,29 @@ export const createPooledIncrementalQueryRuntime = (input: {
   let diagnostics = pooledDiagnostics(environment.runtimeIdentity, 0, 0, 0, 0, 0, 0, 0, 0);
 
   const refreshDiagnostics = (updated: number, changed: number, collected: number): void => {
-    let shared = 0;
-    for (const node of physical.values()) if (node.references > 1) shared += 1;
     diagnostics = pooledDiagnostics(
       environment.runtimeIdentity,
       revision,
       roots.size,
       physical.size,
-      shared,
+      sharedPhysicalNodeCount,
       updated,
       changed,
       collected,
       rejectedUpdateCount
     );
+  };
+
+  const compactPhysicalOrderIfNeeded = (): void => {
+    if (physicalOrderTombstones < 64 || physicalOrderTombstones * 3 < physicalOrder.length) return;
+    const compacted: QueryNode[] = [];
+    for (const node of physicalOrder) {
+      if (node === undefined || !physical.has(node)) continue;
+      (physical.get(node) as PooledPhysicalNode).orderIndex = compacted.length;
+      compacted.push(node);
+    }
+    physicalOrder = compacted;
+    physicalOrderTombstones = 0;
   };
 
   const releaseNow = (root: PooledRootState): void => {
@@ -1297,15 +1310,20 @@ export const createPooledIncrementalQueryRuntime = (input: {
     for (const node of root.reachable) {
       const record = physical.get(node);
       if (record === undefined) continue;
+      if (record.references === 2) sharedPhysicalNodeCount -= 1;
       record.references -= 1;
       if (record.references !== 0) continue;
       physical.delete(node);
       materialized.delete(node);
       if (interned.get(record.key)?.node === node) interned.delete(record.key);
       internedByNode.delete(node);
+      if (physicalOrder[record.orderIndex] === node) {
+        physicalOrder[record.orderIndex] = undefined;
+        physicalOrderTombstones += 1;
+      }
       collected += 1;
     }
-    if (collected > 0) physicalOrder = physicalOrder.filter((node) => physical.has(node));
+    if (!closed) compactPhysicalOrderIfNeeded();
     refreshDiagnostics(0, 0, collected);
   };
 
@@ -1328,6 +1346,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
     internedByNode.clear();
     physical.clear();
     physicalOrder = [];
+    physicalOrderTombstones = 0;
+    sharedPhysicalNodeCount = 0;
     materialized.clear();
     refreshDiagnostics(0, 0, collected);
   };
@@ -1375,15 +1395,18 @@ export const createPooledIncrementalQueryRuntime = (input: {
       for (const node of graph.nodes) {
         const existing = physical.get(node);
         if (existing !== undefined) {
+          if (existing.references === 1) sharedPhysicalNodeCount += 1;
           existing.references += 1;
           continue;
         }
         const identity = internedByNode.get(node) as InternedPooledNode;
+        const orderIndex = physicalOrder.length;
         physical.set(node, {
           key: identity.key,
           children: graph.children.get(node) as readonly QueryNode[],
           externalDependencies: graph.externalDependencies.get(node) as ReadonlySet<string>,
           sessionEvidenceDependency: graph.sessionEvidenceDependencies.get(node) === true,
+          orderIndex,
           references: 1
         });
         physicalOrder.push(node);
@@ -1449,6 +1472,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
     const updatedNodes = new Set<QueryNode>();
     const changedNodes = new Set<QueryNode>();
     for (const node of physicalOrder) {
+      if (node === undefined) continue;
       const record = physical.get(node) as PooledPhysicalNode;
       const previousNode = materialized.get(node);
       const childChanged = record.children.some((child) => changedNodes.has(child));

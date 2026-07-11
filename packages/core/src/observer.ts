@@ -23,6 +23,7 @@ import {
   type PooledIncrementalQueryDiagnostics,
   type PooledIncrementalQueryRoot,
   type PooledIncrementalQueryRuntime,
+  type QueryMaintenanceUpdate,
   type QueryMaintenanceSnapshot,
   type QueryNode,
   type QueryRecord,
@@ -120,12 +121,18 @@ export type CreateDatabaseQueryMaintenance<Query, Row, Projection> = (input: {
 
 /** Frozen physical counters for one active shared query-maintenance cohort. */
 export type QueryMaintenanceDiagnostics = PooledIncrementalQueryDiagnostics;
+/** Frame-delta computations shared across parameter cohorts in this database view. */
+export type QueryMaintenanceReuseDiagnostics = {
+  readonly computedFrameDeltaCount: number;
+  readonly reusedFrameDeltaCount: number;
+};
 
 const incrementalMaintenanceFactoryBrand = Symbol('tarstate.incremental-maintenance-factory');
 const maintenanceRuntimeIdentity = Symbol('tarstate.maintenance-runtime');
 type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
   readonly [incrementalMaintenanceFactoryBrand]: {
     readonly getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
+    readonly getReuseDiagnostics: (runtimeIdentity: object) => QueryMaintenanceReuseDiagnostics;
   };
 };
 type InternalCreateDatabaseQueryMaintenanceInput<Query, Projection> = {
@@ -243,6 +250,21 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     const branded = (this.#createQueryMaintenance as Partial<IncrementalDatabaseQueryMaintenanceFactory>)[incrementalMaintenanceFactoryBrand];
     if (branded === undefined || typeof branded.getDiagnostics !== 'function') return [];
     return Object.freeze([...this.#datasetRuntimes.values()].flatMap((runtime) => branded.getDiagnostics(runtime.identity)));
+  }
+
+  getQueryMaintenanceReuseDiagnostics(): QueryMaintenanceReuseDiagnostics {
+    const branded = (this.#createQueryMaintenance as Partial<IncrementalDatabaseQueryMaintenanceFactory>)[incrementalMaintenanceFactoryBrand];
+    if (branded === undefined || typeof branded.getReuseDiagnostics !== 'function') {
+      return Object.freeze({ computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 });
+    }
+    let computedFrameDeltaCount = 0;
+    let reusedFrameDeltaCount = 0;
+    for (const runtime of this.#datasetRuntimes.values()) {
+      const diagnostics = branded.getReuseDiagnostics(runtime.identity);
+      computedFrameDeltaCount += diagnostics.computedFrameDeltaCount;
+      reusedFrameDeltaCount += diagnostics.reusedFrameDeltaCount;
+    }
+    return Object.freeze({ computedFrameDeltaCount, reusedFrameDeltaCount });
   }
 
   getDatabaseDescriptionSnapshot(): JsonValue | undefined {
@@ -504,7 +526,7 @@ class DatasetCaptureRuntime<Projection> {
 }
 
 const captureFrameMetadata = Symbol('tarstate.capture-frame');
-type CaptureFrameMetadata = { readonly frameIdentity: object; readonly parameterKey: string };
+type CaptureFrameMetadata = { readonly frameIdentity: object; readonly parameterKey: string; readonly runtimeIdentity: object };
 type InternalDatabaseQueryMaintenanceInput<Query, Projection> = DatabaseQueryMaintenanceInput<Query, Projection> & {
   readonly [captureFrameMetadata]: CaptureFrameMetadata;
 };
@@ -640,7 +662,11 @@ class SharedObservation<Query, Row, Projection> {
       parameters: this.#options.parameters,
       dataset: captured.dataset,
       attachments: captured.available,
-      [captureFrameMetadata]: Object.freeze({ frameIdentity: captured.identity, parameterKey: this.#parameterKey })
+      [captureFrameMetadata]: Object.freeze({
+        frameIdentity: captured.identity,
+        parameterKey: this.#parameterKey,
+        runtimeIdentity: this.#options.runtime.identity
+      })
     } as InternalDatabaseQueryMaintenanceInput<Query, Projection>;
   }
 
@@ -776,7 +802,8 @@ export const createIncrementalDatabaseQueryMaintenance = (
     value: Object.freeze({
       getDiagnostics: (runtimeIdentity: object) => Object.freeze(
         [...(scopes.get(runtimeIdentity)?.values() ?? [])].map(({ runtime }) => runtime.getDiagnostics())
-      )
+      ),
+      getReuseDiagnostics: (runtimeIdentity: object) => normalize.getReuseDiagnostics(runtimeIdentity)
     })
   });
   return factory;
@@ -847,16 +874,16 @@ const openPooledDatabaseMaintenance = (options: {
       }
       const updatingRoot = root ?? options.root;
       const rejectedBefore = options.cohort.runtime.getDiagnostics().rejectedUpdateCount;
-      let update: ReturnType<typeof diffQueryMaintenanceSnapshots>;
+      let delta: QueryMaintenanceSnapshotDiff;
       try {
-        update = diffQueryMaintenanceSnapshots(options.cohort.accepted, normalizedNext);
+        delta = options.normalize.diff(options.cohort.accepted, normalizedNext);
       } catch (error) {
         const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
         options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: false };
         return result;
       }
       try {
-        options.cohort.runtime.applyUpdate(update);
+        options.cohort.runtime.applyUpdate(delta.update);
       } catch (error) {
         const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
         options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: true };
@@ -864,6 +891,7 @@ const openPooledDatabaseMaintenance = (options: {
       }
       delete options.cohort.transitionFailure;
       if (options.cohort.runtime.getDiagnostics().rejectedUpdateCount === rejectedBefore) {
+        delta.accept();
         options.cohort.accepted = normalizedNext;
         delete options.cohort.lastRejected;
         localAccepted = normalizedNext;
@@ -945,16 +973,32 @@ const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: Que
   { relations: right.relations, parameters: right.parameters, basis: right.basis, membershipRevision: right.membershipRevision }
 );
 
-type QueryMaintenanceSnapshotNormalizer = (
-  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>
-) => QueryMaintenanceSnapshot;
+const queryMaintenanceFrameIdentity = Symbol('tarstate.query-maintenance-frame');
+type FramedQueryMaintenanceSnapshot = QueryMaintenanceSnapshot & {
+  readonly [queryMaintenanceFrameIdentity]: {
+    readonly frameIdentity: object;
+    readonly runtimeIdentity: object;
+  };
+};
+type QueryMaintenanceSnapshotDiff = {
+  readonly update: QueryMaintenanceUpdate;
+  /** Publishes a reusable delta only after its physical application was accepted. */
+  readonly accept: () => void;
+};
+type QueryMaintenanceSnapshotNormalizer = {
+  (input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>): QueryMaintenanceSnapshot;
+  readonly diff: (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot) => QueryMaintenanceSnapshotDiff;
+  readonly getReuseDiagnostics: (runtimeIdentity: object) => QueryMaintenanceReuseDiagnostics;
+};
 
 const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | undefined): QueryMaintenanceSnapshotNormalizer => {
   const frames = new WeakMap<object, {
     readonly normalized: Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'>;
     readonly parameters: Map<string, QueryMaintenanceSnapshot>;
   }>();
-  return (input) => {
+  const deltas = new WeakMap<object, WeakMap<object, QueryMaintenanceUpdate>>();
+  const reuseDiagnostics = new WeakMap<object, { computedFrameDeltaCount: number; reusedFrameDeltaCount: number }>();
+  const normalize = (input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>): QueryMaintenanceSnapshot => {
     const metadata = (input as Partial<InternalDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[captureFrameMetadata];
     if (metadata === undefined) return normalizeQueryMaintenanceSnapshot(input, functions);
     let frame = frames.get(metadata.frameIdentity);
@@ -964,15 +1008,62 @@ const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | 
     }
     const cached = frame.parameters.get(metadata.parameterKey);
     if (cached !== undefined) return cached;
-    const normalized: QueryMaintenanceSnapshot = {
+    const normalized: FramedQueryMaintenanceSnapshot = {
       ...frame.normalized,
       parameters: input.parameters,
-      ...(functions === undefined ? {} : { functions })
+      ...(functions === undefined ? {} : { functions }),
+      [queryMaintenanceFrameIdentity]: Object.freeze({
+        frameIdentity: metadata.frameIdentity,
+        runtimeIdentity: metadata.runtimeIdentity
+      })
     };
     frame.parameters.set(metadata.parameterKey, normalized);
     return normalized;
   };
+  normalize.diff = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): QueryMaintenanceSnapshotDiff => {
+    const previousMetadata = (previous as Partial<FramedQueryMaintenanceSnapshot>)[queryMaintenanceFrameIdentity];
+    const nextMetadata = (next as Partial<FramedQueryMaintenanceSnapshot>)[queryMaintenanceFrameIdentity];
+    if (previousMetadata === undefined || nextMetadata === undefined || previousMetadata.runtimeIdentity !== nextMetadata.runtimeIdentity) {
+      return { update: diffQueryMaintenanceSnapshots(previous, next), accept: () => undefined };
+    }
+    const { frameIdentity: previousFrame, runtimeIdentity } = previousMetadata;
+    const { frameIdentity: nextFrame } = nextMetadata;
+
+    // Parameters and capabilities remain cohort-local even though the captured
+    // relation frame is shared. Validate them before consulting the frame cache.
+    diffQueryMaintenanceSnapshots({ ...previous, relations: [] }, { ...next, relations: [] });
+    const prior = deltas.get(previousFrame)?.get(nextFrame);
+    if (prior !== undefined) {
+      const diagnostics = reuseDiagnostics.get(runtimeIdentity) ?? { computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 };
+      diagnostics.reusedFrameDeltaCount += 1;
+      reuseDiagnostics.set(runtimeIdentity, diagnostics);
+      return { update: prior, accept: () => undefined };
+    }
+
+    const update = freezeQueryMaintenanceUpdate(diffQueryMaintenanceSnapshots(previous, next));
+    const diagnostics = reuseDiagnostics.get(runtimeIdentity) ?? { computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 };
+    diagnostics.computedFrameDeltaCount += 1;
+    reuseDiagnostics.set(runtimeIdentity, diagnostics);
+    return {
+      update,
+      accept: () => {
+        let from = deltas.get(previousFrame);
+        if (from === undefined) {
+          from = new WeakMap();
+          deltas.set(previousFrame, from);
+        }
+        if (!from.has(nextFrame)) from.set(nextFrame, update);
+      }
+    };
+  };
+  normalize.getReuseDiagnostics = (runtimeIdentity: object) => Object.freeze({
+    computedFrameDeltaCount: reuseDiagnostics.get(runtimeIdentity)?.computedFrameDeltaCount ?? 0,
+    reusedFrameDeltaCount: reuseDiagnostics.get(runtimeIdentity)?.reusedFrameDeltaCount ?? 0
+  });
+  return normalize;
 };
+
+const freezeQueryMaintenanceUpdate = (update: QueryMaintenanceUpdate): QueryMaintenanceUpdate => deepFreezeClone(update);
 
 const normalizeQueryMaintenanceSnapshot = (
   input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,

@@ -252,7 +252,7 @@ for (const rootCount of [10, 50, 100]) {
   runtime.close();
 }
 
-for (const residentRootCount of [10, 50, 100]) {
+for (const residentRootCount of [100, 1_000]) {
   const initial = { relations: [input('item', linearRows(10))] };
   const runtime = createPooledIncrementalQueryRuntime({ environment: pooledEnvironment('churn-' + residentRootCount), initialSnapshot: initial });
   const residents = Array.from({ length: residentRootCount }, (_, index) => runtime.attach(plan('resident-' + index, {
@@ -297,6 +297,30 @@ const { profile } = await post(allocationSession, 'HeapProfiler.stopSampling');
 allocationSession.disconnect();
 const sampledAllocationBytes = profile.samples.reduce((sum, sample) => sum + sample.size, 0);
 
+const pooledAllocationFirst = { relations: [input('item', linearRows(1_000))] };
+const pooledAllocationSecond = { relations: [input('item', linearRows(1_000, true))] };
+const pooledAllocationRuntime = createPooledIncrementalQueryRuntime({
+  environment: pooledEnvironment('allocation-pooled-fanout-100'), initialSnapshot: pooledAllocationFirst
+});
+const pooledAllocationRoots = Array.from({ length: 100 }, (_, index) => pooledAllocationRuntime.attach(plan('allocation-pooled-' + index, {
+  kind: 'select', alias: 'allocation-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
+})));
+const pooledAllocationForward = diffQueryMaintenanceSnapshots(pooledAllocationFirst, pooledAllocationSecond);
+const pooledAllocationBackward = diffQueryMaintenanceSnapshots(pooledAllocationSecond, pooledAllocationFirst);
+const pooledAllocationSession = new inspector.Session();
+pooledAllocationSession.connect();
+await post(pooledAllocationSession, 'HeapProfiler.enable');
+await post(pooledAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+for (let index = 0; index < 100; index += 1) {
+  pooledAllocationRuntime.applyUpdate(index % 2 === 0 ? pooledAllocationForward : pooledAllocationBackward);
+  consumedRows += pooledAllocationRoots[0].getCurrentResult().rows.length;
+}
+const { profile: pooledAllocationProfile } = await post(pooledAllocationSession, 'HeapProfiler.stopSampling');
+pooledAllocationSession.disconnect();
+for (const root of pooledAllocationRoots) root.close();
+pooledAllocationRuntime.close();
+const pooledSampledAllocationBytes = pooledAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+
 process.stdout.write(JSON.stringify({
   benchmark: 'tarstate-query-scaling',
   note: 'Diagnostic evidence only; timings are not release thresholds.',
@@ -306,6 +330,11 @@ process.stdout.write(JSON.stringify({
     workload: '100 snapshot diffs plus one-row updates over a 1,000-row linear query',
     sampledBytes: sampledAllocationBytes,
     sampledBytesPerUpdate: Math.round(sampledAllocationBytes / 100)
+  },
+  pooledAllocationSample: {
+    workload: '100 one-row updates over 100 pooled roots and 1,000 input rows',
+    sampledBytes: pooledSampledAllocationBytes,
+    sampledBytesPerUpdate: Math.round(pooledSampledAllocationBytes / 100)
   },
   node: process.version,
   consumedRows

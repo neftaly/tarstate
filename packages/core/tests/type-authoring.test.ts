@@ -1,6 +1,6 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
-import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics } from '../src/index.js';
+import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
 import { pipe } from '../src/query-builder.js';
 import {
   customScalar,
@@ -262,6 +262,10 @@ describe('literal-schema and query type authoring', () => {
     type MaintenanceInput = Parameters<CreateDatabaseQueryMaintenance<unknown, Readonly<Record<string, unknown>>, unknown>>[0];
     expectTypeOf<keyof MaintenanceInput>().toEqualTypeOf<'plan' | 'initialInput'>();
     expectTypeOf<QueryMaintenanceDiagnostics['strategy']>().toEqualTypeOf<'pooled-differential-operator-dag'>();
+    expectTypeOf<QueryMaintenanceReuseDiagnostics>().toEqualTypeOf<{
+      readonly computedFrameDeltaCount: number;
+      readonly reusedFrameDeltaCount: number;
+    }>();
   });
 
   it('does not infer write authority from readable row shape', () => {

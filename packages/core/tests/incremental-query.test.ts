@@ -520,6 +520,69 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
+  it('maintains shared-node diagnostics through arbitrary reference transitions', () => {
+    const query = (): QueryNode => ({
+      kind: 'where', input: from('people', 'p'),
+      predicate: { kind: 'compare', op: 'gte', left: field('p', 'id'), right: { kind: 'literal', value: 1 } }
+    });
+    const initial = snapshot(basePeople, 1);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/reference-transitions', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const roots = Array.from({ length: 4 }, () => runtime.attach(plan(query())));
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 4, physicalNodeCount: 2, sharedPhysicalNodeCount: 2 });
+
+    roots[2]?.close();
+    roots[0]?.close();
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 2, physicalNodeCount: 2, sharedPhysicalNodeCount: 2 });
+    roots[3]?.close();
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 1, physicalNodeCount: 2, sharedPhysicalNodeCount: 0 });
+    roots[1]?.close();
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, sharedPhysicalNodeCount: 0 });
+    runtime.close();
+  });
+
+  it('updates correctly after thousands of unique-suffix collections and order compactions', () => {
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    const prefix = (): QueryNode => ({
+      kind: 'where', input: from('people', 'p'),
+      predicate: { kind: 'compare', op: 'gte', left: field('p', 'id'), right: { kind: 'literal', value: 1 } }
+    });
+    const suffix = (marker: number): QueryNode => ({
+      kind: 'select', input: prefix(), alias: 'result',
+      fields: { id: field('p', 'id'), marker: { kind: 'literal', value: marker } }
+    });
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/order-compaction', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const residentQueries = Array.from({ length: 8 }, (_, index) => suffix(index));
+    const residents = residentQueries.map((query, index) => runtime.attach({ ...plan(query), planId: 'resident:' + index, rootNodeId: 'resident:' + index + ':root' }));
+
+    for (let index = 0; index < 2_500; index += 1) {
+      const query = suffix(10_000 + index);
+      const root = runtime.attach({ ...plan(query), planId: 'churn:' + index, rootNodeId: 'churn:' + index + ':root' });
+      root.close();
+    }
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 8, physicalNodeCount: 10, sharedPhysicalNodeCount: 2 });
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+    residentQueries.forEach((query, index) => {
+      expect(semanticResult(residents[index]!.getCurrentResult()), 'resident ' + index).toEqual(oracle(query, next));
+    });
+    for (const index of [3, 0, 7, 2, 5, 1, 6, 4]) residents[index]?.close();
+    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, sharedPhysicalNodeCount: 0 });
+    runtime.close();
+  });
+
   it('shares a join prefix across projection and aggregate roots through insert, update, and delete', () => {
     const joinedPeople = (): QueryNode => ({
       kind: 'join',
