@@ -260,7 +260,7 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<IsAny<RuntimeQueryParameters>>().toEqualTypeOf<false>();
     expectTypeOf<IsAny<RuntimeQueryResultRow>>().toEqualTypeOf<false>();
     type MaintenanceInput = Parameters<CreateDatabaseQueryMaintenance<unknown, Readonly<Record<string, unknown>>, unknown>>[0];
-    expectTypeOf<{}>().toMatchTypeOf<Pick<MaintenanceInput, 'runtimeIdentity'>>();
+    expectTypeOf<keyof MaintenanceInput>().toEqualTypeOf<'plan' | 'initialInput'>();
     expectTypeOf<QueryMaintenanceDiagnostics['strategy']>().toEqualTypeOf<'pooled-differential-operator-dag'>();
   });
 

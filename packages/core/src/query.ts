@@ -1237,6 +1237,11 @@ type PooledRootState = {
   closed: boolean;
 };
 
+type PooledUpdateJournal = {
+  readonly materialized: Map<QueryNode, MaterializedQueryNode | undefined>;
+  readonly roots: Map<PooledRootState, { readonly current: IncrementalQueryResult; readonly asserted: MaterializedQueryNode | undefined }>;
+};
+
 /** Creates an explicitly scoped multi-root physical runtime. */
 export const createPooledIncrementalQueryRuntime = (input: {
   readonly environment: PooledIncrementalQueryEnvironment;
@@ -1257,7 +1262,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
   let physicalOrder: QueryNode[] = [];
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
   const roots = new Set<PooledRootState>();
-  const valueIdentities = new WeakMap<ScopedRow, string>();
+  let valueIdentities = new WeakMap<ScopedRow, string>();
   let acceptedSnapshot = input.initialSnapshot;
   let runtimeIssues = validateMaintenanceSnapshot(input.initialSnapshot);
   let revision = 0;
@@ -1416,7 +1421,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
     }
   };
 
-  const applyUpdateNow = (update: QueryMaintenanceUpdate): void => {
+  const applyUpdateNow = (update: QueryMaintenanceUpdate, journal: PooledUpdateJournal): void => {
     if (closed) throw new Error('Pooled incremental query runtime is closed');
     revision += 1;
     const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
@@ -1424,6 +1429,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
       rejectedUpdateCount += 1;
       runtimeIssues = applied.issues;
       for (const root of roots) {
+        if (!journal.roots.has(root)) journal.roots.set(root, { current: root.current, asserted: root.asserted });
         root.current = maintainedQueryResult(
           undefined,
           runtimeIssues,
@@ -1459,6 +1465,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
         : isLocallyMaintainedNode(node)
           ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
           : materializeQueryNode(node, nextSnapshot, materialized);
+      if (!journal.materialized.has(node)) journal.materialized.set(node, previousNode);
       materialized.set(node, nextNode);
       updatedNodes.add(node);
       if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
@@ -1473,7 +1480,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
         if (updatedNodes.has(node)) updated += 1;
         if (changedNodes.has(node)) changed += 1;
       }
-      root.current = maintainedQueryResult(
+      const nextCurrent = maintainedQueryResult(
         nextRoot,
         [],
         maintenanceState(
@@ -1486,6 +1493,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
           rejectedUpdateCount
         )
       );
+      if (!journal.roots.has(root)) journal.roots.set(root, { current: root.current, asserted: root.asserted });
+      root.current = nextCurrent;
       root.asserted = nextRoot;
     }
     refreshDiagnostics(updatedNodes.size, changedNodes.size, 0);
@@ -1495,9 +1504,35 @@ export const createPooledIncrementalQueryRuntime = (input: {
     if (closed) throw new Error('Pooled incremental query runtime is closed');
     if (executionPhase === 'updating') throw new Error('Recursive pooled query updates are not supported');
     if (executionPhase === 'attaching') throw new Error('Cannot update a pooled query runtime during root attachment');
+    const checkpoint = {
+      acceptedSnapshot,
+      runtimeIssues,
+      revision,
+      rejectedUpdateCount,
+      diagnostics
+    };
+    const journal: PooledUpdateJournal = { materialized: new Map(), roots: new Map() };
     executionPhase = 'updating';
     try {
-      applyUpdateNow(update);
+      applyUpdateNow(update, journal);
+    } catch (error) {
+      acceptedSnapshot = checkpoint.acceptedSnapshot;
+      runtimeIssues = checkpoint.runtimeIssues;
+      revision = checkpoint.revision;
+      rejectedUpdateCount = checkpoint.rejectedUpdateCount;
+      diagnostics = checkpoint.diagnostics;
+      for (const [node, value] of journal.materialized) {
+        if (value === undefined) materialized.delete(node);
+        else materialized.set(node, value);
+      }
+      for (const [root, state] of journal.roots) {
+        root.current = state.current;
+        root.asserted = state.asserted;
+      }
+      // Identity entries computed from an aborted graph may refer to values
+      // that were never accepted. Rebuild them lazily from restored nodes.
+      valueIdentities = new WeakMap();
+      throw error;
     } finally {
       executionPhase = 'idle';
       flushDeferredLifecycle();

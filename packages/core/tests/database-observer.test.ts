@@ -35,6 +35,10 @@ class TestSource {
   #rows: readonly Row[];
   #subscriptionCount = 0;
   #snapshotCount = 0;
+  #unsubscribeCount = 0;
+  #subscriptionFailures = 0;
+  #unsubscribeFailures = 0;
+  #snapshotFailures = 0;
 
   constructor(sourceId: string, rows: readonly Row[]) {
     this.sourceId = sourceId;
@@ -44,6 +48,10 @@ class TestSource {
 
   snapshot(): SourceSnapshot<{ readonly rows: readonly Row[] }> {
     this.#snapshotCount += 1;
+    if (this.#snapshotFailures > 0) {
+      this.#snapshotFailures -= 1;
+      throw new Error('snapshot failed');
+    }
     return {
       sourceId: this.sourceId,
       operationEpoch: 'epoch:one',
@@ -56,9 +64,20 @@ class TestSource {
   }
 
   subscribe(listener: () => void): () => void {
+    if (this.#subscriptionFailures > 0) {
+      this.#subscriptionFailures -= 1;
+      throw new Error('subscription failed');
+    }
     this.#subscriptionCount += 1;
     this.#listeners.add(listener);
-    return () => { this.#listeners.delete(listener); };
+    return () => {
+      this.#unsubscribeCount += 1;
+      if (this.#unsubscribeFailures > 0) {
+        this.#unsubscribeFailures -= 1;
+        throw new Error('unsubscribe failed');
+      }
+      this.#listeners.delete(listener);
+    };
   }
 
   publish(options: { readonly rows?: readonly Row[]; readonly state?: SourceSnapshot<unknown>['state']; readonly freshness?: SourceSnapshot<unknown>['freshness'] }): void {
@@ -76,6 +95,10 @@ class TestSource {
   listenerCount(): number { return this.#listeners.size; }
   subscriptionCount(): number { return this.#subscriptionCount; }
   snapshotCount(): number { return this.#snapshotCount; }
+  unsubscribeCount(): number { return this.#unsubscribeCount; }
+  failSubscriptions(count = 1): void { this.#subscriptionFailures = count; }
+  failUnsubscribes(count = 1): void { this.#unsubscribeFailures = count; }
+  failSnapshots(count = 1): void { this.#snapshotFailures = count; }
 }
 
 const attachment = (attachmentId: string, source: TestSource, authorityScope = 'public'): DatabaseAttachmentInput<{ readonly rows: readonly Row[] }, readonly Row[]> => ({
@@ -210,6 +233,47 @@ describe('database membership and observation', () => {
     });
     expect(builtInSession.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
     builtInSession.close();
+  });
+
+  it('rolls back a partially constructed dataset capture runtime', () => {
+    const firstSource = new TestSource('source:subscription-first', []);
+    const failingSource = new TestSource('source:subscription-failing', []);
+    failingSource.failSubscriptions();
+    const catalog = new AttachmentCatalog();
+    const firstLease = catalog.attach(attachment('attachment:a-first', firstSource));
+    const failingLease = catalog.attach(attachment('attachment:b-failing', failingSource));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled',
+      members: [member('attachment:a-first', firstSource.sourceId), member('attachment:b-failing', failingSource.sourceId)]
+    });
+    const database = view(catalog, [dataset]);
+
+    expect(() => database.observe({ plan: plan() })).toThrow('subscription failed');
+    expect(firstSource.listenerCount()).toBe(0);
+    expect(database.getActiveMaintenanceCount()).toBe(0);
+    database.close();
+    failingLease.close();
+    firstLease.close();
+  });
+
+  it('closes maintenance and capture ownership when observation construction fails', () => {
+    const source = new TestSource('source:construction-failure', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:construction-failure', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:construction-failure', source.sourceId)] });
+    const close = vi.fn();
+    const database = new DatabaseView<Query, Row, readonly Row[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: () => ({ getCurrentResult: () => { throw new Error('current failed'); }, updateInput: evaluate, close })
+    });
+
+    expect(() => database.observe({ plan: plan() })).toThrow('current failed');
+    expect(close).toHaveBeenCalledOnce();
+    expect(source.listenerCount()).toBe(0);
+    expect(database.getActiveMaintenanceCount()).toBe(0);
+    database.close();
+    attachmentLease.close();
   });
 
   it('rejects duplicate attachment IDs whose authority view or projection differs', () => {
@@ -411,6 +475,49 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
+  it('keeps first-cohort bookkeeping stable when observation reenters during attachment', () => {
+    const source = new TestSource('source:reentrant-first-attach', [{ id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:reentrant-first-attach', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:reentrant-first-attach', source.sourceId)] });
+    const callable = { id: 'urn:test:observe-during-first-attach', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    let database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>;
+    let late: QueryObserver<QueryRecord> | undefined;
+    let openLate = true;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      if (openLate) {
+        openLate = false;
+        late = database.observe({ plan: { ...relationalPlan(), planId: 'query:first-attach-late', rootNodeId: 'query:first-attach-late:root' } });
+      }
+      return args[0] ?? null;
+    }]]);
+    database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
+    });
+    const active = database.observe({
+      plan: {
+        ...relationalPlan(), planId: 'query:first-attach-active', rootNodeId: 'query:first-attach-active:root',
+        query: {
+          kind: 'select', input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' }, alias: 'result',
+          fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
+        }
+      }
+    });
+
+    expect(late?.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({ activeRootCount: 1 })]);
+    source.publish({ rows: [{ id: 2, value: 'two' }] });
+    expect(active.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'two' }] } });
+    expect(late?.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+    late?.close();
+    active.close();
+    database.close();
+    attachmentLease.close();
+  });
+
   it('reuses one normalized frame across conservative full-parameter cohorts', () => {
     const source = new TestSource('source:parameter-frames', [{ id: 2, value: 'two' }]);
     const catalog = new AttachmentCatalog();
@@ -471,6 +578,56 @@ describe('database membership and observation', () => {
     expect(database.getActiveMaintenanceCount()).toBe(0);
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([]);
     expect(source.listenerCount()).toBe(0);
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('memoizes one transient cohort failure across sibling and late roots until a new frame', () => {
+    const source = new TestSource('source:cohort-transition-failure', [{ id: 2, value: 'initial' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:cohort-transition-failure', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:cohort-transition-failure', source.sourceId)] });
+    const failingQuery: QueryNode = {
+      kind: 'select', input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' }, alias: 'result',
+      fields: { value: { kind: 'field', alias: 'row', name: 'value' } }
+    };
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const failing = database.observe({ plan: { ...relationalPlan(), planId: 'query:cohort-failing', rootNodeId: 'query:cohort-failing:root', query: failingQuery } });
+    const sibling = database.observe({ plan: { ...relationalPlan(), planId: 'query:cohort-sibling', rootNodeId: 'query:cohort-sibling:root' } });
+
+    let valueReads = 0;
+    const transientRow: Row = { id: 3, get value() {
+      valueReads += 1;
+      if (valueReads === 2) throw new Error('transient transition failure');
+      return 'failed-frame';
+    } };
+    source.publish({ rows: [transientRow] });
+    const late = database.observe({ plan: { ...relationalPlan(), planId: 'query:cohort-late', rootNodeId: 'query:cohort-late:root' } });
+    for (const observer of [failing, sibling, late]) {
+      expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
+    }
+
+    source.notify();
+    expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'failed-frame' }], completeness: 'exact' } });
+    expect(sibling.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'failed-frame' }], completeness: 'exact' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'failed-frame' }], completeness: 'exact' } });
+
+    source.publish({ rows: [{ id: 2, value: 'initial' }] });
+    expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'initial' }], completeness: 'exact' } });
+    expect(sibling.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'initial' }], completeness: 'exact' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'initial' }], completeness: 'exact' } });
+
+    source.publish({ rows: [{ id: 4, value: 'recovered-frame' }] });
+    expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'recovered-frame' }], completeness: 'exact' } });
+    expect(sibling.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 4, value: 'recovered-frame' }], completeness: 'exact' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 4, value: 'recovered-frame' }], completeness: 'exact' } });
+    failing.close();
+    sibling.close();
+    late.close();
     database.close();
     attachmentLease.close();
   });
@@ -578,7 +735,7 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
-  it('falls back to a private session when an initial input diverges within one cohort', () => {
+  it('keeps direct factory sessions private without database capture metadata', () => {
     const source = new TestSource('source:divergent', [{ id: 2, value: 'two' }]);
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(relationalAttachment('attachment:divergent', source));
@@ -599,29 +756,32 @@ describe('database membership and observation', () => {
       }]
     });
     const factory = createIncrementalDatabaseQueryMaintenance();
-    const runtimeIdentity = {};
-    const first = factory({ plan: relationalPlan(), initialInput: input({ id: 2, value: 'two' }), runtimeIdentity });
+    const first = factory({ plan: relationalPlan(), initialInput: input({ id: 2, value: 'two' }) });
     const second = factory({
       plan: { ...relationalPlan(), planId: 'query:divergent', rootNodeId: 'query:divergent:root' },
-      initialInput: input({ id: 9, value: 'private' }),
-      runtimeIdentity
+      initialInput: input({ id: 9, value: 'private' })
     });
 
     expect(first.getCurrentResult().rows).toEqual([{ id: 2, value: 'two' }]);
     expect(second.getCurrentResult().rows).toEqual([{ id: 9, value: 'private' }]);
+    expect(() => first.updateInput({ ...input({ id: 2, value: 'two' }), parameters: { changed: true } })).toThrow('parameters and functions are fixed');
+    const hostile = { id: 2 } as Row;
+    Object.defineProperty(hostile, 'value', { enumerable: true, get: () => { throw new Error('next row failed'); } });
+    expect(() => first.updateInput(input(hostile))).toThrow('next row failed');
+    expect(first.updateInput(input({ id: 2, value: 'two' })).rows).toEqual([{ id: 2, value: 'two' }]);
     second.close();
     first.close();
     attachmentLease.close();
   });
 
-  it('recovers every pooled production root when rejected input returns to the accepted snapshot', () => {
+  it('isolates and recovers malformed direct factory input', () => {
     const original: Row = { id: 2, value: 'accepted' };
     const acceptedRows: Row[] = [original];
     const source = new TestSource('source:rejected-recovery', acceptedRows);
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(relationalAttachment('attachment:rejected-recovery', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:rejected-recovery', source.sourceId)] });
-    const input = (rows: readonly Row[]): DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]> => ({
+    const input = (rows: readonly Row[], occurrenceIds: readonly string[] = ['row:stable']): DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]> => ({
       query: relationalPlan().query,
       parameters: {},
       dataset: dataset.snapshot(),
@@ -631,35 +791,22 @@ describe('database membership and observation', () => {
         snapshot: source.snapshot(),
         projection: [{
           relation: { schemaView: querySchemaView, relationId: 'test.rows' },
-          rows, occurrenceIds: ['row:stable'], completeness: 'exact',
+          rows, occurrenceIds, completeness: 'exact',
           sourceId: source.sourceId, attachmentId: 'attachment:rejected-recovery', basis: source.snapshot().basis
         }]
       }]
     });
     const factory = createIncrementalDatabaseQueryMaintenance();
-    const runtimeIdentity = {};
-    const first = factory({ plan: relationalPlan(), initialInput: input(acceptedRows), runtimeIdentity });
+    const first = factory({ plan: relationalPlan(), initialInput: input(acceptedRows, []) });
     const second = factory({
       plan: { ...relationalPlan(), planId: 'query:recovery-second', rootNodeId: 'query:recovery-second:root' },
-      initialInput: input(acceptedRows), runtimeIdentity
+      initialInput: input(acceptedRows)
     });
-    const malformedRows: Row[] = [];
-    let malformedReadCount = 0;
-    Object.defineProperty(malformedRows, 0, {
-      enumerable: true,
-      get: () => {
-        // Mutating the previously accepted proof between diff construction and
-        // validation simulates an adversarial stale/malformed source delta.
-        malformedReadCount += 1;
-        if (malformedReadCount > 1) acceptedRows[0] = { id: 99, value: 'stale-proof' };
-        return { id: 3, value: 'malformed' };
-      }
-    });
+    expect(first.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
+    expect(second.getCurrentResult()).toMatchObject({ rows: [original], completeness: 'exact' });
 
-    expect(first.updateInput(input(malformedRows))).toMatchObject({ completeness: 'unknown' });
-    expect(second.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
-
-    acceptedRows[0] = original;
+    expect(() => first.updateInput({ ...input(acceptedRows), parameters: { changed: true } })).toThrow('parameters and functions are fixed');
+    expect(first.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
     expect(first.updateInput(input(acceptedRows))).toMatchObject({ rows: [original], completeness: 'exact' });
     expect(second.getCurrentResult()).toMatchObject({ rows: [original], completeness: 'exact' });
     first.close();
@@ -667,7 +814,7 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
-  it('recovers a pooled root opened while the cohort input is malformed', () => {
+  it('recovers a malformed late private root with fixed session parameters', () => {
     const accepted = [{ id: 2, value: 'accepted' }];
     const source = new TestSource('source:late-rejected', accepted);
     const catalog = new AttachmentCatalog();
@@ -691,6 +838,34 @@ describe('database membership and observation', () => {
     expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: accepted, completeness: 'exact' } });
     first.close();
     late.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('keeps an initially malformed frame private so it can recover', () => {
+    const source = new TestSource('source:initially-malformed', [
+      { id: 9, value: 'duplicate-a' },
+      { id: 9, value: 'duplicate-b' }
+    ]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:initially-malformed', source));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled', members: [member('attachment:initially-malformed', source.sourceId)]
+    });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const observer = database.observe({ plan: relationalPlan() });
+
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
+    expect(database.getQueryMaintenanceDiagnostics()).toEqual([]);
+    source.publish({ rows: [{ id: 2, value: 'recovered' }] });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      rows: [{ id: 2, value: 'recovered' }], completeness: 'exact'
+    } });
+    observer.close();
     database.close();
     attachmentLease.close();
   });
@@ -813,6 +988,198 @@ describe('database membership and observation', () => {
     firstLease.close();
   });
 
+  it('turns one optional projection failure into evidence without starving healthy attachments', () => {
+    const healthySource = new TestSource('source:healthy-projection', [{ id: 1, value: 'healthy' }]);
+    const failingSource = new TestSource('source:failing-projection', [{ id: 2, value: 'bad' }]);
+    const catalog = new AttachmentCatalog();
+    const healthyLease = catalog.attach(attachment('attachment:healthy-projection', healthySource));
+    const failingInput = attachment('attachment:failing-projection', failingSource);
+    const failingLease = catalog.attach({
+      ...failingInput,
+      preparation: prepareManualReadOnlyAttachment({
+        schemaViewIds: ['schema:rows'],
+        project: () => { throw new Error('projection failed'); }
+      })
+    });
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled',
+      members: [member('attachment:failing-projection', failingSource.sourceId, 'optional'), member('attachment:healthy-projection', healthySource.sourceId)]
+    });
+    const database = view(catalog, [dataset]);
+    const observer = database.observe({ plan: plan() });
+
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      rows: [{ id: 1, value: 'healthy' }], completeness: 'exact',
+      sourceStates: expect.arrayContaining([expect.objectContaining({ attachmentId: 'attachment:failing-projection', state: 'failed' })]),
+      issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.evaluation_failed', details: expect.objectContaining({ reason: 'attachment_projection_failed' }) })])
+    } });
+    observer.close();
+    database.close();
+    failingLease.close();
+    healthyLease.close();
+  });
+
+  it('retains an unexpected frame failure for observers opened before recovery', () => {
+    const source = new TestSource('source:frame-failure', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    let malformed = false;
+    const attachmentLease = catalog.attach({
+      ...attachment('attachment:frame-failure', source),
+      preparation: prepareManualReadOnlyAttachment({
+        schemaViewIds: ['schema:rows'],
+        project: (snapshot: SourceSnapshot<{ readonly rows: readonly Row[] }>) => {
+          if (malformed) {
+            return Object.defineProperty({}, 'state', { enumerable: true, get: () => { throw new Error('frame failed'); } }) as never;
+          }
+          return snapshot.storage === undefined
+            ? { state: snapshot.state === 'ready' ? 'failed' as const : snapshot.state, issues: [] }
+            : { state: 'ready' as const, value: snapshot.storage.rows, issues: [] };
+        }
+      })
+    });
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:frame-failure', source.sourceId)] });
+    const database = view(catalog, [dataset]);
+    const first = database.observe({ plan: plan() });
+
+    malformed = true;
+    source.notify();
+    const late = database.observe({ plan: { ...plan(), planId: 'query:frame-failure-late', rootNodeId: 'query:frame-failure-late:root' } });
+    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
+
+    malformed = false;
+    source.publish({ rows: [{ id: 2, value: 'recovered' }] });
+    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'recovered' }], completeness: 'exact' } });
+    expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'recovered' }], completeness: 'exact' } });
+    first.close();
+    late.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('does not publish a coalesced recovery superseded by the same frame failure', () => {
+    const source = new TestSource('source:coalesced-frame-failure', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    let malformed = false;
+    let failDuringRecovery = false;
+    const attachmentLease = catalog.attach({
+      ...attachment('attachment:coalesced-frame-failure', source),
+      preparation: prepareManualReadOnlyAttachment({
+        schemaViewIds: ['schema:rows'],
+        project: (snapshot: SourceSnapshot<{ readonly rows: readonly Row[] }>) => malformed
+          ? Object.defineProperty({}, 'state', { enumerable: true, get: () => { throw new Error('frame failed'); } }) as never
+          : snapshot.storage === undefined
+            ? { state: snapshot.state === 'ready' ? 'failed' as const : snapshot.state, issues: [] }
+            : { state: 'ready' as const, value: snapshot.storage.rows, issues: [] }
+      })
+    });
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:coalesced-frame-failure', source.sourceId)] });
+    const database = view(catalog, [dataset], 'public', 'authority:public', (input) => {
+      const result = evaluate(input);
+      if (failDuringRecovery) {
+        failDuringRecovery = false;
+        malformed = true;
+        source.notify();
+      }
+      return result;
+    });
+    const observer = database.observe({ plan: plan() });
+    malformed = true;
+    source.notify();
+    const changes: ObserverChange<Row>[] = [];
+    observer.subscribe((change) => { changes.push(change); });
+
+    malformed = false;
+    failDuringRecovery = true;
+    source.publish({ rows: [{ id: 2, value: 'unpublished-recovery' }] });
+
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
+    expect(changes.every(({ snapshot }) => snapshot.state === 'open' && snapshot.current.completeness === 'unknown')).toBe(true);
+    malformed = false;
+    source.publish({ rows: [{ id: 3, value: 'recovered' }] });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'recovered' }], completeness: 'exact' } });
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('contains authority failures during topology refresh and recovers on the next topology change', () => {
+    const source = new TestSource('source:topology-authority', [{ id: 1, value: 'one' }]);
+    const unrelated = new TestSource('source:topology-authority-unrelated', []);
+    const catalog = new AttachmentCatalog();
+    const sourceLease = catalog.attach(attachment('attachment:topology-authority', source));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled', members: [member('attachment:topology-authority', source.sourceId)]
+    });
+    let authorityFails = false;
+    const database = new DatabaseView<Query, Row, readonly Row[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset],
+      canRead: () => {
+        if (authorityFails) throw new Error('authority unavailable');
+        return true;
+      },
+      createQueryMaintenance: createMaintenance(evaluate)
+    });
+    const observer = database.observe({ plan: plan() });
+
+    authorityFails = true;
+    const unrelatedLease = catalog.attach(attachment('attachment:topology-authority-unrelated', unrelated));
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      rows: [], completeness: 'unknown',
+      issues: expect.arrayContaining([expect.objectContaining({
+        code: 'observer.evaluation_failed', details: expect.objectContaining({ reason: 'authority_check_failed' })
+      })])
+    } });
+
+    authorityFails = false;
+    unrelatedLease.close();
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      rows: [{ id: 1, value: 'one' }], completeness: 'exact'
+    } });
+    observer.close();
+    database.close();
+    sourceLease.close();
+  });
+
+  it('isolates a malformed custom maintenance result from sibling roots', () => {
+    const source = new TestSource('source:custom-stage-failure', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:custom-stage-failure', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:custom-stage-failure', source.sourceId)] });
+    const factory: CreateDatabaseQueryMaintenance<Query, Row, readonly Row[]> = ({ plan: prepared, initialInput }) => {
+      let current = evaluate(initialInput);
+      return {
+        getCurrentResult: () => current,
+        updateInput: (input) => {
+          if (prepared.planId === 'query:broken') {
+            current = {
+              get rows(): readonly Row[] { throw new Error('rows failed'); },
+              resultKeys: [], completeness: 'exact', issues: []
+            };
+          } else current = evaluate(input);
+          return current;
+        },
+        close: () => undefined
+      };
+    };
+    const database = new DatabaseView<Query, Row, readonly Row[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
+    });
+    const broken = database.observe({ plan: { ...plan(), planId: 'query:broken', rootNodeId: 'query:broken:root' } });
+    const healthy = database.observe({ plan: { ...plan(), planId: 'query:healthy', rootNodeId: 'query:healthy:root' } });
+
+    source.publish({ rows: [{ id: 2, value: 'two' }] });
+
+    expect(broken.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown', issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.evaluation_failed' })]) } });
+    expect(healthy.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }], completeness: 'exact' } });
+    broken.close();
+    healthy.close();
+    database.close();
+    attachmentLease.close();
+  });
+
   it('does not subscribe to or leak a required source denied by this authority view', () => {
     const privateSource = new TestSource('source:private', [{ id: 7, value: 'secret' }]);
     const catalog = new AttachmentCatalog();
@@ -893,6 +1260,26 @@ describe('database membership and observation', () => {
     expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
 
     second.close();
+    expect(source.listenerCount()).toBe(0);
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('retains a failed topology unsubscribe for final cleanup retry', () => {
+    const source = new TestSource('source:unsubscribe-retry', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:unsubscribe-retry', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:unsubscribe-retry', source.sourceId)] });
+    const database = view(catalog, [dataset]);
+    const observer = database.observe({ plan: plan() });
+    source.failUnsubscribes();
+
+    dataset.replaceMembers([], 'settled');
+    expect(source.listenerCount()).toBe(1);
+    expect(source.unsubscribeCount()).toBe(1);
+
+    observer.close();
+    expect(source.unsubscribeCount()).toBe(2);
     expect(source.listenerCount()).toBe(0);
     database.close();
     attachmentLease.close();

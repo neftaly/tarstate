@@ -14,6 +14,7 @@ import {
   type QueryRecord,
   type RelationInput
 } from '../src/index.js';
+import { createPooledIncrementalQueryRuntime, type PooledIncrementalQueryRoot } from '../src/query.js';
 
 const configuredRuns = Number.parseInt(process.env.TARSTATE_FUZZ_RUNS ?? '64', 10);
 const runs = Number.isSafeInteger(configuredRuns) && configuredRuns > 0 ? configuredRuns : 64;
@@ -157,6 +158,156 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         accepted = next;
       }
       session.close();
+    }
+  });
+
+  it('keeps pooled multi-root lifecycle and rejection recovery oracle-equivalent', () => {
+    const stateRandom = seededRandom(initialSeed ^ 0x51A7_EF01);
+    const stateInteger = (limit: number): number => Math.floor(stateRandom() * limit);
+    const stateRuns = Math.min(runs, 48);
+    const stateSteps = 24;
+    const fromRows = (): QueryNode => ({ kind: 'from', relation, alias: 'row' });
+    const field = (name: string) => ({ kind: 'field', alias: 'row', name } as const);
+    const sharedPrefix = (): QueryNode => ({
+      kind: 'where',
+      input: fromRows(),
+      predicate: { kind: 'compare', op: 'gte', left: field('score'), right: { kind: 'literal', value: 0 } }
+    });
+    const queryVariant = (variant: number): QueryNode => {
+      if (variant === 0) return {
+        kind: 'select', input: sharedPrefix(), alias: 'result',
+        fields: { id: field('id'), value: field('value') }
+      };
+      if (variant === 1) return {
+        kind: 'aggregate', input: sharedPrefix(), alias: 'summary', groupBy: {},
+        measures: {
+          count: { kind: 'aggregate', op: 'count' },
+          total: { kind: 'aggregate', op: 'sum', value: field('score') }
+        }
+      };
+      return { kind: 'order', input: sharedPrefix(), by: [{ value: field('score'), direction: 'desc' }] };
+    };
+    type LiveRoot = { readonly root: PooledIncrementalQueryRoot; readonly query: QueryNode; readonly variant: number };
+
+    for (let run = 0; run < stateRuns; run += 1) {
+      let revision = 0;
+      let nextId = 3;
+      let rows: FuzzRow[] = Array.from({ length: 3 }, (_, id) => ({
+        occurrenceId: 'pooled:' + id,
+        row: { id, value: 'value:' + id, score: stateInteger(100) }
+      }));
+      const snapshot = (items: readonly FuzzRow[] = rows, basis = revision): QueryMaintenanceSnapshot => ({
+        relations: [{
+          relation,
+          rows: items.map(({ row }) => row),
+          occurrenceIds: items.map(({ occurrenceId }) => occurrenceId),
+          completeness: 'exact',
+          sourceId: 'source:pooled',
+          attachmentId: 'attachment:pooled',
+          basis
+        }],
+        basis: { revision: basis },
+        membershipRevision: 0
+      });
+      let accepted = snapshot();
+      const runtime = createPooledIncrementalQueryRuntime({
+        environment: { runtimeIdentity: 'fuzz:pool:' + run, registryFingerprint: 'registry', authorityFingerprint: 'authority', datasetId: 'dataset' },
+        initialSnapshot: accepted
+      });
+      const live: LiveRoot[] = [];
+      const attach = (variant = stateInteger(3)): void => {
+        const rootQuery = queryVariant(variant);
+        live.push({
+          root: runtime.attach({ ...plan, planId: 'pooled:' + run + ':' + live.length + ':' + variant, rootNodeId: 'pooled:root', query: rootQuery }),
+          query: rootQuery,
+          variant
+        });
+      };
+      const assertState = (label: string): void => {
+        for (const candidate of live) {
+          expect(withoutState(candidate.root.getCurrentResult()), label).toEqual(evaluateQuery({
+            root: candidate.query,
+            relations: accepted.relations,
+            ...(accepted.basis === undefined ? {} : { basis: accepted.basis }),
+            ...(accepted.membershipRevision === undefined ? {} : { membershipRevision: accepted.membershipRevision })
+          }));
+        }
+        const diagnostics = runtime.getDiagnostics();
+        expect(diagnostics.activeRootCount, label).toBe(live.length);
+        expect(diagnostics.sharedPhysicalNodeCount, label).toBeLessThanOrEqual(diagnostics.physicalNodeCount);
+        if (live.length === 0) expect(diagnostics.physicalNodeCount, label).toBe(0);
+        else expect(diagnostics.physicalNodeCount, label).toBeGreaterThan(0);
+        if (live.length > 1) expect(diagnostics.sharedPhysicalNodeCount, label).toBeGreaterThanOrEqual(2);
+      };
+      const applyRows = (nextRows: FuzzRow[]): void => {
+        revision += 1;
+        const next = snapshot(nextRows, revision);
+        runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+        rows = nextRows;
+        accepted = next;
+      };
+
+      attach(run % 3);
+      assertState('pool run ' + run + ', initial');
+      for (let step = 0; step < stateSteps; step += 1) {
+        const action = stateInteger(6);
+        if (action === 0) {
+          const nextRows = rows.map((item) => ({ ...item, row: { ...item.row } }));
+          const mutation = stateInteger(4);
+          if (mutation === 0 && nextRows.length > 0) {
+            const index = stateInteger(nextRows.length);
+            const current = nextRows[index] as FuzzRow;
+            nextRows[index] = { ...current, row: { ...current.row, value: 'changed:' + stateInteger(1_000), score: stateInteger(1_000) } };
+          } else if (mutation === 1) {
+            const id = nextId++;
+            nextRows.push({ occurrenceId: 'pooled:' + id, row: { id, value: 'inserted:' + id, score: stateInteger(1_000) } });
+          } else if (mutation === 2 && nextRows.length > 1) nextRows.splice(stateInteger(nextRows.length), 1);
+          else if (nextRows.length > 1) {
+            const first = stateInteger(nextRows.length);
+            const second = stateInteger(nextRows.length);
+            [nextRows[first], nextRows[second]] = [nextRows[second] as FuzzRow, nextRows[first] as FuzzRow];
+          }
+          applyRows(nextRows);
+        } else if (action === 1) attach();
+        else if (action === 2 && live.length > 1) {
+          const index = stateInteger(live.length);
+          const [removed] = live.splice(index, 1);
+          removed?.root.close();
+        } else if (action === 3) {
+          const recoveryRows = rows.map((item) => ({ ...item, row: { ...item.row } }));
+          const index = recoveryRows.length === 0 ? -1 : stateInteger(recoveryRows.length);
+          if (index >= 0) {
+            const current = recoveryRows[index] as FuzzRow;
+            recoveryRows[index] = { ...current, row: { ...current.row, score: stateInteger(1_000) } };
+          } else {
+            const id = nextId++;
+            recoveryRows.push({ occurrenceId: 'pooled:' + id, row: { id, value: 'recovery:' + id, score: stateInteger(1_000) } });
+          }
+          const recovery = snapshot(recoveryRows, revision + 1);
+          const valid = diffQueryMaintenanceSnapshots(accepted, recovery);
+          const changed = valid.relations[0];
+          expect(changed, 'malformed update requires one relation change').toBeDefined();
+          runtime.applyUpdate({
+            ...valid,
+            relations: [{
+              ...(changed as NonNullable<typeof changed>),
+              rows: [{ occurrenceId: 'pooled:missing', after: { index: 0, row: { id: -1, value: 'malformed', score: -1 } } }]
+            }]
+          });
+          for (const candidate of live) expect(candidate.root.getCurrentResult()).toMatchObject({ rows: [], completeness: 'unknown' });
+          expect(runtime.getDiagnostics().activeRootCount).toBe(live.length);
+          runtime.applyUpdate(valid);
+          revision += 1;
+          rows = recoveryRows;
+          accepted = recovery;
+        } else {
+          runtime.applyUpdate(diffQueryMaintenanceSnapshots(accepted, accepted));
+        }
+        assertState('pool run ' + run + ', step ' + step + ', action ' + action);
+      }
+      while (live.length > 0) live.splice(stateInteger(live.length), 1)[0]?.root.close();
+      expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, sharedPhysicalNodeCount: 0 });
+      runtime.close();
     }
   });
 

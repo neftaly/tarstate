@@ -116,18 +116,22 @@ export interface DatabaseQueryMaintenanceSession<Query, Row, Projection> {
 export type CreateDatabaseQueryMaintenance<Query, Row, Projection> = (input: {
   readonly plan: PreparedPlan<Query>;
   readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
-  /** Opaque identity shared by observations of one captured dataset stream. Custom factories may ignore it. */
-  readonly runtimeIdentity?: object;
 }) => DatabaseQueryMaintenanceSession<Query, Row, Projection>;
 
 /** Frozen physical counters for one active shared query-maintenance cohort. */
 export type QueryMaintenanceDiagnostics = PooledIncrementalQueryDiagnostics;
 
 const incrementalMaintenanceFactoryBrand = Symbol('tarstate.incremental-maintenance-factory');
+const maintenanceRuntimeIdentity = Symbol('tarstate.maintenance-runtime');
 type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
   readonly [incrementalMaintenanceFactoryBrand]: {
     readonly getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
   };
+};
+type InternalCreateDatabaseQueryMaintenanceInput<Query, Projection> = {
+  readonly plan: PreparedPlan<Query>;
+  readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
+  readonly [maintenanceRuntimeIdentity]: object;
 };
 
 export type DatabaseViewOptions<Query, Row, Projection> = {
@@ -212,16 +216,21 @@ export class DatabaseView<Query, Row, Projection = unknown> {
         });
         this.#datasetRuntimes.set(dataset.datasetId, runtime);
       }
-      shared = new SharedObservation({
-        plan: request.plan,
-        parameters,
-        allowPartial: request.allowPartial === true,
-        runtime,
-        createQueryMaintenance: this.#createQueryMaintenance,
-        collect: () => {
-          if (this.#cache.get(key) === shared) this.#cache.delete(key);
-        }
-      });
+      try {
+        shared = new SharedObservation({
+          plan: request.plan,
+          parameters,
+          allowPartial: request.allowPartial === true,
+          runtime,
+          createQueryMaintenance: this.#createQueryMaintenance,
+          collect: () => {
+            if (this.#cache.get(key) === shared) this.#cache.delete(key);
+          }
+        });
+      } catch (error) {
+        runtime.closeIfUnused();
+        throw error;
+      }
       this.#cache.set(key, shared);
     }
     return shared.acquire();
@@ -264,6 +273,7 @@ type CapturedMember<Projection> = {
   readonly projection?: AttachmentProjection<Projection>;
   readonly authorized: boolean;
   readonly sourceMismatch?: boolean;
+  readonly captureIssues?: readonly Issue[];
 };
 
 type EvaluationSnapshot<Projection> = {
@@ -273,8 +283,13 @@ type EvaluationSnapshot<Projection> = {
   readonly available: readonly AvailableQueryAttachment<Projection>[];
 };
 
+type DatasetCaptureState<Projection> =
+  | { readonly state: 'captured'; readonly captured: EvaluationSnapshot<Projection> }
+  | { readonly state: 'failed'; readonly captured: EvaluationSnapshot<Projection>; readonly error: unknown };
+
 type DatasetCaptureConsumer<Projection> = {
   readonly stage: (captured: EvaluationSnapshot<Projection>) => void;
+  readonly stageFailure: (captured: EvaluationSnapshot<Projection>, error: unknown) => void;
   readonly preparePublish: () => void;
   readonly publish: () => void;
 };
@@ -291,10 +306,10 @@ type DatasetCaptureRuntimeOptions = {
 class DatasetCaptureRuntime<Projection> {
   readonly #options: DatasetCaptureRuntimeOptions;
   readonly #consumers = new Set<DatasetCaptureConsumer<Projection>>();
-  readonly #unsubscribeDataset: () => void;
-  readonly #unsubscribeCatalog: () => void;
+  #unsubscribeDataset: () => void = () => undefined;
+  #unsubscribeCatalog: () => void = () => undefined;
   readonly #sourceUnsubscribes = new Map<object, () => void>();
-  #snapshot: EvaluationSnapshot<Projection>;
+  #state!: DatasetCaptureState<Projection>;
   #refreshing = false;
   #pending = false;
   #topologyPending = false;
@@ -304,13 +319,19 @@ class DatasetCaptureRuntime<Projection> {
   constructor(options: DatasetCaptureRuntimeOptions) {
     this.#options = options;
     const refreshTopology = () => this.#requestRefresh(true);
-    this.#unsubscribeDataset = options.dataset.subscribe(refreshTopology);
-    this.#unsubscribeCatalog = options.attachments.subscribe(refreshTopology);
-    this.#refreshSourceSubscriptions();
-    this.#snapshot = this.#capture();
+    try {
+      this.#unsubscribeDataset = options.dataset.subscribe(refreshTopology);
+      this.#unsubscribeCatalog = options.attachments.subscribe(refreshTopology);
+      this.#refreshSourceSubscriptions();
+      this.#state = Object.freeze({ state: 'captured', captured: this.#capture() });
+    } catch (error) {
+      this.#closed = true;
+      this.#cleanupSubscriptions();
+      throw error;
+    }
   }
 
-  snapshot(): EvaluationSnapshot<Projection> { return this.#snapshot; }
+  state(): DatasetCaptureState<Projection> { return this.#state; }
   get identity(): object { return this.#identity; }
 
   add(consumer: DatasetCaptureConsumer<Projection>): void {
@@ -323,15 +344,14 @@ class DatasetCaptureRuntime<Projection> {
     if (this.#consumers.size === 0) this.close();
   }
 
+  closeIfUnused(): void {
+    if (this.#consumers.size === 0) this.close();
+  }
+
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    try { this.#unsubscribeDataset(); } catch { /* lifecycle cleanup is best effort */ }
-    try { this.#unsubscribeCatalog(); } catch { /* lifecycle cleanup is best effort */ }
-    for (const unsubscribe of this.#sourceUnsubscribes.values()) {
-      try { unsubscribe(); } catch { /* one source cannot prevent runtime cleanup */ }
-    }
-    this.#sourceUnsubscribes.clear();
+    this.#cleanupSubscriptions();
     this.#consumers.clear();
     this.#options.collect();
   }
@@ -345,15 +365,32 @@ class DatasetCaptureRuntime<Projection> {
     try {
       while (this.#pending && !this.#closed) {
         this.#pending = false;
-        if (this.#topologyPending) {
-          this.#topologyPending = false;
-          this.#refreshSourceSubscriptions();
+        let captured: EvaluationSnapshot<Projection>;
+        try {
+          if (this.#topologyPending) {
+            this.#topologyPending = false;
+            this.#refreshSourceSubscriptions();
+          }
+          captured = this.#capture();
+        } catch (error) {
+          this.#state = Object.freeze({ state: 'failed', captured: this.#state.captured, error });
+          const consumers = Array.from(this.#consumers);
+          for (const consumer of consumers) {
+            if (!this.#consumers.has(consumer)) continue;
+            try { consumer.stageFailure(this.#state.captured, error); } catch { /* one failed consumer cannot starve peers */ }
+          }
+          if (this.#pending) continue;
+          for (const consumer of consumers) if (this.#consumers.has(consumer)) consumer.preparePublish();
+          for (const consumer of consumers) if (this.#consumers.has(consumer)) consumer.publish();
+          continue;
         }
-        const captured = this.#capture();
-        this.#snapshot = captured;
+        this.#state = Object.freeze({ state: 'captured', captured });
         const consumers = Array.from(this.#consumers);
         for (const consumer of consumers) {
-          if (this.#consumers.has(consumer)) consumer.stage(captured);
+          if (!this.#consumers.has(consumer)) continue;
+          try { consumer.stage(captured); } catch (error) {
+            try { consumer.stageFailure(captured, error); } catch { /* one failed consumer cannot starve peers */ }
+          }
         }
         // A nested input change supersedes this staged pass before consumers
         // are notified. Their maintenance sessions can safely accept both
@@ -377,13 +414,19 @@ class DatasetCaptureRuntime<Projection> {
       const attachment = this.#options.attachments.get(member.attachmentId);
       if (attachment === undefined || desired.has(attachment.source)) continue;
       if (attachment.sourceId !== member.sourceId) continue;
-      if (!this.#options.canRead(this.#options.authorityScope, attachment.authorityScope, attachment.attachmentId)) continue;
+      let authorized = false;
+      try {
+        authorized = this.#options.canRead(this.#options.authorityScope, attachment.authorityScope, attachment.attachmentId);
+      } catch { /* capture records authority failures as member evidence */ }
+      if (!authorized) continue;
       desired.set(attachment.source, attachment.source);
     }
     for (const [source, unsubscribe] of this.#sourceUnsubscribes) {
       if (desired.has(source)) continue;
-      try { unsubscribe(); } catch { /* topology refresh continues for other sources */ }
-      this.#sourceUnsubscribes.delete(source);
+      try {
+        unsubscribe();
+        this.#sourceUnsubscribes.delete(source);
+      } catch { /* retain the handle so final cleanup can retry */ }
     }
     for (const [source, observable] of desired) {
       if (this.#sourceUnsubscribes.has(source)) continue;
@@ -393,20 +436,38 @@ class DatasetCaptureRuntime<Projection> {
 
   #capture(): EvaluationSnapshot<Projection> {
     const dataset = this.#options.dataset.snapshot();
-    const snapshots = new Map<object, SourceSnapshot<unknown>>();
+    const snapshots = new Map<object, { readonly snapshot: SourceSnapshot<unknown> } | { readonly error: unknown }>();
     const members = dataset.members.map((member): CapturedMember<Projection> => {
       const raw = this.#options.attachments.get(member.attachmentId);
       if (raw === undefined) return { member, authorized: true };
       if (raw.sourceId !== member.sourceId) return { member, authorized: true, sourceMismatch: true };
-      const authorized = this.#options.canRead(this.#options.authorityScope, raw.authorityScope, raw.attachmentId);
+      let authorized: boolean;
+      try {
+        authorized = this.#options.canRead(this.#options.authorityScope, raw.authorityScope, raw.attachmentId);
+      } catch (error) {
+        return { member, authorized: false, captureIssues: [captureFailureIssue('authority_check_failed', member, error)] };
+      }
       if (!authorized) return { member, authorized: false };
       const attachment = raw as DatabaseAttachment<unknown, Projection>;
-      let snapshot = snapshots.get(attachment.source);
-      if (snapshot === undefined) {
-        snapshot = attachment.source.snapshot() as SourceSnapshot<unknown>;
-        snapshots.set(attachment.source, snapshot);
+      let capturedSource = snapshots.get(attachment.source);
+      if (capturedSource === undefined) {
+        try {
+          capturedSource = { snapshot: attachment.source.snapshot() as SourceSnapshot<unknown> };
+        } catch (error) {
+          capturedSource = { error };
+        }
+        snapshots.set(attachment.source, capturedSource);
       }
-      const projection = snapshot.state === 'ready' ? attachment.project(snapshot) : undefined;
+      if ('error' in capturedSource) return { member, attachment, authorized: true, captureIssues: [captureFailureIssue('source_snapshot_failed', member, capturedSource.error)] };
+      const snapshot = capturedSource.snapshot;
+      let projection: AttachmentProjection<Projection> | undefined;
+      if (snapshot.state === 'ready') {
+        try {
+          projection = attachment.project(snapshot);
+        } catch (error) {
+          projection = { state: 'failed', issues: [captureFailureIssue('attachment_projection_failed', member, error)] };
+        }
+      }
       return {
         member,
         attachment,
@@ -431,6 +492,15 @@ class DatasetCaptureRuntime<Projection> {
       available: Object.freeze(available)
     });
   }
+
+  #cleanupSubscriptions(): void {
+    try { this.#unsubscribeDataset(); } catch { /* lifecycle cleanup is best effort */ }
+    try { this.#unsubscribeCatalog(); } catch { /* lifecycle cleanup is best effort */ }
+    for (const unsubscribe of this.#sourceUnsubscribes.values()) {
+      try { unsubscribe(); } catch { /* final retry is best effort */ }
+    }
+    this.#sourceUnsubscribes.clear();
+  }
 }
 
 const captureFrameMetadata = Symbol('tarstate.capture-frame');
@@ -452,8 +522,8 @@ class SharedObservation<Query, Row, Projection> {
   readonly #options: SharedOptions<Query, Row, Projection>;
   readonly #leases = new Set<ObserverLease<Row>>();
   #session: DatabaseQueryMaintenanceSession<Query, Row, Projection> | undefined;
-  #snapshot: ObserverSnapshot<Row>;
-  #publishedSnapshot: ObserverSnapshot<Row>;
+  #snapshot!: ObserverSnapshot<Row>;
+  #publishedSnapshot!: ObserverSnapshot<Row>;
   #stagedChange: ObserverChange<Row> | undefined;
   readonly #parameterKey: string;
   #closed = false;
@@ -461,16 +531,32 @@ class SharedObservation<Query, Row, Projection> {
   constructor(options: SharedOptions<Query, Row, Projection>) {
     this.#options = options;
     this.#parameterKey = canonicalizeJson(options.parameters as JsonValue);
-    const captured = options.runtime.snapshot();
-    this.#session = this.#openMaintenance(captured);
-    this.#snapshot = this.#observerSnapshot(this.#result(this.#session.getCurrentResult(), captured), undefined);
-    this.#publishedSnapshot = this.#snapshot;
-    options.runtime.add(this);
-    const latest = options.runtime.snapshot();
-    if (latest !== captured) {
-      this.stage(latest);
+    const capturedState = options.runtime.state();
+    const captured = capturedState.captured;
+    const session = this.#openMaintenance(captured);
+    this.#session = session;
+    let added = false;
+    try {
+      const initial = capturedState.state === 'captured'
+        ? session.getCurrentResult()
+        : failedEvaluation(capturedState.error) as MaintainedDatabaseQueryResult<Row>;
+      this.#snapshot = this.#observerSnapshot(this.#result(initial, captured), undefined);
       this.#publishedSnapshot = this.#snapshot;
-      this.#stagedChange = undefined;
+      options.runtime.add(this);
+      added = true;
+      const latest = options.runtime.state();
+      if (latest !== capturedState) {
+        if (latest.state === 'captured') this.stage(latest.captured);
+        else this.stageFailure(latest.captured, latest.error);
+        this.#publishedSnapshot = this.#snapshot;
+        this.#stagedChange = undefined;
+      }
+    } catch (error) {
+      this.#closed = true;
+      this.#session = undefined;
+      try { session.close(); } catch { /* construction failure still releases ownership */ }
+      if (added) options.runtime.remove(this);
+      throw error;
     }
   }
 
@@ -508,6 +594,17 @@ class SharedObservation<Query, Row, Projection> {
     const session = this.#session;
     if (session === undefined) return;
     const maintained = this.#updateMaintenance(session, captured);
+    if (this.#closed) return;
+    this.#stageMaintained(captured, maintained);
+  }
+
+  stageFailure(captured: EvaluationSnapshot<Projection>, error: unknown): void {
+    this.#stagedChange = undefined;
+    if (this.#closed) return;
+    this.#stageMaintained(captured, failedEvaluation(error) as MaintainedDatabaseQueryResult<Row>);
+  }
+
+  #stageMaintained(captured: EvaluationSnapshot<Projection>, maintained: MaintainedDatabaseQueryResult<Row>): void {
     const current = this.#result(maintained, captured);
     const previousSnapshot = this.#snapshot;
     if (previousSnapshot.state !== 'open') return;
@@ -552,8 +649,8 @@ class SharedObservation<Query, Row, Projection> {
       return this.#options.createQueryMaintenance({
         plan: this.#options.plan,
         initialInput: this.#maintenanceInput(captured),
-        runtimeIdentity: this.#options.runtime.identity
-      });
+        [maintenanceRuntimeIdentity]: this.#options.runtime.identity
+      } as InternalCreateDatabaseQueryMaintenanceInput<Query, Projection>);
     } catch (error) {
       return failedMaintenanceSession<Query, Row, Projection>(error);
     }
@@ -616,7 +713,9 @@ export const createIncrementalDatabaseQueryMaintenance = (
   const scopes = new WeakMap<object, Map<string, PooledDatabaseMaintenanceCohort>>();
   const normalize = createQueryMaintenanceSnapshotNormalizer(functions);
   let nextCohortIdentity = 0;
-  const factory = (({ plan, initialInput, runtimeIdentity }) => {
+  const factory = ((input) => {
+    const { plan, initialInput } = input;
+    const runtimeIdentity = (input as Partial<InternalCreateDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[maintenanceRuntimeIdentity];
     const initial = normalize(initialInput);
     if (runtimeIdentity === undefined) return openPrivateDatabaseMaintenance(plan, initial, normalize);
     let cohorts = scopes.get(runtimeIdentity);
@@ -628,7 +727,10 @@ export const createIncrementalDatabaseQueryMaintenance = (
     let cohort = cohorts.get(key);
     const attachesToRejected = cohort?.lastRejected !== undefined
       && sameQueryMaintenanceSnapshot(cohort.lastRejected, initial);
-    if (cohort !== undefined && !sameQueryMaintenanceSnapshot(cohort.accepted, initial) && !attachesToRejected) {
+    const attachesToFailed = cohort?.transitionFailure !== undefined
+      && cohort.transitionFailure.attachable
+      && cohort.transitionFailure.snapshot === initial;
+    if (cohort !== undefined && !sameQueryMaintenanceSnapshot(cohort.accepted, initial) && !attachesToRejected && !attachesToFailed) {
       return openPrivateDatabaseMaintenance(plan, initial, normalize);
     }
     if (cohort === undefined) {
@@ -643,13 +745,20 @@ export const createIncrementalDatabaseQueryMaintenance = (
         },
         initialSnapshot: initial
       });
+      cohort = { key, runtime, accepted: initial, roots: 0 };
+      cohorts.set(key, cohort);
       try {
         const root = runtime.attach(plan);
-        cohort = { key, runtime, accepted: initial, roots: 1 };
-        cohorts.set(key, cohort);
+        if (hasInvalidIncrementalInput(root.getCurrentResult())) {
+          runtime.close();
+          if (cohorts.get(key) === cohort) cohorts.delete(key);
+          return openPrivateDatabaseMaintenance(plan, initial, normalize);
+        }
+        cohort.roots += 1;
         return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts, normalize });
       } catch (error) {
         runtime.close();
+        if (cohorts.get(key) === cohort) cohorts.delete(key);
         if (!isNonPoolableQueryError(error)) throw error;
         return openPrivateDatabaseMaintenance(plan, initial, normalize);
       }
@@ -657,7 +766,7 @@ export const createIncrementalDatabaseQueryMaintenance = (
     try {
       const root = cohort.runtime.attach(plan);
       cohort.roots += 1;
-      return openPooledDatabaseMaintenance({ plan, initial: attachesToRejected ? cohort.accepted : initial, root, cohort, cohorts, normalize });
+      return openPooledDatabaseMaintenance({ plan, initial: attachesToRejected || attachesToFailed ? cohort.accepted : initial, root, cohort, cohorts, normalize });
     } catch (error) {
       if (!isNonPoolableQueryError(error) && !isPooledQueryRuntimeBusyError(error)) throw error;
       return openPrivateDatabaseMaintenance(plan, initial, normalize);
@@ -678,6 +787,11 @@ type PooledDatabaseMaintenanceCohort = {
   readonly runtime: PooledIncrementalQueryRuntime;
   accepted: QueryMaintenanceSnapshot;
   lastRejected?: QueryMaintenanceSnapshot;
+  transitionFailure?: {
+    readonly snapshot: QueryMaintenanceSnapshot;
+    readonly result: MaintainedDatabaseQueryResult<QueryRecord>;
+    readonly attachable: boolean;
+  };
   roots: number;
 };
 
@@ -706,11 +820,18 @@ const openPooledDatabaseMaintenance = (options: {
 
   return {
     getCurrentResult: () => privateSession === undefined
-      ? databaseResultFromMaintained((root ?? options.root).getCurrentResult())
+      ? options.cohort.transitionFailure?.result ?? databaseResultFromMaintained((root ?? options.root).getCurrentResult())
       : privateSession.getCurrentResult(),
     updateInput: (input) => {
       const normalizedNext = options.normalize(input);
       if (privateSession !== undefined) return privateSession.updateInput(input);
+      if (options.cohort.transitionFailure !== undefined && normalizedNext === options.cohort.transitionFailure.snapshot) {
+        return options.cohort.transitionFailure.result;
+      }
+      // A new capture frame is a fresh transition attempt. In particular, a
+      // source may return directly to the already accepted frame without
+      // invoking the physical runtime again.
+      delete options.cohort.transitionFailure;
       const returnsToAccepted = sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.accepted);
       if (returnsToAccepted && options.cohort.lastRejected === undefined) {
         localAccepted = normalizedNext;
@@ -726,7 +847,22 @@ const openPooledDatabaseMaintenance = (options: {
       }
       const updatingRoot = root ?? options.root;
       const rejectedBefore = options.cohort.runtime.getDiagnostics().rejectedUpdateCount;
-      options.cohort.runtime.applyUpdate(diffQueryMaintenanceSnapshots(options.cohort.accepted, normalizedNext));
+      let update: ReturnType<typeof diffQueryMaintenanceSnapshots>;
+      try {
+        update = diffQueryMaintenanceSnapshots(options.cohort.accepted, normalizedNext);
+      } catch (error) {
+        const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
+        options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: false };
+        return result;
+      }
+      try {
+        options.cohort.runtime.applyUpdate(update);
+      } catch (error) {
+        const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
+        options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: true };
+        return result;
+      }
+      delete options.cohort.transitionFailure;
       if (options.cohort.runtime.getDiagnostics().rejectedUpdateCount === rejectedBefore) {
         options.cohort.accepted = normalizedNext;
         delete options.cohort.lastRejected;
@@ -759,7 +895,20 @@ const openPrivateDatabaseMaintenance = (
       let update: ReturnType<typeof diffQueryMaintenanceSnapshots>;
       try {
         update = diffQueryMaintenanceSnapshots(accepted, next);
-      } catch {
+      } catch (error) {
+        // Verify the fixed session environment without traversing relation
+        // rows; malformed accepted occurrence identity is classified from the
+        // incremental session's validation evidence below.
+        try {
+          diffQueryMaintenanceSnapshots(
+            { ...accepted, relations: [] },
+            { ...next, relations: [] }
+          );
+        } catch {
+          throw error;
+        }
+        const acceptedIsInvalid = hasInvalidIncrementalInput(session.getCurrentResult());
+        if (!acceptedIsInvalid) throw error;
         // An invalid initial snapshot can make an exact delta impossible to
         // construct. Rebase the private fallback so a later valid source
         // snapshot can recover instead of remaining pinned to malformed input.
@@ -776,6 +925,10 @@ const openPrivateDatabaseMaintenance = (
     close: () => session.close()
   };
 };
+
+const hasInvalidIncrementalInput = (result: IncrementalQueryResult): boolean => result.issues.some(({ code }) =>
+  code === 'query.incremental_relation_ambiguous' || code === 'query.incremental_identity_invalid'
+);
 
 const pooledDatabaseCohortKey = (
   plan: PreparedPlan<QueryNode>,
@@ -916,6 +1069,9 @@ class ObserverLease<Row> implements QueryObserver<Row> {
 
 const sourceEvidence = <Projection>(candidate: CapturedMember<Projection>): SourceEvidence => {
   const { member } = candidate;
+  if (candidate.captureIssues !== undefined) {
+    return freezeEvidence({ ...member, state: 'failed', freshness: 'none', authorized: candidate.authorized, issues: candidate.captureIssues });
+  }
   if (!candidate.authorized) {
     const issue = observationIssue('observer.authority_denied', 'after_authority', { attachmentId: member.attachmentId });
     return freezeEvidence({ ...member, state: 'denied', freshness: 'none', authorized: false, issues: [issue] });
@@ -944,6 +1100,12 @@ const sourceEvidence = <Projection>(candidate: CapturedMember<Projection>): Sour
   }
   return freezeEvidence({ ...member, state: 'ready', freshness: candidate.snapshot.freshness, authorized: true, basis: candidate.snapshot.basis, issues: [...candidate.snapshot.issues, ...candidate.projection.issues] });
 };
+
+const captureFailureIssue = (reason: string, member: DatasetMember, error: unknown): Issue => observationIssue(
+  'observer.evaluation_failed',
+  'after_refresh',
+  { reason, attachmentId: member.attachmentId, error: error instanceof Error ? error.name : typeof error }
+);
 
 const observerChange = <Row>(previous: ObserverSnapshot<Row>, next: ObserverSnapshot<Row>): ObserverChange<Row> => {
   if (previous.state !== 'open' || next.state !== 'open') return Object.freeze({ kind: 'reset', snapshot: next });

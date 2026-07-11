@@ -710,6 +710,92 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
+  it('rolls back an update when materialization throws unexpectedly', () => {
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/update-materialization-rollback', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const query = operatorQueries.where as QueryNode;
+    const root = runtime.attach(plan(query));
+    const beforeResult = root.getCurrentResult();
+    const beforeDiagnostics = runtime.getDiagnostics();
+    const validUpdate = diffQueryMaintenanceSnapshots(initial, next);
+    const peopleChange = validUpdate.relations.find(({ relation }) => relation.relationId === 'people') as NonNullable<typeof validUpdate.relations[number]>;
+    const throwingRow: Record<string, unknown> = { id: 2, name: 'Bob', group: 'y', active: true, tags: ['reader'] };
+    Object.defineProperty(throwingRow, 'score', { enumerable: true, get: () => { throw new Error('materialization getter failed'); } });
+    const failingUpdate = {
+      ...validUpdate,
+      relations: validUpdate.relations.map((change) => change !== peopleChange ? change : {
+        ...change,
+        rows: change.rows.map((row) => row.occurrenceId !== 'person:b' || row.after === undefined
+          ? row
+          : { ...row, after: { ...row.after, row: throwingRow as QueryRecord } })
+      })
+    };
+
+    expect(() => runtime.applyUpdate(failingUpdate)).toThrow('materialization getter failed');
+    expect(root.getCurrentResult()).toBe(beforeResult);
+    expect(runtime.getDiagnostics()).toBe(beforeDiagnostics);
+
+    runtime.applyUpdate(validUpdate);
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, next));
+    expect(runtime.getDiagnostics()).toMatchObject({ revision: 1, rejectedUpdateCount: 0 });
+    root.close();
+    runtime.close();
+  });
+
+  it('rolls back accepted state and root assertions when result-delta calculation throws', () => {
+    let throwOnRead = false;
+    let victim: ReturnType<ReturnType<typeof createPooledIncrementalQueryRuntime>['attach']> | undefined;
+    const guardedRow: QueryRecord = { id: 1 };
+    Object.defineProperty(guardedRow, 'value', {
+      enumerable: true,
+      get: () => {
+        if (throwOnRead) {
+          victim?.close();
+          throw new Error('delta getter failed');
+        }
+        return 'one';
+      }
+    });
+    const initialPeople: readonly QueryRowOccurrence[] = [{ occurrenceId: 'person:guarded', row: guardedRow }];
+    const nextPeople: readonly QueryRowOccurrence[] = [
+      initialPeople[0] as QueryRowOccurrence,
+      { occurrenceId: 'person:second', row: { id: 2, value: 'two' } }
+    ];
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('people', initialPeople, 1)] };
+    const next: QueryMaintenanceSnapshot = { relations: [relation('people', nextPeople, 2)] };
+    const update = diffQueryMaintenanceSnapshots(initial, next);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/update-delta-rollback', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test'
+      },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(people));
+    victim = runtime.attach(plan({ kind: 'values', alias: 'victim', rows: [{ value: 'close-after-rollback' }] }));
+    const beforeResult = root.getCurrentResult();
+    const beforeRevision = runtime.getDiagnostics().revision;
+
+    throwOnRead = true;
+    expect(() => runtime.applyUpdate(update)).toThrow('delta getter failed');
+    throwOnRead = false;
+    expect(root.getCurrentResult()).toBe(beforeResult);
+    expect(runtime.getDiagnostics()).toMatchObject({ revision: beforeRevision, activeRootCount: 1, rejectedUpdateCount: 0 });
+
+    runtime.applyUpdate(update);
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(people, next));
+    expect(runtime.getDiagnostics()).toMatchObject({ revision: beforeRevision + 1, activeRootCount: 1 });
+    root.close();
+    runtime.close();
+  });
+
   it('defers root closure during updates and rejects recursive updates and attachment', () => {
     const callable = { id: 'urn:test:pooled-reentrant', version: '1', contractHash: `sha256:${'f'.repeat(64)}` } as const;
     const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
