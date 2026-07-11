@@ -104,6 +104,51 @@ describe('production Automerge adapter', () => {
     expect(runtime.queryOutcome({ operationEpoch: 'epoch:1', operationId: 'operation:1', intentHash: hash('c') })).toEqual({ status: 'ambiguous' });
   });
 
+  it('keeps snapshot identity stable and publishes each changed snapshot before notifying', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: taskBase() });
+    const initial = runtime.snapshot();
+    expect(runtime.snapshot()).toBe(initial);
+    expect([initial, initial.basis, initial.basis.heads].every(Object.isFrozen)).toBe(true);
+    expect(() => { (initial.basis.heads as string[]).push('mutated'); }).toThrow(TypeError);
+    expect(runtime.snapshot()).toBe(initial);
+    await runtime.commit({
+      operationEpoch: 'epoch:1', operationId: 'operation:noop', intentHash: hash('0'), expectedBasis: initial.basis, commands: []
+    });
+    expect(runtime.snapshot()).toBe(initial);
+    const redundant = Automerge.clone(initial.storage, { actor: actor('2') });
+    expect(runtime.merge(redundant)).toBe(initial);
+    const sameHeadsDifferentActor = Automerge.clone(initial.storage, { actor: actor('3') });
+    expect(Automerge.getActorId(sameHeadsDifferentActor)).not.toBe(Automerge.getActorId(initial.storage));
+    expect(runtime.replace(sameHeadsDifferentActor)).toBe(initial);
+    expect(Automerge.getActorId(runtime.snapshot().storage)).toBe(Automerge.getActorId(initial.storage));
+
+    let previous = initial;
+    const listener = vi.fn(() => {
+      const current = runtime.snapshot();
+      expect(current).not.toBe(previous);
+      expect(runtime.snapshot()).toBe(current);
+      previous = current;
+    });
+    runtime.subscribe(listener);
+    await runtime.commit({
+      operationEpoch: 'epoch:1', operationId: 'operation:change', intentHash: hash('1'), expectedBasis: initial.basis,
+      commands: [{ apply: (draft) => { draft.tasks.first!.title = 'Committed'; } }]
+    });
+
+    const beforeMerge = runtime.snapshot();
+    const beforeMergeActor = Automerge.getActorId(beforeMerge.storage);
+    const remote = Automerge.change(Automerge.clone(beforeMerge.storage, { actor: actor('2') }), { time: 0 }, (draft) => {
+      draft.tasks.second = { title: 'Merged' };
+    });
+    const merged = runtime.merge(remote);
+    expect(Automerge.getActorId(merged.storage)).toBe(beforeMergeActor);
+    expect(beforeMerge.storage.tasks.second).toBeUndefined();
+    expect(runtime.view(beforeMerge.basis).storage.tasks.second).toBeUndefined();
+    expect([merged, merged.basis, merged.basis.heads].every(Object.isFrozen)).toBe(true);
+    runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => { draft.metadata.schema = 'v2'; }));
+    expect(listener).toHaveBeenCalledTimes(3);
+  });
+
   it('rejects an exact stale basis without running commands and retains the outcome', async () => {
     const base = taskBase();
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: Automerge.change(base, (draft) => { draft.metadata.schema = 'v2'; }) });

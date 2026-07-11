@@ -58,10 +58,13 @@ type LedgerEntry = {
 };
 
 /** Captures the document's current exact-head basis. */
-export const automergeBasis = (doc: Automerge.Doc<unknown>): AutomergeBasis => ({
+export const automergeBasis = (doc: Automerge.Doc<unknown>): AutomergeBasis => Object.freeze({
   kind: 'automerge-heads',
-  heads: [...Automerge.getHeads(doc)].sort()
+  heads: Object.freeze([...Automerge.getHeads(doc)].sort())
 });
+
+const automergeSnapshot = <T extends object>(sourceId: string, basis: AutomergeBasis, storage: Automerge.Doc<T>): AutomergeSnapshot<T> =>
+  Object.freeze({ sourceId, basis, storage });
 
 export const exactAutomergeHeadsEqual = (left: readonly string[], right: readonly string[]): boolean => {
   if (left.length !== right.length) return false;
@@ -80,6 +83,7 @@ export const exactAutomergeBasisEqual = (left: AutomergeBasis, right: AutomergeB
 export class AutomergeSourceRuntime<T extends object> {
   readonly sourceId: string;
   #doc: Automerge.Doc<T>;
+  #snapshot: AutomergeSnapshot<T>;
   #closed = false;
   #applying = false;
   #queue: Promise<void> = Promise.resolve();
@@ -91,17 +95,20 @@ export class AutomergeSourceRuntime<T extends object> {
     if (options.sourceId.length === 0) throw new Error('Automerge sourceId must not be empty');
     this.sourceId = options.sourceId;
     this.#doc = options.doc;
+    this.#snapshot = automergeSnapshot(this.sourceId, automergeBasis(this.#doc), this.#doc);
   }
 
+  /** Stable until exact heads change; retained storage stays basis-correct for reads and views.
+   * Write via commit and save current snapshot storage: historical handles may serialize advanced shared state. */
   snapshot(): AutomergeSnapshot<T> {
     this.#assertOpen();
-    return { sourceId: this.sourceId, basis: automergeBasis(this.#doc), storage: this.#doc };
+    return this.#snapshot;
   }
 
   view(basis: AutomergeBasis): AutomergeSnapshot<T> {
     this.#assertOpen();
     const storage = Automerge.view(this.#doc, [...basis.heads]);
-    return { sourceId: this.sourceId, basis: { kind: 'automerge-heads', heads: [...basis.heads].sort() }, storage };
+    return automergeSnapshot(this.sourceId, automergeBasis(storage), storage);
   }
 
   subscribe(listener: (change: AutomergeSourceChange) => void): () => void {
@@ -158,21 +165,22 @@ export class AutomergeSourceRuntime<T extends object> {
   merge(remote: Automerge.Doc<T>): AutomergeSnapshot<T> {
     this.#assertOpen();
     if (this.#applying) throw new Error('Cannot merge while an Automerge command is applying');
-    const beforeBasis = automergeBasis(this.#doc);
+    const remoteHeads = Automerge.getHeads(remote);
+    if (Automerge.hasHeads(this.#doc, remoteHeads)) return this.snapshot();
+    const beforeBasis = this.#snapshot.basis;
     const merged = Automerge.merge(this.#doc, remote);
     const afterBasis = automergeBasis(merged);
-    this.#doc = merged;
-    if (!exactAutomergeBasisEqual(beforeBasis, afterBasis)) this.#notify({ beforeBasis, afterBasis, origin: 'merge' });
+    this.#update(merged, beforeBasis, afterBasis, 'merge');
     return this.snapshot();
   }
 
+  /** Adopts a changed document; an exact-head-equivalent replacement is a no-op. */
   replace(doc: Automerge.Doc<T>): AutomergeSnapshot<T> {
     this.#assertOpen();
     if (this.#applying) throw new Error('Cannot replace while an Automerge command is applying');
-    const beforeBasis = automergeBasis(this.#doc);
+    const beforeBasis = this.#snapshot.basis;
     const afterBasis = automergeBasis(doc);
-    this.#doc = doc;
-    if (!exactAutomergeBasisEqual(beforeBasis, afterBasis)) this.#notify({ beforeBasis, afterBasis, origin: 'replace' });
+    this.#update(doc, beforeBasis, afterBasis, 'replace');
     return this.snapshot();
   }
 
@@ -204,7 +212,7 @@ export class AutomergeSourceRuntime<T extends object> {
       }]);
     }
 
-    const beforeBasis = automergeBasis(this.#doc);
+    const beforeBasis = this.#snapshot.basis;
     if (!exactAutomergeBasisEqual(beforeBasis, input.expectedBasis)) {
       const rejected = this.#rejected(input, beforeBasis, [{
         code: 'transaction.expected_basis_stale',
@@ -241,7 +249,6 @@ export class AutomergeSourceRuntime<T extends object> {
 
     const afterBasis = automergeBasis(staged);
     const changed = !exactAutomergeBasisEqual(beforeBasis, afterBasis);
-    this.#doc = staged;
     const committed: AutomergeSourceCommitResult = {
       kind: 'source-commit',
       outcome: 'committed',
@@ -255,8 +262,15 @@ export class AutomergeSourceRuntime<T extends object> {
       issues: []
     };
     this.#ledger.set(key, { intentHash: input.intentHash, result: committed });
-    if (changed) this.#notify({ beforeBasis, afterBasis, origin: 'commit' });
+    this.#update(staged, beforeBasis, afterBasis, 'commit');
     return committed;
+  }
+
+  #update(doc: Automerge.Doc<T>, beforeBasis: AutomergeBasis, afterBasis: AutomergeBasis, origin: AutomergeSourceChange['origin']): void {
+    if (exactAutomergeBasisEqual(beforeBasis, afterBasis)) return;
+    this.#doc = doc;
+    this.#snapshot = automergeSnapshot(this.sourceId, afterBasis, doc);
+    this.#notify({ beforeBasis, afterBasis, origin });
   }
 
   #rejected(
