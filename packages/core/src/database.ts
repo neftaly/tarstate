@@ -164,12 +164,19 @@ export class AttachmentCatalog {
       close: () => {
         if (closed) return;
         closed = true;
-        releaseSource?.();
+        let releaseFailed = false;
+        let releaseError: unknown;
+        try { releaseSource?.(); } catch (error) {
+          releaseFailed = true;
+          releaseError = error;
+        }
         entry.leases -= 1;
-        if (entry.leases > 0) return;
-        if (this.#attachments.get(attachment.attachmentId) === entry) this.#attachments.delete(attachment.attachmentId);
-        if (!Array.from(this.#attachments.values()).some((candidate) => candidate.attachment.sourceId === attachment.sourceId)) this.#sources.delete(attachment.sourceId);
-        this.#notify();
+        if (entry.leases === 0) {
+          if (this.#attachments.get(attachment.attachmentId) === entry) this.#attachments.delete(attachment.attachmentId);
+          if (!Array.from(this.#attachments.values()).some((candidate) => candidate.attachment.sourceId === attachment.sourceId)) this.#sources.delete(attachment.sourceId);
+          this.#notify();
+        }
+        if (releaseFailed) throw releaseError;
       }
     };
   }

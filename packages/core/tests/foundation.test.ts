@@ -82,6 +82,21 @@ describe('production foundation', () => {
     await expect(sealArtifact({ kind: 'query', id: 'urn:tarstate:inline:manual', body: {} })).rejects.toBeInstanceOf(TarstateParseError);
   });
 
+  it('detaches and freezes sealed semantic content so its hash cannot drift', async () => {
+    const body = { root: { literal: ['before'] } };
+    const artifact = await sealArtifact({ kind: 'query', id: 'urn:test:owned-query', body });
+    const originalHash = artifact.contentHash;
+
+    body.root.literal[0] = 'after';
+
+    expect(artifact.body).toEqual({ root: { literal: ['before'] } });
+    expect(Object.isFrozen(artifact)).toBe(true);
+    expect(Object.isFrozen(artifact.body)).toBe(true);
+    expect(Object.isFrozen(artifact.body.root.literal)).toBe(true);
+    expect(artifact.contentHash).toBe(originalHash);
+    expect(artifact.contentHash).toBe(await sha256Json(artifactSemanticValue(artifact)));
+  });
+
   it('detects duplicate JSON members before materialization at every depth', () => {
     expect(safeParseJsonText('{"outer":{"x":1,"x":2}}')).toMatchObject({ success: false, issues: [{ code: 'artifact.duplicate_member', path: ['outer', 'x'] }] });
     expect(safeParseJsonText('{"__proto__":{}}')).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
@@ -142,6 +157,29 @@ describe('production foundation', () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  it('owns frozen capability metadata independently of registration inputs', async () => {
+    const weak: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:owned-weak', version: '1', class: 'edit', contract: {}, implies: [] };
+    const weakRef = await capabilityRefFor(weak);
+    const declaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:owned-strong', version: '1', class: 'edit', contract: { mode: 'before' }, implies: [] } as CapabilityDeclaration & { contract: { mode: string }; implies: typeof weakRef[] };
+    const registry = new CapabilityRegistry('trust:owned');
+    const registered = await registry.registerDeclaration(declaration);
+    if (!registered.success) throw new Error('declaration registration failed');
+    const implementation = { ref: registered.value, integrity: 'before', implementation: {} };
+    expect(registry.registerImplementation(implementation)).toMatchObject({ success: true });
+    const fingerprint = await registry.fingerprint();
+
+    declaration.contract.mode = 'after';
+    declaration.implies.push(weakRef);
+    implementation.integrity = 'after';
+
+    expect(registry.declaration(registered.value)).toMatchObject({ contract: { mode: 'before' }, implies: [] });
+    expect(registry.satisfies(weakRef)).toBe(false);
+    expect(registry.implementation(registered.value)?.integrity).toBe('before');
+    expect(Object.isFrozen(registry.declaration(registered.value))).toBe(true);
+    expect(Object.isFrozen(registry.implementation(registered.value))).toBe(true);
+    expect(await registry.fingerprint()).toBe(fingerprint);
+  });
+
   it('keeps capability upgrades and downgrades exact rather than version-ordered', async () => {
     const v1: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:versioned', version: '1', class: 'function', contract: { operation: 'versioned-1' }, implies: [] };
     const v2: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:versioned', version: '2', class: 'function', contract: { operation: 'versioned-2' }, implies: [] };
@@ -171,6 +209,40 @@ describe('production foundation', () => {
     lease.release();
     expect(close).toHaveBeenCalledOnce();
     expect(() => host.acquire({ sourceId: 'source:new', identity: {}, create: () => ({ runtime: {}, close }) })).toThrow(/closed/);
+  });
+
+  it('removes a final runtime lease even when its close callback throws', () => {
+    const host = new HostRuntimeRegistry({ trustPolicyId: 'host:throwing-release' });
+    const first = host.acquire({
+      sourceId: 'source:throwing',
+      identity: {},
+      create: () => ({ runtime: {}, close: () => { throw new Error('close failed'); } })
+    });
+
+    expect(() => first.release()).toThrow('close failed');
+    expect(host.activeSourceIds()).toEqual([]);
+    const replacement = host.acquire({
+      sourceId: 'source:throwing',
+      identity: {},
+      create: () => ({ runtime: { replacement: true }, close: () => undefined })
+    });
+    expect(replacement.runtime).toEqual({ replacement: true });
+    replacement.release();
+  });
+
+  it('closes every host runtime before propagating a cleanup failure', () => {
+    const host = new HostRuntimeRegistry({ trustPolicyId: 'host:throwing-close' });
+    const laterClose = vi.fn();
+    host.acquire({
+      sourceId: 'source:first', identity: {},
+      create: () => ({ runtime: {}, close: () => { throw new Error('first close failed'); } })
+    });
+    host.acquire({ sourceId: 'source:later', identity: {}, create: () => ({ runtime: {}, close: laterClose }) });
+
+    expect(() => host.close()).toThrow('first close failed');
+    expect(laterClose).toHaveBeenCalledOnce();
+    expect(host.activeSourceIds()).toEqual([]);
+    expect(() => host.acquire({ sourceId: 'source:new', identity: {}, create: () => ({ runtime: {}, close: () => undefined }) })).toThrow(/closed/);
   });
 
 });

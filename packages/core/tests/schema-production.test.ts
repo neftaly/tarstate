@@ -4,7 +4,7 @@ import { createIssue } from '../src/issues.js';
 import { prepareSchema, parseRelationCandidate, parseLogicalKey, type SchemaBody } from '../src/schema.js';
 import { compileStorageMapping, planStoragePatch, projectStorage, type StorageMappingBody } from '../src/mapping.js';
 import { projectLensRelation, resolveLensPath, translateLensEdits, validateLens, type LensArtifact, type LensRows, type SchemaLensBody } from '../src/lens.js';
-import type { CodecImplementation } from '../src/codec.js';
+import { parseScalarValue, type CodecImplementation } from '../src/codec.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 const schemaRef = { id: 'urn:test:schema', contentHash: hash('1') };
@@ -78,6 +78,25 @@ describe('production schemas and codecs', () => {
     const schema = prepareSchema({ relations: { values: { relationId: 'test.value', key: ['value'], fields: { value: { type: { kind: 'custom', codec: actualRef } } } } }, requiredCodecs: [actualRef] }, registry);
     if (!schema.success) throw new Error('schema failed');
     expect(parseRelationCandidate(schema.value, 'test.value', { value: 'ANY' }, registry)).toMatchObject({ success: false, issues: [{ code: 'schema.codec_failed', details: { reason: 'threw' } }] });
+  });
+
+  it('detaches successful custom codec output from host-owned state', async () => {
+    const declaration: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:codec:owned', version: '1', class: 'codec', contract: { type: 'urn:test:owned' }, implies: [] };
+    const ref = await capabilityRefFor(declaration);
+    const registry = new CapabilityRegistry('owned-codec');
+    await registry.registerDeclaration(declaration);
+    const decoded = { kind: 'tarstate.value' as const, type: 'urn:test:owned', value: { state: 'before' } };
+    registry.registerImplementation({
+      ref,
+      integrity: 'owned',
+      implementation: { kind: 'tarstate.codec', type: 'urn:test:owned', decode: () => ({ success: true, value: decoded, issues: [] }), equals: () => false, hash: () => '' } satisfies CodecImplementation
+    });
+
+    const parsed = parseScalarValue({ kind: 'custom', codec: ref }, 'input', { registry });
+    if (!parsed.success) throw new Error('codec parse failed');
+    decoded.value.state = 'after';
+
+    expect(parsed.value).toEqual({ kind: 'tarstate.value', type: 'urn:test:owned', value: { state: 'before' } });
   });
 });
 

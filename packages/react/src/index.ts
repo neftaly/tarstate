@@ -389,7 +389,9 @@ class QueryStore<Row> {
     if (this.#observer !== undefined) return;
     this.#observer = this.#database.observe(this.#request) as QueryObserver<Row>;
     this.#unsubscribeObserver = this.#observer.subscribe(() => {
-      for (const listener of Array.from(this.#listeners)) listener();
+      for (const listener of Array.from(this.#listeners)) {
+        try { listener(); } catch { /* one query view cannot starve later subscribers */ }
+      }
     });
     if (this.#listeners.size === 0) this.#scheduleClose();
   }

@@ -29,7 +29,7 @@ import {
   type QueryRecord,
   type RelationInput
 } from './query.js';
-import type { JsonValue } from './value.js';
+import { defaultValueParseBudget, safeParseJsonValue, type JsonValue } from './value.js';
 
 export type ObservationBasis = {
   readonly dataset: { readonly datasetId: string; readonly revision: number };
@@ -54,6 +54,7 @@ export type SourceEvidence = {
 
 /** Immutable query evidence at one database/attachment basis. Result keys are opaque UI/diff identities, not write locators. */
 export type ObservedQueryResult<Row> = {
+  readonly readiness: 'ready' | 'incomplete' | 'invalid';
   readonly rows: readonly Row[];
   readonly resultKeys: readonly string[];
   readonly completeness: 'exact' | 'lower-bound' | 'unknown';
@@ -167,6 +168,7 @@ export const queryObservationKey = <Query>(
 ): string => canonicalizeJson([
   request.plan.planId,
   request.plan.rootNodeId,
+  request.plan.query,
   request.parameters ?? {},
   database.authorityScope,
   database.authorityFingerprint,
@@ -206,8 +208,9 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     if (request.plan.authorityFingerprint !== this.authorityFingerprint) throw new Error('Prepared plan authority fingerprint does not match database view');
     const dataset = this.#datasets.get(request.plan.datasetId);
     if (dataset === undefined) throw new Error('Dataset is not part of this database view: ' + request.plan.datasetId);
-    const parameters = deepFreezeClone(request.parameters ?? {}) as Readonly<Record<string, JsonValue>>;
-    const key = queryObservationKey(this, { ...request, parameters });
+    const plan = detachPreparedPlan(request.plan);
+    const parameters = parseObservationParameters(request.parameters ?? {});
+    const key = queryObservationKey(this, { ...request, plan, parameters });
     let shared = this.#cache.get(key);
     if (shared === undefined) {
       let runtime = this.#datasetRuntimes.get(dataset.datasetId);
@@ -225,7 +228,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
       }
       try {
         shared = new SharedObservation({
-          plan: request.plan,
+          plan,
           parameters,
           allowPartial: request.allowPartial === true,
           runtime,
@@ -699,18 +702,28 @@ class SharedObservation<Query, Row, Projection> {
     const resultIdentityIssue = maintained.rows.length === maintained.resultKeys.length && new Set(maintained.resultKeys).size === maintained.resultKeys.length
       ? []
       : [observationIssue('observer.evaluation_failed', 'after_refresh', { reason: 'invalid_result_identity' })];
+    const requiredProjectionInvalid = captured.members.some((candidate) =>
+      candidate.member.expectation === 'required' &&
+      candidate.snapshot?.state === 'ready' &&
+      candidate.projection?.state === 'failed'
+    );
+    const evaluationInvalid = resultIdentityIssue.length > 0 || maintained.issues.some(({ code }) => code === 'observer.evaluation_failed');
     const requiredUnavailable = evidence.some((item) => item.expectation === 'required' && (item.state !== 'ready' || !item.authorized));
-    const inputsIncomplete = captured.dataset.state !== 'settled' || requiredUnavailable || resultIdentityIssue.length > 0;
+    const inputsIncomplete = captured.dataset.state !== 'settled' || requiredUnavailable || evaluationInvalid;
     let completeness = maintained.completeness;
     if (inputsIncomplete && !(this.#options.allowPartial && completeness === 'lower-bound')) completeness = 'unknown';
     const rows = completeness === 'unknown' ? [] : maintained.rows;
     const resultKeys = completeness === 'unknown' ? [] : maintained.resultKeys;
+    const readiness = requiredProjectionInvalid || evaluationInvalid
+      ? 'invalid'
+      : completeness === 'exact' ? 'ready' : 'incomplete';
     const basisAttachments = captured.members.flatMap((candidate) => candidate.snapshot === undefined ? [] : [{
       attachmentId: candidate.member.attachmentId,
       sourceId: candidate.member.sourceId,
       basis: candidate.snapshot.basis
     }]);
     return freezeResult({
+      readiness,
       rows,
       resultKeys,
       completeness,
@@ -1243,8 +1256,37 @@ const deepFreezeClone = <Value>(value: Value, seen = new WeakMap<object, object>
   }
   const output: Record<string, unknown> = {};
   seen.set(value, output);
-  for (const [key, item] of Object.entries(value)) output[key] = deepFreezeClone(item, seen);
+  for (const [key, item] of Object.entries(value)) {
+    Object.defineProperty(output, key, {
+      value: deepFreezeClone(item, seen),
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+  }
   return Object.freeze(output) as Value;
+};
+
+const parseObservationParameters = (input: unknown): Readonly<Record<string, JsonValue>> => {
+  const parsed = safeParseJsonValue(input);
+  if (!parsed.success) throw new TypeError('Observation parameters must be a portable record: ' + parsed.issues.map(({ code }) => code).join(', '));
+  if (parsed.value === null || Array.isArray(parsed.value) || typeof parsed.value !== 'object') {
+    throw new TypeError('Observation parameters must be a portable record');
+  }
+  return deepFreezeClone(parsed.value) as Readonly<Record<string, JsonValue>>;
+};
+
+const detachPreparedPlan = <Query>(plan: PreparedPlan<Query>): PreparedPlan<Query> => {
+  const parsed = safeParseJsonValue(plan.query, { ...defaultValueParseBudget, maxDepth: 1_024 });
+  if (!parsed.success) throw new TypeError('Prepared plan query must be a portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
+  return Object.freeze({
+    planId: plan.planId,
+    rootNodeId: plan.rootNodeId,
+    query: deepFreezeClone(parsed.value) as Query,
+    registryFingerprint: plan.registryFingerprint,
+    authorityFingerprint: plan.authorityFingerprint,
+    datasetId: plan.datasetId
+  });
 };
 
 const samePortable = (left: unknown, right: unknown): boolean => {

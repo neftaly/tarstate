@@ -45,6 +45,7 @@ const basis = (revision: number) => ({
 
 const openSnapshot = (rows: readonly Row[], revision = 0): ObserverSnapshot<Row> => {
   const current = Object.freeze({
+    readiness: 'ready' as const,
     rows: Object.freeze([...rows]),
     resultKeys: Object.freeze(rows.map(({ id }) => 'row:' + id)),
     completeness: 'exact' as const,
@@ -159,6 +160,37 @@ describe('@tarstate/react', () => {
     expect(database.closeCount).toBe(0);
   });
 
+  it('continues notifying cached query views when an earlier view throws', async () => {
+    const database = new TestDatabase();
+    const firstSnapshots: ObserverSnapshot<Row>[] = [];
+    const secondSnapshots: ObserverSnapshot<Row>[] = [];
+    const First = () => { firstSnapshots.push(useQuery(plan)); return null; };
+    const Second = () => { secondSnapshots.push(useQuery(plan)); return null; };
+    await mount(createElement(
+      'div',
+      null,
+      createElement(TarstateProvider, { database }, createElement(First)),
+      createElement(TarstateProvider, { database }, createElement(Second))
+    ));
+    expect(database.observers).toHaveLength(1);
+
+    const next = openSnapshot([{ id: 2, name: 'two' }], 1);
+    let firstStateRead = true;
+    const throwsForFirstView = new Proxy(next, {
+      get(target, property, receiver) {
+        if (property === 'state' && firstStateRead) {
+          firstStateRead = false;
+          throw new Error('first query view failed to refresh');
+        }
+        return Reflect.get(target, property, receiver);
+      }
+    });
+
+    await act(() => { database.observers[0]?.publish(throwsForFirstView); });
+    expect(firstSnapshots.at(-1)).toMatchObject({ current: { rows: [{ id: 1, name: 'one' }] } });
+    expect(secondSnapshots.at(-1)).toMatchObject({ current: { rows: [{ id: 2, name: 'two' }] } });
+  });
+
   it('uses collision-safe canonical observation keys', async () => {
     const database = new TestDatabase();
     const first = { ...plan, planId: 'query\u0000all', rootNodeId: 'root' };
@@ -199,6 +231,7 @@ describe('@tarstate/react', () => {
     const currentUnknown = Object.freeze({
       state: 'open' as const,
       current: Object.freeze({
+        readiness: 'incomplete' as const,
         rows: Object.freeze([]) as readonly Row[],
         resultKeys: Object.freeze([]) as readonly string[],
         completeness: 'unknown' as const,

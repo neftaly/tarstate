@@ -4,6 +4,7 @@ import * as automerge from '../src/index.js';
 describe('production Automerge surface', () => {
   it('exports source, projection, binding, and metadata implementations', () => {
     expect(automerge.AutomergeSourceRuntime).toBeTypeOf('function');
+    expect(automerge.automergeRepoSourceRuntime).toBeTypeOf('function');
     expect(automerge.AutomergeAtomicSource).toBeTypeOf('function');
     expect(automerge.AutomergeMapProjectionPlanner).toBeTypeOf('function');
     expect(automerge.AutomergeMapStorageBinding).toBeTypeOf('function');

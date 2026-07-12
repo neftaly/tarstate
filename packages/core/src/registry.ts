@@ -1,5 +1,6 @@
 import { canonicalizeJson, sha256Json, type ContentHash } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { JsonValue } from './value.js';
 
@@ -40,12 +41,15 @@ export class CapabilityRegistry {
   get revision(): number { return this.#revision; }
 
   async registerDeclaration(declaration: CapabilityDeclaration): Promise<ParseResult<CapabilityRef>> {
-    const ref = await capabilityRefFor(declaration);
+    const detached = detachAndFreezeJsonValue(declaration);
+    if (!detached.success) return detached;
+    const ownedDeclaration = detached.value as unknown as CapabilityDeclaration;
+    const ref = Object.freeze(await capabilityRefFor(ownedDeclaration));
     const key = refKey(ref);
-    const identityKey = declaration.id + '\u0000' + declaration.version;
-    const conflicting = [...this.#declarations.entries()].find(([candidateKey, candidate]) => candidateKey.startsWith(identityKey + '\u0000') && canonicalizeJson(candidate as unknown as JsonValue) !== canonicalizeJson(declaration as unknown as JsonValue));
-    if (conflicting !== undefined) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', details: { id: declaration.id, version: declaration.version } })] };
-    this.#declarations.set(key, declaration);
+    const identityKey = ownedDeclaration.id + '\u0000' + ownedDeclaration.version;
+    const conflicting = [...this.#declarations.entries()].find(([candidateKey, candidate]) => candidateKey.startsWith(identityKey + '\u0000') && canonicalizeJson(candidate as unknown as JsonValue) !== canonicalizeJson(ownedDeclaration as unknown as JsonValue));
+    if (conflicting !== undefined) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', details: { id: ownedDeclaration.id, version: ownedDeclaration.version } })] };
+    this.#declarations.set(key, ownedDeclaration);
     const cycle = this.#findCycle();
     if (cycle !== undefined) {
       this.#declarations.delete(key);
@@ -56,13 +60,17 @@ export class CapabilityRegistry {
   }
 
   registerImplementation(implementation: CapabilityImplementation): ParseResult<CapabilityImplementation> {
-    const key = refKey(implementation.ref);
-    if (!this.#declarations.has(key)) return { success: false, issues: [createIssue({ code: 'capability.missing', retry: 'after_capability', requiredCapabilities: [implementation.ref] })] };
+    const detachedRef = detachAndFreezeJsonValue(implementation.ref);
+    if (!detachedRef.success) return detachedRef;
+    const ref = detachedRef.value as unknown as CapabilityRef;
+    const ownedImplementation = Object.freeze({ ref, integrity: implementation.integrity, implementation: implementation.implementation });
+    const key = refKey(ref);
+    if (!this.#declarations.has(key)) return { success: false, issues: [createIssue({ code: 'capability.missing', retry: 'after_capability', requiredCapabilities: [ref] })] };
     const previous = this.#implementations.get(key);
-    if (previous !== undefined && previous.integrity !== implementation.integrity) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', requiredCapabilities: [implementation.ref] })] };
-    this.#implementations.set(key, implementation);
+    if (previous !== undefined && previous.integrity !== ownedImplementation.integrity) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', requiredCapabilities: [ref] })] };
+    this.#implementations.set(key, ownedImplementation);
     this.#revision += 1;
-    return { success: true, value: implementation, issues: [] };
+    return { success: true, value: ownedImplementation, issues: [] };
   }
 
   declaration(ref: CapabilityRef): CapabilityDeclaration | undefined { return this.#declarations.get(refKey(ref)); }

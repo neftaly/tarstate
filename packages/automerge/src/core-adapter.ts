@@ -25,7 +25,7 @@ import {
 } from '@tarstate/core';
 import { conflictsAt, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import {
-  AutomergeSourceRuntime,
+  type AutomergeSourceRuntimeApi,
   type AutomergeBasis,
   type AutomergeSourceCommand,
   type AutomergeSourceCommitResult
@@ -66,7 +66,7 @@ export const relateAutomergeFootprints = (left: Footprint, right: Footprint): Fo
 };
 
 export type AutomergeAtomicSourceOptions<T extends object> = {
-  readonly runtime: AutomergeSourceRuntime<T>;
+  readonly runtime: AutomergeSourceRuntimeApi<T>;
   readonly operationEpoch: string;
   readonly freshness?: SourceFreshness;
   readonly ownsRuntime?: boolean;
@@ -76,7 +76,7 @@ export type AutomergeAtomicSourceOptions<T extends object> = {
 export class AutomergeAtomicSource<T extends object> implements AtomicSource<Automerge.Doc<T>, AutomergeSourceCommand<T>> {
   readonly sourceId: string;
   readonly operationEpoch: string;
-  readonly #runtime: AutomergeSourceRuntime<T>;
+  readonly #runtime: AutomergeSourceRuntimeApi<T>;
   readonly #ownsRuntime: boolean;
   readonly #listeners = new Set<(change?: { readonly beforeBasis?: import('@tarstate/core').SourceBasis; readonly afterBasis: import('@tarstate/core').SourceBasis }) => void>();
   readonly #unsubscribeRuntime: () => void;

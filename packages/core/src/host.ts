@@ -43,11 +43,20 @@ export class HostRuntimeRegistry {
         released = true;
         entry.leases -= 1;
         if (entry.leases > 0) return;
-        if (!entry.closed) {
-          entry.closed = true;
-          entry.close();
+        let closeFailed = false;
+        let closeError: unknown;
+        try {
+          if (!entry.closed) {
+            entry.closed = true;
+            entry.close();
+          }
+        } catch (error) {
+          closeFailed = true;
+          closeError = error;
+        } finally {
+          if (this.#sourceRuntimes.get(options.sourceId) === entry) this.#sourceRuntimes.delete(options.sourceId);
         }
-        if (this.#sourceRuntimes.get(options.sourceId) === entry) this.#sourceRuntimes.delete(options.sourceId);
+        if (closeFailed) throw closeError;
       }
     };
   }
@@ -57,10 +66,16 @@ export class HostRuntimeRegistry {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    let failed = false;
+    let firstError: unknown;
     for (const entry of this.#sourceRuntimes.values()) {
       entry.closed = true;
-      entry.close();
+      try { entry.close(); } catch (error) {
+        if (!failed) firstError = error;
+        failed = true;
+      }
     }
     this.#sourceRuntimes.clear();
+    if (failed) throw firstError;
   }
 }

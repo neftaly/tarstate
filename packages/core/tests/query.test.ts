@@ -4,6 +4,7 @@ import {
   evaluateExpression,
   evaluateQuery,
   logicalUnknown,
+  prepareQuery,
   type ArtifactRef,
   type CapabilityRef,
   type QueryNode,
@@ -30,6 +31,23 @@ const from = (relationId: string, alias = relationId): QueryNode => ({
 });
 
 describe('production query oracle', () => {
+  it('detaches and freezes a prepared query from its caller-owned AST', async () => {
+    const row = { value: 1 };
+    const root: QueryNode = { kind: 'values', alias: 'value', rows: [row] };
+    const prepared = await prepareQuery({
+      root,
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+
+    row.value = 2;
+    expect(prepared.query).toEqual({ kind: 'values', alias: 'value', rows: [{ value: 1 }] });
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(Object.isFrozen(prepared.query)).toBe(true);
+    expect(Object.isFrozen(prepared.query.kind === 'values' ? prepared.query.rows : [])).toBe(true);
+  });
+
   it('keeps data string "unknown" disjoint from logical unknown through nested comparisons', () => {
     expect(evaluateExpression({ kind: 'literal', value: 'unknown' }, {})).toBe('unknown');
     expect(evaluateExpression({

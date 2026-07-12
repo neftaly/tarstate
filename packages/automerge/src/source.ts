@@ -15,7 +15,7 @@ export type AutomergeSnapshot<T extends object> = {
 export type AutomergeSourceChange = {
   readonly beforeBasis: AutomergeBasis;
   readonly afterBasis: AutomergeBasis;
-  readonly origin: 'commit' | 'merge' | 'replace';
+  readonly origin: 'commit' | 'handle' | 'merge' | 'replace';
 };
 
 export type AutomergeSourceCommand<T extends object> = {
@@ -76,13 +76,50 @@ export const exactAutomergeHeadsEqual = (left: readonly string[], right: readonl
 export const exactAutomergeBasisEqual = (left: AutomergeBasis, right: AutomergeBasis): boolean =>
   left.kind === 'automerge-heads' && right.kind === 'automerge-heads' && exactAutomergeHeadsEqual(left.heads, right.heads);
 
+/** Minimal Automerge Repo handle surface consumed by the source runtime. */
+export type AutomergeRepoHandle<T extends object, Heads = unknown> = {
+  readonly url: string;
+  isReady(): boolean;
+  isReadOnly(): boolean;
+  doc(): Automerge.Doc<T>;
+  heads(): Heads;
+  changeAt(heads: Heads, change: Automerge.ChangeFn<T>, options?: Automerge.ChangeOptions<T>): Heads | undefined;
+  on(event: 'heads-changed', listener: (payload: { readonly doc: Automerge.Doc<T> }) => void): unknown;
+  off(event: 'heads-changed', listener: (payload: { readonly doc: Automerge.Doc<T> }) => void): unknown;
+};
+
+type DocumentOwner<T extends object> = {
+  current(): Automerge.Doc<T>;
+  changeAt(
+    basis: AutomergeBasis,
+    commands: readonly AutomergeSourceCommand<T>[],
+    message: string,
+  ): Automerge.Doc<T>;
+  subscribe(listener: (doc: Automerge.Doc<T>) => void): () => void;
+  close(): void;
+  merge?(remote: Automerge.Doc<T>): Automerge.Doc<T>;
+  replace?(doc: Automerge.Doc<T>): Automerge.Doc<T>;
+};
+
+const documentOwner = Symbol('AutomergeSourceRuntime.documentOwner');
+type AutomergeSourceRuntimeOptions<T extends object> =
+  | { readonly sourceId: string; readonly doc: Automerge.Doc<T> }
+  | { readonly sourceId: string; readonly [documentOwner]: DocumentOwner<T> };
+
+class StaleOwnerBasis<T extends object> extends Error {
+  constructor(readonly storage: Automerge.Doc<T>) {
+    super('Automerge document owner basis changed');
+  }
+}
+
 /**
  * One explicit runtime owns one live Automerge document. It serializes local
  * commits, compares exact head sets, and never claims durable receipt storage.
  */
 export class AutomergeSourceRuntime<T extends object> {
   readonly sourceId: string;
-  #doc: Automerge.Doc<T>;
+  readonly #owner: DocumentOwner<T>;
+  readonly #unsubscribeOwner: () => void;
   #snapshot: AutomergeSnapshot<T>;
   #closed = false;
   #applying = false;
@@ -91,11 +128,15 @@ export class AutomergeSourceRuntime<T extends object> {
   readonly #ledger = new Map<string, LedgerEntry>();
   readonly #retiredEpochs = new Set<string>();
 
-  constructor(options: { readonly sourceId: string; readonly doc: Automerge.Doc<T> }) {
+  constructor(options: AutomergeSourceRuntimeOptions<T>) {
     if (options.sourceId.length === 0) throw new Error('Automerge sourceId must not be empty');
     this.sourceId = options.sourceId;
-    this.#doc = options.doc;
-    this.#snapshot = automergeSnapshot(this.sourceId, automergeBasis(this.#doc), this.#doc);
+    this.#owner = 'doc' in options ? memoryDocumentOwner(options.doc) : options[documentOwner];
+    const storage = this.#owner.current();
+    this.#snapshot = automergeSnapshot(this.sourceId, automergeBasis(storage), storage);
+    this.#unsubscribeOwner = this.#owner.subscribe((doc) => {
+      if (!this.#applying) this.#install(doc, 'handle');
+    });
   }
 
   /** Stable until exact heads change; retained storage stays basis-correct for reads and views.
@@ -107,7 +148,7 @@ export class AutomergeSourceRuntime<T extends object> {
 
   view(basis: AutomergeBasis): AutomergeSnapshot<T> {
     this.#assertOpen();
-    const storage = Automerge.view(this.#doc, [...basis.heads]);
+    const storage = Automerge.view(this.#owner.current(), [...basis.heads]);
     return automergeSnapshot(this.sourceId, automergeBasis(storage), storage);
   }
 
@@ -165,12 +206,8 @@ export class AutomergeSourceRuntime<T extends object> {
   merge(remote: Automerge.Doc<T>): AutomergeSnapshot<T> {
     this.#assertOpen();
     if (this.#applying) throw new Error('Cannot merge while an Automerge command is applying');
-    const remoteHeads = Automerge.getHeads(remote);
-    if (Automerge.hasHeads(this.#doc, remoteHeads)) return this.snapshot();
-    const beforeBasis = this.#snapshot.basis;
-    const merged = Automerge.merge(this.#doc, remote);
-    const afterBasis = automergeBasis(merged);
-    this.#update(merged, beforeBasis, afterBasis, 'merge');
+    if (this.#owner.merge === undefined) throw new Error('This Automerge document owner does not support merge');
+    this.#install(this.#owner.merge(remote), 'merge');
     return this.snapshot();
   }
 
@@ -178,15 +215,17 @@ export class AutomergeSourceRuntime<T extends object> {
   replace(doc: Automerge.Doc<T>): AutomergeSnapshot<T> {
     this.#assertOpen();
     if (this.#applying) throw new Error('Cannot replace while an Automerge command is applying');
-    const beforeBasis = this.#snapshot.basis;
-    const afterBasis = automergeBasis(doc);
-    this.#update(doc, beforeBasis, afterBasis, 'replace');
+    if (this.#owner.replace === undefined) throw new Error('This Automerge document owner does not support replace');
+    this.#install(this.#owner.replace(doc), 'replace');
     return this.snapshot();
   }
 
   close(): void {
     if (this.#closed) return;
+    if (this.#applying) throw new Error('Cannot close while an Automerge command is applying');
     this.#closed = true;
+    this.#unsubscribeOwner();
+    this.#owner.close();
     this.#listeners.clear();
   }
 
@@ -212,7 +251,9 @@ export class AutomergeSourceRuntime<T extends object> {
       }]);
     }
 
-    const beforeBasis = this.#snapshot.basis;
+    const current = this.#owner.current();
+    this.#install(current, 'handle');
+    const beforeBasis = automergeBasis(current);
     if (!exactAutomergeBasisEqual(beforeBasis, input.expectedBasis)) {
       const rejected = this.#rejected(input, beforeBasis, [{
         code: 'transaction.expected_basis_stale',
@@ -225,26 +266,35 @@ export class AutomergeSourceRuntime<T extends object> {
       return rejected;
     }
 
-    let staged: Automerge.Doc<T>;
+    let staged: Automerge.Doc<T> | undefined;
+    let failure: unknown;
     this.#applying = true;
     try {
       staged = input.commands.length === 0
-        ? this.#doc
-        : Automerge.change(this.#doc, { message: input.message ?? 'tarstate source commit', time: 0 }, (draft) => {
-            for (const command of input.commands) command.apply(draft);
-          });
+        ? current
+        : this.#owner.changeAt(beforeBasis, input.commands, input.message ?? 'tarstate source commit');
     } catch (error) {
-      const rejected = this.#rejected(input, beforeBasis, [{
-        code: 'automerge.command_failed',
+      failure = error;
+    } finally {
+      this.#applying = false;
+    }
+
+    if (failure !== undefined || staged === undefined) {
+      const actual = failure instanceof StaleOwnerBasis ? failure.storage : this.#owner.current();
+      const actualBasis = automergeBasis(actual);
+      const stale = failure instanceof StaleOwnerBasis;
+      const rejected = this.#rejected(input, stale ? actualBasis : beforeBasis, [{
+        code: stale ? 'transaction.expected_basis_stale' : 'automerge.command_failed',
         phase: 'commit',
         sourceId: this.sourceId,
         operationId: input.operationId,
-        details: { message: error instanceof Error ? error.message : String(error) }
+        details: stale
+          ? { expectedBasis: input.expectedBasis, actualBasis }
+          : { message: failure instanceof Error ? failure.message : String(failure) }
       }]);
       this.#ledger.set(key, { intentHash: input.intentHash, result: rejected });
+      this.#install(actual, 'handle');
       return rejected;
-    } finally {
-      this.#applying = false;
     }
 
     const afterBasis = automergeBasis(staged);
@@ -262,13 +312,14 @@ export class AutomergeSourceRuntime<T extends object> {
       issues: []
     };
     this.#ledger.set(key, { intentHash: input.intentHash, result: committed });
-    this.#update(staged, beforeBasis, afterBasis, 'commit');
+    this.#install(staged, 'commit');
     return committed;
   }
 
-  #update(doc: Automerge.Doc<T>, beforeBasis: AutomergeBasis, afterBasis: AutomergeBasis, origin: AutomergeSourceChange['origin']): void {
+  #install(doc: Automerge.Doc<T>, origin: AutomergeSourceChange['origin']): void {
+    const beforeBasis = this.#snapshot.basis;
+    const afterBasis = automergeBasis(doc);
     if (exactAutomergeBasisEqual(beforeBasis, afterBasis)) return;
-    this.#doc = doc;
     this.#snapshot = automergeSnapshot(this.sourceId, afterBasis, doc);
     this.#notify({ beforeBasis, afterBasis, origin });
   }
@@ -302,4 +353,79 @@ export class AutomergeSourceRuntime<T extends object> {
   }
 }
 
+/**
+ * Runtime operations shared by memory-owned and Repo-owned Automerge sources.
+ * Document replacement and merging remain capabilities of the memory runtime,
+ * rather than being implied for every document owner.
+ */
+export type AutomergeSourceRuntimeApi<T extends object> = Omit<
+  AutomergeSourceRuntime<T>,
+  'merge' | 'replace'
+>;
+
 const ledgerKey = (operationEpoch: string, operationId: string): string => operationEpoch + '\u0000' + operationId;
+
+const memoryDocumentOwner = <T extends object>(initial: Automerge.Doc<T>): DocumentOwner<T> => {
+  let doc = initial;
+  return {
+    current: () => doc,
+    changeAt: (basis, commands, message) => {
+      if (!exactAutomergeBasisEqual(basis, automergeBasis(doc))) throw new StaleOwnerBasis(doc);
+      doc = Automerge.change(doc, { message, time: 0 }, (draft) => {
+        for (const command of commands) command.apply(draft);
+      });
+      return doc;
+    },
+    subscribe: () => () => undefined,
+    close: () => undefined,
+    merge: (remote) => {
+      if (!Automerge.hasHeads(doc, Automerge.getHeads(remote))) doc = Automerge.merge(doc, remote);
+      return doc;
+    },
+    replace: (replacement) => {
+      if (!exactAutomergeBasisEqual(automergeBasis(doc), automergeBasis(replacement))) doc = replacement;
+      return doc;
+    }
+  };
+};
+
+/**
+ * Opens the shared source runtime over a ready, writable Automerge Repo handle.
+ * During a synchronous commit, the handle must be written only through this runtime.
+ */
+export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
+  readonly handle: AutomergeRepoHandle<T, Heads>;
+  readonly sourceId?: string;
+}): AutomergeSourceRuntimeApi<T> => {
+  const { handle } = options;
+  const sourceId = options.sourceId ?? handle.url;
+  if (sourceId.length === 0) throw new Error('Automerge sourceId must not be empty');
+  if (!handle.isReady()) throw new Error('Automerge Repo handle must be ready');
+  if (handle.isReadOnly()) throw new Error('Automerge Repo handle must be writable');
+  const listeners = new Set<(doc: Automerge.Doc<T>) => void>();
+  const handleChanged = ({ doc }: { readonly doc: Automerge.Doc<T> }): void => {
+    for (const listener of Array.from(listeners)) listener(doc);
+  };
+  handle.on('heads-changed', handleChanged);
+  const owner: DocumentOwner<T> = {
+    current: () => handle.doc(),
+    changeAt: (basis, commands, message) => {
+      const current = handle.doc();
+      if (!exactAutomergeBasisEqual(basis, automergeBasis(current))) throw new StaleOwnerBasis(current);
+      const heads = handle.heads();
+      handle.changeAt(heads, (draft) => {
+        for (const command of commands) command.apply(draft);
+      }, { message, time: 0 });
+      return handle.doc();
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    close: () => { handle.off('heads-changed', handleChanged); }
+  };
+  return new AutomergeSourceRuntime({
+    sourceId,
+    [documentOwner]: owner
+  });
+};

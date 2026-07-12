@@ -114,7 +114,7 @@ const parseCustomValue = (ref: CapabilityRef, input: unknown, registry: Capabili
     if (!portable.success || !isTaggedValue(portable.value) || portable.value.type !== registered.type || !exactTaggedShape(portable.value)) {
       return failure('schema.codec_failed', path, { codec: ref, reason: 'invalid_output' }, [ref]);
     }
-    return success(value);
+    return success(portable.value);
   } catch (error) {
     return failure('schema.codec_failed', path, { codec: ref, reason: 'threw', error: error instanceof Error ? error.name : typeof error }, [ref]);
   }

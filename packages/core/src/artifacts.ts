@@ -1,4 +1,5 @@
 import { createIssue, TarstateParseError, type Issue, type ParseResult } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
 
 export const artifactKinds = ['schema', 'query', 'transaction', 'constraint-set', 'storage-mapping', 'schema-lens', 'issue-code-catalog'] as const;
@@ -100,16 +101,19 @@ export const sealArtifact = async <Body extends JsonValue>(input: {
 }): Promise<Artifact<Body>> => {
   const dependencies = normalizeDependencies(input.dependencies ?? []);
   if (!dependencies.success) throw new TarstateParseError(dependencies.issues);
+  const body = detachAndFreezeJsonValue(input.body);
+  if (!body.success) throw new TarstateParseError(body.issues);
+  const ownedDependencies = Object.freeze(dependencies.value.map((dependency) => Object.freeze(dependency)));
   let id = input.id;
   if (id === undefined) {
-    const bodyHash = await sha256Json({ kind: input.kind, formatVersion: 1, dependencies: dependencies.value.map(normalizeArtifactRef), body: input.body });
+    const bodyHash = await sha256Json({ kind: input.kind, formatVersion: 1, dependencies: ownedDependencies.map(normalizeArtifactRef), body: body.value });
     id = 'urn:tarstate:inline:sha256:' + bodyHash.slice('sha256:'.length);
   } else if (id.startsWith('urn:tarstate:inline:')) {
     throw new TarstateParseError([createIssue({ code: 'artifact.invalid_envelope', retry: 'after_input', details: { member: 'id', reason: 'reserved_inline_namespace' } })]);
   }
-  const withoutHash = { kind: input.kind, formatVersion: 1 as const, id, dependencies: dependencies.value, body: input.body };
+  const withoutHash = { kind: input.kind, formatVersion: 1 as const, id, dependencies: ownedDependencies, body: body.value as Body };
   const contentHash = await sha256Json(artifactSemanticValue(withoutHash));
-  return { ...withoutHash, contentHash };
+  return Object.freeze({ ...withoutHash, contentHash });
 };
 
 export const safeParseArtifactText = async (text: string, budget: ArtifactParseBudget = defaultArtifactParseBudget): Promise<ParseResult<Artifact>> => {

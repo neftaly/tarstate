@@ -1,6 +1,6 @@
 import { canonicalizeJson, sha256Json, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
-import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
+import { capabilityUnavailable, defaultValueParseBudget, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, safeParseJsonValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
 import type { PreparedPlan } from './maintenance.js';
 import { comparePortableStrings } from './portable-order.js';
 
@@ -307,9 +307,10 @@ export const prepareQuery = async (input: {
   readonly authorityFingerprint: string;
   readonly datasetId: string;
 }): Promise<PreparedPlan<QueryNode>> => {
-  const semantic = { root: input.root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId } as unknown as JsonValue;
+  const root = cloneAndFreezeQueryAst(input.root);
+  const semantic = { root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId } as unknown as JsonValue;
   const planId = await sha256Json(semantic);
-  return { planId, rootNodeId: planId + ':root', query: input.root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId };
+  return Object.freeze({ planId, rootNodeId: planId + ':root', query: root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId });
 };
 
 const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
@@ -1849,23 +1850,19 @@ const assertPoolableQuery = (root: QueryNode): void => {
 };
 
 const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
-  const clones = new WeakMap<object, object>();
-  const clone = (value: unknown): unknown => {
-    if (value === null || typeof value !== 'object') return value;
-    const prior = clones.get(value);
-    if (prior !== undefined) return prior;
-    if (Array.isArray(value)) {
-      const output: unknown[] = [];
-      clones.set(value, output);
-      for (const item of value) output.push(clone(item));
-      return Object.freeze(output);
-    }
-    const output: Record<string, unknown> = {};
-    clones.set(value, output);
-    for (const [key, item] of Object.entries(value)) output[key] = clone(item);
-    return Object.freeze(output);
-  };
-  return clone(root) as QueryNode;
+  const parsed = safeParseJsonValue(root, { ...defaultValueParseBudget, maxDepth: 1_024 });
+  if (!parsed.success) throw new TypeError('Query AST must be a portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
+  return freezePortableValue(parsed.value) as QueryNode;
+};
+
+const freezePortableValue = <Value extends JsonValue>(value: Value): Value => {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    for (const item of value) freezePortableValue(item);
+  } else {
+    for (const item of Object.values(value)) freezePortableValue(item);
+  }
+  return Object.freeze(value);
 };
 
 const internPooledQueryNode = (
