@@ -97,6 +97,7 @@ exports[`clean rewrite core surface > matches the curated runtime export surface
   "planStoragePatch",
   "prepareDatabaseAttachment",
   "prepareManualReadOnlyAttachment",
+  "preparePlan",
   "prepareQuery",
   "prepareSchema",
   "prepareTypedQuery",

@@ -4,10 +4,12 @@ import {
   evaluateExpression,
   evaluateQuery,
   logicalUnknown,
+  preparePlan,
   prepareQuery,
   type ArtifactRef,
   type CapabilityRef,
   type JsonValue,
+  type PreparedPlan,
   type QueryNode,
   type RelationInput
 } from '../src/index.js';
@@ -81,6 +83,29 @@ describe('production query oracle', () => {
     expect(Object.isFrozen(prepared)).toBe(true);
     expect(Object.isFrozen(prepared.query)).toBe(true);
     expect(Object.isFrozen(prepared.query.kind === 'values' ? prepared.query.rows : [])).toBe(true);
+  });
+
+  it('requires portable plan input and does not execute hostile accessors', async () => {
+    let getterCalls = 0;
+    const hostile = Object.defineProperty({}, 'value', {
+      enumerable: true,
+      get: () => { getterCalls += 1; return 1; }
+    });
+
+    await expect(preparePlan({ query: hostile as JsonValue, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' })).rejects.toThrow('portable value');
+    await expect(preparePlan({ query: { callback: () => undefined } as unknown as JsonValue, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' })).rejects.toThrow('portable value');
+    expect(getterCalls).toBe(0);
+
+    // @ts-expect-error prepared plans cannot be assembled structurally
+    const forged: PreparedPlan<JsonValue> = { planId: 'forged', rootNodeId: 'forged:root', query: null, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' };
+    void forged;
+  });
+
+  it('prepares deeply nested portable plans within the query AST budget', async () => {
+    let query: JsonValue = null;
+    for (let depth = 0; depth < 100; depth += 1) query = { child: query };
+    await expect(preparePlan({ query, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' }))
+      .resolves.toMatchObject({ query });
   });
 
   it('keeps data string "unknown" disjoint from logical unknown through nested comparisons', () => {

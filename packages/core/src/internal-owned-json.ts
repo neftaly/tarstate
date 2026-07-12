@@ -1,9 +1,9 @@
 import type { ParseResult } from './issues.js';
-import { safeParseJsonValue, type JsonValue } from './value.js';
+import { safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
 
 /** Detaches portable semantic data from its caller and makes the owned graph immutable. */
-export const detachAndFreezeJsonValue = (input: unknown): ParseResult<JsonValue> => {
-  const parsed = safeParseJsonValue(input);
+export const detachAndFreezeJsonValue = (input: unknown, budget?: ValueParseBudget): ParseResult<JsonValue> => {
+  const parsed = safeParseJsonValue(input, budget);
   if (!parsed.success) return parsed;
   return { success: true, value: freezeJsonValue(parsed.value), issues: [] };
 };

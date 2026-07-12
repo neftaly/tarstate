@@ -1,5 +1,10 @@
 import type { HostRuntimeRegistry, RuntimeLease } from './host.js';
 import { createIssue, type Issue } from './issues.js';
+import {
+  notifyObservers,
+  runObserverCleanups,
+  type ObserverDiagnosticReporter
+} from './observer-diagnostics.js';
 
 export type HydrationState = 'loading' | 'ready' | 'failed';
 
@@ -62,19 +67,31 @@ export class ExternalStoreRuntime<State> {
   readonly #listeners = new Set<() => void>();
   readonly #unsubscribeStore: () => void;
   readonly #unsubscribeHydration: (() => void) | undefined;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   #revision = 0;
   #leaseCount = 0;
   #coordinating = false;
   #closed = false;
   #hydration: HydrationState;
 
-  constructor(sourceId: string, store: AtomicExternalStore<State>) {
+  constructor(sourceId: string, store: AtomicExternalStore<State>, options: { readonly onDiagnostic?: ObserverDiagnosticReporter } = {}) {
     this.sourceId = sourceId;
     this.store = store;
+    this.#onDiagnostic = options.onDiagnostic;
     this.incarnation = sourceId + ':external:' + nextIncarnation++;
     this.#hydration = store.hydration?.getState() ?? 'ready';
-    this.#unsubscribeStore = store.subscribe(() => this.#onStoreSignal());
-    this.#unsubscribeHydration = store.hydration?.subscribe(() => this.#onHydrationSignal());
+    const unsubscribeStore = store.subscribe(() => this.#onStoreSignal());
+    let unsubscribeHydration: (() => void) | undefined;
+    try {
+      unsubscribeHydration = store.hydration?.subscribe(() => this.#onHydrationSignal());
+    } catch (error) {
+      runObserverCleanups([unsubscribeStore], {
+        component: 'external-store', operation: 'rollback-construction'
+      }, this.#onDiagnostic);
+      throw error;
+    }
+    this.#unsubscribeStore = unsubscribeStore;
+    this.#unsubscribeHydration = unsubscribeHydration;
 
     // Hydration may finish between the first read and subscription setup. No
     // public snapshot exists yet, so adopt the authoritative current state as
@@ -202,8 +219,10 @@ export class ExternalStoreRuntime<State> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#unsubscribeStore();
-    this.#unsubscribeHydration?.();
+    runObserverCleanups([
+      this.#unsubscribeStore,
+      ...(this.#unsubscribeHydration === undefined ? [] : [this.#unsubscribeHydration])
+    ], { component: 'external-store', operation: 'close' }, this.#onDiagnostic);
     this.#listeners.clear();
   }
 
@@ -252,9 +271,9 @@ export class ExternalStoreRuntime<State> {
   }
 
   #notify(): void {
-    for (const listener of Array.from(this.#listeners)) {
-      try { listener(); } catch { /* source state must not depend on observers */ }
-    }
+    notifyObservers(this.#listeners, (listener) => listener(), {
+      component: 'external-store', operation: 'publish'
+    }, this.#onDiagnostic);
   }
 }
 
@@ -268,12 +287,14 @@ export const acquireExternalStoreRuntime = <State>(options: {
   readonly sourceId: string;
   readonly store: AtomicExternalStore<State>;
   readonly storeIdentity: object;
+  readonly onDiagnostic?: ObserverDiagnosticReporter;
 }): ExternalStoreLease<State> => {
   const hostLease: RuntimeLease<ExternalStoreRuntime<State>> = options.registry.acquire({
     sourceId: options.sourceId,
     identity: options.storeIdentity,
     create: () => {
-      const runtime = new ExternalStoreRuntime(options.sourceId, options.store);
+      const diagnosticOptions = options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic };
+      const runtime = new ExternalStoreRuntime(options.sourceId, options.store, diagnosticOptions);
       return { runtime, close: () => runtime.close() };
     }
   });

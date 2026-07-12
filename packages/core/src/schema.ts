@@ -42,13 +42,20 @@ export type FieldDeclaration = {
   readonly metadata?: Readonly<Record<string, JsonValue>>;
 };
 
+declare const preparedRelationBrand: unique symbol;
+declare const preparedSchemaBrand: unique symbol;
+
 export type PreparedRelation = {
+  /** Compile-time evidence that the declaration passed through `prepareSchema`. */
+  readonly [preparedRelationBrand]: true;
   readonly name: string;
   readonly declaration: RelationDeclaration;
   readonly keyFields: readonly FieldDeclaration[];
 };
 
 export type PreparedSchema = {
+  /** Compile-time evidence that this value passed through `prepareSchema`. */
+  readonly [preparedSchemaBrand]: true;
   readonly body: SchemaBody;
   readonly relationsByName: ReadonlyMap<string, PreparedRelation>;
   readonly relationsById: ReadonlyMap<RelationId, PreparedRelation>;
@@ -123,7 +130,7 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
       } else keyFields.push(field);
     }
     if (!relationValid) continue;
-    const prepared = Object.freeze({ name, declaration, keyFields: Object.freeze(keyFields) }) satisfies PreparedRelation;
+    const prepared = Object.freeze({ name, declaration, keyFields: Object.freeze(keyFields) }) as PreparedRelation;
     relationsByName.set(name, prepared);
     relationsById.set(declaration.relationId, prepared);
   }
@@ -146,7 +153,7 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
       body,
       relationsByName: ownedReadonlyMap(relationsByName),
       relationsById: ownedReadonlyMap(relationsById)
-    }),
+    }) as PreparedSchema,
     issues: []
   };
 };

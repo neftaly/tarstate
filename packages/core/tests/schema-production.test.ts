@@ -57,6 +57,15 @@ const makeFixture = async () => {
 };
 
 describe('production schemas and codecs', () => {
+  it('requires prepared schema provenance at schema consumers', () => {
+    const raw = { relations: {} } satisfies SchemaBody;
+    const invalidCallIsRejectedByTypecheck = (): void => {
+      // @ts-expect-error raw authoring bodies are not prepared schemas
+      parseRelationCandidate(raw, 'test.missing', {});
+    };
+    expect(invalidCallIsRejectedByTypecheck).toBeTypeOf('function');
+  });
+
   it('rejects unknown and incomplete schema declaration members at preparation', () => {
     expect(prepareSchema({ relations: {}, ambientAuthority: true })).toMatchObject({ success: false });
     expect(prepareSchema({ relations: { people: { relationId: 'test.person', key: ['id'], fields: { id: { type: { kind: 'string', ambient: true } } } } } }))
@@ -151,6 +160,15 @@ describe('production schemas and codecs', () => {
 });
 
 describe('production JSON-tree storage mappings', () => {
+  it('requires compiled mapping provenance at storage consumers', () => {
+    const raw = { schema: schemaRef, model: 'json-tree-v1', relations: {} } satisfies StorageMappingBody;
+    const invalidCallIsRejectedByTypecheck = (): void => {
+      // @ts-expect-error raw mapping bodies must pass through compileStorageMapping
+      projectStorage(raw, {});
+    };
+    expect(invalidCallIsRejectedByTypecheck).toBeTypeOf('function');
+  });
+
   it('rejects map-key mismatch, retains duplicate candidates for repair, and preserves unknown storage on edit', async () => {
     const { registry, schema } = await makeFixture();
     const mapping: StorageMappingBody = {

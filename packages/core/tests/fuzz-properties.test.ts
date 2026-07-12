@@ -16,6 +16,7 @@ import {
   type RelationInput
 } from '../src/index.js';
 import { createPooledIncrementalQueryRuntime, type PooledIncrementalQueryRoot } from '../src/query.js';
+import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
 
 const configuredRuns = Number.parseInt(process.env.TARSTATE_FUZZ_RUNS ?? '64', 10);
 const runs = Number.isSafeInteger(configuredRuns) && configuredRuns > 0 ? configuredRuns : 64;
@@ -36,7 +37,7 @@ const query: QueryNode = {
     source: { kind: 'source-of', alias: 'row' }
   }
 };
-const plan = { planId: 'fuzz', rootNodeId: 'fuzz:root', query, registryFingerprint: 'registry', authorityFingerprint: 'authority', datasetId: 'dataset' };
+const plan = sealPreparedPlan({ planId: 'fuzz', rootNodeId: 'fuzz:root', query, registryFingerprint: 'registry', authorityFingerprint: 'authority', datasetId: 'dataset' });
 
 type FuzzRow = { readonly occurrenceId: string; readonly row: QueryRecord };
 type FuzzSource = { readonly sourceId: string; readonly attachmentId?: string; revision: number; nextId: number; rows: FuzzRow[] };
@@ -134,7 +135,7 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
       const snapshot = (): QueryMaintenanceSnapshot => ({ relations: [makeInput(itemUse, itemRows, itemRevision), makeInput(groupUse, groupRows, groupRevision)], basis: { itemRevision, groupRevision } });
       const selectedQuery = queries[run % queries.length] as QueryNode;
       let accepted = snapshot();
-      const session = openIncrementalQueryMaintenance({ ...plan, planId: 'operator:' + run, query: selectedQuery }, accepted);
+      const session = openIncrementalQueryMaintenance(sealPreparedPlan({ ...plan, planId: 'operator:' + run, query: selectedQuery }), accepted);
       for (let step = 0; step < 12; step += 1) {
         const mutateItems = integer(3) !== 0;
         const target = mutateItems ? itemRows : groupRows;
@@ -254,7 +255,7 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
         const rootQuery = queryVariant(variant);
         const rootId = nextRootId++;
         live.push({
-          root: runtime.attach({ ...plan, planId: 'pooled:' + run + ':' + rootId + ':' + variant, rootNodeId: 'pooled:root:' + rootId, query: rootQuery }),
+          root: runtime.attach(sealPreparedPlan({ ...plan, planId: 'pooled:' + run + ':' + rootId + ':' + variant, rootNodeId: 'pooled:root:' + rootId, query: rootQuery })),
           query: rootQuery,
           variant
         });

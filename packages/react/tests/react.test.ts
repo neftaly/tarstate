@@ -1,11 +1,12 @@
-import type {
-  CommitReceipt,
-  ObserveRequest,
-  ObserverChange,
-  ObserverSnapshot,
-  PreparedPlan,
-  QueryObserver,
-  TransactionAttempt
+import {
+  preparePlan,
+  type CommitReceipt,
+  type ObserveRequest,
+  type ObserverChange,
+  type ObserverSnapshot,
+  type PreparedPlan,
+  type QueryObserver,
+  type TransactionAttempt
 } from '@tarstate/core';
 import { StrictMode, createElement, type ReactElement } from 'react';
 import { renderToString } from 'react-dom/server';
@@ -29,14 +30,12 @@ import {
 type Query = { readonly kind: 'all' };
 type Row = { readonly id: number; readonly name: string };
 
-const plan: ReactPreparedPlan<Query, Row> = {
-  planId: 'query:all',
-  rootNodeId: 'query:all:root',
+const plan: ReactPreparedPlan<Query, Row> = await preparePlan<Query>({
   query: { kind: 'all' },
   registryFingerprint: 'registry:one',
   authorityFingerprint: 'authority:public',
   datasetId: 'dataset:one'
-};
+});
 
 const basis = (revision: number) => ({
   dataset: { datasetId: 'dataset:one', revision },

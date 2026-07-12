@@ -3,7 +3,7 @@ import { ExternalStoreRuntime, type AtomicExternalStore } from './external-store
 import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, validateLens, type LensRows, type SchemaLensBody } from './lens.js';
 import { InMemoryAtomicSource } from './memory-source.js';
-import type { PreparedPlan } from './maintenance.js';
+import { sealPreparedPlan } from './internal-prepared-plan.js';
 import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance, type QueryMaintenanceSnapshot, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
 import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
 import { sealTransaction } from './transaction.js';
@@ -38,14 +38,14 @@ const from = (relationId: string, alias: string): QueryNode => ({ kind: 'from', 
 const field = (alias: string, name: string) => ({ kind: 'field', alias, name } as const);
 
 const openGoldenMaintenance = (label: GoldenWorkloadLabel, root: QueryNode, relations: readonly RelationInput[]) =>
-  openIncrementalQueryMaintenance({
+  openIncrementalQueryMaintenance(sealPreparedPlan({
     planId: 'golden:' + label,
     rootNodeId: 'golden:' + label + ':root',
     query: root,
     registryFingerprint: 'golden:registry',
     authorityFingerprint: 'golden:authority',
     datasetId: 'golden:dataset'
-  } satisfies PreparedPlan<QueryNode>, { relations });
+  }), { relations });
 
 const runGoldenQuery = (label: GoldenWorkloadLabel, root: QueryNode, relations: readonly RelationInput[]): QueryResult => {
   const session = openGoldenMaintenance(label, root, relations);

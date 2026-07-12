@@ -3,6 +3,7 @@ import type { ReadyAttachmentPreparation } from './attachment-preparation.js';
 import type { Issue } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
 import { comparePortableStrings } from './portable-order.js';
+import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 
 export type SourceLifecycleState = 'loading' | 'ready' | 'failed' | 'denied' | 'deleted' | 'closed';
 export type SourceFreshness = 'current' | 'stale' | 'none';
@@ -57,9 +58,11 @@ export class DatasetMembership {
   readonly datasetId: string;
   readonly #listeners = new Set<() => void>();
   #snapshot: DatasetSnapshot;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
 
-  constructor(options: { readonly datasetId: string; readonly members?: readonly DatasetMember[]; readonly state?: 'open' | 'settled' }) {
+  constructor(options: { readonly datasetId: string; readonly members?: readonly DatasetMember[]; readonly state?: 'open' | 'settled'; readonly onDiagnostic?: ObserverDiagnosticReporter }) {
     this.datasetId = options.datasetId;
+    this.#onDiagnostic = options.onDiagnostic;
     this.#snapshot = freezeDataset({
       datasetId: options.datasetId,
       revision: 0,
@@ -98,9 +101,9 @@ export class DatasetMembership {
       state,
       members
     });
-    for (const listener of Array.from(this.#listeners)) {
-      try { listener(); } catch { /* membership state must not depend on observers */ }
-    }
+    notifyObservers(this.#listeners, (listener) => listener(), {
+      component: 'dataset-membership', operation: 'publish'
+    }, this.#onDiagnostic);
     return this.#snapshot;
   }
 }
@@ -133,6 +136,11 @@ export class AttachmentCatalog {
   readonly #attachments = new Map<string, AttachmentEntry>();
   readonly #sources = new Map<string, ObservableSource<unknown>>();
   readonly #listeners = new Set<() => void>();
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
+
+  constructor(options: { readonly onDiagnostic?: ObserverDiagnosticReporter } = {}) {
+    this.#onDiagnostic = options.onDiagnostic;
+  }
 
   attach<Storage, Projection>(input: DatabaseAttachmentInput<Storage, Projection>, releaseSource?: () => void): AttachmentLease<Storage, Projection> {
     const attachment: DatabaseAttachment<Storage, Projection> = Object.freeze({
@@ -195,9 +203,9 @@ export class AttachmentCatalog {
   }
 
   #notify(): void {
-    for (const listener of Array.from(this.#listeners)) {
-      try { listener(); } catch { /* catalog state must not depend on observers */ }
-    }
+    notifyObservers(this.#listeners, (listener) => listener(), {
+      component: 'attachment-catalog', operation: 'publish'
+    }, this.#onDiagnostic);
   }
 }
 

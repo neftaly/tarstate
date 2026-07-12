@@ -35,7 +35,11 @@ export type StorageMappingArtifact = TypedArtifact<'storage-mapping', StorageMap
 /** Seals a typed storage mapping without a `JsonValue` assertion at the call site. */
 export const sealStorageMapping = (input: TypedArtifactInput<StorageMappingBody>): Promise<StorageMappingArtifact> => sealTypedArtifact('storage-mapping', input);
 
+declare const compiledStorageMappingBrand: unique symbol;
+
 export type CompiledStorageMapping = {
+  /** Compile-time evidence that this value passed through `compileStorageMapping`. */
+  readonly [compiledStorageMappingBrand]: true;
   readonly body: StorageMappingBody;
   readonly schema: PreparedSchema;
   readonly relations: ReadonlyMap<RelationId, { readonly relation: PreparedRelation; readonly mapping: RelationStorageMapping }>;
@@ -112,7 +116,7 @@ export const compileStorageMapping = (
   }
   return issues.length > 0 ? { success: false, issues } : {
     success: true,
-    value: Object.freeze({ body, schema, relations: ownedReadonlyMap(relations) }),
+    value: Object.freeze({ body, schema, relations: ownedReadonlyMap(relations) }) as CompiledStorageMapping,
     issues: []
   };
 };

@@ -20,6 +20,7 @@ import {
 import type { QueryNode, QueryRecord, RelationInput } from '../src/query.js';
 import { ResourceResolver, type ResourceRef } from '../src/resolver.js';
 import type { PreparedPlan } from '../src/maintenance.js';
+import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
 import type { JsonValue } from '../src/value.js';
 
 type Row = { readonly id: number; readonly value: string };
@@ -123,7 +124,7 @@ const member = (attachmentId: string, sourceId: string, expectation: DatasetMemb
   discoveryEdges: ['edge:' + attachmentId]
 });
 
-const plan = (datasetId = 'dataset:one', authorityFingerprint = 'authority:public'): PreparedPlan<Query> => ({
+const plan = (datasetId = 'dataset:one', authorityFingerprint = 'authority:public'): PreparedPlan<Query> => sealPreparedPlan({
   planId: 'query:all',
   rootNodeId: 'query:all:root',
   query: { kind: 'all' },
@@ -154,14 +155,15 @@ const createMaintenance = (evaluation: typeof evaluate): import('../src/observer
   };
 };
 
-const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[], authorityScope = 'public', authorityFingerprint = 'authority:public', evaluation = evaluate) => new DatabaseView<Query, Row, readonly Row[]>({
+const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[], authorityScope = 'public', authorityFingerprint = 'authority:public', evaluation = evaluate, onDiagnostic?: import('../src/observer-diagnostics.js').ObserverDiagnosticReporter) => new DatabaseView<Query, Row, readonly Row[]>({
   authorityScope,
   authorityFingerprint,
   registryFingerprint: 'registry:one',
   attachments: catalog,
   datasets,
   canRead: (viewScope, attachmentScope) => viewScope === 'admin' || viewScope === attachmentScope,
-  createQueryMaintenance: createMaintenance(evaluation)
+  createQueryMaintenance: createMaintenance(evaluation),
+  ...(onDiagnostic === undefined ? {} : { onDiagnostic })
 });
 
 const querySchemaView = { id: 'urn:test:observer-schema', contentHash: `sha256:${'a'.repeat(64)}` } as const;
@@ -202,7 +204,7 @@ const relationalAttachment = (attachmentId: string, source: TestSource, onNormal
   })
 });
 
-const relationalPlan = (): PreparedPlan<QueryNode> => ({
+const relationalPlan = (): PreparedPlan<QueryNode> => sealPreparedPlan({
   planId: 'query:incremental-observer',
   rootNodeId: 'query:incremental-observer:root',
   query: {
@@ -336,6 +338,30 @@ describe('database membership and observation', () => {
     expect(listener).toHaveBeenCalledTimes(2);
   });
 
+  it('reports contained membership and catalog listener failures without starving peers', () => {
+    const diagnostics = vi.fn();
+    const dataset = new DatasetMembership({ datasetId: 'dataset:diagnostics', onDiagnostic: diagnostics });
+    const catalog = new AttachmentCatalog({ onDiagnostic: diagnostics });
+    const source = new TestSource('source:diagnostics', []);
+    const healthyDataset = vi.fn();
+    const healthyCatalog = vi.fn();
+    dataset.subscribe(() => { throw new Error('membership listener failed'); });
+    dataset.subscribe(healthyDataset);
+    catalog.subscribe(() => { throw new Error('catalog listener failed'); });
+    catalog.subscribe(healthyCatalog);
+
+    dataset.settle();
+    const lease = catalog.attach(attachment('attachment:diagnostics', source));
+
+    expect(healthyDataset).toHaveBeenCalledOnce();
+    expect(healthyCatalog).toHaveBeenCalledOnce();
+    expect(diagnostics.mock.calls.map(([diagnostic]) => diagnostic)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'listener_error', component: 'dataset-membership', operation: 'publish' }),
+      expect.objectContaining({ kind: 'listener_error', component: 'attachment-catalog', operation: 'publish' })
+    ]));
+    lease.close();
+  });
+
   it('withdraws adapter results whose occurrence identities are not unique', () => {
     const source = new TestSource('source:duplicates', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }]);
     const catalog = new AttachmentCatalog();
@@ -405,7 +431,7 @@ describe('database membership and observation', () => {
       input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
       predicate: { kind: 'compare', op: 'gte', left: { kind: 'field', alias: 'row', name: 'id' }, right: threshold }
     };
-    const reusedIdentityPlan: PreparedPlan<QueryNode> = { ...relationalPlan(), query: mutableQuery };
+    const reusedIdentityPlan = sealPreparedPlan({ ...relationalPlan(), query: mutableQuery });
     const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -457,8 +483,8 @@ describe('database membership and observation', () => {
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
     });
-    const first = database.observe({ plan: { ...relationalPlan(), planId: 'query:ids', rootNodeId: 'query:ids:root', query: ids } });
-    const second = database.observe({ plan: { ...relationalPlan(), planId: 'query:values', rootNodeId: 'query:values:root', query: values } });
+    const first = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:ids', rootNodeId: 'query:ids:root', query: ids }) });
+    const second = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:values', rootNodeId: 'query:values:root', query: values }) });
 
     expect(normalizationCount).toBe(1);
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({
@@ -505,7 +531,7 @@ describe('database membership and observation', () => {
       if (openLate) {
         openLate = false;
         late = database.observe({
-          plan: { ...relationalPlan(), planId: 'query:opened-during-update', rootNodeId: 'query:opened-during-update:root' }
+          plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:opened-during-update', rootNodeId: 'query:opened-during-update:root' })
         });
       }
       return args[0] ?? null;
@@ -516,7 +542,7 @@ describe('database membership and observation', () => {
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
     });
     const active = database.observe({
-      plan: {
+      plan: sealPreparedPlan({
         ...relationalPlan(),
         planId: 'query:reentrant-trigger',
         rootNodeId: 'query:reentrant-trigger:root',
@@ -526,7 +552,7 @@ describe('database membership and observation', () => {
           alias: 'result',
           fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
         }
-      }
+      })
     });
 
     openLate = true;
@@ -558,7 +584,7 @@ describe('database membership and observation', () => {
     const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
       if (openLate) {
         openLate = false;
-        late = database.observe({ plan: { ...relationalPlan(), planId: 'query:first-attach-late', rootNodeId: 'query:first-attach-late:root' } });
+        late = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:first-attach-late', rootNodeId: 'query:first-attach-late:root' }) });
       }
       return args[0] ?? null;
     }]]);
@@ -568,13 +594,13 @@ describe('database membership and observation', () => {
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
     });
     const active = database.observe({
-      plan: {
+      plan: sealPreparedPlan({
         ...relationalPlan(), planId: 'query:first-attach-active', rootNodeId: 'query:first-attach-active:root',
         query: {
           kind: 'select', input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' }, alias: 'result',
           fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
         }
-      }
+      })
     });
 
     expect(late?.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
@@ -605,11 +631,11 @@ describe('database membership and observation', () => {
     });
     const first = database.observe({ plan: relationalPlan(), parameters: { selected: 1 } });
     const second = database.observe({
-      plan: { ...relationalPlan(), planId: 'query:parameter-frame-two', rootNodeId: 'query:parameter-frame-two:root' },
+      plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:parameter-frame-two', rootNodeId: 'query:parameter-frame-two:root' }),
       parameters: { selected: 2 }
     });
     const third = database.observe({
-      plan: { ...relationalPlan(), planId: 'query:parameter-frame-three', rootNodeId: 'query:parameter-frame-three:root' },
+      plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:parameter-frame-three', rootNodeId: 'query:parameter-frame-three:root' }),
       parameters: { selected: 3 }
     });
 
@@ -657,13 +683,13 @@ describe('database membership and observation', () => {
       }
       return args[0] ?? null;
     }]]);
-    const mutatingPlan: PreparedPlan<QueryNode> = {
+    const mutatingPlan = sealPreparedPlan<QueryNode>({
       ...relationalPlan(), planId: 'query:parameter-detached-mutating', rootNodeId: 'query:parameter-detached-mutating:root',
       query: {
         kind: 'select', input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' }, alias: 'result',
         fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
       }
-    };
+    });
     const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
@@ -673,7 +699,7 @@ describe('database membership and observation', () => {
     // the first physical application and the reader consumes the cached delta.
     const first = database.observe({ plan: mutatingPlan, parameters: { cohort: 1 } });
     const second = database.observe({
-      plan: { ...relationalPlan(), planId: 'query:parameter-detached-reader', rootNodeId: 'query:parameter-detached-reader:root' },
+      plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:parameter-detached-reader', rootNodeId: 'query:parameter-detached-reader:root' }),
       parameters: { cohort: 2 }
     });
 
@@ -733,7 +759,7 @@ describe('database membership and observation', () => {
     });
     const first = database.observe({ plan: relationalPlan(), parameters: { cohort: 1 } });
     const second = database.observe({
-      plan: { ...relationalPlan(), planId: 'query:parameter-rejected-delta-two', rootNodeId: 'query:parameter-rejected-delta-two:root' },
+      plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:parameter-rejected-delta-two', rootNodeId: 'query:parameter-rejected-delta-two:root' }),
       parameters: { cohort: 2 }
     });
     rejectAcceptedIdentity = true;
@@ -783,7 +809,7 @@ describe('database membership and observation', () => {
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
     });
-    const observer = database.observe({ plan: { ...relationalPlan(), planId: 'query:self-closing', rootNodeId: 'query:self-closing:root', query } });
+    const observer = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:self-closing', rootNodeId: 'query:self-closing:root', query }) });
     closeObserver = () => observer.close();
     closeDuringCall = true;
 
@@ -810,8 +836,8 @@ describe('database membership and observation', () => {
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
-    const failing = database.observe({ plan: { ...relationalPlan(), planId: 'query:cohort-failing', rootNodeId: 'query:cohort-failing:root', query: failingQuery } });
-    const sibling = database.observe({ plan: { ...relationalPlan(), planId: 'query:cohort-sibling', rootNodeId: 'query:cohort-sibling:root' } });
+    const failing = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:cohort-failing', rootNodeId: 'query:cohort-failing:root', query: failingQuery }) });
+    const sibling = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:cohort-sibling', rootNodeId: 'query:cohort-sibling:root' }) });
 
     let valueReads = 0;
     const transientRow: Row = { id: 3, get value() {
@@ -819,7 +845,7 @@ describe('database membership and observation', () => {
       return 'detached-frame';
     } };
     source.publish({ rows: [transientRow] });
-    const late = database.observe({ plan: { ...relationalPlan(), planId: 'query:cohort-late', rootNodeId: 'query:cohort-late:root' } });
+    const late = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:cohort-late', rootNodeId: 'query:cohort-late:root' }) });
     expect(valueReads).toBeGreaterThan(0);
     expect(failing.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ value: 'detached-frame' }], completeness: 'exact' } });
     for (const observer of [sibling, late]) expect(observer.getSnapshot()).toMatchObject({
@@ -859,8 +885,8 @@ describe('database membership and observation', () => {
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
     const first = database.observe({ plan: relationalPlan(), parameters: { selected: 1 } });
-    const second = database.observe({ plan: { ...relationalPlan(), planId: 'query:param-two', rootNodeId: 'query:param-two:root' }, parameters: { selected: 2 } });
-    const third = database.observe({ plan: { ...relationalPlan(), planId: 'query:dataset-two', rootNodeId: 'query:dataset-two:root', datasetId: 'dataset:two' }, parameters: { selected: 1 } });
+    const second = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:param-two', rootNodeId: 'query:param-two:root' }), parameters: { selected: 2 } });
+    const third = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:dataset-two', rootNodeId: 'query:dataset-two:root', datasetId: 'dataset:two' }), parameters: { selected: 1 } });
 
     const diagnostics = database.getQueryMaintenanceDiagnostics();
     expect(diagnostics).toHaveLength(3);
@@ -892,7 +918,7 @@ describe('database membership and observation', () => {
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
-    const observer = database.observe({ plan: { ...relationalPlan(), planId: 'query:subquery', rootNodeId: 'query:subquery:root', query } });
+    const observer = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:subquery', rootNodeId: 'query:subquery:root', query }) });
     expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 1, value: 'one' }] } });
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([]);
 
@@ -973,7 +999,7 @@ describe('database membership and observation', () => {
     const factory = createIncrementalDatabaseQueryMaintenance();
     const first = factory({ plan: relationalPlan(), initialInput: input({ id: 2, value: 'two' }) });
     const second = factory({
-      plan: { ...relationalPlan(), planId: 'query:divergent', rootNodeId: 'query:divergent:root' },
+      plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:divergent', rootNodeId: 'query:divergent:root' }),
       initialInput: input({ id: 9, value: 'private' })
     });
 
@@ -1014,7 +1040,7 @@ describe('database membership and observation', () => {
     const factory = createIncrementalDatabaseQueryMaintenance();
     const first = factory({ plan: relationalPlan(), initialInput: input(acceptedRows, []) });
     const second = factory({
-      plan: { ...relationalPlan(), planId: 'query:recovery-second', rootNodeId: 'query:recovery-second:root' },
+      plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:recovery-second', rootNodeId: 'query:recovery-second:root' }),
       initialInput: input(acceptedRows)
     });
     expect(first.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
@@ -1044,7 +1070,7 @@ describe('database membership and observation', () => {
     source.publish({ rows: [{ id: 9, value: 'duplicate-a' }, { id: 9, value: 'duplicate-b' }] });
     expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
 
-    const late = database.observe({ plan: { ...relationalPlan(), planId: 'query:late-rejected', rootNodeId: 'query:late-rejected:root' } });
+    const late = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), planId: 'query:late-rejected', rootNodeId: 'query:late-rejected:root' }) });
     expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
     expect(database.getQueryMaintenanceDiagnostics()).toEqual([expect.objectContaining({ activeRootCount: 1 })]);
 
@@ -1115,7 +1141,7 @@ describe('database membership and observation', () => {
       canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
-    const observer = database.observe({ plan: { ...relationalPlan(), query } });
+    const observer = database.observe({ plan: sealPreparedPlan({ ...relationalPlan(), query }) });
     const initial = observer.getSnapshot();
     expect(initial).toMatchObject({ state: 'open', current: { rows: [
       { id: 1, value: 'personal', source: 'source:personal' },
@@ -1312,7 +1338,7 @@ describe('database membership and observation', () => {
 
     malformed = true;
     source.notify();
-    const late = database.observe({ plan: { ...plan(), planId: 'query:frame-failure-late', rootNodeId: 'query:frame-failure-late:root' } });
+    const late = database.observe({ plan: sealPreparedPlan({ ...plan(), planId: 'query:frame-failure-late', rootNodeId: 'query:frame-failure-late:root' }) });
     expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
     expect(late.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
 
@@ -1436,8 +1462,8 @@ describe('database membership and observation', () => {
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
     });
-    const broken = database.observe({ plan: { ...plan(), planId: 'query:broken', rootNodeId: 'query:broken:root' } });
-    const healthy = database.observe({ plan: { ...plan(), planId: 'query:healthy', rootNodeId: 'query:healthy:root' } });
+    const broken = database.observe({ plan: sealPreparedPlan({ ...plan(), planId: 'query:broken', rootNodeId: 'query:broken:root' }) });
+    const healthy = database.observe({ plan: sealPreparedPlan({ ...plan(), planId: 'query:healthy', rootNodeId: 'query:healthy:root' }) });
 
     source.publish({ rows: [{ id: 2, value: 'two' }] });
 
@@ -1512,7 +1538,7 @@ describe('database membership and observation', () => {
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
     const database = view(catalog, [dataset]);
     const first = database.observe({ plan: plan() });
-    const second = database.observe({ plan: { ...plan(), planId: 'query:other', rootNodeId: 'query:other:root' } });
+    const second = database.observe({ plan: sealPreparedPlan({ ...plan(), planId: 'query:other', rootNodeId: 'query:other:root' }) });
 
     expect(database.getActiveMaintenanceCount()).toBe(2);
     expect(source.listenerCount()).toBe(1);
@@ -1561,7 +1587,7 @@ describe('database membership and observation', () => {
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
     const database = view(catalog, [dataset]);
     const first = database.observe({ plan: plan() });
-    const second = database.observe({ plan: { ...plan(), planId: 'query:other', rootNodeId: 'query:other:root' } });
+    const second = database.observe({ plan: sealPreparedPlan({ ...plan(), planId: 'query:other', rootNodeId: 'query:other:root' }) });
     const seenFromFirstCallback: Row[][] = [];
     first.subscribe(() => {
       const snapshot = second.getSnapshot();
@@ -1584,7 +1610,7 @@ describe('database membership and observation', () => {
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:late-lease', source.sourceId)] });
     const database = view(catalog, [dataset]);
     const first = database.observe({ plan: plan() });
-    const secondPlan = { ...plan(), planId: 'query:late-lease-second', rootNodeId: 'query:late-lease-second:root' };
+    const secondPlan = sealPreparedPlan({ ...plan(), planId: 'query:late-lease-second', rootNodeId: 'query:late-lease-second:root' });
     const second = database.observe({ plan: secondPlan });
     let late: ReturnType<typeof database.observe> | undefined;
     const lateListener = vi.fn();
@@ -1641,16 +1667,18 @@ describe('database membership and observation', () => {
     const attachmentLease = catalog.attach(attachment('attachment:throwing-close', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:throwing-close', source.sourceId)] });
     const close = vi.fn(() => { throw new Error('close failed'); });
+    const diagnostics = vi.fn();
     const factory: import('../src/observer.js').CreateDatabaseQueryMaintenance<Query, Row, readonly Row[]> = ({ initialInput }) => {
       let current = evaluate(initialInput);
       return { getCurrentResult: () => current, updateInput: (input) => { current = evaluate(input); return current; }, close };
     };
     const database = new DatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
-      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
+      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory,
+      onDiagnostic: diagnostics
     });
     const first = database.observe({ plan: plan() });
-    const second = database.observe({ plan: { ...plan(), planId: 'query:throwing-close-second', rootNodeId: 'query:throwing-close-second:root' } });
+    const second = database.observe({ plan: sealPreparedPlan({ ...plan(), planId: 'query:throwing-close-second', rootNodeId: 'query:throwing-close-second:root' }) });
 
     expect(() => first.close()).not.toThrow();
     expect(() => database.close()).not.toThrow();
@@ -1659,6 +1687,10 @@ describe('database membership and observation', () => {
     expect(second.getSnapshot()).toEqual({ state: 'closed' });
     expect(source.listenerCount()).toBe(0);
     expect(database.getActiveMaintenanceCount()).toBe(0);
+    expect(diagnostics).toHaveBeenCalledTimes(2);
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'cleanup_error', component: 'database-view', operation: 'close-maintenance', error: expect.any(Error)
+    }));
     attachmentLease.close();
   });
 
@@ -1719,8 +1751,8 @@ describe('database membership and observation', () => {
     const attachmentLease = catalog.attach(attachment('attachment:one', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
     const database = view(catalog, [dataset]);
-    const firstPlan = { ...plan(), planId: 'query\u0000all', rootNodeId: 'root' };
-    const secondPlan = { ...plan(), planId: 'query', rootNodeId: 'all\u0000root' };
+    const firstPlan = sealPreparedPlan({ ...plan(), planId: 'query\u0000all', rootNodeId: 'root' });
+    const secondPlan = sealPreparedPlan({ ...plan(), planId: 'query', rootNodeId: 'all\u0000root' });
     const first = database.observe({ plan: firstPlan });
     const second = database.observe({ plan: secondPlan });
 
@@ -1841,7 +1873,8 @@ describe('database membership and observation', () => {
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(attachment('attachment:one', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:one', source.sourceId)] });
-    const database = view(catalog, [dataset]);
+    const diagnostics = vi.fn();
+    const database = view(catalog, [dataset], 'public', 'authority:public', evaluate, diagnostics);
     const observer = database.observe({ plan: plan() });
     const healthy = vi.fn();
     let reentered = false;
@@ -1855,6 +1888,10 @@ describe('database membership and observation', () => {
     });
     source.publish({ rows: [{ id: 2, value: 'two' }] });
     expect(healthy).toHaveBeenCalledTimes(2);
+    expect(diagnostics).toHaveBeenCalledTimes(2);
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'listener_error', component: 'query-observer', operation: 'publish', error: expect.any(Error)
+    }));
     expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'three' }] } });
     observer.close();
     database.close();

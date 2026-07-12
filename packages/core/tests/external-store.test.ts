@@ -78,11 +78,13 @@ describe('production external-store runtime', () => {
 
   it('keeps committed storage and revision coherent when a subscriber throws', () => {
     const atomic = createAtomicStore<CounterState>({ count: 0 });
+    const diagnostics = vi.fn();
     const lease = acquireExternalStoreRuntime({
       registry: host(),
       sourceId: 'source:throwing-subscriber',
       store: atomic.store,
-      storeIdentity: atomic
+      storeIdentity: atomic,
+      onDiagnostic: diagnostics
     });
     const healthy = vi.fn();
     lease.runtime.subscribe(() => { throw new Error('consumer failure'); });
@@ -91,7 +93,48 @@ describe('production external-store runtime', () => {
     expect(result).toMatchObject({ outcome: 'committed', afterBasis: { revision: 1 } });
     expect(lease.runtime.snapshot()).toMatchObject({ basis: { revision: 1 }, storage: { count: 1 } });
     expect(healthy).toHaveBeenCalledOnce();
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'listener_error', component: 'external-store', operation: 'publish', error: expect.any(Error)
+    }));
     lease.release();
+  });
+
+  it('attempts every subscription cleanup and reports failures without retaining the runtime', () => {
+    const diagnostics = vi.fn(() => { throw new Error('diagnostics sink failed'); });
+    const cleanupStore = vi.fn(() => { throw new Error('store cleanup failed'); });
+    const cleanupHydration = vi.fn(() => { throw new Error('hydration cleanup failed'); });
+    const store: AtomicExternalStore<CounterState> = {
+      getState: () => ({ count: 0 }),
+      subscribe: () => cleanupStore,
+      update: (fn) => fn({ count: 0 }).result,
+      hydration: { getState: () => 'ready', subscribe: () => cleanupHydration }
+    };
+    const lease = acquireExternalStoreRuntime({
+      registry: host(), sourceId: 'source:cleanup-diagnostics', store, storeIdentity: store, onDiagnostic: diagnostics
+    });
+
+    expect(() => lease.release()).not.toThrow();
+    expect(cleanupStore).toHaveBeenCalledOnce();
+    expect(cleanupHydration).toHaveBeenCalledOnce();
+    expect(diagnostics).toHaveBeenCalledTimes(2);
+  });
+
+  it('rolls back the store subscription when hydration subscription construction fails', () => {
+    const cleanupStore = vi.fn();
+    const store: AtomicExternalStore<CounterState> = {
+      getState: () => ({ count: 0 }),
+      subscribe: () => cleanupStore,
+      update: (fn) => fn({ count: 0 }).result,
+      hydration: {
+        getState: () => 'loading',
+        subscribe: () => { throw new Error('hydration subscription failed'); }
+      }
+    };
+
+    expect(() => acquireExternalStoreRuntime({
+      registry: host(), sourceId: 'source:construction-rollback', store, storeIdentity: store
+    })).toThrow('hydration subscription failed');
+    expect(cleanupStore).toHaveBeenCalledOnce();
   });
 
   it('observes legitimate external updates and rejects an exact stale basis', () => {

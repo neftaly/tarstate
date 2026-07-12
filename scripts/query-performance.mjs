@@ -1,6 +1,6 @@
 import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
-import { diffQueryMaintenanceSnapshots, evaluateQuery, openIncrementalQueryMaintenance } from '../packages/core/dist/index.js';
+import { diffQueryMaintenanceSnapshots, evaluateQuery, openIncrementalQueryMaintenance, preparePlan } from '../packages/core/dist/index.js';
 import { createPooledIncrementalQueryRuntime } from '../packages/core/dist/query.js';
 
 const schemaView = { id: 'urn:tarstate:benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
@@ -15,9 +15,7 @@ const input = (relationId, rows) => ({
   sourceId: 'source:' + relationId,
   attachmentId: 'attachment:' + relationId
 });
-const plan = (name, query) => ({
-  planId: 'benchmark:' + name,
-  rootNodeId: 'benchmark:' + name + ':root',
+const plan = (_name, query) => preparePlan({
   query,
   registryFingerprint: 'benchmark:registry',
   authorityFingerprint: 'benchmark:authority',
@@ -93,13 +91,13 @@ for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
 
   const first = { relations: [relation] };
   const second = { relations: [input('item', linearRows(count, true))] };
-  const session = openIncrementalQueryMaintenance(plan('linear-' + count, linearQuery), first);
+  const session = openIncrementalQueryMaintenance(await plan('linear-' + count, linearQuery), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
   measurements.push(benchmark('linear-one-row-update', count, iterations, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
   session.close();
   let accepted = first;
-  const endToEnd = openIncrementalQueryMaintenance(plan('linear-end-to-end-' + count, linearQuery), accepted);
+  const endToEnd = openIncrementalQueryMaintenance(await plan('linear-end-to-end-' + count, linearQuery), accepted);
   measurements.push(benchmark('linear-snapshot-diff-and-update', count, iterations, (index) => {
     const next = index % 2 === 0 ? second : first;
     const result = endToEnd.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
@@ -121,7 +119,7 @@ for (const [count, iterations] of [[100, 300], [1_000, 50], [10_000, 5]]) {
   const first = { relations: [input('nested', nestedRows(count))] };
   const second = { relations: [input('nested', nestedRows(count, true))] };
   measurements.push(benchmark('nested-pure-ownership', count, iterations, () => evaluateQuery({ root: nestedQuery, relations: first.relations })));
-  const session = openIncrementalQueryMaintenance(plan('nested-ownership-' + count, nestedQuery), first);
+  const session = openIncrementalQueryMaintenance(await plan('nested-ownership-' + count, nestedQuery), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
   measurements.push(benchmark('nested-one-row-update', count, iterations, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
@@ -134,7 +132,7 @@ for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 2]]) {
   measurements.push(benchmark('equijoin-pure', count * 2, iterations, () => evaluateQuery({ root: joinQuery, relations })));
   const changed = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
   const initial = { relations };
-  const session = openIncrementalQueryMaintenance(plan('join-' + count, joinQuery), initial);
+  const session = openIncrementalQueryMaintenance(await plan('join-' + count, joinQuery), initial);
   const forward = diffQueryMaintenanceSnapshots(initial, changed);
   const backward = diffQueryMaintenanceSnapshots(changed, initial);
   measurements.push(benchmark('equijoin-one-row-update', count * 2, Math.max(10, iterations), (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
@@ -193,12 +191,12 @@ for (const fanout of [1, 10, 50, 100]) {
   const first = { relations: [input('item', linearRows(1_000))] };
   const second = { relations: [input('item', linearRows(1_000, true))] };
   const runtime = createPooledIncrementalQueryRuntime({ environment: pooledEnvironment('fanout-' + fanout), initialSnapshot: first });
-  const roots = Array.from({ length: fanout }, (_, index) => runtime.attach(plan('fanout-' + fanout + '-' + index, {
+  const roots = await Promise.all(Array.from({ length: fanout }, async (_, index) => runtime.attach(await plan('fanout-' + fanout + '-' + index, {
     kind: 'select',
     alias: 'result-' + index,
     input: clonedPrefix(),
     fields: { id: field('item', 'id'), value: field('item', 'value') }
-  })));
+  }))));
   const afterAttach = physicalDiagnostics(runtime.getDiagnostics());
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
@@ -227,13 +225,14 @@ for (const [depth, iterations] of [[10, 30], [25, 20], [50, 10], [100, 5]]) {
   const initial = { relations: [input('item', linearRows(10))] };
   const query = deepPipeline(depth);
   const sample = createPooledIncrementalQueryRuntime({ environment: pooledEnvironment('depth-sample-' + depth), initialSnapshot: initial });
-  const sampleRoot = sample.attach(plan('depth-sample-' + depth, query));
+  const prepared = await plan('depth-' + depth, query);
+  const sampleRoot = sample.attach(prepared);
   const diagnostics = physicalDiagnostics(sample.getDiagnostics());
   sampleRoot.close();
   sample.close();
   const millisecondsPerAttachClose = timedOperation(iterations, (index) => {
     const runtime = createPooledIncrementalQueryRuntime({ environment: pooledEnvironment('depth-' + depth + '-' + index), initialSnapshot: initial });
-    const root = runtime.attach(plan('depth-' + depth + '-' + index, query));
+    const root = runtime.attach(prepared);
     const rows = root.getCurrentResult().rows.length;
     root.close();
     runtime.close();
@@ -252,12 +251,12 @@ for (const rootCount of [10, 50, 100, 1_000]) {
   const first = { relations };
   const second = { relations: changedRelations };
   const runtime = createPooledIncrementalQueryRuntime({ environment: pooledEnvironment('unrelated-' + rootCount), initialSnapshot: first });
-  const roots = Array.from({ length: rootCount }, (_, index) => runtime.attach(plan('unrelated-' + index, {
+  const roots = await Promise.all(Array.from({ length: rootCount }, async (_, index) => runtime.attach(await plan('unrelated-' + index, {
     kind: 'select',
     alias: 'result',
     input: from('unrelated-' + index, 'item'),
     fields: { id: field('item', 'id'), value: field('item', 'value') }
-  })));
+  }))));
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
   let update = 0;
@@ -280,15 +279,16 @@ for (const rootCount of [10, 50, 100, 1_000]) {
 for (const residentRootCount of [100, 1_000]) {
   const initial = { relations: [input('item', linearRows(10))] };
   const runtime = createPooledIncrementalQueryRuntime({ environment: pooledEnvironment('churn-' + residentRootCount), initialSnapshot: initial });
-  const residents = Array.from({ length: residentRootCount }, (_, index) => runtime.attach(plan('resident-' + index, {
+  const residents = await Promise.all(Array.from({ length: residentRootCount }, async (_, index) => runtime.attach(await plan('resident-' + index, {
     kind: 'select', alias: 'resident-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
+  }))));
+  const churnPlans = await Promise.all(Array.from({ length: 105 }, (_, index) => plan('churn-' + index, {
+    kind: 'select', alias: 'churn-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
   })));
   let churn = 0;
   const millisecondsPerAttachClose = timedOperation(100, () => {
     const index = churn++;
-    const root = runtime.attach(plan('churn-' + index, {
-      kind: 'select', alias: 'churn-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
-    }));
+    const root = runtime.attach(churnPlans[index]);
     const rows = root.getCurrentResult().rows.length;
     root.close();
     return rows;
@@ -309,7 +309,7 @@ await post(allocationSession, 'HeapProfiler.startSampling', { samplingInterval: 
 {
   const first = { relations: [input('item', linearRows(1_000))] };
   const second = { relations: [input('item', linearRows(1_000, true))] };
-  const session = openIncrementalQueryMaintenance(plan('allocation-sample', linearQuery), first);
+  const session = openIncrementalQueryMaintenance(await plan('allocation-sample', linearQuery), first);
   let accepted = first;
   for (let index = 0; index < 100; index += 1) {
     const next = index % 2 === 0 ? second : first;
@@ -327,9 +327,9 @@ const pooledAllocationSecond = { relations: [input('item', linearRows(1_000, tru
 const pooledAllocationRuntime = createPooledIncrementalQueryRuntime({
   environment: pooledEnvironment('allocation-pooled-fanout-100'), initialSnapshot: pooledAllocationFirst
 });
-const pooledAllocationRoots = Array.from({ length: 100 }, (_, index) => pooledAllocationRuntime.attach(plan('allocation-pooled-' + index, {
+const pooledAllocationRoots = await Promise.all(Array.from({ length: 100 }, async (_, index) => pooledAllocationRuntime.attach(await plan('allocation-pooled-' + index, {
   kind: 'select', alias: 'allocation-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
-})));
+}))));
 const pooledAllocationForward = diffQueryMaintenanceSnapshots(pooledAllocationFirst, pooledAllocationSecond);
 const pooledAllocationBackward = diffQueryMaintenanceSnapshots(pooledAllocationSecond, pooledAllocationFirst);
 const pooledAllocationSession = new inspector.Session();

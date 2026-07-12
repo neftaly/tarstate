@@ -1,7 +1,8 @@
-import { canonicalizeJson, sha256Json, type ArtifactRef } from './artifacts.js';
+import { canonicalizeJson, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
-import type { PreparedPlan } from './maintenance.js';
+import { preparePlan, type PreparedPlan } from './maintenance.js';
+import { assertPreparedPlan } from './internal-prepared-plan.js';
 import { comparePortableStrings } from './portable-order.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import {
@@ -17,6 +18,7 @@ import {
   cloneAndFreezeQueryAst,
   freezePortableValue
 } from './internal-query-ownership.js';
+import { canonicalizeQueryValue, compareQueryJsonValues, compareQueryJsonValuesTotal, containsQueryLogicalUnknown, queryValueEqual } from './internal-query-values.js';
 
 /** `lower-bound` contains only proven rows; `unknown` withdraws the current row assertion. */
 export type Completeness = 'exact' | 'lower-bound' | 'unknown';
@@ -330,9 +332,7 @@ export const prepareQuery = async (input: {
   readonly datasetId: string;
 }): Promise<PreparedPlan<QueryNode>> => {
   const root = cloneAndFreezeQueryAst(input.root);
-  const semantic = { root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId } as unknown as JsonValue;
-  const planId = await sha256Json(semantic);
-  return Object.freeze({ planId, rootNodeId: planId + ':root', query: root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId });
+  return preparePlan({ query: root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId });
 };
 
 const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
@@ -600,7 +600,7 @@ const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], co
   if (aggregate.op === 'average') return numbers.length === 0 ? null : numbers.reduce((sum, value) => sum + value, 0) / numbers.length;
   if (knownValues.length === 0) return null;
   return knownValues.reduce((selected, value) => {
-    const comparison = compareJsonValuesTotal(value, selected);
+    const comparison = compareQueryJsonValuesTotal(value, selected);
     return aggregate.op === 'minimum' ? (comparison < 0 ? value : selected) : (comparison > 0 ? value : selected);
   });
 };
@@ -803,7 +803,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
       const equal = canonicalizeJson(left.value) === canonicalizeJson(right.value);
       return known(expression.op === 'eq' ? equal : !equal);
     }
-    const comparison = compareJsonValues(left.value, right.value);
+    const comparison = compareQueryJsonValues(left.value, right.value);
     if (comparison === undefined) return { status: 'unknown' };
     return known(expression.op === 'lt' ? comparison < 0 : expression.op === 'lte' ? comparison <= 0 : expression.op === 'gt' ? comparison > 0 : comparison >= 0);
   }
@@ -850,7 +850,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
   }
   if (expression.kind === 'record') {
     const fields = projectFields(expression.fields, context);
-    return Object.values(fields).some((value) => containsLogicalUnknown(value)) ? { status: 'unknown' } : known(fields as JsonValue);
+    return Object.values(fields).some((value) => containsQueryLogicalUnknown(value)) ? { status: 'unknown' } : known(fields as JsonValue);
   }
   if (expression.kind === 'case') {
     for (const branch of expression.branches) {
@@ -1009,97 +1009,8 @@ const compareOrderedExpressions = (left: ExpressionResult, right: ExpressionResu
     return term.nulls === 'first' ? (specialIsLeft ? -1 : 1) : (specialIsLeft ? 1 : -1);
   }
   if (leftRank > 0 || left.status !== 'known' || right.status !== 'known') return 0;
-  const comparison = compareJsonValuesTotal(left.value, right.value);
+  const comparison = compareQueryJsonValuesTotal(left.value, right.value);
   return term.direction === 'asc' ? comparison : -comparison;
-};
-
-const compareJsonValues = (left: JsonValue, right: JsonValue): number | undefined => {
-  if (left === null || right === null) return left === right ? 0 : left === null ? -1 : 1;
-  if (typeof left === 'number' && typeof right === 'number') return left < right ? -1 : left > right ? 1 : 0;
-  if (typeof left === 'string' && typeof right === 'string') return left < right ? -1 : left > right ? 1 : 0;
-  if (typeof left === 'boolean' && typeof right === 'boolean') return left === right ? 0 : left ? 1 : -1;
-  if (Array.isArray(left) && Array.isArray(right)) {
-    const length = Math.min(left.length, right.length);
-    for (let index = 0; index < length; index += 1) {
-      const comparison = compareJsonValuesTotal(left[index] as JsonValue, right[index] as JsonValue);
-      if (comparison !== 0) return comparison;
-    }
-    return left.length < right.length ? -1 : left.length > right.length ? 1 : 0;
-  }
-  if (Array.isArray(left) && typeof right === 'object') return -1;
-  if (typeof left === 'object' && Array.isArray(right)) return 1;
-  if (typeof left === 'object' && typeof right === 'object') {
-    const leftRecord = left as Readonly<Record<string, JsonValue>>;
-    const rightRecord = right as Readonly<Record<string, JsonValue>>;
-    const leftKeys = Object.keys(leftRecord).sort(comparePortableStrings);
-    const rightKeys = Object.keys(rightRecord).sort(comparePortableStrings);
-    const length = Math.min(leftKeys.length, rightKeys.length);
-    for (let index = 0; index < length; index += 1) {
-      const leftKey = leftKeys[index] as string;
-      const rightKey = rightKeys[index] as string;
-      const keyComparison = comparePortableStrings(leftKey, rightKey);
-      if (keyComparison !== 0) return keyComparison;
-      const valueComparison = compareJsonValuesTotal(leftRecord[leftKey] as JsonValue, rightRecord[rightKey] as JsonValue);
-      if (valueComparison !== 0) return valueComparison;
-    }
-    return leftKeys.length < rightKeys.length ? -1 : leftKeys.length > rightKeys.length ? 1 : 0;
-  }
-  return undefined;
-};
-
-const jsonValueOrder = (value: JsonValue): number => value === null
-  ? 0
-  : typeof value === 'string'
-    ? 1
-    : typeof value === 'number'
-      ? 2
-      : typeof value === 'boolean'
-        ? 3
-        : Array.isArray(value)
-          ? 4
-          : 5;
-
-const compareJsonValuesTotal = (left: JsonValue, right: JsonValue): number => {
-  const comparable = compareJsonValues(left, right);
-  if (comparable !== undefined) return comparable;
-  const leftOrder = jsonValueOrder(left);
-  const rightOrder = jsonValueOrder(right);
-  return leftOrder < rightOrder ? -1 : leftOrder > rightOrder ? 1 : 0;
-};
-
-const containsLogicalUnknown = (value: QueryLogicalValue): boolean => {
-  if (value === logicalUnknown) return true;
-  if (Array.isArray(value)) return value.some(containsLogicalUnknown);
-  if (value !== null && typeof value === 'object') return Object.values(value).some(containsLogicalUnknown);
-  return false;
-};
-
-/** Canonical internal equality key; tags keep logical unknown disjoint from every JSON value. */
-const canonicalizeQueryValue = (value: QueryLogicalValue): string => {
-  if (value === logicalUnknown) return 'u';
-  if (Array.isArray(value)) return 'a[' + value.map(canonicalizeQueryValue).join(',') + ']';
-  if (value !== null && typeof value === 'object') {
-    const record = value as Readonly<Record<string, QueryLogicalValue>>;
-    return 'o{' + Object.keys(record).sort().map((key) => JSON.stringify(key) + ':' + canonicalizeQueryValue(record[key] as QueryLogicalValue)).join(',') + '}';
-  }
-  return 'j' + canonicalizeJson(value);
-};
-
-const queryValueEqual = (left: QueryLogicalValue, right: QueryLogicalValue): boolean => {
-  if (Object.is(left, right)) return true;
-  if (Array.isArray(left) || Array.isArray(right)) return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => queryValueEqual(value, right[index] as QueryLogicalValue));
-  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
-  const leftRecord = left as Readonly<Record<string, QueryLogicalValue>>;
-  const rightRecord = right as Readonly<Record<string, QueryLogicalValue>>;
-  let leftCount = 0;
-  for (const key in leftRecord) {
-    if (!Object.hasOwn(leftRecord, key)) continue;
-    leftCount += 1;
-    if (!Object.hasOwn(rightRecord, key) || !queryValueEqual(leftRecord[key] as QueryLogicalValue, rightRecord[key] as QueryLogicalValue)) return false;
-  }
-  let rightCount = 0;
-  for (const key in rightRecord) if (Object.hasOwn(rightRecord, key)) rightCount += 1;
-  return leftCount === rightCount;
 };
 
 const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult => {
@@ -1202,6 +1113,7 @@ export const openIncrementalQueryMaintenance = (
   plan: PreparedPlan<QueryNode>,
   initialSnapshot: QueryMaintenanceSnapshot
 ): IncrementalQueryMaintenanceSession => {
+  assertPreparedPlan(plan);
   const queryRoot = cloneAndFreezeQueryAst(plan.query);
   const graph = compileQueryGraph(queryRoot);
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
@@ -1502,6 +1414,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
   };
 
   const attachNow = (plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot => {
+    assertPreparedPlan(plan);
     if (plan.registryFingerprint !== environment.registryFingerprint) throw new TypeError('Prepared plan registry fingerprint does not match pooled query environment');
     if (plan.authorityFingerprint !== environment.authorityFingerprint) throw new TypeError('Prepared plan authority fingerprint does not match pooled query environment');
     if (plan.datasetId !== environment.datasetId) throw new TypeError('Prepared plan dataset does not match pooled query environment');

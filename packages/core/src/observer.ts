@@ -11,7 +11,15 @@ import {
   type SourceSnapshot
 } from './database.js';
 import { createIssue, type Issue } from './issues.js';
+import {
+  notifyObservers,
+  reportObserverFailure,
+  runObserverCleanups,
+  type ObserverDiagnosticReporter
+} from './observer-diagnostics.js';
 import type { PreparedPlan, SourceBasis } from './maintenance.js';
+import { assertPreparedPlan } from './internal-prepared-plan.js';
+import { deepFreezeObserverValue, detachPreparedPlan, parseObservationParameters, samePortableObserverValue } from './internal-observer-values.js';
 import {
   diffQueryMaintenanceSnapshots,
   createPooledIncrementalQueryRuntime,
@@ -29,7 +37,7 @@ import {
   type QueryRecord,
   type RelationInput
 } from './query.js';
-import { defaultValueParseBudget, safeParseJsonValue, type JsonValue } from './value.js';
+import type { JsonValue } from './value.js';
 
 export type ObservationBasis = {
   readonly dataset: { readonly datasetId: string; readonly revision: number };
@@ -150,6 +158,8 @@ export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly datasets: readonly DatasetMembership[];
   readonly canRead: (viewAuthorityScope: string, attachmentAuthorityScope: string, attachmentId: string) => boolean;
   readonly createQueryMaintenance: CreateDatabaseQueryMaintenance<Query, Row, Projection>;
+  /** Receives contained listener and lifecycle-cleanup failures. */
+  readonly onDiagnostic?: ObserverDiagnosticReporter;
   /** Already authority-filtered portable input consumed by optional tooling. */
   readonly getDatabaseDescriptionSnapshot?: () => JsonValue;
 };
@@ -187,6 +197,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   readonly #canRead: DatabaseViewOptions<Query, Row, Projection>['canRead'];
   readonly #createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
   readonly #getDatabaseDescriptionSnapshot: (() => JsonValue) | undefined;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   readonly #cache = new Map<string, SharedObservation<Query, Row, Projection>>();
   readonly #datasetRuntimes = new Map<string, DatasetCaptureRuntime<Projection>>();
   #closed = false;
@@ -199,11 +210,13 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     this.#datasets = new Map(options.datasets.map((dataset) => [dataset.datasetId, dataset]));
     this.#canRead = options.canRead;
     this.#createQueryMaintenance = options.createQueryMaintenance;
+    this.#onDiagnostic = options.onDiagnostic;
     this.#getDatabaseDescriptionSnapshot = options.getDatabaseDescriptionSnapshot;
   }
 
   observe(request: ObserveRequest<Query>): QueryObserver<Row> {
     if (this.#closed) throw new Error('Database view is closed');
+    assertPreparedPlan(request.plan);
     if (request.plan.registryFingerprint !== this.registryFingerprint) throw new Error('Prepared plan registry fingerprint does not match database view');
     if (request.plan.authorityFingerprint !== this.authorityFingerprint) throw new Error('Prepared plan authority fingerprint does not match database view');
     const dataset = this.#datasets.get(request.plan.datasetId);
@@ -220,6 +233,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
           attachments: this.#attachments,
           authorityScope: this.authorityScope,
           canRead: this.#canRead,
+          ...(this.#onDiagnostic === undefined ? {} : { onDiagnostic: this.#onDiagnostic }),
           collect: () => {
             if (this.#datasetRuntimes.get(dataset.datasetId) === runtime) this.#datasetRuntimes.delete(dataset.datasetId);
           }
@@ -233,6 +247,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
           allowPartial: request.allowPartial === true,
           runtime,
           createQueryMaintenance: this.#createQueryMaintenance,
+          ...(this.#onDiagnostic === undefined ? {} : { onDiagnostic: this.#onDiagnostic }),
           collect: () => {
             if (this.#cache.get(key) === shared) this.#cache.delete(key);
           }
@@ -277,17 +292,18 @@ export class DatabaseView<Query, Row, Projection = unknown> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    try {
-      for (const shared of Array.from(this.#cache.values())) {
-        try { shared.close(); } catch { /* one maintenance implementation cannot prevent database cleanup */ }
-      }
-    } finally {
-      this.#cache.clear();
-      for (const runtime of Array.from(this.#datasetRuntimes.values())) {
-        try { runtime.close(); } catch { /* one source runtime cannot prevent database cleanup */ }
-      }
-      this.#datasetRuntimes.clear();
-    }
+    runObserverCleanups(
+      Array.from(this.#cache.values(), (shared) => () => shared.close()),
+      { component: 'database-view', operation: 'close-observations' },
+      this.#onDiagnostic
+    );
+    this.#cache.clear();
+    runObserverCleanups(
+      Array.from(this.#datasetRuntimes.values(), (runtime) => () => runtime.close()),
+      { component: 'database-view', operation: 'close-dataset-runtimes' },
+      this.#onDiagnostic
+    );
+    this.#datasetRuntimes.clear();
   }
 }
 
@@ -325,6 +341,7 @@ type DatasetCaptureRuntimeOptions = {
   readonly authorityScope: string;
   readonly canRead: (viewAuthorityScope: string, attachmentAuthorityScope: string, attachmentId: string) => boolean;
   readonly collect: () => void;
+  readonly onDiagnostic?: ObserverDiagnosticReporter;
 };
 
 /** One authority-filtered capture and subscription topology shared by every active root in a dataset. */
@@ -402,7 +419,11 @@ class DatasetCaptureRuntime<Projection> {
           const consumers = Array.from(this.#consumers);
           for (const consumer of consumers) {
             if (!this.#consumers.has(consumer)) continue;
-            try { consumer.stageFailure(this.#state.captured, error); } catch { /* one failed consumer cannot starve peers */ }
+            try { consumer.stageFailure(this.#state.captured, error); } catch (consumerError) {
+              reportObserverFailure('listener_error', {
+                component: 'dataset-capture', operation: 'stage-capture-failure'
+              }, consumerError, this.#options.onDiagnostic);
+            }
           }
           if (this.#pending) continue;
           for (const consumer of consumers) if (this.#consumers.has(consumer)) consumer.preparePublish();
@@ -414,7 +435,11 @@ class DatasetCaptureRuntime<Projection> {
         for (const consumer of consumers) {
           if (!this.#consumers.has(consumer)) continue;
           try { consumer.stage(captured); } catch (error) {
-            try { consumer.stageFailure(captured, error); } catch { /* one failed consumer cannot starve peers */ }
+            try { consumer.stageFailure(captured, error); } catch (consumerError) {
+              reportObserverFailure('listener_error', {
+                component: 'dataset-capture', operation: 'stage-fallback-failure'
+              }, consumerError, this.#options.onDiagnostic);
+            }
           }
         }
         // A nested input change supersedes this staged pass before consumers
@@ -451,7 +476,12 @@ class DatasetCaptureRuntime<Projection> {
       try {
         unsubscribe();
         this.#sourceUnsubscribes.delete(source);
-      } catch { /* retain the handle so final cleanup can retry */ }
+      } catch (error) {
+        reportObserverFailure('cleanup_error', {
+          component: 'dataset-capture', operation: 'unsubscribe-removed-source'
+        }, error, this.#options.onDiagnostic);
+        // Retain the handle so final cleanup can retry.
+      }
     }
     for (const [source, observable] of desired) {
       if (this.#sourceUnsubscribes.has(source)) continue;
@@ -519,11 +549,11 @@ class DatasetCaptureRuntime<Projection> {
   }
 
   #cleanupSubscriptions(): void {
-    try { this.#unsubscribeDataset(); } catch { /* lifecycle cleanup is best effort */ }
-    try { this.#unsubscribeCatalog(); } catch { /* lifecycle cleanup is best effort */ }
-    for (const unsubscribe of this.#sourceUnsubscribes.values()) {
-      try { unsubscribe(); } catch { /* final retry is best effort */ }
-    }
+    runObserverCleanups([
+      this.#unsubscribeDataset,
+      this.#unsubscribeCatalog,
+      ...this.#sourceUnsubscribes.values()
+    ], { component: 'dataset-capture', operation: 'close-subscriptions' }, this.#options.onDiagnostic);
     this.#sourceUnsubscribes.clear();
   }
 }
@@ -541,6 +571,7 @@ type SharedOptions<Query, Row, Projection> = {
   readonly runtime: DatasetCaptureRuntime<Projection>;
   readonly createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
   readonly collect: () => void;
+  readonly onDiagnostic?: ObserverDiagnosticReporter;
 };
 
 class SharedObservation<Query, Row, Projection> {
@@ -579,7 +610,9 @@ class SharedObservation<Query, Row, Projection> {
     } catch (error) {
       this.#closed = true;
       this.#session = undefined;
-      try { session.close(); } catch { /* construction failure still releases ownership */ }
+      runObserverCleanups([() => session.close()], {
+        component: 'database-view', operation: 'rollback-maintenance-construction'
+      }, options.onDiagnostic);
       if (added) options.runtime.remove(this);
       throw error;
     }
@@ -587,7 +620,7 @@ class SharedObservation<Query, Row, Projection> {
 
   acquire(): QueryObserver<Row> {
     if (this.#closed) throw new Error('Shared observation is closed');
-    const lease = new ObserverLease(this, this.#publishedSnapshot);
+    const lease = new ObserverLease(this, this.#publishedSnapshot, this.#options.onDiagnostic);
     this.#leases.add(lease);
     return lease;
   }
@@ -602,7 +635,9 @@ class SharedObservation<Query, Row, Projection> {
     this.#closed = true;
     const session = this.#session;
     this.#session = undefined;
-    try { session?.close(); } catch { /* maintenance cleanup cannot retain observation lifecycle */ }
+    if (session !== undefined) runObserverCleanups([() => session.close()], {
+      component: 'database-view', operation: 'close-maintenance'
+    }, this.#options.onDiagnostic);
     try {
       this.#options.runtime.remove(this);
     } finally {
@@ -634,7 +669,7 @@ class SharedObservation<Query, Row, Projection> {
     const previousSnapshot = this.#snapshot;
     if (previousSnapshot.state !== 'open') return;
     const nextSnapshot = this.#observerSnapshot(current, previousSnapshot);
-    if (samePortable(this.#publishedSnapshot, nextSnapshot)) {
+    if (samePortableObserverValue(this.#publishedSnapshot, nextSnapshot)) {
       this.#snapshot = this.#publishedSnapshot;
       return;
     }
@@ -981,7 +1016,7 @@ const pooledDatabaseCohortKey = (
   parameters
 ] as JsonValue);
 
-const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => left === right || samePortable(
+const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => left === right || samePortableObserverValue(
   { relations: left.relations, parameters: left.parameters, basis: left.basis, membershipRevision: left.membershipRevision },
   { relations: right.relations, parameters: right.parameters, basis: right.basis, membershipRevision: right.membershipRevision }
 );
@@ -1076,7 +1111,7 @@ const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | 
   return normalize;
 };
 
-const freezeQueryMaintenanceUpdate = (update: QueryMaintenanceUpdate): QueryMaintenanceUpdate => deepFreezeClone(update);
+const freezeQueryMaintenanceUpdate = (update: QueryMaintenanceUpdate): QueryMaintenanceUpdate => deepFreezeObserverValue(update);
 
 const normalizeQueryMaintenanceSnapshot = (
   input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
@@ -1125,11 +1160,13 @@ class ObserverLease<Row> implements QueryObserver<Row> {
   #shared: ObserverLeaseOwner<Row> | undefined;
   readonly #listeners = new Set<(change: ObserverChange<Row>) => void>();
   #snapshot: ObserverSnapshot<Row>;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   #closed = false;
 
-  constructor(shared: ObserverLeaseOwner<Row>, snapshot: ObserverSnapshot<Row>) {
+  constructor(shared: ObserverLeaseOwner<Row>, snapshot: ObserverSnapshot<Row>, onDiagnostic?: ObserverDiagnosticReporter) {
     this.#shared = shared;
     this.#snapshot = snapshot;
+    this.#onDiagnostic = onDiagnostic;
   }
 
   getSnapshot(): ObserverSnapshot<Row> { return this.#snapshot; }
@@ -1165,9 +1202,9 @@ class ObserverLease<Row> implements QueryObserver<Row> {
 
   publish(change: ObserverChange<Row>): void {
     if (this.#closed) return;
-    for (const listener of Array.from(this.#listeners)) {
-      try { listener(change); } catch { /* one consumer cannot break observation */ }
-    }
+    notifyObservers(this.#listeners, (listener) => listener(change), {
+      component: 'query-observer', operation: 'publish'
+    }, this.#onDiagnostic);
   }
 }
 
@@ -1226,7 +1263,7 @@ const resultDiff = <Row>(before: ObservedQueryResult<Row>, after: ObservedQueryR
   const removed = [...beforeRows].filter(([key]) => !afterRows.has(key)).map(([key, row]) => Object.freeze({ key, row }));
   const updated = [...afterRows].flatMap(([key, row]) => {
     const prior = beforeRows.get(key);
-    return prior === undefined || samePortable(prior, row) ? [] : [Object.freeze({ key, before: prior, after: row })];
+    return prior === undefined || samePortableObserverValue(prior, row) ? [] : [Object.freeze({ key, before: prior, after: row })];
   });
   return Object.freeze({ added: Object.freeze(added), removed: Object.freeze(removed), updated: Object.freeze(updated) });
 };
@@ -1241,58 +1278,8 @@ const compositeFreshness = (evidence: readonly SourceEvidence[]): 'current' | 's
 
 const staleResult = <Row>(result: ObservedQueryResult<Row>): ObservedQueryResult<Row> => result.freshness === 'stale' ? result : freezeResult({ ...result, freshness: 'stale' });
 
-const freezeResult = <Row>(result: ObservedQueryResult<Row>): ObservedQueryResult<Row> => deepFreezeClone(result);
-const freezeEvidence = (evidence: SourceEvidence): SourceEvidence => deepFreezeClone(evidence);
-
-const deepFreezeClone = <Value>(value: Value, seen = new WeakMap<object, object>()): Value => {
-  if (value === null || typeof value !== 'object') return value;
-  const prior = seen.get(value);
-  if (prior !== undefined) return prior as Value;
-  if (Array.isArray(value)) {
-    const output: unknown[] = [];
-    seen.set(value, output);
-    for (const item of value) output.push(deepFreezeClone(item, seen));
-    return Object.freeze(output) as Value;
-  }
-  const output: Record<string, unknown> = {};
-  seen.set(value, output);
-  for (const [key, item] of Object.entries(value)) {
-    Object.defineProperty(output, key, {
-      value: deepFreezeClone(item, seen),
-      enumerable: true,
-      configurable: true,
-      writable: true
-    });
-  }
-  return Object.freeze(output) as Value;
-};
-
-const parseObservationParameters = (input: unknown): Readonly<Record<string, JsonValue>> => {
-  const parsed = safeParseJsonValue(input);
-  if (!parsed.success) throw new TypeError('Observation parameters must be a portable record: ' + parsed.issues.map(({ code }) => code).join(', '));
-  if (parsed.value === null || Array.isArray(parsed.value) || typeof parsed.value !== 'object') {
-    throw new TypeError('Observation parameters must be a portable record');
-  }
-  return deepFreezeClone(parsed.value) as Readonly<Record<string, JsonValue>>;
-};
-
-const detachPreparedPlan = <Query>(plan: PreparedPlan<Query>): PreparedPlan<Query> => {
-  const parsed = safeParseJsonValue(plan.query, { ...defaultValueParseBudget, maxDepth: 1_024 });
-  if (!parsed.success) throw new TypeError('Prepared plan query must be a portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
-  return Object.freeze({
-    planId: plan.planId,
-    rootNodeId: plan.rootNodeId,
-    query: deepFreezeClone(parsed.value) as Query,
-    registryFingerprint: plan.registryFingerprint,
-    authorityFingerprint: plan.authorityFingerprint,
-    datasetId: plan.datasetId
-  });
-};
-
-const samePortable = (left: unknown, right: unknown): boolean => {
-  if (Object.is(left, right)) return true;
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
-};
+const freezeResult = <Row>(result: ObservedQueryResult<Row>): ObservedQueryResult<Row> => deepFreezeObserverValue(result);
+const freezeEvidence = (evidence: SourceEvidence): SourceEvidence => deepFreezeObserverValue(evidence);
 
 const observationIssue = (code: string, retry: 'after_refresh' | 'after_capability' | 'after_authority', details: unknown): Issue => createIssue({
   code,

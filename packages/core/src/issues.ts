@@ -39,12 +39,14 @@ export type Issue = {
   readonly phase: IssuePhase;
   readonly sourceId?: string;
   readonly relationId?: string;
+  /** Portable row or locator identity; copied and frozen by `createIssue`. */
   readonly key?: unknown;
+  /** Portable diagnostic path; copied and frozen by `createIssue`. */
   readonly path?: readonly unknown[];
   readonly operationId?: string;
   readonly requiredCapabilities?: readonly CapabilityRef[];
   readonly retry?: IssueRetry;
-  /** Must be JSON-serializable; non-portable host values are programmer errors in `createIssue`. */
+  /** Portable diagnostic context; copied and frozen by `createIssue`. Non-portable host values are programmer errors. */
   readonly details?: unknown;
 };
 
@@ -270,15 +272,20 @@ export const createIssue = (input: IssueInput): Issue => {
   const phase = input.phase ?? declaration?.phase;
   const severity = input.severity ?? declaration?.severity;
   if (phase === undefined || severity === undefined) throw new Error('Unregistered issue code requires explicit phase and severity: ' + input.code);
+  const key = input.key === undefined ? undefined : ownIssueValue(input.key, 'key');
+  const pathValue = input.path === undefined ? undefined : ownIssueValue(input.path, 'path');
+  if (pathValue !== undefined && !Array.isArray(pathValue)) throw invalidIssueValue('path', 'array required');
+  const path = pathValue as readonly unknown[] | undefined;
+  const details = input.details === undefined ? undefined : ownIssueValue(input.details, 'details');
   const identity = stableIssueIdentity({
     code: input.code,
     sourceId: input.sourceId,
     relationId: input.relationId,
-    key: input.key,
-    path: input.path,
+    key,
+    path,
     operationId: input.operationId,
     requiredCapabilities: input.requiredCapabilities,
-    details: input.details
+    details
   });
   return Object.freeze({
     id: input.code + ':' + identity,
@@ -287,14 +294,74 @@ export const createIssue = (input: IssueInput): Issue => {
     severity,
     ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
     ...(input.relationId === undefined ? {} : { relationId: input.relationId }),
-    ...(input.key === undefined ? {} : { key: input.key }),
-    ...(input.path === undefined ? {} : { path: Object.freeze([...input.path]) }),
+    ...(key === undefined ? {} : { key }),
+    ...(path === undefined ? {} : { path }),
     ...(input.operationId === undefined ? {} : { operationId: input.operationId }),
     ...(input.requiredCapabilities === undefined ? {} : { requiredCapabilities: Object.freeze(input.requiredCapabilities.map((ref) => Object.freeze({ ...ref }))) }),
     ...(input.retry === undefined ? {} : { retry: input.retry }),
-    ...(input.details === undefined ? {} : { details: input.details })
+    ...(details === undefined ? {} : { details })
   });
 };
+
+const forbiddenPortableKeys = new Set(['__proto__', 'constructor', 'prototype']);
+
+/**
+ * Owns identity-bearing issue data without executing accessors. `createIssue` is
+ * a throwing shell, so violations of its documented portable-value contract are
+ * programmer errors rather than issues (which would recurse through this API).
+ */
+const ownIssueValue = (input: unknown, member: 'key' | 'path' | 'details'): unknown => {
+  const ancestors = new Set<object>();
+  let members = 0;
+  const visit = (value: unknown, depth: number): unknown => {
+    if (depth > 64) throw invalidIssueValue(member, 'maximum depth exceeded');
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw invalidIssueValue(member, 'number must be finite');
+      return Object.is(value, -0) ? 0 : value;
+    }
+    if (typeof value !== 'object') throw invalidIssueValue(member, `unsupported ${typeof value}`);
+    try {
+      if (ancestors.has(value)) throw invalidIssueValue(member, 'cyclic value');
+      if (Object.getPrototypeOf(value) !== Object.prototype && !Array.isArray(value)) throw invalidIssueValue(member, 'object must have the default prototype');
+      ancestors.add(value);
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      const keys = Reflect.ownKeys(value);
+      if (keys.some((key) => typeof key !== 'string')) throw invalidIssueValue(member, 'symbol properties are not portable');
+      members += keys.length;
+      if (members > 500_000) throw invalidIssueValue(member, 'maximum member count exceeded');
+      if (Array.isArray(value)) {
+        if (keys.some((key) => key !== 'length' && !/^(0|[1-9][0-9]*)$/.test(key as string))) throw invalidIssueValue(member, 'array properties must be indexed members');
+        const length = descriptors.length?.value;
+        if (!Number.isSafeInteger(length) || length < 0) throw invalidIssueValue(member, 'array length is invalid');
+        const owned: unknown[] = [];
+        for (let index = 0; index < length; index += 1) {
+          const descriptor = descriptors[String(index)];
+          if (descriptor === undefined) throw invalidIssueValue(member, 'sparse arrays are not portable');
+          if (!descriptor.enumerable || !('value' in descriptor)) throw invalidIssueValue(member, 'array members must be enumerable data properties');
+          owned.push(visit(descriptor.value, depth + 1));
+        }
+        return Object.freeze(owned);
+      }
+      const owned: Record<string, unknown> = {};
+      for (const key of keys as string[]) {
+        if (forbiddenPortableKeys.has(key)) throw invalidIssueValue(member, `property ${key} is not portable`);
+        const descriptor = descriptors[key];
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw invalidIssueValue(member, 'object members must be enumerable data properties');
+        Object.defineProperty(owned, key, { value: visit(descriptor.value, depth + 1), enumerable: true, configurable: false, writable: false });
+      }
+      return Object.freeze(owned);
+    } catch (error) {
+      if (error instanceof TypeError && error.message.startsWith('Invalid issue ')) throw error;
+      throw invalidIssueValue(member, 'inspection failed');
+    } finally {
+      ancestors.delete(value);
+    }
+  };
+  return visit(input, 0);
+};
+
+const invalidIssueValue = (member: string, reason: string): TypeError => new TypeError(`Invalid issue ${member}: ${reason}`);
 
 const stableIssueIdentity = (input: Record<string, unknown>): string => {
   const entries = Object.entries(input).filter(([, value]) => value !== undefined).sort(([left], [right]) => comparePortableStrings(left, right));

@@ -55,20 +55,13 @@ const query = pipe(
   typedWhere(typedCompare('eq', base.aliases.entry.row.owner, typedParameter('owner', referenceTo(accounts)))),
   typedWhere(typedCompare('eq', base.aliases.entry.row.slug, typedParameter('slug', customScalar<Slug>(slugCodec))))
 );
-const rawPlan = {
-  planId: 'plan:entries',
-  rootNodeId: 'plan:entries:root',
-  query: query.root,
-  registryFingerprint: 'registry:one',
-  authorityFingerprint: 'authority:one',
-  datasetId: 'dataset:one'
-};
-const prepared = typedPreparedPlan(rawPlan, query);
 const prepareRuntimePlan = () => prepareTypedQuery(query, {
   registryFingerprint: 'registry:one',
   authorityFingerprint: 'authority:one',
   datasetId: 'dataset:one'
 });
+const runtimePlan = await prepareRuntimePlan();
+const prepared = typedPreparedPlan(runtimePlan, query);
 type RuntimePreparedPlan = Awaited<ReturnType<typeof prepareRuntimePlan>>;
 type Row = {
   readonly id: string;
@@ -115,7 +108,7 @@ void invalidPendingMutation;
 
 describe('React typed-query contract', () => {
   it('keeps type evidence phantom and the prepared plan unchanged', () => {
-    expect(prepared).toBe(rawPlan);
+    expect(prepared).toBe(runtimePlan);
     expect(Object.keys(prepared)).not.toContain('__tarstateRowType');
     expectTypeOf(prepared).toMatchTypeOf<ReactPreparedPlan<QueryNode, Row, Parameters>>();
     expectTypeOf<RuntimePreparedPlan>().toEqualTypeOf<ReactPreparedPlan<QueryNode, Row, Parameters>>();

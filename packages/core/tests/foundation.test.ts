@@ -140,6 +140,39 @@ describe('production foundation', () => {
     expect(Object.isFrozen(issue.requiredCapabilities)).toBe(true);
   });
 
+  it('owns identity-bearing issue payloads before generating their id', () => {
+    const key = { tenant: 'one', nested: [1, { active: true }] };
+    const path = ['relations', { id: 'users' }];
+    const details = { reason: 'not_ready', context: { attempts: [1, 2] } };
+    const issue = createIssue({ code: 'source.not_ready', key, path, details });
+    const originalId = issue.id;
+
+    key.tenant = 'two';
+    key.nested[1] = { active: false };
+    path[0] = 'changed';
+    details.context.attempts.push(3);
+
+    expect(issue.id).toBe(originalId);
+    expect(issue.key).toEqual({ tenant: 'one', nested: [1, { active: true }] });
+    expect(issue.path).toEqual(['relations', { id: 'users' }]);
+    expect(issue.details).toEqual({ reason: 'not_ready', context: { attempts: [1, 2] } });
+    expect(Object.isFrozen(issue.key)).toBe(true);
+    expect(Object.isFrozen((issue.key as { nested: unknown[] }).nested)).toBe(true);
+    expect(Object.isFrozen(issue.details)).toBe(true);
+    expect(Object.isFrozen((issue.details as { context: { attempts: unknown[] } }).context.attempts)).toBe(true);
+    expect(createIssue({ code: 'source.not_ready', key: { tenant: 'one', nested: [1, { active: true }] }, path: ['relations', { id: 'users' }], details: { reason: 'not_ready', context: { attempts: [1, 2] } } }).id).toBe(originalId);
+  });
+
+  it('rejects non-portable and hostile issue payloads as programmer errors', () => {
+    let reads = 0;
+    const hostile = Object.defineProperty({}, 'secret', { enumerable: true, get: () => { reads += 1; return 'read'; } });
+    expect(() => createIssue({ code: 'source.not_ready', details: hostile })).toThrow(TypeError);
+    expect(reads).toBe(0);
+    expect(() => createIssue({ code: 'source.not_ready', key: new Date() })).toThrow(/Invalid issue key/);
+    expect(() => createIssue({ code: 'source.not_ready', path: ['state', undefined] })).toThrow(/Invalid issue path/);
+    expect(() => createIssue({ code: 'source.not_ready', details: { value: Number.NaN } })).toThrow(/Invalid issue details/);
+  });
+
   it('round-trips artifacts and rejects hash/dependency ambiguity', async () => {
     const artifact = await sealArtifact({ kind: 'schema', id: 'urn:test:schema', body: { relations: {} } });
     const parsed = await parseArtifactText(JSON.stringify(artifact));

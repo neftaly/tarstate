@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
 import { pipe } from '../src/query-builder.js';
+import { prepareQuery } from '../src/query.js';
 import {
   customScalar,
   prepareTypedQuery,
@@ -128,7 +129,7 @@ describe('literal-schema and query type authoring', () => {
     >>();
   });
 
-  it('ties reference values to target key tuples and keeps typed operators pipe-compatible', () => {
+  it('ties reference values to target key tuples and keeps typed operators pipe-compatible', async () => {
     const accounts = relationDeclaration({
       relationId: 'example.account',
       key: ['tenant', 'accountId'],
@@ -158,14 +159,12 @@ describe('literal-schema and query type authoring', () => {
       typedWhere(typedCompare('eq', base.aliases.event.row.account, parameter)),
       typedSelect('result', { id: base.aliases.event.row.id, account: base.aliases.event.row.account })
     );
-    const plan = {
-      planId: 'plan:events',
-      rootNodeId: 'plan:events:root',
-      query: query.root,
+    const plan = await prepareQuery({
+      root: query.root,
       registryFingerprint: 'registry:one',
       authorityFingerprint: 'authority:one',
       datasetId: 'dataset:one'
-    };
+    });
     const prepared = typedPreparedPlan(plan, query);
 
     expect(referenceTo(accounts)).toEqual({ kind: 'ref', target: { relationId: 'example.account' } });

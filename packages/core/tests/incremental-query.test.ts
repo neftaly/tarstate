@@ -13,6 +13,7 @@ import {
   type QueryMaintenanceSnapshot,
 } from '../src/query.js';
 import type { PreparedPlan } from '../src/maintenance.js';
+import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
 import { logicalUnknown, type JsonValue } from '../src/value.js';
 import type { ArtifactRef } from '../src/artifacts.js';
 
@@ -166,7 +167,7 @@ const operatorQueries: Readonly<Record<string, QueryNode>> = {
   recursive
 };
 
-const plan = (query: QueryNode): PreparedPlan<QueryNode> => ({
+const plan = (query: QueryNode): PreparedPlan<QueryNode> => sealPreparedPlan({
   planId: 'plan:test',
   rootNodeId: 'plan:test:root',
   query,
@@ -189,6 +190,17 @@ const applySnapshot = (session: ReturnType<typeof openIncrementalQueryMaintenanc
   session.applyUpdate(diffQueryMaintenanceSnapshots(before, after));
 
 describe('incremental query maintenance', () => {
+  it('rejects structurally forged and spread-cloned plans at execution boundaries', () => {
+    const legitimate = plan(people);
+    const snapshot: QueryMaintenanceSnapshot = { relations: [] };
+
+    expect(() => openIncrementalQueryMaintenance({ ...legitimate }, snapshot)).toThrow('not produced by a plan preparation API');
+    expect(() => openIncrementalQueryMaintenance({
+      planId: 'forged', rootNodeId: 'forged:root', query: people,
+      registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test'
+    } as unknown as PreparedPlan<QueryNode>, snapshot)).toThrow('not produced by a plan preparation API');
+  });
+
   it('detaches the private-session query plan from later caller mutation', () => {
     const predicate = { kind: 'literal' as const, value: true };
     const query: QueryNode = { kind: 'where', input: from('owned-plan', 'row'), predicate };
@@ -927,11 +939,11 @@ describe('incremental query maintenance', () => {
       initialSnapshot: initial
     });
     const residentQueries = Array.from({ length: 8 }, (_, index) => suffix(index));
-    const residents = residentQueries.map((query, index) => runtime.attach({ ...plan(query), planId: 'resident:' + index, rootNodeId: 'resident:' + index + ':root' }));
+    const residents = residentQueries.map((query, index) => runtime.attach(sealPreparedPlan({ ...plan(query), planId: 'resident:' + index, rootNodeId: 'resident:' + index + ':root' })));
 
     for (let index = 0; index < 2_500; index += 1) {
       const query = suffix(10_000 + index);
-      const root = runtime.attach({ ...plan(query), planId: 'churn:' + index, rootNodeId: 'churn:' + index + ':root' });
+      const root = runtime.attach(sealPreparedPlan({ ...plan(query), planId: 'churn:' + index, rootNodeId: 'churn:' + index + ':root' }));
       root.close();
     }
     expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 8, physicalNodeCount: 10, sharedPhysicalNodeCount: 2 });

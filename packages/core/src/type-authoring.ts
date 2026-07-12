@@ -5,6 +5,7 @@ import type { PipeOperator, PipeType } from './internal-pipe.js';
 import { prepareQuery, type Expr, type QueryNode } from './query.js';
 import type { QueryArtifact, QueryArtifactBody, ValueDeclaration } from './query-builder.js';
 import type { PreparedPlan } from './maintenance.js';
+import { assertPreparedPlan } from './internal-prepared-plan.js';
 import type { FieldDeclaration, RelationDeclaration, SchemaBody } from './schema.js';
 import type { JsonValue, PortableValue, TaggedValue } from './value.js';
 
@@ -374,6 +375,7 @@ export const typedPreparedPlan = <
   plan: PreparedPlan<QueryNode>,
   query: TypedQuery<Aliases, Parameters, Row>
 ): TypedPreparedPlan<QueryNode, Row, { readonly [Name in keyof Parameters]: ValueOfDeclaration<Parameters[Name]> }> => {
+  assertPreparedPlan(plan);
   if (canonicalizeJson(plan.query as JsonValue) !== canonicalizeJson(query.root as JsonValue)) throw new Error('Prepared plan root does not match the typed query');
   return plan;
 };
