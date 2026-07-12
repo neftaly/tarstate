@@ -5,6 +5,7 @@ import {
   openIncrementalQueryMaintenance,
   resolveLensPath,
   safeParseReceipt,
+  validateLens,
   type ArtifactRef,
   type IncrementalQueryResult,
   type JsonValue,
@@ -505,7 +506,9 @@ describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
       for (let edge = 0; edge < nodeCount * 3; edge += 1) {
         const from = nodes[integer(nodes.length)] as ArtifactRef;
         const to = nodes[integer(nodes.length)] as ArtifactRef;
-        candidates.push({ ref: { id: 'urn:fuzz:lens:' + edge, contentHash: hash(edge + 3) }, body: { from, to, relations: [] } });
+        const validated = validateLens({ from, to, relations: [] });
+        if (!validated.success) throw new Error('generated lens failed validation');
+        candidates.push({ ref: { id: 'urn:fuzz:lens:' + edge, contentHash: hash(edge + 3) }, body: validated.value });
       }
       const from = nodes[0] as ArtifactRef;
       const to = nodes.at(-1) as ArtifactRef;

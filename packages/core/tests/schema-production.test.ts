@@ -277,10 +277,13 @@ describe('production schema lenses', () => {
       }
     ]
   };
+  const validated = validateLens(body);
+  if (!validated.success) throw new Error('fixture lens failed validation');
+  const lens = validated.value;
 
   it('rejects an unmapped candidate instead of exposing partial exact data', () => {
     const rows: LensRows = { 'test.task': [{ slug: 'a', name: 'A', state: 'open' }, { slug: 'b', name: 'B', state: 'future' }] };
-    const projection = projectLensRelation(body, 'test.task', rows);
+    const projection = projectLensRelation(lens, 'test.task', rows);
     expect(projection.rows).toEqual([{ id: 'a', title: 'A', status: 'active' }]);
     expect(projection.rejected).toMatchObject([{ rowIndex: 1 }]);
     expect(projection.issues).toMatchObject([{ code: 'lens.unmapped_value' }]);
@@ -292,12 +295,12 @@ describe('production schema lenses', () => {
       'test.task': [{ slug: 'a', name: 'A', state: 'open', serverOnly: { retained: true } }],
       'test.comment': [{ id: 'c', taskPair: 'a' }]
     };
-    expect(projectLensRelation(body, 'test.comment', rows)).toMatchObject({ rows: [], rejected: [{ rowIndex: 0 }], issues: [{ code: 'lens.lookup_arity' }] });
-    const translated = translateLensEdits(body, 'test.task', rows['test.task']?.[0] ?? {}, { title: 'Renamed' }, rows);
+    expect(projectLensRelation(lens, 'test.comment', rows)).toMatchObject({ rows: [], rejected: [{ rowIndex: 0 }], issues: [{ code: 'lens.lookup_arity' }] });
+    const translated = translateLensEdits(lens, 'test.task', rows['test.task']?.[0] ?? {}, { title: 'Renamed' }, rows);
     expect(translated).toEqual({ success: true, value: { name: 'Renamed' }, issues: [] });
   });
 
-  it('rejects ambiguous inverse derivation instead of choosing a write path by order', () => {
+  it('rejects ambiguous inverse derivation during validation', () => {
     const task = body.relations[0]!;
     const ambiguous: SchemaLensBody = {
       ...body,
@@ -306,14 +309,14 @@ describe('production schema lenses', () => {
         steps: [...task.steps, { kind: 'lens.field', from: 'legacyName', to: 'title', write: 'invertible' }]
       }, ...body.relations.slice(1)]
     };
-    expect(translateLensEdits(ambiguous, 'test.task', { name: 'A', legacyName: 'Old' }, { title: 'Renamed' }, {}))
-      .toMatchObject({ success: false, issues: [{ code: 'lens.inverse_ambiguous', path: ['title'] }] });
+    expect(validateLens(ambiguous))
+      .toMatchObject({ success: false, issues: [{ code: 'lens.field_ambiguous', path: [0, 'steps', 4] }] });
   });
 
   it('resolves only a single unambiguous exact path', () => {
     expect(validateLens(body)).toMatchObject({ success: true });
-    const first: LensArtifact = { ref: { id: 'urn:test:lens:first', contentHash: hash('5') }, body };
-    const second: LensArtifact = { ref: { id: 'urn:test:lens:second', contentHash: hash('6') }, body };
+    const first: LensArtifact = { ref: { id: 'urn:test:lens:first', contentHash: hash('5') }, body: lens };
+    const second: LensArtifact = { ref: { id: 'urn:test:lens:second', contentHash: hash('6') }, body: lens };
     expect(resolveLensPath(from, to, [first])).toMatchObject({ outcome: 'resolved', path: [{ ref: first.ref }] });
     expect(resolveLensPath(from, to, [first, second])).toMatchObject({ outcome: 'rejected', issues: [{ code: 'lens.path_ambiguous' }] });
     expect(resolveLensPath(from, to, [first, second], [first.ref])).toMatchObject({ outcome: 'resolved', path: [{ ref: first.ref }] });
@@ -351,6 +354,17 @@ describe('production schema lenses', () => {
     expect(Object.isFrozen(validated.value)).toBe(true);
     expect(Object.isFrozen(ownedRelation.steps)).toBe(true);
     expect(Object.isFrozen((ownedRelation.steps[0] as { readonly cases: readonly unknown[] }).cases)).toBe(true);
+  });
+
+  it('requires validated lenses at projection and edit boundaries', () => {
+    const invalidCallsAreRejectedByTypecheck = (): void => {
+      // @ts-expect-error portable authoring input must pass through validateLens first
+      projectLensRelation(body, 'test.task', {});
+      // @ts-expect-error portable authoring input must pass through validateLens first
+      translateLensEdits(body, 'test.task', {}, {}, {});
+    };
+    expect(invalidCallsAreRejectedByTypecheck).toBeTypeOf('function');
+    expect(projectLensRelation(lens, 'test.task', {})).toMatchObject({ rows: [] });
   });
 
   it('rejects hostile lens input before adopting it', () => {

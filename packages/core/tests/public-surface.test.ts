@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import * as core from '../src/index.js';
+import * as artifacts from '@tarstate/core/artifacts';
+import * as database from '@tarstate/core/database';
+import * as query from '@tarstate/core/query';
+import * as schema from '@tarstate/core/schema';
+import * as transactions from '@tarstate/core/transactions';
 
 describe('clean rewrite core surface', () => {
   it('exposes the production foundation at the package root', () => {
@@ -33,6 +38,21 @@ describe('clean rewrite core surface', () => {
 
   it('matches the curated runtime export surface', () => {
     expect(Object.keys(core).sort()).toMatchSnapshot();
+  });
+
+  it('offers additive topic entry points with the same runtime identities', () => {
+    expect(artifacts.safeParseArtifactText).toBe(core.safeParseArtifactText);
+    expect(database.DatabaseView).toBe(core.DatabaseView);
+    expect(query.evaluateQuery).toBe(core.evaluateQuery);
+    expect(query.prepareTypedQuery).toBe(core.prepareTypedQuery);
+    expect(query.typedSelect).toBe(core.typedSelect);
+    expect(schema.prepareSchema).toBe(core.prepareSchema);
+    expect(schema.schemaLiteral).toBe(core.schemaLiteral);
+    expect(transactions.sealTransaction).toBe(core.sealTransaction);
+    expect(transactions.typedReturning).toBe(core.typedReturning);
+    expect('createPooledIncrementalQueryRuntime' in query).toBe(false);
+    expect('typedReturning' in query).toBe(false);
+    expect('typedSelect' in schema).toBe(false);
   });
 
   it('does not retain legacy API names', () => {

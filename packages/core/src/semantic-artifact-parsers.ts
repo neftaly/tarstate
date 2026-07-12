@@ -9,7 +9,7 @@ import {
 import { compileSourceConstraints, type ConstraintSetArtifact } from './constraint-artifact.js';
 import type { SourceConstraint } from './constraints.js';
 import { createIssue, TarstateParseError, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
-import { validateLens, type SchemaLensArtifact } from './lens.js';
+import { validateLens, type SchemaLensArtifact, type ValidatedSchemaLensArtifact } from './lens.js';
 import { compileStorageMapping, type CompiledStorageMapping, type StorageMappingArtifact } from './mapping.js';
 import type { SourceBasis } from './maintenance.js';
 import { evaluateQuery, prepareQuery, type FunctionRegistry, type QueryResult, type RelationInput } from './query.js';
@@ -131,7 +131,7 @@ export const safePrepareStorageMappingArtifact = async (input: unknown, options:
   return compiled.success ? { success: true, value: { artifact: parsed.value, compiled: compiled.value }, issues: [] } : compiled;
 };
 
-export const safePrepareSchemaLensArtifact = async (input: unknown, budget?: SemanticArtifactParseBudget): Promise<ParseResult<SchemaLensArtifact>> => {
+export const safePrepareSchemaLensArtifact = async (input: unknown, budget?: SemanticArtifactParseBudget): Promise<ParseResult<ValidatedSchemaLensArtifact>> => {
   const parsed = await safeParseSchemaLensArtifact(input, budget);
   if (!parsed.success) return parsed;
   const validated = validateLens(parsed.value.body);

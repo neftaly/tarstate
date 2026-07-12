@@ -203,6 +203,26 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
+  it('detaches function registry membership while retaining implementation identity', () => {
+    const capability = { id: 'urn:test:owned-registry', version: '1', contractHash: `sha256:${'e'.repeat(64)}` } as const;
+    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const original = (args: readonly JsonValue[]) => typeof args[0] === 'string' ? args[0] + '!' : 'unexpected';
+    const functions = new Map([[key, original]]);
+    const query: QueryNode = {
+      kind: 'select', input: people, alias: 'result',
+      fields: { value: { kind: 'call', capability, args: [field('p', 'name')] } }
+    };
+    const initial = { ...snapshot(basePeople, 1), functions };
+    const next = { ...snapshot(middlePeople, 2), functions };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    functions.set(key, () => 'replaced');
+
+    expect(session.getCurrentResult().rows).toEqual([{ value: 'Ada!' }, { value: 'Bob!' }]);
+    expect(applySnapshot(session, initial, next).rows).toEqual([{ value: 'Ada!' }, { value: 'Bob!' }, { value: 'Cy!' }]);
+    session.close();
+  });
+
   it('owns private-session inputs, changed rows, and cached public row views', () => {
     const firstRow = { id: 1, nested: { label: 'one' } };
     const secondRow = { id: 2, nested: { label: 'two' } };

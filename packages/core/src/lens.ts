@@ -40,11 +40,26 @@ export type SchemaLensBody = {
   readonly to: ArtifactRef;
   readonly relations: readonly LensRelation[];
 };
+declare const validatedLensBrand: unique symbol;
+declare const validatedLensStepsBrand: unique symbol;
+/**
+ * A detached, immutable lens relation whose steps have passed `validateLens`.
+ * Obtain this type through `validateLens`; it is not an authoring input type.
+ */
+export type ValidatedLensSteps = readonly LensStep[] & { readonly [validatedLensStepsBrand]: true };
+export type ValidatedLensRelation = Omit<LensRelation, 'steps'> & { readonly steps: ValidatedLensSteps };
+/** A detached, immutable schema lens accepted by projection and edit translation. */
+export type ValidatedSchemaLensBody = Omit<SchemaLensBody, 'relations'> & {
+  readonly relations: readonly ValidatedLensRelation[];
+  readonly [validatedLensBrand]: true;
+};
 /** Sealed portable schema-lens artifact with its typed body preserved. */
 export type SchemaLensArtifact = TypedArtifact<'schema-lens', SchemaLensBody>;
+/** A schema-lens artifact whose body has passed `validateLens`. */
+export type ValidatedSchemaLensArtifact = Omit<SchemaLensArtifact, 'body'> & { readonly body: ValidatedSchemaLensBody };
 /** Seals a typed schema lens without a `JsonValue` assertion at the call site. */
 export const sealSchemaLens = (input: TypedArtifactInput<SchemaLensBody>): Promise<SchemaLensArtifact> => sealTypedArtifact('schema-lens', input);
-export type LensArtifact = { readonly ref: ArtifactRef; readonly body: SchemaLensBody };
+export type LensArtifact = { readonly ref: ArtifactRef; readonly body: ValidatedSchemaLensBody };
 export type LensRows = Readonly<Record<RelationId, readonly RelationRow[]>>;
 
 export type LensResolution =
@@ -112,7 +127,7 @@ export const resolveLensPath = (
   return { outcome: 'resolved', path: paths[0] as LensArtifact[], issues: [] };
 };
 
-export const validateLens = (input: unknown): ParseResult<SchemaLensBody> => {
+export const validateLens = (input: unknown): ParseResult<ValidatedSchemaLensBody> => {
   const owned = detachAndFreezeJsonValue(input);
   if (!owned.success) return owned;
   if (!isRecord(owned.value) || !isArtifactRef(owned.value.from) || !isArtifactRef(owned.value.to) || !Array.isArray(owned.value.relations)) return lensFailure('lens.invalid', 'parse', [], { reason: 'shape' });
@@ -130,10 +145,12 @@ export const validateLens = (input: unknown): ParseResult<SchemaLensBody> => {
       if (step.kind === 'lens.lookup' && (step.sourceFields.length === 0 || step.resultFields.length === 0)) issues.push(lensIssue('lens.lookup_arity', 'parse', [relationIndex, 'steps', stepIndex]));
     });
   });
-  return issues.length > 0 ? { success: false, issues } : { success: true, value: body, issues: [] };
+  return issues.length > 0
+    ? { success: false, issues }
+    : { success: true, value: body as ValidatedSchemaLensBody, issues: [] };
 };
 
-export const projectLensRelation = (lens: SchemaLensBody, relationId: RelationId, rows: LensRows): LensProjection => {
+export const projectLensRelation = (lens: ValidatedSchemaLensBody, relationId: RelationId, rows: LensRows): LensProjection => {
   const relation = lens.relations.find((candidate) => candidate.toRelationId === relationId);
   if (relation === undefined) return { rows: [], rejected: [], issues: [lensIssue('lens.relation_missing', 'query', [], { relationId })], completeness: 'unknown' };
   const projected: RelationRow[] = [];
@@ -148,7 +165,7 @@ export const projectLensRelation = (lens: SchemaLensBody, relationId: RelationId
 };
 
 export const projectLensCandidate = (
-  steps: readonly LensStep[],
+  steps: ValidatedLensSteps,
   row: RelationRow,
   rows: LensRows,
   rowIndex?: number
@@ -185,7 +202,7 @@ export const projectLensCandidate = (
 };
 
 export const translateLensEdits = (
-  lens: SchemaLensBody,
+  lens: ValidatedSchemaLensBody,
   relationId: RelationId,
   storedRow: RelationRow,
   edits: Readonly<Record<string, PortableValue>>,

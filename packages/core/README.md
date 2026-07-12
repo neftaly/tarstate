@@ -3,6 +3,25 @@
 Portable artifacts, schemas, query evaluation, transactions, source protocols,
 database observations, and incremental maintenance for Tarstate v1.
 
+## Imports
+
+The package root remains the complete, compatibility-stable surface. For
+focused modules and clearer dependency boundaries, the same public values are
+also available through topic entry points:
+
+| Entry point | Responsibility |
+| --- | --- |
+| `@tarstate/core/artifacts` | Portable envelopes, parsing, capabilities, issues, and resolution |
+| `@tarstate/core/schema` | Schemas, codecs, constraints, mappings, lenses, and typed authoring |
+| `@tarstate/core/query` | Query builders, evaluation, preparation, and incremental maintenance |
+| `@tarstate/core/database` | Observation, source protocols, host runtimes, and maintenance contracts |
+| `@tarstate/core/transactions` | Writes, commit coordination, receipts, and lifecycle governance |
+
+Topic entry points are additive aliases: importing from `@tarstate/core`
+continues to work, and a value exported through both paths has the same runtime
+identity. Internal maintenance-pool APIs and conformance fixtures are not made
+public by these entry points.
+
 ## Query authoring
 
 `typedFrom`, `typedWhere`, `typedJoin`, and `typedSelect` cover the common path

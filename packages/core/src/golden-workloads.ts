@@ -1,7 +1,7 @@
 import type { ArtifactRef } from './artifacts.js';
 import { ExternalStoreRuntime, type AtomicExternalStore } from './external-store.js';
 import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
-import { projectLensRelation, translateLensEdits, type LensRows, type SchemaLensBody } from './lens.js';
+import { projectLensRelation, translateLensEdits, validateLens, type LensRows, type SchemaLensBody } from './lens.js';
 import { InMemoryAtomicSource } from './memory-source.js';
 import type { PreparedPlan } from './maintenance.js';
 import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance, type QueryMaintenanceSnapshot, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
@@ -109,8 +109,10 @@ export const runSchemaV1V200Golden = (): GoldenWorkloadTrace => {
       { id: 'task-2', legacySlug: 'blocked-plan', name: 'Blocked plan', state: 'blocked', notes: 'hidden' }
     ]
   };
-  const projection = projectLensRelation(lens, 'golden.task', rows);
-  const patch = translateLensEdits(lens, 'golden.task', rows['golden.task']?.[0] ?? {}, { title: 'Renamed by v1' }, rows);
+  const validatedLens = validateLens(lens);
+  if (!validatedLens.success) throw new Error('golden schema lens failed validation');
+  const projection = projectLensRelation(validatedLens.value, 'golden.task', rows);
+  const patch = translateLensEdits(validatedLens.value, 'golden.task', rows['golden.task']?.[0] ?? {}, { title: 'Renamed by v1' }, rows);
   return {
     label: 'schema-v1-v200-lens',
     fixtureStatus: 'synthetic',

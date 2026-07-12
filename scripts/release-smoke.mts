@@ -1,4 +1,9 @@
 import type { QueryArtifact, SourceLifecycleCoordinator } from '../packages/core/dist/index.js';
+import type { Artifact as TopicArtifact } from '../packages/core/dist/artifacts/index.js';
+import type { DatabaseView as TopicDatabaseView } from '../packages/core/dist/database/index.js';
+import type { QueryNode as TopicQueryNode } from '../packages/core/dist/query/index.js';
+import type { SchemaBody as TopicSchemaBody } from '../packages/core/dist/schema/index.js';
+import type { Transaction as TopicTransaction } from '../packages/core/dist/transactions/index.js';
 import type { AutomergeAtomicSource } from '../packages/automerge/dist/index.js';
 import type { zustandAtomicExternalStore } from '../packages/zustand/dist/index.js';
 import type { ReactPreparedPlan } from '../packages/react/dist/index.js';
@@ -10,5 +15,6 @@ declare const automerge: AutomergeAtomicSource<Record<string, unknown>>;
 declare const zustand: typeof zustandAtomicExternalStore;
 declare const plan: ReactPreparedPlan<unknown, { readonly id: string }>;
 declare const description: DatabaseDescription;
+declare const topicSurface: readonly [TopicArtifact, TopicDatabaseView<unknown, unknown>, TopicQueryNode, TopicSchemaBody, TopicTransaction];
 
-void [query, lifecycle, automerge, zustand, plan, description];
+void [query, lifecycle, automerge, zustand, plan, description, topicSurface];

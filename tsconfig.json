@@ -13,6 +13,11 @@
     "moduleResolution": "Bundler",
     "paths": {
       "@tarstate/core": ["./packages/core/src/index.ts"],
+      "@tarstate/core/artifacts": ["./packages/core/src/artifacts/index.ts"],
+      "@tarstate/core/database": ["./packages/core/src/database/index.ts"],
+      "@tarstate/core/query": ["./packages/core/src/query/index.ts"],
+      "@tarstate/core/schema": ["./packages/core/src/schema/index.ts"],
+      "@tarstate/core/transactions": ["./packages/core/src/transactions/index.ts"],
       "@tarstate/automerge": ["./packages/automerge/src/index.ts"],
       "@tarstate/zustand": ["./packages/zustand/src/index.ts"],
       "@tarstate/react": ["./packages/react/src/index.ts"],

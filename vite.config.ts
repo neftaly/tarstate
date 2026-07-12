@@ -2,12 +2,16 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, type UserConfig } from 'vite';
-import { coreInternalEntryNames, sourceAliasesFor } from './vite.shared.js';
+import { coreInternalEntryNames, corePublicEntryNames, sourceAliasesFor } from './vite.shared.js';
 
 type PackageConfig = { readonly build: NonNullable<UserConfig['build']> };
 
 const packageEntryPath = (entryName: string): string => 'src/' + entryName + '.ts';
-const coreBuildEntries = Object.fromEntries(['index', ...coreInternalEntryNames].map((entryName) => [entryName, packageEntryPath(entryName)]));
+const coreBuildEntries = Object.fromEntries([
+  ['index', packageEntryPath('index')],
+  ...coreInternalEntryNames.map((entryName) => [entryName, packageEntryPath(entryName)]),
+  ...corePublicEntryNames.map((entryName) => [entryName + '/index', 'src/' + entryName + '/index.ts'])
+]);
 
 const failOnRollupWarning = (warning: string | { readonly message?: string }): never => {
   const message = typeof warning === 'string' ? warning : warning.message ?? JSON.stringify(warning);
