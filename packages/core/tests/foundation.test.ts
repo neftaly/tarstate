@@ -9,6 +9,8 @@ import {
   canonicalizeJson,
   capabilityRefFor,
   capabilityUnavailable,
+  createIssue,
+  issueCatalog,
   logicalAnd,
   logicalNot,
   logicalOr,
@@ -124,9 +126,27 @@ describe('production foundation', () => {
     expect(safeParseJsonText('[[0]]', { maxBytes: 10, maxDepth: 1, maxArrayMembers: 2, maxObjectMembers: 1, maxTotalMembers: 3, maxDependencies: 1 })).toMatchObject({ success: false, issues: [{ code: 'artifact.budget_exceeded' }] });
   });
 
+  it('publishes immutable issue policy and issue envelopes', () => {
+    const declaration = issueCatalog.get('source.not_ready');
+    expect(declaration).toBeDefined();
+    expect(() => (issueCatalog as Map<string, unknown>).set('source.not_ready', {})).toThrow();
+    expect(() => Map.prototype.set.call(issueCatalog, 'source.not_ready', {})).toThrow();
+    expect(Object.isFrozen(declaration)).toBe(true);
+    expect(Object.isFrozen(declaration?.retries)).toBe(true);
+
+    const issue = createIssue({ code: 'source.not_ready', sourceId: 'source:test', path: ['state'], requiredCapabilities: [builtInCapabilityRefs.fieldReplace] });
+    expect(Object.isFrozen(issue)).toBe(true);
+    expect(Object.isFrozen(issue.path)).toBe(true);
+    expect(Object.isFrozen(issue.requiredCapabilities)).toBe(true);
+  });
+
   it('round-trips artifacts and rejects hash/dependency ambiguity', async () => {
     const artifact = await sealArtifact({ kind: 'schema', id: 'urn:test:schema', body: { relations: {} } });
-    expect(await parseArtifactText(JSON.stringify(artifact))).toEqual(artifact);
+    const parsed = await parseArtifactText(JSON.stringify(artifact));
+    expect(parsed).toEqual(artifact);
+    expect(Object.isFrozen(parsed)).toBe(true);
+    expect(Object.isFrozen(parsed.dependencies)).toBe(true);
+    expect(Object.isFrozen(parsed.body)).toBe(true);
     expect(await safeParseArtifactText(JSON.stringify({ ...artifact, contentHash: hash('f') }))).toMatchObject({ success: false, issues: [{ code: 'artifact.hash_mismatch' }] });
     await expect(sealArtifact({ kind: 'query', id: 'urn:test:ambiguous', dependencies: [{ id: 'same', contentHash: hash('1') }, { id: 'same', contentHash: hash('2') }], body: {} })).rejects.toMatchObject({ issues: [{ code: 'artifact.dependency_ambiguous' }] });
   });
@@ -178,6 +198,34 @@ describe('production foundation', () => {
     expect(Object.isFrozen(registry.declaration(registered.value))).toBe(true);
     expect(Object.isFrozen(registry.implementation(registered.value))).toBe(true);
     expect(await registry.fingerprint()).toBe(fingerprint);
+  });
+
+  it('keeps capability behavior stable under duplicate registration', async () => {
+    const declaration: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:stable-implementation', version: '1', class: 'function', contract: {}, implies: [] };
+    const registry = new CapabilityRegistry('trust:stable-implementation');
+    const registered = await registry.registerDeclaration(declaration);
+    if (!registered.success) throw new Error('declaration registration failed');
+    const implementation = () => 'first';
+    const first = registry.registerImplementation({ ref: registered.value, integrity: 'sha256:stable', implementation });
+    const revision = registry.revision;
+    const fingerprint = await registry.fingerprint();
+
+    expect(registry.registerImplementation({ ref: registered.value, integrity: 'sha256:stable', implementation })).toEqual(first);
+    expect(registry.revision).toBe(revision);
+    expect(registry.registerImplementation({ ref: registered.value, integrity: 'sha256:stable', implementation: () => 'second' }))
+      .toMatchObject({ success: false, issues: [{ code: 'capability.registry_conflict', details: { reason: 'implementation_identity_changed' } }] });
+    expect(registry.implementation(registered.value)?.implementation).toBe(implementation);
+    expect(await registry.fingerprint()).toBe(fingerprint);
+  });
+
+  it('rejects malformed capability declarations instead of structurally casting them', async () => {
+    const registry = new CapabilityRegistry('trust:malformed');
+    expect(await registry.registerDeclaration({
+      kind: 'tarstate.capability-contract', formatVersion: 1, id: '', version: '1', class: 'edit', contract: {}, implies: []
+    })).toMatchObject({ success: false, issues: [{ code: 'artifact.invalid_envelope' }] });
+    expect(await registry.registerDeclaration({
+      kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:extra', version: '1', class: 'edit', contract: {}, implies: [], extra: true
+    } as unknown as CapabilityDeclaration)).toMatchObject({ success: false, issues: [{ code: 'artifact.invalid_envelope' }] });
   });
 
   it('keeps capability upgrades and downgrades exact rather than version-ordered', async () => {

@@ -1,5 +1,6 @@
 import { canonicalizeJson, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import type { RelationId, RelationRow } from './schema.js';
 import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
@@ -112,8 +113,10 @@ export const resolveLensPath = (
 };
 
 export const validateLens = (input: unknown): ParseResult<SchemaLensBody> => {
-  if (!isRecord(input) || !isArtifactRef(input.from) || !isArtifactRef(input.to) || !Array.isArray(input.relations)) return lensFailure('lens.invalid', 'parse', [], { reason: 'shape' });
-  const body = input as unknown as SchemaLensBody;
+  const owned = detachAndFreezeJsonValue(input);
+  if (!owned.success) return owned;
+  if (!isRecord(owned.value) || !isArtifactRef(owned.value.from) || !isArtifactRef(owned.value.to) || !Array.isArray(owned.value.relations)) return lensFailure('lens.invalid', 'parse', [], { reason: 'shape' });
+  const body = owned.value as unknown as SchemaLensBody;
   const issues: Issue[] = [];
   body.relations.forEach((relation, relationIndex) => {
     if (!isRecord(relation) || typeof relation.fromRelationId !== 'string' || typeof relation.toRelationId !== 'string' || !Array.isArray(relation.steps)) {

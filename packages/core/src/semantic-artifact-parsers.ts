@@ -95,6 +95,10 @@ export const safeEvaluateQueryArtifact = async (input: unknown, request: {
 }): Promise<ParseResult<QueryResult>> => {
   const parsed = await safeParseQueryArtifact(input, request.budget);
   if (!parsed.success) return parsed;
+  const missingCapabilities = request.registry === undefined
+    ? parsed.value.body.requiredCapabilities.map((ref) => createIssue({ code: 'capability.missing', retry: 'after_capability', requiredCapabilities: [ref] }))
+    : request.registry.missing(parsed.value.body.requiredCapabilities);
+  if (missingCapabilities.length > 0) return { success: false, issues: missingCapabilities };
   const parameters = safeParseQueryParameters(parsed.value.body.parameters, request.parameters, request.registry === undefined ? {} : { registry: request.registry });
   if (!parameters.success) return parameters;
   try {
@@ -131,7 +135,16 @@ export const safePrepareSchemaLensArtifact = async (input: unknown, budget?: Sem
   const parsed = await safeParseSchemaLensArtifact(input, budget);
   if (!parsed.success) return parsed;
   const validated = validateLens(parsed.value.body);
-  return validated.success ? parsed : validated;
+  if (!validated.success) return validated;
+  const dependencies = Object.freeze(parsed.value.dependencies.map((dependency) => Object.freeze({
+    ...dependency,
+    ...(dependency.locations === undefined ? {} : { locations: Object.freeze([...dependency.locations]) })
+  })));
+  return {
+    success: true,
+    value: Object.freeze({ ...parsed.value, dependencies, body: validated.value }),
+    issues: []
+  };
 };
 
 export const safePrepareConstraintSetArtifact = async <State>(input: unknown, options: {

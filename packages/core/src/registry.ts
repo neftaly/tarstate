@@ -1,10 +1,11 @@
-import { canonicalizeJson, sha256Json, type ContentHash } from './artifacts.js';
+import { canonicalizeJson, isContentHash, sha256Json, type ContentHash } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { JsonValue } from './value.js';
 
 export type CapabilityClass = 'edit' | 'executor' | 'source' | 'function' | 'codec' | 'collation';
+const capabilityClasses: readonly CapabilityClass[] = ['edit', 'executor', 'source', 'function', 'codec', 'collation'];
 
 export type CapabilityDeclaration = {
   readonly kind: 'tarstate.capability-contract';
@@ -43,12 +44,15 @@ export class CapabilityRegistry {
   async registerDeclaration(declaration: CapabilityDeclaration): Promise<ParseResult<CapabilityRef>> {
     const detached = detachAndFreezeJsonValue(declaration);
     if (!detached.success) return detached;
-    const ownedDeclaration = detached.value as unknown as CapabilityDeclaration;
+    const parsed = parseCapabilityDeclaration(detached.value);
+    if (!parsed.success) return parsed;
+    const ownedDeclaration = parsed.value;
     const ref = Object.freeze(await capabilityRefFor(ownedDeclaration));
     const key = refKey(ref);
     const identityKey = ownedDeclaration.id + '\u0000' + ownedDeclaration.version;
     const conflicting = [...this.#declarations.entries()].find(([candidateKey, candidate]) => candidateKey.startsWith(identityKey + '\u0000') && canonicalizeJson(candidate as unknown as JsonValue) !== canonicalizeJson(ownedDeclaration as unknown as JsonValue));
     if (conflicting !== undefined) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', details: { id: ownedDeclaration.id, version: ownedDeclaration.version } })] };
+    if (this.#declarations.has(key)) return { success: true, value: ref, issues: [] };
     this.#declarations.set(key, ownedDeclaration);
     const cycle = this.#findCycle();
     if (cycle !== undefined) {
@@ -62,12 +66,15 @@ export class CapabilityRegistry {
   registerImplementation(implementation: CapabilityImplementation): ParseResult<CapabilityImplementation> {
     const detachedRef = detachAndFreezeJsonValue(implementation.ref);
     if (!detachedRef.success) return detachedRef;
-    const ref = detachedRef.value as unknown as CapabilityRef;
+    const ref = parseCapabilityRef(detachedRef.value);
+    if (ref === undefined || typeof implementation.integrity !== 'string' || implementation.integrity.length === 0) return invalidCapability('implementation_shape');
     const ownedImplementation = Object.freeze({ ref, integrity: implementation.integrity, implementation: implementation.implementation });
     const key = refKey(ref);
     if (!this.#declarations.has(key)) return { success: false, issues: [createIssue({ code: 'capability.missing', retry: 'after_capability', requiredCapabilities: [ref] })] };
     const previous = this.#implementations.get(key);
     if (previous !== undefined && previous.integrity !== ownedImplementation.integrity) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', requiredCapabilities: [ref] })] };
+    if (previous !== undefined && previous.implementation !== ownedImplementation.implementation) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', requiredCapabilities: [ref], details: { reason: 'implementation_identity_changed' } })] };
+    if (previous !== undefined) return { success: true, value: previous, issues: [] };
     this.#implementations.set(key, ownedImplementation);
     this.#revision += 1;
     return { success: true, value: ownedImplementation, issues: [] };
@@ -126,3 +133,47 @@ export class CapabilityRegistry {
     return undefined;
   }
 }
+
+const parseCapabilityDeclaration = (value: JsonValue): ParseResult<CapabilityDeclaration> => {
+  if (!isRecord(value) || !hasExactKeys(value, ['kind', 'formatVersion', 'id', 'version', 'class', 'contract', 'implies'])) return invalidCapability('declaration_shape');
+  if (value.kind !== 'tarstate.capability-contract' || value.formatVersion !== 1 || typeof value.id !== 'string' || value.id.length === 0 || typeof value.version !== 'string' || value.version.length === 0 || typeof value.class !== 'string' || !capabilityClasses.includes(value.class as CapabilityClass) || !Array.isArray(value.implies)) return invalidCapability('declaration_shape');
+  const implies: CapabilityRef[] = [];
+  const seen = new Set<string>();
+  for (const candidate of value.implies) {
+    const ref = parseCapabilityRef(candidate);
+    if (ref === undefined || seen.has(refKey(ref))) return invalidCapability(ref === undefined ? 'implication_shape' : 'duplicate_implication');
+    seen.add(refKey(ref));
+    implies.push(ref);
+  }
+  return {
+    success: true,
+    value: Object.freeze({
+      kind: 'tarstate.capability-contract',
+      formatVersion: 1,
+      id: value.id,
+      version: value.version,
+      class: value.class as CapabilityClass,
+      contract: value.contract as JsonValue,
+      implies: Object.freeze(implies)
+    }),
+    issues: []
+  };
+};
+
+const parseCapabilityRef = (value: unknown): CapabilityRef | undefined => {
+  if (!isRecord(value) || !hasExactKeys(value, ['id', 'version', 'contractHash'])) return undefined;
+  if (typeof value.id !== 'string' || value.id.length === 0 || typeof value.version !== 'string' || value.version.length === 0 || !isContentHash(value.contractHash)) return undefined;
+  return Object.freeze({ id: value.id, version: value.version, contractHash: value.contractHash });
+};
+
+const invalidCapability = <Value>(reason: string): ParseResult<Value> => ({
+  success: false,
+  issues: [createIssue({ code: 'artifact.invalid_envelope', retry: 'after_input', details: { artifact: 'capability', reason } })]
+});
+
+const hasExactKeys = (value: Readonly<Record<string, unknown>>, expected: readonly string[]): boolean => {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+};
+
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);

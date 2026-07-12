@@ -1,3 +1,4 @@
+import { ownedReadonlyMap } from './internal-owned-map.js';
 import { comparePortableStrings } from './portable-order.js';
 
 export type IssuePhase =
@@ -248,14 +249,14 @@ const declarations = [
   ['transaction.unexpected_failure', 'commit', 'error', ['after_refresh']]
 ] as const satisfies readonly (readonly [string, IssuePhase, IssueSeverity, readonly IssueRetry[]])[];
 
-export const issueCatalog: ReadonlyMap<string, IssueDeclaration> = new Map(
-  declarations.map(([code, phase, severity, retries]) => [code, {
+export const issueCatalog: ReadonlyMap<string, IssueDeclaration> = ownedReadonlyMap(
+  declarations.map(([code, phase, severity, retries]) => [code, Object.freeze({
     code,
     phase,
     severity,
-    retries,
+    retries: Object.freeze([...retries]),
     ...(code.startsWith('capability.') || code.includes('capability_') ? { capabilityRelevant: true } : {})
-  }])
+  })] as const)
 );
 
 export type IssueInput = Omit<Issue, 'id' | 'phase' | 'severity'> & {
@@ -279,7 +280,7 @@ export const createIssue = (input: IssueInput): Issue => {
     requiredCapabilities: input.requiredCapabilities,
     details: input.details
   });
-  return {
+  return Object.freeze({
     id: input.code + ':' + identity,
     code: input.code,
     phase,
@@ -287,12 +288,12 @@ export const createIssue = (input: IssueInput): Issue => {
     ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
     ...(input.relationId === undefined ? {} : { relationId: input.relationId }),
     ...(input.key === undefined ? {} : { key: input.key }),
-    ...(input.path === undefined ? {} : { path: input.path }),
+    ...(input.path === undefined ? {} : { path: Object.freeze([...input.path]) }),
     ...(input.operationId === undefined ? {} : { operationId: input.operationId }),
-    ...(input.requiredCapabilities === undefined ? {} : { requiredCapabilities: input.requiredCapabilities }),
+    ...(input.requiredCapabilities === undefined ? {} : { requiredCapabilities: Object.freeze(input.requiredCapabilities.map((ref) => Object.freeze({ ...ref }))) }),
     ...(input.retry === undefined ? {} : { retry: input.retry }),
     ...(input.details === undefined ? {} : { details: input.details })
-  };
+  });
 };
 
 const stableIssueIdentity = (input: Record<string, unknown>): string => {

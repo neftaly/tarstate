@@ -11,6 +11,12 @@ use the exhaustive `Expr` and `QueryNode` unions directly, optionally composed
 with the functional builders. This is an explicit authoring boundary; runtime
 evaluation never falls back from typed to untyped behavior.
 
+Call `prepareTypedQuery(query, { registryFingerprint,
+authorityFingerprint, datasetId })` for the application path. It detaches and
+freezes the portable query while carrying its inferred row and parameter types
+into observers and framework adapters. `prepareQuery` remains the lower-level
+API for an already-erased `QueryNode`.
+
 ## Minimal database assembly
 
 `DatabaseView` is the imperative shell around host-owned sources and authority
@@ -38,6 +44,11 @@ const database = new DatabaseView({
   datasets: [membership],
   canRead,
   createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+});
+const plan = await prepareTypedQuery(query, {
+  registryFingerprint,
+  authorityFingerprint,
+  datasetId: 'primary'
 });
 const observer = database.observe({ plan });
 ```

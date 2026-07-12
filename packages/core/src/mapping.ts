@@ -1,5 +1,7 @@
 import { canonicalizeJson, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { ownedReadonlyMap } from './internal-owned-map.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
 import { parseRelationCandidates, parseScalarValueForField, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
@@ -78,8 +80,10 @@ export const compileStorageMapping = (
   schema: PreparedSchema,
   registry?: CapabilityRegistry
 ): ParseResult<CompiledStorageMapping> => {
-  if (!isRecord(input) || input.model !== 'json-tree-v1' || !sameRef(input.schema, schemaRef) || !isRecord(input.relations)) return mappingFailure('mapping.invalid', [], { reason: 'shape_or_schema' });
-  const body = input as unknown as StorageMappingBody;
+  const owned = detachAndFreezeJsonValue(input);
+  if (!owned.success) return owned;
+  if (!isRecord(owned.value) || owned.value.model !== 'json-tree-v1' || !sameRef(owned.value.schema, schemaRef) || !isRecord(owned.value.relations)) return mappingFailure('mapping.invalid', [], { reason: 'shape_or_schema' });
+  const body = owned.value as unknown as StorageMappingBody;
   const issues: Issue[] = [];
   const relations = new Map<RelationId, { relation: PreparedRelation; mapping: RelationStorageMapping }>();
   for (const [relationId, mapping] of Object.entries(body.relations)) {
@@ -104,9 +108,13 @@ export const compileStorageMapping = (
     for (const field of Object.keys(relation.declaration.fields)) {
       if (!(field in mapping.fields) && !(field in mapping.keys)) issues.push(mappingIssue('mapping.field_unmapped', [...path, 'fields', field], { field }));
     }
-    relations.set(relationId, { relation, mapping });
+    relations.set(relationId, Object.freeze({ relation, mapping }));
   }
-  return issues.length > 0 ? { success: false, issues } : { success: true, value: { body, schema, relations }, issues: [] };
+  return issues.length > 0 ? { success: false, issues } : {
+    success: true,
+    value: Object.freeze({ body, schema, relations: ownedReadonlyMap(relations) }),
+    issues: []
+  };
 };
 
 export const projectStorage = (
@@ -204,7 +212,18 @@ const extractCandidates = (snapshot: unknown, collection: CollectionMapping, rel
   }
   if (collection.kind === 'array') {
     if (!Array.isArray(resolved.value)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { expected: 'array' }, undefined, sourceId, relationId)], complete: false };
-    return { candidates: resolved.value.map((candidate, index) => ({ candidate, locator: { kind: 'array-position', index, durable: false }, absolutePath: [...collection.path, index] })), issues: [], complete: true };
+    try {
+      const descriptors = Object.getOwnPropertyDescriptors(resolved.value);
+      const candidates: ExtractedCandidate[] = [];
+      for (let index = 0; index < resolved.value.length; index += 1) {
+        const descriptor = descriptors[index];
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', [...collection.path, index], { reason: 'descriptor' }, undefined, sourceId, relationId)], complete: false };
+        candidates.push({ candidate: descriptor.value, locator: { kind: 'array-position', index, durable: false }, absolutePath: [...collection.path, index] });
+      }
+      return { candidates, issues: [], complete: true };
+    } catch (error) {
+      return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: 'inspection_threw', error: error instanceof Error ? error.name : typeof error }, undefined, sourceId, relationId)], complete: false };
+    }
   }
   if (!isRecord(resolved.value)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { expected: 'object-map' }, undefined, sourceId, relationId)], complete: false };
   try {
@@ -281,19 +300,57 @@ const readPath = (root: unknown, path: StoragePath): PathRead => {
 const setPath = (root: unknown, path: StoragePath, value: unknown): ParseResult<unknown> => {
   if (path.length === 0) return { success: true, value, issues: [] };
   const [head, ...tail] = path;
-  if (Array.isArray(root) && typeof head === 'number' && Number.isInteger(head) && head >= 0 && (head < root.length || (head === root.length && tail.length === 0))) {
-    if (tail.length === 0) { const output = [...root]; output[head] = value; return { success: true, value: output, issues: [] }; }
-    const child = setPath(root[head], tail, value);
-    if (!child.success) return child;
-    const output = [...root]; output[head] = child.value; return { success: true, value: output, issues: [] };
+  try {
+    if (Array.isArray(root) && typeof head === 'number' && Number.isInteger(head) && head >= 0 && (head < root.length || (head === root.length && tail.length === 0))) {
+      const copied = copyDataArray(root);
+      if (copied === undefined) return mappingFailure('mapping.path_invalid', path, { reason: 'descriptor' });
+      if (tail.length === 0) { copied[head] = value; return { success: true, value: copied, issues: [] }; }
+      const descriptor = Object.getOwnPropertyDescriptor(root, head);
+      if (descriptor === undefined || !('value' in descriptor)) return mappingFailure('mapping.path_invalid', path, { reason: 'descriptor' });
+      const child = setPath(descriptor.value, tail, value);
+      if (!child.success) return child;
+      copied[head] = child.value;
+      return { success: true, value: copied, issues: [] };
+    }
+    if (isRecord(root) && typeof head === 'string' && (Object.hasOwn(root, head) || tail.length === 0)) {
+      const copied = copyDataRecord(root);
+      if (copied === undefined) return mappingFailure('mapping.path_invalid', path, { reason: 'descriptor' });
+      if (tail.length === 0) { copied[head] = value; return { success: true, value: copied, issues: [] }; }
+      const descriptor = Object.getOwnPropertyDescriptor(root, head);
+      if (descriptor === undefined || !('value' in descriptor)) return mappingFailure('mapping.path_invalid', path, { reason: 'descriptor' });
+      const child = setPath(descriptor.value, tail, value);
+      if (!child.success) return child;
+      copied[head] = child.value;
+      return { success: true, value: copied, issues: [] };
+    }
+    return mappingFailure('mapping.path_invalid', path);
+  } catch (error) {
+    return mappingFailure('mapping.path_invalid', path, { reason: 'inspection_threw', error: error instanceof Error ? error.name : typeof error });
   }
-  if (isRecord(root) && typeof head === 'string' && (Object.hasOwn(root, head) || tail.length === 0)) {
-    if (tail.length === 0) return { success: true, value: { ...root, [head]: value }, issues: [] };
-    const child = setPath(root[head], tail, value);
-    if (!child.success) return child;
-    return { success: true, value: { ...root, [head]: child.value }, issues: [] };
+};
+
+const copyDataArray = (value: readonly unknown[]): unknown[] | undefined => {
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const output: unknown[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[index];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return undefined;
+    output.push(descriptor.value);
   }
-  return mappingFailure('mapping.path_invalid', path);
+  return output;
+};
+
+const copyDataRecord = (value: Readonly<Record<string, unknown>>): Record<string, unknown> | undefined => {
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const output: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') return undefined;
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !descriptor.enumerable) continue;
+    if (!('value' in descriptor)) return undefined;
+    output[key] = descriptor.value;
+  }
+  return output;
 };
 
 const samePortableCandidate = (left: unknown, right: unknown): boolean => {

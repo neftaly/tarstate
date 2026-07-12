@@ -4,6 +4,7 @@ import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, Query
 import { pipe } from '../src/query-builder.js';
 import {
   customScalar,
+  prepareTypedQuery,
   relationAccess,
   relationDeclaration,
   relationLiteral,
@@ -108,6 +109,23 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<QueryParametersOf<typeof projected>>().toEqualTypeOf<{ readonly minimumScore: number }>();
     expectTypeOf<QueryResultRowOf<typeof projected>>().toEqualTypeOf<{ readonly author: string; readonly manager: string }>();
     expectTypeOf<ReturningRowOf<typeof returning>>().toEqualTypeOf<{ readonly author: string; readonly manager: string }>();
+  });
+
+  it('prepares a detached query plan without losing inferred rows or parameters', async () => {
+    const prepared = await prepareTypedQuery(projected, {
+      registryFingerprint: 'registry:one',
+      authorityFingerprint: 'authority:one',
+      datasetId: 'dataset:one'
+    });
+
+    expect(prepared.query).not.toBe(projected.root);
+    expect(prepared.query).toEqual(projected.root);
+    expectTypeOf<PreparedPlanParameters<typeof prepared>>().toEqualTypeOf<{ readonly minimumScore: number }>();
+    expectTypeOf(prepared).toMatchTypeOf<import('../src/type-authoring.js').TypedPreparedPlan<
+      import('../src/query.js').QueryNode,
+      { readonly author: string; readonly manager: string },
+      { readonly minimumScore: number }
+    >>();
   });
 
   it('ties reference values to target key tuples and keeps typed operators pipe-compatible', () => {

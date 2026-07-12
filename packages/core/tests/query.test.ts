@@ -7,6 +7,7 @@ import {
   prepareQuery,
   type ArtifactRef,
   type CapabilityRef,
+  type JsonValue,
   type QueryNode,
   type RelationInput
 } from '../src/index.js';
@@ -31,6 +32,40 @@ const from = (relationId: string, alias = relationId): QueryNode => ({
 });
 
 describe('production query oracle', () => {
+  it('detaches and freezes pure query inputs and visible results', () => {
+    const nested = { labels: ['original'] };
+    const source = { id: 1, nested };
+    const result = evaluateQuery({ root: from('people', 'person'), relations: [relation('people', [source])] });
+
+    nested.labels[0] = 'source-mutated';
+    expect(result.rows).toEqual([{ id: 1, nested: { labels: ['original'] } }]);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.rows)).toBe(true);
+    expect(Object.isFrozen(result.rows[0]?.nested)).toBe(true);
+    expect(() => ((result.rows[0]!.nested as { labels: string[] }).labels[0] = 'result-mutated')).toThrow();
+    expect(source.nested.labels).toEqual(['source-mutated']);
+  });
+
+  it('isolates named function arguments and retained return values', () => {
+    const capability: CapabilityRef = { id: 'urn:test:owned-function', version: '1', contractHash: `sha256:${'e'.repeat(64)}` };
+    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const source = { nested: { value: 1 } };
+    const returned = { nested: { value: 2 } };
+    let captured: readonly JsonValue[] | undefined;
+    const functions = new Map([[key, (args: readonly JsonValue[]) => { captured = args; return returned; }]]);
+    const result = evaluateQuery({
+      root: { kind: 'select', input: { kind: 'values', alias: 'v', rows: [source] }, alias: 'out', fields: { value: { kind: 'call', capability, args: [{ kind: 'field', alias: 'v', name: 'nested' }] } } },
+      relations: [], functions
+    });
+
+    expect(captured).toEqual([{ value: 1 }]);
+    expect(captured?.[0]).not.toBe(source.nested);
+    expect(Object.isFrozen(captured?.[0])).toBe(true);
+    returned.nested.value = 9;
+    source.nested.value = 8;
+    expect(result.rows).toEqual([{ value: { nested: { value: 2 } } }]);
+  });
+
   it('detaches and freezes a prepared query from its caller-owned AST', async () => {
     const row = { value: 1 };
     const root: QueryNode = { kind: 'values', alias: 'value', rows: [row] };

@@ -3,6 +3,7 @@ import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import { capabilityUnavailable, defaultValueParseBudget, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, safeParseJsonValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
 import type { PreparedPlan } from './maintenance.js';
 import { comparePortableStrings } from './portable-order.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 
 /** `lower-bound` contains only proven rows; `unknown` withdraws the current row assertion. */
 export type Completeness = 'exact' | 'lower-bound' | 'unknown';
@@ -280,25 +281,33 @@ const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.ve
 
 /** Evaluates the independent, deterministic semantic oracle. */
 export const evaluateQuery = (request: QueryRequest): QueryResult => {
-  const issues = [...validateRelationInputs(request.relations, 'query')];
-  if (issues.length > 0) return { rows: [], resultKeys: [], completeness: 'unknown', issues };
+  const owned = adoptQueryRequest(request);
+  const issues = [...validateRelationInputs(owned.relations, 'query')];
+  if (issues.length > 0) return frozenQueryResult([], [], 'unknown', issues);
   const context: QueryContext = {
-    relations: groupRelationInputs(request.relations),
-    parameters: request.parameters ?? {},
-    functions: request.functions ?? new Map(),
+    relations: groupRelationInputs(owned.relations),
+    parameters: owned.parameters ?? {},
+    functions: owned.functions ?? new Map(),
     issues,
     recursions: new Map(),
     recursionConstants: new Map(),
     joinIndexes: new Map(),
-    ...(request.basis === undefined ? {} : { basis: request.basis }),
-    ...(request.membershipRevision === undefined ? {} : { membershipRevision: request.membershipRevision }),
+    ...(owned.basis === undefined ? {} : { basis: owned.basis }),
+    ...(owned.membershipRevision === undefined ? {} : { membershipRevision: owned.membershipRevision }),
     unavailable: false
   };
-  const result = evaluateNode(request.root, context);
-  if (context.unavailable || result.completeness === 'unknown') return { rows: [], resultKeys: [], completeness: 'unknown', issues };
-  const rows = result.rows.map(visibleRow);
-  return { rows, resultKeys: result.rows.map(resultKey), completeness: result.completeness, issues };
+  const result = evaluateNode(owned.root, context);
+  if (context.unavailable || result.completeness === 'unknown') return frozenQueryResult([], [], 'unknown', issues);
+  const rows = publicQueryRows(result.rows, new WeakMap());
+  return frozenQueryResult(rows, result.rows.map(resultKey), result.completeness, issues);
 };
+
+const frozenQueryResult = (rows: readonly QueryRecord[], resultKeys: readonly string[], completeness: Completeness, issues: readonly Issue[]): QueryResult => Object.freeze({
+  rows: Object.isFrozen(rows) ? rows : Object.freeze([...rows]),
+  resultKeys: Object.freeze([...resultKeys]),
+  completeness,
+  issues: publicQueryIssues(issues)
+});
 
 /** Seals query and authority identities into a prepared execution plan. */
 export const prepareQuery = async (input: {
@@ -739,9 +748,11 @@ const queryAliases = (node: QueryNode): ReadonlySet<string> => {
 /** Evaluates one expression using Tarstate missing/unknown three-valued semantics. */
 export const evaluateExpression = (expression: Expr, row: Readonly<Record<string, QueryRecord>>, options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}): EvaluationValue => {
   const issues: Issue[] = [];
-  const scoped: ScopedRow = { scope: row, provenance: {}, identity: '' };
-  const result = evaluateExpr(expression, { row: scoped, parameters: options.parameters ?? {}, functions: options.functions ?? new Map(), issues });
-  if (result.status === 'known') return result.value;
+  const ownedExpression = cloneAndFreezeExpression(expression);
+  const scoped: ScopedRow = { scope: adoptExpressionScope(row), provenance: {}, identity: '' };
+  const parameters = options.parameters === undefined ? {} : adoptJsonRecord(options.parameters, 'Query expression parameters');
+  const result = evaluateExpr(ownedExpression, { row: scoped, parameters, functions: options.functions === undefined ? new Map() : new Map(options.functions), issues });
+  if (result.status === 'known') return adoptJsonValue(result.value, 'Query expression result');
   if (result.status === 'missing') return missingValue;
   if (result.status === 'unknown' || result.status === 'indeterminate') return logicalUnknown;
   return capabilityUnavailable;
@@ -887,7 +898,13 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
     if (args.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
     if (args.some((value) => value.status !== 'known')) return { status: 'unknown' };
     try {
-      return known(fn(args.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value)));
+      const ownedArgs = Object.freeze(args.map((value) => freezePortableValue(
+        (value as { readonly status: 'known'; readonly value: JsonValue }).value
+      )));
+      const returned = fn(ownedArgs);
+      const parsed = detachAndFreezeJsonValue(returned);
+      if (!parsed.success) throw new TypeError('Query function returned a non-portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
+      return known(parsed.value);
     } catch (error) {
       context.issues.push(createIssue({ code: 'query.function_failed', phase: 'query', severity: 'error', retry: 'after_input', requiredCapabilities: [expression.capability], details: { error: error instanceof Error ? error.name : typeof error } }));
       return { status: 'unavailable' };
@@ -1172,26 +1189,30 @@ export const openIncrementalQueryMaintenance = (
   plan: PreparedPlan<QueryNode>,
   initialSnapshot: QueryMaintenanceSnapshot
 ): IncrementalQueryMaintenanceSession => {
-  const graph = compileQueryGraph(plan.query);
+  const queryRoot = cloneAndFreezeQueryAst(plan.query);
+  const graph = compileQueryGraph(queryRoot);
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
-  let acceptedSnapshot = initialSnapshot;
+  const ownedInitialSnapshot = adoptMaintenanceSnapshot(initialSnapshot);
+  let acceptedSnapshot = ownedInitialSnapshot;
   let closed = false;
   let revision = 0;
   let rejectedUpdateCount = 0;
   let valueIdentities = new WeakMap<ScopedRow, string>();
+  const publicRows = new WeakMap<ScopedRow, QueryRecord>();
   let executionPhase: 'idle' | 'updating' = 'idle';
   let closeRequested = false;
 
-  const initialIssues = validateMaintenanceSnapshot(initialSnapshot);
+  const initialIssues = validateMaintenanceSnapshot(ownedInitialSnapshot);
   if (initialIssues.length === 0) {
-    for (const node of graph.nodes) materialized.set(node, materializeQueryNode(node, initialSnapshot, materialized));
+    for (const node of graph.nodes) materialized.set(node, materializeQueryNode(node, ownedInitialSnapshot, materialized));
   }
   let current = maintainedQueryResult(
-    initialIssues.length === 0 ? materialized.get(plan.query) : undefined,
+    initialIssues.length === 0 ? materialized.get(queryRoot) : undefined,
     initialIssues,
-    maintenanceState(graph.nodes.length, graph.nodes.length, graph.nodes.length, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+    maintenanceState(graph.nodes.length, graph.nodes.length, graph.nodes.length, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount),
+    publicRows
   );
-  let assertedRoot = initialIssues.length === 0 ? materialized.get(plan.query) : undefined;
+  let assertedRoot = initialIssues.length === 0 ? materialized.get(queryRoot) : undefined;
 
   const closeNow = (): void => {
     if (closed) return;
@@ -1208,21 +1229,23 @@ export const openIncrementalQueryMaintenance = (
       const journal = new Map<QueryNode, MaterializedQueryNode | undefined>();
       executionPhase = 'updating';
       try {
+        const ownedUpdate = adoptQueryMaintenanceUpdate(update);
         revision += 1;
-        const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, update);
+        const applied = applyQueryMaintenanceUpdate(acceptedSnapshot, ownedUpdate);
         if (!applied.success) {
           rejectedUpdateCount += 1;
           current = maintainedQueryResult(
             undefined,
             applied.issues,
-            maintenanceState(graph.nodes.length, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+            maintenanceState(graph.nodes.length, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount),
+            publicRows
           );
           assertedRoot = undefined;
           return current;
         }
 
         const nextSnapshot = applied.value;
-        const changedRelations = new Set(update.relations.map(({ relation }) => relationKey(relation)));
+        const changedRelations = new Set(ownedUpdate.relations.map(({ relation }) => relationKey(relation)));
         const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
           || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
         let updatedNodeCount = 0;
@@ -1248,7 +1271,7 @@ export const openIncrementalQueryMaintenance = (
           if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) changedNodes.add(node);
         }
         acceptedSnapshot = nextSnapshot;
-        const root = materialized.get(plan.query);
+        const root = materialized.get(queryRoot);
         current = maintainedQueryResult(
           root,
           [],
@@ -1260,7 +1283,8 @@ export const openIncrementalQueryMaintenance = (
             diffMaintainedResults(assertedRoot, root, valueIdentities),
             revision,
             rejectedUpdateCount
-          )
+          ),
+          publicRows
         );
         assertedRoot = root;
         return current;
@@ -1326,11 +1350,16 @@ export const createPooledIncrementalQueryRuntime = (input: {
   readonly environment: PooledIncrementalQueryEnvironment;
   readonly initialSnapshot: QueryMaintenanceSnapshot;
 }): PooledIncrementalQueryRuntime => {
-  const environment = input.environment;
-  if (!sameOptionalJson(environment.parameters, input.initialSnapshot.parameters)) {
+  const environment = Object.freeze({
+    ...input.environment,
+    ...(input.environment.parameters === undefined ? {} : { parameters: adoptJsonRecord(input.environment.parameters, 'Pooled query parameters') }),
+    ...(input.environment.functions === undefined ? {} : { functions: new Map(input.environment.functions) })
+  });
+  const ownedInitialSnapshot = adoptMaintenanceSnapshot(input.initialSnapshot);
+  if (!sameOptionalJson(environment.parameters, ownedInitialSnapshot.parameters)) {
     throw new TypeError('Pooled query environment parameters do not match the initial snapshot');
   }
-  if (!sameFunctionRegistry(environment.functions, input.initialSnapshot.functions)) {
+  if (!sameFunctionRegistry(environment.functions, ownedInitialSnapshot.functions)) {
     throw new TypeError('Pooled query environment functions do not match the initial snapshot');
   }
 
@@ -1347,8 +1376,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
   const materialized = new Map<QueryNode, MaterializedQueryNode>();
   const roots = new Set<PooledRootState>();
   let valueIdentities = new WeakMap<ScopedRow, string>();
-  let acceptedSnapshot = input.initialSnapshot;
-  let runtimeIssues = validateMaintenanceSnapshot(input.initialSnapshot);
+  const publicRows = new WeakMap<ScopedRow, QueryRecord>();
+  let acceptedSnapshot = ownedInitialSnapshot;
+  let runtimeIssues = validateMaintenanceSnapshot(ownedInitialSnapshot);
   let revision = 0;
   let rejectedUpdateCount = 0;
   let closed = false;
@@ -1485,7 +1515,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
         current: maintainedQueryResult(
           rootMaterialized,
           runtimeIssues,
-          maintenanceState(reachable.size, reachable.size, reachable.size, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+          maintenanceState(reachable.size, reachable.size, reachable.size, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount),
+          publicRows
         ),
         asserted: rootMaterialized,
         closed: false
@@ -1580,7 +1611,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
         root.current = maintainedQueryResult(
           undefined,
           runtimeIssues,
-          maintenanceState(root.reachable.size, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount)
+          maintenanceState(root.reachable.size, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount),
+          publicRows
         );
         root.asserted = undefined;
       }
@@ -1678,7 +1710,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
           diffMaintainedResults(root.asserted, nextRoot, valueIdentities),
           revision,
           rejectedUpdateCount
-        )
+        ),
+        publicRows
       );
       if (!journal.roots.has(root)) journal.roots.set(root, { current: root.current, asserted: root.asserted });
       root.current = nextCurrent;
@@ -1701,7 +1734,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
     const journal: PooledUpdateJournal = { materialized: new Map(), roots: new Map() };
     executionPhase = 'updating';
     try {
-      applyUpdateNow(update, journal);
+      applyUpdateNow(adoptQueryMaintenanceUpdate(update), journal);
     } catch (error) {
       acceptedSnapshot = checkpoint.acceptedSnapshot;
       runtimeIssues = checkpoint.runtimeIssues;
@@ -1855,8 +1888,15 @@ const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
   return freezePortableValue(parsed.value) as QueryNode;
 };
 
+const cloneAndFreezeExpression = (expression: Expr): Expr => {
+  const parsed = safeParseJsonValue(expression, { ...defaultValueParseBudget, maxDepth: 1_024 });
+  if (!parsed.success) throw new TypeError('Query expression must be a portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
+  return freezePortableValue(parsed.value) as Expr;
+};
+
 const freezePortableValue = <Value extends JsonValue>(value: Value): Value => {
   if (value === null || typeof value !== 'object') return value;
+  if (Object.isFrozen(value)) return value;
   if (Array.isArray(value)) {
     for (const item of value) freezePortableValue(item);
   } else {
@@ -1864,6 +1904,246 @@ const freezePortableValue = <Value extends JsonValue>(value: Value): Value => {
   }
   return Object.freeze(value);
 };
+
+const adoptJsonValue = (input: unknown, label: string): JsonValue => {
+  const parsed = detachAndFreezeJsonValue(input);
+  if (!parsed.success) throw new TypeError(label + ' must be a portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
+  return parsed.value;
+};
+
+const adoptJsonRecord = (input: unknown, label: string): Readonly<Record<string, JsonValue>> => {
+  const value = adoptJsonValue(input, label);
+  if (value === null || Array.isArray(value) || typeof value !== 'object') throw new TypeError(label + ' must be a portable record');
+  return value as Readonly<Record<string, JsonValue>>;
+};
+
+const forbiddenQueryKeys = new Set(['__proto__', 'constructor', 'prototype']);
+const adoptQueryLogicalValue = (input: unknown, label: string): QueryLogicalValue => {
+  const seen = new Set<object>();
+  let totalMembers = 0;
+  const visit = (value: unknown, depth: number): QueryLogicalValue => {
+    if (value === logicalUnknown) return logicalUnknown;
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw new TypeError(label + ' contains a non-finite number');
+      return Object.is(value, -0) ? 0 : value;
+    }
+    if (typeof value !== 'object') throw new TypeError(label + ' contains a non-portable value');
+    if (depth > defaultValueParseBudget.maxDepth) throw new TypeError(label + ' exceeds the maximum depth');
+    if (seen.has(value)) throw new TypeError(label + ' contains a cycle');
+    seen.add(value);
+    try {
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      const keys = Reflect.ownKeys(value);
+      if (keys.some((key) => typeof key !== 'string')) throw new TypeError(label + ' contains a symbol key');
+      if (Array.isArray(value)) {
+        if (value.length > defaultValueParseBudget.maxArrayMembers) throw new TypeError(label + ' exceeds the array-member budget');
+        totalMembers += value.length;
+        if (totalMembers > defaultValueParseBudget.maxTotalMembers) throw new TypeError(label + ' exceeds the total-member budget');
+        const output: QueryLogicalValue[] = [];
+        for (let index = 0; index < value.length; index += 1) {
+          const descriptor = descriptors[String(index)];
+          if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
+          output.push(visit(descriptor.value, depth + 1));
+        }
+        return Object.freeze(output);
+      }
+      if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError(label + ' contains a hostile prototype');
+      if (keys.length > defaultValueParseBudget.maxObjectMembers) throw new TypeError(label + ' exceeds the object-member budget');
+      totalMembers += keys.length;
+      if (totalMembers > defaultValueParseBudget.maxTotalMembers) throw new TypeError(label + ' exceeds the total-member budget');
+      const output: Record<string, QueryLogicalValue> = {};
+      for (const key of keys as string[]) {
+        if (forbiddenQueryKeys.has(key)) throw new TypeError(label + ' contains a prototype-pollution key');
+        const descriptor = descriptors[key];
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile object descriptor');
+        output[key] = visit(descriptor.value, depth + 1);
+      }
+      return Object.freeze(output);
+    } finally {
+      seen.delete(value);
+    }
+  };
+  return visit(input, 0);
+};
+
+const adoptQueryRecord = (input: unknown, label = 'Query row'): QueryRecord => {
+  const value = adoptQueryLogicalValue(input, label);
+  if (value === null || Array.isArray(value) || typeof value !== 'object') throw new TypeError(label + ' must be a portable record');
+  return value as QueryRecord;
+};
+
+const adoptExpressionScope = (scope: Readonly<Record<string, QueryRecord>>): Readonly<Record<string, QueryRecord>> => Object.freeze(
+  Object.fromEntries(Object.entries(scope).map(([alias, row]) => [alias, adoptQueryRecord(row, 'Query expression row')]))
+);
+
+const adoptStringArray = (input: readonly string[], label: string): readonly string[] => {
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  const output: string[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor) || typeof descriptor.value !== 'string') throw new TypeError(label + ' contains a hostile value');
+    output.push(descriptor.value);
+  }
+  return Object.freeze(output);
+};
+
+const adoptRelationInput = (input: RelationInput): RelationInput => Object.freeze({
+  relation: adoptJsonValue(input.relation, 'Query relation') as unknown as RelationUse,
+  rows: Object.freeze(input.rows.map((row) => adoptQueryRecord(row))),
+  ...(input.occurrenceIds === undefined ? {} : { occurrenceIds: adoptStringArray(input.occurrenceIds, 'Query occurrence identities') }),
+  completeness: input.completeness,
+  ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
+  ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }),
+  ...(input.basis === undefined ? {} : { basis: adoptJsonValue(input.basis, 'Query relation basis') })
+});
+
+const adoptMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): QueryMaintenanceSnapshot => Object.freeze({
+  relations: Object.freeze(snapshot.relations.map(adoptRelationInput)),
+  ...(snapshot.parameters === undefined ? {} : { parameters: adoptJsonRecord(snapshot.parameters, 'Query parameters') }),
+  ...(snapshot.functions === undefined ? {} : { functions: new Map(snapshot.functions) }),
+  ...(snapshot.basis === undefined ? {} : { basis: adoptJsonValue(snapshot.basis, 'Query basis') }),
+  ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision })
+});
+
+type OwnedDataRecord = Readonly<Record<string, PropertyDescriptor>>;
+
+const inspectOwnedDataRecord = (input: unknown, label: string): OwnedDataRecord => {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new TypeError(label + ' must be a plain record');
+  try {
+    if (Object.getPrototypeOf(input) !== Object.prototype) throw new TypeError(label + ' contains a hostile prototype');
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== 'string') throw new TypeError(label + ' contains a symbol key');
+      if (forbiddenQueryKeys.has(key)) throw new TypeError(label + ' contains a prototype-pollution key');
+      const descriptor = descriptors[key];
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile object descriptor');
+    }
+    return descriptors;
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
+    throw new TypeError(label + ' could not be inspected', { cause: error });
+  }
+};
+
+const ownedDataValue = (descriptors: OwnedDataRecord, key: string): unknown => descriptors[key]?.value;
+
+const inspectOwnedArray = (input: unknown, label: string): readonly unknown[] => {
+  if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const length = (Reflect.get(descriptors, 'length') as PropertyDescriptor | undefined)?.value;
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError(label + ' contains a hostile length');
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== 'string') throw new TypeError(label + ' contains a symbol key');
+      if (key === 'length' || /^(0|[1-9][0-9]*)$/.test(key)) continue;
+      const descriptor = descriptors[key];
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
+    }
+    const output: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
+      output.push(descriptor.value);
+    }
+    return output;
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
+    throw new TypeError(label + ' could not be inspected', { cause: error });
+  }
+};
+
+const adoptOptionalIndex = (value: unknown, label: string): number => {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) throw new TypeError(label + ' must be a safe integer');
+  return value;
+};
+
+const adoptOptionalString = (value: unknown, label: string): string => {
+  if (typeof value !== 'string') throw new TypeError(label + ' must be a string');
+  return value;
+};
+
+const adoptCompleteness = (value: unknown, label: string): Completeness => {
+  if (value !== 'exact' && value !== 'lower-bound' && value !== 'unknown') throw new TypeError(label + ' has invalid completeness');
+  return value;
+};
+
+const adoptIndexedQueryRow = (input: unknown, label: string): NonNullable<RelationRowChange['before']> => {
+  const descriptors = inspectOwnedDataRecord(input, label);
+  return Object.freeze({
+    index: adoptOptionalIndex(ownedDataValue(descriptors, 'index'), label + ' index'),
+    row: adoptQueryRecord(ownedDataValue(descriptors, 'row'), label + ' row')
+  });
+};
+
+const adoptRelationChangeState = (input: unknown, label: string): NonNullable<RelationInputChange['before']> => {
+  const descriptors = inspectOwnedDataRecord(input, label);
+  const basis = ownedDataValue(descriptors, 'basis');
+  return Object.freeze({
+    index: adoptOptionalIndex(ownedDataValue(descriptors, 'index'), label + ' index'),
+    completeness: adoptCompleteness(ownedDataValue(descriptors, 'completeness'), label),
+    ...(basis === undefined ? {} : { basis: adoptJsonValue(basis, label + ' basis') })
+  });
+};
+
+const adoptRelationRowChange = (input: unknown): RelationRowChange => {
+  const descriptors = inspectOwnedDataRecord(input, 'Query row change');
+  const before = ownedDataValue(descriptors, 'before');
+  const after = ownedDataValue(descriptors, 'after');
+  return Object.freeze({
+    occurrenceId: adoptOptionalString(ownedDataValue(descriptors, 'occurrenceId'), 'Query row change occurrenceId'),
+    ...(before === undefined ? {} : { before: adoptIndexedQueryRow(before, 'Query row change before') }),
+    ...(after === undefined ? {} : { after: adoptIndexedQueryRow(after, 'Query row change after') })
+  });
+};
+
+const adoptRelationInputChange = (input: unknown): RelationInputChange => {
+  const descriptors = inspectOwnedDataRecord(input, 'Query relation change');
+  const sourceId = ownedDataValue(descriptors, 'sourceId');
+  const attachmentId = ownedDataValue(descriptors, 'attachmentId');
+  const before = ownedDataValue(descriptors, 'before');
+  const after = ownedDataValue(descriptors, 'after');
+  return Object.freeze({
+    relation: adoptJsonValue(ownedDataValue(descriptors, 'relation'), 'Changed query relation') as unknown as RelationUse,
+    ...(sourceId === undefined ? {} : { sourceId: adoptOptionalString(sourceId, 'Query relation change sourceId') }),
+    ...(attachmentId === undefined ? {} : { attachmentId: adoptOptionalString(attachmentId, 'Query relation change attachmentId') }),
+    ...(before === undefined ? {} : { before: adoptRelationChangeState(before, 'Query relation change before') }),
+    ...(after === undefined ? {} : { after: adoptRelationChangeState(after, 'Query relation change after') }),
+    rows: Object.freeze(inspectOwnedArray(ownedDataValue(descriptors, 'rows'), 'Query relation row changes').map(adoptRelationRowChange))
+  });
+};
+
+const adoptQueryMaintenanceUpdate = (input: QueryMaintenanceUpdate): QueryMaintenanceUpdate => {
+  const descriptors = inspectOwnedDataRecord(input, 'Query maintenance update');
+  const expectedBasis = ownedDataValue(descriptors, 'expectedBasis');
+  const basis = ownedDataValue(descriptors, 'basis');
+  const expectedMembershipRevision = ownedDataValue(descriptors, 'expectedMembershipRevision');
+  const membershipRevision = ownedDataValue(descriptors, 'membershipRevision');
+  return Object.freeze({
+    ...(expectedBasis === undefined ? {} : { expectedBasis: adoptJsonValue(expectedBasis, 'Expected query basis') }),
+    ...(basis === undefined ? {} : { basis: adoptJsonValue(basis, 'Changed query basis') }),
+    ...(expectedMembershipRevision === undefined ? {} : { expectedMembershipRevision: adoptOptionalIndex(expectedMembershipRevision, 'Expected membership revision') }),
+    ...(membershipRevision === undefined ? {} : { membershipRevision: adoptOptionalIndex(membershipRevision, 'Changed membership revision') }),
+    relations: Object.freeze(inspectOwnedArray(ownedDataValue(descriptors, 'relations'), 'Query relation changes').map(adoptRelationInputChange))
+  });
+};
+
+const adoptQueryRequest = (request: QueryRequest): QueryRequest => ({
+  root: cloneAndFreezeQueryAst(request.root),
+  ...adoptMaintenanceSnapshot(request)
+});
+
+const publicQueryRows = (rows: readonly ScopedRow[], cache: WeakMap<ScopedRow, QueryRecord>): readonly QueryRecord[] => Object.freeze(rows.map((row) => {
+  const cached = cache.get(row);
+  if (cached !== undefined) return cached;
+  const owned = adoptQueryRecord(visibleRow(row), 'Query result row');
+  cache.set(row, owned);
+  return owned;
+}));
+
+const publicQueryIssues = (issues: readonly Issue[]): readonly Issue[] => Object.freeze(issues.map((issue) =>
+  adoptJsonValue(issue, 'Query issue') as unknown as Issue
+));
 
 const internPooledQueryNode = (
   node: QueryNode,
@@ -2236,19 +2516,20 @@ const containsSubquery = (expression: Expr): boolean => {
 const maintainedQueryResult = (
   root: MaterializedQueryNode | undefined,
   additionalIssues: readonly Issue[],
-  state: IncrementalQueryMaintenanceState
+  state: IncrementalQueryMaintenanceState,
+  publicRows: WeakMap<ScopedRow, QueryRecord>
 ): IncrementalQueryResult => {
-  const issues = deduplicateQueryIssues([...(root?.issues ?? []), ...additionalIssues]);
+  const issues = publicQueryIssues(deduplicateQueryIssues([...(root?.issues ?? []), ...additionalIssues]));
   if (root === undefined || root.unavailable || root.result.completeness === 'unknown') {
-    return { rows: [], resultKeys: [], completeness: 'unknown', issues, state };
+    return Object.freeze({ rows: Object.freeze([]), resultKeys: Object.freeze([]), completeness: 'unknown', issues, state });
   }
-  return {
-    rows: root.result.rows.map(visibleRow),
-    resultKeys: root.result.rows.map(resultKey),
+  return Object.freeze({
+    rows: publicQueryRows(root.result.rows, publicRows),
+    resultKeys: Object.freeze(root.result.rows.map(resultKey)),
     completeness: root.result.completeness,
     issues,
     state
-  };
+  });
 };
 
 const maintenanceState = (
@@ -2259,18 +2540,22 @@ const maintenanceState = (
   resultDelta: IncrementalQueryResultDelta,
   revision: number,
   rejectedUpdateCount: number
-): IncrementalQueryMaintenanceState => ({
+): IncrementalQueryMaintenanceState => Object.freeze({
   strategy: 'differential-operator-graph',
   revision,
   materializedNodeCount,
   updatedNodeCount,
   changedNodeCount,
-  changedRelationIds,
-  resultDelta,
+  changedRelationIds: Object.freeze([...changedRelationIds]),
+  resultDelta: Object.freeze({
+    addedResultKeys: Object.freeze([...resultDelta.addedResultKeys]),
+    removedResultKeys: Object.freeze([...resultDelta.removedResultKeys]),
+    updatedResultKeys: Object.freeze([...resultDelta.updatedResultKeys])
+  }),
   rejectedUpdateCount
 });
 
-const emptyIncrementalQueryResultDelta: IncrementalQueryResultDelta = Object.freeze({ addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] });
+const emptyIncrementalQueryResultDelta: IncrementalQueryResultDelta = Object.freeze({ addedResultKeys: Object.freeze([]), removedResultKeys: Object.freeze([]), updatedResultKeys: Object.freeze([]) });
 
 const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: MaterializedQueryNode, values: WeakMap<ScopedRow, string>): boolean => {
   if (left.unavailable !== right.unavailable || left.result.completeness !== right.result.completeness) return false;
@@ -2358,7 +2643,7 @@ const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, update:
       if (!sameIndexedRow({ index, row }, rowChange.before)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
       if (rowChange.after !== undefined && !placeChangedRow(nextRows, nextOccurrences, occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('invalid_row_order', change.relation.relationId);
     }
-    for (const rowChange of change.rows) {
+    for (const rowChange of rowChanges.values()) {
       if (consumedChanges.has(rowChange.occurrenceId)) continue;
       if (rowChange.before !== undefined || rowChange.after === undefined || !placeChangedRow(nextRows, nextOccurrences, rowChange.occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
     }
@@ -2370,25 +2655,25 @@ const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, update:
     }
     const input: RelationInput = {
       relation: change.relation,
-      rows: nextRows as QueryRecord[],
-      occurrenceIds: nextOccurrences as string[],
+      rows: Object.freeze(nextRows as QueryRecord[]),
+      occurrenceIds: Object.freeze(nextOccurrences as string[]),
       completeness: change.after.completeness,
       ...(change.sourceId === undefined ? {} : { sourceId: change.sourceId }),
       ...(change.attachmentId === undefined ? {} : { attachmentId: change.attachmentId }),
       ...(change.after.basis === undefined ? {} : { basis: change.after.basis })
     };
-    current.set(identity, { input, index: change.after.index });
+    current.set(identity, { input: Object.freeze(input), index: change.after.index });
   }
   const orderedInputs = [...current.values()].sort((left, right) => left.index - right.index);
   if (orderedInputs.some(({ index }, expected) => index !== expected)) return rejectedMaintenanceUpdate('invalid_relation_order');
   const value: QueryMaintenanceSnapshot = {
-    relations: orderedInputs.map(({ input }) => input),
+    relations: Object.freeze(orderedInputs.map(({ input }) => input)),
     ...(previous.parameters === undefined ? {} : { parameters: previous.parameters }),
     ...(previous.functions === undefined ? {} : { functions: previous.functions }),
     ...(update.basis === undefined ? {} : { basis: update.basis }),
     ...(update.membershipRevision === undefined ? {} : { membershipRevision: update.membershipRevision })
   };
-  return { success: true, value };
+  return { success: true, value: Object.freeze(value) };
 };
 
 const sameRelationChangeState = (current: IndexedRelationInput | undefined, expected: RelationInputChange['before']): boolean => {

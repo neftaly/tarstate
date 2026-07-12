@@ -57,6 +57,15 @@ const makeFixture = async () => {
 };
 
 describe('production schemas and codecs', () => {
+  it('rejects unknown and incomplete schema declaration members at preparation', () => {
+    expect(prepareSchema({ relations: {}, ambientAuthority: true })).toMatchObject({ success: false });
+    expect(prepareSchema({ relations: { people: { relationId: 'test.person', key: ['id'], fields: { id: { type: { kind: 'string', ambient: true } } } } } }))
+      .toMatchObject({ success: false });
+    expect(prepareSchema({ relations: { people: { relationId: 'test.person', key: ['id'], fields: { id: { type: { kind: 'instant' } } } } } }))
+      .toMatchObject({ success: false });
+    expect(prepareSchema({ relations: { people: { relationId: 'test.person', key: ['id'], fields: { id: null } } } }))
+      .toMatchObject({ success: false, issues: [{ code: 'schema.field_invalid' }] });
+  });
   it('keeps missing and null distinct, enforces exact ref/key arity, and reports codec failure', async () => {
     const { registry, schema } = await makeFixture();
     expect(parseRelationCandidate(schema, 'test.user', { id: 'a', code: 'OK' }, registry)).toMatchObject({ success: true, value: { row: { id: 'a', code: { type: 'urn:test:upper' } } } });
@@ -97,6 +106,47 @@ describe('production schemas and codecs', () => {
     decoded.value.state = 'after';
 
     expect(parsed.value).toEqual({ kind: 'tarstate.value', type: 'urn:test:owned', value: { state: 'before' } });
+  });
+
+  it('owns prepared declarations and exposes lookup maps that cannot be mutated at runtime', () => {
+    const input = {
+      relations: {
+        items: {
+          relationId: 'test.item',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string' } },
+            state: { type: { kind: 'string', values: ['open'] } }
+          }
+        }
+      }
+    };
+    const prepared = prepareSchema(input);
+    if (!prepared.success) throw new Error('schema failed');
+
+    input.relations.items.relationId = 'test.changed';
+    input.relations.items.key.push('state');
+    input.relations.items.fields.state.type.values.push('closed');
+
+    expect(prepared.value.body.relations.items).toMatchObject({ relationId: 'test.item', key: ['id'] });
+    expect(prepared.value.relationsById.has('test.changed')).toBe(false);
+    expect(prepared.value.relationsById.get('test.item')?.declaration.fields.state?.type).toEqual({ kind: 'string', values: ['open'] });
+    expect(Object.isFrozen(prepared.value)).toBe(true);
+    expect(Object.isFrozen(prepared.value.body.relations.items)).toBe(true);
+    expect(Object.isFrozen(prepared.value.relationsById.get('test.item')?.keyFields)).toBe(true);
+
+    expect(() => (prepared.value.relationsById as Map<string, unknown>).set('test.changed', {})).toThrow();
+    expect(() => Map.prototype.set.call(prepared.value.relationsById, 'test.changed', {})).toThrow();
+    expect(() => { Object.getPrototypeOf(prepared.value.relationsById).get = () => undefined; }).toThrow();
+    expect(prepared.value.relationsById.has('test.changed')).toBe(false);
+
+    let callbackMap: ReadonlyMap<string, unknown> | undefined;
+    prepared.value.relationsById.forEach((_value, _key, map) => { callbackMap = map; });
+    expect(callbackMap).toBe(prepared.value.relationsById);
+  });
+
+  it('rejects hostile schema input before adopting it', () => {
+    expect(prepareSchema(Object.create(null))).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
   });
 });
 
@@ -144,6 +194,14 @@ describe('production JSON-tree storage mappings', () => {
     expect(hostileProjection.completeness).toBe('unknown');
     expect(hostileProjection.issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'mapping.collection_invalid', details: { reason: 'inspection_failed', error: 'Error' } })]));
 
+    let getterCalls = 0;
+    const hostileNotes: unknown[] = [];
+    Object.defineProperty(hostileNotes, 0, { enumerable: true, get: () => { getterCalls += 1; return { id: 'n' }; } });
+    hostileNotes.length = 1;
+    expect(projectStorage(compiled.value, { users: {}, notes: hostileNotes }, registry).relations.get('test.note'))
+      .toMatchObject({ completeness: 'unknown', issues: [{ code: 'mapping.collection_invalid', details: { reason: 'descriptor' } }] });
+    expect(getterCalls).toBe(0);
+
     const plan = planStoragePatch(compiled.value, snapshot, 'test.user', { kind: 'object-map-key', key: 'alice' }, { nickname: 'Al' }, undefined, 'source:test');
     expect(plan).toMatchObject({ success: true, value: { intents: [{ path: ['users', 'alice', 'profile', 'nickname'] }] } });
     if (!plan.success) throw new Error('plan failed');
@@ -151,6 +209,48 @@ describe('production JSON-tree storage mappings', () => {
       ...snapshot,
       users: { ...snapshot.users, alice: { ...snapshot.users.alice, profile: { nickname: 'Al', color: 'blue' } } }
     });
+
+    const hostileSibling = Object.defineProperty({ users: snapshot.users, notes: snapshot.notes }, 'ambient', {
+      enumerable: true,
+      get: () => { getterCalls += 1; return 'authority'; }
+    });
+    expect(planStoragePatch(compiled.value, hostileSibling, 'test.user', { kind: 'object-map-key', key: 'alice' }, { nickname: 'Al' }))
+      .toMatchObject({ success: false, issues: [{ code: 'mapping.path_invalid', details: { reason: 'descriptor' } }] });
+    expect(getterCalls).toBe(0);
+  });
+
+  it('owns compiled mapping paths and prevents mutation of the compiled relation lookup', async () => {
+    const { schema } = await makeFixture();
+    const input = {
+      schema: { ...schemaRef },
+      model: 'json-tree-v1',
+      relations: {
+        'test.note': {
+          collection: { kind: 'array', path: ['notes'], absent: 'empty' },
+          keys: { id: { kind: 'field', path: ['id'] } },
+          fields: { body: { path: ['body'], write: { kind: 'read-only' } } }
+        }
+      }
+    };
+    const compiled = compileStorageMapping(input, schemaRef, schema);
+    if (!compiled.success) throw new Error('mapping failed');
+
+    input.relations['test.note'].collection.path[0] = 'changed';
+    input.relations['test.note'].fields.body.path[0] = 'changed';
+
+    expect(compiled.value.body.relations['test.note']?.collection.path).toEqual(['notes']);
+    expect(projectStorage(compiled.value, { notes: [{ id: 'n', body: 'kept' }] }).relations.get('test.note')?.rows)
+      .toMatchObject([{ row: { id: 'n', body: 'kept' } }]);
+    expect(Object.isFrozen(compiled.value)).toBe(true);
+    expect(Object.isFrozen(compiled.value.body.relations['test.note']?.collection.path)).toBe(true);
+    expect(() => (compiled.value.relations as Map<string, unknown>).clear()).toThrow();
+    expect(() => Map.prototype.set.call(compiled.value.relations, 'test.changed', {})).toThrow();
+    expect(compiled.value.relations.has('test.changed')).toBe(false);
+  });
+
+  it('rejects hostile mapping input before adopting it', async () => {
+    const { schema } = await makeFixture();
+    expect(compileStorageMapping(Object.create(null), schemaRef, schema)).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
   });
 });
 
@@ -218,5 +318,42 @@ describe('production schema lenses', () => {
     expect(resolveLensPath(from, to, [first, second])).toMatchObject({ outcome: 'rejected', issues: [{ code: 'lens.path_ambiguous' }] });
     expect(resolveLensPath(from, to, [first, second], [first.ref])).toMatchObject({ outcome: 'resolved', path: [{ ref: first.ref }] });
     expect(resolveLensPath(from, to, [first], undefined, { maxVisitedNodes: 1 })).toMatchObject({ outcome: 'rejected', issues: [{ code: 'lens.path_budget_exceeded' }] });
+  });
+
+  it('owns and freezes validated lens bodies', () => {
+    const input = {
+      from: { ...from },
+      to: { ...to },
+      relations: [{
+        fromRelationId: 'test.task',
+        toRelationId: 'test.task',
+        steps: [{
+          kind: 'lens.value-map',
+          from: 'state',
+          to: 'status',
+          cases: [{ from: 'open', to: 'active', writeBack: 'to-from' }],
+          unmapped: 'reject'
+        }]
+      }]
+    };
+    const validated = validateLens(input);
+    if (!validated.success) throw new Error('lens failed');
+
+    input.to.id = 'urn:test:changed';
+    input.relations[0]!.steps[0]!.to = 'changed';
+    input.relations[0]!.steps[0]!.cases[0]!.to = 'changed';
+
+    expect(validated.value.to).toEqual(to);
+    expect(projectLensRelation(validated.value, 'test.task', { 'test.task': [{ state: 'open' }] }).rows)
+      .toEqual([{ status: 'active' }]);
+    const ownedRelation = validated.value.relations[0];
+    if (ownedRelation === undefined) throw new Error('validated relation missing');
+    expect(Object.isFrozen(validated.value)).toBe(true);
+    expect(Object.isFrozen(ownedRelation.steps)).toBe(true);
+    expect(Object.isFrozen((ownedRelation.steps[0] as { readonly cases: readonly unknown[] }).cases)).toBe(true);
+  });
+
+  it('rejects hostile lens input before adopting it', () => {
+    expect(validateLens(Object.create(null))).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
   });
 });

@@ -740,13 +740,13 @@ describe('database membership and observation', () => {
     source.publish({ rows: [{ id: 9, value: 'rejected' }] });
     expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 2, reusedFrameDeltaCount: 0 });
     expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
-    expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'exact' } });
+    expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
 
     rejectAcceptedIdentity = false;
     source.publish({ rows: [{ id: 4, value: 'recovered' }] });
-    // The cohorts accepted different prior frames, so recovery also computes
-    // two distinct deltas rather than reusing an invalid transition.
-    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 4, reusedFrameDeltaCount: 0 });
+    // Both cohorts rejected the unstable frame and therefore share the same
+    // accepted owned snapshot; recovery can safely reuse that transition.
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 3, reusedFrameDeltaCount: 1 });
     for (const observer of [first, second]) expect(observer.getSnapshot()).toMatchObject({
       state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], completeness: 'exact' }
     });

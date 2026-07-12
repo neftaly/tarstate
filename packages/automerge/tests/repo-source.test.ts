@@ -5,6 +5,7 @@ import {
   AutomergeSourceRuntime,
   automergeRepoSourceRuntime,
   exactAutomergeBasisEqual,
+  type AutomergeRepoHandle,
   type AutomergeSourceRuntimeApi,
 } from '../src/index.js';
 
@@ -102,6 +103,49 @@ describe('Automerge Repo source owner', () => {
       outcome: 'rejected', issues: [{ code: 'transaction.operation_epoch_expired' }],
     });
     await repo.shutdown();
+  });
+
+  it('rejects a Repo changeAt refusal instead of recording a phantom commit', async () => {
+    const repo = new Repo();
+    const handle = repo.create<CounterDoc>({ count: 0 });
+    const runtime = automergeRepoSourceRuntime({ handle });
+    const operation = input(runtime, 'change-at-refused');
+    const apply = vi.fn((draft: CounterDoc) => { draft.count = 1; });
+    vi.spyOn(handle, 'changeAt').mockReturnValueOnce(undefined);
+
+    const rejected = await runtime.commit({ ...operation, commands: [{ apply }] });
+
+    expect(rejected).toMatchObject({
+      outcome: 'rejected',
+      changed: false,
+      issues: [{ code: 'transaction.expected_basis_stale' }],
+    });
+    expect(apply).not.toHaveBeenCalled();
+    expect(handle.doc().count).toBe(0);
+    expect(runtime.queryOutcome(operation)).toEqual({ status: 'known', result: rejected });
+    runtime.close();
+    await repo.shutdown();
+  });
+
+  it('removes the Repo listener when runtime construction fails', () => {
+    const on = vi.fn();
+    const off = vi.fn();
+    const constructionFailure = new Error('doc unavailable');
+    const handle: AutomergeRepoHandle<CounterDoc, readonly string[]> = {
+      url: 'automerge:test-construction-failure',
+      isReady: () => true,
+      isReadOnly: () => false,
+      doc: () => { throw constructionFailure; },
+      heads: () => [],
+      changeAt: () => undefined,
+      on,
+      off,
+    };
+
+    expect(() => automergeRepoSourceRuntime({ handle })).toThrow(constructionFailure);
+    expect(on).toHaveBeenCalledOnce();
+    expect(off).toHaveBeenCalledOnce();
+    expect(off).toHaveBeenCalledWith('heads-changed', on.mock.calls[0]?.[1]);
   });
 
   it('records receipts before isolated listeners observe canonical changes', async () => {

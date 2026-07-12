@@ -99,6 +99,7 @@ exports[`clean rewrite core surface > matches the curated runtime export surface
   "prepareManualReadOnlyAttachment",
   "prepareQuery",
   "prepareSchema",
+  "prepareTypedQuery",
   "projectLensCandidate",
   "projectLensRelation",
   "projectStorage",

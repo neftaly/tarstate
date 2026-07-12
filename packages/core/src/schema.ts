@@ -1,6 +1,8 @@
 import { canonicalizeJson } from './artifacts.js';
 import { parseScalarValue, type ScalarDeclaration } from './codec.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { ownedReadonlyMap } from './internal-owned-map.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
 import type { JsonValue, PortableValue } from './value.js';
@@ -77,8 +79,10 @@ export type ParsedRelation = {
 };
 
 export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): ParseResult<PreparedSchema> => {
-  if (!isRecord(input) || !isRecord(input.relations)) return schemaFailure('schema.invalid', [], { reason: 'shape' });
-  const body = input as unknown as SchemaBody;
+  const owned = detachAndFreezeJsonValue(input);
+  if (!owned.success) return owned;
+  if (!isSchemaBody(owned.value)) return schemaFailure('schema.invalid', [], { reason: 'shape' });
+  const body = owned.value as unknown as SchemaBody;
   const issues: Issue[] = [];
   const relationsByName = new Map<string, PreparedRelation>();
   const relationsById = new Map<RelationId, PreparedRelation>();
@@ -97,23 +101,29 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
       issues.push(schemaIssue('schema.key_invalid', [...path, 'key'], { reason: declaration.key.length === 0 ? 'empty' : 'duplicate_field' }));
       continue;
     }
+    let relationValid = true;
+    for (const [fieldName, field] of Object.entries(declaration.fields)) {
+      if (fieldName.length === 0 || !isFieldDeclaration(field)) {
+        issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName]));
+        relationValid = false;
+        continue;
+      }
+      if (field.type.kind === 'string' && field.type.values !== undefined && (field.type.values.length === 0 || new Set(field.type.values).size !== field.type.values.length)) {
+        issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName, 'type', 'values'], { reason: field.type.values.length === 0 ? 'empty_enum' : 'duplicate_enum_value' }));
+        relationValid = false;
+      }
+    }
+    if (!relationValid) continue;
     const keyFields: FieldDeclaration[] = [];
     for (const fieldName of declaration.key) {
       const field = declaration.fields[fieldName];
       if (field === undefined || field.optional === true || field.nullable === true) {
         issues.push(schemaIssue('schema.key_invalid', [...path, 'key', fieldName], { reason: field === undefined ? 'unknown_field' : field.optional === true ? 'optional' : 'nullable' }));
+        relationValid = false;
       } else keyFields.push(field);
     }
-    for (const [fieldName, field] of Object.entries(declaration.fields)) {
-      if (!isFieldDeclaration(field)) {
-        issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName]));
-        continue;
-      }
-      if (field.type.kind === 'string' && field.type.values !== undefined && (field.type.values.length === 0 || new Set(field.type.values).size !== field.type.values.length)) {
-        issues.push(schemaIssue('schema.field_invalid', [...path, 'fields', fieldName, 'type', 'values'], { reason: field.type.values.length === 0 ? 'empty_enum' : 'duplicate_enum_value' }));
-      }
-    }
-    const prepared = { name, declaration, keyFields } satisfies PreparedRelation;
+    if (!relationValid) continue;
+    const prepared = Object.freeze({ name, declaration, keyFields: Object.freeze(keyFields) }) satisfies PreparedRelation;
     relationsByName.set(name, prepared);
     relationsById.set(declaration.relationId, prepared);
   }
@@ -130,7 +140,15 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
   if (!Array.isArray(required) || required.some((ref) => !isCapabilityRef(ref))) issues.push(schemaIssue('schema.required_codecs_invalid', ['requiredCodecs']));
   else if (registry !== undefined) issues.push(...registry.missing(required));
   if (issues.length > 0) return { success: false, issues };
-  return { success: true, value: { body, relationsByName, relationsById }, issues: [] };
+  return {
+    success: true,
+    value: Object.freeze({
+      body,
+      relationsByName: ownedReadonlyMap(relationsByName),
+      relationsById: ownedReadonlyMap(relationsById)
+    }),
+    issues: []
+  };
 };
 
 /** Projects declared logical fields; undeclared storage fields remain outside the row so preserving writers can round-trip them. */
@@ -243,17 +261,39 @@ export const parseScalarValueForField = (
   });
 };
 
-const isRelationDeclaration = (value: unknown): value is RelationDeclaration => isRecord(value) && typeof value.relationId === 'string' && value.relationId.length > 0 && Array.isArray(value.key) && value.key.every((field) => typeof field === 'string') && isRecord(value.fields);
-const isFieldDeclaration = (value: unknown): value is FieldDeclaration => isRecord(value) && isScalarDeclaration(value.type) && (value.optional === undefined || typeof value.optional === 'boolean') && (value.nullable === undefined || typeof value.nullable === 'boolean');
+const isSchemaBody = (value: unknown): value is SchemaBody => isRecord(value)
+  && hasOnlyKeys(value, ['relations', 'requiredCodecs', 'description', 'metadata'])
+  && isRecord(value.relations)
+  && (value.requiredCodecs === undefined || isCapabilityRefs(value.requiredCodecs))
+  && (value.description === undefined || typeof value.description === 'string')
+  && (value.metadata === undefined || isRecord(value.metadata));
+const isRelationDeclaration = (value: unknown): value is RelationDeclaration => isRecord(value)
+  && hasOnlyKeys(value, ['relationId', 'key', 'fields', 'entityEditCapabilities', 'description', 'metadata'])
+  && typeof value.relationId === 'string' && value.relationId.length > 0
+  && Array.isArray(value.key) && value.key.every((field) => typeof field === 'string' && field.length > 0)
+  && isRecord(value.fields)
+  && (value.entityEditCapabilities === undefined || isCapabilityRefs(value.entityEditCapabilities))
+  && (value.description === undefined || typeof value.description === 'string')
+  && (value.metadata === undefined || isRecord(value.metadata));
+const isFieldDeclaration = (value: unknown): value is FieldDeclaration => isRecord(value)
+  && hasOnlyKeys(value, ['type', 'optional', 'nullable', 'editCapabilities', 'description', 'metadata'])
+  && isScalarDeclaration(value.type)
+  && (value.optional === undefined || typeof value.optional === 'boolean')
+  && (value.nullable === undefined || typeof value.nullable === 'boolean')
+  && (value.editCapabilities === undefined || isCapabilityRefs(value.editCapabilities))
+  && (value.description === undefined || typeof value.description === 'string')
+  && (value.metadata === undefined || isRecord(value.metadata));
 const isScalarDeclaration = (value: unknown): value is ScalarDeclaration => {
   if (!isRecord(value) || typeof value.kind !== 'string') return false;
-  if (value.kind === 'string') return value.values === undefined || (Array.isArray(value.values) && value.values.every((member) => typeof member === 'string'));
-  if (['boolean', 'number', 'integer', 'decimal', 'bytes', 'json'].includes(value.kind)) return true;
-  if (value.kind === 'instant') return value.precision === 'millisecond' || value.precision === 'microsecond' || value.precision === 'nanosecond';
-  if (value.kind === 'ref') return isRecord(value.target) && typeof value.target.relationId === 'string';
-  return value.kind === 'custom' && isCapabilityRef(value.codec);
+  if (value.kind === 'string') return hasOnlyKeys(value, ['kind', 'values']) && (value.values === undefined || (Array.isArray(value.values) && value.values.every((member) => typeof member === 'string')));
+  if (['boolean', 'number', 'integer', 'decimal', 'bytes', 'json'].includes(value.kind)) return hasOnlyKeys(value, ['kind']);
+  if (value.kind === 'instant') return hasOnlyKeys(value, ['kind', 'precision']) && (value.precision === 'millisecond' || value.precision === 'microsecond' || value.precision === 'nanosecond');
+  if (value.kind === 'ref') return hasOnlyKeys(value, ['kind', 'target']) && isRecord(value.target) && hasOnlyKeys(value.target, ['relationId']) && typeof value.target.relationId === 'string' && value.target.relationId.length > 0;
+  return value.kind === 'custom' && hasOnlyKeys(value, ['kind', 'codec']) && isCapabilityRef(value.codec);
 };
-const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && typeof value.id === 'string' && typeof value.version === 'string' && typeof value.contractHash === 'string' && /^sha256:[0-9a-f]{64}$/.test(value.contractHash);
+const isCapabilityRefs = (value: unknown): value is readonly CapabilityRef[] => Array.isArray(value) && value.every(isCapabilityRef);
+const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && hasOnlyKeys(value, ['id', 'version', 'contractHash']) && typeof value.id === 'string' && value.id.length > 0 && typeof value.version === 'string' && value.version.length > 0 && typeof value.contractHash === 'string' && /^sha256:[0-9a-f]{64}$/.test(value.contractHash);
+const hasOnlyKeys = (value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean => Object.keys(value).every((key) => allowed.includes(key));
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isSafeCandidateRecord = (value: unknown): value is Readonly<Record<string, unknown>> => {
   if (!isRecord(value)) return false;

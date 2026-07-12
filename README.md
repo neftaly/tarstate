@@ -17,54 +17,42 @@ Tarstate was heavily inspired by
 
 ## Queries
 
-Queries are portable values composed with `pipe`. This one joins pizzas to
-their bases, sorts the menu by name, and selects the fields the UI needs:
+Queries are portable values. The typed authoring helpers preserve exact result
+rows and parameters through preparation and into the UI:
 
 ```ts
-import { aggregate, compare, field, from, join, orderBy, pipe, select } from '@tarstate/core';
-import { schema } from './schema';
+import {
+  prepareTypedQuery,
+  relationLiteral,
+  typedFrom,
+  typedOrderBy,
+  typedSelect
+} from '@tarstate/core';
+import { schema, schemaBody } from './schema';
 
-const base = from({ schemaView: schema, relationId: 'example.base' }, 'base');
-const pizza = from({ schemaView: schema, relationId: 'example.pizza' }, 'pizza');
-
-export const pizzaMenuQuery = pipe(
-  pizza,
-  join(base, 'inner', compare(
-    'eq',
-    field('pizza', 'base'),
-    { kind: 'array', items: [field('base', 'name')] }
-  )),
-  orderBy([{ value: field('pizza', 'name'), direction: 'asc' }]),
-  select('menu', {
-    name: field('pizza', 'name'),
-    style: field('base', 'style'),
-    price: field('pizza', 'price')
+const pizzas = relationLiteral(schema, schemaBody, 'pizzas');
+const pizza = typedFrom(pizzas, 'pizza');
+const pizzaMenuQuery = typedSelect(
+  typedOrderBy(pizza, aliases => [{
+    value: aliases.pizza.row.name,
+    direction: 'asc'
+  }]),
+  'menu',
+  aliases => ({
+    name: aliases.pizza.row.name,
+    price: aliases.pizza.row.price
   })
 );
+
+export const pizzaMenuPlan = await prepareTypedQuery(pizzaMenuQuery, {
+  registryFingerprint,
+  authorityFingerprint,
+  datasetId: 'primary'
+});
 ```
 
-Queries are compiled into an Incremental View Maintenance graph, so work is shared.
-When data changes, it updates only the affected operators, and processing is reused:
-
-```ts
-export const menuSummaryQuery = pipe(
-  pizza,
-  join(base, 'inner', compare(
-    'eq',
-    field('pizza', 'base'),
-    { kind: 'array', items: [field('base', 'name')] }
-  )),
-  // --- The query is free before this line ---
-  aggregate('summary', {}, {
-    pizzaCount: { kind: 'aggregate', op: 'count' },
-    averagePrice: {
-      kind: 'aggregate',
-      op: 'average',
-      value: field('pizza', 'price')
-    }
-  })
-);
-```
+Prepared queries are compiled into an Incremental View Maintenance graph. When
+data changes, Tarstate updates affected operators and reuses shared work.
 
 ## Schemas
 
@@ -74,27 +62,46 @@ They are different from `json-schema`, and justified by [parse not validate](htt
 Schemas can live alongside (or inside) your data, making versioning almost free:
 
 ```ts
-import { sealSchema } from '@tarstate/core';
+import { relationDeclaration, referenceTo, schemaLiteral, sealSchema } from '@tarstate/core';
 
-export const schema = await sealSchema({
-  "id": "example.pizza-ordering@1",
-  "body": {
-    "relations": {
-    "bases": { "relationId": "example.base", "key": ["name"], "fields": {
-      "name": { "type": { "kind": "string" } },
-      "style": { "type": { "kind": "string" } }
-    } },
-    "pizzas": { "relationId": "example.pizza", "key": ["name"], "fields": {
-      "name": { "type": { "kind": "string" } },
-      "base": { "type": { "kind": "ref", "target": { "relationId": "example.base" } } },
-      "price": { "type": { "kind": "number" } }
-    } },
-    "toppings": { "relationId": "example.topping", "key": ["pizza", "name"], "fields": {
-      "pizza": { "type": { "kind": "ref", "target": { "relationId": "example.pizza" } } },
-      "name": { "type": { "kind": "string" } },
-      "extra": { "type": { "kind": "boolean" } } } }
+const bases = relationDeclaration({
+  relationId: 'example.base',
+  key: ['name'],
+  fields: {
+    name: { type: { kind: 'string' } },
+    style: { type: { kind: 'string' } }
+  }
+});
+
+const pizzas = relationDeclaration({
+  relationId: 'example.pizza',
+  key: ['name'],
+  fields: {
+    name: { type: { kind: 'string' } },
+    base: { type: referenceTo(bases) },
+    price: { type: { kind: 'number' } }
+  }
+});
+
+export const schemaBody = schemaLiteral({
+  relations: {
+    bases,
+    pizzas,
+    toppings: {
+      relationId: 'example.topping',
+      key: ['pizza', 'name'],
+      fields: {
+        pizza: { type: referenceTo(pizzas) },
+        name: { type: { kind: 'string' } },
+        extra: { type: { kind: 'boolean' } }
+      }
     }
   }
+});
+
+export const schema = await sealSchema({
+  id: 'example.pizza-ordering@1',
+  body: schemaBody
 });
 
 export const initialState = {
@@ -133,24 +140,25 @@ This script writes `src/generated/tarstate/rows.d.ts`. As it's in `src`, TypeScr
 
 ## React hooks
 
-Tarstate can read and write existing state management, making views more consise, and actions easier to reason about:
+Tarstate can read existing state management through a prepared query while
+preserving its inferred row type:
 
 ```tsx
-import { TarstateProvider, useCommit, useQuery } from '@tarstate/react';
-import { database, executeCommit } from './tarstate';
+import { TarstateProvider, useQuery } from '@tarstate/react';
+import { pizzaMenuPlan } from './queries';
+import { database } from './tarstate';
 
 export function App() {
   return (
-    <TarstateProvider database={database} executeCommit={executeCommit}>
+    <TarstateProvider database={database}>
       <PizzaMenu />
     </TarstateProvider>
   );
 }
 
 function PizzaMenu() {
-  const menu = useQuery(pizzaMenuQuery); // TODO: Check works
-  const commit = useCommit();
-  // const makeDetroitStyle = ...
+  const menu = useQuery(pizzaMenuPlan);
+  if (menu.state === 'closed') return null;
 
   return (
     <section>
@@ -158,10 +166,7 @@ function PizzaMenu() {
       <ul>
         {menu.current.rows.map((row, index) => (
           <li key={menu.current.resultKeys[index]}>
-            {row.name} ({row.style}) - ${row.price}
-            <button type="button" onClick={() => void commit(makeDetroitStyle(row.name))}>
-              make Detroit style
-            </button>
+            {row.name} - ${row.price}
           </li>
         ))}
       </ul>

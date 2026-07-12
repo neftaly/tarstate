@@ -189,6 +189,60 @@ const applySnapshot = (session: ReturnType<typeof openIncrementalQueryMaintenanc
   session.applyUpdate(diffQueryMaintenanceSnapshots(before, after));
 
 describe('incremental query maintenance', () => {
+  it('detaches the private-session query plan from later caller mutation', () => {
+    const predicate = { kind: 'literal' as const, value: true };
+    const query: QueryNode = { kind: 'where', input: from('owned-plan', 'row'), predicate };
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('owned-plan', [
+      { occurrenceId: 'owned-plan:1', row: { id: 1 } }
+    ], 1)] };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    predicate.value = false;
+
+    expect(session.getCurrentResult().rows).toEqual([{ id: 1 }]);
+    session.close();
+  });
+
+  it('owns private-session inputs, changed rows, and cached public row views', () => {
+    const firstRow = { id: 1, nested: { label: 'one' } };
+    const secondRow = { id: 2, nested: { label: 'two' } };
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('owned', [
+      { occurrenceId: 'owned:1', row: firstRow }, { occurrenceId: 'owned:2', row: secondRow }
+    ], 1)] };
+    const changedSecond = { id: 2, nested: { label: 'changed' } };
+    const next: QueryMaintenanceSnapshot = { relations: [relation('owned', [
+      { occurrenceId: 'owned:1', row: firstRow }, { occurrenceId: 'owned:2', row: changedSecond }
+    ], 2)] };
+    const update = diffQueryMaintenanceSnapshots(initial, next);
+    const session = openIncrementalQueryMaintenance(plan(from('owned', 'owned')), initial);
+    const before = session.getCurrentResult();
+
+    firstRow.nested.label = 'caller mutation';
+    expect(before.rows[0]).toEqual({ id: 1, nested: { label: 'one' } });
+    expect(Object.isFrozen(before.rows[0]?.nested)).toBe(true);
+    const after = session.applyUpdate(update);
+    changedSecond.nested.label = 'late mutation';
+    expect(after.rows).toEqual([{ id: 1, nested: { label: 'one' } }, { id: 2, nested: { label: 'changed' } }]);
+    expect(after.rows[0]).toBe(before.rows[0]);
+    session.close();
+  });
+
+  it('owns pooled inputs and shares immutable public views for retained physical rows', () => {
+    const firstRow = { id: 1, nested: { label: 'one' } };
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('pooled-owned', [{ occurrenceId: 'owned:1', row: firstRow }], 1)] };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: { runtimeIdentity: 'database:test/owned', registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(from('pooled-owned', 'owned')));
+    const result = root.getCurrentResult();
+    firstRow.nested.label = 'caller mutation';
+    expect(result.rows).toEqual([{ id: 1, nested: { label: 'one' } }]);
+    expect(Object.isFrozen(result.rows[0])).toBe(true);
+    root.close();
+    runtime.close();
+  });
+
   it('matches the independent pure oracle for every query node across insert, update, and delete sequences', () => {
     const initial = snapshot(basePeople, 1);
     const middle = snapshot(middlePeople, 2);
@@ -310,6 +364,55 @@ describe('incremental query maintenance', () => {
     const recovered = applySnapshot(session, initial, final);
     expect(semanticResult(recovered)).toEqual(oracle(query, final));
     expect(recovered.state).toMatchObject({ rejectedUpdateCount: 1 });
+  });
+
+  it('atomically adopts update identity before private and pooled invalidation', () => {
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    const valid = diffQueryMaintenanceSnapshots(initial, next);
+    const peopleChange = valid.relations.find(({ relation }) => relation.relationId === 'people') as NonNullable<typeof valid.relations[number]>;
+    let relationIdReads = 0;
+    const accessorRelation = { schemaView } as Record<string, unknown>;
+    Object.defineProperty(accessorRelation, 'relationId', {
+      enumerable: true,
+      get: () => {
+        relationIdReads += 1;
+        return relationIdReads === 1 ? 'people' : 'groups';
+      }
+    });
+    const hostile = {
+      ...valid,
+      relations: valid.relations.map((change) => change === peopleChange
+        ? { ...change, relation: accessorRelation as RelationInput['relation'] }
+        : change)
+    };
+
+    const privateSession = openIncrementalQueryMaintenance(plan(people), initial);
+    const privateBefore = privateSession.getCurrentResult();
+    expect(() => privateSession.applyUpdate(hostile)).toThrow('Changed query relation must be a portable value');
+    expect(privateSession.getCurrentResult()).toBe(privateBefore);
+
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/atomic-update-adoption', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(people));
+    const pooledBefore = root.getCurrentResult();
+    const diagnosticsBefore = runtime.getDiagnostics();
+    expect(() => runtime.applyUpdate(hostile)).toThrow('Changed query relation must be a portable value');
+    expect(root.getCurrentResult()).toBe(pooledBefore);
+    expect(runtime.getDiagnostics()).toBe(diagnosticsBefore);
+    expect(relationIdReads).toBe(0);
+
+    expect(semanticResult(privateSession.applyUpdate(valid))).toEqual(oracle(people, next));
+    runtime.applyUpdate(valid);
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(people, next));
+    privateSession.close();
+    root.close();
+    runtime.close();
   });
 
   it('requires occurrence identity when opening maintenance over non-empty relations', () => {
@@ -467,7 +570,7 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
-  it('rolls back a private session after a later branch throws and accepts a retry from the prior snapshot', () => {
+  it('withdraws a private assertion after a named function returns a non-portable value and later recovers', () => {
     const callable = { id: 'urn:test:private-rollback', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
     const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
     const cyclic: Record<string, unknown> = {};
@@ -491,16 +594,14 @@ describe('incremental query maintenance', () => {
     const failing = input(2, 2);
     const recovered = input(1, 3);
     const session = openIncrementalQueryMaintenance(plan(query), initial);
-    const before = session.getCurrentResult();
+    const failed = session.applyUpdate(diffQueryMaintenanceSnapshots(initial, failing));
+    expect(failed).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.function_failed' }] });
+    expect(failed.state).toMatchObject({ revision: 1, rejectedUpdateCount: 0 });
 
-    expect(() => session.applyUpdate(diffQueryMaintenanceSnapshots(initial, failing))).toThrow();
-    expect(session.getCurrentResult()).toBe(before);
-    expect(session.getCurrentResult().state).toMatchObject({ revision: 0, rejectedUpdateCount: 0 });
-
-    const result = session.applyUpdate(diffQueryMaintenanceSnapshots(initial, recovered));
+    const result = session.applyUpdate(diffQueryMaintenanceSnapshots(failing, recovered));
     expect(result.rows).toEqual([{ source: 'alpha', value: 1 }, { source: 'beta', value: 3 }]);
     expect(semanticResult(result)).toEqual(oracle(query, recovered));
-    expect(result.state).toMatchObject({ revision: 1, rejectedUpdateCount: 0 });
+    expect(result.state).toMatchObject({ revision: 2, rejectedUpdateCount: 0 });
     session.close();
   });
 
@@ -911,27 +1012,17 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
-  it('rolls back interning and staged materialization when attachment fails unexpectedly', () => {
+  it('rejects accessor-backed rows at the pooled snapshot boundary', () => {
     const throwingRow: Record<string, import('../src/query.js').QueryLogicalValue> = { id: 1 };
     Object.defineProperty(throwingRow, 'name', { configurable: true, enumerable: true, get: () => { throw new Error('row getter failed'); } });
     const initial: QueryMaintenanceSnapshot = { relations: [relation('people', [{ occurrenceId: 'person:throwing', row: throwingRow }], 1)] };
-    const query: QueryNode = { kind: 'select', input: from('people', 'p'), alias: 'result', fields: { name: field('p', 'name') } };
-    const runtime = createPooledIncrementalQueryRuntime({
+    expect(() => createPooledIncrementalQueryRuntime({
       environment: {
         runtimeIdentity: 'database:test/rollback', registryFingerprint: 'registry:test',
         authorityFingerprint: 'authority:test', datasetId: 'dataset:test'
       },
       initialSnapshot: initial
-    });
-
-    expect(() => runtime.attach(plan(query))).toThrow('row getter failed');
-    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0 });
-    Object.defineProperty(throwingRow, 'name', { configurable: true, enumerable: true, value: 'recovered' });
-    const root = runtime.attach(plan(query));
-    expect(root.getCurrentResult()).toMatchObject({ completeness: 'exact', rows: [{ name: 'recovered' }] });
-    expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 1, physicalNodeCount: 2 });
-    root.close();
-    runtime.close();
+    })).toThrow('hostile object descriptor');
   });
 
   it('interns deep cloned pipelines exactly without retaining full-subtree keys', () => {
@@ -1014,7 +1105,7 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
-  it('rolls back an update when materialization throws unexpectedly', () => {
+  it('rolls back an update when changed-row adoption throws', () => {
     const initial = snapshot(basePeople, 1);
     const next = snapshot(middlePeople, 2);
     const runtime = createPooledIncrementalQueryRuntime({
@@ -1042,7 +1133,7 @@ describe('incremental query maintenance', () => {
       })
     };
 
-    expect(() => runtime.applyUpdate(failingUpdate)).toThrow('materialization getter failed');
+    expect(() => runtime.applyUpdate(failingUpdate)).toThrow('hostile object descriptor');
     expect(root.getCurrentResult()).toBe(beforeResult);
     expect(runtime.getDiagnostics()).toBe(beforeDiagnostics);
 
@@ -1053,51 +1144,21 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
-  it('rolls back accepted state and root assertions when result-delta calculation throws', () => {
-    let throwOnRead = false;
-    let victim: ReturnType<ReturnType<typeof createPooledIncrementalQueryRuntime>['attach']> | undefined;
+  it('rejects accessor-backed initial rows before retaining incremental state', () => {
     const guardedRow: QueryRecord = { id: 1 };
     Object.defineProperty(guardedRow, 'value', {
       enumerable: true,
-      get: () => {
-        if (throwOnRead) {
-          victim?.close();
-          throw new Error('delta getter failed');
-        }
-        return 'one';
-      }
+      get: () => 'one'
     });
     const initialPeople: readonly QueryRowOccurrence[] = [{ occurrenceId: 'person:guarded', row: guardedRow }];
-    const nextPeople: readonly QueryRowOccurrence[] = [
-      initialPeople[0] as QueryRowOccurrence,
-      { occurrenceId: 'person:second', row: { id: 2, value: 'two' } }
-    ];
     const initial: QueryMaintenanceSnapshot = { relations: [relation('people', initialPeople, 1)] };
-    const next: QueryMaintenanceSnapshot = { relations: [relation('people', nextPeople, 2)] };
-    const update = diffQueryMaintenanceSnapshots(initial, next);
-    const runtime = createPooledIncrementalQueryRuntime({
+    expect(() => createPooledIncrementalQueryRuntime({
       environment: {
         runtimeIdentity: 'database:test/update-delta-rollback', registryFingerprint: 'registry:test',
         authorityFingerprint: 'authority:test', datasetId: 'dataset:test'
       },
       initialSnapshot: initial
-    });
-    const root = runtime.attach(plan(people));
-    victim = runtime.attach(plan({ kind: 'values', alias: 'victim', rows: [{ value: 'close-after-rollback' }] }));
-    const beforeResult = root.getCurrentResult();
-    const beforeRevision = runtime.getDiagnostics().revision;
-
-    throwOnRead = true;
-    expect(() => runtime.applyUpdate(update)).toThrow('delta getter failed');
-    throwOnRead = false;
-    expect(root.getCurrentResult()).toBe(beforeResult);
-    expect(runtime.getDiagnostics()).toMatchObject({ revision: beforeRevision, activeRootCount: 1, rejectedUpdateCount: 0 });
-
-    runtime.applyUpdate(update);
-    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(people, next));
-    expect(runtime.getDiagnostics()).toMatchObject({ revision: beforeRevision + 1, activeRootCount: 1 });
-    root.close();
-    runtime.close();
+    })).toThrow('hostile object descriptor');
   });
 
   it('defers root closure during updates and rejects recursive updates and attachment', () => {

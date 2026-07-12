@@ -151,6 +151,32 @@ describe('semantic artifact safe parsers', () => {
       .toMatchObject({ success: false, issues: [{ code: 'query.parameter_invalid', details: { reason: 'extra' } }] });
   });
 
+  it('refuses to evaluate query artifacts until every required capability is implemented', async () => {
+    const declaration = {
+      kind: 'tarstate.capability-contract' as const,
+      formatVersion: 1 as const,
+      id: 'urn:test:query-executor',
+      version: '1',
+      class: 'executor' as const,
+      contract: { queryLanguage: 1 },
+      implies: []
+    };
+    const required = await capabilityRefFor(declaration);
+    const artifact = await seal('query', { ...queryBody(), requiredCapabilities: [required] });
+    const request = {
+      relations: [{ relation: relationUse, rows: [{ id: 1, score: 4 }], completeness: 'exact' as const }],
+      parameters: { minimum: 3, filters: { active: true } }
+    };
+    expect(await safeEvaluateQueryArtifact(artifact, request))
+      .toMatchObject({ success: false, issues: [{ code: 'capability.missing', requiredCapabilities: [required] }] });
+
+    const registry = new CapabilityRegistry('trusted:test');
+    expect(await registry.registerDeclaration(declaration)).toMatchObject({ success: true });
+    expect(registry.registerImplementation({ ref: required, integrity: 'test:query-executor', implementation: {} })).toMatchObject({ success: true });
+    expect(await safeEvaluateQueryArtifact(artifact, { ...request, registry }))
+      .toMatchObject({ success: true, value: { rows: [{ id: 1, score: 4 }] } });
+  });
+
   it('validates all transaction statement/edit/guard families and bound parameter references', async () => {
     const artifact = await seal('transaction', transactionBody());
     expect(await safeParseTransactionArtifact(artifact)).toMatchObject({ success: true });
@@ -218,7 +244,13 @@ describe('semantic artifact safe parsers', () => {
   it('parses and prepares the complete schema-lens step subset with exact members', async () => {
     const artifact = await seal('schema-lens', lensBody());
     expect(await safeParseSchemaLensArtifact(artifact)).toMatchObject({ success: true });
-    expect(await safePrepareSchemaLensArtifact(artifact)).toMatchObject({ success: true });
+    const prepared = await safePrepareSchemaLensArtifact(artifact);
+    expect(prepared).toMatchObject({ success: true });
+    if (!prepared.success) throw new Error('lens preparation failed');
+    expect(Object.isFrozen(prepared.value)).toBe(true);
+    expect(Object.isFrozen(prepared.value.dependencies)).toBe(true);
+    expect(Object.isFrozen(prepared.value.body)).toBe(true);
+    expect(Object.isFrozen(prepared.value.body.relations[0]?.steps)).toBe(true);
     const duplicateRelation = mutate(lensBody(), (body) => { body.relations.push(body.relations[0]); });
     expect(await safeParseSchemaLensArtifact(await seal('schema-lens', duplicateRelation)))
       .toMatchObject({ success: false, issues: [{ details: { reason: 'duplicate_lens_relation' } }] });

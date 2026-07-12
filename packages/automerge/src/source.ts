@@ -413,10 +413,12 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
       const current = handle.doc();
       if (!exactAutomergeBasisEqual(basis, automergeBasis(current))) throw new StaleOwnerBasis(current);
       const heads = handle.heads();
-      handle.changeAt(heads, (draft) => {
+      const changedHeads = handle.changeAt(heads, (draft) => {
         for (const command of commands) command.apply(draft);
       }, { message, time: 0 });
-      return handle.doc();
+      const changed = handle.doc();
+      if (changedHeads === undefined) throw new StaleOwnerBasis(changed);
+      return changed;
     },
     subscribe: (listener) => {
       listeners.add(listener);
@@ -424,8 +426,13 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
     },
     close: () => { handle.off('heads-changed', handleChanged); }
   };
-  return new AutomergeSourceRuntime({
-    sourceId,
-    [documentOwner]: owner
-  });
+  try {
+    return new AutomergeSourceRuntime({
+      sourceId,
+      [documentOwner]: owner
+    });
+  } catch (error) {
+    try { handle.off('heads-changed', handleChanged); } catch { /* preserve the construction failure */ }
+    throw error;
+  }
 };

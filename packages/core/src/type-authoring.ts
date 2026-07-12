@@ -1,8 +1,8 @@
-import type { ArtifactRef } from './artifacts.js';
+import { canonicalizeJson, type ArtifactRef } from './artifacts.js';
 import type { ScalarDeclaration } from './codec.js';
 import type { CapabilityRef } from './issues.js';
 import type { PipeOperator, PipeType } from './internal-pipe.js';
-import type { Expr, QueryNode } from './query.js';
+import { prepareQuery, type Expr, type QueryNode } from './query.js';
 import type { QueryArtifact, QueryArtifactBody, ValueDeclaration } from './query-builder.js';
 import type { PreparedPlan } from './maintenance.js';
 import type { FieldDeclaration, RelationDeclaration, SchemaBody } from './schema.js';
@@ -365,7 +365,7 @@ export type PreparedPlanRow<Plan> = Plan extends { readonly [preparedPlanRow]?: 
 /** Exact parameter object inferred from a typed prepared plan. */
 export type PreparedPlanParameters<Plan> = Plan extends { readonly [preparedPlanParameters]?: (parameters: infer Parameters) => unknown } ? Parameters : never;
 
-/** Attaches query inference to the exact plan that was prepared from its root. */
+/** Attaches query inference to a plan with the same portable query semantics. */
 export const typedPreparedPlan = <
   Aliases extends TypedAliases,
   Parameters extends Readonly<Record<string, ValueDeclaration>>,
@@ -374,9 +374,24 @@ export const typedPreparedPlan = <
   plan: PreparedPlan<QueryNode>,
   query: TypedQuery<Aliases, Parameters, Row>
 ): TypedPreparedPlan<QueryNode, Row, { readonly [Name in keyof Parameters]: ValueOfDeclaration<Parameters[Name]> }> => {
-  if (plan.query !== query.root) throw new Error('Prepared plan root does not match the typed query');
+  if (canonicalizeJson(plan.query as JsonValue) !== canonicalizeJson(query.root as JsonValue)) throw new Error('Prepared plan root does not match the typed query');
   return plan;
 };
+
+/** Prepares a typed query while preserving its inferred row and parameter types. */
+export const prepareTypedQuery = async <
+  Aliases extends TypedAliases,
+  Parameters extends Readonly<Record<string, ValueDeclaration>>,
+  Row
+>(
+  query: TypedQuery<Aliases, Parameters, Row>,
+  options: {
+    readonly registryFingerprint: string;
+    readonly authorityFingerprint: string;
+    readonly datasetId: string;
+  }
+): Promise<TypedPreparedPlan<QueryNode, Row, { readonly [Name in keyof Parameters]: ValueOfDeclaration<Parameters[Name]> }>> =>
+  typedPreparedPlan(await prepareQuery({ root: query.root, ...options }), query);
 
 export type TypedReturning<Name extends string, Query extends TypedQuery<TypedAliases, Readonly<Record<string, ValueDeclaration>>, unknown>> = {
   readonly name: Name;

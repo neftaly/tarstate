@@ -144,14 +144,16 @@ export const safeParseArtifactValue = async (input: unknown, budget: ArtifactPar
   }
   const normalized = normalizeDependencies(dependencies);
   if (!normalized.success) return normalized;
-  const artifact: Artifact = {
+  const body = detachAndFreezeJsonValue(value.body);
+  if (!body.success) return body;
+  const artifact: Artifact = Object.freeze({
     kind: value.kind as ArtifactKind,
     formatVersion: 1,
     id: value.id,
     contentHash: value.contentHash,
-    dependencies: normalized.value,
-    body: value.body as JsonValue
-  };
+    dependencies: Object.freeze(normalized.value.map((dependency) => Object.freeze(dependency))),
+    body: body.value
+  });
   const expectedHash = await sha256Json(artifactSemanticValue(artifact));
   if (expectedHash !== artifact.contentHash) return { success: false, issues: [createIssue({ code: 'artifact.hash_mismatch', retry: 'after_input', details: { expected: expectedHash, actual: artifact.contentHash } })] };
   return { success: true, value: artifact, issues: [] };

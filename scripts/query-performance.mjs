@@ -43,6 +43,7 @@ const joinQuery = {
 };
 const linearRows = (count, changed = false) => Array.from({ length: count }, (_, id) => ({ id, active: id % 2 === 0, value: id === 0 && changed ? 1 : 0 }));
 const joinRows = (count, left, changed = false) => Array.from({ length: count }, (_, id) => left ? { id, joinId: id, value: id === 0 && changed ? 1 : 0 } : { id, label: 'row-' + id });
+const nestedRows = (count, changed = false) => Array.from({ length: count }, (_, id) => ({ id, payload: { label: 'row-' + id, values: [id, id + 1, id === 0 && changed ? 1 : 0] } }));
 
 let consumedRows = 0;
 const benchmark = (label, inputRows, iterations, operation) => {
@@ -106,6 +107,26 @@ for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
     return result;
   }));
   endToEnd.close();
+}
+
+const functionCapability = { id: 'urn:tarstate:benchmark:identity', version: '1', contractHash: 'sha256:' + 'f'.repeat(64) };
+const functionKey = functionCapability.id + '\u0000' + functionCapability.version + '\u0000' + functionCapability.contractHash;
+const functions = new Map([[functionKey, ([value]) => value ?? null]]);
+const nestedQuery = from('nested', 'nested');
+const functionQuery = { kind: 'select', input: nestedQuery, alias: 'result', fields: {
+  id: field('nested', 'id'),
+  payload: { kind: 'call', capability: functionCapability, args: [field('nested', 'payload')] }
+} };
+for (const [count, iterations] of [[100, 300], [1_000, 50], [10_000, 5]]) {
+  const first = { relations: [input('nested', nestedRows(count))] };
+  const second = { relations: [input('nested', nestedRows(count, true))] };
+  measurements.push(benchmark('nested-pure-ownership', count, iterations, () => evaluateQuery({ root: nestedQuery, relations: first.relations })));
+  const session = openIncrementalQueryMaintenance(plan('nested-ownership-' + count, nestedQuery), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  measurements.push(benchmark('nested-one-row-update', count, iterations, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
+  session.close();
+  measurements.push(benchmark('named-function-ownership', count, iterations, () => evaluateQuery({ root: functionQuery, relations: first.relations, functions })));
 }
 
 for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 2]]) {
