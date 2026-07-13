@@ -36,6 +36,7 @@ export type {
   OrderTerm,
   PreparedQueryRequest,
   QueryCursor,
+  QueryExecutionBudget,
   QueryFunction,
   QueryLogicalValue,
   QueryMaintenanceSnapshot,

@@ -101,11 +101,12 @@ measurements.push(benchmark('repeated-unprepared-pure', 1, 500, () => evaluateQu
 measurements.push(benchmark('repeated-prepared-pure', 1, 500, () => evaluatePreparedQuery(repeatedPlan, repeatedInputs)));
 for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
   const relation = input('item', linearRows(count));
-  measurements.push(benchmark('linear-pure', count, iterations, () => evaluateQuery({ root: linearQuery, relations: [relation] })));
+  const linearPlan = await plan('linear-pure-' + count, linearQuery);
+  measurements.push(benchmark('linear-pure', count, iterations, () => evaluatePreparedQuery(linearPlan, { relations: [relation] })));
 
   const first = { relations: [relation] };
   const second = { relations: [input('item', linearRows(count, true))] };
-  const session = openIncrementalQueryMaintenance(await plan('linear-' + count, linearQuery), first);
+  const session = openIncrementalQueryMaintenance(linearPlan, first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
   measurements.push(benchmark('linear-one-row-update', count, iterations, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
@@ -132,8 +133,9 @@ const functionQuery = { kind: 'select', input: nestedQuery, alias: 'result', fie
 for (const [count, iterations] of [[100, 300], [1_000, 50], [10_000, 10]]) {
   const first = { relations: [input('nested', nestedRows(count))] };
   const second = { relations: [input('nested', nestedRows(count, true))] };
-  measurements.push(benchmark('nested-pure-ownership', count, iterations, () => evaluateQuery({ root: nestedQuery, relations: first.relations })));
-  const session = openIncrementalQueryMaintenance(await plan('nested-ownership-' + count, nestedQuery), first);
+  const nestedPlan = await plan('nested-ownership-' + count, nestedQuery);
+  measurements.push(benchmark('nested-pure-ownership', count, iterations, () => evaluatePreparedQuery(nestedPlan, { relations: first.relations })));
+  const session = openIncrementalQueryMaintenance(nestedPlan, first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
   measurements.push(benchmark('nested-one-row-update', count, iterations, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
@@ -143,10 +145,11 @@ for (const [count, iterations] of [[100, 300], [1_000, 50], [10_000, 10]]) {
 
 for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 5]]) {
   const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
-  measurements.push(benchmark('equijoin-pure', count * 2, iterations, () => evaluateQuery({ root: joinQuery, relations })));
+  const joinPlan = await plan('join-' + count, joinQuery);
+  measurements.push(benchmark('equijoin-pure', count * 2, iterations, () => evaluatePreparedQuery(joinPlan, { relations })));
   const changed = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
   const initial = { relations };
-  const session = openIncrementalQueryMaintenance(await plan('join-' + count, joinQuery), initial);
+  const session = openIncrementalQueryMaintenance(joinPlan, initial);
   const forward = diffQueryMaintenanceSnapshots(initial, changed);
   const backward = diffQueryMaintenanceSnapshots(changed, initial);
   measurements.push(benchmark('equijoin-one-row-update', count * 2, Math.max(10, iterations), (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
@@ -157,6 +160,10 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const rows = Array.from({ length: count }, (_, id) => ({ id, group: id % 100, score: id * 7_919 % count }));
   const relations = [input('score', rows)];
   const order = { kind: 'order', input: from('score', 'score'), by: [{ value: field('score', 'score'), direction: 'asc' }] };
+  const objectKeyOrder = { kind: 'order', input: from('score', 'score'), by: [{ value: { kind: 'record', fields: { group: field('score', 'group'), score: field('score', 'score') } }, direction: 'asc' }] };
+  const scalarEquality = { kind: 'where', input: from('score', 'score'), predicate: { kind: 'compare', op: 'eq', left: field('score', 'score'), right: field('score', 'score') } };
+  const equalityRecord = { kind: 'record', fields: { group: field('score', 'group'), score: field('score', 'score') } };
+  const objectEquality = { kind: 'where', input: from('score', 'score'), predicate: { kind: 'compare', op: 'eq', left: equalityRecord, right: equalityRecord } };
   const aggregate = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: {
     count: { kind: 'aggregate', op: 'count' },
     sum: { kind: 'aggregate', op: 'sum', value: field('score', 'score') },
@@ -164,8 +171,15 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
     maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') }
   } };
   const orderPlan = await plan('order-pure-' + count, order);
+  const objectKeyOrderPlan = await plan('order-object-key-pure-' + count, objectKeyOrder);
+  const scalarEqualityPlan = await plan('equality-scalar-pure-' + count, scalarEquality);
+  const objectEqualityPlan = await plan('equality-object-pure-' + count, objectEquality);
   const aggregatePlan = await plan('aggregate-pure-' + count, aggregate);
   measurements.push(benchmark('order', count, iterations, () => evaluatePreparedQuery(orderPlan, { relations })));
+  measurements.push(benchmark('order-prepared-scalar-key', count, iterations, () => evaluatePreparedQuery(orderPlan, { relations })));
+  measurements.push(benchmark('order-prepared-object-key', count, iterations, () => evaluatePreparedQuery(objectKeyOrderPlan, { relations })));
+  measurements.push(benchmark('equality-prepared-scalar', count, iterations, () => evaluatePreparedQuery(scalarEqualityPlan, { relations })));
+  measurements.push(benchmark('equality-prepared-object', count, iterations, () => evaluatePreparedQuery(objectEqualityPlan, { relations })));
   measurements.push(benchmark('aggregate', count, iterations, () => evaluatePreparedQuery(aggregatePlan, { relations })));
   const changedRows = rows.map((row, index) => index === 0 ? { ...row, score: count + 1 } : row);
   const first = { relations };
@@ -190,7 +204,32 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
     const windowSession = openIncrementalQueryMaintenance(await plan('window-' + count, window), first);
     measurements.push(benchmark('window-one-row-update', count, updateIterations, (index) => windowSession.applyUpdate(index % 2 === 0 ? forward : backward)));
     windowSession.close();
+    const partitionBy = [field('score', 'group')];
+    const partitionedWindow = { ...window, fields: {
+      rowNumber: { kind: 'window', op: 'row-number', partitionBy, orderBy },
+      rank: { kind: 'window', op: 'rank', partitionBy, orderBy },
+      previous: { kind: 'window', op: 'lag', value: field('score', 'score'), partitionBy, orderBy }
+    } };
+    const partitionedWindowPlan = await plan('window-partitioned-' + count, partitionedWindow);
+    measurements.push(benchmark('window-partitioned-prepared-pure', count, iterations, () => evaluatePreparedQuery(partitionedWindowPlan, first)));
+    const partitionedWindowSession = openIncrementalQueryMaintenance(partitionedWindowPlan, first);
+    measurements.push(benchmark('window-partitioned-one-row-update', count, updateIterations, (index) => partitionedWindowSession.applyUpdate(index % 2 === 0 ? forward : backward)));
+    partitionedWindowSession.close();
   }
+}
+
+{
+  const count = 5_000;
+  const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
+  const initial = { relations };
+  const changed = { relations: [relations[0], input('right', joinRows(count, false).map((row, index) => index === 0 ? { ...row, label: 'changed' } : row))] };
+  const prepared = await plan('join-right-' + count, joinQuery);
+  measurements.push(benchmark('equijoin-prepared-pure', count * 2, 6, () => evaluatePreparedQuery(prepared, initial)));
+  const session = openIncrementalQueryMaintenance(prepared, initial);
+  const forward = diffQueryMaintenanceSnapshots(initial, changed);
+  const backward = diffQueryMaintenanceSnapshots(changed, initial);
+  measurements.push(benchmark('equijoin-right-one-row-update', count * 2, 6, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
+  session.close();
 }
 
 for (const [count, iterations] of [[10, 100], [20, 30], [40, 8], [80, 5]]) {
@@ -365,6 +404,31 @@ const { profile } = await post(allocationSession, 'HeapProfiler.stopSampling');
 allocationSession.disconnect();
 const sampledAllocationBytes = profile.samples.reduce((sum, sample) => sum + sample.size, 0);
 
+const aggregateAllocationSession = new inspector.Session();
+aggregateAllocationSession.connect();
+await post(aggregateAllocationSession, 'HeapProfiler.enable');
+await post(aggregateAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+{
+  const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, group: id % 100, score: id }));
+  const changed = rows.map((row, index) => index === 0 ? { ...row, score: 2_000 } : row);
+  const first = { relations: [input('score', rows)] };
+  const second = { relations: [input('score', changed)] };
+  const aggregateQuery = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: {
+    count: { kind: 'aggregate', op: 'count' },
+    sum: { kind: 'aggregate', op: 'sum', value: field('score', 'score') },
+    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
+    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') }
+  } };
+  const session = openIncrementalQueryMaintenance(await plan('aggregate-allocation-sample', aggregateQuery), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
+  session.close();
+}
+const { profile: aggregateAllocationProfile } = await post(aggregateAllocationSession, 'HeapProfiler.stopSampling');
+aggregateAllocationSession.disconnect();
+const aggregateSampledAllocationBytes = aggregateAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+
 const pooledAllocationFirst = { relations: [input('item', linearRows(1_000))] };
 const pooledAllocationSecond = { relations: [input('item', linearRows(1_000, true))] };
 const pooledAllocationRuntime = createPooledIncrementalQueryRuntime({
@@ -398,17 +462,27 @@ const orderPure10k = measurement('order', 10_000)?.millisecondsPerOperation;
 const orderUpdate10k = measurement('order-one-row-update', 10_000)?.millisecondsPerOperation;
 const aggregatePure10k = measurement('aggregate', 10_000)?.millisecondsPerOperation;
 const aggregateUpdate10k = measurement('aggregate-one-row-update', 10_000)?.millisecondsPerOperation;
+const windowUpdate10k = measurement('window-one-row-update', 10_000)?.millisecondsPerOperation;
+const partitionedWindowUpdate10k = measurement('window-partitioned-one-row-update', 10_000)?.millisecondsPerOperation;
+const partitionedWindowPure10k = measurement('window-partitioned-prepared-pure', 10_000)?.millisecondsPerOperation;
+const joinPreparedPure10k = measurement('equijoin-prepared-pure', 10_000)?.millisecondsPerOperation;
+const joinRightUpdate10k = measurement('equijoin-right-one-row-update', 10_000)?.millisecondsPerOperation;
 const recursiveChain40 = measurement('recursive-chain', 40)?.millisecondsPerOperation;
 const recursiveChain80 = measurement('recursive-chain', 80)?.millisecondsPerOperation;
 const reversedRecursiveChain40 = measurement('recursive-chain-reversed', 40)?.millisecondsPerOperation;
 const reversedRecursiveChain80 = measurement('recursive-chain-reversed', 80)?.millisecondsPerOperation;
 const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
+const aggregateBytesPerUpdate = Math.round(aggregateSampledAllocationBytes / 100);
 const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
 const contracts = {
   repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
   linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
+  aggregateAllocationCeiling: aggregateBytesPerUpdate <= 1_000_000,
+  partitionedWindowAdvantage: windowUpdate10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < windowUpdate10k * 0.5,
+  partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
+  rightJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinRightUpdate10k !== undefined && joinRightUpdate10k < joinPreparedPure10k * 0.5,
   preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
   recursiveChainNearLinear: recursiveChain40 !== undefined && recursiveChain80 !== undefined && recursiveChain80 < recursiveChain40 * 2.75,
   reversedRecursiveChainNearLinear: reversedRecursiveChain40 !== undefined && reversedRecursiveChain80 !== undefined && reversedRecursiveChain80 < reversedRecursiveChain40 * 2.75,
@@ -428,6 +502,11 @@ process.stdout.write(JSON.stringify({
     workload: '100 snapshot diffs plus one-row updates over a 1,000-row linear query',
     sampledBytes: sampledAllocationBytes,
     sampledBytesPerUpdate: privateBytesPerUpdate
+  },
+  aggregateAllocationSample: {
+    workload: '100 one-row updates over a 1,000-row, 100-group aggregate query',
+    sampledBytes: aggregateSampledAllocationBytes,
+    sampledBytesPerUpdate: aggregateBytesPerUpdate
   },
   pooledAllocationSample: {
     workload: '100 one-row updates over 100 pooled roots and 1,000 input rows',

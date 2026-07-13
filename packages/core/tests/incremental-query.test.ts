@@ -190,6 +190,37 @@ const applySnapshot = (session: ReturnType<typeof openIncrementalQueryMaintenanc
   session.applyUpdate(diffQueryMaintenanceSnapshots(before, after));
 
 describe('incremental query maintenance', () => {
+  it('fails closed and recovers atomically when a fixed update budget is exceeded', () => {
+    const query: QueryNode = { kind: 'join', join: 'cross', left: from('left', 'left'), right: from('right', 'right') };
+    const relationRows = (relationId: string, count: number, basis: number) => relation(relationId, Array.from({ length: count }, (_, index) => ({ occurrenceId: `${relationId}:${index}`, row: { id: index } })), basis);
+    const initial: QueryMaintenanceSnapshot = { relations: [relationRows('left', 1, 1), relationRows('right', 1, 1)], executionBudget: { maxWorkUnits: 20 } };
+    const expanded: QueryMaintenanceSnapshot = { relations: [relationRows('left', 1, 2), relationRows('right', 30, 2)], executionBudget: { maxWorkUnits: 20 } };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    const exhausted = applySnapshot(session, initial, expanded);
+    expect(exhausted).toMatchObject({ rows: [], resultKeys: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    const recovered = applySnapshot(session, expanded, initial);
+    expect(semanticResult(recovered)).toEqual(oracle(query, initial));
+    expect(() => diffQueryMaintenanceSnapshots(initial, { ...initial, executionBudget: { maxWorkUnits: 21 } })).toThrow(/execution budget/);
+    session.close();
+
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: { runtimeIdentity: 'budget:pooled', registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test', executionBudget: { maxWorkUnits: 20 } },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(query));
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, expanded));
+    expect(root.getCurrentResult()).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(expanded, initial));
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, initial));
+    root.close();
+    runtime.close();
+    expect(() => createPooledIncrementalQueryRuntime({
+      environment: { runtimeIdentity: 'budget:mismatch', registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test', executionBudget: { maxWorkUnits: 21 } },
+      initialSnapshot: initial
+    })).toThrow(/execution budget/);
+  });
+
   it('rejects structurally forged and spread-cloned plans at execution boundaries', () => {
     const legitimate = plan(people);
     const snapshot: QueryMaintenanceSnapshot = { relations: [] };
@@ -323,6 +354,35 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
+  it('keeps sparse aggregate overlays bounded and preserves the empty ungrouped row', () => {
+    const query: QueryNode = {
+      kind: 'aggregate', input: people, alias: 'summary', groupBy: {},
+      measures: {
+        count: { kind: 'aggregate', op: 'count' },
+        sum: { kind: 'aggregate', op: 'sum', value: field('p', 'score') },
+        values: { kind: 'aggregate', op: 'collect', value: field('p', 'name') },
+        first: { kind: 'aggregate', op: 'first', value: field('p', 'name'), orderBy: [{ value: field('p', 'score'), direction: 'desc' }] }
+      }
+    };
+    const first = snapshot(basePeople, 1);
+    const second = snapshot([
+      { ...(basePeople[0] as QueryRowOccurrence), row: { ...(basePeople[0] as QueryRowOccurrence).row, score: 11 } },
+      basePeople[1] as QueryRowOccurrence
+    ], 2);
+    const session = openIncrementalQueryMaintenance(plan(query), first);
+    let accepted = first;
+    for (let revision = 0; revision < 70; revision += 1) {
+      const next = revision % 2 === 0 ? second : first;
+      const maintained = applySnapshot(session, accepted, next);
+      expect(semanticResult(maintained)).toEqual(oracle(query, next));
+      accepted = next;
+    }
+    const empty = snapshot([], 3);
+    expect(semanticResult(applySnapshot(session, accepted, empty))).toEqual(oracle(query, empty));
+    expect(session.getCurrentResult().rows).toEqual([{ count: 0, sum: null, values: [], first: null }]);
+    session.close();
+  });
+
   it('rematerializes order and aggregate outputs when only an expression subquery dependency changes', () => {
     const rankForPerson = {
       kind: 'subquery', mode: 'scalar',
@@ -361,6 +421,59 @@ describe('incremental query maintenance', () => {
       { group: 'x', rank: 0 }, { group: 'y', rank: 3 }
     ]);
     aggregateSession.close();
+  });
+
+  it('maintains a skewed right join index across payload and key replacements', () => {
+    const query: QueryNode = {
+      kind: 'join', join: 'inner', left: from('left', 'l'), right: from('right', 'r'),
+      on: { kind: 'compare', op: 'eq', left: field('l', 'joinId'), right: field('r', 'id') }
+    };
+    const leftRows = Array.from({ length: 300 }, (_, index): QueryRowOccurrence => ({ occurrenceId: `left:${index}`, row: { id: index, joinId: index % 10 } }));
+    const rightRows = Array.from({ length: 100 }, (_, index): QueryRowOccurrence => ({ occurrenceId: `right:${index}`, row: { id: index % 10, label: `r${index}` } }));
+    const state = (right: readonly QueryRowOccurrence[], revision: number): QueryMaintenanceSnapshot => ({
+      relations: [relation('left', leftRows, revision), relation('right', right, revision)]
+    });
+    const initial = state(rightRows, 1);
+    const payloadRows = rightRows.map((entry, index) => index === 55 ? { ...entry, row: { ...entry.row, label: 'changed' } } : entry);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    let accepted = initial;
+    for (let revision = 0; revision < 101; revision += 1) {
+      const next = state(revision % 2 === 0 ? payloadRows : rightRows, revision + 2);
+      session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+      accepted = next;
+    }
+    expect(semanticResult(session.getCurrentResult())).toEqual(oracle(query, accepted));
+    const moved = state((accepted.relations[1] as RelationInput).rows.map((row, index) => ({ occurrenceId: `right:${index}`, row: index === 55 ? { ...row, id: 20 } : row })), 104);
+    expect(semanticResult(applySnapshot(session, accepted, moved))).toEqual(oracle(query, moved));
+    const bulk = state((moved.relations[1] as RelationInput).rows.map((row, index) => ({ occurrenceId: `right:${index}`, row: index < 40 ? { ...row, label: `bulk:${index}` } : row })), 105);
+    expect(semanticResult(applySnapshot(session, moved, bulk))).toEqual(oracle(query, bulk));
+    session.close();
+  });
+
+  it('compacts historical join-key overlays and remains correct after hundreds of unique moves', () => {
+    const query: QueryNode = {
+      kind: 'join', join: 'inner', left: from('compact-left', 'l'), right: from('compact-right', 'r'),
+      on: { kind: 'compare', op: 'eq', left: field('l', 'joinId'), right: field('r', 'joinId') }
+    };
+    const leftRows = Array.from({ length: 10 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `compact-left:${id}`, row: { id, joinId: id } }));
+    const state = (joinId: number, revision: number): QueryMaintenanceSnapshot => ({ relations: [
+      relation('compact-left', leftRows, revision),
+      relation('compact-right', [{ occurrenceId: 'compact-right:one', row: { id: 'right', joinId, payload: { revision } } }], revision)
+    ] });
+    let accepted = state(0, 0);
+    const session = openIncrementalQueryMaintenance(plan(query), accepted);
+    for (let revision = 1; revision <= 320; revision += 1) {
+      const next = state(revision, revision);
+      const maintained = applySnapshot(session, accepted, next);
+      if (revision % 40 === 0) expect(semanticResult(maintained)).toEqual(oracle(query, next));
+      accepted = next;
+    }
+    const returned = state(5, 321);
+
+    expect(semanticResult(applySnapshot(session, accepted, returned))).toEqual(oracle(query, returned));
+    expect(session.getCurrentResult().rows).toHaveLength(1);
+    session.close();
   });
 
   it('owns pooled inputs and shares immutable public views for retained physical rows', () => {
@@ -780,6 +893,98 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
+  it('recomputes only the affected partition for compatible windows', () => {
+    const specification = {
+      partitionBy: [field('p', 'group')],
+      orderBy: [{ value: field('p', 'score'), direction: 'asc' as const }]
+    };
+    const query: QueryNode = {
+      kind: 'window', input: people, alias: 'p', fields: {
+        rowNumber: { kind: 'window', op: 'row-number', ...specification },
+        rank: { kind: 'window', op: 'rank', ...specification },
+        previous: { kind: 'window', op: 'lag', value: field('p', 'score'), ...specification }
+      }
+    };
+    const rows = Array.from({ length: 1_000 }, (_, index): QueryRowOccurrence => ({
+      occurrenceId: `window:${index}`,
+      row: { id: index, group: index % 100, score: index, active: true, tags: [] }
+    }));
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('people', rows, 1)] };
+    const changed = rows.map((entry, index) => index === 550 ? { ...entry, row: { ...entry.row, score: -1 } } : entry);
+    const next: QueryMaintenanceSnapshot = { relations: [relation('people', changed, 2)] };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const before = session.getCurrentResult();
+
+    const maintained = session.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+
+    expect(maintained.rows[0]).toBe(before.rows[0]);
+    expect(semanticResult(maintained)).toEqual(oracle(query, next));
+    session.close();
+  });
+
+  it('keeps named window calls on the conservative full-evaluation path', () => {
+    const ordered = { id: 'urn:test:window-order-stateful', version: '1', contractHash: `sha256:${'6'.repeat(64)}` } as const;
+    const orderedKey = ordered.id + '\u0000' + ordered.version + '\u0000' + ordered.contractHash;
+    let failingId: number | undefined;
+    const functions = new Map([[orderedKey, (args: readonly JsonValue[]) => {
+      if (args[0] === failingId) throw new Error('stateful window failure');
+      return args[1] ?? null;
+    }]]);
+    const query: QueryNode = {
+      kind: 'window', input: people, alias: 'p', fields: {
+        rank: {
+          kind: 'window', op: 'rank', partitionBy: [field('p', 'group')],
+          orderBy: [{ value: { kind: 'call', capability: ordered, args: [field('p', 'id'), field('p', 'score')] }, direction: 'asc' }]
+        }
+      }
+    };
+    const rows = Array.from({ length: 100 }, (_, index): QueryRowOccurrence => ({
+      occurrenceId: `window-stateful:${index}`,
+      row: { id: index, group: index % 10, score: index, active: true, tags: [] }
+    }));
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('people', rows, 1)], functions };
+    const changed = rows.map((entry, index) => index === 55 ? { ...entry, row: { ...entry.row, score: -1 } } : entry);
+    const next: QueryMaintenanceSnapshot = { relations: [relation('people', changed, 2)], functions };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    failingId = 0; // Outside the changed row's partition.
+
+    const maintained = session.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
+
+    expect(maintained).toMatchObject({ completeness: 'unknown', rows: [], issues: [expect.objectContaining({ code: 'query.function_failed' })] });
+    session.close();
+  });
+
+  it('invalidates window values that depend on an external subquery', () => {
+    const weights = (value: number, revision: number): RelationInput => relation('weights', [
+      { occurrenceId: 'weight:1', row: { id: 1, value } },
+      { occurrenceId: 'weight:2', row: { id: 2, value: value + 1 } }
+    ], revision);
+    const weightForPerson: QueryNode = {
+      kind: 'select', alias: 'weight',
+      input: {
+        kind: 'where', input: from('weights', 'w'),
+        predicate: { kind: 'compare', op: 'eq', left: field('w', 'id'), right: field('p', 'id') }
+      },
+      fields: { value: field('w', 'value') }
+    };
+    const query: QueryNode = {
+      kind: 'window', input: people, alias: 'p', fields: {
+        previousWeight: {
+          kind: 'window', op: 'lag',
+          value: { kind: 'subquery', mode: 'scalar', query: weightForPerson },
+          orderBy: [{ value: field('p', 'id'), direction: 'asc' }]
+        }
+      }
+    };
+    const initial = snapshot(basePeople, 1);
+    const first: QueryMaintenanceSnapshot = { ...initial, relations: [...initial.relations, weights(10, 1)] };
+    const second: QueryMaintenanceSnapshot = { ...initial, relations: [...initial.relations, weights(20, 2)] };
+    const session = openIncrementalQueryMaintenance(plan(query), first);
+
+    expect(semanticResult(applySnapshot(session, first, second))).toEqual(oracle(query, second));
+    session.close();
+  });
+
   it('withdraws a private assertion after a named function returns a non-portable value and later recovers', () => {
     const callable = { id: 'urn:test:private-rollback', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
     const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
@@ -1105,6 +1310,29 @@ describe('incremental query maintenance', () => {
     expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, next));
     expect(root.getCurrentResult().state).toMatchObject({ updatedNodeCount: 2, changedNodeCount: 1 });
     expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 2, lastChangedPhysicalNodeCount: 1 });
+    root.close();
+    runtime.close();
+  });
+
+  it('applies sparse aggregate group movement through the pooled runtime', () => {
+    const query = operatorQueries.aggregate as QueryNode;
+    const initial = snapshot(basePeople, 1);
+    const moved = snapshot([
+      basePeople[0] as QueryRowOccurrence,
+      { ...(basePeople[1] as QueryRowOccurrence), row: { ...(basePeople[1] as QueryRowOccurrence).row, group: 'x', score: 9, active: true } }
+    ], 2);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/pooled-sparse-aggregate', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(query));
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, moved));
+
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, moved));
     root.close();
     runtime.close();
   });

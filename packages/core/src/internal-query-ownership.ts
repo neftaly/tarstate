@@ -127,6 +127,10 @@ const adoptStringArray = (input: readonly string[], label: string): readonly str
   return Object.freeze(output);
 };
 
+/** Descriptor-safe ownership for capture-frame occurrence identity. */
+export const adoptQueryOccurrenceIds = (input: readonly string[]): readonly string[] =>
+  adoptStringArray(input, 'Query occurrence identities');
+
 const adoptRelationInput = (input: RelationInput): RelationInput => Object.freeze({
   relation: adoptJsonValue(input.relation, 'Query relation') as unknown as RelationUse,
   rows: Object.freeze(input.rows.map((row) => adoptQueryRecord(row))),
@@ -142,8 +146,17 @@ export const adoptMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): Qu
   ...(snapshot.parameters === undefined ? {} : { parameters: adoptJsonRecord(snapshot.parameters, 'Query parameters') }),
   ...(snapshot.functions === undefined ? {} : { functions: adoptFunctionRegistry(snapshot.functions) }),
   ...(snapshot.basis === undefined ? {} : { basis: adoptJsonValue(snapshot.basis, 'Query basis') }),
-  ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision })
+  ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision }),
+  ...(snapshot.executionBudget === undefined ? {} : { executionBudget: adoptExecutionBudget(snapshot.executionBudget) })
 });
+
+const adoptExecutionBudget = (budget: unknown): { readonly maxWorkUnits: number } => {
+  const descriptors = inspectOwnedDataRecord(budget, 'Query execution budget');
+  if (Reflect.ownKeys(descriptors).length !== 1 || !Object.hasOwn(descriptors, 'maxWorkUnits')) throw new TypeError('Query execution budget must contain exactly maxWorkUnits');
+  const maxWorkUnits = adoptOptionalIndex(ownedDataValue(descriptors, 'maxWorkUnits'), 'Query execution budget maxWorkUnits');
+  if (maxWorkUnits < 0) throw new TypeError('Query execution budget maxWorkUnits must be non-negative');
+  return Object.freeze({ maxWorkUnits });
+};
 
 type OwnedDataRecord = Readonly<Record<string, PropertyDescriptor>>;
 

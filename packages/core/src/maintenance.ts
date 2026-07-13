@@ -1,7 +1,7 @@
 import { defaultValueParseBudget, type JsonValue } from './value.js';
 import { sha256Json } from './artifacts.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
-import { sealPreparedPlan } from './internal-prepared-plan.js';
+import { sealOwnedPreparedPlan } from './internal-prepared-plan.js';
 
 export type SourceBasis = JsonValue;
 export type RowOccurrenceId = string;
@@ -42,7 +42,7 @@ export const preparePlan = async <Query extends JsonValue>(input: {
   const query = parsed.value as Query;
   const semantic = { root: query, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId } as JsonValue;
   const planId = await sha256Json(semantic);
-  return sealPreparedPlan({
+  return sealOwnedPreparedPlan({
     planId,
     rootNodeId: planId + ':root',
     query,

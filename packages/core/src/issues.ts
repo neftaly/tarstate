@@ -155,6 +155,7 @@ const declarations = [
   ['query.function_failed', 'query', 'error', ['after_input']],
   ['query.parameter_invalid', 'query', 'error', ['after_input']],
   ['query.recursion_budget_exceeded', 'query', 'error', ['after_input']],
+  ['query.execution_budget_exceeded', 'query', 'error', ['after_input']],
   ['query.recursion_non_monotone', 'query', 'error', ['after_input']],
   ['query.recursion_reference_missing', 'query', 'error', ['after_input']],
   ['query.scalar_subquery_cardinality', 'query', 'error', ['after_input']],

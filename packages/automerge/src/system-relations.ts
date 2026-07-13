@@ -2,6 +2,7 @@ import {
   canonicalizeJson,
   createIssue,
   type JsonValue,
+  type ObserverDiagnosticReporter,
   type SchemaBody
 } from '@tarstate/core';
 import type { AutomergeConflictFact } from './projection.js';
@@ -271,6 +272,7 @@ export type AutomergeSystemEvent =
 /** Pure event normalizer; attaching it to Repo event emitters remains host code. */
 export class AutomergeSystemRelationState {
   readonly attachmentId: string;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   readonly #listeners = new Set<() => void>();
   readonly #peers = new Map<string, AutomergePeerSystemRow>();
   readonly #connections = new Map<string, AutomergeConnectionSystemRow>();
@@ -281,9 +283,10 @@ export class AutomergeSystemRelationState {
   #snapshot: AutomergeSystemRelationSnapshot;
   #closed = false;
 
-  constructor(attachmentId: string) {
+  constructor(attachmentId: string, options: { readonly onDiagnostic?: ObserverDiagnosticReporter } = {}) {
     if (attachmentId.length === 0) throw new TypeError('attachmentId must not be empty');
     this.attachmentId = attachmentId;
+    this.#onDiagnostic = options.onDiagnostic;
     this.#snapshot = freezeSnapshot({ revision: 0, peers: [], connections: [], sync: [], conflicts: [], presence: [] });
   }
 
@@ -484,7 +487,16 @@ export class AutomergeSystemRelationState {
     if (sameRows(this.#snapshot, candidate)) return this.#snapshot;
     this.#snapshot = candidate;
     for (const listener of Array.from(this.#listeners)) {
-      try { listener(); } catch { /* one observer cannot break normalized state */ }
+      try { listener(); } catch (error) {
+        try {
+          this.#onDiagnostic?.(Object.freeze({
+            kind: 'listener_error',
+            component: 'automerge-system-relations',
+            operation: 'publish',
+            error
+          }));
+        } catch { /* diagnostics are observers and cannot break normalized state */ }
+      }
     }
     return candidate;
   }

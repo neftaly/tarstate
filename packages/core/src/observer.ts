@@ -19,6 +19,7 @@ import {
 } from './observer-diagnostics.js';
 import type { PreparedPlan, SourceBasis } from './maintenance.js';
 import { assertPreparedPlan } from './internal-prepared-plan.js';
+import { adoptQueryOccurrenceIds } from './internal-query-ownership.js';
 import { deepFreezeObserverValue, detachPreparedPlan, parseObservationParameters, samePortableObserverValue } from './internal-observer-values.js';
 import {
   diffQueryMaintenanceSnapshots,
@@ -138,6 +139,10 @@ export type QueryMaintenanceReuseDiagnostics = {
 
 const incrementalMaintenanceFactoryBrand = Symbol('tarstate.incremental-maintenance-factory');
 const maintenanceRuntimeIdentity = Symbol('tarstate.maintenance-runtime');
+type TrustedIncrementalMetadata = Readonly<Pick<IncrementalQueryResult['state'], 'revision' | 'resultDelta'> & { readonly owner: object }>;
+const trustedIncrementalResults = new WeakMap<object, TrustedIncrementalMetadata>();
+const trustedObservedResults = new WeakMap<object, TrustedIncrementalMetadata>();
+const trustedIncrementalFactories = new WeakMap<object, object>();
 type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
   readonly [incrementalMaintenanceFactoryBrand]: {
     readonly getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
@@ -669,7 +674,7 @@ class SharedObservation<Query, Row, Projection> {
     const previousSnapshot = this.#snapshot;
     if (previousSnapshot.state !== 'open') return;
     const nextSnapshot = this.#observerSnapshot(current, previousSnapshot);
-    if (samePortableObserverValue(this.#publishedSnapshot, nextSnapshot)) {
+    if (sameObserverSnapshot(this.#publishedSnapshot, nextSnapshot)) {
       this.#snapshot = this.#publishedSnapshot;
       return;
     }
@@ -729,12 +734,15 @@ class SharedObservation<Query, Row, Projection> {
   }
 
   #result(maintained: MaintainedDatabaseQueryResult<Row>, captured: EvaluationSnapshot<Projection>): ObservedQueryResult<Row> {
+    const candidateIncremental = trustedIncrementalResults.get(maintained as object);
+    const expectedOwner = trustedIncrementalFactories.get(this.#options.createQueryMaintenance as object);
+    const trustedIncremental = candidateIncremental?.owner === expectedOwner ? candidateIncremental : undefined;
     const evidence = captured.members.map(sourceEvidence);
     const evidenceIssues = evidence.flatMap(({ issues }) => issues);
     const membershipIssue = captured.dataset.state === 'open'
       ? [observationIssue('observer.membership_open', 'after_refresh', { datasetId: captured.dataset.datasetId, revision: captured.dataset.revision })]
       : [];
-    const resultIdentityIssue = maintained.rows.length === maintained.resultKeys.length && new Set(maintained.resultKeys).size === maintained.resultKeys.length
+    const resultIdentityIssue = trustedIncremental !== undefined || (maintained.rows.length === maintained.resultKeys.length && new Set(maintained.resultKeys).size === maintained.resultKeys.length)
       ? []
       : [observationIssue('observer.evaluation_failed', 'after_refresh', { reason: 'invalid_result_identity' })];
     const requiredProjectionInvalid = captured.members.some((candidate) =>
@@ -757,7 +765,7 @@ class SharedObservation<Query, Row, Projection> {
       sourceId: candidate.member.sourceId,
       basis: candidate.snapshot.basis
     }]);
-    return freezeResult({
+    const result = {
       readiness,
       rows,
       resultKeys,
@@ -769,7 +777,21 @@ class SharedObservation<Query, Row, Projection> {
       },
       sourceStates: evidence,
       issues: [...evidenceIssues, ...membershipIssue, ...resultIdentityIssue, ...maintained.issues]
+    } satisfies ObservedQueryResult<Row>;
+    if (trustedIncremental === undefined || completeness === 'unknown' || rows !== maintained.rows || resultKeys !== maintained.resultKeys) {
+      return freezeResult(result);
+    }
+    const metadata = deepFreezeObserverValue({
+      readiness: result.readiness,
+      completeness: result.completeness,
+      freshness: result.freshness,
+      basis: result.basis,
+      sourceStates: result.sourceStates,
+      issues: result.issues
     });
+    const trusted = Object.freeze({ ...metadata, rows, resultKeys }) as ObservedQueryResult<Row>;
+    trustedObservedResults.set(trusted, trustedIncremental);
+    return trusted;
   }
 
   #observerSnapshot(current: ObservedQueryResult<Row>, previous: ObserverSnapshot<Row> | undefined): ObserverSnapshot<Row> {
@@ -786,12 +808,13 @@ export const createIncrementalDatabaseQueryMaintenance = (
 ): CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> => {
   const scopes = new WeakMap<object, Map<string, PooledDatabaseMaintenanceCohort>>();
   const normalize = createQueryMaintenanceSnapshotNormalizer(functions);
+  const trustOwner = Object.freeze({});
   let nextCohortIdentity = 0;
   const factory = ((input) => {
     const { plan, initialInput } = input;
     const runtimeIdentity = (input as Partial<InternalCreateDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[maintenanceRuntimeIdentity];
     const initial = normalize(initialInput);
-    if (runtimeIdentity === undefined) return openPrivateDatabaseMaintenance(plan, initial, normalize);
+    if (runtimeIdentity === undefined) return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
     let cohorts = scopes.get(runtimeIdentity);
     if (cohorts === undefined) {
       cohorts = new Map();
@@ -805,7 +828,7 @@ export const createIncrementalDatabaseQueryMaintenance = (
       && cohort.transitionFailure.attachable
       && cohort.transitionFailure.snapshot === initial;
     if (cohort !== undefined && !sameQueryMaintenanceSnapshot(cohort.accepted, initial) && !attachesToRejected && !attachesToFailed) {
-      return openPrivateDatabaseMaintenance(plan, initial, normalize);
+      return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
     }
     if (cohort === undefined) {
       const runtime = createPooledIncrementalQueryRuntime({
@@ -826,26 +849,27 @@ export const createIncrementalDatabaseQueryMaintenance = (
         if (hasInvalidIncrementalInput(root.getCurrentResult())) {
           runtime.close();
           if (cohorts.get(key) === cohort) cohorts.delete(key);
-          return openPrivateDatabaseMaintenance(plan, initial, normalize);
+          return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
         }
         cohort.roots += 1;
-        return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts, normalize });
+        return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts, normalize, trustOwner });
       } catch (error) {
         runtime.close();
         if (cohorts.get(key) === cohort) cohorts.delete(key);
         if (!isNonPoolableQueryError(error)) throw error;
-        return openPrivateDatabaseMaintenance(plan, initial, normalize);
+        return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
       }
     }
     try {
       const root = cohort.runtime.attach(plan);
       cohort.roots += 1;
-      return openPooledDatabaseMaintenance({ plan, initial: attachesToRejected || attachesToFailed ? cohort.accepted : initial, root, cohort, cohorts, normalize });
+      return openPooledDatabaseMaintenance({ plan, initial: attachesToRejected || attachesToFailed ? cohort.accepted : initial, root, cohort, cohorts, normalize, trustOwner });
     } catch (error) {
       if (!isNonPoolableQueryError(error) && !isPooledQueryRuntimeBusyError(error)) throw error;
-      return openPrivateDatabaseMaintenance(plan, initial, normalize);
+      return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
     }
   }) as IncrementalDatabaseQueryMaintenanceFactory;
+  trustedIncrementalFactories.set(factory, trustOwner);
   Object.defineProperty(factory, incrementalMaintenanceFactoryBrand, {
     value: Object.freeze({
       getDiagnostics: (runtimeIdentity: object) => Object.freeze(
@@ -877,6 +901,7 @@ const openPooledDatabaseMaintenance = (options: {
   readonly cohort: PooledDatabaseMaintenanceCohort;
   readonly cohorts: Map<string, PooledDatabaseMaintenanceCohort>;
   readonly normalize: QueryMaintenanceSnapshotNormalizer;
+  readonly trustOwner: object;
 }): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
   let localAccepted = options.initial;
   let root: PooledIncrementalQueryRoot | undefined = options.root;
@@ -895,7 +920,7 @@ const openPooledDatabaseMaintenance = (options: {
 
   return {
     getCurrentResult: () => privateSession === undefined
-      ? options.cohort.transitionFailure?.result ?? databaseResultFromMaintained((root ?? options.root).getCurrentResult())
+      ? options.cohort.transitionFailure?.result ?? databaseResultFromMaintained((root ?? options.root).getCurrentResult(), options.trustOwner)
       : privateSession.getCurrentResult(),
     updateInput: (input) => {
       const normalizedNext = options.normalize(input);
@@ -910,14 +935,14 @@ const openPooledDatabaseMaintenance = (options: {
       const returnsToAccepted = sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.accepted);
       if (returnsToAccepted && options.cohort.lastRejected === undefined) {
         localAccepted = normalizedNext;
-        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult());
+        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult(), options.trustOwner);
       }
       if (!returnsToAccepted && options.cohort.lastRejected !== undefined && sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.lastRejected)) {
-        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult());
+        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult(), options.trustOwner);
       }
       if (!sameQueryMaintenanceSnapshot(localAccepted, options.cohort.accepted)) {
         detach();
-        privateSession = openPrivateDatabaseMaintenance(options.plan, localAccepted, options.normalize);
+        privateSession = openPrivateDatabaseMaintenance(options.plan, localAccepted, options.normalize, options.trustOwner);
         return privateSession.updateInput(input);
       }
       const updatingRoot = root ?? options.root;
@@ -946,7 +971,7 @@ const openPooledDatabaseMaintenance = (options: {
       } else {
         options.cohort.lastRejected = normalizedNext;
       }
-      return databaseResultFromMaintained(updatingRoot.getCurrentResult());
+      return databaseResultFromMaintained(updatingRoot.getCurrentResult(), options.trustOwner);
     },
     close: () => {
       if (closed) return;
@@ -960,12 +985,13 @@ const openPooledDatabaseMaintenance = (options: {
 const openPrivateDatabaseMaintenance = (
   plan: PreparedPlan<QueryNode>,
   initial: QueryMaintenanceSnapshot,
-  normalize: QueryMaintenanceSnapshotNormalizer
+  normalize: QueryMaintenanceSnapshotNormalizer,
+  trustOwner: object
 ): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
   let accepted = initial;
   let session = openIncrementalQueryMaintenance(plan, accepted);
   return {
-    getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult()),
+    getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult(), trustOwner),
     updateInput: (input) => {
       const next = normalize(input);
       let update: ReturnType<typeof diffQueryMaintenanceSnapshots>;
@@ -991,12 +1017,12 @@ const openPrivateDatabaseMaintenance = (
         try { session.close(); } catch { /* replacement must not depend on cleanup */ }
         accepted = next;
         session = openIncrementalQueryMaintenance(plan, accepted);
-        return databaseResultFromMaintained(session.getCurrentResult());
+        return databaseResultFromMaintained(session.getCurrentResult(), trustOwner);
       }
       const rejectedBefore = session.getCurrentResult().state.rejectedUpdateCount;
       const result = session.applyUpdate(update);
       if (result.state.rejectedUpdateCount === rejectedBefore) accepted = next;
-      return databaseResultFromMaintained(result);
+      return databaseResultFromMaintained(result, trustOwner);
     },
     close: () => session.close()
   };
@@ -1016,10 +1042,16 @@ const pooledDatabaseCohortKey = (
   parameters
 ] as JsonValue);
 
-const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => left === right || samePortableObserverValue(
-  { relations: left.relations, parameters: left.parameters, basis: left.basis, membershipRevision: left.membershipRevision },
-  { relations: right.relations, parameters: right.parameters, basis: right.basis, membershipRevision: right.membershipRevision }
-);
+const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => {
+  if (left === right) return true;
+  // Basis and membership evidence are cheap, high-selectivity guards. Avoid
+  // canonicalizing every relation row for the normal new-basis transition.
+  // Occurrence identity was descriptor-safely adopted once when the capture
+  // frame was built, so new-basis transitions need no source-owned traversal.
+  if (left.membershipRevision !== right.membershipRevision || !samePortableObserverValue(left.basis, right.basis)) return false;
+  if (!samePortableObserverValue(left.parameters, right.parameters)) return false;
+  return samePortableObserverValue(left.relations, right.relations);
+};
 
 const queryMaintenanceFrameIdentity = Symbol('tarstate.query-maintenance-frame');
 type FramedQueryMaintenanceSnapshot = QueryMaintenanceSnapshot & {
@@ -1040,6 +1072,7 @@ type QueryMaintenanceSnapshotNormalizer = {
 };
 
 const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | undefined): QueryMaintenanceSnapshotNormalizer => {
+  const maxParameterSnapshotsPerFrame = 256;
   const frames = new WeakMap<object, {
     readonly normalized: Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'>;
     readonly parameters: Map<string, QueryMaintenanceSnapshot>;
@@ -1055,7 +1088,12 @@ const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | 
       frames.set(metadata.frameIdentity, frame);
     }
     const cached = frame.parameters.get(metadata.parameterKey);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      // Map insertion order is the deterministic recency list.
+      frame.parameters.delete(metadata.parameterKey);
+      frame.parameters.set(metadata.parameterKey, cached);
+      return cached;
+    }
     const normalized: FramedQueryMaintenanceSnapshot = {
       ...frame.normalized,
       parameters: input.parameters,
@@ -1065,6 +1103,10 @@ const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | 
         runtimeIdentity: metadata.runtimeIdentity
       })
     };
+    if (frame.parameters.size >= maxParameterSnapshotsPerFrame) {
+      const leastRecentlyUsed = frame.parameters.keys().next().value;
+      if (leastRecentlyUsed !== undefined) frame.parameters.delete(leastRecentlyUsed);
+    }
     frame.parameters.set(metadata.parameterKey, normalized);
     return normalized;
   };
@@ -1127,6 +1169,7 @@ const normalizeQueryMaintenanceFrame = (
 ): Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'> => ({
   relations: input.attachments.flatMap(({ member, snapshot, projection }) => projection.map((relation) => ({
     ...relation,
+    ...(relation.occurrenceIds === undefined ? {} : { occurrenceIds: adoptQueryOccurrenceIds(relation.occurrenceIds) }),
     sourceId: member.sourceId,
     attachmentId: member.attachmentId,
     basis: snapshot.basis
@@ -1138,7 +1181,11 @@ const normalizeQueryMaintenanceFrame = (
   membershipRevision: input.dataset.revision
 });
 
-const databaseResultFromMaintained = ({ state: _state, ...result }: IncrementalQueryResult): MaintainedDatabaseQueryResult<QueryRecord> => result;
+const databaseResultFromMaintained = ({ state, rows, resultKeys, completeness, issues }: IncrementalQueryResult, owner: object): MaintainedDatabaseQueryResult<QueryRecord> => {
+  const result = Object.freeze({ rows, resultKeys, completeness, issues });
+  trustedIncrementalResults.set(result, Object.freeze({ revision: state.revision, resultDelta: state.resultDelta, owner }));
+  return result;
+};
 
 const failedMaintenanceSession = <Query, Row, Projection>(error: unknown): DatabaseQueryMaintenanceSession<Query, Row, Projection> => {
   const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<Row>;
@@ -1253,7 +1300,66 @@ const observerChange = <Row>(previous: ObserverSnapshot<Row>, next: ObserverSnap
   if (next.current.completeness === 'unknown') return Object.freeze({ kind: 'invalidation', snapshot: next });
   const baseline = previous.current.completeness === 'exact' ? previous.current : previous.lastExact;
   if (next.current.completeness !== 'exact' || baseline === undefined) return Object.freeze({ kind: 'reset', snapshot: next });
+  const beforeMetadata = trustedObservedResults.get(baseline as object);
+  const afterMetadata = trustedObservedResults.get(next.current as object);
+  if (baseline === previous.current && beforeMetadata !== undefined && afterMetadata !== undefined && afterMetadata.revision === beforeMetadata.revision + 1) {
+    return Object.freeze({ kind: 'diff', diff: incrementalResultDiff(baseline, next.current, afterMetadata.resultDelta), snapshot: next });
+  }
   return Object.freeze({ kind: 'diff', diff: resultDiff(baseline, next.current), snapshot: next });
+};
+
+const sameObserverSnapshot = <Row>(left: ObserverSnapshot<Row>, right: ObserverSnapshot<Row>): boolean => {
+  if (left === right) return true;
+  if (left.state !== 'open' || right.state !== 'open') return false;
+  const before = trustedObservedResults.get(left.current as object);
+  const after = trustedObservedResults.get(right.current as object);
+  if (before === undefined || after === undefined) return samePortableObserverValue(left, right);
+  const consecutiveUnchanged = after.revision === before.revision + 1
+    && after.resultDelta.addedResultKeys.length === 0
+    && after.resultDelta.removedResultKeys.length === 0
+    && after.resultDelta.updatedResultKeys.length === 0
+    && sameStringArray(left.current.resultKeys, right.current.resultKeys);
+  const sharedResultViews = left.current.rows === right.current.rows && left.current.resultKeys === right.current.resultKeys;
+  return (consecutiveUnchanged || sharedResultViews) && sameObservedResultMetadata(left.current, right.current);
+};
+
+const sameStringArray = (left: readonly string[], right: readonly string[]): boolean =>
+  left === right || left.length === right.length && left.every((value, index) => value === right[index]);
+
+const sameObservedResultMetadata = <Row>(left: ObservedQueryResult<Row>, right: ObservedQueryResult<Row>): boolean =>
+  left.readiness === right.readiness
+  && left.completeness === right.completeness
+  && left.freshness === right.freshness
+  && samePortableObserverValue(left.basis, right.basis)
+  && samePortableObserverValue(left.sourceStates, right.sourceStates)
+  && samePortableObserverValue(left.issues, right.issues);
+
+const incrementalResultDiff = <Row>(
+  before: ObservedQueryResult<Row>,
+  after: ObservedQueryResult<Row>,
+  delta: IncrementalQueryResult['state']['resultDelta']
+): ResultDiff<Row> => {
+  const addedKeys = new Set(delta.addedResultKeys);
+  const removedKeys = new Set(delta.removedResultKeys);
+  const updatedKeys = new Set(delta.updatedResultKeys);
+  const added: { readonly key: string; readonly row: Row }[] = [];
+  const removed: { readonly key: string; readonly row: Row }[] = [];
+  for (let index = 0; index < after.resultKeys.length; index += 1) {
+    const key = after.resultKeys[index] as string;
+    if (addedKeys.has(key)) added.push(Object.freeze({ key, row: after.rows[index] as Row }));
+  }
+  for (let index = 0; index < before.resultKeys.length; index += 1) {
+    const key = before.resultKeys[index] as string;
+    if (removedKeys.has(key)) removed.push(Object.freeze({ key, row: before.rows[index] as Row }));
+  }
+  const beforeUpdated = new Map<string, Row>();
+  before.resultKeys.forEach((key, index) => { if (updatedKeys.has(key)) beforeUpdated.set(key, before.rows[index] as Row); });
+  const updated: { readonly key: string; readonly before: Row; readonly after: Row }[] = [];
+  after.resultKeys.forEach((key, index) => {
+    const prior = beforeUpdated.get(key);
+    if (prior !== undefined && updatedKeys.has(key)) updated.push(Object.freeze({ key, before: prior, after: after.rows[index] as Row }));
+  });
+  return Object.freeze({ added: Object.freeze(added), removed: Object.freeze(removed), updated: Object.freeze(updated) });
 };
 
 const resultDiff = <Row>(before: ObservedQueryResult<Row>, after: ObservedQueryResult<Row>): ResultDiff<Row> => {

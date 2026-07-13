@@ -401,9 +401,19 @@ describe('database membership and observation', () => {
     const initial = observer.getSnapshot();
     expect(initial).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
     const initialKey = initial.state === 'open' ? initial.current.resultKeys[0] : undefined;
+    const changes: ObserverChange<QueryRecord>[] = [];
+    observer.subscribe((change) => changes.push(change));
 
     source.publish({ rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }] });
     expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], resultKeys: [initialKey, expect.any(String)] } });
+    expect(changes[0]).toMatchObject({ kind: 'diff', diff: {
+      added: [{ row: { id: 3, value: 'three' } }], removed: [],
+      updated: [{ key: initialKey, before: { id: 2, value: 'two' }, after: { id: 2, value: 'updated' } }]
+    } });
+    const changed = observer.getSnapshot();
+    source.notify();
+    expect(observer.getSnapshot()).toBe(changed);
+    expect(changes).toHaveLength(1);
 
     source.publish({ state: 'failed', freshness: 'none' });
     expect(observer.getSnapshot()).toMatchObject({
@@ -665,6 +675,42 @@ describe('database membership and observation', () => {
     secondaryLease.close();
   });
 
+  it('bounds live-frame parameter snapshots with deterministic LRU eviction while sessions remain correct', () => {
+    const source = new TestSource('source:parameter-lru', [{ id: 2, value: 'initial' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:parameter-lru', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-lru', source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const observe = (cohort: number, suffix: string) => database.observe({
+      plan: sealPreparedPlan({ ...relationalPlan(), planId: `query:parameter-lru:${suffix}`, rootNodeId: `query:parameter-lru:${suffix}:root` }),
+      parameters: { cohort }
+    });
+    const observers = Array.from({ length: 256 }, (_, index) => observe(index, String(index)));
+    // Refresh key zero, then insert a new key. Deterministic Map-order LRU
+    // eviction removes key one; requesting it again must safely recompute.
+    const refreshed = observe(0, 'refresh-zero');
+    const overflow = observe(256, 'overflow');
+    const recomputed = observe(1, 'recomputed-one');
+
+    expect(refreshed.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'initial' }] } });
+    expect(recomputed.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'initial' }] } });
+    source.publish({ rows: [{ id: 2, value: 'changed' }] });
+    for (const observer of [observers[0], observers[1], observers[255], refreshed, overflow, recomputed]) {
+      expect(observer?.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'changed' }] } });
+    }
+
+    observers.forEach((observer) => observer.close());
+    refreshed.close();
+    overflow.close();
+    recomputed.close();
+    database.close();
+    attachmentLease.close();
+  });
+
   it('detaches a reused relation delta from source-owned nested row values', () => {
     const source = new TestSource('source:parameter-detached-delta', [{ id: 2, value: 'initial' }]);
     const catalog = new AttachmentCatalog();
@@ -717,7 +763,7 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
-  it('does not cache a rejected frame delta before parameter cohorts recover', () => {
+  it('adopts occurrence identity once before parameter cohorts reuse an accepted frame delta', () => {
     const source = new TestSource('source:parameter-rejected-delta', [{ id: 2, value: 'accepted' }]);
     const catalog = new AttachmentCatalog();
     let rejectAcceptedIdentity = false;
@@ -764,20 +810,64 @@ describe('database membership and observation', () => {
     });
     rejectAcceptedIdentity = true;
     source.publish({ rows: [{ id: 9, value: 'rejected' }] });
-    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 2, reusedFrameDeltaCount: 0 });
-    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
-    expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { completeness: 'unknown' } });
+    expect(acceptedIdentityReads).toBe(0);
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 1, reusedFrameDeltaCount: 1 });
+    expect(first.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 9, value: 'rejected' }], completeness: 'exact' } });
+    expect(second.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 9, value: 'rejected' }], completeness: 'exact' } });
 
     rejectAcceptedIdentity = false;
     source.publish({ rows: [{ id: 4, value: 'recovered' }] });
-    // Both cohorts rejected the unstable frame and therefore share the same
-    // accepted owned snapshot; recovery can safely reuse that transition.
-    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 3, reusedFrameDeltaCount: 1 });
+    expect(database.getQueryMaintenanceReuseDiagnostics()).toEqual({ computedFrameDeltaCount: 2, reusedFrameDeltaCount: 2 });
     for (const observer of [first, second]) expect(observer.getSnapshot()).toMatchObject({
       state: 'open', current: { rows: [{ id: 4, value: 'recovered' }], completeness: 'exact' }
     });
     first.close();
     second.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('rejects accessor-backed occurrence identity without invoking it and recovers on the next frame', () => {
+    const source = new TestSource('source:occurrence-accessor', [{ id: 2, value: 'initial' }]);
+    const catalog = new AttachmentCatalog();
+    let hostile = false;
+    let getterCalls = 0;
+    const attachmentId = 'attachment:occurrence-accessor';
+    const attachmentLease = catalog.attach({
+      ...relationalAttachment(attachmentId, source),
+      preparation: prepareManualReadOnlyAttachment({
+        schemaViewIds: [querySchemaView.id],
+        project: (snapshot: SourceSnapshot<{ readonly rows: readonly Row[] }>) => {
+          if (snapshot.storage === undefined) return { state: snapshot.state === 'ready' ? 'failed' as const : snapshot.state, issues: [] };
+          const occurrenceIds = snapshot.storage.rows.map(({ id }) => 'row:' + id);
+          if (hostile) Object.defineProperty(occurrenceIds, '0', {
+            enumerable: true,
+            configurable: true,
+            get: () => { getterCalls += 1; return 'row:hostile'; }
+          });
+          return { state: 'ready' as const, value: [{
+            relation: { schemaView: querySchemaView, relationId: 'test.rows' }, rows: snapshot.storage.rows,
+            occurrenceIds, completeness: 'exact' as const, sourceId: source.sourceId, attachmentId, basis: snapshot.basis
+          }], issues: [] };
+        }
+      })
+    });
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member(attachmentId, source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const observer = database.observe({ plan: relationalPlan() });
+
+    hostile = true;
+    source.publish({ rows: [{ id: 2, value: 'hostile' }] });
+    expect(getterCalls).toBe(0);
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [], completeness: 'unknown' } });
+
+    hostile = false;
+    source.publish({ rows: [{ id: 3, value: 'recovered' }] });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { rows: [{ id: 3, value: 'recovered' }], completeness: 'exact' } });
+    observer.close();
     database.close();
     attachmentLease.close();
   });
@@ -1005,7 +1095,7 @@ describe('database membership and observation', () => {
 
     expect(first.getCurrentResult().rows).toEqual([{ id: 2, value: 'two' }]);
     expect(second.getCurrentResult().rows).toEqual([{ id: 9, value: 'private' }]);
-    expect(() => first.updateInput({ ...input({ id: 2, value: 'two' }), parameters: { changed: true } })).toThrow('parameters and functions are fixed');
+    expect(() => first.updateInput({ ...input({ id: 2, value: 'two' }), parameters: { changed: true } })).toThrow('parameters, functions, and execution budget are fixed');
     const hostile = { id: 2 } as Row;
     Object.defineProperty(hostile, 'value', { enumerable: true, get: () => { throw new Error('next row failed'); } });
     expect(() => first.updateInput(input(hostile))).toThrow('next row failed');
@@ -1046,7 +1136,7 @@ describe('database membership and observation', () => {
     expect(first.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
     expect(second.getCurrentResult()).toMatchObject({ rows: [original], completeness: 'exact' });
 
-    expect(() => first.updateInput({ ...input(acceptedRows), parameters: { changed: true } })).toThrow('parameters and functions are fixed');
+    expect(() => first.updateInput({ ...input(acceptedRows), parameters: { changed: true } })).toThrow('parameters, functions, and execution budget are fixed');
     expect(first.getCurrentResult()).toMatchObject({ completeness: 'unknown' });
     expect(first.updateInput(input(acceptedRows))).toMatchObject({ rows: [original], completeness: 'exact' });
     expect(second.getCurrentResult()).toMatchObject({ rows: [original], completeness: 'exact' });
@@ -1472,6 +1562,68 @@ describe('database membership and observation', () => {
     broken.close();
     healthy.close();
     database.close();
+    attachmentLease.close();
+  });
+
+  it('fully adopts frozen custom maintenance rows instead of trusting their apparent immutability', () => {
+    const source = new TestSource('source:custom-owned', [{ id: 1, value: 'source' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:custom-owned', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:custom-owned', source.sourceId)] });
+    const nested = { label: 'owned' };
+    const callerRow = Object.freeze({ id: 1, value: 'one', nested }) as unknown as Row;
+    const database = view(catalog, [dataset], 'public', 'authority:public', () => ({
+      rows: Object.freeze([callerRow]), resultKeys: Object.freeze(['custom:1']), completeness: 'exact', issues: Object.freeze([])
+    }));
+    const observer = database.observe({ plan: plan() });
+    const snapshot = observer.getSnapshot();
+
+    nested.label = 'mutated';
+
+    expect(snapshot).toMatchObject({ state: 'open', current: { rows: [{ nested: { label: 'owned' } }] } });
+    expect(Object.isFrozen(snapshot.state === 'open' ? (snapshot.current.rows[0] as unknown as { nested: object }).nested : undefined)).toBe(true);
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('does not transfer built-in result trust through a custom maintenance factory', () => {
+    const source = new TestSource('source:replayed-trust', [{ id: 2, value: 'two' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentId = 'attachment:replayed-trust';
+    const attachmentLease = catalog.attach(relationalAttachment(attachmentId, source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member(attachmentId, source.sourceId)] });
+    const snapshot = source.snapshot();
+    const attachment = catalog.get(attachmentId) as DatabaseAttachment<unknown, readonly RelationInput[]>;
+    const projection: readonly RelationInput[] = [{
+      relation: { schemaView: querySchemaView, relationId: 'test.rows' }, rows: snapshot.storage?.rows ?? [],
+      occurrenceIds: (snapshot.storage?.rows ?? []).map(({ id }) => 'row:' + id), completeness: 'exact',
+      sourceId: source.sourceId, attachmentId, basis: snapshot.basis
+    }];
+    const builtIn = createIncrementalDatabaseQueryMaintenance();
+    const builtInSession = builtIn({
+      plan: relationalPlan(),
+      initialInput: {
+        query: relationalPlan().query, parameters: {}, dataset: dataset.snapshot(),
+        attachments: [{ member: member(attachmentId, source.sourceId), attachment, snapshot, projection }]
+      }
+    });
+    const replayed = builtInSession.getCurrentResult();
+    const replayFactory: CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> = () => ({
+      getCurrentResult: () => replayed, updateInput: () => replayed, close: () => undefined
+    });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: replayFactory
+    });
+    const observer = database.observe({ plan: relationalPlan() });
+    const observed = observer.getSnapshot();
+
+    expect(observed).toMatchObject({ state: 'open', current: { rows: [{ id: 2, value: 'two' }] } });
+    expect(observed.state === 'open' ? observed.current.rows : undefined).not.toBe(replayed.rows);
+    observer.close();
+    database.close();
+    builtInSession.close();
     attachmentLease.close();
   });
 

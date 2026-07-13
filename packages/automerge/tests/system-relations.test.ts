@@ -165,4 +165,26 @@ describe('Automerge system relations', () => {
     expect(() => state.apply({ kind: 'peer-disconnected', peerId: 'peer:one', observedAt: 2 })).toThrow(/closed/);
     expect(listener).toHaveBeenCalledTimes(1);
   });
+
+  it('reports contained listener failures without interrupting healthy notifications or state', () => {
+    const diagnostics = vi.fn();
+    const state = new AutomergeSystemRelationState('attachment:diagnostics', { onDiagnostic: diagnostics });
+    const healthy = vi.fn();
+    state.subscribe(() => { throw new Error('listener failed'); });
+    state.subscribe(healthy);
+
+    const snapshot = state.apply({ kind: 'peer-observed', peerId: 'peer:one', observedAt: 1 });
+
+    expect(healthy).toHaveBeenCalledTimes(1);
+    expect(state.getSnapshot()).toBe(snapshot);
+    expect(snapshot.peers).toEqual([expect.objectContaining({ peerId: 'peer:one' })]);
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'listener_error', component: 'automerge-system-relations', operation: 'publish', error: expect.any(Error)
+    }));
+
+    const hostileDiagnostic = new AutomergeSystemRelationState('attachment:hostile-diagnostics', { onDiagnostic: () => { throw new Error('diagnostic failed'); } });
+    hostileDiagnostic.subscribe(() => { throw new Error('listener failed'); });
+    expect(() => hostileDiagnostic.apply({ kind: 'peer-observed', peerId: 'peer:two', observedAt: 2 })).not.toThrow();
+    expect(hostileDiagnostic.getSnapshot().peers).toHaveLength(1);
+  });
 });

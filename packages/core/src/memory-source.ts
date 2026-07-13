@@ -3,6 +3,7 @@ import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { builtInCapabilityRefs } from './builtins.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
+import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { QueryNode } from './query.js';
 import { safeParseTransactionArtifact } from './semantic-artifact-parsers.js';
@@ -106,6 +107,7 @@ export class InMemoryAtomicSource {
   readonly #resolveArtifact: ((ref: ArtifactRef) => Promise<Transaction | undefined> | Transaction | undefined) | undefined;
   readonly #evaluateQuery: ((root: QueryNode, state: MemoryState, parameters: Readonly<Record<string, JsonValue>>) => MemoryQueryResult) | undefined;
   readonly #satisfiesCapability: (capability: CapabilityRef) => boolean;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   readonly #listeners = new Set<() => void>();
   readonly #ledger = new Map<string, LedgerEntry>();
   readonly #retiredEpochs = new Set<string>();
@@ -125,6 +127,8 @@ export class InMemoryAtomicSource {
     readonly resolveArtifact?: (ref: ArtifactRef) => Promise<Transaction | undefined> | Transaction | undefined;
     readonly evaluateQuery?: (root: QueryNode, state: MemoryState, parameters: Readonly<Record<string, JsonValue>>) => MemoryQueryResult;
     readonly satisfiesCapability?: (capability: CapabilityRef) => boolean;
+    /** Receives listener failures isolated after a committed state transition. */
+    readonly onDiagnostic?: ObserverDiagnosticReporter;
   }) {
     this.sourceId = options.sourceId;
     this.incarnation = options.incarnation;
@@ -136,6 +140,7 @@ export class InMemoryAtomicSource {
     this.#resolveArtifact = options.resolveArtifact;
     this.#evaluateQuery = options.evaluateQuery;
     this.#satisfiesCapability = options.satisfiesCapability ?? (() => true);
+    this.#onDiagnostic = options.onDiagnostic;
   }
 
   snapshot(): { readonly basis: MemoryBasis; readonly state: MemoryState } {
@@ -281,9 +286,9 @@ export class InMemoryAtomicSource {
           durability: 'memory'
         };
         ledgerEntry.receipt = receipt;
-        if (evaluated.changed) for (const listener of this.#listeners) {
-          try { listener(); } catch { /* Observation callbacks cannot change a known commit outcome. */ }
-        }
+        if (evaluated.changed) notifyObservers(this.#listeners, (listener) => listener(), {
+          component: 'memory-source', operation: 'publish-commit'
+        }, this.#onDiagnostic);
         return receipt;
       }
     } catch (error) {

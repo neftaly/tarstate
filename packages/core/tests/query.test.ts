@@ -35,6 +35,87 @@ const from = (relationId: string, alias = relationId): QueryNode => ({
 });
 
 describe('production query oracle', () => {
+  it('orders built-in scalar and object keys correctly while retaining conservative host-call evaluation', () => {
+    const field = (name: string) => ({ kind: 'field', alias: 'row', name } as const);
+    const rows = [
+      { id: 1, group: 'b', score: 1 },
+      { id: 2, group: 'a', score: 2 },
+      { id: 3, group: 'a', score: 1 },
+      { id: 4, group: 'b', score: 2 }
+    ];
+    const objectOrder: QueryNode = {
+      kind: 'order', input: from('ordered', 'row'), by: [{
+        value: { kind: 'record', fields: { group: field('group'), score: field('score') } }, direction: 'asc'
+      }]
+    };
+    expect(evaluateQuery({ root: objectOrder, relations: [relation('ordered', rows)] }).rows.map(({ id }) => id)).toEqual([3, 2, 1, 4]);
+    const tiedInput = { ...relation('ordered', [{ id: 1, score: 1 }, { id: 2, score: 1 }]), occurrenceIds: ['z', 'a'] };
+    const tiedOrder: QueryNode = { kind: 'order', input: from('ordered', 'row'), by: [{ value: field('score'), direction: 'asc' }] };
+    expect(evaluateQuery({ root: tiedOrder, relations: [tiedInput] }).rows.map(({ id }) => id)).toEqual([2, 1]);
+
+    const capability: CapabilityRef = { id: 'urn:test:order-call-count', version: '1', contractHash: `sha256:${'c'.repeat(64)}` };
+    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    let calls = 0;
+    const callOrder: QueryNode = {
+      kind: 'order', input: from('ordered', 'row'),
+      by: [{ value: { kind: 'call', capability, args: [field('score')] }, direction: 'asc' }]
+    };
+    const result = evaluateQuery({
+      root: callOrder,
+      relations: [relation('ordered', rows)],
+      functions: new Map([[key, ([value]) => { calls += 1; return value ?? null; }]])
+    });
+    expect(result.rows.map(({ id }) => id)).toEqual([1, 3, 2, 4]);
+    expect(calls).toBeGreaterThan(rows.length);
+  });
+
+  it('compares portable equality without depending on object insertion order or numeric spelling', () => {
+    const eq = (left: JsonValue, right: JsonValue) => evaluateExpression({
+      kind: 'compare', op: 'eq', left: { kind: 'literal', value: left }, right: { kind: 'literal', value: right }
+    }, {});
+    const ne = (left: JsonValue, right: JsonValue) => evaluateExpression({
+      kind: 'compare', op: 'ne', left: { kind: 'literal', value: left }, right: { kind: 'literal', value: right }
+    }, {});
+
+    expect(eq({ outer: { a: 1, b: [true, -0] } }, { outer: { b: [true, 0], a: 1 } })).toBe(true);
+    expect(ne({ outer: { a: 1, b: [true, -0] } }, { outer: { b: [true, 0], a: 2 } })).toBe(true);
+    expect(eq(-0, 0)).toBe(true);
+    expect(eq([1, { x: 'same' }], [1, { x: 'same' }])).toBe(true);
+  });
+
+  it('fails closed under an explicit deterministic execution budget', async () => {
+    const values = (alias: string): QueryNode => ({ kind: 'values', alias, rows: Array.from({ length: 8 }, (_, id) => ({ id })) });
+    const product: QueryNode = { kind: 'join', join: 'cross', left: values('left'), right: values('right') };
+    const request = { relations: [], executionBudget: { maxWorkUnits: 12 } } as const;
+    const pure = evaluateQuery({ root: product, ...request });
+    expect(pure).toMatchObject({ rows: [], resultKeys: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded', details: { maxWorkUnits: 12 } }] });
+
+    const prepared = await prepareQuery({ root: product, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' });
+    expect(evaluatePreparedQuery(prepared, request)).toEqual(pure);
+    expect(evaluateQuery({ root: product, relations: [] }).rows).toHaveLength(64);
+
+    const source: QueryNode = { kind: 'values', alias: 'v', rows: Array.from({ length: 20 }, (_, id) => ({ id })) };
+    const aggregate: QueryNode = { kind: 'aggregate', input: source, alias: 'summary', groupBy: {}, measures: { count: { kind: 'aggregate', op: 'count' } } };
+    expect(evaluateQuery({ root: aggregate, relations: [], executionBudget: { maxWorkUnits: 25 } })).toMatchObject({ completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    const duplicates: QueryNode = { kind: 'distinct', input: { kind: 'values', alias: 'v', rows: Array.from({ length: 20 }, () => ({ id: 1 })) } };
+    expect(evaluateQuery({ root: duplicates, relations: [], executionBudget: { maxWorkUnits: 25 } })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    const sliced: QueryNode = { kind: 'slice', input: source, limit: 1 };
+    expect(evaluateQuery({ root: sliced, relations: [], executionBudget: { maxWorkUnits: 25 } })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    const order: QueryNode = { kind: 'order', input: source, by: [{ value: { kind: 'field', alias: 'v', name: 'id' }, direction: 'desc' }] };
+    expect(evaluateQuery({ root: order, relations: [], executionBudget: { maxWorkUnits: 45 } })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    const window: QueryNode = { kind: 'window', input: source, alias: 'v', fields: { rank: { kind: 'window', op: 'rank', orderBy: [{ value: { kind: 'field', alias: 'v', name: 'id' }, direction: 'desc' }] } } };
+    expect(evaluateQuery({ root: window, relations: [], executionBudget: { maxWorkUnits: 45 } })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+  });
+
+  it('adopts execution budgets exactly without invoking accessors', () => {
+    expect(() => evaluateQuery({ root: { kind: 'values', alias: 'v', rows: [] }, relations: [], executionBudget: { maxWorkUnits: -1 } })).toThrow(/maxWorkUnits/);
+    expect(() => evaluateQuery({ root: { kind: 'values', alias: 'v', rows: [] }, relations: [], executionBudget: { maxWorkUnits: 1, extra: 1 } as never })).toThrow(/exactly/);
+    let calls = 0;
+    const hostile = Object.defineProperty({}, 'maxWorkUnits', { enumerable: true, get: () => { calls += 1; return 1; } });
+    expect(() => evaluateQuery({ root: { kind: 'values', alias: 'v', rows: [] }, relations: [], executionBudget: hostile as never })).toThrow(/hostile/);
+    expect(calls).toBe(0);
+  });
+
   it('detaches and freezes pure query inputs and visible results', () => {
     const nested = { labels: ['original'] };
     const source = { id: 1, nested };

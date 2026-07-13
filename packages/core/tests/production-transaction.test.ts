@@ -20,7 +20,7 @@ const transaction = (statements: readonly WriteStatement[], parameters: Transact
   body: { schemaView, parameters, statements, guards, requiredCapabilities }
 });
 
-const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult } = {}) => new InMemoryAtomicSource({
+const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult; onDiagnostic?: ConstructorParameters<typeof InMemoryAtomicSource>[0]['onDiagnostic'] } = {}) => new InMemoryAtomicSource({
   sourceId: 'source:one',
   incarnation: 'incarnation:one',
   operationEpoch: 'epoch:one',
@@ -28,7 +28,8 @@ const source = (options: { state?: MemoryState; relations?: readonly MemoryRelat
   relations: options.relations ?? [{ relationId: 'items', schemaView, keyFields: ['id'] }],
   attachments: [{ attachmentId: 'attachment:one', fingerprint: hash('b'), authorityViewFingerprint: hash('c'), schemaView, writable: true }],
   ...(options.constraints === undefined ? {} : { constraints: options.constraints }),
-  ...(options.evaluateQuery === undefined ? {} : { evaluateQuery: options.evaluateQuery })
+  ...(options.evaluateQuery === undefined ? {} : { evaluateQuery: options.evaluateQuery }),
+  ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
 });
 
 const attempt = (operationId: string, value: Transaction, extra: Partial<{ expectedBasis: { incarnation: string; revision: number }; signal: AbortSignal }> = {}) => ({
@@ -298,6 +299,21 @@ describe('production in-memory transaction coordinator', () => {
     expect(memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'stale', intentHash: stale.intentHash })).toMatchObject({ status: 'known' });
     expect(memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'stale', intentHash: stale.intentHash })).toMatchObject({ status: 'known', receipt: stale });
     expect(await memory.commit(attempt('stale', noMatch, { expectedBasis: { incarnation: 'incarnation:one', revision: 99 } }))).toBe(stale);
+  });
+
+  it('reports isolated listener failures without changing a committed outcome', async () => {
+    const diagnostics: unknown[] = [];
+    const memory = source({ onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) });
+    const healthy = vi.fn();
+    memory.subscribe(() => { throw new Error('listener failed'); });
+    memory.subscribe(healthy);
+    const insert = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
+
+    const receipt = await memory.commit(attempt('listener-diagnostic', insert));
+
+    expect(receipt).toMatchObject({ outcome: 'committed', afterBasis: { revision: 1 } });
+    expect(healthy).toHaveBeenCalledOnce();
+    expect(diagnostics).toMatchObject([{ kind: 'listener_error', component: 'memory-source', operation: 'publish-commit' }]);
   });
 
   it('serializes concurrent and reentrant commits and reports semantic list edits', async () => {
