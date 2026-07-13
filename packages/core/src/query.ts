@@ -193,16 +193,81 @@ export type IncrementalQueryResultDelta = {
   readonly updatedResultKeys: readonly string[];
 };
 
+/**
+ * Physical operator families reported by incremental-maintenance diagnostics.
+ *
+ * The corresponding diagnostics record contains every operator in this union,
+ * including operators with all-zero counters. New operator families may be
+ * added in a future release, so persisted or remotely transported diagnostics
+ * should be decoded as telemetry rather than as a versioned wire format.
+ */
 export type QueryMaintenanceOperator = 'local' | 'join' | 'distinct' | 'order' | 'aggregate' | 'window' | 'slice' | 'set';
+
+/**
+ * Why an evaluated physical node used semantic rematerialization. The set may
+ * grow as new fallback boundaries become observable; branch defensively when
+ * diagnostics cross package-version or process boundaries.
+ */
 export type QueryMaintenanceFallbackReason = 'unsupported_expression' | 'state_unavailable' | 'input_unavailable' | 'unstable_layout' | 'evaluation_unavailable';
+
+/**
+ * Per-operator telemetry for one maintenance transition.
+ *
+ * Each evaluated physical node contributes to exactly one strategy count:
+ * `selectiveNodeCount` when a subset was maintained, `fullNodeCount` when the
+ * operator's full-input path ran, or `fallbackNodeCount` when semantic
+ * rematerialization ran. These are operational observations, not correctness
+ * or complexity guarantees; thresholds and chosen strategies may evolve.
+ *
+ * `affectedUnitCount` is the sum of the logical affected scope reported by
+ * those nodes. It is not a count of CPU operations. Its unit depends on the
+ * operator and strategy:
+ *
+ * - `local`: input row/segment positions evaluated or changed.
+ * - `join`: left-row segments evaluated (including those affected by a
+ *   right-side change).
+ * - `distinct`: distinct value classes for selective maintenance; input rows
+ *   for full maintenance.
+ * - `order`: changed/new input rows that selected the maintenance path.
+ * - `aggregate`: changed input positions for selective maintenance; input rows
+ *   for full maintenance.
+ * - `window`: row positions whose window output was targeted or recomputed.
+ * - `slice`: changed output positions for selective maintenance.
+ * - `set`: changed output positions for selective maintenance.
+ *
+ * A fallback reports the best available affected scope in that operator's
+ * units, commonly the available input cardinality or the positions that
+ * triggered fallback; it may be zero when the input itself is unavailable.
+ *
+ * Consequently, `affectedUnitCount` is useful for comparing like-for-like
+ * transitions of one operator, but must not be summed across operator families
+ * as a normalized cost metric.
+ */
 export type QueryOperatorMaintenanceDiagnostics = {
+  /** Evaluated physical nodes that maintained a subset of their input. */
   readonly selectiveNodeCount: number;
+  /** Evaluated physical nodes that ran their operator-specific full path. */
   readonly fullNodeCount: number;
+  /** Evaluated physical nodes that used semantic rematerialization. */
   readonly fallbackNodeCount: number;
+  /** Operator-specific affected units, as defined on this type. */
   readonly affectedUnitCount: number;
+  /**
+   * Persistent maintenance-index compactions performed in this transition,
+   * excluding DAG garbage collection. One node may compact multiple indexes.
+   */
   readonly compactionCount: number;
+  /**
+   * Sparse histogram of reasons for fallback nodes in this transition. Counts
+   * sum to `fallbackNodeCount`; reasons with zero occurrences are omitted.
+   */
   readonly fallbackReasons: Readonly<Partial<Record<QueryMaintenanceFallbackReason, number>>>;
 };
+
+/**
+ * Complete, frozen diagnostics for the current operator set. Every key is
+ * present and has zero-valued counters when no node of that family ran.
+ */
 export type QueryMaintenanceOperatorDiagnostics = Readonly<Record<QueryMaintenanceOperator, QueryOperatorMaintenanceDiagnostics>>;
 
 /** Observable evidence that the stateful operator graph handled an update incrementally. */
@@ -215,7 +280,11 @@ export type IncrementalQueryMaintenanceState = {
   readonly changedRelationIds: readonly string[];
   readonly resultDelta: IncrementalQueryResultDelta;
   readonly rejectedUpdateCount: number;
-  /** Per-update physical operator decisions. Counts contain no keys or row values. */
+  /**
+   * Physical operator decisions for the transition that produced this result.
+   * The record is reset on every accepted or rejected `applyUpdate`; the
+   * initial result contains zero counters. Counts contain no keys or row values.
+   */
   readonly operatorDiagnostics: QueryMaintenanceOperatorDiagnostics;
 };
 
@@ -252,7 +321,14 @@ export type PooledIncrementalQueryDiagnostics = {
   readonly lastChangedPhysicalNodeCount: number;
   readonly lastCollectedPhysicalNodeCount: number;
   readonly rejectedUpdateCount: number;
-  /** Last update across distinct evaluated physical nodes; lifecycle operations reset it. */
+  /**
+   * Decisions for the last runtime update across distinct evaluated physical
+   * nodes. Each shared node is counted once, not once per attached root.
+   * Runtime lifecycle operations (`attach`, root closure, runtime closure)
+   * reset this record to zero counters, as does a rejected update with no node
+   * evaluation. Per-root result diagnostics instead count the evaluated nodes
+   * reachable by that root.
+   */
   readonly operatorDiagnostics: QueryMaintenanceOperatorDiagnostics;
 };
 

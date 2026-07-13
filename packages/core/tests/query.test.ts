@@ -149,6 +149,52 @@ describe('production query oracle', () => {
     expect(calls).toBe(0);
   });
 
+  it('rejects accessor-backed query ownership containers without invoking accessors', () => {
+    let requestCalls = 0;
+    const hostileRequest: Record<string, unknown> = { relations: [] };
+    Object.defineProperty(hostileRequest, 'root', {
+      enumerable: true,
+      get: () => { requestCalls += 1; return { kind: 'values', alias: 'v', rows: [] }; }
+    });
+    expect(() => evaluateQuery(hostileRequest as never)).toThrow(/Query request contains a hostile object descriptor/);
+    expect(requestCalls).toBe(0);
+
+    let relationCalls = 0;
+    const hostileRelation: Record<string, unknown> = {
+      relation: { schemaView, relationId: 'people' },
+      completeness: 'exact'
+    };
+    Object.defineProperty(hostileRelation, 'rows', {
+      enumerable: true,
+      get: () => { relationCalls += 1; return []; }
+    });
+    expect(() => evaluateQuery({ root: from('people'), relations: [hostileRelation as never] }))
+      .toThrow(/Query relation input contains a hostile object descriptor/);
+    expect(relationCalls).toBe(0);
+
+    let occurrenceCalls = 0;
+    const hostileOccurrenceIds: string[] = [];
+    Object.defineProperty(hostileOccurrenceIds, '0', {
+      enumerable: true,
+      get: () => { occurrenceCalls += 1; return 'person:one'; }
+    });
+    expect(() => evaluateQuery({
+      root: from('people'),
+      relations: [{ ...relation('people', [{ id: 1 }]), occurrenceIds: hostileOccurrenceIds }]
+    })).toThrow(/Query occurrence identities contains a hostile array descriptor/);
+    expect(occurrenceCalls).toBe(0);
+
+    let scopeCalls = 0;
+    const hostileScope: Record<string, unknown> = {};
+    Object.defineProperty(hostileScope, 'row', {
+      enumerable: true,
+      get: () => { scopeCalls += 1; return { value: 1 }; }
+    });
+    expect(() => evaluateExpression({ kind: 'field', alias: 'row', name: 'value' }, hostileScope as never))
+      .toThrow(/Query expression scope contains a hostile object descriptor/);
+    expect(scopeCalls).toBe(0);
+  });
+
   it('detaches and freezes pure query inputs and visible results', () => {
     const nested = { labels: ['original'] };
     const source = { id: 1, nested };

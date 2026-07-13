@@ -2353,6 +2353,21 @@ describe('incremental query maintenance', () => {
     })).toThrow('hostile object descriptor');
   });
 
+  it('rejects an accessor-backed initial snapshot without invoking the accessor', () => {
+    let calls = 0;
+    const initial: Record<string, unknown> = {};
+    Object.defineProperty(initial, 'relations', {
+      enumerable: true,
+      get: () => { calls += 1; return []; }
+    });
+
+    expect(() => openIncrementalQueryMaintenance(
+      plan({ kind: 'values', alias: 'constant', rows: [] }),
+      initial as never
+    )).toThrow(/Query maintenance snapshot contains a hostile object descriptor/);
+    expect(calls).toBe(0);
+  });
+
   it('defers root closure during updates and rejects recursive updates and attachment', () => {
     const callable = { id: 'urn:test:pooled-reentrant', version: '1', contractHash: `sha256:${'f'.repeat(64)}` } as const;
     const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;

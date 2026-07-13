@@ -112,43 +112,56 @@ export const adoptQueryRecord = (input: unknown, label = 'Query row'): QueryReco
   return value as QueryRecord;
 };
 
-export const adoptExpressionScope = (scope: Readonly<Record<string, QueryRecord>>): Readonly<Record<string, QueryRecord>> => Object.freeze(
-  Object.fromEntries(Object.entries(scope).map(([alias, row]) => [alias, adoptQueryRecord(row, 'Query expression row')]))
-);
+export const adoptExpressionScope = (scope: Readonly<Record<string, QueryRecord>>): Readonly<Record<string, QueryRecord>> => {
+  const descriptors = inspectOwnedDataRecord(scope, 'Query expression scope', { allowSymbols: true });
+  return Object.freeze(Object.fromEntries(Object.entries(descriptors).map(([alias, descriptor]) => [alias, adoptQueryRecord(descriptor.value, 'Query expression row')])));
+};
 
 const adoptStringArray = (input: readonly string[], label: string): readonly string[] => {
-  const descriptors = Object.getOwnPropertyDescriptors(input);
-  const output: string[] = [];
-  for (let index = 0; index < input.length; index += 1) {
-    const descriptor = descriptors[String(index)];
-    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor) || typeof descriptor.value !== 'string') throw new TypeError(label + ' contains a hostile value');
-    output.push(descriptor.value);
-  }
-  return Object.freeze(output);
+  const values = inspectOwnedArray(input, label, { allowSymbols: true });
+  if (values.some((value) => typeof value !== 'string')) throw new TypeError(label + ' contains a hostile value');
+  return Object.freeze(values as string[]);
 };
 
 /** Descriptor-safe ownership for capture-frame occurrence identity. */
 export const adoptQueryOccurrenceIds = (input: readonly string[]): readonly string[] =>
   adoptStringArray(input, 'Query occurrence identities');
 
-const adoptRelationInput = (input: RelationInput): RelationInput => Object.freeze({
-  relation: adoptJsonValue(input.relation, 'Query relation') as unknown as RelationUse,
-  rows: Object.freeze(input.rows.map((row) => adoptQueryRecord(row))),
-  ...(input.occurrenceIds === undefined ? {} : { occurrenceIds: adoptStringArray(input.occurrenceIds, 'Query occurrence identities') }),
-  completeness: input.completeness,
-  ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
-  ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }),
-  ...(input.basis === undefined ? {} : { basis: adoptJsonValue(input.basis, 'Query relation basis') })
-});
+const adoptRelationInput = (input: RelationInput): RelationInput => {
+  const descriptors = inspectOwnedDataRecord(input, 'Query relation input', { allowSymbols: true });
+  const occurrenceIds = ownedDataValue(descriptors, 'occurrenceIds');
+  const sourceId = ownedDataValue(descriptors, 'sourceId');
+  const attachmentId = ownedDataValue(descriptors, 'attachmentId');
+  const basis = ownedDataValue(descriptors, 'basis');
+  return Object.freeze({
+    relation: adoptJsonValue(ownedDataValue(descriptors, 'relation'), 'Query relation') as unknown as RelationUse,
+    rows: Object.freeze(inspectOwnedArray(ownedDataValue(descriptors, 'rows'), 'Query relation rows', { allowSymbols: true }).map((row) => adoptQueryRecord(row))),
+    ...(occurrenceIds === undefined ? {} : { occurrenceIds: adoptStringArray(occurrenceIds as readonly string[], 'Query occurrence identities') }),
+    completeness: adoptCompleteness(ownedDataValue(descriptors, 'completeness'), 'Query relation input'),
+    ...(sourceId === undefined ? {} : { sourceId: adoptOptionalString(sourceId, 'Query relation sourceId') }),
+    ...(attachmentId === undefined ? {} : { attachmentId: adoptOptionalString(attachmentId, 'Query relation attachmentId') }),
+    ...(basis === undefined ? {} : { basis: adoptJsonValue(basis, 'Query relation basis') })
+  });
+};
 
-export const adoptMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): QueryMaintenanceSnapshot => Object.freeze({
-  relations: Object.freeze(snapshot.relations.map(adoptRelationInput)),
-  ...(snapshot.parameters === undefined ? {} : { parameters: adoptJsonRecord(snapshot.parameters, 'Query parameters') }),
-  ...(snapshot.functions === undefined ? {} : { functions: adoptFunctionRegistry(snapshot.functions) }),
-  ...(snapshot.basis === undefined ? {} : { basis: adoptJsonValue(snapshot.basis, 'Query basis') }),
-  ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision }),
-  ...(snapshot.executionBudget === undefined ? {} : { executionBudget: adoptExecutionBudget(snapshot.executionBudget) })
-});
+const adoptMaintenanceSnapshotDescriptors = (descriptors: OwnedDataRecord): QueryMaintenanceSnapshot => {
+  const parameters = ownedDataValue(descriptors, 'parameters');
+  const functions = ownedDataValue(descriptors, 'functions');
+  const basis = ownedDataValue(descriptors, 'basis');
+  const membershipRevision = ownedDataValue(descriptors, 'membershipRevision');
+  const executionBudget = ownedDataValue(descriptors, 'executionBudget');
+  return Object.freeze({
+    relations: Object.freeze(inspectOwnedArray(ownedDataValue(descriptors, 'relations'), 'Query relations', { allowSymbols: true }).map((input) => adoptRelationInput(input as RelationInput))),
+    ...(parameters === undefined ? {} : { parameters: adoptJsonRecord(parameters, 'Query parameters') }),
+    ...(functions === undefined ? {} : { functions: adoptFunctionRegistry(functions as FunctionRegistry) }),
+    ...(basis === undefined ? {} : { basis: adoptJsonValue(basis, 'Query basis') }),
+    ...(membershipRevision === undefined ? {} : { membershipRevision: adoptOptionalIndex(membershipRevision, 'Query membership revision') }),
+    ...(executionBudget === undefined ? {} : { executionBudget: adoptExecutionBudget(executionBudget) })
+  });
+};
+
+export const adoptMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): QueryMaintenanceSnapshot =>
+  adoptMaintenanceSnapshotDescriptors(inspectOwnedDataRecord(snapshot, 'Query maintenance snapshot', { allowSymbols: true }));
 
 const adoptExecutionBudget = (budget: unknown): { readonly maxWorkUnits: number } => {
   const descriptors = inspectOwnedDataRecord(budget, 'Query execution budget');
@@ -159,14 +172,18 @@ const adoptExecutionBudget = (budget: unknown): { readonly maxWorkUnits: number 
 };
 
 type OwnedDataRecord = Readonly<Record<string, PropertyDescriptor>>;
+type OwnedInspectionOptions = { readonly allowSymbols?: boolean };
 
-const inspectOwnedDataRecord = (input: unknown, label: string): OwnedDataRecord => {
+const inspectOwnedDataRecord = (input: unknown, label: string, options: OwnedInspectionOptions = {}): OwnedDataRecord => {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new TypeError(label + ' must be a plain record');
   try {
     if (Object.getPrototypeOf(input) !== Object.prototype) throw new TypeError(label + ' contains a hostile prototype');
     const descriptors = Object.getOwnPropertyDescriptors(input);
     for (const key of Reflect.ownKeys(descriptors)) {
-      if (typeof key !== 'string') throw new TypeError(label + ' contains a symbol key');
+      if (typeof key !== 'string') {
+        if (options.allowSymbols === true) continue;
+        throw new TypeError(label + ' contains a symbol key');
+      }
       if (forbiddenQueryKeys.has(key)) throw new TypeError(label + ' contains a prototype-pollution key');
       const descriptor = descriptors[key];
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile object descriptor');
@@ -180,14 +197,17 @@ const inspectOwnedDataRecord = (input: unknown, label: string): OwnedDataRecord 
 
 const ownedDataValue = (descriptors: OwnedDataRecord, key: string): unknown => descriptors[key]?.value;
 
-const inspectOwnedArray = (input: unknown, label: string): readonly unknown[] => {
+const inspectOwnedArray = (input: unknown, label: string, options: OwnedInspectionOptions = {}): readonly unknown[] => {
   if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
   try {
     const descriptors = Object.getOwnPropertyDescriptors(input);
     const length = (Reflect.get(descriptors, 'length') as PropertyDescriptor | undefined)?.value;
     if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError(label + ' contains a hostile length');
     for (const key of Reflect.ownKeys(descriptors)) {
-      if (typeof key !== 'string') throw new TypeError(label + ' contains a symbol key');
+      if (typeof key !== 'string') {
+        if (options.allowSymbols === true) continue;
+        throw new TypeError(label + ' contains a symbol key');
+      }
       if (key === 'length' || /^(0|[1-9][0-9]*)$/.test(key)) continue;
       const descriptor = descriptors[key];
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
@@ -280,7 +300,10 @@ export const adoptQueryMaintenanceUpdate = (input: QueryMaintenanceUpdate): Quer
   });
 };
 
-export const adoptQueryRequest = (request: QueryRequest): QueryRequest => ({
-  root: cloneAndFreezeQueryAst(request.root),
-  ...adoptMaintenanceSnapshot(request)
-});
+export const adoptQueryRequest = (request: QueryRequest): QueryRequest => {
+  const descriptors = inspectOwnedDataRecord(request, 'Query request', { allowSymbols: true });
+  return Object.freeze({
+    root: cloneAndFreezeQueryAst(ownedDataValue(descriptors, 'root') as QueryNode),
+    ...adoptMaintenanceSnapshotDescriptors(descriptors)
+  });
+};

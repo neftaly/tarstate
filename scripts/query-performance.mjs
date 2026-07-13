@@ -276,7 +276,9 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const first = { relations: [input('distinct-high-cardinality', rows)] };
   const second = { relations: [input('distinct-high-cardinality', changedRows)] };
   const query = { kind: 'distinct', input: { kind: 'select', input: from('distinct-high-cardinality', 'row'), alias: 'value', fields: { key: field('row', 'key') } } };
-  const session = openIncrementalQueryMaintenance(await plan('distinct-high-cardinality', query), first);
+  const highCardinalityPlan = await plan('distinct-high-cardinality', query);
+  measurements.push(benchmark('distinct-high-cardinality-prepared-pure', rows.length, 5, () => evaluatePreparedQuery(highCardinalityPlan, first)));
+  const session = openIncrementalQueryMaintenance(highCardinalityPlan, first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
   measurements.push(benchmark('distinct-high-cardinality-hidden-update', rows.length, 200, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
@@ -649,6 +651,7 @@ const aggregatePure10k = measurement('aggregate', 10_000)?.millisecondsPerOperat
 const aggregateUpdate10k = measurement('aggregate-one-row-update', 10_000)?.millisecondsPerOperation;
 const distinctPure10k = measurement('distinct', 10_000)?.millisecondsPerOperation;
 const distinctUpdate10k = measurement('distinct-one-row-update', 10_000)?.millisecondsPerOperation;
+const highCardinalityDistinctPure = measurement('distinct-high-cardinality-prepared-pure', 10_001)?.millisecondsPerOperation;
 const highCardinalityDistinctUpdate = measurement('distinct-high-cardinality-hidden-update', 10_001)?.millisecondsPerOperation;
 const groupedReducerPure10k = measurement('aggregate-reducer-grouped', 10_000)?.millisecondsPerOperation;
 const groupedReducerUpdate10k = measurement('aggregate-reducer-grouped-one-row-update', 10_000)?.millisecondsPerOperation;
@@ -686,7 +689,7 @@ const contracts = {
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
   distinctIncrementalAdvantage: distinctPure10k !== undefined && distinctUpdate10k !== undefined && distinctUpdate10k < distinctPure10k * 0.5,
-  highCardinalityDistinctIncrementalAdvantage: highCardinalityDistinctUpdate !== undefined && distinctPure10k !== undefined && highCardinalityDistinctUpdate < distinctPure10k * 0.2,
+  highCardinalityDistinctIncrementalAdvantage: highCardinalityDistinctUpdate !== undefined && highCardinalityDistinctPure !== undefined && highCardinalityDistinctUpdate < highCardinalityDistinctPure * 0.2,
   groupedReducerIncrementalAdvantage: groupedReducerPure10k !== undefined && groupedReducerUpdate10k !== undefined && groupedReducerUpdate10k < groupedReducerPure10k * 0.5,
   ungroupedReducerIncrementalAdvantage: ungroupedReducerPure10k !== undefined && ungroupedReducerUpdate10k !== undefined && ungroupedReducerUpdate10k < ungroupedReducerPure10k * 0.5,
   groupedReducerOpenNearLinear: groupedReducerOpen1k !== undefined && groupedReducerOpen10k !== undefined && groupedReducerOpen10k < groupedReducerOpen1k * 15,
