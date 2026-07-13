@@ -1,7 +1,6 @@
 import { createIssue, type Issue } from './issues.js';
 import { sameOptionalJson } from './internal-query-equality.js';
 import {
-  groupRelationInputs,
   indexedRelationInputs,
   relationInputKey,
   type IndexedRelationInput
@@ -14,7 +13,8 @@ import type {
   QueryRecord,
   RelationInput,
   RelationInputChange,
-  RelationRowChange
+  RelationRowChange,
+  RelationUse
 } from './query-model.js';
 import type { JsonValue } from './value.js';
 
@@ -149,10 +149,8 @@ const rejectedMaintenanceUpdate = (reason: string, relationId?: string): Applied
   issues: [incrementalQueryIssue('query.incremental_identity_invalid', { reason, ...(relationId === undefined ? {} : { relationId }) })]
 });
 
-export const changedRelationIds = (snapshot: QueryMaintenanceSnapshot, identities: ReadonlySet<string>): readonly string[] => {
-  const byIdentity = groupRelationInputs(snapshot.relations);
-  return [...new Set([...identities].map((identity) => byIdentity.get(identity)?.[0]?.relation.relationId ?? identity.split('\u0000').at(-1) as string))].sort(comparePortableStrings);
-};
+export const changedRelationIds = (relations: readonly RelationUse[]): readonly string[] =>
+  [...new Set(relations.map(({ relationId }) => relationId))].sort(comparePortableStrings);
 
 const incrementalQueryIssue = (code: string, details: JsonValue): Issue => createIssue({
   code,

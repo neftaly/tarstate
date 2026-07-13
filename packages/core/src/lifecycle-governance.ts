@@ -1,9 +1,10 @@
 import { canonicalizeJson, isContentHash, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { stringTupleKey } from './internal-string-key.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
 import type { DocumentDeclaration, GovernanceReceipt, SourceLifecycleCommand, SourceLifecycleReceipt } from './receipts.js';
-import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
+import { type JsonValue, type PortableValue } from './value.js';
 
 export type CoordinatorOutcomeLookup<Receipt> =
   | { readonly status: 'known'; readonly receipt: Receipt }
@@ -90,9 +91,10 @@ export class SourceOperationLedger<Receipt> implements OperationLedgerProtocol<R
 
   rotateEpoch(nextEpoch: string): void {
     if (nextEpoch.length === 0 || nextEpoch === this.#activeEpoch || this.#retiredEpochs.has(nextEpoch)) throw new Error('Operation epoch must be new and non-empty');
-    if ([...this.#entries.entries()].some(([key, entry]) => key.startsWith(this.#activeEpoch + '\u0000') && entry.receipt === undefined)) throw new Error('Cannot retire an epoch with a pending operation');
+    const activeEpochPrefix = stringTupleKey(this.#activeEpoch);
+    if ([...this.#entries.entries()].some(([key, entry]) => key.startsWith(activeEpochPrefix) && entry.receipt === undefined)) throw new Error('Cannot retire an epoch with a pending operation');
     this.#retiredEpochs.add(this.#activeEpoch);
-    for (const key of this.#entries.keys()) if (key.startsWith(this.#activeEpoch + '\u0000')) this.#entries.delete(key);
+    for (const key of this.#entries.keys()) if (key.startsWith(activeEpochPrefix)) this.#entries.delete(key);
     this.#activeEpoch = nextEpoch;
   }
 }
@@ -176,9 +178,9 @@ export class SourceLifecycleCoordinator {
     const validated = validateLifecycleCommand(command, this.lifecycleCoordinatorId);
     const commandHash = validated.success
       ? await lifecycleCommandHash(command, this.authorityViewFingerprint)
-      : await invalidCommandHash('source-lifecycle', command.operationEpoch, command.operationId);
+      : await invalidCommandHash('source-lifecycle', commandIdentity(command, 'operationEpoch'), commandIdentity(command, 'operationId'));
     const reject = (issues: readonly Issue[], sourceId?: string): SourceLifecycleReceipt => lifecycleReceipt(command, commandHash, 'rejected', issues, sourceId);
-    if (!validated.success) return reject(validated.issues, command.request.action === 'delete' ? command.request.sourceId : undefined);
+    if (!validated.success) return reject(validated.issues);
     if (command.operationEpoch !== this.ledger.activeEpoch) return reject([coordinatorIssue('lifecycle.operation_epoch_expired', 'lifecycle', 'never')], command.request.action === 'delete' ? command.request.sourceId : undefined);
     let decision: AuthorityDecision;
     try { decision = await this.#authorize(command.request); }
@@ -320,9 +322,14 @@ export class GovernanceCoordinator {
   execute(command: GovernanceCommand, options: { readonly signal?: AbortSignal } = {}): Promise<GovernanceReceipt> {
     const ownedCommand = adoptCoordinatorCommand<GovernanceCommand>(command, 'Governance command');
     const signal = options.signal;
-    const prior = this.#queues.get(ownedCommand.sourceId) ?? Promise.resolve();
+    const sourceId = commandIdentity(ownedCommand, 'sourceId');
+    const prior = this.#queues.get(sourceId) ?? Promise.resolve();
     const run = prior.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }));
-    this.#queues.set(ownedCommand.sourceId, run.then(() => undefined, () => undefined));
+    const tail = run.then(() => undefined, () => undefined);
+    this.#queues.set(sourceId, tail);
+    void tail.then(() => {
+      if (this.#queues.get(sourceId) === tail) this.#queues.delete(sourceId);
+    });
     return run;
   }
 
@@ -343,7 +350,7 @@ export class GovernanceCoordinator {
     const validated = validateGovernanceCommand(command);
     const commandHash = validated.success
       ? await governanceCommandHash(command, this.authorityViewFingerprint)
-      : await invalidCommandHash('governance', command.operationEpoch, command.operationId);
+      : await invalidCommandHash('governance', commandIdentity(command, 'operationEpoch'), commandIdentity(command, 'operationId'));
     const selectedArtifactHashes = validated.success ? selectedHashes(command) : [];
     const reject = (issues: readonly Issue[], beforeBasis?: SourceBasis): GovernanceReceipt => governanceReceipt(command, commandHash, selectedArtifactHashes, 'rejected', issues, beforeBasis);
     if (!validated.success) return reject(validated.issues);
@@ -424,36 +431,71 @@ export const governanceCommandHash = (command: GovernanceCommand, authorityViewF
 } as unknown as JsonValue);
 
 const validateLifecycleCommand = (command: SourceLifecycleCommand, coordinatorId: string): ParseResult<SourceLifecycleCommand> => {
-  if (command.lifecycleCoordinatorId !== coordinatorId || command.operationEpoch.length === 0 || command.operationId.length === 0) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'identity' });
-  const portable = safeParseJsonValue(command.request);
-  if (!portable.success) return portable as ParseResult<SourceLifecycleCommand>;
+  if (command.lifecycleCoordinatorId !== coordinatorId || !nonEmptyString(command.operationEpoch) || !nonEmptyString(command.operationId)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'identity' });
+  if (!isCanonicalJson(command)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'canonical_json' });
+  if (!isPortableRecord(command.request)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'request' });
   if (command.request.action === 'create') {
-    if (!validCapability(command.request.sourceCapability)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'capability' });
-  } else if (command.request.sourceId.length === 0) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'source_id' });
-  return { success: true, value: command, issues: [] };
-};
-
-const validateGovernanceCommand = (command: GovernanceCommand): ParseResult<GovernanceCommand> => {
-  if (command.operationEpoch.length === 0 || command.operationId.length === 0 || command.sourceId.length === 0) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'identity' });
-  const portable = safeParseJsonValue(command as unknown);
-  if (!portable.success) return portable as ParseResult<GovernanceCommand>;
-  if (command.request.action === 'initialize_declaration' && !validDeclaration(command.request.declaration)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'declaration' });
-  if (command.request.action === 'activate_constraints' && !validConstraintSection(command.request.activation)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'activation' });
-  if (command.request.action === 'repair_declaration') {
-    const request = command.request;
-    const alternatives = request.alternatives.map((alternative) => canonicalizeJson(alternative as unknown as JsonValue));
-    if (request.selected.kind !== request.section || request.alternatives.length < 2 || new Set(alternatives).size !== alternatives.length || request.alternatives.some((alternative) => alternative.kind !== request.section || !validSection(alternative)) || !validSection(request.selected)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'repair_shape' });
-    const selected = canonicalizeJson(request.selected as unknown as JsonValue);
-    if (!request.alternatives.some((alternative) => canonicalizeJson(alternative as unknown as JsonValue) === selected)) return coordinatorFailure('governance.repair_selection_invalid', 'governance', { reason: 'selected_not_observed' });
+    if (!validCapability(command.request.sourceCapability) || !Object.hasOwn(command.request, 'input')) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'capability' });
+  } else if (command.request.action === 'delete') {
+    if (!nonEmptyString(command.request.sourceId)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'source_id' });
+  } else {
+    return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'action' });
   }
   return { success: true, value: command, issues: [] };
 };
 
-const validDeclaration = (value: DocumentDeclaration): boolean => value.formatVersion === 1 && validArtifactRef(value.storageSchema) && (value.projection.kind === 'storage-mapping' ? validArtifactRef(value.projection.storageMapping) : validCapability(value.projection.storageBinding)) && (value.constraints === undefined || (validArtifactRef(value.constraints.set) && (value.constraints.mode === 'audit' || value.constraints.mode === 'required')));
-const validSection = (value: GovernanceSection): boolean => value.kind === 'storage' ? validArtifactRef(value.storageSchema) && (value.projection.kind === 'storage-mapping' ? validArtifactRef(value.projection.storageMapping) : validCapability(value.projection.storageBinding)) : validConstraintSection(value);
-const validConstraintSection = (value: GovernanceConstraintSection): boolean => value.kind === 'constraints' && validArtifactRef(value.set) && (value.mode === 'audit' || value.mode === 'required');
-const validArtifactRef = (ref: ArtifactRef): boolean => ref.id.length > 0 && isContentHash(ref.contentHash);
-const validCapability = (ref: CapabilityRef): boolean => ref.id.length > 0 && ref.version.length > 0 && isContentHash(ref.contractHash);
+const validateGovernanceCommand = (command: GovernanceCommand): ParseResult<GovernanceCommand> => {
+  if (!nonEmptyString(command.operationEpoch) || !nonEmptyString(command.operationId) || !nonEmptyString(command.sourceId)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'identity' });
+  if (!isCanonicalJson(command)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'canonical_json' });
+  if (!Object.hasOwn(command, 'expectedBasis')) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'expected_basis' });
+  if (!isPortableRecord(command.request)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'request' });
+  if (command.request.action === 'initialize_declaration') {
+    if (!validDeclaration(command.request.declaration)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'declaration' });
+  } else if (command.request.action === 'activate_constraints') {
+    if (!validConstraintSection(command.request.activation)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'activation' });
+  } else if (command.request.action === 'repair_declaration') {
+    const request = command.request;
+    if ((request.section !== 'storage' && request.section !== 'constraints') || !Array.isArray(request.alternatives) || request.alternatives.length < 2 || !validSection(request.selected) || request.selected.kind !== request.section || request.alternatives.some((alternative) => !validSection(alternative) || alternative.kind !== request.section)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'repair_shape' });
+    const alternatives = request.alternatives.map((alternative) => canonicalizeJson(alternative as unknown as JsonValue));
+    if (new Set(alternatives).size !== alternatives.length) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'repair_shape' });
+    const selected = canonicalizeJson(request.selected as unknown as JsonValue);
+    if (!request.alternatives.some((alternative) => canonicalizeJson(alternative as unknown as JsonValue) === selected)) return coordinatorFailure('governance.repair_selection_invalid', 'governance', { reason: 'selected_not_observed' });
+  } else {
+    return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'action' });
+  }
+  return { success: true, value: command, issues: [] };
+};
+
+const validDeclaration = (value: unknown): value is DocumentDeclaration => {
+  if (!isPortableRecord(value) || value.formatVersion !== 1 || !validArtifactRef(value.storageSchema) || !validProjection(value.projection)) return false;
+  return value.constraints === undefined || (isPortableRecord(value.constraints) && validArtifactRef(value.constraints.set) && (value.constraints.mode === 'audit' || value.constraints.mode === 'required'));
+};
+
+const validProjection = (value: unknown): value is DocumentDeclaration['projection'] => isPortableRecord(value) && (
+  value.kind === 'storage-mapping'
+    ? validArtifactRef(value.storageMapping)
+    : value.kind === 'storage-binding' && validCapability(value.storageBinding)
+);
+
+const validSection = (value: unknown): value is GovernanceSection => {
+  if (!isPortableRecord(value)) return false;
+  if (value.kind === 'constraints') return validConstraintSection(value);
+  return value.kind === 'storage' && validArtifactRef(value.storageSchema) && validProjection(value.projection);
+};
+
+const validConstraintSection = (value: unknown): value is GovernanceConstraintSection => isPortableRecord(value) && value.kind === 'constraints' && validArtifactRef(value.set) && (value.mode === 'audit' || value.mode === 'required');
+const validArtifactRef = (value: unknown): value is ArtifactRef => isPortableRecord(value) && nonEmptyString(value.id) && isContentHash(value.contentHash);
+const validCapability = (value: unknown): value is CapabilityRef => isPortableRecord(value) && nonEmptyString(value.id) && nonEmptyString(value.version) && isContentHash(value.contractHash);
+const isPortableRecord = (value: unknown): value is Readonly<Record<string, JsonValue>> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const nonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+const isCanonicalJson = (value: JsonValue): boolean => {
+  try {
+    canonicalizeJson(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 const normalizeGovernanceRequest = (request: GovernanceCommand['request']): JsonValue => {
   if (request.action === 'initialize_declaration') return { action: request.action, declaration: normalizeDeclaration(request.declaration) } as unknown as JsonValue;
@@ -503,11 +545,11 @@ const selectedHashes = (command: GovernanceCommand): readonly ContentHash[] => {
 
 const lifecycleReceipt = (command: SourceLifecycleCommand, commandHash: ContentHash, outcome: SourceLifecycleReceipt['outcome'], issues: readonly Issue[], sourceId?: string, durability?: SourceLifecycleReceipt['durability']): SourceLifecycleReceipt => ownCoordinatorReceipt({
   kind: 'source-lifecycle', receiptVersion: 1,
-  lifecycleCoordinatorId: command.lifecycleCoordinatorId,
-  operationEpoch: command.operationEpoch,
-  operationId: command.operationId,
+  lifecycleCoordinatorId: commandIdentity(command, 'lifecycleCoordinatorId'),
+  operationEpoch: commandIdentity(command, 'operationEpoch'),
+  operationId: commandIdentity(command, 'operationId'),
   commandHash,
-  action: command.request.action,
+  action: lifecycleAction(command),
   ...(sourceId === undefined ? {} : { sourceId }),
   outcome,
   ...(durability === undefined ? {} : { durability }),
@@ -516,11 +558,11 @@ const lifecycleReceipt = (command: SourceLifecycleCommand, commandHash: ContentH
 
 const governanceReceipt = (command: GovernanceCommand, commandHash: ContentHash, selectedArtifactHashes: readonly ContentHash[], outcome: GovernanceReceipt['outcome'], issues: readonly Issue[], beforeBasis?: SourceBasis, afterBasis?: SourceBasis, durability?: GovernanceReceipt['durability']): GovernanceReceipt => ownCoordinatorReceipt({
   kind: 'governance', receiptVersion: 1,
-  operationEpoch: command.operationEpoch,
-  operationId: command.operationId,
+  operationEpoch: commandIdentity(command, 'operationEpoch'),
+  operationId: commandIdentity(command, 'operationId'),
   commandHash,
-  sourceId: command.sourceId,
-  action: command.request.action,
+  sourceId: commandIdentity(command, 'sourceId'),
+  action: governanceAction(command),
   outcome,
   ...(beforeBasis === undefined ? {} : { beforeBasis }),
   ...(afterBasis === undefined ? {} : { afterBasis }),
@@ -533,9 +575,21 @@ const coordinatorFailure = <Value>(code: string, phase: 'lifecycle' | 'governanc
 const coordinatorIssue = (code: string, phase: 'commit' | 'governance' | 'lifecycle' | 'resolve', retry: 'never' | 'after_input' | 'after_refresh' | 'after_authority' | 'query_outcome', details?: JsonValue): Issue => createIssue({ code, phase, severity: 'error', retry, ...(details === undefined ? {} : { details }) });
 const errorDetails = (error: unknown): JsonValue => ({ error: error instanceof Error ? error.name : typeof error });
 const invalidCommandHash = (kind: string, operationEpoch: string, operationId: string): Promise<ContentHash> => sha256Json({ kind, invalid: true, operationEpoch, operationId });
-const operationKey = (epoch: string, id: string): string => epoch + '\u0000' + id;
+const operationKey = (epoch: string, id: string): string => stringTupleKey(epoch, id);
 const sameBasis = (left: SourceBasis, right: SourceBasis): boolean => canonicalizeJson(left) === canonicalizeJson(right);
 const compare = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
+const commandIdentity = (command: unknown, member: string): string => {
+  if (!isPortableRecord(command)) return '<invalid>';
+  const value = command[member];
+  return nonEmptyString(value) && isCanonicalJson(value) ? value : '<invalid>';
+};
+const commandRequest = (command: unknown): Readonly<Record<string, JsonValue>> | undefined => isPortableRecord(command) && isPortableRecord(command.request) ? command.request : undefined;
+const lifecycleAction = (command: unknown): SourceLifecycleReceipt['action'] => commandRequest(command)?.action === 'delete' ? 'delete' : 'create';
+const governanceAction = (command: unknown): GovernanceReceipt['action'] => {
+  const action = commandRequest(command)?.action;
+  if (action === 'repair_declaration' || action === 'activate_constraints') return action;
+  return 'initialize_declaration';
+};
 
 const adoptCoordinatorCommand = <Command>(input: unknown, label: string): Command => {
   const owned = detachAndFreezeJsonValue(input);

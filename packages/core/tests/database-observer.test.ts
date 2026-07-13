@@ -247,6 +247,72 @@ describe('database membership and observation', () => {
     customView.close();
   });
 
+  it('reopens maintenance after a transient factory construction failure', () => {
+    const source = new TestSource('source:transient-maintenance', [{ id: 1, value: 'one' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(attachment('attachment:transient-maintenance', source));
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled', members: [member('attachment:transient-maintenance', source.sourceId)]
+    });
+    const working = createMaintenance(evaluate);
+    let factoryCalls = 0;
+    const database = new DatabaseView<Query, Row, readonly Row[]>({
+      authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
+      attachments: catalog, datasets: [dataset], canRead: () => true,
+      createQueryMaintenance: (input) => {
+        factoryCalls += 1;
+        if (factoryCalls === 1) throw new Error('temporarily unavailable');
+        return working(input);
+      }
+    });
+    const observer = database.observe({ plan: plan() });
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: { readiness: 'invalid', completeness: 'unknown' } });
+
+    source.publish({ rows: [{ id: 2, value: 'recovered' }] });
+    expect(factoryCalls).toBe(2);
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      readiness: 'ready', completeness: 'exact', rows: [{ id: 2, value: 'recovered' }]
+    } });
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
+  it('rejects ambiguous database dataset identities', () => {
+    const catalog = new AttachmentCatalog();
+    const first = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled' });
+    const second = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled' });
+    expect(() => view(catalog, [first, second])).toThrow(/different dataset membership/);
+  });
+
+  it('fails closed when a source snapshot claims a different source identity', () => {
+    const source = new TestSource('source:expected', [{ id: 1, value: 'must-not-project' }]);
+    const base = attachment('attachment:snapshot-mismatch', source);
+    const project = vi.fn(base.preparation.project);
+    const mismatchedSource = {
+      sourceId: source.sourceId,
+      snapshot: (): SourceSnapshot<{ readonly rows: readonly Row[] }> => ({ ...source.snapshot(), sourceId: 'source:other' }),
+      subscribe: (listener: () => void) => source.subscribe(listener)
+    };
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach({ ...base, source: mismatchedSource, preparation: { ...base.preparation, project } });
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one', state: 'settled', members: [member('attachment:snapshot-mismatch', source.sourceId)]
+    });
+    const database = view(catalog, [dataset]);
+    const observer = database.observe({ plan: plan() });
+
+    expect(project).not.toHaveBeenCalled();
+    expect(observer.getSnapshot()).toMatchObject({ state: 'open', current: {
+      readiness: 'incomplete', rows: [], completeness: 'unknown',
+      basis: { attachments: [] },
+      sourceStates: [{ state: 'missing', issues: [{ code: 'observer.membership_source_mismatch' }] }]
+    } });
+    observer.close();
+    database.close();
+    attachmentLease.close();
+  });
+
   it('rolls back a partially constructed dataset capture runtime', () => {
     const firstSource = new TestSource('source:subscription-first', []);
     const failingSource = new TestSource('source:subscription-failing', []);
@@ -2099,6 +2165,29 @@ describe('resource resolver', () => {
     expect(calls.mock.calls.filter(([uri]) => uri === 'mem:loading')).toHaveLength(2);
   });
 
+  it('rejects accessor and malformed integrity evidence from resolver drivers', async () => {
+    const getter = vi.fn(() => `sha256:${'a'.repeat(64)}`);
+    const resolver = new ResourceResolver({ authority: { permits: () => true } });
+    resolver.register('mem', {
+      resolve: async (reference) => ({
+        state: 'ready',
+        freshness: 'current',
+        value: 'unverified',
+        resolved: reference.uri.endsWith('accessor')
+          ? Object.defineProperty({ uri: reference.uri, kind: reference.kind }, 'integrity', { enumerable: true, get: getter }) as ResourceRef
+          : { uri: reference.uri, kind: reference.kind, integrity: 'not-a-content-hash' as `sha256:${string}` }
+      })
+    });
+
+    await expect(resolver.resolve({ uri: 'mem:accessor', kind: 'data' }, { authorityScope: 'public' })).resolves.toMatchObject({
+      state: 'failed', issues: [{ code: 'resolver.failed', details: { reason: 'invalid_driver_reference', field: 'resolved' } }]
+    });
+    await expect(resolver.resolve({ uri: 'mem:malformed', kind: 'data' }, { authorityScope: 'public' })).resolves.toMatchObject({
+      state: 'failed', issues: [{ code: 'resolver.failed', details: { reason: 'invalid_driver_reference', field: 'resolved' } }]
+    });
+    expect(getter).not.toHaveBeenCalled();
+  });
+
   it('scopes caches by authority, follows redirects, detects cycles, and never invokes denied drivers', async () => {
     const calls = vi.fn();
     const resolver = new ResourceResolver({ authority: { permits: (scope, reference) => scope === 'admin' || !reference.uri.includes('secret') } });
@@ -2124,6 +2213,88 @@ describe('resource resolver', () => {
     expect(await resolver.resolve({ uri: 'mem:secret', kind: 'data' }, { authorityScope: 'public' })).toMatchObject({ state: 'denied', issues: [{ code: 'resolver.authority_denied' }] });
     expect(calls).toHaveBeenCalledTimes(beforeDenied);
     expect(await resolver.resolve({ uri: 'mem:cycle-a', kind: 'data' }, { authorityScope: 'admin' })).toMatchObject({ state: 'failed', issues: [{ code: 'resolver.cycle' }] });
+  });
+
+  it('authorizes the final reference supplied by a driver before returning its value', async () => {
+    const permits = vi.fn((_scope: string, reference: ResourceRef) => reference.uri !== 'mem:forbidden');
+    const resolver = new ResourceResolver({ authority: { permits } });
+    resolver.register('mem', {
+      resolve: async () => ({
+        state: 'ready',
+        resolved: { uri: 'mem:forbidden', kind: 'data' },
+        freshness: 'current',
+        value: 'secret'
+      })
+    });
+
+    const result = await resolver.resolve({ uri: 'mem:allowed', kind: 'data' }, { authorityScope: 'public' });
+
+    expect(result).toMatchObject({
+      state: 'denied',
+      resolved: { uri: 'mem:forbidden' },
+      issues: [{ code: 'resolver.authority_denied' }]
+    });
+    expect(result).not.toHaveProperty('value');
+    expect(permits.mock.calls.map(([, reference]) => reference.uri)).toEqual(['mem:allowed', 'mem:forbidden']);
+  });
+
+  it('uses unambiguous authority-scoped cache keys', async () => {
+    const calls = vi.fn();
+    const resolver = new ResourceResolver({ authority: { permits: (scope) => scope === 'public' } });
+    resolver.register('mem', {
+      resolve: async (reference) => {
+        calls(reference);
+        return { state: 'ready', freshness: 'current', value: 'allowed' };
+      }
+    });
+    const firstReference: ResourceRef = { uri: 'mem:\u0000data\u0000secret', kind: 'bytes' };
+    const collidingScope = 'public\u0000bytes\u0000mem:';
+
+    expect(await resolver.resolve(firstReference, { authorityScope: 'public' })).toMatchObject({ state: 'ready', value: 'allowed' });
+    expect(await resolver.resolve({ uri: 'secret', kind: 'data' }, { authorityScope: collidingScope })).toMatchObject({
+      state: 'denied',
+      issues: [{ code: 'resolver.authority_denied' }]
+    });
+    expect(calls).toHaveBeenCalledOnce();
+  });
+
+  it('owns and freezes references and authority scope before asynchronous resolution', async () => {
+    let continueResolution: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { continueResolution = resolve; });
+    const firstDriverInput: { uri?: string; authorityScope?: string; referenceFrozen?: boolean; contextFrozen?: boolean } = {};
+    let calls = 0;
+    const resolver = new ResourceResolver({ authority: { permits: (scope) => scope === 'public' } });
+    resolver.register('mem', {
+      resolve: async (reference, context) => {
+        calls += 1;
+        if (calls === 1) {
+          await gate;
+          firstDriverInput.uri = reference.uri;
+          firstDriverInput.authorityScope = context.authorityScope;
+          firstDriverInput.referenceFrozen = Object.isFrozen(reference);
+          firstDriverInput.contextFrozen = Object.isFrozen(context);
+          return { state: 'redirect', target: { uri: 'mem:finish', kind: 'data' } };
+        }
+        return { state: 'ready', freshness: 'current', value: reference.uri };
+      }
+    });
+    const reference = { uri: 'mem:start', kind: 'data' as const };
+    const options = { authorityScope: 'public' };
+
+    const pending = resolver.resolve(reference, options);
+    reference.uri = 'mem:forbidden';
+    options.authorityScope = 'denied';
+    continueResolution?.();
+
+    await expect(pending).resolves.toMatchObject({
+      state: 'ready',
+      requested: { uri: 'mem:start' },
+      resolved: { uri: 'mem:finish' },
+      value: 'mem:finish'
+    });
+    expect(firstDriverInput).toEqual({
+      uri: 'mem:start', authorityScope: 'public', referenceFrozen: true, contextFrozen: true
+    });
   });
 
   it('keeps missing, stale, denied, failed, and deleted resource evidence distinct across alias chains', async () => {

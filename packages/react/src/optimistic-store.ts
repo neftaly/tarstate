@@ -29,6 +29,7 @@ type ActiveOptimisticOverlay = {
   readonly attachmentId: string;
   readonly sourceId: string;
   readonly sourceBasis: JsonValue;
+  readonly sourceBasisFingerprint: string;
   readonly definition: OptimisticOverlay<unknown, unknown>;
 };
 
@@ -69,8 +70,9 @@ export class OptimisticOverlayStore {
     // Validate the opaque basis now so projection callbacks never receive a
     // host-only or non-canonical value disguised as source evidence.
     let sourceBasis: JsonValue;
+    let sourceBasisFingerprint: string;
     try {
-      canonicalizeJson(definition.sourceBasis);
+      sourceBasisFingerprint = canonicalizeJson(definition.sourceBasis);
       sourceBasis = deepFreezeClone(definition.sourceBasis);
     } catch (error) {
       return { phase: 'source-basis', ...errorDetails(error) };
@@ -82,6 +84,7 @@ export class OptimisticOverlayStore {
       attachmentId: attempt.attachmentId,
       sourceId: definition.sourceId,
       sourceBasis,
+      sourceBasisFingerprint,
       definition
     });
     this.#changed();
@@ -99,6 +102,16 @@ export class OptimisticOverlayStore {
     let resultKeys = authoritative.current.resultKeys;
     const operations: OptimisticOperationEvidence[] = [];
     const failures: [ActiveOptimisticOverlay, OptimisticUpdateError][] = [];
+    const attachments = new Map<string, Map<string, JsonValue>>();
+    for (const attachment of authoritative.current.basis.attachments) {
+      let sources = attachments.get(attachment.attachmentId);
+      if (sources === undefined) {
+        sources = new Map();
+        attachments.set(attachment.attachmentId, sources);
+      }
+      sources.set(attachment.sourceId, attachment.basis);
+    }
+    const observedBasisFingerprints = new Map<JsonValue, string>();
     for (const overlay of this.#overlays.values()) {
       const definition = overlay.definition as OptimisticOverlay<Query, Row>;
       if (definition.appliesToQuery !== undefined) {
@@ -111,10 +124,14 @@ export class OptimisticOverlayStore {
         }
         if (!applies) continue;
       }
-      const source = authoritative.current.basis.attachments.find((candidate) => candidate.attachmentId === overlay.attachmentId && candidate.sourceId === overlay.sourceId);
-      if (source === undefined) continue;
-      const observedBasis = source.basis;
-      const rebased = canonicalizeJson(observedBasis) !== canonicalizeJson(overlay.sourceBasis);
+      const observedBasis = attachments.get(overlay.attachmentId)?.get(overlay.sourceId);
+      if (observedBasis === undefined) continue;
+      let observedBasisFingerprint = observedBasisFingerprints.get(observedBasis);
+      if (observedBasisFingerprint === undefined) {
+        observedBasisFingerprint = canonicalizeJson(observedBasis);
+        observedBasisFingerprints.set(observedBasis, observedBasisFingerprint);
+      }
+      const rebased = observedBasisFingerprint !== overlay.sourceBasisFingerprint;
       let candidate: OptimisticProjection<Row>;
       try {
         candidate = definition.projectRows({ request, authoritativeSnapshot: authoritative, currentRows: rows, currentResultKeys: resultKeys, sourceBasis: overlay.sourceBasis, observedBasis, rebased });

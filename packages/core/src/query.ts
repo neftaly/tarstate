@@ -1,4 +1,5 @@
 import type { PreparedPlan } from './maintenance.js';
+export { capabilityRefKey } from './issues.js';
 import { assertPreparedPlan, hasOwnedPreparedQuery } from './internal-prepared-plan.js';
 import {
   adoptFunctionRegistry,
@@ -179,7 +180,7 @@ export const openIncrementalQueryMaintenance = (
             graph.nodes.length,
             updatedNodeCount,
             changedNodes.size,
-            changedRelationIds(nextSnapshot, changedRelations),
+            changedRelationIds(ownedUpdate.relations.map(({ relation }) => relation)),
             diffMaintainedResults(assertedRoot, root, valueIdentities),
             revision,
             rejectedUpdateCount,
@@ -611,7 +612,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
       }
     }
     acceptedSnapshot = nextSnapshot;
-    const changedIds = changedRelationIds(nextSnapshot, changedRelations);
+    const changedIds = changedRelationIds(update.relations.map(({ relation }) => relation));
     for (const root of roots) {
       const nextRoot = materialized.get(root.root);
       const rootChangedNodeCount = rootChangedCounts.get(root) ?? 0;

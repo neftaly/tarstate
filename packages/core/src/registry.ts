@@ -1,5 +1,5 @@
 import { canonicalizeJson, isContentHash, sha256Json, type ContentHash } from './artifacts.js';
-import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { capabilityRefKey, createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { JsonValue } from './value.js';
@@ -22,8 +22,6 @@ export type CapabilityImplementation = {
   readonly integrity: string;
   readonly implementation: unknown;
 };
-
-const refKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
 
 export const capabilityRefFor = async (declaration: CapabilityDeclaration): Promise<CapabilityRef> => ({
   id: declaration.id,
@@ -48,9 +46,12 @@ export class CapabilityRegistry {
     if (!parsed.success) return parsed;
     const ownedDeclaration = parsed.value;
     const ref = Object.freeze(await capabilityRefFor(ownedDeclaration));
-    const key = refKey(ref);
-    const identityKey = ownedDeclaration.id + '\u0000' + ownedDeclaration.version;
-    const conflicting = [...this.#declarations.entries()].find(([candidateKey, candidate]) => candidateKey.startsWith(identityKey + '\u0000') && canonicalizeJson(candidate as unknown as JsonValue) !== canonicalizeJson(ownedDeclaration as unknown as JsonValue));
+    const key = capabilityRefKey(ref);
+    const conflicting = [...this.#declarations.values()].find((candidate) =>
+      candidate.id === ownedDeclaration.id
+      && candidate.version === ownedDeclaration.version
+      && canonicalizeJson(candidate as unknown as JsonValue) !== canonicalizeJson(ownedDeclaration as unknown as JsonValue)
+    );
     if (conflicting !== undefined) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', details: { id: ownedDeclaration.id, version: ownedDeclaration.version } })] };
     if (this.#declarations.has(key)) return { success: true, value: ref, issues: [] };
     this.#declarations.set(key, ownedDeclaration);
@@ -69,7 +70,7 @@ export class CapabilityRegistry {
     const ref = parseCapabilityRef(detachedRef.value);
     if (ref === undefined || typeof implementation.integrity !== 'string' || implementation.integrity.length === 0) return invalidCapability('implementation_shape');
     const ownedImplementation = Object.freeze({ ref, integrity: implementation.integrity, implementation: implementation.implementation });
-    const key = refKey(ref);
+    const key = capabilityRefKey(ref);
     if (!this.#declarations.has(key)) return { success: false, issues: [createIssue({ code: 'capability.missing', retry: 'after_capability', requiredCapabilities: [ref] })] };
     const previous = this.#implementations.get(key);
     if (previous !== undefined && previous.integrity !== ownedImplementation.integrity) return { success: false, issues: [createIssue({ code: 'capability.registry_conflict', retry: 'after_capability', requiredCapabilities: [ref] })] };
@@ -80,11 +81,11 @@ export class CapabilityRegistry {
     return { success: true, value: ownedImplementation, issues: [] };
   }
 
-  declaration(ref: CapabilityRef): CapabilityDeclaration | undefined { return this.#declarations.get(refKey(ref)); }
-  implementation(ref: CapabilityRef): CapabilityImplementation | undefined { return this.#implementations.get(refKey(ref)); }
+  declaration(ref: CapabilityRef): CapabilityDeclaration | undefined { return this.#declarations.get(capabilityRefKey(ref)); }
+  implementation(ref: CapabilityRef): CapabilityImplementation | undefined { return this.#implementations.get(capabilityRefKey(ref)); }
 
   satisfies(required: CapabilityRef): boolean {
-    const target = refKey(required);
+    const target = capabilityRefKey(required);
     if (this.#implementations.has(target)) return true;
     for (const implemented of this.#implementations.keys()) if (this.#implies(implemented, target, new Set())) return true;
     return false;
@@ -105,7 +106,7 @@ export class CapabilityRegistry {
     if (visited.has(from)) return false;
     visited.add(from);
     const declaration = this.#declarations.get(from);
-    return declaration?.implies.some((ref) => this.#implies(refKey(ref), target, visited)) ?? false;
+    return declaration?.implies.some((ref) => this.#implies(capabilityRefKey(ref), target, visited)) ?? false;
   }
 
   #findCycle(): readonly string[] | undefined {
@@ -118,7 +119,7 @@ export class CapabilityRegistry {
       visiting.add(key);
       path.push(key);
       for (const implied of this.#declarations.get(key)?.implies ?? []) {
-        const cycle = visit(refKey(implied));
+        const cycle = visit(capabilityRefKey(implied));
         if (cycle !== undefined) return cycle;
       }
       path.pop();
@@ -141,8 +142,8 @@ const parseCapabilityDeclaration = (value: JsonValue): ParseResult<CapabilityDec
   const seen = new Set<string>();
   for (const candidate of value.implies) {
     const ref = parseCapabilityRef(candidate);
-    if (ref === undefined || seen.has(refKey(ref))) return invalidCapability(ref === undefined ? 'implication_shape' : 'duplicate_implication');
-    seen.add(refKey(ref));
+    if (ref === undefined || seen.has(capabilityRefKey(ref))) return invalidCapability(ref === undefined ? 'implication_shape' : 'duplicate_implication');
+    seen.add(capabilityRefKey(ref));
     implies.push(ref);
   }
   return {

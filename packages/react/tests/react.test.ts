@@ -567,6 +567,39 @@ describe('@tarstate/react', () => {
     expect(states.at(-1)).toMatchObject({ pendingCount: 0, mutations: [{ state: 'failed', error: { message: 'Commit receipt identity does not match its transaction attempt' } }] });
   });
 
+  it('owns transaction attempts before an asynchronous commit handoff', async () => {
+    const database = new TestDatabase();
+    const states: MutationState[] = [];
+    let resolveCommit: ((receipt: CommitReceipt) => void) | undefined;
+    let received: TransactionAttempt | undefined;
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); states.push(useMutationState()); return null; };
+    await mount(createElement(TarstateProvider, {
+      database,
+      executeCommit: (attempt) => {
+        received = attempt;
+        return new Promise<CommitReceipt>((resolve) => { resolveCommit = resolve; });
+      }
+    }, createElement(Consumer)));
+    const caller = transactionAttempt() as TransactionAttempt & {
+      operationId: string;
+      transaction: { id: string; contentHash: string };
+    };
+    let result: Promise<CommitReceipt> | undefined;
+    await act(() => { result = commit?.(caller); });
+
+    caller.operationId = 'operation:mutated';
+    caller.transaction.contentHash = 'sha256:mutated';
+    expect(received).toMatchObject({ operationId: 'operation:one', transaction: { contentHash: 'sha256:transaction' } });
+    expect(Object.isFrozen(received)).toBe(true);
+    expect(Object.isFrozen(received?.transaction)).toBe(true);
+    await act(async () => {
+      resolveCommit?.(commitReceipt());
+      await result;
+    });
+    expect(states.at(-1)).toMatchObject({ pendingCount: 0, mutations: [{ operationId: 'operation:one', state: 'settled' }] });
+  });
+
   it('drops overlays with the owning provider runtime without owning observer or database lifecycle', async () => {
     const database = new TestDatabase();
     const project = vi.fn(({ currentRows }: { readonly currentRows: readonly Row[] }) => ({ rows: currentRows.map((row) => ({ ...row, name: row.name + '+pending' })), resultKeys: currentRows.map(({ id }) => 'row:' + id) }));

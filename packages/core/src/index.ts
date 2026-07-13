@@ -17,6 +17,7 @@ export * from './memory-source.js';
 export * from './observer.js';
 export type { ObserverDiagnostic, ObserverDiagnosticReporter } from './observer-diagnostics.js';
 export {
+  capabilityRefKey,
   diffQueryMaintenanceSnapshots,
   evaluateExpression,
   evaluatePreparedExpression,

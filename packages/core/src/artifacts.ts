@@ -1,5 +1,6 @@
 import { createIssue, TarstateParseError, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { stringTupleKey } from './internal-string-key.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
 
 export const artifactKinds = ['schema', 'query', 'transaction', 'constraint-set', 'storage-mapping', 'schema-lens', 'issue-code-catalog'] as const;
@@ -72,7 +73,7 @@ export const normalizeDependencies = (dependencies: readonly ArtifactRef[]): Par
       return { success: false, issues: [createIssue({ code: 'artifact.dependency_ambiguous', retry: 'after_input', details: { id: dependency.id, hashes: [previousHash, dependency.contentHash].sort(compareUnicodeScalars) } })] };
     }
     byId.set(dependency.id, dependency.contentHash);
-    byPair.set(dependency.id + '\u0000' + dependency.contentHash, normalizeArtifactRef(dependency));
+    byPair.set(stringTupleKey(dependency.id, dependency.contentHash), normalizeArtifactRef(dependency));
   }
   return {
     success: true,

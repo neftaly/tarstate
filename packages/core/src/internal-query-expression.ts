@@ -1,4 +1,4 @@
-import { createIssue, type Issue } from './issues.js';
+import { capabilityRefKey, createIssue, type CapabilityRef, type Issue } from './issues.js';
 import { assertPreparedExpression, sealPreparedExpression } from './internal-prepared-expression.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import {
@@ -56,8 +56,14 @@ export type QueryExpressionContext = {
   readonly runtimeState?: unknown;
 };
 
-const capabilityKey = (ref: { readonly id: string; readonly version: string; readonly contractHash: string }): string =>
+const legacyCapabilityRefKey = (ref: CapabilityRef): string =>
   ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
+
+const queryFunction = (functions: FunctionRegistry, ref: CapabilityRef) =>
+  functions.get(capabilityRefKey(ref))
+  ?? (ref.id.includes('\u0000') || ref.version.includes('\u0000') || ref.contractHash.includes('\u0000')
+    ? undefined
+    : functions.get(legacyCapabilityRefKey(ref)));
 
 const publicExpressionValue = (result: QueryExpressionResult): EvaluationValue => {
   if (result.status === 'known') return adoptJsonValue(result.value, 'Query expression result');
@@ -226,7 +232,7 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
     return values[0] === logicalUnknown ? { status: 'unknown' } : knownExpression(values[0] as JsonValue);
   }
   if (expression.kind === 'call') {
-    const fn = context.functions.get(capabilityKey(expression.capability));
+    const fn = queryFunction(context.functions, expression.capability);
     if (fn === undefined) {
       context.issues.push(createIssue({ code: 'query.capability_unavailable', retry: 'after_capability', requiredCapabilities: [expression.capability] }));
       return { status: 'unavailable' };

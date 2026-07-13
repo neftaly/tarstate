@@ -1,4 +1,4 @@
-import type { HostRuntimeRegistry, RuntimeLease } from './host.js';
+import { createRuntimeKind, type HostRuntimeRegistry, type RuntimeKind, type RuntimeLease } from './host.js';
 import { createIssue, type Issue } from './issues.js';
 import {
   notifyObservers,
@@ -59,6 +59,7 @@ export type ExternalStoreCommitResult<Result> =
 // Incarnations only need process-local uniqueness. Runtime ownership and
 // source-identity conflict detection live in HostRuntimeRegistry, not here.
 let nextIncarnation = 1;
+const externalStoreRuntimeKind = createRuntimeKind<ExternalStoreRuntime<unknown>>();
 
 export class ExternalStoreRuntime<State> {
   readonly sourceId: string;
@@ -292,6 +293,9 @@ export const acquireExternalStoreRuntime = <State>(options: {
   const hostLease: RuntimeLease<ExternalStoreRuntime<State>> = options.registry.acquire({
     sourceId: options.sourceId,
     identity: options.storeIdentity,
+    // Store identity already establishes State; the shared token prevents a
+    // different runtime family from occupying that source slot.
+    kind: externalStoreRuntimeKind as unknown as RuntimeKind<ExternalStoreRuntime<State>>,
     create: () => {
       const diagnosticOptions = options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic };
       const runtime = new ExternalStoreRuntime(options.sourceId, options.store, diagnosticOptions);

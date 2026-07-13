@@ -91,6 +91,31 @@ describe('production external-store adapter', () => {
     expect(finishes.size).toBe(0);
   });
 
+  it('rolls back partial hydration subscriptions and attempts every cleanup', () => {
+    const store = createPersistedZustand();
+    const stopStart = vi.fn();
+    const failed = zustandAtomicExternalStore(store, {
+      hydration: {
+        hasHydrated: () => false,
+        onHydrate: () => stopStart,
+        onFinishHydration: () => { throw new Error('finish registration failed'); }
+      }
+    });
+    expect(() => failed.hydration?.subscribe(() => undefined)).toThrow('finish registration failed');
+    expect(stopStart).toHaveBeenCalledOnce();
+
+    const stopFinish = vi.fn();
+    const cleanupFailure = zustandAtomicExternalStore(store, {
+      hydration: {
+        hasHydrated: () => false,
+        onHydrate: () => () => { throw new Error('start cleanup failed'); },
+        onFinishHydration: () => stopFinish
+      }
+    });
+    expect(() => cleanupFailure.hydration?.subscribe(() => undefined)()).toThrow('start cleanup failed');
+    expect(stopFinish).toHaveBeenCalledOnce();
+  });
+
   it('tracks real Zustand persistence hydration even when hydrated data equals initial state', async () => {
     const store = createPersistedZustand();
     const external = zustandAtomicExternalStore(store, { hydration: store.persist });

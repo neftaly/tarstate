@@ -1,4 +1,5 @@
 import * as Automerge from '@automerge/automerge';
+import { canonicalizeJson, isContentHash, type ContentHash } from '@tarstate/core/artifacts';
 import {
   reportAutomergeDiagnostic,
   runAutomergeCleanups,
@@ -33,7 +34,7 @@ type AutomergeSourceCommitEvidence = {
   readonly kind: 'source-commit';
   readonly operationEpoch: string;
   readonly operationId: string;
-  readonly intentHash: `sha256:${string}`;
+  readonly intentHash: ContentHash;
   readonly durability: 'local';
   readonly issues: readonly AutomergeSourceIssue[];
 };
@@ -59,14 +60,14 @@ export type AutomergeSourceOutcomeLookup =
   | { readonly status: 'ambiguous' | 'expired' };
 
 type LedgerEntry = {
-  readonly intentHash: `sha256:${string}`;
+  readonly intentHash: ContentHash;
   readonly result: AutomergeSourceCommitResult;
 };
 
 type AutomergeSourceCommitInput<T extends object> = {
   readonly operationEpoch: string;
   readonly operationId: string;
-  readonly intentHash: `sha256:${string}`;
+  readonly intentHash: ContentHash;
   readonly expectedBasis: AutomergeBasis;
   readonly commands: readonly AutomergeSourceCommand<T>[];
   readonly message?: string;
@@ -141,7 +142,7 @@ export class AutomergeSourceRuntime<T extends object> {
   #applying = false;
   #queue: Promise<void> = Promise.resolve();
   readonly #listeners = new Set<(change: AutomergeSourceChange) => void>();
-  readonly #ledger = new Map<string, LedgerEntry>();
+  readonly #ledger = new Map<string, Map<string, LedgerEntry>>();
   readonly #retiredEpochs = new Set<string>();
 
   constructor(options: AutomergeSourceRuntimeOptions<T>) {
@@ -194,21 +195,27 @@ export class AutomergeSourceRuntime<T extends object> {
   queryOutcome(input: {
     readonly operationEpoch: string;
     readonly operationId: string;
-    readonly intentHash: `sha256:${string}`;
+    readonly intentHash: ContentHash;
   }): AutomergeSourceOutcomeLookup {
-    if (this.#retiredEpochs.has(input.operationEpoch)) return Object.freeze({ status: 'expired' });
-    const entry = this.#ledger.get(ledgerKey(input.operationEpoch, input.operationId));
+    const identity = adoptOperationIdentity(input, 'Automerge outcome query');
+    if (this.#retiredEpochs.has(identity.operationEpoch)) return Object.freeze({ status: 'expired' });
+    const entry = this.#ledger.get(identity.operationEpoch)?.get(identity.operationId);
     if (entry === undefined) return Object.freeze({ status: 'not_seen' });
-    if (entry.intentHash !== input.intentHash) return Object.freeze({ status: 'ambiguous' });
+    if (entry.intentHash !== identity.intentHash) return Object.freeze({ status: 'ambiguous' });
     return Object.freeze({ status: 'known', result: entry.result });
   }
 
   /** Retires one application-owned operation epoch after its in-flight work. */
   retireOperationEpoch(operationEpoch: string): Promise<void> {
-    if (operationEpoch.length === 0) return Promise.reject(new TypeError('operationEpoch must not be empty'));
+    let ownedOperationEpoch: string;
+    try {
+      ownedOperationEpoch = adoptIdentifier(operationEpoch, 'Automerge operationEpoch');
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const result = this.#queue.then(() => {
-      this.#retiredEpochs.add(operationEpoch);
-      for (const key of this.#ledger.keys()) if (key.startsWith(operationEpoch + '\u0000')) this.#ledger.delete(key);
+      this.#retiredEpochs.add(ownedOperationEpoch);
+      this.#ledger.delete(ownedOperationEpoch);
     });
     this.#queue = result.then(() => undefined, () => undefined);
     return result;
@@ -245,8 +252,7 @@ export class AutomergeSourceRuntime<T extends object> {
   async #commit(input: AutomergeSourceCommitInput<T>): Promise<AutomergeSourceCommitResult> {
     if (this.#closed) return this.#rejected(input, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
     if (this.#retiredEpochs.has(input.operationEpoch)) return this.#rejected(input, undefined, [{ code: 'transaction.operation_epoch_expired', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
-    const key = ledgerKey(input.operationEpoch, input.operationId);
-    const known = this.#ledger.get(key);
+    const known = this.#ledger.get(input.operationEpoch)?.get(input.operationId);
     if (known !== undefined) {
       if (known.intentHash === input.intentHash) return known.result;
       return this.#rejected(input, undefined, [{
@@ -269,7 +275,7 @@ export class AutomergeSourceRuntime<T extends object> {
         operationId: input.operationId,
         details: { expectedBasis, actualBasis: beforeBasis }
       }]);
-      this.#ledger.set(key, { intentHash: input.intentHash, result: rejected });
+      this.#retainOutcome(input, rejected);
       return rejected;
     }
 
@@ -299,7 +305,7 @@ export class AutomergeSourceRuntime<T extends object> {
           ? { expectedBasis, actualBasis }
           : { message: failure instanceof Error ? failure.message : String(failure) }
       }]);
-      this.#ledger.set(key, { intentHash: input.intentHash, result: rejected });
+      this.#retainOutcome(input, rejected);
       this.#install(actual, 'handle');
       return rejected;
     }
@@ -318,7 +324,7 @@ export class AutomergeSourceRuntime<T extends object> {
       durability: 'local',
       issues: []
     });
-    this.#ledger.set(key, { intentHash: input.intentHash, result: committed });
+    this.#retainOutcome(input, committed);
     this.#install(staged, 'commit');
     return committed;
   }
@@ -331,8 +337,20 @@ export class AutomergeSourceRuntime<T extends object> {
     this.#notify({ beforeBasis, afterBasis, origin });
   }
 
+  #retainOutcome(
+    identity: OperationIdentity,
+    result: AutomergeSourceCommitResult
+  ): void {
+    let epoch = this.#ledger.get(identity.operationEpoch);
+    if (epoch === undefined) {
+      epoch = new Map();
+      this.#ledger.set(identity.operationEpoch, epoch);
+    }
+    epoch.set(identity.operationId, { intentHash: identity.intentHash, result });
+  }
+
   #rejected(
-    input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: `sha256:${string}` },
+    input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash },
     beforeBasis: AutomergeBasis | undefined,
     issues: readonly AutomergeSourceIssue[]
   ): AutomergeSourceCommitResult {
@@ -370,6 +388,7 @@ const ownCommitResult = (result: AutomergeSourceCommitResult): AutomergeSourceCo
   cloneAndFreezeEvidence(result) as AutomergeSourceCommitResult;
 
 type DataDescriptors = Readonly<Record<string, PropertyDescriptor>>;
+const automergeHeadPattern = /^[0-9a-f]{64}$/;
 
 const inspectCommitRecord = (input: unknown, label: string): DataDescriptors => {
   if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new TypeError(label + ' must be a record');
@@ -379,8 +398,13 @@ const inspectCommitRecord = (input: unknown, label: string): DataDescriptors => 
 const commitDataValue = (descriptors: DataDescriptors, key: string, label: string): unknown => {
   const descriptor = descriptors[key];
   if (descriptor === undefined) return undefined;
-  if (!('value' in descriptor)) throw new TypeError(label + ' ' + key + ' has a hostile property descriptor');
+  if (!descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' ' + key + ' has a hostile property descriptor');
   return descriptor.value;
+};
+
+const requiredCommitDataValue = (descriptors: DataDescriptors, key: string, label: string): unknown => {
+  if (descriptors[key] === undefined) throw new TypeError(label + ' must have an enumerable data property ' + key);
+  return commitDataValue(descriptors, key, label);
 };
 
 const inspectCommitArray = (input: unknown, label: string): readonly unknown[] => {
@@ -399,31 +423,68 @@ const inspectCommitArray = (input: unknown, label: string): readonly unknown[] =
 
 const ownBasisEvidence = (input: AutomergeBasis): AutomergeBasis => {
   const descriptors = inspectCommitRecord(input, 'Automerge expectedBasis');
-  const heads = inspectCommitArray(commitDataValue(descriptors, 'heads', 'Automerge expectedBasis'), 'Automerge expectedBasis heads');
-  if (heads.some((head) => typeof head !== 'string')) throw new TypeError('Automerge expectedBasis heads must be strings');
+  const kind = requiredCommitDataValue(descriptors, 'kind', 'Automerge expectedBasis');
+  if (kind !== 'automerge-heads') throw new TypeError('Automerge expectedBasis kind must be automerge-heads');
+  const heads = inspectCommitArray(requiredCommitDataValue(descriptors, 'heads', 'Automerge expectedBasis'), 'Automerge expectedBasis heads');
+  if (heads.some((head) => typeof head !== 'string' || !automergeHeadPattern.test(head))) {
+    throw new TypeError('Automerge expectedBasis heads must be canonical Automerge hashes');
+  }
+  if (new Set(heads).size !== heads.length) throw new TypeError('Automerge expectedBasis heads must be unique');
   return Object.freeze({
-    kind: commitDataValue(descriptors, 'kind', 'Automerge expectedBasis') as AutomergeBasis['kind'],
+    kind,
     heads: Object.freeze(heads as string[])
   });
 };
 
+type OperationIdentity = {
+  readonly operationEpoch: string;
+  readonly operationId: string;
+  readonly intentHash: ContentHash;
+};
+
+const adoptIdentifier = (input: unknown, label: string): string => {
+  if (typeof input !== 'string' || input.length === 0) throw new TypeError(label + ' must be a non-empty string');
+  try {
+    canonicalizeJson(input);
+  } catch {
+    throw new TypeError(label + ' must contain only Unicode scalar values');
+  }
+  return input;
+};
+
+const adoptOperationIdentity = (input: unknown, label: string): OperationIdentity => {
+  const descriptors = inspectCommitRecord(input, label);
+  return adoptOperationIdentityDescriptors(descriptors, label);
+};
+
+const adoptOperationIdentityDescriptors = (descriptors: DataDescriptors, label: string): OperationIdentity => {
+  const operationEpoch = adoptIdentifier(requiredCommitDataValue(descriptors, 'operationEpoch', label), label + ' operationEpoch');
+  const operationId = adoptIdentifier(requiredCommitDataValue(descriptors, 'operationId', label), label + ' operationId');
+  const intentHash = requiredCommitDataValue(descriptors, 'intentHash', label);
+  if (!isContentHash(intentHash)) throw new TypeError(label + ' intentHash must be a canonical SHA-256 content hash');
+  return Object.freeze({ operationEpoch, operationId, intentHash });
+};
+
 const adoptCommitInput = <T extends object>(input: AutomergeSourceCommitInput<T>): AutomergeSourceCommitInput<T> => {
   const descriptors = inspectCommitRecord(input, 'Automerge commit input');
-  const commands = inspectCommitArray(commitDataValue(descriptors, 'commands', 'Automerge commit input'), 'Automerge commit commands')
+  const identity = adoptOperationIdentityDescriptors(descriptors, 'Automerge commit input');
+  const commands = inspectCommitArray(requiredCommitDataValue(descriptors, 'commands', 'Automerge commit input'), 'Automerge commit commands')
     .map((command, index): AutomergeSourceCommand<T> => {
       const commandDescriptors = inspectCommitRecord(command, 'Automerge commit command ' + String(index));
       const description = commitDataValue(commandDescriptors, 'description', 'Automerge commit command ' + String(index));
+      const apply = requiredCommitDataValue(commandDescriptors, 'apply', 'Automerge commit command ' + String(index));
+      if (description !== undefined && typeof description !== 'string') throw new TypeError('Automerge commit command description must be a string');
+      if (typeof apply !== 'function') throw new TypeError('Automerge commit command apply must be a function');
       return Object.freeze({
         ...(description === undefined ? {} : { description: description as string }),
-        apply: commitDataValue(commandDescriptors, 'apply', 'Automerge commit command ' + String(index)) as Automerge.ChangeFn<T>
+        apply: apply as Automerge.ChangeFn<T>
       });
     });
   const message = commitDataValue(descriptors, 'message', 'Automerge commit input');
+  if (message !== undefined && typeof message !== 'string') throw new TypeError('Automerge commit input message must be a string');
   return Object.freeze({
-    operationEpoch: commitDataValue(descriptors, 'operationEpoch', 'Automerge commit input') as string,
-    operationId: commitDataValue(descriptors, 'operationId', 'Automerge commit input') as string,
-    intentHash: commitDataValue(descriptors, 'intentHash', 'Automerge commit input') as `sha256:${string}`,
-    expectedBasis: ownBasisEvidence(commitDataValue(descriptors, 'expectedBasis', 'Automerge commit input') as AutomergeBasis),
+    ...identity,
+    expectedBasis: ownBasisEvidence(requiredCommitDataValue(descriptors, 'expectedBasis', 'Automerge commit input') as AutomergeBasis),
     commands: Object.freeze(commands),
     ...(message === undefined ? {} : { message: message as string })
   });
@@ -472,8 +533,6 @@ export type AutomergeSourceRuntimeApi<T extends object> = Omit<
   AutomergeSourceRuntime<T>,
   'merge' | 'replace'
 >;
-
-const ledgerKey = (operationEpoch: string, operationId: string): string => operationEpoch + '\u0000' + operationId;
 
 const memoryDocumentOwner = <T extends object>(initial: Automerge.Doc<T>): DocumentOwner<T> => {
   let doc = initial;

@@ -1,6 +1,7 @@
-import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
+import { type JsonValue, type PortableValue } from './value.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { isContentHash, safeParseJsonText, type ArtifactParseBudget, type ArtifactRef, type ContentHash } from './artifacts.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import type { SourceBasis } from './maintenance.js';
 import type { CommitReceipt, NonAtomicBatchReceipt } from './transaction.js';
 
@@ -82,7 +83,7 @@ export type KnownReceipt = CommitReceipt | NonAtomicBatchReceipt | SourceLifecyc
 export type ForwardableReceipt = KnownReceipt | UnknownReceipt;
 
 export const safeParseReceipt = (input: unknown): ParseResult<ForwardableReceipt> => {
-  const parsed = safeParseJsonValue(input);
+  const parsed = detachAndFreezeJsonValue(input);
   if (!parsed.success) return parsed;
   if (!isRecord(parsed.value)) return receiptFailure('receipt.invalid', { reason: 'not_record' });
   const kind = parsed.value.kind;
@@ -92,7 +93,13 @@ export const safeParseReceipt = (input: unknown): ParseResult<ForwardableReceipt
     return { success: true, value: parsed.value as unknown as KnownReceipt, issues: [] };
   }
   const issue = createIssue({ code: 'receipt.unknown_kind_version', phase: 'parse', severity: 'warning', retry: 'never', details: { kind: typeof kind === 'string' ? kind : null, version: typeof version === 'number' ? version : null } });
-  return { success: true, value: { kind: 'unknown_receipt', receiptVersion: 1, original: parsed.value, issues: [issue] }, issues: [issue] };
+  const value: UnknownReceipt = Object.freeze({
+    kind: 'unknown_receipt',
+    receiptVersion: 1,
+    original: parsed.value,
+    issues: Object.freeze([issue])
+  });
+  return { success: true, value, issues: value.issues };
 };
 
 export const safeParseReceiptText = (text: string, budget?: ArtifactParseBudget): ParseResult<ForwardableReceipt> => {

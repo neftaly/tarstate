@@ -9,6 +9,7 @@ import {
   canonicalizeJson,
   capabilityRefFor,
   capabilityUnavailable,
+  createRuntimeKind,
   createIssue,
   issueCatalog,
   logicalAnd,
@@ -200,10 +201,12 @@ describe('production foundation', () => {
     const host = new HostRuntimeRegistry({ trustPolicyId: 'host:test' });
     const close = vi.fn();
     const identity = {};
-    const first = host.acquire({ sourceId: 'source:one', identity, create: () => ({ runtime: { id: 1 }, close }) });
-    const second = host.acquire({ sourceId: 'source:one', identity, create: () => ({ runtime: { id: 2 }, close }) });
+    const kind = createRuntimeKind<{ id: number }>();
+    const first = host.acquire({ sourceId: 'source:one', identity, kind, create: () => ({ runtime: { id: 1 }, close }) });
+    const second = host.acquire({ sourceId: 'source:one', identity, kind, create: () => ({ runtime: { id: 2 }, close }) });
     expect(second.runtime).toBe(first.runtime);
-    expect(() => host.acquire({ sourceId: 'source:one', identity: {}, create: () => ({ runtime: {}, close }) })).toThrow(/different live source/);
+    expect(() => host.acquire({ sourceId: 'source:one', identity: {}, kind, create: () => ({ runtime: { id: 3 }, close }) })).toThrow(/different live source/);
+    expect(() => host.acquire({ sourceId: 'source:one', identity, kind: createRuntimeKind<object>(), create: () => ({ runtime: {}, close }) })).toThrow(/different runtime kind/);
     first.release();
     expect(close).not.toHaveBeenCalled();
     second.release();
@@ -251,6 +254,32 @@ describe('production foundation', () => {
     expect(await registry.fingerprint()).toBe(fingerprint);
   });
 
+  it('uses unambiguous capability keys for declarations and implementations', async () => {
+    const declaration: CapabilityDeclaration = {
+      kind: 'tarstate.capability-contract',
+      formatVersion: 1,
+      id: 'a',
+      version: 'b\u0000c',
+      class: 'function',
+      contract: {},
+      implies: []
+    };
+    const registry = new CapabilityRegistry('trust:unambiguous-keys');
+    const registered = await registry.registerDeclaration(declaration);
+    if (!registered.success) throw new Error('declaration registration failed');
+    expect(registry.registerImplementation({ ref: registered.value, integrity: 'sha256:implementation', implementation: {} }))
+      .toMatchObject({ success: true });
+    const colliding = {
+      id: 'a\u0000b',
+      version: 'c',
+      contractHash: registered.value.contractHash
+    };
+
+    expect(registry.declaration(colliding)).toBeUndefined();
+    expect(registry.implementation(colliding)).toBeUndefined();
+    expect(registry.satisfies(colliding)).toBe(false);
+  });
+
   it('rejects malformed capability declarations instead of structurally casting them', async () => {
     const registry = new CapabilityRegistry('trust:malformed');
     expect(await registry.registerDeclaration({
@@ -284,19 +313,22 @@ describe('production foundation', () => {
   it('closes host runtimes once and cannot be resurrected by stale leases', () => {
     const host = new HostRuntimeRegistry({ trustPolicyId: 'host:closed' });
     const close = vi.fn();
-    const lease = host.acquire({ sourceId: 'source:closed', identity: {}, create: () => ({ runtime: {}, close }) });
+    const kind = createRuntimeKind<object>();
+    const lease = host.acquire({ sourceId: 'source:closed', identity: {}, kind, create: () => ({ runtime: {}, close }) });
     host.close();
     host.close();
     lease.release();
     expect(close).toHaveBeenCalledOnce();
-    expect(() => host.acquire({ sourceId: 'source:new', identity: {}, create: () => ({ runtime: {}, close }) })).toThrow(/closed/);
+    expect(() => host.acquire({ sourceId: 'source:new', identity: {}, kind, create: () => ({ runtime: {}, close }) })).toThrow(/closed/);
   });
 
   it('removes a final runtime lease even when its close callback throws', () => {
     const host = new HostRuntimeRegistry({ trustPolicyId: 'host:throwing-release' });
+    const kind = createRuntimeKind<object>();
     const first = host.acquire({
       sourceId: 'source:throwing',
       identity: {},
+      kind,
       create: () => ({ runtime: {}, close: () => { throw new Error('close failed'); } })
     });
 
@@ -305,6 +337,7 @@ describe('production foundation', () => {
     const replacement = host.acquire({
       sourceId: 'source:throwing',
       identity: {},
+      kind,
       create: () => ({ runtime: { replacement: true }, close: () => undefined })
     });
     expect(replacement.runtime).toEqual({ replacement: true });
@@ -313,20 +346,30 @@ describe('production foundation', () => {
 
   it('closes every host runtime before propagating a cleanup failure', () => {
     const host = new HostRuntimeRegistry({ trustPolicyId: 'host:throwing-close' });
+    const kind = createRuntimeKind<object>();
     const laterClose = vi.fn();
     host.acquire({
-      sourceId: 'source:first', identity: {},
+      sourceId: 'source:first', identity: {}, kind,
       create: () => ({ runtime: {}, close: () => { throw new Error('first close failed'); } })
     });
-    host.acquire({ sourceId: 'source:later', identity: {}, create: () => ({ runtime: {}, close: laterClose }) });
+    host.acquire({ sourceId: 'source:later', identity: {}, kind, create: () => ({ runtime: {}, close: laterClose }) });
 
     expect(() => host.close()).toThrow('first close failed');
     expect(laterClose).toHaveBeenCalledOnce();
     expect(host.activeSourceIds()).toEqual([]);
-    expect(() => host.acquire({ sourceId: 'source:new', identity: {}, create: () => ({ runtime: {}, close: () => undefined }) })).toThrow(/closed/);
+    expect(() => host.acquire({ sourceId: 'source:new', identity: {}, kind, create: () => ({ runtime: {}, close: () => undefined }) })).toThrow(/closed/);
   });
 
 });
 
 const _jsonValueFixture: JsonValue = { ok: true };
 void _jsonValueFixture;
+
+const hostRuntimeTypeFixture = (): void => {
+  const typedHost = new HostRuntimeRegistry({ trustPolicyId: 'host:type-fixture' });
+  const numberKind = createRuntimeKind<number>();
+  typedHost.acquire({ sourceId: 'number', identity: {}, kind: numberKind, create: () => ({ runtime: 1, close: () => undefined }) });
+  // @ts-expect-error a runtime-kind token cannot be reused for another runtime type
+  typedHost.acquire({ sourceId: 'string', identity: {}, kind: numberKind, create: () => ({ runtime: 'wrong', close: () => undefined }) });
+};
+void hostRuntimeTypeFixture;

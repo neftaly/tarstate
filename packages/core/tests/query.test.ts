@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  capabilityRefKey,
   capabilityUnavailable,
   evaluateExpression,
   evaluatePreparedExpression,
@@ -66,6 +67,42 @@ describe('production query oracle', () => {
     expect(evaluatePreparedExpression(prepared, { row: { value: 4 } }, { functions })).toBe(4);
     expect(calls).toBe(2);
     expect(evaluatePreparedExpression(prepared, { row: { value: 5 } })).toBe(capabilityUnavailable);
+  });
+
+  it('addresses function capabilities without delimiter collisions', () => {
+    const contractHash = `sha256:${'9'.repeat(64)}` as const;
+    const first: CapabilityRef = { id: 'a', version: 'b\u0000c', contractHash };
+    const second: CapabilityRef = { id: 'a\u0000b', version: 'c', contractHash };
+    const functions = new Map([
+      [capabilityRefKey(first), () => 'first'],
+      [capabilityRefKey(second), () => 'second']
+    ]);
+
+    expect(evaluateExpression({ kind: 'call', capability: first, args: [] }, {}, { functions })).toBe('first');
+    expect(evaluateExpression({ kind: 'call', capability: second, args: [] }, {}, { functions })).toBe('second');
+  });
+
+  it('keeps relation identities distinct when their fields contain delimiters', () => {
+    const firstHash = `sha256:${'1'.repeat(64)}` as const;
+    const secondHash = `sha256:${'2'.repeat(64)}` as const;
+    const first = {
+      schemaView: { id: 'a', contentHash: firstHash },
+      relationId: `x\u0000${secondHash}\u0000y`
+    };
+    const second = {
+      schemaView: { id: `a\u0000${firstHash}\u0000x`, contentHash: secondHash },
+      relationId: 'y'
+    };
+
+    const result = evaluateQuery({
+      root: { kind: 'from', relation: first, alias: 'row' },
+      relations: [
+        { relation: first, rows: [{ value: 'first' }], completeness: 'exact', attachmentId: 'first' },
+        { relation: second, rows: [{ value: 'second' }], completeness: 'exact', attachmentId: 'second' }
+      ]
+    });
+
+    expect(result.rows).toEqual([{ value: 'first' }]);
   });
 
   it('orders built-in scalar and object keys correctly while retaining conservative host-call evaluation', () => {

@@ -1,5 +1,6 @@
 /** Typed query authoring, evaluation, preparation, and incremental maintenance. */
 export {
+  capabilityRefKey,
   diffQueryMaintenanceSnapshots,
   evaluateExpression,
   evaluatePreparedExpression,

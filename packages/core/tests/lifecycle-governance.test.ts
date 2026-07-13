@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createIssue, type CapabilityRef, type Issue } from '../src/issues.js';
 import {
   GovernanceCoordinator,
+  SourceOperationLedger,
   SourceLifecycleCoordinator,
   governanceCommandHash,
   lifecycleCommandHash,
@@ -53,7 +54,62 @@ const governanceCommand = (operationId: string, request: GovernanceCommand['requ
 
 const deniedIssue = (): Issue => createIssue({ code: 'test.denied', phase: 'governance', severity: 'error', retry: 'after_authority' });
 
+describe('source operation ledger identity', () => {
+  it('keeps delimiter-bearing epoch and operation tuples distinct across retirement', () => {
+    const firstEpoch = 'epoch';
+    const firstOperationId = 'operation\u0000tail';
+    const secondEpoch = 'epoch\u0000operation';
+    const secondOperationId = 'tail';
+    expect(firstEpoch + '\u0000' + firstOperationId).toBe(secondEpoch + '\u0000' + secondOperationId);
+
+    const ledger = new SourceOperationLedger<string>(firstEpoch);
+    const first = ledger.reserve(firstEpoch, firstOperationId, hash('1'));
+    if (first.status !== 'reserved') throw new Error('expected first reservation');
+    expect(() => ledger.rotateEpoch(secondEpoch)).toThrow(/pending operation/);
+    ledger.complete(first.entry, 'first receipt');
+    expect(ledger.lookup(firstEpoch, firstOperationId, hash('1'))).toEqual({ status: 'known', receipt: 'first receipt' });
+
+    ledger.rotateEpoch(secondEpoch);
+    expect(ledger.lookup(firstEpoch, firstOperationId, hash('1'))).toEqual({ status: 'expired' });
+    const second = ledger.reserve(secondEpoch, secondOperationId, hash('2'));
+    if (second.status !== 'reserved') throw new Error('expected second reservation');
+    ledger.complete(second.entry, 'second receipt');
+    expect(ledger.lookup(secondEpoch, secondOperationId, hash('2'))).toEqual({ status: 'known', receipt: 'second receipt' });
+  });
+});
+
 describe('source lifecycle coordination', () => {
+  it('returns command-invalid receipts for malformed nested lifecycle requests', async () => {
+    const authorize = vi.fn(() => ({ allowed: true } as const));
+    const allocateSourceId = vi.fn(() => 'source:new');
+    const coordinator = new SourceLifecycleCoordinator({
+      lifecycleCoordinatorId: 'lifecycle:test', operationEpoch: 'lifecycle:epoch:one', authorityViewFingerprint: authorityFingerprint,
+      authorize,
+      adapter: { allocateSourceId, create: () => ({ outcome: 'committed', issues: [] }), delete: () => ({ outcome: 'committed', issues: [] }) }
+    });
+    const malformedRequests: readonly unknown[] = [
+      { action: 'create', sourceCapability: null, input: {} },
+      { action: 'create', sourceCapability },
+      { action: 'delete', sourceId: null },
+      { action: 'unknown' }
+    ];
+
+    for (const [index, request] of malformedRequests.entries()) {
+      const command = { ...lifecycleCommand('malformed:' + index), request } as unknown as SourceLifecycleCommand;
+      await expect(coordinator.execute(command)).resolves.toMatchObject({
+        kind: 'source-lifecycle', outcome: 'rejected', issues: [{ code: 'lifecycle.command_invalid' }]
+      });
+    }
+    await expect(coordinator.execute({
+      ...lifecycleCommand('malformed:unicode'),
+      request: { action: 'create', sourceCapability, input: '\ud800' }
+    })).resolves.toMatchObject({
+      kind: 'source-lifecycle', outcome: 'rejected', issues: [{ code: 'lifecycle.command_invalid' }]
+    });
+    expect(authorize).not.toHaveBeenCalled();
+    expect(allocateSourceId).not.toHaveBeenCalled();
+  });
+
   it('keeps authority, preflight, and cancellation rejection before handoff', async () => {
     const allocateSourceId = vi.fn(() => 'source:new');
     const create = vi.fn((): LifecycleMutationResult => ({ outcome: 'committed', durability: 'memory', issues: [] }));
@@ -247,6 +303,39 @@ describe('source lifecycle coordination', () => {
 });
 
 describe('governance coordination', () => {
+  it('returns command-invalid receipts for malformed nested governance requests', async () => {
+    const authorize = vi.fn(() => ({ allowed: true } as const));
+    const coordinator = new GovernanceCoordinator({ authorityViewFingerprint: authorityFingerprint, authorize });
+    const malformedRequests: readonly unknown[] = [
+      { action: 'initialize_declaration', declaration: null },
+      { action: 'initialize_declaration', declaration: { formatVersion: 1, storageSchema: schema, projection: null } },
+      { action: 'activate_constraints', activation: null },
+      { action: 'repair_declaration', section: 'storage', alternatives: null, selected: storageSection() },
+      { action: 'repair_declaration', section: 'storage', alternatives: [storageSection(), null], selected: storageSection() },
+      { action: 'unknown' }
+    ];
+
+    const missingBasis = governanceCommand('malformed:basis') as unknown as Record<string, unknown>;
+    delete missingBasis.expectedBasis;
+    await expect(coordinator.execute(missingBasis as unknown as GovernanceCommand)).resolves.toMatchObject({
+      kind: 'governance', outcome: 'rejected', issues: [{ code: 'governance.command_invalid' }]
+    });
+
+    for (const [index, request] of malformedRequests.entries()) {
+      const command = { ...governanceCommand('malformed:' + index), request } as unknown as GovernanceCommand;
+      await expect(coordinator.execute(command)).resolves.toMatchObject({
+        kind: 'governance', outcome: 'rejected', issues: [{ code: 'governance.command_invalid' }]
+      });
+    }
+    await expect(coordinator.execute({
+      ...governanceCommand('malformed:unicode'),
+      sourceId: '\ud800'
+    })).resolves.toMatchObject({
+      kind: 'governance', sourceId: '<invalid>', outcome: 'rejected', issues: [{ code: 'governance.command_invalid' }]
+    });
+    expect(authorize).not.toHaveBeenCalled();
+  });
+
   it('commits initialization at an exact basis and retains auditable selected hashes', async () => {
     let basis = { incarnation: 'one', revision: 0 };
     let declaration: unknown;

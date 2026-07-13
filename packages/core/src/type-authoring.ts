@@ -8,6 +8,7 @@ import type { PreparedPlan } from './maintenance.js';
 import { assertPreparedPlan } from './internal-prepared-plan.js';
 import type { FieldDeclaration, RelationDeclaration, SchemaBody } from './schema.js';
 import type { JsonValue, PortableValue, TaggedValue } from './value.js';
+import { stringTupleKey } from './internal-string-key.js';
 
 type Simplify<Value> = { readonly [Key in keyof Value]: Value[Key] };
 type UnionToIntersection<Union> = (Union extends unknown ? (value: Union) => void : never) extends (value: infer Intersection) => void ? Intersection : never;
@@ -469,4 +470,4 @@ export type RuntimeQueryParameters = QueryParametersOf<RuntimeTypedQuery>;
 export type RuntimeQueryResultRow = QueryResultRowOf<RuntimeTypedQuery>;
 
 const fieldEditKind = (id: string): string => id.startsWith('urn:tarstate:capability:field/') ? id.slice('urn:tarstate:capability:field/'.length) : 'custom';
-const uniqueSchemaViews = (references: readonly ArtifactRef[]): readonly ArtifactRef[] => [...new Map(references.map((reference) => [reference.id + '\u0000' + reference.contentHash, reference])).values()];
+const uniqueSchemaViews = (references: readonly ArtifactRef[]): readonly ArtifactRef[] => [...new Map(references.map((reference) => [stringTupleKey(reference.id, reference.contentHash), reference])).values()];

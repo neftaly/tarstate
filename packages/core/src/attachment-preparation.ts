@@ -7,6 +7,7 @@ import {
 import type { AttachmentProjection, SourceSnapshot } from './database.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { stringTupleKey } from './internal-string-key.js';
 import { projectStorage, type BindingProjection, type CompiledStorageMapping } from './mapping.js';
 import type { SourceBasis } from './maintenance.js';
 import type { DocumentDeclaration } from './receipts.js';
@@ -274,7 +275,7 @@ const mappingCapabilities = (mapping: CompiledStorageMapping): readonly Capabili
     for (const field of Object.values(relation.fields)) {
       if (field.write.kind !== 'replace') continue;
       const ref = field.write.capability;
-      capabilities.set(ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash, ref);
+      capabilities.set(stringTupleKey(ref.id, ref.version, ref.contractHash), ref);
     }
   }
   return [...capabilities.values()];

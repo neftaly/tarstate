@@ -1,4 +1,6 @@
+import { isContentHash } from './artifacts.js';
 import { createIssue, type Issue } from './issues.js';
+import { stringTupleKey } from './internal-string-key.js';
 
 export type ResourceKind = 'bytes' | 'data' | 'schema' | 'constraint' | 'document' | 'executable-code';
 export type ResourceLifecycleState = 'loading' | 'ready' | 'missing' | 'failed' | 'denied' | 'deleted' | 'unsupported';
@@ -34,6 +36,11 @@ export type ResolverDriver = {
 
 export type ResolverAuthority = {
   readonly permits: (authorityScope: string, reference: ResourceRef) => boolean;
+};
+
+type ResolutionContext = {
+  readonly authorityScope: string;
+  readonly signal?: AbortSignal;
 };
 
 /**
@@ -79,8 +86,11 @@ export class ResourceResolver {
     readonly signal?: AbortSignal;
     readonly bypassCache?: boolean;
   }): Promise<ResolvedResource<Value>> {
-    const key = options.authorityScope + '\u0000' + reference.kind + '\u0000' + reference.uri + '\u0000' + (reference.integrity ?? '');
-    const useCache = options.bypassCache !== true && options.signal === undefined;
+    const requested = adoptResourceRef(reference, 'reference');
+    const context = adoptResolutionContext(options);
+    const bypassCache = ownDataProperty(options, 'bypassCache');
+    const key = resourceCacheKey(context.authorityScope, requested);
+    const useCache = bypassCache !== true && context.signal === undefined;
     if (useCache) {
       const cached = this.#cache.get(key);
       if (cached !== undefined) {
@@ -91,7 +101,7 @@ export class ResourceResolver {
       const inflight = this.#inflight.get(key);
       if (inflight !== undefined) return inflight as Promise<ResolvedResource<Value>>;
     }
-    const pending = this.#resolve(reference, options);
+    const pending = this.#resolve(requested, context);
     if (useCache) {
       this.#inflight.set(key, pending);
       void pending.then(
@@ -114,7 +124,7 @@ export class ResourceResolver {
       this.#inflight.clear();
       return;
     }
-    const prefix = authorityScope + '\u0000';
+    const prefix = authorityCachePrefix(authorityScope);
     for (const key of this.#cache.keys()) if (key.startsWith(prefix)) this.#cache.delete(key);
     for (const key of this.#inflight.keys()) if (key.startsWith(prefix)) this.#inflight.delete(key);
   }
@@ -130,16 +140,16 @@ export class ResourceResolver {
     }
   }
 
-  async #resolve(reference: ResourceRef, options: { readonly authorityScope: string; readonly signal?: AbortSignal }): Promise<ResolvedResource> {
+  async #resolve(reference: ResourceRef, context: ResolutionContext): Promise<ResolvedResource> {
     const redirects: string[] = [];
     const accumulatedIssues: Issue[] = [];
     const visited = new Set<string>();
     let current = reference;
     for (let depth = 0; depth <= this.#maxRedirects; depth += 1) {
-      if (!this.#authority.permits(options.authorityScope, current)) {
+      if (!this.#authority.permits(context.authorityScope, current)) {
         return resolution(reference, current, redirects, 'denied', 'none', undefined, [...accumulatedIssues, resolverIssue('resolver.authority_denied', 'after_authority', { uri: current.uri })]);
       }
-      const identity = current.kind + '\u0000' + current.uri;
+      const identity = stringTupleKey(current.kind, current.uri);
       if (visited.has(identity)) {
         return resolution(reference, current, redirects, 'failed', 'none', undefined, [...accumulatedIssues, resolverIssue('resolver.cycle', 'after_input', { uri: current.uri })]);
       }
@@ -150,10 +160,7 @@ export class ResourceResolver {
       }
       let result: ResolverDriverResult;
       try {
-        result = await driver.resolve(current, {
-          authorityScope: options.authorityScope,
-          ...(options.signal === undefined ? {} : { signal: options.signal })
-        });
+        result = await driver.resolve(current, context);
       } catch (error) {
         result = {
           state: 'failed',
@@ -164,16 +171,23 @@ export class ResourceResolver {
       if (result.state === 'redirect') {
         accumulatedIssues.push(...(result.issues ?? []));
         redirects.push(current.uri);
-        if (current.integrity !== undefined && result.target.integrity !== undefined && current.integrity !== result.target.integrity) {
+        const target = tryAdoptResourceRef(result.target);
+        if (target === undefined) {
+          return invalidDriverReference(reference, current, redirects, accumulatedIssues, 'redirect_target');
+        }
+        if (current.integrity !== undefined && target.integrity !== undefined && current.integrity !== target.integrity) {
           return resolution(reference, current, redirects, 'failed', 'none', undefined, [
             ...accumulatedIssues,
-            resolverIssue('resolver.integrity_mismatch', 'after_refresh', { expected: current.integrity, actual: result.target.integrity })
+            resolverIssue('resolver.integrity_mismatch', 'after_refresh', { expected: current.integrity, actual: target.integrity })
           ]);
         }
-        current = current.integrity === undefined ? result.target : { ...result.target, integrity: current.integrity };
+        current = withIntegrity(target, current.integrity);
         continue;
       }
-      const driverResolved = result.resolved ?? current;
+      const driverResolved = result.resolved === undefined ? current : tryAdoptResourceRef(result.resolved);
+      if (driverResolved === undefined) {
+        return invalidDriverReference(reference, current, redirects, [...accumulatedIssues, ...(result.issues ?? [])], 'resolved');
+      }
       if (current.integrity !== undefined && driverResolved.integrity !== undefined && current.integrity !== driverResolved.integrity) {
         return resolution(reference, current, redirects, 'failed', 'none', undefined, [
           ...accumulatedIssues,
@@ -181,7 +195,14 @@ export class ResourceResolver {
           resolverIssue('resolver.integrity_mismatch', 'after_refresh', { expected: current.integrity, actual: driverResolved.integrity })
         ]);
       }
-      const resolved = current.integrity === undefined ? driverResolved : { ...driverResolved, integrity: current.integrity };
+      const resolved = withIntegrity(driverResolved, current.integrity);
+      if (!sameResourceRef(current, resolved) && !this.#authority.permits(context.authorityScope, resolved)) {
+        return resolution(reference, resolved, redirects, 'denied', 'none', undefined, [
+          ...accumulatedIssues,
+          ...(result.issues ?? []),
+          resolverIssue('resolver.authority_denied', 'after_authority', { uri: resolved.uri })
+        ]);
+      }
       if (result.state === 'ready' && resolved.integrity !== undefined && result.contentHash !== resolved.integrity) {
         return resolution(reference, resolved, redirects, 'failed', 'none', undefined, [
           ...accumulatedIssues,
@@ -213,6 +234,84 @@ const schemeOf = (uri: string): string => {
   const separator = uri.indexOf(':');
   return separator === -1 ? '' : uri.slice(0, separator).toLowerCase();
 };
+
+const resourceKinds: readonly ResourceKind[] = ['bytes', 'data', 'schema', 'constraint', 'document', 'executable-code'];
+
+const tryAdoptResourceRef = (value: unknown): ResourceRef | undefined => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  let uri: unknown;
+  let kind: unknown;
+  let integrity: unknown;
+  try {
+    uri = ownDataProperty(value, 'uri', true);
+    kind = ownDataProperty(value, 'kind', true);
+    integrity = ownDataProperty(value, 'integrity');
+  } catch {
+    return undefined;
+  }
+  if (typeof uri !== 'string' || typeof kind !== 'string' || !resourceKinds.includes(kind as ResourceKind)) return undefined;
+  if (integrity !== undefined && !isContentHash(integrity)) return undefined;
+  return Object.freeze({
+    uri,
+    kind: kind as ResourceKind,
+    ...(integrity === undefined ? {} : { integrity: integrity as `sha256:${string}` })
+  });
+};
+
+const adoptResourceRef = (value: unknown, label: string): ResourceRef => {
+  const adopted = tryAdoptResourceRef(value);
+  if (adopted === undefined) throw new TypeError(label + ' must be a resource reference with own data properties');
+  return adopted;
+};
+
+const adoptResolutionContext = (options: {
+  readonly authorityScope: string;
+  readonly signal?: AbortSignal;
+}): ResolutionContext => {
+  const authorityScope = ownDataProperty(options, 'authorityScope');
+  const signal = ownDataProperty(options, 'signal');
+  if (typeof authorityScope !== 'string') throw new TypeError('authorityScope must be an own string data property');
+  return Object.freeze({
+    authorityScope,
+    ...(signal === undefined ? {} : { signal: signal as AbortSignal })
+  });
+};
+
+const ownDataProperty = (value: object, key: string, required = false): unknown => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined) {
+    if (required) throw new TypeError(key + ' must be an own data property');
+    return undefined;
+  }
+  if (!descriptor.enumerable || !('value' in descriptor)) throw new TypeError(key + ' must be an enumerable data property');
+  return descriptor.value;
+};
+
+const withIntegrity = (reference: ResourceRef, integrity: ResourceRef['integrity']): ResourceRef => integrity === undefined
+  ? reference
+  : Object.freeze({ uri: reference.uri, kind: reference.kind, integrity });
+
+const sameResourceRef = (left: ResourceRef, right: ResourceRef): boolean =>
+  left.uri === right.uri && left.kind === right.kind && left.integrity === right.integrity;
+
+const encodeKeyPart = (value: string): string => value.length + ':' + value;
+const authorityCachePrefix = (authorityScope: string): string => encodeKeyPart(authorityScope);
+const resourceCacheKey = (authorityScope: string, reference: ResourceRef): string =>
+  authorityCachePrefix(authorityScope)
+  + encodeKeyPart(reference.kind)
+  + encodeKeyPart(reference.uri)
+  + (reference.integrity === undefined ? '0' : '1' + encodeKeyPart(reference.integrity));
+
+const invalidDriverReference = (
+  requested: ResourceRef,
+  resolved: ResourceRef,
+  redirects: readonly string[],
+  issues: readonly Issue[],
+  field: 'redirect_target' | 'resolved'
+): ResolvedResource => resolution(requested, resolved, redirects, 'failed', 'none', undefined, [
+  ...issues,
+  resolverIssue('resolver.failed', 'after_refresh', { uri: resolved.uri, reason: 'invalid_driver_reference', field })
+]);
 
 const resolution = (
   requested: ResourceRef,

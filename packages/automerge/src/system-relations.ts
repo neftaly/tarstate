@@ -522,8 +522,13 @@ const observationDecision = <Row>(
   if (previousTime < nextTime) return 'replace';
   return comparePortableStrings(canonicalizeJson(previous as unknown as JsonValue), canonicalizeJson(next as unknown as JsonValue)) < 0 ? 'replace' : 'ignore';
 };
-const syncKey = (documentId: string, storageId: string): string => documentId + '\u0000' + storageId;
-const presenceKey = (peerId: string, channel: string): string => peerId + '\u0000' + channel;
+const stringTupleKey = (...parts: readonly string[]): string => {
+  let key = '';
+  for (const part of parts) key += part.length + ':' + part;
+  return key;
+};
+const syncKey = (documentId: string, storageId: string): string => stringTupleKey(documentId, storageId);
+const presenceKey = (peerId: string, channel: string): string => stringTupleKey(peerId, channel);
 
 const sortedValues = <Row>(rows: ReadonlyMap<string, Row>, key: (row: Row) => string): readonly Row[] =>
   Object.freeze([...rows.values()].sort((left, right) => comparePortableStrings(key(left), key(right))));

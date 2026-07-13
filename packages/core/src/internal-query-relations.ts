@@ -1,12 +1,13 @@
 import type { QueryRecord, RelationInput, RelationUse } from './query-model.js';
+import { stringTupleKey } from './internal-string-key.js';
 
 export type IndexedRelationInput = { readonly input: RelationInput; readonly index: number };
 
 export const relationKey = (relation: RelationUse): string =>
-  relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
+  stringTupleKey(relation.schemaView.id, relation.schemaView.contentHash, relation.relationId);
 
 export const relationInputKey = (input: RelationInput): string =>
-  relationKey(input.relation) + '\u0000' + (input.attachmentId ?? input.sourceId ?? '');
+  stringTupleKey(relationKey(input.relation), input.attachmentId ?? input.sourceId ?? '');
 
 export const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyMap<string, readonly RelationInput[]> => {
   const grouped = new Map<string, RelationInput[]>();

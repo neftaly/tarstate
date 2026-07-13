@@ -166,7 +166,13 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     this.authorityFingerprint = options.authorityFingerprint;
     this.registryFingerprint = options.registryFingerprint;
     this.#attachments = options.attachments;
-    this.#datasets = new Map(options.datasets.map((dataset) => [dataset.datasetId, dataset]));
+    const datasets = new Map<string, DatasetMembership>();
+    for (const dataset of options.datasets) {
+      const existing = datasets.get(dataset.datasetId);
+      if (existing !== undefined && existing !== dataset) throw new Error('A different dataset membership is registered for ' + dataset.datasetId);
+      datasets.set(dataset.datasetId, dataset);
+    }
+    this.#datasets = datasets;
     this.#canRead = options.canRead;
     this.#createQueryMaintenance = options.createQueryMaintenance;
     this.#onDiagnostic = options.onDiagnostic;
@@ -273,6 +279,7 @@ class SharedObservation<Query, Row, Projection> {
   readonly #options: SharedOptions<Query, Row, Projection>;
   readonly #leases = new Set<ObserverLease<Row>>();
   #session: DatabaseQueryMaintenanceSession<Query, Row, Projection> | undefined;
+  #maintenanceOpenFailed = false;
   #snapshot!: ObserverSnapshot<Row>;
   #publishedSnapshot!: ObserverSnapshot<Row>;
   #stagedChange: ObserverChange<Row> | undefined;
@@ -284,8 +291,10 @@ class SharedObservation<Query, Row, Projection> {
     this.#parameterKey = canonicalizeJson(options.parameters as JsonValue);
     const capturedState = options.runtime.state();
     const captured = capturedState.captured;
-    const session = this.#openMaintenance(captured);
+    const opened = this.#openMaintenance(captured);
+    const session = opened.session;
     this.#session = session;
+    this.#maintenanceOpenFailed = opened.failed;
     let added = false;
     try {
       const initial = capturedState.state === 'captured'
@@ -346,9 +355,22 @@ class SharedObservation<Query, Row, Projection> {
   stage(captured: EvaluationSnapshot<Projection>): void {
     this.#stagedChange = undefined;
     if (this.#closed) return;
-    const session = this.#session;
+    let session = this.#session;
     if (session === undefined) return;
-    const maintained = this.#updateMaintenance(session, captured);
+    let maintained: MaintainedDatabaseQueryResult<Row>;
+    if (this.#maintenanceOpenFailed) {
+      const previous = session;
+      const reopened = this.#openMaintenance(captured);
+      session = reopened.session;
+      this.#session = session;
+      this.#maintenanceOpenFailed = reopened.failed;
+      runObserverCleanups([() => previous.close()], {
+        component: 'database-view', operation: 'replace-failed-maintenance'
+      }, this.#options.onDiagnostic);
+      maintained = session.getCurrentResult();
+    } else {
+      maintained = this.#updateMaintenance(session, captured);
+    }
     if (this.#closed) return;
     this.#stageMaintained(captured, maintained);
   }
@@ -403,15 +425,21 @@ class SharedObservation<Query, Row, Projection> {
     );
   }
 
-  #openMaintenance(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceSession<Query, Row, Projection> {
+  #openMaintenance(captured: EvaluationSnapshot<Projection>): {
+    readonly session: DatabaseQueryMaintenanceSession<Query, Row, Projection>;
+    readonly failed: boolean;
+  } {
     try {
-      return this.#options.createQueryMaintenance(maintenanceFactoryInput(
-        this.#options.plan,
-        this.#maintenanceInput(captured),
-        this.#options.runtime.identity
-      ));
+      return {
+        session: this.#options.createQueryMaintenance(maintenanceFactoryInput(
+          this.#options.plan,
+          this.#maintenanceInput(captured),
+          this.#options.runtime.identity
+        )),
+        failed: false
+      };
     } catch (error) {
-      return failedMaintenanceSession<Query, Row, Projection>(error);
+      return { session: failedMaintenanceSession<Query, Row, Projection>(error), failed: true };
     }
   }
 

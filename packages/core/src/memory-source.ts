@@ -3,6 +3,7 @@ import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { builtInCapabilityRefs } from './builtins.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { stringTupleKey } from './internal-string-key.js';
 import type { SourceBasis } from './maintenance.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import { comparePortableStrings } from './portable-order.js';
@@ -204,12 +205,17 @@ export class InMemoryAtomicSource {
     return entry.receipt === undefined ? { status: 'unavailable' } : { status: 'known', receipt: entry.receipt };
   }
 
-  /** Retires the complete previous epoch atomically; its IDs can never bind to the new epoch. */
-  rotateOperationEpoch(nextEpoch: string): void {
-    if (nextEpoch.length === 0 || nextEpoch === this.#activeEpoch || this.#retiredEpochs.has(nextEpoch)) throw new Error('Operation epoch must be new and non-empty');
-    this.#retiredEpochs.add(this.#activeEpoch);
-    for (const key of this.#ledger.keys()) if (key.startsWith(this.#activeEpoch + '\u0000')) this.#ledger.delete(key);
-    this.#activeEpoch = nextEpoch;
+  /** Retires the previous epoch after queued commits. Await before observing or using the new epoch. */
+  rotateOperationEpoch(nextEpoch: string): Promise<void> {
+    const run = this.#queue.then(() => {
+      if (nextEpoch.length === 0 || nextEpoch === this.#activeEpoch || this.#retiredEpochs.has(nextEpoch)) throw new Error('Operation epoch must be new and non-empty');
+      this.#retiredEpochs.add(this.#activeEpoch);
+      const retiredPrefix = stringTupleKey(this.#activeEpoch);
+      for (const key of this.#ledger.keys()) if (key.startsWith(retiredPrefix)) this.#ledger.delete(key);
+      this.#activeEpoch = nextEpoch;
+    });
+    this.#queue = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   async #prepare(attempt: TransactionAttempt): Promise<PreparedAttempt | { readonly receipt: CommitReceipt }> {
@@ -539,7 +545,7 @@ export class InMemoryAtomicSource {
     for (const [index, replacement] of replacements) targetRows[index] = replacement;
     plannedRelations.set(relation.relationId, targetRows);
     const changedRows = new Set<string>();
-    for (const [index, replacement] of replacements) if (!sameJson(rows[index] as MemoryRow, replacement)) changedRows.add(relation.relationId + '\u0000' + index);
+    for (const [index, replacement] of replacements) if (!sameJson(rows[index] as MemoryRow, replacement)) changedRows.add(stringTupleKey(relation.relationId, String(index)));
 
     if (statement.references === 'source-local-declared' && oldToNew.size > 0) {
       for (const { relation: referencingRelation, reference } of declaredReferences) {
@@ -552,7 +558,7 @@ export class InMemoryAtomicSource {
           if (replacementTuple === undefined) continue;
           const current = nextRows[index] as MemoryRow;
           nextRows[index] = { ...current, [reference.field]: replacementTuple };
-          changedRows.add(referencingRelation.relationId + '\u0000' + index);
+          changedRows.add(stringTupleKey(referencingRelation.relationId, String(index)));
           relationChanged = true;
         }
         if (relationChanged) plannedRelations.set(referencingRelation.relationId, nextRows);
@@ -774,7 +780,7 @@ const intentHashFor = (attempt: TransactionAttempt, transactionHash: ContentHash
 
 const isTransaction = (value: Transaction | ArtifactRef): value is Transaction => 'kind' in value && value.kind === 'transaction' && 'body' in value;
 
-const operationKey = (operationEpoch: string, operationId: string): string => operationEpoch + '\u0000' + operationId;
+const operationKey = (operationEpoch: string, operationId: string): string => stringTupleKey(operationEpoch, operationId);
 const statementRelation = (statement: WriteStatement): WriteRelation | undefined => {
   if (statement.kind === 'extension') return undefined;
   if (statement.kind === 'statement.insert' || statement.kind === 'statement.insert-from-query' || statement.kind === 'statement.upsert' || statement.kind === 'statement.replace-all') return statement.relation;

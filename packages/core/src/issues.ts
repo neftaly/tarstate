@@ -1,4 +1,5 @@
 import { ownedReadonlyMap } from './internal-owned-map.js';
+import { stringTupleKey } from './internal-string-key.js';
 import { comparePortableStrings } from './portable-order.js';
 
 export type IssuePhase =
@@ -30,6 +31,10 @@ export type CapabilityRef = {
   readonly version: string;
   readonly contractHash: `sha256:${string}`;
 };
+
+/** Collision-free registry key for a capability reference. */
+export const capabilityRefKey = (ref: CapabilityRef): string =>
+  stringTupleKey(ref.id, ref.version, ref.contractHash);
 
 /** Stable, portable diagnostic with an explicit phase and retry policy. */
 export type Issue = {

@@ -43,6 +43,38 @@ describe('production Automerge adapter', () => {
     await expect(runtime.commit(first)).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.operation_epoch_expired' }] });
   });
 
+  it('keeps delimiter-containing operation identities distinct in the ledger', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:collision-safe-ledger', doc: taskBase() });
+    const basis = runtime.snapshot().basis;
+    const first = {
+      operationEpoch: 'epoch:left',
+      operationId: 'operation:right\u0000tail',
+      intentHash: hash('1'),
+      expectedBasis: basis,
+      commands: []
+    };
+    const second = {
+      operationEpoch: 'epoch:left\u0000operation:right',
+      operationId: 'tail',
+      intentHash: hash('2'),
+      expectedBasis: basis,
+      commands: []
+    };
+
+    const firstResult = await runtime.commit(first);
+    const secondResult = await runtime.commit(second);
+
+    expect(firstResult).toMatchObject({ outcome: 'committed', operationEpoch: first.operationEpoch, operationId: first.operationId });
+    expect(secondResult).toMatchObject({ outcome: 'committed', operationEpoch: second.operationEpoch, operationId: second.operationId });
+    expect(secondResult).not.toBe(firstResult);
+    expect(runtime.queryOutcome(first)).toEqual({ status: 'known', result: firstResult });
+    expect(runtime.queryOutcome(second)).toEqual({ status: 'known', result: secondResult });
+
+    await runtime.retireOperationEpoch(first.operationEpoch);
+    expect(runtime.queryOutcome(first)).toEqual({ status: 'expired' });
+    expect(runtime.queryOutcome(second)).toEqual({ status: 'known', result: secondResult });
+  });
+
   it('rejects reentrant document replacement without losing either document', async () => {
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: taskBase() });
     const before = runtime.snapshot();
@@ -155,6 +187,56 @@ describe('production Automerge adapter', () => {
     expect(calls).toBe(0);
   });
 
+  it('rejects malformed public commit input before queue or ledger handoff', () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:malformed-commit', doc: taskBase() });
+    const valid = {
+      operationEpoch: 'epoch:valid',
+      operationId: 'operation:valid',
+      intentHash: hash('6'),
+      expectedBasis: runtime.snapshot().basis,
+      commands: [{ description: 'valid', apply: () => undefined }],
+      message: 'valid'
+    };
+    const invalid: readonly (readonly [unknown, RegExp])[] = [
+      [{ ...valid, operationEpoch: 1 }, /operationEpoch.*non-empty string/],
+      [{ ...valid, operationEpoch: '' }, /operationEpoch.*non-empty string/],
+      [{ ...valid, operationId: null }, /operationId.*non-empty string/],
+      [{ ...valid, operationId: '' }, /operationId.*non-empty string/],
+      [{ ...valid, intentHash: 'sha256:not-a-hash' }, /canonical SHA-256/],
+      [{ ...valid, expectedBasis: { ...valid.expectedBasis, kind: 'other' } }, /kind must be automerge-heads/],
+      [{ ...valid, expectedBasis: { kind: 'automerge-heads', heads: [1] } }, /canonical Automerge hashes/],
+      [{ ...valid, expectedBasis: { kind: 'automerge-heads', heads: ['not-a-head'] } }, /canonical Automerge hashes/],
+      [{ ...valid, expectedBasis: { kind: 'automerge-heads', heads: [valid.expectedBasis.heads[0], valid.expectedBasis.heads[0]] } }, /heads must be unique/],
+      [{ ...valid, commands: [{ description: 1, apply: () => undefined }] }, /description must be a string/],
+      [{ ...valid, commands: [{ description: 'invalid', apply: 'not-a-function' }] }, /apply must be a function/],
+      [{ ...valid, message: 1 }, /message must be a string/]
+    ];
+
+    for (const [input, message] of invalid) expect(() => runtime.commit(input as never)).toThrow(message);
+    expect(runtime.queryOutcome(valid)).toEqual({ status: 'not_seen' });
+  });
+
+  it('rejects malformed outcome and retirement identities without ledger coercion', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:malformed-lookup', doc: taskBase() });
+    const identity = { operationEpoch: 'epoch:valid', operationId: 'operation:valid', intentHash: hash('6') };
+    let accessorCalls = 0;
+    const accessorIdentity: Record<string, unknown> = { operationId: identity.operationId, intentHash: identity.intentHash };
+    Object.defineProperty(accessorIdentity, 'operationEpoch', {
+      enumerable: true,
+      get: () => { accessorCalls += 1; return identity.operationEpoch; }
+    });
+
+    expect(() => runtime.queryOutcome({ ...identity, operationEpoch: 1 } as never)).toThrow(/operationEpoch.*non-empty string/);
+    expect(() => runtime.queryOutcome({ ...identity, operationId: null } as never)).toThrow(/operationId.*non-empty string/);
+    expect(() => runtime.queryOutcome({ ...identity, intentHash: 'bad' } as never)).toThrow(/canonical SHA-256/);
+    expect(() => runtime.queryOutcome(accessorIdentity as never)).toThrow(/hostile property descriptor/);
+    expect(accessorCalls).toBe(0);
+    await expect(runtime.retireOperationEpoch(1 as never)).rejects.toThrow(/non-empty string/);
+    await expect(runtime.retireOperationEpoch('')).rejects.toThrow(/non-empty string/);
+
+    expect(runtime.queryOutcome(identity)).toEqual({ status: 'not_seen' });
+  });
+
   it('keeps snapshot identity stable and publishes each changed snapshot before notifying', async () => {
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: taskBase() });
     const initial = runtime.snapshot();
@@ -227,19 +309,15 @@ describe('production Automerge adapter', () => {
     expect(ignoredCalls).toBe(0);
   });
 
-  it('does not normalize an invalid basis kind into an accepted Automerge basis', async () => {
+  it('rejects an invalid Automerge basis kind before commit handoff', () => {
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:invalid-basis-kind', doc: taskBase() });
     const command = vi.fn();
-    const result = await runtime.commit({
-      operationEpoch: 'epoch:1', operationId: 'operation:invalid-kind', intentHash: hash('8'),
-      expectedBasis: { ...runtime.snapshot().basis, kind: 'invalid-kind' } as never,
-      commands: [{ apply: command }]
-    });
-
-    expect(result).toMatchObject({
-      outcome: 'rejected',
-      issues: [{ code: 'transaction.expected_basis_stale', details: { expectedBasis: { kind: 'invalid-kind' } } }]
-    });
+    expect(() => runtime.commit({
+        operationEpoch: 'epoch:1', operationId: 'operation:invalid-kind', intentHash: hash('8'),
+        expectedBasis: { ...runtime.snapshot().basis, kind: 'invalid-kind' } as never,
+        commands: [{ apply: command }]
+      }))
+      .toThrow(/kind must be automerge-heads/);
     expect(command).not.toHaveBeenCalled();
   });
 

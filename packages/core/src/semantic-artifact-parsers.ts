@@ -18,6 +18,7 @@ import type { CapabilityRegistry } from './registry.js';
 import type { PreparedSchema } from './schema.js';
 import type { Transaction } from './transaction.js';
 import type { JsonValue } from './value.js';
+import { stringTupleKey } from './internal-string-key.js';
 
 export type SemanticArtifactParseBudget = ArtifactParseBudget & {
   readonly maxSemanticDepth: number;
@@ -581,7 +582,7 @@ const validateSchemaLensBody = (context: ValidationContext, body: JsonValue): bo
   if (!Array.isArray(value.relations)) invalid(context, ['body', 'relations'], 'array_required');
   else {
     const pairs = new Set<string>(); checkNameBudget(context, value.relations.length, ['body', 'relations']);
-    value.relations.forEach((relation, index) => { const path = ['body', 'relations', index]; if (!shape(context, relation, ['fromRelationId', 'toRelationId', 'steps'], [], path)) return; const record = relation as RecordValue; const from = nonEmptyString(context, record.fromRelationId, [...path, 'fromRelationId']); const to = nonEmptyString(context, record.toRelationId, [...path, 'toRelationId']); if (from !== undefined && to !== undefined) { const pair = from + '\u0000' + to; if (pairs.has(pair)) invalid(context, path, 'duplicate_lens_relation'); else pairs.add(pair); } if (!Array.isArray(record.steps)) invalid(context, [...path, 'steps'], 'array_required'); else record.steps.forEach((step, stepIndex) => validateLensStep(context, step, [...path, 'steps', stepIndex])); });
+    value.relations.forEach((relation, index) => { const path = ['body', 'relations', index]; if (!shape(context, relation, ['fromRelationId', 'toRelationId', 'steps'], [], path)) return; const record = relation as RecordValue; const from = nonEmptyString(context, record.fromRelationId, [...path, 'fromRelationId']); const to = nonEmptyString(context, record.toRelationId, [...path, 'toRelationId']); if (from !== undefined && to !== undefined) { const pair = stringTupleKey(from, to); if (pairs.has(pair)) invalid(context, path, 'duplicate_lens_relation'); else pairs.add(pair); } if (!Array.isArray(record.steps)) invalid(context, [...path, 'steps'], 'array_required'); else record.steps.forEach((step, stepIndex) => validateLensStep(context, step, [...path, 'steps', stepIndex])); });
   }
   if (context.issues.length === 0) { const validated = validateLens(body); if (!validated.success) context.issues.push(...validated.issues); }
   return context.issues.length === 0;
@@ -653,7 +654,7 @@ const semanticFailure = <Value>(family: SemanticKind, path: readonly unknown[], 
 const unwrap = <Value>(result: ParseResult<Value>): Value => { if (!result.success) throw new TarstateParseError(result.issues); return result.value; };
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;
 const hashValue = (value: JsonValue | undefined): value is `sha256:${string}` => typeof value === 'string' && /^sha256:[0-9a-f]{64}$/.test(value);
-const refKey = (ref: ArtifactRef): string => ref.id + '\u0000' + ref.contentHash;
-const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
+const refKey = (ref: ArtifactRef): string => stringTupleKey(ref.id, ref.contentHash);
+const capabilityKey = (ref: CapabilityRef): string => stringTupleKey(ref.id, ref.version, ref.contractHash);
 const union = <Value>(...sets: readonly ReadonlySet<Value>[]): Set<Value> => new Set(sets.flatMap((set) => [...set]));
 const setEqual = <Value>(left: ReadonlySet<Value>, right: ReadonlySet<Value>): boolean => left.size === right.size && [...left].every((value) => right.has(value));

@@ -1,8 +1,10 @@
 import type {
   CommitReceipt,
+  JsonValue,
   ObserverDiagnosticReporter,
   TransactionAttempt
 } from '@tarstate/core';
+import { safeParseJsonValue } from '@tarstate/core';
 import type {
   CommitFunction,
   ErasedCreateOptimisticOverlay,
@@ -25,6 +27,48 @@ const receiptIdentityMatches = (attempt: TransactionAttempt, receipt: CommitRece
   && receipt.attachmentId === attempt.attachmentId
   && receipt.transactionHash === attempt.transaction.contentHash;
 
+const adoptTransactionAttempt = (input: TransactionAttempt): TransactionAttempt => {
+  if (input === null || typeof input !== 'object' || Array.isArray(input) || Object.getPrototypeOf(input) !== Object.prototype) {
+    throw new TypeError('Transaction attempt must be a plain object');
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  const required = (name: 'operationEpoch' | 'operationId' | 'attachmentId' | 'transaction'): unknown => {
+    const descriptor = descriptors[name];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(`Transaction attempt ${name} must be an enumerable data property`);
+    return descriptor.value;
+  };
+  const operationEpoch = required('operationEpoch');
+  const operationId = required('operationId');
+  const attachmentId = required('attachmentId');
+  if (typeof operationEpoch !== 'string' || operationEpoch.length === 0 || typeof operationId !== 'string' || operationId.length === 0 || typeof attachmentId !== 'string' || attachmentId.length === 0) {
+    throw new TypeError('Transaction attempt identifiers must be non-empty strings');
+  }
+  const transaction = safeParseJsonValue(required('transaction'));
+  if (!transaction.success || transaction.value === null || typeof transaction.value !== 'object' || Array.isArray(transaction.value)) {
+    throw new TypeError('Transaction attempt transaction must be descriptor-safe portable data');
+  }
+  const optionalPortable = (name: 'expectedBasis'): JsonValue | undefined => {
+    const descriptor = descriptors[name];
+    if (descriptor === undefined) return undefined;
+    if (!descriptor.enumerable || !('value' in descriptor)) throw new TypeError(`Transaction attempt ${name} must be an enumerable data property`);
+    if (descriptor.value === undefined) return undefined;
+    const parsed = safeParseJsonValue(descriptor.value);
+    if (!parsed.success) throw new TypeError(`Transaction attempt ${name} must be descriptor-safe portable data`);
+    return parsed.value;
+  };
+  const expectedBasis = optionalPortable('expectedBasis');
+  const signalDescriptor = descriptors.signal;
+  if (signalDescriptor !== undefined && (!signalDescriptor.enumerable || !('value' in signalDescriptor))) throw new TypeError('Transaction attempt signal must be an enumerable data property');
+  return Object.freeze({
+    operationEpoch,
+    operationId,
+    attachmentId,
+    transaction: deepFreezeClone(transaction.value) as TransactionAttempt['transaction'],
+    ...(expectedBasis === undefined ? {} : { expectedBasis: deepFreezeClone(expectedBasis) }),
+    ...(signalDescriptor === undefined || signalDescriptor.value === undefined ? {} : { signal: signalDescriptor.value as AbortSignal })
+  });
+};
+
 export class MutationStore {
   readonly #overlayStore: OptimisticOverlayStore;
   readonly #listeners = new Set<() => void>();
@@ -45,36 +89,37 @@ export class MutationStore {
   readonly commit = async (attempt: TransactionAttempt, commitImplementation: CommitFunction | undefined, createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined): Promise<CommitReceipt> => {
     if (this.#closed) throw new Error('Tarstate provider runtime is closed');
     if (commitImplementation === undefined) throw new Error('TarstateProvider has no commit implementation');
+    const ownedAttempt = adoptTransactionAttempt(attempt);
     const mutationId = this.#nextMutationId++;
     let optimisticError: MutationEntry['optimisticError'];
     let overlay: OptimisticOverlay<unknown, unknown> | undefined;
     if (createOptimisticOverlay !== undefined) {
       try {
-        overlay = createOptimisticOverlay(attempt);
+        overlay = createOptimisticOverlay(ownedAttempt);
       } catch (error) {
         optimisticError = { phase: 'create-overlay', ...errorDetails(error) };
       }
     }
-    if (overlay !== undefined) optimisticError = this.#overlayStore.add(mutationId, attempt, overlay) ?? optimisticError;
+    if (overlay !== undefined) optimisticError = this.#overlayStore.add(mutationId, ownedAttempt, overlay) ?? optimisticError;
     this.#replace({
       mutationId,
-      operationEpoch: attempt.operationEpoch,
-      operationId: attempt.operationId,
-      attachmentId: attempt.attachmentId,
+      operationEpoch: ownedAttempt.operationEpoch,
+      operationId: ownedAttempt.operationId,
+      attachmentId: ownedAttempt.attachmentId,
       state: 'pending',
       ...(optimisticError === undefined ? {} : { optimisticError })
     });
     let receipt: CommitReceipt;
     try {
-      receipt = await commitImplementation(attempt);
-      if (!receiptIdentityMatches(attempt, receipt)) throw new Error('Commit receipt identity does not match its transaction attempt');
+      receipt = await commitImplementation(ownedAttempt);
+      if (!receiptIdentityMatches(ownedAttempt, receipt)) throw new Error('Commit receipt identity does not match its transaction attempt');
     } catch (error) {
       this.#overlayStore.discard(mutationId);
       this.#replace({
         mutationId,
-        operationEpoch: attempt.operationEpoch,
-        operationId: attempt.operationId,
-        attachmentId: attempt.attachmentId,
+        operationEpoch: ownedAttempt.operationEpoch,
+        operationId: ownedAttempt.operationId,
+        attachmentId: ownedAttempt.attachmentId,
         state: 'failed',
         error: errorDetails(error),
         ...(optimisticError === undefined ? {} : { optimisticError })
@@ -85,9 +130,9 @@ export class MutationStore {
     const latestError = this.#snapshot.mutations.find((entry) => entry.mutationId === mutationId)?.optimisticError ?? optimisticError;
     this.#replace({
       mutationId,
-      operationEpoch: attempt.operationEpoch,
-      operationId: attempt.operationId,
-      attachmentId: attempt.attachmentId,
+      operationEpoch: ownedAttempt.operationEpoch,
+      operationId: ownedAttempt.operationId,
+      attachmentId: ownedAttempt.attachmentId,
       state: 'settled',
       receipt,
       ...(latestError === undefined ? {} : { optimisticError: latestError })

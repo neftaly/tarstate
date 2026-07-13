@@ -133,9 +133,6 @@ importers:
       '@tarstate/core':
         specifier: workspace:^
         version: link:../core
-      zustand:
-        specifier: 5.0.14
-        version: 5.0.14(@types/react@19.2.17)(react@19.2.7)
     devDependencies:
       '@tanstack/store':
         specifier: 0.11.0
@@ -149,6 +146,9 @@ importers:
       vitest:
         specifier: 'catalog:'
         version: 4.1.9(@types/node@24.13.2)(vite@8.1.0(@types/node@24.13.2))
+      zustand:
+        specifier: 5.0.14
+        version: 5.0.14(@types/react@19.2.17)(react@19.2.7)
 
 packages:
 

@@ -9,7 +9,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageDirectories = ['core', 'automerge', 'zustand', 'react', 'schema-tools'];
 const coreSubpaths = ['artifacts', 'database', 'query', 'schema', 'transactions'];
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-release-'));
-const releaseVersion = '0.3.0';
+const releaseVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
+if (typeof releaseVersion !== 'string' || releaseVersion.length === 0) throw new Error('Root package version must be a non-empty string');
 const packedPackages = [];
 const builtins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
 
@@ -59,6 +60,10 @@ try {
       fail(`${manifest.name}: tarball contains source or build-state files`);
     }
     const packedManifest = JSON.parse(execFileSync('tar', ['-xOf', tarball, 'package/package.json'], { encoding: 'utf8' }));
+    if (manifest.name === '@tarstate/zustand') {
+      if (packedManifest.dependencies?.zustand !== undefined) fail('@tarstate/zustand: zustand must remain a peer dependency');
+      if (packedManifest.peerDependencies?.zustand !== '>=5.0.0 <6') fail('@tarstate/zustand: unexpected zustand peer range');
+    }
     for (const [dependency, version] of Object.entries(packedManifest.dependencies ?? {})) {
       if (String(version).startsWith('workspace:')) fail(`${manifest.name}: unresolved workspace dependency ${dependency}`);
       if (dependency.startsWith('@tarstate/') && !internalRangeIncludesRelease(String(version))) {
@@ -106,6 +111,7 @@ async function verifyPackedRuntime(packages) {
   mkdirSync(installation);
   const dependencies = Object.fromEntries(packages.map(({ manifest, tarball }) => [manifest.name, `file:${tarball}`]));
   dependencies.react = '19.2.7';
+  dependencies.zustand = '5.0.14';
   writeFileSync(path.join(installation, 'package.json'), JSON.stringify({
     name: 'tarstate-release-consumer',
     private: true,

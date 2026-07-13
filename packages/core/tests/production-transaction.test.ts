@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { ArtifactRef } from '../src/artifacts.js';
 import { checkFinalConstraints, type ConstraintEvaluation, type SourceConstraint } from '../src/constraints.js';
 import { InMemoryAtomicSource, type MemoryAttachment, type MemoryQueryResult, type MemoryRelation, type MemoryRow, type MemoryState } from '../src/memory-source.js';
 import type { QueryNode } from '../src/query.js';
@@ -20,7 +21,7 @@ const transaction = (statements: readonly WriteStatement[], parameters: Transact
   body: { schemaView, parameters, statements, guards, requiredCapabilities }
 });
 
-const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; attachments?: readonly MemoryAttachment[]; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult; onDiagnostic?: ConstructorParameters<typeof InMemoryAtomicSource>[0]['onDiagnostic'] } = {}) => new InMemoryAtomicSource({
+const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; attachments?: readonly MemoryAttachment[]; constraints?: readonly SourceConstraint<MemoryState>[]; resolveArtifact?: (ref: ArtifactRef) => Promise<Transaction | undefined> | Transaction | undefined; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult; onDiagnostic?: ConstructorParameters<typeof InMemoryAtomicSource>[0]['onDiagnostic'] } = {}) => new InMemoryAtomicSource({
   sourceId: 'source:one',
   incarnation: 'incarnation:one',
   operationEpoch: 'epoch:one',
@@ -28,11 +29,12 @@ const source = (options: { state?: MemoryState; relations?: readonly MemoryRelat
   relations: options.relations ?? [{ relationId: 'items', schemaView, keyFields: ['id'] }],
   attachments: options.attachments ?? [{ attachmentId: 'attachment:one', fingerprint: hash('b'), authorityViewFingerprint: hash('c'), schemaView, writable: true }],
   ...(options.constraints === undefined ? {} : { constraints: options.constraints }),
+  ...(options.resolveArtifact === undefined ? {} : { resolveArtifact: options.resolveArtifact }),
   ...(options.evaluateQuery === undefined ? {} : { evaluateQuery: options.evaluateQuery }),
   ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
 });
 
-const attempt = (operationId: string, value: Transaction, extra: Partial<{ expectedBasis: { incarnation: string; revision: number }; signal: AbortSignal }> = {}) => ({
+const attempt = (operationId: string, value: Transaction | ArtifactRef, extra: Partial<{ expectedBasis: { incarnation: string; revision: number }; signal: AbortSignal }> = {}) => ({
   operationEpoch: 'epoch:one', operationId, attachmentId: 'attachment:one', transaction: value, ...extra
 });
 
@@ -585,9 +587,35 @@ describe('production in-memory transaction coordinator', () => {
     const memory = source();
     const value = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
     const receipt = await memory.commit(attempt('old', value));
-    memory.rotateOperationEpoch('epoch:two');
+    await memory.rotateOperationEpoch('epoch:two');
     expect(memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'old', intentHash: receipt.intentHash })).toEqual({ status: 'expired' });
     expect(await memory.commit(attempt('after-retire', value))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.operation_epoch_expired' }] });
+  });
+
+  it('serializes epoch rotation after in-flight artifact resolution', async () => {
+    const value = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
+    let releaseResolution: (() => void) | undefined;
+    let markResolutionStarted: (() => void) | undefined;
+    const resolutionStarted = new Promise<void>((resolve) => { markResolutionStarted = resolve; });
+    const resolutionGate = new Promise<void>((resolve) => { releaseResolution = resolve; });
+    const memory = source({ resolveArtifact: async () => {
+      markResolutionStarted?.();
+      await resolutionGate;
+      return value;
+    } });
+    const reference: ArtifactRef = { id: value.id, contentHash: value.contentHash };
+    const commit = memory.commit(attempt('queued-before-rotation', reference));
+    await resolutionStarted;
+    let rotationSettled = false;
+    const rotation = memory.rotateOperationEpoch('epoch:two').then(() => { rotationSettled = true; });
+
+    await Promise.resolve();
+    expect(rotationSettled).toBe(false);
+    expect(memory.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [] } });
+    releaseResolution?.();
+    expect(await commit).toMatchObject({ outcome: 'committed', operationEpoch: 'epoch:one' });
+    await rotation;
+    expect(memory.snapshot()).toMatchObject({ basis: { revision: 1 }, state: { items: [{ id: 1 }] } });
   });
 });
 

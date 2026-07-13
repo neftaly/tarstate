@@ -46,6 +46,7 @@ import {
 } from './internal-query-maintenance-model.js';
 import { canonicalizeQueryValue, queryValueEqual } from './internal-query-values.js';
 import { groupRelationInputs, relationInputKey, relationKey, relationOccurrence } from './internal-query-relations.js';
+import { stringTupleKey } from './internal-string-key.js';
 import type {
   Expr,
   IncrementalQueryMaintenanceState,
@@ -857,7 +858,7 @@ export const incrementallyMaterializeFrom = (
 };
 
 const relationInputChangeKey = (input: RelationInputChange): string =>
-  relationKey(input.relation) + '\u0000' + (input.attachmentId ?? input.sourceId ?? '');
+  stringTupleKey(relationKey(input.relation), input.attachmentId ?? input.sourceId ?? '');
 
 const namespacedOccurrence = (namespace: string | undefined, occurrenceId: string): string =>
   namespace === undefined ? occurrenceId : namespace.length + ':' + namespace + occurrenceId.length + ':' + occurrenceId;
@@ -1266,7 +1267,7 @@ export const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: M
   });
 };
 
-const scopedRowIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => resultKey(row) + '\u0000' + rowValueIdentity(row, values);
+const scopedRowIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => stringTupleKey(resultKey(row), rowValueIdentity(row, values));
 const rowValueIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => {
   const cached = values.get(row);
   if (cached !== undefined) return cached;

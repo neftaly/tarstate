@@ -3,8 +3,18 @@ import { comparePortableStrings } from './portable-order.js';
 
 export type RuntimeLease<Runtime> = { readonly runtime: Runtime; readonly release: () => void };
 
+declare const runtimeKindBrand: unique symbol;
+/** Invariant token that binds a host registry slot to one runtime type. */
+export type RuntimeKind<Runtime> = object & {
+  readonly [runtimeKindBrand]: (runtime: Runtime) => Runtime;
+};
+
+/** Creates a stable token to reuse for every acquisition of one runtime family. */
+export const createRuntimeKind = <Runtime>(): RuntimeKind<Runtime> => Object.freeze({}) as RuntimeKind<Runtime>;
+
 type RuntimeEntry<Runtime> = {
   readonly identity: object;
+  readonly kind: RuntimeKind<Runtime>;
   readonly runtime: Runtime;
   leases: number;
   closed: boolean;
@@ -23,14 +33,16 @@ export class HostRuntimeRegistry {
   acquire<Runtime>(options: {
     readonly sourceId: string;
     readonly identity: object;
+    readonly kind: RuntimeKind<Runtime>;
     readonly create: () => { readonly runtime: Runtime; readonly close: () => void };
   }): RuntimeLease<Runtime> {
     if (this.#closed) throw new Error('Host runtime registry is closed');
     const existing = this.#sourceRuntimes.get(options.sourceId);
     if (existing !== undefined && existing.identity !== options.identity) throw new Error('A different live source identity is registered for ' + options.sourceId);
+    if (existing !== undefined && existing.kind !== options.kind) throw new Error('A different runtime kind is registered for ' + options.sourceId);
     const entry = existing ?? (() => {
       const created = options.create();
-      const next: RuntimeEntry<Runtime> = { identity: options.identity, runtime: created.runtime, close: created.close, leases: 0, closed: false };
+      const next: RuntimeEntry<Runtime> = { identity: options.identity, kind: options.kind, runtime: created.runtime, close: created.close, leases: 0, closed: false };
       this.#sourceRuntimes.set(options.sourceId, next as RuntimeEntry<unknown>);
       return next as RuntimeEntry<unknown>;
     })();

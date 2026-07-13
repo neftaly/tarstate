@@ -222,7 +222,7 @@ const parseBasis = (value: unknown): ParseResult<DatabaseDescriptionBasis> => {
   for (let index = 0; index < value.attachments.length; index += 1) {
     const item = value.attachments[index];
     if (!isRecord(item) || !exactKeys(item, ['attachmentId', 'basis', 'sourceId']) || typeof item.attachmentId !== 'string' || item.attachmentId.length === 0 || typeof item.sourceId !== 'string' || item.sourceId.length === 0) return invalid(['basis', 'attachments', index]);
-    const identity = item.attachmentId + '\u0000' + item.sourceId;
+    const identity = stringTupleKey(item.attachmentId, item.sourceId);
     if (identities.has(identity)) return invalid(['basis', 'attachments', index], 'duplicate');
     identities.add(identity);
     attachments.push({ attachmentId: item.attachmentId, sourceId: item.sourceId, basis: item.basis as JsonValue });
@@ -236,7 +236,7 @@ const parseDatasets = (values: readonly JsonValue[], acceptNormalizableInput = f
   for (let index = 0; index < values.length; index += 1) {
     const value = values[index];
     if (!isRecord(value) || !exactKeys(value, ['attachmentIds', 'datasetId', 'revision', 'state']) || typeof value.datasetId !== 'string' || value.datasetId.length === 0 || !isRevision(value.revision) || (value.state !== 'open' && value.state !== 'settled') || !Array.isArray(value.attachmentIds) || !value.attachmentIds.every((item) => typeof item === 'string' && item.length > 0)) return invalid(['datasets', index]);
-    const identity = value.datasetId + '\u0000' + value.revision;
+    const identity = stringTupleKey(value.datasetId, String(value.revision));
     if (identities.has(identity) || (!acceptNormalizableInput && new Set(value.attachmentIds).size !== value.attachmentIds.length)) return invalid(['datasets', index], 'duplicate');
     identities.add(identity);
     output.push({ datasetId: value.datasetId, revision: value.revision, state: value.state, attachmentIds: value.attachmentIds });
@@ -256,7 +256,7 @@ const parseRelations = (values: readonly JsonValue[], acceptNormalizableInput = 
     if (!editCapabilities.success) return editCapabilities;
     const missingCapabilities = parseCapabilities(value.missingCapabilities, ['relations', index, 'missingCapabilities'], acceptNormalizableInput);
     if (!missingCapabilities.success) return missingCapabilities;
-    const identity = schema.value.id + '\u0000' + schema.value.contentHash + '\u0000' + value.relationId + '\u0000' + value.attachmentId;
+    const identity = stringTupleKey(schema.value.id, schema.value.contentHash, value.relationId, value.attachmentId);
     if (identities.has(identity)) return invalid(['relations', index], 'duplicate');
     identities.add(identity);
     output.push({ schema: schema.value, relationId: value.relationId, localName: value.localName, attachmentId: value.attachmentId, readable: value.readable, editCapabilities: editCapabilities.value, missingCapabilities: missingCapabilities.value });
@@ -286,7 +286,7 @@ const parseImplications = (values: readonly JsonValue[]): ParseResult<DatabaseDe
     if (!provided.success) return provided;
     const implies = parseCapability(value.implies, ['capabilityImplications', index, 'implies']);
     if (!implies.success) return implies;
-    const identity = capabilityKey(provided.value) + '\u0000' + capabilityKey(implies.value);
+    const identity = stringTupleKey(capabilityKey(provided.value), capabilityKey(implies.value));
     if (identities.has(identity)) return invalid(['capabilityImplications', index], 'duplicate');
     identities.add(identity);
     output.push({ provided: provided.value, implies: implies.value });
@@ -344,7 +344,12 @@ const descriptionBudgetIssue = (value: DatabaseDescriptionSnapshot | DatabaseDes
 const normalizeCapabilities = (refs: readonly CapabilityRef[]): readonly CapabilityRef[] => [...new Map(refs.map((ref) => [capabilityKey(ref), normalizeCapability(ref)])).values()].sort((left, right) => compare(capabilityKey(left), capabilityKey(right)));
 const normalizeCapability = (ref: CapabilityRef): CapabilityRef => ({ id: ref.id, version: ref.version, contractHash: ref.contractHash });
 const normalizeRef = (ref: ArtifactRef): ArtifactRef => ({ id: ref.id, contentHash: ref.contentHash });
-const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
+const stringTupleKey = (...parts: readonly string[]): string => {
+  let key = '';
+  for (const part of parts) key += part.length + ':' + part;
+  return key;
+};
+const capabilityKey = (ref: CapabilityRef): string => stringTupleKey(ref.id, ref.version, ref.contractHash);
 const isRecord = (value: unknown): value is Readonly<Record<string, JsonValue | undefined>> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const exactKeys = (value: Readonly<Record<string, unknown>>, required: readonly string[], optional: readonly string[] = []): boolean => Object.keys(value).every((key) => required.includes(key) || optional.includes(key)) && required.every((key) => Object.hasOwn(value, key));
 const isRevision = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;

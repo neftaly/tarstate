@@ -21,6 +21,7 @@ export type RelationInput = {
 };
 
 export type QueryFunction = (args: readonly JsonValue[]) => JsonValue;
+/** Key with `capabilityRefKey`; legacy NUL-delimited keys remain accepted for NUL-free references. */
 export type FunctionRegistry = ReadonlyMap<string, QueryFunction>;
 
 export type Expr =

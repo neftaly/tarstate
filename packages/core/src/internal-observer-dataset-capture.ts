@@ -229,6 +229,7 @@ export class DatasetCaptureRuntime<Projection> {
       }
       if ('error' in capturedSource) return { member, attachment, authorized: true, captureIssues: [captureFailureIssue('source_snapshot_failed', member, capturedSource.error)] };
       const snapshot = capturedSource.snapshot;
+      if (snapshot.sourceId !== attachment.sourceId) return { member, attachment, authorized: true, sourceMismatch: true };
       let projection: AttachmentProjection<Projection> | undefined;
       if (snapshot.state === 'ready') {
         try {

@@ -30,8 +30,19 @@ export const zustandAtomicExternalStore = <State>(
         getState: () => hydration.hasHydrated() ? 'ready' : 'loading',
         subscribe: (listener: () => void) => {
           const stopStart = hydration.onHydrate(listener);
-          const stopFinish = hydration.onFinishHydration(listener);
-          return () => { stopStart(); stopFinish(); };
+          let stopFinish: () => void;
+          try {
+            stopFinish = hydration.onFinishHydration(listener);
+          } catch (error) {
+            try { stopStart(); } catch { /* preserve the registration failure */ }
+            throw error;
+          }
+          return () => {
+            let firstError: unknown;
+            try { stopStart(); } catch (error) { firstError = error; }
+            try { stopFinish(); } catch (error) { firstError ??= error; }
+            if (firstError !== undefined) throw firstError;
+          };
         }
       }
     })
