@@ -417,7 +417,14 @@ const withMaintenanceEvent = (node: MaterializedQueryNode, event: QueryMaintenan
 
 type AggregateGroupKey = { readonly canonical: string; readonly key: QueryRecord };
 type DistinctPositionKeyIndex = { readonly base: readonly string[]; readonly overlays: readonly ReadonlyMap<number, string>[] };
-type DistinctMaterializedState = { readonly inputs: readonly ScopedRow[]; readonly keys: DistinctPositionKeyIndex; readonly positionsByKey: ReadonlyMap<string, readonly number[]> };
+type DistinctPositionsIndex = { readonly base: ReadonlyMap<string, readonly number[]>; readonly overlays: readonly ReadonlyMap<string, readonly number[] | undefined>[] };
+type DistinctMaterializedState = {
+  readonly inputs: readonly ScopedRow[];
+  readonly keys: DistinctPositionKeyIndex;
+  readonly positions: DistinctPositionsIndex;
+  readonly outputKeys: readonly string[];
+  readonly outputPositionByKey: ReadonlyMap<string, number>;
+};
 type AggregateGroupMember = { readonly position: number; readonly row: ScopedRow };
 type AggregateGroupState = { readonly key: QueryRecord; readonly members: readonly AggregateGroupMember[]; readonly reducers: AggregateReducerStates; readonly output: ScopedRow };
 type DistinctCountIndex = { readonly base: ReadonlyMap<string, number>; readonly overlays: readonly ReadonlyMap<string, number>[], readonly distinctCount: number };
@@ -2893,7 +2900,14 @@ const indexDistinctState = (inputs: readonly ScopedRow[]): DistinctMaterializedS
     if (positions === undefined) positionsByKey.set(key, [position]);
     else positions.push(position);
   });
-  return { inputs, keys: { base, overlays: [] }, positionsByKey };
+  const outputKeys = [...positionsByKey.keys()];
+  return {
+    inputs,
+    keys: { base, overlays: [] },
+    positions: { base: positionsByKey, overlays: [] },
+    outputKeys,
+    outputPositionByKey: new Map(outputKeys.map((key, position) => [key, position]))
+  };
 };
 
 const distinctPositionKey = (index: DistinctPositionKeyIndex, position: number): string | undefined => {
@@ -2902,6 +2916,23 @@ const distinctPositionKey = (index: DistinctPositionKeyIndex, position: number):
     if (key !== undefined) return key;
   }
   return index.base[position];
+};
+
+const distinctPositions = (index: DistinctPositionsIndex, key: string): readonly number[] | undefined => {
+  for (let overlay = index.overlays.length - 1; overlay >= 0; overlay -= 1) {
+    const changes = index.overlays[overlay] as ReadonlyMap<string, readonly number[] | undefined>;
+    if (changes.has(key)) return changes.get(key);
+  }
+  return index.base.get(key);
+};
+
+const materializeDistinctPositions = (index: DistinctPositionsIndex): Map<string, readonly number[]> => {
+  const materialized = new Map(index.base);
+  for (const overlay of index.overlays) for (const [key, positions] of overlay) {
+    if (positions === undefined) materialized.delete(key);
+    else materialized.set(key, positions);
+  }
+  return materialized;
 };
 
 const incrementallyMaterializeDistinct = (
@@ -2926,9 +2957,13 @@ const incrementallyMaterializeDistinct = (
     issues: [], unavailable: false, stableChangedPositions: [],
     distinct: { ...previous.distinct, inputs: child.result.rows }
   }, { operator: 'distinct', strategy: 'selective', affectedUnitCount: 0 });
-  const positionsByKey = new Map(previous.distinct.positionsByKey);
   const affectedKeys = new Set<string>();
   const keyChanges = new Map<number, string>();
+  const positionChanges = new Map<string, readonly number[] | undefined>();
+  const previousPositions = previous.distinct.positions;
+  const currentPositions = (key: string): readonly number[] | undefined => positionChanges.has(key)
+    ? positionChanges.get(key)
+    : distinctPositions(previousPositions, key);
   for (const position of changed) {
     const row = child.result.rows[position];
     const beforeKey = distinctPositionKey(previous.distinct.keys, position);
@@ -2938,27 +2973,104 @@ const incrementallyMaterializeDistinct = (
     affectedKeys.add(beforeKey);
     affectedKeys.add(afterKey);
     if (beforeKey !== afterKey) {
-      const oldPositions = positionsByKey.get(beforeKey)?.filter((candidate) => candidate !== position) ?? [];
-      if (oldPositions.length === 0) positionsByKey.delete(beforeKey);
-      else positionsByKey.set(beforeKey, oldPositions);
-      const target = positionsByKey.get(afterKey) ?? [];
-      positionsByKey.set(afterKey, [...target, position].sort((left, right) => left - right));
+      const oldPositions = currentPositions(beforeKey)?.filter((candidate) => candidate !== position) ?? [];
+      positionChanges.set(beforeKey, oldPositions.length === 0 ? undefined : oldPositions);
+      const target = currentPositions(afterKey) ?? [];
+      positionChanges.set(afterKey, [...target, position].sort((left, right) => left - right));
     }
   }
   let keys: DistinctPositionKeyIndex = keyChanges.size === 0 ? previous.distinct.keys : { base: previous.distinct.keys.base, overlays: [...previous.distinct.keys.overlays, keyChanges] };
+  let positions: DistinctPositionsIndex = positionChanges.size === 0
+    ? previous.distinct.positions
+    : { base: previous.distinct.positions.base, overlays: [...previous.distinct.positions.overlays, positionChanges] };
   let compactionCount = 0;
   if (keys.overlays.length >= 64) {
     const base = [...keys.base];
     for (const overlay of keys.overlays) for (const [position, key] of overlay) base[position] = key;
     keys = { base, overlays: [] };
-    compactionCount = 1;
+    compactionCount += 1;
   }
-  const previousOutputByKey = new Map<string, ScopedRow>();
-  for (const row of previous.result.rows) previousOutputByKey.set(canonicalizeQueryValue(visibleRow(row)), row);
+  if (positions.overlays.length >= 64) {
+    positions = { base: materializeDistinctPositions(positions), overlays: [] };
+    compactionCount += 1;
+  }
+
+  // Most sparse replacements do not add, remove, or reorder a representative.
+  // Validate only the affected representatives and their immediate neighbours;
+  // untouched first positions remain strictly ordered by construction.
+  let stableRepresentativeLayout = true;
+  const nextKeyByOutputPosition = new Map<number, string>();
+  const vacatedOutputPositions: number[] = [];
+  const addedKeys: string[] = [];
+  const edges = new Set<number>();
+  for (const key of affectedKeys) {
+    const outputPosition = previous.distinct.outputPositionByKey.get(key);
+    const next = distinctPositions(positions, key);
+    if (outputPosition === undefined) {
+      if (next !== undefined) addedKeys.push(key);
+    } else if (next === undefined) vacatedOutputPositions.push(outputPosition);
+    else nextKeyByOutputPosition.set(outputPosition, key);
+  }
+  vacatedOutputPositions.sort((left, right) => left - right);
+  addedKeys.sort((left, right) => (distinctPositions(positions, left)?.[0] as number) - (distinctPositions(positions, right)?.[0] as number));
+  if (vacatedOutputPositions.length !== addedKeys.length) stableRepresentativeLayout = false;
+  else addedKeys.forEach((key, index) => nextKeyByOutputPosition.set(vacatedOutputPositions[index] as number, key));
+  for (const outputPosition of nextKeyByOutputPosition.keys()) {
+    if (outputPosition > 0) edges.add(outputPosition - 1);
+    if (outputPosition + 1 < previous.distinct.outputKeys.length) edges.add(outputPosition);
+  }
+  if (stableRepresentativeLayout) for (const leftPosition of edges) {
+    const leftKey = nextKeyByOutputPosition.get(leftPosition) ?? previous.distinct.outputKeys[leftPosition] as string;
+    const rightKey = nextKeyByOutputPosition.get(leftPosition + 1) ?? previous.distinct.outputKeys[leftPosition + 1] as string;
+    const leftFirst = distinctPositions(positions, leftKey)?.[0];
+    const rightFirst = distinctPositions(positions, rightKey)?.[0];
+    if (leftFirst === undefined || rightFirst === undefined || leftFirst >= rightFirst) {
+      stableRepresentativeLayout = false;
+      break;
+    }
+  }
+
+  if (stableRepresentativeLayout) {
+    const replacements = new Map<number, ScopedRow>();
+    for (const [outputPosition, key] of nextKeyByOutputPosition) {
+      const firstPosition = distinctPositions(positions, key)?.[0] as number;
+      const row = child.result.rows[firstPosition] as ScopedRow;
+      if (row !== previous.result.rows[outputPosition]) replacements.set(outputPosition, row);
+    }
+    const changedOutputPositions = [...replacements.keys()].sort((left, right) => left - right);
+    const output = changedOutputPositions.length === 0 ? previous.result.rows : [...previous.result.rows];
+    for (const [position, row] of replacements) (output as ScopedRow[])[position] = row;
+    let outputKeys = previous.distinct.outputKeys;
+    let outputPositionByKey = previous.distinct.outputPositionByKey;
+    if (vacatedOutputPositions.length > 0) {
+      const updatedKeys = [...outputKeys];
+      const updatedPositions = new Map(outputPositionByKey);
+      vacatedOutputPositions.forEach((outputPosition, index) => {
+        updatedPositions.delete(previous.distinct?.outputKeys[outputPosition] as string);
+        const key = addedKeys[index] as string;
+        updatedKeys[outputPosition] = key;
+        updatedPositions.set(key, outputPosition);
+      });
+      outputKeys = updatedKeys;
+      outputPositionByKey = updatedPositions;
+    }
+    const stableIdentityLayout = output.length === previous.result.rows.length
+      && output.every((row, index) => resultKey(row) === resultKey(previous.result.rows[index] as ScopedRow));
+    return withMaintenanceEvent({
+      result: { rows: output, completeness: child.result.completeness },
+      issues: [], unavailable: false,
+      ...(stableIdentityLayout ? { stableChangedPositions: changedOutputPositions } : {}),
+      distinct: { inputs: child.result.rows, keys, positions, outputKeys, outputPositionByKey }
+    }, { operator: 'distinct', strategy: 'selective', affectedUnitCount: affectedKeys.size, compactionCount });
+  }
+
+  const positionsByKey = materializeDistinctPositions(positions);
+  const previousOutputByKey = new Map(previous.distinct.outputKeys.map((key, position) => [key, previous.result.rows[position] as ScopedRow]));
   const entries = [...positionsByKey].sort((left, right) => (left[1][0] as number) - (right[1][0] as number));
-  const candidateOutput = entries.map(([key, positions]) => affectedKeys.has(key)
-    ? child.result.rows[positions[0] as number] as ScopedRow
-    : previousOutputByKey.get(key) ?? child.result.rows[positions[0] as number] as ScopedRow);
+  const outputKeys = entries.map(([key]) => key);
+  const candidateOutput = entries.map(([key, keyPositions]) => affectedKeys.has(key)
+    ? child.result.rows[keyPositions[0] as number] as ScopedRow
+    : previousOutputByKey.get(key) ?? child.result.rows[keyPositions[0] as number] as ScopedRow);
   const stableIdentityLayout = candidateOutput.length === previous.result.rows.length
     && candidateOutput.every((row, index) => resultKey(row) === resultKey(previous.result.rows[index] as ScopedRow));
   const changedOutputPositions = stableIdentityLayout ? candidateOutput.flatMap((row, index) => row === previous.result.rows[index] ? [] : [index]) : undefined;
@@ -2967,7 +3079,7 @@ const incrementallyMaterializeDistinct = (
     result: { rows: output, completeness: child.result.completeness },
     issues: [], unavailable: false,
     ...(changedOutputPositions === undefined ? {} : { stableChangedPositions: changedOutputPositions }),
-    distinct: { inputs: child.result.rows, keys, positionsByKey }
+    distinct: { inputs: child.result.rows, keys, positions, outputKeys, outputPositionByKey: new Map(outputKeys.map((key, position) => [key, position])) }
   }, { operator: 'distinct', strategy: 'selective', affectedUnitCount: affectedKeys.size, compactionCount });
 };
 

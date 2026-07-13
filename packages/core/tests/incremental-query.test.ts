@@ -451,6 +451,59 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
+  it('maintains a sparse key substitution without disturbing high-cardinality distinct representatives', () => {
+    const query: QueryNode = {
+      kind: 'distinct',
+      input: { kind: 'select', input: people, alias: 'value', fields: { value: field('p', 'score') } }
+    };
+    const rows = Array.from({ length: 10_000 }, (_, index): QueryRowOccurrence => ({
+      occurrenceId: `distinct:unique:${index}`,
+      row: { id: index, score: index }
+    }));
+    const initial = snapshot(rows, 1);
+    const next = snapshot(rows.map((row, index) => index === 5_000
+      ? { ...row, row: { ...row.row, score: 20_000 } }
+      : row), 2);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const before = session.getCurrentResult();
+    const maintained = applySnapshot(session, initial, next);
+
+    expect(semanticResult(maintained)).toEqual(oracle(query, next));
+    expect(maintained.state.operatorDiagnostics.distinct.selectiveNodeCount).toBe(1);
+    expect(maintained.rows[4_999]).toBe(before.rows[4_999]);
+    expect(maintained.rows[5_000]).not.toBe(before.rows[5_000]);
+    expect(maintained.rows[5_001]).toBe(before.rows[5_001]);
+    session.close();
+  });
+
+  it('does not reuse distinct result identities when a balanced substitution changes representatives', () => {
+    const distinct: QueryNode = {
+      kind: 'distinct',
+      input: { kind: 'select', input: people, alias: 'value', fields: { value: field('p', 'group') } }
+    };
+    const initial = snapshot([
+      { occurrenceId: 'balanced:a:first', row: { id: 1, group: 'a' } },
+      { occurrenceId: 'balanced:b:first', row: { id: 2, group: 'b' } },
+      { occurrenceId: 'balanced:b:second', row: { id: 3, group: 'b' } },
+      { occurrenceId: 'balanced:c:first', row: { id: 4, group: 'c' } }
+    ], 1);
+    const next = snapshot([
+      { occurrenceId: 'balanced:a:first', row: { id: 1, group: 'a' } },
+      { occurrenceId: 'balanced:b:first', row: { id: 2, group: 'a' } },
+      { occurrenceId: 'balanced:b:second', row: { id: 3, group: 'd' } },
+      { occurrenceId: 'balanced:c:first', row: { id: 4, group: 'c' } }
+    ], 2);
+    const session = openIncrementalQueryMaintenance(plan(distinct), initial);
+    const maintained = applySnapshot(session, initial, next);
+    const reopened = openIncrementalQueryMaintenance(plan(distinct), next);
+
+    expect(semanticResult(maintained)).toEqual(oracle(distinct, next));
+    expect(maintained.resultKeys).toEqual(reopened.getCurrentResult().resultKeys);
+    expect(maintained.state.operatorDiagnostics.distinct.selectiveNodeCount).toBe(1);
+    session.close();
+    reopened.close();
+  });
+
   it('propagates stable distinct replacements safely through slice and union-all', () => {
     const distinct: QueryNode = { kind: 'distinct', input: { kind: 'select', input: people, alias: 'value', fields: { value: field('p', 'score') } } };
     const queries: readonly QueryNode[] = [
@@ -584,6 +637,33 @@ describe('incremental query maintenance', () => {
       expect(maintained.state.operatorDiagnostics.aggregate.compactionCount).toBe(revision === 33 ? 1 : 0);
       accepted = next;
     }
+    session.close();
+  });
+
+  it('preserves left-to-right IEEE-754 sum and average semantics on sparse replacement', () => {
+    const query: QueryNode = {
+      kind: 'aggregate', input: people, alias: 'summary', groupBy: {},
+      measures: {
+        sum: { kind: 'aggregate', op: 'sum', value: field('p', 'score') },
+        average: { kind: 'aggregate', op: 'average', value: field('p', 'score') }
+      }
+    };
+    const initial = snapshot([
+      { occurrenceId: 'floating:a', row: { id: 1, score: 1e16 } },
+      { occurrenceId: 'floating:b', row: { id: 2, score: 1 } },
+      { occurrenceId: 'floating:c', row: { id: 3, score: -1e16 } }
+    ], 1);
+    const next = snapshot([
+      { occurrenceId: 'floating:a', row: { id: 1, score: 1e16 } },
+      { occurrenceId: 'floating:b', row: { id: 2, score: 2 } },
+      { occurrenceId: 'floating:c', row: { id: 3, score: -1e16 } }
+    ], 2);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const maintained = applySnapshot(session, initial, next);
+    expect(semanticResult(maintained)).toEqual(oracle(query, next));
+    expect(maintained.rows).toEqual([{ sum: 2, average: 2 / 3 }]);
+    // A sum-only delta would produce 0 - 1 + 2 = 1 here, so these measures
+    // must retain the ordered fold unless the public numeric semantics change.
     session.close();
   });
 
