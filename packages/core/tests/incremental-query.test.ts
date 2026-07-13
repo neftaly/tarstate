@@ -783,6 +783,39 @@ describe('incremental query maintenance', () => {
     aggregateSession.close();
   });
 
+  it('rematerializes local operators when a call argument contains a subquery dependency', () => {
+    const identity = { id: 'urn:test:nested-subquery-call', version: '1', contractHash: `sha256:${'6'.repeat(64)}` } as const;
+    const identityKey = identity.id + '\u0000' + identity.version + '\u0000' + identity.contractHash;
+    const functions = new Map([[identityKey, (args: readonly JsonValue[]) => args[0] ?? false]]);
+    const enabled = {
+      kind: 'subquery', mode: 'scalar',
+      query: {
+        kind: 'select', input: groupRows, alias: 'enabled',
+        fields: { value: field('g', 'enabled') }
+      }
+    } as const;
+    const query: QueryNode = {
+      kind: 'where',
+      input: people,
+      predicate: { kind: 'call', capability: identity, args: [enabled] }
+    };
+    const state = (value: boolean, revision: number): QueryMaintenanceSnapshot => ({
+      relations: [
+        relation('people', [basePeople[0] as QueryRowOccurrence], 1),
+        relation('groups', [{ occurrenceId: 'group:only', row: { enabled: value } }], revision)
+      ],
+      functions
+    });
+    const initial = state(true, 1);
+    const next = state(false, 2);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    const maintained = applySnapshot(session, initial, next);
+    expect(semanticResult(maintained)).toEqual(oracle(query, next));
+    expect(maintained.rows).toEqual([]);
+    session.close();
+  });
+
   it('maintains a skewed right join index across payload and key replacements', () => {
     const query: QueryNode = {
       kind: 'join', join: 'inner', left: from('left', 'l'), right: from('right', 'r'),

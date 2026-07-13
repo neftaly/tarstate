@@ -1,7 +1,6 @@
 import { canonicalizeJson } from './artifacts.js';
 import {
   type DatasetMembership,
-  type DatasetSnapshot,
   type AttachmentCatalog,
   type SourceFreshness,
   type SourceLifecycleState
@@ -9,10 +8,27 @@ import {
 import { createIssue, type Issue } from './issues.js';
 import {
   DatasetCaptureRuntime,
-  type AvailableQueryAttachment,
   type CapturedMember,
   type EvaluationSnapshot
 } from './internal-observer-dataset-capture.js';
+import { maintenanceInputWithFrame } from './internal-observer-maintenance-frames.js';
+import type {
+  CreateDatabaseQueryMaintenance,
+  DatabaseQueryMaintenanceInput,
+  DatabaseQueryMaintenanceSession,
+  MaintainedDatabaseQueryResult,
+  QueryMaintenanceDiagnostics,
+  QueryMaintenanceReuseDiagnostics
+} from './internal-observer-query-maintenance-contracts.js';
+import {
+  failedEvaluation,
+  failedMaintenanceSession,
+  getIncrementalMaintenanceDiagnostics,
+  getIncrementalMaintenanceReuseDiagnostics,
+  getTrustedIncrementalMetadata,
+  maintenanceFactoryInput,
+  type TrustedIncrementalMetadata
+} from './internal-observer-query-maintenance.js';
 import {
   notifyObservers,
   runObserverCleanups,
@@ -20,28 +36,19 @@ import {
 } from './observer-diagnostics.js';
 import type { PreparedPlan, SourceBasis } from './maintenance.js';
 import { assertPreparedPlan } from './internal-prepared-plan.js';
-import { adoptQueryOccurrenceIds } from './internal-query-ownership.js';
 import { deepFreezeObserverValue, detachPreparedPlan, parseObservationParameters, samePortableObserverValue } from './internal-observer-values.js';
-import {
-  diffQueryMaintenanceSnapshots,
-  createPooledIncrementalQueryRuntime,
-  isNonPoolableQueryError,
-  isPooledQueryRuntimeBusyError,
-  openIncrementalQueryMaintenance,
-  type FunctionRegistry,
-  type IncrementalQueryResult,
-  type PooledIncrementalQueryDiagnostics,
-  type PooledIncrementalQueryRoot,
-  type PooledIncrementalQueryRuntime,
-  type QueryMaintenanceUpdate,
-  type QueryMaintenanceSnapshot,
-  type QueryNode,
-  type QueryRecord,
-  type RelationInput
-} from './query.js';
 import type { JsonValue } from './value.js';
 
 export type { AvailableQueryAttachment } from './internal-observer-dataset-capture.js';
+export { createIncrementalDatabaseQueryMaintenance } from './internal-observer-query-maintenance.js';
+export type {
+  CreateDatabaseQueryMaintenance,
+  DatabaseQueryMaintenanceInput,
+  DatabaseQueryMaintenanceSession,
+  MaintainedDatabaseQueryResult,
+  QueryMaintenanceDiagnostics,
+  QueryMaintenanceReuseDiagnostics
+} from './internal-observer-query-maintenance-contracts.js';
 
 export type ObservationBasis = {
   readonly dataset: { readonly datasetId: string; readonly revision: number };
@@ -100,56 +107,7 @@ export interface QueryObserver<Row> {
   close(): void;
 }
 
-export type DatabaseQueryMaintenanceInput<Query, Projection> = {
-  readonly query: Query;
-  readonly parameters: Readonly<Record<string, JsonValue>>;
-  readonly dataset: DatasetSnapshot;
-  readonly attachments: readonly AvailableQueryAttachment<Projection>[];
-};
-
-export type MaintainedDatabaseQueryResult<Row> = {
-  readonly rows: readonly Row[];
-  readonly resultKeys: readonly string[];
-  readonly completeness: 'exact' | 'lower-bound' | 'unknown';
-  readonly issues: readonly Issue[];
-};
-
-export interface DatabaseQueryMaintenanceSession<Query, Row, Projection> {
-  getCurrentResult(): MaintainedDatabaseQueryResult<Row>;
-  updateInput(input: DatabaseQueryMaintenanceInput<Query, Projection>): MaintainedDatabaseQueryResult<Row>;
-  close(): void;
-}
-
-export type CreateDatabaseQueryMaintenance<Query, Row, Projection> = (input: {
-  readonly plan: PreparedPlan<Query>;
-  readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
-}) => DatabaseQueryMaintenanceSession<Query, Row, Projection>;
-
-/** Frozen physical counters for one active shared query-maintenance cohort. */
-export type QueryMaintenanceDiagnostics = PooledIncrementalQueryDiagnostics;
-/** Frame-delta computations shared across parameter cohorts in this database view. */
-export type QueryMaintenanceReuseDiagnostics = {
-  readonly computedFrameDeltaCount: number;
-  readonly reusedFrameDeltaCount: number;
-};
-
-const incrementalMaintenanceFactoryBrand = Symbol('tarstate.incremental-maintenance-factory');
-const maintenanceRuntimeIdentity = Symbol('tarstate.maintenance-runtime');
-type TrustedIncrementalMetadata = Readonly<Pick<IncrementalQueryResult['state'], 'revision' | 'resultDelta'> & { readonly owner: object }>;
-const trustedIncrementalResults = new WeakMap<object, TrustedIncrementalMetadata>();
 const trustedObservedResults = new WeakMap<object, TrustedIncrementalMetadata>();
-const trustedIncrementalFactories = new WeakMap<object, object>();
-type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
-  readonly [incrementalMaintenanceFactoryBrand]: {
-    readonly getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
-    readonly getReuseDiagnostics: (runtimeIdentity: object) => QueryMaintenanceReuseDiagnostics;
-  };
-};
-type InternalCreateDatabaseQueryMaintenanceInput<Query, Projection> = {
-  readonly plan: PreparedPlan<Query>;
-  readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
-  readonly [maintenanceRuntimeIdentity]: object;
-};
 
 export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly authorityScope: string;
@@ -266,24 +224,17 @@ export class DatabaseView<Query, Row, Projection = unknown> {
 
   /** Optional physical IVM counters; custom maintenance factories return no entries. */
   getQueryMaintenanceDiagnostics(): readonly QueryMaintenanceDiagnostics[] {
-    const branded = (this.#createQueryMaintenance as Partial<IncrementalDatabaseQueryMaintenanceFactory>)[incrementalMaintenanceFactoryBrand];
-    if (branded === undefined || typeof branded.getDiagnostics !== 'function') return [];
-    return Object.freeze([...this.#datasetRuntimes.values()].flatMap((runtime) => branded.getDiagnostics(runtime.identity)));
+    return getIncrementalMaintenanceDiagnostics(
+      this.#createQueryMaintenance,
+      this.#datasetRuntimes.values()
+    );
   }
 
   getQueryMaintenanceReuseDiagnostics(): QueryMaintenanceReuseDiagnostics {
-    const branded = (this.#createQueryMaintenance as Partial<IncrementalDatabaseQueryMaintenanceFactory>)[incrementalMaintenanceFactoryBrand];
-    if (branded === undefined || typeof branded.getReuseDiagnostics !== 'function') {
-      return Object.freeze({ computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 });
-    }
-    let computedFrameDeltaCount = 0;
-    let reusedFrameDeltaCount = 0;
-    for (const runtime of this.#datasetRuntimes.values()) {
-      const diagnostics = branded.getReuseDiagnostics(runtime.identity);
-      computedFrameDeltaCount += diagnostics.computedFrameDeltaCount;
-      reusedFrameDeltaCount += diagnostics.reusedFrameDeltaCount;
-    }
-    return Object.freeze({ computedFrameDeltaCount, reusedFrameDeltaCount });
+    return getIncrementalMaintenanceReuseDiagnostics(
+      this.#createQueryMaintenance,
+      this.#datasetRuntimes.values()
+    );
   }
 
   getDatabaseDescriptionSnapshot(): JsonValue | undefined {
@@ -307,12 +258,6 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     this.#datasetRuntimes.clear();
   }
 }
-
-const captureFrameMetadata = Symbol('tarstate.capture-frame');
-type CaptureFrameMetadata = { readonly frameIdentity: object; readonly parameterKey: string; readonly runtimeIdentity: object };
-type InternalDatabaseQueryMaintenanceInput<Query, Projection> = DatabaseQueryMaintenanceInput<Query, Projection> & {
-  readonly [captureFrameMetadata]: CaptureFrameMetadata;
-};
 
 type SharedOptions<Query, Row, Projection> = {
   readonly plan: PreparedPlan<Query>;
@@ -445,26 +390,26 @@ class SharedObservation<Query, Row, Projection> {
   }
 
   #maintenanceInput(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceInput<Query, Projection> {
-    return {
-      query: this.#options.plan.query,
-      parameters: this.#options.parameters,
-      dataset: captured.dataset,
-      attachments: captured.available,
-      [captureFrameMetadata]: Object.freeze({
+    return maintenanceInputWithFrame(
+      this.#options.plan.query,
+      this.#options.parameters,
+      captured.dataset,
+      captured.available,
+      {
         frameIdentity: captured.identity,
         parameterKey: this.#parameterKey,
         runtimeIdentity: this.#options.runtime.identity
-      })
-    } as InternalDatabaseQueryMaintenanceInput<Query, Projection>;
+      }
+    );
   }
 
   #openMaintenance(captured: EvaluationSnapshot<Projection>): DatabaseQueryMaintenanceSession<Query, Row, Projection> {
     try {
-      return this.#options.createQueryMaintenance({
-        plan: this.#options.plan,
-        initialInput: this.#maintenanceInput(captured),
-        [maintenanceRuntimeIdentity]: this.#options.runtime.identity
-      } as InternalCreateDatabaseQueryMaintenanceInput<Query, Projection>);
+      return this.#options.createQueryMaintenance(maintenanceFactoryInput(
+        this.#options.plan,
+        this.#maintenanceInput(captured),
+        this.#options.runtime.identity
+      ));
     } catch (error) {
       return failedMaintenanceSession<Query, Row, Projection>(error);
     }
@@ -479,9 +424,7 @@ class SharedObservation<Query, Row, Projection> {
   }
 
   #result(maintained: MaintainedDatabaseQueryResult<Row>, captured: EvaluationSnapshot<Projection>): ObservedQueryResult<Row> {
-    const candidateIncremental = trustedIncrementalResults.get(maintained as object);
-    const expectedOwner = trustedIncrementalFactories.get(this.#options.createQueryMaintenance as object);
-    const trustedIncremental = candidateIncremental?.owner === expectedOwner ? candidateIncremental : undefined;
+    const trustedIncremental = getTrustedIncrementalMetadata(this.#options.createQueryMaintenance, maintained);
     const evidence = captured.members.map(sourceEvidence);
     const evidenceIssues = evidence.flatMap(({ issues }) => issues);
     const membershipIssue = captured.dataset.state === 'open'
@@ -546,403 +489,6 @@ class SharedObservation<Query, Row, Projection> {
     return Object.freeze({ state: 'open', current, ...(lastExact === undefined ? {} : { lastExact }) });
   }
 }
-
-/** Bridges relation projections into the production incremental query graph. */
-export const createIncrementalDatabaseQueryMaintenance = (
-  functions?: FunctionRegistry
-): CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> => {
-  const scopes = new WeakMap<object, Map<string, PooledDatabaseMaintenanceCohort>>();
-  const normalize = createQueryMaintenanceSnapshotNormalizer(functions);
-  const trustOwner = Object.freeze({});
-  let nextCohortIdentity = 0;
-  const factory = ((input) => {
-    const { plan, initialInput } = input;
-    const runtimeIdentity = (input as Partial<InternalCreateDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[maintenanceRuntimeIdentity];
-    const initial = normalize(initialInput);
-    if (runtimeIdentity === undefined) return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
-    let cohorts = scopes.get(runtimeIdentity);
-    if (cohorts === undefined) {
-      cohorts = new Map();
-      scopes.set(runtimeIdentity, cohorts);
-    }
-    const key = pooledDatabaseCohortKey(plan, initialInput.parameters);
-    let cohort = cohorts.get(key);
-    const attachesToRejected = cohort?.lastRejected !== undefined
-      && sameQueryMaintenanceSnapshot(cohort.lastRejected, initial);
-    const attachesToFailed = cohort?.transitionFailure !== undefined
-      && cohort.transitionFailure.attachable
-      && cohort.transitionFailure.snapshot === initial;
-    if (cohort !== undefined && !sameQueryMaintenanceSnapshot(cohort.accepted, initial) && !attachesToRejected && !attachesToFailed) {
-      return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
-    }
-    if (cohort === undefined) {
-      const runtime = createPooledIncrementalQueryRuntime({
-        environment: {
-          runtimeIdentity: 'cohort:' + String(nextCohortIdentity += 1),
-          registryFingerprint: plan.registryFingerprint,
-          authorityFingerprint: plan.authorityFingerprint,
-          datasetId: plan.datasetId,
-          parameters: initialInput.parameters,
-          ...(functions === undefined ? {} : { functions })
-        },
-        initialSnapshot: initial
-      });
-      cohort = { key, runtime, accepted: initial, roots: 0 };
-      cohorts.set(key, cohort);
-      try {
-        const root = runtime.attach(plan);
-        if (hasInvalidIncrementalInput(root.getCurrentResult())) {
-          runtime.close();
-          if (cohorts.get(key) === cohort) cohorts.delete(key);
-          return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
-        }
-        cohort.roots += 1;
-        return openPooledDatabaseMaintenance({ plan, initial, root, cohort, cohorts, normalize, trustOwner });
-      } catch (error) {
-        runtime.close();
-        if (cohorts.get(key) === cohort) cohorts.delete(key);
-        if (!isNonPoolableQueryError(error)) throw error;
-        return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
-      }
-    }
-    try {
-      const root = cohort.runtime.attach(plan);
-      cohort.roots += 1;
-      return openPooledDatabaseMaintenance({ plan, initial: attachesToRejected || attachesToFailed ? cohort.accepted : initial, root, cohort, cohorts, normalize, trustOwner });
-    } catch (error) {
-      if (!isNonPoolableQueryError(error) && !isPooledQueryRuntimeBusyError(error)) throw error;
-      return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
-    }
-  }) as IncrementalDatabaseQueryMaintenanceFactory;
-  trustedIncrementalFactories.set(factory, trustOwner);
-  Object.defineProperty(factory, incrementalMaintenanceFactoryBrand, {
-    value: Object.freeze({
-      getDiagnostics: (runtimeIdentity: object) => Object.freeze(
-        [...(scopes.get(runtimeIdentity)?.values() ?? [])].map(({ runtime }) => runtime.getDiagnostics())
-      ),
-      getReuseDiagnostics: (runtimeIdentity: object) => normalize.getReuseDiagnostics(runtimeIdentity)
-    })
-  });
-  return factory;
-};
-
-type PooledDatabaseMaintenanceCohort = {
-  readonly key: string;
-  readonly runtime: PooledIncrementalQueryRuntime;
-  accepted: QueryMaintenanceSnapshot;
-  lastRejected?: QueryMaintenanceSnapshot;
-  transitionFailure?: {
-    readonly snapshot: QueryMaintenanceSnapshot;
-    readonly result: MaintainedDatabaseQueryResult<QueryRecord>;
-    readonly attachable: boolean;
-  };
-  roots: number;
-};
-
-const openPooledDatabaseMaintenance = (options: {
-  readonly plan: PreparedPlan<QueryNode>;
-  readonly initial: QueryMaintenanceSnapshot;
-  readonly root: PooledIncrementalQueryRoot;
-  readonly cohort: PooledDatabaseMaintenanceCohort;
-  readonly cohorts: Map<string, PooledDatabaseMaintenanceCohort>;
-  readonly normalize: QueryMaintenanceSnapshotNormalizer;
-  readonly trustOwner: object;
-}): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
-  let localAccepted = options.initial;
-  let root: PooledIncrementalQueryRoot | undefined = options.root;
-  let privateSession: DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
-  let closed = false;
-
-  const detach = (): void => {
-    if (root === undefined) return;
-    root.close();
-    root = undefined;
-    options.cohort.roots -= 1;
-    if (options.cohort.roots !== 0) return;
-    options.cohort.runtime.close();
-    if (options.cohorts.get(options.cohort.key) === options.cohort) options.cohorts.delete(options.cohort.key);
-  };
-
-  return {
-    getCurrentResult: () => privateSession === undefined
-      ? options.cohort.transitionFailure?.result ?? databaseResultFromMaintained((root ?? options.root).getCurrentResult(), options.trustOwner)
-      : privateSession.getCurrentResult(),
-    updateInput: (input) => {
-      const normalizedNext = options.normalize(input);
-      if (privateSession !== undefined) return privateSession.updateInput(input);
-      if (options.cohort.transitionFailure !== undefined && normalizedNext === options.cohort.transitionFailure.snapshot) {
-        return options.cohort.transitionFailure.result;
-      }
-      // A new capture frame is a fresh transition attempt. In particular, a
-      // source may return directly to the already accepted frame without
-      // invoking the physical runtime again.
-      delete options.cohort.transitionFailure;
-      const returnsToAccepted = sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.accepted);
-      if (returnsToAccepted && options.cohort.lastRejected === undefined) {
-        localAccepted = normalizedNext;
-        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult(), options.trustOwner);
-      }
-      if (!returnsToAccepted && options.cohort.lastRejected !== undefined && sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.lastRejected)) {
-        return databaseResultFromMaintained((root as PooledIncrementalQueryRoot).getCurrentResult(), options.trustOwner);
-      }
-      if (!sameQueryMaintenanceSnapshot(localAccepted, options.cohort.accepted)) {
-        detach();
-        privateSession = openPrivateDatabaseMaintenance(options.plan, localAccepted, options.normalize, options.trustOwner);
-        return privateSession.updateInput(input);
-      }
-      const updatingRoot = root ?? options.root;
-      const rejectedBefore = options.cohort.runtime.getDiagnostics().rejectedUpdateCount;
-      let delta: QueryMaintenanceSnapshotDiff;
-      try {
-        delta = options.normalize.diff(options.cohort.accepted, normalizedNext);
-      } catch (error) {
-        const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
-        options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: false };
-        return result;
-      }
-      try {
-        options.cohort.runtime.applyUpdate(delta.update);
-      } catch (error) {
-        const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
-        options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: true };
-        return result;
-      }
-      delete options.cohort.transitionFailure;
-      if (options.cohort.runtime.getDiagnostics().rejectedUpdateCount === rejectedBefore) {
-        delta.accept();
-        options.cohort.accepted = normalizedNext;
-        delete options.cohort.lastRejected;
-        localAccepted = normalizedNext;
-      } else {
-        options.cohort.lastRejected = normalizedNext;
-      }
-      return databaseResultFromMaintained(updatingRoot.getCurrentResult(), options.trustOwner);
-    },
-    close: () => {
-      if (closed) return;
-      closed = true;
-      privateSession?.close();
-      detach();
-    }
-  };
-};
-
-const openPrivateDatabaseMaintenance = (
-  plan: PreparedPlan<QueryNode>,
-  initial: QueryMaintenanceSnapshot,
-  normalize: QueryMaintenanceSnapshotNormalizer,
-  trustOwner: object
-): DatabaseQueryMaintenanceSession<QueryNode, QueryRecord, readonly RelationInput[]> => {
-  let accepted = initial;
-  let session = openIncrementalQueryMaintenance(plan, accepted);
-  return {
-    getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult(), trustOwner),
-    updateInput: (input) => {
-      const next = normalize(input);
-      let update: ReturnType<typeof diffQueryMaintenanceSnapshots>;
-      try {
-        update = diffQueryMaintenanceSnapshots(accepted, next);
-      } catch (error) {
-        // Verify the fixed session environment without traversing relation
-        // rows; malformed accepted occurrence identity is classified from the
-        // incremental session's validation evidence below.
-        try {
-          diffQueryMaintenanceSnapshots(
-            { ...accepted, relations: [] },
-            { ...next, relations: [] }
-          );
-        } catch {
-          throw error;
-        }
-        const acceptedIsInvalid = hasInvalidIncrementalInput(session.getCurrentResult());
-        if (!acceptedIsInvalid) throw error;
-        // An invalid initial snapshot can make an exact delta impossible to
-        // construct. Rebase the private fallback so a later valid source
-        // snapshot can recover instead of remaining pinned to malformed input.
-        try { session.close(); } catch { /* replacement must not depend on cleanup */ }
-        accepted = next;
-        session = openIncrementalQueryMaintenance(plan, accepted);
-        return databaseResultFromMaintained(session.getCurrentResult(), trustOwner);
-      }
-      const rejectedBefore = session.getCurrentResult().state.rejectedUpdateCount;
-      const result = session.applyUpdate(update);
-      if (result.state.rejectedUpdateCount === rejectedBefore) accepted = next;
-      return databaseResultFromMaintained(result, trustOwner);
-    },
-    close: () => session.close()
-  };
-};
-
-const hasInvalidIncrementalInput = (result: IncrementalQueryResult): boolean => result.issues.some(({ code }) =>
-  code === 'query.incremental_relation_ambiguous' || code === 'query.incremental_identity_invalid'
-);
-
-const pooledDatabaseCohortKey = (
-  plan: PreparedPlan<QueryNode>,
-  parameters: Readonly<Record<string, JsonValue>>
-): string => canonicalizeJson([
-  plan.datasetId,
-  plan.authorityFingerprint,
-  plan.registryFingerprint,
-  parameters
-] as JsonValue);
-
-const sameQueryMaintenanceSnapshot = (left: QueryMaintenanceSnapshot, right: QueryMaintenanceSnapshot): boolean => {
-  if (left === right) return true;
-  // Basis and membership evidence are cheap, high-selectivity guards. Avoid
-  // canonicalizing every relation row for the normal new-basis transition.
-  // Occurrence identity was descriptor-safely adopted once when the capture
-  // frame was built, so new-basis transitions need no source-owned traversal.
-  if (left.membershipRevision !== right.membershipRevision || !samePortableObserverValue(left.basis, right.basis)) return false;
-  if (!samePortableObserverValue(left.parameters, right.parameters)) return false;
-  return samePortableObserverValue(left.relations, right.relations);
-};
-
-const queryMaintenanceFrameIdentity = Symbol('tarstate.query-maintenance-frame');
-type FramedQueryMaintenanceSnapshot = QueryMaintenanceSnapshot & {
-  readonly [queryMaintenanceFrameIdentity]: {
-    readonly frameIdentity: object;
-    readonly runtimeIdentity: object;
-  };
-};
-type QueryMaintenanceSnapshotDiff = {
-  readonly update: QueryMaintenanceUpdate;
-  /** Publishes a reusable delta only after its physical application was accepted. */
-  readonly accept: () => void;
-};
-type QueryMaintenanceSnapshotNormalizer = {
-  (input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>): QueryMaintenanceSnapshot;
-  readonly diff: (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot) => QueryMaintenanceSnapshotDiff;
-  readonly getReuseDiagnostics: (runtimeIdentity: object) => QueryMaintenanceReuseDiagnostics;
-};
-
-const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | undefined): QueryMaintenanceSnapshotNormalizer => {
-  const maxParameterSnapshotsPerFrame = 256;
-  const frames = new WeakMap<object, {
-    readonly normalized: Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'>;
-    readonly parameters: Map<string, QueryMaintenanceSnapshot>;
-  }>();
-  const deltas = new WeakMap<object, WeakMap<object, QueryMaintenanceUpdate>>();
-  const reuseDiagnostics = new WeakMap<object, { computedFrameDeltaCount: number; reusedFrameDeltaCount: number }>();
-  const normalize = (input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>): QueryMaintenanceSnapshot => {
-    const metadata = (input as Partial<InternalDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[captureFrameMetadata];
-    if (metadata === undefined) return normalizeQueryMaintenanceSnapshot(input, functions);
-    let frame = frames.get(metadata.frameIdentity);
-    if (frame === undefined) {
-      frame = { normalized: normalizeQueryMaintenanceFrame(input), parameters: new Map() };
-      frames.set(metadata.frameIdentity, frame);
-    }
-    const cached = frame.parameters.get(metadata.parameterKey);
-    if (cached !== undefined) {
-      // Map insertion order is the deterministic recency list.
-      frame.parameters.delete(metadata.parameterKey);
-      frame.parameters.set(metadata.parameterKey, cached);
-      return cached;
-    }
-    const normalized: FramedQueryMaintenanceSnapshot = {
-      ...frame.normalized,
-      parameters: input.parameters,
-      ...(functions === undefined ? {} : { functions }),
-      [queryMaintenanceFrameIdentity]: Object.freeze({
-        frameIdentity: metadata.frameIdentity,
-        runtimeIdentity: metadata.runtimeIdentity
-      })
-    };
-    if (frame.parameters.size >= maxParameterSnapshotsPerFrame) {
-      const leastRecentlyUsed = frame.parameters.keys().next().value;
-      if (leastRecentlyUsed !== undefined) frame.parameters.delete(leastRecentlyUsed);
-    }
-    frame.parameters.set(metadata.parameterKey, normalized);
-    return normalized;
-  };
-  normalize.diff = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): QueryMaintenanceSnapshotDiff => {
-    const previousMetadata = (previous as Partial<FramedQueryMaintenanceSnapshot>)[queryMaintenanceFrameIdentity];
-    const nextMetadata = (next as Partial<FramedQueryMaintenanceSnapshot>)[queryMaintenanceFrameIdentity];
-    if (previousMetadata === undefined || nextMetadata === undefined || previousMetadata.runtimeIdentity !== nextMetadata.runtimeIdentity) {
-      return { update: diffQueryMaintenanceSnapshots(previous, next), accept: () => undefined };
-    }
-    const { frameIdentity: previousFrame, runtimeIdentity } = previousMetadata;
-    const { frameIdentity: nextFrame } = nextMetadata;
-
-    // Parameters and capabilities remain cohort-local even though the captured
-    // relation frame is shared. Validate them before consulting the frame cache.
-    diffQueryMaintenanceSnapshots({ ...previous, relations: [] }, { ...next, relations: [] });
-    const prior = deltas.get(previousFrame)?.get(nextFrame);
-    if (prior !== undefined) {
-      const diagnostics = reuseDiagnostics.get(runtimeIdentity) ?? { computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 };
-      diagnostics.reusedFrameDeltaCount += 1;
-      reuseDiagnostics.set(runtimeIdentity, diagnostics);
-      return { update: prior, accept: () => undefined };
-    }
-
-    const update = freezeQueryMaintenanceUpdate(diffQueryMaintenanceSnapshots(previous, next));
-    const diagnostics = reuseDiagnostics.get(runtimeIdentity) ?? { computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 };
-    diagnostics.computedFrameDeltaCount += 1;
-    reuseDiagnostics.set(runtimeIdentity, diagnostics);
-    return {
-      update,
-      accept: () => {
-        let from = deltas.get(previousFrame);
-        if (from === undefined) {
-          from = new WeakMap();
-          deltas.set(previousFrame, from);
-        }
-        if (!from.has(nextFrame)) from.set(nextFrame, update);
-      }
-    };
-  };
-  normalize.getReuseDiagnostics = (runtimeIdentity: object) => Object.freeze({
-    computedFrameDeltaCount: reuseDiagnostics.get(runtimeIdentity)?.computedFrameDeltaCount ?? 0,
-    reusedFrameDeltaCount: reuseDiagnostics.get(runtimeIdentity)?.reusedFrameDeltaCount ?? 0
-  });
-  return normalize;
-};
-
-const freezeQueryMaintenanceUpdate = (update: QueryMaintenanceUpdate): QueryMaintenanceUpdate => deepFreezeObserverValue(update);
-
-const normalizeQueryMaintenanceSnapshot = (
-  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
-  functions: FunctionRegistry | undefined
-): QueryMaintenanceSnapshot => ({
-  ...normalizeQueryMaintenanceFrame(input),
-  parameters: input.parameters,
-  ...(functions === undefined ? {} : { functions })
-});
-
-const normalizeQueryMaintenanceFrame = (
-  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>
-): Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'> => ({
-  relations: input.attachments.flatMap(({ member, snapshot, projection }) => projection.map((relation) => ({
-    ...relation,
-    ...(relation.occurrenceIds === undefined ? {} : { occurrenceIds: adoptQueryOccurrenceIds(relation.occurrenceIds) }),
-    sourceId: member.sourceId,
-    attachmentId: member.attachmentId,
-    basis: snapshot.basis
-  }))),
-  basis: {
-    dataset: { datasetId: input.dataset.datasetId, revision: input.dataset.revision },
-    attachments: input.attachments.map(({ member, snapshot }) => ({ attachmentId: member.attachmentId, sourceId: member.sourceId, basis: snapshot.basis }))
-  },
-  membershipRevision: input.dataset.revision
-});
-
-const databaseResultFromMaintained = ({ state, rows, resultKeys, completeness, issues }: IncrementalQueryResult, owner: object): MaintainedDatabaseQueryResult<QueryRecord> => {
-  const result = Object.freeze({ rows, resultKeys, completeness, issues });
-  trustedIncrementalResults.set(result, Object.freeze({ revision: state.revision, resultDelta: state.resultDelta, owner }));
-  return result;
-};
-
-const failedMaintenanceSession = <Query, Row, Projection>(error: unknown): DatabaseQueryMaintenanceSession<Query, Row, Projection> => {
-  const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<Row>;
-  return { getCurrentResult: () => result, updateInput: () => result, close: () => undefined };
-};
-
-const failedEvaluation = (error: unknown): MaintainedDatabaseQueryResult<never> => ({
-  rows: [],
-  resultKeys: [],
-  completeness: 'unknown',
-  issues: [observationIssue('observer.evaluation_failed', 'after_refresh', { error: error instanceof Error ? error.name : typeof error })]
-});
 
 const closedSnapshot: ObserverSnapshot<never> = Object.freeze({ state: 'closed' });
 
@@ -1076,7 +622,7 @@ const sameObservedResultMetadata = <Row>(left: ObservedQueryResult<Row>, right: 
 const incrementalResultDiff = <Row>(
   before: ObservedQueryResult<Row>,
   after: ObservedQueryResult<Row>,
-  delta: IncrementalQueryResult['state']['resultDelta']
+  delta: TrustedIncrementalMetadata['resultDelta']
 ): ResultDiff<Row> => {
   const addedKeys = new Set(delta.addedResultKeys);
   const removedKeys = new Set(delta.removedResultKeys);
