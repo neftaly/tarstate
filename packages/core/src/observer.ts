@@ -109,6 +109,17 @@ export interface QueryObserver<Row> {
 
 const trustedObservedResults = new WeakMap<object, TrustedIncrementalMetadata>();
 
+type CaptureObservationEvidence = {
+  readonly basis: ObservationBasis;
+  readonly sourceStates: readonly SourceEvidence[];
+  readonly issues: readonly Issue[];
+  readonly freshness: ObservedQueryResult<never>['freshness'];
+  readonly requiredProjectionInvalid: boolean;
+  readonly requiredUnavailable: boolean;
+};
+
+const captureObservationEvidence = new WeakMap<object, CaptureObservationEvidence>();
+
 export type DatabaseViewOptions<Query, Row, Projection> = {
   readonly authorityScope: string;
   readonly authorityFingerprint: string;
@@ -453,61 +464,34 @@ class SharedObservation<Query, Row, Projection> {
 
   #result(maintained: MaintainedDatabaseQueryResult<Row>, captured: EvaluationSnapshot<Projection>): ObservedQueryResult<Row> {
     const trustedIncremental = getTrustedIncrementalMetadata(this.#options.createQueryMaintenance, maintained);
-    const evidence = captured.members.map(sourceEvidence);
-    const evidenceIssues = evidence.flatMap(({ issues }) => issues);
-    const membershipIssue = captured.dataset.state === 'open'
-      ? [observationIssue('observer.membership_open', 'after_refresh', { datasetId: captured.dataset.datasetId, revision: captured.dataset.revision })]
-      : [];
+    const captureEvidence = evidenceForCapture(captured);
     const resultIdentityIssue = trustedIncremental !== undefined || (maintained.rows.length === maintained.resultKeys.length && new Set(maintained.resultKeys).size === maintained.resultKeys.length)
       ? []
       : [observationIssue('observer.evaluation_failed', 'after_refresh', { reason: 'invalid_result_identity' })];
-    const requiredProjectionInvalid = captured.members.some((candidate) =>
-      candidate.member.expectation === 'required' &&
-      candidate.snapshot?.state === 'ready' &&
-      candidate.projection?.state === 'failed'
-    );
     const evaluationInvalid = resultIdentityIssue.length > 0 || maintained.issues.some(({ code }) => code === 'observer.evaluation_failed');
-    const requiredUnavailable = evidence.some((item) => item.expectation === 'required' && (item.state !== 'ready' || !item.authorized));
-    const inputsIncomplete = captured.dataset.state !== 'settled' || requiredUnavailable || evaluationInvalid;
+    const inputsIncomplete = captured.dataset.state !== 'settled' || captureEvidence.requiredUnavailable || evaluationInvalid;
     let completeness = maintained.completeness;
     if (inputsIncomplete && !(this.#options.allowPartial && completeness === 'lower-bound')) completeness = 'unknown';
     const rows = completeness === 'unknown' ? [] : maintained.rows;
     const resultKeys = completeness === 'unknown' ? [] : maintained.resultKeys;
-    const readiness = requiredProjectionInvalid || evaluationInvalid
+    const readiness = captureEvidence.requiredProjectionInvalid || evaluationInvalid
       ? 'invalid'
       : completeness === 'exact' ? 'ready' : 'incomplete';
-    const basisAttachments = captured.members.flatMap((candidate) => candidate.snapshot === undefined ? [] : [{
-      attachmentId: candidate.member.attachmentId,
-      sourceId: candidate.member.sourceId,
-      basis: candidate.snapshot.basis
-    }]);
-    const result = {
+    const dynamicIssues = deepFreezeObserverValue([...resultIdentityIssue, ...maintained.issues]) as readonly Issue[];
+    const issues = Object.freeze([...captureEvidence.issues, ...dynamicIssues]);
+    const canReuseMaintained = trustedIncremental !== undefined && completeness !== 'unknown' && rows === maintained.rows && resultKeys === maintained.resultKeys;
+    const result = Object.freeze({
       readiness,
-      rows,
-      resultKeys,
+      rows: canReuseMaintained ? rows : deepFreezeObserverValue(rows),
+      resultKeys: canReuseMaintained ? resultKeys : deepFreezeObserverValue(resultKeys),
       completeness,
-      freshness: compositeFreshness(evidence),
-      basis: {
-        dataset: { datasetId: captured.dataset.datasetId, revision: captured.dataset.revision },
-        attachments: basisAttachments
-      },
-      sourceStates: evidence,
-      issues: [...evidenceIssues, ...membershipIssue, ...resultIdentityIssue, ...maintained.issues]
-    } satisfies ObservedQueryResult<Row>;
-    if (trustedIncremental === undefined || completeness === 'unknown' || rows !== maintained.rows || resultKeys !== maintained.resultKeys) {
-      return freezeResult(result);
-    }
-    const metadata = deepFreezeObserverValue({
-      readiness: result.readiness,
-      completeness: result.completeness,
-      freshness: result.freshness,
-      basis: result.basis,
-      sourceStates: result.sourceStates,
-      issues: result.issues
-    });
-    const trusted = Object.freeze({ ...metadata, rows, resultKeys }) as ObservedQueryResult<Row>;
-    trustedObservedResults.set(trusted, trustedIncremental);
-    return trusted;
+      freshness: captureEvidence.freshness,
+      basis: captureEvidence.basis,
+      sourceStates: captureEvidence.sourceStates,
+      issues
+    }) as ObservedQueryResult<Row>;
+    if (canReuseMaintained) trustedObservedResults.set(result, trustedIncremental);
+    return result;
   }
 
   #observerSnapshot(current: ObservedQueryResult<Row>, previous: ObserverSnapshot<Row> | undefined): ObserverSnapshot<Row> {
@@ -608,6 +592,37 @@ const sourceEvidence = <Projection>(candidate: CapturedMember<Projection>): Sour
   return freezeEvidence({ ...member, state: 'ready', freshness: candidate.snapshot.freshness, authorized: true, basis: candidate.snapshot.basis, issues: [...candidate.snapshot.issues, ...candidate.projection.issues] });
 };
 
+const evidenceForCapture = <Projection>(captured: EvaluationSnapshot<Projection>): CaptureObservationEvidence => {
+  const cached = captureObservationEvidence.get(captured.identity);
+  if (cached !== undefined) return cached;
+  const sourceStates = Object.freeze(captured.members.map(sourceEvidence));
+  const evidenceIssues = Object.freeze(sourceStates.flatMap(({ issues }) => issues));
+  const membershipIssues = captured.dataset.state === 'open'
+    ? Object.freeze([observationIssue('observer.membership_open', 'after_refresh', { datasetId: captured.dataset.datasetId, revision: captured.dataset.revision })])
+    : Object.freeze([]);
+  const basis = deepFreezeObserverValue({
+    dataset: { datasetId: captured.dataset.datasetId, revision: captured.dataset.revision },
+    attachments: captured.members.flatMap((candidate) => candidate.snapshot === undefined ? [] : [{
+      attachmentId: candidate.member.attachmentId,
+      sourceId: candidate.member.sourceId,
+      basis: candidate.snapshot.basis
+    }])
+  }) as ObservationBasis;
+  const evidence = Object.freeze({
+    basis,
+    sourceStates,
+    issues: Object.freeze([...evidenceIssues, ...membershipIssues]),
+    freshness: compositeFreshness(sourceStates),
+    requiredProjectionInvalid: captured.members.some((candidate) =>
+      candidate.member.expectation === 'required'
+      && candidate.snapshot?.state === 'ready'
+      && candidate.projection?.state === 'failed'),
+    requiredUnavailable: sourceStates.some((item) => item.expectation === 'required' && (item.state !== 'ready' || !item.authorized))
+  });
+  captureObservationEvidence.set(captured.identity, evidence);
+  return evidence;
+};
+
 const observerChange = <Row>(previous: ObserverSnapshot<Row>, next: ObserverSnapshot<Row>): ObserverChange<Row> => {
   if (previous.state !== 'open' || next.state !== 'open') return Object.freeze({ kind: 'reset', snapshot: next });
   if (next.current.completeness === 'unknown') return Object.freeze({ kind: 'invalidation', snapshot: next });
@@ -696,9 +711,8 @@ const compositeFreshness = (evidence: readonly SourceEvidence[]): 'current' | 's
   return 'mixed';
 };
 
-const staleResult = <Row>(result: ObservedQueryResult<Row>): ObservedQueryResult<Row> => result.freshness === 'stale' ? result : freezeResult({ ...result, freshness: 'stale' });
+const staleResult = <Row>(result: ObservedQueryResult<Row>): ObservedQueryResult<Row> => result.freshness === 'stale' ? result : Object.freeze({ ...result, freshness: 'stale' });
 
-const freezeResult = <Row>(result: ObservedQueryResult<Row>): ObservedQueryResult<Row> => deepFreezeObserverValue(result);
 const freezeEvidence = (evidence: SourceEvidence): SourceEvidence => deepFreezeObserverValue(evidence);
 
 const observationIssue = (code: string, retry: 'after_refresh' | 'after_capability' | 'after_authority', details: unknown): Issue => createIssue({

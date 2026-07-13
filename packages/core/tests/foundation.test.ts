@@ -27,6 +27,7 @@ import {
   type CapabilityDeclaration,
   type JsonValue
 } from '../src/index.js';
+import { canonicalizeJsonWithCache } from '../src/internal-canonical-json.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
 
@@ -71,6 +72,22 @@ describe('production foundation', () => {
   it('canonicalizes JSON deterministically and normalizes negative zero', () => {
     expect(canonicalizeJson({ z: -0, a: ['x', { b: true, a: null }] })).toBe('{"a":["x",{"a":null,"b":true}],"z":0}');
     expect(() => canonicalizeJson('\ud800')).toThrow(/Lone surrogate/);
+  });
+
+  it('memoizes canonical subtrees only inside an explicit owned-graph context', () => {
+    const leaf = Object.freeze({ value: Object.freeze([1, 2, 3]) });
+    const root = Object.freeze({ first: leaf, second: leaf });
+    const cache = new WeakMap<object, string>();
+    const canonical = canonicalizeJsonWithCache(root, cache);
+
+    expect(canonical).toBe('{"first":{"value":[1,2,3]},"second":{"value":[1,2,3]}}');
+    expect(cache.get(root)).toBe(canonical);
+    expect(cache.get(leaf)).toBe('{"value":[1,2,3]}');
+    expect(cache.get(leaf.value)).toBe('[1,2,3]');
+    expect(canonicalizeJsonWithCache(leaf, cache)).toBe(cache.get(leaf));
+    const isolated = new WeakMap<object, string>();
+    expect(canonicalizeJsonWithCache(root, isolated)).toBe(canonical);
+    expect(isolated.has(root)).toBe(true);
   });
 
   it('seals named and deterministic inline artifacts with normalized dependencies', async () => {

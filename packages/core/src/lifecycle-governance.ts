@@ -1,4 +1,5 @@
-import { canonicalizeJson, isContentHash, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
+import { canonicalizeJson, isContentHash, sha256Bytes, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
+import { canonicalizeJsonWithCache, type CanonicalJsonCache } from './internal-canonical-json.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
@@ -161,8 +162,9 @@ export class SourceLifecycleCoordinator {
 
   execute(command: SourceLifecycleCommand, options: { readonly signal?: AbortSignal } = {}): Promise<SourceLifecycleReceipt> {
     const ownedCommand = adoptCoordinatorCommand<SourceLifecycleCommand>(command, 'Source lifecycle command');
+    const canonicalization = new WeakMap<object, string>();
     const signal = options.signal;
-    const run = this.#queue.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }));
+    const run = this.#queue.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }, canonicalization));
     this.#queue = run.then(() => undefined, () => undefined);
     return run;
   }
@@ -174,10 +176,10 @@ export class SourceLifecycleCoordinator {
 
   async rotateOperationEpoch(nextEpoch: string): Promise<void> { await this.ledger.rotateEpoch(nextEpoch); }
 
-  async #execute(command: SourceLifecycleCommand, options: { readonly signal?: AbortSignal }): Promise<SourceLifecycleReceipt> {
-    const validated = validateLifecycleCommand(command, this.lifecycleCoordinatorId);
+  async #execute(command: SourceLifecycleCommand, options: { readonly signal?: AbortSignal }, canonicalization: CanonicalJsonCache): Promise<SourceLifecycleReceipt> {
+    const validated = validateLifecycleCommand(command, this.lifecycleCoordinatorId, canonicalization);
     const commandHash = validated.success
-      ? await lifecycleCommandHash(command, this.authorityViewFingerprint)
+      ? await lifecycleCommandHashOwned(command, this.authorityViewFingerprint, canonicalization)
       : await invalidCommandHash('source-lifecycle', commandIdentity(command, 'operationEpoch'), commandIdentity(command, 'operationId'));
     const reject = (issues: readonly Issue[], sourceId?: string): SourceLifecycleReceipt => lifecycleReceipt(command, commandHash, 'rejected', issues, sourceId);
     if (!validated.success) return reject(validated.issues);
@@ -321,10 +323,11 @@ export class GovernanceCoordinator {
 
   execute(command: GovernanceCommand, options: { readonly signal?: AbortSignal } = {}): Promise<GovernanceReceipt> {
     const ownedCommand = adoptCoordinatorCommand<GovernanceCommand>(command, 'Governance command');
+    const canonicalization = new WeakMap<object, string>();
     const signal = options.signal;
     const sourceId = commandIdentity(ownedCommand, 'sourceId');
     const prior = this.#queues.get(sourceId) ?? Promise.resolve();
-    const run = prior.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }));
+    const run = prior.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }, canonicalization));
     const tail = run.then(() => undefined, () => undefined);
     this.#queues.set(sourceId, tail);
     void tail.then(() => {
@@ -346,10 +349,10 @@ export class GovernanceCoordinator {
     await source.ledger.rotateEpoch(nextEpoch);
   }
 
-  async #execute(command: GovernanceCommand, options: { readonly signal?: AbortSignal }): Promise<GovernanceReceipt> {
-    const validated = validateGovernanceCommand(command);
+  async #execute(command: GovernanceCommand, options: { readonly signal?: AbortSignal }, canonicalization: CanonicalJsonCache): Promise<GovernanceReceipt> {
+    const validated = validateGovernanceCommand(command, canonicalization);
     const commandHash = validated.success
-      ? await governanceCommandHash(command, this.authorityViewFingerprint)
+      ? await governanceCommandHashOwned(command, this.authorityViewFingerprint, canonicalization)
       : await invalidCommandHash('governance', commandIdentity(command, 'operationEpoch'), commandIdentity(command, 'operationId'));
     const selectedArtifactHashes = validated.success ? selectedHashes(command) : [];
     const reject = (issues: readonly Issue[], beforeBasis?: SourceBasis): GovernanceReceipt => governanceReceipt(command, commandHash, selectedArtifactHashes, 'rejected', issues, beforeBasis);
@@ -430,9 +433,28 @@ export const governanceCommandHash = (command: GovernanceCommand, authorityViewF
   authorityViewFingerprint
 } as unknown as JsonValue);
 
-const validateLifecycleCommand = (command: SourceLifecycleCommand, coordinatorId: string): ParseResult<SourceLifecycleCommand> => {
+const lifecycleCommandHashOwned = (command: SourceLifecycleCommand, authorityViewFingerprint: ContentHash, canonicalization: CanonicalJsonCache): Promise<ContentHash> => sha256CanonicalJson({
+  lifecycleCoordinatorId: command.lifecycleCoordinatorId,
+  operationEpoch: command.operationEpoch,
+  request: command.request,
+  authorityViewFingerprint
+} as unknown as JsonValue, canonicalization);
+
+const governanceCommandHashOwned = (command: GovernanceCommand, authorityViewFingerprint: ContentHash, canonicalization: CanonicalJsonCache): Promise<ContentHash> => sha256CanonicalJson({
+  operationEpoch: command.operationEpoch,
+  sourceId: command.sourceId,
+  action: command.request.action,
+  request: normalizeGovernanceRequest(command.request),
+  expectedBasis: command.expectedBasis,
+  authorityViewFingerprint
+} as unknown as JsonValue, canonicalization);
+
+const sha256CanonicalJson = (value: JsonValue, canonicalization: CanonicalJsonCache): Promise<ContentHash> =>
+  sha256Bytes(new TextEncoder().encode(canonicalizeJsonWithCache(value, canonicalization)));
+
+const validateLifecycleCommand = (command: SourceLifecycleCommand, coordinatorId: string, canonicalization: CanonicalJsonCache): ParseResult<SourceLifecycleCommand> => {
   if (command.lifecycleCoordinatorId !== coordinatorId || !nonEmptyString(command.operationEpoch) || !nonEmptyString(command.operationId)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'identity' });
-  if (!isCanonicalJson(command)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'canonical_json' });
+  if (!isCanonicalJson(command, canonicalization)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'canonical_json' });
   if (!isPortableRecord(command.request)) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'request' });
   if (command.request.action === 'create') {
     if (!validCapability(command.request.sourceCapability) || !Object.hasOwn(command.request, 'input')) return coordinatorFailure('lifecycle.command_invalid', 'lifecycle', { reason: 'capability' });
@@ -444,9 +466,9 @@ const validateLifecycleCommand = (command: SourceLifecycleCommand, coordinatorId
   return { success: true, value: command, issues: [] };
 };
 
-const validateGovernanceCommand = (command: GovernanceCommand): ParseResult<GovernanceCommand> => {
+const validateGovernanceCommand = (command: GovernanceCommand, canonicalization: CanonicalJsonCache): ParseResult<GovernanceCommand> => {
   if (!nonEmptyString(command.operationEpoch) || !nonEmptyString(command.operationId) || !nonEmptyString(command.sourceId)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'identity' });
-  if (!isCanonicalJson(command)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'canonical_json' });
+  if (!isCanonicalJson(command, canonicalization)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'canonical_json' });
   if (!Object.hasOwn(command, 'expectedBasis')) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'expected_basis' });
   if (!isPortableRecord(command.request)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'request' });
   if (command.request.action === 'initialize_declaration') {
@@ -456,10 +478,10 @@ const validateGovernanceCommand = (command: GovernanceCommand): ParseResult<Gove
   } else if (command.request.action === 'repair_declaration') {
     const request = command.request;
     if ((request.section !== 'storage' && request.section !== 'constraints') || !Array.isArray(request.alternatives) || request.alternatives.length < 2 || !validSection(request.selected) || request.selected.kind !== request.section || request.alternatives.some((alternative) => !validSection(alternative) || alternative.kind !== request.section)) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'repair_shape' });
-    const alternatives = request.alternatives.map((alternative) => canonicalizeJson(alternative as unknown as JsonValue));
+    const alternatives = request.alternatives.map((alternative) => canonicalizeJsonWithCache(alternative as unknown as JsonValue, canonicalization));
     if (new Set(alternatives).size !== alternatives.length) return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'repair_shape' });
-    const selected = canonicalizeJson(request.selected as unknown as JsonValue);
-    if (!request.alternatives.some((alternative) => canonicalizeJson(alternative as unknown as JsonValue) === selected)) return coordinatorFailure('governance.repair_selection_invalid', 'governance', { reason: 'selected_not_observed' });
+    const selected = canonicalizeJsonWithCache(request.selected as unknown as JsonValue, canonicalization);
+    if (!alternatives.includes(selected)) return coordinatorFailure('governance.repair_selection_invalid', 'governance', { reason: 'selected_not_observed' });
   } else {
     return coordinatorFailure('governance.command_invalid', 'governance', { reason: 'action' });
   }
@@ -488,9 +510,9 @@ const validArtifactRef = (value: unknown): value is ArtifactRef => isPortableRec
 const validCapability = (value: unknown): value is CapabilityRef => isPortableRecord(value) && nonEmptyString(value.id) && nonEmptyString(value.version) && isContentHash(value.contractHash);
 const isPortableRecord = (value: unknown): value is Readonly<Record<string, JsonValue>> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
-const isCanonicalJson = (value: JsonValue): boolean => {
+const isCanonicalJson = (value: JsonValue, canonicalization = new WeakMap<object, string>()): boolean => {
   try {
-    canonicalizeJson(value);
+    canonicalizeJsonWithCache(value, canonicalization);
     return true;
   } catch {
     return false;

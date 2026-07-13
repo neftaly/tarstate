@@ -523,6 +523,69 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
+  it('shares owned capture evidence across distinct roots and isolates successive frames', () => {
+    const source = new TestSource('source:shared-evidence', [{ id: 1, value: 'one' }, { id: 2, value: 'two' }, { id: 3, value: 'three' }]);
+    const catalog = new AttachmentCatalog();
+    const attachmentLease = catalog.attach(relationalAttachment('attachment:shared-evidence', source));
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:shared-evidence', source.sourceId)] });
+    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+      authorityScope: 'public',
+      authorityFingerprint: 'authority:public',
+      registryFingerprint: 'registry:one',
+      attachments: catalog,
+      datasets: [dataset],
+      canRead: () => true,
+      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+    });
+    const first = database.observe({ plan: relationalPlan() });
+    const second = database.observe({ plan: sealPreparedPlan({
+      ...relationalPlan(),
+      planId: 'query:shared-evidence:second',
+      rootNodeId: 'query:shared-evidence:second:root',
+      query: {
+        kind: 'where',
+        input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
+        predicate: { kind: 'compare', op: 'gte', left: { kind: 'field', alias: 'row', name: 'id' }, right: { kind: 'literal', value: 3 } }
+      }
+    }) });
+    const initialFirst = first.getSnapshot();
+    const initialSecond = second.getSnapshot();
+    if (initialFirst.state !== 'open' || initialSecond.state !== 'open') throw new Error('expected open observers');
+    expect(initialFirst.current).not.toBe(initialSecond.current);
+    expect(initialFirst.current.rows).not.toBe(initialSecond.current.rows);
+    expect(initialFirst.current.rows).toHaveLength(2);
+    expect(initialSecond.current.rows).toHaveLength(1);
+    expect(initialFirst.current.basis).toBe(initialSecond.current.basis);
+    expect(initialFirst.current.sourceStates).toBe(initialSecond.current.sourceStates);
+    expect(initialFirst.current.issues).not.toBe(initialSecond.current.issues);
+
+    source.publish({ rows: [{ id: 1, value: 'one' }, { id: 2, value: 'updated' }, { id: 4, value: 'four' }] });
+    const updatedFirst = first.getSnapshot();
+    const updatedSecond = second.getSnapshot();
+    if (updatedFirst.state !== 'open' || updatedSecond.state !== 'open') throw new Error('expected updated observers');
+    expect(updatedFirst.current.basis).toBe(updatedSecond.current.basis);
+    expect(updatedFirst.current.sourceStates).toBe(updatedSecond.current.sourceStates);
+    expect(updatedFirst.current.basis).not.toBe(initialFirst.current.basis);
+    expect(updatedFirst.current.sourceStates).not.toBe(initialFirst.current.sourceStates);
+    expect(initialFirst.current.basis.attachments[0]?.basis).toMatchObject({ revision: 0 });
+    expect(updatedFirst.current.basis.attachments[0]?.basis).toMatchObject({ revision: 1 });
+
+    source.publish({ state: 'loading' });
+    const invalidFirst = first.getSnapshot();
+    const invalidSecond = second.getSnapshot();
+    if (invalidFirst.state !== 'open' || invalidSecond.state !== 'open') throw new Error('expected invalidated observers');
+    expect(invalidFirst.current.sourceStates).toBe(invalidSecond.current.sourceStates);
+    expect(invalidFirst.lastExact?.sourceStates).toBe(updatedFirst.current.sourceStates);
+    expect(invalidSecond.lastExact?.sourceStates).toBe(updatedSecond.current.sourceStates);
+    expect(invalidFirst.lastExact?.basis).toBe(updatedFirst.current.basis);
+    expect(Object.isFrozen(invalidFirst.lastExact)).toBe(true);
+
+    first.close();
+    second.close();
+    database.close();
+    attachmentLease.close();
+  });
+
   it('detaches observed queries and does not alias different semantics with reused plan IDs', () => {
     const source = new TestSource('source:plan-identity', [{ id: 2, value: 'two' }, { id: 3, value: 'three' }]);
     const catalog = new AttachmentCatalog();

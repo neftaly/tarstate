@@ -1,4 +1,5 @@
 import { createIssue, TarstateParseError, type Issue, type ParseResult } from './issues.js';
+import { assertUnicodeScalarString, canonicalizeJsonValue, compareUnicodeScalars } from './internal-canonical-json.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
@@ -38,19 +39,7 @@ const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
 
 export const isContentHash = (value: unknown): value is ContentHash => typeof value === 'string' && hashPattern.test(value);
 
-export const canonicalizeJson = (value: JsonValue): string => {
-  if (value === null || typeof value !== 'object') {
-    if (typeof value === 'number' && !Number.isFinite(value)) throw new TypeError('Canonical JSON requires a finite number');
-    if (typeof value === 'string') assertUnicodeScalarString(value);
-    return JSON.stringify(Object.is(value, -0) ? 0 : value);
-  }
-  if (Array.isArray(value)) return '[' + value.map(canonicalizeJson).join(',') + ']';
-  const record = value as Readonly<Record<string, JsonValue>>;
-  return '{' + Object.keys(record).sort(compareUnicodeScalars).map((key) => {
-    assertUnicodeScalarString(key);
-    return JSON.stringify(key) + ':' + canonicalizeJson(record[key] as JsonValue);
-  }).join(',') + '}';
-};
+export const canonicalizeJson = canonicalizeJsonValue;
 
 export const sha256Bytes = async (bytes: Uint8Array): Promise<ContentHash> => {
   const digest = await globalThis.crypto.subtle.digest('SHA-256', Uint8Array.from(bytes).buffer);
@@ -314,15 +303,3 @@ class DuplicateAwareJsonParser {
 
 const invalidEnvelope = (reason: string): ParseResult<never> => ({ success: false, issues: [createIssue({ code: 'artifact.invalid_envelope', retry: 'after_input', details: { reason } })] });
 const isRecord = (value: JsonValue): value is Readonly<Record<string, JsonValue>> => value !== null && typeof value === 'object' && !Array.isArray(value);
-const compareUnicodeScalars = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
-
-const assertUnicodeScalarString = (value: string): void => {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new TypeError('Lone surrogate');
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) throw new TypeError('Lone surrogate');
-  }
-};
