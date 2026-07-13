@@ -94,9 +94,10 @@ describe('database attachment preparation', () => {
       authorityScope: 'public', discoveryEdges: [], preparation: prepared
     });
     expect(lease.attachment.writable).toBe(true);
-    expect(lease.attachment.project(source.snapshot())).toMatchObject({
-      state: 'ready', value: { completeness: 'exact', relations: expect.any(Map) }
-    });
+    const projection = lease.attachment.project(source.snapshot());
+    expect(projection).toMatchObject({ state: 'ready', value: { completeness: 'exact' } });
+    if (projection.state !== 'ready' || !('relations' in projection.value)) throw new Error('mapping projection did not become ready');
+    expect(projection.value.relations.get('test.item')?.rows).toHaveLength(1);
     lease.close();
   });
 

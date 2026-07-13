@@ -3,6 +3,7 @@ import {
   type CommitReceipt,
   type ObserveRequest,
   type ObserverChange,
+  type ObserverDiagnostic,
   type ObserverSnapshot,
   type PreparedPlan,
   type QueryObserver,
@@ -23,6 +24,7 @@ import {
   type MutationState,
   type ObservableDatabase,
   type CreateOptimisticOverlay,
+  type OptimisticProjection,
   type ReactObserverSnapshot,
   type ReactPreparedPlan
 } from '../src/index.js';
@@ -161,6 +163,7 @@ describe('@tarstate/react', () => {
 
   it('continues notifying cached query views when an earlier view throws', async () => {
     const database = new TestDatabase();
+    const diagnostics: ObserverDiagnostic[] = [];
     const firstSnapshots: ObserverSnapshot<Row>[] = [];
     const secondSnapshots: ObserverSnapshot<Row>[] = [];
     const First = () => { firstSnapshots.push(useQuery(plan)); return null; };
@@ -168,7 +171,7 @@ describe('@tarstate/react', () => {
     await mount(createElement(
       'div',
       null,
-      createElement(TarstateProvider, { database }, createElement(First)),
+      createElement(TarstateProvider, { database, onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) }, createElement(First)),
       createElement(TarstateProvider, { database }, createElement(Second))
     ));
     expect(database.observers).toHaveLength(1);
@@ -188,6 +191,35 @@ describe('@tarstate/react', () => {
     await act(() => { database.observers[0]?.publish(throwsForFirstView); });
     expect(firstSnapshots.at(-1)).toMatchObject({ current: { rows: [{ id: 1, name: 'one' }] } });
     expect(secondSnapshots.at(-1)).toMatchObject({ current: { rows: [{ id: 2, name: 'two' }] } });
+    expect(diagnostics).toMatchObject([{ kind: 'listener_error', component: 'react-query', operation: 'publish-query-store' }]);
+  });
+
+  it('attempts every query teardown and reports contained cleanup failures', async () => {
+    const diagnostics: ObserverDiagnostic[] = [];
+    class ThrowingCleanupObserver extends TestObserver {
+      override subscribe(listener: (change: ObserverChange<Row>) => void): () => void {
+        super.subscribe(listener);
+        return () => { this.listeners.delete(listener); throw new Error('unsubscribe failed'); };
+      }
+      override close(): void { this.closeCount += 1; throw new Error('close failed'); }
+    }
+    class ThrowingCleanupDatabase extends TestDatabase {
+      override observe(_request: ObserveRequest<Query>): QueryObserver<Row> {
+        const observer = new ThrowingCleanupObserver(this.snapshot);
+        this.observers.push(observer);
+        return observer;
+      }
+    }
+    const database = new ThrowingCleanupDatabase();
+    const Consumer = () => { useQuery(plan); return null; };
+    const renderer = await mount(createElement(TarstateProvider, { database, onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) }, createElement(Consumer)));
+
+    await act(() => { renderer.unmount(); });
+    await act(async () => { await Promise.resolve(); });
+    expect(diagnostics.filter(({ kind, component }) => kind === 'cleanup_error' && component === 'react-query')).toHaveLength(2);
+
+    await mount(createElement(TarstateProvider, { database, onDiagnostic: (diagnostic) => diagnostics.push(diagnostic) }, createElement(Consumer)));
+    expect(database.observers).toHaveLength(2);
   });
 
   it('uses collision-safe canonical observation keys', async () => {
@@ -406,6 +438,41 @@ describe('@tarstate/react', () => {
       mutations: [{ state: 'settled', optimisticError: { phase } }]
     });
     expect(latest).not.toHaveProperty('optimistic');
+  });
+
+  it('contains hostile optimistic result access and removes the rejected overlay immediately', async () => {
+    const database = new TestDatabase();
+    const commitImplementation = () => new Promise<CommitReceipt>(() => undefined);
+    const states: MutationState[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    let latest: ReactObserverSnapshot<Row> | undefined;
+    const hostileProjection = Object.defineProperty({}, 'rows', {
+      enumerable: true,
+      get: () => { throw new Error('rows getter escaped'); }
+    }) as OptimisticProjection<Row>;
+    const Consumer = () => {
+      commit = useCommit();
+      latest = useQuery(plan);
+      states.push(useMutationState());
+      return null;
+    };
+    await mount(createElement(TarstateProvider, {
+      database,
+      executeCommit: commitImplementation,
+      createOptimisticOverlay: () => ({
+        sourceId: 'source:one',
+        sourceBasis: { revision: 0 },
+        projectRows: () => hostileProjection
+      })
+    }, createElement(Consumer)));
+
+    await expect(act(() => { void commit?.(transactionAttempt()); })).resolves.toBeUndefined();
+    await act(async () => { await Promise.resolve(); });
+    expect(latest).not.toHaveProperty('optimistic');
+    expect(states.at(-1)).toMatchObject({
+      pendingCount: 1,
+      mutations: [{ state: 'pending', optimisticError: { phase: 'projection-result', message: 'rows getter escaped' } }]
+    });
   });
 
   it('recomputes the overlay as a rebase when a newer source basis arrives', async () => {

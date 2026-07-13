@@ -1,6 +1,6 @@
 import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
-import { diffQueryMaintenanceSnapshots, evaluateQuery, openIncrementalQueryMaintenance, preparePlan } from '../packages/core/dist/index.js';
+import { diffQueryMaintenanceSnapshots, evaluatePreparedQuery, evaluateQuery, openIncrementalQueryMaintenance, preparePlan } from '../packages/core/dist/index.js';
 import { createPooledIncrementalQueryRuntime } from '../packages/core/dist/query.js';
 
 const schemaView = { id: 'urn:tarstate:benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
@@ -46,19 +46,24 @@ const nestedRows = (count, changed = false) => Array.from({ length: count }, (_,
 let consumedRows = 0;
 const benchmark = (label, inputRows, iterations, operation) => {
   for (let index = 0; index < Math.min(iterations, 10); index += 1) consumedRows += operation(index).rows.length;
-  globalThis.gc();
-  const started = performance.now();
-  for (let index = 0; index < iterations; index += 1) consumedRows += operation(index).rows.length;
-  const elapsed = performance.now() - started;
-  return { label, inputRows, iterations, millisecondsPerOperation: Number((elapsed / iterations).toFixed(3)) };
+  const samples = Array.from({ length: 3 }, () => {
+    globalThis.gc();
+    const started = performance.now();
+    for (let index = 0; index < iterations; index += 1) consumedRows += operation(index).rows.length;
+    return (performance.now() - started) / iterations;
+  }).sort((left, right) => left - right);
+  return { label, inputRows, iterations, sampleCount: samples.length, millisecondsPerOperation: Number((samples[1]).toFixed(3)) };
 };
 
 const timedOperation = (iterations, operation) => {
   for (let index = 0; index < Math.min(iterations, 5); index += 1) consumedRows += operation(index);
-  globalThis.gc();
-  const started = performance.now();
-  for (let index = 0; index < iterations; index += 1) consumedRows += operation(index);
-  return Number(((performance.now() - started) / iterations).toFixed(3));
+  const samples = Array.from({ length: 3 }, () => {
+    globalThis.gc();
+    const started = performance.now();
+    for (let index = 0; index < iterations; index += 1) consumedRows += operation(index);
+    return (performance.now() - started) / iterations;
+  }).sort((left, right) => left - right);
+  return Number((samples[1]).toFixed(3));
 };
 
 const pooledEnvironment = (runtimeIdentity) => ({
@@ -85,6 +90,15 @@ const physicalDiagnostics = ({
 });
 
 const measurements = [];
+const repeatedQuery = (() => {
+  let query = from('item', 'item');
+  for (let depth = 0; depth < 50; depth += 1) query = { kind: 'where', input: query, predicate: { kind: 'literal', value: true } };
+  return query;
+})();
+const repeatedInputs = { relations: [input('item', linearRows(1))] };
+const repeatedPlan = await plan('repeated-pure', repeatedQuery);
+measurements.push(benchmark('repeated-unprepared-pure', 1, 500, () => evaluateQuery({ root: repeatedQuery, ...repeatedInputs })));
+measurements.push(benchmark('repeated-prepared-pure', 1, 500, () => evaluatePreparedQuery(repeatedPlan, repeatedInputs)));
 for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
   const relation = input('item', linearRows(count));
   measurements.push(benchmark('linear-pure', count, iterations, () => evaluateQuery({ root: linearQuery, relations: [relation] })));
@@ -115,7 +129,7 @@ const functionQuery = { kind: 'select', input: nestedQuery, alias: 'result', fie
   id: field('nested', 'id'),
   payload: { kind: 'call', capability: functionCapability, args: [field('nested', 'payload')] }
 } };
-for (const [count, iterations] of [[100, 300], [1_000, 50], [10_000, 5]]) {
+for (const [count, iterations] of [[100, 300], [1_000, 50], [10_000, 10]]) {
   const first = { relations: [input('nested', nestedRows(count))] };
   const second = { relations: [input('nested', nestedRows(count, true))] };
   measurements.push(benchmark('nested-pure-ownership', count, iterations, () => evaluateQuery({ root: nestedQuery, relations: first.relations })));
@@ -127,7 +141,7 @@ for (const [count, iterations] of [[100, 300], [1_000, 50], [10_000, 5]]) {
   measurements.push(benchmark('named-function-ownership', count, iterations, () => evaluateQuery({ root: functionQuery, relations: first.relations, functions })));
 }
 
-for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 2]]) {
+for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 5]]) {
   const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
   measurements.push(benchmark('equijoin-pure', count * 2, iterations, () => evaluateQuery({ root: joinQuery, relations })));
   const changed = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
@@ -139,8 +153,8 @@ for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 2]]) {
   session.close();
 }
 
-for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 3]]) {
-  const rows = Array.from({ length: count }, (_, id) => ({ id, group: id % 100, score: count - id }));
+for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
+  const rows = Array.from({ length: count }, (_, id) => ({ id, group: id % 100, score: id * 7_919 % count }));
   const relations = [input('score', rows)];
   const order = { kind: 'order', input: from('score', 'score'), by: [{ value: field('score', 'score'), direction: 'asc' }] };
   const aggregate = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: {
@@ -151,7 +165,19 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 3]]) {
   } };
   measurements.push(benchmark('order', count, iterations, () => evaluateQuery({ root: order, relations })));
   measurements.push(benchmark('aggregate', count, iterations, () => evaluateQuery({ root: aggregate, relations })));
-  if (count <= 1_000) {
+  const changedRows = rows.map((row, index) => index === 0 ? { ...row, score: count + 1 } : row);
+  const first = { relations };
+  const second = { relations: [input('score', changedRows)] };
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  const updateIterations = iterations % 2 === 0 ? iterations : iterations + 1;
+  const orderSession = openIncrementalQueryMaintenance(await plan('order-' + count, order), first);
+  measurements.push(benchmark('order-one-row-update', count, updateIterations, (index) => orderSession.applyUpdate(index % 2 === 0 ? forward : backward)));
+  orderSession.close();
+  const aggregateSession = openIncrementalQueryMaintenance(await plan('aggregate-' + count, aggregate), first);
+  measurements.push(benchmark('aggregate-one-row-update', count, updateIterations, (index) => aggregateSession.applyUpdate(index % 2 === 0 ? forward : backward)));
+  aggregateSession.close();
+  if (count <= 10_000) {
     const orderBy = [{ value: field('score', 'score'), direction: 'asc' }];
     const window = { kind: 'window', input: from('score', 'score'), alias: 'score', fields: {
       rowNumber: { kind: 'window', op: 'row-number', orderBy },
@@ -159,10 +185,13 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 3]]) {
       previous: { kind: 'window', op: 'lag', value: field('score', 'score'), orderBy }
     } };
     measurements.push(benchmark('window-three-fields', count, iterations, () => evaluateQuery({ root: window, relations })));
+    const windowSession = openIncrementalQueryMaintenance(await plan('window-' + count, window), first);
+    measurements.push(benchmark('window-one-row-update', count, updateIterations, (index) => windowSession.applyUpdate(index % 2 === 0 ? forward : backward)));
+    windowSession.close();
   }
 }
 
-for (const [count, iterations] of [[10, 100], [20, 30], [40, 5], [80, 1]]) {
+for (const [count, iterations] of [[10, 100], [20, 30], [40, 8], [80, 5]]) {
   const recursive = {
     kind: 'recursive',
     name: 'nodes',
@@ -282,7 +311,7 @@ for (const residentRootCount of [100, 1_000]) {
   const residents = await Promise.all(Array.from({ length: residentRootCount }, async (_, index) => runtime.attach(await plan('resident-' + index, {
     kind: 'select', alias: 'resident-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
   }))));
-  const churnPlans = await Promise.all(Array.from({ length: 105 }, (_, index) => plan('churn-' + index, {
+  const churnPlans = await Promise.all(Array.from({ length: 305 }, (_, index) => plan('churn-' + index, {
     kind: 'select', alias: 'churn-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
   })));
   let churn = 0;
@@ -346,21 +375,44 @@ for (const root of pooledAllocationRoots) root.close();
 pooledAllocationRuntime.close();
 const pooledSampledAllocationBytes = pooledAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
 
+const measurement = (label, inputRows) => measurements.find((candidate) => candidate.label === label && candidate.inputRows === inputRows);
+const linearPure10k = measurement('linear-pure', 10_000)?.millisecondsPerOperation;
+const linearUpdate10k = measurement('linear-one-row-update', 10_000)?.millisecondsPerOperation;
+const repeatedUnprepared = measurement('repeated-unprepared-pure', 1)?.millisecondsPerOperation;
+const repeatedPrepared = measurement('repeated-prepared-pure', 1)?.millisecondsPerOperation;
+const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
+const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
+const contracts = {
+  repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
+  linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
+  preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
+  unrelatedTraversalSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'unrelated-relation-union-dag').every(({ selectiveVisitedPhysicalNodeCount }) => selectiveVisitedPhysicalNodeCount <= 2),
+  privateAllocationCeiling: privateBytesPerUpdate <= 2_000_000,
+  pooledAllocationCeiling: pooledBytesPerUpdate <= 20_000_000
+};
+const contractFailures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);
+
 process.stdout.write(JSON.stringify({
   benchmark: 'tarstate-query-scaling',
-  note: 'Diagnostic evidence only; timings are not release thresholds.',
+  note: 'Wall times are diagnostic medians; conservative relative, selectivity, and allocation contracts are enforced.',
+  contracts,
   measurements,
   pooledMeasurements,
   allocationSample: {
     workload: '100 snapshot diffs plus one-row updates over a 1,000-row linear query',
     sampledBytes: sampledAllocationBytes,
-    sampledBytesPerUpdate: Math.round(sampledAllocationBytes / 100)
+    sampledBytesPerUpdate: privateBytesPerUpdate
   },
   pooledAllocationSample: {
     workload: '100 one-row updates over 100 pooled roots and 1,000 input rows',
     sampledBytes: pooledSampledAllocationBytes,
-    sampledBytesPerUpdate: Math.round(pooledSampledAllocationBytes / 100)
+    sampledBytesPerUpdate: pooledBytesPerUpdate
   },
   node: process.version,
   consumedRows
 }, null, 2) + '\n');
+
+if (contractFailures.length > 0) {
+  process.stderr.write('Query performance contracts failed: ' + contractFailures.join(', ') + '\n');
+  process.exitCode = 1;
+}

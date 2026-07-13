@@ -1,7 +1,8 @@
-import { canonicalizeJson, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
+import { canonicalizeJson, isContentHash, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { ownedReadonlyMap } from './internal-owned-map.js';
+import { assertCompiledStorageMapping, assertPreparedSchema, sealCompiledStorageMapping } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
 import { parseRelationCandidates, parseScalarValueForField, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
@@ -84,9 +85,11 @@ export const compileStorageMapping = (
   schema: PreparedSchema,
   registry?: CapabilityRegistry
 ): ParseResult<CompiledStorageMapping> => {
+  assertPreparedSchema(schema);
+  if (!isArtifactRef(schemaRef)) return mappingFailure('mapping.invalid', ['schema'], { reason: 'schema_ref' });
   const owned = detachAndFreezeJsonValue(input);
   if (!owned.success) return owned;
-  if (!isRecord(owned.value) || owned.value.model !== 'json-tree-v1' || !sameRef(owned.value.schema, schemaRef) || !isRecord(owned.value.relations)) return mappingFailure('mapping.invalid', [], { reason: 'shape_or_schema' });
+  if (!isRecord(owned.value) || !hasOnlyKeys(owned.value, ['schema', 'model', 'relations']) || owned.value.model !== 'json-tree-v1' || !isArtifactRef(owned.value.schema) || !sameRef(owned.value.schema, schemaRef) || !isRecord(owned.value.relations)) return mappingFailure('mapping.invalid', [], { reason: 'shape_or_schema' });
   const body = owned.value as unknown as StorageMappingBody;
   const issues: Issue[] = [];
   const relations = new Map<RelationId, { relation: PreparedRelation; mapping: RelationStorageMapping }>();
@@ -116,7 +119,7 @@ export const compileStorageMapping = (
   }
   return issues.length > 0 ? { success: false, issues } : {
     success: true,
-    value: Object.freeze({ body, schema, relations: ownedReadonlyMap(relations) }) as CompiledStorageMapping,
+    value: sealCompiledStorageMapping({ body, schema, relations: ownedReadonlyMap(relations) }),
     issues: []
   };
 };
@@ -127,6 +130,7 @@ export const projectStorage = (
   registry?: CapabilityRegistry,
   sourceId?: string
 ): BindingProjection => {
+  assertCompiledStorageMapping(binding);
   const relations = new Map<RelationId, BoundRelation>();
   const allIssues: Issue[] = [];
   for (const [relationId, compiled] of binding.relations) {
@@ -143,17 +147,17 @@ export const projectStorage = (
     relationIssues.push(...parsed.issues);
     rejectedLocators.push(...parsed.rejected.flatMap((candidate) => candidate.locator === undefined ? [] : [candidate.locator as MappingLocator]));
     const rows = parsed.rows.map((row) => ({ row: row.row, key: row.key, locator: row.locator as MappingLocator }));
-    const result: BoundRelation = {
+    const result: BoundRelation = Object.freeze({
       relationId,
-      rows,
-      rejectedLocators,
-      issues: relationIssues,
+      rows: Object.freeze(rows.map((row) => Object.freeze({ ...row, locator: Object.freeze({ ...row.locator }) }))),
+      rejectedLocators: Object.freeze(rejectedLocators.map((locator) => Object.freeze({ ...locator }))),
+      issues: Object.freeze(relationIssues),
       completeness: extracted.complete && parsed.completeness === 'exact' && rejectedLocators.length === 0 ? 'exact' : 'unknown'
-    };
+    });
     relations.set(relationId, result);
     allIssues.push(...relationIssues);
   }
-  return { relations, issues: allIssues, completeness: [...relations.values()].every((relation) => relation.completeness === 'exact') ? 'exact' : 'unknown' };
+  return Object.freeze({ relations: ownedReadonlyMap(relations), issues: Object.freeze(allIssues), completeness: [...relations.values()].every((relation) => relation.completeness === 'exact') ? 'exact' : 'unknown' });
 };
 
 export const planStoragePatch = (
@@ -165,6 +169,7 @@ export const planStoragePatch = (
   registry?: CapabilityRegistry,
   sourceId?: string
 ): ParseResult<StorageEditPlan> => {
+  assertCompiledStorageMapping(binding);
   const compiled = binding.relations.get(relationId);
   if (compiled === undefined) return mappingFailure('mapping.relation_missing', [], { relationId });
   const located = locateCandidate(snapshot, compiled.mapping.collection, locator);
@@ -197,10 +202,19 @@ export const planStoragePatch = (
   if (issues.length > 0) return { success: false, issues };
   const nextSnapshot = setPath(snapshot, located.value.absolutePath, nextCandidate);
   if (!nextSnapshot.success) return nextSnapshot;
+  const ownedNextSnapshot = detachAndFreezeJsonValue(nextSnapshot.value);
+  if (!ownedNextSnapshot.success) return mappingFailure('mapping.path_invalid', [], { reason: 'non_portable_snapshot' });
   const readFootprint = [compiled.mapping.collection.path, ...Object.values(compiled.mapping.fields).map((field) => [...located.value.absolutePath, ...field.path])];
   return {
     success: true,
-    value: { relationId, locator, readFootprint, writeFootprint: intents.map((intent) => intent.path), intents, nextSnapshot: nextSnapshot.value },
+    value: Object.freeze({
+      relationId,
+      locator: Object.freeze({ ...locator }),
+      readFootprint: Object.freeze(readFootprint.map((path) => Object.freeze([...path]))),
+      writeFootprint: Object.freeze(intents.map((intent) => intent.path)),
+      intents: Object.freeze(intents.map((intent) => Object.freeze({ ...intent, path: Object.freeze([...intent.path]) }))),
+      nextSnapshot: ownedNextSnapshot.value
+    }),
     issues: []
   };
 };
@@ -361,12 +375,14 @@ const samePortableCandidate = (left: unknown, right: unknown): boolean => {
   try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
 };
 const sameRef = (value: unknown, expected: ArtifactRef): boolean => isRecord(value) && typeof value.id === 'string' && typeof value.contentHash === 'string' && JSON.stringify(normalizeArtifactRef(value as ArtifactRef)) === JSON.stringify(normalizeArtifactRef(expected));
-const isRelationMapping = (value: unknown): value is RelationStorageMapping => isRecord(value) && isCollectionMapping(value.collection) && isRecord(value.keys) && isRecord(value.fields);
-const isCollectionMapping = (value: unknown): value is CollectionMapping => isRecord(value) && (value.kind === 'object-map' || value.kind === 'array') && isStoragePath(value.path) && (value.absent === 'empty' || value.absent === 'creatable' || value.absent === 'invalid');
-const isKeyMapping = (value: unknown): value is KeyMapping => isRecord(value) && ((value.kind === 'map-key' && (value.mirrorPath === undefined || isStoragePath(value.mirrorPath)) && value.onMismatch === 'reject') || (value.kind === 'field' && isStoragePath(value.path)));
-const isFieldMapping = (value: unknown): value is FieldMapping => isRecord(value) && isStoragePath(value.path) && isRecord(value.write) && (value.write.kind === 'read-only' || (value.write.kind === 'replace' && isCapabilityRef(value.write.capability)));
-const isStoragePath = (value: unknown): value is StoragePath => Array.isArray(value) && value.every((member) => typeof member === 'string' || (typeof member === 'number' && Number.isInteger(member) && member >= 0));
-const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && typeof value.id === 'string' && typeof value.version === 'string' && typeof value.contractHash === 'string';
+const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && hasOnlyKeys(value, ['id', 'contentHash', 'locations']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string' && location.length > 0)));
+const isRelationMapping = (value: unknown): value is RelationStorageMapping => isRecord(value) && hasOnlyKeys(value, ['collection', 'keys', 'fields']) && isCollectionMapping(value.collection) && isRecord(value.keys) && isRecord(value.fields);
+const isCollectionMapping = (value: unknown): value is CollectionMapping => isRecord(value) && hasOnlyKeys(value, ['kind', 'path', 'absent']) && (value.kind === 'object-map' || value.kind === 'array') && isStoragePath(value.path) && (value.absent === 'empty' || value.absent === 'creatable' || value.absent === 'invalid');
+const isKeyMapping = (value: unknown): value is KeyMapping => isRecord(value) && ((value.kind === 'map-key' && hasOnlyKeys(value, ['kind', 'mirrorPath', 'onMismatch']) && (value.mirrorPath === undefined || isStoragePath(value.mirrorPath)) && value.onMismatch === 'reject') || (value.kind === 'field' && hasOnlyKeys(value, ['kind', 'path']) && isStoragePath(value.path)));
+const isFieldMapping = (value: unknown): value is FieldMapping => isRecord(value) && hasOnlyKeys(value, ['path', 'write']) && isStoragePath(value.path) && isRecord(value.write) && ((value.write.kind === 'read-only' && hasOnlyKeys(value.write, ['kind'])) || (value.write.kind === 'replace' && hasOnlyKeys(value.write, ['kind', 'capability']) && isCapabilityRef(value.write.capability)));
+const isStoragePath = (value: unknown): value is StoragePath => Array.isArray(value) && value.every((member) => (typeof member === 'string' && member.length > 0) || (typeof member === 'number' && Number.isSafeInteger(member) && member >= 0));
+const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && hasOnlyKeys(value, ['id', 'version', 'contractHash']) && typeof value.id === 'string' && value.id.length > 0 && typeof value.version === 'string' && value.version.length > 0 && isContentHash(value.contractHash);
+const hasOnlyKeys = (value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean => Object.keys(value).every((key) => allowed.includes(key));
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 const mappingIssue = (code: string, path: readonly unknown[], details?: unknown, requiredCapabilities?: readonly CapabilityRef[], sourceId?: string, relationId?: string, retry: 'after_input' | 'after_capability' | 'manual_repair' = requiredCapabilities === undefined ? 'after_input' : 'after_capability'): Issue => createIssue({

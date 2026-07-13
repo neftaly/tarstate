@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   capabilityUnavailable,
   evaluateExpression,
+  evaluatePreparedQuery,
   evaluateQuery,
   logicalUnknown,
   preparePlan,
@@ -83,6 +84,24 @@ describe('production query oracle', () => {
     expect(Object.isFrozen(prepared)).toBe(true);
     expect(Object.isFrozen(prepared.query)).toBe(true);
     expect(Object.isFrozen(prepared.query.kind === 'values' ? prepared.query.rows : [])).toBe(true);
+  });
+
+  it('reuses a prepared AST while continuing to own changing evaluation inputs', async () => {
+    const root: QueryNode = from('people', 'person');
+    const prepared = await prepareQuery({
+      root,
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+    const nested = { label: 'original' };
+    const result = evaluatePreparedQuery(prepared, { relations: [relation('people', [{ id: 1, nested }])] });
+
+    nested.label = 'mutated';
+    expect(result.rows).toEqual([{ id: 1, nested: { label: 'original' } }]);
+    expect(Object.isFrozen(result.rows[0]?.nested)).toBe(true);
+    expect(() => evaluatePreparedQuery({ ...prepared } as PreparedPlan<QueryNode>, { relations: [] }))
+      .toThrow('not produced by a plan preparation API');
   });
 
   it('requires portable plan input and does not execute hostile accessors', async () => {
@@ -244,6 +263,63 @@ describe('production query oracle', () => {
       .toEqual([{ id: 'a', points: 10, rank: 1 }, { id: 'b', points: 5, rank: 2 }, { id: 'c', points: 5, rank: 2 }]);
   });
 
+  it('shares partitioning and ordering work across equivalent window fields', () => {
+    const capability: CapabilityRef = { id: 'urn:test:window-value', version: '1', contractHash: `sha256:${'f'.repeat(64)}` };
+    const capabilityKey = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    let evaluations = 0;
+    const call = (name: string) => ({ kind: 'call' as const, capability, args: [{ kind: 'field' as const, alias: 'score', name }] });
+    const specification = {
+      partitionBy: [call('group')],
+      orderBy: [{ value: call('points'), direction: 'asc' as const }]
+    };
+    const window: QueryNode = {
+      kind: 'window',
+      input: from('scores', 'score'),
+      alias: 'score',
+      fields: {
+        rowNumber: { kind: 'window', op: 'row-number', ...specification },
+        rank: { kind: 'window', op: 'rank', ...specification },
+        previous: { kind: 'window', op: 'lag', value: { kind: 'field', alias: 'score', name: 'points' }, ...specification }
+      }
+    };
+    const rows = [
+      { id: 'a', group: 'x', points: 2 },
+      { id: 'b', group: 'x', points: 1 },
+      { id: 'c', group: 'y', points: 1 },
+      { id: 'd', group: 'y', points: null }
+    ];
+    const functions = new Map([[capabilityKey, (args: readonly JsonValue[]) => { evaluations += 1; return args[0] ?? null; }]]);
+
+    expect(evaluateQuery({ root: window, relations: [relation('scores', rows)], functions }).rows).toEqual([
+      { id: 'a', group: 'x', points: 2, rowNumber: 2, rank: 2, previous: 1 },
+      { id: 'b', group: 'x', points: 1, rowNumber: 1, rank: 1, previous: null },
+      { id: 'c', group: 'y', points: 1, rowNumber: 1, rank: 1, previous: null },
+      { id: 'd', group: 'y', points: null, rowNumber: 2, rank: 2, previous: 1 }
+    ]);
+    expect(evaluations).toBe(rows.length * 2);
+  });
+
+  it('rebuilds a window layout when its specification reads an earlier window field', () => {
+    const specification = {
+      partitionBy: [{ kind: 'field' as const, alias: 'score', name: 'bucket' }],
+      orderBy: [{ value: { kind: 'field' as const, alias: 'score', name: 'points' }, direction: 'asc' as const }]
+    };
+    const window: QueryNode = {
+      kind: 'window',
+      input: from('scores', 'score'),
+      alias: 'score',
+      fields: {
+        bucket: { kind: 'window', op: 'row-number', ...specification },
+        rank: { kind: 'window', op: 'rank', ...specification }
+      }
+    };
+
+    expect(evaluateQuery({ root: window, relations: [relation('scores', [{ id: 'high', points: 2 }, { id: 'low', points: 1 }])] }).rows).toEqual([
+      { id: 'high', points: 2, bucket: 2, rank: 1 },
+      { id: 'low', points: 1, bucket: 1, rank: 1 }
+    ]);
+  });
+
   it('rejects non-monotone operators over lower-bound inputs', () => {
     const result = evaluateQuery({ root: { kind: 'slice', input: from('partial'), limit: 1 }, relations: [relation('partial', [{ id: 1 }], 'lower-bound')] });
     expect(result).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ details: { reason: 'incomplete_non_monotone', operator: 'slice' } }] });
@@ -321,6 +397,92 @@ describe('production query oracle', () => {
       key: [{ kind: 'field', alias: 'n', name: 'value' }]
     };
     expect(evaluateQuery({ root: nonlinear, relations: [] })).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.recursion_non_monotone', details: { reason: 'recursion_must_be_linear_and_monotone' } }] });
+  });
+
+  it('evaluates an invariant recursive join side once as the frontier grows', () => {
+    const capability: CapabilityRef = { id: 'urn:test:recursion-index-key', version: '1', contractHash: `sha256:${'d'.repeat(64)}` };
+    const capabilityKey = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    const edgeCount = 48;
+    let invariantEvaluations = 0;
+    const functions = new Map([[capabilityKey, (args: readonly JsonValue[]) => {
+      invariantEvaluations += 1;
+      return args[0] ?? null;
+    }]]);
+    const indexedEdges: QueryNode = {
+      kind: 'select',
+      alias: 'edge',
+      input: from('edges', 'rawEdge'),
+      fields: {
+        parentId: { kind: 'call', capability, args: [{ kind: 'field', alias: 'rawEdge', name: 'parentId' }] },
+        targetId: { kind: 'field', alias: 'rawEdge', name: 'targetId' }
+      }
+    };
+    const recursive: QueryNode = {
+      kind: 'recursive',
+      name: 'nodes',
+      seed: { kind: 'values', alias: 'node', rows: [{ id: 0 }] },
+      step: {
+        kind: 'select',
+        alias: 'node',
+        input: {
+          kind: 'join',
+          join: 'inner',
+          left: { kind: 'recursion-ref', name: 'nodes' },
+          right: indexedEdges,
+          on: { kind: 'compare', op: 'eq', left: { kind: 'field', alias: 'node', name: 'id' }, right: { kind: 'field', alias: 'edge', name: 'parentId' } }
+        },
+        fields: { id: { kind: 'field', alias: 'edge', name: 'targetId' } }
+      },
+      key: [{ kind: 'field', alias: 'node', name: 'id' }],
+      maxIterations: edgeCount + 1
+    };
+    const edges = Array.from({ length: edgeCount }, (_, parentId) => ({ parentId, targetId: parentId + 1 }));
+
+    const result = evaluateQuery({ root: recursive, relations: [relation('edges', edges)], functions });
+
+    expect(result).toMatchObject({ completeness: 'exact', issues: [] });
+    expect(result.rows.map((row) => row.id)).toEqual(Array.from({ length: edgeCount + 1 }, (_, id) => id));
+    // Without invariant-side memoization this is edgeCount work for each of
+    // edgeCount frontiers. The semantic pipeline and its join index are built
+    // once for this evaluation instead.
+    expect(invariantEvaluations).toBe(edgeCount);
+  });
+
+  it('does not memoize a nested recursion that captures the outer frontier', () => {
+    const capturedFrontier: QueryNode = {
+      kind: 'recursive',
+      name: 'captured',
+      seed: {
+        kind: 'select',
+        alias: 'capturedNode',
+        input: { kind: 'recursion-ref', name: 'nodes' },
+        fields: { id: { kind: 'field', alias: 'node', name: 'id' } }
+      },
+      step: { kind: 'recursion-ref', name: 'captured' },
+      key: [{ kind: 'field', alias: 'capturedNode', name: 'id' }]
+    };
+    const recursive: QueryNode = {
+      kind: 'recursive',
+      name: 'nodes',
+      seed: { kind: 'values', alias: 'node', rows: [{ id: 0 }] },
+      step: {
+        kind: 'select',
+        alias: 'node',
+        input: {
+          kind: 'where',
+          input: { kind: 'join', join: 'cross', left: { kind: 'recursion-ref', name: 'nodes' }, right: capturedFrontier },
+          predicate: { kind: 'compare', op: 'lt', left: { kind: 'field', alias: 'capturedNode', name: 'id' }, right: { kind: 'literal', value: 3 } }
+        },
+        fields: { id: { kind: 'arithmetic', op: 'add', left: { kind: 'field', alias: 'capturedNode', name: 'id' }, right: { kind: 'literal', value: 1 } } }
+      },
+      key: [{ kind: 'field', alias: 'node', name: 'id' }]
+    };
+
+    expect(evaluateQuery({ root: recursive, relations: [] })).toMatchObject({
+      completeness: 'exact',
+      rows: [{ id: 0 }, { id: 1 }, { id: 2 }, { id: 3 }],
+      issues: []
+    });
   });
 
   it('binds keyset seek to basis and membership revision', () => {

@@ -31,6 +31,11 @@ import {
   type AutomergeSourceCommitResult
 } from './source.js';
 import {
+  reportAutomergeDiagnostic,
+  runAutomergeCleanups,
+  type AutomergeSourceDiagnosticReporter
+} from './internal-diagnostics.js';
+import {
   AutomergeMapProjectionPlanner,
   type AutomergeMapProjectionPlannerOptions,
   type AutomergeProjectedRow,
@@ -70,6 +75,7 @@ export type AutomergeAtomicSourceOptions<T extends object> = {
   readonly operationEpoch: string;
   readonly freshness?: SourceFreshness;
   readonly ownsRuntime?: boolean;
+  readonly onDiagnostic?: AutomergeSourceDiagnosticReporter;
 };
 
 /** Core AtomicSource facade over the proven exact-head Automerge runtime. */
@@ -78,6 +84,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   readonly operationEpoch: string;
   readonly #runtime: AutomergeSourceRuntimeApi<T>;
   readonly #ownsRuntime: boolean;
+  readonly #onDiagnostic: AutomergeSourceDiagnosticReporter | undefined;
   readonly #listeners = new Set<(change?: { readonly beforeBasis?: import('@tarstate/core').SourceBasis; readonly afterBasis: import('@tarstate/core').SourceBasis }) => void>();
   readonly #unsubscribeRuntime: () => void;
   #freshness: SourceFreshness;
@@ -92,6 +99,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     this.operationEpoch = options.operationEpoch;
     this.#freshness = options.freshness ?? 'current';
     this.#ownsRuntime = options.ownsRuntime === true;
+    this.#onDiagnostic = options.onDiagnostic;
     const initial = options.runtime.snapshot();
     this.#lastReady = { basis: initial.basis, storage: initial.storage };
     this.#unsubscribeRuntime = options.runtime.subscribe((change) => {
@@ -244,18 +252,26 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
 
   close(): void {
     if (this.#lifecycle === 'closed') return;
-    this.#unsubscribeRuntime();
     this.#lifecycle = 'closed';
     this.#freshness = 'none';
     this.#lifecycleIssues = Object.freeze([createIssue({ code: 'source.closed', sourceId: this.sourceId, retry: 'never' })]);
     this.#publish({ afterBasis: this.#lastReady.basis });
     this.#listeners.clear();
-    if (this.#ownsRuntime) this.#runtime.close();
+    runAutomergeCleanups([
+      { operation: 'close.unsubscribe-runtime', cleanup: this.#unsubscribeRuntime },
+      ...(this.#ownsRuntime ? [{ operation: 'close.runtime', cleanup: () => this.#runtime.close() }] : [])
+    ], 'atomic-source', this.#onDiagnostic);
   }
 
   #publish(change: { readonly beforeBasis?: AutomergeBasis; readonly afterBasis: AutomergeBasis }): void {
     for (const listener of Array.from(this.#listeners)) {
-      try { listener(change); } catch { /* source state cannot depend on observers */ }
+      try {
+        listener(change);
+      } catch (error) {
+        reportAutomergeDiagnostic(this.#onDiagnostic, {
+          kind: 'listener_error', component: 'atomic-source', operation: 'publish', error
+        });
+      }
     }
   }
 }

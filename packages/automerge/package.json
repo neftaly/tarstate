@@ -28,6 +28,7 @@
   },
   "devDependencies": {
     "@automerge/automerge-repo": "2.5.6",
+    "fast-check": "^4.9.0",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vitest": "catalog:"

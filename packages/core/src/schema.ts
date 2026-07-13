@@ -3,6 +3,7 @@ import { parseScalarValue, type ScalarDeclaration } from './codec.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { ownedReadonlyMap } from './internal-owned-map.js';
+import { assertPreparedRelation, assertPreparedSchema, sealPreparedRelation, sealPreparedSchema } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
 import type { JsonValue, PortableValue } from './value.js';
@@ -130,7 +131,7 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
       } else keyFields.push(field);
     }
     if (!relationValid) continue;
-    const prepared = Object.freeze({ name, declaration, keyFields: Object.freeze(keyFields) }) as PreparedRelation;
+    const prepared = sealPreparedRelation({ name, declaration, keyFields: Object.freeze(keyFields) });
     relationsByName.set(name, prepared);
     relationsById.set(declaration.relationId, prepared);
   }
@@ -149,7 +150,7 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
   if (issues.length > 0) return { success: false, issues };
   return {
     success: true,
-    value: Object.freeze({
+    value: sealPreparedSchema({
       body,
       relationsByName: ownedReadonlyMap(relationsByName),
       relationsById: ownedReadonlyMap(relationsById)
@@ -166,6 +167,8 @@ export const parseRelationCandidate = (
   registry?: CapabilityRegistry,
   context: CandidateContext = {}
 ): ParseResult<ParsedCandidate> => {
+  assertPreparedSchema(schema);
+  if (typeof relation !== 'string') assertPreparedRelation(relation);
   const prepared = typeof relation === 'string' ? schema.relationsById.get(relation) ?? schema.relationsByName.get(relation) : relation;
   if (prepared === undefined) return schemaFailure('schema.relation_missing', context.path ?? [], { relation });
   const basePath = context.path ?? [];
@@ -193,8 +196,11 @@ export const parseRelationCandidate = (
     else issues.push(...parsed.issues.map((issue) => addCandidateContext(issue, prepared.declaration.relationId, context)));
   }
   if (issues.length > 0) return { success: false, issues };
-  const key = prepared.declaration.key.map((field) => row[field]) as unknown as LogicalKey;
-  return { success: true, value: { row, key }, issues: [] };
+  const ownedRow = detachAndFreezeJsonValue(row);
+  if (!ownedRow.success) return ownedRow;
+  const frozenRow = ownedRow.value as RelationRow;
+  const key = Object.freeze(prepared.declaration.key.map((field) => frozenRow[field])) as unknown as LogicalKey;
+  return { success: true, value: Object.freeze({ row: frozenRow, key }), issues: [] };
 };
 
 export const parseRelationCandidates = (
@@ -204,8 +210,10 @@ export const parseRelationCandidates = (
   registry?: CapabilityRegistry,
   context: Omit<CandidateContext, 'locator' | 'path'> = {}
 ): ParsedRelation => {
+  assertPreparedSchema(schema);
+  if (typeof relation !== 'string') assertPreparedRelation(relation);
   const prepared = typeof relation === 'string' ? schema.relationsById.get(relation) ?? schema.relationsByName.get(relation) : relation;
-  if (prepared === undefined) return { rows: [], rejected: candidates, completeness: 'unknown', issues: [schemaIssue('schema.relation_missing', [], { relation })] };
+  if (prepared === undefined) return Object.freeze({ rows: Object.freeze([]), rejected: Object.freeze([...candidates]), completeness: 'unknown', issues: Object.freeze([schemaIssue('schema.relation_missing', [], { relation })]) });
   const rows: (ParsedCandidate & { readonly locator?: unknown })[] = [];
   const rejected: RelationCandidate[] = [];
   const issues: Issue[] = [];
@@ -229,7 +237,7 @@ export const parseRelationCandidates = (
       issues.push(contextualIssue('schema.duplicate_key', prepared.declaration.relationId, { ...context, locator: duplicate.locator }, [], { count: duplicates.length }, duplicate.key));
     }
   }
-  return { rows, rejected, issues, completeness: rejected.length === 0 && !duplicateKeys ? 'exact' : 'unknown' };
+  return Object.freeze({ rows: Object.freeze(rows.map((row) => Object.freeze(row))), rejected: Object.freeze([...rejected]), issues: Object.freeze(issues), completeness: rejected.length === 0 && !duplicateKeys ? 'exact' : 'unknown' });
 };
 
 export const parseLogicalKey = (
@@ -238,6 +246,7 @@ export const parseLogicalKey = (
   input: unknown,
   registry?: CapabilityRegistry
 ): ParseResult<LogicalKey> => {
+  assertPreparedSchema(schema);
   const relation = schema.relationsById.get(relationId);
   if (relation === undefined) return schemaFailure('schema.relation_missing', [], { relationId });
   if (!Array.isArray(input) || input.length !== relation.keyFields.length) return schemaFailure('schema.key_arity', [], { expected: relation.keyFields.length, actual: Array.isArray(input) ? input.length : 'non_tuple' });
@@ -248,7 +257,9 @@ export const parseLogicalKey = (
     if (parsed.success) values.push(parsed.value);
     else issues.push(...parsed.issues);
   });
-  return issues.length === 0 ? { success: true, value: values as unknown as LogicalKey, issues: [] } : { success: false, issues };
+  if (issues.length > 0) return { success: false, issues };
+  const owned = detachAndFreezeJsonValue(values);
+  return owned.success ? { success: true, value: owned.value as unknown as LogicalKey, issues: [] } : owned;
 };
 
 export const parseScalarValueForField = (
@@ -258,14 +269,18 @@ export const parseScalarValueForField = (
   registry?: CapabilityRegistry,
   path: readonly unknown[] = []
 ): ParseResult<PortableValue> => {
+  assertPreparedSchema(schema);
   if (input === null) return field.nullable === true
     ? { success: true, value: null, issues: [] }
     : schemaFailure('schema.null_not_allowed', path);
-  return parseScalarValue(field.type, input, {
+  const parsed = parseScalarValue(field.type, input, {
     ...(registry === undefined ? {} : { registry }),
     path,
     refFields: (relationId) => schema.relationsById.get(relationId)?.keyFields.map((keyField) => keyField.type)
   });
+  if (!parsed.success) return parsed;
+  const owned = detachAndFreezeJsonValue(parsed.value);
+  return owned.success ? { success: true, value: owned.value as PortableValue, issues: [] } : owned;
 };
 
 const isSchemaBody = (value: unknown): value is SchemaBody => isRecord(value)

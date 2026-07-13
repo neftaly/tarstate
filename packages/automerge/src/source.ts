@@ -1,4 +1,10 @@
 import * as Automerge from '@automerge/automerge';
+import {
+  reportAutomergeDiagnostic,
+  runAutomergeCleanups,
+  type AutomergeSourceDiagnosticReporter
+} from './internal-diagnostics.js';
+export type { AutomergeSourceDiagnostic, AutomergeSourceDiagnosticReporter } from './internal-diagnostics.js';
 
 /** Exact, order-insensitive Automerge head set used for optimistic concurrency. */
 export type AutomergeBasis = {
@@ -103,8 +109,8 @@ type DocumentOwner<T extends object> = {
 
 const documentOwner = Symbol('AutomergeSourceRuntime.documentOwner');
 type AutomergeSourceRuntimeOptions<T extends object> =
-  | { readonly sourceId: string; readonly doc: Automerge.Doc<T> }
-  | { readonly sourceId: string; readonly [documentOwner]: DocumentOwner<T> };
+  | { readonly sourceId: string; readonly doc: Automerge.Doc<T>; readonly onDiagnostic?: AutomergeSourceDiagnosticReporter }
+  | { readonly sourceId: string; readonly [documentOwner]: DocumentOwner<T>; readonly onDiagnostic?: AutomergeSourceDiagnosticReporter };
 
 class StaleOwnerBasis<T extends object> extends Error {
   constructor(readonly storage: Automerge.Doc<T>) {
@@ -119,6 +125,7 @@ class StaleOwnerBasis<T extends object> extends Error {
 export class AutomergeSourceRuntime<T extends object> {
   readonly sourceId: string;
   readonly #owner: DocumentOwner<T>;
+  readonly #onDiagnostic: AutomergeSourceDiagnosticReporter | undefined;
   readonly #unsubscribeOwner: () => void;
   #snapshot: AutomergeSnapshot<T>;
   #closed = false;
@@ -131,6 +138,7 @@ export class AutomergeSourceRuntime<T extends object> {
   constructor(options: AutomergeSourceRuntimeOptions<T>) {
     if (options.sourceId.length === 0) throw new Error('Automerge sourceId must not be empty');
     this.sourceId = options.sourceId;
+    this.#onDiagnostic = options.onDiagnostic;
     this.#owner = 'doc' in options ? memoryDocumentOwner(options.doc) : options[documentOwner];
     const storage = this.#owner.current();
     this.#snapshot = automergeSnapshot(this.sourceId, automergeBasis(storage), storage);
@@ -224,9 +232,11 @@ export class AutomergeSourceRuntime<T extends object> {
     if (this.#closed) return;
     if (this.#applying) throw new Error('Cannot close while an Automerge command is applying');
     this.#closed = true;
-    this.#unsubscribeOwner();
-    this.#owner.close();
     this.#listeners.clear();
+    runAutomergeCleanups([
+      { operation: 'close.unsubscribe-owner', cleanup: this.#unsubscribeOwner },
+      { operation: 'close.owner', cleanup: () => this.#owner.close() }
+    ], 'source-runtime', this.#onDiagnostic);
   }
 
   async #commit(input: {
@@ -344,7 +354,13 @@ export class AutomergeSourceRuntime<T extends object> {
 
   #notify(change: AutomergeSourceChange): void {
     for (const listener of Array.from(this.#listeners)) {
-      try { listener(change); } catch { /* committed source state cannot depend on observers */ }
+      try {
+        listener(change);
+      } catch (error) {
+        reportAutomergeDiagnostic(this.#onDiagnostic, {
+          kind: 'listener_error', component: 'source-runtime', operation: 'publish', error
+        });
+      }
     }
   }
 
@@ -396,6 +412,7 @@ const memoryDocumentOwner = <T extends object>(initial: Automerge.Doc<T>): Docum
 export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
   readonly handle: AutomergeRepoHandle<T, Heads>;
   readonly sourceId?: string;
+  readonly onDiagnostic?: AutomergeSourceDiagnosticReporter;
 }): AutomergeSourceRuntimeApi<T> => {
   const { handle } = options;
   const sourceId = options.sourceId ?? handle.url;
@@ -429,6 +446,7 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
   try {
     return new AutomergeSourceRuntime({
       sourceId,
+      ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
       [documentOwner]: owner
     });
   } catch (error) {

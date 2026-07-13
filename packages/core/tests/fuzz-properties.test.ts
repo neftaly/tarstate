@@ -42,7 +42,9 @@ const plan = sealPreparedPlan({ planId: 'fuzz', rootNodeId: 'fuzz:root', query, 
 type FuzzRow = { readonly occurrenceId: string; readonly row: QueryRecord };
 type FuzzSource = { readonly sourceId: string; readonly attachmentId?: string; revision: number; nextId: number; rows: FuzzRow[] };
 
-describe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
+const deterministicDescribe = process.env.TARSTATE_FUZZ_PROPERTY === undefined ? describe : describe.skip;
+
+deterministicDescribe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
   it('keeps multi-source bag identity unique and incremental results oracle-equivalent', () => {
     for (let run = 0; run < runs; run += 1) {
       const sources = Array.from({ length: 1 + integer(4) }, (_, sourceIndex): FuzzSource => {

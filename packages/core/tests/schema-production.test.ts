@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { capabilityRefFor, CapabilityRegistry, type CapabilityDeclaration } from '../src/registry.js';
 import { createIssue } from '../src/issues.js';
-import { prepareSchema, parseRelationCandidate, parseLogicalKey, type SchemaBody } from '../src/schema.js';
+import { prepareSchema, parseRelationCandidate, parseLogicalKey, type RelationRow, type SchemaBody } from '../src/schema.js';
 import { compileStorageMapping, planStoragePatch, projectStorage, type StorageMappingBody } from '../src/mapping.js';
 import { projectLensRelation, resolveLensPath, translateLensEdits, validateLens, type LensArtifact, type LensRows, type SchemaLensBody } from '../src/lens.js';
 import { parseScalarValue, type CodecImplementation } from '../src/codec.js';
@@ -157,6 +157,25 @@ describe('production schemas and codecs', () => {
   it('rejects hostile schema input before adopting it', () => {
     expect(prepareSchema(Object.create(null))).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
   });
+
+  it('rejects forged prepared schemas and relations at runtime and deeply freezes parse output', () => {
+    const forged = { body: { relations: {} }, relationsByName: new Map(), relationsById: new Map() };
+    expect(() => parseRelationCandidate(forged as never, 'missing', {})).toThrow(TypeError);
+
+    const prepared = prepareSchema({ relations: { values: { relationId: 'test.value', key: ['id'], fields: { id: { type: { kind: 'string' } }, data: { type: { kind: 'json' } } } } } });
+    if (!prepared.success) throw new Error('schema failed');
+    const parsed = parseRelationCandidate(prepared.value, 'test.value', { id: 'a', data: { nested: ['kept'] } });
+    if (!parsed.success) throw new Error('candidate failed');
+    expect(Object.isFrozen(parsed.value)).toBe(true);
+    expect(Object.isFrozen(parsed.value.row)).toBe(true);
+    expect(Object.isFrozen(parsed.value.row.data)).toBe(true);
+    expect(Object.isFrozen((parsed.value.row.data as { readonly nested: readonly unknown[] }).nested)).toBe(true);
+    expect(Object.isFrozen(parsed.value.key)).toBe(true);
+
+    const relation = prepared.value.relationsById.get('test.value');
+    if (relation === undefined) throw new Error('relation missing');
+    expect(() => parseRelationCandidate(prepared.value, { ...relation } as never, {})).toThrow(TypeError);
+  });
 });
 
 describe('production JSON-tree storage mappings', () => {
@@ -223,6 +242,8 @@ describe('production JSON-tree storage mappings', () => {
     const plan = planStoragePatch(compiled.value, snapshot, 'test.user', { kind: 'object-map-key', key: 'alice' }, { nickname: 'Al' }, undefined, 'source:test');
     expect(plan).toMatchObject({ success: true, value: { intents: [{ path: ['users', 'alice', 'profile', 'nickname'] }] } });
     if (!plan.success) throw new Error('plan failed');
+    expect(Object.isFrozen(plan.value.nextSnapshot)).toBe(true);
+    expect(Object.isFrozen((plan.value.nextSnapshot as typeof snapshot).users.alice.profile)).toBe(true);
     expect(plan.value.nextSnapshot).toEqual({
       ...snapshot,
       users: { ...snapshot.users, alice: { ...snapshot.users.alice, profile: { nickname: 'Al', color: 'blue' } } }
@@ -269,6 +290,32 @@ describe('production JSON-tree storage mappings', () => {
   it('rejects hostile mapping input before adopting it', async () => {
     const { schema } = await makeFixture();
     expect(compileStorageMapping(Object.create(null), schemaRef, schema)).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
+  });
+
+  it('parses mapping unions exactly, validates references, seals provenance, and freezes projections', async () => {
+    const { schema } = await makeFixture();
+    const valid = {
+      schema: schemaRef,
+      model: 'json-tree-v1',
+      relations: { 'test.note': { collection: { kind: 'array', path: ['notes'], absent: 'empty' }, keys: { id: { kind: 'field', path: ['id'] } }, fields: { body: { path: ['body'], write: { kind: 'read-only' } } } } }
+    };
+    expect(compileStorageMapping({ ...valid, authority: true }, schemaRef, schema)).toMatchObject({ success: false });
+    expect(compileStorageMapping({ ...valid, schema: { ...schemaRef, contentHash: 'not-a-hash' } }, schemaRef, schema)).toMatchObject({ success: false });
+    expect(compileStorageMapping({ ...valid, relations: { 'test.note': { ...valid.relations['test.note'], collection: { ...valid.relations['test.note'].collection, extra: true } } } }, schemaRef, schema)).toMatchObject({ success: false });
+    expect(compileStorageMapping({ ...valid, relations: { 'test.note': { ...valid.relations['test.note'], keys: { id: { kind: 'field', path: ['id'], onMismatch: 'reject' } } } } }, schemaRef, schema)).toMatchObject({ success: false });
+    expect(compileStorageMapping({ ...valid, relations: { 'test.note': { ...valid.relations['test.note'], fields: { body: { path: [''], write: { kind: 'read-only' } } } } } }, schemaRef, schema)).toMatchObject({ success: false });
+
+    const compiled = compileStorageMapping(valid, schemaRef, schema);
+    if (!compiled.success) throw new Error('mapping failed');
+    expect(() => projectStorage({ ...compiled.value } as never, {})).toThrow(TypeError);
+    const projection = projectStorage(compiled.value, { notes: [{ id: 'n', body: { nested: ['kept'] } }] });
+    const relation = projection.relations.get('test.note');
+    expect(Object.isFrozen(projection)).toBe(true);
+    expect(() => (projection.relations as Map<string, unknown>).clear()).toThrow();
+    expect(Object.isFrozen(projection.issues)).toBe(true);
+    expect(Object.isFrozen(relation)).toBe(true);
+    expect(Object.isFrozen(relation?.rows)).toBe(true);
+    expect(Object.isFrozen(relation?.rows[0]?.row.body)).toBe(true);
   });
 });
 
@@ -387,5 +434,29 @@ describe('production schema lenses', () => {
 
   it('rejects hostile lens input before adopting it', () => {
     expect(validateLens(Object.create(null))).toMatchObject({ success: false, issues: [{ code: 'artifact.hostile_shape' }] });
+  });
+
+  it('parses lens unions exactly, seals provenance, and deeply freezes public output', () => {
+    expect(validateLens({ ...body, authority: true })).toMatchObject({ success: false });
+    expect(validateLens({ ...body, from: { ...from, contentHash: 'nope' } })).toMatchObject({ success: false });
+    expect(validateLens({ ...body, relations: [{ ...body.relations[0]!, extra: true }] })).toMatchObject({ success: false });
+    expect(validateLens({ ...body, relations: [{ ...body.relations[0]!, steps: [{ kind: 'lens.field', from: 'x', to: 'y', write: 'invertible', payload: null }] }] })).toMatchObject({ success: false });
+    expect(validateLens({ ...body, relations: [{ ...body.relations[0]!, steps: [{ kind: 'lens.hide', from: '', write: 'preserve' }] }] })).toMatchObject({ success: false });
+
+    expect(() => projectLensRelation({ ...lens } as never, 'test.task', {})).toThrow(TypeError);
+    const projection = projectLensRelation(lens, 'test.task', { 'test.task': [{ slug: 'a', name: { nested: ['A'] }, state: 'open' }] });
+    expect(Object.isFrozen(projection)).toBe(true);
+    expect(Object.isFrozen(projection.rows)).toBe(true);
+    expect(Object.isFrozen(projection.rows[0])).toBe(true);
+    expect(Object.isFrozen(projection.rows[0]?.title)).toBe(true);
+    expect(() => (projectLensRelation(lens, 'test.task', {}).rows as RelationRow[]).push({})).toThrow();
+    const hostileRow = Object.defineProperty({}, 'slug', { enumerable: true, get: () => { throw new Error('must not run'); } });
+    expect(() => projectLensRelation(lens, 'test.task', { 'test.task': [hostileRow as RelationRow] })).not.toThrow();
+    expect(projectLensRelation(lens, 'test.task', { 'test.task': [hostileRow as RelationRow] })).toMatchObject({ completeness: 'unknown', issues: [{ code: 'lens.input_invalid' }] });
+
+    const translated = translateLensEdits(lens, 'test.task', { name: 'old' }, { title: { nested: ['new'] } }, {});
+    if (!translated.success) throw new Error('translation failed');
+    expect(Object.isFrozen(translated.value)).toBe(true);
+    expect(Object.isFrozen(translated.value.name)).toBe(true);
   });
 });

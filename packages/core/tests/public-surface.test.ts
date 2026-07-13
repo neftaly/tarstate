@@ -14,6 +14,7 @@ describe('clean rewrite core surface', () => {
     expect(core.CapabilityRegistry).toBeTypeOf('function');
     expect(core.HostRuntimeRegistry).toBeTypeOf('function');
     expect(core.evaluateQuery).toBeTypeOf('function');
+    expect(core.evaluatePreparedQuery).toBeTypeOf('function');
     expect(core.openIncrementalQueryMaintenance).toBeTypeOf('function');
     expect(core.acquireExternalStoreRuntime).toBeTypeOf('function');
     expect(core.prepareSchema).toBeTypeOf('function');
@@ -44,6 +45,7 @@ describe('clean rewrite core surface', () => {
     expect(artifacts.safeParseArtifactText).toBe(core.safeParseArtifactText);
     expect(database.DatabaseView).toBe(core.DatabaseView);
     expect(query.evaluateQuery).toBe(core.evaluateQuery);
+    expect(query.evaluatePreparedQuery).toBe(core.evaluatePreparedQuery);
     expect(query.prepareTypedQuery).toBe(core.prepareTypedQuery);
     expect(query.typedSelect).toBe(core.typedSelect);
     expect(schema.prepareSchema).toBe(core.prepareSchema);
@@ -53,6 +55,15 @@ describe('clean rewrite core surface', () => {
     expect('createPooledIncrementalQueryRuntime' in query).toBe(false);
     expect('typedReturning' in query).toBe(false);
     expect('typedSelect' in schema).toBe(false);
+  });
+
+  it('shares prepared-plan provenance across the root and query entry points', async () => {
+    const root = { kind: 'values', alias: 'value', rows: [{ id: 1 }] } as const;
+    const fromTopic = await query.prepareQuery({ root, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' });
+    const fromRoot = await core.prepareQuery({ root, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' });
+
+    expect(core.evaluatePreparedQuery(fromTopic, { relations: [] }).rows).toEqual([{ id: 1 }]);
+    expect(query.evaluatePreparedQuery(fromRoot, { relations: [] }).rows).toEqual([{ id: 1 }]);
   });
 
   it('does not retain legacy API names', () => {

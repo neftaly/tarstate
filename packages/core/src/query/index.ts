@@ -2,6 +2,7 @@
 export {
   diffQueryMaintenanceSnapshots,
   evaluateExpression,
+  evaluatePreparedQuery,
   evaluateQuery,
   openIncrementalQueryMaintenance,
   prepareQuery
@@ -16,6 +17,7 @@ export type {
   IncrementalQueryResult,
   IncrementalQueryResultDelta,
   OrderTerm,
+  PreparedQueryRequest,
   QueryCursor,
   QueryFunction,
   QueryLogicalValue,

@@ -3,8 +3,8 @@ import { runGoldenConformanceWorkloads } from '../packages/core/dist/golden-work
 
 const requestedIterations = Number.parseInt(process.env.TARSTATE_BENCH_ITERATIONS ?? '250', 10);
 const iterations = Number.isSafeInteger(requestedIterations) && requestedIterations > 0 ? requestedIterations : 250;
-const requestedBudget = Number(process.env.TARSTATE_BENCH_BUDGET_MS ?? 50);
-const budgetPerIterationMs = Number.isFinite(requestedBudget) && requestedBudget > 0 ? requestedBudget : 50;
+const requestedBudget = Number(process.env.TARSTATE_BENCH_BUDGET_MS ?? 10);
+const budgetPerIterationMs = Number.isFinite(requestedBudget) && requestedBudget > 0 ? requestedBudget : 10;
 
 for (let index = 0; index < 10; index += 1) runGoldenConformanceWorkloads();
 const started = performance.now();

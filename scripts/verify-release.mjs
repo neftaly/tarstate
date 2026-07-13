@@ -59,6 +59,8 @@ try {
       if (String(version).startsWith('workspace:')) fail(`${manifest.name}: unresolved workspace dependency ${dependency}`);
     }
 
+    if (manifest.name === '@tarstate/core') await verifyCoreCrossEntryProvenance(tarball, destination);
+
     for (const exported of Object.values(manifest.exports ?? {})) {
       await import(pathToFileURL(path.join(packageDirectory, String(exported.import))).href);
     }
@@ -66,6 +68,126 @@ try {
   console.log(`Verified ${packageDirectories.length} v0.2.2 tarballs and runtime entry points.`);
 } finally {
   rmSync(temporaryDirectory, { recursive: true, force: true });
+}
+
+async function verifyCoreCrossEntryProvenance(tarball, destination) {
+  const producerDirectory = path.join(destination, 'producer');
+  const consumerDirectory = path.join(destination, 'consumer');
+  mkdirSync(producerDirectory);
+  mkdirSync(consumerDirectory);
+  execFileSync('tar', ['-xzf', tarball, '-C', producerDirectory]);
+  execFileSync('tar', ['-xzf', tarball, '-C', consumerDirectory]);
+
+  const producer = await import(pathToFileURL(path.join(producerDirectory, 'package/dist/index.js')).href);
+  const queryConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/query/index.js')).href);
+  const schemaConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/schema/index.js')).href);
+
+  const plan = await producer.prepareQuery({
+    root: { kind: 'values', alias: 'value', rows: [{ id: 1 }] },
+    registryFingerprint: 'registry:packed-cross-entry',
+    authorityFingerprint: 'authority:packed-cross-entry',
+    datasetId: 'dataset:packed-cross-entry'
+  });
+  const session = queryConsumer.openIncrementalQueryMaintenance(plan, { relations: [] });
+  if (session.getCurrentResult().rows[0]?.id !== 1) fail('@tarstate/core: packed query entry rejected root-entry prepared plan');
+  session.close();
+  if (queryConsumer.evaluatePreparedQuery(plan, { relations: [] }).rows[0]?.id !== 1) {
+    fail('@tarstate/core: packed query entry rejected root-entry plan for prepared evaluation');
+  }
+  const subpathPlan = await queryConsumer.prepareQuery({
+    root: { kind: 'values', alias: 'value', rows: [{ id: 2 }] },
+    registryFingerprint: 'registry:packed-cross-entry',
+    authorityFingerprint: 'authority:packed-cross-entry',
+    datasetId: 'dataset:packed-cross-entry'
+  });
+  const reverseSession = producer.openIncrementalQueryMaintenance(subpathPlan, { relations: [] });
+  if (reverseSession.getCurrentResult().rows[0]?.id !== 2) fail('@tarstate/core: packed root entry rejected query-entry prepared plan');
+  reverseSession.close();
+  if (producer.evaluatePreparedQuery(subpathPlan, { relations: [] }).rows[0]?.id !== 2) {
+    fail('@tarstate/core: packed root entry rejected query-entry plan for prepared evaluation');
+  }
+  try {
+    queryConsumer.openIncrementalQueryMaintenance({ ...plan }, { relations: [] });
+    fail('@tarstate/core: packed query entry accepted forged prepared plan');
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+  }
+
+  const prepared = producer.prepareSchema({
+    relations: {
+      values: { relationId: 'test.value', key: ['id'], fields: { id: { type: { kind: 'number' } } } }
+    }
+  });
+  if (!prepared.success) fail('@tarstate/core: packed root entry could not prepare schema');
+  const parsed = schemaConsumer.parseRelationCandidate(prepared.value, 'test.value', { id: 1 });
+  if (!parsed.success) fail('@tarstate/core: packed schema entry rejected root-entry prepared schema');
+
+  const hash = (character) => `sha256:${character.repeat(64)}`;
+  const schemaRef = { id: 'urn:test:schema:packed-cross-entry', contentHash: hash('1') };
+  const mapping = producer.compileStorageMapping({
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: {
+      'test.value': {
+        collection: { kind: 'array', path: ['values'], absent: 'empty' },
+        keys: { id: { kind: 'field', path: ['id'] } },
+        fields: {}
+      }
+    }
+  }, schemaRef, prepared.value);
+  if (!mapping.success) fail('@tarstate/core: packed root entry could not compile mapping');
+  if (schemaConsumer.projectStorage(mapping.value, { values: [{ id: 1 }] }).relations.get('test.value')?.rows.length !== 1) {
+    fail('@tarstate/core: packed schema entry rejected root-entry compiled mapping');
+  }
+
+  const lens = producer.validateLens({
+    from: { id: 'urn:test:schema:from', contentHash: hash('2') },
+    to: { id: 'urn:test:schema:to', contentHash: hash('3') },
+    relations: [{
+      fromRelationId: 'test.value',
+      toRelationId: 'test.projected-value',
+      steps: [{ kind: 'lens.field', from: 'id', to: 'id', write: 'invertible' }]
+    }]
+  });
+  if (!lens.success) fail('@tarstate/core: packed root entry could not validate lens');
+  if (schemaConsumer.projectLensRelation(lens.value, 'test.projected-value', { 'test.value': [{ id: 1 }] }).rows[0]?.id !== 1) {
+    fail('@tarstate/core: packed schema entry rejected root-entry validated lens');
+  }
+
+  const subpathPrepared = schemaConsumer.prepareSchema({
+    relations: {
+      reverse: { relationId: 'test.reverse', key: ['id'], fields: { id: { type: { kind: 'number' } } } }
+    }
+  });
+  if (!subpathPrepared.success || !producer.parseRelationCandidate(subpathPrepared.value, 'test.reverse', { id: 2 }).success) {
+    fail('@tarstate/core: packed root entry rejected schema-entry prepared schema');
+  }
+  const subpathMapping = schemaConsumer.compileStorageMapping({
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: {
+      'test.reverse': {
+        collection: { kind: 'array', path: ['reverse'], absent: 'empty' },
+        keys: { id: { kind: 'field', path: ['id'] } },
+        fields: {}
+      }
+    }
+  }, schemaRef, subpathPrepared.value);
+  if (!subpathMapping.success || producer.projectStorage(subpathMapping.value, { reverse: [{ id: 2 }] }).relations.get('test.reverse')?.rows.length !== 1) {
+    fail('@tarstate/core: packed root entry rejected schema-entry compiled mapping');
+  }
+  const subpathLens = schemaConsumer.validateLens({
+    from: { id: 'urn:test:schema:reverse-from', contentHash: hash('4') },
+    to: { id: 'urn:test:schema:reverse-to', contentHash: hash('5') },
+    relations: [{
+      fromRelationId: 'test.reverse',
+      toRelationId: 'test.reverse-view',
+      steps: [{ kind: 'lens.field', from: 'id', to: 'id', write: 'invertible' }]
+    }]
+  });
+  if (!subpathLens.success || producer.projectLensRelation(subpathLens.value, 'test.reverse-view', { 'test.reverse': [{ id: 2 }] }).rows[0]?.id !== 2) {
+    fail('@tarstate/core: packed root entry rejected schema-entry validated lens');
+  }
 }
 
 function verifyDeclarationReachability(packageName, tarball, entries) {

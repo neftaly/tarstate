@@ -4,6 +4,8 @@ import {
   type CommitReceipt,
   type JsonValue,
   type ObserveRequest,
+  type ObserverDiagnostic,
+  type ObserverDiagnosticReporter,
   type ObserverSnapshot,
   type PreparedPlan,
   type QueryObserver,
@@ -117,6 +119,8 @@ export type TarstateProviderProps<Query = unknown, Row = unknown> = {
   readonly executeCommit?: (attempt: TransactionAttempt) => Promise<CommitReceipt>;
   readonly createOptimisticOverlay?: CreateOptimisticOverlay<Query, Row>;
   readonly serverQueryObservations?: readonly ServerQueryObservation<Query, Row>[];
+  /** Receives contained React subscription and teardown failures. */
+  readonly onDiagnostic?: ObserverDiagnosticReporter;
   readonly children?: ReactNode;
 };
 
@@ -125,6 +129,7 @@ type Runtime = {
   readonly serverQuerySnapshots: ReadonlyMap<string, ObserverSnapshot<unknown>>;
   readonly mutationStore: MutationStore;
   readonly overlayStore: OptimisticOverlayStore;
+  readonly onDiagnostic: ObserverDiagnosticReporter | undefined;
   readonly acquire: () => () => void;
 };
 
@@ -136,11 +141,12 @@ type CommitActions = {
 const CommitActionsContext = createContext<CommitActions | undefined>(undefined);
 
 /** Borrows a database. Unmounting never closes the database or its sources. */
-export const TarstateProvider = <Query, Row>({ database, executeCommit, createOptimisticOverlay, serverQueryObservations = emptyServerQueryObservations as readonly ServerQueryObservation<Query, Row>[], children }: TarstateProviderProps<Query, Row>): ReactNode => {
+export const TarstateProvider = <Query, Row>({ database, executeCommit, createOptimisticOverlay, serverQueryObservations = emptyServerQueryObservations as readonly ServerQueryObservation<Query, Row>[], onDiagnostic, children }: TarstateProviderProps<Query, Row>): ReactNode => {
   const runtime = useMemo<Runtime>(() => createRuntime(
     database as unknown as ErasedDatabase,
-    normalizeServerQueryObservations(database, serverQueryObservations)
-  ), [database, serverQueryObservations]);
+    normalizeServerQueryObservations(database, serverQueryObservations),
+    onDiagnostic
+  ), [database, onDiagnostic, serverQueryObservations]);
   const actions = useMemo(() => ({ executeCommit, createOptimisticOverlay: createOptimisticOverlay as ErasedCreateOptimisticOverlay | undefined }), [executeCommit, createOptimisticOverlay]);
   useEffect(() => runtime.acquire(), [runtime]);
   return createElement(TarstateContext.Provider, { value: runtime }, createElement(CommitActionsContext.Provider, { value: actions }, children));
@@ -178,7 +184,7 @@ export function useQuery<Query, Row, Parameters extends Readonly<Record<string, 
   const runtime = useRuntime();
   const request = useMemo(() => queryRequest(plan, options), [plan, options.parameters, options.allowPartial]);
   const key = useMemo(() => queryObservationKey(runtime.database, request), [runtime.database, request]);
-  const baseStore = queryStore<Query, Row>(runtime.database, request, key);
+  const baseStore = queryStore<Query, Row>(runtime.database, request, key, runtime.onDiagnostic);
   const store = runtime.overlayStore.view<Query, Row>(baseStore, request, key);
   const serverSnapshot = runtime.serverQuerySnapshots.get(key) as ObserverSnapshot<Row> | undefined;
   const getServerSnapshot = useMemo(() => serverSnapshot === undefined ? undefined : () => serverSnapshot, [serverSnapshot]);
@@ -291,6 +297,42 @@ const optimisticOverlayError = (
 const errorDetails = (error: unknown): { readonly name: string; readonly message: string } =>
   error instanceof Error ? { name: error.name, message: error.message } : { name: typeof error, message: String(error) };
 
+type ReactDiagnosticComponent = Extract<ObserverDiagnostic['component'], `react-${string}`>;
+
+const reportReactDiagnostic = (
+  reporter: ObserverDiagnosticReporter | undefined,
+  diagnostic: ObserverDiagnostic
+): void => {
+  if (reporter === undefined) return;
+  try { reporter(diagnostic); } catch { /* diagnostics cannot affect adapter state */ }
+};
+
+const notifyReactListeners = (
+  listeners: Iterable<() => void>,
+  component: ReactDiagnosticComponent,
+  operation: string,
+  reporter?: ObserverDiagnosticReporter
+): void => {
+  for (const listener of Array.from(listeners)) {
+    try { listener(); } catch (error) {
+      reportReactDiagnostic(reporter, Object.freeze({ kind: 'listener_error', component, operation, error }));
+    }
+  }
+};
+
+const runReactCleanups = (
+  cleanups: Iterable<() => void>,
+  component: ReactDiagnosticComponent,
+  operation: string,
+  reporter?: ObserverDiagnosticReporter
+): void => {
+  for (const cleanup of cleanups) {
+    try { cleanup(); } catch (error) {
+      reportReactDiagnostic(reporter, Object.freeze({ kind: 'cleanup_error', component, operation, error }));
+    }
+  }
+};
+
 const receiptIdentityMatches = (attempt: TransactionAttempt, receipt: CommitReceipt): boolean =>
   receipt.kind === 'commit'
   && receipt.receiptVersion === 1
@@ -303,11 +345,12 @@ const storesByDatabase = new WeakMap<object, Map<string, QueryStore<unknown>>>()
 
 const createRuntime = (
   database: ErasedDatabase,
-  serverQuerySnapshots: ReadonlyMap<string, ObserverSnapshot<unknown>>
+  serverQuerySnapshots: ReadonlyMap<string, ObserverSnapshot<unknown>>,
+  onDiagnostic: ObserverDiagnosticReporter | undefined
 ): Runtime => {
   let mutationStore: MutationStore | undefined;
-  const overlayStore = new OptimisticOverlayStore((mutationId, error) => mutationStore?.recordOptimisticError(mutationId, error));
-  mutationStore = new MutationStore(overlayStore);
+  const overlayStore = new OptimisticOverlayStore((mutationId, error) => mutationStore?.recordOptimisticError(mutationId, error), onDiagnostic);
+  mutationStore = new MutationStore(overlayStore, onDiagnostic);
   let acquisitions = 0;
   let closeGeneration = 0;
   let closed = false;
@@ -316,6 +359,7 @@ const createRuntime = (
     serverQuerySnapshots,
     mutationStore,
     overlayStore,
+    onDiagnostic,
     acquire: () => {
       if (closed) throw new Error('Tarstate provider runtime is closed');
       acquisitions += 1;
@@ -329,15 +373,14 @@ const createRuntime = (
         queueMicrotask(() => {
           if (closed || acquisitions !== 0 || generation !== closeGeneration) return;
           closed = true;
-          mutationStore.close();
-          overlayStore.close();
+          runReactCleanups([() => mutationStore.close(), () => overlayStore.close()], 'react-provider', 'release-runtime', onDiagnostic);
         });
       };
     }
   };
 };
 
-const queryStore = <Query, Row>(database: ErasedDatabase, request: ObserveRequest<Query>, key: string): QueryStore<Row> => {
+const queryStore = <Query, Row>(database: ErasedDatabase, request: ObserveRequest<Query>, key: string, onDiagnostic?: ObserverDiagnosticReporter): QueryStore<Row> => {
   let stores = storesByDatabase.get(database);
   if (stores === undefined) {
     stores = new Map();
@@ -347,7 +390,7 @@ const queryStore = <Query, Row>(database: ErasedDatabase, request: ObserveReques
   if (existing !== undefined) return existing as QueryStore<Row>;
   const store = new QueryStore<Row>(database, request as unknown as ObserveRequest<unknown>, () => {
     if (stores?.get(key) === store) stores.delete(key);
-  });
+  }, onDiagnostic);
   stores.set(key, store as QueryStore<unknown>);
   return store;
 };
@@ -357,14 +400,16 @@ class QueryStore<Row> {
   readonly #request: ObserveRequest<unknown>;
   readonly #collect: () => void;
   readonly #listeners = new Set<() => void>();
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   #observer: QueryObserver<Row> | undefined;
   #unsubscribeObserver: (() => void) | undefined;
   #closeGeneration = 0;
 
-  constructor(database: ErasedDatabase, request: ObserveRequest<unknown>, collect: () => void) {
+  constructor(database: ErasedDatabase, request: ObserveRequest<unknown>, collect: () => void, onDiagnostic?: ObserverDiagnosticReporter) {
     this.#database = database;
     this.#request = request;
     this.#collect = collect;
+    this.#onDiagnostic = onDiagnostic;
     // Server-only or abandoned renders may create a cache entry without ever
     // acquiring a live observer subscription.
     this.#scheduleClose();
@@ -389,9 +434,7 @@ class QueryStore<Row> {
     if (this.#observer !== undefined) return;
     this.#observer = this.#database.observe(this.#request) as QueryObserver<Row>;
     this.#unsubscribeObserver = this.#observer.subscribe(() => {
-      for (const listener of Array.from(this.#listeners)) {
-        try { listener(); } catch { /* one query view cannot starve later subscribers */ }
-      }
+      notifyReactListeners(this.#listeners, 'react-query', 'publish-query-store', this.#onDiagnostic);
     });
     if (this.#listeners.size === 0) this.#scheduleClose();
   }
@@ -400,11 +443,12 @@ class QueryStore<Row> {
     const generation = ++this.#closeGeneration;
     queueMicrotask(() => {
       if (generation !== this.#closeGeneration || this.#listeners.size !== 0) return;
-      this.#unsubscribeObserver?.();
+      const observer = this.#observer;
+      const cleanups = [this.#unsubscribeObserver, observer === undefined ? undefined : () => observer.close(), this.#collect]
+        .filter((cleanup): cleanup is () => void => cleanup !== undefined);
       this.#unsubscribeObserver = undefined;
-      this.#observer?.close();
       this.#observer = undefined;
-      this.#collect();
+      runReactCleanups(cleanups, 'react-query', 'close-query-store', this.#onDiagnostic);
     });
   }
 }
@@ -414,14 +458,17 @@ class OptimisticOverlayStore {
   readonly #views = new Map<string, OptimisticQueryView<unknown, unknown>>();
   readonly #reportError: (mutationId: number, error: OptimisticUpdateError) => void;
   readonly #pendingFailures = new Map<number, OptimisticUpdateError>();
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   #revision = 0;
   #closed = false;
 
-  constructor(reportError: (mutationId: number, error: OptimisticUpdateError) => void) {
+  constructor(reportError: (mutationId: number, error: OptimisticUpdateError) => void, onDiagnostic?: ObserverDiagnosticReporter) {
     this.#reportError = reportError;
+    this.#onDiagnostic = onDiagnostic;
   }
 
   get revision(): number { return this.#revision; }
+  get onDiagnostic(): ObserverDiagnosticReporter | undefined { return this.#onDiagnostic; }
 
   view<Query, Row>(base: QueryStore<Row>, request: ObserveRequest<Query>, key: string): OptimisticQueryView<Query, Row> {
     const existing = this.#views.get(key);
@@ -484,15 +531,18 @@ class OptimisticOverlayStore {
       if (source === undefined) continue;
       const observedBasis = source.basis;
       const rebased = canonicalizeJson(observedBasis) !== canonicalizeJson(overlay.sourceBasis);
-      let projection: OptimisticProjection<Row>;
+      let candidate: OptimisticProjection<Row>;
       try {
-        projection = definition.projectRows({ request, authoritativeSnapshot: authoritative, currentRows: rows, currentResultKeys: resultKeys, sourceBasis: overlay.sourceBasis, observedBasis, rebased });
+        candidate = definition.projectRows({ request, authoritativeSnapshot: authoritative, currentRows: rows, currentResultKeys: resultKeys, sourceBasis: overlay.sourceBasis, observedBasis, rebased });
       } catch (error) {
         failures.push([overlay, optimisticOverlayError('project-rows', error)]);
         continue;
       }
-      if (projection === null || typeof projection !== 'object' || !Array.isArray(projection.rows) || !Array.isArray(projection.resultKeys) || projection.rows.length !== projection.resultKeys.length || projection.resultKeys.some((key) => typeof key !== 'string') || new Set(projection.resultKeys).size !== projection.resultKeys.length) {
-        failures.push([overlay, optimisticOverlayError('projection-result', new TypeError('rows and unique string resultKeys must have equal lengths'))]);
+      let projection: OptimisticProjection<Row>;
+      try {
+        projection = adoptOptimisticProjection(candidate);
+      } catch (error) {
+        failures.push([overlay, optimisticOverlayError('projection-result', error)]);
         continue;
       }
       rows = projection.rows;
@@ -520,7 +570,7 @@ class OptimisticOverlayStore {
     this.#closed = true;
     this.#overlays.clear();
     this.#pendingFailures.clear();
-    for (const view of Array.from(this.#views.values())) view.close();
+    runReactCleanups(Array.from(this.#views.values(), (view) => () => view.close()), 'react-optimistic', 'close-overlay-views', this.#onDiagnostic);
     this.#views.clear();
   }
 
@@ -531,6 +581,9 @@ class OptimisticOverlayStore {
 
   #scheduleFailure(overlay: ActiveOptimisticOverlay, error: OptimisticUpdateError): void {
     if (this.#pendingFailures.has(overlay.mutationId)) return;
+    // A rejected host projection cannot remain active between render and the
+    // deferred mutation-state notification.
+    this.#overlays.delete(overlay.mutationId);
     this.#pendingFailures.set(overlay.mutationId, error);
     queueMicrotask(() => this.#flushFailures());
   }
@@ -539,7 +592,6 @@ class OptimisticOverlayStore {
     if (this.#closed) { this.#pendingFailures.clear(); return; }
     let changed = false;
     for (const [mutationId, error] of this.#pendingFailures) {
-      if (!this.#overlays.delete(mutationId)) continue;
       this.#reportError(mutationId, error);
       changed = true;
     }
@@ -587,12 +639,12 @@ class OptimisticQueryView<Query, Row> {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#unsubscribeBase?.();
+    const cleanups = [this.#unsubscribeBase, this.#collect].filter((cleanup): cleanup is () => void => cleanup !== undefined);
     this.#unsubscribeBase = undefined;
     this.#listeners.clear();
     this.#snapshot = undefined;
     this.#baseSnapshot = undefined;
-    this.#collect();
+    runReactCleanups(cleanups, 'react-optimistic', 'close-query-view', this.#overlays.onDiagnostic);
   }
 
   #refresh(): void {
@@ -600,9 +652,7 @@ class OptimisticQueryView<Query, Row> {
     const previous = this.#snapshot;
     const next = this.#recompute();
     if (previous === next) return;
-    for (const listener of Array.from(this.#listeners)) {
-      try { listener(); } catch { /* observer callbacks cannot change materialized UI state */ }
-    }
+    notifyReactListeners(this.#listeners, 'react-optimistic', 'publish-query-view', this.#overlays.onDiagnostic);
   }
 
   #recompute(): ReactObserverSnapshot<Row> {
@@ -629,8 +679,9 @@ class MutationStore {
   #snapshot: MutationState = emptyMutationState;
   #nextMutationId = 1;
   #closed = false;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
 
-  constructor(overlayStore: OptimisticOverlayStore) { this.#overlayStore = overlayStore; }
+  constructor(overlayStore: OptimisticOverlayStore, onDiagnostic?: ObserverDiagnosticReporter) { this.#overlayStore = overlayStore; this.#onDiagnostic = onDiagnostic; }
 
   readonly getSnapshot = (): MutationState => this.#snapshot;
 
@@ -709,9 +760,7 @@ class MutationStore {
       pendingCount: mutations.filter(({ state }) => state === 'pending').length,
       mutations: Object.freeze(mutations)
     });
-    for (const listener of Array.from(this.#listeners)) {
-      try { listener(); } catch { /* mutation observers cannot change recorded commit state */ }
-    }
+    notifyReactListeners(this.#listeners, 'react-mutations', 'publish-mutation-state', this.#onDiagnostic);
   }
 
   close(): void {
@@ -770,6 +819,22 @@ const useExternalStoreWithSelector = <Snapshot, Selected>(
   }, [selected]);
   useDebugValue(selected);
   return selected;
+};
+
+const adoptOptimisticProjection = <Row>(candidate: OptimisticProjection<Row>): OptimisticProjection<Row> => {
+  const projection = deepFreezeClone(candidate);
+  if (
+    projection === null
+    || typeof projection !== 'object'
+    || !Array.isArray(projection.rows)
+    || !Array.isArray(projection.resultKeys)
+    || projection.rows.length !== projection.resultKeys.length
+    || projection.resultKeys.some((key) => typeof key !== 'string')
+    || new Set(projection.resultKeys).size !== projection.resultKeys.length
+  ) {
+    throw new TypeError('rows and unique string resultKeys must have equal lengths');
+  }
+  return projection;
 };
 
 const deepFreezeClone = <Value>(value: Value, seen = new WeakMap<object, object>()): Value => {

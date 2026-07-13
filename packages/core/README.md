@@ -36,6 +36,13 @@ freezes the portable query while carrying its inferred row and parameter types
 into observers and framework adapters. `prepareQuery` remains the lower-level
 API for an already-erased `QueryNode`.
 
+For repeated pure evaluation outside an observer, call
+`evaluatePreparedQuery(plan, { relations, parameters, functions })`. It reuses
+the plan's already-owned query AST while continuing to detach and freeze every
+changing input. Use `evaluateQuery({ root, ...inputs })` at arbitrary or
+untrusted query ingress; its full request, including the AST, is adopted on
+every call.
+
 ## Minimal database assembly
 
 `DatabaseView` is the imperative shell around host-owned sources and authority
@@ -93,3 +100,34 @@ expression subqueries, divergent input streams, custom factories, and
 incompatible cohorts safely use isolated maintenance sessions.
 `getQueryMaintenanceReuseDiagnostics()` reports how often active runtimes computed
 or reused relation deltas across parameter cohorts; custom factories report zeroes.
+
+## Property tests and replay
+
+`pnpm --filter @tarstate/core test:fuzz` runs both the deterministic seeded
+state-machine checks and shrinking fast-check properties. Each property gets a
+seed derived from its stable name, so adding or reordering another property
+does not change its generated cases. Increase coverage with
+`TARSTATE_FUZZ_RUNS=1000`.
+
+On failure, fast-check prints a seed and shrink path. Replay only that minimized
+case by supplying its exact property name, seed, and path:
+
+```sh
+TARSTATE_FUZZ_PROPERTY=canonical-json-round-trip \
+TARSTATE_FUZZ_SEED=123456789 \
+TARSTATE_FUZZ_PATH='4:2:0' \
+pnpm --filter @tarstate/core test:fuzz
+```
+
+Omit `TARSTATE_FUZZ_PATH` to rerun every generated case for that property and
+seed. `TARSTATE_FUZZ_SEED` acts as the suite's base seed when no property is
+selected.
+
+## Performance contracts
+
+From the repository root, `pnpm check:perf` runs the coarse release budget and
+the repeated query-scaling suite. Query timings are reported as medians; the
+enforced contracts are conservative relative-speed, physical-node selectivity,
+and sampled-allocation ceilings rather than machine-specific absolute timings.
+Use `pnpm bench:query` when iterating on query maintenance and include its JSON
+output when changing a performance-sensitive execution path.

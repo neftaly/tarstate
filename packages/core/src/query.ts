@@ -118,6 +118,9 @@ export type QueryRequest = {
   readonly membershipRevision?: number;
 };
 
+/** Changing inputs for repeated evaluation of an already prepared query. */
+export type PreparedQueryRequest = Omit<QueryRequest, 'root'>;
+
 /** Pure query result. `resultKeys` are stable occurrence identities and grant no write authority. */
 export type QueryResult = {
   readonly rows: readonly QueryRecord[];
@@ -248,6 +251,7 @@ type QueryContext = {
   readonly issues: Issue[];
   readonly recursions: Map<string, readonly ScopedRow[]>;
   readonly recursionConstants: Map<QueryNode, NodeResult>;
+  readonly recursionDependencies: Map<QueryNode, ReadonlySet<string>>;
   readonly joinIndexes: Map<QueryNode, ReadonlyMap<string, readonly ScopedRow[]>>;
   readonly basis?: JsonValue;
   readonly membershipRevision?: number;
@@ -297,6 +301,22 @@ const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.ve
 /** Evaluates the independent, deterministic semantic oracle. */
 export const evaluateQuery = (request: QueryRequest): QueryResult => {
   const owned = adoptQueryRequest(request);
+  return evaluateOwnedQuery(owned.root, owned);
+};
+
+/**
+ * Evaluates a runtime-sealed prepared plan while adopting every changing input.
+ * Unlike `evaluateQuery`, this path amortizes adoption of the portable query AST.
+ */
+export const evaluatePreparedQuery = (
+  plan: PreparedPlan<QueryNode>,
+  request: PreparedQueryRequest
+): QueryResult => {
+  assertPreparedPlan(plan);
+  return evaluateOwnedQuery(plan.query, adoptMaintenanceSnapshot(request));
+};
+
+const evaluateOwnedQuery = (root: QueryNode, owned: QueryMaintenanceSnapshot): QueryResult => {
   const issues = [...validateRelationInputs(owned.relations, 'query')];
   if (issues.length > 0) return frozenQueryResult([], [], 'unknown', issues);
   const context: QueryContext = {
@@ -306,12 +326,13 @@ export const evaluateQuery = (request: QueryRequest): QueryResult => {
     issues,
     recursions: new Map(),
     recursionConstants: new Map(),
+    recursionDependencies: new Map(),
     joinIndexes: new Map(),
     ...(owned.basis === undefined ? {} : { basis: owned.basis }),
     ...(owned.membershipRevision === undefined ? {} : { membershipRevision: owned.membershipRevision }),
     unavailable: false
   };
-  const result = evaluateNode(owned.root, context);
+  const result = evaluateNode(root, context);
   if (context.unavailable || result.completeness === 'unknown') return frozenQueryResult([], [], 'unknown', issues);
   const rows = publicQueryRows(result.rows, new WeakMap());
   return frozenQueryResult(rows, result.rows.map(resultKey), result.completeness, issues);
@@ -342,7 +363,7 @@ const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
     context.unavailable = context.unavailable || materialized.unavailable;
     return materialized.result;
   }
-  const cacheable = context.outer === undefined && context.recursions.size > 0 && !containsRecursionReference(node);
+  const cacheable = context.outer === undefined && context.recursions.size > 0 && !referencesActiveRecursion(node, context);
   const cached = cacheable ? context.recursionConstants.get(node) : undefined;
   if (cached !== undefined) return cached;
   const result = evaluateNodeUncached(node, context);
@@ -516,7 +537,7 @@ const equijoinFields = (node: Extract<QueryNode, { readonly kind: 'join' }>): Eq
 };
 
 const indexedRows = (node: QueryNode, rows: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlyMap<string, readonly ScopedRow[]> => {
-  const cacheable = context.outer === undefined && !containsRecursionReference(node.kind === 'join' ? node.right : node);
+  const cacheable = context.outer === undefined && !referencesActiveRecursion(node.kind === 'join' ? node.right : node, context);
   const cached = cacheable ? context.joinIndexes.get(node) : undefined;
   if (cached !== undefined) return cached;
   const index = buildIndexedRows(rows, expression, context);
@@ -547,16 +568,41 @@ const indexKey = (expression: Expr, row: ScopedRow, context: QueryContext): stri
   return result.status === 'known' && result.value !== null ? canonicalizeJson(result.value) : undefined;
 };
 
-const containsRecursionReference = (node: QueryNode): boolean => {
-  const visit = (value: unknown): boolean => {
-    if (Array.isArray(value)) return value.some(visit);
-    if (value === null || typeof value !== 'object') return false;
-    const candidate = value as Readonly<Record<string, unknown>>;
-    if (candidate.kind === 'recursion-ref') return true;
-    if (candidate.kind === 'recursive') return false;
-    return Object.values(candidate).some(visit);
-  };
-  return visit(node);
+const referencesActiveRecursion = (node: QueryNode, context: QueryContext): boolean => {
+  let dependencies = context.recursionDependencies.get(node);
+  if (dependencies === undefined) {
+    const free = new Set<string>();
+    const visit = (value: unknown, bound: ReadonlySet<string>): void => {
+      if (Array.isArray(value)) {
+        value.forEach((child) => visit(child, bound));
+        return;
+      }
+      if (value === null || typeof value !== 'object') return;
+      const candidate = value as Readonly<Record<string, unknown>>;
+      if (candidate.kind === 'recursion-ref') {
+        if (typeof candidate.name === 'string' && !bound.has(candidate.name)) free.add(candidate.name);
+        return;
+      }
+      if (candidate.kind !== 'recursive' || typeof candidate.name !== 'string') {
+        Object.values(candidate).forEach((child) => visit(child, bound));
+        return;
+      }
+      // A nested recursion can capture an outer binding in its seed. Its own
+      // binding shadows an outer recursion with the same name in the step,
+      // key, and expression subqueries evaluated while iterating.
+      visit(candidate.seed, bound);
+      const nested = new Set(bound);
+      nested.add(candidate.name);
+      Object.entries(candidate).forEach(([key, child]) => {
+        if (key !== 'seed') visit(child, nested);
+      });
+    };
+    visit(node, new Set());
+    dependencies = free;
+    context.recursionDependencies.set(node, dependencies);
+  }
+  for (const name of context.recursions.keys()) if (dependencies.has(name)) return true;
+  return false;
 };
 
 const evaluateAggregate = (node: Extract<QueryNode, { readonly kind: 'aggregate' }>, context: QueryContext): NodeResult => {
@@ -622,33 +668,27 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
   const inner = evaluateNode(node.input, context);
   if (inner.completeness !== 'exact') return nonMonotoneUnknown(context, 'window');
   const output = [...inner.rows];
+  const outputFields = new Set(Object.keys(node.fields));
+  const layouts = new Map<string, WindowLayout>();
   for (const [field, window] of Object.entries(node.fields)) {
-    const partitions = new Map<string, { readonly row: ScopedRow; readonly outputIndex: number }[]>();
-    for (const [outputIndex, row] of output.entries()) {
-      const partitionValues = (window.partitionBy ?? []).map((expr) => evaluateExpr(expr, exprContext(row, context)));
-      if (partitionValues.some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
-      const key = canonicalizeJson(partitionValues.map(expressionJson));
-      const rows = partitions.get(key) ?? [];
-      rows.push({ row, outputIndex });
-      partitions.set(key, rows);
+    const reusable = !windowSpecificationReferencesFields(window, node.alias, outputFields);
+    const layoutKey = reusable ? windowSpecificationKey(window) : field;
+    let layout = reusable ? layouts.get(layoutKey) : undefined;
+    if (layout === undefined) {
+      layout = buildWindowLayout(output, window, context);
+      if (reusable) layouts.set(layoutKey, layout);
     }
-    for (const partition of partitions.values()) {
-      partition.sort((left, right) => compareOrder(left.row, right.row, window.orderBy, context));
-      let rank = 1;
-      let previousOrder: string | undefined;
-      partition.forEach(({ row, outputIndex }, index) => {
-        const orderValues = window.orderBy.map((term) => evaluateExpr(term.value, exprContext(row, context)));
-        if (orderValues.some((item) => item.status === 'unavailable' || item.status === 'indeterminate')) context.unavailable = true;
-        const orderKey = canonicalizeJson(orderValues.map(expressionJson));
-        if (previousOrder !== undefined && previousOrder !== orderKey) rank = index + 1;
-        previousOrder = orderKey;
-        let value: JsonValue = window.op === 'row-number' ? index + 1 : rank;
+    for (const partition of layout) {
+      partition.forEach(({ outputIndex, rowNumber, rank }, index) => {
+        let value: JsonValue = window.op === 'row-number' ? rowNumber : rank;
         if (window.op === 'lag') {
-          const previous = partition[index - (window.offset ?? 1)]?.row;
+          const previousIndex = partition[index - (window.offset ?? 1)]?.outputIndex;
+          const previous = previousIndex === undefined ? undefined : output[previousIndex];
           const lagged = previous === undefined || window.value === undefined ? undefined : evaluateExpr(window.value, exprContext(previous, context));
           if (lagged?.status === 'unavailable' || lagged?.status === 'indeterminate') context.unavailable = true;
           value = lagged === undefined ? null : expressionJson(lagged);
         }
+        const row = output[outputIndex] as ScopedRow;
         const aliasFields = requiredAlias(row, node.alias, context);
         if (aliasFields === undefined) return;
         output[outputIndex] = { ...row, scope: { ...row.scope, [node.alias]: { ...aliasFields, [field]: value } } };
@@ -656,6 +696,66 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
     }
   }
   return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows: output, completeness: 'exact' };
+};
+
+type WindowLayoutRow = {
+  readonly outputIndex: number;
+  readonly rowNumber: number;
+  readonly rank: number;
+};
+type WindowLayout = readonly (readonly WindowLayoutRow[])[];
+
+const buildWindowLayout = (rows: readonly ScopedRow[], window: WindowExpr, context: QueryContext): WindowLayout => {
+  const partitions = new Map<string, { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[] }[]>();
+  for (const [outputIndex, row] of rows.entries()) {
+    const partitionValues = (window.partitionBy ?? []).map((expression) => evaluateExpr(expression, exprContext(row, context)));
+    const orderValues = window.orderBy.map((term) => evaluateExpr(term.value, exprContext(row, context)));
+    if ([...partitionValues, ...orderValues].some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
+    const key = canonicalizeJson(partitionValues.map(expressionJson));
+    const partition = partitions.get(key) ?? [];
+    partition.push({ outputIndex, orderValues });
+    partitions.set(key, partition);
+  }
+  return [...partitions.values()].map((partition) => {
+    partition.sort((left, right) => compareWindowRows(left, right, rows, window.orderBy));
+    let rank = 1;
+    let previousOrder: string | undefined;
+    return partition.map(({ outputIndex, orderValues }, index): WindowLayoutRow => {
+      const orderKey = canonicalizeJson(orderValues.map(expressionJson));
+      if (previousOrder !== undefined && previousOrder !== orderKey) rank = index + 1;
+      previousOrder = orderKey;
+      return { outputIndex, rowNumber: index + 1, rank };
+    });
+  });
+};
+
+const compareWindowRows = (
+  left: { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[] },
+  right: { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[] },
+  rows: readonly ScopedRow[],
+  terms: readonly OrderTerm[]
+): number => {
+  for (let index = 0; index < terms.length; index += 1) {
+    const comparison = compareOrderedExpressions(left.orderValues[index] as ExpressionResult, right.orderValues[index] as ExpressionResult, terms[index] as OrderTerm);
+    if (comparison !== 0) return comparison;
+  }
+  return comparePortableStrings(resultKey(rows[left.outputIndex] as ScopedRow), resultKey(rows[right.outputIndex] as ScopedRow));
+};
+
+const windowSpecificationKey = (window: WindowExpr): string => canonicalizeJson({
+  partitionBy: window.partitionBy ?? [],
+  orderBy: window.orderBy
+} as unknown as JsonValue);
+
+const windowSpecificationReferencesFields = (window: WindowExpr, alias: string, fields: ReadonlySet<string>): boolean => {
+  const visit = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(visit);
+    if (value === null || typeof value !== 'object') return false;
+    const candidate = value as Readonly<Record<string, unknown>>;
+    if (candidate.kind === 'field' && candidate.alias === alias && typeof candidate.name === 'string' && fields.has(candidate.name)) return true;
+    return Object.values(candidate).some(visit);
+  };
+  return visit(window.partitionBy ?? []) || visit(window.orderBy);
 };
 
 const evaluateSeek = (node: Extract<QueryNode, { readonly kind: 'seek' }>, context: QueryContext): NodeResult => {
@@ -878,6 +978,7 @@ const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult 
       issues: context.issues,
       recursions: context.query.recursions,
       recursionConstants: context.query.recursionConstants,
+      recursionDependencies: context.query.recursionDependencies,
       joinIndexes: context.query.joinIndexes,
       ...(context.query.basis === undefined ? {} : { basis: context.query.basis }),
       ...(context.query.membershipRevision === undefined ? {} : { membershipRevision: context.query.membershipRevision }),
@@ -1625,19 +1726,27 @@ export const createPooledIncrementalQueryRuntime = (input: {
     const changedIds = changedRelationIds(nextSnapshot, changedRelations);
     for (const root of roots) {
       const nextRoot = materialized.get(root.root);
+      const rootChangedNodeCount = rootChangedCounts.get(root) ?? 0;
+      // A rejected update clears `asserted` while retaining the last physical
+      // graph. The first accepted transition must therefore republish that
+      // graph even when no node needed evaluation.
+      const reusePublicViews = root.asserted !== undefined && rootChangedNodeCount === 0;
       const nextCurrent = maintainedQueryResult(
         nextRoot,
         [],
         maintenanceState(
           root.reachable.size,
           rootUpdatedCounts.get(root) ?? 0,
-          rootChangedCounts.get(root) ?? 0,
+          rootChangedNodeCount,
           changedIds,
-          diffMaintainedResults(root.asserted, nextRoot, valueIdentities),
+          reusePublicViews
+            ? emptyIncrementalQueryResultDelta
+            : diffMaintainedResults(root.asserted, nextRoot, valueIdentities),
           revision,
           rejectedUpdateCount
         ),
-        publicRows
+        publicRows,
+        reusePublicViews ? root.current : undefined
       );
       if (!journal.roots.has(root)) journal.roots.set(root, { current: root.current, asserted: root.asserted });
       root.current = nextCurrent;
@@ -1957,6 +2066,7 @@ const materializationContext = (
     issues,
     recursions: new Map(),
     recursionConstants: new Map(),
+    recursionDependencies: new Map(),
     joinIndexes: new Map(),
     ...(snapshot.basis === undefined ? {} : { basis: snapshot.basis }),
     ...(snapshot.membershipRevision === undefined ? {} : { membershipRevision: snapshot.membershipRevision }),
@@ -2096,9 +2206,13 @@ const incrementallyMaterializeLocal = (
   if (child === undefined || child.unavailable || child.result.completeness === 'unknown' || child.issues.length > 0 || previous?.local === undefined) {
     return materializeQueryNode(node, snapshot, materializedNodes);
   }
+  const oneToOne = isOneToOneLocallyMaintainedNode(node);
+  // One-to-one operators have exactly one output per input, in input order, so
+  // their packed output array is also their segment index. Other local
+  // operators only need a separate sparse/variable-width segment array; the
+  // child result already is the immutable input index and does not need copying.
   const segments: LocalSegment[] = [];
-  const inputs: ScopedRow[] = [];
-  const output: ScopedRow[] = [];
+  const output: ScopedRow[] = oneToOne ? segments as ScopedRow[] : [];
   const issues: Issue[] = [];
   let unavailable = false;
   let previousPositions: ReadonlyMap<string, number> | undefined;
@@ -2109,7 +2223,6 @@ const incrementallyMaterializeLocal = (
   for (let index = 0; index < child.result.rows.length; index += 1) {
     const row = child.result.rows[index] as ScopedRow;
     const key = resultKey(row);
-    inputs.push(row);
     let previousIndex = index;
     const aligned = previous.local.inputs[index];
     if (aligned === undefined || resultKey(aligned) !== key) {
@@ -2120,7 +2233,7 @@ const incrementallyMaterializeLocal = (
     if (canRetain) {
       const retained = previous.local.segments[previousIndex];
       segments.push(retained);
-      appendLocalSegment(output, retained);
+      if (!oneToOne) appendLocalSegment(output, retained);
       continue;
     }
     overrides ??= new Map(materializedNodes);
@@ -2130,14 +2243,14 @@ const incrementallyMaterializeLocal = (
     unavailable = unavailable || segment.unavailable;
     const next = localSegment(node, segment.result.rows);
     segments.push(next);
-    appendLocalSegment(output, next);
+    if (!oneToOne) appendLocalSegment(output, next);
   }
   if (unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
   return {
     result: { rows: output, completeness: child.result.completeness },
     issues: [],
     unavailable: false,
-    local: { inputs, segments }
+    local: { inputs: child.result.rows, segments }
   };
 };
 
@@ -2146,6 +2259,9 @@ const indexLocalSegments = (
   inputs: readonly ScopedRow[],
   outputs: readonly ScopedRow[]
 ): NonNullable<MaterializedQueryNode['local']> => {
+  if (isOneToOneLocallyMaintainedNode(node) && outputs.length === inputs.length) {
+    return { inputs, segments: outputs };
+  }
   const positions = new Map(inputs.map((row, index) => [resultKey(row), index]));
   const segments: LocalSegment[] = Array.from({ length: inputs.length });
   for (const row of outputs) {
@@ -2176,6 +2292,12 @@ const isLocallyMaintainedNode = (node: QueryNode): node is Extract<QueryNode, { 
   return node.kind === 'unnest' && !containsSubquery(node.expression);
 };
 
+const isOneToOneLocallyMaintainedNode = (
+  node: Extract<QueryNode, { readonly kind: 'where' | 'select' | 'with-fields' | 'rename' | 'omit' | 'unnest' }>
+): node is Extract<QueryNode, { readonly kind: 'select' | 'with-fields' | 'rename' | 'omit' }> => {
+  return node.kind === 'select' || node.kind === 'with-fields' || node.kind === 'rename' || node.kind === 'omit';
+};
+
 const containsSubquery = (expression: Expr): boolean => {
   if (expression.kind === 'subquery') return true;
   if (expression.kind === 'literal' || expression.kind === 'parameter' || expression.kind === 'field' || expression.kind === 'key-of' || expression.kind === 'source-of') return false;
@@ -2192,8 +2314,18 @@ const maintainedQueryResult = (
   root: MaterializedQueryNode | undefined,
   additionalIssues: readonly Issue[],
   state: IncrementalQueryMaintenanceState,
-  publicRows: WeakMap<ScopedRow, QueryRecord>
+  publicRows: WeakMap<ScopedRow, QueryRecord>,
+  reusablePublicViews?: IncrementalQueryResult
 ): IncrementalQueryResult => {
+  if (reusablePublicViews !== undefined) {
+    return Object.freeze({
+      rows: reusablePublicViews.rows,
+      resultKeys: reusablePublicViews.resultKeys,
+      completeness: reusablePublicViews.completeness,
+      issues: reusablePublicViews.issues,
+      state
+    });
+  }
   const issues = publicQueryIssues(deduplicateQueryIssues([...(root?.issues ?? []), ...additionalIssues]));
   if (root === undefined || root.unavailable || root.result.completeness === 'unknown') {
     return Object.freeze({ rows: Object.freeze([]), resultKeys: Object.freeze([]), completeness: 'unknown', issues, state });

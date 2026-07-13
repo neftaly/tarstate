@@ -10,6 +10,7 @@ import {
   AutomergeAtomicSource,
   AutomergeMapStorageBinding,
   AutomergeSourceRuntime,
+  type AutomergeSourceDiagnostic,
   automergePathFootprint,
   exactAutomergeBasisEqual,
   relateAutomergeFootprints
@@ -219,8 +220,10 @@ describe('Automerge core source protocols', () => {
   });
 
   it('does not let an observer make an applied runtime commit appear rejected', async () => {
-    const { runtime } = fixture();
-    runtime.subscribe(() => { throw new Error('observer failed'); });
+    const diagnostics = vi.fn();
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: baseDoc(), onDiagnostic: diagnostics });
+    const observerFailure = new Error('observer failed');
+    runtime.subscribe(() => { throw observerFailure; });
     const before = runtime.snapshot();
     const result = await runtime.commit({
       ...commitInput(before.basis as JsonValue, 'operation:throwing-observer', '5'),
@@ -229,6 +232,40 @@ describe('Automerge core source protocols', () => {
     });
     expect(result).toMatchObject({ outcome: 'committed', changed: true });
     expect(runtime.snapshot().storage.tasks.first?.title).toBe('Committed');
+    expect(diagnostics).toHaveBeenCalledWith({
+      kind: 'listener_error', component: 'source-runtime', operation: 'publish', error: observerFailure
+    });
+  });
+
+  it('finalizes an owned atomic source and attempts every teardown after contained failures', () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: baseDoc() });
+    const unsubscribeFailure = new Error('unsubscribe failed');
+    const runtimeCloseFailure = new Error('runtime close failed');
+    vi.spyOn(runtime, 'subscribe').mockImplementation(() => () => { throw unsubscribeFailure; });
+    vi.spyOn(runtime, 'close').mockImplementation(() => { throw runtimeCloseFailure; });
+    const diagnostics = vi.fn((_diagnostic: AutomergeSourceDiagnostic) => { throw new Error('diagnostic sink failed'); });
+    const source = new AutomergeAtomicSource({
+      runtime,
+      operationEpoch: 'epoch:teardown',
+      ownsRuntime: true,
+      onDiagnostic: diagnostics
+    });
+    const observerFailure = new Error('observer failed');
+    const listener = vi.fn(() => { throw observerFailure; });
+    source.subscribe(listener);
+
+    expect(() => source.close()).not.toThrow();
+
+    expect(source.snapshot()).toMatchObject({ state: 'closed', freshness: 'none' });
+    expect(listener).toHaveBeenCalledOnce();
+    expect(diagnostics.mock.calls.map(([diagnostic]) => diagnostic)).toEqual([
+      { kind: 'listener_error', component: 'atomic-source', operation: 'publish', error: observerFailure },
+      { kind: 'cleanup_error', component: 'atomic-source', operation: 'close.unsubscribe-runtime', error: unsubscribeFailure },
+      { kind: 'cleanup_error', component: 'atomic-source', operation: 'close.runtime', error: runtimeCloseFailure }
+    ]);
+    expect(() => source.close()).not.toThrow();
+    expect(listener).toHaveBeenCalledOnce();
+    expect(diagnostics).toHaveBeenCalledTimes(3);
   });
 
   it('resolves an exactly observed concurrent map conflict through the coordinator', async () => {

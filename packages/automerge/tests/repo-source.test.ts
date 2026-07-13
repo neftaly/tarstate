@@ -1,4 +1,5 @@
 import { Repo } from '@automerge/automerge-repo';
+import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource,
@@ -188,5 +189,34 @@ describe('Automerge Repo source owner', () => {
     expect(handle.doc().count).toBe(0);
     expect(handle.isReady()).toBe(true);
     await repo.shutdown();
+  });
+
+  it('finalizes a Repo runtime when owner teardown throws and reports the failure once', () => {
+    const doc = Automerge.from<CounterDoc>({ count: 0 }, { actor: '7'.repeat(64) });
+    const closeFailure = new Error('handle off failed');
+    const diagnostics = vi.fn();
+    const handle: AutomergeRepoHandle<CounterDoc, readonly string[]> = {
+      url: 'automerge:test-close-failure',
+      isReady: () => true,
+      isReadOnly: () => false,
+      doc: () => doc,
+      heads: () => Automerge.getHeads(doc),
+      changeAt: () => Automerge.getHeads(doc),
+      on: vi.fn(),
+      off: vi.fn(() => { throw closeFailure; })
+    };
+    const runtime = automergeRepoSourceRuntime({ handle, onDiagnostic: diagnostics });
+    const listener = vi.fn();
+    runtime.subscribe(listener);
+
+    expect(() => runtime.close()).not.toThrow();
+    expect(() => runtime.snapshot()).toThrow(/closed/);
+    expect(diagnostics).toHaveBeenCalledOnce();
+    expect(diagnostics).toHaveBeenCalledWith({
+      kind: 'cleanup_error', component: 'source-runtime', operation: 'close.owner', error: closeFailure
+    });
+    expect(() => runtime.close()).not.toThrow();
+    expect(diagnostics).toHaveBeenCalledOnce();
+    expect(listener).not.toHaveBeenCalled();
   });
 });

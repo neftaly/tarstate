@@ -259,6 +259,22 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
+  it('retains unchanged public row identity through every one-to-one local operator', () => {
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot(middlePeople, 2);
+    for (const name of ['select', 'with-fields', 'rename', 'omit'] as const) {
+      const session = openIncrementalQueryMaintenance(plan(operatorQueries[name] as QueryNode), initial);
+      const before = session.getCurrentResult();
+      const after = applySnapshot(session, initial, next);
+
+      expect(after.rows).not.toBe(before.rows);
+      expect(after.rows[0], name).toBe(before.rows[0]);
+      expect(after.rows[1], name).not.toBe(before.rows[1]);
+      expect(semanticResult(after)).toEqual(oracle(operatorQueries[name] as QueryNode, next));
+      session.close();
+    }
+  });
+
   it('owns pooled inputs and shares immutable public views for retained physical rows', () => {
     const firstRow = { id: 1, nested: { label: 'one' } };
     const initial: QueryMaintenanceSnapshot = { relations: [relation('pooled-owned', [{ occurrenceId: 'owned:1', row: firstRow }], 1)] };
@@ -793,15 +809,52 @@ describe('incremental query maintenance', () => {
     });
     const peopleRoot = runtime.attach(plan(peopleQuery));
     const groupsRoot = runtime.attach(plan(groupsQuery));
+    const previousPeople = peopleRoot.getCurrentResult();
+    const previousGroups = groupsRoot.getCurrentResult();
 
     runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
 
-    expect(peopleRoot.getCurrentResult().state).toMatchObject({ revision: 1, updatedNodeCount: 2, changedNodeCount: 2 });
-    expect(groupsRoot.getCurrentResult().state).toMatchObject({ revision: 1, updatedNodeCount: 0, changedNodeCount: 0 });
-    expect(semanticResult(groupsRoot.getCurrentResult())).toEqual(oracle(groupsQuery, next));
+    const nextPeople = peopleRoot.getCurrentResult();
+    const nextGroups = groupsRoot.getCurrentResult();
+    expect(nextPeople.state).toMatchObject({ revision: 1, updatedNodeCount: 2, changedNodeCount: 2 });
+    expect(nextPeople.rows).not.toBe(previousPeople.rows);
+    expect(nextPeople.resultKeys).not.toBe(previousPeople.resultKeys);
+    expect(nextGroups).not.toBe(previousGroups);
+    expect(nextGroups.state).not.toBe(previousGroups.state);
+    expect(nextGroups.state).toMatchObject({ revision: 1, updatedNodeCount: 0, changedNodeCount: 0 });
+    expect(nextGroups.rows).toBe(previousGroups.rows);
+    expect(nextGroups.resultKeys).toBe(previousGroups.resultKeys);
+    expect(nextGroups.issues).toBe(previousGroups.issues);
+    expect(semanticResult(nextGroups)).toEqual(oracle(groupsQuery, next));
     expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 2, lastChangedPhysicalNodeCount: 2 });
     peopleRoot.close();
     groupsRoot.close();
+    runtime.close();
+  });
+
+  it('reuses every immutable public view across an exact pooled no-op while advancing state', () => {
+    const initial = snapshot(basePeople, 1);
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/no-op-public-views', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan({ kind: 'select', input: from('people', 'p'), alias: 'result', fields: { id: field('p', 'id') } }));
+    const before = root.getCurrentResult();
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, initial));
+
+    const after = root.getCurrentResult();
+    expect(after).not.toBe(before);
+    expect(after.state).not.toBe(before.state);
+    expect(after.state).toMatchObject({ revision: 1, updatedNodeCount: 0, changedNodeCount: 0 });
+    expect(after.rows).toBe(before.rows);
+    expect(after.resultKeys).toBe(before.resultKeys);
+    expect(after.issues).toBe(before.issues);
+    expect(after.state.resultDelta).toEqual({ addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] });
+    root.close();
     runtime.close();
   });
 
