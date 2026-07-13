@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/core",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Portable relational semantics and source protocols for Tarstate",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/core" },

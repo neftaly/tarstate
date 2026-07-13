@@ -125,7 +125,8 @@ export type QueryRequest = {
  * node, visited scan-operator input, join candidate, sort comparison, recursion
  * iteration/admission, and output row produced by an evaluated physical node.
  * The counter resets for each evaluation, update, or pooled attachment.
- * Omission preserves unlimited execution.
+ * `maxWorkUnits` must be a nonnegative safe integer; zero permits no charged
+ * work. Omission preserves unlimited execution.
  */
 export type QueryExecutionBudget = { readonly maxWorkUnits: number };
 
@@ -187,6 +188,20 @@ export type QueryMaintenanceUpdate = {
   readonly relations: readonly RelationInputChange[];
 };
 
+/**
+ * Occurrence-identity changes from the previously accepted result to the
+ * current available exact or lower-bound materialization. Each array should be
+ * consumed as a set; ordering is deterministic but is not a public sorting
+ * guarantee.
+ *
+ * - `addedResultKeys`: identities absent before and asserted by the new result.
+ * - `removedResultKeys`: identities asserted before and absent from the new result.
+ * - `updatedResultKeys`: retained identities whose visible row value changed.
+ *
+ * Rejected updates and invalidation to unknown completeness report empty arrays:
+ * withdrawing an assertion does not prove that its rows were removed. Recovery
+ * from an unknown result republishes the recovered identities as additions.
+ */
 export type IncrementalQueryResultDelta = {
   readonly addedResultKeys: readonly string[];
   readonly removedResultKeys: readonly string[];

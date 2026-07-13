@@ -81,9 +81,12 @@ const observer = database.observe({ plan });
 
 Use `prepareManualReadOnlyAttachment` for an already trusted projection, or
 `prepareDatabaseAttachment` when artifacts and capabilities must be validated.
-The host closes the observer, database, and attachment lease; none owns the
-others. Registries and authority checks remain explicit because they are policy,
-not construction defaults.
+Closing the database closes every observer and maintenance runtime it created;
+closing an observer earlier only releases that observer's lease. The database
+borrows the attachment catalog, dataset memberships, attachments, and sources,
+so the host must still close attachment leases and any independently owned
+sources. Registries and authority checks remain explicit because they are
+policy, not construction defaults.
 
 ## Shared maintenance
 

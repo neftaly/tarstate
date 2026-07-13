@@ -41,6 +41,7 @@ export type {
   RelationUse,
   WindowExpr
 } from '../query.js';
+export type { PreparedPlan } from '../maintenance.js';
 export * from '../query-builder.js';
 export {
   prepareTypedQuery,

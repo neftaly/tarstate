@@ -1,10 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as core from '../src/index.js';
 import * as artifacts from '@tarstate/core/artifacts';
 import * as database from '@tarstate/core/database';
 import * as query from '@tarstate/core/query';
 import * as schema from '@tarstate/core/schema';
 import * as transactions from '@tarstate/core/transactions';
+import type { ObserverDiagnosticReporter as TopicObserverDiagnosticReporter } from '@tarstate/core/database';
+import type { PreparedPlan as TopicPreparedPlan } from '@tarstate/core/query';
 
 describe('clean rewrite core surface', () => {
   it('exposes the production foundation at the package root', () => {
@@ -55,6 +57,8 @@ describe('clean rewrite core surface', () => {
     expect('createPooledIncrementalQueryRuntime' in query).toBe(false);
     expect('typedReturning' in query).toBe(false);
     expect('typedSelect' in schema).toBe(false);
+    expectTypeOf<TopicObserverDiagnosticReporter>().toMatchTypeOf<import('../src/observer-diagnostics.js').ObserverDiagnosticReporter>();
+    expectTypeOf<TopicPreparedPlan>().toMatchTypeOf<import('../src/maintenance.js').PreparedPlan>();
   });
 
   it('shares prepared-plan provenance across the root and query entry points', async () => {

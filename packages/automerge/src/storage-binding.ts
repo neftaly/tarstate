@@ -4,6 +4,7 @@ import { conflictsAt, normalizeAutomergeValue, type AutomergePath, type Automerg
 import { isAutomergeReservedRootProperty } from './reserved.js';
 import { comparePortableStrings } from './portable-order.js';
 import { automergeBasis, type AutomergeBasis, type AutomergeSnapshot, type AutomergeSourceCommand } from './source.js';
+import { adoptAutomergeMapOptions, type OwnedAutomergeMapOptions } from './internal-options-ownership.js';
 
 export type AutomergeRowLocator = {
   readonly namespace: string;
@@ -60,11 +61,11 @@ export type AutomergeEditPlan<T extends object> = {
 /** A pure map-collection binding. It never subscribes or commits. */
 export class AutomergeMapProjectionPlanner<T extends object, Row extends Readonly<Record<string, JsonValue>>> {
   readonly relationId: string;
-  readonly #options: AutomergeMapProjectionPlannerOptions<Row>;
+  readonly #options: OwnedAutomergeMapOptions<Row>;
 
   constructor(options: AutomergeMapProjectionPlannerOptions<Row>) {
-    this.relationId = options.relationId;
-    this.#options = options;
+    this.#options = adoptAutomergeMapOptions<Row>(options);
+    this.relationId = this.#options.relationId;
   }
 
   project(snapshot: AutomergeSnapshot<T>): AutomergeRelationProjection<Row> {

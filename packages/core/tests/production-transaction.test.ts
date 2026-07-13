@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { checkFinalConstraints, type ConstraintEvaluation, type SourceConstraint } from '../src/constraints.js';
-import { InMemoryAtomicSource, type MemoryQueryResult, type MemoryRelation, type MemoryState } from '../src/memory-source.js';
+import { InMemoryAtomicSource, type MemoryAttachment, type MemoryQueryResult, type MemoryRelation, type MemoryRow, type MemoryState } from '../src/memory-source.js';
 import type { QueryNode } from '../src/query.js';
 import { safeParseReceipt } from '../src/receipts.js';
 import { executeNonAtomicBatch, sealTransaction, type NonAtomicBatch, type Transaction, type TransactionBody, type WriteStatement } from '../src/transaction.js';
@@ -20,13 +20,13 @@ const transaction = (statements: readonly WriteStatement[], parameters: Transact
   body: { schemaView, parameters, statements, guards, requiredCapabilities }
 });
 
-const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult; onDiagnostic?: ConstructorParameters<typeof InMemoryAtomicSource>[0]['onDiagnostic'] } = {}) => new InMemoryAtomicSource({
+const source = (options: { state?: MemoryState; relations?: readonly MemoryRelation[]; attachments?: readonly MemoryAttachment[]; constraints?: readonly SourceConstraint<MemoryState>[]; evaluateQuery?: (root: unknown, state: MemoryState, parameters: TransactionBody['parameters']) => MemoryQueryResult; onDiagnostic?: ConstructorParameters<typeof InMemoryAtomicSource>[0]['onDiagnostic'] } = {}) => new InMemoryAtomicSource({
   sourceId: 'source:one',
   incarnation: 'incarnation:one',
   operationEpoch: 'epoch:one',
   state: options.state ?? { items: [] },
   relations: options.relations ?? [{ relationId: 'items', schemaView, keyFields: ['id'] }],
-  attachments: [{ attachmentId: 'attachment:one', fingerprint: hash('b'), authorityViewFingerprint: hash('c'), schemaView, writable: true }],
+  attachments: options.attachments ?? [{ attachmentId: 'attachment:one', fingerprint: hash('b'), authorityViewFingerprint: hash('c'), schemaView, writable: true }],
   ...(options.constraints === undefined ? {} : { constraints: options.constraints }),
   ...(options.evaluateQuery === undefined ? {} : { evaluateQuery: options.evaluateQuery }),
   ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
@@ -37,6 +37,153 @@ const attempt = (operationId: string, value: Transaction, extra: Partial<{ expec
 });
 
 describe('production in-memory transaction coordinator', () => {
+  it('descriptor-safely owns and deeply freezes constructor and snapshot state', () => {
+    let getterCalls = 0;
+    const hostile: Record<string, unknown> = {};
+    Object.defineProperty(hostile, 'items', {
+      enumerable: true,
+      get: () => { getterCalls += 1; return []; }
+    });
+    expect(() => source({ state: hostile as MemoryState })).toThrow(/Initial memory state must be descriptor-safe portable state/);
+    expect(getterCalls).toBe(0);
+
+    const nested = { label: 'owned', values: [1] };
+    const rows = [{ id: 1, nested }];
+    const memory = source({ state: { items: rows } });
+    nested.label = 'caller-mutated';
+    nested.values.push(2);
+    rows.push({ id: 2, nested: { label: 'late', values: [] } });
+
+    const snapshot = memory.snapshot();
+    expect(snapshot.state).toEqual({ items: [{ id: 1, nested: { label: 'owned', values: [1] } }] });
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.basis)).toBe(true);
+    expect(Object.isFrozen(snapshot.state)).toBe(true);
+    expect(Object.isFrozen(snapshot.state.items)).toBe(true);
+    expect(Object.isFrozen(snapshot.state.items?.[0])).toBe(true);
+    expect(Object.isFrozen(snapshot.state.items?.[0]?.nested)).toBe(true);
+    expect(Object.isFrozen((snapshot.state.items![0]!.nested as { readonly values: readonly number[] }).values)).toBe(true);
+    expect(() => (((snapshot.state.items as unknown as MemoryRow[])[0] as unknown as Record<string, unknown>).id = 99)).toThrow(TypeError);
+    expect(memory.snapshot().state).toEqual({ items: [{ id: 1, nested: { label: 'owned', values: [1] } }] });
+  });
+
+  it('owns portable relation and attachment metadata and freezes the constraint container', async () => {
+    const keyFields = ['id'];
+    const relations: MemoryRelation[] = [{ relationId: 'items', schemaView, keyFields }];
+    const relationOwned = source({ state: { items: [{ id: 1 }] }, relations });
+    keyFields.length = 0;
+    relations.length = 0;
+    const upsert = await transaction([{
+      kind: 'statement.upsert', relation, rows: [{ id: literal(2) }], onConflict: 'replace'
+    }]);
+    expect(await relationOwned.commit(attempt('owned-relation', upsert))).toMatchObject({ outcome: 'committed' });
+    expect(relationOwned.snapshot().state.items).toEqual([{ id: 1 }, { id: 2 }]);
+
+    const attachments: MemoryAttachment[] = [{
+      attachmentId: 'attachment:one', fingerprint: hash('b'), authorityViewFingerprint: hash('c'), schemaView, writable: false
+    }];
+    const attachmentOwned = source({ attachments });
+    (attachments[0] as { writable: boolean }).writable = true;
+    attachments.length = 0;
+    const insert = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
+    expect(await attachmentOwned.commit(attempt('owned-attachment', insert))).toMatchObject({
+      outcome: 'rejected', issues: [{ code: 'transaction.authority_denied' }]
+    });
+
+    const dependencyRelations = ['items'];
+    const required: SourceConstraint<MemoryState> = {
+      id: 'always-invalid', mode: 'required', dependencyRelations,
+      evaluate: () => ({
+        status: 'violated',
+        violations: [{ id: 'always-invalid:one', subject: { relationId: 'items', scopeId: 'items' }, code: 'test.invalid' }]
+      })
+    };
+    const constraints = [required];
+    const constraintOwned = source({ constraints });
+    constraints.length = 0;
+    dependencyRelations.length = 0;
+    (required as { mode: 'audit' | 'required' }).mode = 'audit';
+    (required as { evaluate: SourceConstraint<MemoryState>['evaluate'] }).evaluate = () => ({ status: 'satisfied' });
+    expect(await constraintOwned.commit(attempt('owned-constraints', insert))).toMatchObject({
+      outcome: 'rejected', issues: [{ code: 'test.invalid' }]
+    });
+  });
+
+  it('adopts commit and simulation attempts at API entry while retaining a live AbortSignal', async () => {
+    const first = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }]);
+    const replacement = await transaction([{ kind: 'statement.insert', relation, rows: [{ id: literal(99) }] }]);
+    const memory = source();
+    const expectedBasis = { incarnation: 'incarnation:one', revision: 0 };
+    const mutableAttempt = {
+      operationEpoch: 'epoch:one', operationId: 'stable-commit', attachmentId: 'attachment:one', transaction: first, expectedBasis
+    };
+    const committed = memory.commit(mutableAttempt);
+    mutableAttempt.operationEpoch = 'expired';
+    mutableAttempt.operationId = 'mutated';
+    mutableAttempt.attachmentId = 'missing';
+    mutableAttempt.transaction = replacement;
+    expectedBasis.revision = 99;
+    const receipt = await committed;
+    expect(receipt).toMatchObject({ outcome: 'committed', operationEpoch: 'epoch:one', operationId: 'stable-commit', attachmentId: 'attachment:one' });
+    expect(memory.snapshot().state.items).toEqual([{ id: 1 }]);
+
+    const simulatedAttempt = {
+      operationEpoch: 'epoch:one', operationId: 'stable-simulation', attachmentId: 'attachment:one', transaction: first,
+      expectedBasis: { incarnation: 'incarnation:one', revision: 1 }
+    };
+    const simulated = memory.simulate(simulatedAttempt);
+    simulatedAttempt.operationId = 'mutated-simulation';
+    simulatedAttempt.expectedBasis.revision = 99;
+    expect(await simulated).toMatchObject({ outcome: 'would-commit', operationId: 'stable-simulation' });
+
+    const controller = new AbortController();
+    const cancelled = memory.commit(attempt('live-signal', first, { signal: controller.signal }));
+    controller.abort();
+    expect(await cancelled).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.cancelled' }] });
+  });
+
+  it('rejects hostile attempt and metadata descriptors without invoking getters', async () => {
+    let getterCalls = 0;
+    const hostileRelation: Record<string, unknown> = { schemaView, keyFields: ['id'] };
+    Object.defineProperty(hostileRelation, 'relationId', {
+      enumerable: true,
+      get: () => { getterCalls += 1; return 'items'; }
+    });
+    expect(() => source({ relations: [hostileRelation as MemoryRelation] })).toThrow(/descriptor-safe portable array/);
+    expect(getterCalls).toBe(0);
+
+    const value = await transaction([]);
+    const hostileAttempt: Record<string, unknown> = {
+      operationEpoch: 'epoch:one', operationId: 'hostile-attempt', attachmentId: 'attachment:one'
+    };
+    Object.defineProperty(hostileAttempt, 'transaction', {
+      enumerable: true,
+      get: () => { getterCalls += 1; return value; }
+    });
+    expect(() => source().commit(hostileAttempt as Parameters<InMemoryAtomicSource['commit']>[0])).toThrow(/enumerable data property transaction/);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('supports prototype-named relation IDs without exposing an object prototype', async () => {
+    const relationIds = ['__proto__', 'constructor', 'prototype'] as const;
+    const relations: MemoryRelation[] = relationIds.map((relationId) => ({ relationId, schemaView, keyFields: ['id'] }));
+    const initialState = Object.fromEntries(relationIds.map((relationId) => [relationId, []])) as MemoryState;
+    const memory = source({ state: initialState, relations });
+    const value = await transaction(relationIds.map((relationId, index) => ({
+      kind: 'statement.insert' as const,
+      relation: { relationId, schemaView },
+      rows: [{ id: literal(index + 1) }]
+    })));
+
+    expect(await memory.commit(attempt('reserved-relations', value))).toMatchObject({ outcome: 'committed' });
+    const state = memory.snapshot().state;
+    expect(Object.getPrototypeOf(state)).toBeNull();
+    for (const [index, relationId] of relationIds.entries()) {
+      expect(Object.hasOwn(state, relationId)).toBe(true);
+      expect(state[relationId]).toEqual([{ id: index + 1 }]);
+    }
+  });
+
   it('binds parameters inside the transaction hash and returns missing parameters as retained rejected receipts', async () => {
     const insert = [{ kind: 'statement.insert' as const, relation, rows: [{ id: parameter('id') }] }];
     const withOne = await transaction(insert, { id: 1 });
@@ -92,6 +239,26 @@ describe('production in-memory transaction coordinator', () => {
     expect(incomplete.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [{ id: 1 }] } });
   });
 
+  it('publishes frozen staged transitions to query callbacks without changing callback semantics', async () => {
+    const evaluateQuery = vi.fn((_root: unknown, state: MemoryState): MemoryQueryResult => {
+      expect(state.items).toEqual([{ id: 1 }]);
+      expect(Object.isFrozen(state)).toBe(true);
+      expect(Object.isFrozen(state.items)).toBe(true);
+      expect(Object.isFrozen(state.items?.[0])).toBe(true);
+      expect(() => (state.items as unknown as MemoryRow[]).push({ id: 99 })).toThrow(TypeError);
+      return { rows: [{ id: 2 }], resultKeys: ['derived:two'], completeness: 'exact', issues: [] };
+    });
+    const memory = source({ evaluateQuery });
+    const value = await transaction([
+      { kind: 'statement.insert', relation, rows: [{ id: literal(1) }] },
+      { kind: 'statement.insert-from-query', relation, root: queryRoot('derived') }
+    ]);
+
+    expect(await memory.commit(attempt('frozen-query-state', value))).toMatchObject({ outcome: 'committed' });
+    expect(evaluateQuery).toHaveBeenCalledOnce();
+    expect(memory.snapshot().state.items).toEqual([{ id: 1 }, { id: 2 }]);
+  });
+
   it('upserts by declared relation keys with explicit reject, keep, and replace policies', async () => {
     const memory = source({ state: { items: [{ id: 1, title: 'old' }] } });
     const rows = [{ id: literal(1), title: literal('new') }, { id: literal(2), title: literal('second') }];
@@ -137,6 +304,65 @@ describe('production in-memory transaction coordinator', () => {
       returning: [{ name: 'same', root: queryRoot('same') }, { name: 'same', root: queryRoot('same') }]
     } });
     expect(await memory.commit(attempt('returning-duplicate', duplicate))).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.returning_name_duplicate' }] });
+  });
+
+  it('owns and freezes commit receipts before ledger publication', async () => {
+    const nested = { label: 'owned', values: [1] };
+    const returnedRow = { id: 1, nested };
+    const memory = source({
+      evaluateQuery: () => ({ rows: [returnedRow], resultKeys: ['returned:one'], completeness: 'exact', issues: [] })
+    });
+    const value = await sealTransaction({ body: {
+      schemaView, parameters: {}, statements: [], guards: [], requiredCapabilities: [],
+      returning: [{ name: 'owned', root: queryRoot('owned') }]
+    } });
+
+    const receipt = await memory.commit(attempt('owned-receipt', value));
+    nested.label = 'caller-mutated';
+    nested.values.push(2);
+    returnedRow.id = 2;
+
+    expect(receipt).toMatchObject({
+      outcome: 'committed',
+      returning: [{ name: 'owned', rows: [{ id: 1, nested: { label: 'owned', values: [1] } }], resultKeys: ['returned:one'] }]
+    });
+    expect(Object.isFrozen(receipt)).toBe(true);
+    expect(Object.isFrozen(receipt.statementResults)).toBe(true);
+    expect(Object.isFrozen(receipt.issues)).toBe(true);
+    expect(Object.isFrozen(receipt.returning)).toBe(true);
+    expect(Object.isFrozen(receipt.returning?.[0]?.rows)).toBe(true);
+    expect(Object.isFrozen((receipt.returning![0]!.rows[0] as { readonly nested: object }).nested)).toBe(true);
+    const lookup = memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'owned-receipt', intentHash: receipt.intentHash });
+    expect(lookup).toMatchObject({ status: 'known', receipt });
+    if (lookup.status === 'known') expect(lookup.receipt).toBe(receipt);
+    expect(await memory.commit(attempt('owned-receipt', value))).toBe(receipt);
+  });
+
+  it('rejects hostile returning evidence before state or ledger publication without invoking getters', async () => {
+    let getterCalls = 0;
+    const hostileRow: Record<string, unknown> = { id: 1 };
+    Object.defineProperty(hostileRow, 'payload', {
+      enumerable: true,
+      get: () => { getterCalls += 1; return 'hostile'; }
+    });
+    const memory = source({
+      evaluateQuery: () => ({ rows: [hostileRow], resultKeys: ['hostile:one'], completeness: 'exact', issues: [] })
+    });
+    const value = await sealTransaction({ body: {
+      schemaView, parameters: {},
+      statements: [{ kind: 'statement.insert', relation, rows: [{ id: literal(1) }] }],
+      guards: [], requiredCapabilities: [], returning: [{ name: 'hostile', root: queryRoot('hostile') }]
+    } });
+
+    const receipt = await memory.commit(attempt('hostile-receipt', value));
+
+    expect(getterCalls).toBe(0);
+    expect(receipt).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.unexpected_failure' }] });
+    expect(Object.isFrozen(receipt)).toBe(true);
+    expect(memory.snapshot()).toMatchObject({ basis: { revision: 0 }, state: { items: [] } });
+    const lookup = memory.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'hostile-receipt', intentHash: receipt.intentHash });
+    expect(lookup).toMatchObject({ status: 'known', receipt });
+    if (lookup.status === 'known') expect(lookup.receipt).toBe(receipt);
   });
 
   it('uses explicit conflict observations and fails stale resolutions without mutation', async () => {

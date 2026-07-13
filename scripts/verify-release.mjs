@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { builtinModules } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -8,6 +9,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageDirectories = ['core', 'automerge', 'zustand', 'react', 'schema-tools'];
 const coreSubpaths = ['artifacts', 'database', 'query', 'schema', 'transactions'];
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-release-'));
+const releaseVersion = '0.3.0';
+const packedPackages = [];
+const builtins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
 
 const fail = (message) => { throw new Error(message); };
 
@@ -15,7 +19,7 @@ try {
   for (const directory of packageDirectories) {
     const packageDirectory = path.join(root, 'packages', directory);
     const manifest = JSON.parse(readFileSync(path.join(packageDirectory, 'package.json'), 'utf8'));
-    if (manifest.version !== '0.2.2') fail(`${manifest.name}: expected version 0.2.2`);
+    if (manifest.version !== releaseVersion) fail(`${manifest.name}: expected version ${releaseVersion}`);
     if (manifest.private === true) fail(`${manifest.name}: package remains private`);
     const expectedExports = manifest.name === '@tarstate/core' ? ['.', ...coreSubpaths.map((name) => './' + name)] : ['.'];
     if (JSON.stringify(Object.keys(manifest.exports ?? {}).sort()) !== JSON.stringify(expectedExports.sort())) {
@@ -57,17 +61,78 @@ try {
     const packedManifest = JSON.parse(execFileSync('tar', ['-xOf', tarball, 'package/package.json'], { encoding: 'utf8' }));
     for (const [dependency, version] of Object.entries(packedManifest.dependencies ?? {})) {
       if (String(version).startsWith('workspace:')) fail(`${manifest.name}: unresolved workspace dependency ${dependency}`);
+      if (dependency.startsWith('@tarstate/') && !internalRangeIncludesRelease(String(version))) {
+        fail(`${manifest.name}: internal dependency ${dependency}@${version} does not admit ${releaseVersion}`);
+      }
     }
+    verifyRuntimeDependencyDeclarations(packedManifest, tarball, entries);
+    packedPackages.push({ directory, manifest: packedManifest, packageDirectory, tarball });
 
     if (manifest.name === '@tarstate/core') await verifyCoreCrossEntryProvenance(tarball, destination);
-
-    for (const exported of Object.values(manifest.exports ?? {})) {
-      await import(pathToFileURL(path.join(packageDirectory, String(exported.import))).href);
-    }
   }
-  console.log(`Verified ${packageDirectories.length} v0.2.2 tarballs and runtime entry points.`);
+  await verifyPackedRuntime(packedPackages);
+  console.log(`Verified ${packageDirectories.length} v${releaseVersion} tarballs and installed runtime entry points.`);
 } finally {
   rmSync(temporaryDirectory, { recursive: true, force: true });
+}
+
+function internalRangeIncludesRelease(range) {
+  return range === releaseVersion || range === `^${releaseVersion}` || range === `~${releaseVersion}`;
+}
+
+function verifyRuntimeDependencyDeclarations(manifest, tarball, entries) {
+  const declared = new Set([
+    ...Object.keys(manifest.dependencies ?? {}),
+    ...Object.keys(manifest.peerDependencies ?? {}),
+    ...Object.keys(manifest.optionalDependencies ?? {})
+  ]);
+  const javascriptEntries = entries.filter((entry) => entry.startsWith('package/dist/') && entry.endsWith('.js'));
+  for (const entry of javascriptEntries) {
+    const source = execFileSync('tar', ['-xOf', tarball, entry], { encoding: 'utf8' });
+    const specifiers = [
+      ...Array.from(source.matchAll(/^(?:import\s+(?:[^"'`\n;]+?\s+from\s+)?|export\s+[^"'`\n;]+?\s+from\s+)["']([^"']+)["'];?/gm), (match) => match[1]),
+      ...Array.from(source.matchAll(/\bimport\(\s*["']([^"']+)["']\s*\)/g), (match) => match[1])
+    ];
+    for (const specifier of specifiers) {
+      if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('#') || builtins.has(specifier)) continue;
+      const dependency = specifier.startsWith('@') ? specifier.split('/').slice(0, 2).join('/') : specifier.split('/')[0];
+      if (!declared.has(dependency)) fail(`${manifest.name}: ${entry} imports undeclared runtime dependency ${dependency}`);
+    }
+  }
+}
+
+async function verifyPackedRuntime(packages) {
+  const installation = path.join(temporaryDirectory, 'installed');
+  const nodeModules = path.join(installation, 'node_modules');
+
+  for (const { manifest, tarball } of packages) {
+    const installedPackage = path.join(nodeModules, ...manifest.name.split('/'));
+    mkdirSync(installedPackage, { recursive: true });
+    execFileSync('tar', ['-xzf', tarball, '--strip-components=1', '-C', installedPackage]);
+  }
+
+  for (const { manifest, packageDirectory } of packages) {
+    const externalDependencies = new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.peerDependencies ?? {})
+    ]);
+    for (const dependency of externalDependencies) {
+      if (dependency.startsWith('@tarstate/')) continue;
+      const source = path.join(packageDirectory, 'node_modules', ...dependency.split('/'));
+      if (!existsSync(source)) fail(`${manifest.name}: runtime dependency ${dependency} is not installed for packed verification`);
+      const target = path.join(nodeModules, ...dependency.split('/'));
+      if (existsSync(target)) continue;
+      mkdirSync(path.dirname(target), { recursive: true });
+      symlinkSync(realpathSync(source), target, 'dir');
+    }
+  }
+
+  for (const { manifest } of packages) {
+    const installedPackage = path.join(nodeModules, ...manifest.name.split('/'));
+    for (const exported of Object.values(manifest.exports ?? {})) {
+      await import(pathToFileURL(path.join(installedPackage, String(exported.import))).href);
+    }
+  }
 }
 
 async function verifyCoreCrossEntryProvenance(tarball, destination) {

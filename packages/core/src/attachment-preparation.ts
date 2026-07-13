@@ -6,6 +6,7 @@ import {
 } from './artifacts.js';
 import type { AttachmentProjection, SourceSnapshot } from './database.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { projectStorage, type BindingProjection, type CompiledStorageMapping } from './mapping.js';
 import type { SourceBasis } from './maintenance.js';
 import type { DocumentDeclaration } from './receipts.js';
@@ -186,14 +187,24 @@ export const prepareManualReadOnlyAttachment = <Storage, Projection>(input: {
   readonly schemaViewIds: readonly string[];
   readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
   readonly issues?: readonly Issue[];
-}): ReadyAttachmentPreparation<Storage, Projection> => ready({
-  origin: 'manual-read-only',
-  writable: false,
-  schemaViewIds: [...new Set(input.schemaViewIds)].sort(),
-  constraints: [],
-  issues: input.issues ?? [],
-  project: input.project
-});
+}): ReadyAttachmentPreparation<Storage, Projection> => {
+  const descriptors = ownRecordDescriptors(input, 'Manual attachment preparation');
+  const schemaViewIds = requiredDataValue(descriptors, 'schemaViewIds', 'Manual attachment preparation');
+  const project = requiredDataValue(descriptors, 'project', 'Manual attachment preparation');
+  const issueDescriptor = descriptors.issues;
+  if (issueDescriptor !== undefined && (!issueDescriptor.enumerable || !('value' in issueDescriptor))) {
+    throw new TypeError('Manual attachment preparation issues must be an enumerable data property');
+  }
+  if (typeof project !== 'function') throw new TypeError('Manual attachment preparation project must be a function');
+  return ready({
+    origin: 'manual-read-only',
+    writable: false,
+    schemaViewIds: schemaViewIds as readonly string[],
+    constraints: [],
+    issues: issueDescriptor === undefined || issueDescriptor.value === undefined ? [] : issueDescriptor.value as readonly Issue[],
+    project: project as (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>
+  });
+};
 
 const selectDeclaration = (
   bootstrap: RawBootstrapDeclaration,
@@ -271,9 +282,85 @@ const mappingCapabilities = (mapping: CompiledStorageMapping): readonly Capabili
 
 const ready = <Storage, Projection, State>(
   input: Omit<ReadyAttachmentPreparation<Storage, Projection, State>, typeof attachmentPreparationBrand | 'state'>
-): ReadyAttachmentPreparation<Storage, Projection, State> => Object.freeze({ ...input, state: 'ready', [attachmentPreparationBrand]: true as const });
+): ReadyAttachmentPreparation<Storage, Projection, State> => {
+  const descriptors = ownRecordDescriptors(input, 'Ready attachment preparation');
+  const origin = requiredDataValue(descriptors, 'origin', 'Ready attachment preparation');
+  const writable = requiredDataValue(descriptors, 'writable', 'Ready attachment preparation');
+  const project = requiredDataValue(descriptors, 'project', 'Ready attachment preparation');
+  if ((origin !== 'bootstrap' && origin !== 'out-of-band' && origin !== 'manual-read-only') || typeof writable !== 'boolean' || typeof project !== 'function') {
+    throw new TypeError('Ready attachment preparation has invalid scalar or callback fields');
+  }
+  const schemaViewIds = ownStringArray(requiredDataValue(descriptors, 'schemaViewIds', 'Ready attachment preparation'), 'Ready attachment preparation schemaViewIds');
+  const constraints = ownArrayValues<SourceConstraint<State>>(requiredDataValue(descriptors, 'constraints', 'Ready attachment preparation'), 'Ready attachment preparation constraints');
+  const issues = ownIssues(requiredDataValue(descriptors, 'issues', 'Ready attachment preparation'), 'Ready attachment preparation issues');
+  const declaration = optionalDataValue(descriptors, 'declaration', 'Ready attachment preparation');
+  const schema = optionalDataValue(descriptors, 'schema', 'Ready attachment preparation');
+  const mapping = optionalDataValue(descriptors, 'mapping', 'Ready attachment preparation');
+  return Object.freeze({
+    state: 'ready', origin, writable, schemaViewIds, constraints, issues,
+    project: project as ReadyAttachmentPreparation<Storage, Projection, State>['project'],
+    ...(declaration === undefined ? {} : { declaration: declaration as DocumentDeclaration }),
+    ...(schema === undefined ? {} : { schema: schema as PreparedSchema }),
+    ...(mapping === undefined ? {} : { mapping: mapping as CompiledStorageMapping }),
+    [attachmentPreparationBrand]: true as const
+  });
+};
 
-const unavailable = (issues: readonly Issue[]): UnavailableAttachmentPreparation => Object.freeze({ state: 'unavailable', issues: Object.freeze([...issues]), [attachmentPreparationBrand]: true as const });
+const unavailable = (issues: readonly Issue[]): UnavailableAttachmentPreparation => Object.freeze({ state: 'unavailable', issues: ownIssues(issues, 'Unavailable attachment preparation issues'), [attachmentPreparationBrand]: true as const });
+
+const ownArrayValues = <Value>(input: unknown, label: string): readonly Value[] => {
+  if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const output: Value[] = [];
+    for (let index = 0; index < input.length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' must be a dense descriptor-safe array');
+      output.push(descriptor.value as Value);
+    }
+    return Object.freeze(output);
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
+    throw new TypeError(label + ' must be a descriptor-safe array');
+  }
+};
+
+const ownStringArray = (input: unknown, label: string): readonly string[] => {
+  const values = ownArrayValues<unknown>(input, label);
+  if (values.some((value) => typeof value !== 'string')) throw new TypeError(label + ' must contain only strings');
+  return Object.freeze([...new Set(values as readonly string[])].sort());
+};
+
+const ownIssues = (input: unknown, label: string): readonly Issue[] => {
+  const parsed = detachAndFreezeJsonValue(input);
+  if (!parsed.success || !Array.isArray(parsed.value)) throw new TypeError(label + ' must be descriptor-safe portable issues');
+  return parsed.value as unknown as readonly Issue[];
+};
+
+const ownRecordDescriptors = (input: unknown, label: string): PropertyDescriptorMap => {
+  if (!isRecord(input)) throw new TypeError(label + ' must be a record');
+  try {
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError(label + ' must have a plain prototype');
+    return Object.getOwnPropertyDescriptors(input);
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
+    throw new TypeError(label + ' must be descriptor-safe');
+  }
+};
+
+const requiredDataValue = (descriptors: PropertyDescriptorMap, key: string, label: string): unknown => {
+  const descriptor = descriptors[key];
+  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' must have an enumerable data property ' + key);
+  return descriptor.value;
+};
+
+const optionalDataValue = (descriptors: PropertyDescriptorMap, key: string, label: string): unknown => {
+  const descriptor = descriptors[key];
+  if (descriptor === undefined) return undefined;
+  if (!descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' property ' + key + ' must be an enumerable data property');
+  return descriptor.value;
+};
 const declarationFailure = (): ParseResult<never> => ({ success: false, issues: [preparationIssue('artifact.invalid_envelope', { reason: 'document_declaration' })] });
 const preparationIssue = (code: string, details: JsonValue): Issue => createIssue({ code, phase: 'resolve', severity: 'error', retry: code === 'capability.missing' ? 'after_capability' : 'after_refresh', details });
 const sameRef = (left: ArtifactRef, right: ArtifactRef): boolean => left.id === right.id && left.contentHash === right.contentHash;

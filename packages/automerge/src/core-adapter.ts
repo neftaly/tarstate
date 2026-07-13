@@ -1,5 +1,6 @@
 import * as Automerge from '@automerge/automerge';
 import { comparePortableStrings } from './portable-order.js';
+import { adoptAutomergeMapStorageBindingOptions } from './internal-options-ownership.js';
 import {
   canonicalizeJson,
   createIssue,
@@ -140,10 +141,10 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
 
   commit = async (input: SourceCommitInput<AutomergeSourceCommand<T>>): Promise<SourceCommitResult> => {
     if (this.#lifecycle !== 'ready') {
-      return { outcome: 'rejected', issues: [sourceStateIssue(this.sourceId, this.#lifecycle)] };
+      return frozenCoreCommitResult({ outcome: 'rejected', issues: [sourceStateIssue(this.sourceId, this.#lifecycle)] });
     }
     if (input.operationEpoch !== this.operationEpoch) {
-      return {
+      return frozenCoreCommitResult({
         outcome: 'rejected',
         issues: [createIssue({
           code: 'transaction.operation_epoch_expired',
@@ -152,11 +153,11 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
           retry: 'never',
           details: { expected: this.operationEpoch, received: input.operationEpoch }
         })]
-      };
+      });
     }
     const basis = parseAutomergeBasis(input.expectedBasis);
     if (basis === undefined) {
-      return {
+      return frozenCoreCommitResult({
         outcome: 'rejected',
         issues: [createIssue({
           code: 'transaction.expected_basis_stale',
@@ -167,7 +168,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
           operationId: input.operationId,
           details: { reason: 'automerge_basis_required' }
         })]
-      };
+      });
     }
     const result = await this.#runtime.commit({
       operationEpoch: input.operationEpoch,
@@ -224,7 +225,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
 
   queryOutcome = async (input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash }): Promise<SourceOutcomeLookup<SourceCommitResult>> => {
     const lookup = this.#runtime.queryOutcome(input);
-    if (lookup.status === 'known') return { status: 'known', result: coreCommitResult(lookup.result) };
+    if (lookup.status === 'known') return Object.freeze({ status: 'known', result: coreCommitResult(lookup.result) });
     return lookup;
   };
 
@@ -292,13 +293,14 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly #projectionPlanner: AutomergeMapProjectionPlanner<T, Row>;
 
   constructor(options: AutomergeMapStorageBindingOptions<Row>) {
-    this.id = options.id ?? 'automerge-map:' + options.relationId;
-    this.#relationId = options.relationId;
-    this.#collectionPath = Object.freeze([...options.collectionPath]);
-    this.#keySource = options.keySource;
+    const owned = adoptAutomergeMapStorageBindingOptions<Row>(options);
+    this.id = owned.id ?? 'automerge-map:' + owned.relationId;
+    this.#relationId = owned.relationId;
+    this.#collectionPath = owned.collectionPath;
+    this.#keySource = owned.keySource;
     this.declaredReadFootprint = automergePathFootprint([{ scope: 'subtree', path: this.#collectionPath }]);
     this.declaredWriteFootprint = this.declaredReadFootprint;
-    this.#projectionPlanner = new AutomergeMapProjectionPlanner(options);
+    this.#projectionPlanner = new AutomergeMapProjectionPlanner(owned);
   }
 
   project = (snapshot: SourceSnapshot<Automerge.Doc<T>>): ProjectionResult<AutomergeProjectedRow<Row>> => {
@@ -444,7 +446,16 @@ const readyAutomergeSnapshot = <T extends object>(snapshot: SourceSnapshot<Autom
     ? undefined
     : { sourceId: snapshot.sourceId, basis: parseAutomergeBasis(snapshot.basis)!, storage: snapshot.storage };
 
-const coreCommitResult = (result: AutomergeSourceCommitResult): SourceCommitResult => ({
+const frozenCoreCommitResult = (result: SourceCommitResult): SourceCommitResult => Object.freeze({
+  ...result,
+  ...('beforeBasis' in result && result.beforeBasis !== undefined ? {
+    beforeBasis: result.beforeBasis,
+    ...(result.afterBasis === undefined ? {} : { afterBasis: result.afterBasis })
+  } : {}),
+  issues: Object.freeze([...result.issues])
+});
+
+const coreCommitResult = (result: AutomergeSourceCommitResult): SourceCommitResult => frozenCoreCommitResult({
   outcome: result.outcome,
   ...('beforeBasis' in result ? { beforeBasis: result.beforeBasis, afterBasis: result.afterBasis } : {}),
   issues: result.issues.map((issue) => adapterIssue(

@@ -304,6 +304,27 @@ describe('database membership and observation', () => {
     first.close();
   });
 
+  it('owns and freezes attachment schema views and discovery edges', () => {
+    const source = new TestSource('source:owned-attachment-metadata', []);
+    const schemaViewIds = ['schema:owned'];
+    const discoveryEdges = ['edge:owned'];
+    const base = attachment('attachment:owned-metadata', source);
+    const catalog = new AttachmentCatalog();
+    const lease = catalog.attach({
+      ...base,
+      discoveryEdges,
+      preparation: { ...base.preparation, schemaViewIds }
+    });
+
+    schemaViewIds.push('schema:mutated');
+    discoveryEdges.push('edge:mutated');
+    expect(lease.attachment.schemaViewIds).toEqual(['schema:owned']);
+    expect(lease.attachment.discoveryEdges).toEqual(['edge:owned']);
+    expect(Object.isFrozen(lease.attachment.schemaViewIds)).toBe(true);
+    expect(Object.isFrozen(lease.attachment.discoveryEdges)).toBe(true);
+    lease.close();
+  });
+
   it('removes an attachment lease even when source release throws', () => {
     const source = new TestSource('source:throwing-release', []);
     const catalog = new AttachmentCatalog();

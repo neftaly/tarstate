@@ -2,6 +2,7 @@ import * as Automerge from '@automerge/automerge';
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeMapProjectionPlanner,
+  AutomergeMapStorageBinding,
   AutomergeSourceRuntime,
   automergeBasis,
   exactAutomergeBasisEqual,
@@ -96,12 +97,62 @@ describe('production Automerge adapter', () => {
       operationEpoch: 'epoch:1', operationId: 'operation:1', intentHash: hash('a'), expectedBasis: before, commands: []
     });
     expect(replay).toBe(committed);
+    expect(Object.isFrozen(committed)).toBe(true);
+    expect(Object.isFrozen(committed.issues)).toBe(true);
+    expect(() => { (committed as { outcome: string }).outcome = 'rejected'; }).toThrow(TypeError);
+    const known = runtime.queryOutcome({ operationEpoch: 'epoch:1', operationId: 'operation:1', intentHash: hash('a') });
+    expect(Object.isFrozen(known)).toBe(true);
+    expect(known.status === 'known' ? known.result : undefined).toBe(committed);
     const noOp = await runtime.commit({
       operationEpoch: 'epoch:1', operationId: 'operation:noop', intentHash: hash('b'), expectedBasis: runtime.snapshot().basis, commands: []
     });
     expect(noOp).toMatchObject({ outcome: 'committed', changed: false });
     expect(listener).toHaveBeenCalledTimes(1);
     expect(runtime.queryOutcome({ operationEpoch: 'epoch:1', operationId: 'operation:1', intentHash: hash('c') })).toEqual({ status: 'ambiguous' });
+  });
+
+  it('owns commit input synchronously before queued execution', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:queued-input', doc: taskBase() });
+    const expectedBasis = { kind: 'automerge-heads' as const, heads: [...runtime.snapshot().basis.heads] };
+    const apply = vi.fn((draft: TaskDoc) => { draft.tasks.first!.title = 'Owned'; });
+    const replacementApply = vi.fn((draft: TaskDoc) => { draft.tasks.first!.title = 'Mutated'; });
+    const command = { description: 'owned description', apply };
+    const commands = [command];
+    const input = {
+      operationEpoch: 'epoch:owned', operationId: 'operation:owned', intentHash: hash('7'),
+      expectedBasis, commands, message: 'owned message'
+    };
+
+    const pending = runtime.commit(input);
+    input.operationId = 'operation:mutated';
+    input.message = 'mutated message';
+    expectedBasis.heads.splice(0, expectedBasis.heads.length, 'mutated-head');
+    command.description = 'mutated description';
+    command.apply = replacementApply;
+    commands.push({ description: 'late command', apply: replacementApply });
+
+    const result = await pending;
+    expect(result).toMatchObject({ outcome: 'committed', operationId: 'operation:owned' });
+    expect(runtime.snapshot().storage.tasks.first?.title).toBe('Owned');
+    expect(apply).toHaveBeenCalledOnce();
+    expect(replacementApply).not.toHaveBeenCalled();
+    expect(runtime.queryOutcome({ operationEpoch: 'epoch:owned', operationId: 'operation:owned', intentHash: hash('7') })).toMatchObject({ status: 'known' });
+    expect(runtime.queryOutcome({ operationEpoch: 'epoch:owned', operationId: 'operation:mutated', intentHash: hash('7') })).toEqual({ status: 'not_seen' });
+  });
+
+  it('rejects hostile known commit accessors without invoking them', () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:hostile-commit', doc: taskBase() });
+    let calls = 0;
+    const input: Record<string, unknown> = {
+      operationEpoch: 'epoch:hostile', operationId: 'operation:hostile', intentHash: hash('6'), commands: []
+    };
+    Object.defineProperty(input, 'expectedBasis', {
+      enumerable: true,
+      get: () => { calls += 1; return runtime.snapshot().basis; }
+    });
+
+    expect(() => runtime.commit(input as never)).toThrow(/hostile property descriptor/);
+    expect(calls).toBe(0);
   });
 
   it('keeps snapshot identity stable and publishes each changed snapshot before notifying', async () => {
@@ -153,12 +204,128 @@ describe('production Automerge adapter', () => {
     const base = taskBase();
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: Automerge.change(base, (draft) => { draft.metadata.schema = 'v2'; }) });
     const command = vi.fn();
+    let ignoredCalls = 0;
+    const expectedBasis = Object.assign(Object.create(null) as Record<PropertyKey, unknown>, automergeBasis(base));
+    Object.defineProperty(expectedBasis, Symbol('metadata'), {
+      get: () => { ignoredCalls += 1; return 'ignored'; }
+    });
+    Object.defineProperty(expectedBasis, 'metadata', {
+      get: () => { ignoredCalls += 1; return 'ignored'; }
+    });
     const result = await runtime.commit({
-      operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d'), expectedBasis: automergeBasis(base), commands: [{ apply: command }]
+      operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d'),
+      expectedBasis: expectedBasis as unknown as import('../src/index.js').AutomergeBasis,
+      commands: [{ apply: command }]
     });
     expect(result).toMatchObject({ outcome: 'rejected', changed: false, issues: [{ code: 'transaction.expected_basis_stale' }] });
     expect(command).not.toHaveBeenCalled();
-    expect(runtime.queryOutcome({ operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d') })).toMatchObject({ status: 'known' });
+    expect([result, result.issues, result.issues[0], result.issues[0]?.details].every(Object.isFrozen)).toBe(true);
+    expect(() => { (result.issues as unknown[]).push({ code: 'mutated' }); }).toThrow(TypeError);
+    const lookup = runtime.queryOutcome({ operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d') });
+    expect(lookup).toMatchObject({ status: 'known' });
+    expect(lookup.status === 'known' ? lookup.result : undefined).toBe(result);
+    expect(ignoredCalls).toBe(0);
+  });
+
+  it('does not normalize an invalid basis kind into an accepted Automerge basis', async () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:invalid-basis-kind', doc: taskBase() });
+    const command = vi.fn();
+    const result = await runtime.commit({
+      operationEpoch: 'epoch:1', operationId: 'operation:invalid-kind', intentHash: hash('8'),
+      expectedBasis: { ...runtime.snapshot().basis, kind: 'invalid-kind' } as never,
+      commands: [{ apply: command }]
+    });
+
+    expect(result).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'transaction.expected_basis_stale', details: { expectedBasis: { kind: 'invalid-kind' } } }]
+    });
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it('owns map binding structure while preserving the parser callback identity', () => {
+    const collectionPath: (string | number)[] = ['tasks'];
+    const keySource = { field: 'title' };
+    const parser = vi.fn((candidate: unknown) => ({
+      success: true as const,
+      row: { title: (candidate as Task).title }
+    }));
+    const replacementParser = vi.fn((_candidate: unknown) => ({ success: true as const, row: { title: 'Replacement' } }));
+    const options = {
+      id: 'binding:owned',
+      relationId: 'relation:tasks',
+      collectionPath,
+      missingCollection: 'invalid' as const,
+      keySource,
+      locatorNamespace: 'owned-locator',
+      parse: parser
+    };
+    const planner = new AutomergeMapProjectionPlanner<TaskDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>(options);
+    const binding = new AutomergeMapStorageBinding<TaskDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>(options);
+
+    collectionPath[0] = 'metadata';
+    keySource.field = 'missing';
+    options.id = 'binding:mutated';
+    options.relationId = 'relation:mutated';
+    options.locatorNamespace = 'mutated-locator';
+    options.parse = replacementParser;
+
+    const snapshot = snapshotAutomergeDocument('source:tasks', taskBase());
+    expect(planner.project(snapshot).rows).toMatchObject([{ relationId: 'relation:tasks', key: ['First'], locator: { namespace: 'owned-locator' } }]);
+    expect(binding.project({ ...snapshot, operationEpoch: 'epoch:one', state: 'ready', freshness: 'current', issues: [] }).rows)
+      .toMatchObject([{ relationId: 'relation:tasks', key: ['First'], locator: { namespace: 'owned-locator' } }]);
+    expect(binding.id).toBe('binding:owned');
+    expect(binding.declaredReadFootprint).toMatchObject({ entries: [{ path: ['tasks'] }] });
+    expect(parser).toHaveBeenCalled();
+    expect(replacementParser).not.toHaveBeenCalled();
+  });
+
+  it('rejects hostile map option descriptors without invoking them', () => {
+    let calls = 0;
+    const options: Record<string, unknown> = {
+      relationId: 'relation:tasks',
+      missingCollection: 'invalid',
+      keySource: 'map-key'
+    };
+    Object.defineProperty(options, 'collectionPath', {
+      enumerable: true,
+      get: () => { calls += 1; return ['tasks']; }
+    });
+
+    expect(() => new AutomergeMapProjectionPlanner(options as never)).toThrow(/hostile property descriptor/);
+    expect(() => new AutomergeMapStorageBinding(options as never)).toThrow(/hostile property descriptor/);
+    expect(calls).toBe(0);
+  });
+
+  it('ignores unrelated option metadata and accepts class and null-prototype records', () => {
+    let ignoredCalls = 0;
+    const keySource = Object.assign(Object.create(null) as Record<string, unknown>, { field: 'title', extra: 'ignored' });
+    Object.defineProperty(keySource, 'ignored', { get: () => { ignoredCalls += 1; return 'ignored'; } });
+    class Options {
+      relationId = 'relation:tasks';
+      collectionPath = ['tasks'];
+      missingCollection = 'invalid' as const;
+      keySource = keySource;
+    }
+    const options = new Options();
+    Object.defineProperty(options, 'ignored', { get: () => { ignoredCalls += 1; return 'ignored'; } });
+    Object.defineProperty(options, Symbol('metadata'), { get: () => { ignoredCalls += 1; return 'ignored'; } });
+    const planner = new AutomergeMapProjectionPlanner<TaskDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>(options as never);
+    expect(planner.project(snapshotAutomergeDocument('source:tasks', taskBase())).rows[0]?.key).toEqual(['First']);
+
+    const nullPrototypeOptions = Object.assign(Object.create(null) as Record<string, unknown>, {
+      relationId: 'relation:tasks', collectionPath: ['tasks'], missingCollection: 'invalid', keySource: 'map-key'
+    });
+    expect(() => new AutomergeMapStorageBinding(nullPrototypeOptions as never)).not.toThrow();
+    expect(ignoredCalls).toBe(0);
+  });
+
+  it('rejects non-index numeric collection path components', () => {
+    for (const part of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => new AutomergeMapProjectionPlanner({
+        relationId: 'relation:tasks', collectionPath: ['tasks', part], missingCollection: 'invalid', keySource: 'map-key'
+      })).toThrow(/collectionPath entries/);
+    }
   });
 
   it('projects every concurrent map candidate and requires explicit observed conflict resolution', async () => {

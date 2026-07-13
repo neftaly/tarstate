@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/react",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "React observer and commit bindings for Tarstate",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/react" },

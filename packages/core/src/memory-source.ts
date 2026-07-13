@@ -2,6 +2,7 @@ import { sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { builtInCapabilityRefs } from './builtins.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import type { SourceBasis } from './maintenance.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import { comparePortableStrings } from './portable-order.js';
@@ -133,10 +134,12 @@ export class InMemoryAtomicSource {
     this.sourceId = options.sourceId;
     this.incarnation = options.incarnation;
     this.#activeEpoch = options.operationEpoch;
-    this.#state = cloneState(options.state);
-    this.#relations = new Map(options.relations.map((relation) => [relation.relationId, relation]));
-    this.#attachments = new Map(options.attachments.map((attachment) => [attachment.attachmentId, attachment]));
-    this.#constraints = options.constraints ?? [];
+    this.#state = adoptMemoryState(options.state, 'Initial memory state');
+    const relations = adoptPortableArray<MemoryRelation>(options.relations, 'Memory relations');
+    const attachments = adoptPortableArray<MemoryAttachment>(options.attachments, 'Memory attachments');
+    this.#relations = new Map(relations.map((relation) => [relation.relationId, relation]));
+    this.#attachments = new Map(attachments.map((attachment) => [attachment.attachmentId, attachment]));
+    this.#constraints = adoptConstraints(options.constraints ?? []);
     this.#resolveArtifact = options.resolveArtifact;
     this.#evaluateQuery = options.evaluateQuery;
     this.#satisfiesCapability = options.satisfiesCapability ?? (() => true);
@@ -144,7 +147,7 @@ export class InMemoryAtomicSource {
   }
 
   snapshot(): { readonly basis: MemoryBasis; readonly state: MemoryState } {
-    return { basis: this.#basis(), state: cloneState(this.#state) };
+    return Object.freeze({ basis: Object.freeze(this.#basis()), state: this.#state });
   }
 
   subscribe(listener: () => void): () => void {
@@ -154,18 +157,19 @@ export class InMemoryAtomicSource {
 
   /** Simulation is advisory and intentionally does not join the commit queue or reserve an operation ID. */
   async simulate(attempt: TransactionAttempt): Promise<SimulationReceipt> {
-    const prepared = await this.#prepare(attempt);
+    const ownedAttempt = adoptTransactionAttempt(attempt);
+    const prepared = await this.#prepare(ownedAttempt);
     if ('receipt' in prepared) return { ...prepared.receipt, kind: 'simulation', outcome: 'rejected' };
     const before = this.snapshot();
     const evaluated = this.#evaluate(prepared, before.state, before.basis);
     return {
       kind: 'simulation',
       receiptVersion: 1,
-      operationEpoch: attempt.operationEpoch,
-      operationId: attempt.operationId,
+      operationEpoch: ownedAttempt.operationEpoch,
+      operationId: ownedAttempt.operationId,
       transactionHash: prepared.transaction.contentHash,
       intentHash: prepared.intentHash,
-      attachmentId: attempt.attachmentId,
+      attachmentId: ownedAttempt.attachmentId,
       attachmentFingerprint: prepared.attachment.fingerprint,
       sourceId: this.sourceId,
       beforeBasis: before.basis,
@@ -178,12 +182,13 @@ export class InMemoryAtomicSource {
   }
 
   commit(attempt: TransactionAttempt): Promise<CommitReceipt> {
+    const ownedAttempt = adoptTransactionAttempt(attempt);
     const run = this.#queue.then(async () => {
-      const prepared = await this.#prepare(attempt);
+      const prepared = await this.#prepare(ownedAttempt);
       if ('receipt' in prepared) return prepared.receipt;
       // This is the explicit source-handoff boundary. Cancellation and all
       // shell checks above it leave no operation-ledger evidence.
-      if (attempt.signal?.aborted === true) return this.#reject(prepared, [], [txIssue('transaction.cancelled', 'commit', { timing: 'before_handoff' }, attempt, 'never')]);
+      if (ownedAttempt.signal?.aborted === true) return this.#reject(prepared, [], [txIssue('transaction.cancelled', 'commit', { timing: 'before_handoff' }, ownedAttempt, 'never')]);
       return this.#handoff(prepared);
     });
     this.#queue = run.then(() => undefined, () => undefined);
@@ -270,11 +275,7 @@ export class InMemoryAtomicSource {
       } else {
         const afterBasis = evaluated.changed ? { incarnation: this.incarnation, revision: this.#revision + 1 } : this.#basis();
         const returning = this.#returning(prepared, afterBasis, evaluated.state);
-        if (evaluated.changed) {
-          this.#state = evaluated.state;
-          this.#revision += 1;
-        }
-        receipt = {
+        receipt = ownCommitReceipt({
           kind: 'commit', receiptVersion: 1,
           operationEpoch: attempt.operationEpoch, operationId: attempt.operationId,
           transactionHash: prepared.transaction.contentHash, intentHash: prepared.intentHash,
@@ -284,7 +285,11 @@ export class InMemoryAtomicSource {
           ...(returning === undefined ? {} : { returning }),
           issues: evaluated.issues,
           durability: 'memory'
-        };
+        });
+        if (evaluated.changed) {
+          this.#state = evaluated.state;
+          this.#revision += 1;
+        }
         ledgerEntry.receipt = receipt;
         if (evaluated.changed) notifyObservers(this.#listeners, (listener) => listener(), {
           component: 'memory-source', operation: 'publish-commit'
@@ -304,14 +309,16 @@ export class InMemoryAtomicSource {
       const issue = txIssue('transaction.expected_basis_stale', 'commit', { expected: attempt.expectedBasis, actual: basis }, attempt, 'after_refresh');
       return { state: sourceState, changed: false, touchedRelations: new Set(), statementResults: [], blockingIssues: [issue], issues: [issue] };
     }
-    const staged = cloneState(sourceState) as Record<string, readonly MemoryRow[]>;
+    let staged = sourceState;
     const touched = new Set<string>();
     const statementResults: StatementResult[] = [];
     const blockingIssues: Issue[] = [];
     const statementAuditIssues: Issue[] = [];
     for (const [statementIndex, statement] of transaction.body.statements.entries()) {
-      const beforeRekey = statement.kind === 'statement.rekey' ? cloneState(staged) : undefined;
-      const result = this.#applyStatement(statement, statementIndex, staged, transaction.body.parameters);
+      const beforeRekey = statement.kind === 'statement.rekey' ? staged : undefined;
+      const working = mutableStateCopy(staged);
+      const result = this.#applyStatement(statement, statementIndex, working, transaction.body.parameters);
+      staged = adoptMemoryStateTransition(staged, working, 'Staged memory state');
       statementResults.push(result);
       const statementBlockingIssues = result.issues.filter(({ severity }) => severity === 'error');
       blockingIssues.push(...statementBlockingIssues);
@@ -367,7 +374,7 @@ export class InMemoryAtomicSource {
       if (this.#evaluateQuery === undefined) return { ...empty, issues: [txIssue('transaction.capability_unavailable', 'plan', { capability: 'query-evaluator' })] };
       let evaluated: MemoryQueryResult;
       try {
-        evaluated = this.#evaluateQuery(statement.root, state, parameters);
+        evaluated = this.#evaluateQuery(statement.root, frozenStateView(state), parameters);
       } catch (error) {
         return { ...empty, issues: [txIssue('transaction.insert_query_failed', 'query', { error: error instanceof Error ? error.name : typeof error })] };
       }
@@ -376,8 +383,9 @@ export class InMemoryAtomicSource {
       }
       const inserted: MemoryRow[] = [];
       for (const candidate of evaluated.rows) {
-        if (!isMemoryRow(candidate)) return { ...empty, issues: [txIssue('transaction.insert_query_row_invalid', 'parse', { rowType: Array.isArray(candidate) ? 'array' : typeof candidate })] };
-        inserted.push({ ...candidate });
+        const adopted = tryAdoptMemoryRow(candidate);
+        if (adopted === undefined) return { ...empty, issues: [txIssue('transaction.insert_query_row_invalid', 'parse', { rowType: Array.isArray(candidate) ? 'array' : typeof candidate })] };
+        inserted.push(adopted);
       }
       state[relationId] = [...rows, ...inserted];
       return { ...empty, inserted: inserted.length, logicallyChanged: inserted.length, issues: evaluated.issues };
@@ -605,14 +613,14 @@ export class InMemoryAtomicSource {
   }
 
   #rejectRaw(attempt: TransactionAttempt, transactionHash: ContentHash, intentHash: ContentHash, attachmentFingerprint: ContentHash, statementResults: readonly StatementResult[], issues: readonly Issue[], beforeBasis?: SourceBasis): CommitReceipt {
-    return {
+    return ownCommitReceipt({
       kind: 'commit', receiptVersion: 1,
       operationEpoch: attempt.operationEpoch, operationId: attempt.operationId,
       transactionHash, intentHash, attachmentId: attempt.attachmentId, attachmentFingerprint,
       sourceId: this.sourceId, outcome: 'rejected',
       ...(beforeBasis === undefined ? {} : { beforeBasis }),
       statementResults, issues
-    };
+    });
   }
 
   #basis(): MemoryBasis { return { incarnation: this.incarnation, revision: this.#revision }; }
@@ -772,12 +780,179 @@ const statementRelation = (statement: WriteStatement): WriteRelation | undefined
   if (statement.kind === 'statement.insert' || statement.kind === 'statement.insert-from-query' || statement.kind === 'statement.upsert' || statement.kind === 'statement.replace-all') return statement.relation;
   return statement.target.relation;
 };
-const cloneState = (state: MemoryState): MemoryState => Object.fromEntries(Object.entries(state).map(([relationId, rows]) => [relationId, rows.map((row) => ({ ...row }))]));
+const adoptMemoryState = (input: unknown, label: string): MemoryState => {
+  const descriptors = ownRecordDescriptors(input, label);
+  const entries: [string, readonly MemoryRow[]][] = [];
+  for (const relationId of Reflect.ownKeys(descriptors)) {
+    if (typeof relationId !== 'string') throw new TypeError(label + ' must not contain symbol relation IDs');
+    const descriptor = descriptors[relationId];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(label + ' must be descriptor-safe portable state with enumerable data properties');
+    }
+    const parsed = detachAndFreezeJsonValue(descriptor.value);
+    if (!parsed.success || !Array.isArray(parsed.value) || parsed.value.some((row) => !isRecord(row))) {
+      throw new TypeError(label + ' must map relation IDs to descriptor-safe portable arrays of rows');
+    }
+    entries.push([relationId, parsed.value as readonly MemoryRow[]]);
+  }
+  return frozenRelationIndex(entries);
+};
+
+const mutableStateCopy = (state: MemoryState): Record<string, readonly MemoryRow[]> =>
+  relationIndex(Object.entries(state));
+
+const frozenStateView = (state: Readonly<Record<string, readonly MemoryRow[]>>): MemoryState =>
+  frozenRelationIndex(Object.entries(state));
+
+const adoptMemoryStateTransition = (
+  previous: MemoryState,
+  candidate: Readonly<Record<string, readonly MemoryRow[]>>,
+  label: string
+): MemoryState => {
+  const entries: [string, readonly MemoryRow[]][] = [];
+  for (const [relationId, rows] of Object.entries(candidate)) {
+    if (!Array.isArray(rows)) throw new TypeError(label + ' must map relation IDs to arrays of rows');
+    const prior = previous[relationId];
+    if (rows === prior) {
+      entries.push([relationId, rows]);
+      continue;
+    }
+    const retained = new Set(prior ?? []);
+    const owned = rows.map((row) => retained.has(row) && Object.isFrozen(row) ? row : adoptMemoryRow(row, label + ' row'));
+    entries.push([relationId, Object.freeze(owned)]);
+  }
+  return frozenRelationIndex(entries);
+};
+
+const relationIndex = <Value>(entries: Iterable<readonly [string, Value]>): Record<string, Value> => {
+  const output = Object.create(null) as Record<string, Value>;
+  for (const [key, value] of entries) {
+    Object.defineProperty(output, key, { value, enumerable: true, writable: true, configurable: true });
+  }
+  return output;
+};
+
+const frozenRelationIndex = <Value>(entries: Iterable<readonly [string, Value]>): Readonly<Record<string, Value>> =>
+  Object.freeze(relationIndex(entries));
+
+const adoptPortableArray = <Value>(input: unknown, label: string): readonly Value[] => {
+  const parsed = detachAndFreezeJsonValue(input);
+  if (!parsed.success || !Array.isArray(parsed.value)) throw new TypeError(label + ' must be a descriptor-safe portable array');
+  return parsed.value as unknown as readonly Value[];
+};
+
+const ownArrayValues = <Value>(input: unknown, label: string): readonly Value[] => {
+  if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(input);
+    const output: Value[] = [];
+    for (let index = 0; index < input.length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+        throw new TypeError(label + ' must be a dense descriptor-safe array');
+      }
+      output.push(descriptor.value as Value);
+    }
+    return Object.freeze(output);
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
+    throw new TypeError(label + ' must be a descriptor-safe array');
+  }
+};
+
+const adoptConstraints = (input: unknown): readonly SourceConstraint<MemoryState>[] => Object.freeze(
+  ownArrayValues<unknown>(input, 'Memory constraints').map((constraint, index) => {
+    const label = 'Memory constraint ' + index;
+    const descriptors = ownRecordDescriptors(constraint, label);
+    const id = requiredDataValue(descriptors, 'id', label);
+    const mode = requiredDataValue(descriptors, 'mode', label);
+    const dependencyRelations = ownArrayValues<unknown>(requiredDataValue(descriptors, 'dependencyRelations', label), label + ' dependencyRelations');
+    const evaluate = requiredDataValue(descriptors, 'evaluate', label);
+    if (typeof id !== 'string' || (mode !== 'audit' && mode !== 'required') || dependencyRelations.some((value) => typeof value !== 'string') || typeof evaluate !== 'function') {
+      throw new TypeError(label + ' must have valid constraint fields');
+    }
+    return Object.freeze({
+      id,
+      mode,
+      dependencyRelations: dependencyRelations as readonly string[],
+      evaluate: evaluate as SourceConstraint<MemoryState>['evaluate']
+    });
+  })
+);
+
+const ownRecordDescriptors = (input: unknown, label: string): PropertyDescriptorMap => {
+  if (!isRecord(input)) throw new TypeError(label + ' must be a record');
+  try {
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError(label + ' must have a plain prototype');
+    return Object.getOwnPropertyDescriptors(input);
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
+    throw new TypeError(label + ' must be descriptor-safe');
+  }
+};
+
+const requiredDataValue = (descriptors: PropertyDescriptorMap, key: string, label: string): unknown => {
+  const descriptor = descriptors[key];
+  if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' must have an enumerable data property ' + key);
+  return descriptor.value;
+};
+
+const adoptTransactionAttempt = (input: TransactionAttempt): TransactionAttempt => {
+  const descriptors = ownRecordDescriptors(input, 'Transaction attempt');
+  const operationEpoch = requiredDataValue(descriptors, 'operationEpoch', 'Transaction attempt');
+  const operationId = requiredDataValue(descriptors, 'operationId', 'Transaction attempt');
+  const attachmentId = requiredDataValue(descriptors, 'attachmentId', 'Transaction attempt');
+  if (typeof operationEpoch !== 'string' || typeof operationId !== 'string' || typeof attachmentId !== 'string') {
+    throw new TypeError('Transaction attempt identifiers must be strings');
+  }
+  const rawTransaction = requiredDataValue(descriptors, 'transaction', 'Transaction attempt');
+  const parsedTransaction = detachAndFreezeJsonValue(rawTransaction);
+  if (!parsedTransaction.success || !isRecord(parsedTransaction.value)) throw new TypeError('Transaction attempt transaction must be descriptor-safe portable data');
+  const expectedBasisDescriptor = descriptors.expectedBasis;
+  let expectedBasis: SourceBasis | undefined;
+  if (expectedBasisDescriptor !== undefined) {
+    if (!expectedBasisDescriptor.enumerable || !('value' in expectedBasisDescriptor)) throw new TypeError('Transaction attempt expectedBasis must be an enumerable data property');
+    if (expectedBasisDescriptor.value !== undefined) {
+      const parsedBasis = detachAndFreezeJsonValue(expectedBasisDescriptor.value);
+      if (!parsedBasis.success) throw new TypeError('Transaction attempt expectedBasis must be descriptor-safe portable data');
+      expectedBasis = parsedBasis.value;
+    }
+  }
+  const signalDescriptor = descriptors.signal;
+  if (signalDescriptor !== undefined && (!signalDescriptor.enumerable || !('value' in signalDescriptor))) {
+    throw new TypeError('Transaction attempt signal must be an enumerable data property');
+  }
+  return Object.freeze({
+    operationEpoch,
+    operationId,
+    attachmentId,
+    transaction: parsedTransaction.value as unknown as Transaction | ArtifactRef,
+    ...(expectedBasis === undefined ? {} : { expectedBasis }),
+    ...(signalDescriptor === undefined || signalDescriptor.value === undefined ? {} : { signal: signalDescriptor.value as AbortSignal })
+  });
+};
+
+const adoptMemoryRow = (input: unknown, label: string): MemoryRow => {
+  const parsed = detachAndFreezeJsonValue(input);
+  if (!parsed.success || !isRecord(parsed.value)) throw new TypeError(label + ' must be a descriptor-safe portable row');
+  return parsed.value;
+};
+
+const tryAdoptMemoryRow = (input: unknown): MemoryRow | undefined => {
+  const parsed = detachAndFreezeJsonValue(input);
+  return parsed.success && isRecord(parsed.value) ? parsed.value : undefined;
+};
+
+const ownCommitReceipt = (input: CommitReceipt): CommitReceipt => {
+  const parsed = detachAndFreezeJsonValue(input);
+  if (!parsed.success || !isRecord(parsed.value)) throw new TypeError('Commit receipt must be descriptor-safe portable evidence');
+  return parsed.value as unknown as CommitReceipt;
+};
+
 const canonical = (value: JsonValue): string => JSON.stringify(value, (_key, candidate: unknown) => isRecord(candidate) ? Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => comparePortableStrings(left, right))) : candidate);
 const sameJson = (left: JsonValue | MemoryState, right: JsonValue | MemoryState): boolean => canonical(left as JsonValue) === canonical(right as JsonValue);
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => typeof value === 'object' && value !== null && !Array.isArray(value);
-const isJsonValue = (value: unknown): value is JsonValue => value === null || typeof value === 'boolean' || typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)) || (Array.isArray(value) && value.every(isJsonValue)) || (isRecord(value) && Object.values(value).every(isJsonValue));
-const isMemoryRow = (value: unknown): value is MemoryRow => isRecord(value) && Object.values(value).every(isJsonValue);
 const rowKey = (row: MemoryRow, fields: readonly string[]): string => canonical(fields.map((field) => Object.hasOwn(row, field) ? row[field] as JsonValue : { missing: field }));
 const hasFields = (row: MemoryRow, fields: readonly string[]): boolean => fields.every((field) => Object.hasOwn(row, field));
 const keyTuple = (row: MemoryRow, fields: readonly string[]): readonly JsonValue[] => fields.map((field) => row[field] as JsonValue);

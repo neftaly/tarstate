@@ -1,6 +1,6 @@
 # Tarstate v1 conformance matrix
 
-Status: v0.2.0 release evidence. Date: 2026-07-11.
+Status: v0.3.0 release evidence. Date: 2026-07-13.
 
 This matrix is the self-contained index of production release gates and their
 executable evidence. A complete gate means the in-repository contract in
@@ -36,8 +36,9 @@ dependency versions, and successful runtime imports.
 
 `pnpm bench` runs the five staged golden workloads after build and fails above
 its loose ceiling. It is a gross regression signal, not a claim of legacy
-performance parity. `pnpm bench:query` is the non-gating structural and GC
-diagnostic. The immutable
+performance parity. `pnpm bench:query` is a release-gated structural and GC
+diagnostic with conservative relative-time, selectivity, and sampled-allocation
+contracts. The immutable
 legacy reference remains the `legacy-v0-final` tag at commit `25f707c`.
 
 Publishing packages, creating a Git tag/release, and claiming compatibility for

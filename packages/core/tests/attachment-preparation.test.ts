@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { sealArtifact, type Artifact, type ArtifactRef } from '../src/artifacts.js';
-import { prepareDatabaseAttachment } from '../src/attachment-preparation.js';
+import { prepareDatabaseAttachment, prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
 import { AttachmentCatalog, type SourceSnapshot } from '../src/database.js';
+import type { Issue } from '../src/issues.js';
 import { capabilityRefFor, CapabilityRegistry, type CapabilityDeclaration } from '../src/registry.js';
 import type { DocumentDeclaration } from '../src/receipts.js';
 import type { JsonValue } from '../src/value.js';
@@ -73,6 +74,45 @@ class TestSource {
 }
 
 describe('database attachment preparation', () => {
+  it('owns and freezes ready preparation arrays and issues while retaining callbacks', () => {
+    const schemaViewIds = ['schema:z', 'schema:a', 'schema:z'];
+    const details = { nested: [1] };
+    const issues: Issue[] = [{
+      id: 'test:owned', code: 'test.owned', severity: 'warning', phase: 'resolve', retry: 'after_input', details
+    }];
+    const project = (_snapshot: SourceSnapshot<unknown>) => ({ state: 'ready' as const, value: null, issues: [] });
+    const prepared = prepareManualReadOnlyAttachment({ schemaViewIds, issues, project });
+
+    schemaViewIds.push('schema:late');
+    issues.length = 0;
+    details.nested.push(2);
+
+    expect(prepared.schemaViewIds).toEqual(['schema:a', 'schema:z']);
+    expect(prepared.issues).toMatchObject([{ details: { nested: [1] } }]);
+    expect(prepared.project).toBe(project);
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(Object.isFrozen(prepared.schemaViewIds)).toBe(true);
+    expect(Object.isFrozen(prepared.constraints)).toBe(true);
+    expect(Object.isFrozen(prepared.issues)).toBe(true);
+    expect(Object.isFrozen(prepared.issues[0])).toBe(true);
+    expect(Object.isFrozen(prepared.issues[0]?.details)).toBe(true);
+  });
+
+  it('rejects hostile ready preparation arrays without invoking getters', () => {
+    let getterCalls = 0;
+    const schemaViewIds: string[] = [];
+    Object.defineProperty(schemaViewIds, '0', {
+      enumerable: true,
+      get: () => { getterCalls += 1; return 'schema:hostile'; }
+    });
+    schemaViewIds.length = 1;
+    expect(() => prepareManualReadOnlyAttachment({
+      schemaViewIds,
+      project: (_snapshot: SourceSnapshot<unknown>) => ({ state: 'ready' as const, value: null, issues: [] })
+    })).toThrow(/descriptor-safe array/);
+    expect(getterCalls).toBe(0);
+  });
+
   it('resolves exact bootstrap artifacts and lets the catalog derive writable projection state', async () => {
     const fixture = await fixtures();
     const registry = new CapabilityRegistry('trust:attachment');

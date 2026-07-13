@@ -121,6 +121,83 @@ describe('source lifecycle coordination', () => {
     expect(await coordinator.queryOutcome({ operationEpoch: command.operationEpoch, operationId: command.operationId, commandHash: differentHash })).toEqual({ status: 'ambiguous' });
   });
 
+  it('owns queued commands and captures the abort signal without invoking hostile getters', async () => {
+    let releaseAuthorization!: () => void;
+    const authorizationGate = new Promise<void>((resolve) => { releaseAuthorization = resolve; });
+    const allocated: unknown[] = [];
+    const created: unknown[] = [];
+    const coordinator = new SourceLifecycleCoordinator({
+      lifecycleCoordinatorId: 'lifecycle:test', operationEpoch: 'lifecycle:epoch:one', authorityViewFingerprint: authorityFingerprint,
+      authorize: (request) => request.action === 'create' && request.input !== null && typeof request.input === 'object' && 'title' in request.input && request.input.title === 'blocker'
+        ? authorizationGate.then(() => ({ allowed: true as const }))
+        : { allowed: true },
+      adapter: {
+        allocateSourceId: (input, capability) => { allocated.push({ input, capability }); return 'source:owned'; },
+        create: ({ value, capability }) => { created.push({ value, capability }); return { outcome: 'committed', durability: 'memory', issues: [] }; },
+        delete: () => ({ outcome: 'committed', issues: [] })
+      }
+    });
+    const blocker = coordinator.execute(lifecycleCommand('queue-blocker', { action: 'create', sourceCapability: { ...sourceCapability }, input: { title: 'blocker' } }));
+    const queued = lifecycleCommand('queue-owned', { action: 'create', sourceCapability: { ...sourceCapability }, input: { title: 'owned' } });
+    const mutable = queued as unknown as { operationId: string; request: { sourceCapability: { id: string }; input: { title: string } } };
+    const controller = new AbortController();
+    const replacement = new AbortController();
+    replacement.abort();
+    const executionOptions = { signal: controller.signal };
+    const queuedResult = coordinator.execute(queued, executionOptions);
+    mutable.operationId = 'queue-mutated';
+    mutable.request.sourceCapability.id = 'urn:test:mutated';
+    mutable.request.input.title = 'mutated';
+    executionOptions.signal = replacement.signal;
+    releaseAuthorization();
+
+    await blocker;
+    const receipt = await queuedResult;
+    const expected = lifecycleCommand('queue-owned', { action: 'create', sourceCapability: { ...sourceCapability }, input: { title: 'owned' } });
+    expect(receipt).toMatchObject({ operationId: 'queue-owned', outcome: 'committed', commandHash: await lifecycleCommandHash(expected, authorityFingerprint) });
+    expect(allocated[1]).toEqual({ input: { title: 'owned' }, capability: sourceCapability });
+    expect(created[1]).toEqual({ value: { title: 'owned' }, capability: sourceCapability });
+    expect(Object.isFrozen((allocated[1] as { input: object }).input)).toBe(true);
+
+    let getterCalls = 0;
+    const hostile = Object.defineProperty({
+      lifecycleCoordinatorId: 'lifecycle:test', operationEpoch: 'lifecycle:epoch:one', operationId: 'hostile'
+    }, 'request', { enumerable: true, get: () => { getterCalls += 1; return { action: 'delete', sourceId: 'source:owned' }; } });
+    expect(() => coordinator.execute(hostile as unknown as SourceLifecycleCommand)).toThrow(/descriptor-safe portable data/);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('stores and returns one deeply owned immutable lifecycle receipt', async () => {
+    const adapterIssues: Issue[] = [createIssue({ code: 'test.lifecycle_evidence', phase: 'lifecycle', severity: 'warning', retry: 'never' })];
+    const coordinator = new SourceLifecycleCoordinator({
+      lifecycleCoordinatorId: 'lifecycle:test', operationEpoch: 'lifecycle:epoch:one', authorityViewFingerprint: authorityFingerprint,
+      authorize: () => ({ allowed: true }),
+      adapter: {
+        allocateSourceId: () => 'source:receipt-owned',
+        create: () => ({ outcome: 'committed', durability: 'memory', issues: adapterIssues }),
+        delete: () => ({ outcome: 'committed', issues: [] })
+      }
+    });
+    const command = lifecycleCommand('receipt-owned');
+    const receipt = await coordinator.execute(command);
+    adapterIssues.push(deniedIssue());
+
+    expect(receipt.issues).toHaveLength(1);
+    expect(Object.isFrozen(receipt)).toBe(true);
+    expect(Object.isFrozen(receipt.issues)).toBe(true);
+    expect(() => (receipt.issues as Issue[]).push(deniedIssue())).toThrow();
+    expect(await coordinator.execute(command)).toBe(receipt);
+    const lookup = await coordinator.queryOutcome({
+      operationEpoch: command.operationEpoch,
+      operationId: command.operationId,
+      commandHash: await lifecycleCommandHash(command, authorityFingerprint)
+    });
+    expect(Object.isFrozen(lookup)).toBe(true);
+    expect(lookup).toEqual({ status: 'known', receipt });
+    if (lookup.status !== 'known') throw new Error('expected known lifecycle outcome');
+    expect(lookup.receipt).toBe(receipt);
+  });
+
   it('retains source-side stale rejection and committed delete no-op, then expires the epoch', async () => {
     const remove = vi.fn((): LifecycleMutationResult => ({ outcome: 'committed', durability: 'local', issues: [] }));
     const coordinator = new SourceLifecycleCoordinator({
@@ -202,6 +279,92 @@ describe('governance coordination', () => {
     expect(declaration).toEqual(command.request);
     expect(await coordinator.execute(command)).toBe(receipt);
     expect(apply).toHaveBeenCalledOnce();
+  });
+
+  it('owns queued commands before selecting the source queue and rejects hostile getters', async () => {
+    let releaseAuthorization!: () => void;
+    const authorizationGate = new Promise<void>((resolve) => { releaseAuthorization = resolve; });
+    let basis = { incarnation: 'one', revision: 0 };
+    const applied: GovernanceCommand[] = [];
+    const coordinator = new GovernanceCoordinator({
+      authorityViewFingerprint: authorityFingerprint,
+      authorize: (command) => command.operationId === 'queue-blocker'
+        ? authorizationGate.then(() => ({ allowed: true as const }))
+        : { allowed: true }
+    });
+    coordinator.registerSource('source:one', 'governance:epoch:one', {
+      snapshotBasis: () => basis,
+      apply: ({ command }) => {
+        applied.push(command);
+        const beforeBasis = basis;
+        basis = { ...basis, revision: basis.revision + 1 };
+        return { outcome: 'committed', beforeBasis, afterBasis: basis, durability: 'memory', issues: [] };
+      }
+    });
+    const blocker = coordinator.execute(governanceCommand('queue-blocker'));
+    const queued: GovernanceCommand = {
+      ...governanceCommand('queue-owned', { action: 'activate_constraints', activation: constraintSection({ ...constraints }) }),
+      expectedBasis: { incarnation: 'one', revision: 1 }
+    };
+    const mutable = queued as unknown as { operationId: string; sourceId: string; expectedBasis: { revision: number }; request: { activation: { set: { id: string } } } };
+    const queuedResult = coordinator.execute(queued);
+    mutable.operationId = 'queue-mutated';
+    mutable.sourceId = 'source:mutated';
+    mutable.expectedBasis.revision = 99;
+    mutable.request.activation.set.id = 'urn:test:mutated';
+    releaseAuthorization();
+
+    await blocker;
+    const receipt = await queuedResult;
+    const expected: GovernanceCommand = {
+      ...governanceCommand('queue-owned', { action: 'activate_constraints', activation: constraintSection({ ...constraints }) }),
+      expectedBasis: { incarnation: 'one', revision: 1 }
+    };
+    expect(receipt).toMatchObject({ operationId: 'queue-owned', sourceId: 'source:one', outcome: 'committed', commandHash: await governanceCommandHash(expected, authorityFingerprint), selectedArtifactHashes: [constraints.contentHash] });
+    expect(applied[1]).toEqual(expected);
+    expect(Object.isFrozen(applied[1]?.request)).toBe(true);
+
+    let getterCalls = 0;
+    const hostile = Object.defineProperty({
+      operationEpoch: 'governance:epoch:one', operationId: 'hostile', expectedBasis: { revision: 2 }, request: { action: 'activate_constraints', activation: constraintSection() }
+    }, 'sourceId', { enumerable: true, get: () => { getterCalls += 1; return 'source:one'; } });
+    expect(() => coordinator.execute(hostile as unknown as GovernanceCommand)).toThrow(/descriptor-safe portable data/);
+    expect(getterCalls).toBe(0);
+  });
+
+  it('detaches governance receipt evidence before storing and returning it', async () => {
+    const snapshotBasis = { incarnation: 'one', revision: 0 };
+    const reportedBefore = { incarnation: 'one', revision: 0 };
+    const reportedAfter = { incarnation: 'one', revision: 1 };
+    const adapterIssues: Issue[] = [createIssue({ code: 'test.governance_evidence', phase: 'governance', severity: 'warning', retry: 'never' })];
+    const coordinator = new GovernanceCoordinator({ authorityViewFingerprint: authorityFingerprint, authorize: () => ({ allowed: true }) });
+    coordinator.registerSource('source:one', 'governance:epoch:one', {
+      snapshotBasis: () => snapshotBasis,
+      apply: () => ({ outcome: 'committed', beforeBasis: reportedBefore, afterBasis: reportedAfter, durability: 'local', issues: adapterIssues })
+    });
+    const command = governanceCommand('receipt-owned');
+    const receipt = await coordinator.execute(command);
+    reportedBefore.revision = 10;
+    reportedAfter.revision = 11;
+    adapterIssues.push(deniedIssue());
+
+    expect(receipt).toMatchObject({ beforeBasis: { revision: 0 }, afterBasis: { revision: 1 }, issues: [{ code: 'test.governance_evidence' }] });
+    expect(Object.isFrozen(receipt)).toBe(true);
+    expect(Object.isFrozen(receipt.beforeBasis)).toBe(true);
+    expect(Object.isFrozen(receipt.afterBasis)).toBe(true);
+    expect(Object.isFrozen(receipt.selectedArtifactHashes)).toBe(true);
+    expect(Object.isFrozen(receipt.issues)).toBe(true);
+    expect(await coordinator.execute(command)).toBe(receipt);
+    const lookup = await coordinator.queryOutcome({
+      sourceId: command.sourceId,
+      operationEpoch: command.operationEpoch,
+      operationId: command.operationId,
+      commandHash: await governanceCommandHash(command, authorityFingerprint)
+    });
+    expect(Object.isFrozen(lookup)).toBe(true);
+    expect(lookup).toEqual({ status: 'known', receipt });
+    if (lookup.status !== 'known') throw new Error('expected known governance outcome');
+    expect(lookup.receipt).toBe(receipt);
   });
 
   it('keeps invalid repair and authority denial pre-handoff, but retains stale handed-off rejection', async () => {

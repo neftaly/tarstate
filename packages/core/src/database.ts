@@ -150,8 +150,8 @@ export class AttachmentCatalog {
       source: input.source,
       authorityScope: input.authorityScope,
       writable: input.preparation.writable,
-      schemaViewIds: input.preparation.schemaViewIds,
-      discoveryEdges: input.discoveryEdges,
+      schemaViewIds: Object.freeze([...input.preparation.schemaViewIds]),
+      discoveryEdges: Object.freeze([...input.discoveryEdges]),
       project: input.preparation.project
     });
     if (attachment.sourceId !== attachment.source.sourceId) throw new Error('Attachment source ID does not match its source');

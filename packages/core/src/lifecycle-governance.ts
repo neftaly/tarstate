@@ -1,4 +1,5 @@
 import { canonicalizeJson, isContentHash, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import type { SourceBasis } from './maintenance.js';
 import type { DocumentDeclaration, GovernanceReceipt, SourceLifecycleCommand, SourceLifecycleReceipt } from './receipts.js';
@@ -52,16 +53,18 @@ export class SourceOperationLedger<Receipt> implements OperationLedgerProtocol<R
   get activeEpoch(): string { return this.#activeEpoch; }
 
   reserve(operationEpoch: string, operationId: string, commandHash: ContentHash): OperationReservation<Receipt> {
-    if (operationEpoch !== this.#activeEpoch) return { status: 'expired' };
+    if (operationEpoch !== this.#activeEpoch) return Object.freeze({ status: 'expired' });
     const key = operationKey(operationEpoch, operationId);
     const existing = this.#entries.get(key);
     if (existing !== undefined) {
-      if (existing.commandHash !== commandHash) return { status: 'ambiguous' };
-      return existing.receipt === undefined ? { status: 'pending' } : { status: 'known', receipt: existing.receipt };
+      if (existing.commandHash !== commandHash) return Object.freeze({ status: 'ambiguous' });
+      return existing.receipt === undefined
+        ? Object.freeze({ status: 'pending' })
+        : Object.freeze({ status: 'known', receipt: existing.receipt });
     }
     const entry = { commandHash };
     this.#entries.set(key, entry);
-    return { status: 'reserved', entry };
+    return Object.freeze({ status: 'reserved', entry });
   }
 
   complete(entry: OperationLedgerEntry<Receipt>, receipt: Receipt): void {
@@ -75,14 +78,14 @@ export class SourceOperationLedger<Receipt> implements OperationLedgerProtocol<R
   }
 
   lookup(operationEpoch: string, operationId: string, commandHash: ContentHash): CoordinatorOutcomeLookup<Receipt> {
-    if (this.#retiredEpochs.has(operationEpoch)) return { status: 'expired' };
-    if (operationEpoch !== this.#activeEpoch) return { status: 'expired' };
+    if (this.#retiredEpochs.has(operationEpoch)) return Object.freeze({ status: 'expired' });
+    if (operationEpoch !== this.#activeEpoch) return Object.freeze({ status: 'expired' });
     const entry = this.#entries.get(operationKey(operationEpoch, operationId));
-    if (entry === undefined) return { status: 'not_seen' };
-    if (entry.commandHash !== commandHash) return { status: 'ambiguous' };
+    if (entry === undefined) return Object.freeze({ status: 'not_seen' });
+    if (entry.commandHash !== commandHash) return Object.freeze({ status: 'ambiguous' });
     return entry.receipt === undefined
-      ? { status: 'unavailable', issues: [coordinatorIssue('operation.outcome_pending', 'commit', 'query_outcome')] }
-      : { status: 'known', receipt: entry.receipt };
+      ? Object.freeze({ status: 'unavailable', issues: Object.freeze([coordinatorIssue('operation.outcome_pending', 'commit', 'query_outcome')]) })
+      : Object.freeze({ status: 'known', receipt: entry.receipt });
   }
 
   rotateEpoch(nextEpoch: string): void {
@@ -155,7 +158,9 @@ export class SourceLifecycleCoordinator {
   }
 
   execute(command: SourceLifecycleCommand, options: { readonly signal?: AbortSignal } = {}): Promise<SourceLifecycleReceipt> {
-    const run = this.#queue.then(() => this.#execute(command, options));
+    const ownedCommand = adoptCoordinatorCommand<SourceLifecycleCommand>(command, 'Source lifecycle command');
+    const signal = options.signal;
+    const run = this.#queue.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }));
     this.#queue = run.then(() => undefined, () => undefined);
     return run;
   }
@@ -313,9 +318,11 @@ export class GovernanceCoordinator {
   }
 
   execute(command: GovernanceCommand, options: { readonly signal?: AbortSignal } = {}): Promise<GovernanceReceipt> {
-    const prior = this.#queues.get(command.sourceId) ?? Promise.resolve();
-    const run = prior.then(() => this.#execute(command, options));
-    this.#queues.set(command.sourceId, run.then(() => undefined, () => undefined));
+    const ownedCommand = adoptCoordinatorCommand<GovernanceCommand>(command, 'Governance command');
+    const signal = options.signal;
+    const prior = this.#queues.get(ownedCommand.sourceId) ?? Promise.resolve();
+    const run = prior.then(() => this.#execute(ownedCommand, signal === undefined ? {} : { signal }));
+    this.#queues.set(ownedCommand.sourceId, run.then(() => undefined, () => undefined));
     return run;
   }
 
@@ -494,7 +501,7 @@ const selectedHashes = (command: GovernanceCommand): readonly ContentHash[] => {
   return [...new Set(refs)].sort(compare);
 };
 
-const lifecycleReceipt = (command: SourceLifecycleCommand, commandHash: ContentHash, outcome: SourceLifecycleReceipt['outcome'], issues: readonly Issue[], sourceId?: string, durability?: SourceLifecycleReceipt['durability']): SourceLifecycleReceipt => ({
+const lifecycleReceipt = (command: SourceLifecycleCommand, commandHash: ContentHash, outcome: SourceLifecycleReceipt['outcome'], issues: readonly Issue[], sourceId?: string, durability?: SourceLifecycleReceipt['durability']): SourceLifecycleReceipt => ownCoordinatorReceipt({
   kind: 'source-lifecycle', receiptVersion: 1,
   lifecycleCoordinatorId: command.lifecycleCoordinatorId,
   operationEpoch: command.operationEpoch,
@@ -505,9 +512,9 @@ const lifecycleReceipt = (command: SourceLifecycleCommand, commandHash: ContentH
   outcome,
   ...(durability === undefined ? {} : { durability }),
   issues
-});
+}, 'Source lifecycle receipt');
 
-const governanceReceipt = (command: GovernanceCommand, commandHash: ContentHash, selectedArtifactHashes: readonly ContentHash[], outcome: GovernanceReceipt['outcome'], issues: readonly Issue[], beforeBasis?: SourceBasis, afterBasis?: SourceBasis, durability?: GovernanceReceipt['durability']): GovernanceReceipt => ({
+const governanceReceipt = (command: GovernanceCommand, commandHash: ContentHash, selectedArtifactHashes: readonly ContentHash[], outcome: GovernanceReceipt['outcome'], issues: readonly Issue[], beforeBasis?: SourceBasis, afterBasis?: SourceBasis, durability?: GovernanceReceipt['durability']): GovernanceReceipt => ownCoordinatorReceipt({
   kind: 'governance', receiptVersion: 1,
   operationEpoch: command.operationEpoch,
   operationId: command.operationId,
@@ -520,7 +527,7 @@ const governanceReceipt = (command: GovernanceCommand, commandHash: ContentHash,
   selectedArtifactHashes,
   issues,
   ...(durability === undefined ? {} : { durability })
-});
+}, 'Governance receipt');
 
 const coordinatorFailure = <Value>(code: string, phase: 'lifecycle' | 'governance', details: JsonValue): ParseResult<Value> => ({ success: false, issues: [coordinatorIssue(code, phase, 'after_input', details)] });
 const coordinatorIssue = (code: string, phase: 'commit' | 'governance' | 'lifecycle' | 'resolve', retry: 'never' | 'after_input' | 'after_refresh' | 'after_authority' | 'query_outcome', details?: JsonValue): Issue => createIssue({ code, phase, severity: 'error', retry, ...(details === undefined ? {} : { details }) });
@@ -529,6 +536,22 @@ const invalidCommandHash = (kind: string, operationEpoch: string, operationId: s
 const operationKey = (epoch: string, id: string): string => epoch + '\u0000' + id;
 const sameBasis = (left: SourceBasis, right: SourceBasis): boolean => canonicalizeJson(left) === canonicalizeJson(right);
 const compare = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
+
+const adoptCoordinatorCommand = <Command>(input: unknown, label: string): Command => {
+  const owned = detachAndFreezeJsonValue(input);
+  if (!owned.success || owned.value === null || typeof owned.value !== 'object' || Array.isArray(owned.value)) {
+    throw new TypeError(label + ' must be descriptor-safe portable data');
+  }
+  return owned.value as unknown as Command;
+};
+
+const ownCoordinatorReceipt = <Receipt>(input: unknown, label: string): Receipt => {
+  const owned = detachAndFreezeJsonValue(input);
+  if (!owned.success || owned.value === null || typeof owned.value !== 'object' || Array.isArray(owned.value)) {
+    throw new TypeError(label + ' must be descriptor-safe portable evidence');
+  }
+  return owned.value as unknown as Receipt;
+};
 
 class CoordinatorExpectedError extends Error {
   readonly issue: Issue;

@@ -63,6 +63,15 @@ type LedgerEntry = {
   readonly result: AutomergeSourceCommitResult;
 };
 
+type AutomergeSourceCommitInput<T extends object> = {
+  readonly operationEpoch: string;
+  readonly operationId: string;
+  readonly intentHash: `sha256:${string}`;
+  readonly expectedBasis: AutomergeBasis;
+  readonly commands: readonly AutomergeSourceCommand<T>[];
+  readonly message?: string;
+};
+
 /** Captures the document's current exact-head basis. */
 export const automergeBasis = (doc: Automerge.Doc<unknown>): AutomergeBasis => Object.freeze({
   kind: 'automerge-heads',
@@ -166,24 +175,18 @@ export class AutomergeSourceRuntime<T extends object> {
     return () => { this.#listeners.delete(listener); };
   }
 
-  commit(input: {
-    readonly operationEpoch: string;
-    readonly operationId: string;
-    readonly intentHash: `sha256:${string}`;
-    readonly expectedBasis: AutomergeBasis;
-    readonly commands: readonly AutomergeSourceCommand<T>[];
-    readonly message?: string;
-  }): Promise<AutomergeSourceCommitResult> {
-    if (this.#closed) return Promise.resolve(this.#rejected(input, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]));
+  commit(input: AutomergeSourceCommitInput<T>): Promise<AutomergeSourceCommitResult> {
+    const owned = adoptCommitInput<T>(input);
+    if (this.#closed) return Promise.resolve(this.#rejected(owned, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: owned.operationId }]));
     if (this.#applying) {
-      return Promise.resolve(this.#rejected(input, undefined, [{
+      return Promise.resolve(this.#rejected(owned, undefined, [{
         code: 'automerge.reentrant_commit',
         phase: 'commit',
         sourceId: this.sourceId,
-        operationId: input.operationId
+        operationId: owned.operationId
       }]));
     }
-    const result = this.#queue.then(() => this.#commit(input));
+    const result = this.#queue.then(() => this.#commit(owned));
     this.#queue = result.then(() => undefined, () => undefined);
     return result;
   }
@@ -193,11 +196,11 @@ export class AutomergeSourceRuntime<T extends object> {
     readonly operationId: string;
     readonly intentHash: `sha256:${string}`;
   }): AutomergeSourceOutcomeLookup {
-    if (this.#retiredEpochs.has(input.operationEpoch)) return { status: 'expired' };
+    if (this.#retiredEpochs.has(input.operationEpoch)) return Object.freeze({ status: 'expired' });
     const entry = this.#ledger.get(ledgerKey(input.operationEpoch, input.operationId));
-    if (entry === undefined) return { status: 'not_seen' };
-    if (entry.intentHash !== input.intentHash) return { status: 'ambiguous' };
-    return { status: 'known', result: entry.result };
+    if (entry === undefined) return Object.freeze({ status: 'not_seen' });
+    if (entry.intentHash !== input.intentHash) return Object.freeze({ status: 'ambiguous' });
+    return Object.freeze({ status: 'known', result: entry.result });
   }
 
   /** Retires one application-owned operation epoch after its in-flight work. */
@@ -239,14 +242,7 @@ export class AutomergeSourceRuntime<T extends object> {
     ], 'source-runtime', this.#onDiagnostic);
   }
 
-  async #commit(input: {
-    readonly operationEpoch: string;
-    readonly operationId: string;
-    readonly intentHash: `sha256:${string}`;
-    readonly expectedBasis: AutomergeBasis;
-    readonly commands: readonly AutomergeSourceCommand<T>[];
-    readonly message?: string;
-  }): Promise<AutomergeSourceCommitResult> {
+  async #commit(input: AutomergeSourceCommitInput<T>): Promise<AutomergeSourceCommitResult> {
     if (this.#closed) return this.#rejected(input, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
     if (this.#retiredEpochs.has(input.operationEpoch)) return this.#rejected(input, undefined, [{ code: 'transaction.operation_epoch_expired', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
     const key = ledgerKey(input.operationEpoch, input.operationId);
@@ -264,13 +260,14 @@ export class AutomergeSourceRuntime<T extends object> {
     const current = this.#owner.current();
     this.#install(current, 'handle');
     const beforeBasis = automergeBasis(current);
-    if (!exactAutomergeBasisEqual(beforeBasis, input.expectedBasis)) {
+    const expectedBasis = input.expectedBasis;
+    if (!exactAutomergeBasisEqual(beforeBasis, expectedBasis)) {
       const rejected = this.#rejected(input, beforeBasis, [{
         code: 'transaction.expected_basis_stale',
         phase: 'commit',
         sourceId: this.sourceId,
         operationId: input.operationId,
-        details: { expectedBasis: input.expectedBasis, actualBasis: beforeBasis }
+        details: { expectedBasis, actualBasis: beforeBasis }
       }]);
       this.#ledger.set(key, { intentHash: input.intentHash, result: rejected });
       return rejected;
@@ -299,7 +296,7 @@ export class AutomergeSourceRuntime<T extends object> {
         sourceId: this.sourceId,
         operationId: input.operationId,
         details: stale
-          ? { expectedBasis: input.expectedBasis, actualBasis }
+          ? { expectedBasis, actualBasis }
           : { message: failure instanceof Error ? failure.message : String(failure) }
       }]);
       this.#ledger.set(key, { intentHash: input.intentHash, result: rejected });
@@ -309,7 +306,7 @@ export class AutomergeSourceRuntime<T extends object> {
 
     const afterBasis = automergeBasis(staged);
     const changed = !exactAutomergeBasisEqual(beforeBasis, afterBasis);
-    const committed: AutomergeSourceCommitResult = {
+    const committed = ownCommitResult({
       kind: 'source-commit',
       outcome: 'committed',
       operationEpoch: input.operationEpoch,
@@ -320,7 +317,7 @@ export class AutomergeSourceRuntime<T extends object> {
       changed,
       durability: 'local',
       issues: []
-    };
+    });
     this.#ledger.set(key, { intentHash: input.intentHash, result: committed });
     this.#install(staged, 'commit');
     return committed;
@@ -339,7 +336,7 @@ export class AutomergeSourceRuntime<T extends object> {
     beforeBasis: AutomergeBasis | undefined,
     issues: readonly AutomergeSourceIssue[]
   ): AutomergeSourceCommitResult {
-    return {
+    return ownCommitResult({
       kind: 'source-commit',
       outcome: 'rejected',
       operationEpoch: input.operationEpoch,
@@ -349,7 +346,7 @@ export class AutomergeSourceRuntime<T extends object> {
       changed: false,
       durability: 'local',
       issues
-    };
+    });
   }
 
   #notify(change: AutomergeSourceChange): void {
@@ -368,6 +365,103 @@ export class AutomergeSourceRuntime<T extends object> {
     if (this.#closed) throw new Error('Automerge source runtime is closed');
   }
 }
+
+const ownCommitResult = (result: AutomergeSourceCommitResult): AutomergeSourceCommitResult =>
+  cloneAndFreezeEvidence(result) as AutomergeSourceCommitResult;
+
+type DataDescriptors = Readonly<Record<string, PropertyDescriptor>>;
+
+const inspectCommitRecord = (input: unknown, label: string): DataDescriptors => {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new TypeError(label + ' must be a record');
+  return Object.getOwnPropertyDescriptors(input);
+};
+
+const commitDataValue = (descriptors: DataDescriptors, key: string, label: string): unknown => {
+  const descriptor = descriptors[key];
+  if (descriptor === undefined) return undefined;
+  if (!('value' in descriptor)) throw new TypeError(label + ' ' + key + ' has a hostile property descriptor');
+  return descriptor.value;
+};
+
+const inspectCommitArray = (input: unknown, label: string): readonly unknown[] => {
+  if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  const length = (Reflect.get(descriptors, 'length') as PropertyDescriptor | undefined)?.value;
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError(label + ' has a hostile length');
+  const output: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' has a hostile property descriptor');
+    output.push(descriptor.value);
+  }
+  return output;
+};
+
+const ownBasisEvidence = (input: AutomergeBasis): AutomergeBasis => {
+  const descriptors = inspectCommitRecord(input, 'Automerge expectedBasis');
+  const heads = inspectCommitArray(commitDataValue(descriptors, 'heads', 'Automerge expectedBasis'), 'Automerge expectedBasis heads');
+  if (heads.some((head) => typeof head !== 'string')) throw new TypeError('Automerge expectedBasis heads must be strings');
+  return Object.freeze({
+    kind: commitDataValue(descriptors, 'kind', 'Automerge expectedBasis') as AutomergeBasis['kind'],
+    heads: Object.freeze(heads as string[])
+  });
+};
+
+const adoptCommitInput = <T extends object>(input: AutomergeSourceCommitInput<T>): AutomergeSourceCommitInput<T> => {
+  const descriptors = inspectCommitRecord(input, 'Automerge commit input');
+  const commands = inspectCommitArray(commitDataValue(descriptors, 'commands', 'Automerge commit input'), 'Automerge commit commands')
+    .map((command, index): AutomergeSourceCommand<T> => {
+      const commandDescriptors = inspectCommitRecord(command, 'Automerge commit command ' + String(index));
+      const description = commitDataValue(commandDescriptors, 'description', 'Automerge commit command ' + String(index));
+      return Object.freeze({
+        ...(description === undefined ? {} : { description: description as string }),
+        apply: commitDataValue(commandDescriptors, 'apply', 'Automerge commit command ' + String(index)) as Automerge.ChangeFn<T>
+      });
+    });
+  const message = commitDataValue(descriptors, 'message', 'Automerge commit input');
+  return Object.freeze({
+    operationEpoch: commitDataValue(descriptors, 'operationEpoch', 'Automerge commit input') as string,
+    operationId: commitDataValue(descriptors, 'operationId', 'Automerge commit input') as string,
+    intentHash: commitDataValue(descriptors, 'intentHash', 'Automerge commit input') as `sha256:${string}`,
+    expectedBasis: ownBasisEvidence(commitDataValue(descriptors, 'expectedBasis', 'Automerge commit input') as AutomergeBasis),
+    commands: Object.freeze(commands),
+    ...(message === undefined ? {} : { message: message as string })
+  });
+};
+
+const cloneAndFreezeEvidence = (value: unknown, seen = new WeakMap<object, object>()): unknown => {
+  if (value === null || typeof value !== 'object') return value;
+  const existing = seen.get(value);
+  if (existing !== undefined) return existing;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Array.isArray(value)) {
+    const length = (Reflect.get(descriptors, 'length') as PropertyDescriptor | undefined)?.value;
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError('Automerge commit evidence has a hostile array length');
+    const output: unknown[] = [];
+    seen.set(value, output);
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Automerge commit evidence has a hostile array descriptor');
+      output.push(cloneAndFreezeEvidence(descriptor.value, seen));
+    }
+    return Object.freeze(output);
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError('Automerge commit evidence must contain only plain records');
+  const output: Record<string, unknown> = {};
+  seen.set(value, output);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== 'string') throw new TypeError('Automerge commit evidence contains a symbol key');
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError('Automerge commit evidence has a hostile object descriptor');
+    Object.defineProperty(output, key, {
+      value: cloneAndFreezeEvidence(descriptor.value, seen),
+      enumerable: true,
+      configurable: true,
+      writable: true
+    });
+  }
+  return Object.freeze(output);
+};
 
 /**
  * Runtime operations shared by memory-owned and Repo-owned Automerge sources.

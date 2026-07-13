@@ -154,6 +154,34 @@ describe('Automerge core source protocols', () => {
     expect(runtime.snapshot().storage.tasks.first).toEqual({ title: 'First', priority: 1 });
   });
 
+  it('returns deeply frozen commit and outcome evidence from the core facade', async () => {
+    const { runtime, source } = fixture();
+    const apply = vi.fn((draft: TaskDoc) => { draft.tasks.first!.title = 'Owned by handoff'; });
+    const replacementApply = vi.fn((draft: TaskDoc) => { draft.tasks.first!.title = 'Mutated after handoff'; });
+    const command = { apply };
+    const commands = [command];
+    const input = {
+      ...commitInput(source.snapshot().basis as JsonValue, 'operation:frozen-facade', '9'),
+      commands
+    };
+    const pending = source.commit(input);
+    command.apply = replacementApply;
+    commands.push({ apply: replacementApply });
+    const result = await pending;
+    expect([result, result.issues, result.beforeBasis, result.afterBasis].every(Object.isFrozen)).toBe(true);
+    expect(() => { (result.issues as unknown[]).push({ code: 'mutated' }); }).toThrow(TypeError);
+    expect(runtime.snapshot().storage.tasks.first?.title).toBe('Owned by handoff');
+    expect(apply).toHaveBeenCalledOnce();
+    expect(replacementApply).not.toHaveBeenCalled();
+
+    const lookup = await source.queryOutcome(input);
+    expect(Object.isFrozen(lookup)).toBe(true);
+    expect(lookup.status).toBe('known');
+    if (lookup.status === 'known') {
+      expect([lookup.result, lookup.result.issues, lookup.result.beforeBasis, lookup.result.afterBasis].every(Object.isFrozen)).toBe(true);
+    }
+  });
+
   it('lowers counter, text, and list edits to their exact Automerge operations', async () => {
     const doc = Automerge.from<TaskDoc>({
       tasks: { first: { title: 'First', count: new Automerge.Counter(2), tags: ['a', 'b'] } }
