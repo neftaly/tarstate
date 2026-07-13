@@ -265,15 +265,31 @@ type MaterializedQueryNode = {
   readonly result: NodeResult;
   readonly issues: readonly Issue[];
   readonly unavailable: boolean;
+  /** Exact changed output positions when length and order match the prior materialization. */
+  readonly stableChangedPositions?: readonly number[];
+  readonly from?: {
+    readonly inputOffsets: ReadonlyMap<string, number>;
+  };
   readonly local?: {
     readonly inputs: readonly ScopedRow[];
     readonly segments: readonly LocalSegment[];
+    /** Omitted for one-to-one nodes, where offset=index and width=1. */
+    readonly outputOffsets?: readonly number[];
+    readonly widths?: readonly number[];
   };
   readonly join?: {
     readonly leftInputs: readonly ScopedRow[];
     readonly rightInputs: readonly ScopedRow[];
     readonly segments: readonly (readonly ScopedRow[])[];
     readonly rightIndex?: ReadonlyMap<string, readonly ScopedRow[]>;
+  };
+  readonly order?: {
+    readonly inputs: readonly ScopedRow[];
+  };
+  readonly aggregate?: {
+    readonly inputs: readonly ScopedRow[];
+    readonly groupKeyByRow: ReadonlyMap<ScopedRow, { readonly canonical: string; readonly key: QueryRecord }>;
+    readonly groups: ReadonlyMap<string, { readonly key: QueryRecord; readonly members: readonly ScopedRow[]; readonly output: ScopedRow }>;
   };
 };
 
@@ -479,8 +495,33 @@ const evaluateJoin = (node: Extract<QueryNode, { readonly kind: 'join' }>, conte
   if (left.completeness === 'unknown' || right.completeness === 'unknown') return { rows: [], completeness: 'unknown' };
   if ((node.join === 'anti' || node.join === 'left') && right.completeness !== 'exact') return nonMonotoneUnknown(context, node.join);
   const rows: ScopedRow[] = [];
-  const equality = equijoinFields(node);
-  const rightIndex = equality === undefined ? undefined : indexedRows(node, right.rows, equality.right, context);
+  // A recursion-ref has no statically declared aliases, but its frontier rows
+  // do. Recover those aliases from the materialized operands so recursive
+  // equijoins still use the invariant-side index instead of scanning it once
+  // per frontier row.
+  const equality = equijoinFields(node) ?? materializedEquijoinFields(node, left.rows, right.rows);
+  const reverseIndexed = node.join === 'inner'
+    && equality !== undefined
+    && !referencesActiveRecursion(node.left, context)
+    && referencesActiveRecursion(node.right, context);
+  if (reverseIndexed && equality !== undefined) {
+    const leftIndex = indexedRows(node, node.left, left.rows, equality.left, context);
+    const leftPositions = indexedRowPositions.get(leftIndex);
+    const rightPositions = new Map(right.rows.map((row, index) => [row, index]));
+    const matches: { readonly left: ScopedRow; readonly right: ScopedRow }[] = [];
+    for (const rightRow of right.rows) {
+      for (const leftRow of lookupIndexedRows(leftIndex, equality.right, rightRow, context)) matches.push({ left: leftRow, right: rightRow });
+    }
+    matches.sort((first, second) =>
+      (leftPositions?.get(first.left) ?? 0) - (leftPositions?.get(second.left) ?? 0)
+      || (rightPositions.get(first.right) ?? 0) - (rightPositions.get(second.right) ?? 0));
+    for (const { left: leftRow, right: rightRow } of matches) {
+      const origin = resultKey(leftRow);
+      rows.push(scopedRow({ ...leftRow.scope, ...rightRow.scope }, { ...leftRow.provenance, ...rightRow.provenance }, origin));
+    }
+    return context.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
+  }
+  const rightIndex = equality === undefined ? undefined : indexedRows(node, node.right, right.rows, equality.right, context);
   for (const leftRow of left.rows) {
     const candidates = rightIndex === undefined || equality === undefined ? right.rows : lookupIndexedRows(rightIndex, equality.left, leftRow, context);
     rows.push(...joinLeftRow(node, leftRow, candidates, rightIndex !== undefined, context));
@@ -536,24 +577,46 @@ const equijoinFields = (node: Extract<QueryNode, { readonly kind: 'join' }>): Eq
   return undefined;
 };
 
-const indexedRows = (node: QueryNode, rows: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlyMap<string, readonly ScopedRow[]> => {
-  const cacheable = context.outer === undefined && !referencesActiveRecursion(node.kind === 'join' ? node.right : node, context);
-  const cached = cacheable ? context.joinIndexes.get(node) : undefined;
+const materializedEquijoinFields = (
+  node: Extract<QueryNode, { readonly kind: 'join' }>,
+  leftRows: readonly ScopedRow[],
+  rightRows: readonly ScopedRow[]
+): EquijoinExpressions | undefined => {
+  if (node.on?.kind !== 'compare' || node.on.op !== 'eq' || leftRows.length === 0 || rightRows.length === 0) return undefined;
+  const leftField = equijoinField(node.on.left);
+  const rightField = equijoinField(node.on.right);
+  if (leftField === undefined || rightField === undefined) return undefined;
+  const leftScope = (leftRows[0] as ScopedRow).scope;
+  const rightScope = (rightRows[0] as ScopedRow).scope;
+  if (Object.hasOwn(leftScope, leftField.alias) && Object.hasOwn(rightScope, rightField.alias)) return { left: node.on.left, right: node.on.right };
+  if (Object.hasOwn(leftScope, rightField.alias) && Object.hasOwn(rightScope, leftField.alias)) return { left: node.on.right, right: node.on.left };
+  return undefined;
+};
+
+const indexedRowPositions = new WeakMap<ReadonlyMap<string, readonly ScopedRow[]>, ReadonlyMap<ScopedRow, number>>();
+
+const indexedRows = (cacheKey: QueryNode, input: QueryNode, rows: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlyMap<string, readonly ScopedRow[]> => {
+  const cacheable = context.outer === undefined && !referencesActiveRecursion(input, context);
+  const cached = cacheable ? context.joinIndexes.get(cacheKey) : undefined;
   if (cached !== undefined) return cached;
   const index = buildIndexedRows(rows, expression, context);
-  if (cacheable) context.joinIndexes.set(node, index);
+  if (cacheable) context.joinIndexes.set(cacheKey, index);
   return index;
 };
 
 const buildIndexedRows = (rows: readonly ScopedRow[], expression: Expr, context: QueryContext): Map<string, ScopedRow[]> => {
   const index = new Map<string, ScopedRow[]>();
-  for (const row of rows) {
+  const positions = new Map<ScopedRow, number>();
+  for (let position = 0; position < rows.length; position += 1) {
+    const row = rows[position] as ScopedRow;
+    if (!positions.has(row)) positions.set(row, position);
     const key = indexKey(expression, row, context);
     if (key === undefined) continue;
     const bucket = index.get(key);
     if (bucket === undefined) index.set(key, [row]);
     else bucket.push(row);
   }
+  indexedRowPositions.set(index, positions);
   return index;
 };
 
@@ -781,15 +844,26 @@ const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive'
   const previous = context.recursions.get(node.name);
   const rows: ScopedRow[] = [];
   const keys = new Set<string>();
-  const add = (candidate: ScopedRow): boolean => {
+  const add = (candidate: ScopedRow): ScopedRow | undefined => {
     const parts = node.key.map((expression) => evaluateExpr(expression, exprContext(candidate, context)));
     if (parts.some((part) => part.status === 'unavailable' || part.status === 'indeterminate')) context.unavailable = true;
-    if (parts.some((part) => part.status !== 'known')) return false;
+    if (parts.some((part) => part.status !== 'known')) return undefined;
     const key = canonicalizeJson(parts.map((part) => (part as { readonly status: 'known'; readonly value: JsonValue }).value));
-    if (keys.has(key)) return false;
+    if (keys.has(key)) return undefined;
     keys.add(key);
-    rows.push(candidate);
-    return true;
+    // A recursive row is semantically identified by the declared fixpoint key,
+    // not by the complete derivation path that happened to discover it. Keeping
+    // the path would append another projection occurrence on every iteration,
+    // making identities grow linearly and a simple chain take quadratic work.
+    const occurrence = node.name.length + ':' + node.name + key.length + ':' + key;
+    const provenance = Object.fromEntries(Object.entries(candidate.provenance).map(([alias, value]) => [alias, { ...value, occurrence }]));
+    const normalizedProvenance = Object.keys(provenance).length === 0
+      ? { [node.name]: { relationId: 'recursive', occurrence } }
+      : provenance;
+    const identity = provenanceIdentity(normalizedProvenance);
+    const accepted = candidate.identity === identity ? candidate : { ...candidate, provenance: normalizedProvenance, identity, origin: identity };
+    rows.push(accepted);
+    return accepted;
   };
   try {
     seed.rows.forEach(add);
@@ -801,7 +875,8 @@ const evaluateRecursive = (node: Extract<QueryNode, { readonly kind: 'recursive'
       if (step.completeness !== 'exact' || context.unavailable) return { rows: [], completeness: 'unknown' };
       const next: ScopedRow[] = [];
       for (const candidate of step.rows) {
-        if (add(candidate)) next.push(candidate);
+        const accepted = add(candidate);
+        if (accepted !== undefined) next.push(accepted);
         if (rows.length > maxRows) return recursionBudgetUnknown(context, 'rows', maxRows);
       }
       if (next.length === 0) return { rows, completeness: 'exact' };
@@ -1288,6 +1363,10 @@ export const openIncrementalQueryMaintenance = (
             ? incrementallyMaterializeFrom(node, nextSnapshot, update, previousNode)
             : node.kind === 'join'
               ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
+            : node.kind === 'order'
+              ? incrementallyMaterializeOrder(node, nextSnapshot, materialized, previousNode)
+            : node.kind === 'aggregate'
+              ? incrementallyMaterializeAggregate(node, nextSnapshot, materialized, previousNode)
             : isLocallyMaintainedNode(node)
               ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
               : materializeQueryNode(node, nextSnapshot, materialized);
@@ -1310,7 +1389,8 @@ export const openIncrementalQueryMaintenance = (
             revision,
             rejectedUpdateCount
           ),
-          publicRows
+          publicRows,
+          current
         );
         assertedRoot = root;
         return current;
@@ -1708,6 +1788,10 @@ export const createPooledIncrementalQueryRuntime = (input: {
         ? incrementallyMaterializeFrom(node, nextSnapshot, update, previousNode)
         : node.kind === 'join'
           ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
+        : node.kind === 'order'
+          ? incrementallyMaterializeOrder(node, nextSnapshot, materialized, previousNode)
+        : node.kind === 'aggregate'
+          ? incrementallyMaterializeAggregate(node, nextSnapshot, materialized, previousNode)
         : isLocallyMaintainedNode(node)
           ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
           : materializeQueryNode(node, nextSnapshot, materialized);
@@ -1746,7 +1830,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
           rejectedUpdateCount
         ),
         publicRows,
-        reusePublicViews ? root.current : undefined
+        root.current,
+        reusePublicViews
       );
       if (!journal.roots.has(root)) journal.roots.set(root, { current: root.current, asserted: root.asserted });
       root.current = nextCurrent;
@@ -1917,13 +2002,16 @@ const assertPoolableQuery = (root: QueryNode): void => {
   visitQuery(root);
 };
 
-const publicQueryRows = (rows: readonly ScopedRow[], cache: WeakMap<ScopedRow, QueryRecord>): readonly QueryRecord[] => Object.freeze(rows.map((row) => {
+const publicQueryRow = (row: ScopedRow, cache: WeakMap<ScopedRow, QueryRecord>): QueryRecord => {
   const cached = cache.get(row);
   if (cached !== undefined) return cached;
   const owned = adoptQueryRecord(visibleRow(row), 'Query result row');
   cache.set(row, owned);
   return owned;
-}));
+};
+
+const publicQueryRows = (rows: readonly ScopedRow[], cache: WeakMap<ScopedRow, QueryRecord>): readonly QueryRecord[] =>
+  Object.freeze(rows.map((row) => publicQueryRow(row, cache)));
 
 const publicQueryIssues = (issues: readonly Issue[]): readonly Issue[] => Object.freeze(issues.map((issue) =>
   adoptJsonValue(issue, 'Query issue') as unknown as Issue
@@ -2032,15 +2120,188 @@ const materializeQueryNode = (
   materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>
 ): MaterializedQueryNode => {
   const materialized = evaluateMaterializedQueryNode(node, snapshot, materializedNodes);
+  if (node.kind === 'from' && !materialized.unavailable && materialized.issues.length === 0) {
+    return { ...materialized, from: indexFromInputs(node, snapshot) };
+  }
   if (node.kind === 'join' && equijoinFields(node) !== undefined && !materialized.unavailable && materialized.issues.length === 0) {
     const left = materializedNodes.get(node.left);
     const right = materializedNodes.get(node.right);
     if (left !== undefined && right !== undefined && !left.unavailable && !right.unavailable) return { ...materialized, join: indexJoinSegments(node, left.result.rows, right.result.rows, materialized.result.rows) };
   }
+  if (node.kind === 'order' && orderCanBeIncrementallyIndexed(node) && !materialized.unavailable && materialized.issues.length === 0) {
+    const child = materializedNodes.get(node.input);
+    if (child !== undefined && child.result.completeness === 'exact') return { ...materialized, order: { inputs: child.result.rows } };
+  }
+  if (node.kind === 'aggregate' && aggregateCanBeIncrementallyIndexed(node) && !materialized.unavailable && materialized.issues.length === 0) {
+    const child = materializedNodes.get(node.input);
+    if (child !== undefined && child.result.completeness === 'exact') {
+      const indexed = indexAggregateState(node, child.result.rows, materialized.result.rows, materializationContext(snapshot, materializedNodes, node, []));
+      if (indexed !== undefined) return { ...materialized, aggregate: indexed };
+    }
+  }
   if (!isLocallyMaintainedNode(node) || materialized.unavailable || materialized.issues.length > 0) return materialized;
   const child = materializedNodes.get(node.input);
   if (child === undefined || child.unavailable || child.result.completeness === 'unknown') return materialized;
   return { ...materialized, local: indexLocalSegments(node, child.result.rows, materialized.result.rows) };
+};
+
+const incrementallyMaterializeOrder = (
+  node: Extract<QueryNode, { readonly kind: 'order' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const child = materializedNodes.get(node.input);
+  if (!orderCanBeIncrementallyIndexed(node) || child === undefined || child.unavailable || child.issues.length > 0 || child.result.completeness !== 'exact' || previous?.order === undefined) {
+    return materializeQueryNode(node, snapshot, materializedNodes);
+  }
+  const issues: Issue[] = [];
+  const context = materializationContext(snapshot, materializedNodes, node, issues);
+  const nextPositions = new Map(child.result.rows.map((row, index) => [row, index]));
+  const previousInputs = new Set(previous.order.inputs);
+  const retained = previous.result.rows.filter((row) => nextPositions.has(row));
+  // Stable sort ties follow input order. Insert/delete preserves the relative
+  // order of retained inputs; an upstream reorder does not, so fall back in
+  // that uncommon case rather than silently changing SQL-style tie semantics.
+  const previousCommon = previous.order.inputs.filter((row) => nextPositions.has(row));
+  const nextCommon = child.result.rows.filter((row) => previousInputs.has(row));
+  if (previousCommon.some((row, index) => row !== nextCommon[index])) return materializeQueryNode(node, snapshot, materializedNodes);
+  const changed = child.result.rows.filter((row) => !previousInputs.has(row));
+  // Repeated array insertion is attractive for sparse changes but quadratic
+  // for bulk replacements. A full stable sort is the safer upper bound once
+  // the changed set is no longer sparse.
+  if (changed.length > Math.max(32, child.result.rows.length >>> 3)) {
+    return materializeQueryNode(node, snapshot, materializedNodes);
+  }
+  const compare = (left: ScopedRow, right: ScopedRow): number => {
+    const semantic = compareOrder(left, right, node.by, context);
+    return semantic !== 0 ? semantic : (nextPositions.get(left) ?? 0) - (nextPositions.get(right) ?? 0);
+  };
+  for (const row of changed) {
+    let low = 0;
+    let high = retained.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (compare(retained[middle] as ScopedRow, row) <= 0) low = middle + 1;
+      else high = middle;
+    }
+    retained.splice(low, 0, row);
+  }
+  if (context.unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+  return { result: { rows: retained, completeness: 'exact' }, issues: [], unavailable: false, order: { inputs: child.result.rows } };
+};
+
+const incrementallyMaterializeAggregate = (
+  node: Extract<QueryNode, { readonly kind: 'aggregate' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const child = materializedNodes.get(node.input);
+  if (!aggregateCanBeIncrementallyIndexed(node) || child === undefined || child.unavailable || child.issues.length > 0 || child.result.completeness !== 'exact' || previous?.aggregate === undefined) {
+    return materializeQueryNode(node, snapshot, materializedNodes);
+  }
+  const issues: Issue[] = [];
+  const context = materializationContext(snapshot, materializedNodes, node, issues);
+  const groups = new Map<string, { key: QueryRecord; members: ScopedRow[]; output?: ScopedRow }>();
+  const groupKeyByRow = new Map<ScopedRow, { readonly canonical: string; readonly key: QueryRecord }>();
+  for (const row of child.result.rows) {
+    const previousIndex = previous.aggregate.groupKeyByRow.get(row);
+    const indexed = previousIndex ?? (() => {
+      const key = projectFields(node.groupBy, exprContext(row, context));
+      return { canonical: canonicalizeQueryValue(key), key };
+    })();
+    groupKeyByRow.set(row, indexed);
+    const group = groups.get(indexed.canonical);
+    if (group === undefined) groups.set(indexed.canonical, { key: indexed.key, members: [row] });
+    else group.members.push(row);
+  }
+  if (groups.size === 0 && Object.keys(node.groupBy).length === 0) groups.set('{}', { key: {}, members: [] });
+  const output: ScopedRow[] = [];
+  const indexedGroups = new Map<string, { readonly key: QueryRecord; readonly members: readonly ScopedRow[]; readonly output: ScopedRow }>();
+  for (const [canonical, group] of groups) {
+    const prior = previous.aggregate.groups.get(canonical);
+    const reusable = prior !== undefined && prior.members.length === group.members.length && prior.members.every((row, index) => row === group.members[index]);
+    const row = reusable ? prior.output : aggregateGroupRow(node, group.key, group.members, context);
+    output.push(row);
+    indexedGroups.set(canonical, { key: group.key, members: group.members, output: row });
+  }
+  if (context.unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+  return { result: { rows: output, completeness: 'exact' }, issues: [], unavailable: false, aggregate: { inputs: child.result.rows, groupKeyByRow, groups: indexedGroups } };
+};
+
+const aggregateGroupRow = (
+  node: Extract<QueryNode, { readonly kind: 'aggregate' }>,
+  key: QueryRecord,
+  members: readonly ScopedRow[],
+  context: QueryContext
+): ScopedRow => {
+  const output: Record<string, QueryLogicalValue> = { ...key };
+  for (const [name, aggregate] of Object.entries(node.measures)) output[name] = aggregateValue(aggregate, members, context);
+  return scopedRow({ [node.alias]: output }, { [node.alias]: { relationId: 'aggregate', occurrence: 'aggregate:' + canonicalizeQueryValue(key) } });
+};
+
+const indexAggregateState = (
+  node: Extract<QueryNode, { readonly kind: 'aggregate' }>,
+  inputs: readonly ScopedRow[],
+  outputs: readonly ScopedRow[],
+  context: QueryContext
+): NonNullable<MaterializedQueryNode['aggregate']> | undefined => {
+  const groupKeyByRow = new Map<ScopedRow, { readonly canonical: string; readonly key: QueryRecord }>();
+  const groups = new Map<string, { key: QueryRecord; members: ScopedRow[]; output?: ScopedRow }>();
+  for (const row of inputs) {
+    const key = projectFields(node.groupBy, exprContext(row, context));
+    const canonical = canonicalizeQueryValue(key);
+    groupKeyByRow.set(row, { canonical, key });
+    const group = groups.get(canonical);
+    if (group === undefined) groups.set(canonical, { key, members: [row] });
+    else group.members.push(row);
+  }
+  if (groups.size === 0 && Object.keys(node.groupBy).length === 0) groups.set('{}', { key: {}, members: [] });
+  if (groups.size !== outputs.length || context.unavailable) return undefined;
+  const indexed = new Map<string, { readonly key: QueryRecord; readonly members: readonly ScopedRow[]; readonly output: ScopedRow }>();
+  [...groups].forEach(([canonical, group], index) => indexed.set(canonical, { key: group.key, members: group.members, output: outputs[index] as ScopedRow }));
+  return { inputs, groupKeyByRow, groups: indexed };
+};
+
+// Building the persistent group index evaluates grouping expressions once in
+// addition to semantic materialization. Built-in expressions are pure; named
+// host calls and subqueries may carry observable work, so keep those on the
+// single-evaluation fallback path.
+const orderCanBeIncrementallyIndexed = (node: Extract<QueryNode, { readonly kind: 'order' }>): boolean =>
+  !node.by.some(({ value }) => containsSubquery(value));
+
+const aggregateCanBeIncrementallyIndexed = (node: Extract<QueryNode, { readonly kind: 'aggregate' }>): boolean => {
+  if (Object.values(node.groupBy).some((expression) => containsSubquery(expression) || containsNamedCall(expression))) return false;
+  return !Object.values(node.measures).some((measure) =>
+    measure.value !== undefined && containsSubquery(measure.value)
+    || measure.orderBy?.some(({ value }) => containsSubquery(value)) === true
+  );
+};
+
+const containsNamedCall = (expression: Expr): boolean => {
+  if (expression.kind === 'call') return true;
+  if (expression.kind === 'literal' || expression.kind === 'parameter' || expression.kind === 'field' || expression.kind === 'key-of' || expression.kind === 'source-of' || expression.kind === 'subquery') return false;
+  if (expression.kind === 'compare' || expression.kind === 'arithmetic') return containsNamedCall(expression.left) || containsNamedCall(expression.right);
+  if (expression.kind === 'is-null' || expression.kind === 'is-missing') return containsNamedCall(expression.value);
+  if (expression.kind === 'boolean') return expression.op === 'not' ? containsNamedCall(expression.arg) : expression.args.some(containsNamedCall);
+  if (expression.kind === 'case') return expression.branches.some(({ when, then }) => containsNamedCall(when) || containsNamedCall(then)) || containsNamedCall(expression.otherwise);
+  if (expression.kind === 'record') return Object.values(expression.fields).some(containsNamedCall);
+  const expressions = expression.kind === 'array' ? expression.items : expression.args;
+  return expressions.some(containsNamedCall);
+};
+
+const indexFromInputs = (
+  node: Extract<QueryNode, { readonly kind: 'from' }>,
+  snapshot: QueryMaintenanceSnapshot
+): NonNullable<MaterializedQueryNode['from']> => {
+  const inputOffsets = new Map<string, number>();
+  let offset = 0;
+  for (const input of groupRelationInputs(snapshot.relations).get(relationKey(node.relation)) ?? []) {
+    inputOffsets.set(relationInputKey(input), offset);
+    offset += input.rows.length;
+  }
+  return { inputOffsets };
 };
 
 const evaluateMaterializedQueryNode = (
@@ -2158,8 +2419,51 @@ const incrementallyMaterializeFrom = (
   previous: MaterializedQueryNode | undefined
 ): MaterializedQueryNode => {
   const inputs = groupRelationInputs(snapshot.relations).get(relationKey(node.relation));
-  if (inputs === undefined || inputs.some(({ completeness }) => completeness === 'unknown') || previous === undefined || previous.unavailable) {
+  if (inputs === undefined || inputs.some(({ completeness }) => completeness === 'unknown')) {
     return evaluateMaterializedQueryNode(node, snapshot, new Map());
+  }
+  if (previous === undefined || previous.unavailable || previous.from === undefined) {
+    const recovered = evaluateMaterializedQueryNode(node, snapshot, new Map());
+    return recovered.unavailable || recovered.issues.length > 0 || recovered.result.completeness === 'unknown'
+      ? recovered
+      : { ...recovered, from: indexFromInputs(node, snapshot) };
+  }
+  const relevantChanges = update.relations.filter(({ relation }) => relationKey(relation) === relationKey(node.relation));
+  const stable = previous.from !== undefined && relevantChanges.every((change) => {
+    if (change.before === undefined || change.after === undefined || change.before.index !== change.after.index) return false;
+    if (!previous.from?.inputOffsets.has(relationInputChangeKey(change))) return false;
+    return change.rows.every((row) => row.before !== undefined && row.after !== undefined && row.before.index === row.after.index);
+  });
+  if (stable) {
+    const rows = previous.result.rows.slice();
+    const changedPositions: number[] = [];
+    for (const change of relevantChanges) {
+      const offset = previous.from?.inputOffsets.get(relationInputChangeKey(change)) as number;
+      for (const row of change.rows) {
+        if (row.before !== undefined && row.after !== undefined && queryValueEqual(row.before.row, row.after.row)) continue;
+        const after = row.after as NonNullable<RelationRowChange['after']>;
+        const occurrence = namespacedOccurrence(change.sourceId ?? change.attachmentId, row.occurrenceId);
+        const position = offset + after.index;
+        rows[position] = scopedRow(
+          { [node.alias]: after.row },
+          { [node.alias]: {
+            ...(change.sourceId === undefined ? {} : { sourceId: change.sourceId }),
+            ...(change.attachmentId === undefined ? {} : { attachmentId: change.attachmentId }),
+            relationId: node.relation.relationId,
+            ...(Object.hasOwn(after.row, 'id') ? { key: after.row.id as JsonValue } : {}),
+            occurrence
+          } }
+        );
+        changedPositions.push(position);
+      }
+    }
+    return {
+      result: { rows, completeness: inputs.some(({ completeness }) => completeness === 'lower-bound') ? 'lower-bound' : 'exact' },
+      issues: [],
+      unavailable: false,
+      stableChangedPositions: [...new Set(changedPositions)].sort((left, right) => left - right),
+      from: previous.from
+    };
   }
   const changed = changedOccurrences(update, node.relation);
   const rows: ScopedRow[] = [];
@@ -2177,8 +2481,19 @@ const incrementallyMaterializeFrom = (
     ));
     outputIndex += 1;
   });
-  return { result: { rows, completeness: inputs.some(({ completeness }) => completeness === 'lower-bound') ? 'lower-bound' : 'exact' }, issues: [], unavailable: false };
+  return {
+    result: { rows, completeness: inputs.some(({ completeness }) => completeness === 'lower-bound') ? 'lower-bound' : 'exact' },
+    issues: [],
+    unavailable: false,
+    from: indexFromInputs(node, snapshot)
+  };
 };
+
+const relationInputChangeKey = (input: RelationInputChange): string =>
+  relationKey(input.relation) + '\u0000' + (input.attachmentId ?? input.sourceId ?? '');
+
+const namespacedOccurrence = (namespace: string | undefined, occurrenceId: string): string =>
+  namespace === undefined ? occurrenceId : namespace.length + ':' + namespace + occurrenceId.length + ':' + occurrenceId;
 
 const changedOccurrences = (update: QueryMaintenanceUpdate, relation: RelationUse): ReadonlySet<string> => {
   const changed = new Set<string>();
@@ -2207,6 +2522,57 @@ const incrementallyMaterializeLocal = (
     return materializeQueryNode(node, snapshot, materializedNodes);
   }
   const oneToOne = isOneToOneLocallyMaintainedNode(node);
+  if (child.stableChangedPositions !== undefined) {
+    const segments = previous.local.segments.slice();
+    const replacements = new Map<number, LocalSegment>();
+    const issues: Issue[] = [];
+    let unavailable = false;
+    let overrides: Map<QueryNode, MaterializedQueryNode> | undefined;
+    for (const index of child.stableChangedPositions) {
+      const row = child.result.rows[index];
+      if (row === undefined) return materializeQueryNode(node, snapshot, materializedNodes);
+      overrides ??= new Map(materializedNodes);
+      overrides.set(node.input, { result: { rows: [row], completeness: child.result.completeness }, issues: [], unavailable: false });
+      const evaluated = evaluateMaterializedQueryNode(node, snapshot, overrides);
+      issues.push(...evaluated.issues);
+      unavailable = unavailable || evaluated.unavailable;
+      replacements.set(index, localSegment(node, evaluated.result.rows));
+    }
+    if (unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+    const widthsChanged = [...replacements].some(([index, segment]) => localSegmentWidth(segment) !== (previous.local?.widths?.[index] ?? 1));
+    for (const [index, segment] of replacements) segments[index] = segment;
+    if (!widthsChanged) {
+      const output = previous.result.rows.slice();
+      const changedOutputPositions: number[] = [];
+      for (const [index, segment] of replacements) {
+        const offset = previous.local.outputOffsets?.[index] ?? index;
+        const replacementRows = localSegmentRows(segment);
+        for (let relative = 0; relative < replacementRows.length; relative += 1) {
+          output[offset + relative] = replacementRows[relative] as ScopedRow;
+          changedOutputPositions.push(offset + relative);
+        }
+      }
+      return {
+        result: { rows: output, completeness: child.result.completeness },
+        issues: [],
+        unavailable: false,
+        stableChangedPositions: changedOutputPositions,
+        local: {
+          inputs: child.result.rows,
+          segments,
+          ...(previous.local.outputOffsets === undefined ? {} : { outputOffsets: previous.local.outputOffsets }),
+          ...(previous.local.widths === undefined ? {} : { widths: previous.local.widths })
+        }
+      };
+    }
+    const indexed = indexLocalSegmentLayout(segments);
+    return {
+      result: { rows: indexed.rows, completeness: child.result.completeness },
+      issues: [],
+      unavailable: false,
+      local: { inputs: child.result.rows, segments, outputOffsets: indexed.outputOffsets, widths: indexed.widths }
+    };
+  }
   // One-to-one operators have exactly one output per input, in input order, so
   // their packed output array is also their segment index. Other local
   // operators only need a separate sparse/variable-width segment array; the
@@ -2246,11 +2612,20 @@ const incrementallyMaterializeLocal = (
     if (!oneToOne) appendLocalSegment(output, next);
   }
   if (unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+  if (oneToOne) {
+    return {
+      result: { rows: output, completeness: child.result.completeness },
+      issues: [],
+      unavailable: false,
+      local: { inputs: child.result.rows, segments }
+    };
+  }
+  const indexed = indexLocalSegmentLayout(segments);
   return {
-    result: { rows: output, completeness: child.result.completeness },
+    result: { rows: indexed.rows, completeness: child.result.completeness },
     issues: [],
     unavailable: false,
-    local: { inputs: child.result.rows, segments }
+    local: { inputs: child.result.rows, segments, outputOffsets: indexed.outputOffsets, widths: indexed.widths }
   };
 };
 
@@ -2275,10 +2650,29 @@ const indexLocalSegments = (
       else (existing as ScopedRow[]).push(row);
     }
   }
-  return { inputs, segments };
+  const indexed = indexLocalSegmentLayout(segments);
+  return { inputs, segments, outputOffsets: indexed.outputOffsets, widths: indexed.widths };
 };
 
 const localSegment = (node: QueryNode, rows: readonly ScopedRow[]): LocalSegment => node.kind === 'unnest' ? rows : rows[0];
+const localSegmentRows = (segment: LocalSegment): readonly ScopedRow[] => segment === undefined ? [] : Array.isArray(segment) ? segment : [segment as ScopedRow];
+const localSegmentWidth = (segment: LocalSegment): number => segment === undefined ? 0 : Array.isArray(segment) ? segment.length : 1;
+const indexLocalSegmentLayout = (segments: readonly LocalSegment[]): {
+  readonly rows: readonly ScopedRow[];
+  readonly outputOffsets: readonly number[];
+  readonly widths: readonly number[];
+} => {
+  const rows: ScopedRow[] = [];
+  const outputOffsets: number[] = [];
+  const widths: number[] = [];
+  for (const segment of segments) {
+    outputOffsets.push(rows.length);
+    const segmentRows = localSegmentRows(segment);
+    widths.push(segmentRows.length);
+    rows.push(...segmentRows);
+  }
+  return { rows, outputOffsets, widths };
+};
 const appendLocalSegment = (output: ScopedRow[], segment: LocalSegment): void => {
   if (segment === undefined) return;
   if (Array.isArray(segment)) output.push(...segment);
@@ -2315,20 +2709,35 @@ const maintainedQueryResult = (
   additionalIssues: readonly Issue[],
   state: IncrementalQueryMaintenanceState,
   publicRows: WeakMap<ScopedRow, QueryRecord>,
-  reusablePublicViews?: IncrementalQueryResult
+  previousPublicViews?: IncrementalQueryResult,
+  reusePublicViews = false
 ): IncrementalQueryResult => {
-  if (reusablePublicViews !== undefined) {
+  if (reusePublicViews && previousPublicViews !== undefined) {
     return Object.freeze({
-      rows: reusablePublicViews.rows,
-      resultKeys: reusablePublicViews.resultKeys,
-      completeness: reusablePublicViews.completeness,
-      issues: reusablePublicViews.issues,
+      rows: previousPublicViews.rows,
+      resultKeys: previousPublicViews.resultKeys,
+      completeness: previousPublicViews.completeness,
+      issues: previousPublicViews.issues,
       state
     });
   }
   const issues = publicQueryIssues(deduplicateQueryIssues([...(root?.issues ?? []), ...additionalIssues]));
   if (root === undefined || root.unavailable || root.result.completeness === 'unknown') {
     return Object.freeze({ rows: Object.freeze([]), resultKeys: Object.freeze([]), completeness: 'unknown', issues, state });
+  }
+  if (root.stableChangedPositions !== undefined && previousPublicViews !== undefined && previousPublicViews.rows.length === root.result.rows.length) {
+    const rows = previousPublicViews.rows.slice();
+    for (const position of root.stableChangedPositions) {
+      const row = root.result.rows[position];
+      if (row !== undefined) rows[position] = publicQueryRow(row, publicRows);
+    }
+    return Object.freeze({
+      rows: Object.freeze(rows),
+      resultKeys: previousPublicViews.resultKeys,
+      completeness: root.result.completeness,
+      issues,
+      state
+    });
   }
   return Object.freeze({
     rows: publicQueryRows(root.result.rows, publicRows),
@@ -2536,6 +2945,17 @@ const diffMaintainedResults = (
   if (nextRoot === undefined || nextRoot.unavailable || nextRoot.result.completeness === 'unknown') return emptyIncrementalQueryResultDelta;
   const beforeRows = previousRoot?.result.rows ?? [];
   const afterRows = nextRoot.result.rows;
+  if (previousRoot !== undefined && nextRoot.stableChangedPositions !== undefined && beforeRows.length === afterRows.length) {
+    const updatedResultKeys = nextRoot.stableChangedPositions.flatMap((index) => {
+      const before = beforeRows[index];
+      const after = afterRows[index];
+      if (before === undefined || after === undefined) return [];
+      return before === after || rowValueIdentity(before, values) === rowValueIdentity(after, values) ? [] : [resultKey(after)];
+    });
+    return updatedResultKeys.length === 0
+      ? emptyIncrementalQueryResultDelta
+      : { addedResultKeys: [], removedResultKeys: [], updatedResultKeys };
+  }
   if (beforeRows.length === afterRows.length && beforeRows.every((row, index) => resultKey(row) === resultKey(afterRows[index] as ScopedRow))) {
     const updatedResultKeys = beforeRows.flatMap((row, index) => {
       const after = afterRows[index] as ScopedRow;

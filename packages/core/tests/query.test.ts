@@ -448,6 +448,72 @@ describe('production query oracle', () => {
     expect(invariantEvaluations).toBe(edgeCount);
   });
 
+  it('matches graph reachability and gives recursive keys stable bounded identities', () => {
+    const edges = [
+      { id: 'a', parentId: 0, targetId: 1 },
+      { id: 'b', parentId: 0, targetId: 2 },
+      { id: 'c', parentId: 1, targetId: 3 },
+      { id: 'd', parentId: 2, targetId: 3 },
+      { id: 'e', parentId: 3, targetId: 4 },
+      { id: 'cycle', parentId: 4, targetId: 0 }
+    ];
+    const recursive: QueryNode = {
+      kind: 'recursive',
+      name: 'reachable',
+      seed: { kind: 'values', alias: 'node', rows: [{ id: 0 }] },
+      step: {
+        kind: 'select',
+        alias: 'node',
+        input: {
+          kind: 'join',
+          join: 'inner',
+          left: { kind: 'recursion-ref', name: 'reachable' },
+          right: from('edges', 'edge'),
+          on: { kind: 'compare', op: 'eq', left: { kind: 'field', alias: 'node', name: 'id' }, right: { kind: 'field', alias: 'edge', name: 'parentId' } }
+        },
+        fields: { id: { kind: 'field', alias: 'edge', name: 'targetId' } }
+      },
+      key: [{ kind: 'field', alias: 'node', name: 'id' }]
+    };
+    const reversedOperands: QueryNode = {
+      ...recursive,
+      step: {
+        kind: 'select',
+        alias: 'node',
+        input: {
+          kind: 'join',
+          join: 'inner',
+          left: from('edges', 'edge'),
+          right: { kind: 'recursion-ref', name: 'reachable' },
+          on: { kind: 'compare', op: 'eq', left: { kind: 'field', alias: 'edge', name: 'parentId' }, right: { kind: 'field', alias: 'node', name: 'id' } }
+        },
+        fields: { id: { kind: 'field', alias: 'edge', name: 'targetId' } }
+      }
+    };
+    const oracle = (source: number): readonly number[] => {
+      const reached = new Set([source]);
+      const frontier = [source];
+      while (frontier.length > 0) {
+        const parent = frontier.shift() as number;
+        for (const edge of edges) if (edge.parentId === parent && !reached.has(edge.targetId)) {
+          reached.add(edge.targetId);
+          frontier.push(edge.targetId);
+        }
+      }
+      return [...reached].sort((left, right) => left - right);
+    };
+    const forward = evaluateQuery({ root: recursive, relations: [relation('edges', edges)] });
+    const reversed = evaluateQuery({ root: recursive, relations: [relation('edges', [...edges].reverse())] });
+    const reversedJoin = evaluateQuery({ root: reversedOperands, relations: [relation('edges', edges)] });
+    const identitiesById = (result: typeof forward): ReadonlyMap<number, string> => new Map(result.rows.map((row, index) => [row.id as number, result.resultKeys[index] as string]));
+
+    expect(forward.rows.map((row) => row.id as number).sort((left, right) => left - right)).toEqual(oracle(0));
+    expect(reversedJoin.rows.map((row) => row.id as number).sort((left, right) => left - right)).toEqual(oracle(0));
+    expect(identitiesById(reversedJoin)).toEqual(identitiesById(forward));
+    expect([...identitiesById(forward)].sort(([left], [right]) => left - right)).toEqual([...identitiesById(reversed)].sort(([left], [right]) => left - right));
+    expect(Math.max(...forward.resultKeys.map((key) => key.length))).toBeLessThan(40);
+  });
+
   it('does not memoize a nested recursion that captures the outer frontier', () => {
     const capturedFrontier: QueryNode = {
       kind: 'recursive',

@@ -163,8 +163,10 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
     minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
     maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') }
   } };
-  measurements.push(benchmark('order', count, iterations, () => evaluateQuery({ root: order, relations })));
-  measurements.push(benchmark('aggregate', count, iterations, () => evaluateQuery({ root: aggregate, relations })));
+  const orderPlan = await plan('order-pure-' + count, order);
+  const aggregatePlan = await plan('aggregate-pure-' + count, aggregate);
+  measurements.push(benchmark('order', count, iterations, () => evaluatePreparedQuery(orderPlan, { relations })));
+  measurements.push(benchmark('aggregate', count, iterations, () => evaluatePreparedQuery(aggregatePlan, { relations })));
   const changedRows = rows.map((row, index) => index === 0 ? { ...row, score: count + 1 } : row);
   const first = { relations };
   const second = { relations: [input('score', changedRows)] };
@@ -205,8 +207,20 @@ for (const [count, iterations] of [[10, 100], [20, 30], [40, 8], [80, 5]]) {
     key: [field('node', 'id')],
     maxIterations: count + 1
   };
+  const reversedRecursive = {
+    ...recursive,
+    step: {
+      kind: 'select',
+      alias: 'node',
+      input: { kind: 'join', join: 'inner', left: from('edge', 'edge'), right: { kind: 'recursion-ref', name: 'nodes' }, on: { kind: 'compare', op: 'eq', left: field('edge', 'parentId'), right: field('node', 'id') } },
+      fields: { id: field('edge', 'targetId') }
+    }
+  };
   const edges = Array.from({ length: count }, (_, id) => ({ id: 'edge-' + id, parentId: id, targetId: id + 1 }));
-  measurements.push(benchmark('recursive-chain', count, iterations, () => evaluateQuery({ root: recursive, relations: [input('edge', edges)] })));
+  const recursivePlan = await plan('recursive-chain-' + count, recursive);
+  const reversedRecursivePlan = await plan('recursive-chain-reversed-' + count, reversedRecursive);
+  measurements.push(benchmark('recursive-chain', count, iterations, () => evaluatePreparedQuery(recursivePlan, { relations: [input('edge', edges)] })));
+  measurements.push(benchmark('recursive-chain-reversed', count, iterations, () => evaluatePreparedQuery(reversedRecursivePlan, { relations: [input('edge', edges)] })));
 }
 
 const pooledMeasurements = [];
@@ -380,12 +394,24 @@ const linearPure10k = measurement('linear-pure', 10_000)?.millisecondsPerOperati
 const linearUpdate10k = measurement('linear-one-row-update', 10_000)?.millisecondsPerOperation;
 const repeatedUnprepared = measurement('repeated-unprepared-pure', 1)?.millisecondsPerOperation;
 const repeatedPrepared = measurement('repeated-prepared-pure', 1)?.millisecondsPerOperation;
+const orderPure10k = measurement('order', 10_000)?.millisecondsPerOperation;
+const orderUpdate10k = measurement('order-one-row-update', 10_000)?.millisecondsPerOperation;
+const aggregatePure10k = measurement('aggregate', 10_000)?.millisecondsPerOperation;
+const aggregateUpdate10k = measurement('aggregate-one-row-update', 10_000)?.millisecondsPerOperation;
+const recursiveChain40 = measurement('recursive-chain', 40)?.millisecondsPerOperation;
+const recursiveChain80 = measurement('recursive-chain', 80)?.millisecondsPerOperation;
+const reversedRecursiveChain40 = measurement('recursive-chain-reversed', 40)?.millisecondsPerOperation;
+const reversedRecursiveChain80 = measurement('recursive-chain-reversed', 80)?.millisecondsPerOperation;
 const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
 const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
 const contracts = {
   repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
   linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
+  orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
+  aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
   preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
+  recursiveChainNearLinear: recursiveChain40 !== undefined && recursiveChain80 !== undefined && recursiveChain80 < recursiveChain40 * 2.75,
+  reversedRecursiveChainNearLinear: reversedRecursiveChain40 !== undefined && reversedRecursiveChain80 !== undefined && reversedRecursiveChain80 < reversedRecursiveChain40 * 2.75,
   unrelatedTraversalSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'unrelated-relation-union-dag').every(({ selectiveVisitedPhysicalNodeCount }) => selectiveVisitedPhysicalNodeCount <= 2),
   privateAllocationCeiling: privateBytesPerUpdate <= 2_000_000,
   pooledAllocationCeiling: pooledBytesPerUpdate <= 20_000_000
