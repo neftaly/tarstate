@@ -10,7 +10,7 @@ import type {
 } from './contracts.js';
 import { MutationStore } from './mutation-store.js';
 import { OptimisticOverlayStore } from './optimistic-store.js';
-import { deepFreezeClone, runReactCleanups } from './shared.js';
+import { runReactCleanups } from './shared.js';
 
 export type Runtime = {
   readonly database: ErasedDatabase;
@@ -63,7 +63,7 @@ export const normalizeServerQueryObservations = <Query, Row>(database: Observabl
   for (const observation of observations) {
     const key = queryObservationKey(database, observation.request);
     if (output.has(key)) throw new Error('Duplicate server observation: ' + key);
-    output.set(key, deepFreezeClone(observation.snapshot));
+    output.set(key, observation.snapshot);
   }
   return output;
 };

@@ -303,6 +303,39 @@ describe('@tarstate/react', () => {
     expect(database.observers).toHaveLength(0);
   });
 
+  it('preserves opaque server row identities without inspecting them', () => {
+    const database = new TestDatabase();
+    let getterReads = 0;
+    class OpaqueRow {
+      readonly id = 8;
+      readonly createdAt = new Date(0);
+      get derived(): string { getterReads += 1; return 'derived'; }
+    }
+    const row = new OpaqueRow();
+    const request: ObserveRequest<Query> = { plan: plan as PreparedPlan<Query> };
+    const serverSnapshot = openSnapshot([row as unknown as Row]);
+    let receivedSnapshot: ReactObserverSnapshot<Row> | undefined;
+    let received: Row | undefined;
+    const Consumer = () => {
+      const snapshot = useQuery(plan);
+      receivedSnapshot = snapshot;
+      received = snapshot.state === 'open' ? snapshot.current.rows[0] : undefined;
+      return null;
+    };
+
+    renderToString(createElement(
+      TarstateProvider,
+      { database, serverQueryObservations: [{ request, snapshot: serverSnapshot }] },
+      createElement(Consumer)
+    ));
+    expect(receivedSnapshot).toBe(serverSnapshot);
+    expect(received).toBe(row);
+    expect(row.createdAt).toBeInstanceOf(Date);
+    expect(Object.isFrozen(row)).toBe(false);
+    expect(getterReads).toBe(0);
+    expect(database.observers).toHaveLength(0);
+  });
+
   it('tracks pending and settled commit state with selectable render suppression', async () => {
     const database = new TestDatabase();
     let resolveCommit: ((receipt: CommitReceipt) => void) | undefined;
@@ -379,7 +412,8 @@ describe('@tarstate/react', () => {
       optimistic: { operations: [{ operationEpoch: 'epoch:one', operationId: 'operation:one', sourceId: 'source:one', sourceBasis: { revision: 0 }, observedBasis: { revision: 0 }, rebased: false }] }
     });
     expect(Object.isFrozen(optimistic)).toBe(true);
-    expect(Object.isFrozen(optimistic?.state === 'open' ? optimistic.current.rows[0] : undefined)).toBe(true);
+    expect(Object.isFrozen(optimistic?.state === 'open' ? optimistic.current.rows : undefined)).toBe(true);
+    expect(Object.isFrozen(optimistic?.state === 'open' ? optimistic.current.resultKeys : undefined)).toBe(true);
     if (optimistic?.state !== 'open' || authoritative?.state !== 'open') throw new Error('expected open snapshots');
     expect(optimistic.lastExact).toBe(authoritative.lastExact);
     expect(optimistic.current.basis).toBe(authoritative.current.basis);
@@ -391,6 +425,44 @@ describe('@tarstate/react', () => {
       resolveCommit?.(commitReceipt());
       await result;
     });
+  });
+
+  it('preserves opaque optimistic row identities without inspecting or freezing them', async () => {
+    const database = new TestDatabase();
+    const commitImplementation = () => new Promise<CommitReceipt>(() => undefined);
+    let getterReads = 0;
+    class OpaqueRow {
+      readonly id = 9;
+      readonly values = new Map([['status', 'pending']]);
+      get derived(): string { getterReads += 1; return 'derived'; }
+    }
+    const row = new OpaqueRow();
+    const projectedRows: Row[] = [row as unknown as Row];
+    const projectedKeys = ['row:opaque'];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    let latest: ReactObserverSnapshot<Row> | undefined;
+    const Consumer = () => { commit = useCommit(); latest = useQuery(plan); return null; };
+    await mount(createElement(TarstateProvider, {
+      database,
+      executeCommit: commitImplementation,
+      createOptimisticOverlay: () => ({
+        sourceId: 'source:one',
+        sourceBasis: { incarnation: 'one', revision: 0 },
+        projectRows: () => ({ rows: projectedRows, resultKeys: projectedKeys })
+      })
+    }, createElement(Consumer)));
+
+    await act(() => { void commit?.(transactionAttempt()); });
+    if (latest?.state !== 'open') throw new Error('expected open snapshot');
+    expect(latest.current.rows[0]).toBe(row);
+    expect(row.values).toBeInstanceOf(Map);
+    expect(Object.isFrozen(row)).toBe(false);
+    expect(Object.isFrozen(latest.current.rows)).toBe(true);
+    expect(getterReads).toBe(0);
+    projectedRows.length = 0;
+    projectedKeys[0] = 'row:mutated';
+    expect(latest.current.rows).toEqual([row]);
+    expect(latest.current.resultKeys).toEqual(['row:opaque']);
   });
 
   it('retains optimistic factory errors without blocking the real commit', async () => {
@@ -453,10 +525,11 @@ describe('@tarstate/react', () => {
     const states: MutationState[] = [];
     let commit: ReturnType<typeof useCommit> | undefined;
     let latest: ReactObserverSnapshot<Row> | undefined;
-    const hostileProjection = Object.defineProperty({}, 'rows', {
+    let getterReads = 0;
+    const hostileProjection = Object.defineProperty({ resultKeys: [] }, 'rows', {
       enumerable: true,
-      get: () => { throw new Error('rows getter escaped'); }
-    }) as OptimisticProjection<Row>;
+      get: () => { getterReads += 1; throw new Error('rows getter escaped'); }
+    }) as unknown as OptimisticProjection<Row>;
     const Consumer = () => {
       commit = useCommit();
       latest = useQuery(plan);
@@ -478,8 +551,72 @@ describe('@tarstate/react', () => {
     expect(latest).not.toHaveProperty('optimistic');
     expect(states.at(-1)).toMatchObject({
       pendingCount: 1,
-      mutations: [{ state: 'pending', optimisticError: { phase: 'projection-result', message: 'rows getter escaped' } }]
+      mutations: [{ state: 'pending', optimisticError: { phase: 'projection-result', message: expect.stringMatching(/rows.*data property/) } }]
     });
+    expect(getterReads).toBe(0);
+  });
+
+  it('rejects hostile optimistic source basis without invoking accessors', async () => {
+    const database = new TestDatabase();
+    let getterReads = 0;
+    const sourceBasis = Object.defineProperty({}, 'revision', {
+      enumerable: true,
+      get: () => { getterReads += 1; return 0; }
+    });
+    const states: MutationState[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); states.push(useMutationState()); return null; };
+    await mount(createElement(TarstateProvider, {
+      database,
+      executeCommit: async () => commitReceipt(),
+      createOptimisticOverlay: () => ({
+        sourceId: 'source:one',
+        sourceBasis: sourceBasis as never,
+        projectRows: ({ currentRows, currentResultKeys }) => ({ rows: currentRows, resultKeys: currentResultKeys })
+      })
+    }, createElement(Consumer)));
+
+    await act(async () => { await commit?.(transactionAttempt()); });
+    expect(states.at(-1)).toMatchObject({
+      pendingCount: 0,
+      mutations: [{ state: 'settled', optimisticError: { phase: 'source-basis' } }]
+    });
+    expect(getterReads).toBe(0);
+  });
+
+  it.each(['sourceId', 'appliesToQuery'] as const)('rejects an optimistic overlay %s accessor without invoking it', async (property) => {
+    const database = new TestDatabase();
+    const commitImplementation = vi.fn(async () => commitReceipt());
+    let getterReads = 0;
+    const definition = {
+      sourceId: 'source:one',
+      sourceBasis: { revision: 0 },
+      appliesToQuery: () => true,
+      projectRows: ({ currentRows, currentResultKeys }: { readonly currentRows: readonly Row[]; readonly currentResultKeys: readonly string[] }) => ({
+        rows: currentRows,
+        resultKeys: currentResultKeys
+      })
+    };
+    Object.defineProperty(definition, property, {
+      enumerable: true,
+      get: () => { getterReads += 1; throw new Error(`${property} getter escaped`); }
+    });
+    const states: MutationState[] = [];
+    let commit: ReturnType<typeof useCommit> | undefined;
+    const Consumer = () => { commit = useCommit(); states.push(useMutationState()); return null; };
+    await mount(createElement(TarstateProvider, {
+      database,
+      executeCommit: commitImplementation,
+      createOptimisticOverlay: () => definition as unknown as ReturnType<CreateOptimisticOverlay<Query, Row>>
+    }, createElement(Consumer)));
+
+    await act(async () => { await commit?.(transactionAttempt()); });
+    expect(commitImplementation).toHaveBeenCalledTimes(1);
+    expect(states.at(-1)).toMatchObject({
+      pendingCount: 0,
+      mutations: [{ state: 'settled', optimisticError: { phase: 'create-overlay', message: expect.stringMatching(new RegExp(property)) } }]
+    });
+    expect(getterReads).toBe(0);
   });
 
   it('recomputes the overlay as a rebase when a newer source basis arrives', async () => {

@@ -1,5 +1,6 @@
 import {
   canonicalizeJson,
+  safeParseJsonValue,
   type JsonValue,
   type ObserveRequest,
   type ObserverDiagnosticReporter,
@@ -16,8 +17,8 @@ import type {
 import type { QueryStore } from './query-store.js';
 import {
   adoptOptimisticProjection,
-  deepFreezeClone,
   errorDetails,
+  freezeOwnedPortable,
   notifyReactListeners,
   runReactCleanups
 } from './shared.js';
@@ -31,6 +32,48 @@ type ActiveOptimisticOverlay = {
   readonly sourceBasis: JsonValue;
   readonly sourceBasisFingerprint: string;
   readonly definition: OptimisticOverlay<unknown, unknown>;
+};
+
+type InspectedOptimisticOverlay = {
+  readonly sourceId: string;
+  readonly sourceBasis: unknown;
+  readonly appliesToQuery?: NonNullable<OptimisticOverlay<unknown, unknown>['appliesToQuery']>;
+  readonly projectRows: OptimisticOverlay<unknown, unknown>['projectRows'];
+};
+
+const inspectOptimisticOverlay = (
+  definition: OptimisticOverlay<unknown, unknown>
+): InspectedOptimisticOverlay => {
+  if (definition === null || typeof definition !== 'object') throw new TypeError('Optimistic overlay must be an object');
+  const descriptors = Object.getOwnPropertyDescriptors(definition);
+  const required = (name: 'sourceId' | 'sourceBasis' | 'projectRows'): unknown => {
+    const descriptor = descriptors[name];
+    if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) {
+      throw new TypeError(`Optimistic overlay ${name} must be an enumerable data property`);
+    }
+    return descriptor.value;
+  };
+  const sourceId = required('sourceId');
+  const sourceBasis = required('sourceBasis');
+  const projectRows = required('projectRows');
+  const appliesDescriptor = descriptors.appliesToQuery;
+  if (typeof sourceId !== 'string' || sourceId.length === 0) throw new TypeError('Optimistic overlay sourceId must be a non-empty string');
+  if (typeof projectRows !== 'function') throw new TypeError('Optimistic overlay projectRows must be a function');
+  if (appliesDescriptor !== undefined && (!appliesDescriptor.enumerable || !('value' in appliesDescriptor))) {
+    throw new TypeError('Optimistic overlay appliesToQuery must be an enumerable data property');
+  }
+  const appliesToQuery = appliesDescriptor === undefined ? undefined : appliesDescriptor.value;
+  if (appliesToQuery !== undefined && typeof appliesToQuery !== 'function') {
+    throw new TypeError('Optimistic overlay appliesToQuery must be a function');
+  }
+  return Object.freeze({
+    sourceId,
+    sourceBasis,
+    projectRows: projectRows as OptimisticOverlay<unknown, unknown>['projectRows'],
+    ...(appliesToQuery === undefined ? {} : {
+      appliesToQuery: appliesToQuery as NonNullable<OptimisticOverlay<unknown, unknown>['appliesToQuery']>
+    })
+  });
 };
 
 const optimisticOverlayError = (
@@ -67,13 +110,21 @@ export class OptimisticOverlayStore {
 
   add(mutationId: number, attempt: TransactionAttempt, definition: OptimisticOverlay<unknown, unknown>): OptimisticUpdateError | undefined {
     if (this.#closed) return undefined;
+    let inspectedDefinition: InspectedOptimisticOverlay;
+    try {
+      inspectedDefinition = inspectOptimisticOverlay(definition);
+    } catch (error) {
+      return { phase: 'create-overlay', ...errorDetails(error) };
+    }
     // Validate the opaque basis now so projection callbacks never receive a
     // host-only or non-canonical value disguised as source evidence.
     let sourceBasis: JsonValue;
     let sourceBasisFingerprint: string;
     try {
-      sourceBasisFingerprint = canonicalizeJson(definition.sourceBasis);
-      sourceBasis = deepFreezeClone(definition.sourceBasis);
+      const parsed = safeParseJsonValue(inspectedDefinition.sourceBasis);
+      if (!parsed.success) throw new TypeError('sourceBasis must be descriptor-safe portable data');
+      sourceBasis = freezeOwnedPortable(parsed.value);
+      sourceBasisFingerprint = canonicalizeJson(sourceBasis);
     } catch (error) {
       return { phase: 'source-basis', ...errorDetails(error) };
     }
@@ -82,10 +133,10 @@ export class OptimisticOverlayStore {
       operationEpoch: attempt.operationEpoch,
       operationId: attempt.operationId,
       attachmentId: attempt.attachmentId,
-      sourceId: definition.sourceId,
+      sourceId: inspectedDefinition.sourceId,
       sourceBasis,
       sourceBasisFingerprint,
-      definition
+      definition: Object.freeze({ ...inspectedDefinition, sourceBasis })
     });
     this.#changed();
     return undefined;

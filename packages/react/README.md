@@ -38,7 +38,11 @@ root.render(
 'last-exact' })` is the explicit opt-in for retained stale evidence during an
 invalidation. `createOptimisticOverlay` may project pending rows for display,
 but overlay errors are recorded in `useMutationState` and never decide the
-authoritative commit outcome.
+authoritative commit outcome. Row values are generic opaque identities: the
+adapter never clones, traverses, or freezes row objects. Live and server
+snapshots are borrowed as immutable evidence, while optimistic projection
+arrays are copied and frozen. Producers must not mutate a published row while
+React can still read it; in-place mutation does not notify React.
 
 For server rendering, pass request/snapshot pairs through
 `serverQueryObservations`; the provider does not open a live observer while

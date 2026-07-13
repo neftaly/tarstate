@@ -25,7 +25,11 @@ export type ReactPreparedPlan<
   Parameters extends Readonly<Record<string, JsonValue>> = Readonly<Record<string, JsonValue>>
 > = TypedPreparedPlan<Query, Row, Parameters>;
 
-/** Request/snapshot pair used as the exact server-render snapshot for one query identity. */
+/**
+ * Request/snapshot pair used as the exact server-render snapshot for one query
+ * identity. The already-immutable snapshot and its generic row values are
+ * borrowed by identity and must not be mutated while the provider can read them.
+ */
 export type ServerQueryObservation<Query = unknown, Row = unknown> = {
   readonly request: ObserveRequest<Query>;
   readonly snapshot: ObserverSnapshot<Row>;
@@ -58,6 +62,10 @@ export type MutationState = {
   readonly mutations: readonly MutationEntry[];
 };
 
+/**
+ * Display-only projection. React owns the returned arrays but preserves each
+ * generic row as an opaque identity; callers must not mutate a returned row.
+ */
 export type OptimisticProjection<Row> = {
   readonly rows: readonly Row[];
   readonly resultKeys: readonly string[];

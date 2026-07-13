@@ -14,7 +14,7 @@ import type {
   OptimisticUpdateError
 } from './contracts.js';
 import type { OptimisticOverlayStore } from './optimistic-store.js';
-import { deepFreezeClone, errorDetails, notifyReactListeners } from './shared.js';
+import { deepFreezeDataClone, errorDetails, freezeOwnedPortable, notifyReactListeners } from './shared.js';
 
 const emptyMutationState: MutationState = Object.freeze({ pendingCount: 0, mutations: Object.freeze([]) });
 const maxRetainedMutations = 100;
@@ -67,12 +67,6 @@ const adoptTransactionAttempt = (input: TransactionAttempt): TransactionAttempt 
     ...(expectedBasis === undefined ? {} : { expectedBasis: freezeOwnedPortable(expectedBasis) }),
     ...(signalDescriptor === undefined || signalDescriptor.value === undefined ? {} : { signal: signalDescriptor.value as AbortSignal })
   });
-};
-
-const freezeOwnedPortable = (value: JsonValue): JsonValue => {
-  if (value === null || typeof value !== 'object') return value;
-  for (const member of Array.isArray(value) ? value : Object.values(value)) freezeOwnedPortable(member);
-  return Object.freeze(value);
 };
 
 export class MutationStore {
@@ -154,7 +148,7 @@ export class MutationStore {
 
   #replace(entry: MutationEntry): void {
     if (this.#closed) return;
-    const replaced = [...this.#snapshot.mutations.filter(({ mutationId }) => mutationId !== entry.mutationId), deepFreezeClone(entry)];
+    const replaced = [...this.#snapshot.mutations.filter(({ mutationId }) => mutationId !== entry.mutationId), deepFreezeDataClone(entry)];
     // Pending operations are evidence, not history: retain them until their promise settles.
     const pending = replaced.filter(({ state }) => state === 'pending');
     const settled = replaced.filter(({ state }) => state !== 'pending').slice(-maxRetainedMutations);

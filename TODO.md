@@ -10,9 +10,6 @@ justifies its conversion and bundle costs.
 
 ## Cross-cutting hot paths
 
-- [ ] Make React's generic row ownership contract explicit: either require
-  portable rows and validate them, or preserve opaque row identity. Generic
-  deep cloning can corrupt `Map`, `Date`, and class values and can invoke getters.
 - [ ] Remove repeated deep clone-and-freeze passes over graphs that are already
   owned and immutable; prefer one boundary adoption followed by shallow frozen
   wrappers and shared references.

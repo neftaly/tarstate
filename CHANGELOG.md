@@ -1,10 +1,11 @@
 # Changelog
 
 Notable changes to Tarstate are recorded here. Dates use the repository's Git
-history; the current `0.3.0` package version remains unreleased until it is
-tagged.
+history.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-07-13
 
 ### Changed
 
@@ -23,6 +24,8 @@ tagged.
   entry points.
 - Added an executable, release-gated end-to-end quickstart and direct tarball
   installation guidance for every public package.
+- React now preserves generic row values as opaque identities across live,
+  server, and optimistic snapshots while owning optimistic container arrays.
 
 ## [0.2.2] - 2026-07-12
 
@@ -53,7 +56,8 @@ tagged.
 - Hardened relational, source, transaction, typed-query, and differential
   maintenance contracts for the v1 architecture.
 
-[Unreleased]: https://github.com/neftaly/tarstate/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/neftaly/tarstate/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/neftaly/tarstate/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/neftaly/tarstate/compare/c324fdb...v0.2.2
 [0.2.1]: https://github.com/neftaly/tarstate/compare/v0.2.0...c324fdb
 [0.2.0]: https://github.com/neftaly/tarstate/releases/tag/v0.2.0
