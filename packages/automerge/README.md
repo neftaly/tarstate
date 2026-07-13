@@ -5,10 +5,58 @@ The Automerge source and storage bindings for Tarstate v1.
 This package depends on `@tarstate/core` and reports adapter-specific
 projection and conflict guarantees through portable receipts and capabilities.
 
+Install both Tarstate tarballs and the Automerge package imported by application
+code:
+
+```sh
+npm install \
+  ./tarstate-core-0.3.0.tgz \
+  ./tarstate-automerge-0.3.0.tgz \
+  @automerge/automerge
+```
+
 `AutomergeMapProjectionPlanner` is the pure map projection/edit-planning
 kernel. `AutomergeMapStorageBinding` adapts that kernel to core's
 `StorageBinding` protocol, and `AutomergeAtomicSource` is the atomic source
 shell.
+
+## Usage
+
+```ts
+import * as Automerge from '@automerge/automerge';
+import {
+  AutomergeAtomicSource,
+  AutomergeMapStorageBinding,
+  AutomergeSourceRuntime
+} from '@tarstate/automerge';
+
+type TaskDoc = {
+  readonly tasks: Readonly<Record<string, { readonly title: string }>>;
+};
+
+const doc = Automerge.from<TaskDoc>({ tasks: { first: { title: 'First' } } });
+const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc });
+const source = new AutomergeAtomicSource({
+  runtime,
+  operationEpoch: 'session:one',
+  ownsRuntime: true
+});
+const binding = new AutomergeMapStorageBinding({
+  id: 'binding:tasks',
+  relationId: 'tasks',
+  collectionPath: ['tasks'],
+  missingCollection: 'invalid',
+  keySource: 'map-key'
+});
+
+const projection = binding.project(source.snapshot());
+console.log(projection.rows.map(row => row.fields));
+source.close();
+```
+
+Keep one `AutomergeSourceRuntime` per live document. Set `ownsRuntime: true` only
+when closing the atomic source should also close that runtime; otherwise close
+or release the runtime through its host owner.
 
 ## Automerge Repo compatibility
 

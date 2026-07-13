@@ -1,7 +1,7 @@
 import { canonicalizeJson } from './artifacts.js';
 import { comparePortableStrings } from './portable-order.js';
 import { logicalUnknown, type JsonValue } from './value.js';
-import type { QueryLogicalValue } from './query.js';
+import type { QueryLogicalValue } from './query-model.js';
 
 /** Deterministic ordering for every portable query value, including unlike JSON kinds. */
 export const compareQueryJsonValuesTotal = (left: JsonValue, right: JsonValue): number => {

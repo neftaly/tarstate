@@ -15,7 +15,7 @@ import type {
   RelationInputChange,
   RelationRowChange,
   RelationUse
-} from './query.js';
+} from './query-model.js';
 
 export const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
   const parsed = safeParseJsonValue(root, { ...defaultValueParseBudget, maxDepth: 1_024 });

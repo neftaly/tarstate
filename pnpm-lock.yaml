@@ -29,6 +29,9 @@ importers:
 
   .:
     devDependencies:
+      '@tarstate/core':
+        specifier: workspace:*
+        version: link:packages/core
       '@types/node':
         specifier: 'catalog:'
         version: 24.13.2

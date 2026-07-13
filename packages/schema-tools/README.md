@@ -3,19 +3,29 @@
 Deterministic schema, issue-catalog, and authority-filtered database-description
 artifacts for Tarstate v1 tooling and agents.
 
+Install both downloaded Tarstate tarballs:
+
+```sh
+npm install \
+  ./tarstate-core-0.3.0.tgz \
+  ./tarstate-schema-tools-0.3.0.tgz
+```
+
 ```ts
+import { writeFile } from 'node:fs/promises'
 import { describeDatabase, generateSchemaOutputs } from '@tarstate/schema-tools'
 
 const description = await describeDatabase(database)
 const generated = await generateSchemaOutputs(schemaArtifact)
 
 if (!generated.success) throw new Error(generated.issues[0]?.code)
+console.log(description.databaseFingerprint)
 
-await writeOutputs({
-  'schema.d.ts': generated.value.typescript,
-  'schema.json': generated.value.jsonSchemaText,
-  'schema.md': generated.value.markdown,
-})
+await Promise.all([
+  writeFile('schema.d.ts', generated.value.typescript),
+  writeFile('schema.json', generated.value.jsonSchemaText),
+  writeFile('schema.md', generated.value.markdown),
+])
 ```
 
 `describeDatabase` accepts either an already authority-filtered

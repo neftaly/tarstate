@@ -1,13 +1,10 @@
-import { canonicalizeJson, type ArtifactRef } from './artifacts.js';
-import { createIssue, type CapabilityRef, type Issue } from './issues.js';
-import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
+import { canonicalizeJson } from './artifacts.js';
+import { createIssue, type Issue } from './issues.js';
+import { logicalAnd, logicalOr, logicalUnknown, type JsonValue, type LogicalTruth } from './value.js';
 import { preparePlan, type PreparedPlan } from './maintenance.js';
 import { assertPreparedPlan, hasOwnedPreparedQuery } from './internal-prepared-plan.js';
-import { assertPreparedExpression, sealPreparedExpression } from './internal-prepared-expression.js';
 import { comparePortableStrings } from './portable-order.js';
-import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import {
-  adoptExpressionScope,
   adoptFunctionRegistry,
   adoptJsonRecord,
   adoptJsonValue,
@@ -15,363 +12,73 @@ import {
   adoptQueryMaintenanceUpdate,
   adoptQueryRecord,
   adoptQueryRequest,
-  cloneAndFreezeExpression,
-  cloneAndFreezeQueryAst,
-  freezePortableValue
+  cloneAndFreezeQueryAst
 } from './internal-query-ownership.js';
-import { canonicalizeQueryValue, compareQueryJsonValues, compareQueryJsonValuesTotal, containsQueryLogicalUnknown, queryValueEqual } from './internal-query-values.js';
+import { canonicalizeQueryValue, compareQueryJsonValuesTotal, queryValueEqual } from './internal-query-values.js';
+import {
+  evaluateExpression,
+  evaluatePreparedExpression,
+  evaluateQueryExpression as evaluateExpr,
+  expressionJson,
+  knownExpression as known,
+  prepareExpression,
+  projectExpressionFields as projectFields,
+  type QueryExpressionContext as EvalContext,
+  type QueryExpressionResult as ExpressionResult,
+  type QueryExpressionRuntime
+} from './internal-query-expression.js';
+import { sameExecutionBudget, sameFunctionRegistry, sameOptionalJson } from './internal-query-equality.js';
+import {
+  emptyOperatorDiagnostics,
+  summarizeOperatorEvents,
+  type QueryMaintenanceOperatorEvent
+} from './internal-query-maintenance-diagnostics.js';
+import { diffQueryMaintenanceSnapshots } from './query-maintenance-diff.js';
+import {
+  groupRelationInputs,
+  indexedRelationInputs,
+  relationInputKey,
+  relationKey,
+  relationOccurrence,
+  type IndexedRelationInput
+} from './internal-query-relations.js';
+import type {
+  AggregateExpr,
+  Completeness,
+  Expr,
+  FunctionRegistry,
+  IncrementalQueryMaintenanceSession,
+  IncrementalQueryMaintenanceState,
+  IncrementalQueryResult,
+  IncrementalQueryResultDelta,
+  OrderTerm,
+  PooledIncrementalQueryDiagnostics,
+  PooledIncrementalQueryEnvironment,
+  PooledIncrementalQueryRoot,
+  PooledIncrementalQueryRuntime,
+  PreparedQueryRequest,
+  QueryCursor,
+  QueryLogicalValue,
+  QueryMaintenanceFallbackReason,
+  QueryMaintenanceSnapshot,
+  QueryMaintenanceUpdate,
+  QueryNode,
+  QueryRecord,
+  QueryRequest,
+  QueryResult,
+  RelationInput,
+  RelationInputChange,
+  RelationRowChange,
+  RelationUse,
+  WindowExpr
+} from './query-model.js';
 
-/** `lower-bound` contains only proven rows; `unknown` withdraws the current row assertion. */
-export type Completeness = 'exact' | 'lower-bound' | 'unknown';
-export type QueryLogicalValue = null | boolean | number | string | LogicalUnknown | readonly QueryLogicalValue[] | { readonly [key: string]: QueryLogicalValue };
-export type QueryRecord = Readonly<Record<string, QueryLogicalValue>>;
-
-export type RelationUse = { readonly schemaView: ArtifactRef; readonly relationId: string };
-export type RelationInput = {
-  readonly relation: RelationUse;
-  readonly rows: readonly QueryRecord[];
-  /** Stable base-row occurrence identities within this attachment input. */
-  readonly occurrenceIds?: readonly string[];
-  readonly completeness: Completeness;
-  readonly sourceId?: string;
-  readonly attachmentId?: string;
-  readonly basis?: JsonValue;
-};
-
-export type QueryFunction = (args: readonly JsonValue[]) => JsonValue;
-export type FunctionRegistry = ReadonlyMap<string, QueryFunction>;
-
-export type Expr =
-  | { readonly kind: 'literal'; readonly value: JsonValue }
-  | { readonly kind: 'parameter'; readonly name: string }
-  | { readonly kind: 'field'; readonly alias: string; readonly name: string }
-  | { readonly kind: 'compare'; readonly op: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte'; readonly left: Expr; readonly right: Expr }
-  | { readonly kind: 'boolean'; readonly op: 'and' | 'or'; readonly args: readonly Expr[] }
-  | { readonly kind: 'boolean'; readonly op: 'not'; readonly arg: Expr }
-  | { readonly kind: 'arithmetic'; readonly op: 'add' | 'subtract' | 'multiply' | 'divide' | 'modulo'; readonly left: Expr; readonly right: Expr }
-  | { readonly kind: 'string'; readonly op: 'concat'; readonly args: readonly Expr[] }
-  | { readonly kind: 'string'; readonly op: 'lower' | 'upper' | 'length'; readonly args: readonly [Expr] }
-  | { readonly kind: 'array'; readonly items: readonly Expr[] }
-  | { readonly kind: 'record'; readonly fields: Readonly<Record<string, Expr>> }
-  | { readonly kind: 'case'; readonly branches: readonly { readonly when: Expr; readonly then: Expr }[]; readonly otherwise: Expr }
-  | { readonly kind: 'coalesce'; readonly args: readonly Expr[] }
-  | { readonly kind: 'call'; readonly capability: CapabilityRef; readonly args: readonly Expr[] }
-  | { readonly kind: 'subquery'; readonly mode: 'scalar' | 'exists'; readonly query: QueryNode }
-  | { readonly kind: 'is-null'; readonly value: Expr }
-  | { readonly kind: 'is-missing'; readonly value: Expr }
-  | { readonly kind: 'key-of'; readonly alias: string }
-  | { readonly kind: 'source-of'; readonly alias: string };
-
-export type AggregateExpr = {
-  readonly kind: 'aggregate';
-  readonly op: 'count' | 'count-distinct' | 'sum' | 'average' | 'minimum' | 'maximum' | 'any' | 'every' | 'collect' | 'first' | 'last';
-  readonly value?: Expr;
-  readonly orderBy?: readonly OrderTerm[];
-};
-
-export type OrderTerm = { readonly value: Expr; readonly direction: 'asc' | 'desc'; readonly nulls?: 'first' | 'last' };
-
-export type WindowExpr = {
-  readonly kind: 'window';
-  readonly op: 'row-number' | 'rank' | 'lag';
-  readonly value?: Expr;
-  readonly offset?: number;
-  readonly partitionBy?: readonly Expr[];
-  readonly orderBy: readonly OrderTerm[];
-};
-
-/** Portable relational query AST with bag semantics and hidden occurrence identity. Recursive bodies must be monotone with exactly one structural recursion reference. Unmatched left-join fields are missing, never synthesized as null. */
-export type QueryNode =
-  | { readonly kind: 'from'; readonly relation: RelationUse; readonly alias: string }
-  | { readonly kind: 'values'; readonly alias: string; readonly rows: readonly Readonly<Record<string, JsonValue>>[] }
-  | { readonly kind: 'where'; readonly input: QueryNode; readonly predicate: Expr }
-  | { readonly kind: 'select'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, Expr>> }
-  | { readonly kind: 'with-fields'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, Expr>> }
-  | { readonly kind: 'rename'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, string>> }
-  | { readonly kind: 'omit'; readonly input: QueryNode; readonly alias: string; readonly fields: readonly string[] }
-  | { readonly kind: 'unnest'; readonly input: QueryNode; readonly expression: Expr; readonly alias: string; readonly field: string }
-  | { readonly kind: 'join'; readonly join: 'inner' | 'cross' | 'left' | 'semi' | 'anti'; readonly left: QueryNode; readonly right: QueryNode; readonly on?: Expr }
-  | { readonly kind: 'aggregate'; readonly input: QueryNode; readonly alias: string; readonly groupBy: Readonly<Record<string, Expr>>; readonly measures: Readonly<Record<string, AggregateExpr>> }
-  | { readonly kind: 'distinct'; readonly input: QueryNode }
-  | { readonly kind: 'set'; readonly op: 'union' | 'union-all' | 'intersect' | 'except'; readonly left: QueryNode; readonly right: QueryNode }
-  | { readonly kind: 'order'; readonly input: QueryNode; readonly by: readonly OrderTerm[] }
-  | { readonly kind: 'slice'; readonly input: QueryNode; readonly offset?: number; readonly limit?: number }
-  | { readonly kind: 'window'; readonly input: QueryNode; readonly alias: string; readonly fields: Readonly<Record<string, WindowExpr>> }
-  | { readonly kind: 'seek'; readonly input: QueryNode; readonly by: readonly OrderTerm[]; readonly after: QueryCursor }
-  | { readonly kind: 'recursion-ref'; readonly name: string }
-  | { readonly kind: 'recursive'; readonly name: string; readonly seed: QueryNode; readonly step: QueryNode; readonly key: readonly Expr[]; readonly maxIterations?: number; readonly maxRows?: number };
-
-/** Basis-bound seek position. Cursors reject basis or dataset-membership drift. */
-export type QueryCursor = {
-  readonly order: readonly JsonValue[];
-  readonly resultKey: string;
-  readonly basis: JsonValue;
-  readonly membershipRevision: number;
-  readonly mode: 'live';
-};
-
-export type QueryRequest = {
-  readonly root: QueryNode;
-  readonly relations: readonly RelationInput[];
-  readonly parameters?: Readonly<Record<string, JsonValue>>;
-  readonly functions?: FunctionRegistry;
-  readonly basis?: JsonValue;
-  readonly membershipRevision?: number;
-  readonly executionBudget?: QueryExecutionBudget;
-};
-
-/**
- * Optional deterministic work limit. One unit is charged for each expression
- * node, visited scan-operator input, join candidate, sort comparison, recursion
- * iteration/admission, and output row produced by an evaluated physical node.
- * The counter resets for each evaluation, update, or pooled attachment.
- * `maxWorkUnits` must be a nonnegative safe integer; zero permits no charged
- * work. Omission preserves unlimited execution.
- */
-export type QueryExecutionBudget = { readonly maxWorkUnits: number };
-
-/** Changing inputs for repeated evaluation of an already prepared query. */
-export type PreparedQueryRequest = Omit<QueryRequest, 'root'>;
-
-declare const preparedExpressionBrand: unique symbol;
-/** Owned expression syntax accepted by the prepared scalar evaluator. */
-export type PreparedExpression = {
-  readonly [preparedExpressionBrand]: true;
-  readonly expression: Expr;
-};
-
-/** Pure query result. `resultKeys` are stable occurrence identities and grant no write authority. */
-export type QueryResult = {
-  readonly rows: readonly QueryRecord[];
-  readonly resultKeys: readonly string[];
-  readonly completeness: Completeness;
-  readonly issues: readonly Issue[];
-};
-
-/** Initial session state. Every non-empty relation requires unique occurrence IDs. */
-export type QueryMaintenanceSnapshot = {
-  readonly relations: readonly RelationInput[];
-  readonly parameters?: Readonly<Record<string, JsonValue>>;
-  readonly functions?: FunctionRegistry;
-  readonly basis?: JsonValue;
-  readonly membershipRevision?: number;
-  /** Fixed for the lifetime of a maintenance session; reset for each update. */
-  readonly executionBudget?: QueryExecutionBudget;
-};
-
-export type RelationRowChange = {
-  /** Source-local stable occurrence identity. */
-  readonly occurrenceId: string;
-  /** Required proof of the accepted row being replaced or removed. */
-  readonly before?: { readonly index: number; readonly row: QueryRecord };
-  /** New row and its exact position; omitted for removal. */
-  readonly after?: { readonly index: number; readonly row: QueryRecord };
-};
-
-export type RelationInputChange = {
-  readonly relation: RelationUse;
-  readonly sourceId?: string;
-  readonly attachmentId?: string;
-  readonly before?: { readonly index: number; readonly completeness: Completeness; readonly basis?: JsonValue };
-  readonly after?: { readonly index: number; readonly completeness: Completeness; readonly basis?: JsonValue };
-  readonly rows: readonly RelationRowChange[];
-};
-
-/** Exact occurrence-keyed change from one accepted maintenance basis to the next. */
-export type QueryMaintenanceUpdate = {
-  /** Optimistic evidence for the currently accepted dataset/source basis. */
-  readonly expectedBasis?: JsonValue;
-  /** Evidence attached to the state after applying this update. */
-  readonly basis?: JsonValue;
-  readonly expectedMembershipRevision?: number;
-  readonly membershipRevision?: number;
-  readonly relations: readonly RelationInputChange[];
-};
-
-/**
- * Occurrence-identity changes from the previously accepted result to the
- * current available exact or lower-bound materialization. Each array should be
- * consumed as a set; ordering is deterministic but is not a public sorting
- * guarantee.
- *
- * - `addedResultKeys`: identities absent before and asserted by the new result.
- * - `removedResultKeys`: identities asserted before and absent from the new result.
- * - `updatedResultKeys`: retained identities whose visible row value changed.
- *
- * Rejected updates and invalidation to unknown completeness report empty arrays:
- * withdrawing an assertion does not prove that its rows were removed. Recovery
- * from an unknown result republishes the recovered identities as additions.
- */
-export type IncrementalQueryResultDelta = {
-  readonly addedResultKeys: readonly string[];
-  readonly removedResultKeys: readonly string[];
-  readonly updatedResultKeys: readonly string[];
-};
-
-/**
- * Physical operator families reported by incremental-maintenance diagnostics.
- *
- * The corresponding diagnostics record contains every operator in this union,
- * including operators with all-zero counters. New operator families may be
- * added in a future release, so persisted or remotely transported diagnostics
- * should be decoded as telemetry rather than as a versioned wire format.
- */
-export type QueryMaintenanceOperator = 'local' | 'join' | 'distinct' | 'order' | 'aggregate' | 'window' | 'slice' | 'set';
-
-/**
- * Why an evaluated physical node used semantic rematerialization. The set may
- * grow as new fallback boundaries become observable; branch defensively when
- * diagnostics cross package-version or process boundaries.
- */
-export type QueryMaintenanceFallbackReason = 'unsupported_expression' | 'state_unavailable' | 'input_unavailable' | 'unstable_layout' | 'evaluation_unavailable';
-
-/**
- * Per-operator telemetry for one maintenance transition.
- *
- * Each evaluated physical node contributes to exactly one strategy count:
- * `selectiveNodeCount` when a subset was maintained, `fullNodeCount` when the
- * operator's full-input path ran, or `fallbackNodeCount` when semantic
- * rematerialization ran. These are operational observations, not correctness
- * or complexity guarantees; thresholds and chosen strategies may evolve.
- *
- * `affectedUnitCount` is the sum of the logical affected scope reported by
- * those nodes. It is not a count of CPU operations. Its unit depends on the
- * operator and strategy:
- *
- * - `local`: input row/segment positions evaluated or changed.
- * - `join`: left-row segments evaluated (including those affected by a
- *   right-side change).
- * - `distinct`: distinct value classes for selective maintenance; input rows
- *   for full maintenance.
- * - `order`: changed/new input rows that selected the maintenance path.
- * - `aggregate`: changed input positions for selective maintenance; input rows
- *   for full maintenance.
- * - `window`: row positions whose window output was targeted or recomputed.
- * - `slice`: changed output positions for selective maintenance.
- * - `set`: changed output positions for selective maintenance.
- *
- * A fallback reports the best available affected scope in that operator's
- * units, commonly the available input cardinality or the positions that
- * triggered fallback; it may be zero when the input itself is unavailable.
- *
- * Consequently, `affectedUnitCount` is useful for comparing like-for-like
- * transitions of one operator, but must not be summed across operator families
- * as a normalized cost metric.
- */
-export type QueryOperatorMaintenanceDiagnostics = {
-  /** Evaluated physical nodes that maintained a subset of their input. */
-  readonly selectiveNodeCount: number;
-  /** Evaluated physical nodes that ran their operator-specific full path. */
-  readonly fullNodeCount: number;
-  /** Evaluated physical nodes that used semantic rematerialization. */
-  readonly fallbackNodeCount: number;
-  /** Operator-specific affected units, as defined on this type. */
-  readonly affectedUnitCount: number;
-  /**
-   * Persistent maintenance-index compactions performed in this transition,
-   * excluding DAG garbage collection. One node may compact multiple indexes.
-   */
-  readonly compactionCount: number;
-  /**
-   * Sparse histogram of reasons for fallback nodes in this transition. Counts
-   * sum to `fallbackNodeCount`; reasons with zero occurrences are omitted.
-   */
-  readonly fallbackReasons: Readonly<Partial<Record<QueryMaintenanceFallbackReason, number>>>;
-};
-
-/**
- * Complete, frozen diagnostics for the current operator set. Every key is
- * present and has zero-valued counters when no node of that family ran.
- */
-export type QueryMaintenanceOperatorDiagnostics = Readonly<Record<QueryMaintenanceOperator, QueryOperatorMaintenanceDiagnostics>>;
-
-/** Observable evidence that the stateful operator graph handled an update incrementally. */
-export type IncrementalQueryMaintenanceState = {
-  readonly strategy: 'differential-operator-graph';
-  readonly revision: number;
-  readonly materializedNodeCount: number;
-  readonly updatedNodeCount: number;
-  readonly changedNodeCount: number;
-  readonly changedRelationIds: readonly string[];
-  readonly resultDelta: IncrementalQueryResultDelta;
-  readonly rejectedUpdateCount: number;
-  /**
-   * Physical operator decisions for the transition that produced this result.
-   * The record is reset on every accepted or rejected `applyUpdate`; the
-   * initial result contains zero counters. Counts contain no keys or row values.
-   */
-  readonly operatorDiagnostics: QueryMaintenanceOperatorDiagnostics;
-};
-
-export type IncrementalQueryResult = QueryResult & { readonly state: IncrementalQueryMaintenanceState };
-
-export interface IncrementalQueryMaintenanceSession {
-  getCurrentResult(): IncrementalQueryResult;
-  /** Applies one exact change against the last accepted basis; malformed or stale changes are rejected without mutating accepted state. */
-  applyUpdate(update: QueryMaintenanceUpdate): IncrementalQueryResult;
-  /** Idempotent; closure requested during an update is applied after that update completes. */
-  close(): void;
-}
-
-/** Fixed execution environment for one conservative shared physical query DAG. */
-export type PooledIncrementalQueryEnvironment = {
-  readonly runtimeIdentity: string;
-  readonly registryFingerprint: string;
-  readonly authorityFingerprint: string;
-  readonly datasetId: string;
-  readonly parameters?: Readonly<Record<string, JsonValue>>;
-  readonly functions?: FunctionRegistry;
-  readonly executionBudget?: QueryExecutionBudget;
-};
-
-/** Frozen physical counters for the pooled DAG, independent of any logical root. */
-export type PooledIncrementalQueryDiagnostics = {
-  readonly strategy: 'pooled-differential-operator-dag';
-  readonly runtimeIdentity: string;
-  readonly revision: number;
-  readonly activeRootCount: number;
-  readonly physicalNodeCount: number;
-  readonly sharedPhysicalNodeCount: number;
-  readonly lastUpdatedPhysicalNodeCount: number;
-  readonly lastChangedPhysicalNodeCount: number;
-  readonly lastCollectedPhysicalNodeCount: number;
-  readonly rejectedUpdateCount: number;
-  /**
-   * Decisions for the last runtime update across distinct evaluated physical
-   * nodes. Each shared node is counted once, not once per attached root.
-   * Runtime lifecycle operations (`attach`, root closure, runtime closure)
-   * reset this record to zero counters, as does a rejected update with no node
-   * evaluation. Per-root result diagnostics instead count the evaluated nodes
-   * reachable by that root.
-   */
-  readonly operatorDiagnostics: QueryMaintenanceOperatorDiagnostics;
-};
-
-export interface PooledIncrementalQueryRoot {
-  getCurrentResult(): IncrementalQueryResult;
-  /** Idempotent; closure requested during an update is applied after that update completes. */
-  close(): void;
-}
-
-/**
- * Explicit multi-root runtime. Exact portable subtrees are interned; seek,
- * recursion, and expression-subquery graphs remain isolated in v1.
- */
-export interface PooledIncrementalQueryRuntime {
-  /** Attaches a root while idle; attachment during an update is rejected. */
-  attach(plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot;
-  /** Applies one update synchronously; recursive application is rejected. */
-  applyUpdate(update: QueryMaintenanceUpdate): void;
-  getDiagnostics(): PooledIncrementalQueryDiagnostics;
-  /** Idempotent; closure requested during an update is applied after that update completes. */
-  close(): void;
-}
+export type * from './query-model.js';
+export { diffQueryMaintenanceSnapshots, evaluateExpression, evaluatePreparedExpression, prepareExpression };
 
 type Provenance = { readonly sourceId?: string; readonly attachmentId?: string; readonly relationId: string; readonly key?: JsonValue; readonly occurrence: string };
 type ScopedRow = { readonly scope: Readonly<Record<string, QueryRecord>>; readonly provenance: Readonly<Record<string, Provenance>>; readonly identity: string; readonly origin?: string };
 type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: Completeness };
-type ExpressionResult = { readonly status: 'known'; readonly value: JsonValue } | { readonly status: 'missing' | 'unknown' | 'indeterminate' | 'unavailable' };
-type EvalContext = { readonly row: ScopedRow; readonly parameters: Readonly<Record<string, JsonValue>>; readonly functions: FunctionRegistry; readonly issues: Issue[]; readonly query?: QueryContext };
 type QueryContext = {
   readonly relations: ReadonlyMap<string, readonly RelationInput[]>;
   readonly parameters: Readonly<Record<string, JsonValue>>;
@@ -392,54 +99,6 @@ type QueryContext = {
 };
 
 type QueryWork = { readonly limit: number; used: number; exhausted: boolean };
-type QueryMaintenanceOperatorEvent = {
-  readonly operator: QueryMaintenanceOperator;
-  readonly strategy: 'selective' | 'full' | 'fallback';
-  readonly affectedUnitCount: number;
-  readonly compactionCount?: number;
-  readonly reason?: QueryMaintenanceFallbackReason;
-};
-
-const operatorKinds: readonly QueryMaintenanceOperator[] = ['local', 'join', 'distinct', 'order', 'aggregate', 'window', 'slice', 'set'];
-const emptyQueryOperatorMaintenanceDiagnostics: QueryOperatorMaintenanceDiagnostics = Object.freeze({
-  selectiveNodeCount: 0,
-  fullNodeCount: 0,
-  fallbackNodeCount: 0,
-  affectedUnitCount: 0,
-  compactionCount: 0,
-  fallbackReasons: Object.freeze({})
-});
-const emptyQueryMaintenanceOperatorDiagnostics = Object.freeze(Object.fromEntries(
-  operatorKinds.map((operator) => [operator, emptyQueryOperatorMaintenanceDiagnostics])
-)) as QueryMaintenanceOperatorDiagnostics;
-const emptyOperatorDiagnostics = (): QueryMaintenanceOperatorDiagnostics => emptyQueryMaintenanceOperatorDiagnostics;
-
-const summarizeOperatorEvents = (events: Iterable<QueryMaintenanceOperatorEvent>): QueryMaintenanceOperatorDiagnostics => {
-  const mutable = new Map<QueryMaintenanceOperator, {
-    selectiveNodeCount: number; fullNodeCount: number; fallbackNodeCount: number; affectedUnitCount: number; compactionCount: number;
-    fallbackReasons: Partial<Record<QueryMaintenanceFallbackReason, number>>;
-  }>();
-  for (const event of events) {
-    let summary = mutable.get(event.operator);
-    if (summary === undefined) {
-      summary = { selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 0, affectedUnitCount: 0, compactionCount: 0, fallbackReasons: {} };
-      mutable.set(event.operator, summary);
-    }
-    if (event.strategy === 'selective') summary.selectiveNodeCount += 1;
-    else if (event.strategy === 'full') summary.fullNodeCount += 1;
-    else summary.fallbackNodeCount += 1;
-    summary.affectedUnitCount += event.affectedUnitCount;
-    summary.compactionCount += event.compactionCount ?? 0;
-    if (event.reason !== undefined) summary.fallbackReasons[event.reason] = (summary.fallbackReasons[event.reason] ?? 0) + 1;
-  }
-  return Object.freeze(Object.fromEntries(operatorKinds.map((operator) => {
-    const summary = mutable.get(operator);
-    return [operator, summary === undefined
-      ? emptyQueryOperatorMaintenanceDiagnostics
-      : Object.freeze({ ...summary, fallbackReasons: Object.freeze({ ...summary.fallbackReasons }) })];
-  }))) as QueryMaintenanceOperatorDiagnostics;
-};
-
 const snapshotWork = new WeakMap<QueryMaintenanceSnapshot, QueryWork>();
 const resetSnapshotWork = (snapshot: QueryMaintenanceSnapshot): void => {
   if (snapshot.executionBudget === undefined) snapshotWork.delete(snapshot);
@@ -534,25 +193,6 @@ type AggregateRowGroupIndex = {
 };
 
 type LocalSegment = ScopedRow | readonly ScopedRow[] | undefined;
-
-const relationKey = (relation: RelationUse): string => relation.schemaView.id + '\u0000' + relation.schemaView.contentHash + '\u0000' + relation.relationId;
-const relationInputKey = (input: RelationInput): string => relationKey(input.relation) + '\u0000' + (input.attachmentId ?? input.sourceId ?? '');
-const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyMap<string, readonly RelationInput[]> => {
-  const grouped = new Map<string, RelationInput[]>();
-  for (const input of inputs) {
-    const key = relationKey(input.relation);
-    const group = grouped.get(key);
-    if (group === undefined) grouped.set(key, [input]);
-    else group.push(input);
-  }
-  return grouped;
-};
-const relationOccurrence = (input: RelationInput, index: number): string => {
-  const occurrence = input.occurrenceIds?.[index] ?? relationKey(input.relation) + ':' + index;
-  const namespace = input.sourceId ?? input.attachmentId;
-  return namespace === undefined ? occurrence : namespace.length + ':' + namespace + occurrence.length + ':' + occurrence;
-};
-const capabilityKey = (ref: CapabilityRef): string => ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
 
 /** Evaluates the independent, deterministic semantic oracle. */
 export const evaluateQuery = (request: QueryRequest): QueryResult => {
@@ -1349,213 +989,39 @@ const queryAliases = (node: QueryNode): ReadonlySet<string> => {
   return queryAliases(node.input);
 };
 
-/** Evaluates one expression using Tarstate missing/unknown three-valued semantics. */
-export const evaluateExpression = (expression: Expr, row: Readonly<Record<string, QueryRecord>>, options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}): EvaluationValue => {
-  const issues: Issue[] = [];
-  const ownedExpression = cloneAndFreezeExpression(expression);
-  const scoped: ScopedRow = { scope: adoptExpressionScope(row), provenance: {}, identity: '' };
-  const parameters = options.parameters === undefined ? {} : adoptJsonRecord(options.parameters, 'Query expression parameters');
-  const result = evaluateExpr(ownedExpression, { row: scoped, parameters, functions: options.functions === undefined ? new Map() : adoptFunctionRegistry(options.functions), issues });
-  if (result.status === 'known') return adoptJsonValue(result.value, 'Query expression result');
-  if (result.status === 'missing') return missingValue;
-  if (result.status === 'unknown' || result.status === 'indeterminate') return logicalUnknown;
-  return capabilityUnavailable;
-};
-
-/** Owns and seals an expression once for repeated scalar evaluation. */
-export const prepareExpression = (expression: Expr): PreparedExpression => sealPreparedExpression(cloneAndFreezeExpression(expression));
-
-/** Evaluates a sealed expression while adopting every changing input frame. */
-export const evaluatePreparedExpression = (
-  prepared: PreparedExpression,
-  row: Readonly<Record<string, QueryRecord>>,
-  options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}
-): EvaluationValue => {
-  assertPreparedExpression(prepared);
-  const issues: Issue[] = [];
-  const scoped: ScopedRow = { scope: adoptExpressionScope(row), provenance: {}, identity: '' };
-  const parameters = options.parameters === undefined ? {} : adoptJsonRecord(options.parameters, 'Query expression parameters');
-  const result = evaluateExpr(prepared.expression, { row: scoped, parameters, functions: options.functions === undefined ? new Map() : adoptFunctionRegistry(options.functions), issues });
-  if (result.status === 'known') return adoptJsonValue(result.value, 'Query expression result');
-  if (result.status === 'missing') return missingValue;
-  if (result.status === 'unknown' || result.status === 'indeterminate') return logicalUnknown;
-  return capabilityUnavailable;
-};
-
-const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult => {
-  if (context.query !== undefined && !consumeQueryWork(context.query)) return { status: 'unavailable' };
-  if (expression.kind === 'literal') return known(expression.value);
-  if (expression.kind === 'parameter') return Object.hasOwn(context.parameters, expression.name) ? known(context.parameters[expression.name] as JsonValue) : { status: 'missing' };
-  if (expression.kind === 'field') {
-    const record = context.row.scope[expression.alias];
-    if (record === undefined || !Object.hasOwn(record, expression.name)) return { status: 'missing' };
-    const value = record[expression.name] as QueryLogicalValue;
-    return value === logicalUnknown ? { status: 'unknown' } : known(value as JsonValue);
-  }
-  if (expression.kind === 'key-of' || expression.kind === 'source-of') {
-    const provenance = context.row.provenance[expression.alias];
-    if (provenance === undefined) return { status: 'missing' };
-    const value = expression.kind === 'key-of' ? provenance.key : provenance.sourceId;
-    return value === undefined ? { status: 'missing' } : known(value);
-  }
-  if (expression.kind === 'is-null' || expression.kind === 'is-missing') {
-    const value = evaluateExpr(expression.value, context);
-    if (value.status === 'unavailable' || value.status === 'indeterminate') return value;
-    if (expression.kind === 'is-missing') return known(value.status === 'missing');
-    if (value.status === 'unknown') return value;
-    return known(value.status === 'known' && value.value === null);
-  }
-  if (expression.kind === 'compare') {
-    const left = evaluateExpr(expression.left, context);
-    const right = evaluateExpr(expression.right, context);
-    const unavailable = propagate(left, right);
-    if (unavailable !== undefined) return unavailable;
-    if (left.status !== 'known' || right.status !== 'known' || left.value === null || right.value === null) return { status: 'unknown' };
-    if (expression.op === 'eq' || expression.op === 'ne') {
-      const equal = compareQueryJsonValuesTotal(left.value, right.value) === 0;
-      return known(expression.op === 'eq' ? equal : !equal);
-    }
-    const comparison = compareQueryJsonValues(left.value, right.value);
-    if (comparison === undefined) return { status: 'unknown' };
-    return known(expression.op === 'lt' ? comparison < 0 : expression.op === 'lte' ? comparison <= 0 : expression.op === 'gt' ? comparison > 0 : comparison >= 0);
-  }
-  if (expression.kind === 'boolean') {
-    if (expression.op === 'not') {
-      const value = evaluateExpr(expression.arg, context);
-      if (value.status === 'unavailable' || value.status === 'indeterminate') return value;
-      const truth = value.status === 'known' && typeof value.value === 'boolean' ? value.value : logicalUnknown;
-      const result = logicalNot(truth);
-      return result === logicalUnknown ? { status: 'unknown' } : known(result);
-    }
-    const values = expression.args.map((argument) => evaluateExpr(argument, context));
-    if (values.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    const truths = values.map((value): LogicalTruth => value.status === 'known' && typeof value.value === 'boolean' ? value.value : logicalUnknown);
-    const result = expression.op === 'and' ? logicalAnd(truths) : logicalOr(truths);
-    return result === logicalUnknown ? values.some((value) => value.status === 'indeterminate') ? { status: 'indeterminate' } : { status: 'unknown' } : known(result);
-  }
-  if (expression.kind === 'arithmetic') {
-    const left = evaluateExpr(expression.left, context);
-    const right = evaluateExpr(expression.right, context);
-    const propagated = propagate(left, right);
-    if (propagated !== undefined) return propagated;
-    if (left.status !== 'known' || right.status !== 'known' || typeof left.value !== 'number' || typeof right.value !== 'number') return { status: 'unknown' };
-    if ((expression.op === 'divide' || expression.op === 'modulo') && right.value === 0) return { status: 'unknown' };
-    const value = expression.op === 'add' ? left.value + right.value : expression.op === 'subtract' ? left.value - right.value : expression.op === 'multiply' ? left.value * right.value : expression.op === 'divide' ? left.value / right.value : left.value % right.value;
-    return Number.isFinite(value) ? known(value) : { status: 'unknown' };
-  }
-  if (expression.kind === 'string') {
-    const args = expression.args.map((argument) => evaluateExpr(argument, context));
-    if (args.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    if (args.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
-    if (args.some((value) => value.status !== 'known' || typeof value.value !== 'string')) return { status: 'unknown' };
-    const strings = args.map((value) => (value as { readonly status: 'known'; readonly value: string }).value);
-    if (expression.op === 'concat') return known(strings.join(''));
-    const value = strings[0]!;
-    return known(expression.op === 'lower' ? value.toLowerCase() : expression.op === 'upper' ? value.toUpperCase() : Array.from(value).length);
-  }
-  if (expression.kind === 'array') {
-    const values = expression.items.map((item) => evaluateExpr(item, context));
-    if (values.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    if (values.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
-    if (values.some((value) => value.status !== 'known')) return { status: 'unknown' };
-    return known(values.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value));
-  }
-  if (expression.kind === 'record') {
-    const fields = projectFields(expression.fields, context);
-    return Object.values(fields).some((value) => containsQueryLogicalUnknown(value)) ? { status: 'unknown' } : known(fields as JsonValue);
-  }
-  if (expression.kind === 'case') {
-    for (const branch of expression.branches) {
-      const condition = evaluateExpr(branch.when, context);
-      if (condition.status === 'unavailable' || condition.status === 'indeterminate') return condition;
-      if (condition.status === 'known' && condition.value === true) return evaluateExpr(branch.then, context);
-    }
-    return evaluateExpr(expression.otherwise, context);
-  }
-  if (expression.kind === 'coalesce') {
-    for (const argument of expression.args) {
-      const value = evaluateExpr(argument, context);
-      if (value.status === 'unavailable' || value.status === 'indeterminate') return value;
-      if (value.status === 'unknown') return value;
-      if (value.status === 'known' && value.value !== null) return value;
-    }
-    return known(null);
-  }
-  if (expression.kind === 'subquery') {
-    if (context.query === undefined) return { status: 'unavailable' };
+const queryExpressionRuntime: QueryExpressionRuntime = {
+  consumeWork: (state) => consumeQueryWork(state as QueryContext),
+  markUnavailable: (state) => { (state as QueryContext).unavailable = true; },
+  evaluateSubquery: (state, node, outer) => {
+    const parent = state as QueryContext;
     const child: QueryContext = {
-      relations: context.query.relations,
-      parameters: context.parameters,
-      functions: context.functions,
-      issues: context.issues,
-      recursions: context.query.recursions,
-      recursionConstants: context.query.recursionConstants,
-      recursionDependencies: context.query.recursionDependencies,
-      joinIndexes: context.query.joinIndexes,
-      ...(context.query.basis === undefined ? {} : { basis: context.query.basis }),
-      ...(context.query.membershipRevision === undefined ? {} : { membershipRevision: context.query.membershipRevision }),
-      outer: context.row,
+      relations: parent.relations,
+      parameters: parent.parameters,
+      functions: parent.functions,
+      issues: parent.issues,
+      recursions: parent.recursions,
+      recursionConstants: parent.recursionConstants,
+      recursionDependencies: parent.recursionDependencies,
+      joinIndexes: parent.joinIndexes,
+      ...(parent.basis === undefined ? {} : { basis: parent.basis }),
+      ...(parent.membershipRevision === undefined ? {} : { membershipRevision: parent.membershipRevision }),
+      outer: outer as ScopedRow,
       unavailable: false,
       aggregateCompactionCount: 0
     };
-    const result = evaluateNode(expression.query, child);
-    if (child.unavailable) { context.query.unavailable = true; return { status: 'unavailable' }; }
-    if (result.completeness === 'unknown') return { status: 'indeterminate' };
-    if (expression.mode === 'exists') return result.rows.length > 0 ? known(true) : result.completeness === 'exact' ? known(false) : { status: 'indeterminate' };
-    if (result.completeness !== 'exact') return { status: 'indeterminate' };
-    if (result.rows.length !== 1) {
-      context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { rows: result.rows.length } }));
-      return { status: 'unknown' };
-    }
-    const record = visibleRow(result.rows[0] as ScopedRow);
-    const values = Object.values(record);
-    if (values.length !== 1) {
-      context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { fields: values.length } }));
-      return { status: 'unknown' };
-    }
-    return values[0] === logicalUnknown ? { status: 'unknown' } : known(values[0] as JsonValue);
+    const result = evaluateNode(node, child);
+    return { rows: result.rows.map(visibleRow), completeness: result.completeness, unavailable: child.unavailable };
   }
-  if (expression.kind === 'call') {
-    const fn = context.functions.get(capabilityKey(expression.capability));
-    if (fn === undefined) {
-      context.issues.push(createIssue({ code: 'query.capability_unavailable', retry: 'after_capability', requiredCapabilities: [expression.capability] }));
-      return { status: 'unavailable' };
-    }
-    const args = expression.args.map((argument) => evaluateExpr(argument, context));
-    if (args.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    if (args.some((value) => value.status !== 'known')) return { status: 'unknown' };
-    try {
-      const ownedArgs = Object.freeze(args.map((value) => freezePortableValue(
-        (value as { readonly status: 'known'; readonly value: JsonValue }).value
-      )));
-      const returned = fn(ownedArgs);
-      const parsed = detachAndFreezeJsonValue(returned);
-      if (!parsed.success) throw new TypeError('Query function returned a non-portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
-      return known(parsed.value);
-    } catch (error) {
-      context.issues.push(createIssue({ code: 'query.function_failed', phase: 'query', severity: 'error', retry: 'after_input', requiredCapabilities: [expression.capability], details: { error: error instanceof Error ? error.name : typeof error } }));
-      return { status: 'unavailable' };
-    }
-  }
-  return assertNever(expression);
 };
 
-const exprContext = (row: ScopedRow, context: QueryContext): EvalContext => ({ row, parameters: context.parameters, functions: context.functions, issues: context.issues, query: context });
-const known = (value: JsonValue): ExpressionResult => ({ status: 'known', value });
-const propagate = (...values: readonly ExpressionResult[]): ExpressionResult | undefined => values.some((value) => value.status === 'unavailable') ? { status: 'unavailable' } : values.some((value) => value.status === 'indeterminate') ? { status: 'indeterminate' } : values.some((value) => value.status === 'unknown') ? { status: 'unknown' } : undefined;
-const expressionJson = (result: ExpressionResult): JsonValue => result.status === 'known' ? result.value : null;
-const assertNever = (value: never): never => { throw new TypeError('Unsupported query expression: ' + String(value)); };
-
-const projectFields = (fields: Readonly<Record<string, Expr>>, context: EvalContext): QueryRecord => {
-  const output: Record<string, QueryLogicalValue> = {};
-  for (const [name, expression] of Object.entries(fields)) {
-    const result = evaluateExpr(expression, context);
-    if (result.status === 'known') output[name] = result.value;
-    else if (result.status === 'unknown') output[name] = logicalUnknown;
-    else if ((result.status === 'unavailable' || result.status === 'indeterminate') && context.query !== undefined) context.query.unavailable = true;
-  }
-  return output;
-};
+const exprContext = (row: ScopedRow, context: QueryContext): EvalContext => ({
+  row,
+  parameters: context.parameters,
+  functions: context.functions,
+  issues: context.issues,
+  runtime: queryExpressionRuntime,
+  runtimeState: context
+});
 
 const mapProjection = (inner: NodeResult, alias: string, project: (row: ScopedRow) => QueryRecord, context: QueryContext): NodeResult => {
   const rows = inner.rows.map((row) => {
@@ -1655,91 +1121,6 @@ const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult
   return { rows: [], completeness: 'unknown' };
 };
 
-/** Pure shell adapter from two snapshots to the exact update consumed by maintenance. */
-export const diffQueryMaintenanceSnapshots = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): QueryMaintenanceUpdate => {
-  if (!sameOptionalJson(previous.parameters, next.parameters) || !sameFunctionRegistry(previous.functions, next.functions) || !sameExecutionBudget(previous.executionBudget, next.executionBudget)) {
-    throw new TypeError('Query maintenance parameters, functions, and execution budget are fixed for the session');
-  }
-  const previousInputs = indexedRelationInputs(previous.relations);
-  const nextInputs = indexedRelationInputs(next.relations);
-  const identities = [...new Set([...previousInputs.keys(), ...nextInputs.keys()])].sort(comparePortableStrings);
-  const relations: RelationInputChange[] = [];
-  for (const identity of identities) {
-    const before = previousInputs.get(identity);
-    const after = nextInputs.get(identity);
-    const rows = diffRelationRows(before?.input, after?.input);
-    if (before !== undefined && after !== undefined && before.index === after.index && before.input.completeness === after.input.completeness && sameOptionalJson(before.input.basis, after.input.basis) && rows.length === 0) continue;
-    const input = after?.input ?? before?.input;
-    if (input === undefined) continue;
-    relations.push({
-      relation: input.relation,
-      ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
-      ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }),
-      ...(before === undefined ? {} : { before: relationChangeState(before) }),
-      ...(after === undefined ? {} : { after: relationChangeState(after) }),
-      rows
-    });
-  }
-  return {
-    ...(previous.basis === undefined ? {} : { expectedBasis: previous.basis }),
-    ...(next.basis === undefined ? {} : { basis: next.basis }),
-    ...(previous.membershipRevision === undefined ? {} : { expectedMembershipRevision: previous.membershipRevision }),
-    ...(next.membershipRevision === undefined ? {} : { membershipRevision: next.membershipRevision }),
-    relations
-  };
-};
-
-const diffRelationRows = (before: RelationInput | undefined, after: RelationInput | undefined): readonly RelationRowChange[] => {
-  const beforeIds = before?.occurrenceIds ?? [];
-  const afterIds = after?.occurrenceIds ?? [];
-  if ((before?.rows.length ?? 0) !== beforeIds.length || (after?.rows.length ?? 0) !== afterIds.length) throw new TypeError('Relation changes require complete occurrence IDs');
-  if (beforeIds.length === afterIds.length && beforeIds.every((occurrenceId, index) => occurrenceId === afterIds[index])) {
-    return beforeIds.flatMap((occurrenceId, index) => {
-      const previousRow = before?.rows[index] as QueryRecord;
-      const nextRow = after?.rows[index] as QueryRecord;
-      return previousRow === nextRow || queryValueEqual(previousRow, nextRow) ? [] : [{ occurrenceId, before: { index, row: previousRow }, after: { index, row: nextRow } }];
-    });
-  }
-  const beforeRows = before === undefined ? new Map<string, { readonly index: number; readonly row: QueryRecord }>() : indexedRelationRows(before);
-  const afterRows = after === undefined ? new Map<string, { readonly index: number; readonly row: QueryRecord }>() : indexedRelationRows(after);
-  const changes: RelationRowChange[] = [];
-  for (const occurrenceId of [...new Set([...beforeRows.keys(), ...afterRows.keys()])].sort(comparePortableStrings)) {
-    const previousRow = beforeRows.get(occurrenceId);
-    const nextRow = afterRows.get(occurrenceId);
-    if (previousRow !== undefined && nextRow !== undefined && previousRow.index === nextRow.index && (previousRow.row === nextRow.row || queryValueEqual(previousRow.row, nextRow.row))) continue;
-    changes.push({ occurrenceId, ...(previousRow === undefined ? {} : { before: previousRow }), ...(nextRow === undefined ? {} : { after: nextRow }) });
-  }
-  return changes;
-};
-
-const relationChangeState = ({ input, index }: IndexedRelationInput): NonNullable<RelationInputChange['before']> => ({
-  index,
-  completeness: input.completeness,
-  ...(input.basis === undefined ? {} : { basis: input.basis })
-});
-
-type IndexedRelationInput = { readonly input: RelationInput; readonly index: number };
-
-const indexedRelationInputs = (relations: readonly RelationInput[]): ReadonlyMap<string, IndexedRelationInput> => {
-  const output = new Map<string, IndexedRelationInput>();
-  relations.forEach((input, index) => {
-    const identity = relationInputKey(input);
-    if (output.has(identity)) throw new TypeError('Duplicate relation input identity: ' + input.relation.relationId);
-    output.set(identity, { input, index });
-  });
-  return output;
-};
-
-const indexedRelationRows = (input: RelationInput): ReadonlyMap<string, { readonly index: number; readonly row: QueryRecord }> => {
-  if (input.rows.length > 0 && input.occurrenceIds === undefined) throw new TypeError('Relation changes require occurrence IDs: ' + input.relation.relationId);
-  const output = new Map<string, { readonly index: number; readonly row: QueryRecord }>();
-  input.rows.forEach((row, index) => {
-    const occurrenceId = input.occurrenceIds?.[index];
-    if (occurrenceId === undefined || output.has(occurrenceId)) throw new TypeError('Invalid occurrence identity: ' + input.relation.relationId);
-    output.set(occurrenceId, { index, row });
-  });
-  return output;
-};
 
 /**
  * Opens the production stateful query-maintenance path. The pure
@@ -4737,19 +4118,6 @@ const changedRelationIds = (snapshot: QueryMaintenanceSnapshot, identities: Read
   return [...new Set([...identities].map((identity) => byIdentity.get(identity)?.[0]?.relation.relationId ?? identity.split('\u0000').at(-1) as string))].sort(comparePortableStrings);
 };
 
-const sameOptionalJson = (left: unknown, right: unknown): boolean => {
-  if (left === undefined || right === undefined) return left === right;
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
-};
-
-const sameFunctionRegistry = (left: FunctionRegistry | undefined, right: FunctionRegistry | undefined): boolean => {
-  if (left === right) return true;
-  const leftEntries = [...(left ?? new Map()).entries()];
-  const rightMap = right ?? new Map();
-  return leftEntries.length === rightMap.size && leftEntries.every(([key, implementation]) => rightMap.get(key) === implementation);
-};
-const sameExecutionBudget = (left: QueryExecutionBudget | undefined, right: QueryExecutionBudget | undefined): boolean =>
-  left === undefined || right === undefined ? left === right : left.maxWorkUnits === right.maxWorkUnits;
 
 const diffMaintainedResults = (
   previousRoot: MaterializedQueryNode | undefined,

@@ -5,6 +5,15 @@ borrows database lifecycle; it never closes an externally owned database.
 The declared React range is `>=18.3.0 <20`; CI exercises both the minimum 18.3
 runtime and the workspace's React 19 version.
 
+Install both Tarstate tarballs and your supported React version:
+
+```sh
+npm install \
+  ./tarstate-core-0.3.0.tgz \
+  ./tarstate-react-0.3.0.tgz \
+  react
+```
+
 ```tsx
 import { TarstateProvider, useQuery, useRow } from '@tarstate/react'
 

@@ -1,4 +1,4 @@
-import type { Expr, PreparedExpression } from './query.js';
+import type { Expr, PreparedExpression } from './query-model.js';
 const preparedExpressions = new WeakSet<object>();
 
 export const sealPreparedExpression = (expression: Expr): PreparedExpression => {

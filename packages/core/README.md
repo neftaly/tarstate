@@ -3,6 +3,12 @@
 Portable artifacts, schemas, query evaluation, transactions, source protocols,
 database observations, and incremental maintenance for Tarstate v1.
 
+Install the downloaded release tarball directly:
+
+```sh
+npm install ./tarstate-core-0.3.0.tgz
+```
+
 ## Imports
 
 The package root remains the complete, compatibility-stable surface. For

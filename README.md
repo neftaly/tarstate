@@ -5,9 +5,14 @@ It's a fast, disposable way to glue unrelated data sources together.
 
 Note: Tarstate is **alpha quality** software.
 
+**Requirements:** Node.js 24.12 or newer and a package manager compatible with
+your project. From this checkout, run `pnpm install`, `pnpm build`, then
+`node examples/quickstart.ts`. Consumers can install the downloaded core release
+tarball with `pnpm add ./tarstate-core-0.3.0.tgz`.
+
 Perf and GC targets systems programming and video games.
 Work is shared between queries, and aims to be faster than hand-rolled state management at scale.
-Adaptors are currently provided for Zustand and Automerge.
+Adapters are currently provided for Zustand and Automerge.
 
 It also generates JSON-serializable schemas, describing your data in terms of relationships, that TS can read as types. It is intended to support [schema evolution](https://www.inkandswitch.com/cambria/), i.e. so changing your state tree in the future won't break things.
 
@@ -15,28 +20,65 @@ Tarstate was heavily inspired by
 [wotbrew/relic](https://github.com/wotbrew/relic), after
 [Out of the Tar Pit](http://curtclifton.net/papers/MoseleyMarks06a.pdf).
 
-## Queries
+## Quick start
 
-Queries are portable values. The typed authoring helpers preserve exact result
-rows and parameters through preparation and into the UI:
+This complete example defines a schema and query, exposes application state as
+a source, projects that source through an attachment, and observes it through a
+database. The checked source lives at
+[`examples/quickstart.ts`](./examples/quickstart.ts) and runs with the checkout
+commands above. In another project, copy it after installing the core release
+tarball, then run it with Node.
 
 ```ts
 import {
+  AttachmentCatalog,
+  DatabaseView,
+  DatasetMembership,
+  createIncrementalDatabaseQueryMaintenance,
   prepareTypedQuery,
+  prepareManualReadOnlyAttachment,
   relationLiteral,
+  sealSchema,
+  schemaLiteral,
   typedFrom,
-  typedOrderBy,
-  typedSelect
+  typedSelect,
+  type ObservableSource,
+  type RelationInput,
+  type SourceSnapshot
 } from '@tarstate/core';
-import { schema, schemaBody } from './schema';
 
-const pizzas = relationLiteral(schema, schemaBody, 'pizzas');
+const registryFingerprint = 'registry:quickstart';
+const authorityFingerprint = 'authority:public';
+const datasetId = 'menu';
+const sourceId = 'source:pizzas';
+const attachmentId = 'attachment:pizzas';
+
+const schemaBody = schemaLiteral({
+  relations: {
+    pizzas: {
+      relationId: 'example.pizza',
+      key: ['name'],
+      fields: {
+        name: { type: { kind: 'string' } },
+        price: { type: { kind: 'number' } }
+      }
+    }
+  }
+});
+const schema = await sealSchema({
+  id: 'example.pizza-ordering@1',
+  body: schemaBody
+});
+const schemaView = { id: schema.id, contentHash: schema.contentHash };
+const pizzaRows = [
+  { name: 'margherita', price: 18 },
+  { name: 'pepperoni', price: 21 }
+] as const;
+
+const pizzas = relationLiteral(schemaView, schemaBody, 'pizzas');
 const pizza = typedFrom(pizzas, 'pizza');
 const pizzaMenuQuery = typedSelect(
-  typedOrderBy(pizza, aliases => [{
-    value: aliases.pizza.row.name,
-    direction: 'asc'
-  }]),
+  pizza,
   'menu',
   aliases => ({
     name: aliases.pizza.row.name,
@@ -44,15 +86,100 @@ const pizzaMenuQuery = typedSelect(
   })
 );
 
-export const pizzaMenuPlan = await prepareTypedQuery(pizzaMenuQuery, {
+const pizzaMenuPlan = await prepareTypedQuery(pizzaMenuQuery, {
   registryFingerprint,
   authorityFingerprint,
-  datasetId: 'primary'
+  datasetId
 });
+
+type Storage = { readonly pizzas: typeof pizzaRows };
+const snapshot = (): SourceSnapshot<Storage> => ({
+  sourceId,
+  operationEpoch: 'epoch:quickstart',
+  basis: { incarnation: 'pizzas:one', revision: 0 },
+  state: 'ready',
+  freshness: 'current',
+  storage: { pizzas: pizzaRows },
+  issues: []
+});
+const source: ObservableSource<Storage> = {
+  sourceId,
+  snapshot,
+  subscribe: () => () => undefined
+};
+
+const attachments = new AttachmentCatalog();
+const attachmentLease = attachments.attach({
+  attachmentId,
+  incarnation: 'attachment:pizzas:one',
+  sourceId,
+  source,
+  authorityScope: 'public',
+  discoveryEdges: [],
+  preparation: prepareManualReadOnlyAttachment<Storage, readonly RelationInput[]>({
+    schemaViewIds: [schemaView.id],
+    project: current => {
+      if (current.storage === undefined) {
+        return {
+          state: current.state === 'ready' ? 'failed' : current.state,
+          issues: current.issues
+        };
+      }
+      return {
+        state: 'ready',
+        value: [{
+          relation: { schemaView, relationId: pizzas.relationId },
+          rows: current.storage.pizzas,
+          occurrenceIds: current.storage.pizzas.map(row => `pizza:${row.name}`),
+          completeness: 'exact',
+          sourceId,
+          attachmentId,
+          basis: current.basis
+        }],
+        issues: []
+      };
+    }
+  })
+});
+const membership = new DatasetMembership({
+  datasetId,
+  state: 'settled',
+  members: [{
+    attachmentId,
+    sourceId,
+    expectation: 'required',
+    discoveryEdges: []
+  }]
+});
+const database = new DatabaseView({
+  authorityScope: 'public',
+  authorityFingerprint,
+  registryFingerprint,
+  attachments,
+  datasets: [membership],
+  canRead: (viewScope, attachmentScope) => viewScope === attachmentScope,
+  createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+});
+
+const observer = database.observe({ plan: pizzaMenuPlan });
+const result = observer.getSnapshot();
+if (result.state !== 'open') throw new Error('Quickstart observer closed unexpectedly');
+console.log(result.current.rows);
+
+observer.close();
+database.close();
+attachmentLease.close();
 ```
 
 Prepared queries are compiled into an Incremental View Maintenance graph. When
 data changes, Tarstate updates affected operators and reuses shared work.
+
+## Queries
+
+Queries are portable values. Typed authoring helpers preserve exact result rows
+and parameters through preparation and into framework adapters. The quick start
+uses a read-only manual projection for clarity; production adapters can prepare
+artifact-backed writable attachments instead.
 
 ## Schemas
 

@@ -30,6 +30,7 @@
     "types": ["node", "vitest/globals"]
   },
   "include": [
+    "examples",
     "packages/*/src",
     "packages/*/tests",
     "vite.config.ts"
