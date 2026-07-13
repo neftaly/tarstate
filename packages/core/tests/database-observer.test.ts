@@ -497,16 +497,22 @@ describe('database membership and observation', () => {
       added: [{ row: { id: 3, value: 'three' } }], removed: [],
       updated: [{ key: initialKey, before: { id: 2, value: 'two' }, after: { id: 2, value: 'updated' } }]
     } });
+    source.publish({ rows: [{ id: 4, value: 'four' }, { id: 2, value: 'updated again' }, { id: 5, value: 'five' }] });
+    expect(changes[1]).toMatchObject({ kind: 'diff', diff: {
+      added: [{ row: { id: 4, value: 'four' } }, { row: { id: 5, value: 'five' } }],
+      removed: [{ row: { id: 3, value: 'three' } }],
+      updated: [{ key: initialKey, before: { id: 2, value: 'updated' }, after: { id: 2, value: 'updated again' } }]
+    } });
     const changed = observer.getSnapshot();
     source.notify();
     expect(observer.getSnapshot()).toBe(changed);
-    expect(changes).toHaveLength(1);
+    expect(changes).toHaveLength(2);
 
     source.publish({ state: 'failed', freshness: 'none' });
     expect(observer.getSnapshot()).toMatchObject({
       state: 'open',
       current: { readiness: 'incomplete', rows: [], resultKeys: [], completeness: 'unknown', sourceStates: [{ state: 'failed' }] },
-      lastExact: { rows: [{ id: 2, value: 'updated' }, { id: 3, value: 'three' }], freshness: 'stale' }
+      lastExact: { rows: [{ id: 4, value: 'four' }, { id: 2, value: 'updated again' }, { id: 5, value: 'five' }], freshness: 'stale' }
     });
 
     source.publish({ state: 'ready', freshness: 'current', rows: [{ id: 4, value: 'recovered' }] });

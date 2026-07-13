@@ -371,6 +371,7 @@ describe('@tarstate/react', () => {
     let result: Promise<CommitReceipt> | undefined;
     await act(() => { result = commit?.(transactionAttempt()); });
     const optimistic = snapshots.at(-1);
+    const authoritative = database.observers[0]?.getSnapshot();
     expect(optimistic).toMatchObject({
       state: 'open',
       current: { rows: [{ id: 1, name: 'one+pending' }] },
@@ -379,6 +380,12 @@ describe('@tarstate/react', () => {
     });
     expect(Object.isFrozen(optimistic)).toBe(true);
     expect(Object.isFrozen(optimistic?.state === 'open' ? optimistic.current.rows[0] : undefined)).toBe(true);
+    if (optimistic?.state !== 'open' || authoritative?.state !== 'open') throw new Error('expected open snapshots');
+    expect(optimistic.lastExact).toBe(authoritative.lastExact);
+    expect(optimistic.current.basis).toBe(authoritative.current.basis);
+    expect(optimistic.current.sourceStates).toBe(authoritative.current.sourceStates);
+    expect(Object.isFrozen(optimistic.optimistic?.operations)).toBe(true);
+    expect(Object.isFrozen(optimistic.optimistic?.operations[0])).toBe(true);
 
     await act(async () => {
       resolveCommit?.(commitReceipt());

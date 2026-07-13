@@ -5,15 +5,16 @@ import { safeParseJsonValue, type JsonValue, type ValueParseBudget } from './val
 export const detachAndFreezeJsonValue = (input: unknown, budget?: ValueParseBudget): ParseResult<JsonValue> => {
   const parsed = safeParseJsonValue(input, budget);
   if (!parsed.success) return parsed;
-  return { success: true, value: freezeJsonValue(parsed.value), issues: [] };
+  return { success: true, value: freezeOwnedJsonValue(parsed.value), issues: [] };
 };
 
-const freezeJsonValue = (value: JsonValue): JsonValue => {
+/** Freezes a parser-owned JSON graph in place without traversing it through validation again. */
+export const freezeOwnedJsonValue = (value: JsonValue): JsonValue => {
   if (value === null || typeof value !== 'object') return value;
   if (Array.isArray(value)) {
-    for (const member of value) freezeJsonValue(member);
+    for (const member of value) freezeOwnedJsonValue(member);
     return Object.freeze(value);
   }
-  for (const member of Object.values(value)) freezeJsonValue(member);
+  for (const member of Object.values(value)) freezeOwnedJsonValue(member);
   return Object.freeze(value);
 };

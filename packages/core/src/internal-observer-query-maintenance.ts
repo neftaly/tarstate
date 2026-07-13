@@ -44,12 +44,15 @@ export type {
   QueryMaintenanceReuseDiagnostics
 } from './internal-observer-query-maintenance-contracts.js';
 
-export type TrustedIncrementalMetadata = Readonly<Pick<IncrementalQueryResult['state'], 'revision' | 'resultDelta'>>;
+export type TrustedIncrementalMetadata = Readonly<Pick<IncrementalQueryResult['state'], 'revision' | 'resultDelta'>> & {
+  readonly resultKeyPositions: ReadonlyMap<string, number>;
+};
 type OwnedTrustedIncrementalMetadata = TrustedIncrementalMetadata & { readonly owner: object };
 
 const incrementalMaintenanceFactoryBrand = Symbol('tarstate.incremental-maintenance-factory');
 const maintenanceRuntimeIdentity = Symbol('tarstate.maintenance-runtime');
 const trustedIncrementalResults = new WeakMap<object, OwnedTrustedIncrementalMetadata>();
+const resultKeyPositionCache = new WeakMap<readonly string[], ReadonlyMap<string, number>>();
 const trustedIncrementalFactories = new WeakMap<object, object>();
 
 type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
@@ -358,7 +361,12 @@ const openPrivateDatabaseMaintenance = (
 
 const databaseResultFromMaintained = ({ state, rows, resultKeys, completeness, issues }: IncrementalQueryResult, owner: object): MaintainedDatabaseQueryResult<QueryRecord> => {
   const result = Object.freeze({ rows, resultKeys, completeness, issues });
-  trustedIncrementalResults.set(result, Object.freeze({ revision: state.revision, resultDelta: state.resultDelta, owner }));
+  let resultKeyPositions = resultKeyPositionCache.get(resultKeys);
+  if (resultKeyPositions === undefined) {
+    resultKeyPositions = new Map(resultKeys.map((key, position) => [key, position]));
+    resultKeyPositionCache.set(resultKeys, resultKeyPositions);
+  }
+  trustedIncrementalResults.set(result, Object.freeze({ revision: state.revision, resultDelta: state.resultDelta, resultKeyPositions, owner }));
   return result;
 };
 

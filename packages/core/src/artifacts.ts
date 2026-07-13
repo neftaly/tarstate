@@ -1,5 +1,5 @@
 import { createIssue, TarstateParseError, type Issue, type ParseResult } from './issues.js';
-import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
 
@@ -120,7 +120,7 @@ export const sealArtifact = async <Body extends JsonValue>(input: {
 export const safeParseArtifactText = async (text: string, budget: ArtifactParseBudget = defaultArtifactParseBudget): Promise<ParseResult<Artifact>> => {
   const parsedJson = safeParseJsonText(text, budget);
   if (!parsedJson.success) return parsedJson;
-  return safeParseArtifactValue(parsedJson.value, budget);
+  return safeParseOwnedArtifactValue(parsedJson.value, budget);
 };
 
 export const parseArtifactText = async (text: string, budget?: ArtifactParseBudget): Promise<Artifact> => {
@@ -132,7 +132,10 @@ export const parseArtifactText = async (text: string, budget?: ArtifactParseBudg
 export const safeParseArtifactValue = async (input: unknown, budget: ArtifactParseBudget = defaultArtifactParseBudget): Promise<ParseResult<Artifact>> => {
   const portable = safeParseJsonValue(input, budget);
   if (!portable.success) return portable;
-  const value = portable.value;
+  return safeParseOwnedArtifactValue(portable.value, budget);
+};
+
+const safeParseOwnedArtifactValue = async (value: JsonValue, budget: ArtifactParseBudget): Promise<ParseResult<Artifact>> => {
   if (!isRecord(value)) return invalidEnvelope('root');
   const allowed = new Set(['kind', 'formatVersion', 'id', 'contentHash', 'dependencies', 'body', 'locations']);
   if (Object.keys(value).some((key) => !allowed.has(key))) return invalidEnvelope('unknown_member');
@@ -145,15 +148,14 @@ export const safeParseArtifactValue = async (input: unknown, budget: ArtifactPar
   }
   const normalized = normalizeDependencies(dependencies);
   if (!normalized.success) return normalized;
-  const body = detachAndFreezeJsonValue(value.body);
-  if (!body.success) return body;
+  const body = freezeOwnedJsonValue(value.body as JsonValue);
   const artifact: Artifact = Object.freeze({
     kind: value.kind as ArtifactKind,
     formatVersion: 1,
     id: value.id,
     contentHash: value.contentHash,
     dependencies: Object.freeze(normalized.value.map((dependency) => Object.freeze(dependency))),
-    body: body.value
+    body
   });
   const expectedHash = await sha256Json(artifactSemanticValue(artifact));
   if (expectedHash !== artifact.contentHash) return { success: false, issues: [createIssue({ code: 'artifact.hash_mismatch', retry: 'after_input', details: { expected: expectedHash, actual: artifact.contentHash } })] };

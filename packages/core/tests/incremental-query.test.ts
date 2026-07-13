@@ -1342,6 +1342,40 @@ describe('incremental query maintenance', () => {
     }
   });
 
+  it('selectively maintains composite tuple equijoins in either operand order', () => {
+    const left = relation('composite-left', [
+      { occurrenceId: 'left:one', row: { tenant: 'a', id: 1, label: 'one' } },
+      { occurrenceId: 'left:two', row: { tenant: 'b', id: 1, label: 'two' } }
+    ], 1);
+    const right = relation('composite-right', [
+      { occurrenceId: 'right:one', row: { tenant: 'a', ownerId: 1, value: 'before' } },
+      { occurrenceId: 'right:two', row: { tenant: 'b', ownerId: 1, value: 'stable' } }
+    ], 1);
+    const updatedRight = { ...right, rows: [{ tenant: 'a', ownerId: 1, value: 'after' }, right.rows[1] as QueryRecord], basis: 2 };
+    const initial: QueryMaintenanceSnapshot = { relations: [left, right] };
+    const next: QueryMaintenanceSnapshot = { relations: [left, updatedRight] };
+    const leftKey = { kind: 'array', items: [field('left', 'tenant'), field('left', 'id')] } as const;
+    const rightKey = { kind: 'array', items: [field('right', 'tenant'), field('right', 'ownerId')] } as const;
+    const query = (reversed: boolean): QueryNode => ({
+      kind: 'select', alias: 'result',
+      input: {
+        kind: 'join', join: 'inner', left: from('composite-left', 'left'), right: from('composite-right', 'right'),
+        on: { kind: 'compare', op: 'eq', left: reversed ? rightKey : leftKey, right: reversed ? leftKey : rightKey }
+      },
+      fields: { label: field('left', 'label'), value: field('right', 'value') }
+    });
+
+    for (const reversed of [false, true]) {
+      const root = query(reversed);
+      const session = openIncrementalQueryMaintenance(plan(root), initial);
+      const result = applySnapshot(session, initial, next);
+      expect(result.rows).toEqual([{ label: 'one', value: 'after' }, { label: 'two', value: 'stable' }]);
+      expect(semanticResult(result)).toEqual(oracle(root, next));
+      expect(result.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, fallbackNodeCount: 0, affectedUnitCount: 1 });
+      session.close();
+    }
+  });
+
   it('reuses one local overlay across multiple changed rows without cross-row leakage', () => {
     const query: QueryNode = { kind: 'select', input: from('people', 'p'), alias: 'result', fields: { id: field('p', 'id'), name: field('p', 'name') } };
     const initial = snapshot(basePeople, 1);

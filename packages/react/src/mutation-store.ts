@@ -63,10 +63,16 @@ const adoptTransactionAttempt = (input: TransactionAttempt): TransactionAttempt 
     operationEpoch,
     operationId,
     attachmentId,
-    transaction: deepFreezeClone(transaction.value) as TransactionAttempt['transaction'],
-    ...(expectedBasis === undefined ? {} : { expectedBasis: deepFreezeClone(expectedBasis) }),
+    transaction: freezeOwnedPortable(transaction.value) as TransactionAttempt['transaction'],
+    ...(expectedBasis === undefined ? {} : { expectedBasis: freezeOwnedPortable(expectedBasis) }),
     ...(signalDescriptor === undefined || signalDescriptor.value === undefined ? {} : { signal: signalDescriptor.value as AbortSignal })
   });
+};
+
+const freezeOwnedPortable = (value: JsonValue): JsonValue => {
+  if (value === null || typeof value !== 'object') return value;
+  for (const member of Array.isArray(value) ? value : Object.values(value)) freezeOwnedPortable(member);
+  return Object.freeze(value);
 };
 
 export class MutationStore {

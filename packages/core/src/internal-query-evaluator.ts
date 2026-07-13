@@ -295,6 +295,7 @@ export const joinLeftRow = (
     if (result.status !== 'known' || result.value !== true) continue;
     matched = true;
     if (node.join === 'inner' || node.join === 'cross' || node.join === 'left') rows.push(combined);
+    if (node.join === 'semi' || node.join === 'anti') break;
   }
   if (node.join === 'semi' && matched || node.join === 'anti' && !matched) rows.push(leftRow);
   if (node.join === 'left' && !matched) {
@@ -307,21 +308,21 @@ export const joinLeftRow = (
 type FieldExpression = Extract<Expr, { readonly kind: 'field' }>;
 export type EquijoinExpressions = { readonly left: Expr; readonly right: Expr };
 
-const equijoinField = (expression: Expr): FieldExpression | undefined => expression.kind === 'field'
-  ? expression
-  : expression.kind === 'array' && expression.items.length === 1 && expression.items[0]?.kind === 'field'
-    ? expression.items[0]
-    : undefined;
+const equijoinFieldsIn = (expression: Expr): readonly FieldExpression[] | undefined => {
+  if (expression.kind === 'field') return [expression];
+  if (expression.kind !== 'array' || expression.items.length === 0 || expression.items.some((item) => item.kind !== 'field')) return undefined;
+  return expression.items as readonly FieldExpression[];
+};
 
 export const equijoinFields = (node: Extract<QueryNode, { readonly kind: 'join' }>): EquijoinExpressions | undefined => {
   if (node.on?.kind !== 'compare' || node.on.op !== 'eq') return undefined;
-  const leftField = equijoinField(node.on.left);
-  const rightField = equijoinField(node.on.right);
-  if (leftField === undefined || rightField === undefined) return undefined;
+  const leftFields = equijoinFieldsIn(node.on.left);
+  const rightFields = equijoinFieldsIn(node.on.right);
+  if (leftFields === undefined || rightFields === undefined) return undefined;
   const leftAliases = queryAliases(node.left);
   const rightAliases = queryAliases(node.right);
-  if (leftAliases.has(leftField.alias) && rightAliases.has(rightField.alias)) return { left: node.on.left, right: node.on.right };
-  if (leftAliases.has(rightField.alias) && rightAliases.has(leftField.alias)) return { left: node.on.right, right: node.on.left };
+  if (leftFields.every(({ alias }) => leftAliases.has(alias)) && rightFields.every(({ alias }) => rightAliases.has(alias))) return { left: node.on.left, right: node.on.right };
+  if (leftFields.every(({ alias }) => rightAliases.has(alias)) && rightFields.every(({ alias }) => leftAliases.has(alias))) return { left: node.on.right, right: node.on.left };
   return undefined;
 };
 
@@ -331,13 +332,13 @@ const materializedEquijoinFields = (
   rightRows: readonly ScopedRow[]
 ): EquijoinExpressions | undefined => {
   if (node.on?.kind !== 'compare' || node.on.op !== 'eq' || leftRows.length === 0 || rightRows.length === 0) return undefined;
-  const leftField = equijoinField(node.on.left);
-  const rightField = equijoinField(node.on.right);
-  if (leftField === undefined || rightField === undefined) return undefined;
+  const leftFields = equijoinFieldsIn(node.on.left);
+  const rightFields = equijoinFieldsIn(node.on.right);
+  if (leftFields === undefined || rightFields === undefined) return undefined;
   const leftScope = (leftRows[0] as ScopedRow).scope;
   const rightScope = (rightRows[0] as ScopedRow).scope;
-  if (Object.hasOwn(leftScope, leftField.alias) && Object.hasOwn(rightScope, rightField.alias)) return { left: node.on.left, right: node.on.right };
-  if (Object.hasOwn(leftScope, rightField.alias) && Object.hasOwn(rightScope, leftField.alias)) return { left: node.on.right, right: node.on.left };
+  if (leftFields.every(({ alias }) => Object.hasOwn(leftScope, alias)) && rightFields.every(({ alias }) => Object.hasOwn(rightScope, alias))) return { left: node.on.left, right: node.on.right };
+  if (leftFields.every(({ alias }) => Object.hasOwn(rightScope, alias)) && rightFields.every(({ alias }) => Object.hasOwn(leftScope, alias))) return { left: node.on.right, right: node.on.left };
   return undefined;
 };
 

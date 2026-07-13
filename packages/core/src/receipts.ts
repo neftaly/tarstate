@@ -1,7 +1,7 @@
 import { type JsonValue, type PortableValue } from './value.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { isContentHash, safeParseJsonText, type ArtifactParseBudget, type ArtifactRef, type ContentHash } from './artifacts.js';
-import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import type { SourceBasis } from './maintenance.js';
 import type { CommitReceipt, NonAtomicBatchReceipt } from './transaction.js';
 
@@ -85,26 +85,30 @@ export type ForwardableReceipt = KnownReceipt | UnknownReceipt;
 export const safeParseReceipt = (input: unknown): ParseResult<ForwardableReceipt> => {
   const parsed = detachAndFreezeJsonValue(input);
   if (!parsed.success) return parsed;
-  if (!isRecord(parsed.value)) return receiptFailure('receipt.invalid', { reason: 'not_record' });
-  const kind = parsed.value.kind;
-  const version = parsed.value.receiptVersion;
+  return parseOwnedReceipt(parsed.value);
+};
+
+const parseOwnedReceipt = (value: JsonValue): ParseResult<ForwardableReceipt> => {
+  if (!isRecord(value)) return receiptFailure('receipt.invalid', { reason: 'not_record' });
+  const kind = value.kind;
+  const version = value.receiptVersion;
   if (typeof kind === 'string' && knownReceiptKinds.has(kind) && version === 1) {
-    if (!isKnownReceiptShape(parsed.value, 0)) return receiptFailure('receipt.invalid', { reason: 'known_shape', kind });
-    return { success: true, value: parsed.value as unknown as KnownReceipt, issues: [] };
+    if (!isKnownReceiptShape(value, 0)) return receiptFailure('receipt.invalid', { reason: 'known_shape', kind });
+    return { success: true, value: value as unknown as KnownReceipt, issues: [] };
   }
   const issue = createIssue({ code: 'receipt.unknown_kind_version', phase: 'parse', severity: 'warning', retry: 'never', details: { kind: typeof kind === 'string' ? kind : null, version: typeof version === 'number' ? version : null } });
-  const value: UnknownReceipt = Object.freeze({
+  const wrapper: UnknownReceipt = Object.freeze({
     kind: 'unknown_receipt',
     receiptVersion: 1,
-    original: parsed.value,
+    original: value,
     issues: Object.freeze([issue])
   });
-  return { success: true, value, issues: value.issues };
+  return { success: true, value: wrapper, issues: wrapper.issues };
 };
 
 export const safeParseReceiptText = (text: string, budget?: ArtifactParseBudget): ParseResult<ForwardableReceipt> => {
   const parsed = safeParseJsonText(text, budget);
-  return parsed.success ? safeParseReceipt(parsed.value) : parsed;
+  return parsed.success ? parseOwnedReceipt(freezeOwnedJsonValue(parsed.value)) : parsed;
 };
 
 export const executeSequence = async (input: {

@@ -34,6 +34,8 @@ export class CapabilityRegistry {
   readonly #implementations = new Map<string, CapabilityImplementation>();
   readonly trustPolicyId: string;
   #revision = 0;
+  #reachableRevision = -1;
+  #reachable = new Set<string>();
 
   constructor(trustPolicyId: string) { this.trustPolicyId = trustPolicyId; }
 
@@ -85,10 +87,8 @@ export class CapabilityRegistry {
   implementation(ref: CapabilityRef): CapabilityImplementation | undefined { return this.#implementations.get(capabilityRefKey(ref)); }
 
   satisfies(required: CapabilityRef): boolean {
-    const target = capabilityRefKey(required);
-    if (this.#implementations.has(target)) return true;
-    for (const implemented of this.#implementations.keys()) if (this.#implies(implemented, target, new Set())) return true;
-    return false;
+    if (this.#reachableRevision !== this.#revision) this.#rebuildReachable();
+    return this.#reachable.has(capabilityRefKey(required));
   }
 
   missing(required: readonly CapabilityRef[]): readonly Issue[] {
@@ -101,12 +101,16 @@ export class CapabilityRegistry {
     return sha256Json({ trustPolicyId: this.trustPolicyId, declarations, implementations, resourceBudgets } as unknown as JsonValue);
   }
 
-  #implies(from: string, target: string, visited: Set<string>): boolean {
-    if (from === target) return true;
-    if (visited.has(from)) return false;
-    visited.add(from);
-    const declaration = this.#declarations.get(from);
-    return declaration?.implies.some((ref) => this.#implies(capabilityRefKey(ref), target, visited)) ?? false;
+  #rebuildReachable(): void {
+    const reachable = new Set<string>();
+    const visit = (key: string): void => {
+      if (reachable.has(key)) return;
+      reachable.add(key);
+      for (const implied of this.#declarations.get(key)?.implies ?? []) visit(capabilityRefKey(implied));
+    };
+    for (const implemented of this.#implementations.keys()) visit(implemented);
+    this.#reachable = reachable;
+    this.#reachableRevision = this.#revision;
   }
 
   #findCycle(): readonly string[] | undefined {

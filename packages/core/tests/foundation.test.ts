@@ -213,6 +213,27 @@ describe('production foundation', () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
+  it('invalidates cached capability reachability after implementations and declarations change', async () => {
+    const leaf: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:cache-leaf', version: '1', class: 'edit', contract: {}, implies: [] };
+    const leafRef = await capabilityRefFor(leaf);
+    const middle: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:cache-middle', version: '1', class: 'edit', contract: {}, implies: [leafRef] };
+    const middleRef = await capabilityRefFor(middle);
+    const strong: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:cache-strong', version: '1', class: 'edit', contract: {}, implies: [middleRef] };
+    const strongRef = await capabilityRefFor(strong);
+    const registry = new CapabilityRegistry('trust:cache-invalidation');
+    await registry.registerDeclaration(leaf);
+    await registry.registerDeclaration(strong);
+
+    expect(registry.satisfies(strongRef)).toBe(false);
+    expect(registry.satisfies(leafRef)).toBe(false);
+    registry.registerImplementation({ ref: strongRef, integrity: 'sha256:strong', implementation: {} });
+    expect(registry.satisfies(strongRef)).toBe(true);
+    expect(registry.satisfies(leafRef)).toBe(false);
+
+    await registry.registerDeclaration(middle);
+    expect(registry.satisfies(leafRef)).toBe(true);
+  });
+
   it('owns frozen capability metadata independently of registration inputs', async () => {
     const weak: CapabilityDeclaration = { kind: 'tarstate.capability-contract', formatVersion: 1, id: 'urn:test:owned-weak', version: '1', class: 'edit', contract: {}, implies: [] };
     const weakRef = await capabilityRefFor(weak);

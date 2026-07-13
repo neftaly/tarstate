@@ -408,6 +408,27 @@ describe('production query oracle', () => {
     ]);
   });
 
+  it('stops existence joins after the first indexed match', () => {
+    const join = (kind: 'inner' | 'semi' | 'anti'): QueryNode => ({
+      kind: 'join', join: kind, left: from('existence-left', 'left'), right: from('existence-right', 'right'),
+      on: { kind: 'compare', op: 'eq', left: { kind: 'field', alias: 'left', name: 'id' }, right: { kind: 'field', alias: 'right', name: 'id' } }
+    });
+    const relations = [
+      relation('existence-left', [{ id: 1 }]),
+      relation('existence-right', Array.from({ length: 50 }, (_, index) => ({ id: 1, index })))
+    ];
+    const minimumExactBudget = (kind: 'inner' | 'semi' | 'anti'): number => {
+      const budget = Array.from({ length: 500 }, (_, index) => index + 1).find((maxWorkUnits) =>
+        evaluateQuery({ root: join(kind), relations, executionBudget: { maxWorkUnits } }).completeness === 'exact');
+      if (budget === undefined) throw new Error('expected an exact execution budget');
+      return budget;
+    };
+    const innerBudget = minimumExactBudget('inner');
+
+    expect(minimumExactBudget('semi') * 1.5).toBeLessThan(innerBudget);
+    expect(minimumExactBudget('anti') * 1.5).toBeLessThan(innerBudget);
+  });
+
   it('evaluates singleton-tuple reference joins in either operand order', () => {
     const reference = { kind: 'field', alias: 'pizza', name: 'base' } as const;
     const keyTuple = { kind: 'array', items: [{ kind: 'field', alias: 'base', name: 'name' } as const] } as const;
@@ -423,6 +444,38 @@ describe('production query oracle', () => {
     for (const reversed of [false, true]) expect(evaluateQuery({ root: join(reversed), relations }).rows).toEqual([
       { pizza: { name: 'Margherita', base: ['thin'] }, base: { name: 'thin', style: 'crisp' } },
       { pizza: { name: 'Deep dish', base: ['deep'] }, base: { name: 'deep', style: 'soft' } }
+    ]);
+  });
+
+  it('indexes composite tuple joins without changing null or missing-field semantics', () => {
+    const leftKey = { kind: 'array', items: [
+      { kind: 'field', alias: 'left', name: 'tenant' },
+      { kind: 'field', alias: 'left', name: 'id' }
+    ] } as const;
+    const rightKey = { kind: 'array', items: [
+      { kind: 'field', alias: 'right', name: 'tenant' },
+      { kind: 'field', alias: 'right', name: 'ownerId' }
+    ] } as const;
+    const join = (reversed: boolean): QueryNode => ({
+      kind: 'join', join: 'inner', left: from('composite-left', 'left'), right: from('composite-right', 'right'),
+      on: { kind: 'compare', op: 'eq', left: reversed ? rightKey : leftKey, right: reversed ? leftKey : rightKey }
+    });
+    const relations = [
+      relation('composite-left', [
+        { tenant: 'a', id: 1, label: 'match' },
+        { tenant: null, id: 2, label: 'null tuple member' },
+        { id: 3, label: 'missing tuple member' }
+      ]),
+      relation('composite-right', [
+        { tenant: 'a', ownerId: 1, value: 'match' },
+        { tenant: null, ownerId: 2, value: 'null tuple member' },
+        { ownerId: 3, value: 'missing tuple member' }
+      ])
+    ];
+
+    for (const reversed of [false, true]) expect(evaluateQuery({ root: join(reversed), relations }).rows).toEqual([
+      { left: { tenant: 'a', id: 1, label: 'match' }, right: { tenant: 'a', ownerId: 1, value: 'match' } },
+      { left: { tenant: null, id: 2, label: 'null tuple member' }, right: { tenant: null, ownerId: 2, value: 'null tuple member' } }
     ]);
   });
 

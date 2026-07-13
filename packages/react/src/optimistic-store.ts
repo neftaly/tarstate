@@ -159,10 +159,12 @@ export class OptimisticOverlayStore {
       });
     }
     for (const [overlay, error] of failures) this.#scheduleFailure(overlay, error);
-    return operations.length === 0 ? authoritative : deepFreezeClone({
+    if (operations.length === 0) return authoritative;
+    const ownedOperations = Object.freeze(operations.map((operation) => Object.freeze(operation)));
+    return Object.freeze({
       ...authoritative,
-      current: { ...authoritative.current, rows, resultKeys },
-      optimistic: { operations }
+      current: Object.freeze({ ...authoritative.current, rows, resultKeys }),
+      optimistic: Object.freeze({ operations: ownedOperations })
     });
   }
 

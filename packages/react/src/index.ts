@@ -119,10 +119,19 @@ export const useRow = <Query, Row, Parameters extends Readonly<Record<string, Js
     if (snapshot.state === 'closed') return undefined;
     const result = options.readFrom === 'last-exact' ? snapshot.lastExact : snapshot.current;
     if (result === undefined) return undefined;
-    const index = result.resultKeys.indexOf(resultKey);
+    const index = resultKeyIndex(result.resultKeys).get(resultKey) ?? -1;
     return index < 0 ? undefined : result.rows[index];
   }, [options.readFrom, resultKey]);
   return useQuery(plan, { ...options, selectSnapshot, areSelectionsEqual: options.areSelectionsEqual ?? Object.is });
+};
+
+const resultKeyIndexes = new WeakMap<readonly string[], ReadonlyMap<string, number>>();
+const resultKeyIndex = (keys: readonly string[]): ReadonlyMap<string, number> => {
+  const cached = resultKeyIndexes.get(keys);
+  if (cached !== undefined) return cached;
+  const index = new Map(keys.map((key, position) => [key, position]));
+  resultKeyIndexes.set(keys, index);
+  return index;
 };
 
 /** Returns the current provider commit action without replacing the query runtime. */

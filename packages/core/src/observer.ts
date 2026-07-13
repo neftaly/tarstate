@@ -616,7 +616,7 @@ const observerChange = <Row>(previous: ObserverSnapshot<Row>, next: ObserverSnap
   const beforeMetadata = trustedObservedResults.get(baseline as object);
   const afterMetadata = trustedObservedResults.get(next.current as object);
   if (baseline === previous.current && beforeMetadata !== undefined && afterMetadata !== undefined && afterMetadata.revision === beforeMetadata.revision + 1) {
-    return Object.freeze({ kind: 'diff', diff: incrementalResultDiff(baseline, next.current, afterMetadata.resultDelta), snapshot: next });
+    return Object.freeze({ kind: 'diff', diff: incrementalResultDiff(baseline, next.current, beforeMetadata, afterMetadata), snapshot: next });
   }
   return Object.freeze({ kind: 'diff', diff: resultDiff(baseline, next.current), snapshot: next });
 };
@@ -650,27 +650,28 @@ const sameObservedResultMetadata = <Row>(left: ObservedQueryResult<Row>, right: 
 const incrementalResultDiff = <Row>(
   before: ObservedQueryResult<Row>,
   after: ObservedQueryResult<Row>,
-  delta: TrustedIncrementalMetadata['resultDelta']
+  beforeMetadata: TrustedIncrementalMetadata,
+  afterMetadata: TrustedIncrementalMetadata
 ): ResultDiff<Row> => {
-  const addedKeys = new Set(delta.addedResultKeys);
-  const removedKeys = new Set(delta.removedResultKeys);
-  const updatedKeys = new Set(delta.updatedResultKeys);
-  const added: { readonly key: string; readonly row: Row }[] = [];
-  const removed: { readonly key: string; readonly row: Row }[] = [];
-  for (let index = 0; index < after.resultKeys.length; index += 1) {
-    const key = after.resultKeys[index] as string;
-    if (addedKeys.has(key)) added.push(Object.freeze({ key, row: after.rows[index] as Row }));
-  }
-  for (let index = 0; index < before.resultKeys.length; index += 1) {
-    const key = before.resultKeys[index] as string;
-    if (removedKeys.has(key)) removed.push(Object.freeze({ key, row: before.rows[index] as Row }));
-  }
-  const beforeUpdated = new Map<string, Row>();
-  before.resultKeys.forEach((key, index) => { if (updatedKeys.has(key)) beforeUpdated.set(key, before.rows[index] as Row); });
-  const updated: { readonly key: string; readonly before: Row; readonly after: Row }[] = [];
-  after.resultKeys.forEach((key, index) => {
-    const prior = beforeUpdated.get(key);
-    if (prior !== undefined && updatedKeys.has(key)) updated.push(Object.freeze({ key, before: prior, after: after.rows[index] as Row }));
+  const delta = afterMetadata.resultDelta;
+  const ordered = (keys: readonly string[], positions: ReadonlyMap<string, number>): readonly string[] =>
+    [...keys].sort((left, right) => (positions.get(left) ?? 0) - (positions.get(right) ?? 0));
+  const added = ordered(delta.addedResultKeys, afterMetadata.resultKeyPositions).flatMap((key) => {
+    const position = afterMetadata.resultKeyPositions.get(key);
+    return position === undefined ? [] : [Object.freeze({ key, row: after.rows[position] as Row })];
+  });
+  const removed = ordered(delta.removedResultKeys, beforeMetadata.resultKeyPositions).flatMap((key) => {
+    const position = beforeMetadata.resultKeyPositions.get(key);
+    return position === undefined ? [] : [Object.freeze({ key, row: before.rows[position] as Row })];
+  });
+  const updated = ordered(delta.updatedResultKeys, afterMetadata.resultKeyPositions).flatMap((key) => {
+    const beforePosition = beforeMetadata.resultKeyPositions.get(key);
+    const afterPosition = afterMetadata.resultKeyPositions.get(key);
+    return beforePosition === undefined || afterPosition === undefined ? [] : [Object.freeze({
+      key,
+      before: before.rows[beforePosition] as Row,
+      after: after.rows[afterPosition] as Row
+    })];
   });
   return Object.freeze({ added: Object.freeze(added), removed: Object.freeze(removed), updated: Object.freeze(updated) });
 };

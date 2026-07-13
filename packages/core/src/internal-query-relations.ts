@@ -9,7 +9,11 @@ export const relationKey = (relation: RelationUse): string =>
 export const relationInputKey = (input: RelationInput): string =>
   stringTupleKey(relationKey(input.relation), input.attachmentId ?? input.sourceId ?? '');
 
+const groupedRelationInputs = new WeakMap<readonly RelationInput[], ReadonlyMap<string, readonly RelationInput[]>>();
+
 export const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyMap<string, readonly RelationInput[]> => {
+  const cached = groupedRelationInputs.get(inputs);
+  if (cached !== undefined) return cached;
   const grouped = new Map<string, RelationInput[]>();
   for (const input of inputs) {
     const key = relationKey(input.relation);
@@ -17,6 +21,7 @@ export const groupRelationInputs = (inputs: readonly RelationInput[]): ReadonlyM
     if (group === undefined) grouped.set(key, [input]);
     else group.push(input);
   }
+  if (Object.isFrozen(inputs)) groupedRelationInputs.set(inputs, grouped);
   return grouped;
 };
 
