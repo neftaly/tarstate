@@ -270,6 +270,20 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
 }
 
 {
+  const uniqueKeyCount = 10_000;
+  const rows = [...Array.from({ length: uniqueKeyCount }, (_, id) => ({ id, key: id })), { id: uniqueKeyCount, key: 0 }];
+  const changedRows = rows.map((row, index) => index === uniqueKeyCount ? { ...row, key: 1 } : row);
+  const first = { relations: [input('distinct-high-cardinality', rows)] };
+  const second = { relations: [input('distinct-high-cardinality', changedRows)] };
+  const query = { kind: 'distinct', input: { kind: 'select', input: from('distinct-high-cardinality', 'row'), alias: 'value', fields: { key: field('row', 'key') } } };
+  const session = openIncrementalQueryMaintenance(await plan('distinct-high-cardinality', query), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  measurements.push(benchmark('distinct-high-cardinality-hidden-update', rows.length, 200, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
+  session.close();
+}
+
+{
   const count = 5_000;
   const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
   const initial = { relations };
@@ -577,6 +591,27 @@ const { profile: distinctAllocationProfile } = await post(distinctAllocationSess
 distinctAllocationSession.disconnect();
 const distinctSampledAllocationBytes = distinctAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
 
+const highCardinalityDistinctAllocationSession = new inspector.Session();
+highCardinalityDistinctAllocationSession.connect();
+await post(highCardinalityDistinctAllocationSession, 'HeapProfiler.enable');
+await post(highCardinalityDistinctAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+{
+  const uniqueKeyCount = 10_000;
+  const rows = [...Array.from({ length: uniqueKeyCount }, (_, id) => ({ id, key: id })), { id: uniqueKeyCount, key: 0 }];
+  const changedRows = rows.map((row, index) => index === uniqueKeyCount ? { ...row, key: 1 } : row);
+  const first = { relations: [input('distinct-high-cardinality-allocation', rows)] };
+  const second = { relations: [input('distinct-high-cardinality-allocation', changedRows)] };
+  const query = { kind: 'distinct', input: { kind: 'select', input: from('distinct-high-cardinality-allocation', 'row'), alias: 'value', fields: { key: field('row', 'key') } } };
+  const session = openIncrementalQueryMaintenance(await plan('distinct-high-cardinality-allocation', query), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  for (let index = 0; index < 200; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
+  session.close();
+}
+const { profile: highCardinalityDistinctAllocationProfile } = await post(highCardinalityDistinctAllocationSession, 'HeapProfiler.stopSampling');
+highCardinalityDistinctAllocationSession.disconnect();
+const highCardinalityDistinctSampledAllocationBytes = highCardinalityDistinctAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+
 const pooledAllocationFirst = { relations: [input('item', linearRows(1_000))] };
 const pooledAllocationSecond = { relations: [input('item', linearRows(1_000, true))] };
 const pooledAllocationRuntime = createPooledIncrementalQueryRuntime({
@@ -614,6 +649,7 @@ const aggregatePure10k = measurement('aggregate', 10_000)?.millisecondsPerOperat
 const aggregateUpdate10k = measurement('aggregate-one-row-update', 10_000)?.millisecondsPerOperation;
 const distinctPure10k = measurement('distinct', 10_000)?.millisecondsPerOperation;
 const distinctUpdate10k = measurement('distinct-one-row-update', 10_000)?.millisecondsPerOperation;
+const highCardinalityDistinctUpdate = measurement('distinct-high-cardinality-hidden-update', 10_001)?.millisecondsPerOperation;
 const groupedReducerPure10k = measurement('aggregate-reducer-grouped', 10_000)?.millisecondsPerOperation;
 const groupedReducerUpdate10k = measurement('aggregate-reducer-grouped-one-row-update', 10_000)?.millisecondsPerOperation;
 const ungroupedReducerPure10k = measurement('aggregate-reducer-ungrouped', 10_000)?.millisecondsPerOperation;
@@ -636,6 +672,7 @@ const rightJoinBytesPerUpdate = Math.round(rightJoinSampledAllocationBytes / 100
 const aggregateBytesPerUpdate = Math.round(aggregateSampledAllocationBytes / 100);
 const ungroupedReducerBytesPerUpdate = Math.round(ungroupedReducerSampledAllocationBytes / 100);
 const distinctBytesPerUpdate = Math.round(distinctSampledAllocationBytes / 100);
+const highCardinalityDistinctBytesPerUpdate = Math.round(highCardinalityDistinctSampledAllocationBytes / 200);
 const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
 const pooledFanout10 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 10)?.millisecondsPerUpdate;
 const pooledFanout100 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 100)?.millisecondsPerUpdate;
@@ -649,12 +686,17 @@ const contracts = {
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
   distinctIncrementalAdvantage: distinctPure10k !== undefined && distinctUpdate10k !== undefined && distinctUpdate10k < distinctPure10k * 0.5,
+  highCardinalityDistinctIncrementalAdvantage: highCardinalityDistinctUpdate !== undefined && distinctPure10k !== undefined && highCardinalityDistinctUpdate < distinctPure10k * 0.2,
   groupedReducerIncrementalAdvantage: groupedReducerPure10k !== undefined && groupedReducerUpdate10k !== undefined && groupedReducerUpdate10k < groupedReducerPure10k * 0.5,
   ungroupedReducerIncrementalAdvantage: ungroupedReducerPure10k !== undefined && ungroupedReducerUpdate10k !== undefined && ungroupedReducerUpdate10k < ungroupedReducerPure10k * 0.5,
   groupedReducerOpenNearLinear: groupedReducerOpen1k !== undefined && groupedReducerOpen10k !== undefined && groupedReducerOpen10k < groupedReducerOpen1k * 15,
   aggregateAllocationCeiling: aggregateBytesPerUpdate <= 1_000_000,
   ungroupedReducerAllocationCeiling: ungroupedReducerBytesPerUpdate <= 1_000_000,
   distinctAllocationCeiling: distinctBytesPerUpdate <= 1_000_000,
+  // The duplicate never represents its key, so a correct sparse update can
+  // retain the entire 10k-row result. Full Map cloning and representative
+  // sorting alone sampled above 3.5 MB/update in the rejected implementation.
+  highCardinalityDistinctAllocationCeiling: highCardinalityDistinctBytesPerUpdate <= 1_500_000,
   partitionedWindowAdvantage: windowUpdate10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < windowUpdate10k * 0.5,
   partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
   rightJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinRightUpdate10k !== undefined && joinRightUpdate10k < joinPreparedPure10k * 0.5,
@@ -709,6 +751,12 @@ process.stdout.write(JSON.stringify({
     workload: '100 one-row updates over a 1,000-row, 100-key distinct query',
     sampledBytes: distinctSampledAllocationBytes,
     sampledBytesPerUpdate: distinctBytesPerUpdate
+  },
+  highCardinalityDistinctAllocationSample: {
+    workload: '200 trailing duplicate-key updates over a 10,001-row, 10,000-key distinct query',
+    sampledBytes: highCardinalityDistinctSampledAllocationBytes,
+    sampledBytesPerUpdate: highCardinalityDistinctBytesPerUpdate,
+    boundaryNote: 'The changed row is never a representative, so the public distinct output remains unchanged.'
   },
   pooledAllocationSample: {
     workload: '100 one-row updates to a field ignored by 100 pooled roots over 1,000 input rows',
