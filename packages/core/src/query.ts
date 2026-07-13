@@ -399,8 +399,9 @@ type MaterializedQueryNode = {
   };
   readonly window?: {
     readonly inputs: readonly ScopedRow[];
-    readonly partitionKeyByRow: ReadonlyMap<ScopedRow, string>;
+    readonly partitionKeyByResultKey: ReadonlyMap<string, string>;
     readonly partitions: ReadonlyMap<string, { readonly members: readonly ScopedRow[]; readonly outputs: readonly ScopedRow[] }>;
+    readonly layouts?: WindowMaintenanceLayouts;
   };
   readonly aggregate?: {
     readonly inputs: readonly ScopedRow[];
@@ -415,9 +416,12 @@ type AggregateGroupKey = { readonly canonical: string; readonly key: QueryRecord
 type AggregateGroupMember = { readonly position: number; readonly row: ScopedRow };
 type AggregateGroupState = { readonly key: QueryRecord; readonly members: readonly AggregateGroupMember[]; readonly reducers: AggregateReducerStates; readonly output: ScopedRow };
 type DistinctCountIndex = { readonly base: ReadonlyMap<string, number>; readonly overlays: readonly ReadonlyMap<string, number>[], readonly distinctCount: number };
+type ExtremeValueEntry = { readonly count: number; readonly value: JsonValue };
+type ExtremeValueIndex = { readonly base: ReadonlyMap<string, ExtremeValueEntry>; readonly overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[]; readonly extremeKey?: string };
 type AggregateReducerState =
   | { readonly kind: 'count'; readonly count: number }
   | { readonly kind: 'distinct'; readonly index: DistinctCountIndex }
+  | { readonly kind: 'extreme'; readonly index: ExtremeValueIndex }
   | { readonly kind: 'truth'; readonly trueCount: number; readonly falseCount: number; readonly unknownCount: number };
 type AggregateReducerStates = ReadonlyMap<string, AggregateReducerState>;
 type AggregateRowGroupIndex = {
@@ -962,6 +966,17 @@ type WindowLayoutRow = {
   readonly rank: number;
 };
 type WindowLayout = readonly (readonly WindowLayoutRow[])[];
+type WindowMaintenancePosition = {
+  readonly partitionKey: string;
+  readonly orderSignature: string;
+  readonly sortedIndex: number;
+  readonly outputIndex: number;
+};
+type WindowMaintenanceLayout = {
+  readonly positions: ReadonlyMap<string, WindowMaintenancePosition>;
+  readonly partitions: ReadonlyMap<string, readonly number[]>;
+};
+type WindowMaintenanceLayouts = ReadonlyMap<string, WindowMaintenanceLayout>;
 
 const buildWindowLayout = (rows: readonly ScopedRow[], window: WindowExpr, context: QueryContext): WindowLayout => {
   const partitions = new Map<string, { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[] }[]>();
@@ -998,6 +1013,55 @@ const compareWindowRows = (
     if (comparison !== 0) return comparison;
   }
   return comparePortableStrings(resultKey(rows[left.outputIndex] as ScopedRow), resultKey(rows[right.outputIndex] as ScopedRow));
+};
+
+const windowOrderSignature = (values: readonly ExpressionResult[]): string => canonicalizeJson(values.map((value) =>
+  value.status === 'missing'
+    ? ['missing']
+    : value.status === 'known' && value.value !== null
+      ? ['known', value.value]
+      : ['nullish']
+) as JsonValue);
+
+const evaluateWindowKeys = (window: WindowExpr, row: ScopedRow, context: QueryContext): { readonly partitionKey: string; readonly orderValues: readonly ExpressionResult[]; readonly orderSignature: string } => {
+  const partitionValues = (window.partitionBy ?? []).map((expression) => evaluateExpr(expression, exprContext(row, context)));
+  const orderValues = window.orderBy.map((term) => evaluateExpr(term.value, exprContext(row, context)));
+  if ([...partitionValues, ...orderValues].some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
+  return {
+    partitionKey: canonicalizeJson(partitionValues.map(expressionJson)),
+    orderValues,
+    orderSignature: windowOrderSignature(orderValues)
+  };
+};
+
+const indexWindowMaintenanceLayouts = (
+  node: Extract<QueryNode, { readonly kind: 'window' }>,
+  rows: readonly ScopedRow[],
+  context: QueryContext
+): WindowMaintenanceLayouts | undefined => {
+  const layouts = new Map<string, WindowMaintenanceLayout>();
+  for (const window of Object.values(node.fields)) {
+    const specification = windowSpecificationKey(window);
+    if (layouts.has(specification)) continue;
+    const grouped = new Map<string, { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[]; readonly orderSignature: string }[]>();
+    for (const [outputIndex, row] of rows.entries()) {
+      const keys = evaluateWindowKeys(window, row, context);
+      const partition = grouped.get(keys.partitionKey) ?? [];
+      partition.push({ outputIndex, orderValues: keys.orderValues, orderSignature: keys.orderSignature });
+      grouped.set(keys.partitionKey, partition);
+    }
+    if (context.unavailable) return undefined;
+    const positions = new Map<string, WindowMaintenancePosition>();
+    const partitions = new Map<string, readonly number[]>();
+    for (const [partitionKey, partition] of grouped) {
+      partition.sort((left, right) => compareWindowRows(left, right, rows, window.orderBy));
+      const outputIndexes = partition.map(({ outputIndex }) => outputIndex);
+      partitions.set(partitionKey, outputIndexes);
+      partition.forEach(({ outputIndex, orderSignature }, sortedIndex) => positions.set(resultKey(rows[outputIndex] as ScopedRow), { partitionKey, orderSignature, sortedIndex, outputIndex }));
+    }
+    layouts.set(specification, { positions, partitions });
+  }
+  return layouts;
 };
 
 const windowSpecificationKey = (window: WindowExpr): string => canonicalizeJson({
@@ -2466,17 +2530,122 @@ const indexWindowState = (
   context: QueryContext
 ): NonNullable<MaterializedQueryNode['window']> | undefined => {
   if (inputs.length !== outputs.length) return undefined;
-  const partitionKeyByRow = new Map<ScopedRow, string>();
+  const partitionKeyByResultKey = new Map<string, string>();
   const partitions = new Map<string, { members: ScopedRow[]; outputs: ScopedRow[] }>();
   inputs.forEach((row, index) => {
     const key = windowPartitionKey(node, row, context);
-    partitionKeyByRow.set(row, key);
+    partitionKeyByResultKey.set(resultKey(row), key);
     const partition = partitions.get(key) ?? { members: [], outputs: [] };
     partition.members.push(row);
     partition.outputs.push(outputs[index] as ScopedRow);
     partitions.set(key, partition);
   });
-  return context.unavailable ? undefined : { inputs, partitionKeyByRow, partitions };
+  const layouts = context.unavailable ? undefined : indexWindowMaintenanceLayouts(node, inputs, context);
+  return context.unavailable || layouts === undefined ? undefined : { inputs, partitionKeyByResultKey, partitions, layouts };
+};
+
+const expressionReferencesWindowFields = (expression: Expr, alias: string, fields: ReadonlySet<string>): boolean => {
+  if (expression.kind === 'field') return expression.alias === alias && fields.has(expression.name);
+  if (expression.kind === 'literal' || expression.kind === 'parameter' || expression.kind === 'key-of' || expression.kind === 'source-of' || expression.kind === 'subquery') return false;
+  if (expression.kind === 'compare' || expression.kind === 'arithmetic') return expressionReferencesWindowFields(expression.left, alias, fields) || expressionReferencesWindowFields(expression.right, alias, fields);
+  if (expression.kind === 'is-null' || expression.kind === 'is-missing') return expressionReferencesWindowFields(expression.value, alias, fields);
+  if (expression.kind === 'boolean') return expression.op === 'not' ? expressionReferencesWindowFields(expression.arg, alias, fields) : expression.args.some((argument) => expressionReferencesWindowFields(argument, alias, fields));
+  if (expression.kind === 'case') return expression.branches.some(({ when, then }) => expressionReferencesWindowFields(when, alias, fields) || expressionReferencesWindowFields(then, alias, fields)) || expressionReferencesWindowFields(expression.otherwise, alias, fields);
+  if (expression.kind === 'record') return Object.values(expression.fields).some((field) => expressionReferencesWindowFields(field, alias, fields));
+  const expressions = expression.kind === 'array' ? expression.items : expression.args;
+  return expressions.some((argument) => expressionReferencesWindowFields(argument, alias, fields));
+};
+
+const microMaterializeStableWindow = (
+  node: Extract<QueryNode, { readonly kind: 'window' }>,
+  inputs: readonly ScopedRow[],
+  changedPositions: readonly number[],
+  previous: MaterializedQueryNode,
+  context: QueryContext
+): MaterializedQueryNode | undefined => {
+  const state = previous.window;
+  if (state?.layouts === undefined || state.inputs.length !== inputs.length || previous.result.rows.length !== inputs.length) return undefined;
+  if (!state.inputs.every((row, index) => resultKey(row) === resultKey(inputs[index] as ScopedRow))) return undefined;
+  const outputFields = new Set(Object.keys(node.fields));
+  if (Object.values(node.fields).some((window) => window.op === 'lag' && window.value !== undefined && expressionReferencesWindowFields(window.value, node.alias, outputFields))) return undefined;
+  const specifications = new Map<string, WindowExpr>();
+  for (const window of Object.values(node.fields)) specifications.set(windowSpecificationKey(window), window);
+
+  for (const position of changedPositions) {
+    const row = inputs[position];
+    if (row === undefined) return undefined;
+    for (const [specification, window] of specifications) {
+      const indexed = state.layouts.get(specification)?.positions.get(resultKey(row));
+      if (indexed === undefined) return undefined;
+      const keys = evaluateWindowKeys(window, row, context);
+      if (keys.partitionKey !== indexed.partitionKey || keys.orderSignature !== indexed.orderSignature) return undefined;
+    }
+  }
+  if (context.unavailable || context.issues.length > 0) return undefined;
+
+  const output = previous.result.rows.slice();
+  const affected = new Set<number>();
+  for (const position of changedPositions) {
+    const input = inputs[position] as ScopedRow;
+    if (input === state.inputs[position]) continue;
+    const prior = previous.result.rows[position] as ScopedRow;
+    const inputAlias = requiredAlias(input, node.alias, context);
+    const priorAlias = requiredAlias(prior, node.alias, context);
+    if (inputAlias === undefined || priorAlias === undefined) return undefined;
+    const retainedFields = Object.fromEntries([...outputFields].map((field) => [field, priorAlias[field] as QueryLogicalValue]));
+    output[position] = { ...input, scope: { ...input.scope, [node.alias]: { ...inputAlias, ...retainedFields } } };
+    affected.add(position);
+  }
+
+  for (const [field, window] of Object.entries(node.fields)) {
+    if (window.op !== 'lag') continue;
+    const layout = state.layouts.get(windowSpecificationKey(window));
+    if (layout === undefined) return undefined;
+    const targets = new Map<number, number>();
+    for (const sourcePosition of changedPositions) {
+      const source = inputs[sourcePosition];
+      if (source === undefined || source === state.inputs[sourcePosition]) continue;
+      const indexed = layout.positions.get(resultKey(source));
+      const partition = indexed === undefined ? undefined : layout.partitions.get(indexed.partitionKey);
+      const targetPosition = indexed === undefined || partition === undefined ? undefined : partition[indexed.sortedIndex + (window.offset ?? 1)];
+      if (targetPosition !== undefined) targets.set(targetPosition, sourcePosition);
+    }
+    for (const [targetPosition, sourcePosition] of targets) {
+      const source = inputs[sourcePosition] as ScopedRow;
+      const contribution = window.value === undefined ? undefined : evaluateExpr(window.value, exprContext(source, context));
+      if (contribution?.status === 'unavailable' || contribution?.status === 'indeterminate') context.unavailable = true;
+      const value: JsonValue = contribution === undefined ? null : expressionJson(contribution);
+      const target = output[targetPosition] as ScopedRow;
+      const aliasFields = requiredAlias(target, node.alias, context);
+      if (aliasFields === undefined) return undefined;
+      if (queryValueEqual(aliasFields[field] as QueryLogicalValue, value)) continue;
+      output[targetPosition] = { ...target, scope: { ...target.scope, [node.alias]: { ...aliasFields, [field]: value } } };
+      affected.add(targetPosition);
+    }
+  }
+  if (context.unavailable || context.issues.length > 0) return undefined;
+
+  const partitionKeyByResultKey = new Map<string, string>();
+  const partitions = new Map<string, { members: ScopedRow[]; outputs: ScopedRow[] }>();
+  const firstLayout = state.layouts.values().next().value as WindowMaintenanceLayout | undefined;
+  if (firstLayout === undefined) return undefined;
+  for (const [position, row] of inputs.entries()) {
+    const key = firstLayout.positions.get(resultKey(row))?.partitionKey;
+    if (key === undefined) return undefined;
+    partitionKeyByResultKey.set(resultKey(row), key);
+    const partition = partitions.get(key) ?? { members: [], outputs: [] };
+    partition.members.push(row);
+    partition.outputs.push(output[position] as ScopedRow);
+    partitions.set(key, partition);
+  }
+  const stableChangedPositions = [...affected].sort((left, right) => left - right);
+  return withMaintenanceEvent({
+    result: { rows: output, completeness: 'exact' },
+    issues: [],
+    unavailable: false,
+    stableChangedPositions,
+    window: { inputs, partitionKeyByResultKey, partitions, layouts: state.layouts }
+  }, { operator: 'window', strategy: 'selective', affectedUnitCount: stableChangedPositions.length });
 };
 
 const incrementallyMaterializeWindow = (
@@ -2496,11 +2665,18 @@ const incrementallyMaterializeWindow = (
   }
   const issues: Issue[] = [];
   const context = materializationContext(snapshot, materializedNodes, node, issues);
-  const partitionKeyByRow = new Map<ScopedRow, string>();
+  if (child.stableChangedPositions !== undefined) {
+    const micro = microMaterializeStableWindow(node, child.result.rows, child.stableChangedPositions, previous, context);
+    if (micro !== undefined) return micro;
+  }
+  const partitionKeyByResultKey = new Map<string, string>();
   const partitions = new Map<string, { members: ScopedRow[]; positions: number[] }>();
   child.result.rows.forEach((row, position) => {
-    const key = previous.window?.partitionKeyByRow.get(row) ?? windowPartitionKey(node, row, context);
-    partitionKeyByRow.set(row, key);
+    const identity = resultKey(row);
+    const key = previous.window?.inputs[position] === row
+      ? previous.window.partitionKeyByResultKey.get(identity) ?? windowPartitionKey(node, row, context)
+      : windowPartitionKey(node, row, context);
+    partitionKeyByResultKey.set(identity, key);
     const partition = partitions.get(key) ?? { members: [], positions: [] };
     partition.members.push(row);
     partition.positions.push(position);
@@ -2529,12 +2705,15 @@ const incrementallyMaterializeWindow = (
   }
   const stableIdentityLayout = previous.window.inputs.length === child.result.rows.length
     && previous.window.inputs.every((row, index) => resultKey(row) === resultKey(child.result.rows[index] as ScopedRow));
+  const layoutContext = materializationContext(snapshot, materializedNodes, node, [], false);
+  const layouts = indexWindowMaintenanceLayouts(node, child.result.rows, layoutContext);
+  if (layoutContext.unavailable || layouts === undefined) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' });
   return withMaintenanceEvent({
     result: { rows: output, completeness: 'exact' },
     issues: [],
     unavailable: false,
     ...(stableIdentityLayout ? { stableChangedPositions: changedPositions.sort((left, right) => left - right) } : {}),
-    window: { inputs: child.result.rows, partitionKeyByRow, partitions: indexedPartitions }
+    window: { inputs: child.result.rows, partitionKeyByResultKey, partitions: indexedPartitions, layouts }
   }, { operator: 'window', strategy: 'selective', affectedUnitCount: changedPositions.length });
 };
 
@@ -2641,7 +2820,7 @@ const aggregateGroupRow = (
 
 const aggregateReducerEligible = (aggregate: AggregateExpr): boolean =>
   aggregate.orderBy === undefined
-  && (aggregate.op === 'count' || aggregate.op === 'count-distinct' || aggregate.op === 'any' || aggregate.op === 'every')
+  && (aggregate.op === 'count' || aggregate.op === 'count-distinct' || aggregate.op === 'minimum' || aggregate.op === 'maximum' || aggregate.op === 'any' || aggregate.op === 'every')
   && (aggregate.value === undefined || !containsSubquery(aggregate.value) && !containsNamedCall(aggregate.value));
 
 const allAggregateMeasuresReduced = (node: Extract<QueryNode, { readonly kind: 'aggregate' }>): boolean =>
@@ -2653,7 +2832,7 @@ const aggregateContribution = (aggregate: AggregateExpr, row: ScopedRow, context
   return contribution;
 };
 
-const updateAggregateReducer = (state: AggregateReducerState, contribution: ExpressionResult, delta: 1 | -1, context?: QueryContext): AggregateReducerState => {
+const updateAggregateReducer = (aggregate: AggregateExpr, state: AggregateReducerState, contribution: ExpressionResult, delta: 1 | -1, context?: QueryContext): AggregateReducerState => {
   if (state.kind === 'count') {
     const contributes = contribution.status === 'known' && contribution.value !== null;
     return contributes ? { kind: 'count', count: state.count + delta } : state;
@@ -2666,6 +2845,7 @@ const updateAggregateReducer = (state: AggregateReducerState, contribution: Expr
         ? { ...state, falseCount: state.falseCount + delta }
         : { ...state, unknownCount: state.unknownCount + delta };
   }
+  if (state.kind === 'extreme') return updateExtremeReducer(aggregate, state, contribution, delta, context);
   if (contribution.status !== 'known' || contribution.value === null) return state;
   const key = canonicalizeJson(contribution.value);
   const before = distinctIndexCount(state.index, key);
@@ -2684,6 +2864,72 @@ const updateAggregateReducer = (state: AggregateReducerState, contribution: Expr
     if (context !== undefined) context.aggregateCompactionCount += 1;
   }
   return { kind: 'distinct', index: { base, overlays, distinctCount: state.index.distinctCount + (before === 0 && after > 0 ? 1 : before > 0 && after === 0 ? -1 : 0) } };
+};
+
+const updateExtremeReducer = (
+  aggregate: AggregateExpr,
+  state: Extract<AggregateReducerState, { readonly kind: 'extreme' }>,
+  contribution: ExpressionResult,
+  delta: 1 | -1,
+  context?: QueryContext
+): AggregateReducerState => {
+  if (contribution.status !== 'known') return state;
+  const key = canonicalizeJson(contribution.value);
+  const existing = extremeIndexEntry(state.index, key);
+  const after = (existing?.count ?? 0) + delta;
+  const changedEntry: ExtremeValueEntry | undefined = after === 0 ? undefined : { count: after, value: existing?.value ?? contribution.value };
+  const changed = new Map<string, ExtremeValueEntry | undefined>([[key, changedEntry]]);
+  let base = state.index.base;
+  let overlays = [...state.index.overlays, changed];
+  if (overlays.length >= 64) {
+    const compacted = new Map(base);
+    for (const overlay of overlays) for (const [candidate, entry] of overlay) {
+      if (entry === undefined) compacted.delete(candidate);
+      else compacted.set(candidate, entry);
+    }
+    base = compacted;
+    overlays = [];
+    if (context !== undefined) context.aggregateCompactionCount += 1;
+  }
+  let extremeKey = state.index.extremeKey;
+  if (delta === 1) {
+    const selected = extremeKey === undefined ? undefined : extremeIndexEntry({ base, overlays, extremeKey }, extremeKey);
+    const candidate = changedEntry as ExtremeValueEntry;
+    if (selected === undefined || compareExtremeEntries(aggregate.op, candidate, selected) < 0) extremeKey = key;
+  } else if (after === 0 && extremeKey === key) {
+    extremeKey = selectExtremeKey(aggregate.op, base, overlays);
+  }
+  return { kind: 'extreme', index: { base, overlays, ...(extremeKey === undefined ? {} : { extremeKey }) } };
+};
+
+const extremeIndexEntry = (index: ExtremeValueIndex, key: string): ExtremeValueEntry | undefined => {
+  for (let position = index.overlays.length - 1; position >= 0; position -= 1) {
+    const overlay = index.overlays[position] as ReadonlyMap<string, ExtremeValueEntry | undefined>;
+    if (overlay.has(key)) return overlay.get(key);
+  }
+  return index.base.get(key);
+};
+
+const liveExtremeEntries = (base: ReadonlyMap<string, ExtremeValueEntry>, overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[]): ReadonlyMap<string, ExtremeValueEntry> => {
+  const live = new Map(base);
+  for (const overlay of overlays) for (const [key, entry] of overlay) {
+    if (entry === undefined) live.delete(key);
+    else live.set(key, entry);
+  }
+  return live;
+};
+
+const compareExtremeEntries = (op: AggregateExpr['op'], left: ExtremeValueEntry, right: ExtremeValueEntry): number => {
+  const comparison = compareQueryJsonValuesTotal(left.value, right.value);
+  return op === 'minimum' ? comparison : -comparison;
+};
+
+const selectExtremeKey = (op: AggregateExpr['op'], base: ReadonlyMap<string, ExtremeValueEntry>, overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[]): string | undefined => {
+  let selected: readonly [string, ExtremeValueEntry] | undefined;
+  for (const entry of liveExtremeEntries(base, overlays)) {
+    if (selected === undefined || compareExtremeEntries(op, entry[1], selected[1]) < 0) selected = entry;
+  }
+  return selected?.[0];
 };
 
 const distinctIndexCount = (index: DistinctCountIndex, key: string): number => {
@@ -2726,6 +2972,22 @@ const buildAggregateReducers = (node: Extract<QueryNode, { readonly kind: 'aggre
       reducers.set(name, { kind: 'distinct', index: { base, overlays: [], distinctCount: base.size } });
       continue;
     }
+    if (aggregate.op === 'minimum' || aggregate.op === 'maximum') {
+      const base = new Map<string, ExtremeValueEntry>();
+      let extremeKey: string | undefined;
+      for (const { row } of members) {
+        const contribution = aggregateContribution(aggregate, row, context);
+        if (contribution.status !== 'known') continue;
+        const key = canonicalizeJson(contribution.value);
+        const existing = base.get(key);
+        base.set(key, { count: (existing?.count ?? 0) + 1, value: existing?.value ?? contribution.value });
+        const selected = extremeKey === undefined ? undefined : base.get(extremeKey);
+        const candidate = base.get(key) as ExtremeValueEntry;
+        if (selected === undefined || compareExtremeEntries(aggregate.op, candidate, selected) < 0) extremeKey = key;
+      }
+      reducers.set(name, { kind: 'extreme', index: { base, overlays: [], ...(extremeKey === undefined ? {} : { extremeKey }) } });
+      continue;
+    }
     let trueCount = 0;
     let falseCount = 0;
     let unknownCount = 0;
@@ -2751,7 +3013,7 @@ const updateAggregateReducers = (
   const updated = new Map(reducers);
   for (const [name, reducer] of reducers) {
     const aggregate = node.measures[name];
-    if (aggregate !== undefined) updated.set(name, updateAggregateReducer(reducer, aggregateContribution(aggregate, row, context), delta, context));
+    if (aggregate !== undefined) updated.set(name, updateAggregateReducer(aggregate, reducer, aggregateContribution(aggregate, row, context), delta, context));
   }
   return updated;
 };
@@ -2759,6 +3021,7 @@ const updateAggregateReducers = (
 const aggregateReducerValue = (aggregate: AggregateExpr, reducer: AggregateReducerState): QueryLogicalValue => {
   if (reducer.kind === 'count') return reducer.count;
   if (reducer.kind === 'distinct') return reducer.index.distinctCount;
+  if (reducer.kind === 'extreme') return reducer.index.extremeKey === undefined ? null : extremeIndexEntry(reducer.index, reducer.index.extremeKey)?.value ?? null;
   if (aggregate.op === 'any') return reducer.trueCount > 0 ? true : reducer.unknownCount > 0 ? logicalUnknown : false;
   return reducer.falseCount > 0 ? false : reducer.unknownCount > 0 ? logicalUnknown : true;
 };

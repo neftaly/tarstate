@@ -189,6 +189,8 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const reducerMeasures = {
     count: { kind: 'aggregate', op: 'count' },
     distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
+    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
+    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') },
     any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
     every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
   };
@@ -459,6 +461,8 @@ await post(aggregateAllocationSession, 'HeapProfiler.startSampling', { samplingI
   const aggregateQuery = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: {
     count: { kind: 'aggregate', op: 'count' },
     distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
+    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
+    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') },
     any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
     every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
   } };
@@ -484,6 +488,8 @@ await post(ungroupedReducerAllocationSession, 'HeapProfiler.startSampling', { sa
   const aggregateQuery = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: {}, measures: {
     count: { kind: 'aggregate', op: 'count' },
     distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
+    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
+    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') },
     any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
     every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
   } };

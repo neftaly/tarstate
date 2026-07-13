@@ -222,11 +222,16 @@ describe('shrinking property laws', () => {
   propertyTest('aggregate-reducer-command-sequences-match-an-independent-state-model', fc.property(
     fc.array(reducerCommandArbitrary, { maxLength: 20 }),
     (commands) => {
+      const sequence: readonly ReducerCommand[] = [
+        { kind: 'replace', id: 0, value: { key: 2 }, active: false },
+        { kind: 'move', id: 1, group: 2 },
+        ...commands
+      ];
       let model = initialReducerModel();
       let accepted = reducerSnapshot(model, 0);
       const incremental = openIncrementalQueryMaintenance(propertyPlan('aggregate-reducer-commands', reducerQuery), accepted);
       expect(incremental.getCurrentResult().rows).toEqual(reducerOracle(model));
-      commands.forEach((command, index) => {
+      sequence.forEach((command, index) => {
         model = applyReducerCommand(model, command);
         const next = reducerSnapshot(model, index + 1);
         const maintained = incremental.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
@@ -379,14 +384,19 @@ const windowSnapshot = (model: WindowModel, revision: number): QueryMaintenanceS
   basis: { revision }
 });
 
-type ReducerRow = { readonly id: number; readonly group: number; readonly value: number | null; readonly active: boolean };
+type ReducerRow = { readonly id: number; readonly group: number; readonly value?: JsonValue; readonly active: boolean };
 type ReducerCommand =
-  | { readonly kind: 'replace'; readonly id: number; readonly value: number | null; readonly active: boolean }
+  | { readonly kind: 'replace'; readonly id: number; readonly value: JsonValue | undefined; readonly active: boolean }
   | { readonly kind: 'move'; readonly id: number; readonly group: number }
-  | { readonly kind: 'insert'; readonly id: number; readonly group: number; readonly value: number | null; readonly active: boolean }
+  | { readonly kind: 'insert'; readonly id: number; readonly group: number; readonly value: JsonValue | undefined; readonly active: boolean }
   | { readonly kind: 'delete'; readonly id: number };
 
-const reducerValueArbitrary = fc.oneof(fc.integer({ min: -3, max: 3 }), fc.constant(null));
+const reducerJsonArbitrary: fc.Arbitrary<JsonValue> = fc.oneof(
+  fc.constant(null), fc.integer({ min: -3, max: 3 }), fc.string({ maxLength: 3 }), fc.boolean(),
+  fc.array(fc.integer({ min: -2, max: 2 }), { maxLength: 2 }),
+  fc.integer({ min: -2, max: 2 }).map((key): JsonValue => ({ key }))
+);
+const reducerValueArbitrary = fc.option(reducerJsonArbitrary, { nil: undefined });
 const reducerCommandArbitrary: fc.Arbitrary<ReducerCommand> = fc.oneof(
   fc.record({ kind: fc.constant('replace' as const), id: fc.integer({ min: 0, max: 9 }), value: reducerValueArbitrary, active: fc.boolean() }),
   fc.record({ kind: fc.constant('move' as const), id: fc.integer({ min: 0, max: 9 }), group: fc.integer({ min: 0, max: 2 }) }),
@@ -401,18 +411,30 @@ const reducerQuery: QueryNode = {
     rows: { kind: 'aggregate', op: 'count' },
     present: { kind: 'aggregate', op: 'count', value: field('row', 'value') },
     distinct: { kind: 'aggregate', op: 'count-distinct', value: field('row', 'value') },
+    minimum: { kind: 'aggregate', op: 'minimum', value: field('row', 'value') },
+    maximum: { kind: 'aggregate', op: 'maximum', value: field('row', 'value') },
     any: { kind: 'aggregate', op: 'any', value: field('row', 'active') },
     every: { kind: 'aggregate', op: 'every', value: field('row', 'active') }
   }
 };
 
-const initialReducerModel = (): readonly ReducerRow[] => Array.from({ length: 6 }, (_, id) => ({ id, group: id % 3, value: id % 2, active: id % 2 === 0 }));
+const initialReducerModel = (): readonly ReducerRow[] => [
+  { id: 0, group: 0, value: null, active: true },
+  { id: 1, group: 0, value: 'a', active: false },
+  { id: 2, group: 1, value: -1, active: true },
+  { id: 3, group: 1, value: [0], active: false },
+  { id: 4, group: 2, value: { key: 0 }, active: true },
+  { id: 5, group: 2, active: false }
+];
+
+const reducerRow = (id: number, group: number, value: JsonValue | undefined, active: boolean): ReducerRow =>
+  value === undefined ? { id, group, active } : { id, group, value, active };
 
 const applyReducerCommand = (model: readonly ReducerRow[], command: ReducerCommand): readonly ReducerRow[] => {
   const rows = [...model];
   const index = rows.findIndex(({ id }) => id === command.id);
   if (command.kind === 'insert') {
-    const next = { id: command.id, group: command.group, value: command.value, active: command.active };
+    const next = reducerRow(command.id, command.group, command.value, command.active);
     if (index < 0) rows.push(next); else rows[index] = next;
   } else if (command.kind === 'delete') {
     if (index >= 0) rows.splice(index, 1);
@@ -420,13 +442,13 @@ const applyReducerCommand = (model: readonly ReducerRow[], command: ReducerComma
     const current = rows[index] as ReducerRow;
     rows[index] = command.kind === 'move'
       ? { ...current, group: command.group }
-      : { ...current, value: command.value, active: command.active };
+      : reducerRow(current.id, current.group, command.value, command.active);
   }
   return rows;
 };
 
 const reducerSnapshot = (rows: readonly ReducerRow[], revision: number): QueryMaintenanceSnapshot => ({
-  relations: [{ relation: relationUse('property.reducer.rows'), rows, occurrenceIds: rows.map(({ id }) => 'reducer:' + id), completeness: 'exact', sourceId: 'source:reducer', attachmentId: 'attachment:reducer', basis: revision }],
+  relations: [{ relation: relationUse('property.reducer.rows'), rows: rows.map(({ value, ...row }) => value === undefined ? row : { ...row, value }), occurrenceIds: rows.map(({ id }) => 'reducer:' + id), completeness: 'exact', sourceId: 'source:reducer', attachmentId: 'attachment:reducer', basis: revision }],
   basis: { revision }
 });
 
@@ -437,14 +459,48 @@ const reducerOracle = (rows: readonly ReducerRow[]): readonly QueryRecord[] => {
     if (group === undefined) groups.set(row.group, [row]);
     else group.push(row);
   }
-  return [...groups].map(([group, members]) => ({
-    group,
-    rows: members.length,
-    present: members.filter(({ value }) => value !== null).length,
-    distinct: new Set(members.flatMap(({ value }) => value === null ? [] : [value])).size,
-    any: members.some(({ active }) => active),
-    every: members.every(({ active }) => active)
-  }));
+  return [...groups].map(([group, members]) => {
+    const known = members.flatMap(({ value }) => value === undefined ? [] : [value]);
+    const nonNull = known.filter((value) => value !== null);
+    return {
+      group,
+      rows: members.length,
+      present: nonNull.length,
+      distinct: new Set(nonNull.map(canonicalizeJson)).size,
+      minimum: known.reduce<JsonValue | undefined>((selected, value) => selected === undefined || compareReducerJson(value, selected) < 0 ? value : selected, undefined) ?? null,
+      maximum: known.reduce<JsonValue | undefined>((selected, value) => selected === undefined || compareReducerJson(value, selected) > 0 ? value : selected, undefined) ?? null,
+      any: members.some(({ active }) => active),
+      every: members.every(({ active }) => active)
+    };
+  });
+};
+
+const reducerKind = (value: JsonValue): number => value === null ? 0 : typeof value === 'string' ? 1 : typeof value === 'number' ? 2 : typeof value === 'boolean' ? 3 : Array.isArray(value) ? 4 : 5;
+const compareReducerJson = (left: JsonValue, right: JsonValue): number => {
+  const kind = reducerKind(left) - reducerKind(right);
+  if (kind !== 0) return kind;
+  if (left === null || right === null) return 0;
+  if (typeof left === 'number' && typeof right === 'number' || typeof left === 'string' && typeof right === 'string') return left < right ? -1 : left > right ? 1 : 0;
+  if (typeof left === 'boolean' && typeof right === 'boolean') return left === right ? 0 : left ? 1 : -1;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+      const compared = compareReducerJson(left[index] as JsonValue, right[index] as JsonValue);
+      if (compared !== 0) return compared;
+    }
+    return left.length - right.length;
+  }
+  const leftRecord = left as Readonly<Record<string, JsonValue>>;
+  const rightRecord = right as Readonly<Record<string, JsonValue>>;
+  const leftKeys = Object.keys(leftRecord).sort();
+  const rightKeys = Object.keys(rightRecord).sort();
+  for (let index = 0; index < Math.min(leftKeys.length, rightKeys.length); index += 1) {
+    const leftKey = leftKeys[index] as string;
+    const rightKey = rightKeys[index] as string;
+    if (leftKey !== rightKey) return leftKey < rightKey ? -1 : 1;
+    const compared = compareReducerJson(leftRecord[leftKey] as JsonValue, rightRecord[rightKey] as JsonValue);
+    if (compared !== 0) return compared;
+  }
+  return leftKeys.length - rightKeys.length;
 };
 
 const graphRelation = relationUse('property.graph.edges');
