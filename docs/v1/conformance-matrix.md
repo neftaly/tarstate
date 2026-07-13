@@ -32,7 +32,11 @@ contract's explicit exclusions or the scope records in
 the structural compiler budget, all builds and tests, the coarse runtime ceiling,
 declaration consumption, and pack verification for all five public packages. Pack verification requires
 dist-only JavaScript/declarations, a README and license, resolved workspace
-dependency versions, and successful runtime imports.
+dependency versions, a clean npm consumer installation of the exact five
+tarballs with strict peer resolution, and successful package-export imports.
+Separate compatibility jobs run the React bindings against the minimum declared
+React 18.3 runtime and the Automerge integration against the current Repo
+`next` prerelease; the committed workspace remains on the stable Repo release.
 
 `pnpm bench` runs the five staged golden workloads after build and fails above
 its loose ceiling. It is a gross regression signal, not a claim of legacy

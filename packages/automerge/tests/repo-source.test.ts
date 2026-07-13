@@ -24,7 +24,7 @@ describe('Automerge Repo source owner', () => {
     const repo = new Repo();
     const handle = repo.create<CounterDoc>({ count: 0 });
     const repoRuntime = automergeRepoSourceRuntime({ handle });
-    const memoryRuntime = new AutomergeSourceRuntime({ sourceId: 'memory:counter', doc: handle.doc() });
+    const memoryRuntime = new AutomergeSourceRuntime({ sourceId: 'memory:counter', doc: handle.doc()! });
 
     expectTypeOf<'merge' extends keyof typeof repoRuntime ? true : false>().toEqualTypeOf<false>();
     expectTypeOf<'replace' extends keyof typeof repoRuntime ? true : false>().toEqualTypeOf<false>();
@@ -55,11 +55,11 @@ describe('Automerge Repo source owner', () => {
     expect(committed).toMatchObject({ outcome: 'committed', changed: true });
     expect(apply).toHaveBeenCalledOnce();
     expect(changeAt).toHaveBeenCalledWith(expect.any(Array), expect.any(Function), expect.any(Object));
-    expect(runtime.snapshot().storage).toBe(handle.doc());
+    expect(runtime.snapshot().storage).toBe(handle.doc()!);
     expect(changes).toHaveBeenLastCalledWith(expect.objectContaining({ origin: 'commit' }));
 
     handle.change((draft) => { draft.count = 2; });
-    expect(runtime.snapshot().storage).toBe(handle.doc());
+    expect(runtime.snapshot().storage).toBe(handle.doc()!);
     expect(runtime.snapshot().storage.count).toBe(2);
     expect(exactAutomergeBasisEqual(initial.basis, runtime.snapshot().basis)).toBe(false);
     expect(changes).toHaveBeenLastCalledWith(expect.objectContaining({ origin: 'handle' }));
@@ -78,7 +78,7 @@ describe('Automerge Repo source owner', () => {
 
     runtime.close();
     handle.change((draft) => { draft.count = 3; });
-    expect(handle.doc().count).toBe(3);
+    expect(handle.doc()!.count).toBe(3);
     await repo.shutdown();
   });
 
@@ -122,7 +122,7 @@ describe('Automerge Repo source owner', () => {
       issues: [{ code: 'transaction.expected_basis_stale' }],
     });
     expect(apply).not.toHaveBeenCalled();
-    expect(handle.doc().count).toBe(0);
+    expect(handle.doc()!.count).toBe(0);
     expect(runtime.queryOutcome(operation)).toEqual({ status: 'known', result: rejected });
     runtime.close();
     await repo.shutdown();
@@ -149,6 +149,25 @@ describe('Automerge Repo source owner', () => {
     expect(off).toHaveBeenCalledWith('heads-changed', on.mock.calls[0]?.[1]);
   });
 
+  it('rejects a ready Repo handle whose document is unavailable', () => {
+    const on = vi.fn();
+    const off = vi.fn();
+    const handle: AutomergeRepoHandle<CounterDoc, readonly string[]> = {
+      url: 'automerge:test-missing-document',
+      isReady: () => true,
+      isReadOnly: () => false,
+      doc: () => undefined,
+      heads: () => [],
+      changeAt: () => undefined,
+      on,
+      off,
+    };
+
+    expect(() => automergeRepoSourceRuntime({ handle })).toThrow(/document is unavailable/);
+    expect(on).toHaveBeenCalledOnce();
+    expect(off).toHaveBeenCalledWith('heads-changed', on.mock.calls[0]?.[1]);
+  });
+
   it('records receipts before isolated listeners observe canonical changes', async () => {
     const repo = new Repo();
     const handle = repo.create<CounterDoc>({ count: 0 });
@@ -165,7 +184,7 @@ describe('Automerge Repo source owner', () => {
       commands: [{ apply: (draft) => { draft.count = 1; } }],
     })).resolves.toMatchObject({ outcome: 'committed' });
     expect(observed).toHaveBeenCalledOnce();
-    expect(handle.doc().count).toBe(1);
+    expect(handle.doc()!.count).toBe(1);
     await repo.shutdown();
   });
 
@@ -186,7 +205,7 @@ describe('Automerge Repo source owner', () => {
     });
     runtime.close();
     await expect(queued).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'source.closed' }] });
-    expect(handle.doc().count).toBe(0);
+    expect(handle.doc()!.count).toBe(0);
     expect(handle.isReady()).toBe(true);
     await repo.shutdown();
   });

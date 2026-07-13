@@ -96,7 +96,7 @@ export type AutomergeRepoHandle<T extends object, Heads = unknown> = {
   readonly url: string;
   isReady(): boolean;
   isReadOnly(): boolean;
-  doc(): Automerge.Doc<T>;
+  doc(): Automerge.Doc<T> | undefined;
   heads(): Heads;
   changeAt(heads: Heads, change: Automerge.ChangeFn<T>, options?: Automerge.ChangeOptions<T>): Heads | undefined;
   on(event: 'heads-changed', listener: (payload: { readonly doc: Automerge.Doc<T> }) => void): unknown;
@@ -514,20 +514,25 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
   if (!handle.isReady()) throw new Error('Automerge Repo handle must be ready');
   if (handle.isReadOnly()) throw new Error('Automerge Repo handle must be writable');
   const listeners = new Set<(doc: Automerge.Doc<T>) => void>();
+  const currentDocument = (): Automerge.Doc<T> => {
+    const document = handle.doc();
+    if (document === undefined) throw new Error('Automerge Repo handle document is unavailable');
+    return document;
+  };
   const handleChanged = ({ doc }: { readonly doc: Automerge.Doc<T> }): void => {
     for (const listener of Array.from(listeners)) listener(doc);
   };
   handle.on('heads-changed', handleChanged);
   const owner: DocumentOwner<T> = {
-    current: () => handle.doc(),
+    current: currentDocument,
     changeAt: (basis, commands, message) => {
-      const current = handle.doc();
+      const current = currentDocument();
       if (!exactAutomergeBasisEqual(basis, automergeBasis(current))) throw new StaleOwnerBasis(current);
       const heads = handle.heads();
       const changedHeads = handle.changeAt(heads, (draft) => {
         for (const command of commands) command.apply(draft);
       }, { message, time: 0 });
-      const changed = handle.doc();
+      const changed = currentDocument();
       if (changedHeads === undefined) throw new StaleOwnerBasis(changed);
       return changed;
     },

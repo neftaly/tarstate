@@ -2,6 +2,8 @@
 
 Small React bindings for consuming Tarstate observers and commits. The provider
 borrows database lifecycle; it never closes an externally owned database.
+The declared React range is `>=18.3.0 <20`; CI exercises both the minimum 18.3
+runtime and the workspace's React 19 version.
 
 ```tsx
 import { TarstateProvider, useQuery, useRow } from '@tarstate/react'

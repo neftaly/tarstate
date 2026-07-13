@@ -29,3 +29,35 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm check:release
+
+  compatibility:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: React 18.3 minimum
+            package: '@tarstate/react'
+            install: >-
+              react@18.3.0 react-dom@18.3.0 react-test-renderer@18.3.0
+              @types/react@18.3.31 @types/react-dom@18.3.7 @types/react-test-renderer@18.3.1
+          - name: Automerge Repo next
+            package: '@tarstate/automerge'
+            install: '@automerge/automerge-repo@next'
+    name: Compatibility (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v7.0.0
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.0.9
+        with:
+          run_install: false
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter ${{ matrix.package }} add --save-dev --save-exact --lockfile=false ${{ matrix.install }}
+      - run: pnpm --filter ${{ matrix.package }} test
+      - run: pnpm --filter ${{ matrix.package }} typecheck

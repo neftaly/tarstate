@@ -51,7 +51,7 @@ importers:
   packages/automerge:
     dependencies:
       '@automerge/automerge':
-        specifier: 3.2.6
+        specifier: ^3.2.6
         version: 3.2.6
       '@tarstate/core':
         specifier: workspace:^

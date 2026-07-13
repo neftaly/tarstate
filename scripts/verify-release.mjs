@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { builtinModules } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -66,7 +66,7 @@ try {
       }
     }
     verifyRuntimeDependencyDeclarations(packedManifest, tarball, entries);
-    packedPackages.push({ directory, manifest: packedManifest, packageDirectory, tarball });
+    packedPackages.push({ directory, manifest: packedManifest, tarball });
 
     if (manifest.name === '@tarstate/core') await verifyCoreCrossEntryProvenance(tarball, destination);
   }
@@ -103,36 +103,33 @@ function verifyRuntimeDependencyDeclarations(manifest, tarball, entries) {
 
 async function verifyPackedRuntime(packages) {
   const installation = path.join(temporaryDirectory, 'installed');
-  const nodeModules = path.join(installation, 'node_modules');
+  mkdirSync(installation);
+  const dependencies = Object.fromEntries(packages.map(({ manifest, tarball }) => [manifest.name, `file:${tarball}`]));
+  dependencies.react = '19.2.7';
+  writeFileSync(path.join(installation, 'package.json'), JSON.stringify({
+    name: 'tarstate-release-consumer',
+    private: true,
+    type: 'module',
+    dependencies
+  }, null, 2) + '\n');
 
-  for (const { manifest, tarball } of packages) {
-    const installedPackage = path.join(nodeModules, ...manifest.name.split('/'));
-    mkdirSync(installedPackage, { recursive: true });
-    execFileSync('tar', ['-xzf', tarball, '--strip-components=1', '-C', installedPackage]);
+  try {
+    execFileSync('npm', ['install', '--ignore-scripts', '--no-package-lock', '--strict-peer-deps'], {
+      cwd: installation,
+      encoding: 'utf8',
+      stdio: 'pipe'
+    });
+  } catch (error) {
+    const output = [error.stdout, error.stderr].filter((value) => typeof value === 'string' && value.length > 0).join('\n');
+    fail(`packed consumer installation failed${output.length > 0 ? `:\n${output}` : ''}`);
   }
 
-  for (const { manifest, packageDirectory } of packages) {
-    const externalDependencies = new Set([
-      ...Object.keys(manifest.dependencies ?? {}),
-      ...Object.keys(manifest.peerDependencies ?? {})
-    ]);
-    for (const dependency of externalDependencies) {
-      if (dependency.startsWith('@tarstate/')) continue;
-      const source = path.join(packageDirectory, 'node_modules', ...dependency.split('/'));
-      if (!existsSync(source)) fail(`${manifest.name}: runtime dependency ${dependency} is not installed for packed verification`);
-      const target = path.join(nodeModules, ...dependency.split('/'));
-      if (existsSync(target)) continue;
-      mkdirSync(path.dirname(target), { recursive: true });
-      symlinkSync(realpathSync(source), target, 'dir');
-    }
-  }
-
-  for (const { manifest } of packages) {
-    const installedPackage = path.join(nodeModules, ...manifest.name.split('/'));
-    for (const exported of Object.values(manifest.exports ?? {})) {
-      await import(pathToFileURL(path.join(installedPackage, String(exported.import))).href);
-    }
-  }
+  const specifiers = packages.flatMap(({ manifest }) => Object.keys(manifest.exports ?? {}).map((exported) =>
+    exported === '.' ? manifest.name : `${manifest.name}/${exported.slice(2)}`
+  ));
+  const verificationModule = path.join(installation, 'verify-imports.mjs');
+  writeFileSync(verificationModule, `${specifiers.map((specifier) => `await import(${JSON.stringify(specifier)});`).join('\n')}\n`);
+  execFileSync(process.execPath, [verificationModule], { cwd: installation, stdio: 'pipe' });
 }
 
 async function verifyCoreCrossEntryProvenance(tarball, destination) {

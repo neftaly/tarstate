@@ -23,7 +23,7 @@
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@automerge/automerge": "3.2.6",
+    "@automerge/automerge": "^3.2.6",
     "@tarstate/core": "workspace:^"
   },
   "devDependencies": {

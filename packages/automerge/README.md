@@ -10,6 +10,16 @@ kernel. `AutomergeMapStorageBinding` adapts that kernel to core's
 `StorageBinding` protocol, and `AutomergeAtomicSource` is the atomic source
 shell.
 
+## Automerge Repo compatibility
+
+The Repo integration consumes a small structural handle interface; this package
+does not depend on or re-export `@automerge/automerge-repo`. Applications may
+therefore use either the stable Repo release or its latest `next` prerelease
+without installing a second Repo copy. The adapter accepts compatible Automerge
+3.x releases so Repo and Tarstate can share one Automerge installation. CI runs
+the integration suite against the locked stable release and a separate `next`
+compatibility lane.
+
 System-relation events record observations without inferring stronger network
 facts. In particular, `remote-heads-observed` produces sync state `observed`,
 not `synced`; the host must supply an explicit `sync-state` event for lifecycle
