@@ -3,6 +3,7 @@ import type { TaggedValue } from '../src/value.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
 import { pipe } from '../src/query-builder.js';
 import { prepareQuery } from '../src/query.js';
+import { sealSchema } from '../src/schema.js';
 import {
   customScalar,
   prepareTypedQuery,
@@ -10,7 +11,6 @@ import {
   relationDeclaration,
   relationLiteral,
   referenceTo,
-  schemaLiteral,
   typedAnd,
   typedCompare,
   typedFieldEdit,
@@ -39,34 +39,36 @@ import {
 } from '../src/type-authoring.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
-const schemaRef = { id: 'urn:test:type-schema', contentHash: hash('a') } as const;
 const replace = { id: 'urn:tarstate:capability:field/replace', version: '1', contractHash: hash('b') } as const;
 const move = { id: 'urn:tarstate:capability:entity/move', version: '1', contractHash: hash('c') } as const;
 const rekey = { id: 'urn:tarstate:capability:entity/rekey', version: '1', contractHash: hash('d') } as const;
 const customCodec = { id: 'urn:test:codec:slug', version: '1', contractHash: hash('e') } as const;
 type SlugValue = TaggedValue & { readonly type: 'slug'; readonly value: string };
 
-const schema = schemaLiteral({
-  relations: {
-    people: {
-      relationId: 'example.person',
-      key: ['id'],
-      entityEditCapabilities: [move, rekey],
-      fields: {
-        id: { type: { kind: 'string' } },
-        name: { type: { kind: 'string' }, editCapabilities: [replace] },
-        nickname: { type: { kind: 'string' }, optional: true },
-        biography: { type: { kind: 'string' }, nullable: true },
-        score: { type: { kind: 'integer' } },
-        slug: { type: customScalar<SlugValue>(customCodec) }
-      }
-    },
-    audit: {
-      relationId: 'example.audit',
-      key: ['id'],
-      fields: {
-        id: { type: { kind: 'string' } },
-        event: { type: { kind: 'string', values: ['created', 'deleted'] } }
+const schema = await sealSchema({
+  id: 'urn:test:type-schema',
+  body: {
+    relations: {
+      people: {
+        relationId: 'example.person',
+        key: ['id'],
+        entityEditCapabilities: [move, rekey],
+        fields: {
+          id: { type: { kind: 'string' } },
+          name: { type: { kind: 'string' }, editCapabilities: [replace] },
+          nickname: { type: { kind: 'string' }, optional: true },
+          biography: { type: { kind: 'string' }, nullable: true },
+          score: { type: { kind: 'integer' } },
+          slug: { type: customScalar<SlugValue>(customCodec) }
+        }
+      },
+      audit: {
+        relationId: 'example.audit',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string' } },
+          event: { type: { kind: 'string', values: ['created', 'deleted'] } }
+        }
       }
     }
   }
@@ -75,8 +77,8 @@ const schema = schemaLiteral({
 type PersonRow = SchemaRow<typeof schema, 'people'>;
 type AuditRow = SchemaRow<typeof schema, 'audit'>;
 
-const people = relationLiteral(schemaRef, schema, 'people');
-const audit = relationLiteral(schemaRef, schema, 'audit');
+const people = relationLiteral(schema, 'people');
+const audit = relationLiteral(schema, 'audit');
 const author = typedFrom(people, 'author');
 const manager = typedFrom(people, 'manager');
 const joined = typedJoin(author, manager, (aliases) => typedCompare('ne', aliases.author.row.id, aliases.manager.row.id));
@@ -88,9 +90,9 @@ type IsAny<Value> = 0 extends (1 & Value) ? true : false;
 
 describe('literal-schema and query type authoring', () => {
   it('preserves the portable runtime values while inferring rows, tuple keys, parameters, aliases, and results', () => {
-    expect(schema.relations.people.relationId).toBe('example.person');
+    expect(schema.body.relations.people.relationId).toBe('example.person');
     expect(typedQueryBody(projected)).toMatchObject({
-      schemaViews: [schemaRef],
+      schemaViews: [{ id: schema.id, contentHash: schema.contentHash }],
       parameters: { minimumScore: { kind: 'integer' } },
       root: { kind: 'select', alias: 'result' }
     });
@@ -138,20 +140,30 @@ describe('literal-schema and query type authoring', () => {
         accountId: { type: { kind: 'integer' } }
       }
     });
-    const referenceSchema = schemaLiteral({
-      relations: {
-        accounts,
-        events: {
-          relationId: 'example.event',
-          key: ['id'],
-          fields: {
-            id: { type: { kind: 'string' } },
-            account: { type: referenceTo(accounts) }
+    const referenceSchema = await sealSchema({
+      id: 'urn:test:reference-schema',
+      body: {
+        relations: {
+          accounts: {
+            relationId: 'example.account',
+            key: ['tenant', 'accountId'],
+            fields: {
+              tenant: { type: { kind: 'string' } },
+              accountId: { type: { kind: 'integer' } }
+            }
+          },
+          events: {
+            relationId: 'example.event',
+            key: ['id'],
+            fields: {
+              id: { type: { kind: 'string' } },
+              account: { type: { kind: 'ref', target: { relationId: 'example.account' } } }
+            }
           }
         }
       }
     });
-    const events = relationLiteral(schemaRef, referenceSchema, 'events');
+    const events = relationLiteral(referenceSchema, 'events');
     const base = typedFrom(events, 'event');
     const parameter = typedParameter('account', referenceTo(accounts));
     const query = pipe(
@@ -241,10 +253,10 @@ describe('literal-schema and query type authoring', () => {
   });
 
   it('distinguishes readable, writable, field-edit, rekey, and move evidence', () => {
-    const peopleAccess = relationAccess(schema, 'people');
-    const auditAccess = relationAccess(schema, 'audit');
+    const peopleAccess = relationAccess(schema.body, 'people');
+    const auditAccess = relationAccess(schema.body, 'audit');
 
-    expectTypeOf<typeof peopleAccess>().toEqualTypeOf<RelationAccessOf<typeof schema, 'people'>>();
+    expectTypeOf<typeof peopleAccess>().toEqualTypeOf<RelationAccessOf<typeof schema.body, 'people'>>();
     expectTypeOf(peopleAccess.readable).toEqualTypeOf<true>();
     expectTypeOf(peopleAccess.writable).toEqualTypeOf<true>();
     expectTypeOf(peopleAccess.rekey).toEqualTypeOf<true>();
@@ -254,7 +266,7 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf(auditAccess.readable).toEqualTypeOf<true>();
     expectTypeOf(auditAccess.writable).toEqualTypeOf<false>();
     expect(peopleAccess.fields.name).toEqual(['replace']);
-    expect(peopleAccess.declaration).toBe(schema.relations.people);
+    expect(peopleAccess.declaration).toBe(schema.body.relations.people);
 
     typedFieldEdit(peopleAccess, 'name', 'Renamed');
     typedRekey(peopleAccess, ['new-id'] as const);

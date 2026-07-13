@@ -5,6 +5,13 @@ history.
 
 ## [Unreleased]
 
+### Changed
+
+- Sealed schemas now preserve their exact body type, so relation and reference
+  types can be inferred directly from one plain-JSON schema artifact.
+- Restored the README's concise query example and self-contained JSON schema,
+  and moved TypeScript generation guidance after the React example.
+
 ## [0.3.0] - 2026-07-13
 
 ### Changed

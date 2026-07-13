@@ -20,10 +20,10 @@ export type SchemaBody = {
 };
 
 /** Sealed portable schema artifact with its typed body preserved. */
-export type SchemaArtifact = TypedArtifact<'schema', SchemaBody>;
+export type SchemaArtifact<Body extends SchemaBody = SchemaBody> = TypedArtifact<'schema', Body>;
 
 /** Seals a typed schema body without requiring a `JsonValue` assertion at the call site. */
-export const sealSchema = (input: TypedArtifactInput<SchemaBody>): Promise<SchemaArtifact> => sealTypedArtifact('schema', input);
+export const sealSchema = <const Body extends SchemaBody>(input: TypedArtifactInput<Body>): Promise<SchemaArtifact<Body>> => sealTypedArtifact('schema', input);
 
 export type RelationDeclaration = {
   readonly relationId: RelationId;

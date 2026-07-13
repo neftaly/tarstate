@@ -5,7 +5,7 @@ import {
   relationDeclaration,
   relationLiteral,
   referenceTo,
-  schemaLiteral,
+  sealSchema,
   typedCompare,
   typedFrom,
   typedParameter,
@@ -19,7 +19,6 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import { useDatabase, useMutationState, useQuery, useRow, type MutationEntry, type ReactPreparedPlan } from '../src/index.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
-const schemaView = { id: 'urn:test:react-types', contentHash: hash('a') } as const;
 const slugCodec = { id: 'urn:test:codec:slug', version: '1', contractHash: hash('b') } as const;
 type Slug = TaggedValue & { readonly type: 'slug'; readonly value: string };
 
@@ -32,23 +31,26 @@ const accounts = relationDeclaration({
   }
 });
 
-const schema = schemaLiteral({
-  relations: {
-    accounts,
-    entries: {
-      relationId: 'example.entry',
-      key: ['id'],
-      fields: {
-        id: { type: { kind: 'string' } },
-        owner: { type: referenceTo(accounts) },
-        slug: { type: customScalar<Slug>(slugCodec) },
-        note: { type: { kind: 'string' }, optional: true }
+const schema = await sealSchema({
+  id: 'urn:test:react-types',
+  body: {
+    relations: {
+      accounts,
+      entries: {
+        relationId: 'example.entry',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string' } },
+          owner: { type: referenceTo(accounts) },
+          slug: { type: customScalar<Slug>(slugCodec) },
+          note: { type: { kind: 'string' }, optional: true }
+        }
       }
     }
   }
 });
 
-const entries = relationLiteral(schemaView, schema, 'entries');
+const entries = relationLiteral(schema, 'entries');
 const base = typedFrom(entries, 'entry');
 const query = pipe(
   base,

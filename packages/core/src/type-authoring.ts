@@ -6,7 +6,7 @@ import { prepareQuery, type Expr, type QueryNode } from './query.js';
 import type { QueryArtifact, QueryArtifactBody, ValueDeclaration } from './query-builder.js';
 import type { PreparedPlan } from './maintenance.js';
 import { assertPreparedPlan } from './internal-prepared-plan.js';
-import type { FieldDeclaration, RelationDeclaration, SchemaBody } from './schema.js';
+import type { FieldDeclaration, RelationDeclaration, SchemaArtifact, SchemaBody } from './schema.js';
 import type { JsonValue, PortableValue, TaggedValue } from './value.js';
 import { stringTupleKey } from './internal-string-key.js';
 
@@ -17,8 +17,13 @@ type StringKey<Value> = Extract<keyof Value, string>;
 /** Identity authoring helper: const inference is erased and the portable value is unchanged. */
 export const schemaLiteral = <const Body extends SchemaBody>(body: Body): Body => body;
 
-type RelationsOf<Body> = Body extends { readonly relations: infer Relations } ? Relations : never;
-type RelationOf<Body, Name extends PropertyKey> = Name extends keyof RelationsOf<Body> ? RelationsOf<Body>[Name] : never;
+type SchemaBodyOf<Schema> = Schema extends SchemaBody
+  ? Schema
+  : Schema extends { readonly body: infer Body extends SchemaBody }
+    ? Body
+    : never;
+type RelationsOf<Schema> = SchemaBodyOf<Schema>['relations'];
+type RelationOf<Schema, Name extends PropertyKey> = Name extends keyof RelationsOf<Schema> ? RelationsOf<Schema>[Name] : never;
 type FieldsOf<Relation> = Relation extends { readonly fields: infer Fields } ? Fields : never;
 type OptionalFieldKeys<Fields> = {
   [Key in keyof Fields]-?: Fields[Key] extends { readonly optional: true } ? Key : never
@@ -86,6 +91,37 @@ type FieldValue<Field> = Field extends { readonly type: infer Declaration }
   ? ScalarValueOf<Declaration> | (Field extends { readonly nullable: true } ? null : never)
   : never;
 
+type RelationById<Body extends SchemaBody, Id> = {
+  [Name in keyof Body['relations']]: Body['relations'][Name] extends { readonly relationId: Id }
+    ? Body['relations'][Name]
+    : never
+}[keyof Body['relations']];
+
+type SchemaScalarValue<Body extends SchemaBody, Declaration> =
+  Declaration extends ReferenceScalarDeclaration<infer Target> ? RelationKey<Target>
+    : Declaration extends { readonly kind: 'ref'; readonly target: { readonly relationId: infer RelationId } }
+      ? SchemaRelationKey<Body, RelationById<Body, RelationId>>
+      : ScalarValueOf<Declaration>;
+
+type SchemaFieldValue<Body extends SchemaBody, Field> = Field extends { readonly type: infer Declaration }
+  ? SchemaScalarValue<Body, Declaration> | (Field extends { readonly nullable: true } ? null : never)
+  : never;
+
+type SchemaRelationKey<Body extends SchemaBody, Relation> = Relation extends { readonly key: infer Names extends readonly string[] }
+  ? {
+      readonly [Index in keyof Names]: Names[Index] extends keyof FieldsOf<Relation>
+        ? SchemaFieldValue<Body, FieldsOf<Relation>[Names[Index]]>
+        : never
+    }
+  : never;
+
+type SchemaRelationRow<Body extends SchemaBody, Relation> = Relation extends RelationDeclaration
+  ? Simplify<
+      { readonly [Key in RequiredFieldKeys<FieldsOf<Relation>>]: SchemaFieldValue<Body, FieldsOf<Relation>[Key]> }
+      & { readonly [Key in OptionalFieldKeys<FieldsOf<Relation>>]?: SchemaFieldValue<Body, FieldsOf<Relation>[Key]> }
+    >
+  : never;
+
 export type RowOfRelation<Relation> = Relation extends RelationDeclaration
   ? Simplify<
       { readonly [Key in RequiredFieldKeys<FieldsOf<Relation>>]: FieldValue<FieldsOf<Relation>[Key]> }
@@ -94,16 +130,14 @@ export type RowOfRelation<Relation> = Relation extends RelationDeclaration
   : never;
 
 /** Exact application row inferred from a literal schema relation. */
-export type SchemaRow<Body, Name extends StringKey<RelationsOf<Body>>> = RowOfRelation<RelationOf<Body, Name>>;
+export type SchemaRow<Schema, Name extends StringKey<RelationsOf<Schema>>> = SchemaRelationRow<SchemaBodyOf<Schema>, RelationOf<Schema, Name>>;
 
 type KeyTuple<Relation, Names extends readonly unknown[]> = {
   readonly [Index in keyof Names]: Names[Index] extends keyof FieldsOf<Relation> ? FieldValue<FieldsOf<Relation>[Names[Index]]> : never
 };
 
 /** Ordered logical-key tuple inferred from a literal schema relation. */
-export type SchemaKey<Body, Name extends StringKey<RelationsOf<Body>>> = RelationOf<Body, Name> extends { readonly key: infer Names extends readonly string[] }
-  ? KeyTuple<RelationOf<Body, Name>, Names>
-  : never;
+export type SchemaKey<Schema, Name extends StringKey<RelationsOf<Schema>>> = SchemaRelationKey<SchemaBodyOf<Schema>, RelationOf<Schema, Name>>;
 
 export type LiteralRelation<Body extends SchemaBody, Name extends StringKey<Body['relations']>> = {
   readonly schemaView: ArtifactRef;
@@ -113,11 +147,11 @@ export type LiteralRelation<Body extends SchemaBody, Name extends StringKey<Body
 };
 
 export const relationLiteral = <const Body extends SchemaBody, const Name extends StringKey<Body['relations']>>(
-  schemaView: ArtifactRef,
-  body: Body,
+  schema: SchemaArtifact<Body>,
   name: Name
 ): LiteralRelation<Body, Name> => {
-  const declaration = body.relations[name] as Body['relations'][Name];
+  const declaration = schema.body.relations[name] as Body['relations'][Name];
+  const schemaView = { id: schema.id, contentHash: schema.contentHash };
   return { schemaView, relationId: declaration.relationId, name, declaration };
 };
 
