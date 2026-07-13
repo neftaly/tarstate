@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createPooledIncrementalQueryRuntime,
   diffQueryMaintenanceSnapshots,
+  evaluatePreparedQuery,
   evaluateQuery,
   openIncrementalQueryMaintenance,
   isNonPoolableQueryError,
@@ -190,8 +191,57 @@ const applySnapshot = (session: ReturnType<typeof openIncrementalQueryMaintenanc
   session.applyUpdate(diffQueryMaintenanceSnapshots(before, after));
 
 describe('incremental query maintenance', () => {
+  it('keeps semantic budget boundaries identical across pure, prepared, private, and pooled initial materialization', () => {
+    const queries: readonly QueryNode[] = [
+      {
+        kind: 'join', join: 'inner', left: people, right: groupRows,
+        on: { kind: 'compare', op: 'eq', left: field('p', 'group'), right: field('g', 'id') }
+      },
+      {
+        kind: 'window', input: people, alias: 'p', fields: {
+          rank: { kind: 'window', op: 'rank', partitionBy: [field('p', 'group')], orderBy: [{ value: field('p', 'score'), direction: 'asc' }] }
+        }
+      },
+      {
+        kind: 'aggregate', input: people, alias: 'summary', groupBy: { group: field('p', 'group') },
+        measures: {
+          count: { kind: 'aggregate', op: 'count' },
+          distinct: { kind: 'aggregate', op: 'count-distinct', value: field('p', 'score') },
+          any: { kind: 'aggregate', op: 'any', value: field('p', 'active') }
+        }
+      }
+    ];
+    for (const [index, query] of queries.entries()) {
+      const relations = snapshot(basePeople, 1).relations;
+      const budget = Array.from({ length: 200 }, (_, offset) => offset + 1).find((maxWorkUnits) =>
+        evaluateQuery({ root: query, relations, executionBudget: { maxWorkUnits } }).completeness === 'exact');
+      expect(budget).toBeDefined();
+      const executionBudget = { maxWorkUnits: budget as number };
+      const prepared = plan(query);
+      const pure = evaluateQuery({ root: query, relations, executionBudget });
+      expect(evaluatePreparedQuery(prepared, { relations, executionBudget })).toEqual(pure);
+
+      const initial: QueryMaintenanceSnapshot = { relations, executionBudget };
+      const session = openIncrementalQueryMaintenance(prepared, initial);
+      expect(semanticResult(session.getCurrentResult())).toEqual(pure);
+      session.close();
+
+      const runtime = createPooledIncrementalQueryRuntime({
+        environment: { runtimeIdentity: `budget:decorator:${index}`, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test', executionBudget },
+        initialSnapshot: initial
+      });
+      const root = runtime.attach(prepared);
+      expect(semanticResult(root.getCurrentResult())).toEqual(pure);
+      root.close();
+      runtime.close();
+    }
+  });
+
   it('fails closed and recovers atomically when a fixed update budget is exceeded', () => {
-    const query: QueryNode = { kind: 'join', join: 'cross', left: from('left', 'left'), right: from('right', 'right') };
+    const query: QueryNode = {
+      kind: 'join', join: 'inner', left: from('left', 'left'), right: from('right', 'right'),
+      on: { kind: 'compare', op: 'eq', left: field('left', 'id'), right: field('right', 'id') }
+    };
     const relationRows = (relationId: string, count: number, basis: number) => relation(relationId, Array.from({ length: count }, (_, index) => ({ occurrenceId: `${relationId}:${index}`, row: { id: index } })), basis);
     const initial: QueryMaintenanceSnapshot = { relations: [relationRows('left', 1, 1), relationRows('right', 1, 1)], executionBudget: { maxWorkUnits: 20 } };
     const expanded: QueryMaintenanceSnapshot = { relations: [relationRows('left', 1, 2), relationRows('right', 30, 2)], executionBudget: { maxWorkUnits: 20 } };
@@ -199,6 +249,7 @@ describe('incremental query maintenance', () => {
 
     const exhausted = applySnapshot(session, initial, expanded);
     expect(exhausted).toMatchObject({ rows: [], resultKeys: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    expect(exhausted.state.operatorDiagnostics.join).toMatchObject({ fallbackNodeCount: 1, fallbackReasons: { input_unavailable: 1 } });
     const recovered = applySnapshot(session, expanded, initial);
     expect(semanticResult(recovered)).toEqual(oracle(query, initial));
     expect(() => diffQueryMaintenanceSnapshots(initial, { ...initial, executionBudget: { maxWorkUnits: 21 } })).toThrow(/execution budget/);
@@ -211,6 +262,7 @@ describe('incremental query maintenance', () => {
     const root = runtime.attach(plan(query));
     runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, expanded));
     expect(root.getCurrentResult()).toMatchObject({ rows: [], completeness: 'unknown', issues: [{ code: 'query.execution_budget_exceeded' }] });
+    expect(runtime.getDiagnostics().operatorDiagnostics.join).toMatchObject({ fallbackNodeCount: 1, fallbackReasons: { input_unavailable: 1 } });
     runtime.applyUpdate(diffQueryMaintenanceSnapshots(expanded, initial));
     expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, initial));
     root.close();
@@ -383,6 +435,84 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
+  it('maintains reducer-only aggregates through same-group replacement, group movement, and compaction', () => {
+    const query: QueryNode = {
+      kind: 'aggregate', input: people, alias: 'summary', groupBy: { group: field('p', 'group') },
+      measures: {
+        rows: { kind: 'aggregate', op: 'count' },
+        present: { kind: 'aggregate', op: 'count', value: field('p', 'score') },
+        distinct: { kind: 'aggregate', op: 'count-distinct', value: field('p', 'score') },
+        any: { kind: 'aggregate', op: 'any', value: field('p', 'active') },
+        every: { kind: 'aggregate', op: 'every', value: field('p', 'active') }
+      }
+    };
+    const initialRows: readonly QueryRowOccurrence[] = [
+      { occurrenceId: 'reducer:a', row: { id: 1, group: 'x', score: 1, active: true } },
+      { occurrenceId: 'reducer:b', row: { id: 2, group: 'x', score: 1, active: false } },
+      { occurrenceId: 'reducer:c', row: { id: 3, group: 'y', score: null, active: logicalUnknown } },
+      { occurrenceId: 'reducer:d', row: { id: 4, group: 'y', active: 'not-a-boolean' } }
+    ];
+    const initial = snapshot(initialRows, 1);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    let accepted = initial;
+    let observedReducerCompaction = false;
+
+    for (let revision = 2; revision <= 132; revision += 1) {
+      const toggled = revision % 2 === 0;
+      const nextRows: readonly QueryRowOccurrence[] = [
+        initialRows[0] as QueryRowOccurrence,
+        { occurrenceId: 'reducer:b', row: { id: 2, group: toggled ? 'x' : 'y', score: toggled ? 2 : 1, active: toggled } },
+        initialRows[2] as QueryRowOccurrence,
+        initialRows[3] as QueryRowOccurrence
+      ];
+      const next = snapshot(nextRows, revision);
+      const maintained = applySnapshot(session, accepted, next);
+      expect(semanticResult(maintained), `reducer transition ${revision}`).toEqual(oracle(query, next));
+      observedReducerCompaction ||= maintained.state.operatorDiagnostics.aggregate.compactionCount > 0;
+      accepted = next;
+    }
+    expect(observedReducerCompaction).toBe(true);
+    session.close();
+  });
+
+  it('refreshes reducer-only member references at the bounded group-index compaction boundary', () => {
+    const query: QueryNode = {
+      kind: 'aggregate', input: people, alias: 'summary', groupBy: {},
+      measures: {
+        rows: { kind: 'aggregate', op: 'count' },
+        present: { kind: 'aggregate', op: 'count', value: field('p', 'score') },
+        any: { kind: 'aggregate', op: 'any', value: field('p', 'active') }
+      }
+    };
+    const rowsAt = (revision: number): readonly QueryRowOccurrence[] => [
+      { occurrenceId: 'retention:a', row: { id: 1, score: revision, active: revision % 2 === 0, payload: `${revision}:` + 'x'.repeat(1_024) } },
+      { occurrenceId: 'retention:b', row: { id: 2, score: 2, active: false, payload: 'stable' } }
+    ];
+    let accepted = snapshot(rowsAt(1), 1);
+    const session = openIncrementalQueryMaintenance(plan(query), accepted);
+    const initialOutput = session.getCurrentResult().rows[0];
+    let boundaryOutput: QueryRecord | undefined;
+    for (let revision = 2; revision <= 65; revision += 1) {
+      const next = snapshot(rowsAt(revision), revision);
+      const maintained = applySnapshot(session, accepted, next);
+      expect(semanticResult(maintained)).toEqual(oracle(query, next));
+      expect(maintained.state.operatorDiagnostics.aggregate.compactionCount).toBe(revision === 65 ? 1 : 0);
+      if (revision === 65) boundaryOutput = maintained.rows[0];
+      accepted = next;
+    }
+    expect(boundaryOutput).toBeDefined();
+    expect(boundaryOutput).not.toBe(initialOutput);
+
+    // Force full state recovery after compaction; it must rebuild from current
+    // inputs rather than any member row retained from the initial snapshot.
+    const recovered = snapshot([
+      ...rowsAt(66),
+      { occurrenceId: 'retention:c', row: { id: 3, score: null, active: true, payload: 'inserted' } }
+    ], 66);
+    expect(semanticResult(applySnapshot(session, accepted, recovered))).toEqual(oracle(query, recovered));
+    session.close();
+  });
+
   it('rematerializes order and aggregate outputs when only an expression subquery dependency changes', () => {
     const rankForPerson = {
       kind: 'subquery', mode: 'scalar',
@@ -464,6 +594,7 @@ describe('incremental query maintenance', () => {
     const initial = state(rightRows, 1);
     const session = openIncrementalQueryMaintenance(plan(query), initial);
     const before = session.getCurrentResult();
+    expect(before.state.operatorDiagnostics.join).toEqual({ selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 0, affectedUnitCount: 0, compactionCount: 0, fallbackReasons: {} });
     const changedRows = rightRows.map((entry, index) => index === 155
       ? { ...entry, row: { ...entry.row, label: 'changed' } }
       : entry);
@@ -471,6 +602,7 @@ describe('incremental query maintenance', () => {
     const maintained = applySnapshot(session, initial, changed);
 
     expect(semanticResult(maintained)).toEqual(oracle(query, changed));
+    expect(maintained.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, fullNodeCount: 0, fallbackNodeCount: 0, affectedUnitCount: 1 });
     expect(maintained.resultKeys).toBe(before.resultKeys);
     expect(maintained.rows[0]).toBe(before.rows[0]);
     expect(maintained.rows[155]).not.toBe(before.rows[155]);
@@ -513,15 +645,18 @@ describe('incremental query maintenance', () => {
     ] });
     let accepted = state(0, 0);
     const session = openIncrementalQueryMaintenance(plan(query), accepted);
+    let observedCompaction = false;
     for (let revision = 1; revision <= 320; revision += 1) {
       const next = state(revision, revision);
       const maintained = applySnapshot(session, accepted, next);
+      observedCompaction ||= maintained.state.operatorDiagnostics.join.compactionCount > 0;
       if (revision % 40 === 0) expect(semanticResult(maintained)).toEqual(oracle(query, next));
       accepted = next;
     }
     const returned = state(5, 321);
 
     expect(semanticResult(applySnapshot(session, accepted, returned))).toEqual(oracle(query, returned));
+    expect(observedCompaction).toBe(true);
     expect(session.getCurrentResult().rows).toHaveLength(1);
     session.close();
   });
@@ -554,6 +689,15 @@ describe('incremental query maintenance', () => {
       const middleResult = applySnapshot(session, initial, middle);
       expect(semanticResult(middleResult), `${operator}: insert/update`).toEqual(oracle(query, middle));
       expect(middleResult.state).toMatchObject({ strategy: 'differential-operator-graph', revision: 1, rejectedUpdateCount: 0 });
+      const diagnosticOperator = query.kind === 'where' || query.kind === 'select' || query.kind === 'with-fields' || query.kind === 'rename' || query.kind === 'omit' || query.kind === 'unnest'
+        ? 'local'
+        : query.kind === 'join' || query.kind === 'order' || query.kind === 'aggregate' || query.kind === 'window'
+          ? query.kind
+          : undefined;
+      if (diagnosticOperator !== undefined) {
+        const diagnostic = middleResult.state.operatorDiagnostics[diagnosticOperator];
+        expect(diagnostic.selectiveNodeCount + diagnostic.fullNodeCount + diagnostic.fallbackNodeCount, `${operator}: diagnostic decision`).toBeGreaterThan(0);
+      }
 
       const finalResult = applySnapshot(session, middle, final);
       expect(semanticResult(finalResult), `${operator}: delete/update`).toEqual(oracle(query, final));
@@ -658,7 +802,7 @@ describe('incremental query maintenance', () => {
     const valid = diffQueryMaintenanceSnapshots(initial, middle);
     const peopleChange = valid.relations.find(({ relation }) => relation.relationId === 'people') as NonNullable<typeof valid.relations[number]>;
     const invalid = { ...valid, relations: [{ ...peopleChange, rows: [{ occurrenceId: 'person:missing', after: { index: 0, row: { id: 9 } } }] }] };
-    expect(session.applyUpdate(invalid)).toMatchObject({ completeness: 'unknown', issues: [{ code: 'query.incremental_identity_invalid' }], state: { updatedNodeCount: 0, rejectedUpdateCount: 1, resultDelta: { addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] } } });
+    expect(session.applyUpdate(invalid)).toMatchObject({ completeness: 'unknown', issues: [{ code: 'query.incremental_identity_invalid' }], state: { updatedNodeCount: 0, rejectedUpdateCount: 1, resultDelta: { addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] }, operatorDiagnostics: { local: { selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 0 } } } });
     const final = snapshot(finalPeople, 3);
     const recovered = applySnapshot(session, initial, final);
     expect(semanticResult(recovered)).toEqual(oracle(query, final));
@@ -1033,6 +1177,7 @@ describe('incremental query maintenance', () => {
     const maintained = session.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
 
     expect(maintained).toMatchObject({ completeness: 'unknown', rows: [], issues: [expect.objectContaining({ code: 'query.function_failed' })] });
+    expect(maintained.state.operatorDiagnostics.window).toMatchObject({ selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 1, fallbackReasons: { unsupported_expression: 1 } });
     session.close();
   });
 
@@ -1215,9 +1360,12 @@ describe('incremental query maintenance', () => {
       strategy: 'pooled-differential-operator-dag',
       activeRootCount: 2,
       physicalNodeCount: 4,
-      sharedPhysicalNodeCount: 2
+      sharedPhysicalNodeCount: 2,
+      operatorDiagnostics: { local: { selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 0 } }
     });
     expect(Object.isFrozen(runtime.getDiagnostics())).toBe(true);
+    expect(Object.isFrozen(runtime.getDiagnostics().operatorDiagnostics)).toBe(true);
+    expect(Object.isFrozen(runtime.getDiagnostics().operatorDiagnostics.local.fallbackReasons)).toBe(true);
 
     const next = snapshot(middlePeople, 2);
     runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, next));
@@ -1230,6 +1378,12 @@ describe('incremental query maintenance', () => {
       lastUpdatedPhysicalNodeCount: 4,
       lastChangedPhysicalNodeCount: 4
     });
+    const pooledLocal = runtime.getDiagnostics().operatorDiagnostics.local;
+    expect(pooledLocal.selectiveNodeCount + pooledLocal.fullNodeCount + pooledLocal.fallbackNodeCount).toBe(3);
+    for (const root of [idsRoot, namesRoot]) {
+      const local = root.getCurrentResult().state.operatorDiagnostics.local;
+      expect(local.selectiveNodeCount + local.fullNodeCount + local.fallbackNodeCount).toBe(2);
+    }
 
     idsRoot.close();
     idsRoot.close();
@@ -1237,7 +1391,8 @@ describe('incremental query maintenance', () => {
       activeRootCount: 1,
       physicalNodeCount: 3,
       sharedPhysicalNodeCount: 0,
-      lastCollectedPhysicalNodeCount: 1
+      lastCollectedPhysicalNodeCount: 1,
+      operatorDiagnostics: { local: { selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 0 } }
     });
     namesRoot.close();
     expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, lastCollectedPhysicalNodeCount: 3 });

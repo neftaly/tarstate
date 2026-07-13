@@ -219,6 +219,26 @@ describe('shrinking property laws', () => {
     }
   ));
 
+  propertyTest('aggregate-reducer-command-sequences-match-an-independent-state-model', fc.property(
+    fc.array(reducerCommandArbitrary, { maxLength: 20 }),
+    (commands) => {
+      let model = initialReducerModel();
+      let accepted = reducerSnapshot(model, 0);
+      const incremental = openIncrementalQueryMaintenance(propertyPlan('aggregate-reducer-commands', reducerQuery), accepted);
+      expect(incremental.getCurrentResult().rows).toEqual(reducerOracle(model));
+      commands.forEach((command, index) => {
+        model = applyReducerCommand(model, command);
+        const next = reducerSnapshot(model, index + 1);
+        const maintained = incremental.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
+        expect(maintained.rows).toEqual(reducerOracle(model));
+        expect(maintained.completeness).toBe('exact');
+        expect(maintained.issues).toEqual([]);
+        accepted = next;
+      });
+      incremental.close();
+    }
+  ));
+
   propertyTest('recursive-equijoin-directions-match-bounded-graph-bfs', fc.property(
     fc.uniqueArray(fc.tuple(fc.integer({ min: 0, max: 7 }), fc.integer({ min: 0, max: 7 })), { maxLength: 20, selector: ([from, to]) => from + ':' + to }),
     fc.integer({ min: 0, max: 7 }),
@@ -358,6 +378,74 @@ const windowSnapshot = (model: WindowModel, revision: number): QueryMaintenanceS
   ],
   basis: { revision }
 });
+
+type ReducerRow = { readonly id: number; readonly group: number; readonly value: number | null; readonly active: boolean };
+type ReducerCommand =
+  | { readonly kind: 'replace'; readonly id: number; readonly value: number | null; readonly active: boolean }
+  | { readonly kind: 'move'; readonly id: number; readonly group: number }
+  | { readonly kind: 'insert'; readonly id: number; readonly group: number; readonly value: number | null; readonly active: boolean }
+  | { readonly kind: 'delete'; readonly id: number };
+
+const reducerValueArbitrary = fc.oneof(fc.integer({ min: -3, max: 3 }), fc.constant(null));
+const reducerCommandArbitrary: fc.Arbitrary<ReducerCommand> = fc.oneof(
+  fc.record({ kind: fc.constant('replace' as const), id: fc.integer({ min: 0, max: 9 }), value: reducerValueArbitrary, active: fc.boolean() }),
+  fc.record({ kind: fc.constant('move' as const), id: fc.integer({ min: 0, max: 9 }), group: fc.integer({ min: 0, max: 2 }) }),
+  fc.record({ kind: fc.constant('insert' as const), id: fc.integer({ min: 0, max: 9 }), group: fc.integer({ min: 0, max: 2 }), value: reducerValueArbitrary, active: fc.boolean() }),
+  fc.record({ kind: fc.constant('delete' as const), id: fc.integer({ min: 0, max: 9 }) })
+);
+
+const reducerQuery: QueryNode = {
+  kind: 'aggregate', input: { kind: 'from', relation: relationUse('property.reducer.rows'), alias: 'row' }, alias: 'summary',
+  groupBy: { group: field('row', 'group') },
+  measures: {
+    rows: { kind: 'aggregate', op: 'count' },
+    present: { kind: 'aggregate', op: 'count', value: field('row', 'value') },
+    distinct: { kind: 'aggregate', op: 'count-distinct', value: field('row', 'value') },
+    any: { kind: 'aggregate', op: 'any', value: field('row', 'active') },
+    every: { kind: 'aggregate', op: 'every', value: field('row', 'active') }
+  }
+};
+
+const initialReducerModel = (): readonly ReducerRow[] => Array.from({ length: 6 }, (_, id) => ({ id, group: id % 3, value: id % 2, active: id % 2 === 0 }));
+
+const applyReducerCommand = (model: readonly ReducerRow[], command: ReducerCommand): readonly ReducerRow[] => {
+  const rows = [...model];
+  const index = rows.findIndex(({ id }) => id === command.id);
+  if (command.kind === 'insert') {
+    const next = { id: command.id, group: command.group, value: command.value, active: command.active };
+    if (index < 0) rows.push(next); else rows[index] = next;
+  } else if (command.kind === 'delete') {
+    if (index >= 0) rows.splice(index, 1);
+  } else if (index >= 0) {
+    const current = rows[index] as ReducerRow;
+    rows[index] = command.kind === 'move'
+      ? { ...current, group: command.group }
+      : { ...current, value: command.value, active: command.active };
+  }
+  return rows;
+};
+
+const reducerSnapshot = (rows: readonly ReducerRow[], revision: number): QueryMaintenanceSnapshot => ({
+  relations: [{ relation: relationUse('property.reducer.rows'), rows, occurrenceIds: rows.map(({ id }) => 'reducer:' + id), completeness: 'exact', sourceId: 'source:reducer', attachmentId: 'attachment:reducer', basis: revision }],
+  basis: { revision }
+});
+
+const reducerOracle = (rows: readonly ReducerRow[]): readonly QueryRecord[] => {
+  const groups = new Map<number, ReducerRow[]>();
+  for (const row of rows) {
+    const group = groups.get(row.group);
+    if (group === undefined) groups.set(row.group, [row]);
+    else group.push(row);
+  }
+  return [...groups].map(([group, members]) => ({
+    group,
+    rows: members.length,
+    present: members.filter(({ value }) => value !== null).length,
+    distinct: new Set(members.flatMap(({ value }) => value === null ? [] : [value])).size,
+    any: members.some(({ active }) => active),
+    every: members.every(({ active }) => active)
+  }));
+};
 
 const graphRelation = relationUse('property.graph.edges');
 const graphQuery = (start: number, reversed: boolean): QueryNode => ({

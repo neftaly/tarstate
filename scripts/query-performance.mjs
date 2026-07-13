@@ -173,7 +173,7 @@ for (const [count, iterations] of [[50, 100], [100, 30], [200, 8], [400, 5]]) {
 }
 
 for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
-  const rows = Array.from({ length: count }, (_, id) => ({ id, group: id % 100, score: id * 7_919 % count }));
+  const rows = Array.from({ length: count }, (_, id) => ({ id, group: id % 100, score: id * 7_919 % count, active: id % 3 === 0 }));
   const relations = [input('score', rows)];
   const order = { kind: 'order', input: from('score', 'score'), by: [{ value: field('score', 'score'), direction: 'asc' }] };
   const objectKeyOrder = { kind: 'order', input: from('score', 'score'), by: [{ value: { kind: 'record', fields: { group: field('score', 'group'), score: field('score', 'score') } }, direction: 'asc' }] };
@@ -186,17 +186,35 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
     minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
     maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') }
   } };
+  const reducerMeasures = {
+    count: { kind: 'aggregate', op: 'count' },
+    distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
+    any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
+    every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
+  };
+  const groupedReducers = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: reducerMeasures };
+  const ungroupedReducers = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: {}, measures: reducerMeasures };
   const orderPlan = await plan('order-pure-' + count, order);
   const objectKeyOrderPlan = await plan('order-object-key-pure-' + count, objectKeyOrder);
   const scalarEqualityPlan = await plan('equality-scalar-pure-' + count, scalarEquality);
   const objectEqualityPlan = await plan('equality-object-pure-' + count, objectEquality);
   const aggregatePlan = await plan('aggregate-pure-' + count, aggregate);
+  const groupedReducerPlan = await plan('aggregate-reducer-grouped-pure-' + count, groupedReducers);
+  const ungroupedReducerPlan = await plan('aggregate-reducer-ungrouped-pure-' + count, ungroupedReducers);
   measurements.push(benchmark('order', count, iterations, () => evaluatePreparedQuery(orderPlan, { relations })));
   measurements.push(benchmark('order-prepared-scalar-key', count, iterations, () => evaluatePreparedQuery(orderPlan, { relations })));
   measurements.push(benchmark('order-prepared-object-key', count, iterations, () => evaluatePreparedQuery(objectKeyOrderPlan, { relations })));
   measurements.push(benchmark('equality-prepared-scalar', count, iterations, () => evaluatePreparedQuery(scalarEqualityPlan, { relations })));
   measurements.push(benchmark('equality-prepared-object', count, iterations, () => evaluatePreparedQuery(objectEqualityPlan, { relations })));
   measurements.push(benchmark('aggregate', count, iterations, () => evaluatePreparedQuery(aggregatePlan, { relations })));
+  measurements.push(benchmark('aggregate-reducer-grouped', count, iterations, () => evaluatePreparedQuery(groupedReducerPlan, { relations })));
+  measurements.push(benchmark('aggregate-reducer-ungrouped', count, iterations, () => evaluatePreparedQuery(ungroupedReducerPlan, { relations })));
+  measurements.push(benchmark('aggregate-reducer-grouped-open', count, iterations, () => {
+    const session = openIncrementalQueryMaintenance(groupedReducerPlan, { relations });
+    const result = session.getCurrentResult();
+    session.close();
+    return result;
+  }));
   const changedRows = rows.map((row, index) => index === 0 ? { ...row, score: count + 1 } : row);
   const first = { relations };
   const second = { relations: [input('score', changedRows)] };
@@ -209,6 +227,12 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const aggregateSession = openIncrementalQueryMaintenance(await plan('aggregate-' + count, aggregate), first);
   measurements.push(benchmark('aggregate-one-row-update', count, updateIterations, (index) => aggregateSession.applyUpdate(index % 2 === 0 ? forward : backward)));
   aggregateSession.close();
+  const groupedReducerSession = openIncrementalQueryMaintenance(groupedReducerPlan, first);
+  measurements.push(benchmark('aggregate-reducer-grouped-one-row-update', count, updateIterations, (index) => groupedReducerSession.applyUpdate(index % 2 === 0 ? forward : backward)));
+  groupedReducerSession.close();
+  const ungroupedReducerSession = openIncrementalQueryMaintenance(ungroupedReducerPlan, first);
+  measurements.push(benchmark('aggregate-reducer-ungrouped-one-row-update', count, updateIterations, (index) => ungroupedReducerSession.applyUpdate(index % 2 === 0 ? forward : backward)));
+  ungroupedReducerSession.close();
   if (count <= 10_000) {
     const orderBy = [{ value: field('score', 'score'), direction: 'asc' }];
     const window = { kind: 'window', input: from('score', 'score'), alias: 'score', fields: {
@@ -428,15 +452,15 @@ aggregateAllocationSession.connect();
 await post(aggregateAllocationSession, 'HeapProfiler.enable');
 await post(aggregateAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
 {
-  const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, group: id % 100, score: id }));
+  const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, group: id % 100, score: id, active: id % 3 === 0 }));
   const changed = rows.map((row, index) => index === 0 ? { ...row, score: 2_000 } : row);
   const first = { relations: [input('score', rows)] };
   const second = { relations: [input('score', changed)] };
   const aggregateQuery = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: {
     count: { kind: 'aggregate', op: 'count' },
-    sum: { kind: 'aggregate', op: 'sum', value: field('score', 'score') },
-    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
-    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') }
+    distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
+    any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
+    every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
   } };
   const session = openIncrementalQueryMaintenance(await plan('aggregate-allocation-sample', aggregateQuery), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
@@ -447,6 +471,31 @@ await post(aggregateAllocationSession, 'HeapProfiler.startSampling', { samplingI
 const { profile: aggregateAllocationProfile } = await post(aggregateAllocationSession, 'HeapProfiler.stopSampling');
 aggregateAllocationSession.disconnect();
 const aggregateSampledAllocationBytes = aggregateAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+
+const ungroupedReducerAllocationSession = new inspector.Session();
+ungroupedReducerAllocationSession.connect();
+await post(ungroupedReducerAllocationSession, 'HeapProfiler.enable');
+await post(ungroupedReducerAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+{
+  const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, score: id, active: id % 3 === 0 }));
+  const changed = rows.map((row, index) => index === 0 ? { ...row, score: 2_000, active: !row.active } : row);
+  const first = { relations: [input('score', rows)] };
+  const second = { relations: [input('score', changed)] };
+  const aggregateQuery = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: {}, measures: {
+    count: { kind: 'aggregate', op: 'count' },
+    distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
+    any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
+    every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
+  } };
+  const session = openIncrementalQueryMaintenance(await plan('aggregate-ungrouped-reducer-allocation-sample', aggregateQuery), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
+  session.close();
+}
+const { profile: ungroupedReducerAllocationProfile } = await post(ungroupedReducerAllocationSession, 'HeapProfiler.stopSampling');
+ungroupedReducerAllocationSession.disconnect();
+const ungroupedReducerSampledAllocationBytes = ungroupedReducerAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
 
 const pooledAllocationFirst = { relations: [input('item', linearRows(1_000))] };
 const pooledAllocationSecond = { relations: [input('item', linearRows(1_000, true))] };
@@ -483,6 +532,12 @@ const orderPure10k = measurement('order', 10_000)?.millisecondsPerOperation;
 const orderUpdate10k = measurement('order-one-row-update', 10_000)?.millisecondsPerOperation;
 const aggregatePure10k = measurement('aggregate', 10_000)?.millisecondsPerOperation;
 const aggregateUpdate10k = measurement('aggregate-one-row-update', 10_000)?.millisecondsPerOperation;
+const groupedReducerPure10k = measurement('aggregate-reducer-grouped', 10_000)?.millisecondsPerOperation;
+const groupedReducerUpdate10k = measurement('aggregate-reducer-grouped-one-row-update', 10_000)?.millisecondsPerOperation;
+const ungroupedReducerPure10k = measurement('aggregate-reducer-ungrouped', 10_000)?.millisecondsPerOperation;
+const ungroupedReducerUpdate10k = measurement('aggregate-reducer-ungrouped-one-row-update', 10_000)?.millisecondsPerOperation;
+const groupedReducerOpen1k = measurement('aggregate-reducer-grouped-open', 1_000)?.millisecondsPerOperation;
+const groupedReducerOpen10k = measurement('aggregate-reducer-grouped-open', 10_000)?.millisecondsPerOperation;
 const windowUpdate10k = measurement('window-one-row-update', 10_000)?.millisecondsPerOperation;
 const partitionedWindowUpdate10k = measurement('window-partitioned-one-row-update', 10_000)?.millisecondsPerOperation;
 const partitionedWindowPure10k = measurement('window-partitioned-prepared-pure', 10_000)?.millisecondsPerOperation;
@@ -494,6 +549,7 @@ const reversedRecursiveChain40 = measurement('recursive-chain-reversed', 40)?.mi
 const reversedRecursiveChain80 = measurement('recursive-chain-reversed', 80)?.millisecondsPerOperation;
 const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
 const aggregateBytesPerUpdate = Math.round(aggregateSampledAllocationBytes / 100);
+const ungroupedReducerBytesPerUpdate = Math.round(ungroupedReducerSampledAllocationBytes / 100);
 const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
 const pooledFanout10 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 10)?.millisecondsPerUpdate;
 const pooledFanout100 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 100)?.millisecondsPerUpdate;
@@ -506,7 +562,11 @@ const contracts = {
   linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
+  groupedReducerIncrementalAdvantage: groupedReducerPure10k !== undefined && groupedReducerUpdate10k !== undefined && groupedReducerUpdate10k < groupedReducerPure10k * 0.5,
+  ungroupedReducerIncrementalAdvantage: ungroupedReducerPure10k !== undefined && ungroupedReducerUpdate10k !== undefined && ungroupedReducerUpdate10k < ungroupedReducerPure10k * 0.5,
+  groupedReducerOpenNearLinear: groupedReducerOpen1k !== undefined && groupedReducerOpen10k !== undefined && groupedReducerOpen10k < groupedReducerOpen1k * 15,
   aggregateAllocationCeiling: aggregateBytesPerUpdate <= 1_000_000,
+  ungroupedReducerAllocationCeiling: ungroupedReducerBytesPerUpdate <= 1_000_000,
   partitionedWindowAdvantage: windowUpdate10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < windowUpdate10k * 0.5,
   partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
   rightJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinRightUpdate10k !== undefined && joinRightUpdate10k < joinPreparedPure10k * 0.5,
@@ -533,9 +593,14 @@ process.stdout.write(JSON.stringify({
     sampledBytesPerUpdate: privateBytesPerUpdate
   },
   aggregateAllocationSample: {
-    workload: '100 one-row updates over a 1,000-row, 100-group aggregate query',
+    workload: '100 one-row updates over a 1,000-row, 100-group reducer-only aggregate query',
     sampledBytes: aggregateSampledAllocationBytes,
     sampledBytesPerUpdate: aggregateBytesPerUpdate
+  },
+  ungroupedReducerAllocationSample: {
+    workload: '100 one-row updates over a 1,000-row ungrouped reducer-only aggregate query',
+    sampledBytes: ungroupedReducerSampledAllocationBytes,
+    sampledBytesPerUpdate: ungroupedReducerBytesPerUpdate
   },
   pooledAllocationSample: {
     workload: '100 one-row updates to a field ignored by 100 pooled roots over 1,000 input rows',
