@@ -180,6 +180,7 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const scalarEquality = { kind: 'where', input: from('score', 'score'), predicate: { kind: 'compare', op: 'eq', left: field('score', 'score'), right: field('score', 'score') } };
   const equalityRecord = { kind: 'record', fields: { group: field('score', 'group'), score: field('score', 'score') } };
   const objectEquality = { kind: 'where', input: from('score', 'score'), predicate: { kind: 'compare', op: 'eq', left: equalityRecord, right: equalityRecord } };
+  const distinct = { kind: 'distinct', input: { kind: 'select', input: from('score', 'score'), alias: 'value', fields: { group: field('score', 'group') } } };
   const aggregate = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: {
     count: { kind: 'aggregate', op: 'count' },
     sum: { kind: 'aggregate', op: 'sum', value: field('score', 'score') },
@@ -201,6 +202,7 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const scalarEqualityPlan = await plan('equality-scalar-pure-' + count, scalarEquality);
   const objectEqualityPlan = await plan('equality-object-pure-' + count, objectEquality);
   const aggregatePlan = await plan('aggregate-pure-' + count, aggregate);
+  const distinctPlan = await plan('distinct-pure-' + count, distinct);
   const groupedReducerPlan = await plan('aggregate-reducer-grouped-pure-' + count, groupedReducers);
   const ungroupedReducerPlan = await plan('aggregate-reducer-ungrouped-pure-' + count, ungroupedReducers);
   measurements.push(benchmark('order', count, iterations, () => evaluatePreparedQuery(orderPlan, { relations })));
@@ -209,6 +211,7 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   measurements.push(benchmark('equality-prepared-scalar', count, iterations, () => evaluatePreparedQuery(scalarEqualityPlan, { relations })));
   measurements.push(benchmark('equality-prepared-object', count, iterations, () => evaluatePreparedQuery(objectEqualityPlan, { relations })));
   measurements.push(benchmark('aggregate', count, iterations, () => evaluatePreparedQuery(aggregatePlan, { relations })));
+  measurements.push(benchmark('distinct', count, iterations, () => evaluatePreparedQuery(distinctPlan, { relations })));
   measurements.push(benchmark('aggregate-reducer-grouped', count, iterations, () => evaluatePreparedQuery(groupedReducerPlan, { relations })));
   measurements.push(benchmark('aggregate-reducer-ungrouped', count, iterations, () => evaluatePreparedQuery(ungroupedReducerPlan, { relations })));
   measurements.push(benchmark('aggregate-reducer-grouped-open', count, iterations, () => {
@@ -235,6 +238,12 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const ungroupedReducerSession = openIncrementalQueryMaintenance(ungroupedReducerPlan, first);
   measurements.push(benchmark('aggregate-reducer-ungrouped-one-row-update', count, updateIterations, (index) => ungroupedReducerSession.applyUpdate(index % 2 === 0 ? forward : backward)));
   ungroupedReducerSession.close();
+  const distinctChanged = { relations: [input('score', rows.map((row, index) => index === 0 ? { ...row, group: 101 } : row))] };
+  const distinctSession = openIncrementalQueryMaintenance(distinctPlan, first);
+  const distinctForward = diffQueryMaintenanceSnapshots(first, distinctChanged);
+  const distinctBackward = diffQueryMaintenanceSnapshots(distinctChanged, first);
+  measurements.push(benchmark('distinct-one-row-update', count, updateIterations, (index) => distinctSession.applyUpdate(index % 2 === 0 ? distinctForward : distinctBackward)));
+  distinctSession.close();
   if (count <= 10_000) {
     const orderBy = [{ value: field('score', 'score'), direction: 'asc' }];
     const window = { kind: 'window', input: from('score', 'score'), alias: 'score', fields: {
@@ -272,6 +281,12 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const backward = diffQueryMaintenanceSnapshots(changed, initial);
   measurements.push(benchmark('equijoin-right-one-row-update', count * 2, 6, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
   session.close();
+  const leftChanged = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
+  const leftSession = openIncrementalQueryMaintenance(prepared, initial);
+  const leftForward = diffQueryMaintenanceSnapshots(initial, leftChanged);
+  const leftBackward = diffQueryMaintenanceSnapshots(leftChanged, initial);
+  measurements.push(benchmark('equijoin-left-one-row-update', count * 2, 6, (index) => leftSession.applyUpdate(index % 2 === 0 ? leftForward : leftBackward)));
+  leftSession.close();
 }
 
 for (const [count, iterations] of [[10, 100], [20, 60], [40, 30], [80, 15]]) {
@@ -449,6 +464,45 @@ const { profile } = await post(allocationSession, 'HeapProfiler.stopSampling');
 allocationSession.disconnect();
 const sampledAllocationBytes = profile.samples.reduce((sum, sample) => sum + sample.size, 0);
 
+const leftJoinAllocationSession = new inspector.Session();
+leftJoinAllocationSession.connect();
+await post(leftJoinAllocationSession, 'HeapProfiler.enable');
+await post(leftJoinAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+{
+  const count = 1_000;
+  const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
+  const first = { relations };
+  const second = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
+  const session = openIncrementalQueryMaintenance(await plan('left-join-allocation-sample', joinQuery), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
+  session.close();
+}
+const { profile: leftJoinAllocationProfile } = await post(leftJoinAllocationSession, 'HeapProfiler.stopSampling');
+leftJoinAllocationSession.disconnect();
+const leftJoinSampledAllocationBytes = leftJoinAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+
+const rightJoinAllocationSession = new inspector.Session();
+rightJoinAllocationSession.connect();
+await post(rightJoinAllocationSession, 'HeapProfiler.enable');
+await post(rightJoinAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+{
+  const count = 1_000;
+  const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
+  const first = { relations };
+  const changedRight = joinRows(count, false).map((row, index) => index === 0 ? { ...row, label: 'changed' } : row);
+  const second = { relations: [relations[0], input('right', changedRight)] };
+  const session = openIncrementalQueryMaintenance(await plan('right-join-allocation-sample', joinQuery), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
+  session.close();
+}
+const { profile: rightJoinAllocationProfile } = await post(rightJoinAllocationSession, 'HeapProfiler.stopSampling');
+rightJoinAllocationSession.disconnect();
+const rightJoinSampledAllocationBytes = rightJoinAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+
 const aggregateAllocationSession = new inspector.Session();
 aggregateAllocationSession.connect();
 await post(aggregateAllocationSession, 'HeapProfiler.enable');
@@ -503,6 +557,26 @@ const { profile: ungroupedReducerAllocationProfile } = await post(ungroupedReduc
 ungroupedReducerAllocationSession.disconnect();
 const ungroupedReducerSampledAllocationBytes = ungroupedReducerAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
 
+const distinctAllocationSession = new inspector.Session();
+distinctAllocationSession.connect();
+await post(distinctAllocationSession, 'HeapProfiler.enable');
+await post(distinctAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+{
+  const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, group: id % 100 }));
+  const changed = rows.map((row, index) => index === 0 ? { ...row, group: 101 } : row);
+  const first = { relations: [input('score', rows)] };
+  const second = { relations: [input('score', changed)] };
+  const query = { kind: 'distinct', input: { kind: 'select', input: from('score', 'score'), alias: 'value', fields: { group: field('score', 'group') } } };
+  const session = openIncrementalQueryMaintenance(await plan('distinct-allocation-sample', query), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
+  session.close();
+}
+const { profile: distinctAllocationProfile } = await post(distinctAllocationSession, 'HeapProfiler.stopSampling');
+distinctAllocationSession.disconnect();
+const distinctSampledAllocationBytes = distinctAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+
 const pooledAllocationFirst = { relations: [input('item', linearRows(1_000))] };
 const pooledAllocationSecond = { relations: [input('item', linearRows(1_000, true))] };
 const pooledAllocationRuntime = createPooledIncrementalQueryRuntime({
@@ -538,6 +612,8 @@ const orderPure10k = measurement('order', 10_000)?.millisecondsPerOperation;
 const orderUpdate10k = measurement('order-one-row-update', 10_000)?.millisecondsPerOperation;
 const aggregatePure10k = measurement('aggregate', 10_000)?.millisecondsPerOperation;
 const aggregateUpdate10k = measurement('aggregate-one-row-update', 10_000)?.millisecondsPerOperation;
+const distinctPure10k = measurement('distinct', 10_000)?.millisecondsPerOperation;
+const distinctUpdate10k = measurement('distinct-one-row-update', 10_000)?.millisecondsPerOperation;
 const groupedReducerPure10k = measurement('aggregate-reducer-grouped', 10_000)?.millisecondsPerOperation;
 const groupedReducerUpdate10k = measurement('aggregate-reducer-grouped-one-row-update', 10_000)?.millisecondsPerOperation;
 const ungroupedReducerPure10k = measurement('aggregate-reducer-ungrouped', 10_000)?.millisecondsPerOperation;
@@ -549,13 +625,17 @@ const partitionedWindowUpdate10k = measurement('window-partitioned-one-row-updat
 const partitionedWindowPure10k = measurement('window-partitioned-prepared-pure', 10_000)?.millisecondsPerOperation;
 const joinPreparedPure10k = measurement('equijoin-prepared-pure', 10_000)?.millisecondsPerOperation;
 const joinRightUpdate10k = measurement('equijoin-right-one-row-update', 10_000)?.millisecondsPerOperation;
+const joinLeftUpdate10k = measurement('equijoin-left-one-row-update', 10_000)?.millisecondsPerOperation;
 const recursiveChain40 = measurement('recursive-chain', 40)?.millisecondsPerOperation;
 const recursiveChain80 = measurement('recursive-chain', 80)?.millisecondsPerOperation;
 const reversedRecursiveChain40 = measurement('recursive-chain-reversed', 40)?.millisecondsPerOperation;
 const reversedRecursiveChain80 = measurement('recursive-chain-reversed', 80)?.millisecondsPerOperation;
 const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
+const leftJoinBytesPerUpdate = Math.round(leftJoinSampledAllocationBytes / 100);
+const rightJoinBytesPerUpdate = Math.round(rightJoinSampledAllocationBytes / 100);
 const aggregateBytesPerUpdate = Math.round(aggregateSampledAllocationBytes / 100);
 const ungroupedReducerBytesPerUpdate = Math.round(ungroupedReducerSampledAllocationBytes / 100);
+const distinctBytesPerUpdate = Math.round(distinctSampledAllocationBytes / 100);
 const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
 const pooledFanout10 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 10)?.millisecondsPerUpdate;
 const pooledFanout100 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 100)?.millisecondsPerUpdate;
@@ -568,14 +648,21 @@ const contracts = {
   linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
+  distinctIncrementalAdvantage: distinctPure10k !== undefined && distinctUpdate10k !== undefined && distinctUpdate10k < distinctPure10k * 0.5,
   groupedReducerIncrementalAdvantage: groupedReducerPure10k !== undefined && groupedReducerUpdate10k !== undefined && groupedReducerUpdate10k < groupedReducerPure10k * 0.5,
   ungroupedReducerIncrementalAdvantage: ungroupedReducerPure10k !== undefined && ungroupedReducerUpdate10k !== undefined && ungroupedReducerUpdate10k < ungroupedReducerPure10k * 0.5,
   groupedReducerOpenNearLinear: groupedReducerOpen1k !== undefined && groupedReducerOpen10k !== undefined && groupedReducerOpen10k < groupedReducerOpen1k * 15,
   aggregateAllocationCeiling: aggregateBytesPerUpdate <= 1_000_000,
   ungroupedReducerAllocationCeiling: ungroupedReducerBytesPerUpdate <= 1_000_000,
+  distinctAllocationCeiling: distinctBytesPerUpdate <= 1_000_000,
   partitionedWindowAdvantage: windowUpdate10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < windowUpdate10k * 0.5,
   partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
   rightJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinRightUpdate10k !== undefined && joinRightUpdate10k < joinPreparedPure10k * 0.5,
+  leftJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinLeftUpdate10k !== undefined && joinLeftUpdate10k < joinPreparedPure10k * 0.5,
+  joinSideUpdateSymmetry: joinLeftUpdate10k !== undefined && joinRightUpdate10k !== undefined && Math.max(joinLeftUpdate10k, joinRightUpdate10k) < Math.min(joinLeftUpdate10k, joinRightUpdate10k) * 2.5,
+  leftJoinAllocationCeiling: leftJoinBytesPerUpdate <= 2_000_000,
+  rightJoinAllocationCeiling: rightJoinBytesPerUpdate <= 2_000_000,
+  joinSideAllocationSymmetry: Math.max(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) < Math.min(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) * 2.5,
   preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
   preparedExpressionAdvantage: repeatedUnpreparedExpression !== undefined && repeatedPreparedExpression !== undefined && repeatedPreparedExpression < repeatedUnpreparedExpression * 0.75,
   recursiveChainNearLinear: recursiveChain40 !== undefined && recursiveChain80 !== undefined && recursiveChain80 < recursiveChain40 * 2.75,
@@ -598,6 +685,16 @@ process.stdout.write(JSON.stringify({
     sampledBytes: sampledAllocationBytes,
     sampledBytesPerUpdate: privateBytesPerUpdate
   },
+  leftJoinAllocationSample: {
+    workload: '100 one-row left updates over a 1,000-by-1,000 one-to-one equijoin',
+    sampledBytes: leftJoinSampledAllocationBytes,
+    sampledBytesPerUpdate: leftJoinBytesPerUpdate
+  },
+  rightJoinAllocationSample: {
+    workload: '100 one-row right updates over a 1,000-by-1,000 one-to-one equijoin',
+    sampledBytes: rightJoinSampledAllocationBytes,
+    sampledBytesPerUpdate: rightJoinBytesPerUpdate
+  },
   aggregateAllocationSample: {
     workload: '100 one-row updates over a 1,000-row, 100-group reducer-only aggregate query',
     sampledBytes: aggregateSampledAllocationBytes,
@@ -607,6 +704,11 @@ process.stdout.write(JSON.stringify({
     workload: '100 one-row updates over a 1,000-row ungrouped reducer-only aggregate query',
     sampledBytes: ungroupedReducerSampledAllocationBytes,
     sampledBytesPerUpdate: ungroupedReducerBytesPerUpdate
+  },
+  distinctAllocationSample: {
+    workload: '100 one-row updates over a 1,000-row, 100-key distinct query',
+    sampledBytes: distinctSampledAllocationBytes,
+    sampledBytesPerUpdate: distinctBytesPerUpdate
   },
   pooledAllocationSample: {
     workload: '100 one-row updates to a field ignored by 100 pooled roots over 1,000 input rows',

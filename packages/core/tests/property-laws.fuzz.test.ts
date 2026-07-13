@@ -5,6 +5,7 @@ import {
   canonicalizeJson,
   diffQueryMaintenanceSnapshots,
   evaluateQuery,
+  logicalUnknown,
   openIncrementalQueryMaintenance,
   parseArtifactText,
   safeParseJsonValue,
@@ -238,6 +239,23 @@ describe('shrinking property laws', () => {
         expect(maintained.rows).toEqual(reducerOracle(model));
         expect(maintained.completeness).toBe('exact');
         expect(maintained.issues).toEqual([]);
+        accepted = next;
+      });
+      incremental.close();
+    }
+  ));
+
+  propertyTest('distinct-command-sequences-match-an-independent-first-occurrence-model', fc.property(
+    fc.array(distinctCommandArbitrary, { maxLength: 20 }),
+    (commands) => {
+      let model = initialDistinctModel();
+      let accepted = distinctSnapshot(model, 0);
+      const incremental = openIncrementalQueryMaintenance(propertyPlan('distinct-commands', distinctQuery), accepted);
+      expect(incremental.getCurrentResult().rows).toEqual(distinctOracle(model));
+      commands.forEach((command, index) => {
+        model = applyDistinctCommand(model, command);
+        const next = distinctSnapshot(model, index + 1);
+        expect(incremental.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next)).rows).toEqual(distinctOracle(model));
         accepted = next;
       });
       incremental.close();
@@ -501,6 +519,47 @@ const compareReducerJson = (left: JsonValue, right: JsonValue): number => {
     if (compared !== 0) return compared;
   }
   return leftKeys.length - rightKeys.length;
+};
+
+type DistinctValue = JsonValue | typeof logicalUnknown;
+type DistinctRow = { readonly id: number; readonly value: DistinctValue };
+type DistinctCommand =
+  | { readonly kind: 'replace'; readonly id: number; readonly value: DistinctValue }
+  | { readonly kind: 'insert'; readonly id: number; readonly value: DistinctValue }
+  | { readonly kind: 'delete'; readonly id: number };
+const distinctValueArbitrary: fc.Arbitrary<DistinctValue> = fc.oneof(reducerJsonArbitrary, fc.constant(logicalUnknown));
+const distinctCommandArbitrary: fc.Arbitrary<DistinctCommand> = fc.oneof(
+  fc.record({ kind: fc.constant('replace' as const), id: fc.integer({ min: 0, max: 9 }), value: distinctValueArbitrary }),
+  fc.record({ kind: fc.constant('insert' as const), id: fc.integer({ min: 0, max: 9 }), value: distinctValueArbitrary }),
+  fc.record({ kind: fc.constant('delete' as const), id: fc.integer({ min: 0, max: 9 }) })
+);
+const distinctQuery: QueryNode = {
+  kind: 'distinct',
+  input: { kind: 'select', input: { kind: 'from', relation: relationUse('property.distinct.rows'), alias: 'row' }, alias: 'value', fields: { value: field('row', 'value') } }
+};
+const initialDistinctModel = (): readonly DistinctRow[] => [
+  { id: 0, value: null }, { id: 1, value: 'same' }, { id: 2, value: 'same' }, { id: 3, value: logicalUnknown }, { id: 4, value: [1] }
+];
+const applyDistinctCommand = (model: readonly DistinctRow[], command: DistinctCommand): readonly DistinctRow[] => {
+  const rows = [...model];
+  const index = rows.findIndex(({ id }) => id === command.id);
+  if (command.kind === 'delete') { if (index >= 0) rows.splice(index, 1); }
+  else if (command.kind === 'insert') { const row: DistinctRow = { id: command.id, value: command.value }; if (index < 0) rows.push(row); else rows[index] = row; }
+  else if (index >= 0) rows[index] = { id: command.id, value: command.value };
+  return rows;
+};
+const distinctSnapshot = (rows: readonly DistinctRow[], revision: number): QueryMaintenanceSnapshot => ({
+  relations: [{ relation: relationUse('property.distinct.rows'), rows, occurrenceIds: rows.map(({ id }) => 'distinct:' + id), completeness: 'exact', sourceId: 'source:distinct', attachmentId: 'attachment:distinct', basis: revision }],
+  basis: { revision }
+});
+const distinctOracle = (rows: readonly DistinctRow[]): readonly QueryRecord[] => {
+  const seen = new Set<string>();
+  return rows.flatMap(({ value }) => {
+    const key = value === logicalUnknown ? 'unknown' : 'json:' + canonicalizeJson(value);
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{ value }];
+  });
 };
 
 const graphRelation = relationUse('property.graph.edges');

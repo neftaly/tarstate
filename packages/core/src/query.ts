@@ -193,7 +193,7 @@ export type IncrementalQueryResultDelta = {
   readonly updatedResultKeys: readonly string[];
 };
 
-export type QueryMaintenanceOperator = 'local' | 'join' | 'order' | 'aggregate' | 'window';
+export type QueryMaintenanceOperator = 'local' | 'join' | 'distinct' | 'order' | 'aggregate' | 'window' | 'slice' | 'set';
 export type QueryMaintenanceFallbackReason = 'unsupported_expression' | 'state_unavailable' | 'input_unavailable' | 'unstable_layout' | 'evaluation_unavailable';
 export type QueryOperatorMaintenanceDiagnostics = {
   readonly selectiveNodeCount: number;
@@ -309,7 +309,7 @@ type QueryMaintenanceOperatorEvent = {
   readonly reason?: QueryMaintenanceFallbackReason;
 };
 
-const operatorKinds: readonly QueryMaintenanceOperator[] = ['local', 'join', 'order', 'aggregate', 'window'];
+const operatorKinds: readonly QueryMaintenanceOperator[] = ['local', 'join', 'distinct', 'order', 'aggregate', 'window', 'slice', 'set'];
 const emptyQueryOperatorMaintenanceDiagnostics: QueryOperatorMaintenanceDiagnostics = Object.freeze({
   selectiveNodeCount: 0,
   fullNodeCount: 0,
@@ -397,6 +397,9 @@ type MaterializedQueryNode = {
   readonly order?: {
     readonly inputs: readonly ScopedRow[];
   };
+  readonly distinct?: DistinctMaterializedState;
+  readonly slice?: { readonly inputs: readonly ScopedRow[] };
+  readonly unionAll?: { readonly leftInputs: readonly ScopedRow[]; readonly rightInputs: readonly ScopedRow[] };
   readonly window?: {
     readonly inputs: readonly ScopedRow[];
     readonly partitionKeyByResultKey: ReadonlyMap<string, string>;
@@ -413,6 +416,8 @@ type MaterializedQueryNode = {
 const withMaintenanceEvent = (node: MaterializedQueryNode, event: QueryMaintenanceOperatorEvent): MaterializedQueryNode => ({ ...node, maintenanceEvent: event });
 
 type AggregateGroupKey = { readonly canonical: string; readonly key: QueryRecord };
+type DistinctPositionKeyIndex = { readonly base: readonly string[]; readonly overlays: readonly ReadonlyMap<number, string>[] };
+type DistinctMaterializedState = { readonly inputs: readonly ScopedRow[]; readonly keys: DistinctPositionKeyIndex; readonly positionsByKey: ReadonlyMap<string, readonly number[]> };
 type AggregateGroupMember = { readonly position: number; readonly row: ScopedRow };
 type AggregateGroupState = { readonly key: QueryRecord; readonly members: readonly AggregateGroupMember[]; readonly reducers: AggregateReducerStates; readonly output: ScopedRow };
 type DistinctCountIndex = { readonly base: ReadonlyMap<string, number>; readonly overlays: readonly ReadonlyMap<string, number>[], readonly distinctCount: number };
@@ -790,6 +795,58 @@ class OverlayRowIndex implements ReadonlyMap<string, readonly ScopedRow[]> {
   }
   [Symbol.iterator](): MapIterator<[string, readonly ScopedRow[]]> { return this.entries(); }
   #materialized(): Map<string, readonly ScopedRow[]> { return materializeRowIndex(this.#base, this.#overrides); }
+}
+
+type JoinPositionBucket = number | readonly number[];
+const materializeJoinPositions = (
+  base: ReadonlyMap<string, JoinPositionBucket>,
+  overrides: ReadonlyMap<string, JoinPositionBucket | undefined>
+): Map<string, JoinPositionBucket> => {
+  const output = new Map(base);
+  for (const [key, value] of overrides) {
+    if (value === undefined) output.delete(key);
+    else output.set(key, value);
+  }
+  return output;
+};
+
+class OverlayJoinPositions implements ReadonlyMap<string, JoinPositionBucket> {
+  readonly #base: ReadonlyMap<string, JoinPositionBucket>;
+  readonly #overrides: ReadonlyMap<string, JoinPositionBucket | undefined>;
+  readonly compacted: boolean;
+  constructor(base: ReadonlyMap<string, JoinPositionBucket>, overrides: ReadonlyMap<string, JoinPositionBucket | undefined>) {
+    if (base instanceof OverlayJoinPositions) {
+      const combined = new Map([...base.#overrides, ...overrides]);
+      if (combined.size >= maxJoinIndexOverrides) {
+        this.#base = materializeJoinPositions(base.#base, combined);
+        this.#overrides = new Map();
+        this.compacted = true;
+      } else {
+        this.#base = base.#base;
+        this.#overrides = combined;
+        this.compacted = false;
+      }
+    } else if (overrides.size >= maxJoinIndexOverrides) {
+      this.#base = materializeJoinPositions(base, overrides);
+      this.#overrides = new Map();
+      this.compacted = true;
+    } else {
+      this.#base = base;
+      this.#overrides = overrides;
+      this.compacted = false;
+    }
+  }
+  get(key: string): JoinPositionBucket | undefined { return this.#overrides.has(key) ? this.#overrides.get(key) : this.#base.get(key); }
+  has(key: string): boolean { return this.get(key) !== undefined; }
+  get size(): number { return this.#materialized().size; }
+  entries(): MapIterator<[string, JoinPositionBucket]> { return this.#materialized().entries(); }
+  keys(): MapIterator<string> { return this.#materialized().keys(); }
+  values(): MapIterator<JoinPositionBucket> { return this.#materialized().values(); }
+  forEach(callbackfn: (value: JoinPositionBucket, key: string, map: ReadonlyMap<string, JoinPositionBucket>) => void, thisArg?: unknown): void {
+    this.#materialized().forEach((value, key) => callbackfn.call(thisArg, value, key, this));
+  }
+  [Symbol.iterator](): MapIterator<[string, JoinPositionBucket]> { return this.entries(); }
+  #materialized(): Map<string, JoinPositionBucket> { return materializeJoinPositions(this.#base, this.#overrides); }
 }
 
 const indexedRows = (cacheKey: QueryNode, input: QueryNode, rows: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlyMap<string, readonly ScopedRow[]> => {
@@ -1432,10 +1489,11 @@ const scopedRow = (scope: ScopedRow['scope'], provenance: ScopedRow['provenance'
 const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => Object.fromEntries(Object.entries(record).map(([name, value]) => [fields[name] ?? name, value]));
 const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => Object.fromEntries(Object.entries(record).filter(([name]) => !fields.has(name)));
 const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));
-const tagSetBranch = (rows: readonly ScopedRow[], branch: 'left' | 'right'): readonly ScopedRow[] => rows.map((row) => scopedRow(
+const tagSetRow = (row: ScopedRow, branch: 'left' | 'right'): ScopedRow => scopedRow(
   row.scope,
   Object.fromEntries(Object.entries(row.provenance).map(([alias, value]) => [alias, { ...value, occurrence: branch + ':' + value.occurrence }]))
-));
+);
+const tagSetBranch = (rows: readonly ScopedRow[], branch: 'left' | 'right'): readonly ScopedRow[] => rows.map((row) => tagSetRow(row, branch));
 const compareOrder = (left: ScopedRow, right: ScopedRow, terms: readonly OrderTerm[], context: QueryContext): number => {
   for (const term of terms) {
     const leftValue = evaluateExpr(term.value, exprContext(left, context));
@@ -1673,10 +1731,16 @@ export const openIncrementalQueryMaintenance = (
               ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
             : node.kind === 'order'
               ? incrementallyMaterializeOrder(node, nextSnapshot, materialized, previousNode)
+            : node.kind === 'distinct'
+              ? incrementallyMaterializeDistinct(node, nextSnapshot, materialized, previousNode)
             : node.kind === 'window'
               ? incrementallyMaterializeWindow(node, nextSnapshot, materialized, previousNode)
             : node.kind === 'aggregate'
               ? incrementallyMaterializeAggregate(node, nextSnapshot, materialized, previousNode)
+            : node.kind === 'slice'
+              ? incrementallyMaterializeSlice(node, nextSnapshot, materialized, previousNode)
+            : node.kind === 'set'
+              ? incrementallyMaterializeUnionAll(node, nextSnapshot, materialized, previousNode)
             : isLocallyMaintainedNode(node)
               ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
               : materializeQueryNode(node, nextSnapshot, materialized);
@@ -2113,10 +2177,16 @@ export const createPooledIncrementalQueryRuntime = (input: {
           ? incrementallyMaterializeJoin(node, nextSnapshot, materialized, previousNode)
         : node.kind === 'order'
           ? incrementallyMaterializeOrder(node, nextSnapshot, materialized, previousNode)
+        : node.kind === 'distinct'
+          ? incrementallyMaterializeDistinct(node, nextSnapshot, materialized, previousNode)
         : node.kind === 'window'
           ? incrementallyMaterializeWindow(node, nextSnapshot, materialized, previousNode)
         : node.kind === 'aggregate'
           ? incrementallyMaterializeAggregate(node, nextSnapshot, materialized, previousNode)
+        : node.kind === 'slice'
+          ? incrementallyMaterializeSlice(node, nextSnapshot, materialized, previousNode)
+        : node.kind === 'set'
+          ? incrementallyMaterializeUnionAll(node, nextSnapshot, materialized, previousNode)
         : isLocallyMaintainedNode(node)
           ? incrementallyMaterializeLocal(node, nextSnapshot, materialized, previousNode)
           : materializeQueryNode(node, nextSnapshot, materialized);
@@ -2482,6 +2552,10 @@ const materializeQueryNode = (
     const child = materializedNodes.get(node.input);
     if (child !== undefined && child.result.completeness === 'exact') return { ...materialized, order: { inputs: child.result.rows } };
   }
+  if (node.kind === 'distinct' && !materialized.unavailable && materialized.issues.length === 0) {
+    const child = materializedNodes.get(node.input);
+    if (child !== undefined && child.result.completeness !== 'unknown') return { ...materialized, distinct: indexDistinctState(child.result.rows) };
+  }
   if (node.kind === 'window' && windowCanBePartitionMaintained(node) && !materialized.unavailable && materialized.issues.length === 0) {
     const child = materializedNodes.get(node.input);
     if (child !== undefined && child.result.completeness === 'exact') {
@@ -2494,6 +2568,17 @@ const materializeQueryNode = (
     if (child !== undefined && child.result.completeness === 'exact') {
       const indexed = indexAggregateState(node, child.result.rows, materialized.result.rows, materializationContext(snapshot, materializedNodes, node, [], false));
       if (indexed !== undefined) return { ...materialized, aggregate: indexed };
+    }
+  }
+  if (node.kind === 'slice' && !materialized.unavailable && materialized.issues.length === 0) {
+    const child = materializedNodes.get(node.input);
+    if (child !== undefined && child.result.completeness === 'exact') return { ...materialized, slice: { inputs: child.result.rows } };
+  }
+  if (node.kind === 'set' && node.op === 'union-all' && !materialized.unavailable && materialized.issues.length === 0) {
+    const left = materializedNodes.get(node.left);
+    const right = materializedNodes.get(node.right);
+    if (left !== undefined && right !== undefined && left.result.completeness !== 'unknown' && right.result.completeness !== 'unknown') {
+      return { ...materialized, unionAll: { leftInputs: left.result.rows, rightInputs: right.result.rows } };
     }
   }
   if (!isLocallyMaintainedNode(node) || materialized.unavailable || materialized.issues.length > 0) return materialized;
@@ -2521,6 +2606,87 @@ const windowPartitionKey = (node: Extract<QueryNode, { readonly kind: 'window' }
   const values = (first.partitionBy ?? []).map((expression) => evaluateExpr(expression, exprContext(row, context)));
   if (values.some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.unavailable = true;
   return canonicalizeJson(values.map(expressionJson));
+};
+
+const stableReplacementLayout = (
+  previous: readonly ScopedRow[],
+  next: readonly ScopedRow[],
+  changedPositions: readonly number[] | undefined
+): boolean => previous.length === next.length
+  && previous.every((row, index) => resultKey(row) === resultKey(next[index] as ScopedRow))
+  && (changedPositions !== undefined || previous.every((row, index) => row === next[index]));
+
+const incrementallyMaterializeSlice = (
+  node: Extract<QueryNode, { readonly kind: 'slice' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const child = materializedNodes.get(node.input);
+  if (child === undefined || child.unavailable || child.issues.length > 0 || child.result.completeness !== 'exact' || previous?.slice === undefined) {
+    const reason: QueryMaintenanceFallbackReason = child === undefined || child.unavailable || child.result.completeness !== 'exact' ? 'input_unavailable' : 'state_unavailable';
+    return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'slice', strategy: 'fallback', affectedUnitCount: child?.result.rows.length ?? 0, reason });
+  }
+  if (!stableReplacementLayout(previous.slice.inputs, child.result.rows, child.stableChangedPositions)) {
+    return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'slice', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'unstable_layout' });
+  }
+  const offset = Math.max(0, node.offset ?? 0);
+  const end = Math.min(child.result.rows.length, node.limit === undefined ? child.result.rows.length : offset + Math.max(0, node.limit));
+  const changedOutputPositions: number[] = [];
+  let output = previous.result.rows;
+  for (const position of child.stableChangedPositions ?? []) {
+    if (position < offset || position >= end || previous.slice.inputs[position] === child.result.rows[position]) continue;
+    if (changedOutputPositions.length === 0) output = previous.result.rows.slice();
+    const outputPosition = position - offset;
+    (output as ScopedRow[])[outputPosition] = child.result.rows[position] as ScopedRow;
+    changedOutputPositions.push(outputPosition);
+  }
+  return withMaintenanceEvent({
+    result: { rows: output, completeness: 'exact' },
+    issues: [],
+    unavailable: false,
+    stableChangedPositions: changedOutputPositions,
+    slice: { inputs: child.result.rows }
+  }, { operator: 'slice', strategy: 'selective', affectedUnitCount: changedOutputPositions.length });
+};
+
+const incrementallyMaterializeUnionAll = (
+  node: Extract<QueryNode, { readonly kind: 'set' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const left = materializedNodes.get(node.left);
+  const right = materializedNodes.get(node.right);
+  if (node.op !== 'union-all') return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'set', strategy: 'fallback', affectedUnitCount: (left?.result.rows.length ?? 0) + (right?.result.rows.length ?? 0), reason: 'unsupported_expression' });
+  if (left === undefined || right === undefined || left.unavailable || right.unavailable || left.issues.length > 0 || right.issues.length > 0 || left.result.completeness === 'unknown' || right.result.completeness === 'unknown' || previous?.unionAll === undefined) {
+    const reason: QueryMaintenanceFallbackReason = left === undefined || right === undefined || left.unavailable || right.unavailable || left.result.completeness === 'unknown' || right.result.completeness === 'unknown' ? 'input_unavailable' : 'state_unavailable';
+    return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'set', strategy: 'fallback', affectedUnitCount: (left?.result.rows.length ?? 0) + (right?.result.rows.length ?? 0), reason });
+  }
+  if (!stableReplacementLayout(previous.unionAll.leftInputs, left.result.rows, left.stableChangedPositions)
+    || !stableReplacementLayout(previous.unionAll.rightInputs, right.result.rows, right.stableChangedPositions)) {
+    return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'set', strategy: 'fallback', affectedUnitCount: left.result.rows.length + right.result.rows.length, reason: 'unstable_layout' });
+  }
+  const replacements: { readonly outputPosition: number; readonly row: ScopedRow; readonly branch: 'left' | 'right' }[] = [];
+  for (const position of left.stableChangedPositions ?? []) {
+    const row = left.result.rows[position];
+    if (row !== undefined && row !== previous.unionAll.leftInputs[position]) replacements.push({ outputPosition: position, row, branch: 'left' });
+  }
+  for (const position of right.stableChangedPositions ?? []) {
+    const row = right.result.rows[position];
+    if (row !== undefined && row !== previous.unionAll.rightInputs[position]) replacements.push({ outputPosition: left.result.rows.length + position, row, branch: 'right' });
+  }
+  const output = replacements.length === 0 ? previous.result.rows : previous.result.rows.slice();
+  for (const replacement of replacements) (output as ScopedRow[])[replacement.outputPosition] = tagSetRow(replacement.row, replacement.branch);
+  const completeness = left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound';
+  const stableChangedPositions = replacements.map(({ outputPosition }) => outputPosition).sort((a, b) => a - b);
+  return withMaintenanceEvent({
+    result: { rows: output, completeness },
+    issues: [],
+    unavailable: false,
+    stableChangedPositions,
+    unionAll: { leftInputs: left.result.rows, rightInputs: right.result.rows }
+  }, { operator: 'set', strategy: 'selective', affectedUnitCount: stableChangedPositions.length });
 };
 
 const indexWindowState = (
@@ -2715,6 +2881,94 @@ const incrementallyMaterializeWindow = (
     ...(stableIdentityLayout ? { stableChangedPositions: changedPositions.sort((left, right) => left - right) } : {}),
     window: { inputs: child.result.rows, partitionKeyByResultKey, partitions: indexedPartitions, layouts }
   }, { operator: 'window', strategy: 'selective', affectedUnitCount: changedPositions.length });
+};
+
+const indexDistinctState = (inputs: readonly ScopedRow[]): DistinctMaterializedState => {
+  const base: string[] = [];
+  const positionsByKey = new Map<string, number[]>();
+  inputs.forEach((row, position) => {
+    const key = canonicalizeQueryValue(visibleRow(row));
+    base.push(key);
+    const positions = positionsByKey.get(key);
+    if (positions === undefined) positionsByKey.set(key, [position]);
+    else positions.push(position);
+  });
+  return { inputs, keys: { base, overlays: [] }, positionsByKey };
+};
+
+const distinctPositionKey = (index: DistinctPositionKeyIndex, position: number): string | undefined => {
+  for (let overlay = index.overlays.length - 1; overlay >= 0; overlay -= 1) {
+    const key = index.overlays[overlay]?.get(position);
+    if (key !== undefined) return key;
+  }
+  return index.base[position];
+};
+
+const incrementallyMaterializeDistinct = (
+  node: Extract<QueryNode, { readonly kind: 'distinct' }>,
+  snapshot: QueryMaintenanceSnapshot,
+  materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+  previous: MaterializedQueryNode | undefined
+): MaterializedQueryNode => {
+  const child = materializedNodes.get(node.input);
+  if (child === undefined || child.unavailable || child.issues.length > 0 || child.result.completeness === 'unknown' || previous?.distinct === undefined) {
+    const reason: QueryMaintenanceFallbackReason = child === undefined || child.unavailable || child.result.completeness === 'unknown' ? 'input_unavailable' : 'state_unavailable';
+    return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'distinct', strategy: 'fallback', affectedUnitCount: child?.result.rows.length ?? 0, reason });
+  }
+  const changed = child.stableChangedPositions;
+  if (changed === undefined || child.result.rows.length !== previous.distinct.inputs.length || changed.length > Math.max(32, child.result.rows.length >>> 3)) {
+    return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'distinct', strategy: 'full', affectedUnitCount: child.result.rows.length });
+  }
+  if (changed.length === 0) return withMaintenanceEvent({
+    result: previous.result.completeness === child.result.completeness
+      ? previous.result
+      : { rows: previous.result.rows, completeness: child.result.completeness },
+    issues: [], unavailable: false, stableChangedPositions: [],
+    distinct: { ...previous.distinct, inputs: child.result.rows }
+  }, { operator: 'distinct', strategy: 'selective', affectedUnitCount: 0 });
+  const positionsByKey = new Map(previous.distinct.positionsByKey);
+  const affectedKeys = new Set<string>();
+  const keyChanges = new Map<number, string>();
+  for (const position of changed) {
+    const row = child.result.rows[position];
+    const beforeKey = distinctPositionKey(previous.distinct.keys, position);
+    if (row === undefined || beforeKey === undefined) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'distinct', strategy: 'fallback', affectedUnitCount: changed.length, reason: 'unstable_layout' });
+    const afterKey = canonicalizeQueryValue(visibleRow(row));
+    if (beforeKey !== afterKey) keyChanges.set(position, afterKey);
+    affectedKeys.add(beforeKey);
+    affectedKeys.add(afterKey);
+    if (beforeKey !== afterKey) {
+      const oldPositions = positionsByKey.get(beforeKey)?.filter((candidate) => candidate !== position) ?? [];
+      if (oldPositions.length === 0) positionsByKey.delete(beforeKey);
+      else positionsByKey.set(beforeKey, oldPositions);
+      const target = positionsByKey.get(afterKey) ?? [];
+      positionsByKey.set(afterKey, [...target, position].sort((left, right) => left - right));
+    }
+  }
+  let keys: DistinctPositionKeyIndex = keyChanges.size === 0 ? previous.distinct.keys : { base: previous.distinct.keys.base, overlays: [...previous.distinct.keys.overlays, keyChanges] };
+  let compactionCount = 0;
+  if (keys.overlays.length >= 64) {
+    const base = [...keys.base];
+    for (const overlay of keys.overlays) for (const [position, key] of overlay) base[position] = key;
+    keys = { base, overlays: [] };
+    compactionCount = 1;
+  }
+  const previousOutputByKey = new Map<string, ScopedRow>();
+  for (const row of previous.result.rows) previousOutputByKey.set(canonicalizeQueryValue(visibleRow(row)), row);
+  const entries = [...positionsByKey].sort((left, right) => (left[1][0] as number) - (right[1][0] as number));
+  const candidateOutput = entries.map(([key, positions]) => affectedKeys.has(key)
+    ? child.result.rows[positions[0] as number] as ScopedRow
+    : previousOutputByKey.get(key) ?? child.result.rows[positions[0] as number] as ScopedRow);
+  const stableIdentityLayout = candidateOutput.length === previous.result.rows.length
+    && candidateOutput.every((row, index) => resultKey(row) === resultKey(previous.result.rows[index] as ScopedRow));
+  const changedOutputPositions = stableIdentityLayout ? candidateOutput.flatMap((row, index) => row === previous.result.rows[index] ? [] : [index]) : undefined;
+  const output = changedOutputPositions?.length === 0 ? previous.result.rows : candidateOutput;
+  return withMaintenanceEvent({
+    result: { rows: output, completeness: child.result.completeness },
+    issues: [], unavailable: false,
+    ...(changedOutputPositions === undefined ? {} : { stableChangedPositions: changedOutputPositions }),
+    distinct: { inputs: child.result.rows, keys, positionsByKey }
+  }, { operator: 'distinct', strategy: 'selective', affectedUnitCount: affectedKeys.size, compactionCount });
 };
 
 const incrementallyMaterializeOrder = (
@@ -3319,6 +3573,73 @@ const incrementallyMaterializeJoin = (
     : sparseRightChanges && previous.join.rightIndex !== undefined
       ? updateIndexedRows(previous.join.rightIndex, previous.join.rightInputs, right.result.rows, right.stableChangedPositions ?? [], equality.right, context)
       : buildIndexedRows(right.result.rows, equality.right, context);
+  const stableLeftChanges = left.stableChangedPositions !== undefined
+    && previous.join.leftInputs.length === left.result.rows.length;
+  const sparseLeftChanges = stableLeftChanges
+    && (left.stableChangedPositions?.length ?? 0) <= Math.max(32, Math.floor(left.result.rows.length / 4));
+  const retainedLeftPositions = previous.join.leftPositionsByKey;
+  if (rightUnchanged && previous.join.rightIndex !== undefined && sparseLeftChanges && retainedLeftPositions !== undefined) {
+    const affectedPositions = [...new Set(left.stableChangedPositions ?? [])].sort((first, second) => first - second);
+    const leftPositionsByKey = updateLeftJoinPositions(retainedLeftPositions, previous.join.leftInputs, left.result.rows, affectedPositions, equality.left, context);
+    const segments = previous.join.segments.slice();
+    let widthsStable = true;
+    for (const position of affectedPositions) {
+      const row = left.result.rows[position];
+      if (row === undefined) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'join', strategy: 'fallback', affectedUnitCount: affectedPositions.length, reason: 'unstable_layout' });
+      const leftKey = indexKey(equality.left, row, context);
+      const segment = joinLeftRow(node, row, leftKey === undefined ? [] : rightIndex.get(leftKey) ?? [], true, context);
+      segments[position] = segment;
+      if (segment.length !== previous.join.widths[position]) widthsStable = false;
+    }
+    if (context.unavailable || issues.length > 0) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes), { operator: 'join', strategy: 'fallback', affectedUnitCount: affectedPositions.length, reason: 'evaluation_unavailable' });
+    const compactionCount = leftPositionsByKey !== retainedLeftPositions && leftPositionsByKey instanceof OverlayJoinPositions && leftPositionsByKey.compacted ? 1 : 0;
+    if (widthsStable) {
+      const output = previous.result.rows.slice();
+      const changedOutputPositions: number[] = [];
+      let identitiesStable = true;
+      for (const position of affectedPositions) {
+        const offset = previous.join.outputOffsets[position] as number;
+        const segment = segments[position] as readonly ScopedRow[];
+        for (let relative = 0; relative < segment.length; relative += 1) {
+          const outputPosition = offset + relative;
+          const replacement = segment[relative] as ScopedRow;
+          identitiesStable = identitiesStable && resultKey(previous.result.rows[outputPosition] as ScopedRow) === resultKey(replacement);
+          output[outputPosition] = replacement;
+          changedOutputPositions.push(outputPosition);
+        }
+      }
+      return withMaintenanceEvent({
+        result: { rows: output, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
+        issues: [],
+        unavailable: false,
+        ...(identitiesStable ? { stableChangedPositions: changedOutputPositions } : {}),
+        join: {
+          leftInputs: left.result.rows,
+          rightInputs: right.result.rows,
+          segments,
+          rightIndex,
+          leftPositionsByKey,
+          outputOffsets: previous.join.outputOffsets,
+          widths: previous.join.widths
+        }
+      }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount });
+    }
+    const layout = flattenJoinSegments(segments);
+    return withMaintenanceEvent({
+      result: { rows: layout.rows, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
+      issues: [],
+      unavailable: false,
+      join: {
+        leftInputs: left.result.rows,
+        rightInputs: right.result.rows,
+        segments,
+        rightIndex,
+        leftPositionsByKey,
+        outputOffsets: layout.outputOffsets,
+        widths: layout.widths
+      }
+    }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount });
+  }
   const affectedRightKeys = rightUnchanged
     ? new Set<string>()
     : sparseRightChanges
@@ -3326,7 +3647,6 @@ const incrementallyMaterializeJoin = (
       : changedExpressionKeys(previous.join.rightInputs, right.result.rows, equality.right, context);
   const leftUnchanged = previous.join.leftInputs.length === left.result.rows.length
     && previous.join.leftInputs.every((row, index) => row === left.result.rows[index]);
-  const retainedLeftPositions = previous.join.leftPositionsByKey;
   const selectivelyAffectedLeftPositions = leftUnchanged && sparseRightChanges && retainedLeftPositions !== undefined
     ? [...affectedRightKeys].flatMap((key) => joinPositionBucket(retainedLeftPositions.get(key)))
     : undefined;
@@ -3347,19 +3667,23 @@ const incrementallyMaterializeJoin = (
     if (widthsStable) {
       const output = previous.result.rows.slice();
       const changedOutputPositions: number[] = [];
+      let identitiesStable = true;
       for (const position of affectedPositions) {
         const offset = previous.join.outputOffsets[position] as number;
         const segment = segments[position] as readonly ScopedRow[];
         for (let relative = 0; relative < segment.length; relative += 1) {
-          output[offset + relative] = segment[relative] as ScopedRow;
-          changedOutputPositions.push(offset + relative);
+          const outputPosition = offset + relative;
+          const replacement = segment[relative] as ScopedRow;
+          identitiesStable = identitiesStable && resultKey(previous.result.rows[outputPosition] as ScopedRow) === resultKey(replacement);
+          output[outputPosition] = replacement;
+          changedOutputPositions.push(outputPosition);
         }
       }
       return withMaintenanceEvent({
         result: { rows: output, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
         issues: [],
         unavailable: false,
-        stableChangedPositions: changedOutputPositions,
+        ...(identitiesStable ? { stableChangedPositions: changedOutputPositions } : {}),
         join: {
           leftInputs: left.result.rows,
           rightInputs: right.result.rows,
@@ -3369,7 +3693,7 @@ const incrementallyMaterializeJoin = (
           outputOffsets: previous.join.outputOffsets,
           widths: previous.join.widths
         }
-      }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
+      }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
     }
     const layout = flattenJoinSegments(segments);
     return withMaintenanceEvent({
@@ -3385,7 +3709,7 @@ const incrementallyMaterializeJoin = (
         outputOffsets: layout.outputOffsets,
         widths: layout.widths
       }
-    }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
+    }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
   }
   const segments: (readonly ScopedRow[])[] = [];
   const leftPositionsByKey = new Map<string, number | number[]>();
@@ -3421,7 +3745,7 @@ const incrementallyMaterializeJoin = (
       outputOffsets: layout.outputOffsets,
       widths: layout.widths
     }
-  }, { operator: 'join', strategy: 'full', affectedUnitCount: left.result.rows.length, compactionCount: rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
+  }, { operator: 'join', strategy: 'full', affectedUnitCount: left.result.rows.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
 };
 
 const changedExpressionKeysAtPositions = (
@@ -3479,6 +3803,42 @@ const updateIndexedRows = (
     overrides.set(key, bucket.length === 0 ? undefined : bucket);
   }
   return new OverlayRowIndex(previous, overrides);
+};
+
+const updateLeftJoinPositions = (
+  previous: ReadonlyMap<string, JoinPositionBucket>,
+  before: readonly ScopedRow[],
+  after: readonly ScopedRow[],
+  positions: readonly number[],
+  expression: Expr,
+  context: QueryContext
+): ReadonlyMap<string, JoinPositionBucket> => {
+  const operations = new Map<string, { readonly removed: number[]; readonly added: number[] }>();
+  const operation = (key: string): { readonly removed: number[]; readonly added: number[] } => {
+    const existing = operations.get(key);
+    if (existing !== undefined) return existing;
+    const created = { removed: [], added: [] };
+    operations.set(key, created);
+    return created;
+  };
+  for (const position of positions) {
+    const previousRow = before[position];
+    const nextRow = after[position];
+    const previousKey = previousRow === undefined ? undefined : indexKey(expression, previousRow, context);
+    const nextKey = nextRow === undefined ? undefined : indexKey(expression, nextRow, context);
+    if (previousKey === nextKey) continue;
+    if (previousKey !== undefined) operation(previousKey).removed.push(position);
+    if (nextKey !== undefined) operation(nextKey).added.push(position);
+  }
+  const overrides = new Map<string, JoinPositionBucket | undefined>();
+  for (const [key, { removed, added }] of operations) {
+    const removedPositions = new Set(removed);
+    const bucket = [...joinPositionBucket(previous.get(key))].filter((position) => !removedPositions.has(position));
+    bucket.push(...added);
+    bucket.sort((left, right) => left - right);
+    overrides.set(key, bucket.length === 0 ? undefined : bucket.length === 1 ? bucket[0] : bucket);
+  }
+  return overrides.size === 0 ? previous : new OverlayJoinPositions(previous, overrides);
 };
 
 const changedExpressionKeys = (before: readonly ScopedRow[], after: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlySet<string> => {

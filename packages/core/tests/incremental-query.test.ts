@@ -406,6 +406,95 @@ describe('incremental query maintenance', () => {
     session.close();
   });
 
+  it('incrementally maintains first-occurrence distinct representatives and compacts sparse keys', () => {
+    const query: QueryNode = {
+      kind: 'distinct',
+      input: { kind: 'select', input: people, alias: 'value', fields: { value: field('p', 'score') } }
+    };
+    const rowsAt = (revision: number): readonly QueryRowOccurrence[] => [
+      { occurrenceId: 'distinct:a', row: { id: 1, score: revision % 2 === 0 ? 2 : 1 } },
+      { occurrenceId: 'distinct:b', row: { id: 2, score: 1 } },
+      { occurrenceId: 'distinct:c', row: { id: 3, score: null } },
+      { occurrenceId: 'distinct:d', row: { id: 4, score: logicalUnknown } },
+      { occurrenceId: 'distinct:e', row: { id: 5, score: [1, { nested: true }] } }
+    ];
+    let accepted = snapshot(rowsAt(1), 1);
+    const session = openIncrementalQueryMaintenance(plan(query), accepted);
+    const initialRows = session.getCurrentResult().rows;
+    let observedCompaction = false;
+    for (let revision = 2; revision <= 70; revision += 1) {
+      const next = snapshot(rowsAt(revision), revision);
+      const maintained = applySnapshot(session, accepted, next);
+      expect(semanticResult(maintained)).toEqual(oracle(query, next));
+      expect(maintained.state.operatorDiagnostics.distinct.selectiveNodeCount).toBe(1);
+      if (revision === 2) {
+        expect(maintained.rows[2]).toBe(initialRows[1]);
+        expect(maintained.rows[3]).toBe(initialRows[2]);
+        expect(maintained.rows[4]).toBe(initialRows[3]);
+      }
+      observedCompaction ||= maintained.state.operatorDiagnostics.distinct.compactionCount > 0;
+      accepted = next;
+    }
+    expect(observedCompaction).toBe(true);
+    session.close();
+
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: { runtimeIdentity: 'distinct:pooled', registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 } },
+      initialSnapshot: snapshot(rowsAt(1), 1)
+    });
+    const root = runtime.attach(plan(query));
+    const next = snapshot(rowsAt(2), 2);
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(snapshot(rowsAt(1), 1), next));
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, next));
+    expect(root.getCurrentResult().state.operatorDiagnostics.distinct.selectiveNodeCount).toBe(1);
+    root.close();
+    runtime.close();
+  });
+
+  it('propagates stable distinct replacements safely through slice and union-all', () => {
+    const distinct: QueryNode = { kind: 'distinct', input: { kind: 'select', input: people, alias: 'value', fields: { value: field('p', 'score') } } };
+    const queries: readonly QueryNode[] = [
+      { kind: 'slice', input: distinct, offset: 0, limit: 2 },
+      { kind: 'set', op: 'union-all', left: distinct, right: { kind: 'values', alias: 'value', rows: [{ value: 'constant' }] } }
+    ];
+    const initial = snapshot([
+      { occurrenceId: 'downstream:a', row: { id: 1, score: 1 } },
+      { occurrenceId: 'downstream:b', row: { id: 2, score: 2 } },
+      { occurrenceId: 'downstream:c', row: { id: 3, score: 3 } }
+    ], 1);
+    const next = snapshot([
+      { occurrenceId: 'downstream:a', row: { id: 1, score: 4 } },
+      { occurrenceId: 'downstream:b', row: { id: 2, score: 2 } },
+      { occurrenceId: 'downstream:c', row: { id: 3, score: 3 } }
+    ], 2);
+    for (const query of queries) {
+      const session = openIncrementalQueryMaintenance(plan(query), initial);
+      const maintained = applySnapshot(session, initial, next);
+      expect(semanticResult(maintained)).toEqual(oracle(query, next));
+      expect(maintained.state.operatorDiagnostics.distinct.selectiveNodeCount).toBe(1);
+      if (query.kind === 'slice') expect(maintained.state.operatorDiagnostics.slice.selectiveNodeCount).toBe(1);
+      else expect(maintained.state.operatorDiagnostics.set.selectiveNodeCount).toBe(1);
+      session.close();
+    }
+  });
+
+  it('propagates unchanged-row completeness transitions from distinct into slice', () => {
+    const query: QueryNode = { kind: 'slice', input: { kind: 'distinct', input: people }, offset: 0, limit: 1 };
+    const rows: readonly QueryRowOccurrence[] = [
+      { occurrenceId: 'distinct-completeness:a', row: { id: 1, value: 'a' } },
+      { occurrenceId: 'distinct-completeness:b', row: { id: 2, value: 'b' } }
+    ];
+    const exact: QueryMaintenanceSnapshot = { relations: [relation('people', rows, 1, 'exact')] };
+    const lower: QueryMaintenanceSnapshot = { relations: [relation('people', rows, 2, 'lower-bound')] };
+    const session = openIncrementalQueryMaintenance(plan(query), exact);
+    const maintained = applySnapshot(session, exact, lower);
+    expect(semanticResult(maintained)).toEqual(oracle(query, lower));
+    expect(maintained).toMatchObject({ rows: [], completeness: 'unknown' });
+    expect(maintained.state.operatorDiagnostics.distinct).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 0 });
+    expect(maintained.state.operatorDiagnostics.slice).toMatchObject({ fallbackNodeCount: 1, fallbackReasons: { input_unavailable: 1 } });
+    session.close();
+  });
+
   it('keeps sparse aggregate overlays bounded and preserves the empty ungrouped row', () => {
     const query: QueryNode = {
       kind: 'aggregate', input: people, alias: 'summary', groupBy: {},
@@ -635,8 +724,19 @@ describe('incremental query maintenance', () => {
       accepted = next;
     }
     expect(semanticResult(session.getCurrentResult())).toEqual(oracle(query, accepted));
-    const moved = state((accepted.relations[1] as RelationInput).rows.map((row, index) => ({ occurrenceId: `right:${index}`, row: index === 55 ? { ...row, id: 20 } : row })), 104);
-    expect(semanticResult(applySnapshot(session, accepted, moved))).toEqual(oracle(query, moved));
+    const acceptedRight = (accepted.relations[1] as RelationInput).rows.map((row, index): QueryRowOccurrence => ({ occurrenceId: `right:${index}`, row }));
+    const swappedRight = acceptedRight.map((entry, index) => index === 55
+      ? { ...entry, row: { ...entry.row, id: 6 } }
+      : index === 56
+        ? { ...entry, row: { ...entry.row, id: 5 } }
+        : entry);
+    const swapped = state(swappedRight, 103);
+    const beforeSwap = session.getCurrentResult();
+    const swappedResult = applySnapshot(session, accepted, swapped);
+    expect(semanticResult(swappedResult)).toEqual(oracle(query, swapped));
+    expect(swappedResult.resultKeys).not.toBe(beforeSwap.resultKeys);
+    const moved = state(swappedRight.map((entry, index) => index === 55 ? { ...entry, row: { ...entry.row, id: 20 } } : entry), 104);
+    expect(semanticResult(applySnapshot(session, swapped, moved))).toEqual(oracle(query, moved));
     const bulk = state((moved.relations[1] as RelationInput).rows.map((row, index) => ({ occurrenceId: `right:${index}`, row: index < 40 ? { ...row, label: `bulk:${index}` } : row })), 105);
     expect(semanticResult(applySnapshot(session, moved, bulk))).toEqual(oracle(query, bulk));
     session.close();
@@ -692,6 +792,78 @@ describe('incremental query maintenance', () => {
     expect(semanticResult(applySnapshot(session, accepted, restored))).toEqual(oracle(query, restored));
     expect(session.getCurrentResult().rows).toHaveLength(300);
     session.close();
+  });
+
+  it('selectively maintains sparse left payload and key moves with duplicate join buckets', () => {
+    const query: QueryNode = {
+      kind: 'join', join: 'inner', left: from('left-selective', 'l'), right: from('right-stable', 'r'),
+      on: { kind: 'compare', op: 'eq', left: field('l', 'joinId'), right: field('r', 'id') }
+    };
+    const baseLeft = Array.from({ length: 300 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `left-selective:${id}`, row: { id, joinId: id % 10, payload: 0 } }));
+    const stableRight = Array.from({ length: 100 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `right-stable:${id}`, row: { id: id % 10, label: `right:${id}` } }));
+    const state = (left: readonly QueryRowOccurrence[], right: readonly QueryRowOccurrence[], revision: number): QueryMaintenanceSnapshot => ({ relations: [
+      relation('left-selective', left, revision), relation('right-stable', right, revision)
+    ] });
+    const initial = state(baseLeft, stableRight, 1);
+    const payloadLeft = baseLeft.map((entry, index) => index === 155 ? { ...entry, row: { ...entry.row, payload: 1 } } : entry);
+    const payload = state(payloadLeft, stableRight, 2);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const before = session.getCurrentResult();
+    const payloadResult = applySnapshot(session, initial, payload);
+    expect(semanticResult(payloadResult)).toEqual(oracle(query, payload));
+    expect(payloadResult.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, fullNodeCount: 0, affectedUnitCount: 1 });
+    expect(payloadResult.resultKeys).toBe(before.resultKeys);
+
+    const swappedLeft = payloadLeft.map((entry, index) => index === 155 ? { ...entry, row: { ...entry.row, joinId: 6, payload: 2 } } : entry);
+    const swapped = state(swappedLeft, stableRight, 3);
+    const swappedResult = applySnapshot(session, payload, swapped);
+    expect(semanticResult(swappedResult)).toEqual(oracle(query, swapped));
+    expect(swappedResult.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, fullNodeCount: 0, affectedUnitCount: 1 });
+    expect(swappedResult.resultKeys).not.toBe(payloadResult.resultKeys);
+
+    let accepted = swapped;
+    let observedCompaction = false;
+    let checkedCompactionReset = false;
+    for (let revision = 4; revision <= 324; revision += 1) {
+      const nextLeft = baseLeft.map((entry, index) => index === 155
+        ? { ...entry, row: { ...entry.row, joinId: 1_000 + revision, payload: revision } }
+        : entry);
+      const next = state(nextLeft, stableRight, revision);
+      const maintained = applySnapshot(session, accepted, next);
+      expect(maintained.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, fullNodeCount: 0, affectedUnitCount: 1 });
+      observedCompaction ||= maintained.state.operatorDiagnostics.join.compactionCount > 0;
+      if (revision % 64 === 0) expect(semanticResult(maintained)).toEqual(oracle(query, next));
+      accepted = next;
+      if (!checkedCompactionReset && maintained.state.operatorDiagnostics.join.compactionCount > 0) {
+        const payloadOnlyLeft = nextLeft.map((entry, index) => index === 155 ? { ...entry, row: { ...entry.row, payload: revision + 0.5 } } : entry);
+        const payloadOnly = state(payloadOnlyLeft, stableRight, revision + 0.5);
+        const payloadOnlyResult = applySnapshot(session, accepted, payloadOnly);
+        expect(payloadOnlyResult.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, compactionCount: 0 });
+        accepted = payloadOnly;
+        checkedCompactionReset = true;
+      }
+    }
+    expect(observedCompaction).toBe(true);
+    expect(checkedCompactionReset).toBe(true);
+
+    const changedRight = stableRight.map((entry, index) => index === 6 ? { ...entry, row: { ...entry.row, label: 'both-sides' } } : entry);
+    const both = state(payloadLeft, changedRight, 325);
+    const bothResult = applySnapshot(session, accepted, both);
+    expect(semanticResult(bothResult)).toEqual(oracle(query, both));
+    expect(bothResult.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 0, fullNodeCount: 1 });
+    session.close();
+
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: { runtimeIdentity: 'join:left-selective', registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(query));
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, payload));
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, payload));
+    expect(root.getCurrentResult().state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 1 });
+    expect(runtime.getDiagnostics().operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 1 });
+    root.close();
+    runtime.close();
   });
 
   it('compacts historical join-key overlays and remains correct after hundreds of unique moves', () => {
@@ -1246,6 +1418,107 @@ describe('incremental query maintenance', () => {
     const orderMoved = state(orderMovedRows, 4);
     expect(semanticResult(applySnapshot(session, partitionMoved, orderMoved))).toEqual(oracle(query, orderMoved));
     session.close();
+  });
+
+  it('maps stable slice replacements and retains public views for changes outside the range', () => {
+    const query: QueryNode = { kind: 'slice', input: people, offset: 20, limit: 10 };
+    const rows = Array.from({ length: 100 }, (_, index): QueryRowOccurrence => ({ occurrenceId: `slice:${index}`, row: { id: index, value: index } }));
+    const state = (entries: readonly QueryRowOccurrence[], revision: number): QueryMaintenanceSnapshot => ({ relations: [relation('people', entries, revision)] });
+    const initial = state(rows, 1);
+    const outsideRows = rows.map((entry, index) => index === 5 ? { ...entry, row: { ...entry.row, value: -5 } } : entry);
+    const outside = state(outsideRows, 2);
+    const insideRows = outsideRows.map((entry, index) => index === 25 ? { ...entry, row: { ...entry.row, value: -25 } } : entry);
+    const inside = state(insideRows, 3);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const before = session.getCurrentResult();
+
+    const outsideResult = applySnapshot(session, initial, outside);
+    expect(semanticResult(outsideResult)).toEqual(oracle(query, outside));
+    expect(outsideResult.rows).toBe(before.rows);
+    expect(outsideResult.state.operatorDiagnostics.slice).toMatchObject({ selectiveNodeCount: 1, fallbackNodeCount: 0, affectedUnitCount: 0 });
+
+    const insideResult = applySnapshot(session, outside, inside);
+    expect(semanticResult(insideResult)).toEqual(oracle(query, inside));
+    expect(insideResult.rows[0]).toBe(outsideResult.rows[0]);
+    expect(insideResult.rows[5]).not.toBe(outsideResult.rows[5]);
+    expect(insideResult.state.operatorDiagnostics.slice).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 1 });
+
+    const insertedRows = [...insideRows.slice(0, 10), { occurrenceId: 'slice:inserted', row: { id: 1000, value: 1000 } }, ...insideRows.slice(10)];
+    const inserted = state(insertedRows, 4);
+    const insertedResult = applySnapshot(session, inside, inserted);
+    expect(semanticResult(insertedResult)).toEqual(oracle(query, inserted));
+    expect(insertedResult.state.operatorDiagnostics.slice).toMatchObject({ fallbackNodeCount: 1, fallbackReasons: { unstable_layout: 1 } });
+    session.close();
+  });
+
+  it('maps stable union-all replacements in both branches privately and through pooled roots', () => {
+    const leftNode = from('union-left', 'item');
+    const rightNode = from('union-right', 'item');
+    const query: QueryNode = { kind: 'set', op: 'union-all', left: leftNode, right: rightNode };
+    const branch = (name: string, count: number, revision: number, changed = new Map<number, number>()): RelationInput => relation(name, Array.from({ length: count }, (_, index) => ({ occurrenceId: `${name}:${index}`, row: { id: index, value: changed.get(index) ?? index } })), revision);
+    const state = (left: RelationInput, right: RelationInput): QueryMaintenanceSnapshot => ({ relations: [left, right] });
+    const initial = state(branch('union-left', 5, 1), branch('union-right', 4, 1));
+    const changed = state(branch('union-left', 5, 2, new Map([[2, 20]])), branch('union-right', 4, 2, new Map([[1, 10]])));
+    const prepared = plan(query);
+    const session = openIncrementalQueryMaintenance(prepared, initial);
+    const before = session.getCurrentResult();
+    const maintained = applySnapshot(session, initial, changed);
+    expect(semanticResult(maintained)).toEqual(oracle(query, changed));
+    expect(maintained.rows[0]).toBe(before.rows[0]);
+    expect(maintained.rows[2]).not.toBe(before.rows[2]);
+    expect(maintained.rows[6]).not.toBe(before.rows[6]);
+    expect(maintained.resultKeys[2]).toBe(before.resultKeys[2]);
+    expect(maintained.resultKeys[6]).toBe(before.resultKeys[6]);
+    expect(maintained.state.operatorDiagnostics.set).toMatchObject({ selectiveNodeCount: 1, fallbackNodeCount: 0, affectedUnitCount: 2 });
+    session.close();
+
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: { runtimeIdentity: 'union-all:pooled', registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(prepared);
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, changed));
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, changed));
+    expect(root.getCurrentResult().state.operatorDiagnostics.set).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 2 });
+    expect(runtime.getDiagnostics().operatorDiagnostics.set).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 2 });
+
+    const inserted = state(branch('union-left', 6, 3, new Map([[2, 20]])), branch('union-right', 4, 3, new Map([[1, 10]])));
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(changed, inserted));
+    expect(semanticResult(root.getCurrentResult())).toEqual(oracle(query, inserted));
+    expect(root.getCurrentResult().state.operatorDiagnostics.set).toMatchObject({ fallbackNodeCount: 1, fallbackReasons: { unstable_layout: 1 } });
+    root.close();
+    runtime.close();
+  });
+
+  it('limits downstream named-call work to slice and union-all output deltas', () => {
+    const capability = { id: 'urn:test:delta-call', version: '1', contractHash: `sha256:${'8'.repeat(64)}` } as const;
+    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    let calls = 0;
+    const functions = new Map([[key, (args: readonly JsonValue[]) => { calls += 1; return args[0] ?? null; }]]);
+    const called = (input: QueryNode): QueryNode => ({ kind: 'select', input, alias: 'result', fields: { value: { kind: 'call', capability, args: [field('item', 'value')] } } });
+    const rows = (relationId: string, count: number, revision: number, changed = new Map<number, number>()): RelationInput => relation(relationId, Array.from({ length: count }, (_, index) => ({ occurrenceId: `${relationId}:${index}`, row: { id: index, value: changed.get(index) ?? index } })), revision);
+
+    const slicedQuery = called({ kind: 'slice', input: from('called-slice', 'item'), offset: 20, limit: 10 });
+    const sliceInitial: QueryMaintenanceSnapshot = { relations: [rows('called-slice', 100, 1)], functions };
+    const sliceOutside: QueryMaintenanceSnapshot = { relations: [rows('called-slice', 100, 2, new Map([[5, -5]]))], functions };
+    const sliceInside: QueryMaintenanceSnapshot = { relations: [rows('called-slice', 100, 3, new Map([[5, -5], [25, -25]]))], functions };
+    const sliceSession = openIncrementalQueryMaintenance(plan(slicedQuery), sliceInitial);
+    let beforeCalls = calls;
+    applySnapshot(sliceSession, sliceInitial, sliceOutside);
+    expect(calls - beforeCalls).toBe(0);
+    beforeCalls = calls;
+    applySnapshot(sliceSession, sliceOutside, sliceInside);
+    expect(calls - beforeCalls).toBe(1);
+    sliceSession.close();
+
+    const unionQuery = called({ kind: 'set', op: 'union-all', left: from('called-left', 'item'), right: from('called-right', 'item') });
+    const unionInitial: QueryMaintenanceSnapshot = { relations: [rows('called-left', 50, 1), rows('called-right', 50, 1)], functions };
+    const unionChanged: QueryMaintenanceSnapshot = { relations: [rows('called-left', 50, 2, new Map([[2, -2]])), rows('called-right', 50, 2, new Map([[3, -3]]))], functions };
+    const unionSession = openIncrementalQueryMaintenance(plan(unionQuery), unionInitial);
+    beforeCalls = calls;
+    applySnapshot(unionSession, unionInitial, unionChanged);
+    expect(calls - beforeCalls).toBe(2);
+    unionSession.close();
   });
 
   it('keeps named lag values on full evaluation instead of the stable-key micro path', () => {
