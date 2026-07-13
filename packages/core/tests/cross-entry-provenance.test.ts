@@ -12,8 +12,13 @@ describe('cross-entry prepared-value provenance', () => {
       datasetId: 'dataset:cross-entry'
     });
 
+    const loadedQueryEntry = await import('../src/query/index.js');
+    const preparedExpression = root.prepareExpression({ kind: 'field', alias: 'row', name: 'value' });
+    expect(loadedQueryEntry.evaluatePreparedExpression(preparedExpression, { row: { value: 3 } })).toBe(3);
+
     vi.resetModules();
     const query = await import('../src/query/index.js');
+    expect(() => query.evaluatePreparedExpression(preparedExpression, { row: { value: 3 } })).toThrow('not produced by prepareExpression');
     const session = query.openIncrementalQueryMaintenance(plan, { relations: [] });
     expect(session.getCurrentResult().rows).toEqual([{ id: 1 }]);
     session.close();
@@ -26,12 +31,16 @@ describe('cross-entry prepared-value provenance', () => {
     });
     vi.resetModules();
     const reloadedRoot = await import('../src/index.js');
+    const reverseExpression = query.prepareExpression({ kind: 'field', alias: 'row', name: 'value' });
+    expect(() => reloadedRoot.evaluatePreparedExpression(reverseExpression, { row: { value: 4 } })).toThrow('not produced by prepareExpression');
     const reverseSession = reloadedRoot.openIncrementalQueryMaintenance(subpathPlan, { relations: [] });
     expect(reverseSession.getCurrentResult().rows).toEqual([{ id: 2 }]);
     reverseSession.close();
 
     expect(() => query.openIncrementalQueryMaintenance({ ...plan } as typeof plan, { relations: [] }))
       .toThrow('not produced by a plan preparation API');
+    expect(() => query.evaluatePreparedExpression({ ...preparedExpression } as typeof preparedExpression, { row: { value: 3 } }))
+      .toThrow('not produced by prepareExpression');
   });
 
   it('shares schema, mapping, and lens provenance across independently loaded entries', async () => {

@@ -2,15 +2,18 @@ import { describe, expect, it } from 'vitest';
 import {
   capabilityUnavailable,
   evaluateExpression,
+  evaluatePreparedExpression,
   evaluatePreparedQuery,
   evaluateQuery,
   logicalUnknown,
   preparePlan,
+  prepareExpression,
   prepareQuery,
   type ArtifactRef,
   type CapabilityRef,
   type JsonValue,
   type PreparedPlan,
+  type PreparedExpression,
   type QueryNode,
   type RelationInput
 } from '../src/index.js';
@@ -35,6 +38,36 @@ const from = (relationId: string, alias = relationId): QueryNode => ({
 });
 
 describe('production query oracle', () => {
+  it('prepares a deeply nested expression once while owning every changing frame', () => {
+    const literal = { kind: 'literal' as const, value: 1 };
+    let expression: import('../src/query.js').Expr = { kind: 'field', alias: 'row', name: 'value' };
+    for (let depth = 0; depth < 40; depth += 1) expression = { kind: 'arithmetic', op: 'add', left: expression, right: literal };
+    const prepared = prepareExpression(expression);
+    literal.value = 100;
+    const row = { row: { value: 2 } };
+
+    expect(evaluatePreparedExpression(prepared, row)).toBe(42);
+    row.row.value = 9;
+    expect(evaluatePreparedExpression(prepared, row)).toBe(49);
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(Object.isFrozen(prepared.expression)).toBe(true);
+    expect(() => evaluatePreparedExpression({ ...prepared } as PreparedExpression, row)).toThrow(/not produced by prepareExpression/);
+    expect(() => evaluatePreparedExpression({ expression: prepared.expression } as PreparedExpression, row)).toThrow(/not produced by prepareExpression/);
+  });
+
+  it('preserves named capability evaluation count and unavailable semantics when prepared', () => {
+    const capability: CapabilityRef = { id: 'urn:test:prepared-expression-call', version: '1', contractHash: `sha256:${'8'.repeat(64)}` };
+    const key = capability.id + '\u0000' + capability.version + '\u0000' + capability.contractHash;
+    let calls = 0;
+    const prepared = prepareExpression({ kind: 'call', capability, args: [{ kind: 'field', alias: 'row', name: 'value' }] });
+    const functions = new Map([[key, ([value]: readonly JsonValue[]) => { calls += 1; return value ?? null; }]]);
+
+    expect(evaluatePreparedExpression(prepared, { row: { value: 3 } }, { functions })).toBe(3);
+    expect(evaluatePreparedExpression(prepared, { row: { value: 4 } }, { functions })).toBe(4);
+    expect(calls).toBe(2);
+    expect(evaluatePreparedExpression(prepared, { row: { value: 5 } })).toBe(capabilityUnavailable);
+  });
+
   it('orders built-in scalar and object keys correctly while retaining conservative host-call evaluation', () => {
     const field = (name: string) => ({ kind: 'field', alias: 'row', name } as const);
     const rows = [

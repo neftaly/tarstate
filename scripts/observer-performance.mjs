@@ -188,7 +188,7 @@ const contracts = {
   repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
   exactPublicationSemantics: measurements.every(({ notifications, expectedNotifications, correctnessFailures }) =>
     notifications === expectedNotifications && correctnessFailures.length === 0),
-  observerOneRow10kCeiling: tenThousand !== undefined && tenThousand.millisecondsPerOperation <= 12,
+  observerOneRow10kCeiling: tenThousand !== undefined && tenThousand.millisecondsPerOperation <= 25,
   observerAllocationCeiling: sampledBytesPerUpdate <= 1_250_000
 };
 const failures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);

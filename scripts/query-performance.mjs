@@ -1,6 +1,6 @@
 import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
-import { diffQueryMaintenanceSnapshots, evaluatePreparedQuery, evaluateQuery, openIncrementalQueryMaintenance, preparePlan } from '../packages/core/dist/index.js';
+import { diffQueryMaintenanceSnapshots, evaluateExpression, evaluatePreparedExpression, evaluatePreparedQuery, evaluateQuery, openIncrementalQueryMaintenance, prepareExpression, preparePlan } from '../packages/core/dist/index.js';
 import { createPooledIncrementalQueryRuntime } from '../packages/core/dist/query.js';
 
 const schemaView = { id: 'urn:tarstate:benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
@@ -54,6 +54,16 @@ const benchmark = (label, inputRows, iterations, operation) => {
   }).sort((left, right) => left - right);
   return { label, inputRows, iterations, sampleCount: samples.length, millisecondsPerOperation: Number((samples[1]).toFixed(3)) };
 };
+const benchmarkScalar = (label, iterations, operation) => {
+  for (let index = 0; index < Math.min(iterations, 10); index += 1) consumedRows += operation(index) === undefined ? 0 : 1;
+  const samples = Array.from({ length: 3 }, () => {
+    globalThis.gc();
+    const started = performance.now();
+    for (let index = 0; index < iterations; index += 1) consumedRows += operation(index) === undefined ? 0 : 1;
+    return (performance.now() - started) / iterations;
+  }).sort((left, right) => left - right);
+  return { label, inputRows: 1, iterations, sampleCount: samples.length, millisecondsPerOperation: Number(samples[1].toFixed(3)) };
+};
 
 const timedOperation = (iterations, operation) => {
   for (let index = 0; index < Math.min(iterations, 5); index += 1) consumedRows += operation(index);
@@ -99,6 +109,12 @@ const repeatedInputs = { relations: [input('item', linearRows(1))] };
 const repeatedPlan = await plan('repeated-pure', repeatedQuery);
 measurements.push(benchmark('repeated-unprepared-pure', 1, 500, () => evaluateQuery({ root: repeatedQuery, ...repeatedInputs })));
 measurements.push(benchmark('repeated-prepared-pure', 1, 500, () => evaluatePreparedQuery(repeatedPlan, repeatedInputs)));
+let deepExpression = { kind: 'field', alias: 'row', name: 'value' };
+for (let depth = 0; depth < 50; depth += 1) deepExpression = { kind: 'arithmetic', op: 'add', left: deepExpression, right: { kind: 'literal', value: 1 } };
+const preparedDeepExpression = prepareExpression(deepExpression);
+const deepExpressionRow = { row: { value: 1 } };
+measurements.push(benchmarkScalar('repeated-unprepared-expression', 2_000, () => evaluateExpression(deepExpression, deepExpressionRow)));
+measurements.push(benchmarkScalar('repeated-prepared-expression', 2_000, () => evaluatePreparedExpression(preparedDeepExpression, deepExpressionRow)));
 for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
   const relation = input('item', linearRows(count));
   const linearPlan = await plan('linear-pure-' + count, linearQuery);
@@ -232,7 +248,7 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   session.close();
 }
 
-for (const [count, iterations] of [[10, 100], [20, 30], [40, 8], [80, 5]]) {
+for (const [count, iterations] of [[10, 100], [20, 60], [40, 30], [80, 15]]) {
   const recursive = {
     kind: 'recursive',
     name: 'nodes',
@@ -277,7 +293,10 @@ for (const fanout of [1, 10, 50, 100]) {
     kind: 'select',
     alias: 'result-' + index,
     input: clonedPrefix(),
-    fields: { id: field('item', 'id'), value: field('item', 'value') }
+    // The update changes `value`; omitting it here measures shared traversal
+    // and semantic public-view reuse rather than unavoidable visible array
+    // publication, which is linear in root count by construction.
+    fields: { id: field('item', 'id') }
   }))));
   const afterAttach = physicalDiagnostics(runtime.getDiagnostics());
   const forward = diffQueryMaintenanceSnapshots(first, second);
@@ -458,6 +477,8 @@ const linearPure10k = measurement('linear-pure', 10_000)?.millisecondsPerOperati
 const linearUpdate10k = measurement('linear-one-row-update', 10_000)?.millisecondsPerOperation;
 const repeatedUnprepared = measurement('repeated-unprepared-pure', 1)?.millisecondsPerOperation;
 const repeatedPrepared = measurement('repeated-prepared-pure', 1)?.millisecondsPerOperation;
+const repeatedUnpreparedExpression = measurement('repeated-unprepared-expression', 1)?.millisecondsPerOperation;
+const repeatedPreparedExpression = measurement('repeated-prepared-expression', 1)?.millisecondsPerOperation;
 const orderPure10k = measurement('order', 10_000)?.millisecondsPerOperation;
 const orderUpdate10k = measurement('order-one-row-update', 10_000)?.millisecondsPerOperation;
 const aggregatePure10k = measurement('aggregate', 10_000)?.millisecondsPerOperation;
@@ -474,6 +495,12 @@ const reversedRecursiveChain80 = measurement('recursive-chain-reversed', 80)?.mi
 const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
 const aggregateBytesPerUpdate = Math.round(aggregateSampledAllocationBytes / 100);
 const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
+const pooledFanout10 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 10)?.millisecondsPerUpdate;
+const pooledFanout100 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 100)?.millisecondsPerUpdate;
+// A visible update across 100 roots returning 500 rows each must publish 100
+// new native immutable arrays. At eight bytes per reference that boundary
+// alone is approximately 400 KiB, before array headers and result envelopes.
+const pooledVisiblePublicArrayFloorBytes = 100 * 500 * 8;
 const contracts = {
   repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
   linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
@@ -484,11 +511,13 @@ const contracts = {
   partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
   rightJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinRightUpdate10k !== undefined && joinRightUpdate10k < joinPreparedPure10k * 0.5,
   preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
+  preparedExpressionAdvantage: repeatedUnpreparedExpression !== undefined && repeatedPreparedExpression !== undefined && repeatedPreparedExpression < repeatedUnpreparedExpression * 0.75,
   recursiveChainNearLinear: recursiveChain40 !== undefined && recursiveChain80 !== undefined && recursiveChain80 < recursiveChain40 * 2.75,
   reversedRecursiveChainNearLinear: reversedRecursiveChain40 !== undefined && reversedRecursiveChain80 !== undefined && reversedRecursiveChain80 < reversedRecursiveChain40 * 2.75,
   unrelatedTraversalSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'unrelated-relation-union-dag').every(({ selectiveVisitedPhysicalNodeCount }) => selectiveVisitedPhysicalNodeCount <= 2),
+  pooledIgnoredFanoutScaling: pooledFanout10 !== undefined && pooledFanout100 !== undefined && pooledFanout100 < pooledFanout10 * 8,
   privateAllocationCeiling: privateBytesPerUpdate <= 2_000_000,
-  pooledAllocationCeiling: pooledBytesPerUpdate <= 20_000_000
+  pooledAllocationCeiling: pooledBytesPerUpdate <= 4_000_000
 };
 const contractFailures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);
 
@@ -509,9 +538,11 @@ process.stdout.write(JSON.stringify({
     sampledBytesPerUpdate: aggregateBytesPerUpdate
   },
   pooledAllocationSample: {
-    workload: '100 one-row updates over 100 pooled roots and 1,000 input rows',
+    workload: '100 one-row updates to a field ignored by 100 pooled roots over 1,000 input rows',
     sampledBytes: pooledSampledAllocationBytes,
-    sampledBytesPerUpdate: pooledBytesPerUpdate
+    sampledBytesPerUpdate: pooledBytesPerUpdate,
+    visiblePublicArrayFloorBytes: pooledVisiblePublicArrayFloorBytes,
+    boundaryNote: 'Visible changes cannot share frozen native public arrays across snapshots; ignored changes can and should reuse them.'
   },
   node: process.version,
   consumedRows

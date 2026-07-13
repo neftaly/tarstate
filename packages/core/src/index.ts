@@ -19,9 +19,11 @@ export type { ObserverDiagnostic, ObserverDiagnosticReporter } from './observer-
 export {
   diffQueryMaintenanceSnapshots,
   evaluateExpression,
+  evaluatePreparedExpression,
   evaluatePreparedQuery,
   evaluateQuery,
   openIncrementalQueryMaintenance,
+  prepareExpression,
   prepareQuery
 } from './query.js';
 export type {
@@ -35,6 +37,7 @@ export type {
   IncrementalQueryResultDelta,
   OrderTerm,
   PreparedQueryRequest,
+  PreparedExpression,
   QueryCursor,
   QueryExecutionBudget,
   QueryFunction,

@@ -3,6 +3,7 @@ import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import { capabilityUnavailable, logicalAnd, logicalNot, logicalOr, logicalUnknown, missingValue, type EvaluationValue, type JsonValue, type LogicalTruth, type LogicalUnknown } from './value.js';
 import { preparePlan, type PreparedPlan } from './maintenance.js';
 import { assertPreparedPlan, hasOwnedPreparedQuery } from './internal-prepared-plan.js';
+import { assertPreparedExpression, sealPreparedExpression } from './internal-prepared-expression.js';
 import { comparePortableStrings } from './portable-order.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import {
@@ -130,6 +131,13 @@ export type QueryExecutionBudget = { readonly maxWorkUnits: number };
 
 /** Changing inputs for repeated evaluation of an already prepared query. */
 export type PreparedQueryRequest = Omit<QueryRequest, 'root'>;
+
+declare const preparedExpressionBrand: unique symbol;
+/** Owned expression syntax accepted by the prepared scalar evaluator. */
+export type PreparedExpression = {
+  readonly [preparedExpressionBrand]: true;
+  readonly expression: Expr;
+};
 
 /** Pure query result. `resultKeys` are stable occurrence identities and grant no write authority. */
 export type QueryResult = {
@@ -315,6 +323,9 @@ type MaterializedQueryNode = {
     readonly rightInputs: readonly ScopedRow[];
     readonly segments: readonly (readonly ScopedRow[])[];
     readonly rightIndex?: ReadonlyMap<string, readonly ScopedRow[]>;
+    readonly leftPositionsByKey?: ReadonlyMap<string, number | readonly number[]>;
+    readonly outputOffsets: readonly number[];
+    readonly widths: readonly number[];
   };
   readonly order?: {
     readonly inputs: readonly ScopedRow[];
@@ -1051,6 +1062,26 @@ export const evaluateExpression = (expression: Expr, row: Readonly<Record<string
   return capabilityUnavailable;
 };
 
+/** Owns and seals an expression once for repeated scalar evaluation. */
+export const prepareExpression = (expression: Expr): PreparedExpression => sealPreparedExpression(cloneAndFreezeExpression(expression));
+
+/** Evaluates a sealed expression while adopting every changing input frame. */
+export const evaluatePreparedExpression = (
+  prepared: PreparedExpression,
+  row: Readonly<Record<string, QueryRecord>>,
+  options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}
+): EvaluationValue => {
+  assertPreparedExpression(prepared);
+  const issues: Issue[] = [];
+  const scoped: ScopedRow = { scope: adoptExpressionScope(row), provenance: {}, identity: '' };
+  const parameters = options.parameters === undefined ? {} : adoptJsonRecord(options.parameters, 'Query expression parameters');
+  const result = evaluateExpr(prepared.expression, { row: scoped, parameters, functions: options.functions === undefined ? new Map() : adoptFunctionRegistry(options.functions), issues });
+  if (result.status === 'known') return adoptJsonValue(result.value, 'Query expression result');
+  if (result.status === 'missing') return missingValue;
+  if (result.status === 'unknown' || result.status === 'indeterminate') return logicalUnknown;
+  return capabilityUnavailable;
+};
+
 const evaluateExpr = (expression: Expr, context: EvalContext): ExpressionResult => {
   if (context.query !== undefined && !consumeQueryWork(context.query)) return { status: 'unavailable' };
   if (expression.kind === 'literal') return known(expression.value);
@@ -1523,7 +1554,8 @@ export const openIncrementalQueryMaintenance = (
             rejectedUpdateCount
           ),
           publicRows,
-          current
+          current,
+          assertedRoot !== undefined && !changedNodes.has(queryRoot)
         );
         assertedRoot = root;
         return current;
@@ -2267,7 +2299,19 @@ const materializeQueryNode = (
   if (node.kind === 'join' && equijoinFields(node) !== undefined && !materialized.unavailable && materialized.issues.length === 0) {
     const left = materializedNodes.get(node.left);
     const right = materializedNodes.get(node.right);
-    if (left !== undefined && right !== undefined && !left.unavailable && !right.unavailable) return { ...materialized, join: indexJoinSegments(node, left.result.rows, right.result.rows, materialized.result.rows) };
+    if (left !== undefined && right !== undefined && !left.unavailable && !right.unavailable) {
+      const issues: Issue[] = [];
+      const context = materializationContext(snapshot, materializedNodes, node, issues);
+      const join = indexJoinSegments(node, left.result.rows, right.result.rows, materialized.result.rows, context);
+      if (context.unavailable || issues.length > 0) {
+        return {
+          result: { rows: [], completeness: 'unknown' },
+          issues: deduplicateQueryIssues([...materialized.issues, ...issues]),
+          unavailable: true
+        };
+      }
+      return { ...materialized, join };
+    }
   }
   if (node.kind === 'order' && orderCanBeIncrementallyIndexed(node) && !materialized.unavailable && materialized.issues.length === 0) {
     const child = materializedNodes.get(node.input);
@@ -2727,8 +2771,71 @@ const incrementallyMaterializeJoin = (
     : sparseRightChanges
       ? changedExpressionKeysAtPositions(previous.join.rightInputs, right.result.rows, right.stableChangedPositions ?? [], equality.right, context)
       : changedExpressionKeys(previous.join.rightInputs, right.result.rows, equality.right, context);
+  const leftUnchanged = previous.join.leftInputs.length === left.result.rows.length
+    && previous.join.leftInputs.every((row, index) => row === left.result.rows[index]);
+  const retainedLeftPositions = previous.join.leftPositionsByKey;
+  const selectivelyAffectedLeftPositions = leftUnchanged && sparseRightChanges && retainedLeftPositions !== undefined
+    ? [...affectedRightKeys].flatMap((key) => joinPositionBucket(retainedLeftPositions.get(key)))
+    : undefined;
+  if (selectivelyAffectedLeftPositions !== undefined) {
+    const leftPositionsByKey = retainedLeftPositions as ReadonlyMap<string, number | readonly number[]>;
+    const affectedPositions = [...new Set(selectivelyAffectedLeftPositions)].sort((first, second) => first - second);
+    const segments = previous.join.segments.slice();
+    let widthsStable = true;
+    for (const position of affectedPositions) {
+      const row = left.result.rows[position];
+      if (row === undefined) return materializeQueryNode(node, snapshot, materializedNodes);
+      const leftKey = indexKey(equality.left, row, context);
+      const segment = joinLeftRow(node, row, leftKey === undefined ? [] : rightIndex.get(leftKey) ?? [], true, context);
+      segments[position] = segment;
+      if (segment.length !== previous.join.widths[position]) widthsStable = false;
+    }
+    if (context.unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+    if (widthsStable) {
+      const output = previous.result.rows.slice();
+      const changedOutputPositions: number[] = [];
+      for (const position of affectedPositions) {
+        const offset = previous.join.outputOffsets[position] as number;
+        const segment = segments[position] as readonly ScopedRow[];
+        for (let relative = 0; relative < segment.length; relative += 1) {
+          output[offset + relative] = segment[relative] as ScopedRow;
+          changedOutputPositions.push(offset + relative);
+        }
+      }
+      return {
+        result: { rows: output, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
+        issues: [],
+        unavailable: false,
+        stableChangedPositions: changedOutputPositions,
+        join: {
+          leftInputs: left.result.rows,
+          rightInputs: right.result.rows,
+          segments,
+          rightIndex,
+          leftPositionsByKey,
+          outputOffsets: previous.join.outputOffsets,
+          widths: previous.join.widths
+        }
+      };
+    }
+    const layout = flattenJoinSegments(segments);
+    return {
+      result: { rows: layout.rows, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
+      issues: [],
+      unavailable: false,
+      join: {
+        leftInputs: left.result.rows,
+        rightInputs: right.result.rows,
+        segments,
+        rightIndex,
+        leftPositionsByKey,
+        outputOffsets: layout.outputOffsets,
+        widths: layout.widths
+      }
+    };
+  }
   const segments: (readonly ScopedRow[])[] = [];
-  const output: ScopedRow[] = [];
+  const leftPositionsByKey = new Map<string, number | number[]>();
   let previousPositions: ReadonlyMap<string, number> | undefined;
   for (let index = 0; index < left.result.rows.length; index += 1) {
     const row = left.result.rows[index] as ScopedRow;
@@ -2741,17 +2848,26 @@ const incrementallyMaterializeJoin = (
     }
     const previousInput = previous.join.leftInputs[previousIndex];
     const leftKey = indexKey(equality.left, row, context);
+    if (leftKey !== undefined) appendJoinPosition(leftPositionsByKey, leftKey, index);
     const retained = previousInput === row && (leftKey === undefined || !affectedRightKeys.has(leftKey)) ? previous.join.segments[previousIndex] : undefined;
     const segment = retained ?? joinLeftRow(node, row, leftKey === undefined ? [] : rightIndex.get(leftKey) ?? [], true, context);
     segments.push(segment);
-    output.push(...segment);
   }
   if (context.unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
+  const layout = flattenJoinSegments(segments);
   return {
-    result: { rows: output, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
+    result: { rows: layout.rows, completeness: left.result.completeness === 'exact' && right.result.completeness === 'exact' ? 'exact' : 'lower-bound' },
     issues: [],
     unavailable: false,
-    join: { leftInputs: left.result.rows, rightInputs: right.result.rows, segments, rightIndex }
+    join: {
+      leftInputs: left.result.rows,
+      rightInputs: right.result.rows,
+      segments,
+      rightIndex,
+      leftPositionsByKey,
+      outputOffsets: layout.outputOffsets,
+      widths: layout.widths
+    }
   };
 };
 
@@ -2830,7 +2946,8 @@ const indexJoinSegments = (
   node: Extract<QueryNode, { readonly kind: 'join' }>,
   leftInputs: readonly ScopedRow[],
   rightInputs: readonly ScopedRow[],
-  outputs: readonly ScopedRow[]
+  outputs: readonly ScopedRow[],
+  context: QueryContext
 ): NonNullable<MaterializedQueryNode['join']> => {
   const positions = new Map(leftInputs.map((row, index) => [resultKey(row), index]));
   const segments = leftInputs.map(() => [] as ScopedRow[]);
@@ -2839,7 +2956,72 @@ const indexJoinSegments = (
     const index = key === undefined ? undefined : positions.get(key);
     if (index !== undefined) (segments[index] as ScopedRow[]).push(row);
   }
-  return { leftInputs, rightInputs, segments };
+  const equality = equijoinFields(node) as EquijoinExpressions;
+  const layout = joinSegmentLayout(segments);
+  return {
+    leftInputs,
+    rightInputs,
+    segments,
+    rightIndex: buildIndexedRows(rightInputs, equality.right, context),
+    leftPositionsByKey: buildLeftJoinPositions(leftInputs, equality.left, context),
+    outputOffsets: layout.outputOffsets,
+    widths: layout.widths
+  };
+};
+
+const buildLeftJoinPositions = (
+  rows: readonly ScopedRow[],
+  expression: Expr,
+  context: QueryContext
+): ReadonlyMap<string, number | readonly number[]> => {
+  const positions = new Map<string, number | number[]>();
+  for (const [position, row] of rows.entries()) {
+    const key = indexKey(expression, row, context);
+    if (key === undefined) continue;
+    appendJoinPosition(positions, key, position);
+  }
+  return positions;
+};
+
+const appendJoinPosition = (positions: Map<string, number | number[]>, key: string, position: number): void => {
+  const existing = positions.get(key);
+  if (existing === undefined) positions.set(key, position);
+  else if (typeof existing === 'number') positions.set(key, [existing, position]);
+  else existing.push(position);
+};
+
+const joinPositionBucket = (bucket: number | readonly number[] | undefined): readonly number[] =>
+  bucket === undefined ? [] : typeof bucket === 'number' ? [bucket] : bucket;
+
+const flattenJoinSegments = (segments: readonly (readonly ScopedRow[])[]): {
+  readonly rows: readonly ScopedRow[];
+  readonly outputOffsets: readonly number[];
+  readonly widths: readonly number[];
+} => {
+  const rows: ScopedRow[] = [];
+  const outputOffsets: number[] = [];
+  const widths: number[] = [];
+  for (const segment of segments) {
+    outputOffsets.push(rows.length);
+    widths.push(segment.length);
+    rows.push(...segment);
+  }
+  return { rows, outputOffsets, widths };
+};
+
+const joinSegmentLayout = (segments: readonly (readonly ScopedRow[])[]): {
+  readonly outputOffsets: readonly number[];
+  readonly widths: readonly number[];
+} => {
+  const outputOffsets: number[] = [];
+  const widths: number[] = [];
+  let offset = 0;
+  for (const segment of segments) {
+    outputOffsets.push(offset);
+    widths.push(segment.length);
+    offset += segment.length;
+  }
+  return { outputOffsets, widths };
 };
 
 const incrementallyMaterializeFrom = (
@@ -2953,7 +3135,6 @@ const incrementallyMaterializeLocal = (
   }
   const oneToOne = isOneToOneLocallyMaintainedNode(node);
   if (child.stableChangedPositions !== undefined) {
-    const segments = previous.local.segments.slice();
     const replacements = new Map<number, LocalSegment>();
     const issues: Issue[] = [];
     let unavailable = false;
@@ -2966,19 +3147,31 @@ const incrementallyMaterializeLocal = (
       const evaluated = evaluateMaterializedQueryNode(node, snapshot, overrides);
       issues.push(...evaluated.issues);
       unavailable = unavailable || evaluated.unavailable;
-      replacements.set(index, localSegment(node, evaluated.result.rows));
+      const candidate = localSegment(node, evaluated.result.rows);
+      const retained = localSegmentsSemanticallyEqual(previous.local.segments[index], candidate)
+        ? previous.local.segments[index]
+        : candidate;
+      replacements.set(index, retained);
     }
     if (unavailable || issues.length > 0) return materializeQueryNode(node, snapshot, materializedNodes);
     const widthsChanged = [...replacements].some(([index, segment]) => localSegmentWidth(segment) !== (previous.local?.widths?.[index] ?? 1));
-    for (const [index, segment] of replacements) segments[index] = segment;
+    const changedSegments = [...replacements].filter(([index, segment]) => segment !== previous.local?.segments[index]);
+    const segments = changedSegments.length === 0 ? previous.local.segments : previous.local.segments.slice();
+    for (const [index, segment] of changedSegments) (segments as LocalSegment[])[index] = segment;
     if (!widthsChanged) {
-      const output = previous.result.rows.slice();
+      // One-to-one segments are already the packed output in input order.
+      // Preserve that invariant on updates: a second full reference-array copy
+      // would contain the exact same objects and doubles local-pipeline churn.
+      // Variable-width operators still require a separately packed output.
+      const output = oneToOne
+        ? segments as readonly ScopedRow[]
+        : changedSegments.length === 0 ? previous.result.rows : previous.result.rows.slice();
       const changedOutputPositions: number[] = [];
-      for (const [index, segment] of replacements) {
+      for (const [index, segment] of changedSegments) {
         const offset = previous.local.outputOffsets?.[index] ?? index;
         const replacementRows = localSegmentRows(segment);
         for (let relative = 0; relative < replacementRows.length; relative += 1) {
-          output[offset + relative] = replacementRows[relative] as ScopedRow;
+          if (!oneToOne) (output as ScopedRow[])[offset + relative] = replacementRows[relative] as ScopedRow;
           changedOutputPositions.push(offset + relative);
         }
       }
@@ -3085,6 +3278,16 @@ const indexLocalSegments = (
 };
 
 const localSegment = (node: QueryNode, rows: readonly ScopedRow[]): LocalSegment => node.kind === 'unnest' ? rows : rows[0];
+const localSegmentsSemanticallyEqual = (left: LocalSegment, right: LocalSegment): boolean => {
+  const leftRows = localSegmentRows(left);
+  const rightRows = localSegmentRows(right);
+  return leftRows.length === rightRows.length && leftRows.every((row, index) => {
+    const candidate = rightRows[index] as ScopedRow;
+    return resultKey(row) === resultKey(candidate)
+      && queryValueEqual(row.scope as unknown as QueryLogicalValue, candidate.scope as unknown as QueryLogicalValue)
+      && queryValueEqual(row.provenance as unknown as QueryLogicalValue, candidate.provenance as unknown as QueryLogicalValue);
+  });
+};
 const localSegmentRows = (segment: LocalSegment): readonly ScopedRow[] => segment === undefined ? [] : Array.isArray(segment) ? segment : [segment as ScopedRow];
 const localSegmentWidth = (segment: LocalSegment): number => segment === undefined ? 0 : Array.isArray(segment) ? segment.length : 1;
 const indexLocalSegmentLayout = (segments: readonly LocalSegment[]): {
