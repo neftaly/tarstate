@@ -44,9 +44,12 @@ export type IntentMergeResult<Command> =
 
 export type StorageBinding<Storage, Command, Row = unknown> = {
   readonly id: string;
+  /** Relations this binding can project and handle. Omission preserves compatibility but disables relation routing. */
+  readonly relationIds?: readonly string[];
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
-  readonly project: (snapshot: SourceSnapshot<Storage>) => ProjectionResult<Row>;
+  /** A relation filter permits callers to refresh only affected logical projections. */
+  readonly project: (snapshot: SourceSnapshot<Storage>, relationIds?: ReadonlySet<string>) => ProjectionResult<Row>;
   readonly plan: (snapshot: SourceSnapshot<Storage>, edits: readonly LogicalEdit[]) => PlanResult<Command>;
 };
 

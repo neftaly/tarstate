@@ -1,5 +1,5 @@
 import { Store as TanStackStore, type StoreActionMap } from '@tanstack/store';
-import { acquireExternalStoreRuntime, HostRuntimeRegistry, type AtomicExternalStore } from '@tarstate/core';
+import { acquireExternalStoreRuntime, HostRuntimeRegistry, type AtomicExternalStore } from '@tarstate/core/database';
 import { createStore as createZustandStore } from 'zustand/vanilla';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { describe, expect, it, vi } from 'vitest';

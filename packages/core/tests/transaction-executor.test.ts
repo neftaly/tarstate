@@ -99,10 +99,31 @@ const attempt = (value: Awaited<ReturnType<typeof transaction>>, operationId = '
 });
 
 describe('prepared source-local transaction executor', () => {
+  it('retains atomic stale-basis rejections as exact operation outcomes', async () => {
+    const { source } = await makeContext();
+    const input = {
+      operationEpoch: 'epoch:executor',
+      operationId: 'operation:stale-basis',
+      intentHash: hash('d'),
+      expectedBasis: { incarnation: 'wrong', revision: 0 },
+      commands: []
+    };
+    const rejected = await source.commit(input);
+
+    expect(rejected).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.expected_basis_stale' }] });
+    await expect(source.queryOutcome({
+      operationEpoch: input.operationEpoch,
+      operationId: input.operationId,
+      intentHash: input.intentHash
+    })).resolves.toEqual({ status: 'known', result: rejected });
+    await expect(source.commit(input)).resolves.toBe(rejected);
+  });
+
   it('stages ordered overlapping statements and commits once with final-state query and constraint evidence', async () => {
     const { source, context } = await makeContext();
     const notify = vi.fn();
     source.subscribe(notify);
+    source.subscribe(() => { throw new Error('listener failure after commit'); });
     const value = await transaction();
     const receipt = await executePreparedTransaction(context, attempt(value));
     expect(receipt).toMatchObject({

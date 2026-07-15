@@ -16,11 +16,11 @@ import { samePortableObserverValue } from './internal-observer-values.js';
 import type { PreparedPlan } from './query-plan-contract.js';
 import {
   createPooledIncrementalQueryRuntime,
-  diffQueryMaintenanceSnapshots,
   isNonPoolableQueryError,
   isPooledQueryRuntimeBusyError,
   openIncrementalQueryMaintenance
 } from './query-incremental.js';
+import { diffQueryMaintenanceSnapshotValues } from './query-maintenance-diff.js';
 import type {
   FunctionRegistry,
   QueryNode,
@@ -242,15 +242,15 @@ const openPrivateDatabaseMaintenance = (
     getCurrentResult: () => databaseResultFromMaintained(session.getCurrentResult(), trustOwner),
     updateInput: (input) => {
       const next = normalize(input);
-      let update: ReturnType<typeof diffQueryMaintenanceSnapshots>;
+      let update: ReturnType<typeof diffQueryMaintenanceSnapshotValues>;
       try {
-        update = diffQueryMaintenanceSnapshots(accepted, next);
+        update = diffQueryMaintenanceSnapshotValues(accepted, next);
       } catch (error) {
         // Verify the fixed session environment without traversing relation
         // rows; malformed accepted occurrence identity is classified from the
         // incremental session's validation evidence below.
         try {
-          diffQueryMaintenanceSnapshots(
+          diffQueryMaintenanceSnapshotValues(
             { ...accepted, relations: [] },
             { ...next, relations: [] }
           );

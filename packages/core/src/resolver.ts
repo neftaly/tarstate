@@ -55,12 +55,22 @@ export class ResourceResolver {
   readonly #inflight = new Map<string, Promise<ResolvedResource>>();
   readonly #maxRedirects: number;
   readonly #maxCacheEntries: number;
+  readonly #maxInflightResolutions: number;
 
-  constructor(options: { readonly authority: ResolverAuthority; readonly maxRedirects?: number; readonly maxCacheEntries?: number }) {
+  constructor(options: {
+    readonly authority: ResolverAuthority;
+    readonly maxRedirects?: number;
+    readonly maxCacheEntries?: number;
+    /** Maximum shared, un-signalled driver requests retained for deduplication. */
+    readonly maxInflightResolutions?: number;
+  }) {
     this.#authority = options.authority;
     this.#maxRedirects = options.maxRedirects ?? 16;
     this.#maxCacheEntries = options.maxCacheEntries ?? 256;
+    this.#maxInflightResolutions = options.maxInflightResolutions ?? 256;
+    if (!Number.isSafeInteger(this.#maxRedirects) || this.#maxRedirects < 0) throw new TypeError('maxRedirects must be a non-negative safe integer');
     if (!Number.isSafeInteger(this.#maxCacheEntries) || this.#maxCacheEntries < 0) throw new TypeError('maxCacheEntries must be a non-negative safe integer');
+    if (!Number.isSafeInteger(this.#maxInflightResolutions) || this.#maxInflightResolutions < 1) throw new TypeError('maxInflightResolutions must be a positive safe integer');
   }
 
   register(scheme: string, driver: ResolverDriver): () => void {
@@ -100,6 +110,17 @@ export class ResourceResolver {
       }
       const inflight = this.#inflight.get(key);
       if (inflight !== undefined) return inflight as Promise<ResolvedResource<Value>>;
+      if (this.#inflight.size >= this.#maxInflightResolutions) {
+        return Promise.resolve(resolution(
+          requested,
+          requested,
+          [],
+          'failed',
+          'none',
+          undefined,
+          [resolverIssue('resolver.capacity_exhausted', 'after_refresh', { capacity: this.#maxInflightResolutions })]
+        )) as Promise<ResolvedResource<Value>>;
+      }
     }
     const pending = this.#resolve(requested, context);
     if (useCache) {

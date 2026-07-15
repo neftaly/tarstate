@@ -2513,6 +2513,7 @@ describe('resource resolver', () => {
     await resolve('mem:b');
 
     expect(Object.fromEntries(calls)).toEqual({ 'mem:a': 1, 'mem:b': 2, 'mem:c': 1 });
+    expect(() => new ResourceResolver({ authority: { permits: () => true }, maxRedirects: -1 })).toThrow(/non-negative safe integer/);
     expect(() => new ResourceResolver({ authority: { permits: () => true }, maxCacheEntries: -1 })).toThrow(/non-negative safe integer/);
   });
 
@@ -2538,6 +2539,30 @@ describe('resource resolver', () => {
     expect(calls).toHaveBeenCalledTimes(2);
     finish?.({ state: 'ready', freshness: 'current', value: 'second' });
     await expect(second).resolves.toMatchObject({ value: 'second' });
+  });
+
+  it('bounds retained shared resolutions without starting excess driver work', async () => {
+    const calls = vi.fn();
+    const resolver = new ResourceResolver({
+      authority: { permits: () => true },
+      maxInflightResolutions: 1
+    });
+    resolver.register('mem', {
+      resolve: (reference) => {
+        calls(reference.uri);
+        return new Promise(() => undefined);
+      }
+    });
+
+    void resolver.resolve({ uri: 'mem:first', kind: 'data' }, { authorityScope: 'public' });
+    await expect(resolver.resolve(
+      { uri: 'mem:second', kind: 'data' },
+      { authorityScope: 'public' }
+    )).resolves.toMatchObject({
+      state: 'failed',
+      issues: [{ code: 'resolver.capacity_exhausted' }]
+    });
+    expect(calls).toHaveBeenCalledOnce();
   });
 
   it('invalidates one authority scope and prevents detached in-flight completions from repopulating it', async () => {

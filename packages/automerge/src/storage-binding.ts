@@ -28,6 +28,11 @@ export type AutomergeRelationProjection<Row extends Readonly<Record<string, Json
   readonly issues: readonly AutomergeProjectionIssue[];
 };
 
+export type PriorAutomergeRelationProjection<T extends object, Row extends Readonly<Record<string, JsonValue>>> = {
+  readonly snapshot: Pick<AutomergeSnapshot<T>, 'sourceId' | 'basis'>;
+  readonly projection: AutomergeRelationProjection<Row>;
+};
+
 export type AutomergeMapProjectionPlannerOptions<Row extends Readonly<Record<string, JsonValue>>> = {
   readonly relationId: string;
   readonly collectionPath: AutomergePath;
@@ -68,66 +73,130 @@ export class AutomergeMapProjectionPlanner<T extends object, Row extends Readonl
     this.relationId = this.#options.relationId;
   }
 
-  project(snapshot: AutomergeSnapshot<T>): AutomergeRelationProjection<Row> {
+  project(
+    snapshot: AutomergeSnapshot<T>,
+    previous?: PriorAutomergeRelationProjection<T, Row>
+  ): AutomergeRelationProjection<Row> {
     const collection = valueAtAutomergePath(snapshot.storage, this.#options.collectionPath);
     if (collection === undefined && this.#options.missingCollection === 'empty') {
-      return { basis: snapshot.basis, completeness: 'exact', rows: [], issues: [] };
+      return frozenProjection({ basis: snapshot.basis, completeness: 'exact', rows: [], issues: [] });
     }
     if (!isRecord(collection)) {
-      return {
+      return frozenProjection({
         basis: snapshot.basis,
         completeness: 'unknown',
         rows: [],
         issues: [{ code: 'automerge.collection_invalid', path: this.#options.collectionPath }]
-      };
+      });
+    }
+
+    const affectedKeys = previous === undefined
+      ? undefined
+      : affectedCollectionKeys(previous.snapshot, snapshot, this.#options.collectionPath);
+    if (affectedKeys !== undefined && previous !== undefined) {
+      if (affectedKeys.size === 0) {
+        return frozenProjection({ ...previous.projection, basis: snapshot.basis });
+      }
+      const collectionSize = Object.keys(collection).length;
+      if (affectedKeys.size <= Math.max(32, Math.floor(collectionSize / 4))) {
+        return this.#projectChangedKeys(snapshot, collection, previous.projection, affectedKeys);
+      }
     }
 
     const rows: AutomergeProjectedRow<Row>[] = [];
     const issues: AutomergeProjectionIssue[] = [];
     let incomplete = false;
-    for (const [mapKey, visible] of Object.entries(collection).sort(([left], [right]) => comparePortableStrings(left, right))) {
+    const mapKeys = Object.keys(collection).sort(comparePortableStrings);
+    for (const mapKey of mapKeys) {
       if (this.#options.collectionPath.length === 0 && isAutomergeReservedRootProperty(mapKey)) continue;
-      const conflictAlternatives = conflictsAt(collection, mapKey);
-      const candidates = conflictAlternatives.length > 1 ? conflictAlternatives : [['', visible] as const];
-      for (const [changeHash, candidate] of candidates) {
-        const path = [...this.#options.collectionPath, mapKey];
-        const parsed = this.#parse(candidate, mapKey, path);
-        if (!parsed.success) {
-          incomplete = true;
-          issues.push(parsed.issue);
-          continue;
-        }
-        const key = this.#logicalKey(mapKey, parsed.row);
-        if (key === undefined) {
-          incomplete = true;
-          issues.push({ code: 'automerge.row_key_invalid', path });
-          continue;
-        }
-        const locator = locatorFor(collection, mapKey, candidate, changeHash, this.#options.locatorNamespace ?? 'automerge-object');
-        if (locator === undefined) {
-          incomplete = true;
-          issues.push({ code: 'automerge.row_identity_unavailable', path });
-          continue;
-        }
-        rows.push(Object.freeze({
-          relationId: this.relationId,
-          key: Object.freeze([key]) as readonly [JsonValue],
-          fields: parsed.row,
-          locator: Object.freeze(locator),
-          storagePath: Object.freeze(path),
-          ...(changeHash === '' ? {} : { conflictChangeHash: changeHash })
-        }));
-      }
-      if (conflictAlternatives.length > 1) {
-        issues.push({
-          code: 'automerge.map_key_conflict',
-          path: [...this.#options.collectionPath, mapKey],
-          details: { changeHashes: conflictAlternatives.map(([changeHash]) => changeHash) }
-        });
-      }
+      const projected = this.#projectEntry(collection, mapKey, collection[mapKey]);
+      rows.push(...projected.rows);
+      issues.push(...projected.issues);
+      incomplete ||= projected.incomplete;
     }
     issues.push(...duplicateKeyIssues(rows));
-    return { basis: snapshot.basis, completeness: incomplete ? 'unknown' : 'exact', rows, issues };
+    return frozenProjection({ basis: snapshot.basis, completeness: incomplete ? 'unknown' : 'exact', rows, issues });
+  }
+
+  #projectChangedKeys(
+    snapshot: AutomergeSnapshot<T>,
+    collection: Record<string, unknown>,
+    previous: AutomergeRelationProjection<Row>,
+    affectedKeys: ReadonlySet<string>
+  ): AutomergeRelationProjection<Row> {
+    const rows = previous.rows.filter((row) => !affectedKeys.has(String(row.storagePath[this.#options.collectionPath.length])));
+    const issues = previous.issues.filter((issue) => issue.code !== 'automerge.logical_key_ambiguous'
+      && !pathTouchesMapKey(issue.path, this.#options.collectionPath, affectedKeys));
+    for (const mapKey of affectedKeys) {
+      if (this.#options.collectionPath.length === 0 && isAutomergeReservedRootProperty(mapKey)) continue;
+      if (!Object.hasOwn(collection, mapKey)) continue;
+      const projected = this.#projectEntry(collection, mapKey, collection[mapKey]);
+      rows.push(...projected.rows);
+      issues.push(...projected.issues);
+    }
+    rows.sort((left, right) => {
+      const keyOrder = comparePortableStrings(
+        String(left.storagePath[this.#options.collectionPath.length]),
+        String(right.storagePath[this.#options.collectionPath.length])
+      );
+      return keyOrder !== 0 ? keyOrder : comparePortableStrings(left.conflictChangeHash ?? '', right.conflictChangeHash ?? '');
+    });
+    issues.push(...duplicateKeyIssues(rows));
+    return frozenProjection({
+      basis: snapshot.basis,
+      completeness: issues.some(projectionIssueMakesIncomplete) ? 'unknown' : 'exact',
+      rows,
+      issues
+    });
+  }
+
+  #projectEntry(
+    collection: Record<string, unknown>,
+    mapKey: string,
+    visible: unknown
+  ): { readonly rows: readonly AutomergeProjectedRow<Row>[]; readonly issues: readonly AutomergeProjectionIssue[]; readonly incomplete: boolean } {
+    const rows: AutomergeProjectedRow<Row>[] = [];
+    const issues: AutomergeProjectionIssue[] = [];
+    let incomplete = false;
+    const conflictAlternatives = conflictsAt(collection, mapKey);
+    const candidates = conflictAlternatives.length > 1 ? conflictAlternatives : [['', visible] as const];
+    for (const [changeHash, candidate] of candidates) {
+      const path = [...this.#options.collectionPath, mapKey];
+      const parsed = this.#parse(candidate, mapKey, path);
+      if (!parsed.success) {
+        incomplete = true;
+        issues.push(parsed.issue);
+        continue;
+      }
+      const key = this.#logicalKey(mapKey, parsed.row);
+      if (key === undefined) {
+        incomplete = true;
+        issues.push({ code: 'automerge.row_key_invalid', path });
+        continue;
+      }
+      const locator = locatorFor(collection, mapKey, candidate, changeHash, this.#options.locatorNamespace ?? 'automerge-object');
+      if (locator === undefined) {
+        incomplete = true;
+        issues.push({ code: 'automerge.row_identity_unavailable', path });
+        continue;
+      }
+      rows.push(Object.freeze({
+        relationId: this.relationId,
+        key: Object.freeze([key]) as readonly [JsonValue],
+        fields: parsed.row,
+        locator: Object.freeze(locator),
+        storagePath: Object.freeze(path),
+        ...(changeHash === '' ? {} : { conflictChangeHash: changeHash })
+      }));
+    }
+    if (conflictAlternatives.length > 1) {
+      issues.push({
+        code: 'automerge.map_key_conflict',
+        path: [...this.#options.collectionPath, mapKey],
+        details: { changeHashes: conflictAlternatives.map(([changeHash]) => changeHash) }
+      });
+    }
+    return { rows, issues, incomplete };
   }
 
   plan(snapshot: AutomergeSnapshot<T>, edits: readonly AutomergePropertyEdit[]): AutomergeEditPlan<T> {
@@ -188,6 +257,56 @@ const ownParsedRow = <Row extends Readonly<Record<string, JsonValue>>>(
   }
   return { success: true, row: freezeOwnedJson(owned.value) as Row };
 };
+
+const affectedCollectionKeys = <T extends object>(
+  previous: Pick<AutomergeSnapshot<T>, 'sourceId' | 'basis'>,
+  next: AutomergeSnapshot<T>,
+  collectionPath: AutomergePath
+): ReadonlySet<string> | undefined => {
+  if (previous.sourceId !== next.sourceId || !Automerge.hasHeads(next.storage, [...previous.basis.heads])) return undefined;
+  const affected = new Set<string>();
+  for (const patch of Automerge.diff(next.storage, [...previous.basis.heads], [...next.basis.heads])) {
+    const path = patch.path;
+    let sharesPrefix = true;
+    const sharedLength = Math.min(path.length, collectionPath.length);
+    for (let index = 0; index < sharedLength; index += 1) {
+      if (path[index] !== collectionPath[index]) {
+        sharesPrefix = false;
+        break;
+      }
+    }
+    if (!sharesPrefix) continue;
+    if (path.length <= collectionPath.length) return undefined;
+    const mapKey = path[collectionPath.length];
+    if (typeof mapKey !== 'string') return undefined;
+    affected.add(mapKey);
+  }
+  return affected;
+};
+
+const pathTouchesMapKey = (
+  path: AutomergePath | undefined,
+  collectionPath: AutomergePath,
+  affectedKeys: ReadonlySet<string>
+): boolean => path !== undefined
+  && path.length > collectionPath.length
+  && collectionPath.every((part, index) => path[index] === part)
+  && affectedKeys.has(String(path[collectionPath.length]));
+
+const projectionIssueMakesIncomplete = ({ code }: AutomergeProjectionIssue): boolean =>
+  code === 'automerge.collection_invalid'
+  || code === 'automerge.row_invalid'
+  || code === 'automerge.row_parser_failed'
+  || code === 'automerge.row_key_invalid'
+  || code === 'automerge.row_identity_unavailable';
+
+const frozenProjection = <Row extends Readonly<Record<string, JsonValue>>>(
+  projection: AutomergeRelationProjection<Row>
+): AutomergeRelationProjection<Row> => Object.freeze({
+  ...projection,
+  rows: Object.freeze(projection.rows),
+  issues: Object.freeze(projection.issues)
+});
 
 const freezeOwnedJson = (value: JsonValue): JsonValue => {
   if (value === null || typeof value !== 'object') return value;

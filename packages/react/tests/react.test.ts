@@ -1,14 +1,13 @@
 import {
   preparePlan,
-  type CommitReceipt,
   type ObserveRequest,
   type ObserverChange,
   type ObserverDiagnostic,
   type ObserverSnapshot,
   type PreparedPlan,
-  type QueryObserver,
-  type TransactionAttempt
-} from '@tarstate/core';
+  type QueryObserver
+} from '@tarstate/core/database';
+import type { CommitReceipt, TransactionAttempt } from '@tarstate/core/transactions';
 import { StrictMode, createElement, type ReactElement } from 'react';
 import { renderToString } from 'react-dom/server';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';

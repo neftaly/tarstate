@@ -42,6 +42,7 @@ import type { QueryMaintenanceSnapshot } from './query-incremental-model.js';
 import { logicalAnd, logicalOr, logicalUnknown, type JsonValue, type LogicalTruth } from './value.js';
 
 const scopedInputRows = new WeakMap<object, Map<string, readonly ScopedRow[]>>();
+const maxCachedAliasesPerInput = 16;
 
 export const consumeQueryWork = (context: QueryContext, units = 1): boolean => {
   const work = context.state.work;
@@ -237,21 +238,23 @@ const scopedRowsForInput = (
     const cached = scopedInputRows.get(input)?.get(alias);
     if (cached !== undefined) return cached;
   }
-  const rows = input.rows.map((fields, index) => scopedRow(
-    { ...outer?.scope, [alias]: fields },
-    {
-      ...outer?.provenance,
-      [alias]: {
-        ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
-        ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }),
-        relationId,
-        ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}),
-        occurrence: relationOccurrence(input, index)
-      }
-    }
-  ));
+  const rows: ScopedRow[] = [];
+  for (let index = 0; index < input.rows.length; index += 1) {
+    const fields = input.rows[index] as QueryRecord;
+    const provenance = {
+      ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
+      ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }),
+      relationId,
+      ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}),
+      occurrence: relationOccurrence(input, index)
+    };
+    rows.push(outer === undefined
+      ? scopedRow({ [alias]: fields }, { [alias]: provenance })
+      : scopedRow({ ...outer.scope, [alias]: fields }, { ...outer.provenance, [alias]: provenance }));
+  }
   if (outer === undefined && Object.isFrozen(input)) {
     const byAlias = scopedInputRows.get(input) ?? new Map<string, readonly ScopedRow[]>();
+    if (!byAlias.has(alias) && byAlias.size >= maxCachedAliasesPerInput) byAlias.delete(byAlias.keys().next().value as string);
     byAlias.set(alias, rows);
     scopedInputRows.set(input, byAlias);
   }
@@ -931,8 +934,18 @@ export const requiredAlias = (row: ScopedRow, alias: string, context: QueryConte
 };
 
 export const resultKey = (row: ScopedRow): string => row.identity;
-const provenanceIdentity = (provenance: ScopedRow['provenance']): string => Object.entries(provenance).sort(([left], [right]) => comparePortableStrings(left, right)).map(([alias, value]) => alias.length + ':' + alias + value.occurrence.length + ':' + value.occurrence).join('');
-export const scopedRow = (scope: ScopedRow['scope'], provenance: ScopedRow['provenance'], origin?: string): ScopedRow => ({ scope, provenance, identity: provenanceIdentity(provenance), ...(origin === undefined ? {} : { origin }) });
+const provenanceIdentity = (provenance: ScopedRow['provenance']): string => {
+  const aliases = Object.keys(provenance);
+  if (aliases.length === 0) return '';
+  if (aliases.length > 1) aliases.sort(comparePortableStrings);
+  let identity = '';
+  for (const alias of aliases) {
+    const occurrence = provenance[alias]?.occurrence ?? '';
+    identity += alias.length + ':' + alias + occurrence.length + ':' + occurrence;
+  }
+  return identity;
+};
+export const scopedRow = (scope: ScopedRow['scope'], provenance: ScopedRow['provenance'], origin?: string): ScopedRow => ({ scope, provenance, identity: provenanceIdentity(provenance), origin });
 const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => Object.fromEntries(Object.entries(record).map(([name, value]) => [fields[name] ?? name, value]));
 const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => Object.fromEntries(Object.entries(record).filter(([name]) => !fields.has(name)));
 const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));

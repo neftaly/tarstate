@@ -23,11 +23,11 @@ rows and parameters through preparation and into the UI:
 ```ts
 import {
   prepareTypedQuery,
-  relationLiteral,
   typedFrom,
   typedOrderBy,
   typedSelect
-} from '@tarstate/core';
+} from '@tarstate/core/query/authoring';
+import { relationLiteral } from '@tarstate/core/schema';
 import { schema } from './schema';
 
 const pizzas = relationLiteral(schema, 'pizzas');
@@ -62,7 +62,7 @@ They are different from `json-schema`, and justified by [parse not validate](htt
 Schemas can live alongside (or inside) your data, making versioning almost free:
 
 ```ts
-import { sealSchema } from '@tarstate/core';
+import { sealSchema } from '@tarstate/core/schema';
 
 export const schema = await sealSchema({
   "id": "example.pizza-ordering@1",

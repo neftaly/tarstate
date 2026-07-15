@@ -1,10 +1,9 @@
 import * as Automerge from '@automerge/automerge';
 import {
-  coordinateSourceCommit,
   type ContentHash,
-  type JsonValue,
-  type LogicalEdit
-} from '@tarstate/core';
+  type JsonValue
+} from '@tarstate/core/foundation';
+import { coordinateSourceCommit, type LogicalEdit } from '@tarstate/core/transactions';
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource,
@@ -66,6 +65,25 @@ const commitInput = (expectedBasis: JsonValue, operationId: string, hashDigit: s
 });
 
 describe('Automerge core source protocols', () => {
+  it('reuses unchanged projected rows across descendant Automerge heads', () => {
+    const doc = Automerge.from<TaskDoc>({
+      tasks: { first: { title: 'First' }, second: { title: 'Second' } }
+    }, { actor: actor('2') });
+    const { runtime, source, binding } = fixture(doc);
+    const before = binding.project(source.snapshot());
+    const unchanged = before.rows.find(({ key }) => key[0] === 'second');
+    const changed = before.rows.find(({ key }) => key[0] === 'first');
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
+      draft.tasks.first!.title = 'Changed';
+    }));
+    const after = binding.project(source.snapshot());
+
+    expect(after.rows.find(({ key }) => key[0] === 'second')).toBe(unchanged);
+    expect(after.rows.find(({ key }) => key[0] === 'first')).not.toBe(changed);
+    expect(after.rows.find(({ key }) => key[0] === 'first')?.fields.title).toBe('Changed');
+  });
+
   it('coordinates staged map edits through one exact-head atomic runtime commit', async () => {
     const { runtime, source, binding } = fixture();
     const before = source.snapshot();

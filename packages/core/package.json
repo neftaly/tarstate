@@ -8,7 +8,7 @@
   "files": ["dist", "!dist/golden-workloads.*"],
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./dist/root.d.ts",
       "import": "./dist/index.js"
     },
     "./artifacts": {
@@ -120,7 +120,7 @@
       "import": "./dist/transactions/delta/index.js"
     }
   },
-  "types": "./dist/index.d.ts",
+  "types": "./dist/root.d.ts",
   "sideEffects": false,
   "publishConfig": { "access": "public" },
   "engines": { "node": ">=24.12.0" },

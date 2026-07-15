@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   issueCatalog,
-  sealSchema,
   type CapabilityRef,
-  type JsonValue,
-  type SchemaBody
-} from '@tarstate/core';
+  type JsonValue
+} from '@tarstate/core/foundation';
+import { sealSchema, type SchemaBody } from '@tarstate/core/schema';
 import {
   createIssueCodeCatalogArtifact,
   describeDatabase,

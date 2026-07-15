@@ -1,7 +1,10 @@
 import { canonicalizeJson, type ContentHash } from './artifacts.js';
 import { createIssue, type Issue } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { positiveSafeInteger } from './internal-numeric-boundary.js';
+import { stringTupleKey } from './internal-string-key.js';
 import { samePortableJson } from './internal-json-equality.js';
+import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import type { MemoryRow, MemoryState } from './memory-source.js';
 import { sealStorageProjection, type WritableLogicalRow } from './logical-edit.js';
 import type { SourceBasis, SourceSnapshot } from './source-state.js';
@@ -49,6 +52,8 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
   readonly #incarnation: string;
   readonly #listeners = new Set<(change?: { readonly beforeBasis?: SourceBasis; readonly afterBasis: SourceBasis }) => void>();
   readonly #ledger = new Map<string, LedgerEntry>();
+  readonly #maxOperationReceipts: number;
+  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
   #state: MemoryState;
   #revision = 0;
   #closed = false;
@@ -58,12 +63,18 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
     readonly incarnation: string;
     readonly operationEpoch: string;
     readonly state: MemoryState;
+    /** Fail closed before mutation when exact replay evidence reaches this bound. */
+    readonly maxOperationReceipts?: number;
+    /** Receives listener failures after an already committed transition. */
+    readonly onDiagnostic?: ObserverDiagnosticReporter;
   }) {
     if (options.sourceId.length === 0 || options.incarnation.length === 0 || options.operationEpoch.length === 0) throw new TypeError('Logical memory source identifiers must not be empty');
     this.sourceId = options.sourceId;
     this.#incarnation = options.incarnation;
     this.operationEpoch = options.operationEpoch;
     this.#state = ownState(options.state);
+    this.#maxOperationReceipts = positiveSafeInteger(options.maxOperationReceipts ?? 65_536, 'maxOperationReceipts');
+    this.#onDiagnostic = options.onDiagnostic;
   }
 
   snapshot = () => this.#closed
@@ -79,27 +90,48 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
   commit = async (input: SourceCommitInput<LogicalMemoryCommand>): Promise<SourceCommitResult> => {
     if (this.#closed) return { outcome: 'rejected', issues: [createIssue({ code: 'source.closed', sourceId: this.sourceId })] };
     if (input.operationEpoch !== this.operationEpoch) return { outcome: 'rejected', issues: [createIssue({ code: 'transaction.operation_epoch_expired', operationId: input.operationId, sourceId: this.sourceId })] };
-    const ledgerKey = input.operationEpoch + '\u0000' + input.operationId;
+    const ledgerKey = stringTupleKey(input.operationEpoch, input.operationId);
     const prior = this.#ledger.get(ledgerKey);
     if (prior !== undefined) {
       return prior.intentHash === input.intentHash
         ? prior.result
         : { outcome: 'rejected', issues: [createIssue({ code: 'transaction.operation_id_ambiguous', operationId: input.operationId, sourceId: this.sourceId })] };
     }
+    if (this.#ledger.size >= this.#maxOperationReceipts) {
+      return {
+        outcome: 'rejected',
+        issues: [createIssue({
+          code: 'operation.ledger_capacity_exhausted',
+          sourceId: this.sourceId,
+          operationId: input.operationId,
+          details: { capacity: this.#maxOperationReceipts, action: 'replace_source' }
+        })]
+      };
+    }
+    const retain = (result: SourceCommitResult): SourceCommitResult => {
+      const owned = Object.freeze({ ...result, issues: Object.freeze([...result.issues]) });
+      this.#ledger.set(ledgerKey, { intentHash: input.intentHash, result: owned });
+      return owned;
+    };
     const beforeBasis = this.#basis();
     if (!samePortableJson(input.expectedBasis, beforeBasis)) {
-      return { outcome: 'rejected', beforeBasis, issues: [createIssue({ code: 'transaction.expected_basis_stale', operationId: input.operationId, sourceId: this.sourceId, details: { expected: input.expectedBasis, actual: beforeBasis } })] };
+      return retain({ outcome: 'rejected', beforeBasis, issues: [createIssue({ code: 'transaction.expected_basis_stale', operationId: input.operationId, sourceId: this.sourceId, details: { expected: input.expectedBasis, actual: beforeBasis } })] });
     }
     const staged = this.stage(this.snapshot(), input.commands);
-    if (staged.issues.some(({ severity }) => severity === 'error')) return { outcome: 'rejected', beforeBasis, issues: staged.issues };
+    if (staged.issues.some(({ severity }) => severity === 'error')) return retain({ outcome: 'rejected', beforeBasis, issues: staged.issues });
     const changed = this.#state !== staged.storage;
     if (changed) {
       this.#state = staged.storage;
       this.#revision += 1;
     }
-    const result: SourceCommitResult = { outcome: 'committed', beforeBasis, afterBasis: this.#basis(), issues: staged.issues };
-    this.#ledger.set(ledgerKey, { intentHash: input.intentHash, result });
-    if (changed) for (const listener of this.#listeners) listener({ beforeBasis, afterBasis: this.#basis() });
+    const result = retain({ outcome: 'committed', beforeBasis, afterBasis: this.#basis(), issues: staged.issues });
+    if (changed) {
+      const afterBasis = this.#basis();
+      notifyObservers(this.#listeners, (listener) => listener({ beforeBasis, afterBasis }), {
+        component: 'memory-source',
+        operation: 'publish'
+      }, this.#onDiagnostic);
+    }
     return result;
   };
 
@@ -107,13 +139,9 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
 
   mergeIntents = (plans: readonly PlanResult<LogicalMemoryCommand>[]): IntentMergeResult<LogicalMemoryCommand> => {
     const intents = plans.flatMap(({ intents }) => intents);
-    for (let leftIndex = 0; leftIndex < intents.length; leftIndex += 1) {
-      for (let rightIndex = leftIndex + 1; rightIndex < intents.length; rightIndex += 1) {
-        if (this.relateFootprints(intents[leftIndex]!.footprint, intents[rightIndex]!.footprint) !== 'disjoint') {
-          return { outcome: 'conflict', issues: [createIssue({ code: 'binding.write_footprint_overlap', sourceId: this.sourceId })] };
-        }
-      }
-    }
+    const overlap = firstLogicalMemoryFootprintOverlap(intents.map(({ footprint }) => footprint));
+    if (overlap === 'unknown') return { outcome: 'unknown', issues: [createIssue({ code: 'binding.footprint_relation_unknown', sourceId: this.sourceId })] };
+    if (overlap !== undefined) return { outcome: 'conflict', issues: [createIssue({ code: 'binding.write_footprint_overlap', sourceId: this.sourceId })] };
     return { outcome: 'merged', commands: intents.map(({ command }) => command) };
   };
 
@@ -134,7 +162,8 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
   };
 
   queryOutcome = async (input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash }): Promise<SourceOutcomeLookup<SourceCommitResult>> => {
-    const entry = this.#ledger.get(input.operationEpoch + '\u0000' + input.operationId);
+    if (input.operationEpoch !== this.operationEpoch) return { status: 'expired' };
+    const entry = this.#ledger.get(stringTupleKey(input.operationEpoch, input.operationId));
     if (entry === undefined) return { status: 'not_seen' };
     return entry.intentHash === input.intentHash ? { status: 'known', result: entry.result } : { status: 'ambiguous' };
   };
@@ -152,6 +181,7 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
 /** StorageBinding paired with LogicalMemoryAtomicSource. */
 export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, LogicalMemoryCommand, WritableLogicalRow> {
   readonly id: string;
+  readonly relationIds: readonly string[];
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
   readonly #relations: ReadonlyMap<string, LogicalMemoryRelation>;
@@ -162,17 +192,23 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
     const relations = options.relations.map((relation) => Object.freeze({ relationId: relation.relationId, keyFields: Object.freeze([...relation.keyFields]) }));
     if (new Set(relations.map(({ relationId }) => relationId)).size !== relations.length) throw new TypeError('Logical memory relation IDs must be unique');
     this.#relations = new Map(relations.map((relation) => [relation.relationId, relation]));
+    this.relationIds = Object.freeze(relations.map(({ relationId }) => relationId));
     this.declaredReadFootprint = Object.freeze(relations.map(({ relationId }) => relationFootprint(relationId)));
     this.declaredWriteFootprint = this.declaredReadFootprint;
   }
 
-  project = (snapshot: SourceSnapshot<MemoryState>): ProjectionResult<WritableLogicalRow> => {
+  project = (snapshot: SourceSnapshot<MemoryState>, requestedRelations?: ReadonlySet<string>): ProjectionResult<WritableLogicalRow> => {
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { rows: [], completeness: 'unknown', issues: [createIssue({ code: 'source.not_ready', sourceId: snapshot.sourceId })] };
-    const cached = this.#projections.get(snapshot.storage)?.get(snapshot.sourceId);
+    const selectedRelations = requestedRelations === undefined
+      ? this.relationIds
+      : this.relationIds.filter((relationId) => requestedRelations.has(relationId));
+    const cacheKey = stringTupleKey(snapshot.sourceId, ...selectedRelations);
+    const cached = this.#projections.get(snapshot.storage)?.get(cacheKey);
     if (cached !== undefined) return cached;
     const rows: WritableLogicalRow[] = [];
     const issues: Issue[] = [];
     for (const relation of this.#relations.values()) {
+      if (requestedRelations !== undefined && !requestedRelations.has(relation.relationId)) continue;
       const candidates = snapshot.storage[relation.relationId] ?? [];
       const seen = new Set<string>();
       for (const fields of candidates) {
@@ -196,7 +232,8 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
       issues: Object.freeze(issues)
     }));
     const bySource = this.#projections.get(snapshot.storage) ?? new Map<string, ProjectionResult<WritableLogicalRow>>();
-    bySource.set(snapshot.sourceId, projection);
+    if (!bySource.has(cacheKey) && bySource.size >= 64) bySource.delete(bySource.keys().next().value as string);
+    bySource.set(cacheKey, projection);
     this.#projections.set(snapshot.storage, bySource);
     return projection;
   };
@@ -214,7 +251,7 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
     const rowsByLocator = new Map<string, WritableLogicalRow>();
     const keysByRelation = new Map<string, Set<string>>();
     for (const row of projection.rows) {
-      rowsByLocator.set(row.relationId + '\u0000' + canonicalizeJson(row.locator), row);
+      rowsByLocator.set(stringTupleKey(row.relationId, canonicalizeJson(row.locator)), row);
       const keys = keysByRelation.get(row.relationId) ?? new Set<string>();
       keys.add(canonicalizeJson(row.key));
       keysByRelation.set(row.relationId, keys);
@@ -232,7 +269,7 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
         operationGroup.edits.push({ kind: 'insert', fingerprint, row: ownRow(edit.fields) });
         continue;
       }
-      const row = rowsByLocator.get(edit.relationId + '\u0000' + canonicalizeJson(edit.locator));
+      const row = rowsByLocator.get(stringTupleKey(edit.relationId, canonicalizeJson(edit.locator)));
       if (row === undefined || !samePortableJson(row.key, edit.key)) {
         issues.push(createIssue({ code: 'mapping.locator_stale', sourceId: snapshot.sourceId, relationId: edit.relationId, key: edit.key }));
         continue;
@@ -289,6 +326,46 @@ export const relateLogicalMemoryFootprints = (left: Footprint, right: Footprint)
   if (leftInRight) return 'contained_by';
   if (rightInLeft) return 'contains';
   return leftPaths.some((path) => rightPaths.some((other) => path.startsWith(other + '/') || other.startsWith(path + '/'))) ? 'overlaps' : 'disjoint';
+};
+
+type MemoryPathTrie = {
+  readonly children: Map<string, MemoryPathTrie>;
+  terminalOwner?: number;
+  firstOwner?: number;
+  secondOwner?: number;
+};
+
+const firstLogicalMemoryFootprintOverlap = (
+  footprints: readonly Footprint[]
+): readonly [number, number] | 'unknown' | undefined => {
+  const root: MemoryPathTrie = { children: new Map() };
+  for (let owner = 0; owner < footprints.length; owner += 1) {
+    const paths = parseFootprint(footprints[owner] as Footprint);
+    if (paths === undefined) return 'unknown';
+    for (const path of paths) {
+      const visited = [root];
+      let node = root;
+      for (const segment of path.split('/')) {
+        if (node.terminalOwner !== undefined && node.terminalOwner !== owner) return [node.terminalOwner, owner];
+        const child = node.children.get(segment) ?? { children: new Map<string, MemoryPathTrie>() };
+        if (!node.children.has(segment)) node.children.set(segment, child);
+        node = child;
+        visited.push(node);
+      }
+      const descendantOwner = node.firstOwner !== undefined && node.firstOwner !== owner
+        ? node.firstOwner
+        : node.secondOwner !== undefined && node.secondOwner !== owner
+          ? node.secondOwner
+          : undefined;
+      if (descendantOwner !== undefined) return [descendantOwner, owner];
+      node.terminalOwner = owner;
+      for (const visitedNode of visited) {
+        if (visitedNode.firstOwner === undefined) visitedNode.firstOwner = owner;
+        else if (visitedNode.firstOwner !== owner && visitedNode.secondOwner === undefined) visitedNode.secondOwner = owner;
+      }
+    }
+  }
+  return undefined;
 };
 
 const commandForOperations = (

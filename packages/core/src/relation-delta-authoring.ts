@@ -19,6 +19,7 @@ export type PreparedExactKeyedRelationRows = ExactKeyedRelationRows & {
 
 const preparedExactRows = new WeakSet<object>();
 const preparedRowIndexes = new WeakMap<object, Map<string, Map<string, IndexedRow>>>();
+const maxPreparedIndexesPerRowSet = 16;
 
 export type ExactKeyedRelationDeltaInput = {
   readonly relation: WriteRelation;
@@ -191,6 +192,7 @@ const indexRows = (
   });
   if (issues.length === issueCount) {
     const indexes = preparedRowIndexes.get(rows) ?? new Map<string, Map<string, IndexedRow>>();
+    if (!indexes.has(keySignature) && indexes.size >= maxPreparedIndexesPerRowSet) indexes.delete(indexes.keys().next().value as string);
     indexes.set(keySignature, indexed);
     preparedRowIndexes.set(rows, indexes);
   }

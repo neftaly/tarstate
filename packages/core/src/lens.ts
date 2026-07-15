@@ -86,6 +86,7 @@ export const resolveLensPath = (
   if (!Number.isSafeInteger(maxVisitedNodes) || maxVisitedNodes <= 0 || !Number.isSafeInteger(maxDepth) || maxDepth <= 0) return rejected('lens.path_budget_exceeded', 'plan', { reason: 'invalid_budget' });
   const hashes = new Map<string, string>();
   const outgoing = new Map<string, LensArtifact[]>();
+  const byReference = new Map<string, LensArtifact[]>();
   for (const candidate of candidates) {
     assertValidatedLens(candidate.body);
     const hash = hashes.get(candidate.ref.id);
@@ -94,13 +95,16 @@ export const resolveLensPath = (
     const key = refKey(candidate.body.from);
     const edges = outgoing.get(key);
     if (edges === undefined) outgoing.set(key, [candidate]); else edges.push(candidate);
+    const referenceKey = refKey(candidate.ref);
+    const referenced = byReference.get(referenceKey);
+    if (referenced === undefined) byReference.set(referenceKey, [candidate]); else referenced.push(candidate);
   }
   if (selected !== undefined) {
     if (selected.length > maxDepth || selected.length > maxVisitedNodes) return rejected('lens.path_budget_exceeded', 'plan', { maxVisitedNodes, maxDepth });
     const path: LensArtifact[] = [];
     let cursor = from;
     for (const ref of selected) {
-      const matches = candidates.filter((candidate) => sameRef(candidate.ref, ref));
+      const matches = byReference.get(refKey(ref)) ?? [];
       if (matches.length !== 1 || !sameRef(matches[0]?.body.from, cursor)) return rejected('lens.path_missing', 'plan', { selected: ref });
       const lens = matches[0] as LensArtifact;
       path.push(lens);
@@ -111,18 +115,24 @@ export const resolveLensPath = (
   const paths: LensArtifact[][] = [];
   let visitedNodes = 0;
   let exhausted = false;
-  const visit = (cursor: ArtifactRef, path: readonly LensArtifact[], visited: ReadonlySet<string>): void => {
+  const activePath: LensArtifact[] = [];
+  const visited = new Set<string>([refKey(from)]);
+  const visit = (cursor: ArtifactRef): void => {
     visitedNodes += 1;
-    if (visitedNodes > maxVisitedNodes || path.length > maxDepth) { exhausted = true; return; }
+    if (visitedNodes > maxVisitedNodes || activePath.length > maxDepth) { exhausted = true; return; }
     if (paths.length > 1 || exhausted) return;
-    if (sameRef(cursor, to)) { paths.push([...path]); return; }
+    if (sameRef(cursor, to)) { paths.push([...activePath]); return; }
     for (const lens of outgoing.get(refKey(cursor)) ?? []) {
       const nextKey = refKey(lens.body.to);
       if (visited.has(nextKey)) continue;
-      visit(lens.body.to, [...path, lens], new Set([...visited, nextKey]));
+      activePath.push(lens);
+      visited.add(nextKey);
+      visit(lens.body.to);
+      visited.delete(nextKey);
+      activePath.pop();
     }
   };
-  visit(from, [], new Set([refKey(from)]));
+  visit(from);
   if (exhausted) return rejected('lens.path_budget_exceeded', 'plan', { maxVisitedNodes, maxDepth });
   if (paths.length === 0) return rejected('lens.path_missing', 'plan');
   if (paths.length > 1) return rejected('lens.path_ambiguous', 'plan', { candidates: paths.length });
@@ -207,7 +217,7 @@ const projectOwnedLensCandidate = (
     }
     if (step.kind === 'lens.value-map') {
       if (!Object.hasOwn(row, step.from)) continue;
-      const matched = step.cases.find((candidate) => sameValue(candidate.from, row[step.from] as PortableValue));
+      const matched = valueMapIndex(step).byFrom.get(canonicalizeJson(row[step.from] as JsonValue));
       // `unmapped: reject` rejects this entire projected candidate. A partial row is never exact data.
       if (matched === undefined) return lensFailure('lens.unmapped_value', 'query', [step.from], { field: step.from, rowIndex });
       output[step.to] = matched.to;
@@ -246,8 +256,9 @@ export const translateLensEdits = (
   const patch: Record<string, PortableValue> = {};
   const issues: Issue[] = [];
   const lookupIndexes = createLookupIndexes(relation.steps, safeRows, 'result');
+  const stepsByDestination = destinationStepIndex(relation.steps);
   for (const [field, value] of Object.entries(safeEdits)) {
-    const matching = relation.steps.filter((step): step is Exclude<LensStep, { readonly kind: 'extension' } | { readonly kind: 'lens.hide' }> => step.kind !== 'extension' && step.kind !== 'lens.hide' && step.to === field);
+    const matching = stepsByDestination.get(field) ?? [];
     if (matching.length !== 1) { issues.push(lensIssue(matching.length === 0 ? 'lens.field_not_writable' : 'lens.inverse_ambiguous', 'plan', [field], { field })); continue; }
     const step = matching[0] as typeof matching[number];
     if (step.kind === 'lens.default' || (step.kind === 'lens.field' && step.write === 'read-only') || (step.kind === 'lens.lookup' && step.write === 'read-only')) {
@@ -255,11 +266,14 @@ export const translateLensEdits = (
     }
     if (step.kind === 'lens.field') { patch[step.from] = value; continue; }
     if (step.kind === 'lens.value-map') {
-      const current = step.cases.find((candidate) => Object.hasOwn(safeStoredRow, step.from) && sameValue(candidate.from, safeStoredRow[step.from] as PortableValue));
+      const index = valueMapIndex(step);
+      const current = Object.hasOwn(safeStoredRow, step.from)
+        ? index.byFrom.get(canonicalizeJson(safeStoredRow[step.from] as JsonValue))
+        : undefined;
       if (current === undefined) { issues.push(lensIssue('lens.unmapped_value', 'plan', [field], { field })); continue; }
       if (current.writeBack === 'reject') { issues.push(lensIssue('lens.lossy_reverse', 'plan', [field], { field })); continue; }
       if (current.writeBack === 'same-only' && sameValue(current.to, value)) continue;
-      const inverse = step.cases.filter((candidate) => candidate.writeBack === 'to-from' && sameValue(candidate.to, value));
+      const inverse = index.byWritableTarget.get(canonicalizeJson(value as JsonValue)) ?? [];
       if (inverse.length !== 1) issues.push(lensIssue(inverse.length === 0 ? 'lens.lossy_reverse' : 'lens.inverse_ambiguous', 'plan', [field], { field }));
       else patch[step.from] = (inverse[0] as typeof inverse[number]).from;
       continue;
@@ -274,6 +288,65 @@ export const translateLensEdits = (
   }
   if (issues.length > 0) return { success: false, issues };
   return { success: true, value: Object.freeze(patch), issues: [] };
+};
+
+type ValueMapStep = Extract<LensStep, { readonly kind: 'lens.value-map' }>;
+type ValueMapCase = ValueMapStep['cases'][number];
+type WritableLensStep = Exclude<LensStep, { readonly kind: 'extension' } | { readonly kind: 'lens.hide' }>;
+
+const valueMapIndexes = new WeakMap<object, {
+  readonly byFrom: ReadonlyMap<string, ValueMapCase>;
+  readonly byWritableTarget: ReadonlyMap<string, readonly ValueMapCase[]>;
+}>();
+const destinationStepIndexes = new WeakMap<object, ReadonlyMap<string, readonly WritableLensStep[]>>();
+
+const valueMapIndex = (step: ValueMapStep): {
+  readonly byFrom: ReadonlyMap<string, ValueMapCase>;
+  readonly byWritableTarget: ReadonlyMap<string, readonly ValueMapCase[]>;
+} => {
+  const cached = valueMapIndexes.get(step);
+  if (cached !== undefined) return cached;
+  const index = createValueMapIndex(step);
+  valueMapIndexes.set(step, index);
+  return index;
+};
+
+/** Pure index construction; the wrapper above owns identity-based memoization. */
+const createValueMapIndex = (step: ValueMapStep): {
+  readonly byFrom: ReadonlyMap<string, ValueMapCase>;
+  readonly byWritableTarget: ReadonlyMap<string, readonly ValueMapCase[]>;
+} => {
+  const byFrom = new Map<string, ValueMapCase>();
+  const byWritableTarget = new Map<string, ValueMapCase[]>();
+  for (const candidate of step.cases) {
+    byFrom.set(canonicalizeJson(candidate.from as JsonValue), candidate);
+    if (candidate.writeBack !== 'to-from') continue;
+    const key = canonicalizeJson(candidate.to as JsonValue);
+    const cases = byWritableTarget.get(key);
+    if (cases === undefined) byWritableTarget.set(key, [candidate]);
+    else cases.push(candidate);
+  }
+  return { byFrom, byWritableTarget };
+};
+
+const destinationStepIndex = (steps: ValidatedLensSteps): ReadonlyMap<string, readonly WritableLensStep[]> => {
+  const cached = destinationStepIndexes.get(steps);
+  if (cached !== undefined) return cached;
+  const index = createDestinationStepIndex(steps);
+  destinationStepIndexes.set(steps, index);
+  return index;
+};
+
+/** Pure inverse-routing index; identity retention belongs only to the wrapper. */
+const createDestinationStepIndex = (steps: ValidatedLensSteps): ReadonlyMap<string, readonly WritableLensStep[]> => {
+  const index = new Map<string, WritableLensStep[]>();
+  for (const step of steps) {
+    if (step.kind === 'extension' || step.kind === 'lens.hide') continue;
+    const matches = index.get(step.to);
+    if (matches === undefined) index.set(step.to, [step]);
+    else matches.push(step);
+  }
+  return index;
 };
 
 type LookupStep = Extract<LensStep, { readonly kind: 'lens.lookup' }>;

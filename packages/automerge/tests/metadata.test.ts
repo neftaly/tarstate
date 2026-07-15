@@ -2,10 +2,10 @@ import { readFileSync, readdirSync } from 'node:fs';
 import * as Automerge from '@automerge/automerge';
 import {
   GovernanceCoordinator,
-  type DocumentDeclaration,
   type GovernanceCommand,
   type GovernanceSection
-} from '@tarstate/core';
+} from '@tarstate/core/transactions';
+import type { DocumentDeclaration } from '@tarstate/core/attachment';
 import { describe, expect, it } from 'vitest';
 import { automergeIssueDeclarations } from '../src/issues.js';
 import {

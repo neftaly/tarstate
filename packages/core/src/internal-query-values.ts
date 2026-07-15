@@ -64,8 +64,14 @@ const jsonValueOrder = (value: JsonValue): number => value === null
 
 export const containsQueryLogicalUnknown = (value: QueryLogicalValue): boolean => {
   if (value === logicalUnknown) return true;
-  if (Array.isArray(value)) return value.some(containsQueryLogicalUnknown);
-  if (value !== null && typeof value === 'object') return Object.values(value).some(containsQueryLogicalUnknown);
+  if (Array.isArray(value)) {
+    for (const child of value) if (containsQueryLogicalUnknown(child)) return true;
+  } else if (value !== null && typeof value === 'object') {
+    const record = value as Readonly<Record<string, QueryLogicalValue>>;
+    for (const key in record) {
+      if (Object.hasOwn(record, key) && containsQueryLogicalUnknown(record[key] as QueryLogicalValue)) return true;
+    }
+  }
   return false;
 };
 
@@ -76,27 +82,56 @@ export const canonicalizeQueryValue = (value: QueryLogicalValue): string => {
     const cached = canonicalValues.get(value);
     if (cached !== undefined) return cached;
   }
+  const canonical = renderQueryValue(value);
+  if (value !== null && typeof value === 'object' && Object.isFrozen(value)) canonicalValues.set(value, canonical);
+  return canonical;
+};
+
+/** Pure canonical rendering; the public wrapper owns immutable-value memoization. */
+const renderQueryValue = (value: Exclude<QueryLogicalValue, typeof logicalUnknown>): string => {
   let canonical: string;
-  if (Array.isArray(value)) canonical = 'a[' + value.map(canonicalizeQueryValue).join(',') + ']';
+  if (Array.isArray(value)) {
+    canonical = 'a[';
+    for (let index = 0; index < value.length; index += 1) {
+      if (index !== 0) canonical += ',';
+      canonical += canonicalizeQueryValue(value[index] as QueryLogicalValue);
+    }
+    canonical += ']';
+  }
   else if (value !== null && typeof value === 'object') {
     const record = value as Readonly<Record<string, QueryLogicalValue>>;
-    canonical = 'o{' + stableRecordKeys(record).map((key) => JSON.stringify(key) + ':' + canonicalizeQueryValue(record[key] as QueryLogicalValue)).join(',') + '}';
+    const keys = stableRecordKeys(record);
+    canonical = 'o{';
+    for (let index = 0; index < keys.length; index += 1) {
+      if (index !== 0) canonical += ',';
+      const key = keys[index] as string;
+      canonical += JSON.stringify(key) + ':' + canonicalizeQueryValue(record[key] as QueryLogicalValue);
+    }
+    canonical += '}';
   } else canonical = 'j' + canonicalizeJson(value);
-  if (value !== null && typeof value === 'object' && Object.isFrozen(value)) canonicalValues.set(value, canonical);
   return canonical;
 };
 
 const stableRecordKeys = (record: Readonly<Record<string, unknown>>): readonly string[] => {
   const cached = sortedRecordKeys.get(record);
   if (cached !== undefined) return cached;
-  const keys = Object.keys(record).sort(comparePortableStrings);
+  const keys = sortedKeys(record);
   if (Object.isFrozen(record)) sortedRecordKeys.set(record, keys);
   return keys;
 };
 
+const sortedKeys = (record: Readonly<Record<string, unknown>>): readonly string[] =>
+  Object.keys(record).sort(comparePortableStrings);
+
 export const queryValueEqual = (left: QueryLogicalValue, right: QueryLogicalValue): boolean => {
   if (Object.is(left, right)) return true;
-  if (Array.isArray(left) || Array.isArray(right)) return Array.isArray(left) && Array.isArray(right) && left.length === right.length && left.every((value, index) => queryValueEqual(value, right[index] as QueryLogicalValue));
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (!queryValueEqual(left[index] as QueryLogicalValue, right[index] as QueryLogicalValue)) return false;
+    }
+    return true;
+  }
   if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
   const leftRecord = left as Readonly<Record<string, QueryLogicalValue>>;
   const rightRecord = right as Readonly<Record<string, QueryLogicalValue>>;

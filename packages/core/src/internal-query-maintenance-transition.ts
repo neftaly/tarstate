@@ -47,12 +47,14 @@ export const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, 
     const existingOccurrences = existing?.input.occurrenceIds ?? [];
     if (existingRows.length !== existingOccurrences.length) return rejectedMaintenanceUpdate('invalid_occurrence_ids', change.relation.relationId);
     const rowChanges = new Map<string, RelationRowChange>();
+    let inserted = 0;
+    let removed = 0;
     for (const rowChange of change.rows) {
       if (rowChanges.has(rowChange.occurrenceId)) return rejectedMaintenanceUpdate('duplicate_occurrence_change', change.relation.relationId);
       rowChanges.set(rowChange.occurrenceId, rowChange);
+      if (rowChange.before === undefined && rowChange.after !== undefined) inserted += 1;
+      else if (rowChange.before !== undefined && rowChange.after === undefined) removed += 1;
     }
-    const inserted = change.rows.filter(({ before, after }) => before === undefined && after !== undefined).length;
-    const removed = change.rows.filter(({ before, after }) => before !== undefined && after === undefined).length;
     const nextRows = Array.from<QueryRecord | undefined>({ length: existingRows.length + inserted - removed });
     const nextOccurrences = Array.from<string | undefined>({ length: nextRows.length });
     const consumedChanges = new Set<string>();

@@ -11,9 +11,10 @@ npm install ./tarstate-core-0.3.0.tgz
 
 ## Imports
 
-The package root remains the complete, compatibility-stable surface. For
-focused modules and explicit dependency boundaries, public values are also
-available through architectural and topic entry points:
+The package root intentionally exports only the small `foundation` surface.
+Runtime features use architectural topic entry points so Node, workers, and
+non-tree-shaking bundlers do not link unrelated query, database, transaction,
+and schema implementations:
 
 | Entry point | Responsibility |
 | --- | --- |
@@ -27,12 +28,10 @@ available through architectural and topic entry points:
 | `@tarstate/core/database` | Observation, source protocols, host runtimes, and maintenance contracts |
 | `@tarstate/core/transactions` | Writes, commit coordination, receipts, and lifecycle governance |
 
-Entry points are additive aliases: importing from `@tarstate/core`
-continues to work, and a value exported through both paths has the same runtime
-identity. The architectural entries have deliberately narrow static closures;
-the older topic entries remain broader convenience surfaces. Internal
-maintenance-pool APIs and conformance fixtures are not made public by these
-entry points.
+Foundation values have the same identity through `@tarstate/core` and
+`@tarstate/core/foundation`. All other public values must be imported through a
+topic entry. Internal maintenance-pool APIs and conformance fixtures are not
+made public by these entry points.
 
 Query and observation have narrower execution seams:
 
@@ -48,8 +47,8 @@ Query and observation have narrower execution seams:
 | `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
 
 Schema, query, and transaction authoring are separate implementations behind
-their topic entries. The root `type-authoring` surface is only a compatibility
-facade, so query authoring does not load schema or transaction authoring code.
+their topic entries, so query authoring does not load schema or transaction
+authoring code.
 
 Artifact semantics and attachment preparation also have opt-in execution seams:
 

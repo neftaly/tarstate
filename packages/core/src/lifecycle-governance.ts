@@ -11,6 +11,7 @@ import {
   normalizeDocumentProjection
 } from './internal-document-declaration.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { positiveSafeInteger } from './internal-numeric-boundary.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import type { DocumentDeclaration } from './attachment-model.js';
@@ -56,11 +57,20 @@ export class SourceOperationLedger<Receipt> implements OperationLedgerProtocol<R
   readonly retention = 'memory' as const;
   readonly #entries = new Map<string, OperationLedgerEntry<Receipt>>();
   readonly #retiredEpochs = new Set<string>();
+  readonly #maxEntries: number;
+  readonly #maxRetiredEpochs: number;
   #activeEpoch: string;
 
-  constructor(activeEpoch: string) {
+  constructor(activeEpoch: string, options: {
+    /** Exact active-epoch replay evidence is never evicted; reservations fail closed at this bound. */
+    readonly maxEntries?: number;
+    /** Epoch reuse evidence is exact and bounded; rotation fails before this bound is exceeded. */
+    readonly maxRetiredEpochs?: number;
+  } = {}) {
     if (activeEpoch.length === 0) throw new Error('Operation epoch must be non-empty');
     this.#activeEpoch = activeEpoch;
+    this.#maxEntries = positiveSafeInteger(options.maxEntries ?? 65_536, 'Operation ledger maxEntries');
+    this.#maxRetiredEpochs = positiveSafeInteger(options.maxRetiredEpochs ?? 4_096, 'Operation ledger maxRetiredEpochs');
   }
 
   get activeEpoch(): string { return this.#activeEpoch; }
@@ -74,6 +84,9 @@ export class SourceOperationLedger<Receipt> implements OperationLedgerProtocol<R
       return existing.receipt === undefined
         ? Object.freeze({ status: 'pending' })
         : Object.freeze({ status: 'known', receipt: existing.receipt });
+    }
+    if (this.#entries.size >= this.#maxEntries) {
+      throw new RangeError('Operation ledger capacity exhausted; rotate the operation epoch before accepting more work');
     }
     const entry = { commandHash };
     this.#entries.set(key, entry);
@@ -103,10 +116,10 @@ export class SourceOperationLedger<Receipt> implements OperationLedgerProtocol<R
 
   rotateEpoch(nextEpoch: string): void {
     if (nextEpoch.length === 0 || nextEpoch === this.#activeEpoch || this.#retiredEpochs.has(nextEpoch)) throw new Error('Operation epoch must be new and non-empty');
-    const activeEpochPrefix = stringTupleKey(this.#activeEpoch);
-    if ([...this.#entries.entries()].some(([key, entry]) => key.startsWith(activeEpochPrefix) && entry.receipt === undefined)) throw new Error('Cannot retire an epoch with a pending operation');
+    if (this.#retiredEpochs.size >= this.#maxRetiredEpochs) throw new RangeError('Operation ledger retired-epoch capacity exhausted; replace the ledger');
+    if ([...this.#entries.values()].some((entry) => entry.receipt === undefined)) throw new Error('Cannot retire an epoch with a pending operation');
     this.#retiredEpochs.add(this.#activeEpoch);
-    for (const key of this.#entries.keys()) if (key.startsWith(activeEpochPrefix)) this.#entries.delete(key);
+    this.#entries.clear();
     this.#activeEpoch = nextEpoch;
   }
 }

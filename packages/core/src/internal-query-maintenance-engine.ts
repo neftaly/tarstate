@@ -614,9 +614,7 @@ export const incrementallyMaterializeDistinct = (
   const candidateOutput = entries.map(([key, keyPositions]) => affectedKeys.has(key)
     ? child.result.rows[keyPositions[0] as number] as ScopedRow
     : previousOutputByKey.get(key) ?? child.result.rows[keyPositions[0] as number] as ScopedRow);
-  const stableIdentityLayout = candidateOutput.length === previous.result.rows.length
-    && candidateOutput.every((row, index) => resultKey(row) === resultKey(previous.result.rows[index] as ScopedRow));
-  const changedOutputPositions = stableIdentityLayout ? candidateOutput.flatMap((row, index) => row === previous.result.rows[index] ? [] : [index]) : undefined;
+  const changedOutputPositions = changedRowPositionsIfStableIdentity(candidateOutput, previous.result.rows);
   const output = changedOutputPositions?.length === 0 ? previous.result.rows : candidateOutput;
   return withMaintenanceEvent({
     result: { rows: output, completeness: child.result.completeness },
@@ -881,6 +879,77 @@ const changedOccurrences = (update: QueryMaintenanceUpdate, relation: RelationUs
 
 const singleAliasResultKey = (alias: string, occurrence: string): string => alias.length + ':' + alias + occurrence.length + ':' + occurrence;
 
+const expressionInputsEqual = (expression: Expr, before: ScopedRow, after: ScopedRow): boolean => {
+  if (expression.kind === 'literal' || expression.kind === 'parameter') return true;
+  if (expression.kind === 'field') {
+    const beforeRecord = before.scope[expression.alias];
+    const afterRecord = after.scope[expression.alias];
+    if (beforeRecord === undefined || afterRecord === undefined) return beforeRecord === afterRecord;
+    const beforePresent = Object.hasOwn(beforeRecord, expression.name);
+    if (beforePresent !== Object.hasOwn(afterRecord, expression.name)) return false;
+    return !beforePresent || queryValueEqual(
+      beforeRecord[expression.name] as QueryLogicalValue,
+      afterRecord[expression.name] as QueryLogicalValue
+    );
+  }
+  if (expression.kind === 'key-of' || expression.kind === 'source-of') {
+    const beforeProvenance = before.provenance[expression.alias];
+    const afterProvenance = after.provenance[expression.alias];
+    if (beforeProvenance === undefined || afterProvenance === undefined) return beforeProvenance === afterProvenance;
+    const beforeValue = expression.kind === 'key-of' ? beforeProvenance.key : beforeProvenance.sourceId;
+    const afterValue = expression.kind === 'key-of' ? afterProvenance.key : afterProvenance.sourceId;
+    if (beforeValue === undefined || afterValue === undefined) return beforeValue === afterValue;
+    return queryValueEqual(beforeValue, afterValue);
+  }
+  // Calls and subqueries may observe state beyond their explicit row fields.
+  // They stay on the semantic evaluator path instead of being guessed pure.
+  if (expression.kind === 'call' || expression.kind === 'subquery') return false;
+  if (expression.kind === 'compare' || expression.kind === 'arithmetic') {
+    return expressionInputsEqual(expression.left, before, after)
+      && expressionInputsEqual(expression.right, before, after);
+  }
+  if (expression.kind === 'is-null' || expression.kind === 'is-missing') {
+    return expressionInputsEqual(expression.value, before, after);
+  }
+  if (expression.kind === 'boolean') {
+    if (expression.op === 'not') return expressionInputsEqual(expression.arg, before, after);
+    for (const argument of expression.args) {
+      if (!expressionInputsEqual(argument, before, after)) return false;
+    }
+    return true;
+  }
+  if (expression.kind === 'case') {
+    for (const branch of expression.branches) {
+      if (!expressionInputsEqual(branch.when, before, after)
+        || !expressionInputsEqual(branch.then, before, after)) return false;
+    }
+    return expressionInputsEqual(expression.otherwise, before, after);
+  }
+  if (expression.kind === 'record') {
+    for (const field of Object.values(expression.fields)) {
+      if (!expressionInputsEqual(field, before, after)) return false;
+    }
+    return true;
+  }
+  const expressions = expression.kind === 'array' ? expression.items : expression.args;
+  for (const argument of expressions) {
+    if (!expressionInputsEqual(argument, before, after)) return false;
+  }
+  return true;
+};
+
+const selectProjectionInputsEqual = (
+  node: Extract<QueryNode, { readonly kind: 'select' }>,
+  before: ScopedRow,
+  after: ScopedRow
+): boolean => {
+  if (resultKey(before) !== resultKey(after)) return false;
+  for (const expression of Object.values(node.fields)) {
+    if (!expressionInputsEqual(expression, before, after)) return false;
+  }
+  return true;
+};
+
 export const incrementallyMaterializeLocal = (
   node: Extract<QueryNode, { readonly kind: 'where' | 'select' | 'with-fields' | 'rename' | 'omit' | 'unnest' }>,
   snapshot: QueryMaintenanceSnapshot,
@@ -895,6 +964,26 @@ export const incrementallyMaterializeLocal = (
   }
   const oneToOne = isOneToOneLocallyMaintainedNode(node);
   if (child.stableChangedPositions !== undefined) {
+    if (node.kind === 'select') {
+      let projectionUnchanged = true;
+      for (const index of child.stableChangedPositions) {
+        const before = previous.local.inputs[index];
+        const after = child.result.rows[index];
+        if (before === undefined || after === undefined || !selectProjectionInputsEqual(node, before, after)) {
+          projectionUnchanged = false;
+          break;
+        }
+      }
+      if (projectionUnchanged) {
+        return withMaintenanceEvent({
+          result: previous.result,
+          issues: previous.issues,
+          unavailable: previous.unavailable,
+          stableChangedPositions: [],
+          local: { ...previous.local, inputs: child.result.rows }
+        }, { operator: 'local', strategy: 'selective', affectedUnitCount: 0 });
+      }
+    }
     const replacements = new Map<number, LocalSegment>();
     const issues: Issue[] = [];
     let unavailable = false;
@@ -1269,6 +1358,21 @@ export const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: M
   });
 };
 
+const changedRowPositionsIfStableIdentity = (
+  next: readonly ScopedRow[],
+  previous: readonly ScopedRow[]
+): readonly number[] | undefined => {
+  if (next.length !== previous.length) return undefined;
+  const changed: number[] = [];
+  for (let index = 0; index < next.length; index += 1) {
+    const row = next[index] as ScopedRow;
+    const prior = previous[index] as ScopedRow;
+    if (resultKey(row) !== resultKey(prior)) return undefined;
+    if (row !== prior) changed.push(index);
+  }
+  return changed;
+};
+
 const scopedRowIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => stringTupleKey(resultKey(row), rowValueIdentity(row, values));
 const rowValueIdentity = (row: ScopedRow, values: WeakMap<ScopedRow, string>): string => {
   const cached = values.get(row);
@@ -1290,22 +1394,32 @@ export const diffMaintainedResults = (
   const beforeRows = previousRoot?.result.rows ?? [];
   const afterRows = nextRoot.result.rows;
   if (previousRoot !== undefined && nextRoot.stableChangedPositions !== undefined && beforeRows.length === afterRows.length) {
-    const updatedResultKeys = nextRoot.stableChangedPositions.flatMap((index) => {
+    const updatedResultKeys: string[] = [];
+    for (const index of nextRoot.stableChangedPositions) {
       const before = beforeRows[index];
       const after = afterRows[index];
-      if (before === undefined || after === undefined) return [];
-      return before === after || rowValueIdentity(before, values) === rowValueIdentity(after, values) ? [] : [resultKey(after)];
-    });
+      if (before === undefined || after === undefined || before === after) continue;
+      if (rowValueIdentity(before, values) !== rowValueIdentity(after, values)) updatedResultKeys.push(resultKey(after));
+    }
     return updatedResultKeys.length === 0
       ? emptyIncrementalQueryResultDelta
       : { addedResultKeys: [], removedResultKeys: [], updatedResultKeys };
   }
-  if (beforeRows.length === afterRows.length && beforeRows.every((row, index) => resultKey(row) === resultKey(afterRows[index] as ScopedRow))) {
-    const updatedResultKeys = beforeRows.flatMap((row, index) => {
+  if (beforeRows.length === afterRows.length) {
+    const updatedResultKeys: string[] = [];
+    let identitiesStable = true;
+    for (let index = 0; index < beforeRows.length; index += 1) {
+      const row = beforeRows[index] as ScopedRow;
       const after = afterRows[index] as ScopedRow;
-      return row === after || rowValueIdentity(row, values) === rowValueIdentity(after, values) ? [] : [resultKey(row)];
-    });
-    return updatedResultKeys.length === 0 ? emptyIncrementalQueryResultDelta : { addedResultKeys: [], removedResultKeys: [], updatedResultKeys };
+      if (resultKey(row) !== resultKey(after)) {
+        identitiesStable = false;
+        break;
+      }
+      if (row !== after && rowValueIdentity(row, values) !== rowValueIdentity(after, values)) updatedResultKeys.push(resultKey(row));
+    }
+    if (identitiesStable) {
+      return updatedResultKeys.length === 0 ? emptyIncrementalQueryResultDelta : { addedResultKeys: [], removedResultKeys: [], updatedResultKeys };
+    }
   }
   const previousRows = resultIdentityMap(beforeRows, values);
   const nextRows = resultIdentityMap(afterRows, values);

@@ -3,9 +3,12 @@ import type {
   DatabaseQueryMaintenanceInput,
   QueryMaintenanceReuseDiagnostics
 } from './observer-maintenance-contracts.js';
+import {
+  adoptQueryOccurrenceIds,
+  sealOwnedQueryMaintenanceUpdate
+} from './internal-query-ownership.js';
 import { deepFreezeObserverValue } from './internal-observer-values.js';
-import { adoptQueryOccurrenceIds } from './internal-query-ownership.js';
-import { diffQueryMaintenanceSnapshots } from './query-maintenance-diff.js';
+import { diffQueryMaintenanceSnapshotValues } from './query-maintenance-diff.js';
 import type {
   FunctionRegistry,
   QueryNode,
@@ -76,14 +79,14 @@ export const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegi
     const previousMetadata = (previous as Partial<FramedQueryMaintenanceSnapshot>)[queryMaintenanceFrameIdentity];
     const nextMetadata = (next as Partial<FramedQueryMaintenanceSnapshot>)[queryMaintenanceFrameIdentity];
     if (previousMetadata === undefined || nextMetadata === undefined || previousMetadata.runtimeIdentity !== nextMetadata.runtimeIdentity) {
-      return { update: diffQueryMaintenanceSnapshots(previous, next), accept: () => undefined };
+      return { update: diffQueryMaintenanceSnapshotValues(previous, next), accept: () => undefined };
     }
     const { frameIdentity: previousFrame, runtimeIdentity } = previousMetadata;
     const { frameIdentity: nextFrame } = nextMetadata;
 
     // Parameters and capabilities remain cohort-local even though the captured
     // relation frame is shared. Validate them before consulting the frame cache.
-    diffQueryMaintenanceSnapshots({ ...previous, relations: [] }, { ...next, relations: [] });
+    diffQueryMaintenanceSnapshotValues({ ...previous, relations: [] }, { ...next, relations: [] });
     const prior = deltas.get(previousFrame)?.get(nextFrame);
     if (prior !== undefined) {
       const diagnostics = reuseDiagnostics.get(runtimeIdentity) ?? { computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 };
@@ -92,9 +95,12 @@ export const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegi
       return { update: prior, accept: () => undefined };
     }
 
-    // The diff contains source-owned nested values until this frame cache
-    // adopts and freezes it for reuse across parameter cohorts.
-    const update = deepFreezeObserverValue(diffQueryMaintenanceSnapshots(previous, next));
+    // Observer projections deliberately permit getter-backed values. Detach
+    // them once before publication; physical runtimes recognize the resulting
+    // frozen update and do not traverse it a second time.
+    const update = sealOwnedQueryMaintenanceUpdate(
+      deepFreezeObserverValue(diffQueryMaintenanceSnapshotValues(previous, next))
+    );
     const diagnostics = reuseDiagnostics.get(runtimeIdentity) ?? { computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 };
     diagnostics.computedFrameDeltaCount += 1;
     reuseDiagnostics.set(runtimeIdentity, diagnostics);

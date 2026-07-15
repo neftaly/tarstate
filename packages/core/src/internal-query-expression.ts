@@ -7,10 +7,10 @@ import {
   adoptJsonRecord,
   adoptJsonValue,
   cloneAndFreezeExpression,
-  freezePortableValue
+  isOwnedQueryLogicalContainer
 } from './internal-query-ownership.js';
 import { compareQueryJsonValues, compareQueryJsonValuesTotal, containsQueryLogicalUnknown } from './internal-query-values.js';
-import type { Expr, FunctionRegistry, PreparedExpression, QueryLogicalValue, QueryNode, QueryRecord, Completeness } from './query-model.js';
+import type { Expr, FunctionRegistry, PreparedExpression, QueryFunction, QueryLogicalValue, QueryNode, QueryRecord, Completeness } from './query-model.js';
 import {
   capabilityUnavailable,
   logicalAnd,
@@ -56,14 +56,36 @@ export type QueryExpressionContext = {
   readonly runtimeState?: unknown;
 };
 
+const knownTrue: QueryExpressionResult = Object.freeze({ status: 'known', value: true });
+const knownFalse: QueryExpressionResult = Object.freeze({ status: 'known', value: false });
+const knownNull: QueryExpressionResult = Object.freeze({ status: 'known', value: null });
+const knownObjects = new WeakMap<object, QueryExpressionResult>();
+const knownLiterals = new WeakMap<object, QueryExpressionResult>();
+
 const legacyCapabilityRefKey = (ref: CapabilityRef): string =>
   ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
 
-const queryFunction = (functions: FunctionRegistry, ref: CapabilityRef) =>
+const missingQueryFunction = Symbol('missing-query-function');
+const queryFunctions = new WeakMap<object, WeakMap<object, QueryFunction | typeof missingQueryFunction>>();
+
+const resolveQueryFunction = (functions: FunctionRegistry, ref: CapabilityRef): QueryFunction | undefined =>
   functions.get(capabilityRefKey(ref))
   ?? (ref.id.includes('\u0000') || ref.version.includes('\u0000') || ref.contractHash.includes('\u0000')
     ? undefined
     : functions.get(legacyCapabilityRefKey(ref)));
+
+const queryFunction = (functions: FunctionRegistry, ref: CapabilityRef): QueryFunction | undefined => {
+  let byReference = queryFunctions.get(functions as object);
+  if (byReference === undefined) {
+    byReference = new WeakMap<object, QueryFunction | typeof missingQueryFunction>();
+    queryFunctions.set(functions as object, byReference);
+  }
+  const cached = byReference.get(ref as object);
+  if (cached !== undefined) return cached === missingQueryFunction ? undefined : cached;
+  const resolved = resolveQueryFunction(functions, ref);
+  byReference.set(ref as object, resolved ?? missingQueryFunction);
+  return resolved;
+};
 
 const publicExpressionValue = (result: QueryExpressionResult): EvaluationValue => {
   if (result.status === 'known') return adoptJsonValue(result.value, 'Query expression result');
@@ -110,7 +132,13 @@ export const evaluatePreparedExpression = (
 
 export const evaluateQueryExpression = (expression: Expr, context: QueryExpressionContext): QueryExpressionResult => {
   if (context.runtime !== undefined && !context.runtime.consumeWork(context.runtimeState)) return { status: 'unavailable' };
-  if (expression.kind === 'literal') return knownExpression(expression.value);
+  if (expression.kind === 'literal') {
+    const cached = knownLiterals.get(expression);
+    if (cached !== undefined) return cached;
+    const result = knownExpression(expression.value);
+    knownLiterals.set(expression, result);
+    return result;
+  }
   if (expression.kind === 'parameter') return Object.hasOwn(context.parameters, expression.name) ? knownExpression(context.parameters[expression.name] as JsonValue) : { status: 'missing' };
   if (expression.kind === 'field') {
     const record = context.row.scope[expression.alias];
@@ -234,12 +262,21 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
       context.issues.push(createIssue({ code: 'query.capability_unavailable', retry: 'after_capability', requiredCapabilities: [expression.capability] }));
       return { status: 'unavailable' };
     }
-    const args = expression.args.map((argument) => evaluateQueryExpression(argument, context));
-    if (args.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    if (args.some((value) => value.status !== 'known')) return { status: 'unknown' };
+    const args: JsonValue[] = [];
+    for (const argument of expression.args) {
+      const value = evaluateQueryExpression(argument, context);
+      if (value.status === 'unavailable') return { status: 'unavailable' };
+      if (value.status !== 'known') return { status: 'unknown' };
+      args.push(value.value);
+    }
     try {
-      const ownedArgs = Object.freeze(args.map((value) => freezePortableValue((value as { readonly status: 'known'; readonly value: JsonValue }).value)));
-      const returned = fn(ownedArgs);
+      const returned = fn(Object.freeze(args));
+      if (returned === null || typeof returned === 'string' || typeof returned === 'boolean') return knownExpression(returned);
+      if (typeof returned === 'number') {
+        if (!Number.isFinite(returned)) throw new TypeError('Query function returned a non-portable number');
+        return knownExpression(returned);
+      }
+      if (isOwnedQueryLogicalContainer(returned)) return knownExpression(returned);
       const parsed = detachAndFreezeJsonValue(returned);
       if (!parsed.success) throw new TypeError('Query function returned a non-portable value: ' + parsed.issues.map(({ code }) => code).join(', '));
       return knownExpression(parsed.value);
@@ -251,7 +288,17 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
   return assertNever(expression);
 };
 
-export const knownExpression = (value: JsonValue): QueryExpressionResult => ({ status: 'known', value });
+export const knownExpression = (value: JsonValue): QueryExpressionResult => {
+  if (value === true) return knownTrue;
+  if (value === false) return knownFalse;
+  if (value === null) return knownNull;
+  if (typeof value !== 'object' || !Object.isFrozen(value)) return { status: 'known', value };
+  const cached = knownObjects.get(value);
+  if (cached !== undefined) return cached;
+  const result: QueryExpressionResult = { status: 'known', value };
+  knownObjects.set(value, result);
+  return result;
+};
 
 const propagateExpression = (...values: readonly QueryExpressionResult[]): QueryExpressionResult | undefined =>
   values.some((value) => value.status === 'unavailable') ? { status: 'unavailable' }

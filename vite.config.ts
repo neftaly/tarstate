@@ -8,7 +8,7 @@ type PackageConfig = { readonly build: NonNullable<UserConfig['build']> };
 
 const packageEntryPath = (entryName: string): string => 'src/' + entryName + '.ts';
 const coreBuildEntries = Object.fromEntries([
-  ['index', packageEntryPath('index')],
+  ['index', packageEntryPath('root')],
   ...coreInternalEntryNames.map((entryName) => [entryName, packageEntryPath(entryName)]),
   ...corePublicEntryNames.map((entryName) => [entryName + '/index', 'src/' + entryName + '/index.ts'])
 ]);

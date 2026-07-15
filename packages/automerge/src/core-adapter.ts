@@ -31,6 +31,7 @@ import {
   automergeBasis,
   type AutomergeSourceRuntimeApi,
   type AutomergeBasis,
+  type AutomergeSnapshot,
   type AutomergeSourceCommand,
   type AutomergeSourceCommitResult
 } from './source.js';
@@ -48,6 +49,7 @@ import {
 } from './storage-binding.js';
 import {
   automergePathFootprint,
+  findAutomergeFootprintOverlap,
   relateAutomergeFootprints,
   type AutomergePathFootprint
 } from './footprint.js';
@@ -171,25 +173,25 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   relateFootprints = relateAutomergeFootprints;
 
   mergeIntents = (plans: readonly PlanResult<AutomergeSourceCommand<T>>[]): IntentMergeResult<AutomergeSourceCommand<T>> => {
-    const intents = plans.flatMap(({ intents }) => intents).sort((left, right) => comparePortableStrings(canonicalizeJson(left.footprint), canonicalizeJson(right.footprint)));
-    for (let leftIndex = 0; leftIndex < intents.length; leftIndex += 1) {
-      for (let rightIndex = leftIndex + 1; rightIndex < intents.length; rightIndex += 1) {
-        const left = intents[leftIndex]!;
-        const right = intents[rightIndex]!;
-        const relation = this.relateFootprints(left.footprint, right.footprint);
-        if (relation === 'unknown') {
-          return {
-            outcome: 'unknown',
-            issues: [adapterIssue('binding.footprint_relation_unknown', 'plan', this.sourceId, undefined, undefined, { left: left.footprint, right: right.footprint })]
-          };
-        }
-        if (relation !== 'disjoint') {
-          return {
-            outcome: 'conflict',
-            issues: [adapterIssue('binding.write_footprint_overlap', 'plan', this.sourceId, undefined, undefined, { relation, left: left.footprint, right: right.footprint })]
-          };
-        }
-      }
+    const intents = plans.flatMap(({ intents }) => intents)
+      .map((intent) => ({ intent, sortKey: canonicalizeJson(intent.footprint) }))
+      .sort((left, right) => comparePortableStrings(left.sortKey, right.sortKey))
+      .map(({ intent }) => intent);
+    const overlap = findAutomergeFootprintOverlap(intents.map(({ footprint }) => footprint));
+    if (overlap.status === 'unknown') {
+      return {
+        outcome: 'unknown',
+        issues: [adapterIssue('binding.footprint_relation_unknown', 'plan', this.sourceId, undefined, undefined, { footprint: intents[overlap.footprintIndex]?.footprint })]
+      };
+    }
+    if (overlap.status === 'overlap') {
+      const left = intents[overlap.leftIndex]!;
+      const right = intents[overlap.rightIndex]!;
+      const relation = this.relateFootprints(left.footprint, right.footprint);
+      return {
+        outcome: 'conflict',
+        issues: [adapterIssue('binding.write_footprint_overlap', 'plan', this.sourceId, undefined, undefined, { relation, left: left.footprint, right: right.footprint })]
+      };
     }
     return { outcome: 'merged', commands: intents.map(({ command }) => command) };
   };
@@ -276,6 +278,7 @@ export type AutomergeMapStorageBindingOptions<Row extends Readonly<Record<string
 export class AutomergeMapStorageBinding<T extends object, Row extends Readonly<Record<string, JsonValue>>>
 implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, AutomergeProjectedRow<Row>> {
   readonly id: string;
+  readonly relationIds: readonly string[];
   readonly declaredReadFootprint: AutomergePathFootprint;
   readonly declaredWriteFootprint: AutomergePathFootprint;
   readonly #relationId: string;
@@ -283,11 +286,16 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly #keySource: AutomergeMapStorageBindingOptions<Row>['keySource'];
   readonly #projectionPlanner: AutomergeMapProjectionPlanner<T, Row>;
   readonly #projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeProjectedRow<Row>>>>();
+  #previousProjection: {
+    readonly snapshot: Pick<AutomergeSnapshot<T>, 'sourceId' | 'basis'>;
+    readonly projection: ReturnType<AutomergeMapProjectionPlanner<T, Row>['project']>;
+  } | undefined;
 
   constructor(options: AutomergeMapStorageBindingOptions<Row>) {
     const owned = adoptAutomergeMapStorageBindingOptions<Row>(options);
     this.id = owned.id ?? 'automerge-map:' + owned.relationId;
     this.#relationId = owned.relationId;
+    this.relationIds = Object.freeze([owned.relationId]);
     this.#collectionPath = owned.collectionPath;
     this.#keySource = owned.keySource;
     this.declaredReadFootprint = automergePathFootprint([{ scope: 'subtree', path: this.#collectionPath }]);
@@ -295,18 +303,23 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     this.#projectionPlanner = new AutomergeMapProjectionPlanner(owned);
   }
 
-  project = (snapshot: SourceSnapshot<Automerge.Doc<T>>): ProjectionResult<AutomergeProjectedRow<Row>> => {
+  project = (snapshot: SourceSnapshot<Automerge.Doc<T>>, requestedRelations?: ReadonlySet<string>): ProjectionResult<AutomergeProjectedRow<Row>> => {
+    if (requestedRelations !== undefined && !requestedRelations.has(this.#relationId)) {
+      return sealStorageProjection(Object.freeze({ rows: Object.freeze([]), completeness: 'exact', issues: Object.freeze([]) }));
+    }
     const adapted = readyAutomergeSnapshot(snapshot);
     if (adapted === undefined) return { rows: [], completeness: 'unknown', issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
     const cached = this.#projections.get(adapted.storage)?.get(snapshot.sourceId);
     if (cached !== undefined) return cached;
-    const projection = this.#projectionPlanner.project(adapted);
+    const projection = this.#projectionPlanner.project(adapted, this.#previousProjection);
+    this.#previousProjection = { snapshot: { sourceId: adapted.sourceId, basis: adapted.basis }, projection };
     const result = sealStorageProjection(Object.freeze({
-      rows: Object.freeze([...projection.rows]),
+      rows: projection.rows,
       completeness: projection.completeness,
       issues: Object.freeze(projection.issues.map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'query')))
     }));
     const bySource = this.#projections.get(adapted.storage) ?? new Map<string, ProjectionResult<AutomergeProjectedRow<Row>>>();
+    if (!bySource.has(snapshot.sourceId) && bySource.size >= 64) bySource.delete(bySource.keys().next().value as string);
     bySource.set(snapshot.sourceId, result);
     this.#projections.set(adapted.storage, bySource);
     return result;

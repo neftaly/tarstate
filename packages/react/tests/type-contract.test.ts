@@ -1,20 +1,22 @@
 import {
   customScalar,
-  pipe,
-  prepareTypedQuery,
   relationDeclaration,
   relationLiteral,
   referenceTo,
-  sealSchema,
+  sealSchema
+} from '@tarstate/core/schema';
+import type { TaggedValue } from '@tarstate/core/foundation';
+import {
+  pipe,
+  prepareTypedQuery,
   typedCompare,
   typedFrom,
   typedParameter,
   typedPreparedPlan,
-  typedWhere,
-  type CommitReceipt,
-  type QueryNode,
-  type TaggedValue
-} from '@tarstate/core';
+  typedWhere
+} from '@tarstate/core/query/authoring';
+import type { QueryNode } from '@tarstate/core/query/model';
+import type { CommitReceipt } from '@tarstate/core/transactions';
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import { useDatabase, useMutationState, useQuery, useRow, type MutationEntry, type ReactPreparedPlan } from '../src/index.js';
 

@@ -58,6 +58,7 @@ assignArchitectureGroup('foundation', [
   'capability-model.ts',
   'internal-canonical-json.ts',
   'internal-json-equality.ts',
+  'internal-numeric-boundary.ts',
   'internal-owned-json.ts',
   'internal-owned-map.ts',
   'observer-diagnostics.ts',
@@ -158,6 +159,7 @@ assignArchitectureGroup('composition', [
   'golden-workloads.ts',
   'index.ts',
   'query.ts',
+  'root.ts',
   'semantic-artifact-parsers.ts',
   'type-authoring.ts'
 ]);

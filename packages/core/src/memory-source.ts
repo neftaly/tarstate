@@ -1,8 +1,11 @@
-import { sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
+import { canonicalizeJson, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';
 import { builtInCapabilityRefs } from './builtins.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { canonicalizeJsonWithCache } from './internal-canonical-json.js';
+import { samePortableJson } from './internal-json-equality.js';
+import { positiveSafeInteger } from './internal-numeric-boundary.js';
 import { stringTupleKey } from './internal-string-key.js';
 import type { SourceBasis } from './source-state.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
@@ -113,6 +116,8 @@ export class InMemoryAtomicSource {
   readonly #listeners = new Set<() => void>();
   readonly #ledger = new Map<string, LedgerEntry>();
   readonly #retiredEpochs = new Set<string>();
+  readonly #maxOperationReceipts: number;
+  readonly #maxRetiredOperationEpochs: number;
   #activeEpoch: string;
   #state: MemoryState;
   #revision = 0;
@@ -131,6 +136,8 @@ export class InMemoryAtomicSource {
     readonly satisfiesCapability?: (capability: CapabilityRef) => boolean;
     /** Receives listener failures isolated after a committed state transition. */
     readonly onDiagnostic?: ObserverDiagnosticReporter;
+    readonly maxOperationReceipts?: number;
+    readonly maxRetiredOperationEpochs?: number;
   }) {
     this.sourceId = options.sourceId;
     this.incarnation = options.incarnation;
@@ -145,6 +152,8 @@ export class InMemoryAtomicSource {
     this.#evaluateQuery = options.evaluateQuery;
     this.#satisfiesCapability = options.satisfiesCapability ?? (() => true);
     this.#onDiagnostic = options.onDiagnostic;
+    this.#maxOperationReceipts = positiveSafeInteger(options.maxOperationReceipts ?? 65_536, 'Memory source maxOperationReceipts');
+    this.#maxRetiredOperationEpochs = positiveSafeInteger(options.maxRetiredOperationEpochs ?? 4_096, 'Memory source maxRetiredOperationEpochs');
   }
 
   snapshot(): { readonly basis: MemoryBasis; readonly state: MemoryState } {
@@ -209,9 +218,9 @@ export class InMemoryAtomicSource {
   rotateOperationEpoch(nextEpoch: string): Promise<void> {
     const run = this.#queue.then(() => {
       if (nextEpoch.length === 0 || nextEpoch === this.#activeEpoch || this.#retiredEpochs.has(nextEpoch)) throw new Error('Operation epoch must be new and non-empty');
+      if (this.#retiredEpochs.size >= this.#maxRetiredOperationEpochs) throw new RangeError('Memory source retired operation-epoch capacity exhausted; replace the source');
       this.#retiredEpochs.add(this.#activeEpoch);
-      const retiredPrefix = stringTupleKey(this.#activeEpoch);
-      for (const key of this.#ledger.keys()) if (key.startsWith(retiredPrefix)) this.#ledger.delete(key);
+      this.#ledger.clear();
       this.#activeEpoch = nextEpoch;
     });
     this.#queue = run.then(() => undefined, () => undefined);
@@ -267,6 +276,12 @@ export class InMemoryAtomicSource {
       if (existing.intentHash !== prepared.intentHash) return this.#reject(prepared, [], [txIssue('transaction.operation_id_ambiguous', 'commit', undefined, attempt, 'never')]);
       if (existing.receipt === undefined) return this.#reject(prepared, [], [txIssue('transaction.outcome_unavailable', 'commit', undefined, attempt, 'query_outcome')]);
       return existing.receipt;
+    }
+    if (this.#ledger.size >= this.#maxOperationReceipts) {
+      return this.#reject(prepared, [], [txIssue('operation.ledger_capacity_exhausted', 'commit', {
+        capacity: this.#maxOperationReceipts,
+        action: 'rotate_operation_epoch'
+      }, attempt, 'never')]);
     }
     // Reserve the identity before any evaluation that can lead to mutation or
     // a handed-off rejection. The reservation is correctness state.
@@ -1019,8 +1034,11 @@ const ownCommitReceipt = (input: CommitReceipt): CommitReceipt => {
   return parsed.value as unknown as CommitReceipt;
 };
 
-const canonical = (value: JsonValue): string => JSON.stringify(value, (_key, candidate: unknown) => isRecord(candidate) ? Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => comparePortableStrings(left, right))) : candidate);
-const sameJson = (left: JsonValue | MemoryState, right: JsonValue | MemoryState): boolean => canonical(left as JsonValue) === canonical(right as JsonValue);
+const canonicalValues = new WeakMap<object, string>();
+const canonical = (value: JsonValue): string => value !== null && typeof value === 'object' && Object.isFrozen(value)
+  ? canonicalizeJsonWithCache(value, canonicalValues)
+  : canonicalizeJson(value);
+const sameJson = (left: JsonValue | MemoryState, right: JsonValue | MemoryState): boolean => samePortableJson(left as JsonValue, right as JsonValue);
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const rowKey = (row: MemoryRow, fields: readonly string[]): string => canonical(fields.map((field) => Object.hasOwn(row, field) ? row[field] as JsonValue : { missing: field }));
 const hasFields = (row: MemoryRow, fields: readonly string[]): boolean => fields.every((field) => Object.hasOwn(row, field));

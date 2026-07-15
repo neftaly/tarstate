@@ -3,11 +3,11 @@ import { performance } from 'node:perf_hooks';
 import {
   AttachmentCatalog,
   DatabaseView,
-  DatasetMembership,
-  createIncrementalDatabaseQueryMaintenance,
-  prepareManualReadOnlyAttachment,
-  prepareQuery
-} from '../packages/core/dist/index.js';
+  DatasetMembership
+} from '../packages/core/dist/database/index.js';
+import { createIncrementalDatabaseQueryMaintenance } from '../packages/core/dist/database/incremental/index.js';
+import { prepareManualReadOnlyAttachment } from '../packages/core/dist/attachment/prepare/index.js';
+import { prepareQuery } from '../packages/core/dist/query/index.js';
 
 const schemaView = { id: 'urn:tarstate:observer-benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
 const relation = { schemaView, relationId: 'benchmark.rows' };
@@ -170,15 +170,32 @@ const { profile } = await post(allocationSession, 'HeapProfiler.stopSampling');
 allocationSession.disconnect();
 const sampledBytes = profile.samples.reduce((sum, sample) => sum + sample.size, 0);
 const nodesById = new Map();
-const visitProfile = (node) => { nodesById.set(node.id, node); for (const child of node.children ?? []) visitProfile(child); };
+const parentById = new Map();
+const visitProfile = (node, parent) => {
+  nodesById.set(node.id, node);
+  if (parent !== undefined) parentById.set(node.id, parent.id);
+  for (const child of node.children ?? []) visitProfile(child, node);
+};
 visitProfile(profile.head);
 const allocationByFrame = new Map();
+const allocationStackByFrame = new Map();
 for (const sample of profile.samples) {
   const frame = nodesById.get(sample.nodeId)?.callFrame;
   const key = frame === undefined ? 'unknown' : `${frame.functionName || '(anonymous)'} ${frame.url}:${frame.lineNumber + 1}`;
   allocationByFrame.set(key, (allocationByFrame.get(key) ?? 0) + sample.size);
+  if (!allocationStackByFrame.has(key)) {
+    const stack = [];
+    for (let nodeId = sample.nodeId; nodeId !== undefined && stack.length < 5; nodeId = parentById.get(nodeId)) {
+      const call = nodesById.get(nodeId)?.callFrame;
+      if (call !== undefined) stack.push(`${call.functionName || '(anonymous)'} ${call.url}:${call.lineNumber + 1}`);
+    }
+    allocationStackByFrame.set(key, stack);
+  }
 }
-const allocationHotspots = [...allocationByFrame].sort(([, left], [, right]) => right - left).slice(0, 8).map(([frame, bytes]) => ({ frame, bytes }));
+const allocationHotspots = [...allocationByFrame]
+  .sort(([, left], [, right]) => right - left)
+  .slice(0, 8)
+  .map(([frame, bytes]) => ({ frame, bytes, stack: allocationStackByFrame.get(frame) }));
 allocationRuntime.close();
 
 const measurements = [await measure(1_000, 100), await measure(10_000, 20)];
@@ -194,7 +211,7 @@ const contracts = {
 const failures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);
 process.stdout.write(JSON.stringify({
   benchmark: 'tarstate-observer-publication',
-  note: 'Synchronous end-to-end source publication through capture, maintenance, immutable observer snapshot, exact diff, and listener notification.',
+  note: 'Synchronous end-to-end source publication. Thresholds catch regressions; passing them is not evidence that the implementation is close to optimal.',
   contracts,
   measurements,
   allocationSample: { inputRows: 1_000, updates: 100, sampledBytes, sampledBytesPerUpdate, hotspots: allocationHotspots },

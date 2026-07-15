@@ -25,7 +25,7 @@ import {
 import { canonicalizeQueryValue, compareQueryJsonValuesTotal } from './internal-query-values.js';
 import type { AggregateExpr, QueryLogicalValue, QueryNode, QueryRecord } from './query-model.js';
 import type { QueryMaintenanceFallbackReason } from './query-incremental-model.js';
-import { logicalUnknown } from './value.js';
+import { logicalUnknown, type JsonValue } from './value.js';
 
 export const incrementallyMaterializeAggregateWith = (
   node: Extract<QueryNode, { readonly kind: 'aggregate' }>,
@@ -151,15 +151,16 @@ const updateExtremeReducer = (
     overlays = [];
     if (context !== undefined) context.state.aggregateCompactionCount += 1;
   }
-  let extremeKey = state.index.extremeKey;
-  if (delta === 1) {
-    const selected = extremeKey === undefined ? undefined : extremeIndexEntry({ base, overlays, extremeKey }, extremeKey);
-    const candidate = changedEntry as ExtremeValueEntry;
-    if (selected === undefined || compareExtremeEntries(aggregate.op, candidate, selected) < 0) extremeKey = key;
-  } else if (after === 0 && extremeKey === key) {
-    extremeKey = selectExtremeKey(aggregate.op, base, overlays);
-  }
-  return { kind: 'extreme', index: { base, overlays, ...(extremeKey === undefined ? {} : { extremeKey }) } };
+  const liveIndex: ExtremeValueIndex = { base, overlays, orderedKeys: state.index.orderedKeys };
+  const orderedKeys = after === 0
+    ? state.index.orderedKeys.filter((candidate) => candidate !== key)
+    : existing === undefined
+      ? insertOrderedExtremeKey(state.index.orderedKeys, key, contribution.value, liveIndex)
+      : state.index.orderedKeys;
+  const extremeKey = aggregate.op === 'minimum'
+    ? orderedKeys[0]
+    : orderedKeys[orderedKeys.length - 1];
+  return { kind: 'extreme', index: { base, overlays, orderedKeys, ...(extremeKey === undefined ? {} : { extremeKey }) } };
 };
 
 const extremeIndexEntry = (index: ExtremeValueIndex, key: string): ExtremeValueEntry | undefined => {
@@ -170,26 +171,23 @@ const extremeIndexEntry = (index: ExtremeValueIndex, key: string): ExtremeValueE
   return index.base.get(key);
 };
 
-const liveExtremeEntries = (base: ReadonlyMap<string, ExtremeValueEntry>, overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[]): ReadonlyMap<string, ExtremeValueEntry> => {
-  const live = new Map(base);
-  for (const overlay of overlays) for (const [key, entry] of overlay) {
-    if (entry === undefined) live.delete(key);
-    else live.set(key, entry);
+const insertOrderedExtremeKey = (
+  orderedKeys: readonly string[],
+  key: string,
+  value: JsonValue,
+  index: ExtremeValueIndex
+): readonly string[] => {
+  let low = 0;
+  let high = orderedKeys.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const existing = extremeIndexEntry(index, orderedKeys[middle] as string);
+    if (existing === undefined || compareQueryJsonValuesTotal(existing.value, value) > 0) high = middle;
+    else low = middle + 1;
   }
-  return live;
-};
-
-const compareExtremeEntries = (op: AggregateExpr['op'], left: ExtremeValueEntry, right: ExtremeValueEntry): number => {
-  const comparison = compareQueryJsonValuesTotal(left.value, right.value);
-  return op === 'minimum' ? comparison : -comparison;
-};
-
-const selectExtremeKey = (op: AggregateExpr['op'], base: ReadonlyMap<string, ExtremeValueEntry>, overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[]): string | undefined => {
-  let selected: readonly [string, ExtremeValueEntry] | undefined;
-  for (const entry of liveExtremeEntries(base, overlays)) {
-    if (selected === undefined || compareExtremeEntries(op, entry[1], selected[1]) < 0) selected = entry;
-  }
-  return selected?.[0];
+  const output = orderedKeys.slice();
+  output.splice(low, 0, key);
+  return output;
 };
 
 const distinctIndexCount = (index: DistinctCountIndex, key: string): number => {
@@ -234,18 +232,17 @@ const buildAggregateReducers = (node: Extract<QueryNode, { readonly kind: 'aggre
     }
     if (aggregate.op === 'minimum' || aggregate.op === 'maximum') {
       const base = new Map<string, ExtremeValueEntry>();
-      let extremeKey: string | undefined;
       for (const { row } of members) {
         const contribution = aggregateContribution(aggregate, row, context);
         if (contribution.status !== 'known') continue;
         const key = canonicalizeJson(contribution.value);
         const existing = base.get(key);
         base.set(key, { count: (existing?.count ?? 0) + 1, value: existing?.value ?? contribution.value });
-        const selected = extremeKey === undefined ? undefined : base.get(extremeKey);
-        const candidate = base.get(key) as ExtremeValueEntry;
-        if (selected === undefined || compareExtremeEntries(aggregate.op, candidate, selected) < 0) extremeKey = key;
       }
-      reducers.set(name, { kind: 'extreme', index: { base, overlays: [], ...(extremeKey === undefined ? {} : { extremeKey }) } });
+      const orderedKeys = [...base.keys()].sort((left, right) =>
+        compareQueryJsonValuesTotal((base.get(left) as ExtremeValueEntry).value, (base.get(right) as ExtremeValueEntry).value));
+      const extremeKey = aggregate.op === 'minimum' ? orderedKeys[0] : orderedKeys[orderedKeys.length - 1];
+      reducers.set(name, { kind: 'extreme', index: { base, overlays: [], orderedKeys, ...(extremeKey === undefined ? {} : { extremeKey }) } });
       continue;
     }
     let trueCount = 0;

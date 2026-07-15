@@ -133,7 +133,7 @@ export const prepareWritableExecutionContext = <Storage, Command>(
   const prepared = Object.freeze({
     ...input,
     operationLedger,
-    bindings: Object.freeze([...input.bindings]),
+    bindings: Object.freeze([...input.bindings].sort((left, right) => comparePortableStrings(left.id, right.id))),
     relationKeys,
     ...(input.constraints === undefined ? {} : { constraints: Object.freeze([...input.constraints]) }),
     [preparedWritableContextBrand]: true as const
@@ -456,13 +456,14 @@ const evaluatePreparedExecution = <Storage, Command>(
   }
   const initialProjection = earlyIssues.length === 0
     ? projectLogicalState(context.bindings, beforeSnapshot)
-    : { state: emptyLogicalState, issues: earlyIssues };
+    : emptyLogicalProjection(earlyIssues);
   if (initialProjection.issues.some(isError)) {
     return rejectedEvaluation(beforeSnapshot, beforeBasis, initialProjection.state, initialProjection.issues);
   }
   let stagedSnapshot = beforeSnapshot;
   let stagedBasis = beforeBasis;
   let logicalState = initialProjection.state;
+  let logicalProjection = initialProjection;
   const beforeState = logicalState;
   const commands: Command[] = [];
   const statementResults: StatementResult[] = [];
@@ -475,6 +476,7 @@ const evaluatePreparedExecution = <Storage, Command>(
     issues.push(...evaluated.result.issues);
     if (evaluated.result.issues.some(isError)) break;
     let statementRejected = false;
+    const affectedRelations = new Set<string>();
     for (const editGroup of evaluated.editGroups) {
       if (editGroup.length === 0) continue;
       const staged = stageSourceEdits({
@@ -496,14 +498,16 @@ const evaluatePreparedExecution = <Storage, Command>(
       }
       stagedBasis = derivedBasis.basis;
       stagedSnapshot = { ...staged.snapshot, basis: stagedBasis };
+      for (const edit of editGroup) affectedRelations.add(edit.relationId);
       commands.push(...staged.commands);
       issues.push(...staged.issues);
     }
     if (statementRejected) break;
-    const projected = projectLogicalState(context.bindings, stagedSnapshot);
+    const projected = projectLogicalState(context.bindings, stagedSnapshot, logicalProjection, affectedRelations);
     issues.push(...projected.issues);
     if (projected.issues.some(isError)) break;
     logicalState = projected.state;
+    logicalProjection = projected;
     statementResults[statementIndex] = reconcileStatementResult(
       statement,
       statementStart,
@@ -564,10 +568,14 @@ const reconcileStatementResult = (
   );
   if (!selected.success) return result;
   let logicallyChanged = 0;
+  const projectedByLocator = new Map<string, WritableLogicalRow>();
+  for (const candidate of after.rows) {
+    if (candidate.relationId !== relationId) continue;
+    const locator = canonicalizeJson(candidate.locator);
+    if (!projectedByLocator.has(locator)) projectedByLocator.set(locator, candidate);
+  }
   for (const row of selected.value) {
-    const projected = after.rows.find((candidate) =>
-      candidate.relationId === relationId && samePortableJson(candidate.locator, row.locator)
-    );
+    const projected = projectedByLocator.get(canonicalizeJson(row.locator));
     if (projected === undefined || !samePortableJson(projected.fields, row.fields)) logicallyChanged += 1;
   }
   return logicallyChanged === result.logicallyChanged ? result : { ...result, logicallyChanged };
@@ -758,37 +766,46 @@ const evaluateUpsert = (
   rows: readonly WritableLogicalRow[],
   candidates: readonly Readonly<Record<string, JsonValue>>[]
 ): EvaluatedStatement => {
-  const keyed = candidates.map((fields) => ({ fields, key: logicalKey(fields, keyFields) }));
-  if (keyed.some(({ key }) => key === undefined)) return failedStatement(empty, transactionIssue('transaction.upsert_key_missing', undefined, { relationId, keyFields }));
-  const fingerprints = keyed.map(({ key }) => canonicalizeJson(key as JsonValue));
-  if (new Set(fingerprints).size !== fingerprints.length) return failedStatement(empty, transactionIssue('transaction.upsert_input_ambiguous', undefined, { relationId }));
+  const keyed: { readonly fields: Readonly<Record<string, JsonValue>>; readonly key: JsonValue; readonly fingerprint: string }[] = [];
+  const candidateKeys = new Set<string>();
+  for (const fields of candidates) {
+    const key = logicalKey(fields, keyFields);
+    if (key === undefined) return failedStatement(empty, transactionIssue('transaction.upsert_key_missing', undefined, { relationId, keyFields }));
+    const fingerprint = canonicalizeJson(key);
+    if (candidateKeys.has(fingerprint)) return failedStatement(empty, transactionIssue('transaction.upsert_input_ambiguous', undefined, { relationId }));
+    candidateKeys.add(fingerprint);
+    keyed.push({ fields, key, fingerprint });
+  }
   const existing = new Map<string, WritableLogicalRow[]>();
   for (const row of rows) {
-    const group = existing.get(canonicalizeJson(row.key)) ?? [];
+    const fingerprint = canonicalizeJson(row.key);
+    const group = existing.get(fingerprint) ?? [];
     group.push(row);
-    existing.set(canonicalizeJson(row.key), group);
+    existing.set(fingerprint, group);
   }
-  const conflicts = fingerprints.filter((fingerprint) => (existing.get(fingerprint)?.length ?? 0) > 0);
-  if (conflicts.some((fingerprint) => (existing.get(fingerprint)?.length ?? 0) > 1)) {
-    return failedStatement(empty, transactionIssue('transaction.upsert_target_ambiguous', undefined, { relationId }));
+  let conflicts = 0;
+  for (const { fingerprint } of keyed) {
+    const matches = existing.get(fingerprint)?.length ?? 0;
+    if (matches > 1) return failedStatement(empty, transactionIssue('transaction.upsert_target_ambiguous', undefined, { relationId }));
+    if (matches === 1) conflicts += 1;
   }
-  if (statement.onConflict === 'reject' && conflicts.length > 0) {
-    return failedStatement({ ...empty, matched: conflicts.length }, transactionIssue('transaction.upsert_conflict', undefined, { relationId, conflicts: conflicts.length }));
+  if (statement.onConflict === 'reject' && conflicts > 0) {
+    return failedStatement({ ...empty, matched: conflicts }, transactionIssue('transaction.upsert_conflict', undefined, { relationId, conflicts }));
   }
   const edits: LogicalEdit[] = [];
   let inserted = 0;
   let changed = 0;
-  keyed.forEach(({ fields, key }, index) => {
-    const match = existing.get(fingerprints[index] as string)?.[0];
+  for (const { fields, key, fingerprint } of keyed) {
+    const match = existing.get(fingerprint)?.[0];
     if (match === undefined) {
-      edits.push({ kind: 'insert', relationId, key: key as JsonValue, fields });
+      edits.push({ kind: 'insert', relationId, key, fields });
       inserted += 1;
     } else if (statement.onConflict === 'replace' && !samePortableJson(match.fields, fields)) {
       edits.push({ kind: 'replace-row', relationId, key: match.key, locator: match.locator, fields });
       changed += 1;
     }
-  });
-  return { editGroups: [edits], result: { ...empty, matched: conflicts.length, inserted, logicallyChanged: inserted + changed } };
+  }
+  return { editGroups: [edits], result: { ...empty, matched: conflicts, inserted, logicallyChanged: inserted + changed } };
 };
 
 const evaluateRowEdits = (
@@ -851,38 +868,102 @@ const evaluateRowEdits = (
   return { success: true, edits: logicalEdits, outcomes, changed };
 };
 
+type LogicalBindingProjection = {
+  readonly rows: readonly WritableLogicalRow[];
+  readonly issues: readonly Issue[];
+};
+
+type LogicalProjection = {
+  readonly byBinding: ReadonlyMap<string, LogicalBindingProjection>;
+  readonly state: WritableLogicalState;
+  readonly issues: readonly Issue[];
+};
+
+const emptyLogicalProjection = (issues: readonly Issue[]): LogicalProjection => ({
+  byBinding: new Map(),
+  state: emptyLogicalState,
+  issues
+});
+
 const projectLogicalState = <Storage, Command>(
   bindings: readonly StorageBinding<Storage, Command>[],
-  snapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>
-): { readonly state: WritableLogicalState; readonly issues: readonly Issue[] } => {
-  const rows: WritableLogicalRow[] = [];
-  const issues: Issue[] = [];
-  for (const binding of [...bindings].sort((left, right) => comparePortableStrings(left.id, right.id))) {
+  snapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>,
+  previous?: LogicalProjection,
+  affectedRelations?: ReadonlySet<string>
+): LogicalProjection => {
+  const byBinding = new Map(previous?.byBinding ?? []);
+  for (const binding of bindings) {
+    const selectedRelations = affectedRelations === undefined
+      ? undefined
+      : binding.relationIds === undefined
+        ? undefined
+        : new Set(binding.relationIds.filter((relationId) => affectedRelations.has(relationId)));
+    if (affectedRelations !== undefined && selectedRelations !== undefined && selectedRelations.size === 0) continue;
+    const prior = byBinding.get(binding.id);
+    const mustProjectFully = selectedRelations === undefined || prior === undefined || prior.issues.length > 0;
     let projection: ReturnType<typeof binding.project>;
     try {
-      projection = binding.project(snapshot);
+      projection = binding.project(snapshot, mustProjectFully ? undefined : selectedRelations);
     } catch (error) {
-      issues.push(createIssue({ code: 'observer.projection_unavailable', sourceId: snapshot.sourceId, details: { bindingId: binding.id, error: errorName(error) } }));
+      byBinding.set(binding.id, {
+        rows: prior?.rows ?? [],
+        issues: [createIssue({ code: 'observer.projection_unavailable', sourceId: snapshot.sourceId, details: { bindingId: binding.id, error: errorName(error) } })]
+      });
       continue;
     }
+    byBinding.set(binding.id, mergeLogicalBindingProjection({
+      bindingId: binding.id,
+      sourceId: snapshot.sourceId,
+      projection,
+      prior,
+      selectedRelations: mustProjectFully ? undefined : selectedRelations
+    }));
+  }
+  const rows: WritableLogicalRow[] = [];
+  const issues: Issue[] = [];
+  for (const binding of bindings) {
+    const projection = byBinding.get(binding.id);
+    if (projection === undefined) continue;
+    rows.push(...projection.rows);
     issues.push(...projection.issues);
-    if (projection.completeness !== 'exact') {
-      issues.push(createIssue({ code: 'observer.projection_unavailable', sourceId: snapshot.sourceId, details: { bindingId: binding.id, completeness: projection.completeness } }));
-      continue;
-    }
-    if (isSealedStorageProjection(projection)) {
-      rows.push(...projection.rows as readonly WritableLogicalRow[]);
-      continue;
-    }
-    for (const candidate of projection.rows) {
+  }
+  return {
+    byBinding,
+    state: Object.freeze({ rows: Object.freeze(rows) }),
+    issues: Object.freeze(issues)
+  };
+};
+
+/** Pure adoption and partial-refresh merge after the binding callback returns. */
+const mergeLogicalBindingProjection = (input: {
+  readonly bindingId: string;
+  readonly sourceId: string;
+  readonly projection: ReturnType<StorageBinding<unknown, unknown>['project']>;
+  readonly prior: LogicalBindingProjection | undefined;
+  readonly selectedRelations: ReadonlySet<string> | undefined;
+}): LogicalBindingProjection => {
+  const issues: Issue[] = [...input.projection.issues];
+  const projectedRows: WritableLogicalRow[] = [];
+  if (input.projection.completeness !== 'exact') {
+    issues.push(createIssue({ code: 'observer.projection_unavailable', sourceId: input.sourceId, details: { bindingId: input.bindingId, completeness: input.projection.completeness } }));
+  } else if (isSealedStorageProjection(input.projection)) {
+    projectedRows.push(...input.projection.rows as readonly WritableLogicalRow[]);
+  } else {
+    for (const candidate of input.projection.rows) {
       if (!isProjectedRow(candidate)) {
-        issues.push(createIssue({ code: 'observer.projection_unavailable', sourceId: snapshot.sourceId, details: { bindingId: binding.id, reason: 'writable_row_shape' } }));
-        continue;
+        issues.push(createIssue({ code: 'observer.projection_unavailable', sourceId: input.sourceId, details: { bindingId: input.bindingId, reason: 'writable_row_shape' } }));
+      } else {
+        projectedRows.push(candidate);
       }
-      rows.push(candidate);
     }
   }
-  return { state: Object.freeze({ rows: Object.freeze(rows) }), issues: Object.freeze(issues) };
+  const rows = input.selectedRelations === undefined
+    ? projectedRows
+    : [
+        ...(input.prior?.rows ?? []).filter((row) => !input.selectedRelations?.has(row.relationId)),
+        ...projectedRows
+      ];
+  return { rows: Object.freeze(rows), issues: Object.freeze(issues) };
 };
 
 const evaluateGuards = <Storage, Command>(
@@ -971,8 +1052,13 @@ const insertEdits = (
 };
 
 const logicalKey = (fields: Readonly<Record<string, JsonValue>>, keyFields: readonly string[]): JsonValue | undefined => {
-  if (keyFields.length === 0 || keyFields.some((field) => !Object.hasOwn(fields, field))) return undefined;
-  return keyFields.map((field) => fields[field] as JsonValue);
+  if (keyFields.length === 0) return undefined;
+  const key: JsonValue[] = [];
+  for (const field of keyFields) {
+    if (!Object.hasOwn(fields, field)) return undefined;
+    key.push(fields[field] as JsonValue);
+  }
+  return key;
 };
 
 const replacementMatchesRows = (
@@ -980,9 +1066,19 @@ const replacementMatchesRows = (
   candidates: readonly Readonly<Record<string, JsonValue>>[]
 ): boolean => {
   if (rows.length !== candidates.length) return false;
-  const current = rows.map(({ fields }) => canonicalizeJson(fields as JsonValue)).sort(comparePortableStrings);
-  const replacement = candidates.map((fields) => canonicalizeJson(fields as JsonValue)).sort(comparePortableStrings);
-  return current.every((value, index) => value === replacement[index]);
+  const counts = new Map<string, number>();
+  for (const { fields } of rows) {
+    const fingerprint = canonicalizeJson(fields as JsonValue);
+    counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
+  }
+  for (const fields of candidates) {
+    const fingerprint = canonicalizeJson(fields as JsonValue);
+    const count = counts.get(fingerprint);
+    if (count === undefined) return false;
+    if (count === 1) counts.delete(fingerprint);
+    else counts.set(fingerprint, count - 1);
+  }
+  return counts.size === 0;
 };
 
 const rejectedEvaluation = <Storage, Command>(

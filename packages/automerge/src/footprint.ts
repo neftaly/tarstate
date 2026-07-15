@@ -13,13 +13,19 @@ export type AutomergePathFootprint = {
   readonly entries: readonly AutomergePathFootprintEntry[];
 };
 
+const ownedAutomergeFootprints = new WeakSet<object>();
+
 /** Pure, canonical construction of an Automerge path footprint. */
 export const automergePathFootprint = (
   entries: readonly AutomergePathFootprintEntry[]
-): AutomergePathFootprint => Object.freeze({
-  kind: 'automerge-paths',
-  entries: Object.freeze(normalizeFootprintEntries(entries))
-});
+): AutomergePathFootprint => {
+  const footprint = Object.freeze({
+    kind: 'automerge-paths' as const,
+    entries: Object.freeze(normalizeFootprintEntries(entries))
+  });
+  ownedAutomergeFootprints.add(footprint);
+  return footprint;
+};
 
 /** Pure containment and overlap algebra over adopted footprint values. */
 export const relateAutomergeFootprints = (
@@ -42,6 +48,70 @@ export const relateAutomergeFootprints = (
   return intersects ? 'overlaps' : 'disjoint';
 };
 
+export type AutomergeFootprintOverlap =
+  | { readonly status: 'disjoint' }
+  | { readonly status: 'unknown'; readonly footprintIndex: number }
+  | { readonly status: 'overlap'; readonly leftIndex: number; readonly rightIndex: number };
+
+/** Finds the first cross-footprint path overlap in path-depth time rather than comparing every pair. */
+export const findAutomergeFootprintOverlap = (footprints: readonly Footprint[]): AutomergeFootprintOverlap => {
+  const root = pathTrieNode();
+  for (let footprintIndex = 0; footprintIndex < footprints.length; footprintIndex += 1) {
+    const entries = parseFootprint(footprints[footprintIndex] as Footprint);
+    if (entries === undefined) return { status: 'unknown', footprintIndex };
+    for (const entry of entries) {
+      const overlap = insertTrieEntry(root, entry, footprintIndex);
+      if (overlap !== undefined) return { status: 'overlap', leftIndex: overlap, rightIndex: footprintIndex };
+    }
+  }
+  return { status: 'disjoint' };
+};
+
+type PathTrieNode = {
+  readonly children: Map<string, PathTrieNode>;
+  exactOwner?: number;
+  subtreeOwner?: number;
+  firstOwner?: number;
+  secondOwner?: number;
+};
+
+const pathTrieNode = (): PathTrieNode => ({ children: new Map() });
+
+const insertTrieEntry = (
+  root: PathTrieNode,
+  entry: AutomergePathFootprintEntry,
+  owner: number
+): number | undefined => {
+  const visited = [root];
+  let node = root;
+  for (const part of entry.path) {
+    if (node.subtreeOwner !== undefined && node.subtreeOwner !== owner) return node.subtreeOwner;
+    const key = typeof part === 'string' ? 's' + part : 'n' + String(Object.is(part, -0) ? 0 : part);
+    const child = node.children.get(key) ?? pathTrieNode();
+    if (!node.children.has(key)) node.children.set(key, child);
+    node = child;
+    visited.push(node);
+  }
+  if (entry.scope === 'exact') {
+    if (node.subtreeOwner !== undefined && node.subtreeOwner !== owner) return node.subtreeOwner;
+    if (node.exactOwner !== undefined && node.exactOwner !== owner) return node.exactOwner;
+    node.exactOwner = owner;
+  } else {
+    const descendantOwner = node.firstOwner !== undefined && node.firstOwner !== owner
+      ? node.firstOwner
+      : node.secondOwner !== undefined && node.secondOwner !== owner
+        ? node.secondOwner
+        : undefined;
+    if (descendantOwner !== undefined) return descendantOwner;
+    node.subtreeOwner = owner;
+  }
+  for (const visitedNode of visited) {
+    if (visitedNode.firstOwner === undefined) visitedNode.firstOwner = owner;
+    else if (visitedNode.firstOwner !== owner && visitedNode.secondOwner === undefined) visitedNode.secondOwner = owner;
+  }
+  return undefined;
+};
+
 const containedByFootprint = (
   candidates: readonly AutomergePathFootprintEntry[],
   bounds: readonly AutomergePathFootprintEntry[]
@@ -51,6 +121,7 @@ const parseFootprint = (
   value: Footprint
 ): readonly AutomergePathFootprintEntry[] | undefined => {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  if (ownedAutomergeFootprints.has(value)) return (value as AutomergePathFootprint).entries;
   const candidate = value as { readonly kind?: unknown; readonly entries?: unknown };
   if (candidate.kind !== 'automerge-paths' || !Array.isArray(candidate.entries)) return undefined;
 
@@ -79,10 +150,9 @@ const normalizeFootprintEntries = (
     }) satisfies AutomergePathFootprintEntry;
     byIdentity.set(canonicalizeJson(normalized as unknown as JsonValue), normalized);
   }
-  return [...byIdentity.values()].sort((left, right) => comparePortableStrings(
-    canonicalizeJson(left as unknown as JsonValue),
-    canonicalizeJson(right as unknown as JsonValue)
-  ));
+  return [...byIdentity.entries()]
+    .sort(([left], [right]) => comparePortableStrings(left, right))
+    .map(([, entry]) => entry);
 };
 
 const entryContainedBy = (

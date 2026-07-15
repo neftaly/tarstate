@@ -13,9 +13,9 @@ export const sameOptionalJson = (left: unknown, right: unknown): boolean => {
 
 export const sameFunctionRegistry = (left: FunctionRegistry | undefined, right: FunctionRegistry | undefined): boolean => {
   if (left === right) return true;
-  const leftEntries = [...(left ?? new Map()).entries()];
-  const rightMap = right ?? new Map();
-  return leftEntries.length === rightMap.size && leftEntries.every(([key, implementation]) => rightMap.get(key) === implementation);
+  if (left === undefined || right === undefined || left.size !== right.size) return false;
+  for (const [key, implementation] of left) if (right.get(key) !== implementation) return false;
+  return true;
 };
 
 export const sameExecutionBudget = (left: QueryExecutionBudget | undefined, right: QueryExecutionBudget | undefined): boolean =>

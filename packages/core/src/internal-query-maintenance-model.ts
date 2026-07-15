@@ -19,7 +19,12 @@ export type AggregateGroupMember = { readonly position: number; readonly row: Sc
 export type AggregateGroupState = { readonly key: QueryRecord; readonly members: readonly AggregateGroupMember[]; readonly reducers: AggregateReducerStates; readonly output: ScopedRow };
 export type DistinctCountIndex = { readonly base: ReadonlyMap<string, number>; readonly overlays: readonly ReadonlyMap<string, number>[], readonly distinctCount: number };
 export type ExtremeValueEntry = { readonly count: number; readonly value: JsonValue };
-export type ExtremeValueIndex = { readonly base: ReadonlyMap<string, ExtremeValueEntry>; readonly overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[]; readonly extremeKey?: string };
+export type ExtremeValueIndex = {
+  readonly base: ReadonlyMap<string, ExtremeValueEntry>;
+  readonly overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[];
+  readonly orderedKeys: readonly string[];
+  readonly extremeKey?: string;
+};
 export type AggregateReducerState =
   | { readonly kind: 'count'; readonly count: number }
   | { readonly kind: 'distinct'; readonly index: DistinctCountIndex }

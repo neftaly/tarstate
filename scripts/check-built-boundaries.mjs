@@ -96,6 +96,7 @@ async function verifyPackedDuplicateCopies() {
   const producerDist = path.join(producerDirectory, 'package/dist');
   const consumerDist = path.join(consumerDirectory, 'package/dist');
   const producer = await import(pathToFileURL(path.join(producerDist, 'index.js')).href);
+  const queryProducer = await import(pathToFileURL(path.join(producerDist, 'query/index.js')).href);
   const foundationConsumer = await import(pathToFileURL(path.join(consumerDist, 'foundation/index.js')).href);
   const queryConsumer = await import(pathToFileURL(path.join(consumerDist, 'query/index.js')).href);
 
@@ -103,12 +104,12 @@ async function verifyPackedDuplicateCopies() {
     if (producer[sentinel] !== foundationConsumer[sentinel]) throw new Error('Duplicate copies disagree on ' + sentinel + ' identity');
   }
 
-  const expression = producer.prepareExpression({ kind: 'literal', value: 11 });
+  const expression = queryProducer.prepareExpression({ kind: 'literal', value: 11 });
   if (queryConsumer.evaluatePreparedExpression(expression, {}) !== 11) {
     throw new Error('Duplicate query copy rejected a prepared expression');
   }
 
-  const plan = await producer.prepareQuery({
+  const plan = await queryProducer.prepareQuery({
     root: { kind: 'values', alias: 'value', rows: [{ id: 12 }] },
     registryFingerprint: 'registry:built-boundaries',
     authorityFingerprint: 'authority:built-boundaries',

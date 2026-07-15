@@ -2,17 +2,18 @@ import {
   AttachmentCatalog,
   DatabaseView,
   DatasetMembership,
-  createIncrementalDatabaseQueryMaintenance,
+  type ObservableSource,
+  type SourceSnapshot
+} from '@tarstate/core/database';
+import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/database/incremental';
+import { prepareManualReadOnlyAttachment } from '@tarstate/core/attachment/prepare';
+import {
   prepareTypedQuery,
-  prepareManualReadOnlyAttachment,
-  relationLiteral,
-  sealSchema,
   typedFrom,
   typedSelect,
-  type ObservableSource,
-  type RelationInput,
-  type SourceSnapshot
-} from '@tarstate/core';
+  type RelationInput
+} from '@tarstate/core/query';
+import { relationLiteral, sealSchema } from '@tarstate/core/schema';
 
 const registryFingerprint = 'registry:quickstart';
 const authorityFingerprint = 'authority:public';

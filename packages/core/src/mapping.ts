@@ -130,12 +130,23 @@ export const projectStorage = (
   binding: CompiledStorageMapping,
   snapshot: unknown,
   registry?: CapabilityRegistry,
+  sourceId?: string,
+  relationIds?: ReadonlySet<RelationId>
+): BindingProjection => projectStorageRelations(binding, snapshot, relationIds, registry, sourceId);
+
+/** Projects only selected relations while preserving the same validation and ownership boundary. */
+const projectStorageRelations = (
+  binding: CompiledStorageMapping,
+  snapshot: unknown,
+  relationIds: ReadonlySet<RelationId> | undefined,
+  registry?: CapabilityRegistry,
   sourceId?: string
 ): BindingProjection => {
   assertCompiledStorageMapping(binding);
   const relations = new Map<RelationId, BoundRelation>();
   const allIssues: Issue[] = [];
   for (const [relationId, compiled] of binding.relations) {
+    if (relationIds !== undefined && !relationIds.has(relationId)) continue;
     const extracted = extractCandidates(snapshot, compiled.mapping.collection, relationId, sourceId);
     const rawCandidates: { value: RelationRow; locator: MappingLocator }[] = [];
     const rejectedLocators: MappingLocator[] = [];

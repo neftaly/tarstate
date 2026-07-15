@@ -1,4 +1,4 @@
-import { prepareSchema } from '@tarstate/core';
+import { prepareSchema } from '@tarstate/core/schema';
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeSystemRelationState,

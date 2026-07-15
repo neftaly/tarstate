@@ -48,7 +48,9 @@ export const stageSourceEdits = <Storage, Command>(input: {
   const issues: Issue[] = [];
   const plans: PlanResult<Command>[] = [];
   const editHandlers = input.edits.map(() => [] as { readonly bindingId: string; readonly mode: 'exclusive' | 'cooperative' }[]);
-  for (const binding of [...input.bindings].sort((left, right) => comparePortableStrings(left.id, right.id))) {
+  const editedRelations = new Set(input.edits.map(({ relationId }) => relationId));
+  for (const binding of sortedBindings(input.bindings)) {
+    if (binding.relationIds !== undefined && !binding.relationIds.some((relationId) => editedRelations.has(relationId))) continue;
     let plan: PlanResult<Command>;
     try {
       plan = binding.plan(snapshot, input.edits);
@@ -158,6 +160,17 @@ export const coordinateSourceCommit = async <Storage, Command>(input: {
 };
 
 const hasErrors = (issues: readonly Issue[]): boolean => issues.some(({ severity }) => severity === 'error');
+
+const sortedBindings = <Storage, Command>(
+  bindings: readonly StorageBinding<Storage, Command>[]
+): readonly StorageBinding<Storage, Command>[] => {
+  for (let index = 1; index < bindings.length; index += 1) {
+    if (comparePortableStrings((bindings[index - 1] as StorageBinding<Storage, Command>).id, (bindings[index] as StorageBinding<Storage, Command>).id) > 0) {
+      return [...bindings].sort((left, right) => comparePortableStrings(left.id, right.id));
+    }
+  }
+  return bindings;
+};
 
 const collectEditHandling = <Command>(
   bindingId: string,

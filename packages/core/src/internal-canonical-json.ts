@@ -10,24 +10,45 @@ export const canonicalizeJsonWithCache = (value: JsonValue, cache: CanonicalJson
 
 const canonicalize = (value: JsonValue, cache?: CanonicalJsonCache): string => {
   if (value === null || typeof value !== 'object') {
-    if (typeof value === 'number' && !Number.isFinite(value)) throw new TypeError('Canonical JSON requires a finite number');
-    if (typeof value === 'string') assertUnicodeScalarString(value);
-    return JSON.stringify(Object.is(value, -0) ? 0 : value);
+    return canonicalizePrimitive(value);
   }
   const cached = cache?.get(value);
   if (cached !== undefined) return cached;
   const canonical = Array.isArray(value)
-    ? '[' + value.map((member) => canonicalize(member, cache)).join(',') + ']'
+    ? canonicalizeArray(value, cache)
     : canonicalizeRecord(value as Readonly<Record<string, JsonValue>>, cache);
   cache?.set(value, canonical);
   return canonical;
 };
 
-const canonicalizeRecord = (value: Readonly<Record<string, JsonValue>>, cache?: CanonicalJsonCache): string =>
-  '{' + Object.keys(value).sort(compareUnicodeScalars).map((key) => {
+const canonicalizePrimitive = (value: null | string | number | boolean): string => {
+  if (typeof value === 'number' && !Number.isFinite(value)) throw new TypeError('Canonical JSON requires a finite number');
+  if (typeof value === 'string') assertUnicodeScalarString(value);
+  return JSON.stringify(Object.is(value, -0) ? 0 : value);
+};
+
+/** Pure container rendering; cache ownership remains in `canonicalize`. */
+const canonicalizeArray = (value: readonly JsonValue[], cache?: CanonicalJsonCache): string => {
+  let canonical = '[';
+  for (let index = 0; index < value.length; index += 1) {
+    if (index !== 0) canonical += ',';
+    canonical += canonicalize(value[index] as JsonValue, cache);
+  }
+  return canonical + ']';
+};
+
+/** Pure key ordering and rendering; cache ownership remains in `canonicalize`. */
+const canonicalizeRecord = (value: Readonly<Record<string, JsonValue>>, cache?: CanonicalJsonCache): string => {
+  const keys = Object.keys(value).sort(compareUnicodeScalars);
+  let canonical = '{';
+  for (let index = 0; index < keys.length; index += 1) {
+    if (index !== 0) canonical += ',';
+    const key = keys[index] as string;
     assertUnicodeScalarString(key);
-    return JSON.stringify(key) + ':' + canonicalize(value[key] as JsonValue, cache);
-  }).join(',') + '}';
+    canonical += JSON.stringify(key) + ':' + canonicalize(value[key] as JsonValue, cache);
+  }
+  return canonical + '}';
+};
 
 export const compareUnicodeScalars = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 

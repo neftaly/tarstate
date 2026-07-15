@@ -246,33 +246,45 @@ const updateIndexedRows = (
   expression: Expr,
   context: QueryContext
 ): ReadonlyMap<string, readonly ScopedRow[]> => {
-  const operations = new Map<string, { readonly removed: ScopedRow[]; readonly added: ScopedRow[] }>();
-  const operation = (key: string): { readonly removed: ScopedRow[]; readonly added: ScopedRow[] } => {
+  type IndexOperation = {
+    readonly removed: ScopedRow[];
+    readonly added: ScopedRow[];
+    readonly replacements: Map<ScopedRow, ScopedRow>;
+  };
+  const operations = new Map<string, IndexOperation>();
+  const operation = (key: string): IndexOperation => {
     const existing = operations.get(key);
     if (existing !== undefined) return existing;
-    const created = { removed: [], added: [] };
+    const created = { removed: [], added: [], replacements: new Map<ScopedRow, ScopedRow>() };
     operations.set(key, created);
     return created;
   };
+  let movedBetweenKeys = false;
   for (const position of positions) {
     const previousRow = before[position];
     const nextRow = after[position];
-    if (previousRow !== undefined) {
-      const key = indexKey(expression, previousRow, context);
-      if (key !== undefined) operation(key).removed.push(previousRow);
+    const previousKey = previousRow === undefined ? undefined : indexKey(expression, previousRow, context);
+    const nextKey = nextRow === undefined ? undefined : indexKey(expression, nextRow, context);
+    if (previousRow !== undefined && nextRow !== undefined && previousKey !== undefined && previousKey === nextKey) {
+      operation(previousKey).replacements.set(previousRow, nextRow);
+      continue;
     }
-    if (nextRow !== undefined) {
-      const key = indexKey(expression, nextRow, context);
-      if (key !== undefined) operation(key).added.push(nextRow);
-    }
+    movedBetweenKeys = true;
+    if (previousRow !== undefined && previousKey !== undefined) operation(previousKey).removed.push(previousRow);
+    if (nextRow !== undefined && nextKey !== undefined) operation(nextKey).added.push(nextRow);
   }
-  const nextPositions = new Map(after.map((row, index) => [row, index]));
+  const nextPositions = movedBetweenKeys ? new Map(after.map((row, index) => [row, index])) : undefined;
   const overrides = new Map<string, readonly ScopedRow[] | undefined>();
-  for (const [key, { removed, added }] of operations) {
+  for (const [key, { removed, added, replacements }] of operations) {
     const removedRows = new Set(removed);
-    const bucket = [...(previous.get(key) ?? [])].filter((row) => !removedRows.has(row));
+    const bucket: ScopedRow[] = [];
+    for (const row of previous.get(key) ?? []) {
+      if (!removedRows.has(row)) bucket.push(replacements.get(row) ?? row);
+    }
     bucket.push(...added);
-    bucket.sort((left, right) => (nextPositions.get(left) ?? 0) - (nextPositions.get(right) ?? 0));
+    if (nextPositions !== undefined) {
+      bucket.sort((left, right) => (nextPositions.get(left) ?? 0) - (nextPositions.get(right) ?? 0));
+    }
     overrides.set(key, bucket.length === 0 ? undefined : bucket);
   }
   return new OverlayRowIndex(previous, overrides);

@@ -22,7 +22,7 @@ export type ScopedRow = QueryExpressionRow & {
   readonly scope: Readonly<Record<string, QueryRecord>>;
   readonly provenance: Readonly<Record<string, Provenance>>;
   readonly identity: string;
-  readonly origin?: string;
+  readonly origin?: string | undefined;
 };
 
 export type NodeResult = { readonly rows: readonly ScopedRow[]; readonly completeness: Completeness };

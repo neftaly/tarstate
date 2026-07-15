@@ -76,6 +76,22 @@ describe('source operation ledger identity', () => {
     ledger.complete(second.entry, 'second receipt');
     expect(ledger.lookup(secondEpoch, secondOperationId, hash('2'))).toEqual({ status: 'known', receipt: 'second receipt' });
   });
+
+  it('bounds exact replay and retired-epoch evidence without evicting it', () => {
+    const ledger = new SourceOperationLedger<string>('epoch:one', { maxEntries: 1, maxRetiredEpochs: 1 });
+    const first = ledger.reserve('epoch:one', 'operation:one', hash('1'));
+    if (first.status !== 'reserved') throw new Error('expected first reservation');
+    ledger.complete(first.entry, 'first receipt');
+    expect(() => ledger.reserve('epoch:one', 'operation:two', hash('2'))).toThrow(/capacity exhausted/);
+    expect(ledger.lookup('epoch:one', 'operation:one', hash('1'))).toEqual({ status: 'known', receipt: 'first receipt' });
+
+    ledger.rotateEpoch('epoch:two');
+    const second = ledger.reserve('epoch:two', 'operation:two', hash('2'));
+    if (second.status !== 'reserved') throw new Error('expected second reservation');
+    ledger.complete(second.entry, 'second receipt');
+    expect(() => ledger.rotateEpoch('epoch:three')).toThrow(/retired-epoch capacity exhausted/);
+    expect(ledger.lookup('epoch:two', 'operation:two', hash('2'))).toEqual({ status: 'known', receipt: 'second receipt' });
+  });
 });
 
 describe('source lifecycle coordination', () => {

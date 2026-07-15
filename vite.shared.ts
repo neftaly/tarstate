@@ -3,7 +3,7 @@ import path from 'node:path';
 /** Build-only core modules used by repository tooling; package exports remain explicit. */
 export const coreInternalEntryNames = ['golden-workloads', 'query'] as const;
 
-/** Additive, topic-focused public entry points; the package root remains compatible. */
+/** Topic-focused public entry points; the package root intentionally contains only foundation values. */
 export const corePublicEntryNames = [
   'artifacts',
   'artifacts/constraint-set',
@@ -48,5 +48,5 @@ export const sourceAliasesFor = (repoRoot: string) => [
   ...[...corePublicEntryNames]
     .sort((left, right) => right.length - left.length)
     .map((entryName) => sourceAlias(repoRoot, '@tarstate/core/' + entryName, 'packages/core/src/' + entryName + '/index.ts')),
-  sourceAlias(repoRoot, '@tarstate/core', 'packages/core/src/index.ts')
+  sourceAlias(repoRoot, '@tarstate/core', 'packages/core/src/root.ts')
 ];

@@ -21,6 +21,19 @@ import type {
 } from './query-incremental-model.js';
 
 const ownedMaintenanceSnapshots = new WeakSet<object>();
+const ownedMaintenanceUpdates = new WeakSet<object>();
+const ownedQueryLogicalContainers = new WeakSet<object>();
+
+/** Ownership evidence for values already detached at a query input boundary. */
+export const isOwnedQueryLogicalContainer = (value: object): boolean =>
+  ownedQueryLogicalContainers.has(value);
+
+/** Marks an internally detached, deeply frozen update for reuse across runtime shells. */
+export const sealOwnedQueryMaintenanceUpdate = (update: QueryMaintenanceUpdate): QueryMaintenanceUpdate => {
+  if (!Object.isFrozen(update)) throw new TypeError('Owned query maintenance update must be frozen');
+  ownedMaintenanceUpdates.add(update);
+  return update;
+};
 
 export const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
   const parsed = safeParseJsonValue(root, { ...defaultValueParseBudget, maxDepth: 1_024 });
@@ -63,6 +76,9 @@ export const adoptFunctionRegistry = (registry: FunctionRegistry): FunctionRegis
 const forbiddenQueryKeys = new Set(['__proto__', 'constructor', 'prototype']);
 
 const adoptQueryLogicalValue = (input: unknown, label: string): QueryLogicalValue => {
+  if (input !== null && typeof input === 'object' && ownedQueryLogicalContainers.has(input)) {
+    return input as QueryLogicalValue;
+  }
   const seen = new Set<object>();
   let totalMembers = 0;
   const visit = (value: unknown, depth: number): QueryLogicalValue => {
@@ -90,7 +106,9 @@ const adoptQueryLogicalValue = (input: unknown, label: string): QueryLogicalValu
           if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
           output.push(visit(descriptor.value, depth + 1));
         }
-        return Object.freeze(output);
+        const owned = Object.freeze(output);
+        ownedQueryLogicalContainers.add(owned);
+        return owned;
       }
       if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError(label + ' contains a hostile prototype');
       if (keys.length > defaultValueParseBudget.maxObjectMembers) throw new TypeError(label + ' exceeds the object-member budget');
@@ -103,7 +121,9 @@ const adoptQueryLogicalValue = (input: unknown, label: string): QueryLogicalValu
         if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile object descriptor');
         output[key] = visit(descriptor.value, depth + 1);
       }
-      return Object.freeze(output);
+      const owned = Object.freeze(output);
+      ownedQueryLogicalContainers.add(owned);
+      return owned;
     } finally {
       seen.delete(value);
     }
@@ -211,23 +231,23 @@ const ownedDataValue = (descriptors: OwnedDataRecord, key: string): unknown => d
 const inspectOwnedArray = (input: unknown, label: string, options: OwnedInspectionOptions = {}): readonly unknown[] => {
   if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
   try {
-    const descriptors = Object.getOwnPropertyDescriptors(input);
-    const length = (Reflect.get(descriptors, 'length') as PropertyDescriptor | undefined)?.value;
+    const length = Object.getOwnPropertyDescriptor(input, 'length')?.value;
     if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError(label + ' contains a hostile length');
-    for (const key of Reflect.ownKeys(descriptors)) {
+    for (const key of Reflect.ownKeys(input)) {
       if (typeof key !== 'string') {
         if (options.allowSymbols === true) continue;
         throw new TypeError(label + ' contains a symbol key');
       }
       if (key === 'length' || /^(0|[1-9][0-9]*)$/.test(key)) continue;
-      const descriptor = descriptors[key];
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
     }
     const output: unknown[] = [];
+    output.length = length;
     for (let index = 0; index < length; index += 1) {
-      const descriptor = descriptors[String(index)];
+      const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
-      output.push(descriptor.value);
+      output[index] = descriptor.value;
     }
     return output;
   } catch (error) {
@@ -297,18 +317,21 @@ const adoptRelationInputChange = (input: unknown): RelationInputChange => {
 };
 
 export const adoptQueryMaintenanceUpdate = (input: QueryMaintenanceUpdate): QueryMaintenanceUpdate => {
+  if (ownedMaintenanceUpdates.has(input)) return input;
   const descriptors = inspectOwnedDataRecord(input, 'Query maintenance update');
   const expectedBasis = ownedDataValue(descriptors, 'expectedBasis');
   const basis = ownedDataValue(descriptors, 'basis');
   const expectedMembershipRevision = ownedDataValue(descriptors, 'expectedMembershipRevision');
   const membershipRevision = ownedDataValue(descriptors, 'membershipRevision');
-  return Object.freeze({
+  const owned = Object.freeze({
     ...(expectedBasis === undefined ? {} : { expectedBasis: adoptJsonValue(expectedBasis, 'Expected query basis') }),
     ...(basis === undefined ? {} : { basis: adoptJsonValue(basis, 'Changed query basis') }),
     ...(expectedMembershipRevision === undefined ? {} : { expectedMembershipRevision: adoptOptionalIndex(expectedMembershipRevision, 'Expected membership revision') }),
     ...(membershipRevision === undefined ? {} : { membershipRevision: adoptOptionalIndex(membershipRevision, 'Changed membership revision') }),
     relations: Object.freeze(inspectOwnedArray(ownedDataValue(descriptors, 'relations'), 'Query relation changes').map(adoptRelationInputChange))
   });
+  ownedMaintenanceUpdates.add(owned);
+  return owned;
 };
 
 export const adoptQueryRequest = (request: QueryRequest): QueryRequest => {

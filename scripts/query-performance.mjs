@@ -1,6 +1,6 @@
 import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
-import { diffQueryMaintenanceSnapshots, evaluateExpression, evaluatePreparedExpression, evaluatePreparedQuery, evaluateQuery, openIncrementalQueryMaintenance, prepareExpression, preparePlan, prepareQueryMaintenanceSnapshot } from '../packages/core/dist/index.js';
+import { diffQueryMaintenanceSnapshots, evaluateExpression, evaluatePreparedExpression, evaluatePreparedQuery, evaluateQuery, openIncrementalQueryMaintenance, prepareExpression, preparePlan, prepareQueryMaintenanceSnapshot } from '../packages/core/dist/query.js';
 import { createPooledIncrementalQueryRuntime } from '../packages/core/dist/query.js';
 
 const schemaView = { id: 'urn:tarstate:benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
@@ -74,6 +74,27 @@ const timedOperation = (iterations, operation) => {
     return (performance.now() - started) / iterations;
   }).sort((left, right) => left - right);
   return Number((samples[1]).toFixed(3));
+};
+
+const allocationHotspots = (profile, limit = 8) => {
+  const nodesById = new Map();
+  const visit = (node) => {
+    nodesById.set(node.id, node);
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(profile.head);
+  const bytesByFrame = new Map();
+  for (const sample of profile.samples) {
+    const frame = nodesById.get(sample.nodeId)?.callFrame;
+    const key = frame === undefined
+      ? 'unknown'
+      : `${frame.functionName || '(anonymous)'} ${frame.url}:${frame.lineNumber + 1}`;
+    bytesByFrame.set(key, (bytesByFrame.get(key) ?? 0) + sample.size);
+  }
+  return [...bytesByFrame]
+    .sort(([, left], [, right]) => right - left)
+    .slice(0, limit)
+    .map(([frame, bytes]) => ({ frame, bytes }));
 };
 
 const pooledEnvironment = (runtimeIdentity) => ({
@@ -467,31 +488,61 @@ for (const residentRootCount of [100, 1_000]) {
 }
 
 const post = (session, method, parameters = {}) => new Promise((resolve, reject) => session.post(method, parameters, (error, result) => error ? reject(error) : resolve(result)));
-const allocationSession = new inspector.Session();
-allocationSession.connect();
-await post(allocationSession, 'HeapProfiler.enable');
-await post(allocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-{
+const sampleUpdateAllocations = async (iterations, prepare) => {
+  const workload = await prepare();
+  globalThis.gc();
+  const allocationSession = new inspector.Session();
+  allocationSession.connect();
+  await post(allocationSession, 'HeapProfiler.enable');
+  await post(allocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+  let allocationProfile;
+  try {
+    for (let index = 0; index < iterations; index += 1) consumedRows += workload.update(index);
+    ({ profile: allocationProfile } = await post(allocationSession, 'HeapProfiler.stopSampling'));
+    return allocationProfile;
+  } finally {
+    if (allocationProfile === undefined) {
+      try { await post(allocationSession, 'HeapProfiler.stopSampling'); } catch { /* preserve the workload failure */ }
+    }
+    allocationSession.disconnect();
+    workload.close();
+  }
+};
+const sampledBytes = (profile) => profile.samples.reduce((sum, sample) => sum + sample.size, 0);
+const alternatingSessionWorkload = (session, forward, backward) => ({
+  update: (index) => session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length,
+  close: () => session.close()
+});
+const reducerAggregateQuery = (groupBy) => ({
+  kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy,
+  measures: {
+    count: { kind: 'aggregate', op: 'count' },
+    distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
+    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
+    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') },
+    any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
+    every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
+  }
+});
+
+const profile = await sampleUpdateAllocations(100, async () => {
   const first = { relations: [input('item', linearRows(1_000))] };
   const second = { relations: [input('item', linearRows(1_000, true))] };
   const session = openIncrementalQueryMaintenance(await plan('allocation-sample', linearQuery), first);
   let accepted = first;
-  for (let index = 0; index < 100; index += 1) {
+  return {
+    update: (index) => {
     const next = index % 2 === 0 ? second : first;
-    consumedRows += session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next)).rows.length;
+      const rowCount = session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next)).rows.length;
     accepted = next;
-  }
-  session.close();
-}
-const { profile } = await post(allocationSession, 'HeapProfiler.stopSampling');
-allocationSession.disconnect();
-const sampledAllocationBytes = profile.samples.reduce((sum, sample) => sum + sample.size, 0);
+      return rowCount;
+    },
+    close: () => session.close()
+  };
+});
+const sampledAllocationBytes = sampledBytes(profile);
 
-const leftJoinAllocationSession = new inspector.Session();
-leftJoinAllocationSession.connect();
-await post(leftJoinAllocationSession, 'HeapProfiler.enable');
-await post(leftJoinAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-{
+const leftJoinAllocationProfile = await sampleUpdateAllocations(100, async () => {
   const count = 1_000;
   const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
   const first = { relations };
@@ -499,18 +550,11 @@ await post(leftJoinAllocationSession, 'HeapProfiler.startSampling', { samplingIn
   const session = openIncrementalQueryMaintenance(await plan('left-join-allocation-sample', joinQuery), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
-  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
-  session.close();
-}
-const { profile: leftJoinAllocationProfile } = await post(leftJoinAllocationSession, 'HeapProfiler.stopSampling');
-leftJoinAllocationSession.disconnect();
-const leftJoinSampledAllocationBytes = leftJoinAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+  return alternatingSessionWorkload(session, forward, backward);
+});
+const leftJoinSampledAllocationBytes = sampledBytes(leftJoinAllocationProfile);
 
-const rightJoinAllocationSession = new inspector.Session();
-rightJoinAllocationSession.connect();
-await post(rightJoinAllocationSession, 'HeapProfiler.enable');
-await post(rightJoinAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-{
+const rightJoinAllocationProfile = await sampleUpdateAllocations(100, async () => {
   const count = 1_000;
   const relations = [input('left', joinRows(count, true)), input('right', joinRows(count, false))];
   const first = { relations };
@@ -519,72 +563,37 @@ await post(rightJoinAllocationSession, 'HeapProfiler.startSampling', { samplingI
   const session = openIncrementalQueryMaintenance(await plan('right-join-allocation-sample', joinQuery), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
-  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
-  session.close();
-}
-const { profile: rightJoinAllocationProfile } = await post(rightJoinAllocationSession, 'HeapProfiler.stopSampling');
-rightJoinAllocationSession.disconnect();
-const rightJoinSampledAllocationBytes = rightJoinAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+  return alternatingSessionWorkload(session, forward, backward);
+});
+const rightJoinSampledAllocationBytes = sampledBytes(rightJoinAllocationProfile);
 
-const aggregateAllocationSession = new inspector.Session();
-aggregateAllocationSession.connect();
-await post(aggregateAllocationSession, 'HeapProfiler.enable');
-await post(aggregateAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-{
+const aggregateAllocationProfile = await sampleUpdateAllocations(100, async () => {
   const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, group: id % 100, score: id, active: id % 3 === 0 }));
   const changed = rows.map((row, index) => index === 0 ? { ...row, score: 2_000 } : row);
   const first = { relations: [input('score', rows)] };
   const second = { relations: [input('score', changed)] };
-  const aggregateQuery = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: { group: field('score', 'group') }, measures: {
-    count: { kind: 'aggregate', op: 'count' },
-    distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
-    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
-    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') },
-    any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
-    every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
-  } };
+  const aggregateQuery = reducerAggregateQuery({ group: field('score', 'group') });
   const session = openIncrementalQueryMaintenance(await plan('aggregate-allocation-sample', aggregateQuery), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
-  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
-  session.close();
-}
-const { profile: aggregateAllocationProfile } = await post(aggregateAllocationSession, 'HeapProfiler.stopSampling');
-aggregateAllocationSession.disconnect();
-const aggregateSampledAllocationBytes = aggregateAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+  return alternatingSessionWorkload(session, forward, backward);
+});
+const aggregateSampledAllocationBytes = sampledBytes(aggregateAllocationProfile);
 
-const ungroupedReducerAllocationSession = new inspector.Session();
-ungroupedReducerAllocationSession.connect();
-await post(ungroupedReducerAllocationSession, 'HeapProfiler.enable');
-await post(ungroupedReducerAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-{
+const ungroupedReducerAllocationProfile = await sampleUpdateAllocations(100, async () => {
   const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, score: id, active: id % 3 === 0 }));
   const changed = rows.map((row, index) => index === 0 ? { ...row, score: 2_000, active: !row.active } : row);
   const first = { relations: [input('score', rows)] };
   const second = { relations: [input('score', changed)] };
-  const aggregateQuery = { kind: 'aggregate', input: from('score', 'score'), alias: 'summary', groupBy: {}, measures: {
-    count: { kind: 'aggregate', op: 'count' },
-    distinct: { kind: 'aggregate', op: 'count-distinct', value: field('score', 'score') },
-    minimum: { kind: 'aggregate', op: 'minimum', value: field('score', 'score') },
-    maximum: { kind: 'aggregate', op: 'maximum', value: field('score', 'score') },
-    any: { kind: 'aggregate', op: 'any', value: field('score', 'active') },
-    every: { kind: 'aggregate', op: 'every', value: field('score', 'active') }
-  } };
+  const aggregateQuery = reducerAggregateQuery({});
   const session = openIncrementalQueryMaintenance(await plan('aggregate-ungrouped-reducer-allocation-sample', aggregateQuery), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
-  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
-  session.close();
-}
-const { profile: ungroupedReducerAllocationProfile } = await post(ungroupedReducerAllocationSession, 'HeapProfiler.stopSampling');
-ungroupedReducerAllocationSession.disconnect();
-const ungroupedReducerSampledAllocationBytes = ungroupedReducerAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+  return alternatingSessionWorkload(session, forward, backward);
+});
+const ungroupedReducerSampledAllocationBytes = sampledBytes(ungroupedReducerAllocationProfile);
 
-const distinctAllocationSession = new inspector.Session();
-distinctAllocationSession.connect();
-await post(distinctAllocationSession, 'HeapProfiler.enable');
-await post(distinctAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-{
+const distinctAllocationProfile = await sampleUpdateAllocations(100, async () => {
   const rows = Array.from({ length: 1_000 }, (_, id) => ({ id, group: id % 100 }));
   const changed = rows.map((row, index) => index === 0 ? { ...row, group: 101 } : row);
   const first = { relations: [input('score', rows)] };
@@ -593,18 +602,11 @@ await post(distinctAllocationSession, 'HeapProfiler.startSampling', { samplingIn
   const session = openIncrementalQueryMaintenance(await plan('distinct-allocation-sample', query), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
-  for (let index = 0; index < 100; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
-  session.close();
-}
-const { profile: distinctAllocationProfile } = await post(distinctAllocationSession, 'HeapProfiler.stopSampling');
-distinctAllocationSession.disconnect();
-const distinctSampledAllocationBytes = distinctAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+  return alternatingSessionWorkload(session, forward, backward);
+});
+const distinctSampledAllocationBytes = sampledBytes(distinctAllocationProfile);
 
-const highCardinalityDistinctAllocationSession = new inspector.Session();
-highCardinalityDistinctAllocationSession.connect();
-await post(highCardinalityDistinctAllocationSession, 'HeapProfiler.enable');
-await post(highCardinalityDistinctAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-{
+const highCardinalityDistinctAllocationProfile = await sampleUpdateAllocations(200, async () => {
   const uniqueKeyCount = 10_000;
   const rows = [...Array.from({ length: uniqueKeyCount }, (_, id) => ({ id, key: id })), { id: uniqueKeyCount, key: 0 }];
   const changedRows = rows.map((row, index) => index === uniqueKeyCount ? { ...row, key: 1 } : row);
@@ -614,36 +616,33 @@ await post(highCardinalityDistinctAllocationSession, 'HeapProfiler.startSampling
   const session = openIncrementalQueryMaintenance(await plan('distinct-high-cardinality-allocation', query), first);
   const forward = diffQueryMaintenanceSnapshots(first, second);
   const backward = diffQueryMaintenanceSnapshots(second, first);
-  for (let index = 0; index < 200; index += 1) consumedRows += session.applyUpdate(index % 2 === 0 ? forward : backward).rows.length;
-  session.close();
-}
-const { profile: highCardinalityDistinctAllocationProfile } = await post(highCardinalityDistinctAllocationSession, 'HeapProfiler.stopSampling');
-highCardinalityDistinctAllocationSession.disconnect();
-const highCardinalityDistinctSampledAllocationBytes = highCardinalityDistinctAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
-
-const pooledAllocationFirst = { relations: [input('item', linearRows(1_000))] };
-const pooledAllocationSecond = { relations: [input('item', linearRows(1_000, true))] };
-const pooledAllocationRuntime = createPooledIncrementalQueryRuntime({
-  environment: pooledEnvironment('allocation-pooled-fanout-100'), initialSnapshot: pooledAllocationFirst
+  return alternatingSessionWorkload(session, forward, backward);
 });
-const pooledAllocationRoots = await Promise.all(Array.from({ length: 100 }, async (_, index) => pooledAllocationRuntime.attach(await plan('allocation-pooled-' + index, {
-  kind: 'select', alias: 'allocation-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
-}))));
-const pooledAllocationForward = diffQueryMaintenanceSnapshots(pooledAllocationFirst, pooledAllocationSecond);
-const pooledAllocationBackward = diffQueryMaintenanceSnapshots(pooledAllocationSecond, pooledAllocationFirst);
-const pooledAllocationSession = new inspector.Session();
-pooledAllocationSession.connect();
-await post(pooledAllocationSession, 'HeapProfiler.enable');
-await post(pooledAllocationSession, 'HeapProfiler.startSampling', { samplingInterval: 1_024, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
-for (let index = 0; index < 100; index += 1) {
-  pooledAllocationRuntime.applyUpdate(index % 2 === 0 ? pooledAllocationForward : pooledAllocationBackward);
-  consumedRows += pooledAllocationRoots[0].getCurrentResult().rows.length;
-}
-const { profile: pooledAllocationProfile } = await post(pooledAllocationSession, 'HeapProfiler.stopSampling');
-pooledAllocationSession.disconnect();
-for (const root of pooledAllocationRoots) root.close();
-pooledAllocationRuntime.close();
-const pooledSampledAllocationBytes = pooledAllocationProfile.samples.reduce((sum, sample) => sum + sample.size, 0);
+const highCardinalityDistinctSampledAllocationBytes = sampledBytes(highCardinalityDistinctAllocationProfile);
+
+const pooledAllocationProfile = await sampleUpdateAllocations(100, async () => {
+  const first = { relations: [input('item', linearRows(1_000))] };
+  const second = { relations: [input('item', linearRows(1_000, true))] };
+  const runtime = createPooledIncrementalQueryRuntime({
+    environment: pooledEnvironment('allocation-pooled-fanout-100'), initialSnapshot: first
+  });
+  const roots = await Promise.all(Array.from({ length: 100 }, async (_, index) => runtime.attach(await plan('allocation-pooled-' + index, {
+    kind: 'select', alias: 'allocation-' + index, input: clonedPrefix(), fields: { id: field('item', 'id') }
+  }))));
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  return {
+    update: (index) => {
+      runtime.applyUpdate(index % 2 === 0 ? forward : backward);
+      return roots[0].getCurrentResult().rows.length;
+    },
+    close: () => {
+      for (const root of roots) root.close();
+      runtime.close();
+    }
+  };
+});
+const pooledSampledAllocationBytes = sampledBytes(pooledAllocationProfile);
 
 const measurement = (label, inputRows) => measurements.find((candidate) => candidate.label === label && candidate.inputRows === inputRows);
 const linearPure10k = measurement('linear-pure', 10_000)?.millisecondsPerOperation;
@@ -683,10 +682,6 @@ const highCardinalityDistinctBytesPerUpdate = Math.round(highCardinalityDistinct
 const pooledBytesPerUpdate = Math.round(pooledSampledAllocationBytes / 100);
 const pooledFanout10 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 10)?.millisecondsPerUpdate;
 const pooledFanout100 = pooledMeasurements.find(({ scenario, fanout }) => scenario === 'cloned-root-fanout' && fanout === 100)?.millisecondsPerUpdate;
-// A visible update across 100 roots returning 500 rows each must publish 100
-// new native immutable arrays. At eight bytes per reference that boundary
-// alone is approximately 400 KiB, before array headers and result envelopes.
-const pooledVisiblePublicArrayFloorBytes = 100 * 500 * 8;
 const contracts = {
   repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
   linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
@@ -724,7 +719,7 @@ const contractFailures = Object.entries(contracts).filter(([, passed]) => !passe
 
 process.stdout.write(JSON.stringify({
   benchmark: 'tarstate-query-scaling',
-  note: 'Wall times are diagnostic medians; conservative relative, selectivity, and allocation contracts are enforced.',
+  note: 'Wall times and allocation samples are diagnostic. Thresholds catch regressions; passing them is not evidence that the implementation is close to optimal.',
   contracts,
   measurements,
   pooledMeasurements,
@@ -751,7 +746,8 @@ process.stdout.write(JSON.stringify({
   ungroupedReducerAllocationSample: {
     workload: '100 one-row updates over a 1,000-row ungrouped reducer-only aggregate query',
     sampledBytes: ungroupedReducerSampledAllocationBytes,
-    sampledBytesPerUpdate: ungroupedReducerBytesPerUpdate
+    sampledBytesPerUpdate: ungroupedReducerBytesPerUpdate,
+    hotspots: allocationHotspots(ungroupedReducerAllocationProfile)
   },
   distinctAllocationSample: {
     workload: '100 one-row updates over a 1,000-row, 100-key distinct query',
@@ -762,14 +758,14 @@ process.stdout.write(JSON.stringify({
     workload: '200 trailing duplicate-key updates over a 10,001-row, 10,000-key distinct query',
     sampledBytes: highCardinalityDistinctSampledAllocationBytes,
     sampledBytesPerUpdate: highCardinalityDistinctBytesPerUpdate,
+    hotspots: allocationHotspots(highCardinalityDistinctAllocationProfile),
     boundaryNote: 'The changed row is never a representative, so the public distinct output remains unchanged.'
   },
   pooledAllocationSample: {
     workload: '100 one-row updates to a field ignored by 100 pooled roots over 1,000 input rows',
     sampledBytes: pooledSampledAllocationBytes,
     sampledBytesPerUpdate: pooledBytesPerUpdate,
-    visiblePublicArrayFloorBytes: pooledVisiblePublicArrayFloorBytes,
-    boundaryNote: 'Visible changes cannot share frozen native public arrays across snapshots; ignored changes can and should reuse them.'
+    boundaryNote: 'The changed field is ignored by every root, so public row views should be reused and fanout costs expose internal bookkeeping.'
   },
   node: process.version,
   consumedRows

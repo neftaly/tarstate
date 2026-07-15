@@ -2009,6 +2009,44 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
+  it('reuses a projection when changed input fields cannot affect its expressions', () => {
+    const initial = snapshot(basePeople, 1);
+    const changed = snapshot([
+      { occurrenceId: 'person:a', row: { ...basePeople[0]!.row, name: 'changed outside projection' } },
+      basePeople[1] as QueryRowOccurrence
+    ], 2);
+    const query: QueryNode = {
+      kind: 'select',
+      input: from('people', 'p'),
+      alias: 'result',
+      fields: {
+        id: field('p', 'id'),
+        derived: { kind: 'arithmetic', op: 'add', left: field('p', 'id'), right: { kind: 'literal', value: 1 } }
+      }
+    };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/unobserved-projection-input', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const root = runtime.attach(plan(query));
+    const before = root.getCurrentResult();
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, changed));
+
+    const after = root.getCurrentResult();
+    expect(semanticResult(after)).toEqual(oracle(query, changed));
+    expect(after.state).toMatchObject({ updatedNodeCount: 2, changedNodeCount: 1 });
+    expect(after.state.operatorDiagnostics.local).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 0 });
+    expect(after.rows).toBe(before.rows);
+    expect(after.resultKeys).toBe(before.resultKeys);
+    expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 2, lastChangedPhysicalNodeCount: 1 });
+    root.close();
+    runtime.close();
+  });
+
   it('removes dependency consumers when an unrelated root closes', () => {
     const initial = snapshot(basePeople, 1);
     const next = snapshot(middlePeople, 2);

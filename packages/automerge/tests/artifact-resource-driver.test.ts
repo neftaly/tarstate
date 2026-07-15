@@ -1,9 +1,9 @@
 import * as Automerge from '@automerge/automerge';
 import {
   ExactArtifactResolver,
-  ResourceResolver,
-  sealSchema
-} from '@tarstate/core';
+  ResourceResolver
+} from '@tarstate/core/artifacts';
+import { sealSchema } from '@tarstate/core/schema';
 import { describe, expect, it, vi } from 'vitest';
 import {
   automergeArtifactResourceDriver,

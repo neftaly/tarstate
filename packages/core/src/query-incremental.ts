@@ -603,7 +603,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
       // A rejected update clears `asserted` while retaining the last physical
       // graph. The first accepted transition must therefore republish that
       // graph even when no node needed evaluation.
-      const reusePublicViews = root.asserted !== undefined && rootChangedNodeCount === 0;
+      const reusePublicViews = root.asserted !== undefined && !changedNodes.has(root.root);
       const nextCurrent = maintainedQueryResult(
         nextRoot,
         [],

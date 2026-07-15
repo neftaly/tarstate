@@ -84,9 +84,17 @@ const automergeSnapshot = <T extends object>(sourceId: string, basis: AutomergeB
 
 export const exactAutomergeHeadsEqual = (left: readonly string[], right: readonly string[]): boolean => {
   if (left.length !== right.length) return false;
+  if (isSorted(left) && isSorted(right)) return left.every((head, index) => head === right[index]);
   const sortedLeft = [...left].sort();
   const sortedRight = [...right].sort();
   return sortedLeft.every((head, index) => head === sortedRight[index]);
+};
+
+const isSorted = (values: readonly string[]): boolean => {
+  for (let index = 1; index < values.length; index += 1) {
+    if ((values[index - 1] as string) > (values[index] as string)) return false;
+  }
+  return true;
 };
 
 export const exactAutomergeBasisEqual = (left: AutomergeBasis, right: AutomergeBasis): boolean =>
@@ -119,8 +127,15 @@ type DocumentOwner<T extends object> = {
 
 const documentOwner = Symbol('AutomergeSourceRuntime.documentOwner');
 type AutomergeSourceRuntimeOptions<T extends object> =
-  | { readonly sourceId: string; readonly doc: Automerge.Doc<T>; readonly onDiagnostic?: AutomergeSourceDiagnosticReporter }
-  | { readonly sourceId: string; readonly [documentOwner]: DocumentOwner<T>; readonly onDiagnostic?: AutomergeSourceDiagnosticReporter };
+  | ({ readonly sourceId: string; readonly doc: Automerge.Doc<T> } & AutomergeRuntimeLedgerOptions)
+  | ({ readonly sourceId: string; readonly [documentOwner]: DocumentOwner<T> } & AutomergeRuntimeLedgerOptions);
+
+type AutomergeRuntimeLedgerOptions = {
+  readonly onDiagnostic?: AutomergeSourceDiagnosticReporter;
+  readonly maxOperationEpochs?: number;
+  readonly maxOperationReceiptsPerEpoch?: number;
+  readonly maxRetiredOperationEpochs?: number;
+};
 
 class StaleOwnerBasis<T extends object> extends Error {
   constructor(readonly storage: Automerge.Doc<T>) {
@@ -144,11 +159,17 @@ export class AutomergeSourceRuntime<T extends object> {
   readonly #listeners = new Set<(change: AutomergeSourceChange) => void>();
   readonly #ledger = new Map<string, Map<string, LedgerEntry>>();
   readonly #retiredEpochs = new Set<string>();
+  readonly #maxOperationEpochs: number;
+  readonly #maxOperationReceiptsPerEpoch: number;
+  readonly #maxRetiredOperationEpochs: number;
 
   constructor(options: AutomergeSourceRuntimeOptions<T>) {
     if (options.sourceId.length === 0) throw new Error('Automerge sourceId must not be empty');
     this.sourceId = options.sourceId;
     this.#onDiagnostic = options.onDiagnostic;
+    this.#maxOperationEpochs = positiveSafeInteger(options.maxOperationEpochs ?? 64, 'Automerge maxOperationEpochs');
+    this.#maxOperationReceiptsPerEpoch = positiveSafeInteger(options.maxOperationReceiptsPerEpoch ?? 65_536, 'Automerge maxOperationReceiptsPerEpoch');
+    this.#maxRetiredOperationEpochs = positiveSafeInteger(options.maxRetiredOperationEpochs ?? 4_096, 'Automerge maxRetiredOperationEpochs');
     this.#owner = 'doc' in options ? memoryDocumentOwner(options.doc) : options[documentOwner];
     const storage = this.#owner.current();
     this.#snapshot = automergeSnapshot(this.sourceId, automergeBasis(storage), storage);
@@ -214,6 +235,9 @@ export class AutomergeSourceRuntime<T extends object> {
       return Promise.reject(error);
     }
     const result = this.#queue.then(() => {
+      if (!this.#retiredEpochs.has(ownedOperationEpoch) && this.#retiredEpochs.size >= this.#maxRetiredOperationEpochs) {
+        throw new RangeError('Automerge retired operation-epoch capacity exhausted; replace the runtime');
+      }
       this.#retiredEpochs.add(ownedOperationEpoch);
       this.#ledger.delete(ownedOperationEpoch);
     });
@@ -260,6 +284,17 @@ export class AutomergeSourceRuntime<T extends object> {
         phase: 'commit',
         sourceId: this.sourceId,
         operationId: input.operationId
+      }]);
+    }
+    const epochLedger = this.#ledger.get(input.operationEpoch);
+    if ((epochLedger === undefined && this.#ledger.size >= this.#maxOperationEpochs)
+      || (epochLedger?.size ?? 0) >= this.#maxOperationReceiptsPerEpoch) {
+      return this.#rejected(input, undefined, [{
+        code: 'operation.ledger_capacity_exhausted',
+        phase: 'commit',
+        sourceId: this.sourceId,
+        operationId: input.operationId,
+        details: { action: 'retire_operation_epoch' }
       }]);
     }
 
@@ -432,7 +467,7 @@ const ownBasisEvidence = (input: AutomergeBasis): AutomergeBasis => {
   if (new Set(heads).size !== heads.length) throw new TypeError('Automerge expectedBasis heads must be unique');
   return Object.freeze({
     kind,
-    heads: Object.freeze(heads as string[])
+    heads: Object.freeze((heads as string[]).sort())
   });
 };
 
@@ -566,6 +601,9 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
   readonly handle: AutomergeRepoHandle<T, Heads>;
   readonly sourceId?: string;
   readonly onDiagnostic?: AutomergeSourceDiagnosticReporter;
+  readonly maxOperationEpochs?: number;
+  readonly maxOperationReceiptsPerEpoch?: number;
+  readonly maxRetiredOperationEpochs?: number;
 }): AutomergeSourceRuntimeApi<T> => {
   const { handle } = options;
   const sourceId = options.sourceId ?? handle.url;
@@ -579,7 +617,18 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
     return document;
   };
   const handleChanged = ({ doc }: { readonly doc: Automerge.Doc<T> }): void => {
-    for (const listener of Array.from(listeners)) listener(doc);
+    for (const listener of Array.from(listeners)) {
+      try {
+        listener(doc);
+      } catch (error) {
+        reportAutomergeDiagnostic(options.onDiagnostic, {
+          kind: 'listener_error',
+          component: 'source-runtime',
+          operation: 'repo-owner.publish',
+          error
+        });
+      }
+    }
   };
   handle.on('heads-changed', handleChanged);
   const owner: DocumentOwner<T> = {
@@ -605,10 +654,18 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
     return new AutomergeSourceRuntime({
       sourceId,
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+      ...(options.maxOperationEpochs === undefined ? {} : { maxOperationEpochs: options.maxOperationEpochs }),
+      ...(options.maxOperationReceiptsPerEpoch === undefined ? {} : { maxOperationReceiptsPerEpoch: options.maxOperationReceiptsPerEpoch }),
+      ...(options.maxRetiredOperationEpochs === undefined ? {} : { maxRetiredOperationEpochs: options.maxRetiredOperationEpochs }),
       [documentOwner]: owner
     });
   } catch (error) {
     try { handle.off('heads-changed', handleChanged); } catch { /* preserve the construction failure */ }
     throw error;
   }
+};
+
+const positiveSafeInteger = (value: number, label: string): number => {
+  if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(label + ' must be a positive safe integer');
+  return value;
 };

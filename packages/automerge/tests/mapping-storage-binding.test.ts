@@ -2,18 +2,21 @@ import * as Automerge from '@automerge/automerge';
 import {
   CapabilityRegistry,
   builtInCapabilityRefs,
+  registerBuiltInCapabilities
+} from '@tarstate/core/capabilities';
+import {
   compileStorageMapping,
+  prepareSchema,
+  type StorageMappingBody
+} from '@tarstate/core/schema';
+import {
   coordinateSourceCommit,
   executePreparedTransaction,
   prepareWritableExecutionContext,
-  prepareSchema,
-  registerBuiltInCapabilities,
   sealTransaction,
-  type ArtifactRef,
-  type JsonValue,
-  type PreparedWritableExecutionContext,
-  type StorageMappingBody
-} from '@tarstate/core';
+  type PreparedWritableExecutionContext
+} from '@tarstate/core/transactions';
+import type { ArtifactRef, JsonValue } from '@tarstate/core/foundation';
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource,

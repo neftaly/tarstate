@@ -5,6 +5,9 @@ import {
   type IndexedRelationInput
 } from './internal-query-relations.js';
 import { queryValueEqual } from './internal-query-values.js';
+import {
+  adoptQueryMaintenanceUpdate
+} from './internal-query-ownership.js';
 import { comparePortableStrings } from './portable-order.js';
 import type {
   QueryRecord,
@@ -17,8 +20,13 @@ import type {
   RelationRowChange
 } from './query-incremental-model.js';
 
-/** Pure shell adapter from two snapshots to the exact update consumed by maintenance. */
+/** Owns the exact update once after comparing the caller's snapshot values. */
 export const diffQueryMaintenanceSnapshots = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): QueryMaintenanceUpdate => {
+  return adoptQueryMaintenanceUpdate(diffQueryMaintenanceSnapshotValues(previous, next));
+};
+
+/** Internal value transform; lifecycle shells choose how to own its output. */
+export const diffQueryMaintenanceSnapshotValues = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): QueryMaintenanceUpdate => {
   if (!sameOptionalJson(previous.parameters, next.parameters) || !sameFunctionRegistry(previous.functions, next.functions) || !sameExecutionBudget(previous.executionBudget, next.executionBudget)) {
     throw new TypeError('Query maintenance parameters, functions, and execution budget are fixed for the session');
   }
@@ -55,12 +63,21 @@ const diffRelationRows = (before: RelationInput | undefined, after: RelationInpu
   const beforeIds = before?.occurrenceIds ?? [];
   const afterIds = after?.occurrenceIds ?? [];
   if ((before?.rows.length ?? 0) !== beforeIds.length || (after?.rows.length ?? 0) !== afterIds.length) throw new TypeError('Relation changes require complete occurrence IDs');
-  if (beforeIds.length === afterIds.length && beforeIds.every((occurrenceId, index) => occurrenceId === afterIds[index])) {
-    return beforeIds.flatMap((occurrenceId, index) => {
+  if (beforeIds.length === afterIds.length) {
+    const changes: RelationRowChange[] = [];
+    let positional = true;
+    for (let index = 0; index < beforeIds.length; index += 1) {
+      const occurrenceId = beforeIds[index] as string;
+      if (occurrenceId !== afterIds[index]) {
+        positional = false;
+        break;
+      }
       const previousRow = before?.rows[index] as QueryRecord;
       const nextRow = after?.rows[index] as QueryRecord;
-      return previousRow === nextRow || queryValueEqual(previousRow, nextRow) ? [] : [{ occurrenceId, before: { index, row: previousRow }, after: { index, row: nextRow } }];
-    });
+      if (previousRow === nextRow || queryValueEqual(previousRow, nextRow)) continue;
+      changes.push({ occurrenceId, before: { index, row: previousRow }, after: { index, row: nextRow } });
+    }
+    if (positional) return changes;
   }
   const beforeRows = before === undefined ? new Map<string, { readonly index: number; readonly row: QueryRecord }>() : indexedRelationRows(before);
   const afterRows = after === undefined ? new Map<string, { readonly index: number; readonly row: QueryRecord }>() : indexedRelationRows(after);
