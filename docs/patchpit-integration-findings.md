@@ -30,20 +30,39 @@ concurrency semantics are implemented.
 ## Integration slice
 
 Patchpit stores its workspace in canonical Automerge data shaped as the logical
-relations `state`, `contexts`, `panes`, `paneContexts`, and `splits`. It seals a
-Tarstate `json-tree-v1` storage mapping and uses `projectStorage` to parse that
-data into relations with completeness and issues. Source readiness is supplied
-separately by the captured source snapshot.
+relations `state`, `contexts`, `panes`, `paneContexts`, and `splits`. The
+document declares exact schema and `json-tree-v1` storage-mapping artifacts.
+Patchpit resolves those embedded artifacts through `ExactArtifactResolver`,
+prepares the attachment with `prepareDatabaseAttachment`, and projects the
+captured source snapshot through `AutomergeMappedStorageBinding`.
 
 Patchpit applies named product operations such as open, activate, close, move,
-split, and resize. A canonical Automerge writer stages each operation through
-`AutomergeAtomicSource` before committing it. A known stale-basis rejection may
-cause Patchpit to reapply the named operation to a fresh snapshot; an unknown
-outcome is never retried.
+split, and resize. It lowers the before/after logical relation delta to targeted
+keyed transaction statements and runs them through
+`executePreparedTransaction`. Patchpit topology is a required source-local
+constraint. A known stale-basis rejection may cause Patchpit to reapply the
+named operation to a fresh snapshot; an unknown outcome is never retried.
 
-This arrangement keeps workspace topology and retry policy in Patchpit, but it
-also exposes a missing composition between Tarstate's transaction evaluator,
-storage mappings, bindings, and atomic sources.
+This arrangement keeps workspace topology and retry policy in Patchpit while
+Tarstate owns parsing, projection, transaction simulation, mapped writes, and
+the atomic source handoff. Targeted keyed writes preserve the Automerge object
+identity of surviving workspace rows without requiring native Automerge moves.
+
+### Follow-up ergonomic seam: inline Automerge values
+
+The exact artifact boundary correctly rejects live Automerge values because
+their internal symbol keys are not portable JSON. The Automerge resource driver
+already converts `Automerge.toJS` output to inert plain JSON before artifact
+extraction, but that conversion is internal to the driver. Patchpit embeds its
+artifacts in the same source document, so its embedded exact-artifact store must
+currently repeat the JSON encode/decode boundary before resolution.
+
+This is not a new resolution model and does not justify a Patchpit-specific
+adapter. A small public Automerge helper for obtaining an inert JSON value, or
+an embedded-store adapter built on that helper, would let same-document inline
+artifacts use the same hardened boundary as external Automerge carriers. It
+should return owned portable data only; it must not expose the live document,
+Repo handle, or source lifecycle through artifact resolution.
 
 ## Assessment and disposition
 
