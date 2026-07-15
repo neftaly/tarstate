@@ -22,6 +22,13 @@ export type QueryMaintenanceSnapshot = {
   readonly executionBudget?: QueryExecutionBudget;
 };
 
+declare const ownedQueryMaintenanceSnapshotBrand: unique symbol;
+
+/** Descriptor-safe detached input reusable without another ownership pass. */
+export type OwnedQueryMaintenanceSnapshot = QueryMaintenanceSnapshot & {
+  readonly [ownedQueryMaintenanceSnapshotBrand]: true;
+};
+
 export type RelationRowChange = {
   readonly occurrenceId: string;
   readonly before?: { readonly index: number; readonly row: QueryRecord };

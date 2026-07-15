@@ -10,22 +10,23 @@ import {
   type Issue,
   type JsonValue
 } from '@tarstate/core/foundation';
-import type {
-  AtomicSource,
-  Footprint,
-  FootprintRelation,
-  IntentMergeResult,
-  LogicalEdit,
-  PlanResult,
-  ProjectionResult,
-  SourceCommitInput,
-  SourceCommitResult,
-  SourceFreshness,
-  SourceLifecycleState,
-  SourceOutcomeLookup,
-  SourceSnapshot,
-  StorageBinding
+import {
+  type AtomicSource,
+  type Footprint,
+  type FootprintRelation,
+  type IntentMergeResult,
+  type LogicalEdit,
+  type PlanResult,
+  type ProjectionResult,
+  type SourceCommitInput,
+  type SourceCommitResult,
+  type SourceFreshness,
+  type SourceLifecycleState,
+  type SourceOutcomeLookup,
+  type SourceSnapshot,
+  type StorageBinding
 } from '@tarstate/core/source';
+import { sealStorageProjection } from '@tarstate/core/source/projection';
 import { conflictsAt, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import {
   automergeBasis,
@@ -297,6 +298,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly #collectionPath: AutomergePath;
   readonly #keySource: AutomergeMapStorageBindingOptions<Row>['keySource'];
   readonly #projectionPlanner: AutomergeMapProjectionPlanner<T, Row>;
+  readonly #projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeProjectedRow<Row>>>>();
 
   constructor(options: AutomergeMapStorageBindingOptions<Row>) {
     const owned = adoptAutomergeMapStorageBindingOptions<Row>(options);
@@ -312,12 +314,18 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   project = (snapshot: SourceSnapshot<Automerge.Doc<T>>): ProjectionResult<AutomergeProjectedRow<Row>> => {
     const adapted = readyAutomergeSnapshot(snapshot);
     if (adapted === undefined) return { rows: [], completeness: 'unknown', issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
+    const cached = this.#projections.get(adapted.storage)?.get(snapshot.sourceId);
+    if (cached !== undefined) return cached;
     const projection = this.#projectionPlanner.project(adapted);
-    return {
-      rows: projection.rows,
+    const result = sealStorageProjection(Object.freeze({
+      rows: Object.freeze([...projection.rows]),
       completeness: projection.completeness,
-      issues: projection.issues.map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'query'))
-    };
+      issues: Object.freeze(projection.issues.map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'query')))
+    }));
+    const bySource = this.#projections.get(adapted.storage) ?? new Map<string, ProjectionResult<AutomergeProjectedRow<Row>>>();
+    bySource.set(snapshot.sourceId, result);
+    this.#projections.set(adapted.storage, bySource);
+    return result;
   };
 
   plan = (snapshot: SourceSnapshot<Automerge.Doc<T>>, edits: readonly LogicalEdit[]): PlanResult<AutomergeSourceCommand<T>> => {
@@ -329,11 +337,18 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     if (relevant.length === 0) return { handledEdits, readFootprint: empty, writeFootprint: empty, intents: [], issues: [] };
     const adapted = readyAutomergeSnapshot(snapshot);
     if (adapted === undefined) return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
-    const projection = this.#projectionPlanner.project(adapted);
+    const projection = this.project(snapshot);
     const resolvesOnly = relevant.every(({ kind }) => kind === 'conflict-resolve');
     const issues: Issue[] = projection.issues
       .filter((issue) => !resolvesOnly || (issue.code !== 'automerge.map_key_conflict' && issue.code !== 'automerge.logical_key_ambiguous'))
-      .map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'plan'));
+      .map((issue) => ({ ...issue, phase: 'plan' as const }));
+    const rowsByLocator = new Map<string, AutomergeProjectedRow<Row>[]>();
+    for (const row of projection.rows) {
+      const key = canonicalizeJson(row.locator);
+      const bucket = rowsByLocator.get(key);
+      if (bucket === undefined) rowsByLocator.set(key, [row]);
+      else bucket.push(row);
+    }
     const intents: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> }[] = [];
     const addPropertyEdit = (edit: AutomergePropertyEdit): void => {
       const planned = this.#projectionPlanner.plan(adapted, [edit]);
@@ -370,7 +385,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         });
         continue;
       }
-      const candidates = projection.rows.filter((row) => samePortable(row.locator, edit.locator));
+      const candidates = rowsByLocator.get(canonicalizeJson(edit.locator)) ?? [];
       if (candidates.length !== 1) {
         issues.push(adapterIssue(
           candidates.length === 0 ? 'mapping.locator_stale' : 'mapping.locator_invalid',
@@ -447,11 +462,19 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     }
     const writeFootprint = automergePathFootprint(intents.flatMap(({ footprint }) => footprint.entries));
     if (issues.length > 0) return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues };
+    const command: AutomergeSourceCommand<T> | undefined = intents.length === 0
+      ? undefined
+      : {
+          description: intents.map(({ command: planned }) => planned.description).join('; '),
+          apply: (draft) => {
+            for (const intent of intents) intent.command.apply(draft);
+          }
+        };
     return {
       handledEdits,
       readFootprint: this.declaredReadFootprint,
       writeFootprint,
-      intents,
+      intents: command === undefined ? [] : [{ footprint: writeFootprint, command }],
       issues: []
     };
   };

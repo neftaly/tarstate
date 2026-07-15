@@ -103,9 +103,21 @@
       "types": "./dist/source/index.d.ts",
       "import": "./dist/source/index.js"
     },
+    "./source/projection": {
+      "types": "./dist/source/projection/index.d.ts",
+      "import": "./dist/source/projection/index.js"
+    },
     "./transactions": {
       "types": "./dist/transactions/index.d.ts",
       "import": "./dist/transactions/index.js"
+    },
+    "./transactions/authoring": {
+      "types": "./dist/transactions/authoring/index.d.ts",
+      "import": "./dist/transactions/authoring/index.js"
+    },
+    "./transactions/delta": {
+      "types": "./dist/transactions/delta/index.d.ts",
+      "import": "./dist/transactions/delta/index.js"
     }
   },
   "types": "./dist/index.d.ts",

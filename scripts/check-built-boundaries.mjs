@@ -20,6 +20,7 @@ try {
   assertClosure('artifacts/storage-mapping/index.js', 90_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
+  assertClosure('source/projection/index.js', 1_000, []);
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/prepare/index.js', 140_000, ['internal-query-evaluator', 'semantic-query-artifact', 'semantic-schema-lens', 'transaction-']);
   assertClosure('query/model/index.js', 100, []);

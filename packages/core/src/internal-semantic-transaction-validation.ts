@@ -148,6 +148,47 @@ const validateWriteStatement = (
     validateQueryNode(context, statement.root, [...path, 'root'], new Set(), state, depth + 1);
     return;
   }
+  if (statement.kind === 'statement.keyed-delta') {
+    shape(context, statement, ['kind', 'relation', 'alias', 'changes'], [], path);
+    validateWriteRelation(context, statement.relation, [...path, 'relation'], schemaView);
+    const alias = nonEmptyString(context, statement.alias, [...path, 'alias']);
+    const aliases = alias === undefined ? new Set<string>() : new Set([alias]);
+    if (!Array.isArray(statement.changes) || statement.changes.length === 0) {
+      invalid(context, [...path, 'changes'], 'non_empty_array_required');
+      return;
+    }
+    statement.changes.forEach((candidate, index) => {
+      const changePath = [...path, 'changes', index];
+      if (!isRecord(candidate) || typeof candidate.kind !== 'string') {
+        invalid(context, changePath, 'delta_change_shape');
+        return;
+      }
+      if (candidate.kind === 'delta.delete') {
+        shape(context, candidate, ['kind', 'key'], [], changePath);
+        validateWriteExprRecord(context, candidate.key, [...changePath, 'key'], new Set(), state, depth + 1);
+        return;
+      }
+      if (candidate.kind === 'delta.insert') {
+        shape(context, candidate, ['kind', 'fields'], [], changePath);
+        validateWriteExprRecord(context, candidate.fields, [...changePath, 'fields'], new Set(), state, depth + 1);
+        return;
+      }
+      if (candidate.kind === 'delta.update') {
+        shape(context, candidate, ['kind', 'key', 'edits'], [], changePath);
+        validateWriteExprRecord(context, candidate.key, [...changePath, 'key'], new Set(), state, depth + 1);
+        if (!isRecord(candidate.edits) || Object.keys(candidate.edits).length === 0) {
+          invalid(context, [...changePath, 'edits'], 'non_empty_record_required');
+          return;
+        }
+        for (const [name, edit] of Object.entries(candidate.edits)) {
+          validateFieldEdit(context, edit, [...changePath, 'edits', name], aliases, state, depth + 1);
+        }
+        return;
+      }
+      invalid(context, [...changePath, 'kind'], 'unknown_delta_change', { kind: candidate.kind });
+    });
+    return;
+  }
   if (statement.kind === 'statement.update') {
     shape(context, statement, ['kind', 'target', 'edits'], [], path);
     const aliases = validateWriteTarget(

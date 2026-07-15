@@ -58,6 +58,27 @@ export type ProjectionResult<Row = unknown> = {
   readonly issues: readonly Issue[];
 };
 
+const sealedStorageProjections = new WeakSet<object>();
+
+/**
+ * Seals binding-owned immutable rows so the transaction shell need not
+ * canonicalize every field again after the binding has validated projection.
+ */
+export const sealStorageProjection = <Row>(projection: ProjectionResult<Row>): ProjectionResult<Row> => {
+  if (!Object.isFrozen(projection)
+    || !Object.isFrozen(projection.rows)
+    || !Object.isFrozen(projection.issues)
+    || projection.rows.some((row) => row !== null && typeof row === 'object' && !Object.isFrozen(row))) {
+    throw new TypeError('Sealed storage projections must own frozen rows and evidence');
+  }
+  sealedStorageProjections.add(projection);
+  return projection;
+};
+
+/** @internal */
+export const isSealedStorageProjection = (projection: ProjectionResult): boolean =>
+  sealedStorageProjections.has(projection);
+
 export type PlannedEditHandling = {
   readonly editIndex: number;
   /** Cooperative handling permits multiple bindings to contribute intents for one edit. */

@@ -3,8 +3,12 @@ import { comparePortableStrings } from './portable-order.js';
 import { logicalUnknown, type JsonValue } from './value.js';
 import type { QueryLogicalValue } from './query-model.js';
 
+const canonicalValues = new WeakMap<object, string>();
+const sortedRecordKeys = new WeakMap<object, readonly string[]>();
+
 /** Deterministic ordering for every portable query value, including unlike JSON kinds. */
 export const compareQueryJsonValuesTotal = (left: JsonValue, right: JsonValue): number => {
+  if (Object.is(left, right)) return 0;
   const comparable = compareQueryJsonValues(left, right);
   if (comparable !== undefined) return comparable;
   const leftOrder = jsonValueOrder(left);
@@ -30,8 +34,8 @@ export const compareQueryJsonValues = (left: JsonValue, right: JsonValue): numbe
   if (typeof left === 'object' && typeof right === 'object') {
     const leftRecord = left as Readonly<Record<string, JsonValue>>;
     const rightRecord = right as Readonly<Record<string, JsonValue>>;
-    const leftKeys = Object.keys(leftRecord).sort(comparePortableStrings);
-    const rightKeys = Object.keys(rightRecord).sort(comparePortableStrings);
+    const leftKeys = stableRecordKeys(leftRecord);
+    const rightKeys = stableRecordKeys(rightRecord);
     const length = Math.min(leftKeys.length, rightKeys.length);
     for (let index = 0; index < length; index += 1) {
       const leftKey = leftKeys[index] as string;
@@ -68,12 +72,26 @@ export const containsQueryLogicalUnknown = (value: QueryLogicalValue): boolean =
 /** Canonical internal equality key; tags keep logical unknown disjoint from every JSON value. */
 export const canonicalizeQueryValue = (value: QueryLogicalValue): string => {
   if (value === logicalUnknown) return 'u';
-  if (Array.isArray(value)) return 'a[' + value.map(canonicalizeQueryValue).join(',') + ']';
   if (value !== null && typeof value === 'object') {
-    const record = value as Readonly<Record<string, QueryLogicalValue>>;
-    return 'o{' + Object.keys(record).sort().map((key) => JSON.stringify(key) + ':' + canonicalizeQueryValue(record[key] as QueryLogicalValue)).join(',') + '}';
+    const cached = canonicalValues.get(value);
+    if (cached !== undefined) return cached;
   }
-  return 'j' + canonicalizeJson(value);
+  let canonical: string;
+  if (Array.isArray(value)) canonical = 'a[' + value.map(canonicalizeQueryValue).join(',') + ']';
+  else if (value !== null && typeof value === 'object') {
+    const record = value as Readonly<Record<string, QueryLogicalValue>>;
+    canonical = 'o{' + stableRecordKeys(record).map((key) => JSON.stringify(key) + ':' + canonicalizeQueryValue(record[key] as QueryLogicalValue)).join(',') + '}';
+  } else canonical = 'j' + canonicalizeJson(value);
+  if (value !== null && typeof value === 'object' && Object.isFrozen(value)) canonicalValues.set(value, canonical);
+  return canonical;
+};
+
+const stableRecordKeys = (record: Readonly<Record<string, unknown>>): readonly string[] => {
+  const cached = sortedRecordKeys.get(record);
+  if (cached !== undefined) return cached;
+  const keys = Object.keys(record).sort(comparePortableStrings);
+  if (Object.isFrozen(record)) sortedRecordKeys.set(record, keys);
+  return keys;
 };
 
 export const queryValueEqual = (left: QueryLogicalValue, right: QueryLogicalValue): boolean => {

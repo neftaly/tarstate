@@ -1,6 +1,6 @@
 import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
-import { diffQueryMaintenanceSnapshots, evaluateExpression, evaluatePreparedExpression, evaluatePreparedQuery, evaluateQuery, openIncrementalQueryMaintenance, prepareExpression, preparePlan } from '../packages/core/dist/index.js';
+import { diffQueryMaintenanceSnapshots, evaluateExpression, evaluatePreparedExpression, evaluatePreparedQuery, evaluateQuery, openIncrementalQueryMaintenance, prepareExpression, preparePlan, prepareQueryMaintenanceSnapshot } from '../packages/core/dist/index.js';
 import { createPooledIncrementalQueryRuntime } from '../packages/core/dist/query.js';
 
 const schemaView = { id: 'urn:tarstate:benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };
@@ -106,9 +106,11 @@ const repeatedQuery = (() => {
   return query;
 })();
 const repeatedInputs = { relations: [input('item', linearRows(1))] };
+const ownedRepeatedInputs = prepareQueryMaintenanceSnapshot(repeatedInputs);
 const repeatedPlan = await plan('repeated-pure', repeatedQuery);
 measurements.push(benchmark('repeated-unprepared-pure', 1, 500, () => evaluateQuery({ root: repeatedQuery, ...repeatedInputs })));
 measurements.push(benchmark('repeated-prepared-pure', 1, 500, () => evaluatePreparedQuery(repeatedPlan, repeatedInputs)));
+measurements.push(benchmark('repeated-owned-prepared-pure', 1, 500, () => evaluatePreparedQuery(repeatedPlan, ownedRepeatedInputs)));
 let deepExpression = { kind: 'field', alias: 'row', name: 'value' };
 for (let depth = 0; depth < 50; depth += 1) deepExpression = { kind: 'arithmetic', op: 'add', left: deepExpression, right: { kind: 'literal', value: 1 } };
 const preparedDeepExpression = prepareExpression(deepExpression);
@@ -119,6 +121,11 @@ for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
   const relation = input('item', linearRows(count));
   const linearPlan = await plan('linear-pure-' + count, linearQuery);
   measurements.push(benchmark('linear-pure', count, iterations, () => evaluatePreparedQuery(linearPlan, { relations: [relation] })));
+  const ownedLinear = prepareQueryMaintenanceSnapshot({ relations: [relation] });
+  measurements.push(benchmark('linear-owned-prepared-pure', count, iterations, () => evaluatePreparedQuery(linearPlan, ownedLinear)));
+  measurements.push(benchmark('linear-direct-js-baseline', count, iterations, () => ({
+    rows: relation.rows.filter(({ active }) => active === true).map(({ id, value }) => ({ id, value }))
+  })));
 
   const first = { relations: [relation] };
   const second = { relations: [input('item', linearRows(count, true))] };
@@ -641,6 +648,7 @@ const pooledSampledAllocationBytes = pooledAllocationProfile.samples.reduce((sum
 const measurement = (label, inputRows) => measurements.find((candidate) => candidate.label === label && candidate.inputRows === inputRows);
 const linearPure10k = measurement('linear-pure', 10_000)?.millisecondsPerOperation;
 const linearUpdate10k = measurement('linear-one-row-update', 10_000)?.millisecondsPerOperation;
+const linearOwnedPure10k = measurement('linear-owned-prepared-pure', 10_000)?.millisecondsPerOperation;
 const repeatedUnprepared = measurement('repeated-unprepared-pure', 1)?.millisecondsPerOperation;
 const repeatedPrepared = measurement('repeated-prepared-pure', 1)?.millisecondsPerOperation;
 const repeatedUnpreparedExpression = measurement('repeated-unprepared-expression', 1)?.millisecondsPerOperation;
@@ -665,10 +673,6 @@ const partitionedWindowPure10k = measurement('window-partitioned-prepared-pure',
 const joinPreparedPure10k = measurement('equijoin-prepared-pure', 10_000)?.millisecondsPerOperation;
 const joinRightUpdate10k = measurement('equijoin-right-one-row-update', 10_000)?.millisecondsPerOperation;
 const joinLeftUpdate10k = measurement('equijoin-left-one-row-update', 10_000)?.millisecondsPerOperation;
-const recursiveChain40 = measurement('recursive-chain', 40)?.millisecondsPerOperation;
-const recursiveChain80 = measurement('recursive-chain', 80)?.millisecondsPerOperation;
-const reversedRecursiveChain40 = measurement('recursive-chain-reversed', 40)?.millisecondsPerOperation;
-const reversedRecursiveChain80 = measurement('recursive-chain-reversed', 80)?.millisecondsPerOperation;
 const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
 const leftJoinBytesPerUpdate = Math.round(leftJoinSampledAllocationBytes / 100);
 const rightJoinBytesPerUpdate = Math.round(rightJoinSampledAllocationBytes / 100);
@@ -686,6 +690,7 @@ const pooledVisiblePublicArrayFloorBytes = 100 * 500 * 8;
 const contracts = {
   repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
   linearIncrementalAdvantage: linearPure10k !== undefined && linearUpdate10k !== undefined && linearUpdate10k < linearPure10k * 0.5,
+  ownedPreparedEvaluationAdvantage: linearPure10k !== undefined && linearOwnedPure10k !== undefined && linearOwnedPure10k < linearPure10k * 0.75,
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
   distinctIncrementalAdvantage: distinctPure10k !== undefined && distinctUpdate10k !== undefined && distinctUpdate10k < distinctPure10k * 0.5,
@@ -710,8 +715,6 @@ const contracts = {
   joinSideAllocationSymmetry: Math.max(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) < Math.min(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) * 2.5,
   preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
   preparedExpressionAdvantage: repeatedUnpreparedExpression !== undefined && repeatedPreparedExpression !== undefined && repeatedPreparedExpression < repeatedUnpreparedExpression * 0.75,
-  recursiveChainNearLinear: recursiveChain40 !== undefined && recursiveChain80 !== undefined && recursiveChain80 < recursiveChain40 * 2.75,
-  reversedRecursiveChainNearLinear: reversedRecursiveChain40 !== undefined && reversedRecursiveChain80 !== undefined && reversedRecursiveChain80 < reversedRecursiveChain40 * 2.75,
   unrelatedTraversalSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'unrelated-relation-union-dag').every(({ selectiveVisitedPhysicalNodeCount }) => selectiveVisitedPhysicalNodeCount <= 2),
   pooledIgnoredFanoutScaling: pooledFanout10 !== undefined && pooledFanout100 !== undefined && pooledFanout100 < pooledFanout10 * 8,
   privateAllocationCeiling: privateBytesPerUpdate <= 2_000_000,

@@ -41,11 +41,21 @@ export type FieldEdit =
   | { readonly kind: 'edit.conflict-resolve'; readonly observed: readonly JsonValue[]; readonly value: WriteExpression }
   | { readonly kind: 'extension'; readonly capability: CapabilityRef; readonly payload: JsonValue };
 
+export type KeyedDeltaChange =
+  | { readonly kind: 'delta.delete'; readonly key: Readonly<Record<string, WriteExpression>> }
+  | { readonly kind: 'delta.insert'; readonly fields: Readonly<Record<string, WriteExpression>> }
+  | {
+      readonly kind: 'delta.update';
+      readonly key: Readonly<Record<string, WriteExpression>>;
+      readonly edits: Readonly<Record<string, FieldEdit>>;
+    };
+
 export type WriteStatement =
   | { readonly kind: 'statement.insert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
   | { readonly kind: 'statement.insert-from-query'; readonly relation: WriteRelation; readonly root: QueryNode }
   | { readonly kind: 'statement.upsert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[]; readonly onConflict: InsertConflictPolicy }
   | { readonly kind: 'statement.replace-all'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
+  | { readonly kind: 'statement.keyed-delta'; readonly relation: WriteRelation; readonly alias: string; readonly changes: readonly KeyedDeltaChange[] }
   | { readonly kind: 'statement.update'; readonly target: WriteTarget; readonly edits: Readonly<Record<string, FieldEdit>> }
   | { readonly kind: 'statement.delete'; readonly target: WriteTarget }
   | { readonly kind: 'statement.rekey'; readonly target: WriteTarget; readonly key: Readonly<Record<string, WriteExpression>>; readonly references: 'source-local-declared' | 'reject-if-referenced'; readonly requires: CapabilityRef }

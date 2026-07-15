@@ -9,7 +9,7 @@ import {
   type OperationLedgerProtocol,
   type OperationReservation
 } from './lifecycle-governance.js';
-import type { WritableLogicalRow, WritableLogicalState } from './logical-edit.js';
+import { isSealedStorageProjection, type WritableLogicalRow, type WritableLogicalState } from './logical-edit.js';
 import type { SourceBasis } from './source-state.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { QueryNode } from './query-model.js';
@@ -640,6 +640,9 @@ const evaluateStatement = <Storage, Command>(
     if ('issue' in inserts) return failedStatement(empty, inserts.issue);
     return { editGroups: [inserts.edits], result: { ...empty, inserted: inserts.edits.length, logicallyChanged: inserts.edits.length, issues: queried.issues } };
   }
+  if (statement.kind === 'statement.keyed-delta') {
+    return evaluateKeyedDelta(statement, empty, relation.relationId, keyFields, rows, parameters);
+  }
   const selected = selectTargets(statement.target, rows, parameters);
   if (!selected.success) return failedStatement(empty, selected.issue);
   if (statement.kind === 'statement.delete') {
@@ -664,6 +667,81 @@ const evaluateStatement = <Storage, Command>(
   return {
     editGroups: [edits],
     result: { ...empty, matched: selected.value.length, logicallyChanged: changed, editOutcomes: uniqueOutcomes(outcomes) }
+  };
+};
+
+const evaluateKeyedDelta = (
+  statement: Extract<WriteStatement, { readonly kind: 'statement.keyed-delta' }>,
+  empty: StatementResult,
+  relationId: string,
+  keyFields: readonly string[],
+  rows: readonly WritableLogicalRow[],
+  parameters: Readonly<Record<string, JsonValue>>
+): EvaluatedStatement => {
+  const existing = new Map<string, WritableLogicalRow[]>();
+  for (const row of rows) {
+    const fingerprint = canonicalizeJson(row.key);
+    const bucket = existing.get(fingerprint);
+    if (bucket === undefined) existing.set(fingerprint, [row]);
+    else bucket.push(row);
+  }
+  const changedKeys = new Set<string>();
+  const edits: LogicalEdit[] = [];
+  const outcomes: SemanticEditOutcome[] = [];
+  let matched = 0;
+  let inserted = 0;
+  let deleted = 0;
+  let changed = 0;
+  for (const change of statement.changes) {
+    const fields = change.kind === 'delta.insert'
+      ? evaluateFields(change.fields, {}, parameters)
+      : evaluateFields(change.key, {}, parameters);
+    if (!fields.success) return failedStatement(empty, fields.issue);
+    const key = logicalKey(fields.value, keyFields);
+    if (key === undefined) return failedStatement(empty, transactionIssue('transaction.delta_key_missing', undefined, { relationId, keyFields }));
+    const fingerprint = canonicalizeJson(key);
+    if (changedKeys.has(fingerprint)) return failedStatement(empty, transactionIssue('transaction.delta_input_ambiguous', undefined, { relationId, key }));
+    changedKeys.add(fingerprint);
+    const matches = existing.get(fingerprint) ?? [];
+    if (change.kind === 'delta.insert') {
+      if (matches.length > 0) return failedStatement(empty, transactionIssue('transaction.upsert_conflict', undefined, { relationId, key }));
+      edits.push({ kind: 'insert', relationId, key, fields: fields.value });
+      inserted += 1;
+      changed += 1;
+      continue;
+    }
+    if (matches.length !== 1) {
+      return failedStatement(empty, transactionIssue(
+        matches.length === 0 ? 'transaction.delta_target_missing' : 'transaction.delta_target_ambiguous',
+        undefined,
+        { relationId, key }
+      ));
+    }
+    const row = matches[0] as WritableLogicalRow;
+    matched += 1;
+    if (change.kind === 'delta.delete') {
+      edits.push({ kind: 'delete', relationId, key: row.key, locator: row.locator });
+      deleted += 1;
+      changed += 1;
+      continue;
+    }
+    const evaluated = evaluateRowEdits(row, change.edits, statement.alias, parameters);
+    if (!evaluated.success) return failedStatement({ ...empty, matched }, evaluated.issue);
+    outcomes.push(...evaluated.outcomes);
+    if (!evaluated.changed) continue;
+    edits.push(...evaluated.edits);
+    changed += 1;
+  }
+  return {
+    editGroups: [edits],
+    result: {
+      ...empty,
+      matched,
+      inserted,
+      deleted,
+      logicallyChanged: changed,
+      editOutcomes: uniqueOutcomes(outcomes)
+    }
   };
 };
 
@@ -785,6 +863,10 @@ const projectLogicalState = <Storage, Command>(
     issues.push(...projection.issues);
     if (projection.completeness !== 'exact') {
       issues.push(createIssue({ code: 'observer.projection_unavailable', sourceId: snapshot.sourceId, details: { bindingId: binding.id, completeness: projection.completeness } }));
+      continue;
+    }
+    if (isSealedStorageProjection(projection)) {
+      rows.push(...projection.rows as readonly WritableLogicalRow[]);
       continue;
     }
     for (const candidate of projection.rows) {
@@ -1124,7 +1206,15 @@ const isError = (issue: Issue): boolean => issue.severity === 'error';
 const emptyLogicalState: WritableLogicalState = Object.freeze({ rows: Object.freeze([]) });
 const emptyStatementResult = (statementIndex: number): StatementResult => ({ statementIndex, matched: 0, logicallyChanged: 0, inserted: 0, deleted: 0, editOutcomes: [], issues: [] });
 const failedStatement = (empty: StatementResult, ...issues: readonly Issue[]): EvaluatedStatement => ({ editGroups: [], result: { ...empty, issues } });
-const statementRelation = (statement: WriteStatement): WriteRelation | undefined => statement.kind === 'extension' ? undefined : statement.kind === 'statement.insert' || statement.kind === 'statement.insert-from-query' || statement.kind === 'statement.upsert' || statement.kind === 'statement.replace-all' ? statement.relation : statement.target.relation;
+const statementRelation = (statement: WriteStatement): WriteRelation | undefined => statement.kind === 'extension'
+  ? undefined
+  : statement.kind === 'statement.insert'
+    || statement.kind === 'statement.insert-from-query'
+    || statement.kind === 'statement.upsert'
+    || statement.kind === 'statement.replace-all'
+    || statement.kind === 'statement.keyed-delta'
+    ? statement.relation
+    : statement.target.relation;
 const expressionFailure = (code: string, details: JsonValue): { readonly success: false; readonly issue: Issue } => ({ success: false, issue: transactionIssue(code, undefined, details) });
 const transactionIssue = (code: string, attempt?: Pick<TransactionAttempt, 'operationId'>, details?: JsonValue, retry?: Issue['retry']): Issue => createIssue({ code, ...(attempt === undefined ? {} : { operationId: attempt.operationId }), ...(details === undefined ? {} : { details }), ...(retry === undefined ? {} : { retry }) });
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;

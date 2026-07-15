@@ -1,5 +1,5 @@
 import * as Automerge from '@automerge/automerge';
-import { canonicalizeJson, type JsonValue } from '@tarstate/core/foundation';
+import { canonicalizeJson, safeParseJsonValue, type JsonValue } from '@tarstate/core/foundation';
 import { conflictsAt, normalizeAutomergeValue, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import { isAutomergeReservedRootProperty } from './reserved.js';
 import { comparePortableStrings } from './portable-order.js';
@@ -109,14 +109,14 @@ export class AutomergeMapProjectionPlanner<T extends object, Row extends Readonl
           issues.push({ code: 'automerge.row_identity_unavailable', path });
           continue;
         }
-        rows.push({
+        rows.push(Object.freeze({
           relationId: this.relationId,
-          key: [key],
+          key: Object.freeze([key]) as readonly [JsonValue],
           fields: parsed.row,
-          locator,
-          storagePath: path,
+          locator: Object.freeze(locator),
+          storagePath: Object.freeze(path),
           ...(changeHash === '' ? {} : { conflictChangeHash: changeHash })
-        });
+        }));
       }
       if (conflictAlternatives.length > 1) {
         issues.push({
@@ -153,13 +153,15 @@ export class AutomergeMapProjectionPlanner<T extends object, Row extends Readonl
     | { readonly success: false; readonly issue: AutomergeProjectionIssue } {
     if (this.#options.parse !== undefined) {
       try {
-        return this.#options.parse(candidate, { mapKey, path });
+        const parsed = this.#options.parse(candidate, { mapKey, path });
+        if (!parsed.success) return parsed;
+        return ownParsedRow(parsed.row, path);
       } catch (error) {
         return { success: false, issue: { code: 'automerge.row_parser_failed', path, details: { message: error instanceof Error ? error.message : String(error) } } };
       }
     }
     if (!isRecord(candidate)) return { success: false, issue: { code: 'automerge.row_invalid', path } };
-    return { success: true, row: normalizeAutomergeValue(candidate) as Row };
+    return ownParsedRow(normalizeAutomergeValue(candidate), path);
   }
 
   #logicalKey(mapKey: string, row: Row): JsonValue | undefined {
@@ -168,6 +170,30 @@ export class AutomergeMapProjectionPlanner<T extends object, Row extends Readonl
     return value === undefined ? undefined : value;
   }
 }
+
+const ownParsedRow = <Row extends Readonly<Record<string, JsonValue>>>(
+  candidate: unknown,
+  path: AutomergePath
+): { readonly success: true; readonly row: Row } | { readonly success: false; readonly issue: AutomergeProjectionIssue } => {
+  const owned = safeParseJsonValue(candidate);
+  if (!owned.success || owned.value === null || Array.isArray(owned.value) || typeof owned.value !== 'object') {
+    return {
+      success: false,
+      issue: {
+        code: 'automerge.row_invalid',
+        path,
+        ...(owned.success ? {} : { details: { issueCodes: owned.issues.map(({ code }) => code) } })
+      }
+    };
+  }
+  return { success: true, row: freezeOwnedJson(owned.value) as Row };
+};
+
+const freezeOwnedJson = (value: JsonValue): JsonValue => {
+  if (value === null || typeof value !== 'object') return value;
+  for (const child of Array.isArray(value) ? value : Object.values(value)) freezeOwnedJson(child);
+  return Object.freeze(value);
+};
 
 export const snapshotAutomergeDocument = <T extends object>(sourceId: string, storage: Automerge.Doc<T>): AutomergeSnapshot<T> => ({
   sourceId,

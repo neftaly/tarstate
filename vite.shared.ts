@@ -28,7 +28,10 @@ export const corePublicEntryNames = [
   'query/prepare',
   'schema',
   'source',
-  'transactions'
+  'source/projection',
+  'transactions',
+  'transactions/authoring',
+  'transactions/delta'
 ] as const;
 
 const sourceAlias = (repoRoot: string, find: string, replacement: string) => ({

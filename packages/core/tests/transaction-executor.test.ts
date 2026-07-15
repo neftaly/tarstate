@@ -68,7 +68,7 @@ const makeContext = async (satisfiesCapability: (capability: CapabilityRef) => b
     constraints,
     durability: 'memory'
   });
-  return { source, context };
+  return { source, binding, context };
 };
 
 const transaction = () => sealTransaction({ body: {
@@ -415,5 +415,42 @@ describe('prepared source-local transaction executor', () => {
     } });
     await expect(executePreparedTransaction(context, attempt(value, 'operation:upsert-replace-row'))).resolves.toMatchObject({ outcome: 'committed' });
     expect(source.snapshot()).toMatchObject({ storage: { items: [{ id: 'a', title: 'Only' }] } });
+  });
+
+  it('stages a keyed delta as one ordered edit group', async () => {
+    const { source, binding, context } = await makeContext();
+    const plan = vi.spyOn(binding, 'plan');
+    const value = await sealTransaction({ body: {
+      schemaView,
+      parameters: {},
+      statements: [{
+        kind: 'statement.keyed-delta',
+        relation,
+        alias: 'item',
+        changes: [
+          {
+            kind: 'delta.update',
+            key: { id: literal('a') },
+            edits: { title: { kind: 'edit.replace', value: literal('Changed') } }
+          },
+          {
+            kind: 'delta.insert',
+            fields: { id: literal('b'), title: literal('Inserted') }
+          }
+        ]
+      }],
+      guards: [],
+      requiredCapabilities: []
+    } });
+    await expect(executePreparedTransaction(context, attempt(value, 'operation:keyed-delta'))).resolves.toMatchObject({
+      outcome: 'committed',
+      statementResults: [{ matched: 1, inserted: 1, logicallyChanged: 2 }]
+    });
+    expect(source.snapshot()).toMatchObject({ storage: { items: [
+      { id: 'a', title: 'Changed', count: 1 },
+      { id: 'b', title: 'Inserted' }
+    ] } });
+    expect(plan).toHaveBeenCalledOnce();
+    expect(plan.mock.results[0]?.value).toMatchObject({ intents: [{ command: { description: 'update logical memory relation items' } }] });
   });
 });

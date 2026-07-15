@@ -78,6 +78,7 @@ export type StorageEditPlan = {
   readonly intents: readonly MappedStorageIntent[];
   readonly nextSnapshot: unknown;
 };
+export type StorageIntentPlan = Omit<StorageEditPlan, 'nextSnapshot'>;
 
 export const compileStorageMapping = (
   input: unknown,
@@ -169,6 +170,52 @@ export const planStoragePatch = (
   registry?: CapabilityRegistry,
   sourceId?: string
 ): ParseResult<StorageEditPlan> => {
+  const planned = planStorageIntentDetails(binding, snapshot, relationId, locator, edits, registry, sourceId);
+  if (!planned.success) return planned;
+  const nextSnapshot = setPath(snapshot, planned.value.absolutePath, planned.value.nextCandidate);
+  if (!nextSnapshot.success) return nextSnapshot;
+  const ownedNextSnapshot = detachAndFreezeJsonValue(nextSnapshot.value);
+  if (!ownedNextSnapshot.success) return mappingFailure('mapping.path_invalid', [], { reason: 'non_portable_snapshot' });
+  return {
+    success: true,
+    value: Object.freeze({ ...planned.value.plan, nextSnapshot: ownedNextSnapshot.value }),
+    issues: []
+  };
+};
+
+/**
+ * Plans portable path intents without materializing and owning a complete next
+ * storage snapshot. Sources should prefer this form and stage the intents in
+ * their own immutable representation.
+ */
+export const planStorageIntents = (
+  binding: CompiledStorageMapping,
+  snapshot: unknown,
+  relationId: RelationId,
+  locator: MappingLocator,
+  edits: Readonly<Record<string, unknown>>,
+  registry?: CapabilityRegistry,
+  sourceId?: string
+): ParseResult<StorageIntentPlan> => {
+  const planned = planStorageIntentDetails(binding, snapshot, relationId, locator, edits, registry, sourceId);
+  return planned.success
+    ? { success: true, value: planned.value.plan, issues: [] }
+    : planned;
+};
+
+const planStorageIntentDetails = (
+  binding: CompiledStorageMapping,
+  snapshot: unknown,
+  relationId: RelationId,
+  locator: MappingLocator,
+  edits: Readonly<Record<string, unknown>>,
+  registry?: CapabilityRegistry,
+  sourceId?: string
+): ParseResult<{
+  readonly plan: StorageIntentPlan;
+  readonly absolutePath: StoragePath;
+  readonly nextCandidate: unknown;
+}> => {
   assertCompiledStorageMapping(binding);
   const compiled = binding.relations.get(relationId);
   if (compiled === undefined) return mappingFailure('mapping.relation_missing', [], { relationId });
@@ -200,20 +247,19 @@ export const planStoragePatch = (
     intents.push({ kind: 'replace', path: [...located.value.absolutePath, ...fieldMapping.path], value: parsed.value, capability: fieldMapping.write.capability });
   }
   if (issues.length > 0) return { success: false, issues };
-  const nextSnapshot = setPath(snapshot, located.value.absolutePath, nextCandidate);
-  if (!nextSnapshot.success) return nextSnapshot;
-  const ownedNextSnapshot = detachAndFreezeJsonValue(nextSnapshot.value);
-  if (!ownedNextSnapshot.success) return mappingFailure('mapping.path_invalid', [], { reason: 'non_portable_snapshot' });
   const readFootprint = [compiled.mapping.collection.path, ...Object.values(compiled.mapping.fields).map((field) => [...located.value.absolutePath, ...field.path])];
   return {
     success: true,
     value: Object.freeze({
-      relationId,
-      locator: Object.freeze({ ...locator }),
-      readFootprint: Object.freeze(readFootprint.map((path) => Object.freeze([...path]))),
-      writeFootprint: Object.freeze(intents.map((intent) => intent.path)),
-      intents: Object.freeze(intents.map((intent) => Object.freeze({ ...intent, path: Object.freeze([...intent.path]) }))),
-      nextSnapshot: ownedNextSnapshot.value
+      plan: Object.freeze({
+        relationId,
+        locator: Object.freeze({ ...locator }),
+        readFootprint: Object.freeze(readFootprint.map((path) => Object.freeze([...path]))),
+        writeFootprint: Object.freeze(intents.map((intent) => intent.path)),
+        intents: Object.freeze(intents.map((intent) => Object.freeze({ ...intent, path: Object.freeze([...intent.path]) })))
+      }),
+      absolutePath: Object.freeze([...located.value.absolutePath]),
+      nextCandidate
     }),
     issues: []
   };

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   authorExactKeyedRelationDelta,
+  prepareExactKeyedRelationRows,
   type ExactKeyedRelationDeltaInput
 } from '@tarstate/core/transactions';
 import type { ArtifactRef } from '../src/index.js';
@@ -39,23 +40,20 @@ describe('exact keyed relation-delta authoring', () => {
       success: true,
       value: [
         {
-          kind: 'statement.delete',
-          target: {
-            alias: 'row',
-            where: { kind: 'compare', left: { kind: 'field', name: 'id' }, right: { kind: 'literal', value: 'b' } }
-          }
-        },
-        {
-          kind: 'statement.update',
-          target: {
-            alias: 'row',
-            where: { kind: 'compare', left: { kind: 'field', name: 'id' }, right: { kind: 'literal', value: 'a' } }
-          },
-          edits: { title: { kind: 'edit.replace', value: { kind: 'literal', value: 'After' } } }
-        },
-        {
-          kind: 'statement.insert',
-          rows: [{ count: { kind: 'literal', value: 4 }, id: { kind: 'literal', value: 'd' }, title: { kind: 'literal', value: 'Inserted' } }]
+          kind: 'statement.keyed-delta',
+          alias: 'row',
+          changes: [
+            { kind: 'delta.delete', key: { id: { kind: 'literal', value: 'b' } } },
+            {
+              kind: 'delta.update',
+              key: { id: { kind: 'literal', value: 'a' } },
+              edits: { title: { kind: 'edit.replace', value: { kind: 'literal', value: 'After' } } }
+            },
+            {
+              kind: 'delta.insert',
+              fields: { count: { kind: 'literal', value: 4 }, id: { kind: 'literal', value: 'd' }, title: { kind: 'literal', value: 'Inserted' } }
+            }
+          ]
         }
       ]
     });
@@ -125,5 +123,17 @@ describe('exact keyed relation-delta authoring', () => {
       success: false,
       issues: [{ code: 'transaction.delta_invalid', details: { reason: 'input_shape' } }]
     });
+  });
+
+  it('reuses explicitly prepared exact states across comparisons', () => {
+    const source = { completeness: 'exact' as const, rows: [{ id: 'a', title: 'Before', count: 1 }] };
+    const prepared = prepareExactKeyedRelationRows(source);
+    expect(prepared.success).toBe(true);
+    if (!prepared.success) return;
+    const reused = prepareExactKeyedRelationRows(prepared.value);
+    expect(reused.success && reused.value).toBe(prepared.value);
+    source.rows[0]!.title = 'Mutated';
+    expect(authorExactKeyedRelationDelta(input({ before: prepared.value }))).toMatchObject({ success: true });
+    expect(prepared.value.rows[0]).toEqual({ id: 'a', title: 'Before', count: 1 });
   });
 });

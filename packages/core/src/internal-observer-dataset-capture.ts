@@ -59,6 +59,12 @@ export class DatasetCaptureRuntime<Projection> {
   #unsubscribeDataset: () => void = () => undefined;
   #unsubscribeCatalog: () => void = () => undefined;
   readonly #sourceUnsubscribes = new Map<object, () => void>();
+  readonly #dirtySources = new Set<object>();
+  readonly #sourceSnapshots = new WeakMap<object, { readonly snapshot: SourceSnapshot<unknown> } | { readonly error: unknown }>();
+  readonly #projections = new WeakMap<object, {
+    readonly snapshot: SourceSnapshot<unknown>;
+    readonly projection: AttachmentProjection<Projection>;
+  }>();
   #state!: DatasetCaptureState<Projection>;
   #refreshing = false;
   #pending = false;
@@ -193,12 +199,18 @@ export class DatasetCaptureRuntime<Projection> {
     }
     for (const [source, observable] of desired) {
       if (this.#sourceUnsubscribes.has(source)) continue;
-      this.#sourceUnsubscribes.set(source, observable.subscribe(() => this.#requestRefresh()));
+      this.#dirtySources.add(source);
+      this.#sourceUnsubscribes.set(source, observable.subscribe(() => {
+        this.#dirtySources.add(source);
+        this.#requestRefresh();
+      }));
     }
   }
 
   #capture(): EvaluationSnapshot<Projection> {
     const dataset = this.#options.dataset.snapshot();
+    const previousMembers = new Map((this.#state?.captured.members ?? []).map((candidate) => [candidate.member.attachmentId, candidate]));
+    const previousAvailable = new Map((this.#state?.captured.available ?? []).map((candidate) => [candidate.member.attachmentId, candidate]));
     const snapshots = new Map<object, { readonly snapshot: SourceSnapshot<unknown> } | { readonly error: unknown }>();
     const members = dataset.members.map((member): CapturedMember<Projection> => {
       const raw = this.#options.attachments.get(member.attachmentId);
@@ -214,10 +226,17 @@ export class DatasetCaptureRuntime<Projection> {
       const attachment = raw as DatabaseAttachment<unknown, Projection>;
       let capturedSource = snapshots.get(attachment.source);
       if (capturedSource === undefined) {
-        try {
-          capturedSource = { snapshot: attachment.source.snapshot() as SourceSnapshot<unknown> };
-        } catch (error) {
-          capturedSource = { error };
+        capturedSource = this.#dirtySources.has(attachment.source)
+          ? undefined
+          : this.#sourceSnapshots.get(attachment.source);
+        if (capturedSource === undefined) {
+          try {
+            capturedSource = { snapshot: attachment.source.snapshot() as SourceSnapshot<unknown> };
+          } catch (error) {
+            capturedSource = { error };
+          }
+          this.#sourceSnapshots.set(attachment.source, capturedSource);
+          this.#dirtySources.delete(attachment.source);
         }
         snapshots.set(attachment.source, capturedSource);
       }
@@ -226,10 +245,16 @@ export class DatasetCaptureRuntime<Projection> {
       if (snapshot.sourceId !== attachment.sourceId) return { member, attachment, authorized: true, sourceMismatch: true };
       let projection: AttachmentProjection<Projection> | undefined;
       if (snapshot.state === 'ready') {
-        try {
-          projection = attachment.project(snapshot);
-        } catch (error) {
-          projection = { state: 'failed', issues: [captureFailureIssue('attachment_projection_failed', member, error)] };
+        const cached = this.#projections.get(attachment);
+        if (cached?.snapshot === snapshot) {
+          projection = cached.projection;
+        } else {
+          try {
+            projection = attachment.project(snapshot);
+          } catch (error) {
+            projection = { state: 'failed', issues: [captureFailureIssue('attachment_projection_failed', member, error)] };
+          }
+          this.#projections.set(attachment, { snapshot, projection });
         }
       }
       return {
@@ -239,9 +264,19 @@ export class DatasetCaptureRuntime<Projection> {
         ...(projection === undefined ? {} : { projection }),
         authorized: true
       };
-    }).map((member) => Object.freeze(member));
+    }).map((candidate) => {
+      const previous = previousMembers.get(candidate.member.attachmentId);
+      return previous !== undefined && sameCapturedMember(previous, candidate)
+        ? previous
+        : Object.freeze(candidate);
+    });
     const available = members.flatMap((candidate): readonly AvailableQueryAttachment<Projection>[] => {
       if (candidate.attachment === undefined || candidate.snapshot === undefined || candidate.projection?.state !== 'ready') return [];
+      const previous = previousAvailable.get(candidate.member.attachmentId);
+      if (previous?.member === candidate.member
+        && previous.attachment === candidate.attachment
+        && previous.snapshot === candidate.snapshot
+        && previous.projection === candidate.projection.value) return [previous];
       return [Object.freeze({
         member: candidate.member,
         attachment: candidate.attachment,
@@ -266,6 +301,17 @@ export class DatasetCaptureRuntime<Projection> {
     this.#sourceUnsubscribes.clear();
   }
 }
+
+const sameCapturedMember = <Projection>(
+  left: CapturedMember<Projection>,
+  right: CapturedMember<Projection>
+): boolean => left.member === right.member
+  && left.attachment === right.attachment
+  && left.snapshot === right.snapshot
+  && left.projection === right.projection
+  && left.authorized === right.authorized
+  && left.sourceMismatch === right.sourceMismatch
+  && left.captureIssues === right.captureIssues;
 
 const captureFailureIssue = (reason: string, member: DatasetMember, error: unknown): Issue => createIssue({
   code: 'observer.evaluation_failed',

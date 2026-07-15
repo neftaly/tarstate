@@ -278,6 +278,47 @@ describe('database membership and observation', () => {
     attachmentLease.close();
   });
 
+  it('does not resnapshot or reproject unchanged sources during another source refresh', () => {
+    const firstSource = new TestSource('source:projection-cache:first', [{ id: 1, value: 'one' }]);
+    const secondSource = new TestSource('source:projection-cache:second', [{ id: 2, value: 'two' }]);
+    const firstInput = attachment('attachment:projection-cache:first', firstSource);
+    const secondInput = attachment('attachment:projection-cache:second', secondSource);
+    const firstProject = vi.fn(firstInput.preparation.project);
+    const secondProject = vi.fn(secondInput.preparation.project);
+    const catalog = new AttachmentCatalog();
+    const firstLease = catalog.attach({ ...firstInput, preparation: { ...firstInput.preparation, project: firstProject } });
+    const secondLease = catalog.attach({ ...secondInput, preparation: { ...secondInput.preparation, project: secondProject } });
+    const dataset = new DatasetMembership({
+      datasetId: 'dataset:one',
+      state: 'settled',
+      members: [
+        member(firstInput.attachmentId, firstSource.sourceId),
+        member(secondInput.attachmentId, secondSource.sourceId)
+      ]
+    });
+    const database = view(catalog, [dataset]);
+    const observer = database.observe({ plan: plan() });
+    expect(firstProject).toHaveBeenCalledOnce();
+    expect(secondProject).toHaveBeenCalledOnce();
+    expect(firstSource.snapshotCount()).toBe(1);
+    expect(secondSource.snapshotCount()).toBe(1);
+
+    firstSource.publish({ rows: [{ id: 1, value: 'changed' }] });
+    expect(firstProject).toHaveBeenCalledTimes(2);
+    expect(secondProject).toHaveBeenCalledOnce();
+    expect(firstSource.snapshotCount()).toBe(2);
+    expect(secondSource.snapshotCount()).toBe(1);
+    expect(observer.getSnapshot()).toMatchObject({ current: { rows: [
+      { id: 1, value: 'changed' },
+      { id: 2, value: 'two' }
+    ] } });
+
+    observer.close();
+    database.close();
+    secondLease.close();
+    firstLease.close();
+  });
+
   it('rejects ambiguous database dataset identities', () => {
     const catalog = new AttachmentCatalog();
     const first = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled' });

@@ -1,7 +1,10 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, it } from 'vitest';
 import * as root from '../src/index.js';
-import { adoptAutomergeJsonValue } from '@tarstate/automerge/values';
+import {
+  adoptAutomergeJsonValue,
+  adoptConflictFreeAutomergeJsonValue
+} from '@tarstate/automerge/values';
 
 describe('inert Automerge JSON adoption', () => {
   it('detaches and deeply freezes portable values without retaining live document state', () => {
@@ -20,13 +23,17 @@ describe('inert Automerge JSON adoption', () => {
     expect(adoptAutomergeJsonValue).toBe(root.adoptAutomergeJsonValue);
   });
 
-  it('rejects conflicts rather than silently adopting the visible winner', () => {
+  it('adopts the deterministic visible winner unless conflict auditing is requested', () => {
     let left = Automerge.from({ artifact: { version: 0 } }, { actor: '1'.repeat(64) });
     let right = Automerge.clone(left, { actor: '2'.repeat(64) });
     left = Automerge.change(left, (draft) => { draft.artifact.version = 1; });
     right = Automerge.change(right, (draft) => { draft.artifact.version = 2; });
     const merged = Automerge.merge(left, right);
     expect(adoptAutomergeJsonValue(merged.artifact)).toMatchObject({
+      success: true,
+      value: { version: expect.any(Number) }
+    });
+    expect(adoptConflictFreeAutomergeJsonValue(merged.artifact)).toMatchObject({
       success: false,
       issues: [{ code: 'automerge.value_conflicted', path: ['version'], details: { alternatives: 2 } }]
     });

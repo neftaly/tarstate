@@ -10,6 +10,7 @@ import {
   preparePlan,
   prepareExpression,
   prepareQuery,
+  prepareQueryMaintenanceSnapshot,
   type ArtifactRef,
   type CapabilityRef,
   type JsonValue,
@@ -299,6 +300,24 @@ describe('production query oracle', () => {
     expect(Object.isFrozen(result.rows[0]?.nested)).toBe(true);
     expect(() => evaluatePreparedQuery({ ...prepared } as PreparedPlan<QueryNode>, { relations: [] }))
       .toThrow('not produced by a plan preparation API');
+  });
+
+  it('reuses explicitly owned changing input and its immutable visible rows', async () => {
+    const prepared = await prepareQuery({
+      root: from('people', 'person'),
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+    const sourceRow = { id: 1, nested: { label: 'owned' } };
+    const owned = prepareQueryMaintenanceSnapshot({ relations: [relation('people', [sourceRow])] });
+    sourceRow.nested.label = 'mutated';
+
+    const first = evaluatePreparedQuery(prepared, owned);
+    const second = evaluatePreparedQuery(prepared, owned);
+    expect(first.rows).toEqual([{ id: 1, nested: { label: 'owned' } }]);
+    expect(first.rows[0]).toBe(owned.relations[0]?.rows[0]);
+    expect(second.rows[0]).toBe(first.rows[0]);
   });
 
   it('requires portable plan input and does not execute hostile accessors', async () => {

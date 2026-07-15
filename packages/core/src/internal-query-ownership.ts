@@ -13,11 +13,14 @@ import type {
   RelationUse
 } from './query-model.js';
 import type {
+  OwnedQueryMaintenanceSnapshot,
   QueryMaintenanceSnapshot,
   QueryMaintenanceUpdate,
   RelationInputChange,
   RelationRowChange
 } from './query-incremental-model.js';
+
+const ownedMaintenanceSnapshots = new WeakSet<object>();
 
 export const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
   const parsed = safeParseJsonValue(root, { ...defaultValueParseBudget, maxDepth: 1_024 });
@@ -162,8 +165,14 @@ const adoptMaintenanceSnapshotDescriptors = (descriptors: OwnedDataRecord): Quer
   });
 };
 
-export const adoptMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): QueryMaintenanceSnapshot =>
-  adoptMaintenanceSnapshotDescriptors(inspectOwnedDataRecord(snapshot, 'Query maintenance snapshot', { allowSymbols: true }));
+export const adoptMaintenanceSnapshot = (snapshot: QueryMaintenanceSnapshot): OwnedQueryMaintenanceSnapshot => {
+  if (ownedMaintenanceSnapshots.has(snapshot)) return snapshot as OwnedQueryMaintenanceSnapshot;
+  const owned = adoptMaintenanceSnapshotDescriptors(
+    inspectOwnedDataRecord(snapshot, 'Query maintenance snapshot', { allowSymbols: true })
+  ) as OwnedQueryMaintenanceSnapshot;
+  ownedMaintenanceSnapshots.add(owned);
+  return owned;
+};
 
 const adoptExecutionBudget = (budget: unknown): { readonly maxWorkUnits: number } => {
   const descriptors = inspectOwnedDataRecord(budget, 'Query execution budget');

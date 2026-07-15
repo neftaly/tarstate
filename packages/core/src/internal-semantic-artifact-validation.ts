@@ -48,12 +48,21 @@ export type SemanticBodyValidator = (
   artifact: Artifact
 ) => boolean;
 
+const validatedSemanticArtifacts = new WeakMap<object, Map<SemanticArtifactKind, Artifact>>();
+
 export const safeParseSemanticArtifact = async <Value extends Artifact>(
   input: unknown,
   kind: SemanticArtifactKind,
   validateBody: SemanticBodyValidator,
   budget: SemanticArtifactParseBudget
 ): Promise<ParseResult<Value>> => {
+  if (budget === defaultSemanticArtifactParseBudget
+    && input !== null
+    && typeof input === 'object'
+    && Object.isFrozen(input)) {
+    const cached = validatedSemanticArtifacts.get(input)?.get(kind);
+    if (cached !== undefined) return { success: true, value: cached as Value, issues: Object.freeze([]) };
+  }
   let parsed: ParseResult<Artifact>;
   try {
     parsed = typeof input === 'string'
@@ -85,9 +94,17 @@ export const safeParseSemanticArtifact = async <Value extends Artifact>(
       error: semanticArtifactErrorName(error)
     }));
   }
-  return context.issues.length === 0
-    ? { success: true, value: parsed.value as Value, issues: [] }
-    : { success: false, issues: context.issues };
+  if (context.issues.length > 0) return { success: false, issues: context.issues };
+  if (budget === defaultSemanticArtifactParseBudget) {
+    const remember = (value: object): void => {
+      const byKind = validatedSemanticArtifacts.get(value) ?? new Map<SemanticArtifactKind, Artifact>();
+      byKind.set(kind, parsed.value);
+      validatedSemanticArtifacts.set(value, byKind);
+    };
+    remember(parsed.value);
+    if (input !== null && typeof input === 'object' && Object.isFrozen(input)) remember(input);
+  }
+  return { success: true, value: parsed.value as Value, issues: Object.freeze([]) };
 };
 
 export const semanticShape = (

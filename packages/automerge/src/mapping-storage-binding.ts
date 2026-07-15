@@ -13,13 +13,14 @@ import {
   type CompiledStorageMapping,
   type RelationStorageMapping
 } from '@tarstate/core/schema';
-import type {
-  LogicalEdit,
-  PlanResult,
-  ProjectionResult,
-  SourceSnapshot,
-  StorageBinding
+import {
+  type LogicalEdit,
+  type PlanResult,
+  type ProjectionResult,
+  type SourceSnapshot,
+  type StorageBinding
 } from '@tarstate/core/source';
+import { sealStorageProjection } from '@tarstate/core/source/projection';
 import {
   automergePathFootprint,
   type AutomergePathFootprint
@@ -58,6 +59,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly #registry: CapabilityRegistry | undefined;
   readonly #relations: ReadonlyMap<string, MappedRelation>;
   readonly #locatorNamespace: string;
+  readonly #projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeMappedStorageRow>>>();
 
   constructor(options: AutomergeMappedStorageBindingOptions) {
     const owned = adoptOptions(options);
@@ -83,6 +85,8 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
       return { rows: [], completeness: 'unknown', issues: [sourceIssue(snapshot.sourceId, snapshot.state)] };
     }
+    const cached = this.#projections.get(snapshot.storage)?.get(snapshot.sourceId);
+    if (cached !== undefined) return cached;
     const projection = projectStorage(this.#mapping, snapshot.storage, this.#registry, snapshot.sourceId);
     const rows: AutomergeMappedStorageRow[] = [];
     const issues: Issue[] = [];
@@ -140,11 +144,15 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         }));
       }
     }
-    return Object.freeze({
+    const result = sealStorageProjection(Object.freeze({
       rows: Object.freeze(rows),
       completeness: incomplete ? 'unknown' : 'exact',
       issues: Object.freeze(issues)
-    });
+    }));
+    const bySource = this.#projections.get(snapshot.storage) ?? new Map<string, ProjectionResult<AutomergeMappedStorageRow>>();
+    bySource.set(snapshot.sourceId, result);
+    this.#projections.set(snapshot.storage, bySource);
+    return result;
   };
 
   plan = (snapshot: SourceSnapshot<Automerge.Doc<T>>, edits: readonly LogicalEdit[]): PlanResult<AutomergeSourceCommand<T>> => {
@@ -162,6 +170,13 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     if (projection.completeness !== 'exact') {
       return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues };
     }
+    const rowsByLocator = new Map<string, AutomergeMappedStorageRow[]>();
+    for (const row of projection.rows) {
+      const key = row.relationId + '\u0000' + canonicalizeJson(row.locator);
+      const bucket = rowsByLocator.get(key);
+      if (bucket === undefined) rowsByLocator.set(key, [row]);
+      else bucket.push(row);
+    }
     const intents: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> }[] = [];
     for (const edit of relevant) {
       const compiled = this.#relations.get(edit.relationId) as MappedRelation;
@@ -171,7 +186,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         else intents.push(planned.intent);
         continue;
       }
-      const candidates = projection.rows.filter((row) => row.relationId === edit.relationId && samePortable(row.locator, edit.locator));
+      const candidates = rowsByLocator.get(edit.relationId + '\u0000' + canonicalizeJson(edit.locator)) ?? [];
       if (candidates.length !== 1) {
         issues.push(bindingIssue(candidates.length === 0 ? 'mapping.locator_stale' : 'mapping.locator_invalid', snapshot.sourceId, edit.relationId));
         continue;
@@ -244,9 +259,23 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       }
     }
     const writeFootprint = automergePathFootprint(intents.flatMap(({ footprint }) => footprint.entries));
+    const combinedCommand: AutomergeSourceCommand<T> | undefined = intents.length === 0
+      ? undefined
+      : {
+          description: intents.map(({ command }) => command.description).join('; '),
+          apply: (draft) => {
+            for (const intent of intents) intent.command.apply(draft);
+          }
+        };
+    const combinedIntents = intents.length === 0
+      ? []
+      : [{
+          footprint: writeFootprint,
+          command: combinedCommand as AutomergeSourceCommand<T>
+        }];
     return issues.some(({ severity }) => severity === 'error')
       ? { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues }
-      : { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents, issues };
+      : { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: combinedIntents, issues };
   };
 
   #planInsert(

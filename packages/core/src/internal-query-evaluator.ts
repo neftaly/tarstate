@@ -35,10 +35,13 @@ import type {
   QueryRecord,
   QueryRequest,
   QueryResult,
+  RelationInput,
   WindowExpr
 } from './query-model.js';
 import type { QueryMaintenanceSnapshot } from './query-incremental-model.js';
 import { logicalAnd, logicalOr, logicalUnknown, type JsonValue, type LogicalTruth } from './value.js';
+
+const scopedInputRows = new WeakMap<object, Map<string, readonly ScopedRow[]>>();
 
 export const consumeQueryWork = (context: QueryContext, units = 1): boolean => {
   const work = context.state.work;
@@ -126,11 +129,11 @@ const evaluateNodeUncached = (node: QueryNode, context: QueryContext): NodeResul
       context.state.issues.push(createIssue({ code: 'query.parameter_invalid', phase: 'query', severity: 'error', retry: 'after_refresh', relationId: node.relation.relationId, details: { reason: 'input_unavailable' } }));
       return { rows: [], completeness: 'unknown' };
     }
+    const rows = inputs.length === 1
+      ? scopedRowsForInput(inputs[0] as RelationInput, node.alias, node.relation.relationId, context)
+      : inputs.flatMap((input) => scopedRowsForInput(input, node.alias, node.relation.relationId, context));
     return {
-      rows: inputs.flatMap((input) => input.rows.map((fields, index) => scopedRow(
-        { ...context.environment.outer?.scope, [node.alias]: fields },
-        { ...context.environment.outer?.provenance, [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence: relationOccurrence(input, index) } }
-      ))),
+      rows,
       completeness: inputs.some(({ completeness }) => completeness === 'lower-bound') ? 'lower-bound' : 'exact'
     };
   }
@@ -221,6 +224,38 @@ const evaluateNodeUncached = (node: QueryNode, context: QueryContext): NodeResul
   }
   if (node.kind === 'window') return evaluateWindow(node, context);
   return evaluateSeek(node, context);
+};
+
+const scopedRowsForInput = (
+  input: RelationInput,
+  alias: string,
+  relationId: string,
+  context: QueryContext
+): readonly ScopedRow[] => {
+  const outer = context.environment.outer;
+  if (outer === undefined && Object.isFrozen(input)) {
+    const cached = scopedInputRows.get(input)?.get(alias);
+    if (cached !== undefined) return cached;
+  }
+  const rows = input.rows.map((fields, index) => scopedRow(
+    { ...outer?.scope, [alias]: fields },
+    {
+      ...outer?.provenance,
+      [alias]: {
+        ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }),
+        ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }),
+        relationId,
+        ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}),
+        occurrence: relationOccurrence(input, index)
+      }
+    }
+  ));
+  if (outer === undefined && Object.isFrozen(input)) {
+    const byAlias = scopedInputRows.get(input) ?? new Map<string, readonly ScopedRow[]>();
+    byAlias.set(alias, rows);
+    scopedInputRows.set(input, byAlias);
+  }
+  return rows;
 };
 
 const evaluateJoin = (node: Extract<QueryNode, { readonly kind: 'join' }>, context: QueryContext): NodeResult => {
@@ -971,7 +1006,13 @@ const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult
 export const publicQueryRow = (row: ScopedRow, cache: WeakMap<ScopedRow, QueryRecord>): QueryRecord => {
   const cached = cache.get(row);
   if (cached !== undefined) return cached;
-  const owned = adoptQueryRecord(visibleRow(row), 'Query result row');
+  const visible = visibleRow(row);
+  // Frozen visible rows originate from the already-adopted maintenance input,
+  // prepared values, or a previously owned maintained result. Reuse them
+  // instead of cloning the same immutable graph at the output boundary.
+  const owned = Object.isFrozen(visible)
+    ? visible
+    : adoptQueryRecord(visible, 'Query result row');
   cache.set(row, owned);
   return owned;
 };

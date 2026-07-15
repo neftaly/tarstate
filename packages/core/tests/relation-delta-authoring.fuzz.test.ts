@@ -56,38 +56,35 @@ const applyStatements = (
 ): readonly Row[] => {
   const rows = new Map(before.map((row) => [row.id, { ...row }]));
   for (const statement of statements) {
-    if (statement.kind === 'statement.delete') {
-      rows.delete(targetId(statement));
-      continue;
-    }
-    if (statement.kind === 'statement.update') {
-      const id = targetId(statement);
-      const current = rows.get(id) as Record<string, JsonValue>;
-      for (const [field, edit] of Object.entries(statement.edits)) {
-        if (edit.kind !== 'edit.replace' || edit.value.kind !== 'literal') throw new Error('Unexpected inferred edit');
-        current[field] = edit.value.value;
+    if (statement.kind !== 'statement.keyed-delta') throw new Error('Unexpected authored statement');
+    for (const change of statement.changes) {
+      if (change.kind === 'delta.delete') {
+        rows.delete(literalRecord(change.key).id as string);
+        continue;
       }
-      continue;
-    }
-    if (statement.kind !== 'statement.insert') throw new Error('Unexpected authored statement');
-    for (const expressions of statement.rows) {
-      const row: Record<string, JsonValue> = {};
-      for (const [field, expression] of Object.entries(expressions)) {
-        if (expression.kind !== 'literal') throw new Error('Unexpected authored expression');
-        row[field] = expression.value;
+      if (change.kind === 'delta.update') {
+        const id = literalRecord(change.key).id as string;
+        const current = rows.get(id) as Record<string, JsonValue>;
+        for (const [field, edit] of Object.entries(change.edits)) {
+          if (edit.kind !== 'edit.replace' || edit.value.kind !== 'literal') throw new Error('Unexpected inferred edit');
+          current[field] = edit.value.value;
+        }
+        continue;
       }
+      const row = literalRecord(change.fields);
       rows.set(row.id as string, row as Row);
     }
   }
   return [...rows.values()].sort((left, right) => (left.id as string).localeCompare(right.id as string)) as Row[];
 };
 
-const targetId = (
-  statement: Extract<WriteStatement, { readonly kind: 'statement.delete' | 'statement.update' }>
-): string => {
-  const where = statement.target.where;
-  if (where?.kind !== 'compare' || where.right.kind !== 'literal' || typeof where.right.value !== 'string') {
-    throw new Error('Unexpected keyed target');
+const literalRecord = (
+  expressions: Readonly<Record<string, import('../src/transaction.js').WriteExpression>>
+): Record<string, JsonValue> => {
+  const row: Record<string, JsonValue> = {};
+  for (const [field, expression] of Object.entries(expressions)) {
+    if (expression.kind !== 'literal') throw new Error('Unexpected authored expression');
+    row[field] = expression.value;
   }
-  return where.right.value;
+  return row;
 };

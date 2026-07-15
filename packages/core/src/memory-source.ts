@@ -448,6 +448,65 @@ export class InMemoryAtomicSource {
       state[relationId] = next;
       return { ...empty, matched: conflicts.length, inserted, logicallyChanged: inserted + changed };
     }
+    if (statement.kind === 'statement.keyed-delta') {
+      const declaration = this.#relations.get(relationId) as MemoryRelation;
+      const existing = new Map<string, number[]>();
+      rows.forEach((row, index) => {
+        const key = rowKey(row, declaration.keyFields);
+        const bucket = existing.get(key);
+        if (bucket === undefined) existing.set(key, [index]);
+        else bucket.push(index);
+      });
+      const next: (MemoryRow | undefined)[] = [...rows];
+      const seen = new Set<string>();
+      const outcomes: SemanticEditOutcome[] = [];
+      let matched = 0;
+      let inserted = 0;
+      let deleted = 0;
+      let changed = 0;
+      for (const change of statement.changes) {
+        const evaluated = change.kind === 'delta.insert'
+          ? evaluateFields(change.fields, {}, parameters)
+          : evaluateFields(change.key, {}, parameters);
+        if (!evaluated.success) return { ...empty, issues: [evaluated.issue] };
+        if (declaration.keyFields.some((field) => !Object.hasOwn(evaluated.value, field))) {
+          return { ...empty, issues: [txIssue('transaction.delta_key_missing', 'plan', { relationId, keyFields: declaration.keyFields })] };
+        }
+        const fingerprint = rowKey(evaluated.value, declaration.keyFields);
+        if (seen.has(fingerprint)) return { ...empty, issues: [txIssue('transaction.delta_input_ambiguous', 'plan', { relationId })] };
+        seen.add(fingerprint);
+        const indexes = existing.get(fingerprint) ?? [];
+        if (change.kind === 'delta.insert') {
+          if (indexes.length > 0) return { ...empty, issues: [txIssue('transaction.upsert_conflict', 'plan', { relationId })] };
+          next.push(evaluated.value);
+          inserted += 1;
+          changed += 1;
+          continue;
+        }
+        if (indexes.length !== 1) return {
+          ...empty,
+          issues: [txIssue(indexes.length === 0 ? 'transaction.delta_target_missing' : 'transaction.delta_target_ambiguous', 'plan', { relationId })]
+        };
+        const index = indexes[0] as number;
+        const current = next[index] as MemoryRow;
+        matched += 1;
+        if (change.kind === 'delta.delete') {
+          next[index] = undefined;
+          deleted += 1;
+          changed += 1;
+          continue;
+        }
+        const edited = applyFieldEdits(current, change.edits, { [statement.alias]: current }, parameters);
+        if (!edited.success) return { ...empty, matched, issues: [edited.issue] };
+        outcomes.push(...edited.value.outcomes);
+        if (!sameJson(current, edited.value.row)) {
+          next[index] = edited.value.row;
+          changed += 1;
+        }
+      }
+      state[relationId] = next.filter((row): row is MemoryRow => row !== undefined);
+      return { ...empty, matched, inserted, deleted, logicallyChanged: changed, editOutcomes: uniqueOutcomes(outcomes) };
+    }
     const selected = selectTargets(statement.target, rows, parameters);
     if (!selected.success) return { ...empty, issues: [selected.issue] };
     const matches = selected.value;
@@ -783,7 +842,11 @@ const isTransaction = (value: Transaction | ArtifactRef): value is Transaction =
 const operationKey = (operationEpoch: string, operationId: string): string => stringTupleKey(operationEpoch, operationId);
 const statementRelation = (statement: WriteStatement): WriteRelation | undefined => {
   if (statement.kind === 'extension') return undefined;
-  if (statement.kind === 'statement.insert' || statement.kind === 'statement.insert-from-query' || statement.kind === 'statement.upsert' || statement.kind === 'statement.replace-all') return statement.relation;
+  if (statement.kind === 'statement.insert'
+    || statement.kind === 'statement.insert-from-query'
+    || statement.kind === 'statement.upsert'
+    || statement.kind === 'statement.replace-all'
+    || statement.kind === 'statement.keyed-delta') return statement.relation;
   return statement.target.relation;
 };
 const adoptMemoryState = (input: unknown, label: string): MemoryState => {

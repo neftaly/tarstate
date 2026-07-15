@@ -12,15 +12,30 @@ import { comparePortableStrings } from './portable-order.js';
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
 
 /**
- * Detaches one Automerge object graph as inert, deeply frozen JSON.
- * Native Automerge values and conflicts are rejected rather than normalized.
+ * Detaches Automerge's deterministic visible value as inert, deeply frozen JSON.
+ * Native Automerge values are rejected rather than normalized. Use
+ * `adoptConflictFreeAutomergeJsonValue` when nested conflict absence is part of
+ * the caller's boundary contract.
  */
 export const adoptAutomergeJsonValue = (
   input: unknown,
   budget: ValueParseBudget = defaultValueParseBudget
+): ParseResult<JsonValue> => adoptAutomergeValue(input, budget, false);
+
+/** Detaches JSON while additionally auditing every property for conflicts. */
+export const adoptConflictFreeAutomergeJsonValue = (
+  input: unknown,
+  budget: ValueParseBudget = defaultValueParseBudget
+): ParseResult<JsonValue> => adoptAutomergeValue(input, budget, true);
+
+const adoptAutomergeValue = (
+  input: unknown,
+  budget: ValueParseBudget,
+  inspectConflicts: boolean
 ): ParseResult<JsonValue> => {
   const context: AdoptionContext = {
     budget,
+    inspectConflicts,
     totalMembers: 0,
     ancestors: new Set<object>()
   };
@@ -32,6 +47,7 @@ export const adoptAutomergeJsonValue = (
 
 type AdoptionContext = {
   readonly budget: ValueParseBudget;
+  readonly inspectConflicts: boolean;
   totalMembers: number;
   readonly ancestors: Set<object>;
 };
@@ -99,7 +115,7 @@ const adoptList = (
   const output: JsonValue[] = [];
   for (let index = 0; index < value.length; index += 1) {
     const propertyPath = [...path, index];
-    const conflict = conflictIssue(value, index, propertyPath);
+    const conflict = context.inspectConflicts ? conflictIssue(value, index, propertyPath) : undefined;
     if (conflict !== undefined) return { issue: conflict };
     const child = adoptValue(value[index], propertyPath, depth + 1, context);
     if ('issue' in child) return child;
@@ -129,7 +145,7 @@ const adoptMap = (
     if (forbiddenKeys.has(property)) {
       return failure('artifact.hostile_shape', propertyPath, { reason: 'prototype_pollution_key' });
     }
-    const conflict = conflictIssue(value, property, propertyPath);
+    const conflict = context.inspectConflicts ? conflictIssue(value, property, propertyPath) : undefined;
     if (conflict !== undefined) return { issue: conflict };
     const child = adoptValue(value[property], propertyPath, depth + 1, context);
     if ('issue' in child) return child;

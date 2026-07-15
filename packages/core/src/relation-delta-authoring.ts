@@ -1,14 +1,24 @@
-import { canonicalizeJson, isContentHash } from './artifacts.js';
+import { isContentHash } from './artifacts.js';
 import { createIssue, type Issue, type ParseResult } from './issues.js';
-import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { canonicalizeJsonWithCache, type CanonicalJsonCache } from './internal-canonical-json.js';
+import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
+import { stringTupleKey } from './internal-string-key.js';
 import { comparePortableStrings } from './portable-order.js';
-import type { WriteExpression, WriteRelation, WriteStatement } from './transaction.js';
+import type { KeyedDeltaChange, WriteExpression, WriteRelation, WriteStatement } from './transaction.js';
 import type { JsonValue } from './value.js';
 
 export type ExactKeyedRelationRows = {
   readonly completeness: 'exact';
   readonly rows: readonly Readonly<Record<string, JsonValue>>[];
 };
+
+declare const preparedExactKeyedRelationRowsBrand: unique symbol;
+export type PreparedExactKeyedRelationRows = ExactKeyedRelationRows & {
+  readonly [preparedExactKeyedRelationRowsBrand]: true;
+};
+
+const preparedExactRows = new WeakSet<object>();
+const preparedRowIndexes = new WeakMap<object, Map<string, Map<string, IndexedRow>>>();
 
 export type ExactKeyedRelationDeltaInput = {
   readonly relation: WriteRelation;
@@ -31,60 +41,115 @@ type IndexedRow = {
 export const authorExactKeyedRelationDelta = (
   input: ExactKeyedRelationDeltaInput
 ): ParseResult<readonly WriteStatement[]> => {
-  const adopted = detachAndFreezeJsonValue(input as unknown);
+  const adopted = adoptDeltaInput(input);
   if (!adopted.success) return adopted;
-  if (!isDeltaInput(adopted.value)) {
-    return deltaFailure({ reason: 'input_shape' });
-  }
-
-  const owned = adopted.value as unknown as ExactKeyedRelationDeltaInput;
+  const owned = adopted.value;
   const alias = owned.alias ?? 'row';
   const keyFields = [...owned.keyFields];
   const replaceableFields = new Set(owned.replaceableFields);
+  const canonicalization: CanonicalJsonCache = new WeakMap();
   const issues = validateDeltaContract(owned, alias);
   if (issues.length > 0) return { success: false, issues: Object.freeze(issues) };
-  const before = indexRows('before', owned.before.rows, keyFields, issues);
-  const after = indexRows('after', owned.after.rows, keyFields, issues);
+  const before = indexRows('before', owned.before.rows, keyFields, issues, canonicalization);
+  const after = owned.before === owned.after
+    ? before
+    : indexRows('after', owned.after.rows, keyFields, issues, canonicalization);
   if (issues.length > 0) return { success: false, issues: Object.freeze(issues) };
+  if (before === after) return { success: true, value: Object.freeze([]), issues: Object.freeze([]) };
 
-  const statements: WriteStatement[] = [];
+  const changes: KeyedDeltaChange[] = [];
   const orderedBeforeKeys = [...before.keys()].sort(comparePortableStrings);
   const orderedAfterKeys = [...after.keys()].sort(comparePortableStrings);
 
   for (const fingerprint of orderedBeforeKeys) {
     const previous = before.get(fingerprint) as IndexedRow;
     if (after.has(fingerprint)) continue;
-    statements.push({
-      kind: 'statement.delete',
-      target: keyedTarget(owned.relation, alias, keyFields, previous.fields)
-    });
+    changes.push({ kind: 'delta.delete', key: literalKey(keyFields, previous.fields) });
   }
 
   for (const fingerprint of orderedBeforeKeys) {
     const previous = before.get(fingerprint) as IndexedRow;
     const next = after.get(fingerprint);
     if (next === undefined) continue;
-    const edits = replacementEdits(previous.fields, next.fields, replaceableFields, fingerprint, issues);
+    if (previous.fields === next.fields) continue;
+    const edits = replacementEdits(previous.fields, next.fields, replaceableFields, fingerprint, issues, canonicalization);
     if (Object.keys(edits).length === 0) continue;
-    statements.push({
-      kind: 'statement.update',
-      target: keyedTarget(owned.relation, alias, keyFields, previous.fields),
-      edits
-    });
+    changes.push({ kind: 'delta.update', key: literalKey(keyFields, previous.fields), edits });
   }
 
   const insertedRows = orderedAfterKeys
     .filter((fingerprint) => !before.has(fingerprint))
     .map((fingerprint) => literalFields((after.get(fingerprint) as IndexedRow).fields));
-  if (insertedRows.length > 0) {
-    statements.push({ kind: 'statement.insert', relation: owned.relation, rows: insertedRows });
-  }
+  changes.push(...insertedRows.map((fields): KeyedDeltaChange => ({ kind: 'delta.insert', fields })));
 
   if (issues.length > 0) return { success: false, issues: Object.freeze(issues) };
-  const detached = detachAndFreezeJsonValue(statements as unknown);
-  return detached.success
-    ? { success: true, value: detached.value as unknown as readonly WriteStatement[], issues: Object.freeze([]) }
-    : detached;
+  const statements: WriteStatement[] = changes.length === 0
+    ? []
+    : [{ kind: 'statement.keyed-delta', relation: owned.relation, alias, changes }];
+  return {
+    success: true,
+    value: freezeOwnedJsonValue(statements as unknown as JsonValue) as unknown as readonly WriteStatement[],
+    issues: Object.freeze([])
+  };
+};
+
+/** Owns one exact relation state for reuse across multiple delta comparisons. */
+export const prepareExactKeyedRelationRows = (
+  input: unknown
+): ParseResult<PreparedExactKeyedRelationRows> => {
+  if (input !== null && typeof input === 'object' && preparedExactRows.has(input)) {
+    return { success: true, value: input as PreparedExactKeyedRelationRows, issues: Object.freeze([]) };
+  }
+  const owned = detachAndFreezeJsonValue(input);
+  if (!owned.success) return owned;
+  if (!isExactRows(owned.value)) return deltaFailure({ reason: 'exact_rows_shape' });
+  const prepared = owned.value as unknown as PreparedExactKeyedRelationRows;
+  preparedExactRows.add(prepared);
+  return { success: true, value: prepared, issues: Object.freeze([]) };
+};
+
+const adoptDeltaInput = (input: unknown): ParseResult<ExactKeyedRelationDeltaInput> => {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return deltaFailure({ reason: 'input_shape' });
+  let descriptors: PropertyDescriptorMap;
+  try {
+    if (Object.getPrototypeOf(input) !== Object.prototype) return deltaFailure({ reason: 'input_shape' });
+    descriptors = Object.getOwnPropertyDescriptors(input);
+  } catch {
+    return deltaFailure({ reason: 'input_shape' });
+  }
+  const data = (name: string): unknown => {
+    const descriptor = descriptors[name];
+    return descriptor?.enumerable === true && 'value' in descriptor ? descriptor.value : undefined;
+  };
+  const alias = data('alias');
+  const header = detachAndFreezeJsonValue({
+    relation: data('relation'),
+    keyFields: data('keyFields'),
+    replaceableFields: data('replaceableFields'),
+    ...(alias === undefined ? {} : { alias })
+  });
+  if (!header.success || !isRecord(header.value)
+    || !isWriteRelation(header.value.relation)
+    || !stringArray(header.value.keyFields)
+    || !stringArray(header.value.replaceableFields)
+    || (header.value.alias !== undefined && typeof header.value.alias !== 'string')) {
+    return deltaFailure({ reason: 'input_shape' });
+  }
+  const before = prepareExactKeyedRelationRows(data('before'));
+  const after = prepareExactKeyedRelationRows(data('after'));
+  if (!before.success || !after.success) return deltaFailure({ reason: 'input_shape' });
+  return {
+    success: true,
+    value: Object.freeze({
+      relation: header.value.relation as unknown as WriteRelation,
+      keyFields: header.value.keyFields as readonly string[],
+      replaceableFields: header.value.replaceableFields as readonly string[],
+      before: before.value,
+      after: after.value,
+      ...(header.value.alias === undefined ? {} : { alias: header.value.alias })
+    }),
+    issues: Object.freeze([])
+  };
 };
 
 const validateDeltaContract = (
@@ -103,8 +168,13 @@ const indexRows = (
   side: 'before' | 'after',
   rows: readonly Readonly<Record<string, JsonValue>>[],
   keyFields: readonly string[],
-  issues: Issue[]
+  issues: Issue[],
+  canonicalization: CanonicalJsonCache
 ): Map<string, IndexedRow> => {
+  const keySignature = stringTupleKey(...keyFields);
+  const cached = preparedRowIndexes.get(rows)?.get(keySignature);
+  if (cached !== undefined) return cached;
+  const issueCount = issues.length;
   const indexed = new Map<string, IndexedRow>();
   rows.forEach((fields, rowIndex) => {
     const missingField = keyFields.find((field) => !Object.hasOwn(fields, field));
@@ -112,13 +182,18 @@ const indexRows = (
       issues.push(deltaIssue({ reason: 'key_missing', side, rowIndex, field: missingField }, [side, 'rows', rowIndex, missingField]));
       return;
     }
-    const fingerprint = canonicalizeJson(keyFields.map((field) => fields[field] as JsonValue));
+    const fingerprint = stringTupleKey(...keyFields.map((field) => canonicalizeJsonWithCache(fields[field] as JsonValue, canonicalization)));
     if (indexed.has(fingerprint)) {
       issues.push(deltaIssue({ reason: 'key_ambiguous', side, rowIndex, key: fingerprint }, [side, 'rows', rowIndex]));
       return;
     }
     indexed.set(fingerprint, { fields });
   });
+  if (issues.length === issueCount) {
+    const indexes = preparedRowIndexes.get(rows) ?? new Map<string, Map<string, IndexedRow>>();
+    indexes.set(keySignature, indexed);
+    preparedRowIndexes.set(rows, indexes);
+  }
   return indexed;
 };
 
@@ -127,14 +202,15 @@ const replacementEdits = (
   after: Readonly<Record<string, JsonValue>>,
   replaceableFields: ReadonlySet<string>,
   key: string,
-  issues: Issue[]
+  issues: Issue[],
+  canonicalization: CanonicalJsonCache
 ): Readonly<Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }>> => {
   const edits: Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }> = {};
   const fields = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort(comparePortableStrings);
   for (const field of fields) {
     const hadField = Object.hasOwn(before, field);
     const hasField = Object.hasOwn(after, field);
-    if (hadField && hasField && canonicalizeJson(before[field] as JsonValue) === canonicalizeJson(after[field] as JsonValue)) continue;
+    if (hadField && hasField && sameJson(before[field] as JsonValue, after[field] as JsonValue, canonicalization)) continue;
     if (!hasField) {
       issues.push(deltaIssue({ reason: 'field_removal_unsupported', field, key }, ['after', 'rows', key, field]));
       continue;
@@ -148,26 +224,16 @@ const replacementEdits = (
   return edits;
 };
 
-const keyedTarget = (
-  relation: WriteRelation,
-  alias: string,
+const sameJson = (left: JsonValue, right: JsonValue, canonicalization: CanonicalJsonCache): boolean =>
+  Object.is(left, right)
+  || canonicalizeJsonWithCache(left, canonicalization) === canonicalizeJsonWithCache(right, canonicalization);
+
+const literalKey = (
   keyFields: readonly string[],
   fields: Readonly<Record<string, JsonValue>>
-): Extract<WriteStatement, { readonly kind: 'statement.update' }>['target'] => {
-  const terms = keyFields.map((field): WriteExpression => ({
-    kind: 'compare',
-    op: 'eq',
-    left: { kind: 'field', alias, name: field },
-    right: literal(fields[field] as JsonValue)
-  }));
-  return {
-    relation,
-    alias,
-    where: terms.length === 1
-      ? terms[0] as WriteExpression
-      : { kind: 'boolean', op: 'and', args: terms }
-  };
-};
+): Readonly<Record<string, WriteExpression>> => Object.fromEntries(
+  keyFields.map((field) => [field, literal(fields[field] as JsonValue)])
+);
 
 const literalFields = (
   fields: Readonly<Record<string, JsonValue>>
@@ -188,14 +254,6 @@ const deltaIssue = (details: JsonValue, path?: readonly unknown[]) => createIssu
   ...(path === undefined ? {} : { path }),
   details
 });
-
-const isDeltaInput = (value: JsonValue): boolean => isRecord(value)
-  && isWriteRelation(value.relation)
-  && stringArray(value.keyFields)
-  && stringArray(value.replaceableFields)
-  && isExactRows(value.before)
-  && isExactRows(value.after)
-  && (value.alias === undefined || typeof value.alias === 'string');
 
 const isExactRows = (value: JsonValue | undefined): boolean => isRecord(value)
   && value.completeness === 'exact'

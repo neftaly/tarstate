@@ -1,7 +1,8 @@
 import { canonicalizeJson, type ContentHash } from './artifacts.js';
 import { createIssue, type Issue } from './issues.js';
+import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import type { MemoryRow, MemoryState } from './memory-source.js';
-import type { WritableLogicalRow } from './logical-edit.js';
+import { sealStorageProjection, type WritableLogicalRow } from './logical-edit.js';
 import type { SourceBasis, SourceSnapshot } from './source-state.js';
 import type {
   AtomicSource,
@@ -34,6 +35,11 @@ type LedgerEntry = {
   readonly intentHash: ContentHash;
   readonly result: SourceCommitResult;
 };
+
+type MemoryRowOperation =
+  | { readonly kind: 'insert'; readonly fingerprint: string; readonly row: MemoryRow }
+  | { readonly kind: 'delete'; readonly fingerprint: string }
+  | { readonly kind: 'update'; readonly fingerprint: string; readonly update: (row: MemoryRow) => MemoryRow };
 
 /** Small generic AtomicSource proving adapter over immutable logical rows. */
 export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, LogicalMemoryCommand> {
@@ -85,7 +91,7 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
     }
     const staged = this.stage(this.snapshot(), input.commands);
     if (staged.issues.some(({ severity }) => severity === 'error')) return { outcome: 'rejected', beforeBasis, issues: staged.issues };
-    const changed = !samePortable(this.#state, staged.storage);
+    const changed = this.#state !== staged.storage;
     if (changed) {
       this.#state = staged.storage;
       this.#revision += 1;
@@ -121,7 +127,7 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
 
   basisForStagedStorage = (snapshot: SourceSnapshot<MemoryState>, stagedStorage: MemoryState): SourceBasis => {
     const basis = snapshot.basis as LogicalMemoryBasis;
-    return samePortable(snapshot.storage, stagedStorage)
+    return snapshot.storage === stagedStorage
       ? basis
       : Object.freeze({ incarnation: basis.incarnation, revision: basis.revision + 1 });
   };
@@ -148,6 +154,7 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
   readonly #relations: ReadonlyMap<string, LogicalMemoryRelation>;
+  readonly #projections = new WeakMap<object, Map<string, ProjectionResult<WritableLogicalRow>>>();
 
   constructor(options: { readonly id?: string; readonly relations: readonly LogicalMemoryRelation[] }) {
     this.id = options.id ?? 'logical-memory';
@@ -160,6 +167,8 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
 
   project = (snapshot: SourceSnapshot<MemoryState>): ProjectionResult<WritableLogicalRow> => {
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { rows: [], completeness: 'unknown', issues: [createIssue({ code: 'source.not_ready', sourceId: snapshot.sourceId })] };
+    const cached = this.#projections.get(snapshot.storage)?.get(snapshot.sourceId);
+    if (cached !== undefined) return cached;
     const rows: WritableLogicalRow[] = [];
     const issues: Issue[] = [];
     for (const relation of this.#relations.values()) {
@@ -180,7 +189,15 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
         rows.push(Object.freeze({ relationId: relation.relationId, key, fields, locator: { namespace: this.id, token: fingerprint } }));
       }
     }
-    return { rows, completeness: issues.length === 0 ? 'exact' : 'unknown', issues };
+    const projection = sealStorageProjection(Object.freeze({
+      rows: Object.freeze(rows),
+      completeness: issues.length === 0 ? 'exact' as const : 'unknown' as const,
+      issues: Object.freeze(issues)
+    }));
+    const bySource = this.#projections.get(snapshot.storage) ?? new Map<string, ProjectionResult<WritableLogicalRow>>();
+    bySource.set(snapshot.sourceId, projection);
+    this.#projections.set(snapshot.storage, bySource);
+    return projection;
   };
 
   plan = (snapshot: SourceSnapshot<MemoryState>, edits: readonly LogicalEdit[]): PlanResult<LogicalMemoryCommand> => {
@@ -188,66 +205,76 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
       ? [{ editIndex, mode: 'exclusive' as const }]
       : []);
     const relevant = handledEdits.map(({ editIndex }) => edits[editIndex] as LogicalEdit);
-    const intents: { readonly footprint: Footprint; readonly command: LogicalMemoryCommand }[] = [];
+    const operations = new Map<string, { readonly paths: string[]; readonly edits: MemoryRowOperation[] }>();
     const issues: Issue[] = [];
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: [], intents: [], issues: [createIssue({ code: 'source.not_ready', sourceId: snapshot.sourceId })] };
     const projection = this.project(snapshot);
     if (projection.completeness !== 'exact') return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: [], intents: [], issues: projection.issues };
+    const rowsByLocator = new Map<string, WritableLogicalRow>();
+    const keysByRelation = new Map<string, Set<string>>();
+    for (const row of projection.rows) {
+      rowsByLocator.set(row.relationId + '\u0000' + canonicalizeJson(row.locator), row);
+      const keys = keysByRelation.get(row.relationId) ?? new Set<string>();
+      keys.add(canonicalizeJson(row.key));
+      keysByRelation.set(row.relationId, keys);
+    }
     for (const edit of relevant) {
-      const relation = this.#relations.get(edit.relationId) as LogicalMemoryRelation;
-      const footprint = rowFootprint(edit.relationId, edit.key);
+      const fingerprint = canonicalizeJson(edit.key);
+      const operationGroup = operations.get(edit.relationId) ?? { paths: [], edits: [] };
+      operationGroup.paths.push(rowPath(edit.relationId, edit.key));
+      operations.set(edit.relationId, operationGroup);
       if (edit.kind === 'insert') {
-        if (projection.rows.some((row) => row.relationId === edit.relationId && samePortable(row.key, edit.key))) {
+        if (keysByRelation.get(edit.relationId)?.has(fingerprint) === true) {
           issues.push(createIssue({ code: 'transaction.upsert_conflict', sourceId: snapshot.sourceId, relationId: edit.relationId, key: edit.key }));
           continue;
         }
-        intents.push({ footprint, command: commandFor(edit.relationId, (rows) => [...rows, ownRow(edit.fields)]) });
+        operationGroup.edits.push({ kind: 'insert', fingerprint, row: ownRow(edit.fields) });
         continue;
       }
-      const row = projection.rows.find((candidate) => candidate.relationId === edit.relationId && samePortable(candidate.locator, edit.locator));
+      const row = rowsByLocator.get(edit.relationId + '\u0000' + canonicalizeJson(edit.locator));
       if (row === undefined || !samePortable(row.key, edit.key)) {
         issues.push(createIssue({ code: 'mapping.locator_stale', sourceId: snapshot.sourceId, relationId: edit.relationId, key: edit.key }));
         continue;
       }
-      const indexFor = (rows: readonly MemoryRow[]) => rows.findIndex((candidate) => samePortable(logicalKey(candidate, relation.keyFields), edit.key));
       if (edit.kind === 'delete') {
-        intents.push({ footprint, command: commandFor(edit.relationId, (rows) => rows.filter((_candidate, index) => index !== indexFor(rows))) });
+        operationGroup.edits.push({ kind: 'delete', fingerprint });
         continue;
       }
       if (edit.kind === 'rekey' || edit.kind === 'move-relocate' || edit.kind === 'conflict-resolve') {
         issues.push(createIssue({ code: 'transaction.capability_unavailable', sourceId: snapshot.sourceId, relationId: edit.relationId, details: { edit: edit.kind } }));
         continue;
       }
-      intents.push({ footprint, command: commandFor(edit.relationId, (rows) => {
-        const index = indexFor(rows);
-        if (index < 0) throw new Error('Logical memory target changed after planning');
-        const next = [...rows];
-        const current = next[index] as MemoryRow;
-        if (edit.kind === 'replace-fields') next[index] = ownRow({ ...current, ...edit.fields });
-        if (edit.kind === 'replace-row') next[index] = ownRow(edit.fields);
+      operationGroup.edits.push({ kind: 'update', fingerprint, update: (current) => {
+        if (edit.kind === 'replace-fields') return ownRow({ ...current, ...edit.fields });
+        if (edit.kind === 'replace-row') return ownRow(edit.fields);
         if (edit.kind === 'counter-increment') {
           const currentValue = current[edit.field];
           if (typeof currentValue !== 'number') throw new Error('Counter target is not numeric');
-          next[index] = ownRow({ ...current, [edit.field]: currentValue + edit.by });
+          return ownRow({ ...current, [edit.field]: currentValue + edit.by });
         }
         if (edit.kind === 'text-splice') {
           const value = current[edit.field];
           if (typeof value !== 'string') throw new Error('Text target is not a string');
-          next[index] = ownRow({ ...current, [edit.field]: value.slice(0, edit.index) + edit.value + value.slice(edit.index + edit.deleteCount) });
+          return ownRow({ ...current, [edit.field]: value.slice(0, edit.index) + edit.value + value.slice(edit.index + edit.deleteCount) });
         }
         if (edit.kind === 'list-splice') {
           if (!Array.isArray(current[edit.field])) throw new Error('List target is not an array');
           const value = current[edit.field] as readonly JsonValue[];
-          next[index] = ownRow({ ...current, [edit.field]: [...value.slice(0, edit.index), ...edit.values, ...value.slice(edit.index + edit.deleteCount)] });
+          return ownRow({ ...current, [edit.field]: [...value.slice(0, edit.index), ...edit.values, ...value.slice(edit.index + edit.deleteCount)] });
         }
-        return next;
-      }) });
+        return current;
+      } });
     }
-    const combined = combineMemoryIntents(intents);
-    const writeFootprint = combined.flatMap(({ footprint }) => parseFootprint(footprint) ?? []);
+    const intents = [...operations].flatMap(([relationId, group]) => group.edits.length === 0
+      ? []
+      : [{
+          footprint: Object.freeze(group.paths),
+          command: commandForOperations(relationId, (this.#relations.get(relationId) as LogicalMemoryRelation).keyFields, group.edits)
+        }]);
+    const writeFootprint = Object.freeze(intents.flatMap(({ footprint }) => parseFootprint(footprint) ?? []));
     return issues.some(({ severity }) => severity === 'error')
       ? { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues }
-      : { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: combined, issues };
+      : { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents, issues };
   };
 }
 
@@ -263,33 +290,59 @@ export const relateLogicalMemoryFootprints = (left: Footprint, right: Footprint)
   return leftPaths.some((path) => rightPaths.some((other) => path.startsWith(other + '/') || other.startsWith(path + '/'))) ? 'overlaps' : 'disjoint';
 };
 
-const commandFor = (relationId: string, update: (rows: readonly MemoryRow[]) => readonly MemoryRow[]): LogicalMemoryCommand => ({
+const commandForOperations = (
+  relationId: string,
+  keyFields: readonly string[],
+  operations: readonly MemoryRowOperation[]
+): LogicalMemoryCommand => ({
   description: 'update logical memory relation ' + relationId,
-  apply: (state) => ownState({ ...state, [relationId]: update(state[relationId] ?? []) })
-});
-const combineMemoryIntents = (
-  intents: readonly { readonly footprint: Footprint; readonly command: LogicalMemoryCommand }[]
-): readonly { readonly footprint: Footprint; readonly command: LogicalMemoryCommand }[] => {
-  const groups = new Map<string, { footprint: Footprint; commands: LogicalMemoryCommand[] }>();
-  for (const intent of intents) {
-    const key = canonicalizeJson(intent.footprint);
-    const group = groups.get(key) ?? { footprint: intent.footprint, commands: [] };
-    group.commands.push(intent.command);
-    groups.set(key, group);
-  }
-  return [...groups.values()].map(({ footprint, commands }) => ({
-    footprint,
-    command: {
-      description: commands.map(({ description }) => description).join('; '),
-      apply: (state) => commands.reduce((current, command) => command.apply(current), state)
+  apply: (state) => {
+    const current = state[relationId] ?? [];
+    const next: (MemoryRow | undefined)[] = [...current];
+    const positions = new Map<string, number>();
+    let modified = false;
+    current.forEach((row, index) => {
+      const key = logicalKey(row, keyFields);
+      if (key !== undefined) positions.set(canonicalizeJson(key), index);
+    });
+    for (const operation of operations) {
+      const index = positions.get(operation.fingerprint);
+      if (operation.kind === 'insert') {
+        if (index !== undefined) throw new Error('Logical memory insert target changed after planning');
+        positions.set(operation.fingerprint, next.length);
+        next.push(operation.row);
+        modified = true;
+        continue;
+      }
+      if (index === undefined || next[index] === undefined) throw new Error('Logical memory target changed after planning');
+      if (operation.kind === 'delete') {
+        next[index] = undefined;
+        positions.delete(operation.fingerprint);
+        modified = true;
+      } else {
+        const replacement = operation.update(next[index] as MemoryRow);
+        if (!samePortable(next[index], replacement)) {
+          next[index] = replacement;
+          modified = true;
+        }
+      }
     }
-  }));
-};
+    if (!modified) return state;
+    const rows = next.includes(undefined)
+      ? next.filter((row): row is MemoryRow => row !== undefined)
+      : next as MemoryRow[];
+    return Object.freeze({ ...state, [relationId]: Object.freeze(rows) });
+  }
+});
 const relationFootprint = (relationId: string): string => encodeURIComponent(relationId);
-const rowFootprint = (relationId: string, key: JsonValue): readonly string[] => [relationFootprint(relationId) + '/' + encodeURIComponent(canonicalizeJson(key))];
+const rowPath = (relationId: string, key: JsonValue): string => relationFootprint(relationId) + '/' + encodeURIComponent(canonicalizeJson(key));
 const parseFootprint = (footprint: Footprint): readonly string[] | undefined => Array.isArray(footprint) && footprint.every((value) => typeof value === 'string') ? footprint : undefined;
 const logicalKey = (row: MemoryRow, fields: readonly string[]): JsonValue | undefined => fields.length > 0 && fields.every((field) => Object.hasOwn(row, field)) ? fields.map((field) => row[field] as JsonValue) : undefined;
-const ownRow = (row: Readonly<Record<string, JsonValue>>): MemoryRow => Object.freeze(structuredClone(row));
+const ownRow = (row: Readonly<Record<string, JsonValue>>): MemoryRow => {
+  const owned = detachAndFreezeJsonValue(row);
+  if (!owned.success || owned.value === null || Array.isArray(owned.value) || typeof owned.value !== 'object') throw new TypeError('Logical memory row must be portable data');
+  return owned.value as MemoryRow;
+};
 const ownState = (state: MemoryState): MemoryState => Object.freeze(Object.fromEntries(Object.entries(state).map(([relationId, rows]) => [relationId, Object.freeze(rows.map(ownRow))])));
 const samePortable = (left: unknown, right: unknown): boolean => {
   try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }

@@ -15,7 +15,6 @@ export { createIncrementalDatabaseQueryMaintenance } from './internal-observer-q
 export * from './issues.js';
 export * from './lens.js';
 export * from './lifecycle-governance.js';
-export * from './logical-edit.js';
 export * from './maintenance.js';
 export * from './mapping.js';
 export * from './memory-source.js';
@@ -31,7 +30,8 @@ export {
   evaluateQuery,
   openIncrementalQueryMaintenance,
   prepareExpression,
-  prepareQuery
+  prepareQuery,
+  prepareQueryMaintenanceSnapshot
 } from './query.js';
 export type {
   AggregateExpr,
@@ -43,6 +43,7 @@ export type {
   IncrementalQueryResult,
   IncrementalQueryResultDelta,
   OrderTerm,
+  OwnedQueryMaintenanceSnapshot,
   PreparedQueryRequest,
   PreparedExpression,
   QueryCursor,

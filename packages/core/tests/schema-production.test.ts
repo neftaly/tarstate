@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { capabilityRefFor, CapabilityRegistry, type CapabilityDeclaration } from '../src/registry.js';
 import { createIssue } from '../src/issues.js';
 import { prepareSchema, parseRelationCandidate, parseLogicalKey, type RelationRow, type SchemaBody } from '../src/schema.js';
-import { compileStorageMapping, planStoragePatch, projectStorage, type StorageMappingBody } from '../src/mapping.js';
+import { compileStorageMapping, planStorageIntents, planStoragePatch, projectStorage, type StorageMappingBody } from '../src/mapping.js';
 import { projectLensRelation, resolveLensPath, translateLensEdits, validateLens, type LensArtifact, type LensRows, type SchemaLensBody } from '../src/lens.js';
 import { parseScalarValue, type CodecImplementation } from '../src/codec.js';
 
@@ -248,6 +248,8 @@ describe('production JSON-tree storage mappings', () => {
       ...snapshot,
       users: { ...snapshot.users, alice: { ...snapshot.users.alice, profile: { nickname: 'Al', color: 'blue' } } }
     });
+    expect(planStorageIntents(compiled.value, snapshot, 'test.user', { kind: 'object-map-key', key: 'alice' }, { nickname: 'Al' }))
+      .toMatchObject({ success: true, value: { intents: [{ path: ['users', 'alice', 'profile', 'nickname'] }] } });
 
     const hostileSibling = Object.defineProperty({ users: snapshot.users, notes: snapshot.notes }, 'ambient', {
       enumerable: true,

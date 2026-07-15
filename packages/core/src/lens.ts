@@ -162,12 +162,12 @@ export const projectLensRelation = (lens: ValidatedSchemaLensBody, relationId: R
   const projected: RelationRow[] = [];
   const rejectedRows: { rowIndex: number; row: RelationRow }[] = [];
   const issues: Issue[] = [];
+  const lookupIndexes = createLookupIndexes(relation.steps, safeRows, 'source');
   (safeRows[relation.fromRelationId] ?? []).forEach((row, rowIndex) => {
-    const result = projectOwnedLensCandidate(relation.steps, row, safeRows, rowIndex);
+    const result = projectOwnedLensCandidate(relation.steps, row, safeRows, rowIndex, lookupIndexes);
     if (result.success) { projected.push(result.value); issues.push(...result.issues); }
     else {
-      const ownedRow = detachAndFreezeJsonValue(row);
-      rejectedRows.push(Object.freeze({ rowIndex, row: ownedRow.success ? ownedRow.value as RelationRow : Object.freeze({}) }));
+      rejectedRows.push(Object.freeze({ rowIndex, row }));
       issues.push(...result.issues);
     }
   });
@@ -184,14 +184,16 @@ export const projectLensCandidate = (
   const ownedRow = detachAndFreezeJsonValue(row);
   const ownedRows = detachAndFreezeJsonValue(rows);
   if (!ownedRow.success || !ownedRows.success) return lensFailure('lens.input_invalid', 'query', [], { reason: !ownedRow.success ? 'row' : 'rows' });
-  return projectOwnedLensCandidate(steps, ownedRow.value as RelationRow, ownedRows.value as LensRows, rowIndex);
+  const safeRows = ownedRows.value as LensRows;
+  return projectOwnedLensCandidate(steps, ownedRow.value as RelationRow, safeRows, rowIndex, createLookupIndexes(steps, safeRows, 'source'));
 };
 
 const projectOwnedLensCandidate = (
   steps: ValidatedLensSteps,
   row: RelationRow,
   rows: LensRows,
-  rowIndex?: number
+  rowIndex?: number,
+  lookupIndexes?: LookupIndexes
 ): ParseResult<RelationRow> => {
   const output: Record<string, PortableValue> = {};
   const issues: Issue[] = [];
@@ -215,15 +217,13 @@ const projectOwnedLensCandidate = (
     if (!Object.hasOwn(row, step.from)) continue;
     const tuple = exactTuple(row[step.from] as PortableValue, step.sourceFields.length, step.from, rowIndex);
     if (!tuple.success) return tuple;
-    const matches = (rows[step.through.relationId] ?? []).filter((candidate) => fieldsMatch(candidate, step.sourceFields, tuple.value));
+    const matches = lookupMatches(step, tuple.value, rows, step.sourceFields, lookupIndexes);
     if (matches.length !== 1) return lensFailure(matches.length === 0 ? 'lens.lookup_missing' : 'lens.lookup_ambiguous', 'query', [step.from], { field: step.to, rowIndex, matches: matches.length });
     const values = step.resultFields.map((field) => matches[0]?.[field]).filter((value): value is PortableValue => value !== undefined);
     if (values.length !== step.resultFields.length) return lensFailure('lens.lookup_result_missing', 'query', [step.to], { field: step.to, rowIndex });
-    output[step.to] = values.length === 1 ? values[0] as PortableValue : values;
+    output[step.to] = values.length === 1 ? values[0] as PortableValue : Object.freeze(values);
   }
-  const owned = detachAndFreezeJsonValue(output);
-  if (!owned.success) return owned;
-  return { success: true, value: owned.value as RelationRow, issues: Object.freeze(issues) };
+  return { success: true, value: Object.freeze(output) as RelationRow, issues: Object.freeze(issues) };
 };
 
 export const translateLensEdits = (
@@ -245,6 +245,7 @@ export const translateLensEdits = (
   if (relation === undefined) return lensFailure('lens.relation_missing', 'plan', [], { relationId });
   const patch: Record<string, PortableValue> = {};
   const issues: Issue[] = [];
+  const lookupIndexes = createLookupIndexes(relation.steps, safeRows, 'result');
   for (const [field, value] of Object.entries(safeEdits)) {
     const matching = relation.steps.filter((step): step is Exclude<LensStep, { readonly kind: 'extension' } | { readonly kind: 'lens.hide' }> => step.kind !== 'extension' && step.kind !== 'lens.hide' && step.to === field);
     if (matching.length !== 1) { issues.push(lensIssue(matching.length === 0 ? 'lens.field_not_writable' : 'lens.inverse_ambiguous', 'plan', [field], { field })); continue; }
@@ -265,16 +266,49 @@ export const translateLensEdits = (
     }
     const tuple = exactTuple(value, step.resultFields.length, field, undefined, 'plan');
     if (!tuple.success) { issues.push(...tuple.issues); continue; }
-    const matches = (safeRows[step.through.relationId] ?? []).filter((candidate) => fieldsMatch(candidate, step.resultFields, tuple.value));
+    const matches = lookupMatches(step, tuple.value, safeRows, step.resultFields, lookupIndexes);
     if (matches.length !== 1) { issues.push(lensIssue(matches.length === 0 ? 'lens.lookup_missing' : 'lens.lookup_ambiguous', 'plan', [field], { field, matches: matches.length })); continue; }
     const sourceValues = step.sourceFields.map((sourceField) => matches[0]?.[sourceField]).filter((candidate): candidate is PortableValue => candidate !== undefined);
     if (sourceValues.length !== step.sourceFields.length) { issues.push(lensIssue('lens.lookup_result_missing', 'plan', [field], { field })); continue; }
-    patch[step.from] = sourceValues.length === 1 ? sourceValues[0] as PortableValue : sourceValues;
+    patch[step.from] = sourceValues.length === 1 ? sourceValues[0] as PortableValue : Object.freeze(sourceValues);
   }
   if (issues.length > 0) return { success: false, issues };
-  const owned = detachAndFreezeJsonValue(patch);
-  return owned.success ? { success: true, value: owned.value as Readonly<Record<string, PortableValue>>, issues: [] } : owned;
+  return { success: true, value: Object.freeze(patch), issues: [] };
 };
+
+type LookupStep = Extract<LensStep, { readonly kind: 'lens.lookup' }>;
+type LookupIndexes = ReadonlyMap<LookupStep, ReadonlyMap<string, readonly RelationRow[]>>;
+
+const createLookupIndexes = (
+  steps: ValidatedLensSteps,
+  rows: LensRows,
+  fields: 'source' | 'result'
+): LookupIndexes => {
+  const indexes = new Map<LookupStep, ReadonlyMap<string, readonly RelationRow[]>>();
+  for (const step of steps) {
+    if (step.kind !== 'lens.lookup') continue;
+    const keyFields = fields === 'source' ? step.sourceFields : step.resultFields;
+    const buckets = new Map<string, RelationRow[]>();
+    for (const row of rows[step.through.relationId] ?? []) {
+      if (!keyFields.every((field) => Object.hasOwn(row, field))) continue;
+      const key = canonicalizeJson(keyFields.map((field) => row[field] as JsonValue));
+      const bucket = buckets.get(key);
+      if (bucket === undefined) buckets.set(key, [row]);
+      else bucket.push(row);
+    }
+    indexes.set(step, buckets);
+  }
+  return indexes;
+};
+
+const lookupMatches = (
+  step: LookupStep,
+  tuple: readonly PortableValue[],
+  rows: LensRows,
+  fields: readonly string[],
+  indexes?: LookupIndexes
+): readonly RelationRow[] => indexes?.get(step)?.get(canonicalizeJson(tuple as JsonValue))
+  ?? (rows[step.through.relationId] ?? []).filter((candidate) => fieldsMatch(candidate, fields, tuple));
 
 const exactTuple = (value: PortableValue, length: number, field: string, rowIndex?: number, phase: 'query' | 'plan' = 'query'): ParseResult<readonly PortableValue[]> => {
   if (length === 1) return { success: true, value: [value], issues: [] };
@@ -282,7 +316,8 @@ const exactTuple = (value: PortableValue, length: number, field: string, rowInde
   return { success: true, value, issues: [] };
 };
 const fieldsMatch = (row: RelationRow, fields: readonly string[], tuple: readonly PortableValue[]): boolean => fields.every((field, index) => Object.hasOwn(row, field) && sameValue(row[field] as PortableValue, tuple[index] as PortableValue));
-const sameValue = (left: PortableValue, right: PortableValue): boolean => canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue);
+const sameValue = (left: PortableValue, right: PortableValue): boolean => left === right
+  || canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue);
 const sameRef = (left: ArtifactRef | undefined, right: ArtifactRef): boolean => left !== undefined && refKey(left) === refKey(right);
 const refKey = (ref: ArtifactRef): string => JSON.stringify(normalizeArtifactRef(ref));
 const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && hasOnlyKeys(value, ['id', 'contentHash', 'locations']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string' && location.length > 0)));
