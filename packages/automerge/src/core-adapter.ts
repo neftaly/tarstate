@@ -5,25 +5,27 @@ import {
   canonicalizeJson,
   createIssue,
   builtInCapabilityRefs,
-  type AtomicSource,
   type CapabilityRef,
   type ContentHash,
-  type Footprint,
-  type FootprintRelation,
-  type IntentMergeResult,
   type Issue,
-  type JsonValue,
-  type LogicalEdit,
-  type PlanResult,
-  type ProjectionResult,
-  type SourceCommitInput,
-  type SourceCommitResult,
-  type SourceFreshness,
-  type SourceLifecycleState,
-  type SourceOutcomeLookup,
-  type SourceSnapshot,
-  type StorageBinding
-} from '@tarstate/core';
+  type JsonValue
+} from '@tarstate/core/foundation';
+import type {
+  AtomicSource,
+  Footprint,
+  FootprintRelation,
+  IntentMergeResult,
+  LogicalEdit,
+  PlanResult,
+  ProjectionResult,
+  SourceCommitInput,
+  SourceCommitResult,
+  SourceFreshness,
+  SourceLifecycleState,
+  SourceOutcomeLookup,
+  SourceSnapshot,
+  StorageBinding
+} from '@tarstate/core/source';
 import { conflictsAt, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import {
   automergeBasis,
@@ -87,7 +89,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   readonly #runtime: AutomergeSourceRuntimeApi<T>;
   readonly #ownsRuntime: boolean;
   readonly #onDiagnostic: AutomergeSourceDiagnosticReporter | undefined;
-  readonly #listeners = new Set<(change?: { readonly beforeBasis?: import('@tarstate/core').SourceBasis; readonly afterBasis: import('@tarstate/core').SourceBasis }) => void>();
+  readonly #listeners = new Set<(change?: { readonly beforeBasis?: import('@tarstate/core/source').SourceBasis; readonly afterBasis: import('@tarstate/core/source').SourceBasis }) => void>();
   readonly #unsubscribeRuntime: () => void;
   #freshness: SourceFreshness;
   #lifecycle: SourceLifecycleState = 'ready';
@@ -134,7 +136,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     });
   };
 
-  subscribe = (listener: (change?: { readonly beforeBasis?: import('@tarstate/core').SourceBasis; readonly afterBasis: import('@tarstate/core').SourceBasis }) => void): (() => void) => {
+  subscribe = (listener: (change?: { readonly beforeBasis?: import('@tarstate/core/source').SourceBasis; readonly afterBasis: import('@tarstate/core/source').SourceBasis }) => void): (() => void) => {
     if (this.#lifecycle === 'closed') return () => undefined;
     this.#listeners.add(listener);
     return () => { this.#listeners.delete(listener); };

@@ -1,6 +1,6 @@
 import { canonicalizeJson } from './artifacts.js';
 import { sealPreparedPlan } from './internal-prepared-plan.js';
-import type { PreparedPlan } from './maintenance.js';
+import type { PreparedPlan } from './query-plan-contract.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue } from './value.js';
 
 /** Detached immutable ownership used at observer publication and input boundaries. */

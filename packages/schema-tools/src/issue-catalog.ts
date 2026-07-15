@@ -11,7 +11,7 @@ import {
   type JsonValue,
   type ParseResult,
   type ValueParseBudget
-} from '@tarstate/core';
+} from '@tarstate/core/foundation';
 import { schemaToolsFailure, schemaToolsIssueDeclarations } from './internal-issues.js';
 
 export { schemaToolsIssueDeclarations } from './internal-issues.js';

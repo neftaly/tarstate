@@ -4,11 +4,11 @@ import { builtInCapabilityRefs } from './builtins.js';
 import { createIssue, type CapabilityRef, type Issue, type IssuePhase, type IssueRetry } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { stringTupleKey } from './internal-string-key.js';
-import type { SourceBasis } from './maintenance.js';
+import type { SourceBasis } from './source-state.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import { comparePortableStrings } from './portable-order.js';
-import type { QueryNode } from './query.js';
-import { safeParseTransactionArtifact } from './semantic-artifact-parsers.js';
+import type { QueryNode } from './query-model.js';
+import { safeParseTransactionArtifact } from './semantic-transaction-artifact.js';
 import {
   type CommitReceipt,
   type FieldEdit,

@@ -35,7 +35,7 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
     build: {
       ...sharedBuildOptions,
       lib: {
-        entry: { index: 'src/index.ts' },
+        entry: { index: 'src/index.ts', 'values/index': 'src/values/index.ts' },
         formats: ['es'],
         fileName: (_format, entryName) => entryName + '.js'
       },

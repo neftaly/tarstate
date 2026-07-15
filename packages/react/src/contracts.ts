@@ -1,13 +1,12 @@
 import type {
-  CommitReceipt,
-  JsonValue,
   ObserveRequest,
   ObserverDiagnosticReporter,
   ObserverSnapshot,
-  QueryObserver,
-  TransactionAttempt,
-  TypedPreparedPlan
-} from '@tarstate/core';
+  QueryObserver
+} from '@tarstate/core/database/observer';
+import type { JsonValue } from '@tarstate/core/foundation';
+import type { TypedPreparedPlan } from '@tarstate/core/query/authoring';
+import type { CommitReceipt, TransactionAttempt } from '@tarstate/core/transactions';
 import type { ReactNode } from 'react';
 
 /** Minimal borrowed database contract consumed by the React adapter. */

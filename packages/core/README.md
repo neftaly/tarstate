@@ -12,21 +12,68 @@ npm install ./tarstate-core-0.3.0.tgz
 ## Imports
 
 The package root remains the complete, compatibility-stable surface. For
-focused modules and clearer dependency boundaries, the same public values are
-also available through topic entry points:
+focused modules and explicit dependency boundaries, public values are also
+available through architectural and topic entry points:
 
 | Entry point | Responsibility |
 | --- | --- |
-| `@tarstate/core/artifacts` | Portable envelopes, parsing, capabilities, issues, and resolution |
+| `@tarstate/core/foundation` | Portable values, issues, artifact envelopes, hashes, and built-in capability references |
+| `@tarstate/core/capabilities` | Host-owned capability registry and built-in capability registration |
+| `@tarstate/core/source` | Source state, storage-independent logical edits, and live source protocols |
+| `@tarstate/core/attachment` | Portable attachment declarations and host composition contracts |
+| `@tarstate/core/artifacts` | Portable envelopes, capabilities, issues, and exact resolution; no semantic handlers |
 | `@tarstate/core/schema` | Schemas, codecs, constraints, mappings, lenses, and typed authoring |
 | `@tarstate/core/query` | Query builders, evaluation, preparation, and incremental maintenance |
 | `@tarstate/core/database` | Observation, source protocols, host runtimes, and maintenance contracts |
 | `@tarstate/core/transactions` | Writes, commit coordination, receipts, and lifecycle governance |
 
-Topic entry points are additive aliases: importing from `@tarstate/core`
+Entry points are additive aliases: importing from `@tarstate/core`
 continues to work, and a value exported through both paths has the same runtime
-identity. Internal maintenance-pool APIs and conformance fixtures are not made
-public by these entry points.
+identity. The architectural entries have deliberately narrow static closures;
+the older topic entries remain broader convenience surfaces. Internal
+maintenance-pool APIs and conformance fixtures are not made public by these
+entry points.
+
+Query and observation have narrower execution seams:
+
+| Entry point | Responsibility |
+| --- | --- |
+| `@tarstate/core/query/model` | Portable query AST and batch request/result contracts; no runtime code |
+| `@tarstate/core/query/prepare` | Query and expression preparation without evaluation |
+| `@tarstate/core/query/authoring` | Query artifacts, functional builders, and typed authoring |
+| `@tarstate/core/query/evaluate` | Pure batch query and expression evaluation |
+| `@tarstate/core/query/incremental` | Stateful and pooled incremental maintenance |
+| `@tarstate/core/database/observer` | Generic catalogs and observation with an injected maintenance factory |
+| `@tarstate/core/database/incremental` | Explicit adapter from database observation to incremental query maintenance |
+| `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
+
+Schema, query, and transaction authoring are separate implementations behind
+their topic entries. The root `type-authoring` surface is only a compatibility
+facade, so query authoring does not load schema or transaction authoring code.
+
+Artifact semantics and attachment preparation also have opt-in execution seams:
+
+| Entry point | Responsibility |
+| --- | --- |
+| `@tarstate/core/artifacts/query` | Query artifact parsing, preparation, and evaluation |
+| `@tarstate/core/artifacts/transaction` | Transaction artifact parsing and validation |
+| `@tarstate/core/artifacts/constraint-set` | Constraint-set parsing and compilation |
+| `@tarstate/core/artifacts/storage-mapping` | Storage-mapping parsing and compilation |
+| `@tarstate/core/artifacts/schema-lens` | Schema-lens parsing and validation |
+| `@tarstate/core/artifacts/semantic` | Eager compatibility facade for all semantic artifact kinds |
+| `@tarstate/core/attachment/prepare` | Attachment resolution, schema/mapping preparation, and constraint composition |
+
+The portable `artifacts` entry never imports query evaluation, mapping, lens,
+constraint, or transaction implementations. Hosts opt into only the semantic
+artifact kinds they support; artifact data cannot select or load handlers.
+
+Applications may load the database/incremental adapter at their own composition
+boundary. Artifact or capability data never determines a module specifier:
+
+```ts
+const { createIncrementalDatabaseQueryMaintenance } =
+  await import('@tarstate/core/database/incremental');
+```
 
 ## Query authoring
 

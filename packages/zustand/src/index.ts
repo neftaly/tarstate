@@ -1,4 +1,4 @@
-import type { AtomicExternalStore } from '@tarstate/core';
+import type { AtomicExternalStore } from '@tarstate/core/database/external-store';
 import type { StoreApi } from 'zustand/vanilla';
 
 export type ZustandHydration = {

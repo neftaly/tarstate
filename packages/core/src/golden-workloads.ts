@@ -4,7 +4,9 @@ import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, validateLens, type LensRows, type SchemaLensBody } from './lens.js';
 import { InMemoryAtomicSource } from './memory-source.js';
 import { sealPreparedPlan } from './internal-prepared-plan.js';
-import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance, type QueryMaintenanceSnapshot, type QueryNode, type QueryRecord, type QueryResult, type RelationInput } from './query.js';
+import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance } from './query-incremental.js';
+import type { QueryMaintenanceSnapshot } from './query-incremental-model.js';
+import type { QueryNode, QueryRecord, QueryResult, RelationInput } from './query-model.js';
 import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
 import { sealTransaction } from './transaction.js';
 

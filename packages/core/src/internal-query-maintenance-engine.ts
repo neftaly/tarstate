@@ -49,20 +49,22 @@ import { groupRelationInputs, relationInputKey, relationKey, relationOccurrence 
 import { stringTupleKey } from './internal-string-key.js';
 import type {
   Expr,
-  IncrementalQueryMaintenanceState,
-  IncrementalQueryResult,
-  IncrementalQueryResultDelta,
   QueryLogicalValue,
-  QueryMaintenanceFallbackReason,
-  QueryMaintenanceSnapshot,
-  QueryMaintenanceUpdate,
   QueryNode,
   QueryRecord,
-  RelationInputChange,
-  RelationRowChange,
   RelationUse,
   WindowExpr
 } from './query-model.js';
+import type {
+  IncrementalQueryMaintenanceState,
+  IncrementalQueryResult,
+  IncrementalQueryResultDelta,
+  QueryMaintenanceFallbackReason,
+  QueryMaintenanceSnapshot,
+  QueryMaintenanceUpdate,
+  RelationInputChange,
+  RelationRowChange
+} from './query-incremental-model.js';
 import type { JsonValue } from './value.js';
 
 export const materializeQueryNode = (

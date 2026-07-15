@@ -173,6 +173,88 @@ describe('generic source commit coordinator', () => {
     expect(commit).toHaveBeenCalledOnce();
   });
 
+  it('contains every source callback and distinguishes failures before and after commit handoff', async () => {
+    const emptyBinding = binding('contained', {
+      readFootprint: [],
+      writeFootprint: [],
+      intents: [],
+      issues: []
+    });
+    const snapshotFailure = await coordinateSourceCommit({
+      source: {
+        ...source(),
+        snapshot: () => { throw new Error('snapshot failed'); }
+      },
+      bindings: [emptyBinding],
+      edits: [],
+      commit: commitInput
+    });
+    expect(snapshotFailure).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'source.snapshot_failed' }]
+    });
+
+    const footprintFailure = await coordinateSourceCommit({
+      source: source(defaultCommit, () => { throw new Error('relation failed'); }),
+      bindings: [binding('footprint', {
+        readFootprint: ['a'],
+        writeFootprint: [],
+        intents: [],
+        issues: []
+      })],
+      edits: [],
+      commit: commitInput
+    });
+    expect(footprintFailure).toMatchObject({
+      outcome: 'rejected',
+      issues: expect.arrayContaining([
+        expect.objectContaining({ code: 'binding.footprint_relation_failed' })
+      ])
+    });
+
+    const mergeFailure = await coordinateSourceCommit({
+      source: {
+        ...source(),
+        mergeIntents: () => { throw new Error('merge failed'); }
+      },
+      bindings: [emptyBinding],
+      edits: [],
+      commit: commitInput
+    });
+    expect(mergeFailure).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'binding.merge_failed' }]
+    });
+
+    const validationFailure = await coordinateSourceCommit({
+      source: source(),
+      bindings: [emptyBinding],
+      edits: [],
+      commit: commitInput,
+      validate: () => { throw new Error('validation failed'); }
+    });
+    expect(validationFailure).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'binding.validation_failed' }]
+    });
+
+    const commitFailure = await coordinateSourceCommit({
+      source: source(async () => { throw new Error('commit result lost'); }),
+      bindings: [emptyBinding],
+      edits: [],
+      commit: commitInput
+    });
+    expect(commitFailure).toMatchObject({
+      outcome: 'unknown',
+      beforeBasis: commitInput.expectedBasis,
+      issues: [{
+        code: 'transaction.outcome_unavailable',
+        retry: 'query_outcome',
+        operationId: commitInput.operationId
+      }]
+    });
+  });
+
   it('makes n-ary merge input independent of caller binding order', async () => {
     const orders = [
       ['c', 'a', 'b'],

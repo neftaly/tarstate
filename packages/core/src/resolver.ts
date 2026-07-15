@@ -146,7 +146,22 @@ export class ResourceResolver {
     const visited = new Set<string>();
     let current = reference;
     for (let depth = 0; depth <= this.#maxRedirects; depth += 1) {
-      if (!this.#authority.permits(context.authorityScope, current)) {
+      if (signalAborted(context.signal)) {
+        return cancelledResolution(reference, current, redirects, accumulatedIssues);
+      }
+      let currentPermitted: boolean;
+      try {
+        currentPermitted = this.#authority.permits(context.authorityScope, current);
+      } catch (error) {
+        return authorityFailureResolution(
+          reference,
+          current,
+          redirects,
+          accumulatedIssues,
+          error
+        );
+      }
+      if (!currentPermitted) {
         return resolution(reference, current, redirects, 'denied', 'none', undefined, [...accumulatedIssues, resolverIssue('resolver.authority_denied', 'after_authority', { uri: current.uri })]);
       }
       const identity = stringTupleKey(current.kind, current.uri);
@@ -162,11 +177,17 @@ export class ResourceResolver {
       try {
         result = await driver.resolve(current, context);
       } catch (error) {
+        if (signalAborted(context.signal)) {
+          return cancelledResolution(reference, current, redirects, accumulatedIssues);
+        }
         result = {
           state: 'failed',
           freshness: 'none',
           issues: [resolverIssue('resolver.failed', 'after_refresh', { uri: current.uri, error: error instanceof Error ? error.name : typeof error })]
         };
+      }
+      if (signalAborted(context.signal)) {
+        return cancelledResolution(reference, current, redirects, accumulatedIssues);
       }
       if (result.state === 'redirect') {
         accumulatedIssues.push(...(result.issues ?? []));
@@ -196,12 +217,26 @@ export class ResourceResolver {
         ]);
       }
       const resolved = withIntegrity(driverResolved, current.integrity);
-      if (!sameResourceRef(current, resolved) && !this.#authority.permits(context.authorityScope, resolved)) {
-        return resolution(reference, resolved, redirects, 'denied', 'none', undefined, [
-          ...accumulatedIssues,
-          ...(result.issues ?? []),
-          resolverIssue('resolver.authority_denied', 'after_authority', { uri: resolved.uri })
-        ]);
+      if (!sameResourceRef(current, resolved)) {
+        let resolvedPermitted: boolean;
+        try {
+          resolvedPermitted = this.#authority.permits(context.authorityScope, resolved);
+        } catch (error) {
+          return authorityFailureResolution(
+            reference,
+            resolved,
+            redirects,
+            [...accumulatedIssues, ...(result.issues ?? [])],
+            error
+          );
+        }
+        if (!resolvedPermitted) {
+          return resolution(reference, resolved, redirects, 'denied', 'none', undefined, [
+            ...accumulatedIssues,
+            ...(result.issues ?? []),
+            resolverIssue('resolver.authority_denied', 'after_authority', { uri: resolved.uri })
+          ]);
+        }
       }
       if (result.state === 'ready' && resolved.integrity !== undefined && result.contentHash !== resolved.integrity) {
         return resolution(reference, resolved, redirects, 'failed', 'none', undefined, [
@@ -332,6 +367,46 @@ const resolution = (
   issues: Object.freeze([...issues])
 });
 
+const cancelledResolution = (
+  requested: ResourceRef,
+  resolved: ResourceRef,
+  redirects: readonly string[],
+  issues: readonly Issue[]
+): ResolvedResource => resolution(
+  requested,
+  resolved,
+  redirects,
+  'failed',
+  'none',
+  undefined,
+  [...issues, createIssue({
+    code: 'lifecycle.cancelled',
+    phase: 'lifecycle',
+    severity: 'error',
+    retry: 'never'
+  })]
+);
+
+const authorityFailureResolution = (
+  requested: ResourceRef,
+  resolved: ResourceRef,
+  redirects: readonly string[],
+  issues: readonly Issue[],
+  error: unknown
+): ResolvedResource => resolution(
+  requested,
+  resolved,
+  redirects,
+  'failed',
+  'none',
+  undefined,
+  [...issues, resolverIssue('resolver.failed', 'after_authority', {
+    uri: resolved.uri,
+    reason: 'authority_check_failed',
+    error: error instanceof Error ? error.name : typeof error
+  })]
+);
+
 const resolverIssue = (code: string, retry: 'after_input' | 'after_refresh' | 'after_capability' | 'after_authority', details: unknown): Issue => createIssue({
   code,
   phase: 'resolve',
@@ -339,3 +414,5 @@ const resolverIssue = (code: string, retry: 'after_input' | 'after_refresh' | 'a
   retry,
   details
 });
+
+const signalAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;

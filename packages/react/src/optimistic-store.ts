@@ -1,12 +1,10 @@
 import {
-  canonicalizeJson,
-  safeParseJsonValue,
-  type JsonValue,
   type ObserveRequest,
   type ObserverDiagnosticReporter,
-  type ObserverSnapshot,
-  type TransactionAttempt
-} from '@tarstate/core';
+  type ObserverSnapshot
+} from '@tarstate/core/database/observer';
+import { canonicalizeJson, safeParseJsonValue, type JsonValue } from '@tarstate/core/foundation';
+import type { TransactionAttempt } from '@tarstate/core/transactions';
 import type {
   OptimisticOperationEvidence,
   OptimisticOverlay,

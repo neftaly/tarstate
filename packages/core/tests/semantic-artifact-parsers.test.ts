@@ -273,6 +273,40 @@ describe('semantic artifact safe parsers', () => {
     }
   });
 
+  it('preserves an outer recursion binding after rejecting a nested duplicate name', async () => {
+    const recursiveBody = mutate(queryBody(), (body) => {
+      body.root = {
+        kind: 'recursive',
+        name: 'walk',
+        seed: values('row'),
+        step: {
+          kind: 'set',
+          op: 'union-all',
+          left: {
+            kind: 'recursive',
+            name: 'walk',
+            seed: values('row'),
+            step: { kind: 'recursion-ref', name: 'walk' },
+            key: []
+          },
+          right: { kind: 'recursion-ref', name: 'walk' }
+        },
+        key: []
+      };
+    });
+    const parsed = await safeParseQueryArtifact(await seal('query', recursiveBody));
+    expect(parsed).toMatchObject({
+      success: false,
+      issues: expect.arrayContaining([
+        expect.objectContaining({ details: { reason: 'duplicate_recursion_name' } })
+      ])
+    });
+    if (parsed.success) throw new Error('duplicate recursion fixture was accepted');
+    expect(parsed.issues).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ details: { reason: 'recursion_reference_unbound' } })
+    ]));
+  });
+
   it('uses duplicate-aware envelopes, semantic recursion budgets, and total hostile-input handling', async () => {
     const artifact = await seal('query', queryBody());
     const duplicateText = JSON.stringify(artifact).replace('"requiredCapabilities":[]', '"requiredCapabilities":[],"requiredCapabilities":[]');

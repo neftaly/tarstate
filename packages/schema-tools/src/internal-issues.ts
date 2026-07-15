@@ -1,4 +1,4 @@
-import { canonicalizeJson, issueCatalog, type Issue, type IssueDeclaration, type IssueRetry, type JsonValue, type ParseResult } from '@tarstate/core';
+import { canonicalizeJson, issueCatalog, type Issue, type IssueDeclaration, type IssueRetry, type JsonValue, type ParseResult } from '@tarstate/core/foundation';
 
 export const schemaToolsIssueDeclarations: readonly IssueDeclaration[] = [
   { code: 'schema_tools.artifact_kind', phase: 'parse', severity: 'error', retries: ['after_input'] },

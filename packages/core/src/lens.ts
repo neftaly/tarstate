@@ -149,7 +149,7 @@ export const validateLens = (input: unknown): ParseResult<ValidatedSchemaLensBod
   });
   return issues.length > 0
     ? { success: false, issues }
-    : { success: true, value: sealValidatedLens(body as ValidatedSchemaLensBody), issues: [] };
+    : { success: true, value: sealValidatedLens<ValidatedSchemaLensBody>(body as unknown as Omit<ValidatedSchemaLensBody, symbol>), issues: [] };
 };
 
 export const projectLensRelation = (lens: ValidatedSchemaLensBody, relationId: RelationId, rows: LensRows): LensProjection => {

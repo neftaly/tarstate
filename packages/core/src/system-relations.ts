@@ -1,8 +1,8 @@
 import { canonicalizeJson, normalizeArtifactRef, sealArtifact, type Artifact, type ArtifactRef } from './artifacts.js';
 import type { FieldDeclaration, SchemaBody } from './schema.js';
 import type { CapabilityRef, Issue, IssuePhase, IssueSeverity } from './issues.js';
-import type { SourceBasis } from './maintenance.js';
-import type { QueryRecord, RelationInput } from './query.js';
+import type { SourceBasis } from './source-state.js';
+import type { QueryRecord, RelationInput } from './query-model.js';
 import { executePresence, type PresenceReceipt, type SetPresenceCommand } from './receipts.js';
 import type { JsonValue } from './value.js';
 

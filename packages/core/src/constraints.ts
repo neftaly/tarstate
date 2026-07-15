@@ -1,5 +1,5 @@
 import { createIssue, type Issue, type IssueSeverity } from './issues.js';
-import type { SourceBasis } from './maintenance.js';
+import type { SourceBasis } from './source-state.js';
 import type { JsonValue } from './value.js';
 
 export type ConstraintScope = {

@@ -1,10 +1,10 @@
 import {
   queryObservationKey,
-  type JsonValue,
   type ObserveRequest,
-  type ObserverSnapshot,
-  type PreparedPlan
-} from '@tarstate/core';
+  type ObserverSnapshot
+} from '@tarstate/core/database/observer';
+import type { JsonValue } from '@tarstate/core/foundation';
+import type { PreparedPlan } from '@tarstate/core/query/model';
 import {
   createContext,
   createElement,

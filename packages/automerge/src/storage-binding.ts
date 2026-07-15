@@ -1,5 +1,5 @@
 import * as Automerge from '@automerge/automerge';
-import { canonicalizeJson, type JsonValue } from '@tarstate/core';
+import { canonicalizeJson, type JsonValue } from '@tarstate/core/foundation';
 import { conflictsAt, normalizeAutomergeValue, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import { isAutomergeReservedRootProperty } from './reserved.js';
 import { comparePortableStrings } from './portable-order.js';

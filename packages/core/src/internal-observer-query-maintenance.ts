@@ -1,38 +1,38 @@
 import { canonicalizeJson } from './artifacts.js';
-import { createIssue } from './issues.js';
 import {
   createQueryMaintenanceSnapshotNormalizer,
   type QueryMaintenanceSnapshotDiff,
   type QueryMaintenanceSnapshotNormalizer
 } from './internal-observer-maintenance-frames.js';
-import type {
-  CreateDatabaseQueryMaintenance,
-  DatabaseQueryMaintenanceInput,
-  DatabaseQueryMaintenanceSession,
-  MaintainedDatabaseQueryResult,
-  QueryMaintenanceDiagnostics,
-  QueryMaintenanceReuseDiagnostics
-} from './internal-observer-query-maintenance-contracts.js';
+import {
+  failedMaintenanceEvaluation,
+  registerQueryMaintenanceExtensions,
+  type TrustedQueryMaintenanceMetadata,
+  type CreateDatabaseQueryMaintenance,
+  type DatabaseQueryMaintenanceSession,
+  type MaintainedDatabaseQueryResult
+} from './observer-maintenance-contracts.js';
 import { samePortableObserverValue } from './internal-observer-values.js';
-import type { PreparedPlan } from './maintenance.js';
+import type { PreparedPlan } from './query-plan-contract.js';
 import {
   createPooledIncrementalQueryRuntime,
   diffQueryMaintenanceSnapshots,
   isNonPoolableQueryError,
   isPooledQueryRuntimeBusyError,
   openIncrementalQueryMaintenance
-} from './query.js';
+} from './query-incremental.js';
 import type {
   FunctionRegistry,
-  IncrementalQueryResult,
-  PooledIncrementalQueryDiagnostics,
-  PooledIncrementalQueryRoot,
-  PooledIncrementalQueryRuntime,
-  QueryMaintenanceSnapshot,
   QueryNode,
   QueryRecord,
   RelationInput
 } from './query-model.js';
+import type {
+  IncrementalQueryResult,
+  PooledIncrementalQueryRoot,
+  PooledIncrementalQueryRuntime,
+  QueryMaintenanceSnapshot
+} from './query-incremental-model.js';
 import type { JsonValue } from './value.js';
 
 export type {
@@ -42,31 +42,12 @@ export type {
   MaintainedDatabaseQueryResult,
   QueryMaintenanceDiagnostics,
   QueryMaintenanceReuseDiagnostics
-} from './internal-observer-query-maintenance-contracts.js';
+} from './observer-maintenance-contracts.js';
 
-export type TrustedIncrementalMetadata = Readonly<Pick<IncrementalQueryResult['state'], 'revision' | 'resultDelta'>> & {
-  readonly resultKeyPositions: ReadonlyMap<string, number>;
-};
-type OwnedTrustedIncrementalMetadata = TrustedIncrementalMetadata & { readonly owner: object };
+type OwnedTrustedIncrementalMetadata = TrustedQueryMaintenanceMetadata & { readonly owner: object };
 
-const incrementalMaintenanceFactoryBrand = Symbol('tarstate.incremental-maintenance-factory');
-const maintenanceRuntimeIdentity = Symbol('tarstate.maintenance-runtime');
 const trustedIncrementalResults = new WeakMap<object, OwnedTrustedIncrementalMetadata>();
 const resultKeyPositionCache = new WeakMap<readonly string[], ReadonlyMap<string, number>>();
-const trustedIncrementalFactories = new WeakMap<object, object>();
-
-type IncrementalDatabaseQueryMaintenanceFactory = CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> & {
-  readonly [incrementalMaintenanceFactoryBrand]: {
-    readonly getDiagnostics: (runtimeIdentity: object) => readonly PooledIncrementalQueryDiagnostics[];
-    readonly getReuseDiagnostics: (runtimeIdentity: object) => QueryMaintenanceReuseDiagnostics;
-  };
-};
-
-type InternalCreateDatabaseQueryMaintenanceInput<Query, Projection> = {
-  readonly plan: PreparedPlan<Query>;
-  readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection>;
-  readonly [maintenanceRuntimeIdentity]: object;
-};
 
 type PooledDatabaseMaintenanceCohort = {
   readonly key: string;
@@ -81,71 +62,6 @@ type PooledDatabaseMaintenanceCohort = {
   roots: number;
 };
 
-export const maintenanceFactoryInput = <Query, Projection>(
-  plan: PreparedPlan<Query>,
-  initialInput: DatabaseQueryMaintenanceInput<Query, Projection>,
-  runtimeIdentity: object
-): { readonly plan: PreparedPlan<Query>; readonly initialInput: DatabaseQueryMaintenanceInput<Query, Projection> } => ({
-  plan,
-  initialInput,
-  [maintenanceRuntimeIdentity]: runtimeIdentity
-} as InternalCreateDatabaseQueryMaintenanceInput<Query, Projection>);
-
-export const getIncrementalMaintenanceDiagnostics = <Query, Row, Projection>(
-  factory: CreateDatabaseQueryMaintenance<Query, Row, Projection>,
-  runtimes: Iterable<{ readonly identity: object }>
-): readonly QueryMaintenanceDiagnostics[] => {
-  const branded = (factory as Partial<IncrementalDatabaseQueryMaintenanceFactory>)[incrementalMaintenanceFactoryBrand];
-  return branded === undefined || typeof branded.getDiagnostics !== 'function'
-    ? []
-    : Object.freeze([...runtimes].flatMap(({ identity }) => branded.getDiagnostics(identity)));
-};
-
-export const getIncrementalMaintenanceReuseDiagnostics = <Query, Row, Projection>(
-  factory: CreateDatabaseQueryMaintenance<Query, Row, Projection>,
-  runtimes: Iterable<{ readonly identity: object }>
-): QueryMaintenanceReuseDiagnostics => {
-  const branded = (factory as Partial<IncrementalDatabaseQueryMaintenanceFactory>)[incrementalMaintenanceFactoryBrand];
-  if (branded === undefined || typeof branded.getReuseDiagnostics !== 'function') {
-    return Object.freeze({ computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 });
-  }
-  let computedFrameDeltaCount = 0;
-  let reusedFrameDeltaCount = 0;
-  for (const { identity } of runtimes) {
-    const diagnostics = branded.getReuseDiagnostics(identity);
-    computedFrameDeltaCount += diagnostics.computedFrameDeltaCount;
-    reusedFrameDeltaCount += diagnostics.reusedFrameDeltaCount;
-  }
-  return Object.freeze({ computedFrameDeltaCount, reusedFrameDeltaCount });
-};
-
-export const getTrustedIncrementalMetadata = <Query, Row, Projection>(
-  factory: CreateDatabaseQueryMaintenance<Query, Row, Projection>,
-  result: MaintainedDatabaseQueryResult<Row>
-): TrustedIncrementalMetadata | undefined => {
-  const candidate = trustedIncrementalResults.get(result as object);
-  const expectedOwner = trustedIncrementalFactories.get(factory as object);
-  return candidate?.owner === expectedOwner ? candidate : undefined;
-};
-
-export const failedMaintenanceSession = <Query, Row, Projection>(error: unknown): DatabaseQueryMaintenanceSession<Query, Row, Projection> => {
-  const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<Row>;
-  return { getCurrentResult: () => result, updateInput: () => result, close: () => undefined };
-};
-
-export const failedEvaluation = (error: unknown): MaintainedDatabaseQueryResult<never> => ({
-  rows: [],
-  resultKeys: [],
-  completeness: 'unknown',
-  issues: [createIssue({
-    code: 'observer.evaluation_failed',
-    phase: 'query',
-    severity: 'error',
-    retry: 'after_refresh',
-    details: { error: error instanceof Error ? error.name : typeof error }
-  })]
-});
-
 /** Bridges relation projections into the production incremental query graph. */
 export const createIncrementalDatabaseQueryMaintenance = (
   functions?: FunctionRegistry
@@ -156,7 +72,7 @@ export const createIncrementalDatabaseQueryMaintenance = (
   let nextCohortIdentity = 0;
   const factory = ((input) => {
     const { plan, initialInput } = input;
-    const runtimeIdentity = (input as Partial<InternalCreateDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[maintenanceRuntimeIdentity];
+    const runtimeIdentity = input.reuseScope;
     const initial = normalize(initialInput);
     if (runtimeIdentity === undefined) return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
     let cohorts = scopes.get(runtimeIdentity);
@@ -212,15 +128,16 @@ export const createIncrementalDatabaseQueryMaintenance = (
       if (!isNonPoolableQueryError(error) && !isPooledQueryRuntimeBusyError(error)) throw error;
       return openPrivateDatabaseMaintenance(plan, initial, normalize, trustOwner);
     }
-  }) as IncrementalDatabaseQueryMaintenanceFactory;
-  trustedIncrementalFactories.set(factory, trustOwner);
-  Object.defineProperty(factory, incrementalMaintenanceFactoryBrand, {
-    value: Object.freeze({
-      getDiagnostics: (runtimeIdentity: object) => Object.freeze(
-        [...(scopes.get(runtimeIdentity)?.values() ?? [])].map(({ runtime }) => runtime.getDiagnostics())
-      ),
-      getReuseDiagnostics: (runtimeIdentity: object) => normalize.getReuseDiagnostics(runtimeIdentity)
-    })
+  }) as CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]>;
+  registerQueryMaintenanceExtensions(factory, {
+    diagnostics: (reuseScope) => Object.freeze(
+      [...(scopes.get(reuseScope)?.values() ?? [])].map(({ runtime }) => runtime.getDiagnostics())
+    ),
+    reuseDiagnostics: (reuseScope) => normalize.getReuseDiagnostics(reuseScope),
+    trustedMetadata: (result) => {
+      const candidate = trustedIncrementalResults.get(result as object);
+      return candidate?.owner === trustOwner ? candidate : undefined;
+    }
   });
   return factory;
 };
@@ -282,14 +199,14 @@ const openPooledDatabaseMaintenance = (options: {
       try {
         delta = options.normalize.diff(options.cohort.accepted, normalizedNext);
       } catch (error) {
-        const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
+        const result = failedMaintenanceEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
         options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: false };
         return result;
       }
       try {
         options.cohort.runtime.applyUpdate(delta.update);
       } catch (error) {
-        const result = failedEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
+        const result = failedMaintenanceEvaluation(error) as MaintainedDatabaseQueryResult<QueryRecord>;
         options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: true };
         return result;
       }

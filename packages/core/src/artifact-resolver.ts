@@ -198,6 +198,7 @@ export class ExactArtifactResolver {
         ...(input.signal === undefined ? {} : { signal: input.signal })
       });
     } catch (error) {
+      if (isAborted(input.signal)) return undefined;
       attempts.push(failedAttempt(id, origin, resolutionIssue('resolver.failed', id, { error: errorName(error) })));
       return undefined;
     }

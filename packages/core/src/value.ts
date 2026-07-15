@@ -3,9 +3,10 @@ import { createIssue, type Issue, type ParseResult } from './issues.js';
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 
-export const missingValue = Symbol('tarstate.value.missing');
-export const logicalUnknown = Symbol('tarstate.value.logical-unknown');
-export const capabilityUnavailable = Symbol('tarstate.value.capability-unavailable');
+/** Realm-stable semantic sentinels; compatible package copies must compare them by identity. */
+export const missingValue = Symbol.for('@tarstate/core/value/missing/v1');
+export const logicalUnknown = Symbol.for('@tarstate/core/value/logical-unknown/v1');
+export const capabilityUnavailable = Symbol.for('@tarstate/core/value/capability-unavailable/v1');
 
 export type MissingValue = typeof missingValue;
 export type LogicalUnknown = typeof logicalUnknown;

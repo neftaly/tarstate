@@ -2,7 +2,7 @@ import {
   queryObservationKey,
   type ObserverDiagnosticReporter,
   type ObserverSnapshot
-} from '@tarstate/core';
+} from '@tarstate/core/database/observer';
 import type {
   ErasedDatabase,
   ObservableDatabase,

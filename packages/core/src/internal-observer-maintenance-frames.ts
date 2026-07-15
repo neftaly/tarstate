@@ -1,33 +1,18 @@
-import type { DatasetSnapshot } from './database.js';
-import type { AvailableQueryAttachment } from './internal-observer-dataset-capture.js';
+import { maintenanceFrameMetadataFor } from './internal-observer-maintenance-frame.js';
 import type {
   DatabaseQueryMaintenanceInput,
   QueryMaintenanceReuseDiagnostics
-} from './internal-observer-query-maintenance-contracts.js';
+} from './observer-maintenance-contracts.js';
 import { deepFreezeObserverValue } from './internal-observer-values.js';
 import { adoptQueryOccurrenceIds } from './internal-query-ownership.js';
 import { diffQueryMaintenanceSnapshots } from './query-maintenance-diff.js';
 import type {
   FunctionRegistry,
-  QueryMaintenanceSnapshot,
-  QueryMaintenanceUpdate,
   QueryNode,
   RelationInput
 } from './query-model.js';
-import type { JsonValue } from './value.js';
-
-const captureFrameMetadata = Symbol('tarstate.capture-frame');
+import type { QueryMaintenanceSnapshot, QueryMaintenanceUpdate } from './query-incremental-model.js';
 const queryMaintenanceFrameIdentity = Symbol('tarstate.query-maintenance-frame');
-
-type CaptureFrameMetadata = {
-  readonly frameIdentity: object;
-  readonly parameterKey: string;
-  readonly runtimeIdentity: object;
-};
-
-type InternalDatabaseQueryMaintenanceInput<Query, Projection> = DatabaseQueryMaintenanceInput<Query, Projection> & {
-  readonly [captureFrameMetadata]: CaptureFrameMetadata;
-};
 
 type FramedQueryMaintenanceSnapshot = QueryMaintenanceSnapshot & {
   readonly [queryMaintenanceFrameIdentity]: {
@@ -48,20 +33,6 @@ export type QueryMaintenanceSnapshotNormalizer = {
   readonly getReuseDiagnostics: (runtimeIdentity: object) => QueryMaintenanceReuseDiagnostics;
 };
 
-export const maintenanceInputWithFrame = <Query, Projection>(
-  query: Query,
-  parameters: Readonly<Record<string, JsonValue>>,
-  dataset: DatasetSnapshot,
-  attachments: readonly AvailableQueryAttachment<Projection>[],
-  metadata: CaptureFrameMetadata
-): DatabaseQueryMaintenanceInput<Query, Projection> => ({
-  query,
-  parameters,
-  dataset,
-  attachments,
-  [captureFrameMetadata]: Object.freeze(metadata)
-} as InternalDatabaseQueryMaintenanceInput<Query, Projection>);
-
 export const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | undefined): QueryMaintenanceSnapshotNormalizer => {
   const maxParameterSnapshotsPerFrame = 256;
   const frames = new WeakMap<object, {
@@ -71,7 +42,7 @@ export const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegi
   const deltas = new WeakMap<object, WeakMap<object, QueryMaintenanceUpdate>>();
   const reuseDiagnostics = new WeakMap<object, { computedFrameDeltaCount: number; reusedFrameDeltaCount: number }>();
   const normalize = (input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>): QueryMaintenanceSnapshot => {
-    const metadata = (input as Partial<InternalDatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>>)[captureFrameMetadata];
+    const metadata = maintenanceFrameMetadataFor(input);
     if (metadata === undefined) return normalizeQueryMaintenanceSnapshot(input, functions);
     let frame = frames.get(metadata.frameIdentity);
     if (frame === undefined) {

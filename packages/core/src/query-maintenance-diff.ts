@@ -7,13 +7,15 @@ import {
 import { queryValueEqual } from './internal-query-values.js';
 import { comparePortableStrings } from './portable-order.js';
 import type {
+  QueryRecord,
+  RelationInput
+} from './query-model.js';
+import type {
   QueryMaintenanceSnapshot,
   QueryMaintenanceUpdate,
-  QueryRecord,
-  RelationInput,
   RelationInputChange,
   RelationRowChange
-} from './query-model.js';
+} from './query-incremental-model.js';
 
 /** Pure shell adapter from two snapshots to the exact update consumed by maintenance. */
 export const diffQueryMaintenanceSnapshots = (previous: QueryMaintenanceSnapshot, next: QueryMaintenanceSnapshot): QueryMaintenanceUpdate => {

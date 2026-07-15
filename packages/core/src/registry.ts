@@ -1,21 +1,13 @@
 import { canonicalizeJson, isContentHash, sha256Json, type ContentHash } from './artifacts.js';
+import type { CapabilityClass, CapabilityDeclaration } from './capability-model.js';
 import { capabilityRefKey, createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { JsonValue } from './value.js';
 
-export type CapabilityClass = 'edit' | 'executor' | 'source' | 'function' | 'codec' | 'collation';
 const capabilityClasses: readonly CapabilityClass[] = ['edit', 'executor', 'source', 'function', 'codec', 'collation'];
 
-export type CapabilityDeclaration = {
-  readonly kind: 'tarstate.capability-contract';
-  readonly formatVersion: 1;
-  readonly id: string;
-  readonly version: string;
-  readonly class: CapabilityClass;
-  readonly contract: JsonValue;
-  readonly implies: readonly CapabilityRef[];
-};
+export type { CapabilityClass, CapabilityDeclaration } from './capability-model.js';
 
 export type CapabilityImplementation = {
   readonly ref: CapabilityRef;

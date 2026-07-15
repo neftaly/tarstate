@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageDirectories = ['core', 'automerge', 'zustand', 'react', 'schema-tools'];
-const coreSubpaths = ['artifacts', 'database', 'query', 'schema', 'transactions'];
+const coreSubpaths = ['artifacts', 'artifacts/constraint-set', 'artifacts/query', 'artifacts/schema-lens', 'artifacts/semantic', 'artifacts/storage-mapping', 'artifacts/transaction', 'attachment', 'attachment/prepare', 'capabilities', 'database', 'database/external-store', 'database/incremental', 'database/observer', 'foundation', 'query', 'query/authoring', 'query/evaluate', 'query/incremental', 'query/model', 'query/prepare', 'schema', 'source', 'transactions'];
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-release-'));
 const releaseVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
 if (typeof releaseVersion !== 'string' || releaseVersion.length === 0) throw new Error('Root package version must be a non-empty string');
@@ -149,6 +149,18 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
   const producer = await import(pathToFileURL(path.join(producerDirectory, 'package/dist/index.js')).href);
   const queryConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/query/index.js')).href);
   const schemaConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/schema/index.js')).href);
+  const foundationConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/foundation/index.js')).href);
+
+  for (const sentinel of ['missingValue', 'logicalUnknown', 'capabilityUnavailable']) {
+    if (producer[sentinel] !== foundationConsumer[sentinel]) {
+      fail('@tarstate/core: packed duplicate copies disagree on ' + sentinel + ' identity');
+    }
+  }
+
+  const preparedExpression = producer.prepareExpression({ kind: 'literal', value: 7 });
+  if (queryConsumer.evaluatePreparedExpression(preparedExpression, {}) !== 7) {
+    fail('@tarstate/core: packed query entry rejected root-entry prepared expression');
+  }
 
   const plan = await producer.prepareQuery({
     root: { kind: 'values', alias: 'value', rows: [{ id: 1 }] },

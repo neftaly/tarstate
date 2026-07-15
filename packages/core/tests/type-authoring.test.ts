@@ -204,6 +204,21 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly source: string | undefined }>();
   });
 
+  it('rejects conflicting declarations for a composed parameter name', () => {
+    expect(() => typedAnd(
+      typedCompare(
+        'gte',
+        author.aliases.author.row.score,
+        typedParameter('shared', { kind: 'integer' })
+      ),
+      typedCompare(
+        'eq',
+        author.aliases.author.row.name,
+        typedParameter('shared', { kind: 'string' })
+      )
+    )).toThrow('Conflicting declarations for query parameter "shared"');
+  });
+
   it('preserves exact query evidence through more than ten pipeline operators', () => {
     const query = pipe(
       author,
@@ -240,8 +255,10 @@ describe('literal-schema and query type authoring', () => {
 
   it('rejects typed query operators outside a typed query pipeline', () => {
     const filter = typedWhere(typedCompare('gte', author.aliases.author.row.score, typedParameter('minimum', { kind: 'integer' })));
-    // @ts-expect-error typed query operators do not accept primitive pipeline values
-    pipe(1, filter);
+    expect(() => {
+      // @ts-expect-error typed query operators do not accept primitive pipeline values
+      pipe(1, filter);
+    }).toThrow('Typed query operator received an invalid query input');
   });
 
   it('keeps self-join aliases collision-safe at the responsible operator', () => {
@@ -289,7 +306,7 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<IsAny<RuntimeQueryParameters>>().toEqualTypeOf<false>();
     expectTypeOf<IsAny<RuntimeQueryResultRow>>().toEqualTypeOf<false>();
     type MaintenanceInput = Parameters<CreateDatabaseQueryMaintenance<unknown, Readonly<Record<string, unknown>>, unknown>>[0];
-    expectTypeOf<keyof MaintenanceInput>().toEqualTypeOf<'plan' | 'initialInput'>();
+    expectTypeOf<keyof MaintenanceInput>().toEqualTypeOf<'plan' | 'initialInput' | 'reuseScope'>();
     expectTypeOf<QueryMaintenanceDiagnostics['strategy']>().toEqualTypeOf<'pooled-differential-operator-dag'>();
     expectTypeOf<QueryMaintenanceReuseDiagnostics>().toEqualTypeOf<{
       readonly computedFrameDeltaCount: number;

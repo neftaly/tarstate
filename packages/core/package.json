@@ -15,17 +15,93 @@
       "types": "./dist/artifacts/index.d.ts",
       "import": "./dist/artifacts/index.js"
     },
+    "./artifacts/constraint-set": {
+      "types": "./dist/artifacts/constraint-set/index.d.ts",
+      "import": "./dist/artifacts/constraint-set/index.js"
+    },
+    "./artifacts/query": {
+      "types": "./dist/artifacts/query/index.d.ts",
+      "import": "./dist/artifacts/query/index.js"
+    },
+    "./artifacts/schema-lens": {
+      "types": "./dist/artifacts/schema-lens/index.d.ts",
+      "import": "./dist/artifacts/schema-lens/index.js"
+    },
+    "./artifacts/semantic": {
+      "types": "./dist/artifacts/semantic/index.d.ts",
+      "import": "./dist/artifacts/semantic/index.js"
+    },
+    "./artifacts/storage-mapping": {
+      "types": "./dist/artifacts/storage-mapping/index.d.ts",
+      "import": "./dist/artifacts/storage-mapping/index.js"
+    },
+    "./artifacts/transaction": {
+      "types": "./dist/artifacts/transaction/index.d.ts",
+      "import": "./dist/artifacts/transaction/index.js"
+    },
+    "./attachment": {
+      "types": "./dist/attachment/index.d.ts",
+      "import": "./dist/attachment/index.js"
+    },
+    "./attachment/prepare": {
+      "types": "./dist/attachment/prepare/index.d.ts",
+      "import": "./dist/attachment/prepare/index.js"
+    },
+    "./capabilities": {
+      "types": "./dist/capabilities/index.d.ts",
+      "import": "./dist/capabilities/index.js"
+    },
     "./database": {
       "types": "./dist/database/index.d.ts",
       "import": "./dist/database/index.js"
+    },
+    "./database/external-store": {
+      "types": "./dist/database/external-store/index.d.ts",
+      "import": "./dist/database/external-store/index.js"
+    },
+    "./database/incremental": {
+      "types": "./dist/database/incremental/index.d.ts",
+      "import": "./dist/database/incremental/index.js"
+    },
+    "./database/observer": {
+      "types": "./dist/database/observer/index.d.ts",
+      "import": "./dist/database/observer/index.js"
+    },
+    "./foundation": {
+      "types": "./dist/foundation/index.d.ts",
+      "import": "./dist/foundation/index.js"
     },
     "./query": {
       "types": "./dist/query/index.d.ts",
       "import": "./dist/query/index.js"
     },
+    "./query/authoring": {
+      "types": "./dist/query/authoring/index.d.ts",
+      "import": "./dist/query/authoring/index.js"
+    },
+    "./query/evaluate": {
+      "types": "./dist/query/evaluate/index.d.ts",
+      "import": "./dist/query/evaluate/index.js"
+    },
+    "./query/incremental": {
+      "types": "./dist/query/incremental/index.d.ts",
+      "import": "./dist/query/incremental/index.js"
+    },
+    "./query/model": {
+      "types": "./dist/query/model/index.d.ts",
+      "import": "./dist/query/model/index.js"
+    },
+    "./query/prepare": {
+      "types": "./dist/query/prepare/index.d.ts",
+      "import": "./dist/query/prepare/index.js"
+    },
     "./schema": {
       "types": "./dist/schema/index.d.ts",
       "import": "./dist/schema/index.js"
+    },
+    "./source": {
+      "types": "./dist/source/index.d.ts",
+      "import": "./dist/source/index.js"
     },
     "./transactions": {
       "types": "./dist/transactions/index.d.ts",

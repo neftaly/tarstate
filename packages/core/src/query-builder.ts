@@ -5,7 +5,7 @@ import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from '
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import type { CapabilityRegistry } from './registry.js';
 import { safeParseJsonValue, type JsonValue, type PortableValue } from './value.js';
-import type { AggregateExpr, Expr, OrderTerm, QueryNode, WindowExpr } from './query.js';
+import type { AggregateExpr, Expr, OrderTerm, QueryNode, WindowExpr } from './query-model.js';
 
 export type ValueDeclaration =
   | ScalarDeclaration

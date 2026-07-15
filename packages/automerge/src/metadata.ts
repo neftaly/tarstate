@@ -1,19 +1,21 @@
 import * as Automerge from '@automerge/automerge';
+import type { DocumentDeclaration } from '@tarstate/core/attachment';
 import {
   canonicalizeJson,
   createIssue,
   isContentHash,
   type ArtifactRef,
   type CapabilityRef,
-  type DocumentDeclaration,
-  type GovernanceCommand,
-  type GovernanceConstraintSection,
-  type GovernanceSection,
-  type GovernanceSourceAdapter,
-  type GovernanceStorageSection,
   type Issue,
   type JsonValue
-} from '@tarstate/core';
+} from '@tarstate/core/foundation';
+import type {
+  GovernanceCommand,
+  GovernanceConstraintSection,
+  GovernanceSection,
+  GovernanceSourceAdapter,
+  GovernanceStorageSection
+} from '@tarstate/core/transactions';
 import { automergeIssueDeclarations } from './issues.js';
 import { conflictsAt, normalizeAutomergeValue } from './projection.js';
 import { automergeMetadataProperty } from './reserved.js';

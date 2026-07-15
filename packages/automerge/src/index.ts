@@ -1,5 +1,6 @@
 export * from './core-adapter.js';
 export * from './artifact-resource-driver.js';
+export * from './automerge-json.js';
 export * from './issues.js';
 export * from './metadata.js';
 export * from './mapping-storage-binding.js';

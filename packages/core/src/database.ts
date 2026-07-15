@@ -1,58 +1,19 @@
 import { canonicalizeJson } from './artifacts.js';
 import type { ReadyAttachmentPreparation } from './attachment-preparation.js';
-import type { Issue } from './issues.js';
-import type { SourceBasis } from './maintenance.js';
+import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
 import { comparePortableStrings } from './portable-order.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
+import type { ObservableSource } from './source-state.js';
 
-export type SourceLifecycleState = 'loading' | 'ready' | 'failed' | 'denied' | 'deleted' | 'closed';
-export type SourceFreshness = 'current' | 'stale' | 'none';
-
-export type SourceSnapshot<Storage> = {
-  readonly sourceId: string;
-  readonly operationEpoch: string;
-  readonly basis: SourceBasis;
-  readonly state: SourceLifecycleState;
-  readonly freshness: SourceFreshness;
-  readonly storage?: Storage;
-  readonly issues: readonly Issue[];
-};
-
-export type ObservableSource<Storage> = {
-  readonly sourceId: string;
-  readonly snapshot: () => SourceSnapshot<Storage>;
-  readonly subscribe: (listener: () => void) => () => void;
-};
-
-export type AttachmentProjection<Projection> =
-  | { readonly state: 'ready'; readonly value: Projection; readonly issues: readonly Issue[] }
-  | { readonly state: Exclude<SourceLifecycleState, 'ready'>; readonly issues: readonly Issue[] };
-
-export type DatabaseAttachment<Storage = unknown, Projection = unknown> = {
-  readonly attachmentId: string;
-  readonly incarnation: string;
-  readonly sourceId: string;
-  readonly source: ObservableSource<Storage>;
-  readonly authorityScope: string;
-  readonly writable: boolean;
-  readonly schemaViewIds: readonly string[];
-  readonly discoveryEdges: readonly string[];
-  readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
-};
-
-export type DatasetMember = {
-  readonly attachmentId: string;
-  readonly sourceId: string;
-  readonly expectation: 'required' | 'optional';
-  readonly discoveryEdges: readonly string[];
-};
-
-export type DatasetSnapshot = {
-  readonly datasetId: string;
-  readonly revision: number;
-  readonly state: 'open' | 'settled';
-  readonly members: readonly DatasetMember[];
-};
+export type { AttachmentProjection } from './attachment-model.js';
+export type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
+export type {
+  ObservableSource,
+  SourceBasis,
+  SourceFreshness,
+  SourceLifecycleState,
+  SourceSnapshot
+} from './source-state.js';
 
 export class DatasetMembership {
   readonly datasetId: string;

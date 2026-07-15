@@ -7,7 +7,8 @@
  * must still validate untrusted serialized input at their public parser.
  */
 type ProvenanceRegistry = Readonly<{
-  protocolVersion: 1;
+  protocolVersion: 2;
+  preparedExpressions: WeakSet<object>;
   preparedPlans: WeakSet<object>;
   preparedSchemas: WeakSet<object>;
   preparedRelations: WeakSet<object>;
@@ -16,13 +17,14 @@ type ProvenanceRegistry = Readonly<{
   validatedLensSteps: WeakSet<object>;
 }>;
 
-const registryKey = Symbol.for('@tarstate/core/provenance/v1');
+const registryKey = Symbol.for('@tarstate/core/provenance/v2');
 const realm = globalThis as typeof globalThis & { [key: symbol]: unknown };
 
 const isRegistry = (value: unknown): value is ProvenanceRegistry => {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Partial<ProvenanceRegistry>;
-  return candidate.protocolVersion === 1
+  return candidate.protocolVersion === 2
+    && candidate.preparedExpressions instanceof WeakSet
     && candidate.preparedPlans instanceof WeakSet
     && candidate.preparedSchemas instanceof WeakSet
     && candidate.preparedRelations instanceof WeakSet
@@ -32,7 +34,8 @@ const isRegistry = (value: unknown): value is ProvenanceRegistry => {
 };
 
 const createRegistry = (): ProvenanceRegistry => Object.freeze({
-  protocolVersion: 1,
+  protocolVersion: 2,
+  preparedExpressions: new WeakSet<object>(),
   preparedPlans: new WeakSet<object>(),
   preparedSchemas: new WeakSet<object>(),
   preparedRelations: new WeakSet<object>(),

@@ -1,8 +1,8 @@
 import { canonicalizeJson, type ContentHash } from './artifacts.js';
 import { createIssue, type Issue } from './issues.js';
 import type { MemoryRow, MemoryState } from './memory-source.js';
-import type { SourceBasis } from './maintenance.js';
-import type { SourceSnapshot } from './database.js';
+import type { WritableLogicalRow } from './logical-edit.js';
+import type { SourceBasis, SourceSnapshot } from './source-state.js';
 import type {
   AtomicSource,
   Footprint,
@@ -16,7 +16,6 @@ import type {
   SourceOutcomeLookup,
   StorageBinding
 } from './source-protocol.js';
-import type { WritableLogicalRow } from './transaction-executor.js';
 import type { JsonValue } from './value.js';
 
 export type LogicalMemoryBasis = { readonly incarnation: string; readonly revision: number };

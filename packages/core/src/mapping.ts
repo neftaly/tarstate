@@ -119,7 +119,7 @@ export const compileStorageMapping = (
   }
   return issues.length > 0 ? { success: false, issues } : {
     success: true,
-    value: sealCompiledStorageMapping({ body, schema, relations: ownedReadonlyMap(relations) }),
+    value: sealCompiledStorageMapping<CompiledStorageMapping>({ body, schema, relations: ownedReadonlyMap(relations) }),
     issues: []
   };
 };

@@ -11,36 +11,31 @@ import {
   type CapturedMember,
   type EvaluationSnapshot
 } from './internal-observer-dataset-capture.js';
-import { maintenanceInputWithFrame } from './internal-observer-maintenance-frames.js';
-import type {
-  CreateDatabaseQueryMaintenance,
-  DatabaseQueryMaintenanceInput,
-  DatabaseQueryMaintenanceSession,
-  MaintainedDatabaseQueryResult,
-  QueryMaintenanceDiagnostics,
-  QueryMaintenanceReuseDiagnostics
-} from './internal-observer-query-maintenance-contracts.js';
+import { maintenanceInputWithFrame } from './internal-observer-maintenance-frame.js';
 import {
-  failedEvaluation,
+  failedMaintenanceEvaluation,
   failedMaintenanceSession,
-  getIncrementalMaintenanceDiagnostics,
-  getIncrementalMaintenanceReuseDiagnostics,
-  getTrustedIncrementalMetadata,
-  maintenanceFactoryInput,
-  type TrustedIncrementalMetadata
-} from './internal-observer-query-maintenance.js';
+  queryMaintenanceExtensionsFor,
+  type CreateDatabaseQueryMaintenance,
+  type DatabaseQueryMaintenanceInput,
+  type DatabaseQueryMaintenanceSession,
+  type MaintainedDatabaseQueryResult,
+  type QueryMaintenanceDiagnostics,
+  type QueryMaintenanceReuseDiagnostics,
+  type TrustedQueryMaintenanceMetadata
+} from './observer-maintenance-contracts.js';
 import {
   notifyObservers,
   runObserverCleanups,
   type ObserverDiagnosticReporter
 } from './observer-diagnostics.js';
-import type { PreparedPlan, SourceBasis } from './maintenance.js';
+import type { PreparedPlan } from './query-plan-contract.js';
+import type { SourceBasis } from './source-state.js';
 import { assertPreparedPlan } from './internal-prepared-plan.js';
 import { deepFreezeObserverValue, detachPreparedPlan, parseObservationParameters, samePortableObserverValue } from './internal-observer-values.js';
 import type { JsonValue } from './value.js';
 
-export type { AvailableQueryAttachment } from './internal-observer-dataset-capture.js';
-export { createIncrementalDatabaseQueryMaintenance } from './internal-observer-query-maintenance.js';
+export type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';
 export type {
   CreateDatabaseQueryMaintenance,
   DatabaseQueryMaintenanceInput,
@@ -48,7 +43,7 @@ export type {
   MaintainedDatabaseQueryResult,
   QueryMaintenanceDiagnostics,
   QueryMaintenanceReuseDiagnostics
-} from './internal-observer-query-maintenance-contracts.js';
+} from './observer-maintenance-contracts.js';
 
 export type ObservationBasis = {
   readonly dataset: { readonly datasetId: string; readonly revision: number };
@@ -107,7 +102,7 @@ export interface QueryObserver<Row> {
   close(): void;
 }
 
-const trustedObservedResults = new WeakMap<object, TrustedIncrementalMetadata>();
+const trustedObservedResults = new WeakMap<object, TrustedQueryMaintenanceMetadata>();
 
 type CaptureObservationEvidence = {
   readonly basis: ObservationBasis;
@@ -241,17 +236,23 @@ export class DatabaseView<Query, Row, Projection = unknown> {
 
   /** Optional physical IVM counters; custom maintenance factories return no entries. */
   getQueryMaintenanceDiagnostics(): readonly QueryMaintenanceDiagnostics[] {
-    return getIncrementalMaintenanceDiagnostics(
-      this.#createQueryMaintenance,
-      this.#datasetRuntimes.values()
-    );
+    const extensions = queryMaintenanceExtensionsFor(this.#createQueryMaintenance);
+    return extensions === undefined
+      ? []
+      : Object.freeze([...this.#datasetRuntimes.values()].flatMap(({ identity }) => extensions.diagnostics(identity)));
   }
 
   getQueryMaintenanceReuseDiagnostics(): QueryMaintenanceReuseDiagnostics {
-    return getIncrementalMaintenanceReuseDiagnostics(
-      this.#createQueryMaintenance,
-      this.#datasetRuntimes.values()
-    );
+    const extensions = queryMaintenanceExtensionsFor(this.#createQueryMaintenance);
+    if (extensions === undefined) return Object.freeze({ computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 });
+    let computedFrameDeltaCount = 0;
+    let reusedFrameDeltaCount = 0;
+    for (const { identity } of this.#datasetRuntimes.values()) {
+      const diagnostics = extensions.reuseDiagnostics(identity);
+      computedFrameDeltaCount += diagnostics.computedFrameDeltaCount;
+      reusedFrameDeltaCount += diagnostics.reusedFrameDeltaCount;
+    }
+    return Object.freeze({ computedFrameDeltaCount, reusedFrameDeltaCount });
   }
 
   getDatabaseDescriptionSnapshot(): JsonValue | undefined {
@@ -310,7 +311,7 @@ class SharedObservation<Query, Row, Projection> {
     try {
       const initial = capturedState.state === 'captured'
         ? session.getCurrentResult()
-        : failedEvaluation(capturedState.error) as MaintainedDatabaseQueryResult<Row>;
+        : failedMaintenanceEvaluation(capturedState.error) as MaintainedDatabaseQueryResult<Row>;
       this.#snapshot = this.#observerSnapshot(this.#result(initial, captured), undefined);
       this.#publishedSnapshot = this.#snapshot;
       options.runtime.add(this);
@@ -389,7 +390,7 @@ class SharedObservation<Query, Row, Projection> {
   stageFailure(captured: EvaluationSnapshot<Projection>, error: unknown): void {
     this.#stagedChange = undefined;
     if (this.#closed) return;
-    this.#stageMaintained(captured, failedEvaluation(error) as MaintainedDatabaseQueryResult<Row>);
+    this.#stageMaintained(captured, failedMaintenanceEvaluation(error) as MaintainedDatabaseQueryResult<Row>);
   }
 
   #stageMaintained(captured: EvaluationSnapshot<Projection>, maintained: MaintainedDatabaseQueryResult<Row>): void {
@@ -442,11 +443,11 @@ class SharedObservation<Query, Row, Projection> {
   } {
     try {
       return {
-        session: this.#options.createQueryMaintenance(maintenanceFactoryInput(
-          this.#options.plan,
-          this.#maintenanceInput(captured),
-          this.#options.runtime.identity
-        )),
+        session: this.#options.createQueryMaintenance({
+          plan: this.#options.plan,
+          initialInput: this.#maintenanceInput(captured),
+          reuseScope: this.#options.runtime.identity
+        }),
         failed: false
       };
     } catch (error) {
@@ -458,12 +459,12 @@ class SharedObservation<Query, Row, Projection> {
     try {
       return session.updateInput(this.#maintenanceInput(captured));
     } catch (error) {
-      return failedEvaluation(error);
+      return failedMaintenanceEvaluation(error);
     }
   }
 
   #result(maintained: MaintainedDatabaseQueryResult<Row>, captured: EvaluationSnapshot<Projection>): ObservedQueryResult<Row> {
-    const trustedIncremental = getTrustedIncrementalMetadata(this.#options.createQueryMaintenance, maintained);
+    const trustedIncremental = queryMaintenanceExtensionsFor(this.#options.createQueryMaintenance)?.trustedMetadata(maintained);
     const captureEvidence = evidenceForCapture(captured);
     const resultIdentityIssue = trustedIncremental !== undefined || (maintained.rows.length === maintained.resultKeys.length && new Set(maintained.resultKeys).size === maintained.resultKeys.length)
       ? []
@@ -665,8 +666,8 @@ const sameObservedResultMetadata = <Row>(left: ObservedQueryResult<Row>, right: 
 const incrementalResultDiff = <Row>(
   before: ObservedQueryResult<Row>,
   after: ObservedQueryResult<Row>,
-  beforeMetadata: TrustedIncrementalMetadata,
-  afterMetadata: TrustedIncrementalMetadata
+  beforeMetadata: TrustedQueryMaintenanceMetadata,
+  afterMetadata: TrustedQueryMaintenanceMetadata
 ): ResultDiff<Row> => {
   const delta = afterMetadata.resultDelta;
   const ordered = (keys: readonly string[], positions: ReadonlyMap<string, number>): readonly string[] =>

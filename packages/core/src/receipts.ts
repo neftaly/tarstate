@@ -1,8 +1,8 @@
 import { type JsonValue, type PortableValue } from './value.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
-import { isContentHash, safeParseJsonText, type ArtifactParseBudget, type ArtifactRef, type ContentHash } from './artifacts.js';
+import { isContentHash, safeParseJsonText, type ArtifactParseBudget, type ContentHash } from './artifacts.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
-import type { SourceBasis } from './maintenance.js';
+import type { SourceBasis } from './source-state.js';
 import type { CommitReceipt, NonAtomicBatchReceipt } from './transaction.js';
 
 export type SourceLifecycleCommand = {
@@ -156,12 +156,7 @@ export const executePresence = async (command: SetPresenceCommand, accept: (comm
   }
 };
 
-export type DocumentDeclaration = {
-  readonly formatVersion: 1;
-  readonly storageSchema: ArtifactRef;
-  readonly projection: { readonly kind: 'storage-mapping'; readonly storageMapping: ArtifactRef } | { readonly kind: 'storage-binding'; readonly storageBinding: CapabilityRef };
-  readonly constraints?: { readonly set: ArtifactRef; readonly mode: 'audit' | 'required' };
-};
+export type { DocumentDeclaration } from './attachment-model.js';
 
 const knownReceiptKinds = new Set(['commit', 'non-atomic-batch', 'source-lifecycle', 'governance', 'sequence', 'presence']);
 const receiptFailure = (code: string, details: JsonValue): ParseResult<never> => ({ success: false, issues: [createIssue({ code, phase: 'parse', severity: 'error', retry: 'after_input', details })] });

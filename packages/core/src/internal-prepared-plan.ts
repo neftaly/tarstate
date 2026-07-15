@@ -1,7 +1,5 @@
-import type { PreparedPlan } from './maintenance.js';
 import { provenanceRegistry } from './internal-provenance-registry.js';
-
-type PreparedPlanFields<Query> = Omit<PreparedPlan<Query>, symbol>;
+import type { PreparedPlan, PreparedPlanFields } from './query-plan-contract.js';
 
 // Deliberately module-private: this is an optimization marker, not portable
 // provenance. Compatible copies safely re-adopt plans they did not prepare.

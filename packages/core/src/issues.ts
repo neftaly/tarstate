@@ -233,6 +233,7 @@ const declarations = [
   ['transaction.conflict_requires_resolution', 'plan', 'error', ['after_input']],
   ['transaction.conflict_selection_invalid', 'plan', 'error', ['after_input']],
   ['transaction.cross_source_access', 'plan', 'error', ['after_input']],
+  ['transaction.delta_invalid', 'plan', 'error', ['after_input']],
   ['transaction.edit_type_mismatch', 'plan', 'error', ['after_input']],
   ['transaction.expected_basis_stale', 'commit', 'error', ['after_refresh']],
   ['transaction.expression_indeterminate', 'plan', 'error', ['after_input']],

@@ -1,6 +1,6 @@
 import { createIssue, type Issue } from './issues.js';
 import { comparePortableStrings } from './portable-order.js';
-import type { SourceSnapshot } from './database.js';
+import type { SourceSnapshot } from './source-state.js';
 import type {
   AtomicSource,
   LogicalEdit,
@@ -64,8 +64,22 @@ export const stageSourceEdits = <Storage, Command>(input: {
   }
   requireCompleteEditHandling(input.edits, editHandlers, issues);
   if (hasErrors(issues)) return { outcome: 'rejected', issues };
-  const merged = input.source.mergeIntents(plans);
-  if (merged.outcome !== 'merged') return { outcome: 'rejected', issues: merged.issues };
+  let merged: ReturnType<AtomicSource<Storage, Command>['mergeIntents']>;
+  try {
+    merged = input.source.mergeIntents(plans);
+  } catch (error) {
+    return {
+      outcome: 'rejected',
+      issues: [...issues, callbackIssue(
+        'binding.merge_failed',
+        input.source.sourceId,
+        error
+      )]
+    };
+  }
+  if (merged.outcome !== 'merged') {
+    return { outcome: 'rejected', issues: [...issues, ...merged.issues] };
+  }
   let staged: ReturnType<AtomicSource<Storage, Command>['stage']>;
   try {
     staged = input.source.stage(snapshot, merged.commands);
@@ -74,7 +88,17 @@ export const stageSourceEdits = <Storage, Command>(input: {
   }
   issues.push(...staged.issues);
   const stagedSnapshot = { ...snapshot, storage: staged.storage };
-  if (!hasErrors(issues) && input.validate !== undefined) issues.push(...input.validate({ snapshot: stagedSnapshot, plans }));
+  if (!hasErrors(issues) && input.validate !== undefined) {
+    try {
+      issues.push(...input.validate({ snapshot: stagedSnapshot, plans }));
+    } catch (error) {
+      issues.push(callbackIssue(
+        'binding.validation_failed',
+        input.source.sourceId,
+        error
+      ));
+    }
+  }
   return hasErrors(issues)
     ? { outcome: 'rejected', issues }
     : { outcome: 'staged', snapshot: stagedSnapshot, plans, commands: merged.commands, issues };
@@ -91,7 +115,15 @@ export const coordinateSourceCommit = async <Storage, Command>(input: {
   readonly commit: Omit<SourceCommitInput<Command>, 'commands'>;
   readonly validate?: (staged: { readonly snapshot: SourceSnapshot<Storage>; readonly plans: readonly PlanResult<Command>[] }) => readonly Issue[];
 }): Promise<CoordinatedCommitResult> => {
-  const snapshot = input.source.snapshot();
+  let snapshot: SourceSnapshot<Storage>;
+  try {
+    snapshot = input.source.snapshot();
+  } catch (error) {
+    return {
+      outcome: 'rejected',
+      issues: [callbackIssue('source.snapshot_failed', input.source.sourceId, error)]
+    };
+  }
   const staged = stageSourceEdits({
     source: input.source,
     bindings: input.bindings,
@@ -100,7 +132,27 @@ export const coordinateSourceCommit = async <Storage, Command>(input: {
     ...(input.validate === undefined ? {} : { validate: input.validate })
   });
   if (staged.outcome === 'rejected') return staged;
-  const result = await input.source.commit({ ...input.commit, commands: staged.commands });
+  let result: SourceCommitResult;
+  try {
+    result = await input.source.commit({ ...input.commit, commands: staged.commands });
+  } catch (error) {
+    return {
+      outcome: 'unknown',
+      beforeBasis: input.commit.expectedBasis,
+      issues: [
+        ...staged.issues,
+        createIssue({
+          code: 'transaction.outcome_unavailable',
+          phase: 'commit',
+          severity: 'error',
+          retry: 'query_outcome',
+          sourceId: input.source.sourceId,
+          operationId: input.commit.operationId,
+          details: { error: errorName(error) }
+        })
+      ]
+    };
+  }
   const combined = staged.issues.length === 0 ? result : { ...result, issues: [...staged.issues, ...result.issues] };
   return combined.outcome === 'rejected' ? { outcome: 'rejected', issues: combined.issues } : combined;
 };
@@ -172,7 +224,35 @@ const requireContained = <Storage, Command>(
   bound: import('./source-protocol.js').Footprint,
   issues: Issue[]
 ): void => {
-  const relation = source.relateFootprints(actual, bound);
+  let relation: ReturnType<AtomicSource<Storage, Command>['relateFootprints']>;
+  try {
+    relation = source.relateFootprints(actual, bound);
+  } catch (error) {
+    issues.push(createIssue({
+      code: 'binding.footprint_relation_failed',
+      phase: 'plan',
+      severity: 'error',
+      retry: 'after_input',
+      sourceId: source.sourceId,
+      details: { bindingId, kind, error: errorName(error) }
+    }));
+    return;
+  }
   if (relation === 'equal' || relation === 'contained_by') return;
   issues.push(createIssue({ code: 'binding.footprint_out_of_bounds', phase: 'plan', severity: 'error', retry: 'after_input', sourceId: source.sourceId, details: { bindingId, kind, relation } }));
 };
+
+const callbackIssue = (
+  code: string,
+  sourceId: string,
+  error: unknown
+): Issue => createIssue({
+  code,
+  phase: 'plan',
+  severity: 'error',
+  retry: 'after_refresh',
+  sourceId,
+  details: { error: errorName(error) }
+});
+
+const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;

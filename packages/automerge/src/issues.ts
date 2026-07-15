@@ -1,4 +1,4 @@
-import type { IssueDeclaration, IssuePhase, IssueRetry, IssueSeverity } from '@tarstate/core';
+import type { IssueDeclaration, IssuePhase, IssueRetry, IssueSeverity } from '@tarstate/core/foundation';
 import { comparePortableStrings } from './portable-order.js';
 
 const declaration = (
@@ -33,5 +33,7 @@ export const automergeIssueDeclarations: readonly IssueDeclaration[] = Object.fr
   declaration('automerge.row_identity_unavailable', 'parse', 'error', ['after_refresh']),
   declaration('automerge.row_key_invalid', 'parse', 'error', ['after_input']),
   declaration('automerge.row_parser_failed', 'parse', 'error', ['after_input']),
-  declaration('automerge.text_edit_invalid', 'plan', 'error', ['after_input'])
+  declaration('automerge.text_edit_invalid', 'plan', 'error', ['after_input']),
+  declaration('automerge.value_conflicted', 'parse', 'error', ['manual_repair']),
+  declaration('automerge.value_invalid', 'parse', 'error', ['after_input'])
 ].sort((left, right) => comparePortableStrings(left.code, right.code)));

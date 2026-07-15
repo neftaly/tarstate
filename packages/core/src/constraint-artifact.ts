@@ -3,7 +3,7 @@ import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from '
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { JsonValue } from './value.js';
 import type { ConstraintEvaluation, ConstraintFailure, SourceConstraint } from './constraints.js';
-import type { SourceBasis } from './maintenance.js';
+import type { SourceBasis } from './source-state.js';
 
 export type PortableConstraint = {
   readonly id: string;

@@ -141,6 +141,33 @@ describe('source lifecycle coordination', () => {
     });
     expect(await cancelled.execute(command, { signal: controller.signal })).toMatchObject({ outcome: 'rejected', issues: [{ code: 'lifecycle.cancelled' }] });
     expect(await cancelled.queryOutcome({ operationEpoch: command.operationEpoch, operationId: command.operationId, commandHash })).toEqual({ status: 'not_seen' });
+
+    const duringPreflight = new AbortController();
+    const cancelledDuringPreflight = new SourceLifecycleCoordinator({
+      lifecycleCoordinatorId: 'lifecycle:test', operationEpoch: command.operationEpoch, authorityViewFingerprint: authorityFingerprint,
+      authorize: () => ({ allowed: true }),
+      adapter: {
+        preflight: async () => {
+          duringPreflight.abort();
+          return [];
+        },
+        allocateSourceId,
+        create,
+        delete: () => ({ outcome: 'committed', issues: [] })
+      }
+    });
+    expect(await cancelledDuringPreflight.execute(command, {
+      signal: duringPreflight.signal
+    })).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'lifecycle.cancelled' }]
+    });
+    expect(await cancelledDuringPreflight.queryOutcome({
+      operationEpoch: command.operationEpoch,
+      operationId: command.operationId,
+      commandHash
+    })).toEqual({ status: 'not_seen' });
+    expect(allocateSourceId).not.toHaveBeenCalled();
   });
 
   it('allocates after reservation and before mutation, then deduplicates exact retry', async () => {
@@ -479,6 +506,71 @@ describe('governance coordination', () => {
     expect(staleReceipt).toMatchObject({ outcome: 'rejected', beforeBasis: { revision: 2 }, issues: [{ code: 'governance.expected_basis_stale' }] });
     expect(await allowed.execute(stale)).toBe(staleReceipt);
     expect(apply).not.toHaveBeenCalled();
+  });
+
+  it('does not reserve or invoke a governance adapter after cancellation during preflight', async () => {
+    const controller = new AbortController();
+    const snapshotBasis = vi.fn(() => ({ incarnation: 'one', revision: 0 }));
+    const apply = vi.fn(() => ({
+      outcome: 'committed' as const,
+      beforeBasis: { incarnation: 'one', revision: 0 },
+      afterBasis: { incarnation: 'one', revision: 1 },
+      issues: []
+    }));
+    const coordinator = new GovernanceCoordinator({
+      authorityViewFingerprint: authorityFingerprint,
+      authorize: () => ({ allowed: true })
+    });
+    coordinator.registerSource('source:one', 'governance:epoch:one', {
+      preflight: async () => {
+        controller.abort();
+        return [];
+      },
+      snapshotBasis,
+      apply
+    });
+    const command = governanceCommand('cancel-during-preflight');
+    const commandHash = await governanceCommandHash(command, authorityFingerprint);
+
+    expect(await coordinator.execute(command, { signal: controller.signal })).toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'governance.cancelled' }]
+    });
+    expect(snapshotBasis).not.toHaveBeenCalled();
+    expect(apply).not.toHaveBeenCalled();
+    expect(await coordinator.queryOutcome({
+      sourceId: command.sourceId,
+      operationEpoch: command.operationEpoch,
+      operationId: command.operationId,
+      commandHash
+    })).toEqual({ status: 'not_seen' });
+  });
+
+  it('classifies invalid post-handoff governance evidence as unknown with lookup limits', async () => {
+    const coordinator = new GovernanceCoordinator({
+      authorityViewFingerprint: authorityFingerprint,
+      authorize: () => ({ allowed: true })
+    });
+    coordinator.registerSource('source:one', 'governance:epoch:one', {
+      snapshotBasis: () => ({ incarnation: 'one', revision: 0 }),
+      apply: ({ context }) => {
+        context.markMutationPossible();
+        return {
+          outcome: 'committed',
+          beforeBasis: { incarnation: 'one', revision: 0 },
+          issues: []
+        };
+      }
+    });
+
+    expect(await coordinator.execute(governanceCommand('invalid-evidence'))).toMatchObject({
+      outcome: 'unknown',
+      durability: 'unknown',
+      issues: [
+        { code: 'governance.adapter_evidence_invalid' },
+        { code: 'operation.durable_lookup_unavailable' }
+      ]
+    });
   });
 
   it('repairs only an exact observed bootstrap alternative and receipts selected artifact hashes', async () => {

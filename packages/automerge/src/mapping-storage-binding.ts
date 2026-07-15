@@ -2,20 +2,24 @@ import * as Automerge from '@automerge/automerge';
 import {
   canonicalizeJson,
   createIssue,
+  type Issue,
+  type JsonValue
+} from '@tarstate/core/foundation';
+import type { CapabilityRegistry } from '@tarstate/core/capabilities';
+import {
   parseRelationCandidate,
   parseScalarValueForField,
   projectStorage,
-  type CapabilityRegistry,
   type CompiledStorageMapping,
-  type Issue,
-  type JsonValue,
-  type LogicalEdit,
-  type PlanResult,
-  type ProjectionResult,
-  type RelationStorageMapping,
-  type SourceSnapshot,
-  type StorageBinding
-} from '@tarstate/core';
+  type RelationStorageMapping
+} from '@tarstate/core/schema';
+import type {
+  LogicalEdit,
+  PlanResult,
+  ProjectionResult,
+  SourceSnapshot,
+  StorageBinding
+} from '@tarstate/core/source';
 import {
   automergePathFootprint,
   type AutomergePathFootprint

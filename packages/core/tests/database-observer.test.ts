@@ -9,7 +9,6 @@ import {
 } from '../src/database.js';
 import { prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
 import {
-  createIncrementalDatabaseQueryMaintenance,
   DatabaseView,
   type MaintainedDatabaseQueryResult,
   type DatabaseQueryMaintenanceInput,
@@ -17,6 +16,7 @@ import {
   type ObserverChange,
   type QueryObserver
 } from '../src/observer.js';
+import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/database/incremental';
 import type { QueryNode, QueryRecord, RelationInput } from '../src/query.js';
 import { ResourceResolver, type ResourceRef } from '../src/resolver.js';
 import type { PreparedPlan } from '../src/maintenance.js';
@@ -2307,6 +2307,29 @@ describe('resource resolver', () => {
     expect(permits.mock.calls.map(([, reference]) => reference.uri)).toEqual(['mem:allowed', 'mem:forbidden']);
   });
 
+  it('contains authority callback failures without invoking a resolver driver', async () => {
+    const driver = vi.fn(async () => ({
+      state: 'ready' as const,
+      freshness: 'current' as const,
+      value: 'unreachable'
+    }));
+    const resolver = new ResourceResolver({
+      authority: { permits: () => { throw new Error('authority unavailable'); } }
+    });
+    resolver.register('mem', { resolve: driver });
+
+    await expect(resolver.resolve({ uri: 'mem:value', kind: 'data' }, {
+      authorityScope: 'public'
+    })).resolves.toMatchObject({
+      state: 'failed',
+      issues: [{
+        code: 'resolver.failed',
+        details: { reason: 'authority_check_failed', error: 'Error' }
+      }]
+    });
+    expect(driver).not.toHaveBeenCalled();
+  });
+
   it('uses unambiguous authority-scoped cache keys', async () => {
     const calls = vi.fn();
     const resolver = new ResourceResolver({ authority: { permits: (scope) => scope === 'public' } });
@@ -2364,6 +2387,45 @@ describe('resource resolver', () => {
     expect(firstDriverInput).toEqual({
       uri: 'mem:start', authorityScope: 'public', referenceFrozen: true, contextFrozen: true
     });
+  });
+
+  it('does not invoke work for pre-cancelled requests or accept success after driver cancellation', async () => {
+    const permits = vi.fn(() => true);
+    const driver = vi.fn(async () => ({
+      state: 'ready' as const,
+      freshness: 'current' as const,
+      value: 'too-late'
+    }));
+    const resolver = new ResourceResolver({ authority: { permits } });
+    resolver.register('mem', { resolve: driver });
+    const reference: ResourceRef = { uri: 'mem:cancelled', kind: 'data' };
+
+    const beforeStart = new AbortController();
+    beforeStart.abort();
+    await expect(resolver.resolve(reference, {
+      authorityScope: 'public',
+      signal: beforeStart.signal
+    })).resolves.toMatchObject({
+      state: 'failed',
+      issues: [{ code: 'lifecycle.cancelled' }]
+    });
+    expect(permits).not.toHaveBeenCalled();
+    expect(driver).not.toHaveBeenCalled();
+
+    const duringDriver = new AbortController();
+    driver.mockImplementationOnce(async () => {
+      duringDriver.abort();
+      return { state: 'ready', freshness: 'current', value: 'too-late' };
+    });
+    const resolved = await resolver.resolve(reference, {
+      authorityScope: 'public',
+      signal: duringDriver.signal
+    });
+    expect(resolved).toMatchObject({
+      state: 'failed',
+      issues: [{ code: 'lifecycle.cancelled' }]
+    });
+    expect(resolved).not.toHaveProperty('value');
   });
 
   it('keeps missing, stale, denied, failed, and deleted resource evidence distinct across alias chains', async () => {

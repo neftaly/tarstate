@@ -3,7 +3,7 @@ import type {
   ObserverDiagnosticReporter,
   ObserverSnapshot,
   QueryObserver
-} from '@tarstate/core';
+} from '@tarstate/core/database/observer';
 import type { ErasedDatabase } from './contracts.js';
 import { notifyReactListeners, runReactCleanups } from './shared.js';
 

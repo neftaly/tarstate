@@ -20,8 +20,8 @@ import {
 } from './internal-query-ownership.js';
 import { canonicalizeQueryValue, compareQueryJsonValuesTotal } from './internal-query-values.js';
 import { groupRelationInputs, relationKey, relationOccurrence } from './internal-query-relations.js';
-import { validateRelationInputs } from './internal-query-maintenance-transition.js';
-import { preparePlan, type PreparedPlan } from './maintenance.js';
+import { validateRelationInputs } from './internal-query-input-validation.js';
+import type { PreparedPlan } from './query-plan-contract.js';
 import { comparePortableStrings } from './portable-order.js';
 import type {
   AggregateExpr,
@@ -31,13 +31,13 @@ import type {
   PreparedQueryRequest,
   QueryCursor,
   QueryLogicalValue,
-  QueryMaintenanceSnapshot,
   QueryNode,
   QueryRecord,
   QueryRequest,
   QueryResult,
   WindowExpr
 } from './query-model.js';
+import type { QueryMaintenanceSnapshot } from './query-incremental-model.js';
 import { logicalAnd, logicalOr, logicalUnknown, type JsonValue, type LogicalTruth } from './value.js';
 
 export const consumeQueryWork = (context: QueryContext, units = 1): boolean => {
@@ -102,16 +102,6 @@ const frozenQueryResult = (rows: readonly QueryRecord[], resultKeys: readonly st
   completeness,
   issues: publicQueryIssues(issues)
 });
-
-/** Seals query and authority identities into a prepared execution plan. */
-export const prepareQuery = async (input: {
-  readonly root: QueryNode;
-  readonly registryFingerprint: string;
-  readonly authorityFingerprint: string;
-  readonly datasetId: string;
-}): Promise<PreparedPlan<QueryNode>> => {
-  return preparePlan({ query: input.root, registryFingerprint: input.registryFingerprint, authorityFingerprint: input.authorityFingerprint, datasetId: input.datasetId });
-};
 
 export const evaluateNode = (node: QueryNode, context: QueryContext): NodeResult => {
   const materialized = context.environment.outer === undefined ? context.environment.evaluationCache?.resultFor(node) : undefined;

@@ -11,7 +11,7 @@ export {
   relationDeclaration,
   relationLiteral,
   schemaLiteral
-} from '../type-authoring.js';
+} from '../schema-authoring.js';
 export type {
   CustomScalarDeclaration,
   LiteralRelation,
@@ -22,4 +22,4 @@ export type {
   SchemaKey,
   SchemaRow,
   ValueOfDeclaration
-} from '../type-authoring.js';
+} from '../schema-authoring.js';

@@ -1,8 +1,8 @@
+import type { JsonValue } from '@tarstate/core/foundation';
 import type {
-  JsonValue,
   ObserverDiagnostic,
   ObserverDiagnosticReporter
-} from '@tarstate/core';
+} from '@tarstate/core/database/observer';
 import type { OptimisticProjection } from './contracts.js';
 
 export const errorDetails = (error: unknown): { readonly name: string; readonly message: string } =>

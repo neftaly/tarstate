@@ -1,10 +1,9 @@
 import type {
   CommitReceipt,
-  JsonValue,
-  ObserverDiagnosticReporter,
   TransactionAttempt
-} from '@tarstate/core';
-import { safeParseJsonValue } from '@tarstate/core';
+} from '@tarstate/core/transactions';
+import { safeParseJsonValue, type JsonValue } from '@tarstate/core/foundation';
+import type { ObserverDiagnosticReporter } from '@tarstate/core/database/observer';
 import type {
   CommitFunction,
   ErasedCreateOptimisticOverlay,

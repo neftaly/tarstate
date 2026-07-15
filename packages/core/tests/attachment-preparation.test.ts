@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { sealArtifact, type Artifact, type ArtifactRef } from '../src/artifacts.js';
 import { exactArtifactAttachmentResolver, prepareDatabaseAttachment, prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
 import { ExactArtifactResolver } from '../src/artifact-resolver.js';
@@ -115,6 +115,33 @@ describe('database attachment preparation', () => {
     expect(getterCalls).toBe(0);
   });
 
+  it('adopts bootstrap declarations without invoking accessors or resolving malformed references', async () => {
+    let getterCalls = 0;
+    const declaration = Object.defineProperty({
+      formatVersion: 1,
+      projection: { kind: 'storage-mapping' }
+    }, 'storageSchema', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return { id: 'urn:test:hostile', contentHash: `sha256:${'a'.repeat(64)}` };
+      }
+    });
+    const resolveArtifact = vi.fn();
+
+    await expect(prepareDatabaseAttachment({
+      sourceId: 'source:attachment',
+      bootstrap: { status: 'ready', declaration },
+      resolveArtifact,
+      registry: new CapabilityRegistry('trust:hostile')
+    })).resolves.toMatchObject({
+      state: 'unavailable',
+      issues: [{ code: 'artifact.invalid_envelope' }]
+    });
+    expect(getterCalls).toBe(0);
+    expect(resolveArtifact).not.toHaveBeenCalled();
+  });
+
   it('resolves exact bootstrap artifacts and lets the catalog derive writable projection state', async () => {
     const fixture = await fixtures();
     const registry = new CapabilityRegistry('trust:attachment');
@@ -176,6 +203,38 @@ describe('database attachment preparation', () => {
     expect(prepared).toMatchObject({ state: 'ready', writable: false, issues: [{ code: 'capability.missing', requiredCapabilities: [fixture.writeCapability] }] });
     if (prepared.state !== 'ready') throw new Error('attachment did not prepare');
     expect(prepared.project(new TestSource().snapshot())).toMatchObject({ state: 'ready', value: { completeness: 'exact' } });
+  });
+
+  it('contains storage-binding resolver failures inside attachment preparation', async () => {
+    const fixture = await fixtures();
+    const registry = new CapabilityRegistry('trust:binding-failure');
+    await registry.registerDeclaration(capabilityDeclaration);
+    registry.registerImplementation({
+      ref: fixture.writeCapability,
+      integrity: 'test:binding',
+      implementation: {}
+    });
+    const declaration: DocumentDeclaration = {
+      ...fixture.declaration(),
+      projection: {
+        kind: 'storage-binding',
+        storageBinding: fixture.writeCapability
+      }
+    };
+
+    await expect(prepareDatabaseAttachment({
+      sourceId: 'source:attachment',
+      bootstrap: { status: 'ready', declaration },
+      resolveArtifact: (reference) => fixture.artifacts.get(key(reference)),
+      resolveStorageBinding: () => { throw new Error('binding unavailable'); },
+      registry
+    })).resolves.toMatchObject({
+      state: 'unavailable',
+      issues: [{
+        code: 'observer.projection_unavailable',
+        details: { reason: 'storage_binding_resolution_failed', error: 'Error' }
+      }]
+    });
   });
 
   it('keeps required constraint failures readable but read-only', async () => {

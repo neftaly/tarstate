@@ -1,6 +1,8 @@
 export * from './artifacts.js';
 export * from './artifact-resolver.js';
+export * from './attachment-model.js';
 export * from './attachment-preparation.js';
+export * from './capability-model.js';
 export * from './builtins.js';
 export * from './codec.js';
 export * from './commit-coordinator.js';
@@ -9,9 +11,11 @@ export * from './constraints.js';
 export * from './database.js';
 export * from './external-store.js';
 export * from './host.js';
+export { createIncrementalDatabaseQueryMaintenance } from './internal-observer-query-maintenance.js';
 export * from './issues.js';
 export * from './lens.js';
 export * from './lifecycle-governance.js';
+export * from './logical-edit.js';
 export * from './maintenance.js';
 export * from './mapping.js';
 export * from './memory-source.js';
@@ -62,12 +66,14 @@ export type {
   WindowExpr
 } from './query.js';
 export * from './query-builder.js';
+export * from './query-plan.js';
 export * from './receipts.js';
 export * from './registry.js';
 export * from './resolver.js';
 export * from './schema.js';
 export * from './semantic-artifact-parsers.js';
 export * from './source-protocol.js';
+export * from './source-state.js';
 export * from './system-relations.js';
 export * from './transaction.js';
 export * from './transaction-executor.js';

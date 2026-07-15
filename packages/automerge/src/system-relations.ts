@@ -1,10 +1,10 @@
 import {
   canonicalizeJson,
   createIssue,
-  type JsonValue,
-  type ObserverDiagnosticReporter,
-  type SchemaBody
-} from '@tarstate/core';
+  type JsonValue
+} from '@tarstate/core/foundation';
+import type { ObserverDiagnosticReporter } from '@tarstate/core/database/observer';
+import type { SchemaBody } from '@tarstate/core/schema';
 import type { AutomergeConflictFact } from './projection.js';
 import type { AutomergeBasis } from './source.js';
 import { comparePortableStrings } from './portable-order.js';

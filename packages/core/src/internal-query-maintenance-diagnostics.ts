@@ -3,7 +3,7 @@ import type {
   QueryMaintenanceOperator,
   QueryMaintenanceOperatorDiagnostics,
   QueryOperatorMaintenanceDiagnostics
-} from './query-model.js';
+} from './query-incremental-model.js';
 
 export type QueryMaintenanceOperatorEvent = {
   readonly operator: QueryMaintenanceOperator;

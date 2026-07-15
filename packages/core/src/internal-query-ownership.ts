@@ -6,16 +6,18 @@ import type {
   Expr,
   FunctionRegistry,
   QueryLogicalValue,
-  QueryMaintenanceSnapshot,
-  QueryMaintenanceUpdate,
   QueryNode,
   QueryRecord,
   QueryRequest,
   RelationInput,
-  RelationInputChange,
-  RelationRowChange,
   RelationUse
 } from './query-model.js';
+import type {
+  QueryMaintenanceSnapshot,
+  QueryMaintenanceUpdate,
+  RelationInputChange,
+  RelationRowChange
+} from './query-incremental-model.js';
 
 export const cloneAndFreezeQueryAst = (root: QueryNode): QueryNode => {
   const parsed = safeParseJsonValue(root, { ...defaultValueParseBudget, maxDepth: 1_024 });

@@ -23,7 +23,8 @@ import {
   type MaterializedQueryNode
 } from './internal-query-maintenance-model.js';
 import { canonicalizeQueryValue, compareQueryJsonValuesTotal } from './internal-query-values.js';
-import type { AggregateExpr, QueryLogicalValue, QueryMaintenanceFallbackReason, QueryNode, QueryRecord } from './query-model.js';
+import type { AggregateExpr, QueryLogicalValue, QueryNode, QueryRecord } from './query-model.js';
+import type { QueryMaintenanceFallbackReason } from './query-incremental-model.js';
 import { logicalUnknown } from './value.js';
 
 export const incrementallyMaterializeAggregateWith = (

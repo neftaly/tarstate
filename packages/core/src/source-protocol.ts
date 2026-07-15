@@ -1,63 +1,32 @@
-import type { ArtifactRef, ContentHash } from './artifacts.js';
-import type { CapabilityRef, Issue } from './issues.js';
-import type { SourceBasis } from './maintenance.js';
-import type { SourceSnapshot } from './database.js';
-import type { JsonValue } from './value.js';
+import type { ContentHash } from './artifacts.js';
+import type { Issue } from './issues.js';
+import type {
+  Footprint,
+  FootprintRelation,
+  LogicalEdit,
+  PlannedEditHandling,
+  ProjectionResult
+} from './logical-edit.js';
+import type { SourceBasis, SourceSnapshot } from './source-state.js';
 
-export type Footprint = JsonValue;
-export type FootprintRelation = 'disjoint' | 'equal' | 'contains' | 'contained_by' | 'overlaps' | 'unknown';
-
-export type LogicalEditTarget = {
-  readonly relationId: string;
-  readonly key: JsonValue;
-  readonly locator: JsonValue;
-};
-
-type LogicalFieldsEdit = LogicalEditTarget & {
-  readonly fields: Readonly<Record<string, JsonValue>>;
-};
-
-export type LogicalReplaceFieldsEdit = LogicalFieldsEdit & { readonly kind: 'replace-fields' };
-export type LogicalReplaceRowEdit = LogicalFieldsEdit & { readonly kind: 'replace-row' };
-
-export type LogicalSemanticEdit =
-  | LogicalReplaceFieldsEdit
-  | LogicalReplaceRowEdit
-  | {
-      readonly kind: 'insert';
-      readonly relationId: string;
-      readonly key: JsonValue;
-      readonly fields: Readonly<Record<string, JsonValue>>;
-    }
-  | (LogicalEditTarget & { readonly kind: 'delete' })
-  | (LogicalEditTarget & { readonly kind: 'counter-increment'; readonly field: string; readonly by: number })
-  | (LogicalEditTarget & { readonly kind: 'text-splice'; readonly field: string; readonly index: number; readonly deleteCount: number; readonly value: string })
-  | (LogicalEditTarget & { readonly kind: 'list-splice'; readonly field: string; readonly index: number; readonly deleteCount: number; readonly values: readonly JsonValue[] })
-  | (LogicalEditTarget & { readonly kind: 'conflict-resolve'; readonly field?: string; readonly observedChangeHashes: readonly string[]; readonly selectedChangeHash: string })
-  | (LogicalEditTarget & { readonly kind: 'rekey'; readonly newKey: JsonValue })
-  | (LogicalEditTarget & {
-      readonly kind: 'move-relocate';
-      readonly destination: { readonly relationId: string; readonly key: JsonValue; readonly locator?: JsonValue };
-      readonly mode: 'identity-preserving' | 'copy-relocate';
-    });
-
-export type LogicalEdit = LogicalSemanticEdit;
+export type {
+  Footprint,
+  FootprintRelation,
+  LogicalEdit,
+  LogicalEditTarget,
+  LogicalReplaceFieldsEdit,
+  LogicalReplaceRowEdit,
+  LogicalSemanticEdit,
+  PlannedEditHandling,
+  ProjectionResult,
+  WritableLogicalRow,
+  WritableLogicalState
+} from './logical-edit.js';
+export type { SourceBasis, SourceSnapshot } from './source-state.js';
 
 export type StorageIntent<Command> = {
   readonly footprint: Footprint;
   readonly command: Command;
-};
-
-export type ProjectionResult<Row = unknown> = {
-  readonly rows: readonly Row[];
-  readonly completeness: 'exact' | 'unknown';
-  readonly issues: readonly Issue[];
-};
-
-export type PlannedEditHandling = {
-  readonly editIndex: number;
-  /** Cooperative handling permits multiple bindings to contribute intents for one edit. */
-  readonly mode: 'exclusive' | 'cooperative';
 };
 
 export type PlanResult<Command> = {
@@ -118,15 +87,4 @@ export type AtomicSource<Storage, Command> = {
 /** Atomic source capability required by prepared generic transaction execution. */
 export type StagedBasisAtomicSource<Storage, Command> = AtomicSource<Storage, Command> & {
   readonly basisForStagedStorage: NonNullable<AtomicSource<Storage, Command>['basisForStagedStorage']>;
-};
-
-export type Attachment<Storage = unknown, Command = unknown> = {
-  readonly attachmentId: string;
-  readonly incarnation: string;
-  readonly sourceId: string;
-  readonly source: AtomicSource<Storage, Command>;
-  readonly storageBindings: readonly StorageBinding<Storage, Command>[];
-  readonly schemaViews: readonly ArtifactRef[];
-  readonly authorityScope: string;
-  readonly capabilities?: readonly CapabilityRef[];
 };

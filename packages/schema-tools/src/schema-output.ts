@@ -1,17 +1,14 @@
+import { safeParseArtifactValue, type ArtifactParseBudget, type JsonValue, type ParseResult } from '@tarstate/core/foundation';
 import {
   prepareSchema,
-  safeParseArtifactValue,
-  type ArtifactParseBudget,
   type FieldDeclaration,
-  type JsonValue,
-  type ParseResult,
   type PreparedSchema,
   type ScalarDeclaration,
   type SchemaArtifact
-} from '@tarstate/core';
+} from '@tarstate/core/schema';
 import { schemaToolsFailure } from './internal-issues.js';
 
-export type { SchemaArtifact } from '@tarstate/core';
+export type { SchemaArtifact } from '@tarstate/core/schema';
 
 export type PreparedSchemaTooling = {
   readonly artifact: SchemaArtifact;

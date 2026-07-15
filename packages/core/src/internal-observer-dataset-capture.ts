@@ -1,25 +1,19 @@
 import {
   type AttachmentCatalog,
-  type AttachmentProjection,
-  type DatabaseAttachment,
-  type DatasetMember,
   type DatasetMembership,
-  type DatasetSnapshot,
-  type SourceSnapshot
 } from './database.js';
+import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
+import type { AttachmentProjection } from './attachment-model.js';
 import { createIssue, type Issue } from './issues.js';
 import {
   reportObserverFailure,
   runObserverCleanups,
   type ObserverDiagnosticReporter
 } from './observer-diagnostics.js';
+import type { SourceSnapshot } from './source-state.js';
+import type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';
 
-export type AvailableQueryAttachment<Projection> = {
-  readonly member: DatasetMember;
-  readonly attachment: DatabaseAttachment<unknown, Projection>;
-  readonly snapshot: SourceSnapshot<unknown>;
-  readonly projection: Projection;
-};
+export type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';
 
 export type CapturedMember<Projection> = {
   readonly member: DatasetMember;

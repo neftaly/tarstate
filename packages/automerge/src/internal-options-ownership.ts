@@ -1,4 +1,4 @@
-import type { JsonValue } from '@tarstate/core';
+import type { JsonValue } from '@tarstate/core/foundation';
 import type { AutomergePath } from './projection.js';
 
 type Parser<Row> = (candidate: unknown, context: { readonly mapKey: string; readonly path: AutomergePath }) =>

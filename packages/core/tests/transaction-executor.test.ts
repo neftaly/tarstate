@@ -331,6 +331,49 @@ describe('prepared source-local transaction executor', () => {
     });
   });
 
+  it('contains authority and snapshot callback failures at the execution shell', async () => {
+    const required: CapabilityRef = { id: 'urn:test:capability:write', version: '1', contractHash: hash('d') };
+    const authorityContext = (await makeContext(() => {
+      throw new Error('authority unavailable');
+    })).context;
+    const requiringCapability = await sealTransaction({ body: {
+      schemaView,
+      parameters: {},
+      statements: [],
+      guards: [],
+      requiredCapabilities: [required]
+    } });
+    await expect(executePreparedTransaction(
+      authorityContext,
+      attempt(requiringCapability, 'operation:authority-failure')
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'transaction.capability_unavailable', details: { reason: 'authority_check_failed' } }]
+    });
+
+    const { context, source } = await makeContext();
+    const sourceWithFailingSnapshot = new Proxy(source, {
+      get: (target, property) => {
+        if (property === 'snapshot') return () => { throw new Error('snapshot unavailable'); };
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+    });
+    const snapshotContext = prepareWritableExecutionContext({
+      ...context,
+      source: sourceWithFailingSnapshot
+    });
+    const value = await transaction();
+    await expect(simulatePreparedTransaction(
+      snapshotContext,
+      attempt(value, 'operation:snapshot-simulation')
+    )).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'source.snapshot_failed' }] });
+    await expect(executePreparedTransaction(
+      snapshotContext,
+      attempt(value, 'operation:snapshot-commit')
+    )).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'source.snapshot_failed' }] });
+  });
+
   it('requires staged basis derivation when adopting a prepared writable source', async () => {
     const { context, source } = await makeContext();
     const sourceWithoutStagedBasis = new Proxy(source, {

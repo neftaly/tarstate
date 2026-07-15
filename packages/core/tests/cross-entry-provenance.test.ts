@@ -18,7 +18,7 @@ describe('cross-entry prepared-value provenance', () => {
 
     vi.resetModules();
     const query = await import('../src/query/index.js');
-    expect(() => query.evaluatePreparedExpression(preparedExpression, { row: { value: 3 } })).toThrow('not produced by prepareExpression');
+    expect(query.evaluatePreparedExpression(preparedExpression, { row: { value: 3 } })).toBe(3);
     const session = query.openIncrementalQueryMaintenance(plan, { relations: [] });
     expect(session.getCurrentResult().rows).toEqual([{ id: 1 }]);
     session.close();
@@ -32,7 +32,7 @@ describe('cross-entry prepared-value provenance', () => {
     vi.resetModules();
     const reloadedRoot = await import('../src/index.js');
     const reverseExpression = query.prepareExpression({ kind: 'field', alias: 'row', name: 'value' });
-    expect(() => reloadedRoot.evaluatePreparedExpression(reverseExpression, { row: { value: 4 } })).toThrow('not produced by prepareExpression');
+    expect(reloadedRoot.evaluatePreparedExpression(reverseExpression, { row: { value: 4 } })).toBe(4);
     const reverseSession = reloadedRoot.openIncrementalQueryMaintenance(subpathPlan, { relations: [] });
     expect(reverseSession.getCurrentResult().rows).toEqual([{ id: 2 }]);
     reverseSession.close();

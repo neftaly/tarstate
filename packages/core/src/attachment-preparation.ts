@@ -6,21 +6,21 @@ import {
   type ArtifactRef
 } from './artifacts.js';
 import type { ExactArtifactResolution, ExactArtifactResolver } from './artifact-resolver.js';
-import type { AttachmentProjection, SourceSnapshot } from './database.js';
+import type { AttachmentProjection, DocumentDeclaration } from './attachment-model.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { adoptDocumentDeclaration } from './internal-document-declaration.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { projectStorage, type BindingProjection, type CompiledStorageMapping } from './mapping.js';
-import type { SourceBasis } from './maintenance.js';
-import type { DocumentDeclaration } from './receipts.js';
 import type { CapabilityRegistry } from './registry.js';
 import { prepareSchema, type PreparedSchema } from './schema.js';
 import {
-  safeParseConstraintSetArtifact,
-  safePrepareConstraintSetArtifact,
-  safePrepareStorageMappingArtifact
-} from './semantic-artifact-parsers.js';
+  safeParseConstraintSetArtifact
+} from './semantic-constraint-artifact.js';
+import { prepareParsedConstraintSetArtifact } from './internal-constraint-set-preparation.js';
+import { safePrepareStorageMappingArtifact } from './semantic-storage-mapping-artifact.js';
 import type { ProjectionResult, StorageBinding } from './source-protocol.js';
+import type { SourceBasis, SourceSnapshot } from './source-state.js';
 import type { SourceConstraint } from './constraints.js';
 import type { JsonValue } from './value.js';
 
@@ -137,7 +137,20 @@ export const prepareDatabaseAttachment = async <State = unknown>(
     };
   } else {
     const missingBinding = input.registry.missing([declaration.projection.storageBinding]);
-    const binding = missingBinding.length === 0 ? input.resolveStorageBinding?.(declaration.projection.storageBinding) : undefined;
+    let binding: StorageBinding<unknown, unknown> | undefined;
+    if (missingBinding.length === 0) {
+      try {
+        binding = input.resolveStorageBinding?.(declaration.projection.storageBinding);
+      } catch (error) {
+        return unavailable([
+          ...issues,
+          preparationIssue('observer.projection_unavailable', {
+            reason: 'storage_binding_resolution_failed',
+            error: errorName(error)
+          })
+        ], artifactResolutions);
+      }
+    }
     if (missingBinding.length > 0 || binding === undefined) {
       return unavailable([...issues, ...missingBinding, ...(binding === undefined && missingBinding.length === 0 ? [preparationIssue('observer.projection_unavailable', { reason: 'storage_binding_unavailable' })] : [])], artifactResolutions);
     }
@@ -174,7 +187,7 @@ export const prepareDatabaseAttachment = async <State = unknown>(
           issues.push(...missingConstraintCapabilities);
           if (input.evaluateConstraintQuery === undefined) issues.push(preparationIssue('observer.projection_unavailable', { reason: 'constraint_executor_unavailable' }));
         } else {
-          const preparedConstraint = await safePrepareConstraintSetArtifact<State>(parsedConstraint.value, {
+          const preparedConstraint = prepareParsedConstraintSetArtifact<State>(parsedConstraint.value, {
             mode: declaration.constraints.mode,
             registry: input.registry,
             evaluateQuery: input.evaluateConstraintQuery
@@ -254,23 +267,10 @@ const selectDeclaration = (
 };
 
 const parseDocumentDeclaration = (input: unknown): ParseResult<DocumentDeclaration> => {
-  if (!isRecord(input) || input.formatVersion !== 1 || !isArtifactRef(input.storageSchema) || !isRecord(input.projection)) return declarationFailure();
-  let projection: DocumentDeclaration['projection'];
-  if (input.projection.kind === 'storage-mapping' && isArtifactRef(input.projection.storageMapping)) {
-    projection = { kind: 'storage-mapping', storageMapping: input.projection.storageMapping };
-  } else if (input.projection.kind === 'storage-binding' && isCapabilityRef(input.projection.storageBinding)) {
-    projection = { kind: 'storage-binding', storageBinding: input.projection.storageBinding };
-  } else return declarationFailure();
-  let constraints: DocumentDeclaration['constraints'];
-  if (input.constraints !== undefined) {
-    if (!isRecord(input.constraints) || !isArtifactRef(input.constraints.set) || (input.constraints.mode !== 'audit' && input.constraints.mode !== 'required')) return declarationFailure();
-    constraints = { set: input.constraints.set, mode: input.constraints.mode };
-  }
-  return {
-    success: true,
-    value: { formatVersion: 1, storageSchema: input.storageSchema, projection, ...(constraints === undefined ? {} : { constraints }) },
-    issues: []
-  };
+  const declaration = adoptDocumentDeclaration(input);
+  return declaration === undefined
+    ? declarationFailure()
+    : { success: true, value: declaration, issues: [] };
 };
 
 const resolveExactArtifact = async (
@@ -419,7 +419,5 @@ const optionalDataValue = (descriptors: PropertyDescriptorMap, key: string, labe
 const declarationFailure = (): ParseResult<never> => ({ success: false, issues: [preparationIssue('artifact.invalid_envelope', { reason: 'document_declaration' })] });
 const preparationIssue = (code: string, details: JsonValue): Issue => createIssue({ code, phase: 'resolve', severity: 'error', retry: code === 'capability.missing' ? 'after_capability' : 'after_refresh', details });
 const sameRef = (left: ArtifactRef, right: ArtifactRef): boolean => left.id === right.id && left.contentHash === right.contentHash;
-const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && typeof value.id === 'string' && /^sha256:[0-9a-f]{64}$/.test(String(value.contentHash));
-const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && typeof value.id === 'string' && typeof value.version === 'string' && /^sha256:[0-9a-f]{64}$/.test(String(value.contractHash));
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;

@@ -131,7 +131,7 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
       } else keyFields.push(field);
     }
     if (!relationValid) continue;
-    const prepared = sealPreparedRelation({ name, declaration, keyFields: Object.freeze(keyFields) });
+    const prepared = sealPreparedRelation<PreparedRelation>({ name, declaration, keyFields: Object.freeze(keyFields) });
     relationsByName.set(name, prepared);
     relationsById.set(declaration.relationId, prepared);
   }
@@ -150,7 +150,7 @@ export const prepareSchema = (input: unknown, registry?: CapabilityRegistry): Pa
   if (issues.length > 0) return { success: false, issues };
   return {
     success: true,
-    value: sealPreparedSchema({
+    value: sealPreparedSchema<PreparedSchema>({
       body,
       relationsByName: ownedReadonlyMap(relationsByName),
       relationsById: ownedReadonlyMap(relationsById)

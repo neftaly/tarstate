@@ -12,7 +12,8 @@ import {
   type JoinPositionBucket
 } from './internal-query-evaluator.js';
 import { withMaintenanceEvent, type MaterializedQueryNode } from './internal-query-maintenance-model.js';
-import type { Expr, QueryMaintenanceFallbackReason, QueryNode } from './query-model.js';
+import type { Expr, QueryNode } from './query-model.js';
+import type { QueryMaintenanceFallbackReason } from './query-incremental-model.js';
 
 export const incrementallyMaterializeJoinWith = (
   node: Extract<QueryNode, { readonly kind: 'join' }>,

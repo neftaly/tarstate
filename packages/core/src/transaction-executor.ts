@@ -9,10 +9,11 @@ import {
   type OperationLedgerProtocol,
   type OperationReservation
 } from './lifecycle-governance.js';
-import type { SourceBasis } from './maintenance.js';
+import type { WritableLogicalRow, WritableLogicalState } from './logical-edit.js';
+import type { SourceBasis } from './source-state.js';
 import { comparePortableStrings } from './portable-order.js';
-import type { QueryNode } from './query.js';
-import { safeParseTransactionArtifact } from './semantic-artifact-parsers.js';
+import type { QueryNode } from './query-model.js';
+import { safeParseTransactionArtifact } from './semantic-transaction-artifact.js';
 import type { AtomicSource, LogicalEdit, StagedBasisAtomicSource, StorageBinding } from './source-protocol.js';
 import {
   type CommitReceipt,
@@ -31,16 +32,7 @@ import {
 } from './transaction.js';
 import { logicalAnd, logicalNot, logicalOr, logicalUnknown, type JsonValue, type LogicalTruth } from './value.js';
 
-export type WritableLogicalRow = {
-  readonly relationId: string;
-  readonly key: JsonValue;
-  readonly fields: Readonly<Record<string, JsonValue>>;
-  readonly locator: JsonValue;
-};
-
-export type WritableLogicalState = {
-  readonly rows: readonly WritableLogicalRow[];
-};
+export type { WritableLogicalRow, WritableLogicalState } from './logical-edit.js';
 
 export type PreparedTransactionQueryResult = {
   readonly rows: readonly unknown[];
@@ -227,6 +219,30 @@ type EvaluatedExecution<Storage, Command> = {
   readonly blockingIssues: readonly Issue[];
 };
 
+type CapturedExecutionSnapshot<Storage, Command> =
+  | { readonly snapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']> }
+  | { readonly issue: Issue };
+
+/** The source callback is an effect boundary; evaluation only receives captured state. */
+const captureExecutionSnapshot = <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>
+): CapturedExecutionSnapshot<Storage, Command> => {
+  try {
+    return { snapshot: context.source.snapshot() };
+  } catch (error) {
+    return {
+      issue: createIssue({
+        code: 'source.snapshot_failed',
+        phase: 'plan',
+        severity: 'error',
+        retry: 'after_refresh',
+        sourceId: context.source.sourceId,
+        details: { error: errorName(error) }
+      })
+    };
+  }
+};
+
 export const executePreparedTransaction = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   attempt: TransactionAttempt
@@ -237,7 +253,16 @@ export const executePreparedTransaction = async <Storage, Command>(
   if ('receipt' in prepared) return prepared.receipt;
   const reservation = await reservePreparedExecution(context, prepared);
   if ('receipt' in reservation) return reservation.receipt;
-  const evaluated = evaluatePreparedExecution(context, prepared);
+  const captured = captureExecutionSnapshot(context);
+  if ('issue' in captured) {
+    return completePreparedExecution(
+      context,
+      prepared,
+      reservation.entry,
+      rejectedBeforeSnapshotReceipt(context, prepared, captured.issue)
+    );
+  }
+  const evaluated = evaluatePreparedExecution(context, prepared, captured.snapshot);
   if (evaluated.blockingIssues.length > 0) {
     return completePreparedExecution(context, prepared, reservation.entry, rejectedReceipt(context, prepared, evaluated));
   }
@@ -307,7 +332,11 @@ export const simulatePreparedTransaction = async <Storage, Command>(
   const preparedAttempt = adoptAttempt(attempt);
   const prepared = await prepareExecution(context, preparedAttempt);
   if ('receipt' in prepared) return commitRejectionAsSimulation(prepared.receipt);
-  const evaluated = evaluatePreparedExecution(context, prepared);
+  const captured = captureExecutionSnapshot(context);
+  if ('issue' in captured) {
+    return commitRejectionAsSimulation(rejectedBeforeSnapshotReceipt(context, prepared, captured.issue));
+  }
+  const evaluated = evaluatePreparedExecution(context, prepared, captured.snapshot);
   return {
     kind: 'simulation',
     receiptVersion: 1,
@@ -344,7 +373,7 @@ const prepareExecution = async <Storage, Command>(
   if (attempt.operationEpoch !== context.operationEpoch) {
     return reject([transactionIssue('transaction.operation_epoch_expired', attempt, { operationEpoch: attempt.operationEpoch }, 'never')]);
   }
-  if (attempt.signal?.aborted === true) {
+  if (signalAborted(attempt.signal)) {
     return reject([transactionIssue('transaction.cancelled', attempt, { timing: 'preparation' }, 'never')]);
   }
   let candidate: Transaction | undefined;
@@ -353,7 +382,13 @@ const prepareExecution = async <Storage, Command>(
     try {
       candidate = await context.resolveTransaction?.(attempt.transaction, attempt.signal);
     } catch (error) {
+      if (signalAborted(attempt.signal)) {
+        return reject([transactionIssue('transaction.cancelled', attempt, { timing: 'preparation' }, 'never')]);
+      }
       return reject([transactionIssue('transaction.artifact_unavailable', attempt, { error: errorName(error) })]);
+    }
+    if (signalAborted(attempt.signal)) {
+      return reject([transactionIssue('transaction.cancelled', attempt, { timing: 'preparation' }, 'never')]);
     }
     if (candidate === undefined) return reject([transactionIssue('transaction.artifact_unavailable', attempt, { transactionHash })]);
     if (candidate.id !== attempt.transaction.id || candidate.contentHash !== attempt.transaction.contentHash) {
@@ -365,11 +400,24 @@ const prepareExecution = async <Storage, Command>(
   }
   const parsed = await safeParseTransactionArtifact(candidate);
   if (!parsed.success) return reject(parsed.issues);
+  if (signalAborted(attempt.signal)) {
+    return reject([transactionIssue('transaction.cancelled', attempt, { timing: 'preparation' }, 'never')]);
+  }
   const transaction = parsed.value;
   if (!sameRef(transaction.body.schemaView, context.schemaView)) {
     return reject([transactionIssue('transaction.schema_view_unavailable', attempt, { schemaView: transaction.body.schemaView })]);
   }
-  const missing = transaction.body.requiredCapabilities.filter((capability) => !context.satisfiesCapability(capability));
+  const missing: CapabilityRef[] = [];
+  try {
+    for (const capability of transaction.body.requiredCapabilities) {
+      if (!context.satisfiesCapability(capability)) missing.push(capability);
+    }
+  } catch (error) {
+    return reject([transactionIssue('transaction.capability_unavailable', attempt, {
+      reason: 'authority_check_failed',
+      error: errorName(error)
+    })]);
+  }
   if (missing.length > 0) {
     return reject([createIssue({
       code: 'transaction.capability_unavailable',
@@ -384,9 +432,9 @@ const prepareExecution = async <Storage, Command>(
 
 const evaluatePreparedExecution = <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
-  prepared: PreparedExecution
+  prepared: PreparedExecution,
+  beforeSnapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>
 ): EvaluatedExecution<Storage, Command> => {
-  const beforeSnapshot = context.source.snapshot();
   const beforeBasis = beforeSnapshot.basis;
   const earlyIssues: Issue[] = [];
   if (beforeSnapshot.state !== 'ready' || beforeSnapshot.storage === undefined) {
@@ -953,6 +1001,15 @@ const rejectedReceipt = <Storage, Command>(
   beforeBasis: evaluated.beforeBasis
 });
 
+const rejectedBeforeSnapshotReceipt = <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  prepared: PreparedExecution,
+  issue: Issue
+): CommitReceipt => ({
+  ...receiptEvidence(context, prepared, [], [issue]),
+  outcome: 'rejected'
+});
+
 const receiptEvidence = <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   prepared: PreparedExecution,
@@ -1071,6 +1128,7 @@ const statementRelation = (statement: WriteStatement): WriteRelation | undefined
 const expressionFailure = (code: string, details: JsonValue): { readonly success: false; readonly issue: Issue } => ({ success: false, issue: transactionIssue(code, undefined, details) });
 const transactionIssue = (code: string, attempt?: Pick<TransactionAttempt, 'operationId'>, details?: JsonValue, retry?: Issue['retry']): Issue => createIssue({ code, ...(attempt === undefined ? {} : { operationId: attempt.operationId }), ...(details === undefined ? {} : { details }), ...(retry === undefined ? {} : { retry }) });
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;
+const signalAborted = (signal?: AbortSignal): boolean => signal?.aborted === true;
 const isRecord = (value: unknown): value is Readonly<Record<string, any>> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isJsonRecord = (value: unknown): value is Readonly<Record<string, JsonValue>> => isRecord(value) && Object.values(value).every((child) => {
   try { canonicalizeJson(child as JsonValue); return true; } catch { return false; }

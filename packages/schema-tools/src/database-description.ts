@@ -12,8 +12,8 @@ import {
   type ContentHash,
   type JsonValue,
   type ParseResult,
-  type ValueDeclaration
-} from '@tarstate/core';
+} from '@tarstate/core/foundation';
+import type { ValueDeclaration } from '@tarstate/core/query/authoring';
 import { schemaToolsFailure, schemaToolsIssue } from './internal-issues.js';
 
 export type DatabaseDescriptionBasis = {

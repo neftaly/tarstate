@@ -1,5 +1,5 @@
 import { capabilityRefKey, createIssue, type CapabilityRef, type Issue } from './issues.js';
-import { assertPreparedExpression, sealPreparedExpression } from './internal-prepared-expression.js';
+import { assertPreparedExpression } from './internal-prepared-expression.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import {
   adoptExpressionScope,
@@ -89,9 +89,6 @@ export const evaluateExpression = (
     issues
   }));
 };
-
-/** Owns and seals an expression once for repeated scalar evaluation. */
-export const prepareExpression = (expression: Expr): PreparedExpression => sealPreparedExpression(cloneAndFreezeExpression(expression));
 
 /** Evaluates a sealed expression while adopting every changing input frame. */
 export const evaluatePreparedExpression = (
