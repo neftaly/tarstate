@@ -389,6 +389,27 @@ describe('incremental query maintenance', () => {
     aggregateSession.close();
   });
 
+  it('reports only the logically updated identity when a sparse order change moves it', () => {
+    const query: QueryNode = { kind: 'order', input: people, by: [{ value: field('p', 'score'), direction: 'asc' }] };
+    const initial = snapshot(basePeople, 1);
+    const next = snapshot([
+      { occurrenceId: 'person:a', row: { ...(basePeople[0] as QueryRowOccurrence).row, score: 1 } },
+      basePeople[1] as QueryRowOccurrence
+    ], 2);
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const updatedKey = session.getCurrentResult().resultKeys[1] as string;
+
+    const result = applySnapshot(session, initial, next);
+
+    expect(semanticResult(result)).toEqual(oracle(query, next));
+    expect(result.state.resultDelta).toEqual({
+      addedResultKeys: [],
+      removedResultKeys: [],
+      updatedResultKeys: [updatedKey]
+    });
+    session.close();
+  });
+
   it('reuses aggregate output rows for groups whose membership is unchanged', () => {
     const query = operatorQueries.aggregate as QueryNode;
     const initial = snapshot(basePeople, 1);
@@ -1525,6 +1546,10 @@ describe('incremental query maintenance', () => {
 
     expect(maintained.rows[0]).toBe(before.rows[0]);
     expect(semanticResult(maintained)).toEqual(oracle(query, next));
+    const logicallyChangedKeys = maintained.rows.flatMap((row, index) =>
+      JSON.stringify(row) === JSON.stringify(before.rows[index]) ? [] : [maintained.resultKeys[index] as string]
+    );
+    expect(maintained.state.resultDelta.updatedResultKeys).toEqual(logicallyChangedKeys);
     session.close();
   });
 
@@ -1564,6 +1589,69 @@ describe('incremental query maintenance', () => {
     const orderMovedRows = partitionMovedRows.map((entry, index) => index === 2 ? { ...entry, row: { ...entry.row, score: -10 } } : entry);
     const orderMoved = state(orderMovedRows, 4);
     expect(semanticResult(applySnapshot(session, partitionMoved, orderMoved))).toEqual(oracle(query, orderMoved));
+    session.close();
+  });
+
+  it('falls back when lag reads a previously projected window field', () => {
+    const specification = { orderBy: [{ value: field('p', 'score'), direction: 'asc' as const }] };
+    const query: QueryNode = {
+      kind: 'window', input: people, alias: 'p', fields: {
+        rowNumber: { kind: 'window', op: 'row-number', ...specification },
+        priorRowNumber: { kind: 'window', op: 'lag', value: field('p', 'rowNumber'), ...specification }
+      }
+    };
+    const rows: readonly QueryRowOccurrence[] = [
+      { occurrenceId: 'window-dependent:1', row: { id: 1, score: 1, payload: 'a' } },
+      { occurrenceId: 'window-dependent:2', row: { id: 2, score: 2, payload: 'b' } },
+      { occurrenceId: 'window-dependent:3', row: { id: 3, score: 3, payload: 'c' } }
+    ];
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('people', rows, 1)] };
+    const changedRows = rows.map((entry, index) => index === 0
+      ? { ...entry, row: { ...entry.row, payload: 'changed' } }
+      : entry);
+    const changed: QueryMaintenanceSnapshot = { relations: [relation('people', changedRows, 2)] };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    const maintained = applySnapshot(session, initial, changed);
+
+    expect(semanticResult(maintained)).toEqual(oracle(query, changed));
+    expect(maintained.rows.map((row) => row.priorRowNumber)).toEqual([null, 1, 2]);
+    expect(maintained.state.operatorDiagnostics.window).toMatchObject({
+      fallbackNodeCount: 1,
+      fallbackReasons: { unsupported_expression: 1 }
+    });
+    session.close();
+  });
+
+  it('keeps sparse rank semantics aligned for missing and null order values', () => {
+    const query: QueryNode = {
+      kind: 'window', input: people, alias: 'p', fields: {
+        rank: {
+          kind: 'window', op: 'rank',
+          orderBy: [{ value: field('p', 'score'), direction: 'asc' }]
+        }
+      }
+    };
+    const rows: readonly QueryRowOccurrence[] = [
+      { occurrenceId: 'window-rank:1', row: { id: 1, score: 1 } },
+      { occurrenceId: 'window-rank:2', row: { id: 2, score: null } },
+      { occurrenceId: 'window-rank:3', row: { id: 3 } }
+    ];
+    const initial: QueryMaintenanceSnapshot = { relations: [relation('people', rows, 1)] };
+    const changedRows = rows.map((entry, index) => index === 0
+      ? { ...entry, row: { ...entry.row, score: 2 } }
+      : entry);
+    const changed: QueryMaintenanceSnapshot = { relations: [relation('people', changedRows, 2)] };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+
+    const maintained = applySnapshot(session, initial, changed);
+
+    expect(semanticResult(maintained)).toEqual(oracle(query, changed));
+    expect(maintained.rows.map((row) => row.rank)).toEqual([1, 2, 2]);
+    expect(maintained.state.operatorDiagnostics.window).toMatchObject({
+      selectiveNodeCount: 1,
+      fallbackNodeCount: 0
+    });
     session.close();
   });
 
@@ -2009,7 +2097,44 @@ describe('incremental query maintenance', () => {
     runtime.close();
   });
 
-  it('reuses a projection when changed input fields cannot affect its expressions', () => {
+  it('publishes unread pooled roots from the latest physical transition', () => {
+    const initial = snapshot(basePeople, 1);
+    const first = snapshot([
+      { occurrenceId: 'person:a', row: { ...basePeople[0]!.row, name: 'first' } },
+      basePeople[1] as QueryRowOccurrence
+    ], 2);
+    const second = snapshot([
+      { occurrenceId: 'person:a', row: { ...basePeople[0]!.row, name: 'second' } },
+      basePeople[1] as QueryRowOccurrence
+    ], 3);
+    const ids: QueryNode = { kind: 'select', input: from('people', 'p'), alias: 'ids', fields: { id: field('p', 'id') } };
+    const names: QueryNode = { kind: 'select', input: from('people', 'p'), alias: 'names', fields: { name: field('p', 'name') } };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/lazy-root-publication', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
+      },
+      initialSnapshot: initial
+    });
+    const idsRoot = runtime.attach(plan(ids));
+    const namesRoot = runtime.attach(plan(names));
+    const initialIds = idsRoot.getCurrentResult();
+
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(initial, first));
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots(first, second));
+
+    const latestIds = idsRoot.getCurrentResult();
+    const latestNames = namesRoot.getCurrentResult();
+    expect(latestIds.rows).toBe(initialIds.rows);
+    expect(latestIds.state).toMatchObject({ revision: 2, updatedNodeCount: 1, changedNodeCount: 1 });
+    expect(semanticResult(latestNames)).toEqual(oracle(names, second));
+    expect(latestNames.state).toMatchObject({ revision: 2, updatedNodeCount: 2, changedNodeCount: 2 });
+    idsRoot.close();
+    namesRoot.close();
+    runtime.close();
+  });
+
+  it('does not schedule a projection when changed input fields cannot affect its expressions', () => {
     const initial = snapshot(basePeople, 1);
     const changed = snapshot([
       { occurrenceId: 'person:a', row: { ...basePeople[0]!.row, name: 'changed outside projection' } },
@@ -2038,11 +2163,11 @@ describe('incremental query maintenance', () => {
 
     const after = root.getCurrentResult();
     expect(semanticResult(after)).toEqual(oracle(query, changed));
-    expect(after.state).toMatchObject({ updatedNodeCount: 2, changedNodeCount: 1 });
-    expect(after.state.operatorDiagnostics.local).toMatchObject({ selectiveNodeCount: 1, affectedUnitCount: 0 });
+    expect(after.state).toMatchObject({ updatedNodeCount: 1, changedNodeCount: 1 });
+    expect(after.state.operatorDiagnostics.local).toMatchObject({ selectiveNodeCount: 0, affectedUnitCount: 0 });
     expect(after.rows).toBe(before.rows);
     expect(after.resultKeys).toBe(before.resultKeys);
-    expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 2, lastChangedPhysicalNodeCount: 1 });
+    expect(runtime.getDiagnostics()).toMatchObject({ lastUpdatedPhysicalNodeCount: 1, lastChangedPhysicalNodeCount: 1 });
     root.close();
     runtime.close();
   });
@@ -2471,6 +2596,49 @@ describe('incremental query maintenance', () => {
       initial as never
     )).toThrow(/Query maintenance snapshot contains a hostile object descriptor/);
     expect(calls).toBe(0);
+  });
+
+  it('keeps pooled root reads atomic during reentrant query functions', () => {
+    const callable = { id: 'urn:test:pooled-reentrant-read', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
+    const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
+    const initial = snapshot(basePeople, 1);
+    const changed = snapshot(middlePeople, 2);
+    let root: ReturnType<ReturnType<typeof createPooledIncrementalQueryRuntime>['attach']> | undefined;
+    let readDuringUpdate: IncrementalQueryResult | undefined;
+    let shouldRead = false;
+    const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
+      if (shouldRead) {
+        shouldRead = false;
+        readDuringUpdate = root?.getCurrentResult();
+      }
+      return args[0] ?? null;
+    }]]);
+    const query: QueryNode = {
+      kind: 'select', input: people, alias: 'result',
+      fields: { value: { kind: 'call', capability: callable, args: [field('p', 'name')] } }
+    };
+    const runtime = createPooledIncrementalQueryRuntime({
+      environment: {
+        runtimeIdentity: 'database:test/reentrant-read', registryFingerprint: 'registry:test',
+        authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }, functions
+      },
+      initialSnapshot: { ...initial, functions }
+    });
+    root = runtime.attach(plan(query));
+    const attachedRoot = root;
+    const before = attachedRoot.getCurrentResult();
+
+    shouldRead = true;
+    runtime.applyUpdate(diffQueryMaintenanceSnapshots({ ...initial, functions }, { ...changed, functions }));
+
+    expect(readDuringUpdate).toBe(before);
+    expect(semanticResult(attachedRoot.getCurrentResult())).toEqual(oracle(query, { ...changed, functions }));
+    expect(attachedRoot.getCurrentResult()).toMatchObject({
+      rows: [{ value: 'Ada' }, { value: 'Bob' }, { value: 'Cy' }],
+      state: { revision: 1, updatedNodeCount: 2, changedNodeCount: 2 }
+    });
+    attachedRoot.close();
+    runtime.close();
   });
 
   it('defers root closure during updates and rejects recursive updates and attachment', () => {

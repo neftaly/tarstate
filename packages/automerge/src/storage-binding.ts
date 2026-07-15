@@ -413,7 +413,7 @@ const locatorFor = (
   if (changeHash !== '' && typeof collectionObjectId === 'string') {
     return {
       namespace: namespace + ':conflict',
-      token: { collectionObjectId, mapKey, changeHash },
+      token: Object.freeze({ collectionObjectId, mapKey, changeHash }),
       rowIncarnation: changeHash
     };
   }

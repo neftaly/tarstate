@@ -53,14 +53,48 @@ describe('topic-focused core surface', () => {
     expect(Object.keys(source)).toEqual([]);
     expect(Object.keys(queryModel)).toEqual([]);
     expect(Object.keys(sourceProjection)).toEqual(['sealStorageProjection']);
+    expect('prepareQuery' in queryEvaluate).toBe(false);
+    expect('prepareQueryMaintenanceSnapshot' in queryEvaluate).toBe(false);
     expect('openIncrementalQueryMaintenance' in queryEvaluate).toBe(false);
     expect('evaluateQuery' in queryIncremental).toBe(false);
     expect('sealTransaction' in transactionDelta).toBe(false);
+    expect('executeNonAtomicBatch' in transactionAuthoring).toBe(false);
     expect('createIncrementalDatabaseQueryMaintenance' in databaseObserver).toBe(false);
     expectTypeOf<ObserverDiagnosticReporter>().toMatchTypeOf<import('../src/observer-diagnostics.js').ObserverDiagnosticReporter>();
     expectTypeOf<PreparedPlan>().toMatchTypeOf<import('../src/maintenance.js').PreparedPlan>();
     expectTypeOf<AtomicSource<unknown, unknown>>().toMatchTypeOf<import('../src/source-protocol.js').AtomicSource<unknown, unknown>>();
     expectTypeOf<DocumentDeclaration>().toMatchTypeOf<import('../src/attachment-model.js').DocumentDeclaration>();
+  });
+
+  it('publishes immutable constants and adopts sealed storage projections', () => {
+    expect(Object.isFrozen(root.artifactKinds)).toBe(true);
+    expect(Object.isFrozen(root.defaultArtifactParseBudget)).toBe(true);
+    expect(Object.isFrozen(root.defaultValueParseBudget)).toBe(true);
+    expect(Object.isFrozen(root.builtInCapabilityRefs)).toBe(true);
+    expect(Object.values(root.builtInCapabilityRefs).every(Object.isFrozen)).toBe(true);
+    expect(Object.isFrozen(root.builtInCapabilityDeclarations)).toBe(true);
+
+    const input = Object.freeze({
+      rows: Object.freeze([Object.freeze({
+        relationId: 'test.row',
+        key: Object.freeze(['one']),
+        fields: Object.freeze({ nested: Object.freeze({ value: 1 }) }),
+        locator: Object.freeze(['one'])
+      })]),
+      completeness: 'exact' as const,
+      issues: Object.freeze([])
+    });
+    const sealed = sourceProjection.sealStorageProjection(input);
+    expect(sealed).toBe(input);
+    expect(Object.isFrozen(sealed)).toBe(true);
+    expect(Object.isFrozen(sealed.rows)).toBe(true);
+    expect(Object.isFrozen(sealed.rows[0])).toBe(true);
+    expect(Object.isFrozen(sealed.rows[0]?.fields.nested)).toBe(true);
+    expect(() => sourceProjection.sealStorageProjection({
+      rows: [{ relationId: 'test.row', key: ['one'], fields: {}, locator: ['one'] }],
+      completeness: 'exact',
+      issues: []
+    } as never)).toThrow(TypeError);
   });
 
   it('shares provenance across focused query entries', async () => {

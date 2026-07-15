@@ -265,6 +265,7 @@ export class DatasetCaptureRuntime<Projection> {
       ...this.#sourceUnsubscribes.values()
     ], { component: 'dataset-capture', operation: 'close-subscriptions' }, this.#options.onDiagnostic);
     this.#sourceUnsubscribes.clear();
+    this.#dirtySources.clear();
   }
 }
 

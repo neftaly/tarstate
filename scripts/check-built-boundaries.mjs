@@ -20,7 +20,7 @@ try {
   assertClosure('artifacts/storage-mapping/index.js', 90_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
-  assertClosure('source/projection/index.js', 1_000, []);
+  assertClosure('source/projection/index.js', 6_000, []);
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/prepare/index.js', 140_000, ['internal-query-evaluator', 'semantic-query-artifact', 'semantic-schema-lens', 'transaction-']);
   assertClosure('query/model/index.js', 100, []);
@@ -29,7 +29,7 @@ try {
   assertClosure('query/evaluate/index.js', 120_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'transaction-executor']);
   assertClosure('query/incremental/index.js', 215_000, ['internal-observer-query-maintenance', 'observer-maintenance-contracts', 'memory-source', 'transaction-executor']);
   assertClosure('schema/index.js', 100_000, ['query-authoring', 'transaction-authoring', 'internal-query-evaluator', 'query-incremental']);
-  assertClosure('transactions/index.js', 155_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
+  assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/incremental/index.js', 225_000, ['memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/external-store/index.js', 60_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);

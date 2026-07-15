@@ -7,7 +7,8 @@ import {
   adoptJsonRecord,
   adoptJsonValue,
   cloneAndFreezeExpression,
-  isOwnedQueryLogicalContainer
+  isOwnedQueryLogicalContainer,
+  sealOwnedQueryLogicalContainer
 } from './internal-query-ownership.js';
 import { compareQueryJsonValues, compareQueryJsonValuesTotal, containsQueryLogicalUnknown } from './internal-query-values.js';
 import type { Expr, FunctionRegistry, PreparedExpression, QueryFunction, QueryLogicalValue, QueryNode, QueryRecord, Completeness } from './query-model.js';
@@ -61,6 +62,7 @@ const knownFalse: QueryExpressionResult = Object.freeze({ status: 'known', value
 const knownNull: QueryExpressionResult = Object.freeze({ status: 'known', value: null });
 const knownObjects = new WeakMap<object, QueryExpressionResult>();
 const knownLiterals = new WeakMap<object, QueryExpressionResult>();
+const expressionFieldEntries = new WeakMap<object, readonly (readonly [string, Expr])[]>();
 
 const legacyCapabilityRefKey = (ref: CapabilityRef): string =>
   ref.id + '\u0000' + ref.version + '\u0000' + ref.contractHash;
@@ -212,7 +214,9 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
     if (values.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
     if (values.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
     if (values.some((value) => value.status !== 'known')) return { status: 'unknown' };
-    return knownExpression(values.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value));
+    return knownExpression(sealOwnedQueryLogicalContainer(Object.freeze(
+      values.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value)
+    )));
   }
   if (expression.kind === 'record') {
     const fields = projectExpressionFields(expression.fields, context);
@@ -308,15 +312,49 @@ const propagateExpression = (...values: readonly QueryExpressionResult[]): Query
 
 export const expressionJson = (result: QueryExpressionResult): JsonValue => result.status === 'known' ? result.value : null;
 
+const cachedExpressionFieldEntries = (fields: Readonly<Record<string, Expr>>): readonly (readonly [string, Expr])[] => {
+  const cached = expressionFieldEntries.get(fields);
+  if (cached !== undefined) return cached;
+  const entries = Object.entries(fields);
+  expressionFieldEntries.set(fields, entries);
+  return entries;
+};
+
+const projectLeafExpression = (
+  expression: Expr,
+  context: QueryExpressionContext
+): QueryLogicalValue | undefined => {
+  if (context.runtime !== undefined && !context.runtime.consumeWork(context.runtimeState)) {
+    context.runtime.markUnavailable(context.runtimeState);
+    return undefined;
+  }
+  if (expression.kind === 'literal') return expression.value;
+  if (expression.kind === 'parameter') return context.parameters[expression.name];
+  if (expression.kind === 'field') {
+    const record = context.row.scope[expression.alias];
+    return record?.[expression.name];
+  }
+  if (expression.kind === 'key-of' || expression.kind === 'source-of') {
+    const provenance = context.row.provenance[expression.alias];
+    return expression.kind === 'key-of' ? provenance?.key : provenance?.sourceId;
+  }
+  return undefined;
+};
+
 export const projectExpressionFields = (fields: Readonly<Record<string, Expr>>, context: QueryExpressionContext): QueryRecord => {
   const output: Record<string, QueryLogicalValue> = {};
-  for (const [name, expression] of Object.entries(fields)) {
+  for (const [name, expression] of cachedExpressionFieldEntries(fields)) {
+    if (expression.kind === 'literal' || expression.kind === 'parameter' || expression.kind === 'field' || expression.kind === 'key-of' || expression.kind === 'source-of') {
+      const value = projectLeafExpression(expression, context);
+      if (value !== undefined) output[name] = value;
+      continue;
+    }
     const result = evaluateQueryExpression(expression, context);
     if (result.status === 'known') output[name] = result.value;
     else if (result.status === 'unknown') output[name] = logicalUnknown;
     else if ((result.status === 'unavailable' || result.status === 'indeterminate') && context.runtime !== undefined) context.runtime.markUnavailable(context.runtimeState);
   }
-  return output;
+  return sealOwnedQueryLogicalContainer(Object.freeze(output));
 };
 
 const assertNever = (value: never): never => {

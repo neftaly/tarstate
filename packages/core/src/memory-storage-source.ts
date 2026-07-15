@@ -6,7 +6,8 @@ import { stringTupleKey } from './internal-string-key.js';
 import { samePortableJson } from './internal-json-equality.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import type { MemoryRow, MemoryState } from './memory-source.js';
-import { sealStorageProjection, type WritableLogicalRow } from './logical-edit.js';
+import type { WritableLogicalRow } from './logical-edit.js';
+import { sealStorageProjection } from './storage-projection.js';
 import type { SourceBasis, SourceSnapshot } from './source-state.js';
 import type {
   AtomicSource,
@@ -223,7 +224,12 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
           continue;
         }
         seen.add(fingerprint);
-        rows.push(Object.freeze({ relationId: relation.relationId, key, fields, locator: { namespace: this.id, token: fingerprint } }));
+        rows.push(Object.freeze({
+          relationId: relation.relationId,
+          key,
+          fields,
+          locator: Object.freeze({ namespace: this.id, token: fingerprint })
+        }));
       }
     }
     const projection = sealStorageProjection(Object.freeze({
@@ -415,7 +421,9 @@ const commandForOperations = (
 const relationFootprint = (relationId: string): string => encodeURIComponent(relationId);
 const rowPath = (relationId: string, key: JsonValue): string => relationFootprint(relationId) + '/' + encodeURIComponent(canonicalizeJson(key));
 const parseFootprint = (footprint: Footprint): readonly string[] | undefined => Array.isArray(footprint) && footprint.every((value) => typeof value === 'string') ? footprint : undefined;
-const logicalKey = (row: MemoryRow, fields: readonly string[]): JsonValue | undefined => fields.length > 0 && fields.every((field) => Object.hasOwn(row, field)) ? fields.map((field) => row[field] as JsonValue) : undefined;
+const logicalKey = (row: MemoryRow, fields: readonly string[]): JsonValue | undefined => fields.length > 0 && fields.every((field) => Object.hasOwn(row, field))
+  ? Object.freeze(fields.map((field) => row[field] as JsonValue))
+  : undefined;
 const ownRow = (row: Readonly<Record<string, JsonValue>>): MemoryRow => {
   const owned = detachAndFreezeJsonValue(row);
   if (!owned.success || owned.value === null || Array.isArray(owned.value) || typeof owned.value !== 'object') throw new TypeError('Logical memory row must be portable data');

@@ -21,14 +21,14 @@ export type DatabaseDescriptionBasis = {
   readonly attachments: readonly { readonly attachmentId: string; readonly sourceId: string; readonly basis: JsonValue }[];
 };
 
-export const supportedDatabaseCommandIds = [
+export const supportedDatabaseCommandIds = Object.freeze([
   'tarstate.command.commit',
   'tarstate.command.non_atomic_batch',
   'tarstate.command.simulate',
   'tarstate.command.set_presence',
   'tarstate.command.source_lifecycle',
   'tarstate.command.governance'
-] as const;
+] as const);
 
 export type SupportedDatabaseCommandId = typeof supportedDatabaseCommandIds[number];
 
@@ -81,7 +81,7 @@ export type DatabaseDescriptionBudget = ArtifactParseBudget & {
   readonly maxAttachmentReferences: number;
 };
 
-export const defaultDatabaseDescriptionBudget: DatabaseDescriptionBudget = {
+export const defaultDatabaseDescriptionBudget: DatabaseDescriptionBudget = Object.freeze({
   ...defaultArtifactParseBudget,
   maxBytes: 2 * 1024 * 1024,
   maxDatasets: 1_000,
@@ -89,7 +89,7 @@ export const defaultDatabaseDescriptionBudget: DatabaseDescriptionBudget = {
   maxCommands: 64,
   maxCapabilities: 100_000,
   maxAttachmentReferences: 100_000
-};
+});
 
 /** Consumes an already authority-filtered shell snapshot; it performs no grant widening. */
 export const describeDatabase = async (source: DatabaseDescriptionSnapshot | DatabaseDescriptionSnapshotProvider, budget: DatabaseDescriptionBudget = defaultDatabaseDescriptionBudget): Promise<DatabaseDescription> => {

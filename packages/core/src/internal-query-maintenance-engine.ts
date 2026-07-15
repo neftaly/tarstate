@@ -16,16 +16,16 @@ import {
   publicQueryIssues,
   publicQueryRow,
   publicQueryRows,
+  replaceScopedAlias,
   requiredAlias,
   resultKey,
   scopedRow,
   tagSetRow,
-  visibleRow,
-  windowSpecificationKey,
-  windowSpecificationReferencesFields,
-  type WindowMaintenanceLayout
+  visibleRow
 } from './internal-query-evaluator.js';
 import { containsNamedCall, containsSubquery } from './internal-query-graph.js';
+import { selectProjectionDependenciesEqual } from './internal-query-dependency.js';
+import { transitionOrderedRows } from './internal-query-ordering.js';
 import {
   aggregateCanBeIncrementallyIndexed,
   incrementallyMaterializeAggregateWith,
@@ -44,6 +44,16 @@ import {
   type LocalSegment,
   type MaterializedQueryNode
 } from './internal-query-maintenance-model.js';
+import {
+  transformWindowPartitions,
+  transitionWindowLayouts,
+  updateWindowPartitionKeyIndex,
+  updateWindowPartitionStates,
+  windowSpecificationKey,
+  windowSpecificationReferencesFields,
+  type IndexedWindowField,
+  type WindowMaintenanceLayout
+} from './internal-query-window-maintenance.js';
 import { canonicalizeQueryValue, queryValueEqual } from './internal-query-values.js';
 import { groupRelationInputs, relationInputKey, relationKey, relationOccurrence } from './internal-query-relations.js';
 import { stringTupleKey } from './internal-string-key.js';
@@ -144,7 +154,10 @@ const windowCanBePartitionMaintained = (node: Extract<QueryNode, { readonly kind
     && !windowSpecificationReferencesFields(window, node.alias, outputFields)
     && !(window.partitionBy ?? []).some((expression) => containsSubquery(expression) || containsNamedCall(expression))
     && !window.orderBy.some((term) => containsSubquery(term.value) || containsNamedCall(term.value))
-    && (window.value === undefined || !containsSubquery(window.value) && !containsNamedCall(window.value)));
+    && (window.value === undefined
+      || !expressionReferencesWindowFields(window.value, node.alias, outputFields)
+        && !containsSubquery(window.value)
+        && !containsNamedCall(window.value)));
 };
 
 const windowPartitionKey = (node: Extract<QueryNode, { readonly kind: 'window' }>, row: ScopedRow, context: QueryContext): string => {
@@ -307,7 +320,7 @@ const microMaterializeStableWindow = (
     const priorAlias = requiredAlias(prior, node.alias, context);
     if (inputAlias === undefined || priorAlias === undefined) return undefined;
     const retainedFields = Object.fromEntries([...outputFields].map((field) => [field, priorAlias[field] as QueryLogicalValue]));
-    output[position] = { ...input, scope: { ...input.scope, [node.alias]: { ...inputAlias, ...retainedFields } } };
+    output[position] = replaceScopedAlias(input, node.alias, { ...inputAlias, ...retainedFields });
     affected.add(position);
   }
 
@@ -333,7 +346,7 @@ const microMaterializeStableWindow = (
       const aliasFields = requiredAlias(target, node.alias, context);
       if (aliasFields === undefined) return undefined;
       if (queryValueEqual(aliasFields[field] as QueryLogicalValue, value)) continue;
-      output[targetPosition] = { ...target, scope: { ...target.scope, [node.alias]: { ...aliasFields, [field]: value } } };
+      output[targetPosition] = replaceScopedAlias(target, node.alias, { ...aliasFields, [field]: value });
       affected.add(targetPosition);
     }
   }
@@ -384,6 +397,69 @@ export const incrementallyMaterializeWindow = (
     const micro = microMaterializeStableWindow(node, child.result.rows, child.stableChangedPositions, previous, context);
     if (micro !== undefined) return micro;
   }
+  const stableIdentityLayout = previous.window.inputs.length === child.result.rows.length
+    && previous.window.inputs.every((row, index) => resultKey(row) === resultKey(child.result.rows[index] as ScopedRow));
+  const specifications = new Map<string, WindowExpr>();
+  for (const window of Object.values(node.fields)) specifications.set(windowSpecificationKey(window), window);
+
+  if (stableIdentityLayout && child.stableChangedPositions !== undefined && previous.window.layouts !== undefined) {
+    const layoutContext = materializationContext(snapshot, materializedNodes, node, [], run, false);
+    const transitioned = transitionWindowLayouts(
+      specifications,
+      previous.window.layouts,
+      child.result.rows,
+      child.stableChangedPositions,
+      (window, row) => evaluateWindowKeys(window, row, layoutContext)
+    );
+    if (layoutContext.state.unavailable) {
+      return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' });
+    }
+    if (transitioned !== undefined) {
+      const indexedFields: IndexedWindowField[] = [];
+      for (const [field, window] of Object.entries(node.fields)) {
+        const layout = transitioned.layouts.get(windowSpecificationKey(window));
+        if (layout === undefined) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'state_unavailable' });
+        indexedFields.push({ field, window, layout });
+      }
+      const transformed = transformWindowPartitions(
+        node.alias,
+        indexedFields,
+        transitioned.affectedPartitionKeys,
+        child.result.rows,
+        previous.window.inputs,
+        previous.result.rows,
+        (expression, source) => {
+          const value = evaluateExpr(expression, exprContext(source, context));
+          if (value.status === 'unavailable' || value.status === 'indeterminate') context.state.unavailable = true;
+          return expressionJson(value);
+        }
+      );
+      const firstLayout = transitioned.layouts.values().next().value as WindowMaintenanceLayout | undefined;
+      const partitionKeyByResultKey = firstLayout === undefined
+        ? undefined
+        : updateWindowPartitionKeyIndex(previous.window.partitionKeyByResultKey, child.stableChangedPositions, child.result.rows, firstLayout);
+      if (transformed === undefined || firstLayout === undefined || partitionKeyByResultKey === undefined || context.state.unavailable || issues.length > 0) {
+        return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' });
+      }
+      const changedPositions = [...transformed.changedPositions].sort((left, right) => left - right);
+      const partitions = updateWindowPartitionStates(
+        previous.window.partitions,
+        transitioned.affectedPartitionKeys,
+        firstLayout,
+        child.result.rows,
+        transformed.rows
+      );
+      return withMaintenanceEvent({
+        result: { rows: transformed.rows, completeness: 'exact' },
+        issues: [],
+        unavailable: false,
+        stableChangedPositions: changedPositions,
+        verifiedChangedPositions: changedPositions,
+        window: { inputs: child.result.rows, partitionKeyByResultKey, partitions, layouts: transitioned.layouts }
+      }, { operator: 'window', strategy: 'selective', affectedUnitCount: changedPositions.length });
+    }
+  }
+
   const partitionKeyByResultKey = new Map<string, string>();
   const partitions = new Map<string, { members: ScopedRow[]; positions: number[] }>();
   child.result.rows.forEach((row, position) => {
@@ -398,36 +474,84 @@ export const incrementallyMaterializeWindow = (
     partitions.set(key, partition);
   });
   if (context.state.unavailable || issues.length > 0) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' });
-  const output: ScopedRow[] = Array.from({ length: child.result.rows.length });
-  const indexedPartitions = new Map<string, { readonly members: readonly ScopedRow[]; readonly outputs: readonly ScopedRow[] }>();
-  const changedPositions: number[] = [];
-  const overrides = new Map(materializedNodes);
-  for (const [key, partition] of partitions) {
-    const prior = previous.window.partitions.get(key);
-    const reusable = prior !== undefined && prior.members.length === partition.members.length && prior.members.every((row, index) => row === partition.members[index]);
-    let outputs: readonly ScopedRow[];
-    if (reusable) outputs = prior.outputs;
-    else {
-      overrides.set(node.input, { result: { rows: partition.members, completeness: 'exact' }, issues: [], unavailable: false });
-      const evaluated = evaluateMaterializedQueryNode(node, snapshot, overrides, run);
-      if (evaluated.unavailable || evaluated.issues.length > 0 || evaluated.result.completeness !== 'exact') return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: partition.members.length, reason: 'evaluation_unavailable' });
-      outputs = evaluated.result.rows;
-      if (outputs.length !== partition.members.length) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: partition.members.length, reason: 'unstable_layout' });
-      changedPositions.push(...partition.positions);
-    }
-    partition.positions.forEach((position, index) => { output[position] = outputs[index] as ScopedRow; });
-    indexedPartitions.set(key, { members: partition.members, outputs });
-  }
-  const stableIdentityLayout = previous.window.inputs.length === child.result.rows.length
-    && previous.window.inputs.every((row, index) => resultKey(row) === resultKey(child.result.rows[index] as ScopedRow));
   const layoutContext = materializationContext(snapshot, materializedNodes, node, [], run, false);
   const layouts = indexWindowMaintenanceLayouts(node, child.result.rows, layoutContext);
   if (layoutContext.state.unavailable || layouts === undefined) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' });
+
+  let output: readonly ScopedRow[];
+  let changedPositions: number[];
+  if (stableIdentityLayout) {
+    const affectedPartitionKeys = new Set<string>();
+    for (const [key, partition] of partitions) {
+      const prior = previous.window.partitions.get(key);
+      const reusable = prior !== undefined
+        && prior.members.length === partition.members.length
+        && prior.members.every((row, index) => row === partition.members[index]);
+      if (!reusable) affectedPartitionKeys.add(key);
+    }
+    for (const key of previous.window.partitions.keys()) {
+      if (!partitions.has(key)) affectedPartitionKeys.add(key);
+    }
+    const indexedFields: IndexedWindowField[] = [];
+    for (const [field, window] of Object.entries(node.fields)) {
+      const layout = layouts.get(windowSpecificationKey(window));
+      if (layout === undefined) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'state_unavailable' });
+      indexedFields.push({ field, window, layout });
+    }
+    const transformed = transformWindowPartitions(
+      node.alias,
+      indexedFields,
+      affectedPartitionKeys,
+      child.result.rows,
+      previous.window.inputs,
+      previous.result.rows,
+      (expression, source) => {
+        const value = evaluateExpr(expression, exprContext(source, context));
+        if (value.status === 'unavailable' || value.status === 'indeterminate') context.state.unavailable = true;
+        return expressionJson(value);
+      }
+    );
+    if (transformed === undefined || context.state.unavailable || issues.length > 0) {
+      return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' });
+    }
+    output = transformed.rows;
+    changedPositions = [...transformed.changedPositions];
+  } else {
+    const rebuilt: ScopedRow[] = Array.from({ length: child.result.rows.length });
+    changedPositions = [];
+    const overrides = new Map(materializedNodes);
+    for (const [key, partition] of partitions) {
+      const prior = previous.window.partitions.get(key);
+      const reusable = prior !== undefined && prior.members.length === partition.members.length && prior.members.every((row, index) => row === partition.members[index]);
+      let outputs: readonly ScopedRow[];
+      if (reusable) outputs = prior.outputs;
+      else {
+        overrides.set(node.input, { result: { rows: partition.members, completeness: 'exact' }, issues: [], unavailable: false });
+        const evaluated = evaluateMaterializedQueryNode(node, snapshot, overrides, run);
+        if (evaluated.unavailable || evaluated.issues.length > 0 || evaluated.result.completeness !== 'exact') return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: partition.members.length, reason: 'evaluation_unavailable' });
+        outputs = evaluated.result.rows;
+        if (outputs.length !== partition.members.length) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'window', strategy: 'fallback', affectedUnitCount: partition.members.length, reason: 'unstable_layout' });
+        changedPositions.push(...partition.positions);
+      }
+      partition.positions.forEach((position, index) => { rebuilt[position] = outputs[index] as ScopedRow; });
+    }
+    output = rebuilt;
+  }
+
+  const indexedPartitions = new Map<string, { readonly members: readonly ScopedRow[]; readonly outputs: readonly ScopedRow[] }>();
+  for (const [key, partition] of partitions) {
+    indexedPartitions.set(key, {
+      members: partition.members,
+      outputs: partition.positions.map((position) => output[position] as ScopedRow)
+    });
+  }
   return withMaintenanceEvent({
     result: { rows: output, completeness: 'exact' },
     issues: [],
     unavailable: false,
-    ...(stableIdentityLayout ? { stableChangedPositions: changedPositions.sort((left, right) => left - right) } : {}),
+    ...(stableIdentityLayout ? {
+      stableChangedPositions: changedPositions.sort((left, right) => left - right)
+    } : {}),
     window: { inputs: child.result.rows, partitionKeyByResultKey, partitions: indexedPartitions, layouts }
   }, { operator: 'window', strategy: 'selective', affectedUnitCount: changedPositions.length });
 };
@@ -642,6 +766,36 @@ export const incrementallyMaterializeOrder = (
   }
   const issues: Issue[] = [];
   const context = materializationContext(snapshot, materializedNodes, node, issues, run);
+  const stableChanges = child.stableChangedPositions;
+  const sparseChangeLimit = Math.min(64, Math.max(32, child.result.rows.length >>> 3));
+  if (stableChanges !== undefined && stableChanges.length <= sparseChangeLimit) {
+    const transitioned = transitionOrderedRows(
+      previous.order.inputs,
+      child.result.rows,
+      previous.result.rows,
+      stableChanges,
+      (left, right) => compareOrder(left, right, node.by, context)
+    );
+    if (transitioned !== undefined && !context.state.unavailable && issues.length === 0) {
+      const changedOutputPositions = changedRowPositionsIfStableIdentity(transitioned, previous.result.rows);
+      const verifiedUpdatedResultKeys = stableChanges.flatMap((position) => {
+        const before = previous.order?.inputs[position];
+        const after = child.result.rows[position];
+        return before === undefined || after === undefined
+          || queryValueEqual(visibleRow(before) as QueryLogicalValue, visibleRow(after) as QueryLogicalValue)
+          ? []
+          : [resultKey(after)];
+      });
+      return withMaintenanceEvent({
+        result: { rows: changedOutputPositions?.length === 0 ? previous.result.rows : transitioned, completeness: 'exact' },
+        issues: [],
+        unavailable: false,
+        ...(changedOutputPositions === undefined ? {} : { stableChangedPositions: changedOutputPositions }),
+        verifiedUpdatedResultKeys,
+        order: { inputs: child.result.rows }
+      }, { operator: 'order', strategy: 'selective', affectedUnitCount: stableChanges.length });
+    }
+  }
   const nextPositions = new Map(child.result.rows.map((row, index) => [row, index]));
   const previousInputs = new Set(previous.order.inputs);
   const retained = previous.result.rows.filter((row) => nextPositions.has(row));
@@ -655,7 +809,7 @@ export const incrementallyMaterializeOrder = (
   // Repeated array insertion is attractive for sparse changes but quadratic
   // for bulk replacements. A full stable sort is the safer upper bound once
   // the changed set is no longer sparse.
-  if (changed.length > Math.max(32, child.result.rows.length >>> 3)) {
+  if (changed.length > sparseChangeLimit) {
     return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'order', strategy: 'full', affectedUnitCount: changed.length });
   }
   const compare = (left: ScopedRow, right: ScopedRow): number => {
@@ -879,77 +1033,6 @@ const changedOccurrences = (update: QueryMaintenanceUpdate, relation: RelationUs
 
 const singleAliasResultKey = (alias: string, occurrence: string): string => alias.length + ':' + alias + occurrence.length + ':' + occurrence;
 
-const expressionInputsEqual = (expression: Expr, before: ScopedRow, after: ScopedRow): boolean => {
-  if (expression.kind === 'literal' || expression.kind === 'parameter') return true;
-  if (expression.kind === 'field') {
-    const beforeRecord = before.scope[expression.alias];
-    const afterRecord = after.scope[expression.alias];
-    if (beforeRecord === undefined || afterRecord === undefined) return beforeRecord === afterRecord;
-    const beforePresent = Object.hasOwn(beforeRecord, expression.name);
-    if (beforePresent !== Object.hasOwn(afterRecord, expression.name)) return false;
-    return !beforePresent || queryValueEqual(
-      beforeRecord[expression.name] as QueryLogicalValue,
-      afterRecord[expression.name] as QueryLogicalValue
-    );
-  }
-  if (expression.kind === 'key-of' || expression.kind === 'source-of') {
-    const beforeProvenance = before.provenance[expression.alias];
-    const afterProvenance = after.provenance[expression.alias];
-    if (beforeProvenance === undefined || afterProvenance === undefined) return beforeProvenance === afterProvenance;
-    const beforeValue = expression.kind === 'key-of' ? beforeProvenance.key : beforeProvenance.sourceId;
-    const afterValue = expression.kind === 'key-of' ? afterProvenance.key : afterProvenance.sourceId;
-    if (beforeValue === undefined || afterValue === undefined) return beforeValue === afterValue;
-    return queryValueEqual(beforeValue, afterValue);
-  }
-  // Calls and subqueries may observe state beyond their explicit row fields.
-  // They stay on the semantic evaluator path instead of being guessed pure.
-  if (expression.kind === 'call' || expression.kind === 'subquery') return false;
-  if (expression.kind === 'compare' || expression.kind === 'arithmetic') {
-    return expressionInputsEqual(expression.left, before, after)
-      && expressionInputsEqual(expression.right, before, after);
-  }
-  if (expression.kind === 'is-null' || expression.kind === 'is-missing') {
-    return expressionInputsEqual(expression.value, before, after);
-  }
-  if (expression.kind === 'boolean') {
-    if (expression.op === 'not') return expressionInputsEqual(expression.arg, before, after);
-    for (const argument of expression.args) {
-      if (!expressionInputsEqual(argument, before, after)) return false;
-    }
-    return true;
-  }
-  if (expression.kind === 'case') {
-    for (const branch of expression.branches) {
-      if (!expressionInputsEqual(branch.when, before, after)
-        || !expressionInputsEqual(branch.then, before, after)) return false;
-    }
-    return expressionInputsEqual(expression.otherwise, before, after);
-  }
-  if (expression.kind === 'record') {
-    for (const field of Object.values(expression.fields)) {
-      if (!expressionInputsEqual(field, before, after)) return false;
-    }
-    return true;
-  }
-  const expressions = expression.kind === 'array' ? expression.items : expression.args;
-  for (const argument of expressions) {
-    if (!expressionInputsEqual(argument, before, after)) return false;
-  }
-  return true;
-};
-
-const selectProjectionInputsEqual = (
-  node: Extract<QueryNode, { readonly kind: 'select' }>,
-  before: ScopedRow,
-  after: ScopedRow
-): boolean => {
-  if (resultKey(before) !== resultKey(after)) return false;
-  for (const expression of Object.values(node.fields)) {
-    if (!expressionInputsEqual(expression, before, after)) return false;
-  }
-  return true;
-};
-
 export const incrementallyMaterializeLocal = (
   node: Extract<QueryNode, { readonly kind: 'where' | 'select' | 'with-fields' | 'rename' | 'omit' | 'unnest' }>,
   snapshot: QueryMaintenanceSnapshot,
@@ -965,22 +1048,22 @@ export const incrementallyMaterializeLocal = (
   const oneToOne = isOneToOneLocallyMaintainedNode(node);
   if (child.stableChangedPositions !== undefined) {
     if (node.kind === 'select') {
-      let projectionUnchanged = true;
-      for (const index of child.stableChangedPositions) {
-        const before = previous.local.inputs[index];
-        const after = child.result.rows[index];
-        if (before === undefined || after === undefined || !selectProjectionInputsEqual(node, before, after)) {
-          projectionUnchanged = false;
-          break;
-        }
-      }
-      if (projectionUnchanged) {
+      if (selectProjectionDependenciesEqual(
+        node,
+        previous.local.inputs,
+        child.result.rows,
+        child.stableChangedPositions
+      )) {
         return withMaintenanceEvent({
           result: previous.result,
           issues: previous.issues,
           unavailable: previous.unavailable,
           stableChangedPositions: [],
-          local: { ...previous.local, inputs: child.result.rows }
+          // The comparison above proves every projection dependency is equal.
+          // Retaining the older input witness is safe: future comparisons only
+          // inspect those same dependencies, while avoiding one state object
+          // per independent projection in a pooled fanout.
+          local: previous.local
         }, { operator: 'local', strategy: 'selective', affectedUnitCount: 0 });
       }
     }
@@ -1250,8 +1333,9 @@ export const operatorEventForUpdate = (
     if (previous?.order === undefined) return { operator: 'order', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'state_unavailable' };
     if (failed) return { operator: 'order', strategy: 'fallback', affectedUnitCount: child.result.rows.length, reason: 'evaluation_unavailable' };
     const retained = new Set(previous.order.inputs);
+    const nextInputs = new Set(child.result.rows);
     const affected = child.result.rows.reduce((count, row) => count + (retained.has(row) ? 0 : 1), 0);
-    const previousCommon = previous.order.inputs.filter((row) => child.result.rows.includes(row));
+    const previousCommon = previous.order.inputs.filter((row) => nextInputs.has(row));
     const nextCommon = child.result.rows.filter((row) => retained.has(row));
     if (previousCommon.some((row, index) => row !== nextCommon[index])) return { operator: 'order', strategy: 'fallback', affectedUnitCount: affected, reason: 'unstable_layout' };
     return { operator: 'order', strategy: affected > Math.max(32, child.result.rows.length >>> 3) ? 'full' : 'selective', affectedUnitCount: affected };
@@ -1352,6 +1436,7 @@ export const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: M
   if (left.unavailable !== right.unavailable || left.result.completeness !== right.result.completeness) return false;
   if (left.issues.length !== right.issues.length || left.issues.some((issue, index) => issue.id !== right.issues[index]?.id)) return false;
   if (left.result.rows.length !== right.result.rows.length) return false;
+  if (right.verifiedChangedPositions !== undefined) return right.verifiedChangedPositions.length === 0;
   return left.result.rows.every((row, index) => {
     const candidate = right.result.rows[index] as ScopedRow;
     return row === candidate || scopedRowIdentity(row, values) === scopedRowIdentity(candidate, values);
@@ -1393,6 +1478,20 @@ export const diffMaintainedResults = (
   if (nextRoot === undefined || nextRoot.unavailable || nextRoot.result.completeness === 'unknown') return emptyIncrementalQueryResultDelta;
   const beforeRows = previousRoot?.result.rows ?? [];
   const afterRows = nextRoot.result.rows;
+  if (previousRoot !== undefined && nextRoot.verifiedUpdatedResultKeys !== undefined) {
+    return nextRoot.verifiedUpdatedResultKeys.length === 0
+      ? emptyIncrementalQueryResultDelta
+      : { addedResultKeys: [], removedResultKeys: [], updatedResultKeys: nextRoot.verifiedUpdatedResultKeys };
+  }
+  if (previousRoot !== undefined && nextRoot.verifiedChangedPositions !== undefined && beforeRows.length === afterRows.length) {
+    return nextRoot.verifiedChangedPositions.length === 0
+      ? emptyIncrementalQueryResultDelta
+      : {
+        addedResultKeys: [],
+        removedResultKeys: [],
+        updatedResultKeys: nextRoot.verifiedChangedPositions.map((index) => resultKey(afterRows[index] as ScopedRow))
+      };
+  }
   if (previousRoot !== undefined && nextRoot.stableChangedPositions !== undefined && beforeRows.length === afterRows.length) {
     const updatedResultKeys: string[] = [];
     for (const index of nextRoot.stableChangedPositions) {
@@ -1426,13 +1525,12 @@ export const diffMaintainedResults = (
   const added: string[] = [];
   const removed: string[] = [];
   const updated: string[] = [];
-  for (const key of new Set([...previousRows.keys(), ...nextRows.keys()])) {
-    const before = previousRows.get(key);
+  for (const [key, before] of previousRows) {
     const after = nextRows.get(key);
-    if (before === undefined) added.push(key);
-    else if (after === undefined) removed.push(key);
+    if (after === undefined) removed.push(key);
     else if (before !== after) updated.push(key);
   }
+  for (const key of nextRows.keys()) if (!previousRows.has(key)) added.push(key);
   return { addedResultKeys: added.sort(), removedResultKeys: removed.sort(), updatedResultKeys: updated.sort() };
 };
 

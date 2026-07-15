@@ -4,7 +4,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "paths": {
-      "@tarstate/core": ["../core/dist/index.d.ts"]
+      "@tarstate/core": ["../core/dist/root.d.ts"]
     }
   },
   "include": ["src"]

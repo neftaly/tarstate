@@ -27,10 +27,6 @@
       "types": "./dist/artifacts/schema-lens/index.d.ts",
       "import": "./dist/artifacts/schema-lens/index.js"
     },
-    "./artifacts/semantic": {
-      "types": "./dist/artifacts/semantic/index.d.ts",
-      "import": "./dist/artifacts/semantic/index.js"
-    },
     "./artifacts/storage-mapping": {
       "types": "./dist/artifacts/storage-mapping/index.d.ts",
       "import": "./dist/artifacts/storage-mapping/index.js"

@@ -9,7 +9,8 @@ import {
   type OperationLedgerProtocol,
   type OperationReservation
 } from './lifecycle-governance.js';
-import { isSealedStorageProjection, type WritableLogicalRow, type WritableLogicalState } from './logical-edit.js';
+import type { WritableLogicalRow, WritableLogicalState } from './logical-edit.js';
+import { isSealedStorageProjection } from './storage-projection.js';
 import {
   evaluateTransactionExpression,
   evaluateTransactionFields,

@@ -72,7 +72,7 @@ assignArchitectureGroup('foundation', [
 ]);
 assignArchitectureGroup('capability', ['builtins.ts', 'host.ts', 'registry.ts', 'resolver.ts']);
 assignArchitectureGroup('artifact-resolution', ['artifact-resolver.ts']);
-assignArchitectureGroup('source-contract', ['attachment-model.ts', 'logical-edit.ts', 'source-protocol.ts', 'source-state.ts']);
+assignArchitectureGroup('source-contract', ['attachment-model.ts', 'logical-edit.ts', 'source-protocol.ts', 'source-state.ts', 'storage-projection.ts']);
 assignArchitectureGroup('schema', [
   'codec.ts',
   'constraint-artifact.ts',
@@ -94,9 +94,11 @@ assignArchitectureGroup('query-batch', [
   'internal-query-expression.ts',
   'internal-query-graph.ts',
   'internal-query-input-validation.ts',
+  'internal-query-ordering.ts',
   'internal-query-ownership.ts',
   'internal-query-relations.ts',
   'internal-query-values.ts',
+  'internal-query-window-maintenance.ts',
   'query-authoring.ts',
   'query-builder.ts',
   'query-evaluate.ts',
@@ -104,12 +106,14 @@ assignArchitectureGroup('query-batch', [
   'query-prepare.ts'
 ]);
 assignArchitectureGroup('query-incremental', [
+  'internal-query-dependency.ts',
   'internal-query-aggregate-maintenance.ts',
   'internal-query-join-maintenance.ts',
   'internal-query-maintenance-diagnostics.ts',
   'internal-query-maintenance-engine.ts',
   'internal-query-maintenance-model.ts',
   'internal-query-maintenance-transition.ts',
+  'internal-query-pool-publication.ts',
   'maintenance.ts',
   'query-incremental.ts',
   'query-maintenance-diff.ts'
@@ -219,7 +223,6 @@ const publicRuntimePolicies = new Map(Object.entries({
   'artifacts/constraint-set/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'semantic-artifact'],
   'artifacts/storage-mapping/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
   'artifacts/schema-lens/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
-  'artifacts/semantic/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact'],
   'database/observer/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
   'database/incremental/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer', 'observer-incremental'],
   'database/external-store/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],

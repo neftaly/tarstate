@@ -15,10 +15,12 @@ describe('production Automerge surface', () => {
     expect(automerge.planAutomergeMetadataMutation).toBeTypeOf('function');
     expect(automerge.automergeIssueDeclarations.length).toBeGreaterThan(0);
     expect(automerge.projectAutomergeFacts).toBeTypeOf('function');
+    expect(automerge.snapshotAutomergeDocument).toBeTypeOf('function');
+    expect(Object.isFrozen(automerge.defaultAutomergeProjectionBudget)).toBe(true);
   });
 
   it('does not expose legacy names, move metadata, or internal row materializers', () => {
-    for (const name of ['automergeMapAdapter', 'automergeMapSource', 'automergePresenceRuntime', 'useAutomergeStore', 'copyRelocateAutomerge', 'readAutomergeMoveRecords', 'repairAutomergeLiveFork', 'materializeAutomergePeerRow', 'materializeAutomergeConnectionRow', 'materializeAutomergeSyncRow', 'materializeAutomergePresenceRow']) {
+    for (const name of ['automergeMapAdapter', 'automergeMapSource', 'automergePresenceRuntime', 'useAutomergeStore', 'copyRelocateAutomerge', 'readAutomergeMoveRecords', 'repairAutomergeLiveFork', 'materializeAutomergePeerRow', 'materializeAutomergeConnectionRow', 'materializeAutomergeSyncRow', 'materializeAutomergePresenceRow', 'conflictsAt', 'normalizeAutomergeValue', 'planPropertyEdit', 'valueAtAutomergePath']) {
       expect(name in automerge, name).toBe(false);
     }
   });

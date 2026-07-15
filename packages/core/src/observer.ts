@@ -358,6 +358,8 @@ class SharedObservation<Query, Row, Projection> {
       this.#options.runtime.remove(this);
     } finally {
       this.#snapshot = closedSnapshot as ObserverSnapshot<Row>;
+      this.#publishedSnapshot = closedSnapshot as ObserverSnapshot<Row>;
+      this.#stagedChange = undefined;
       for (const lease of Array.from(this.#leases)) lease.closeFromShared();
       this.#leases.clear();
       this.#options.collect();

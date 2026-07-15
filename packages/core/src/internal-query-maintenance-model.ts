@@ -1,6 +1,6 @@
 import type { Issue } from './issues.js';
 import type { EvaluationCache, NodeResult, ScopedRow } from './internal-query-evaluation-context.js';
-import type { WindowMaintenanceLayouts } from './internal-query-evaluator.js';
+import type { WindowMaintenanceLayouts } from './internal-query-window-maintenance.js';
 import type { QueryMaintenanceOperatorEvent } from './internal-query-maintenance-diagnostics.js';
 import type { QueryNode, QueryRecord } from './query-model.js';
 import type { JsonValue } from './value.js';
@@ -45,6 +45,10 @@ export type MaterializedQueryNode = {
   readonly unavailable: boolean;
   readonly maintenanceEvent?: QueryMaintenanceOperatorEvent;
   readonly stableChangedPositions?: readonly number[];
+  /** Stable-identity positions already proven to differ in their public logical value. */
+  readonly verifiedChangedPositions?: readonly number[];
+  /** Exact logical updates when identities are retained but their layout moves. */
+  readonly verifiedUpdatedResultKeys?: readonly string[];
   readonly from?: { readonly inputOffsets: ReadonlyMap<string, number> };
   readonly local?: {
     readonly inputs: readonly ScopedRow[];

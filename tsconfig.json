@@ -12,12 +12,11 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "paths": {
-      "@tarstate/core": ["./packages/core/src/index.ts"],
+      "@tarstate/core": ["./packages/core/src/root.ts"],
       "@tarstate/core/artifacts": ["./packages/core/src/artifacts/index.ts"],
       "@tarstate/core/artifacts/constraint-set": ["./packages/core/src/artifacts/constraint-set/index.ts"],
       "@tarstate/core/artifacts/query": ["./packages/core/src/artifacts/query/index.ts"],
       "@tarstate/core/artifacts/schema-lens": ["./packages/core/src/artifacts/schema-lens/index.ts"],
-      "@tarstate/core/artifacts/semantic": ["./packages/core/src/artifacts/semantic/index.ts"],
       "@tarstate/core/artifacts/storage-mapping": ["./packages/core/src/artifacts/storage-mapping/index.ts"],
       "@tarstate/core/artifacts/transaction": ["./packages/core/src/artifacts/transaction/index.ts"],
       "@tarstate/core/attachment": ["./packages/core/src/attachment/index.ts"],

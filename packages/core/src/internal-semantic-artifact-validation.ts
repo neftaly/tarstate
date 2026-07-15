@@ -17,13 +17,13 @@ export type SemanticArtifactParseBudget = ArtifactParseBudget & {
   readonly maxNames: number;
 };
 
-export const defaultSemanticArtifactParseBudget: SemanticArtifactParseBudget = {
+export const defaultSemanticArtifactParseBudget: SemanticArtifactParseBudget = Object.freeze({
   ...defaultArtifactParseBudget,
   maxSemanticDepth: 128,
   maxSemanticNodes: 100_000,
   maxIssues: 256,
   maxNames: 10_000
-};
+});
 
 export type SemanticArtifactKind =
   | 'query'

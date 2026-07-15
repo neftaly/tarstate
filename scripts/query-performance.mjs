@@ -667,6 +667,7 @@ const ungroupedReducerUpdate10k = measurement('aggregate-reducer-ungrouped-one-r
 const groupedReducerOpen1k = measurement('aggregate-reducer-grouped-open', 1_000)?.millisecondsPerOperation;
 const groupedReducerOpen10k = measurement('aggregate-reducer-grouped-open', 10_000)?.millisecondsPerOperation;
 const windowUpdate10k = measurement('window-one-row-update', 10_000)?.millisecondsPerOperation;
+const windowPure10k = measurement('window-three-fields', 10_000)?.millisecondsPerOperation;
 const partitionedWindowUpdate10k = measurement('window-partitioned-one-row-update', 10_000)?.millisecondsPerOperation;
 const partitionedWindowPure10k = measurement('window-partitioned-prepared-pure', 10_000)?.millisecondsPerOperation;
 const joinPreparedPure10k = measurement('equijoin-prepared-pure', 10_000)?.millisecondsPerOperation;
@@ -699,7 +700,8 @@ const contracts = {
   // The duplicate never represents its key, so a correct sparse update can
   // retain the entire 10k-row result. Full Map cloning and representative
   // sorting alone sampled above 3.5 MB/update in the rejected implementation.
-  highCardinalityDistinctAllocationCeiling: highCardinalityDistinctBytesPerUpdate <= 1_500_000,
+  highCardinalityDistinctAllocationCeiling: highCardinalityDistinctBytesPerUpdate <= 750_000,
+  globalWindowIncrementalAdvantage: windowPure10k !== undefined && windowUpdate10k !== undefined && windowUpdate10k < windowPure10k * 0.5,
   partitionedWindowAdvantage: windowUpdate10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < windowUpdate10k * 0.5,
   partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
   rightJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinRightUpdate10k !== undefined && joinRightUpdate10k < joinPreparedPure10k * 0.5,
@@ -711,6 +713,7 @@ const contracts = {
   preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
   preparedExpressionAdvantage: repeatedUnpreparedExpression !== undefined && repeatedPreparedExpression !== undefined && repeatedPreparedExpression < repeatedUnpreparedExpression * 0.75,
   unrelatedTraversalSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'unrelated-relation-union-dag').every(({ selectiveVisitedPhysicalNodeCount }) => selectiveVisitedPhysicalNodeCount <= 2),
+  pooledIgnoredFieldSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'cloned-root-fanout').every(({ afterUpdate }) => afterUpdate.lastUpdatedPhysicalNodeCount <= 2),
   pooledIgnoredFanoutScaling: pooledFanout10 !== undefined && pooledFanout100 !== undefined && pooledFanout100 < pooledFanout10 * 8,
   privateAllocationCeiling: privateBytesPerUpdate <= 2_000_000,
   pooledAllocationCeiling: pooledBytesPerUpdate <= 4_000_000

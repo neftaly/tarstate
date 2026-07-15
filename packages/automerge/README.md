@@ -5,6 +5,10 @@ The Automerge source and storage bindings for Tarstate v1.
 This package depends on `@tarstate/core` and reports adapter-specific
 projection and conflict guarantees through portable receipts and capabilities.
 
+The package root exposes the supported source, binding, metadata, projection,
+and system-relation APIs. Low-level Automerge value adoption is also available
+without loading the adapter runtime from `@tarstate/automerge/values`.
+
 Install both Tarstate tarballs and the Automerge package imported by application
 code:
 

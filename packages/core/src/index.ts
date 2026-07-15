@@ -1,3 +1,4 @@
+/** Test-only broad source barrel. The package root is `root.ts`. */
 export * from './artifacts.js';
 export * from './artifact-resolver.js';
 export * from './attachment-model.js';
@@ -44,8 +45,8 @@ export type {
   IncrementalQueryResultDelta,
   OrderTerm,
   OwnedQueryMaintenanceSnapshot,
-  PreparedQueryRequest,
   PreparedExpression,
+  PreparedQueryRequest,
   QueryCursor,
   QueryExecutionBudget,
   QueryFunction,
@@ -53,10 +54,10 @@ export type {
   QueryMaintenanceFallbackReason,
   QueryMaintenanceOperator,
   QueryMaintenanceOperatorDiagnostics,
-  QueryOperatorMaintenanceDiagnostics,
   QueryMaintenanceSnapshot,
   QueryMaintenanceUpdate,
   QueryNode,
+  QueryOperatorMaintenanceDiagnostics,
   QueryRecord,
   QueryRequest,
   QueryResult,

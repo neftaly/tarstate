@@ -1,13 +1,19 @@
 import { canonicalizeJson, issueCatalog, type Issue, type IssueDeclaration, type IssueRetry, type JsonValue, type ParseResult } from '@tarstate/core/foundation';
 
-export const schemaToolsIssueDeclarations: readonly IssueDeclaration[] = [
-  { code: 'schema_tools.artifact_kind', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.database_description_hash_mismatch', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.database_description_invalid', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.database_description_unavailable', phase: 'resolve', severity: 'error', retries: ['after_authority', 'after_refresh'] },
-  { code: 'schema_tools.issue_catalog_hash_mismatch', phase: 'parse', severity: 'error', retries: ['after_input'] },
-  { code: 'schema_tools.issue_catalog_invalid', phase: 'parse', severity: 'error', retries: ['after_input'] }
-];
+const declaration = (
+  code: string,
+  phase: IssueDeclaration['phase'],
+  retries: IssueDeclaration['retries']
+): IssueDeclaration => Object.freeze({ code, phase, severity: 'error', retries: Object.freeze([...retries]) });
+
+export const schemaToolsIssueDeclarations: readonly IssueDeclaration[] = Object.freeze([
+  declaration('schema_tools.artifact_kind', 'parse', ['after_input']),
+  declaration('schema_tools.database_description_hash_mismatch', 'parse', ['after_input']),
+  declaration('schema_tools.database_description_invalid', 'parse', ['after_input']),
+  declaration('schema_tools.database_description_unavailable', 'resolve', ['after_authority', 'after_refresh']),
+  declaration('schema_tools.issue_catalog_hash_mismatch', 'parse', ['after_input']),
+  declaration('schema_tools.issue_catalog_invalid', 'parse', ['after_input'])
+]);
 
 const declarations = new Map([...issueCatalog, ...schemaToolsIssueDeclarations.map((declaration) => [declaration.code, declaration] as const)]);
 

@@ -1,4 +1,5 @@
-import type { QueryArtifact, SourceLifecycleCoordinator } from '../packages/core/dist/index.js';
+import type { QueryArtifact } from '../packages/core/dist/query/authoring/index.js';
+import type { SourceLifecycleCoordinator } from '../packages/core/dist/transactions/index.js';
 import type { Artifact as TopicArtifact } from '../packages/core/dist/artifacts/index.js';
 import type { DatabaseView as TopicDatabaseView } from '../packages/core/dist/database/index.js';
 import type { ObserverDiagnosticReporter as TopicObserverDiagnosticReporter } from '../packages/core/dist/database/index.js';

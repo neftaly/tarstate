@@ -50,6 +50,14 @@ Schema, query, and transaction authoring are separate implementations behind
 their topic entries, so query authoring does not load schema or transaction
 authoring code.
 
+Source and transaction adapters also have narrow construction seams:
+
+| Entry point | Responsibility |
+| --- | --- |
+| `@tarstate/core/source/projection` | Validates and seals binding-owned immutable writable projections once for reuse |
+| `@tarstate/core/transactions/authoring` | Portable transaction and exact-delta construction without execution |
+| `@tarstate/core/transactions/delta` | Exact keyed relation-delta construction only |
+
 Artifact semantics and attachment preparation also have opt-in execution seams:
 
 | Entry point | Responsibility |
@@ -59,7 +67,6 @@ Artifact semantics and attachment preparation also have opt-in execution seams:
 | `@tarstate/core/artifacts/constraint-set` | Constraint-set parsing and compilation |
 | `@tarstate/core/artifacts/storage-mapping` | Storage-mapping parsing and compilation |
 | `@tarstate/core/artifacts/schema-lens` | Schema-lens parsing and validation |
-| `@tarstate/core/artifacts/semantic` | Eager compatibility facade for all semantic artifact kinds |
 | `@tarstate/core/attachment/prepare` | Attachment resolution, schema/mapping preparation, and constraint composition |
 
 The portable `artifacts` entry never imports query evaluation, mapping, lens,

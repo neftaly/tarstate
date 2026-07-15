@@ -29,12 +29,12 @@ export type ValueParseBudget = {
   readonly maxTotalMembers: number;
 };
 
-export const defaultValueParseBudget: ValueParseBudget = {
+export const defaultValueParseBudget: ValueParseBudget = Object.freeze({
   maxDepth: 64,
   maxArrayMembers: 100_000,
   maxObjectMembers: 100_000,
   maxTotalMembers: 500_000
-};
+});
 
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
 const inspectionFailure = Symbol('inspectionFailure');

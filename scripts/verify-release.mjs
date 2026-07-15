@@ -4,10 +4,14 @@ import { builtinModules } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { automergePublicEntryNames, corePublicEntryNames } from '../vite.shared.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageDirectories = ['core', 'automerge', 'zustand', 'react', 'schema-tools'];
-const coreSubpaths = ['artifacts', 'artifacts/constraint-set', 'artifacts/query', 'artifacts/schema-lens', 'artifacts/semantic', 'artifacts/storage-mapping', 'artifacts/transaction', 'attachment', 'attachment/prepare', 'capabilities', 'database', 'database/external-store', 'database/incremental', 'database/observer', 'foundation', 'query', 'query/authoring', 'query/evaluate', 'query/incremental', 'query/model', 'query/prepare', 'schema', 'source', 'transactions'];
+const publicSubpaths = new Map([
+  ['@tarstate/core', corePublicEntryNames],
+  ['@tarstate/automerge', automergePublicEntryNames]
+]);
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-release-'));
 const releaseVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
 if (typeof releaseVersion !== 'string' || releaseVersion.length === 0) throw new Error('Root package version must be a non-empty string');
@@ -22,21 +26,8 @@ try {
     const manifest = JSON.parse(readFileSync(path.join(packageDirectory, 'package.json'), 'utf8'));
     if (manifest.version !== releaseVersion) fail(`${manifest.name}: expected version ${releaseVersion}`);
     if (manifest.private === true) fail(`${manifest.name}: package remains private`);
-    const expectedExports = manifest.name === '@tarstate/core' ? ['.', ...coreSubpaths.map((name) => './' + name)] : ['.'];
-    if (JSON.stringify(Object.keys(manifest.exports ?? {}).sort()) !== JSON.stringify(expectedExports.sort())) {
-      fail(`${manifest.name}: unexpected public exports`);
-    }
-    if (manifest.exports?.['.']?.types !== './dist/index.d.ts' || manifest.exports?.['.']?.import !== './dist/index.js') {
-      fail(`${manifest.name}: exports do not resolve to dist`);
-    }
-    if (manifest.name === '@tarstate/core') {
-      for (const subpath of coreSubpaths) {
-        const exported = manifest.exports?.['./' + subpath];
-        if (exported?.types !== `./dist/${subpath}/index.d.ts` || exported?.import !== `./dist/${subpath}/index.js`) {
-          fail(`${manifest.name}: ${subpath} export does not resolve to dist`);
-        }
-      }
-    }
+    const surfaceIssue = packageSurfaceIssues(manifest)[0];
+    if (surfaceIssue !== undefined) fail(surfaceIssue);
 
     const destination = path.join(temporaryDirectory, directory);
     mkdirSync(destination);
@@ -45,7 +36,7 @@ try {
     if (tarballs.length !== 1) fail(`${manifest.name}: expected one packed tarball`);
     const tarball = path.join(destination, tarballs[0]);
     const entries = execFileSync('tar', ['-tzf', tarball], { encoding: 'utf8' }).trim().split('\n');
-    for (const required of ['package/package.json', 'package/README.md', 'package/LICENSE', 'package/dist/index.js', 'package/dist/index.d.ts']) {
+    for (const required of ['package/package.json', 'package/README.md', 'package/LICENSE']) {
       if (!entries.includes(required)) fail(`${manifest.name}: tarball is missing ${required}`);
     }
     for (const exported of Object.values(manifest.exports ?? {})) {
@@ -83,6 +74,27 @@ try {
 
 function internalRangeIncludesRelease(range) {
   return range === releaseVersion || range === `^${releaseVersion}` || range === `~${releaseVersion}`;
+}
+
+/** Pure package-manifest validation; packing and installation remain in the shell above. */
+function packageSurfaceIssues(manifest) {
+  const issues = [];
+  const expectedSubpaths = publicSubpaths.get(manifest.name) ?? [];
+  const expectedExports = ['.', ...expectedSubpaths.map((name) => './' + name)].sort();
+  if (JSON.stringify(Object.keys(manifest.exports ?? {}).sort()) !== JSON.stringify(expectedExports)) {
+    issues.push(`${manifest.name}: unexpected public exports`);
+  }
+  const expectedRootTypes = manifest.name === '@tarstate/core' ? './dist/root.d.ts' : './dist/index.d.ts';
+  if (manifest.exports?.['.']?.types !== expectedRootTypes || manifest.exports?.['.']?.import !== './dist/index.js') {
+    issues.push(`${manifest.name}: root export does not resolve to dist`);
+  }
+  for (const subpath of expectedSubpaths) {
+    const exported = manifest.exports?.['./' + subpath];
+    if (exported?.types !== `./dist/${subpath}/index.d.ts` || exported?.import !== `./dist/${subpath}/index.js`) {
+      issues.push(`${manifest.name}: ${subpath} export does not resolve to dist`);
+    }
+  }
+  return issues;
 }
 
 function verifyRuntimeDependencyDeclarations(manifest, tarball, entries) {
@@ -147,6 +159,8 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
   execFileSync('tar', ['-xzf', tarball, '-C', consumerDirectory]);
 
   const producer = await import(pathToFileURL(path.join(producerDirectory, 'package/dist/index.js')).href);
+  const queryProducer = await import(pathToFileURL(path.join(producerDirectory, 'package/dist/query/index.js')).href);
+  const schemaProducer = await import(pathToFileURL(path.join(producerDirectory, 'package/dist/schema/index.js')).href);
   const queryConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/query/index.js')).href);
   const schemaConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/schema/index.js')).href);
   const foundationConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/foundation/index.js')).href);
@@ -157,12 +171,12 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
     }
   }
 
-  const preparedExpression = producer.prepareExpression({ kind: 'literal', value: 7 });
+  const preparedExpression = queryProducer.prepareExpression({ kind: 'literal', value: 7 });
   if (queryConsumer.evaluatePreparedExpression(preparedExpression, {}) !== 7) {
     fail('@tarstate/core: packed query entry rejected root-entry prepared expression');
   }
 
-  const plan = await producer.prepareQuery({
+  const plan = await queryProducer.prepareQuery({
     root: { kind: 'values', alias: 'value', rows: [{ id: 1 }] },
     registryFingerprint: 'registry:packed-cross-entry',
     authorityFingerprint: 'authority:packed-cross-entry',
@@ -180,10 +194,10 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
     authorityFingerprint: 'authority:packed-cross-entry',
     datasetId: 'dataset:packed-cross-entry'
   });
-  const reverseSession = producer.openIncrementalQueryMaintenance(subpathPlan, { relations: [] });
+  const reverseSession = queryProducer.openIncrementalQueryMaintenance(subpathPlan, { relations: [] });
   if (reverseSession.getCurrentResult().rows[0]?.id !== 2) fail('@tarstate/core: packed root entry rejected query-entry prepared plan');
   reverseSession.close();
-  if (producer.evaluatePreparedQuery(subpathPlan, { relations: [] }).rows[0]?.id !== 2) {
+  if (queryProducer.evaluatePreparedQuery(subpathPlan, { relations: [] }).rows[0]?.id !== 2) {
     fail('@tarstate/core: packed root entry rejected query-entry plan for prepared evaluation');
   }
   try {
@@ -193,7 +207,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
     if (!(error instanceof TypeError)) throw error;
   }
 
-  const prepared = producer.prepareSchema({
+  const prepared = schemaProducer.prepareSchema({
     relations: {
       values: { relationId: 'test.value', key: ['id'], fields: { id: { type: { kind: 'number' } } } }
     }
@@ -204,7 +218,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
 
   const hash = (character) => `sha256:${character.repeat(64)}`;
   const schemaRef = { id: 'urn:test:schema:packed-cross-entry', contentHash: hash('1') };
-  const mapping = producer.compileStorageMapping({
+  const mapping = schemaProducer.compileStorageMapping({
     schema: schemaRef,
     model: 'json-tree-v1',
     relations: {
@@ -220,7 +234,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
     fail('@tarstate/core: packed schema entry rejected root-entry compiled mapping');
   }
 
-  const lens = producer.validateLens({
+  const lens = schemaProducer.validateLens({
     from: { id: 'urn:test:schema:from', contentHash: hash('2') },
     to: { id: 'urn:test:schema:to', contentHash: hash('3') },
     relations: [{
@@ -239,7 +253,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
       reverse: { relationId: 'test.reverse', key: ['id'], fields: { id: { type: { kind: 'number' } } } }
     }
   });
-  if (!subpathPrepared.success || !producer.parseRelationCandidate(subpathPrepared.value, 'test.reverse', { id: 2 }).success) {
+  if (!subpathPrepared.success || !schemaProducer.parseRelationCandidate(subpathPrepared.value, 'test.reverse', { id: 2 }).success) {
     fail('@tarstate/core: packed root entry rejected schema-entry prepared schema');
   }
   const subpathMapping = schemaConsumer.compileStorageMapping({
@@ -253,7 +267,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
       }
     }
   }, schemaRef, subpathPrepared.value);
-  if (!subpathMapping.success || producer.projectStorage(subpathMapping.value, { reverse: [{ id: 2 }] }).relations.get('test.reverse')?.rows.length !== 1) {
+  if (!subpathMapping.success || schemaProducer.projectStorage(subpathMapping.value, { reverse: [{ id: 2 }] }).relations.get('test.reverse')?.rows.length !== 1) {
     fail('@tarstate/core: packed root entry rejected schema-entry compiled mapping');
   }
   const subpathLens = schemaConsumer.validateLens({
@@ -265,7 +279,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
       steps: [{ kind: 'lens.field', from: 'id', to: 'id', write: 'invertible' }]
     }]
   });
-  if (!subpathLens.success || producer.projectLensRelation(subpathLens.value, 'test.reverse-view', { 'test.reverse': [{ id: 2 }] }).rows[0]?.id !== 2) {
+  if (!subpathLens.success || schemaProducer.projectLensRelation(subpathLens.value, 'test.reverse-view', { 'test.reverse': [{ id: 2 }] }).rows[0]?.id !== 2) {
     fail('@tarstate/core: packed root entry rejected schema-entry validated lens');
   }
 }

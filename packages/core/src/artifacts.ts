@@ -4,7 +4,7 @@ import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned
 import { stringTupleKey } from './internal-string-key.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
 
-export const artifactKinds = ['schema', 'query', 'transaction', 'constraint-set', 'storage-mapping', 'schema-lens', 'issue-code-catalog'] as const;
+export const artifactKinds = Object.freeze(['schema', 'query', 'transaction', 'constraint-set', 'storage-mapping', 'schema-lens', 'issue-code-catalog'] as const);
 export type ArtifactKind = typeof artifactKinds[number];
 export type ContentHash = `sha256:${string}`;
 
@@ -28,11 +28,11 @@ export type ArtifactParseBudget = ValueParseBudget & {
   readonly maxDependencies: number;
 };
 
-export const defaultArtifactParseBudget: ArtifactParseBudget = {
+export const defaultArtifactParseBudget: ArtifactParseBudget = Object.freeze({
   ...defaultValueParseBudget,
   maxBytes: 8 * 1024 * 1024,
   maxDependencies: 10_000
-};
+});
 
 const hashPattern = /^sha256:[0-9a-f]{64}$/;
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);

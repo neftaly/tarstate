@@ -164,6 +164,9 @@ const openPooledDatabaseMaintenance = (options: {
     if (options.cohort.roots !== 0) return;
     options.cohort.runtime.close();
     if (options.cohorts.get(options.cohort.key) === options.cohort) options.cohorts.delete(options.cohort.key);
+    options.cohort.accepted = closedQueryMaintenanceSnapshot;
+    delete options.cohort.lastRejected;
+    delete options.cohort.transitionFailure;
   };
 
   return {
@@ -226,6 +229,7 @@ const openPooledDatabaseMaintenance = (options: {
       closed = true;
       privateSession?.close();
       detach();
+      localAccepted = closedQueryMaintenanceSnapshot;
     }
   };
 };
@@ -272,9 +276,16 @@ const openPrivateDatabaseMaintenance = (
       if (result.state.rejectedUpdateCount === rejectedBefore) accepted = next;
       return databaseResultFromMaintained(result, trustOwner);
     },
-    close: () => session.close()
+    close: () => {
+      session.close();
+      accepted = closedQueryMaintenanceSnapshot;
+    }
   };
 };
+
+const closedQueryMaintenanceSnapshot: QueryMaintenanceSnapshot = Object.freeze({
+  relations: Object.freeze([])
+});
 
 const databaseResultFromMaintained = ({ state, rows, resultKeys, completeness, issues }: IncrementalQueryResult, owner: object): MaintainedDatabaseQueryResult<QueryRecord> => {
   const result = Object.freeze({ rows, resultKeys, completeness, issues });

@@ -2,4 +2,12 @@
 export * from '../../database.js';
 export * from '../../observer.js';
 export type { ObserverDiagnostic, ObserverDiagnosticReporter } from '../../observer-diagnostics.js';
-export type * from '../../observer-maintenance-contracts.js';
+export type {
+  AvailableQueryAttachment,
+  CreateDatabaseQueryMaintenance,
+  DatabaseQueryMaintenanceInput,
+  DatabaseQueryMaintenanceSession,
+  MaintainedDatabaseQueryResult,
+  QueryMaintenanceDiagnostics,
+  QueryMaintenanceReuseDiagnostics
+} from '../../observer-maintenance-contracts.js';

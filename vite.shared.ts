@@ -9,7 +9,6 @@ export const corePublicEntryNames = [
   'artifacts/constraint-set',
   'artifacts/query',
   'artifacts/schema-lens',
-  'artifacts/semantic',
   'artifacts/storage-mapping',
   'artifacts/transaction',
   'attachment',
@@ -33,6 +32,9 @@ export const corePublicEntryNames = [
   'transactions/authoring',
   'transactions/delta'
 ] as const;
+
+/** Narrow public Automerge entries in addition to the package root. */
+export const automergePublicEntryNames = ['values'] as const;
 
 const sourceAlias = (repoRoot: string, find: string, replacement: string) => ({
   find,

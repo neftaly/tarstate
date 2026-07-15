@@ -1,3 +1,2 @@
-/** Pure query preparation and batch evaluation. */
+/** Pure batch query and expression evaluation. */
 export * from '../../query-evaluate.js';
-export * from '../../query-plan.js';

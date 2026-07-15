@@ -55,10 +55,10 @@ export type AutomergeProjectionBudget = {
   readonly maxProperties: number;
 };
 
-export const defaultAutomergeProjectionBudget: AutomergeProjectionBudget = {
+export const defaultAutomergeProjectionBudget: AutomergeProjectionBudget = Object.freeze({
   maxObjects: 100_000,
   maxProperties: 1_000_000
-};
+});
 
 /** Projects Automerge-specific storage details into deterministic diagnostic facts. */
 export const projectAutomergeFacts = <T extends object>(
@@ -78,71 +78,72 @@ export const projectAutomergeFacts = <T extends object>(
     if (typeof objectId !== 'string' || visited.has(objectId)) return;
     if (objects.length >= budget.maxObjects) {
       incomplete = true;
-      issues.push({ code: 'automerge.projection_budget_exceeded', path, details: { budget: 'maxObjects', limit: budget.maxObjects } });
+      issues.push(Object.freeze({ code: 'automerge.projection_budget_exceeded', path, details: Object.freeze({ budget: 'maxObjects', limit: budget.maxObjects }) }));
       return;
     }
     visited.add(objectId);
-    objects.push({ kind: 'automerge.object', objectId, path: [...path], objectKind: Array.isArray(value) ? 'list' : 'map' });
+    objects.push(Object.freeze({ kind: 'automerge.object', objectId, path, objectKind: Array.isArray(value) ? 'list' : 'map' }));
     for (const [rawProperty, child] of Object.entries(value)) {
       const property = Array.isArray(value) ? Number(rawProperty) : rawProperty;
       if (path.length === 0 && typeof property === 'string' && isAutomergeReservedRootProperty(property)) continue;
+      const childPath = Object.freeze([...path, property]);
       if (properties.length >= budget.maxProperties) {
         incomplete = true;
-        issues.push({ code: 'automerge.projection_budget_exceeded', path: [...path, property], details: { budget: 'maxProperties', limit: budget.maxProperties } });
+        issues.push(Object.freeze({ code: 'automerge.projection_budget_exceeded', path: childPath, details: Object.freeze({ budget: 'maxProperties', limit: budget.maxProperties }) }));
         return;
       }
       const childObjectId = objectIdOf(child);
-      properties.push({
+      properties.push(Object.freeze({
         kind: 'automerge.property',
         ownerObjectId: objectId,
-        path: [...path, property],
+        path: childPath,
         property,
         value: normalizeAutomergeValue(child),
         ...(childObjectId === undefined ? {} : { childObjectId })
-      });
+      }));
       const alternatives = Array.isArray(value) ? [] : conflictsAt(value, property);
       if (alternatives.length > 1) {
-        conflicts.push({
+        conflicts.push(Object.freeze({
           kind: 'automerge.conflict',
           ownerObjectId: objectId,
-          path: [...path, property],
+          path: childPath,
           property,
-          alternatives: alternatives.map(([changeHash, candidate]) => {
+          alternatives: Object.freeze(alternatives.map(([changeHash, candidate]) => {
             const candidateObjectId = objectIdOf(candidate);
-            return {
+            return Object.freeze({
               changeHash,
               value: normalizeAutomergeValue(candidate),
               ...(candidateObjectId === undefined ? {} : { childObjectId: candidateObjectId })
-            };
-          })
-        });
+            });
+          }))
+        }));
       }
-      visit(child, [...path, property]);
+      visit(child, childPath);
     }
   };
 
-  visit(doc, []);
-  return {
+  visit(doc, Object.freeze([]));
+  return Object.freeze({
     basis: automergeBasis(doc),
     completeness: incomplete ? 'unknown' : 'exact',
-    objects,
-    properties,
-    conflicts,
-    issues
-  };
+    objects: Object.freeze(objects),
+    properties: Object.freeze(properties),
+    conflicts: Object.freeze(conflicts),
+    issues: Object.freeze(issues)
+  });
 };
 
 export const normalizeAutomergeValue = (value: unknown): AutomergeFactValue => {
-  if (Automerge.isCounter(value)) return { '@type': 'automerge-counter', value: Number(value) };
-  if (value instanceof Date) return { '@type': 'date', value: value.toISOString() };
-  if (value instanceof Uint8Array) return { '@type': 'bytes', value: [...value] };
+  if (Automerge.isCounter(value)) return Object.freeze({ '@type': 'automerge-counter', value: Number(value) });
+  if (value instanceof Date) return Object.freeze({ '@type': 'date', value: value.toISOString() });
+  if (value instanceof Uint8Array) return Object.freeze({ '@type': 'bytes', value: Object.freeze([...value]) });
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : { '@type': 'unsupported-number' };
-  if (Array.isArray(value)) return value.map(normalizeAutomergeValue);
+  if (typeof value === 'number') return Number.isFinite(value) ? value : Object.freeze({ '@type': 'unsupported-number' });
+  if (Array.isArray(value)) return Object.freeze(value.map(normalizeAutomergeValue));
   if (isRecord(value)) {
-    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, normalizeAutomergeValue(child)]));
+    return Object.freeze(Object.fromEntries(Object.entries(value).map(([key, child]) => [key, normalizeAutomergeValue(child)])));
   }
-  return { '@type': 'unsupported', jsType: typeof value };
+  return Object.freeze({ '@type': 'unsupported', jsType: typeof value });
 };
 
 export const conflictsAt = (owner: object, property: string | number): readonly (readonly [string, unknown])[] => {

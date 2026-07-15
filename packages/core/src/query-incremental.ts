@@ -9,6 +9,7 @@ import {
 } from './internal-query-ownership.js';
 import { createEvaluationRun, type ScopedRow } from './internal-query-evaluation-context.js';
 import { sameExecutionBudget, sameFunctionRegistry, sameOptionalJson } from './internal-query-equality.js';
+import { selectCanRetainMaterialization } from './internal-query-dependency.js';
 import {
   assertPoolableQuery,
   compileQueryGraph,
@@ -21,6 +22,7 @@ import {
   summarizeOperatorEvents,
   type QueryMaintenanceOperatorEvent
 } from './internal-query-maintenance-diagnostics.js';
+import { summarizePooledRootMaintenance } from './internal-query-pool-publication.js';
 import type { MaterializedQueryNode } from './internal-query-maintenance-model.js';
 import {
   diffMaintainedResults,
@@ -56,6 +58,10 @@ import type {
 export type * from './query-model.js';
 export type * from './query-incremental-model.js';
 export { diffQueryMaintenanceSnapshots };
+
+const closedMaintenanceSnapshot: QueryMaintenanceSnapshot = Object.freeze({
+  relations: Object.freeze([])
+});
 
 /**
  * Opens the production stateful query-maintenance path. The pure
@@ -97,6 +103,9 @@ export const openIncrementalQueryMaintenance = (
     if (closed) return;
     closed = true;
     materialized.clear();
+    acceptedSnapshot = closedMaintenanceSnapshot;
+    assertedRoot = undefined;
+    valueIdentities = new WeakMap();
   };
 
   return {
@@ -138,6 +147,10 @@ export const openIncrementalQueryMaintenance = (
           const externalInputChanged = [...externalDependencies].some((key) => changedRelations.has(key));
           const evidenceInputChanged = sessionEvidenceChanged && graph.sessionEvidenceDependencies.get(node) === true;
           if (!evidenceInputChanged && !childChanged && !externalInputChanged) continue;
+          if (!evidenceInputChanged && !externalInputChanged && node.kind === 'select') {
+            const child = materialized.get(node.input);
+            if (child !== undefined && selectCanRetainMaterialization(node, materialized.get(node), child)) continue;
+          }
           const previousNode = materialized.get(node);
           const updated = materializeUpdatedQueryNode({
             node,
@@ -211,21 +224,46 @@ type PooledPhysicalNode = {
   readonly sessionEvidenceDependency: boolean;
   orderIndex: number;
   readonly owners: Set<PooledRootState>;
+  readonly rootOwners: Set<PooledRootState>;
 };
-
 
 type PooledRootState = {
   readonly root: QueryNode;
-  readonly reachable: ReadonlySet<QueryNode>;
+  readonly reachable: Set<QueryNode>;
   current: IncrementalQueryResult;
-  asserted: MaterializedQueryNode | undefined;
+  currentIsAssertion: boolean;
+  publishedRevision: number;
   closed: boolean;
 };
 
 type PooledUpdateJournal = {
   readonly materialized: Map<QueryNode, MaterializedQueryNode | undefined>;
-  readonly roots: Map<PooledRootState, { readonly current: IncrementalQueryResult; readonly asserted: MaterializedQueryNode | undefined }>;
+  readonly roots: Map<PooledRootState, {
+    readonly current: IncrementalQueryResult;
+    readonly currentIsAssertion: boolean;
+    readonly publishedRevision: number;
+  }>;
 };
+
+type PooledTransitionEvidence = {
+  readonly rejected: boolean;
+  readonly assertionWasInvalidated: boolean;
+  readonly changedRelationIds: readonly string[];
+  readonly updatedNodes: ReadonlySet<QueryNode>;
+  readonly changedNodes: ReadonlySet<QueryNode>;
+  readonly previousRootNodes: ReadonlyMap<QueryNode, MaterializedQueryNode | undefined>;
+  readonly operatorEvents: ReadonlyMap<QueryNode, QueryMaintenanceOperatorEvent>;
+};
+
+const emptyPooledTransitionEvidence = (rejected: boolean): PooledTransitionEvidence => ({
+  rejected,
+  assertionWasInvalidated: false,
+  changedRelationIds: Object.freeze([]),
+  updatedNodes: new Set(),
+  changedNodes: new Set(),
+  previousRootNodes: new Map(),
+  operatorEvents: new Map()
+});
 
 /** Creates an explicitly scoped multi-root physical runtime. */
 export const createPooledIncrementalQueryRuntime = (input: {
@@ -270,6 +308,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
   let closeRequested = false;
   const deferredReleases = new Set<PooledRootState>();
   let diagnostics = pooledDiagnostics(environment.runtimeIdentity, 0, 0, 0, 0, 0, 0, 0, 0);
+  let assertionInvalidated = runtimeIssues.length > 0;
+  let transitionEvidence = emptyPooledTransitionEvidence(runtimeIssues.length > 0);
 
   const refreshDiagnostics = (updated: number, changed: number, collected: number, operatorDiagnostics = emptyOperatorDiagnostics()): void => {
     diagnostics = pooledDiagnostics(
@@ -328,11 +368,15 @@ export const createPooledIncrementalQueryRuntime = (input: {
       if (record === undefined) continue;
       const ownerCount = record.owners.size;
       if (!record.owners.delete(root)) continue;
+      record.rootOwners.delete(root);
       if (ownerCount === 2) sharedPhysicalNodeCount -= 1;
       if (record.owners.size !== 0) continue;
       removePhysicalNode(node, record);
       collected += 1;
     }
+    root.reachable.clear();
+    root.currentIsAssertion = false;
+    if (roots.size === 0) transitionEvidence = emptyPooledTransitionEvidence(runtimeIssues.length > 0);
     if (!closed) compactPhysicalOrderIfNeeded();
     refreshDiagnostics(0, 0, collected);
   };
@@ -362,6 +406,11 @@ export const createPooledIncrementalQueryRuntime = (input: {
     unmaterializedNodes.clear();
     sharedPhysicalNodeCount = 0;
     materialized.clear();
+    acceptedSnapshot = closedMaintenanceSnapshot;
+    runtimeIssues = [];
+    transitionEvidence = emptyPooledTransitionEvidence(false);
+    assertionInvalidated = false;
+    valueIdentities = new WeakMap();
     refreshDiagnostics(0, 0, collected);
   };
 
@@ -372,6 +421,66 @@ export const createPooledIncrementalQueryRuntime = (input: {
     }
     for (const root of Array.from(deferredReleases)) releaseNow(root);
     deferredReleases.clear();
+  };
+
+  const rememberRootPublication = (root: PooledRootState, journal?: PooledUpdateJournal): void => {
+    if (journal === undefined || journal.roots.has(root)) return;
+    journal.roots.set(root, {
+      current: root.current,
+      currentIsAssertion: root.currentIsAssertion,
+      publishedRevision: root.publishedRevision
+    });
+  };
+
+  const publishRoot = (root: PooledRootState, journal?: PooledUpdateJournal): IncrementalQueryResult => {
+    if (root.closed) return root.current;
+    if (root.publishedRevision === revision) return root.current;
+    rememberRootPublication(root, journal);
+    if (transitionEvidence.rejected) {
+      root.current = maintainedQueryResult(
+        undefined,
+        runtimeIssues,
+        maintenanceState(root.reachable.size, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount),
+        publicRows
+      );
+      root.currentIsAssertion = false;
+      root.publishedRevision = revision;
+      return root.current;
+    }
+
+    const nextRoot = materialized.get(root.root);
+    const rootChanged = transitionEvidence.changedNodes.has(root.root);
+    const summary = summarizePooledRootMaintenance(
+      root.reachable,
+      transitionEvidence.updatedNodes,
+      transitionEvidence.changedNodes,
+      transitionEvidence.operatorEvents
+    );
+    const previousRoot = transitionEvidence.assertionWasInvalidated
+      ? undefined
+      : rootChanged ? transitionEvidence.previousRootNodes.get(root.root) : nextRoot;
+    root.current = maintainedQueryResult(
+      nextRoot,
+      [],
+      maintenanceState(
+        root.reachable.size,
+        summary.updatedNodeCount,
+        summary.changedNodeCount,
+        transitionEvidence.changedRelationIds,
+        rootChanged || transitionEvidence.assertionWasInvalidated
+          ? diffMaintainedResults(previousRoot, nextRoot, valueIdentities)
+          : emptyIncrementalQueryResultDelta,
+        revision,
+        rejectedUpdateCount,
+        summary.operatorDiagnostics
+      ),
+      publicRows,
+      root.current,
+      root.currentIsAssertion && !rootChanged
+    );
+    root.currentIsAssertion = true;
+    root.publishedRevision = revision;
+    return root.current;
   };
 
   const attachNow = (plan: PreparedPlan<QueryNode>): PooledIncrementalQueryRoot => {
@@ -406,7 +515,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
           maintenanceState(reachable.size, reachable.size, reachable.size, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount),
           publicRows
         ),
-        asserted: rootMaterialized,
+        currentIsAssertion: rootMaterialized !== undefined,
+        publishedRevision: revision,
         closed: false
       };
       for (const node of graph.nodes) {
@@ -423,7 +533,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
           externalDependencies: graph.externalDependencies.get(node) as ReadonlySet<string>,
           sessionEvidenceDependency: graph.sessionEvidenceDependencies.get(node) === true,
           orderIndex,
-          owners: new Set([state])
+          owners: new Set([state]),
+          rootOwners: new Set()
         });
         physicalOrder.push(node);
         if (!materialized.has(node)) unmaterializedNodes.add(node);
@@ -438,13 +549,20 @@ export const createPooledIncrementalQueryRuntime = (input: {
         if (graph.sessionEvidenceDependencies.get(node) === true) evidenceConsumers.add(node);
       }
       for (const node of graph.nodes) {
+        const record = physical.get(node) as PooledPhysicalNode;
+        if (node === canonicalRoot) record.rootOwners.add(state);
         for (const child of graph.children.get(node) as readonly QueryNode[]) (physical.get(child) as PooledPhysicalNode).parents.add(node);
       }
       const registeredState = state;
       roots.add(registeredState);
       refreshDiagnostics(newNodes.length, newNodes.length, 0);
       return {
-        getCurrentResult: () => registeredState.current,
+        // Query functions may synchronously inspect an existing root while a
+        // pooled update is evaluating. Preserve atomic publication by exposing
+        // the last committed result until the transition has finished.
+        getCurrentResult: () => executionPhase === 'idle'
+          ? publishRoot(registeredState)
+          : registeredState.current,
         close: () => release(registeredState)
       };
     } catch (error) {
@@ -455,6 +573,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
           if (record === undefined) continue;
           const ownerCount = record.owners.size;
           if (!record.owners.delete(state)) continue;
+          record.rootOwners.delete(state);
           if (ownerCount === 2) sharedPhysicalNodeCount -= 1;
           if (record.owners.size === 0) removePhysicalNode(node, record);
         }
@@ -492,16 +611,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
     if (!applied.success) {
       rejectedUpdateCount += 1;
       runtimeIssues = applied.issues;
-      for (const root of roots) {
-        if (!journal.roots.has(root)) journal.roots.set(root, { current: root.current, asserted: root.asserted });
-        root.current = maintainedQueryResult(
-          undefined,
-          runtimeIssues,
-          maintenanceState(root.reachable.size, 0, 0, [], emptyIncrementalQueryResultDelta, revision, rejectedUpdateCount),
-          publicRows
-        );
-        root.asserted = undefined;
-      }
+      assertionInvalidated = true;
+      transitionEvidence = emptyPooledTransitionEvidence(true);
       refreshDiagnostics(0, 0, 0);
       return;
     }
@@ -514,10 +625,10 @@ export const createPooledIncrementalQueryRuntime = (input: {
       || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
     const updatedNodes = new Set<QueryNode>();
     const changedNodes = new Set<QueryNode>();
-    const rootUpdatedCounts = new Map<PooledRootState, number>();
-    const rootChangedCounts = new Map<PooledRootState, number>();
     const operatorEvents: QueryMaintenanceOperatorEvent[] = [];
-    const rootOperatorEvents = new Map<PooledRootState, QueryMaintenanceOperatorEvent[]>();
+    const operatorEventsByNode = new Map<QueryNode, QueryMaintenanceOperatorEvent>();
+    const previousRootNodes = new Map<QueryNode, MaterializedQueryNode | undefined>();
+    const changedRoots = new Set<PooledRootState>();
     const candidates: QueryNode[] = [];
     const enqueued = new Set<QueryNode>();
     const evaluated = new Set<QueryNode>();
@@ -578,55 +689,39 @@ export const createPooledIncrementalQueryRuntime = (input: {
       const operatorEvent = updated.operatorEvent;
       if (operatorEvent !== undefined) {
         operatorEvents.push(operatorEvent);
-        for (const owner of record.owners) {
-          const ownedEvents = rootOperatorEvents.get(owner);
-          if (ownedEvents === undefined) rootOperatorEvents.set(owner, [operatorEvent]);
-          else ownedEvents.push(operatorEvent);
-        }
+        operatorEventsByNode.set(node, operatorEvent);
       }
       if (!journal.materialized.has(node)) journal.materialized.set(node, previousNode);
       materialized.set(node, nextNode);
       unmaterializedNodes.delete(node);
       updatedNodes.add(node);
-      for (const owner of record.owners) rootUpdatedCounts.set(owner, (rootUpdatedCounts.get(owner) ?? 0) + 1);
       if (previousNode === undefined || !materializedQueryNodeEqual(previousNode, nextNode, valueIdentities)) {
         changedNodes.add(node);
-        for (const owner of record.owners) rootChangedCounts.set(owner, (rootChangedCounts.get(owner) ?? 0) + 1);
-        for (const parent of record.parents) enqueue(parent);
+        if (record.rootOwners.size > 0) {
+          previousRootNodes.set(node, previousNode);
+          for (const root of record.rootOwners) changedRoots.add(root);
+        }
+        for (const parent of record.parents) {
+          const parentNode = materialized.get(parent);
+          if (parent.kind === 'select' && selectCanRetainMaterialization(parent, parentNode, nextNode)) continue;
+          enqueue(parent);
+        }
       }
     }
     acceptedSnapshot = nextSnapshot;
-    const changedIds = changedRelationIds(update.relations.map(({ relation }) => relation));
-    for (const root of roots) {
-      const nextRoot = materialized.get(root.root);
-      const rootChangedNodeCount = rootChangedCounts.get(root) ?? 0;
-      // A rejected update clears `asserted` while retaining the last physical
-      // graph. The first accepted transition must therefore republish that
-      // graph even when no node needed evaluation.
-      const reusePublicViews = root.asserted !== undefined && !changedNodes.has(root.root);
-      const nextCurrent = maintainedQueryResult(
-        nextRoot,
-        [],
-        maintenanceState(
-          root.reachable.size,
-          rootUpdatedCounts.get(root) ?? 0,
-          rootChangedNodeCount,
-          changedIds,
-          reusePublicViews
-            ? emptyIncrementalQueryResultDelta
-            : diffMaintainedResults(root.asserted, nextRoot, valueIdentities),
-          revision,
-          rejectedUpdateCount,
-          summarizeOperatorEvents(rootOperatorEvents.get(root) ?? [])
-        ),
-        publicRows,
-        root.current,
-        reusePublicViews
-      );
-      if (!journal.roots.has(root)) journal.roots.set(root, { current: root.current, asserted: root.asserted });
-      root.current = nextCurrent;
-      root.asserted = nextRoot;
-    }
+    transitionEvidence = {
+      rejected: false,
+      assertionWasInvalidated: assertionInvalidated,
+      changedRelationIds: Object.freeze(changedRelationIds(update.relations.map(({ relation }) => relation))),
+      updatedNodes,
+      changedNodes,
+      previousRootNodes,
+      operatorEvents: operatorEventsByNode
+    };
+    assertionInvalidated = false;
+    // Changed roots must consume sparse positional evidence before a later
+    // transition replaces it. Unchanged roots publish telemetry lazily.
+    for (const root of changedRoots) publishRoot(root, journal);
     refreshDiagnostics(updatedNodes.size, changedNodes.size, 0, summarizeOperatorEvents(operatorEvents));
   };
 
@@ -639,7 +734,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
       runtimeIssues,
       revision,
       rejectedUpdateCount,
-      diagnostics
+      diagnostics,
+      assertionInvalidated,
+      transitionEvidence
     };
     const journal: PooledUpdateJournal = { materialized: new Map(), roots: new Map() };
     executionPhase = 'updating';
@@ -651,6 +748,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
       revision = checkpoint.revision;
       rejectedUpdateCount = checkpoint.rejectedUpdateCount;
       diagnostics = checkpoint.diagnostics;
+      assertionInvalidated = checkpoint.assertionInvalidated;
+      transitionEvidence = checkpoint.transitionEvidence;
       for (const [node, value] of journal.materialized) {
         if (value === undefined) {
           materialized.delete(node);
@@ -662,7 +761,8 @@ export const createPooledIncrementalQueryRuntime = (input: {
       }
       for (const [root, state] of journal.roots) {
         root.current = state.current;
-        root.asserted = state.asserted;
+        root.currentIsAssertion = state.currentIsAssertion;
+        root.publishedRevision = state.publishedRevision;
       }
       // Identity entries computed from an aborted graph may refer to values
       // that were never accepted. Rebuild them lazily from restored nodes.

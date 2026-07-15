@@ -16,9 +16,21 @@ import {
   adoptJsonValue,
   adoptMaintenanceSnapshot,
   adoptQueryRecord,
-  adoptQueryRequest
+  adoptQueryRequest,
+  isOwnedQueryLogicalContainer,
+  sealOwnedQueryLogicalContainer,
+  sealOwnedQueryScope
 } from './internal-query-ownership.js';
 import { canonicalizeQueryValue, compareQueryJsonValuesTotal } from './internal-query-values.js';
+import { compareOrderedExpressions } from './internal-query-ordering.js';
+import {
+  compareWindowRows,
+  windowSpecificationKey,
+  windowSpecificationReferencesFields,
+  type WindowMaintenanceLayout,
+  type WindowMaintenanceLayouts,
+  type WindowMaintenancePosition
+} from './internal-query-window-maintenance.js';
 import { groupRelationInputs, relationKey, relationOccurrence } from './internal-query-relations.js';
 import { validateRelationInputs } from './internal-query-input-validation.js';
 import type { PreparedPlan } from './query-plan-contract.js';
@@ -167,8 +179,7 @@ const evaluateNodeUncached = (node: QueryNode, context: QueryContext): NodeResul
       const base = requiredAlias(row, node.alias, context);
       if (base === undefined) return row;
       const additions = projectFields(node.fields, exprContext(row, context));
-      const identity = resultKey(row);
-      return { scope: { ...row.scope, [node.alias]: { ...base, ...additions } }, provenance: row.provenance, identity, origin: identity };
+      return replaceScopedAlias(row, node.alias, { ...base, ...additions });
     });
     return context.state.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
@@ -176,7 +187,7 @@ const evaluateNodeUncached = (node: QueryNode, context: QueryContext): NodeResul
     const inner = evaluateNode(node.input, context);
     const rows = inner.rows.map((row) => {
       const record = requiredAlias(row, node.alias, context);
-      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: renameFields(record, node.fields) }, origin: resultKey(row) };
+      return record === undefined ? row : replaceScopedAlias(row, node.alias, renameFields(record, node.fields));
     });
     return context.state.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
@@ -185,7 +196,7 @@ const evaluateNodeUncached = (node: QueryNode, context: QueryContext): NodeResul
     const omitted = new Set(node.fields);
     const rows = inner.rows.map((row) => {
       const record = requiredAlias(row, node.alias, context);
-      return record === undefined ? row : { ...row, scope: { ...row.scope, [node.alias]: omitFields(record, omitted) }, origin: resultKey(row) };
+      return record === undefined ? row : replaceScopedAlias(row, node.alias, omitFields(record, omitted));
     });
     return context.state.unavailable ? { rows: [], completeness: 'unknown' } : { rows, completeness: inner.completeness };
   }
@@ -328,7 +339,7 @@ export const joinLeftRow = (
   if (node.join === 'semi' && matched || node.join === 'anti' && !matched) rows.push(leftRow);
   if (node.join === 'left' && !matched) {
     const missingRight = Object.fromEntries([...queryAliases(node.right)].map((alias) => [alias, {}]));
-    rows.push({ scope: { ...leftRow.scope, ...missingRight }, provenance: leftRow.provenance, identity: origin, origin });
+    rows.push(scopedRow({ ...leftRow.scope, ...missingRight }, leftRow.provenance, origin));
   }
   return rows;
 };
@@ -578,7 +589,7 @@ export const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRo
   const nonNullValues = knownValues.filter((value) => value !== null);
   if (aggregate.op === 'count') return nonNullValues.length;
   if (aggregate.op === 'count-distinct') return new Set(nonNullValues.map(canonicalizeJson)).size;
-  if (aggregate.op === 'collect') return knownValues;
+  if (aggregate.op === 'collect') return sealOwnedQueryLogicalContainer(Object.freeze(knownValues));
   if (aggregate.op === 'first') return knownValues[0] ?? null;
   if (aggregate.op === 'last') return knownValues.at(-1) ?? null;
   if (aggregate.op === 'any' || aggregate.op === 'every') {
@@ -637,7 +648,7 @@ const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, c
         const row = output[outputIndex] as ScopedRow;
         const aliasFields = requiredAlias(row, node.alias, context);
         if (aliasFields === undefined) return;
-        output[outputIndex] = { ...row, scope: { ...row.scope, [node.alias]: { ...aliasFields, [field]: value } } };
+        output[outputIndex] = replaceScopedAlias(row, node.alias, { ...aliasFields, [field]: value });
       });
     }
   }
@@ -650,18 +661,6 @@ type WindowLayoutRow = {
   readonly rank: number;
 };
 type WindowLayout = readonly (readonly WindowLayoutRow[])[];
-type WindowMaintenancePosition = {
-  readonly partitionKey: string;
-  readonly orderSignature: string;
-  readonly sortedIndex: number;
-  readonly outputIndex: number;
-};
-export type WindowMaintenanceLayout = {
-  readonly positions: ReadonlyMap<string, WindowMaintenancePosition>;
-  readonly partitions: ReadonlyMap<string, readonly number[]>;
-};
-export type WindowMaintenanceLayouts = ReadonlyMap<string, WindowMaintenanceLayout>;
-
 const buildWindowLayout = (rows: readonly ScopedRow[], window: WindowExpr, context: QueryContext): WindowLayout => {
   const partitions = new Map<string, { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[] }[]>();
   for (const [outputIndex, row] of rows.entries()) {
@@ -686,19 +685,6 @@ const buildWindowLayout = (rows: readonly ScopedRow[], window: WindowExpr, conte
   });
 };
 
-const compareWindowRows = (
-  left: { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[] },
-  right: { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[] },
-  rows: readonly ScopedRow[],
-  terms: readonly OrderTerm[]
-): number => {
-  for (let index = 0; index < terms.length; index += 1) {
-    const comparison = compareOrderedExpressions(left.orderValues[index] as ExpressionResult, right.orderValues[index] as ExpressionResult, terms[index] as OrderTerm);
-    if (comparison !== 0) return comparison;
-  }
-  return comparePortableStrings(resultKey(rows[left.outputIndex] as ScopedRow), resultKey(rows[right.outputIndex] as ScopedRow));
-};
-
 const windowOrderSignature = (values: readonly ExpressionResult[]): string => canonicalizeJson(values.map((value) =>
   value.status === 'missing'
     ? ['missing']
@@ -707,14 +693,23 @@ const windowOrderSignature = (values: readonly ExpressionResult[]): string => ca
       : ['nullish']
 ) as JsonValue);
 
-export const evaluateWindowKeys = (window: WindowExpr, row: ScopedRow, context: QueryContext): { readonly partitionKey: string; readonly orderValues: readonly ExpressionResult[]; readonly orderSignature: string } => {
+const windowRankSignature = (values: readonly ExpressionResult[]): string =>
+  canonicalizeJson(values.map(expressionJson));
+
+export const evaluateWindowKeys = (window: WindowExpr, row: ScopedRow, context: QueryContext): {
+  readonly partitionKey: string;
+  readonly orderValues: readonly ExpressionResult[];
+  readonly orderSignature: string;
+  readonly rankSignature: string;
+} => {
   const partitionValues = (window.partitionBy ?? []).map((expression) => evaluateExpr(expression, exprContext(row, context)));
   const orderValues = window.orderBy.map((term) => evaluateExpr(term.value, exprContext(row, context)));
   if ([...partitionValues, ...orderValues].some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.state.unavailable = true;
   return {
     partitionKey: canonicalizeJson(partitionValues.map(expressionJson)),
     orderValues,
-    orderSignature: windowOrderSignature(orderValues)
+    orderSignature: windowOrderSignature(orderValues),
+    rankSignature: windowRankSignature(orderValues)
   };
 };
 
@@ -727,11 +722,21 @@ export const indexWindowMaintenanceLayouts = (
   for (const window of Object.values(node.fields)) {
     const specification = windowSpecificationKey(window);
     if (layouts.has(specification)) continue;
-    const grouped = new Map<string, { readonly outputIndex: number; readonly orderValues: readonly ExpressionResult[]; readonly orderSignature: string }[]>();
+    const grouped = new Map<string, {
+      readonly outputIndex: number;
+      readonly orderValues: readonly ExpressionResult[];
+      readonly orderSignature: string;
+      readonly rankSignature: string;
+    }[]>();
     for (const [outputIndex, row] of rows.entries()) {
       const keys = evaluateWindowKeys(window, row, context);
       const partition = grouped.get(keys.partitionKey) ?? [];
-      partition.push({ outputIndex, orderValues: keys.orderValues, orderSignature: keys.orderSignature });
+      partition.push({
+        outputIndex,
+        orderValues: keys.orderValues,
+        orderSignature: keys.orderSignature,
+        rankSignature: keys.rankSignature
+      });
       grouped.set(keys.partitionKey, partition);
     }
     if (context.state.unavailable) return undefined;
@@ -741,27 +746,14 @@ export const indexWindowMaintenanceLayouts = (
       partition.sort((left, right) => compareWindowRows(left, right, rows, window.orderBy));
       const outputIndexes = partition.map(({ outputIndex }) => outputIndex);
       partitions.set(partitionKey, outputIndexes);
-      partition.forEach(({ outputIndex, orderSignature }, sortedIndex) => positions.set(resultKey(rows[outputIndex] as ScopedRow), { partitionKey, orderSignature, sortedIndex, outputIndex }));
+      partition.forEach(({ outputIndex, orderValues, orderSignature, rankSignature }, sortedIndex) => positions.set(
+        resultKey(rows[outputIndex] as ScopedRow),
+        { partitionKey, orderValues, orderSignature, rankSignature, sortedIndex, outputIndex }
+      ));
     }
     layouts.set(specification, { positions, partitions });
   }
   return layouts;
-};
-
-export const windowSpecificationKey = (window: WindowExpr): string => canonicalizeJson({
-  partitionBy: window.partitionBy ?? [],
-  orderBy: window.orderBy
-} as unknown as JsonValue);
-
-export const windowSpecificationReferencesFields = (window: WindowExpr, alias: string, fields: ReadonlySet<string>): boolean => {
-  const visit = (value: unknown): boolean => {
-    if (Array.isArray(value)) return value.some(visit);
-    if (value === null || typeof value !== 'object') return false;
-    const candidate = value as Readonly<Record<string, unknown>>;
-    if (candidate.kind === 'field' && candidate.alias === alias && typeof candidate.name === 'string' && fields.has(candidate.name)) return true;
-    return Object.values(candidate).some(visit);
-  };
-  return visit(window.partitionBy ?? []) || visit(window.orderBy);
 };
 
 const evaluateSeek = (node: Extract<QueryNode, { readonly kind: 'seek' }>, context: QueryContext): NodeResult => {
@@ -945,9 +937,30 @@ const provenanceIdentity = (provenance: ScopedRow['provenance']): string => {
   }
   return identity;
 };
-export const scopedRow = (scope: ScopedRow['scope'], provenance: ScopedRow['provenance'], origin?: string): ScopedRow => ({ scope, provenance, identity: provenanceIdentity(provenance), origin });
-const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => Object.fromEntries(Object.entries(record).map(([name, value]) => [fields[name] ?? name, value]));
-const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => Object.fromEntries(Object.entries(record).filter(([name]) => !fields.has(name)));
+export const scopedRow = (scope: ScopedRow['scope'], provenance: ScopedRow['provenance'], origin?: string): ScopedRow => {
+  for (const record of Object.values(scope)) {
+    if (!isOwnedQueryLogicalContainer(record)) sealOwnedQueryLogicalContainer(Object.freeze(record));
+  }
+  const ownedScope = sealOwnedQueryScope(scope);
+  return { scope: ownedScope, provenance, identity: provenanceIdentity(provenance), origin };
+};
+export const replaceScopedAlias = (row: ScopedRow, alias: string, record: QueryRecord): ScopedRow => {
+  if (!isOwnedQueryLogicalContainer(record)) sealOwnedQueryLogicalContainer(Object.freeze(record));
+  const scope = sealOwnedQueryScope({ ...row.scope, [alias]: record });
+  return { ...row, scope, origin: resultKey(row) };
+};
+const renameFields = (record: QueryRecord, fields: Readonly<Record<string, string>>): QueryRecord => {
+  const renamed = Object.fromEntries(
+    Object.entries(record).map(([name, value]) => [fields[name] ?? name, value])
+  ) as Record<string, QueryLogicalValue>;
+  return sealOwnedQueryLogicalContainer(Object.freeze(renamed));
+};
+const omitFields = (record: QueryRecord, fields: ReadonlySet<string>): QueryRecord => {
+  const retained = Object.fromEntries(
+    Object.entries(record).filter(([name]) => !fields.has(name))
+  ) as Record<string, QueryLogicalValue>;
+  return sealOwnedQueryLogicalContainer(Object.freeze(retained));
+};
 const uniqueRows = (rows: readonly ScopedRow[]): Map<string, ScopedRow> => new Map(rows.map((row) => [canonicalizeQueryValue(visibleRow(row)), row]));
 export const tagSetRow = (row: ScopedRow, branch: 'left' | 'right'): ScopedRow => scopedRow(
   row.scope,
@@ -998,19 +1011,6 @@ const compareRowToCursor = (row: ScopedRow, terms: readonly OrderTerm[], cursor:
   return comparePortableStrings(resultKey(row), cursor.resultKey);
 };
 
-const compareOrderedExpressions = (left: ExpressionResult, right: ExpressionResult, term: OrderTerm): number => {
-  const leftRank = left.status === 'missing' ? 2 : left.status !== 'known' || left.value === null ? 1 : 0;
-  const rightRank = right.status === 'missing' ? 2 : right.status !== 'known' || right.value === null ? 1 : 0;
-  if (leftRank !== rightRank) {
-    if (leftRank > 0 && rightRank > 0) return leftRank < rightRank ? -1 : 1;
-    const specialIsLeft = leftRank > 0;
-    return term.nulls === 'first' ? (specialIsLeft ? -1 : 1) : (specialIsLeft ? 1 : -1);
-  }
-  if (leftRank > 0 || left.status !== 'known' || right.status !== 'known') return 0;
-  const comparison = compareQueryJsonValuesTotal(left.value, right.value);
-  return term.direction === 'asc' ? comparison : -comparison;
-};
-
 const nonMonotoneUnknown = (context: QueryContext, operator: string): NodeResult => {
   context.state.issues.push(createIssue({ code: 'query.parameter_invalid', phase: 'query', severity: 'error', retry: 'after_refresh', details: { reason: 'incomplete_non_monotone', operator } }));
   return { rows: [], completeness: 'unknown' };
@@ -1020,10 +1020,7 @@ export const publicQueryRow = (row: ScopedRow, cache: WeakMap<ScopedRow, QueryRe
   const cached = cache.get(row);
   if (cached !== undefined) return cached;
   const visible = visibleRow(row);
-  // Frozen visible rows originate from the already-adopted maintenance input,
-  // prepared values, or a previously owned maintained result. Reuse them
-  // instead of cloning the same immutable graph at the output boundary.
-  const owned = Object.isFrozen(visible)
+  const owned = isOwnedQueryLogicalContainer(visible)
     ? visible
     : adoptQueryRecord(visible, 'Query result row');
   cache.set(row, owned);

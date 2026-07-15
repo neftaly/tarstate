@@ -55,27 +55,51 @@ export const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, 
       if (rowChange.before === undefined && rowChange.after !== undefined) inserted += 1;
       else if (rowChange.before !== undefined && rowChange.after === undefined) removed += 1;
     }
-    const nextRows = Array.from<QueryRecord | undefined>({ length: existingRows.length + inserted - removed });
-    const nextOccurrences = Array.from<string | undefined>({ length: nextRows.length });
-    const consumedChanges = new Set<string>();
-    for (let index = 0; index < existingRows.length; index += 1) {
-      const occurrenceId = existingOccurrences[index] as string;
-      const row = existingRows[index] as QueryRecord;
-      const rowChange = rowChanges.get(occurrenceId);
-      if (rowChange === undefined) {
-        nextRows[index] = row;
-        nextOccurrences[index] = occurrenceId;
-        continue;
+    let nextRows: readonly QueryRecord[];
+    let nextOccurrences: readonly string[];
+    const stableReplacements = inserted === 0
+      && removed === 0
+      && [...rowChanges.values()].every((row) => row.before !== undefined && row.after !== undefined && row.before.index === row.after.index);
+    if (stableReplacements) {
+      const replacedRows = rowChanges.size === 0 ? existingRows : [...existingRows];
+      for (const rowChange of rowChanges.values()) {
+        const before = rowChange.before as NonNullable<RelationRowChange['before']>;
+        const after = rowChange.after as NonNullable<RelationRowChange['after']>;
+        const row = existingRows[before.index];
+        if (row === undefined
+          || existingOccurrences[before.index] !== rowChange.occurrenceId
+          || !sameIndexedRow({ index: before.index, row }, before)) {
+          return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
+        }
+        (replacedRows as QueryRecord[])[after.index] = after.row;
       }
-      consumedChanges.add(occurrenceId);
-      if (!sameIndexedRow({ index, row }, rowChange.before)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
-      if (rowChange.after !== undefined && !placeChangedRow(nextRows, nextOccurrences, occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('invalid_row_order', change.relation.relationId);
+      nextRows = replacedRows;
+      nextOccurrences = existingOccurrences;
+    } else {
+      const placedRows = Array.from<QueryRecord | undefined>({ length: existingRows.length + inserted - removed });
+      const placedOccurrences = Array.from<string | undefined>({ length: placedRows.length });
+      const consumedChanges = new Set<string>();
+      for (let index = 0; index < existingRows.length; index += 1) {
+        const occurrenceId = existingOccurrences[index] as string;
+        const row = existingRows[index] as QueryRecord;
+        const rowChange = rowChanges.get(occurrenceId);
+        if (rowChange === undefined) {
+          placedRows[index] = row;
+          placedOccurrences[index] = occurrenceId;
+          continue;
+        }
+        consumedChanges.add(occurrenceId);
+        if (!sameIndexedRow({ index, row }, rowChange.before)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
+        if (rowChange.after !== undefined && !placeChangedRow(placedRows, placedOccurrences, occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('invalid_row_order', change.relation.relationId);
+      }
+      for (const rowChange of rowChanges.values()) {
+        if (consumedChanges.has(rowChange.occurrenceId)) continue;
+        if (rowChange.before !== undefined || rowChange.after === undefined || !placeChangedRow(placedRows, placedOccurrences, rowChange.occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
+      }
+      if (placedRows.some((row) => row === undefined) || placedOccurrences.some((occurrence) => occurrence === undefined)) return rejectedMaintenanceUpdate('invalid_row_order', change.relation.relationId);
+      nextRows = placedRows as QueryRecord[];
+      nextOccurrences = placedOccurrences as string[];
     }
-    for (const rowChange of rowChanges.values()) {
-      if (consumedChanges.has(rowChange.occurrenceId)) continue;
-      if (rowChange.before !== undefined || rowChange.after === undefined || !placeChangedRow(nextRows, nextOccurrences, rowChange.occurrenceId, rowChange.after)) return rejectedMaintenanceUpdate('stale_occurrence_change', change.relation.relationId);
-    }
-    if (nextRows.some((row) => row === undefined) || nextOccurrences.some((occurrence) => occurrence === undefined)) return rejectedMaintenanceUpdate('invalid_row_order', change.relation.relationId);
     if (change.after === undefined) {
       if (nextRows.length > 0) return rejectedMaintenanceUpdate('relation_removal_incomplete', change.relation.relationId);
       current.delete(identity);
@@ -83,8 +107,8 @@ export const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, 
     }
     const input: RelationInput = {
       relation: change.relation,
-      rows: Object.freeze(nextRows as QueryRecord[]),
-      occurrenceIds: Object.freeze(nextOccurrences as string[]),
+      rows: Object.isFrozen(nextRows) ? nextRows : Object.freeze(nextRows),
+      occurrenceIds: Object.isFrozen(nextOccurrences) ? nextOccurrences : Object.freeze(nextOccurrences),
       completeness: change.after.completeness,
       ...(change.sourceId === undefined ? {} : { sourceId: change.sourceId }),
       ...(change.attachmentId === undefined ? {} : { attachmentId: change.attachmentId }),

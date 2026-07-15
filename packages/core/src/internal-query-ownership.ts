@@ -28,6 +28,19 @@ const ownedQueryLogicalContainers = new WeakSet<object>();
 export const isOwnedQueryLogicalContainer = (value: object): boolean =>
   ownedQueryLogicalContainers.has(value);
 
+/** Seals a logical container assembled exclusively from already-owned values. */
+export const sealOwnedQueryLogicalContainer = <Value extends object>(value: Value): Value => {
+  if (!Object.isFrozen(value)) throw new TypeError('Owned query logical container must be frozen');
+  ownedQueryLogicalContainers.add(value);
+  return value;
+};
+
+/** Owns a scope only when the scope itself can be the public logical value. */
+export const sealOwnedQueryScope = <Value extends Readonly<Record<string, QueryRecord>>>(value: Value): Value => {
+  Object.freeze(value);
+  return Object.keys(value).length === 1 ? value : sealOwnedQueryLogicalContainer(value);
+};
+
 /** Marks an internally detached, deeply frozen update for reuse across runtime shells. */
 export const sealOwnedQueryMaintenanceUpdate = (update: QueryMaintenanceUpdate): QueryMaintenanceUpdate => {
   if (!Object.isFrozen(update)) throw new TypeError('Owned query maintenance update must be frozen');
