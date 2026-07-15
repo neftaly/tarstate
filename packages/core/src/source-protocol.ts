@@ -115,6 +115,11 @@ export type AtomicSource<Storage, Command> = {
   readonly queryOutcome?: (input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash }) => Promise<SourceOutcomeLookup<SourceCommitResult>>;
 };
 
+/** Atomic source capability required by prepared generic transaction execution. */
+export type StagedBasisAtomicSource<Storage, Command> = AtomicSource<Storage, Command> & {
+  readonly basisForStagedStorage: NonNullable<AtomicSource<Storage, Command>['basisForStagedStorage']>;
+};
+
 export type Attachment<Storage = unknown, Command = unknown> = {
   readonly attachmentId: string;
   readonly incarnation: string;

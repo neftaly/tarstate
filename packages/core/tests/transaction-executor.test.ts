@@ -331,6 +331,19 @@ describe('prepared source-local transaction executor', () => {
     });
   });
 
+  it('requires staged basis derivation when adopting a prepared writable source', async () => {
+    const { context, source } = await makeContext();
+    const sourceWithoutStagedBasis = new Proxy(source, {
+      get: (target, property, receiver) => property === 'basisForStagedStorage'
+        ? undefined
+        : Reflect.get(target, property, receiver)
+    });
+    expect(() => prepareWritableExecutionContext({
+      ...context,
+      source: sourceWithoutStagedBasis
+    } as never)).toThrow('Prepared writable execution source must derive staged basis');
+  });
+
   it('reconciles semantic no-ops before affected-count guards', async () => {
     const { source, context } = await makeContext();
     const value = await sealTransaction({ body: {

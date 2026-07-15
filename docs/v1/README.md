@@ -230,12 +230,13 @@ Prepared generic execution reserves an operation identity before guard,
 constraint, or mutation-capable evaluation and retains the resulting receipt.
 Memory contexts receive a process-local ledger by default; contexts claiming
 local or persisted durability must supply a durable ledger.
-Sources must provide exact basis evidence for immutable staged storage. The
-executor advances that basis with staged state for later statements, guards,
-returning queries, binding projections, and final constraints; reusing the
-captured before-basis after a logical change is invalid. Relation replacement
-stages ordered delete and insert phases, while upsert replacement replaces the
-complete logical row.
+Prepared generic transaction contexts require a `StagedBasisAtomicSource`,
+which provides exact basis evidence for immutable staged storage. The executor
+advances that basis with staged state for later statements, guards, returning
+queries, binding projections, and final constraints; reusing the captured
+before-basis after a logical change is invalid. Relation replacement stages
+ordered delete and insert phases, while upsert replacement replaces the complete
+logical row.
 
 Expected-basis mismatch rejects. Without an expected basis, a safe pre-handoff
 replan MAY occur against a newer local basis. Nothing replans after handoff.

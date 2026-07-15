@@ -13,7 +13,7 @@ import type { SourceBasis } from './maintenance.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { QueryNode } from './query.js';
 import { safeParseTransactionArtifact } from './semantic-artifact-parsers.js';
-import type { AtomicSource, LogicalEdit, StorageBinding } from './source-protocol.js';
+import type { AtomicSource, LogicalEdit, StagedBasisAtomicSource, StorageBinding } from './source-protocol.js';
 import {
   type CommitReceipt,
   type FieldEdit,
@@ -73,7 +73,7 @@ export type PreparedWritableExecutionContext<Storage, Command> = {
   readonly authorityViewFingerprint: ContentHash;
   readonly writable: true;
   readonly schemaView: ArtifactRef;
-  readonly source: AtomicSource<Storage, Command>;
+  readonly source: StagedBasisAtomicSource<Storage, Command>;
   readonly operationEpoch: string;
   readonly operationLedger: OperationLedgerProtocol<CommitReceipt>;
   readonly bindings: readonly StorageBinding<Storage, Command>[];
@@ -118,6 +118,9 @@ export const prepareWritableExecutionContext = <Storage, Command>(
     throw new TypeError('Prepared writable execution context has invalid boundary fields');
   }
   if (new Set(input.bindings.map(({ id }) => id)).size !== input.bindings.length) throw new TypeError('Prepared writable execution binding IDs must be unique');
+  if (typeof input.source.basisForStagedStorage !== 'function') {
+    throw new TypeError('Prepared writable execution source must derive staged basis');
+  }
   const operationLedger = input.operationLedger ?? new SourceOperationLedger<CommitReceipt>(input.operationEpoch);
   if (input.durability !== 'memory' && operationLedger.retention !== 'durable') {
     throw new TypeError('Local or persisted writable execution requires a durable operation ledger');
@@ -522,8 +525,8 @@ const deriveStagedBasis = <Storage, Command>(
   before: ReturnType<AtomicSource<Storage, Command>['snapshot']>,
   staged: ReturnType<AtomicSource<Storage, Command>['snapshot']>
 ): { readonly basis: SourceBasis } | { readonly issue: Issue } => {
-  if (staged.storage === undefined || context.source.basisForStagedStorage === undefined) {
-    return { issue: transactionIssue('transaction.staged_basis_unavailable', undefined, { reason: 'basis_derivation_unavailable' }, 'after_refresh') };
+  if (staged.storage === undefined) {
+    return { issue: transactionIssue('transaction.staged_basis_unavailable', undefined, { reason: 'staged_storage_unavailable' }, 'after_refresh') };
   }
   try {
     return { basis: context.source.basisForStagedStorage(before, staged.storage) };
