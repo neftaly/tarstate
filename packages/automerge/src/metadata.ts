@@ -17,6 +17,7 @@ import type {
   GovernanceStorageSection
 } from '@tarstate/core/transactions';
 import { automergeIssueDeclarations } from './issues.js';
+import { samePortableJson } from './internal-portable-json.js';
 import { conflictsAt, normalizeAutomergeValue } from './projection.js';
 import { automergeMetadataProperty } from './reserved.js';
 import {
@@ -179,11 +180,16 @@ export const planAutomergeMetadataMutation = <T extends object>(
     .filter(({ section }) => section !== undefined)
     .map(({ section }) => normalizeSection(section!));
   const requested = repair.alternatives.map(normalizeSection);
-  if (!samePortableSet(observed, requested) || !requested.some((section) => samePortable(section, normalizeSection(repair.selected)))) {
+  if (!samePortableSet(observed, requested)
+    || !requested.some((section) => samePortableJson(section, normalizeSection(repair.selected)))) {
     return rejectedPlan(beforeBasis, metadataIssue('automerge.metadata_repair_alternatives_changed', command.sourceId, { section: repair.section }));
   }
   const selected = normalizeSection(repair.selected);
-  const selectedAlternative = current.alternatives.find(({ scope, section }) => scope === selected.kind && section !== undefined && samePortable(normalizeSection(section), selected));
+  const selectedAlternative = current.alternatives.find(({ scope, section }) =>
+    scope === selected.kind
+    && section !== undefined
+    && samePortableJson(normalizeSection(section), selected)
+  );
   if (selectedAlternative === undefined) return rejectedPlan(beforeBasis, metadataIssue('automerge.metadata_repair_alternatives_changed', command.sourceId));
   return planned(beforeBasis, command.request.action, { kind: 'set-section', section: selected.kind, value: selectedAlternative.value });
 };
@@ -410,10 +416,6 @@ const samePortableSet = (left: readonly GovernanceSection[], right: readonly Gov
   const normalizedLeft = left.map((value) => canonicalizeJson(value as unknown as JsonValue)).sort();
   const normalizedRight = right.map((value) => canonicalizeJson(value as unknown as JsonValue)).sort();
   return normalizedLeft.length === normalizedRight.length && normalizedLeft.every((value, index) => value === normalizedRight[index]);
-};
-
-const samePortable = (left: unknown, right: unknown): boolean => {
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
 };
 
 const cloneJson = (value: JsonValue): JsonValue => {

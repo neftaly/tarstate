@@ -24,9 +24,10 @@ import { sealStorageProjection } from '@tarstate/core/source/projection';
 import {
   automergePathFootprint,
   type AutomergePathFootprint
-} from './core-adapter.js';
+} from './footprint.js';
 import { conflictsAt, type AutomergePath } from './projection.js';
 import { isAutomergeReservedRootProperty } from './reserved.js';
+import { samePortableJson } from './internal-portable-json.js';
 import {
   planPropertyEdit,
   valueAtAutomergePath,
@@ -192,7 +193,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         continue;
       }
       const row = candidates[0] as AutomergeMappedStorageRow;
-      if (!samePortable(row.key, edit.key)) {
+      if (!samePortableJson(row.key, edit.key)) {
         issues.push(bindingIssue('mapping.locator_stale', snapshot.sourceId, edit.relationId, row.storagePath, { reason: 'logical_key_changed' }));
         continue;
       }
@@ -216,7 +217,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           issues.push(...parsed.issues.map((issue) => withEvidence(issue, snapshot.sourceId, edit.relationId, row.storagePath, edit.key)));
           continue;
         }
-        if (!samePortable(parsed.value.key, row.key)) {
+        if (!samePortableJson(parsed.value.key, row.key)) {
           issues.push(bindingIssue('mapping.rekey_required', snapshot.sourceId, edit.relationId, row.storagePath));
           continue;
         }
@@ -226,7 +227,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       }
       for (const [field, input] of fieldInputs) {
         if (field in compiled.mapping.keys) {
-          if (!samePortable(row.fields[field], input)) issues.push(bindingIssue('mapping.rekey_required', snapshot.sourceId, edit.relationId, row.storagePath, { field }));
+          if (!samePortableJson(row.fields[field], input)) issues.push(bindingIssue('mapping.rekey_required', snapshot.sourceId, edit.relationId, row.storagePath, { field }));
           continue;
         }
         const fieldMapping = compiled.mapping.fields[field];
@@ -252,7 +253,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           issues.push(...parsed.issues.map((issue) => withEvidence(issue, snapshot.sourceId, edit.relationId, row.storagePath)));
           continue;
         }
-        if (samePortable(row.fields[field], parsed.value)) continue;
+        if (samePortableJson(row.fields[field], parsed.value)) continue;
         const planned = planPropertyEdit(snapshot.storage, { kind: 'replace', path, value: parsed.value });
         if ('issue' in planned) issues.push(projectionIssue(planned.issue.code, snapshot.sourceId, edit.relationId, planned.issue.path, planned.issue.details));
         else intents.push(intentAt(path, planned.command));
@@ -461,9 +462,6 @@ const copyPortable = (value: JsonValue): JsonValue => {
   return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, copyPortable(child)]));
 };
 
-const samePortable = (left: unknown, right: unknown): boolean => {
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
-};
 
 const withEvidence = (issue: Issue, sourceId: string, relationId: string, candidatePath: AutomergePath, key?: JsonValue): Issue => createIssue({
   ...issue,

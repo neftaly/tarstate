@@ -1,8 +1,8 @@
 import {
   type AttachmentCatalog,
-  type DatasetMembership,
+  type DatasetMembership
 } from './database.js';
-import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
+import type { DatabaseAttachment, DatasetMember } from './database-model.js';
 import type { AttachmentProjection } from './attachment-model.js';
 import { createIssue, type Issue } from './issues.js';
 import {
@@ -11,26 +11,14 @@ import {
   type ObserverDiagnosticReporter
 } from './observer-diagnostics.js';
 import type { SourceSnapshot } from './source-state.js';
-import type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';
+import {
+  assembleEvaluationSnapshot,
+  type CapturedMember,
+  type EvaluationSnapshot
+} from './internal-observer-capture-core.js';
 
 export type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';
-
-export type CapturedMember<Projection> = {
-  readonly member: DatasetMember;
-  readonly attachment?: DatabaseAttachment<unknown, Projection>;
-  readonly snapshot?: SourceSnapshot<unknown>;
-  readonly projection?: AttachmentProjection<Projection>;
-  readonly authorized: boolean;
-  readonly sourceMismatch?: boolean;
-  readonly captureIssues?: readonly Issue[];
-};
-
-export type EvaluationSnapshot<Projection> = {
-  readonly identity: object;
-  readonly dataset: DatasetSnapshot;
-  readonly members: readonly CapturedMember<Projection>[];
-  readonly available: readonly AvailableQueryAttachment<Projection>[];
-};
+export type { CapturedMember, EvaluationSnapshot } from './internal-observer-capture-core.js';
 
 export type DatasetCaptureState<Projection> =
   | { readonly state: 'captured'; readonly captured: EvaluationSnapshot<Projection> }
@@ -209,10 +197,8 @@ export class DatasetCaptureRuntime<Projection> {
 
   #capture(): EvaluationSnapshot<Projection> {
     const dataset = this.#options.dataset.snapshot();
-    const previousMembers = new Map((this.#state?.captured.members ?? []).map((candidate) => [candidate.member.attachmentId, candidate]));
-    const previousAvailable = new Map((this.#state?.captured.available ?? []).map((candidate) => [candidate.member.attachmentId, candidate]));
     const snapshots = new Map<object, { readonly snapshot: SourceSnapshot<unknown> } | { readonly error: unknown }>();
-    const members = dataset.members.map((member): CapturedMember<Projection> => {
+    const candidates = dataset.members.map((member): CapturedMember<Projection> => {
       const raw = this.#options.attachments.get(member.attachmentId);
       if (raw === undefined) return { member, authorized: true };
       if (raw.sourceId !== member.sourceId) return { member, authorized: true, sourceMismatch: true };
@@ -264,31 +250,11 @@ export class DatasetCaptureRuntime<Projection> {
         ...(projection === undefined ? {} : { projection }),
         authorized: true
       };
-    }).map((candidate) => {
-      const previous = previousMembers.get(candidate.member.attachmentId);
-      return previous !== undefined && sameCapturedMember(previous, candidate)
-        ? previous
-        : Object.freeze(candidate);
     });
-    const available = members.flatMap((candidate): readonly AvailableQueryAttachment<Projection>[] => {
-      if (candidate.attachment === undefined || candidate.snapshot === undefined || candidate.projection?.state !== 'ready') return [];
-      const previous = previousAvailable.get(candidate.member.attachmentId);
-      if (previous?.member === candidate.member
-        && previous.attachment === candidate.attachment
-        && previous.snapshot === candidate.snapshot
-        && previous.projection === candidate.projection.value) return [previous];
-      return [Object.freeze({
-        member: candidate.member,
-        attachment: candidate.attachment,
-        snapshot: candidate.snapshot,
-        projection: candidate.projection.value
-      })];
-    });
-    return Object.freeze({
-      identity: Object.freeze({}),
+    return assembleEvaluationSnapshot({
       dataset,
-      members: Object.freeze(members),
-      available: Object.freeze(available)
+      candidates,
+      ...(this.#state === undefined ? {} : { previous: this.#state.captured })
     });
   }
 
@@ -301,17 +267,6 @@ export class DatasetCaptureRuntime<Projection> {
     this.#sourceUnsubscribes.clear();
   }
 }
-
-const sameCapturedMember = <Projection>(
-  left: CapturedMember<Projection>,
-  right: CapturedMember<Projection>
-): boolean => left.member === right.member
-  && left.attachment === right.attachment
-  && left.snapshot === right.snapshot
-  && left.projection === right.projection
-  && left.authorized === right.authorized
-  && left.sourceMismatch === right.sourceMismatch
-  && left.captureIssues === right.captureIssues;
 
 const captureFailureIssue = (reason: string, member: DatasetMember, error: unknown): Issue => createIssue({
   code: 'observer.evaluation_failed',

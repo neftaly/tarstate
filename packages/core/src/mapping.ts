@@ -1,12 +1,13 @@
-import { canonicalizeJson, isContentHash, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
+import { isContentHash, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { samePortableJson } from './internal-json-equality.js';
 import { ownedReadonlyMap } from './internal-owned-map.js';
 import { assertCompiledStorageMapping, assertPreparedSchema, sealCompiledStorageMapping } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
 import { parseRelationCandidates, parseScalarValueForField, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
-import type { JsonValue, PortableValue } from './value.js';
+import type { PortableValue } from './value.js';
 
 export type StoragePath = readonly (string | number)[];
 export type CollectionMapping =
@@ -313,7 +314,7 @@ const projectCandidate = (candidate: ExtractedCandidate, mapping: RelationStorag
       if (keyMapping.mirrorPath !== undefined) {
         const mirror = readPath(candidate.candidate, keyMapping.mirrorPath);
         if (!mirror.present && mirror.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...keyMapping.mirrorPath], { reason: mirror.reason, error: mirror.error, locator: candidate.locator }, sourceId, relationId);
-        if (!mirror.present || !samePortableCandidate(mirror.value, storageKey)) return mappingFailure('mapping.map_key_mismatch', [...candidate.absolutePath, ...keyMapping.mirrorPath], { field, mapKey: storageKey, mirror: mirror.present ? mirror.value : 'missing', locator: candidate.locator }, sourceId, relationId, 'manual_repair');
+        if (!mirror.present || !samePortableJson(mirror.value, storageKey)) return mappingFailure('mapping.map_key_mismatch', [...candidate.absolutePath, ...keyMapping.mirrorPath], { field, mapKey: storageKey, mirror: mirror.present ? mirror.value : 'missing', locator: candidate.locator }, sourceId, relationId, 'manual_repair');
       }
       output[field] = storageKey;
     } else {
@@ -417,9 +418,6 @@ const copyDataRecord = (value: Readonly<Record<string, unknown>>): Record<string
   return output;
 };
 
-const samePortableCandidate = (left: unknown, right: unknown): boolean => {
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
-};
 const sameRef = (value: unknown, expected: ArtifactRef): boolean => isRecord(value) && typeof value.id === 'string' && typeof value.contentHash === 'string' && JSON.stringify(normalizeArtifactRef(value as ArtifactRef)) === JSON.stringify(normalizeArtifactRef(expected));
 const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && hasOnlyKeys(value, ['id', 'contentHash', 'locations']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string' && location.length > 0)));
 const isRelationMapping = (value: unknown): value is RelationStorageMapping => isRecord(value) && hasOnlyKeys(value, ['collection', 'keys', 'fields']) && isCollectionMapping(value.collection) && isRecord(value.keys) && isRecord(value.fields);

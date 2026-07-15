@@ -57,6 +57,7 @@ assignArchitectureGroup('foundation', [
   'built-in-capability-declarations.ts',
   'capability-model.ts',
   'internal-canonical-json.ts',
+  'internal-json-equality.ts',
   'internal-owned-json.ts',
   'internal-owned-map.ts',
   'observer-diagnostics.ts',
@@ -112,7 +113,13 @@ assignArchitectureGroup('query-incremental', [
   'query-incremental.ts',
   'query-maintenance-diff.ts'
 ]);
-assignArchitectureGroup('transaction-model', ['receipts.ts', 'relation-delta-authoring.ts', 'transaction-authoring.ts', 'transaction.ts']);
+assignArchitectureGroup('transaction-model', [
+  'internal-transaction-expression.ts',
+  'receipts.ts',
+  'relation-delta-authoring.ts',
+  'transaction-authoring.ts',
+  'transaction.ts'
+]);
 assignArchitectureGroup('semantic-artifact', [
   'internal-constraint-set-preparation.ts',
   'internal-semantic-artifact-validation.ts',
@@ -138,6 +145,7 @@ assignArchitectureGroup('observer-contract', ['database-model.ts', 'observer-mai
 assignArchitectureGroup('observer', [
   'database.ts',
   'external-store.ts',
+  'internal-observer-capture-core.ts',
   'internal-observer-dataset-capture.ts',
   'internal-observer-maintenance-frame.ts',
   'internal-observer-values.ts',

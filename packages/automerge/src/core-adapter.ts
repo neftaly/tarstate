@@ -1,6 +1,7 @@
 import * as Automerge from '@automerge/automerge';
 import { comparePortableStrings } from './portable-order.js';
 import { adoptAutomergeMapStorageBindingOptions } from './internal-options-ownership.js';
+import { samePortableJson } from './internal-portable-json.js';
 import {
   canonicalizeJson,
   createIssue,
@@ -12,8 +13,6 @@ import {
 } from '@tarstate/core/foundation';
 import {
   type AtomicSource,
-  type Footprint,
-  type FootprintRelation,
   type IntentMergeResult,
   type LogicalEdit,
   type PlanResult,
@@ -47,33 +46,18 @@ import {
   type AutomergePropertyEdit,
   valueAtAutomergePath
 } from './storage-binding.js';
+import {
+  automergePathFootprint,
+  relateAutomergeFootprints,
+  type AutomergePathFootprint
+} from './footprint.js';
 
-export type AutomergePathFootprintEntry = {
-  readonly scope: 'exact' | 'subtree';
-  readonly path: AutomergePath;
-};
-
-export type AutomergePathFootprint = {
-  readonly kind: 'automerge-paths';
-  readonly entries: readonly AutomergePathFootprintEntry[];
-};
-
-export const automergePathFootprint = (entries: readonly AutomergePathFootprintEntry[]): AutomergePathFootprint => Object.freeze({
-  kind: 'automerge-paths',
-  entries: Object.freeze(normalizeFootprintEntries(entries))
-});
-
-export const relateAutomergeFootprints = (left: Footprint, right: Footprint): FootprintRelation => {
-  const normalizedLeft = parseFootprint(left);
-  const normalizedRight = parseFootprint(right);
-  if (normalizedLeft === undefined || normalizedRight === undefined) return 'unknown';
-  const leftInRight = normalizedLeft.every((entry) => normalizedRight.some((bound) => entryContainedBy(entry, bound)));
-  const rightInLeft = normalizedRight.every((entry) => normalizedLeft.some((bound) => entryContainedBy(entry, bound)));
-  if (leftInRight && rightInLeft) return 'equal';
-  if (leftInRight) return 'contained_by';
-  if (rightInLeft) return 'contains';
-  return normalizedLeft.some((entry) => normalizedRight.some((other) => entriesIntersect(entry, other))) ? 'overlaps' : 'disjoint';
-};
+export {
+  automergePathFootprint,
+  relateAutomergeFootprints,
+  type AutomergePathFootprint,
+  type AutomergePathFootprintEntry
+} from './footprint.js';
 
 export type AutomergeAtomicSourceOptions<T extends object> = {
   readonly runtime: AutomergeSourceRuntimeApi<T>;
@@ -398,24 +382,24 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         continue;
       }
       const row = candidates[0]!;
-      if (!samePortable(row.key, edit.key)) {
+      if (!samePortableJson(row.key, edit.key)) {
         issues.push(adapterIssue('mapping.locator_stale', 'plan', snapshot.sourceId, this.#relationId, undefined, { reason: 'logical_key_changed' }));
         continue;
       }
       if (edit.kind === 'replace-fields') {
-        if (typeof this.#keySource !== 'string' && Object.hasOwn(edit.fields, this.#keySource.field) && !samePortable(edit.fields[this.#keySource.field], row.fields[this.#keySource.field])) {
+        if (typeof this.#keySource !== 'string' && Object.hasOwn(edit.fields, this.#keySource.field) && !samePortableJson(edit.fields[this.#keySource.field], row.fields[this.#keySource.field])) {
           issues.push(createIssue({ code: 'mapping.rekey_required', sourceId: snapshot.sourceId, relationId: this.#relationId, path: [...row.storagePath, this.#keySource.field], retry: 'after_input' }));
           continue;
         }
         for (const [field, value] of Object.entries(edit.fields).sort(([left], [right]) => comparePortableStrings(left, right))) {
-          if (!samePortable(row.fields[field], value)) addPropertyEdit({ kind: 'replace', path: [...row.storagePath, field], value });
+          if (!samePortableJson(row.fields[field], value)) addPropertyEdit({ kind: 'replace', path: [...row.storagePath, field], value });
         }
       } else if (edit.kind === 'replace-row') {
-        if (typeof this.#keySource !== 'string' && !samePortable(edit.fields[this.#keySource.field], row.fields[this.#keySource.field])) {
+        if (typeof this.#keySource !== 'string' && !samePortableJson(edit.fields[this.#keySource.field], row.fields[this.#keySource.field])) {
           issues.push(createIssue({ code: 'mapping.rekey_required', sourceId: snapshot.sourceId, relationId: this.#relationId, path: [...row.storagePath, this.#keySource.field], retry: 'after_input' }));
           continue;
         }
-        if (!samePortable(row.fields, edit.fields)) addPropertyEdit({ kind: 'replace', path: row.storagePath, value: edit.fields });
+        if (!samePortableJson(row.fields, edit.fields)) addPropertyEdit({ kind: 'replace', path: row.storagePath, value: edit.fields });
       } else if (edit.kind === 'delete') {
         addPropertyEdit({ kind: 'delete', path: row.storagePath });
       } else if (edit.kind === 'counter-increment') {
@@ -546,53 +530,7 @@ const parseAutomergeBasis = (value: unknown): AutomergeBasis | undefined => {
   return { kind: 'automerge-heads', heads: [...new Set(candidate.heads as string[])].sort() };
 };
 
-const parseFootprint = (value: Footprint): readonly AutomergePathFootprintEntry[] | undefined => {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const candidate = value as { readonly kind?: unknown; readonly entries?: unknown };
-  if (candidate.kind !== 'automerge-paths' || !Array.isArray(candidate.entries)) return undefined;
-  const entries: AutomergePathFootprintEntry[] = [];
-  for (const raw of candidate.entries) {
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-    const entry = raw as { readonly scope?: unknown; readonly path?: unknown };
-    if ((entry.scope !== 'exact' && entry.scope !== 'subtree') || !Array.isArray(entry.path) || entry.path.some((part) => typeof part !== 'string' && typeof part !== 'number')) return undefined;
-    entries.push({ scope: entry.scope, path: entry.path as AutomergePath });
-  }
-  return normalizeFootprintEntries(entries);
-};
-
-const normalizeFootprintEntries = (entries: readonly AutomergePathFootprintEntry[]): AutomergePathFootprintEntry[] => {
-  const byIdentity = new Map<string, AutomergePathFootprintEntry>();
-  for (const entry of entries) {
-    const normalized = { scope: entry.scope, path: Object.freeze([...entry.path]) } satisfies AutomergePathFootprintEntry;
-    byIdentity.set(canonicalizeJson(normalized as unknown as JsonValue), Object.freeze(normalized));
-  }
-  return [...byIdentity.values()].sort((left, right) => comparePortableStrings(canonicalizeJson(left as unknown as JsonValue), canonicalizeJson(right as unknown as JsonValue)));
-};
-
-const entryContainedBy = (candidate: AutomergePathFootprintEntry, bound: AutomergePathFootprintEntry): boolean => {
-  if (bound.scope === 'exact') return candidate.scope === 'exact' && samePath(candidate.path, bound.path);
-  return pathStartsWith(candidate.path, bound.path);
-};
-
-const entriesIntersect = (left: AutomergePathFootprintEntry, right: AutomergePathFootprintEntry): boolean => {
-  if (left.scope === 'exact' && right.scope === 'exact') return samePath(left.path, right.path);
-  if (left.scope === 'subtree' && right.scope === 'subtree') return pathStartsWith(left.path, right.path) || pathStartsWith(right.path, left.path);
-  const exact = left.scope === 'exact' ? left : right;
-  const subtree = left.scope === 'subtree' ? left : right;
-  return pathStartsWith(exact.path, subtree.path);
-};
-
-const pathStartsWith = (path: AutomergePath, prefix: AutomergePath): boolean =>
-  prefix.length <= path.length && prefix.every((part, index) => Object.is(part, path[index]));
-
-const samePath = (left: AutomergePath, right: AutomergePath): boolean =>
-  left.length === right.length && pathStartsWith(left, right);
-
-const samePortable = (left: unknown, right: unknown): boolean => {
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
-};
-
-const sameIssues = (left: readonly Issue[], right: readonly Issue[]): boolean => samePortable(left, right);
+const sameIssues = (left: readonly Issue[], right: readonly Issue[]): boolean => samePortableJson(left, right);
 
 const mapKeyFromLogicalKey = (key: JsonValue): string | undefined =>
   Array.isArray(key) && key.length === 1 && typeof key[0] === 'string' ? key[0] : undefined;

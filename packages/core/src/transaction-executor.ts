@@ -10,6 +10,12 @@ import {
   type OperationReservation
 } from './lifecycle-governance.js';
 import { isSealedStorageProjection, type WritableLogicalRow, type WritableLogicalState } from './logical-edit.js';
+import {
+  evaluateTransactionExpression,
+  evaluateTransactionFields,
+  requireTransactionExpression
+} from './internal-transaction-expression.js';
+import { samePortableJson } from './internal-json-equality.js';
 import type { SourceBasis } from './source-state.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { QueryNode } from './query-model.js';
@@ -25,12 +31,11 @@ import {
   type Transaction,
   type TransactionAttempt,
   type TransactionGuard,
-  type WriteExpression,
   type WriteRelation,
   type WriteStatement,
   type WriteTarget
 } from './transaction.js';
-import { logicalAnd, logicalNot, logicalOr, logicalUnknown, type JsonValue, type LogicalTruth } from './value.js';
+import type { JsonValue } from './value.js';
 
 export type { WritableLogicalRow, WritableLogicalState } from './logical-edit.js';
 
@@ -443,7 +448,7 @@ const evaluatePreparedExecution = <Storage, Command>(
   if (beforeSnapshot.operationEpoch !== context.operationEpoch) {
     earlyIssues.push(transactionIssue('transaction.operation_epoch_expired', prepared.attempt, { snapshotEpoch: beforeSnapshot.operationEpoch }, 'never'));
   }
-  if (prepared.attempt.expectedBasis !== undefined && !samePortable(prepared.attempt.expectedBasis, beforeBasis)) {
+  if (prepared.attempt.expectedBasis !== undefined && !samePortableJson(prepared.attempt.expectedBasis, beforeBasis)) {
     earlyIssues.push(transactionIssue('transaction.expected_basis_stale', prepared.attempt, {
       expected: prepared.attempt.expectedBasis,
       actual: beforeBasis
@@ -561,9 +566,9 @@ const reconcileStatementResult = (
   let logicallyChanged = 0;
   for (const row of selected.value) {
     const projected = after.rows.find((candidate) =>
-      candidate.relationId === relationId && samePortable(candidate.locator, row.locator)
+      candidate.relationId === relationId && samePortableJson(candidate.locator, row.locator)
     );
-    if (projected === undefined || !samePortable(projected.fields, row.fields)) logicallyChanged += 1;
+    if (projected === undefined || !samePortableJson(projected.fields, row.fields)) logicallyChanged += 1;
   }
   return logicallyChanged === result.logicallyChanged ? result : { ...result, logicallyChanged };
 };
@@ -605,7 +610,7 @@ const evaluateStatement = <Storage, Command>(
   if (statement.kind === 'statement.insert' || statement.kind === 'statement.replace-all' || statement.kind === 'statement.upsert') {
     const candidates: Readonly<Record<string, JsonValue>>[] = [];
     for (const fields of statement.rows) {
-      const evaluated = evaluateFields(fields, {}, parameters);
+      const evaluated = evaluateTransactionFields(fields, {}, parameters);
       if (!evaluated.success) return failedStatement(empty, evaluated.issue);
       candidates.push(evaluated.value);
     }
@@ -694,8 +699,8 @@ const evaluateKeyedDelta = (
   let changed = 0;
   for (const change of statement.changes) {
     const fields = change.kind === 'delta.insert'
-      ? evaluateFields(change.fields, {}, parameters)
-      : evaluateFields(change.key, {}, parameters);
+      ? evaluateTransactionFields(change.fields, {}, parameters)
+      : evaluateTransactionFields(change.key, {}, parameters);
     if (!fields.success) return failedStatement(empty, fields.issue);
     const key = logicalKey(fields.value, keyFields);
     if (key === undefined) return failedStatement(empty, transactionIssue('transaction.delta_key_missing', undefined, { relationId, keyFields }));
@@ -778,7 +783,7 @@ const evaluateUpsert = (
     if (match === undefined) {
       edits.push({ kind: 'insert', relationId, key: key as JsonValue, fields });
       inserted += 1;
-    } else if (statement.onConflict === 'replace' && !samePortable(match.fields, fields)) {
+    } else if (statement.onConflict === 'replace' && !samePortableJson(match.fields, fields)) {
       edits.push({ kind: 'replace-row', relationId, key: match.key, locator: match.locator, fields });
       changed += 1;
     }
@@ -802,14 +807,14 @@ const evaluateRowEdits = (
     }
     const scope = { [alias]: row.fields };
     if (edit.kind === 'edit.replace') {
-      const value = requireExpression(edit.value, scope, parameters);
+      const value = requireTransactionExpression(edit.value, scope, parameters);
       if (!value.success) return value;
       replacements[field] = value.value;
-      if (!samePortable(row.fields[field], value.value)) changed = true;
+      if (!samePortableJson(row.fields[field], value.value)) changed = true;
       continue;
     }
     if (edit.kind === 'edit.counter-increment') {
-      const amount = requireExpression(edit.amount, scope, parameters);
+      const amount = requireTransactionExpression(edit.amount, scope, parameters);
       if (!amount.success) return amount;
       if (typeof amount.value !== 'number' || typeof row.fields[field] !== 'number') return expressionFailure('transaction.edit_type_mismatch', { field, edit: edit.kind });
       logicalEdits.push({ kind: 'counter-increment', relationId: row.relationId, key: row.key, locator: row.locator, field, by: amount.value });
@@ -817,13 +822,13 @@ const evaluateRowEdits = (
       outcomes.push({ edit: 'counter', mechanism: builtInCapabilityRefs.counterIncrement, preservationLosses: [] });
       continue;
     }
-    const index = requireExpression(edit.index, scope, parameters);
+    const index = requireTransactionExpression(edit.index, scope, parameters);
     if (!index.success) return index;
-    const deleteCount = requireExpression(edit.deleteCount, scope, parameters);
+    const deleteCount = requireTransactionExpression(edit.deleteCount, scope, parameters);
     if (!deleteCount.success) return deleteCount;
     if (!isIndex(index.value) || !isIndex(deleteCount.value)) return expressionFailure('transaction.edit_type_mismatch', { field, edit: edit.kind });
     if (edit.kind === 'edit.text-splice') {
-      const insert = requireExpression(edit.insert, scope, parameters);
+      const insert = requireTransactionExpression(edit.insert, scope, parameters);
       if (!insert.success) return insert;
       if (typeof insert.value !== 'string' || typeof row.fields[field] !== 'string') return expressionFailure('transaction.edit_type_mismatch', { field, edit: edit.kind });
       logicalEdits.push({ kind: 'text-splice', relationId: row.relationId, key: row.key, locator: row.locator, field, index: index.value, deleteCount: deleteCount.value, value: insert.value });
@@ -833,7 +838,7 @@ const evaluateRowEdits = (
     }
     const values: JsonValue[] = [];
     for (const expression of edit.values) {
-      const value = requireExpression(expression, scope, parameters);
+      const value = requireTransactionExpression(expression, scope, parameters);
       if (!value.success) return value;
       values.push(value.value);
     }
@@ -944,7 +949,7 @@ const selectTargets = (
       selected.push(row);
       continue;
     }
-    const evaluated = evaluateExpression(target.where, { [target.alias]: row.fields }, parameters);
+    const evaluated = evaluateTransactionExpression(target.where, { [target.alias]: row.fields }, parameters);
     if (!evaluated.success) return evaluated;
     if (evaluated.value === true) selected.push(row);
   }
@@ -978,84 +983,6 @@ const replacementMatchesRows = (
   const current = rows.map(({ fields }) => canonicalizeJson(fields as JsonValue)).sort(comparePortableStrings);
   const replacement = candidates.map((fields) => canonicalizeJson(fields as JsonValue)).sort(comparePortableStrings);
   return current.every((value, index) => value === replacement[index]);
-};
-
-const evaluateFields = (
-  fields: Readonly<Record<string, WriteExpression>>,
-  scope: Readonly<Record<string, Readonly<Record<string, JsonValue>>>>,
-  parameters: Readonly<Record<string, JsonValue>>
-): { readonly success: true; readonly value: Readonly<Record<string, JsonValue>> } | { readonly success: false; readonly issue: Issue } => {
-  const row: Record<string, JsonValue> = {};
-  for (const [field, expression] of Object.entries(fields)) {
-    const value = requireExpression(expression, scope, parameters);
-    if (!value.success) return value;
-    row[field] = value.value;
-  }
-  return { success: true, value: row };
-};
-
-type ExpressionResult =
-  | { readonly success: true; readonly value: JsonValue | typeof logicalUnknown }
-  | { readonly success: false; readonly issue: Issue };
-
-const requireExpression = (
-  expression: WriteExpression,
-  scope: Readonly<Record<string, Readonly<Record<string, JsonValue>>>>,
-  parameters: Readonly<Record<string, JsonValue>>
-): { readonly success: true; readonly value: JsonValue } | { readonly success: false; readonly issue: Issue } => {
-  const result = evaluateExpression(expression, scope, parameters);
-  if (!result.success) return result;
-  return result.value === logicalUnknown
-    ? expressionFailure('transaction.expression_indeterminate', { expression: expression.kind })
-    : { success: true, value: result.value };
-};
-
-const evaluateExpression = (
-  expression: WriteExpression,
-  scope: Readonly<Record<string, Readonly<Record<string, JsonValue>>>>,
-  parameters: Readonly<Record<string, JsonValue>>
-): ExpressionResult => {
-  if (expression.kind === 'literal') return { success: true, value: expression.value };
-  if (expression.kind === 'parameter') {
-    return Object.hasOwn(parameters, expression.name)
-      ? { success: true, value: parameters[expression.name] as JsonValue }
-      : expressionFailure('transaction.parameter_missing', { parameter: expression.name });
-  }
-  if (expression.kind === 'field') {
-    const row = scope[expression.alias];
-    return row !== undefined && Object.hasOwn(row, expression.name)
-      ? { success: true, value: row[expression.name] as JsonValue }
-      : { success: true, value: logicalUnknown };
-  }
-  if (expression.kind === 'compare') {
-    const left = evaluateExpression(expression.left, scope, parameters);
-    if (!left.success) return left;
-    const right = evaluateExpression(expression.right, scope, parameters);
-    if (!right.success) return right;
-    if (left.value === logicalUnknown || right.value === logicalUnknown || left.value === null || right.value === null) return { success: true, value: logicalUnknown };
-    const comparison = compareValues(left.value, right.value);
-    if (comparison === undefined) return { success: true, value: logicalUnknown };
-    return { success: true, value: expression.op === 'eq' ? comparison === 0 : expression.op === 'ne' ? comparison !== 0 : expression.op === 'lt' ? comparison < 0 : expression.op === 'lte' ? comparison <= 0 : expression.op === 'gt' ? comparison > 0 : comparison >= 0 };
-  }
-  if (expression.op === 'not') {
-    const value = evaluateExpression(expression.arg, scope, parameters);
-    return value.success ? { success: true, value: logicalNot(asTruth(value.value)) } : value;
-  }
-  const values: LogicalTruth[] = [];
-  for (const arg of expression.args) {
-    const value = evaluateExpression(arg, scope, parameters);
-    if (!value.success) return value;
-    values.push(asTruth(value.value));
-  }
-  return { success: true, value: expression.op === 'and' ? logicalAnd(values) : logicalOr(values) };
-};
-
-const compareValues = (left: JsonValue, right: JsonValue): number | undefined => {
-  if (typeof left === 'number' && typeof right === 'number') return left - right;
-  if (typeof left === 'string' && typeof right === 'string') return comparePortableStrings(left, right);
-  if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
-  if ((Array.isArray(left) && Array.isArray(right)) || (isJsonRecord(left) && isJsonRecord(right))) return comparePortableStrings(canonicalizeJson(left), canonicalizeJson(right));
-  return undefined;
 };
 
 const rejectedEvaluation = <Storage, Command>(
@@ -1199,30 +1126,74 @@ const isArtifactReference = (value: unknown): value is ArtifactRef => isRecord(v
 
 const isTransaction = (value: Transaction | ArtifactRef): value is Transaction => 'kind' in value && value.kind === 'transaction' && 'body' in value;
 const sameRef = (left: ArtifactRef, right: ArtifactRef): boolean => left.id === right.id && left.contentHash === right.contentHash;
-const samePortable = (left: unknown, right: unknown): boolean => {
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
-};
 const isError = (issue: Issue): boolean => issue.severity === 'error';
 const emptyLogicalState: WritableLogicalState = Object.freeze({ rows: Object.freeze([]) });
-const emptyStatementResult = (statementIndex: number): StatementResult => ({ statementIndex, matched: 0, logicallyChanged: 0, inserted: 0, deleted: 0, editOutcomes: [], issues: [] });
-const failedStatement = (empty: StatementResult, ...issues: readonly Issue[]): EvaluatedStatement => ({ editGroups: [], result: { ...empty, issues } });
-const statementRelation = (statement: WriteStatement): WriteRelation | undefined => statement.kind === 'extension'
-  ? undefined
-  : statement.kind === 'statement.insert'
-    || statement.kind === 'statement.insert-from-query'
-    || statement.kind === 'statement.upsert'
-    || statement.kind === 'statement.replace-all'
-    || statement.kind === 'statement.keyed-delta'
-    ? statement.relation
-    : statement.target.relation;
-const expressionFailure = (code: string, details: JsonValue): { readonly success: false; readonly issue: Issue } => ({ success: false, issue: transactionIssue(code, undefined, details) });
-const transactionIssue = (code: string, attempt?: Pick<TransactionAttempt, 'operationId'>, details?: JsonValue, retry?: Issue['retry']): Issue => createIssue({ code, ...(attempt === undefined ? {} : { operationId: attempt.operationId }), ...(details === undefined ? {} : { details }), ...(retry === undefined ? {} : { retry }) });
+const emptyStatementResult = (statementIndex: number): StatementResult => ({
+  statementIndex,
+  matched: 0,
+  logicallyChanged: 0,
+  inserted: 0,
+  deleted: 0,
+  editOutcomes: [],
+  issues: []
+});
+
+const failedStatement = (
+  empty: StatementResult,
+  ...issues: readonly Issue[]
+): EvaluatedStatement => ({ editGroups: [], result: { ...empty, issues } });
+
+const statementRelation = (statement: WriteStatement): WriteRelation | undefined => {
+  switch (statement.kind) {
+    case 'extension': return undefined;
+    case 'statement.insert':
+    case 'statement.insert-from-query':
+    case 'statement.upsert':
+    case 'statement.replace-all':
+    case 'statement.keyed-delta':
+      return statement.relation;
+    default:
+      return statement.target.relation;
+  }
+};
+
+const expressionFailure = (
+  code: string,
+  details: JsonValue
+): { readonly success: false; readonly issue: Issue } => ({
+  success: false,
+  issue: transactionIssue(code, undefined, details)
+});
+
+const transactionIssue = (
+  code: string,
+  attempt?: Pick<TransactionAttempt, 'operationId'>,
+  details?: JsonValue,
+  retry?: Issue['retry']
+): Issue => createIssue({
+  code,
+  ...(attempt === undefined ? {} : { operationId: attempt.operationId }),
+  ...(details === undefined ? {} : { details }),
+  ...(retry === undefined ? {} : { retry })
+});
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;
 const signalAborted = (signal?: AbortSignal): boolean => signal?.aborted === true;
-const isRecord = (value: unknown): value is Readonly<Record<string, any>> => value !== null && typeof value === 'object' && !Array.isArray(value);
-const isJsonRecord = (value: unknown): value is Readonly<Record<string, JsonValue>> => isRecord(value) && Object.values(value).every((child) => {
-  try { canonicalizeJson(child as JsonValue); return true; } catch { return false; }
-});
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+
+const isJsonRecord = (value: unknown): value is Readonly<Record<string, JsonValue>> =>
+  isRecord(value) && Object.values(value).every((child) => {
+    try {
+      canonicalizeJson(child as JsonValue);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 const isIndex = (value: JsonValue): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-const asTruth = (value: JsonValue | typeof logicalUnknown): LogicalTruth => value === true ? true : value === false ? false : logicalUnknown;
-const uniqueOutcomes = (outcomes: readonly SemanticEditOutcome[]): readonly SemanticEditOutcome[] => [...new Map(outcomes.map((outcome) => [canonicalizeJson(outcome as unknown as JsonValue), outcome])).values()];
+const uniqueOutcomes = (
+  outcomes: readonly SemanticEditOutcome[]
+): readonly SemanticEditOutcome[] => [...new Map(outcomes.map((outcome) => [
+  canonicalizeJson(outcome as unknown as JsonValue),
+  outcome
+])).values()];

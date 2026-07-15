@@ -1,6 +1,7 @@
 import { canonicalizeJson, type ContentHash } from './artifacts.js';
 import { createIssue, type Issue } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import { samePortableJson } from './internal-json-equality.js';
 import type { MemoryRow, MemoryState } from './memory-source.js';
 import { sealStorageProjection, type WritableLogicalRow } from './logical-edit.js';
 import type { SourceBasis, SourceSnapshot } from './source-state.js';
@@ -86,7 +87,7 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
         : { outcome: 'rejected', issues: [createIssue({ code: 'transaction.operation_id_ambiguous', operationId: input.operationId, sourceId: this.sourceId })] };
     }
     const beforeBasis = this.#basis();
-    if (!samePortable(input.expectedBasis, beforeBasis)) {
+    if (!samePortableJson(input.expectedBasis, beforeBasis)) {
       return { outcome: 'rejected', beforeBasis, issues: [createIssue({ code: 'transaction.expected_basis_stale', operationId: input.operationId, sourceId: this.sourceId, details: { expected: input.expectedBasis, actual: beforeBasis } })] };
     }
     const staged = this.stage(this.snapshot(), input.commands);
@@ -232,7 +233,7 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
         continue;
       }
       const row = rowsByLocator.get(edit.relationId + '\u0000' + canonicalizeJson(edit.locator));
-      if (row === undefined || !samePortable(row.key, edit.key)) {
+      if (row === undefined || !samePortableJson(row.key, edit.key)) {
         issues.push(createIssue({ code: 'mapping.locator_stale', sourceId: snapshot.sourceId, relationId: edit.relationId, key: edit.key }));
         continue;
       }
@@ -321,7 +322,7 @@ const commandForOperations = (
         modified = true;
       } else {
         const replacement = operation.update(next[index] as MemoryRow);
-        if (!samePortable(next[index], replacement)) {
+        if (!samePortableJson(next[index], replacement)) {
           next[index] = replacement;
           modified = true;
         }
@@ -344,6 +345,3 @@ const ownRow = (row: Readonly<Record<string, JsonValue>>): MemoryRow => {
   return owned.value as MemoryRow;
 };
 const ownState = (state: MemoryState): MemoryState => Object.freeze(Object.fromEntries(Object.entries(state).map(([relationId, rows]) => [relationId, Object.freeze(rows.map(ownRow))])));
-const samePortable = (left: unknown, right: unknown): boolean => {
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
-};

@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { samePortableJson } from './internal-json-equality.js';
 import { sealPreparedPlan } from './internal-prepared-plan.js';
 import type { PreparedPlan } from './query-plan-contract.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue } from './value.js';
@@ -50,6 +50,5 @@ export const detachPreparedPlan = <Query>(plan: PreparedPlan<Query>): PreparedPl
 };
 
 export const samePortableObserverValue = (left: unknown, right: unknown): boolean => {
-  if (Object.is(left, right)) return true;
-  try { return canonicalizeJson(left as JsonValue) === canonicalizeJson(right as JsonValue); } catch { return false; }
+  return samePortableJson(left, right);
 };
