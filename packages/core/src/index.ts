@@ -1,4 +1,5 @@
 export * from './artifacts.js';
+export * from './artifact-resolver.js';
 export * from './attachment-preparation.js';
 export * from './builtins.js';
 export * from './codec.js';
@@ -14,6 +15,7 @@ export * from './lifecycle-governance.js';
 export * from './maintenance.js';
 export * from './mapping.js';
 export * from './memory-source.js';
+export * from './memory-storage-source.js';
 export * from './observer.js';
 export type { ObserverDiagnostic, ObserverDiagnosticReporter } from './observer-diagnostics.js';
 export {
@@ -68,5 +70,6 @@ export * from './semantic-artifact-parsers.js';
 export * from './source-protocol.js';
 export * from './system-relations.js';
 export * from './transaction.js';
+export * from './transaction-executor.js';
 export * from './type-authoring.js';
 export * from './value.js';

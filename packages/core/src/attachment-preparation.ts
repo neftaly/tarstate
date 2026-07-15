@@ -2,8 +2,10 @@ import {
   safeParseArtifactText,
   safeParseArtifactValue,
   type Artifact,
+  type ArtifactKind,
   type ArtifactRef
 } from './artifacts.js';
+import type { ExactArtifactResolution, ExactArtifactResolver } from './artifact-resolver.js';
 import type { AttachmentProjection, SourceSnapshot } from './database.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
@@ -29,7 +31,18 @@ export type RawBootstrapDeclaration =
   | { readonly status: 'ready'; readonly declaration: unknown }
   | { readonly status: 'malformed' | 'conflicted'; readonly issues?: readonly Issue[] };
 
-export type AttachmentArtifactResolver = (reference: ArtifactRef) => unknown;
+export type AttachmentArtifactResolver = (reference: ArtifactRef, expectedKind?: ArtifactKind) => unknown;
+
+/** Adapts lifecycle-rich exact resolution without collapsing its issues. */
+export const exactArtifactAttachmentResolver = (
+  resolver: ExactArtifactResolver,
+  options: { readonly authorityScope: string; readonly signal?: AbortSignal }
+): AttachmentArtifactResolver => (reference, expectedKind) => resolver.resolve({
+  expectedKind: expectedKind ?? 'schema',
+  reference,
+  authorityScope: options.authorityScope,
+  ...(options.signal === undefined ? {} : { signal: options.signal })
+});
 
 export type AttachmentConstraintQuery<State> = (
   query: JsonValue,
@@ -50,6 +63,7 @@ export type ReadyAttachmentPreparation<Storage = unknown, Projection = unknown, 
   readonly schema?: PreparedSchema;
   readonly mapping?: CompiledStorageMapping;
   readonly constraints: readonly SourceConstraint<ConstraintState>[];
+  readonly artifactResolutions: readonly ExactArtifactResolution[];
   readonly issues: readonly Issue[];
   readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
   readonly [attachmentPreparationBrand]: true;
@@ -57,6 +71,7 @@ export type ReadyAttachmentPreparation<Storage = unknown, Projection = unknown, 
 
 export type UnavailableAttachmentPreparation = {
   readonly state: 'unavailable';
+  readonly artifactResolutions: readonly ExactArtifactResolution[];
   readonly issues: readonly Issue[];
   readonly [attachmentPreparationBrand]: true;
 };
@@ -86,12 +101,14 @@ export const prepareDatabaseAttachment = async <State = unknown>(
   if (!selected.success) return unavailable(selected.issues);
   const declaration = selected.value.declaration;
   const issues = [...selected.value.issues];
+  const artifactResolutions: ExactArtifactResolution[] = [];
   let writable = selected.value.writable;
 
   const schemaArtifact = await resolveExactArtifact(declaration.storageSchema, 'schema', input.resolveArtifact);
-  if (!schemaArtifact.success) return unavailable([...issues, ...schemaArtifact.issues]);
+  if (schemaArtifact.resolution !== undefined) artifactResolutions.push(schemaArtifact.resolution);
+  if (!schemaArtifact.success) return unavailable([...issues, ...schemaArtifact.issues], artifactResolutions);
   const schema = prepareSchema(schemaArtifact.value.body);
-  if (!schema.success) return unavailable([...issues, ...schema.issues]);
+  if (!schema.success) return unavailable([...issues, ...schema.issues], artifactResolutions);
   const missingCodecs = input.registry.missing(schema.value.body.requiredCodecs ?? []);
   if (missingCodecs.length > 0) {
     writable = false;
@@ -102,9 +119,10 @@ export const prepareDatabaseAttachment = async <State = unknown>(
   let project: ReadyAttachmentPreparation<unknown, BindingProjection | ProjectionResult, State>['project'];
   if (declaration.projection.kind === 'storage-mapping') {
     const mappingArtifact = await resolveExactArtifact(declaration.projection.storageMapping, 'storage-mapping', input.resolveArtifact);
-    if (!mappingArtifact.success) return unavailable([...issues, ...mappingArtifact.issues]);
+    if (mappingArtifact.resolution !== undefined) artifactResolutions.push(mappingArtifact.resolution);
+    if (!mappingArtifact.success) return unavailable([...issues, ...mappingArtifact.issues], artifactResolutions);
     const preparedMapping = await safePrepareStorageMappingArtifact(mappingArtifact.value, { schemaRef: declaration.storageSchema, schema: schema.value });
-    if (!preparedMapping.success) return unavailable([...issues, ...preparedMapping.issues]);
+    if (!preparedMapping.success) return unavailable([...issues, ...preparedMapping.issues], artifactResolutions);
     mapping = preparedMapping.value.compiled;
     const requiredWriteCapabilities = mappingCapabilities(mapping);
     const missingWriteCapabilities = input.registry.missing(requiredWriteCapabilities);
@@ -121,7 +139,7 @@ export const prepareDatabaseAttachment = async <State = unknown>(
     const missingBinding = input.registry.missing([declaration.projection.storageBinding]);
     const binding = missingBinding.length === 0 ? input.resolveStorageBinding?.(declaration.projection.storageBinding) : undefined;
     if (missingBinding.length > 0 || binding === undefined) {
-      return unavailable([...issues, ...missingBinding, ...(binding === undefined && missingBinding.length === 0 ? [preparationIssue('observer.projection_unavailable', { reason: 'storage_binding_unavailable' })] : [])]);
+      return unavailable([...issues, ...missingBinding, ...(binding === undefined && missingBinding.length === 0 ? [preparationIssue('observer.projection_unavailable', { reason: 'storage_binding_unavailable' })] : [])], artifactResolutions);
     }
     project = (snapshot) => {
       if (snapshot.state !== 'ready') return { state: snapshot.state, issues: snapshot.issues };
@@ -137,6 +155,7 @@ export const prepareDatabaseAttachment = async <State = unknown>(
   let constraints: readonly SourceConstraint<State>[] = [];
   if (declaration.constraints !== undefined) {
     const constraintArtifact = await resolveExactArtifact(declaration.constraints.set, 'constraint-set', input.resolveArtifact);
+    if (constraintArtifact.resolution !== undefined) artifactResolutions.push(constraintArtifact.resolution);
     if (!constraintArtifact.success) {
       writable = false;
       issues.push(...constraintArtifact.issues);
@@ -178,6 +197,7 @@ export const prepareDatabaseAttachment = async <State = unknown>(
     schema: schema.value,
     ...(mapping === undefined ? {} : { mapping }),
     constraints,
+    artifactResolutions,
     issues,
     project
   });
@@ -202,6 +222,7 @@ export const prepareManualReadOnlyAttachment = <Storage, Projection>(input: {
     writable: false,
     schemaViewIds: schemaViewIds as readonly string[],
     constraints: [],
+    artifactResolutions: [],
     issues: issueDescriptor === undefined || issueDescriptor.value === undefined ? [] : issueDescriptor.value as readonly Issue[],
     project: project as (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>
   });
@@ -256,10 +277,32 @@ const resolveExactArtifact = async (
   reference: ArtifactRef,
   kind: string,
   resolve: AttachmentArtifactResolver
-): Promise<ParseResult<Artifact>> => {
+): Promise<
+  | { readonly success: true; readonly value: Artifact; readonly issues: readonly Issue[]; readonly resolution?: ExactArtifactResolution }
+  | { readonly success: false; readonly issues: readonly Issue[]; readonly resolution?: ExactArtifactResolution }
+> => {
   let raw: unknown;
-  try { raw = await resolve(reference); }
+  try { raw = await resolve(reference, kind as ArtifactKind); }
   catch (error) { return { success: false, issues: [preparationIssue('artifact.dependency_mismatch', { artifactId: reference.id, error: errorName(error) })] }; }
+  if (isExactArtifactResolution(raw)) {
+    const resolution = raw;
+    if (raw.state === 'unavailable') {
+      return {
+        success: false,
+        resolution,
+        issues: raw.issues.length > 0
+          ? raw.issues
+          : [preparationIssue('artifact.dependency_mismatch', { artifactId: reference.id, reason: 'all_candidates_unavailable', attempts: raw.attempts.map(({ candidateId, origin, state, freshness }) => ({ candidateId, origin, state, freshness })) })]
+      };
+    }
+    raw = raw.artifact;
+    const parsed = await safeParseArtifactValue(raw);
+    if (!parsed.success) return { ...parsed, resolution };
+    if (parsed.value.kind !== kind || !sameRef(parsed.value, reference)) {
+      return { success: false, resolution, issues: [preparationIssue('artifact.dependency_mismatch', { artifactId: reference.id, expectedKind: kind, actualKind: parsed.value.kind })] };
+    }
+    return { ...parsed, resolution };
+  }
   if (raw === undefined) return { success: false, issues: [preparationIssue('artifact.dependency_mismatch', { artifactId: reference.id, reason: 'missing' })] };
   const parsed = typeof raw === 'string' ? await safeParseArtifactText(raw) : await safeParseArtifactValue(raw);
   if (!parsed.success) return parsed;
@@ -268,6 +311,11 @@ const resolveExactArtifact = async (
   }
   return parsed;
 };
+
+const isExactArtifactResolution = (value: unknown): value is ExactArtifactResolution => isRecord(value)
+  && (value.state === 'ready' || value.state === 'unavailable')
+  && Array.isArray(value.attempts)
+  && isRecord(value.reference);
 
 const mappingCapabilities = (mapping: CompiledStorageMapping): readonly CapabilityRef[] => {
   const capabilities = new Map<string, CapabilityRef>();
@@ -293,12 +341,13 @@ const ready = <Storage, Projection, State>(
   }
   const schemaViewIds = ownStringArray(requiredDataValue(descriptors, 'schemaViewIds', 'Ready attachment preparation'), 'Ready attachment preparation schemaViewIds');
   const constraints = ownArrayValues<SourceConstraint<State>>(requiredDataValue(descriptors, 'constraints', 'Ready attachment preparation'), 'Ready attachment preparation constraints');
+  const artifactResolutions = ownArrayValues<ExactArtifactResolution>(requiredDataValue(descriptors, 'artifactResolutions', 'Ready attachment preparation'), 'Ready attachment preparation artifact resolutions');
   const issues = ownIssues(requiredDataValue(descriptors, 'issues', 'Ready attachment preparation'), 'Ready attachment preparation issues');
   const declaration = optionalDataValue(descriptors, 'declaration', 'Ready attachment preparation');
   const schema = optionalDataValue(descriptors, 'schema', 'Ready attachment preparation');
   const mapping = optionalDataValue(descriptors, 'mapping', 'Ready attachment preparation');
   return Object.freeze({
-    state: 'ready', origin, writable, schemaViewIds, constraints, issues,
+    state: 'ready', origin, writable, schemaViewIds, constraints, artifactResolutions, issues,
     project: project as ReadyAttachmentPreparation<Storage, Projection, State>['project'],
     ...(declaration === undefined ? {} : { declaration: declaration as DocumentDeclaration }),
     ...(schema === undefined ? {} : { schema: schema as PreparedSchema }),
@@ -307,7 +356,12 @@ const ready = <Storage, Projection, State>(
   });
 };
 
-const unavailable = (issues: readonly Issue[]): UnavailableAttachmentPreparation => Object.freeze({ state: 'unavailable', issues: ownIssues(issues, 'Unavailable attachment preparation issues'), [attachmentPreparationBrand]: true as const });
+const unavailable = (issues: readonly Issue[], artifactResolutions: readonly ExactArtifactResolution[] = []): UnavailableAttachmentPreparation => Object.freeze({
+  state: 'unavailable',
+  artifactResolutions: ownArrayValues<ExactArtifactResolution>(artifactResolutions, 'Unavailable attachment preparation artifact resolutions'),
+  issues: ownIssues(issues, 'Unavailable attachment preparation issues'),
+  [attachmentPreparationBrand]: true as const
+});
 
 const ownArrayValues = <Value>(input: unknown, label: string): readonly Value[] => {
   if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');

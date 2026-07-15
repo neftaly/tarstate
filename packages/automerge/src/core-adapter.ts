@@ -26,6 +26,7 @@ import {
 } from '@tarstate/core';
 import { conflictsAt, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import {
+  automergeBasis,
   type AutomergeSourceRuntimeApi,
   type AutomergeBasis,
   type AutomergeSourceCommand,
@@ -223,6 +224,9 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     }
   };
 
+  basisForStagedStorage = (_snapshot: SourceSnapshot<Automerge.Doc<T>>, stagedStorage: Automerge.Doc<T>): AutomergeBasis =>
+    automergeBasis(stagedStorage);
+
   queryOutcome = async (input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash }): Promise<SourceOutcomeLookup<SourceCommitResult>> => {
     const lookup = this.#runtime.queryOutcome(input);
     if (lookup.status === 'known') return Object.freeze({ status: 'known', result: coreCommitResult(lookup.result) });
@@ -386,6 +390,12 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         for (const [field, value] of Object.entries(edit.fields).sort(([left], [right]) => comparePortableStrings(left, right))) {
           if (!samePortable(row.fields[field], value)) addPropertyEdit({ kind: 'replace', path: [...row.storagePath, field], value });
         }
+      } else if (edit.kind === 'replace-row') {
+        if (typeof this.#keySource !== 'string' && !samePortable(edit.fields[this.#keySource.field], row.fields[this.#keySource.field])) {
+          issues.push(createIssue({ code: 'mapping.rekey_required', sourceId: snapshot.sourceId, relationId: this.#relationId, path: [...row.storagePath, this.#keySource.field], retry: 'after_input' }));
+          continue;
+        }
+        if (!samePortable(row.fields, edit.fields)) addPropertyEdit({ kind: 'replace', path: row.storagePath, value: edit.fields });
       } else if (edit.kind === 'delete') {
         addPropertyEdit({ kind: 'delete', path: row.storagePath });
       } else if (edit.kind === 'counter-increment') {

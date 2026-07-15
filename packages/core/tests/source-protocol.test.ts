@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   coordinateSourceCommit,
   createIssue,
+  stageSourceEdits,
   type AtomicSource,
   type Footprint,
   type FootprintRelation,
@@ -37,7 +38,7 @@ const source = (
   commit,
   relateFootprints,
   mergeIntents: (plans) => ({ outcome: 'merged', commands: plans.flatMap((plan) => plan.intents.map(({ command }) => command)) }),
-  stage: (_snapshot, commands) => ({ storage: Object.fromEntries(commands.map((command) => [command.path, command.value])), issues: [] })
+  stage: (snapshot, commands) => ({ storage: { ...snapshot.storage, ...Object.fromEntries(commands.map((command) => [command.path, command.value])) }, issues: [] })
 });
 
 const binding = (id: string, plan: PlanResult<Command>, declared: readonly string[] = ['a', 'b']): StorageBinding<Storage, Command> => ({
@@ -51,6 +52,28 @@ const binding = (id: string, plan: PlanResult<Command>, declared: readonly strin
 const commitInput = { operationEpoch: 'epoch', operationId: 'operation', intentHash: `sha256:${'a'.repeat(64)}` as const, expectedBasis: 0 };
 
 describe('generic source commit coordinator', () => {
+  it('stages ordered edit groups without committing and permits later groups to rewrite an earlier footprint', () => {
+    const commit = vi.fn(defaultCommit);
+    const value = source(commit);
+    const initial = value.snapshot();
+    const first = stageSourceEdits({
+      source: value,
+      bindings: [binding('write:first', { readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'a', value: 1 } }], issues: [] })],
+      snapshot: initial,
+      edits: []
+    });
+    expect(first).toMatchObject({ outcome: 'staged', snapshot: { storage: { a: 1 } }, commands: [{ path: 'a', value: 1 }] });
+    if (first.outcome !== 'staged') return;
+    const second = stageSourceEdits({
+      source: value,
+      bindings: [binding('write:second', { readFootprint: ['a'], writeFootprint: ['a'], intents: [{ footprint: ['a'], command: { path: 'a', value: 2 } }], issues: [] })],
+      snapshot: first.snapshot,
+      edits: []
+    });
+    expect(second).toMatchObject({ outcome: 'staged', snapshot: { storage: { a: 2 } }, commands: [{ path: 'a', value: 2 }] });
+    expect(commit).not.toHaveBeenCalled();
+  });
+
   it('checks all footprint bounds, merges deterministically, validates staged storage, then commits once', async () => {
     const commit = vi.fn(async () => ({ outcome: 'committed' as const, beforeBasis: 0, afterBasis: 1, issues: [] }));
     const observed: string[] = [];

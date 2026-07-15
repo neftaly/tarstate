@@ -32,6 +32,9 @@ describe('clean rewrite core surface', () => {
     expect(core.DatabaseView).toBeTypeOf('function');
     expect(core.queryObservationKey).toBeTypeOf('function');
     expect(core.coordinateSourceCommit).toBeTypeOf('function');
+    expect(core.prepareWritableExecutionContext).toBeTypeOf('function');
+    expect(core.executePreparedTransaction).toBeTypeOf('function');
+    expect(core.ExactArtifactResolver).toBeTypeOf('function');
     expect(core.SourceLifecycleCoordinator).toBeTypeOf('function');
     expect(core.GovernanceCoordinator).toBeTypeOf('function');
     expect(core.safeParseReceipt).toBeTypeOf('function');

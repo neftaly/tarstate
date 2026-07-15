@@ -3,6 +3,7 @@ export * from '../commit-coordinator.js';
 export * from '../lifecycle-governance.js';
 export * from '../receipts.js';
 export * from '../transaction.js';
+export * from '../transaction-executor.js';
 export {
   relationAccess,
   typedFieldEdit,

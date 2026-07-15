@@ -156,6 +156,12 @@ conflicted recognized bootstrap data disables automatic writable attachment
 until an authority-gated governance repair. Unknown document fields and future
 metadata are preserved.
 
+Exact artifact resolution retains every embedded, registered, catalog, and
+location attempt with lifecycle, freshness, resource, and carrier-provenance
+evidence. Stores and catalogs receive the same authority scope and cancellation
+signal as resource drivers. Attachment preparation retains these complete
+resolution records on both ready and unavailable results.
+
 A dataset is a versioned expected set of attachments. Required members must be
 ready for an exact result. Unavailable optional members contribute no rows and
 do not block exactness, but their absence remains evidence. A settled revision
@@ -191,7 +197,8 @@ one set-based statement, the target set and expression inputs are fixed from
 that statement's starting staged state, preventing iteration-order and
 Halloween effects.
 
-The source coordinator:
+The v1 transaction execution model, across source-specific transaction
+executors and generic source commit coordination:
 
 1. captures one snapshot, basis, attachment incarnation, authority, and active
    artifacts;
@@ -202,6 +209,24 @@ The source coordinator:
 6. applies intents to immutable staged storage and reprojects touched data;
 7. evaluates hard constraints on the final logical state; and
 8. performs exactly one atomic compare-and-apply.
+
+`executePreparedTransaction` and `simulatePreparedTransaction` compose a sealed
+transaction artifact with any `AtomicSource` whose prepared bindings expose
+writable logical rows. The prepared context is the authority, capability,
+schema, query, constraint, and artifact-resolution boundary. Statements stage
+in order and may revisit a footprint; unordered binding intents within one
+statement still require a merge proof. `InMemoryAtomicSource` remains the
+source-specific complete evaluator, while `LogicalMemoryAtomicSource` is the
+generic protocol proving adapter.
+
+Prepared generic execution reserves an operation identity before guard,
+constraint, or mutation-capable evaluation and retains the resulting receipt.
+Memory contexts receive a process-local ledger by default; contexts claiming
+local or persisted durability must supply a durable ledger.
+Sources with final-state constraints must provide exact basis evidence for
+their immutable staged storage; reusing the captured before-basis is not valid
+after a logical change. Relation replacement stages ordered delete and insert
+phases, while upsert replacement replaces the complete logical row.
 
 Expected-basis mismatch rejects. Without an expected basis, a safe pre-handoff
 replan MAY occur against a newer local basis. Nothing replans after handoff.

@@ -14,20 +14,36 @@ export type CoordinatedCommitResult =
   | { readonly outcome: 'rejected'; readonly issues: readonly Issue[] }
   | ({ readonly outcome: 'committed' | 'unknown' } & SourceCommitResult);
 
+export type StagedSourceEdits<Storage, Command> = {
+  readonly outcome: 'staged';
+  readonly snapshot: SourceSnapshot<Storage>;
+  readonly plans: readonly PlanResult<Command>[];
+  readonly commands: readonly Command[];
+  readonly issues: readonly Issue[];
+};
+
+export type StageSourceEditsResult<Storage, Command> =
+  | StagedSourceEdits<Storage, Command>
+  | { readonly outcome: 'rejected'; readonly issues: readonly Issue[] };
+
 /**
- * Generic one-source coordinator. Bindings remain pure planners; the source is
- * the only component allowed to compare-and-apply commands atomically.
+ * Pure pre-handoff planning and staging for one ordered logical edit group.
+ * Callers may chain the returned snapshot and append command groups before one
+ * final source commit; this function never mutates or hands off to the source.
  */
-export const coordinateSourceCommit = async <Storage, Command>(input: {
+export const stageSourceEdits = <Storage, Command>(input: {
   readonly source: AtomicSource<Storage, Command>;
   readonly bindings: readonly StorageBinding<Storage, Command>[];
+  readonly snapshot: SourceSnapshot<Storage>;
   readonly edits: readonly LogicalEdit[];
-  readonly commit: Omit<SourceCommitInput<Command>, 'commands'>;
   readonly validate?: (staged: { readonly snapshot: SourceSnapshot<Storage>; readonly plans: readonly PlanResult<Command>[] }) => readonly Issue[];
-}): Promise<CoordinatedCommitResult> => {
-  const snapshot = input.source.snapshot();
+}): StageSourceEditsResult<Storage, Command> => {
+  const snapshot = input.snapshot;
   if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
     return { outcome: 'rejected', issues: [createIssue({ code: 'source.not_ready', phase: 'load', severity: 'error', retry: 'after_refresh', sourceId: input.source.sourceId, details: { state: snapshot.state } })] };
+  }
+  if (snapshot.sourceId !== input.source.sourceId) {
+    return { outcome: 'rejected', issues: [createIssue({ code: 'source.identity_mismatch', phase: 'plan', severity: 'error', retry: 'after_input', sourceId: input.source.sourceId, details: { snapshotSourceId: snapshot.sourceId } })] };
   }
   const issues: Issue[] = [];
   const plans: PlanResult<Command>[] = [];
@@ -54,12 +70,35 @@ export const coordinateSourceCommit = async <Storage, Command>(input: {
     return { outcome: 'rejected', issues: [...issues, createIssue({ code: 'binding.stage_failed', sourceId: input.source.sourceId, details: { error: error instanceof Error ? error.name : typeof error } })] };
   }
   issues.push(...staged.issues);
-  if (!hasErrors(issues) && input.validate !== undefined) {
-    issues.push(...input.validate({ snapshot: { ...snapshot, storage: staged.storage }, plans }));
-  }
-  if (hasErrors(issues)) return { outcome: 'rejected', issues };
-  const result = await input.source.commit({ ...input.commit, commands: merged.commands });
-  const combined = issues.length === 0 ? result : { ...result, issues: [...issues, ...result.issues] };
+  const stagedSnapshot = { ...snapshot, storage: staged.storage };
+  if (!hasErrors(issues) && input.validate !== undefined) issues.push(...input.validate({ snapshot: stagedSnapshot, plans }));
+  return hasErrors(issues)
+    ? { outcome: 'rejected', issues }
+    : { outcome: 'staged', snapshot: stagedSnapshot, plans, commands: merged.commands, issues };
+};
+
+/**
+ * Generic one-source coordinator. Bindings remain pure planners; the source is
+ * the only component allowed to compare-and-apply commands atomically.
+ */
+export const coordinateSourceCommit = async <Storage, Command>(input: {
+  readonly source: AtomicSource<Storage, Command>;
+  readonly bindings: readonly StorageBinding<Storage, Command>[];
+  readonly edits: readonly LogicalEdit[];
+  readonly commit: Omit<SourceCommitInput<Command>, 'commands'>;
+  readonly validate?: (staged: { readonly snapshot: SourceSnapshot<Storage>; readonly plans: readonly PlanResult<Command>[] }) => readonly Issue[];
+}): Promise<CoordinatedCommitResult> => {
+  const snapshot = input.source.snapshot();
+  const staged = stageSourceEdits({
+    source: input.source,
+    bindings: input.bindings,
+    snapshot,
+    edits: input.edits,
+    ...(input.validate === undefined ? {} : { validate: input.validate })
+  });
+  if (staged.outcome === 'rejected') return staged;
+  const result = await input.source.commit({ ...input.commit, commands: staged.commands });
+  const combined = staged.issues.length === 0 ? result : { ...result, issues: [...staged.issues, ...result.issues] };
   return combined.outcome === 'rejected' ? { outcome: 'rejected', issues: combined.issues } : combined;
 };
 

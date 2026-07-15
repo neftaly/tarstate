@@ -18,9 +18,11 @@ type LogicalFieldsEdit = LogicalEditTarget & {
 };
 
 export type LogicalReplaceFieldsEdit = LogicalFieldsEdit & { readonly kind: 'replace-fields' };
+export type LogicalReplaceRowEdit = LogicalFieldsEdit & { readonly kind: 'replace-row' };
 
 export type LogicalSemanticEdit =
   | LogicalReplaceFieldsEdit
+  | LogicalReplaceRowEdit
   | {
       readonly kind: 'insert';
       readonly relationId: string;
@@ -100,6 +102,8 @@ export type AtomicSource<Storage, Command> = {
   readonly relateFootprints: (left: Footprint, right: Footprint) => FootprintRelation;
   readonly mergeIntents: (plans: readonly PlanResult<Command>[]) => IntentMergeResult<Command>;
   readonly stage: (snapshot: SourceSnapshot<Storage>, commands: readonly Command[]) => { readonly storage: Storage; readonly issues: readonly Issue[] };
+  /** Derives exact basis evidence for immutable staged storage without handoff. */
+  readonly basisForStagedStorage?: (snapshot: SourceSnapshot<Storage>, stagedStorage: Storage) => SourceBasis;
   readonly queryOutcome?: (input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash }) => Promise<SourceOutcomeLookup<SourceCommitResult>>;
 };
 

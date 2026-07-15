@@ -8,6 +8,9 @@ describe('production Automerge surface', () => {
     expect(automerge.AutomergeAtomicSource).toBeTypeOf('function');
     expect(automerge.AutomergeMapProjectionPlanner).toBeTypeOf('function');
     expect(automerge.AutomergeMapStorageBinding).toBeTypeOf('function');
+    expect(automerge.AutomergeMappedStorageBinding).toBeTypeOf('function');
+    expect(automerge.automergeArtifactResourceDriver).toBeTypeOf('function');
+    expect(automerge.extractAutomergeArtifactCarrier).toBeTypeOf('function');
     expect(automerge.readAutomergeMetadata).toBeTypeOf('function');
     expect(automerge.planAutomergeMetadataMutation).toBeTypeOf('function');
     expect(automerge.automergeIssueDeclarations.length).toBeGreaterThan(0);

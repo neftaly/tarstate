@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { sealArtifact, type Artifact, type ArtifactRef } from '../src/artifacts.js';
-import { prepareDatabaseAttachment, prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
+import { exactArtifactAttachmentResolver, prepareDatabaseAttachment, prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
+import { ExactArtifactResolver } from '../src/artifact-resolver.js';
 import { AttachmentCatalog, type SourceSnapshot } from '../src/database.js';
 import type { Issue } from '../src/issues.js';
 import { capabilityRefFor, CapabilityRegistry, type CapabilityDeclaration } from '../src/registry.js';
+import { ResourceResolver } from '../src/resolver.js';
 import type { DocumentDeclaration } from '../src/receipts.js';
 import type { JsonValue } from '../src/value.js';
 
@@ -141,6 +143,30 @@ describe('database attachment preparation', () => {
     lease.close();
   });
 
+  it('composes lifecycle-rich exact artifact resolution into attachment preparation', async () => {
+    const fixture = await fixtures();
+    const registry = new CapabilityRegistry('trust:exact-attachment');
+    await registry.registerDeclaration(capabilityDeclaration);
+    registry.registerImplementation({ ref: fixture.writeCapability, integrity: 'test:replace', implementation: {} });
+    const exact = new ExactArtifactResolver({
+      resourceResolver: new ResourceResolver({ authority: { permits: () => true } }),
+      registered: { get: (reference) => fixture.artifacts.get(key(reference)) }
+    });
+    const prepared = await prepareDatabaseAttachment({
+      sourceId: 'source:attachment',
+      bootstrap: { status: 'ready', declaration: fixture.declaration() },
+      resolveArtifact: exactArtifactAttachmentResolver(exact, { authorityScope: 'scope:attachment' }),
+      registry
+    });
+    expect(prepared).toMatchObject({
+      state: 'ready', writable: true, issues: [],
+      artifactResolutions: [
+        { state: 'ready', reference: { id: fixture.schema.id }, selected: { origin: 'registered' } },
+        { state: 'ready', reference: { id: fixture.mapping.id }, selected: { origin: 'registered' } }
+      ]
+    });
+  });
+
   it('keeps a valid mapping readable but makes missing exact write capabilities read-only', async () => {
     const fixture = await fixtures();
     const prepared = await prepareDatabaseAttachment({
@@ -200,6 +226,23 @@ describe('database attachment preparation', () => {
       resolveArtifact: () => undefined, registry: new CapabilityRegistry('trust:missing')
     });
     expect(prepared).toMatchObject({ state: 'unavailable', issues: [{ code: 'artifact.dependency_mismatch' }] });
+  });
+
+  it('retains complete unavailable exact-resolution attempts', async () => {
+    const fixture = await fixtures();
+    const resources = new ResourceResolver({ authority: { permits: () => false } });
+    const exact = new ExactArtifactResolver({ resourceResolver: resources });
+    const declaration = fixture.declaration();
+    const prepared = await prepareDatabaseAttachment({
+      sourceId: 'source:attachment',
+      bootstrap: { status: 'ready', declaration: { ...declaration, storageSchema: { ...declaration.storageSchema, locations: ['denied:schema'] } } },
+      resolveArtifact: exactArtifactAttachmentResolver(exact, { authorityScope: 'scope:denied' }),
+      registry: new CapabilityRegistry('trust:denied')
+    });
+    expect(prepared).toMatchObject({
+      state: 'unavailable',
+      artifactResolutions: [{ state: 'unavailable', attempts: [{ state: 'denied', resource: { requested: { uri: 'denied:schema' } } }] }]
+    });
   });
 });
 
