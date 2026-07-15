@@ -144,16 +144,19 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   };
 
   plan = (snapshot: SourceSnapshot<Automerge.Doc<T>>, edits: readonly LogicalEdit[]): PlanResult<AutomergeSourceCommand<T>> => {
-    const relevant = edits.filter(({ relationId }) => this.#relations.has(relationId));
+    const handledEdits = edits.flatMap((edit, editIndex) => this.#relations.has(edit.relationId)
+      ? [{ editIndex, mode: 'exclusive' as const }]
+      : []);
+    const relevant = handledEdits.map(({ editIndex }) => edits[editIndex] as LogicalEdit);
     const empty = automergePathFootprint([]);
-    if (relevant.length === 0) return { readFootprint: empty, writeFootprint: empty, intents: [], issues: [] };
+    if (relevant.length === 0) return { handledEdits, readFootprint: empty, writeFootprint: empty, intents: [], issues: [] };
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
-      return { readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues: [sourceIssue(snapshot.sourceId, snapshot.state)] };
+      return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues: [sourceIssue(snapshot.sourceId, snapshot.state)] };
     }
     const projection = this.project(snapshot);
     const issues = [...projection.issues];
     if (projection.completeness !== 'exact') {
-      return { readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues };
+      return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues };
     }
     const intents: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> }[] = [];
     for (const edit of relevant) {
@@ -238,8 +241,8 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     }
     const writeFootprint = automergePathFootprint(intents.flatMap(({ footprint }) => footprint.entries));
     return issues.some(({ severity }) => severity === 'error')
-      ? { readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues }
-      : { readFootprint: this.declaredReadFootprint, writeFootprint, intents, issues };
+      ? { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues }
+      : { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents, issues };
   };
 
   #planInsert(

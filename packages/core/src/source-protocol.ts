@@ -54,7 +54,15 @@ export type ProjectionResult<Row = unknown> = {
   readonly issues: readonly Issue[];
 };
 
+export type PlannedEditHandling = {
+  readonly editIndex: number;
+  /** Cooperative handling permits multiple bindings to contribute intents for one edit. */
+  readonly mode: 'exclusive' | 'cooperative';
+};
+
 export type PlanResult<Command> = {
+  /** Explicit evidence that this binding handled specific indexes in the supplied edit array. */
+  readonly handledEdits: readonly PlannedEditHandling[];
   readonly readFootprint: Footprint;
   readonly writeFootprint: Footprint;
   readonly intents: readonly StorageIntent<Command>[];

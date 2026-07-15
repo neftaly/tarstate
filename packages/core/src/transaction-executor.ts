@@ -80,7 +80,8 @@ export type PreparedWritableExecutionContext<Storage, Command> = {
   readonly relationKeys: ReadonlyMap<string, readonly string[]>;
   readonly query: PreparedTransactionQueryService;
   readonly constraints?: readonly SourceConstraint<WritableLogicalState>[];
-  readonly satisfiesCapability?: (capability: CapabilityRef) => boolean;
+  /** Authority decision for every exact capability required by an artifact. */
+  readonly satisfiesCapability: (capability: CapabilityRef) => boolean;
   readonly resolveTransaction?: (ref: ArtifactRef, signal?: AbortSignal) => Promise<Transaction | undefined>;
   readonly durability: 'memory' | 'local' | 'persisted';
 };
@@ -111,6 +112,7 @@ export const prepareWritableExecutionContext = <Storage, Command>(
     || !(input.relationKeys instanceof Map)
     || !isRecord(input.query)
     || typeof input.query.evaluate !== 'function'
+    || typeof input.satisfiesCapability !== 'function'
     || (input.operationLedger !== undefined && !isOperationLedger(input.operationLedger))
     || !['memory', 'local', 'persisted'].includes(input.durability)) {
     throw new TypeError('Prepared writable execution context has invalid boundary fields');
@@ -364,7 +366,7 @@ const prepareExecution = async <Storage, Command>(
   if (!sameRef(transaction.body.schemaView, context.schemaView)) {
     return reject([transactionIssue('transaction.schema_view_unavailable', attempt, { schemaView: transaction.body.schemaView })]);
   }
-  const missing = transaction.body.requiredCapabilities.filter((capability) => context.satisfiesCapability?.(capability) === false);
+  const missing = transaction.body.requiredCapabilities.filter((capability) => !context.satisfiesCapability(capability));
   if (missing.length > 0) {
     return reject([createIssue({
       code: 'transaction.capability_unavailable',
@@ -403,6 +405,7 @@ const evaluatePreparedExecution = <Storage, Command>(
     return rejectedEvaluation(beforeSnapshot, beforeBasis, initialProjection.state, initialProjection.issues);
   }
   let stagedSnapshot = beforeSnapshot;
+  let stagedBasis = beforeBasis;
   let logicalState = initialProjection.state;
   const beforeState = logicalState;
   const commands: Command[] = [];
@@ -411,7 +414,7 @@ const evaluatePreparedExecution = <Storage, Command>(
   const touchedRelations = new Set<string>();
   for (const [statementIndex, statement] of prepared.transaction.body.statements.entries()) {
     const statementStart = logicalState;
-    const evaluated = evaluateStatement(context, statement, statementIndex, statementStart, prepared.transaction.body.parameters, beforeBasis);
+    const evaluated = evaluateStatement(context, statement, statementIndex, statementStart, prepared.transaction.body.parameters, stagedBasis);
     statementResults.push(evaluated.result);
     issues.push(...evaluated.result.issues);
     if (evaluated.result.issues.some(isError)) break;
@@ -429,7 +432,14 @@ const evaluatePreparedExecution = <Storage, Command>(
         statementRejected = true;
         break;
       }
-      stagedSnapshot = staged.snapshot;
+      const derivedBasis = deriveStagedBasis(context, beforeSnapshot, staged.snapshot);
+      if ('issue' in derivedBasis) {
+        issues.push(derivedBasis.issue);
+        statementRejected = true;
+        break;
+      }
+      stagedBasis = derivedBasis.basis;
+      stagedSnapshot = { ...staged.snapshot, basis: stagedBasis };
       commands.push(...staged.commands);
       issues.push(...staged.issues);
     }
@@ -450,30 +460,24 @@ const evaluatePreparedExecution = <Storage, Command>(
   }
   let blockingIssues = issues.filter(isError);
   if (blockingIssues.length === 0) {
-    const guardIssues = evaluateGuards(context, prepared.transaction.body.guards, logicalState, prepared.transaction.body.parameters, statementResults, prepared.attempt, beforeBasis);
+    const guardIssues = evaluateGuards(context, prepared.transaction.body.guards, logicalState, prepared.transaction.body.parameters, statementResults, prepared.attempt, stagedBasis);
     issues.push(...guardIssues);
     blockingIssues = guardIssues.filter(isError);
   }
   if (blockingIssues.length === 0 && context.constraints !== undefined && context.constraints.length > 0) {
-    const stagedBasis = stagedBasisForConstraints(context, beforeSnapshot, stagedSnapshot);
-    if ('issue' in stagedBasis) {
-      issues.push(stagedBasis.issue);
-      blockingIssues = [stagedBasis.issue];
-    } else {
-      const checked = checkFinalConstraints({
-        constraints: context.constraints,
-        before: beforeState,
-        after: logicalState,
-        beforeBasis,
-        afterBasis: stagedBasis.basis,
-        touchedRelations
-      });
-      issues.push(...checked.blockingIssues, ...checked.auditIssues);
-      blockingIssues = [...checked.blockingIssues];
-    }
+    const checked = checkFinalConstraints({
+      constraints: context.constraints,
+      before: beforeState,
+      after: logicalState,
+      beforeBasis,
+      afterBasis: stagedBasis,
+      touchedRelations
+    });
+    issues.push(...checked.blockingIssues, ...checked.auditIssues);
+    blockingIssues = [...checked.blockingIssues];
   }
   const returning = blockingIssues.length === 0
-    ? evaluateReturning(context, prepared, logicalState, beforeBasis)
+    ? evaluateReturning(context, prepared, logicalState, stagedBasis)
     : undefined;
   if (returning !== undefined) issues.push(...returning.flatMap(({ issues: resultIssues }) => resultIssues));
   return {
@@ -513,18 +517,18 @@ const reconcileStatementResult = (
   return logicallyChanged === result.logicallyChanged ? result : { ...result, logicallyChanged };
 };
 
-const stagedBasisForConstraints = <Storage, Command>(
+const deriveStagedBasis = <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   before: ReturnType<AtomicSource<Storage, Command>['snapshot']>,
   staged: ReturnType<AtomicSource<Storage, Command>['snapshot']>
 ): { readonly basis: SourceBasis } | { readonly issue: Issue } => {
   if (staged.storage === undefined || context.source.basisForStagedStorage === undefined) {
-    return { issue: transactionIssue('constraint.indeterminate', undefined, { reason: 'staged_basis_unavailable' }, 'after_refresh') };
+    return { issue: transactionIssue('transaction.staged_basis_unavailable', undefined, { reason: 'basis_derivation_unavailable' }, 'after_refresh') };
   }
   try {
     return { basis: context.source.basisForStagedStorage(before, staged.storage) };
   } catch (error) {
-    return { issue: transactionIssue('constraint.indeterminate', undefined, { reason: 'staged_basis_failed', error: errorName(error) }, 'after_refresh') };
+    return { issue: transactionIssue('transaction.staged_basis_unavailable', undefined, { reason: 'basis_derivation_failed', error: errorName(error) }, 'after_refresh') };
   }
 };
 

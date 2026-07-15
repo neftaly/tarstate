@@ -179,7 +179,8 @@ physical snapshot and its projected logical state.
 2. Capture one ready source snapshot and verify attachment identity, operation
    epoch, context writability and authority, and optional expected basis.
 3. Resolve and parse the transaction artifact exactly, then verify its schema
-   view and required capabilities against the prepared context. Compute the
+   view and required capabilities through the prepared context's required,
+   explicit authorization callback. Compute the
    intent hash from exactly the operation epoch, transaction hash, attachment
    ID, attachment fingerprint, optional expected basis, and authority-view
    fingerprint. Operation ID and physical command objects are excluded from
@@ -190,17 +191,21 @@ physical snapshot and its projected logical state.
    that statement's starting logical state. Produce logical edits and the
    statement result without mutating live storage.
 6. Plan that statement's edits against the current staged physical snapshot.
-   Check declared footprints and merge potentially competing intents across
-   bindings for that statement only.
+   Require explicit indexed handling evidence for every edit, reject missing or
+   conflicting exclusive handlers, check declared footprints, and merge
+   cooperative intents across bindings for that statement only.
 7. Append the resulting commands to the ordered command list, stage them, and
-   reproject affected bindings before evaluating the next statement. Footprint
+   derive the exact staged basis before reprojecting affected bindings and
+   evaluating the next statement. Footprint
    overlap between different ordered statements is allowed; overlap between
    unordered binding plans for one statement still requires a merge proof.
-8. Evaluate affected-count and query guards against the ordered staged result.
-9. Derive exact staged basis evidence from the source and evaluate required and
-   audit constraints against the complete final logical staged state. Required
-   violation, indeterminacy, or unavailable staged basis rejects.
-10. Evaluate returning queries against that same final logical state, retaining
+8. Evaluate affected-count and query guards against the ordered staged result
+   at its staged basis.
+9. Evaluate required and audit constraints against the complete final logical
+   staged state and its exact staged basis. Required violation, indeterminacy,
+   or unavailable staged basis rejects.
+10. Evaluate returning queries against that same final logical state and staged
+    basis, retaining
     rows and result keys until an actual committed after-basis is known.
 11. Simulation stops here and emits a simulation receipt. Commit execution
     hands the complete ordered command list to the source exactly once.

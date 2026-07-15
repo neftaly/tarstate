@@ -41,17 +41,54 @@ const source = (
   stage: (snapshot, commands) => ({ storage: { ...snapshot.storage, ...Object.fromEntries(commands.map((command) => [command.path, command.value])) }, issues: [] })
 });
 
-const binding = (id: string, plan: PlanResult<Command>, declared: readonly string[] = ['a', 'b']): StorageBinding<Storage, Command> => ({
+type TestPlan = Omit<PlanResult<Command>, 'handledEdits'> & Pick<Partial<PlanResult<Command>>, 'handledEdits'>;
+
+const binding = (id: string, plan: TestPlan, declared: readonly string[] = ['a', 'b']): StorageBinding<Storage, Command> => ({
   id,
   declaredReadFootprint: declared,
   declaredWriteFootprint: declared,
   project: () => ({ rows: [], completeness: 'exact', issues: [] }),
-  plan: () => plan
+  plan: (_snapshot, edits) => ({
+    ...plan,
+    handledEdits: plan.handledEdits ?? edits.map((_edit, editIndex) => ({ editIndex, mode: 'exclusive' as const }))
+  })
 });
 
 const commitInput = { operationEpoch: 'epoch', operationId: 'operation', intentHash: `sha256:${'a'.repeat(64)}` as const, expectedBasis: 0 };
 
 describe('generic source commit coordinator', () => {
+  it('rejects unhandled and conflicting edit coverage while allowing explicit cooperation', () => {
+    const value = source();
+    const edit = { kind: 'insert' as const, relationId: 'items', key: 'a', fields: { id: 'a' } };
+    const unhandled = stageSourceEdits({
+      source: value,
+      bindings: [binding('ignores-items', { handledEdits: [], readFootprint: [], writeFootprint: [], intents: [], issues: [] })],
+      snapshot: value.snapshot(),
+      edits: [edit]
+    });
+    expect(unhandled).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.edit_unhandled' }] });
+
+    const exclusive = { readFootprint: [], writeFootprint: [], intents: [], issues: [] };
+    const conflicting = stageSourceEdits({
+      source: value,
+      bindings: [binding('first', exclusive), binding('second', exclusive)],
+      snapshot: value.snapshot(),
+      edits: [edit]
+    });
+    expect(conflicting).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.edit_handling_conflict' }] });
+
+    const cooperative = stageSourceEdits({
+      source: value,
+      bindings: [
+        binding('first', { ...exclusive, handledEdits: [{ editIndex: 0, mode: 'cooperative' }] }),
+        binding('second', { ...exclusive, handledEdits: [{ editIndex: 0, mode: 'cooperative' }] })
+      ],
+      snapshot: value.snapshot(),
+      edits: [edit]
+    });
+    expect(cooperative).toMatchObject({ outcome: 'staged' });
+  });
+
   it('stages ordered edit groups without committing and permits later groups to rewrite an earlier footprint', () => {
     const commit = vi.fn(defaultCommit);
     const value = source(commit);

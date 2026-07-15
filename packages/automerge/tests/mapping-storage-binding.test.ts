@@ -199,6 +199,7 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       operationEpoch: 'epoch:mapped',
       bindings: [binding],
       relationKeys: new Map([['relation:tasks', ['id']]]),
+      satisfiesCapability: () => true,
       query: {
         evaluate: (_root, state) => ({
           rows: state.rows.map(({ fields }) => fields),

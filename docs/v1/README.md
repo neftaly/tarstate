@@ -219,14 +219,23 @@ statement still require a merge proof. `InMemoryAtomicSource` remains the
 source-specific complete evaluator, while `LogicalMemoryAtomicSource` is the
 generic protocol proving adapter.
 
+Every binding plan reports which input edit indexes it handled. Each edit must
+have one exclusive handler, or one or more handlers that all explicitly opt
+into cooperative handling before their intents are merged. Missing, malformed,
+or conflicting handling evidence rejects before staging. A prepared writable
+context must also provide an explicit capability decision callback; allow-all
+authority is never inferred from an omitted policy.
+
 Prepared generic execution reserves an operation identity before guard,
 constraint, or mutation-capable evaluation and retains the resulting receipt.
 Memory contexts receive a process-local ledger by default; contexts claiming
 local or persisted durability must supply a durable ledger.
-Sources with final-state constraints must provide exact basis evidence for
-their immutable staged storage; reusing the captured before-basis is not valid
-after a logical change. Relation replacement stages ordered delete and insert
-phases, while upsert replacement replaces the complete logical row.
+Sources must provide exact basis evidence for immutable staged storage. The
+executor advances that basis with staged state for later statements, guards,
+returning queries, binding projections, and final constraints; reusing the
+captured before-basis after a logical change is invalid. Relation replacement
+stages ordered delete and insert phases, while upsert replacement replaces the
+complete logical row.
 
 Expected-basis mismatch rejects. Without an expected basis, a safe pre-handoff
 replan MAY occur against a newer local basis. Nothing replans after handoff.

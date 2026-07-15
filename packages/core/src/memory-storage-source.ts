@@ -185,12 +185,15 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
   };
 
   plan = (snapshot: SourceSnapshot<MemoryState>, edits: readonly LogicalEdit[]): PlanResult<LogicalMemoryCommand> => {
-    const relevant = edits.filter(({ relationId }) => this.#relations.has(relationId));
+    const handledEdits = edits.flatMap((edit, editIndex) => this.#relations.has(edit.relationId)
+      ? [{ editIndex, mode: 'exclusive' as const }]
+      : []);
+    const relevant = handledEdits.map(({ editIndex }) => edits[editIndex] as LogicalEdit);
     const intents: { readonly footprint: Footprint; readonly command: LogicalMemoryCommand }[] = [];
     const issues: Issue[] = [];
-    if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { readFootprint: this.declaredReadFootprint, writeFootprint: [], intents: [], issues: [createIssue({ code: 'source.not_ready', sourceId: snapshot.sourceId })] };
+    if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: [], intents: [], issues: [createIssue({ code: 'source.not_ready', sourceId: snapshot.sourceId })] };
     const projection = this.project(snapshot);
-    if (projection.completeness !== 'exact') return { readFootprint: this.declaredReadFootprint, writeFootprint: [], intents: [], issues: projection.issues };
+    if (projection.completeness !== 'exact') return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: [], intents: [], issues: projection.issues };
     for (const edit of relevant) {
       const relation = this.#relations.get(edit.relationId) as LogicalMemoryRelation;
       const footprint = rowFootprint(edit.relationId, edit.key);
@@ -244,8 +247,8 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
     const combined = combineMemoryIntents(intents);
     const writeFootprint = combined.flatMap(({ footprint }) => parseFootprint(footprint) ?? []);
     return issues.some(({ severity }) => severity === 'error')
-      ? { readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues }
-      : { readFootprint: this.declaredReadFootprint, writeFootprint, intents: combined, issues };
+      ? { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues }
+      : { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: combined, issues };
   };
 }
 

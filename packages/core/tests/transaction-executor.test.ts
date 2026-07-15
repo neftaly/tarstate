@@ -9,6 +9,7 @@ import {
   sealTransaction,
   simulatePreparedTransaction,
   type ArtifactRef,
+  type CapabilityRef,
   type MemoryState,
   type PreparedWritableExecutionContext,
   type TransactionAttempt,
@@ -22,7 +23,7 @@ const literal = (value: string) => ({ kind: 'literal' as const, value });
 const field = (name: string) => ({ kind: 'field' as const, alias: 'item', name });
 const queryRoot = { kind: 'values' as const, alias: 'result', rows: [] };
 
-const makeContext = async () => {
+const makeContext = async (satisfiesCapability: (capability: CapabilityRef) => boolean = () => true) => {
   const source = new LogicalMemoryAtomicSource({
     sourceId: 'source:executor-memory',
     incarnation: 'incarnation:executor-memory',
@@ -55,6 +56,7 @@ const makeContext = async () => {
     operationEpoch: 'epoch:executor',
     bindings: [binding],
     relationKeys: new Map([['items', ['id']]]),
+    satisfiesCapability,
     query: {
       evaluate: (_root, state) => ({
         rows: state.rows.map(({ fields }) => fields),
@@ -262,6 +264,7 @@ describe('prepared source-local transaction executor', () => {
       schemaView, source, operationEpoch: 'epoch:executor',
       bindings: [new LogicalMemoryStorageBinding({ relations: [{ relationId: 'items', keyFields: ['id'] }] })],
       relationKeys: new Map([['items', ['id']]]),
+      satisfiesCapability: () => true,
       query: { evaluate: () => ({ rows: [], resultKeys: [], completeness: 'exact', issues: [] }) },
       constraints: [{ id: 'basis', mode: 'required', dependencyRelations: ['items'], evaluate: (_state, basis) => { observed.push(basis); return { status: 'satisfied' }; } }],
       durability: 'memory'
@@ -272,6 +275,60 @@ describe('prepared source-local transaction executor', () => {
       { incarnation: 'incarnation:executor-memory', revision: 0 },
       { incarnation: 'incarnation:executor-memory', revision: 1 }
     ]);
+  });
+
+  it('uses staged basis evidence for later statement, guard, and returning queries', async () => {
+    const { source } = await makeContext();
+    const observed: unknown[] = [];
+    const context = prepareWritableExecutionContext({
+      attachmentId: 'attachment:executor', attachmentIncarnation: 'attachment-incarnation:executor',
+      attachmentFingerprint: hash('b'), authorityViewFingerprint: hash('c'), writable: true,
+      schemaView, source, operationEpoch: 'epoch:executor',
+      bindings: [new LogicalMemoryStorageBinding({ relations: [{ relationId: 'items', keyFields: ['id'] }] })],
+      relationKeys: new Map([['items', ['id']]]),
+      satisfiesCapability: () => true,
+      query: { evaluate: (_root, _state, _parameters, basis) => {
+        observed.push(basis);
+        return { rows: [], resultKeys: [], completeness: 'exact', issues: [] };
+      } },
+      durability: 'memory'
+    });
+    const value = await sealTransaction({ body: {
+      schemaView,
+      parameters: {},
+      statements: [
+        { kind: 'statement.update', target: { relation, alias: 'item' }, edits: { title: { kind: 'edit.replace', value: literal('Staged') } } },
+        { kind: 'statement.insert-from-query', relation, root: queryRoot }
+      ],
+      guards: [{ kind: 'guard.query', root: queryRoot, expect: 'empty' }],
+      returning: [{ name: 'items', root: queryRoot }],
+      requiredCapabilities: []
+    } });
+    await expect(executePreparedTransaction(context, attempt(value, 'operation:query-basis'))).resolves.toMatchObject({
+      outcome: 'committed',
+      returning: [{ basis: { revision: 1 } }]
+    });
+    expect(observed).toEqual([
+      { incarnation: 'incarnation:executor-memory', revision: 1 },
+      { incarnation: 'incarnation:executor-memory', revision: 1 },
+      { incarnation: 'incarnation:executor-memory', revision: 1 }
+    ]);
+  });
+
+  it('requires an explicit authority decision for artifact capabilities', async () => {
+    const required: CapabilityRef = { id: 'urn:test:capability:write', version: '1', contractHash: hash('d') };
+    const { context } = await makeContext(() => false);
+    const value = await sealTransaction({ body: {
+      schemaView,
+      parameters: {},
+      statements: [],
+      guards: [],
+      requiredCapabilities: [required]
+    } });
+    await expect(executePreparedTransaction(context, attempt(value, 'operation:capability-denied'))).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'transaction.capability_unavailable', requiredCapabilities: [required] }]
+    });
   });
 
   it('reconciles semantic no-ops before affected-count guards', async () => {

@@ -47,6 +47,7 @@ export const stageSourceEdits = <Storage, Command>(input: {
   }
   const issues: Issue[] = [];
   const plans: PlanResult<Command>[] = [];
+  const editHandlers = input.edits.map(() => [] as { readonly bindingId: string; readonly mode: 'exclusive' | 'cooperative' }[]);
   for (const binding of [...input.bindings].sort((left, right) => comparePortableStrings(left.id, right.id))) {
     let plan: PlanResult<Command>;
     try {
@@ -55,11 +56,13 @@ export const stageSourceEdits = <Storage, Command>(input: {
       return { outcome: 'rejected', issues: [createIssue({ code: 'binding.plan_failed', sourceId: input.source.sourceId, details: { bindingId: binding.id, error: error instanceof Error ? error.name : typeof error } })] };
     }
     issues.push(...plan.issues);
+    collectEditHandling(binding.id, plan, input.edits, editHandlers, issues);
     requireContained(input.source, binding.id, 'read', plan.readFootprint, binding.declaredReadFootprint, issues);
     requireContained(input.source, binding.id, 'write', plan.writeFootprint, binding.declaredWriteFootprint, issues);
     for (const intent of plan.intents) requireContained(input.source, binding.id, 'intent', intent.footprint, plan.writeFootprint, issues);
     plans.push(plan);
   }
+  requireCompleteEditHandling(input.edits, editHandlers, issues);
   if (hasErrors(issues)) return { outcome: 'rejected', issues };
   const merged = input.source.mergeIntents(plans);
   if (merged.outcome !== 'merged') return { outcome: 'rejected', issues: merged.issues };
@@ -103,6 +106,63 @@ export const coordinateSourceCommit = async <Storage, Command>(input: {
 };
 
 const hasErrors = (issues: readonly Issue[]): boolean => issues.some(({ severity }) => severity === 'error');
+
+const collectEditHandling = <Command>(
+  bindingId: string,
+  plan: PlanResult<Command>,
+  edits: readonly LogicalEdit[],
+  handlers: { readonly bindingId: string; readonly mode: 'exclusive' | 'cooperative' }[][],
+  issues: Issue[]
+): void => {
+  if (!Array.isArray(plan.handledEdits)) {
+    issues.push(editHandlingIssue('binding.edit_handling_invalid', { bindingId, reason: 'handled_edits_array_required' }));
+    return;
+  }
+  const claimed = new Set<number>();
+  for (const handling of plan.handledEdits) {
+    if (typeof handling !== 'object'
+      || handling === null
+      || !Number.isSafeInteger(handling.editIndex)
+      || handling.editIndex < 0
+      || handling.editIndex >= edits.length
+      || (handling.mode !== 'exclusive' && handling.mode !== 'cooperative')
+      || claimed.has(handling.editIndex)) {
+      issues.push(editHandlingIssue('binding.edit_handling_invalid', { bindingId, reason: 'invalid_or_duplicate_claim' }));
+      continue;
+    }
+    claimed.add(handling.editIndex);
+    handlers[handling.editIndex]?.push({ bindingId, mode: handling.mode });
+  }
+};
+
+const requireCompleteEditHandling = (
+  edits: readonly LogicalEdit[],
+  handlers: readonly (readonly { readonly bindingId: string; readonly mode: 'exclusive' | 'cooperative' }[])[],
+  issues: Issue[]
+): void => {
+  handlers.forEach((claims, editIndex) => {
+    const edit = edits[editIndex] as LogicalEdit;
+    if (claims.length === 0) {
+      issues.push(editHandlingIssue('binding.edit_unhandled', { editIndex, relationId: edit.relationId }));
+      return;
+    }
+    if (claims.length > 1 && claims.some(({ mode }) => mode !== 'cooperative')) {
+      issues.push(editHandlingIssue('binding.edit_handling_conflict', {
+        editIndex,
+        relationId: edit.relationId,
+        bindingIds: claims.map(({ bindingId }) => bindingId)
+      }));
+    }
+  });
+};
+
+const editHandlingIssue = (code: string, details: import('./value.js').JsonValue): Issue => createIssue({
+  code,
+  phase: 'plan',
+  severity: 'error',
+  retry: 'after_input',
+  details
+});
 
 const requireContained = <Storage, Command>(
   source: AtomicSource<Storage, Command>,

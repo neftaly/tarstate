@@ -319,11 +319,14 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   };
 
   plan = (snapshot: SourceSnapshot<Automerge.Doc<T>>, edits: readonly LogicalEdit[]): PlanResult<AutomergeSourceCommand<T>> => {
-    const relevant = edits.filter(({ relationId }) => relationId === this.#relationId);
+    const handledEdits = edits.flatMap((edit, editIndex) => edit.relationId === this.#relationId
+      ? [{ editIndex, mode: 'exclusive' as const }]
+      : []);
+    const relevant = handledEdits.map(({ editIndex }) => edits[editIndex] as LogicalEdit);
     const empty = automergePathFootprint([]);
-    if (relevant.length === 0) return { readFootprint: empty, writeFootprint: empty, intents: [], issues: [] };
+    if (relevant.length === 0) return { handledEdits, readFootprint: empty, writeFootprint: empty, intents: [], issues: [] };
     const adapted = readyAutomergeSnapshot(snapshot);
-    if (adapted === undefined) return { readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
+    if (adapted === undefined) return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint: empty, intents: [], issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
     const projection = this.#projectionPlanner.project(adapted);
     const resolvesOnly = relevant.every(({ kind }) => kind === 'conflict-resolve');
     const issues: Issue[] = projection.issues
@@ -441,8 +444,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       }
     }
     const writeFootprint = automergePathFootprint(intents.flatMap(({ footprint }) => footprint.entries));
-    if (issues.length > 0) return { readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues };
+    if (issues.length > 0) return { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: [], issues };
     return {
+      handledEdits,
       readFootprint: this.declaredReadFootprint,
       writeFootprint,
       intents,

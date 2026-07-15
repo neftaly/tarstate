@@ -101,7 +101,7 @@ describe('Automerge core source protocols', () => {
     expect((after.basis as import('../src/index.js').AutomergeBasis).heads).toEqual([...(after.basis as import('../src/index.js').AutomergeBasis).heads].sort());
   });
 
-  it('rejects overlapping binding plans deterministically before the runtime commit', async () => {
+  it('rejects competing exclusive edit handlers before the runtime commit', async () => {
     const { runtime, source, binding } = fixture();
     const overlapping = new AutomergeMapStorageBinding<TaskDoc, Readonly<Record<string, JsonValue>>>({
       id: 'binding:overlapping', relationId: 'relation:tasks', collectionPath: ['tasks'], missingCollection: 'invalid', keySource: 'map-key'
@@ -114,7 +114,7 @@ describe('Automerge core source protocols', () => {
       edits: [selectedEdit(source, binding, { title: 'Nope' })],
       commit: commitInput(before.basis as JsonValue, 'operation:overlap', 'b')
     });
-    expect(result).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.write_footprint_overlap', phase: 'plan' }] });
+    expect(result).toMatchObject({ outcome: 'rejected', issues: [{ code: 'binding.edit_handling_conflict', phase: 'plan' }] });
     expect(runtimeCommit).not.toHaveBeenCalled();
     expect(runtime.snapshot().storage.tasks.first?.title).toBe('First');
   });
