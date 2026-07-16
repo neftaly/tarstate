@@ -224,6 +224,7 @@ describe('database query session', () => {
       completeness: 'exact',
       rows
     });
+    await expect(session.whenSettled()).resolves.toBe(snapshot.current);
     expect(mountedCatalog?.list()).toHaveLength(1);
 
     session.close();
@@ -294,5 +295,27 @@ describe('database query session', () => {
       canRead: () => true
     })).rejects.toThrow('mount failed');
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('rejects settlement waits deterministically on abort and close', async () => {
+    const plan = await prepareQuery({
+      root: { kind: 'values', alias: 'row', rows: [] },
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+    const session = await openDatabaseQuery({
+      sources: [],
+      plan,
+      queryAuthorityScope: 'scope:test'
+    });
+    const alreadyAborted = new AbortController();
+    alreadyAborted.abort();
+
+    await expect(session.whenSettled({ signal: alreadyAborted.signal })).rejects.toMatchObject({
+      name: 'AbortError'
+    });
+    session.close();
+    await expect(session.whenSettled()).rejects.toThrow('Database query session is closed');
   });
 });

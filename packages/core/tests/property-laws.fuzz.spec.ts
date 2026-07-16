@@ -8,9 +8,11 @@ import {
   logicalUnknown,
   openIncrementalQueryMaintenance,
   parseArtifactText,
+  safeMaterializePortableBytes,
   safeParseJsonValue,
   sealArtifact,
   sha256Json,
+  toPortableBytes,
   type ArtifactRef,
   type JsonValue,
   type QueryMaintenanceSnapshot,
@@ -74,6 +76,15 @@ const globalQueries: readonly QueryNode[] = [
 ];
 
 describe('shrinking property laws', () => {
+  propertyTest('portable-bytes-round-trip', fc.property(
+    fc.uint8Array({ maxLength: 16_384 }),
+    (bytes) => {
+      const materialized = safeMaterializePortableBytes(toPortableBytes(bytes));
+      expect(materialized).toMatchObject({ success: true });
+      if (materialized.success) expect(materialized.value).toEqual(bytes);
+    }
+  ));
+
   propertyTest('execution-budgeted-products-never-publish-partial-results', fc.property(
     fc.integer({ min: 0, max: 30 }),
     fc.integer({ min: 0, max: 30 }),

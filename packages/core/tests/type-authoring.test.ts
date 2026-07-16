@@ -175,6 +175,11 @@ describe('literal-schema and query type authoring', () => {
       }
     });
     expectTypeOf(openLinked).returns.toEqualTypeOf<ReturnType<typeof openLinked>>();
+    type Settled = Awaited<ReturnType<Awaited<ReturnType<typeof openLinked>>['whenSettled']>>;
+    expectTypeOf<Settled['rows']>().toEqualTypeOf<readonly {
+      readonly author: string;
+      readonly manager: string;
+    }[]>();
 
     const rejectsNonLinkRows = (linkPlan: typeof prepared): OpenDatabaseQueryOptions<
       typeof prepared,

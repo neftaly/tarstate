@@ -20,6 +20,7 @@ try {
   assertClosure('artifacts/storage-mapping/index.js', 90_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
+  assertClosure('values/index.js', 25_000, ['query', 'schema', 'transaction', 'database', 'memory-source']);
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/adapter/index.js', 305_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);

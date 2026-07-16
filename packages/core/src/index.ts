@@ -16,6 +16,7 @@ export * from './external-store.js';
 export * from './host.js';
 export { createIncrementalDatabaseQueryMaintenance } from './internal-observer-query-maintenance.js';
 export * from './issues.js';
+export * from './portable-bytes.js';
 export * from './lens.js';
 export * from './lifecycle-governance.js';
 export * from './maintenance.js';

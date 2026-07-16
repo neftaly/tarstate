@@ -5,7 +5,13 @@ import type {
 } from './follow-source-links.js';
 import { createIncrementalDatabaseQueryMaintenance } from '../internal-observer-query-maintenance.js';
 import { runObserverCleanups, type ObserverDiagnosticReporter } from '../observer-diagnostics.js';
-import { DatabaseView, type ObserverChange, type ObserverSnapshot, type QueryObserver } from '../observer.js';
+import {
+  DatabaseView,
+  type ObservedQueryResult,
+  type ObserverChange,
+  type ObserverSnapshot,
+  type QueryObserver
+} from '../observer.js';
 import type { PreparedPlanParameters, PreparedPlanRow } from '../query/authoring.js';
 import type { PreparedPlan } from '../query/plan-contract.js';
 import type { QueryNode, QueryRecord, RelationInput } from '../query/model.js';
@@ -104,8 +110,17 @@ export type OpenDatabaseQueryOptions<
   readonly followSourceLinks?: FollowDatabaseSourceLinksOptions<LinkPlan>;
 } & SessionParameterOptions<Plan>;
 
+export type WaitForDatabaseQuerySettlementOptions = {
+  readonly signal?: AbortSignal;
+};
+
 /** One owned query lifecycle over mounted or unresolved sources and incremental maintenance. */
-export type DatabaseQuerySession<Row> = QueryObserver<Row>;
+export type DatabaseQuerySession<Row> = QueryObserver<Row> & {
+  /** Resolves with the first result whose recursively discovered membership has settled. */
+  readonly whenSettled: (
+    options?: WaitForDatabaseQuerySettlementOptions
+  ) => Promise<ObservedQueryResult<Row>>;
+};
 
 export const openDatabaseQuery = async <
   Plan extends PreparedPlan<QueryNode>,
@@ -136,6 +151,7 @@ export const openDatabaseQuery = async <
   const leases: DatabaseSourceMountLease[] = [];
   let database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
   let observer: QueryObserver<SessionRow<Plan>> | undefined;
+  let membership: DatasetMembership | undefined;
   let sourceLinkDatabase: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
   let sourceLinkObserver: QueryObserver<QueryRecord> | undefined;
   let sourceLinkFollower: DatabaseSourceLinkFollower | undefined;
@@ -167,13 +183,14 @@ export const openDatabaseQuery = async <
       } as const);
     }
 
-    const membership = new DatasetMembership({
+    const openedDatasetMembership = new DatasetMembership({
       datasetId: options.plan.datasetId,
       state: 'settled',
       members,
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
     });
-    const createDatabase = (datasetMembership = membership): DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> =>
+    membership = openedDatasetMembership;
+    const createDatabase = (datasetMembership = openedDatasetMembership): DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> =>
       new DatabaseView({
         authorityScope: options.queryAuthorityScope,
         authorityFingerprint: options.plan.authorityFingerprint,
@@ -241,17 +258,47 @@ export const openDatabaseQuery = async <
 
   const openedObserver = observer;
   const openedDatabase = database;
+  const openedMembership = membership;
   const openedSourceLinkFollower = sourceLinkFollower;
   const openedSourceLinkObserver = sourceLinkObserver;
   const openedSourceLinkDatabase = sourceLinkDatabase;
   let closed = false;
+  type Settlement = {
+    readonly whenSettled: (
+      options?: WaitForDatabaseQuerySettlementOptions
+    ) => Promise<ObservedQueryResult<SessionRow<Plan>>>;
+    readonly close: () => void;
+  };
+  let openedSettlement: Settlement | undefined;
+  let settlement: Promise<Settlement> | undefined;
+  const openSettlement = (): Promise<Settlement> => {
+    settlement ??= import('./query-settlement.js').then(({ createDatabaseQuerySettlement }) => {
+      const opened = createDatabaseQuerySettlement(openedMembership, openedObserver);
+      openedSettlement = opened;
+      if (closed) opened.close();
+      return opened;
+    });
+    return settlement;
+  };
+
   return Object.freeze({
     getSnapshot: (): ObserverSnapshot<SessionRow<Plan>> => openedObserver.getSnapshot(),
     subscribe: (listener: (change: ObserverChange<SessionRow<Plan>>) => void): (() => void) =>
       openedObserver.subscribe(listener),
+    whenSettled: (waitOptions?: WaitForDatabaseQuerySettlementOptions) => {
+      if (closed) return Promise.reject(new Error('Database query session is closed'));
+      const snapshot = openedObserver.getSnapshot();
+      if (waitOptions?.signal?.aborted !== true
+        && openedMembership.snapshot().state === 'settled'
+        && snapshot.state === 'open') {
+        return Promise.resolve(snapshot.current);
+      }
+      return openSettlement().then((opened) => opened.whenSettled(waitOptions));
+    },
     close: (): void => {
       if (closed) return;
       closed = true;
+      openedSettlement?.close();
       runObserverCleanups(
         [
           () => openedObserver.close(),

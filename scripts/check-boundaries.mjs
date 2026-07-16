@@ -70,6 +70,7 @@ assignArchitectureGroup('foundation', [
   'internal-seal.ts',
   'internal-string-key.ts',
   'issues.ts',
+  'portable-bytes.ts',
   'portable-order.ts',
   'value.ts'
 ]);
@@ -174,6 +175,7 @@ assignArchitectureGroup('observer', [
 assignArchitectureGroup('observer-incremental', ['internal-observer-maintenance-frames.ts', 'internal-observer-query-maintenance.ts']);
 assignArchitectureGroup('database-session', [
   'database/follow-source-links.ts',
+  'database/query-settlement.ts',
   'database/query-session.ts',
   'database/source-link-graph.ts',
   'database/source-mount.ts'

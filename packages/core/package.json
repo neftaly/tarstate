@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/core",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "private": true,
   "description": "Portable relational semantics and source protocols for Tarstate",
   "license": "MIT",
@@ -107,6 +107,10 @@
     "./transactions/authoring": {
       "types": "./dist/transactions/authoring/index.d.ts",
       "import": "./dist/transactions/authoring/index.js"
+    },
+    "./values": {
+      "types": "./dist/values/index.d.ts",
+      "import": "./dist/values/index.js"
     }
   },
   "types": "./dist/root.d.ts",

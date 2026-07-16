@@ -33,7 +33,7 @@ export const mappedWriteEntries = (
   if (mapping.collection.kind === 'object-map') {
     return [{ scope: 'subtree', path: mapping.collection.path as AutomergePath }];
   }
-  return Object.values(mapping.fields).flatMap((field) => field.write.kind === 'replace'
+  return Object.values(mapping.fields).flatMap((field) => field.kind !== 'absent' && field.write.kind === 'replace'
     ? [{ scope: 'exact' as const, path: [...mapping.collection.path, ...field.path] as AutomergePath }]
     : []);
 };

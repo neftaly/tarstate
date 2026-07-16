@@ -119,6 +119,10 @@ const validateFieldMapping = (
   input: JsonValue,
   path: readonly unknown[]
 ): void => {
+  if (isSemanticRecord(input) && input.kind === 'absent') {
+    semanticShape(context, input, ['kind'], [], path);
+    return;
+  }
   if (!semanticShape(context, input, ['path', 'write'], [], path)) return;
   validateStoragePath(context, input.path, [...path, 'path']);
   if (!isSemanticRecord(input.write) || typeof input.write.kind !== 'string') {

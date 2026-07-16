@@ -188,6 +188,71 @@ describe('production JSON-tree storage mappings', () => {
     expect(invalidCallIsRejectedByTypecheck).toBeTypeOf('function');
   });
 
+  it('represents layout-wide absence only for optional fields', () => {
+    const prepared = prepareSchema({
+      relations: {
+        files: {
+          relationId: 'test.file',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string' } },
+            title: { type: { kind: 'string' } },
+            binary: { type: { kind: 'bytes' }, optional: true }
+          }
+        }
+      }
+    });
+    if (!prepared.success) throw new Error('schema fixture failed');
+    const mapping: StorageMappingBody = {
+      schema: schemaRef,
+      model: 'json-tree-v1',
+      relations: {
+        'test.file': {
+          collection: { kind: 'object-map', path: ['files'], absent: 'empty' },
+          keys: { id: { kind: 'map-key', onMismatch: 'reject' } },
+          fields: {
+            title: { path: ['title'], write: { kind: 'read-only' } },
+            binary: { kind: 'absent' }
+          }
+        }
+      }
+    };
+    const compiled = compileStorageMapping(mapping, schemaRef, prepared.value);
+    if (!compiled.success) throw new Error('mapping fixture failed');
+
+    expect(compiled.value.relations.get('test.file')?.valuePaths).toEqual([['title']]);
+    expect(projectStorage(compiled.value, {
+      files: { first: { title: 'Text', binary: 'ignored physical value' } }
+    }).relations.get('test.file')).toMatchObject({
+      completeness: 'exact',
+      rows: [{ row: { id: 'first', title: 'Text' } }]
+    });
+    expect(planStorageIntents(
+      compiled.value,
+      { files: { first: { title: 'Text' } } },
+      'test.file',
+      { kind: 'object-map-key', key: 'first' },
+      { binary: { kind: 'tarstate.value', type: 'bytes', value: 'AQ' } }
+    )).toMatchObject({ success: false, issues: [{ code: 'mapping.field_read_only' }] });
+
+    const requiredAbsent = compileStorageMapping({
+      ...mapping,
+      relations: {
+        'test.file': {
+          ...mapping.relations['test.file']!,
+          fields: {
+            title: { kind: 'absent' },
+            binary: { kind: 'absent' }
+          }
+        }
+      }
+    }, schemaRef, prepared.value);
+    expect(requiredAbsent).toMatchObject({
+      success: false,
+      issues: [{ code: 'mapping.field_invalid', details: { field: 'title', reason: 'required_field_absent' } }]
+    });
+  });
+
   it('rejects map-key mismatch, retains duplicate candidates for repair, and preserves unknown storage on edit', async () => {
     const { registry, schema } = await makeFixture();
     const mapping: StorageMappingBody = {

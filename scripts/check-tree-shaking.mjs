@@ -14,6 +14,11 @@ const cases = [
     maxGzipBytes: 650
   },
   {
+    name: 'portable byte materializer',
+    source: selectedExport('packages/core/dist/values/index.js', 'safeMaterializePortableBytes'),
+    maxGzipBytes: 4_100
+  },
+  {
     name: 'typed query parameter',
     source: selectedExport('packages/core/dist/query/authoring/index.js', 'typedParameter'),
     maxGzipBytes: 700
@@ -27,15 +32,17 @@ const cases = [
     name: 'incremental database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // This is the complete incremental evaluator, including joins, aggregates,
-    // windows, fallback evaluation, observation, and fixed-source lifecycle.
+    // windows, fallback evaluation, observation, fixed-source lifecycle, and
+    // the lazy settlement-coordinator entry point.
     initialOnly: true,
-    maxGzipBytes: 44_500
+    maxGzipBytes: 44_700
   },
   {
     name: 'source-link database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
-    // Optional fixed-point traversal is a lazy chunk and remains bounded too.
-    maxGzipBytes: 47_000
+    // Optional fixed-point traversal and settlement coordination are lazy
+    // chunks and remain bounded too.
+    maxGzipBytes: 47_350
   },
   {
     name: 'query expression evaluator',

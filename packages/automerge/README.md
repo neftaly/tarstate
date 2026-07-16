@@ -115,7 +115,10 @@ logical key:
 
 Mapped Automerge `Uint8Array` fields cross the adapter's standard scalar
 boundary as canonical Tarstate `bytes` values and are written back as native
-bytes. Root-field replacement preserves unrelated namespaced metadata.
+bytes. Consumers that need native bytes use the shared core
+`safeMaterializePortableBytes` helper from `@tarstate/core/values` rather than
+decoding the tagged value themselves. Root-field replacement preserves
+unrelated namespaced metadata.
 Automerge `ImmutableString` fields declared as logical strings cross the same
 boundary as ordinary strings. A read-only mapping can therefore query foreign
 immutable text without upgrading its write capability or exposing an

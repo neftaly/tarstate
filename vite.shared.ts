@@ -29,6 +29,7 @@ export const corePublicEntryNames = [
   'source',
   'transactions',
   'transactions/authoring',
+  'values',
 ] as const;
 
 /** Narrow public Automerge entries in addition to the package root. */

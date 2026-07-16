@@ -216,19 +216,20 @@ describe('database source links', () => {
     expect(openSource).toHaveBeenCalledWith(expect.objectContaining({
       sourceId: 'child'
     }));
+    const settled = session.whenSettled();
+    let didSettle = false;
+    void settled.then(() => { didSettle = true; });
 
     childOpening.resolve(child.source);
     await vi.waitFor(() => expect(openSource).toHaveBeenCalledWith(expect.objectContaining({ sourceId: 'file' })));
     expect(session.getSnapshot()).toMatchObject({ state: 'open', current: { readiness: 'incomplete' } });
+    expect(didSettle).toBe(false);
 
     fileOpening.resolve(file.source);
-    await vi.waitFor(() => expect(session.getSnapshot()).toMatchObject({
-      state: 'open',
-      current: {
-        readiness: 'ready',
-        rows: expect.arrayContaining([{ id: 'root-item' }, { id: 'child-item' }, { id: 'file-item' }])
-      }
-    }));
+    await expect(settled).resolves.toMatchObject({
+      readiness: 'ready',
+      rows: expect.arrayContaining([{ id: 'root-item' }, { id: 'child-item' }, { id: 'file-item' }])
+    });
 
     const readiness: string[] = [];
     const unsubscribe = session.subscribe((change) => {
@@ -310,8 +311,10 @@ describe('database source links', () => {
     expect(childRequest).toMatchObject({
       sourceId: 'child'
     });
+    const settled = session.whenSettled();
     root.replace({ links: [], items: [] });
     await vi.waitFor(() => expect(childRequest?.signal.aborted).toBe(true));
+    await expect(settled).resolves.toMatchObject({ readiness: 'ready', rows: [] });
 
     const stale = createMutableSource({
       sourceId: 'child',
@@ -332,6 +335,34 @@ describe('database source links', () => {
     session.close();
     expect(root.closeMount).toHaveBeenCalledOnce();
     expect(root.closeSource).not.toHaveBeenCalled();
+  });
+
+  it('rejects a pending settlement wait when it is aborted or the session closes', async () => {
+    const { relations, linkPlan, itemPlan } = await setup();
+    const root = createMutableSource({
+      sourceId: 'root',
+      attachmentId: 'attachment:root',
+      relations,
+      storage: {
+        links: [{ linkId: 'pending', originSourceId: 'root', targetSourceId: 'pending', expectation: 'required' }],
+        items: []
+      }
+    });
+    const pending = deferred<OwnedDatabaseSource | undefined>();
+    const session = await openDatabaseQuery({
+      sources: [{ source: root.source }],
+      plan: itemPlan,
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: { plan: linkPlan, openSource: () => pending.promise }
+    });
+    const abort = new AbortController();
+    const aborted = session.whenSettled({ signal: abort.signal });
+    const closed = session.whenSettled();
+
+    abort.abort();
+    await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+    session.close();
+    await expect(closed).rejects.toThrow('Database query session is closed');
   });
 
   it('keeps one owned source until its last reachable edge disappears', async () => {
@@ -412,24 +443,21 @@ describe('database source links', () => {
       }
     });
 
-    await vi.waitFor(() => expect(session.getSnapshot()).toMatchObject({
-      state: 'open',
-      current: {
-        readiness: 'invalid',
-        sourceStates: expect.arrayContaining([
-          expect.objectContaining({
-            sourceId: 'missing',
-            state: 'missing',
-            issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.linked_source_unavailable' })])
-          }),
-          expect.objectContaining({
-            sourceId: 'failed',
-            state: 'failed',
-            issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.linked_source_resolution_failed' })])
-          })
-        ])
-      }
-    }));
+    await expect(session.whenSettled()).resolves.toMatchObject({
+      readiness: 'invalid',
+      sourceStates: expect.arrayContaining([
+        expect.objectContaining({
+          sourceId: 'missing',
+          state: 'missing',
+          issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.linked_source_unavailable' })])
+        }),
+        expect.objectContaining({
+          sourceId: 'failed',
+          state: 'failed',
+          issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.linked_source_resolution_failed' })])
+        })
+      ])
+    });
 
     session.close();
   });

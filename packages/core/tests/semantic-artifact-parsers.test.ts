@@ -239,6 +239,15 @@ describe('semantic artifact safe parsers', () => {
     const unknownMember = mutate(mappingBody(), (body) => { body.relations['test.person'].collection.ambient = true; });
     expect(await safeParseStorageMappingArtifact(await seal('storage-mapping', unknownMember)))
       .toMatchObject({ success: false, issues: [{ details: { reason: 'unknown_member' } }] });
+    const absentField = mutate(mappingBody(), (body) => { body.relations['test.person'].fields.name = { kind: 'absent' }; });
+    const absentArtifact = await seal('storage-mapping', absentField);
+    expect(await safeParseStorageMappingArtifact(absentArtifact))
+      .toMatchObject({ success: true });
+    expect(await safePrepareStorageMappingArtifact(absentArtifact, { schemaRef, schema: prepared.value }))
+      .toMatchObject({ success: false, issues: [{ code: 'mapping.field_invalid', details: { reason: 'required_field_absent' } }] });
+    const invalidAbsentField = mutate(absentField, (body) => { body.relations['test.person'].fields.name.path = ['fabricated']; });
+    expect(await safeParseStorageMappingArtifact(await seal('storage-mapping', invalidAbsentField)))
+      .toMatchObject({ success: false, issues: [{ details: { reason: 'unknown_member' } }] });
     const singleton = mutate(mappingBody(), (body) => {
       body.relations['test.person'].collection = { kind: 'singleton', path: [], absent: 'invalid' };
       body.relations['test.person'].keys = { id: { kind: 'literal', value: 'person' } };

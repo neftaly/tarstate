@@ -18,6 +18,7 @@ import * as schema from '@tarstate/core/schema';
 import * as source from '@tarstate/core/source';
 import * as transactions from '@tarstate/core/transactions';
 import * as transactionAuthoring from '@tarstate/core/transactions/authoring';
+import * as values from '@tarstate/core/values';
 import type { DocumentDeclaration } from '@tarstate/core/attachment';
 import type { ObserverDiagnosticReporter } from '@tarstate/core/database';
 import type { PreparedPlan } from '@tarstate/core/query';
@@ -29,6 +30,7 @@ describe('topic-focused core surface', () => {
     expect('evaluateQuery' in root).toBe(false);
     expect('DatabaseView' in root).toBe(false);
     expect('executePreparedTransaction' in root).toBe(false);
+    expect('safeMaterializePortableBytes' in root).toBe(false);
   });
 
   it('exposes runtime features only from their topic entries', () => {
@@ -62,6 +64,8 @@ describe('topic-focused core surface', () => {
     expect('executePreparedTransaction' in transactions).toBe(false);
     expect('simulatePreparedTransaction' in transactions).toBe(false);
     expect(transactionAuthoring.sealTransaction).toBe(transactions.sealTransaction);
+    expect(values.safeMaterializePortableBytes).toBeTypeOf('function');
+    expect(values.toPortableBytes).toBeTypeOf('function');
   });
 
   it('keeps deliberately type-only and narrow runtime entries narrow', () => {

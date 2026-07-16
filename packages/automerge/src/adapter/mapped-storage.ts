@@ -283,7 +283,14 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           issues.push(bindingIssue('mapping.rekey_required', snapshot.sourceId, edit.relationId, row.storagePath));
           continue;
         }
-        fieldInputs = Object.keys(compiled.mapping.fields).map((field) => [field, parsed.value.row[field]] as const);
+        const mappedInputs: (readonly [string, JsonValue | undefined])[] = [];
+        for (const field of Object.keys(compiled.mapping.fields)) {
+          const mapping = compiled.mapping.fields[field];
+          if (mapping?.kind !== 'absent' || Object.hasOwn(parsed.value.row, field)) {
+            mappedInputs.push([field, parsed.value.row[field]]);
+          }
+        }
+        fieldInputs = mappedInputs;
       } else {
         fieldInputs = Object.entries(edit.fields);
       }
@@ -294,7 +301,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         }
         const fieldMapping = compiled.mapping.fields[field];
         const declaration = compiled.relation.declaration.fields[field];
-        if (fieldMapping === undefined || declaration === undefined || fieldMapping.write.kind !== 'replace') {
+        if (fieldMapping === undefined || declaration === undefined
+          || fieldMapping.kind === 'absent'
+          || fieldMapping.write.kind !== 'replace') {
           issues.push(bindingIssue('mapping.field_read_only', snapshot.sourceId, edit.relationId, row.storagePath, { field }));
           continue;
         }
@@ -409,6 +418,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     }
     for (const [field, mapping] of Object.entries(compiled.mapping.fields)) {
       if (!Object.hasOwn(parsed.value.row, field)) continue;
+      if (mapping.kind === 'absent') {
+        return { issues: [bindingIssue('mapping.field_read_only', snapshot.sourceId, relationId, candidatePath, { field })] };
+      }
       const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
       const encoded = this.#scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
       if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };

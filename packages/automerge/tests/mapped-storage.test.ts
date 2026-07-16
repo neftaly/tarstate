@@ -34,6 +34,7 @@ type TaskDoc = {
     id: string;
     title?: string;
     nested?: { priority: number };
+    inactiveContent?: string;
     unknown?: { keep: boolean };
   }>;
 };
@@ -68,7 +69,8 @@ const fixture = async (doc: TaskDoc = {
         fields: {
           id: { type: { kind: 'string' } },
           title: { type: { kind: 'string' } },
-          priority: { type: { kind: 'number' } }
+          priority: { type: { kind: 'number' } },
+          inactiveContent: { type: { kind: 'string' }, optional: true }
         }
       }
     }
@@ -85,7 +87,8 @@ const fixture = async (doc: TaskDoc = {
         keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
         fields: {
           title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
-          priority: { path: ['nested', 'priority'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+          priority: { path: ['nested', 'priority'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+          inactiveContent: { kind: 'absent' }
         }
       }
     }
@@ -101,7 +104,7 @@ const fixture = async (doc: TaskDoc = {
   return { runtime, source, binding, registry, schemaArtifact, mappingArtifact };
 };
 
-const singletonFixture = async () => {
+const singletonFixture = async (mimeTypeAbsent = false) => {
   const registry = new CapabilityRegistry('registry:singleton');
   await registerBuiltInCapabilities(registry);
   registry.registerImplementation({
@@ -134,7 +137,9 @@ const singletonFixture = async () => {
         keys: { id: { kind: 'literal', value: 'content' } },
         fields: {
           content: { path: ['content'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
-          mimeType: { path: ['mimeType'], write: { kind: 'read-only' } }
+          mimeType: mimeTypeAbsent
+            ? { kind: 'absent' }
+            : { path: ['mimeType'], write: { kind: 'read-only' } }
         }
       }
     }
@@ -293,6 +298,55 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     source.close();
   });
 
+  it('omits intentionally absent optional fields from projection and footprints', async () => {
+    const { source, binding } = await singletonFixture(true);
+    const projection = binding.project(source.snapshot());
+    const row = projection.rows[0]!;
+
+    expect(row.fields).toEqual({
+      id: 'content',
+      content: { kind: 'tarstate.value', type: 'bytes', value: 'AQL_' }
+    });
+    expect(binding.declaredReadFootprint.entries).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: ['mimeType'] })
+    ]));
+    expect(binding.declaredWriteFootprint.entries).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: ['mimeType'] })
+    ]));
+
+    await expect(coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'replace-fields',
+        relationId: row.relationId,
+        key: row.key as JsonValue,
+        locator: row.locator as unknown as JsonValue,
+        fields: { mimeType: 'text/plain' }
+      }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:replace-absent', 'd')
+    })).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'mapping.field_read_only' }]
+    });
+    await expect(coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'replace-row',
+        relationId: row.relationId,
+        key: row.key as JsonValue,
+        locator: row.locator as unknown as JsonValue,
+        fields: { ...row.fields, mimeType: 'text/plain' }
+      }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:replace-row-absent', 'c')
+    })).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'mapping.field_read_only' }]
+    });
+    source.close();
+  });
+
   it('withholds a singleton row when its mapped root field has concurrent values', async () => {
     const { runtime, source, binding } = await singletonFixture();
     const base = runtime.snapshot().storage;
@@ -352,6 +406,26 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     });
     expect(deleted.outcome).toBe('committed');
     expect(runtime.snapshot().storage.tasks).not.toHaveProperty('second');
+    source.close();
+  });
+
+  it('rejects inserts that target a field absent from the physical layout', async () => {
+    const { runtime, source, binding } = await fixture();
+    await expect(coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'insert',
+        relationId: 'relation:tasks',
+        key: ['variant'],
+        fields: { title: 'Variant', priority: 3, inactiveContent: 'not in this layout' }
+      }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:insert-absent', '9')
+    })).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'mapping.field_read_only' }]
+    });
+    expect(runtime.snapshot().storage.tasks).not.toHaveProperty('variant');
     source.close();
   });
 

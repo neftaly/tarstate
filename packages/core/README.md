@@ -84,6 +84,7 @@ Artifact semantics and attachment preparation also have opt-in execution seams:
 | `@tarstate/core/artifacts/storage-mapping` | Storage-mapping parsing and compilation |
 | `@tarstate/core/artifacts/schema-lens` | Schema-lens parsing and validation |
 | `@tarstate/core/attachment/adapter` | Adapter-facing preparation and replayable transaction-service composition |
+| `@tarstate/core/values` | Portable built-in scalar conversion at host boundaries |
 
 The portable `artifacts` entry never imports query evaluation, mapping, lens,
 constraint, or transaction implementations. Hosts opt into only the semantic
@@ -184,6 +185,11 @@ const session = await openDatabaseQuery({
       sourceStore.open({ sourceId, attachmentId, signal })
   }
 });
+
+// Wait for recursive membership to reach a fixed point without interpreting
+// diagnostic issue codes. Missing or invalid sources remain ordinary result
+// evidence; cancellation rejects with an AbortError.
+const settled = await session.whenSettled();
 ```
 
 The opener translates portable source identity into a newly opened source with
@@ -195,6 +201,17 @@ incomplete while it opens and invalid if resolution fails. Removing the
 last reachable link aborts pending work and closes its mounted subtree. The
 source-link query and application query must use the same dataset, registry,
 and authority fingerprints.
+
+Portable bytes remain tagged base64url values at relational boundaries. Use
+`safeMaterializePortableBytes(value)` from `@tarstate/core/values` when a host
+specifically needs a `Uint8Array`; malformed data returns `ParseResult` issues
+rather than throwing. `toPortableBytes(bytes)` performs the inverse canonical
+conversion.
+
+A storage layout that deliberately has no physical representation for an
+optional logical field maps it as `{ kind: 'absent' }`. Required fields cannot
+use this mapping. Absent fields are omitted from projection and physical
+footprints, and attempts to write them are rejected as read-only.
 
 Adapter authors import `prepareManualReadOnlyAttachment`,
 `prepareDatabaseAttachment`, and `createAttachmentTransactionService` from

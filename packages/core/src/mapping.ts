@@ -19,10 +19,13 @@ export type KeyMapping =
   | { readonly kind: 'map-key'; readonly mirrorPath?: StoragePath; readonly onMismatch: 'reject' }
   | { readonly kind: 'field'; readonly path: StoragePath }
   | { readonly kind: 'literal'; readonly value: PortableValue };
-export type FieldMapping = {
+export type StoredFieldMapping = {
+  readonly kind?: never;
   readonly path: StoragePath;
   readonly write: { readonly kind: 'replace'; readonly capability: CapabilityRef } | { readonly kind: 'read-only' };
 };
+export type AbsentFieldMapping = { readonly kind: 'absent' };
+export type FieldMapping = StoredFieldMapping | AbsentFieldMapping;
 export type RelationStorageMapping = {
   readonly collection: CollectionMapping;
   readonly keys: Readonly<Record<string, KeyMapping>>;
@@ -143,8 +146,18 @@ export const compileStorageMapping = (
       }
     }
     for (const [field, fieldMapping] of Object.entries(mapping.fields)) {
-      if (!(field in relation.declaration.fields) || !isFieldMapping(fieldMapping)) issues.push(mappingIssue('mapping.field_invalid', [...path, 'fields', field]));
-      else if (fieldMapping.write.kind === 'replace' && registry !== undefined && !registry.satisfies(fieldMapping.write.capability)) {
+      const declaration = relation.declaration.fields[field];
+      if (declaration === undefined || !isFieldMapping(fieldMapping)) {
+        issues.push(mappingIssue('mapping.field_invalid', [...path, 'fields', field]));
+      } else if (fieldMapping.kind === 'absent' && declaration.optional !== true) {
+        issues.push(mappingIssue('mapping.field_invalid', [...path, 'fields', field], {
+          field,
+          reason: 'required_field_absent'
+        }));
+      } else if (fieldMapping.kind !== 'absent'
+        && fieldMapping.write.kind === 'replace'
+        && registry !== undefined
+        && !registry.satisfies(fieldMapping.write.capability)) {
         issues.push(mappingIssue('mapping.capability_unavailable', [...path, 'fields', field, 'write'], { field }, [fieldMapping.write.capability]));
       }
     }
@@ -273,7 +286,9 @@ const planStorageIntentDetails = (
     }
     const fieldMapping = compiled.mapping.fields[field];
     const declaration = compiled.relation.declaration.fields[field];
-    if (fieldMapping === undefined || declaration === undefined || fieldMapping.write.kind === 'read-only') {
+    if (fieldMapping === undefined || declaration === undefined
+      || fieldMapping.kind === 'absent'
+      || fieldMapping.write.kind === 'read-only') {
       issues.push(mappingIssue('mapping.field_read_only', [field], { field, relationId }, undefined, sourceId, relationId));
       continue;
     }
@@ -388,6 +403,7 @@ const projectCandidate = (
     }
   }
   for (const [field, fieldMapping] of Object.entries(mapping.fields)) {
+    if (fieldMapping.kind === 'absent') continue;
     const value = readPath(candidate.candidate, fieldMapping.path);
     const path = [...candidate.absolutePath, ...fieldMapping.path];
     if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', path, { reason: value.reason, error: value.error, locator: candidate.locator }, options.sourceId, relationId);
@@ -464,7 +480,7 @@ const mappedValuePaths = (mapping: RelationStorageMapping): readonly StoragePath
     if (key.kind === 'map-key' && key.mirrorPath !== undefined) paths.push(key.mirrorPath);
   }
   for (const field of Object.values(mapping.fields)) {
-    if (isFieldMapping(field)) paths.push(field.path);
+    if (isFieldMapping(field) && field.kind !== 'absent') paths.push(field.path);
   }
   return Object.freeze(paths);
 };
@@ -560,7 +576,17 @@ const isKeyMapping = (value: unknown): value is KeyMapping => isRecord(value) &&
   || (value.kind === 'field' && hasOnlyKeys(value, ['kind', 'path']) && isStoragePath(value.path))
   || (value.kind === 'literal' && hasOnlyKeys(value, ['kind', 'value']) && Object.hasOwn(value, 'value'))
 );
-const isFieldMapping = (value: unknown): value is FieldMapping => isRecord(value) && hasOnlyKeys(value, ['path', 'write']) && isStoragePath(value.path) && isRecord(value.write) && ((value.write.kind === 'read-only' && hasOnlyKeys(value.write, ['kind'])) || (value.write.kind === 'replace' && hasOnlyKeys(value.write, ['kind', 'capability']) && isCapabilityRef(value.write.capability)));
+const isFieldMapping = (value: unknown): value is FieldMapping => isRecord(value) && (
+  (value.kind === 'absent' && hasOnlyKeys(value, ['kind']))
+  || (value.kind === undefined
+    && hasOnlyKeys(value, ['path', 'write'])
+    && isStoragePath(value.path)
+    && isRecord(value.write)
+    && ((value.write.kind === 'read-only' && hasOnlyKeys(value.write, ['kind']))
+      || (value.write.kind === 'replace'
+        && hasOnlyKeys(value.write, ['kind', 'capability'])
+        && isCapabilityRef(value.write.capability))))
+);
 const isStoragePath = (value: unknown): value is StoragePath => Array.isArray(value) && value.every((member) => (typeof member === 'string' && member.length > 0) || (typeof member === 'number' && Number.isSafeInteger(member) && member >= 0));
 const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && hasOnlyKeys(value, ['id', 'version', 'contractHash']) && typeof value.id === 'string' && value.id.length > 0 && typeof value.version === 'string' && value.version.length > 0 && isContentHash(value.contractHash);
 const hasOnlyKeys = (value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean => Object.keys(value).every((key) => allowed.includes(key));

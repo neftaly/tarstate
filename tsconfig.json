@@ -42,6 +42,7 @@
       "@tarstate/core/source": ["./packages/core/src/source/index.ts"],
       "@tarstate/core/transactions": ["./packages/core/src/transactions/index.ts"],
       "@tarstate/core/transactions/authoring": ["./packages/core/src/transactions/authoring/index.ts"],
+      "@tarstate/core/values": ["./packages/core/src/values/index.ts"],
       "@tarstate/automerge/values": ["./packages/automerge/src/values/index.ts"],
       "@tarstate/automerge": ["./packages/automerge/src/index.ts"],
       "@tarstate/zustand": ["./packages/zustand/src/index.ts"],
