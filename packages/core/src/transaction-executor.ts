@@ -259,28 +259,45 @@ export const executePreparedTransaction = async <Storage, Command>(
   if ('receipt' in prepared) return prepared.receipt;
   const reservation = await reservePreparedExecution(context, prepared);
   if ('receipt' in reservation) return reservation.receipt;
-  const receipt = await reconcileAndCommitPreparedExecution(context, prepared);
-  return completePreparedExecution(context, prepared, reservation.entry, receipt);
+  const completed = await reconcileAndCommitPreparedExecution(context, prepared);
+  return completePreparedExecution(context, completed.prepared, reservation.entry, completed.receipt);
 };
 
 const maxReconciliationAttempts = 16;
 
+type ReplayablePreparation<Storage, Command> = (
+  snapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>
+) => Promise<PreparedExecution | { readonly receipt: CommitReceipt }>;
+
+type ReconciledPreparedCommit = {
+  readonly prepared: PreparedExecution;
+  readonly receipt: CommitReceipt;
+};
+
 /** Re-evaluates all guards and constraints after a transient concurrent change. */
 const reconcileAndCommitPreparedExecution = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
-  prepared: PreparedExecution
-): Promise<CommitReceipt> => {
+  initialPrepared: PreparedExecution,
+  initialSnapshot?: ReturnType<AtomicSource<Storage, Command>['snapshot']>,
+  reprepare?: ReplayablePreparation<Storage, Command>
+): Promise<ReconciledPreparedCommit> => {
+  let prepared = initialPrepared;
+  let nextSnapshot = initialSnapshot;
   for (let reconciliationAttempt = 0; reconciliationAttempt < maxReconciliationAttempts; reconciliationAttempt += 1) {
-    const captured = captureExecutionSnapshot(context);
-    if ('issue' in captured) return rejectedBeforeSnapshotReceipt(context, prepared, captured.issue);
+    const captured = nextSnapshot === undefined ? captureExecutionSnapshot(context) : { snapshot: nextSnapshot };
+    nextSnapshot = undefined;
+    if ('issue' in captured) return { prepared, receipt: rejectedBeforeSnapshotReceipt(context, prepared, captured.issue) };
     const evaluated = evaluatePreparedExecution(context, prepared, captured.snapshot);
-    if (evaluated.blockingIssues.length > 0) return rejectedReceipt(context, prepared, evaluated);
+    if (evaluated.blockingIssues.length > 0) return { prepared, receipt: rejectedReceipt(context, prepared, evaluated) };
     if (prepared.attempt.signal?.aborted === true) {
-      return rejectedReceipt(context, prepared, {
-        ...evaluated,
-        issues: [...evaluated.issues, transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })],
-        blockingIssues: [transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })]
-      });
+      return {
+        prepared,
+        receipt: rejectedReceipt(context, prepared, {
+          ...evaluated,
+          issues: [...evaluated.issues, transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })],
+          blockingIssues: [transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })]
+        })
+      };
     }
     let outcome: Awaited<ReturnType<AtomicSource<Storage, Command>['commit']>>;
     try {
@@ -292,7 +309,7 @@ const reconcileAndCommitPreparedExecution = async <Storage, Command>(
         commands: evaluated.commands
       });
     } catch (error) {
-      return {
+      return { prepared, receipt: {
         ...receiptEvidence(context, prepared, evaluated.statementResults, [
           ...evaluated.issues,
           transactionIssue('transaction.outcome_unavailable', prepared.attempt, { error: errorName(error) }, 'query_outcome')
@@ -300,37 +317,64 @@ const reconcileAndCommitPreparedExecution = async <Storage, Command>(
         outcome: 'unknown',
         beforeBasis: evaluated.beforeBasis,
         durability: 'unknown'
-      };
+      } };
     }
-    if (isTransientStaleBasis(outcome) && prepared.attempt.expectedBasis === undefined) continue;
+    if (isTransientStaleBasis(outcome) && prepared.attempt.expectedBasis === undefined) {
+      if (reprepare !== undefined) {
+        const refreshed = captureExecutionSnapshot(context);
+        if ('issue' in refreshed) return { prepared, receipt: rejectedBeforeSnapshotReceipt(context, prepared, refreshed.issue) };
+        let replacement: Awaited<ReturnType<ReplayablePreparation<Storage, Command>>>;
+        try {
+          replacement = await reprepare(refreshed.snapshot);
+        } catch (error) {
+          return {
+            prepared,
+            receipt: {
+              ...receiptEvidence(context, prepared, [], [transactionIssue(
+                'transaction.unexpected_failure',
+                prepared.attempt,
+                { timing: 'reconciliation', error: errorName(error) },
+                'after_input'
+              )]),
+              outcome: 'rejected',
+              beforeBasis: refreshed.snapshot.basis
+            }
+          };
+        }
+        if ('receipt' in replacement) return { prepared, receipt: replacement.receipt };
+        prepared = replacement;
+        nextSnapshot = refreshed.snapshot;
+      }
+      continue;
+    }
     const issues = [...evaluated.issues, ...outcome.issues];
     if (outcome.outcome === 'rejected') {
-      return {
+      return { prepared, receipt: {
         ...receiptEvidence(context, prepared, evaluated.statementResults, issues),
         outcome: 'rejected',
         ...(outcome.beforeBasis === undefined ? {} : { beforeBasis: outcome.beforeBasis })
-      };
+      } };
     }
     if (outcome.outcome === 'unknown' || outcome.beforeBasis === undefined || outcome.afterBasis === undefined) {
-      return {
+      return { prepared, receipt: {
         ...receiptEvidence(context, prepared, evaluated.statementResults, issues),
         outcome: 'unknown',
         ...(outcome.beforeBasis === undefined ? {} : { beforeBasis: outcome.beforeBasis }),
         durability: 'unknown'
-      };
+      } };
     }
     const returning = evaluated.returning?.map((result): ReturningResult => ({ ...result, basis: outcome.afterBasis as SourceBasis }));
-    return {
+    return { prepared, receipt: {
       ...receiptEvidence(context, prepared, evaluated.statementResults, issues, returning),
       outcome: 'committed',
       beforeBasis: outcome.beforeBasis,
       afterBasis: outcome.afterBasis,
       durability: context.durability
-    };
+    } };
   }
   const latest = captureExecutionSnapshot(context);
   const beforeBasis = 'snapshot' in latest ? latest.snapshot.basis : undefined;
-  return {
+  return { prepared, receipt: {
     ...receiptEvidence(context, prepared, [], [transactionIssue(
       'transaction.expected_basis_stale',
       prepared.attempt,
@@ -338,13 +382,90 @@ const reconcileAndCommitPreparedExecution = async <Storage, Command>(
     )]),
     outcome: 'rejected',
     ...(beforeBasis === undefined ? {} : { beforeBasis })
-  };
+  } };
 };
 
 const isTransientStaleBasis = (outcome: { readonly outcome: string; readonly issues: readonly Issue[] }): boolean =>
   outcome.outcome === 'rejected'
   && outcome.issues.length > 0
   && outcome.issues.every(({ code }) => code === 'transaction.expected_basis_stale');
+
+export type ReplayablePreparedTransactionInput = {
+  readonly operationId: string;
+  readonly intentHash: ContentHash;
+  readonly signal?: AbortSignal;
+  readonly author: (input: {
+    readonly basis: SourceBasis;
+    readonly state: WritableLogicalState;
+    readonly issues: readonly Issue[];
+  }) => Promise<Transaction>;
+};
+
+/** Internal bridge used by attachment services; the author is replayed only after transient concurrency. */
+export const executeReplayablePreparedTransaction = async <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  input: ReplayablePreparedTransactionInput
+): Promise<CommitReceipt> => {
+  assertPreparedWritableContext(context);
+  try {
+    const prior = await context.operationLedger.lookup(
+      context.operationEpoch,
+      input.operationId,
+      input.intentHash
+    );
+    if (prior.status === 'known') return prior.receipt;
+  } catch { /* Reservation below reports ledger availability with receipt evidence. */ }
+  const prepareFromSnapshot: ReplayablePreparation<Storage, Command> = (snapshot) =>
+    prepareReplayableExecution(context, input, snapshot);
+  const captured = captureExecutionSnapshot(context);
+  if ('issue' in captured) throw new Error('Cannot author a transaction without a source snapshot');
+  const initial = await prepareFromSnapshot(captured.snapshot);
+  if ('receipt' in initial) return initial.receipt;
+  const reservation = await reservePreparedExecution(context, initial);
+  if ('receipt' in reservation) return reservation.receipt;
+  const completed = await reconcileAndCommitPreparedExecution(
+    context,
+    initial,
+    captured.snapshot,
+    prepareFromSnapshot
+  );
+  return completePreparedExecution(context, completed.prepared, reservation.entry, completed.receipt);
+};
+
+export const simulateReplayablePreparedTransaction = async <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  input: ReplayablePreparedTransactionInput
+): Promise<SimulationReceipt> => {
+  assertPreparedWritableContext(context);
+  const captured = captureExecutionSnapshot(context);
+  if ('issue' in captured) throw new Error('Cannot simulate a transaction without a source snapshot');
+  const prepared = await prepareReplayableExecution(context, input, captured.snapshot);
+  if ('receipt' in prepared) return commitRejectionAsSimulation(prepared.receipt);
+  const evaluated = evaluatePreparedExecution(context, prepared, captured.snapshot);
+  return simulationReceipt(context, prepared, evaluated);
+};
+
+const prepareReplayableExecution = async <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  input: ReplayablePreparedTransactionInput,
+  snapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>
+): Promise<PreparedExecution | { readonly receipt: CommitReceipt }> => {
+  const projection = projectLogicalState(context.bindings, snapshot);
+  const transaction = await input.author({
+    basis: snapshot.basis,
+    state: logicalProjectionState(projection),
+    issues: projection.issues
+  });
+  const attempt = adoptAttempt({
+    operationEpoch: context.operationEpoch,
+    operationId: input.operationId,
+    attachmentId: context.attachmentId,
+    transaction,
+    ...(input.signal === undefined ? {} : { signal: input.signal })
+  });
+  const prepared = await prepareExecution(context, attempt);
+  return 'receipt' in prepared ? prepared : { ...prepared, intentHash: input.intentHash };
+};
 
 export const simulatePreparedTransaction = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
@@ -359,7 +480,14 @@ export const simulatePreparedTransaction = async <Storage, Command>(
     return commitRejectionAsSimulation(rejectedBeforeSnapshotReceipt(context, prepared, captured.issue));
   }
   const evaluated = evaluatePreparedExecution(context, prepared, captured.snapshot);
-  return {
+  return simulationReceipt(context, prepared, evaluated);
+};
+
+const simulationReceipt = <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  prepared: PreparedExecution,
+  evaluated: EvaluatedExecution<Storage, Command>
+): SimulationReceipt => ({
     kind: 'simulation',
     receiptVersion: 1,
     operationEpoch: prepared.attempt.operationEpoch,
@@ -374,8 +502,7 @@ export const simulatePreparedTransaction = async <Storage, Command>(
     statementResults: evaluated.statementResults,
     issues: evaluated.issues,
     ...(evaluated.blockingIssues.length === 0 ? { stagedState: evaluated.logicalState } : {})
-  };
-};
+  });
 
 const prepareExecution = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,

@@ -3,6 +3,7 @@ import * as automerge from '../src/index.js';
 
 describe('production Automerge surface', () => {
   it('exports source, projection, binding, and metadata implementations', () => {
+    expect(automerge.openAutomergeAttachment).toBeTypeOf('function');
     expect(automerge.AutomergeSourceRuntime).toBeTypeOf('function');
     expect(automerge.automergeRepoSourceRuntime).toBeTypeOf('function');
     expect(automerge.AutomergeAtomicSource).toBeTypeOf('function');

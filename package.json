@@ -20,7 +20,7 @@
     "check:built-boundaries": "node scripts/check-built-boundaries.mjs",
     "check:examples": "pnpm --filter @tarstate/core build && node examples/quickstart.ts",
     "check:perf": "pnpm bench && pnpm bench:query && pnpm bench:observer && pnpm bench:automerge",
-    "check:release": "pnpm check && pnpm check:perf && tsc -p tsconfig.release.json && node scripts/verify-release.mjs",
+    "check:release": "pnpm check && pnpm test:fuzz && pnpm check:perf && tsc -p tsconfig.release.json && node scripts/verify-release.mjs",
     "lint": "oxlint . --deny-warnings --type-aware",
     "test": "pnpm --filter './packages/*' test",
     "test:fuzz": "pnpm --filter './packages/*' --if-present test:fuzz",

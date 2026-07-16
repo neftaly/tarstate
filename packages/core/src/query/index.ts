@@ -8,8 +8,7 @@ export {
   evaluateQuery,
   openIncrementalQueryMaintenance,
   prepareExpression,
-  prepareQuery,
-  prepareQueryMaintenanceSnapshot
+  prepareQuery
 } from '../query.js';
 export type {
   AggregateExpr,
@@ -32,7 +31,6 @@ export type {
   QueryMaintenanceOperatorDiagnostics,
   QueryOperatorMaintenanceDiagnostics,
   QueryMaintenanceSnapshot,
-  OwnedQueryMaintenanceSnapshot,
   QueryMaintenanceUpdate,
   QueryNode,
   QueryRecord,

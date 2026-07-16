@@ -15,9 +15,7 @@ export type {
   WritableLogicalState
 } from '../logical-edit.js';
 export * from '../receipts.js';
-export * from '../relation-delta-authoring.js';
 export * from '../transaction.js';
-export * from '../transaction-executor.js';
 export {
   relationAccess,
   typedFieldEdit,

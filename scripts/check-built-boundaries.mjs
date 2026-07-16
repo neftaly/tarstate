@@ -23,6 +23,7 @@ try {
   assertClosure('source/projection/index.js', 6_000, []);
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/prepare/index.js', 140_000, ['internal-query-evaluator', 'semantic-query-artifact', 'semantic-schema-lens', 'transaction-']);
+  assertClosure('attachment/transact/index.js', 180_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['internal-query-evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);

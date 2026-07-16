@@ -3,7 +3,7 @@ import {
   authorExactKeyedRelationDelta,
   prepareExactKeyedRelationRows,
   type ExactKeyedRelationDeltaInput
-} from '@tarstate/core/transactions';
+} from '../src/relation-delta-authoring.js';
 import type { ArtifactRef } from '../src/index.js';
 
 const hash = (character: string): `sha256:${string}` => `sha256:${character.repeat(64)}`;

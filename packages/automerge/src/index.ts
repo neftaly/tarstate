@@ -11,6 +11,12 @@ export type {
   AutomergePathFootprintEntry
 } from './core-adapter.js';
 
+export { openAutomergeAttachment } from './attachment.js';
+export type {
+  OpenAutomergeAttachment,
+  OpenAutomergeAttachmentInput
+} from './attachment.js';
+
 export {
   automergeArtifactResourceDriver,
   extractAutomergeArtifactCarrier

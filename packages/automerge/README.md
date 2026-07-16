@@ -19,48 +19,50 @@ npm install \
   @automerge/automerge
 ```
 
-`AutomergeMapProjectionPlanner` is the pure map projection/edit-planning
-kernel. `AutomergeMapStorageBinding` adapts that kernel to core's
-`StorageBinding` protocol, and `AutomergeAtomicSource` is the atomic source
-shell.
-
 ## Usage
 
 ```ts
-import * as Automerge from '@automerge/automerge';
-import {
-  AutomergeAtomicSource,
-  AutomergeMapStorageBinding,
-  AutomergeSourceRuntime
-} from '@tarstate/automerge';
+import { openAutomergeAttachment } from '@tarstate/automerge';
 
 type TaskDoc = {
-  readonly tasks: Readonly<Record<string, { readonly title: string }>>;
+  readonly tasks: Readonly<Record<string, { readonly id: string; readonly title: string }>>;
+  readonly tarstate: {
+    readonly declaration: unknown;
+    readonly artifacts: readonly unknown[];
+  };
 };
 
-const doc = Automerge.from<TaskDoc>({ tasks: { first: { title: 'First' } } });
-const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc });
-const source = new AutomergeAtomicSource({
-  runtime,
-  operationEpoch: 'session:one',
-  ownsRuntime: true
+// `handle` is an already-ready, writable Automerge Repo handle. The declaration
+// references schema and storage-mapping artifacts embedded in the same document.
+const document = handle.doc() as TaskDoc;
+const opened = await openAutomergeAttachment({
+  handle,
+  declaration: document.tarstate.declaration,
+  embeddedArtifacts: document.tarstate.artifacts,
+  authorityScope: 'workspace'
 });
-const binding = new AutomergeMapStorageBinding({
-  id: 'binding:tasks',
-  relationId: 'tasks',
-  collectionPath: ['tasks'],
-  missingCollection: 'invalid',
-  keySource: 'map-key'
-});
+if (!opened.success) throw new Error(opened.issues.map(({ code }) => code).join(', '));
 
-const projection = binding.project(source.snapshot());
-console.log(projection.rows.map(row => row.fields));
-source.close();
+const operation = { kind: 'rename-task', id: 'first', title: 'Renamed' } as const;
+const receipt = await opened.value.transact(operation, ({ rows }) => rows.map((row) =>
+  row.relationId === 'tasks' && row.fields.id === operation.id
+    ? { ...row, fields: { ...row.fields, title: operation.title } }
+    : row
+));
+
+opened.value.close();
 ```
 
-Keep one `AutomergeSourceRuntime` per live document. Set `ownsRuntime: true` only
-when closing the atomic source should also close that runtime; otherwise close
-or release the runtime through its host owner.
+The callback is pure and may run again after a concurrent document change.
+Tarstate derives keyed deltas from the prepared schema, re-projects and checks
+constraints, and publishes only the validated candidate. Automerge heads,
+changes, bindings, execution contexts, and canonical keys remain private. Use
+`opened.value.simulate` with the same arguments for a non-mutating preview.
+
+`AutomergeMapProjectionPlanner`, `AutomergeMappedStorageBinding`,
+`AutomergeAtomicSource`, and `AutomergeSourceRuntime` remain adapter construction
+tools for non-standard hosts. Keep one runtime per live document and close it
+through its owner.
 
 ## Automerge Repo compatibility
 

@@ -3,6 +3,7 @@ export * from './artifacts.js';
 export * from './artifact-resolver.js';
 export * from './attachment-model.js';
 export * from './attachment-preparation.js';
+export * from './attachment-transactions.js';
 export * from './capability-model.js';
 export * from './builtins.js';
 export * from './codec.js';

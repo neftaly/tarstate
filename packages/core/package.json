@@ -43,6 +43,10 @@
       "types": "./dist/attachment/prepare/index.d.ts",
       "import": "./dist/attachment/prepare/index.js"
     },
+    "./attachment/transact": {
+      "types": "./dist/attachment/transact/index.d.ts",
+      "import": "./dist/attachment/transact/index.js"
+    },
     "./capabilities": {
       "types": "./dist/capabilities/index.d.ts",
       "import": "./dist/capabilities/index.js"
@@ -110,10 +114,6 @@
     "./transactions/authoring": {
       "types": "./dist/transactions/authoring/index.d.ts",
       "import": "./dist/transactions/authoring/index.js"
-    },
-    "./transactions/delta": {
-      "types": "./dist/transactions/delta/index.d.ts",
-      "import": "./dist/transactions/delta/index.js"
     }
   },
   "types": "./dist/root.d.ts",

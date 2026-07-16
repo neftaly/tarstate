@@ -1,9 +1,9 @@
 import fc from 'fast-check';
 import { expect } from 'vitest';
 import {
-  authorExactKeyedRelationDelta,
-  type WriteStatement
-} from '@tarstate/core/transactions';
+  authorExactKeyedRelationDelta
+} from '../src/relation-delta-authoring.js';
+import type { WriteStatement } from '../src/transaction.js';
 import type { JsonValue } from '@tarstate/core/foundation';
 import { propertyTest } from './support/property-test.js';
 

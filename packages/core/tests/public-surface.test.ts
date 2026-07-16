@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as root from '../src/root.js';
 import * as artifacts from '@tarstate/core/artifacts';
 import * as attachmentPreparation from '@tarstate/core/attachment/prepare';
+import * as attachmentTransactions from '@tarstate/core/attachment/transact';
 import * as capabilities from '@tarstate/core/capabilities';
 import * as database from '@tarstate/core/database';
 import * as databaseIncremental from '@tarstate/core/database/incremental';
@@ -18,7 +19,6 @@ import * as source from '@tarstate/core/source';
 import * as sourceProjection from '@tarstate/core/source/projection';
 import * as transactions from '@tarstate/core/transactions';
 import * as transactionAuthoring from '@tarstate/core/transactions/authoring';
-import * as transactionDelta from '@tarstate/core/transactions/delta';
 import type { DocumentDeclaration } from '@tarstate/core/attachment';
 import type { ObserverDiagnosticReporter } from '@tarstate/core/database';
 import type { PreparedPlan } from '@tarstate/core/query';
@@ -45,9 +45,11 @@ describe('topic-focused core surface', () => {
     expect(queryPrepare.prepareQuery).toBe(query.prepareQuery);
     expect(queryAuthoring.typedSelect).toBe(query.typedSelect);
     expect(schema.prepareSchema).toBeTypeOf('function');
-    expect(transactions.executePreparedTransaction).toBeTypeOf('function');
+    expect(attachmentTransactions.createAttachmentTransactionService).toBeTypeOf('function');
+    expect('prepareWritableExecutionContext' in transactions).toBe(false);
+    expect('executePreparedTransaction' in transactions).toBe(false);
+    expect('simulatePreparedTransaction' in transactions).toBe(false);
     expect(transactionAuthoring.sealTransaction).toBe(transactions.sealTransaction);
-    expect(transactionDelta.authorExactKeyedRelationDelta).toBe(transactions.authorExactKeyedRelationDelta);
   });
 
   it('creates immutable occurrence identities at the incremental input boundary', () => {
@@ -69,9 +71,10 @@ describe('topic-focused core surface', () => {
     expect(Object.keys(sourceProjection)).toEqual(['sealStorageProjection']);
     expect('prepareQuery' in queryEvaluate).toBe(false);
     expect('prepareQueryMaintenanceSnapshot' in queryEvaluate).toBe(false);
+    expect('prepareQueryMaintenanceSnapshot' in query).toBe(false);
+    expect('prepareQueryMaintenanceSnapshot' in queryPrepare).toBe(false);
     expect('openIncrementalQueryMaintenance' in queryEvaluate).toBe(false);
     expect('evaluateQuery' in queryIncremental).toBe(false);
-    expect('sealTransaction' in transactionDelta).toBe(false);
     expect('executeNonAtomicBatch' in transactionAuthoring).toBe(false);
     expect('createIncrementalDatabaseQueryMaintenance' in databaseObserver).toBe(false);
     expectTypeOf<ObserverDiagnosticReporter>().toMatchTypeOf<import('../src/observer-diagnostics.js').ObserverDiagnosticReporter>();

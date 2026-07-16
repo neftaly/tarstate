@@ -146,7 +146,7 @@ assignArchitectureGroup('transaction-runtime', [
   'lifecycle-governance.ts',
   'transaction-executor.ts'
 ]);
-assignArchitectureGroup('attachment-runtime', ['attachment-preparation.ts']);
+assignArchitectureGroup('attachment-runtime', ['attachment-preparation.ts', 'attachment-transactions.ts']);
 assignArchitectureGroup('observer-contract', ['database-model.ts', 'observer-maintenance-contracts.ts']);
 assignArchitectureGroup('observer', [
   'database.ts',
@@ -186,7 +186,7 @@ const allowedArchitectureDependencies = new Map(Object.entries({
   'transaction-model': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch'],
   'semantic-artifact': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model'],
   'transaction-runtime': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact'],
-  'attachment-runtime': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'semantic-artifact'],
+  'attachment-runtime': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime'],
   'observer-contract': ['foundation', 'source-contract', 'query-model'],
   'observer': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract'],
   'observer-incremental': ['foundation', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer'],
@@ -214,6 +214,7 @@ const publicRuntimePolicies = new Map(Object.entries({
   'source/index.ts': ['foundation', 'source-contract'],
   'attachment/index.ts': ['foundation', 'source-contract'],
   'attachment/prepare/index.ts': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'semantic-artifact', 'attachment-runtime'],
+  'attachment/transact/index.ts': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime', 'attachment-runtime'],
   'query/model/index.ts': ['foundation', 'query-model'],
   'query/prepare/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],
   'query/authoring/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],

@@ -13,6 +13,7 @@ export const corePublicEntryNames = [
   'artifacts/transaction',
   'attachment',
   'attachment/prepare',
+  'attachment/transact',
   'capabilities',
   'database',
   'database/external-store',
@@ -30,7 +31,6 @@ export const corePublicEntryNames = [
   'source/projection',
   'transactions',
   'transactions/authoring',
-  'transactions/delta'
 ] as const;
 
 /** Narrow public Automerge entries in addition to the package root. */

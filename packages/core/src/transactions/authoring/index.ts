@@ -1,5 +1,4 @@
 /** Portable transaction construction without execution, sources, or governance. */
-export * from '../../relation-delta-authoring.js';
 export { sealTransaction } from '../../transaction.js';
 export type {
   FieldEdit,

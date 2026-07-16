@@ -7,22 +7,25 @@ import {
 import {
   compileStorageMapping,
   prepareSchema,
+  sealSchema,
+  sealStorageMapping,
   type StorageMappingBody
 } from '@tarstate/core/schema';
 import {
   coordinateSourceCommit,
-  executePreparedTransaction,
-  prepareWritableExecutionContext,
-  sealTransaction,
-  type PreparedWritableExecutionContext
+  type WritableLogicalState
 } from '@tarstate/core/transactions';
-import type { ArtifactRef, JsonValue } from '@tarstate/core/foundation';
+import {
+  createAttachmentTransactionService,
+  type AttachmentTransactionSnapshot
+} from '@tarstate/core/attachment/transact';
+import { prepareDatabaseAttachment } from '@tarstate/core/attachment/prepare';
+import type { JsonValue } from '@tarstate/core/foundation';
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource,
   AutomergeMappedStorageBinding,
-  AutomergeSourceRuntime,
-  type AutomergeSourceCommand
+  AutomergeSourceRuntime
 } from '../src/index.js';
 
 type TaskDoc = {
@@ -35,7 +38,6 @@ type TaskDoc = {
 };
 
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;
-const schemaRef: ArtifactRef = { id: 'urn:test:mapped-schema', contentHash: hash('a') };
 
 const fixture = async (doc: TaskDoc = {
   tasks: { first: { id: 'first', title: 'First', nested: { priority: 1 }, unknown: { keep: true } } }
@@ -47,7 +49,7 @@ const fixture = async (doc: TaskDoc = {
     integrity: 'builtin:test',
     implementation: Object.freeze({ kind: 'field-replace' })
   });
-  const schema = prepareSchema({
+  const schemaArtifact = await sealSchema({ id: 'urn:test:mapped-schema', body: {
     relations: {
       tasks: {
         relationId: 'relation:tasks', key: ['id'],
@@ -58,7 +60,9 @@ const fixture = async (doc: TaskDoc = {
         }
       }
     }
-  }, registry);
+  } });
+  const schemaRef = { id: schemaArtifact.id, contentHash: schemaArtifact.contentHash };
+  const schema = prepareSchema(schemaArtifact.body, registry);
   if (!schema.success) throw new Error('schema fixture failed');
   const body: StorageMappingBody = {
     schema: schemaRef,
@@ -74,6 +78,7 @@ const fixture = async (doc: TaskDoc = {
       }
     }
   };
+  const mappingArtifact = await sealStorageMapping({ id: 'urn:test:mapped-mapping', body });
   const compiled = compileStorageMapping(body, schemaRef, schema.value, registry);
   if (!compiled.success) {
     throw new Error('mapping fixture failed: ' + compiled.issues.map(({ code, path }) => `${code}:${JSON.stringify(path)}`).join(','));
@@ -81,7 +86,7 @@ const fixture = async (doc: TaskDoc = {
   const runtime = new AutomergeSourceRuntime({ sourceId: 'source:mapped', doc: Automerge.from<TaskDoc>(doc) });
   const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
   const binding = new AutomergeMappedStorageBinding<TaskDoc>({ id: 'binding:mapped', mapping: compiled.value, registry });
-  return { runtime, source, binding };
+  return { runtime, source, binding, registry, schemaArtifact, mappingArtifact };
 };
 
 const commit = (basis: JsonValue, operationId: string, digit: string) => ({
@@ -189,52 +194,32 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     source.close();
   });
 
-  it('reconciles an external Automerge change before committing ordered transaction statements', async () => {
-    const { runtime, source, binding } = await fixture();
-    const context: PreparedWritableExecutionContext<Automerge.Doc<TaskDoc>, AutomergeSourceCommand<TaskDoc>> = prepareWritableExecutionContext({
+  it('replays a logical-row transaction after an external Automerge change', async () => {
+    const { runtime, source, binding, registry, schemaArtifact, mappingArtifact } = await fixture();
+    const preparation = await prepareDatabaseAttachment<WritableLogicalState>({
+      sourceId: source.sourceId,
+      bootstrap: { status: 'ready', declaration: {
+        formatVersion: 1,
+        storageSchema: { id: schemaArtifact.id, contentHash: schemaArtifact.contentHash },
+        projection: {
+          kind: 'storage-mapping',
+          storageMapping: { id: mappingArtifact.id, contentHash: mappingArtifact.contentHash }
+        }
+      } },
+      resolveArtifact: (reference) => reference.id === schemaArtifact.id ? schemaArtifact : mappingArtifact,
+      registry
+    });
+    if (preparation.state !== 'ready') throw new Error('Expected a ready mapped attachment');
+    const transactions = await createAttachmentTransactionService({
       attachmentId: 'attachment:mapped',
       attachmentIncarnation: 'attachment-incarnation:mapped',
-      attachmentFingerprint: hash('e'),
-      authorityViewFingerprint: hash('f'),
-      writable: true,
-      schemaView: schemaRef,
+      authorityScope: 'scope:mapped',
+      preparation,
       source,
-      operationEpoch: 'epoch:mapped',
       bindings: [binding],
-      relationKeys: new Map([['relation:tasks', ['id']]]),
-      satisfiesCapability: () => true,
-      query: {
-        evaluate: (_root, state) => ({
-          rows: state.rows.map(({ fields }) => fields),
-          resultKeys: state.rows.map(({ key }) => JSON.stringify(key)),
-          completeness: 'exact',
-          issues: []
-        })
-      },
+      registry,
       durability: 'memory'
     });
-    const relation = { relationId: 'relation:tasks', schemaView: schemaRef };
-    const target = {
-      relation,
-      alias: 'task',
-      where: {
-        kind: 'compare' as const,
-        op: 'eq' as const,
-        left: { kind: 'field' as const, alias: 'task', name: 'id' },
-        right: { kind: 'literal' as const, value: 'first' }
-      }
-    };
-    const transaction = await sealTransaction({ body: {
-      schemaView: schemaRef,
-      parameters: {},
-      statements: [
-        { kind: 'statement.update', target, edits: { title: { kind: 'edit.replace', value: { kind: 'literal', value: 'Intermediate' } } } },
-        { kind: 'statement.update', target, edits: { title: { kind: 'edit.replace', value: { kind: 'literal', value: 'Final' } } } }
-      ],
-      guards: [],
-      returning: [{ name: 'tasks', root: { kind: 'values', alias: 'task', rows: [] } }],
-      requiredCapabilities: []
-    } });
     const commitDirect = source.commit;
     const commit = vi.spyOn(source, 'commit');
     commit.mockImplementationOnce(async (input) => {
@@ -243,19 +228,22 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       }));
       return commitDirect(input);
     });
-    const receipt = await executePreparedTransaction(context, {
-      operationEpoch: 'epoch:mapped',
-      operationId: 'operation:transaction',
-      attachmentId: 'attachment:mapped',
-      transaction
-    });
+    const transform = vi.fn(({ rows }: AttachmentTransactionSnapshot) => rows.map((row) => ({
+      ...row,
+      fields: { ...row.fields, title: 'Final' }
+    })));
+    const receipt = await transactions.transact(
+      { kind: 'set-final-title' },
+      transform,
+      { operationId: 'operation:transaction' }
+    );
     expect(receipt).toMatchObject({
       outcome: 'committed',
-      statementResults: [{ matched: 1, logicallyChanged: 1 }, { matched: 1, logicallyChanged: 1 }],
-      returning: [{ rows: [{ id: 'first', title: 'Final', priority: 2 }] }]
+      statementResults: [{ logicallyChanged: 1 }]
     });
     expect(runtime.snapshot().storage.tasks!.first).toMatchObject({ title: 'Final', nested: { priority: 2 }, unknown: { keep: true } });
     expect(commit).toHaveBeenCalledTimes(2);
+    expect(transform).toHaveBeenCalledTimes(2);
     source.close();
   });
 });

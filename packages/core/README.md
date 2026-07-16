@@ -59,8 +59,7 @@ Source and transaction adapters also have narrow construction seams:
 | Entry point | Responsibility |
 | --- | --- |
 | `@tarstate/core/source/projection` | Validates and seals binding-owned immutable writable projections once for reuse |
-| `@tarstate/core/transactions/authoring` | Portable transaction and exact-delta construction without execution |
-| `@tarstate/core/transactions/delta` | Exact keyed relation-delta construction only |
+| `@tarstate/core/transactions/authoring` | Portable transaction construction without execution |
 
 Artifact semantics and attachment preparation also have opt-in execution seams:
 
@@ -72,6 +71,7 @@ Artifact semantics and attachment preparation also have opt-in execution seams:
 | `@tarstate/core/artifacts/storage-mapping` | Storage-mapping parsing and compilation |
 | `@tarstate/core/artifacts/schema-lens` | Schema-lens parsing and validation |
 | `@tarstate/core/attachment/prepare` | Attachment resolution, schema/mapping preparation, and constraint composition |
+| `@tarstate/core/attachment/transact` | Replayable logical-row transactions over one prepared writable attachment |
 
 The portable `artifacts` entry never imports query evaluation, mapping, lens,
 constraint, or transaction implementations. Hosts opt into only the semantic
