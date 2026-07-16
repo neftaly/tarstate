@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';
 import type { Issue } from './issues.js';
 import type { EvaluationRun, QueryContext, ScopedRow } from './internal-query-evaluation-context.js';
 import {
@@ -1382,6 +1382,15 @@ export const maintainedQueryResult = (
   if (root === undefined || root.unavailable || root.result.completeness === 'unknown') {
     return Object.freeze({ rows: Object.freeze([]), resultKeys: Object.freeze([]), completeness: 'unknown', issues, state });
   }
+  if (root.stableChangedPositions?.length === 0 && previousPublicViews !== undefined && previousPublicViews.rows.length === root.result.rows.length) {
+    return Object.freeze({
+      rows: previousPublicViews.rows,
+      resultKeys: previousPublicViews.resultKeys,
+      completeness: root.result.completeness,
+      issues,
+      state
+    });
+  }
   if (root.stableChangedPositions !== undefined && previousPublicViews !== undefined && previousPublicViews.rows.length === root.result.rows.length) {
     const rows = previousPublicViews.rows.slice();
     for (const position of root.stableChangedPositions) {
@@ -1420,11 +1429,11 @@ export const maintenanceState = (
   materializedNodeCount,
   updatedNodeCount,
   changedNodeCount,
-  changedRelationIds: Object.freeze([...changedRelationIds]),
+  changedRelationIds: frozenInternalArray(changedRelationIds),
   resultDelta: Object.freeze({
-    addedResultKeys: Object.freeze([...resultDelta.addedResultKeys]),
-    removedResultKeys: Object.freeze([...resultDelta.removedResultKeys]),
-    updatedResultKeys: Object.freeze([...resultDelta.updatedResultKeys])
+    addedResultKeys: frozenInternalArray(resultDelta.addedResultKeys),
+    removedResultKeys: frozenInternalArray(resultDelta.removedResultKeys),
+    updatedResultKeys: frozenInternalArray(resultDelta.updatedResultKeys)
   }),
   rejectedUpdateCount,
   operatorDiagnostics
@@ -1536,5 +1545,8 @@ export const diffMaintainedResults = (
 
 const resultIdentityMap = (rows: readonly ScopedRow[], values: WeakMap<ScopedRow, string>): ReadonlyMap<string, string> =>
   new Map(rows.map((row) => [resultKey(row), rowValueIdentity(row, values)]));
+
+const frozenInternalArray = <Value>(values: readonly Value[]): readonly Value[] =>
+  Object.isFrozen(values) ? values : Object.freeze([...values]);
 
 const deduplicateQueryIssues = (issues: readonly Issue[]): readonly Issue[] => [...new Map(issues.map((issue) => [issue.id, issue])).values()];

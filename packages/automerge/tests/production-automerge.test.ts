@@ -460,6 +460,24 @@ describe('production Automerge adapter', () => {
     expect(facts.properties.some((fact) => fact.path[0] === '__tarstateMetaV1')).toBe(false);
   });
 
+  it('bounds traversal and value normalization depth before projecting hostile nesting', () => {
+    let nested: Record<string, unknown> = { leaf: true };
+    for (let depth = 0; depth < 24; depth += 1) nested = { child: nested };
+    const facts = projectAutomergeFacts(Automerge.from(nested), {
+      maxObjects: 100,
+      maxProperties: 100,
+      maxDepth: 4,
+      maxNormalizedValues: 100
+    });
+
+    expect(facts.completeness).toBe('unknown');
+    expect(facts.objects).toHaveLength(5);
+    expect(facts.issues).toContainEqual(expect.objectContaining({
+      code: 'automerge.projection_budget_exceeded',
+      details: { budget: 'maxDepth', limit: 4 }
+    }));
+  });
+
   it('treats application move-looking records as ordinary uninterpreted data', () => {
     const doc = Automerge.from({
       __automergeMoves: { old: { from: ['a'], to: ['b'] } },

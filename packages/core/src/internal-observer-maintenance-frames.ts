@@ -38,6 +38,7 @@ export type QueryMaintenanceSnapshotNormalizer = {
 
 export const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegistry | undefined): QueryMaintenanceSnapshotNormalizer => {
   const maxParameterSnapshotsPerFrame = 256;
+  const normalizedAttachments = new WeakMap<object, readonly RelationInput[]>();
   const frames = new WeakMap<object, {
     readonly normalized: Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'>;
     readonly parameters: Map<string, QueryMaintenanceSnapshot>;
@@ -46,10 +47,10 @@ export const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegi
   const reuseDiagnostics = new WeakMap<object, { computedFrameDeltaCount: number; reusedFrameDeltaCount: number }>();
   const normalize = (input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>): QueryMaintenanceSnapshot => {
     const metadata = maintenanceFrameMetadataFor(input);
-    if (metadata === undefined) return normalizeQueryMaintenanceSnapshot(input, functions);
+    if (metadata === undefined) return normalizeQueryMaintenanceSnapshot(input, functions, normalizedAttachments);
     let frame = frames.get(metadata.frameIdentity);
     if (frame === undefined) {
-      frame = { normalized: normalizeQueryMaintenanceFrame(input), parameters: new Map() };
+      frame = { normalized: normalizeQueryMaintenanceFrame(input, normalizedAttachments), parameters: new Map() };
       frames.set(metadata.frameIdentity, frame);
     }
     const cached = frame.parameters.get(metadata.parameterKey);
@@ -125,23 +126,32 @@ export const createQueryMaintenanceSnapshotNormalizer = (functions: FunctionRegi
 
 const normalizeQueryMaintenanceSnapshot = (
   input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
-  functions: FunctionRegistry | undefined
+  functions: FunctionRegistry | undefined,
+  normalizedAttachments: WeakMap<object, readonly RelationInput[]>
 ): QueryMaintenanceSnapshot => ({
-  ...normalizeQueryMaintenanceFrame(input),
+  ...normalizeQueryMaintenanceFrame(input, normalizedAttachments),
   parameters: input.parameters,
   ...(functions === undefined ? {} : { functions })
 });
 
 const normalizeQueryMaintenanceFrame = (
-  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>
+  input: DatabaseQueryMaintenanceInput<QueryNode, readonly RelationInput[]>,
+  normalizedAttachments: WeakMap<object, readonly RelationInput[]>
 ): Pick<QueryMaintenanceSnapshot, 'relations' | 'basis' | 'membershipRevision'> => ({
-  relations: input.attachments.flatMap(({ member, snapshot, projection }) => projection.map((relation) => ({
-    ...relation,
-    ...(relation.occurrenceIds === undefined ? {} : { occurrenceIds: adoptQueryOccurrenceIds(relation.occurrenceIds) }),
-    sourceId: member.sourceId,
-    attachmentId: member.attachmentId,
-    basis: snapshot.basis
-  }))),
+  relations: input.attachments.flatMap((available) => {
+    const cached = normalizedAttachments.get(available);
+    if (cached !== undefined) return cached;
+    const { member, snapshot, projection } = available;
+    const normalized = Object.freeze(projection.map((relation) => Object.freeze({
+      ...relation,
+      ...(relation.occurrenceIds === undefined ? {} : { occurrenceIds: adoptQueryOccurrenceIds(relation.occurrenceIds) }),
+      sourceId: member.sourceId,
+      attachmentId: member.attachmentId,
+      basis: snapshot.basis
+    })));
+    normalizedAttachments.set(available, normalized);
+    return normalized;
+  }),
   basis: {
     dataset: { datasetId: input.dataset.datasetId, revision: input.dataset.revision },
     attachments: input.attachments.map(({ member, snapshot }) => ({ attachmentId: member.attachmentId, sourceId: member.sourceId, basis: snapshot.basis }))

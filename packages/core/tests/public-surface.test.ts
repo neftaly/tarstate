@@ -41,12 +41,26 @@ describe('topic-focused core surface', () => {
     expect(databaseIncremental.createIncrementalDatabaseQueryMaintenance).toBeTypeOf('function');
     expect(queryEvaluate.evaluateQuery).toBe(query.evaluateQuery);
     expect(queryIncremental.openIncrementalQueryMaintenance).toBe(query.openIncrementalQueryMaintenance);
+    expect(queryIncremental.createQueryOccurrenceIds).toBeTypeOf('function');
     expect(queryPrepare.prepareQuery).toBe(query.prepareQuery);
     expect(queryAuthoring.typedSelect).toBe(query.typedSelect);
     expect(schema.prepareSchema).toBeTypeOf('function');
     expect(transactions.executePreparedTransaction).toBeTypeOf('function');
     expect(transactionAuthoring.sealTransaction).toBe(transactions.sealTransaction);
     expect(transactionDelta.authorExactKeyedRelationDelta).toBe(transactions.authorExactKeyedRelationDelta);
+  });
+
+  it('creates immutable occurrence identities at the incremental input boundary', () => {
+    const rows = [{ id: 'first' }, { id: 'second' }];
+    const visited: number[] = [];
+    const occurrenceIds = queryIncremental.createQueryOccurrenceIds(rows, (row, index) => {
+      visited.push(index);
+      return `${row.id}:${index}`;
+    });
+
+    expect(occurrenceIds).toEqual(['first:0', 'second:1']);
+    expect(visited).toEqual([0, 1]);
+    expect(Object.isFrozen(occurrenceIds)).toBe(true);
   });
 
   it('keeps deliberately type-only and narrow runtime entries narrow', () => {

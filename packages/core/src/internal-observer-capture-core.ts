@@ -30,25 +30,33 @@ export const assembleEvaluationSnapshot = <Projection>(input: {
   readonly candidates: readonly CapturedMember<Projection>[];
   readonly previous?: EvaluationSnapshot<Projection>;
 }): EvaluationSnapshot<Projection> => {
-  const previousMembers = new Map(
-    (input.previous?.members ?? []).map((candidate) => [candidate.member.attachmentId, candidate])
-  );
-  const previousAvailable = new Map(
-    (input.previous?.available ?? []).map((candidate) => [candidate.member.attachmentId, candidate])
-  );
-  const members = Object.freeze(input.candidates.map((candidate) => {
-    const previous = previousMembers.get(candidate.member.attachmentId);
+  const previousMembers = input.previous?.members;
+  const membersRemainAligned = previousMembers?.length === input.candidates.length
+    && input.candidates.every((candidate, index) => previousMembers[index]?.member.attachmentId === candidate.member.attachmentId);
+  const previousMembersById = membersRemainAligned || previousMembers === undefined
+    ? undefined
+    : new Map(previousMembers.map((candidate) => [candidate.member.attachmentId, candidate]));
+  const members = Object.freeze(input.candidates.map((candidate, index) => {
+    const previous = membersRemainAligned ? previousMembers?.[index] : previousMembersById?.get(candidate.member.attachmentId);
     return previous !== undefined && sameCapturedMember(previous, candidate)
       ? previous
       : Object.freeze(candidate);
   }));
+  const previousAvailable = input.previous?.available;
+  let previousAvailableIndex = 0;
+  let previousAvailableById: ReadonlyMap<string, AvailableQueryAttachment<Projection>> | undefined;
   const available = Object.freeze(members.flatMap((candidate): readonly AvailableQueryAttachment<Projection>[] => {
     if (candidate.attachment === undefined
       || candidate.snapshot === undefined
       || candidate.projection?.state !== 'ready') {
       return [];
     }
-    const previous = previousAvailable.get(candidate.member.attachmentId);
+    let previous = previousAvailable?.[previousAvailableIndex];
+    if (previous?.member.attachmentId === candidate.member.attachmentId) previousAvailableIndex += 1;
+    else {
+      previousAvailableById ??= new Map((previousAvailable ?? []).map((available) => [available.member.attachmentId, available]));
+      previous = previousAvailableById.get(candidate.member.attachmentId);
+    }
     if (previous?.member === candidate.member
       && previous.attachment === candidate.attachment
       && previous.snapshot === candidate.snapshot

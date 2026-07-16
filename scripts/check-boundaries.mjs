@@ -157,7 +157,7 @@ assignArchitectureGroup('observer', [
   'observer.ts'
 ]);
 assignArchitectureGroup('observer-incremental', ['internal-observer-maintenance-frames.ts', 'internal-observer-query-maintenance.ts']);
-assignArchitectureGroup('source-runtime', ['memory-source.ts', 'memory-storage-source.ts']);
+assignArchitectureGroup('source-runtime', ['memory-source.ts']);
 assignArchitectureGroup('system', ['system-relations.ts']);
 assignArchitectureGroup('composition', [
   'golden-workloads.ts',

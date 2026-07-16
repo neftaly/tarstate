@@ -307,4 +307,4 @@ export const transformWindowPartitions = (
   }
   return { rows, changedPositions };
 };
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';

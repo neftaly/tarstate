@@ -60,6 +60,7 @@ export const diffQueryMaintenanceSnapshotValues = (previous: QueryMaintenanceSna
 };
 
 const diffRelationRows = (before: RelationInput | undefined, after: RelationInput | undefined): readonly RelationRowChange[] => {
+  if (before === after || (before !== undefined && after !== undefined && before.rows === after.rows && before.occurrenceIds === after.occurrenceIds)) return [];
   const beforeIds = before?.occurrenceIds ?? [];
   const afterIds = after?.occurrenceIds ?? [];
   if ((before?.rows.length ?? 0) !== beforeIds.length || (after?.rows.length ?? 0) !== afterIds.length) throw new TypeError('Relation changes require complete occurrence IDs');

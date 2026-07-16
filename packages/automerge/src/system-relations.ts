@@ -269,6 +269,16 @@ export type AutomergeSystemEvent =
   | { readonly kind: 'presence-stop'; readonly peerId: string; readonly observedAt: number; readonly reason: 'goodbye' | 'expired' }
   | { readonly kind: 'conflicts-replaced'; readonly rows: readonly AutomergeConflictSystemRow[] };
 
+type SystemRelationChanges = number;
+const noSystemRelationChanges = 0;
+const systemRelationChanges = Object.freeze({
+  peers: 1,
+  connections: 2,
+  sync: 4,
+  conflicts: 8,
+  presence: 16
+});
+
 /** Pure event normalizer; attaching it to Repo event emitters remains host code. */
 export class AutomergeSystemRelationState {
   readonly attachmentId: string;
@@ -287,7 +297,7 @@ export class AutomergeSystemRelationState {
     if (attachmentId.length === 0) throw new TypeError('attachmentId must not be empty');
     this.attachmentId = attachmentId;
     this.#onDiagnostic = options.onDiagnostic;
-    this.#snapshot = freezeSnapshot({ revision: 0, peers: [], connections: [], sync: [], conflicts: [], presence: [] });
+    this.#snapshot = emptySystemRelationSnapshot(0);
   }
 
   getSnapshot(): AutomergeSystemRelationSnapshot { return this.#snapshot; }
@@ -301,18 +311,19 @@ export class AutomergeSystemRelationState {
   apply(event: AutomergeSystemEvent): AutomergeSystemRelationSnapshot {
     if (this.#closed) throw new Error('Automerge system relation state is closed');
     validateEventTime(event);
+    let changed: SystemRelationChanges = noSystemRelationChanges;
     switch (event.kind) {
-      case 'peer-observed': this.#observePeer(event); break;
-      case 'peer-disconnected': this.#disconnectPeer(event); break;
-      case 'sync-state': this.#setSync(event); break;
-      case 'remote-heads-observed': this.#observeRemoteHeads(event); break;
-      case 'presence-set': this.#setPresence(event); break;
-      case 'presence-heartbeat': this.#heartbeat(event); break;
-      case 'presence-stop': this.#stopPresence(event); break;
-      case 'conflicts-replaced': this.#replaceConflicts(event.rows); break;
+      case 'peer-observed': changed = this.#observePeer(event); break;
+      case 'peer-disconnected': changed = this.#disconnectPeer(event); break;
+      case 'sync-state': changed = this.#setSync(event); break;
+      case 'remote-heads-observed': changed = this.#observeRemoteHeads(event); break;
+      case 'presence-set': changed = this.#setPresence(event); break;
+      case 'presence-heartbeat': changed = this.#heartbeat(event); break;
+      case 'presence-stop': changed = this.#stopPresence(event); break;
+      case 'conflicts-replaced': changed = this.#replaceConflicts(event.rows); break;
       default: assertNever(event);
     }
-    return this.#publishIfChanged();
+    return this.#publish(changed);
   }
 
   close(): void {
@@ -325,10 +336,10 @@ export class AutomergeSystemRelationState {
     this.#explicitSyncPeers.clear();
     this.#presence.clear();
     this.#conflicts = Object.freeze([]);
-    this.#snapshot = freezeSnapshot({ revision: this.#snapshot.revision + 1, peers: [], connections: [], sync: [], conflicts: [], presence: [] });
+    this.#snapshot = emptySystemRelationSnapshot(this.#snapshot.revision + 1);
   }
 
-  #observePeer(event: Extract<AutomergeSystemEvent, { readonly kind: 'peer-observed' }>): void {
+  #observePeer(event: Extract<AutomergeSystemEvent, { readonly kind: 'peer-observed' }>): SystemRelationChanges {
     const metadata = event.peerMetadata;
     const prior = this.#peers.get(event.peerId);
     const next = materializeAutomergePeerRow({
@@ -340,7 +351,7 @@ export class AutomergeSystemRelationState {
       ...(metadata?.isEphemeral === undefined ? {} : { isEphemeral: metadata.isEphemeral }),
       ...(metadata?.metadata === undefined ? {} : { metadata: metadata.metadata })
     });
-    if (observationDecision(prior, next, (row) => row.observedAt) === 'ignore') return;
+    if (observationDecision(prior, next, (row) => row.observedAt) === 'ignore') return noSystemRelationChanges;
     this.#peers.set(event.peerId, next);
     this.#connections.set(event.peerId, materializeAutomergeConnectionRow({
       attachmentId: this.attachmentId,
@@ -348,11 +359,13 @@ export class AutomergeSystemRelationState {
       state: 'connected',
       observedAt: event.observedAt
     }));
-    if (prior?.storageId !== undefined && prior.storageId !== metadata?.storageId) this.#correlateStorage(prior.storageId);
-    if (metadata?.storageId !== undefined) this.#correlateStorage(metadata.storageId);
+    let syncChanged = false;
+    if (prior?.storageId !== undefined && prior.storageId !== metadata?.storageId) syncChanged = this.#correlateStorage(prior.storageId) || syncChanged;
+    if (metadata?.storageId !== undefined) syncChanged = this.#correlateStorage(metadata.storageId) || syncChanged;
+    return systemRelationChanges.peers | systemRelationChanges.connections | (syncChanged ? systemRelationChanges.sync : 0);
   }
 
-  #disconnectPeer(event: Extract<AutomergeSystemEvent, { readonly kind: 'peer-disconnected' }>): void {
+  #disconnectPeer(event: Extract<AutomergeSystemEvent, { readonly kind: 'peer-disconnected' }>): SystemRelationChanges {
     const previous = this.#peers.get(event.peerId);
     const next = materializeAutomergePeerRow({
       attachmentId: this.attachmentId,
@@ -363,7 +376,7 @@ export class AutomergeSystemRelationState {
       ...(previous?.isEphemeral === undefined ? {} : { isEphemeral: previous.isEphemeral }),
       ...(previous?.metadata === undefined ? {} : { metadata: previous.metadata })
     });
-    if (observationDecision(previous, next, (row) => row.observedAt) === 'ignore') return;
+    if (observationDecision(previous, next, (row) => row.observedAt) === 'ignore') return noSystemRelationChanges;
     this.#peers.set(event.peerId, next);
     this.#connections.set(event.peerId, materializeAutomergeConnectionRow({
       attachmentId: this.attachmentId,
@@ -371,10 +384,11 @@ export class AutomergeSystemRelationState {
       state: 'disconnected',
       observedAt: event.observedAt
     }));
-    if (previous?.storageId !== undefined) this.#correlateStorage(previous.storageId);
+    const syncChanged = previous?.storageId !== undefined && this.#correlateStorage(previous.storageId);
+    return systemRelationChanges.peers | systemRelationChanges.connections | (syncChanged ? systemRelationChanges.sync : 0);
   }
 
-  #setSync(event: Extract<AutomergeSystemEvent, { readonly kind: 'sync-state' }>): void {
+  #setSync(event: Extract<AutomergeSystemEvent, { readonly kind: 'sync-state' }>): SystemRelationChanges {
     const key = syncKey(event.documentId, event.storageId);
     const previous = this.#sync.get(key);
     const previousWasExplicit = this.#explicitSyncPeers.has(key);
@@ -391,15 +405,16 @@ export class AutomergeSystemRelationState {
       ...(event.peerId === undefined ? {} : { peerId: event.peerId }),
       ...(event.errorCode === undefined ? {} : { errorCode: event.errorCode })
     });
-    if (observationDecision(comparablePrevious, next, (row) => row.observedAt) === 'ignore') return;
+    if (observationDecision(comparablePrevious, next, (row) => row.observedAt) === 'ignore') return noSystemRelationChanges;
     if (event.peerId === undefined) this.#explicitSyncPeers.delete(key);
     else this.#explicitSyncPeers.add(key);
     this.#sync.set(key, next);
     this.#correlateStorage(event.storageId);
+    return systemRelationChanges.sync;
   }
 
-  #observeRemoteHeads(event: Extract<AutomergeSystemEvent, { readonly kind: 'remote-heads-observed' }>): void {
-    this.#setSync({
+  #observeRemoteHeads(event: Extract<AutomergeSystemEvent, { readonly kind: 'remote-heads-observed' }>): SystemRelationChanges {
+    return this.#setSync({
       kind: 'sync-state',
       documentId: event.documentId,
       storageId: event.storageId,
@@ -410,7 +425,7 @@ export class AutomergeSystemRelationState {
     });
   }
 
-  #setPresence(event: Extract<AutomergeSystemEvent, { readonly kind: 'presence-set' }>): void {
+  #setPresence(event: Extract<AutomergeSystemEvent, { readonly kind: 'presence-set' }>): SystemRelationChanges {
     const key = presenceKey(event.peerId, event.channel);
     const previous = this.#presence.get(key);
     const next = materializeAutomergePresenceRow({
@@ -423,19 +438,23 @@ export class AutomergeSystemRelationState {
       lastActiveAt: event.observedAt,
       lastSeenAt: event.observedAt
     });
-    if (observationDecision(previous, next, (row) => row.lastSeenAt) === 'ignore') return;
+    if (observationDecision(previous, next, (row) => row.lastSeenAt) === 'ignore') return noSystemRelationChanges;
     this.#presence.set(key, next);
+    return systemRelationChanges.presence;
   }
 
-  #heartbeat(event: Extract<AutomergeSystemEvent, { readonly kind: 'presence-heartbeat' }>): void {
+  #heartbeat(event: Extract<AutomergeSystemEvent, { readonly kind: 'presence-heartbeat' }>): SystemRelationChanges {
+    let changed = false;
     for (const [key, row] of this.#presence) {
       if (row.peerId !== event.peerId || row.state !== 'active') continue;
-      if (row.lastSeenAt > event.observedAt) continue;
+      if (row.lastSeenAt >= event.observedAt) continue;
       this.#presence.set(key, materializeAutomergePresenceRow({ ...row, lastSeenAt: event.observedAt }));
+      changed = true;
     }
+    return changed ? systemRelationChanges.presence : noSystemRelationChanges;
   }
 
-  #stopPresence(event: Extract<AutomergeSystemEvent, { readonly kind: 'presence-stop' }>): void {
+  #stopPresence(event: Extract<AutomergeSystemEvent, { readonly kind: 'presence-stop' }>): SystemRelationChanges {
     const updates: [string, AutomergePresenceSystemRow][] = [];
     for (const [key, row] of this.#presence) {
       if (row.peerId !== event.peerId || row.state !== 'active') continue;
@@ -448,9 +467,10 @@ export class AutomergeSystemRelationState {
       if (observationDecision(row, next, (candidate) => candidate.lastSeenAt) === 'replace') updates.push([key, next]);
     }
     for (const [key, row] of updates) this.#presence.set(key, row);
+    return updates.length === 0 ? noSystemRelationChanges : systemRelationChanges.presence;
   }
 
-  #replaceConflicts(rows: readonly AutomergeConflictSystemRow[]): void {
+  #replaceConflicts(rows: readonly AutomergeConflictSystemRow[]): SystemRelationChanges {
     const byIssue = new Map<string, AutomergeConflictSystemRow>();
     for (const input of rows) {
       if (input.attachmentId !== this.attachmentId) throw new TypeError('Conflict row belongs to a different attachment');
@@ -460,31 +480,41 @@ export class AutomergeSystemRelationState {
       const nextValue = canonicalizeJson(row as unknown as JsonValue);
       if (previousValue === undefined || comparePortableStrings(previousValue, nextValue) < 0) byIssue.set(row.issueId, row);
     }
-    this.#conflicts = Object.freeze([...byIssue.values()].sort((left, right) => comparePortableStrings(left.issueId, right.issueId)));
+    const conflicts = Object.freeze([...byIssue.values()].sort((left, right) => comparePortableStrings(left.issueId, right.issueId)));
+    if (sameConflictRows(this.#conflicts, conflicts)) return noSystemRelationChanges;
+    this.#conflicts = conflicts;
+    return systemRelationChanges.conflicts;
   }
 
-  #correlateStorage(storageId: string): void {
+  #correlateStorage(storageId: string): boolean {
     const candidates = [...this.#peers.values()].filter((row) => row.state === 'observed' && row.storageId === storageId);
+    let changed = false;
     for (const [key, row] of this.#sync) {
       if (row.storageId !== storageId || this.#explicitSyncPeers.has(key)) continue;
-      if (candidates.length === 1) this.#sync.set(key, materializeAutomergeSyncRow({ ...row, peerId: candidates[0]!.peerId }));
-      else if (row.peerId !== undefined) {
+      if (candidates.length === 1) {
+        if (row.peerId !== candidates[0]!.peerId) {
+          this.#sync.set(key, materializeAutomergeSyncRow({ ...row, peerId: candidates[0]!.peerId }));
+          changed = true;
+        }
+      } else if (row.peerId !== undefined) {
         const { peerId: _peerId, ...uncorrelated } = row;
         this.#sync.set(key, materializeAutomergeSyncRow(uncorrelated));
+        changed = true;
       }
     }
+    return changed;
   }
 
-  #publishIfChanged(): AutomergeSystemRelationSnapshot {
-    const candidate = freezeSnapshot({
+  #publish(changed: SystemRelationChanges): AutomergeSystemRelationSnapshot {
+    if (changed === noSystemRelationChanges) return this.#snapshot;
+    const candidate = Object.freeze({
       revision: this.#snapshot.revision + 1,
-      peers: sortedValues(this.#peers, (row) => row.peerId),
-      connections: sortedValues(this.#connections, (row) => row.peerId),
-      sync: sortedValues(this.#sync, (row) => syncKey(row.documentId, row.storageId)),
-      conflicts: this.#conflicts,
-      presence: sortedValues(this.#presence, (row) => presenceKey(row.peerId, row.channel))
+      peers: changed & systemRelationChanges.peers ? sortedValues(this.#peers, (row) => row.peerId) : this.#snapshot.peers,
+      connections: changed & systemRelationChanges.connections ? sortedValues(this.#connections, (row) => row.peerId) : this.#snapshot.connections,
+      sync: changed & systemRelationChanges.sync ? sortedValues(this.#sync, (row) => syncKey(row.documentId, row.storageId)) : this.#snapshot.sync,
+      conflicts: changed & systemRelationChanges.conflicts ? this.#conflicts : this.#snapshot.conflicts,
+      presence: changed & systemRelationChanges.presence ? sortedValues(this.#presence, (row) => presenceKey(row.peerId, row.channel)) : this.#snapshot.presence
     });
-    if (sameRows(this.#snapshot, candidate)) return this.#snapshot;
     this.#snapshot = candidate;
     for (const listener of Array.from(this.#listeners)) {
       try { listener(); } catch (error) {
@@ -533,11 +563,18 @@ const presenceKey = (peerId: string, channel: string): string => stringTupleKey(
 const sortedValues = <Row>(rows: ReadonlyMap<string, Row>, key: (row: Row) => string): readonly Row[] =>
   Object.freeze([...rows.values()].sort((left, right) => comparePortableStrings(key(left), key(right))));
 
-const sameRows = (left: AutomergeSystemRelationSnapshot, right: AutomergeSystemRelationSnapshot): boolean =>
-  canonicalizeJson({ peers: left.peers, connections: left.connections, sync: left.sync, conflicts: left.conflicts, presence: left.presence } as unknown as JsonValue) ===
-  canonicalizeJson({ peers: right.peers, connections: right.connections, sync: right.sync, conflicts: right.conflicts, presence: right.presence } as unknown as JsonValue);
+const sameConflictRows = (left: readonly AutomergeConflictSystemRow[], right: readonly AutomergeConflictSystemRow[]): boolean =>
+  left.length === right.length && left.every((row, index) => row === right[index]
+    || canonicalizeJson(row as unknown as JsonValue) === canonicalizeJson(right[index] as unknown as JsonValue));
 
-const freezeSnapshot = (snapshot: AutomergeSystemRelationSnapshot): AutomergeSystemRelationSnapshot => deepFreezeClone(snapshot);
+const emptySystemRelationSnapshot = (revision: number): AutomergeSystemRelationSnapshot => Object.freeze({
+  revision,
+  peers: Object.freeze([]),
+  connections: Object.freeze([]),
+  sync: Object.freeze([]),
+  conflicts: Object.freeze([]),
+  presence: Object.freeze([])
+});
 
 const validateEventTime = (event: AutomergeSystemEvent): void => {
   if (event.kind === 'conflicts-replaced') return;

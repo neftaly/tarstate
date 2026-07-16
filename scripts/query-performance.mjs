@@ -166,6 +166,17 @@ for (const [count, iterations] of [[100, 1_000], [1_000, 200], [10_000, 20]]) {
   endToEnd.close();
 }
 
+{
+  const rows = linearRows(10_000);
+  const first = { relations: [input('item', rows)] };
+  const second = { relations: [input('item', [...rows, { id: 10_000, active: true, value: 1 }])] };
+  const session = openIncrementalQueryMaintenance(await plan('linear-insert-delete-10000', linearQuery), first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  measurements.push(benchmark('linear-one-row-insert-delete', 10_000, 10, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
+  session.close();
+}
+
 const functionCapability = { id: 'urn:tarstate:benchmark:identity', version: '1', contractHash: 'sha256:' + 'f'.repeat(64) };
 const functionKey = functionCapability.id + '\u0000' + functionCapability.version + '\u0000' + functionCapability.contractHash;
 const functions = new Map([[functionKey, ([value]) => value ?? null]]);
@@ -319,18 +330,30 @@ for (const [count, iterations] of [[100, 300], [1_000, 30], [10_000, 5]]) {
   const initial = { relations };
   const changed = { relations: [relations[0], input('right', joinRows(count, false).map((row, index) => index === 0 ? { ...row, label: 'changed' } : row))] };
   const prepared = await plan('join-right-' + count, joinQuery);
-  measurements.push(benchmark('equijoin-prepared-pure', count * 2, 6, () => evaluatePreparedQuery(prepared, initial)));
+  measurements.push(benchmark('equijoin-prepared-pure', count * 2, 10, () => evaluatePreparedQuery(prepared, initial)));
   const session = openIncrementalQueryMaintenance(prepared, initial);
   const forward = diffQueryMaintenanceSnapshots(initial, changed);
   const backward = diffQueryMaintenanceSnapshots(changed, initial);
-  measurements.push(benchmark('equijoin-right-one-row-update', count * 2, 6, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
+  measurements.push(benchmark('equijoin-right-one-row-update', count * 2, 20, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
   session.close();
   const leftChanged = { relations: [input('left', joinRows(count, true, true)), relations[1]] };
   const leftSession = openIncrementalQueryMaintenance(prepared, initial);
   const leftForward = diffQueryMaintenanceSnapshots(initial, leftChanged);
   const leftBackward = diffQueryMaintenanceSnapshots(leftChanged, initial);
-  measurements.push(benchmark('equijoin-left-one-row-update', count * 2, 6, (index) => leftSession.applyUpdate(index % 2 === 0 ? leftForward : leftBackward)));
+  measurements.push(benchmark('equijoin-left-one-row-update', count * 2, 20, (index) => leftSession.applyUpdate(index % 2 === 0 ? leftForward : leftBackward)));
   leftSession.close();
+}
+
+{
+  const leftRows = Array.from({ length: 5_000 }, (_, id) => ({ id, joinId: 0 }));
+  const first = { relations: [input('left', leftRows), input('right', [{ id: 0, label: 'before' }])] };
+  const second = { relations: [first.relations[0], input('right', [{ id: 0, label: 'after' }])] };
+  const prepared = await plan('join-skewed-fanout', joinQuery);
+  const session = openIncrementalQueryMaintenance(prepared, first);
+  const forward = diffQueryMaintenanceSnapshots(first, second);
+  const backward = diffQueryMaintenanceSnapshots(second, first);
+  measurements.push(benchmark('equijoin-skewed-right-one-row-update', 5_001, 6, (index) => session.applyUpdate(index % 2 === 0 ? forward : backward)));
+  session.close();
 }
 
 for (const [count, iterations] of [[10, 100], [20, 60], [40, 30], [80, 15]]) {
@@ -673,6 +696,8 @@ const partitionedWindowPure10k = measurement('window-partitioned-prepared-pure',
 const joinPreparedPure10k = measurement('equijoin-prepared-pure', 10_000)?.millisecondsPerOperation;
 const joinRightUpdate10k = measurement('equijoin-right-one-row-update', 10_000)?.millisecondsPerOperation;
 const joinLeftUpdate10k = measurement('equijoin-left-one-row-update', 10_000)?.millisecondsPerOperation;
+const linearInsertDelete10k = measurement('linear-one-row-insert-delete', 10_000)?.millisecondsPerOperation;
+const skewedJoinUpdate = measurement('equijoin-skewed-right-one-row-update', 5_001)?.millisecondsPerOperation;
 const privateBytesPerUpdate = Math.round(sampledAllocationBytes / 100);
 const leftJoinBytesPerUpdate = Math.round(leftJoinSampledAllocationBytes / 100);
 const rightJoinBytesPerUpdate = Math.round(rightJoinSampledAllocationBytes / 100);
@@ -689,34 +714,42 @@ const contracts = {
   ownedPreparedEvaluationAdvantage: linearPure10k !== undefined && linearOwnedPure10k !== undefined && linearOwnedPure10k < linearPure10k * 0.75,
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
+  linearOneRow10kCeiling: linearUpdate10k !== undefined && linearUpdate10k <= 2,
+  linearInsertDelete10kCeiling: linearInsertDelete10k !== undefined && linearInsertDelete10k <= 15,
+  orderOneRow10kCeiling: orderUpdate10k !== undefined && orderUpdate10k <= 5,
+  aggregateOneRow10kCeiling: aggregateUpdate10k !== undefined && aggregateUpdate10k <= 5,
   distinctIncrementalAdvantage: distinctPure10k !== undefined && distinctUpdate10k !== undefined && distinctUpdate10k < distinctPure10k * 0.5,
   highCardinalityDistinctIncrementalAdvantage: highCardinalityDistinctUpdate !== undefined && highCardinalityDistinctPure !== undefined && highCardinalityDistinctUpdate < highCardinalityDistinctPure * 0.2,
   groupedReducerIncrementalAdvantage: groupedReducerPure10k !== undefined && groupedReducerUpdate10k !== undefined && groupedReducerUpdate10k < groupedReducerPure10k * 0.5,
   ungroupedReducerIncrementalAdvantage: ungroupedReducerPure10k !== undefined && ungroupedReducerUpdate10k !== undefined && ungroupedReducerUpdate10k < ungroupedReducerPure10k * 0.5,
   groupedReducerOpenNearLinear: groupedReducerOpen1k !== undefined && groupedReducerOpen10k !== undefined && groupedReducerOpen10k < groupedReducerOpen1k * 15,
-  aggregateAllocationCeiling: aggregateBytesPerUpdate <= 1_000_000,
-  ungroupedReducerAllocationCeiling: ungroupedReducerBytesPerUpdate <= 1_000_000,
-  distinctAllocationCeiling: distinctBytesPerUpdate <= 1_000_000,
+  aggregateAllocationCeiling: aggregateBytesPerUpdate <= 300_000,
+  ungroupedReducerAllocationCeiling: ungroupedReducerBytesPerUpdate <= 350_000,
+  distinctAllocationCeiling: distinctBytesPerUpdate <= 400_000,
   // The duplicate never represents its key, so a correct sparse update can
   // retain the entire 10k-row result. Full Map cloning and representative
   // sorting alone sampled above 3.5 MB/update in the rejected implementation.
-  highCardinalityDistinctAllocationCeiling: highCardinalityDistinctBytesPerUpdate <= 750_000,
+  highCardinalityDistinctAllocationCeiling: highCardinalityDistinctBytesPerUpdate <= 500_000,
   globalWindowIncrementalAdvantage: windowPure10k !== undefined && windowUpdate10k !== undefined && windowUpdate10k < windowPure10k * 0.5,
   partitionedWindowAdvantage: windowUpdate10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < windowUpdate10k * 0.5,
   partitionedWindowIncrementalAdvantage: partitionedWindowPure10k !== undefined && partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k < partitionedWindowPure10k * 0.5,
+  partitionedWindowOneRow10kCeiling: partitionedWindowUpdate10k !== undefined && partitionedWindowUpdate10k <= 30,
   rightJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinRightUpdate10k !== undefined && joinRightUpdate10k < joinPreparedPure10k * 0.5,
   leftJoinIncrementalAdvantage: joinPreparedPure10k !== undefined && joinLeftUpdate10k !== undefined && joinLeftUpdate10k < joinPreparedPure10k * 0.5,
   joinSideUpdateSymmetry: joinLeftUpdate10k !== undefined && joinRightUpdate10k !== undefined && Math.max(joinLeftUpdate10k, joinRightUpdate10k) < Math.min(joinLeftUpdate10k, joinRightUpdate10k) * 2.5,
-  leftJoinAllocationCeiling: leftJoinBytesPerUpdate <= 2_000_000,
-  rightJoinAllocationCeiling: rightJoinBytesPerUpdate <= 2_000_000,
+  leftJoinOneRow10kCeiling: joinLeftUpdate10k !== undefined && joinLeftUpdate10k <= 15,
+  rightJoinOneRow10kCeiling: joinRightUpdate10k !== undefined && joinRightUpdate10k <= 15,
+  skewedJoinFanoutCeiling: skewedJoinUpdate !== undefined && skewedJoinUpdate <= 40,
+  leftJoinAllocationCeiling: leftJoinBytesPerUpdate <= 250_000,
+  rightJoinAllocationCeiling: rightJoinBytesPerUpdate <= 250_000,
   joinSideAllocationSymmetry: Math.max(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) < Math.min(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) * 2.5,
   preparedEvaluationAdvantage: repeatedUnprepared !== undefined && repeatedPrepared !== undefined && repeatedPrepared < repeatedUnprepared * 0.75,
   preparedExpressionAdvantage: repeatedUnpreparedExpression !== undefined && repeatedPreparedExpression !== undefined && repeatedPreparedExpression < repeatedUnpreparedExpression * 0.75,
   unrelatedTraversalSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'unrelated-relation-union-dag').every(({ selectiveVisitedPhysicalNodeCount }) => selectiveVisitedPhysicalNodeCount <= 2),
   pooledIgnoredFieldSelective: pooledMeasurements.filter(({ scenario }) => scenario === 'cloned-root-fanout').every(({ afterUpdate }) => afterUpdate.lastUpdatedPhysicalNodeCount <= 2),
   pooledIgnoredFanoutScaling: pooledFanout10 !== undefined && pooledFanout100 !== undefined && pooledFanout100 < pooledFanout10 * 8,
-  privateAllocationCeiling: privateBytesPerUpdate <= 2_000_000,
-  pooledAllocationCeiling: pooledBytesPerUpdate <= 4_000_000
+  privateAllocationCeiling: privateBytesPerUpdate <= 250_000,
+  pooledAllocationCeiling: pooledBytesPerUpdate <= 300_000
 };
 const contractFailures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);
 

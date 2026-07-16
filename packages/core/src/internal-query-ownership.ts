@@ -23,6 +23,7 @@ import type {
 const ownedMaintenanceSnapshots = new WeakSet<object>();
 const ownedMaintenanceUpdates = new WeakSet<object>();
 const ownedQueryLogicalContainers = new WeakSet<object>();
+const ownedOccurrenceIdentities = new WeakSet<object>();
 
 /** Ownership evidence for values already detached at a query input boundary. */
 export const isOwnedQueryLogicalContainer = (value: object): boolean =>
@@ -162,8 +163,29 @@ const adoptStringArray = (input: readonly string[], label: string): readonly str
 };
 
 /** Descriptor-safe ownership for capture-frame occurrence identity. */
-export const adoptQueryOccurrenceIds = (input: readonly string[]): readonly string[] =>
-  adoptStringArray(input, 'Query occurrence identities');
+export const adoptQueryOccurrenceIds = (input: readonly string[]): readonly string[] => {
+  if (ownedOccurrenceIdentities.has(input)) return input;
+  const owned = adoptStringArray(input, 'Query occurrence identities');
+  ownedOccurrenceIdentities.add(owned);
+  return owned;
+};
+
+/** Builds trusted occurrence identity without re-inspecting an intermediate caller-owned array. */
+export const createQueryOccurrenceIds = <Row>(
+  rows: readonly Row[],
+  identity: (row: Row, index: number) => string
+): readonly string[] => {
+  const output: string[] = [];
+  output.length = rows.length;
+  for (let index = 0; index < rows.length; index += 1) {
+    const value = identity(rows[index] as Row, index);
+    if (typeof value !== 'string') throw new TypeError('Query occurrence identity must be a string');
+    output[index] = value;
+  }
+  Object.freeze(output);
+  ownedOccurrenceIdentities.add(output);
+  return output;
+};
 
 const adoptRelationInput = (input: RelationInput): RelationInput => {
   const descriptors = inspectOwnedDataRecord(input, 'Query relation input', { allowSymbols: true });
@@ -244,21 +266,22 @@ const ownedDataValue = (descriptors: OwnedDataRecord, key: string): unknown => d
 const inspectOwnedArray = (input: unknown, label: string, options: OwnedInspectionOptions = {}): readonly unknown[] => {
   if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
   try {
-    const length = Object.getOwnPropertyDescriptor(input, 'length')?.value;
+    const descriptors = Object.getOwnPropertyDescriptors(input) as Readonly<Record<string, PropertyDescriptor>>;
+    const length = descriptors.length?.value;
     if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError(label + ' contains a hostile length');
-    for (const key of Reflect.ownKeys(input)) {
+    for (const key of Reflect.ownKeys(descriptors)) {
       if (typeof key !== 'string') {
         if (options.allowSymbols === true) continue;
         throw new TypeError(label + ' contains a symbol key');
       }
       if (key === 'length' || /^(0|[1-9][0-9]*)$/.test(key)) continue;
-      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      const descriptor = descriptors[key];
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
     }
     const output: unknown[] = [];
     output.length = length;
     for (let index = 0; index < length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
+      const descriptor = descriptors[String(index)];
       if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
       output[index] = descriptor.value;
     }

@@ -1,14 +1,14 @@
-import { canonicalizeJson, type ContentHash } from './artifacts.js';
-import { createIssue, type Issue } from './issues.js';
-import { detachAndFreezeJsonValue } from './internal-owned-json.js';
-import { positiveSafeInteger } from './internal-numeric-boundary.js';
-import { stringTupleKey } from './internal-string-key.js';
-import { samePortableJson } from './internal-json-equality.js';
-import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
-import type { MemoryRow, MemoryState } from './memory-source.js';
-import type { WritableLogicalRow } from './logical-edit.js';
-import { sealStorageProjection } from './storage-projection.js';
-import type { SourceBasis, SourceSnapshot } from './source-state.js';
+import { canonicalizeJson, type ContentHash } from '../../src/artifacts.js';
+import { createIssue, type Issue } from '../../src/issues.js';
+import { detachAndFreezeJsonValue } from '../../src/internal-owned-json.js';
+import { positiveSafeInteger } from '../../src/internal-numeric-boundary.js';
+import { stringTupleKey } from '../../src/internal-string-key.js';
+import { samePortableJson } from '../../src/internal-json-equality.js';
+import { notifyObservers, type ObserverDiagnosticReporter } from '../../src/observer-diagnostics.js';
+import type { MemoryRow, MemoryState } from '../../src/memory-source.js';
+import type { WritableLogicalRow } from '../../src/logical-edit.js';
+import { sealStorageProjection } from '../../src/storage-projection.js';
+import type { SourceBasis, SourceSnapshot } from '../../src/source-state.js';
 import type {
   AtomicSource,
   Footprint,
@@ -21,8 +21,8 @@ import type {
   SourceCommitResult,
   SourceOutcomeLookup,
   StorageBinding
-} from './source-protocol.js';
-import type { JsonValue } from './value.js';
+} from '../../src/source-protocol.js';
+import type { JsonValue } from '../../src/value.js';
 
 export type LogicalMemoryBasis = { readonly incarnation: string; readonly revision: number };
 

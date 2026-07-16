@@ -77,21 +77,30 @@ export type QueryMaintenanceExtensions<Row> = {
   readonly trustedMetadata: (result: MaintainedDatabaseQueryResult<Row>) => TrustedQueryMaintenanceMetadata | undefined;
 };
 
-const extensionsByFactory = new WeakMap<object, QueryMaintenanceExtensions<unknown>>();
+const queryMaintenanceExtensions = Symbol('tarstate.query-maintenance-extensions');
+type ExtensibleQueryMaintenanceFactory = {
+  readonly [queryMaintenanceExtensions]?: QueryMaintenanceExtensions<unknown>;
+};
 
 /** Registers optional observer optimizations without changing correctness behavior. */
 export const registerQueryMaintenanceExtensions = <Query, Row, Projection>(
   factory: CreateDatabaseQueryMaintenance<Query, Row, Projection>,
   extensions: QueryMaintenanceExtensions<Row>
 ): void => {
-  if (extensionsByFactory.has(factory)) throw new TypeError('Query maintenance extensions are already registered for this factory');
-  extensionsByFactory.set(factory, Object.freeze(extensions) as QueryMaintenanceExtensions<unknown>);
+  const extensible = factory as typeof factory & ExtensibleQueryMaintenanceFactory;
+  if (extensible[queryMaintenanceExtensions] !== undefined) throw new TypeError('Query maintenance extensions are already registered for this factory');
+  Object.defineProperty(extensible, queryMaintenanceExtensions, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: Object.freeze(extensions) as QueryMaintenanceExtensions<unknown>
+  });
 };
 
 export const queryMaintenanceExtensionsFor = <Query, Row, Projection>(
   factory: CreateDatabaseQueryMaintenance<Query, Row, Projection>
 ): QueryMaintenanceExtensions<Row> | undefined =>
-  extensionsByFactory.get(factory) as QueryMaintenanceExtensions<Row> | undefined;
+  (factory as typeof factory & ExtensibleQueryMaintenanceFactory)[queryMaintenanceExtensions] as QueryMaintenanceExtensions<Row> | undefined;
 
 export const failedMaintenanceSession = <Query, Row, Projection>(
   error: unknown

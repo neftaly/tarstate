@@ -1,7 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  LogicalMemoryAtomicSource,
-  LogicalMemoryStorageBinding,
   compileSourceConstraints,
   executePreparedTransaction,
   prepareWritableExecutionContext,
@@ -15,6 +13,11 @@ import {
   type TransactionAttempt,
   type WritableLogicalState
 } from '../src/index.js';
+import {
+  LogicalMemoryAtomicSource,
+  LogicalMemoryStorageBinding,
+  type LogicalMemoryCommand
+} from './fixtures/memory-storage-source.js';
 
 const hash = (character: string): `sha256:${string}` => `sha256:${character.repeat(64)}`;
 const schemaView: ArtifactRef = { id: 'urn:test:executor-schema', contentHash: hash('a') };
@@ -45,7 +48,7 @@ const makeContext = async (satisfiesCapability: (capability: CapabilityRef) => b
       issues: []
     })
   });
-  const context: PreparedWritableExecutionContext<MemoryState, import('../src/index.js').LogicalMemoryCommand> = prepareWritableExecutionContext({
+  const context: PreparedWritableExecutionContext<MemoryState, LogicalMemoryCommand> = prepareWritableExecutionContext({
     attachmentId: 'attachment:executor',
     attachmentIncarnation: 'attachment-incarnation:executor',
     attachmentFingerprint: hash('b'),

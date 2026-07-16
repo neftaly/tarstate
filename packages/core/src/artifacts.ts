@@ -35,6 +35,7 @@ export const defaultArtifactParseBudget: ArtifactParseBudget = Object.freeze({
 });
 
 const hashPattern = /^sha256:[0-9a-f]{64}$/;
+const jsonNumberPattern = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
 
 export const isContentHash = (value: unknown): value is ContentHash => typeof value === 'string' && hashPattern.test(value);
@@ -42,8 +43,13 @@ export const isContentHash = (value: unknown): value is ContentHash => typeof va
 export const canonicalizeJson = canonicalizeJsonValue;
 
 export const sha256Bytes = async (bytes: Uint8Array): Promise<ContentHash> => {
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', Uint8Array.from(bytes).buffer);
-  return `sha256:${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+  const input: Uint8Array<ArrayBuffer> = bytes.buffer instanceof ArrayBuffer
+    ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    : Uint8Array.from(bytes);
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', input));
+  let hex = '';
+  for (const byte of digest) hex += byte.toString(16).padStart(2, '0');
+  return `sha256:${hex}`;
 };
 
 export const sha256Json = (value: JsonValue): Promise<ContentHash> => sha256Bytes(new TextEncoder().encode(canonicalizeJson(value)));
@@ -152,7 +158,7 @@ const safeParseOwnedArtifactValue = async (value: JsonValue, budget: ArtifactPar
 };
 
 export const safeParseJsonText = (text: string, budget: ArtifactParseBudget = defaultArtifactParseBudget): ParseResult<JsonValue> => {
-  const byteLength = new TextEncoder().encode(text).byteLength;
+  const byteLength = utf8ByteLength(text);
   if (byteLength > budget.maxBytes) return { success: false, issues: [createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', details: { budget: 'maxBytes', limit: budget.maxBytes } })] };
   try {
     return { success: true, value: new DuplicateAwareJsonParser(text, budget).parse(), issues: [] };
@@ -271,8 +277,8 @@ class DuplicateAwareJsonParser {
   }
 
   #number(path: readonly unknown[]): number {
-    const rest = this.#text.slice(this.#position);
-    const match = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/.exec(rest);
+    jsonNumberPattern.lastIndex = this.#position;
+    const match = jsonNumberPattern.exec(this.#text);
     if (match === null) this.#fail('artifact.invalid_json', path, { position: this.#position });
     this.#position += match[0].length;
     const value = Number(match[0]);
@@ -300,6 +306,23 @@ class DuplicateAwareJsonParser {
     throw new JsonTextIssue(createIssue({ code, phase: 'parse', severity: 'error', retry: 'after_input', path, ...(details === undefined ? {} : { details }) }));
   }
 }
+
+const utf8ByteLength = (text: string): number => {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const first = text.charCodeAt(index);
+    if (first <= 0x7f) bytes += 1;
+    else if (first <= 0x7ff) bytes += 2;
+    else if (first >= 0xd800 && first <= 0xdbff && index + 1 < text.length) {
+      const second = text.charCodeAt(index + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else bytes += 3;
+    } else bytes += 3;
+  }
+  return bytes;
+};
 
 const invalidEnvelope = (reason: string): ParseResult<never> => ({ success: false, issues: [createIssue({ code: 'artifact.invalid_envelope', retry: 'after_input', details: { reason } })] });
 const isRecord = (value: JsonValue): value is Readonly<Record<string, JsonValue>> => value !== null && typeof value === 'object' && !Array.isArray(value);

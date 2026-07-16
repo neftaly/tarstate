@@ -459,19 +459,18 @@ const evaluatePreparedExecution = <Storage, Command>(
     ? projectLogicalState(context.bindings, beforeSnapshot)
     : emptyLogicalProjection(earlyIssues);
   if (initialProjection.issues.some(isError)) {
-    return rejectedEvaluation(beforeSnapshot, beforeBasis, initialProjection.state, initialProjection.issues);
+    return rejectedEvaluation(beforeSnapshot, beforeBasis, logicalProjectionState(initialProjection), initialProjection.issues);
   }
   let stagedSnapshot = beforeSnapshot;
   let stagedBasis = beforeBasis;
-  let logicalState = initialProjection.state;
   let logicalProjection = initialProjection;
-  const beforeState = logicalState;
+  const beforeState = logicalProjectionState(initialProjection);
   const commands: Command[] = [];
   const statementResults: StatementResult[] = [];
   const issues: Issue[] = [...initialProjection.issues];
   const touchedRelations = new Set<string>();
   for (const [statementIndex, statement] of prepared.transaction.body.statements.entries()) {
-    const statementStart = logicalState;
+    const statementStart = logicalProjection;
     const evaluated = evaluateStatement(context, statement, statementIndex, statementStart, prepared.transaction.body.parameters, stagedBasis);
     statementResults.push(evaluated.result);
     issues.push(...evaluated.result.issues);
@@ -507,18 +506,18 @@ const evaluatePreparedExecution = <Storage, Command>(
     const projected = projectLogicalState(context.bindings, stagedSnapshot, logicalProjection, affectedRelations);
     issues.push(...projected.issues);
     if (projected.issues.some(isError)) break;
-    logicalState = projected.state;
     logicalProjection = projected;
     statementResults[statementIndex] = reconcileStatementResult(
       statement,
       statementStart,
-      logicalState,
+      logicalProjection,
       prepared.transaction.body.parameters,
       evaluated.result
     );
     const relation = statementRelation(statement);
     if (relation !== undefined) touchedRelations.add(relation.relationId);
   }
+  const logicalState = logicalProjectionState(logicalProjection);
   let blockingIssues = issues.filter(isError);
   if (blockingIssues.length === 0) {
     const guardIssues = evaluateGuards(context, prepared.transaction.body.guards, logicalState, prepared.transaction.body.parameters, statementResults, prepared.attempt, stagedBasis);
@@ -555,8 +554,8 @@ const evaluatePreparedExecution = <Storage, Command>(
 
 const reconcileStatementResult = (
   statement: WriteStatement,
-  before: WritableLogicalState,
-  after: WritableLogicalState,
+  before: LogicalProjection,
+  after: LogicalProjection,
   parameters: Readonly<Record<string, JsonValue>>,
   result: StatementResult
 ): StatementResult => {
@@ -564,14 +563,13 @@ const reconcileStatementResult = (
   const relationId = statement.target.relation.relationId;
   const selected = selectTargets(
     statement.target,
-    before.rows.filter((row) => row.relationId === relationId),
+    before.rowsByRelation.get(relationId) ?? [],
     parameters
   );
   if (!selected.success) return result;
   let logicallyChanged = 0;
   const projectedByLocator = new Map<string, WritableLogicalRow>();
-  for (const candidate of after.rows) {
-    if (candidate.relationId !== relationId) continue;
+  for (const candidate of after.rowsByRelation.get(relationId) ?? []) {
     const locator = canonicalizeJson(candidate.locator);
     if (!projectedByLocator.has(locator)) projectedByLocator.set(locator, candidate);
   }
@@ -601,7 +599,7 @@ const evaluateStatement = <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   statement: WriteStatement,
   statementIndex: number,
-  state: WritableLogicalState,
+  state: LogicalProjection,
   parameters: Readonly<Record<string, JsonValue>>,
   basis: SourceBasis
 ): EvaluatedStatement => {
@@ -615,7 +613,7 @@ const evaluateStatement = <Storage, Command>(
   }
   const keyFields = context.relationKeys.get(relation.relationId);
   if (keyFields === undefined) return failedStatement(empty, transactionIssue('transaction.cross_source_access', undefined, { relationId: relation.relationId }));
-  const rows = state.rows.filter(({ relationId }) => relationId === relation.relationId);
+  const rows = state.rowsByRelation.get(relation.relationId) ?? [];
   if (statement.kind === 'statement.insert' || statement.kind === 'statement.replace-all' || statement.kind === 'statement.upsert') {
     const candidates: Readonly<Record<string, JsonValue>>[] = [];
     for (const fields of statement.rows) {
@@ -641,7 +639,7 @@ const evaluateStatement = <Storage, Command>(
     return evaluateUpsert(statement, empty, relation.relationId, keyFields, rows, candidates);
   }
   if (statement.kind === 'statement.insert-from-query') {
-    const queried = safeEvaluateQuery(context.query, statement.root, state, parameters, basis, 'transaction.insert_query_failed');
+    const queried = safeEvaluateQuery(context.query, statement.root, logicalProjectionState(state), parameters, basis, 'transaction.insert_query_failed');
     if (queried.completeness !== 'exact') {
       return failedStatement(empty, ...queried.issues, transactionIssue('transaction.insert_query_incomplete', undefined, { completeness: queried.completeness }));
     }
@@ -876,13 +874,15 @@ type LogicalBindingProjection = {
 
 type LogicalProjection = {
   readonly byBinding: ReadonlyMap<string, LogicalBindingProjection>;
-  readonly state: WritableLogicalState;
+  readonly rowsByRelation: ReadonlyMap<string, readonly WritableLogicalRow[]>;
   readonly issues: readonly Issue[];
 };
 
+const logicalProjectionStates = new WeakMap<LogicalProjection, WritableLogicalState>();
+
 const emptyLogicalProjection = (issues: readonly Issue[]): LogicalProjection => ({
   byBinding: new Map(),
-  state: emptyLogicalState,
+  rowsByRelation: new Map(),
   issues
 });
 
@@ -892,6 +892,7 @@ const projectLogicalState = <Storage, Command>(
   previous?: LogicalProjection,
   affectedRelations?: ReadonlySet<string>
 ): LogicalProjection => {
+  if (previous !== undefined && affectedRelations?.size === 0) return previous;
   const byBinding = new Map(previous?.byBinding ?? []);
   for (const binding of bindings) {
     const selectedRelations = affectedRelations === undefined
@@ -920,19 +921,39 @@ const projectLogicalState = <Storage, Command>(
       selectedRelations: mustProjectFully ? undefined : selectedRelations
     }));
   }
-  const rows: WritableLogicalRow[] = [];
   const issues: Issue[] = [];
+  const rowsByRelation = affectedRelations === undefined || previous === undefined
+    ? new Map<string, readonly WritableLogicalRow[]>()
+    : new Map(previous.rowsByRelation);
+  if (affectedRelations !== undefined && previous !== undefined) {
+    for (const relationId of affectedRelations) rowsByRelation.set(relationId, []);
+  }
   for (const binding of bindings) {
     const projection = byBinding.get(binding.id);
     if (projection === undefined) continue;
-    rows.push(...projection.rows);
     issues.push(...projection.issues);
+    for (const row of projection.rows) {
+      if (affectedRelations !== undefined && previous !== undefined && !affectedRelations.has(row.relationId)) continue;
+      const relationRows = rowsByRelation.get(row.relationId);
+      if (relationRows === undefined) rowsByRelation.set(row.relationId, [row]);
+      else (relationRows as WritableLogicalRow[]).push(row);
+    }
   }
   return {
     byBinding,
-    state: Object.freeze({ rows: Object.freeze(rows) }),
+    rowsByRelation: new Map([...rowsByRelation].map(([relationId, rows]) => [relationId, Object.freeze(rows)])),
     issues: Object.freeze(issues)
   };
+};
+
+const logicalProjectionState = (projection: LogicalProjection): WritableLogicalState => {
+  const cached = logicalProjectionStates.get(projection);
+  if (cached !== undefined) return cached;
+  const rows: WritableLogicalRow[] = [];
+  for (const relationRows of projection.rowsByRelation.values()) rows.push(...relationRows);
+  const state = Object.freeze({ rows: Object.freeze(rows) });
+  logicalProjectionStates.set(projection, state);
+  return state;
 };
 
 /** Pure adoption and partial-refresh merge after the binding callback returns. */
@@ -1224,7 +1245,6 @@ const isArtifactReference = (value: unknown): value is ArtifactRef => isRecord(v
 const isTransaction = (value: Transaction | ArtifactRef): value is Transaction => 'kind' in value && value.kind === 'transaction' && 'body' in value;
 const sameRef = (left: ArtifactRef, right: ArtifactRef): boolean => left.id === right.id && left.contentHash === right.contentHash;
 const isError = (issue: Issue): boolean => issue.severity === 'error';
-const emptyLogicalState: WritableLogicalState = Object.freeze({ rows: Object.freeze([]) });
 const emptyStatementResult = (statementIndex: number): StatementResult => ({
   statementIndex,
   matched: 0,

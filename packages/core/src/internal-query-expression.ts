@@ -60,6 +60,10 @@ export type QueryExpressionContext = {
 const knownTrue: QueryExpressionResult = Object.freeze({ status: 'known', value: true });
 const knownFalse: QueryExpressionResult = Object.freeze({ status: 'known', value: false });
 const knownNull: QueryExpressionResult = Object.freeze({ status: 'known', value: null });
+const missingExpression: QueryExpressionResult = Object.freeze({ status: 'missing' });
+const unknownExpression: QueryExpressionResult = Object.freeze({ status: 'unknown' });
+const indeterminateExpression: QueryExpressionResult = Object.freeze({ status: 'indeterminate' });
+const unavailableExpression: QueryExpressionResult = Object.freeze({ status: 'unavailable' });
 const knownObjects = new WeakMap<object, QueryExpressionResult>();
 const knownLiterals = new WeakMap<object, QueryExpressionResult>();
 const expressionFieldEntries = new WeakMap<object, readonly (readonly [string, Expr])[]>();
@@ -133,7 +137,7 @@ export const evaluatePreparedExpression = (
 };
 
 export const evaluateQueryExpression = (expression: Expr, context: QueryExpressionContext): QueryExpressionResult => {
-  if (context.runtime !== undefined && !context.runtime.consumeWork(context.runtimeState)) return { status: 'unavailable' };
+  if (context.runtime !== undefined && !context.runtime.consumeWork(context.runtimeState)) return unavailableExpression;
   if (expression.kind === 'literal') {
     const cached = knownLiterals.get(expression);
     if (cached !== undefined) return cached;
@@ -141,18 +145,18 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
     knownLiterals.set(expression, result);
     return result;
   }
-  if (expression.kind === 'parameter') return Object.hasOwn(context.parameters, expression.name) ? knownExpression(context.parameters[expression.name] as JsonValue) : { status: 'missing' };
+  if (expression.kind === 'parameter') return Object.hasOwn(context.parameters, expression.name) ? knownExpression(context.parameters[expression.name] as JsonValue) : missingExpression;
   if (expression.kind === 'field') {
     const record = context.row.scope[expression.alias];
-    if (record === undefined || !Object.hasOwn(record, expression.name)) return { status: 'missing' };
+    if (record === undefined || !Object.hasOwn(record, expression.name)) return missingExpression;
     const value = record[expression.name] as QueryLogicalValue;
-    return value === logicalUnknown ? { status: 'unknown' } : knownExpression(value as JsonValue);
+    return value === logicalUnknown ? unknownExpression : knownExpression(value as JsonValue);
   }
   if (expression.kind === 'key-of' || expression.kind === 'source-of') {
     const provenance = context.row.provenance[expression.alias];
-    if (provenance === undefined) return { status: 'missing' };
+    if (provenance === undefined) return missingExpression;
     const value = expression.kind === 'key-of' ? provenance.key : provenance.sourceId;
-    return value === undefined ? { status: 'missing' } : knownExpression(value);
+    return value === undefined ? missingExpression : knownExpression(value);
   }
   if (expression.kind === 'is-null' || expression.kind === 'is-missing') {
     const value = evaluateQueryExpression(expression.value, context);
@@ -164,15 +168,15 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
   if (expression.kind === 'compare') {
     const left = evaluateQueryExpression(expression.left, context);
     const right = evaluateQueryExpression(expression.right, context);
-    const unavailable = propagateExpression(left, right);
+    const unavailable = propagateBinaryExpression(left, right);
     if (unavailable !== undefined) return unavailable;
-    if (left.status !== 'known' || right.status !== 'known' || left.value === null || right.value === null) return { status: 'unknown' };
+    if (left.status !== 'known' || right.status !== 'known' || left.value === null || right.value === null) return unknownExpression;
     if (expression.op === 'eq' || expression.op === 'ne') {
       const equal = compareQueryJsonValuesTotal(left.value, right.value) === 0;
       return knownExpression(expression.op === 'eq' ? equal : !equal);
     }
     const comparison = compareQueryJsonValues(left.value, right.value);
-    if (comparison === undefined) return { status: 'unknown' };
+    if (comparison === undefined) return unknownExpression;
     return knownExpression(expression.op === 'lt' ? comparison < 0 : expression.op === 'lte' ? comparison <= 0 : expression.op === 'gt' ? comparison > 0 : comparison >= 0);
   }
   if (expression.kind === 'boolean') {
@@ -181,46 +185,70 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
       if (value.status === 'unavailable' || value.status === 'indeterminate') return value;
       const truth = value.status === 'known' && typeof value.value === 'boolean' ? value.value : logicalUnknown;
       const result = logicalNot(truth);
-      return result === logicalUnknown ? { status: 'unknown' } : knownExpression(result);
+      return result === logicalUnknown ? unknownExpression : knownExpression(result);
     }
-    const values = expression.args.map((argument) => evaluateQueryExpression(argument, context));
-    if (values.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    const truths = values.map((value): LogicalTruth => value.status === 'known' && typeof value.value === 'boolean' ? value.value : logicalUnknown);
+    const truths: LogicalTruth[] = [];
+    let unavailable = false;
+    let indeterminate = false;
+    for (const argument of expression.args) {
+      const value = evaluateQueryExpression(argument, context);
+      unavailable ||= value.status === 'unavailable';
+      indeterminate ||= value.status === 'indeterminate';
+      truths.push(value.status === 'known' && typeof value.value === 'boolean' ? value.value : logicalUnknown);
+    }
+    if (unavailable) return unavailableExpression;
     const result = expression.op === 'and' ? logicalAnd(truths) : logicalOr(truths);
-    return result === logicalUnknown ? values.some((value) => value.status === 'indeterminate') ? { status: 'indeterminate' } : { status: 'unknown' } : knownExpression(result);
+    return result === logicalUnknown ? indeterminate ? indeterminateExpression : unknownExpression : knownExpression(result);
   }
   if (expression.kind === 'arithmetic') {
     const left = evaluateQueryExpression(expression.left, context);
     const right = evaluateQueryExpression(expression.right, context);
-    const propagated = propagateExpression(left, right);
+    const propagated = propagateBinaryExpression(left, right);
     if (propagated !== undefined) return propagated;
-    if (left.status !== 'known' || right.status !== 'known' || typeof left.value !== 'number' || typeof right.value !== 'number') return { status: 'unknown' };
-    if ((expression.op === 'divide' || expression.op === 'modulo') && right.value === 0) return { status: 'unknown' };
+    if (left.status !== 'known' || right.status !== 'known' || typeof left.value !== 'number' || typeof right.value !== 'number') return unknownExpression;
+    if ((expression.op === 'divide' || expression.op === 'modulo') && right.value === 0) return unknownExpression;
     const value = expression.op === 'add' ? left.value + right.value : expression.op === 'subtract' ? left.value - right.value : expression.op === 'multiply' ? left.value * right.value : expression.op === 'divide' ? left.value / right.value : left.value % right.value;
-    return Number.isFinite(value) ? knownExpression(value) : { status: 'unknown' };
+    return Number.isFinite(value) ? knownExpression(value) : unknownExpression;
   }
   if (expression.kind === 'string') {
-    const args = expression.args.map((argument) => evaluateQueryExpression(argument, context));
-    if (args.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    if (args.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
-    if (args.some((value) => value.status !== 'known' || typeof value.value !== 'string')) return { status: 'unknown' };
-    const strings = args.map((value) => (value as { readonly status: 'known'; readonly value: string }).value);
+    const strings: string[] = [];
+    let unavailable = false;
+    let indeterminate = false;
+    let invalid = false;
+    for (const argument of expression.args) {
+      const value = evaluateQueryExpression(argument, context);
+      unavailable ||= value.status === 'unavailable';
+      indeterminate ||= value.status === 'indeterminate';
+      if (value.status === 'known' && typeof value.value === 'string') strings.push(value.value);
+      else invalid = true;
+    }
+    if (unavailable) return unavailableExpression;
+    if (indeterminate) return indeterminateExpression;
+    if (invalid) return unknownExpression;
     if (expression.op === 'concat') return knownExpression(strings.join(''));
     const value = strings[0]!;
     return knownExpression(expression.op === 'lower' ? value.toLowerCase() : expression.op === 'upper' ? value.toUpperCase() : Array.from(value).length);
   }
   if (expression.kind === 'array') {
-    const values = expression.items.map((item) => evaluateQueryExpression(item, context));
-    if (values.some((value) => value.status === 'unavailable')) return { status: 'unavailable' };
-    if (values.some((value) => value.status === 'indeterminate')) return { status: 'indeterminate' };
-    if (values.some((value) => value.status !== 'known')) return { status: 'unknown' };
-    return knownExpression(sealOwnedQueryLogicalContainer(Object.freeze(
-      values.map((value) => (value as { readonly status: 'known'; readonly value: JsonValue }).value)
-    )));
+    const values: JsonValue[] = [];
+    let unavailable = false;
+    let indeterminate = false;
+    let invalid = false;
+    for (const item of expression.items) {
+      const value = evaluateQueryExpression(item, context);
+      unavailable ||= value.status === 'unavailable';
+      indeterminate ||= value.status === 'indeterminate';
+      if (value.status === 'known') values.push(value.value);
+      else invalid = true;
+    }
+    if (unavailable) return unavailableExpression;
+    if (indeterminate) return indeterminateExpression;
+    if (invalid) return unknownExpression;
+    return knownExpression(sealOwnedQueryLogicalContainer(Object.freeze(values)));
   }
   if (expression.kind === 'record') {
     const fields = projectExpressionFields(expression.fields, context);
-    return Object.values(fields).some((value) => containsQueryLogicalUnknown(value)) ? { status: 'unknown' } : knownExpression(fields as JsonValue);
+    return Object.values(fields).some((value) => containsQueryLogicalUnknown(value)) ? unknownExpression : knownExpression(fields as JsonValue);
   }
   if (expression.kind === 'case') {
     for (const branch of expression.branches) {
@@ -240,37 +268,37 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
     return knownExpression(null);
   }
   if (expression.kind === 'subquery') {
-    if (context.runtime === undefined) return { status: 'unavailable' };
+    if (context.runtime === undefined) return unavailableExpression;
     const result = context.runtime.evaluateSubquery(context.runtimeState, expression.query, context.row);
     if (result.unavailable) {
       context.runtime.markUnavailable(context.runtimeState);
-      return { status: 'unavailable' };
+      return unavailableExpression;
     }
-    if (result.completeness === 'unknown') return { status: 'indeterminate' };
-    if (expression.mode === 'exists') return result.rows.length > 0 ? knownExpression(true) : result.completeness === 'exact' ? knownExpression(false) : { status: 'indeterminate' };
-    if (result.completeness !== 'exact') return { status: 'indeterminate' };
+    if (result.completeness === 'unknown') return indeterminateExpression;
+    if (expression.mode === 'exists') return result.rows.length > 0 ? knownExpression(true) : result.completeness === 'exact' ? knownExpression(false) : indeterminateExpression;
+    if (result.completeness !== 'exact') return indeterminateExpression;
     if (result.rows.length !== 1) {
       context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { rows: result.rows.length } }));
-      return { status: 'unknown' };
+      return unknownExpression;
     }
     const values = Object.values(result.rows[0] as QueryRecord);
     if (values.length !== 1) {
       context.issues.push(createIssue({ code: 'query.scalar_subquery_cardinality', phase: 'query', severity: 'error', retry: 'after_input', details: { fields: values.length } }));
-      return { status: 'unknown' };
+      return unknownExpression;
     }
-    return values[0] === logicalUnknown ? { status: 'unknown' } : knownExpression(values[0] as JsonValue);
+    return values[0] === logicalUnknown ? unknownExpression : knownExpression(values[0] as JsonValue);
   }
   if (expression.kind === 'call') {
     const fn = queryFunction(context.functions, expression.capability);
     if (fn === undefined) {
       context.issues.push(createIssue({ code: 'query.capability_unavailable', retry: 'after_capability', requiredCapabilities: [expression.capability] }));
-      return { status: 'unavailable' };
+      return unavailableExpression;
     }
     const args: JsonValue[] = [];
     for (const argument of expression.args) {
       const value = evaluateQueryExpression(argument, context);
-      if (value.status === 'unavailable') return { status: 'unavailable' };
-      if (value.status !== 'known') return { status: 'unknown' };
+      if (value.status === 'unavailable') return unavailableExpression;
+      if (value.status !== 'known') return unknownExpression;
       args.push(value.value);
     }
     try {
@@ -286,7 +314,7 @@ export const evaluateQueryExpression = (expression: Expr, context: QueryExpressi
       return knownExpression(parsed.value);
     } catch (error) {
       context.issues.push(createIssue({ code: 'query.function_failed', phase: 'query', severity: 'error', retry: 'after_input', requiredCapabilities: [expression.capability], details: { error: error instanceof Error ? error.name : typeof error } }));
-      return { status: 'unavailable' };
+      return unavailableExpression;
     }
   }
   return assertNever(expression);
@@ -304,11 +332,12 @@ export const knownExpression = (value: JsonValue): QueryExpressionResult => {
   return result;
 };
 
-const propagateExpression = (...values: readonly QueryExpressionResult[]): QueryExpressionResult | undefined =>
-  values.some((value) => value.status === 'unavailable') ? { status: 'unavailable' }
-    : values.some((value) => value.status === 'indeterminate') ? { status: 'indeterminate' }
-      : values.some((value) => value.status === 'unknown') ? { status: 'unknown' }
-        : undefined;
+const propagateBinaryExpression = (left: QueryExpressionResult, right: QueryExpressionResult): QueryExpressionResult | undefined => {
+  if (left.status === 'unavailable' || right.status === 'unavailable') return unavailableExpression;
+  if (left.status === 'indeterminate' || right.status === 'indeterminate') return indeterminateExpression;
+  if (left.status === 'unknown' || right.status === 'unknown') return unknownExpression;
+  return undefined;
+};
 
 export const expressionJson = (result: QueryExpressionResult): JsonValue => result.status === 'known' ? result.value : null;
 

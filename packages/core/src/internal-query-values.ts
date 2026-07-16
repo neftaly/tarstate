@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';
 import { comparePortableStrings } from './portable-order.js';
 import { logicalUnknown, type JsonValue } from './value.js';
 import type { QueryLogicalValue } from './query-model.js';

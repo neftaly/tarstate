@@ -19,7 +19,6 @@ export * from './lifecycle-governance.js';
 export * from './maintenance.js';
 export * from './mapping.js';
 export * from './memory-source.js';
-export * from './memory-storage-source.js';
 export * from './observer.js';
 export type { ObserverDiagnostic, ObserverDiagnosticReporter } from './observer-diagnostics.js';
 export {

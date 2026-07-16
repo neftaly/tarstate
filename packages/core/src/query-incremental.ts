@@ -7,6 +7,7 @@ import {
   adoptQueryMaintenanceUpdate,
   cloneAndFreezeQueryAst
 } from './internal-query-ownership.js';
+export { createQueryOccurrenceIds } from './internal-query-ownership.js';
 import { createEvaluationRun, type ScopedRow } from './internal-query-evaluation-context.js';
 import { sameExecutionBudget, sameFunctionRegistry, sameOptionalJson } from './internal-query-equality.js';
 import { selectCanRetainMaterialization } from './internal-query-dependency.js';
@@ -237,8 +238,8 @@ type PooledRootState = {
 };
 
 type PooledUpdateJournal = {
-  readonly materialized: Map<QueryNode, MaterializedQueryNode | undefined>;
-  readonly roots: Map<PooledRootState, {
+  materialized?: Map<QueryNode, MaterializedQueryNode | undefined>;
+  roots?: Map<PooledRootState, {
     readonly current: IncrementalQueryResult;
     readonly currentIsAssertion: boolean;
     readonly publishedRevision: number;
@@ -424,8 +425,10 @@ export const createPooledIncrementalQueryRuntime = (input: {
   };
 
   const rememberRootPublication = (root: PooledRootState, journal?: PooledUpdateJournal): void => {
-    if (journal === undefined || journal.roots.has(root)) return;
-    journal.roots.set(root, {
+    if (journal === undefined) return;
+    const roots = journal.roots ??= new Map();
+    if (roots.has(root)) return;
+    roots.set(root, {
       current: root.current,
       currentIsAssertion: root.currentIsAssertion,
       publishedRevision: root.publishedRevision
@@ -620,12 +623,10 @@ export const createPooledIncrementalQueryRuntime = (input: {
     const nextSnapshot = applied.value;
     const run = createEvaluationRun(nextSnapshot.executionBudget);
     runtimeIssues = [];
-    const changedRelations = new Set(update.relations.map(({ relation }) => relationKey(relation)));
     const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
       || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
     const updatedNodes = new Set<QueryNode>();
     const changedNodes = new Set<QueryNode>();
-    const operatorEvents: QueryMaintenanceOperatorEvent[] = [];
     const operatorEventsByNode = new Map<QueryNode, QueryMaintenanceOperatorEvent>();
     const previousRootNodes = new Map<QueryNode, MaterializedQueryNode | undefined>();
     const changedRoots = new Set<PooledRootState>();
@@ -669,7 +670,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
       }
       return first;
     };
-    for (const relation of changedRelations) for (const node of relationConsumers.get(relation) ?? []) enqueue(node);
+    for (const { relation } of update.relations) for (const node of relationConsumers.get(relationKey(relation)) ?? []) enqueue(node);
     if (sessionEvidenceChanged) for (const node of evidenceConsumers) enqueue(node);
     for (const node of unmaterializedNodes) enqueue(node);
 
@@ -687,11 +688,9 @@ export const createPooledIncrementalQueryRuntime = (input: {
       });
       const nextNode = updated.materialized;
       const operatorEvent = updated.operatorEvent;
-      if (operatorEvent !== undefined) {
-        operatorEvents.push(operatorEvent);
-        operatorEventsByNode.set(node, operatorEvent);
-      }
-      if (!journal.materialized.has(node)) journal.materialized.set(node, previousNode);
+      if (operatorEvent !== undefined) operatorEventsByNode.set(node, operatorEvent);
+      const materializedJournal = journal.materialized ??= new Map();
+      if (!materializedJournal.has(node)) materializedJournal.set(node, previousNode);
       materialized.set(node, nextNode);
       unmaterializedNodes.delete(node);
       updatedNodes.add(node);
@@ -722,7 +721,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
     // Changed roots must consume sparse positional evidence before a later
     // transition replaces it. Unchanged roots publish telemetry lazily.
     for (const root of changedRoots) publishRoot(root, journal);
-    refreshDiagnostics(updatedNodes.size, changedNodes.size, 0, summarizeOperatorEvents(operatorEvents));
+    refreshDiagnostics(updatedNodes.size, changedNodes.size, 0, summarizeOperatorEvents(operatorEventsByNode.values()));
   };
 
   const applyUpdate = (update: QueryMaintenanceUpdate): void => {
@@ -738,7 +737,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
       assertionInvalidated,
       transitionEvidence
     };
-    const journal: PooledUpdateJournal = { materialized: new Map(), roots: new Map() };
+    const journal: PooledUpdateJournal = {};
     executionPhase = 'updating';
     try {
       applyUpdateNow(adoptQueryMaintenanceUpdate(update), journal);
@@ -750,7 +749,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
       diagnostics = checkpoint.diagnostics;
       assertionInvalidated = checkpoint.assertionInvalidated;
       transitionEvidence = checkpoint.transitionEvidence;
-      for (const [node, value] of journal.materialized) {
+      for (const [node, value] of journal.materialized ?? []) {
         if (value === undefined) {
           materialized.delete(node);
           if (physical.has(node)) unmaterializedNodes.add(node);
@@ -759,7 +758,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
           unmaterializedNodes.delete(node);
         }
       }
-      for (const [root, state] of journal.roots) {
+      for (const [root, state] of journal.roots ?? []) {
         root.current = state.current;
         root.currentIsAssertion = state.currentIsAssertion;
         root.publishedRevision = state.publishedRevision;

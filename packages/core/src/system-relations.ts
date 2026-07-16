@@ -3,6 +3,7 @@ import type { FieldDeclaration, SchemaBody } from './schema.js';
 import type { CapabilityRef, Issue, IssuePhase, IssueSeverity } from './issues.js';
 import type { SourceBasis } from './source-state.js';
 import type { QueryRecord, RelationInput } from './query-model.js';
+import { createQueryOccurrenceIds } from './internal-query-ownership.js';
 import { executePresence, type PresenceReceipt, type SetPresenceCommand } from './receipts.js';
 import type { JsonValue } from './value.js';
 
@@ -244,12 +245,12 @@ export const materializeSystemRelationInputs = (snapshot: SystemCatalogSnapshot,
   const normalizedSchemaView = normalizeArtifactRef(schemaView);
   return Object.entries(systemRelationKeys).map(([relationId, keyFields]) => {
     const relationRows = rows[relationId as SystemRelationId] as readonly QueryRecord[];
-    const occurrenceIds = relationRows.map((row) => occurrenceId(relationId, keyFields, row));
+    const occurrenceIds = createQueryOccurrenceIds(relationRows, (row) => occurrenceId(relationId, keyFields, row));
     if (new Set(occurrenceIds).size !== occurrenceIds.length) throw new Error('Duplicate system relation key in ' + relationId);
     return Object.freeze({
       relation: { schemaView: normalizedSchemaView, relationId },
       rows: Object.freeze([...relationRows]),
-      occurrenceIds: Object.freeze(occurrenceIds),
+      occurrenceIds,
       completeness: 'exact' as const,
       sourceId: 'tarstate:system',
       attachmentId: 'tarstate:system:' + snapshot.viewId,

@@ -6,6 +6,7 @@ import {
   DatasetMembership
 } from '../packages/core/dist/database/index.js';
 import { createIncrementalDatabaseQueryMaintenance } from '../packages/core/dist/database/incremental/index.js';
+import { createQueryOccurrenceIds } from '../packages/core/dist/query/incremental/index.js';
 import { prepareManualReadOnlyAttachment } from '../packages/core/dist/attachment/prepare/index.js';
 import { prepareQuery } from '../packages/core/dist/query/index.js';
 
@@ -57,7 +58,7 @@ const openObserver = async (count) => {
         state: 'ready', issues: [], value: [{
           relation,
           rows: snapshot.storage.rows,
-          occurrenceIds: snapshot.storage.rows.map(({ id }) => 'row:' + id),
+          occurrenceIds: createQueryOccurrenceIds(snapshot.storage.rows, ({ id }) => 'row:' + id),
           completeness: 'exact',
           sourceId: source.sourceId,
           attachmentId,
@@ -205,8 +206,8 @@ const contracts = {
   repeatedSamples: measurements.every(({ sampleCount }) => sampleCount === 3),
   exactPublicationSemantics: measurements.every(({ notifications, expectedNotifications, correctnessFailures }) =>
     notifications === expectedNotifications && correctnessFailures.length === 0),
-  observerOneRow10kCeiling: tenThousand !== undefined && tenThousand.millisecondsPerOperation <= 25,
-  observerAllocationCeiling: sampledBytesPerUpdate <= 1_250_000
+  observerOneRow10kCeiling: tenThousand !== undefined && tenThousand.millisecondsPerOperation <= 15,
+  observerAllocationCeiling: sampledBytesPerUpdate <= 350_000
 };
 const failures = Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name);
 process.stdout.write(JSON.stringify({

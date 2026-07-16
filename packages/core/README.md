@@ -46,6 +46,10 @@ Query and observation have narrower execution seams:
 | `@tarstate/core/database/incremental` | Explicit adapter from database observation to incremental query maintenance |
 | `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
 
+Projection adapters that already own their rows can use
+`createQueryOccurrenceIds` from `@tarstate/core/query/incremental` to build
+frozen occurrence identities without a second descriptor-inspection pass.
+
 Schema, query, and transaction authoring are separate implementations behind
 their topic entries, so query authoring does not load schema or transaction
 authoring code.

@@ -51,6 +51,12 @@ describe('Automerge system relations', () => {
     state.apply({ kind: 'peer-disconnected', peerId: 'peer:two', observedAt: 4 });
     expect(state.getSnapshot()).toBe(beforeDuplicate);
     expect(listener).toHaveBeenCalledTimes(4);
+
+    const beforePresence = state.getSnapshot();
+    state.apply({ kind: 'presence-set', peerId: 'peer:one', channel: 'cursor', origin: 'observed', value: null, observedAt: 5 });
+    expect(state.getSnapshot().peers).toBe(beforePresence.peers);
+    expect(state.getSnapshot().connections).toBe(beforePresence.connections);
+    expect(state.getSnapshot().sync).toBe(beforePresence.sync);
   });
 
   it('retains explicit peer correlation and all normalized sync lifecycle states', () => {
@@ -151,6 +157,9 @@ describe('Automerge system relations', () => {
     const state = new AutomergeSystemRelationState('attachment:one');
     state.apply({ kind: 'conflicts-replaced', rows: first });
     expect(state.getSnapshot().conflicts).toEqual(first);
+    const beforeDuplicate = state.getSnapshot();
+    state.apply({ kind: 'conflicts-replaced', rows: second });
+    expect(state.getSnapshot()).toBe(beforeDuplicate);
     state.apply({ kind: 'conflicts-replaced', rows: [] });
     expect(state.getSnapshot().conflicts).toEqual([]);
   });

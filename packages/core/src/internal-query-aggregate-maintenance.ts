@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';
 import type { Issue } from './issues.js';
 import type { QueryContext, ScopedRow } from './internal-query-evaluation-context.js';
 import {

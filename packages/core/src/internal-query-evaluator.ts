@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';
 import { createIssue, type Issue } from './issues.js';
 import { WorkBudgetLedger, type NodeResult, type QueryContext, type ScopedRow } from './internal-query-evaluation-context.js';
 import {
@@ -583,18 +583,24 @@ const evaluateAggregate = (node: Extract<QueryNode, { readonly kind: 'aggregate'
 
 export const aggregateValue = (aggregate: AggregateExpr, rows: readonly ScopedRow[], context: QueryContext): QueryLogicalValue => {
   const ordered = aggregate.orderBy === undefined ? rows : sortRowsByOrder(rows, aggregate.orderBy, context);
-  const values = aggregate.value === undefined ? ordered.map(() => known(1)) : ordered.map((row) => evaluateExpr(aggregate.value as Expr, exprContext(row, context)));
-  if (values.some((value) => value.status === 'unavailable' || value.status === 'indeterminate')) context.state.unavailable = true;
-  const knownValues = values.filter((result): result is { readonly status: 'known'; readonly value: JsonValue } => result.status === 'known').map((result) => result.value);
-  const nonNullValues = knownValues.filter((value) => value !== null);
+  const knownValues: JsonValue[] = [];
+  const nonNullValues: Exclude<JsonValue, null>[] = [];
+  const truths: LogicalTruth[] | undefined = aggregate.op === 'any' || aggregate.op === 'every' ? [] : undefined;
+  for (const row of ordered) {
+    const result = aggregate.value === undefined ? known(1) : evaluateExpr(aggregate.value, exprContext(row, context));
+    if (result.status === 'unavailable' || result.status === 'indeterminate') context.state.unavailable = true;
+    if (truths !== undefined) truths.push(result.status === 'known' && typeof result.value === 'boolean' ? result.value : logicalUnknown);
+    if (result.status !== 'known') continue;
+    knownValues.push(result.value);
+    if (result.value !== null) nonNullValues.push(result.value);
+  }
   if (aggregate.op === 'count') return nonNullValues.length;
   if (aggregate.op === 'count-distinct') return new Set(nonNullValues.map(canonicalizeJson)).size;
   if (aggregate.op === 'collect') return sealOwnedQueryLogicalContainer(Object.freeze(knownValues));
   if (aggregate.op === 'first') return knownValues[0] ?? null;
   if (aggregate.op === 'last') return knownValues.at(-1) ?? null;
   if (aggregate.op === 'any' || aggregate.op === 'every') {
-    const truths = values.map((result): LogicalTruth => result.status === 'known' && typeof result.value === 'boolean' ? result.value : logicalUnknown);
-    const truth = aggregate.op === 'any' ? logicalOr(truths) : logicalAnd(truths);
+    const truth = aggregate.op === 'any' ? logicalOr(truths as LogicalTruth[]) : logicalAnd(truths as LogicalTruth[]);
     return truth;
   }
   const numbers = nonNullValues.filter((value): value is number => typeof value === 'number');

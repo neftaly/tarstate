@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';
 import { relationKey } from './internal-query-relations.js';
 import type { AggregateExpr, Expr, OrderTerm, QueryNode, RelationUse, WindowExpr } from './query-model.js';
 import type { JsonValue } from './value.js';
