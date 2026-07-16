@@ -37,7 +37,7 @@ describe('mutation state transformation', () => {
 
     const mutationIds = state.mutations.map(({ mutationId }) => mutationId);
     expect(state.mutations).toHaveLength(100);
-    expect(mutationIds).toEqual([...mutationIds].sort((left, right) => left - right));
+    expect(mutationIds).toEqual(Array.from({ length: 100 }, (_, index) => index + 26));
     expect(new Set(mutationIds).size).toBe(mutationIds.length);
     expect(state.mutations.every(({ state: entryState }) => entryState === 'failed')).toBe(true);
     expect(Object.isFrozen(state)).toBe(true);

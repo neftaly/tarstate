@@ -177,7 +177,7 @@ export const openIncrementalQueryMaintenance = (
             graph.nodes.length,
             updatedNodeCount,
             changedNodes.size,
-            changedRelationIds(ownedUpdate.relations.map(({ relation }) => relation)),
+            changedRelationIds(ownedUpdate.relations),
             diffMaintainedResults(assertedRoot, root, valueIdentities),
             revision,
             rejectedUpdateCount,
@@ -710,7 +710,7 @@ export const createPooledIncrementalQueryRuntime = (input: {
     transitionEvidence = {
       rejected: false,
       assertionWasInvalidated: assertionInvalidated,
-      changedRelationIds: Object.freeze(changedRelationIds(update.relations.map(({ relation }) => relation))),
+      changedRelationIds: changedRelationIds(update.relations),
       updatedNodes,
       changedNodes,
       previousRootNodes,

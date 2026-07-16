@@ -186,13 +186,17 @@ export const nextMutationState = (current: MutationState, entry: MutationEntry):
   const ownedEntry = deepFreezeDataClone(entry);
   (ownedEntry.state === 'pending' ? pending : settled).push(ownedEntry);
   // Pending operations are evidence, not history: retain them until their promise settles.
-  const retainedSettled = settled.length > maxRetainedMutations
-    ? settled.slice(settled.length - maxRetainedMutations)
-    : settled;
-  const mutations = [...retainedSettled, ...pending]
-    .sort((left, right) => left.mutationId - right.mutationId);
+  const droppedSettled = settled.length - maxRetainedMutations;
+  if (droppedSettled > 0) {
+    for (let index = droppedSettled; index < settled.length; index += 1) {
+      settled[index - droppedSettled] = settled[index] as MutationEntry;
+    }
+    settled.length = maxRetainedMutations;
+  }
+  for (const entry of pending) settled.push(entry);
+  settled.sort((left, right) => left.mutationId - right.mutationId);
   return Object.freeze({
     pendingCount: pending.length,
-    mutations: Object.freeze(mutations)
+    mutations: Object.freeze(settled)
   });
 };

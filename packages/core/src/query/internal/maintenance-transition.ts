@@ -10,8 +10,7 @@ import { queryValueEqual } from './values.js';
 import { comparePortableStrings } from '../../portable-order.js';
 import type {
   QueryRecord,
-  RelationInput,
-  RelationUse
+  RelationInput
 } from '../model.js';
 import type {
   QueryMaintenanceSnapshot,
@@ -156,8 +155,11 @@ const rejectedMaintenanceUpdate = (reason: string, relationId?: string): Applied
   issues: [incrementalQueryIssue('query.incremental_identity_invalid', { reason, ...(relationId === undefined ? {} : { relationId }) })]
 });
 
-export const changedRelationIds = (relations: readonly RelationUse[]): readonly string[] =>
-  [...new Set(relations.map(({ relationId }) => relationId))].sort(comparePortableStrings);
+export const changedRelationIds = (changes: readonly RelationInputChange[]): readonly string[] => {
+  const relationIds = new Set<string>();
+  for (const change of changes) relationIds.add(change.relation.relationId);
+  return Object.freeze([...relationIds].sort(comparePortableStrings));
+};
 
 const incrementalQueryIssue = (code: string, details: JsonValue): Issue => createIssue({
   code,
