@@ -22,11 +22,11 @@ import { adoptConflictFreeAutomergeJsonValue } from '../document/json-value.js';
 import { AutomergeAtomicSource } from '../adapter/atomic-source.js';
 import { AutomergeMappedStorageBinding } from '../adapter/mapped-storage.js';
 import {
-  createLiveAutomergeAttachment,
+  createLiveAutomergeDatabase,
 } from './live.js';
-import { embeddedArtifactKey, indexEmbeddedArtifacts } from './embedded-artifacts.js';
+import { embeddedArtifactKey, indexEmbeddedArtifacts } from '../attachment/embedded-artifacts.js';
 import type { AutomergeDatabase } from './model.js';
-import { createAutomergeAttachmentProjector, databaseProjection } from './projection.js';
+import { createAutomergeAttachmentProjector, databaseProjection } from '../attachment/projection.js';
 import {
   automergeRepoSourceRuntime,
   type AutomergeRepoHandle,
@@ -46,6 +46,13 @@ export type OpenAutomergeDatabaseOptions<T extends object, Heads> = {
 export const openAutomergeDatabase = async <T extends object, Heads>(
   input: OpenAutomergeDatabaseOptions<T, Heads>
 ): Promise<ParseResult<AutomergeDatabase>> => {
+  if (typeof input.authorityScope !== 'string' || input.authorityScope.length === 0) {
+    throw new TypeError('authorityScope must be a non-empty string');
+  }
+  if (input.attachmentId !== undefined
+    && (typeof input.attachmentId !== 'string' || input.attachmentId.length === 0)) {
+    throw new TypeError('attachmentId must be a non-empty string');
+  }
   const declaration = adoptBoundaryJson(input.declaration);
   if (!declaration.success) return declaration;
   const embedded = adoptBoundaryJson(input.embeddedArtifacts);
@@ -115,7 +122,7 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
     });
     return {
       success: true,
-      value: createLiveAutomergeAttachment({
+      value: createLiveAutomergeDatabase({
         attachmentId,
         incarnation: attachmentIncarnation,
         authorityScope: input.authorityScope,

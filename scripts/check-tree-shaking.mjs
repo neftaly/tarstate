@@ -41,6 +41,11 @@ const cases = [
     maxGzipBytes: 400
   },
   {
+    name: 'React query hook',
+    source: selectedExport('packages/react/dist/index.js', 'useQuery'),
+    maxGzipBytes: 5_200
+  },
+  {
     name: 'schema JSON generator',
     source: selectedExport('packages/schema-tools/dist/index.js', 'generateJsonSchema'),
     maxGzipBytes: 8_500

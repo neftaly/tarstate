@@ -164,16 +164,22 @@ export class OptimisticOverlayStore {
     let rows = authoritative.current.rows;
     let resultKeys = authoritative.current.resultKeys;
     const operations: OptimisticOperationEvidence[] = [];
-    const failures: [ActiveOptimisticOverlay, OptimisticUpdateError][] = [];
-    const observedBases = new Map<string, JsonValue>();
-    const candidates = new Map<number, ActiveOptimisticOverlay>();
+    let failures: [ActiveOptimisticOverlay, OptimisticUpdateError][] | undefined;
+    let observedBases: Map<string, JsonValue> | undefined;
+    let candidates: Map<number, ActiveOptimisticOverlay> | undefined;
     for (const attachment of authoritative.current.basis.attachments) {
       const target = overlayTargetKey(attachment.attachmentId, attachment.sourceId);
-      observedBases.set(target, attachment.basis);
-      for (const overlay of this.#overlaysByTarget.get(target)?.values() ?? []) candidates.set(overlay.mutationId, overlay);
+      const targeted = this.#overlaysByTarget.get(target);
+      if (targeted === undefined) continue;
+      (observedBases ??= new Map()).set(target, attachment.basis);
+      const indexed = candidates ??= new Map();
+      for (const overlay of targeted.values()) indexed.set(overlay.mutationId, overlay);
     }
-    const observedBasisFingerprints = new Map<JsonValue, string>();
-    const orderedCandidates = [...candidates.values()].sort((left, right) => left.sequence - right.sequence);
+    if (candidates === undefined || observedBases === undefined) return authoritative;
+    const observedBasisFingerprints = candidates.size > 1 ? new Map<JsonValue, string>() : undefined;
+    const orderedCandidates: Iterable<ActiveOptimisticOverlay> = candidates.size === 1
+      ? candidates.values()
+      : [...candidates.values()].sort((left, right) => left.sequence - right.sequence);
     for (const overlay of orderedCandidates) {
       const definition = overlay.definition as OptimisticOverlay<Query, Row>;
       if (definition.appliesToQuery !== undefined) {
@@ -181,36 +187,36 @@ export class OptimisticOverlayStore {
         try {
           applies = definition.appliesToQuery(request);
         } catch (error) {
-          failures.push([overlay, optimisticOverlayError('applies-to-query', error)]);
+          (failures ??= []).push([overlay, optimisticOverlayError('applies-to-query', error)]);
           continue;
         }
         if (!applies) continue;
       }
       const observedBasis = observedBases.get(overlayTargetKey(overlay.attachmentId, overlay.sourceId));
       if (observedBasis === undefined) continue;
-      let observedBasisFingerprint = observedBasisFingerprints.get(observedBasis);
+      let observedBasisFingerprint = observedBasisFingerprints?.get(observedBasis);
       if (observedBasisFingerprint === undefined) {
         observedBasisFingerprint = canonicalizeJson(observedBasis);
-        observedBasisFingerprints.set(observedBasis, observedBasisFingerprint);
+        observedBasisFingerprints?.set(observedBasis, observedBasisFingerprint);
       }
       const rebased = observedBasisFingerprint !== overlay.sourceBasisFingerprint;
       let candidate: OptimisticProjection<Row>;
       try {
         candidate = definition.projectRows({ request, authoritativeSnapshot: authoritative, currentRows: rows, currentResultKeys: resultKeys, sourceBasis: overlay.sourceBasis, observedBasis, rebased });
       } catch (error) {
-        failures.push([overlay, optimisticOverlayError('project-rows', error)]);
+        (failures ??= []).push([overlay, optimisticOverlayError('project-rows', error)]);
         continue;
       }
       let projection: OptimisticProjection<Row>;
       try {
         projection = adoptOptimisticProjection(candidate);
       } catch (error) {
-        failures.push([overlay, optimisticOverlayError('projection-result', error)]);
+        (failures ??= []).push([overlay, optimisticOverlayError('projection-result', error)]);
         continue;
       }
       rows = projection.rows;
       resultKeys = projection.resultKeys;
-      operations.push({
+      operations.push(Object.freeze({
         operationEpoch: overlay.operationEpoch,
         operationId: overlay.operationId,
         attachmentId: overlay.attachmentId,
@@ -218,15 +224,16 @@ export class OptimisticOverlayStore {
         sourceBasis: overlay.sourceBasis,
         observedBasis,
         rebased
-      });
+      }));
     }
-    for (const [overlay, error] of failures) this.#scheduleFailure(overlay, error);
+    if (failures !== undefined) {
+      for (const [overlay, error] of failures) this.#scheduleFailure(overlay, error);
+    }
     if (operations.length === 0) return authoritative;
-    const ownedOperations = Object.freeze(operations.map((operation) => Object.freeze(operation)));
     return Object.freeze({
       ...authoritative,
       current: Object.freeze({ ...authoritative.current, rows, resultKeys }),
-      optimistic: Object.freeze({ operations: ownedOperations })
+      optimistic: Object.freeze({ operations: Object.freeze(operations) })
     });
   }
 

@@ -324,7 +324,7 @@ const resolutionIssue = (code: string, candidateId: string, details: unknown): I
 const cancelledIssue = (): Issue => createIssue({ code: 'lifecycle.cancelled', phase: 'lifecycle', severity: 'error', retry: 'never' });
 const isAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;
-const isRecord = (value: unknown): value is Readonly<Record<string, any>> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isArtifactCarrierExtraction = (value: unknown): value is ArtifactCarrierExtraction => isRecord(value)
   && value.kind === 'artifact-carrier-extraction'
   && Object.hasOwn(value, 'value');

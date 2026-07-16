@@ -12,12 +12,12 @@ import type { WritableLogicalState } from '@tarstate/core/source';
 import type { AutomergeAtomicSource } from '../adapter/atomic-source.js';
 import type { AutomergeDatabase, AutomergeDatabaseSnapshot } from './model.js';
 import {
-  attachmentSnapshot,
-  sameAttachmentSnapshot,
+  databaseSnapshot,
+  sameDatabaseSnapshot,
   type AutomergeAttachmentProjector
-} from './projection.js';
+} from '../attachment/projection.js';
 
-export const createLiveAutomergeAttachment = <T extends object>(input: {
+export const createLiveAutomergeDatabase = <T extends object>(input: {
   readonly attachmentId: string;
   readonly incarnation: string;
   readonly authorityScope: string;
@@ -31,7 +31,7 @@ export const createLiveAutomergeAttachment = <T extends object>(input: {
   const logicalRows = new WeakMap<object, readonly LogicalRelationRow[]>();
   let closed = false;
   let dirty = false;
-  let snapshot = attachmentSnapshot(input.source.snapshot(), input.projector, logicalRows);
+  let snapshot = databaseSnapshot(input.source.snapshot(), input.projector, logicalRows);
   let unsubscribeSource: (() => void) | undefined;
 
   const notify = (): void => {
@@ -41,9 +41,9 @@ export const createLiveAutomergeAttachment = <T extends object>(input: {
   };
   const refresh = (): boolean => {
     if (!dirty || closed) return false;
-    const next = attachmentSnapshot(input.source.snapshot(), input.projector, logicalRows);
+    const next = databaseSnapshot(input.source.snapshot(), input.projector, logicalRows);
     dirty = false;
-    if (sameAttachmentSnapshot(snapshot, next)) return false;
+    if (sameDatabaseSnapshot(snapshot, next)) return false;
     snapshot = next;
     return true;
   };
@@ -75,7 +75,7 @@ export const createLiveAutomergeAttachment = <T extends object>(input: {
       };
     },
     mount: (catalog, options = {}) => {
-      if (closed) throw new Error('Automerge attachment is closed');
+      if (closed) throw new Error('Automerge database is closed');
       const discoveryEdges = Object.freeze([...new Set(options.discoveryEdges ?? [])].sort());
       const lease = catalog.attach({
         attachmentId: input.attachmentId,
@@ -107,7 +107,7 @@ export const createLiveAutomergeAttachment = <T extends object>(input: {
       unsubscribeSource = undefined;
       for (const lease of Array.from(leases)) lease.close();
       leases.clear();
-      snapshot = closedAttachmentSnapshot;
+      snapshot = closedDatabaseSnapshot;
       notify();
       listeners.clear();
       input.source.close();
@@ -115,4 +115,4 @@ export const createLiveAutomergeAttachment = <T extends object>(input: {
   } satisfies AutomergeDatabase);
 };
 
-const closedAttachmentSnapshot: AutomergeDatabaseSnapshot = Object.freeze({ state: 'closed' });
+const closedDatabaseSnapshot: AutomergeDatabaseSnapshot = Object.freeze({ state: 'closed' });

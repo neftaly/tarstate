@@ -804,6 +804,7 @@ describe('@tarstate/react', () => {
     })).toBeUndefined();
     expect(primaryListener).toHaveBeenCalledOnce();
     expect(unrelatedListener).not.toHaveBeenCalled();
+    expect(unrelatedView.getSnapshot()).toBe(unrelated.snapshot);
 
     unsubscribePrimary();
     unsubscribeUnrelated();

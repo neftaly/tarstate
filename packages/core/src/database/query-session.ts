@@ -1,4 +1,4 @@
-import { AttachmentCatalog, DatasetMembership } from '../database.js';
+import { AttachmentCatalog, DatasetMembership, type DatasetMember } from '../database.js';
 import { createIncrementalDatabaseQueryMaintenance } from '../internal-observer-query-maintenance.js';
 import { runObserverCleanups, type ObserverDiagnosticReporter } from '../observer-diagnostics.js';
 import { DatabaseView, type ObserverChange, type ObserverSnapshot, type QueryObserver } from '../observer.js';
@@ -26,12 +26,22 @@ export type MountableDatabaseSource = {
   ) => DatabaseSourceMountLease | Promise<DatabaseSourceMountLease>;
 };
 
-export type DatabaseQuerySource = {
-  readonly source: MountableDatabaseSource;
+export type UnresolvedDatabaseSource = {
+  readonly attachmentId: string;
+  readonly sourceId: string;
+};
+
+type DatabaseQuerySourceOptions = {
   /** Defaults to required. */
   readonly expectation?: 'required' | 'optional';
   readonly discoveryEdges?: readonly string[];
 };
+
+/** A mountable source or explicit evidence that a known source is unavailable. */
+export type DatabaseQuerySource = DatabaseQuerySourceOptions & (
+  | { readonly source: MountableDatabaseSource; readonly unresolved?: never }
+  | { readonly source?: never; readonly unresolved: UnresolvedDatabaseSource }
+);
 
 export type DatabaseQueryReadContext = {
   readonly queryAuthorityScope: string;
@@ -63,14 +73,14 @@ export type OpenDatabaseQueryOptions<Plan extends PreparedPlan<QueryNode>> = {
   readonly onDiagnostic?: ObserverDiagnosticReporter;
 } & SessionParameterOptions<Plan>;
 
-/** One owned query lifecycle over mountable sources and incremental maintenance. */
+/** One owned query lifecycle over mounted or unresolved sources and incremental maintenance. */
 export type DatabaseQuerySession<Row> = QueryObserver<Row>;
 
 export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
   options: OpenDatabaseQueryOptions<Plan>
 ): Promise<DatabaseQuerySession<SessionRow<Plan>>> => {
-  if (options.queryAuthorityScope.length === 0) {
-    throw new TypeError('Database query queryAuthorityScope must not be empty');
+  if (typeof options.queryAuthorityScope !== 'string' || options.queryAuthorityScope.length === 0) {
+    throw new TypeError('queryAuthorityScope must be a non-empty string');
   }
   const catalog = new AttachmentCatalog(
     options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }
@@ -80,8 +90,20 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
   let observer: QueryObserver<SessionRow<Plan>> | undefined;
 
   try {
-    const members = [];
+    const members: DatasetMember[] = [];
     for (const member of options.sources) {
+      if (member.unresolved !== undefined) {
+        if (member.unresolved.attachmentId.length === 0 || member.unresolved.sourceId.length === 0) {
+          throw new TypeError('Unresolved database source IDs must not be empty');
+        }
+        members.push({
+          attachmentId: member.unresolved.attachmentId,
+          sourceId: member.unresolved.sourceId,
+          expectation: member.expectation ?? 'required',
+          discoveryEdges: member.discoveryEdges ?? []
+        });
+        continue;
+      }
       const lease = await member.source.mount(catalog, {
         discoveryEdges: member.discoveryEdges ?? []
       });

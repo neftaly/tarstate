@@ -17,9 +17,30 @@ type TaskDocument = {
   tasks: Record<string, { id: string; title: string }>;
 };
 
-describe('standard Automerge attachment', () => {
+describe('standard Automerge database', () => {
+  it('rejects invalid database identities before reading metadata', async () => {
+    const repo = new Repo();
+    const handle = repo.create<TaskDocument>({ tasks: {} });
+
+    await expect(openAutomergeDatabase({
+      handle,
+      declaration: null,
+      embeddedArtifacts: null,
+      authorityScope: ''
+    })).rejects.toThrow('authorityScope must be a non-empty string');
+    await expect(openAutomergeDatabase({
+      handle,
+      declaration: null,
+      embeddedArtifacts: null,
+      authorityScope: 'scope:test',
+      attachmentId: ''
+    })).rejects.toThrow('attachmentId must be a non-empty string');
+
+    await repo.shutdown();
+  });
+
   it('opens embedded artifacts and exposes only logical transactions and lifecycle', async () => {
-    const fixture = await openTaskAttachment();
+    const fixture = await openTaskDatabase();
     expect(Object.keys(fixture.database).sort()).toEqual([
       'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
     ]);
@@ -62,7 +83,7 @@ describe('standard Automerge attachment', () => {
   });
 
   it('accepts embedded artifact maps and runs standard logical constraints without host plumbing', async () => {
-    const fixture = await openTaskAttachment({ artifactMap: true, constrained: true });
+    const fixture = await openTaskDatabase({ artifactMap: true, constrained: true });
     const mounted = await mountTaskDatabase(fixture);
 
     await expect(fixture.database.transact(
@@ -134,7 +155,7 @@ describe('standard Automerge attachment', () => {
   });
 
   it('reports an initially invalid constrained document and permits a final-state repair', async () => {
-    const fixture = await openTaskAttachment({ constrained: true, initialTitle: 'Forbidden' });
+    const fixture = await openTaskDatabase({ constrained: true, initialTitle: 'Forbidden' });
     expect(fixture.database.getSnapshot()).toMatchObject({
       state: 'open', current: { readiness: 'invalid', issues: [{ code: 'test.task_invalid' }] }
     });
@@ -155,7 +176,7 @@ describe('standard Automerge attachment', () => {
   });
 
   it('mounts through dataset authority into a recursive source-aware database query', async () => {
-    const fixture = await openTaskAttachment();
+    const fixture = await openTaskDatabase();
     const mounted = await mountTaskDatabase(fixture);
 
     expect(mounted.observer.getSnapshot()).toMatchObject({
@@ -174,7 +195,7 @@ describe('standard Automerge attachment', () => {
   });
 
   it('replays across repeated player syncs and preserves every disjoint row', async () => {
-    const fixture = await openTaskAttachment();
+    const fixture = await openTaskDatabase();
     const started = [deferred(), deferred()];
     const resume = [deferred(), deferred()];
     let calls = 0;
@@ -222,7 +243,7 @@ describe('standard Automerge attachment', () => {
   });
 
   it('does not resurrect a row deleted by another player during authoring', async () => {
-    const fixture = await openTaskAttachment();
+    const fixture = await openTaskDatabase();
     const started = deferred();
     const resume = deferred();
     let calls = 0;
@@ -261,7 +282,7 @@ describe('standard Automerge attachment', () => {
   });
 
   it('rejects mapped same-field conflicts without selecting a winner or invoking the transform', async () => {
-    const fixture = await openTaskAttachment();
+    const fixture = await openTaskDatabase();
     const base = fixture.handle.doc()!;
     const left = Automerge.change(Automerge.clone(base, { actor: '6'.repeat(64) }), (draft) => {
       draft.tasks.first!.title = 'Left';
@@ -323,7 +344,7 @@ const reference = (artifact: { readonly id: string; readonly contentHash: `sha25
   contentHash: artifact.contentHash
 });
 
-const openTaskAttachment = async (options: {
+const openTaskDatabase = async (options: {
   readonly artifactMap?: boolean;
   readonly constrained?: boolean;
   readonly initialTitle?: string;
@@ -410,7 +431,7 @@ const openTaskAttachment = async (options: {
 };
 
 const mountTaskDatabase = async (
-  fixture: Awaited<ReturnType<typeof openTaskAttachment>>
+  fixture: Awaited<ReturnType<typeof openTaskDatabase>>
 ) => {
   const taskRelation = { schemaView: reference(fixture.schema), relationId: 'tasks' };
   const root: QueryNode = {
@@ -469,7 +490,7 @@ const deferred = () => {
 };
 
 const mergePlayerChange = (
-  handle: Awaited<ReturnType<typeof openTaskAttachment>>['handle'],
+  handle: Awaited<ReturnType<typeof openTaskDatabase>>['handle'],
   actorDigit: string,
   change: Automerge.ChangeFn<TaskDocument>
 ): void => {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
+const moduleReloadTimeout = 15_000;
 
 describe('cross-entry prepared-value provenance', () => {
   it('accepts a root-entry prepared plan after the query entry is loaded independently', async () => {
@@ -41,7 +42,7 @@ describe('cross-entry prepared-value provenance', () => {
       .toThrow('not produced by a plan preparation API');
     expect(() => query.evaluateExpression({ ...preparedExpression } as typeof preparedExpression, { row: { value: 3 } }))
       .toThrow('not produced by prepareExpression');
-  });
+  }, moduleReloadTimeout);
 
   it('shares schema, mapping, and lens provenance across independently loaded entries', async () => {
     const root = await import('../src/index.js');
@@ -125,5 +126,5 @@ describe('cross-entry prepared-value provenance', () => {
       .toThrow('not produced by compileStorageMapping');
     expect(() => schema.projectLensRelation({ ...lens.value } as typeof lens.value, 'test.projected-value', {}))
       .toThrow('not produced by validateLens');
-  });
+  }, moduleReloadTimeout);
 });

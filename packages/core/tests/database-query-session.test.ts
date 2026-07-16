@@ -19,6 +19,60 @@ import { prepareManualReadOnlyAttachment } from '../src/attachment/preparation.j
 import { relationLiteral, sealSchema } from '../src/schema/index.js';
 
 describe('database query session', () => {
+  it('rejects an invalid authority scope before mounting sources', async () => {
+    const mount = vi.fn();
+    const plan = await prepareQuery({
+      root: { kind: 'values', alias: 'row', rows: [] },
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+
+    await expect(openDatabaseQuery({
+      sources: [{ source: { mount } }],
+      plan,
+      queryAuthorityScope: ''
+    })).rejects.toThrow('queryAuthorityScope must be a non-empty string');
+    expect(mount).not.toHaveBeenCalled();
+  });
+
+  it('preserves required unresolved sources as incomplete evidence without fetching them', async () => {
+    const plan = await prepareQuery({
+      root: { kind: 'values', alias: 'row', rows: [] },
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+    const session = await openDatabaseQuery({
+      sources: [{
+        unresolved: {
+          attachmentId: 'attachment:remote-file',
+          sourceId: 'https://example.test/file.json'
+        },
+        expectation: 'required',
+        discoveryEdges: ['resource:https://example.test/file.json']
+      }],
+      plan,
+      queryAuthorityScope: 'scope:test'
+    });
+
+    expect(session.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: {
+        readiness: 'incomplete',
+        completeness: 'unknown',
+        sourceStates: [{
+          attachmentId: 'attachment:remote-file',
+          sourceId: 'https://example.test/file.json',
+          expectation: 'required',
+          state: 'missing',
+          discoveryEdges: ['resource:https://example.test/file.json']
+        }]
+      }
+    });
+    session.close();
+  });
+
   it('owns mounting, typed observation, and idempotent reverse cleanup', async () => {
     const schema = await sealSchema({ body: { relations: { items: {
       relationId: 'test.item',

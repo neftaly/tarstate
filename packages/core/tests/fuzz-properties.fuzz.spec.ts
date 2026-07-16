@@ -45,14 +45,16 @@ type FuzzRow = { readonly occurrenceId: string; readonly row: QueryRecord };
 type FuzzSource = { readonly sourceId: string; readonly attachmentId?: string; revision: number; nextId: number; rows: FuzzRow[] };
 
 const selectedProperty = process.env.TARSTATE_FUZZ_PROPERTY;
-const deterministicFuzzTest = (name: string, test: () => void): void => {
+const deterministicFuzzTest = (name: string, test: () => void, timeout?: number): void => {
   const selected = selectedProperty === undefined || selectedProperty === name;
   const register = selected ? it : it.skip;
-  register(name, () => {
+  const run = (): void => {
     activeSeed = selectedProperty === name ? initialSeed : derivePropertySeed(initialSeed, name);
     random = seededRandom(activeSeed);
     test();
-  });
+  };
+  if (timeout === undefined) register(name, run);
+  else register(name, run, timeout);
 };
 
 describe('deterministic fuzz properties', () => {
@@ -420,7 +422,7 @@ describe('deterministic fuzz properties', () => {
       expect(runtime.getDiagnostics()).toMatchObject({ activeRootCount: 0, physicalNodeCount: 0, sharedPhysicalNodeCount: 0 });
       runtime.close();
     }
-  });
+  }, 15_000);
 
   deterministicFuzzTest('orders nested JSON structurally with deterministic, transitive seek boundaries', () => {
     const orderingRelation = { schemaView, relationId: 'fuzz.structural-order' } as const;

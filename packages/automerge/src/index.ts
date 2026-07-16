@@ -1,10 +1,10 @@
 /** The standard, conflict-aware Automerge database boundary. */
-export { openAutomergeDatabase } from './attachment/open.js';
+export { openAutomergeDatabase } from './database/open.js';
 export type {
   OpenAutomergeDatabaseOptions
-} from './attachment/open.js';
+} from './database/open.js';
 export type {
   AutomergeDatabase,
   AutomergeDatabaseResult,
   AutomergeDatabaseSnapshot
-} from './attachment/model.js';
+} from './database/model.js';

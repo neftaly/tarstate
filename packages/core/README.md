@@ -62,7 +62,7 @@ Query and observation have narrower execution seams:
 | `@tarstate/core/database/observer` | Generic catalogs and observation with an injected maintenance factory |
 | `@tarstate/core/database/incremental` | Explicit adapter from database observation to incremental query maintenance |
 | `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
-| `@tarstate/core/database/session` | Owned incremental query lifecycle over mountable database sources |
+| `@tarstate/core/database/session` | Owned incremental query lifecycle over mounted and unresolved database sources |
 
 Schema, query, and transaction authoring are separate implementations behind
 their topic entries, so query authoring does not load schema or transaction
@@ -135,7 +135,7 @@ exceptions—for ordinary product behavior.
 
 ## Database query sessions
 
-Applications query mountable database sources through one owned session. Authority,
+Applications query database sources through one owned session. Authority,
 membership expectations, discovery edges, and dataset settlement remain
 explicit policy; catalog, database, observer, incremental maintenance, leases,
 and reverse-order cleanup are mechanical and remain inside the session:
@@ -162,6 +162,11 @@ Sources are required by default, and the default read policy permits only a
 source whose authority scope exactly matches `queryAuthorityScope`. Specify
 `expectation`, `discoveryEdges`, or `canRead` only when application policy
 differs.
+
+A known source that is not currently mountable remains explicit evidence in the
+same list: `{ unresolved: { attachmentId, sourceId } }`. A required unresolved
+source makes the snapshot incomplete; Tarstate never fetches it or silently
+treats it as an empty relation.
 
 Adapter authors import `prepareManualReadOnlyAttachment`,
 `prepareDatabaseAttachment`, and `createAttachmentTransactionService` from

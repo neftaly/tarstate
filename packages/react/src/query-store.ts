@@ -45,8 +45,7 @@ export class QueryStore<Row> {
   }
 
   readonly getSnapshot = (): ObserverSnapshot<Row> => {
-    this.#ensureObserver();
-    return this.#observer!.getSnapshot();
+    return this.#ensureObserver().getSnapshot();
   };
 
   readonly subscribe = (listener: () => void): (() => void) => {
@@ -59,13 +58,15 @@ export class QueryStore<Row> {
     };
   };
 
-  #ensureObserver(): void {
-    if (this.#observer !== undefined) return;
-    this.#observer = this.#database.observe(this.#request) as QueryObserver<Row>;
-    this.#unsubscribeObserver = this.#observer.subscribe(() => {
+  #ensureObserver(): QueryObserver<Row> {
+    if (this.#observer !== undefined) return this.#observer;
+    const observer = this.#database.observe(this.#request) as QueryObserver<Row>;
+    this.#observer = observer;
+    this.#unsubscribeObserver = observer.subscribe(() => {
       notifyReactListeners(this.#listeners, 'react-query', 'publish-query-store', this.#onDiagnostic);
     });
     if (this.#listeners.size === 0) this.#scheduleClose();
+    return observer;
   }
 
   #scheduleClose(): void {

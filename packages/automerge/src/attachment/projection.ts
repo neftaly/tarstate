@@ -17,7 +17,7 @@ import type {
 } from '@tarstate/core/source';
 import type { AutomergeMappedStorageBinding, AutomergeMappedStorageRow } from '../adapter/mapped-storage.js';
 import { samePortableJson } from '../shared/portable-json.js';
-import type { AutomergeDatabaseResult, AutomergeDatabaseSnapshot } from './model.js';
+import type { AutomergeDatabaseResult, AutomergeDatabaseSnapshot } from '../database/model.js';
 
 export type AutomergeAttachmentProjection = {
   readonly mapped: ProjectionResult<AutomergeMappedStorageRow>;
@@ -54,13 +54,13 @@ export const createAutomergeAttachmentProjector = <T extends object>(input: {
   });
 };
 
-export const attachmentSnapshot = <T extends object>(
+export const databaseSnapshot = <T extends object>(
   sourceSnapshot: SourceSnapshot<Automerge.Doc<T>>,
   projector: AutomergeAttachmentProjector<T>,
   logicalRows: WeakMap<object, readonly LogicalRelationRow[]>
 ): AutomergeDatabaseSnapshot => {
   if (sourceSnapshot.state !== 'ready') {
-    return unavailableAttachmentSnapshot(sourceSnapshot);
+    return unavailableDatabaseSnapshot(sourceSnapshot);
   }
   const projection = projector.project(sourceSnapshot);
   let rows = logicalRows.get(projection.mapped);
@@ -70,7 +70,7 @@ export const attachmentSnapshot = <T extends object>(
   }
   const issues = Object.freeze([...sourceSnapshot.issues, ...projection.issues]);
   return Object.freeze({ state: 'open', current: Object.freeze({
-    readiness: attachmentReadiness(
+    readiness: databaseReadiness(
       sourceSnapshot.state,
       projection.mapped.completeness,
       projection.constraints.blockingIssues,
@@ -108,7 +108,7 @@ export const databaseProjection = <T extends object>(input: {
   };
 };
 
-export const sameAttachmentSnapshot = (
+export const sameDatabaseSnapshot = (
   left: AutomergeDatabaseSnapshot,
   right: AutomergeDatabaseSnapshot
 ): boolean => left.state === 'open'
@@ -121,7 +121,7 @@ export const sameAttachmentSnapshot = (
   && samePortableJson(left.current.basis, right.current.basis)
   && samePortableJson(left.current.issues, right.current.issues);
 
-const unavailableAttachmentSnapshot = <T>(
+const unavailableDatabaseSnapshot = <T>(
   snapshot: SourceSnapshot<T>
 ): AutomergeDatabaseSnapshot => Object.freeze({ state: 'open', current: Object.freeze({
   readiness: snapshot.state === 'loading' ? 'incomplete' : 'invalid',
@@ -133,7 +133,7 @@ const unavailableAttachmentSnapshot = <T>(
   issues: snapshot.issues
 }) });
 
-const attachmentReadiness = (
+const databaseReadiness = (
   sourceState: SourceLifecycleState,
   completeness: 'exact' | 'unknown',
   blockingConstraintIssues: readonly Issue[],

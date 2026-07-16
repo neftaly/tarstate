@@ -46,7 +46,7 @@ export const authorExactKeyedRelationDelta = (
   if (!adopted.success) return adopted;
   const owned = adopted.value;
   const alias = owned.alias ?? 'row';
-  const keyFields = [...owned.keyFields];
+  const keyFields = owned.keyFields;
   const replaceableFields = new Set(owned.replaceableFields);
   const canonicalization: CanonicalJsonCache = new WeakMap();
   const issues = validateDeltaContract(owned, alias);
@@ -74,14 +74,15 @@ export const authorExactKeyedRelationDelta = (
     if (next === undefined) continue;
     if (previous.fields === next.fields) continue;
     const edits = replacementEdits(previous.fields, next.fields, replaceableFields, fingerprint, issues, canonicalization);
-    if (Object.keys(edits).length === 0) continue;
+    if (edits === undefined) continue;
     changes.push({ kind: 'delta.update', key: literalKey(keyFields, previous.fields), edits });
   }
 
-  const insertedRows = orderedAfterKeys
-    .filter((fingerprint) => !before.has(fingerprint))
-    .map((fingerprint) => literalFields((after.get(fingerprint) as IndexedRow).fields));
-  changes.push(...insertedRows.map((fields): KeyedDeltaChange => ({ kind: 'delta.insert', fields })));
+  for (const fingerprint of orderedAfterKeys) {
+    if (before.has(fingerprint)) continue;
+    const inserted = after.get(fingerprint) as IndexedRow;
+    changes.push({ kind: 'delta.insert', fields: literalFields(inserted.fields) });
+  }
 
   if (issues.length > 0) return { success: false, issues: Object.freeze(issues) };
   const statements: WriteStatement[] = changes.length === 0
@@ -206,8 +207,8 @@ const replacementEdits = (
   key: string,
   issues: Issue[],
   canonicalization: CanonicalJsonCache
-): Readonly<Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }>> => {
-  const edits: Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }> = {};
+): Readonly<Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }>> | undefined => {
+  let edits: Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }> | undefined;
   const fields = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort(comparePortableStrings);
   for (const field of fields) {
     const hadField = Object.hasOwn(before, field);
@@ -221,7 +222,7 @@ const replacementEdits = (
       issues.push(deltaIssue({ reason: 'field_replacement_unavailable', field, key }, ['after', 'rows', key, field]));
       continue;
     }
-    edits[field] = { kind: 'edit.replace', value: literal(after[field] as JsonValue) };
+    (edits ??= {})[field] = { kind: 'edit.replace', value: literal(after[field] as JsonValue) };
   }
   return edits;
 };
@@ -233,15 +234,21 @@ const sameJson = (left: JsonValue, right: JsonValue, canonicalization: Canonical
 const literalKey = (
   keyFields: readonly string[],
   fields: Readonly<Record<string, JsonValue>>
-): Readonly<Record<string, WriteExpression>> => Object.fromEntries(
-  keyFields.map((field) => [field, literal(fields[field] as JsonValue)])
-);
+): Readonly<Record<string, WriteExpression>> => {
+  const expressions: Record<string, WriteExpression> = {};
+  for (const field of keyFields) expressions[field] = literal(fields[field] as JsonValue);
+  return expressions;
+};
 
 const literalFields = (
   fields: Readonly<Record<string, JsonValue>>
-): Readonly<Record<string, WriteExpression>> => Object.fromEntries(
-  Object.keys(fields).sort(comparePortableStrings).map((field) => [field, literal(fields[field] as JsonValue)])
-);
+): Readonly<Record<string, WriteExpression>> => {
+  const expressions: Record<string, WriteExpression> = {};
+  for (const field of Object.keys(fields).sort(comparePortableStrings)) {
+    expressions[field] = literal(fields[field] as JsonValue);
+  }
+  return expressions;
+};
 
 const literal = (value: JsonValue): WriteExpression => ({ kind: 'literal', value });
 
