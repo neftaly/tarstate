@@ -56,7 +56,7 @@ data changes, Tarstate updates affected operators and reuses shared work.
 
 ## Schemas
 
-[Schemas](./docs/v1/README.md#identity-storage-and-compatibility) are JSON manifests that describe the shape of data. 
+Schemas are JSON manifests that describe the shape and relationships of data.
 They are different from `json-schema`, and justified by [parse not validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/). 
 
 Schemas can live alongside (or inside) your data, making versioning almost free:
