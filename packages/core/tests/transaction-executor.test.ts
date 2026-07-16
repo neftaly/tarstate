@@ -102,7 +102,7 @@ const attempt = (value: Awaited<ReturnType<typeof transaction>>, operationId = '
 });
 
 describe('prepared source-local transaction executor', () => {
-  it('retains atomic stale-basis rejections as exact operation outcomes', async () => {
+  it('keeps stale-basis coordination transient until an operation reaches a final outcome', async () => {
     const { source } = await makeContext();
     const input = {
       operationEpoch: 'epoch:executor',
@@ -118,8 +118,42 @@ describe('prepared source-local transaction executor', () => {
       operationEpoch: input.operationEpoch,
       operationId: input.operationId,
       intentHash: input.intentHash
-    })).resolves.toEqual({ status: 'known', result: rejected });
-    await expect(source.commit(input)).resolves.toBe(rejected);
+    })).resolves.toEqual({ status: 'not_seen' });
+    await expect(source.commit({ ...input, expectedBasis: source.snapshot().basis })).resolves.toMatchObject({
+      outcome: 'committed'
+    });
+  });
+
+  it('re-evaluates against the latest source after a concurrent handoff change', async () => {
+    const { source, context } = await makeContext();
+    const commitDirect = source.commit;
+    const commit = vi.spyOn(source, 'commit');
+    commit.mockImplementationOnce(async (input) => {
+      await commitDirect({
+        operationEpoch: input.operationEpoch,
+        operationId: 'operation:concurrent',
+        intentHash: hash('9'),
+        expectedBasis: input.expectedBasis,
+        commands: [{
+          description: 'concurrent count change',
+          apply: (state) => Object.freeze({
+            ...state,
+            items: Object.freeze(state.items?.map((row) => row.id === 'a' ? Object.freeze({ ...row, count: 2 }) : row) ?? [])
+          })
+        }]
+      });
+      return commitDirect(input);
+    });
+
+    const receipt = await executePreparedTransaction(
+      context,
+      attempt(await transaction(), 'operation:reconciled')
+    );
+
+    expect(receipt.issues).toEqual([]);
+    expect(receipt).toMatchObject({ outcome: 'committed', beforeBasis: { revision: 1 }, afterBasis: { revision: 2 } });
+    expect(source.snapshot()).toMatchObject({ storage: { items: [{ title: 'Final', count: 2 }] } });
+    expect(commit).toHaveBeenCalledTimes(2);
   });
 
   it('stages ordered overlapping statements and commits once with final-state query and constraint evidence', async () => {

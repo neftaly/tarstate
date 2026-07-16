@@ -5,7 +5,8 @@ import {
   type ArtifactCarrierExtractor,
   type ResolverDriver
 } from '@tarstate/core/artifacts';
-import { createIssue, safeParseJsonValue, type Issue } from '@tarstate/core/foundation';
+import { createIssue, type Issue } from '@tarstate/core/foundation';
+import { adoptConflictFreeAutomergeJsonValue } from './automerge-json.js';
 
 export type AutomergeArtifactCarrierSnapshot<T extends object, Heads = readonly string[]> =
   | { readonly state: 'ready'; readonly doc: Automerge.Doc<T>; readonly heads: Heads; readonly freshness?: 'current' | 'stale'; readonly issues?: readonly Issue[] }
@@ -72,7 +73,7 @@ const readLease = async <T extends object, Heads>(
     ...(snapshot.issues === undefined ? {} : { issues: snapshot.issues })
   };
   if (isAborted(signal)) return { state: 'failed', freshness: 'none', issues: [driverIssue('lifecycle.cancelled', uri)] };
-  const value = safeParseJsonValue(toPlainJson(Automerge.toJS(snapshot.doc)));
+  const value = adoptConflictFreeAutomergeJsonValue(snapshot.doc);
   if (!value.success) return { state: 'failed', freshness: 'none', issues: value.issues };
   let heads: readonly string[];
   try {
@@ -104,11 +105,6 @@ export const extractAutomergeArtifactCarrier: ArtifactCarrierExtractor = (input)
 
 const isAutomergeCarrier = (value: unknown): value is InertAutomergeArtifactCarrier => value !== null && typeof value === 'object' && !Array.isArray(value) && (value as { readonly kind?: unknown }).kind === 'automerge-artifact-carrier';
 const isAborted = (signal: AbortSignal | undefined): boolean => signal?.aborted === true;
-const toPlainJson = (value: unknown): unknown => {
-  const encoded = JSON.stringify(value);
-  if (encoded === undefined) throw new TypeError('Automerge carrier is not JSON data');
-  return JSON.parse(encoded) as unknown;
-};
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;
 const driverIssue = (code: string, uri: string, details?: unknown): Issue => createIssue({
   code,

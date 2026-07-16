@@ -137,7 +137,7 @@ describe('Automerge core source protocols', () => {
     expect(runtime.snapshot().storage.tasks.first?.title).toBe('First');
   });
 
-  it('rejects a stale exact-head basis after planning and retains the structured outcome', async () => {
+  it('returns a stale exact-head basis as transient coordination evidence', async () => {
     const { runtime, source, binding } = fixture();
     const stale = source.snapshot().basis as JsonValue;
     runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => { draft.tasks.first!.priority = 2; }));
@@ -150,9 +150,7 @@ describe('Automerge core source protocols', () => {
     });
     expect(result).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.expected_basis_stale', phase: 'commit', retry: 'after_refresh' }] });
     expect(runtime.snapshot().storage.tasks.first).toEqual({ title: 'First', priority: 2 });
-    await expect(source.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'operation:stale', intentHash: intentHash('c') })).resolves.toMatchObject({
-      status: 'known', result: { outcome: 'rejected', issues: [{ code: 'transaction.expected_basis_stale' }] }
-    });
+    await expect(source.queryOutcome({ operationEpoch: 'epoch:one', operationId: 'operation:stale', intentHash: intentHash('c') })).resolves.toEqual({ status: 'not_seen' });
   });
 
   it('commits a semantic no-op without changing heads or notifying subscribers', async () => {

@@ -282,7 +282,7 @@ describe('production Automerge adapter', () => {
     expect(listener).toHaveBeenCalledTimes(3);
   });
 
-  it('rejects an exact stale basis without running commands and retains the outcome', async () => {
+  it('rejects an exact stale basis without running commands or completing the operation', async () => {
     const base = taskBase();
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: Automerge.change(base, (draft) => { draft.metadata.schema = 'v2'; }) });
     const command = vi.fn();
@@ -304,8 +304,7 @@ describe('production Automerge adapter', () => {
     expect([result, result.issues, result.issues[0], result.issues[0]?.details].every(Object.isFrozen)).toBe(true);
     expect(() => { (result.issues as unknown[]).push({ code: 'mutated' }); }).toThrow(TypeError);
     const lookup = runtime.queryOutcome({ operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d') });
-    expect(lookup).toMatchObject({ status: 'known' });
-    expect(lookup.status === 'known' ? lookup.result : undefined).toBe(result);
+    expect(lookup).toEqual({ status: 'not_seen' });
     expect(ignoredCalls).toBe(0);
   });
 

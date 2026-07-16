@@ -116,7 +116,7 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
     };
     const beforeBasis = this.#basis();
     if (!samePortableJson(input.expectedBasis, beforeBasis)) {
-      return retain({ outcome: 'rejected', beforeBasis, issues: [createIssue({ code: 'transaction.expected_basis_stale', operationId: input.operationId, sourceId: this.sourceId, details: { expected: input.expectedBasis, actual: beforeBasis } })] });
+      return { outcome: 'rejected', beforeBasis, issues: [createIssue({ code: 'transaction.expected_basis_stale', operationId: input.operationId, sourceId: this.sourceId, details: { expected: input.expectedBasis, actual: beforeBasis } })] };
     }
     const staged = this.stage(this.snapshot(), input.commands);
     if (staged.issues.some(({ severity }) => severity === 'error')) return retain({ outcome: 'rejected', beforeBasis, issues: staged.issues });

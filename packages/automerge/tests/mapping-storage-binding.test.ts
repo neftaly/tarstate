@@ -189,7 +189,7 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     source.close();
   });
 
-  it('executes ordered transaction statements through one Automerge commit', async () => {
+  it('reconciles an external Automerge change before committing ordered transaction statements', async () => {
     const { runtime, source, binding } = await fixture();
     const context: PreparedWritableExecutionContext<Automerge.Doc<TaskDoc>, AutomergeSourceCommand<TaskDoc>> = prepareWritableExecutionContext({
       attachmentId: 'attachment:mapped',
@@ -235,6 +235,14 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       returning: [{ name: 'tasks', root: { kind: 'values', alias: 'task', rows: [] } }],
       requiredCapabilities: []
     } });
+    const commitDirect = source.commit;
+    const commit = vi.spyOn(source, 'commit');
+    commit.mockImplementationOnce(async (input) => {
+      runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
+        draft.tasks!.first!.nested!.priority = 2;
+      }));
+      return commitDirect(input);
+    });
     const receipt = await executePreparedTransaction(context, {
       operationEpoch: 'epoch:mapped',
       operationId: 'operation:transaction',
@@ -244,9 +252,10 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     expect(receipt).toMatchObject({
       outcome: 'committed',
       statementResults: [{ matched: 1, logicallyChanged: 1 }, { matched: 1, logicallyChanged: 1 }],
-      returning: [{ rows: [{ id: 'first', title: 'Final', priority: 1 }] }]
+      returning: [{ rows: [{ id: 'first', title: 'Final', priority: 2 }] }]
     });
-    expect(runtime.snapshot().storage.tasks!.first).toMatchObject({ title: 'Final', unknown: { keep: true } });
+    expect(runtime.snapshot().storage.tasks!.first).toMatchObject({ title: 'Final', nested: { priority: 2 }, unknown: { keep: true } });
+    expect(commit).toHaveBeenCalledTimes(2);
     source.close();
   });
 });

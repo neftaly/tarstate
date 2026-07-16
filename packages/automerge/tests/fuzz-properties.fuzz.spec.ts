@@ -137,7 +137,7 @@ describe('Automerge shrinking model properties', () => {
         } else if (!basisIsCurrent) {
           expect(result).toMatchObject({ outcome: 'rejected', changed: false, issues: [{ code: 'transaction.expected_basis_stale' }] });
           expect(applications).toBe(0);
-          ledger.set(key, { intentHash, result });
+          expect(runtime.queryOutcome({ operationEpoch, operationId, intentHash })).toEqual({ status: 'not_seen' });
         } else {
           expect(result.outcome).toBe('committed');
           expect(applications).toBe(1);

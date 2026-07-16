@@ -286,18 +286,6 @@ export class AutomergeSourceRuntime<T extends object> {
         operationId: input.operationId
       }]);
     }
-    const epochLedger = this.#ledger.get(input.operationEpoch);
-    if ((epochLedger === undefined && this.#ledger.size >= this.#maxOperationEpochs)
-      || (epochLedger?.size ?? 0) >= this.#maxOperationReceiptsPerEpoch) {
-      return this.#rejected(input, undefined, [{
-        code: 'operation.ledger_capacity_exhausted',
-        phase: 'commit',
-        sourceId: this.sourceId,
-        operationId: input.operationId,
-        details: { action: 'retire_operation_epoch' }
-      }]);
-    }
-
     const current = this.#owner.current();
     this.#install(current, 'handle');
     const beforeBasis = automergeBasis(current);
@@ -310,8 +298,18 @@ export class AutomergeSourceRuntime<T extends object> {
         operationId: input.operationId,
         details: { expectedBasis, actualBasis: beforeBasis }
       }]);
-      this.#retainOutcome(input, rejected);
       return rejected;
+    }
+    const epochLedger = this.#ledger.get(input.operationEpoch);
+    if ((epochLedger === undefined && this.#ledger.size >= this.#maxOperationEpochs)
+      || (epochLedger?.size ?? 0) >= this.#maxOperationReceiptsPerEpoch) {
+      return this.#rejected(input, undefined, [{
+        code: 'operation.ledger_capacity_exhausted',
+        phase: 'commit',
+        sourceId: this.sourceId,
+        operationId: input.operationId,
+        details: { action: 'retire_operation_epoch' }
+      }]);
     }
 
     let staged: Automerge.Doc<T> | undefined;
@@ -340,7 +338,7 @@ export class AutomergeSourceRuntime<T extends object> {
           ? { expectedBasis, actualBasis }
           : { message: failure instanceof Error ? failure.message : String(failure) }
       }]);
-      this.#retainOutcome(input, rejected);
+      if (!stale) this.#retainOutcome(input, rejected);
       this.#install(actual, 'handle');
       return rejected;
     }

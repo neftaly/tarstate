@@ -259,76 +259,92 @@ export const executePreparedTransaction = async <Storage, Command>(
   if ('receipt' in prepared) return prepared.receipt;
   const reservation = await reservePreparedExecution(context, prepared);
   if ('receipt' in reservation) return reservation.receipt;
-  const captured = captureExecutionSnapshot(context);
-  if ('issue' in captured) {
-    return completePreparedExecution(
-      context,
-      prepared,
-      reservation.entry,
-      rejectedBeforeSnapshotReceipt(context, prepared, captured.issue)
-    );
-  }
-  const evaluated = evaluatePreparedExecution(context, prepared, captured.snapshot);
-  if (evaluated.blockingIssues.length > 0) {
-    return completePreparedExecution(context, prepared, reservation.entry, rejectedReceipt(context, prepared, evaluated));
-  }
-  if (prepared.attempt.signal?.aborted === true) {
-    const receipt = rejectedReceipt(context, prepared, {
-      ...evaluated,
-      issues: [...evaluated.issues, transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })],
-      blockingIssues: [transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })]
-    });
-    return completePreparedExecution(context, prepared, reservation.entry, receipt);
-  }
-  let outcome: Awaited<ReturnType<AtomicSource<Storage, Command>['commit']>>;
-  try {
-    outcome = await context.source.commit({
-      operationEpoch: prepared.attempt.operationEpoch,
-      operationId: prepared.attempt.operationId,
-      intentHash: prepared.intentHash,
-      expectedBasis: evaluated.beforeBasis,
-      commands: evaluated.commands
-    });
-  } catch (error) {
-    const receipt: CommitReceipt = {
-      ...receiptEvidence(context, prepared, evaluated.statementResults, [
-        ...evaluated.issues,
-        transactionIssue('transaction.outcome_unavailable', prepared.attempt, { error: errorName(error) }, 'query_outcome')
-      ]),
-      outcome: 'unknown',
-      beforeBasis: evaluated.beforeBasis,
-      durability: 'unknown'
-    };
-    return completePreparedExecution(context, prepared, reservation.entry, receipt);
-  }
-  const issues = [...evaluated.issues, ...outcome.issues];
-  if (outcome.outcome === 'rejected') {
-    const receipt: CommitReceipt = {
-      ...receiptEvidence(context, prepared, evaluated.statementResults, issues),
-      outcome: 'rejected',
-      ...(outcome.beforeBasis === undefined ? {} : { beforeBasis: outcome.beforeBasis })
-    };
-    return completePreparedExecution(context, prepared, reservation.entry, receipt);
-  }
-  if (outcome.outcome === 'unknown' || outcome.beforeBasis === undefined || outcome.afterBasis === undefined) {
-    const receipt: CommitReceipt = {
-      ...receiptEvidence(context, prepared, evaluated.statementResults, issues),
-      outcome: 'unknown',
-      ...(outcome.beforeBasis === undefined ? {} : { beforeBasis: outcome.beforeBasis }),
-      durability: 'unknown'
-    };
-    return completePreparedExecution(context, prepared, reservation.entry, receipt);
-  }
-  const returning = evaluated.returning?.map((result): ReturningResult => ({ ...result, basis: outcome.afterBasis as SourceBasis }));
-  const receipt: CommitReceipt = {
-    ...receiptEvidence(context, prepared, evaluated.statementResults, issues, returning),
-    outcome: 'committed',
-    beforeBasis: outcome.beforeBasis,
-    afterBasis: outcome.afterBasis,
-    durability: context.durability
-  };
+  const receipt = await reconcileAndCommitPreparedExecution(context, prepared);
   return completePreparedExecution(context, prepared, reservation.entry, receipt);
 };
+
+const maxReconciliationAttempts = 16;
+
+/** Re-evaluates all guards and constraints after a transient concurrent change. */
+const reconcileAndCommitPreparedExecution = async <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  prepared: PreparedExecution
+): Promise<CommitReceipt> => {
+  for (let reconciliationAttempt = 0; reconciliationAttempt < maxReconciliationAttempts; reconciliationAttempt += 1) {
+    const captured = captureExecutionSnapshot(context);
+    if ('issue' in captured) return rejectedBeforeSnapshotReceipt(context, prepared, captured.issue);
+    const evaluated = evaluatePreparedExecution(context, prepared, captured.snapshot);
+    if (evaluated.blockingIssues.length > 0) return rejectedReceipt(context, prepared, evaluated);
+    if (prepared.attempt.signal?.aborted === true) {
+      return rejectedReceipt(context, prepared, {
+        ...evaluated,
+        issues: [...evaluated.issues, transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })],
+        blockingIssues: [transactionIssue('transaction.cancelled', prepared.attempt, { timing: 'before_handoff' })]
+      });
+    }
+    let outcome: Awaited<ReturnType<AtomicSource<Storage, Command>['commit']>>;
+    try {
+      outcome = await context.source.commit({
+        operationEpoch: prepared.attempt.operationEpoch,
+        operationId: prepared.attempt.operationId,
+        intentHash: prepared.intentHash,
+        expectedBasis: evaluated.beforeBasis,
+        commands: evaluated.commands
+      });
+    } catch (error) {
+      return {
+        ...receiptEvidence(context, prepared, evaluated.statementResults, [
+          ...evaluated.issues,
+          transactionIssue('transaction.outcome_unavailable', prepared.attempt, { error: errorName(error) }, 'query_outcome')
+        ]),
+        outcome: 'unknown',
+        beforeBasis: evaluated.beforeBasis,
+        durability: 'unknown'
+      };
+    }
+    if (isTransientStaleBasis(outcome) && prepared.attempt.expectedBasis === undefined) continue;
+    const issues = [...evaluated.issues, ...outcome.issues];
+    if (outcome.outcome === 'rejected') {
+      return {
+        ...receiptEvidence(context, prepared, evaluated.statementResults, issues),
+        outcome: 'rejected',
+        ...(outcome.beforeBasis === undefined ? {} : { beforeBasis: outcome.beforeBasis })
+      };
+    }
+    if (outcome.outcome === 'unknown' || outcome.beforeBasis === undefined || outcome.afterBasis === undefined) {
+      return {
+        ...receiptEvidence(context, prepared, evaluated.statementResults, issues),
+        outcome: 'unknown',
+        ...(outcome.beforeBasis === undefined ? {} : { beforeBasis: outcome.beforeBasis }),
+        durability: 'unknown'
+      };
+    }
+    const returning = evaluated.returning?.map((result): ReturningResult => ({ ...result, basis: outcome.afterBasis as SourceBasis }));
+    return {
+      ...receiptEvidence(context, prepared, evaluated.statementResults, issues, returning),
+      outcome: 'committed',
+      beforeBasis: outcome.beforeBasis,
+      afterBasis: outcome.afterBasis,
+      durability: context.durability
+    };
+  }
+  const latest = captureExecutionSnapshot(context);
+  const beforeBasis = 'snapshot' in latest ? latest.snapshot.basis : undefined;
+  return {
+    ...receiptEvidence(context, prepared, [], [transactionIssue(
+      'transaction.expected_basis_stale',
+      prepared.attempt,
+      { reason: 'reconciliation_exhausted' }
+    )]),
+    outcome: 'rejected',
+    ...(beforeBasis === undefined ? {} : { beforeBasis })
+  };
+};
+
+const isTransientStaleBasis = (outcome: { readonly outcome: string; readonly issues: readonly Issue[] }): boolean =>
+  outcome.outcome === 'rejected'
+  && outcome.issues.length > 0
+  && outcome.issues.every(({ code }) => code === 'transaction.expected_basis_stale');
 
 export const simulatePreparedTransaction = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,

@@ -106,7 +106,7 @@ describe('Automerge Repo source owner', () => {
     await repo.shutdown();
   });
 
-  it('rejects a Repo changeAt refusal instead of recording a phantom commit', async () => {
+  it('keeps a Repo changeAt refusal transient instead of recording a phantom commit', async () => {
     const repo = new Repo();
     const handle = repo.create<CounterDoc>({ count: 0 });
     const runtime = automergeRepoSourceRuntime({ handle });
@@ -123,7 +123,7 @@ describe('Automerge Repo source owner', () => {
     });
     expect(apply).not.toHaveBeenCalled();
     expect(handle.doc()!.count).toBe(0);
-    expect(runtime.queryOutcome(operation)).toEqual({ status: 'known', result: rejected });
+    expect(runtime.queryOutcome(operation)).toEqual({ status: 'not_seen' });
     runtime.close();
     await repo.shutdown();
   });

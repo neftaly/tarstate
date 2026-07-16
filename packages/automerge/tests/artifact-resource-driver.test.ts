@@ -77,4 +77,29 @@ describe('Automerge artifact resource driver', () => {
       issues: [{ code: 'resolver.failed', details: { reason: 'lease_release_failed' } }]
     });
   });
+
+  it('rejects conflicted embedded artifacts at the Automerge boundary', async () => {
+    let left = Automerge.from({ artifacts: { schema: { version: 0 } } }, { actor: '1'.repeat(64) });
+    let right = Automerge.clone(left, { actor: '2'.repeat(64) });
+    left = Automerge.change(left, (draft) => { draft.artifacts.schema.version = 1; });
+    right = Automerge.change(right, (draft) => { draft.artifacts.schema.version = 2; });
+    const doc = Automerge.merge(left, right);
+    const driver = automergeArtifactResourceDriver({
+      repo: {
+        acquire: async () => ({
+          waitForSnapshot: async () => ({ state: 'ready' as const, doc, heads: [] as const }),
+          release: () => undefined
+        })
+      },
+      normalizeHeads: (heads: readonly string[]) => heads
+    });
+
+    await expect(driver.resolve(
+      { uri: 'automerge:conflicted', kind: 'data' },
+      { authorityScope: 'scope:test' }
+    )).resolves.toMatchObject({
+      state: 'failed',
+      issues: [{ code: 'automerge.value_conflicted', path: ['artifacts', 'schema', 'version'] }]
+    });
+  });
 });

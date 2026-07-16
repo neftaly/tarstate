@@ -10,7 +10,9 @@ import type { AttachmentProjection, DocumentDeclaration } from './attachment-mod
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { adoptDocumentDeclaration } from './internal-document-declaration.js';
+import { ownedReadonlyMap } from './internal-owned-map.js';
 import { stringTupleKey } from './internal-string-key.js';
+import { comparePortableStrings } from './portable-order.js';
 import { projectStorage, type BindingProjection, type CompiledStorageMapping } from './mapping.js';
 import type { CapabilityRegistry } from './registry.js';
 import { prepareSchema, type PreparedSchema } from './schema.js';
@@ -54,6 +56,12 @@ export type AttachmentConstraintQuery<State> = (
   readonly issues: readonly Issue[];
 };
 
+export type PreparedAttachmentRelation = {
+  readonly relationId: string;
+  readonly keyFields: readonly string[];
+  readonly replaceableFields: readonly string[];
+};
+
 export type ReadyAttachmentPreparation<Storage = unknown, Projection = unknown, ConstraintState = Storage> = {
   readonly state: 'ready';
   readonly origin: 'bootstrap' | 'out-of-band' | 'manual-read-only';
@@ -62,6 +70,7 @@ export type ReadyAttachmentPreparation<Storage = unknown, Projection = unknown, 
   readonly declaration?: DocumentDeclaration;
   readonly schema?: PreparedSchema;
   readonly mapping?: CompiledStorageMapping;
+  readonly relations: ReadonlyMap<string, PreparedAttachmentRelation>;
   readonly constraints: readonly SourceConstraint<ConstraintState>[];
   readonly artifactResolutions: readonly ExactArtifactResolution[];
   readonly issues: readonly Issue[];
@@ -209,6 +218,7 @@ export const prepareDatabaseAttachment = async <State = unknown>(
     declaration,
     schema: schema.value,
     ...(mapping === undefined ? {} : { mapping }),
+    relations: preparedAttachmentRelations(schema.value, mapping),
     constraints,
     artifactResolutions,
     issues,
@@ -234,6 +244,7 @@ export const prepareManualReadOnlyAttachment = <Storage, Projection>(input: {
     origin: 'manual-read-only',
     writable: false,
     schemaViewIds: schemaViewIds as readonly string[],
+    relations: new Map(),
     constraints: [],
     artifactResolutions: [],
     issues: issueDescriptor === undefined || issueDescriptor.value === undefined ? [] : issueDescriptor.value as readonly Issue[],
@@ -329,6 +340,25 @@ const mappingCapabilities = (mapping: CompiledStorageMapping): readonly Capabili
   return [...capabilities.values()];
 };
 
+const preparedAttachmentRelations = (
+  schema: PreparedSchema,
+  mapping: CompiledStorageMapping | undefined
+): ReadonlyMap<string, PreparedAttachmentRelation> => new Map(
+  [...schema.relationsById].map(([relationId, relation]) => {
+    const mapped = mapping?.relations.get(relationId);
+    const replaceableFields = mapped === undefined
+      ? Object.keys(relation.declaration.fields).filter((field) => !relation.declaration.key.includes(field))
+      : Object.entries(mapped.mapping.fields)
+        .filter(([, field]) => field.write.kind === 'replace')
+        .map(([field]) => field);
+    return [relationId, Object.freeze({
+      relationId,
+      keyFields: Object.freeze([...relation.declaration.key]),
+      replaceableFields: Object.freeze(replaceableFields.sort(comparePortableStrings))
+    })] as const;
+  })
+);
+
 const ready = <Storage, Projection, State>(
   input: Omit<ReadyAttachmentPreparation<Storage, Projection, State>, typeof attachmentPreparationBrand | 'state'>
 ): ReadyAttachmentPreparation<Storage, Projection, State> => {
@@ -340,6 +370,7 @@ const ready = <Storage, Projection, State>(
     throw new TypeError('Ready attachment preparation has invalid scalar or callback fields');
   }
   const schemaViewIds = ownStringArray(requiredDataValue(descriptors, 'schemaViewIds', 'Ready attachment preparation'), 'Ready attachment preparation schemaViewIds');
+  const relations = ownPreparedAttachmentRelations(requiredDataValue(descriptors, 'relations', 'Ready attachment preparation'));
   const constraints = ownArrayValues<SourceConstraint<State>>(requiredDataValue(descriptors, 'constraints', 'Ready attachment preparation'), 'Ready attachment preparation constraints');
   const artifactResolutions = ownArrayValues<ExactArtifactResolution>(requiredDataValue(descriptors, 'artifactResolutions', 'Ready attachment preparation'), 'Ready attachment preparation artifact resolutions');
   const issues = ownIssues(requiredDataValue(descriptors, 'issues', 'Ready attachment preparation'), 'Ready attachment preparation issues');
@@ -347,13 +378,28 @@ const ready = <Storage, Projection, State>(
   const schema = optionalDataValue(descriptors, 'schema', 'Ready attachment preparation');
   const mapping = optionalDataValue(descriptors, 'mapping', 'Ready attachment preparation');
   return Object.freeze({
-    state: 'ready', origin, writable, schemaViewIds, constraints, artifactResolutions, issues,
+    state: 'ready', origin, writable, schemaViewIds, relations, constraints, artifactResolutions, issues,
     project: project as ReadyAttachmentPreparation<Storage, Projection, State>['project'],
     ...(declaration === undefined ? {} : { declaration: declaration as DocumentDeclaration }),
     ...(schema === undefined ? {} : { schema: schema as PreparedSchema }),
     ...(mapping === undefined ? {} : { mapping: mapping as CompiledStorageMapping }),
     [attachmentPreparationBrand]: true as const
   });
+};
+
+const ownPreparedAttachmentRelations = (input: unknown): ReadonlyMap<string, PreparedAttachmentRelation> => {
+  if (!(input instanceof Map)) throw new TypeError('Ready attachment preparation relations must be a Map');
+  const entries: [string, PreparedAttachmentRelation][] = [];
+  for (const [relationId, relation] of input) {
+    if (typeof relationId !== 'string' || relationId.length === 0 || !isRecord(relation) || relation.relationId !== relationId) {
+      throw new TypeError('Ready attachment preparation relation identity is invalid');
+    }
+    const keyFields = ownStringArray(relation.keyFields, 'Ready attachment preparation relation key fields');
+    const replaceableFields = ownStringArray(relation.replaceableFields, 'Ready attachment preparation relation replaceable fields');
+    if (keyFields.length === 0) throw new TypeError('Ready attachment preparation relation keys must not be empty');
+    entries.push([relationId, Object.freeze({ relationId, keyFields, replaceableFields })]);
+  }
+  return ownedReadonlyMap(entries);
 };
 
 const unavailable = (issues: readonly Issue[], artifactResolutions: readonly ExactArtifactResolution[] = []): UnavailableAttachmentPreparation => Object.freeze({
