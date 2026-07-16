@@ -65,6 +65,12 @@ callback runs again against the newly merged snapshot. Disjoint remote work is
 preserved, while conflicts already present in mapped data remain explicit
 projection evidence rather than being selected or JSON-round-tripped away.
 
+Opening returns a `ParseResult`. A malformed call or an initial callback failure
+rejects the promise; once execution has reserved a valid candidate, expected
+transaction failures resolve as receipts. In particular, a callback failure
+during multiplayer replay becomes a rejected receipt so no reserved operation
+is left pending.
+
 ## Automerge Repo compatibility
 
 The Repo integration consumes a small structural handle interface; this package

@@ -100,6 +100,22 @@ be portable syntax or a plan returned by `prepareTypedQuery`/`prepareQuery`;
 the evaluator automatically reuses an already-owned plan while continuing to
 detach and freeze every changing input. There is no separate fast-path API.
 
+## Failure boundary
+
+Public parsers and attachment openers return `ParseResult` for untrusted
+documents and artifacts. Invalid host configuration, malformed method
+arguments, and a transform that fails before producing its first valid
+transaction reject with `TypeError` or `TarstateParseError`. After a valid
+candidate enters execution, expected source, guard, constraint, and handoff
+failures resolve to a receipt; an uncertain handoff resolves with
+`outcome: 'unknown'` rather than throwing.
+
+A replay callback may run after its operation has been reserved. If that replay
+throws, the operation resolves to a rejected receipt with
+`transaction.unexpected_failure` so the reservation reaches a final state.
+Callbacks must therefore be pure, replayable, and use returned logical rows—not
+exceptions—for ordinary product behavior.
+
 ## Minimal database assembly
 
 `DatabaseView` is the imperative shell around host-owned sources and authority

@@ -26,47 +26,119 @@ describe('standard Automerge attachment', () => {
     await fixture.repo.shutdown();
   });
 
-  it('reconciles a player sync before publishing local work', async () => {
+  it('replays across repeated player syncs and preserves every disjoint row', async () => {
     const fixture = await openTaskAttachment();
-    const remote = Automerge.change(
-      Automerge.clone(fixture.handle.doc()!, { actor: '2'.repeat(64) }),
-      (draft) => {
-        draft.tasks.first!.title = 'Remote';
-        draft.tasks.second = { id: 'second', title: 'From another player' };
-      }
-    );
+    const started = [deferred(), deferred()];
+    const resume = [deferred(), deferred()];
     let calls = 0;
-    let markTransformStarted!: () => void;
-    let resumeTransform!: () => void;
-    const transformStarted = new Promise<void>((resolve) => { markTransformStarted = resolve; });
-    const transformCanResume = new Promise<void>((resolve) => { resumeTransform = resolve; });
-
     const pending = fixture.attachment.transact(
-      { kind: 'derive-title-from-current-state', id: 'first' },
+      { kind: 'repeated-player-sync', id: 'first' },
       async ({ rows }) => {
+        const call = calls;
         calls += 1;
-        if (calls === 1) {
-          markTransformStarted();
-          await transformCanResume;
+        if (call < started.length) {
+          started[call]!.resolve();
+          await resume[call]!.promise;
         }
         return rows.map((row) => {
           if (row.fields.id !== 'first') return row;
           if (typeof row.fields.title !== 'string') throw new TypeError('Expected a task title');
           return { ...row, fields: { ...row.fields, title: `Local after ${row.fields.title}` } };
         });
-      },
+      }
     );
-    await transformStarted;
-    fixture.handle.update((current) => Automerge.merge(current, remote));
-    resumeTransform();
-    const receipt = await pending;
 
-    expect(receipt).toMatchObject({ outcome: 'committed' });
+    await started[0]!.promise;
+    mergePlayerChange(fixture.handle, '3', (draft) => {
+      draft.tasks.first!.title = 'Remote one';
+      draft.tasks.second = { id: 'second', title: 'Second player row' };
+    });
+    resume[0]!.resolve();
+    await started[1]!.promise;
+    mergePlayerChange(fixture.handle, '4', (draft) => {
+      draft.tasks.first!.title = 'Remote two';
+      draft.tasks.third = { id: 'third', title: 'Third player row' };
+    });
+    resume[1]!.resolve();
+
+    await expect(pending).resolves.toMatchObject({ outcome: 'committed' });
+    expect(calls).toBe(3);
+    expect(fixture.handle.doc()?.tasks).toEqual({
+      first: { id: 'first', title: 'Local after Remote two' },
+      second: { id: 'second', title: 'Second player row' },
+      third: { id: 'third', title: 'Third player row' }
+    });
+
+    fixture.attachment.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('does not resurrect a row deleted by another player during authoring', async () => {
+    const fixture = await openTaskAttachment();
+    const started = deferred();
+    const resume = deferred();
+    let calls = 0;
+    const pending = fixture.attachment.transact(
+      { kind: 'rename-if-present', id: 'first' },
+      async ({ rows }) => {
+        calls += 1;
+        if (calls === 1) {
+          started.resolve();
+          await resume.promise;
+        }
+        return rows.map((row) => row.fields.id === 'first'
+          ? { ...row, fields: { ...row.fields, title: 'Local rename' } }
+          : row);
+      }
+    );
+
+    await started.promise;
+    mergePlayerChange(fixture.handle, '5', (draft) => {
+      delete draft.tasks.first;
+      draft.tasks.second = { id: 'second', title: 'Preserved' };
+    });
+    resume.resolve();
+
+    await expect(pending).resolves.toMatchObject({ outcome: 'committed' });
     expect(calls).toBe(2);
     expect(fixture.handle.doc()?.tasks).toEqual({
-      first: { id: 'first', title: 'Local after Remote' },
-      second: { id: 'second', title: 'From another player' }
+      second: { id: 'second', title: 'Preserved' }
     });
+
+    fixture.attachment.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('rejects mapped same-field conflicts without selecting a winner or invoking the transform', async () => {
+    const fixture = await openTaskAttachment();
+    const base = fixture.handle.doc()!;
+    const left = Automerge.change(Automerge.clone(base, { actor: '6'.repeat(64) }), (draft) => {
+      draft.tasks.first!.title = 'Left';
+    });
+    const right = Automerge.change(Automerge.clone(base, { actor: '7'.repeat(64) }), (draft) => {
+      draft.tasks.first!.title = 'Right';
+    });
+    fixture.handle.update(() => Automerge.merge(left, right));
+    let calls = 0;
+
+    const receipt = await fixture.attachment.transact(
+      { kind: 'must-not-select-conflict', id: 'first' },
+      ({ rows }) => {
+        calls += 1;
+        return rows;
+      }
+    );
+
+    expect(receipt).toMatchObject({ outcome: 'rejected' });
+    expect(receipt.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'automerge.conflict_observed', path: ['tasks', 'first', 'title'] })
+    ]));
+    expect(calls).toBe(0);
+    const conflictTitles = Object.values(Automerge.getConflicts(fixture.handle.doc()!.tasks.first!, 'title') ?? {});
+    expect(conflictTitles.every((title) => typeof title === 'string')).toBe(true);
+    expect(conflictTitles.filter((title): title is string => typeof title === 'string')
+      .sort((left, right) => left.localeCompare(right)))
+      .toEqual(['Left', 'Right']);
 
     fixture.attachment.close();
     await fixture.repo.shutdown();
@@ -140,4 +212,22 @@ const openTaskAttachment = async () => {
     throw new Error(JSON.stringify(opened.issues));
   }
   return { attachment: opened.value, handle, repo };
+};
+
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+};
+
+const mergePlayerChange = (
+  handle: Awaited<ReturnType<typeof openTaskAttachment>>['handle'],
+  actorDigit: string,
+  change: Automerge.ChangeFn<TaskDocument>
+): void => {
+  const remote = Automerge.change(
+    Automerge.clone(handle.doc()!, { actor: actorDigit.repeat(64) }),
+    change
+  );
+  handle.update((current) => Automerge.merge(current, remote));
 };

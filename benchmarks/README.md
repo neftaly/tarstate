@@ -40,3 +40,9 @@ small number of representative workloads and investigate only large
 regressions. A large gap is primarily a signal to simplify boundaries, remove
 duplicated work, or decomplect the design; it is not a mandate to preserve the
 legacy implementation or its micro-optimizations.
+
+`pnpm bench:transaction` exercises the standard public Automerge attachment
+from logical rows through intent hashing, exact-delta authoring, staging,
+validation, operation-ledger completion, and publication. It measures both a
+no-op and a one-row update over 100 rows. `pnpm check:perf` includes this beside
+the query, observer, Automerge projection, and coarse workload contracts.

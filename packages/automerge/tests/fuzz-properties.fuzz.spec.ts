@@ -78,6 +78,37 @@ const hash = (digit: number): `sha256:${string}` => `sha256:${(digit & 15).toStr
 const ledgerKey = (epoch: number, operation: number): string => epoch + '\u0000' + operation;
 
 describe('Automerge shrinking model properties', () => {
+  propertyTest('concurrent disjoint player maps survive local commit and merge', fc.asyncProperty(
+    fc.dictionary(key, fc.integer({ min: -20, max: 20 }), { minKeys: 1, maxKeys: 8 }),
+    fc.dictionary(key, fc.integer({ min: -20, max: 20 }), { minKeys: 1, maxKeys: 8 }),
+    async (localRecords, remoteRecords) => {
+      const base = initialDocument();
+      const runtime = new AutomergeSourceRuntime({ sourceId: 'source:multiplayer-fuzz', doc: base });
+      const listener = vi.fn();
+      runtime.subscribe(listener);
+      const local = Object.fromEntries(Object.entries(localRecords).map(([recordKey, value]) => ['local:' + recordKey, value]));
+      const remote = Object.fromEntries(Object.entries(remoteRecords).map(([recordKey, value]) => ['remote:' + recordKey, value]));
+      await runtime.commit({
+        operationEpoch: 'epoch:multiplayer',
+        operationId: 'operation:local',
+        intentHash: hash(1),
+        expectedBasis: runtime.snapshot().basis,
+        commands: [{ apply: (draft) => { Object.assign(draft.records, local); } }]
+      });
+      const remoteBranch = Automerge.change(
+        Automerge.clone(base, { actor: '2'.repeat(64) }),
+        (draft) => { Object.assign(draft.records, remote); }
+      );
+
+      runtime.merge(remoteBranch);
+
+      expect(runtime.snapshot().storage.records).toEqual({ ...local, ...remote });
+      expect(runtime.snapshot().basis.heads).toEqual([...runtime.snapshot().basis.heads].sort());
+      expect(listener).toHaveBeenCalledTimes(2);
+      runtime.close();
+    }
+  ));
+
   propertyTest('commands-replays-stale-bases-and-epoch-retirement-follow-the-model', fc.asyncProperty(
     fc.array(actionArbitrary, { minLength: 1, maxLength: 80 }),
     async (actions) => {

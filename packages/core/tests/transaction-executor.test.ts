@@ -156,6 +156,41 @@ describe('prepared source-local transaction executor', () => {
     expect(commit).toHaveBeenCalledTimes(2);
   });
 
+  it('does not resurrect a target deleted before reconciliation and re-evaluates its guard', async () => {
+    const { source, context } = await makeContext();
+    const commitDirect = source.commit;
+    const commit = vi.spyOn(source, 'commit');
+    commit.mockImplementationOnce(async (input) => {
+      await commitDirect({
+        operationEpoch: input.operationEpoch,
+        operationId: 'operation:concurrent-delete',
+        intentHash: hash('8'),
+        expectedBasis: input.expectedBasis,
+        commands: [{
+          description: 'concurrent delete',
+          apply: (state) => Object.freeze({ ...state, items: Object.freeze([]) })
+        }]
+      });
+      return commitDirect(input);
+    });
+
+    const receipt = await executePreparedTransaction(
+      context,
+      attempt(await transaction(), 'operation:deleted-target')
+    );
+
+    expect(receipt).toMatchObject({
+      outcome: 'rejected',
+      statementResults: [
+        { matched: 0, logicallyChanged: 0 },
+        { matched: 0, logicallyChanged: 0 }
+      ],
+      issues: [{ code: 'transaction.guard_failed' }]
+    });
+    expect(source.snapshot()).toMatchObject({ storage: { items: [] } });
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
+
   it('stages ordered overlapping statements and commits once with final-state query and constraint evidence', async () => {
     const { source, context } = await makeContext();
     const notify = vi.fn();

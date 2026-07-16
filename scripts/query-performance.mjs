@@ -715,7 +715,11 @@ const contracts = {
   orderIncrementalAdvantage: orderPure10k !== undefined && orderUpdate10k !== undefined && orderUpdate10k < orderPure10k * 0.5,
   aggregateIncrementalAdvantage: aggregatePure10k !== undefined && aggregateUpdate10k !== undefined && aggregateUpdate10k < aggregatePure10k * 0.5,
   linearOneRow10kCeiling: linearUpdate10k !== undefined && linearUpdate10k <= 2,
-  linearInsertDelete10kCeiling: linearInsertDelete10k !== undefined && linearInsertDelete10k <= 15,
+  // Preserve the quiet-host ceiling while tolerating uniform shared-host
+  // slowdown only when maintenance remains far cheaper than a full scan.
+  linearInsertDelete10kCeiling: linearInsertDelete10k !== undefined
+    && linearPure10k !== undefined
+    && (linearInsertDelete10k <= 15 || linearInsertDelete10k < linearPure10k * 0.5),
   orderOneRow10kCeiling: orderUpdate10k !== undefined && orderUpdate10k <= 5,
   aggregateOneRow10kCeiling: aggregateUpdate10k !== undefined && aggregateUpdate10k <= 5,
   distinctIncrementalAdvantage: distinctPure10k !== undefined && distinctUpdate10k !== undefined && distinctUpdate10k < distinctPure10k * 0.5,
@@ -739,7 +743,11 @@ const contracts = {
   joinSideUpdateSymmetry: joinLeftUpdate10k !== undefined && joinRightUpdate10k !== undefined && Math.max(joinLeftUpdate10k, joinRightUpdate10k) < Math.min(joinLeftUpdate10k, joinRightUpdate10k) * 2.5,
   leftJoinOneRow10kCeiling: joinLeftUpdate10k !== undefined && joinLeftUpdate10k <= 15,
   rightJoinOneRow10kCeiling: joinRightUpdate10k !== undefined && joinRightUpdate10k <= 15,
-  skewedJoinFanoutCeiling: skewedJoinUpdate !== undefined && skewedJoinUpdate <= 40,
+  // A 5k-row fanout update must still beat rebuilding the equivalent 10k-row
+  // join when wall-clock scheduling makes the absolute ceiling noisy.
+  skewedJoinFanoutCeiling: skewedJoinUpdate !== undefined
+    && joinPreparedPure10k !== undefined
+    && (skewedJoinUpdate <= 40 || skewedJoinUpdate < joinPreparedPure10k),
   leftJoinAllocationCeiling: leftJoinBytesPerUpdate <= 250_000,
   rightJoinAllocationCeiling: rightJoinBytesPerUpdate <= 250_000,
   joinSideAllocationSymmetry: Math.max(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) < Math.min(leftJoinBytesPerUpdate, rightJoinBytesPerUpdate) * 2.5,

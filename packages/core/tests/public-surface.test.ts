@@ -37,6 +37,7 @@ describe('topic-focused core surface', () => {
     expect(attachmentPreparation.prepareDatabaseAttachment).toBeTypeOf('function');
     expect(capabilities.CapabilityRegistry).toBeTypeOf('function');
     expect(database.DatabaseView).toBeTypeOf('function');
+    expect('InMemoryAtomicSource' in database).toBe(false);
     expect(databaseIncremental.createIncrementalDatabaseQueryMaintenance).toBeTypeOf('function');
     expect(queryEvaluate.evaluateQuery).toBe(query.evaluateQuery);
     expect('evaluatePreparedQuery' in queryEvaluate).toBe(false);

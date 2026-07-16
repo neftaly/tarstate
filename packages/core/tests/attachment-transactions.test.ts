@@ -159,6 +159,18 @@ describe('attachment transaction service', () => {
       outcome: 'rejected',
       issues: [{ code: 'transaction.unexpected_failure', details: { timing: 'reconciliation', error: 'Error' } }]
     });
+
+    await expect(service.transact(
+      { kind: 'initial-author-failure' },
+      () => { throw new Error('initial author failure'); }
+    )).rejects.toThrow('initial author failure');
+    await expect(service.simulate(
+      { kind: 'invalid-transform-output' },
+      () => null
+    )).rejects.toMatchObject({ name: 'TarstateParseError' });
+    expect(source.snapshot()).toMatchObject({
+      storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 3 }] }
+    });
   });
 });
 
