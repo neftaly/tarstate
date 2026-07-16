@@ -1,7 +1,7 @@
 /** A contained failure from synchronous observation notification or teardown. */
 export type ObserverDiagnostic = Readonly<{
   readonly kind: 'listener_error' | 'cleanup_error';
-  readonly component: 'dataset-membership' | 'attachment-catalog' | 'database-view' | 'dataset-capture' | 'query-observer' | 'external-store' | 'memory-source' | 'automerge-system-relations' | 'react-query' | 'react-optimistic' | 'react-mutations' | 'react-provider';
+  readonly component: 'source' | 'dataset-membership' | 'attachment-catalog' | 'database-view' | 'dataset-capture' | 'query-observer' | 'external-store' | 'automerge-system-relations' | 'react-query' | 'react-optimistic' | 'react-mutations' | 'react-provider';
   readonly operation: string;
   readonly error: unknown;
 }>;

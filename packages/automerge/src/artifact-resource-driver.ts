@@ -5,7 +5,7 @@ import {
   type ArtifactCarrierExtractor,
   type ResolverDriver
 } from '@tarstate/core/artifacts';
-import { createIssue, type Issue } from '@tarstate/core/foundation';
+import { createIssue, type Issue } from '@tarstate/core';
 import { adoptConflictFreeAutomergeJsonValue } from './automerge-json.js';
 
 export type AutomergeArtifactCarrierSnapshot<T extends object, Heads = readonly string[]> =
@@ -24,7 +24,7 @@ export type AutomergeArtifactCarrierRepo<T extends object, Heads = readonly stri
 
 export type InertAutomergeArtifactCarrier = {
   readonly kind: 'automerge-artifact-carrier';
-  readonly value: import('@tarstate/core/foundation').JsonValue;
+  readonly value: import('@tarstate/core').JsonValue;
   readonly provenance: { readonly heads: readonly string[] };
 };
 

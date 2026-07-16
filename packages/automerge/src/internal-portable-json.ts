@@ -1,4 +1,4 @@
-import { canonicalizeJson, type JsonValue } from '@tarstate/core/foundation';
+import { canonicalizeJson, type JsonValue } from '@tarstate/core';
 
 /** Safe canonical equality at Automerge adapter protocol boundaries. */
 export const samePortableJson = (left: unknown, right: unknown): boolean => {

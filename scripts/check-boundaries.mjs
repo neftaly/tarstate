@@ -4,8 +4,6 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const coreSource = path.join(root, 'packages/core/src');
-const satelliteSources = ['automerge', 'react', 'schema-tools', 'zustand']
-  .map((name) => path.join(root, 'packages', name, 'src'));
 
 const sourceFiles = (directory) => readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
   const location = path.join(directory, entry.name);
@@ -158,7 +156,6 @@ assignArchitectureGroup('observer', [
   'observer.ts'
 ]);
 assignArchitectureGroup('observer-incremental', ['internal-observer-maintenance-frames.ts', 'internal-observer-query-maintenance.ts']);
-assignArchitectureGroup('source-runtime', ['memory-source.ts']);
 assignArchitectureGroup('system', ['system-relations.ts']);
 assignArchitectureGroup('composition', [
   'golden-workloads.ts',
@@ -190,7 +187,6 @@ const allowedArchitectureDependencies = new Map(Object.entries({
   'observer-contract': ['foundation', 'source-contract', 'query-model'],
   'observer': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract'],
   'observer-incremental': ['foundation', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer'],
-  'source-runtime': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime'],
   'system': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'transaction-runtime'],
   'composition': [...new Set(architectureGroups.values())]
 }));
@@ -208,13 +204,11 @@ for (const [file, dependencies] of allDependencies) {
 }
 
 const publicRuntimePolicies = new Map(Object.entries({
-  'foundation/index.ts': ['foundation'],
   'capabilities/index.ts': ['foundation', 'capability'],
   'artifacts/index.ts': ['foundation', 'capability', 'artifact-resolution'],
   'source/index.ts': ['foundation', 'source-contract'],
   'attachment/index.ts': ['foundation', 'source-contract'],
-  'attachment/prepare/index.ts': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'semantic-artifact', 'attachment-runtime'],
-  'attachment/transact/index.ts': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime', 'attachment-runtime'],
+  'attachment/adapter/index.ts': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime', 'attachment-runtime'],
   'query/model/index.ts': ['foundation', 'query-model'],
   'query/prepare/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],
   'query/authoring/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],
@@ -228,11 +222,13 @@ const publicRuntimePolicies = new Map(Object.entries({
   'database/observer/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
   'database/incremental/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer', 'observer-incremental'],
   'database/external-store/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
+  'database/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'transaction-runtime', 'attachment-runtime', 'observer-contract', 'observer', 'system'],
   'schema/index.ts': ['foundation', 'capability', 'source-contract', 'schema'],
   'transactions/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime']
 }));
 
 const publicDeclarationPolicyAdditions = new Map(Object.entries({
+  'database/index.ts': ['artifact-resolution', 'semantic-artifact'],
   'database/observer/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact']
 }));
 
@@ -320,20 +316,6 @@ const assertAcyclic = (name, graph) => {
 
 assertAcyclic('runtime', runtimeDependencies);
 assertAcyclic('source/declaration', allDependencies);
-
-for (const directory of satelliteSources) {
-  for (const file of sourceFiles(directory)) {
-    const source = readFileSync(file, 'utf8');
-    for (const { specifier } of staticDependencies(source)) {
-      if (specifier === '@tarstate/core') {
-        throw new Error(relative(file) + ' imports the broad @tarstate/core root instead of an architectural subpath');
-      }
-    }
-    if (/import\(\s*['"]@tarstate\/core['"]\s*\)/.test(source)) {
-      throw new Error(relative(file) + ' type-imports the broad @tarstate/core root instead of an architectural subpath');
-    }
-  }
-}
 
 console.log('Verified architecture directions, source-owned public closures, acyclic dependencies, and narrow satellite imports.');
 

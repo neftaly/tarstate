@@ -5,7 +5,7 @@ import {
   referenceTo,
   sealSchema
 } from '@tarstate/core/schema';
-import type { TaggedValue } from '@tarstate/core/foundation';
+import type { TaggedValue } from '@tarstate/core';
 import {
   pipe,
   prepareTypedQuery,

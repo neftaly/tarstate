@@ -1,4 +1,4 @@
-import { canonicalizeJson, type JsonValue } from '@tarstate/core/foundation';
+import { canonicalizeJson, type JsonValue } from '@tarstate/core';
 import type { Footprint, FootprintRelation } from '@tarstate/core/source';
 import { comparePortableStrings } from './portable-order.js';
 import type { AutomergePath } from './projection.js';

@@ -11,7 +11,7 @@ const automergeDist = path.join(root, 'packages/automerge/dist');
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-built-boundaries-'));
 
 try {
-  assertClosure('foundation/index.js', 45_000, ['registry-', 'builtins-', 'query', 'schema', 'semantic-artifact', 'transaction', 'database', 'memory-source']);
+  assertClosure('index.js', 45_000, ['registry-', 'builtins-', 'query', 'schema', 'semantic-artifact', 'transaction', 'database', 'memory-source']);
   assertClosure('capabilities/index.js', 55_000, ['query', 'schema', 'semantic-artifact', 'transaction', 'database', 'memory-source']);
   assertClosure('artifacts/index.js', 70_000, ['semantic-', 'query-', 'mapping-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/query/index.js', 165_000, ['query-incremental', 'observer-maintenance', 'semantic-transaction', 'semantic-storage-mapping', 'semantic-schema-lens', 'semantic-constraint']);
@@ -21,8 +21,7 @@ try {
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
   assertClosure('attachment/index.js', 100, []);
-  assertClosure('attachment/prepare/index.js', 140_000, ['internal-query-evaluator', 'semantic-query-artifact', 'semantic-schema-lens', 'transaction-']);
-  assertClosure('attachment/transact/index.js', 180_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
+  assertClosure('attachment/adapter/index.js', 280_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['internal-query-evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
@@ -97,7 +96,7 @@ async function verifyPackedDuplicateCopies() {
   const consumerDist = path.join(consumerDirectory, 'package/dist');
   const producer = await import(pathToFileURL(path.join(producerDist, 'index.js')).href);
   const queryProducer = await import(pathToFileURL(path.join(producerDist, 'query/index.js')).href);
-  const foundationConsumer = await import(pathToFileURL(path.join(consumerDist, 'foundation/index.js')).href);
+  const foundationConsumer = await import(pathToFileURL(path.join(consumerDist, 'index.js')).href);
   const queryConsumer = await import(pathToFileURL(path.join(consumerDist, 'query/index.js')).href);
 
   for (const sentinel of ['missingValue', 'logicalUnknown', 'capabilityUnavailable']) {

@@ -8,7 +8,6 @@ import {
   simulatePreparedTransaction,
   type ArtifactRef,
   type CapabilityRef,
-  type MemoryState,
   type PreparedWritableExecutionContext,
   type TransactionAttempt,
   type WritableLogicalState
@@ -16,7 +15,8 @@ import {
 import {
   LogicalMemoryAtomicSource,
   LogicalMemoryStorageBinding,
-  type LogicalMemoryCommand
+  type LogicalMemoryCommand,
+  type MemoryState
 } from './fixtures/memory-storage-source.js';
 
 const hash = (character: string): `sha256:${string}` => `sha256:${character.repeat(64)}`;

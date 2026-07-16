@@ -3,7 +3,7 @@ import {
   type ObserveRequest,
   type ObserverSnapshot
 } from '@tarstate/core/database/observer';
-import type { JsonValue } from '@tarstate/core/foundation';
+import type { JsonValue } from '@tarstate/core';
 import type { PreparedPlan } from '@tarstate/core/query/model';
 import {
   createContext,

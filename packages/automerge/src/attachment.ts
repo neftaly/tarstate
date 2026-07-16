@@ -2,24 +2,22 @@ import * as Automerge from '@automerge/automerge';
 import {
   prepareDatabaseAttachment,
   type AttachmentConstraintQuery,
-  type ReadyAttachmentPreparation
-} from '@tarstate/core/attachment/prepare';
+  type ReadyAttachmentPreparation,
+  createAttachmentTransactionService,
+  type AttachmentTransactionService
+} from '@tarstate/core/attachment/adapter';
 import {
   builtInCapabilityRefs,
   CapabilityRegistry,
   registerBuiltInCapabilities
 } from '@tarstate/core/capabilities';
-import {
-  createAttachmentTransactionService,
-  type AttachmentTransactionService
-} from '@tarstate/core/attachment/transact';
 import type { WritableLogicalState } from '@tarstate/core/transactions';
 import {
   createIssue,
   safeParseJsonValue,
   type JsonValue,
   type ParseResult
-} from '@tarstate/core/foundation';
+} from '@tarstate/core';
 import { adoptConflictFreeAutomergeJsonValue } from './automerge-json.js';
 import { AutomergeAtomicSource } from './core-adapter.js';
 import { AutomergeMappedStorageBinding } from './mapping-storage-binding.js';
@@ -29,7 +27,7 @@ import {
   type AutomergeSourceCommand
 } from './source.js';
 
-export type OpenAutomergeAttachmentInput<T extends object, Heads> = {
+export type OpenAutomergeAttachmentOptions<T extends object, Heads> = {
   readonly handle: AutomergeRepoHandle<T, Heads>;
   readonly declaration: unknown;
   readonly embeddedArtifacts: unknown;
@@ -39,14 +37,14 @@ export type OpenAutomergeAttachmentInput<T extends object, Heads> = {
   readonly evaluateConstraintQuery?: AttachmentConstraintQuery<WritableLogicalState>;
 };
 
-export type OpenAutomergeAttachment = AttachmentTransactionService & {
+export type AutomergeAttachment = AttachmentTransactionService & {
   readonly close: () => void;
 };
 
 /** Opens the standard writable Automerge attachment path without exposing heads, bindings, or execution contexts. */
 export const openAutomergeAttachment = async <T extends object, Heads>(
-  input: OpenAutomergeAttachmentInput<T, Heads>
-): Promise<ParseResult<OpenAutomergeAttachment>> => {
+  input: OpenAutomergeAttachmentOptions<T, Heads>
+): Promise<ParseResult<AutomergeAttachment>> => {
   const declaration = adoptBoundaryJson(input.declaration);
   if (!declaration.success) return declaration;
   const embedded = adoptBoundaryJson(input.embeddedArtifacts);

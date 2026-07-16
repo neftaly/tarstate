@@ -18,20 +18,19 @@ and schema implementations:
 
 | Entry point | Responsibility |
 | --- | --- |
-| `@tarstate/core/foundation` | Portable values, issues, artifact envelopes, hashes, and built-in capability references |
+| `@tarstate/core` | Portable values, issues, artifact envelopes, hashes, and built-in capability references |
 | `@tarstate/core/capabilities` | Host-owned capability registry and built-in capability registration |
 | `@tarstate/core/source` | Source state, storage-independent logical edits, and live source protocols |
 | `@tarstate/core/attachment` | Portable attachment declarations and host composition contracts |
 | `@tarstate/core/artifacts` | Portable envelopes, capabilities, issues, and exact resolution; no semantic handlers |
 | `@tarstate/core/schema` | Schemas, codecs, constraints, mappings, lenses, and typed authoring |
 | `@tarstate/core/query` | Query builders, evaluation, preparation, and incremental maintenance |
-| `@tarstate/core/database` | Observation, source protocols, host runtimes, and maintenance contracts |
+| `@tarstate/core/database` | Database catalogs, observation, host runtimes, and system relations |
 | `@tarstate/core/transactions` | Writes, commit coordination, receipts, and lifecycle governance |
 
-Foundation values have the same identity through `@tarstate/core` and
-`@tarstate/core/foundation`. All other public values must be imported through a
-topic entry. Internal maintenance-pool APIs and conformance fixtures are not
-made public by these entry points.
+All other public values must be imported through a topic entry. Internal
+maintenance-pool APIs and conformance fixtures are not made public by these
+entry points.
 
 Query and observation have narrower execution seams:
 
@@ -65,8 +64,7 @@ Artifact semantics and attachment preparation also have opt-in execution seams:
 | `@tarstate/core/artifacts/constraint-set` | Constraint-set parsing and compilation |
 | `@tarstate/core/artifacts/storage-mapping` | Storage-mapping parsing and compilation |
 | `@tarstate/core/artifacts/schema-lens` | Schema-lens parsing and validation |
-| `@tarstate/core/attachment/prepare` | Attachment resolution, schema/mapping preparation, and constraint composition |
-| `@tarstate/core/attachment/transact` | Replayable logical-row transactions over one prepared writable attachment |
+| `@tarstate/core/attachment/adapter` | Adapter-facing preparation and replayable transaction-service composition |
 
 The portable `artifacts` entry never imports query evaluation, mapping, lens,
 constraint, or transaction implementations. Hosts opt into only the semantic
@@ -152,8 +150,10 @@ const plan = await prepareTypedQuery(query, {
 const observer = database.observe({ plan });
 ```
 
-Use `prepareManualReadOnlyAttachment` for an already trusted projection, or
-`prepareDatabaseAttachment` when artifacts and capabilities must be validated.
+Adapter authors import `prepareManualReadOnlyAttachment`,
+`prepareDatabaseAttachment`, and `createAttachmentTransactionService` from
+`@tarstate/core/attachment/adapter`. Applications using an official adapter do
+not need this construction seam.
 Closing the database closes every observer and maintenance runtime it created;
 closing an observer earlier only releases that observer's lease. The database
 borrows the attachment catalog, dataset memberships, attachments, and sources,

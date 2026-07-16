@@ -2,7 +2,7 @@ import type {
   CommitReceipt,
   TransactionAttempt
 } from '@tarstate/core/transactions';
-import { safeParseJsonValue, type JsonValue } from '@tarstate/core/foundation';
+import { safeParseJsonValue, type JsonValue } from '@tarstate/core';
 import type { ObserverDiagnosticReporter } from '@tarstate/core/database/observer';
 import type {
   CommitFunction,

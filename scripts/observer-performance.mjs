@@ -6,7 +6,7 @@ import {
   DatasetMembership
 } from '../packages/core/dist/database/index.js';
 import { createIncrementalDatabaseQueryMaintenance } from '../packages/core/dist/database/incremental/index.js';
-import { prepareManualReadOnlyAttachment } from '../packages/core/dist/attachment/prepare/index.js';
+import { prepareManualReadOnlyAttachment } from '../packages/core/dist/attachment/adapter/index.js';
 import { prepareQuery } from '../packages/core/dist/query/index.js';
 
 const schemaView = { id: 'urn:tarstate:observer-benchmark:schema', contentHash: 'sha256:' + 'a'.repeat(64) };

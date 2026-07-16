@@ -3,7 +3,7 @@ import {
   type ObserverDiagnosticReporter,
   type ObserverSnapshot
 } from '@tarstate/core/database/observer';
-import { canonicalizeJson, safeParseJsonValue, type JsonValue } from '@tarstate/core/foundation';
+import { canonicalizeJson, safeParseJsonValue, type JsonValue } from '@tarstate/core';
 import type { TransactionAttempt } from '@tarstate/core/transactions';
 import type {
   OptimisticOperationEvidence,

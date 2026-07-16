@@ -4,4 +4,7 @@
  * `@tarstate/core/transactions` so importing one concern does not link all of
  * Tarstate in runtimes without tree shaking.
  */
-export * from './foundation/index.js';
+export * from './artifacts.js';
+export * from './built-in-capability-declarations.js';
+export * from './issues.js';
+export * from './value.js';

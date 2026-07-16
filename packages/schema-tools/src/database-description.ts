@@ -12,7 +12,7 @@ import {
   type ContentHash,
   type JsonValue,
   type ParseResult,
-} from '@tarstate/core/foundation';
+} from '@tarstate/core';
 import type { ValueDeclaration } from '@tarstate/core/query/authoring';
 import { schemaToolsFailure, schemaToolsIssue } from './internal-issues.js';
 

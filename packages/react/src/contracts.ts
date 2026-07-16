@@ -4,7 +4,7 @@ import type {
   ObserverSnapshot,
   QueryObserver
 } from '@tarstate/core/database/observer';
-import type { JsonValue } from '@tarstate/core/foundation';
+import type { JsonValue } from '@tarstate/core';
 import type { TypedPreparedPlan } from '@tarstate/core/query/authoring';
 import type { CommitReceipt, TransactionAttempt } from '@tarstate/core/transactions';
 import type { ReactNode } from 'react';

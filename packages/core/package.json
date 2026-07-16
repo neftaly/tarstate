@@ -39,13 +39,9 @@
       "types": "./dist/attachment/index.d.ts",
       "import": "./dist/attachment/index.js"
     },
-    "./attachment/prepare": {
-      "types": "./dist/attachment/prepare/index.d.ts",
-      "import": "./dist/attachment/prepare/index.js"
-    },
-    "./attachment/transact": {
-      "types": "./dist/attachment/transact/index.d.ts",
-      "import": "./dist/attachment/transact/index.js"
+    "./attachment/adapter": {
+      "types": "./dist/attachment/adapter/index.d.ts",
+      "import": "./dist/attachment/adapter/index.js"
     },
     "./capabilities": {
       "types": "./dist/capabilities/index.d.ts",
@@ -66,10 +62,6 @@
     "./database/observer": {
       "types": "./dist/database/observer/index.d.ts",
       "import": "./dist/database/observer/index.js"
-    },
-    "./foundation": {
-      "types": "./dist/foundation/index.d.ts",
-      "import": "./dist/foundation/index.js"
     },
     "./query": {
       "types": "./dist/query/index.d.ts",

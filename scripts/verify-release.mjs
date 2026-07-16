@@ -163,7 +163,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
   const schemaProducer = await import(pathToFileURL(path.join(producerDirectory, 'package/dist/schema/index.js')).href);
   const queryConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/query/index.js')).href);
   const schemaConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/schema/index.js')).href);
-  const foundationConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/foundation/index.js')).href);
+  const foundationConsumer = await import(pathToFileURL(path.join(consumerDirectory, 'package/dist/index.js')).href);
 
   for (const sentinel of ['missingValue', 'logicalUnknown', 'capabilityUnavailable']) {
     if (producer[sentinel] !== foundationConsumer[sentinel]) {
@@ -172,7 +172,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
   }
 
   const preparedExpression = queryProducer.prepareExpression({ kind: 'literal', value: 7 });
-  if (queryConsumer.evaluatePreparedExpression(preparedExpression, {}) !== 7) {
+  if (queryConsumer.evaluateExpression(preparedExpression, {}) !== 7) {
     fail('@tarstate/core: packed query entry rejected root-entry prepared expression');
   }
 
@@ -185,7 +185,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
   const session = queryConsumer.openIncrementalQueryMaintenance(plan, { relations: [] });
   if (session.getCurrentResult().rows[0]?.id !== 1) fail('@tarstate/core: packed query entry rejected root-entry prepared plan');
   session.close();
-  if (queryConsumer.evaluatePreparedQuery(plan, { relations: [] }).rows[0]?.id !== 1) {
+  if (queryConsumer.evaluateQuery({ root: plan, relations: [] }).rows[0]?.id !== 1) {
     fail('@tarstate/core: packed query entry rejected root-entry plan for prepared evaluation');
   }
   const subpathPlan = await queryConsumer.prepareQuery({
@@ -197,7 +197,7 @@ async function verifyCoreCrossEntryProvenance(tarball, destination) {
   const reverseSession = queryProducer.openIncrementalQueryMaintenance(subpathPlan, { relations: [] });
   if (reverseSession.getCurrentResult().rows[0]?.id !== 2) fail('@tarstate/core: packed root entry rejected query-entry prepared plan');
   reverseSession.close();
-  if (queryProducer.evaluatePreparedQuery(subpathPlan, { relations: [] }).rows[0]?.id !== 2) {
+  if (queryProducer.evaluateQuery({ root: subpathPlan, relations: [] }).rows[0]?.id !== 2) {
     fail('@tarstate/core: packed root entry rejected query-entry plan for prepared evaluation');
   }
   try {

@@ -1,4 +1,4 @@
-import { safeParseArtifactValue, type ArtifactParseBudget, type JsonValue, type ParseResult } from '@tarstate/core/foundation';
+import { safeParseArtifactValue, type ArtifactParseBudget, type JsonValue, type ParseResult } from '@tarstate/core';
 import {
   prepareSchema,
   type FieldDeclaration,

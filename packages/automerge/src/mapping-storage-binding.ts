@@ -4,7 +4,7 @@ import {
   createIssue,
   type Issue,
   type JsonValue
-} from '@tarstate/core/foundation';
+} from '@tarstate/core';
 import type { CapabilityRegistry } from '@tarstate/core/capabilities';
 import {
   parseRelationCandidate,
@@ -29,12 +29,21 @@ import { isAutomergeReservedRootProperty } from './reserved.js';
 import { samePortableJson } from './internal-portable-json.js';
 import {
   planPropertyEdit,
-  valueAtAutomergePath,
-  type AutomergeProjectedRow
+  valueAtAutomergePath
 } from './storage-binding.js';
 import type { AutomergeSourceCommand } from './source.js';
 
-export type AutomergeMappedStorageRow = AutomergeProjectedRow<Readonly<Record<string, JsonValue>>>;
+export type AutomergeMappedStorageRow = {
+  readonly relationId: string;
+  readonly key: readonly [JsonValue, ...JsonValue[]];
+  readonly fields: Readonly<Record<string, JsonValue>>;
+  readonly locator: {
+    readonly namespace: string;
+    readonly token: JsonValue;
+    readonly rowIncarnation: string;
+  };
+  readonly storagePath: AutomergePath;
+};
 
 export type AutomergeMappedStorageBindingOptions = {
   readonly id?: string;

@@ -1,4 +1,4 @@
-import type { IssueDeclaration, IssuePhase, IssueRetry, IssueSeverity } from '@tarstate/core/foundation';
+import type { IssueDeclaration, IssuePhase, IssueRetry, IssueSeverity } from '@tarstate/core';
 import { comparePortableStrings } from './portable-order.js';
 
 const declaration = (

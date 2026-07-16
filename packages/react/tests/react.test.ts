@@ -1,12 +1,12 @@
 import {
-  preparePlan,
   type ObserveRequest,
   type ObserverChange,
   type ObserverDiagnostic,
   type ObserverSnapshot,
-  type PreparedPlan,
   type QueryObserver
 } from '@tarstate/core/database';
+import { prepareQuery } from '@tarstate/core/query/prepare';
+import type { PreparedPlan, QueryNode } from '@tarstate/core/query/model';
 import type { CommitReceipt, TransactionAttempt } from '@tarstate/core/transactions';
 import { StrictMode, createElement, type ReactElement } from 'react';
 import { renderToString } from 'react-dom/server';
@@ -30,11 +30,11 @@ import {
 import { OptimisticOverlayStore } from '../src/optimistic-store.js';
 import { QueryStore } from '../src/query-store.js';
 
-type Query = { readonly kind: 'all' };
+type Query = QueryNode;
 type Row = { readonly id: number; readonly name: string };
 
-const plan: ReactPreparedPlan<Query, Row> = await preparePlan<Query>({
-  query: { kind: 'all' },
+const plan: ReactPreparedPlan<Query, Row> = await prepareQuery({
+  root: { kind: 'values', alias: 'row', rows: [] },
   registryFingerprint: 'registry:one',
   authorityFingerprint: 'authority:public',
   datasetId: 'dataset:one'

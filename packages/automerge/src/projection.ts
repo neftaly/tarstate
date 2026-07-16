@@ -1,5 +1,5 @@
 import * as Automerge from '@automerge/automerge';
-import type { JsonValue } from '@tarstate/core/foundation';
+import type { JsonValue } from '@tarstate/core';
 import { automergeBasis, type AutomergeBasis } from './source.js';
 import { isAutomergeReservedRootProperty } from './reserved.js';
 import { comparePortableStrings } from './portable-order.js';

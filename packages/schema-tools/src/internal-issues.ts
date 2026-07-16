@@ -1,4 +1,4 @@
-import { canonicalizeJson, issueCatalog, type Issue, type IssueDeclaration, type IssueRetry, type JsonValue, type ParseResult } from '@tarstate/core/foundation';
+import { canonicalizeJson, issueCatalog, type Issue, type IssueDeclaration, type IssueRetry, type JsonValue, type ParseResult } from '@tarstate/core';
 
 const declaration = (
   code: string,

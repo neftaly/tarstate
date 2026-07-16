@@ -1,4 +1,4 @@
-import type { JsonValue } from '@tarstate/core/foundation';
+import type { JsonValue } from '@tarstate/core';
 import type {
   ObserverDiagnostic,
   ObserverDiagnosticReporter

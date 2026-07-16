@@ -4,7 +4,7 @@ import {
   authorExactKeyedRelationDelta
 } from '../src/relation-delta-authoring.js';
 import type { WriteStatement } from '../src/transaction.js';
-import type { JsonValue } from '@tarstate/core/foundation';
+import type { JsonValue } from '@tarstate/core';
 import { propertyTest } from './support/property-test.js';
 
 const hash = `sha256:${'a'.repeat(64)}` as const;

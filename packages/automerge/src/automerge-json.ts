@@ -6,7 +6,7 @@ import {
   type JsonValue,
   type ParseResult,
   type ValueParseBudget
-} from '@tarstate/core/foundation';
+} from '@tarstate/core';
 import { comparePortableStrings } from './portable-order.js';
 
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);

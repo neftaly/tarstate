@@ -7,14 +7,14 @@ import type { QueryNode as TopicQueryNode } from '../packages/core/dist/query/in
 import type { PreparedPlan as TopicPreparedPlan } from '../packages/core/dist/query/index.js';
 import type { SchemaBody as TopicSchemaBody } from '../packages/core/dist/schema/index.js';
 import type { Transaction as TopicTransaction } from '../packages/core/dist/transactions/index.js';
-import type { AutomergeAtomicSource } from '../packages/automerge/dist/index.js';
+import type { AutomergeAttachment } from '../packages/automerge/dist/index.js';
 import type { zustandAtomicExternalStore } from '../packages/zustand/dist/index.js';
 import type { ReactPreparedPlan } from '../packages/react/dist/index.js';
 import type { DatabaseDescription } from '../packages/schema-tools/dist/index.js';
 
 declare const query: QueryArtifact;
 declare const lifecycle: SourceLifecycleCoordinator;
-declare const automerge: AutomergeAtomicSource<Record<string, unknown>>;
+declare const automerge: AutomergeAttachment;
 declare const zustand: typeof zustandAtomicExternalStore;
 declare const plan: ReactPreparedPlan<unknown, { readonly id: string }>;
 declare const description: DatabaseDescription;

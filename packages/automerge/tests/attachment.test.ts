@@ -5,7 +5,7 @@ import { sealSchema, sealStorageMapping } from '@tarstate/core/schema';
 import { describe, expect, it } from 'vitest';
 import {
   openAutomergeAttachment,
-  type OpenAutomergeAttachmentInput
+  type OpenAutomergeAttachmentOptions
 } from '../src/index.js';
 
 type TaskDocument = {
@@ -196,7 +196,7 @@ const openTaskAttachment = async () => {
   } });
   const repo = new Repo();
   const handle = repo.create<TaskDocument>({ tasks: { first: { id: 'first', title: 'First' } } });
-  const declaration: OpenAutomergeAttachmentInput<TaskDocument, readonly string[]>['declaration'] = {
+  const declaration: OpenAutomergeAttachmentOptions<TaskDocument, readonly string[]>['declaration'] = {
     formatVersion: 1,
     storageSchema: reference(schema),
     projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }

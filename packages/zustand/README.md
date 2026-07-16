@@ -23,7 +23,7 @@ Adapt a vanilla Zustand store, then acquire one host-owned Tarstate runtime for
 that store identity:
 
 ```ts
-import { HostRuntimeRegistry, acquireExternalStoreRuntime } from '@tarstate/core/database';
+import { HostRuntimeRegistry, acquireExternalStoreRuntime } from '@tarstate/core/database/external-store';
 import { zustandAtomicExternalStore } from '@tarstate/zustand';
 import { createStore } from 'zustand/vanilla';
 

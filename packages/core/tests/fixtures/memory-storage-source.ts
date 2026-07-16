@@ -5,7 +5,6 @@ import { positiveSafeInteger } from '../../src/internal-numeric-boundary.js';
 import { stringTupleKey } from '../../src/internal-string-key.js';
 import { samePortableJson } from '../../src/internal-json-equality.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from '../../src/observer-diagnostics.js';
-import type { MemoryRow, MemoryState } from '../../src/memory-source.js';
 import type { WritableLogicalRow } from '../../src/logical-edit.js';
 import type { SourceBasis, SourceSnapshot } from '../../src/source-state.js';
 import type {
@@ -22,6 +21,9 @@ import type {
   StorageBinding
 } from '../../src/source-protocol.js';
 import type { JsonValue } from '../../src/value.js';
+
+export type MemoryRow = Readonly<Record<string, JsonValue>>;
+export type MemoryState = Readonly<Record<string, readonly MemoryRow[]>>;
 
 export type LogicalMemoryBasis = { readonly incarnation: string; readonly revision: number };
 
@@ -128,7 +130,7 @@ export class LogicalMemoryAtomicSource implements AtomicSource<MemoryState, Logi
     if (changed) {
       const afterBasis = this.#basis();
       notifyObservers(this.#listeners, (listener) => listener({ beforeBasis, afterBasis }), {
-        component: 'memory-source',
+        component: 'source',
         operation: 'publish'
       }, this.#onDiagnostic);
     }

@@ -6,7 +6,7 @@ import {
   type SourceSnapshot
 } from '@tarstate/core/database';
 import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/database/incremental';
-import { prepareManualReadOnlyAttachment } from '@tarstate/core/attachment/prepare';
+import { prepareManualReadOnlyAttachment } from '@tarstate/core/attachment/adapter';
 import {
   prepareTypedQuery,
   typedFrom,

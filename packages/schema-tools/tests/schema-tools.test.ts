@@ -3,7 +3,7 @@ import {
   issueCatalog,
   type CapabilityRef,
   type JsonValue
-} from '@tarstate/core/foundation';
+} from '@tarstate/core';
 import { sealSchema, type SchemaBody } from '@tarstate/core/schema';
 import {
   createIssueCodeCatalogArtifact,

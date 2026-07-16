@@ -1,14 +1,14 @@
 import type { ArtifactRef } from './artifacts.js';
 import { ExternalStoreRuntime, type AtomicExternalStore } from './external-store.js';
+import { createIssue } from './issues.js';
 import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, validateLens, type LensRows, type SchemaLensBody } from './lens.js';
-import { InMemoryAtomicSource } from './memory-source.js';
 import { sealPreparedPlan } from './internal-prepared-plan.js';
 import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance } from './query-incremental.js';
 import type { QueryMaintenanceSnapshot } from './query-incremental-model.js';
 import type { QueryNode, QueryRecord, QueryResult, RelationInput } from './query-model.js';
 import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
-import { sealTransaction } from './transaction.js';
+import type { CommitReceipt } from './transaction.js';
 
 export type GoldenFixtureStatus = 'synthetic' | 'migrated-synthetic';
 export type GoldenWorkloadLabel =
@@ -231,47 +231,31 @@ export const runPatchpitCreationFailureGolden = async (): Promise<SequenceReceip
     operationId: 'golden:create:C',
     request: { action: 'create', sourceCapability, input: { kind: 'folder', title: 'C' } }
   };
-  const folder = new InMemoryAtomicSource({
-    sourceId: 'golden:folder:A',
-    incarnation: 'golden:folder:A:1',
+  const staleLinkReceipt: CommitReceipt = {
+    kind: 'commit',
+    receiptVersion: 1,
     operationEpoch: 'golden:folder:A:operations:1',
-    state: { entries: [] },
-    relations: [{ relationId: 'golden.folder-entry', schemaView, keyFields: ['entryId'] }],
-    attachments: [{
-      attachmentId: 'golden:folder:A:attachment',
-      fingerprint: hash('f'),
-      authorityViewFingerprint: hash('e'),
-      schemaView,
-      writable: true
-    }]
-  });
-  const link = await sealTransaction({ body: {
-    schemaView,
-    parameters: {},
-    guards: [],
-    requiredCapabilities: [],
-    statements: [{
-      kind: 'statement.insert',
-      relation: { relationId: 'golden.folder-entry', schemaView },
-      rows: [{
-        entryId: { kind: 'literal', value: 'a-folder-c' },
-        kind: { kind: 'literal', value: 'folder' },
-        targetId: { kind: 'literal', value: 'C' },
-        ref: { kind: 'literal', value: 'automerge:C' }
-      }]
-    }]
-  } });
+    operationId: 'golden:link:C',
+    transactionHash: hash('b'),
+    intentHash: hash('c'),
+    attachmentId: 'golden:folder:A:attachment',
+    attachmentFingerprint: hash('f'),
+    sourceId: 'golden:folder:A',
+    outcome: 'rejected',
+    beforeBasis: { incarnation: 'golden:folder:A:1', revision: 0 },
+    statementResults: [],
+    issues: [createIssue({
+      code: 'transaction.expected_basis_stale',
+      sourceId: 'golden:folder:A',
+      operationId: 'golden:link:C',
+      retry: 'after_refresh'
+    })]
+  };
   return executeSequence({
     sequenceId: 'golden:patchpit:create-and-link:C',
     steps: [
       { stepId: 'create-source', run: () => lifecycle.execute(create) },
-      { stepId: 'link-folder-entry', run: () => folder.commit({
-        operationEpoch: 'golden:folder:A:operations:1',
-        operationId: 'golden:link:C',
-        attachmentId: 'golden:folder:A:attachment',
-        expectedBasis: { incarnation: 'stale-folder-incarnation', revision: 0 },
-        transaction: link
-      }) }
+      { stepId: 'link-folder-entry', run: async () => staleLinkReceipt }
     ]
   });
 };

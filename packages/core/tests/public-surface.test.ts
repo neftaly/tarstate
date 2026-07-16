@@ -1,13 +1,11 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as root from '../src/root.js';
 import * as artifacts from '@tarstate/core/artifacts';
-import * as attachmentPreparation from '@tarstate/core/attachment/prepare';
-import * as attachmentTransactions from '@tarstate/core/attachment/transact';
+import * as attachmentAdapter from '@tarstate/core/attachment/adapter';
 import * as capabilities from '@tarstate/core/capabilities';
 import * as database from '@tarstate/core/database';
 import * as databaseIncremental from '@tarstate/core/database/incremental';
 import * as databaseObserver from '@tarstate/core/database/observer';
-import * as foundation from '@tarstate/core/foundation';
 import * as query from '@tarstate/core/query';
 import * as queryAuthoring from '@tarstate/core/query/authoring';
 import * as queryEvaluate from '@tarstate/core/query/evaluate';
@@ -24,9 +22,8 @@ import type { PreparedPlan } from '@tarstate/core/query';
 import type { AtomicSource } from '@tarstate/core/source';
 
 describe('topic-focused core surface', () => {
-  it('keeps the package root identical to the small foundation entry', () => {
-    expect(Object.keys(root).sort()).toEqual(Object.keys(foundation).sort());
-    expect(root.safeParseArtifactText).toBe(foundation.safeParseArtifactText);
+  it('keeps the package root limited to portable foundation values', () => {
+    expect(root.safeParseArtifactText).toBeTypeOf('function');
     expect('evaluateQuery' in root).toBe(false);
     expect('DatabaseView' in root).toBe(false);
     expect('executePreparedTransaction' in root).toBe(false);
@@ -34,9 +31,11 @@ describe('topic-focused core surface', () => {
 
   it('exposes runtime features only from their topic entries', () => {
     expect(artifacts.ExactArtifactResolver).toBeTypeOf('function');
-    expect(attachmentPreparation.prepareDatabaseAttachment).toBeTypeOf('function');
+    expect(attachmentAdapter.prepareDatabaseAttachment).toBeTypeOf('function');
     expect(capabilities.CapabilityRegistry).toBeTypeOf('function');
     expect(database.DatabaseView).toBeTypeOf('function');
+    expect('prepareDatabaseAttachment' in database).toBe(false);
+    expect('coordinateSourceCommit' in database).toBe(false);
     expect('InMemoryAtomicSource' in database).toBe(false);
     expect(databaseIncremental.createIncrementalDatabaseQueryMaintenance).toBeTypeOf('function');
     expect(queryEvaluate.evaluateQuery).toBe(query.evaluateQuery);
@@ -52,7 +51,7 @@ describe('topic-focused core surface', () => {
     expect('typedPreparedPlan' in query).toBe(false);
     expect(queryAuthoring.typedSelect).toBe(query.typedSelect);
     expect(schema.prepareSchema).toBeTypeOf('function');
-    expect(attachmentTransactions.createAttachmentTransactionService).toBeTypeOf('function');
+    expect(attachmentAdapter.createAttachmentTransactionService).toBeTypeOf('function');
     expect('prepareWritableExecutionContext' in transactions).toBe(false);
     expect('executePreparedTransaction' in transactions).toBe(false);
     expect('simulatePreparedTransaction' in transactions).toBe(false);

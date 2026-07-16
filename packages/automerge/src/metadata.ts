@@ -8,7 +8,7 @@ import {
   type CapabilityRef,
   type Issue,
   type JsonValue
-} from '@tarstate/core/foundation';
+} from '@tarstate/core';
 import type {
   GovernanceCommand,
   GovernanceConstraintSection,

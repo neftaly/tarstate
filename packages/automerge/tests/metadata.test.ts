@@ -11,12 +11,10 @@ import { automergeIssueDeclarations } from '../src/issues.js';
 import {
   applyAutomergeMetadataPlan,
   automergeGovernanceSourceAdapter,
-  automergeMetadataProperty,
   planAutomergeMetadataMutation,
   readAutomergeMetadata
 } from '../src/metadata.js';
 import { AutomergeSourceRuntime, automergeBasis } from '../src/source.js';
-import { AutomergeMapProjectionPlanner, snapshotAutomergeDocument } from '../src/storage-binding.js';
 import { projectAutomergeFacts } from '../src/projection.js';
 
 type MetadataDoc = {
@@ -212,20 +210,10 @@ describe('Automerge bootstrap metadata', () => {
     expect(await coordinator.execute(stale)).toBe(staleReceipt);
   });
 
-  it('keeps reserved metadata out of bindings and facts and rejects direct writes', () => {
+  it('keeps reserved metadata out of projected facts', () => {
     const doc = docFrom({ app: { value: 'visible' }, __tarstateMetaV1: carrier(), __tarstateMetaV2: { future: true } });
-    const binding = new AutomergeMapProjectionPlanner<MetadataDoc, Readonly<Record<string, import('@tarstate/core').JsonValue>>>({
-      relationId: 'relation:root', collectionPath: [], missingCollection: 'invalid', keySource: 'map-key'
-    });
-    const snapshot = snapshotAutomergeDocument('source:metadata', doc);
-    expect(binding.project(snapshot).rows.map(({ key }) => key[0])).toEqual(['app']);
-    expect(binding.plan(snapshot, [{ kind: 'replace', path: [automergeMetadataProperty, 'storage'], value: {} }])).toMatchObject({
-      commands: [], issues: [{ code: 'automerge.reserved_metadata_write' }]
-    });
-    expect(binding.plan(snapshot, [{ kind: 'replace', path: ['__tarstateMetaV2'], value: {} }])).toMatchObject({
-      commands: [], issues: [{ code: 'automerge.reserved_metadata_write' }]
-    });
     const facts = projectAutomergeFacts(doc);
+    expect(facts.properties).toContainEqual(expect.objectContaining({ path: ['app', 'value'] }));
     expect(facts.properties.some(({ path }) => typeof path[0] === 'string' && path[0].startsWith('__tarstateMetaV'))).toBe(false);
     expect(facts.objects.some(({ path }) => typeof path[0] === 'string' && path[0].startsWith('__tarstateMetaV'))).toBe(false);
   });

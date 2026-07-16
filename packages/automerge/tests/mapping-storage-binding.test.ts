@@ -17,10 +17,10 @@ import {
 } from '@tarstate/core/transactions';
 import {
   createAttachmentTransactionService,
+  prepareDatabaseAttachment,
   type AttachmentTransactionSnapshot
-} from '@tarstate/core/attachment/transact';
-import { prepareDatabaseAttachment } from '@tarstate/core/attachment/prepare';
-import type { JsonValue } from '@tarstate/core/foundation';
+} from '@tarstate/core/attachment/adapter';
+import type { JsonValue } from '@tarstate/core';
 import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource

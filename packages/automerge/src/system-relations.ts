@@ -2,7 +2,7 @@ import {
   canonicalizeJson,
   createIssue,
   type JsonValue
-} from '@tarstate/core/foundation';
+} from '@tarstate/core';
 import type { ObserverDiagnosticReporter } from '@tarstate/core/database/observer';
 import type { SchemaBody } from '@tarstate/core/schema';
 import type { AutomergeConflictFact } from './projection.js';
