@@ -124,7 +124,7 @@
     "bench": "node ../../scripts/v1-coarse-benchmark.mjs",
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",
     "test": "vitest run --config ../../vite.config.ts tests/*.test.ts",
-    "test:fuzz": "vitest run --config ../../vite.config.ts tests/fuzz-properties.test.ts tests/*.fuzz.test.ts",
+    "test:fuzz": "vitest run --config ../../vite.config.ts tests/*.fuzz.spec.ts",
     "typecheck:budget": "tsc -p type-fixtures/tsconfig.json --extendedDiagnostics --pretty false | node scripts/check-type-budget.mjs",
     "typecheck": "tsc -p ../../tsconfig.json --noEmit"
   },
