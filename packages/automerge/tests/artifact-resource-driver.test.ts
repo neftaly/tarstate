@@ -9,7 +9,7 @@ import {
   automergeArtifactResourceDriver,
   extractAutomergeArtifactCarrier,
   type AutomergeArtifactCarrierRepo
-} from '../src/index.js';
+} from '../src/artifact-resource-driver.js';
 
 describe('Automerge artifact resource driver', () => {
   it('extracts inert carrier data and heads, then releases the temporary lease', async () => {

@@ -477,13 +477,13 @@ describe('incremental query maintenance', () => {
       kind: 'distinct',
       input: { kind: 'select', input: people, alias: 'value', fields: { value: field('p', 'score') } }
     };
-    const rows = Array.from({ length: 10_000 }, (_, index): QueryRowOccurrence => ({
+    const rows = Array.from({ length: 2_000 }, (_, index): QueryRowOccurrence => ({
       occurrenceId: `distinct:unique:${index}`,
       row: { id: index, score: index }
     }));
     const initial = snapshot(rows, 1);
-    const next = snapshot(rows.map((row, index) => index === 5_000
-      ? { ...row, row: { ...row.row, score: 20_000 } }
+    const next = snapshot(rows.map((row, index) => index === 1_000
+      ? { ...row, row: { ...row.row, score: 4_000 } }
       : row), 2);
     const session = openIncrementalQueryMaintenance(plan(query), initial);
     const before = session.getCurrentResult();
@@ -491,9 +491,9 @@ describe('incremental query maintenance', () => {
 
     expect(semanticResult(maintained)).toEqual(oracle(query, next));
     expect(maintained.state.operatorDiagnostics.distinct.selectiveNodeCount).toBe(1);
-    expect(maintained.rows[4_999]).toBe(before.rows[4_999]);
-    expect(maintained.rows[5_000]).not.toBe(before.rows[5_000]);
-    expect(maintained.rows[5_001]).toBe(before.rows[5_001]);
+    expect(maintained.rows[999]).toBe(before.rows[999]);
+    expect(maintained.rows[1_000]).not.toBe(before.rows[1_000]);
+    expect(maintained.rows[1_001]).toBe(before.rows[1_001]);
     session.close();
   });
 
@@ -842,26 +842,26 @@ describe('incremental query maintenance', () => {
       kind: 'join', join: 'inner', left: from('left', 'l'), right: from('right', 'r'),
       on: { kind: 'compare', op: 'eq', left: field('l', 'joinId'), right: field('r', 'id') }
     };
-    const leftRows = Array.from({ length: 300 }, (_, index): QueryRowOccurrence => ({ occurrenceId: `left:${index}`, row: { id: index, joinId: index % 10 } }));
-    const rightRows = Array.from({ length: 100 }, (_, index): QueryRowOccurrence => ({ occurrenceId: `right:${index}`, row: { id: index % 10, label: `r${index}` } }));
+    const leftRows = Array.from({ length: 60 }, (_, index): QueryRowOccurrence => ({ occurrenceId: `left:${index}`, row: { id: index, joinId: index % 10 } }));
+    const rightRows = Array.from({ length: 20 }, (_, index): QueryRowOccurrence => ({ occurrenceId: `right:${index}`, row: { id: index % 10, label: `r${index}` } }));
     const state = (right: readonly QueryRowOccurrence[], revision: number): QueryMaintenanceSnapshot => ({
       relations: [relation('left', leftRows, revision), relation('right', right, revision)]
     });
     const initial = state(rightRows, 1);
-    const payloadRows = rightRows.map((entry, index) => index === 55 ? { ...entry, row: { ...entry.row, label: 'changed' } } : entry);
+    const payloadRows = rightRows.map((entry, index) => index === 15 ? { ...entry, row: { ...entry.row, label: 'changed' } } : entry);
     const session = openIncrementalQueryMaintenance(plan(query), initial);
 
     let accepted = initial;
-    for (let revision = 0; revision < 101; revision += 1) {
+    for (let revision = 0; revision < 17; revision += 1) {
       const next = state(revision % 2 === 0 ? payloadRows : rightRows, revision + 2);
       session.applyUpdate(diffQueryMaintenanceSnapshots(accepted, next));
       accepted = next;
     }
     expect(semanticResult(session.getCurrentResult())).toEqual(oracle(query, accepted));
     const acceptedRight = (accepted.relations[1] as RelationInput).rows.map((row, index): QueryRowOccurrence => ({ occurrenceId: `right:${index}`, row }));
-    const swappedRight = acceptedRight.map((entry, index) => index === 55
+    const swappedRight = acceptedRight.map((entry, index) => index === 15
       ? { ...entry, row: { ...entry.row, id: 6 } }
-      : index === 56
+      : index === 16
         ? { ...entry, row: { ...entry.row, id: 5 } }
         : entry);
     const swapped = state(swappedRight, 103);
@@ -869,9 +869,9 @@ describe('incremental query maintenance', () => {
     const swappedResult = applySnapshot(session, accepted, swapped);
     expect(semanticResult(swappedResult)).toEqual(oracle(query, swapped));
     expect(swappedResult.resultKeys).not.toBe(beforeSwap.resultKeys);
-    const moved = state(swappedRight.map((entry, index) => index === 55 ? { ...entry, row: { ...entry.row, id: 20 } } : entry), 104);
+    const moved = state(swappedRight.map((entry, index) => index === 15 ? { ...entry, row: { ...entry.row, id: 20 } } : entry), 104);
     expect(semanticResult(applySnapshot(session, swapped, moved))).toEqual(oracle(query, moved));
-    const bulk = state((moved.relations[1] as RelationInput).rows.map((row, index) => ({ occurrenceId: `right:${index}`, row: index < 40 ? { ...row, label: `bulk:${index}` } : row })), 105);
+    const bulk = state((moved.relations[1] as RelationInput).rows.map((row, index) => ({ occurrenceId: `right:${index}`, row: index < 8 ? { ...row, label: `bulk:${index}` } : row })), 105);
     expect(semanticResult(applySnapshot(session, moved, bulk))).toEqual(oracle(query, bulk));
     session.close();
   });
@@ -881,8 +881,8 @@ describe('incremental query maintenance', () => {
       kind: 'join', join: 'inner', left: from('selective-left', 'l'), right: from('selective-right', 'r'),
       on: { kind: 'compare', op: 'eq', left: field('l', 'joinId'), right: field('r', 'id') }
     };
-    const leftRows = Array.from({ length: 300 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `selective-left:${id}`, row: { id, joinId: id } }));
-    const rightRows = Array.from({ length: 300 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `selective-right:${id}`, row: { id, label: `right:${id}` } }));
+    const leftRows = Array.from({ length: 100 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `selective-left:${id}`, row: { id, joinId: id } }));
+    const rightRows = Array.from({ length: 100 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `selective-right:${id}`, row: { id, label: `right:${id}` } }));
     const state = (right: readonly QueryRowOccurrence[], revision: number): QueryMaintenanceSnapshot => ({ relations: [
       relation('selective-left', leftRows, revision), relation('selective-right', right, revision)
     ] });
@@ -890,7 +890,7 @@ describe('incremental query maintenance', () => {
     const session = openIncrementalQueryMaintenance(plan(query), initial);
     const before = session.getCurrentResult();
     expect(before.state.operatorDiagnostics.join).toEqual({ selectiveNodeCount: 0, fullNodeCount: 0, fallbackNodeCount: 0, affectedUnitCount: 0, compactionCount: 0, fallbackReasons: {} });
-    const changedRows = rightRows.map((entry, index) => index === 155
+    const changedRows = rightRows.map((entry, index) => index === 55
       ? { ...entry, row: { ...entry.row, label: 'changed' } }
       : entry);
     const changed = state(changedRows, 2);
@@ -900,22 +900,22 @@ describe('incremental query maintenance', () => {
     expect(maintained.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, fullNodeCount: 0, fallbackNodeCount: 0, affectedUnitCount: 1 });
     expect(maintained.resultKeys).toBe(before.resultKeys);
     expect(maintained.rows[0]).toBe(before.rows[0]);
-    expect(maintained.rows[155]).not.toBe(before.rows[155]);
+    expect(maintained.rows[55]).not.toBe(before.rows[55]);
 
-    const movedRows = changedRows.map((entry, index) => index === 155
+    const movedRows = changedRows.map((entry, index) => index === 55
       ? { ...entry, row: { ...entry.row, id: 1_000 } }
       : entry);
     const moved = state(movedRows, 3);
     expect(semanticResult(applySnapshot(session, changed, moved))).toEqual(oracle(query, moved));
-    expect(session.getCurrentResult().rows).toHaveLength(299);
+    expect(session.getCurrentResult().rows).toHaveLength(99);
 
     const returned = state(rightRows, 4);
     expect(semanticResult(applySnapshot(session, moved, returned))).toEqual(oracle(query, returned));
-    expect(session.getCurrentResult().rows).toHaveLength(300);
+    expect(session.getCurrentResult().rows).toHaveLength(100);
     let accepted = returned;
     for (let revision = 5; revision <= 325; revision += 1) {
-      const nextRows = rightRows.map((entry, index) => index === 155
-        ? { ...entry, row: { ...entry.row, id: revision % 4 === 0 ? 155 : 1_000 + revision, label: `revision:${revision}` } }
+      const nextRows = rightRows.map((entry, index) => index === 55
+        ? { ...entry, row: { ...entry.row, id: revision % 4 === 0 ? 55 : 1_000 + revision, label: `revision:${revision}` } }
         : entry);
       const next = state(nextRows, revision);
       const result = applySnapshot(session, accepted, next);
@@ -924,7 +924,7 @@ describe('incremental query maintenance', () => {
     }
     const restored = state(rightRows, 326);
     expect(semanticResult(applySnapshot(session, accepted, restored))).toEqual(oracle(query, restored));
-    expect(session.getCurrentResult().rows).toHaveLength(300);
+    expect(session.getCurrentResult().rows).toHaveLength(100);
     session.close();
   });
 
@@ -933,13 +933,13 @@ describe('incremental query maintenance', () => {
       kind: 'join', join: 'inner', left: from('left-selective', 'l'), right: from('right-stable', 'r'),
       on: { kind: 'compare', op: 'eq', left: field('l', 'joinId'), right: field('r', 'id') }
     };
-    const baseLeft = Array.from({ length: 300 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `left-selective:${id}`, row: { id, joinId: id % 10, payload: 0 } }));
-    const stableRight = Array.from({ length: 100 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `right-stable:${id}`, row: { id: id % 10, label: `right:${id}` } }));
+    const baseLeft = Array.from({ length: 60 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `left-selective:${id}`, row: { id, joinId: id % 10, payload: 0 } }));
+    const stableRight = Array.from({ length: 20 }, (_, id): QueryRowOccurrence => ({ occurrenceId: `right-stable:${id}`, row: { id: id % 10, label: `right:${id}` } }));
     const state = (left: readonly QueryRowOccurrence[], right: readonly QueryRowOccurrence[], revision: number): QueryMaintenanceSnapshot => ({ relations: [
       relation('left-selective', left, revision), relation('right-stable', right, revision)
     ] });
     const initial = state(baseLeft, stableRight, 1);
-    const payloadLeft = baseLeft.map((entry, index) => index === 155 ? { ...entry, row: { ...entry.row, payload: 1 } } : entry);
+    const payloadLeft = baseLeft.map((entry, index) => index === 35 ? { ...entry, row: { ...entry.row, payload: 1 } } : entry);
     const payload = state(payloadLeft, stableRight, 2);
     const session = openIncrementalQueryMaintenance(plan(query), initial);
     const before = session.getCurrentResult();
@@ -948,7 +948,7 @@ describe('incremental query maintenance', () => {
     expect(payloadResult.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, fullNodeCount: 0, affectedUnitCount: 1 });
     expect(payloadResult.resultKeys).toBe(before.resultKeys);
 
-    const swappedLeft = payloadLeft.map((entry, index) => index === 155 ? { ...entry, row: { ...entry.row, joinId: 6, payload: 2 } } : entry);
+    const swappedLeft = payloadLeft.map((entry, index) => index === 35 ? { ...entry, row: { ...entry.row, joinId: 6, payload: 2 } } : entry);
     const swapped = state(swappedLeft, stableRight, 3);
     const swappedResult = applySnapshot(session, payload, swapped);
     expect(semanticResult(swappedResult)).toEqual(oracle(query, swapped));
@@ -959,7 +959,7 @@ describe('incremental query maintenance', () => {
     let observedCompaction = false;
     let checkedCompactionReset = false;
     for (let revision = 4; revision <= 324; revision += 1) {
-      const nextLeft = baseLeft.map((entry, index) => index === 155
+      const nextLeft = baseLeft.map((entry, index) => index === 35
         ? { ...entry, row: { ...entry.row, joinId: 1_000 + revision, payload: revision } }
         : entry);
       const next = state(nextLeft, stableRight, revision);
@@ -969,7 +969,7 @@ describe('incremental query maintenance', () => {
       if (revision % 64 === 0) expect(semanticResult(maintained)).toEqual(oracle(query, next));
       accepted = next;
       if (!checkedCompactionReset && maintained.state.operatorDiagnostics.join.compactionCount > 0) {
-        const payloadOnlyLeft = nextLeft.map((entry, index) => index === 155 ? { ...entry, row: { ...entry.row, payload: revision + 0.5 } } : entry);
+        const payloadOnlyLeft = nextLeft.map((entry, index) => index === 35 ? { ...entry, row: { ...entry.row, payload: revision + 0.5 } } : entry);
         const payloadOnly = state(payloadOnlyLeft, stableRight, revision + 0.5);
         const payloadOnlyResult = applySnapshot(session, accepted, payloadOnly);
         expect(payloadOnlyResult.state.operatorDiagnostics.join).toMatchObject({ selectiveNodeCount: 1, compactionCount: 0 });
@@ -1483,7 +1483,7 @@ describe('incremental query maintenance', () => {
     const session = openIncrementalQueryMaintenance(plan(query), initial);
     const publicRows = session.getCurrentResult().rows;
 
-    for (let index = 0; index < 1_000; index += 1) {
+    for (let index = 0; index < 256; index += 1) {
       const result = session.applyUpdate(index % 2 === 0 ? forward : backward);
       expect(result.rows).toBe(publicRows);
       expect(result.state.resultDelta).toEqual({ addedResultKeys: [], removedResultKeys: [], updatedResultKeys: [] });

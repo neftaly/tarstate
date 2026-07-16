@@ -3,8 +3,6 @@ export {
   capabilityRefKey,
   diffQueryMaintenanceSnapshots,
   evaluateExpression,
-  evaluatePreparedExpression,
-  evaluatePreparedQuery,
   evaluateQuery,
   openIncrementalQueryMaintenance,
   prepareExpression,
@@ -20,7 +18,6 @@ export type {
   IncrementalQueryResult,
   IncrementalQueryResultDelta,
   OrderTerm,
-  PreparedQueryRequest,
   PreparedExpression,
   QueryCursor,
   QueryExecutionBudget,
@@ -44,7 +41,6 @@ export type {
 } from '../query.js';
 export type { PreparedPlan } from '../query-plan-contract.js';
 export * from '../query-builder.js';
-export * from '../query-plan.js';
 export {
   prepareTypedQuery,
   typedAnd,
@@ -58,7 +54,6 @@ export {
   typedOr,
   typedOrderBy,
   typedParameter,
-  typedPreparedPlan,
   typedQueryBody,
   typedSelect,
   typedSourceOf,

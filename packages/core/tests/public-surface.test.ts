@@ -16,7 +16,6 @@ import * as queryModel from '@tarstate/core/query/model';
 import * as queryPrepare from '@tarstate/core/query/prepare';
 import * as schema from '@tarstate/core/schema';
 import * as source from '@tarstate/core/source';
-import * as sourceProjection from '@tarstate/core/source/projection';
 import * as transactions from '@tarstate/core/transactions';
 import * as transactionAuthoring from '@tarstate/core/transactions/authoring';
 import type { DocumentDeclaration } from '@tarstate/core/attachment';
@@ -40,9 +39,16 @@ describe('topic-focused core surface', () => {
     expect(database.DatabaseView).toBeTypeOf('function');
     expect(databaseIncremental.createIncrementalDatabaseQueryMaintenance).toBeTypeOf('function');
     expect(queryEvaluate.evaluateQuery).toBe(query.evaluateQuery);
+    expect('evaluatePreparedQuery' in queryEvaluate).toBe(false);
+    expect('evaluatePreparedQuery' in query).toBe(false);
+    expect('evaluatePreparedExpression' in queryEvaluate).toBe(false);
+    expect('evaluatePreparedExpression' in query).toBe(false);
     expect(queryIncremental.openIncrementalQueryMaintenance).toBe(query.openIncrementalQueryMaintenance);
-    expect(queryIncremental.createQueryOccurrenceIds).toBeTypeOf('function');
     expect(queryPrepare.prepareQuery).toBe(query.prepareQuery);
+    expect('preparePlan' in queryPrepare).toBe(false);
+    expect('preparePlan' in query).toBe(false);
+    expect('typedPreparedPlan' in queryAuthoring).toBe(false);
+    expect('typedPreparedPlan' in query).toBe(false);
     expect(queryAuthoring.typedSelect).toBe(query.typedSelect);
     expect(schema.prepareSchema).toBeTypeOf('function');
     expect(attachmentTransactions.createAttachmentTransactionService).toBeTypeOf('function');
@@ -52,23 +58,9 @@ describe('topic-focused core surface', () => {
     expect(transactionAuthoring.sealTransaction).toBe(transactions.sealTransaction);
   });
 
-  it('creates immutable occurrence identities at the incremental input boundary', () => {
-    const rows = [{ id: 'first' }, { id: 'second' }];
-    const visited: number[] = [];
-    const occurrenceIds = queryIncremental.createQueryOccurrenceIds(rows, (row, index) => {
-      visited.push(index);
-      return `${row.id}:${index}`;
-    });
-
-    expect(occurrenceIds).toEqual(['first:0', 'second:1']);
-    expect(visited).toEqual([0, 1]);
-    expect(Object.isFrozen(occurrenceIds)).toBe(true);
-  });
-
   it('keeps deliberately type-only and narrow runtime entries narrow', () => {
     expect(Object.keys(source)).toEqual([]);
     expect(Object.keys(queryModel)).toEqual([]);
-    expect(Object.keys(sourceProjection)).toEqual(['sealStorageProjection']);
     expect('prepareQuery' in queryEvaluate).toBe(false);
     expect('prepareQueryMaintenanceSnapshot' in queryEvaluate).toBe(false);
     expect('prepareQueryMaintenanceSnapshot' in query).toBe(false);
@@ -83,40 +75,18 @@ describe('topic-focused core surface', () => {
     expectTypeOf<DocumentDeclaration>().toMatchTypeOf<import('../src/attachment-model.js').DocumentDeclaration>();
   });
 
-  it('publishes immutable constants and adopts sealed storage projections', () => {
+  it('publishes immutable constants', () => {
     expect(Object.isFrozen(root.artifactKinds)).toBe(true);
     expect(Object.isFrozen(root.defaultArtifactParseBudget)).toBe(true);
     expect(Object.isFrozen(root.defaultValueParseBudget)).toBe(true);
     expect(Object.isFrozen(root.builtInCapabilityRefs)).toBe(true);
     expect(Object.values(root.builtInCapabilityRefs).every(Object.isFrozen)).toBe(true);
     expect(Object.isFrozen(root.builtInCapabilityDeclarations)).toBe(true);
-
-    const input = Object.freeze({
-      rows: Object.freeze([Object.freeze({
-        relationId: 'test.row',
-        key: Object.freeze(['one']),
-        fields: Object.freeze({ nested: Object.freeze({ value: 1 }) }),
-        locator: Object.freeze(['one'])
-      })]),
-      completeness: 'exact' as const,
-      issues: Object.freeze([])
-    });
-    const sealed = sourceProjection.sealStorageProjection(input);
-    expect(sealed).toBe(input);
-    expect(Object.isFrozen(sealed)).toBe(true);
-    expect(Object.isFrozen(sealed.rows)).toBe(true);
-    expect(Object.isFrozen(sealed.rows[0])).toBe(true);
-    expect(Object.isFrozen(sealed.rows[0]?.fields.nested)).toBe(true);
-    expect(() => sourceProjection.sealStorageProjection({
-      rows: [{ relationId: 'test.row', key: ['one'], fields: {}, locator: ['one'] }],
-      completeness: 'exact',
-      issues: []
-    } as never)).toThrow(TypeError);
   });
 
   it('shares provenance across focused query entries', async () => {
     const queryRoot = { kind: 'values', alias: 'value', rows: [{ id: 1 }] } as const;
     const prepared = await queryPrepare.prepareQuery({ root: queryRoot, registryFingerprint: 'registry:test', authorityFingerprint: 'authority:test', datasetId: 'dataset:test' });
-    expect(queryEvaluate.evaluatePreparedQuery(prepared, { relations: [] }).rows).toEqual([{ id: 1 }]);
+    expect(queryEvaluate.evaluateQuery({ root: prepared, relations: [] }).rows).toEqual([{ id: 1 }]);
   });
 });

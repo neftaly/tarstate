@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import {
   AutomergeSystemRelationState,
   projectAutomergeFacts
-} from '../packages/automerge/dist/index.js';
+} from '../packages/automerge/dist/internal-benchmark.js';
 
 const requireFromAutomerge = createRequire(new URL('../packages/automerge/package.json', import.meta.url));
 const Automerge = await import(pathToFileURL(requireFromAutomerge.resolve('@automerge/automerge')).href);

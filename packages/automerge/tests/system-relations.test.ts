@@ -4,9 +4,9 @@ import {
   AutomergeSystemRelationState,
   automergeSystemRelationIds,
   automergeSystemSchema,
-  materializeAutomergeConflictRows,
-  type AutomergeConflictFact
-} from '../src/index.js';
+  materializeAutomergeConflictRows
+} from '../src/system-relations.js';
+import type { AutomergeConflictFact } from '../src/projection.js';
 
 describe('Automerge system relations', () => {
   it('declares the five normalized relations with measured identity keys', () => {

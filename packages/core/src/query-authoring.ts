@@ -1,6 +1,5 @@
 import { canonicalizeJson, type ArtifactRef } from './artifacts.js';
 import type { CapabilityRef } from './issues.js';
-import { assertPreparedPlan } from './internal-prepared-plan.js';
 import type { PipeOperator, PipeType } from './internal-pipe.js';
 import { stringTupleKey } from './internal-string-key.js';
 import type { QueryArtifact, QueryArtifactBody, ValueDeclaration } from './query-builder.js';
@@ -306,20 +305,6 @@ export type PreparedPlanRow<Plan> = Plan extends { readonly [preparedPlanRow]?: 
 /** Exact parameter object inferred from a typed prepared plan. */
 export type PreparedPlanParameters<Plan> = Plan extends { readonly [preparedPlanParameters]?: (parameters: infer Parameters) => unknown } ? Parameters : never;
 
-/** Attaches query inference to a plan with the same portable query semantics. */
-export const typedPreparedPlan = <
-  Aliases extends TypedAliases,
-  Parameters extends Readonly<Record<string, ValueDeclaration>>,
-  Row
->(
-  plan: PreparedPlan<QueryNode>,
-  query: TypedQuery<Aliases, Parameters, Row>
-): TypedPreparedPlan<QueryNode, Row, { readonly [Name in keyof Parameters]: ValueOfDeclaration<Parameters[Name]> }> => {
-  assertPreparedPlan(plan);
-  if (canonicalizeJson(plan.query as JsonValue) !== canonicalizeJson(query.root as JsonValue)) throw new Error('Prepared plan root does not match the typed query');
-  return plan;
-};
-
 /** Prepares a typed query while preserving its inferred row and parameter types. */
 export const prepareTypedQuery = async <
   Aliases extends TypedAliases,
@@ -333,7 +318,7 @@ export const prepareTypedQuery = async <
     readonly datasetId: string;
   }
 ): Promise<TypedPreparedPlan<QueryNode, Row, { readonly [Name in keyof Parameters]: ValueOfDeclaration<Parameters[Name]> }>> =>
-  typedPreparedPlan(await prepareQuery({ root: query.root, ...options }), query);
+  prepareQuery({ root: query.root, ...options });
 
 export type RuntimeTypedQuery = QueryArtifact;
 export type RuntimeQueryParameters = QueryParametersOf<RuntimeTypedQuery>;

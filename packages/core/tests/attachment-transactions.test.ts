@@ -93,8 +93,7 @@ describe('attachment transaction service', () => {
     });
     await expect(service.simulate(
       { kind: 'preview-title' },
-      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Preview' } })),
-      { operationId: 'operation:preview' }
+      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Preview' } }))
     )).resolves.toMatchObject({ outcome: 'would-commit', statementResults: [{ logicallyChanged: 1 }] });
     expect(source.snapshot()).toMatchObject({ storage: { 'test.item': [{ title: 'Old', count: 1 }] } });
     const commitDirect = source.commit;
@@ -122,8 +121,7 @@ describe('attachment transaction service', () => {
 
     const receipt = await service.transact(
       { kind: 'set-title-from-count' },
-      transform,
-      { operationId: 'operation:replayable' }
+      transform
     );
 
     expect(receipt).toMatchObject({ outcome: 'committed', statementResults: [{ logicallyChanged: 1 }] });
@@ -155,18 +153,12 @@ describe('attachment transaction service', () => {
         replayCount += 1;
         if (replayCount > 1) throw new Error('impure replay');
         return rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Never committed' } }));
-      },
-      { operationId: 'operation:replay-failure' }
+      }
     );
     expect(replayFailure).toMatchObject({
       outcome: 'rejected',
       issues: [{ code: 'transaction.unexpected_failure', details: { timing: 'reconciliation', error: 'Error' } }]
     });
-    await expect(service.transact(
-      { kind: 'fail-on-replay' },
-      () => { throw new Error('completed operation must not replay'); },
-      { operationId: 'operation:replay-failure' }
-    )).resolves.toBe(replayFailure);
   });
 });
 

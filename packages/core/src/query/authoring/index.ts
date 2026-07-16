@@ -13,7 +13,6 @@ export {
   typedOr,
   typedOrderBy,
   typedParameter,
-  typedPreparedPlan,
   typedQueryBody,
   typedSelect,
   typedSourceOf,

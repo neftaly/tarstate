@@ -14,11 +14,11 @@ describe('cross-entry prepared-value provenance', () => {
 
     const loadedQueryEntry = await import('../src/query/index.js');
     const preparedExpression = root.prepareExpression({ kind: 'field', alias: 'row', name: 'value' });
-    expect(loadedQueryEntry.evaluatePreparedExpression(preparedExpression, { row: { value: 3 } })).toBe(3);
+    expect(loadedQueryEntry.evaluateExpression(preparedExpression, { row: { value: 3 } })).toBe(3);
 
     vi.resetModules();
     const query = await import('../src/query/index.js');
-    expect(query.evaluatePreparedExpression(preparedExpression, { row: { value: 3 } })).toBe(3);
+    expect(query.evaluateExpression(preparedExpression, { row: { value: 3 } })).toBe(3);
     const session = query.openIncrementalQueryMaintenance(plan, { relations: [] });
     expect(session.getCurrentResult().rows).toEqual([{ id: 1 }]);
     session.close();
@@ -39,7 +39,7 @@ describe('cross-entry prepared-value provenance', () => {
 
     expect(() => query.openIncrementalQueryMaintenance({ ...plan } as typeof plan, { relations: [] }))
       .toThrow('not produced by a plan preparation API');
-    expect(() => query.evaluatePreparedExpression({ ...preparedExpression } as typeof preparedExpression, { row: { value: 3 } }))
+    expect(() => query.evaluateExpression({ ...preparedExpression } as typeof preparedExpression, { row: { value: 3 } }))
       .toThrow('not produced by prepareExpression');
   });
 

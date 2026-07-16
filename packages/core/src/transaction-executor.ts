@@ -10,7 +10,6 @@ import {
   type OperationReservation
 } from './lifecycle-governance.js';
 import type { WritableLogicalRow, WritableLogicalState } from './logical-edit.js';
-import { isSealedStorageProjection } from './storage-projection.js';
 import {
   evaluateTransactionExpression,
   evaluateTransactionFields,
@@ -1111,8 +1110,6 @@ const mergeLogicalBindingProjection = (input: {
   const projectedRows: WritableLogicalRow[] = [];
   if (input.projection.completeness !== 'exact') {
     issues.push(createIssue({ code: 'observer.projection_unavailable', sourceId: input.sourceId, details: { bindingId: input.bindingId, completeness: input.projection.completeness } }));
-  } else if (isSealedStorageProjection(input.projection)) {
-    projectedRows.push(...input.projection.rows as readonly WritableLogicalRow[]);
   } else {
     for (const candidate of input.projection.rows) {
       if (!isProjectedRow(candidate)) {

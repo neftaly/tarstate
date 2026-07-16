@@ -28,7 +28,6 @@ export const corePublicEntryNames = [
   'query/prepare',
   'schema',
   'source',
-  'source/projection',
   'transactions',
   'transactions/authoring',
 ] as const;

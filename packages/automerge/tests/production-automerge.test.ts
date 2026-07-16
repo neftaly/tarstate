@@ -1,14 +1,18 @@
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  AutomergeMapProjectionPlanner,
-  AutomergeMapStorageBinding,
+  AutomergeMapStorageBinding
+} from '../src/core-adapter.js';
+import {
   AutomergeSourceRuntime,
   automergeBasis,
-  exactAutomergeBasisEqual,
-  projectAutomergeFacts,
+  exactAutomergeBasisEqual
+} from '../src/source.js';
+import { projectAutomergeFacts } from '../src/projection.js';
+import {
+  AutomergeMapProjectionPlanner,
   snapshotAutomergeDocument
-} from '../src/index.js';
+} from '../src/storage-binding.js';
 
 const actor = (digit: string): string => digit.repeat(64);
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;
@@ -296,7 +300,7 @@ describe('production Automerge adapter', () => {
     });
     const result = await runtime.commit({
       operationEpoch: 'epoch:1', operationId: 'operation:stale', intentHash: hash('d'),
-      expectedBasis: expectedBasis as unknown as import('../src/index.js').AutomergeBasis,
+      expectedBasis: expectedBasis as unknown as import('../src/source.js').AutomergeBasis,
       commands: [{ apply: command }]
     });
     expect(result).toMatchObject({ outcome: 'rejected', changed: false, issues: [{ code: 'transaction.expected_basis_stale' }] });

@@ -7,8 +7,13 @@ export const sealPreparedExpression = (expression: Expr): PreparedExpression => 
   return prepared;
 };
 
+export const isPreparedExpression = (value: unknown): value is PreparedExpression =>
+  (typeof value === 'object' || typeof value === 'function')
+  && value !== null
+  && provenanceRegistry.preparedExpressions.has(value);
+
 export const assertPreparedExpression = (value: PreparedExpression): void => {
-  if ((typeof value !== 'object' && typeof value !== 'function') || value === null || !provenanceRegistry.preparedExpressions.has(value)) {
+  if (!isPreparedExpression(value)) {
     throw new TypeError('Prepared expression was not produced by prepareExpression');
   }
 };

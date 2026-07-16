@@ -36,7 +36,6 @@
       "@tarstate/core/query/prepare": ["./packages/core/src/query/prepare/index.ts"],
       "@tarstate/core/schema": ["./packages/core/src/schema/index.ts"],
       "@tarstate/core/source": ["./packages/core/src/source/index.ts"],
-      "@tarstate/core/source/projection": ["./packages/core/src/source/projection/index.ts"],
       "@tarstate/core/transactions": ["./packages/core/src/transactions/index.ts"],
       "@tarstate/core/transactions/authoring": ["./packages/core/src/transactions/authoring/index.ts"],
       "@tarstate/automerge/values": ["./packages/automerge/src/values/index.ts"],

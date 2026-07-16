@@ -12,7 +12,6 @@ import {
   typedCompare,
   typedFrom,
   typedParameter,
-  typedPreparedPlan,
   typedWhere
 } from '@tarstate/core/query/authoring';
 import type { QueryNode } from '@tarstate/core/query/model';
@@ -65,7 +64,6 @@ const prepareRuntimePlan = () => prepareTypedQuery(query, {
   datasetId: 'dataset:one'
 });
 const runtimePlan = await prepareRuntimePlan();
-const prepared = typedPreparedPlan(runtimePlan, query);
 type RuntimePreparedPlan = Awaited<ReturnType<typeof prepareRuntimePlan>>;
 type Row = {
   readonly id: string;
@@ -112,9 +110,8 @@ void invalidPendingMutation;
 
 describe('React typed-query contract', () => {
   it('keeps type evidence phantom and the prepared plan unchanged', () => {
-    expect(prepared).toBe(runtimePlan);
-    expect(Object.keys(prepared)).not.toContain('__tarstateRowType');
-    expectTypeOf(prepared).toMatchTypeOf<ReactPreparedPlan<QueryNode, Row, Parameters>>();
+    expect(Object.keys(runtimePlan)).not.toContain('__tarstateRowType');
+    expectTypeOf(runtimePlan).toMatchTypeOf<ReactPreparedPlan<QueryNode, Row, Parameters>>();
     expectTypeOf<RuntimePreparedPlan>().toEqualTypeOf<ReactPreparedPlan<QueryNode, Row, Parameters>>();
   });
 });

@@ -20,7 +20,7 @@ describe('inert Automerge JSON adoption', () => {
     expect(Object.isFrozen((result.value as { readonly body: object }).body)).toBe(true);
     document = Automerge.change(document, (draft) => { draft.artifact.body.values.push(3); });
     expect(result.value).toEqual({ body: { values: [1, 2] }, id: 'artifact:one' });
-    expect(adoptAutomergeJsonValue).toBe(root.adoptAutomergeJsonValue);
+    expect('adoptAutomergeJsonValue' in root).toBe(false);
   });
 
   it('adopts the deterministic visible winner unless conflict auditing is requested', () => {

@@ -6,7 +6,6 @@ import {
   DatasetMembership
 } from '../packages/core/dist/database/index.js';
 import { createIncrementalDatabaseQueryMaintenance } from '../packages/core/dist/database/incremental/index.js';
-import { createQueryOccurrenceIds } from '../packages/core/dist/query/incremental/index.js';
 import { prepareManualReadOnlyAttachment } from '../packages/core/dist/attachment/prepare/index.js';
 import { prepareQuery } from '../packages/core/dist/query/index.js';
 
@@ -58,7 +57,7 @@ const openObserver = async (count) => {
         state: 'ready', issues: [], value: [{
           relation,
           rows: snapshot.storage.rows,
-          occurrenceIds: createQueryOccurrenceIds(snapshot.storage.rows, ({ id }) => 'row:' + id),
+          occurrenceIds: snapshot.storage.rows.map(({ id }) => 'row:' + id),
           completeness: 'exact',
           sourceId: source.sourceId,
           attachmentId,

@@ -25,7 +25,6 @@ import {
   type SourceSnapshot,
   type StorageBinding
 } from '@tarstate/core/source';
-import { sealStorageProjection } from '@tarstate/core/source/projection';
 import { conflictsAt, type AutomergePath, type AutomergeProjectionIssue } from './projection.js';
 import {
   automergeBasis,
@@ -305,7 +304,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
 
   project = (snapshot: SourceSnapshot<Automerge.Doc<T>>, requestedRelations?: ReadonlySet<string>): ProjectionResult<AutomergeProjectedRow<Row>> => {
     if (requestedRelations !== undefined && !requestedRelations.has(this.#relationId)) {
-      return sealStorageProjection(Object.freeze({ rows: Object.freeze([]), completeness: 'exact', issues: Object.freeze([]) }));
+      return Object.freeze({ rows: Object.freeze([]), completeness: 'exact', issues: Object.freeze([]) });
     }
     const adapted = readyAutomergeSnapshot(snapshot);
     if (adapted === undefined) return { rows: [], completeness: 'unknown', issues: [sourceStateIssue(snapshot.sourceId, snapshot.state)] };
@@ -313,11 +312,11 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     if (cached !== undefined) return cached;
     const projection = this.#projectionPlanner.project(adapted, this.#previousProjection);
     this.#previousProjection = { snapshot: { sourceId: adapted.sourceId, basis: adapted.basis }, projection };
-    const result = sealStorageProjection(Object.freeze({
+    const result = Object.freeze({
       rows: projection.rows,
       completeness: projection.completeness,
       issues: Object.freeze(projection.issues.map((issue) => projectionIssue(issue, snapshot.sourceId, this.#relationId, 'query')))
-    }));
+    });
     const bySource = this.#projections.get(adapted.storage) ?? new Map<string, ProjectionResult<AutomergeProjectedRow<Row>>>();
     if (!bySource.has(snapshot.sourceId) && bySource.size >= 64) bySource.delete(bySource.keys().next().value as string);
     bySource.set(snapshot.sourceId, result);

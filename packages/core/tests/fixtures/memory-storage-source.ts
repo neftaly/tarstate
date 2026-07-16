@@ -7,7 +7,6 @@ import { samePortableJson } from '../../src/internal-json-equality.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from '../../src/observer-diagnostics.js';
 import type { MemoryRow, MemoryState } from '../../src/memory-source.js';
 import type { WritableLogicalRow } from '../../src/logical-edit.js';
-import { sealStorageProjection } from '../../src/storage-projection.js';
 import type { SourceBasis, SourceSnapshot } from '../../src/source-state.js';
 import type {
   AtomicSource,
@@ -232,11 +231,11 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
         }));
       }
     }
-    const projection = sealStorageProjection(Object.freeze({
+    const projection = Object.freeze({
       rows: Object.freeze(rows),
       completeness: issues.length === 0 ? 'exact' as const : 'unknown' as const,
       issues: Object.freeze(issues)
-    }));
+    });
     const bySource = this.#projections.get(snapshot.storage) ?? new Map<string, ProjectionResult<WritableLogicalRow>>();
     if (!bySource.has(cacheKey) && bySource.size >= 64) bySource.delete(bySource.keys().next().value as string);
     bySource.set(cacheKey, projection);

@@ -21,8 +21,13 @@ export const sealOwnedPreparedPlan = <Query>(fields: PreparedPlanFields<Query>):
 
 export const hasOwnedPreparedQuery = (plan: PreparedPlan<unknown>): boolean => ownedPreparedPlans.has(plan);
 
+export const isPreparedPlan = <Query>(value: unknown): value is PreparedPlan<Query> =>
+  (typeof value === 'object' || typeof value === 'function')
+  && value !== null
+  && provenanceRegistry.preparedPlans.has(value);
+
 export const assertPreparedPlan = <Query>(value: PreparedPlan<Query>): void => {
-  if ((typeof value !== 'object' && typeof value !== 'function') || value === null || !provenanceRegistry.preparedPlans.has(value)) {
+  if (!isPreparedPlan(value)) {
     throw new TypeError('Prepared plan was not produced by a plan preparation API');
   }
 };

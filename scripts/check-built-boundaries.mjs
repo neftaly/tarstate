@@ -20,7 +20,6 @@ try {
   assertClosure('artifacts/storage-mapping/index.js', 90_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
-  assertClosure('source/projection/index.js', 6_000, []);
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/prepare/index.js', 140_000, ['internal-query-evaluator', 'semantic-query-artifact', 'semantic-schema-lens', 'transaction-']);
   assertClosure('attachment/transact/index.js', 180_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
@@ -106,7 +105,7 @@ async function verifyPackedDuplicateCopies() {
   }
 
   const expression = queryProducer.prepareExpression({ kind: 'literal', value: 11 });
-  if (queryConsumer.evaluatePreparedExpression(expression, {}) !== 11) {
+  if (queryConsumer.evaluateExpression(expression, {}) !== 11) {
     throw new Error('Duplicate query copy rejected a prepared expression');
   }
 
@@ -116,7 +115,7 @@ async function verifyPackedDuplicateCopies() {
     authorityFingerprint: 'authority:built-boundaries',
     datasetId: 'dataset:built-boundaries'
   });
-  if (queryConsumer.evaluatePreparedQuery(plan, { relations: [] }).rows[0]?.id !== 12) {
+  if (queryConsumer.evaluateQuery({ root: plan, relations: [] }).rows[0]?.id !== 12) {
     throw new Error('Duplicate query copy rejected a prepared plan');
   }
 }

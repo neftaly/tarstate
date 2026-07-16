@@ -1,5 +1,5 @@
 import { capabilityRefKey, createIssue, type CapabilityRef, type Issue } from './issues.js';
-import { assertPreparedExpression } from './internal-prepared-expression.js';
+import { assertPreparedExpression, isPreparedExpression } from './internal-prepared-expression.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import {
   adoptExpressionScope,
@@ -102,12 +102,17 @@ const publicExpressionValue = (result: QueryExpressionResult): EvaluationValue =
 
 /** Evaluates one expression using Tarstate missing/unknown three-valued semantics. */
 export const evaluateExpression = (
-  expression: Expr,
+  expression: Expr | PreparedExpression,
   row: Readonly<Record<string, QueryRecord>>,
   options: { readonly parameters?: Readonly<Record<string, JsonValue>>; readonly functions?: FunctionRegistry } = {}
 ): EvaluationValue => {
+  if (!isPreparedExpression(expression) && Object.hasOwn(expression, 'expression')) {
+    assertPreparedExpression(expression as unknown as PreparedExpression);
+  }
   const issues: Issue[] = [];
-  const ownedExpression = cloneAndFreezeExpression(expression);
+  const ownedExpression = isPreparedExpression(expression)
+    ? expression.expression
+    : cloneAndFreezeExpression(expression);
   const scoped: QueryExpressionRow = { scope: adoptExpressionScope(row), provenance: {} };
   const parameters = options.parameters === undefined ? {} : adoptJsonRecord(options.parameters, 'Query expression parameters');
   return publicExpressionValue(evaluateQueryExpression(ownedExpression, {

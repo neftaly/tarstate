@@ -5,9 +5,9 @@ The Automerge source and storage bindings for Tarstate v1.
 This package depends on `@tarstate/core` and reports adapter-specific
 projection and conflict guarantees through portable receipts and capabilities.
 
-The package root exposes the supported source, binding, metadata, projection,
-and system-relation APIs. Low-level Automerge value adoption is also available
-without loading the adapter runtime from `@tarstate/automerge/values`.
+The package root exposes one standard attachment API. Low-level Automerge value
+adoption is available without loading the adapter runtime from
+`@tarstate/automerge/values`.
 
 Install both Tarstate tarballs and the Automerge package imported by application
 code:
@@ -59,10 +59,11 @@ constraints, and publishes only the validated candidate. Automerge heads,
 changes, bindings, execution contexts, and canonical keys remain private. Use
 `opened.value.simulate` with the same arguments for a non-mutating preview.
 
-`AutomergeMapProjectionPlanner`, `AutomergeMappedStorageBinding`,
-`AutomergeAtomicSource`, and `AutomergeSourceRuntime` remain adapter construction
-tools for non-standard hosts. Keep one runtime per live document and close it
-through its owner.
+Multiplayer changes are ordinary input to this loop. Each candidate is staged
+on an Automerge clone; if another player's heads arrive before publication, the
+callback runs again against the newly merged snapshot. Disjoint remote work is
+preserved, while conflicts already present in mapped data remain explicit
+projection evidence rather than being selected or JSON-round-tripped away.
 
 ## Automerge Repo compatibility
 

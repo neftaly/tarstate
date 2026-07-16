@@ -26,8 +26,6 @@ export {
   capabilityRefKey,
   diffQueryMaintenanceSnapshots,
   evaluateExpression,
-  evaluatePreparedExpression,
-  evaluatePreparedQuery,
   evaluateQuery,
   openIncrementalQueryMaintenance,
   prepareExpression,
@@ -46,7 +44,6 @@ export type {
   OrderTerm,
   OwnedQueryMaintenanceSnapshot,
   PreparedExpression,
-  PreparedQueryRequest,
   QueryCursor,
   QueryExecutionBudget,
   QueryFunction,
@@ -67,6 +64,8 @@ export type {
   RelationUse,
   WindowExpr
 } from './query.js';
+export { evaluatePreparedExpression } from './internal-query-expression.js';
+export { evaluatePreparedQuery } from './internal-query-evaluator.js';
 export * from './query-builder.js';
 export * from './query-plan.js';
 export * from './receipts.js';

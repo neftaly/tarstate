@@ -23,10 +23,10 @@ import { prepareDatabaseAttachment } from '@tarstate/core/attachment/prepare';
 import type { JsonValue } from '@tarstate/core/foundation';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  AutomergeAtomicSource,
-  AutomergeMappedStorageBinding,
-  AutomergeSourceRuntime
-} from '../src/index.js';
+  AutomergeAtomicSource
+} from '../src/core-adapter.js';
+import { AutomergeMappedStorageBinding } from '../src/mapping-storage-binding.js';
+import { AutomergeSourceRuntime } from '../src/source.js';
 
 type TaskDoc = {
   tasks?: Record<string, {
@@ -234,8 +234,7 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
     })));
     const receipt = await transactions.transact(
       { kind: 'set-final-title' },
-      transform,
-      { operationId: 'operation:transaction' }
+      transform
     );
     expect(receipt).toMatchObject({
       outcome: 'committed',

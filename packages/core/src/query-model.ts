@@ -1,5 +1,6 @@
 import type { ArtifactRef } from './artifacts.js';
 import type { CapabilityRef, Issue } from './issues.js';
+import type { PreparedPlan } from './query-plan-contract.js';
 import type { JsonValue, LogicalUnknown } from './value.js';
 
 /** `lower-bound` contains only proven rows; `unknown` withdraws the current row assertion. */
@@ -93,7 +94,8 @@ export type QueryCursor = {
 };
 
 export type QueryRequest = {
-  readonly root: QueryNode;
+  /** A portable query or a prepared query from the same public preparation API. */
+  readonly root: QueryNode | PreparedPlan<QueryNode>;
   readonly relations: readonly RelationInput[];
   readonly parameters?: Readonly<Record<string, JsonValue>>;
   readonly functions?: FunctionRegistry;
@@ -111,9 +113,6 @@ export type QueryRequest = {
  * work. Omission preserves unlimited execution.
  */
 export type QueryExecutionBudget = { readonly maxWorkUnits: number };
-
-/** Changing inputs for repeated evaluation of an already prepared query. */
-export type PreparedQueryRequest = Omit<QueryRequest, 'root'>;
 
 declare const preparedExpressionBrand: unique symbol;
 /** Owned expression syntax accepted by the prepared scalar evaluator. */

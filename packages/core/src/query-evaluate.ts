@@ -1,10 +1,8 @@
 export { capabilityRefKey } from './issues.js';
 export {
-  evaluateExpression,
-  evaluatePreparedExpression
+  evaluateExpression
 } from './internal-query-expression.js';
 export {
-  evaluatePreparedQuery,
   evaluateQuery
 } from './internal-query-evaluator.js';
 export type * from './query-model.js';

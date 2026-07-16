@@ -2,7 +2,6 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
 import { pipe } from '../src/query-builder.js';
-import { prepareQuery } from '../src/query.js';
 import { sealSchema } from '../src/schema.js';
 import {
   customScalar,
@@ -20,7 +19,6 @@ import {
   typedOrderBy,
   typedMove,
   typedParameter,
-  typedPreparedPlan,
   typedQueryBody,
   typedRekey,
   typedReturning,
@@ -171,16 +169,13 @@ describe('literal-schema and query type authoring', () => {
       typedWhere(typedCompare('eq', base.aliases.event.row.account, parameter)),
       typedSelect('result', { id: base.aliases.event.row.id, account: base.aliases.event.row.account })
     );
-    const plan = await prepareQuery({
-      root: query.root,
+    const prepared = await prepareTypedQuery(query, {
       registryFingerprint: 'registry:one',
       authorityFingerprint: 'authority:one',
       datasetId: 'dataset:one'
     });
-    const prepared = typedPreparedPlan(plan, query);
 
     expect(referenceTo(accounts)).toEqual({ kind: 'ref', target: { relationId: 'example.account' } });
-    expect(prepared).toBe(plan);
     expectTypeOf<SchemaKey<typeof referenceSchema, 'accounts'>>().toEqualTypeOf<readonly [string, number]>();
     expectTypeOf<SchemaRow<typeof referenceSchema, 'events'>['account']>().toEqualTypeOf<readonly [string, number]>();
     expectTypeOf<QueryParametersOf<typeof query>>().toEqualTypeOf<{ readonly account: readonly [string, number] }>();

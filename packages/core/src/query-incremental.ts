@@ -7,7 +7,6 @@ import {
   adoptQueryMaintenanceUpdate,
   cloneAndFreezeQueryAst
 } from './internal-query-ownership.js';
-export { createQueryOccurrenceIds } from './internal-query-ownership.js';
 import { createEvaluationRun, type ScopedRow } from './internal-query-evaluation-context.js';
 import { sameExecutionBudget, sameFunctionRegistry, sameOptionalJson } from './internal-query-equality.js';
 import { selectCanRetainMaterialization } from './internal-query-dependency.js';

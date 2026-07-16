@@ -1,5 +1,6 @@
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { ownedReadonlyMap } from './internal-owned-map.js';
+import { isPreparedPlan } from './internal-prepared-plan.js';
 import { defaultValueParseBudget, logicalUnknown, safeParseJsonValue, type JsonValue } from './value.js';
 import type {
   Completeness,
@@ -156,9 +157,32 @@ export const adoptExpressionScope = (scope: Readonly<Record<string, QueryRecord>
 };
 
 const adoptStringArray = (input: readonly string[], label: string): readonly string[] => {
-  const values = inspectOwnedArray(input, label, { allowSymbols: true });
-  if (values.some((value) => typeof value !== 'string')) throw new TypeError(label + ' contains a hostile value');
-  return Object.freeze(values as string[]);
+  if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
+  try {
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(input, 'length');
+    const length = lengthDescriptor?.value;
+    if (typeof length !== 'number'
+      || !Number.isSafeInteger(length)
+      || length < 0) {
+      throw new TypeError(label + ' contains a hostile length');
+    }
+    const values: string[] = [];
+    values.length = length;
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, String(index));
+      if (descriptor === undefined
+        || !descriptor.enumerable
+        || !('value' in descriptor)
+        || typeof descriptor.value !== 'string') {
+        throw new TypeError(label + ' contains a hostile array descriptor');
+      }
+      values[index] = descriptor.value;
+    }
+    return Object.freeze(values);
+  } catch (error) {
+    if (error instanceof TypeError && error.message.startsWith(label)) throw error;
+    throw new TypeError(label + ' could not be inspected', { cause: error });
+  }
 };
 
 /** Descriptor-safe ownership for capture-frame occurrence identity. */
@@ -369,10 +393,15 @@ export const adoptQueryMaintenanceUpdate = (input: QueryMaintenanceUpdate): Quer
   return owned;
 };
 
-export const adoptQueryRequest = (request: QueryRequest): QueryRequest => {
+export const adoptQueryRequest = (
+  request: QueryRequest
+): QueryRequest => {
   const descriptors = inspectOwnedDataRecord(request, 'Query request', { allowSymbols: true });
+  const root = ownedDataValue(descriptors, 'root');
   return Object.freeze({
-    root: cloneAndFreezeQueryAst(ownedDataValue(descriptors, 'root') as QueryNode),
+    root: isPreparedPlan<QueryNode>(root)
+      ? root
+      : cloneAndFreezeQueryAst(root as QueryNode),
     ...adoptMaintenanceSnapshotDescriptors(descriptors)
   });
 };

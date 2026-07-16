@@ -11,7 +11,7 @@ import {
   type QueryExpressionRuntime
 } from './internal-query-expression.js';
 import { containsNamedCall, containsSubquery, directQueryChildren } from './internal-query-graph.js';
-import { assertPreparedPlan } from './internal-prepared-plan.js';
+import { assertPreparedPlan, isPreparedPlan } from './internal-prepared-plan.js';
 import {
   adoptJsonValue,
   adoptMaintenanceSnapshot,
@@ -39,7 +39,6 @@ import type {
   Completeness,
   Expr,
   OrderTerm,
-  PreparedQueryRequest,
   QueryCursor,
   QueryLogicalValue,
   QueryNode,
@@ -68,7 +67,10 @@ export const consumeQueryWork = (context: QueryContext, units = 1): boolean => {
 
 export const evaluateQuery = (request: QueryRequest): QueryResult => {
   const owned = adoptQueryRequest(request);
-  return evaluateOwnedQuery(owned.root, owned);
+  const root = isPreparedPlan<QueryNode>(owned.root)
+    ? owned.root.query
+    : owned.root;
+  return evaluateOwnedQuery(root, owned);
 };
 
 /**
@@ -77,7 +79,7 @@ export const evaluateQuery = (request: QueryRequest): QueryResult => {
  */
 export const evaluatePreparedQuery = (
   plan: PreparedPlan<QueryNode>,
-  request: PreparedQueryRequest
+  request: Omit<QueryRequest, 'root'>
 ): QueryResult => {
   assertPreparedPlan(plan);
   return evaluateOwnedQuery(plan.query, adoptMaintenanceSnapshot(request));

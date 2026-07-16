@@ -27,7 +27,6 @@ export type AttachmentTransactionSnapshot = {
 };
 
 export type AttachmentTransactionOptions = {
-  readonly operationId?: string;
   readonly signal?: AbortSignal;
 };
 
@@ -69,10 +68,8 @@ export const createAttachmentTransactionService = async <Storage, Command>(
     if (typeof transform !== 'function') throw new TypeError('Attachment transaction transform must be a function');
     const ownedIntent = detachAndFreezeJsonValue(intent);
     if (!ownedIntent.success) throw new TarstateParseError(ownedIntent.issues);
-    const operationId = options.operationId ?? globalThis.crypto.randomUUID();
-    if (operationId.length === 0) throw new TypeError('Attachment transaction operationId must not be empty');
     return {
-      operationId,
+      operationId: globalThis.crypto.randomUUID(),
       intentHash: await attachmentIntentHash(context, ownedIntent.value),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       author: async ({ state, issues }: { readonly state: WritableLogicalState; readonly issues: readonly Issue[] }) =>

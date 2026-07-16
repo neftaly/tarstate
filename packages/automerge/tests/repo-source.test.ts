@@ -1,14 +1,14 @@
 import { Repo } from '@automerge/automerge-repo';
 import * as Automerge from '@automerge/automerge';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { AutomergeAtomicSource } from '../src/core-adapter.js';
 import {
-  AutomergeAtomicSource,
   AutomergeSourceRuntime,
   automergeRepoSourceRuntime,
   exactAutomergeBasisEqual,
   type AutomergeRepoHandle,
   type AutomergeSourceRuntimeApi,
-} from '../src/index.js';
+} from '../src/source.js';
 
 type CounterDoc = { count: number };
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;

@@ -46,19 +46,14 @@ Query and observation have narrower execution seams:
 | `@tarstate/core/database/incremental` | Explicit adapter from database observation to incremental query maintenance |
 | `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
 
-Projection adapters that already own their rows can use
-`createQueryOccurrenceIds` from `@tarstate/core/query/incremental` to build
-frozen occurrence identities without a second descriptor-inspection pass.
-
 Schema, query, and transaction authoring are separate implementations behind
 their topic entries, so query authoring does not load schema or transaction
 authoring code.
 
-Source and transaction adapters also have narrow construction seams:
+Transaction adapters also have a narrow construction seam:
 
 | Entry point | Responsibility |
 | --- | --- |
-| `@tarstate/core/source/projection` | Validates and seals binding-owned immutable writable projections once for reuse |
 | `@tarstate/core/transactions/authoring` | Portable transaction construction without execution |
 
 Artifact semantics and attachment preparation also have opt-in execution seams:
@@ -99,12 +94,11 @@ freezes the portable query while carrying its inferred row and parameter types
 into observers and framework adapters. `prepareQuery` remains the lower-level
 API for an already-erased `QueryNode`.
 
-For repeated pure evaluation outside an observer, call
-`evaluatePreparedQuery(plan, { relations, parameters, functions })`. It reuses
-the plan's already-owned query AST while continuing to detach and freeze every
-changing input. Use `evaluateQuery({ root, ...inputs })` at arbitrary or
-untrusted query ingress; its full request, including the AST, is adopted on
-every call.
+For pure evaluation outside an observer, call
+`evaluateQuery({ root: query, relations, parameters, functions })`. `query` may
+be portable syntax or a plan returned by `prepareTypedQuery`/`prepareQuery`;
+the evaluator automatically reuses an already-owned plan while continuing to
+detach and freeze every changing input. There is no separate fast-path API.
 
 ## Minimal database assembly
 

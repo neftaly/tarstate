@@ -1,7 +1,6 @@
 /** Query and expression preparation without evaluation or incremental maintenance. */
 export {
   prepareExpression,
-  preparePlan,
   prepareQuery
 } from '../../query-prepare.js';
 export type * from '../../query-model.js';

@@ -20,7 +20,6 @@ import {
   type SourceSnapshot,
   type StorageBinding
 } from '@tarstate/core/source';
-import { sealStorageProjection } from '@tarstate/core/source/projection';
 import {
   automergePathFootprint,
   type AutomergePathFootprint
@@ -171,11 +170,11 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         }));
       }
     }
-    const result = sealStorageProjection(Object.freeze({
+    const result = Object.freeze({
       rows: Object.freeze(rows),
       completeness: incomplete ? 'unknown' : 'exact',
       issues: Object.freeze(issues)
-    }));
+    });
     rememberProjection(this.#projections, snapshot.storage, cacheKey, result);
     if (fullProjection) this.#previousFullProjection = { sourceId: snapshot.sourceId, heads: Automerge.getHeads(snapshot.storage), result };
     return result;

@@ -8,12 +8,14 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AutomergeAtomicSource,
   AutomergeMapStorageBinding,
-  AutomergeSourceRuntime,
-  type AutomergeSourceDiagnostic,
   automergePathFootprint,
-  exactAutomergeBasisEqual,
   relateAutomergeFootprints
-} from '../src/index.js';
+} from '../src/core-adapter.js';
+import {
+  AutomergeSourceRuntime,
+  exactAutomergeBasisEqual,
+  type AutomergeSourceDiagnostic
+} from '../src/source.js';
 
 type Task = { title: string; priority?: number; count?: Automerge.Counter; tags?: string[] };
 type TaskDoc = { tasks: Record<string, Task> };
@@ -115,8 +117,8 @@ describe('Automerge core source protocols', () => {
     expect(runtimeCommit).toHaveBeenCalledTimes(1);
     expect(listener).toHaveBeenCalledTimes(1);
     const after = source.snapshot();
-    expect(exactAutomergeBasisEqual(before.basis as import('../src/index.js').AutomergeBasis, after.basis as import('../src/index.js').AutomergeBasis)).toBe(false);
-    expect((after.basis as import('../src/index.js').AutomergeBasis).heads).toEqual([...(after.basis as import('../src/index.js').AutomergeBasis).heads].sort());
+    expect(exactAutomergeBasisEqual(before.basis as import('../src/source.js').AutomergeBasis, after.basis as import('../src/source.js').AutomergeBasis)).toBe(false);
+    expect((after.basis as import('../src/source.js').AutomergeBasis).heads).toEqual([...(after.basis as import('../src/source.js').AutomergeBasis).heads].sort());
   });
 
   it('rejects competing exclusive edit handlers before the runtime commit', async () => {
@@ -166,7 +168,7 @@ describe('Automerge core source protocols', () => {
     });
     expect(result.outcome).toBe('committed');
     expect(listener).not.toHaveBeenCalled();
-    expect(exactAutomergeBasisEqual(before.basis as import('../src/index.js').AutomergeBasis, source.snapshot().basis as import('../src/index.js').AutomergeBasis)).toBe(true);
+    expect(exactAutomergeBasisEqual(before.basis as import('../src/source.js').AutomergeBasis, source.snapshot().basis as import('../src/source.js').AutomergeBasis)).toBe(true);
     expect(runtime.snapshot().storage.tasks.first).toEqual({ title: 'First', priority: 1 });
   });
 
@@ -355,7 +357,7 @@ describe('Automerge core source protocols', () => {
     });
     expect(rekeyed).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.capability_unavailable', requiredCapabilities: [{ id: 'urn:tarstate:capability:entity/rekey' }] }] });
     expect(runtime.snapshot().storage.tasks).toEqual({ first: { title: 'First', priority: 1 } });
-    expect(exactAutomergeBasisEqual(before.basis as import('../src/index.js').AutomergeBasis, source.snapshot().basis as import('../src/index.js').AutomergeBasis)).toBe(true);
+    expect(exactAutomergeBasisEqual(before.basis as import('../src/source.js').AutomergeBasis, source.snapshot().basis as import('../src/source.js').AutomergeBasis)).toBe(true);
   });
 
   it('rejects generic move intent without writing or interpreting move metadata', async () => {
