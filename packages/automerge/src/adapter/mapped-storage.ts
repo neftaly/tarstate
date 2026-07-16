@@ -22,15 +22,24 @@ import {
 } from '@tarstate/core/source';
 import {
   automergePathFootprint,
-  type AutomergePathFootprint
+  type AutomergePathFootprint,
+  type AutomergePathFootprintEntry
 } from './footprint.js';
 import { conflictsAt, type AutomergePath } from '../document/projection.js';
 import { isAutomergeReservedRootProperty } from '../document/reserved-properties.js';
 import { samePortableJson } from '../shared/portable-json.js';
 import {
-  planPropertyEdit,
-  valueAtAutomergePath
+  planPropertyEdit
 } from './property-edits.js';
+import { valueAtAutomergePath } from './path-access.js';
+import { createAutomergeStorageScalarCodec } from './scalar-codec.js';
+import {
+  affectedMappedRelations,
+  conflictsAlongMappedPaths,
+  locateProjectedCandidate,
+  mappedReadEntries,
+  mappedWriteEntries
+} from './mapped-projection.js';
 import type { AutomergeSourceCommand } from '../source/runtime.js';
 
 export type AutomergeMappedStorageRow = {
@@ -56,7 +65,7 @@ export type AutomergeMappedStorageBindingOptions = {
 type MappedRelation = CompiledStorageMapping['relations'] extends ReadonlyMap<string, infer Relation> ? Relation : never;
 
 /**
- * Writable Automerge object-map binding derived from the same compiled
+ * Writable Automerge mapped-storage binding derived from the same compiled
  * `json-tree-v1` mapping used by `projectStorage`.
  */
 export class AutomergeMappedStorageBinding<T extends object>
@@ -70,6 +79,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly #relations: ReadonlyMap<string, MappedRelation>;
   readonly #relationSelection: ReadonlySet<string>;
   readonly #locatorNamespace: string;
+  readonly #relationValuePaths: ReadonlyMap<string, readonly (readonly (string | number)[])[]>;
+  readonly #relationReadEntries: ReadonlyMap<string, readonly AutomergePathFootprintEntry[]>;
+  readonly #scalarCodec = createAutomergeStorageScalarCodec();
   readonly #projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeMappedStorageRow>>>();
   #previousFullProjection: {
     readonly sourceId: string;
@@ -88,15 +100,23 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     for (const relationId of selectedIds) {
       const relation = owned.mapping.relations.get(relationId);
       if (relation === undefined) throw new TypeError('Mapped Automerge relation is missing: ' + relationId);
-      if (relation.mapping.collection.kind !== 'object-map') throw new TypeError('Mapped Automerge relation must use an object-map collection: ' + relationId);
+      if (relation.mapping.collection.kind === 'array') throw new TypeError('Mapped Automerge relation must use a durable object-map or singleton collection: ' + relationId);
       relations.set(relationId, relation as MappedRelation);
     }
     this.#relations = relations;
     this.relationIds = Object.freeze([...relations.keys()]);
     this.#relationSelection = new Set(this.relationIds);
-    const entries = [...relations.values()].map(({ mapping }) => ({ scope: 'subtree' as const, path: mapping.collection.path as AutomergePath }));
-    this.declaredReadFootprint = automergePathFootprint(entries);
-    this.declaredWriteFootprint = this.declaredReadFootprint;
+    const relationValuePaths = new Map<string, readonly AutomergePath[]>();
+    const relationReadEntries = new Map<string, readonly AutomergePathFootprintEntry[]>();
+    for (const [relationId, { mapping, valuePaths: compiledValuePaths }] of relations) {
+      const valuePaths = compiledValuePaths as readonly AutomergePath[];
+      relationValuePaths.set(relationId, valuePaths);
+      relationReadEntries.set(relationId, mappedReadEntries(mapping, valuePaths));
+    }
+    this.#relationValuePaths = relationValuePaths;
+    this.#relationReadEntries = relationReadEntries;
+    this.declaredReadFootprint = automergePathFootprint([...this.#relationReadEntries.values()].flat());
+    this.declaredWriteFootprint = automergePathFootprint([...relations.values()].flatMap(({ mapping }) => mappedWriteEntries(mapping)));
   }
 
   project = (snapshot: SourceSnapshot<Automerge.Doc<T>>, requestedRelations?: ReadonlySet<string>): ProjectionResult<AutomergeMappedStorageRow> => {
@@ -111,7 +131,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     const cached = this.#projections.get(snapshot.storage)?.get(cacheKey);
     if (cached !== undefined) return cached;
     const affected = fullProjection && this.#previousFullProjection?.result.completeness === 'exact'
-      ? affectedMappedRelations(snapshot.sourceId, snapshot.storage, this.#previousFullProjection, this.#relations)
+      ? affectedMappedRelations(snapshot.sourceId, snapshot.storage, this.#previousFullProjection, this.#relationReadEntries)
       : undefined;
     if (affected !== undefined && affected.size === 0 && this.#previousFullProjection !== undefined) {
       rememberProjection(this.#projections, snapshot.storage, cacheKey, this.#previousFullProjection.result);
@@ -119,7 +139,12 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       return this.#previousFullProjection.result;
     }
     const projectedRelations = affected ?? selected;
-    const projection = projectStorage(this.#mapping, snapshot.storage, this.#registry, snapshot.sourceId, projectedRelations);
+    const projection = projectStorage(this.#mapping, snapshot.storage, {
+      ...(this.#registry === undefined ? {} : { registry: this.#registry }),
+      sourceId: snapshot.sourceId,
+      relationIds: projectedRelations,
+      scalarDecoder: this.#scalarCodec.decode
+    });
     const rows: AutomergeMappedStorageRow[] = affected === undefined || this.#previousFullProjection === undefined
       ? []
       : this.#previousFullProjection.result.rows.filter((row) => !affected.has(row.relationId));
@@ -137,25 +162,24 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       }
       issues.push(...relation.issues.map((issue) => rebaseProjectionIssue(issue, compiled.mapping.collection.path)));
       if (relation.completeness !== 'exact') incomplete = true;
-      const collection = valueAtAutomergePath(snapshot.storage, compiled.mapping.collection.path as AutomergePath);
       for (const projected of relation.rows) {
-        if (projected.locator.kind !== 'object-map-key' || !isRecord(collection)) {
+        const located = locateProjectedCandidate(snapshot.storage, compiled.mapping, projected.locator);
+        if ('issue' in located) {
           incomplete = true;
-          issues.push(bindingIssue('mapping.locator_invalid', snapshot.sourceId, relationId));
+          issues.push(bindingIssue(located.issue, snapshot.sourceId, relationId, compiled.mapping.collection.path));
           continue;
         }
-        const path = [...compiled.mapping.collection.path, projected.locator.key] as AutomergePath;
-        const candidates = conflictsAt(collection, projected.locator.key);
-        if (candidates.length > 1) {
+        const { candidate, path, collectionConflict } = located;
+        if (collectionConflict !== undefined) {
           incomplete = true;
           issues.push(createIssue({
-            code: 'automerge.map_key_conflict', phase: 'query', severity: 'warning', retry: 'manual_repair',
+            code: collectionConflict.code, phase: 'query', severity: 'warning', retry: 'manual_repair',
             sourceId: snapshot.sourceId, relationId, path,
-            details: { changeHashes: candidates.map(([changeHash]) => changeHash) }
+            details: { changeHashes: collectionConflict.changeHashes }
           }));
           continue;
         }
-        const mappedConflicts = conflictsAlongMappedPaths(snapshot.storage, path, compiled.mapping);
+        const mappedConflicts = conflictsAlongMappedPaths(snapshot.storage, path, this.#relationValuePaths.get(relationId) ?? []);
         if (mappedConflicts.length > 0) {
           incomplete = true;
           issues.push(...mappedConflicts.map((conflict) => createIssue({
@@ -165,7 +189,6 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           })));
           continue;
         }
-        const candidate = collection[projected.locator.key];
         const objectId = candidate === null || typeof candidate !== 'object' ? null : Automerge.getObjectId(candidate);
         if (typeof objectId !== 'string') {
           incomplete = true;
@@ -233,6 +256,10 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         continue;
       }
       if (edit.kind === 'delete') {
+        if (compiled.mapping.collection.kind === 'singleton') {
+          issues.push(bindingIssue('transaction.capability_unavailable', snapshot.sourceId, edit.relationId, row.storagePath, { edit: 'delete', collection: 'singleton' }));
+          continue;
+        }
         const planned = planPropertyEdit(snapshot.storage, { kind: 'delete', path: row.storagePath });
         if ('issue' in planned) issues.push(projectionIssue(planned.issue.code, snapshot.sourceId, edit.relationId, planned.issue.path, planned.issue.details));
         else intents.push(intentAt(row.storagePath, planned.command));
@@ -289,7 +316,18 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           continue;
         }
         if (samePortableJson(row.fields[field], parsed.value)) continue;
-        const planned = planPropertyEdit(snapshot.storage, { kind: 'replace', path, value: parsed.value });
+        const encoded = this.#scalarCodec.encode({
+          value: parsed.value,
+          declaration,
+          relationId: edit.relationId,
+          field,
+          path
+        });
+        if (!encoded.success) {
+          issues.push(...encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, edit.relationId, path)));
+          continue;
+        }
+        const planned = planPropertyEdit(snapshot.storage, { kind: 'replace', path, value: encoded.value });
         if ('issue' in planned) issues.push(projectionIssue(planned.issue.code, snapshot.sourceId, edit.relationId, planned.issue.path, planned.issue.details));
         else intents.push(intentAt(path, planned.command));
       }
@@ -321,6 +359,9 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     key: JsonValue,
     fields: Readonly<Record<string, JsonValue>>
   ): { readonly intent: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> } } | { readonly issues: readonly Issue[] } {
+    if (compiled.mapping.collection.kind !== 'object-map') {
+      return { issues: [bindingIssue('transaction.capability_unavailable', snapshot.sourceId, relationId, compiled.mapping.collection.path, { edit: 'insert', collection: compiled.mapping.collection.kind })] };
+    }
     const keyValues = Array.isArray(key) ? key : [];
     const keyFields = compiled.relation.declaration.key;
     if (keyValues.length !== keyFields.length) return { issues: [bindingIssue('schema.key_arity', snapshot.sourceId, relationId)] };
@@ -349,19 +390,29 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     if (isRecord(collection) && (Object.hasOwn(collection, mapKey) || conflictsAt(collection, mapKey).length > 0)) {
       return { issues: [bindingIssue('transaction.upsert_conflict', snapshot.sourceId, relationId, [...compiled.mapping.collection.path, mapKey])] };
     }
-    const physical: Record<string, JsonValue> = {};
+    const physical: Record<string, unknown> = {};
     for (const [field, mapping] of Object.entries(compiled.mapping.keys)) {
       if (mapping.kind === 'map-key') {
-        if (mapping.mirrorPath !== undefined && !setPortablePath(physical, mapping.mirrorPath, parsed.value.row[field] as JsonValue)) {
+        if (mapping.mirrorPath !== undefined && !setStoragePath(physical, mapping.mirrorPath, parsed.value.row[field])) {
           return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.mirrorPath)] };
         }
-      } else if (!setPortablePath(physical, mapping.path, parsed.value.row[field] as JsonValue)) {
-        return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
+      } else if (mapping.kind === 'field') {
+        const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
+        const encoded = this.#scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
+        if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };
+        if (!setStoragePath(physical, mapping.path, encoded.value)) {
+          return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
+        }
+      } else if (mapping.kind === 'literal') {
+        return { issues: [bindingIssue('mapping.key_invalid', snapshot.sourceId, relationId, compiled.mapping.collection.path, { reason: 'literal_key_requires_singleton' })] };
       }
     }
     for (const [field, mapping] of Object.entries(compiled.mapping.fields)) {
       if (!Object.hasOwn(parsed.value.row, field)) continue;
-      if (!setPortablePath(physical, mapping.path, parsed.value.row[field] as JsonValue)) {
+      const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
+      const encoded = this.#scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
+      if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };
+      if (!setStoragePath(physical, mapping.path, encoded.value)) {
         return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
       }
     }
@@ -385,7 +436,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
             apply: (draft) => {
               const target = valueAtAutomergePath(draft, parentPath);
               if (!isRecord(target) || Object.hasOwn(target, member)) throw new Error('Mapped collection target changed after planning');
-              target[member] = { [mapKey]: copyPortable(physical) };
+              target[member] = { [mapKey]: copyStorageValue(physical) };
             }
           }
         }
@@ -397,7 +448,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         apply: (draft) => {
           const target = valueAtAutomergePath(draft, compiled.mapping.collection.path as AutomergePath);
           if (!isRecord(target) || Object.hasOwn(target, mapKey)) throw new Error('Mapped insert target changed after planning');
-          target[mapKey] = copyPortable(physical);
+          target[mapKey] = copyStorageValue(physical);
         }
       })
     };
@@ -426,28 +477,6 @@ const adoptOptions = (input: AutomergeMappedStorageBindingOptions): AutomergeMap
     ...(locatorNamespace === undefined ? {} : { locatorNamespace }),
     ...(relationIds === undefined ? {} : { relationIds })
   });
-};
-
-const affectedMappedRelations = <T extends object>(
-  sourceId: string,
-  storage: Automerge.Doc<T>,
-  previous: { readonly sourceId: string; readonly heads: readonly string[] },
-  relations: ReadonlyMap<string, MappedRelation>
-): ReadonlySet<string> | undefined => {
-  if (sourceId !== previous.sourceId || !Automerge.hasHeads(storage, [...previous.heads])) return undefined;
-  const patches = Automerge.diff(storage, [...previous.heads], Automerge.getHeads(storage));
-  const affected = new Set<string>();
-  for (const [relationId, { mapping }] of relations) {
-    const collectionPath = mapping.collection.path;
-    if (patches.some(({ path }) => pathsIntersect(path, collectionPath))) affected.add(relationId);
-  }
-  return affected;
-};
-
-const pathsIntersect = (left: readonly (string | number)[], right: readonly (string | number)[]): boolean => {
-  const shared = Math.min(left.length, right.length);
-  for (let index = 0; index < shared; index += 1) if (left[index] !== right[index]) return false;
-  return true;
 };
 
 const rememberProjection = <Storage extends object, Row>(
@@ -486,61 +515,31 @@ const intentAt = <T extends object>(path: AutomergePath, command: AutomergeSourc
   command
 });
 
-const conflictsAlongMappedPaths = (
-  doc: object,
-  rowPath: AutomergePath,
-  mapping: RelationStorageMapping
-): readonly { readonly path: AutomergePath; readonly changeHashes: readonly string[] }[] => {
-  const relativePaths = [
-    ...Object.values(mapping.keys).flatMap((key) => key.kind === 'field'
-      ? [key.path]
-      : key.mirrorPath === undefined ? [] : [key.mirrorPath]),
-    ...Object.values(mapping.fields).map(({ path }) => path)
-  ];
-  const conflicts = new Map<string, { readonly path: AutomergePath; readonly changeHashes: readonly string[] }>();
-  for (const relative of relativePaths) {
-    const absolute = [...rowPath, ...relative] as AutomergePath;
-    for (let index = rowPath.length; index < absolute.length; index += 1) {
-      const owner = valueAtAutomergePath(doc, absolute.slice(0, index) as AutomergePath);
-      if (owner === null || typeof owner !== 'object') break;
-      if (Array.isArray(owner)) continue;
-      const alternatives = conflictsAt(owner, absolute[index] as string | number);
-      if (alternatives.length < 2) continue;
-      const path = absolute.slice(0, index + 1) as AutomergePath;
-      conflicts.set(canonicalizeJson(path as JsonValue), {
-        path: Object.freeze([...path]),
-        changeHashes: Object.freeze(alternatives.map(([changeHash]) => changeHash))
-      });
-      break;
-    }
-  }
-  return Object.freeze([...conflicts.values()]);
-};
-
-const setPortablePath = (root: Record<string, JsonValue>, path: readonly (string | number)[], value: JsonValue): boolean => {
+const setStoragePath = (root: Record<string, unknown>, path: readonly (string | number)[], value: unknown): boolean => {
   if (path.length === 0 || path.some((part) => typeof part !== 'string')) return false;
   let current = root;
   for (const [index, part] of path.entries()) {
     const key = part as string;
     if (index === path.length - 1) {
-      current[key] = copyPortable(value);
+      current[key] = copyStorageValue(value);
       return true;
     }
     const child = current[key];
     if (child === undefined) {
-      const created: Record<string, JsonValue> = {};
+      const created: Record<string, unknown> = {};
       current[key] = created;
       current = created;
-    } else if (isRecord(child)) current = child as Record<string, JsonValue>;
+    } else if (isRecord(child)) current = child;
     else return false;
   }
   return false;
 };
 
-const copyPortable = (value: JsonValue): JsonValue => {
+const copyStorageValue = (value: unknown): unknown => {
+  if (value instanceof Uint8Array) return new Uint8Array(value);
   if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(copyPortable);
-  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, copyPortable(child)]));
+  if (Array.isArray(value)) return value.map(copyStorageValue);
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, copyStorageValue(child)]));
 };
 
 
@@ -556,8 +555,11 @@ const rebaseProjectionIssue = (issue: Issue, collectionPath: readonly (string | 
   if (!issue.code.startsWith('schema.')) return issue;
   const details = isRecord(issue.details) ? issue.details : undefined;
   const locator = details !== undefined && isRecord(details.locator) ? details.locator : undefined;
-  if (locator?.kind !== 'object-map-key' || typeof locator.key !== 'string') return issue;
   const relative = typeof issue.path?.[0] === 'number' ? issue.path.slice(1) : issue.path ?? [];
+  if (locator?.kind === 'singleton') {
+    return createIssue({ ...issue, path: [...collectionPath, ...relative] });
+  }
+  if (locator?.kind !== 'object-map-key' || typeof locator.key !== 'string') return issue;
   return createIssue({ ...issue, path: [...collectionPath, locator.key, ...relative] });
 };
 

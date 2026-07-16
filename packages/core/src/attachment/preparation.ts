@@ -147,7 +147,10 @@ export const prepareDatabaseAttachment = async <State = unknown>(
     }
     project = (snapshot) => {
       if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { state: snapshot.state === 'ready' ? 'failed' : snapshot.state, issues: snapshot.issues };
-      const value = projectStorage(preparedMapping.value.compiled, snapshot.storage, input.registry, input.sourceId);
+      const value = projectStorage(preparedMapping.value.compiled, snapshot.storage, {
+        registry: input.registry,
+        sourceId: input.sourceId
+      });
       return { state: 'ready', value, issues: value.issues };
     };
   } else {

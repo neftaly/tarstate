@@ -7,16 +7,18 @@ import { ownedReadonlyMap } from './internal-owned-map.js';
 import { assertCompiledStorageMapping, assertPreparedSchema, sealCompiledStorageMapping } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
-import { parseRelationCandidates, parseScalarValueForField, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
+import { parseRelationCandidates, parseScalarValueForField, type FieldDeclaration, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
 import type { PortableValue } from './value.js';
 
 export type StoragePath = readonly (string | number)[];
 export type CollectionMapping =
   | { readonly kind: 'object-map'; readonly path: StoragePath; readonly absent: 'empty' | 'creatable' | 'invalid' }
-  | { readonly kind: 'array'; readonly path: StoragePath; readonly absent: 'empty' | 'creatable' | 'invalid' };
+  | { readonly kind: 'array'; readonly path: StoragePath; readonly absent: 'empty' | 'creatable' | 'invalid' }
+  | { readonly kind: 'singleton'; readonly path: StoragePath; readonly absent: 'empty' | 'invalid' };
 export type KeyMapping =
   | { readonly kind: 'map-key'; readonly mirrorPath?: StoragePath; readonly onMismatch: 'reject' }
-  | { readonly kind: 'field'; readonly path: StoragePath };
+  | { readonly kind: 'field'; readonly path: StoragePath }
+  | { readonly kind: 'literal'; readonly value: PortableValue };
 export type FieldMapping = {
   readonly path: StoragePath;
   readonly write: { readonly kind: 'replace'; readonly capability: CapabilityRef } | { readonly kind: 'read-only' };
@@ -45,12 +47,17 @@ export type CompiledStorageMapping = {
   readonly [compiledStorageMappingBrand]: true;
   readonly body: StorageMappingBody;
   readonly schema: PreparedSchema;
-  readonly relations: ReadonlyMap<RelationId, { readonly relation: PreparedRelation; readonly mapping: RelationStorageMapping }>;
+  readonly relations: ReadonlyMap<RelationId, {
+    readonly relation: PreparedRelation;
+    readonly mapping: RelationStorageMapping;
+    readonly valuePaths: readonly StoragePath[];
+  }>;
 };
 
 export type MappingLocator =
   | { readonly kind: 'object-map-key'; readonly key: string }
-  | { readonly kind: 'array-position'; readonly index: number; readonly durable: false };
+  | { readonly kind: 'array-position'; readonly index: number; readonly durable: false }
+  | { readonly kind: 'singleton' };
 
 export type BoundRow = ParsedCandidate & { readonly locator: MappingLocator };
 export type BoundRelation = {
@@ -64,6 +71,24 @@ export type BindingProjection = {
   readonly relations: ReadonlyMap<RelationId, BoundRelation>;
   readonly issues: readonly Issue[];
   readonly completeness: 'exact' | 'unknown';
+};
+
+export type StorageScalarCodecInput = {
+  readonly value: unknown;
+  readonly declaration: FieldDeclaration;
+  readonly relationId: RelationId;
+  readonly field: string;
+  readonly path: StoragePath;
+};
+
+/** Read boundary from source-native scalar storage to canonical logical values. */
+export type StorageScalarDecoder = (input: StorageScalarCodecInput) => ParseResult<unknown>;
+
+export type ProjectStorageOptions = {
+  readonly registry?: CapabilityRegistry;
+  readonly sourceId?: string;
+  readonly relationIds?: ReadonlySet<RelationId>;
+  readonly scalarDecoder?: StorageScalarDecoder;
 };
 
 export type MappedStorageIntent = {
@@ -95,7 +120,11 @@ export const compileStorageMapping = (
   if (!isRecord(owned.value) || !hasOnlyKeys(owned.value, ['schema', 'model', 'relations']) || owned.value.model !== 'json-tree-v1' || !isArtifactRef(owned.value.schema) || !sameRef(owned.value.schema, schemaRef) || !isRecord(owned.value.relations)) return mappingFailure('mapping.invalid', [], { reason: 'shape_or_schema' });
   const body = owned.value as unknown as StorageMappingBody;
   const issues: Issue[] = [];
-  const relations = new Map<RelationId, { relation: PreparedRelation; mapping: RelationStorageMapping }>();
+  const relations = new Map<RelationId, {
+    relation: PreparedRelation;
+    mapping: RelationStorageMapping;
+    valuePaths: readonly StoragePath[];
+  }>();
   for (const [relationId, mapping] of Object.entries(body.relations)) {
     const relation = schema.relationsById.get(relationId);
     const path = ['relations', relationId];
@@ -107,7 +136,11 @@ export const compileStorageMapping = (
       continue;
     }
     for (const [field, keyMapping] of Object.entries(mapping.keys)) {
-      if (!isKeyMapping(keyMapping) || (keyMapping.kind === 'map-key' && mapping.collection.kind !== 'object-map')) issues.push(mappingIssue('mapping.key_invalid', [...path, 'keys', field]));
+      if (!isKeyMapping(keyMapping)
+        || (keyMapping.kind === 'map-key' && mapping.collection.kind !== 'object-map')
+        || (keyMapping.kind === 'literal' && mapping.collection.kind !== 'singleton')) {
+        issues.push(mappingIssue('mapping.key_invalid', [...path, 'keys', field]));
+      }
     }
     for (const [field, fieldMapping] of Object.entries(mapping.fields)) {
       if (!(field in relation.declaration.fields) || !isFieldMapping(fieldMapping)) issues.push(mappingIssue('mapping.field_invalid', [...path, 'fields', field]));
@@ -118,7 +151,7 @@ export const compileStorageMapping = (
     for (const field of Object.keys(relation.declaration.fields)) {
       if (!(field in mapping.fields) && !(field in mapping.keys)) issues.push(mappingIssue('mapping.field_unmapped', [...path, 'fields', field], { field }));
     }
-    relations.set(relationId, Object.freeze({ relation, mapping }));
+    relations.set(relationId, Object.freeze({ relation, mapping, valuePaths: mappedValuePaths(mapping) }));
   }
   return issues.length > 0 ? { success: false, issues } : {
     success: true,
@@ -130,34 +163,30 @@ export const compileStorageMapping = (
 export const projectStorage = (
   binding: CompiledStorageMapping,
   snapshot: unknown,
-  registry?: CapabilityRegistry,
-  sourceId?: string,
-  relationIds?: ReadonlySet<RelationId>
-): BindingProjection => projectStorageRelations(binding, snapshot, relationIds, registry, sourceId);
+  options: ProjectStorageOptions = {}
+): BindingProjection => projectStorageRelations(binding, snapshot, options);
 
 /** Projects only selected relations while preserving the same validation and ownership boundary. */
 const projectStorageRelations = (
   binding: CompiledStorageMapping,
   snapshot: unknown,
-  relationIds: ReadonlySet<RelationId> | undefined,
-  registry?: CapabilityRegistry,
-  sourceId?: string
+  options: ProjectStorageOptions
 ): BindingProjection => {
   assertCompiledStorageMapping(binding);
   const relations = new Map<RelationId, BoundRelation>();
   const allIssues: Issue[] = [];
   for (const [relationId, compiled] of binding.relations) {
-    if (relationIds !== undefined && !relationIds.has(relationId)) continue;
-    const extracted = extractCandidates(snapshot, compiled.mapping.collection, relationId, sourceId);
+    if (options.relationIds !== undefined && !options.relationIds.has(relationId)) continue;
+    const extracted = extractCandidates(snapshot, compiled.mapping.collection, relationId, options.sourceId);
     const rawCandidates: { value: RelationRow; locator: MappingLocator }[] = [];
     const rejectedLocators: MappingLocator[] = [];
     const relationIssues = [...extracted.issues];
     for (const candidate of extracted.candidates) {
-      const projected = projectCandidate(candidate, compiled.mapping, relationId, sourceId);
+      const projected = projectCandidate(candidate, compiled, relationId, options);
       if (projected.success) rawCandidates.push({ value: projected.value, locator: candidate.locator });
       else { rejectedLocators.push(candidate.locator); relationIssues.push(...projected.issues); }
     }
-    const parsed = parseRelationCandidates(binding.schema, compiled.relation, rawCandidates, registry, sourceId === undefined ? {} : { sourceId });
+    const parsed = parseRelationCandidates(binding.schema, compiled.relation, rawCandidates, options.registry, options.sourceId === undefined ? {} : { sourceId: options.sourceId });
     relationIssues.push(...parsed.issues);
     rejectedLocators.push(...parsed.rejected.flatMap((candidate) => candidate.locator === undefined ? [] : [candidate.locator as MappingLocator]));
     const rows = parsed.rows.map((row) => ({ row: row.row, key: row.key, locator: row.locator as MappingLocator }));
@@ -260,7 +289,10 @@ const planStorageIntentDetails = (
     intents.push({ kind: 'replace', path: [...located.value.absolutePath, ...fieldMapping.path], value: parsed.value, capability: fieldMapping.write.capability });
   }
   if (issues.length > 0) return { success: false, issues };
-  const readFootprint = [compiled.mapping.collection.path, ...Object.values(compiled.mapping.fields).map((field) => [...located.value.absolutePath, ...field.path])];
+  const readFootprint = [
+    compiled.mapping.collection.path,
+    ...compiled.valuePaths.map((path) => [...located.value.absolutePath, ...path])
+  ];
   return {
     success: true,
     value: Object.freeze({
@@ -286,6 +318,13 @@ const extractCandidates = (snapshot: unknown, collection: CollectionMapping, rel
     if (resolved.reason === 'inspection_failed') return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { reason: resolved.reason, error: resolved.error }, undefined, sourceId, relationId)], complete: false };
     if (collection.absent === 'empty' || collection.absent === 'creatable') return { candidates: [], issues: [], complete: true };
     return { candidates: [], issues: [mappingIssue('mapping.collection_absent', collection.path, { relationId }, undefined, sourceId, relationId)], complete: false };
+  }
+  if (collection.kind === 'singleton') {
+    return {
+      candidates: [{ candidate: resolved.value, locator: { kind: 'singleton' }, absolutePath: collection.path }],
+      issues: [],
+      complete: true
+    };
   }
   if (collection.kind === 'array') {
     if (!Array.isArray(resolved.value)) return { candidates: [], issues: [mappingIssue('mapping.collection_invalid', collection.path, { expected: 'array' }, undefined, sourceId, relationId)], complete: false };
@@ -317,34 +356,64 @@ const extractCandidates = (snapshot: unknown, collection: CollectionMapping, rel
   }
 };
 
-const projectCandidate = (candidate: ExtractedCandidate, mapping: RelationStorageMapping, relationId: RelationId, sourceId?: string): ParseResult<RelationRow> => {
-  if (!isRecord(candidate.candidate)) return mappingFailure('mapping.candidate_invalid', candidate.absolutePath, { relationId, locator: candidate.locator }, sourceId, relationId);
+const projectCandidate = (
+  candidate: ExtractedCandidate,
+  compiled: { readonly relation: PreparedRelation; readonly mapping: RelationStorageMapping },
+  relationId: RelationId,
+  options: ProjectStorageOptions
+): ParseResult<RelationRow> => {
+  if (!isRecord(candidate.candidate)) return mappingFailure('mapping.candidate_invalid', candidate.absolutePath, { relationId, locator: candidate.locator }, options.sourceId, relationId);
+  const { mapping } = compiled;
   const output: Record<string, PortableValue> = {};
   for (const [field, keyMapping] of Object.entries(mapping.keys)) {
     if (keyMapping.kind === 'map-key') {
       const storageKey = candidate.storageKey as string;
       if (keyMapping.mirrorPath !== undefined) {
         const mirror = readPath(candidate.candidate, keyMapping.mirrorPath);
-        if (!mirror.present && mirror.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...keyMapping.mirrorPath], { reason: mirror.reason, error: mirror.error, locator: candidate.locator }, sourceId, relationId);
-        if (!mirror.present || !samePortableJson(mirror.value, storageKey)) return mappingFailure('mapping.map_key_mismatch', [...candidate.absolutePath, ...keyMapping.mirrorPath], { field, mapKey: storageKey, mirror: mirror.present ? mirror.value : 'missing', locator: candidate.locator }, sourceId, relationId, 'manual_repair');
+        if (!mirror.present && mirror.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...keyMapping.mirrorPath], { reason: mirror.reason, error: mirror.error, locator: candidate.locator }, options.sourceId, relationId);
+        if (!mirror.present || !samePortableJson(mirror.value, storageKey)) return mappingFailure('mapping.map_key_mismatch', [...candidate.absolutePath, ...keyMapping.mirrorPath], { field, mapKey: storageKey, mirror: mirror.present ? mirror.value : 'missing', locator: candidate.locator }, options.sourceId, relationId, 'manual_repair');
       }
       output[field] = storageKey;
+    } else if (keyMapping.kind === 'literal') {
+      output[field] = keyMapping.value;
     } else {
       const value = readPath(candidate.candidate, keyMapping.path);
-      if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...keyMapping.path], { reason: value.reason, error: value.error, locator: candidate.locator }, sourceId, relationId);
-      if (value.present) output[field] = value.value as PortableValue;
+      const path = [...candidate.absolutePath, ...keyMapping.path];
+      if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', path, { reason: value.reason, error: value.error, locator: candidate.locator }, options.sourceId, relationId);
+      if (value.present) {
+        const decoded = decodeMappedValue(value.value, compiled.relation.declaration.fields[field], relationId, field, path, options);
+        if (!decoded.success) return decoded;
+        output[field] = decoded.value as PortableValue;
+      }
     }
   }
   for (const [field, fieldMapping] of Object.entries(mapping.fields)) {
     const value = readPath(candidate.candidate, fieldMapping.path);
-    if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', [...candidate.absolutePath, ...fieldMapping.path], { reason: value.reason, error: value.error, locator: candidate.locator }, sourceId, relationId);
-    if (value.present) output[field] = value.value as PortableValue;
+    const path = [...candidate.absolutePath, ...fieldMapping.path];
+    if (!value.present && value.reason === 'inspection_failed') return mappingFailure('mapping.candidate_invalid', path, { reason: value.reason, error: value.error, locator: candidate.locator }, options.sourceId, relationId);
+    if (value.present) {
+      const decoded = decodeMappedValue(value.value, compiled.relation.declaration.fields[field], relationId, field, path, options);
+      if (!decoded.success) return decoded;
+      output[field] = decoded.value as PortableValue;
+    }
   }
   return { success: true, value: output, issues: [] };
 };
 
 const locateCandidate = (snapshot: unknown, collection: CollectionMapping, locator: MappingLocator): ParseResult<{ candidate: unknown; absolutePath: StoragePath }> => {
-  if ((collection.kind === 'object-map' && locator.kind !== 'object-map-key') || (collection.kind === 'array' && locator.kind !== 'array-position')) return mappingFailure('mapping.locator_invalid', collection.path);
+  if (collection.kind === 'singleton') {
+    if (locator.kind !== 'singleton') return mappingFailure('mapping.locator_invalid', collection.path);
+    const found = readPath(snapshot, collection.path);
+    if (found.present) return { success: true, value: { candidate: found.value, absolutePath: collection.path }, issues: [] };
+    return found.reason === 'inspection_failed'
+      ? mappingFailure('mapping.locator_invalid', collection.path, { reason: found.reason, error: found.error })
+      : mappingFailure('mapping.locator_stale', collection.path);
+  }
+  if ((collection.kind === 'object-map' && locator.kind !== 'object-map-key')
+    || (collection.kind === 'array' && locator.kind !== 'array-position')) {
+    return mappingFailure('mapping.locator_invalid', collection.path);
+  }
+  if (locator.kind === 'singleton') return mappingFailure('mapping.locator_invalid', collection.path);
   const member = locator.kind === 'object-map-key' ? locator.key : locator.index;
   const absolutePath = [...collection.path, member];
   const found = readPath(snapshot, absolutePath);
@@ -352,6 +421,52 @@ const locateCandidate = (snapshot: unknown, collection: CollectionMapping, locat
   return found.reason === 'inspection_failed'
     ? mappingFailure('mapping.locator_invalid', absolutePath, { reason: found.reason, error: found.error })
     : mappingFailure('mapping.locator_stale', absolutePath);
+};
+
+const decodeMappedValue = (
+  value: unknown,
+  declaration: FieldDeclaration | undefined,
+  relationId: RelationId,
+  field: string,
+  path: StoragePath,
+  options: ProjectStorageOptions
+): ParseResult<unknown> => {
+  if (declaration === undefined || options.scalarDecoder === undefined) {
+    return { success: true, value, issues: [] };
+  }
+  try {
+    const decoded = options.scalarDecoder({ value, declaration, relationId, field, path });
+    return decoded.success
+      ? decoded
+      : {
+          success: false,
+          issues: decoded.issues.map((issue) => createIssue({
+            ...issue,
+            path: [...path, ...(issue.path ?? [])],
+            ...(options.sourceId === undefined ? {} : { sourceId: options.sourceId }),
+            relationId
+          }))
+        };
+  } catch (error) {
+    return mappingFailure('mapping.candidate_invalid', path, {
+      reason: 'decode_threw',
+      error: error instanceof Error ? error.name : typeof error,
+      field
+    }, options.sourceId, relationId);
+  }
+};
+
+const mappedValuePaths = (mapping: RelationStorageMapping): readonly StoragePath[] => {
+  const paths: StoragePath[] = [];
+  for (const key of Object.values(mapping.keys)) {
+    if (!isKeyMapping(key)) continue;
+    if (key.kind === 'field') paths.push(key.path);
+    if (key.kind === 'map-key' && key.mirrorPath !== undefined) paths.push(key.mirrorPath);
+  }
+  for (const field of Object.values(mapping.fields)) {
+    if (isFieldMapping(field)) paths.push(field.path);
+  }
+  return Object.freeze(paths);
 };
 
 type PathRead =
@@ -433,8 +548,18 @@ const copyDataRecord = (value: Readonly<Record<string, unknown>>): Record<string
 const sameRef = (value: unknown, expected: ArtifactRef): boolean => isRecord(value) && typeof value.id === 'string' && typeof value.contentHash === 'string' && JSON.stringify(normalizeArtifactRef(value as ArtifactRef)) === JSON.stringify(normalizeArtifactRef(expected));
 const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value) && hasOnlyKeys(value, ['id', 'contentHash', 'locations']) && typeof value.id === 'string' && value.id.length > 0 && isContentHash(value.contentHash) && (value.locations === undefined || (Array.isArray(value.locations) && value.locations.every((location) => typeof location === 'string' && location.length > 0)));
 const isRelationMapping = (value: unknown): value is RelationStorageMapping => isRecord(value) && hasOnlyKeys(value, ['collection', 'keys', 'fields']) && isCollectionMapping(value.collection) && isRecord(value.keys) && isRecord(value.fields);
-const isCollectionMapping = (value: unknown): value is CollectionMapping => isRecord(value) && hasOnlyKeys(value, ['kind', 'path', 'absent']) && (value.kind === 'object-map' || value.kind === 'array') && isStoragePath(value.path) && (value.absent === 'empty' || value.absent === 'creatable' || value.absent === 'invalid');
-const isKeyMapping = (value: unknown): value is KeyMapping => isRecord(value) && ((value.kind === 'map-key' && hasOnlyKeys(value, ['kind', 'mirrorPath', 'onMismatch']) && (value.mirrorPath === undefined || isStoragePath(value.mirrorPath)) && value.onMismatch === 'reject') || (value.kind === 'field' && hasOnlyKeys(value, ['kind', 'path']) && isStoragePath(value.path)));
+const isCollectionMapping = (value: unknown): value is CollectionMapping => isRecord(value)
+  && hasOnlyKeys(value, ['kind', 'path', 'absent'])
+  && isStoragePath(value.path)
+  && (value.kind === 'singleton'
+    ? value.absent === 'empty' || value.absent === 'invalid'
+    : (value.kind === 'object-map' || value.kind === 'array')
+      && (value.absent === 'empty' || value.absent === 'creatable' || value.absent === 'invalid'));
+const isKeyMapping = (value: unknown): value is KeyMapping => isRecord(value) && (
+  (value.kind === 'map-key' && hasOnlyKeys(value, ['kind', 'mirrorPath', 'onMismatch']) && (value.mirrorPath === undefined || isStoragePath(value.mirrorPath)) && value.onMismatch === 'reject')
+  || (value.kind === 'field' && hasOnlyKeys(value, ['kind', 'path']) && isStoragePath(value.path))
+  || (value.kind === 'literal' && hasOnlyKeys(value, ['kind', 'value']) && Object.hasOwn(value, 'value'))
+);
 const isFieldMapping = (value: unknown): value is FieldMapping => isRecord(value) && hasOnlyKeys(value, ['path', 'write']) && isStoragePath(value.path) && isRecord(value.write) && ((value.write.kind === 'read-only' && hasOnlyKeys(value.write, ['kind'])) || (value.write.kind === 'replace' && hasOnlyKeys(value.write, ['kind', 'capability']) && isCapabilityRef(value.write.capability)));
 const isStoragePath = (value: unknown): value is StoragePath => Array.isArray(value) && value.every((member) => (typeof member === 'string' && member.length > 0) || (typeof member === 'number' && Number.isSafeInteger(member) && member >= 0));
 const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value) && hasOnlyKeys(value, ['id', 'version', 'contractHash']) && typeof value.id === 'string' && value.id.length > 0 && typeof value.version === 'string' && value.version.length > 0 && isContentHash(value.contractHash);

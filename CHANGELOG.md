@@ -5,8 +5,13 @@ history.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-17
+
 ### Breaking changes
 
+- `projectStorage` now accepts one named options object instead of positional
+  registry, source, and relation-selection arguments. Adapter-specific scalar
+  decoding is an optional callback on that same options object.
 - Renamed the application-facing Automerge entry point and result from
   `openAutomergeAttachment`/`AutomergeAttachment` to
   `openAutomergeDatabase`/`AutomergeDatabase` so the primary API names the
@@ -26,6 +31,11 @@ history.
   catalog, membership, database, observer, maintenance, leases, and idempotent
   reverse-order cleanup while retaining explicit authority and membership
   policy.
+- Added root-object singleton storage mappings with explicit literal logical
+  keys. The Automerge adapter projects and replaces native byte fields through
+  one bidirectional scalar boundary without replacing unrelated document
+  metadata, and reads Automerge `ImmutableString` fields as ordinary logical
+  strings without changing their declared writability.
 
 ### Changed
 
@@ -50,6 +60,10 @@ history.
 - `DatabaseView.observe` now infers the exact result-row type carried by a
   typed prepared plan while preserving the database row type as the fallback
   for ordinary prepared plans.
+- Singleton Automerge mappings declare exact mapped-field dependencies, so
+  unrelated root metadata changes reuse the existing logical projection and do
+  not create false transaction overlap. Generic edit footprints now also
+  include stored key and mirror paths.
 
 ## [0.4.0] - 2026-07-16
 

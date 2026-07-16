@@ -73,9 +73,14 @@ const validateCollectionMapping = (
   path: readonly unknown[]
 ): void => {
   if (!semanticShape(context, input, ['kind', 'path', 'absent'], [], path)) return;
-  semanticEnumValue(context, input.kind, ['object-map', 'array'], [...path, 'kind']);
+  semanticEnumValue(context, input.kind, ['object-map', 'array', 'singleton'], [...path, 'kind']);
   validateStoragePath(context, input.path, [...path, 'path']);
-  semanticEnumValue(context, input.absent, ['empty', 'creatable', 'invalid'], [...path, 'absent']);
+  semanticEnumValue(
+    context,
+    input.absent,
+    input.kind === 'singleton' ? ['empty', 'invalid'] : ['empty', 'creatable', 'invalid'],
+    [...path, 'absent']
+  );
 };
 
 const validateKeyMapping = (
@@ -100,6 +105,10 @@ const validateKeyMapping = (
   if (input.kind === 'field') {
     semanticShape(context, input, ['kind', 'path'], [], path);
     validateStoragePath(context, input.path, [...path, 'path']);
+    return;
+  }
+  if (input.kind === 'literal') {
+    semanticShape(context, input, ['kind', 'value'], [], path);
     return;
   }
   semanticInvalid(context, [...path, 'kind'], 'unknown_key_mapping');

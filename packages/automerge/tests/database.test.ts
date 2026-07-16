@@ -17,6 +17,11 @@ type TaskDocument = {
   tasks: Record<string, { id: string; title: string }>;
 };
 
+type FileDocument = {
+  '@patchpit': { type: string };
+  content: Uint8Array;
+};
+
 describe('standard Automerge database', () => {
   it('rejects invalid database identities before reading metadata', async () => {
     const repo = new Repo();
@@ -80,6 +85,72 @@ describe('standard Automerge database', () => {
     expect(fixture.database.getSnapshot()).toEqual({ state: 'closed' });
     expect(catalog.list()).toHaveLength(0);
     await fixture.repo.shutdown();
+  });
+
+  it('opens and updates a native-byte root singleton through the standard database API', async () => {
+    const schema = await sealSchema({ id: 'urn:test:file:schema', body: {
+      relations: {
+        file: {
+          relationId: 'file',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string', values: ['content'] } },
+            content: { type: { kind: 'bytes' } }
+          }
+        }
+      }
+    } });
+    const mapping = await sealStorageMapping({ id: 'urn:test:file:mapping', body: {
+      schema: reference(schema),
+      model: 'json-tree-v1',
+      relations: {
+        file: {
+          collection: { kind: 'singleton', path: [], absent: 'invalid' },
+          keys: { id: { kind: 'literal', value: 'content' } },
+          fields: {
+            content: { path: ['content'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+          }
+        }
+      }
+    } });
+    const repo = new Repo();
+    const handle = repo.create<FileDocument>({
+      '@patchpit': { type: 'file-content' },
+      content: new Uint8Array([1, 2, 3])
+    });
+    const opened = await openAutomergeDatabase({
+      handle,
+      declaration: {
+        formatVersion: 1,
+        storageSchema: reference(schema),
+        projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
+      },
+      embeddedArtifacts: [schema, mapping],
+      authorityScope: 'scope:test'
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    expect(opened.value.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: {
+        readiness: 'ready',
+        rows: [{ fields: { id: 'content', content: { type: 'bytes', value: 'AQID' } } }]
+      }
+    });
+    const file = relationLiteral(schema, 'file');
+    await expect(opened.value.transact(
+      { kind: 'replace-content' },
+      (snapshot) => snapshot.withRows(
+        file,
+        snapshot.rows(file).map((row) => ({
+          ...row,
+          content: { kind: 'tarstate.value', type: 'bytes', value: 'BAU' }
+        }))
+      )
+    )).resolves.toMatchObject({ outcome: 'committed' });
+    expect([...(handle.doc()?.content ?? [])]).toEqual([4, 5]);
+    expect(handle.doc()?.['@patchpit']).toEqual({ type: 'file-content' });
+    opened.value.close();
+    await repo.shutdown();
   });
 
   it('accepts embedded artifact maps and runs standard logical constraints without host plumbing', async () => {

@@ -1,10 +1,10 @@
 import * as Automerge from '@automerge/automerge';
-import type { JsonValue } from '@tarstate/core';
 import { conflictsAt, type AutomergePath, type AutomergeProjectionIssue } from '../document/projection.js';
 import type { AutomergeSourceCommand } from '../source/runtime.js';
+import { valueAtAutomergePath } from './path-access.js';
 
 export type AutomergePropertyEdit =
-  | { readonly kind: 'replace'; readonly path: AutomergePath; readonly value: JsonValue }
+  | { readonly kind: 'replace'; readonly path: AutomergePath; readonly value: unknown }
   | { readonly kind: 'delete'; readonly path: AutomergePath };
 
 export const planPropertyEdit = <T extends object>(
@@ -54,15 +54,6 @@ export const planPropertyEdit = <T extends object>(
   };
 };
 
-export const valueAtAutomergePath = (root: unknown, path: AutomergePath): unknown => {
-  let current = root;
-  for (const part of path) {
-    if (current === null || typeof current !== 'object') return undefined;
-    current = (current as Record<string | number, unknown>)[part];
-  }
-  return current;
-};
-
 const firstConflictAlongPath = (
   doc: object,
   path: AutomergePath
@@ -99,6 +90,7 @@ const deleteAtPath = (root: unknown, path: AutomergePath): void => {
 
 const copyAutomergeValue = (value: unknown): unknown => {
   if (Automerge.isCounter(value)) return new Automerge.Counter(Number(value));
+  if (Automerge.isImmutableString(value)) return new Automerge.ImmutableString(value.toString());
   if (value instanceof Date) return new Date(value.getTime());
   if (value instanceof Uint8Array) return new Uint8Array(value);
   if (Array.isArray(value)) return value.map(copyAutomergeValue);

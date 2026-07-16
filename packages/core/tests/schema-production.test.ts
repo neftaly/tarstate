@@ -219,7 +219,7 @@ describe('production JSON-tree storage mappings', () => {
       notes: [{ id: 'duplicate', body: 'one' }, { id: 'duplicate', body: 'two' }],
       rootUnknown: true
     };
-    const projection = projectStorage(compiled.value, snapshot, registry, 'source:test');
+    const projection = projectStorage(compiled.value, snapshot, { registry, sourceId: 'source:test' });
     expect(projection.relations.get('test.user')?.rows).toMatchObject([{ row: { id: 'alice', nickname: null, code: { type: 'urn:test:upper' } } }]);
     expect(projection.issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'mapping.map_key_mismatch' }), expect.objectContaining({ code: 'schema.duplicate_key' })]));
     expect(projection.relations.get('test.note')?.rows).toHaveLength(2);
@@ -227,7 +227,7 @@ describe('production JSON-tree storage mappings', () => {
     expect(projection.completeness).toBe('unknown');
 
     const hostile = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error('inspection failed'); } });
-    const hostileProjection = projectStorage(compiled.value, hostile, registry, 'source:test');
+    const hostileProjection = projectStorage(compiled.value, hostile, { registry, sourceId: 'source:test' });
     expect(hostileProjection.completeness).toBe('unknown');
     expect(hostileProjection.issues).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'mapping.collection_invalid', details: { reason: 'inspection_failed', error: 'Error' } })]));
 
@@ -235,13 +235,18 @@ describe('production JSON-tree storage mappings', () => {
     const hostileNotes: unknown[] = [];
     Object.defineProperty(hostileNotes, 0, { enumerable: true, get: () => { getterCalls += 1; return { id: 'n' }; } });
     hostileNotes.length = 1;
-    expect(projectStorage(compiled.value, { users: {}, notes: hostileNotes }, registry).relations.get('test.note'))
+    expect(projectStorage(compiled.value, { users: {}, notes: hostileNotes }, { registry }).relations.get('test.note'))
       .toMatchObject({ completeness: 'unknown', issues: [{ code: 'mapping.collection_invalid', details: { reason: 'descriptor' } }] });
     expect(getterCalls).toBe(0);
 
     const plan = planStoragePatch(compiled.value, snapshot, 'test.user', { kind: 'object-map-key', key: 'alice' }, { nickname: 'Al' }, undefined, 'source:test');
     expect(plan).toMatchObject({ success: true, value: { intents: [{ path: ['users', 'alice', 'profile', 'nickname'] }] } });
     if (!plan.success) throw new Error('plan failed');
+    expect(plan.value.readFootprint).toEqual(expect.arrayContaining([
+      ['users', 'alice', 'id'],
+      ['users', 'alice', 'profile', 'nickname'],
+      ['users', 'alice', 'code']
+    ]));
     expect(Object.isFrozen(plan.value.nextSnapshot)).toBe(true);
     expect(Object.isFrozen((plan.value.nextSnapshot as typeof snapshot).users.alice.profile)).toBe(true);
     expect(plan.value.nextSnapshot).toEqual({
@@ -258,6 +263,104 @@ describe('production JSON-tree storage mappings', () => {
     expect(planStoragePatch(compiled.value, hostileSibling, 'test.user', { kind: 'object-map-key', key: 'alice' }, { nickname: 'Al' }))
       .toMatchObject({ success: false, issues: [{ code: 'mapping.path_invalid', details: { reason: 'descriptor' } }] });
     expect(getterCalls).toBe(0);
+  });
+
+  it('projects and updates one explicitly keyed singleton without replacing its container', () => {
+    const schema = prepareSchema({
+      relations: {
+        settings: {
+          relationId: 'test.settings',
+          key: ['id'],
+          fields: {
+            id: { type: { kind: 'string', values: ['settings'] } },
+            title: { type: { kind: 'string' } }
+          }
+        }
+      }
+    });
+    if (!schema.success) throw new Error('singleton schema failed');
+    const mapping: StorageMappingBody = {
+      schema: schemaRef,
+      model: 'json-tree-v1',
+      relations: {
+        'test.settings': {
+          collection: { kind: 'singleton', path: [], absent: 'invalid' },
+          keys: { id: { kind: 'literal', value: 'settings' } },
+          fields: {
+            title: { path: ['title'], write: { kind: 'replace', capability: replaceRef } }
+          }
+        }
+      }
+    };
+    const compiled = compileStorageMapping(mapping, schemaRef, schema.value);
+    if (!compiled.success) throw new Error('singleton mapping failed');
+    const snapshot = { title: 'Before', metadata: { retained: true } };
+    expect(projectStorage(compiled.value, snapshot)).toMatchObject({
+      completeness: 'exact',
+      relations: expect.any(Object)
+    });
+    expect(projectStorage(compiled.value, snapshot).relations.get('test.settings')?.rows).toMatchObject([
+      { key: ['settings'], row: { id: 'settings', title: 'Before' }, locator: { kind: 'singleton' } }
+    ]);
+    expect(planStoragePatch(compiled.value, snapshot, 'test.settings', { kind: 'singleton' }, { title: 'After' }))
+      .toMatchObject({
+        success: true,
+        value: {
+          intents: [{ path: ['title'], value: 'After' }],
+          nextSnapshot: { title: 'After', metadata: { retained: true } }
+        }
+      });
+    expect(compileStorageMapping({
+      ...mapping,
+      relations: {
+        'test.settings': {
+          ...mapping.relations['test.settings'],
+          collection: { kind: 'array', path: [], absent: 'invalid' },
+          keys: { id: { kind: 'literal', value: 'settings' } }
+        }
+      }
+    }, schemaRef, schema.value)).toMatchObject({ success: false, issues: [{ code: 'mapping.key_invalid' }] });
+    expect(compileStorageMapping({
+      ...mapping,
+      relations: {
+        'test.settings': {
+          ...mapping.relations['test.settings'],
+          keys: { id: null }
+        }
+      }
+    }, schemaRef, schema.value)).toMatchObject({ success: false, issues: [{ code: 'mapping.key_invalid' }] });
+
+    const nestedMapping = (absent: 'empty' | 'invalid'): StorageMappingBody => ({
+      ...mapping,
+      relations: {
+        'test.settings': {
+          ...mapping.relations['test.settings']!,
+          collection: { kind: 'singleton', path: ['settings'], absent }
+        }
+      }
+    });
+    const empty = compileStorageMapping(nestedMapping('empty'), schemaRef, schema.value);
+    const invalid = compileStorageMapping(nestedMapping('invalid'), schemaRef, schema.value);
+    if (!empty.success || !invalid.success) throw new Error('nested singleton mapping failed');
+    expect(projectStorage(empty.value, {})).toMatchObject({ completeness: 'exact', issues: [] });
+    expect(projectStorage(empty.value, {}).relations.get('test.settings')?.rows).toEqual([]);
+    expect(projectStorage(invalid.value, {})).toMatchObject({
+      completeness: 'unknown',
+      issues: [{ code: 'mapping.collection_absent', path: ['settings'] }]
+    });
+    expect(projectStorage(compiled.value, snapshot, {
+      sourceId: 'source:settings',
+      scalarDecoder: () => { throw new Error('host decoder failed'); }
+    })).toMatchObject({
+      completeness: 'unknown',
+      issues: [{
+        code: 'mapping.candidate_invalid',
+        sourceId: 'source:settings',
+        relationId: 'test.settings',
+        path: ['title'],
+        details: { reason: 'decode_threw', error: 'Error', field: 'title' }
+      }]
+    });
   });
 
   it('owns compiled mapping paths and prevents mutation of the compiled relation lookup', async () => {

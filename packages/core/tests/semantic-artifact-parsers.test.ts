@@ -239,6 +239,15 @@ describe('semantic artifact safe parsers', () => {
     const unknownMember = mutate(mappingBody(), (body) => { body.relations['test.person'].collection.ambient = true; });
     expect(await safeParseStorageMappingArtifact(await seal('storage-mapping', unknownMember)))
       .toMatchObject({ success: false, issues: [{ details: { reason: 'unknown_member' } }] });
+    const singleton = mutate(mappingBody(), (body) => {
+      body.relations['test.person'].collection = { kind: 'singleton', path: [], absent: 'invalid' };
+      body.relations['test.person'].keys = { id: { kind: 'literal', value: 'person' } };
+    });
+    expect(await safeParseStorageMappingArtifact(await seal('storage-mapping', singleton)))
+      .toMatchObject({ success: true });
+    const creatableSingleton = mutate(singleton, (body) => { body.relations['test.person'].collection.absent = 'creatable'; });
+    expect(await safeParseStorageMappingArtifact(await seal('storage-mapping', creatableSingleton)))
+      .toMatchObject({ success: false });
   });
 
   it('parses and prepares the complete schema-lens step subset with exact members', async () => {

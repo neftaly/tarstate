@@ -14,8 +14,8 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.4.0.tgz \
-  ./tarstate-automerge-0.4.0.tgz \
+  ./tarstate-core-0.4.1.tgz \
+  ./tarstate-automerge-0.4.1.tgz \
   @automerge/automerge
 ```
 
@@ -95,6 +95,32 @@ array or a record keyed by exact artifact ID. A keyed record rejects entries
 whose embedded `id` disagrees with its key. The standard constraint evaluator
 uses a deterministic work budget; exhausting it makes the constraint result
 indeterminate and prevents publication.
+
+A document whose root is one logical entity needs no artificial array or
+object-map wrapper. Its storage mapping uses an explicit singleton and literal
+logical key:
+
+```ts
+{
+  collection: { kind: 'singleton', path: [], absent: 'invalid' },
+  keys: { id: { kind: 'literal', value: 'content' } },
+  fields: {
+    content: {
+      path: ['content'],
+      write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace }
+    }
+  }
+}
+```
+
+Mapped Automerge `Uint8Array` fields cross the adapter's standard scalar
+boundary as canonical Tarstate `bytes` values and are written back as native
+bytes. Root-field replacement preserves unrelated namespaced metadata.
+Automerge `ImmutableString` fields declared as logical strings cross the same
+boundary as ordinary strings. A read-only mapping can therefore query foreign
+immutable text without upgrading its write capability or exposing an
+Automerge-specific logical type. If a mapping deliberately enables replacement,
+the replacement is written as an ordinary Automerge string.
 
 `getSnapshot` and `subscribe` form a synchronous external-store boundary. The
 snapshot reports readiness, exactness, freshness, source lifecycle, basis, and

@@ -6,6 +6,7 @@ import {
   exactAutomergeBasisEqual,
   type AutomergeSourceCommitResult
 } from '../src/source/runtime.js';
+import { createAutomergeStorageScalarCodec } from '../src/adapter/scalar-codec.js';
 import { propertyTest } from './support/property-test.js';
 
 type TestDoc = {
@@ -78,6 +79,27 @@ const hash = (digit: number): `sha256:${string}` => `sha256:${(digit & 15).toStr
 const ledgerKey = (epoch: number, operation: number): string => epoch + '\u0000' + operation;
 
 describe('Automerge shrinking model properties', () => {
+  propertyTest('native-bytes-round-trip-through-the-storage-scalar-codec', fc.property(
+    fc.uint8Array({ maxLength: 16_384 }),
+    (bytes) => {
+      const codec = createAutomergeStorageScalarCodec();
+      const context = {
+        declaration: { type: { kind: 'bytes' as const } },
+        relationId: 'relation:bytes',
+        field: 'content',
+        path: ['content']
+      };
+      const decoded = codec.decode({ ...context, value: bytes });
+      expect(decoded.success).toBe(true);
+      if (!decoded.success) return;
+      const cached = codec.decode({ ...context, value: bytes });
+      if (cached.success) expect(cached.value).toBe(decoded.value);
+      const encoded = codec.encode({ ...context, value: decoded.value });
+      expect(encoded).toMatchObject({ success: true });
+      if (encoded.success) expect(encoded.value).toEqual(bytes);
+    }
+  ));
+
   propertyTest('concurrent disjoint player maps survive local commit and merge', fc.asyncProperty(
     fc.dictionary(key, fc.integer({ min: -20, max: 20 }), { minKeys: 1, maxKeys: 8 }),
     fc.dictionary(key, fc.integer({ min: -20, max: 20 }), { minKeys: 1, maxKeys: 8 }),

@@ -38,6 +38,17 @@ type TaskDoc = {
   }>;
 };
 
+type FileDoc = {
+  '@patchpit': { type: string; revision: number };
+  content: Uint8Array;
+  mimeType?: string;
+};
+
+type ForeignTextFileDoc = {
+  '@patchwork': { type: string };
+  content: Automerge.ImmutableString;
+};
+
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;
 
 const fixture = async (doc: TaskDoc = {
@@ -90,11 +101,216 @@ const fixture = async (doc: TaskDoc = {
   return { runtime, source, binding, registry, schemaArtifact, mappingArtifact };
 };
 
+const singletonFixture = async () => {
+  const registry = new CapabilityRegistry('registry:singleton');
+  await registerBuiltInCapabilities(registry);
+  registry.registerImplementation({
+    ref: builtInCapabilityRefs.fieldReplace,
+    integrity: 'builtin:test',
+    implementation: Object.freeze({ kind: 'field-replace' })
+  });
+  const schemaArtifact = await sealSchema({ id: 'urn:test:file-schema', body: {
+    relations: {
+      file: {
+        relationId: 'relation:file',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string', values: ['content'] } },
+          content: { type: { kind: 'bytes' } },
+          mimeType: { type: { kind: 'string' }, optional: true }
+        }
+      }
+    }
+  } });
+  const schemaRef = { id: schemaArtifact.id, contentHash: schemaArtifact.contentHash };
+  const schema = prepareSchema(schemaArtifact.body, registry);
+  if (!schema.success) throw new Error('singleton schema fixture failed');
+  const body: StorageMappingBody = {
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: {
+      'relation:file': {
+        collection: { kind: 'singleton', path: [], absent: 'invalid' },
+        keys: { id: { kind: 'literal', value: 'content' } },
+        fields: {
+          content: { path: ['content'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+          mimeType: { path: ['mimeType'], write: { kind: 'read-only' } }
+        }
+      }
+    }
+  };
+  const compiled = compileStorageMapping(body, schemaRef, schema.value, registry);
+  if (!compiled.success) throw new Error('singleton mapping fixture failed');
+  const runtime = new AutomergeSourceRuntime<FileDoc>({
+    sourceId: 'source:file',
+    doc: Automerge.from<FileDoc>({
+      '@patchpit': { type: 'file-content', revision: 1 },
+      content: new Uint8Array([1, 2, 255]),
+      mimeType: 'application/octet-stream'
+    })
+  });
+  const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
+  const binding = new AutomergeMappedStorageBinding<FileDoc>({ id: 'binding:file', mapping: compiled.value, registry });
+  return { runtime, source, binding };
+};
+
+const immutableTextSingletonFixture = async () => {
+  const registry = new CapabilityRegistry('registry:immutable-text-singleton');
+  await registerBuiltInCapabilities(registry);
+  const schemaArtifact = await sealSchema({ id: 'urn:test:immutable-text-file-schema', body: {
+    relations: {
+      file: {
+        relationId: 'relation:immutable-text-file',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string', values: ['content'] } },
+          content: { type: { kind: 'string' } }
+        }
+      }
+    }
+  } });
+  const schemaRef = { id: schemaArtifact.id, contentHash: schemaArtifact.contentHash };
+  const schema = prepareSchema(schemaArtifact.body, registry);
+  if (!schema.success) throw new Error('immutable text singleton schema fixture failed');
+  const body: StorageMappingBody = {
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: {
+      'relation:immutable-text-file': {
+        collection: { kind: 'singleton', path: [], absent: 'invalid' },
+        keys: { id: { kind: 'literal', value: 'content' } },
+        fields: {
+          content: { path: ['content'], write: { kind: 'read-only' } }
+        }
+      }
+    }
+  };
+  const compiled = compileStorageMapping(body, schemaRef, schema.value, registry);
+  if (!compiled.success) throw new Error('immutable text singleton mapping fixture failed');
+  const runtime = new AutomergeSourceRuntime<ForeignTextFileDoc>({
+    sourceId: 'source:immutable-text-file',
+    doc: Automerge.from<ForeignTextFileDoc>({
+      '@patchwork': { type: 'file' },
+      content: new Automerge.ImmutableString('Collaborative text')
+    })
+  });
+  const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
+  const binding = new AutomergeMappedStorageBinding<ForeignTextFileDoc>({
+    id: 'binding:immutable-text-file',
+    mapping: compiled.value,
+    registry
+  });
+  return { runtime, source, binding };
+};
+
 const commit = (basis: JsonValue, operationId: string, digit: string) => ({
   operationEpoch: 'epoch:mapped', operationId, expectedBasis: basis, intentHash: hash(digit)
 });
 
 describe('compiled-mapping-backed Automerge storage binding', () => {
+  it('reads a foreign immutable string as logical text without making it writable', async () => {
+    const { source, binding } = await immutableTextSingletonFixture();
+    const projection = binding.project(source.snapshot());
+    expect(projection).toMatchObject({
+      completeness: 'exact',
+      rows: [{
+        relationId: 'relation:immutable-text-file',
+        key: ['content'],
+        fields: { id: 'content', content: 'Collaborative text' },
+        storagePath: []
+      }]
+    });
+    expect(binding.declaredWriteFootprint.entries).toEqual([]);
+
+    const row = projection.rows[0]!;
+    const replaced = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'replace-fields',
+        relationId: row.relationId,
+        key: row.key as JsonValue,
+        locator: row.locator as unknown as JsonValue,
+        fields: { content: 'Changed' }
+      }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:replace-immutable-text', 'd')
+    });
+    expect(replaced).toMatchObject({ outcome: 'rejected', issues: [{ code: 'mapping.field_read_only' }] });
+    source.close();
+  });
+
+  it('projects and replaces native bytes through a durable root singleton without touching metadata', async () => {
+    const { runtime, source, binding } = await singletonFixture();
+    const projection = binding.project(source.snapshot());
+    expect(projection).toMatchObject({
+      completeness: 'exact',
+      rows: [{
+        relationId: 'relation:file',
+        key: ['content'],
+        fields: {
+          id: 'content',
+          content: { kind: 'tarstate.value', type: 'bytes', value: 'AQL_' },
+          mimeType: 'application/octet-stream'
+        },
+        storagePath: []
+      }]
+    });
+    expect(binding.declaredReadFootprint.entries).toEqual(expect.arrayContaining([
+      { scope: 'subtree', path: ['content'] },
+      { scope: 'subtree', path: ['mimeType'] }
+    ]));
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
+      draft['@patchpit'].revision = 2;
+    }));
+    expect(binding.project(source.snapshot())).toBe(projection);
+
+    const row = projection.rows[0]!;
+    const replaced = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'replace-fields',
+        relationId: row.relationId,
+        key: row.key as JsonValue,
+        locator: row.locator as unknown as JsonValue,
+        fields: { content: { kind: 'tarstate.value', type: 'bytes', value: '_wA' } }
+      }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:replace-bytes', 'e')
+    });
+    expect(replaced.outcome).toBe('committed');
+    expect([...runtime.snapshot().storage.content]).toEqual([255, 0]);
+    expect(runtime.snapshot().storage['@patchpit']).toEqual({ type: 'file-content', revision: 2 });
+
+    const current = binding.project(source.snapshot()).rows[0]!;
+    const deleted = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{ kind: 'delete', relationId: current.relationId, key: current.key as JsonValue, locator: current.locator as unknown as JsonValue }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:delete-singleton', 'f')
+    });
+    expect(deleted).toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.capability_unavailable' }] });
+    source.close();
+  });
+
+  it('withholds a singleton row when its mapped root field has concurrent values', async () => {
+    const { runtime, source, binding } = await singletonFixture();
+    const base = runtime.snapshot().storage;
+    const left = Automerge.change(Automerge.clone(base), (draft) => {
+      draft.content = new Uint8Array([2]);
+    });
+    const right = Automerge.change(Automerge.clone(base), (draft) => {
+      draft.content = new Uint8Array([3]);
+    });
+    runtime.replace(Automerge.merge(left, right));
+    expect(binding.project(source.snapshot())).toMatchObject({
+      completeness: 'unknown',
+      rows: [],
+      issues: [{ code: 'automerge.conflict_observed', path: ['content'] }]
+    });
+    source.close();
+  });
+
   it('projects mapped nested fields and preserves unknown storage through replacements', async () => {
     const { runtime, source, binding } = await fixture();
     const projection = binding.project(source.snapshot());
