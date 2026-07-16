@@ -2,7 +2,11 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
 import type { DatabaseView, QueryObserver } from '../src/observer.js';
-import type { OpenDatabaseQueryOptions } from '../src/database/query-session.js';
+import {
+  openDatabaseQuery,
+  type DatabaseSourceLink,
+  type OpenDatabaseQueryOptions
+} from '../src/database/query-session.js';
 import type { QueryNode, QueryRecord, RelationInput } from '../src/query/model.js';
 import type { PreparedPlan } from '../src/query/plan-contract.js';
 import { pipe } from '../src/query/builder.js';
@@ -37,7 +41,8 @@ import {
   type RuntimeQueryParameters,
   type RuntimeQueryResultRow,
   type SchemaKey,
-  type SchemaRow
+  type SchemaRow,
+  type TypedPreparedPlan
 } from '../src/type-authoring.js';
 
 const hash = (character: string) => `sha256:${character.repeat(64)}` as const;
@@ -157,6 +162,35 @@ describe('literal-schema and query type authoring', () => {
       expectTypeOf(database.observe({ plan: untypedPlan })).toEqualTypeOf<QueryObserver<QueryRecord>>();
     };
     expectTypeOf(assertObservationTypes).toBeFunction();
+
+    type LinkPlan = TypedPreparedPlan<QueryNode, DatabaseSourceLink, {}>;
+    const openLinked = (linkPlan: LinkPlan) => openDatabaseQuery({
+      sources: [],
+      plan: prepared,
+      parameters: { minimumScore: 1 },
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: {
+        plan: linkPlan,
+        openSource: () => undefined
+      }
+    });
+    expectTypeOf(openLinked).returns.toEqualTypeOf<ReturnType<typeof openLinked>>();
+
+    const rejectsNonLinkRows = (linkPlan: typeof prepared): OpenDatabaseQueryOptions<
+      typeof prepared,
+      typeof prepared
+    > => ({
+      sources: [],
+      plan: prepared,
+      parameters: { minimumScore: 1 },
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: {
+        // @ts-expect-error source-link plans must produce DatabaseSourceLink rows
+        plan: linkPlan,
+        openSource: () => undefined
+      }
+    });
+    expectTypeOf(rejectsNonLinkRows).toBeFunction();
   });
 
   it('ties reference values to target key tuples and keeps typed operators pipe-compatible', async () => {

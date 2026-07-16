@@ -177,7 +177,17 @@ export class AttachmentCatalog {
 const normalizeMembers = (members: readonly DatasetMember[]): readonly DatasetMember[] => {
   const byAttachment = new Map<string, DatasetMember>();
   for (const member of members) {
-    const normalized = Object.freeze({ ...member, discoveryEdges: Object.freeze([...new Set(member.discoveryEdges)].sort()) });
+    const sourceAvailability = member.sourceAvailability === undefined
+      ? undefined
+      : Object.freeze({
+          state: member.sourceAvailability.state,
+          issues: Object.freeze([...member.sourceAvailability.issues])
+        });
+    const normalized = Object.freeze({
+      ...member,
+      discoveryEdges: Object.freeze([...new Set(member.discoveryEdges)].sort()),
+      ...(sourceAvailability === undefined ? {} : { sourceAvailability })
+    });
     const existing = byAttachment.get(member.attachmentId);
     if (existing !== undefined && canonicalizeJson(existing as never) !== canonicalizeJson(normalized as never)) throw new Error('Ambiguous dataset member ' + member.attachmentId);
     byAttachment.set(member.attachmentId, normalized);

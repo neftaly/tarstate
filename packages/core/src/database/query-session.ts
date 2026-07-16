@@ -1,4 +1,8 @@
 import { AttachmentCatalog, DatasetMembership, type DatasetMember } from '../database.js';
+import type {
+  DatabaseSourceLinkFollower,
+  NormalizedFollowSourceLinks
+} from './follow-source-links.js';
 import { createIncrementalDatabaseQueryMaintenance } from '../internal-observer-query-maintenance.js';
 import { runObserverCleanups, type ObserverDiagnosticReporter } from '../observer-diagnostics.js';
 import { DatabaseView, type ObserverChange, type ObserverSnapshot, type QueryObserver } from '../observer.js';
@@ -6,25 +10,23 @@ import type { PreparedPlanParameters, PreparedPlanRow } from '../query/authoring
 import type { PreparedPlan } from '../query/plan-contract.js';
 import type { QueryNode, QueryRecord, RelationInput } from '../query/model.js';
 import type { JsonValue } from '../value.js';
+import type { DatabaseSourceLink } from './source-link-graph.js';
+import { parseObservationParameters } from '../internal-observer-values.js';
+import { assertPreparedPlan } from '../query/internal/prepared-plan.js';
+import type {
+  DatabaseSourceMountLease,
+  MountableDatabaseSource,
+  OpenLinkedDatabaseSource
+} from './source-mount.js';
 
-export type DatabaseSourceMountOptions = {
-  readonly discoveryEdges?: readonly string[];
-};
-
-export type DatabaseSourceMountLease = {
-  readonly attachmentId: string;
-  readonly sourceId: string;
-  readonly discoveryEdges: readonly string[];
-  readonly close: () => void;
-};
-
-/** Minimal structural protocol shared by official and application database sources. */
-export type MountableDatabaseSource = {
-  readonly mount: (
-    catalog: AttachmentCatalog,
-    options?: DatabaseSourceMountOptions
-  ) => DatabaseSourceMountLease | Promise<DatabaseSourceMountLease>;
-};
+export type { DatabaseSourceLink } from './source-link-graph.js';
+export type {
+  DatabaseSourceMountLease,
+  DatabaseSourceMountOptions,
+  MountableDatabaseSource,
+  OpenLinkedDatabaseSource,
+  OpenLinkedDatabaseSourceRequest
+} from './source-mount.js';
 
 export type UnresolvedDatabaseSource = {
   readonly attachmentId: string;
@@ -71,7 +73,25 @@ type SessionParameterOptions<Plan> = [PreparedPlanParameters<Plan>] extends [nev
     ? { readonly parameters?: SessionParameters<Plan> }
     : { readonly parameters: SessionParameters<Plan> };
 
-export type OpenDatabaseQueryOptions<Plan extends PreparedPlan<QueryNode>> = {
+type SourceLinkPlan<Plan extends PreparedPlan<QueryNode>> = [PreparedPlanRow<Plan>] extends [never]
+  ? Plan
+  : PreparedPlanRow<Plan> extends DatabaseSourceLink
+    ? Plan
+    : never;
+
+export type FollowDatabaseSourceLinksOptions<
+  LinkPlan extends PreparedPlan<QueryNode> = PreparedPlan<QueryNode>
+> = {
+  /** Query rows describe links from an attached source to another source. */
+  readonly plan: SourceLinkPlan<LinkPlan>;
+  /** Host-owned source opening; Tarstate owns mounting, cancellation, and cleanup. */
+  readonly openSource: OpenLinkedDatabaseSource;
+} & SessionParameterOptions<LinkPlan>;
+
+export type OpenDatabaseQueryOptions<
+  Plan extends PreparedPlan<QueryNode>,
+  LinkPlan extends PreparedPlan<QueryNode> = PreparedPlan<QueryNode>
+> = {
   readonly sources: readonly DatabaseQuerySource[];
   readonly plan: Plan;
   readonly queryAuthorityScope: string;
@@ -79,16 +99,34 @@ export type OpenDatabaseQueryOptions<Plan extends PreparedPlan<QueryNode>> = {
   readonly canRead?: (context: DatabaseQueryReadContext) => boolean;
   readonly allowPartial?: boolean;
   readonly onDiagnostic?: ObserverDiagnosticReporter;
+  /** Repeatedly follows query-produced source links until the reachable set settles. */
+  readonly followSourceLinks?: FollowDatabaseSourceLinksOptions<LinkPlan>;
 } & SessionParameterOptions<Plan>;
 
 /** One owned query lifecycle over mounted or unresolved sources and incremental maintenance. */
 export type DatabaseQuerySession<Row> = QueryObserver<Row>;
 
-export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
-  options: OpenDatabaseQueryOptions<Plan>
+export const openDatabaseQuery = async <
+  Plan extends PreparedPlan<QueryNode>,
+  LinkPlan extends PreparedPlan<QueryNode> = PreparedPlan<QueryNode>
+>(
+  options: OpenDatabaseQueryOptions<Plan, LinkPlan>
 ): Promise<DatabaseQuerySession<SessionRow<Plan>>> => {
   if (typeof options.queryAuthorityScope !== 'string' || options.queryAuthorityScope.length === 0) {
     throw new TypeError('queryAuthorityScope must be a non-empty string');
+  }
+  assertPreparedPlan(options.plan);
+  const parameters = parseObservationParameters(options.parameters ?? {});
+  let sourceLinks: {
+    readonly runtime: typeof import('./follow-source-links.js');
+    readonly options: NormalizedFollowSourceLinks;
+  } | undefined;
+  if (options.followSourceLinks !== undefined) {
+    const runtime = await import('./follow-source-links.js');
+    sourceLinks = {
+      runtime,
+      options: runtime.normalizeFollowSourceLinks(options.followSourceLinks, options.plan)
+    };
   }
   const sources = normalizeDatabaseQuerySources(options.sources);
   const catalog = new AttachmentCatalog(
@@ -97,6 +135,9 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
   const leases: DatabaseSourceMountLease[] = [];
   let database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
   let observer: QueryObserver<SessionRow<Plan>> | undefined;
+  let sourceLinkDatabase: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
+  let sourceLinkObserver: QueryObserver<QueryRecord> | undefined;
+  let sourceLinkFollower: DatabaseSourceLinkFollower | undefined;
 
   try {
     const members: DatasetMember[] = [];
@@ -131,30 +172,62 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
       members,
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
     });
-    database = new DatabaseView({
-      authorityScope: options.queryAuthorityScope,
-      authorityFingerprint: options.plan.authorityFingerprint,
-      registryFingerprint: options.plan.registryFingerprint,
-      attachments: catalog,
-      datasets: [membership],
-      canRead: (queryAuthorityScope, sourceAuthorityScope, attachmentId) => {
-        if (options.canRead === undefined) {
-          return queryAuthorityScope === sourceAuthorityScope;
-        }
-        return options.canRead({ queryAuthorityScope, sourceAuthorityScope, attachmentId });
-      },
-      createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(),
-      ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
-    });
+    const createDatabase = (datasetMembership = membership): DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> =>
+      new DatabaseView({
+        authorityScope: options.queryAuthorityScope,
+        authorityFingerprint: options.plan.authorityFingerprint,
+        registryFingerprint: options.plan.registryFingerprint,
+        attachments: catalog,
+        datasets: [datasetMembership],
+        canRead: (queryAuthorityScope, sourceAuthorityScope, attachmentId) => {
+          if (options.canRead === undefined) {
+            return queryAuthorityScope === sourceAuthorityScope;
+          }
+          return options.canRead({ queryAuthorityScope, sourceAuthorityScope, attachmentId });
+        },
+        createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(),
+        ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
+      });
+    if (sourceLinks !== undefined) {
+      const sourceLinkMembership = new DatasetMembership({
+        datasetId: options.plan.datasetId,
+        state: 'settled',
+        members: membership.snapshot().members.map((member) => ({
+          ...member,
+          expectation: 'optional'
+        })),
+        ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
+      });
+      sourceLinkDatabase = createDatabase(sourceLinkMembership);
+      const openedSourceLinkObserver = sourceLinkDatabase.observe({
+        plan: sourceLinks.options.plan,
+        parameters: sourceLinks.options.parameters,
+        allowPartial: true
+      }) as QueryObserver<QueryRecord>;
+      sourceLinkObserver = openedSourceLinkObserver;
+      sourceLinkFollower = sourceLinks.runtime.followDatabaseSourceLinks({
+        observer: openedSourceLinkObserver,
+        catalog,
+        membership,
+        sourceLinkMembership,
+        rootMembers: membership.snapshot().members,
+        openSource: sourceLinks.options.openSource,
+        ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
+      });
+    }
+    database = createDatabase();
     observer = database.observe({
       plan: options.plan,
-      parameters: (options.parameters ?? {}) as Readonly<Record<string, JsonValue>>,
+      parameters,
       ...(options.allowPartial === undefined ? {} : { allowPartial: options.allowPartial })
     });
   } catch (error) {
     const cleanups = [
       ...(observer === undefined ? [] : [() => observer?.close()]),
       ...(database === undefined ? [] : [() => database?.close()]),
+      ...(sourceLinkFollower === undefined ? [] : [() => sourceLinkFollower?.close()]),
+      ...(sourceLinkObserver === undefined ? [] : [() => sourceLinkObserver?.close()]),
+      ...(sourceLinkDatabase === undefined ? [] : [() => sourceLinkDatabase?.close()]),
       ...[...leases].reverse().map((lease) => () => lease.close())
     ];
     runObserverCleanups(
@@ -167,6 +240,9 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
 
   const openedObserver = observer;
   const openedDatabase = database;
+  const openedSourceLinkFollower = sourceLinkFollower;
+  const openedSourceLinkObserver = sourceLinkObserver;
+  const openedSourceLinkDatabase = sourceLinkDatabase;
   let closed = false;
   return Object.freeze({
     getSnapshot: (): ObserverSnapshot<SessionRow<Plan>> => openedObserver.getSnapshot(),
@@ -179,6 +255,9 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
         [
           () => openedObserver.close(),
           () => openedDatabase.close(),
+          ...(openedSourceLinkFollower === undefined ? [] : [() => openedSourceLinkFollower.close()]),
+          ...(openedSourceLinkObserver === undefined ? [] : [() => openedSourceLinkObserver.close()]),
+          ...(openedSourceLinkDatabase === undefined ? [] : [() => openedSourceLinkDatabase.close()]),
           ...[...leases].reverse().map((lease) => () => lease.close())
         ],
         { component: 'database-view', operation: 'close-database-query' },

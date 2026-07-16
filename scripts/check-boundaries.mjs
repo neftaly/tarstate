@@ -172,9 +172,14 @@ assignArchitectureGroup('observer', [
   'observer.ts'
 ]);
 assignArchitectureGroup('observer-incremental', ['internal-observer-maintenance-frames.ts', 'internal-observer-query-maintenance.ts']);
+assignArchitectureGroup('database-session', [
+  'database/follow-source-links.ts',
+  'database/query-session.ts',
+  'database/source-link-graph.ts',
+  'database/source-mount.ts'
+]);
 assignArchitectureGroup('system', ['system-relations.ts']);
 assignArchitectureGroup('composition', [
-  'database/query-session.ts',
   'golden-workloads.ts',
   'index.ts',
   'query.ts',
@@ -204,6 +209,7 @@ const allowedArchitectureDependencies = new Map(Object.entries({
   'observer-contract': ['foundation', 'source-contract', 'query-model'],
   'observer': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract'],
   'observer-incremental': ['foundation', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer'],
+  'database-session': ['foundation', 'source-contract', 'query-model', 'query-batch', 'observer-contract', 'observer', 'observer-incremental'],
   'system': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'transaction-runtime'],
   'composition': [...new Set(architectureGroups.values())]
 }));
@@ -237,7 +243,7 @@ const publicRuntimePolicies = new Map(Object.entries({
   'artifacts/storage-mapping/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
   'artifacts/schema-lens/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
   'database/observer/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
-  'database/session/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'attachment-runtime', 'observer-contract', 'observer', 'observer-incremental'],
+  'database/session/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'attachment-runtime', 'observer-contract', 'observer', 'observer-incremental', 'database-session'],
   'database/incremental/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer', 'observer-incremental'],
   'database/external-store/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
   'database/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'transaction-runtime', 'attachment-runtime', 'observer-contract', 'observer', 'system'],

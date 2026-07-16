@@ -1,4 +1,5 @@
 import type { AttachmentProjection } from './attachment/model.js';
+import type { Issue } from './issues.js';
 import type { ObservableSource, SourceSnapshot } from './source-state.js';
 
 export type DatabaseAttachment<Storage = unknown, Projection = unknown> = {
@@ -18,6 +19,10 @@ export type DatasetMember = {
   readonly sourceId: string;
   readonly expectation: 'required' | 'optional';
   readonly discoveryEdges: readonly string[];
+  readonly sourceAvailability?: {
+    readonly state: 'loading' | 'missing' | 'failed';
+    readonly issues: readonly Issue[];
+  };
 };
 
 export type DatasetSnapshot = {

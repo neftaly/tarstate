@@ -168,6 +168,32 @@ same list: `{ unresolved: { attachmentId, sourceId } }`. A required unresolved
 source makes the snapshot incomplete; Tarstate never fetches it or silently
 treats it as an empty relation.
 
+When rows in one source link to other sources, the same session can maintain
+the reachable source set. A source-link query returns `linkId`,
+`originSourceId`, `targetSourceId`, optional `targetAttachmentId`, and optional
+`expectation` (`required` by default):
+
+```ts
+const session = await openDatabaseQuery({
+  sources: [{ source: rootSource }],
+  plan: applicationPlan,
+  queryAuthorityScope: authorityScope,
+  followSourceLinks: {
+    plan: sourceLinkPlan,
+    openSource: ({ sourceId, attachmentId, signal }) =>
+      sourceStore.open({ sourceId, attachmentId, signal })
+  }
+});
+```
+
+The opener only translates portable source identity into a mountable source.
+Tarstate owns fixed-point traversal, deduplication, cycles, readiness,
+cancellation, and cleanup. A required link makes the application query
+incomplete while it opens and invalid if resolution fails. Removing the
+last reachable link aborts pending work and closes its mounted subtree. The
+source-link query and application query must use the same dataset, registry,
+and authority fingerprints.
+
 Adapter authors import `prepareManualReadOnlyAttachment`,
 `prepareDatabaseAttachment`, and `createAttachmentTransactionService` from
 `@tarstate/core/attachment/adapter`. Custom adapters implement the small

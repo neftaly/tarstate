@@ -110,7 +110,7 @@ type CaptureObservationEvidence = {
   readonly sourceStates: readonly SourceEvidence[];
   readonly issues: readonly Issue[];
   readonly freshness: ObservedQueryResult<never>['freshness'];
-  readonly requiredProjectionInvalid: boolean;
+  readonly requiredInputInvalid: boolean;
   readonly requiredUnavailable: boolean;
 };
 
@@ -484,7 +484,7 @@ class SharedObservation<Query, Row, Projection> {
     if (inputsIncomplete && !(this.#options.allowPartial && completeness === 'lower-bound')) completeness = 'unknown';
     const rows = completeness === 'unknown' ? [] : maintained.rows;
     const resultKeys = completeness === 'unknown' ? [] : maintained.resultKeys;
-    const readiness = captureEvidence.requiredProjectionInvalid || evaluationInvalid
+    const readiness = captureEvidence.requiredInputInvalid || evaluationInvalid
       ? 'invalid'
       : completeness === 'exact' ? 'ready' : 'incomplete';
     const dynamicIssues = deepFreezeObserverValue([...resultIdentityIssue, ...maintained.issues]) as readonly Issue[];
@@ -570,24 +570,39 @@ class ObserverLease<Row> implements QueryObserver<Row> {
 
 const sourceEvidence = <Projection>(candidate: CapturedMember<Projection>): SourceEvidence => {
   const { member } = candidate;
+  const memberEvidence = {
+    attachmentId: member.attachmentId,
+    sourceId: member.sourceId,
+    expectation: member.expectation,
+    discoveryEdges: member.discoveryEdges
+  };
   if (candidate.captureIssues !== undefined) {
-    return freezeEvidence({ ...member, state: 'failed', freshness: 'none', authorized: candidate.authorized, issues: candidate.captureIssues });
+    return freezeEvidence({ ...memberEvidence, state: 'failed', freshness: 'none', authorized: candidate.authorized, issues: candidate.captureIssues });
   }
   if (!candidate.authorized) {
     const issue = observationIssue('observer.authority_denied', 'after_authority', { attachmentId: member.attachmentId });
-    return freezeEvidence({ ...member, state: 'denied', freshness: 'none', authorized: false, issues: [issue] });
+    return freezeEvidence({ ...memberEvidence, state: 'denied', freshness: 'none', authorized: false, issues: [issue] });
   }
   if (candidate.sourceMismatch === true) {
     const issue = observationIssue('observer.membership_source_mismatch', 'after_refresh', { attachmentId: member.attachmentId, sourceId: member.sourceId });
-    return freezeEvidence({ ...member, state: 'missing', freshness: 'none', authorized: true, issues: [issue] });
+    return freezeEvidence({ ...memberEvidence, state: 'missing', freshness: 'none', authorized: true, issues: [issue] });
   }
   if (candidate.attachment === undefined || candidate.snapshot === undefined) {
+    if (member.sourceAvailability !== undefined) {
+      return freezeEvidence({
+        ...memberEvidence,
+        state: member.sourceAvailability.state,
+        freshness: 'none',
+        authorized: true,
+        issues: member.sourceAvailability.issues
+      });
+    }
     const issue = observationIssue('observer.attachment_missing', 'after_refresh', { attachmentId: member.attachmentId });
-    return freezeEvidence({ ...member, state: 'missing', freshness: 'none', authorized: true, issues: [issue] });
+    return freezeEvidence({ ...memberEvidence, state: 'missing', freshness: 'none', authorized: true, issues: [issue] });
   }
   if (candidate.snapshot.state !== 'ready') {
     return freezeEvidence({
-      ...member,
+      ...memberEvidence,
       state: candidate.snapshot.state,
       freshness: candidate.snapshot.freshness,
       authorized: true,
@@ -597,9 +612,9 @@ const sourceEvidence = <Projection>(candidate: CapturedMember<Projection>): Sour
   }
   if (candidate.projection?.state !== 'ready') {
     const projectionIssues = candidate.projection?.issues ?? [observationIssue('observer.projection_unavailable', 'after_capability', { attachmentId: member.attachmentId })];
-    return freezeEvidence({ ...member, state: candidate.projection?.state ?? 'failed', freshness: candidate.snapshot.freshness, authorized: true, basis: candidate.snapshot.basis, issues: [...candidate.snapshot.issues, ...projectionIssues] });
+    return freezeEvidence({ ...memberEvidence, state: candidate.projection?.state ?? 'failed', freshness: candidate.snapshot.freshness, authorized: true, basis: candidate.snapshot.basis, issues: [...candidate.snapshot.issues, ...projectionIssues] });
   }
-  return freezeEvidence({ ...member, state: 'ready', freshness: candidate.snapshot.freshness, authorized: true, basis: candidate.snapshot.basis, issues: [...candidate.snapshot.issues, ...candidate.projection.issues] });
+  return freezeEvidence({ ...memberEvidence, state: 'ready', freshness: candidate.snapshot.freshness, authorized: true, basis: candidate.snapshot.basis, issues: [...candidate.snapshot.issues, ...candidate.projection.issues] });
 };
 
 const evidenceForCapture = <Projection>(captured: EvaluationSnapshot<Projection>): CaptureObservationEvidence => {
@@ -623,10 +638,10 @@ const evidenceForCapture = <Projection>(captured: EvaluationSnapshot<Projection>
     sourceStates,
     issues: Object.freeze([...evidenceIssues, ...membershipIssues]),
     freshness: compositeFreshness(sourceStates),
-    requiredProjectionInvalid: captured.members.some((candidate) =>
+    requiredInputInvalid: captured.members.some((candidate) =>
       candidate.member.expectation === 'required'
-      && candidate.snapshot?.state === 'ready'
-      && candidate.projection?.state === 'failed'),
+      && (candidate.member.sourceAvailability?.state === 'failed'
+        || (candidate.snapshot?.state === 'ready' && candidate.projection?.state === 'failed'))),
     requiredUnavailable: sourceStates.some((item) => item.expectation === 'required' && (item.state !== 'ready' || !item.authorized))
   });
   captureObservationEvidence.set(captured.identity, evidence);

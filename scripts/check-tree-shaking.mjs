@@ -27,8 +27,15 @@ const cases = [
     name: 'incremental database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // This is the complete incremental evaluator, including joins, aggregates,
-    // windows, fallback evaluation, observation, and owned source lifecycle.
-    maxGzipBytes: 44_000
+    // windows, fallback evaluation, observation, and fixed-source lifecycle.
+    initialOnly: true,
+    maxGzipBytes: 44_500
+  },
+  {
+    name: 'source-link database query session',
+    source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
+    // Optional fixed-point traversal is a lazy chunk and remains bounded too.
+    maxGzipBytes: 47_000
   },
   {
     name: 'query expression evaluator',
@@ -63,7 +70,7 @@ const externalRuntime = (id) =>
   || id.startsWith('zustand/')
   || id.startsWith('@automerge/');
 
-const bundleSize = async ({ name, source }) => {
+const bundleSize = async ({ name, source, initialOnly = false }) => {
   const virtualId = `\0tarstate-tree-shaking:${name}`;
   const result = await build({
     root: repoRoot,
@@ -92,8 +99,21 @@ const bundleSize = async ({ name, source }) => {
   const outputs = Array.isArray(result)
     ? result.flatMap(({ output }) => output)
     : result.output;
-  const code = outputs
-    .filter(({ type }) => type === 'chunk')
+  const chunks = outputs.filter(({ type }) => type === 'chunk');
+  const includedFiles = new Set();
+  const includeStaticImports = (chunk) => {
+    if (includedFiles.has(chunk.fileName)) return;
+    includedFiles.add(chunk.fileName);
+    for (const imported of chunk.imports) {
+      const dependency = chunks.find(({ fileName }) => fileName === imported);
+      if (dependency !== undefined) includeStaticImports(dependency);
+    }
+  };
+  if (initialOnly) {
+    for (const chunk of chunks) if (chunk.isEntry) includeStaticImports(chunk);
+  }
+  const code = chunks
+    .filter(({ fileName }) => !initialOnly || includedFiles.has(fileName))
     .map(({ code: chunkCode }) => chunkCode)
     .join('\n');
   return {
