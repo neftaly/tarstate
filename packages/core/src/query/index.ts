@@ -39,8 +39,8 @@ export type {
   RelationUse,
   WindowExpr
 } from '../query.js';
-export type { PreparedPlan } from '../query-plan-contract.js';
-export * from '../query-builder.js';
+export type { PreparedPlan } from './plan-contract.js';
+export * from './builder.js';
 export {
   prepareTypedQuery,
   typedAnd,
@@ -58,7 +58,7 @@ export {
   typedSelect,
   typedSourceOf,
   typedWhere
-} from '../query-authoring.js';
+} from './authoring.js';
 export type {
   PreparedPlanParameters,
   PreparedPlanRow,
@@ -70,4 +70,4 @@ export type {
   TypedOrderTerm,
   TypedPreparedPlan,
   TypedQuery
-} from '../query-authoring.js';
+} from './authoring.js';

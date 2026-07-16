@@ -13,9 +13,9 @@ import {
   automergeGovernanceSourceAdapter,
   planAutomergeMetadataMutation,
   readAutomergeMetadata
-} from '../src/metadata.js';
-import { AutomergeSourceRuntime, automergeBasis } from '../src/source.js';
-import { projectAutomergeFacts } from '../src/projection.js';
+} from '../src/document/metadata.js';
+import { AutomergeSourceRuntime, automergeBasis } from '../src/source/runtime.js';
+import { projectAutomergeFacts } from '../src/document/projection.js';
 
 type MetadataDoc = {
   app?: Record<string, unknown>;

@@ -1,7 +1,7 @@
 import { samePortableJson } from './internal-json-equality.js';
 import { freezeOwnedJsonValue } from './internal-owned-json.js';
-import { sealPreparedPlan } from './internal-prepared-plan.js';
-import type { PreparedPlan } from './query-plan-contract.js';
+import { sealPreparedPlan } from './query/internal/prepared-plan.js';
+import type { PreparedPlan } from './query/plan-contract.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue } from './value.js';
 
 /** Detached immutable ownership used at observer publication and input boundaries. */

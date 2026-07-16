@@ -1,5 +1,5 @@
 /** Query artifacts, functional builders, and schema-aware typed authoring. */
-export * from '../../query-builder.js';
+export * from '../builder.js';
 export {
   prepareTypedQuery,
   typedAnd,
@@ -17,7 +17,7 @@ export {
   typedSelect,
   typedSourceOf,
   typedWhere
-} from '../../query-authoring.js';
+} from '../authoring.js';
 export type {
   PreparedPlanParameters,
   PreparedPlanRow,
@@ -29,4 +29,4 @@ export type {
   TypedOrderTerm,
   TypedPreparedPlan,
   TypedQuery
-} from '../../query-authoring.js';
+} from '../authoring.js';

@@ -1,6 +1,6 @@
 import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
 import { createIssue, type Issue } from './issues.js';
-import type { PreparedPlan } from './query-plan-contract.js';
+import type { PreparedPlan } from './query/plan-contract.js';
 import type { SourceSnapshot } from './source-state.js';
 import type { JsonValue } from './value.js';
 

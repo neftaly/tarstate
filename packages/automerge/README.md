@@ -21,6 +21,10 @@ npm install \
 
 ## Usage
 
+This is the normal writable application path. Consumers do not choose between
+prepared, owned, staged, or fast variants; the attachment optimizes and replays
+this one operation API internally.
+
 ```ts
 import { openAutomergeAttachment } from '@tarstate/automerge';
 

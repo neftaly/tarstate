@@ -72,7 +72,7 @@ describe('topic-focused core surface', () => {
     expectTypeOf<ObserverDiagnosticReporter>().toMatchTypeOf<import('../src/observer-diagnostics.js').ObserverDiagnosticReporter>();
     expectTypeOf<PreparedPlan>().toMatchTypeOf<import('../src/maintenance.js').PreparedPlan>();
     expectTypeOf<AtomicSource<unknown, unknown>>().toMatchTypeOf<import('../src/source-protocol.js').AtomicSource<unknown, unknown>>();
-    expectTypeOf<DocumentDeclaration>().toMatchTypeOf<import('../src/attachment-model.js').DocumentDeclaration>();
+    expectTypeOf<DocumentDeclaration>().toMatchTypeOf<import('../src/attachment/model.js').DocumentDeclaration>();
   });
 
   it('publishes immutable constants', () => {

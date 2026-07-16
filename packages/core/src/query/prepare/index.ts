@@ -2,6 +2,6 @@
 export {
   prepareExpression,
   prepareQuery
-} from '../../query-prepare.js';
-export type * from '../../query-model.js';
-export type { QueryMaintenanceSnapshot } from '../../query-incremental-model.js';
+} from '../prepare.js';
+export type * from '../model.js';
+export type { QueryMaintenanceSnapshot } from '../incremental-model.js';

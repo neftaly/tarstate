@@ -1,7 +1,7 @@
 import type { JsonValue } from './value.js';
 
-export type { PreparedPlan } from './query-plan-contract.js';
-export { preparePlan } from './query-plan.js';
+export type { PreparedPlan } from './query/plan-contract.js';
+export { preparePlan } from './query/plan.js';
 export type { SourceBasis } from './source-state.js';
 export type RowOccurrenceId = string;
 export type PlanNodeId = string;

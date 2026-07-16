@@ -5,7 +5,7 @@ import {
   AutomergeSourceRuntime,
   exactAutomergeBasisEqual,
   type AutomergeSourceCommitResult
-} from '../src/source.js';
+} from '../src/source/runtime.js';
 import { propertyTest } from './support/property-test.js';
 
 type TestDoc = {

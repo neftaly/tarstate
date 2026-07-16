@@ -14,7 +14,7 @@ import {
   type QueryMaintenanceSnapshot,
 } from '../src/query.js';
 import type { PreparedPlan } from '../src/maintenance.js';
-import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
+import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
 import { logicalUnknown, type JsonValue } from '../src/value.js';
 import type { ArtifactRef } from '../src/artifacts.js';
 

@@ -1,4 +1,4 @@
-import type { AttachmentProjection } from './attachment-model.js';
+import type { AttachmentProjection } from './attachment/model.js';
 import type { ObservableSource, SourceSnapshot } from './source-state.js';
 
 export type DatabaseAttachment<Storage = unknown, Projection = unknown> = {

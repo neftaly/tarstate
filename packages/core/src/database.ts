@@ -1,11 +1,11 @@
 import { canonicalizeJson } from './artifacts.js';
-import type { ReadyAttachmentPreparation } from './attachment-preparation.js';
+import type { ReadyAttachmentPreparation } from './attachment/preparation.js';
 import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
 import { comparePortableStrings } from './portable-order.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import type { ObservableSource } from './source-state.js';
 
-export type { AttachmentProjection } from './attachment-model.js';
+export type { AttachmentProjection } from './attachment/model.js';
 export type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
 export type {
   ObservableSource,

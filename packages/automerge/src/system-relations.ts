@@ -5,9 +5,9 @@ import {
 } from '@tarstate/core';
 import type { ObserverDiagnosticReporter } from '@tarstate/core/database/observer';
 import type { SchemaBody } from '@tarstate/core/schema';
-import type { AutomergeConflictFact } from './projection.js';
-import type { AutomergeBasis } from './source.js';
-import { comparePortableStrings } from './portable-order.js';
+import type { AutomergeConflictFact } from './document/projection.js';
+import type { AutomergeBasis } from './source/runtime.js';
+import { comparePortableStrings } from './shared/portable-order.js';
 
 export const automergeSystemRelationIds = Object.freeze({
   peers: 'tarstate.automerge.peers',

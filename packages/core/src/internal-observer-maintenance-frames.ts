@@ -6,15 +6,15 @@ import type {
 import {
   adoptQueryOccurrenceIds,
   sealOwnedQueryMaintenanceUpdate
-} from './internal-query-ownership.js';
+} from './query/internal/ownership.js';
 import { deepFreezeObserverValue } from './internal-observer-values.js';
-import { diffQueryMaintenanceSnapshotValues } from './query-maintenance-diff.js';
+import { diffQueryMaintenanceSnapshotValues } from './query/maintenance-diff.js';
 import type {
   FunctionRegistry,
   QueryNode,
   RelationInput
-} from './query-model.js';
-import type { QueryMaintenanceSnapshot, QueryMaintenanceUpdate } from './query-incremental-model.js';
+} from './query/model.js';
+import type { QueryMaintenanceSnapshot, QueryMaintenanceUpdate } from './query/incremental-model.js';
 const queryMaintenanceFrameIdentity = Symbol('tarstate.query-maintenance-frame');
 
 type FramedQueryMaintenanceSnapshot = QueryMaintenanceSnapshot & {

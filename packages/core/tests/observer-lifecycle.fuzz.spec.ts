@@ -1,6 +1,6 @@
 import fc from 'fast-check';
 import { expect } from 'vitest';
-import { prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
+import { prepareManualReadOnlyAttachment } from '../src/attachment/preparation.js';
 import {
   AttachmentCatalog,
   DatasetMembership,
@@ -14,7 +14,7 @@ import {
   type ObserverSnapshot,
   type QueryObserver
 } from '../src/observer.js';
-import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
+import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
 import { propertyTest } from './support/property-test.js';
 
 type Row = { readonly id: number; readonly value: string };

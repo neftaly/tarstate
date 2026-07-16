@@ -156,7 +156,7 @@ export const executePresence = async (command: SetPresenceCommand, accept: (comm
   }
 };
 
-export type { DocumentDeclaration } from './attachment-model.js';
+export type { DocumentDeclaration } from './attachment/model.js';
 
 const knownReceiptKinds = new Set(['commit', 'non-atomic-batch', 'source-lifecycle', 'governance', 'sequence', 'presence']);
 const receiptFailure = (code: string, details: JsonValue): ParseResult<never> => ({ success: false, issues: [createIssue({ code, phase: 'parse', severity: 'error', retry: 'after_input', details })] });

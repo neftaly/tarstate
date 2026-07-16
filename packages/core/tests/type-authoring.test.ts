@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
-import { pipe } from '../src/query-builder.js';
+import { pipe } from '../src/query/builder.js';
 import { sealSchema } from '../src/schema.js';
 import {
   customScalar,

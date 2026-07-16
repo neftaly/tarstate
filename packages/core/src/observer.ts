@@ -29,9 +29,9 @@ import {
   runObserverCleanups,
   type ObserverDiagnosticReporter
 } from './observer-diagnostics.js';
-import type { PreparedPlan } from './query-plan-contract.js';
+import type { PreparedPlan } from './query/plan-contract.js';
 import type { SourceBasis } from './source-state.js';
-import { assertPreparedPlan } from './internal-prepared-plan.js';
+import { assertPreparedPlan } from './query/internal/prepared-plan.js';
 import { deepFreezeObserverValue, detachPreparedPlan, parseObservationParameters, samePortableObserverValue } from './internal-observer-values.js';
 import type { JsonValue } from './value.js';
 

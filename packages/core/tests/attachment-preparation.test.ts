@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { sealArtifact, type Artifact, type ArtifactRef } from '../src/artifacts.js';
-import { exactArtifactAttachmentResolver, prepareDatabaseAttachment, prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
+import { exactArtifactAttachmentResolver, prepareDatabaseAttachment, prepareManualReadOnlyAttachment } from '../src/attachment/preparation.js';
 import { ExactArtifactResolver } from '../src/artifact-resolver.js';
 import { AttachmentCatalog, type SourceSnapshot } from '../src/database.js';
 import type { Issue } from '../src/issues.js';

@@ -13,26 +13,26 @@ import {
   type MaintainedDatabaseQueryResult
 } from './observer-maintenance-contracts.js';
 import { samePortableObserverValue } from './internal-observer-values.js';
-import type { PreparedPlan } from './query-plan-contract.js';
+import type { PreparedPlan } from './query/plan-contract.js';
 import {
   createPooledIncrementalQueryRuntime,
   isNonPoolableQueryError,
   isPooledQueryRuntimeBusyError,
   openIncrementalQueryMaintenance
-} from './query-incremental.js';
-import { diffQueryMaintenanceSnapshotValues } from './query-maintenance-diff.js';
+} from './query/incremental.js';
+import { diffQueryMaintenanceSnapshotValues } from './query/maintenance-diff.js';
 import type {
   FunctionRegistry,
   QueryNode,
   QueryRecord,
   RelationInput
-} from './query-model.js';
+} from './query/model.js';
 import type {
   IncrementalQueryResult,
   PooledIncrementalQueryRoot,
   PooledIncrementalQueryRuntime,
   QueryMaintenanceSnapshot
-} from './query-incremental-model.js';
+} from './query/incremental-model.js';
 import type { JsonValue } from './value.js';
 
 export type {

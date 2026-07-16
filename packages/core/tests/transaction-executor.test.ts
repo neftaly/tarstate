@@ -17,7 +17,7 @@ import {
   LogicalMemoryStorageBinding,
   type LogicalMemoryCommand,
   type MemoryState
-} from './fixtures/memory-storage-source.js';
+} from './fixtures/logical-memory-adapter.js';
 
 const hash = (character: string): `sha256:${string}` => `sha256:${character.repeat(64)}`;
 const schemaView: ArtifactRef = { id: 'urn:test:executor-schema', contentHash: hash('a') };

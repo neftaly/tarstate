@@ -2,7 +2,7 @@ import type { ArtifactRef, ContentHash } from './artifacts.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { SourceBasis } from './source-state.js';
-import type { QueryNode } from './query-model.js';
+import type { QueryNode } from './query/model.js';
 import type { JsonValue } from './value.js';
 
 /** Portable expression subset used by source-local writes. */

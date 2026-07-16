@@ -18,7 +18,7 @@ import {
   type QueryRecord,
   type RelationInput
 } from '../src/index.js';
-import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
+import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
 import { propertyTest } from './support/property-test.js';
 
 const portableJson = fc.jsonValue({ maxDepth: 5 }).filter((value) => safeParseJsonValue(value).success);

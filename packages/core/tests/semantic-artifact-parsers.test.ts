@@ -3,7 +3,7 @@ import { sealArtifact, type ArtifactRef } from '../src/artifacts.js';
 import type { ConstraintSetBody } from '../src/constraint-artifact.js';
 import { sealSchemaLens, type SchemaLensBody } from '../src/lens.js';
 import { sealStorageMapping, type StorageMappingBody } from '../src/mapping.js';
-import type { QueryArtifactBody } from '../src/query-builder.js';
+import type { QueryArtifactBody } from '../src/query/builder.js';
 import { prepareSchema, sealSchema, type SchemaBody } from '../src/schema.js';
 import { capabilityRefFor, CapabilityRegistry } from '../src/registry.js';
 import {

@@ -1,2 +1,2 @@
 /** Pure batch query and expression evaluation. */
-export * from '../../query-evaluate.js';
+export * from '../evaluate.js';

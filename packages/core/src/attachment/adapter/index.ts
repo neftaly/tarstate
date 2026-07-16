@@ -1,3 +1,3 @@
 /** Adapter-facing attachment preparation and transaction-service composition. */
-export * from '../../attachment-preparation.js';
-export * from '../../attachment-transactions.js';
+export * from '../preparation.js';
+export * from '../transaction-service.js';

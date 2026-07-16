@@ -7,7 +7,7 @@ import {
   type DatasetMember,
   type SourceSnapshot
 } from '../src/database.js';
-import { prepareManualReadOnlyAttachment } from '../src/attachment-preparation.js';
+import { prepareManualReadOnlyAttachment } from '../src/attachment/preparation.js';
 import {
   DatabaseView,
   type MaintainedDatabaseQueryResult,
@@ -20,7 +20,7 @@ import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/databa
 import type { QueryNode, QueryRecord, RelationInput } from '../src/query.js';
 import { ResourceResolver, type ResourceRef } from '../src/resolver.js';
 import type { PreparedPlan } from '../src/maintenance.js';
-import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
+import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
 import type { JsonValue } from '../src/value.js';
 
 type Row = { readonly id: number; readonly value: string };

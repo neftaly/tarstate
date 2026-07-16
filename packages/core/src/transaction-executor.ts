@@ -18,7 +18,7 @@ import {
 import { samePortableJson } from './internal-json-equality.js';
 import type { SourceBasis } from './source-state.js';
 import { comparePortableStrings } from './portable-order.js';
-import type { QueryNode } from './query-model.js';
+import type { QueryNode } from './query/model.js';
 import { safeParseTransactionArtifact } from './semantic-transaction-artifact.js';
 import type { AtomicSource, LogicalEdit, StagedBasisAtomicSource, StorageBinding } from './source-protocol.js';
 import {

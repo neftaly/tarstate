@@ -1,6 +1,6 @@
 import { sealSchema } from '../src/schema.js';
 import type { TaggedValue } from '../src/value.js';
-import { pipe } from '../src/query-builder.js';
+import { pipe } from '../src/query/builder.js';
 import {
   customScalar,
   relationAccess,

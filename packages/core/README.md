@@ -9,6 +9,24 @@ Install the downloaded release tarball directly:
 npm install ./tarstate-core-0.3.0.tgz
 ```
 
+## Choose the application path
+
+Most applications should make one choice based on where their data lives:
+
+- For a writable Automerge document, start with
+  `openAutomergeAttachment` from `@tarstate/automerge`. It owns attachment
+  preparation, keyed relation diffs, replay after multiplayer changes,
+  validation, and publication.
+- For pure in-memory query evaluation, import the typed builders and
+  `evaluateQuery` from `@tarstate/core/query`.
+- For live observation over host-owned sources, prepare a typed query and use
+  `DatabaseView` from `@tarstate/core/database`.
+
+The `source`, `attachment/adapter`, query-incremental, and transaction-authoring
+entries are extension seams for adapter implementors. Application code using an
+official adapter should not assemble sources, bindings, execution contexts,
+canonical keys, or transaction syntax.
+
 ## Imports
 
 The package root intentionally exports only the small `foundation` surface.

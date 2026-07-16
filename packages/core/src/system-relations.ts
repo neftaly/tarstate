@@ -2,8 +2,8 @@ import { canonicalizeJson, normalizeArtifactRef, sealArtifact, type Artifact, ty
 import type { FieldDeclaration, SchemaBody } from './schema.js';
 import type { CapabilityRef, Issue, IssuePhase, IssueSeverity } from './issues.js';
 import type { SourceBasis } from './source-state.js';
-import type { QueryRecord, RelationInput } from './query-model.js';
-import { createQueryOccurrenceIds } from './internal-query-ownership.js';
+import type { QueryRecord, RelationInput } from './query/model.js';
+import { createQueryOccurrenceIds } from './query/internal/ownership.js';
 import { executePresence, type PresenceReceipt, type SetPresenceCommand } from './receipts.js';
 import type { JsonValue } from './value.js';
 

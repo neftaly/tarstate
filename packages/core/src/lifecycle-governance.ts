@@ -14,7 +14,7 @@ import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { positiveSafeInteger } from './internal-numeric-boundary.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
-import type { DocumentDeclaration } from './attachment-model.js';
+import type { DocumentDeclaration } from './attachment/model.js';
 import type { GovernanceReceipt, SourceLifecycleCommand, SourceLifecycleReceipt } from './receipts.js';
 import type { SourceBasis } from './source-state.js';
 import { type JsonValue, type PortableValue } from './value.js';

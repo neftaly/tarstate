@@ -1,9 +1,9 @@
 /** Test-only broad source barrel. The package root is `root.ts`. */
 export * from './artifacts.js';
 export * from './artifact-resolver.js';
-export * from './attachment-model.js';
-export * from './attachment-preparation.js';
-export * from './attachment-transactions.js';
+export * from './attachment/model.js';
+export * from './attachment/preparation.js';
+export * from './attachment/transaction-service.js';
 export * from './capability-model.js';
 export * from './builtins.js';
 export * from './codec.js';
@@ -63,10 +63,10 @@ export type {
   RelationUse,
   WindowExpr
 } from './query.js';
-export { evaluatePreparedExpression } from './internal-query-expression.js';
-export { evaluatePreparedQuery } from './internal-query-evaluator.js';
-export * from './query-builder.js';
-export * from './query-plan.js';
+export { evaluatePreparedExpression } from './query/internal/expression.js';
+export { evaluatePreparedQuery } from './query/internal/evaluator.js';
+export * from './query/builder.js';
+export * from './query/plan.js';
 export * from './receipts.js';
 export * from './registry.js';
 export * from './resolver.js';

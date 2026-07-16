@@ -16,7 +16,7 @@ import {
   type RelationInput
 } from '../src/index.js';
 import { createPooledIncrementalQueryRuntime, type PooledIncrementalQueryRoot } from '../src/query.js';
-import { sealPreparedPlan } from '../src/internal-prepared-plan.js';
+import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
 
 const configuredRuns = Number.parseInt(process.env.TARSTATE_FUZZ_RUNS ?? '64', 10);
 const runs = Number.isSafeInteger(configuredRuns) && configuredRuns > 0 ? configuredRuns : 64;

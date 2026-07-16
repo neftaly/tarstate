@@ -71,7 +71,7 @@ assignArchitectureGroup('foundation', [
 ]);
 assignArchitectureGroup('capability', ['builtins.ts', 'host.ts', 'registry.ts', 'resolver.ts']);
 assignArchitectureGroup('artifact-resolution', ['artifact-resolver.ts']);
-assignArchitectureGroup('source-contract', ['attachment-model.ts', 'logical-edit.ts', 'source-protocol.ts', 'source-state.ts']);
+assignArchitectureGroup('source-contract', ['attachment/model.ts', 'logical-edit.ts', 'source-protocol.ts', 'source-state.ts']);
 assignArchitectureGroup('schema', [
   'codec.ts',
   'constraint-artifact.ts',
@@ -83,39 +83,39 @@ assignArchitectureGroup('schema', [
   'schema-authoring.ts',
   'schema.ts'
 ]);
-assignArchitectureGroup('query-model', ['query-incremental-model.ts', 'query-model.ts', 'query-plan-contract.ts']);
+assignArchitectureGroup('query-model', ['query/incremental-model.ts', 'query/model.ts', 'query/plan-contract.ts']);
 assignArchitectureGroup('query-batch', [
-  'internal-prepared-expression.ts',
-  'internal-prepared-plan.ts',
-  'internal-query-equality.ts',
-  'internal-query-evaluation-context.ts',
-  'internal-query-evaluator.ts',
-  'internal-query-expression.ts',
-  'internal-query-graph.ts',
-  'internal-query-input-validation.ts',
-  'internal-query-ordering.ts',
-  'internal-query-ownership.ts',
-  'internal-query-relations.ts',
-  'internal-query-values.ts',
-  'internal-query-window-maintenance.ts',
-  'query-authoring.ts',
-  'query-builder.ts',
-  'query-evaluate.ts',
-  'query-plan.ts',
-  'query-prepare.ts'
+  'query/internal/prepared-expression.ts',
+  'query/internal/prepared-plan.ts',
+  'query/internal/equality.ts',
+  'query/internal/evaluation-context.ts',
+  'query/internal/evaluator.ts',
+  'query/internal/expression.ts',
+  'query/internal/graph.ts',
+  'query/internal/input-validation.ts',
+  'query/internal/ordering.ts',
+  'query/internal/ownership.ts',
+  'query/internal/relations.ts',
+  'query/internal/values.ts',
+  'query/internal/window-maintenance.ts',
+  'query/authoring.ts',
+  'query/builder.ts',
+  'query/evaluate.ts',
+  'query/plan.ts',
+  'query/prepare.ts'
 ]);
 assignArchitectureGroup('query-incremental', [
-  'internal-query-dependency.ts',
-  'internal-query-aggregate-maintenance.ts',
-  'internal-query-join-maintenance.ts',
-  'internal-query-maintenance-diagnostics.ts',
-  'internal-query-maintenance-engine.ts',
-  'internal-query-maintenance-model.ts',
-  'internal-query-maintenance-transition.ts',
-  'internal-query-pool-publication.ts',
+  'query/internal/dependency.ts',
+  'query/internal/aggregate-maintenance.ts',
+  'query/internal/join-maintenance.ts',
+  'query/internal/maintenance-diagnostics.ts',
+  'query/internal/maintenance-engine.ts',
+  'query/internal/maintenance-model.ts',
+  'query/internal/maintenance-transition.ts',
+  'query/internal/pool-publication.ts',
   'maintenance.ts',
-  'query-incremental.ts',
-  'query-maintenance-diff.ts'
+  'query/incremental.ts',
+  'query/maintenance-diff.ts'
 ]);
 assignArchitectureGroup('transaction-model', [
   'internal-transaction-expression.ts',
@@ -144,7 +144,7 @@ assignArchitectureGroup('transaction-runtime', [
   'lifecycle-governance.ts',
   'transaction-executor.ts'
 ]);
-assignArchitectureGroup('attachment-runtime', ['attachment-preparation.ts', 'attachment-transactions.ts']);
+assignArchitectureGroup('attachment-runtime', ['attachment/preparation.ts', 'attachment/transaction-service.ts']);
 assignArchitectureGroup('observer-contract', ['database-model.ts', 'observer-maintenance-contracts.ts']);
 assignArchitectureGroup('observer', [
   'database.ts',
@@ -254,12 +254,12 @@ for (const [entryName, allowedGroups] of publicRuntimePolicies) {
 }
 
 const contractDependencies = new Map(Object.entries({
-  'attachment-model.ts': ['artifacts.ts', 'issues.ts', 'source-protocol.ts', 'source-state.ts'],
+  'attachment/model.ts': ['artifacts.ts', 'issues.ts', 'source-protocol.ts', 'source-state.ts'],
   'internal-semantic-provenance.ts': ['internal-provenance-registry.ts'],
   'logical-edit.ts': ['issues.ts', 'value.ts'],
-  'query-incremental-model.ts': ['query-model.ts', 'query-plan-contract.ts', 'value.ts'],
-  'query-model.ts': ['artifacts.ts', 'issues.ts', 'query-plan-contract.ts', 'value.ts'],
-  'query-plan-contract.ts': [],
+  'query/incremental-model.ts': ['query/model.ts', 'query/plan-contract.ts', 'value.ts'],
+  'query/model.ts': ['artifacts.ts', 'issues.ts', 'query/plan-contract.ts', 'value.ts'],
+  'query/plan-contract.ts': [],
   'source-protocol.ts': ['artifacts.ts', 'issues.ts', 'logical-edit.ts', 'source-state.ts'],
   'source-state.ts': ['issues.ts', 'value.ts']
 }));
@@ -275,12 +275,12 @@ for (const [name, allowedNames] of contractDependencies) {
 }
 
 const forbiddenDirectDependencies = new Map(Object.entries({
-  'attachment-preparation.ts': ['semantic-artifact-parsers.ts', 'semantic-query-artifact.ts', 'semantic-schema-lens-artifact.ts', 'semantic-transaction-artifact.ts'],
+  'attachment/preparation.ts': ['semantic-artifact-parsers.ts', 'semantic-query-artifact.ts', 'semantic-schema-lens-artifact.ts', 'semantic-transaction-artifact.ts'],
   'internal-semantic-schema-lens-validation.ts': ['internal-semantic-query-validation.ts'],
   'internal-semantic-storage-mapping-validation.ts': ['internal-semantic-query-validation.ts'],
-  'observer.ts': ['internal-observer-query-maintenance.ts', 'query-incremental.ts'],
-  'query-evaluate.ts': ['internal-observer-query-maintenance.ts', 'query-incremental.ts'],
-  'query-prepare.ts': ['internal-observer-query-maintenance.ts', 'internal-query-evaluator.ts', 'internal-query-expression.ts', 'query-incremental.ts']
+  'observer.ts': ['internal-observer-query-maintenance.ts', 'query/incremental.ts'],
+  'query/evaluate.ts': ['internal-observer-query-maintenance.ts', 'query/incremental.ts'],
+  'query/prepare.ts': ['internal-observer-query-maintenance.ts', 'query/internal/evaluator.ts', 'query/internal/expression.ts', 'query/incremental.ts']
 }));
 
 for (const [name, forbiddenNames] of forbiddenDirectDependencies) {

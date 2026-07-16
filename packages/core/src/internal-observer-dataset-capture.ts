@@ -3,7 +3,7 @@ import {
   type DatasetMembership
 } from './database.js';
 import type { DatabaseAttachment, DatasetMember } from './database-model.js';
-import type { AttachmentProjection } from './attachment-model.js';
+import type { AttachmentProjection } from './attachment/model.js';
 import { createIssue, type Issue } from './issues.js';
 import {
   reportObserverFailure,

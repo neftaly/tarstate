@@ -3,9 +3,9 @@ import type {
   QueryResultRowOf,
   TypedAliases,
   TypedQuery
-} from './query-authoring.js';
-import type { QueryNode } from './query-model.js';
-import type { ValueDeclaration } from './query-builder.js';
+} from './query/authoring.js';
+import type { QueryNode } from './query/model.js';
+import type { ValueDeclaration } from './query/builder.js';
 import type { RelationKey, RowOfRelation } from './schema-authoring.js';
 import type { PortableValue } from './value.js';
 

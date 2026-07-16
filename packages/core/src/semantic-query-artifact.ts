@@ -7,10 +7,10 @@ import {
   type SemanticArtifactParseBudget
 } from './internal-semantic-artifact-validation.js';
 import { validateQueryArtifactBody } from './internal-semantic-query-validation.js';
-import { evaluateQuery } from './query-evaluate.js';
-import { safeParseQueryParameters, type QueryArtifact } from './query-builder.js';
-import type { FunctionRegistry, QueryResult, RelationInput } from './query-model.js';
-import { prepareQuery } from './query-prepare.js';
+import { evaluateQuery } from './query/evaluate.js';
+import { safeParseQueryParameters, type QueryArtifact } from './query/builder.js';
+import type { FunctionRegistry, QueryResult, RelationInput } from './query/model.js';
+import { prepareQuery } from './query/prepare.js';
 import type { CapabilityRegistry } from './registry.js';
 import type { JsonValue } from './value.js';
 

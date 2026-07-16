@@ -1,4 +1,4 @@
-import type { AttachmentProjection } from './attachment-model.js';
+import type { AttachmentProjection } from './attachment/model.js';
 import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
 import type { Issue } from './issues.js';
 import type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';

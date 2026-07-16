@@ -3,10 +3,10 @@ import { ExternalStoreRuntime, type AtomicExternalStore } from './external-store
 import { createIssue } from './issues.js';
 import { SourceLifecycleCoordinator } from './lifecycle-governance.js';
 import { projectLensRelation, translateLensEdits, validateLens, type LensRows, type SchemaLensBody } from './lens.js';
-import { sealPreparedPlan } from './internal-prepared-plan.js';
-import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance } from './query-incremental.js';
-import type { QueryMaintenanceSnapshot } from './query-incremental-model.js';
-import type { QueryNode, QueryRecord, QueryResult, RelationInput } from './query-model.js';
+import { sealPreparedPlan } from './query/internal/prepared-plan.js';
+import { diffQueryMaintenanceSnapshots, openIncrementalQueryMaintenance } from './query/incremental.js';
+import type { QueryMaintenanceSnapshot } from './query/incremental-model.js';
+import type { QueryNode, QueryRecord, QueryResult, RelationInput } from './query/model.js';
 import { executeSequence, type SequenceReceipt, type SourceLifecycleCommand } from './receipts.js';
 import type { CommitReceipt } from './transaction.js';
 
