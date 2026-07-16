@@ -1,6 +1,9 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
+import type { DatabaseView, QueryObserver } from '../src/observer.js';
+import type { QueryNode, QueryRecord, RelationInput } from '../src/query/model.js';
+import type { PreparedPlan } from '../src/query/plan-contract.js';
 import { pipe } from '../src/query/builder.js';
 import { sealSchema } from '../src/schema.js';
 import {
@@ -127,6 +130,19 @@ describe('literal-schema and query type authoring', () => {
       { readonly author: string; readonly manager: string },
       { readonly minimumScore: number }
     >>();
+
+    const assertObservationTypes = (
+      database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>,
+      typedPlan: typeof prepared,
+      untypedPlan: PreparedPlan<QueryNode>
+    ): void => {
+      expectTypeOf(database.observe({ plan: typedPlan })).toEqualTypeOf<QueryObserver<{
+        readonly author: string;
+        readonly manager: string;
+      }>>();
+      expectTypeOf(database.observe({ plan: untypedPlan })).toEqualTypeOf<QueryObserver<QueryRecord>>();
+    };
+    expectTypeOf(assertObservationTypes).toBeFunction();
   });
 
   it('ties reference values to target key tuples and keeps typed operators pipe-compatible', async () => {

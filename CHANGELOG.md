@@ -5,6 +5,12 @@ history.
 
 ## [Unreleased]
 
+### Fixed
+
+- `DatabaseView.observe` now infers the exact result-row type carried by a
+  typed prepared plan while preserving the database row type as the fallback
+  for ordinary prepared plans.
+
 ## [0.4.0] - 2026-07-16
 
 ### Breaking changes

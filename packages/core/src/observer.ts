@@ -30,6 +30,7 @@ import {
   type ObserverDiagnosticReporter
 } from './observer-diagnostics.js';
 import type { PreparedPlan } from './query/plan-contract.js';
+import type { PreparedPlanRow } from './query/authoring.js';
 import type { SourceBasis } from './source-state.js';
 import { assertPreparedPlan } from './query/internal/prepared-plan.js';
 import { deepFreezeObserverValue, detachPreparedPlan, parseObservationParameters, samePortableObserverValue } from './internal-observer-values.js';
@@ -130,11 +131,15 @@ export type DatabaseViewOptions<Query, Row, Projection> = {
 };
 
 /** Prepared query identity plus bound parameters and an explicit partial-evidence opt-in. */
-export type ObserveRequest<Query> = {
-  readonly plan: PreparedPlan<Query>;
+export type ObserveRequest<Query, Plan extends PreparedPlan<Query> = PreparedPlan<Query>> = {
+  readonly plan: Plan;
   readonly parameters?: Readonly<Record<string, JsonValue>>;
   readonly allowPartial?: boolean;
 };
+
+type ObservationRowForPlan<Plan, Fallback> = [PreparedPlanRow<Plan>] extends [never]
+  ? Fallback
+  : PreparedPlanRow<Plan>;
 
 /** Canonical cache key for every field that changes observation semantics. */
 export const queryObservationKey = <Query>(
@@ -185,7 +190,9 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     this.#getDatabaseDescriptionSnapshot = options.getDatabaseDescriptionSnapshot;
   }
 
-  observe(request: ObserveRequest<Query>): QueryObserver<Row> {
+  observe<Plan extends PreparedPlan<Query>>(
+    request: ObserveRequest<Query, Plan>
+  ): QueryObserver<ObservationRowForPlan<Plan, Row>> {
     if (this.#closed) throw new Error('Database view is closed');
     assertPreparedPlan(request.plan);
     if (request.plan.registryFingerprint !== this.registryFingerprint) throw new Error('Prepared plan registry fingerprint does not match database view');
@@ -229,7 +236,7 @@ export class DatabaseView<Query, Row, Projection = unknown> {
       }
       this.#cache.set(key, shared);
     }
-    return shared.acquire();
+    return shared.acquire() as QueryObserver<ObservationRowForPlan<Plan, Row>>;
   }
 
   getActiveMaintenanceCount(): number { return this.#cache.size; }
