@@ -24,6 +24,13 @@ const cases = [
     maxGzipBytes: 1_500
   },
   {
+    name: 'incremental database query session',
+    source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
+    // This is the complete incremental evaluator, including joins, aggregates,
+    // windows, fallback evaluation, observation, and owned source lifecycle.
+    maxGzipBytes: 44_000
+  },
+  {
     name: 'query expression evaluator',
     source: selectedExport('packages/core/dist/query/evaluate/index.js', 'evaluateExpression'),
     maxGzipBytes: 9_500

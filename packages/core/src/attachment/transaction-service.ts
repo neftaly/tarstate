@@ -16,37 +16,23 @@ import {
 import { sealTransaction, type CommitReceipt } from '../transaction.js';
 import type { JsonValue } from '../value.js';
 import type { WritableLogicalState } from '../logical-edit.js';
-
-export type AttachmentTransactionRow = {
-  readonly relationId: string;
-  readonly fields: Readonly<Record<string, JsonValue>>;
-};
-
-export type AttachmentTransactionSnapshot = {
-  readonly rows: readonly AttachmentTransactionRow[];
-};
-
-export type AttachmentTransactionOptions = {
-  readonly signal?: AbortSignal;
-};
-
-export type AttachmentTransactionService = {
-  readonly transact: (
-    intent: JsonValue,
-    transform: (snapshot: AttachmentTransactionSnapshot) => unknown,
-    options?: AttachmentTransactionOptions
-  ) => Promise<CommitReceipt>;
-  readonly simulate: (
-    intent: JsonValue,
-    transform: (snapshot: AttachmentTransactionSnapshot) => unknown,
-    options?: AttachmentTransactionOptions
-  ) => Promise<import('../transaction.js').SimulationReceipt>;
-};
+import type {
+  DatabaseTransactionOptions,
+  DatabaseTransactionService,
+  DatabaseTransactionTransform
+} from '../database/transaction.js';
+import { ImmutableDatabaseTransactionSnapshot } from './transaction-snapshot.js';
 
 type WritableAttachmentPreparation = Pick<
   ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,
   'writable' | 'declaration' | 'schema' | 'relations' | 'constraints'
 >;
+
+type PreparedWritableAttachment = WritableAttachmentPreparation & {
+  readonly writable: true;
+  readonly declaration: NonNullable<WritableAttachmentPreparation['declaration']>;
+  readonly schema: NonNullable<WritableAttachmentPreparation['schema']>;
+};
 
 export type AttachmentTransactionServiceInput<Storage, Command> = {
   readonly attachmentId: string;
@@ -63,12 +49,15 @@ export type AttachmentTransactionServiceInput<Storage, Command> = {
 /** Combines portable attachment evidence with one live source and authority view. */
 export const createAttachmentTransactionService = async <Storage, Command>(
   input: AttachmentTransactionServiceInput<Storage, Command>
-): Promise<AttachmentTransactionService> => {
-  const context = await createExecutionContext(input);
+): Promise<DatabaseTransactionService> => {
+  assertWritablePreparation(input.preparation);
+  const preparation = input.preparation;
+  const context = await createExecutionContext(input, preparation);
+  const snapshotOwner = Object.freeze({});
   const prepareInput = async (
     intent: JsonValue,
-    transform: (snapshot: AttachmentTransactionSnapshot) => unknown,
-    options: AttachmentTransactionOptions
+    transform: DatabaseTransactionTransform,
+    options: DatabaseTransactionOptions
   ) => {
     if (typeof transform !== 'function') throw new TypeError('Attachment transaction transform must be a function');
     const ownedIntent = detachAndFreezeJsonValue(intent);
@@ -78,14 +67,14 @@ export const createAttachmentTransactionService = async <Storage, Command>(
       intentHash: await attachmentIntentHash(context, ownedIntent.value),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       author: async ({ state, issues }: { readonly state: WritableLogicalState; readonly issues: readonly Issue[] }) =>
-        authorStateTransition(context, input.preparation, state, issues, transform)
+        authorStateTransition(context, preparation, input.registry, snapshotOwner, state, issues, transform)
     };
   };
-  const service: AttachmentTransactionService = {
+  const service: DatabaseTransactionService = {
     transact: async (
       intent: JsonValue,
-      transform: (snapshot: AttachmentTransactionSnapshot) => unknown,
-      options: AttachmentTransactionOptions = {}
+      transform: DatabaseTransactionTransform,
+      options: DatabaseTransactionOptions = {}
     ) => {
       return executeReplayablePreparedTransaction(context, await prepareInput(intent, transform, options));
     },
@@ -96,15 +85,13 @@ export const createAttachmentTransactionService = async <Storage, Command>(
 };
 
 const createExecutionContext = async <Storage, Command>(
-  input: AttachmentTransactionServiceInput<Storage, Command>
+  input: AttachmentTransactionServiceInput<Storage, Command>,
+  preparation: PreparedWritableAttachment
 ): Promise<PreparedWritableExecutionContext<Storage, Command>> => {
-  if (!input.preparation.writable || input.preparation.declaration === undefined || input.preparation.schema === undefined) {
-    throw new TypeError('Attachment transaction service requires a writable prepared database attachment');
-  }
   if (input.authorityScope.length === 0) throw new TypeError('Attachment transaction authorityScope must not be empty');
   const snapshot = input.source.snapshot();
   const registryFingerprint = await input.registry.fingerprint();
-  const relations = [...input.preparation.relations.values()].map(({ relationId, keyFields, replaceableFields }) => ({
+  const relations = [...preparation.relations.values()].map(({ relationId, keyFields, replaceableFields }) => ({
     relationId,
     keyFields,
     replaceableFields
@@ -113,7 +100,7 @@ const createExecutionContext = async <Storage, Command>(
     attachmentId: input.attachmentId,
     attachmentIncarnation: input.attachmentIncarnation,
     sourceId: input.source.sourceId,
-    schemaView: input.preparation.declaration.storageSchema,
+    schemaView: preparation.declaration.storageSchema,
     relations
   } as unknown as JsonValue);
   const authorityViewFingerprint = await sha256Json({
@@ -126,34 +113,57 @@ const createExecutionContext = async <Storage, Command>(
     attachmentFingerprint,
     authorityViewFingerprint,
     writable: true,
-    schemaView: input.preparation.declaration.storageSchema,
+    schemaView: preparation.declaration.storageSchema,
     source: input.source,
     operationEpoch: snapshot.operationEpoch,
     bindings: input.bindings,
-    relationKeys: new Map([...input.preparation.relations].map(([relationId, relation]) => [relationId, relation.keyFields])),
+    relationKeys: new Map([...preparation.relations].map(([relationId, relation]) => [relationId, relation.keyFields])),
     query: unavailableQueryService,
-    constraints: input.preparation.constraints,
+    constraints: preparation.constraints,
     satisfiesCapability: (capability) => input.registry.satisfies(capability),
     durability: input.durability,
     ...(input.operationLedger === undefined ? {} : { operationLedger: input.operationLedger })
   });
 };
 
+const assertWritablePreparation: (
+  preparation: WritableAttachmentPreparation
+) => asserts preparation is PreparedWritableAttachment = (preparation) => {
+  if (!preparation.writable || preparation.declaration === undefined || preparation.schema === undefined) {
+    throw new TypeError('Attachment transaction service requires a writable prepared database attachment');
+  }
+};
+
 const authorStateTransition = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
-  preparation: WritableAttachmentPreparation,
+  preparation: PreparedWritableAttachment,
+  registry: CapabilityRegistry,
+  snapshotOwner: object,
   before: WritableLogicalState,
   projectionIssues: readonly Issue[],
-  transform: (snapshot: AttachmentTransactionSnapshot) => unknown
+  transform: DatabaseTransactionTransform
 ) => {
   const statements = [];
   if (!projectionIssues.some(({ severity }) => severity === 'error')) {
-    const beforeRows = before.rows.map(({ relationId, fields }) => Object.freeze({ relationId, fields }));
-    const transformed = await transform(Object.freeze({ rows: Object.freeze(beforeRows) }));
-    const afterRows = adoptTransactionRows(transformed, preparation);
-    const beforeByRelation = groupTransactionFields(beforeRows);
-    const afterByRelation = groupTransactionFields(afterRows);
-    for (const [relationId, relation] of preparation.relations) {
+    const beforeByRelation = groupTransactionFields(before.rows);
+    const snapshot = new ImmutableDatabaseTransactionSnapshot({
+      owner: snapshotOwner,
+      schemaView: context.schemaView,
+      schema: preparation.schema,
+      availableRelations: preparation.relations,
+      registry,
+      rowsByRelation: beforeByRelation,
+      changedRelationIds: emptyChangedRelationIds
+    });
+    const transformed = await transform(snapshot);
+    if (!(transformed instanceof ImmutableDatabaseTransactionSnapshot)
+      || !transformed.belongsTo(snapshotOwner)) {
+      throw new TypeError('Attachment transaction transform must return a snapshot created by this service');
+    }
+    const afterByRelation = transformed.relationRows();
+    for (const relationId of transformed.changedRelations()) {
+      const relation = preparation.relations.get(relationId);
+      if (relation === undefined) throw new TypeError(`Transaction relation ${JSON.stringify(relationId)} is unavailable`);
       const authored = authorExactKeyedRelationDelta({
         relation: { relationId, schemaView: context.schemaView },
         keyFields: relation.keyFields,
@@ -174,31 +184,12 @@ const authorStateTransition = async <Storage, Command>(
   } });
 };
 
-const adoptTransactionRows = (
-  input: unknown,
-  preparation: WritableAttachmentPreparation
-): readonly AttachmentTransactionRow[] => {
-  const owned = detachAndFreezeJsonValue(input);
-  if (!owned.success) throw new TarstateParseError(owned.issues);
-  if (!Array.isArray(owned.value)) throw new TarstateParseError([rowIssue('array_required')]);
-  const rows: AttachmentTransactionRow[] = [];
-  for (const [rowIndex, candidate] of owned.value.entries()) {
-    if (!isRecord(candidate)
-      || typeof candidate.relationId !== 'string'
-      || !preparation.relations.has(candidate.relationId)
-      || !isRecord(candidate.fields)) {
-      throw new TarstateParseError([rowIssue('row_shape', rowIndex)]);
-    }
-    rows.push(candidate as unknown as AttachmentTransactionRow);
-  }
-  return Object.freeze(rows);
-};
-
 const emptyTransactionFields: readonly Readonly<Record<string, JsonValue>>[] = Object.freeze([]);
+const emptyChangedRelationIds: ReadonlySet<string> = new Set<string>();
 
 /** Groups one adopted logical state once before per-relation delta authoring. */
 const groupTransactionFields = (
-  rows: readonly AttachmentTransactionRow[]
+  rows: readonly { readonly relationId: string; readonly fields: Readonly<Record<string, JsonValue>> }[]
 ): ReadonlyMap<string, readonly Readonly<Record<string, JsonValue>>[]> => {
   const grouped = new Map<string, Readonly<Record<string, JsonValue>>[]>();
   for (const { relationId, fields } of rows) {
@@ -229,13 +220,3 @@ const attachmentIntentHash = <Storage, Command>(
   authorityViewFingerprint: context.authorityViewFingerprint,
   intent
 });
-
-const rowIssue = (reason: string, rowIndex?: number): Issue => createIssue({
-  code: 'transaction.insert_query_row_invalid',
-  retry: 'after_input',
-  ...(rowIndex === undefined ? {} : { path: [rowIndex] }),
-  details: { reason }
-});
-
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);

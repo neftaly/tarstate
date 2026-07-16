@@ -84,13 +84,19 @@ export type MaterializedQueryNode = {
 };
 
 export class MaterializedEvaluationCache implements EvaluationCache {
+  readonly #nodes: ReadonlyMap<QueryNode, MaterializedQueryNode>;
+  readonly #activeNode: QueryNode;
+
   constructor(
-    private readonly nodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
-    private readonly activeNode: QueryNode
-  ) {}
+    nodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
+    activeNode: QueryNode
+  ) {
+    this.#nodes = nodes;
+    this.#activeNode = activeNode;
+  }
 
   resultFor(node: QueryNode): MaterializedQueryNode | undefined {
-    return node === this.activeNode ? undefined : this.nodes.get(node);
+    return node === this.#activeNode ? undefined : this.#nodes.get(node);
   }
 }
 

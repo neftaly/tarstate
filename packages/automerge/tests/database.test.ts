@@ -1,15 +1,16 @@
 import * as Automerge from '@automerge/automerge';
 import { Repo } from '@automerge/automerge-repo';
 import { builtInCapabilityRefs } from '@tarstate/core/capabilities';
-import { AttachmentCatalog, DatabaseView, DatasetMembership } from '@tarstate/core/database';
-import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/database/incremental';
-import type { QueryNode, QueryRecord, RelationInput } from '@tarstate/core/query/model';
+import { sealConstraintSet } from '@tarstate/core/artifacts/constraint-set';
+import { AttachmentCatalog } from '@tarstate/core/database';
+import { openDatabaseQuery } from '@tarstate/core/database/session';
+import type { QueryNode } from '@tarstate/core/query/model';
 import { prepareQuery } from '@tarstate/core/query/prepare';
-import { sealConstraintSet, sealSchema, sealStorageMapping } from '@tarstate/core/schema';
+import { relationLiteral, sealSchema, sealStorageMapping } from '@tarstate/core/schema';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  openAutomergeAttachment,
-  type OpenAutomergeAttachmentOptions
+  openAutomergeDatabase,
+  type OpenAutomergeDatabaseOptions
 } from '../src/index.js';
 
 type TaskDocument = {
@@ -19,27 +20,30 @@ type TaskDocument = {
 describe('standard Automerge attachment', () => {
   it('opens embedded artifacts and exposes only logical transactions and lifecycle', async () => {
     const fixture = await openTaskAttachment();
-    expect(Object.keys(fixture.attachment).sort()).toEqual([
+    expect(Object.keys(fixture.database).sort()).toEqual([
       'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
     ]);
-    const initial = fixture.attachment.getSnapshot();
+    const initial = fixture.database.getSnapshot();
     expect(initial).toMatchObject({
       state: 'open',
       current: { readiness: 'ready', completeness: 'exact', rows: [{ relationId: 'tasks', fields: { id: 'first', title: 'First' } }] }
     });
-    expect(fixture.attachment.getSnapshot()).toBe(initial);
+    expect(fixture.database.getSnapshot()).toBe(initial);
     const listener = vi.fn();
-    const unsubscribe = fixture.attachment.subscribe(listener);
-    await expect(fixture.attachment.transact(
+    const unsubscribe = fixture.database.subscribe(listener);
+    await expect(fixture.database.transact(
       { kind: 'rename-task', id: 'first' },
-      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Renamed' } }))
+      (snapshot) => snapshot.withRows(
+        fixture.tasks,
+        snapshot.rows(fixture.tasks).map((row) => ({ ...row, title: 'Renamed' }))
+      )
     )).resolves.toMatchObject({ outcome: 'committed' });
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('Renamed');
     expect(listener).toHaveBeenCalled();
     unsubscribe();
 
     const catalog = new AttachmentCatalog();
-    const lease = fixture.attachment.mount(catalog, { discoveryEdges: ['embedded'] });
+    const lease = fixture.database.mount(catalog, { discoveryEdges: ['embedded'] });
     expect(lease).toMatchObject({
       attachmentId: fixture.handle.url,
       sourceId: fixture.handle.url,
@@ -49,10 +53,10 @@ describe('standard Automerge attachment', () => {
     expect(catalog.list()).toHaveLength(1);
 
     const closeListener = vi.fn();
-    fixture.attachment.subscribe(closeListener);
-    fixture.attachment.close();
+    fixture.database.subscribe(closeListener);
+    fixture.database.close();
     expect(closeListener).toHaveBeenCalledOnce();
-    expect(fixture.attachment.getSnapshot()).toEqual({ state: 'closed' });
+    expect(fixture.database.getSnapshot()).toEqual({ state: 'closed' });
     expect(catalog.list()).toHaveLength(0);
     await fixture.repo.shutdown();
   });
@@ -61,24 +65,30 @@ describe('standard Automerge attachment', () => {
     const fixture = await openTaskAttachment({ artifactMap: true, constrained: true });
     const mounted = await mountTaskDatabase(fixture);
 
-    await expect(fixture.attachment.transact(
+    await expect(fixture.database.transact(
       { kind: 'rename-task', id: 'first' },
-      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Constrained' } }))
+      (snapshot) => snapshot.withRows(
+        fixture.tasks,
+        snapshot.rows(fixture.tasks).map((row) => ({ ...row, title: 'Constrained' }))
+      )
     )).resolves.toMatchObject({ outcome: 'committed' });
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('Constrained');
-    await expect(fixture.attachment.transact(
+    await expect(fixture.database.transact(
       { kind: 'rename-task', id: 'first' },
-      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Forbidden' } }))
+      (snapshot) => snapshot.withRows(
+        fixture.tasks,
+        snapshot.rows(fixture.tasks).map((row) => ({ ...row, title: 'Forbidden' }))
+      )
     )).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'test.task_invalid' }] });
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('Constrained');
 
     const changed = vi.fn();
-    fixture.attachment.subscribe(changed);
+    fixture.database.subscribe(changed);
     mergePlayerChange(fixture.handle, '8', (draft) => {
       draft.tasks.first!.title = 'Forbidden';
     });
     expect(changed).toHaveBeenCalled();
-    expect(fixture.attachment.getSnapshot()).toMatchObject({
+    expect(fixture.database.getSnapshot()).toMatchObject({
       state: 'open',
       current: {
         readiness: 'invalid',
@@ -100,15 +110,18 @@ describe('standard Automerge attachment', () => {
     );
 
     let repairCalls = 0;
-    await expect(fixture.attachment.transact(
+    await expect(fixture.database.transact(
       { kind: 'repair-task', id: 'first' },
-      ({ rows }) => {
+      (snapshot) => {
         repairCalls += 1;
-        return rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Repaired' } }));
+        return snapshot.withRows(
+          fixture.tasks,
+          snapshot.rows(fixture.tasks).map((row) => ({ ...row, title: 'Repaired' }))
+        );
       }
     )).resolves.toMatchObject({ outcome: 'committed' });
     expect(repairCalls).toBe(1);
-    expect(fixture.attachment.getSnapshot()).toMatchObject({
+    expect(fixture.database.getSnapshot()).toMatchObject({
       state: 'open', current: { readiness: 'ready', issues: [] }
     });
     expect(mounted.observer.getSnapshot()).toMatchObject({
@@ -116,25 +129,28 @@ describe('standard Automerge attachment', () => {
     });
 
     mounted.close();
-    fixture.attachment.close();
+    fixture.database.close();
     await fixture.repo.shutdown();
   });
 
   it('reports an initially invalid constrained document and permits a final-state repair', async () => {
     const fixture = await openTaskAttachment({ constrained: true, initialTitle: 'Forbidden' });
-    expect(fixture.attachment.getSnapshot()).toMatchObject({
+    expect(fixture.database.getSnapshot()).toMatchObject({
       state: 'open', current: { readiness: 'invalid', issues: [{ code: 'test.task_invalid' }] }
     });
 
-    await expect(fixture.attachment.transact(
+    await expect(fixture.database.transact(
       { kind: 'repair-task', id: 'first' },
-      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Valid' } }))
+      (snapshot) => snapshot.withRows(
+        fixture.tasks,
+        snapshot.rows(fixture.tasks).map((row) => ({ ...row, title: 'Valid' }))
+      )
     )).resolves.toMatchObject({ outcome: 'committed' });
-    expect(fixture.attachment.getSnapshot()).toMatchObject({
+    expect(fixture.database.getSnapshot()).toMatchObject({
       state: 'open', current: { readiness: 'ready', rows: [{ fields: { title: 'Valid' } }] }
     });
 
-    fixture.attachment.close();
+    fixture.database.close();
     await fixture.repo.shutdown();
   });
 
@@ -152,8 +168,8 @@ describe('standard Automerge attachment', () => {
     });
 
     mounted.close();
-    fixture.attachment.close();
-    expect(mounted.catalog.list()).toHaveLength(0);
+    fixture.database.close();
+    expect(mounted.observer.getSnapshot()).toEqual({ state: 'closed' });
     await fixture.repo.shutdown();
   });
 
@@ -162,20 +178,21 @@ describe('standard Automerge attachment', () => {
     const started = [deferred(), deferred()];
     const resume = [deferred(), deferred()];
     let calls = 0;
-    const pending = fixture.attachment.transact(
+    const pending = fixture.database.transact(
       { kind: 'repeated-player-sync', id: 'first' },
-      async ({ rows }) => {
+      async (snapshot) => {
         const call = calls;
         calls += 1;
         if (call < started.length) {
           started[call]!.resolve();
           await resume[call]!.promise;
         }
-        return rows.map((row) => {
-          if (row.fields.id !== 'first') return row;
-          if (typeof row.fields.title !== 'string') throw new TypeError('Expected a task title');
-          return { ...row, fields: { ...row.fields, title: `Local after ${row.fields.title}` } };
-        });
+        return snapshot.withRows(
+          fixture.tasks,
+          snapshot.rows(fixture.tasks).map((row) => row.id === 'first'
+            ? { ...row, title: `Local after ${row.title}` }
+            : row)
+        );
       }
     );
 
@@ -200,7 +217,7 @@ describe('standard Automerge attachment', () => {
       third: { id: 'third', title: 'Third player row' }
     });
 
-    fixture.attachment.close();
+    fixture.database.close();
     await fixture.repo.shutdown();
   });
 
@@ -209,17 +226,20 @@ describe('standard Automerge attachment', () => {
     const started = deferred();
     const resume = deferred();
     let calls = 0;
-    const pending = fixture.attachment.transact(
+    const pending = fixture.database.transact(
       { kind: 'rename-if-present', id: 'first' },
-      async ({ rows }) => {
+      async (snapshot) => {
         calls += 1;
         if (calls === 1) {
           started.resolve();
           await resume.promise;
         }
-        return rows.map((row) => row.fields.id === 'first'
-          ? { ...row, fields: { ...row.fields, title: 'Local rename' } }
-          : row);
+        return snapshot.withRows(
+          fixture.tasks,
+          snapshot.rows(fixture.tasks).map((row) => row.id === 'first'
+            ? { ...row, title: 'Local rename' }
+            : row)
+        );
       }
     );
 
@@ -236,7 +256,7 @@ describe('standard Automerge attachment', () => {
       second: { id: 'second', title: 'Preserved' }
     });
 
-    fixture.attachment.close();
+    fixture.database.close();
     await fixture.repo.shutdown();
   });
 
@@ -252,11 +272,11 @@ describe('standard Automerge attachment', () => {
     fixture.handle.update(() => Automerge.merge(left, right));
     let calls = 0;
 
-    const receipt = await fixture.attachment.transact(
+    const receipt = await fixture.database.transact(
       { kind: 'must-not-select-conflict', id: 'first' },
-      ({ rows }) => {
+      (snapshot) => {
         calls += 1;
-        return rows;
+        return snapshot;
       }
     );
 
@@ -271,7 +291,7 @@ describe('standard Automerge attachment', () => {
       .sort((left, right) => left.localeCompare(right)))
       .toEqual(['Left', 'Right']);
 
-    fixture.attachment.close();
+    fixture.database.close();
     await fixture.repo.shutdown();
   });
 
@@ -284,7 +304,7 @@ describe('standard Automerge attachment', () => {
     const repo = new Repo();
     const handle = repo.create<TaskDocument>({ tasks: {} });
 
-    await expect(openAutomergeAttachment({
+    await expect(openAutomergeDatabase({
       handle,
       declaration,
       embeddedArtifacts: [],
@@ -367,14 +387,14 @@ const openTaskAttachment = async (options: {
   const handle = repo.create<TaskDocument>({
     tasks: { first: { id: 'first', title: options.initialTitle ?? 'First' } }
   });
-  const declaration: OpenAutomergeAttachmentOptions<TaskDocument, readonly string[]>['declaration'] = {
+  const declaration: OpenAutomergeDatabaseOptions<TaskDocument, readonly string[]>['declaration'] = {
     formatVersion: 1,
     storageSchema: reference(schema),
     projection: { kind: 'storage-mapping', storageMapping: reference(mapping) },
     ...(constraint === undefined ? {} : { constraints: { set: reference(constraint), mode: 'required' as const } })
   };
   const artifacts = [schema, mapping, ...(constraint === undefined ? [] : [constraint])];
-  const opened = await openAutomergeAttachment({
+  const opened = await openAutomergeDatabase({
     handle,
     declaration,
     embeddedArtifacts: options.artifactMap === true
@@ -386,33 +406,12 @@ const openTaskAttachment = async (options: {
     await repo.shutdown();
     throw new Error(JSON.stringify(opened.issues));
   }
-  return { attachment: opened.value, handle, repo, schema };
+  return { database: opened.value, handle, repo, schema, tasks: relationLiteral(schema, 'tasks') };
 };
 
 const mountTaskDatabase = async (
   fixture: Awaited<ReturnType<typeof openTaskAttachment>>
 ) => {
-  const catalog = new AttachmentCatalog();
-  const lease = fixture.attachment.mount(catalog, { discoveryEdges: ['workspace'] });
-  const dataset = new DatasetMembership({
-    datasetId: 'workspace',
-    state: 'settled',
-    members: [{
-      attachmentId: lease.attachmentId,
-      sourceId: lease.sourceId,
-      expectation: 'required',
-      discoveryEdges: lease.discoveryEdges
-    }]
-  });
-  const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
-    authorityScope: 'scope:test',
-    authorityFingerprint: 'authority:test',
-    registryFingerprint: 'registry:test',
-    attachments: catalog,
-    datasets: [dataset],
-    canRead: (viewScope, attachmentScope) => viewScope === attachmentScope,
-    createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
-  });
   const taskRelation = { schemaView: reference(fixture.schema), relationId: 'tasks' };
   const root: QueryNode = {
     kind: 'recursive',
@@ -446,15 +445,20 @@ const mountTaskDatabase = async (
     authorityFingerprint: 'authority:test',
     datasetId: 'workspace'
   });
-  const observer = database.observe({ plan });
+  const observer = await openDatabaseQuery({
+    sources: [{
+      source: fixture.database,
+      expectation: 'required',
+      discoveryEdges: ['workspace']
+    }],
+    plan,
+    queryAuthorityScope: 'scope:test',
+    canRead: ({ queryAuthorityScope, sourceAuthorityScope }) =>
+      queryAuthorityScope === sourceAuthorityScope
+  });
   return {
-    catalog,
     observer,
-    close: () => {
-      observer.close();
-      database.close();
-      lease.close();
-    }
+    close: () => observer.close()
   };
 };
 

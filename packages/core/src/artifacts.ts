@@ -164,7 +164,12 @@ export const safeParseJsonText = (text: string, budget: ArtifactParseBudget = de
 };
 
 class JsonTextIssue extends Error {
-  constructor(readonly issue: Issue) { super(issue.code); }
+  readonly issue: Issue;
+
+  constructor(issue: Issue) {
+    super(issue.code);
+    this.issue = issue;
+  }
 }
 
 class DuplicateAwareJsonParser {

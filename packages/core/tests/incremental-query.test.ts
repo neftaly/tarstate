@@ -2419,14 +2419,34 @@ describe('incremental query maintenance', () => {
   it('treats kind-like literal and values JSON as opaque poolable data', () => {
     const query: QueryNode = {
       kind: 'values', alias: 'data',
-      rows: [{ kind: 'subquery', nested: { kind: 'recursive' }, literal: { kind: 'seek' } }]
+      rows: [{
+        kind: 'subquery',
+        nested: { kind: 'recursive' },
+        literal: { kind: 'seek' },
+        relationLike: { kind: 'from', relation: { schemaView, relationId: 'unrelated' } }
+      }]
     };
+    const unrelated = relation('unrelated', [{ occurrenceId: 'unrelated:1', row: { id: 1 } }], 1);
+    const initial = { ...snapshot(basePeople, 1), relations: [unrelated] };
+    const next = {
+      ...initial,
+      basis: { dataset: 'changed-evidence' },
+      relations: [relation('unrelated', [{ occurrenceId: 'unrelated:1', row: { id: 2 } }], 2)]
+    };
+    const session = openIncrementalQueryMaintenance(plan(query), initial);
+    const result = applySnapshot(session, initial, next);
+    expect(result.state).toMatchObject({
+      changedRelationIds: ['unrelated'],
+      updatedNodeCount: 0,
+      changedNodeCount: 0
+    });
+    session.close();
     const runtime = createPooledIncrementalQueryRuntime({
       environment: {
         runtimeIdentity: 'database:test/opaque-values', registryFingerprint: 'registry:test',
         authorityFingerprint: 'authority:test', datasetId: 'dataset:test', parameters: { minimum: 6 }
       },
-      initialSnapshot: snapshot(basePeople, 1)
+      initialSnapshot: initial
     });
     const root = runtime.attach(plan(query));
     expect(root.getCurrentResult()).toMatchObject({ completeness: 'exact', rows: query.rows });

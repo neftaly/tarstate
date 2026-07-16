@@ -25,7 +25,7 @@ import {
   createLiveAutomergeAttachment,
 } from './live.js';
 import { embeddedArtifactKey, indexEmbeddedArtifacts } from './embedded-artifacts.js';
-import type { AutomergeAttachment } from './model.js';
+import type { AutomergeDatabase } from './model.js';
 import { createAutomergeAttachmentProjector, databaseProjection } from './projection.js';
 import {
   automergeRepoSourceRuntime,
@@ -33,7 +33,7 @@ import {
   type AutomergeSourceCommand
 } from '../source/runtime.js';
 
-export type OpenAutomergeAttachmentOptions<T extends object, Heads> = {
+export type OpenAutomergeDatabaseOptions<T extends object, Heads> = {
   readonly handle: AutomergeRepoHandle<T, Heads>;
   readonly declaration: unknown;
   readonly embeddedArtifacts: unknown;
@@ -42,10 +42,10 @@ export type OpenAutomergeAttachmentOptions<T extends object, Heads> = {
   readonly registry?: CapabilityRegistry;
 };
 
-/** Opens the standard writable Automerge attachment path without exposing heads, bindings, or execution contexts. */
-export const openAutomergeAttachment = async <T extends object, Heads>(
-  input: OpenAutomergeAttachmentOptions<T, Heads>
-): Promise<ParseResult<AutomergeAttachment>> => {
+/** Opens a writable Automerge-backed database without exposing heads, bindings, or execution contexts. */
+export const openAutomergeDatabase = async <T extends object, Heads>(
+  input: OpenAutomergeDatabaseOptions<T, Heads>
+): Promise<ParseResult<AutomergeDatabase>> => {
   const declaration = adoptBoundaryJson(input.declaration);
   if (!declaration.success) return declaration;
   const embedded = adoptBoundaryJson(input.embeddedArtifacts);

@@ -1,14 +1,16 @@
 import type * as Automerge from '@automerge/automerge';
 import type {
-  AttachmentTransactionRow,
-  AttachmentTransactionService,
   ReadyAttachmentPreparation
 } from '@tarstate/core/attachment/adapter';
+import type {
+  DatabaseTransactionService,
+  LogicalRelationRow
+} from '@tarstate/core/transactions';
 import type { AttachmentLease } from '@tarstate/core/database';
 import type { RelationInput } from '@tarstate/core/query/model';
 import type { WritableLogicalState } from '@tarstate/core/source';
 import type { AutomergeAtomicSource } from '../adapter/atomic-source.js';
-import type { AutomergeAttachment, AutomergeAttachmentSnapshot } from './model.js';
+import type { AutomergeDatabase, AutomergeDatabaseSnapshot } from './model.js';
 import {
   attachmentSnapshot,
   sameAttachmentSnapshot,
@@ -19,14 +21,14 @@ export const createLiveAutomergeAttachment = <T extends object>(input: {
   readonly attachmentId: string;
   readonly incarnation: string;
   readonly authorityScope: string;
-  readonly transactions: AttachmentTransactionService;
+  readonly transactions: DatabaseTransactionService;
   readonly preparation: ReadyAttachmentPreparation<Automerge.Doc<T>, readonly RelationInput[], WritableLogicalState>;
   readonly source: AutomergeAtomicSource<T>;
   readonly projector: AutomergeAttachmentProjector<T>;
-}): AutomergeAttachment => {
+}): AutomergeDatabase => {
   const listeners = new Set<() => void>();
   const leases = new Set<AttachmentLease<Automerge.Doc<T>, readonly RelationInput[]>>();
-  const logicalRows = new WeakMap<object, readonly AttachmentTransactionRow[]>();
+  const logicalRows = new WeakMap<object, readonly LogicalRelationRow[]>();
   let closed = false;
   let dirty = false;
   let snapshot = attachmentSnapshot(input.source.snapshot(), input.projector, logicalRows);
@@ -110,7 +112,7 @@ export const createLiveAutomergeAttachment = <T extends object>(input: {
       listeners.clear();
       input.source.close();
     }
-  } satisfies AutomergeAttachment);
+  } satisfies AutomergeDatabase);
 };
 
-const closedAttachmentSnapshot: AutomergeAttachmentSnapshot = Object.freeze({ state: 'closed' });
+const closedAttachmentSnapshot: AutomergeDatabaseSnapshot = Object.freeze({ state: 'closed' });

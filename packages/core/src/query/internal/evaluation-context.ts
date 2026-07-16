@@ -52,8 +52,11 @@ export type EvaluationEnvironment = {
 export class WorkBudgetLedger {
   private used = 0;
   private exhausted = false;
+  readonly limit: number;
 
-  constructor(readonly limit: number) {}
+  constructor(limit: number) {
+    this.limit = limit;
+  }
 
   consume(units: number): boolean {
     if (this.exhausted || this.used + units > this.limit) {

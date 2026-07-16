@@ -1,11 +1,11 @@
 import {
-  AttachmentCatalog,
-  DatabaseView,
-  DatasetMembership,
   type ObservableSource,
   type SourceSnapshot
 } from '@tarstate/core/database';
-import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/database/incremental';
+import {
+  openDatabaseQuery,
+  type MountableDatabaseSource
+} from '@tarstate/core/database/session';
 import { prepareManualReadOnlyAttachment } from '@tarstate/core/attachment/adapter';
 import {
   prepareTypedQuery,
@@ -74,64 +74,58 @@ const source: ObservableSource<Storage> = {
   subscribe: () => () => undefined
 };
 
-const attachments = new AttachmentCatalog();
-const attachmentLease = attachments.attach({
-  attachmentId,
-  incarnation: 'attachment:pizzas:one',
-  sourceId,
-  source,
-  authorityScope: 'public',
-  discoveryEdges: [],
-  preparation: prepareManualReadOnlyAttachment<Storage, readonly RelationInput[]>({
-    schemaViewIds: [schema.id],
-    project: current => {
-      if (current.storage === undefined) {
-        return {
-          state: current.state === 'ready' ? 'failed' : current.state,
-          issues: current.issues
-        };
-      }
-      return {
-        state: 'ready',
-        value: [{
-          relation: { schemaView: pizzas.schemaView, relationId: pizzas.relationId },
-          rows: current.storage.pizzas,
-          occurrenceIds: current.storage.pizzas.map(row => `pizza:${row.name}`),
-          completeness: 'exact',
-          sourceId,
-          attachmentId,
-          basis: current.basis
-        }],
-        issues: []
-      };
-    }
-  })
-});
-const membership = new DatasetMembership({
-  datasetId,
-  state: 'settled',
-  members: [{
-    attachmentId,
-    sourceId,
-    expectation: 'required',
-    discoveryEdges: []
-  }]
-});
-const database = new DatabaseView({
-  authorityScope: 'public',
-  authorityFingerprint,
-  registryFingerprint,
-  attachments,
-  datasets: [membership],
-  canRead: (viewScope, attachmentScope) => viewScope === attachmentScope,
-  createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+const databaseSource: MountableDatabaseSource = {
+  mount: (catalog, options = {}) => {
+    const discoveryEdges = Object.freeze([...(options.discoveryEdges ?? [])]);
+    const lease = catalog.attach({
+      attachmentId,
+      incarnation: 'attachment:pizzas:one',
+      sourceId,
+      source,
+      authorityScope: 'public',
+      discoveryEdges,
+      preparation: prepareManualReadOnlyAttachment<Storage, readonly RelationInput[]>({
+        schemaViewIds: [schema.id],
+        project: current => {
+          if (current.storage === undefined) {
+            return {
+              state: current.state === 'ready' ? 'failed' : current.state,
+              issues: current.issues
+            };
+          }
+          return {
+            state: 'ready',
+            value: [{
+              relation: { schemaView: pizzas.schemaView, relationId: pizzas.relationId },
+              rows: current.storage.pizzas,
+              occurrenceIds: current.storage.pizzas.map(row => `pizza:${row.name}`),
+              completeness: 'exact',
+              sourceId,
+              attachmentId,
+              basis: current.basis
+            }],
+            issues: []
+          };
+        }
+      })
+    });
+    return {
+      attachmentId,
+      sourceId,
+      discoveryEdges,
+      close: () => lease.close()
+    };
+  }
+};
+
+const session = await openDatabaseQuery({
+  sources: [{ source: databaseSource }],
+  plan: pizzaMenuPlan,
+  queryAuthorityScope: 'public'
 });
 
-const observer = database.observe({ plan: pizzaMenuPlan });
-const result = observer.getSnapshot();
+const result = session.getSnapshot();
 if (result.state !== 'open') throw new Error('Quickstart observer closed unexpectedly');
 console.log(result.current.rows);
 
-observer.close();
-database.close();
-attachmentLease.close();
+session.close();

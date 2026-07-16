@@ -14,7 +14,7 @@ npm install ./tarstate-core-0.4.0.tgz
 Most applications should make one choice based on where their data lives:
 
 - For a writable Automerge document, start with
-  `openAutomergeAttachment` from `@tarstate/automerge`. It owns attachment
+  `openAutomergeDatabase` from `@tarstate/automerge`. It owns attachment
   preparation, keyed relation diffs, replay after multiplayer changes,
   validation, and publication.
 - For pure in-memory query evaluation, import the typed builders and
@@ -41,7 +41,7 @@ and schema implementations:
 | `@tarstate/core/source` | Source state, storage-independent logical edits, and live source protocols |
 | `@tarstate/core/attachment` | Portable attachment declarations and host composition contracts |
 | `@tarstate/core/artifacts` | Portable envelopes, capabilities, issues, and exact resolution; no semantic handlers |
-| `@tarstate/core/schema` | Schemas, codecs, constraints, mappings, lenses, and typed authoring |
+| `@tarstate/core/schema` | Schemas, codecs, source-constraint contracts, mappings, lenses, and typed authoring |
 | `@tarstate/core/query` | Query builders, evaluation, preparation, and incremental maintenance |
 | `@tarstate/core/database` | Database catalogs, observation, host runtimes, and system relations |
 | `@tarstate/core/transactions` | Writes, commit coordination, receipts, and lifecycle governance |
@@ -62,6 +62,7 @@ Query and observation have narrower execution seams:
 | `@tarstate/core/database/observer` | Generic catalogs and observation with an injected maintenance factory |
 | `@tarstate/core/database/incremental` | Explicit adapter from database observation to incremental query maintenance |
 | `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
+| `@tarstate/core/database/session` | Owned incremental query lifecycle over mountable database sources |
 
 Schema, query, and transaction authoring are separate implementations behind
 their topic entries, so query authoring does not load schema or transaction
@@ -118,7 +119,7 @@ detach and freeze every changing input. There is no separate fast-path API.
 
 ## Failure boundary
 
-Public parsers and attachment openers return `ParseResult` for untrusted
+Public parsers and database openers return `ParseResult` for untrusted
 documents and artifacts. Invalid host configuration, malformed method
 arguments, and a transform that fails before producing its first valid
 transaction reject with `TypeError` or `TarstateParseError`. After a valid
@@ -132,55 +133,46 @@ throws, the operation resolves to a rejected receipt with
 Callbacks must therefore be pure, replayable, and use returned logical rows—not
 exceptions—for ordinary product behavior.
 
-## Minimal database assembly
+## Database query sessions
 
-`DatabaseView` is the imperative shell around host-owned sources and authority
-policy. A minimal read path consists of a catalog, one prepared attachment, a
-dataset membership, and a maintenance factory:
+Applications query mountable database sources through one owned session. Authority,
+membership expectations, discovery edges, and dataset settlement remain
+explicit policy; catalog, database, observer, incremental maintenance, leases,
+and reverse-order cleanup are mechanical and remain inside the session:
 
 ```ts
-const catalog = new AttachmentCatalog();
-const attachmentLease = catalog.attach(attachment);
-const membership = new DatasetMembership({
-  datasetId: 'primary',
-  state: 'settled',
-  members: [{
-    attachmentId: attachment.attachmentId,
-    sourceId: attachment.sourceId,
-    expectation: 'required',
-    discoveryEdges: []
-  }]
-});
-const database = new DatabaseView({
-  authorityScope,
-  authorityFingerprint,
-  registryFingerprint,
-  attachments: catalog,
-  datasets: [membership],
-  canRead,
-  createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
-});
 const plan = await prepareTypedQuery(query, {
   registryFingerprint,
   authorityFingerprint,
   datasetId: 'primary'
 });
-const observer = database.observe({ plan });
+const session = await openDatabaseQuery({
+  sources: [{
+    source: databaseSource
+  }],
+  plan,
+  queryAuthorityScope: authorityScope
+});
+
+// One idempotent close owns the complete query lifecycle.
+session.close();
 ```
+
+Sources are required by default, and the default read policy permits only a
+source whose authority scope exactly matches `queryAuthorityScope`. Specify
+`expectation`, `discoveryEdges`, or `canRead` only when application policy
+differs.
 
 Adapter authors import `prepareManualReadOnlyAttachment`,
 `prepareDatabaseAttachment`, and `createAttachmentTransactionService` from
-`@tarstate/core/attachment/adapter`. Applications using an official adapter do
-not need this construction seam. In particular, an attachment returned by
-`openAutomergeAttachment` mounts itself into an `AttachmentCatalog`; its live
-database projection and replayable write projection are the same
-conflict-aware mapping.
-Closing the database closes every observer and maintenance runtime it created;
-closing an observer earlier only releases that observer's lease. The database
-borrows the attachment catalog, dataset memberships, attachments, and sources,
-so the host must still close attachment leases and any independently owned
-sources. Registries and authority checks remain explicit because they are
-policy, not construction defaults.
+`@tarstate/core/attachment/adapter`. Custom adapters implement the small
+structural `MountableDatabaseSource` protocol; the executable quickstart contains a
+complete implementation. Applications using an official adapter do not need
+this construction seam. A database returned by `openAutomergeDatabase`
+already conforms, and its live database projection and replayable write
+projection are the same conflict-aware mapping. `AttachmentCatalog`,
+`DatasetMembership`, and `DatabaseView` remain available as lower-level host
+primitives for dynamic dataset runtimes rather than ordinary application setup.
 
 ## Shared maintenance
 

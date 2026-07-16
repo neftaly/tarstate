@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { sealArtifact, type Artifact } from '../src/artifacts.js';
 import { prepareDatabaseAttachment } from '../src/attachment/preparation.js';
 import {
-  createAttachmentTransactionService,
-  type AttachmentTransactionSnapshot
+  createAttachmentTransactionService
 } from '../src/attachment/transaction-service.js';
+import type { DatabaseTransactionSnapshot } from '../src/database/transaction.js';
 import { capabilityRefFor, CapabilityRegistry, type CapabilityDeclaration } from '../src/registry.js';
+import { sealSchema } from '../src/schema.js';
+import { relationLiteral } from '../src/schema-authoring.js';
 import type { WritableLogicalState } from '../src/logical-edit.js';
 import {
   LogicalMemoryAtomicSource,
@@ -25,8 +27,7 @@ const replaceDeclaration: CapabilityDeclaration = {
 describe('attachment transaction service', () => {
   it('derives exact deltas and replays the pure transform after a concurrent change', async () => {
     const replace = await capabilityRefFor(replaceDeclaration);
-    const schema = await sealArtifact({
-      kind: 'schema',
+    const schema = await sealSchema({
       id: 'urn:test:attachment-transactions:schema',
       body: { relations: { items: {
         relationId: 'test.item',
@@ -38,6 +39,7 @@ describe('attachment transaction service', () => {
         }
       } } }
     });
+    const items = relationLiteral(schema, 'items');
     const mapping = await sealArtifact({
       kind: 'storage-mapping',
       id: 'urn:test:attachment-transactions:mapping',
@@ -93,8 +95,15 @@ describe('attachment transaction service', () => {
     });
     await expect(service.simulate(
       { kind: 'preview-title' },
-      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Preview' } }))
+      (snapshot) => snapshot.withRows(
+        items,
+        snapshot.rows(items).map((row) => ({ ...row, title: 'Preview' }))
+      )
     )).resolves.toMatchObject({ outcome: 'would-commit', statementResults: [{ logicallyChanged: 1 }] });
+    await expect(service.simulate(
+      { kind: 'preview-no-op' },
+      (snapshot) => snapshot
+    )).resolves.toMatchObject({ outcome: 'would-commit', statementResults: [] });
     expect(source.snapshot()).toMatchObject({ storage: { 'test.item': [{ title: 'Old', count: 1 }] } });
     const commitDirect = source.commit;
     vi.spyOn(source, 'commit').mockImplementationOnce(async (input) => {
@@ -113,11 +122,10 @@ describe('attachment transaction service', () => {
       });
       return commitDirect(input);
     });
-    const transform = vi.fn(({ rows }: AttachmentTransactionSnapshot) => rows.map((row) => {
-      const count = row.fields.count;
-      if (typeof count !== 'number') throw new TypeError('Expected numeric count');
-      return { ...row, fields: { ...row.fields, title: `Count:${count}` } };
-    }));
+    const transform = vi.fn((snapshot: DatabaseTransactionSnapshot) => snapshot.withRows(
+      items,
+      snapshot.rows(items).map((row) => ({ ...row, title: `Count:${row.count}` }))
+    ));
 
     const receipt = await service.transact(
       { kind: 'set-title-from-count' },
@@ -149,10 +157,13 @@ describe('attachment transaction service', () => {
     let replayCount = 0;
     const replayFailure = await service.transact(
       { kind: 'fail-on-replay' },
-      ({ rows }) => {
+      (snapshot) => {
         replayCount += 1;
         if (replayCount > 1) throw new Error('impure replay');
-        return rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Never committed' } }));
+        return snapshot.withRows(
+          items,
+          snapshot.rows(items).map((row) => ({ ...row, title: 'Never committed' }))
+        );
       }
     );
     expect(replayFailure).toMatchObject({
@@ -166,7 +177,11 @@ describe('attachment transaction service', () => {
     )).rejects.toThrow('initial author failure');
     await expect(service.simulate(
       { kind: 'invalid-transform-output' },
-      () => null
+      () => null as unknown as DatabaseTransactionSnapshot
+    )).rejects.toThrow('must return a snapshot');
+    await expect(service.simulate(
+      { kind: 'invalid-replacement-row' },
+      (snapshot) => snapshot.withRows(items, [{ id: 'one', title: 4, count: 3 } as never])
     )).rejects.toMatchObject({ name: 'TarstateParseError' });
     expect(source.snapshot()).toMatchObject({
       storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 3 }] }

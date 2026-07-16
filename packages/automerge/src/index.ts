@@ -1,12 +1,10 @@
-/** The standard, conflict-aware Automerge attachment boundary. */
-export { openAutomergeAttachment } from './attachment/open.js';
+/** The standard, conflict-aware Automerge database boundary. */
+export { openAutomergeDatabase } from './attachment/open.js';
 export type {
-  OpenAutomergeAttachmentOptions
+  OpenAutomergeDatabaseOptions
 } from './attachment/open.js';
 export type {
-  AutomergeAttachment,
-  AutomergeAttachmentMountLease,
-  AutomergeAttachmentMountOptions,
-  AutomergeAttachmentResult,
-  AutomergeAttachmentSnapshot
+  AutomergeDatabase,
+  AutomergeDatabaseResult,
+  AutomergeDatabaseSnapshot
 } from './attachment/model.js';

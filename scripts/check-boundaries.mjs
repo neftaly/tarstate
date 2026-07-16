@@ -78,7 +78,6 @@ assignArchitectureGroup('artifact-resolution', ['artifact-resolver.ts']);
 assignArchitectureGroup('source-contract', ['attachment/model.ts', 'logical-edit.ts', 'source-protocol.ts', 'source-state.ts']);
 assignArchitectureGroup('schema', [
   'codec.ts',
-  'constraint-artifact.ts',
   'constraints.ts',
   'internal-document-declaration.ts',
   'internal-semantic-provenance.ts',
@@ -87,7 +86,12 @@ assignArchitectureGroup('schema', [
   'schema-authoring.ts',
   'schema.ts'
 ]);
-assignArchitectureGroup('query-model', ['query/incremental-model.ts', 'query/model.ts', 'query/plan-contract.ts']);
+assignArchitectureGroup('query-model', [
+  'query/incremental-model.ts',
+  'query/internal/syntax-walk.ts',
+  'query/model.ts',
+  'query/plan-contract.ts'
+]);
 assignArchitectureGroup('query-batch', [
   'query/internal/prepared-expression.ts',
   'query/internal/prepared-plan.ts',
@@ -123,6 +127,7 @@ assignArchitectureGroup('query-incremental', [
   'query/maintenance-diff.ts'
 ]);
 assignArchitectureGroup('transaction-model', [
+  'database/transaction.ts',
   'internal-transaction-expression.ts',
   'receipts.ts',
   'relation-delta-authoring.ts',
@@ -130,6 +135,7 @@ assignArchitectureGroup('transaction-model', [
   'transaction.ts'
 ]);
 assignArchitectureGroup('semantic-artifact', [
+  'constraint-artifact.ts',
   'internal-constraint-set-preparation.ts',
   'internal-semantic-artifact-validation.ts',
   'internal-semantic-constraint-validation.ts',
@@ -152,6 +158,7 @@ assignArchitectureGroup('transaction-runtime', [
 assignArchitectureGroup('attachment-runtime', [
   'attachment/logical-constraint-query.ts',
   'attachment/preparation.ts',
+  'attachment/transaction-snapshot.ts',
   'attachment/transaction-service.ts'
 ]);
 assignArchitectureGroup('observer-contract', ['database-model.ts', 'observer-maintenance-contracts.ts']);
@@ -167,6 +174,7 @@ assignArchitectureGroup('observer', [
 assignArchitectureGroup('observer-incremental', ['internal-observer-maintenance-frames.ts', 'internal-observer-query-maintenance.ts']);
 assignArchitectureGroup('system', ['system-relations.ts']);
 assignArchitectureGroup('composition', [
+  'database/query-session.ts',
   'golden-workloads.ts',
   'index.ts',
   'query.ts',
@@ -229,6 +237,7 @@ const publicRuntimePolicies = new Map(Object.entries({
   'artifacts/storage-mapping/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
   'artifacts/schema-lens/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
   'database/observer/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
+  'database/session/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'attachment-runtime', 'observer-contract', 'observer', 'observer-incremental'],
   'database/incremental/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer', 'observer-incremental'],
   'database/external-store/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
   'database/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'transaction-runtime', 'attachment-runtime', 'observer-contract', 'observer', 'system'],
@@ -238,7 +247,8 @@ const publicRuntimePolicies = new Map(Object.entries({
 
 const publicDeclarationPolicyAdditions = new Map(Object.entries({
   'database/index.ts': ['artifact-resolution', 'semantic-artifact'],
-  'database/observer/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact']
+  'database/observer/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact'],
+  'database/session/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact']
 }));
 
 for (const [entryName, allowedGroups] of publicRuntimePolicies) {

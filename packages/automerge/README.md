@@ -5,7 +5,7 @@ The Automerge source and storage bindings for Tarstate v1.
 This package depends on `@tarstate/core` and reports adapter-specific
 projection and conflict guarantees through portable receipts and capabilities.
 
-The package root exposes one standard attachment API. Low-level Automerge value
+The package root exposes one standard database API. Low-level Automerge value
 adoption is available without loading the adapter runtime from
 `@tarstate/automerge/values`.
 
@@ -22,11 +22,12 @@ npm install \
 ## Usage
 
 This is the normal writable application path. Consumers do not choose between
-prepared, owned, staged, or fast variants; the attachment optimizes and replays
+prepared, owned, staged, or fast variants; the database optimizes and replays
 this one operation API internally.
 
 ```ts
-import { openAutomergeAttachment } from '@tarstate/automerge';
+import { openAutomergeDatabase } from '@tarstate/automerge';
+import { relationLiteral, sealSchema } from '@tarstate/core/schema';
 
 type TaskDoc = {
   readonly tasks: Readonly<Record<string, { readonly id: string; readonly title: string }>>;
@@ -36,10 +37,25 @@ type TaskDoc = {
   };
 };
 
+// This is the same schema artifact embedded in the document. Sealing the same
+// ID and body produces the same exact reference while retaining row inference.
+const taskSchema = await sealSchema({
+  id: 'example.tasks@1',
+  body: { relations: { tasks: {
+    relationId: 'tasks',
+    key: ['id'],
+    fields: {
+      id: { type: { kind: 'string' } },
+      title: { type: { kind: 'string' } }
+    }
+  } } }
+});
+const tasks = relationLiteral(taskSchema, 'tasks');
+
 // `handle` is an already-ready, writable Automerge Repo handle. The declaration
 // references schema and storage-mapping artifacts embedded in the same document.
 const document = handle.doc() as TaskDoc;
-const opened = await openAutomergeAttachment({
+const opened = await openAutomergeDatabase({
   handle,
   declaration: document.tarstate.declaration,
   embeddedArtifacts: document.tarstate.artifacts,
@@ -55,11 +71,14 @@ const unsubscribe = opened.value.subscribe(() => {
 });
 
 const operation = { kind: 'rename-task', id: 'first', title: 'Renamed' } as const;
-const receipt = await opened.value.transact(operation, ({ rows }) => rows.map((row) =>
-  row.relationId === 'tasks' && row.fields.id === operation.id
-    ? { ...row, fields: { ...row.fields, title: operation.title } }
-    : row
-));
+const receipt = await opened.value.transact(operation, (snapshot) =>
+  snapshot.withRows(
+    tasks,
+    snapshot.rows(tasks).map((row) => row.id === operation.id
+      ? { ...row, title: operation.title }
+      : row)
+  )
+);
 
 unsubscribe();
 opened.value.close();
@@ -80,30 +99,23 @@ indeterminate and prevents publication.
 `getSnapshot` and `subscribe` form a synchronous external-store boundary. The
 snapshot reports readiness, exactness, freshness, source lifecycle, basis, and
 issues; its logical row array retains identity while the mapped projection is
-unchanged. To compose the same attachment into Tarstate database observation,
-mount it rather than rebuilding a prepared attachment:
+unchanged. To query the same database through Tarstate's incremental observer,
+mount it as a source rather than rebuilding adapter machinery:
 
 ```ts
-import { AttachmentCatalog, DatasetMembership } from '@tarstate/core/database';
+import { openDatabaseQuery } from '@tarstate/core/database/session';
 
-const catalog = new AttachmentCatalog();
-const lease = opened.value.mount(catalog, { discoveryEdges: ['workspace'] });
-
-const membership = new DatasetMembership({
-  datasetId: 'workspace',
-  state: 'settled',
-  members: [{
-    attachmentId: lease.attachmentId,
-    sourceId: lease.sourceId,
-    expectation: 'required',
-    discoveryEdges: lease.discoveryEdges
-  }]
+const session = await openDatabaseQuery({
+  sources: [{
+    source: opened.value,
+    discoveryEdges: ['workspace']
+  }],
+  plan,
+  queryAuthorityScope: 'workspace'
 });
 
-// The trusted catalog retains the internal source. The public lease exposes
-// only dataset identity and lifecycle, never the raw Automerge document.
-// Closing the opened attachment also releases every lease it created.
-lease.close();
+// One idempotent close releases the observer, database, membership, and mount.
+session.close();
 ```
 
 Multiplayer changes are ordinary input to this loop. Each candidate is staged

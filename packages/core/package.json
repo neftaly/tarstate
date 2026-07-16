@@ -64,6 +64,10 @@
       "types": "./dist/database/observer/index.d.ts",
       "import": "./dist/database/observer/index.js"
     },
+    "./database/session": {
+      "types": "./dist/database/session/index.d.ts",
+      "import": "./dist/database/session/index.js"
+    },
     "./query": {
       "types": "./dist/query/index.d.ts",
       "import": "./dist/query/index.js"

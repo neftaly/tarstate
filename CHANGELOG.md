@@ -5,6 +5,28 @@ history.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Renamed the application-facing Automerge entry point and result from
+  `openAutomergeAttachment`/`AutomergeAttachment` to
+  `openAutomergeDatabase`/`AutomergeDatabase` so the primary API names the
+  capability consumers use rather than its internal catalog mechanism.
+- Constraint-set artifact authoring now lives at the self-describing
+  `@tarstate/core/artifacts/constraint-set` topic rather than coupling the
+  schema topic to the query model.
+- Replayable database transforms now receive one immutable schema-aware
+  snapshot. `rows(relation)` returns inferred logical rows and
+  `withRows(relation, rows)` carries every untouched relation forward, replacing
+  the flat `{ relationId, fields }[]` callback contract.
+
+### Added
+
+- Added `openDatabaseQuery`, an owned query session over the small structural
+  mount protocol implemented by official and application database sources. It owns
+  catalog, membership, database, observer, maintenance, leases, and idempotent
+  reverse-order cleanup while retaining explicit authority and membership
+  policy.
+
 ### Changed
 
 - Preserved consumer-facing module boundaries in core, React, and schema tools,
@@ -12,9 +34,19 @@ history.
   query preparation and React lifecycle shells from their functional authoring
   and hook cores. Representative single-export bundle sizes are now checked in
   `pnpm check`.
+- Enabled TypeScript 7 erasable-syntax and stricter control-flow checks; runtime
+  enums, namespaces, parameter properties, and import-assignment syntax are now
+  rejected by the compiler configuration.
 
 ### Fixed
 
+- Functional `from()` now projects schema-aware relation literals to minimal
+  portable relation uses, and constraint-set sealing accepts query nodes
+  directly without consumer-side `JsonValue` casts, derives syntactic relation
+  dependencies, and verifies explicit dependency supersets.
+- Query dependency analysis now walks query and expression syntax explicitly,
+  so kind-like application JSON no longer causes false relation or seek
+  invalidation.
 - `DatabaseView.observe` now infers the exact result-row type carried by a
   typed prepared plan while preserving the database row type as the fallback
   for ordinary prepared plans.

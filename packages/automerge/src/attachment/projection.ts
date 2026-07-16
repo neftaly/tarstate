@@ -1,8 +1,6 @@
 import type * as Automerge from '@automerge/automerge';
-import type {
-  AttachmentTransactionRow,
-  ReadyAttachmentPreparation
-} from '@tarstate/core/attachment/adapter';
+import type { ReadyAttachmentPreparation } from '@tarstate/core/attachment/adapter';
+import type { LogicalRelationRow } from '@tarstate/core/transactions';
 import type { Issue } from '@tarstate/core';
 import type { RelationInput } from '@tarstate/core/query/model';
 import {
@@ -19,7 +17,7 @@ import type {
 } from '@tarstate/core/source';
 import type { AutomergeMappedStorageBinding, AutomergeMappedStorageRow } from '../adapter/mapped-storage.js';
 import { samePortableJson } from '../shared/portable-json.js';
-import type { AutomergeAttachmentResult, AutomergeAttachmentSnapshot } from './model.js';
+import type { AutomergeDatabaseResult, AutomergeDatabaseSnapshot } from './model.js';
 
 export type AutomergeAttachmentProjection = {
   readonly mapped: ProjectionResult<AutomergeMappedStorageRow>;
@@ -59,8 +57,8 @@ export const createAutomergeAttachmentProjector = <T extends object>(input: {
 export const attachmentSnapshot = <T extends object>(
   sourceSnapshot: SourceSnapshot<Automerge.Doc<T>>,
   projector: AutomergeAttachmentProjector<T>,
-  logicalRows: WeakMap<object, readonly AttachmentTransactionRow[]>
-): AutomergeAttachmentSnapshot => {
+  logicalRows: WeakMap<object, readonly LogicalRelationRow[]>
+): AutomergeDatabaseSnapshot => {
   if (sourceSnapshot.state !== 'ready') {
     return unavailableAttachmentSnapshot(sourceSnapshot);
   }
@@ -111,8 +109,8 @@ export const databaseProjection = <T extends object>(input: {
 };
 
 export const sameAttachmentSnapshot = (
-  left: AutomergeAttachmentSnapshot,
-  right: AutomergeAttachmentSnapshot
+  left: AutomergeDatabaseSnapshot,
+  right: AutomergeDatabaseSnapshot
 ): boolean => left.state === 'open'
   && right.state === 'open'
   && left.current.rows === right.current.rows
@@ -125,7 +123,7 @@ export const sameAttachmentSnapshot = (
 
 const unavailableAttachmentSnapshot = <T>(
   snapshot: SourceSnapshot<T>
-): AutomergeAttachmentSnapshot => Object.freeze({ state: 'open', current: Object.freeze({
+): AutomergeDatabaseSnapshot => Object.freeze({ state: 'open', current: Object.freeze({
   readiness: snapshot.state === 'loading' ? 'incomplete' : 'invalid',
   rows: Object.freeze([]),
   completeness: 'unknown',
@@ -140,7 +138,7 @@ const attachmentReadiness = (
   completeness: 'exact' | 'unknown',
   blockingConstraintIssues: readonly Issue[],
   issues: readonly Issue[]
-): AutomergeAttachmentResult['readiness'] => {
+): AutomergeDatabaseResult['readiness'] => {
   if (sourceState !== 'ready' && sourceState !== 'loading') return 'invalid';
   if (blockingConstraintIssues.length > 0) return 'invalid';
   if (issues.some(({ severity }) => severity === 'error')) return 'invalid';

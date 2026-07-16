@@ -11,7 +11,7 @@ const schemaView = { id: 'schema', contentHash: hash('a') };
 
 describe('portable constraints and referential actions', () => {
   it('compiles portable violation queries with stable subject identities and indeterminate evidence', async () => {
-    const set = await sealConstraintSet({ id: 'constraints:test', body: { schemaView, constraints: [{ id: 'unique-name', code: 'constraint.unique', dependencyRelations: ['people'], violationQuery: { kind: 'unique-name' } }], requiredCapabilities: [] } });
+    const set = await sealConstraintSet({ id: 'constraints:test', body: { schemaView, constraints: [{ id: 'unique-name', code: 'constraint.unique', dependencyRelations: ['people'], violationQuery: { kind: 'values', alias: 'violation', rows: [] } }], requiredCapabilities: [] } });
     const constraints = compileSourceConstraints({ set, mode: 'required', evaluateQuery: (_query, state: { mode: string }) => state.mode === 'unknown' ? { rows: [], completeness: 'unknown', issues: [] } : { rows: [{ subject: { relationId: 'people', key: 1 }, evidence: ['row:2'] }], completeness: 'exact', issues: [] } });
     const violated = constraints[0]?.evaluate({ mode: 'bad' }, 1);
     expect(violated).toMatchObject({ status: 'violated', violations: [{ code: 'constraint.unique', subject: { relationId: 'people', key: 1 } }] });
@@ -20,6 +20,31 @@ describe('portable constraints and referential actions', () => {
     if (violated?.status !== 'violated' || repeat?.status !== 'violated') throw new Error('expected violation');
     expect(repeat.violations[0]?.id).toBe(violated.violations[0]?.id);
     expect(constraints[0]?.evaluate({ mode: 'unknown' }, 2)).toMatchObject({ status: 'indeterminate', failures: [{ code: 'constraint.query_indeterminate' }] });
+  });
+
+  it('derives syntactic relation dependencies and rejects incomplete overrides', async () => {
+    const violationQuery = {
+      kind: 'from',
+      relation: { schemaView, relationId: 'people' },
+      alias: 'person'
+    } as const;
+    await expect(sealConstraintSet({ body: {
+      schemaView,
+      constraints: [{ id: 'derived', code: 'constraint.derived', violationQuery }],
+      requiredCapabilities: []
+    } })).resolves.toMatchObject({
+      body: { constraints: [{ dependencyRelations: ['people'] }] }
+    });
+    expect(() => sealConstraintSet({ body: {
+      schemaView,
+      constraints: [{
+        id: 'incomplete',
+        code: 'constraint.incomplete',
+        dependencyRelations: ['other'],
+        violationQuery
+      }],
+      requiredCapabilities: []
+    } })).toThrow('omits query relation dependencies: people');
   });
 
   it('reports current required failures as blocking and audit failures as warnings', () => {

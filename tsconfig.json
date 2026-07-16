@@ -9,6 +9,11 @@
     "noUncheckedSideEffectImports": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "paths": {
@@ -26,6 +31,7 @@
       "@tarstate/core/database/external-store": ["./packages/core/src/database/external-store/index.ts"],
       "@tarstate/core/database/incremental": ["./packages/core/src/database/incremental/index.ts"],
       "@tarstate/core/database/observer": ["./packages/core/src/database/observer/index.ts"],
+      "@tarstate/core/database/session": ["./packages/core/src/database/session/index.ts"],
       "@tarstate/core/query": ["./packages/core/src/query/index.ts"],
       "@tarstate/core/query/authoring": ["./packages/core/src/query/authoring/index.ts"],
       "@tarstate/core/query/evaluate": ["./packages/core/src/query/evaluate/index.ts"],
@@ -44,6 +50,7 @@
     },
     "moduleDetection": "force",
     "isolatedModules": true,
+    "erasableSyntaxOnly": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,
     "types": ["node", "vitest/globals"]

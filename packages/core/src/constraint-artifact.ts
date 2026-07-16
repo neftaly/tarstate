@@ -5,6 +5,9 @@ import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { JsonValue } from './value.js';
 import type { ConstraintEvaluation, ConstraintFailure, SourceConstraint } from './constraints.js';
 import type { SourceBasis } from './source-state.js';
+import type { QueryNode } from './query/model.js';
+import { visitFullQuerySyntax } from './query/internal/syntax-walk.js';
+import { comparePortableStrings } from './portable-order.js';
 
 export type PortableConstraint = {
   readonly id: string;
@@ -21,11 +24,60 @@ export type ConstraintSetBody = {
 
 export type ConstraintSetArtifact = TypedArtifact<'constraint-set', ConstraintSetBody>;
 
-export const sealConstraintSet = (input: TypedArtifactInput<ConstraintSetBody>): Promise<ConstraintSetArtifact> => {
-  const ids = input.body.constraints.map(({ id }) => id);
-  if (new Set(ids).size !== ids.length) throw new Error('Constraint IDs must be unique within a set');
-  return sealTypedArtifact('constraint-set', input);
+export type PortableConstraintInput = Omit<PortableConstraint, 'dependencyRelations' | 'violationQuery'> & {
+  /**
+   * Defaults to every relation referenced by the query. Explicit supersets
+   * may declare dependencies hidden behind host capability calls.
+   */
+  readonly dependencyRelations?: readonly string[];
+  readonly violationQuery: QueryNode;
 };
+
+export type ConstraintSetInputBody = Omit<ConstraintSetBody, 'constraints'> & {
+  readonly constraints: readonly PortableConstraintInput[];
+};
+
+export const sealConstraintSet = (input: TypedArtifactInput<ConstraintSetInputBody>): Promise<ConstraintSetArtifact> => {
+  const ids = input.body.constraints.map(({ id }) => id);
+  if (new Set(ids).size !== ids.length) throw new TypeError('Constraint IDs must be unique within a set');
+  const constraints = input.body.constraints.map((constraint): PortableConstraint => {
+    const referencedRelations = queryDependencyRelations(constraint.violationQuery);
+    const declaredRelations = constraint.dependencyRelations === undefined
+      ? referencedRelations
+      : uniqueSortedStrings(constraint.dependencyRelations);
+    const declared = new Set(declaredRelations);
+    const missing = referencedRelations.filter((relationId) => !declared.has(relationId));
+    if (missing.length > 0) {
+      throw new TypeError(`Constraint ${JSON.stringify(constraint.id)} omits query relation dependencies: ${missing.join(', ')}`);
+    }
+    return {
+      id: constraint.id,
+      code: constraint.code,
+      dependencyRelations: declaredRelations,
+      violationQuery: constraint.violationQuery as unknown as JsonValue
+    };
+  });
+  return sealTypedArtifact('constraint-set', {
+    ...(input.id === undefined ? {} : { id: input.id }),
+    ...(input.dependencies === undefined ? {} : { dependencies: input.dependencies }),
+    body: {
+      schemaView: input.body.schemaView,
+      constraints,
+      requiredCapabilities: input.body.requiredCapabilities
+    }
+  });
+};
+
+const queryDependencyRelations = (query: QueryNode): readonly string[] => {
+  const relationIds = new Set<string>();
+  visitFullQuerySyntax(query, (node) => {
+    if (node.kind === 'from') relationIds.add(node.relation.relationId);
+  });
+  return Object.freeze([...relationIds].sort(comparePortableStrings));
+};
+
+const uniqueSortedStrings = (values: readonly string[]): readonly string[] =>
+  Object.freeze([...new Set(values)].sort(comparePortableStrings));
 
 export type ConstraintQueryOutcome = {
   readonly rows: readonly { readonly subject: JsonValue; readonly evidence?: JsonValue; readonly details?: JsonValue }[];
@@ -81,25 +133,24 @@ export const expandReferentialDeletes = (input: {
   const visited = new Set(queue.map(({ handle }) => handle));
   const edits: GeneratedReferentialEdit[] = [];
   const issues: Issue[] = [];
-  while (queue.length > 0) {
-    const parent = queue.shift() as ReferentialRow;
-    for (const action of input.actions.filter(({ parentRelationId }) => parentRelationId === parent.relationId)) {
+  const actionsByParent = groupByRelation(input.actions, ({ parentRelationId }) => parentRelationId);
+  const rowsByRelation = groupByRelation(input.rows, ({ relationId }) => relationId);
+  for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
+    const parent = queue[queueIndex] as ReferentialRow;
+    for (const action of actionsByParent.get(parent.relationId) ?? []) {
       if (action.childFields.length === 0) {
         issues.push(createIssue({ code: 'constraint.referential_action_invalid', relationId: action.childRelationId, details: { actionId: action.id, reason: 'child_fields_empty' } }));
         continue;
       }
-      const children = input.rows.filter((row) => {
-        if (row.relationId !== action.childRelationId) return false;
-        const childKey = action.childFields.length === 1
-          ? row.fields[action.childFields[0] as string] ?? null
-          : action.childFields.map((field) => row.fields[field] ?? null);
-        return canonicalizeJson(childKey) === canonicalizeJson(parent.key);
-      });
-      if (children.length > 0 && action.policy === 'restrict') {
+      const parentKey = canonicalizeJson(parent.key);
+      const candidates = rowsByRelation.get(action.childRelationId) ?? [];
+      if (action.policy === 'restrict'
+        && candidates.some((row) => referencesParent(row, action.childFields, parentKey))) {
         issues.push(createIssue({ code: 'constraint.delete_restricted', phase: 'constraint', severity: 'error', retry: 'after_input', relationId: parent.relationId, key: parent.key, details: { actionId: action.id } }));
         continue;
       }
-      for (const child of children) {
+      for (const child of candidates) {
+        if (!referencesParent(child, action.childFields, parentKey)) continue;
         if (action.policy === 'set-null') edits.push({ actionId: action.id, handle: child.handle, relationId: child.relationId, kind: 'set-null', fields: action.childFields });
         if (action.policy === 'cascade' && !visited.has(child.handle)) {
           visited.add(child.handle);
@@ -111,6 +162,31 @@ export const expandReferentialDeletes = (input: {
     }
   }
   return { edits: issues.length === 0 ? edits : [], issues };
+};
+
+const groupByRelation = <Value>(
+  values: readonly Value[],
+  relationId: (value: Value) => string
+): ReadonlyMap<string, readonly Value[]> => {
+  const grouped = new Map<string, Value[]>();
+  for (const value of values) {
+    const key = relationId(value);
+    const group = grouped.get(key);
+    if (group === undefined) grouped.set(key, [value]);
+    else group.push(value);
+  }
+  return grouped;
+};
+
+const referencesParent = (
+  row: ReferentialRow,
+  childFields: readonly string[],
+  parentKey: string
+): boolean => {
+  const childKey = childFields.length === 1
+    ? row.fields[childFields[0] as string] ?? null
+    : childFields.map((field) => row.fields[field] ?? null);
+  return canonicalizeJson(childKey) === parentKey;
 };
 
 const stableFailureId = (setId: string, constraintId: string, subject: JsonValue, code: string): string => [setId, constraintId, code, canonicalizeJson(subject)].join(':');

@@ -6,7 +6,12 @@ import {
   from,
   literal,
   pipe,
+  relationLiteral,
+  safeParseConstraintSetArtifact,
+  safeParseQueryArtifact,
+  sealConstraintSet,
   sealQuery,
+  sealSchema,
   safeParseQueryParameters,
   select,
   where,
@@ -52,6 +57,46 @@ describe('functional query authoring', () => {
     const query = await sealQuery({ body: { schemaViews: [schemaView], parameters: {}, root, requiredCapabilities: [] } });
     expect(query).toMatchObject({ kind: 'query', formatVersion: 1, body: { root } });
     expect(query.contentHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it('projects literal relations to portable uses at the functional authoring boundary', async () => {
+    const schema = await sealSchema({ body: {
+      relations: {
+        items: {
+          relationId: 'items',
+          key: ['id'],
+          fields: { id: { type: { kind: 'integer' } } }
+        }
+      }
+    } });
+    const relation = relationLiteral(schema, 'items');
+    const root = from(relation, 'item');
+
+    expect(root).toEqual({
+      kind: 'from',
+      relation: { schemaView: relation.schemaView, relationId: 'items' },
+      alias: 'item'
+    });
+
+    const query = await sealQuery({ body: {
+      schemaViews: [relation.schemaView],
+      parameters: {},
+      root,
+      requiredCapabilities: []
+    } });
+    const constraints = await sealConstraintSet({ body: {
+      schemaView: relation.schemaView,
+      constraints: [{
+        id: 'item',
+        code: 'test.item',
+        violationQuery: root
+      }],
+      requiredCapabilities: []
+    } });
+
+    await expect(safeParseQueryArtifact(query)).resolves.toMatchObject({ success: true });
+    await expect(safeParseConstraintSetArtifact(constraints)).resolves.toMatchObject({ success: true });
+    expect(constraints.body.constraints[0]?.dependencyRelations).toEqual(['items']);
   });
 
   it('parses declared parameters without accepting missing, extra, or malformed values', () => {

@@ -138,8 +138,11 @@ type AutomergeRuntimeLedgerOptions = {
 };
 
 class StaleOwnerBasis<T extends object> extends Error {
-  constructor(readonly storage: Automerge.Doc<T>) {
+  readonly storage: Automerge.Doc<T>;
+
+  constructor(storage: Automerge.Doc<T>) {
     super('Automerge document owner basis changed');
+    this.storage = storage;
   }
 }
 

@@ -89,7 +89,7 @@ const transactionBody = (): TransactionBody => ({
 const constraintBody = (): ConstraintSetBody => ({
   schemaView: schemaRef,
   constraints: [
-    { id: 'person-score', code: 'test.person_score', dependencyRelations: ['test.person'], violationQuery: { kind: 'where', input: { kind: 'from', relation: relationUse, alias: 'person' }, predicate: { kind: 'compare', op: 'lt', left: field('person', 'score'), right: literal(0) } } as unknown as JsonValue }
+    { id: 'person-score', code: 'test.person_score', dependencyRelations: ['test.person'], violationQuery: { kind: 'where', input: { kind: 'from', relation: relationUse, alias: 'person' }, predicate: { kind: 'compare', op: 'lt', left: field('person', 'score'), right: literal(0) } } }
   ],
   requiredCapabilities: []
 });

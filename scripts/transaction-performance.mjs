@@ -2,8 +2,8 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { builtInCapabilityRefs } from '../packages/core/dist/capabilities/index.js';
-import { sealSchema, sealStorageMapping } from '../packages/core/dist/schema/index.js';
-import { openAutomergeAttachment } from '../packages/automerge/dist/index.js';
+import { relationLiteral, sealSchema, sealStorageMapping } from '../packages/core/dist/schema/index.js';
+import { openAutomergeDatabase } from '../packages/automerge/dist/index.js';
 
 const requireFromAutomerge = createRequire(new URL('../packages/automerge/package.json', import.meta.url));
 const { Repo } = await import(pathToFileURL(requireFromAutomerge.resolve('@automerge/automerge-repo')).href);
@@ -32,6 +32,7 @@ const mapping = await sealStorageMapping({ id: 'urn:tarstate:transaction-benchma
     }
   } }
 } });
+const tasks = relationLiteral(schema, 'tasks');
 const measure = async (changed) => {
   const samples = [];
   const correctnessFailures = [];
@@ -65,8 +66,8 @@ const contracts = {
   oneRow100RowsCeiling: oneRow.milliseconds <= 30
 };
 const report = {
-  benchmark: 'tarstate-public-automerge-attachment-transactions',
-  note: 'End-to-end public attachment calls include intent hashing, projection, exact-delta authoring, staging, validation, ledger completion, and Repo publication.',
+  benchmark: 'tarstate-public-automerge-database-transactions',
+  note: 'End-to-end public database calls include intent hashing, projection, exact-delta authoring, staging, validation, ledger completion, and Repo publication.',
   contracts,
   measurements: {
     inputRows: rowCount,
@@ -97,7 +98,7 @@ async function openBenchmarkRuntime() {
       { id: 'task-' + index, title: 'Title ' + index }
     ]))
   });
-  const opened = await openAutomergeAttachment({
+  const opened = await openAutomergeDatabase({
     handle,
     declaration: {
       formatVersion: 1,
@@ -111,19 +112,22 @@ async function openBenchmarkRuntime() {
     await repo.shutdown();
     throw new Error('Transaction benchmark attachment failed: ' + opened.issues.map(({ code }) => code).join(', '));
   }
-  const attachment = opened.value;
+  const database = opened.value;
   let sequence = 0;
   return {
     transact: async (changed) => {
       const current = sequence;
       sequence += 1;
-      const receipt = await attachment.transact(
+      const receipt = await database.transact(
         { kind: changed ? 'replace-title' : 'no-op', sequence: current },
-        ({ rows }) => changed
-          ? rows.map((row) => row.fields.id === 'task-0'
-            ? { ...row, fields: { ...row.fields, title: 'Changed ' + current } }
-            : row)
-          : rows
+        (snapshot) => changed
+          ? snapshot.withRows(
+              tasks,
+              snapshot.rows(tasks).map((row) => row.id === 'task-0'
+                ? { ...row, title: 'Changed ' + current }
+                : row)
+            )
+          : snapshot
       );
       if (receipt.outcome !== 'committed') {
         throw new Error('Transaction benchmark rejected: ' + receipt.issues.map(({ code }) => code).join(', '));
@@ -132,7 +136,7 @@ async function openBenchmarkRuntime() {
     sequence: () => sequence,
     title: () => handle.doc()?.tasks['task-0']?.title,
     close: async () => {
-      attachment.close();
+      database.close();
       await repo.shutdown();
     }
   };

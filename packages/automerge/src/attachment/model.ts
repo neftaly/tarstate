@@ -1,14 +1,14 @@
 import type {
-  AttachmentTransactionRow,
-  AttachmentTransactionService
-} from '@tarstate/core/attachment/adapter';
-import type { AttachmentCatalog } from '@tarstate/core/database';
+  DatabaseTransactionService,
+  LogicalRelationRow
+} from '@tarstate/core/transactions';
+import type { MountableDatabaseSource } from '@tarstate/core/database/session';
 import type { Issue } from '@tarstate/core';
 import type { SourceBasis, SourceFreshness, SourceLifecycleState } from '@tarstate/core/source';
 
-export type AutomergeAttachmentResult = {
+export type AutomergeDatabaseResult = {
   readonly readiness: 'ready' | 'incomplete' | 'invalid';
-  readonly rows: readonly AttachmentTransactionRow[];
+  readonly rows: readonly LogicalRelationRow[];
   readonly completeness: 'exact' | 'unknown';
   readonly freshness: SourceFreshness;
   readonly basis: SourceBasis;
@@ -16,27 +16,12 @@ export type AutomergeAttachmentResult = {
   readonly issues: readonly Issue[];
 };
 
-export type AutomergeAttachmentSnapshot =
-  | { readonly state: 'open'; readonly current: AutomergeAttachmentResult }
+export type AutomergeDatabaseSnapshot =
+  | { readonly state: 'open'; readonly current: AutomergeDatabaseResult }
   | { readonly state: 'closed' };
 
-export type AutomergeAttachmentMountOptions = {
-  readonly discoveryEdges?: readonly string[];
-};
-
-export type AutomergeAttachmentMountLease = {
-  readonly attachmentId: string;
-  readonly sourceId: string;
-  readonly discoveryEdges: readonly string[];
-  readonly close: () => void;
-};
-
-export type AutomergeAttachment = AttachmentTransactionService & {
-  readonly getSnapshot: () => AutomergeAttachmentSnapshot;
+export type AutomergeDatabase = DatabaseTransactionService & MountableDatabaseSource & {
+  readonly getSnapshot: () => AutomergeDatabaseSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
-  readonly mount: (
-    catalog: AttachmentCatalog,
-    options?: AutomergeAttachmentMountOptions
-  ) => AutomergeAttachmentMountLease;
   readonly close: () => void;
 };

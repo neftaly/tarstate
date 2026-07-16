@@ -2,6 +2,7 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import type { TaggedValue } from '../src/value.js';
 import type { CreateDatabaseQueryMaintenance, QueryMaintenanceDiagnostics, QueryMaintenanceReuseDiagnostics } from '../src/index.js';
 import type { DatabaseView, QueryObserver } from '../src/observer.js';
+import type { OpenDatabaseQueryOptions } from '../src/database/query-session.js';
 import type { QueryNode, QueryRecord, RelationInput } from '../src/query/model.js';
 import type { PreparedPlan } from '../src/query/plan-contract.js';
 import { pipe } from '../src/query/builder.js';
@@ -125,6 +126,19 @@ describe('literal-schema and query type authoring', () => {
     expect(prepared.query).not.toBe(projected.root);
     expect(prepared.query).toEqual(projected.root);
     expectTypeOf<PreparedPlanParameters<typeof prepared>>().toEqualTypeOf<{ readonly minimumScore: number }>();
+    const sessionOptions: OpenDatabaseQueryOptions<typeof prepared> = {
+      sources: [],
+      plan: prepared,
+      queryAuthorityScope: 'scope:test',
+      parameters: { minimumScore: 1 }
+    };
+    // @ts-expect-error typed plans with declared parameters require exact bound values
+    const missingSessionParameters: OpenDatabaseQueryOptions<typeof prepared> = {
+      sources: [],
+      plan: prepared,
+      queryAuthorityScope: 'scope:test'
+    };
+    void [sessionOptions, missingSessionParameters];
     expectTypeOf(prepared).toMatchTypeOf<import('../src/type-authoring.js').TypedPreparedPlan<
       import('../src/query.js').QueryNode,
       { readonly author: string; readonly manager: string },

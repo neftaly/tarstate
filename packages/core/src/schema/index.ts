@@ -1,6 +1,5 @@
-/** Schema authoring, codecs, constraints, storage mappings, and schema lenses. */
+/** Schema authoring, codecs, source constraints, storage mappings, and schema lenses. */
 export * from '../codec.js';
-export * from '../constraint-artifact.js';
 export * from '../constraints.js';
 export * from '../lens.js';
 export * from '../mapping.js';

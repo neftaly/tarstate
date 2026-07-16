@@ -1,4 +1,5 @@
 /** Constraint-set artifact parsing and compilation. */
+export * from '../../constraint-artifact.js';
 export {
   defaultSemanticArtifactParseBudget,
   type SemanticArtifactParseBudget

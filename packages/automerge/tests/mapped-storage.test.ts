@@ -7,6 +7,7 @@ import {
 import {
   compileStorageMapping,
   prepareSchema,
+  relationLiteral,
   sealSchema,
   sealStorageMapping,
   type StorageMappingBody
@@ -17,9 +18,9 @@ import {
 } from '@tarstate/core/transactions';
 import {
   createAttachmentTransactionService,
-  prepareDatabaseAttachment,
-  type AttachmentTransactionSnapshot
+  prepareDatabaseAttachment
 } from '@tarstate/core/attachment/adapter';
+import type { DatabaseTransactionSnapshot } from '@tarstate/core/transactions';
 import type { JsonValue } from '@tarstate/core';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -210,6 +211,7 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       registry
     });
     if (preparation.state !== 'ready') throw new Error('Expected a ready mapped attachment');
+    const tasks = relationLiteral(schemaArtifact, 'tasks');
     const transactions = await createAttachmentTransactionService({
       attachmentId: 'attachment:mapped',
       attachmentIncarnation: 'attachment-incarnation:mapped',
@@ -228,10 +230,10 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       }));
       return commitDirect(input);
     });
-    const transform = vi.fn(({ rows }: AttachmentTransactionSnapshot) => rows.map((row) => ({
-      ...row,
-      fields: { ...row.fields, title: 'Final' }
-    })));
+    const transform = vi.fn((snapshot: DatabaseTransactionSnapshot) => snapshot.withRows(
+      tasks,
+      snapshot.rows(tasks).map((row) => ({ ...row, title: 'Final' }))
+    ));
     const receipt = await transactions.transact(
       { kind: 'set-final-title' },
       transform

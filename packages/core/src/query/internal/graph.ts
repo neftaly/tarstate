@@ -1,7 +1,10 @@
 import { canonicalizeJsonValue as canonicalizeJson } from '../../internal-canonical-json.js';
 import { relationKey } from './relations.js';
-import type { AggregateExpr, Expr, OrderTerm, QueryNode, RelationUse, WindowExpr } from '../model.js';
+import type { AggregateExpr, Expr, OrderTerm, QueryNode, WindowExpr } from '../model.js';
 import type { JsonValue } from '../../value.js';
+import { directQueryChildren, visitLocalQuerySyntax } from './syntax-walk.js';
+
+export { directQueryChildren } from './syntax-walk.js';
 
 export type InternedPooledNode = { readonly id: number; readonly key: string; readonly node: QueryNode };
 
@@ -98,50 +101,24 @@ export const compileQueryGraph = (root: QueryNode): CompiledQueryGraph => {
   };
   visit(root);
   const children = new Map(nodes.map((node) => [node, directQueryChildren(node)]));
+  const externalDependencies = new Map<QueryNode, ReadonlySet<string>>();
+  const sessionEvidenceDependencies = new Map<QueryNode, boolean>();
+  for (const node of nodes) {
+    const dependencies = new Set<string>();
+    let containsSeek = false;
+    visitLocalQuerySyntax(node, (candidate) => {
+      if (candidate.kind === 'from') dependencies.add(relationKey(candidate.relation));
+      else if (candidate.kind === 'seek') containsSeek = true;
+    });
+    externalDependencies.set(node, dependencies);
+    sessionEvidenceDependencies.set(node, containsSeek);
+  }
   return {
     nodes: Object.freeze(nodes),
     children,
-    externalDependencies: new Map(nodes.map((node) => [node, relationDependencies(node, children.get(node))])),
-    sessionEvidenceDependencies: new Map(nodes.map((node) => [node, containsSeek(node, children.get(node))]))
+    externalDependencies,
+    sessionEvidenceDependencies
   };
-};
-
-export const directQueryChildren = (node: QueryNode): readonly QueryNode[] => {
-  if (node.kind === 'join' || node.kind === 'set') return [node.left, node.right];
-  if (node.kind === 'where' || node.kind === 'select' || node.kind === 'with-fields' || node.kind === 'rename' || node.kind === 'omit' || node.kind === 'unnest' || node.kind === 'aggregate' || node.kind === 'distinct' || node.kind === 'order' || node.kind === 'slice' || node.kind === 'window' || node.kind === 'seek') return [node.input];
-  // Recursion owns a cyclic local fixpoint and is one incremental operator.
-  return [];
-};
-
-const relationDependencies = (node: QueryNode, excludedChildren: readonly QueryNode[] = []): ReadonlySet<string> => {
-  const dependencies = new Set<string>();
-  const excluded = new Set<unknown>(excludedChildren);
-  const visit = (value: unknown): void => {
-    if (Array.isArray(value)) { for (const item of value) visit(item); return; }
-    if (value === null || typeof value !== 'object' || excluded.has(value)) return;
-    const candidate = value as Readonly<Record<string, unknown>>;
-    if (candidate.kind === 'from' && isRelationUse(candidate.relation)) dependencies.add(relationKey(candidate.relation));
-    for (const child of Object.values(candidate)) visit(child);
-  };
-  visit(node);
-  return dependencies;
-};
-
-const containsSeek = (node: QueryNode, excludedChildren: readonly QueryNode[] = []): boolean => {
-  const excluded = new Set<unknown>(excludedChildren);
-  const visit = (value: unknown): boolean => {
-    if (Array.isArray(value)) return value.some(visit);
-    if (value === null || typeof value !== 'object' || excluded.has(value)) return false;
-    const candidate = value as Readonly<Record<string, unknown>>;
-    return candidate.kind === 'seek' || Object.values(candidate).some(visit);
-  };
-  return visit(node);
-};
-
-const isRelationUse = (value: unknown): value is RelationUse => {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const candidate = value as { readonly schemaView?: unknown; readonly relationId?: unknown };
-  return typeof candidate.relationId === 'string' && candidate.schemaView !== null && typeof candidate.schemaView === 'object';
 };
 
 export const containsNamedCall = (expression: Expr): boolean => expressionContains(expression, 'call');

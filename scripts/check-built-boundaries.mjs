@@ -30,7 +30,9 @@ try {
   assertClosure('schema/index.js', 100_000, ['query-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental']);
   assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
-  assertClosure('database/incremental/index.js', 225_000, ['memory-source', 'system-relations', 'transaction-executor']);
+  assertClosure('database/session/index.js', 310_000, ['system-relations', 'transaction-executor']);
+  // Explicit syntax walking keeps application JSON opaque at a small code-size cost.
+  assertClosure('database/incremental/index.js', 226_000, ['memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/external-store/index.js', 60_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('values/index.js', 15_000, [
     'artifact-resource-driver',

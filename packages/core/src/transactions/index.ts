@@ -16,6 +16,7 @@ export type {
 } from '../logical-edit.js';
 export * from '../receipts.js';
 export * from '../transaction.js';
+export type * from '../database/transaction.js';
 export {
   relationAccess,
   typedFieldEdit,

@@ -43,7 +43,11 @@ export function pipe(value: unknown, ...operators: readonly ((value: never) => u
 }
 
 /** Common functional builders; `Expr` and `QueryNode` remain the exhaustive advanced-authoring API. */
-export const from = (relation: { readonly schemaView: ArtifactRef; readonly relationId: string }, alias: string): QueryNode => ({ kind: 'from', relation, alias });
+export const from = (relation: { readonly schemaView: ArtifactRef; readonly relationId: string }, alias: string): QueryNode => ({
+  kind: 'from',
+  relation: { schemaView: relation.schemaView, relationId: relation.relationId },
+  alias
+});
 export const constantValues = (alias: string, rows: readonly Readonly<Record<string, JsonValue>>[]): QueryNode => ({ kind: 'values', alias, rows });
 export const where = (predicate: Expr) => (input: QueryNode): QueryNode => ({ kind: 'where', input, predicate });
 export const select = (alias: string, fields: Readonly<Record<string, Expr>>) => (input: QueryNode): QueryNode => ({ kind: 'select', input, alias, fields });

@@ -18,6 +18,7 @@ export const corePublicEntryNames = [
   'database/external-store',
   'database/incremental',
   'database/observer',
+  'database/session',
   'query',
   'query/authoring',
   'query/evaluate',
