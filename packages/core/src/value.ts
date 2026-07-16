@@ -44,32 +44,36 @@ const isInspectionFailure = (value: JsonValue | InspectionFailure): value is Ins
 
 export const safeParseJsonValue = (input: unknown, budget: ValueParseBudget = defaultValueParseBudget): ParseResult<JsonValue> => {
   const seen = new Set<object>();
+  const path: unknown[] = [];
   let totalMembers = 0;
-  const inspect = (value: unknown, depth: number, path: readonly unknown[]): JsonValue | InspectionFailure => {
-    if (depth > budget.maxDepth) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path, details: { budget: 'maxDepth', limit: budget.maxDepth } }));
+  const issuePath = (segment?: unknown): readonly unknown[] => segment === undefined ? [...path] : [...path, segment];
+  const inspect = (value: unknown, depth: number): JsonValue | InspectionFailure => {
+    if (depth > budget.maxDepth) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxDepth', limit: budget.maxDepth } }));
     if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
     if (typeof value === 'number') {
-      if (!Number.isFinite(value)) return failedInspection(createIssue({ code: 'artifact.unsupported_value', retry: 'after_input', path, details: { type: 'non_finite_number' } }));
+      if (!Number.isFinite(value)) return failedInspection(createIssue({ code: 'artifact.unsupported_value', retry: 'after_input', path: issuePath(), details: { type: 'non_finite_number' } }));
       return Object.is(value, -0) ? 0 : value;
     }
-    if (typeof value !== 'object') return failedInspection(createIssue({ code: 'artifact.unsupported_value', retry: 'after_input', path, details: { type: typeof value } }));
+    if (typeof value !== 'object') return failedInspection(createIssue({ code: 'artifact.unsupported_value', retry: 'after_input', path: issuePath(), details: { type: typeof value } }));
     try {
-      if (seen.has(value)) return failedInspection(createIssue({ code: 'artifact.cycle', retry: 'after_input', path }));
-      if (Object.getPrototypeOf(value) !== Object.prototype && !Array.isArray(value)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path, details: { reason: 'prototype' } }));
+      if (seen.has(value)) return failedInspection(createIssue({ code: 'artifact.cycle', retry: 'after_input', path: issuePath() }));
+      if (Object.getPrototypeOf(value) !== Object.prototype && !Array.isArray(value)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(), details: { reason: 'prototype' } }));
       seen.add(value);
       if (Array.isArray(value)) {
-        if (value.length > budget.maxArrayMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path, details: { budget: 'maxArrayMembers', limit: budget.maxArrayMembers } }));
+        if (value.length > budget.maxArrayMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxArrayMembers', limit: budget.maxArrayMembers } }));
         const descriptors = Object.getOwnPropertyDescriptors(value);
         for (let index = 0; index < value.length; index += 1) {
           const descriptor = descriptors[String(index)];
-          if (descriptor === undefined) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: [...path, index], details: { reason: 'sparse_array' } }));
-          if (!descriptor.enumerable || !('value' in descriptor)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: [...path, index], details: { reason: 'array_descriptor' } }));
+          if (descriptor === undefined) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(index), details: { reason: 'sparse_array' } }));
+          if (!descriptor.enumerable || !('value' in descriptor)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(index), details: { reason: 'array_descriptor' } }));
         }
         totalMembers += value.length;
-        if (totalMembers > budget.maxTotalMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path, details: { budget: 'maxTotalMembers', limit: budget.maxTotalMembers } }));
+        if (totalMembers > budget.maxTotalMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxTotalMembers', limit: budget.maxTotalMembers } }));
         const output: JsonValue[] = [];
         for (let index = 0; index < value.length; index += 1) {
-          const parsed = inspect((descriptors[String(index)] as PropertyDescriptor & { readonly value: unknown }).value, depth + 1, [...path, index]);
+          path.push(index);
+          const parsed = inspect((descriptors[String(index)] as PropertyDescriptor & { readonly value: unknown }).value, depth + 1);
+          path.pop();
           if (isInspectionFailure(parsed)) return parsed;
           output.push(parsed);
         }
@@ -77,28 +81,30 @@ export const safeParseJsonValue = (input: unknown, budget: ValueParseBudget = de
       }
       const descriptors = Object.getOwnPropertyDescriptors(value);
       const keys = Reflect.ownKeys(value);
-      if (keys.some((key) => typeof key !== 'string')) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path, details: { reason: 'symbol_key' } }));
-      if (keys.length > budget.maxObjectMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path, details: { budget: 'maxObjectMembers', limit: budget.maxObjectMembers } }));
+      if (keys.some((key) => typeof key !== 'string')) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(), details: { reason: 'symbol_key' } }));
+      if (keys.length > budget.maxObjectMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxObjectMembers', limit: budget.maxObjectMembers } }));
       totalMembers += keys.length;
-      if (totalMembers > budget.maxTotalMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path, details: { budget: 'maxTotalMembers', limit: budget.maxTotalMembers } }));
+      if (totalMembers > budget.maxTotalMembers) return failedInspection(createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', path: issuePath(), details: { budget: 'maxTotalMembers', limit: budget.maxTotalMembers } }));
       const output: Record<string, JsonValue> = {};
       for (const property of keys as string[]) {
-        if (forbiddenKeys.has(property)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: [...path, property], details: { reason: 'prototype_pollution_key' } }));
+        if (forbiddenKeys.has(property)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(property), details: { reason: 'prototype_pollution_key' } }));
         const descriptor = descriptors[property];
-        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: [...path, property], details: { reason: 'object_descriptor' } }));
-        const parsed = inspect(descriptor.value, depth + 1, [...path, property]);
+        if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(property), details: { reason: 'object_descriptor' } }));
+        path.push(property);
+        const parsed = inspect(descriptor.value, depth + 1);
+        path.pop();
         if (isInspectionFailure(parsed)) return parsed;
         output[property] = parsed;
       }
       return output;
     } catch (error) {
-      return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path, details: { reason: 'inspection_threw', error: error instanceof Error ? error.name : typeof error } }));
+      return failedInspection(createIssue({ code: 'artifact.hostile_shape', retry: 'after_input', path: issuePath(), details: { reason: 'inspection_threw', error: error instanceof Error ? error.name : typeof error } }));
     } finally {
       seen.delete(value);
     }
   };
 
-  const value = inspect(input, 0, []);
+  const value = inspect(input, 0);
   return isInspectionFailure(value) ? { success: false, issues: [value[inspectionFailure]] } : { success: true, value, issues: [] };
 };
 

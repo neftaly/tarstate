@@ -36,10 +36,9 @@ export const sealOwnedQueryLogicalContainer = <Value extends object>(value: Valu
   return value;
 };
 
-/** Owns a scope only when the scope itself can be the public logical value. */
+/** Freezes a trusted scope assembled from already-owned records. */
 export const sealOwnedQueryScope = <Value extends Readonly<Record<string, QueryRecord>>>(value: Value): Value => {
-  Object.freeze(value);
-  return Object.keys(value).length === 1 ? value : sealOwnedQueryLogicalContainer(value);
+  return Object.freeze(value);
 };
 
 /** Marks an internally detached, deeply frozen update for reuse across runtime shells. */

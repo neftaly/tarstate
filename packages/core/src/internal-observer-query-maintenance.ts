@@ -53,12 +53,12 @@ type PooledDatabaseMaintenanceCohort = {
   readonly key: string;
   readonly runtime: PooledIncrementalQueryRuntime;
   accepted: QueryMaintenanceSnapshot;
-  lastRejected?: QueryMaintenanceSnapshot;
-  transitionFailure?: {
+  lastRejected: QueryMaintenanceSnapshot | undefined;
+  transitionFailure: {
     readonly snapshot: QueryMaintenanceSnapshot;
     readonly result: MaintainedDatabaseQueryResult<QueryRecord>;
     readonly attachable: boolean;
-  };
+  } | undefined;
   roots: number;
 };
 
@@ -102,7 +102,7 @@ export const createIncrementalDatabaseQueryMaintenance = (
         },
         initialSnapshot: initial
       });
-      cohort = { key, runtime, accepted: initial, roots: 0 };
+      cohort = { key, runtime, accepted: initial, lastRejected: undefined, transitionFailure: undefined, roots: 0 };
       cohorts.set(key, cohort);
       try {
         const root = runtime.attach(plan);
@@ -165,8 +165,8 @@ const openPooledDatabaseMaintenance = (options: {
     options.cohort.runtime.close();
     if (options.cohorts.get(options.cohort.key) === options.cohort) options.cohorts.delete(options.cohort.key);
     options.cohort.accepted = closedQueryMaintenanceSnapshot;
-    delete options.cohort.lastRejected;
-    delete options.cohort.transitionFailure;
+    options.cohort.lastRejected = undefined;
+    options.cohort.transitionFailure = undefined;
   };
 
   return {
@@ -182,7 +182,7 @@ const openPooledDatabaseMaintenance = (options: {
       // A new capture frame is a fresh transition attempt. In particular, a
       // source may return directly to the already accepted frame without
       // invoking the physical runtime again.
-      delete options.cohort.transitionFailure;
+      options.cohort.transitionFailure = undefined;
       const returnsToAccepted = sameQueryMaintenanceSnapshot(normalizedNext, options.cohort.accepted);
       if (returnsToAccepted && options.cohort.lastRejected === undefined) {
         localAccepted = normalizedNext;
@@ -213,11 +213,11 @@ const openPooledDatabaseMaintenance = (options: {
         options.cohort.transitionFailure = { snapshot: normalizedNext, result, attachable: true };
         return result;
       }
-      delete options.cohort.transitionFailure;
+      options.cohort.transitionFailure = undefined;
       if (options.cohort.runtime.getDiagnostics().rejectedUpdateCount === rejectedBefore) {
         delta.accept();
         options.cohort.accepted = normalizedNext;
-        delete options.cohort.lastRejected;
+        options.cohort.lastRejected = undefined;
         localAccepted = normalizedNext;
       } else {
         options.cohort.lastRejected = normalizedNext;

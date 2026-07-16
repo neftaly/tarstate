@@ -1,4 +1,5 @@
 import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';
+import { memoizeFrozenAnalysis } from './internal-frozen-analysis.js';
 import type { Issue } from './issues.js';
 import type { EvaluationRun, QueryContext, ScopedRow } from './internal-query-evaluation-context.js';
 import {
@@ -143,13 +144,20 @@ export const materializeQueryNode = (
   return { ...materialized, local: indexLocalSegments(node, child.result.rows, materialized.result.rows) };
 };
 
-const windowCanBePartitionMaintained = (node: Extract<QueryNode, { readonly kind: 'window' }>): boolean => {
+type WindowNode = Extract<QueryNode, { readonly kind: 'window' }>;
+type WindowMaintenancePlan = {
+  readonly canPartitionMaintain: boolean;
+  readonly outputFields: ReadonlySet<string>;
+  readonly specifications: ReadonlyMap<string, WindowExpr>;
+};
+const windowMaintenancePlan = memoizeFrozenAnalysis((node: WindowNode): WindowMaintenancePlan => {
   const windows = Object.values(node.fields);
   const first = windows[0];
-  if (first === undefined) return false;
-  const partitionKey = canonicalizeJson((first.partitionBy ?? []) as unknown as JsonValue);
   const outputFields = new Set(Object.keys(node.fields));
-  return windows.every((window) =>
+  const specifications = new Map<string, WindowExpr>();
+  for (const window of windows) specifications.set(windowSpecificationKey(window), window);
+  const partitionKey = first === undefined ? undefined : canonicalizeJson((first.partitionBy ?? []) as unknown as JsonValue);
+  const canPartitionMaintain = partitionKey !== undefined && windows.every((window) =>
     canonicalizeJson((window.partitionBy ?? []) as unknown as JsonValue) === partitionKey
     && !windowSpecificationReferencesFields(window, node.alias, outputFields)
     && !(window.partitionBy ?? []).some((expression) => containsSubquery(expression) || containsNamedCall(expression))
@@ -158,7 +166,9 @@ const windowCanBePartitionMaintained = (node: Extract<QueryNode, { readonly kind
       || !expressionReferencesWindowFields(window.value, node.alias, outputFields)
         && !containsSubquery(window.value)
         && !containsNamedCall(window.value)));
-};
+  return { canPartitionMaintain, outputFields, specifications };
+});
+const windowCanBePartitionMaintained = (node: WindowNode): boolean => windowMaintenancePlan(node).canPartitionMaintain;
 
 const windowPartitionKey = (node: Extract<QueryNode, { readonly kind: 'window' }>, row: ScopedRow, context: QueryContext): string => {
   const first = Object.values(node.fields)[0] as WindowExpr;
@@ -293,10 +303,8 @@ const microMaterializeStableWindow = (
   const state = previous.window;
   if (state?.layouts === undefined || state.inputs.length !== inputs.length || previous.result.rows.length !== inputs.length) return undefined;
   if (!state.inputs.every((row, index) => resultKey(row) === resultKey(inputs[index] as ScopedRow))) return undefined;
-  const outputFields = new Set(Object.keys(node.fields));
+  const { outputFields, specifications } = windowMaintenancePlan(node);
   if (Object.values(node.fields).some((window) => window.op === 'lag' && window.value !== undefined && expressionReferencesWindowFields(window.value, node.alias, outputFields))) return undefined;
-  const specifications = new Map<string, WindowExpr>();
-  for (const window of Object.values(node.fields)) specifications.set(windowSpecificationKey(window), window);
 
   for (const position of changedPositions) {
     const row = inputs[position];
@@ -352,26 +360,23 @@ const microMaterializeStableWindow = (
   }
   if (context.state.unavailable || context.state.issues.length > 0) return undefined;
 
-  const partitionKeyByResultKey = new Map<string, string>();
-  const partitions = new Map<string, { members: ScopedRow[]; outputs: ScopedRow[] }>();
   const firstLayout = state.layouts.values().next().value as WindowMaintenanceLayout | undefined;
   if (firstLayout === undefined) return undefined;
-  for (const [position, row] of inputs.entries()) {
-    const key = firstLayout.positions.get(resultKey(row))?.partitionKey;
+  const affectedPartitionKeys = new Set<string>();
+  for (const position of affected) {
+    const row = inputs[position];
+    const key = row === undefined ? undefined : firstLayout.positions.get(resultKey(row))?.partitionKey;
     if (key === undefined) return undefined;
-    partitionKeyByResultKey.set(resultKey(row), key);
-    const partition = partitions.get(key) ?? { members: [], outputs: [] };
-    partition.members.push(row);
-    partition.outputs.push(output[position] as ScopedRow);
-    partitions.set(key, partition);
+    affectedPartitionKeys.add(key);
   }
+  const partitions = updateWindowPartitionStates(state.partitions, affectedPartitionKeys, firstLayout, inputs, output);
   const stableChangedPositions = [...affected].sort((left, right) => left - right);
   return withMaintenanceEvent({
     result: { rows: output, completeness: 'exact' },
     issues: [],
     unavailable: false,
     stableChangedPositions,
-    window: { inputs, partitionKeyByResultKey, partitions, layouts: state.layouts }
+    window: { inputs, partitionKeyByResultKey: state.partitionKeyByResultKey, partitions, layouts: state.layouts }
   }, { operator: 'window', strategy: 'selective', affectedUnitCount: stableChangedPositions.length });
 };
 
@@ -399,8 +404,7 @@ export const incrementallyMaterializeWindow = (
   }
   const stableIdentityLayout = previous.window.inputs.length === child.result.rows.length
     && previous.window.inputs.every((row, index) => resultKey(row) === resultKey(child.result.rows[index] as ScopedRow));
-  const specifications = new Map<string, WindowExpr>();
-  for (const window of Object.values(node.fields)) specifications.set(windowSpecificationKey(window), window);
+  const { specifications } = windowMaintenancePlan(node);
 
   if (stableIdentityLayout && child.stableChangedPositions !== undefined && previous.window.layouts !== undefined) {
     const layoutContext = materializationContext(snapshot, materializedNodes, node, [], run, false);
@@ -993,10 +997,15 @@ export const incrementallyMaterializeFrom = (
   let outputIndex = 0;
   for (const input of inputs) input.rows.forEach((fields, index) => {
     const occurrence = relationOccurrence(input, index);
-    const key = singleAliasResultKey(node.alias, occurrence);
     const aligned = previous.result.rows[outputIndex];
-    if (aligned !== undefined && resultKey(aligned) !== key && previousByIdentity === undefined) previousByIdentity = new Map(previous.result.rows.map((row) => [resultKey(row), row]));
-    const retained = changed.has(occurrence) ? undefined : aligned !== undefined && resultKey(aligned) === key ? aligned : previousByIdentity?.get(key);
+    let retained: ScopedRow | undefined;
+    if (!changed.has(occurrence)) {
+      if (aligned?.provenance[node.alias]?.occurrence === occurrence) retained = aligned;
+      else {
+        previousByIdentity ??= new Map(previous.result.rows.map((row) => [resultKey(row), row]));
+        retained = previousByIdentity.get(singleAliasResultKey(node.alias, occurrence));
+      }
+    }
     rows.push(retained ?? scopedRow(
       { [node.alias]: fields },
       { [node.alias]: { ...(input.sourceId === undefined ? {} : { sourceId: input.sourceId }), ...(input.attachmentId === undefined ? {} : { attachmentId: input.attachmentId }), relationId: node.relation.relationId, ...(Object.hasOwn(fields, 'id') ? { key: fields.id as JsonValue } : {}), occurrence } }

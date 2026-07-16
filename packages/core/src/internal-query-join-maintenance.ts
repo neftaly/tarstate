@@ -118,14 +118,15 @@ export const incrementallyMaterializeJoinWith = (
     : sparseRightChanges
       ? changedExpressionKeysAtPositions(previous.join.rightInputs, right.result.rows, right.stableChangedPositions ?? [], equality.right, context)
       : changedExpressionKeys(previous.join.rightInputs, right.result.rows, equality.right, context);
-  const leftUnchanged = previous.join.leftInputs.length === left.result.rows.length
-    && previous.join.leftInputs.every((row, index) => row === left.result.rows[index]);
+  const leftUnchanged = previous.join.leftInputs === left.result.rows
+    || previous.join.leftInputs.length === left.result.rows.length
+      && previous.join.leftInputs.every((row, index) => row === left.result.rows[index]);
   const selectivelyAffectedLeftPositions = leftUnchanged && sparseRightChanges && retainedLeftPositions !== undefined
-    ? [...affectedRightKeys].flatMap((key) => joinPositionBucket(retainedLeftPositions.get(key)))
+    ? affectedJoinPositions(affectedRightKeys, retainedLeftPositions)
     : undefined;
   if (selectivelyAffectedLeftPositions !== undefined) {
     const leftPositionsByKey = retainedLeftPositions as ReadonlyMap<string, number | readonly number[]>;
-    const affectedPositions = [...new Set(selectivelyAffectedLeftPositions)].sort((first, second) => first - second);
+    const affectedPositions = selectivelyAffectedLeftPositions;
     const segments = previous.join.segments.slice();
     let widthsStable = true;
     for (const position of affectedPositions) {
@@ -390,6 +391,17 @@ const appendJoinPosition = (positions: Map<string, number | number[]>, key: stri
 
 const joinPositionBucket = (bucket: number | readonly number[] | undefined): readonly number[] =>
   bucket === undefined ? [] : typeof bucket === 'number' ? [bucket] : bucket;
+
+const affectedJoinPositions = (
+  keys: ReadonlySet<string>,
+  positions: ReadonlyMap<string, JoinPositionBucket>
+): readonly number[] => {
+  if (keys.size === 0) return [];
+  if (keys.size === 1) return joinPositionBucket(positions.get(keys.values().next().value as string));
+  const affected = new Set<number>();
+  for (const key of keys) for (const position of joinPositionBucket(positions.get(key))) affected.add(position);
+  return [...affected].sort((left, right) => left - right);
+};
 
 const flattenJoinSegments = (segments: readonly (readonly ScopedRow[])[]): {
   readonly rows: readonly ScopedRow[];

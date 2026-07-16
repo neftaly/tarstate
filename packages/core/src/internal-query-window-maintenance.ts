@@ -1,5 +1,6 @@
 import type { ScopedRow } from './internal-query-evaluation-context.js';
 import type { QueryExpressionResult } from './internal-query-expression.js';
+import { memoizeFrozenAnalysis } from './internal-frozen-analysis.js';
 import { compareOrderedExpressions } from './internal-query-ordering.js';
 import { sealOwnedQueryLogicalContainer, sealOwnedQueryScope } from './internal-query-ownership.js';
 import { queryValueEqual } from './internal-query-values.js';
@@ -30,10 +31,8 @@ export type WindowPartitionState = {
 
 export type EvaluatedWindowKeys = Pick<WindowMaintenancePosition, 'partitionKey' | 'orderValues' | 'orderSignature' | 'rankSignature'>;
 
-export const windowSpecificationKey = (window: WindowExpr): string => canonicalizeJson({
-  partitionBy: window.partitionBy ?? [],
-  orderBy: window.orderBy
-} as unknown as JsonValue);
+export const windowSpecificationKey = memoizeFrozenAnalysis((window: WindowExpr): string =>
+  canonicalizeJson({ partitionBy: window.partitionBy ?? [], orderBy: window.orderBy } as unknown as JsonValue));
 
 export const windowSpecificationReferencesFields = (
   window: WindowExpr,
@@ -234,7 +233,7 @@ export const transformWindowPartitions = (
 ): WindowPartitionTransformation | undefined => {
   if (inputs.length !== previousInputs.length || inputs.length !== previousOutputs.length) return undefined;
 
-  const projectedAliases: (Record<string, QueryLogicalValue> | undefined)[] = Array.from({ length: inputs.length });
+  const projectedAliases = new Map<number, Record<string, QueryLogicalValue>>();
   for (const { field, window, layout } of fields) {
     for (const partitionKey of affectedPartitionKeys) {
       const partition = layout.partitions.get(partitionKey);
@@ -258,12 +257,12 @@ export const transformWindowPartitions = (
             ? null
             : evaluateLagValue(window.value, source);
         }
-        let projectedAlias = projectedAliases[outputIndex];
+        let projectedAlias = projectedAliases.get(outputIndex);
         if (projectedAlias === undefined) {
           const inputAlias = input.scope[alias];
           if (inputAlias === undefined) return undefined;
           projectedAlias = { ...inputAlias };
-          projectedAliases[outputIndex] = projectedAlias;
+          projectedAliases.set(outputIndex, projectedAlias);
         }
         projectedAlias[field] = value;
       }
@@ -272,9 +271,7 @@ export const transformWindowPartitions = (
 
   const rows = previousOutputs.slice();
   const changedPositions: number[] = [];
-  for (let position = 0; position < projectedAliases.length; position += 1) {
-    const projectedAlias = projectedAliases[position];
-    if (projectedAlias === undefined) continue;
+  for (const [position, projectedAlias] of projectedAliases) {
     const input = inputs[position] as ScopedRow;
     const previousOutput = previousOutputs[position] as ScopedRow;
     const inputAlias = input.scope[alias];

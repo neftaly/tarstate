@@ -1,4 +1,5 @@
 import { samePortableJson } from './internal-json-equality.js';
+import { freezeOwnedJsonValue } from './internal-owned-json.js';
 import { sealPreparedPlan } from './internal-prepared-plan.js';
 import type { PreparedPlan } from './query-plan-contract.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue } from './value.js';
@@ -33,7 +34,7 @@ export const parseObservationParameters = (input: unknown): Readonly<Record<stri
   if (parsed.value === null || Array.isArray(parsed.value) || typeof parsed.value !== 'object') {
     throw new TypeError('Observation parameters must be a portable record');
   }
-  return deepFreezeObserverValue(parsed.value) as Readonly<Record<string, JsonValue>>;
+  return freezeOwnedJsonValue(parsed.value) as Readonly<Record<string, JsonValue>>;
 };
 
 export const detachPreparedPlan = <Query>(plan: PreparedPlan<Query>): PreparedPlan<Query> => {
@@ -42,7 +43,7 @@ export const detachPreparedPlan = <Query>(plan: PreparedPlan<Query>): PreparedPl
   return sealPreparedPlan({
     planId: plan.planId,
     rootNodeId: plan.rootNodeId,
-    query: deepFreezeObserverValue(parsed.value) as Query,
+    query: freezeOwnedJsonValue(parsed.value) as Query,
     registryFingerprint: plan.registryFingerprint,
     authorityFingerprint: plan.authorityFingerprint,
     datasetId: plan.datasetId

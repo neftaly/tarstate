@@ -15,7 +15,6 @@ import { assertPreparedPlan } from './internal-prepared-plan.js';
 import {
   adoptJsonValue,
   adoptMaintenanceSnapshot,
-  adoptQueryRecord,
   adoptQueryRequest,
   isOwnedQueryLogicalContainer,
   sealOwnedQueryLogicalContainer,
@@ -1026,11 +1025,8 @@ export const publicQueryRow = (row: ScopedRow, cache: WeakMap<ScopedRow, QueryRe
   const cached = cache.get(row);
   if (cached !== undefined) return cached;
   const visible = visibleRow(row);
-  const owned = isOwnedQueryLogicalContainer(visible)
-    ? visible
-    : adoptQueryRecord(visible, 'Query result row');
-  cache.set(row, owned);
-  return owned;
+  cache.set(row, visible);
+  return visible;
 };
 
 export const publicQueryRows = (rows: readonly ScopedRow[], cache: WeakMap<ScopedRow, QueryRecord>): readonly QueryRecord[] =>

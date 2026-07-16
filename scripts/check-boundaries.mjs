@@ -57,6 +57,7 @@ assignArchitectureGroup('foundation', [
   'built-in-capability-declarations.ts',
   'capability-model.ts',
   'internal-canonical-json.ts',
+  'internal-frozen-analysis.ts',
   'internal-json-equality.ts',
   'internal-numeric-boundary.ts',
   'internal-owned-json.ts',

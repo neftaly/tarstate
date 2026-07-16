@@ -16,18 +16,23 @@ export type TransactionExpressionResult =
   | { readonly success: false; readonly issue: Issue };
 
 type ExpressionScope = Readonly<Record<string, Readonly<Record<string, JsonValue>>>>;
+type ExpressionFailure = (
+  code: string,
+  details: JsonValue
+) => { readonly success: false; readonly issue: Issue };
 
 /** Pure evaluation of the deliberately small transaction-expression language. */
 export const evaluateTransactionExpression = (
   expression: WriteExpression,
   scope: ExpressionScope,
-  parameters: Readonly<Record<string, JsonValue>>
+  parameters: Readonly<Record<string, JsonValue>>,
+  failure: ExpressionFailure = expressionFailure
 ): TransactionExpressionResult => {
   if (expression.kind === 'literal') return { success: true, value: expression.value };
   if (expression.kind === 'parameter') {
     return Object.hasOwn(parameters, expression.name)
       ? { success: true, value: parameters[expression.name] as JsonValue }
-      : expressionFailure('transaction.parameter_missing', { parameter: expression.name });
+      : failure('transaction.parameter_missing', { parameter: expression.name });
   }
   if (expression.kind === 'field') {
     const row = scope[expression.alias];
@@ -36,17 +41,17 @@ export const evaluateTransactionExpression = (
       : { success: true, value: logicalUnknown };
   }
   if (expression.kind === 'compare') {
-    return evaluateComparison(expression, scope, parameters);
+    return evaluateComparison(expression, scope, parameters, failure);
   }
   if (expression.op === 'not') {
-    const value = evaluateTransactionExpression(expression.arg, scope, parameters);
+    const value = evaluateTransactionExpression(expression.arg, scope, parameters, failure);
     return value.success
       ? { success: true, value: logicalNot(asTruth(value.value)) }
       : value;
   }
   const values: LogicalTruth[] = [];
   for (const argument of expression.args) {
-    const value = evaluateTransactionExpression(argument, scope, parameters);
+    const value = evaluateTransactionExpression(argument, scope, parameters, failure);
     if (!value.success) return value;
     values.push(asTruth(value.value));
   }
@@ -59,23 +64,25 @@ export const evaluateTransactionExpression = (
 export const requireTransactionExpression = (
   expression: WriteExpression,
   scope: ExpressionScope,
-  parameters: Readonly<Record<string, JsonValue>>
+  parameters: Readonly<Record<string, JsonValue>>,
+  failure: ExpressionFailure = expressionFailure
 ): { readonly success: true; readonly value: JsonValue } | { readonly success: false; readonly issue: Issue } => {
-  const result = evaluateTransactionExpression(expression, scope, parameters);
+  const result = evaluateTransactionExpression(expression, scope, parameters, failure);
   if (!result.success) return result;
   return result.value === logicalUnknown
-    ? expressionFailure('transaction.expression_indeterminate', { expression: expression.kind })
+    ? failure('transaction.expression_indeterminate', { expression: expression.kind })
     : { success: true, value: result.value };
 };
 
 export const evaluateTransactionFields = (
   fields: Readonly<Record<string, WriteExpression>>,
   scope: ExpressionScope,
-  parameters: Readonly<Record<string, JsonValue>>
+  parameters: Readonly<Record<string, JsonValue>>,
+  failure: ExpressionFailure = expressionFailure
 ): { readonly success: true; readonly value: Readonly<Record<string, JsonValue>> } | { readonly success: false; readonly issue: Issue } => {
   const row: Record<string, JsonValue> = {};
   for (const [field, expression] of Object.entries(fields)) {
-    const value = requireTransactionExpression(expression, scope, parameters);
+    const value = requireTransactionExpression(expression, scope, parameters, failure);
     if (!value.success) return value;
     row[field] = value.value;
   }
@@ -85,11 +92,12 @@ export const evaluateTransactionFields = (
 const evaluateComparison = (
   expression: Extract<WriteExpression, { readonly kind: 'compare' }>,
   scope: ExpressionScope,
-  parameters: Readonly<Record<string, JsonValue>>
+  parameters: Readonly<Record<string, JsonValue>>,
+  failure: ExpressionFailure
 ): TransactionExpressionResult => {
-  const left = evaluateTransactionExpression(expression.left, scope, parameters);
+  const left = evaluateTransactionExpression(expression.left, scope, parameters, failure);
   if (!left.success) return left;
-  const right = evaluateTransactionExpression(expression.right, scope, parameters);
+  const right = evaluateTransactionExpression(expression.right, scope, parameters, failure);
   if (!right.success) return right;
   if (left.value === logicalUnknown
     || right.value === logicalUnknown

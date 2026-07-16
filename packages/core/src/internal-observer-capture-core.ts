@@ -45,11 +45,12 @@ export const assembleEvaluationSnapshot = <Projection>(input: {
   const previousAvailable = input.previous?.available;
   let previousAvailableIndex = 0;
   let previousAvailableById: ReadonlyMap<string, AvailableQueryAttachment<Projection>> | undefined;
-  const available = Object.freeze(members.flatMap((candidate): readonly AvailableQueryAttachment<Projection>[] => {
+  const available: AvailableQueryAttachment<Projection>[] = [];
+  for (const candidate of members) {
     if (candidate.attachment === undefined
       || candidate.snapshot === undefined
       || candidate.projection?.state !== 'ready') {
-      return [];
+      continue;
     }
     let previous = previousAvailable?.[previousAvailableIndex];
     if (previous?.member.attachmentId === candidate.member.attachmentId) previousAvailableIndex += 1;
@@ -61,15 +62,17 @@ export const assembleEvaluationSnapshot = <Projection>(input: {
       && previous.attachment === candidate.attachment
       && previous.snapshot === candidate.snapshot
       && previous.projection === candidate.projection.value) {
-      return [previous];
+      available.push(previous);
+      continue;
     }
-    return [Object.freeze({
+    available.push(Object.freeze({
       member: candidate.member,
       attachment: candidate.attachment,
       snapshot: candidate.snapshot,
       projection: candidate.projection.value
-    })];
-  }));
+    }));
+  }
+  Object.freeze(available);
   return Object.freeze({
     identity: Object.freeze({}),
     dataset: input.dataset,

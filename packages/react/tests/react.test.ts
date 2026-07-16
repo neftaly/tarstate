@@ -27,6 +27,8 @@ import {
   type ReactObserverSnapshot,
   type ReactPreparedPlan
 } from '../src/index.js';
+import { OptimisticOverlayStore } from '../src/optimistic-store.js';
+import { QueryStore } from '../src/query-store.js';
 
 type Query = { readonly kind: 'all' };
 type Row = { readonly id: number; readonly name: string };
@@ -769,6 +771,43 @@ describe('@tarstate/react', () => {
     expect(remounted).toMatchObject({ state: 'open', current: { rows: [{ id: 1, name: 'one' }] } });
     expect(remounted).not.toHaveProperty('optimistic');
     expect(database.closeCount).toBe(0);
+  });
+
+  it('invalidates only query views whose authoritative basis contains the overlay target', () => {
+    const primary = new TestDatabase();
+    const unrelated = new TestDatabase();
+    const unrelatedBase = openSnapshot([{ id: 1, name: 'one' }]);
+    if (unrelatedBase.state !== 'open') throw new Error('expected open snapshot');
+    const unrelatedCurrent = {
+      ...unrelatedBase.current,
+      basis: {
+        dataset: { datasetId: 'dataset:one', revision: 0 },
+        attachments: [{ attachmentId: 'attachment:two', sourceId: 'source:two', basis: { incarnation: 'two', revision: 0 } }]
+      }
+    };
+    unrelated.snapshot = Object.freeze({ state: 'open', current: unrelatedCurrent, lastExact: unrelatedCurrent });
+    const request: ObserveRequest<Query> = { plan };
+    const primaryStore = new QueryStore<Row>(primary as ObservableDatabase<unknown, unknown>, request, () => undefined);
+    const unrelatedStore = new QueryStore<Row>(unrelated as ObservableDatabase<unknown, unknown>, request, () => undefined);
+    const overlays = new OptimisticOverlayStore(() => undefined);
+    const primaryView = overlays.view(primaryStore, request, 'primary');
+    const unrelatedView = overlays.view(unrelatedStore, request, 'unrelated');
+    const primaryListener = vi.fn();
+    const unrelatedListener = vi.fn();
+    const unsubscribePrimary = primaryView.subscribe(primaryListener);
+    const unsubscribeUnrelated = unrelatedView.subscribe(unrelatedListener);
+
+    expect(overlays.add(1, transactionAttempt(), {
+      sourceId: 'source:one',
+      sourceBasis: { incarnation: 'one', revision: 0 },
+      projectRows: ({ currentRows, currentResultKeys }) => ({ rows: currentRows, resultKeys: currentResultKeys })
+    })).toBeUndefined();
+    expect(primaryListener).toHaveBeenCalledOnce();
+    expect(unrelatedListener).not.toHaveBeenCalled();
+
+    unsubscribePrimary();
+    unsubscribeUnrelated();
+    overlays.close();
   });
 
   it('removes a failed overlay from every query view after a pure snapshot pass', async () => {

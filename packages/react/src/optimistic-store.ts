@@ -23,6 +23,7 @@ import {
 
 type ActiveOptimisticOverlay = {
   readonly mutationId: number;
+  readonly sequence: number;
   readonly operationEpoch: string;
   readonly operationId: string;
   readonly attachmentId: string;
@@ -31,6 +32,9 @@ type ActiveOptimisticOverlay = {
   readonly sourceBasisFingerprint: string;
   readonly definition: OptimisticOverlay<unknown, unknown>;
 };
+
+const overlayTargetKey = (attachmentId: string, sourceId: string): string =>
+  attachmentId.length + ':' + attachmentId + sourceId.length + ':' + sourceId;
 
 type InspectedOptimisticOverlay = {
   readonly sourceId: string;
@@ -81,11 +85,12 @@ const optimisticOverlayError = (
 
 export class OptimisticOverlayStore {
   readonly #overlays = new Map<number, ActiveOptimisticOverlay>();
+  readonly #overlaysByTarget = new Map<string, Map<number, ActiveOptimisticOverlay>>();
   readonly #views = new Map<string, OptimisticQueryView<unknown, unknown>>();
   readonly #reportError: (mutationId: number, error: OptimisticUpdateError) => void;
-  readonly #pendingFailures = new Map<number, OptimisticUpdateError>();
+  readonly #pendingFailures = new Map<number, { readonly overlay: ActiveOptimisticOverlay; readonly error: OptimisticUpdateError }>();
   readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
-  #revision = 0;
+  #nextSequence = 0;
   #closed = false;
 
   constructor(reportError: (mutationId: number, error: OptimisticUpdateError) => void, onDiagnostic?: ObserverDiagnosticReporter) {
@@ -93,7 +98,6 @@ export class OptimisticOverlayStore {
     this.#onDiagnostic = onDiagnostic;
   }
 
-  get revision(): number { return this.#revision; }
   get onDiagnostic(): ObserverDiagnosticReporter | undefined { return this.#onDiagnostic; }
 
   view<Query, Row>(base: QueryStore<Row>, request: ObserveRequest<Query>, key: string): OptimisticQueryView<Query, Row> {
@@ -126,8 +130,10 @@ export class OptimisticOverlayStore {
     } catch (error) {
       return { phase: 'source-basis', ...errorDetails(error) };
     }
-    this.#overlays.set(mutationId, {
+    const prior = this.#deleteOverlay(mutationId);
+    const overlay = {
       mutationId,
+      sequence: this.#nextSequence += 1,
       operationEpoch: attempt.operationEpoch,
       operationId: attempt.operationId,
       attachmentId: attempt.attachmentId,
@@ -135,14 +141,22 @@ export class OptimisticOverlayStore {
       sourceBasis,
       sourceBasisFingerprint,
       definition: Object.freeze({ ...inspectedDefinition, sourceBasis })
-    });
-    this.#changed();
+    };
+    this.#overlays.set(mutationId, overlay);
+    const target = overlayTargetKey(overlay.attachmentId, overlay.sourceId);
+    let targeted = this.#overlaysByTarget.get(target);
+    if (targeted === undefined) {
+      targeted = new Map();
+      this.#overlaysByTarget.set(target, targeted);
+    }
+    targeted.set(mutationId, overlay);
+    this.#changed(prior === undefined ? [overlay] : [prior, overlay]);
     return undefined;
   }
 
   discard(mutationId: number): void {
-    if (!this.#overlays.delete(mutationId)) return;
-    this.#changed();
+    const overlay = this.#deleteOverlay(mutationId);
+    if (overlay !== undefined) this.#changed([overlay]);
   }
 
   project<Query, Row>(authoritative: ObserverSnapshot<Row>, request: ObserveRequest<Query>): ReactObserverSnapshot<Row> {
@@ -151,17 +165,16 @@ export class OptimisticOverlayStore {
     let resultKeys = authoritative.current.resultKeys;
     const operations: OptimisticOperationEvidence[] = [];
     const failures: [ActiveOptimisticOverlay, OptimisticUpdateError][] = [];
-    const attachments = new Map<string, Map<string, JsonValue>>();
+    const observedBases = new Map<string, JsonValue>();
+    const candidates = new Map<number, ActiveOptimisticOverlay>();
     for (const attachment of authoritative.current.basis.attachments) {
-      let sources = attachments.get(attachment.attachmentId);
-      if (sources === undefined) {
-        sources = new Map();
-        attachments.set(attachment.attachmentId, sources);
-      }
-      sources.set(attachment.sourceId, attachment.basis);
+      const target = overlayTargetKey(attachment.attachmentId, attachment.sourceId);
+      observedBases.set(target, attachment.basis);
+      for (const overlay of this.#overlaysByTarget.get(target)?.values() ?? []) candidates.set(overlay.mutationId, overlay);
     }
     const observedBasisFingerprints = new Map<JsonValue, string>();
-    for (const overlay of this.#overlays.values()) {
+    const orderedCandidates = [...candidates.values()].sort((left, right) => left.sequence - right.sequence);
+    for (const overlay of orderedCandidates) {
       const definition = overlay.definition as OptimisticOverlay<Query, Row>;
       if (definition.appliesToQuery !== undefined) {
         let applies: boolean;
@@ -173,7 +186,7 @@ export class OptimisticOverlayStore {
         }
         if (!applies) continue;
       }
-      const observedBasis = attachments.get(overlay.attachmentId)?.get(overlay.sourceId);
+      const observedBasis = observedBases.get(overlayTargetKey(overlay.attachmentId, overlay.sourceId));
       if (observedBasis === undefined) continue;
       let observedBasisFingerprint = observedBasisFingerprints.get(observedBasis);
       if (observedBasisFingerprint === undefined) {
@@ -221,34 +234,45 @@ export class OptimisticOverlayStore {
     if (this.#closed) return;
     this.#closed = true;
     this.#overlays.clear();
+    this.#overlaysByTarget.clear();
     this.#pendingFailures.clear();
     runReactCleanups(Array.from(this.#views.values(), (view) => () => view.close()), 'react-optimistic', 'close-overlay-views', this.#onDiagnostic);
     this.#views.clear();
   }
 
-  #changed(): void {
-    this.#revision += 1;
-    for (const view of this.#views.values()) view.overlayChanged();
+  #changed(overlays: readonly ActiveOptimisticOverlay[]): void {
+    for (const view of this.#views.values()) view.overlaysChanged(overlays);
   }
 
   #scheduleFailure(overlay: ActiveOptimisticOverlay, error: OptimisticUpdateError): void {
     if (this.#pendingFailures.has(overlay.mutationId)) return;
     // A rejected host projection cannot remain active between render and the
     // deferred mutation-state notification.
-    this.#overlays.delete(overlay.mutationId);
-    this.#pendingFailures.set(overlay.mutationId, error);
+    this.#deleteOverlay(overlay.mutationId);
+    this.#pendingFailures.set(overlay.mutationId, { overlay, error });
     queueMicrotask(() => this.#flushFailures());
   }
 
   #flushFailures(): void {
     if (this.#closed) { this.#pendingFailures.clear(); return; }
-    let changed = false;
-    for (const [mutationId, error] of this.#pendingFailures) {
+    const changed: ActiveOptimisticOverlay[] = [];
+    for (const [mutationId, { overlay, error }] of this.#pendingFailures) {
       this.#reportError(mutationId, error);
-      changed = true;
+      changed.push(overlay);
     }
     this.#pendingFailures.clear();
-    if (changed) this.#changed();
+    if (changed.length > 0) this.#changed(changed);
+  }
+
+  #deleteOverlay(mutationId: number): ActiveOptimisticOverlay | undefined {
+    const overlay = this.#overlays.get(mutationId);
+    if (overlay === undefined) return undefined;
+    this.#overlays.delete(mutationId);
+    const target = overlayTargetKey(overlay.attachmentId, overlay.sourceId);
+    const targeted = this.#overlaysByTarget.get(target);
+    targeted?.delete(mutationId);
+    if (targeted?.size === 0) this.#overlaysByTarget.delete(target);
+    return overlay;
   }
 }
 
@@ -260,7 +284,8 @@ class OptimisticQueryView<Query, Row> {
   readonly #listeners = new Set<() => void>();
   #unsubscribeBase: (() => void) | undefined;
   #baseSnapshot: ObserverSnapshot<Row> | undefined;
-  #overlayRevision = -1;
+  #overlayRevision = 0;
+  #projectedOverlayRevision = -1;
   #snapshot: ReactObserverSnapshot<Row> | undefined;
   #closeGeneration = 0;
   #closed = false;
@@ -286,7 +311,12 @@ class OptimisticQueryView<Query, Row> {
     };
   };
 
-  overlayChanged(): void { this.#refresh(); }
+  overlaysChanged(overlays: readonly ActiveOptimisticOverlay[]): void {
+    const base = this.#base.getSnapshot();
+    if (!overlays.some((overlay) => overlayTargetsSnapshot(overlay, base))) return;
+    this.#overlayRevision += 1;
+    this.#refresh();
+  }
 
   close(): void {
     if (this.#closed) return;
@@ -309,9 +339,9 @@ class OptimisticQueryView<Query, Row> {
 
   #recompute(): ReactObserverSnapshot<Row> {
     const baseSnapshot = this.#base.getSnapshot();
-    if (this.#snapshot !== undefined && this.#baseSnapshot === baseSnapshot && this.#overlayRevision === this.#overlays.revision) return this.#snapshot;
+    if (this.#snapshot !== undefined && this.#baseSnapshot === baseSnapshot && this.#projectedOverlayRevision === this.#overlayRevision) return this.#snapshot;
     this.#baseSnapshot = baseSnapshot;
-    this.#overlayRevision = this.#overlays.revision;
+    this.#projectedOverlayRevision = this.#overlayRevision;
     this.#snapshot = this.#overlays.project(baseSnapshot, this.#request);
     return this.#snapshot;
   }
@@ -324,3 +354,10 @@ class OptimisticQueryView<Query, Row> {
     });
   }
 }
+
+const overlayTargetsSnapshot = (overlay: ActiveOptimisticOverlay, snapshot: ObserverSnapshot<unknown>): boolean =>
+  snapshot.state === 'open'
+  && snapshot.current.completeness !== 'unknown'
+  && snapshot.current.basis.attachments.some(({ attachmentId, sourceId }) =>
+    attachmentId === overlay.attachmentId && sourceId === overlay.sourceId
+  );

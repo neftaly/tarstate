@@ -23,6 +23,7 @@ export type ExtremeValueIndex = {
   readonly base: ReadonlyMap<string, ExtremeValueEntry>;
   readonly overlays: readonly ReadonlyMap<string, ExtremeValueEntry | undefined>[];
   readonly orderedKeys: readonly string[];
+  readonly tombstoneCount: number;
   readonly extremeKey?: string;
 };
 export type AggregateReducerState =

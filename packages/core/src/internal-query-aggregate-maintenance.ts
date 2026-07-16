@@ -1,4 +1,5 @@
 import { canonicalizeJsonValue as canonicalizeJson } from './internal-canonical-json.js';
+import { memoizeFrozenAnalysis } from './internal-frozen-analysis.js';
 import type { Issue } from './issues.js';
 import type { QueryContext, ScopedRow } from './internal-query-evaluation-context.js';
 import {
@@ -83,8 +84,9 @@ const aggregateReducerEligible = (aggregate: AggregateExpr): boolean =>
   && (aggregate.op === 'count' || aggregate.op === 'count-distinct' || aggregate.op === 'minimum' || aggregate.op === 'maximum' || aggregate.op === 'any' || aggregate.op === 'every')
   && (aggregate.value === undefined || !containsSubquery(aggregate.value) && !containsNamedCall(aggregate.value));
 
-const allAggregateMeasuresReduced = (node: Extract<QueryNode, { readonly kind: 'aggregate' }>): boolean =>
-  Object.values(node.measures).every(aggregateReducerEligible);
+type AggregateNode = Extract<QueryNode, { readonly kind: 'aggregate' }>;
+const allAggregateMeasuresReduced = memoizeFrozenAnalysis((node: AggregateNode): boolean =>
+  Object.values(node.measures).every(aggregateReducerEligible));
 
 const aggregateContribution = (aggregate: AggregateExpr, row: ScopedRow, context: QueryContext): ExpressionResult => {
   const contribution = aggregate.value === undefined ? known(1) : evaluateExpr(aggregate.value, exprContext(row, context));
@@ -137,7 +139,7 @@ const updateExtremeReducer = (
   const key = canonicalizeJson(contribution.value);
   const existing = extremeIndexEntry(state.index, key);
   const after = (existing?.count ?? 0) + delta;
-  const changedEntry: ExtremeValueEntry | undefined = after === 0 ? undefined : { count: after, value: existing?.value ?? contribution.value };
+  const changedEntry: ExtremeValueEntry = { count: after, value: existing?.value ?? contribution.value };
   const changed = new Map<string, ExtremeValueEntry | undefined>([[key, changedEntry]]);
   let base = state.index.base;
   let overlays = [...state.index.overlays, changed];
@@ -151,16 +153,38 @@ const updateExtremeReducer = (
     overlays = [];
     if (context !== undefined) context.state.aggregateCompactionCount += 1;
   }
-  const liveIndex: ExtremeValueIndex = { base, overlays, orderedKeys: state.index.orderedKeys };
-  const orderedKeys = after === 0
-    ? state.index.orderedKeys.filter((candidate) => candidate !== key)
-    : existing === undefined
-      ? insertOrderedExtremeKey(state.index.orderedKeys, key, contribution.value, liveIndex)
-      : state.index.orderedKeys;
-  const extremeKey = aggregate.op === 'minimum'
-    ? orderedKeys[0]
-    : orderedKeys[orderedKeys.length - 1];
-  return { kind: 'extreme', index: { base, overlays, orderedKeys, ...(extremeKey === undefined ? {} : { extremeKey }) } };
+  const lookupIndex: ExtremeValueIndex = { base, overlays, orderedKeys: state.index.orderedKeys, tombstoneCount: state.index.tombstoneCount };
+  let orderedKeys = after > 0 && existing === undefined
+    ? insertOrderedExtremeKey(state.index.orderedKeys, key, contribution.value, lookupIndex)
+    : state.index.orderedKeys;
+  let tombstoneCount = state.index.tombstoneCount
+    + (existing !== undefined && existing.count > 0 && after === 0 ? 1 : existing !== undefined && existing.count === 0 && after > 0 ? -1 : 0);
+  if (tombstoneCount >= 64 && tombstoneCount * 3 >= orderedKeys.length) {
+    const compacted = new Map(base);
+    for (const overlay of overlays) for (const [candidate, entry] of overlay) {
+      if (entry === undefined || entry.count === 0) compacted.delete(candidate);
+      else compacted.set(candidate, entry);
+    }
+    orderedKeys = orderedKeys.filter((candidate) => compacted.has(candidate));
+    base = compacted;
+    overlays = [];
+    tombstoneCount = 0;
+    if (context !== undefined) context.state.aggregateCompactionCount += 1;
+  }
+  const liveIndex: ExtremeValueIndex = { base, overlays, orderedKeys, tombstoneCount };
+  const extremeKey = liveExtremeKey(aggregate, liveIndex);
+  return { kind: 'extreme', index: { ...liveIndex, ...(extremeKey === undefined ? {} : { extremeKey }) } };
+};
+
+const liveExtremeKey = (aggregate: AggregateExpr, index: ExtremeValueIndex): string | undefined => {
+  let position = aggregate.op === 'minimum' ? 0 : index.orderedKeys.length - 1;
+  const step = aggregate.op === 'minimum' ? 1 : -1;
+  while (position >= 0 && position < index.orderedKeys.length) {
+    const key = index.orderedKeys[position] as string;
+    if ((extremeIndexEntry(index, key)?.count ?? 0) > 0) return key;
+    position += step;
+  }
+  return undefined;
 };
 
 const extremeIndexEntry = (index: ExtremeValueIndex, key: string): ExtremeValueEntry | undefined => {
@@ -242,7 +266,7 @@ const buildAggregateReducers = (node: Extract<QueryNode, { readonly kind: 'aggre
       const orderedKeys = [...base.keys()].sort((left, right) =>
         compareQueryJsonValuesTotal((base.get(left) as ExtremeValueEntry).value, (base.get(right) as ExtremeValueEntry).value));
       const extremeKey = aggregate.op === 'minimum' ? orderedKeys[0] : orderedKeys[orderedKeys.length - 1];
-      reducers.set(name, { kind: 'extreme', index: { base, overlays: [], orderedKeys, ...(extremeKey === undefined ? {} : { extremeKey }) } });
+      reducers.set(name, { kind: 'extreme', index: { base, overlays: [], orderedKeys, tombstoneCount: 0, ...(extremeKey === undefined ? {} : { extremeKey }) } });
       continue;
     }
     let trueCount = 0;
@@ -455,13 +479,11 @@ const buildAggregateState = (
 // addition to semantic materialization. Built-in expressions are pure; named
 // host calls and subqueries may carry observable work, so keep those on the
 // single-evaluation fallback path.
-export const orderCanBeIncrementallyIndexed = (node: Extract<QueryNode, { readonly kind: 'order' }>): boolean =>
-  !node.by.some(({ value }) => containsSubquery(value) || containsNamedCall(value));
+export const orderCanBeIncrementallyIndexed = memoizeFrozenAnalysis((node: Extract<QueryNode, { readonly kind: 'order' }>): boolean =>
+  !node.by.some(({ value }) => containsSubquery(value) || containsNamedCall(value)));
 
-export const aggregateCanBeIncrementallyIndexed = (node: Extract<QueryNode, { readonly kind: 'aggregate' }>): boolean => {
-  if (Object.values(node.groupBy).some((expression) => containsSubquery(expression) || containsNamedCall(expression))) return false;
-  return !Object.values(node.measures).some((measure) =>
-    measure.value !== undefined && containsSubquery(measure.value)
-    || measure.orderBy?.some(({ value }) => containsSubquery(value)) === true
-  );
-};
+export const aggregateCanBeIncrementallyIndexed = memoizeFrozenAnalysis((node: AggregateNode): boolean =>
+  !Object.values(node.groupBy).some((expression) => containsSubquery(expression) || containsNamedCall(expression))
+    && !Object.values(node.measures).some((measure) =>
+      measure.value !== undefined && containsSubquery(measure.value)
+      || measure.orderBy?.some(({ value }) => containsSubquery(value)) === true));

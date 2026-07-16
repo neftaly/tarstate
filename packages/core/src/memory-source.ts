@@ -7,9 +7,13 @@ import { canonicalizeJsonWithCache } from './internal-canonical-json.js';
 import { samePortableJson } from './internal-json-equality.js';
 import { positiveSafeInteger } from './internal-numeric-boundary.js';
 import { stringTupleKey } from './internal-string-key.js';
+import {
+  evaluateTransactionExpression,
+  evaluateTransactionFields,
+  requireTransactionExpression
+} from './internal-transaction-expression.js';
 import type { SourceBasis } from './source-state.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
-import { comparePortableStrings } from './portable-order.js';
 import type { QueryNode } from './query-model.js';
 import { safeParseTransactionArtifact } from './semantic-transaction-artifact.js';
 import {
@@ -27,7 +31,7 @@ import {
   type WriteStatement,
   type WriteTarget
 } from './transaction.js';
-import { logicalAnd, logicalNot, logicalOr, logicalUnknown, type LogicalTruth, type JsonValue } from './value.js';
+import type { JsonValue } from './value.js';
 
 export type MemoryBasis = { readonly incarnation: string; readonly revision: number };
 export type MemoryRow = Readonly<Record<string, JsonValue>>;
@@ -88,10 +92,6 @@ type EvaluatedAttempt = {
   readonly blockingIssues: readonly Issue[];
   readonly issues: readonly Issue[];
 };
-
-type ExpressionResult =
-  | { readonly success: true; readonly value: JsonValue | typeof logicalUnknown }
-  | { readonly success: false; readonly issue: Issue };
 
 const emptyStatementResult = (statementIndex: number): StatementResult => ({
   statementIndex,
@@ -782,64 +782,15 @@ const selectTargets = (target: WriteTarget, rows: readonly MemoryRow[], paramete
 };
 
 const evaluateFields = (fields: Readonly<Record<string, WriteExpression>>, scope: Readonly<Record<string, MemoryRow>>, parameters: Readonly<Record<string, JsonValue>>):
-  { readonly success: true; readonly value: MemoryRow } | { readonly success: false; readonly issue: Issue } => {
-  const row: Record<string, JsonValue> = {};
-  for (const [field, expression] of Object.entries(fields)) {
-    const value = requireExpression(expression, scope, parameters);
-    if (!value.success) return value;
-    row[field] = value.value;
-  }
-  return { success: true, value: row };
-};
+  { readonly success: true; readonly value: MemoryRow } | { readonly success: false; readonly issue: Issue } =>
+  evaluateTransactionFields(fields, scope, parameters, expressionIssue);
 
 const requireExpression = (expression: WriteExpression, scope: Readonly<Record<string, MemoryRow>>, parameters: Readonly<Record<string, JsonValue>>):
-  { readonly success: true; readonly value: JsonValue } | { readonly success: false; readonly issue: Issue } => {
-  const result = evaluateExpression(expression, scope, parameters);
-  if (!result.success) return result;
-  return result.value === logicalUnknown ? expressionIssue('transaction.expression_indeterminate', { expression: expression.kind }) : { success: true, value: result.value };
-};
+  { readonly success: true; readonly value: JsonValue } | { readonly success: false; readonly issue: Issue } =>
+  requireTransactionExpression(expression, scope, parameters, expressionIssue);
 
-const evaluateExpression = (expression: WriteExpression, scope: Readonly<Record<string, MemoryRow>>, parameters: Readonly<Record<string, JsonValue>>): ExpressionResult => {
-  if (expression.kind === 'literal') return { success: true, value: expression.value };
-  if (expression.kind === 'parameter') return Object.hasOwn(parameters, expression.name)
-    ? { success: true, value: parameters[expression.name] as JsonValue }
-    : expressionIssue('transaction.parameter_missing', { parameter: expression.name });
-  if (expression.kind === 'field') {
-    const row = scope[expression.alias];
-    return row !== undefined && Object.hasOwn(row, expression.name) ? { success: true, value: row[expression.name] as JsonValue } : { success: true, value: logicalUnknown };
-  }
-  if (expression.kind === 'compare') {
-    const left = evaluateExpression(expression.left, scope, parameters);
-    if (!left.success) return left;
-    const right = evaluateExpression(expression.right, scope, parameters);
-    if (!right.success) return right;
-    if (left.value === logicalUnknown || right.value === logicalUnknown || left.value === null || right.value === null) return { success: true, value: logicalUnknown };
-    const comparison = compareValues(left.value, right.value);
-    if (comparison === undefined) return { success: true, value: logicalUnknown };
-    return { success: true, value: expression.op === 'eq' ? comparison === 0 : expression.op === 'ne' ? comparison !== 0 : expression.op === 'lt' ? comparison < 0 : expression.op === 'lte' ? comparison <= 0 : expression.op === 'gt' ? comparison > 0 : comparison >= 0 };
-  }
-  if (expression.op === 'not') {
-    const arg = evaluateExpression(expression.arg, scope, parameters);
-    return arg.success ? { success: true, value: logicalNot(asTruth(arg.value)) } : arg;
-  }
-  const args: LogicalTruth[] = [];
-  for (const expressionArg of expression.args) {
-    const arg = evaluateExpression(expressionArg, scope, parameters);
-    if (!arg.success) return arg;
-    args.push(asTruth(arg.value));
-  }
-  return { success: true, value: expression.op === 'and' ? logicalAnd(args) : logicalOr(args) };
-};
-
-const asTruth = (value: JsonValue | typeof logicalUnknown): LogicalTruth => value === true ? true : value === false ? false : logicalUnknown;
-
-const compareValues = (left: JsonValue, right: JsonValue): number | undefined => {
-  if (typeof left === 'number' && typeof right === 'number') return left - right;
-  if (typeof left === 'string' && typeof right === 'string') return comparePortableStrings(left, right);
-  if (typeof left === 'boolean' && typeof right === 'boolean') return Number(left) - Number(right);
-  if ((Array.isArray(left) && Array.isArray(right)) || (isRecord(left) && isRecord(right))) return comparePortableStrings(canonical(left), canonical(right));
-  return undefined;
-};
+const evaluateExpression = (expression: WriteExpression, scope: Readonly<Record<string, MemoryRow>>, parameters: Readonly<Record<string, JsonValue>>) =>
+  evaluateTransactionExpression(expression, scope, parameters, expressionIssue);
 
 const expressionIssue = (code: string, details: JsonValue): { readonly success: false; readonly issue: Issue } => ({ success: false, issue: txIssue(code, 'plan', details, undefined, 'after_input') });
 
