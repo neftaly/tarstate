@@ -84,9 +84,8 @@ const ownedDataValue = (descriptors: PropertyDescriptorMap, name: string): unkno
 
 const inspectDenseDataArray = <Value>(value: unknown): Value[] => {
   if (!Array.isArray(value)) throw new TypeError('Optimistic projection rows and resultKeys must be arrays');
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-  const length = lengthDescriptor !== undefined && 'value' in lengthDescriptor ? lengthDescriptor.value : undefined;
+  const descriptors = Object.getOwnPropertyDescriptors(value) as Readonly<Record<string, PropertyDescriptor>>;
+  const length = descriptors.length?.value;
   if (!Number.isSafeInteger(length) || length < 0) throw new TypeError('Optimistic projection array length is invalid');
   const output: Value[] = [];
   for (let index = 0; index < length; index += 1) {

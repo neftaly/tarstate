@@ -60,7 +60,7 @@ export type SourceEvidence = {
   readonly sourceId: string;
   readonly expectation: 'required' | 'optional';
   readonly discoveryEdges: readonly string[];
-  readonly state: SourceLifecycleState | 'missing';
+  readonly state: SourceLifecycleState | 'missing' | 'limited';
   readonly freshness: SourceFreshness;
   readonly authorized: boolean;
   readonly basis?: SourceBasis;

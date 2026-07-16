@@ -96,4 +96,20 @@ describe('database source-link graph', () => {
 
     expect(built.graph?.targets).toHaveLength(edgeCount);
   });
+
+  it('applies deterministic source, edge, depth, and traversal budgets', () => {
+    const references = parse([
+      { linkId: 'root-a', originSourceId: 'root', targetSourceId: 'a' },
+      { linkId: 'root-b', originSourceId: 'root', targetSourceId: 'b' },
+      { linkId: 'a-c', originSourceId: 'a', targetSourceId: 'c' }
+    ]);
+    expect(buildDatabaseDiscoveryGraph(['root'], references, { maxLinkedSources: 1 }).budgetExceeded)
+      .toEqual({ limit: 'maxLinkedSources', maximum: 1 });
+    expect(buildDatabaseDiscoveryGraph(['root'], references, { maxDiscoveryEdges: 1 }).budgetExceeded)
+      .toEqual({ limit: 'maxDiscoveryEdges', maximum: 1 });
+    expect(buildDatabaseDiscoveryGraph(['root'], references, { maxDepth: 1 }).budgetExceeded)
+      .toEqual({ limit: 'maxDepth', maximum: 1 });
+    expect(buildDatabaseDiscoveryGraph(['root'], references, { maxTraversalSteps: 1 }).budgetExceeded)
+      .toEqual({ limit: 'maxTraversalSteps', maximum: 1 });
+  });
 });

@@ -16,7 +16,7 @@ import type { PreparedPlanParameters, PreparedPlanRow } from '../query/authoring
 import type { PreparedPlan } from '../query/plan-contract.js';
 import type { QueryNode, QueryRecord, RelationInput } from '../query/model.js';
 import type { JsonValue } from '../value.js';
-import type { DatabaseSourceLink } from './source-link-graph.js';
+import type { DatabaseDiscoveryBudget, DatabaseSourceLink } from './source-link-graph.js';
 import { parseObservationParameters } from '../internal-observer-values.js';
 import { assertPreparedPlan } from '../query/internal/prepared-plan.js';
 import type {
@@ -25,10 +25,12 @@ import type {
   OpenLinkedDatabaseSource
 } from './source-mount.js';
 
-export type { DatabaseSourceLink } from './source-link-graph.js';
+export type { DatabaseDiscoveryBudget, DatabaseSourceLink } from './source-link-graph.js';
 export type {
   DatabaseSourceMountLease,
   DatabaseSourceMountOptions,
+  FailedLinkedDatabaseSource,
+  LinkedDatabaseSourceResolution,
   MountableDatabaseSource,
   OwnedDatabaseSource,
   OpenLinkedDatabaseSource,
@@ -93,6 +95,8 @@ export type FollowDatabaseSourceLinksOptions<
   readonly plan: SourceLinkPlan<LinkPlan>;
   /** Opens a new owned source; Tarstate closes it when its last reachable link ends. */
   readonly openSource: OpenLinkedDatabaseSource;
+  /** Deterministic bounds over the reachable graph, independent of open completion order. */
+  readonly budget?: DatabaseDiscoveryBudget;
 } & SessionParameterOptions<LinkPlan>;
 
 export type OpenDatabaseQueryOptions<
@@ -230,6 +234,7 @@ export const openDatabaseQuery = async <
         sourceLinkMembership,
         rootMembers: membership.snapshot().members,
         openSource: sourceLinks.options.openSource,
+        budget: sourceLinks.options.budget,
         ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
       });
     }

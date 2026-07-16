@@ -9,6 +9,7 @@ import {
 import { prepareManualReadOnlyAttachment } from '../src/attachment/preparation.js';
 import { prepareQuery, type QueryNode, type QueryRecord, type RelationInput, type RelationUse } from '../src/query/index.js';
 import { relationLiteral, sealSchema } from '../src/schema/index.js';
+import { createIssue } from '../src/issues.js';
 
 type Storage = {
   readonly links: readonly QueryRecord[];
@@ -425,7 +426,8 @@ describe('database source links', () => {
       storage: {
         links: [
           { linkId: 'missing', originSourceId: 'root', targetSourceId: 'missing', expectation: 'required' },
-          { linkId: 'failed', originSourceId: 'root', targetSourceId: 'failed', expectation: 'required' }
+          { linkId: 'failed', originSourceId: 'root', targetSourceId: 'failed', expectation: 'required' },
+          { linkId: 'malformed', originSourceId: 'root', targetSourceId: 'malformed', expectation: 'required' }
         ],
         items: []
       }
@@ -438,6 +440,10 @@ describe('database source links', () => {
         plan: linkPlan,
         openSource: ({ sourceId }) => {
           if (sourceId === 'missing') return undefined;
+          if (sourceId === 'malformed') return {
+            state: 'failed',
+            issues: [createIssue({ code: 'mapping.invalid', details: { reason: 'foreign_declaration' } })]
+          } as const;
           throw new Error('offline');
         }
       }
@@ -455,10 +461,55 @@ describe('database source links', () => {
           sourceId: 'failed',
           state: 'failed',
           issues: expect.arrayContaining([expect.objectContaining({ code: 'observer.linked_source_resolution_failed' })])
+        }),
+        expect.objectContaining({
+          sourceId: 'malformed',
+          state: 'failed',
+          issues: expect.arrayContaining([expect.objectContaining({
+            code: 'mapping.invalid',
+            details: { reason: 'foreign_declaration' }
+          })])
         })
       ])
     });
 
+    session.close();
+  });
+
+  it('reports deterministic graph budget evidence without opening an arbitrary prefix', async () => {
+    const { relations, linkPlan, itemPlan } = await setup();
+    const root = createMutableSource({
+      sourceId: 'root',
+      attachmentId: 'attachment:root',
+      relations,
+      storage: {
+        links: [
+          { linkId: 'root-a', originSourceId: 'root', targetSourceId: 'a' },
+          { linkId: 'root-b', originSourceId: 'root', targetSourceId: 'b' }
+        ],
+        items: [{ id: 'root-item' }]
+      }
+    });
+    const openSource = vi.fn(() => undefined);
+    const session = await openDatabaseQuery({
+      sources: [{ source: root.source }],
+      plan: itemPlan,
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: {
+        plan: linkPlan,
+        budget: { maxLinkedSources: 1 },
+        openSource
+      }
+    });
+
+    await expect(session.whenSettled()).resolves.toMatchObject({
+      readiness: 'incomplete',
+      issues: expect.arrayContaining([expect.objectContaining({
+        code: 'observer.source_link_budget_exceeded',
+        details: { limit: 'maxLinkedSources', maximum: 1 }
+      })])
+    });
+    expect(openSource).not.toHaveBeenCalled();
     session.close();
   });
 

@@ -108,14 +108,15 @@ const adoptQueryLogicalValue = (input: unknown, label: string): QueryLogicalValu
     seen.add(value);
     try {
       const descriptors = Object.getOwnPropertyDescriptors(value);
-      const keys = Reflect.ownKeys(value);
+      const keys = Reflect.ownKeys(descriptors);
       if (keys.some((key) => typeof key !== 'string')) throw new TypeError(label + ' contains a symbol key');
       if (Array.isArray(value)) {
-        if (value.length > defaultValueParseBudget.maxArrayMembers) throw new TypeError(label + ' exceeds the array-member budget');
-        totalMembers += value.length;
+        const length = descriptors.length?.value;
+        if (!Number.isSafeInteger(length) || length < 0 || length > defaultValueParseBudget.maxArrayMembers) throw new TypeError(label + ' contains an invalid or oversized array');
+        totalMembers += length;
         if (totalMembers > defaultValueParseBudget.maxTotalMembers) throw new TypeError(label + ' exceeds the total-member budget');
         const output: QueryLogicalValue[] = [];
-        for (let index = 0; index < value.length; index += 1) {
+        for (let index = 0; index < length; index += 1) {
           const descriptor = descriptors[String(index)];
           if (descriptor === undefined || !descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' contains a hostile array descriptor');
           output.push(visit(descriptor.value, depth + 1));

@@ -253,6 +253,55 @@ describe('production JSON-tree storage mappings', () => {
     });
   });
 
+  it('projects array position and adapter-provided element identity without inventing either', () => {
+    const prepared = prepareSchema({ relations: { links: {
+      relationId: 'test.link',
+      key: ['occurrenceId'],
+      fields: {
+        occurrenceId: { type: { kind: 'string' } },
+        order: { type: { kind: 'integer' } },
+        name: { type: { kind: 'string' } }
+      }
+    } } });
+    if (!prepared.success) throw new Error('schema fixture failed');
+    const mapping: StorageMappingBody = {
+      schema: schemaRef,
+      model: 'json-tree-v1',
+      relations: { 'test.link': {
+        collection: { kind: 'array', path: ['links'], absent: 'empty' },
+        keys: { occurrenceId: { kind: 'source-metadata', value: 'collection-element-identity' } },
+        fields: {
+          order: { kind: 'source-metadata', value: 'collection-position' },
+          name: { path: ['name'], write: { kind: 'read-only' } }
+        }
+      } }
+    };
+    const compiled = compileStorageMapping(mapping, schemaRef, prepared.value);
+    if (!compiled.success) throw new Error('mapping fixture failed');
+    expect(compileStorageMapping({
+      ...mapping,
+      relations: { 'test.link': {
+        ...mapping.relations['test.link']!,
+        keys: { occurrenceId: { kind: 'source-metadata', value: 'collection-position' } }
+      } }
+    }, schemaRef, prepared.value)).toMatchObject({
+      success: false,
+      issues: [{ code: 'mapping.key_invalid' }]
+    });
+
+    const unavailable = projectStorage(compiled.value, { links: [{ name: 'First' }] });
+    expect(unavailable).toMatchObject({
+      completeness: 'unknown',
+      issues: [{ code: 'mapping.source_metadata_unavailable' }]
+    });
+    expect(projectStorage(compiled.value, { links: [{ name: 'First' }, { name: 'Second' }] }, {
+      sourceMetadata: ({ locator }) => locator.kind === 'array-position' ? `element:${locator.index}` : undefined
+    }).relations.get('test.link')?.rows).toMatchObject([
+      { key: ['element:0'], row: { occurrenceId: 'element:0', order: 0, name: 'First' } },
+      { key: ['element:1'], row: { occurrenceId: 'element:1', order: 1, name: 'Second' } }
+    ]);
+  });
+
   it('rejects map-key mismatch, retains duplicate candidates for repair, and preserves unknown storage on edit', async () => {
     const { registry, schema } = await makeFixture();
     const mapping: StorageMappingBody = {

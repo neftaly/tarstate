@@ -107,6 +107,10 @@ const validateKeyMapping = (
     validateStoragePath(context, input.path, [...path, 'path']);
     return;
   }
+  if (input.kind === 'source-metadata') {
+    validateSourceMetadataMapping(context, input, path);
+    return;
+  }
   if (input.kind === 'literal') {
     semanticShape(context, input, ['kind', 'value'], [], path);
     return;
@@ -121,6 +125,10 @@ const validateFieldMapping = (
 ): void => {
   if (isSemanticRecord(input) && input.kind === 'absent') {
     semanticShape(context, input, ['kind'], [], path);
+    return;
+  }
+  if (isSemanticRecord(input) && input.kind === 'source-metadata') {
+    validateSourceMetadataMapping(context, input, path);
     return;
   }
   if (!semanticShape(context, input, ['path', 'write'], [], path)) return;
@@ -139,6 +147,20 @@ const validateFieldMapping = (
     return;
   }
   semanticInvalid(context, [...path, 'write', 'kind'], 'unknown_write_mapping');
+};
+
+const validateSourceMetadataMapping = (
+  context: SemanticValidationContext,
+  input: Readonly<Record<string, JsonValue>>,
+  path: readonly unknown[]
+): void => {
+  if (!semanticShape(context, input, ['kind', 'value'], [], path)) return;
+  semanticEnumValue(
+    context,
+    input.value,
+    ['collection-position', 'collection-element-identity'],
+    [...path, 'value']
+  );
 };
 
 const validateStoragePath = (

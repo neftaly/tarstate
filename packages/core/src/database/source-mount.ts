@@ -1,4 +1,5 @@
 import type { AttachmentCatalog } from '../database.js';
+import type { Issue } from '../issues.js';
 
 export type DatabaseSourceMountOptions = {
   readonly discoveryEdges?: readonly string[];
@@ -30,6 +31,14 @@ export type OpenLinkedDatabaseSourceRequest = {
   readonly signal: AbortSignal;
 };
 
+/** Structured adapter failure retained as source evidence by the following session. */
+export type FailedLinkedDatabaseSource = {
+  readonly state: 'failed';
+  readonly issues: readonly Issue[];
+};
+
+export type LinkedDatabaseSourceResolution = OwnedDatabaseSource | FailedLinkedDatabaseSource | undefined;
+
 export type OpenLinkedDatabaseSource = (
   request: OpenLinkedDatabaseSourceRequest
-) => OwnedDatabaseSource | undefined | Promise<OwnedDatabaseSource | undefined>;
+) => LinkedDatabaseSourceResolution | Promise<LinkedDatabaseSourceResolution>;

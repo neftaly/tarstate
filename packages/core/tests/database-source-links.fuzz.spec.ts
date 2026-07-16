@@ -52,3 +52,23 @@ propertyTest('source-link reachability matches an independent fixed-point walk',
     expect(built.graph?.targets).toEqual(expectedTargets);
   }
 ));
+
+propertyTest('source-link budgets are independent of reference input order', fc.property(
+  fc.array(edgeArbitrary, { maxLength: 60 }),
+  fc.record({
+    maxLinkedSources: fc.integer({ min: 0, max: 12 }),
+    maxDiscoveryEdges: fc.integer({ min: 0, max: 60 }),
+    maxDepth: fc.integer({ min: 0, max: 12 }),
+    maxTraversalSteps: fc.integer({ min: 0, max: 80 })
+  }),
+  (inputs, budget) => {
+    const parsed = parseDatabaseDiscoveryReferences(inputs.map((input, index) => ({
+      linkId: `link:${index}`,
+      originSourceId: `source:${input.origin}`,
+      targetSourceId: `source:${input.target}`,
+      expectation: input.required ? 'required' : 'optional'
+    })));
+    expect(buildDatabaseDiscoveryGraph(['source:0'], parsed.references, budget))
+      .toEqual(buildDatabaseDiscoveryGraph(['source:0'], [...parsed.references].reverse(), budget));
+  }
+));

@@ -13,7 +13,7 @@ export const mappedReadEntries = (
   valuePaths: readonly AutomergePath[]
 ): readonly AutomergePathFootprintEntry[] => {
   const collectionPath = mapping.collection.path as AutomergePath;
-  if (mapping.collection.kind === 'object-map') {
+  if (mapping.collection.kind === 'object-map' || mapping.collection.kind === 'array') {
     return Object.freeze([{ scope: 'subtree', path: collectionPath }]);
   }
   const entries: AutomergePathFootprintEntry[] = [{ scope: 'exact', path: collectionPath }];
@@ -30,10 +30,12 @@ export const mappedReadEntries = (
 export const mappedWriteEntries = (
   mapping: RelationStorageMapping
 ): readonly AutomergePathFootprintEntry[] => {
-  if (mapping.collection.kind === 'object-map') {
+  if (mapping.collection.kind === 'object-map' || mapping.collection.kind === 'array') {
     return [{ scope: 'subtree', path: mapping.collection.path as AutomergePath }];
   }
-  return Object.values(mapping.fields).flatMap((field) => field.kind !== 'absent' && field.write.kind === 'replace'
+  return Object.values(mapping.fields).flatMap((field) => field.kind !== 'absent'
+    && field.kind !== 'source-metadata'
+    && field.write.kind === 'replace'
     ? [{ scope: 'exact' as const, path: [...mapping.collection.path, ...field.path] as AutomergePath }]
     : []);
 };
@@ -59,6 +61,17 @@ export const locateProjectedCandidate = (
       ...(alternatives.length < 2
         ? {}
         : { collectionConflict: { code: 'automerge.conflict_observed', changeHashes: alternatives.map(([changeHash]) => changeHash) } })
+    };
+  }
+  if (mapping.collection.kind === 'array') {
+    if (locator.kind !== 'array-position') return { issue: 'mapping.locator_invalid' };
+    const collection = valueAtAutomergePath(doc, collectionPath);
+    if (!Array.isArray(collection) || locator.index >= collection.length) {
+      return { issue: 'mapping.locator_invalid' };
+    }
+    return {
+      candidate: collection[locator.index],
+      path: [...collectionPath, locator.index] as AutomergePath
     };
   }
   if (mapping.collection.kind !== 'object-map' || locator.kind !== 'object-map-key') {

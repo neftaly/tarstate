@@ -22,7 +22,8 @@ try {
   assertClosure('source/index.js', 100, []);
   assertClosure('values/index.js', 25_000, ['query', 'schema', 'transaction', 'database', 'memory-source']);
   assertClosure('attachment/index.js', 100, []);
-  assertClosure('attachment/adapter/index.js', 305_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  // Includes portable source-metadata projection for ordered/native-identity mappings.
+  assertClosure('attachment/adapter/index.js', 307_500, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
@@ -33,7 +34,7 @@ try {
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/session/index.js', 310_000, ['system-relations', 'transaction-executor']);
   // Explicit syntax walking keeps application JSON opaque at a small code-size cost.
-  assertClosure('database/incremental/index.js', 226_000, ['memory-source', 'system-relations', 'transaction-executor']);
+  assertClosure('database/incremental/index.js', 226_300, ['memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/external-store/index.js', 60_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('values/index.js', 15_000, [
     'artifact-resource-driver',

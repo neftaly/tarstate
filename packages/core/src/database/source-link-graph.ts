@@ -34,6 +34,18 @@ export type DatabaseDiscoveryGraph = {
   readonly targets: readonly DatabaseDiscoveryTarget[];
 };
 
+export type DatabaseDiscoveryBudget = {
+  readonly maxLinkedSources?: number;
+  readonly maxDiscoveryEdges?: number;
+  readonly maxDepth?: number;
+  readonly maxTraversalSteps?: number;
+};
+
+export type DatabaseDiscoveryBudgetExceeded = {
+  readonly limit: keyof DatabaseDiscoveryBudget;
+  readonly maximum: number;
+};
+
 export const parseDatabaseDiscoveryReferences = (
   rows: readonly unknown[]
 ): { readonly references: readonly NormalizedDatabaseDiscoveryReference[]; readonly problems: readonly DatabaseDiscoveryGraphProblem[] } => {
@@ -60,8 +72,20 @@ export const parseDatabaseDiscoveryReferences = (
 
 export const buildDatabaseDiscoveryGraph = (
   rootSourceIds: readonly string[],
-  references: readonly NormalizedDatabaseDiscoveryReference[]
-): { readonly graph?: DatabaseDiscoveryGraph; readonly problems: readonly DatabaseDiscoveryGraphProblem[] } => {
+  references: readonly NormalizedDatabaseDiscoveryReference[],
+  budget: DatabaseDiscoveryBudget = {}
+): {
+  readonly graph?: DatabaseDiscoveryGraph;
+  readonly problems: readonly DatabaseDiscoveryGraphProblem[];
+  readonly budgetExceeded?: DatabaseDiscoveryBudgetExceeded;
+} => {
+  const maxLinkedSources = budget.maxLinkedSources ?? Number.MAX_SAFE_INTEGER;
+  const maxDiscoveryEdges = budget.maxDiscoveryEdges ?? Number.MAX_SAFE_INTEGER;
+  const maxDepth = budget.maxDepth ?? Number.MAX_SAFE_INTEGER;
+  const maxTraversalSteps = budget.maxTraversalSteps ?? Number.MAX_SAFE_INTEGER;
+  if (references.length > maxTraversalSteps) {
+    return budgetFailure('maxTraversalSteps', maxTraversalSteps);
+  }
   const roots = new Set(rootSourceIds);
   const byOrigin = new Map<string, NormalizedDatabaseDiscoveryReference[]>();
   for (const reference of references) {
@@ -69,16 +93,40 @@ export const buildDatabaseDiscoveryGraph = (
     if (edges === undefined) byOrigin.set(reference.originSourceId, [reference]);
     else edges.push(reference);
   }
+  for (const edges of byOrigin.values()) edges.sort(compareEdges);
   const reachable = new Set(roots);
-  const queue = [...roots];
+  const queue = [...roots].sort(comparePortableStrings);
+  const depths = queue.map(() => 0);
   const reachableEdges: NormalizedDatabaseDiscoveryReference[] = [];
+  let linkedSourceCount = 0;
+  let traversalSteps = references.length;
   for (let index = 0; index < queue.length; index += 1) {
+    traversalSteps += 1;
+    if (traversalSteps > maxTraversalSteps) {
+      return budgetFailure('maxTraversalSteps', maxTraversalSteps);
+    }
     const origin = queue[index] as string;
+    const depth = depths[index] as number;
     for (const edge of byOrigin.get(origin) ?? []) {
+      traversalSteps += 1;
+      if (traversalSteps > maxTraversalSteps) {
+        return budgetFailure('maxTraversalSteps', maxTraversalSteps);
+      }
+      if (reachableEdges.length >= maxDiscoveryEdges) {
+        return budgetFailure('maxDiscoveryEdges', maxDiscoveryEdges);
+      }
       reachableEdges.push(edge);
       if (reachable.has(edge.targetSourceId)) continue;
+      if (depth >= maxDepth) return budgetFailure('maxDepth', maxDepth);
+      if (!roots.has(edge.targetSourceId)) {
+        if (linkedSourceCount >= maxLinkedSources) {
+          return budgetFailure('maxLinkedSources', maxLinkedSources);
+        }
+        linkedSourceCount += 1;
+      }
       reachable.add(edge.targetSourceId);
       queue.push(edge.targetSourceId);
+      depths.push(depth + 1);
     }
   }
 
@@ -136,6 +184,14 @@ export const buildDatabaseDiscoveryGraph = (
     problems: Object.freeze([])
   };
 };
+
+const budgetFailure = (
+  limit: keyof DatabaseDiscoveryBudget,
+  maximum: number
+): { readonly problems: readonly []; readonly budgetExceeded: DatabaseDiscoveryBudgetExceeded } => ({
+  problems: Object.freeze([]),
+  budgetExceeded: Object.freeze({ limit, maximum })
+});
 
 export const mergeDatabaseDiscoveryReferences = (
   retained: readonly NormalizedDatabaseDiscoveryReference[],

@@ -14,6 +14,7 @@ import {
   mergeDatabaseDiscoveryReferences,
   parseDatabaseDiscoveryReferences,
   sameDatabaseDiscoveryTarget,
+  type DatabaseDiscoveryBudget,
   type DatabaseDiscoveryGraphProblem,
   type DatabaseDiscoveryTarget,
   type NormalizedDatabaseDiscoveryReference
@@ -32,6 +33,7 @@ export type NormalizedFollowSourceLinks = {
   readonly plan: PreparedPlan<QueryNode>;
   readonly parameters: Readonly<Record<string, JsonValue>>;
   readonly openSource: OpenLinkedDatabaseSource;
+  readonly budget: DatabaseDiscoveryBudget;
 };
 
 export const normalizeFollowSourceLinks = (
@@ -45,6 +47,7 @@ export const normalizeFollowSourceLinks = (
     readonly plan?: unknown;
     readonly parameters?: unknown;
     readonly openSource?: unknown;
+    readonly budget?: unknown;
   };
   if (typeof candidate.openSource !== 'function') {
     throw new TypeError('followSourceLinks.openSource must be a function');
@@ -61,7 +64,8 @@ export const normalizeFollowSourceLinks = (
   return Object.freeze({
     plan,
     parameters: parseObservationParameters(candidate.parameters ?? {}),
-    openSource: candidate.openSource as OpenLinkedDatabaseSource
+    openSource: candidate.openSource as OpenLinkedDatabaseSource,
+    budget: normalizeDiscoveryBudget(candidate.budget)
   });
 };
 
@@ -81,6 +85,7 @@ export const followDatabaseSourceLinks = (options: {
   readonly sourceLinkMembership: DatasetMembership;
   readonly rootMembers: readonly DatasetMember[];
   readonly openSource: OpenLinkedDatabaseSource;
+  readonly budget: DatabaseDiscoveryBudget;
   readonly onDiagnostic?: ObserverDiagnosticReporter;
 }): DatabaseSourceLinkFollower => {
   const rootSourceIds = Object.freeze(options.rootMembers.map(({ sourceId }) => sourceId));
@@ -89,9 +94,12 @@ export const followDatabaseSourceLinks = (options: {
     attachmentId === sourceId ? [sourceId] : [attachmentId, sourceId]));
   let invalidEvidenceId = `tarstate:source-links:${options.membership.datasetId}`;
   while (reservedRootIds.has(invalidEvidenceId)) invalidEvidenceId += ':invalid';
+  let budgetEvidenceId = invalidEvidenceId + ':budget';
+  while (reservedRootIds.has(budgetEvidenceId)) budgetEvidenceId += ':budget';
   const linkedSources = new Map<string, LinkedSourceRecord>();
   let references: readonly NormalizedDatabaseDiscoveryReference[] = Object.freeze([]);
   let invalidIssue: Issue | undefined;
+  let budgetIssue: Issue | undefined;
   let closed = false;
   let reconciling = false;
   let reconcileAgain = false;
@@ -130,6 +138,15 @@ export const followDatabaseSourceLinks = (options: {
         expectation: 'required',
         discoveryEdges: [],
         sourceAvailability: { state: 'failed', issues: [invalidIssue] }
+      });
+    }
+    if (includeInvalidIssue && budgetIssue !== undefined) {
+      members.push({
+        attachmentId: budgetEvidenceId,
+        sourceId: budgetEvidenceId,
+        expectation: 'required',
+        discoveryEdges: [],
+        sourceAvailability: { state: 'limited', issues: [budgetIssue] }
       });
     }
     return { members, loading };
@@ -223,6 +240,16 @@ export const followDatabaseSourceLinks = (options: {
           failRecord(record, 'observer.linked_source_unavailable', { reason: 'source_unavailable' });
           return;
         }
+        if (isFailedLinkedDatabaseSource(source)) {
+          if (!recordIsCurrent(record)) return;
+          record.state = 'failed';
+          record.issues = Object.freeze(source.issues.map((issue) => createIssue({
+            ...issue,
+            sourceId: record.target.sourceId
+          })));
+          publishMembership();
+          return;
+        }
         if (!isOwnedDatabaseSource(source)) {
           if (!recordIsCurrent(record)) return;
           failRecord(record, 'observer.linked_source_resolution_failed', {
@@ -314,6 +341,7 @@ export const followDatabaseSourceLinks = (options: {
   };
 
   const rejectGraph = (problems: readonly DatabaseDiscoveryGraphProblem[]): void => {
+    budgetIssue = undefined;
     invalidIssue = createIssue({
       code: 'observer.source_link_invalid',
       retry: 'after_input',
@@ -330,6 +358,7 @@ export const followDatabaseSourceLinks = (options: {
         issues.map(({ id }) => id)));
       if (current.issues.some(({ code, id }) =>
         code === 'observer.evaluation_failed' && !sourceIssueIds.has(id))) {
+        budgetIssue = undefined;
         invalidIssue = createIssue({
           code: 'observer.source_link_invalid',
           retry: 'after_refresh',
@@ -368,7 +397,21 @@ export const followDatabaseSourceLinks = (options: {
       return;
     }
     const nextReferences = merged.references;
-    const built = buildDatabaseDiscoveryGraph(rootSourceIds, nextReferences);
+    const built = buildDatabaseDiscoveryGraph(rootSourceIds, nextReferences, options.budget);
+    if (built.budgetExceeded !== undefined) {
+      references = nextReferences;
+      lastProcessedRows = current.rows;
+      lastProcessedCompleteness = current.completeness;
+      lastUnavailableOrigins = unavailableOrigins;
+      invalidIssue = undefined;
+      budgetIssue = createIssue({
+        code: 'observer.source_link_budget_exceeded',
+        retry: 'after_input',
+        details: built.budgetExceeded
+      });
+      reconcileTargets([], true);
+      return;
+    }
     if (built.graph === undefined) {
       rejectGraph(built.problems);
       return;
@@ -377,7 +420,9 @@ export const followDatabaseSourceLinks = (options: {
       const attachmentId = target.attachmentId ?? target.sourceId;
       return rootAttachmentIds.has(attachmentId)
         || attachmentId === invalidEvidenceId
-        || target.sourceId === invalidEvidenceId;
+        || target.sourceId === invalidEvidenceId
+        || attachmentId === budgetEvidenceId
+        || target.sourceId === budgetEvidenceId;
     });
     if (conflictingTarget !== undefined) {
       rejectGraph([{
@@ -391,8 +436,9 @@ export const followDatabaseSourceLinks = (options: {
     lastProcessedRows = current.rows;
     lastProcessedCompleteness = current.completeness;
     lastUnavailableOrigins = unavailableOrigins;
-    const recovered = invalidIssue !== undefined;
+    const recovered = invalidIssue !== undefined || budgetIssue !== undefined;
     invalidIssue = undefined;
+    budgetIssue = undefined;
     reconcileTargets(built.graph.targets, recovered);
   };
 
@@ -433,11 +479,48 @@ export const followDatabaseSourceLinks = (options: {
   });
 };
 
+const normalizeDiscoveryBudget = (input: unknown): DatabaseDiscoveryBudget => {
+  if (input === undefined) return Object.freeze({});
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('followSourceLinks.budget must be an object');
+  }
+  const budget = input as Readonly<Record<string, unknown>>;
+  if (Object.keys(budget).some((key) => !discoveryBudgetFields.includes(key as typeof discoveryBudgetFields[number]))) {
+    throw new TypeError('followSourceLinks.budget has an unknown field');
+  }
+  const normalized: Record<string, number> = {};
+  for (const key of discoveryBudgetFields) {
+    const value = budget[key];
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+      throw new TypeError(`followSourceLinks.budget.${key} must be a non-negative safe integer`);
+    }
+    normalized[key] = value as number;
+  }
+  return Object.freeze(normalized);
+};
+
+const discoveryBudgetFields = [
+  'maxLinkedSources',
+  'maxDiscoveryEdges',
+  'maxDepth',
+  'maxTraversalSteps'
+] as const;
+
 const isOwnedDatabaseSource = (input: unknown): input is OwnedDatabaseSource =>
   input !== null
   && (typeof input === 'object' || typeof input === 'function')
   && typeof (input as { readonly mount?: unknown }).mount === 'function'
   && typeof (input as { readonly close?: unknown }).close === 'function';
+
+const isFailedLinkedDatabaseSource = (
+  input: unknown
+): input is { readonly state: 'failed'; readonly issues: readonly Issue[] } =>
+  input !== null
+  && typeof input === 'object'
+  && (input as { readonly state?: unknown }).state === 'failed'
+  && Array.isArray((input as { readonly issues?: unknown }).issues)
+  && (input as { readonly issues: readonly unknown[] }).issues.length > 0;
 
 const sameStringSet = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean => {
   if (left.size !== right.size) return false;

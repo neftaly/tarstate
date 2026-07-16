@@ -445,8 +445,8 @@ const requiredCommitDataValue = (descriptors: DataDescriptors, key: string, labe
 
 const inspectCommitArray = (input: unknown, label: string): readonly unknown[] => {
   if (!Array.isArray(input)) throw new TypeError(label + ' must be an array');
-  const descriptors = Object.getOwnPropertyDescriptors(input);
-  const length = (Reflect.get(descriptors, 'length') as PropertyDescriptor | undefined)?.value;
+  const descriptors = Object.getOwnPropertyDescriptors(input) as DataDescriptors;
+  const length = descriptors.length?.value;
   if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError(label + ' has a hostile length');
   const output: unknown[] = [];
   for (let index = 0; index < length; index += 1) {
@@ -530,9 +530,9 @@ const cloneAndFreezeEvidence = (value: unknown, seen = new WeakMap<object, objec
   if (value === null || typeof value !== 'object') return value;
   const existing = seen.get(value);
   if (existing !== undefined) return existing;
-  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const descriptors = Object.getOwnPropertyDescriptors(value) as DataDescriptors;
   if (Array.isArray(value)) {
-    const length = (Reflect.get(descriptors, 'length') as PropertyDescriptor | undefined)?.value;
+    const length = descriptors.length?.value;
     if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) throw new TypeError('Automerge commit evidence has a hostile array length');
     const output: unknown[] = [];
     seen.set(value, output);

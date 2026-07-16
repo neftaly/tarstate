@@ -364,7 +364,9 @@ const mappingCapabilities = (mapping: CompiledStorageMapping): readonly Capabili
   const capabilities = new Map<string, CapabilityRef>();
   for (const { mapping: relation } of mapping.relations.values()) {
     for (const field of Object.values(relation.fields)) {
-      if (field.kind === 'absent' || field.write.kind !== 'replace') continue;
+      if (field.kind === 'absent'
+        || field.kind === 'source-metadata'
+        || field.write.kind !== 'replace') continue;
       const ref = field.write.capability;
       capabilities.set(stringTupleKey(ref.id, ref.version, ref.contractHash), ref);
     }
@@ -381,7 +383,9 @@ const preparedAttachmentRelations = (
     const replaceableFields = mapped === undefined
       ? Object.keys(relation.declaration.fields).filter((field) => !relation.declaration.key.includes(field))
       : Object.entries(mapped.mapping.fields)
-        .filter(([, field]) => field.kind !== 'absent' && field.write.kind === 'replace')
+        .filter(([, field]) => field.kind !== 'absent'
+          && field.kind !== 'source-metadata'
+          && field.write.kind === 'replace')
         .map(([field]) => field);
     return [relationId, Object.freeze({
       relationId,

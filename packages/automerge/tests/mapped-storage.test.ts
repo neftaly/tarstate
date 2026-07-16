@@ -50,6 +50,10 @@ type ForeignTextFileDoc = {
   content: Automerge.ImmutableString;
 };
 
+type LinkDoc = {
+  links: { id?: string; name: string }[];
+};
+
 const hash = (digit: string): `sha256:${string}` => `sha256:${digit.repeat(64)}`;
 
 const fixture = async (doc: TaskDoc = {
@@ -208,11 +212,136 @@ const immutableTextSingletonFixture = async () => {
   return { runtime, source, binding };
 };
 
+const arrayFixture = async (identity: 'source' | 'field') => {
+  const registry = new CapabilityRegistry(`registry:array:${identity}`);
+  await registerBuiltInCapabilities(registry);
+  registry.registerImplementation({
+    ref: builtInCapabilityRefs.fieldReplace,
+    integrity: 'builtin:test',
+    implementation: Object.freeze({ kind: 'field-replace' })
+  });
+  const schemaArtifact = await sealSchema({ id: `urn:test:array-schema:${identity}`, body: {
+    relations: { links: {
+      relationId: 'relation:links',
+      key: ['id'],
+      fields: {
+        id: { type: { kind: 'string' } },
+        name: { type: { kind: 'string' } },
+        order: { type: { kind: 'integer' }, optional: true }
+      }
+    } }
+  } });
+  const schemaRef = { id: schemaArtifact.id, contentHash: schemaArtifact.contentHash };
+  const schema = prepareSchema(schemaArtifact.body, registry);
+  if (!schema.success) throw new Error('array schema fixture failed');
+  const body: StorageMappingBody = {
+    schema: schemaRef,
+    model: 'json-tree-v1',
+    relations: { 'relation:links': {
+      collection: { kind: 'array', path: ['links'], absent: 'creatable' },
+      keys: {
+        id: identity === 'source'
+          ? { kind: 'source-metadata', value: 'collection-element-identity' }
+          : { kind: 'field', path: ['id'] }
+      },
+      fields: {
+        name: { path: ['name'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+        order: identity === 'source'
+          ? { kind: 'source-metadata', value: 'collection-position' }
+          : { kind: 'absent' }
+      }
+    } }
+  };
+  const compiled = compileStorageMapping(body, schemaRef, schema.value, registry);
+  if (!compiled.success) throw new Error('array mapping fixture failed');
+  const doc = identity === 'source'
+    ? { links: [{ name: 'First' }, { name: 'Second' }] }
+    : { links: [{ id: 'first', name: 'First' }, { id: 'second', name: 'Second' }] };
+  const runtime = new AutomergeSourceRuntime<LinkDoc>({
+    sourceId: `source:array:${identity}`,
+    doc: Automerge.from<LinkDoc>(doc)
+  });
+  const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:mapped' });
+  const binding = new AutomergeMappedStorageBinding<LinkDoc>({
+    id: `binding:array:${identity}`,
+    mapping: compiled.value,
+    registry
+  });
+  return { runtime, source, binding };
+};
+
 const commit = (basis: JsonValue, operationId: string, digit: string) => ({
   operationEpoch: 'epoch:mapped', operationId, expectedBasis: basis, intentHash: hash(digit)
 });
 
 describe('compiled-mapping-backed Automerge storage binding', () => {
+  it('projects stable source identity and retargets an edit after array positions shift', async () => {
+    const { runtime, source, binding } = await arrayFixture('source');
+    const initial = binding.project(source.snapshot());
+    expect(initial).toMatchObject({
+      completeness: 'exact',
+      rows: [
+        { fields: { name: 'First', order: 0 } },
+        { fields: { name: 'Second', order: 1 } }
+      ]
+    });
+    const second = initial.rows[1]!;
+    const occurrenceId = second.key[0];
+    runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
+      draft.links.unshift({ name: 'Before' });
+    }));
+    const shifted = binding.project(source.snapshot());
+    expect(shifted.rows.find(({ key }) => key[0] === occurrenceId)).toMatchObject({
+      fields: { name: 'Second', order: 2 }
+    });
+
+    const replaced = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{
+        kind: 'replace-fields',
+        relationId: second.relationId,
+        key: second.key as JsonValue,
+        locator: second.locator as unknown as JsonValue,
+        fields: { name: 'Changed' }
+      }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:shifted-array-edit', '8')
+    });
+    expect(replaced.outcome).toBe('committed');
+    expect(runtime.snapshot().storage.links.map(({ name }) => name)).toEqual(['Before', 'First', 'Changed']);
+    source.close();
+  });
+
+  it('inserts and deletes explicitly keyed array rows through the ordinary binding path', async () => {
+    const { runtime, source, binding } = await arrayFixture('field');
+    const inserted = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{ kind: 'insert', relationId: 'relation:links', key: ['third'], fields: { name: 'Third' } }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:array-insert', '7')
+    });
+    expect(inserted.outcome).toBe('committed');
+    expect(runtime.snapshot().storage.links.at(-1)).toEqual({ id: 'third', name: 'Third' });
+
+    await expect(coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{ kind: 'insert', relationId: 'relation:links', key: ['third'], fields: { name: 'Duplicate' } }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:duplicate-array-insert', '5')
+    })).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'transaction.upsert_conflict' }] });
+
+    const third = binding.project(source.snapshot()).rows.find(({ key }) => key[0] === 'third')!;
+    const deleted = await coordinateSourceCommit({
+      source,
+      bindings: [binding],
+      edits: [{ kind: 'delete', relationId: third.relationId, key: third.key as JsonValue, locator: third.locator as unknown as JsonValue }],
+      commit: commit(source.snapshot().basis as JsonValue, 'operation:array-delete', '6')
+    });
+    expect(deleted.outcome).toBe('committed');
+    expect(runtime.snapshot().storage.links.map(({ id }) => id)).toEqual(['first', 'second']);
+    source.close();
+  });
+
   it('reads a foreign immutable string as logical text without making it writable', async () => {
     const { source, binding } = await immutableTextSingletonFixture();
     const projection = binding.project(source.snapshot());

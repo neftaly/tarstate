@@ -20,7 +20,7 @@ export type DatasetMember = {
   readonly expectation: 'required' | 'optional';
   readonly discoveryEdges: readonly string[];
   readonly sourceAvailability?: {
-    readonly state: 'loading' | 'missing' | 'failed';
+    readonly state: 'loading' | 'missing' | 'failed' | 'limited';
     readonly issues: readonly Issue[];
   };
 };

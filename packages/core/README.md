@@ -181,6 +181,12 @@ const session = await openDatabaseQuery({
   queryAuthorityScope: authorityScope,
   followSourceLinks: {
     plan: sourceLinkPlan,
+    budget: {
+      maxLinkedSources: 1_000,
+      maxDiscoveryEdges: 4_000,
+      maxDepth: 32,
+      maxTraversalSteps: 10_000
+    },
     openSource: ({ sourceId, attachmentId, signal }) =>
       sourceStore.open({ sourceId, attachmentId, signal })
   }
@@ -201,6 +207,13 @@ incomplete while it opens and invalid if resolution fails. Removing the
 last reachable link aborts pending work and closes its mounted subtree. The
 source-link query and application query must use the same dataset, registry,
 and authority fingerprints.
+
+The graph budget is evaluated before opening sources and is independent of
+asynchronous completion order. Exceeding it produces `limited` source evidence
+and an incomplete result, never a silently truncated graph. An adapter that
+already has parse or policy issues may return `{ state: 'failed', issues }`
+from `openSource`; Tarstate retains those issues under the linked source.
+Thrown exceptions remain generic opening failures.
 
 Portable bytes remain tagged base64url values at relational boundaries. Use
 `safeMaterializePortableBytes(value)` from `@tarstate/core/values` when a host

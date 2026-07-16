@@ -25,6 +25,10 @@ type FileDocument = {
   content: Uint8Array;
 };
 
+type OrderedTaskDocument = {
+  tasks: { id: string; title: string }[];
+};
+
 describe('standard Automerge database', () => {
   it('rejects invalid database identities before reading metadata', async () => {
     const repo = new Repo();
@@ -220,6 +224,59 @@ describe('standard Automerge database', () => {
     )).resolves.toMatchObject({ outcome: 'committed' });
     expect([...(handle.doc()?.content ?? [])]).toEqual([4, 5]);
     expect(handle.doc()?.['@patchpit']).toEqual({ type: 'file-content' });
+    opened.value.close();
+    await repo.shutdown();
+  });
+
+  it('opens and updates an explicitly keyed array through the standard database API', async () => {
+    const schema = await sealSchema({ id: 'urn:test:ordered-task:schema', body: {
+      relations: { tasks: {
+        relationId: 'ordered-tasks',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string' } },
+          title: { type: { kind: 'string' } }
+        }
+      } }
+    } });
+    const mapping = await sealStorageMapping({ id: 'urn:test:ordered-task:mapping', body: {
+      schema: reference(schema),
+      model: 'json-tree-v1',
+      relations: { 'ordered-tasks': {
+        collection: { kind: 'array', path: ['tasks'], absent: 'creatable' },
+        keys: { id: { kind: 'field', path: ['id'] } },
+        fields: {
+          title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+        }
+      } }
+    } });
+    const repo = new Repo();
+    const handle = repo.create<OrderedTaskDocument>({
+      tasks: [{ id: 'first', title: 'First' }, { id: 'second', title: 'Second' }]
+    });
+    const opened = await openAutomergeDatabase({
+      handle,
+      declaration: {
+        formatVersion: 1,
+        storageSchema: reference(schema),
+        projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
+      },
+      embeddedArtifacts: [schema, mapping],
+      authorityScope: 'scope:test'
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const tasks = relationLiteral(schema, 'tasks');
+    await expect(opened.value.transact(
+      { kind: 'replace-ordered-tasks' },
+      (snapshot) => snapshot.withRows(tasks, [
+        ...snapshot.rows(tasks).filter(({ id }) => id !== 'first'),
+        { id: 'third', title: 'Third' }
+      ])
+    )).resolves.toMatchObject({ outcome: 'committed' });
+    expect(handle.doc()?.tasks).toEqual([
+      { id: 'second', title: 'Second' },
+      { id: 'third', title: 'Third' }
+    ]);
     opened.value.close();
     await repo.shutdown();
   });

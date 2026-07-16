@@ -41,8 +41,8 @@ const cases = [
     name: 'source-link database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // Optional fixed-point traversal and settlement coordination are lazy
-    // chunks and remain bounded too.
-    maxGzipBytes: 47_350
+    // chunks and include deterministic graph budgets plus structured failures.
+    maxGzipBytes: 47_900
   },
   {
     name: 'query expression evaluator',

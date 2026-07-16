@@ -125,6 +125,33 @@ immutable text without upgrading its write capability or exposing an
 Automerge-specific logical type. If a mapping deliberately enables replacement,
 the replacement is written as an ordinary Automerge string.
 
+Array mappings may expose current order and stable Automerge element identity
+without adding properties to a foreign document:
+
+```ts
+{
+  collection: { kind: 'array', path: ['docs'], absent: 'empty' },
+  keys: {
+    occurrenceId: {
+      kind: 'source-metadata',
+      value: 'collection-element-identity'
+    }
+  },
+  fields: {
+    order: { kind: 'source-metadata', value: 'collection-position' },
+    name: { path: ['name'], write: { kind: 'read-only' } }
+  }
+}
+```
+
+Portable JSON projection can derive collection position but reports source
+identity as unavailable unless its adapter supplies one. Source metadata is
+read-only, and collection position cannot be used as a logical key. Arrays
+with an explicit stored key support ordinary append insertion, field edits,
+and deletion. Tarstate does not advertise identity-preserving reorder because
+Automerge has no native object move; changing only the row array passed to
+`withRows` remains a relational no-op.
+
 `getSnapshot` and `subscribe` form a synchronous external-store boundary. The
 snapshot reports readiness, exactness, freshness, source lifecycle, basis, and
 issues; its logical row array retains identity while the mapped projection is

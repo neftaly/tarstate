@@ -233,6 +233,23 @@ describe('production query oracle', () => {
     expect(scopeCalls).toBe(0);
   });
 
+  it('adopts descriptor-safe proxy data without reading through the proxy', () => {
+    let reads = 0;
+    const labels = new Proxy(['original'], {
+      get: () => {
+        reads += 1;
+        throw new Error('query ownership read through a proxy');
+      }
+    });
+    const result = evaluateQuery({
+      root: from('people', 'person'),
+      relations: [relation('people', [{ id: 1, labels }])]
+    });
+
+    expect(result.rows).toEqual([{ id: 1, labels: ['original'] }]);
+    expect(reads).toBe(0);
+  });
+
   it('detaches and freezes pure query inputs and visible results', () => {
     const nested = { labels: ['original'] };
     const source = { id: 1, nested };
