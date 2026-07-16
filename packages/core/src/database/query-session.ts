@@ -24,6 +24,7 @@ export type {
   DatabaseSourceMountLease,
   DatabaseSourceMountOptions,
   MountableDatabaseSource,
+  OwnedDatabaseSource,
   OpenLinkedDatabaseSource,
   OpenLinkedDatabaseSourceRequest
 } from './source-mount.js';
@@ -84,7 +85,7 @@ export type FollowDatabaseSourceLinksOptions<
 > = {
   /** Query rows describe links from an attached source to another source. */
   readonly plan: SourceLinkPlan<LinkPlan>;
-  /** Host-owned source opening; Tarstate owns mounting, cancellation, and cleanup. */
+  /** Opens a new owned source; Tarstate closes it when its last reachable link ends. */
   readonly openSource: OpenLinkedDatabaseSource;
 } & SessionParameterOptions<LinkPlan>;
 

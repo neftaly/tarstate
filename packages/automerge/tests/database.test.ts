@@ -3,7 +3,10 @@ import { Repo } from '@automerge/automerge-repo';
 import { builtInCapabilityRefs } from '@tarstate/core/capabilities';
 import { sealConstraintSet } from '@tarstate/core/artifacts/constraint-set';
 import { AttachmentCatalog } from '@tarstate/core/database';
-import { openDatabaseQuery } from '@tarstate/core/database/session';
+import {
+  openDatabaseQuery,
+  type OwnedDatabaseSource
+} from '@tarstate/core/database/session';
 import type { QueryNode } from '@tarstate/core/query/model';
 import { prepareQuery } from '@tarstate/core/query/prepare';
 import { relationLiteral, sealSchema, sealStorageMapping } from '@tarstate/core/schema';
@@ -85,6 +88,74 @@ describe('standard Automerge database', () => {
     expect(fixture.database.getSnapshot()).toEqual({ state: 'closed' });
     expect(catalog.list()).toHaveLength(0);
     await fixture.repo.shutdown();
+  });
+
+  it('transfers an opened linked database lifetime while keeping the root caller-owned', async () => {
+    const child = await openTaskDatabase();
+    const root = await openTaskDatabase({ initialTitle: child.handle.url });
+    const taskRelation = {
+      schemaView: reference(root.schema),
+      relationId: 'tasks'
+    };
+    const common = {
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'workspace'
+    } as const;
+    const linkPlan = await prepareQuery({
+      ...common,
+      root: {
+        kind: 'select',
+        input: {
+          kind: 'where',
+          input: { kind: 'from', relation: taskRelation, alias: 'task' },
+          predicate: {
+            kind: 'compare',
+            op: 'eq',
+            left: { kind: 'field', alias: 'task', name: 'title' },
+            right: { kind: 'literal', value: child.handle.url }
+          }
+        },
+        alias: 'link',
+        fields: {
+          linkId: { kind: 'field', alias: 'task', name: 'id' },
+          originSourceId: { kind: 'source-of', alias: 'task' },
+          targetSourceId: { kind: 'field', alias: 'task', name: 'title' },
+          expectation: { kind: 'literal', value: 'required' }
+        }
+      } satisfies QueryNode
+    });
+    const itemPlan = await prepareQuery({
+      ...common,
+      root: {
+        kind: 'select',
+        input: { kind: 'from', relation: taskRelation, alias: 'task' },
+        alias: 'item',
+        fields: { id: { kind: 'field', alias: 'task', name: 'id' } }
+      }
+    });
+    const openSource = vi.fn((): OwnedDatabaseSource => child.database);
+    const session = await openDatabaseQuery({
+      sources: [{ source: root.database }],
+      plan: itemPlan,
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: { plan: linkPlan, openSource }
+    });
+
+    await vi.waitFor(() => expect(openSource).toHaveBeenCalledOnce());
+    expect(child.database.getSnapshot()).toMatchObject({ state: 'open' });
+
+    await expect(root.database.transact(
+      { kind: 'remove-link' },
+      (snapshot) => snapshot.withRows(root.tasks, [])
+    )).resolves.toMatchObject({ outcome: 'committed' });
+    await vi.waitFor(() => expect(child.database.getSnapshot()).toEqual({ state: 'closed' }));
+
+    session.close();
+    expect(root.database.getSnapshot()).toMatchObject({ state: 'open' });
+    root.database.close();
+    await child.repo.shutdown();
+    await root.repo.shutdown();
   });
 
   it('opens and updates a native-byte root singleton through the standard database API', async () => {

@@ -186,9 +186,11 @@ const session = await openDatabaseQuery({
 });
 ```
 
-The opener only translates portable source identity into a mountable source.
-Tarstate owns fixed-point traversal, deduplication, cycles, readiness,
-cancellation, and cleanup. A required link makes the application query
+The opener translates portable source identity into a newly opened source with
+`mount()` and idempotent `close()` methods. Its lifetime transfers to the
+session; Tarstate owns fixed-point traversal, deduplication, cycles, readiness,
+cancellation, mount detachment, and source cleanup. Explicit root sources remain
+caller-owned. A required link makes the application query
 incomplete while it opens and invalid if resolution fails. Removing the
 last reachable link aborts pending work and closes its mounted subtree. The
 source-link query and application query must use the same dataset, registry,

@@ -3,7 +3,7 @@ import type { AttachmentCatalog, ObservableSource, SourceSnapshot } from '../src
 import {
   openDatabaseQuery,
   type DatabaseSourceMountLease,
-  type MountableDatabaseSource,
+  type OwnedDatabaseSource,
   type OpenLinkedDatabaseSourceRequest
 } from '../src/database/query-session.js';
 import { prepareManualReadOnlyAttachment } from '../src/attachment/preparation.js';
@@ -34,7 +34,8 @@ const createMutableSource = (input: {
   let storage = input.storage;
   let revision = 0;
   const listeners = new Set<() => void>();
-  const close = vi.fn();
+  const closeMount = vi.fn();
+  const closeSource = vi.fn();
   const source: ObservableSource<Storage> = {
     sourceId: input.sourceId,
     snapshot: (): SourceSnapshot<Storage> => ({
@@ -51,7 +52,7 @@ const createMutableSource = (input: {
       return () => { listeners.delete(listener); };
     }
   };
-  const mountable: MountableDatabaseSource = {
+  const mountable: OwnedDatabaseSource = {
     mount: (catalog: AttachmentCatalog, options = {}) => {
       const lease = catalog.attach({
         attachmentId: input.attachmentId,
@@ -93,15 +94,17 @@ const createMutableSource = (input: {
         sourceId: input.sourceId,
         discoveryEdges: options.discoveryEdges ?? [],
         close: () => {
-          close();
+          closeMount();
           lease.close();
         }
       };
-    }
+    },
+    close: closeSource
   };
   return {
     source: mountable,
-    close,
+    closeMount,
+    closeSource,
     replace(next: Storage): void {
       storage = next;
       revision += 1;
@@ -184,9 +187,9 @@ describe('database source links', () => {
       relations,
       storage: { links: [], items: [{ id: 'late-item' }] }
     });
-    const childOpening = deferred<MountableDatabaseSource | undefined>();
-    const fileOpening = deferred<MountableDatabaseSource | undefined>();
-    const lateOpening = deferred<MountableDatabaseSource | undefined>();
+    const childOpening = deferred<OwnedDatabaseSource | undefined>();
+    const fileOpening = deferred<OwnedDatabaseSource | undefined>();
+    const lateOpening = deferred<OwnedDatabaseSource | undefined>();
     const openSource = vi.fn((request: OpenLinkedDatabaseSourceRequest) => {
       if (request.sourceId === 'child') return childOpening.promise;
       if (request.sourceId === 'file') return fileOpening.promise;
@@ -256,16 +259,23 @@ describe('database source links', () => {
       state: 'open',
       current: { readiness: 'ready', rows: [{ id: 'root-item' }] }
     }));
-    expect(child.close).toHaveBeenCalledOnce();
-    expect(file.close).toHaveBeenCalledOnce();
-    expect(late.close).toHaveBeenCalledOnce();
+    expect(child.closeMount).toHaveBeenCalledOnce();
+    expect(child.closeSource).toHaveBeenCalledOnce();
+    expect(file.closeMount).toHaveBeenCalledOnce();
+    expect(file.closeSource).toHaveBeenCalledOnce();
+    expect(late.closeMount).toHaveBeenCalledOnce();
+    expect(late.closeSource).toHaveBeenCalledOnce();
 
     unsubscribe();
     session.close();
-    expect(root.close).toHaveBeenCalledOnce();
-    expect(child.close).toHaveBeenCalledOnce();
-    expect(file.close).toHaveBeenCalledOnce();
-    expect(late.close).toHaveBeenCalledOnce();
+    expect(root.closeMount).toHaveBeenCalledOnce();
+    expect(root.closeSource).not.toHaveBeenCalled();
+    expect(child.closeMount).toHaveBeenCalledOnce();
+    expect(child.closeSource).toHaveBeenCalledOnce();
+    expect(file.closeMount).toHaveBeenCalledOnce();
+    expect(file.closeSource).toHaveBeenCalledOnce();
+    expect(late.closeMount).toHaveBeenCalledOnce();
+    expect(late.closeSource).toHaveBeenCalledOnce();
   });
 
   it('deduplicates source opens, retains cycles, and aborts obsolete work', async () => {
@@ -282,7 +292,7 @@ describe('database source links', () => {
         items: []
       }
     });
-    const childOpening = deferred<MountableDatabaseSource | undefined>();
+    const childOpening = deferred<OwnedDatabaseSource | undefined>();
     let childRequest: OpenLinkedDatabaseSourceRequest | undefined;
     const session = await openDatabaseQuery({
       sources: [{ source: root.source }],
@@ -315,11 +325,64 @@ describe('database source links', () => {
     childOpening.resolve(stale.source);
     await Promise.resolve();
     await Promise.resolve();
-    expect(stale.close).not.toHaveBeenCalled();
+    expect(stale.closeMount).not.toHaveBeenCalled();
+    expect(stale.closeSource).toHaveBeenCalledOnce();
     expect(session.getSnapshot()).toMatchObject({ state: 'open', current: { readiness: 'ready' } });
 
     session.close();
-    expect(root.close).toHaveBeenCalledOnce();
+    expect(root.closeMount).toHaveBeenCalledOnce();
+    expect(root.closeSource).not.toHaveBeenCalled();
+  });
+
+  it('keeps one owned source until its last reachable edge disappears', async () => {
+    const { relations, linkPlan, itemPlan } = await setup();
+    const firstLink = {
+      linkId: 'root-child-a',
+      originSourceId: 'root',
+      targetSourceId: 'child',
+      expectation: 'required'
+    };
+    const secondLink = { ...firstLink, linkId: 'root-child-b' };
+    const root = createMutableSource({
+      sourceId: 'root',
+      attachmentId: 'attachment:root',
+      relations,
+      storage: { links: [firstLink, secondLink], items: [] }
+    });
+    const child = createMutableSource({
+      sourceId: 'child',
+      attachmentId: 'attachment:child',
+      relations,
+      storage: { links: [], items: [{ id: 'child-item' }] }
+    });
+    const openSource = vi.fn(() => child.source);
+    const session = await openDatabaseQuery({
+      sources: [{ source: root.source }],
+      plan: itemPlan,
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: { plan: linkPlan, openSource }
+    });
+
+    await vi.waitFor(() => expect(session.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', rows: [{ id: 'child-item' }] }
+    }));
+    expect(openSource).toHaveBeenCalledOnce();
+
+    root.replace({ links: [secondLink], items: [] });
+    await vi.waitFor(() => expect(session.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', rows: [{ id: 'child-item' }] }
+    }));
+    expect(child.closeMount).not.toHaveBeenCalled();
+    expect(child.closeSource).not.toHaveBeenCalled();
+
+    root.replace({ links: [], items: [] });
+    await vi.waitFor(() => expect(child.closeSource).toHaveBeenCalledOnce());
+    expect(child.closeMount).toHaveBeenCalledOnce();
+    session.close();
+    expect(child.closeMount).toHaveBeenCalledOnce();
+    expect(child.closeSource).toHaveBeenCalledOnce();
   });
 
   it('keeps unavailable and failed linked sources distinct', async () => {
@@ -369,6 +432,53 @@ describe('database source links', () => {
     }));
 
     session.close();
+  });
+
+  it('closes an owned source after mount failure and never mounts an unowned result', async () => {
+    const { relations, linkPlan, itemPlan } = await setup();
+    const root = createMutableSource({
+      sourceId: 'root',
+      attachmentId: 'attachment:root',
+      relations,
+      storage: {
+        links: [
+          { linkId: 'throws', originSourceId: 'root', targetSourceId: 'throws', expectation: 'required' },
+          { linkId: 'unowned', originSourceId: 'root', targetSourceId: 'unowned', expectation: 'required' }
+        ],
+        items: []
+      }
+    });
+    const closeFailedSource = vi.fn();
+    const failedSource: OwnedDatabaseSource = {
+      mount: () => { throw new Error('mount failed'); },
+      close: closeFailedSource
+    };
+    const mountUnownedSource = vi.fn();
+    const unownedSource = { mount: mountUnownedSource } as unknown as OwnedDatabaseSource;
+    const session = await openDatabaseQuery({
+      sources: [{ source: root.source }],
+      plan: itemPlan,
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: {
+        plan: linkPlan,
+        openSource: ({ sourceId }) => sourceId === 'throws' ? failedSource : unownedSource
+      }
+    });
+
+    await vi.waitFor(() => expect(session.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: {
+        readiness: 'invalid',
+        sourceStates: expect.arrayContaining([
+          expect.objectContaining({ sourceId: 'throws', state: 'failed' }),
+          expect.objectContaining({ sourceId: 'unowned', state: 'failed' })
+        ])
+      }
+    }));
+    expect(closeFailedSource).toHaveBeenCalledOnce();
+    expect(mountUnownedSource).not.toHaveBeenCalled();
+    session.close();
+    expect(closeFailedSource).toHaveBeenCalledOnce();
   });
 
   it('publishes invalid link evidence and recovers when the source rows are repaired', async () => {
@@ -452,7 +562,8 @@ describe('database source links', () => {
     expect(openSource).not.toHaveBeenCalledWith(expect.objectContaining({ sourceId: 'hidden' }));
 
     session.close();
-    expect(privateSource.close).toHaveBeenCalledOnce();
+    expect(privateSource.closeMount).toHaveBeenCalledOnce();
+    expect(privateSource.closeSource).toHaveBeenCalledOnce();
   });
 
   it('closes a mount that finishes after its link is removed', async () => {
@@ -474,12 +585,13 @@ describe('database source links', () => {
     });
     const finishMount = deferred<void>();
     let mountedLease: DatabaseSourceMountLease | undefined;
-    const slowMount: MountableDatabaseSource = {
+    const slowMount: OwnedDatabaseSource = {
       mount: async (catalog, options) => {
         mountedLease = await slow.source.mount(catalog, options);
         await finishMount.promise;
         return mountedLease;
-      }
+      },
+      close: slow.source.close
     };
     const session = await openDatabaseQuery({
       sources: [{ source: root.source }],
@@ -492,9 +604,11 @@ describe('database source links', () => {
     root.replace({ links: [], items: [] });
     finishMount.resolve();
 
-    await vi.waitFor(() => expect(slow.close).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(slow.closeMount).toHaveBeenCalledOnce());
+    expect(slow.closeSource).toHaveBeenCalledOnce();
     expect(session.getSnapshot()).toMatchObject({ state: 'open', current: { readiness: 'ready' } });
     session.close();
-    expect(slow.close).toHaveBeenCalledOnce();
+    expect(slow.closeMount).toHaveBeenCalledOnce();
+    expect(slow.closeSource).toHaveBeenCalledOnce();
   });
 });

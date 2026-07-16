@@ -20,6 +20,7 @@ import {
 } from './source-link-graph.js';
 import type {
   DatabaseSourceMountLease,
+  OwnedDatabaseSource,
   OpenLinkedDatabaseSource
 } from './source-mount.js';
 
@@ -69,6 +70,7 @@ type LinkedSourceRecord = {
   readonly abort: AbortController;
   state: 'loading' | 'mounted' | 'missing' | 'failed';
   lease?: DatabaseSourceMountLease;
+  source?: OwnedDatabaseSource;
   issues: readonly Issue[];
 };
 
@@ -181,9 +183,28 @@ export const followDatabaseSourceLinks = (options: {
     publishMembership();
   };
 
-  const closeLease = (lease: DatabaseSourceMountLease, operation: string): void => {
+  const closeResources = (
+    record: LinkedSourceRecord,
+    operation: string,
+    pendingLease?: DatabaseSourceMountLease
+  ): void => {
+    const lease = pendingLease ?? record.lease;
+    const source = record.source;
+    delete record.lease;
+    delete record.source;
     runObserverCleanups(
-      [lease.close],
+      [
+        ...(lease === undefined ? [] : [lease.close]),
+        ...(source === undefined ? [] : [source.close])
+      ],
+      { component: 'database-view', operation },
+      options.onDiagnostic
+    );
+  };
+
+  const closeDetachedSource = (source: OwnedDatabaseSource, operation: string): void => {
+    runObserverCleanups(
+      [source.close],
       { component: 'database-view', operation },
       options.onDiagnostic
     );
@@ -197,16 +218,28 @@ export const followDatabaseSourceLinks = (options: {
         signal: record.abort.signal
       })))
       .then(async (source) => {
-        if (!recordIsCurrent(record)) return;
         if (source === undefined) {
+          if (!recordIsCurrent(record)) return;
           failRecord(record, 'observer.linked_source_unavailable', { reason: 'source_unavailable' });
           return;
         }
+        if (!isOwnedDatabaseSource(source)) {
+          if (!recordIsCurrent(record)) return;
+          failRecord(record, 'observer.linked_source_resolution_failed', {
+            reason: 'opened_source_must_provide_mount_and_close'
+          });
+          return;
+        }
+        if (!recordIsCurrent(record)) {
+          closeDetachedSource(source, 'close-stale-opened-source');
+          return;
+        }
+        record.source = source;
         const lease = await source.mount(options.catalog, {
           discoveryEdges: record.target.discoveryEdges
         });
         if (!recordIsCurrent(record)) {
-          closeLease(lease, 'close-stale-linked-source');
+          closeResources(record, 'close-stale-linked-source', lease);
           return;
         }
         const attachment = options.catalog.get(lease.attachmentId);
@@ -214,7 +247,7 @@ export const followDatabaseSourceLinks = (options: {
         if (lease.sourceId !== record.target.sourceId
           || attachment?.sourceId !== lease.sourceId
           || (expectedAttachmentId !== undefined && lease.attachmentId !== expectedAttachmentId)) {
-          closeLease(lease, 'close-invalid-linked-source');
+          closeResources(record, 'close-invalid-linked-source', lease);
           failRecord(record, 'observer.linked_source_resolution_failed', {
             reason: 'mounted_identity_mismatch'
           });
@@ -227,6 +260,7 @@ export const followDatabaseSourceLinks = (options: {
       })
       .catch((error: unknown) => {
         if (!recordIsCurrent(record)) return;
+        closeResources(record, 'close-failed-linked-source');
         failRecord(record, 'observer.linked_source_resolution_failed', {
           reason: 'open_failed',
           error: error instanceof Error ? error.name : typeof error
@@ -234,10 +268,9 @@ export const followDatabaseSourceLinks = (options: {
       });
   };
 
-  const removeRecord = (record: LinkedSourceRecord): DatabaseSourceMountLease | undefined => {
+  const removeRecord = (record: LinkedSourceRecord): void => {
     record.abort.abort();
     linkedSources.delete(record.target.sourceId);
-    return record.lease;
   };
 
   const reconcileTargets = (
@@ -245,13 +278,13 @@ export const followDatabaseSourceLinks = (options: {
     forcePublish: boolean
   ): void => {
     const desired = new Map(targets.map((target) => [target.sourceId, target]));
-    const removedLeases: DatabaseSourceMountLease[] = [];
+    const removedRecords: LinkedSourceRecord[] = [];
     let changed = forcePublish;
     for (const record of linkedSources.values()) {
       const target = desired.get(record.target.sourceId);
       if (target === undefined || target.attachmentId !== record.target.attachmentId) {
-        const lease = removeRecord(record);
-        if (lease !== undefined) removedLeases.push(lease);
+        removeRecord(record);
+        removedRecords.push(record);
         changed = true;
         continue;
       }
@@ -274,8 +307,8 @@ export const followDatabaseSourceLinks = (options: {
       changed = true;
     }
     if (changed) publishMembership();
-    for (let index = removedLeases.length - 1; index >= 0; index -= 1) {
-      closeLease(removedLeases[index] as DatabaseSourceMountLease, 'close-unlinked-source');
+    for (let index = removedRecords.length - 1; index >= 0; index -= 1) {
+      closeResources(removedRecords[index] as LinkedSourceRecord, 'close-unlinked-source');
     }
     for (const record of added) openRecord(record);
   };
@@ -388,20 +421,23 @@ export const followDatabaseSourceLinks = (options: {
       if (closed) return;
       closed = true;
       unsubscribe();
-      const leases: DatabaseSourceMountLease[] = [];
+      const records = [...linkedSources.values()];
       for (const record of linkedSources.values()) {
         record.abort.abort();
-        if (record.lease !== undefined) leases.push(record.lease);
       }
       linkedSources.clear();
-      runObserverCleanups(
-        [...leases].reverse().map(({ close }) => close),
-        { component: 'database-view', operation: 'close-linked-sources' },
-        options.onDiagnostic
-      );
+      for (let index = records.length - 1; index >= 0; index -= 1) {
+        closeResources(records[index] as LinkedSourceRecord, 'close-linked-sources');
+      }
     }
   });
 };
+
+const isOwnedDatabaseSource = (input: unknown): input is OwnedDatabaseSource =>
+  input !== null
+  && (typeof input === 'object' || typeof input === 'function')
+  && typeof (input as { readonly mount?: unknown }).mount === 'function'
+  && typeof (input as { readonly close?: unknown }).close === 'function';
 
 const sameStringSet = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean => {
   if (left.size !== right.size) return false;

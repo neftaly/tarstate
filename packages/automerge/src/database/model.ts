@@ -2,7 +2,7 @@ import type {
   DatabaseTransactionService,
   LogicalRelationRow
 } from '@tarstate/core/transactions';
-import type { MountableDatabaseSource } from '@tarstate/core/database/session';
+import type { OwnedDatabaseSource } from '@tarstate/core/database/session';
 import type { Issue } from '@tarstate/core';
 import type { SourceBasis, SourceFreshness, SourceLifecycleState } from '@tarstate/core/source';
 
@@ -20,8 +20,7 @@ export type AutomergeDatabaseSnapshot =
   | { readonly state: 'open'; readonly current: AutomergeDatabaseResult }
   | { readonly state: 'closed' };
 
-export type AutomergeDatabase = DatabaseTransactionService & MountableDatabaseSource & {
+export type AutomergeDatabase = DatabaseTransactionService & OwnedDatabaseSource & {
   readonly getSnapshot: () => AutomergeDatabaseSnapshot;
   readonly subscribe: (listener: () => void) => () => void;
-  readonly close: () => void;
 };

@@ -19,6 +19,11 @@ export type MountableDatabaseSource = {
   ) => DatabaseSourceMountLease | Promise<DatabaseSourceMountLease>;
 };
 
+/** A dynamically opened source whose lifetime transfers to the following session. */
+export type OwnedDatabaseSource = MountableDatabaseSource & {
+  readonly close: () => void;
+};
+
 export type OpenLinkedDatabaseSourceRequest = {
   readonly sourceId: string;
   readonly attachmentId?: string;
@@ -27,4 +32,4 @@ export type OpenLinkedDatabaseSourceRequest = {
 
 export type OpenLinkedDatabaseSource = (
   request: OpenLinkedDatabaseSourceRequest
-) => MountableDatabaseSource | undefined | Promise<MountableDatabaseSource | undefined>;
+) => OwnedDatabaseSource | undefined | Promise<OwnedDatabaseSource | undefined>;
