@@ -17,12 +17,14 @@ import {
 } from '../src/index.js';
 import { createPooledIncrementalQueryRuntime, type PooledIncrementalQueryRoot } from '../src/query.js';
 import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
+import { derivePropertySeed } from './support/property-test.js';
 
 const configuredRuns = Number.parseInt(process.env.TARSTATE_FUZZ_RUNS ?? '64', 10);
 const runs = Number.isSafeInteger(configuredRuns) && configuredRuns > 0 ? configuredRuns : 64;
 const configuredSeed = Number.parseInt(process.env.TARSTATE_FUZZ_SEED ?? '1597463007', 10);
 const initialSeed = Number.isSafeInteger(configuredSeed) ? configuredSeed >>> 0 : 1_597_463_007;
-const random = seededRandom(initialSeed);
+let activeSeed = initialSeed;
+let random = seededRandom(activeSeed);
 const integer = (limit: number): number => Math.floor(random() * limit);
 const hash = (value: number): `sha256:${string}` => `sha256:${(value % 16).toString(16).repeat(64)}`;
 const schemaView: ArtifactRef = { id: 'urn:test:fuzz-schema', contentHash: hash(10) };
@@ -42,10 +44,19 @@ const plan = sealPreparedPlan({ planId: 'fuzz', rootNodeId: 'fuzz:root', query, 
 type FuzzRow = { readonly occurrenceId: string; readonly row: QueryRecord };
 type FuzzSource = { readonly sourceId: string; readonly attachmentId?: string; revision: number; nextId: number; rows: FuzzRow[] };
 
-const deterministicDescribe = process.env.TARSTATE_FUZZ_PROPERTY === undefined ? describe : describe.skip;
+const selectedProperty = process.env.TARSTATE_FUZZ_PROPERTY;
+const deterministicFuzzTest = (name: string, test: () => void): void => {
+  const selected = selectedProperty === undefined || selectedProperty === name;
+  const register = selected ? it : it.skip;
+  register(name, () => {
+    activeSeed = selectedProperty === name ? initialSeed : derivePropertySeed(initialSeed, name);
+    random = seededRandom(activeSeed);
+    test();
+  });
+};
 
-deterministicDescribe('deterministic fuzz properties (seed ' + initialSeed + ')', () => {
-  it('keeps multi-source bag identity unique and incremental results oracle-equivalent', () => {
+describe('deterministic fuzz properties', () => {
+  deterministicFuzzTest('keeps multi-source bag identity unique and incremental results oracle-equivalent', () => {
     for (let run = 0; run < runs; run += 1) {
       const sources = Array.from({ length: 1 + integer(4) }, (_, sourceIndex): FuzzSource => {
         const rowCount = integer(6);
@@ -97,7 +108,7 @@ deterministicDescribe('deterministic fuzz properties (seed ' + initialSeed + ')'
     }
   });
 
-  it('keeps every maintained operator oracle-equivalent across two-sided row changes and reordering', () => {
+  deterministicFuzzTest('keeps every maintained operator oracle-equivalent across two-sided row changes and reordering', () => {
     const itemUse = { schemaView, relationId: 'fuzz.items' } as const;
     const groupUse = { schemaView, relationId: 'fuzz.groups' } as const;
     const from = (relation: typeof itemUse | typeof groupUse, alias: string): QueryNode => ({ kind: 'from', relation, alias });
@@ -165,8 +176,8 @@ deterministicDescribe('deterministic fuzz properties (seed ' + initialSeed + ')'
     }
   });
 
-  it('keeps a two-relation pooled state machine oracle-equivalent and relation-local', () => {
-    const stateRandom = seededRandom(initialSeed ^ 0x51A7_EF01);
+  deterministicFuzzTest('keeps a two-relation pooled state machine oracle-equivalent and relation-local', () => {
+    const stateRandom = seededRandom(activeSeed ^ 0x51A7_EF01);
     const stateInteger = (limit: number): number => Math.floor(stateRandom() * limit);
     const stateRuns = Math.min(runs, 48);
     const stateSteps = 24;
@@ -411,7 +422,7 @@ deterministicDescribe('deterministic fuzz properties (seed ' + initialSeed + ')'
     }
   });
 
-  it('orders nested JSON structurally with deterministic, transitive seek boundaries', () => {
+  deterministicFuzzTest('orders nested JSON structurally with deterministic, transitive seek boundaries', () => {
     const orderingRelation = { schemaView, relationId: 'fuzz.structural-order' } as const;
     const input: QueryNode = { kind: 'from', relation: orderingRelation, alias: 'item' };
     const by = [{ value: { kind: 'field', alias: 'item', name: 'value' } as const, direction: 'asc' as const }];
@@ -492,7 +503,7 @@ deterministicDescribe('deterministic fuzz properties (seed ' + initialSeed + ')'
     }
   });
 
-  it('is total over generated portable receipt inputs', () => {
+  deterministicFuzzTest('is total over generated portable receipt inputs', () => {
     for (let run = 0; run < runs * 8; run += 1) {
       const input = randomJson(0);
       expect(() => safeParseReceipt(input), 'receipt run ' + run).not.toThrow();
@@ -501,7 +512,7 @@ deterministicDescribe('deterministic fuzz properties (seed ' + initialSeed + ')'
     }
   });
 
-  it('terminates bounded lens traversal and returns only connected paths', () => {
+  deterministicFuzzTest('terminates bounded lens traversal and returns only connected paths', () => {
     for (let run = 0; run < runs; run += 1) {
       const nodeCount = 2 + integer(10);
       const nodes = Array.from({ length: nodeCount }, (_, index): ArtifactRef => ({ id: 'urn:fuzz:schema:' + index, contentHash: hash(index) }));

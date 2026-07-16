@@ -620,12 +620,29 @@ const evaluateSet = (node: Extract<QueryNode, { readonly kind: 'set' }>, context
   if (left.completeness === 'unknown' || right.completeness === 'unknown') return { rows: [], completeness: 'unknown' };
   if (!consumeQueryWork(context, left.rows.length + right.rows.length)) return { rows: [], completeness: 'unknown' };
   if (node.op === 'except' && right.completeness !== 'exact') return nonMonotoneUnknown(context, node.op);
-  if (node.op === 'union-all') return { rows: [...left.rows.map((row) => tagSetRow(row, 'left')), ...right.rows.map((row) => tagSetRow(row, 'right'))], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
+  if (node.op === 'union-all') {
+    const rows: ScopedRow[] = [];
+    for (const row of left.rows) rows.push(tagSetRow(row, 'left'));
+    for (const row of right.rows) rows.push(tagSetRow(row, 'right'));
+    return { rows, completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
+  }
   const leftMap = uniqueRows(left.rows);
   const rightMap = uniqueRows(right.rows);
-  if (node.op === 'union') return { rows: [...new Map([...leftMap, ...rightMap]).values()], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
-  if (node.op === 'intersect') return { rows: [...leftMap].filter(([key]) => rightMap.has(key)).map(([, row]) => row), completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
-  return { rows: [...leftMap].filter(([key]) => !rightMap.has(key)).map(([, row]) => row), completeness: left.completeness };
+  if (node.op === 'union') {
+    for (const [key, row] of rightMap) leftMap.set(key, row);
+    return { rows: [...leftMap.values()], completeness: left.completeness === 'exact' && right.completeness === 'exact' ? 'exact' : 'lower-bound' };
+  }
+  const rows: ScopedRow[] = [];
+  const includeRightMatches = node.op === 'intersect';
+  for (const [key, row] of leftMap) {
+    if (rightMap.has(key) === includeRightMatches) rows.push(row);
+  }
+  return {
+    rows,
+    completeness: node.op === 'intersect' && (left.completeness !== 'exact' || right.completeness !== 'exact')
+      ? 'lower-bound'
+      : left.completeness
+  };
 };
 
 const evaluateWindow = (node: Extract<QueryNode, { readonly kind: 'window' }>, context: QueryContext): NodeResult => {

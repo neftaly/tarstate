@@ -1,6 +1,7 @@
 {
   "name": "@tarstate/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
+  "private": true,
   "description": "Portable relational semantics and source protocols for Tarstate",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/core" },
@@ -106,7 +107,6 @@
   },
   "types": "./dist/root.d.ts",
   "sideEffects": false,
-  "publishConfig": { "access": "public" },
   "engines": { "node": ">=24.12.0" },
   "scripts": {
     "bench": "node ../../scripts/v1-coarse-benchmark.mjs",

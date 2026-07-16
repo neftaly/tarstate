@@ -1,7 +1,7 @@
 {
   "name": "tarstate",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@10.33.2",
@@ -23,6 +23,7 @@
     "check:perf": "pnpm bench && pnpm bench:query && pnpm bench:observer && pnpm bench:transaction && pnpm bench:automerge",
     "check:release": "pnpm check && pnpm test:fuzz && pnpm check:perf && tsc -p tsconfig.release.json && node scripts/verify-release.mjs",
     "lint": "oxlint . --deny-warnings --type-aware",
+    "pack:release": "pnpm build && pnpm --filter './packages/*' -r pack --pack-destination release",
     "test": "pnpm --filter './packages/*' test",
     "test:fuzz": "pnpm --filter './packages/*' --if-present test:fuzz",
     "typecheck": "tsc -p tsconfig.json --noEmit",

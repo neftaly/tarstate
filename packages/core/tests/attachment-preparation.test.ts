@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { sealArtifact, type Artifact, type ArtifactRef } from '../src/artifacts.js';
-import { exactArtifactAttachmentResolver, prepareDatabaseAttachment, prepareManualReadOnlyAttachment } from '../src/attachment/preparation.js';
+import {
+  bindAttachmentProjection,
+  exactArtifactAttachmentResolver,
+  prepareDatabaseAttachment,
+  prepareManualReadOnlyAttachment
+} from '../src/attachment/preparation.js';
 import { ExactArtifactResolver } from '../src/artifact-resolver.js';
 import { AttachmentCatalog, type SourceSnapshot } from '../src/database.js';
 import type { Issue } from '../src/issues.js';
@@ -98,6 +103,25 @@ describe('database attachment preparation', () => {
     expect(Object.isFrozen(prepared.issues)).toBe(true);
     expect(Object.isFrozen(prepared.issues[0])).toBe(true);
     expect(Object.isFrozen(prepared.issues[0]?.details)).toBe(true);
+  });
+
+  it('rebinds an owned preparation to one authoritative adapter projection', () => {
+    const prepared = prepareManualReadOnlyAttachment({
+      schemaViewIds: ['schema:one'],
+      project: (_snapshot: SourceSnapshot<unknown>) => ({ state: 'ready' as const, value: 'old', issues: [] })
+    });
+    const project = (_snapshot: SourceSnapshot<{ readonly value: number }>) => ({
+      state: 'ready' as const,
+      value: 42,
+      issues: []
+    });
+    const rebound = bindAttachmentProjection(prepared, project);
+
+    expect(rebound.project).toBe(project);
+    expect(rebound).toMatchObject({
+      state: 'ready', origin: 'manual-read-only', writable: false, schemaViewIds: ['schema:one']
+    });
+    expect(Object.isFrozen(rebound)).toBe(true);
   });
 
   it('rejects hostile ready preparation arrays without invoking getters', () => {
@@ -248,7 +272,7 @@ describe('database attachment preparation', () => {
     const prepared = await prepareDatabaseAttachment({
       sourceId: 'source:attachment', bootstrap: { status: 'ready', declaration: fixture.declaration() },
       resolveArtifact: (reference) => fixture.artifacts.get(key(reference)), registry,
-      evaluateConstraintQuery: () => ({ rows: [], completeness: 'exact', issues: [] })
+      createConstraintQuery: () => () => ({ rows: [], completeness: 'exact', issues: [] })
     });
     expect(prepared).toMatchObject({ state: 'ready', writable: false, issues: [{ code: 'capability.missing' }] });
 
@@ -258,7 +282,7 @@ describe('database attachment preparation', () => {
     const malformed = await prepareDatabaseAttachment({
       sourceId: 'source:attachment', bootstrap: { status: 'ready', declaration: fixture.declaration() },
       resolveArtifact: (reference) => malformedArtifacts.get(key(reference)), registry,
-      evaluateConstraintQuery: () => ({ rows: [], completeness: 'exact', issues: [] })
+      createConstraintQuery: () => () => ({ rows: [], completeness: 'exact', issues: [] })
     });
     expect(malformed).toMatchObject({ state: 'ready', writable: false, issues: expect.arrayContaining([expect.objectContaining({ code: 'artifact.hash_mismatch' })]) });
   });

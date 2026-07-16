@@ -7,8 +7,8 @@ Install both downloaded Tarstate tarballs:
 
 ```sh
 npm install \
-  ./tarstate-core-0.3.0.tgz \
-  ./tarstate-schema-tools-0.3.0.tgz
+  ./tarstate-core-0.4.0.tgz \
+  ./tarstate-schema-tools-0.4.0.tgz
 ```
 
 ```ts

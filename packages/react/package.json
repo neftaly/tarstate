@@ -1,6 +1,7 @@
 {
   "name": "@tarstate/react",
-  "version": "0.3.0",
+  "version": "0.4.0",
+  "private": true,
   "description": "React observer and commit bindings for Tarstate",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/react" },
@@ -14,7 +15,6 @@
   },
   "types": "./dist/index.d.ts",
   "sideEffects": false,
-  "publishConfig": { "access": "public" },
   "engines": { "node": ">=24.12.0" },
   "scripts": {
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",

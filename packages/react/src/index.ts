@@ -129,7 +129,10 @@ const resultKeyIndexes = new WeakMap<readonly string[], ReadonlyMap<string, numb
 const resultKeyIndex = (keys: readonly string[]): ReadonlyMap<string, number> => {
   const cached = resultKeyIndexes.get(keys);
   if (cached !== undefined) return cached;
-  const index = new Map(keys.map((key, position) => [key, position]));
+  const index = new Map<string, number>();
+  for (let position = 0; position < keys.length; position += 1) {
+    index.set(keys[position] as string, position);
+  }
   resultKeyIndexes.set(keys, index);
   return index;
 };

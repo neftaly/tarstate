@@ -1,11 +1,12 @@
 {
   "name": "@tarstate/automerge",
-  "version": "0.3.0",
+  "version": "0.4.0",
+  "private": true,
   "description": "Automerge source and storage bindings for Tarstate",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/neftaly/tarstate.git", "directory": "packages/automerge" },
   "type": "module",
-  "files": ["dist"],
+  "files": ["dist", "!dist/internal-benchmark.*"],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -18,7 +19,6 @@
   },
   "types": "./dist/index.d.ts",
   "sideEffects": false,
-  "publishConfig": { "access": "public" },
   "engines": { "node": ">=24.12.0" },
   "scripts": {
     "build": "vite build --config ../../vite.config.ts --logLevel warn && tsc -p tsconfig.build.json",

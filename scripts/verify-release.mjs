@@ -14,7 +14,13 @@ const publicSubpaths = new Map([
 ]);
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-release-'));
 const releaseVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
-if (typeof releaseVersion !== 'string' || releaseVersion.length === 0) throw new Error('Root package version must be a non-empty string');
+if (typeof releaseVersion !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(releaseVersion)) {
+  throw new Error('Root package version must be a release semantic version');
+}
+const expectedReleaseVersion = process.env.TARSTATE_EXPECTED_VERSION;
+if (expectedReleaseVersion !== undefined && releaseVersion !== expectedReleaseVersion) {
+  throw new Error(`Root package version ${releaseVersion} does not match requested release ${expectedReleaseVersion}`);
+}
 const packedPackages = [];
 const builtins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
 
@@ -25,7 +31,7 @@ try {
     const packageDirectory = path.join(root, 'packages', directory);
     const manifest = JSON.parse(readFileSync(path.join(packageDirectory, 'package.json'), 'utf8'));
     if (manifest.version !== releaseVersion) fail(`${manifest.name}: expected version ${releaseVersion}`);
-    if (manifest.private === true) fail(`${manifest.name}: package remains private`);
+    if (manifest.private !== true) fail(`${manifest.name}: tarball-only package must remain private`);
     const surfaceIssue = packageSurfaceIssues(manifest)[0];
     if (surfaceIssue !== undefined) fail(surfaceIssue);
 
@@ -46,7 +52,9 @@ try {
       }
     }
     verifyDeclarationReachability(manifest.name, tarball, entries);
-    if (entries.some((entry) => entry.includes('golden-workloads'))) fail(`${manifest.name}: tarball contains conformance fixtures`);
+    if (entries.some((entry) => entry.includes('golden-workloads') || entry.includes('internal-benchmark'))) {
+      fail(`${manifest.name}: tarball contains repository-only benchmark or conformance entries`);
+    }
     if (entries.some((entry) => entry.includes('/src/') || entry.endsWith('.tsbuildinfo'))) {
       fail(`${manifest.name}: tarball contains source or build-state files`);
     }

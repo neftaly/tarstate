@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.3.0.tgz
+npm install ./tarstate-core-0.4.0.tgz
 ```
 
 ## Choose the application path
@@ -171,7 +171,10 @@ const observer = database.observe({ plan });
 Adapter authors import `prepareManualReadOnlyAttachment`,
 `prepareDatabaseAttachment`, and `createAttachmentTransactionService` from
 `@tarstate/core/attachment/adapter`. Applications using an official adapter do
-not need this construction seam.
+not need this construction seam. In particular, an attachment returned by
+`openAutomergeAttachment` mounts itself into an `AttachmentCatalog`; its live
+database projection and replayable write projection are the same
+conflict-aware mapping.
 Closing the database closes every observer and maintenance runtime it created;
 closing an observer earlier only releases that observer's lease. The database
 borrows the attachment catalog, dataset memberships, attachments, and sources,
@@ -197,14 +200,15 @@ or reused relation deltas across parameter cohorts; custom factories report zero
 
 ## Property tests and replay
 
-`pnpm --filter @tarstate/core test:fuzz` runs both the deterministic seeded
-state-machine checks and shrinking fast-check properties. Each property gets a
-seed derived from its stable name, so adding or reordering another property
-does not change its generated cases. Increase coverage with
+`pnpm --filter @tarstate/core test:fuzz` runs both deterministic seeded
+state-machine checks and shrinking fast-check properties. Every test gets a
+seed derived from its stable name, so adding or reordering another test does
+not change its generated cases. Increase coverage with
 `TARSTATE_FUZZ_RUNS=1000`.
 
-On failure, fast-check prints a seed and shrink path. Replay only that minimized
-case by supplying its exact property name, seed, and path:
+Set `TARSTATE_FUZZ_PROPERTY` to either kind of test's exact name to run it in
+isolation. Fast-check failures additionally print a shrink path; replay one
+minimized case by supplying its exact property name, seed, and path:
 
 ```sh
 TARSTATE_FUZZ_PROPERTY=canonical-json-round-trip \
@@ -214,8 +218,8 @@ pnpm --filter @tarstate/core test:fuzz
 ```
 
 Omit `TARSTATE_FUZZ_PATH` to rerun every generated case for that property and
-seed. `TARSTATE_FUZZ_SEED` acts as the suite's base seed when no property is
-selected.
+seed. Deterministic state-machine tests do not use a shrink path.
+`TARSTATE_FUZZ_SEED` acts as the suite's base seed when no property is selected.
 
 ## Performance contracts
 

@@ -5,6 +5,7 @@ dist/
 dist-ssr/
 .vite/
 *.tsbuildinfo
+/release/
 
 coverage/
 playwright-report/

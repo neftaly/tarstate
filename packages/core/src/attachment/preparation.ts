@@ -56,6 +56,12 @@ export type AttachmentConstraintQuery<State> = (
   readonly issues: readonly Issue[];
 };
 
+export type AttachmentConstraintQueryFactory<State> = (input: {
+  readonly schemaView: ArtifactRef;
+  readonly relationIds: readonly string[];
+  readonly registry: CapabilityRegistry;
+}) => AttachmentConstraintQuery<State>;
+
 export type PreparedAttachmentRelation = {
   readonly relationId: string;
   readonly keyFields: readonly string[];
@@ -95,7 +101,7 @@ export type PrepareDatabaseAttachmentInput<State = unknown> = {
   readonly outOfBandDeclaration?: unknown;
   readonly resolveArtifact: AttachmentArtifactResolver;
   readonly registry: CapabilityRegistry;
-  readonly evaluateConstraintQuery?: AttachmentConstraintQuery<State>;
+  readonly createConstraintQuery?: AttachmentConstraintQueryFactory<State>;
   readonly resolveStorageBinding?: (reference: CapabilityRef) => StorageBinding<unknown, unknown> | undefined;
 };
 
@@ -176,6 +182,11 @@ export const prepareDatabaseAttachment = async <State = unknown>(
 
   let constraints: readonly SourceConstraint<State>[] = [];
   if (declaration.constraints !== undefined) {
+    const evaluateConstraintQuery = input.createConstraintQuery?.({
+      schemaView: declaration.storageSchema,
+      relationIds: [...schema.value.relationsById.keys()],
+      registry: input.registry
+    });
     const constraintArtifact = await resolveExactArtifact(declaration.constraints.set, 'constraint-set', input.resolveArtifact);
     if (constraintArtifact.resolution !== undefined) artifactResolutions.push(constraintArtifact.resolution);
     if (!constraintArtifact.success) {
@@ -191,15 +202,15 @@ export const prepareDatabaseAttachment = async <State = unknown>(
         issues.push(preparationIssue('artifact.dependency_mismatch', { dependency: 'constraint.schemaView' }));
       } else {
         const missingConstraintCapabilities = input.registry.missing(parsedConstraint.value.body.requiredCapabilities);
-        if (missingConstraintCapabilities.length > 0 || input.evaluateConstraintQuery === undefined) {
+        if (missingConstraintCapabilities.length > 0 || evaluateConstraintQuery === undefined) {
           writable = false;
           issues.push(...missingConstraintCapabilities);
-          if (input.evaluateConstraintQuery === undefined) issues.push(preparationIssue('observer.projection_unavailable', { reason: 'constraint_executor_unavailable' }));
+          if (evaluateConstraintQuery === undefined) issues.push(preparationIssue('observer.projection_unavailable', { reason: 'constraint_executor_unavailable' }));
         } else {
           const preparedConstraint = prepareParsedConstraintSetArtifact<State>(parsedConstraint.value, {
             mode: declaration.constraints.mode,
             registry: input.registry,
-            evaluateQuery: input.evaluateConstraintQuery
+            evaluateQuery: evaluateConstraintQuery
           });
           if (preparedConstraint.success) constraints = preparedConstraint.value.constraints;
           else {
@@ -251,6 +262,24 @@ export const prepareManualReadOnlyAttachment = <Storage, Projection>(input: {
     project: project as (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>
   });
 };
+
+/** Reuses validated attachment facts with the adapter's authoritative live projection. */
+export const bindAttachmentProjection = <Storage, Projection, ConstraintState>(
+  preparation: ReadyAttachmentPreparation<unknown, unknown, ConstraintState>,
+  project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>
+): ReadyAttachmentPreparation<Storage, Projection, ConstraintState> => ready({
+  origin: preparation.origin,
+  writable: preparation.writable,
+  schemaViewIds: preparation.schemaViewIds,
+  ...(preparation.declaration === undefined ? {} : { declaration: preparation.declaration }),
+  ...(preparation.schema === undefined ? {} : { schema: preparation.schema }),
+  ...(preparation.mapping === undefined ? {} : { mapping: preparation.mapping }),
+  relations: new Map(preparation.relations),
+  constraints: preparation.constraints,
+  artifactResolutions: preparation.artifactResolutions,
+  issues: preparation.issues,
+  project
+});
 
 const selectDeclaration = (
   bootstrap: RawBootstrapDeclaration,

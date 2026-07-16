@@ -1,8 +1,12 @@
 import * as Automerge from '@automerge/automerge';
 import { Repo } from '@automerge/automerge-repo';
 import { builtInCapabilityRefs } from '@tarstate/core/capabilities';
-import { sealSchema, sealStorageMapping } from '@tarstate/core/schema';
-import { describe, expect, it } from 'vitest';
+import { AttachmentCatalog, DatabaseView, DatasetMembership } from '@tarstate/core/database';
+import { createIncrementalDatabaseQueryMaintenance } from '@tarstate/core/database/incremental';
+import type { QueryNode, QueryRecord, RelationInput } from '@tarstate/core/query/model';
+import { prepareQuery } from '@tarstate/core/query/prepare';
+import { sealConstraintSet, sealSchema, sealStorageMapping } from '@tarstate/core/schema';
+import { describe, expect, it, vi } from 'vitest';
 import {
   openAutomergeAttachment,
   type OpenAutomergeAttachmentOptions
@@ -15,14 +19,141 @@ type TaskDocument = {
 describe('standard Automerge attachment', () => {
   it('opens embedded artifacts and exposes only logical transactions and lifecycle', async () => {
     const fixture = await openTaskAttachment();
-    expect(Object.keys(fixture.attachment).sort()).toEqual(['close', 'simulate', 'transact']);
+    expect(Object.keys(fixture.attachment).sort()).toEqual([
+      'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
+    ]);
+    const initial = fixture.attachment.getSnapshot();
+    expect(initial).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', completeness: 'exact', rows: [{ relationId: 'tasks', fields: { id: 'first', title: 'First' } }] }
+    });
+    expect(fixture.attachment.getSnapshot()).toBe(initial);
+    const listener = vi.fn();
+    const unsubscribe = fixture.attachment.subscribe(listener);
     await expect(fixture.attachment.transact(
       { kind: 'rename-task', id: 'first' },
       ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Renamed' } }))
     )).resolves.toMatchObject({ outcome: 'committed' });
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('Renamed');
+    expect(listener).toHaveBeenCalled();
+    unsubscribe();
+
+    const catalog = new AttachmentCatalog();
+    const lease = fixture.attachment.mount(catalog, { discoveryEdges: ['embedded'] });
+    expect(lease).toMatchObject({
+      attachmentId: fixture.handle.url,
+      sourceId: fixture.handle.url,
+      discoveryEdges: ['embedded']
+    });
+    expect('attachment' in lease).toBe(false);
+    expect(catalog.list()).toHaveLength(1);
+
+    const closeListener = vi.fn();
+    fixture.attachment.subscribe(closeListener);
+    fixture.attachment.close();
+    expect(closeListener).toHaveBeenCalledOnce();
+    expect(fixture.attachment.getSnapshot()).toEqual({ state: 'closed' });
+    expect(catalog.list()).toHaveLength(0);
+    await fixture.repo.shutdown();
+  });
+
+  it('accepts embedded artifact maps and runs standard logical constraints without host plumbing', async () => {
+    const fixture = await openTaskAttachment({ artifactMap: true, constrained: true });
+    const mounted = await mountTaskDatabase(fixture);
+
+    await expect(fixture.attachment.transact(
+      { kind: 'rename-task', id: 'first' },
+      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Constrained' } }))
+    )).resolves.toMatchObject({ outcome: 'committed' });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('Constrained');
+    await expect(fixture.attachment.transact(
+      { kind: 'rename-task', id: 'first' },
+      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Forbidden' } }))
+    )).resolves.toMatchObject({ outcome: 'rejected', issues: [{ code: 'test.task_invalid' }] });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('Constrained');
+
+    const changed = vi.fn();
+    fixture.attachment.subscribe(changed);
+    mergePlayerChange(fixture.handle, '8', (draft) => {
+      draft.tasks.first!.title = 'Forbidden';
+    });
+    expect(changed).toHaveBeenCalled();
+    expect(fixture.attachment.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: {
+        readiness: 'invalid',
+        completeness: 'exact',
+        issues: [{ code: 'test.task_invalid', severity: 'error' }]
+      }
+    });
+    const invalidMounted = mounted.observer.getSnapshot();
+    expect(invalidMounted).toMatchObject({
+      state: 'open',
+      current: {
+        readiness: 'invalid',
+        completeness: 'unknown',
+        rows: []
+      }
+    });
+    expect(invalidMounted.state === 'open' && invalidMounted.current.issues).toContainEqual(
+      expect.objectContaining({ code: 'test.task_invalid', severity: 'error' })
+    );
+
+    let repairCalls = 0;
+    await expect(fixture.attachment.transact(
+      { kind: 'repair-task', id: 'first' },
+      ({ rows }) => {
+        repairCalls += 1;
+        return rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Repaired' } }));
+      }
+    )).resolves.toMatchObject({ outcome: 'committed' });
+    expect(repairCalls).toBe(1);
+    expect(fixture.attachment.getSnapshot()).toMatchObject({
+      state: 'open', current: { readiness: 'ready', issues: [] }
+    });
+    expect(mounted.observer.getSnapshot()).toMatchObject({
+      state: 'open', current: { readiness: 'ready', completeness: 'exact' }
+    });
+
+    mounted.close();
+    fixture.attachment.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('reports an initially invalid constrained document and permits a final-state repair', async () => {
+    const fixture = await openTaskAttachment({ constrained: true, initialTitle: 'Forbidden' });
+    expect(fixture.attachment.getSnapshot()).toMatchObject({
+      state: 'open', current: { readiness: 'invalid', issues: [{ code: 'test.task_invalid' }] }
+    });
+
+    await expect(fixture.attachment.transact(
+      { kind: 'repair-task', id: 'first' },
+      ({ rows }) => rows.map((row) => ({ ...row, fields: { ...row.fields, title: 'Valid' } }))
+    )).resolves.toMatchObject({ outcome: 'committed' });
+    expect(fixture.attachment.getSnapshot()).toMatchObject({
+      state: 'open', current: { readiness: 'ready', rows: [{ fields: { title: 'Valid' } }] }
+    });
 
     fixture.attachment.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('mounts through dataset authority into a recursive source-aware database query', async () => {
+    const fixture = await openTaskAttachment();
+    const mounted = await mountTaskDatabase(fixture);
+
+    expect(mounted.observer.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: {
+        readiness: 'ready',
+        completeness: 'exact',
+        rows: [{ id: 'first', source: fixture.handle.url }]
+      }
+    });
+
+    mounted.close();
+    fixture.attachment.close();
+    expect(mounted.catalog.list()).toHaveLength(0);
     await fixture.repo.shutdown();
   });
 
@@ -172,7 +303,11 @@ const reference = (artifact: { readonly id: string; readonly contentHash: `sha25
   contentHash: artifact.contentHash
 });
 
-const openTaskAttachment = async () => {
+const openTaskAttachment = async (options: {
+  readonly artifactMap?: boolean;
+  readonly constrained?: boolean;
+  readonly initialTitle?: string;
+} = {}) => {
   const schema = await sealSchema({ id: 'urn:test:open-automerge:schema', body: {
     relations: { tasks: {
       relationId: 'tasks',
@@ -194,24 +329,133 @@ const openTaskAttachment = async () => {
       }
     } }
   } });
+  const constraint = options.constrained === true
+    ? await sealConstraintSet({ id: 'urn:test:open-automerge:constraints', body: {
+        schemaView: reference(schema),
+        constraints: [{
+          id: 'task-validity',
+          code: 'test.task_invalid',
+          dependencyRelations: ['tasks'],
+          violationQuery: {
+            kind: 'select',
+            input: {
+              kind: 'where',
+              input: { kind: 'from', relation: { schemaView: reference(schema), relationId: 'tasks' }, alias: 'task' },
+              predicate: {
+                kind: 'compare',
+                op: 'eq',
+                left: { kind: 'field', alias: 'task', name: 'title' },
+                right: { kind: 'literal', value: 'Forbidden' }
+              }
+            },
+            alias: 'violation',
+            fields: {
+              subject: {
+                kind: 'record',
+                fields: {
+                  relationId: { kind: 'literal', value: 'tasks' },
+                  key: { kind: 'field', alias: 'task', name: 'id' }
+                }
+              }
+            }
+          }
+        }],
+        requiredCapabilities: []
+      } })
+    : undefined;
   const repo = new Repo();
-  const handle = repo.create<TaskDocument>({ tasks: { first: { id: 'first', title: 'First' } } });
+  const handle = repo.create<TaskDocument>({
+    tasks: { first: { id: 'first', title: options.initialTitle ?? 'First' } }
+  });
   const declaration: OpenAutomergeAttachmentOptions<TaskDocument, readonly string[]>['declaration'] = {
     formatVersion: 1,
     storageSchema: reference(schema),
-    projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
+    projection: { kind: 'storage-mapping', storageMapping: reference(mapping) },
+    ...(constraint === undefined ? {} : { constraints: { set: reference(constraint), mode: 'required' as const } })
   };
+  const artifacts = [schema, mapping, ...(constraint === undefined ? [] : [constraint])];
   const opened = await openAutomergeAttachment({
     handle,
     declaration,
-    embeddedArtifacts: [schema, mapping],
+    embeddedArtifacts: options.artifactMap === true
+      ? Object.fromEntries(artifacts.map((artifact) => [artifact.id, artifact]))
+      : artifacts,
     authorityScope: 'scope:test'
   });
   if (!opened.success) {
     await repo.shutdown();
     throw new Error(JSON.stringify(opened.issues));
   }
-  return { attachment: opened.value, handle, repo };
+  return { attachment: opened.value, handle, repo, schema };
+};
+
+const mountTaskDatabase = async (
+  fixture: Awaited<ReturnType<typeof openTaskAttachment>>
+) => {
+  const catalog = new AttachmentCatalog();
+  const lease = fixture.attachment.mount(catalog, { discoveryEdges: ['workspace'] });
+  const dataset = new DatasetMembership({
+    datasetId: 'workspace',
+    state: 'settled',
+    members: [{
+      attachmentId: lease.attachmentId,
+      sourceId: lease.sourceId,
+      expectation: 'required',
+      discoveryEdges: lease.discoveryEdges
+    }]
+  });
+  const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    authorityScope: 'scope:test',
+    authorityFingerprint: 'authority:test',
+    registryFingerprint: 'registry:test',
+    attachments: catalog,
+    datasets: [dataset],
+    canRead: (viewScope, attachmentScope) => viewScope === attachmentScope,
+    createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
+  });
+  const taskRelation = { schemaView: reference(fixture.schema), relationId: 'tasks' };
+  const root: QueryNode = {
+    kind: 'recursive',
+    name: 'reachable',
+    seed: {
+      kind: 'select',
+      alias: 'node',
+      input: { kind: 'from', relation: taskRelation, alias: 'task' },
+      fields: {
+        id: { kind: 'field', alias: 'task', name: 'id' },
+        source: { kind: 'source-of', alias: 'task' }
+      }
+    },
+    step: {
+      kind: 'select',
+      alias: 'node',
+      input: { kind: 'recursion-ref', name: 'reachable' },
+      fields: {
+        id: { kind: 'field', alias: 'node', name: 'id' },
+        source: { kind: 'field', alias: 'node', name: 'source' }
+      }
+    },
+    key: [
+      { kind: 'field', alias: 'node', name: 'id' },
+      { kind: 'field', alias: 'node', name: 'source' }
+    ]
+  };
+  const plan = await prepareQuery({
+    root,
+    registryFingerprint: 'registry:test',
+    authorityFingerprint: 'authority:test',
+    datasetId: 'workspace'
+  });
+  const observer = database.observe({ plan });
+  return {
+    catalog,
+    observer,
+    close: () => {
+      observer.close();
+      database.close();
+      lease.close();
+    }
+  };
 };
 
 const deferred = () => {

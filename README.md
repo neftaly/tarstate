@@ -44,11 +44,13 @@ const pizzaMenuQuery = typedSelect(
   })
 );
 
-export const pizzaMenuPlan = await prepareTypedQuery(pizzaMenuQuery, {
-  registryFingerprint,
-  authorityFingerprint,
+const queryScope = {
+  registryFingerprint: 'registry:application-v1',
+  authorityFingerprint: 'authority:application-v1',
   datasetId: 'primary'
-});
+} as const;
+
+export const pizzaMenuPlan = await prepareTypedQuery(pizzaMenuQuery, queryScope);
 ```
 
 Prepared queries are compiled into an Incremental View Maintenance graph. When

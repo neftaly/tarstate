@@ -1,10 +1,10 @@
 import * as Automerge from '@automerge/automerge';
 import {
+  bindAttachmentProjection,
+  createLogicalConstraintQuery,
   prepareDatabaseAttachment,
-  type AttachmentConstraintQuery,
   type ReadyAttachmentPreparation,
-  createAttachmentTransactionService,
-  type AttachmentTransactionService
+  createAttachmentTransactionService
 } from '@tarstate/core/attachment/adapter';
 import {
   builtInCapabilityRefs,
@@ -22,6 +22,12 @@ import { adoptConflictFreeAutomergeJsonValue } from '../document/json-value.js';
 import { AutomergeAtomicSource } from '../adapter/atomic-source.js';
 import { AutomergeMappedStorageBinding } from '../adapter/mapped-storage.js';
 import {
+  createLiveAutomergeAttachment,
+} from './live.js';
+import { embeddedArtifactKey, indexEmbeddedArtifacts } from './embedded-artifacts.js';
+import type { AutomergeAttachment } from './model.js';
+import { createAutomergeAttachmentProjector, databaseProjection } from './projection.js';
+import {
   automergeRepoSourceRuntime,
   type AutomergeRepoHandle,
   type AutomergeSourceCommand
@@ -34,11 +40,6 @@ export type OpenAutomergeAttachmentOptions<T extends object, Heads> = {
   readonly authorityScope: string;
   readonly attachmentId?: string;
   readonly registry?: CapabilityRegistry;
-  readonly evaluateConstraintQuery?: AttachmentConstraintQuery<WritableLogicalState>;
-};
-
-export type AutomergeAttachment = AttachmentTransactionService & {
-  readonly close: () => void;
 };
 
 /** Opens the standard writable Automerge attachment path without exposing heads, bindings, or execution contexts. */
@@ -49,23 +50,27 @@ export const openAutomergeAttachment = async <T extends object, Heads>(
   if (!declaration.success) return declaration;
   const embedded = adoptBoundaryJson(input.embeddedArtifacts);
   if (!embedded.success) return embedded;
-  if (!Array.isArray(embedded.value)) return failure('embedded_artifacts_array_required');
-  const artifacts: readonly JsonValue[] = embedded.value;
+  const artifacts = indexEmbeddedArtifacts(embedded.value);
+  if (!artifacts.success) return artifacts;
   const registry = input.registry ?? await standardAutomergeRegistry();
   const sourceId = input.handle.url;
+  const attachmentId = input.attachmentId ?? sourceId;
   const preparation = await prepareDatabaseAttachment<WritableLogicalState>({
     sourceId,
     bootstrap: { status: 'ready', declaration: declaration.value },
-    resolveArtifact: (reference) => artifacts.find((candidate) =>
-      isRecord(candidate)
-      && candidate.id === reference.id
-      && candidate.contentHash === reference.contentHash
-    ),
+    resolveArtifact: (reference) => artifacts.value.get(embeddedArtifactKey(reference.id, reference.contentHash)),
     registry,
-    ...(input.evaluateConstraintQuery === undefined ? {} : { evaluateConstraintQuery: input.evaluateConstraintQuery })
+    createConstraintQuery: ({ schemaView, relationIds, registry: constraintRegistry }) =>
+      createLogicalConstraintQuery({
+        schemaView,
+        relationIds,
+        registry: constraintRegistry,
+        sourceId,
+        attachmentId
+      })
   });
   if (preparation.state !== 'ready') return { success: false, issues: preparation.issues };
-  if (!preparation.writable || preparation.mapping === undefined) {
+  if (!preparation.writable || preparation.mapping === undefined || preparation.declaration === undefined) {
     return {
       success: false,
       issues: preparation.issues.length > 0
@@ -81,11 +86,27 @@ export const openAutomergeAttachment = async <T extends object, Heads>(
   });
   try {
     const binding = new AutomergeMappedStorageBinding<T>({ mapping: preparation.mapping, registry });
+    const attachmentIncarnation = globalThis.crypto.randomUUID();
+    const projector = createAutomergeAttachmentProjector({
+      binding,
+      constraints: preparation.constraints
+    });
+    const projection = databaseProjection({
+      projector,
+      schemaView: preparation.declaration.storageSchema,
+      relationIds: [...preparation.relations.keys()],
+      sourceId,
+      attachmentId
+    });
+    const boundPreparation = bindAttachmentProjection(
+      preparation as ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,
+      projection
+    );
     const transactions = await createAttachmentTransactionService<Automerge.Doc<T>, AutomergeSourceCommand<T>>({
-      attachmentId: input.attachmentId ?? sourceId,
-      attachmentIncarnation: globalThis.crypto.randomUUID(),
+      attachmentId,
+      attachmentIncarnation,
       authorityScope: input.authorityScope,
-      preparation: preparation as ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,
+      preparation: boundPreparation,
       source,
       bindings: [binding],
       registry,
@@ -94,7 +115,15 @@ export const openAutomergeAttachment = async <T extends object, Heads>(
     });
     return {
       success: true,
-      value: Object.freeze({ ...transactions, close: () => { source.close(); } }),
+      value: createLiveAutomergeAttachment({
+        attachmentId,
+        incarnation: attachmentIncarnation,
+        authorityScope: input.authorityScope,
+        transactions,
+        preparation: boundPreparation,
+        source,
+        projector
+      }),
       issues: preparation.issues
     };
   } catch (error) {
@@ -122,11 +151,3 @@ const adoptBoundaryJson = (input: unknown): ParseResult<JsonValue> => {
   } catch { /* Plain host JSON is handled by the ordinary parser below. */ }
   return safeParseJsonValue(input);
 };
-
-const failure = (reason: string): ParseResult<never> => ({
-  success: false,
-  issues: [createIssue({ code: 'artifact.invalid_envelope', retry: 'after_input', details: { reason } })]
-});
-
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  value !== null && typeof value === 'object' && !Array.isArray(value);

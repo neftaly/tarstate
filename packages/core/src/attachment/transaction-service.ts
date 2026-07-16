@@ -43,11 +43,16 @@ export type AttachmentTransactionService = {
   ) => Promise<import('../transaction.js').SimulationReceipt>;
 };
 
+type WritableAttachmentPreparation = Pick<
+  ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,
+  'writable' | 'declaration' | 'schema' | 'relations' | 'constraints'
+>;
+
 export type AttachmentTransactionServiceInput<Storage, Command> = {
   readonly attachmentId: string;
   readonly attachmentIncarnation: string;
   readonly authorityScope: string;
-  readonly preparation: ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>;
+  readonly preparation: WritableAttachmentPreparation;
   readonly source: StagedBasisAtomicSource<Storage, Command>;
   readonly bindings: readonly StorageBinding<Storage, Command>[];
   readonly registry: CapabilityRegistry;
@@ -136,7 +141,7 @@ const createExecutionContext = async <Storage, Command>(
 
 const authorStateTransition = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
-  preparation: ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,
+  preparation: WritableAttachmentPreparation,
   before: WritableLogicalState,
   projectionIssues: readonly Issue[],
   transform: (snapshot: AttachmentTransactionSnapshot) => unknown
@@ -146,13 +151,15 @@ const authorStateTransition = async <Storage, Command>(
     const beforeRows = before.rows.map(({ relationId, fields }) => Object.freeze({ relationId, fields }));
     const transformed = await transform(Object.freeze({ rows: Object.freeze(beforeRows) }));
     const afterRows = adoptTransactionRows(transformed, preparation);
+    const beforeByRelation = groupTransactionFields(beforeRows);
+    const afterByRelation = groupTransactionFields(afterRows);
     for (const [relationId, relation] of preparation.relations) {
       const authored = authorExactKeyedRelationDelta({
         relation: { relationId, schemaView: context.schemaView },
         keyFields: relation.keyFields,
         replaceableFields: relation.replaceableFields,
-        before: { completeness: 'exact', rows: beforeRows.filter((row) => row.relationId === relationId).map(({ fields }) => fields) },
-        after: { completeness: 'exact', rows: afterRows.filter((row) => row.relationId === relationId).map(({ fields }) => fields) }
+        before: { completeness: 'exact', rows: beforeByRelation.get(relationId) ?? emptyTransactionFields },
+        after: { completeness: 'exact', rows: afterByRelation.get(relationId) ?? emptyTransactionFields }
       });
       if (!authored.success) throw new TarstateParseError(authored.issues);
       statements.push(...authored.value);
@@ -169,7 +176,7 @@ const authorStateTransition = async <Storage, Command>(
 
 const adoptTransactionRows = (
   input: unknown,
-  preparation: ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>
+  preparation: WritableAttachmentPreparation
 ): readonly AttachmentTransactionRow[] => {
   const owned = detachAndFreezeJsonValue(input);
   if (!owned.success) throw new TarstateParseError(owned.issues);
@@ -185,6 +192,22 @@ const adoptTransactionRows = (
     rows.push(candidate as unknown as AttachmentTransactionRow);
   }
   return Object.freeze(rows);
+};
+
+const emptyTransactionFields: readonly Readonly<Record<string, JsonValue>>[] = Object.freeze([]);
+
+/** Groups one adopted logical state once before per-relation delta authoring. */
+const groupTransactionFields = (
+  rows: readonly AttachmentTransactionRow[]
+): ReadonlyMap<string, readonly Readonly<Record<string, JsonValue>>[]> => {
+  const grouped = new Map<string, Readonly<Record<string, JsonValue>>[]>();
+  for (const { relationId, fields } of rows) {
+    const relationRows = grouped.get(relationId);
+    if (relationRows === undefined) grouped.set(relationId, [fields]);
+    else relationRows.push(fields);
+  }
+  for (const relationRows of grouped.values()) Object.freeze(relationRows);
+  return grouped;
 };
 
 const unavailableQueryService: PreparedTransactionQueryService = {

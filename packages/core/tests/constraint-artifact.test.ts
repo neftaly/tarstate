@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { compileSourceConstraints, expandReferentialDeletes, sealConstraintSet } from '../src/index.js';
+import {
+  checkCurrentConstraints,
+  compileSourceConstraints,
+  expandReferentialDeletes,
+  sealConstraintSet
+} from '../src/index.js';
 
 const hash = (value: string) => `sha256:${value.repeat(64)}` as const;
 const schemaView = { id: 'schema', contentHash: hash('a') };
@@ -15,6 +20,21 @@ describe('portable constraints and referential actions', () => {
     if (violated?.status !== 'violated' || repeat?.status !== 'violated') throw new Error('expected violation');
     expect(repeat.violations[0]?.id).toBe(violated.violations[0]?.id);
     expect(constraints[0]?.evaluate({ mode: 'unknown' }, 2)).toMatchObject({ status: 'indeterminate', failures: [{ code: 'constraint.query_indeterminate' }] });
+  });
+
+  it('reports current required failures as blocking and audit failures as warnings', () => {
+    const failure = { id: 'failure:one', subject: { scopeId: 'row:one' }, code: 'test.invalid' };
+    const checked = checkCurrentConstraints({
+      constraints: [
+        { id: 'required', mode: 'required', dependencyRelations: [], evaluate: () => ({ status: 'violated', violations: [failure] }) },
+        { id: 'audit', mode: 'audit', dependencyRelations: [], evaluate: () => ({ status: 'violated', violations: [failure] }) }
+      ],
+      state: {},
+      basis: { revision: 1 }
+    });
+
+    expect(checked.blockingIssues).toMatchObject([{ code: 'test.invalid', severity: 'error' }]);
+    expect(checked.auditIssues).toMatchObject([{ code: 'test.invalid', severity: 'warning' }]);
   });
 
   it('expands cascades to a cycle-safe fixed point and exposes restrict/set-null', () => {

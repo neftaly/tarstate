@@ -654,8 +654,14 @@ const sameObserverSnapshot = <Row>(left: ObserverSnapshot<Row>, right: ObserverS
   return (consecutiveUnchanged || sharedResultViews) && sameObservedResultMetadata(left.current, right.current);
 };
 
-const sameStringArray = (left: readonly string[], right: readonly string[]): boolean =>
-  left === right || left.length === right.length && left.every((value, index) => value === right[index]);
+const sameStringArray = (left: readonly string[], right: readonly string[]): boolean => {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+};
 
 const sameObservedResultMetadata = <Row>(left: ObservedQueryResult<Row>, right: ObservedQueryResult<Row>): boolean =>
   left.readiness === right.readiness
@@ -672,46 +678,73 @@ const incrementalResultDiff = <Row>(
   afterMetadata: TrustedQueryMaintenanceMetadata
 ): ResultDiff<Row> => {
   const delta = afterMetadata.resultDelta;
-  const ordered = (keys: readonly string[], positions: ReadonlyMap<string, number>): readonly string[] =>
-    [...keys].sort((left, right) => (positions.get(left) ?? 0) - (positions.get(right) ?? 0));
-  const added = ordered(delta.addedResultKeys, afterMetadata.resultKeyPositions).flatMap((key) => {
+  const added: { readonly key: string; readonly row: Row }[] = [];
+  for (const key of orderedResultKeys(delta.addedResultKeys, afterMetadata.resultKeyPositions)) {
     const position = afterMetadata.resultKeyPositions.get(key);
-    return position === undefined ? [] : [Object.freeze({ key, row: after.rows[position] as Row })];
-  });
-  const removed = ordered(delta.removedResultKeys, beforeMetadata.resultKeyPositions).flatMap((key) => {
+    if (position !== undefined) added.push(Object.freeze({ key, row: after.rows[position] as Row }));
+  }
+  const removed: { readonly key: string; readonly row: Row }[] = [];
+  for (const key of orderedResultKeys(delta.removedResultKeys, beforeMetadata.resultKeyPositions)) {
     const position = beforeMetadata.resultKeyPositions.get(key);
-    return position === undefined ? [] : [Object.freeze({ key, row: before.rows[position] as Row })];
-  });
-  const updated = ordered(delta.updatedResultKeys, afterMetadata.resultKeyPositions).flatMap((key) => {
+    if (position !== undefined) removed.push(Object.freeze({ key, row: before.rows[position] as Row }));
+  }
+  const updated: { readonly key: string; readonly before: Row; readonly after: Row }[] = [];
+  for (const key of orderedResultKeys(delta.updatedResultKeys, afterMetadata.resultKeyPositions)) {
     const beforePosition = beforeMetadata.resultKeyPositions.get(key);
     const afterPosition = afterMetadata.resultKeyPositions.get(key);
-    return beforePosition === undefined || afterPosition === undefined ? [] : [Object.freeze({
-      key,
-      before: before.rows[beforePosition] as Row,
-      after: after.rows[afterPosition] as Row
-    })];
-  });
+    if (beforePosition !== undefined && afterPosition !== undefined) {
+      updated.push(Object.freeze({
+        key,
+        before: before.rows[beforePosition] as Row,
+        after: after.rows[afterPosition] as Row
+      }));
+    }
+  }
   return Object.freeze({ added: Object.freeze(added), removed: Object.freeze(removed), updated: Object.freeze(updated) });
 };
 
+const orderedResultKeys = (
+  keys: readonly string[],
+  positions: ReadonlyMap<string, number>
+): readonly string[] => keys.length < 2
+  ? keys
+  : [...keys].sort((left, right) => (positions.get(left) ?? 0) - (positions.get(right) ?? 0));
+
 const resultDiff = <Row>(before: ObservedQueryResult<Row>, after: ObservedQueryResult<Row>): ResultDiff<Row> => {
-  const beforeRows = new Map(before.resultKeys.map((key, index) => [key, before.rows[index] as Row]));
-  const afterRows = new Map(after.resultKeys.map((key, index) => [key, after.rows[index] as Row]));
-  const added = [...afterRows].filter(([key]) => !beforeRows.has(key)).map(([key, row]) => Object.freeze({ key, row }));
-  const removed = [...beforeRows].filter(([key]) => !afterRows.has(key)).map(([key, row]) => Object.freeze({ key, row }));
-  const updated = [...afterRows].flatMap(([key, row]) => {
-    const prior = beforeRows.get(key);
-    return prior === undefined || samePortableObserverValue(prior, row) ? [] : [Object.freeze({ key, before: prior, after: row })];
-  });
+  const beforeRows = new Map<string, Row>();
+  const afterRows = new Map<string, Row>();
+  for (let index = 0; index < before.resultKeys.length; index += 1) {
+    beforeRows.set(before.resultKeys[index] as string, before.rows[index] as Row);
+  }
+  for (let index = 0; index < after.resultKeys.length; index += 1) {
+    afterRows.set(after.resultKeys[index] as string, after.rows[index] as Row);
+  }
+  const added: { readonly key: string; readonly row: Row }[] = [];
+  const removed: { readonly key: string; readonly row: Row }[] = [];
+  const updated: { readonly key: string; readonly before: Row; readonly after: Row }[] = [];
+  for (const [key, row] of afterRows) {
+    const wasPresent = beforeRows.has(key);
+    if (!wasPresent) added.push(Object.freeze({ key, row }));
+    const prior = beforeRows.get(key) as Row;
+    if (wasPresent && !samePortableObserverValue(prior, row)) {
+      updated.push(Object.freeze({ key, before: prior, after: row }));
+    }
+  }
+  for (const [key, row] of beforeRows) {
+    if (!afterRows.has(key)) removed.push(Object.freeze({ key, row }));
+  }
   return Object.freeze({ added: Object.freeze(added), removed: Object.freeze(removed), updated: Object.freeze(updated) });
 };
 
 const compositeFreshness = (evidence: readonly SourceEvidence[]): 'current' | 'stale' | 'mixed' | 'none' => {
-  const usable = evidence.filter(({ state }) => state === 'ready').map(({ freshness }) => freshness);
-  if (usable.length === 0) return evidence.length === 0 ? 'current' : 'none';
-  const unique = new Set(usable);
-  if (unique.size === 1) return usable[0] === 'none' ? 'none' : usable[0] as 'current' | 'stale';
-  return 'mixed';
+  let freshness: SourceEvidence['freshness'] | undefined;
+  for (const source of evidence) {
+    if (source.state !== 'ready') continue;
+    if (freshness !== undefined && freshness !== source.freshness) return 'mixed';
+    freshness = source.freshness;
+  }
+  if (freshness === undefined) return evidence.length === 0 ? 'current' : 'none';
+  return freshness;
 };
 
 const staleResult = <Row>(result: ObservedQueryResult<Row>): ObservedQueryResult<Row> => result.freshness === 'stale' ? result : Object.freeze({ ...result, freshness: 'stale' });

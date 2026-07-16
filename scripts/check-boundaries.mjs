@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const coreSource = path.join(root, 'packages/core/src');
+const satelliteSources = ['automerge', 'react', 'schema-tools', 'zustand'].map((name) => path.join(root, 'packages', name, 'src'));
 
 const sourceFiles = (directory) => readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
   const location = path.join(directory, entry.name);
@@ -17,10 +18,12 @@ const runtimeDependencies = new Map(coreFiles.map((file) => [file, new Set()]));
 
 const importPattern = /^\s*import\s+(type\s+)?(?:[^;]+?\s+from\s+)?['"]([^'"]+)['"]\s*;/gm;
 const exportPattern = /^\s*export\s+(type\s+)?[^;]*?\s+from\s+['"]([^'"]+)['"]\s*;/gm;
+const inlineImportPattern = /\bimport\(\s*['"]([^'"]+)['"]\s*\)/g;
 
 const staticDependencies = (source) => [
   ...Array.from(source.matchAll(importPattern), (match) => ({ typeOnly: match[1] !== undefined, specifier: match[2] })),
-  ...Array.from(source.matchAll(exportPattern), (match) => ({ typeOnly: match[1] !== undefined, specifier: match[2] }))
+  ...Array.from(source.matchAll(exportPattern), (match) => ({ typeOnly: match[1] !== undefined, specifier: match[2] })),
+  ...Array.from(source.matchAll(inlineImportPattern), (match) => ({ typeOnly: true, specifier: match[1] }))
 ];
 
 const resolveCoreDependency = (importer, specifier) => {
@@ -144,7 +147,11 @@ assignArchitectureGroup('transaction-runtime', [
   'lifecycle-governance.ts',
   'transaction-executor.ts'
 ]);
-assignArchitectureGroup('attachment-runtime', ['attachment/preparation.ts', 'attachment/transaction-service.ts']);
+assignArchitectureGroup('attachment-runtime', [
+  'attachment/logical-constraint-query.ts',
+  'attachment/preparation.ts',
+  'attachment/transaction-service.ts'
+]);
 assignArchitectureGroup('observer-contract', ['database-model.ts', 'observer-maintenance-contracts.ts']);
 assignArchitectureGroup('observer', [
   'database.ts',
@@ -316,6 +323,28 @@ const assertAcyclic = (name, graph) => {
 
 assertAcyclic('runtime', runtimeDependencies);
 assertAcyclic('source/declaration', allDependencies);
+
+const coreManifest = JSON.parse(readFileSync(path.join(root, 'packages/core/package.json'), 'utf8'));
+const publicCoreSpecifiers = new Set(Object.keys(coreManifest.exports).map((specifier) => (
+  specifier === '.' ? '@tarstate/core' : '@tarstate/core/' + specifier.slice(2)
+)));
+
+for (const satelliteSource of satelliteSources) {
+  for (const file of sourceFiles(satelliteSource)) {
+    const source = readFileSync(file, 'utf8');
+    for (const dependency of staticDependencies(source)) {
+      if (dependency.specifier === '@tarstate/core' || dependency.specifier.startsWith('@tarstate/core/')) {
+        if (!publicCoreSpecifiers.has(dependency.specifier)) {
+          throw new Error(relative(file) + ' imports non-public core module ' + dependency.specifier);
+        }
+        continue;
+      }
+      if (dependency.specifier.startsWith('@tarstate/')) {
+        throw new Error(relative(file) + ' couples satellite packages through ' + dependency.specifier);
+      }
+    }
+  }
+}
 
 console.log('Verified architecture directions, source-owned public closures, acyclic dependencies, and narrow satellite imports.');
 
