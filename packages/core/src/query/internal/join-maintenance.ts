@@ -15,6 +15,16 @@ import { withMaintenanceEvent, type MaterializedQueryNode } from './maintenance-
 import type { Expr, QueryNode } from '../model.js';
 import type { QueryMaintenanceFallbackReason } from '../incremental-model.js';
 
+const inputRowsUnchanged = (
+  previous: readonly ScopedRow[],
+  next: readonly ScopedRow[],
+  stableChangedPositions: readonly number[] | undefined
+): boolean => previous === next
+  || previous.length === next.length
+    && (stableChangedPositions === undefined
+      ? previous.every((row, index) => row === next[index])
+      : stableChangedPositions.length === 0);
+
 export const incrementallyMaterializeJoinWith = (
   node: Extract<QueryNode, { readonly kind: 'join' }>,
   materializedNodes: ReadonlyMap<QueryNode, MaterializedQueryNode>,
@@ -36,9 +46,13 @@ export const incrementallyMaterializeJoinWith = (
   if ((node.join === 'anti' || node.join === 'left') && right.result.completeness !== 'exact') return withMaintenanceEvent(fallback(), { operator: 'join', strategy: 'fallback', affectedUnitCount: left.result.rows.length, reason: 'input_unavailable' });
   const issues: Issue[] = [];
   const context = contextFor(issues);
-  const rightUnchanged = previous.join.rightInputs.length === right.result.rows.length && previous.join.rightInputs.every((row, index) => row === right.result.rows[index]);
   const stableRightChanges = right.stableChangedPositions !== undefined
     && previous.join.rightInputs.length === right.result.rows.length;
+  const rightUnchanged = inputRowsUnchanged(
+    previous.join.rightInputs,
+    right.result.rows,
+    stableRightChanges ? right.stableChangedPositions : undefined
+  );
   const sparseRightChanges = stableRightChanges
     && (right.stableChangedPositions?.length ?? 0) <= Math.max(32, Math.floor(right.result.rows.length / 4));
   const rightIndex = rightUnchanged && previous.join.rightIndex !== undefined
@@ -118,9 +132,11 @@ export const incrementallyMaterializeJoinWith = (
     : sparseRightChanges
       ? changedExpressionKeysAtPositions(previous.join.rightInputs, right.result.rows, right.stableChangedPositions ?? [], equality.right, context)
       : changedExpressionKeys(previous.join.rightInputs, right.result.rows, equality.right, context);
-  const leftUnchanged = previous.join.leftInputs === left.result.rows
-    || previous.join.leftInputs.length === left.result.rows.length
-      && previous.join.leftInputs.every((row, index) => row === left.result.rows[index]);
+  const leftUnchanged = inputRowsUnchanged(
+    previous.join.leftInputs,
+    left.result.rows,
+    stableLeftChanges ? left.stableChangedPositions : undefined
+  );
   const selectivelyAffectedLeftPositions = leftUnchanged && sparseRightChanges && retainedLeftPositions !== undefined
     ? affectedJoinPositions(affectedRightKeys, retainedLeftPositions)
     : undefined;

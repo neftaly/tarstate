@@ -134,7 +134,8 @@ export const openIncrementalQueryMaintenance = (
 
         const nextSnapshot = applied.value;
         const run = createEvaluationRun(nextSnapshot.executionBudget);
-        const changedRelations = new Set(ownedUpdate.relations.map(({ relation }) => relationKey(relation)));
+        const changedRelations = new Set<string>();
+        for (const { relation } of ownedUpdate.relations) changedRelations.add(relationKey(relation));
         const sessionEvidenceChanged = !sameOptionalJson(acceptedSnapshot.basis, nextSnapshot.basis)
           || acceptedSnapshot.membershipRevision !== nextSnapshot.membershipRevision;
         let updatedNodeCount = 0;
@@ -144,7 +145,12 @@ export const openIncrementalQueryMaintenance = (
           const children = graph.children.get(node) as readonly QueryNode[];
           const externalDependencies = graph.externalDependencies.get(node) as ReadonlySet<string>;
           const childChanged = children.some((child) => changedNodes.has(child));
-          const externalInputChanged = [...externalDependencies].some((key) => changedRelations.has(key));
+          let externalInputChanged = false;
+          for (const key of externalDependencies) {
+            if (!changedRelations.has(key)) continue;
+            externalInputChanged = true;
+            break;
+          }
           const evidenceInputChanged = sessionEvidenceChanged && graph.sessionEvidenceDependencies.get(node) === true;
           if (!evidenceInputChanged && !childChanged && !externalInputChanged) continue;
           if (!evidenceInputChanged && !externalInputChanged && node.kind === 'select') {

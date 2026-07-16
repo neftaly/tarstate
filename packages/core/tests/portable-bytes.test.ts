@@ -7,6 +7,7 @@ import {
 describe('portable bytes', () => {
   it('materializes canonical bytes without exposing base64url details to consumers', () => {
     const portable = toPortableBytes(new Uint8Array([0, 1, 2, 253, 254, 255]));
+    const materialized = safeMaterializePortableBytes(portable);
 
     expect(portable).toEqual({
       kind: 'tarstate.value',
@@ -14,10 +15,13 @@ describe('portable bytes', () => {
       value: 'AAEC_f7_'
     });
     expect(Object.isFrozen(portable)).toBe(true);
-    expect(safeMaterializePortableBytes(portable)).toMatchObject({
+    expect(materialized).toMatchObject({
       success: true,
       value: new Uint8Array([0, 1, 2, 253, 254, 255])
     });
+    if (!materialized.success) return;
+    const blobPart: BlobPart = materialized.value;
+    expect(new Blob([blobPart]).size).toBe(6);
   });
 
   it.each([

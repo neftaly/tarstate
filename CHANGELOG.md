@@ -5,6 +5,40 @@ history.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-07-17
+
+### Changed
+
+- Sparse query maintenance now uses its private stable-position evidence for
+  scheduler equality and operator layout checks, avoiding redundant full-row
+  scans and temporary dependency arrays without adding a public fast path.
+- Portable byte materialization now preserves its concrete
+  `Uint8Array<ArrayBuffer>` ownership in the public type, so browser consumers
+  can construct `Blob` values without a defensive copy.
+
+## [0.4.4] - 2026-07-17
+
+### Added
+
+- Added abortable query-session settlement and a narrow portable-bytes topic
+  for canonical native byte conversion.
+- Optional schema fields may be explicitly absent from storage mappings while
+  remaining excluded from read and write footprints.
+
+## [0.4.3] - 2026-07-17
+
+### Fixed
+
+- Followed database sources now retain their owned lifetimes until the final
+  query lease closes.
+
+## [0.4.2] - 2026-07-17
+
+### Added
+
+- Added live source-link discovery with bounded fixed-point traversal and
+  settlement-aware query sessions.
+
 ## [0.4.1] - 2026-07-17
 
 ### Breaking changes
@@ -175,7 +209,12 @@ history.
 - Hardened relational, source, transaction, typed-query, and differential
   maintenance contracts for the v1 architecture.
 
-[Unreleased]: https://github.com/neftaly/tarstate/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/neftaly/tarstate/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/neftaly/tarstate/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/neftaly/tarstate/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/neftaly/tarstate/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/neftaly/tarstate/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/neftaly/tarstate/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/neftaly/tarstate/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/neftaly/tarstate/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/neftaly/tarstate/compare/c324fdb...v0.2.2

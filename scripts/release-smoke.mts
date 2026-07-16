@@ -7,6 +7,7 @@ import type { QueryNode as TopicQueryNode } from '../packages/core/dist/query/in
 import type { PreparedPlan as TopicPreparedPlan } from '../packages/core/dist/query/index.js';
 import type { SchemaBody as TopicSchemaBody } from '../packages/core/dist/schema/index.js';
 import type { Transaction as TopicTransaction } from '../packages/core/dist/transactions/index.js';
+import type { safeMaterializePortableBytes } from '../packages/core/dist/values/index.js';
 import type { AutomergeDatabase } from '../packages/automerge/dist/index.js';
 import type { zustandAtomicExternalStore } from '../packages/zustand/dist/index.js';
 import type { ReactPreparedPlan } from '../packages/react/dist/index.js';
@@ -19,5 +20,9 @@ declare const zustand: typeof zustandAtomicExternalStore;
 declare const plan: ReactPreparedPlan<unknown, { readonly id: string }>;
 declare const description: DatabaseDescription;
 declare const topicSurface: readonly [TopicArtifact, TopicDatabaseView<unknown, unknown>, TopicObserverDiagnosticReporter, TopicQueryNode, TopicPreparedPlan, TopicSchemaBody, TopicTransaction];
+type MaterializedBytes = Extract<ReturnType<typeof safeMaterializePortableBytes>, { readonly success: true }>['value'];
+declare const materializedBytes: MaterializedBytes;
+const ownedBytes: Uint8Array<ArrayBuffer> = materializedBytes;
+const blobPart: BlobPart = materializedBytes;
 
-void [query, lifecycle, automerge, zustand, plan, description, topicSurface];
+void [query, lifecycle, automerge, zustand, plan, description, topicSurface, ownedBytes, blobPart];

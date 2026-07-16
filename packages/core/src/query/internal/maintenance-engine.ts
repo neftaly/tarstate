@@ -177,12 +177,12 @@ const windowPartitionKey = (node: Extract<QueryNode, { readonly kind: 'window' }
   return canonicalizeJson(values.map(expressionJson));
 };
 
+// Stable-position evidence already proves that result identities retain their layout.
 const stableReplacementLayout = (
   previous: readonly ScopedRow[],
   next: readonly ScopedRow[],
   changedPositions: readonly number[] | undefined
 ): boolean => previous.length === next.length
-  && previous.every((row, index) => resultKey(row) === resultKey(next[index] as ScopedRow))
   && (changedPositions !== undefined || previous.every((row, index) => row === next[index]));
 
 export const incrementallyMaterializeSlice = (
@@ -302,7 +302,6 @@ const microMaterializeStableWindow = (
 ): MaterializedQueryNode | undefined => {
   const state = previous.window;
   if (state?.layouts === undefined || state.inputs.length !== inputs.length || previous.result.rows.length !== inputs.length) return undefined;
-  if (!state.inputs.every((row, index) => resultKey(row) === resultKey(inputs[index] as ScopedRow))) return undefined;
   const { outputFields, specifications } = windowMaintenancePlan(node);
   if (Object.values(node.fields).some((window) => window.op === 'lag' && window.value !== undefined && expressionReferencesWindowFields(window.value, node.alias, outputFields))) return undefined;
 
@@ -402,8 +401,8 @@ export const incrementallyMaterializeWindow = (
     const micro = microMaterializeStableWindow(node, child.result.rows, child.stableChangedPositions, previous, context);
     if (micro !== undefined) return micro;
   }
-  const stableIdentityLayout = previous.window.inputs.length === child.result.rows.length
-    && previous.window.inputs.every((row, index) => resultKey(row) === resultKey(child.result.rows[index] as ScopedRow));
+  const stableIdentityLayout = child.stableChangedPositions !== undefined
+    && previous.window.inputs.length === child.result.rows.length;
   const { specifications } = windowMaintenancePlan(node);
 
   if (stableIdentityLayout && child.stableChangedPositions !== undefined && previous.window.layouts !== undefined) {
@@ -1455,10 +1454,22 @@ export const materializedQueryNodeEqual = (left: MaterializedQueryNode, right: M
   if (left.issues.length !== right.issues.length || left.issues.some((issue, index) => issue.id !== right.issues[index]?.id)) return false;
   if (left.result.rows.length !== right.result.rows.length) return false;
   if (right.verifiedChangedPositions !== undefined) return right.verifiedChangedPositions.length === 0;
-  return left.result.rows.every((row, index) => {
+  if (right.stableChangedPositions !== undefined) {
+    for (const index of right.stableChangedPositions) {
+      const row = left.result.rows[index];
+      const candidate = right.result.rows[index];
+      if (row === undefined
+        || candidate === undefined
+        || row !== candidate && scopedRowIdentity(row, values) !== scopedRowIdentity(candidate, values)) return false;
+    }
+    return true;
+  }
+  for (let index = 0; index < left.result.rows.length; index += 1) {
+    const row = left.result.rows[index] as ScopedRow;
     const candidate = right.result.rows[index] as ScopedRow;
-    return row === candidate || scopedRowIdentity(row, values) === scopedRowIdentity(candidate, values);
-  });
+    if (row !== candidate && scopedRowIdentity(row, values) !== scopedRowIdentity(candidate, values)) return false;
+  }
+  return true;
 };
 
 const changedRowPositionsIfStableIdentity = (

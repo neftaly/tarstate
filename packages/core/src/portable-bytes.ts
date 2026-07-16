@@ -20,7 +20,7 @@ export const toPortableBytes = (bytes: Uint8Array): PortableBytes => Object.free
 });
 
 /** Materializes a canonical Tarstate bytes scalar without throwing for invalid data. */
-export const safeMaterializePortableBytes = (input: unknown): ParseResult<Uint8Array> => {
+export const safeMaterializePortableBytes = (input: unknown): ParseResult<Uint8Array<ArrayBuffer>> => {
   const encoded = inspectPortableBytes(input);
   if (encoded === undefined) return invalidPortableBytes();
   const decoded = decodeBase64Url(encoded);
@@ -49,7 +49,7 @@ const encodeBase64Url = (bytes: Uint8Array): string => {
   return chunks.join('');
 };
 
-const decodeBase64Url = (value: string): Uint8Array | undefined => {
+const decodeBase64Url = (value: string): Uint8Array<ArrayBuffer> | undefined => {
   if (value.length % 4 === 1) return undefined;
   const output = new Uint8Array(Math.floor(value.length * 6 / 8));
   let bits = 0;

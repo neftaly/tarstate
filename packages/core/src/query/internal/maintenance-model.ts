@@ -45,6 +45,10 @@ export type MaterializedQueryNode = {
   readonly issues: readonly Issue[];
   readonly unavailable: boolean;
   readonly maintenanceEvent?: QueryMaintenanceOperatorEvent;
+  /**
+   * When present, result length and identities match the preceding accepted
+   * materialization, and public value changes are confined to these positions.
+   */
   readonly stableChangedPositions?: readonly number[];
   /** Stable-identity positions already proven to differ in their public logical value. */
   readonly verifiedChangedPositions?: readonly number[];
