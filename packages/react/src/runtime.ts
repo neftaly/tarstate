@@ -8,8 +8,8 @@ import type {
   ObservableDatabase,
   ServerQueryObservation
 } from './contracts.js';
-import { MutationStore } from './mutation-store.js';
-import { OptimisticOverlayStore } from './optimistic-store.js';
+import { createMutationStore, type MutationStore } from './mutation-store.js';
+import { createOptimisticOverlayStore, type OptimisticOverlayStore } from './optimistic-store.js';
 import { runReactCleanups } from './shared.js';
 
 export type Runtime = {
@@ -27,8 +27,11 @@ export const createRuntime = (
   onDiagnostic: ObserverDiagnosticReporter | undefined
 ): Runtime => {
   let mutationStore: MutationStore | undefined;
-  const overlayStore = new OptimisticOverlayStore((mutationId, error) => mutationStore?.recordOptimisticError(mutationId, error), onDiagnostic);
-  mutationStore = new MutationStore(overlayStore, onDiagnostic);
+  const overlayStore = createOptimisticOverlayStore(
+    (mutationId, error) => mutationStore?.recordOptimisticError(mutationId, error),
+    onDiagnostic
+  );
+  mutationStore = createMutationStore(overlayStore, onDiagnostic);
   let acquisitions = 0;
   let closeGeneration = 0;
   let closed = false;

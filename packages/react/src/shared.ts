@@ -18,6 +18,17 @@ const reportReactDiagnostic = (
   try { reporter(diagnostic); } catch { /* diagnostics cannot affect adapter state */ }
 };
 
+export const notifyReactListener = (
+  listener: () => void,
+  component: ReactDiagnosticComponent,
+  operation: string,
+  reporter?: ObserverDiagnosticReporter
+): void => {
+  try { listener(); } catch (error) {
+    reportReactDiagnostic(reporter, Object.freeze({ kind: 'listener_error', component, operation, error }));
+  }
+};
+
 export const notifyReactListeners = (
   listeners: Iterable<() => void>,
   component: ReactDiagnosticComponent,
@@ -25,9 +36,7 @@ export const notifyReactListeners = (
   reporter?: ObserverDiagnosticReporter
 ): void => {
   for (const listener of Array.from(listeners)) {
-    try { listener(); } catch (error) {
-      reportReactDiagnostic(reporter, Object.freeze({ kind: 'listener_error', component, operation, error }));
-    }
+    notifyReactListener(listener, component, operation, reporter);
   }
 };
 

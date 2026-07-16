@@ -358,6 +358,14 @@ for (const satelliteSource of satelliteSources) {
   }
 }
 
+for (const name of ['mutation-store.ts', 'optimistic-store.ts', 'query-store.ts']) {
+  const file = path.join(root, 'packages/react/src', name);
+  const source = readFileSync(file, 'utf8');
+  if (/\bclass\s|\bthis\./.test(source)) {
+    throw new Error('React store state machines must keep transitions in closure-based shells: ' + relative(file));
+  }
+}
+
 console.log('Verified architecture directions, source-owned public closures, acyclic dependencies, and narrow satellite imports.');
 
 function relative(file) {

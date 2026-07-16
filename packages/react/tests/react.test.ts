@@ -23,12 +23,13 @@ import {
   type MutationState,
   type ObservableDatabase,
   type CreateOptimisticOverlay,
+  type OptimisticOverlayInput,
   type OptimisticProjection,
   type ReactObserverSnapshot,
   type ReactPreparedPlan
 } from '../src/index.js';
-import { OptimisticOverlayStore } from '../src/optimistic-store.js';
-import { QueryStore } from '../src/query-store.js';
+import { createOptimisticOverlayStore } from '../src/optimistic-store.js';
+import { createQueryStore } from '../src/query-store.js';
 
 type Query = QueryNode;
 type Row = { readonly id: number; readonly name: string };
@@ -193,6 +194,32 @@ describe('@tarstate/react', () => {
     expect(firstSnapshots.at(-1)).toMatchObject({ current: { rows: [{ id: 1, name: 'one' }] } });
     expect(secondSnapshots.at(-1)).toMatchObject({ current: { rows: [{ id: 2, name: 'two' }] } });
     expect(diagnostics).toMatchObject([{ kind: 'listener_error', component: 'react-query', operation: 'publish-query-store' }]);
+  });
+
+  it('routes shared query listener failures to the subscribing runtime', async () => {
+    const database = new TestDatabase();
+    const firstDiagnostics: ObserverDiagnostic[] = [];
+    const secondDiagnostics: ObserverDiagnostic[] = [];
+    const store = createQueryStore<Row>(
+      database as ObservableDatabase<unknown, unknown>,
+      { plan },
+      () => undefined
+    );
+    const unsubscribeFirst = store.subscribe(() => undefined, (diagnostic) => firstDiagnostics.push(diagnostic));
+    const unsubscribeSecond = store.subscribe(() => { throw new Error('second listener failed'); }, (diagnostic) => secondDiagnostics.push(diagnostic));
+
+    database.observers[0]?.publish(openSnapshot([{ id: 2, name: 'two' }], 1));
+
+    expect(firstDiagnostics).toEqual([]);
+    expect(secondDiagnostics).toMatchObject([{
+      kind: 'listener_error',
+      component: 'react-query',
+      operation: 'publish-query-store',
+      error: expect.objectContaining({ message: 'second listener failed' })
+    }]);
+    unsubscribeFirst();
+    unsubscribeSecond();
+    await Promise.resolve();
   });
 
   it('attempts every query teardown and reports contained cleanup failures', async () => {
@@ -787,9 +814,9 @@ describe('@tarstate/react', () => {
     };
     unrelated.snapshot = Object.freeze({ state: 'open', current: unrelatedCurrent, lastExact: unrelatedCurrent });
     const request: ObserveRequest<Query> = { plan };
-    const primaryStore = new QueryStore<Row>(primary as ObservableDatabase<unknown, unknown>, request, () => undefined);
-    const unrelatedStore = new QueryStore<Row>(unrelated as ObservableDatabase<unknown, unknown>, request, () => undefined);
-    const overlays = new OptimisticOverlayStore(() => undefined);
+    const primaryStore = createQueryStore<Row>(primary as ObservableDatabase<unknown, unknown>, request, () => undefined);
+    const unrelatedStore = createQueryStore<Row>(unrelated as ObservableDatabase<unknown, unknown>, request, () => undefined);
+    const overlays = createOptimisticOverlayStore(() => undefined);
     const primaryView = overlays.view(primaryStore, request, 'primary');
     const unrelatedView = overlays.view(unrelatedStore, request, 'unrelated');
     const primaryListener = vi.fn();
@@ -808,6 +835,71 @@ describe('@tarstate/react', () => {
 
     unsubscribePrimary();
     unsubscribeUnrelated();
+    overlays.close();
+  });
+
+  it('allows a delayed concurrent subscription after speculative view collection', async () => {
+    const database = new TestDatabase();
+    const request: ObserveRequest<Query> = { plan };
+    const base = createQueryStore<Row>(
+      database as ObservableDatabase<unknown, unknown>,
+      request,
+      () => undefined
+    );
+    const overlays = createOptimisticOverlayStore(() => undefined);
+    const view = overlays.view(base, request, 'speculative');
+    view.getSnapshot();
+    await Promise.resolve();
+
+    const listener = vi.fn();
+    const unsubscribe = view.subscribe(listener);
+    expect(overlays.add(1, transactionAttempt(), {
+      sourceId: 'source:one',
+      sourceBasis: { incarnation: 'one', revision: 0 },
+      projectRows: ({ currentRows, currentResultKeys }: OptimisticOverlayInput<Query, Row>) => ({
+        rows: currentRows.map((row) => ({ ...row, name: row.name + '+pending' })),
+        resultKeys: currentResultKeys
+      })
+    })).toBeUndefined();
+
+    expect(listener).toHaveBeenCalledOnce();
+    expect(view.getSnapshot()).toMatchObject({
+      current: { rows: [{ id: 1, name: 'one+pending' }] },
+      optimistic: { operations: [{ operationId: 'operation:one' }] }
+    });
+    unsubscribe();
+    overlays.close();
+  });
+
+  it('reprojects overlays added between same-turn unsubscribe and resubscribe', () => {
+    const database = new TestDatabase();
+    const request: ObserveRequest<Query> = { plan };
+    const base = createQueryStore<Row>(
+      database as ObservableDatabase<unknown, unknown>,
+      request,
+      () => undefined
+    );
+    const overlays = createOptimisticOverlayStore(() => undefined);
+    const view = overlays.view(base, request, 'reactivated');
+    const unsubscribe = view.subscribe(() => undefined);
+    expect(view.getSnapshot()).not.toHaveProperty('optimistic');
+    unsubscribe();
+
+    expect(overlays.add(1, transactionAttempt(), {
+      sourceId: 'source:one',
+      sourceBasis: { incarnation: 'one', revision: 0 },
+      projectRows: ({ currentRows, currentResultKeys }: OptimisticOverlayInput<Query, Row>) => ({
+        rows: currentRows.map((row) => ({ ...row, name: row.name + '+pending' })),
+        resultKeys: currentResultKeys
+      })
+    })).toBeUndefined();
+    const unsubscribeAgain = view.subscribe(() => undefined);
+
+    expect(view.getSnapshot()).toMatchObject({
+      current: { rows: [{ id: 1, name: 'one+pending' }] },
+      optimistic: { operations: [{ operationId: 'operation:one' }] }
+    });
+    unsubscribeAgain();
     overlays.close();
   });
 

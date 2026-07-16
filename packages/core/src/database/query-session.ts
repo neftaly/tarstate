@@ -43,6 +43,14 @@ export type DatabaseQuerySource = DatabaseQuerySourceOptions & (
   | { readonly source?: never; readonly unresolved: UnresolvedDatabaseSource }
 );
 
+type NormalizedDatabaseQuerySource = {
+  readonly expectation: 'required' | 'optional';
+  readonly discoveryEdges: readonly string[];
+} & (
+  | { readonly kind: 'mountable'; readonly source: MountableDatabaseSource }
+  | { readonly kind: 'unresolved'; readonly attachmentId: string; readonly sourceId: string }
+);
+
 export type DatabaseQueryReadContext = {
   readonly queryAuthorityScope: string;
   readonly sourceAuthorityScope: string;
@@ -82,6 +90,7 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
   if (typeof options.queryAuthorityScope !== 'string' || options.queryAuthorityScope.length === 0) {
     throw new TypeError('queryAuthorityScope must be a non-empty string');
   }
+  const sources = normalizeDatabaseQuerySources(options.sources);
   const catalog = new AttachmentCatalog(
     options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }
   );
@@ -91,21 +100,18 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
 
   try {
     const members: DatasetMember[] = [];
-    for (const member of options.sources) {
-      if (member.unresolved !== undefined) {
-        if (member.unresolved.attachmentId.length === 0 || member.unresolved.sourceId.length === 0) {
-          throw new TypeError('Unresolved database source IDs must not be empty');
-        }
+    for (const member of sources) {
+      if (member.kind === 'unresolved') {
         members.push({
-          attachmentId: member.unresolved.attachmentId,
-          sourceId: member.unresolved.sourceId,
-          expectation: member.expectation ?? 'required',
-          discoveryEdges: member.discoveryEdges ?? []
+          attachmentId: member.attachmentId,
+          sourceId: member.sourceId,
+          expectation: member.expectation,
+          discoveryEdges: member.discoveryEdges
         });
         continue;
       }
       const lease = await member.source.mount(catalog, {
-        discoveryEdges: member.discoveryEdges ?? []
+        discoveryEdges: member.discoveryEdges
       });
       leases.push(lease);
       if (catalog.get(lease.attachmentId)?.sourceId !== lease.sourceId) {
@@ -114,7 +120,7 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
       members.push({
         attachmentId: lease.attachmentId,
         sourceId: lease.sourceId,
-        expectation: member.expectation ?? 'required',
+        expectation: member.expectation,
         discoveryEdges: lease.discoveryEdges
       } as const);
     }
@@ -180,4 +186,82 @@ export const openDatabaseQuery = async <Plan extends PreparedPlan<QueryNode>>(
       );
     }
   });
+};
+
+const normalizeDatabaseQuerySources = (input: unknown): readonly NormalizedDatabaseQuerySource[] => {
+  if (!Array.isArray(input)) throw new TypeError('sources must be an array');
+  const sources: NormalizedDatabaseQuerySource[] = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const label = `sources[${index}]`;
+    const candidate = input[index];
+    if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      throw new TypeError(`${label} must be an object`);
+    }
+    const member = candidate as {
+      readonly source?: unknown;
+      readonly unresolved?: unknown;
+      readonly expectation?: unknown;
+      readonly discoveryEdges?: unknown;
+    };
+    const source = member.source;
+    const unresolved = member.unresolved;
+    if ((source === undefined) === (unresolved === undefined)) {
+      throw new TypeError(`${label} must provide exactly one of source or unresolved`);
+    }
+    const expectation = member.expectation ?? 'required';
+    if (expectation !== 'required' && expectation !== 'optional') {
+      throw new TypeError(`${label}.expectation must be required or optional`);
+    }
+    const discoveryEdges = normalizeStringArray(
+      member.discoveryEdges ?? [],
+      `${label}.discoveryEdges`
+    );
+    if (source !== undefined) {
+      if (source === null || (typeof source !== 'object' && typeof source !== 'function')
+        || typeof (source as { readonly mount?: unknown }).mount !== 'function') {
+        throw new TypeError(`${label}.source must provide a mount function`);
+      }
+      sources.push({
+        kind: 'mountable',
+        source: source as MountableDatabaseSource,
+        expectation,
+        discoveryEdges
+      });
+      continue;
+    }
+    if (unresolved === null || typeof unresolved !== 'object' || Array.isArray(unresolved)) {
+      throw new TypeError(`${label}.unresolved must be an object`);
+    }
+    const { attachmentId, sourceId } = unresolved as {
+      readonly attachmentId?: unknown;
+      readonly sourceId?: unknown;
+    };
+    if (typeof attachmentId !== 'string' || attachmentId.length === 0
+      || typeof sourceId !== 'string' || sourceId.length === 0) {
+      throw new TypeError(`${label}.unresolved IDs must be non-empty strings`);
+    }
+    sources.push({
+      kind: 'unresolved',
+      attachmentId,
+      sourceId,
+      expectation,
+      discoveryEdges
+    });
+  }
+  return sources;
+};
+
+const normalizeStringArray = (input: unknown, label: string): readonly string[] => {
+  if (!Array.isArray(input)) throw new TypeError(`${label} must be an array of strings`);
+  const values: string[] = [];
+  const valueCount = input.length;
+  for (let index = 0; index < valueCount; index += 1) {
+    if (!Object.hasOwn(input, index)) {
+      throw new TypeError(`${label} must be a dense array of strings`);
+    }
+    const value = input[index];
+    if (typeof value !== 'string') throw new TypeError(`${label} must be a dense array of strings`);
+    values.push(value);
+  }
+  return Object.freeze([...new Set(values)].sort());
 };

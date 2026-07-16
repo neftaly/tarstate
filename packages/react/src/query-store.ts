@@ -5,11 +5,11 @@ import type {
   QueryObserver
 } from '@tarstate/core/database/observer';
 import type { ErasedDatabase } from './contracts.js';
-import { notifyReactListeners, runReactCleanups } from './shared.js';
+import { notifyReactListener, runReactCleanups } from './shared.js';
 
 const storesByDatabase = new WeakMap<object, Map<string, QueryStore<unknown>>>();
 
-export const queryStore = <Query, Row>(database: ErasedDatabase, request: ObserveRequest<Query>, key: string, onDiagnostic?: ObserverDiagnosticReporter): QueryStore<Row> => {
+export const queryStore = <Query, Row>(database: ErasedDatabase, request: ObserveRequest<Query>, key: string): QueryStore<Row> => {
   let stores = storesByDatabase.get(database);
   if (stores === undefined) {
     stores = new Map();
@@ -17,68 +17,79 @@ export const queryStore = <Query, Row>(database: ErasedDatabase, request: Observ
   }
   const existing = stores.get(key);
   if (existing !== undefined) return existing as QueryStore<Row>;
-  const store = new QueryStore<Row>(database, request as unknown as ObserveRequest<unknown>, () => {
+  const store = createQueryStore<Row>(database, request as unknown as ObserveRequest<unknown>, () => {
     if (stores?.get(key) === store) stores.delete(key);
-  }, onDiagnostic);
+  });
   stores.set(key, store as QueryStore<unknown>);
   return store;
 };
 
-export class QueryStore<Row> {
-  readonly #database: ErasedDatabase;
-  readonly #request: ObserveRequest<unknown>;
-  readonly #collect: () => void;
-  readonly #listeners = new Set<() => void>();
-  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
-  #observer: QueryObserver<Row> | undefined;
-  #unsubscribeObserver: (() => void) | undefined;
-  #closeGeneration = 0;
+export type QueryStore<Row> = {
+  readonly getSnapshot: () => ObserverSnapshot<Row>;
+  readonly subscribe: (
+    listener: () => void,
+    onDiagnostic?: ObserverDiagnosticReporter
+  ) => () => void;
+};
 
-  constructor(database: ErasedDatabase, request: ObserveRequest<unknown>, collect: () => void, onDiagnostic?: ObserverDiagnosticReporter) {
-    this.#database = database;
-    this.#request = request;
-    this.#collect = collect;
-    this.#onDiagnostic = onDiagnostic;
-    // Server-only or abandoned renders may create a cache entry without ever
-    // acquiring a live observer subscription.
-    this.#scheduleClose();
-  }
+export const createQueryStore = <Row>(
+  database: ErasedDatabase,
+  request: ObserveRequest<unknown>,
+  collect: () => void
+): QueryStore<Row> => {
+  const listeners = new Set<{
+    readonly notify: () => void;
+    readonly onDiagnostic: ObserverDiagnosticReporter | undefined;
+  }>();
+  let observer: QueryObserver<Row> | undefined;
+  let unsubscribeObserver: (() => void) | undefined;
+  let closeGeneration = 0;
 
-  readonly getSnapshot = (): ObserverSnapshot<Row> => {
-    return this.#ensureObserver().getSnapshot();
+  const scheduleClose = (onDiagnostic?: ObserverDiagnosticReporter): void => {
+    const generation = ++closeGeneration;
+    queueMicrotask(() => {
+      if (generation !== closeGeneration || listeners.size !== 0) return;
+      const activeObserver = observer;
+      const cleanups = [unsubscribeObserver, activeObserver === undefined ? undefined : () => activeObserver.close(), collect]
+        .filter((cleanup): cleanup is () => void => cleanup !== undefined);
+      unsubscribeObserver = undefined;
+      observer = undefined;
+      runReactCleanups(cleanups, 'react-query', 'close-query-store', onDiagnostic);
+    });
   };
 
-  readonly subscribe = (listener: () => void): (() => void) => {
-    this.#listeners.add(listener);
-    this.#closeGeneration += 1;
-    this.#ensureObserver();
+  const ensureObserver = (): QueryObserver<Row> => {
+    if (observer !== undefined) return observer;
+    const openedObserver = database.observe(request) as QueryObserver<Row>;
+    observer = openedObserver;
+    unsubscribeObserver = openedObserver.subscribe(() => {
+      for (const subscription of Array.from(listeners)) {
+        notifyReactListener(
+          subscription.notify,
+          'react-query',
+          'publish-query-store',
+          subscription.onDiagnostic
+        );
+      }
+    });
+    if (listeners.size === 0) scheduleClose();
+    return openedObserver;
+  };
+
+  const subscribe = (listener: () => void, onDiagnostic?: ObserverDiagnosticReporter): (() => void) => {
+    const subscription = { notify: listener, onDiagnostic };
+    listeners.add(subscription);
+    closeGeneration += 1;
+    ensureObserver();
     return () => {
-      if (!this.#listeners.delete(listener)) return;
-      if (this.#listeners.size === 0) this.#scheduleClose();
+      if (!listeners.delete(subscription)) return;
+      if (listeners.size === 0) scheduleClose(onDiagnostic);
     };
   };
 
-  #ensureObserver(): QueryObserver<Row> {
-    if (this.#observer !== undefined) return this.#observer;
-    const observer = this.#database.observe(this.#request) as QueryObserver<Row>;
-    this.#observer = observer;
-    this.#unsubscribeObserver = observer.subscribe(() => {
-      notifyReactListeners(this.#listeners, 'react-query', 'publish-query-store', this.#onDiagnostic);
-    });
-    if (this.#listeners.size === 0) this.#scheduleClose();
-    return observer;
-  }
-
-  #scheduleClose(): void {
-    const generation = ++this.#closeGeneration;
-    queueMicrotask(() => {
-      if (generation !== this.#closeGeneration || this.#listeners.size !== 0) return;
-      const observer = this.#observer;
-      const cleanups = [this.#unsubscribeObserver, observer === undefined ? undefined : () => observer.close(), this.#collect]
-        .filter((cleanup): cleanup is () => void => cleanup !== undefined);
-      this.#unsubscribeObserver = undefined;
-      this.#observer = undefined;
-      runReactCleanups(cleanups, 'react-query', 'close-query-store', this.#onDiagnostic);
-    });
-  }
-}
+  scheduleClose();
+  return {
+    getSnapshot: (): ObserverSnapshot<Row> => ensureObserver().getSnapshot(),
+    subscribe
+  };
+};

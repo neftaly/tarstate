@@ -68,28 +68,42 @@ const adoptTransactionAttempt = (input: TransactionAttempt): TransactionAttempt 
   });
 };
 
-export class MutationStore {
-  readonly #overlayStore: OptimisticOverlayStore;
-  readonly #listeners = new Set<() => void>();
-  #snapshot: MutationState = emptyMutationState;
-  #nextMutationId = 1;
-  #closed = false;
-  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
+export type MutationStore = {
+  readonly getSnapshot: () => MutationState;
+  readonly subscribe: (listener: () => void) => () => void;
+  readonly commit: (
+    attempt: TransactionAttempt,
+    commitImplementation: CommitFunction | undefined,
+    createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined
+  ) => Promise<CommitReceipt>;
+  readonly recordOptimisticError: (mutationId: number, optimisticError: OptimisticUpdateError) => void;
+  readonly close: () => void;
+};
 
-  constructor(overlayStore: OptimisticOverlayStore, onDiagnostic?: ObserverDiagnosticReporter) { this.#overlayStore = overlayStore; this.#onDiagnostic = onDiagnostic; }
+export const createMutationStore = (
+  overlayStore: OptimisticOverlayStore,
+  onDiagnostic?: ObserverDiagnosticReporter
+): MutationStore => {
+  const listeners = new Set<() => void>();
+  let snapshot: MutationState = emptyMutationState;
+  let nextMutationId = 1;
+  let closed = false;
 
-  readonly getSnapshot = (): MutationState => this.#snapshot;
-
-  readonly subscribe = (listener: () => void): (() => void) => {
-    this.#listeners.add(listener);
-    return () => { this.#listeners.delete(listener); };
+  const replace = (entry: MutationEntry): void => {
+    if (closed) return;
+    snapshot = nextMutationState(snapshot, entry);
+    notifyReactListeners(listeners, 'react-mutations', 'publish-mutation-state', onDiagnostic);
   };
 
-  readonly commit = async (attempt: TransactionAttempt, commitImplementation: CommitFunction | undefined, createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined): Promise<CommitReceipt> => {
-    if (this.#closed) throw new Error('Tarstate provider runtime is closed');
+  const commit = async (
+    attempt: TransactionAttempt,
+    commitImplementation: CommitFunction | undefined,
+    createOptimisticOverlay: ErasedCreateOptimisticOverlay | undefined
+  ): Promise<CommitReceipt> => {
+    if (closed) throw new Error('Tarstate provider runtime is closed');
     if (commitImplementation === undefined) throw new Error('TarstateProvider has no commit implementation');
     const ownedAttempt = adoptTransactionAttempt(attempt);
-    const mutationId = this.#nextMutationId++;
+    const mutationId = nextMutationId++;
     let optimisticError: MutationEntry['optimisticError'];
     let overlay: OptimisticOverlay<unknown, unknown> | undefined;
     if (createOptimisticOverlay !== undefined) {
@@ -99,8 +113,8 @@ export class MutationStore {
         optimisticError = { phase: 'create-overlay', ...errorDetails(error) };
       }
     }
-    if (overlay !== undefined) optimisticError = this.#overlayStore.add(mutationId, ownedAttempt, overlay) ?? optimisticError;
-    this.#replace({
+    if (overlay !== undefined) optimisticError = overlayStore.add(mutationId, ownedAttempt, overlay) ?? optimisticError;
+    replace({
       mutationId,
       operationEpoch: ownedAttempt.operationEpoch,
       operationId: ownedAttempt.operationId,
@@ -113,8 +127,8 @@ export class MutationStore {
       receipt = await commitImplementation(ownedAttempt);
       if (!receiptIdentityMatches(ownedAttempt, receipt)) throw new Error('Commit receipt identity does not match its transaction attempt');
     } catch (error) {
-      this.#overlayStore.discard(mutationId);
-      this.#replace({
+      overlayStore.discard(mutationId);
+      replace({
         mutationId,
         operationEpoch: ownedAttempt.operationEpoch,
         operationId: ownedAttempt.operationId,
@@ -125,9 +139,9 @@ export class MutationStore {
       });
       throw error;
     }
-    this.#overlayStore.discard(mutationId);
-    const latestError = this.#snapshot.mutations.find((entry) => entry.mutationId === mutationId)?.optimisticError ?? optimisticError;
-    this.#replace({
+    overlayStore.discard(mutationId);
+    const latestError = snapshot.mutations.find((entry) => entry.mutationId === mutationId)?.optimisticError ?? optimisticError;
+    replace({
       mutationId,
       operationEpoch: ownedAttempt.operationEpoch,
       operationId: ownedAttempt.operationId,
@@ -139,30 +153,46 @@ export class MutationStore {
     return receipt;
   };
 
-  recordOptimisticError(mutationId: number, optimisticError: OptimisticUpdateError): void {
-    const entry = this.#snapshot.mutations.find((candidate) => candidate.mutationId === mutationId);
+  const recordOptimisticError = (mutationId: number, optimisticError: OptimisticUpdateError): void => {
+    const entry = snapshot.mutations.find((candidate) => candidate.mutationId === mutationId);
     if (entry === undefined) return;
-    this.#replace({ ...entry, optimisticError });
-  }
+    replace({ ...entry, optimisticError });
+  };
 
-  #replace(entry: MutationEntry): void {
-    if (this.#closed) return;
-    const replaced = [...this.#snapshot.mutations.filter(({ mutationId }) => mutationId !== entry.mutationId), deepFreezeDataClone(entry)];
-    // Pending operations are evidence, not history: retain them until their promise settles.
-    const pending = replaced.filter(({ state }) => state === 'pending');
-    const settled = replaced.filter(({ state }) => state !== 'pending').slice(-maxRetainedMutations);
-    const mutations = [...settled, ...pending].sort((left, right) => left.mutationId - right.mutationId);
-    this.#snapshot = Object.freeze({
-      pendingCount: mutations.filter(({ state }) => state === 'pending').length,
-      mutations: Object.freeze(mutations)
-    });
-    notifyReactListeners(this.#listeners, 'react-mutations', 'publish-mutation-state', this.#onDiagnostic);
-  }
+  return {
+    getSnapshot: () => snapshot,
+    subscribe: (listener: () => void): (() => void) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    commit,
+    recordOptimisticError,
+    close: (): void => {
+      if (closed) return;
+      closed = true;
+      listeners.clear();
+      snapshot = emptyMutationState;
+    }
+  };
+};
 
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    this.#listeners.clear();
-    this.#snapshot = emptyMutationState;
+export const nextMutationState = (current: MutationState, entry: MutationEntry): MutationState => {
+  const pending: MutationEntry[] = [];
+  const settled: MutationEntry[] = [];
+  for (const candidate of current.mutations) {
+    if (candidate.mutationId === entry.mutationId) continue;
+    (candidate.state === 'pending' ? pending : settled).push(candidate);
   }
-}
+  const ownedEntry = deepFreezeDataClone(entry);
+  (ownedEntry.state === 'pending' ? pending : settled).push(ownedEntry);
+  // Pending operations are evidence, not history: retain them until their promise settles.
+  const retainedSettled = settled.length > maxRetainedMutations
+    ? settled.slice(settled.length - maxRetainedMutations)
+    : settled;
+  const mutations = [...retainedSettled, ...pending]
+    .sort((left, right) => left.mutationId - right.mutationId);
+  return Object.freeze({
+    pendingCount: pending.length,
+    mutations: Object.freeze(mutations)
+  });
+};

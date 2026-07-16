@@ -36,6 +36,65 @@ describe('database query session', () => {
     expect(mount).not.toHaveBeenCalled();
   });
 
+  it('adopts every source descriptor before mounting and rejects ambiguous or invalid members', async () => {
+    const mount = vi.fn();
+    const plan = await prepareQuery({
+      root: { kind: 'values', alias: 'row', rows: [] },
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+    const invalid = {
+      unresolved: { attachmentId: 'attachment:invalid', sourceId: 'source:invalid' },
+      expectation: 'sometimes'
+    } as never;
+
+    await expect(openDatabaseQuery({
+      sources: [{ source: { mount } }, invalid],
+      plan,
+      queryAuthorityScope: 'scope:test'
+    })).rejects.toThrow('sources[1].expectation must be required or optional');
+    expect(mount).not.toHaveBeenCalled();
+
+    await expect(openDatabaseQuery({
+      sources: [{
+        source: { mount },
+        unresolved: { attachmentId: 'attachment:invalid', sourceId: 'source:invalid' }
+      } as never],
+      plan,
+      queryAuthorityScope: 'scope:test'
+    })).rejects.toThrow('sources[0] must provide exactly one of source or unresolved');
+    expect(mount).not.toHaveBeenCalled();
+  });
+
+  it('copies and normalizes source discovery edges before asynchronous mounting', async () => {
+    const discoveryEdges = ['edge:b', 'edge:a', 'edge:b'];
+    let mountedEdges: readonly string[] | undefined;
+    const source: MountableDatabaseSource = {
+      mount: async (_catalog, options) => {
+        await Promise.resolve();
+        mountedEdges = options?.discoveryEdges;
+        throw new Error('stop after inspecting normalized options');
+      }
+    };
+    const plan = await prepareQuery({
+      root: { kind: 'values', alias: 'row', rows: [] },
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'dataset:test'
+    });
+    const opening = openDatabaseQuery({
+      sources: [{ source, discoveryEdges }],
+      plan,
+      queryAuthorityScope: 'scope:test'
+    });
+    discoveryEdges.splice(0, discoveryEdges.length, 'edge:mutated');
+
+    await expect(opening).rejects.toThrow('stop after inspecting normalized options');
+    expect(mountedEdges).toEqual(['edge:a', 'edge:b']);
+    expect(Object.isFrozen(mountedEdges)).toBe(true);
+  });
+
   it('preserves required unresolved sources as incomplete evidence without fetching them', async () => {
     const plan = await prepareQuery({
       root: { kind: 'values', alias: 'row', rows: [] },

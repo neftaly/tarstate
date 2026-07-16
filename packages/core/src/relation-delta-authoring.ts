@@ -178,19 +178,29 @@ const indexRows = (
   if (cached !== undefined) return cached;
   const issueCount = issues.length;
   const indexed = new Map<string, IndexedRow>();
-  rows.forEach((fields, rowIndex) => {
-    const missingField = keyFields.find((field) => !Object.hasOwn(fields, field));
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const fields = rows[rowIndex] as Readonly<Record<string, JsonValue>>;
+    const keyParts: string[] = [];
+    let missingField: string | undefined;
+    for (let keyIndex = 0; keyIndex < keyFields.length; keyIndex += 1) {
+      const field = keyFields[keyIndex] as string;
+      if (!Object.hasOwn(fields, field)) {
+        missingField = field;
+        break;
+      }
+      keyParts.push(canonicalizeJsonWithCache(fields[field] as JsonValue, canonicalization));
+    }
     if (missingField !== undefined) {
       issues.push(deltaIssue({ reason: 'key_missing', side, rowIndex, field: missingField }, [side, 'rows', rowIndex, missingField]));
-      return;
+      continue;
     }
-    const fingerprint = stringTupleKey(...keyFields.map((field) => canonicalizeJsonWithCache(fields[field] as JsonValue, canonicalization)));
+    const fingerprint = stringTupleKey(...keyParts);
     if (indexed.has(fingerprint)) {
       issues.push(deltaIssue({ reason: 'key_ambiguous', side, rowIndex, key: fingerprint }, [side, 'rows', rowIndex]));
-      return;
+      continue;
     }
     indexed.set(fingerprint, { fields });
-  });
+  }
   if (issues.length === issueCount) {
     const indexes = preparedRowIndexes.get(rows) ?? new Map<string, Map<string, IndexedRow>>();
     if (!indexes.has(keySignature) && indexes.size >= maxPreparedIndexesPerRowSet) indexes.delete(indexes.keys().next().value as string);
@@ -209,7 +219,11 @@ const replacementEdits = (
   canonicalization: CanonicalJsonCache
 ): Readonly<Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }>> | undefined => {
   let edits: Record<string, { readonly kind: 'edit.replace'; readonly value: WriteExpression }> | undefined;
-  const fields = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort(comparePortableStrings);
+  const fields = Object.keys(before);
+  for (const field of Object.keys(after)) {
+    if (!Object.hasOwn(before, field)) fields.push(field);
+  }
+  fields.sort(comparePortableStrings);
   for (const field of fields) {
     const hadField = Object.hasOwn(before, field);
     const hasField = Object.hasOwn(after, field);

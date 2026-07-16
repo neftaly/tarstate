@@ -38,7 +38,7 @@ export function useQuery<Query, Row, Parameters extends Readonly<Record<string, 
     () => queryObservationKey(runtime.database, request),
     [runtime.database, request]
   );
-  const baseStore = queryStore<Query, Row>(runtime.database, request, key, runtime.onDiagnostic);
+  const baseStore = queryStore<Query, Row>(runtime.database, request, key);
   const store = runtime.overlayStore.view<Query, Row>(baseStore, request, key);
   const serverSnapshot = runtime.serverQuerySnapshots.get(key) as ObserverSnapshot<Row> | undefined;
   const getServerSnapshot = useMemo(

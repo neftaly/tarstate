@@ -68,6 +68,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly #mapping: CompiledStorageMapping;
   readonly #registry: CapabilityRegistry | undefined;
   readonly #relations: ReadonlyMap<string, MappedRelation>;
+  readonly #relationSelection: ReadonlySet<string>;
   readonly #locatorNamespace: string;
   readonly #projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeMappedStorageRow>>>();
   #previousFullProjection: {
@@ -92,6 +93,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     }
     this.#relations = relations;
     this.relationIds = Object.freeze([...relations.keys()]);
+    this.#relationSelection = new Set(this.relationIds);
     const entries = [...relations.values()].map(({ mapping }) => ({ scope: 'subtree' as const, path: mapping.collection.path as AutomergePath }));
     this.declaredReadFootprint = automergePathFootprint(entries);
     this.declaredWriteFootprint = this.declaredReadFootprint;
@@ -102,10 +104,10 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       return { rows: [], completeness: 'unknown', issues: [sourceIssue(snapshot.sourceId, snapshot.state)] };
     }
     const selected = requestedRelations === undefined
-      ? new Set(this.relationIds)
+      ? this.#relationSelection
       : new Set(this.relationIds.filter((relationId) => requestedRelations.has(relationId)));
     const fullProjection = selected.size === this.relationIds.length;
-    const cacheKey = canonicalizeJson([snapshot.sourceId, [...selected]] as JsonValue);
+    const cacheKey = relationSelectionKey(snapshot.sourceId, selected);
     const cached = this.#projections.get(snapshot.storage)?.get(cacheKey);
     if (cached !== undefined) return cached;
     const affected = fullProjection && this.#previousFullProjection?.result.completeness === 'exact'
@@ -470,6 +472,12 @@ const ownValue = (input: object, key: string): unknown => {
 const compoundKey = (...parts: readonly string[]): string => {
   let key = '';
   for (const part of parts) key += part.length + ':' + part;
+  return key;
+};
+
+const relationSelectionKey = (sourceId: string, relationIds: ReadonlySet<string>): string => {
+  let key = sourceId.length + ':' + sourceId;
+  for (const relationId of relationIds) key += relationId.length + ':' + relationId;
   return key;
 };
 
