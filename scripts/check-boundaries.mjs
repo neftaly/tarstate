@@ -56,6 +56,7 @@ const assignArchitectureGroup = (group, names) => {
 assignArchitectureGroup('foundation', [
   'artifacts.ts',
   'built-in-capability-declarations.ts',
+  'canonical-json.ts',
   'capability-model.ts',
   'internal-canonical-json.ts',
   'internal-frozen-analysis.ts',
@@ -105,7 +106,8 @@ assignArchitectureGroup('query-batch', [
   'query/builder.ts',
   'query/evaluate.ts',
   'query/plan.ts',
-  'query/prepare.ts'
+  'query/prepare.ts',
+  'query/typed-plan.ts'
 ]);
 assignArchitectureGroup('query-incremental', [
   'query/internal/dependency.ts',

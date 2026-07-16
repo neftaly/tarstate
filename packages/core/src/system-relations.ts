@@ -1,4 +1,5 @@
-import { canonicalizeJson, normalizeArtifactRef, sealArtifact, type Artifact, type ArtifactRef } from './artifacts.js';
+import { normalizeArtifactRef, sealArtifact, type Artifact, type ArtifactRef } from './artifacts.js';
+import { canonicalizeJson } from './canonical-json.js';
 import type { FieldDeclaration, SchemaBody } from './schema.js';
 import type { CapabilityRef, Issue, IssuePhase, IssueSeverity } from './issues.js';
 import type { SourceBasis } from './source-state.js';

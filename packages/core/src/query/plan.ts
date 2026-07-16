@@ -1,4 +1,4 @@
-import { sha256Json } from '../artifacts.js';
+import { sha256Json } from '../canonical-json.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
 import { sealOwnedPreparedPlan } from './internal/prepared-plan.js';
 import type { PreparedPlan } from './plan-contract.js';

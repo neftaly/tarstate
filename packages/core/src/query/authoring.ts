@@ -1,11 +1,11 @@
-import { canonicalizeJson, type ArtifactRef } from '../artifacts.js';
+import type { ArtifactRef } from '../artifacts.js';
+import { canonicalizeJson } from '../canonical-json.js';
 import type { CapabilityRef } from '../issues.js';
 import type { PipeOperator, PipeType } from '../internal-pipe.js';
 import { stringTupleKey } from '../internal-string-key.js';
 import type { QueryArtifact, QueryArtifactBody, ValueDeclaration } from './builder.js';
 import type { Expr, QueryNode } from './model.js';
 import type { PreparedPlan } from './plan-contract.js';
-import { prepareQuery } from './prepare.js';
 import type {
   LiteralRelation,
   SchemaRow,
@@ -304,21 +304,6 @@ export type TypedPreparedPlan<Query, Row, Parameters extends Readonly<Record<str
 export type PreparedPlanRow<Plan> = Plan extends { readonly [preparedPlanRow]?: (row: infer Row) => unknown } ? Row : never;
 /** Exact parameter object inferred from a typed prepared plan. */
 export type PreparedPlanParameters<Plan> = Plan extends { readonly [preparedPlanParameters]?: (parameters: infer Parameters) => unknown } ? Parameters : never;
-
-/** Prepares a typed query while preserving its inferred row and parameter types. */
-export const prepareTypedQuery = async <
-  Aliases extends TypedAliases,
-  Parameters extends Readonly<Record<string, ValueDeclaration>>,
-  Row
->(
-  query: TypedQuery<Aliases, Parameters, Row>,
-  options: {
-    readonly registryFingerprint: string;
-    readonly authorityFingerprint: string;
-    readonly datasetId: string;
-  }
-): Promise<TypedPreparedPlan<QueryNode, Row, { readonly [Name in keyof Parameters]: ValueOfDeclaration<Parameters[Name]> }>> =>
-  prepareQuery({ root: query.root, ...options });
 
 export type RuntimeTypedQuery = QueryArtifact;
 export type RuntimeQueryParameters = QueryParametersOf<RuntimeTypedQuery>;

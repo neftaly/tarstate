@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJson } from './canonical-json.js';
 import { createIssue, type Issue } from './issues.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { WriteExpression } from './transaction.js';

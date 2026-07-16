@@ -1,4 +1,4 @@
-import { sha256Json, type ContentHash } from '../artifacts.js';
+import { sha256Json, type ContentHash } from '../canonical-json.js';
 import type { ReadyAttachmentPreparation } from './preparation.js';
 import { createIssue, TarstateParseError, type Issue } from '../issues.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';

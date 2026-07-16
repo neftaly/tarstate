@@ -1,7 +1,7 @@
 /** Query artifacts, functional builders, and schema-aware typed authoring. */
 export * from '../builder.js';
+export { prepareTypedQuery } from '../typed-plan.js';
 export {
-  prepareTypedQuery,
   typedAnd,
   typedCompare,
   typedFrom,

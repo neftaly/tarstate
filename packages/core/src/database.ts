@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJson } from './canonical-json.js';
 import type { AttachmentProjection } from './attachment/model.js';
 import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
 import { comparePortableStrings } from './portable-order.js';

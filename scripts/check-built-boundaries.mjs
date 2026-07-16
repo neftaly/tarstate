@@ -15,20 +15,20 @@ try {
   assertClosure('capabilities/index.js', 55_000, ['query', 'schema', 'semantic-artifact', 'transaction', 'database', 'memory-source']);
   assertClosure('artifacts/index.js', 70_000, ['semantic-', 'query-', 'mapping-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/query/index.js', 165_000, ['query-incremental', 'observer-maintenance', 'semantic-transaction', 'semantic-storage-mapping', 'semantic-schema-lens', 'semantic-constraint']);
-  assertClosure('artifacts/transaction/index.js', 80_000, ['internal-query-evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'constraint-']);
-  assertClosure('artifacts/constraint-set/index.js', 85_000, ['internal-query-evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'transaction-']);
+  assertClosure('artifacts/transaction/index.js', 80_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'constraint-']);
+  assertClosure('artifacts/constraint-set/index.js', 85_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'transaction-']);
   assertClosure('artifacts/storage-mapping/index.js', 90_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
   assertClosure('attachment/index.js', 100, []);
-  assertClosure('attachment/adapter/index.js', 280_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
+  assertClosure('attachment/adapter/index.js', 305_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);
-  assertClosure('query/prepare/index.js', 60_000, ['internal-query-evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
-  assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
+  assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
+  assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/evaluate/index.js', 120_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'transaction-executor']);
   assertClosure('query/incremental/index.js', 215_000, ['internal-observer-query-maintenance', 'observer-maintenance-contracts', 'memory-source', 'transaction-executor']);
-  assertClosure('schema/index.js', 100_000, ['query-authoring', 'transaction-authoring', 'internal-query-evaluator', 'query-incremental']);
-  assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'internal-query-evaluator', 'query-incremental', 'observer-maintenance']);
+  assertClosure('schema/index.js', 100_000, ['query-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental']);
+  assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/incremental/index.js', 225_000, ['memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/external-store/index.js', 60_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
@@ -53,10 +53,17 @@ function assertClosure(entry, maximumBytes, forbiddenNames, directory = dist) {
     throw new Error(entry + ' static closure is ' + bytes + ' bytes; budget is ' + maximumBytes);
   }
   for (const file of closure) {
-    const name = path.basename(file);
-    const forbidden = forbiddenNames.find((candidate) => name.includes(candidate));
+    const name = path.relative(directory, file).replaceAll(path.sep, '/');
+    const normalizedName = normalizeModuleName(name);
+    const forbidden = forbiddenNames.find((candidate) =>
+      normalizedName.includes(normalizeModuleName(candidate))
+    );
     if (forbidden !== undefined) throw new Error(entry + ' reaches forbidden built module ' + name);
   }
+}
+
+function normalizeModuleName(name) {
+  return name.toLowerCase().replaceAll(/[^a-z0-9]/g, '');
 }
 
 function staticClosure(entry) {

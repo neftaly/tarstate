@@ -1,4 +1,5 @@
-import { canonicalizeJson, type ArtifactRef } from '../artifacts.js';
+import type { ArtifactRef } from '../artifacts.js';
+import { canonicalizeJson } from '../canonical-json.js';
 import { capabilityRefKey, createIssue, type CapabilityRef, type Issue } from '../issues.js';
 import type { WritableLogicalState } from '../logical-edit.js';
 import { evaluateQuery } from '../query/evaluate.js';

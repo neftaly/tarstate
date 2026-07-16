@@ -1,4 +1,5 @@
-import { canonicalizeJson, type ArtifactRef } from './artifacts.js';
+import type { ArtifactRef } from './artifacts.js';
+import { canonicalizeJson } from './canonical-json.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { JsonValue } from './value.js';

@@ -1,4 +1,4 @@
-import { canonicalizeJson } from './artifacts.js';
+import { canonicalizeJson } from './canonical-json.js';
 import {
   type DatasetMembership,
   type AttachmentCatalog,

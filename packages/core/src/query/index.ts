@@ -41,8 +41,8 @@ export type {
 } from '../query.js';
 export type { PreparedPlan } from './plan-contract.js';
 export * from './builder.js';
+export { prepareTypedQuery } from './typed-plan.js';
 export {
-  prepareTypedQuery,
   typedAnd,
   typedCompare,
   typedFrom,

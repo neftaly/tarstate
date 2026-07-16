@@ -1,4 +1,5 @@
-import { canonicalizeJson, isContentHash, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
+import type { ArtifactRef } from './artifacts.js';
+import { canonicalizeJson, isContentHash, sha256Json, type ContentHash } from './canonical-json.js';
 import { stageSourceEdits } from './commit-coordinator.js';
 import { builtInCapabilityRefs } from './builtins.js';
 import { checkFinalConstraints, type SourceConstraint } from './constraints.js';

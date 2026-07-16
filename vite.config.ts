@@ -24,11 +24,20 @@ const sharedBuildOptions = {
   rollupOptions: { onwarn: failOnRollupWarning }
 } satisfies NonNullable<UserConfig['build']>;
 
+const preservedModuleOutput = {
+  preserveModules: true,
+  preserveModulesRoot: 'src'
+} as const;
+
 const buildConfigsByPackageName: Record<string, PackageConfig> = {
   '@tarstate/core': {
     build: {
       ...sharedBuildOptions,
-      lib: { entry: coreBuildEntries, formats: ['es'], fileName: (_format, entryName) => entryName + '.js' }
+      lib: { entry: coreBuildEntries, formats: ['es'], fileName: (_format, entryName) => entryName + '.js' },
+      rollupOptions: {
+        ...sharedBuildOptions.rollupOptions,
+        output: preservedModuleOutput
+      }
     }
   },
   '@tarstate/automerge': {
@@ -65,7 +74,8 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       lib: { entry: { index: 'src/index.ts' }, formats: ['es'], fileName: (_format, entryName) => entryName + '.js' },
       rollupOptions: {
         ...sharedBuildOptions.rollupOptions,
-        external: [/^@tarstate\/core(?:\/.*)?$/, /^react(?:\/.*)?$/]
+        external: [/^@tarstate\/core(?:\/.*)?$/, /^react(?:\/.*)?$/],
+        output: preservedModuleOutput
       }
     }
   },
@@ -75,7 +85,8 @@ const buildConfigsByPackageName: Record<string, PackageConfig> = {
       lib: { entry: { index: 'src/index.ts' }, formats: ['es'], fileName: (_format, entryName) => entryName + '.js' },
       rollupOptions: {
         ...sharedBuildOptions.rollupOptions,
-        external: [/^@tarstate\/core(?:\/.*)?$/]
+        external: [/^@tarstate\/core(?:\/.*)?$/],
+        output: preservedModuleOutput
       }
     }
   }

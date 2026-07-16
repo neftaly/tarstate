@@ -1,4 +1,4 @@
-import { canonicalizeJson, isContentHash, sha256Json, type ContentHash } from './artifacts.js';
+import { canonicalizeJson, isContentHash, sha256Json, type ContentHash } from './canonical-json.js';
 import type { CapabilityClass, CapabilityDeclaration } from './capability-model.js';
 import { capabilityRefKey, createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';

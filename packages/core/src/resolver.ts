@@ -1,4 +1,4 @@
-import { isContentHash } from './artifacts.js';
+import { isContentHash } from './canonical-json.js';
 import { createIssue, type Issue } from './issues.js';
 import { stringTupleKey } from './internal-string-key.js';
 

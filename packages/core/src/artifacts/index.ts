@@ -1,4 +1,5 @@
 /** Portable artifact envelopes, capability policy, and resolution. */
+export * from '../canonical-json.js';
 export * from '../artifacts.js';
 export * from '../artifact-resolver.js';
 export * from '../builtins.js';

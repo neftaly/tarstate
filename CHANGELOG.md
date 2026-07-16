@@ -5,6 +5,14 @@ history.
 
 ## [Unreleased]
 
+### Changed
+
+- Preserved consumer-facing module boundaries in core, React, and schema tools,
+  split canonical JSON/hash helpers from artifact parsing, and separated typed
+  query preparation and React lifecycle shells from their functional authoring
+  and hook cores. Representative single-export bundle sizes are now checked in
+  `pnpm check`.
+
 ### Fixed
 
 - `DatabaseView.observe` now infers the exact result-row type carried by a

@@ -1,4 +1,5 @@
 /** Test-only broad source barrel. The package root is `root.ts`. */
+export * from './canonical-json.js';
 export * from './artifacts.js';
 export * from './artifact-resolver.js';
 export * from './attachment/model.js';

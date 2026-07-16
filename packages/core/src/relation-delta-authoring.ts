@@ -1,4 +1,4 @@
-import { isContentHash } from './artifacts.js';
+import { isContentHash } from './canonical-json.js';
 import { createIssue, type Issue, type ParseResult } from './issues.js';
 import { canonicalizeJsonWithCache, type CanonicalJsonCache } from './internal-canonical-json.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';

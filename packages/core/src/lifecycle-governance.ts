@@ -1,4 +1,5 @@
-import { canonicalizeJson, isContentHash, sha256Bytes, sha256Json, type ArtifactRef, type ContentHash } from './artifacts.js';
+import type { ArtifactRef } from './artifacts.js';
+import { canonicalizeJson, isContentHash, sha256Bytes, sha256Json, type ContentHash } from './canonical-json.js';
 import { canonicalizeJsonWithCache, type CanonicalJsonCache } from './internal-canonical-json.js';
 import {
   deriveCoordinatorFailureEvidence,

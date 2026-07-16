@@ -1,6 +1,7 @@
 import { type JsonValue, type PortableValue } from './value.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
-import { isContentHash, safeParseJsonText, type ArtifactParseBudget, type ContentHash } from './artifacts.js';
+import { safeParseJsonText, type ArtifactParseBudget } from './artifacts.js';
+import { isContentHash, type ContentHash } from './canonical-json.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import type { SourceBasis } from './source-state.js';
 import type { CommitReceipt, NonAtomicBatchReceipt } from './transaction.js';

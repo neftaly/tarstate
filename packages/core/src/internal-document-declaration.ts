@@ -1,4 +1,5 @@
-import { isContentHash, type ArtifactRef } from './artifacts.js';
+import type { ArtifactRef } from './artifacts.js';
+import { isContentHash } from './canonical-json.js';
 import type { DocumentDeclaration } from './attachment/model.js';
 import type { CapabilityRef } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';

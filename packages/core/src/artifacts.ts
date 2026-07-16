@@ -1,12 +1,24 @@
 import { createIssue, TarstateParseError, type Issue, type ParseResult } from './issues.js';
-import { assertUnicodeScalarString, canonicalizeJsonValue, compareUnicodeScalars } from './internal-canonical-json.js';
+import {
+  isContentHash,
+  sha256Json,
+  type ContentHash
+} from './canonical-json.js';
+import { assertUnicodeScalarString, compareUnicodeScalars } from './internal-canonical-json.js';
 import { detachAndFreezeJsonValue, freezeOwnedJsonValue } from './internal-owned-json.js';
 import { stringTupleKey } from './internal-string-key.js';
 import { defaultValueParseBudget, safeParseJsonValue, type JsonValue, type ValueParseBudget } from './value.js';
 
+export {
+  canonicalizeJson,
+  isContentHash,
+  sha256Bytes,
+  sha256Json
+} from './canonical-json.js';
+export type { ContentHash } from './canonical-json.js';
+
 export const artifactKinds = Object.freeze(['schema', 'query', 'transaction', 'constraint-set', 'storage-mapping', 'schema-lens', 'issue-code-catalog'] as const);
 export type ArtifactKind = typeof artifactKinds[number];
-export type ContentHash = `sha256:${string}`;
 
 export type ArtifactRef = {
   readonly id: string;
@@ -34,25 +46,8 @@ export const defaultArtifactParseBudget: ArtifactParseBudget = Object.freeze({
   maxDependencies: 10_000
 });
 
-const hashPattern = /^sha256:[0-9a-f]{64}$/;
 const jsonNumberPattern = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
-
-export const isContentHash = (value: unknown): value is ContentHash => typeof value === 'string' && hashPattern.test(value);
-
-export const canonicalizeJson = canonicalizeJsonValue;
-
-export const sha256Bytes = async (bytes: Uint8Array): Promise<ContentHash> => {
-  const input: Uint8Array<ArrayBuffer> = bytes.buffer instanceof ArrayBuffer
-    ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    : Uint8Array.from(bytes);
-  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', input));
-  let hex = '';
-  for (const byte of digest) hex += byte.toString(16).padStart(2, '0');
-  return `sha256:${hex}`;
-};
-
-export const sha256Json = (value: JsonValue): Promise<ContentHash> => sha256Bytes(new TextEncoder().encode(canonicalizeJson(value)));
 
 export const normalizeArtifactRef = (ref: ArtifactRef): ArtifactRef => ({ id: ref.id, contentHash: ref.contentHash });
 

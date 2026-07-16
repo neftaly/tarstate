@@ -1,4 +1,5 @@
-import { canonicalizeJson, isContentHash, normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
+import { normalizeArtifactRef, type ArtifactRef } from './artifacts.js';
+import { canonicalizeJson, isContentHash } from './canonical-json.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { assertValidatedLens, assertValidatedLensSteps, sealValidatedLens } from './internal-semantic-provenance.js';

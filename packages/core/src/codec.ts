@@ -1,4 +1,4 @@
-import { canonicalizeJson, sha256Json } from './artifacts.js';
+import { canonicalizeJson, sha256Json } from './canonical-json.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from './issues.js';
 import { CapabilityRegistry } from './registry.js';
 import { isTaggedValue, safeParseJsonValue, type JsonValue, type PortableValue, type TaggedValue } from './value.js';
