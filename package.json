@@ -12,7 +12,7 @@
     "bench": "pnpm --filter @tarstate/core build && pnpm --filter './packages/*' --if-present bench",
     "bench:query": "pnpm --filter @tarstate/core build && node --expose-gc scripts/query-performance.mjs",
     "bench:observer": "pnpm --filter @tarstate/core build && node --expose-gc scripts/observer-performance.mjs",
-    "bench:transaction": "pnpm --filter @tarstate/core build && pnpm --filter @tarstate/automerge build && node scripts/transaction-performance.mjs",
+    "bench:transaction": "pnpm --filter @tarstate/core build && pnpm --filter @tarstate/automerge build && node --expose-gc --disable-warning=TimeoutNegativeWarning scripts/transaction-performance.mjs",
     "bench:automerge": "pnpm --filter @tarstate/automerge build && node scripts/automerge-performance.mjs",
     "bench:legacy": "node scripts/legacy-benchmark.mjs",
     "build": "pnpm --filter './packages/*' -r build",

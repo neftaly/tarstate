@@ -8,7 +8,8 @@ import { openAutomergeAttachment } from '../packages/automerge/dist/index.js';
 const requireFromAutomerge = createRequire(new URL('../packages/automerge/package.json', import.meta.url));
 const { Repo } = await import(pathToFileURL(requireFromAutomerge.resolve('@automerge/automerge-repo')).href);
 const rowCount = 100;
-const sampleCount = 3;
+const sampleCount = 5;
+const warmupIterations = 10;
 const iterations = 30;
 const schema = await sealSchema({ id: 'urn:tarstate:transaction-benchmark:schema', body: {
   relations: { tasks: {
@@ -31,61 +32,37 @@ const mapping = await sealStorageMapping({ id: 'urn:tarstate:transaction-benchma
     }
   } }
 } });
-const repo = new Repo();
-const handle = repo.create({
-  tasks: Object.fromEntries(Array.from({ length: rowCount }, (_, index) => [
-    'task-' + index,
-    { id: 'task-' + index, title: 'Title ' + index }
-  ]))
-});
-const opened = await openAutomergeAttachment({
-  handle,
-  declaration: {
-    formatVersion: 1,
-    storageSchema: reference(schema),
-    projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
-  },
-  embeddedArtifacts: [schema, mapping],
-  authorityScope: 'tarstate:transaction-benchmark'
-});
-if (!opened.success) throw new Error('Transaction benchmark attachment failed: ' + opened.issues.map(({ code }) => code).join(', '));
-
-const attachment = opened.value;
-let sequence = 0;
-const transact = async (changed) => {
-  const current = sequence;
-  sequence += 1;
-  const receipt = await attachment.transact(
-    { kind: changed ? 'replace-title' : 'no-op', sequence: current },
-    ({ rows }) => changed
-      ? rows.map((row) => row.fields.id === 'task-0'
-        ? { ...row, fields: { ...row.fields, title: 'Changed ' + current } }
-        : row)
-      : rows
-  );
-  if (receipt.outcome !== 'committed') throw new Error('Transaction benchmark rejected: ' + receipt.issues.map(({ code }) => code).join(', '));
-};
-
-for (let index = 0; index < 5; index += 1) await transact(index % 2 === 0);
 const measure = async (changed) => {
   const samples = [];
+  const correctnessFailures = [];
   for (let sample = 0; sample < sampleCount; sample += 1) {
-    const started = performance.now();
-    for (let index = 0; index < iterations; index += 1) await transact(changed);
-    samples.push((performance.now() - started) / iterations);
+    const runtime = await openBenchmarkRuntime();
+    try {
+      for (let index = 0; index < warmupIterations; index += 1) await runtime.transact(changed);
+      globalThis.gc();
+      const started = performance.now();
+      for (let index = 0; index < iterations; index += 1) await runtime.transact(changed);
+      samples.push((performance.now() - started) / iterations);
+      const expectedTitle = changed ? 'Changed ' + (runtime.sequence() - 1) : 'Title 0';
+      if (runtime.title() !== expectedTitle) correctnessFailures.push('sample-' + sample);
+    } finally {
+      await runtime.close();
+    }
   }
   samples.sort((left, right) => left - right);
-  return Number(samples[Math.floor(samples.length / 2)].toFixed(3));
+  return {
+    milliseconds: Number(samples[Math.floor(samples.length / 2)].toFixed(3)),
+    correctnessFailures
+  };
 };
 
-const noOpMilliseconds = await measure(false);
-const oneRowMilliseconds = await measure(true);
-const finalTitle = handle.doc()?.tasks['task-0']?.title;
+const noOp = await measure(false);
+const oneRow = await measure(true);
 const contracts = {
-  repeatedSamples: sampleCount >= 3,
-  exactCommitSemantics: finalTitle === 'Changed ' + (sequence - 1),
-  noOp100RowsCeiling: noOpMilliseconds <= 20,
-  oneRow100RowsCeiling: oneRowMilliseconds <= 30
+  independentRepeatedSamples: sampleCount >= 5,
+  exactCommitSemantics: noOp.correctnessFailures.length === 0 && oneRow.correctnessFailures.length === 0,
+  noOp100RowsCeiling: noOp.milliseconds <= 20,
+  oneRow100RowsCeiling: oneRow.milliseconds <= 30
 };
 const report = {
   benchmark: 'tarstate-public-automerge-attachment-transactions',
@@ -95,14 +72,14 @@ const report = {
     inputRows: rowCount,
     iterations,
     sampleCount,
-    noOpMillisecondsPerTransaction: noOpMilliseconds,
-    oneRowMillisecondsPerTransaction: oneRowMilliseconds
+    warmupIterations,
+    noOpMillisecondsPerTransaction: noOp.milliseconds,
+    oneRowMillisecondsPerTransaction: oneRow.milliseconds,
+    correctnessFailures: [...noOp.correctnessFailures, ...oneRow.correctnessFailures]
   },
   node: process.version
 };
 console.log(JSON.stringify(report, null, 2));
-attachment.close();
-await repo.shutdown();
 if (Object.values(contracts).some((passed) => !passed)) {
   console.error('Transaction performance contracts failed: ' + Object.entries(contracts).filter(([, passed]) => !passed).map(([name]) => name).join(', '));
   process.exitCode = 1;
@@ -110,4 +87,53 @@ if (Object.values(contracts).some((passed) => !passed)) {
 
 function reference(artifact) {
   return { id: artifact.id, contentHash: artifact.contentHash };
+}
+
+async function openBenchmarkRuntime() {
+  const repo = new Repo();
+  const handle = repo.create({
+    tasks: Object.fromEntries(Array.from({ length: rowCount }, (_, index) => [
+      'task-' + index,
+      { id: 'task-' + index, title: 'Title ' + index }
+    ]))
+  });
+  const opened = await openAutomergeAttachment({
+    handle,
+    declaration: {
+      formatVersion: 1,
+      storageSchema: reference(schema),
+      projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
+    },
+    embeddedArtifacts: [schema, mapping],
+    authorityScope: 'tarstate:transaction-benchmark'
+  });
+  if (!opened.success) {
+    await repo.shutdown();
+    throw new Error('Transaction benchmark attachment failed: ' + opened.issues.map(({ code }) => code).join(', '));
+  }
+  const attachment = opened.value;
+  let sequence = 0;
+  return {
+    transact: async (changed) => {
+      const current = sequence;
+      sequence += 1;
+      const receipt = await attachment.transact(
+        { kind: changed ? 'replace-title' : 'no-op', sequence: current },
+        ({ rows }) => changed
+          ? rows.map((row) => row.fields.id === 'task-0'
+            ? { ...row, fields: { ...row.fields, title: 'Changed ' + current } }
+            : row)
+          : rows
+      );
+      if (receipt.outcome !== 'committed') {
+        throw new Error('Transaction benchmark rejected: ' + receipt.issues.map(({ code }) => code).join(', '));
+      }
+    },
+    sequence: () => sequence,
+    title: () => handle.doc()?.tasks['task-0']?.title,
+    close: async () => {
+      attachment.close();
+      await repo.shutdown();
+    }
+  };
 }
