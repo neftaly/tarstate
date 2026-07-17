@@ -264,6 +264,15 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
       keysByRelation.set(row.relationId, keys);
     }
     for (const edit of relevant) {
+      if (edit.kind === 'insert-generated-key') {
+        issues.push(createIssue({
+          code: 'transaction.capability_unavailable',
+          sourceId: snapshot.sourceId,
+          relationId: edit.relationId,
+          details: { edit: edit.kind }
+        }));
+        continue;
+      }
       const fingerprint = canonicalizeJson(edit.key);
       const operationGroup = operations.get(edit.relationId) ?? { paths: [], edits: [] };
       operationGroup.paths.push(rowPath(edit.relationId, edit.key));

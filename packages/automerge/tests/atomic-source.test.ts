@@ -66,6 +66,49 @@ describe('Automerge core source protocol', () => {
     )).toBe(false);
   });
 
+  it('owns generated key evidence and preserves the staged identity on publish', async () => {
+    type ListDocument = { items: { title: string }[] };
+    const runtime = new AutomergeSourceRuntime<ListDocument>({
+      sourceId: 'source:generated-keys',
+      doc: Automerge.from<ListDocument>({ items: [] }, { actor: actor('2') })
+    });
+    const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:generated-keys' });
+    const before = source.snapshot();
+    const command = {
+      generatesKeys: true as const,
+      apply: (
+        draft: Parameters<Automerge.ChangeFn<ListDocument>>[0],
+        context: Parameters<import('../src/source/runtime.js').AutomergeSourceCommand<ListDocument>['apply']>[1]
+      ) => {
+        draft.items.push({ title: 'Generated' });
+        const objectId = Automerge.getObjectId(draft.items[0]!);
+        if (objectId === null) throw new Error('missing generated object identity');
+        const key = [objectId];
+        context.recordGeneratedKey('items', 'new-item', key);
+        key[0] = 'caller mutation';
+      }
+    };
+    const staged = source.stage(before, [command]);
+    const stagedId = Automerge.getObjectId(staged.storage.items[0]!);
+
+    const result = await source.commit({
+      operationEpoch: 'epoch:generated-keys',
+      operationId: 'operation:generated-keys',
+      intentHash: intentHash('b'),
+      expectedBasis: before.basis,
+      commands: [command]
+    });
+
+    expect(result).toMatchObject({ outcome: 'committed' });
+    expect(result.generatedKeys).toEqual([{
+      relationId: 'items',
+      token: 'new-item',
+      key: [stagedId]
+    }]);
+    expect(Automerge.getObjectId(runtime.snapshot().storage.items[0]!)).toBe(stagedId);
+    expect([result.generatedKeys, result.generatedKeys?.[0], result.generatedKeys?.[0]?.key].every(Object.isFrozen)).toBe(true);
+  });
+
   it('returns deeply frozen commit and replay evidence', async () => {
     const { runtime, source } = fixture();
     const apply = vi.fn((draft: TaskDoc) => {

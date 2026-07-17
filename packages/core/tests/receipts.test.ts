@@ -69,8 +69,31 @@ describe('receipt forwarding and shell sequences', () => {
     expect(safeParseReceipt({ ...commitEvidence, outcome: 'unknown' })).toMatchObject({ success: false, issues: [{ code: 'receipt.invalid' }] });
     expect(safeParseReceipt({ ...commitEvidence, outcome: 'rejected', statementResults: [{ statementIndex: 0, matched: 0, logicallyChanged: 0, inserted: 0, deleted: 0, editOutcomes: [42], issues: [] }] })).toMatchObject({ success: false, issues: [{ code: 'receipt.invalid' }] });
     expect(safeParseReceipt({ ...commitEvidence, outcome: 'rejected', returning: [42] })).toMatchObject({ success: false, issues: [{ code: 'receipt.invalid' }] });
+    expect(safeParseReceipt({ ...commitEvidence, outcome: 'rejected', generatedKeys: [{ relationId: 'items', token: 'new' }] })).toMatchObject({ success: false, issues: [{ code: 'receipt.invalid' }] });
+    expect(safeParseReceipt({ ...commitEvidence, outcome: 'rejected', generatedKeys: [{ relationId: 'items', token: 'new', key: ['id'] }] })).toMatchObject({ success: false, issues: [{ code: 'receipt.invalid' }] });
     expect(safeParseReceipt({ kind: 'presence', receiptVersion: 1, operationId: 'one', attachmentId: 'a', outcome: 'accepted', issues: [{ id: 'bad', code: 'bad', severity: 'fatal', phase: 'query' }] })).toMatchObject({ success: false, issues: [{ code: 'receipt.invalid' }] });
     expect(safeParseReceiptText('{"kind":"presence","kind":"presence","receiptVersion":1,"operationId":"one","attachmentId":"a","outcome":"accepted","issues":[]}')).toMatchObject({ success: false, issues: [{ code: 'artifact.duplicate_member' }] });
+  });
+
+  it('forwards generated logical key evidence on committed receipts', () => {
+    const receipt = safeParseReceipt({
+      ...commitEvidence,
+      outcome: 'committed',
+      beforeBasis: { revision: 1 },
+      afterBasis: { revision: 2 },
+      durability: 'local',
+      generatedKeys: [{ relationId: 'items', token: 'new', key: ['source-id'] }]
+    });
+
+    expect(receipt).toMatchObject({
+      success: true,
+      value: {
+        kind: 'commit',
+        generatedKeys: [{ relationId: 'items', token: 'new', key: ['source-id'] }]
+      }
+    });
+    if (!receipt.success) throw new Error('expected generated key receipt');
+    expectDeepFrozen(receipt.value);
   });
 
   it('retains successful creation and reports its source as orphaned after a later failure', async () => {

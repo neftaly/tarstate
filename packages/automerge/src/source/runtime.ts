@@ -1,5 +1,7 @@
 import * as Automerge from '@automerge/automerge';
 import { canonicalizeJson, isContentHash, type ContentHash } from '@tarstate/core/artifacts';
+import type { GeneratedLogicalKey } from '@tarstate/core/source';
+import type { JsonValue } from '@tarstate/core';
 import {
   reportAutomergeDiagnostic,
   runAutomergeCleanups,
@@ -27,7 +29,19 @@ export type AutomergeSourceChange = {
 
 export type AutomergeSourceCommand<T extends object> = {
   readonly description?: string;
-  readonly apply: Automerge.ChangeFn<T>;
+  readonly generatesKeys?: true;
+  readonly apply: (
+    draft: Parameters<Automerge.ChangeFn<T>>[0],
+    context: AutomergeSourceCommandContext
+  ) => void;
+};
+
+export type AutomergeSourceCommandContext = {
+  readonly recordGeneratedKey: (
+    relationId: string,
+    token: string,
+    key: JsonValue
+  ) => void;
 };
 
 type AutomergeSourceCommitEvidence = {
@@ -36,6 +50,7 @@ type AutomergeSourceCommitEvidence = {
   readonly operationId: string;
   readonly intentHash: ContentHash;
   readonly durability: 'local';
+  readonly generatedKeys: readonly GeneratedLogicalKey[];
   readonly issues: readonly AutomergeSourceIssue[];
 };
 
@@ -118,7 +133,7 @@ type DocumentOwner<T extends object> = {
     basis: AutomergeBasis,
     commands: readonly AutomergeSourceCommand<T>[],
     message: string,
-  ): Automerge.Doc<T>;
+  ): { readonly storage: Automerge.Doc<T>; readonly generatedKeys: readonly GeneratedLogicalKey[] };
   subscribe(listener: (doc: Automerge.Doc<T>) => void): () => void;
   close(): void;
   merge?(remote: Automerge.Doc<T>): Automerge.Doc<T>;
@@ -315,12 +330,12 @@ export class AutomergeSourceRuntime<T extends object> {
       }]);
     }
 
-    let staged: Automerge.Doc<T> | undefined;
+    let applied: { readonly storage: Automerge.Doc<T>; readonly generatedKeys: readonly GeneratedLogicalKey[] } | undefined;
     let failure: unknown;
     this.#applying = true;
     try {
-      staged = input.commands.length === 0
-        ? current
+      applied = input.commands.length === 0
+        ? { storage: current, generatedKeys: emptyGeneratedKeys }
         : this.#owner.changeAt(beforeBasis, input.commands, input.message ?? 'tarstate source commit');
     } catch (error) {
       failure = error;
@@ -328,7 +343,7 @@ export class AutomergeSourceRuntime<T extends object> {
       this.#applying = false;
     }
 
-    if (failure !== undefined || staged === undefined) {
+    if (failure !== undefined || applied === undefined) {
       const actual = failure instanceof StaleOwnerBasis ? failure.storage : this.#owner.current();
       const actualBasis = automergeBasis(actual);
       const stale = failure instanceof StaleOwnerBasis;
@@ -346,7 +361,7 @@ export class AutomergeSourceRuntime<T extends object> {
       return rejected;
     }
 
-    const afterBasis = automergeBasis(staged);
+    const afterBasis = automergeBasis(applied.storage);
     const changed = !exactAutomergeBasisEqual(beforeBasis, afterBasis);
     const committed = ownCommitResult({
       kind: 'source-commit',
@@ -358,10 +373,11 @@ export class AutomergeSourceRuntime<T extends object> {
       afterBasis,
       changed,
       durability: 'local',
+      generatedKeys: applied.generatedKeys,
       issues: []
     });
     this.#retainOutcome(input, committed);
-    this.#install(staged, 'commit');
+    this.#install(applied.storage, 'commit');
     return committed;
   }
 
@@ -399,6 +415,7 @@ export class AutomergeSourceRuntime<T extends object> {
       ...(beforeBasis === undefined ? {} : { beforeBasis, afterBasis: beforeBasis }),
       changed: false,
       durability: 'local',
+      generatedKeys: emptyGeneratedKeys,
       issues
     });
   }
@@ -508,12 +525,15 @@ const adoptCommitInput = <T extends object>(input: AutomergeSourceCommitInput<T>
     .map((command, index): AutomergeSourceCommand<T> => {
       const commandDescriptors = inspectCommitRecord(command, 'Automerge commit command ' + String(index));
       const description = commitDataValue(commandDescriptors, 'description', 'Automerge commit command ' + String(index));
+      const generatesKeys = commitDataValue(commandDescriptors, 'generatesKeys', 'Automerge commit command ' + String(index));
       const apply = requiredCommitDataValue(commandDescriptors, 'apply', 'Automerge commit command ' + String(index));
       if (description !== undefined && typeof description !== 'string') throw new TypeError('Automerge commit command description must be a string');
+      if (generatesKeys !== undefined && generatesKeys !== true) throw new TypeError('Automerge commit command generatesKeys must be true');
       if (typeof apply !== 'function') throw new TypeError('Automerge commit command apply must be a function');
       return Object.freeze({
         ...(description === undefined ? {} : { description: description as string }),
-        apply: apply as Automerge.ChangeFn<T>
+        ...(generatesKeys === undefined ? {} : { generatesKeys: true as const }),
+        apply: apply as AutomergeSourceCommand<T>['apply']
       });
     });
   const message = commitDataValue(descriptors, 'message', 'Automerge commit input');
@@ -576,10 +596,11 @@ const memoryDocumentOwner = <T extends object>(initial: Automerge.Doc<T>): Docum
     current: () => doc,
     changeAt: (basis, commands, message) => {
       if (!exactAutomergeBasisEqual(basis, automergeBasis(doc))) throw new StaleOwnerBasis(doc);
+      let generatedKeys = emptyGeneratedKeys;
       doc = Automerge.change(doc, { message, time: 0 }, (draft) => {
-        for (const command of commands) command.apply(draft);
+        generatedKeys = applySourceCommands(commands, draft);
       });
-      return doc;
+      return { storage: doc, generatedKeys };
     },
     subscribe: () => () => undefined,
     close: () => undefined,
@@ -638,12 +659,13 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
       const current = currentDocument();
       if (!exactAutomergeBasisEqual(basis, automergeBasis(current))) throw new StaleOwnerBasis(current);
       const heads = handle.heads();
+      let generatedKeys = emptyGeneratedKeys;
       const changedHeads = handle.changeAt(heads, (draft) => {
-        for (const command of commands) command.apply(draft);
+        generatedKeys = applySourceCommands(commands, draft);
       }, { message, time: 0 });
       const changed = currentDocument();
       if (changedHeads === undefined) throw new StaleOwnerBasis(changed);
-      return changed;
+      return { storage: changed, generatedKeys };
     },
     subscribe: (listener) => {
       listeners.add(listener);
@@ -665,6 +687,47 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
     throw error;
   }
 };
+
+export const applySourceCommands = <T extends object>(
+  commands: readonly AutomergeSourceCommand<T>[],
+  draft: Parameters<Automerge.ChangeFn<T>>[0]
+): readonly GeneratedLogicalKey[] => {
+  if (!commands.some(({ generatesKeys }) => generatesKeys === true)) {
+    for (const command of commands) command.apply(draft, noGeneratedKeyContext);
+    return emptyGeneratedKeys;
+  }
+  const generatedKeys: GeneratedLogicalKey[] = [];
+  const tokens = new Set<string>();
+  const context: AutomergeSourceCommandContext = {
+    recordGeneratedKey: (relationId, token, key) => {
+      if (typeof relationId !== 'string'
+        || typeof token !== 'string'
+        || relationId.length === 0
+        || token.length === 0) {
+        throw new TypeError('Generated logical key relation and token must not be empty');
+      }
+      if (tokens.has(token)) throw new TypeError('Generated logical key token must be unique per operation');
+      canonicalizeJson(relationId);
+      canonicalizeJson(token);
+      canonicalizeJson(key);
+      tokens.add(token);
+      generatedKeys.push(Object.freeze({
+        relationId,
+        token,
+        key: cloneAndFreezeEvidence(key) as JsonValue
+      }));
+    }
+  };
+  for (const command of commands) command.apply(draft, context);
+  return Object.freeze(generatedKeys);
+};
+
+const emptyGeneratedKeys: readonly GeneratedLogicalKey[] = Object.freeze([]);
+const noGeneratedKeyContext: AutomergeSourceCommandContext = Object.freeze({
+  recordGeneratedKey: () => {
+    throw new TypeError('Automerge command must declare generatesKeys before recording generated keys');
+  }
+});
 
 const positiveSafeInteger = (value: number, label: string): number => {
   if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(label + ' must be a positive safe integer');

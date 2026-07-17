@@ -146,11 +146,30 @@ without adding properties to a foreign document:
 
 Portable JSON projection can derive collection position but reports source
 identity as unavailable unless its adapter supplies one. Source metadata is
-read-only, and collection position cannot be used as a logical key. Arrays
-with an explicit stored key support ordinary append insertion, field edits,
-and deletion. Tarstate does not advertise identity-preserving reorder because
-Automerge has no native object move; changing only the row array passed to
-`withRows` remains a relational no-op.
+read-only, and collection position cannot be used as a logical key. When every
+key field uses `collection-element-identity`, queue insertion through the same
+transaction callback without fabricating an Automerge object ID:
+
+```ts
+const intent = { kind: 'add-doc', token: 'new-doc', name: 'Notes' } as const;
+const receipt = await opened.value.transact(intent, (snapshot) =>
+  snapshot.insertWithGeneratedKey(docs, intent.token, { name: intent.name })
+);
+
+if (receipt.outcome === 'committed') {
+  const inserted = receipt.generatedKeys?.find(({ token }) => token === intent.token);
+  // inserted?.key is the committed logical key tuple.
+}
+```
+
+The token is operation-local application intent and must remain stable if the
+callback is replayed. Source-generated fields such as identity and position are
+omitted from the supplied fields. Only a committed receipt returns their final
+token-to-key association; simulation creates no durable identity. Arrays with
+an explicit stored key continue to use `withRows` for ordinary append
+insertion, field edits, and deletion. Tarstate does not advertise
+identity-preserving reorder because Automerge has no native object move;
+changing only the row array passed to `withRows` remains a relational no-op.
 
 `getSnapshot` and `subscribe` form a synchronous external-store boundary. The
 snapshot reports readiness, exactness, freshness, source lifecycle, basis, and

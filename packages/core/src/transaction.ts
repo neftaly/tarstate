@@ -4,6 +4,7 @@ import { createIssue, type CapabilityRef, type Issue } from './issues.js';
 import type { SourceBasis } from './source-state.js';
 import type { QueryNode } from './query/model.js';
 import type { JsonValue } from './value.js';
+import type { GeneratedLogicalKey } from './logical-edit.js';
 
 /** Portable expression subset used by source-local writes. */
 export type WriteExpression =
@@ -52,6 +53,7 @@ export type KeyedDeltaChange =
 
 export type WriteStatement =
   | { readonly kind: 'statement.insert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
+  | { readonly kind: 'statement.insert-generated-key'; readonly relation: WriteRelation; readonly token: string; readonly fields: Readonly<Record<string, WriteExpression>> }
   | { readonly kind: 'statement.insert-from-query'; readonly relation: WriteRelation; readonly root: QueryNode }
   | { readonly kind: 'statement.upsert'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[]; readonly onConflict: InsertConflictPolicy }
   | { readonly kind: 'statement.replace-all'; readonly relation: WriteRelation; readonly rows: readonly Readonly<Record<string, WriteExpression>>[] }
@@ -124,6 +126,7 @@ type CommitReceiptEvidence = {
   readonly attachmentFingerprint: ContentHash;
   readonly sourceId: string;
   readonly statementResults: readonly StatementResult[];
+  readonly generatedKeys?: readonly GeneratedLogicalKey[];
   readonly returning?: readonly ReturningResult[];
   readonly issues: readonly Issue[];
 };

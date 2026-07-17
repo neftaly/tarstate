@@ -10,7 +10,11 @@ import {
   type OperationLedgerProtocol,
   type OperationReservation
 } from './lifecycle-governance.js';
-import type { WritableLogicalRow, WritableLogicalState } from './logical-edit.js';
+import type {
+  GeneratedLogicalKey,
+  WritableLogicalRow,
+  WritableLogicalState
+} from './logical-edit.js';
 import {
   evaluateTransactionExpression,
   evaluateTransactionFields,
@@ -197,7 +201,7 @@ const unknownOperationReceipt = <Storage, Command>(
   ...receiptEvidence(context, prepared, prior?.statementResults ?? [], [
     ...(prior?.issues ?? []),
     transactionIssue(code, prepared.attempt, error === undefined ? undefined : { error: errorName(error) }, 'query_outcome')
-  ], prior?.returning),
+  ], prior?.returning, prior?.generatedKeys),
   outcome: 'unknown',
   ...(prior?.beforeBasis === undefined ? {} : { beforeBasis: prior.beforeBasis }),
   durability: 'unknown'
@@ -365,7 +369,14 @@ const reconcileAndCommitPreparedExecution = async <Storage, Command>(
     }
     const returning = evaluated.returning?.map((result): ReturningResult => ({ ...result, basis: outcome.afterBasis as SourceBasis }));
     return { prepared, receipt: {
-      ...receiptEvidence(context, prepared, evaluated.statementResults, issues, returning),
+      ...receiptEvidence(
+        context,
+        prepared,
+        evaluated.statementResults,
+        issues,
+        returning,
+        outcome.generatedKeys
+      ),
       outcome: 'committed',
       beforeBasis: outcome.beforeBasis,
       afterBasis: outcome.afterBasis,
@@ -757,6 +768,27 @@ const evaluateStatement = <Storage, Command>(
   const keyFields = context.relationKeys.get(relation.relationId);
   if (keyFields === undefined) return failedStatement(empty, transactionIssue('transaction.cross_source_access', undefined, { relationId: relation.relationId }));
   const rows = state.rowsByRelation.get(relation.relationId) ?? [];
+  if (statement.kind === 'statement.insert-generated-key') {
+    const evaluated = evaluateTransactionFields(statement.fields, {}, parameters);
+    if (!evaluated.success) return failedStatement(empty, evaluated.issue);
+    const suppliedKey = keyFields.find((field) => Object.hasOwn(evaluated.value, field));
+    if (suppliedKey !== undefined) {
+      return failedStatement(empty, transactionIssue('transaction.delta_invalid', undefined, {
+        relationId: relation.relationId,
+        field: suppliedKey,
+        reason: 'source_generated_key_supplied'
+      }));
+    }
+    return {
+      editGroups: [[{
+        kind: 'insert-generated-key',
+        relationId: relation.relationId,
+        token: statement.token,
+        fields: evaluated.value
+      }]],
+      result: { ...empty, inserted: 1, logicallyChanged: 1 }
+    };
+  }
   if (statement.kind === 'statement.insert' || statement.kind === 'statement.replace-all' || statement.kind === 'statement.upsert') {
     const candidates: Readonly<Record<string, JsonValue>>[] = [];
     for (const fields of statement.rows) {
@@ -1283,8 +1315,18 @@ const receiptEvidence = <Storage, Command>(
   prepared: PreparedExecution,
   statementResults: readonly StatementResult[],
   issues: readonly Issue[],
-  returning?: readonly ReturningResult[]
-) => rawReceiptEvidence(context, prepared.attempt, prepared.transaction.contentHash, prepared.intentHash, statementResults, issues, returning);
+  returning?: readonly ReturningResult[],
+  generatedKeys?: readonly GeneratedLogicalKey[]
+) => rawReceiptEvidence(
+  context,
+  prepared.attempt,
+  prepared.transaction.contentHash,
+  prepared.intentHash,
+  statementResults,
+  issues,
+  returning,
+  generatedKeys
+);
 
 const rawReceiptEvidence = <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
@@ -1293,7 +1335,8 @@ const rawReceiptEvidence = <Storage, Command>(
   intentHash: ContentHash,
   statementResults: readonly StatementResult[],
   issues: readonly Issue[],
-  returning?: readonly ReturningResult[]
+  returning?: readonly ReturningResult[],
+  generatedKeys?: readonly GeneratedLogicalKey[]
 ) => ({
   kind: 'commit' as const,
   receiptVersion: 1 as const,
@@ -1305,6 +1348,7 @@ const rawReceiptEvidence = <Storage, Command>(
   attachmentFingerprint: context.attachmentFingerprint,
   sourceId: context.source.sourceId,
   statementResults,
+  ...(generatedKeys === undefined ? {} : { generatedKeys }),
   ...(returning === undefined ? {} : { returning }),
   issues
 });
@@ -1405,6 +1449,7 @@ const statementRelation = (statement: WriteStatement): WriteRelation | undefined
   switch (statement.kind) {
     case 'extension': return undefined;
     case 'statement.insert':
+    case 'statement.insert-generated-key':
     case 'statement.insert-from-query':
     case 'statement.upsert':
     case 'statement.replace-all':

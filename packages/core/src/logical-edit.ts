@@ -4,6 +4,12 @@ import type { JsonValue } from './value.js';
 export type Footprint = JsonValue;
 export type FootprintRelation = 'disjoint' | 'equal' | 'contains' | 'contained_by' | 'overlaps' | 'unknown';
 
+export type GeneratedLogicalKey = {
+  readonly relationId: string;
+  readonly token: string;
+  readonly key: JsonValue;
+};
+
 export type LogicalEditTarget = {
   readonly relationId: string;
   readonly key: JsonValue;
@@ -24,6 +30,12 @@ export type LogicalSemanticEdit =
       readonly kind: 'insert';
       readonly relationId: string;
       readonly key: JsonValue;
+      readonly fields: Readonly<Record<string, JsonValue>>;
+    }
+  | {
+      readonly kind: 'insert-generated-key';
+      readonly relationId: string;
+      readonly token: string;
       readonly fields: Readonly<Record<string, JsonValue>>;
     }
   | (LogicalEditTarget & { readonly kind: 'delete' })

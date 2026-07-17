@@ -171,7 +171,17 @@ const isKnownReceiptShape = (value: Readonly<Record<string, JsonValue>>, depth: 
       : value.outcome === 'rejected'
         ? value.afterBasis === undefined && value.durability === undefined
         : value.outcome === 'unknown' && value.afterBasis === undefined && value.durability === 'unknown';
-    return strings(value, ['operationEpoch', 'operationId', 'attachmentId', 'sourceId']) && hashes(value, ['transactionHash', 'intentHash', 'attachmentFingerprint']) && outcomeShape && Array.isArray(value.statementResults) && value.statementResults.every(isStatementResult) && (value.returning === undefined || (Array.isArray(value.returning) && value.returning.every(isReturningResult)));
+    return strings(value, ['operationEpoch', 'operationId', 'attachmentId', 'sourceId'])
+      && hashes(value, ['transactionHash', 'intentHash', 'attachmentFingerprint'])
+      && outcomeShape
+      && Array.isArray(value.statementResults)
+      && value.statementResults.every(isStatementResult)
+      && (value.generatedKeys === undefined
+        || (value.outcome !== 'rejected'
+          && Array.isArray(value.generatedKeys)
+          && value.generatedKeys.every(isGeneratedLogicalKey)))
+      && (value.returning === undefined
+        || (Array.isArray(value.returning) && value.returning.every(isReturningResult)));
   }
   if (value.kind === 'non-atomic-batch') {
     return typeof value.batchId === 'string' && includes(value.outcome, ['complete', 'partial', 'failed', 'unknown']) && Array.isArray(value.steps) && value.steps.every((step) => isBatchStep(step, depth));
@@ -191,6 +201,9 @@ const isKnownReceiptShape = (value: Readonly<Record<string, JsonValue>>, depth: 
 const isStatementResult = (value: JsonValue): boolean => isRecord(value) && typeof value.statementIndex === 'number' && Number.isSafeInteger(value.statementIndex) && value.statementIndex >= 0 && ['matched', 'logicallyChanged', 'inserted', 'deleted'].every((field) => typeof value[field] === 'number' && Number.isSafeInteger(value[field]) && value[field] >= 0) && Array.isArray(value.editOutcomes) && value.editOutcomes.every(isSemanticEditOutcome) && isIssueArray(value.issues);
 const isSemanticEditOutcome = (value: JsonValue): boolean => isRecord(value) && includes(value.edit, ['move', 'rekey', 'counter', 'text', 'list', 'custom']) && isCapabilityRef(value.mechanism) && Array.isArray(value.preservationLosses) && value.preservationLosses.every((loss) => typeof loss === 'string');
 const isReturningResult = (value: JsonValue): boolean => isRecord(value) && strings(value, ['name', 'sourceId']) && Array.isArray(value.rows) && Array.isArray(value.resultKeys) && value.resultKeys.length === value.rows.length && value.resultKeys.every((key) => typeof key === 'string') && Object.hasOwn(value, 'basis') && isIssueArray(value.issues);
+const isGeneratedLogicalKey = (value: JsonValue): boolean => isRecord(value)
+  && strings(value, ['relationId', 'token'])
+  && Object.hasOwn(value, 'key');
 const isBatchStep = (value: JsonValue, depth: number): boolean => isRecord(value) && strings(value, ['stepId', 'attachmentId']) && (value.sourceId === undefined || (typeof value.sourceId === 'string' && value.sourceId.length > 0)) && includes(value.outcome, ['applied', 'failed', 'unattempted', 'unknown']) && (value.receipt === undefined || (isRecord(value.receipt) && isKnownReceiptShape(value.receipt, depth + 1)));
 const isSequenceStep = (value: JsonValue, depth: number): boolean => isRecord(value) && typeof value.stepId === 'string' && includes(value.outcome, ['applied', 'failed', 'unattempted', 'unknown']) && (value.receipt === undefined || (isRecord(value.receipt) && isKnownReceiptShape(value.receipt, depth + 1)));
 const isIssueArray = (value: JsonValue | undefined): boolean => Array.isArray(value) && value.every(isIssue);

@@ -4,6 +4,7 @@ export * from '../lifecycle-governance.js';
 export type {
   Footprint,
   FootprintRelation,
+  GeneratedLogicalKey,
   LogicalEdit,
   LogicalEditTarget,
   LogicalReplaceFieldsEdit,

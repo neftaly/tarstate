@@ -3,6 +3,7 @@ import type { Issue } from './issues.js';
 import type {
   Footprint,
   FootprintRelation,
+  GeneratedLogicalKey,
   LogicalEdit,
   PlannedEditHandling,
   ProjectionResult
@@ -12,6 +13,7 @@ import type { SourceBasis, SourceSnapshot } from './source-state.js';
 export type {
   Footprint,
   FootprintRelation,
+  GeneratedLogicalKey,
   LogicalEdit,
   LogicalEditTarget,
   LogicalReplaceFieldsEdit,
@@ -65,6 +67,7 @@ export type SourceCommitResult = {
   readonly outcome: 'committed' | 'rejected' | 'unknown';
   readonly beforeBasis?: SourceBasis;
   readonly afterBasis?: SourceBasis;
+  readonly generatedKeys?: readonly GeneratedLogicalKey[];
   readonly issues: readonly Issue[];
 };
 

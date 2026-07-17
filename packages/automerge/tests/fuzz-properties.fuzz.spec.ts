@@ -2,6 +2,9 @@ import * as Automerge from '@automerge/automerge';
 import fc from 'fast-check';
 import { describe, expect, vi } from 'vitest';
 import {
+  AutomergeAtomicSource,
+} from '../src/adapter/atomic-source.js';
+import {
   AutomergeSourceRuntime,
   exactAutomergeBasisEqual,
   type AutomergeSourceCommitResult
@@ -78,6 +81,52 @@ const hash = (digit: number): `sha256:${string}` => `sha256:${(digit & 15).toStr
 const ledgerKey = (epoch: number, operation: number): string => epoch + '\u0000' + operation;
 
 describe('Automerge shrinking model properties', () => {
+  propertyTest('staged generated identities equal committed and replayed evidence', fc.asyncProperty(
+    fc.array(safeString, { minLength: 1, maxLength: 8 }),
+    async (values) => {
+      type IdentityDocument = { readonly items: { value: string }[] };
+      const runtime = new AutomergeSourceRuntime<IdentityDocument>({
+        sourceId: 'source:generated-identity-fuzz',
+        doc: Automerge.from<IdentityDocument>({ items: [] }, { actor: '3'.repeat(64) })
+      });
+      const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:generated' });
+      const before = source.snapshot();
+      const command = {
+        generatesKeys: true as const,
+        apply: (
+          draft: Parameters<Automerge.ChangeFn<IdentityDocument>>[0],
+          context: Parameters<import('../src/source/runtime.js').AutomergeSourceCommand<IdentityDocument>['apply']>[1]
+        ) => {
+          values.forEach((value, index) => {
+            draft.items.push({ value });
+            const objectId = Automerge.getObjectId(draft.items[draft.items.length - 1]!);
+            if (objectId === null) throw new Error('missing generated object identity');
+            context.recordGeneratedKey('items', String(index), [objectId]);
+          });
+        }
+      };
+      const staged = source.stage(before, [command]);
+      const stagedKeys = staged.storage.items.map((item) => [Automerge.getObjectId(item)]);
+      const input = {
+        operationEpoch: 'epoch:generated',
+        operationId: 'operation:generated',
+        intentHash: hash(7),
+        expectedBasis: before.basis,
+        commands: [command]
+      };
+
+      const committed = await source.commit(input);
+      expect(committed).toMatchObject({ outcome: 'committed' });
+      expect(committed.generatedKeys?.map(({ key }) => key)).toEqual(stagedKeys);
+      expect(runtime.snapshot().storage.items.map((item) => [Automerge.getObjectId(item)])).toEqual(stagedKeys);
+
+      const replayed = await source.commit(input);
+      expect(replayed).toEqual(committed);
+      expect(runtime.snapshot().storage.items).toHaveLength(values.length);
+      source.close();
+    }
+  ));
+
   propertyTest('concurrent disjoint player maps survive local commit and merge', fc.asyncProperty(
     fc.dictionary(key, fc.integer({ min: -20, max: 20 }), { minKeys: 1, maxKeys: 8 }),
     fc.dictionary(key, fc.integer({ min: -20, max: 20 }), { minKeys: 1, maxKeys: 8 }),

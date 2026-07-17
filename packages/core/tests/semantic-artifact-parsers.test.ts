@@ -57,6 +57,7 @@ const transactionBody = (): TransactionBody => ({
   parameters: { name: 'Ada', amount: 2 },
   statements: [
     { kind: 'statement.insert', relation: relationUse, rows: [{ id: literal(1), name: parameter('name') }] },
+    { kind: 'statement.insert-generated-key', relation: relationUse, token: 'new-person', fields: { name: parameter('name') } },
     { kind: 'statement.insert-from-query', relation: relationUse, root: values('inserted') },
     { kind: 'statement.upsert', relation: relationUse, rows: [{ id: literal(2) }], onConflict: 'keep-existing' },
     { kind: 'statement.replace-all', relation: relationUse, rows: [{ id: literal(3) }] },
@@ -187,6 +188,11 @@ describe('semantic artifact safe parsers', () => {
     const duplicateReturning = mutate(transactionBody(), (body) => { body.returning.push(body.returning[0]); });
     expect(await safeParseTransactionArtifact(await seal('transaction', duplicateReturning)))
       .toMatchObject({ success: false, issues: [{ details: { reason: 'duplicate_returning_name' } }] });
+    const duplicateGeneratedToken = mutate(transactionBody(), (body) => {
+      body.statements.push({ ...body.statements[1], fields: { name: literal('Grace') } });
+    });
+    expect(await safeParseTransactionArtifact(await seal('transaction', duplicateGeneratedToken)))
+      .toMatchObject({ success: false, issues: [{ details: { reason: 'duplicate_generated_key_token' } }] });
     const wrongSchema = mutate(transactionBody(), (body) => { body.statements[0].relation.schemaView = otherSchemaRef; });
     expect(await safeParseTransactionArtifact(await seal('transaction', wrongSchema)))
       .toMatchObject({ success: false, issues: expect.arrayContaining([expect.objectContaining({ details: { reason: 'transaction_schema_mismatch' } })]) });

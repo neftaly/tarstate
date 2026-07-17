@@ -74,7 +74,9 @@ describe('attachment transaction service', () => {
     expect(preparation.relations.get('test.item')).toEqual({
       relationId: 'test.item',
       keyFields: ['id'],
-      replaceableFields: ['title']
+      replaceableFields: ['title'],
+      sourceGeneratedFields: [],
+      supportsGeneratedKeyInsert: false
     });
     const source = new LogicalMemoryAtomicSource({
       sourceId: 'source:attachment-transactions',
@@ -183,6 +185,13 @@ describe('attachment transaction service', () => {
       { kind: 'invalid-replacement-row' },
       (snapshot) => snapshot.withRows(items, [{ id: 'one', title: 4, count: 3 } as never])
     )).rejects.toMatchObject({ name: 'TarstateParseError' });
+    await expect(service.simulate(
+      { kind: 'generated-key-unavailable' },
+      (snapshot) => snapshot.insertWithGeneratedKey(items, 'new-item', { title: 'New', count: 4 })
+    )).rejects.toMatchObject({
+      name: 'TarstateParseError',
+      issues: [{ details: { reason: 'source_generated_key_unavailable' } }]
+    });
     expect(source.snapshot()).toMatchObject({
       storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 3 }] }
     });

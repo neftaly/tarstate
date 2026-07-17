@@ -56,14 +56,26 @@ export const validateTransactionArtifactBody = (
   if (!Array.isArray(value.statements)) {
     invalid(context, ['body', 'statements'], 'array_required');
   } else {
-    value.statements.forEach((statement, index) => validateWriteStatement(
-      context,
-      statement,
-      ['body', 'statements', index],
-      schemaView,
-      queryState,
-      0
-    ));
+    let generatedKeyTokens: Set<string> | undefined;
+    value.statements.forEach((statement, index) => {
+      validateWriteStatement(
+        context,
+        statement,
+        ['body', 'statements', index],
+        schemaView,
+        queryState,
+        0
+      );
+      if (isRecord(statement)
+        && statement.kind === 'statement.insert-generated-key'
+        && typeof statement.token === 'string') {
+        if (generatedKeyTokens?.has(statement.token) === true) {
+          invalid(context, ['body', 'statements', index, 'token'], 'duplicate_generated_key_token');
+        } else {
+          (generatedKeyTokens ??= new Set()).add(statement.token);
+        }
+      }
+    });
   }
   if (!Array.isArray(value.guards)) {
     invalid(context, ['body', 'guards'], 'array_required');
@@ -116,6 +128,13 @@ const validateWriteStatement = (
   if (statement.kind === 'extension') {
     shape(context, statement, ['kind', 'capability', 'payload'], [], path);
     recordCapabilityUse(context, statement.capability, [...path, 'capability'], state);
+    return;
+  }
+  if (statement.kind === 'statement.insert-generated-key') {
+    shape(context, statement, ['kind', 'relation', 'token', 'fields'], [], path);
+    validateWriteRelation(context, statement.relation, [...path, 'relation'], schemaView);
+    nonEmptyString(context, statement.token, [...path, 'token']);
+    validateWriteExprRecord(context, statement.fields, [...path, 'fields'], new Set(), state, depth + 1);
     return;
   }
   if (

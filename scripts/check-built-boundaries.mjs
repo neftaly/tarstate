@@ -22,8 +22,8 @@ try {
   assertClosure('source/index.js', 100, []);
   assertClosure('values/index.js', 25_000, ['query', 'schema', 'transaction', 'database', 'memory-source']);
   assertClosure('attachment/index.js', 100, []);
-  // Includes portable source-metadata projection for ordered/native-identity mappings.
-  assertClosure('attachment/adapter/index.js', 307_500, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  // Includes portable source-metadata projection and generated-key transaction authoring.
+  assertClosure('attachment/adapter/index.js', 313_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);

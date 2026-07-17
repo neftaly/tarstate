@@ -33,6 +33,10 @@ type OrderedTaskDocument = {
   tasks: { id: string; title: string }[];
 };
 
+type SourceIdentityTaskDocument = {
+  tasks?: { title: string }[];
+};
+
 describe('standard Automerge database', () => {
   it('rejects invalid database identities before reading metadata', async () => {
     const repo = new Repo();
@@ -298,6 +302,120 @@ describe('standard Automerge database', () => {
     ]);
     opened.value.close();
     await repo.shutdown();
+  });
+
+  it('inserts a source-identity keyed row and returns its committed logical key', async () => {
+    const fixture = await openSourceIdentityTaskDatabase({ collectionPresent: false });
+
+    await expect(fixture.database.simulate(
+      { kind: 'invalid-generated-task' },
+      (snapshot) => snapshot.insertWithGeneratedKey(
+        fixture.tasks,
+        'invalid',
+        { title: 'Invalid', position: 0 }
+      )
+    )).rejects.toMatchObject({
+      name: 'TarstateParseError',
+      issues: [{ details: { reason: 'source_generated_field_supplied', field: 'position' } }]
+    });
+    await expect(fixture.database.simulate(
+      { kind: 'duplicate-generated-token' },
+      (snapshot) => snapshot
+        .insertWithGeneratedKey(fixture.tasks, 'duplicate', { title: 'First' })
+        .insertWithGeneratedKey(fixture.tasks, 'duplicate', { title: 'Second' })
+    )).rejects.toMatchObject({
+      name: 'TarstateParseError',
+      issues: [{ details: { reason: 'insertion_token_duplicate' } }]
+    });
+
+    const simulated = await fixture.database.simulate(
+      { kind: 'preview-generated-task', token: 'preview' },
+      (snapshot) => snapshot.insertWithGeneratedKey(
+        fixture.tasks,
+        'preview',
+        { title: 'Preview' }
+      )
+    );
+    expect(simulated).toMatchObject({
+      outcome: 'would-commit',
+      statementResults: [{ inserted: 1, logicallyChanged: 1 }]
+    });
+    expect('generatedKeys' in simulated).toBe(false);
+    expect(fixture.handle.doc()?.tasks).toBeUndefined();
+
+    const receipt = await fixture.database.transact(
+      { kind: 'insert-generated-task', token: 'local' },
+      (snapshot) => snapshot.insertWithGeneratedKey(
+        fixture.tasks,
+        'local',
+        { title: 'Local' }
+      )
+    );
+
+    expect(receipt).toMatchObject({
+      outcome: 'committed',
+      generatedKeys: [{ relationId: 'source-identity-tasks', token: 'local' }]
+    });
+    const inserted = fixture.handle.doc()?.tasks?.[0];
+    const objectId = inserted === undefined ? null : Automerge.getObjectId(inserted);
+    expect(receipt.generatedKeys).toEqual([{
+      relationId: 'source-identity-tasks',
+      token: 'local',
+      key: [objectId]
+    }]);
+    expect(fixture.database.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: {
+        rows: [{
+          relationId: 'source-identity-tasks',
+          fields: { id: objectId, title: 'Local', position: 0 }
+        }]
+      }
+    });
+
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('replays a generated-key insert after a player edit without duplicating it', async () => {
+    const fixture = await openSourceIdentityTaskDatabase();
+    const started = deferred();
+    const resume = deferred();
+    let calls = 0;
+    const pending = fixture.database.transact(
+      { kind: 'insert-generated-task-after-player-change', token: 'local' },
+      async (snapshot) => {
+        calls += 1;
+        if (calls === 1) {
+          started.resolve();
+          await resume.promise;
+        }
+        return snapshot.insertWithGeneratedKey(fixture.tasks, 'local', { title: 'Local' });
+      }
+    );
+
+    await started.promise;
+    const remote = Automerge.change(
+      Automerge.clone(fixture.handle.doc()!, { actor: 'b'.repeat(64) }),
+      (draft) => { draft.tasks!.push({ title: 'Remote' }); }
+    );
+    fixture.handle.update((current) => Automerge.merge(current, remote));
+    resume.resolve();
+
+    const receipt = await pending;
+    expect(receipt).toMatchObject({ outcome: 'committed' });
+    expect(calls).toBe(2);
+    expect(fixture.handle.doc()?.tasks?.map(({ title }) => title).sort()).toEqual(['Local', 'Remote']);
+    const local = fixture.handle.doc()?.tasks?.find(({ title }) => title === 'Local');
+    const localObjectId = local === undefined ? null : Automerge.getObjectId(local);
+    expect(receipt.generatedKeys).toEqual([{
+      relationId: 'source-identity-tasks',
+      token: 'local',
+      key: [localObjectId]
+    }]);
+
+    fixture.database.close();
+    await fixture.repo.shutdown();
   });
 
   it('accepts embedded artifact maps and runs standard logical constraints without host plumbing', async () => {
@@ -662,6 +780,58 @@ const openTaskDatabase = async (options: {
     throw new Error(JSON.stringify(opened.issues));
   }
   return { database: opened.value, handle, repo, schema, tasks: relationLiteral(schema, 'tasks') };
+};
+
+const openSourceIdentityTaskDatabase = async (
+  options: { readonly collectionPresent?: boolean } = {}
+) => {
+  const schema = await sealSchema({ id: 'urn:test:source-identity-task:schema', body: {
+    relations: { tasks: {
+      relationId: 'source-identity-tasks',
+      key: ['id'],
+      fields: {
+        id: { type: { kind: 'string' } },
+        title: { type: { kind: 'string' } },
+        position: { type: { kind: 'number' } }
+      }
+    } }
+  } });
+  const mapping = await sealStorageMapping({ id: 'urn:test:source-identity-task:mapping', body: {
+    schema: reference(schema),
+    model: 'json-tree-v1',
+    relations: { 'source-identity-tasks': {
+      collection: { kind: 'array', path: ['tasks'], absent: 'creatable' },
+      keys: { id: { kind: 'source-metadata', value: 'collection-element-identity' } },
+      fields: {
+        title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+        position: { kind: 'source-metadata', value: 'collection-position' }
+      }
+    } }
+  } });
+  const repo = new Repo();
+  const handle = repo.create<SourceIdentityTaskDocument>(
+    options.collectionPresent === false ? {} : { tasks: [] }
+  );
+  const opened = await openAutomergeDatabase({
+    handle,
+    declaration: {
+      formatVersion: 1,
+      storageSchema: reference(schema),
+      projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
+    },
+    embeddedArtifacts: [schema, mapping],
+    authorityScope: 'scope:test'
+  });
+  if (!opened.success) {
+    await repo.shutdown();
+    throw new Error(JSON.stringify(opened.issues));
+  }
+  return {
+    database: opened.value,
+    handle,
+    repo,
+    tasks: relationLiteral(schema, 'tasks')
+  };
 };
 
 const mountTaskDatabase = async (

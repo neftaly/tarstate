@@ -19,6 +19,7 @@ import {
   type SourceSnapshot
 } from '@tarstate/core/source';
 import {
+  applySourceCommands,
   automergeBasis,
   type AutomergeSourceRuntimeApi,
   type AutomergeBasis,
@@ -182,9 +183,13 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     try {
       const storage = commands.length === 0
         ? snapshot.storage
-        : Automerge.change(Automerge.clone(snapshot.storage), { message: 'tarstate staged source commit', time: 0 }, (draft) => {
-            for (const command of commands) command.apply(draft);
-          });
+        : Automerge.change(
+            // The clone is speculative and never merged. Reusing the serialized
+            // owner's actor makes source-generated IDs match a later exact-basis publish.
+            Automerge.clone(snapshot.storage, Automerge.getActorId(snapshot.storage)),
+            { message: 'tarstate staged source commit', time: 0 },
+            (draft) => { applySourceCommands(commands, draft); }
+          );
       return { storage, issues: [] };
     } catch (error) {
       return {
@@ -257,12 +262,16 @@ const frozenCoreCommitResult = (result: SourceCommitResult): SourceCommitResult 
     beforeBasis: result.beforeBasis,
     ...(result.afterBasis === undefined ? {} : { afterBasis: result.afterBasis })
   } : {}),
+  ...(result.generatedKeys === undefined
+    ? {}
+    : { generatedKeys: result.generatedKeys }),
   issues: Object.freeze([...result.issues])
 });
 
 const coreCommitResult = (result: AutomergeSourceCommitResult): SourceCommitResult => frozenCoreCommitResult({
   outcome: result.outcome,
   ...('beforeBasis' in result ? { beforeBasis: result.beforeBasis, afterBasis: result.afterBasis } : {}),
+  ...(result.generatedKeys.length === 0 ? {} : { generatedKeys: result.generatedKeys }),
   issues: result.issues.map((issue) => adapterIssue(
     issue.code,
     issue.phase,

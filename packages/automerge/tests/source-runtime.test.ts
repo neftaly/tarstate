@@ -205,6 +205,7 @@ describe('production Automerge adapter', () => {
       [{ ...valid, expectedBasis: { kind: 'automerge-heads', heads: ['not-a-head'] } }, /canonical Automerge hashes/],
       [{ ...valid, expectedBasis: { kind: 'automerge-heads', heads: [valid.expectedBasis.heads[0], valid.expectedBasis.heads[0]] } }, /heads must be unique/],
       [{ ...valid, commands: [{ description: 1, apply: () => undefined }] }, /description must be a string/],
+      [{ ...valid, commands: [{ generatesKeys: false, apply: () => undefined }] }, /generatesKeys must be true/],
       [{ ...valid, commands: [{ description: 'invalid', apply: 'not-a-function' }] }, /apply must be a function/],
       [{ ...valid, message: 1 }, /message must be a string/]
     ];

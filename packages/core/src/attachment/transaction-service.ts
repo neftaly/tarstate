@@ -13,7 +13,12 @@ import {
   type PreparedWritableExecutionContext,
   type PreparedTransactionQueryService
 } from '../transaction-executor.js';
-import { sealTransaction, type CommitReceipt } from '../transaction.js';
+import {
+  sealTransaction,
+  type CommitReceipt,
+  type WriteExpression,
+  type WriteStatement
+} from '../transaction.js';
 import type { JsonValue } from '../value.js';
 import type { WritableLogicalState } from '../logical-edit.js';
 import type {
@@ -91,10 +96,18 @@ const createExecutionContext = async <Storage, Command>(
   if (input.authorityScope.length === 0) throw new TypeError('Attachment transaction authorityScope must not be empty');
   const snapshot = input.source.snapshot();
   const registryFingerprint = await input.registry.fingerprint();
-  const relations = [...preparation.relations.values()].map(({ relationId, keyFields, replaceableFields }) => ({
+  const relations = [...preparation.relations.values()].map(({
     relationId,
     keyFields,
-    replaceableFields
+    replaceableFields,
+    sourceGeneratedFields,
+    supportsGeneratedKeyInsert
+  }) => ({
+    relationId,
+    keyFields,
+    replaceableFields,
+    sourceGeneratedFields,
+    supportsGeneratedKeyInsert
   }));
   const attachmentFingerprint = await sha256Json({
     attachmentId: input.attachmentId,
@@ -143,7 +156,7 @@ const authorStateTransition = async <Storage, Command>(
   projectionIssues: readonly Issue[],
   transform: DatabaseTransactionTransform
 ) => {
-  const statements = [];
+  const statements: WriteStatement[] = [];
   if (!projectionIssues.some(({ severity }) => severity === 'error')) {
     const beforeByRelation = groupTransactionFields(before.rows);
     const snapshot = new ImmutableDatabaseTransactionSnapshot({
@@ -153,7 +166,8 @@ const authorStateTransition = async <Storage, Command>(
       availableRelations: preparation.relations,
       registry,
       rowsByRelation: beforeByRelation,
-      changedRelationIds: emptyChangedRelationIds
+      changedRelationIds: emptyChangedRelationIds,
+      generatedKeyInserts: emptyGeneratedKeyInserts
     });
     const transformed = await transform(snapshot);
     if (!(transformed instanceof ImmutableDatabaseTransactionSnapshot)
@@ -174,6 +188,14 @@ const authorStateTransition = async <Storage, Command>(
       if (!authored.success) throw new TarstateParseError(authored.issues);
       statements.push(...authored.value);
     }
+    for (const insert of transformed.generatedInserts()) {
+      statements.push({
+        kind: 'statement.insert-generated-key',
+        relation: { relationId: insert.relationId, schemaView: context.schemaView },
+        token: insert.token,
+        fields: literalFields(insert.fields)
+      });
+    }
   }
   return sealTransaction({ body: {
     schemaView: context.schemaView,
@@ -186,6 +208,13 @@ const authorStateTransition = async <Storage, Command>(
 
 const emptyTransactionFields: readonly Readonly<Record<string, JsonValue>>[] = Object.freeze([]);
 const emptyChangedRelationIds: ReadonlySet<string> = new Set<string>();
+const emptyGeneratedKeyInserts = Object.freeze([]);
+
+const literalFields = (
+  fields: Readonly<Record<string, JsonValue>>
+): Readonly<Record<string, WriteExpression>> => Object.fromEntries(
+  Object.entries(fields).map(([field, value]) => [field, { kind: 'literal' as const, value }])
+);
 
 /** Groups one adopted logical state once before per-relation delta authoring. */
 const groupTransactionFields = (
