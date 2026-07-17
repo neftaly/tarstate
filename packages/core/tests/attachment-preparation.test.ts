@@ -6,6 +6,7 @@ import {
   prepareDatabaseAttachment,
   prepareManualReadOnlyAttachment
 } from '../src/attachment/preparation.js';
+import { safeParseDocumentDeclaration } from '../src/attachment/declaration/index.js';
 import { ExactArtifactResolver } from '../src/artifact-resolver.js';
 import { AttachmentCatalog, type SourceSnapshot } from '../src/database.js';
 import type { Issue } from '../src/issues.js';
@@ -164,6 +165,20 @@ describe('database attachment preparation', () => {
     });
     expect(getterCalls).toBe(0);
     expect(resolveArtifact).not.toHaveBeenCalled();
+  });
+
+  it('rejects unknown declaration members instead of silently normalizing typos', async () => {
+    const fixture = await fixtures();
+    expect(safeParseDocumentDeclaration({
+      ...fixture.declaration(),
+      projection: {
+        ...fixture.declaration().projection,
+        storageMaping: ref(fixture.mapping)
+      }
+    })).toMatchObject({
+      success: false,
+      issues: [{ code: 'artifact.invalid_envelope' }]
+    });
   });
 
   it('resolves exact bootstrap artifacts and lets the catalog derive writable projection state', async () => {

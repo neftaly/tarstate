@@ -10,7 +10,7 @@ import {
   isValidDocumentProjection,
   normalizeDocumentDeclaration,
   normalizeDocumentProjection
-} from './internal-document-declaration.js';
+} from './attachment/document-declaration.js';
 import { detachAndFreezeJsonValue } from './internal-owned-json.js';
 import { positiveSafeInteger } from './internal-numeric-boundary.js';
 import { stringTupleKey } from './internal-string-key.js';

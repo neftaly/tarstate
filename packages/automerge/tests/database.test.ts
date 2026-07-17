@@ -359,6 +359,43 @@ describe('standard Automerge database', () => {
       current: { readiness: 'ready', completeness: 'exact', rows: [{ title: 'large.bin' }] }
     });
 
+    const contentPlan = await prepareQuery({
+      root: {
+        kind: 'select',
+        input: {
+          kind: 'from',
+          relation: { schemaView: reference(schema), relationId: 'titled-file' },
+          alias: 'file'
+        },
+        alias: 'content',
+        fields: { content: { kind: 'field', alias: 'file', name: 'content' } }
+      },
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'files'
+    });
+    const contentQuery = await openDatabaseQuery({
+      sources: [{ source: opened.value }],
+      plan: contentPlan,
+      queryAuthorityScope: 'scope:test'
+    });
+    expect(contentQuery.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', completeness: 'exact', rows: [{ content: { type: 'bytes' } }] }
+    });
+    handle.change((draft) => {
+      draft.content = new Uint8Array([9]);
+    });
+    expect(contentQuery.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', completeness: 'exact', rows: [{ content: { value: 'CQ' } }] }
+    });
+    expect(query.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', completeness: 'exact', rows: [{ title: 'large.bin' }] }
+    });
+    contentQuery.close();
+
     const base = handle.doc()!;
     const left = Automerge.change(Automerge.clone(base, { actor: 'a'.repeat(64) }), (draft) => {
       draft.content = new Uint8Array([1]);

@@ -25,6 +25,7 @@
       "@tarstate/core/artifacts/storage-mapping": ["./packages/core/src/artifacts/storage-mapping/index.ts"],
       "@tarstate/core/artifacts/transaction": ["./packages/core/src/artifacts/transaction/index.ts"],
       "@tarstate/core/attachment": ["./packages/core/src/attachment/index.ts"],
+      "@tarstate/core/attachment/declaration": ["./packages/core/src/attachment/declaration/index.ts"],
       "@tarstate/core/attachment/adapter": ["./packages/core/src/attachment/adapter/index.ts"],
       "@tarstate/core/capabilities": ["./packages/core/src/capabilities/index.ts"],
       "@tarstate/core/database": ["./packages/core/src/database/index.ts"],

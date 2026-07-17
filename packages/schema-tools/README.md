@@ -3,17 +3,13 @@
 Deterministic schema, issue-catalog, and authority-filtered database-description
 artifacts for Tarstate v1 tooling and agents.
 
-Install both downloaded Tarstate tarballs:
-
-```sh
-npm install \
-  ./tarstate-core-0.4.1.tgz \
-  ./tarstate-schema-tools-0.4.1.tgz
-```
-
 ```ts
 import { writeFile } from 'node:fs/promises'
-import { describeDatabase, generateSchemaOutputs } from '@tarstate/schema-tools'
+import {
+  buildArtifactOutputs,
+  describeDatabase,
+  generateSchemaOutputs,
+} from '@tarstate/schema-tools'
 
 const description = await describeDatabase(database)
 const generated = await generateSchemaOutputs(schemaArtifact)
@@ -22,9 +18,23 @@ if (!generated.success) throw new Error(generated.issues[0]?.code)
 console.log(description.databaseFingerprint)
 
 await Promise.all([
-  writeFile('schema.d.ts', generated.value.typescript),
+  writeFile('schema.ts', generated.value.typescript),
   writeFile('schema.json', generated.value.jsonSchemaText),
   writeFile('schema.md', generated.value.markdown),
+])
+
+const portable = await buildArtifactOutputs({
+  artifacts: { workspaceSchema, workspaceMapping },
+  declarations: { workspace: workspaceDeclaration },
+  relations: {
+    task: { schema: 'workspaceSchema', relation: 'tasks' },
+  },
+})
+
+if (!portable.success) throw new Error(portable.issues[0]?.code)
+await Promise.all([
+  writeFile('artifacts.json', portable.value.bundleJson),
+  writeFile('artifact-bindings.ts', portable.value.bindingsTypeScript),
 ])
 ```
 
@@ -38,3 +48,14 @@ description without throwing, including its fingerprint and parse budget.
 Generated declarations embed the exact schema ID and content hash. Generation
 returns a `ParseResult`; invalid or over-budget input does not emit partial
 files.
+
+`buildArtifactOutputs` is a pure offline compiler: it performs no filesystem
+I/O and has no CLI or application convention. It verifies content hashes,
+document declarations, exact dependency closure, and the schema references
+embedded by mappings, queries, transactions, constraints, and lenses. The JSON
+is canonical; the generated module contains exact refs, relation handles, row
+types, and key types without embedding whole schema artifacts at runtime.
+`checkArtifactOutputs` compares existing text with a fresh build, while
+`safeParseArtifactBuildBundleText` verifies generated or transported JSON at a
+trust boundary. Attachment-time preparation still validates and compiles
+untrusted document artifacts before use.

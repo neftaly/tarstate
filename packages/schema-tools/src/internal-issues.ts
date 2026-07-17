@@ -8,6 +8,8 @@ const declaration = (
 
 export const schemaToolsIssueDeclarations: readonly IssueDeclaration[] = Object.freeze([
   declaration('schema_tools.artifact_kind', 'parse', ['after_input']),
+  declaration('schema_tools.artifact_build_invalid', 'parse', ['after_input']),
+  declaration('schema_tools.artifact_build_stale', 'parse', ['after_input']),
   declaration('schema_tools.database_description_hash_mismatch', 'parse', ['after_input']),
   declaration('schema_tools.database_description_invalid', 'parse', ['after_input']),
   declaration('schema_tools.database_description_unavailable', 'resolve', ['after_authority', 'after_refresh']),

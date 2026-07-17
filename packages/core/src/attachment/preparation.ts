@@ -9,7 +9,7 @@ import type { ExactArtifactResolution, ExactArtifactResolver } from '../artifact
 import type { AttachmentProjection, DocumentDeclaration } from './model.js';
 import { createIssue, type CapabilityRef, type Issue, type ParseResult } from '../issues.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
-import { adoptDocumentDeclaration } from '../internal-document-declaration.js';
+import { adoptDocumentDeclaration } from './document-declaration.js';
 import { ownedReadonlyMap } from '../internal-owned-map.js';
 import { stringTupleKey } from '../internal-string-key.js';
 import { comparePortableStrings } from '../portable-order.js';
@@ -347,7 +347,7 @@ const selectDeclaration = (
 const parseDocumentDeclaration = (input: unknown): ParseResult<DocumentDeclaration> => {
   const declaration = adoptDocumentDeclaration(input);
   return declaration === undefined
-    ? declarationFailure()
+    ? { success: false, issues: [preparationIssue('artifact.invalid_envelope', { reason: 'document_declaration' })] }
     : { success: true, value: declaration, issues: [] };
 };
 
@@ -558,7 +558,6 @@ const optionalDataValue = (descriptors: PropertyDescriptorMap, key: string, labe
   if (!descriptor.enumerable || !('value' in descriptor)) throw new TypeError(label + ' property ' + key + ' must be an enumerable data property');
   return descriptor.value;
 };
-const declarationFailure = (): ParseResult<never> => ({ success: false, issues: [preparationIssue('artifact.invalid_envelope', { reason: 'document_declaration' })] });
 const preparationIssue = (code: string, details: JsonValue): Issue => createIssue({ code, phase: 'resolve', severity: 'error', retry: code === 'capability.missing' ? 'after_capability' : 'after_refresh', details });
 const sameRef = (left: ArtifactRef, right: ArtifactRef): boolean => left.id === right.id && left.contentHash === right.contentHash;
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> => value !== null && typeof value === 'object' && !Array.isArray(value);

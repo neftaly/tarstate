@@ -77,6 +77,7 @@ assignArchitectureGroup('foundation', [
 assignArchitectureGroup('capability', ['builtins.ts', 'host.ts', 'registry.ts', 'resolver.ts']);
 assignArchitectureGroup('artifact-resolution', ['artifact-resolver.ts']);
 assignArchitectureGroup('source-contract', [
+  'attachment/document-declaration.ts',
   'attachment/model.ts',
   'logical-edit.ts',
   'source-protocol.ts',
@@ -85,7 +86,6 @@ assignArchitectureGroup('source-contract', [
 assignArchitectureGroup('schema', [
   'codec.ts',
   'constraints.ts',
-  'internal-document-declaration.ts',
   'internal-semantic-provenance.ts',
   'lens.ts',
   'mapping.ts',

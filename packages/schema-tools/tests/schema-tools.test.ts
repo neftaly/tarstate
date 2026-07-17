@@ -4,14 +4,17 @@ import {
   type CapabilityRef,
   type JsonValue
 } from '@tarstate/core';
-import { sealSchema, type SchemaBody } from '@tarstate/core/schema';
+import { sealSchema, sealStorageMapping, type SchemaBody } from '@tarstate/core/schema';
 import {
+  buildArtifactOutputs,
+  checkArtifactOutputs,
   createIssueCodeCatalogArtifact,
   describeDatabase,
   generateSchemaOutputs,
   issueCodeCatalogRef,
   safeParseDatabaseDescription,
   safeParseDatabaseDescriptionText,
+  safeParseArtifactBuildBundleText,
   safeParseIssueCodeCatalog,
   safePrepareSchemaArtifact,
   schemaToolsIssueDeclarations,
@@ -135,6 +138,116 @@ describe('schema outputs', () => {
       relations: { invalid: { relationId: 'urn:test:invalid', key: ['id'], fields: { id: { type: { kind: 'string', values: [] } } } } }
     } });
     await expect(safePrepareSchemaArtifact(emptyEnum)).resolves.toMatchObject({ success: false, issues: [{ code: 'schema.field_invalid', details: { reason: 'empty_enum' } }] });
+  });
+});
+
+describe('portable artifact builds', () => {
+  const manifest = async (reverse = false) => {
+    const schema = await schemaArtifact(reverse);
+    const mapping = await sealStorageMapping({
+      id: 'urn:test:leaderboard:mapping',
+      dependencies: [{ id: schema.id, contentHash: schema.contentHash }],
+      body: {
+        schema: { id: schema.id, contentHash: schema.contentHash },
+        model: 'json-tree-v1',
+        relations: {
+          'urn:test:players': {
+            collection: { kind: 'object-map', path: ['players'], absent: 'empty' },
+            keys: { id: { kind: 'map-key', onMismatch: 'reject' } },
+            fields: {
+              nickname: { path: ['nickname'], write: { kind: 'read-only' } },
+              status: { path: ['status'], write: { kind: 'read-only' } },
+              joinedAt: { path: ['joinedAt'], write: { kind: 'read-only' } }
+            }
+          }
+        }
+      }
+    });
+    const artifacts = reverse
+      ? { leaderboardMapping: mapping, leaderboardSchema: schema }
+      : { leaderboardSchema: schema, leaderboardMapping: mapping };
+    return {
+      artifacts,
+      declarations: {
+        leaderboard: {
+          formatVersion: 1 as const,
+          storageSchema: { id: schema.id, contentHash: schema.contentHash },
+          projection: {
+            kind: 'storage-mapping' as const,
+            storageMapping: { id: mapping.id, contentHash: mapping.contentHash }
+          }
+        }
+      },
+      relations: {
+        player: { schema: 'leaderboardSchema', relation: 'players' }
+      }
+    };
+  };
+
+  it('emits deterministic closed JSON and exact relation bindings from typed authoring', async () => {
+    const first = await buildArtifactOutputs(await manifest());
+    const second = await buildArtifactOutputs(await manifest(true));
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    if (!first.success || !second.success) throw new Error('artifact build failed');
+    expect(first.value).toEqual(second.value);
+    expect(first.value.bindingsTypeScript).toContain(
+      "import type { LiteralRelation, SchemaKey, SchemaRow } from '@tarstate/core/schema';"
+    );
+    expect(first.value.bindingsTypeScript).toContain('export const playerRelation = {');
+    expect(first.value.bindingsTypeScript).toContain('export type PlayerRow = SchemaRow<');
+    expect(first.value.bindingsTypeScript).not.toContain(' as Schema');
+    expect(first.value.bundleJson.endsWith('\n')).toBe(true);
+    await expect(safeParseArtifactBuildBundleText(first.value.bundleJson)).resolves.toEqual({
+      success: true,
+      value: first.value.bundle,
+      issues: []
+    });
+    await expect(checkArtifactOutputs(await manifest(), first.value)).resolves.toMatchObject({ success: true });
+    await expect(checkArtifactOutputs(await manifest(), {
+      ...first.value,
+      bindingsTypeScript: first.value.bindingsTypeScript + '// stale\n'
+    })).resolves.toMatchObject({
+      success: false,
+      issues: [{ code: 'schema_tools.artifact_build_stale', details: { outputs: ['bindingsTypeScript'] } }]
+    });
+  });
+
+  it('rejects tampering, missing semantic references, and conflicting artifact IDs', async () => {
+    const built = await buildArtifactOutputs(await manifest());
+    if (!built.success) throw new Error('artifact build failed');
+    const tampered = JSON.parse(built.value.bundleJson) as {
+      artifacts: { body: { description?: string } }[];
+    };
+    tampered.artifacts[0]!.body.description = 'tampered';
+    await expect(safeParseArtifactBuildBundleText(JSON.stringify(tampered))).resolves.toMatchObject({
+      success: false,
+      issues: [{ code: 'artifact.hash_mismatch' }]
+    });
+
+    const complete = await manifest();
+    await expect(buildArtifactOutputs({ artifacts: {
+      leaderboardMapping: complete.artifacts.leaderboardMapping
+    } })).resolves.toMatchObject({
+      success: false,
+      issues: [{ code: 'schema_tools.artifact_build_invalid', details: { reason: 'closure' } }]
+    });
+
+    const conflicting = await sealSchema({
+      id: 'urn:test:leaderboard',
+      body: { relations: { other: {
+        relationId: 'urn:test:other',
+        key: ['id'],
+        fields: { id: { type: { kind: 'string' } } }
+      } } }
+    });
+    await expect(buildArtifactOutputs({ artifacts: {
+      original: complete.artifacts.leaderboardSchema,
+      conflicting
+    } })).resolves.toMatchObject({
+      success: false,
+      issues: [{ code: 'schema_tools.artifact_build_invalid', details: { reason: 'conflicting_artifact_id' } }]
+    });
   });
 });
 

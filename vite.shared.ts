@@ -13,6 +13,7 @@ export const corePublicEntryNames = [
   'artifacts/transaction',
   'attachment',
   'attachment/adapter',
+  'attachment/declaration',
   'capabilities',
   'database',
   'database/external-store',

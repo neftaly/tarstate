@@ -44,6 +44,10 @@
       "types": "./dist/attachment/adapter/index.d.ts",
       "import": "./dist/attachment/adapter/index.js"
     },
+    "./attachment/declaration": {
+      "types": "./dist/attachment/declaration/index.d.ts",
+      "import": "./dist/attachment/declaration/index.js"
+    },
     "./capabilities": {
       "types": "./dist/capabilities/index.d.ts",
       "import": "./dist/capabilities/index.js"

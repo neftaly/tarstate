@@ -1,8 +1,8 @@
-import type { ArtifactRef } from './artifacts.js';
-import { isContentHash } from './canonical-json.js';
-import type { DocumentDeclaration } from './attachment/model.js';
-import type { CapabilityRef } from './issues.js';
-import { detachAndFreezeJsonValue } from './internal-owned-json.js';
+import type { ArtifactRef } from '../artifacts.js';
+import { isContentHash } from '../canonical-json.js';
+import type { CapabilityRef } from '../issues.js';
+import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
+import type { DocumentDeclaration } from './model.js';
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 
@@ -15,12 +15,15 @@ export const adoptDocumentDeclaration = (input: unknown): DocumentDeclaration | 
 
 /** Validation for values already adopted by an enclosing portable-data boundary. */
 export const isValidDocumentDeclaration = (value: unknown): value is DocumentDeclaration => {
-  if (!isRecord(value) || value.formatVersion !== 1) return false;
+  if (!isRecord(value)
+    || !hasOnlyKeys(value, ['formatVersion', 'storageSchema', 'projection', 'constraints'])
+    || value.formatVersion !== 1) return false;
   if (!isArtifactRef(value.storageSchema) || !isValidDocumentProjection(value.projection)) {
     return false;
   }
   return value.constraints === undefined || (
     isRecord(value.constraints)
+    && hasOnlyKeys(value.constraints, ['set', 'mode'])
     && isArtifactRef(value.constraints.set)
     && (value.constraints.mode === 'audit' || value.constraints.mode === 'required')
   );
@@ -30,8 +33,10 @@ export const isValidDocumentProjection = (
   value: unknown
 ): value is DocumentDeclaration['projection'] => isRecord(value) && (
   value.kind === 'storage-mapping'
-    ? isArtifactRef(value.storageMapping)
-    : value.kind === 'storage-binding' && isCapabilityRef(value.storageBinding)
+    ? hasOnlyKeys(value, ['kind', 'storageMapping']) && isArtifactRef(value.storageMapping)
+    : value.kind === 'storage-binding'
+      && hasOnlyKeys(value, ['kind', 'storageBinding'])
+      && isCapabilityRef(value.storageBinding)
 );
 
 /** Canonical semantic form used by governance hashing; transport locations are not identity. */
@@ -99,6 +104,7 @@ const normalizeCapabilityRef = (reference: CapabilityRef): CapabilityRef => ({
 });
 
 const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value)
+  && hasOnlyKeys(value, ['id', 'contentHash', 'locations'])
   && nonEmptyString(value.id)
   && isContentHash(value.contentHash)
   && (
@@ -107,6 +113,7 @@ const isArtifactRef = (value: unknown): value is ArtifactRef => isRecord(value)
   );
 
 const isCapabilityRef = (value: unknown): value is CapabilityRef => isRecord(value)
+  && hasOnlyKeys(value, ['id', 'version', 'contractHash'])
   && nonEmptyString(value.id)
   && nonEmptyString(value.version)
   && isContentHash(value.contractHash);
@@ -117,3 +124,6 @@ const isRecord = (value: unknown): value is JsonRecord => value !== null
 
 const nonEmptyString = (value: unknown): value is string => typeof value === 'string'
   && value.length > 0;
+
+const hasOnlyKeys = (value: JsonRecord, allowed: readonly string[]): boolean =>
+  Object.keys(value).every((key) => allowed.includes(key));
