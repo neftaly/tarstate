@@ -1,6 +1,6 @@
 {
   "name": "@tarstate/schema-tools",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "private": true,
   "description": "Deterministic schema and agent artifacts for Tarstate",
   "license": "MIT",
