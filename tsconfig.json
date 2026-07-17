@@ -48,7 +48,8 @@
       "@tarstate/automerge": ["./packages/automerge/src/index.ts"],
       "@tarstate/zustand": ["./packages/zustand/src/index.ts"],
       "@tarstate/react": ["./packages/react/src/index.ts"],
-      "@tarstate/schema-tools": ["./packages/schema-tools/src/index.ts"]
+      "@tarstate/schema-tools": ["./packages/schema-tools/src/index.ts"],
+      "@tarstate/schema-tools/artifact-bundle": ["./packages/schema-tools/src/artifact-bundle/index.ts"]
     },
     "moduleDetection": "force",
     "isolatedModules": true,

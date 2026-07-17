@@ -65,9 +65,12 @@ const cases = [
     maxGzipBytes: 8_500
   },
   {
-    name: 'artifact bundle parser',
-    source: selectedExport('packages/schema-tools/dist/index.js', 'safeParseArtifactBuildBundle'),
-    maxGzipBytes: 7_500
+    name: 'artifact bundle runtime catalog',
+    source: selectedExport(
+      'packages/schema-tools/dist/artifact-bundle/index.js',
+      'prepareArtifactBundle'
+    ),
+    maxGzipBytes: 9_500
   },
   {
     name: 'Automerge value adoption',

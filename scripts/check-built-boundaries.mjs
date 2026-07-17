@@ -8,6 +8,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const coreDirectory = path.join(root, 'packages/core');
 const dist = path.join(coreDirectory, 'dist');
 const automergeDist = path.join(root, 'packages/automerge/dist');
+const schemaToolsDist = path.join(root, 'packages/schema-tools/dist');
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-built-boundaries-'));
 
 try {
@@ -46,6 +47,12 @@ try {
     'source-',
     'storage-binding'
   ], automergeDist);
+  assertClosure('artifact-bundle/index.js', 45_000, [
+    'bindings',
+    'database-description',
+    'issue-catalog',
+    'schema-output'
+  ], schemaToolsDist);
   await verifyPackedDuplicateCopies();
   console.log('Verified narrow built closures and packed duplicate-copy identities.');
 } finally {

@@ -59,3 +59,24 @@ types, and key types without embedding whole schema artifacts at runtime.
 `safeParseArtifactBuildBundleText` verifies generated or transported JSON at a
 trust boundary. Attachment-time preparation still validates and compiles
 untrusted document artifacts before use.
+
+Applications that ship a generated bundle can prepare its source-neutral
+runtime catalog without importing the offline compiler:
+
+```ts
+import { prepareArtifactBundle } from '@tarstate/schema-tools/artifact-bundle'
+import bundle from './artifacts.json' with { type: 'json' }
+import { artifactDeclarationNames } from './artifact-bindings.js'
+
+const prepared = await prepareArtifactBundle(bundle)
+if (!prepared.success) throw new Error(prepared.issues[0]?.code)
+
+const attachment = prepared.value.attachment(
+  artifactDeclarationNames.workspace,
+)
+if (!attachment.success) throw new Error(attachment.issues[0]?.code)
+```
+
+The selected attachment contains its validated declaration and the minimal
+deterministic ID-keyed artifact closure required by that declaration. The
+catalog performs no filesystem I/O and does not import an adapter runtime.

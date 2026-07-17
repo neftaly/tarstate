@@ -13,6 +13,7 @@ import type { AutomergeDatabase } from '../packages/automerge/dist/index.js';
 import type { zustandAtomicExternalStore } from '../packages/zustand/dist/index.js';
 import type { ReactPreparedPlan } from '../packages/react/dist/index.js';
 import type { ArtifactBuildOutputs, DatabaseDescription } from '../packages/schema-tools/dist/index.js';
+import type { PreparedArtifactBundleCatalog } from '../packages/schema-tools/dist/artifact-bundle/index.js';
 
 declare const query: QueryArtifact;
 declare const lifecycle: SourceLifecycleCoordinator;
@@ -21,6 +22,7 @@ declare const zustand: typeof zustandAtomicExternalStore;
 declare const plan: ReactPreparedPlan<unknown, { readonly id: string }>;
 declare const description: DatabaseDescription;
 declare const artifactBuild: ArtifactBuildOutputs;
+declare const artifactBundleCatalog: PreparedArtifactBundleCatalog<'workspace'>;
 declare const parseDeclaration: typeof safeParseDocumentDeclaration;
 declare const topicSurface: readonly [TopicArtifact, TopicDatabaseView<unknown, unknown>, TopicObserverDiagnosticReporter, TopicQueryNode, TopicPreparedPlan, TopicSchemaBody, TopicTransaction];
 type MaterializedBytes = Extract<ReturnType<typeof safeMaterializePortableBytes>, { readonly success: true }>['value'];
@@ -28,4 +30,4 @@ declare const materializedBytes: MaterializedBytes;
 const ownedBytes: Uint8Array<ArrayBuffer> = materializedBytes;
 const blobPart: BlobPart = materializedBytes;
 
-void [query, lifecycle, automerge, zustand, plan, description, artifactBuild, parseDeclaration, topicSurface, ownedBytes, blobPart];
+void [query, lifecycle, automerge, zustand, plan, description, artifactBuild, artifactBundleCatalog, parseDeclaration, topicSurface, ownedBytes, blobPart];

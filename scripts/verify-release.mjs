@@ -4,13 +4,18 @@ import { builtinModules } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { automergePublicEntryNames, corePublicEntryNames } from '../vite.shared.ts';
+import {
+  automergePublicEntryNames,
+  corePublicEntryNames,
+  schemaToolsPublicEntryNames
+} from '../vite.shared.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageDirectories = ['core', 'automerge', 'zustand', 'react', 'schema-tools'];
 const publicSubpaths = new Map([
   ['@tarstate/core', corePublicEntryNames],
-  ['@tarstate/automerge', automergePublicEntryNames]
+  ['@tarstate/automerge', automergePublicEntryNames],
+  ['@tarstate/schema-tools', schemaToolsPublicEntryNames]
 ]);
 const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'tarstate-release-'));
 const releaseVersion = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;

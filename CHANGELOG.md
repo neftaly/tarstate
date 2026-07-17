@@ -3,6 +3,19 @@
 Notable changes to Tarstate are recorded here. Dates use the repository's Git
 history.
 
+## [Unreleased]
+
+### Added
+
+- Added a narrow `@tarstate/schema-tools/artifact-bundle` runtime catalog that
+  parses generated bundles once, performs exact typed lookup, and derives the
+  minimal deterministic artifact closure for a named document declaration.
+
+### Fixed
+
+- Portable artifact-build records now preserve hostile but valid names such as
+  `__proto__` without prototype-setter confusion.
+
 ## [0.4.8] - 2026-07-17
 
 ### Fixed

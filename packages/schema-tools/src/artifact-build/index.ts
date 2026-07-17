@@ -14,6 +14,7 @@ import { prepareSchema, type PreparedSchema, type SchemaBody } from '@tarstate/c
 import { schemaToolsFailure } from '../internal-issues.js';
 import { renderArtifactBindings } from './bindings.js';
 import { safeParseArtifactBuildBundle } from './bundle.js';
+import { artifactBuildFailure } from './failure.js';
 import {
   defaultArtifactBuildBudget,
   type ArtifactBuildBudget,
@@ -59,7 +60,7 @@ export const buildArtifactOutputs = async (
       issues: []
     };
   } catch (error) {
-    return buildFailure('build_failed', { error: errorName(error) });
+    return artifactBuildFailure('build_failed', { error: errorName(error) });
   }
 };
 
@@ -84,35 +85,37 @@ const parseManifest = async (
   manifest: ArtifactBuildManifest,
   budget: ArtifactBuildBudget
 ): Promise<ParseResult<PreparedArtifactBuildManifest>> => {
-  if (!isRecord(manifest) || !isRecord(manifest.artifacts)) return buildFailure('manifest_shape');
+  if (!isRecord(manifest) || !isRecord(manifest.artifacts)) return artifactBuildFailure('manifest_shape');
   const artifactEntries = Object.entries(manifest.artifacts).sort(compareEntries);
   if (artifactEntries.length > budget.maxArtifacts) return budgetFailure('maxArtifacts', budget.maxArtifacts);
-  const artifacts: Record<string, Artifact> = {};
+  const parsedArtifacts: [string, Artifact][] = [];
   const schemas = new Map<string, { readonly body: SchemaBody; readonly schema: PreparedSchema }>();
   for (const [name, candidate] of artifactEntries) {
-    if (!identifier(name)) return buildFailure('artifact_name', { name });
+    if (!identifier(name)) return artifactBuildFailure('artifact_name', { name });
     const parsed = await safeParseArtifactValue(candidate, budget);
     if (!parsed.success) return parsed;
-    artifacts[name] = parsed.value;
+    parsedArtifacts.push([name, parsed.value]);
     if (parsed.value.kind !== 'schema') continue;
     const prepared = prepareSchema(parsed.value.body);
     if (!prepared.success) return prepared;
     schemas.set(name, { body: prepared.value.body, schema: prepared.value });
   }
 
-  const declarations: Record<string, DocumentDeclaration> = {};
+  const artifacts = Object.fromEntries(parsedArtifacts);
+  const parsedDeclarations: [string, DocumentDeclaration][] = [];
   if (manifest.declarations !== undefined && !isRecord(manifest.declarations)) {
-    return buildFailure('manifest_declarations');
+    return artifactBuildFailure('manifest_declarations');
   }
   for (const [name, candidate] of Object.entries(manifest.declarations ?? {}).sort(compareEntries)) {
-    if (name.length === 0) return buildFailure('declaration_name');
+    if (name.length === 0) return artifactBuildFailure('declaration_name');
     const parsed = safeParseDocumentDeclaration(candidate);
     if (!parsed.success) return parsed;
-    declarations[name] = parsed.value;
+    parsedDeclarations.push([name, parsed.value]);
   }
+  const declarations = Object.fromEntries(parsedDeclarations);
 
   if (manifest.relations !== undefined && !isRecord(manifest.relations)) {
-    return buildFailure('manifest_relations');
+    return artifactBuildFailure('manifest_relations');
   }
   const relationEntries = Object.entries(manifest.relations ?? {}).sort(compareEntries);
   if (relationEntries.length > budget.maxRelationBindings) {
@@ -126,15 +129,19 @@ const parseManifest = async (
       || !hasOnlyKeys(binding, ['schema', 'relation'])
       || typeof binding.schema !== 'string'
       || typeof binding.relation !== 'string') {
-      return buildFailure('relation_binding', { name });
+      return artifactBuildFailure('relation_binding', { name });
     }
     const schema = schemas.get(binding.schema);
-    if (schema === undefined) return buildFailure('relation_schema', { name, schema: binding.schema });
+    if (schema === undefined) {
+      return artifactBuildFailure('relation_schema', { name, schema: binding.schema });
+    }
     if (!schema.schema.relationsByName.has(binding.relation)) {
-      return buildFailure('relation_missing', { name, relation: binding.relation });
+      return artifactBuildFailure('relation_missing', { name, relation: binding.relation });
     }
     const typeName = pascalIdentifier(name);
-    if (typeNames.has(typeName)) return buildFailure('relation_type_name', { name, typeName });
+    if (typeNames.has(typeName)) {
+      return artifactBuildFailure('relation_type_name', { name, typeName });
+    }
     typeNames.add(typeName);
     relations.push({
       name,
@@ -173,8 +180,6 @@ const hasOnlyKeys = (value: Readonly<Record<string, unknown>>, keys: readonly st
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const errorName = (error: unknown): string => error instanceof Error ? error.name : typeof error;
-const buildFailure = <Value = never>(reason: string, details: JsonValue = {}): ParseResult<Value> =>
-  schemaToolsFailure('schema_tools.artifact_build_invalid', { reason, details });
 const budgetFailure = <Value = never>(budget: string, limit: number): ParseResult<Value> => ({
   success: false,
   issues: [createIssue({ code: 'artifact.budget_exceeded', retry: 'after_input', details: { budget, limit } })]

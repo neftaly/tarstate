@@ -11,6 +11,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./artifact-bundle": {
+      "types": "./dist/artifact-bundle/index.d.ts",
+      "import": "./dist/artifact-bundle/index.js"
     }
   },
   "types": "./dist/index.d.ts",
