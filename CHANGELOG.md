@@ -3,7 +3,7 @@
 Notable changes to Tarstate are recorded here. Dates use the repository's Git
 history.
 
-## [Unreleased]
+## [0.4.9] - 2026-07-17
 
 ### Added
 
