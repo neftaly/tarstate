@@ -8,6 +8,8 @@ import {
   openDatabaseQuery,
   type MountableDatabaseSource
 } from '../src/database/query-session.js';
+import { createDatabaseQuerySettlement } from '../src/database/query-settlement.js';
+import { DatasetMembership } from '../src/database.js';
 import {
   prepareTypedQuery,
   prepareQuery,
@@ -317,5 +319,25 @@ describe('database query session', () => {
     });
     session.close();
     await expect(session.whenSettled()).rejects.toThrow('Database query session is closed');
+  });
+
+  it('does not miss an abort raised during settlement subscription', async () => {
+    const abort = new AbortController();
+    const settlement = createDatabaseQuerySettlement(
+      new DatasetMembership({ datasetId: 'dataset:abort-race' }),
+      {
+        getSnapshot: () => ({ state: 'closed' }),
+        subscribe: () => {
+          abort.abort();
+          return () => undefined;
+        },
+        close: () => undefined
+      }
+    );
+
+    await expect(settlement.whenSettled({ signal: abort.signal })).rejects.toMatchObject({
+      name: 'AbortError'
+    });
+    settlement.close();
   });
 });

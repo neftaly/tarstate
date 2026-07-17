@@ -218,6 +218,7 @@ const projectStorageRelations = (
   assertCompiledStorageMapping(binding);
   const relations = new Map<RelationId, BoundRelation>();
   const allIssues: Issue[] = [];
+  let completeness: BindingProjection['completeness'] = 'exact';
   for (const [relationId, compiled] of binding.relations) {
     if (options.relationIds !== undefined && !options.relationIds.has(relationId)) continue;
     const extracted = extractCandidates(snapshot, compiled.mapping.collection, relationId, options.sourceId);
@@ -241,9 +242,10 @@ const projectStorageRelations = (
       completeness: extracted.complete && parsed.completeness === 'exact' && rejectedLocators.length === 0 ? 'exact' : 'unknown'
     });
     relations.set(relationId, result);
+    if (result.completeness !== 'exact') completeness = 'unknown';
     allIssues.push(...relationIssues);
   }
-  return Object.freeze({ relations: ownedReadonlyMap(relations), issues: Object.freeze(allIssues), completeness: [...relations.values()].every((relation) => relation.completeness === 'exact') ? 'exact' : 'unknown' });
+  return Object.freeze({ relations: ownedReadonlyMap(relations), issues: Object.freeze(allIssues), completeness });
 };
 
 export const planStoragePatch = (

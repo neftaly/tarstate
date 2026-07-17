@@ -49,7 +49,8 @@ export const createDatabaseQuerySettlement = <Row>(
       unsubscribe = observer.subscribe(settle);
       cancelPending.add(cancel);
       signal?.addEventListener('abort', onAbort, { once: true });
-      settle();
+      if (signal?.aborted === true) onAbort();
+      else settle();
     });
   };
 

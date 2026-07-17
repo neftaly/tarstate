@@ -48,17 +48,22 @@ export const applyQueryMaintenanceUpdate = (previous: QueryMaintenanceSnapshot, 
     const rowChanges = new Map<string, RelationRowChange>();
     let inserted = 0;
     let removed = 0;
+    let stableReplacements = true;
     for (const rowChange of change.rows) {
       if (rowChanges.has(rowChange.occurrenceId)) return rejectedMaintenanceUpdate('duplicate_occurrence_change', change.relation.relationId);
       rowChanges.set(rowChange.occurrenceId, rowChange);
-      if (rowChange.before === undefined && rowChange.after !== undefined) inserted += 1;
-      else if (rowChange.before !== undefined && rowChange.after === undefined) removed += 1;
+      if (rowChange.before === undefined) {
+        stableReplacements = false;
+        if (rowChange.after !== undefined) inserted += 1;
+      } else if (rowChange.after === undefined) {
+        removed += 1;
+        stableReplacements = false;
+      } else if (rowChange.before.index !== rowChange.after.index) {
+        stableReplacements = false;
+      }
     }
     let nextRows: readonly QueryRecord[];
     let nextOccurrences: readonly string[];
-    const stableReplacements = inserted === 0
-      && removed === 0
-      && [...rowChanges.values()].every((row) => row.before !== undefined && row.after !== undefined && row.before.index === row.after.index);
     if (stableReplacements) {
       const replacedRows = rowChanges.size === 0 ? existingRows : [...existingRows];
       for (const rowChange of rowChanges.values()) {

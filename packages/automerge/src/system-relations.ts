@@ -487,13 +487,22 @@ export class AutomergeSystemRelationState {
   }
 
   #correlateStorage(storageId: string): boolean {
-    const candidates = [...this.#peers.values()].filter((row) => row.state === 'observed' && row.storageId === storageId);
+    let candidatePeerId: string | undefined;
+    let ambiguous = false;
+    for (const peer of this.#peers.values()) {
+      if (peer.state !== 'observed' || peer.storageId !== storageId) continue;
+      if (candidatePeerId !== undefined) {
+        ambiguous = true;
+        break;
+      }
+      candidatePeerId = peer.peerId;
+    }
     let changed = false;
     for (const [key, row] of this.#sync) {
       if (row.storageId !== storageId || this.#explicitSyncPeers.has(key)) continue;
-      if (candidates.length === 1) {
-        if (row.peerId !== candidates[0]!.peerId) {
-          this.#sync.set(key, materializeAutomergeSyncRow({ ...row, peerId: candidates[0]!.peerId }));
+      if (!ambiguous && candidatePeerId !== undefined) {
+        if (row.peerId !== candidatePeerId) {
+          this.#sync.set(key, materializeAutomergeSyncRow({ ...row, peerId: candidatePeerId }));
           changed = true;
         }
       } else if (row.peerId !== undefined) {

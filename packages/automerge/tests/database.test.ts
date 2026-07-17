@@ -2,7 +2,11 @@ import * as Automerge from '@automerge/automerge';
 import { Repo } from '@automerge/automerge-repo';
 import { builtInCapabilityRefs } from '@tarstate/core/capabilities';
 import { sealConstraintSet } from '@tarstate/core/artifacts/constraint-set';
-import { AttachmentCatalog } from '@tarstate/core/database';
+import {
+  AttachmentCatalog,
+  type AttachmentLease,
+  type DatabaseAttachmentInput
+} from '@tarstate/core/database';
 import {
   openDatabaseQuery,
   type OwnedDatabaseSource
@@ -91,6 +95,21 @@ describe('standard Automerge database', () => {
     expect(closeListener).toHaveBeenCalledOnce();
     expect(fixture.database.getSnapshot()).toEqual({ state: 'closed' });
     expect(catalog.list()).toHaveLength(0);
+    await fixture.repo.shutdown();
+  });
+
+  it('finishes closing after a mounted lease reports a cleanup failure', async () => {
+    const fixture = await openTaskDatabase();
+    const catalog = new ThrowingLeaseCatalog();
+    await fixture.database.mount(catalog);
+    const closeListener = vi.fn();
+    fixture.database.subscribe(closeListener);
+
+    expect(() => fixture.database.close()).toThrow('lease cleanup failed');
+    expect(fixture.database.getSnapshot()).toEqual({ state: 'closed' });
+    expect(closeListener).toHaveBeenCalledOnce();
+    expect(catalog.list()).toEqual([]);
+    expect(() => fixture.database.close()).not.toThrow();
     await fixture.repo.shutdown();
   });
 
@@ -542,6 +561,22 @@ const reference = (artifact: { readonly id: string; readonly contentHash: `sha25
   id: artifact.id,
   contentHash: artifact.contentHash
 });
+
+class ThrowingLeaseCatalog extends AttachmentCatalog {
+  override attach<Storage, Projection>(
+    input: DatabaseAttachmentInput<Storage, Projection>,
+    releaseSource?: () => void
+  ): AttachmentLease<Storage, Projection> {
+    const lease = super.attach(input, releaseSource);
+    return {
+      attachment: lease.attachment,
+      close: () => {
+        lease.close();
+        throw new Error('lease cleanup failed');
+      }
+    };
+  }
+}
 
 const openTaskDatabase = async (options: {
   readonly artifactMap?: boolean;

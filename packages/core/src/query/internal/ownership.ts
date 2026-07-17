@@ -220,7 +220,7 @@ const adoptRelationInput = (input: RelationInput): RelationInput => {
   return Object.freeze({
     relation: adoptJsonValue(ownedDataValue(descriptors, 'relation'), 'Query relation') as unknown as RelationUse,
     rows: Object.freeze(inspectOwnedArray(ownedDataValue(descriptors, 'rows'), 'Query relation rows', { allowSymbols: true }).map((row) => adoptQueryRecord(row))),
-    ...(occurrenceIds === undefined ? {} : { occurrenceIds: adoptStringArray(occurrenceIds as readonly string[], 'Query occurrence identities') }),
+    ...(occurrenceIds === undefined ? {} : { occurrenceIds: adoptQueryOccurrenceIds(occurrenceIds as readonly string[]) }),
     completeness: adoptCompleteness(ownedDataValue(descriptors, 'completeness'), 'Query relation input'),
     ...(sourceId === undefined ? {} : { sourceId: adoptOptionalString(sourceId, 'Query relation sourceId') }),
     ...(attachmentId === undefined ? {} : { attachmentId: adoptOptionalString(attachmentId, 'Query relation attachmentId') }),

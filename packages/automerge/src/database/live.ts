@@ -103,14 +103,30 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
     close: () => {
       if (closed) return;
       closed = true;
-      unsubscribeSource?.();
+      const subscription = unsubscribeSource;
       unsubscribeSource = undefined;
-      for (const lease of Array.from(leases)) lease.close();
-      leases.clear();
       snapshot = closedDatabaseSnapshot;
       notify();
       listeners.clear();
-      input.source.close();
+
+      let firstCleanupFailure: { readonly error: unknown } | undefined;
+      const attemptCleanup = (cleanup: (() => void) | undefined): void => {
+        if (cleanup === undefined) return;
+        try {
+          cleanup();
+        } catch (error) {
+          firstCleanupFailure ??= { error };
+        }
+      };
+      attemptCleanup(subscription);
+      for (const lease of leases) attemptCleanup(lease.close);
+      leases.clear();
+      try {
+        input.source.close();
+      } catch (error) {
+        firstCleanupFailure ??= { error };
+      }
+      if (firstCleanupFailure !== undefined) throw firstCleanupFailure.error;
     }
   } satisfies AutomergeDatabase);
 };

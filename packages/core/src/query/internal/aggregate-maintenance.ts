@@ -370,7 +370,10 @@ const sparselyMaterializeAggregate = (
       groups.set(afterKey.canonical, { key, members: [nextMember], reducers, output: oldGroup.output });
     }
     else {
-      const members = [...target.members, nextMember].sort((left, right) => left.position - right.position);
+      let insertionIndex = 0;
+      while ((target.members[insertionIndex]?.position ?? Infinity) < position) insertionIndex += 1;
+      const members = target.members.slice();
+      members.splice(insertionIndex, 0, nextMember);
       groups.set(afterKey.canonical, { ...target, members, reducers: updateAggregateReducers(node, target.reducers, after, 1, context) });
     }
   }
@@ -391,11 +394,12 @@ const sparselyMaterializeAggregate = (
   // Unaffected groups retain their already-sorted relative order. Merge the
   // few affected groups back by first input position instead of sorting all
   // groups, keeping sparse maintenance O(groups + affected log affected).
-  const unaffected = [...groups].filter(([canonical]) => !affected.has(canonical));
-  const changedGroups = [...affected].flatMap((canonical) => {
-    const group = groups.get(canonical);
-    return group === undefined ? [] : [[canonical, group] as const];
-  }).sort(([, left], [, right]) => aggregateGroupPosition(left) - aggregateGroupPosition(right));
+  const unaffected: [string, AggregateGroupState][] = [];
+  const changedGroups: [string, AggregateGroupState][] = [];
+  for (const entry of groups) {
+    (affected.has(entry[0]) ? changedGroups : unaffected).push(entry);
+  }
+  changedGroups.sort(([, left], [, right]) => aggregateGroupPosition(left) - aggregateGroupPosition(right));
   const orderedEntries: [string, AggregateGroupState][] = [];
   let unchangedIndex = 0;
   let changedIndex = 0;

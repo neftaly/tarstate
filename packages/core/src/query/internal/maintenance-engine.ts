@@ -1094,8 +1094,12 @@ export const incrementallyMaterializeLocal = (
       replacements.set(index, retained);
     }
     if (unavailable || issues.length > 0) return withMaintenanceEvent(materializeQueryNode(node, snapshot, materializedNodes, run), { operator: 'local', strategy: 'fallback', affectedUnitCount: child.stableChangedPositions.length, reason: 'evaluation_unavailable' });
-    const widthsChanged = [...replacements].some(([index, segment]) => localSegmentWidth(segment) !== (previous.local?.widths?.[index] ?? 1));
-    const changedSegments = [...replacements].filter(([index, segment]) => segment !== previous.local?.segments[index]);
+    const changedSegments: (readonly [index: number, segment: LocalSegment])[] = [];
+    let widthsChanged = false;
+    for (const [index, segment] of replacements) {
+      if (segment !== previous.local.segments[index]) changedSegments.push([index, segment]);
+      if (localSegmentWidth(segment) !== (previous.local.widths?.[index] ?? 1)) widthsChanged = true;
+    }
     const segments = changedSegments.length === 0 ? previous.local.segments : previous.local.segments.slice();
     for (const [index, segment] of changedSegments) (segments as LocalSegment[])[index] = segment;
     if (!widthsChanged) {
@@ -1109,9 +1113,13 @@ export const incrementallyMaterializeLocal = (
       const changedOutputPositions: number[] = [];
       for (const [index, segment] of changedSegments) {
         const offset = previous.local.outputOffsets?.[index] ?? index;
+        if (oneToOne) {
+          changedOutputPositions.push(offset);
+          continue;
+        }
         const replacementRows = localSegmentRows(segment);
         for (let relative = 0; relative < replacementRows.length; relative += 1) {
-          if (!oneToOne) (output as ScopedRow[])[offset + relative] = replacementRows[relative] as ScopedRow;
+          (output as ScopedRow[])[offset + relative] = replacementRows[relative] as ScopedRow;
           changedOutputPositions.push(offset + relative);
         }
       }
@@ -1261,15 +1269,19 @@ const indexLocalSegments = (
 
 const localSegment = (node: QueryNode, rows: readonly ScopedRow[]): LocalSegment => node.kind === 'unnest' ? rows : rows[0];
 const localSegmentsSemanticallyEqual = (left: LocalSegment, right: LocalSegment): boolean => {
-  const leftRows = localSegmentRows(left);
-  const rightRows = localSegmentRows(right);
-  return leftRows.length === rightRows.length && leftRows.every((row, index) => {
-    const candidate = rightRows[index] as ScopedRow;
-    return resultKey(row) === resultKey(candidate)
-      && queryValueEqual(row.scope as unknown as QueryLogicalValue, candidate.scope as unknown as QueryLogicalValue)
-      && queryValueEqual(row.provenance as unknown as QueryLogicalValue, candidate.provenance as unknown as QueryLogicalValue);
-  });
+  if (left === right) return true;
+  if (left === undefined || right === undefined) return false;
+  if (Array.isArray(left)) {
+    return Array.isArray(right)
+      && left.length === right.length
+      && left.every((row, index) => scopedRowsSemanticallyEqual(row, right[index] as ScopedRow));
+  }
+  return !Array.isArray(right) && scopedRowsSemanticallyEqual(left as ScopedRow, right as ScopedRow);
 };
+const scopedRowsSemanticallyEqual = (left: ScopedRow, right: ScopedRow): boolean =>
+  resultKey(left) === resultKey(right)
+  && queryValueEqual(left.scope as unknown as QueryLogicalValue, right.scope as unknown as QueryLogicalValue)
+  && queryValueEqual(left.provenance as unknown as QueryLogicalValue, right.provenance as unknown as QueryLogicalValue);
 const localSegmentRows = (segment: LocalSegment): readonly ScopedRow[] => segment === undefined ? [] : Array.isArray(segment) ? segment : [segment as ScopedRow];
 const localSegmentWidth = (segment: LocalSegment): number => segment === undefined ? 0 : Array.isArray(segment) ? segment.length : 1;
 const indexLocalSegmentLayout = (segments: readonly LocalSegment[]): {

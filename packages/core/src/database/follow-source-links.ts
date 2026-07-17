@@ -73,8 +73,8 @@ type LinkedSourceRecord = {
   target: DatabaseDiscoveryTarget;
   readonly abort: AbortController;
   state: 'loading' | 'mounted' | 'missing' | 'failed';
-  lease?: DatabaseSourceMountLease;
-  source?: OwnedDatabaseSource;
+  lease: DatabaseSourceMountLease | undefined;
+  source: OwnedDatabaseSource | undefined;
   issues: readonly Issue[];
 };
 
@@ -207,8 +207,8 @@ export const followDatabaseSourceLinks = (options: {
   ): void => {
     const lease = pendingLease ?? record.lease;
     const source = record.source;
-    delete record.lease;
-    delete record.source;
+    record.lease = undefined;
+    record.source = undefined;
     runObserverCleanups(
       [
         ...(lease === undefined ? [] : [lease.close]),
@@ -327,6 +327,8 @@ export const followDatabaseSourceLinks = (options: {
         target,
         abort: new AbortController(),
         state: 'loading',
+        lease: undefined,
+        source: undefined,
         issues: Object.freeze([])
       };
       linkedSources.set(target.sourceId, record);
