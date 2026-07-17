@@ -17,6 +17,7 @@ import {
 } from '../src/index.js';
 import { createPooledIncrementalQueryRuntime, type PooledIncrementalQueryRoot } from '../src/query.js';
 import { sealPreparedPlan } from '../src/query/internal/prepared-plan.js';
+import { deriveProjectionDemand } from '../src/query/internal/projection-demand.js';
 import { derivePropertySeed } from './support/property-test.js';
 
 const configuredRuns = Number.parseInt(process.env.TARSTATE_FUZZ_RUNS ?? '64', 10);
@@ -58,6 +59,45 @@ const deterministicFuzzTest = (name: string, test: () => void, timeout?: number)
 };
 
 describe('deterministic fuzz properties', () => {
+  deterministicFuzzTest('field-bounded projection stays oracle-equivalent to full relation rows', () => {
+    const fieldNames = ['alpha', 'beta', 'gamma'] as const;
+    for (let run = 0; run < runs; run += 1) {
+      const selected = fieldNames.filter(() => integer(2) === 0);
+      const outputFields = selected.length === 0 ? [fieldNames[integer(fieldNames.length)]!] : selected;
+      const root: QueryNode = {
+        kind: 'select',
+        alias: 'result',
+        input: { kind: 'from', relation, alias: 'row' },
+        fields: Object.fromEntries(outputFields.map((field) => [
+          field,
+          { kind: 'field' as const, alias: 'row', name: field }
+        ]))
+      };
+      const rows = Array.from({ length: integer(12) }, (_, index) => ({
+        id: index,
+        alpha: integer(1_000),
+        beta: integer(1_000),
+        gamma: integer(1_000),
+        unobserved: 'payload:' + integer(1_000)
+      }));
+      const demand = deriveProjectionDemand(root);
+      if (demand === undefined) throw new Error('expected field-bounded demand');
+      const demandedFields = new Set(demand.relations[0]?.fields ?? []);
+      const prunedRows = rows.map((row) => Object.fromEntries(
+        Object.entries(row).filter(([field]) => field === 'id' || demandedFields.has(field))
+      ));
+      const input = (relationRows: readonly QueryRecord[]): RelationInput => ({
+        relation,
+        rows: relationRows,
+        occurrenceIds: relationRows.map((_, index) => 'row:' + index),
+        completeness: 'exact'
+      });
+
+      expect(evaluateQuery({ root, relations: [input(prunedRows)] }), 'run ' + run)
+        .toEqual(evaluateQuery({ root, relations: [input(rows)] }));
+    }
+  });
+
   deterministicFuzzTest('keeps multi-source bag identity unique and incremental results oracle-equivalent', () => {
     for (let run = 0; run < runs; run += 1) {
       const sources = Array.from({ length: 1 + integer(4) }, (_, sourceIndex): FuzzSource => {

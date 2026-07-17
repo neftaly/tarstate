@@ -32,17 +32,17 @@ const cases = [
     name: 'incremental database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // This is the complete incremental evaluator, including joins, aggregates,
-    // windows, fallback evaluation, observation, fixed-source lifecycle, and
-    // the lazy settlement-coordinator entry point.
+    // windows, fallback evaluation, field-dependency projection, observation,
+    // fixed-source lifecycle, and the lazy settlement-coordinator entry point.
     initialOnly: true,
-    maxGzipBytes: 44_700
+    maxGzipBytes: 45_200
   },
   {
     name: 'source-link database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
-    // Optional fixed-point traversal and settlement coordination are lazy
-    // chunks and include deterministic graph budgets plus structured failures.
-    maxGzipBytes: 47_900
+    // Optional fixed-point traversal and settlement coordination are lazy;
+    // the complete closure also includes field-dependency projection.
+    maxGzipBytes: 48_300
   },
   {
     name: 'query expression evaluator',

@@ -83,11 +83,11 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly #relationReadEntries: ReadonlyMap<string, readonly AutomergePathFootprintEntry[]>;
   readonly #scalarCodec = createAutomergeStorageScalarCodec();
   readonly #projections = new WeakMap<object, Map<string, ProjectionResult<AutomergeMappedStorageRow>>>();
-  #previousFullProjection: {
+  readonly #previousProjections = new Map<string, {
     readonly sourceId: string;
     readonly heads: readonly string[];
     readonly result: ProjectionResult<AutomergeMappedStorageRow>;
-  } | undefined;
+  }>();
 
   constructor(options: AutomergeMappedStorageBindingOptions) {
     const owned = adoptOptions(options);
@@ -118,39 +118,69 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     this.declaredWriteFootprint = automergePathFootprint([...relations.values()].flatMap(({ mapping }) => mappedWriteEntries(mapping)));
   }
 
-  project = (snapshot: SourceSnapshot<Automerge.Doc<T>>, requestedRelations?: ReadonlySet<string>): ProjectionResult<AutomergeMappedStorageRow> => {
+  project = (
+    snapshot: SourceSnapshot<Automerge.Doc<T>>,
+    requestedRelations?: ReadonlySet<string>,
+    requestedFields?: ReadonlyMap<string, ReadonlySet<string>>
+  ): ProjectionResult<AutomergeMappedStorageRow> => {
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
       return { rows: [], completeness: 'unknown', issues: [sourceIssue(snapshot.sourceId, snapshot.state)] };
     }
     const selected = requestedRelations === undefined
       ? this.#relationSelection
       : new Set(this.relationIds.filter((relationId) => requestedRelations.has(relationId)));
-    const fullProjection = selected.size === this.relationIds.length;
-    const cacheKey = relationSelectionKey(snapshot.sourceId, selected);
+    const selectedFields = requestedFields === undefined
+      ? undefined
+      : new Map([...selected].map((relationId) => [
+          relationId,
+          requestedFields.get(relationId) ?? emptyFieldSelection
+        ]));
+    const cacheKey = projectionSelectionKey(snapshot.sourceId, selected, selectedFields);
     const cached = this.#projections.get(snapshot.storage)?.get(cacheKey);
     if (cached !== undefined) return cached;
-    const affected = fullProjection && this.#previousFullProjection?.result.completeness === 'exact'
-      ? affectedMappedRelations(snapshot.sourceId, snapshot.storage, this.#previousFullProjection, this.#relationReadEntries)
+    const previous = this.#previousProjections.get(cacheKey);
+    const selectedValuePaths = selectedFields === undefined
+      ? this.#relationValuePaths
+      : new Map([...selected].map((relationId) => {
+          const compiled = this.#relations.get(relationId) as MappedRelation;
+          return [relationId, selectedMappedValuePaths(
+            compiled.mapping,
+            selectedFields.get(relationId) ?? emptyFieldSelection
+          )] as const;
+        }));
+    const selectedReadEntries = selectedFields === undefined
+      ? this.#relationReadEntries
+      : new Map([...selectedValuePaths].map(([relationId, paths]) => [
+          relationId,
+          mappedReadEntries((this.#relations.get(relationId) as MappedRelation).mapping, paths)
+        ]));
+    const affected = previous?.result.completeness === 'exact'
+      ? affectedMappedRelations(snapshot.sourceId, snapshot.storage, previous, selectedReadEntries)
       : undefined;
-    if (affected !== undefined && affected.size === 0 && this.#previousFullProjection !== undefined) {
-      rememberProjection(this.#projections, snapshot.storage, cacheKey, this.#previousFullProjection.result);
-      this.#previousFullProjection = { sourceId: snapshot.sourceId, heads: Automerge.getHeads(snapshot.storage), result: this.#previousFullProjection.result };
-      return this.#previousFullProjection.result;
+    if (affected !== undefined && affected.size === 0 && previous !== undefined) {
+      rememberProjection(this.#projections, snapshot.storage, cacheKey, previous.result);
+      this.#rememberPreviousProjection(cacheKey, {
+        sourceId: snapshot.sourceId,
+        heads: Automerge.getHeads(snapshot.storage),
+        result: previous.result
+      });
+      return previous.result;
     }
     const projectedRelations = affected ?? selected;
     const projection = projectStorage(this.#mapping, snapshot.storage, {
       ...(this.#registry === undefined ? {} : { registry: this.#registry }),
       sourceId: snapshot.sourceId,
       relationIds: projectedRelations,
+      ...(selectedFields === undefined ? {} : { fieldsByRelation: selectedFields }),
       scalarDecoder: this.#scalarCodec.decode,
       sourceMetadata: automergeSourceMetadata
     });
-    const rows: AutomergeMappedStorageRow[] = affected === undefined || this.#previousFullProjection === undefined
+    const rows: AutomergeMappedStorageRow[] = affected === undefined || previous === undefined
       ? []
-      : this.#previousFullProjection.result.rows.filter((row) => !affected.has(row.relationId));
-    const issues: Issue[] = affected === undefined || this.#previousFullProjection === undefined
+      : previous.result.rows.filter((row) => !affected.has(row.relationId));
+    const issues: Issue[] = affected === undefined || previous === undefined
       ? []
-      : this.#previousFullProjection.result.issues.filter((issue) => issue.relationId === undefined || !affected.has(issue.relationId));
+      : previous.result.issues.filter((issue) => issue.relationId === undefined || !affected.has(issue.relationId));
     let incomplete = false;
     for (const [relationId, compiled] of this.#relations) {
       if (!projectedRelations.has(relationId)) continue;
@@ -179,7 +209,11 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           }));
           continue;
         }
-        const mappedConflicts = conflictsAlongMappedPaths(snapshot.storage, path, this.#relationValuePaths.get(relationId) ?? []);
+        const mappedConflicts = conflictsAlongMappedPaths(
+          snapshot.storage,
+          path,
+          selectedValuePaths.get(relationId) ?? []
+        );
         if (mappedConflicts.length > 0) {
           incomplete = true;
           issues.push(...mappedConflicts.map((conflict) => createIssue({
@@ -210,9 +244,27 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       issues: Object.freeze(issues)
     });
     rememberProjection(this.#projections, snapshot.storage, cacheKey, result);
-    if (fullProjection) this.#previousFullProjection = { sourceId: snapshot.sourceId, heads: Automerge.getHeads(snapshot.storage), result };
+    this.#rememberPreviousProjection(cacheKey, {
+      sourceId: snapshot.sourceId,
+      heads: Automerge.getHeads(snapshot.storage),
+      result
+    });
     return result;
   };
+
+  #rememberPreviousProjection(
+    key: string,
+    projection: {
+      readonly sourceId: string;
+      readonly heads: readonly string[];
+      readonly result: ProjectionResult<AutomergeMappedStorageRow>;
+    }
+  ): void {
+    if (!this.#previousProjections.has(key) && this.#previousProjections.size >= 64) {
+      this.#previousProjections.delete(this.#previousProjections.keys().next().value as string);
+    }
+    this.#previousProjections.set(key, projection);
+  }
 
   plan = (snapshot: SourceSnapshot<Automerge.Doc<T>>, edits: readonly LogicalEdit[]): PlanResult<AutomergeSourceCommand<T>> => {
     const handledEdits = edits.flatMap((edit, editIndex) => this.#relations.has(edit.relationId)
@@ -720,11 +772,39 @@ const compoundKey = (...parts: readonly string[]): string => {
   return key;
 };
 
-const relationSelectionKey = (sourceId: string, relationIds: ReadonlySet<string>): string => {
+const projectionSelectionKey = (
+  sourceId: string,
+  relationIds: ReadonlySet<string>,
+  fieldsByRelation?: ReadonlyMap<string, ReadonlySet<string>>
+): string => {
   let key = sourceId.length + ':' + sourceId;
-  for (const relationId of relationIds) key += relationId.length + ':' + relationId;
+  for (const relationId of relationIds) {
+    key += relationId.length + ':' + relationId;
+    if (fieldsByRelation === undefined) continue;
+    const fields = fieldsByRelation.get(relationId);
+    key += (fields?.size ?? 0) + ':';
+    if (fields === undefined) continue;
+    for (const field of fields) key += field.length + ':' + field;
+  }
   return key;
 };
+
+const emptyFieldSelection: ReadonlySet<string> = new Set();
+
+const selectedMappedValuePaths = (
+  mapping: MappedRelation['mapping'],
+  selectedFields: ReadonlySet<string>
+): readonly AutomergePath[] => [
+  ...Object.values(mapping.keys).flatMap((field) => {
+    if (field.kind === 'field') return [field.path as AutomergePath];
+    if (field.kind === 'map-key' && field.mirrorPath !== undefined) return [field.mirrorPath as AutomergePath];
+    return [];
+  }),
+  ...Object.entries(mapping.fields).flatMap(([name, field]) =>
+    selectedFields.has(name) && field.kind !== 'absent' && field.kind !== 'source-metadata'
+      ? [field.path as AutomergePath]
+      : [])
+];
 
 const intentAt = <T extends object>(path: AutomergePath, command: AutomergeSourceCommand<T>) => ({
   footprint: automergePathFootprint([{ scope: 'exact' as const, path }]),

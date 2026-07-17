@@ -1,6 +1,7 @@
 import type { AttachmentProjection } from './attachment/model.js';
 import type { Issue } from './issues.js';
 import type { ObservableSource, SourceSnapshot } from './source-state.js';
+import type { LogicalProjectionDemand } from './query/projection-demand.js';
 
 export type DatabaseAttachment<Storage = unknown, Projection = unknown> = {
   readonly attachmentId: string;
@@ -11,7 +12,10 @@ export type DatabaseAttachment<Storage = unknown, Projection = unknown> = {
   readonly writable: boolean;
   readonly schemaViewIds: readonly string[];
   readonly discoveryEdges: readonly string[];
-  readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
+  readonly project: (
+    snapshot: SourceSnapshot<Storage>,
+    demand?: LogicalProjectionDemand
+  ) => AttachmentProjection<Projection>;
 };
 
 export type DatasetMember = {

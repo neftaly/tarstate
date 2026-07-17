@@ -7,7 +7,7 @@ import { ownedReadonlyMap } from './internal-owned-map.js';
 import { assertCompiledStorageMapping, assertPreparedSchema, sealCompiledStorageMapping } from './internal-semantic-provenance.js';
 import { sealTypedArtifact, type TypedArtifact, type TypedArtifactInput } from './internal-seal.js';
 import { CapabilityRegistry } from './registry.js';
-import { parseRelationCandidates, parseScalarValueForField, type FieldDeclaration, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
+import { parseProjectedRelationCandidates, parseRelationCandidates, parseScalarValueForField, type FieldDeclaration, type ParsedCandidate, type PreparedRelation, type PreparedSchema, type RelationId, type RelationRow } from './schema.js';
 import type { PortableValue } from './value.js';
 
 export type StoragePath = readonly (string | number)[];
@@ -110,6 +110,7 @@ export type ProjectStorageOptions = {
   readonly registry?: CapabilityRegistry;
   readonly sourceId?: string;
   readonly relationIds?: ReadonlySet<RelationId>;
+  readonly fieldsByRelation?: ReadonlyMap<RelationId, ReadonlySet<string>>;
   readonly scalarDecoder?: StorageScalarDecoder;
   readonly sourceMetadata?: SourceMetadataResolver;
 };
@@ -230,7 +231,17 @@ const projectStorageRelations = (
       if (projected.success) rawCandidates.push({ value: projected.value, locator: candidate.locator });
       else { rejectedLocators.push(candidate.locator); relationIssues.push(...projected.issues); }
     }
-    const parsed = parseRelationCandidates(binding.schema, compiled.relation, rawCandidates, options.registry, options.sourceId === undefined ? {} : { sourceId: options.sourceId });
+    const selectedFields = options.fieldsByRelation?.get(relationId);
+    const parsed = selectedFields === undefined
+      ? parseRelationCandidates(binding.schema, compiled.relation, rawCandidates, options.registry, options.sourceId === undefined ? {} : { sourceId: options.sourceId })
+      : parseProjectedRelationCandidates(
+          binding.schema,
+          compiled.relation,
+          rawCandidates,
+          selectedFields,
+          options.registry,
+          options.sourceId === undefined ? {} : { sourceId: options.sourceId }
+        );
     relationIssues.push(...parsed.issues);
     rejectedLocators.push(...parsed.rejected.flatMap((candidate) => candidate.locator === undefined ? [] : [candidate.locator as MappingLocator]));
     const rows = parsed.rows.map((row) => ({ row: row.row, key: row.key, locator: row.locator as MappingLocator }));
@@ -416,6 +427,7 @@ const projectCandidate = (
 ): ParseResult<RelationRow> => {
   if (!isRecord(candidate.candidate)) return mappingFailure('mapping.candidate_invalid', candidate.absolutePath, { relationId, locator: candidate.locator }, options.sourceId, relationId);
   const { mapping } = compiled;
+  const selectedFields = options.fieldsByRelation?.get(relationId);
   const output: Record<string, PortableValue> = {};
   for (const [field, keyMapping] of Object.entries(mapping.keys)) {
     if (keyMapping.kind === 'map-key') {
@@ -444,6 +456,7 @@ const projectCandidate = (
     }
   }
   for (const [field, fieldMapping] of Object.entries(mapping.fields)) {
+    if (selectedFields !== undefined && !selectedFields.has(field)) continue;
     if (fieldMapping.kind === 'absent') continue;
     if (fieldMapping.kind === 'source-metadata') {
       const projected = projectSourceMetadata(candidate, fieldMapping, compiled, relationId, field, options);

@@ -76,7 +76,12 @@ assignArchitectureGroup('foundation', [
 ]);
 assignArchitectureGroup('capability', ['builtins.ts', 'host.ts', 'registry.ts', 'resolver.ts']);
 assignArchitectureGroup('artifact-resolution', ['artifact-resolver.ts']);
-assignArchitectureGroup('source-contract', ['attachment/model.ts', 'logical-edit.ts', 'source-protocol.ts', 'source-state.ts']);
+assignArchitectureGroup('source-contract', [
+  'attachment/model.ts',
+  'logical-edit.ts',
+  'source-protocol.ts',
+  'source-state.ts'
+]);
 assignArchitectureGroup('schema', [
   'codec.ts',
   'constraints.ts',
@@ -91,11 +96,13 @@ assignArchitectureGroup('query-model', [
   'query/incremental-model.ts',
   'query/internal/syntax-walk.ts',
   'query/model.ts',
-  'query/plan-contract.ts'
+  'query/plan-contract.ts',
+  'query/projection-demand.ts'
 ]);
 assignArchitectureGroup('query-batch', [
   'query/internal/prepared-expression.ts',
   'query/internal/prepared-plan.ts',
+  'query/internal/projection-demand.ts',
   'query/internal/equality.ts',
   'query/internal/evaluation-context.ts',
   'query/internal/evaluator.ts',
@@ -159,6 +166,7 @@ assignArchitectureGroup('transaction-runtime', [
 assignArchitectureGroup('attachment-runtime', [
   'attachment/logical-constraint-query.ts',
   'attachment/preparation.ts',
+  'attachment/projection-selection.ts',
   'attachment/transaction-snapshot.ts',
   'attachment/transaction-service.ts'
 ]);
@@ -169,6 +177,7 @@ assignArchitectureGroup('observer', [
   'internal-observer-capture-core.ts',
   'internal-observer-dataset-capture.ts',
   'internal-observer-maintenance-frame.ts',
+  'internal-observer-projection-demand.ts',
   'internal-observer-values.ts',
   'observer.ts'
 ]);

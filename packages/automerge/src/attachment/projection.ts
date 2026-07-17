@@ -1,7 +1,11 @@
 import type * as Automerge from '@automerge/automerge';
 import type { ReadyAttachmentPreparation } from '@tarstate/core/attachment/adapter';
 import type { LogicalRelationRow } from '@tarstate/core/transactions';
-import type { Issue } from '@tarstate/core';
+import { canonicalizeJson, type Issue } from '@tarstate/core';
+import {
+  selectStorageProjection,
+  type LogicalProjectionDemand
+} from '@tarstate/core/attachment/adapter';
 import type { RelationInput } from '@tarstate/core/query/model';
 import {
   checkCurrentConstraints,
@@ -27,7 +31,11 @@ export type AutomergeAttachmentProjection = {
 };
 
 export type AutomergeAttachmentProjector<T extends object> = {
-  readonly project: (snapshot: SourceSnapshot<Automerge.Doc<T>>) => AutomergeAttachmentProjection;
+  readonly project: (
+    snapshot: SourceSnapshot<Automerge.Doc<T>>,
+    relationIds?: ReadonlySet<string>,
+    fieldsByRelation?: ReadonlyMap<string, ReadonlySet<string>>
+  ) => AutomergeAttachmentProjection;
 };
 
 /** Canonical pure logical projection shared by live rows and database mounting. */
@@ -41,8 +49,10 @@ export const createAutomergeAttachmentProjector = <T extends object>(input: {
     readonly projection: AutomergeAttachmentProjection;
   } | undefined;
   return Object.freeze({
-    project: (snapshot) => {
-      const mapped = input.binding.project(snapshot);
+    project: (snapshot, relationIds, fieldsByRelation) => {
+      const mapped = input.constraints.length === 0
+        ? input.binding.project(snapshot, relationIds, fieldsByRelation)
+        : input.binding.project(snapshot);
       if (previous?.mapped === mapped
         && (input.constraints.length === 0 || samePortableJson(previous.basis, snapshot.basis))) {
         return previous.projection;
@@ -92,17 +102,33 @@ export const databaseProjection = <T extends object>(input: {
   readonly sourceId: string;
   readonly attachmentId: string;
 }): ReadyAttachmentPreparation<Automerge.Doc<T>, readonly RelationInput[]>['project'] => {
-  const values = new WeakMap<object, readonly RelationInput[]>();
-  return (snapshot) => {
+  const values = new WeakMap<object, Map<string, readonly RelationInput[]>>();
+  return (snapshot, demand?: LogicalProjectionDemand) => {
     if (snapshot.state !== 'ready') return { state: snapshot.state, issues: snapshot.issues };
-    const projection = input.projector.project(snapshot);
+    const selection = selectStorageProjection(demand, input.schemaView, input.relationIds);
+    const selectedRelationIds = selection === undefined
+      ? input.relationIds
+      : [...selection.relationIds];
+    const projection = input.projector.project(
+      snapshot,
+      selection?.relationIds,
+      selection?.fieldsByRelation
+    );
     if (projection.constraints.blockingIssues.length > 0) {
       return { state: 'failed', issues: projection.issues };
     }
-    let relations = values.get(projection.mapped);
+    const selectionKey = canonicalizeJson(selectedRelationIds);
+    let bySelection = values.get(projection.mapped);
+    let relations = bySelection?.get(selectionKey);
     if (relations === undefined) {
-      relations = relationInputs({ ...input, projection: projection.mapped });
-      values.set(projection.mapped, relations);
+      relations = relationInputs({
+        ...input,
+        relationIds: selectedRelationIds,
+        projection: projection.mapped
+      });
+      bySelection ??= new Map();
+      bySelection.set(selectionKey, relations);
+      values.set(projection.mapped, bySelection);
     }
     return { state: 'ready', value: relations, issues: projection.issues };
   };

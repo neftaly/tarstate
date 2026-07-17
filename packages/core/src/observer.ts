@@ -35,6 +35,9 @@ import type { SourceBasis } from './source-state.js';
 import { assertPreparedPlan } from './query/internal/prepared-plan.js';
 import { deepFreezeObserverValue, detachPreparedPlan, parseObservationParameters, samePortableObserverValue } from './internal-observer-values.js';
 import type { JsonValue } from './value.js';
+import { projectionDemandKey } from './query/projection-demand.js';
+import { stringTupleKey } from './internal-string-key.js';
+import { projectionDemandFor } from './internal-observer-projection-demand.js';
 
 export type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';
 export type {
@@ -200,23 +203,26 @@ export class DatabaseView<Query, Row, Projection = unknown> {
     const dataset = this.#datasets.get(request.plan.datasetId);
     if (dataset === undefined) throw new Error('Dataset is not part of this database view: ' + request.plan.datasetId);
     const plan = detachPreparedPlan(request.plan);
+    const projectionDemand = projectionDemandFor(this.#createQueryMaintenance)?.(plan.query);
     const parameters = parseObservationParameters(request.parameters ?? {});
     const key = queryObservationKey(this, { ...request, plan, parameters });
     let shared = this.#cache.get(key);
     if (shared === undefined) {
-      let runtime = this.#datasetRuntimes.get(dataset.datasetId);
+      const runtimeKey = stringTupleKey(dataset.datasetId, projectionDemandKey(projectionDemand));
+      let runtime = this.#datasetRuntimes.get(runtimeKey);
       if (runtime === undefined) {
         runtime = new DatasetCaptureRuntime({
           dataset,
           attachments: this.#attachments,
           authorityScope: this.authorityScope,
           canRead: this.#canRead,
+          ...(projectionDemand === undefined ? {} : { projectionDemand }),
           ...(this.#onDiagnostic === undefined ? {} : { onDiagnostic: this.#onDiagnostic }),
           collect: () => {
-            if (this.#datasetRuntimes.get(dataset.datasetId) === runtime) this.#datasetRuntimes.delete(dataset.datasetId);
+            if (this.#datasetRuntimes.get(runtimeKey) === runtime) this.#datasetRuntimes.delete(runtimeKey);
           }
         });
-        this.#datasetRuntimes.set(dataset.datasetId, runtime);
+        this.#datasetRuntimes.set(runtimeKey, runtime);
       }
       try {
         shared = new SharedObservation({

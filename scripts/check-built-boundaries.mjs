@@ -17,13 +17,14 @@ try {
   assertClosure('artifacts/query/index.js', 165_000, ['query-incremental', 'observer-maintenance', 'semantic-transaction', 'semantic-storage-mapping', 'semantic-schema-lens', 'semantic-constraint']);
   assertClosure('artifacts/transaction/index.js', 80_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'constraint-']);
   assertClosure('artifacts/constraint-set/index.js', 85_000, ['query/internal/evaluator', 'semantic-query-artifact', 'mapping-', 'lens-', 'transaction-']);
-  assertClosure('artifacts/storage-mapping/index.js', 90_000, ['query-', 'lens-', 'constraint-', 'transaction-']);
+  // Includes canonical field-bounded candidate parsing without a second parser implementation.
+  assertClosure('artifacts/storage-mapping/index.js', 90_500, ['query-', 'lens-', 'constraint-', 'transaction-']);
   assertClosure('artifacts/schema-lens/index.js', 75_000, ['query-', 'mapping-', 'constraint-', 'transaction-']);
   assertClosure('source/index.js', 100, []);
   assertClosure('values/index.js', 25_000, ['query', 'schema', 'transaction', 'database', 'memory-source']);
   assertClosure('attachment/index.js', 100, []);
-  // Includes portable source-metadata projection and generated-key transaction authoring.
-  assertClosure('attachment/adapter/index.js', 313_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  // Includes portable source metadata, generated-key authoring, and field-bounded projection.
+  assertClosure('attachment/adapter/index.js', 314_000, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
@@ -33,8 +34,8 @@ try {
   assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/session/index.js', 310_000, ['system-relations', 'transaction-executor']);
-  // Explicit syntax walking keeps application JSON opaque at a small code-size cost.
-  assertClosure('database/incremental/index.js', 226_300, ['memory-source', 'system-relations', 'transaction-executor']);
+  // Explicit syntax walking keeps application JSON opaque and derives safe projection dependencies.
+  assertClosure('database/incremental/index.js', 230_500, ['memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('database/external-store/index.js', 60_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
   assertClosure('values/index.js', 15_000, [
     'artifact-resource-driver',

@@ -193,6 +193,14 @@ const session = await openDatabaseQuery({
 session.close();
 ```
 
+Plans created with `prepareQuery` also bound storage projection to the relations
+and fields the query actually reads when that can be proven safely. A query for
+a file title therefore does not decode an unselected binary content field, and
+a content-only change can retain the title projection. This is automatic: the
+ordinary query API remains the only path. Full database snapshots, transactions,
+constraints, and query shapes whose dependencies are ambiguous still project
+the complete mapped state.
+
 Multiplayer changes are ordinary input to this loop. Each candidate is staged
 on an Automerge clone; if another player's heads arrive before publication, the
 callback runs again against the newly merged snapshot. Disjoint remote work is

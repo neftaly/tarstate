@@ -19,19 +19,22 @@ export const directQueryChildren = (node: QueryNode): readonly QueryNode[] => {
  */
 export const visitLocalQuerySyntax = (
   root: QueryNode,
-  visitNode: (candidate: QueryNode) => void
-): void => visitQuerySyntax(root, false, visitNode);
+  visitNode: (candidate: QueryNode) => void,
+  visitExpression?: (candidate: Expr) => void
+): void => visitQuerySyntax(root, false, visitNode, visitExpression);
 
 /** Visits a complete query without interpreting portable data as syntax. */
 export const visitFullQuerySyntax = (
   root: QueryNode,
-  visitNode: (candidate: QueryNode) => void
-): void => visitQuerySyntax(root, true, visitNode);
+  visitNode: (candidate: QueryNode) => void,
+  visitExpression?: (candidate: Expr) => void
+): void => visitQuerySyntax(root, true, visitNode, visitExpression);
 
 const visitQuerySyntax = (
   root: QueryNode,
   includeStructuralChildren: boolean,
-  visitNode: (candidate: QueryNode) => void
+  visitNode: (candidate: QueryNode) => void,
+  visitExpressionNode?: (candidate: Expr) => void
 ): void => {
   const visited = new Set<QueryNode>();
   const visitQuery = (node: QueryNode, includeChildren: boolean): void => {
@@ -40,6 +43,7 @@ const visitQuerySyntax = (
     visitNode(node);
 
     const visitExpression = (expression: Expr): void => {
+      visitExpressionNode?.(expression);
       if (expression.kind === 'literal'
         || expression.kind === 'parameter'
         || expression.kind === 'field'

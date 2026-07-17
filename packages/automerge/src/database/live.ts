@@ -31,7 +31,7 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
   const logicalRows = new WeakMap<object, readonly LogicalRelationRow[]>();
   let closed = false;
   let dirty = false;
-  let snapshot = databaseSnapshot(input.source.snapshot(), input.projector, logicalRows);
+  let snapshot: AutomergeDatabaseSnapshot | undefined;
   let unsubscribeSource: (() => void) | undefined;
 
   const notify = (): void => {
@@ -40,10 +40,10 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
     }
   };
   const refresh = (): boolean => {
-    if (!dirty || closed) return false;
+    if ((!dirty && snapshot !== undefined) || closed) return false;
     const next = databaseSnapshot(input.source.snapshot(), input.projector, logicalRows);
     dirty = false;
-    if (sameDatabaseSnapshot(snapshot, next)) return false;
+    if (snapshot !== undefined && sameDatabaseSnapshot(snapshot, next)) return false;
     snapshot = next;
     return true;
   };
@@ -58,9 +58,10 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
   return Object.freeze({
     ...input.transactions,
     getSnapshot: () => {
+      if (closed) return closedDatabaseSnapshot;
       if (unsubscribeSource === undefined) dirty = true;
       refresh();
-      return snapshot;
+      return snapshot as AutomergeDatabaseSnapshot;
     },
     subscribe: (listener: () => void) => {
       if (closed) return () => undefined;

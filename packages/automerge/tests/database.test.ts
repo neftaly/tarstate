@@ -19,6 +19,7 @@ import {
   openAutomergeDatabase,
   type OpenAutomergeDatabaseOptions
 } from '../src/index.js';
+import { createLiveAutomergeDatabase } from '../src/database/live.js';
 
 type TaskDocument = {
   tasks: Record<string, { id: string; title: string }>;
@@ -29,6 +30,8 @@ type FileDocument = {
   content: Uint8Array;
 };
 
+type TitledFileDocument = FileDocument & { name: string };
+
 type OrderedTaskDocument = {
   tasks: { id: string; title: string }[];
 };
@@ -38,6 +41,45 @@ type SourceIdentityTaskDocument = {
 };
 
 describe('standard Automerge database', () => {
+  it('does not build a full logical snapshot until a snapshot consumer asks for one', () => {
+    const sourceSnapshot = vi.fn(() => ({
+      sourceId: 'source:test',
+      operationEpoch: 'epoch:test',
+      basis: { kind: 'test', revision: 1 },
+      state: 'ready',
+      freshness: 'current',
+      storage: Automerge.from({ value: 'ready' }),
+      issues: []
+    } as const));
+    const project = vi.fn(() => ({
+      mapped: Object.freeze({ rows: Object.freeze([]), completeness: 'exact' as const, issues: Object.freeze([]) }),
+      logicalState: Object.freeze({ rows: Object.freeze([]) }),
+      constraints: Object.freeze({ blockingIssues: Object.freeze([]), auditIssues: Object.freeze([]) }),
+      issues: Object.freeze([])
+    }));
+    const database = createLiveAutomergeDatabase({
+      attachmentId: 'attachment:test',
+      incarnation: 'incarnation:test',
+      authorityScope: 'scope:test',
+      transactions: { transact: vi.fn(), simulate: vi.fn() },
+      preparation: {},
+      source: {
+        sourceId: 'source:test',
+        snapshot: sourceSnapshot,
+        subscribe: vi.fn(() => () => undefined),
+        close: vi.fn()
+      },
+      projector: { project }
+    } as unknown as Parameters<typeof createLiveAutomergeDatabase<{ value: string }>>[0]);
+
+    expect(sourceSnapshot).not.toHaveBeenCalled();
+    expect(project).not.toHaveBeenCalled();
+    expect(database.getSnapshot()).toMatchObject({ state: 'open', current: { readiness: 'ready' } });
+    expect(sourceSnapshot).toHaveBeenCalledOnce();
+    expect(project).toHaveBeenCalledOnce();
+    database.close();
+  });
+
   it('rejects invalid database identities before reading metadata', async () => {
     const repo = new Repo();
     const handle = repo.create<TaskDocument>({ tasks: {} });
@@ -247,6 +289,94 @@ describe('standard Automerge database', () => {
     )).resolves.toMatchObject({ outcome: 'committed' });
     expect([...(handle.doc()?.content ?? [])]).toEqual([4, 5]);
     expect(handle.doc()?.['@patchpit']).toEqual({ type: 'file-content' });
+    opened.value.close();
+    await repo.shutdown();
+  });
+
+  it('keeps a title-only query exact without projecting conflicted binary content', async () => {
+    const schema = await sealSchema({ id: 'urn:test:titled-file:schema', body: {
+      relations: { file: {
+        relationId: 'titled-file',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string', values: ['file'] } },
+          name: { type: { kind: 'string' } },
+          content: { type: { kind: 'bytes' } }
+        }
+      } }
+    } });
+    const mapping = await sealStorageMapping({ id: 'urn:test:titled-file:mapping', body: {
+      schema: reference(schema),
+      model: 'json-tree-v1',
+      relations: { 'titled-file': {
+        collection: { kind: 'singleton', path: [], absent: 'invalid' },
+        keys: { id: { kind: 'literal', value: 'file' } },
+        fields: {
+          name: { path: ['name'], write: { kind: 'read-only' } },
+          content: { path: ['content'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+        }
+      } }
+    } });
+    const repo = new Repo();
+    const handle = repo.create<TitledFileDocument>({
+      '@patchpit': { type: 'file-content' },
+      name: 'large.bin',
+      content: new Uint8Array(1024 * 1024)
+    });
+    const opened = await openAutomergeDatabase({
+      handle,
+      declaration: {
+        formatVersion: 1,
+        storageSchema: reference(schema),
+        projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
+      },
+      embeddedArtifacts: [schema, mapping],
+      authorityScope: 'scope:test'
+    });
+    if (!opened.success) throw new Error(JSON.stringify(opened.issues));
+    const plan = await prepareQuery({
+      root: {
+        kind: 'select',
+        input: {
+          kind: 'from',
+          relation: { schemaView: reference(schema), relationId: 'titled-file' },
+          alias: 'file'
+        },
+        alias: 'title',
+        fields: { title: { kind: 'field', alias: 'file', name: 'name' } }
+      },
+      registryFingerprint: 'registry:test',
+      authorityFingerprint: 'authority:test',
+      datasetId: 'files'
+    });
+    const query = await openDatabaseQuery({
+      sources: [{ source: opened.value }],
+      plan,
+      queryAuthorityScope: 'scope:test'
+    });
+    expect(query.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', completeness: 'exact', rows: [{ title: 'large.bin' }] }
+    });
+
+    const base = handle.doc()!;
+    const left = Automerge.change(Automerge.clone(base, { actor: 'a'.repeat(64) }), (draft) => {
+      draft.content = new Uint8Array([1]);
+    });
+    const right = Automerge.change(Automerge.clone(base, { actor: 'b'.repeat(64) }), (draft) => {
+      draft.content = new Uint8Array([2]);
+    });
+    handle.update(() => Automerge.merge(left, right));
+    expect(query.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'ready', completeness: 'exact', rows: [{ title: 'large.bin' }] }
+    });
+    expect(opened.value.getSnapshot()).toMatchObject({
+      state: 'open',
+      current: { readiness: 'incomplete', completeness: 'unknown', rows: [] }
+    });
+
+    query.close();
     opened.value.close();
     await repo.shutdown();
   });

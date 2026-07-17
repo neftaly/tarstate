@@ -19,6 +19,8 @@ import type { JsonValue } from '../value.js';
 import type { DatabaseDiscoveryBudget, DatabaseSourceLink } from './source-link-graph.js';
 import { parseObservationParameters } from '../internal-observer-values.js';
 import { assertPreparedPlan } from '../query/internal/prepared-plan.js';
+import { deriveProjectionDemand } from '../query/internal/projection-demand.js';
+import { registerProjectionDemand } from '../internal-observer-projection-demand.js';
 import type {
   DatabaseSourceMountLease,
   MountableDatabaseSource,
@@ -194,8 +196,10 @@ export const openDatabaseQuery = async <
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
     });
     membership = openedDatasetMembership;
-    const createDatabase = (datasetMembership = openedDatasetMembership): DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> =>
-      new DatabaseView({
+    const createDatabase = (datasetMembership = openedDatasetMembership): DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> => {
+      const createQueryMaintenance = createIncrementalDatabaseQueryMaintenance();
+      registerProjectionDemand(createQueryMaintenance, deriveProjectionDemand);
+      return new DatabaseView({
         authorityScope: options.queryAuthorityScope,
         authorityFingerprint: options.plan.authorityFingerprint,
         registryFingerprint: options.plan.registryFingerprint,
@@ -207,9 +211,10 @@ export const openDatabaseQuery = async <
           }
           return options.canRead({ queryAuthorityScope, sourceAuthorityScope, attachmentId });
         },
-        createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(),
+        createQueryMaintenance,
         ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
       });
+    };
     if (sourceLinks !== undefined) {
       const sourceLinkMembership = new DatasetMembership({
         datasetId: options.plan.datasetId,

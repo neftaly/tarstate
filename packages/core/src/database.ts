@@ -4,6 +4,7 @@ import type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './datab
 import { comparePortableStrings } from './portable-order.js';
 import { notifyObservers, type ObserverDiagnosticReporter } from './observer-diagnostics.js';
 import type { ObservableSource, SourceSnapshot } from './source-state.js';
+import type { LogicalProjectionDemand } from './query/projection-demand.js';
 
 export type { AttachmentProjection } from './attachment/model.js';
 export type { DatabaseAttachment, DatasetMember, DatasetSnapshot } from './database-model.js';
@@ -89,7 +90,10 @@ export type DatabaseAttachmentInput<Storage = unknown, Projection = unknown> = {
   readonly preparation: {
     readonly writable: boolean;
     readonly schemaViewIds: readonly string[];
-    readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
+    readonly project: (
+      snapshot: SourceSnapshot<Storage>,
+      demand?: LogicalProjectionDemand
+    ) => AttachmentProjection<Projection>;
   };
 };
 

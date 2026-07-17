@@ -51,7 +51,11 @@ export type StorageBinding<Storage, Command, Row = unknown> = {
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
   /** A relation filter permits callers to refresh only affected logical projections. */
-  readonly project: (snapshot: SourceSnapshot<Storage>, relationIds?: ReadonlySet<string>) => ProjectionResult<Row>;
+  readonly project: (
+    snapshot: SourceSnapshot<Storage>,
+    relationIds?: ReadonlySet<string>,
+    fieldsByRelation?: ReadonlyMap<string, ReadonlySet<string>>
+  ) => ProjectionResult<Row>;
   readonly plan: (snapshot: SourceSnapshot<Storage>, edits: readonly LogicalEdit[]) => PlanResult<Command>;
 };
 

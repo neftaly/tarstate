@@ -3,7 +3,29 @@ export * from '../codec.js';
 export * from '../constraints.js';
 export * from '../lens.js';
 export * from '../mapping.js';
-export * from '../schema.js';
+export {
+  parseLogicalKey,
+  parseRelationCandidate,
+  parseRelationCandidates,
+  parseScalarValueForField,
+  prepareSchema,
+  sealSchema
+} from '../schema.js';
+export type {
+  CandidateContext,
+  FieldDeclaration,
+  LogicalKey,
+  ParsedCandidate,
+  ParsedRelation,
+  PreparedRelation,
+  PreparedSchema,
+  RelationCandidate,
+  RelationDeclaration,
+  RelationId,
+  RelationRow,
+  SchemaArtifact,
+  SchemaBody
+} from '../schema.js';
 export {
   customScalar,
   referenceTo,

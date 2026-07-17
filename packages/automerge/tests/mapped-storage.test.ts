@@ -486,6 +486,15 @@ describe('compiled-mapping-backed Automerge storage binding', () => {
       draft.content = new Uint8Array([3]);
     });
     runtime.replace(Automerge.merge(left, right));
+    expect(binding.project(
+      source.snapshot(),
+      new Set(['relation:file']),
+      new Map([['relation:file', new Set(['mimeType'])]])
+    )).toMatchObject({
+      completeness: 'exact',
+      rows: [{ fields: { id: 'content', mimeType: 'application/octet-stream' } }],
+      issues: []
+    });
     expect(binding.project(source.snapshot())).toMatchObject({
       completeness: 'unknown',
       rows: [],

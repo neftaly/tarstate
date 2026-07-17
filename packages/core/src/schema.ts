@@ -166,6 +166,21 @@ export const parseRelationCandidate = (
   input: unknown,
   registry?: CapabilityRegistry,
   context: CandidateContext = {}
+): ParseResult<ParsedCandidate> => parseRelationCandidateFields(
+  schema,
+  relation,
+  input,
+  registry,
+  context
+);
+
+const parseRelationCandidateFields = (
+  schema: PreparedSchema,
+  relation: RelationId | PreparedRelation,
+  input: unknown,
+  registry: CapabilityRegistry | undefined,
+  context: CandidateContext,
+  projectedFields?: ReadonlySet<string>
 ): ParseResult<ParsedCandidate> => {
   assertPreparedSchema(schema);
   if (typeof relation !== 'string') assertPreparedRelation(relation);
@@ -176,6 +191,7 @@ export const parseRelationCandidate = (
   const row: Record<string, PortableValue> = {};
   const issues: Issue[] = [];
   for (const [name, field] of Object.entries(prepared.declaration.fields)) {
+    if (projectedFields !== undefined && !projectedFields.has(name)) continue;
     const fieldPath = [...basePath, name];
     if (!Object.hasOwn(input, name)) {
       if (field.optional !== true) issues.push(contextualIssue('schema.field_missing', prepared.declaration.relationId, context, fieldPath, { field: name }));
@@ -209,6 +225,32 @@ export const parseRelationCandidates = (
   candidates: readonly RelationCandidate[],
   registry?: CapabilityRegistry,
   context: Omit<CandidateContext, 'locator' | 'path'> = {}
+): ParsedRelation => parseRelationCandidateFieldsBatch(schema, relation, candidates, registry, context);
+
+/** @internal Storage projection keeps keys plus proven query dependencies on the canonical parser path. */
+export const parseProjectedRelationCandidates = (
+  schema: PreparedSchema,
+  relation: RelationId | PreparedRelation,
+  candidates: readonly RelationCandidate[],
+  projectedFields: ReadonlySet<string>,
+  registry?: CapabilityRegistry,
+  context: Omit<CandidateContext, 'locator' | 'path'> = {}
+): ParsedRelation => parseRelationCandidateFieldsBatch(
+  schema,
+  relation,
+  candidates,
+  registry,
+  context,
+  projectedFields
+);
+
+const parseRelationCandidateFieldsBatch = (
+  schema: PreparedSchema,
+  relation: RelationId | PreparedRelation,
+  candidates: readonly RelationCandidate[],
+  registry: CapabilityRegistry | undefined,
+  context: Omit<CandidateContext, 'locator' | 'path'>,
+  selectedFields?: ReadonlySet<string>
 ): ParsedRelation => {
   assertPreparedSchema(schema);
   if (typeof relation !== 'string') assertPreparedRelation(relation);
@@ -217,9 +259,22 @@ export const parseRelationCandidates = (
   const rows: (ParsedCandidate & { readonly locator?: unknown })[] = [];
   const rejected: RelationCandidate[] = [];
   const issues: Issue[] = [];
+  const projectedFields = selectedFields === undefined
+    ? undefined
+    : new Set([...prepared.declaration.key, ...selectedFields]);
   candidates.forEach((candidate, index) => {
-    const parsed = parseRelationCandidate(schema, prepared, candidate.value, registry, { ...context, relationId: prepared.declaration.relationId, locator: candidate.locator, path: [index] });
-    if (parsed.success) rows.push({ ...parsed.value, ...(candidate.locator === undefined ? {} : { locator: candidate.locator }) });
+    const parsed = parseRelationCandidateFields(
+      schema,
+      prepared,
+      candidate.value,
+      registry,
+      { ...context, relationId: prepared.declaration.relationId, locator: candidate.locator, path: [index] },
+      projectedFields
+    );
+    if (parsed.success) rows.push(Object.freeze({
+      ...parsed.value,
+      ...(candidate.locator === undefined ? {} : { locator: candidate.locator })
+    }));
     else { rejected.push(candidate); issues.push(...parsed.issues); }
   });
   const byKey = new Map<string, typeof rows>();
@@ -237,7 +292,7 @@ export const parseRelationCandidates = (
       issues.push(contextualIssue('schema.duplicate_key', prepared.declaration.relationId, { ...context, locator: duplicate.locator }, [], { count: duplicates.length }, duplicate.key));
     }
   }
-  return Object.freeze({ rows: Object.freeze(rows.map((row) => Object.freeze(row))), rejected: Object.freeze([...rejected]), issues: Object.freeze(issues), completeness: rejected.length === 0 && !duplicateKeys ? 'exact' : 'unknown' });
+  return Object.freeze({ rows: Object.freeze(rows), rejected: Object.freeze(rejected), issues: Object.freeze(issues), completeness: rejected.length === 0 && !duplicateKeys ? 'exact' : 'unknown' });
 };
 
 export const parseLogicalKey = (

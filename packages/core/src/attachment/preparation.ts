@@ -25,6 +25,13 @@ import type { ProjectionResult, StorageBinding } from '../source-protocol.js';
 import type { SourceBasis, SourceSnapshot } from '../source-state.js';
 import type { SourceConstraint } from '../constraints.js';
 import type { JsonValue } from '../value.js';
+import {
+  type LogicalProjectionDemand
+} from '../query/projection-demand.js';
+import { selectStorageProjection } from './projection-selection.js';
+
+export { selectStorageProjection } from './projection-selection.js';
+export type { LogicalProjectionDemand } from '../query/projection-demand.js';
 
 const attachmentPreparationBrand: unique symbol = Symbol('tarstate.attachment-preparation');
 
@@ -82,7 +89,10 @@ export type ReadyAttachmentPreparation<Storage = unknown, Projection = unknown, 
   readonly constraints: readonly SourceConstraint<ConstraintState>[];
   readonly artifactResolutions: readonly ExactArtifactResolution[];
   readonly issues: readonly Issue[];
-  readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
+  readonly project: (
+    snapshot: SourceSnapshot<Storage>,
+    demand?: LogicalProjectionDemand
+  ) => AttachmentProjection<Projection>;
   readonly [attachmentPreparationBrand]: true;
 };
 
@@ -147,11 +157,18 @@ export const prepareDatabaseAttachment = async <State = unknown>(
       writable = false;
       issues.push(...missingWriteCapabilities);
     }
-    project = (snapshot) => {
+    project = (snapshot, demand) => {
       if (snapshot.state !== 'ready' || snapshot.storage === undefined) return { state: snapshot.state === 'ready' ? 'failed' : snapshot.state, issues: snapshot.issues };
+      const selection = constraints.length === 0
+        ? selectStorageProjection(demand, declaration.storageSchema, [...preparedMapping.value.compiled.relations.keys()])
+        : undefined;
       const value = projectStorage(preparedMapping.value.compiled, snapshot.storage, {
         registry: input.registry,
-        sourceId: input.sourceId
+        sourceId: input.sourceId,
+        ...(selection === undefined ? {} : {
+          relationIds: selection.relationIds,
+          fieldsByRelation: selection.fieldsByRelation
+        })
       });
       return { state: 'ready', value, issues: value.issues };
     };
@@ -174,10 +191,17 @@ export const prepareDatabaseAttachment = async <State = unknown>(
     if (missingBinding.length > 0 || binding === undefined) {
       return unavailable([...issues, ...missingBinding, ...(binding === undefined && missingBinding.length === 0 ? [preparationIssue('observer.projection_unavailable', { reason: 'storage_binding_unavailable' })] : [])], artifactResolutions);
     }
-    project = (snapshot) => {
+    project = (snapshot, demand) => {
       if (snapshot.state !== 'ready') return { state: snapshot.state, issues: snapshot.issues };
       try {
-        const value = binding.project(snapshot);
+        const selection = constraints.length === 0
+          ? selectStorageProjection(demand, declaration.storageSchema, binding.relationIds ?? [...schema.value.relationsById.keys()])
+          : undefined;
+        const value = binding.project(
+          snapshot,
+          selection?.relationIds,
+          selection?.fieldsByRelation
+        );
         return { state: 'ready', value, issues: value.issues };
       } catch (error) {
         return { state: 'failed', issues: [preparationIssue('observer.projection_unavailable', { reason: 'storage_binding_failed', error: errorName(error) })] };
@@ -245,7 +269,10 @@ export const prepareDatabaseAttachment = async <State = unknown>(
 /** Branded preparation for an already-bound projection that can never write. */
 export const prepareManualReadOnlyAttachment = <Storage, Projection>(input: {
   readonly schemaViewIds: readonly string[];
-  readonly project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>;
+  readonly project: (
+    snapshot: SourceSnapshot<Storage>,
+    demand?: LogicalProjectionDemand
+  ) => AttachmentProjection<Projection>;
   readonly issues?: readonly Issue[];
 }): ReadyAttachmentPreparation<Storage, Projection> => {
   const descriptors = ownRecordDescriptors(input, 'Manual attachment preparation');
@@ -264,14 +291,20 @@ export const prepareManualReadOnlyAttachment = <Storage, Projection>(input: {
     constraints: [],
     artifactResolutions: [],
     issues: issueDescriptor === undefined || issueDescriptor.value === undefined ? [] : issueDescriptor.value as readonly Issue[],
-    project: project as (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>
+    project: project as (
+      snapshot: SourceSnapshot<Storage>,
+      demand?: LogicalProjectionDemand
+    ) => AttachmentProjection<Projection>
   });
 };
 
 /** Reuses validated attachment facts with the adapter's authoritative live projection. */
 export const bindAttachmentProjection = <Storage, Projection, ConstraintState>(
   preparation: ReadyAttachmentPreparation<unknown, unknown, ConstraintState>,
-  project: (snapshot: SourceSnapshot<Storage>) => AttachmentProjection<Projection>
+  project: (
+    snapshot: SourceSnapshot<Storage>,
+    demand?: LogicalProjectionDemand
+  ) => AttachmentProjection<Projection>
 ): ReadyAttachmentPreparation<Storage, Projection, ConstraintState> => ready({
   origin: preparation.origin,
   writable: preparation.writable,

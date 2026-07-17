@@ -16,6 +16,7 @@ import {
   type CapturedMember,
   type EvaluationSnapshot
 } from './internal-observer-capture-core.js';
+import type { LogicalProjectionDemand } from './query/projection-demand.js';
 
 export type { AvailableQueryAttachment } from './observer-maintenance-contracts.js';
 export type { CapturedMember, EvaluationSnapshot } from './internal-observer-capture-core.js';
@@ -37,6 +38,7 @@ type DatasetCaptureRuntimeOptions = {
   readonly authorityScope: string;
   readonly canRead: (viewAuthorityScope: string, attachmentAuthorityScope: string, attachmentId: string) => boolean;
   readonly collect: () => void;
+  readonly projectionDemand?: LogicalProjectionDemand;
   readonly onDiagnostic?: ObserverDiagnosticReporter;
 };
 
@@ -236,7 +238,7 @@ export class DatasetCaptureRuntime<Projection> {
           projection = cached.projection;
         } else {
           try {
-            projection = attachment.project(snapshot);
+            projection = attachment.project(snapshot, this.#options.projectionDemand);
           } catch (error) {
             projection = { state: 'failed', issues: [captureFailureIssue('attachment_projection_failed', member, error)] };
           }

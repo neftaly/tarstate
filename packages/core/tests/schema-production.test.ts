@@ -477,6 +477,54 @@ describe('production JSON-tree storage mappings', () => {
     });
   });
 
+  it('projects requested fields plus keys without decoding unobserved fields', () => {
+    const schema = prepareSchema({
+      relations: { file: {
+        relationId: 'test.file',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string', values: ['file'] } },
+          name: { type: { kind: 'string' } },
+          content: { type: { kind: 'bytes' } }
+        }
+      } }
+    });
+    if (!schema.success) throw new Error('file schema failed');
+    const compiled = compileStorageMapping({
+      schema: schemaRef,
+      model: 'json-tree-v1',
+      relations: { 'test.file': {
+        collection: { kind: 'singleton', path: [], absent: 'invalid' },
+        keys: { id: { kind: 'literal', value: 'file' } },
+        fields: {
+          name: { path: ['name'], write: { kind: 'read-only' } },
+          content: { path: ['content'], write: { kind: 'read-only' } }
+        }
+      } }
+    }, schemaRef, schema.value);
+    if (!compiled.success) throw new Error('file mapping failed');
+    const decodedFields: string[] = [];
+    const projection = projectStorage(compiled.value, {
+      name: 'large.bin',
+      content: new Uint8Array(8 * 1024 * 1024)
+    }, {
+      relationIds: new Set(['test.file']),
+      fieldsByRelation: new Map([['test.file', new Set(['name'])]]),
+      scalarDecoder: (input) => {
+        decodedFields.push(input.field);
+        return { success: true, value: input.value, issues: [] };
+      }
+    });
+
+    expect(projection).toMatchObject({ completeness: 'exact', issues: [] });
+    expect(projection.relations.get('test.file')?.rows).toEqual([{
+      key: ['file'],
+      row: { id: 'file', name: 'large.bin' },
+      locator: { kind: 'singleton' }
+    }]);
+    expect(decodedFields).toEqual(['name']);
+  });
+
   it('owns compiled mapping paths and prevents mutation of the compiled relation lookup', async () => {
     const { schema } = await makeFixture();
     const input = {
