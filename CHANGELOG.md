@@ -5,6 +5,12 @@ history.
 
 ## [Unreleased]
 
+### Fixed
+
+- Generated relation constants now retain their schema-body type through
+  database transaction methods, preserving exact row and generated-key
+  inference for artifact-binding consumers.
+
 ## [0.4.5] - 2026-07-17
 
 ### Changed

@@ -34,12 +34,12 @@ export const renderArtifactBindings = (manifest: PreparedArtifactBuildManifest):
     const relationName = binding.name + 'Relation';
     const typeName = binding.name[0]!.toUpperCase() + binding.name.slice(1);
     lines.push(
-      'export const ' + relationName + ' = {',
+      'export const ' + relationName + ': LiteralRelation<typeof ' + schemaBodyName + ', ' + JSON.stringify(binding.relationName) + '> = {',
       '  schemaView: ' + binding.schemaName + 'ArtifactRef,',
       '  relationId: ' + JSON.stringify(relation.declaration.relationId) + ',',
       '  name: ' + JSON.stringify(binding.relationName) + ',',
       '  declaration: ' + canonicalizeJson(relation.declaration as unknown as JsonValue),
-      '} as const satisfies LiteralRelation<typeof ' + schemaBodyName + ', ' + JSON.stringify(binding.relationName) + '>;',
+      '};',
       'export type ' + typeName + 'Row = SchemaRow<typeof ' + schemaBodyName + ', ' + JSON.stringify(binding.relationName) + '>;',
       'export type ' + typeName + 'Key = SchemaKey<typeof ' + schemaBodyName + ', ' + JSON.stringify(binding.relationName) + '>;',
       ''

@@ -194,7 +194,9 @@ describe('portable artifact builds', () => {
     expect(first.value.bindingsTypeScript).toContain(
       "import type { LiteralRelation, SchemaKey, SchemaRow } from '@tarstate/core/schema';"
     );
-    expect(first.value.bindingsTypeScript).toContain('export const playerRelation = {');
+    expect(first.value.bindingsTypeScript).toContain(
+      "export const playerRelation: LiteralRelation<typeof leaderboardSchemaSchemaBody, \"players\"> = {"
+    );
     expect(first.value.bindingsTypeScript).toContain('export type PlayerRow = SchemaRow<');
     expect(first.value.bindingsTypeScript).not.toContain(' as Schema');
     expect(first.value.bundleJson.endsWith('\n')).toBe(true);
