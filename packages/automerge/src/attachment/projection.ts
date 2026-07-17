@@ -1,7 +1,7 @@
 import type * as Automerge from '@automerge/automerge';
 import type { ReadyAttachmentPreparation } from '@tarstate/core/attachment/adapter';
 import type { LogicalRelationRow } from '@tarstate/core/transactions';
-import { canonicalizeJson, type Issue } from '@tarstate/core';
+import { canonicalizeJson, type Issue, type JsonValue } from '@tarstate/core';
 import {
   selectStorageProjection,
   type LogicalProjectionDemand
@@ -178,19 +178,28 @@ const relationInputs = (input: {
   readonly sourceId: string;
   readonly attachmentId: string;
 }): readonly RelationInput[] => {
-  const rows = new Map(input.relationIds.map((relationId) => [relationId, [] as AutomergeMappedStorageRow[]]));
+  const rows = new Map<string, AutomergeMappedStorageRow[]>();
+  for (const relationId of input.relationIds) rows.set(relationId, []);
   for (const row of input.projection.rows) rows.get(row.relationId)?.push(row);
-  return Object.freeze(input.relationIds.map((relationId) => {
+  const relations: RelationInput[] = [];
+  for (const relationId of input.relationIds) {
     const relationRows = rows.get(relationId) ?? [];
-    return Object.freeze({
+    const logicalRows: Readonly<Record<string, JsonValue>>[] = [];
+    const occurrenceIds: string[] = [];
+    for (const row of relationRows) {
+      logicalRows.push(row.fields);
+      occurrenceIds.push(row.locator.rowIncarnation);
+    }
+    relations.push(Object.freeze({
       relation: Object.freeze({ schemaView: input.schemaView, relationId }),
-      rows: Object.freeze(relationRows.map(({ fields }) => fields)),
-      occurrenceIds: Object.freeze(relationRows.map(({ locator }) => locator.rowIncarnation)),
+      rows: Object.freeze(logicalRows),
+      occurrenceIds: Object.freeze(occurrenceIds),
       completeness: input.projection.completeness,
       sourceId: input.sourceId,
       attachmentId: input.attachmentId
-    });
-  }));
+    }));
+  }
+  return Object.freeze(relations);
 };
 
 const emptyConstraintCheck: ConstraintCheck = Object.freeze({

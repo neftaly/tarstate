@@ -13,9 +13,9 @@ const configuredSeed = parseInteger(process.env.TARSTATE_FUZZ_SEED);
 const selectedProperty = process.env.TARSTATE_FUZZ_PROPERTY;
 const replayPath = process.env.TARSTATE_FUZZ_PATH;
 
-export const propertyRuns = configuredRuns !== undefined && configuredRuns > 0 ? configuredRuns : 100;
+const propertyRuns = configuredRuns !== undefined && configuredRuns > 0 ? configuredRuns : 100;
 
-/** Register a reproducible, independently seeded fast-check property. */
+/** Register a reproducible, independently seeded, shrinkable fast-check property. */
 export const propertyTest = <Ts>(name: string, property: IRawProperty<Ts>): void => {
   const selected = selectedProperty === undefined || selectedProperty === name;
   const test = selected ? it : it.skip;

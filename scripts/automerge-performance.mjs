@@ -6,6 +6,7 @@ import {
   AutomergeSystemRelationState,
   projectAutomergeFacts
 } from '../packages/automerge/dist/internal-benchmark.js';
+import { adoptAutomergeJsonValue } from '../packages/automerge/dist/values/index.js';
 import { builtInCapabilityRefs } from '../packages/core/dist/capabilities/index.js';
 import {
   compileStorageMapping,
@@ -49,6 +50,24 @@ const measureStaleEvent = (peerCount, iterations) => {
     peerCount,
     iterations,
     millisecondsPerEvent: Number(((performance.now() - started) / iterations).toFixed(4))
+  };
+};
+
+const measureValueAdoption = (rowCount) => {
+  const document = Automerge.from({
+    rows: Array.from({ length: rowCount }, (_, index) => ({
+      id: index,
+      name: 'row:' + index,
+      values: [index, index + 1, index + 2]
+    }))
+  });
+  const started = performance.now();
+  const adopted = adoptAutomergeJsonValue(document);
+  return {
+    rowCount,
+    milliseconds: Number((performance.now() - started).toFixed(3)),
+    success: adopted.success,
+    frozen: adopted.success && Object.isFrozen(adopted.value)
   };
 };
 
@@ -124,11 +143,13 @@ const measureTitleOnlyFileProjection = () => {
 
 const projections = [measureProjection(400), measureProjection(800)];
 const staleEvents = measureStaleEvent(800, 1_000);
+const valueAdoption = measureValueAdoption(2_000);
 const titleOnlyFile = measureTitleOnlyFileProjection();
 const contracts = {
   exactProjectionWithinBound: projections[0].completeness === 'exact' && projections[0].milliseconds <= 50,
   hostileDepthIsBounded: projections[1].completeness === 'unknown' && projections[1].propertyCount <= 513 && projections[1].milliseconds <= 50,
   staleEventConstantTime: staleEvents.millisecondsPerEvent <= 0.05,
+  valueAdoptionBounded: valueAdoption.success && valueAdoption.frozen && valueAdoption.milliseconds <= 25,
   titleOnlyFileProjectionBounded: titleOnlyFile.completeness === 'exact'
     && titleOnlyFile.initialMilliseconds <= 50
     && titleOnlyFile.fields.join(',') === 'id,name',
@@ -142,6 +163,7 @@ process.stdout.write(JSON.stringify({
   contracts,
   projections,
   staleEvents,
+  valueAdoption,
   titleOnlyFile,
   node: process.version
 }, null, 2) + '\n');

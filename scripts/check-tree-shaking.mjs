@@ -76,6 +76,13 @@ const cases = [
     name: 'Automerge value adoption',
     source: selectedExport('packages/automerge/dist/values/index.js', 'adoptConflictFreeAutomergeJsonValue'),
     maxGzipBytes: 5_200
+  },
+  {
+    name: 'Automerge database',
+    source: selectedExport('packages/automerge/dist/index.js', 'openAutomergeDatabase'),
+    // Automerge itself remains external. This covers Tarstate's complete
+    // conflict-aware attachment, transaction, and observation closure.
+    maxGzipBytes: 68_000
   }
 ];
 

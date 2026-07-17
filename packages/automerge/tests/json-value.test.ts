@@ -63,4 +63,17 @@ describe('inert Automerge JSON adoption', () => {
       issues: [{ code: 'artifact.budget_exceeded', path: ['values'], details: { budget: 'maxArrayMembers' } }]
     });
   });
+
+  it('owns the complete nested path before unwinding a failed adoption', () => {
+    const document = Automerge.from({ outer: [{ inner: new Uint8Array([1]) }] });
+    const result = adoptAutomergeJsonValue(document);
+    expect(result).toMatchObject({
+      success: false,
+      issues: [{
+        code: 'artifact.unsupported_value',
+        path: ['outer', 0, 'inner'],
+        details: { type: 'bytes' }
+      }]
+    });
+  });
 });

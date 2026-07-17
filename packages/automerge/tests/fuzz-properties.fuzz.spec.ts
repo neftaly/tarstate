@@ -9,7 +9,7 @@ import {
   exactAutomergeBasisEqual,
   type AutomergeSourceCommitResult
 } from '../src/source/runtime.js';
-import { propertyTest } from './support/property-test.js';
+import { propertyTest } from '../../core/tests/support/property-test.js';
 
 type TestDoc = {
   count: number;

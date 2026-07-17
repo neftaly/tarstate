@@ -10,6 +10,7 @@ import {
 import { comparePortableStrings } from '../shared/portable-order.js';
 
 const forbiddenKeys = new Set(['__proto__', 'constructor', 'prototype']);
+const noIssues: readonly Issue[] = Object.freeze([]);
 
 /**
  * Detaches Automerge's deterministic visible value as inert, deeply frozen JSON.
@@ -37,12 +38,13 @@ const adoptAutomergeValue = (
     budget,
     inspectConflicts,
     totalMembers: 0,
-    ancestors: new Set<object>()
+    ancestors: new Set<object>(),
+    path: []
   };
-  const adopted = adoptValue(input, [], 0, context);
+  const adopted = adoptValue(input, 0, context);
   return 'issue' in adopted
     ? { success: false, issues: Object.freeze([adopted.issue]) }
-    : { success: true, value: adopted.value, issues: Object.freeze([]) };
+    : { success: true, value: adopted.value, issues: noIssues };
 };
 
 type AdoptionContext = {
@@ -50,46 +52,46 @@ type AdoptionContext = {
   readonly inspectConflicts: boolean;
   totalMembers: number;
   readonly ancestors: Set<object>;
+  readonly path: (string | number)[];
 };
 
 type Adopted = { readonly value: JsonValue } | { readonly issue: Issue };
 
 const adoptValue = (
   value: unknown,
-  path: readonly (string | number)[],
   depth: number,
   context: AdoptionContext
 ): Adopted => {
   if (depth > context.budget.maxDepth) {
-    return failure('artifact.budget_exceeded', path, { budget: 'maxDepth', limit: context.budget.maxDepth });
+    return failure('artifact.budget_exceeded', context.path, { budget: 'maxDepth', limit: context.budget.maxDepth });
   }
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return { value };
   if (typeof value === 'number') {
     return Number.isFinite(value)
       ? { value: Object.is(value, -0) ? 0 : value }
-      : failure('artifact.unsupported_value', path, { type: 'non_finite_number' });
+      : failure('artifact.unsupported_value', context.path, { type: 'non_finite_number' });
   }
-  if (typeof value !== 'object') return failure('artifact.unsupported_value', path, { type: typeof value });
-  if (Automerge.isCounter(value)) return failure('artifact.unsupported_value', path, { type: 'automerge_counter' });
-  if (value instanceof Date) return failure('artifact.unsupported_value', path, { type: 'date' });
-  if (value instanceof Uint8Array) return failure('artifact.unsupported_value', path, { type: 'bytes' });
+  if (typeof value !== 'object') return failure('artifact.unsupported_value', context.path, { type: typeof value });
+  if (Automerge.isCounter(value)) return failure('artifact.unsupported_value', context.path, { type: 'automerge_counter' });
+  if (value instanceof Date) return failure('artifact.unsupported_value', context.path, { type: 'date' });
+  if (value instanceof Uint8Array) return failure('artifact.unsupported_value', context.path, { type: 'bytes' });
 
   let objectId: string | null;
   try {
     objectId = Automerge.getObjectId(value);
   } catch {
-    return failure('automerge.value_invalid', path, { reason: 'not_automerge_object' });
+    return failure('automerge.value_invalid', context.path, { reason: 'not_automerge_object' });
   }
-  if (typeof objectId !== 'string') return failure('automerge.value_invalid', path, { reason: 'not_automerge_object' });
+  if (typeof objectId !== 'string') return failure('automerge.value_invalid', context.path, { reason: 'not_automerge_object' });
 
+  if (context.ancestors.has(value)) return failure('artifact.cycle', context.path);
+  context.ancestors.add(value);
   try {
-    if (context.ancestors.has(value)) return failure('artifact.cycle', path);
-    context.ancestors.add(value);
     return Array.isArray(value)
-      ? adoptList(value, path, depth, context)
-      : adoptMap(value as Readonly<Record<string, unknown>>, path, depth, context);
+      ? adoptList(value, depth, context)
+      : adoptMap(value as Readonly<Record<string, unknown>>, depth, context);
   } catch (error) {
-    return failure('automerge.value_invalid', path, {
+    return failure('automerge.value_invalid', context.path, {
       reason: 'inspection_failed',
       error: errorName(error)
     });
@@ -100,24 +102,25 @@ const adoptValue = (
 
 const adoptList = (
   value: readonly unknown[],
-  path: readonly (string | number)[],
   depth: number,
   context: AdoptionContext
 ): Adopted => {
   if (value.length > context.budget.maxArrayMembers) {
-    return failure('artifact.budget_exceeded', path, {
+    return failure('artifact.budget_exceeded', context.path, {
       budget: 'maxArrayMembers',
       limit: context.budget.maxArrayMembers
     });
   }
-  const budgetFailure = countMembers(value.length, path, context);
+  const budgetFailure = countMembers(value.length, context);
   if (budgetFailure !== undefined) return { issue: budgetFailure };
   const output: JsonValue[] = [];
   for (let index = 0; index < value.length; index += 1) {
-    const propertyPath = [...path, index];
-    const conflict = context.inspectConflicts ? conflictIssue(value, index, propertyPath) : undefined;
-    if (conflict !== undefined) return { issue: conflict };
-    const child = adoptValue(value[index], propertyPath, depth + 1, context);
+    context.path.push(index);
+    const conflict = context.inspectConflicts ? conflictIssue(value, index, context.path) : undefined;
+    const child = conflict === undefined
+      ? adoptValue(value[index], depth + 1, context)
+      : { issue: conflict };
+    context.path.pop();
     if ('issue' in child) return child;
     output.push(child.value);
   }
@@ -126,28 +129,31 @@ const adoptList = (
 
 const adoptMap = (
   value: Readonly<Record<string, unknown>>,
-  path: readonly (string | number)[],
   depth: number,
   context: AdoptionContext
 ): Adopted => {
   const keys = Object.keys(value).sort(comparePortableStrings);
   if (keys.length > context.budget.maxObjectMembers) {
-    return failure('artifact.budget_exceeded', path, {
+    return failure('artifact.budget_exceeded', context.path, {
       budget: 'maxObjectMembers',
       limit: context.budget.maxObjectMembers
     });
   }
-  const budgetFailure = countMembers(keys.length, path, context);
+  const budgetFailure = countMembers(keys.length, context);
   if (budgetFailure !== undefined) return { issue: budgetFailure };
   const output: Record<string, JsonValue> = {};
   for (const property of keys) {
-    const propertyPath = [...path, property];
+    context.path.push(property);
     if (forbiddenKeys.has(property)) {
-      return failure('artifact.hostile_shape', propertyPath, { reason: 'prototype_pollution_key' });
+      const issue = failure('artifact.hostile_shape', context.path, { reason: 'prototype_pollution_key' });
+      context.path.pop();
+      return issue;
     }
-    const conflict = context.inspectConflicts ? conflictIssue(value, property, propertyPath) : undefined;
-    if (conflict !== undefined) return { issue: conflict };
-    const child = adoptValue(value[property], propertyPath, depth + 1, context);
+    const conflict = context.inspectConflicts ? conflictIssue(value, property, context.path) : undefined;
+    const child = conflict === undefined
+      ? adoptValue(value[property], depth + 1, context)
+      : { issue: conflict };
+    context.path.pop();
     if ('issue' in child) return child;
     output[property] = child.value;
   }
@@ -175,7 +181,6 @@ const conflictIssue = (
 
 const countMembers = (
   count: number,
-  path: readonly (string | number)[],
   context: AdoptionContext
 ): Issue | undefined => {
   context.totalMembers += count;
@@ -183,7 +188,7 @@ const countMembers = (
     ? createIssue({
         code: 'artifact.budget_exceeded',
         retry: 'after_input',
-        path,
+        path: context.path,
         details: { budget: 'maxTotalMembers', limit: context.budget.maxTotalMembers }
       })
     : undefined;
