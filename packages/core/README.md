@@ -106,11 +106,13 @@ const { createIncrementalDatabaseQueryMaintenance } =
 
 ## Query authoring
 
-`typedFrom`, `typedWhere`, `typedJoin`, and `typedSelect` cover the common path
-while preserving exact aliases, parameters, and result rows. Advanced queries
-use the exhaustive `Expr` and `QueryNode` unions directly, optionally composed
-with the functional builders. This is an explicit authoring boundary; runtime
-evaluation never falls back from typed to untyped behavior.
+`typedFrom`, `typedWhere`, `typedJoin`, `typedSelect`, and `typedUnionAll` cover
+the common path while preserving exact aliases, parameters, literal
+discriminants, and result rows. Selecting a possibly missing expression infers
+an optional result property, matching the runtime row. Advanced queries use the
+exhaustive `Expr` and `QueryNode` unions directly, optionally composed with the
+functional builders. This is an explicit authoring boundary; runtime evaluation
+never falls back from typed to untyped behavior.
 
 Call `prepareTypedQuery(query, { registryFingerprint,
 authorityFingerprint, datasetId })` for the application path. It detaches and
@@ -156,7 +158,6 @@ import {
 const opened = await openExternalStoreDatabase({
   sourceId: 'source:presence',
   store: atomicStore,
-  storeIdentity: underlyingStore,
   declaration,
   embeddedArtifacts,
   authorityScope: 'workspace.presence'
@@ -188,6 +189,11 @@ The standard opener owns runtime leasing and transaction plumbing. Pass a
 `hostRegistry` only when the application needs an explicit isolation/lifetime
 boundary. `acquireExternalStoreRuntime` remains the lower-level seam for
 framework adapters and non-relational host state.
+
+`createMemoryAtomicExternalStore(initialState)` supplies the small reference
+store for ephemeral application state and tests; it needs no separate
+`storeIdentity`. A wrapper adapter supplies `storeIdentity` only when its stable
+underlying store differs from the wrapper object.
 
 `mappedRelationRows` verifies the result's exact schema artifact before
 selecting a relation. It returns a stable native readonly array for repeated
