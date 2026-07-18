@@ -11,11 +11,11 @@ changelog.
 | Portable boundary parsing and hostile budgets | conforms | foundation/parser tests and fuzz properties |
 | Exact artifact identity and semantic handler isolation | conforms | artifact tests, boundary and tree-shake checks |
 | Ordered schema relation keys | conforms | preparation regression, Automerge simulate/commit matrix, type fixtures |
-| One typed/untyped query semantics | conforms | shared portable model, batch tests, typed fixtures |
+| One typed/untyped query semantics | conforms | shared portable model, typed set-authoring/runtime tests, typed fixtures |
 | Batch/incremental agreement | conforms with bounded fallbacks | incremental/property tests and query perf contracts |
 | Database external-store observation | conforms | observer/source lifecycle tests and React store use |
 | Source-link discovery and settlement | conforms for current feature set | source-link unit and fuzz tests |
-| Replayable exact-state transactions | conforms | attachment/external-store/Automerge integration tests |
+| Replayable exact-state transactions | conforms | source-neutral schedule properties plus attachment/external-store/Automerge integration tests |
 | Captured Automerge text reconciliation | conforms for eligible pure splice transactions | real branch/head integration and rejection tests |
 | Candidate validation before reconciled publication | conforms | executor ordering and integration failure cases |
 | Official adapter one-path DX | conforms | `openAutomergeDatabase`, `openExternalStoreDatabase`, package recipes |
@@ -77,6 +77,19 @@ This is a deferred feature, not a hidden defect. It requires an authority and
 migration protocol before code work. Silent re-preparation or automatic hot
 reload is rejected.
 
+### Coherent multiple query projections
+
+A query session currently owns one result plan. Independent sessions can race,
+while normalizing unrelated projections into one set query can broaden query
+dependencies and erase their independent readiness evidence.
+
+This is a deferred generic capability, not permission to wrap several current
+observers and label their snapshots atomic. A future implementation must batch
+capture and publication at the database-observation boundary, preserve each
+prepared plan's row/parameter types and focused readiness, share discovery and
+mount ownership, and compare its work against independent sessions and a
+normalized set query.
+
 ### Physical performance evidence
 
 Algorithmic, bundle, and correctness-bearing benchmark ratchets exist. Absolute
@@ -86,20 +99,6 @@ directly measure consumer devices.
 Candidate approach: preserve independent samples and correctness contracts,
 capture comparable clean-host baselines for meaningful hot-path work, and use
 profiles rather than threshold tuning.
-
-### End-to-end replay model evidence
-
-Exact relation-delta authoring, source-link graphs, observer lifecycle,
-external-store paths, query maintenance, and Automerge runtime schedules have
-focused properties. Replayable transaction-service behavior is strongly covered
-by units and adapter integrations, but there is not yet one small
-source-neutral model generating stale-basis, abort, unknown-outcome, and replay
-sequences across the complete service.
-
-Candidate approach: build a pure reference source with an explicit command
-schedule and compare receipt/state invariants. Keep named adapter concurrency
-regressions. Do not merge this into the Automerge property suite because CRDT
-reconciliation has a different model and shrinking vocabulary.
 
 ## Accepted architectural decisions
 
@@ -189,10 +188,10 @@ findings and resulting changes are recorded.
 | Lens | Material findings and revisions | Follow-up |
 | --- | --- | --- |
 | Hostile correctness | Corrected the false claim that compiled attachment preparation is fully portable; separated portable artifact evidence from source-neutral owned functions. Corrected authority ownership so preparation can be reused while live contexts cannot. Clarified query-observer change evidence and the common publication boundary. | A complete third pass found no new material correctness issue. |
-| Consumer DX | Named `openDatabaseQuery` as the normal multi-source query path and `createDatabaseView` as a host seam; added exact import paths, direct mapped-row selection, prepared capabilities, and one-place scope configuration. | A complete third pass found no new public concept, cast, or path to remove. |
+| Consumer DX | Named `openDatabaseQuery` as the normal multi-source query path and `createDatabaseView` as a host seam; added exact import paths, direct mapped-row selection, prepared capabilities, one-place scope configuration, truthful optional result properties, typed `unionAll`, and a reference memory atomic store. | A later consumer pass found the set-authoring cast and repeated memory-store plumbing; both now use existing runtime protocols. Coherent multi-projection publication remains a named gap because a wrapper would not satisfy its atomicity promise. |
 | Coupling and agent context | Principles/navigation did not concretely divide large subsystem phases. Added `subsystem-boundaries.md` with semantic/effect owners and evidence-driven extraction seams; corrected an ordinary-versus-reconciled publication ambiguity found on the repeat. | A complete third pass found no new authority overlap in the documents. |
 | Performance, allocation, and TypeScript | Tightened the React rule so it prevents required per-row subscription fan-out without outlawing independent `useRow`; formalized freeze, assignment, bind/closure, engine-shape, emitted-JS, erasable TypeScript, and type-budget rules. | The repeat found no new optimization claim that justified API or architectural complexity. |
-| Verification portfolio | Confirmed focused fuzz suites have distinct models; recorded why the two broad query suites should not be merged mechanically. Identified one real future evidence candidate: a source-neutral end-to-end replay schedule model. Added a focused-to-full feedback ladder. | The repeat found no further unit-to-fuzz conversion or suite combination with a clear correctness or feedback-time win. |
+| Verification portfolio | Confirmed focused fuzz suites have distinct models; recorded why the two broad query suites should not be merged mechanically. Added a source-neutral end-to-end replay schedule model and a focused-to-full feedback ladder. | The replay model now covers stale-basis, abort, and unknown-outcome schedules without coupling CRDT-specific shrinking vocabulary into the core suite. |
 
 The review intentionally made no production-code change. Current gaps remain
 gaps until a future implementation task supplies its own acceptance evidence.

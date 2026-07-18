@@ -75,6 +75,12 @@ Generated bindings should be ordinary exact values usable across a module
 boundary. Consumers should not need casts to recover a row type already known
 from a schema or prepared plan.
 
+Use `typedUnionAll` when compatible typed branches need bag-union semantics.
+It compiles to the ordinary set query, retains branch literal discriminants,
+and rejects incompatible fields, aliases, or logical value families. Selecting
+a possibly missing expression produces an optional result property, matching
+the runtime row rather than a required property containing `undefined`.
+
 Type cleverness is subordinate to predictable diagnostics and compiler cost.
 An overload or conditional type is justified when it removes a real consumer
 cast or prevents a meaningful mistake. Type-only aliases which create another
