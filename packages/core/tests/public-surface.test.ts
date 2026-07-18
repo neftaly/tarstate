@@ -57,6 +57,7 @@ describe('topic-focused core surface', () => {
       'ExternalStoreRuntime',
       'HostRuntimeRegistry',
       'acquireExternalStoreRuntime',
+      'createMemoryAtomicExternalStore',
       'mappedRelationRows',
       'openExternalStoreDatabase',
       'sameExternalStoreBasis'

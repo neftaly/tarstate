@@ -2,6 +2,7 @@
 export * from '../../external-store.js';
 export { HostRuntimeRegistry } from '../../host.js';
 export { mappedRelationRows } from '../../attachment/mapped-relation-rows.js';
+export { createMemoryAtomicExternalStore } from './memory.js';
 export type {
   ExternalStoreDatabase,
   ExternalStoreDatabaseResult,

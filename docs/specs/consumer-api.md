@@ -11,6 +11,7 @@ There should be one obvious safe path for each ordinary task:
 | Build a custom host observation runtime | `createDatabaseView` from `@tarstate/core/database/observer` with injected maintenance |
 | Open writable Automerge state | `openAutomergeDatabase` from `@tarstate/automerge` |
 | Open an immutable atomic external store | `openExternalStoreDatabase` from `@tarstate/core/database/external-store` |
+| Create an ephemeral atomic store | `createMemoryAtomicExternalStore` from `@tarstate/core/database/external-store` |
 | Use React | `TarstateProvider`, `useQuery`, `useRow`, `useCommit` from `@tarstate/react` |
 | Adapt Zustand | `zustandAtomicExternalStore` from `@tarstate/zustand` into the external-store path |
 | Generate schema outputs | `@tarstate/schema-tools` |

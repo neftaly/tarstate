@@ -180,6 +180,7 @@ assignArchitectureGroup('attachment-runtime', [
 assignArchitectureGroup('observer-contract', ['database-model.ts', 'observer-maintenance-contracts.ts']);
 assignArchitectureGroup('observer', [
   'database.ts',
+  'database/external-store/memory.ts',
   'external-store.ts',
   'internal-observer-capture-core.ts',
   'internal-observer-dataset-capture.ts',
