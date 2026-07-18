@@ -21,6 +21,7 @@ import type { WritableLogicalState } from '@tarstate/core/transactions';
 import {
   createIssue,
   safeParseJsonValue,
+  TarstateParseError,
   type JsonValue,
   type ParseResult
 } from '@tarstate/core';
@@ -141,6 +142,7 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
     };
   } catch (error) {
     source.close();
+    if (error instanceof TarstateParseError) return { success: false, issues: error.issues };
     throw error;
   }
 };
@@ -152,6 +154,16 @@ const standardAutomergeRegistry = async (): Promise<CapabilityRegistry> => {
     ref: builtInCapabilityRefs.fieldReplace,
     integrity: 'tarstate:automerge:field-replace-v1',
     implementation: Object.freeze({ kind: 'automerge-field-replace' })
+  });
+  registry.registerImplementation({
+    ref: builtInCapabilityRefs.textSplice,
+    integrity: 'tarstate:automerge:text-splice-v2',
+    implementation: Object.freeze({
+      kind: 'automerge-text-splice',
+      indexUnit: 'utf16-code-unit',
+      rangeBoundary: 'unicode-code-point',
+      insertedText: 'well-formed-utf16'
+    })
   });
   return registry;
 };

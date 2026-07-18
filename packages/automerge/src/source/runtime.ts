@@ -88,6 +88,14 @@ type AutomergeSourceCommitInput<T extends object> = {
   readonly message?: string;
 };
 
+type AutomergeReconciledCommitInput<T extends object> = {
+  readonly operationEpoch: string;
+  readonly operationId: string;
+  readonly intentHash: ContentHash;
+  readonly expectedBasis: AutomergeBasis;
+  readonly candidate: Automerge.Doc<T>;
+};
+
 /** Captures the document's current exact-head basis. */
 export const automergeBasis = (doc: Automerge.Doc<unknown>): AutomergeBasis => Object.freeze({
   kind: 'automerge-heads',
@@ -123,6 +131,7 @@ export type AutomergeRepoHandle<T extends object, Heads = unknown> = {
   doc(): Automerge.Doc<T> | undefined;
   heads(): Heads;
   changeAt(heads: Heads, change: Automerge.ChangeFn<T>, options?: Automerge.ChangeOptions<T>): Heads | undefined;
+  update(change: (doc: Automerge.Doc<T>) => Automerge.Doc<T>): void;
   on(event: 'heads-changed', listener: (payload: { readonly doc: Automerge.Doc<T> }) => void): unknown;
   off(event: 'heads-changed', listener: (payload: { readonly doc: Automerge.Doc<T> }) => void): unknown;
 };
@@ -130,10 +139,11 @@ export type AutomergeRepoHandle<T extends object, Heads = unknown> = {
 type DocumentOwner<T extends object> = {
   current(): Automerge.Doc<T>;
   changeAt(
-    basis: AutomergeBasis,
+    expectedBasis: AutomergeBasis,
     commands: readonly AutomergeSourceCommand<T>[],
     message: string,
   ): { readonly storage: Automerge.Doc<T>; readonly generatedKeys: readonly GeneratedLogicalKey[] };
+  installCandidate(expectedBasis: AutomergeBasis, candidate: Automerge.Doc<T>): Automerge.Doc<T>;
   subscribe(listener: (doc: Automerge.Doc<T>) => void): () => void;
   close(): void;
   merge?(remote: Automerge.Doc<T>): Automerge.Doc<T>;
@@ -217,6 +227,17 @@ export class AutomergeSourceRuntime<T extends object> {
 
   commit(input: AutomergeSourceCommitInput<T>): Promise<AutomergeSourceCommitResult> {
     const owned = adoptCommitInput<T>(input);
+    return this.#enqueueCommit(owned);
+  }
+
+  commitReconciled(input: AutomergeReconciledCommitInput<T>): Promise<AutomergeSourceCommitResult> {
+    const owned = adoptReconciledCommitInput(input);
+    return this.#enqueueCommit(owned);
+  }
+
+  #enqueueCommit(
+    owned: AutomergeSourceCommitInput<T> | AutomergeReconciledCommitInput<T>
+  ): Promise<AutomergeSourceCommitResult> {
     if (this.#closed) return Promise.resolve(this.#rejected(owned, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: owned.operationId }]));
     if (this.#applying) {
       return Promise.resolve(this.#rejected(owned, undefined, [{
@@ -291,7 +312,9 @@ export class AutomergeSourceRuntime<T extends object> {
     ], 'source-runtime', this.#onDiagnostic);
   }
 
-  async #commit(input: AutomergeSourceCommitInput<T>): Promise<AutomergeSourceCommitResult> {
+  async #commit(
+    input: AutomergeSourceCommitInput<T> | AutomergeReconciledCommitInput<T>
+  ): Promise<AutomergeSourceCommitResult> {
     if (this.#closed) return this.#rejected(input, undefined, [{ code: 'source.closed', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
     if (this.#retiredEpochs.has(input.operationEpoch)) return this.#rejected(input, undefined, [{ code: 'transaction.operation_epoch_expired', phase: 'commit', sourceId: this.sourceId, operationId: input.operationId }]);
     const known = this.#ledger.get(input.operationEpoch)?.get(input.operationId);
@@ -334,9 +357,20 @@ export class AutomergeSourceRuntime<T extends object> {
     let failure: unknown;
     this.#applying = true;
     try {
-      applied = input.commands.length === 0
-        ? { storage: current, generatedKeys: emptyGeneratedKeys }
-        : this.#owner.changeAt(beforeBasis, input.commands, input.message ?? 'tarstate source commit');
+      if ('candidate' in input) {
+        applied = {
+          storage: this.#owner.installCandidate(beforeBasis, input.candidate),
+          generatedKeys: emptyGeneratedKeys
+        };
+      } else {
+        applied = input.commands.length === 0
+          ? { storage: current, generatedKeys: emptyGeneratedKeys }
+          : this.#owner.changeAt(
+              beforeBasis,
+              input.commands,
+              input.message ?? 'tarstate source commit'
+            );
+      }
     } catch (error) {
       failure = error;
     } finally {
@@ -546,6 +580,32 @@ const adoptCommitInput = <T extends object>(input: AutomergeSourceCommitInput<T>
   });
 };
 
+const adoptReconciledCommitInput = <T extends object>(
+  input: AutomergeReconciledCommitInput<T>
+): AutomergeReconciledCommitInput<T> => {
+  const descriptors = inspectCommitRecord(input, 'Automerge reconciled commit input');
+  const identity = adoptOperationIdentityDescriptors(descriptors, 'Automerge reconciled commit input');
+  const candidate = requiredCommitDataValue(
+    descriptors,
+    'candidate',
+    'Automerge reconciled commit input'
+  );
+  try {
+    Automerge.getHeads(candidate as Automerge.Doc<T>);
+  } catch {
+    throw new TypeError('Automerge reconciled commit candidate must be an Automerge document');
+  }
+  return Object.freeze({
+    ...identity,
+    expectedBasis: ownBasisEvidence(requiredCommitDataValue(
+      descriptors,
+      'expectedBasis',
+      'Automerge reconciled commit input'
+    ) as AutomergeBasis),
+    candidate: candidate as Automerge.Doc<T>
+  });
+};
+
 const cloneAndFreezeEvidence = (value: unknown, seen = new WeakMap<object, object>()): unknown => {
   if (value === null || typeof value !== 'object') return value;
   const existing = seen.get(value);
@@ -594,13 +654,21 @@ const memoryDocumentOwner = <T extends object>(initial: Automerge.Doc<T>): Docum
   let doc = initial;
   return {
     current: () => doc,
-    changeAt: (basis, commands, message) => {
-      if (!exactAutomergeBasisEqual(basis, automergeBasis(doc))) throw new StaleOwnerBasis(doc);
+    changeAt: (expectedBasis, commands, message) => {
+      if (!exactAutomergeBasisEqual(expectedBasis, automergeBasis(doc))) throw new StaleOwnerBasis(doc);
       let generatedKeys = emptyGeneratedKeys;
       doc = Automerge.change(doc, { message, time: 0 }, (draft) => {
         generatedKeys = applySourceCommands(commands, draft);
       });
       return { storage: doc, generatedKeys };
+    },
+    installCandidate: (expectedBasis, candidate) => {
+      if (!exactAutomergeBasisEqual(expectedBasis, automergeBasis(doc))) throw new StaleOwnerBasis(doc);
+      if (!Automerge.hasHeads(candidate, [...expectedBasis.heads])) {
+        throw new Error('Reconciled Automerge candidate does not include the integration basis');
+      }
+      doc = candidate;
+      return doc;
     },
     subscribe: () => () => undefined,
     close: () => undefined,
@@ -655,17 +723,28 @@ export const automergeRepoSourceRuntime = <T extends object, Heads>(options: {
   handle.on('heads-changed', handleChanged);
   const owner: DocumentOwner<T> = {
     current: currentDocument,
-    changeAt: (basis, commands, message) => {
+    changeAt: (expectedBasis, commands, message) => {
       const current = currentDocument();
-      if (!exactAutomergeBasisEqual(basis, automergeBasis(current))) throw new StaleOwnerBasis(current);
-      const heads = handle.heads();
+      if (!exactAutomergeBasisEqual(expectedBasis, automergeBasis(current))) throw new StaleOwnerBasis(current);
       let generatedKeys = emptyGeneratedKeys;
-      const changedHeads = handle.changeAt(heads, (draft) => {
+      const changedHeads = handle.changeAt(handle.heads(), (draft) => {
         generatedKeys = applySourceCommands(commands, draft);
       }, { message, time: 0 });
       const changed = currentDocument();
       if (changedHeads === undefined) throw new StaleOwnerBasis(changed);
       return { storage: changed, generatedKeys };
+    },
+    installCandidate: (expectedBasis, candidate) => {
+      handle.update((current) => {
+        if (!exactAutomergeBasisEqual(expectedBasis, automergeBasis(current))) {
+          throw new StaleOwnerBasis(current);
+        }
+        if (!Automerge.hasHeads(candidate, [...expectedBasis.heads])) {
+          throw new Error('Reconciled Automerge candidate does not include the integration basis');
+        }
+        return candidate;
+      });
+      return currentDocument();
     },
     subscribe: (listener) => {
       listeners.add(listener);

@@ -14,8 +14,8 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.4.12.tgz \
-  ./tarstate-automerge-0.4.12.tgz \
+  ./tarstate-core-0.5.0.tgz \
+  ./tarstate-automerge-0.5.0.tgz \
   @automerge/automerge
 ```
 
@@ -65,8 +65,9 @@ if (!opened.success) throw new Error(opened.issues.map(({ code }) => code).join(
 
 // Prepared mapping facts let the UI distinguish writable fields without
 // reading or duplicating the storage-mapping artifact.
-const taskWrites = opened.value.writeCapabilities(tasks);
-// taskWrites.replaceableFields includes `title` when this mapping can replace it.
+const taskCapabilities = opened.value.capabilities(tasks);
+// `taskCapabilities.fields.title` describes the operations this concrete
+// schema + mapping + Automerge source can execute.
 
 const unsubscribe = opened.value.subscribe(() => {
   const snapshot = opened.value.getSnapshot();
@@ -84,6 +85,21 @@ const receipt = await opened.value.transact(operation, (snapshot) =>
       : row)
   )
 );
+
+// Position-sensitive text intent names the basis the user actually observed.
+const visible = opened.value.getSnapshot();
+if (visible.state === 'open' && visible.current.readiness === 'ready') {
+  await opened.value.transact(
+    { kind: 'prefix-task-title', id: 'first' },
+    (snapshot) => snapshot.spliceText(
+      tasks,
+      ['first'],
+      'title',
+      { index: 0, deleteCount: 0, insert: 'New ' }
+    ),
+    { observedBasis: visible.current.basis }
+  );
+}
 
 unsubscribe();
 opened.value.close();
@@ -116,7 +132,7 @@ logical key:
   fields: {
     content: {
       path: ['content'],
-      write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace }
+      write: { replace: builtInCapabilityRefs.fieldReplace }
     }
   }
 }
@@ -148,7 +164,7 @@ without adding properties to a foreign document:
   },
   fields: {
     order: { kind: 'source-metadata', value: 'collection-position' },
-    name: { path: ['name'], write: { kind: 'read-only' } }
+    name: { path: ['name'], write: {} }
   }
 }
 ```
@@ -210,9 +226,11 @@ ordinary query API remains the only path. Full database snapshots, transactions,
 constraints, and query shapes whose dependencies are ambiguous still project
 the complete mapped state.
 
-Multiplayer changes are ordinary input to this loop. Each candidate is staged
-on an Automerge clone; if another player's heads arrive before publication, the
-callback runs again against the newly merged snapshot. Disjoint remote work is
+Multiplayer changes are ordinary input to this loop. Replayable row transforms
+run again against a newer logical snapshot when needed. Position-sensitive
+text edits instead become one private Automerge branch at their observed basis;
+Tarstate merges that branch with current heads, re-projects and validates the
+exact candidate, then conditionally publishes it. Disjoint remote work is
 preserved, while conflicts already present in mapped data remain explicit
 projection evidence rather than being selected or JSON-round-tripped away.
 Required constraints are also evaluated for live and remotely received states,
@@ -226,7 +244,7 @@ produce an unsuccessful result. Invalid transaction intent or an initial
 callback failure rejects that transaction call. Once execution has reserved a
 valid candidate, expected transaction failures resolve as receipts. A valid
 logical edit that the prepared mapping cannot represent also resolves as a
-rejected simulation or commit receipt; use `writeCapabilities(relation)` to
+rejected simulation or commit receipt; use `capabilities(relation)` to
 avoid offering known read-only edits. In particular, a callback failure during
 multiplayer replay becomes a rejected receipt so no reserved operation is left
 pending.

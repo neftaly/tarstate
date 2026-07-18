@@ -95,10 +95,10 @@ const measureTitleOnlyFileProjection = () => {
       collection: { kind: 'singleton', path: [], absent: 'invalid' },
       keys: { id: { kind: 'literal', value: 'file' } },
       fields: {
-        name: { path: ['name'], write: { kind: 'read-only' } },
+        name: { path: ['name'], write: {} },
         content: {
           path: ['content'],
-          write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace }
+          write: { replace: builtInCapabilityRefs.fieldReplace }
         }
       }
     } }

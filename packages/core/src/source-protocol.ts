@@ -44,12 +44,31 @@ export type IntentMergeResult<Command> =
   | { readonly outcome: 'merged'; readonly commands: readonly Command[] }
   | { readonly outcome: 'conflict' | 'unknown'; readonly issues: readonly Issue[] };
 
+export type BindingFieldWriteCapabilities = {
+  readonly replace?: true;
+  readonly textSplice?: {
+    readonly indexUnit: 'utf16-code-unit';
+    readonly reconciliation: 'captured-basis';
+  };
+};
+
+/** Concrete operations one binding can preserve and lower for a relation. */
+export type BindingRelationWriteCapabilities = {
+  readonly relationId: string;
+  readonly insert?: true;
+  readonly delete?: true;
+  readonly generatedKeyInsert?: true;
+  readonly fields: Readonly<Record<string, BindingFieldWriteCapabilities>>;
+};
+
 export type StorageBinding<Storage, Command, Row = unknown> = {
   readonly id: string;
   /** Relations this binding can project and handle. Omission preserves compatibility but disables relation routing. */
   readonly relationIds?: readonly string[];
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
+  /** Stable implementation evidence used by attachment-scoped authoring. */
+  readonly writeCapabilities: ReadonlyMap<string, BindingRelationWriteCapabilities>;
   /** A relation filter permits callers to refresh only affected logical projections. */
   readonly project: (
     snapshot: SourceSnapshot<Storage>,
@@ -65,6 +84,15 @@ export type SourceCommitInput<Command> = {
   readonly intentHash: ContentHash;
   readonly expectedBasis: SourceBasis;
   readonly commands: readonly Command[];
+};
+
+export type ReconciledSourceCommitInput<Storage> = {
+  readonly operationEpoch: string;
+  readonly operationId: string;
+  readonly intentHash: ContentHash;
+  readonly expectedBasis: SourceBasis;
+  /** Exact source-native candidate already reconciled and validated by core. */
+  readonly candidate: Storage;
 };
 
 export type SourceCommitResult = {
@@ -84,11 +112,23 @@ export type SourceOutcomeLookup<Result> =
 export type AtomicSource<Storage, Command> = {
   readonly sourceId: string;
   readonly snapshot: () => SourceSnapshot<Storage>;
+  /** Retains one source-local historical view when the source can prove it. */
+  readonly snapshotAt?: (basis: SourceBasis) => SourceSnapshot<Storage>;
   readonly subscribe: (listener: (change?: { readonly beforeBasis?: SourceBasis; readonly afterBasis: SourceBasis }) => void) => () => void;
   readonly commit: (input: SourceCommitInput<Command>) => Promise<SourceCommitResult>;
   readonly relateFootprints: (left: Footprint, right: Footprint) => FootprintRelation;
   readonly mergeIntents: (plans: readonly PlanResult<Command>[]) => IntentMergeResult<Command>;
   readonly stage: (snapshot: SourceSnapshot<Storage>, commands: readonly Command[]) => { readonly storage: Storage; readonly issues: readonly Issue[] };
+  /** Builds a non-published candidate by applying captured commands at commandBasis to snapshot. */
+  readonly reconcile?: (
+    snapshot: SourceSnapshot<Storage>,
+    commandBasis: SourceBasis,
+    commands: readonly Command[],
+    /** Prior unpublished candidate from the same intent after a publication race. */
+    priorCandidate?: Storage
+  ) => { readonly storage: Storage; readonly issues: readonly Issue[] };
+  /** Conditionally publishes the exact candidate returned by reconcile. */
+  readonly commitReconciled?: (input: ReconciledSourceCommitInput<Storage>) => Promise<SourceCommitResult>;
   /** Derives exact basis evidence for immutable staged storage without handoff. */
   readonly basisForStagedStorage?: (snapshot: SourceSnapshot<Storage>, stagedStorage: Storage) => SourceBasis;
   readonly queryOutcome?: (input: { readonly operationEpoch: string; readonly operationId: string; readonly intentHash: ContentHash }) => Promise<SourceOutcomeLookup<SourceCommitResult>>;

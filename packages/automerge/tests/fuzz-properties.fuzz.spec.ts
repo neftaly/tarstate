@@ -1,6 +1,7 @@
 import * as Automerge from '@automerge/automerge';
 import fc from 'fast-check';
 import { describe, expect, vi } from 'vitest';
+import { isValidUtf16TextSplice } from '@tarstate/core/transactions';
 import {
   AutomergeAtomicSource,
 } from '../src/adapter/atomic-source.js';
@@ -47,6 +48,10 @@ const safeString = fc.string({
   unit: fc.constantFrom('a', 'b', 'c', 'd', 'e', 'f', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
 });
 const key = fc.string({ minLength: 1, maxLength: 4, unit: fc.constantFrom('a', 'b', 'c', 'd') });
+const unicodeText = fc.array(
+  fc.constantFrom('a', 'b', '😀', '🙂', 'e\u0301', '\n', '\r\n'),
+  { maxLength: 12 }
+).map((parts) => parts.join(''));
 const editArbitrary: fc.Arbitrary<Edit> = fc.oneof(
   fc.record({ kind: fc.constant('set-count'), value: fc.integer({ min: -20, max: 20 }) }),
   fc.record({ kind: fc.constant('put-record'), key, value: fc.integer({ min: -20, max: 20 }) }),
@@ -81,6 +86,101 @@ const hash = (digit: number): `sha256:${string}` => `sha256:${(digit & 15).toStr
 const ledgerKey = (epoch: number, operation: number): string => epoch + '\u0000' + operation;
 
 describe('Automerge shrinking model properties', () => {
+  propertyTest('valid UTF-16 splices match JavaScript and concurrent delivery converges', fc.property(
+    unicodeText,
+    unicodeText,
+    fc.nat(),
+    fc.nat(),
+    unicodeText,
+    fc.nat(),
+    fc.nat(),
+    (initial, leftInsert, leftStart, leftEnd, rightInsert, rightStart, rightEnd) => {
+      const boundaries = codePointBoundaries(initial);
+      const left = normalizedSplice(boundaries, leftStart, leftEnd, leftInsert);
+      const right = normalizedSplice(boundaries, rightStart, rightEnd, rightInsert);
+      expect(isValidUtf16TextSplice(initial, left)).toBe(true);
+      expect(isValidUtf16TextSplice(initial, right)).toBe(true);
+      const base = Automerge.from({ text: initial }, { actor: '4'.repeat(64) });
+      const leftDoc = Automerge.change(
+        Automerge.clone(base, { actor: '5'.repeat(64) }),
+        (draft) => { Automerge.splice(draft, ['text'], left.index, left.deleteCount, left.insert); }
+      );
+      const rightDoc = Automerge.change(
+        Automerge.clone(base, { actor: '6'.repeat(64) }),
+        (draft) => { Automerge.splice(draft, ['text'], right.index, right.deleteCount, right.insert); }
+      );
+      expect(leftDoc.text).toBe(applyStringSplice(initial, left));
+      expect(rightDoc.text).toBe(applyStringSplice(initial, right));
+      // Automerge's WASM handles are stateful even though Doc values are
+      // immutable at the API. Independent clones keep the delivery-order
+      // comparison from sharing merge internals.
+      const leftThenRight = Automerge.merge(Automerge.clone(leftDoc), Automerge.clone(rightDoc));
+      const rightThenLeft = Automerge.merge(Automerge.clone(rightDoc), Automerge.clone(leftDoc));
+      expect(leftThenRight.text).toBe(rightThenLeft.text);
+      expect(Automerge.getHeads(leftThenRight).sort()).toEqual(Automerge.getHeads(rightThenLeft).sort());
+    }
+  ));
+
+  propertyTest('captured text reconciliation retains one local change across integration races', fc.property(
+    unicodeText,
+    unicodeText,
+    fc.nat(),
+    fc.nat(),
+    unicodeText,
+    fc.nat(),
+    fc.nat(),
+    (initial, localInsert, localStart, localEnd, remoteInsert, remoteStart, remoteEnd) => {
+      type TextDocument = { text: string };
+      const boundaries = codePointBoundaries(initial);
+      const local = normalizedSplice(boundaries, localStart, localEnd, 'L' + localInsert);
+      const remote = normalizedSplice(boundaries, remoteStart, remoteEnd, 'R' + remoteInsert);
+      const base = Automerge.from<TextDocument>({ text: initial }, { actor: '7'.repeat(64) });
+      const historyBase = Automerge.load<TextDocument>(Automerge.save(base), { actor: '8'.repeat(64) });
+      const runtime = new AutomergeSourceRuntime({ sourceId: 'source:text-reconcile-fuzz', doc: base });
+      const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:text-reconcile' });
+      const observed = source.snapshot();
+      const firstRemote = Automerge.change(
+        Automerge.clone(base, { actor: '9'.repeat(64) }),
+        (draft) => { Automerge.splice(draft, ['text'], remote.index, remote.deleteCount, remote.insert); }
+      );
+      runtime.merge(firstRemote);
+      const firstIntegration = source.snapshot();
+      const commands = [{
+        apply: (draft: Parameters<Automerge.ChangeFn<TextDocument>>[0]) => {
+          Automerge.splice(draft, ['text'], local.index, local.deleteCount, local.insert);
+        }
+      }];
+      const firstCandidate = source.reconcile!(firstIntegration, observed.basis, commands);
+      expect(firstCandidate.issues).toEqual([]);
+      expect(Automerge.getChanges(historyBase, firstCandidate.storage)).toHaveLength(2);
+
+      const secondRemote = Automerge.change(
+        Automerge.clone(runtime.snapshot().storage, { actor: 'a'.repeat(64) }),
+        (draft) => { Automerge.splice(draft, ['text'], draft.text.length, 0, 'S'); }
+      );
+      runtime.merge(secondRemote);
+      const secondIntegration = source.snapshot();
+      const secondCandidate = source.reconcile!(
+        secondIntegration,
+        observed.basis,
+        commands,
+        firstCandidate.storage
+      );
+      expect(secondCandidate.issues).toEqual([]);
+      expect(Automerge.getChanges(historyBase, secondCandidate.storage)).toHaveLength(3);
+      expect(Automerge.hasHeads(
+        secondCandidate.storage,
+        Automerge.getHeads(firstCandidate.storage)
+      )).toBe(true);
+      expect(isValidUtf16TextSplice(secondCandidate.storage.text, {
+        index: secondCandidate.storage.text.length,
+        deleteCount: 0,
+        insert: ''
+      })).toBe(true);
+      source.close();
+    }
+  ));
+
   propertyTest('staged generated identities equal committed and replayed evidence', fc.asyncProperty(
     fc.array(safeString, { minLength: 1, maxLength: 8 }),
     async (values) => {
@@ -267,6 +367,37 @@ describe('Automerge shrinking model properties', () => {
     }
   ));
 });
+
+type NormalizedSplice = {
+  readonly index: number;
+  readonly deleteCount: number;
+  readonly insert: string;
+};
+
+const codePointBoundaries = (value: string): readonly number[] => {
+  const boundaries = [0];
+  let offset = 0;
+  for (const point of value) {
+    offset += point.length;
+    boundaries.push(offset);
+  }
+  return boundaries;
+};
+
+const normalizedSplice = (
+  boundaries: readonly number[],
+  first: number,
+  second: number,
+  insert: string
+): NormalizedSplice => {
+  const left = boundaries[first % boundaries.length] as number;
+  const right = boundaries[second % boundaries.length] as number;
+  const index = Math.min(left, right);
+  return { index, deleteCount: Math.max(left, right) - index, insert };
+};
+
+const applyStringSplice = (value: string, edit: NormalizedSplice): string =>
+  value.slice(0, edit.index) + edit.insert + value.slice(edit.index + edit.deleteCount);
 
 const applyDocumentEdit = (draft: TestDraft, edit: Edit): void => {
   switch (edit.kind) {

@@ -1,12 +1,26 @@
 import type { SchemaBody } from '../schema.js';
-import type { LiteralRelation, SchemaRow } from '../schema-authoring.js';
+import type { LiteralRelation, SchemaKey, SchemaRow } from '../schema-authoring.js';
 import type { CommitReceipt, SimulationReceipt } from '../transaction.js';
 import type { JsonValue } from '../value.js';
+import type { SourceBasis } from '../source-state.js';
 
 type RelationKeyField<
   Body extends SchemaBody,
   Name extends Extract<keyof Body['relations'], string>
 > = Body['relations'][Name]['key'][number];
+
+type StringField<
+  Body extends SchemaBody,
+  Name extends Extract<keyof Body['relations'], string>
+> = {
+  [Field in Extract<keyof SchemaRow<Body, Name>, string>]:
+    Exclude<SchemaRow<Body, Name>[Field], undefined> extends string ? Field : never
+}[Extract<keyof SchemaRow<Body, Name>, string>];
+
+export type RelationKey<
+  Body extends SchemaBody,
+  Name extends Extract<keyof Body['relations'], string>
+> = SchemaKey<Body, Name>;
 
 export type GeneratedKeyInsertFields<
   Body extends SchemaBody,
@@ -36,6 +50,17 @@ export type DatabaseTransactionSnapshot = {
     token: string,
     fields: GeneratedKeyInsertFields<Body, Name>
   ) => DatabaseTransactionSnapshot;
+  /** Queues one exact-key semantic splice using JavaScript UTF-16 code-unit offsets. */
+  readonly spliceText: <Body extends SchemaBody, Name extends Extract<keyof Body['relations'], string>>(
+    relation: LiteralRelation<Body, Name>,
+    key: RelationKey<Body, Name>,
+    field: StringField<Body, Name>,
+    edit: {
+      readonly index: number;
+      readonly deleteCount: number;
+      readonly insert: string;
+    }
+  ) => DatabaseTransactionSnapshot;
 };
 
 export type DatabaseTransactionTransform = (
@@ -44,24 +69,36 @@ export type DatabaseTransactionTransform = (
 
 export type DatabaseTransactionOptions = {
   readonly signal?: AbortSignal;
+  /** Contributing source basis of a user-observed position-sensitive intent. */
+  readonly observedBasis?: SourceBasis;
 };
 
 /** Prepared logical write facts for one relation, independent of source readiness. */
-export type DatabaseRelationWriteCapabilities = {
+export type DatabaseFieldWriteCapabilities = {
+  readonly replace?: { readonly concurrency: 'replay-transform' };
+  readonly textSplice?: {
+    readonly indexUnit: 'utf16-code-unit';
+    readonly concurrency: 'merge-captured-intent';
+  };
+};
+
+export type DatabaseRelationCapabilities = {
   readonly relationId: string;
   readonly keyFields: readonly string[];
-  readonly replaceableFields: readonly string[];
   readonly sourceGeneratedFields: readonly string[];
-  readonly supportsGeneratedKeyInsert: boolean;
+  readonly insert?: { readonly concurrency: 'replay-transform' };
+  readonly delete?: { readonly concurrency: 'replay-transform' };
+  readonly generatedKeyInsert?: { readonly concurrency: 'replay-transform' };
+  readonly fields: Readonly<Record<string, DatabaseFieldWriteCapabilities>>;
 };
 
 export type DatabaseTransactionService = {
-  readonly writeCapabilities: <
+  readonly capabilities: <
     Body extends SchemaBody,
     Name extends Extract<keyof Body['relations'], string>
   >(
     relation: LiteralRelation<Body, Name>
-  ) => DatabaseRelationWriteCapabilities;
+  ) => DatabaseRelationCapabilities;
   readonly transact: (
     intent: JsonValue,
     transform: DatabaseTransactionTransform,

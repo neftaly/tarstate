@@ -43,7 +43,7 @@ const fixtures = async (constraintCapability?: CapabilityDeclaration) => {
         'test.item': {
           collection: { kind: 'object-map', path: ['items'], absent: 'empty' },
           keys: { id: { kind: 'field', path: ['id'] } },
-          fields: { title: { path: ['title'], write: { kind: 'replace', capability: writeCapability } } }
+          fields: { title: { path: ['title'], write: { replace: writeCapability } } }
         }
       }
     }

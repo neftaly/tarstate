@@ -35,7 +35,7 @@ export const mappedWriteEntries = (
   }
   return Object.values(mapping.fields).flatMap((field) => field.kind !== 'absent'
     && field.kind !== 'source-metadata'
-    && field.write.kind === 'replace'
+    && Object.keys(field.write).length > 0
     ? [{ scope: 'exact' as const, path: [...mapping.collection.path, ...field.path] as AutomergePath }]
     : []);
 };

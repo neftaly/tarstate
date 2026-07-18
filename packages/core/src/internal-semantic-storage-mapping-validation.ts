@@ -133,20 +133,17 @@ const validateFieldMapping = (
   }
   if (!semanticShape(context, input, ['path', 'write'], [], path)) return;
   validateStoragePath(context, input.path, [...path, 'path']);
-  if (!isSemanticRecord(input.write) || typeof input.write.kind !== 'string') {
+  if (!isSemanticRecord(input.write)) {
     semanticInvalid(context, [...path, 'write'], 'write_mapping_shape');
     return;
   }
-  if (input.write.kind === 'read-only') {
-    semanticShape(context, input.write, ['kind'], [], [...path, 'write']);
-    return;
+  if (!semanticShape(context, input.write, [], ['replace', 'textSplice'], [...path, 'write'])) return;
+  if (input.write.replace !== undefined) {
+    validateSemanticCapabilityRef(context, input.write.replace, [...path, 'write', 'replace']);
   }
-  if (input.write.kind === 'replace') {
-    semanticShape(context, input.write, ['kind', 'capability'], [], [...path, 'write']);
-    validateSemanticCapabilityRef(context, input.write.capability, [...path, 'write', 'capability']);
-    return;
+  if (input.write.textSplice !== undefined) {
+    validateSemanticCapabilityRef(context, input.write.textSplice, [...path, 'write', 'textSplice']);
   }
-  semanticInvalid(context, [...path, 'write', 'kind'], 'unknown_write_mapping');
 };
 
 const validateSourceMetadataMapping = (

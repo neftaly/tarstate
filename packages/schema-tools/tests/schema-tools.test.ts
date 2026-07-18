@@ -155,9 +155,9 @@ describe('portable artifact builds', () => {
             collection: { kind: 'object-map', path: ['players'], absent: 'empty' },
             keys: { id: { kind: 'map-key', onMismatch: 'reject' } },
             fields: {
-              nickname: { path: ['nickname'], write: { kind: 'read-only' } },
-              status: { path: ['status'], write: { kind: 'read-only' } },
-              joinedAt: { path: ['joinedAt'], write: { kind: 'read-only' } }
+              nickname: { path: ['nickname'], write: {} },
+              status: { path: ['status'], write: {} },
+              joinedAt: { path: ['joinedAt'], write: {} }
             }
           }
         }

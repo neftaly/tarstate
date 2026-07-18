@@ -16,6 +16,7 @@ import {
 } from '../../mapping.js';
 import type { CapabilityRegistry } from '../../registry.js';
 import type {
+  BindingRelationWriteCapabilities,
   LogicalEdit,
   PlanResult,
   ProjectionResult,
@@ -63,6 +64,7 @@ export const createExternalStoreMappedBinding = <State extends object>(input: {
   const id = input.id ?? 'external-store-mapping';
   const relationIds = Object.freeze([...input.mapping.relations.keys()]);
   const relationSelection = new Set(relationIds);
+  const writeCapabilities = externalStoreWriteCapabilities(input.mapping, input.registry);
   const declaredReadFootprint = jsonTreePathFootprint(
     [...input.mapping.relations.values()].map(({ mapping }) => ({
       scope: 'subtree' as const,
@@ -310,16 +312,17 @@ export const createExternalStoreMappedBinding = <State extends object>(input: {
           || declaration === undefined
           || fieldMapping.kind === 'absent'
           || fieldMapping.kind === 'source-metadata'
-          || fieldMapping.write.kind !== 'replace') {
+          || fieldMapping.write.replace === undefined) {
           issues.push(bindingIssue('mapping.field_read_only', snapshot.sourceId, edit.relationId, row.storagePath, { field }));
           continue;
         }
-        if (!input.registry.satisfies(fieldMapping.write.capability)) {
+        const replaceCapability = fieldMapping.write.replace;
+        if (!input.registry.satisfies(replaceCapability)) {
           issues.push(createIssue({
             code: 'mapping.capability_unavailable',
             sourceId: snapshot.sourceId,
             relationId: edit.relationId,
-            requiredCapabilities: [fieldMapping.write.capability],
+            requiredCapabilities: [replaceCapability],
             retry: 'after_capability',
             details: { field }
           }));
@@ -373,10 +376,34 @@ export const createExternalStoreMappedBinding = <State extends object>(input: {
     relationIds,
     declaredReadFootprint,
     declaredWriteFootprint,
+    writeCapabilities,
     project,
     plan
   });
 };
+
+const externalStoreWriteCapabilities = (
+  mapping: CompiledStorageMapping,
+  registry: CapabilityRegistry
+): ReadonlyMap<string, BindingRelationWriteCapabilities> => new Map(
+  [...mapping.relations].map(([relationId, compiled]) => {
+    const fields: Record<string, { readonly replace: true }> = {};
+    for (const [field, fieldMapping] of Object.entries(compiled.mapping.fields)) {
+      if (fieldMapping.kind !== 'absent'
+        && fieldMapping.kind !== 'source-metadata'
+        && fieldMapping.write.replace !== undefined
+        && registry.satisfies(fieldMapping.write.replace)) {
+        fields[field] = { replace: true };
+      }
+    }
+    const collectionWritable = compiled.mapping.collection.kind !== 'singleton';
+    return [relationId, Object.freeze({
+      relationId,
+      ...(collectionWritable ? { insert: true as const, delete: true as const } : {}),
+      fields: Object.freeze(fields)
+    })] as const;
+  })
+);
 
 const planInsert = <State extends object>(input: {
   readonly snapshot: SourceSnapshot<State>;

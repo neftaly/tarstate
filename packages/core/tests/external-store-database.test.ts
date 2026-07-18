@@ -1,4 +1,5 @@
-import { builtInCapabilityRefs } from '../src/builtins.js';
+import { builtInCapabilityRefs, registerBuiltInCapabilities } from '../src/builtins.js';
+import { CapabilityRegistry } from '../src/registry.js';
 import { sealConstraintSet } from '../src/constraint-artifact.js';
 import {
   mappedRelationRows,
@@ -67,7 +68,7 @@ describe('external-store relational database', () => {
   it('opens the ordinary database surface and performs immutable mapped writes', async () => {
     const fixture = await createTaskFixture();
     expect(Object.keys(fixture.database).sort()).toEqual([
-      'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact', 'writeCapabilities'
+      'capabilities', 'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
     ]);
     expect(fixture.database.getSnapshot()).toMatchObject({
       state: 'open',
@@ -231,7 +232,7 @@ describe('external-store relational database', () => {
         collection: { kind: 'array', path: ['tasks'], absent: 'creatable' },
         keys: { id: { kind: 'source-metadata', value: 'collection-element-identity' } },
         fields: {
-          title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+          title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } }
         }
       } }
     } });
@@ -246,6 +247,55 @@ describe('external-store relational database', () => {
     })).resolves.toMatchObject({
       success: false,
       issues: [{ code: 'mapping.source_metadata_unavailable' }]
+    });
+    expect(atomic.activeSubscriptions).toBe(0);
+  });
+
+  it('rejects a writable mapping whose operation has no binding handler', async () => {
+    const schema = await sealSchema({ id: 'urn:test:external-splice:schema', body: {
+      relations: { tasks: {
+        relationId: 'tasks',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string' } },
+          title: { type: { kind: 'string' } }
+        }
+      } }
+    } });
+    const mapping = await sealStorageMapping({ id: 'urn:test:external-splice:mapping', body: {
+      schema: reference(schema),
+      model: 'json-tree-v1',
+      relations: { tasks: {
+        collection: { kind: 'object-map', path: ['tasks'], absent: 'empty' },
+        keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
+        fields: {
+          title: { path: ['title'], write: { textSplice: builtInCapabilityRefs.textSplice } }
+        }
+      } }
+    } });
+    const atomic = createAtomicStore({ tasks: { first: { id: 'first', title: 'First' } } });
+    const registry = new CapabilityRegistry('test:external-splice');
+    await registerBuiltInCapabilities(registry);
+    registry.registerImplementation({
+      ref: builtInCapabilityRefs.textSplice,
+      integrity: 'test:text-splice-v2',
+      implementation: Object.freeze({ kind: 'test-text-splice' })
+    });
+
+    await expect(openExternalStoreDatabase({
+      sourceId: 'source:external-splice',
+      store: atomic.store,
+      storeIdentity: atomic.identity,
+      declaration: declaration(schema, mapping),
+      embeddedArtifacts: [schema, mapping],
+      authorityScope: 'scope:test',
+      registry
+    })).resolves.toMatchObject({
+      success: false,
+      issues: [expect.objectContaining({
+        code: 'mapping.binding_incompatible',
+        details: { field: 'title', operation: 'text-splice' }
+      })]
     });
     expect(atomic.activeSubscriptions).toBe(0);
   });
@@ -354,14 +404,14 @@ const taskArtifacts = async (options: { readonly constrained?: boolean } = {}) =
       collection: { kind: 'object-map', path: ['tasks'], absent: 'creatable' },
       keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
       fields: {
-        title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+        title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } }
       }
     },
     'archived-tasks': {
       collection: { kind: 'object-map', path: ['archivedTasks'], absent: 'empty' },
       keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
       fields: {
-        title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+        title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } }
       }
     } }
   } });
@@ -426,7 +476,7 @@ const createArrayTaskFixture = async (initial: {
       collection: { kind: 'array', path: ['tasks'], absent: 'creatable' },
       keys: { id: { kind: 'field', path: ['id'] } },
       fields: {
-        title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+        title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } }
       }
     } }
   } });

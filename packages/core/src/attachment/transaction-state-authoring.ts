@@ -1,4 +1,6 @@
 import type { ContentHash } from '../canonical-json.js';
+import { builtInCapabilityRefs } from '../builtins.js';
+import type { DatabaseRelationCapabilities } from '../database/transaction.js';
 import type { DatabaseTransactionTransform } from '../database/transaction.js';
 import type { Issue } from '../issues.js';
 import type { WritableLogicalState } from '../logical-edit.js';
@@ -11,12 +13,11 @@ import {
   type WriteStatement
 } from '../transaction.js';
 import type { JsonValue } from '../value.js';
-import type { PreparedAttachmentRelation } from './preparation.js';
 import { ImmutableDatabaseTransactionSnapshot } from './transaction-snapshot.js';
 
 type TransactionAuthoringPreparation = {
   readonly schema: PreparedSchema;
-  readonly relations: ReadonlyMap<string, PreparedAttachmentRelation>;
+  readonly relations: ReadonlyMap<string, DatabaseRelationCapabilities>;
 };
 
 /** Pure logical-state authoring core; lifecycle, replay, and publication stay outside. */
@@ -42,6 +43,7 @@ export const authorAttachmentStateTransition = async (input: {
       rowsByRelation: beforeByRelation,
       changedRelationIds: emptyChangedRelationIds,
       generatedKeyInserts: emptyGeneratedKeyInserts,
+      textSplices: emptyTextSplices,
       authoringIssues: emptyAuthoringIssues
     });
     const transformed = await input.transform(snapshot);
@@ -61,7 +63,9 @@ export const authorAttachmentStateTransition = async (input: {
       const authored = authorExactKeyedRelationDelta({
         relation: { relationId, schemaView: input.schemaView },
         keyFields: relation.keyFields,
-        replaceableFields: relation.replaceableFields,
+        replaceableFields: Object.entries(relation.fields)
+          .filter(([, capabilities]) => capabilities.replace !== undefined)
+          .map(([field]) => field),
         before: {
           completeness: 'exact',
           rows: beforeByRelation.get(relationId) ?? emptyTransactionFields
@@ -84,13 +88,43 @@ export const authorAttachmentStateTransition = async (input: {
         fields: literalFields(insert.fields)
       });
     }
+    for (const splice of authoringIssues.length === 0
+      ? transformed.authoredTextSplices()
+      : emptyTextSplices) {
+      const relation = input.preparation.relations.get(splice.relationId);
+      if (relation === undefined) throw new TypeError(`Transaction relation ${JSON.stringify(splice.relationId)} is unavailable`);
+      statements.push({
+        kind: 'statement.keyed-delta',
+        relation: { relationId: splice.relationId, schemaView: input.schemaView },
+        alias: 'row',
+        changes: [{
+          kind: 'delta.update',
+          key: Object.fromEntries(relation.keyFields.map((field, index) => [field, {
+            kind: 'literal' as const,
+            value: splice.key[index] as JsonValue
+          }])),
+          edits: {
+            [splice.field]: {
+              kind: 'edit.text-splice',
+              index: { kind: 'literal', value: splice.index },
+              deleteCount: { kind: 'literal', value: splice.deleteCount },
+              insert: { kind: 'literal', value: splice.insert }
+            }
+          }
+        }]
+      });
+    }
   }
   const transaction = await sealTransaction({ body: {
     schemaView: input.schemaView,
     parameters: {},
     statements: authoringIssues.length === 0 ? statements : [],
     guards: [],
-    requiredCapabilities: []
+    requiredCapabilities: statements.some((statement) => statement.kind === 'statement.keyed-delta'
+      && statement.changes.some((change) => change.kind === 'delta.update'
+        && Object.values(change.edits).some(({ kind }) => kind === 'edit.text-splice')))
+      ? [builtInCapabilityRefs.textSplice]
+      : []
   } });
   return {
     transaction,
@@ -101,6 +135,7 @@ export const authorAttachmentStateTransition = async (input: {
 const emptyTransactionFields: readonly Readonly<Record<string, JsonValue>>[] = Object.freeze([]);
 const emptyChangedRelationIds: ReadonlySet<string> = new Set<string>();
 const emptyGeneratedKeyInserts = Object.freeze([]);
+const emptyTextSplices = Object.freeze([]);
 const emptyAuthoringIssues: readonly Issue[] = Object.freeze([]);
 
 const literalFields = (

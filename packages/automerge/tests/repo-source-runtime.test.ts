@@ -139,6 +139,7 @@ describe('Automerge Repo source owner', () => {
       doc: () => { throw constructionFailure; },
       heads: () => [],
       changeAt: () => undefined,
+      update: () => undefined,
       on,
       off,
     };
@@ -159,6 +160,7 @@ describe('Automerge Repo source owner', () => {
       doc: () => undefined,
       heads: () => [],
       changeAt: () => undefined,
+      update: () => undefined,
       on,
       off,
     };
@@ -221,6 +223,7 @@ describe('Automerge Repo source owner', () => {
       doc: () => doc,
       heads: () => Automerge.getHeads(doc),
       changeAt: () => Automerge.getHeads(doc),
+      update: () => undefined,
       on: vi.fn(),
       off: vi.fn(() => { throw closeFailure; })
     };

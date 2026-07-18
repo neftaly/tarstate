@@ -2,6 +2,7 @@ import * as Automerge from '@automerge/automerge';
 import { Repo } from '@automerge/automerge-repo';
 import { builtInCapabilityRefs } from '@tarstate/core/capabilities';
 import { sealConstraintSet } from '@tarstate/core/artifacts/constraint-set';
+import type { DatabaseTransactionSnapshot } from '@tarstate/core/transactions';
 import {
   AttachmentCatalog,
   type AttachmentLease,
@@ -22,7 +23,7 @@ import {
 import { createLiveAutomergeDatabase } from '../src/database/live.js';
 
 type TaskDocument = {
-  tasks: Record<string, { id: string; title: string }>;
+  tasks: Record<string, { id: string; title: string; unknownPhysicalField?: string }>;
 };
 
 type FileDocument = {
@@ -104,12 +105,15 @@ describe('standard Automerge database', () => {
   it('opens embedded artifacts and exposes only logical transactions and lifecycle', async () => {
     const fixture = await openTaskDatabase();
     expect(Object.keys(fixture.database).sort()).toEqual([
-      'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact', 'writeCapabilities'
+      'capabilities', 'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
     ]);
-    expect(fixture.database.writeCapabilities(fixture.tasks)).toMatchObject({
+    expect(fixture.database.capabilities(fixture.tasks)).toMatchObject({
       relationId: 'tasks',
       keyFields: ['id'],
-      replaceableFields: ['title']
+      fields: { title: {
+        replace: { concurrency: 'replay-transform' },
+        textSplice: { indexUnit: 'utf16-code-unit', concurrency: 'merge-captured-intent' }
+      } }
     });
     const initial = fixture.database.getSnapshot();
     expect(initial).toMatchObject({
@@ -146,6 +150,176 @@ describe('standard Automerge database', () => {
     expect(closeListener).toHaveBeenCalledOnce();
     expect(fixture.database.getSnapshot()).toEqual({ state: 'closed' });
     expect(catalog.list()).toHaveLength(0);
+    await fixture.repo.shutdown();
+  });
+
+  it('authors native text splices from the observed basis and merges later text changes', async () => {
+    const fixture = await openTaskDatabase();
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') throw new Error('Expected ready database');
+    const observedBasis = observed.current.basis;
+
+    fixture.handle.change((draft) => {
+      Automerge.splice(draft, ['tasks', 'first', 'title'], 5, 0, '!');
+      draft.tasks.first!.unknownPhysicalField = 'preserved';
+    });
+
+    const transform = (snapshot: DatabaseTransactionSnapshot) => snapshot.spliceText(
+      fixture.tasks,
+      ['first'],
+      'title',
+      { index: 0, deleteCount: 0, insert: 'New ' }
+    );
+    const simulation = await fixture.database.simulate(
+      { kind: 'prefix-title' },
+      transform,
+      { observedBasis }
+    );
+    expect(simulation).toMatchObject({
+      outcome: 'would-commit',
+      beforeBasis: observedBasis,
+      stagedState: { rows: [expect.objectContaining({ fields: { id: 'first', title: 'New First' } })] }
+    });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('First!');
+
+    const receipt = await fixture.database.transact(
+      { kind: 'prefix-title' },
+      transform,
+      { observedBasis }
+    );
+    expect(receipt).toMatchObject({
+      outcome: 'committed',
+      evaluationBasis: observedBasis,
+      integrationBasis: expect.any(Object)
+    });
+    expect(receipt.outcome === 'committed' && receipt.integrationBasis).not.toEqual(observedBasis);
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('New First!');
+    expect(fixture.handle.doc()?.tasks.first?.unknownPhysicalField).toBe('preserved');
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('requires observed-basis evidence and rejects unsafe UTF-16 splices before publication', async () => {
+    const fixture = await openTaskDatabase({ initialTitle: 'A😀B' });
+    const withoutBasis = await fixture.database.transact(
+      { kind: 'unsafe-unbound-splice' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 0, deleteCount: 0, insert: 'x' }
+      )
+    );
+    expect(withoutBasis).toMatchObject({
+      outcome: 'rejected',
+      issues: expect.arrayContaining([expect.objectContaining({
+        code: 'transaction.expected_basis_stale',
+        details: expect.objectContaining({ reason: 'observed_basis_required_for_position_sensitive_intent' })
+      })])
+    });
+
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') throw new Error('Expected ready database');
+    const splitSurrogate = await fixture.database.transact(
+      { kind: 'split-surrogate' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 2, deleteCount: 0, insert: 'x' }
+      ),
+      { observedBasis: observed.current.basis }
+    );
+    expect(splitSurrogate).toMatchObject({ outcome: 'rejected' });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('A😀B');
+
+    const malformedInsertion = await fixture.database.transact(
+      { kind: 'malformed-surrogate' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 1, deleteCount: 2, insert: '\uD800' }
+      ),
+      { observedBasis: observed.current.basis }
+    );
+    expect(malformedInsertion).toMatchObject({ outcome: 'rejected' });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('A😀B');
+
+    const validEmojiReplacement = await fixture.database.transact(
+      { kind: 'replace-emoji' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 1, deleteCount: 2, insert: '🙂' }
+      ),
+      { observedBasis: observed.current.basis }
+    );
+    expect(validEmojiReplacement).toMatchObject({ outcome: 'committed' });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('A🙂B');
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('validates the reconciled candidate before publishing a captured splice', async () => {
+    const fixture = await openTaskDatabase({
+      constrained: true,
+      allowedTitles: ['First', 'Firstn', 'Forbidde']
+    });
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') throw new Error('Expected ready database');
+    fixture.handle.change((draft) => {
+      Automerge.splice(draft, ['tasks', 'first', 'title'], 0, 5, 'Forbidde');
+    });
+
+    const receipt = await fixture.database.transact(
+      { kind: 'complete-forbidden-title' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 5, deleteCount: 0, insert: 'n' }
+      ),
+      { observedBasis: observed.current.basis }
+    );
+
+    expect(receipt).toMatchObject({
+      outcome: 'rejected',
+      evaluationBasis: observed.current.basis,
+      issues: expect.arrayContaining([expect.objectContaining({ code: 'test.task_invalid' })])
+    });
+    expect(fixture.handle.doc()?.tasks.first?.title).toBe('Forbidde');
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it('rejects a captured splice when another player deletes its target', async () => {
+    const fixture = await openTaskDatabase();
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') throw new Error('Expected ready database');
+    fixture.handle.change((draft) => { delete draft.tasks.first; });
+
+    const receipt = await fixture.database.transact(
+      { kind: 'edit-deleted-task' },
+      (snapshot) => snapshot.spliceText(
+        fixture.tasks,
+        ['first'],
+        'title',
+        { index: 0, deleteCount: 0, insert: 'x' }
+      ),
+      { observedBasis: observed.current.basis }
+    );
+
+    expect(receipt).toMatchObject({
+      outcome: 'rejected',
+      issues: expect.arrayContaining([expect.objectContaining({
+        code: 'transaction.expected_basis_stale',
+        details: expect.objectContaining({ reason: 'captured_text_target_unavailable' })
+      })])
+    });
+    expect(fixture.handle.doc()?.tasks.first).toBeUndefined();
+    fixture.database.close();
     await fixture.repo.shutdown();
   });
 
@@ -253,7 +427,7 @@ describe('standard Automerge database', () => {
           collection: { kind: 'singleton', path: [], absent: 'invalid' },
           keys: { id: { kind: 'literal', value: 'content' } },
           fields: {
-            content: { path: ['content'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+            content: { path: ['content'], write: { replace: builtInCapabilityRefs.fieldReplace } }
           }
         }
       }
@@ -317,8 +491,8 @@ describe('standard Automerge database', () => {
         collection: { kind: 'singleton', path: [], absent: 'invalid' },
         keys: { id: { kind: 'literal', value: 'file' } },
         fields: {
-          name: { path: ['name'], write: { kind: 'read-only' } },
-          content: { path: ['content'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+          name: { path: ['name'], write: {} },
+          content: { path: ['content'], write: { replace: builtInCapabilityRefs.fieldReplace } }
         }
       } }
     } });
@@ -441,7 +615,7 @@ describe('standard Automerge database', () => {
         collection: { kind: 'array', path: ['tasks'], absent: 'creatable' },
         keys: { id: { kind: 'field', path: ['id'] } },
         fields: {
-          title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+          title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } }
         }
       } }
     } });
@@ -870,6 +1044,7 @@ class ThrowingLeaseCatalog extends AttachmentCatalog {
 
 const openTaskDatabase = async (options: {
   readonly artifactMap?: boolean;
+  readonly allowedTitles?: readonly string[];
   readonly constrained?: boolean;
   readonly initialTitle?: string;
 } = {}) => {
@@ -890,7 +1065,10 @@ const openTaskDatabase = async (options: {
       collection: { kind: 'object-map', path: ['tasks'], absent: 'creatable' },
       keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
       fields: {
-        title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+        title: { path: ['title'], write: {
+          replace: builtInCapabilityRefs.fieldReplace,
+          textSplice: builtInCapabilityRefs.textSplice
+        } }
       }
     } }
   } });
@@ -906,12 +1084,23 @@ const openTaskDatabase = async (options: {
             input: {
               kind: 'where',
               input: { kind: 'from', relation: { schemaView: reference(schema), relationId: 'tasks' }, alias: 'task' },
-              predicate: {
-                kind: 'compare',
-                op: 'eq',
-                left: { kind: 'field', alias: 'task', name: 'title' },
-                right: { kind: 'literal', value: 'Forbidden' }
-              }
+              predicate: options.allowedTitles === undefined
+                ? {
+                    kind: 'compare',
+                    op: 'eq',
+                    left: { kind: 'field', alias: 'task', name: 'title' },
+                    right: { kind: 'literal', value: 'Forbidden' }
+                  }
+                : {
+                    kind: 'boolean',
+                    op: 'and',
+                    args: options.allowedTitles.map((title) => ({
+                      kind: 'compare' as const,
+                      op: 'ne' as const,
+                      left: { kind: 'field' as const, alias: 'task', name: 'title' },
+                      right: { kind: 'literal' as const, value: title }
+                    }))
+                  }
             },
             alias: 'violation',
             fields: {
@@ -975,7 +1164,7 @@ const openSourceIdentityTaskDatabase = async (
       collection: { kind: 'array', path: ['tasks'], absent: 'creatable' },
       keys: { id: { kind: 'source-metadata', value: 'collection-element-identity' } },
       fields: {
-        title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+        title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } },
         position: { kind: 'source-metadata', value: 'collection-position' }
       }
     } }

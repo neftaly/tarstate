@@ -24,10 +24,15 @@ export type SourceMetadataMapping = {
   readonly kind: 'source-metadata';
   readonly value: 'collection-position' | 'collection-element-identity';
 };
+export type StoredFieldWriteMapping = {
+  readonly replace?: CapabilityRef;
+  readonly textSplice?: CapabilityRef;
+};
 export type StoredFieldMapping = {
   readonly kind?: never;
   readonly path: StoragePath;
-  readonly write: { readonly kind: 'replace'; readonly capability: CapabilityRef } | { readonly kind: 'read-only' };
+  /** Operations the physical field can represent. An empty object is read-only. */
+  readonly write: StoredFieldWriteMapping;
 };
 export type AbsentFieldMapping = { readonly kind: 'absent' };
 export type FieldMapping = StoredFieldMapping | AbsentFieldMapping | SourceMetadataMapping;
@@ -186,10 +191,17 @@ export const compileStorageMapping = (
         }));
       } else if (fieldMapping.kind !== 'absent'
         && fieldMapping.kind !== 'source-metadata'
-        && fieldMapping.write.kind === 'replace'
-        && registry !== undefined
-        && !registry.satisfies(fieldMapping.write.capability)) {
-        issues.push(mappingIssue('mapping.capability_unavailable', [...path, 'fields', field, 'write'], { field }, [fieldMapping.write.capability]));
+        && registry !== undefined) {
+        for (const [operation, capability] of Object.entries(fieldMapping.write)) {
+          if (!registry.satisfies(capability)) {
+            issues.push(mappingIssue(
+              'mapping.capability_unavailable',
+              [...path, 'fields', field, 'write', operation],
+              { field, operation },
+              [capability]
+            ));
+          }
+        }
       }
     }
     for (const field of Object.keys(relation.declaration.fields)) {
@@ -332,12 +344,13 @@ const planStorageIntentDetails = (
     if (fieldMapping === undefined || declaration === undefined
       || fieldMapping.kind === 'absent'
       || fieldMapping.kind === 'source-metadata'
-      || fieldMapping.write.kind === 'read-only') {
+      || fieldMapping.write.replace === undefined) {
       issues.push(mappingIssue('mapping.field_read_only', [field], { field, relationId }, undefined, sourceId, relationId));
       continue;
     }
-    if (registry !== undefined && !registry.satisfies(fieldMapping.write.capability)) {
-      issues.push(mappingIssue('mapping.capability_unavailable', [field], { field }, [fieldMapping.write.capability], sourceId, relationId));
+    const replaceCapability = fieldMapping.write.replace;
+    if (registry !== undefined && !registry.satisfies(replaceCapability)) {
+      issues.push(mappingIssue('mapping.capability_unavailable', [field], { field, operation: 'replace' }, [replaceCapability], sourceId, relationId));
       continue;
     }
     const parsed = parseScalarValueForField(binding.schema, declaration, input, registry, [field]);
@@ -345,7 +358,7 @@ const planStorageIntentDetails = (
     const set = setPath(nextCandidate, fieldMapping.path, parsed.value);
     if (!set.success) { issues.push(...set.issues); continue; }
     nextCandidate = set.value;
-    intents.push({ kind: 'replace', path: [...located.value.absolutePath, ...fieldMapping.path], value: parsed.value, capability: fieldMapping.write.capability });
+    intents.push({ kind: 'replace', path: [...located.value.absolutePath, ...fieldMapping.path], value: parsed.value, capability: replaceCapability });
   }
   if (issues.length > 0) return { success: false, issues };
   const readFootprint = [
@@ -702,10 +715,9 @@ const isFieldMapping = (value: unknown): value is FieldMapping => isRecord(value
     && hasOnlyKeys(value, ['path', 'write'])
     && isStoragePath(value.path)
     && isRecord(value.write)
-    && ((value.write.kind === 'read-only' && hasOnlyKeys(value.write, ['kind']))
-      || (value.write.kind === 'replace'
-        && hasOnlyKeys(value.write, ['kind', 'capability'])
-        && isCapabilityRef(value.write.capability))))
+    && hasOnlyKeys(value.write, ['replace', 'textSplice'])
+    && (value.write.replace === undefined || isCapabilityRef(value.write.replace))
+    && (value.write.textSplice === undefined || isCapabilityRef(value.write.textSplice)))
 );
 const isSourceMetadataMapping = (value: Readonly<Record<string, unknown>>): value is SourceMetadataMapping =>
   value.kind === 'source-metadata'

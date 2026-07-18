@@ -109,6 +109,45 @@ describe('Automerge core source protocol', () => {
     expect([result.generatedKeys, result.generatedKeys?.[0], result.generatedKeys?.[0]?.key].every(Object.isFrozen)).toBe(true);
   });
 
+  it('reuses one captured branch across repeated integration races', async () => {
+    const { runtime, source } = fixture();
+    const observed = source.snapshot();
+    const commands = [{
+      apply: (draft: Parameters<Automerge.ChangeFn<TaskDoc>>[0]) => {
+        Automerge.splice(draft, ['tasks', 'first', 'title'], 0, 0, 'New ');
+      }
+    }];
+    const firstRemote = Automerge.change(
+      Automerge.clone(runtime.snapshot().storage, { actor: actor('2') }),
+      (draft) => { Automerge.splice(draft, ['tasks', 'first', 'title'], 5, 0, '!'); }
+    );
+    runtime.merge(firstRemote);
+    const firstIntegration = source.snapshot();
+    const firstCandidate = source.reconcile!(firstIntegration, observed.basis, commands);
+    expect(firstCandidate.storage.tasks.first?.title).toBe('New First!');
+
+    const secondRemote = Automerge.change(
+      Automerge.clone(runtime.snapshot().storage, { actor: actor('3') }),
+      (draft) => { Automerge.splice(draft, ['tasks', 'first', 'title'], 6, 0, '?'); }
+    );
+    runtime.merge(secondRemote);
+    const secondIntegration = source.snapshot();
+    const secondCandidate = source.reconcile!(
+      secondIntegration,
+      observed.basis,
+      commands,
+      firstCandidate.storage
+    );
+    expect(secondCandidate.storage.tasks.first?.title).toBe('New First!?');
+
+    const committed = await source.commitReconciled!({
+      ...commitInput(secondIntegration.basis as JsonValue, 'operation:reconciled', 'c'),
+      candidate: secondCandidate.storage
+    });
+    expect(committed).toMatchObject({ outcome: 'committed' });
+    expect(runtime.snapshot().storage.tasks.first?.title).toBe('New First!?');
+  });
+
   it('returns deeply frozen commit and replay evidence', async () => {
     const { runtime, source } = fixture();
     const apply = vi.fn((draft: TaskDoc) => {

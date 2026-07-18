@@ -136,6 +136,7 @@ assignArchitectureGroup('query-incremental', [
 ]);
 assignArchitectureGroup('transaction-model', [
   'database/transaction.ts',
+  'internal-text-splice.ts',
   'internal-transaction-expression.ts',
   'receipts.ts',
   'relation-delta-authoring.ts',

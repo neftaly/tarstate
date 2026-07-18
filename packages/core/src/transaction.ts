@@ -125,6 +125,10 @@ type CommitReceiptEvidence = {
   readonly attachmentId: string;
   readonly attachmentFingerprint: ContentHash;
   readonly sourceId: string;
+  /** Present when position-sensitive intent was evaluated before integration. */
+  readonly evaluationBasis?: SourceBasis;
+  /** Present when a source-native candidate was reconciled before publication. */
+  readonly integrationBasis?: SourceBasis;
   readonly statementResults: readonly StatementResult[];
   readonly generatedKeys?: readonly GeneratedLogicalKey[];
   readonly returning?: readonly ReturningResult[];

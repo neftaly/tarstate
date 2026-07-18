@@ -45,6 +45,7 @@ type TestPlan = Omit<PlanResult<Command>, 'handledEdits'> & Pick<Partial<PlanRes
 
 const binding = (id: string, plan: TestPlan, declared: readonly string[] = ['a', 'b']): StorageBinding<Storage, Command> => ({
   id,
+  writeCapabilities: new Map(),
   declaredReadFootprint: declared,
   declaredWriteFootprint: declared,
   project: () => ({ rows: [], completeness: 'exact', issues: [] }),

@@ -211,7 +211,7 @@ describe('production JSON-tree storage mappings', () => {
           collection: { kind: 'object-map', path: ['files'], absent: 'empty' },
           keys: { id: { kind: 'map-key', onMismatch: 'reject' } },
           fields: {
-            title: { path: ['title'], write: { kind: 'read-only' } },
+            title: { path: ['title'], write: {} },
             binary: { kind: 'absent' }
           }
         }
@@ -272,7 +272,7 @@ describe('production JSON-tree storage mappings', () => {
         keys: { occurrenceId: { kind: 'source-metadata', value: 'collection-element-identity' } },
         fields: {
           order: { kind: 'source-metadata', value: 'collection-position' },
-          name: { path: ['name'], write: { kind: 'read-only' } }
+          name: { path: ['name'], write: {} }
         }
       } }
     };
@@ -312,14 +312,14 @@ describe('production JSON-tree storage mappings', () => {
           collection: { kind: 'object-map', path: ['users'], absent: 'invalid' },
           keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
           fields: {
-            nickname: { path: ['profile', 'nickname'], write: { kind: 'replace', capability: replaceRef } },
-            code: { path: ['code'], write: { kind: 'read-only' } }
+            nickname: { path: ['profile', 'nickname'], write: { replace: replaceRef } },
+            code: { path: ['code'], write: {} }
           }
         },
         'test.note': {
           collection: { kind: 'array', path: ['notes'], absent: 'empty' },
           keys: { id: { kind: 'field', path: ['id'] } },
-          fields: { body: { path: ['body'], write: { kind: 'read-only' } } }
+          fields: { body: { path: ['body'], write: {} } }
         }
       }
     };
@@ -401,7 +401,7 @@ describe('production JSON-tree storage mappings', () => {
           collection: { kind: 'singleton', path: [], absent: 'invalid' },
           keys: { id: { kind: 'literal', value: 'settings' } },
           fields: {
-            title: { path: ['title'], write: { kind: 'replace', capability: replaceRef } }
+            title: { path: ['title'], write: { replace: replaceRef } }
           }
         }
       }
@@ -497,8 +497,8 @@ describe('production JSON-tree storage mappings', () => {
         collection: { kind: 'singleton', path: [], absent: 'invalid' },
         keys: { id: { kind: 'literal', value: 'file' } },
         fields: {
-          name: { path: ['name'], write: { kind: 'read-only' } },
-          content: { path: ['content'], write: { kind: 'read-only' } }
+          name: { path: ['name'], write: {} },
+          content: { path: ['content'], write: {} }
         }
       } }
     }, schemaRef, schema.value);
@@ -534,7 +534,7 @@ describe('production JSON-tree storage mappings', () => {
         'test.note': {
           collection: { kind: 'array', path: ['notes'], absent: 'empty' },
           keys: { id: { kind: 'field', path: ['id'] } },
-          fields: { body: { path: ['body'], write: { kind: 'read-only' } } }
+          fields: { body: { path: ['body'], write: {} } }
         }
       }
     };
@@ -564,13 +564,13 @@ describe('production JSON-tree storage mappings', () => {
     const valid = {
       schema: schemaRef,
       model: 'json-tree-v1',
-      relations: { 'test.note': { collection: { kind: 'array', path: ['notes'], absent: 'empty' }, keys: { id: { kind: 'field', path: ['id'] } }, fields: { body: { path: ['body'], write: { kind: 'read-only' } } } } }
+      relations: { 'test.note': { collection: { kind: 'array', path: ['notes'], absent: 'empty' }, keys: { id: { kind: 'field', path: ['id'] } }, fields: { body: { path: ['body'], write: {} } } } }
     };
     expect(compileStorageMapping({ ...valid, authority: true }, schemaRef, schema)).toMatchObject({ success: false });
     expect(compileStorageMapping({ ...valid, schema: { ...schemaRef, contentHash: 'not-a-hash' } }, schemaRef, schema)).toMatchObject({ success: false });
     expect(compileStorageMapping({ ...valid, relations: { 'test.note': { ...valid.relations['test.note'], collection: { ...valid.relations['test.note'].collection, extra: true } } } }, schemaRef, schema)).toMatchObject({ success: false });
     expect(compileStorageMapping({ ...valid, relations: { 'test.note': { ...valid.relations['test.note'], keys: { id: { kind: 'field', path: ['id'], onMismatch: 'reject' } } } } }, schemaRef, schema)).toMatchObject({ success: false });
-    expect(compileStorageMapping({ ...valid, relations: { 'test.note': { ...valid.relations['test.note'], fields: { body: { path: [''], write: { kind: 'read-only' } } } } } }, schemaRef, schema)).toMatchObject({ success: false });
+    expect(compileStorageMapping({ ...valid, relations: { 'test.note': { ...valid.relations['test.note'], fields: { body: { path: [''], write: {} } } } } }, schemaRef, schema)).toMatchObject({ success: false });
 
     const compiled = compileStorageMapping(valid, schemaRef, schema);
     if (!compiled.success) throw new Error('mapping failed');

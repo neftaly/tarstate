@@ -90,8 +90,8 @@ const fixture = async (doc: TaskDoc = {
         collection: { kind: 'object-map', path: ['tasks'], absent },
         keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
         fields: {
-          title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
-          priority: { path: ['nested', 'priority'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+          title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } },
+          priority: { path: ['nested', 'priority'], write: { replace: builtInCapabilityRefs.fieldReplace } },
           inactiveContent: { kind: 'absent' }
         }
       }
@@ -140,10 +140,10 @@ const singletonFixture = async (mimeTypeAbsent = false) => {
         collection: { kind: 'singleton', path: [], absent: 'invalid' },
         keys: { id: { kind: 'literal', value: 'content' } },
         fields: {
-          content: { path: ['content'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+          content: { path: ['content'], write: { replace: builtInCapabilityRefs.fieldReplace } },
           mimeType: mimeTypeAbsent
             ? { kind: 'absent' }
-            : { path: ['mimeType'], write: { kind: 'read-only' } }
+            : { path: ['mimeType'], write: {} }
         }
       }
     }
@@ -189,7 +189,7 @@ const immutableTextSingletonFixture = async () => {
         collection: { kind: 'singleton', path: [], absent: 'invalid' },
         keys: { id: { kind: 'literal', value: 'content' } },
         fields: {
-          content: { path: ['content'], write: { kind: 'read-only' } }
+          content: { path: ['content'], write: {} }
         }
       }
     }
@@ -245,7 +245,7 @@ const arrayFixture = async (identity: 'source' | 'field') => {
           : { kind: 'field', path: ['id'] }
       },
       fields: {
-        name: { path: ['name'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } },
+        name: { path: ['name'], write: { replace: builtInCapabilityRefs.fieldReplace } },
         order: identity === 'source'
           ? { kind: 'source-metadata', value: 'collection-position' }
           : { kind: 'absent' }

@@ -50,8 +50,8 @@ describe('attachment transaction service', () => {
           collection: { kind: 'object-map', path: ['items'], absent: 'empty' },
           keys: { id: { kind: 'field', path: ['id'] } },
           fields: {
-            title: { path: ['title'], write: { kind: 'replace', capability: replace } },
-            count: { path: ['count'], write: { kind: 'read-only' } }
+            title: { path: ['title'], write: { replace } },
+            count: { path: ['count'], write: {} }
           }
         } }
       }
@@ -74,9 +74,7 @@ describe('attachment transaction service', () => {
     expect(preparation.relations.get('test.item')).toEqual({
       relationId: 'test.item',
       keyFields: ['id'],
-      replaceableFields: ['title'],
-      sourceGeneratedFields: [],
-      supportsGeneratedKeyInsert: false
+      sourceGeneratedFields: []
     });
     const source = new LogicalMemoryAtomicSource({
       sourceId: 'source:attachment-transactions',
@@ -84,7 +82,7 @@ describe('attachment transaction service', () => {
       operationEpoch: 'epoch:attachment-transactions',
       state: { 'test.item': [{ id: 'one', title: 'Old', count: 1 }] }
     });
-    const binding = new LogicalMemoryStorageBinding({ relations: [{ relationId: 'test.item', keyFields: ['id'] }] });
+    const binding = new LogicalMemoryStorageBinding({ relations: [{ relationId: 'test.item', keyFields: ['id'], replaceFields: ['title'] }] });
     const service = await createAttachmentTransactionService({
       attachmentId: 'attachment:transactions',
       attachmentIncarnation: 'attachment-incarnation:transactions',
@@ -95,14 +93,15 @@ describe('attachment transaction service', () => {
       registry,
       durability: 'memory'
     });
-    expect(service.writeCapabilities(items)).toEqual({
+    expect(service.capabilities(items)).toEqual({
       relationId: 'test.item',
       keyFields: ['id'],
-      replaceableFields: ['title'],
       sourceGeneratedFields: [],
-      supportsGeneratedKeyInsert: false
+      insert: { concurrency: 'replay-transform' },
+      delete: { concurrency: 'replay-transform' },
+      fields: { title: { replace: { concurrency: 'replay-transform' } } }
     });
-    expect(() => service.writeCapabilities({
+    expect(() => service.capabilities({
       ...items,
       schemaView: { ...items.schemaView, id: 'urn:test:foreign-schema' }
     })).toThrow('different schema view');

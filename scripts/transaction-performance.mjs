@@ -28,7 +28,7 @@ const mapping = await sealStorageMapping({ id: 'urn:tarstate:transaction-benchma
     collection: { kind: 'object-map', path: ['tasks'], absent: 'creatable' },
     keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
     fields: {
-      title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+      title: { path: ['title'], write: { replace: builtInCapabilityRefs.fieldReplace } }
     }
   } }
 } });

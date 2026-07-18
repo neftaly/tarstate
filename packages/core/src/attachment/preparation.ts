@@ -72,9 +72,7 @@ export type AttachmentConstraintQueryFactory<State> = (input: {
 export type PreparedAttachmentRelation = {
   readonly relationId: string;
   readonly keyFields: readonly string[];
-  readonly replaceableFields: readonly string[];
   readonly sourceGeneratedFields: readonly string[];
-  readonly supportsGeneratedKeyInsert: boolean;
 };
 
 export type ReadyAttachmentPreparation<Storage = unknown, Projection = unknown, ConstraintState = Storage> = {
@@ -399,11 +397,10 @@ const mappingCapabilities = (mapping: CompiledStorageMapping): readonly Capabili
   const capabilities = new Map<string, CapabilityRef>();
   for (const { mapping: relation } of mapping.relations.values()) {
     for (const field of Object.values(relation.fields)) {
-      if (field.kind === 'absent'
-        || field.kind === 'source-metadata'
-        || field.write.kind !== 'replace') continue;
-      const ref = field.write.capability;
-      capabilities.set(stringTupleKey(ref.id, ref.version, ref.contractHash), ref);
+      if (field.kind === 'absent' || field.kind === 'source-metadata') continue;
+      for (const ref of Object.values(field.write)) {
+        capabilities.set(stringTupleKey(ref.id, ref.version, ref.contractHash), ref);
+      }
     }
   }
   return [...capabilities.values()];
@@ -415,13 +412,6 @@ const preparedAttachmentRelations = (
 ): ReadonlyMap<string, PreparedAttachmentRelation> => new Map(
   [...schema.relationsById].map(([relationId, relation]) => {
     const mapped = mapping?.relations.get(relationId);
-    const replaceableFields = mapped === undefined
-      ? Object.keys(relation.declaration.fields).filter((field) => !relation.declaration.key.includes(field))
-      : Object.entries(mapped.mapping.fields)
-        .filter(([, field]) => field.kind !== 'absent'
-          && field.kind !== 'source-metadata'
-          && field.write.kind === 'replace')
-        .map(([field]) => field);
     const sourceGeneratedFields = mapped === undefined
       ? []
       : [...new Set([
@@ -430,17 +420,10 @@ const preparedAttachmentRelations = (
         ]
         .filter(([, field]) => field.kind === 'source-metadata')
         .map(([field]) => field))];
-    const supportsGeneratedKeyInsert = mapped?.mapping.collection.kind === 'array'
-      && Object.values(mapped.mapping.keys).length > 0
-      && Object.values(mapped.mapping.keys).every((field) => field.kind === 'source-metadata'
-        && field.value === 'collection-element-identity')
-      && relation.declaration.key.every((field) => !Object.hasOwn(mapped.mapping.fields, field));
     return [relationId, Object.freeze({
       relationId,
       keyFields: Object.freeze([...relation.declaration.key]),
-      replaceableFields: Object.freeze(replaceableFields.sort(comparePortableStrings)),
-      sourceGeneratedFields: Object.freeze(sourceGeneratedFields.sort(comparePortableStrings)),
-      supportsGeneratedKeyInsert
+      sourceGeneratedFields: Object.freeze(sourceGeneratedFields.sort(comparePortableStrings))
     })] as const;
   })
 );
@@ -481,18 +464,12 @@ const ownPreparedAttachmentRelations = (input: unknown): ReadonlyMap<string, Pre
       throw new TypeError('Ready attachment preparation relation identity is invalid');
     }
     const keyFields = ownStringArray(relation.keyFields, 'Ready attachment preparation relation key fields');
-    const replaceableFields = ownStringArray(relation.replaceableFields, 'Ready attachment preparation relation replaceable fields');
     const sourceGeneratedFields = ownStringArray(relation.sourceGeneratedFields, 'Ready attachment preparation relation source-generated fields');
-    if (typeof relation.supportsGeneratedKeyInsert !== 'boolean') {
-      throw new TypeError('Ready attachment preparation relation generated-key insert support must be boolean');
-    }
     if (keyFields.length === 0) throw new TypeError('Ready attachment preparation relation keys must not be empty');
     entries.push([relationId, Object.freeze({
       relationId,
       keyFields,
-      replaceableFields,
-      sourceGeneratedFields,
-      supportsGeneratedKeyInsert: relation.supportsGeneratedKeyInsert
+      sourceGeneratedFields
     })]);
   }
   return ownedReadonlyMap(entries);

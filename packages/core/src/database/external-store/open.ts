@@ -16,7 +16,7 @@ import {
 } from '../../builtins.js';
 import { acquireExternalStoreRuntime, type AtomicExternalStore } from '../../external-store.js';
 import { HostRuntimeRegistry } from '../../host.js';
-import { createIssue, type ParseResult } from '../../issues.js';
+import { createIssue, TarstateParseError, type ParseResult } from '../../issues.js';
 import type { WritableLogicalState } from '../../logical-edit.js';
 import type { CompiledStorageMapping } from '../../mapping.js';
 import { CapabilityRegistry } from '../../registry.js';
@@ -142,6 +142,7 @@ export const openExternalStoreDatabase = async <State extends object>(
     };
   } catch (error) {
     source.close();
+    if (error instanceof TarstateParseError) return { success: false, issues: error.issues };
     throw error;
   }
 };

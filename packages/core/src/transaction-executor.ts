@@ -21,6 +21,7 @@ import {
   requireTransactionExpression
 } from './internal-transaction-expression.js';
 import { samePortableJson } from './internal-json-equality.js';
+import { isValidUtf16TextSplice } from './internal-text-splice.js';
 import type { SourceBasis } from './source-state.js';
 import { comparePortableStrings } from './portable-order.js';
 import type { QueryNode } from './query/model.js';
@@ -235,10 +236,24 @@ type CapturedExecutionSnapshot<Storage, Command> =
 
 /** The source callback is an effect boundary; evaluation only receives captured state. */
 const captureExecutionSnapshot = <Storage, Command>(
-  context: PreparedWritableExecutionContext<Storage, Command>
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  basis?: SourceBasis
 ): CapturedExecutionSnapshot<Storage, Command> => {
   try {
-    return { snapshot: context.source.snapshot() };
+    if (basis === undefined) return { snapshot: context.source.snapshot() };
+    if (context.source.snapshotAt !== undefined) return { snapshot: context.source.snapshotAt(basis) };
+    const snapshot = context.source.snapshot();
+    if (samePortableJson(snapshot.basis, basis)) return { snapshot };
+    return {
+      issue: createIssue({
+        code: 'transaction.expected_basis_stale',
+        phase: 'plan',
+        severity: 'error',
+        retry: 'after_refresh',
+        sourceId: context.source.sourceId,
+        details: { reason: 'observed_basis_unavailable', observedBasis: basis, actualBasis: snapshot.basis }
+      })
+    };
   } catch (error) {
     return {
       issue: createIssue({
@@ -329,6 +344,21 @@ const reconcileAndCommitPreparedExecution = async <Storage, Command>(
       } };
     }
     if (isTransientStaleBasis(outcome) && prepared.attempt.expectedBasis === undefined) {
+      if (capturedBasisMergeable(prepared.transaction)
+        && context.source.reconcile !== undefined
+        && context.source.commitReconciled !== undefined) {
+        return reconcileCapturedBasisExecution(context, prepared, evaluated);
+      }
+      // Numeric text coordinates belong to the captured projection. A mixed or
+      // conditional transaction is exact, so replaying its author against a
+      // newer snapshot would silently reinterpret those coordinates.
+      if (containsCapturedBasisEdit(prepared.transaction)) {
+        return { prepared, receipt: rejectedReceipt(context, prepared, {
+          ...evaluated,
+          issues: [...evaluated.issues, ...outcome.issues],
+          blockingIssues: outcome.issues
+        }) };
+      }
       if (reprepare !== undefined) {
         const refreshed = captureExecutionSnapshot(context);
         if ('issue' in refreshed) return { prepared, receipt: rejectedBeforeSnapshotReceipt(context, prepared, refreshed.issue) };
@@ -411,10 +441,242 @@ const isTransientStaleBasis = (outcome: { readonly outcome: string; readonly iss
   && outcome.issues.length > 0
   && outcome.issues.every(({ code }) => code === 'transaction.expected_basis_stale');
 
+/** Conservative private policy: mixed or conditional work remains exact/replayable. */
+const capturedBasisMergeable = (transaction: Transaction): boolean =>
+  transaction.body.guards.length === 0
+  && transaction.body.statements.length > 0
+  && transaction.body.statements.every((statement) => statement.kind === 'statement.keyed-delta'
+    && statement.changes.length > 0
+    && statement.changes.every((change) => change.kind === 'delta.update'
+      && Object.values(change.key).every(({ kind }) => kind === 'literal')
+      && Object.values(change.edits).length > 0
+      && Object.values(change.edits).every(({ kind }) => kind === 'edit.text-splice')));
+
+const containsCapturedBasisEdit = (transaction: Transaction): boolean =>
+  transaction.body.statements.some((statement) => statement.kind === 'statement.keyed-delta'
+    && statement.changes.some((change) => change.kind === 'delta.update'
+      && Object.values(change.edits).some(({ kind }) => kind === 'edit.text-splice')));
+
+const reconcileCapturedBasisExecution = async <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  prepared: PreparedExecution,
+  evaluated: EvaluatedExecution<Storage, Command>
+): Promise<ReconciledPreparedCommit> => {
+  const reconcile = context.source.reconcile;
+  const commitReconciled = context.source.commitReconciled;
+  if (reconcile === undefined || commitReconciled === undefined) {
+    throw new TypeError('Captured-basis reconciliation requires source support');
+  }
+  let priorCandidate: Storage | undefined;
+  for (let attemptIndex = 0; attemptIndex < maxReconciliationAttempts; attemptIndex += 1) {
+    const captured = captureExecutionSnapshot(context);
+    if ('issue' in captured) return { prepared, receipt: rejectedBeforeSnapshotReceipt(context, prepared, captured.issue) };
+    const integration = captured.snapshot;
+    let candidate: ReturnType<typeof reconcile>;
+    try {
+      candidate = reconcile(integration, evaluated.beforeBasis, evaluated.commands, priorCandidate);
+    } catch (error) {
+      return { prepared, receipt: reconciledRejectedReceipt(context, prepared, evaluated, integration.basis, [
+        transactionIssue('binding.stage_failed', prepared.attempt, { timing: 'reconciliation', error: errorName(error) })
+      ]) };
+    }
+    if (candidate.issues.some(isError) || integration.storage === undefined) {
+      return { prepared, receipt: reconciledRejectedReceipt(context, prepared, evaluated, integration.basis, candidate.issues) };
+    }
+    priorCandidate = candidate.storage;
+    const candidateBasis = deriveStagedBasis(context, integration, { ...integration, storage: candidate.storage });
+    if ('issue' in candidateBasis) {
+      return { prepared, receipt: reconciledRejectedReceipt(context, prepared, evaluated, integration.basis, [candidateBasis.issue]) };
+    }
+    const candidateSnapshot = { ...integration, storage: candidate.storage, basis: candidateBasis.basis };
+    const validation = validateReconciledCandidate(
+      context,
+      prepared,
+      integration,
+      candidateSnapshot
+    );
+    if (validation.blockingIssues.length > 0) {
+      return { prepared, receipt: reconciledRejectedReceipt(
+        context,
+        prepared,
+        evaluated,
+        integration.basis,
+        validation.issues
+      ) };
+    }
+    let outcome: Awaited<ReturnType<AtomicSource<Storage, Command>['commit']>>;
+    try {
+      outcome = await commitReconciled({
+        operationEpoch: prepared.attempt.operationEpoch,
+        operationId: prepared.attempt.operationId,
+        intentHash: prepared.intentHash,
+        expectedBasis: integration.basis,
+        candidate: candidate.storage
+      });
+    } catch (error) {
+      return { prepared, receipt: {
+        ...receiptEvidence(context, prepared, evaluated.statementResults, [
+          ...validation.issues,
+          transactionIssue('transaction.outcome_unavailable', prepared.attempt, { error: errorName(error) }, 'query_outcome')
+        ]),
+        evaluationBasis: evaluated.beforeBasis,
+        integrationBasis: integration.basis,
+        outcome: 'unknown',
+        beforeBasis: integration.basis,
+        durability: 'unknown'
+      } };
+    }
+    if (isTransientStaleBasis(outcome)) continue;
+    const issues = [...validation.issues, ...outcome.issues];
+    if (outcome.outcome === 'rejected') {
+      return { prepared, receipt: reconciledRejectedReceipt(context, prepared, evaluated, integration.basis, issues) };
+    }
+    if (outcome.outcome === 'unknown' || outcome.beforeBasis === undefined || outcome.afterBasis === undefined) {
+      return { prepared, receipt: {
+        ...receiptEvidence(context, prepared, evaluated.statementResults, issues),
+        evaluationBasis: evaluated.beforeBasis,
+        integrationBasis: integration.basis,
+        outcome: 'unknown',
+        ...(outcome.beforeBasis === undefined ? {} : { beforeBasis: outcome.beforeBasis }),
+        durability: 'unknown'
+      } };
+    }
+    if (!samePortableJson(outcome.afterBasis, candidateBasis.basis)) {
+      return { prepared, receipt: {
+        ...receiptEvidence(context, prepared, evaluated.statementResults, [
+          ...issues,
+          transactionIssue('transaction.outcome_unavailable', prepared.attempt, {
+            reason: 'published_candidate_basis_mismatch',
+            validated: candidateBasis.basis,
+            published: outcome.afterBasis
+          }, 'query_outcome')
+        ]),
+        evaluationBasis: evaluated.beforeBasis,
+        integrationBasis: integration.basis,
+        outcome: 'unknown',
+        beforeBasis: outcome.beforeBasis,
+        durability: 'unknown'
+      } };
+    }
+    const returning = validation.returning?.map((result): ReturningResult => ({
+      ...result,
+      basis: outcome.afterBasis as SourceBasis
+    }));
+    return { prepared, receipt: {
+      ...receiptEvidence(context, prepared, evaluated.statementResults, issues, returning, outcome.generatedKeys),
+      evaluationBasis: evaluated.beforeBasis,
+      integrationBasis: outcome.beforeBasis,
+      outcome: 'committed',
+      beforeBasis: outcome.beforeBasis,
+      afterBasis: outcome.afterBasis,
+      durability: context.durability
+    } };
+  }
+  const latest = captureExecutionSnapshot(context);
+  const integrationBasis = 'snapshot' in latest ? latest.snapshot.basis : evaluated.beforeBasis;
+  return { prepared, receipt: reconciledRejectedReceipt(context, prepared, evaluated, integrationBasis, [
+    transactionIssue('transaction.expected_basis_stale', prepared.attempt, { reason: 'reconciliation_exhausted' })
+  ]) };
+};
+
+type ReconciledCandidateValidation = {
+  readonly issues: readonly Issue[];
+  readonly blockingIssues: readonly Issue[];
+  readonly returning?: readonly Omit<ReturningResult, 'basis'>[];
+};
+
+const validateReconciledCandidate = <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  prepared: PreparedExecution,
+  integration: ReturnType<AtomicSource<Storage, Command>['snapshot']>,
+  candidate: ReturnType<AtomicSource<Storage, Command>['snapshot']>
+): ReconciledCandidateValidation => {
+  const beforeProjection = projectLogicalState(context.bindings, integration);
+  const afterProjection = projectLogicalState(context.bindings, candidate);
+  const issues: Issue[] = [...beforeProjection.issues, ...afterProjection.issues];
+  if (!capturedTargetsRemain(prepared.transaction, beforeProjection, context.relationKeys)) {
+    issues.push(transactionIssue('transaction.expected_basis_stale', prepared.attempt, {
+      reason: 'captured_text_target_unavailable'
+    }, 'after_refresh'));
+  }
+  let blockingIssues = issues.filter(isError);
+  const before = logicalProjectionState(beforeProjection);
+  const after = logicalProjectionState(afterProjection);
+  if (blockingIssues.length === 0 && context.constraints !== undefined && context.constraints.length > 0) {
+    const checked = checkFinalConstraints({
+      constraints: context.constraints,
+      before,
+      after,
+      beforeBasis: integration.basis,
+      afterBasis: candidate.basis,
+      touchedRelations: new Set(prepared.transaction.body.statements.flatMap((statement) => {
+        const relation = statementRelation(statement);
+        return relation === undefined ? [] : [relation.relationId];
+      }))
+    });
+    issues.push(...checked.blockingIssues, ...checked.auditIssues);
+    blockingIssues = [...checked.blockingIssues];
+  }
+  const returning = blockingIssues.length === 0
+    ? evaluateReturning(context, prepared, after, candidate.basis)
+    : undefined;
+  if (returning !== undefined) issues.push(...returning.flatMap(({ issues: resultIssues }) => resultIssues));
+  return { issues, blockingIssues, ...(returning === undefined ? {} : { returning }) };
+};
+
+const capturedTargetsRemain = (
+  transaction: Transaction,
+  projection: LogicalProjection,
+  relationKeys: ReadonlyMap<string, readonly string[]>
+): boolean => {
+  const keyCountsByRelation = new Map<string, ReadonlyMap<string, number>>();
+  for (const statement of transaction.body.statements) {
+    if (statement.kind !== 'statement.keyed-delta') return false;
+    const relationId = statement.relation.relationId;
+    const keyFields = relationKeys.get(relationId);
+    if (keyFields === undefined) return false;
+    let keyCounts = keyCountsByRelation.get(relationId);
+    if (keyCounts === undefined) {
+      const counts = new Map<string, number>();
+      for (const row of projection.rowsByRelation.get(relationId) ?? []) {
+        const fingerprint = canonicalizeJson(row.key);
+        counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
+      }
+      keyCounts = counts;
+      keyCountsByRelation.set(relationId, keyCounts);
+    }
+    for (const change of statement.changes) {
+      if (change.kind !== 'delta.update') return false;
+      const key = keyFields.map((field) => {
+        const expression = change.key[field];
+        return expression?.kind === 'literal' ? expression.value : undefined;
+      });
+      if (key.some((value) => value === undefined)) return false;
+      if (keyCounts.get(canonicalizeJson(key as JsonValue)) !== 1) return false;
+    }
+  }
+  return true;
+};
+
+const reconciledRejectedReceipt = <Storage, Command>(
+  context: PreparedWritableExecutionContext<Storage, Command>,
+  prepared: PreparedExecution,
+  evaluated: EvaluatedExecution<Storage, Command>,
+  integrationBasis: SourceBasis,
+  issues: readonly Issue[]
+): CommitReceipt => ({
+  ...receiptEvidence(context, prepared, evaluated.statementResults, [...evaluated.issues, ...issues]),
+  evaluationBasis: evaluated.beforeBasis,
+  integrationBasis,
+  outcome: 'rejected',
+  beforeBasis: integrationBasis
+});
+
 export type ReplayablePreparedTransactionInput = {
   readonly operationId: string;
   readonly intentHash: ContentHash;
   readonly signal?: AbortSignal;
+  readonly observedBasis?: SourceBasis;
   readonly author: (input: {
     readonly basis: SourceBasis;
     readonly state: WritableLogicalState;
@@ -441,7 +703,7 @@ export const executeReplayablePreparedTransaction = async <Storage, Command>(
   } catch { /* Reservation below reports ledger availability with receipt evidence. */ }
   const prepareFromSnapshot: ReplayablePreparation<Storage, Command> = (snapshot) =>
     prepareReplayableExecution(context, input, snapshot);
-  const captured = captureExecutionSnapshot(context);
+  const captured = captureExecutionSnapshot(context, input.observedBasis);
   if ('issue' in captured) throw new Error('Cannot author a transaction without a source snapshot');
   const initial = await prepareFromSnapshot(captured.snapshot);
   if ('receipt' in initial) return initial.receipt;
@@ -461,7 +723,7 @@ export const simulateReplayablePreparedTransaction = async <Storage, Command>(
   input: ReplayablePreparedTransactionInput
 ): Promise<SimulationReceipt> => {
   assertPreparedWritableContext(context);
-  const captured = captureExecutionSnapshot(context);
+  const captured = captureExecutionSnapshot(context, input.observedBasis);
   if ('issue' in captured) throw new Error('Cannot simulate a transaction without a source snapshot');
   const prepared = await prepareReplayableExecution(context, input, captured.snapshot);
   if ('receipt' in prepared) return commitRejectionAsSimulation(prepared.receipt);
@@ -487,6 +749,19 @@ const prepareReplayableExecution = async <Storage, Command>(
     transaction: authored.transaction,
     ...(input.signal === undefined ? {} : { signal: input.signal })
   });
+  if (containsCapturedBasisEdit(authored.transaction) && input.observedBasis === undefined) {
+    const issue = transactionIssue('transaction.expected_basis_stale', attempt, {
+      reason: 'observed_basis_required_for_position_sensitive_intent'
+    }, 'after_input');
+    return {
+      prepared: { attempt, transaction: authored.transaction, intentHash: input.intentHash },
+      receipt: {
+        ...rawReceiptEvidence(context, attempt, authored.transaction.contentHash, input.intentHash, [], [issue]),
+        outcome: 'rejected',
+        beforeBasis: snapshot.basis
+      }
+    };
+  }
   if (authored.issues.length > 0) {
     const prepared = {
       attempt,
@@ -1056,7 +1331,15 @@ const evaluateRowEdits = (
     if (edit.kind === 'edit.text-splice') {
       const insert = requireTransactionExpression(edit.insert, scope, parameters);
       if (!insert.success) return insert;
-      if (typeof insert.value !== 'string' || typeof row.fields[field] !== 'string') return expressionFailure('transaction.edit_type_mismatch', { field, edit: edit.kind });
+      if (typeof insert.value !== 'string'
+        || typeof row.fields[field] !== 'string'
+        || !isValidUtf16TextSplice(row.fields[field], {
+          index: index.value,
+          deleteCount: deleteCount.value,
+          insert: insert.value
+        })) {
+        return expressionFailure('transaction.edit_type_mismatch', { field, edit: edit.kind, reason: 'invalid_utf16_range_or_insert' });
+      }
       logicalEdits.push({ kind: 'text-splice', relationId: row.relationId, key: row.key, locator: row.locator, field, index: index.value, deleteCount: deleteCount.value, value: insert.value });
       changed ||= deleteCount.value !== 0 || insert.value.length !== 0;
       outcomes.push({ edit: 'text', mechanism: builtInCapabilityRefs.textSplice, preservationLosses: [] });

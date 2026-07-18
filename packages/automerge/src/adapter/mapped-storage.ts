@@ -6,6 +6,7 @@ import {
   type JsonValue
 } from '@tarstate/core';
 import type { CapabilityRegistry } from '@tarstate/core/capabilities';
+import { isValidUtf16TextSplice } from '@tarstate/core/transactions';
 import {
   parseRelationCandidate,
   parseScalarValueForField,
@@ -14,6 +15,7 @@ import {
   type SourceMetadataResolver
 } from '@tarstate/core/schema';
 import {
+  type BindingRelationWriteCapabilities,
   type LogicalEdit,
   type PlanResult,
   type ProjectionResult,
@@ -74,6 +76,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   readonly relationIds: readonly string[];
   readonly declaredReadFootprint: AutomergePathFootprint;
   readonly declaredWriteFootprint: AutomergePathFootprint;
+  readonly writeCapabilities: ReadonlyMap<string, BindingRelationWriteCapabilities>;
   readonly #mapping: CompiledStorageMapping;
   readonly #registry: CapabilityRegistry | undefined;
   readonly #relations: ReadonlyMap<string, MappedRelation>;
@@ -116,6 +119,7 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
     this.#relationReadEntries = relationReadEntries;
     this.declaredReadFootprint = automergePathFootprint([...this.#relationReadEntries.values()].flat());
     this.declaredWriteFootprint = automergePathFootprint([...relations.values()].flatMap(({ mapping }) => mappedWriteEntries(mapping)));
+    this.writeCapabilities = automergeWriteCapabilities(relations, this.#registry);
   }
 
   project = (
@@ -344,6 +348,61 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         else intents.push(intentAt(row.storagePath, planned.command));
         continue;
       }
+      if (edit.kind === 'text-splice') {
+        const fieldMapping = compiled.mapping.fields[edit.field];
+        if (fieldMapping === undefined
+          || fieldMapping.kind === 'absent'
+          || fieldMapping.kind === 'source-metadata'
+          || fieldMapping.write.textSplice === undefined) {
+          issues.push(bindingIssue('mapping.field_read_only', snapshot.sourceId, edit.relationId, row.storagePath, {
+            field: edit.field,
+            operation: 'text-splice'
+          }));
+          continue;
+        }
+        const textCapability = fieldMapping.write.textSplice;
+        if (this.writeCapabilities.get(edit.relationId)?.fields[edit.field]?.textSplice === undefined) {
+          issues.push(createIssue({
+            code: 'mapping.capability_unavailable',
+            sourceId: snapshot.sourceId,
+            relationId: edit.relationId,
+            requiredCapabilities: [textCapability],
+            retry: 'after_capability',
+            details: { field: edit.field, operation: 'text-splice' }
+          }));
+          continue;
+        }
+        const path = [...row.storagePath, ...fieldMapping.path] as AutomergePath;
+        const current = valueAtAutomergePath(snapshot.storage, path);
+        if (typeof current !== 'string') {
+          issues.push(bindingIssue('mapping.field_type_invalid', snapshot.sourceId, edit.relationId, path, {
+            field: edit.field,
+            expected: 'mutable-string'
+          }));
+          continue;
+        }
+        if (!isValidUtf16TextSplice(current, {
+          index: edit.index,
+          deleteCount: edit.deleteCount,
+          insert: edit.value
+        })) {
+          issues.push(bindingIssue('transaction.edit_type_mismatch', snapshot.sourceId, edit.relationId, path, {
+            field: edit.field,
+            reason: 'text_splice_range'
+          }));
+          continue;
+        }
+        intents.push({
+          footprint: automergePathFootprint([{ scope: 'exact', path }]),
+          command: {
+            description: `splice mapped text ${edit.field}`,
+            apply: (draft) => {
+              Automerge.splice(draft as Automerge.Doc<T>, [...path], edit.index, edit.deleteCount, edit.value);
+            }
+          }
+        });
+        continue;
+      }
       if (edit.kind !== 'replace-fields' && edit.kind !== 'replace-row') {
         issues.push(bindingIssue('transaction.capability_unavailable', snapshot.sourceId, edit.relationId, row.storagePath, { edit: edit.kind }));
         continue;
@@ -383,12 +442,13 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
         if (fieldMapping === undefined || declaration === undefined
           || fieldMapping.kind === 'absent'
           || fieldMapping.kind === 'source-metadata'
-          || fieldMapping.write.kind !== 'replace') {
+          || fieldMapping.write.replace === undefined) {
           issues.push(bindingIssue('mapping.field_read_only', snapshot.sourceId, edit.relationId, row.storagePath, { field }));
           continue;
         }
-        if (this.#registry !== undefined && !this.#registry.satisfies(fieldMapping.write.capability)) {
-          issues.push(createIssue({ code: 'mapping.capability_unavailable', sourceId: snapshot.sourceId, relationId: edit.relationId, requiredCapabilities: [fieldMapping.write.capability], retry: 'after_capability', details: { field } }));
+        const replaceCapability = fieldMapping.write.replace;
+        if (this.writeCapabilities.get(edit.relationId)?.fields[field]?.replace !== true) {
+          issues.push(createIssue({ code: 'mapping.capability_unavailable', sourceId: snapshot.sourceId, relationId: edit.relationId, requiredCapabilities: [replaceCapability], retry: 'after_capability', details: { field, operation: 'replace' } }));
           continue;
         }
         const path = [...row.storagePath, ...fieldMapping.path] as AutomergePath;
@@ -586,6 +646,61 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   }
 
 }
+
+const automergeWriteCapabilities = (
+  relations: ReadonlyMap<string, MappedRelation>,
+  registry: CapabilityRegistry | undefined
+): ReadonlyMap<string, BindingRelationWriteCapabilities> => new Map(
+  [...relations].map(([relationId, compiled]) => {
+    const fields: Record<string, BindingRelationWriteCapabilities['fields'][string]> = {};
+    for (const [field, fieldMapping] of Object.entries(compiled.mapping.fields)) {
+      const handlers = automergeFieldWriteHandlers(fieldMapping, registry);
+      if (handlers.replace === true || handlers.textSplice !== undefined) fields[field] = handlers;
+    }
+    const collection = compiled.mapping.collection;
+    const mapKeys = Object.values(compiled.mapping.keys).filter(({ kind }) => kind === 'map-key');
+    const supportsInsert = collection.kind === 'array'
+      ? mapKeys.length === 0
+      : collection.kind === 'object-map' && mapKeys.length === 1;
+    const supportsGeneratedKeyInsert = collection.kind === 'array'
+      && Object.values(compiled.mapping.keys).length > 0
+      && Object.values(compiled.mapping.keys).every((field) => field.kind === 'source-metadata'
+        && field.value === 'collection-element-identity');
+    return [relationId, Object.freeze({
+      relationId,
+      ...(supportsInsert ? { insert: true as const } : {}),
+      ...(collection.kind === 'singleton' ? {} : { delete: true as const }),
+      ...(supportsGeneratedKeyInsert ? { generatedKeyInsert: true as const } : {}),
+      fields: Object.freeze(fields)
+    })] as const;
+  })
+);
+
+const noFieldWriteHandlers = Object.freeze({});
+
+/** Advertisement and dispatch consult this one concrete handler matrix. */
+const automergeFieldWriteHandlers = (
+  field: MappedRelation['mapping']['fields'][string] | undefined,
+  registry: CapabilityRegistry | undefined
+): BindingRelationWriteCapabilities['fields'][string] => {
+  if (field === undefined || field.kind === 'absent' || field.kind === 'source-metadata') {
+    return noFieldWriteHandlers;
+  }
+  const supports = (capability: typeof field.write.replace): boolean => capability !== undefined
+    && (registry === undefined || registry.satisfies(capability));
+  const replace = supports(field.write.replace);
+  const textSplice = supports(field.write.textSplice);
+  if (!replace && !textSplice) return noFieldWriteHandlers;
+  return Object.freeze({
+    ...(replace ? { replace: true as const } : {}),
+    ...(textSplice ? {
+      textSplice: Object.freeze({
+        indexUnit: 'utf16-code-unit' as const,
+        reconciliation: 'captured-basis' as const
+      })
+    } : {})
+  });
+};
 
 type GeneratedKeyInsertPlan<T extends object> = {
   readonly snapshot: SourceSnapshot<Automerge.Doc<T>>;

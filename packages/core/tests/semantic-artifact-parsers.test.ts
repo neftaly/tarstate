@@ -102,7 +102,7 @@ const mappingBody = (): StorageMappingBody => ({
     'test.person': {
       collection: { kind: 'object-map', path: ['people'], absent: 'creatable' },
       keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
-      fields: { name: { path: ['name'], write: { kind: 'replace', capability } } }
+      fields: { name: { path: ['name'], write: { replace: capability } } }
     }
   }
 });

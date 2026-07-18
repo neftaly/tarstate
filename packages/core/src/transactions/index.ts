@@ -17,6 +17,7 @@ export type {
 } from '../logical-edit.js';
 export * from '../receipts.js';
 export * from '../transaction.js';
+export { isValidUtf16TextSplice, type TextSpliceRange } from '../internal-text-splice.js';
 export type * from '../database/transaction.js';
 export {
   relationAccess,

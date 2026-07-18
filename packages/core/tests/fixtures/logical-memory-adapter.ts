@@ -186,10 +186,14 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
   readonly relationIds: readonly string[];
   readonly declaredReadFootprint: Footprint;
   readonly declaredWriteFootprint: Footprint;
+  readonly writeCapabilities: StorageBinding<MemoryState, LogicalMemoryCommand>['writeCapabilities'];
   readonly #relations: ReadonlyMap<string, LogicalMemoryRelation>;
   readonly #projections = new WeakMap<object, Map<string, ProjectionResult<WritableLogicalRow>>>();
 
-  constructor(options: { readonly id?: string; readonly relations: readonly LogicalMemoryRelation[] }) {
+  constructor(options: {
+    readonly id?: string;
+    readonly relations: readonly (LogicalMemoryRelation & { readonly replaceFields?: readonly string[] })[];
+  }) {
     this.id = options.id ?? 'logical-memory';
     const relations = options.relations.map((relation) => Object.freeze({ relationId: relation.relationId, keyFields: Object.freeze([...relation.keyFields]) }));
     if (new Set(relations.map(({ relationId }) => relationId)).size !== relations.length) throw new TypeError('Logical memory relation IDs must be unique');
@@ -197,6 +201,12 @@ export class LogicalMemoryStorageBinding implements StorageBinding<MemoryState, 
     this.relationIds = Object.freeze(relations.map(({ relationId }) => relationId));
     this.declaredReadFootprint = Object.freeze(relations.map(({ relationId }) => relationFootprint(relationId)));
     this.declaredWriteFootprint = this.declaredReadFootprint;
+    this.writeCapabilities = new Map(options.relations.map((relation) => [relation.relationId, {
+      relationId: relation.relationId,
+      insert: true,
+      delete: true,
+      fields: Object.fromEntries((relation.replaceFields ?? []).map((field) => [field, { replace: true }]))
+    }]));
   }
 
   project = (snapshot: SourceSnapshot<MemoryState>, requestedRelations?: ReadonlySet<string>): ProjectionResult<WritableLogicalRow> => {

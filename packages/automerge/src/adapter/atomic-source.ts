@@ -105,6 +105,22 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     });
   };
 
+  snapshotAt = (input: import('@tarstate/core/source').SourceBasis): SourceSnapshot<Automerge.Doc<T>> => {
+    if (this.#lifecycle !== 'ready') throw new TypeError('Cannot view a non-ready Automerge source');
+    const basis = parseAutomergeBasis(input);
+    if (basis === undefined) throw new TypeError('Automerge historical view requires an Automerge basis');
+    const view = this.#runtime.view(basis);
+    return Object.freeze({
+      sourceId: this.sourceId,
+      operationEpoch: this.operationEpoch,
+      basis: view.basis,
+      state: 'ready',
+      freshness: this.#freshness,
+      storage: view.storage,
+      issues: this.#lifecycleIssues
+    });
+  };
+
   subscribe = (listener: (change?: { readonly beforeBasis?: import('@tarstate/core/source').SourceBasis; readonly afterBasis: import('@tarstate/core/source').SourceBasis }) => void): (() => void) => {
     if (this.#lifecycle === 'closed') return () => undefined;
     this.#listeners.add(listener);
@@ -152,6 +168,39 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     return coreCommitResult(result);
   };
 
+  commitReconciled = async (
+    input: import('@tarstate/core/source').ReconciledSourceCommitInput<Automerge.Doc<T>>
+  ): Promise<SourceCommitResult> => {
+    if (this.#lifecycle !== 'ready') {
+      return frozenCoreCommitResult({
+        outcome: 'rejected',
+        issues: [sourceStateIssue(this.sourceId, this.#lifecycle)]
+      });
+    }
+    const basis = parseAutomergeBasis(input.expectedBasis);
+    if (basis === undefined) {
+      return frozenCoreCommitResult({
+        outcome: 'rejected',
+        issues: [createIssue({
+          code: 'transaction.expected_basis_stale',
+          phase: 'commit',
+          severity: 'error',
+          retry: 'after_refresh',
+          sourceId: this.sourceId,
+          operationId: input.operationId,
+          details: { reason: 'automerge_basis_required' }
+        })]
+      });
+    }
+    return coreCommitResult(await this.#runtime.commitReconciled({
+      operationEpoch: input.operationEpoch,
+      operationId: input.operationId,
+      intentHash: input.intentHash,
+      expectedBasis: basis,
+      candidate: input.candidate
+    }));
+  };
+
   relateFootprints = relateAutomergeFootprints;
 
   mergeIntents = (plans: readonly PlanResult<AutomergeSourceCommand<T>>[]): IntentMergeResult<AutomergeSourceCommand<T>> => {
@@ -195,6 +244,47 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
       return {
         storage: snapshot.storage,
         issues: [adapterIssue('automerge.command_failed', 'plan', this.sourceId, undefined, undefined, { message: error instanceof Error ? error.message : String(error) })]
+      };
+    }
+  };
+
+  reconcile = (
+    snapshot: SourceSnapshot<Automerge.Doc<T>>,
+    commandBasis: import('@tarstate/core/source').SourceBasis,
+    commands: readonly AutomergeSourceCommand<T>[],
+    priorCandidate?: Automerge.Doc<T>
+  ): { readonly storage: Automerge.Doc<T>; readonly issues: readonly Issue[] } => {
+    if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
+      throw new TypeError('Cannot reconcile a non-ready Automerge snapshot');
+    }
+    const basis = parseAutomergeBasis(commandBasis);
+    if (basis === undefined || !Automerge.hasHeads(snapshot.storage, [...basis.heads])) {
+      return {
+        storage: snapshot.storage,
+        issues: [adapterIssue('transaction.expected_basis_stale', 'plan', this.sourceId, undefined, undefined, {
+          reason: 'captured_basis_not_in_current_history'
+        })]
+      };
+    }
+    if (commands.length === 0) return { storage: snapshot.storage, issues: [] };
+    try {
+      const storage = priorCandidate === undefined
+        ? Automerge.merge(
+            Automerge.clone(snapshot.storage),
+            Automerge.change(
+              Automerge.clone(Automerge.view(snapshot.storage, [...basis.heads])),
+              { message: 'tarstate source commit', time: 0 },
+              (draft) => { applySourceCommands(commands, draft); }
+            )
+          )
+        : Automerge.merge(Automerge.clone(snapshot.storage), priorCandidate);
+      return { storage, issues: [] };
+    } catch (error) {
+      return {
+        storage: snapshot.storage,
+        issues: [adapterIssue('automerge.command_failed', 'plan', this.sourceId, undefined, undefined, {
+          message: error instanceof Error ? error.message : String(error)
+        })]
       };
     }
   };
