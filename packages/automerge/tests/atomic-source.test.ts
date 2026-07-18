@@ -184,6 +184,11 @@ describe('Automerge core source protocol', () => {
     expect(source.snapshot()).toBe(initial);
     source.subscribe(() => {
       states.push(source.snapshot().state);
+      if (source.snapshot().state === 'closed') {
+        runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
+          draft.tasks.afterClose = { title: 'Ignored by the closed facade' };
+        }));
+      }
     });
 
     runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {

@@ -74,6 +74,7 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
       initial
     );
     this.#unsubscribeRuntime = options.runtime.subscribe((change) => {
+      if (this.#closed) return;
       const latest = this.#runtime.snapshot();
       this.#snapshot = readySourceSnapshot(
         this.sourceId,
