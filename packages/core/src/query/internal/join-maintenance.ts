@@ -5,12 +5,10 @@ import {
   equijoinFields,
   indexKey,
   joinLeftRow,
-  OverlayJoinPositions,
-  OverlayRowIndex,
   resultKey,
-  type EquijoinExpressions,
-  type JoinPositionBucket
+  type EquijoinExpressions
 } from './evaluator.js';
+import { OverlayMap } from './overlay-map.js';
 import { withMaintenanceEvent, type MaterializedQueryNode } from './maintenance-model.js';
 import type { Expr, QueryNode } from '../model.js';
 import type { QueryMaintenanceFallbackReason } from '../incremental-model.js';
@@ -24,6 +22,8 @@ const inputRowsUnchanged = (
     && (stableChangedPositions === undefined
       ? previous.every((row, index) => row === next[index])
       : stableChangedPositions.length === 0);
+
+type JoinPositionBucket = number | readonly number[];
 
 export const incrementallyMaterializeJoinWith = (
   node: Extract<QueryNode, { readonly kind: 'join' }>,
@@ -79,7 +79,7 @@ export const incrementallyMaterializeJoinWith = (
       if (segment.length !== previous.join.widths[position]) widthsStable = false;
     }
     if (context.state.unavailable || issues.length > 0) return withMaintenanceEvent(fallback(), { operator: 'join', strategy: 'fallback', affectedUnitCount: affectedPositions.length, reason: 'evaluation_unavailable' });
-    const compactionCount = leftPositionsByKey !== retainedLeftPositions && leftPositionsByKey instanceof OverlayJoinPositions && leftPositionsByKey.compacted ? 1 : 0;
+    const compactionCount = leftPositionsByKey !== retainedLeftPositions && leftPositionsByKey instanceof OverlayMap && leftPositionsByKey.compacted ? 1 : 0;
     if (widthsStable) {
       const output = previous.result.rows.slice();
       const changedOutputPositions: number[] = [];
@@ -183,7 +183,7 @@ export const incrementallyMaterializeJoinWith = (
           outputOffsets: previous.join.outputOffsets,
           widths: previous.join.widths
         }
-      }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
+      }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayMap && rightIndex.compacted ? 1 : 0 });
     }
     const layout = flattenJoinSegments(segments);
     return withMaintenanceEvent({
@@ -199,7 +199,7 @@ export const incrementallyMaterializeJoinWith = (
         outputOffsets: layout.outputOffsets,
         widths: layout.widths
       }
-    }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
+    }, { operator: 'join', strategy: 'selective', affectedUnitCount: affectedPositions.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayMap && rightIndex.compacted ? 1 : 0 });
   }
   const segments: (readonly ScopedRow[])[] = [];
   const leftPositionsByKey = new Map<string, number | number[]>();
@@ -235,7 +235,7 @@ export const incrementallyMaterializeJoinWith = (
       outputOffsets: layout.outputOffsets,
       widths: layout.widths
     }
-  }, { operator: 'join', strategy: 'full', affectedUnitCount: left.result.rows.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayRowIndex && rightIndex.compacted ? 1 : 0 });
+  }, { operator: 'join', strategy: 'full', affectedUnitCount: left.result.rows.length, compactionCount: rightIndex !== previous.join.rightIndex && rightIndex instanceof OverlayMap && rightIndex.compacted ? 1 : 0 });
 };
 
 const changedExpressionKeysAtPositions = (
@@ -304,7 +304,7 @@ const updateIndexedRows = (
     }
     overrides.set(key, bucket.length === 0 ? undefined : bucket);
   }
-  return new OverlayRowIndex(previous, overrides);
+  return new OverlayMap(previous, overrides);
 };
 
 const updateLeftJoinPositions = (
@@ -340,7 +340,7 @@ const updateLeftJoinPositions = (
     bucket.sort((left, right) => left - right);
     overrides.set(key, bucket.length === 0 ? undefined : bucket.length === 1 ? bucket[0] : bucket);
   }
-  return overrides.size === 0 ? previous : new OverlayJoinPositions(previous, overrides);
+  return overrides.size === 0 ? previous : new OverlayMap(previous, overrides);
 };
 
 const changedExpressionKeys = (before: readonly ScopedRow[], after: readonly ScopedRow[], expression: Expr, context: QueryContext): ReadonlySet<string> => {

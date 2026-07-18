@@ -129,6 +129,7 @@ assignArchitectureGroup('query-incremental', [
   'query/internal/maintenance-engine.ts',
   'query/internal/maintenance-model.ts',
   'query/internal/maintenance-transition.ts',
+  'query/internal/overlay-map.ts',
   'query/internal/pool-publication.ts',
   'maintenance.ts',
   'query/incremental.ts',
