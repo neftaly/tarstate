@@ -160,6 +160,7 @@ assignArchitectureGroup('semantic-artifact', [
 ]);
 assignArchitectureGroup('transaction-runtime', [
   'commit-coordinator.ts',
+  'internal-captured-target-validation.ts',
   'internal-coordinator-outcome.ts',
   'lifecycle-governance.ts',
   'transaction-executor.ts'

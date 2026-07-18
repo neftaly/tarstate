@@ -20,6 +20,7 @@ import {
   evaluateTransactionFields,
   requireTransactionExpression
 } from './internal-transaction-expression.js';
+import { capturedTargetsRemain } from './internal-captured-target-validation.js';
 import { samePortableJson } from './internal-json-equality.js';
 import { isValidUtf16TextSplice } from './internal-text-splice.js';
 import type { SourceBasis } from './source-state.js';
@@ -594,7 +595,7 @@ const validateReconciledCandidate = <Storage, Command>(
   const beforeProjection = projectLogicalState(context.bindings, integration);
   const afterProjection = projectLogicalState(context.bindings, candidate);
   const issues: Issue[] = [...beforeProjection.issues, ...afterProjection.issues];
-  if (!capturedTargetsRemain(prepared.transaction, beforeProjection, context.relationKeys)) {
+  if (!capturedTargetsRemain(prepared.transaction.body.statements, beforeProjection.rowsByRelation, context.relationKeys)) {
     issues.push(transactionIssue('transaction.expected_basis_stale', prepared.attempt, {
       reason: 'captured_text_target_unavailable'
     }, 'after_refresh'));
@@ -622,40 +623,6 @@ const validateReconciledCandidate = <Storage, Command>(
     : undefined;
   if (returning !== undefined) issues.push(...returning.flatMap(({ issues: resultIssues }) => resultIssues));
   return { issues, blockingIssues, ...(returning === undefined ? {} : { returning }) };
-};
-
-const capturedTargetsRemain = (
-  transaction: Transaction,
-  projection: LogicalProjection,
-  relationKeys: ReadonlyMap<string, readonly string[]>
-): boolean => {
-  const keyCountsByRelation = new Map<string, ReadonlyMap<string, number>>();
-  for (const statement of transaction.body.statements) {
-    if (statement.kind !== 'statement.keyed-delta') return false;
-    const relationId = statement.relation.relationId;
-    const keyFields = relationKeys.get(relationId);
-    if (keyFields === undefined) return false;
-    let keyCounts = keyCountsByRelation.get(relationId);
-    if (keyCounts === undefined) {
-      const counts = new Map<string, number>();
-      for (const row of projection.rowsByRelation.get(relationId) ?? []) {
-        const fingerprint = canonicalizeJson(row.key);
-        counts.set(fingerprint, (counts.get(fingerprint) ?? 0) + 1);
-      }
-      keyCounts = counts;
-      keyCountsByRelation.set(relationId, keyCounts);
-    }
-    for (const change of statement.changes) {
-      if (change.kind !== 'delta.update') return false;
-      const key = keyFields.map((field) => {
-        const expression = change.key[field];
-        return expression?.kind === 'literal' ? expression.value : undefined;
-      });
-      if (key.some((value) => value === undefined)) return false;
-      if (keyCounts.get(canonicalizeJson(key as JsonValue)) !== 1) return false;
-    }
-  }
-  return true;
 };
 
 const reconciledRejectedReceipt = <Storage, Command>(
