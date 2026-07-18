@@ -3,6 +3,23 @@
 Notable changes to Tarstate are recorded here. Dates use the repository's Git
 history.
 
+## [0.4.10] - 2026-07-18
+
+### Added
+
+- Writable databases now expose prepared relation write capabilities without
+  requiring consumers to inspect storage-mapping artifacts.
+- Adapter implementors can compose source-neutral live database observation,
+  mounting, and cleanup through `@tarstate/core/database/adapter`.
+
+### Changed
+
+- Logical edits that are valid but cannot be represented by the prepared
+  source now resolve as rejected simulation or commit receipts. Programmer
+  misuse and invalid transform ownership remain exceptions.
+- Replayable attachment authoring is isolated as a pure logical-state core,
+  including rejection evidence discovered after multiplayer reconciliation.
+
 ## [0.4.9] - 2026-07-17
 
 ### Added
