@@ -1,16 +1,16 @@
 import type * as Automerge from '@automerge/automerge';
-import type {
-  ReadyAttachmentPreparation
+import {
+  type ReadyAttachmentPreparation
 } from '@tarstate/core/attachment/adapter';
+import { createLiveAttachmentDatabase } from '@tarstate/core/database/adapter';
 import type {
   DatabaseTransactionService,
   LogicalRelationRow
 } from '@tarstate/core/transactions';
-import type { AttachmentLease } from '@tarstate/core/database';
 import type { RelationInput } from '@tarstate/core/query/model';
 import type { WritableLogicalState } from '@tarstate/core/source';
 import type { AutomergeAtomicSource } from '../adapter/atomic-source.js';
-import type { AutomergeDatabase, AutomergeDatabaseSnapshot } from './model.js';
+import type { AutomergeDatabase } from './model.js';
 import {
   databaseSnapshot,
   sameDatabaseSnapshot,
@@ -26,110 +26,18 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
   readonly source: AutomergeAtomicSource<T>;
   readonly projector: AutomergeAttachmentProjector<T>;
 }): AutomergeDatabase => {
-  const listeners = new Set<() => void>();
-  const leases = new Set<AttachmentLease<Automerge.Doc<T>, readonly RelationInput[]>>();
   const logicalRows = new WeakMap<object, readonly LogicalRelationRow[]>();
-  let closed = false;
-  let dirty = false;
-  let snapshot: AutomergeDatabaseSnapshot | undefined;
-  let unsubscribeSource: (() => void) | undefined;
-
-  const notify = (): void => {
-    for (const listener of Array.from(listeners)) {
-      try { listener(); } catch { /* Listener failures cannot block peers or source progress. */ }
-    }
-  };
-  const refresh = (): boolean => {
-    if ((!dirty && snapshot !== undefined) || closed) return false;
-    const next = databaseSnapshot(input.source.snapshot(), input.projector, logicalRows);
-    dirty = false;
-    if (snapshot !== undefined && sameDatabaseSnapshot(snapshot, next)) return false;
-    snapshot = next;
-    return true;
-  };
-  const startSourceSubscription = (): void => {
-    if (unsubscribeSource !== undefined) return;
-    unsubscribeSource = input.source.subscribe(() => {
-      dirty = true;
-      if (listeners.size > 0 && refresh()) notify();
-    });
-  };
-
-  return Object.freeze({
-    ...input.transactions,
-    getSnapshot: () => {
-      if (closed) return closedDatabaseSnapshot;
-      if (unsubscribeSource === undefined) dirty = true;
-      refresh();
-      return snapshot as AutomergeDatabaseSnapshot;
-    },
-    subscribe: (listener: () => void) => {
-      if (closed) return () => undefined;
-      listeners.add(listener);
-      dirty = true;
-      startSourceSubscription();
-      return () => {
-        listeners.delete(listener);
-        if (listeners.size > 0) return;
-        unsubscribeSource?.();
-        unsubscribeSource = undefined;
-      };
-    },
-    mount: (catalog, options = {}) => {
-      if (closed) throw new Error('Automerge database is closed');
-      const discoveryEdges = Object.freeze([...new Set(options.discoveryEdges ?? [])].sort());
-      const lease = catalog.attach({
-        attachmentId: input.attachmentId,
-        incarnation: input.incarnation,
-        sourceId: input.source.sourceId,
-        source: input.source,
-        authorityScope: input.authorityScope,
-        discoveryEdges,
-        preparation: input.preparation
-      });
-      leases.add(lease);
-      let leaseClosed = false;
-      return Object.freeze({
-        attachmentId: input.attachmentId,
-        sourceId: input.source.sourceId,
-        discoveryEdges,
-        close: () => {
-          if (leaseClosed) return;
-          leaseClosed = true;
-          leases.delete(lease);
-          lease.close();
-        }
-      });
-    },
-    close: () => {
-      if (closed) return;
-      closed = true;
-      const subscription = unsubscribeSource;
-      unsubscribeSource = undefined;
-      snapshot = closedDatabaseSnapshot;
-      notify();
-      listeners.clear();
-
-      let firstCleanupFailure: { readonly error: unknown } | undefined;
-      const attemptCleanup = (cleanup: (() => void) | undefined): void => {
-        if (cleanup === undefined) return;
-        try {
-          cleanup();
-        } catch (error) {
-          firstCleanupFailure ??= { error };
-        }
-      };
-      attemptCleanup(subscription);
-      for (const lease of leases) attemptCleanup(lease.close);
-      leases.clear();
-      try {
-        input.source.close();
-      } catch (error) {
-        firstCleanupFailure ??= { error };
-      }
-      if (firstCleanupFailure !== undefined) throw firstCleanupFailure.error;
-    }
-  } satisfies AutomergeDatabase);
+  return createLiveAttachmentDatabase({
+    attachmentId: input.attachmentId,
+    incarnation: input.incarnation,
+    authorityScope: input.authorityScope,
+    service: input.transactions,
+    preparation: input.preparation,
+    source: input.source,
+    deriveSnapshot: (source) => databaseSnapshot(source, input.projector, logicalRows),
+    sameSnapshot: sameDatabaseSnapshot,
+    closedSnapshot
+  });
 };
 
-const closedDatabaseSnapshot: AutomergeDatabaseSnapshot = Object.freeze({ state: 'closed' });
+const closedSnapshot = Object.freeze({ state: 'closed' as const });

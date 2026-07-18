@@ -29,6 +29,11 @@ const cases = [
     maxGzipBytes: 1_500
   },
   {
+    name: 'attached database adapter lifecycle',
+    source: selectedExport('packages/core/dist/database/adapter/index.js', 'createLiveAttachmentDatabase'),
+    maxGzipBytes: 2_200
+  },
+  {
     name: 'incremental database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // This is the complete incremental evaluator, including joins, aggregates,

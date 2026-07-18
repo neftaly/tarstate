@@ -3,7 +3,6 @@ import type { ReadyAttachmentPreparation } from './preparation.js';
 import { createIssue, TarstateParseError, type Issue } from '../issues.js';
 import { detachAndFreezeJsonValue } from '../internal-owned-json.js';
 import type { OperationLedgerProtocol } from '../lifecycle-governance.js';
-import { authorExactKeyedRelationDelta } from '../relation-delta-authoring.js';
 import type { CapabilityRegistry } from '../registry.js';
 import type { StagedBasisAtomicSource, StorageBinding } from '../source-protocol.js';
 import {
@@ -13,20 +12,16 @@ import {
   type PreparedWritableExecutionContext,
   type PreparedTransactionQueryService
 } from '../transaction-executor.js';
-import {
-  sealTransaction,
-  type CommitReceipt,
-  type WriteExpression,
-  type WriteStatement
-} from '../transaction.js';
+import type { CommitReceipt } from '../transaction.js';
 import type { JsonValue } from '../value.js';
 import type { WritableLogicalState } from '../logical-edit.js';
 import type {
+  DatabaseRelationWriteCapabilities,
   DatabaseTransactionOptions,
   DatabaseTransactionService,
   DatabaseTransactionTransform
 } from '../database/transaction.js';
-import { ImmutableDatabaseTransactionSnapshot } from './transaction-snapshot.js';
+import { authorAttachmentStateTransition } from './transaction-state-authoring.js';
 
 type WritableAttachmentPreparation = Pick<
   ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,
@@ -59,6 +54,7 @@ export const createAttachmentTransactionService = async <Storage, Command>(
   const preparation = input.preparation;
   const context = await createExecutionContext(input, preparation);
   const snapshotOwner = Object.freeze({});
+  const writeCapabilities = preparedWriteCapabilities(preparation);
   const prepareInput = async (
     intent: JsonValue,
     transform: DatabaseTransactionTransform,
@@ -71,11 +67,35 @@ export const createAttachmentTransactionService = async <Storage, Command>(
       operationId: globalThis.crypto.randomUUID(),
       intentHash: await attachmentIntentHash(context, ownedIntent.value),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
-      author: async ({ state, issues }: { readonly state: WritableLogicalState; readonly issues: readonly Issue[] }) =>
-        authorStateTransition(context, preparation, input.registry, snapshotOwner, state, issues, transform)
+      author: ({
+        state,
+        issues
+      }: {
+        readonly state: WritableLogicalState;
+        readonly issues: readonly Issue[];
+      }) => authorAttachmentStateTransition({
+        schemaView: context.schemaView,
+        preparation,
+        registry: input.registry,
+        snapshotOwner,
+        before: state,
+        projectionIssues: issues,
+        transform
+      })
     };
   };
   const service: DatabaseTransactionService = {
+    writeCapabilities: (relation) => {
+      if (relation.schemaView.id !== context.schemaView.id
+        || relation.schemaView.contentHash !== context.schemaView.contentHash) {
+        throw new TypeError('Write-capability relation belongs to a different schema view');
+      }
+      const capabilities = writeCapabilities.get(relation.relationId);
+      if (capabilities === undefined) {
+        throw new TypeError(`Write-capability relation ${JSON.stringify(relation.relationId)} is unavailable`);
+      }
+      return capabilities;
+    },
     transact: async (
       intent: JsonValue,
       transform: DatabaseTransactionTransform,
@@ -147,87 +167,20 @@ const assertWritablePreparation: (
   }
 };
 
-const authorStateTransition = async <Storage, Command>(
-  context: PreparedWritableExecutionContext<Storage, Command>,
-  preparation: PreparedWritableAttachment,
-  registry: CapabilityRegistry,
-  snapshotOwner: object,
-  before: WritableLogicalState,
-  projectionIssues: readonly Issue[],
-  transform: DatabaseTransactionTransform
-) => {
-  const statements: WriteStatement[] = [];
-  if (!projectionIssues.some(({ severity }) => severity === 'error')) {
-    const beforeByRelation = groupTransactionFields(before.rows);
-    const snapshot = new ImmutableDatabaseTransactionSnapshot({
-      owner: snapshotOwner,
-      schemaView: context.schemaView,
-      schema: preparation.schema,
-      availableRelations: preparation.relations,
-      registry,
-      rowsByRelation: beforeByRelation,
-      changedRelationIds: emptyChangedRelationIds,
-      generatedKeyInserts: emptyGeneratedKeyInserts
-    });
-    const transformed = await transform(snapshot);
-    if (!(transformed instanceof ImmutableDatabaseTransactionSnapshot)
-      || !transformed.belongsTo(snapshotOwner)) {
-      throw new TypeError('Attachment transaction transform must return a snapshot created by this service');
-    }
-    const afterByRelation = transformed.relationRows();
-    for (const relationId of transformed.changedRelations()) {
-      const relation = preparation.relations.get(relationId);
-      if (relation === undefined) throw new TypeError(`Transaction relation ${JSON.stringify(relationId)} is unavailable`);
-      const authored = authorExactKeyedRelationDelta({
-        relation: { relationId, schemaView: context.schemaView },
-        keyFields: relation.keyFields,
-        replaceableFields: relation.replaceableFields,
-        before: { completeness: 'exact', rows: beforeByRelation.get(relationId) ?? emptyTransactionFields },
-        after: { completeness: 'exact', rows: afterByRelation.get(relationId) ?? emptyTransactionFields }
-      });
-      if (!authored.success) throw new TarstateParseError(authored.issues);
-      statements.push(...authored.value);
-    }
-    for (const insert of transformed.generatedInserts()) {
-      statements.push({
-        kind: 'statement.insert-generated-key',
-        relation: { relationId: insert.relationId, schemaView: context.schemaView },
-        token: insert.token,
-        fields: literalFields(insert.fields)
-      });
-    }
+const preparedWriteCapabilities = (
+  preparation: PreparedWritableAttachment
+): ReadonlyMap<string, DatabaseRelationWriteCapabilities> => {
+  const capabilities = new Map<string, DatabaseRelationWriteCapabilities>();
+  for (const [relationId, relation] of preparation.relations) {
+    capabilities.set(relationId, Object.freeze({
+      relationId,
+      keyFields: relation.keyFields,
+      replaceableFields: relation.replaceableFields,
+      sourceGeneratedFields: relation.sourceGeneratedFields,
+      supportsGeneratedKeyInsert: relation.supportsGeneratedKeyInsert
+    }));
   }
-  return sealTransaction({ body: {
-    schemaView: context.schemaView,
-    parameters: {},
-    statements,
-    guards: [],
-    requiredCapabilities: []
-  } });
-};
-
-const emptyTransactionFields: readonly Readonly<Record<string, JsonValue>>[] = Object.freeze([]);
-const emptyChangedRelationIds: ReadonlySet<string> = new Set<string>();
-const emptyGeneratedKeyInserts = Object.freeze([]);
-
-const literalFields = (
-  fields: Readonly<Record<string, JsonValue>>
-): Readonly<Record<string, WriteExpression>> => Object.fromEntries(
-  Object.entries(fields).map(([field, value]) => [field, { kind: 'literal' as const, value }])
-);
-
-/** Groups one adopted logical state once before per-relation delta authoring. */
-const groupTransactionFields = (
-  rows: readonly { readonly relationId: string; readonly fields: Readonly<Record<string, JsonValue>> }[]
-): ReadonlyMap<string, readonly Readonly<Record<string, JsonValue>>[]> => {
-  const grouped = new Map<string, Readonly<Record<string, JsonValue>>[]>();
-  for (const { relationId, fields } of rows) {
-    const relationRows = grouped.get(relationId);
-    if (relationRows === undefined) grouped.set(relationId, [fields]);
-    else relationRows.push(fields);
-  }
-  for (const relationRows of grouped.values()) Object.freeze(relationRows);
-  return grouped;
+  return capabilities;
 };
 
 const unavailableQueryService: PreparedTransactionQueryService = {

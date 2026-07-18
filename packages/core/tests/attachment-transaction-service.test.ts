@@ -95,6 +95,47 @@ describe('attachment transaction service', () => {
       registry,
       durability: 'memory'
     });
+    expect(service.writeCapabilities(items)).toEqual({
+      relationId: 'test.item',
+      keyFields: ['id'],
+      replaceableFields: ['title'],
+      sourceGeneratedFields: [],
+      supportsGeneratedKeyInsert: false
+    });
+    expect(() => service.writeCapabilities({
+      ...items,
+      schemaView: { ...items.schemaView, id: 'urn:test:foreign-schema' }
+    })).toThrow('different schema view');
+    const rejectedCommit = vi.spyOn(source, 'commit');
+    await expect(service.simulate(
+      { kind: 'preview-read-only-count' },
+      (snapshot) => snapshot.withRows(
+        items,
+        snapshot.rows(items).map((row) => ({ ...row, count: row.count + 1 }))
+      )
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
+      beforeBasis: source.snapshot().basis,
+      issues: [{
+        code: 'transaction.delta_invalid',
+        details: { reason: 'field_replacement_unavailable', field: 'count' }
+      }]
+    });
+    await expect(service.transact(
+      { kind: 'commit-read-only-count' },
+      (snapshot) => snapshot.withRows(
+        items,
+        snapshot.rows(items).map((row) => ({ ...row, count: row.count + 1 }))
+      )
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [{
+        code: 'transaction.delta_invalid',
+        details: { reason: 'field_replacement_unavailable', field: 'count' }
+      }]
+    });
+    expect(rejectedCommit).not.toHaveBeenCalled();
+    rejectedCommit.mockRestore();
     await expect(service.simulate(
       { kind: 'preview-title' },
       (snapshot) => snapshot.withRows(
@@ -173,6 +214,47 @@ describe('attachment transaction service', () => {
       issues: [{ code: 'transaction.unexpected_failure', details: { timing: 'reconciliation', error: 'Error' } }]
     });
 
+    vi.spyOn(source, 'commit').mockImplementationOnce(async (input) => {
+      await commitDirect({
+        operationEpoch: input.operationEpoch,
+        operationId: 'operation:concurrent-before-representability-change',
+        intentHash: `sha256:${'7'.repeat(64)}`,
+        expectedBasis: input.expectedBasis,
+        commands: [{
+          description: 'third concurrent count',
+          apply: (state) => Object.freeze({
+            ...state,
+            'test.item': Object.freeze([Object.freeze({ id: 'one', title: 'Count:2', count: 4 })])
+          })
+        }]
+      });
+      return commitDirect(input);
+    });
+    let representabilityAttempts = 0;
+    const replayedRepresentabilityFailure = await service.transact(
+      { kind: 'become-read-only-on-replay' },
+      (snapshot) => {
+        representabilityAttempts += 1;
+        return snapshot.withRows(
+          items,
+          snapshot.rows(items).map((row) => representabilityAttempts === 1
+            ? { ...row, title: 'Initially writable' }
+            : { ...row, count: row.count + 1 })
+        );
+      }
+    );
+    expect(replayedRepresentabilityFailure).toMatchObject({
+      outcome: 'rejected',
+      issues: [{
+        code: 'transaction.delta_invalid',
+        details: { reason: 'field_replacement_unavailable', field: 'count' }
+      }]
+    });
+    expect(representabilityAttempts).toBe(2);
+    expect(source.snapshot()).toMatchObject({
+      storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 4 }] }
+    });
+
     await expect(service.transact(
       { kind: 'initial-author-failure' },
       () => { throw new Error('initial author failure'); }
@@ -184,16 +266,19 @@ describe('attachment transaction service', () => {
     await expect(service.simulate(
       { kind: 'invalid-replacement-row' },
       (snapshot) => snapshot.withRows(items, [{ id: 'one', title: 4, count: 3 } as never])
-    )).rejects.toMatchObject({ name: 'TarstateParseError' });
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
+      issues: [{ code: 'schema.scalar_type' }]
+    });
     await expect(service.simulate(
       { kind: 'generated-key-unavailable' },
       (snapshot) => snapshot.insertWithGeneratedKey(items, 'new-item', { title: 'New', count: 4 })
-    )).rejects.toMatchObject({
-      name: 'TarstateParseError',
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
       issues: [{ details: { reason: 'source_generated_key_unavailable' } }]
     });
     expect(source.snapshot()).toMatchObject({
-      storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 3 }] }
+      storage: { 'test.item': [{ id: 'one', title: 'Count:2', count: 4 }] }
     });
   });
 });

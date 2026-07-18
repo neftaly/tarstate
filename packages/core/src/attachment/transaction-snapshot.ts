@@ -1,5 +1,5 @@
 import type { ContentHash } from '../canonical-json.js';
-import { createIssue, TarstateParseError, type Issue } from '../issues.js';
+import { createIssue, type Issue } from '../issues.js';
 import type { CapabilityRegistry } from '../registry.js';
 import {
   parseRelationCandidates,
@@ -39,6 +39,7 @@ type TransactionSnapshotContext = {
   readonly rowsByRelation: ReadonlyMap<string, LogicalRows>;
   readonly changedRelationIds: ReadonlySet<string>;
   readonly generatedKeyInserts: readonly GeneratedKeyInsert[];
+  readonly authoringIssues: readonly Issue[];
 };
 
 const emptyRows: LogicalRows = Object.freeze([]);
@@ -72,7 +73,9 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
       rows.map((value) => ({ value })),
       this.#context.registry
     );
-    if (parsed.completeness !== 'exact') throw new TarstateParseError(parsed.issues);
+    if (parsed.completeness !== 'exact') {
+      return rejectedSnapshot(this.#context, parsed.issues);
+    }
     const replacement = Object.freeze(parsed.rows.map(({ row }) => row as Readonly<Record<string, JsonValue>>));
     const rowsByRelation = new Map(this.#context.rowsByRelation);
     rowsByRelation.set(relationId, replacement);
@@ -109,7 +112,7 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
     }
     const parsedFields = parseGeneratedFields(this.#context, available, fields);
     issues.push(...parsedFields.issues);
-    if (issues.length > 0) throw new TarstateParseError(issues);
+    if (issues.length > 0) return rejectedSnapshot(this.#context, issues);
     const insert = Object.freeze({
       relationId: available.relationId,
       token: tokenValue as string,
@@ -137,17 +140,21 @@ export class ImmutableDatabaseTransactionSnapshot implements DatabaseTransaction
     return this.#context.generatedKeyInserts;
   }
 
+  rejectionIssues(): readonly Issue[] {
+    return this.#context.authoringIssues;
+  }
+
   #relation(relation: {
     readonly schemaView: { readonly id: string; readonly contentHash: string };
     readonly relationId: string;
   }): AvailableRelation {
     if (relation.schemaView.id !== this.#context.schemaView.id
       || relation.schemaView.contentHash !== this.#context.schemaView.contentHash) {
-      throw new TarstateParseError([snapshotIssue('schema_view_mismatch', relation.relationId)]);
+      throw new TypeError('Transaction relation belongs to a different schema view');
     }
     const available = this.#context.availableRelations.get(relation.relationId);
     if (available === undefined) {
-      throw new TarstateParseError([snapshotIssue('relation_unavailable', relation.relationId)]);
+      throw new TypeError(`Transaction relation ${JSON.stringify(relation.relationId)} is unavailable`);
     }
     return available;
   }
@@ -198,6 +205,14 @@ const parseGeneratedFields = (
     ? { fields: Object.freeze(fields), issues }
     : { issues };
 };
+
+const rejectedSnapshot = (
+  context: TransactionSnapshotContext,
+  issues: readonly Issue[]
+): ImmutableDatabaseTransactionSnapshot => new ImmutableDatabaseTransactionSnapshot({
+  ...context,
+  authoringIssues: Object.freeze([...context.authoringIssues, ...issues])
+});
 
 const snapshotIssue = (reason: string, relationId: string, field?: string): Issue => createIssue({
   code: 'transaction.delta_invalid',

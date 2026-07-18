@@ -269,9 +269,14 @@ export const executePreparedTransaction = async <Storage, Command>(
 
 const maxReconciliationAttempts = 16;
 
+type ReplayablePreparationResult = PreparedExecution | {
+  readonly prepared?: PreparedExecution;
+  readonly receipt: CommitReceipt;
+};
+
 type ReplayablePreparation<Storage, Command> = (
   snapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>
-) => Promise<PreparedExecution | { readonly receipt: CommitReceipt }>;
+) => Promise<ReplayablePreparationResult>;
 
 type ReconciledPreparedCommit = {
   readonly prepared: PreparedExecution;
@@ -345,7 +350,12 @@ const reconcileAndCommitPreparedExecution = async <Storage, Command>(
             }
           };
         }
-        if ('receipt' in replacement) return { prepared, receipt: replacement.receipt };
+        if ('receipt' in replacement) {
+          return {
+            prepared: replacement.prepared ?? prepared,
+            receipt: replacement.receipt
+          };
+        }
         prepared = replacement;
         nextSnapshot = refreshed.snapshot;
       }
@@ -409,7 +419,10 @@ export type ReplayablePreparedTransactionInput = {
     readonly basis: SourceBasis;
     readonly state: WritableLogicalState;
     readonly issues: readonly Issue[];
-  }) => Promise<Transaction>;
+  }) => Promise<{
+    readonly transaction: Transaction;
+    readonly issues: readonly Issue[];
+  }>;
 };
 
 /** Internal bridge used by attachment services; the author is replayed only after transient concurrency. */
@@ -460,9 +473,9 @@ const prepareReplayableExecution = async <Storage, Command>(
   context: PreparedWritableExecutionContext<Storage, Command>,
   input: ReplayablePreparedTransactionInput,
   snapshot: ReturnType<AtomicSource<Storage, Command>['snapshot']>
-): Promise<PreparedExecution | { readonly receipt: CommitReceipt }> => {
+): Promise<ReplayablePreparationResult> => {
   const projection = projectLogicalState(context.bindings, snapshot);
-  const transaction = await input.author({
+  const authored = await input.author({
     basis: snapshot.basis,
     state: logicalProjectionState(projection),
     issues: projection.issues
@@ -471,9 +484,31 @@ const prepareReplayableExecution = async <Storage, Command>(
     operationEpoch: context.operationEpoch,
     operationId: input.operationId,
     attachmentId: context.attachmentId,
-    transaction,
+    transaction: authored.transaction,
     ...(input.signal === undefined ? {} : { signal: input.signal })
   });
+  if (authored.issues.length > 0) {
+    const prepared = {
+      attempt,
+      transaction: authored.transaction,
+      intentHash: input.intentHash
+    };
+    return {
+      prepared,
+      receipt: {
+        ...rawReceiptEvidence(
+          context,
+          attempt,
+          authored.transaction.contentHash,
+          input.intentHash,
+          [],
+          authored.issues
+        ),
+        outcome: 'rejected',
+        beforeBasis: snapshot.basis
+      }
+    };
+  }
   const prepared = await prepareExecution(context, attempt);
   return 'receipt' in prepared ? prepared : { ...prepared, intentHash: input.intentHash };
 };

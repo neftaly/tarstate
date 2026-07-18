@@ -167,6 +167,7 @@ assignArchitectureGroup('attachment-runtime', [
   'attachment/logical-constraint-query.ts',
   'attachment/preparation.ts',
   'attachment/projection-selection.ts',
+  'attachment/transaction-state-authoring.ts',
   'attachment/transaction-snapshot.ts',
   'attachment/transaction-service.ts'
 ]);
@@ -184,6 +185,7 @@ assignArchitectureGroup('observer', [
 assignArchitectureGroup('observer-incremental', ['internal-observer-maintenance-frames.ts', 'internal-observer-query-maintenance.ts']);
 assignArchitectureGroup('database-session', [
   'database/follow-source-links.ts',
+  'database/live-attachment.ts',
   'database/query-settlement.ts',
   'database/query-session.ts',
   'database/source-link-graph.ts',
@@ -254,6 +256,7 @@ const publicRuntimePolicies = new Map(Object.entries({
   'artifacts/storage-mapping/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
   'artifacts/schema-lens/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'semantic-artifact'],
   'database/observer/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],
+  'database/adapter/index.ts': ['foundation', 'source-contract', 'query-model', 'query-batch', 'observer-contract', 'observer', 'database-session'],
   'database/session/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'attachment-runtime', 'observer-contract', 'observer', 'observer-incremental', 'database-session'],
   'database/incremental/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer', 'observer-incremental'],
   'database/external-store/index.ts': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract', 'observer'],

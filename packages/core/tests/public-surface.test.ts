@@ -5,6 +5,7 @@ import * as attachmentAdapter from '@tarstate/core/attachment/adapter';
 import * as capabilities from '@tarstate/core/capabilities';
 import * as constraintSetArtifact from '@tarstate/core/artifacts/constraint-set';
 import * as database from '@tarstate/core/database';
+import * as databaseAdapter from '@tarstate/core/database/adapter';
 import * as databaseIncremental from '@tarstate/core/database/incremental';
 import * as databaseObserver from '@tarstate/core/database/observer';
 import * as databaseSession from '@tarstate/core/database/session';
@@ -39,6 +40,7 @@ describe('topic-focused core surface', () => {
     expect(capabilities.CapabilityRegistry).toBeTypeOf('function');
     expect(constraintSetArtifact.sealConstraintSet).toBeTypeOf('function');
     expect(database.DatabaseView).toBeTypeOf('function');
+    expect(Object.keys(databaseAdapter)).toEqual(['createLiveAttachmentDatabase']);
     expect('openDatabaseQuery' in database).toBe(false);
     expect(databaseSession.openDatabaseQuery).toBeTypeOf('function');
     expect('prepareDatabaseAttachment' in database).toBe(false);

@@ -14,8 +14,8 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.4.1.tgz \
-  ./tarstate-automerge-0.4.1.tgz \
+  ./tarstate-core-0.4.9.tgz \
+  ./tarstate-automerge-0.4.9.tgz \
   @automerge/automerge
 ```
 
@@ -62,6 +62,11 @@ const opened = await openAutomergeDatabase({
   authorityScope: 'workspace'
 });
 if (!opened.success) throw new Error(opened.issues.map(({ code }) => code).join(', '));
+
+// Prepared mapping facts let the UI distinguish writable fields without
+// reading or duplicating the storage-mapping artifact.
+const taskWrites = opened.value.writeCapabilities(tasks);
+// taskWrites.replaceableFields includes `title` when this mapping can replace it.
 
 const unsubscribe = opened.value.subscribe(() => {
   const snapshot = opened.value.getSnapshot();
@@ -215,9 +220,12 @@ invalid document, while invalid candidates remain unpublished.
 Opening returns a `ParseResult`; malformed declarations and embedded artifacts
 produce an unsuccessful result. Invalid transaction intent or an initial
 callback failure rejects that transaction call. Once execution has reserved a
-valid candidate, expected transaction failures resolve as receipts. In
-particular, a callback failure during multiplayer replay becomes a rejected
-receipt so no reserved operation is left pending.
+valid candidate, expected transaction failures resolve as receipts. A valid
+logical edit that the prepared mapping cannot represent also resolves as a
+rejected simulation or commit receipt; use `writeCapabilities(relation)` to
+avoid offering known read-only edits. In particular, a callback failure during
+multiplayer replay becomes a rejected receipt so no reserved operation is left
+pending.
 
 ## Automerge Repo compatibility
 

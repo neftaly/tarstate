@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.4.1.tgz
+npm install ./tarstate-core-0.4.9.tgz
 ```
 
 ## Choose the application path
@@ -60,6 +60,7 @@ Query and observation have narrower execution seams:
 | `@tarstate/core/query/evaluate` | Pure batch query and expression evaluation |
 | `@tarstate/core/query/incremental` | Stateful and pooled incremental maintenance |
 | `@tarstate/core/database/observer` | Generic catalogs and observation with an injected maintenance factory |
+| `@tarstate/core/database/adapter` | Source-neutral live database lifecycle composition for adapter implementors |
 | `@tarstate/core/database/incremental` | Explicit adapter from database observation to incremental query maintenance |
 | `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
 | `@tarstate/core/database/session` | Owned incremental query lifecycle over mounted and unresolved database sources |
@@ -231,7 +232,10 @@ Adapter authors import `prepareManualReadOnlyAttachment`,
 `@tarstate/core/attachment/adapter`. Custom adapters implement the small
 structural `MountableDatabaseSource` protocol; the executable quickstart contains a
 complete implementation. Applications using an official adapter do not need
-this construction seam. A database returned by `openAutomergeDatabase`
+this construction seam. Official adapters may compose their service, source,
+projection, catalog mounts, and cleanup with `createLiveAttachmentDatabase`
+from `@tarstate/core/database/adapter`; this is not an alternative application
+transaction API. A database returned by `openAutomergeDatabase`
 already conforms, and its live database projection and replayable write
 projection are the same conflict-aware mapping. `AttachmentCatalog`,
 `DatasetMembership`, and `DatabaseView` remain available as lower-level host

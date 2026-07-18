@@ -46,7 +46,22 @@ export type DatabaseTransactionOptions = {
   readonly signal?: AbortSignal;
 };
 
+/** Prepared logical write facts for one relation, independent of source readiness. */
+export type DatabaseRelationWriteCapabilities = {
+  readonly relationId: string;
+  readonly keyFields: readonly string[];
+  readonly replaceableFields: readonly string[];
+  readonly sourceGeneratedFields: readonly string[];
+  readonly supportsGeneratedKeyInsert: boolean;
+};
+
 export type DatabaseTransactionService = {
+  readonly writeCapabilities: <
+    Body extends SchemaBody,
+    Name extends Extract<keyof Body['relations'], string>
+  >(
+    relation: LiteralRelation<Body, Name>
+  ) => DatabaseRelationWriteCapabilities;
   readonly transact: (
     intent: JsonValue,
     transform: DatabaseTransactionTransform,

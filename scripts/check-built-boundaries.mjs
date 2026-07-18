@@ -26,7 +26,7 @@ try {
   assertClosure('attachment/index.js', 100, []);
   assertClosure('attachment/declaration/index.js', 35_000, ['preparation', 'projection-selection', 'transaction-service']);
   // Includes strict portable declarations, source metadata, generated-key authoring, and field-bounded projection.
-  assertClosure('attachment/adapter/index.js', 314_100, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  assertClosure('attachment/adapter/index.js', 316_500, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
@@ -35,6 +35,7 @@ try {
   assertClosure('schema/index.js', 100_000, ['query-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental']);
   assertClosure('transactions/index.js', 158_000, ['query-authoring', 'schema-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance']);
   assertClosure('database/observer/index.js', 80_000, ['query-incremental', 'internal-observer-query-maintenance', 'memory-source', 'system-relations', 'transaction-executor']);
+  assertClosure('database/adapter/index.js', 25_000, ['query-incremental', 'internal-observer-query-maintenance', 'system-relations', 'transaction-executor']);
   assertClosure('database/session/index.js', 310_000, ['system-relations', 'transaction-executor']);
   // Explicit syntax walking keeps application JSON opaque and derives safe projection dependencies.
   assertClosure('database/incremental/index.js', 230_500, ['memory-source', 'system-relations', 'transaction-executor']);

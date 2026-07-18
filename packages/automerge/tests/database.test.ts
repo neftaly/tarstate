@@ -104,8 +104,13 @@ describe('standard Automerge database', () => {
   it('opens embedded artifacts and exposes only logical transactions and lifecycle', async () => {
     const fixture = await openTaskDatabase();
     expect(Object.keys(fixture.database).sort()).toEqual([
-      'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
+      'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact', 'writeCapabilities'
     ]);
+    expect(fixture.database.writeCapabilities(fixture.tasks)).toMatchObject({
+      relationId: 'tasks',
+      keyFields: ['id'],
+      replaceableFields: ['title']
+    });
     const initial = fixture.database.getSnapshot();
     expect(initial).toMatchObject({
       state: 'open',
@@ -481,8 +486,8 @@ describe('standard Automerge database', () => {
         'invalid',
         { title: 'Invalid', position: 0 }
       )
-    )).rejects.toMatchObject({
-      name: 'TarstateParseError',
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
       issues: [{ details: { reason: 'source_generated_field_supplied', field: 'position' } }]
     });
     await expect(fixture.database.simulate(
@@ -490,8 +495,8 @@ describe('standard Automerge database', () => {
       (snapshot) => snapshot
         .insertWithGeneratedKey(fixture.tasks, 'duplicate', { title: 'First' })
         .insertWithGeneratedKey(fixture.tasks, 'duplicate', { title: 'Second' })
-    )).rejects.toMatchObject({
-      name: 'TarstateParseError',
+    )).resolves.toMatchObject({
+      outcome: 'rejected',
       issues: [{ details: { reason: 'insertion_token_duplicate' } }]
     });
 

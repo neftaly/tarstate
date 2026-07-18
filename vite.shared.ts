@@ -16,6 +16,7 @@ export const corePublicEntryNames = [
   'attachment/declaration',
   'capabilities',
   'database',
+  'database/adapter',
   'database/external-store',
   'database/incremental',
   'database/observer',
