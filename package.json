@@ -14,7 +14,6 @@
     "bench:observer": "pnpm --filter @tarstate/core build && node --expose-gc scripts/observer-performance.mjs",
     "bench:transaction": "pnpm --filter @tarstate/core build && pnpm --filter @tarstate/automerge build && node --expose-gc --disable-warning=TimeoutNegativeWarning scripts/transaction-performance.mjs",
     "bench:automerge": "pnpm --filter @tarstate/core build && pnpm --filter @tarstate/automerge build && node scripts/automerge-performance.mjs",
-    "bench:legacy": "node scripts/legacy-benchmark.mjs",
     "build": "pnpm --filter './packages/*' -r build",
     "check": "pnpm lint && pnpm check:boundaries && pnpm typecheck && pnpm typecheck:budget && pnpm build && pnpm check:built-boundaries && pnpm check:tree-shaking && pnpm check:examples && pnpm test",
     "check:boundaries": "node scripts/check-boundaries.mjs",
