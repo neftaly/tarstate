@@ -12,15 +12,20 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.4.10.tgz \
-  ./tarstate-zustand-0.4.10.tgz \
+  ./tarstate-core-0.4.11.tgz \
+  ./tarstate-zustand-0.4.11.tgz \
   zustand
 ```
 
 ## Usage
 
-Adapt a vanilla Zustand store, then acquire one host-owned Tarstate runtime for
-that store identity:
+For relational state, adapt the vanilla store and pass it directly to
+`openExternalStoreDatabase` together with its exact declaration and embedded
+artifacts. Tarstate then owns projection, simulation, validation, replay, and
+publication through the ordinary database API.
+
+Use the lower-level runtime bridge only for deliberately non-relational host
+state or when implementing another adapter:
 
 ```ts
 import { HostRuntimeRegistry, acquireExternalStoreRuntime } from '@tarstate/core/database/external-store';

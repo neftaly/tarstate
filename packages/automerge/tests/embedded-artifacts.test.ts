@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   embeddedArtifactKey,
   indexEmbeddedArtifacts
-} from '../src/attachment/embedded-artifacts.js';
+} from '@tarstate/core/attachment/mapped-adapter';
 
 const artifact = {
   id: 'urn:test:embedded',

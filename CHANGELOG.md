@@ -3,6 +3,22 @@
 Notable changes to Tarstate are recorded here. Dates use the repository's Git
 history.
 
+## [0.4.11] - 2026-07-18
+
+### Added
+
+- Added `openExternalStoreDatabase`, the standard relational database path for
+  immutable state behind an atomic external store. It owns artifact
+  preparation, JSON-tree projection and writes, exact-basis replay,
+  constraints, simulation, lifecycle evidence, and host-runtime leases.
+
+### Changed
+
+- Automerge and external-store databases now share one source-neutral mapped
+  projection, constraint, readiness, and embedded-artifact core.
+- The external-store entry lazily loads relational machinery, retaining a
+  narrow initial runtime bridge for framework adapters and non-relational use.
+
 ## [0.4.10] - 2026-07-18
 
 ### Added

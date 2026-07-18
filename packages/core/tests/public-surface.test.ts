@@ -2,10 +2,12 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import * as root from '../src/root.js';
 import * as artifacts from '@tarstate/core/artifacts';
 import * as attachmentAdapter from '@tarstate/core/attachment/adapter';
+import * as mappedAttachmentAdapter from '@tarstate/core/attachment/mapped-adapter';
 import * as capabilities from '@tarstate/core/capabilities';
 import * as constraintSetArtifact from '@tarstate/core/artifacts/constraint-set';
 import * as database from '@tarstate/core/database';
 import * as databaseAdapter from '@tarstate/core/database/adapter';
+import * as databaseExternalStore from '@tarstate/core/database/external-store';
 import * as databaseIncremental from '@tarstate/core/database/incremental';
 import * as databaseObserver from '@tarstate/core/database/observer';
 import * as databaseSession from '@tarstate/core/database/session';
@@ -37,10 +39,25 @@ describe('topic-focused core surface', () => {
   it('exposes runtime features only from their topic entries', () => {
     expect(artifacts.ExactArtifactResolver).toBeTypeOf('function');
     expect(attachmentAdapter.prepareDatabaseAttachment).toBeTypeOf('function');
+    expect(Object.keys(mappedAttachmentAdapter).sort()).toEqual([
+      'createMappedAttachmentProjector',
+      'createMappedDatabaseProjection',
+      'embeddedArtifactKey',
+      'indexEmbeddedArtifacts',
+      'mappedDatabaseSnapshot',
+      'sameMappedDatabaseSnapshot'
+    ]);
     expect(capabilities.CapabilityRegistry).toBeTypeOf('function');
     expect(constraintSetArtifact.sealConstraintSet).toBeTypeOf('function');
     expect(database.DatabaseView).toBeTypeOf('function');
     expect(Object.keys(databaseAdapter)).toEqual(['createLiveAttachmentDatabase']);
+    expect(Object.keys(databaseExternalStore).sort()).toEqual([
+      'ExternalStoreRuntime',
+      'HostRuntimeRegistry',
+      'acquireExternalStoreRuntime',
+      'openExternalStoreDatabase',
+      'sameExternalStoreBasis'
+    ]);
     expect('openDatabaseQuery' in database).toBe(false);
     expect(databaseSession.openDatabaseQuery).toBeTypeOf('function');
     expect('prepareDatabaseAttachment' in database).toBe(false);

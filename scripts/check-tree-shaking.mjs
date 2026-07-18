@@ -34,6 +34,22 @@ const cases = [
     maxGzipBytes: 2_200
   },
   {
+    name: 'external-store runtime bridge',
+    source: selectedExport('packages/core/dist/database/external-store/index.js', 'acquireExternalStoreRuntime'),
+    maxGzipBytes: 5_200
+  },
+  {
+    name: 'external-store database initial entry',
+    source: selectedExport('packages/core/dist/database/external-store/index.js', 'openExternalStoreDatabase'),
+    initialOnly: true,
+    maxGzipBytes: 1_000
+  },
+  {
+    name: 'external-store relational database',
+    source: selectedExport('packages/core/dist/database/external-store/index.js', 'openExternalStoreDatabase'),
+    maxGzipBytes: 67_000
+  },
+  {
     name: 'incremental database query session',
     source: selectedExport('packages/core/dist/database/session/index.js', 'openDatabaseQuery'),
     // This is the complete incremental evaluator, including joins, aggregates,

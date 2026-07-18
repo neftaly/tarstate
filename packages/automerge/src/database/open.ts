@@ -7,6 +7,12 @@ import {
   createAttachmentTransactionService
 } from '@tarstate/core/attachment/adapter';
 import {
+  createMappedAttachmentProjector,
+  createMappedDatabaseProjection,
+  embeddedArtifactKey,
+  indexEmbeddedArtifacts
+} from '@tarstate/core/attachment/mapped-adapter';
+import {
   builtInCapabilityRefs,
   CapabilityRegistry,
   registerBuiltInCapabilities
@@ -24,9 +30,7 @@ import { AutomergeMappedStorageBinding } from '../adapter/mapped-storage.js';
 import {
   createLiveAutomergeDatabase,
 } from './live.js';
-import { embeddedArtifactKey, indexEmbeddedArtifacts } from '../attachment/embedded-artifacts.js';
 import type { AutomergeDatabase } from './model.js';
-import { createAutomergeAttachmentProjector, databaseProjection } from '../attachment/projection.js';
 import {
   automergeRepoSourceRuntime,
   type AutomergeRepoHandle,
@@ -94,16 +98,17 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
   try {
     const binding = new AutomergeMappedStorageBinding<T>({ mapping: preparation.mapping, registry });
     const attachmentIncarnation = globalThis.crypto.randomUUID();
-    const projector = createAutomergeAttachmentProjector({
+    const projector = createMappedAttachmentProjector({
       binding,
       constraints: preparation.constraints
     });
-    const projection = databaseProjection({
+    const projection = createMappedDatabaseProjection({
       projector,
       schemaView: preparation.declaration.storageSchema,
       relationIds: [...preparation.relations.keys()],
       sourceId,
-      attachmentId
+      attachmentId,
+      occurrenceId: (row) => row.locator.rowIncarnation
     });
     const boundPreparation = bindAttachmentProjection(
       preparation as ReadyAttachmentPreparation<unknown, unknown, WritableLogicalState>,

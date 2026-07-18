@@ -7,7 +7,8 @@ Note: Tarstate is **alpha quality** software.
 
 Perf and GC targets systems programming and video games.
 Work is shared between queries, and aims to be faster than hand-rolled state management at scale.
-Adapters are currently provided for Zustand and Automerge.
+Database adapters are provided for Automerge and generic atomic external stores;
+Zustand supplies a thin adapter to the external-store contract.
 
 It also generates JSON-serializable schemas, describing your data in terms of relationships, that TS can read as types. It is intended to support [schema evolution](https://www.inkandswitch.com/cambria/), i.e. so changing your state tree in the future won't break things.
 

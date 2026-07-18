@@ -4,18 +4,19 @@ import {
 } from '@tarstate/core/attachment/adapter';
 import { createLiveAttachmentDatabase } from '@tarstate/core/database/adapter';
 import type {
-  DatabaseTransactionService,
-  LogicalRelationRow
+  DatabaseTransactionService
 } from '@tarstate/core/transactions';
 import type { RelationInput } from '@tarstate/core/query/model';
 import type { WritableLogicalState } from '@tarstate/core/source';
 import type { AutomergeAtomicSource } from '../adapter/atomic-source.js';
 import type { AutomergeDatabase } from './model.js';
 import {
-  databaseSnapshot,
-  sameDatabaseSnapshot,
-  type AutomergeAttachmentProjector
-} from '../attachment/projection.js';
+  mappedDatabaseSnapshot,
+  sameMappedDatabaseSnapshot,
+  type MappedAttachmentProjector,
+  type MappedLogicalRelationRow
+} from '@tarstate/core/attachment/mapped-adapter';
+import type { AutomergeMappedStorageRow } from '../adapter/mapped-storage.js';
 
 export const createLiveAutomergeDatabase = <T extends object>(input: {
   readonly attachmentId: string;
@@ -24,9 +25,9 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
   readonly transactions: DatabaseTransactionService;
   readonly preparation: ReadyAttachmentPreparation<Automerge.Doc<T>, readonly RelationInput[], WritableLogicalState>;
   readonly source: AutomergeAtomicSource<T>;
-  readonly projector: AutomergeAttachmentProjector<T>;
+  readonly projector: MappedAttachmentProjector<Automerge.Doc<T>, AutomergeMappedStorageRow>;
 }): AutomergeDatabase => {
-  const logicalRows = new WeakMap<object, readonly LogicalRelationRow[]>();
+  const logicalRows = new WeakMap<object, readonly MappedLogicalRelationRow[]>();
   return createLiveAttachmentDatabase({
     attachmentId: input.attachmentId,
     incarnation: input.incarnation,
@@ -34,8 +35,8 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
     service: input.transactions,
     preparation: input.preparation,
     source: input.source,
-    deriveSnapshot: (source) => databaseSnapshot(source, input.projector, logicalRows),
-    sameSnapshot: sameDatabaseSnapshot,
+    deriveSnapshot: (source) => mappedDatabaseSnapshot(source, input.projector, logicalRows),
+    sameSnapshot: sameMappedDatabaseSnapshot,
     closedSnapshot
   });
 };

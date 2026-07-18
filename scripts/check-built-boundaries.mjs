@@ -27,6 +27,7 @@ try {
   assertClosure('attachment/declaration/index.js', 35_000, ['preparation', 'projection-selection', 'transaction-service']);
   // Includes strict portable declarations, source metadata, generated-key authoring, and field-bounded projection.
   assertClosure('attachment/adapter/index.js', 316_500, ['query-authoring', 'schema-authoring', 'query-incremental', 'observer-maintenance']);
+  assertClosure('attachment/mapped-adapter/index.js', 95_000, ['transaction-executor', 'relation-delta-authoring', 'lifecycle-governance']);
   assertClosure('query/model/index.js', 100, []);
   assertClosure('query/prepare/index.js', 60_000, ['query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);
   assertClosure('query/authoring/index.js', 75_000, ['schema-authoring', 'transaction-authoring', 'query/internal/evaluator', 'query-incremental', 'observer-maintenance-contracts', 'transaction-executor']);

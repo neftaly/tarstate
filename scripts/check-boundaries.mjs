@@ -164,6 +164,8 @@ assignArchitectureGroup('transaction-runtime', [
   'transaction-executor.ts'
 ]);
 assignArchitectureGroup('attachment-runtime', [
+  'attachment/embedded-artifacts.ts',
+  'attachment/mapped-database-projection.ts',
   'attachment/logical-constraint-query.ts',
   'attachment/preparation.ts',
   'attachment/projection-selection.ts',
@@ -190,6 +192,15 @@ assignArchitectureGroup('database-session', [
   'database/query-session.ts',
   'database/source-link-graph.ts',
   'database/source-mount.ts'
+]);
+assignArchitectureGroup('external-store-adapter', [
+  'database/external-store/atomic-source.ts',
+  'database/external-store/json-tree.ts',
+  'database/external-store/live.ts',
+  'database/external-store/mapped-binding.ts',
+  'database/external-store/model.ts',
+  'database/external-store/open.ts',
+  'database/external-store/record-property.ts'
 ]);
 assignArchitectureGroup('system', ['system-relations.ts']);
 assignArchitectureGroup('composition', [
@@ -223,6 +234,7 @@ const allowedArchitectureDependencies = new Map(Object.entries({
   'observer': ['foundation', 'capability', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime', 'observer-contract'],
   'observer-incremental': ['foundation', 'query-model', 'query-batch', 'query-incremental', 'observer-contract', 'observer'],
   'database-session': ['foundation', 'source-contract', 'query-model', 'query-batch', 'observer-contract', 'observer', 'observer-incremental'],
+  'external-store-adapter': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime', 'attachment-runtime', 'observer-contract', 'observer', 'database-session'],
   'system': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'transaction-runtime'],
   'composition': [...new Set(architectureGroups.values())]
 }));
@@ -245,6 +257,7 @@ const publicRuntimePolicies = new Map(Object.entries({
   'source/index.ts': ['foundation', 'source-contract'],
   'attachment/index.ts': ['foundation', 'source-contract'],
   'attachment/adapter/index.ts': ['foundation', 'capability', 'artifact-resolution', 'source-contract', 'schema', 'query-model', 'query-batch', 'transaction-model', 'semantic-artifact', 'transaction-runtime', 'attachment-runtime'],
+  'attachment/mapped-adapter/index.ts': ['foundation', 'source-contract', 'schema', 'query-model', 'query-batch', 'attachment-runtime'],
   'query/model/index.ts': ['foundation', 'query-model'],
   'query/prepare/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],
   'query/authoring/index.ts': ['foundation', 'capability', 'schema', 'query-model', 'query-batch'],
@@ -268,7 +281,8 @@ const publicRuntimePolicies = new Map(Object.entries({
 const publicDeclarationPolicyAdditions = new Map(Object.entries({
   'database/index.ts': ['artifact-resolution', 'semantic-artifact'],
   'database/observer/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact'],
-  'database/session/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact']
+  'database/session/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact'],
+  'database/external-store/index.ts': ['artifact-resolution', 'transaction-model', 'semantic-artifact', 'transaction-runtime', 'database-session', 'external-store-adapter']
 }));
 
 for (const [entryName, allowedGroups] of publicRuntimePolicies) {

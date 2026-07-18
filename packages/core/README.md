@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.4.10.tgz
+npm install ./tarstate-core-0.4.11.tgz
 ```
 
 ## Choose the application path
@@ -17,6 +17,10 @@ Most applications should make one choice based on where their data lives:
   `openAutomergeDatabase` from `@tarstate/automerge`. It owns attachment
   preparation, keyed relation diffs, replay after multiplayer changes,
   validation, and publication.
+- For plain immutable state behind an atomic external store, start with
+  `openExternalStoreDatabase` from `@tarstate/core/database/external-store`.
+  It provides the same logical transaction and database lifecycle without
+  claiming CRDT identity or merge semantics.
 - For pure in-memory query evaluation, import the typed builders and
   `evaluateQuery` from `@tarstate/core/query`.
 - For live observation over host-owned sources, prepare a typed query and use
@@ -62,7 +66,7 @@ Query and observation have narrower execution seams:
 | `@tarstate/core/database/observer` | Generic catalogs and observation with an injected maintenance factory |
 | `@tarstate/core/database/adapter` | Source-neutral live database lifecycle composition for adapter implementors |
 | `@tarstate/core/database/incremental` | Explicit adapter from database observation to incremental query maintenance |
-| `@tarstate/core/database/external-store` | Framework-neutral external-store runtime bridge |
+| `@tarstate/core/database/external-store` | Relational database opener and framework-neutral atomic-store runtime bridge |
 | `@tarstate/core/database/session` | Owned incremental query lifecycle over mounted and unresolved database sources |
 
 Schema, query, and transaction authoring are separate implementations behind
@@ -85,6 +89,7 @@ Artifact semantics and attachment preparation also have opt-in execution seams:
 | `@tarstate/core/artifacts/storage-mapping` | Storage-mapping parsing and compilation |
 | `@tarstate/core/artifacts/schema-lens` | Schema-lens parsing and validation |
 | `@tarstate/core/attachment/adapter` | Adapter-facing preparation and replayable transaction-service composition |
+| `@tarstate/core/attachment/mapped-adapter` | Shared mapped projection and embedded-artifact composition for source adapters |
 | `@tarstate/core/values` | Portable built-in scalar conversion at host boundaries |
 
 The portable `artifacts` entry never imports query evaluation, mapping, lens,
@@ -134,6 +139,46 @@ throws, the operation resolves to a rejected receipt with
 `transaction.unexpected_failure` so the reservation reaches a final state.
 Callbacks must therefore be pure, replayable, and use returned logical rows—not
 exceptions—for ordinary product behavior.
+
+## Atomic external-store database
+
+`openExternalStoreDatabase` is the ordinary relational path for host state that
+can compare and replace one immutable state synchronously. Supply the same exact
+declaration and embedded schema, mapping, and constraint artifacts used by other
+attached databases:
+
+```ts
+import { openExternalStoreDatabase } from '@tarstate/core/database/external-store';
+
+const opened = await openExternalStoreDatabase({
+  sourceId: 'source:presence',
+  store: atomicStore,
+  storeIdentity: underlyingStore,
+  declaration,
+  embeddedArtifacts,
+  authorityScope: 'workspace.presence'
+});
+
+if (!opened.success) throw new Error(opened.issues[0]?.code);
+const presence = opened.value;
+
+await presence.transact({ kind: 'select-pane', paneId }, snapshot =>
+  snapshot.withRows(panes, applySelection(snapshot.rows(panes), paneId))
+);
+```
+
+The transform is pure and may replay if the store changes before publication.
+Tarstate stages copy-on-write JSON-tree edits, projects and validates the
+candidate, then commits against the exact external-store basis. Concurrent host
+updates are preserved by replay; they are not CRDT-merged. State must be plain
+immutable data and store actions must remain outside it. JSON-tree mappings may
+use map keys, stored keys, literals, and collection positions; stable generated
+element identity is deliberately unavailable for plain JSON.
+
+The standard opener owns runtime leasing and transaction plumbing. Pass a
+`hostRegistry` only when the application needs an explicit isolation/lifetime
+boundary. `acquireExternalStoreRuntime` remains the lower-level seam for
+framework adapters and non-relational host state.
 
 ## Database query sessions
 

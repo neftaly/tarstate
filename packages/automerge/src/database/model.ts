@@ -1,24 +1,12 @@
 import type {
   DatabaseTransactionService,
-  LogicalRelationRow
 } from '@tarstate/core/transactions';
 import type { OwnedDatabaseSource } from '@tarstate/core/database/session';
-import type { Issue } from '@tarstate/core';
-import type { SourceBasis, SourceFreshness, SourceLifecycleState } from '@tarstate/core/source';
+import type { MappedDatabaseResult, MappedDatabaseSnapshot } from '@tarstate/core/attachment/mapped-adapter';
 
-export type AutomergeDatabaseResult = {
-  readonly readiness: 'ready' | 'incomplete' | 'invalid';
-  readonly rows: readonly LogicalRelationRow[];
-  readonly completeness: 'exact' | 'unknown';
-  readonly freshness: SourceFreshness;
-  readonly basis: SourceBasis;
-  readonly sourceState: SourceLifecycleState;
-  readonly issues: readonly Issue[];
-};
+export type AutomergeDatabaseResult = MappedDatabaseResult;
 
-export type AutomergeDatabaseSnapshot =
-  | { readonly state: 'open'; readonly current: AutomergeDatabaseResult }
-  | { readonly state: 'closed' };
+export type AutomergeDatabaseSnapshot = MappedDatabaseSnapshot;
 
 export type AutomergeDatabase = DatabaseTransactionService & OwnedDatabaseSource & {
   readonly getSnapshot: () => AutomergeDatabaseSnapshot;

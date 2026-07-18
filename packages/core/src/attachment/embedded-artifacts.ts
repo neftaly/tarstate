@@ -1,5 +1,7 @@
-import { createIssue, type JsonValue, type ParseResult } from '@tarstate/core';
+import { createIssue, type ParseResult } from '../issues.js';
+import type { JsonValue } from '../value.js';
 
+/** Indexes an owned embedded artifact collection by exact id and content hash. */
 export const indexEmbeddedArtifacts = (
   input: JsonValue
 ): ParseResult<ReadonlyMap<string, JsonValue>> => {
@@ -8,12 +10,16 @@ export const indexEmbeddedArtifacts = (
     const candidates: readonly JsonValue[] = Array.isArray(input)
       ? input
       : Object.entries(input).map(([id, artifact]) => {
-          if (!isRecord(artifact) || artifact.id !== id) throw new EmbeddedArtifactError('embedded_artifact_id_mismatch');
+          if (!isRecord(artifact) || artifact.id !== id) {
+            throw new EmbeddedArtifactError('embedded_artifact_id_mismatch');
+          }
           return artifact as JsonValue;
         });
     const artifacts = new Map<string, JsonValue>();
     for (const candidate of candidates) {
-      if (!isRecord(candidate) || typeof candidate.id !== 'string' || typeof candidate.contentHash !== 'string') continue;
+      if (!isRecord(candidate)
+        || typeof candidate.id !== 'string'
+        || typeof candidate.contentHash !== 'string') continue;
       const key = embeddedArtifactKey(candidate.id, candidate.contentHash);
       if (artifacts.has(key)) return failure('embedded_artifact_duplicate');
       artifacts.set(key, candidate as JsonValue);
@@ -25,13 +31,18 @@ export const indexEmbeddedArtifacts = (
   }
 };
 
-export const embeddedArtifactKey = (id: string, contentHash: string): string => id + '\0' + contentHash;
+export const embeddedArtifactKey = (id: string, contentHash: string): string =>
+  id + '\0' + contentHash;
 
 class EmbeddedArtifactError extends Error {}
 
 const failure = (reason: string): ParseResult<never> => ({
   success: false,
-  issues: [createIssue({ code: 'artifact.invalid_envelope', retry: 'after_input', details: { reason } })]
+  issues: [createIssue({
+    code: 'artifact.invalid_envelope',
+    retry: 'after_input',
+    details: { reason }
+  })]
 });
 
 const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
