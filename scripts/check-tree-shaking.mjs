@@ -24,6 +24,11 @@ const cases = [
     maxGzipBytes: 700
   },
   {
+    name: 'typed union-all authoring',
+    source: selectedExport('packages/core/dist/query/authoring/index.js', 'typedUnionAll'),
+    maxGzipBytes: 1_000
+  },
+  {
     name: 'database attachment catalog',
     source: selectedExport('packages/core/dist/database/index.js', 'AttachmentCatalog'),
     maxGzipBytes: 1_500
@@ -37,6 +42,11 @@ const cases = [
     name: 'external-store runtime bridge',
     source: selectedExport('packages/core/dist/database/external-store/index.js', 'acquireExternalStoreRuntime'),
     maxGzipBytes: 5_200
+  },
+  {
+    name: 'memory atomic external store',
+    source: selectedExport('packages/core/dist/database/external-store/index.js', 'createMemoryAtomicExternalStore'),
+    maxGzipBytes: 650
   },
   {
     name: 'external-store database initial entry',
