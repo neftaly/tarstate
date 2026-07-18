@@ -1,6 +1,5 @@
 import * as Automerge from '@automerge/automerge';
 import { comparePortableStrings } from '../shared/portable-order.js';
-import { samePortableJson } from '../shared/portable-json.js';
 import {
   canonicalizeJson,
   createIssue,
@@ -13,8 +12,6 @@ import {
   type PlanResult,
   type SourceCommitInput,
   type SourceCommitResult,
-  type SourceFreshness,
-  type SourceLifecycleState,
   type SourceOutcomeLookup,
   type SourceSnapshot
 } from '@tarstate/core/source';
@@ -46,7 +43,6 @@ export {
 export type AutomergeAtomicSourceOptions<T extends object> = {
   readonly runtime: AutomergeSourceRuntimeApi<T>;
   readonly operationEpoch: string;
-  readonly freshness?: SourceFreshness;
   readonly ownsRuntime?: boolean;
   readonly onDiagnostic?: AutomergeSourceDiagnosticReporter;
 };
@@ -60,9 +56,8 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   readonly #onDiagnostic: AutomergeSourceDiagnosticReporter | undefined;
   readonly #listeners = new Set<(change?: { readonly beforeBasis?: import('@tarstate/core/source').SourceBasis; readonly afterBasis: import('@tarstate/core/source').SourceBasis }) => void>();
   readonly #unsubscribeRuntime: () => void;
-  #freshness: SourceFreshness;
-  #lifecycle: SourceLifecycleState = 'ready';
-  #lifecycleIssues: readonly Issue[] = Object.freeze([]);
+  #closed = false;
+  #closedIssues: readonly Issue[] | undefined;
   #lastReady: { readonly basis: AutomergeBasis; readonly storage: Automerge.Doc<T> };
 
   constructor(options: AutomergeAtomicSourceOptions<T>) {
@@ -70,7 +65,6 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     this.#runtime = options.runtime;
     this.sourceId = options.runtime.sourceId;
     this.operationEpoch = options.operationEpoch;
-    this.#freshness = options.freshness ?? 'current';
     this.#ownsRuntime = options.ownsRuntime === true;
     this.#onDiagnostic = options.onDiagnostic;
     const initial = options.runtime.snapshot();
@@ -83,14 +77,14 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   }
 
   snapshot = (): SourceSnapshot<Automerge.Doc<T>> => {
-    if (this.#lifecycle !== 'ready') {
+    if (this.#closed) {
       return Object.freeze({
         sourceId: this.sourceId,
         operationEpoch: this.operationEpoch,
         basis: this.#lastReady.basis,
-        state: this.#lifecycle,
-        freshness: this.#lifecycle === 'closed' ? 'none' : this.#freshness,
-        issues: this.#lifecycleIssues
+        state: 'closed',
+        freshness: 'none',
+        issues: this.#closedIssues ?? noIssues
       });
     }
     const current = this.#runtime.snapshot();
@@ -99,14 +93,14 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
       operationEpoch: this.operationEpoch,
       basis: current.basis,
       state: 'ready',
-      freshness: this.#freshness,
+      freshness: 'current',
       storage: current.storage,
-      issues: this.#lifecycleIssues
+      issues: noIssues
     });
   };
 
   snapshotAt = (input: import('@tarstate/core/source').SourceBasis): SourceSnapshot<Automerge.Doc<T>> => {
-    if (this.#lifecycle !== 'ready') throw new TypeError('Cannot view a non-ready Automerge source');
+    if (this.#closed) throw new TypeError('Cannot view a closed Automerge source');
     const basis = parseAutomergeBasis(input);
     if (basis === undefined) throw new TypeError('Automerge historical view requires an Automerge basis');
     const view = this.#runtime.view(basis);
@@ -115,21 +109,21 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
       operationEpoch: this.operationEpoch,
       basis: view.basis,
       state: 'ready',
-      freshness: this.#freshness,
+      freshness: 'current',
       storage: view.storage,
-      issues: this.#lifecycleIssues
+      issues: noIssues
     });
   };
 
   subscribe = (listener: (change?: { readonly beforeBasis?: import('@tarstate/core/source').SourceBasis; readonly afterBasis: import('@tarstate/core/source').SourceBasis }) => void): (() => void) => {
-    if (this.#lifecycle === 'closed') return () => undefined;
+    if (this.#closed) return () => undefined;
     this.#listeners.add(listener);
     return () => { this.#listeners.delete(listener); };
   };
 
   commit = async (input: SourceCommitInput<AutomergeSourceCommand<T>>): Promise<SourceCommitResult> => {
-    if (this.#lifecycle !== 'ready') {
-      return frozenCoreCommitResult({ outcome: 'rejected', issues: [sourceStateIssue(this.sourceId, this.#lifecycle)] });
+    if (this.#closed) {
+      return frozenCoreCommitResult({ outcome: 'rejected', issues: this.#closedIssues ?? noIssues });
     }
     if (input.operationEpoch !== this.operationEpoch) {
       return frozenCoreCommitResult({
@@ -171,10 +165,10 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
   commitReconciled = async (
     input: import('@tarstate/core/source').ReconciledSourceCommitInput<Automerge.Doc<T>>
   ): Promise<SourceCommitResult> => {
-    if (this.#lifecycle !== 'ready') {
+    if (this.#closed) {
       return frozenCoreCommitResult({
         outcome: 'rejected',
-        issues: [sourceStateIssue(this.sourceId, this.#lifecycle)]
+        issues: this.#closedIssues ?? noIssues
       });
     }
     const basis = parseAutomergeBasis(input.expectedBasis);
@@ -298,33 +292,10 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
     return lookup;
   };
 
-  setFreshness(freshness: SourceFreshness): void {
-    if (this.#lifecycle === 'closed' || freshness === this.#freshness) return;
-    this.#freshness = freshness;
-    this.#publish({ afterBasis: this.#lastReady.basis });
-  }
-
-  setLifecycle(state: Exclude<SourceLifecycleState, 'ready' | 'closed'>, issues: readonly Issue[] = []): void {
-    if (this.#lifecycle === 'closed') throw new Error('Automerge atomic source is closed');
-    if (state === this.#lifecycle && sameIssues(issues, this.#lifecycleIssues)) return;
-    this.#lifecycle = state;
-    this.#lifecycleIssues = Object.freeze([...issues]);
-    this.#publish({ afterBasis: this.#lastReady.basis });
-  }
-
-  markReady(freshness: SourceFreshness = 'current'): void {
-    if (this.#lifecycle === 'closed') throw new Error('Automerge atomic source is closed');
-    this.#lifecycle = 'ready';
-    this.#freshness = freshness;
-    this.#lifecycleIssues = Object.freeze([]);
-    this.#publish({ afterBasis: this.#lastReady.basis });
-  }
-
   close(): void {
-    if (this.#lifecycle === 'closed') return;
-    this.#lifecycle = 'closed';
-    this.#freshness = 'none';
-    this.#lifecycleIssues = Object.freeze([createIssue({ code: 'source.closed', sourceId: this.sourceId, retry: 'never' })]);
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#closedIssues = Object.freeze([sourceClosedIssue(this.sourceId)]);
     this.#publish({ afterBasis: this.#lastReady.basis });
     this.#listeners.clear();
     runAutomergeCleanups([
@@ -392,13 +363,13 @@ const adapterIssue = (
   ...(path === undefined ? {} : { path })
 });
 
-const sourceStateIssue = (sourceId: string, state: SourceLifecycleState): Issue => createIssue({
-  code: state === 'closed' ? 'source.closed' : 'source.not_ready',
-  phase: state === 'closed' ? 'lifecycle' : 'load',
+const sourceClosedIssue = (sourceId: string): Issue => createIssue({
+  code: 'source.closed',
+  phase: 'lifecycle',
   severity: 'error',
-  retry: state === 'closed' ? 'never' : 'after_refresh',
+  retry: 'never',
   sourceId,
-  details: { state }
+  details: { state: 'closed' }
 });
 
 const parseAutomergeBasis = (value: unknown): AutomergeBasis | undefined => {
@@ -408,7 +379,7 @@ const parseAutomergeBasis = (value: unknown): AutomergeBasis | undefined => {
   return { kind: 'automerge-heads', heads: [...new Set(candidate.heads as string[])].sort() };
 };
 
-const sameIssues = (left: readonly Issue[], right: readonly Issue[]): boolean => samePortableJson(left, right);
+const noIssues: readonly Issue[] = Object.freeze([]);
 
 const adapterRetry = (code: string, phase: 'load' | 'query' | 'plan' | 'commit'): NonNullable<Issue['retry']> => {
   if (code === 'transaction.operation_id_ambiguous') return 'never';

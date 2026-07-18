@@ -177,22 +177,19 @@ describe('Automerge core source protocol', () => {
     expect(lookup).toMatchObject({ status: 'known', result: { outcome: 'committed' } });
   });
 
-  it('publishes freshness and lifecycle changes as source snapshots', () => {
+  it('publishes runtime changes and the terminal closed snapshot', () => {
     const { runtime, source } = fixture();
     const states: string[] = [];
     source.subscribe(() => {
       states.push(source.snapshot().state);
     });
 
-    source.setFreshness('stale');
-    source.setLifecycle('loading');
     runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
       draft.tasks.second = { title: 'Second' };
     }));
-    source.markReady();
     source.close();
 
-    expect(states).toEqual(['ready', 'loading', 'loading', 'ready', 'closed']);
+    expect(states).toEqual(['ready', 'closed']);
     expect(source.snapshot()).toMatchObject({
       state: 'closed',
       freshness: 'none',
