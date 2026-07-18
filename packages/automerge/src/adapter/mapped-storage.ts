@@ -271,10 +271,14 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
   }
 
   plan = (snapshot: SourceSnapshot<Automerge.Doc<T>>, edits: readonly LogicalEdit[]): PlanResult<AutomergeSourceCommand<T>> => {
-    const handledEdits = edits.flatMap((edit, editIndex) => this.#relations.has(edit.relationId)
-      ? [{ editIndex, mode: 'exclusive' as const }]
-      : []);
-    const relevant = handledEdits.map(({ editIndex }) => edits[editIndex] as LogicalEdit);
+    const handledEdits: { readonly editIndex: number; readonly mode: 'exclusive' }[] = [];
+    const relevant: LogicalEdit[] = [];
+    for (let editIndex = 0; editIndex < edits.length; editIndex += 1) {
+      const edit = edits[editIndex] as LogicalEdit;
+      if (!this.#relations.has(edit.relationId)) continue;
+      handledEdits.push({ editIndex, mode: 'exclusive' });
+      relevant.push(edit);
+    }
     const empty = automergePathFootprint([]);
     if (relevant.length === 0) return { handledEdits, readFootprint: empty, writeFootprint: empty, intents: [], issues: [] };
     if (snapshot.state !== 'ready' || snapshot.storage === undefined) {
@@ -320,7 +324,16 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
           issues.push(bindingIssue('transaction.upsert_conflict', snapshot.sourceId, edit.relationId, undefined, { key: edit.key }));
           continue;
         }
-        const planned = this.#planInsert(snapshot, compiled, edit.relationId, edit.key, edit.fields);
+        const planned = planMappedInsert(
+          snapshot,
+          compiled,
+          edit.relationId,
+          edit.key,
+          edit.fields,
+          this.#mapping.schema,
+          this.#registry,
+          this.#scalarCodec
+        );
         if ('issues' in planned) issues.push(...planned.issues);
         else {
           intents.push(planned.intent);
@@ -504,148 +517,151 @@ implements StorageBinding<Automerge.Doc<T>, AutomergeSourceCommand<T>, Automerge
       : { handledEdits, readFootprint: this.declaredReadFootprint, writeFootprint, intents: combinedIntents, issues };
   };
 
-  #planInsert(
-    snapshot: SourceSnapshot<Automerge.Doc<T>>,
-    compiled: MappedRelation,
-    relationId: string,
-    key: JsonValue,
-    fields: Readonly<Record<string, JsonValue>>
-  ): { readonly intent: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> } } | { readonly issues: readonly Issue[] } {
-    const collectionMapping = compiled.mapping.collection;
-    if (collectionMapping.kind === 'singleton') {
-      return { issues: [bindingIssue('transaction.capability_unavailable', snapshot.sourceId, relationId, compiled.mapping.collection.path, { edit: 'insert', collection: compiled.mapping.collection.kind })] };
-    }
-    const keyValues = Array.isArray(key) ? key : [];
-    const keyFields = compiled.relation.declaration.key;
-    if (keyValues.length !== keyFields.length) return { issues: [bindingIssue('schema.key_arity', snapshot.sourceId, relationId)] };
-    const logical: Record<string, JsonValue> = { ...fields };
-    keyFields.forEach((field, index) => { logical[field] = keyValues[index] as JsonValue; });
-    const mapKeys = Object.entries(compiled.mapping.keys).filter(([, mapping]) => mapping.kind === 'map-key');
-    if ((collectionMapping.kind === 'object-map' && mapKeys.length !== 1)
-      || (collectionMapping.kind === 'array' && mapKeys.length !== 0)) {
-      return { issues: [bindingIssue('mapping.key_invalid', snapshot.sourceId, relationId, collectionMapping.path, {
-        reason: collectionMapping.kind === 'object-map' ? 'single_map_key_required' : 'map_key_requires_object_map'
-      })] };
-    }
-    const mapKeyField = mapKeys[0]?.[0];
-    const rawMapKey = mapKeyField === undefined ? undefined : logical[mapKeyField];
-    let candidatePath = collectionMapping.path as AutomergePath;
-    if (typeof rawMapKey === 'string') candidatePath = [...candidatePath, rawMapKey] as AutomergePath;
-    const parsed = parseRelationCandidate(this.#mapping.schema, compiled.relation, logical, this.#registry, { sourceId: snapshot.sourceId, relationId });
-    if (!parsed.success) {
-      return { issues: parsed.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath, key)) };
-    }
-    const mapKey = mapKeyField === undefined ? undefined : parsed.value.row[mapKeyField];
-    if (collectionMapping.kind === 'object-map'
-      && (typeof mapKey !== 'string'
-        || (collectionMapping.path.length === 0 && isAutomergeReservedRootProperty(mapKey)))) {
-      return { issues: [bindingIssue('mapping.key_invalid', snapshot.sourceId, relationId, compiled.mapping.collection.path, { reason: 'string_map_key_required' })] };
-    }
-    const collection = valueAtAutomergePath(snapshot.storage, collectionMapping.path as AutomergePath);
-    const createCollection = collection === undefined && collectionMapping.absent === 'creatable';
-    const validCollection = collectionMapping.kind === 'array'
-      ? Array.isArray(collection)
-      : isRecord(collection);
-    if (!validCollection && !createCollection) {
-      return { issues: [bindingIssue('mapping.collection_invalid', snapshot.sourceId, relationId, compiled.mapping.collection.path)] };
-    }
-    if (collectionMapping.kind === 'object-map'
-      && isRecord(collection)
-      && typeof mapKey === 'string'
-      && (Object.hasOwn(collection, mapKey) || conflictsAt(collection, mapKey).length > 0)) {
-      return { issues: [bindingIssue('transaction.upsert_conflict', snapshot.sourceId, relationId, [...compiled.mapping.collection.path, mapKey])] };
-    }
-    if (collectionMapping.kind === 'array' && Array.isArray(collection)) {
-      candidatePath = [...collectionMapping.path, collection.length] as AutomergePath;
-    }
-    const physical: Record<string, unknown> = {};
-    for (const [field, mapping] of Object.entries(compiled.mapping.keys)) {
-      if (mapping.kind === 'map-key') {
-        if (mapping.mirrorPath !== undefined && !setStoragePath(physical, mapping.mirrorPath, parsed.value.row[field])) {
-          return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.mirrorPath)] };
-        }
-      } else if (mapping.kind === 'field') {
-        const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
-        const encoded = this.#scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
-        if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };
-        if (!setStoragePath(physical, mapping.path, encoded.value)) {
-          return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
-        }
-      } else if (mapping.kind === 'literal') {
-        return { issues: [bindingIssue('mapping.key_invalid', snapshot.sourceId, relationId, compiled.mapping.collection.path, { reason: 'literal_key_requires_singleton' })] };
-      } else {
-        return { issues: [bindingIssue('transaction.capability_unavailable', snapshot.sourceId, relationId, candidatePath, { edit: 'insert', sourceMetadata: mapping.value })] };
+}
+
+const planMappedInsert = <T extends object>(
+  snapshot: SourceSnapshot<Automerge.Doc<T>>,
+  compiled: MappedRelation,
+  relationId: string,
+  key: JsonValue,
+  fields: Readonly<Record<string, JsonValue>>,
+  schema: CompiledStorageMapping['schema'],
+  registry: CapabilityRegistry | undefined,
+  scalarCodec: ReturnType<typeof createAutomergeStorageScalarCodec>
+): { readonly intent: { readonly footprint: AutomergePathFootprint; readonly command: AutomergeSourceCommand<T> } } | { readonly issues: readonly Issue[] } => {
+  const collectionMapping = compiled.mapping.collection;
+  if (collectionMapping.kind === 'singleton') {
+    return { issues: [bindingIssue('transaction.capability_unavailable', snapshot.sourceId, relationId, compiled.mapping.collection.path, { edit: 'insert', collection: compiled.mapping.collection.kind })] };
+  }
+  const keyValues = Array.isArray(key) ? key : [];
+  const keyFields = compiled.relation.declaration.key;
+  if (keyValues.length !== keyFields.length) return { issues: [bindingIssue('schema.key_arity', snapshot.sourceId, relationId)] };
+  const logical: Record<string, JsonValue> = { ...fields };
+  keyFields.forEach((field, index) => { logical[field] = keyValues[index] as JsonValue; });
+  const mapKeys = Object.entries(compiled.mapping.keys).filter(([, mapping]) => mapping.kind === 'map-key');
+  if ((collectionMapping.kind === 'object-map' && mapKeys.length !== 1)
+    || (collectionMapping.kind === 'array' && mapKeys.length !== 0)) {
+    return { issues: [bindingIssue('mapping.key_invalid', snapshot.sourceId, relationId, collectionMapping.path, {
+      reason: collectionMapping.kind === 'object-map' ? 'single_map_key_required' : 'map_key_requires_object_map'
+    })] };
+  }
+  const mapKeyField = mapKeys[0]?.[0];
+  const rawMapKey = mapKeyField === undefined ? undefined : logical[mapKeyField];
+  let candidatePath = collectionMapping.path as AutomergePath;
+  if (typeof rawMapKey === 'string') candidatePath = [...candidatePath, rawMapKey] as AutomergePath;
+  const parsed = parseRelationCandidate(schema, compiled.relation, logical, registry, { sourceId: snapshot.sourceId, relationId });
+  if (!parsed.success) {
+    return { issues: parsed.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath, key)) };
+  }
+  const mapKey = mapKeyField === undefined ? undefined : parsed.value.row[mapKeyField];
+  if (collectionMapping.kind === 'object-map'
+    && (typeof mapKey !== 'string'
+      || (collectionMapping.path.length === 0 && isAutomergeReservedRootProperty(mapKey)))) {
+    return { issues: [bindingIssue('mapping.key_invalid', snapshot.sourceId, relationId, compiled.mapping.collection.path, { reason: 'string_map_key_required' })] };
+  }
+  const collection = valueAtAutomergePath(snapshot.storage, collectionMapping.path as AutomergePath);
+  const createCollection = collection === undefined && collectionMapping.absent === 'creatable';
+  const validCollection = collectionMapping.kind === 'array'
+    ? Array.isArray(collection)
+    : isRecord(collection);
+  if (!validCollection && !createCollection) {
+    return { issues: [bindingIssue('mapping.collection_invalid', snapshot.sourceId, relationId, compiled.mapping.collection.path)] };
+  }
+  if (collectionMapping.kind === 'object-map'
+    && isRecord(collection)
+    && typeof mapKey === 'string'
+    && (Object.hasOwn(collection, mapKey) || conflictsAt(collection, mapKey).length > 0)) {
+    return { issues: [bindingIssue('transaction.upsert_conflict', snapshot.sourceId, relationId, [...compiled.mapping.collection.path, mapKey])] };
+  }
+  if (collectionMapping.kind === 'array' && Array.isArray(collection)) {
+    candidatePath = [...collectionMapping.path, collection.length] as AutomergePath;
+  }
+  const physical: Record<string, unknown> = {};
+  for (const [field, mapping] of Object.entries(compiled.mapping.keys)) {
+    if (mapping.kind === 'map-key') {
+      if (mapping.mirrorPath !== undefined && !setStoragePath(physical, mapping.mirrorPath, parsed.value.row[field])) {
+        return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.mirrorPath)] };
       }
-    }
-    for (const [field, mapping] of Object.entries(compiled.mapping.fields)) {
-      if (!Object.hasOwn(parsed.value.row, field)) continue;
-      if (mapping.kind === 'absent' || mapping.kind === 'source-metadata') {
-        return { issues: [bindingIssue('mapping.field_read_only', snapshot.sourceId, relationId, candidatePath, { field })] };
-      }
+    } else if (mapping.kind === 'field') {
       const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
-      const encoded = this.#scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
+      const encoded = scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
       if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };
       if (!setStoragePath(physical, mapping.path, encoded.value)) {
         return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
       }
+    } else if (mapping.kind === 'literal') {
+      return { issues: [bindingIssue('mapping.key_invalid', snapshot.sourceId, relationId, compiled.mapping.collection.path, { reason: 'literal_key_requires_singleton' })] };
+    } else {
+      return { issues: [bindingIssue('transaction.capability_unavailable', snapshot.sourceId, relationId, candidatePath, { edit: 'insert', sourceMetadata: mapping.value })] };
     }
-    if (createCollection) {
-      const collectionPath = collectionMapping.path as AutomergePath;
-      if (collectionPath.length === 0) {
-        return { issues: [bindingIssue('mapping.collection_invalid', snapshot.sourceId, relationId, collectionPath, { reason: 'root_collection_cannot_be_created' })] };
-      }
-      const parentPath = collectionPath.slice(0, -1) as AutomergePath;
-      const member = collectionPath.at(-1);
-      const parent = valueAtAutomergePath(snapshot.storage, parentPath);
-      if (!isRecord(parent) || typeof member !== 'string' || conflictsAt(parent, member).length > 0 || Object.hasOwn(parent, member)) {
-        return { issues: [bindingIssue('mapping.collection_invalid', snapshot.sourceId, relationId, collectionPath, { reason: 'uncreatable_or_ambiguous_parent' })] };
-      }
-      return {
-        intent: {
-          footprint: automergePathFootprint([{ scope: 'subtree', path: collectionPath }]),
-          command: {
-            description: 'create mapped collection and insert row',
-            apply: (draft) => {
-              const target = valueAtAutomergePath(draft, parentPath);
-              if (!isRecord(target) || Object.hasOwn(target, member)) throw new Error('Mapped collection target changed after planning');
-              target[member] = collectionMapping.kind === 'array'
-                ? [copyStorageValue(physical)]
-                : { [mapKey as string]: copyStorageValue(physical) };
-            }
-          }
-        }
-      };
+  }
+  for (const [field, mapping] of Object.entries(compiled.mapping.fields)) {
+    if (!Object.hasOwn(parsed.value.row, field)) continue;
+    if (mapping.kind === 'absent' || mapping.kind === 'source-metadata') {
+      return { issues: [bindingIssue('mapping.field_read_only', snapshot.sourceId, relationId, candidatePath, { field })] };
     }
-    if (collectionMapping.kind === 'array') {
-      return {
-        intent: {
-          footprint: automergePathFootprint([{ scope: 'subtree', path: collectionMapping.path as AutomergePath }]),
-          command: {
-            description: 'append mapped array row',
-            apply: (draft) => {
-              const target = valueAtAutomergePath(draft, collectionMapping.path as AutomergePath);
-              if (!Array.isArray(target)) throw new Error('Mapped insert target changed after planning');
-              target.push(copyStorageValue(physical));
-            }
-          }
-        }
-      };
+    const declaration = compiled.relation.declaration.fields[field] as typeof compiled.relation.declaration.fields[string];
+    const encoded = scalarCodec.encode({ value: parsed.value.row[field], declaration, relationId, field, path: mapping.path });
+    if (!encoded.success) return { issues: encoded.issues.map((issue) => withEvidence(issue, snapshot.sourceId, relationId, candidatePath)) };
+    if (!setStoragePath(physical, mapping.path, encoded.value)) {
+      return { issues: [bindingIssue('mapping.path_invalid', snapshot.sourceId, relationId, mapping.path)] };
     }
-    const storageMapKey = mapKey as string;
-    const path = [...collectionMapping.path, storageMapKey] as AutomergePath;
+  }
+  if (createCollection) {
+    const collectionPath = collectionMapping.path as AutomergePath;
+    if (collectionPath.length === 0) {
+      return { issues: [bindingIssue('mapping.collection_invalid', snapshot.sourceId, relationId, collectionPath, { reason: 'root_collection_cannot_be_created' })] };
+    }
+    const parentPath = collectionPath.slice(0, -1) as AutomergePath;
+    const member = collectionPath.at(-1);
+    const parent = valueAtAutomergePath(snapshot.storage, parentPath);
+    if (!isRecord(parent) || typeof member !== 'string' || conflictsAt(parent, member).length > 0 || Object.hasOwn(parent, member)) {
+      return { issues: [bindingIssue('mapping.collection_invalid', snapshot.sourceId, relationId, collectionPath, { reason: 'uncreatable_or_ambiguous_parent' })] };
+    }
     return {
-      intent: intentAt(path, {
-        description: 'insert mapped object row',
-        apply: (draft) => {
-          const target = valueAtAutomergePath(draft, compiled.mapping.collection.path as AutomergePath);
-          if (!isRecord(target) || Object.hasOwn(target, storageMapKey)) throw new Error('Mapped insert target changed after planning');
-          target[storageMapKey] = copyStorageValue(physical);
+      intent: {
+        footprint: automergePathFootprint([{ scope: 'subtree', path: collectionPath }]),
+        command: {
+          description: 'create mapped collection and insert row',
+          apply: (draft) => {
+            const target = valueAtAutomergePath(draft, parentPath);
+            if (!isRecord(target) || Object.hasOwn(target, member)) throw new Error('Mapped collection target changed after planning');
+            target[member] = collectionMapping.kind === 'array'
+              ? [copyStorageValue(physical)]
+              : { [mapKey as string]: copyStorageValue(physical) };
+          }
         }
-      })
+      }
     };
   }
-
-}
+  if (collectionMapping.kind === 'array') {
+    return {
+      intent: {
+        footprint: automergePathFootprint([{ scope: 'subtree', path: collectionMapping.path as AutomergePath }]),
+        command: {
+          description: 'append mapped array row',
+          apply: (draft) => {
+            const target = valueAtAutomergePath(draft, collectionMapping.path as AutomergePath);
+            if (!Array.isArray(target)) throw new Error('Mapped insert target changed after planning');
+            target.push(copyStorageValue(physical));
+          }
+        }
+      }
+    };
+  }
+  const storageMapKey = mapKey as string;
+  const path = [...collectionMapping.path, storageMapKey] as AutomergePath;
+  return {
+    intent: intentAt(path, {
+      description: 'insert mapped object row',
+      apply: (draft) => {
+        const target = valueAtAutomergePath(draft, compiled.mapping.collection.path as AutomergePath);
+        if (!isRecord(target) || Object.hasOwn(target, storageMapKey)) throw new Error('Mapped insert target changed after planning');
+        target[storageMapKey] = copyStorageValue(physical);
+      }
+    })
+  };
+};
 
 const automergeWriteCapabilities = (
   relations: ReadonlyMap<string, MappedRelation>,
