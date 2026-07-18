@@ -193,5 +193,7 @@ findings and resulting changes are recorded.
 | Performance, allocation, and TypeScript | Tightened the React rule so it prevents required per-row subscription fan-out without outlawing independent `useRow`; formalized freeze, assignment, bind/closure, engine-shape, emitted-JS, erasable TypeScript, and type-budget rules. | The repeat found no new optimization claim that justified API or architectural complexity. |
 | Verification portfolio | Confirmed focused fuzz suites have distinct models; recorded why the two broad query suites should not be merged mechanically. Added a source-neutral end-to-end replay schedule model and a focused-to-full feedback ladder. | The replay model now covers stale-basis, abort, and unknown-outcome schedules without coupling CRDT-specific shrinking vocabulary into the core suite. |
 
-The review intentionally made no production-code change. Current gaps remain
-gaps until a future implementation task supplies its own acceptance evidence.
+The initial specification review intentionally made no production-code change.
+The later implementation slices named above were reviewed and verified
+separately. Current gaps remain gaps until a future task supplies its own
+acceptance evidence.

@@ -25,6 +25,10 @@ attachment preparation or adapter constructors. `createDatabaseView` and adapter
 topic entries are host/adapter extension seams, not alternate application
 recipes.
 
+Framework adapters acquire shared external-store runtimes through
+`acquireExternalStoreRuntime`; the runtime constructor is deliberately type-only
+at the package boundary so identity and lease ownership cannot be bypassed.
+
 The memory atomic store is its own default source identity. External-store
 wrappers only provide `storeIdentity` when their stable underlying store differs
 from the wrapper object.

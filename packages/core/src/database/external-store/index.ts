@@ -1,5 +1,17 @@
 /** Host-runtime bridge for framework external stores. */
-export * from '../../external-store.js';
+export {
+  acquireExternalStoreRuntime,
+  sameExternalStoreBasis
+} from '../../external-store.js';
+export type {
+  AtomicExternalStore,
+  ExternalStoreBasis,
+  ExternalStoreCommitResult,
+  ExternalStoreLease,
+  ExternalStoreRuntime,
+  ExternalStoreSnapshot,
+  HydrationState
+} from '../../external-store.js';
 export { HostRuntimeRegistry } from '../../host.js';
 export { mappedRelationRows } from '../../attachment/mapped-relation-rows.js';
 export { createMemoryAtomicExternalStore } from './memory.js';

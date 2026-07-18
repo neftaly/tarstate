@@ -54,7 +54,6 @@ describe('topic-focused core surface', () => {
     expect('DatabaseView' in database).toBe(false);
     expect(Object.keys(databaseAdapter)).toEqual(['createLiveAttachmentDatabase']);
     expect(Object.keys(databaseExternalStore).sort()).toEqual([
-      'ExternalStoreRuntime',
       'HostRuntimeRegistry',
       'acquireExternalStoreRuntime',
       'createMemoryAtomicExternalStore',
@@ -62,6 +61,8 @@ describe('topic-focused core surface', () => {
       'openExternalStoreDatabase',
       'sameExternalStoreBasis'
     ]);
+    expectTypeOf<import('@tarstate/core/database/external-store').ExternalStoreRuntime<unknown>>()
+      .toMatchTypeOf<import('../src/external-store.js').ExternalStoreRuntime<unknown>>();
     expect('openDatabaseQuery' in database).toBe(false);
     expect(databaseSession.openDatabaseQuery).toBeTypeOf('function');
     expect('prepareDatabaseAttachment' in database).toBe(false);
