@@ -90,6 +90,21 @@ prepared plan's row/parameter types and focused readiness, share discovery and
 mount ownership, and compare its work against independent sessions and a
 normalized set query.
 
+### Collaborative text intent sessions and anchors
+
+Current `spliceText` correctly reconciles one eligible captured transaction but
+does not represent a stream whose later offsets depend on earlier
+unacknowledged local insertions. This is a real generic editor capability, not a
+Patchpit convention and not a defect that numeric replay can safely repair.
+
+Implementation is deferred until one design proves a bounded source-native
+candidate lifecycle, segment-level rejection and unknown-outcome evidence,
+historical-basis loss behavior, constraint validation before every conditional
+publication, and delivery-order convergence against real Automerge branches.
+Opaque deletion-aware anchors should remain a separately advertised capability
+unless implementation evidence shows they require the same lifecycle. Memory
+and non-mergeable stores may honestly report both capabilities absent.
+
 ### Physical performance evidence
 
 Algorithmic, bundle, and correctness-bearing benchmark ratchets exist. Absolute

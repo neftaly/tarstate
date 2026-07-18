@@ -71,6 +71,30 @@ evidence, and failed constraints may reject.
 Mixed transactions or guarded work use conservative replay semantics unless a
 future source-neutral rule proves reconciliation safe for the complete unit.
 
+### Dependent collaborative text streams
+
+Current fact: `spliceText` captures one transaction against canonical observed
+basis evidence. It does not provide a continuation basis for a later splice
+whose position depends on text introduced by an earlier unacknowledged local
+transaction. Reusing the older basis or replaying the later numeric offset over
+newly merged text is not safe.
+
+A future collaborative text session is justified only as an optional
+source-native capability. It must retain one private causal candidate across a
+bounded ordered segment stream, reconcile and validate the complete retained
+intent before conditional publication, and return explicit evidence for
+accepted-local, committed, rejected, unknown, expired, and unapplied dependent
+segments. Closing, cancellation, historical-basis loss, retries, and retained
+history must be bounded. Sources without native retained-intent semantics must
+advertise the capability as absent rather than emulate it with offset
+transforms.
+
+Opaque source-native text anchors are related but separable. Any future anchor
+contract must define movement when referenced text is deleted, remain scoped to
+one source and field, and keep adapter cursor representations private. Presence,
+editor rendering, input methods, undo policy, and transport remain product
+concerns.
+
 ## Multiplayer Automerge
 
 Remote users may change the document between any two local async steps. A
@@ -131,4 +155,6 @@ Attack the following:
 - simulation sharing a mutating path;
 - retry loops without a bound or with hidden product policy;
 - constraints checked before, but not after, merge;
+- dependent local text splices silently reinterpreted after a rejected or
+  unknown predecessor;
 - composite-key order changing between authoring and lowering.
