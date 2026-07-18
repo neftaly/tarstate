@@ -180,6 +180,8 @@ describe('Automerge core source protocol', () => {
   it('publishes runtime changes and the terminal closed snapshot', () => {
     const { runtime, source } = fixture();
     const states: string[] = [];
+    const initial = source.snapshot();
+    expect(source.snapshot()).toBe(initial);
     source.subscribe(() => {
       states.push(source.snapshot().state);
     });
@@ -187,10 +189,15 @@ describe('Automerge core source protocol', () => {
     runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
       draft.tasks.second = { title: 'Second' };
     }));
+    const changed = source.snapshot();
+    expect(changed).not.toBe(initial);
+    expect(source.snapshot()).toBe(changed);
     source.close();
 
     expect(states).toEqual(['ready', 'closed']);
-    expect(source.snapshot()).toMatchObject({
+    const closed = source.snapshot();
+    expect(source.snapshot()).toBe(closed);
+    expect(closed).toMatchObject({
       state: 'closed',
       freshness: 'none',
       issues: [{ code: 'source.closed' }]
