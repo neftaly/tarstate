@@ -209,6 +209,37 @@ describe('Automerge core source protocol', () => {
     });
   });
 
+  it('coalesces nested runtime notifications around the authoritative heads', () => {
+    const runtime = new AutomergeSourceRuntime({ sourceId: 'source:nested', doc: baseDoc() });
+    let nested = false;
+    runtime.subscribe(() => {
+      if (nested) return;
+      nested = true;
+      runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
+        draft.tasks.nested = { title: 'Nested' };
+      }));
+    });
+    const source = new AutomergeAtomicSource({ runtime, operationEpoch: 'epoch:nested' });
+    const changes: { readonly before: unknown; readonly after: unknown; readonly observed: unknown }[] = [];
+    source.subscribe((change) => {
+      changes.push({
+        before: change?.beforeBasis,
+        after: change?.afterBasis,
+        observed: source.snapshot().basis
+      });
+    });
+
+    runtime.replace(Automerge.change(runtime.snapshot().storage, { time: 0 }, (draft) => {
+      draft.tasks.outer = { title: 'Outer' };
+    }));
+
+    expect(changes).toHaveLength(1);
+    expect(changes[0]?.after).toBe(changes[0]?.observed);
+    expect(source.snapshot().storage).toMatchObject({
+      tasks: { outer: { title: 'Outer' }, nested: { title: 'Nested' } }
+    });
+  });
+
   it('contains observer and owned-runtime teardown failures', () => {
     const runtime = new AutomergeSourceRuntime({ sourceId: 'source:tasks', doc: baseDoc() });
     const unsubscribeFailure = new Error('unsubscribe failed');

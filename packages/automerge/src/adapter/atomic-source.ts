@@ -18,6 +18,7 @@ import {
 import {
   applySourceCommands,
   automergeBasis,
+  exactAutomergeBasisEqual,
   type AutomergeSnapshot,
   type AutomergeSourceRuntimeApi,
   type AutomergeBasis,
@@ -73,15 +74,17 @@ export class AutomergeAtomicSource<T extends object> implements AtomicSource<Aut
       this.operationEpoch,
       initial
     );
-    this.#unsubscribeRuntime = options.runtime.subscribe((change) => {
+    this.#unsubscribeRuntime = options.runtime.subscribe(() => {
       if (this.#closed) return;
       const latest = this.#runtime.snapshot();
+      const beforeBasis = this.#snapshot.basis;
+      if (beforeBasis === latest.basis || exactAutomergeBasisEqual(beforeBasis, latest.basis)) return;
       this.#snapshot = readySourceSnapshot(
         this.sourceId,
         this.operationEpoch,
         latest
       );
-      this.#publish({ beforeBasis: change.beforeBasis, afterBasis: change.afterBasis });
+      this.#publish({ beforeBasis, afterBasis: latest.basis });
     });
   }
 
