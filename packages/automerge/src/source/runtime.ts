@@ -107,10 +107,18 @@ const automergeSnapshot = <T extends object>(sourceId: string, basis: AutomergeB
 
 export const exactAutomergeHeadsEqual = (left: readonly string[], right: readonly string[]): boolean => {
   if (left.length !== right.length) return false;
-  if (isSorted(left) && isSorted(right)) return left.every((head, index) => head === right[index]);
+  if (isSorted(left) && isSorted(right)) {
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return false;
+    }
+    return true;
+  }
   const sortedLeft = [...left].sort();
   const sortedRight = [...right].sort();
-  return sortedLeft.every((head, index) => head === sortedRight[index]);
+  for (let index = 0; index < sortedLeft.length; index += 1) {
+    if (sortedLeft[index] !== sortedRight[index]) return false;
+  }
+  return true;
 };
 
 const isSorted = (values: readonly string[]): boolean => {
@@ -328,8 +336,8 @@ export class AutomergeSourceRuntime<T extends object> {
       }]);
     }
     const current = this.#owner.current();
-    this.#install(current, 'handle');
     const beforeBasis = automergeBasis(current);
+    this.#installAtBasis(current, beforeBasis, 'handle');
     const expectedBasis = input.expectedBasis;
     if (!exactAutomergeBasisEqual(beforeBasis, expectedBasis)) {
       const rejected = this.#rejected(input, beforeBasis, [{
@@ -391,7 +399,7 @@ export class AutomergeSourceRuntime<T extends object> {
           : { message: failure instanceof Error ? failure.message : String(failure) }
       }]);
       if (!stale) this.#retainOutcome(input, rejected);
-      this.#install(actual, 'handle');
+      this.#installAtBasis(actual, actualBasis, 'handle');
       return rejected;
     }
 
@@ -411,13 +419,21 @@ export class AutomergeSourceRuntime<T extends object> {
       issues: []
     });
     this.#retainOutcome(input, committed);
-    this.#install(applied.storage, 'commit');
+    this.#installAtBasis(applied.storage, afterBasis, 'commit');
     return committed;
   }
 
   #install(doc: Automerge.Doc<T>, origin: AutomergeSourceChange['origin']): void {
-    const beforeBasis = this.#snapshot.basis;
     const afterBasis = automergeBasis(doc);
+    this.#installAtBasis(doc, afterBasis, origin);
+  }
+
+  #installAtBasis(
+    doc: Automerge.Doc<T>,
+    afterBasis: AutomergeBasis,
+    origin: AutomergeSourceChange['origin']
+  ): void {
+    const beforeBasis = this.#snapshot.basis;
     if (exactAutomergeBasisEqual(beforeBasis, afterBasis)) return;
     this.#snapshot = automergeSnapshot(this.sourceId, afterBasis, doc);
     this.#notify({ beforeBasis, afterBasis, origin });
