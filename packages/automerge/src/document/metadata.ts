@@ -173,12 +173,13 @@ export const planAutomergeMetadataMutation = <T extends object>(
   const repair = command.request;
   if (repair.action !== 'repair_declaration') return rejectedPlan(beforeBasis, metadataIssue('automerge.metadata_repair_unsupported', command.sourceId));
   const scopedAlternatives = current.alternatives.filter(({ scope }) => scope === repair.section);
-  if (scopedAlternatives.some(({ section }) => section === undefined)) {
-    return rejectedPlan(beforeBasis, metadataIssue('automerge.metadata_repair_unsupported', command.sourceId, { reason: 'malformed_alternative_cannot_be_bound', section: repair.section }));
+  const observed: GovernanceSection[] = [];
+  for (const alternative of scopedAlternatives) {
+    if (alternative.section === undefined) {
+      return rejectedPlan(beforeBasis, metadataIssue('automerge.metadata_repair_unsupported', command.sourceId, { reason: 'malformed_alternative_cannot_be_bound', section: repair.section }));
+    }
+    observed.push(normalizeSection(alternative.section));
   }
-  const observed = scopedAlternatives
-    .filter(({ section }) => section !== undefined)
-    .map(({ section }) => normalizeSection(section!));
   const requested = repair.alternatives.map(normalizeSection);
   if (!samePortableSet(observed, requested)
     || !requested.some((section) => samePortableJson(section, normalizeSection(repair.selected)))) {
