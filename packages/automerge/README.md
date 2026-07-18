@@ -14,8 +14,8 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.4.11.tgz \
-  ./tarstate-automerge-0.4.11.tgz \
+  ./tarstate-core-0.4.12.tgz \
+  ./tarstate-automerge-0.4.12.tgz \
   @automerge/automerge
 ```
 
@@ -26,7 +26,7 @@ prepared, owned, staged, or fast variants; the database optimizes and replays
 this one operation API internally.
 
 ```ts
-import { openAutomergeDatabase } from '@tarstate/automerge';
+import { mappedRelationRows, openAutomergeDatabase } from '@tarstate/automerge';
 import { relationLiteral, sealSchema } from '@tarstate/core/schema';
 
 type TaskDoc = {
@@ -71,7 +71,7 @@ const taskWrites = opened.value.writeCapabilities(tasks);
 const unsubscribe = opened.value.subscribe(() => {
   const snapshot = opened.value.getSnapshot();
   if (snapshot.state === 'open' && snapshot.current.readiness === 'ready') {
-    renderTasks(snapshot.current.rows);
+    renderTasks(mappedRelationRows(snapshot.current, tasks));
   }
 });
 
@@ -88,6 +88,10 @@ const receipt = await opened.value.transact(operation, (snapshot) =>
 unsubscribe();
 opened.value.close();
 ```
+
+`mappedRelationRows` verifies the snapshot's exact schema view, preserves the
+generated row type and projected row identities, and reuses its readonly array
+for repeated selection from the same immutable result.
 
 The callback is pure and may run again after a concurrent document change.
 Tarstate derives keyed deltas from the prepared schema, re-projects and checks

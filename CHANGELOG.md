@@ -3,6 +3,21 @@
 Notable changes to Tarstate are recorded here. Dates use the repository's Git
 history.
 
+## [0.4.12] - 2026-07-18
+
+### Added
+
+- Added schema-verified `mappedRelationRows` selection to the Automerge and
+  external-store database entries. It preserves generated row types, projected
+  object identity, and stable readonly arrays without weakening readiness.
+
+### Fixed
+
+- Optional schema fields now always provide typed query expression handles
+  while retaining missing values in their expression result types.
+- Typed source-link plans may carry honest optional source provenance into the
+  existing runtime validation and diagnostic boundary.
+
 ## [0.4.11] - 2026-07-18
 
 ### Added

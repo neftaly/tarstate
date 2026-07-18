@@ -131,6 +131,7 @@ export const openAutomergeDatabase = async <T extends object, Heads>(
         attachmentId,
         incarnation: attachmentIncarnation,
         authorityScope: input.authorityScope,
+        schemaView: preparation.declaration.storageSchema,
         transactions,
         preparation: boundPreparation,
         source,

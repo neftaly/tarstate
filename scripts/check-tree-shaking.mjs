@@ -45,6 +45,11 @@ const cases = [
     maxGzipBytes: 1_000
   },
   {
+    name: 'mapped relation row selector',
+    source: selectedExport('packages/core/dist/database/external-store/index.js', 'mappedRelationRows'),
+    maxGzipBytes: 800
+  },
+  {
     name: 'external-store relational database',
     source: selectedExport('packages/core/dist/database/external-store/index.js', 'openExternalStoreDatabase'),
     maxGzipBytes: 67_000
@@ -97,6 +102,11 @@ const cases = [
     name: 'Automerge value adoption',
     source: selectedExport('packages/automerge/dist/values/index.js', 'adoptConflictFreeAutomergeJsonValue'),
     maxGzipBytes: 5_200
+  },
+  {
+    name: 'Automerge mapped relation row selector',
+    source: selectedExport('packages/automerge/dist/index.js', 'mappedRelationRows'),
+    maxGzipBytes: 800
   },
   {
     name: 'Automerge database',

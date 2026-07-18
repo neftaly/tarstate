@@ -45,6 +45,7 @@ describe('topic-focused core surface', () => {
       'embeddedArtifactKey',
       'indexEmbeddedArtifacts',
       'mappedDatabaseSnapshot',
+      'mappedRelationRows',
       'sameMappedDatabaseSnapshot'
     ]);
     expect(capabilities.CapabilityRegistry).toBeTypeOf('function');
@@ -55,6 +56,7 @@ describe('topic-focused core surface', () => {
       'ExternalStoreRuntime',
       'HostRuntimeRegistry',
       'acquireExternalStoreRuntime',
+      'mappedRelationRows',
       'openExternalStoreDatabase',
       'sameExternalStoreBasis'
     ]);

@@ -1,4 +1,5 @@
 import { canonicalizeJson } from '../canonical-json.js';
+import type { ArtifactRef } from '../artifacts.js';
 import { checkCurrentConstraints, type ConstraintCheck, type SourceConstraint } from '../constraints.js';
 import type { Issue } from '../issues.js';
 import { samePortableJson } from '../internal-json-equality.js';
@@ -27,6 +28,7 @@ export type MappedAttachmentProjector<Storage, Row extends WritableLogicalRow> =
 };
 
 export type MappedDatabaseResult = {
+  readonly schemaView: ArtifactRef;
   readonly readiness: 'ready' | 'incomplete' | 'invalid';
   readonly rows: readonly MappedLogicalRelationRow[];
   readonly completeness: 'exact' | 'unknown';
@@ -74,9 +76,10 @@ export const createMappedAttachmentProjector = <Storage, Command, Row extends Wr
 export const mappedDatabaseSnapshot = <Storage, Row extends WritableLogicalRow>(
   sourceSnapshot: SourceSnapshot<Storage>,
   projector: MappedAttachmentProjector<Storage, Row>,
-  logicalRows: WeakMap<object, readonly MappedLogicalRelationRow[]>
+  logicalRows: WeakMap<object, readonly MappedLogicalRelationRow[]>,
+  schemaView: ArtifactRef
 ): MappedDatabaseSnapshot => {
-  if (sourceSnapshot.state !== 'ready') return unavailableSnapshot(sourceSnapshot);
+  if (sourceSnapshot.state !== 'ready') return unavailableSnapshot(sourceSnapshot, schemaView);
   const projection = projector.project(sourceSnapshot);
   let rows = logicalRows.get(projection.mapped);
   if (rows === undefined) {
@@ -90,6 +93,7 @@ export const mappedDatabaseSnapshot = <Storage, Row extends WritableLogicalRow>(
   return Object.freeze({
     state: 'open',
     current: Object.freeze({
+      schemaView,
       readiness: databaseReadiness(
         sourceSnapshot.state,
         projection.mapped.completeness,
@@ -154,6 +158,8 @@ export const sameMappedDatabaseSnapshot = (
   right: MappedDatabaseSnapshot
 ): boolean => left.state === 'open'
   && right.state === 'open'
+  && left.current.schemaView.id === right.current.schemaView.id
+  && left.current.schemaView.contentHash === right.current.schemaView.contentHash
   && left.current.rows === right.current.rows
   && left.current.readiness === right.current.readiness
   && left.current.completeness === right.current.completeness
@@ -187,10 +193,12 @@ const relationInputs = <Row extends WritableLogicalRow>(input: {
 };
 
 const unavailableSnapshot = <Storage>(
-  snapshot: SourceSnapshot<Storage>
+  snapshot: SourceSnapshot<Storage>,
+  schemaView: ArtifactRef
 ): MappedDatabaseSnapshot => Object.freeze({
   state: 'open',
   current: Object.freeze({
+    schemaView,
     readiness: snapshot.state === 'loading' ? 'incomplete' : 'invalid',
     rows: Object.freeze([]),
     completeness: 'unknown',

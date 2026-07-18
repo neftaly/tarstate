@@ -132,6 +132,7 @@ export const openExternalStoreDatabase = async <State extends object>(
         attachmentId,
         incarnation: attachmentIncarnation,
         authorityScope: input.authorityScope,
+        schemaView: preparation.declaration.storageSchema,
         transactions,
         preparation: boundPreparation,
         source,

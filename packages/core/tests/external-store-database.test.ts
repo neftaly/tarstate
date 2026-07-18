@@ -1,6 +1,7 @@
 import { builtInCapabilityRefs } from '../src/builtins.js';
 import { sealConstraintSet } from '../src/constraint-artifact.js';
 import {
+  mappedRelationRows,
   openExternalStoreDatabase,
   type AtomicExternalStore,
   type HydrationState
@@ -8,10 +9,11 @@ import {
 import { relationLiteral } from '../src/schema-authoring.js';
 import { sealSchema } from '../src/schema.js';
 import { sealStorageMapping } from '../src/mapping.js';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 type TaskState = {
   readonly tasks?: Readonly<Record<string, { readonly id: string; readonly title: string }>>;
+  readonly archivedTasks?: Readonly<Record<string, { readonly id: string; readonly title: string }>>;
 };
 
 const createAtomicStore = <State extends object>(initial: State, initialHydration: HydrationState = 'ready') => {
@@ -95,6 +97,38 @@ describe('external-store relational database', () => {
     expect(Object.getPrototypeOf(fixture.atomic.state.tasks)).toBe(Object.prototype);
     expect(fixture.atomic.state).not.toBe(before);
     expect(fixture.atomic.state.tasks?.first).not.toBe(before.tasks?.first);
+    fixture.database.close();
+  });
+
+  it('selects schema-verified typed rows without cloning projected row objects', async () => {
+    const fixture = await createTaskFixture();
+    const snapshot = fixture.database.getSnapshot();
+    if (snapshot.state !== 'open') throw new Error('Expected an open database');
+    const rows = mappedRelationRows(snapshot.current, fixture.tasks);
+    expectTypeOf(rows).toEqualTypeOf<readonly {
+      readonly id: string;
+      readonly title: string;
+    }[]>();
+    expect(rows).toEqual([{ id: 'first', title: 'First' }]);
+    expect(rows[0]).toBe(snapshot.current.rows[0]?.fields);
+    expect(mappedRelationRows(snapshot.current, fixture.tasks)).toBe(rows);
+    expect(mappedRelationRows(snapshot.current, fixture.archivedTasks)).toEqual([]);
+    expect(Object.isFrozen(rows)).toBe(true);
+
+    const otherSchema = await sealSchema({ id: 'urn:test:other-tasks:schema', body: {
+      relations: { tasks: {
+        relationId: 'tasks',
+        key: ['id'],
+        fields: {
+          id: { type: { kind: 'string' } },
+          title: { type: { kind: 'integer' } }
+        }
+      } }
+    } });
+    expect(() => mappedRelationRows(
+      snapshot.current,
+      relationLiteral(otherSchema, 'tasks')
+    )).toThrow('Mapped relation belongs to a different schema view');
     fixture.database.close();
   });
 
@@ -261,7 +295,12 @@ const createTaskFixture = async (options: { readonly constrained?: boolean } = {
     tasks: { first: { id: 'first', title: 'First' } }
   });
   const database = await openTaskDatabase(atomic, artifacts);
-  return { database, atomic, tasks: relationLiteral(artifacts.schema, 'tasks') };
+  return {
+    database,
+    atomic,
+    tasks: relationLiteral(artifacts.schema, 'tasks'),
+    archivedTasks: relationLiteral(artifacts.schema, 'archivedTasks')
+  };
 };
 
 const openTaskDatabase = async (
@@ -298,6 +337,14 @@ const taskArtifacts = async (options: { readonly constrained?: boolean } = {}) =
         id: { type: { kind: 'string' } },
         title: { type: { kind: 'string' } }
       }
+    },
+    archivedTasks: {
+      relationId: 'archived-tasks',
+      key: ['id'],
+      fields: {
+        id: { type: { kind: 'string' } },
+        title: { type: { kind: 'string' } }
+      }
     } }
   } });
   const mapping = await sealStorageMapping({ id: 'urn:test:external-tasks:mapping', body: {
@@ -305,6 +352,13 @@ const taskArtifacts = async (options: { readonly constrained?: boolean } = {}) =
     model: 'json-tree-v1',
     relations: { tasks: {
       collection: { kind: 'object-map', path: ['tasks'], absent: 'creatable' },
+      keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
+      fields: {
+        title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }
+      }
+    },
+    'archived-tasks': {
+      collection: { kind: 'object-map', path: ['archivedTasks'], absent: 'empty' },
       keys: { id: { kind: 'map-key', mirrorPath: ['id'], onMismatch: 'reject' } },
       fields: {
         title: { path: ['title'], write: { kind: 'replace', capability: builtInCapabilityRefs.fieldReplace } }

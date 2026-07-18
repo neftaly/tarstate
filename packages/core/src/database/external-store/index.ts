@@ -1,6 +1,7 @@
 /** Host-runtime bridge for framework external stores. */
 export * from '../../external-store.js';
 export { HostRuntimeRegistry } from '../../host.js';
+export { mappedRelationRows } from '../../attachment/mapped-relation-rows.js';
 export type {
   ExternalStoreDatabase,
   ExternalStoreDatabaseResult,

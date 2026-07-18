@@ -567,7 +567,10 @@ describe('database source links', () => {
       attachmentId: 'attachment:root',
       relations,
       storage: {
-        links: [{ linkId: 'broken', originSourceId: 'root', expectation: 'required' }],
+        links: [
+          { linkId: 'missing-origin', targetSourceId: 'child', expectation: 'required' },
+          { linkId: 'missing-target', originSourceId: 'root', expectation: 'required' }
+        ],
         items: [{ id: 'root-item' }]
       }
     });

@@ -1,4 +1,5 @@
 import type { ReadyAttachmentPreparation } from '../../attachment/preparation.js';
+import type { ArtifactRef } from '../../artifacts.js';
 import { createLiveAttachmentDatabase } from '../live-attachment.js';
 import type { DatabaseTransactionService } from '../transaction.js';
 import type { RelationInput } from '../../query/model.js';
@@ -17,6 +18,7 @@ export const createLiveExternalStoreDatabase = <State extends object>(input: {
   readonly attachmentId: string;
   readonly incarnation: string;
   readonly authorityScope: string;
+  readonly schemaView: ArtifactRef;
   readonly transactions: DatabaseTransactionService;
   readonly preparation: ReadyAttachmentPreparation<State, readonly RelationInput[], WritableLogicalState>;
   readonly source: ExternalStoreAtomicSource<State>;
@@ -30,7 +32,12 @@ export const createLiveExternalStoreDatabase = <State extends object>(input: {
     service: input.transactions,
     preparation: input.preparation,
     source: input.source,
-    deriveSnapshot: (source) => mappedDatabaseSnapshot(source, input.projector, logicalRows),
+    deriveSnapshot: (source) => mappedDatabaseSnapshot(
+      source,
+      input.projector,
+      logicalRows,
+      input.schemaView
+    ),
     sameSnapshot: sameMappedDatabaseSnapshot,
     closedSnapshot
   });

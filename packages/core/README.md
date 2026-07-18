@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.4.11.tgz
+npm install ./tarstate-core-0.4.12.tgz
 ```
 
 ## Choose the application path
@@ -148,7 +148,10 @@ declaration and embedded schema, mapping, and constraint artifacts used by other
 attached databases:
 
 ```ts
-import { openExternalStoreDatabase } from '@tarstate/core/database/external-store';
+import {
+  mappedRelationRows,
+  openExternalStoreDatabase
+} from '@tarstate/core/database/external-store';
 
 const opened = await openExternalStoreDatabase({
   sourceId: 'source:presence',
@@ -161,6 +164,12 @@ const opened = await openExternalStoreDatabase({
 
 if (!opened.success) throw new Error(opened.issues[0]?.code);
 const presence = opened.value;
+
+const current = presence.getSnapshot();
+if (current.state === 'open' && current.current.readiness === 'ready') {
+  const paneRows = mappedRelationRows(current.current, panes);
+  // paneRows retains the exact schema row type and projected object identities.
+}
 
 await presence.transact({ kind: 'select-pane', paneId }, snapshot =>
   snapshot.withRows(panes, applySelection(snapshot.rows(panes), paneId))
@@ -179,6 +188,11 @@ The standard opener owns runtime leasing and transaction plumbing. Pass a
 `hostRegistry` only when the application needs an explicit isolation/lifetime
 boundary. `acquireExternalStoreRuntime` remains the lower-level seam for
 framework adapters and non-relational host state.
+
+`mappedRelationRows` verifies the result's exact schema artifact before
+selecting a relation. It returns a stable native readonly array for repeated
+reads of the same immutable result and does not replace the caller's explicit
+readiness or completeness check.
 
 ## Database query sessions
 
@@ -221,6 +235,14 @@ the reachable source set. A source-link query returns `linkId`,
 `expectation` (`required` by default):
 
 ```ts
+const link = typedFrom(sourceLinks, 'link');
+const sourceLinkQuery = typedSelect(link, 'sourceLink', ({ link }) => ({
+  linkId: link.row.linkId,
+  originSourceId: typedSourceOf(link),
+  targetSourceId: link.row.targetSourceId
+}));
+const sourceLinkPlan = await prepareTypedQuery(sourceLinkQuery, queryScope);
+
 const session = await openDatabaseQuery({
   sources: [{ source: rootSource }],
   plan: applicationPlan,
@@ -243,6 +265,10 @@ const session = await openDatabaseQuery({
 // evidence; cancellation rejects with an AbortError.
 const settled = await session.whenSettled();
 ```
+
+Portable provenance remains typed as `string | undefined`; the discovery
+boundary accepts that honest type and diagnoses a candidate at runtime if its
+origin is actually absent.
 
 The opener translates portable source identity into a newly opened source with
 `mount()` and idempotent `close()` methods. Its lifetime transfers to the

@@ -42,6 +42,7 @@ import {
   type RuntimeQueryResultRow,
   type SchemaKey,
   type SchemaRow,
+  type TypedExpression,
   type TypedPreparedPlan
 } from '../src/type-authoring.js';
 
@@ -119,6 +120,13 @@ describe('literal-schema and query type authoring', () => {
     expectTypeOf<QueryParametersOf<typeof projected>>().toEqualTypeOf<{ readonly minimumScore: number }>();
     expectTypeOf<QueryResultRowOf<typeof projected>>().toEqualTypeOf<{ readonly author: string; readonly manager: string }>();
     expectTypeOf<ReturningRowOf<typeof returning>>().toEqualTypeOf<{ readonly author: string; readonly manager: string }>();
+    expectTypeOf(author.aliases.author.row.nickname).toEqualTypeOf<TypedExpression<string | undefined>>();
+    const optionalResult = typedSelect(author, 'optionalResult', (aliases) => ({
+      nickname: aliases.author.row.nickname
+    }));
+    expectTypeOf<QueryResultRowOf<typeof optionalResult>>().toEqualTypeOf<{
+      readonly nickname: string | undefined;
+    }>();
   });
 
   it('prepares a detached query plan without losing inferred rows or parameters', async () => {
@@ -180,6 +188,28 @@ describe('literal-schema and query type authoring', () => {
       readonly author: string;
       readonly manager: string;
     }[]>();
+
+    const sourceLinkQuery = typedSelect(author, 'sourceLink', (aliases) => ({
+      linkId: aliases.author.row.id,
+      originSourceId: typedSourceOf(aliases.author),
+      targetSourceId: aliases.author.row.name
+    }));
+    const sourceLinkPlan = await prepareTypedQuery(sourceLinkQuery, {
+      registryFingerprint: 'registry:one',
+      authorityFingerprint: 'authority:one',
+      datasetId: 'dataset:one'
+    });
+    const sourceLinkOptions: OpenDatabaseQueryOptions<typeof prepared, typeof sourceLinkPlan> = {
+      sources: [],
+      plan: prepared,
+      parameters: { minimumScore: 1 },
+      queryAuthorityScope: 'scope:test',
+      followSourceLinks: {
+        plan: sourceLinkPlan,
+        openSource: () => undefined
+      }
+    };
+    expectTypeOf(sourceLinkOptions.followSourceLinks?.plan).toEqualTypeOf<typeof sourceLinkPlan | undefined>();
 
     const rejectsNonLinkRows = (linkPlan: typeof prepared): OpenDatabaseQueryOptions<
       typeof prepared,

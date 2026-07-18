@@ -38,7 +38,7 @@ type ParametersOfExpressions<Expressions extends readonly AnyTypedExpression[]> 
 
 export type TypedAlias<Name extends string, Row> = {
   readonly name: Name;
-  readonly row: { readonly [Field in keyof Row]: TypedExpression<Row[Field]> };
+  readonly row: { readonly [Field in keyof Row]-?: TypedExpression<Row[Field]> };
 };
 export type TypedAliases = Readonly<Record<string, TypedAlias<string, unknown>>>;
 

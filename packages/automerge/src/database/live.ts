@@ -1,4 +1,5 @@
 import type * as Automerge from '@automerge/automerge';
+import type { ArtifactRef } from '@tarstate/core/artifacts';
 import {
   type ReadyAttachmentPreparation
 } from '@tarstate/core/attachment/adapter';
@@ -22,6 +23,7 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
   readonly attachmentId: string;
   readonly incarnation: string;
   readonly authorityScope: string;
+  readonly schemaView: ArtifactRef;
   readonly transactions: DatabaseTransactionService;
   readonly preparation: ReadyAttachmentPreparation<Automerge.Doc<T>, readonly RelationInput[], WritableLogicalState>;
   readonly source: AutomergeAtomicSource<T>;
@@ -35,7 +37,12 @@ export const createLiveAutomergeDatabase = <T extends object>(input: {
     service: input.transactions,
     preparation: input.preparation,
     source: input.source,
-    deriveSnapshot: (source) => mappedDatabaseSnapshot(source, input.projector, logicalRows),
+    deriveSnapshot: (source) => mappedDatabaseSnapshot(
+      source,
+      input.projector,
+      logicalRows,
+      input.schemaView
+    ),
     sameSnapshot: sameMappedDatabaseSnapshot,
     closedSnapshot
   });

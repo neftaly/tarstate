@@ -86,9 +86,18 @@ type SessionParameterOptions<Plan> = [PreparedPlanParameters<Plan>] extends [nev
 
 type SourceLinkPlan<Plan extends PreparedPlan<QueryNode>> = [PreparedPlanRow<Plan>] extends [never]
   ? Plan
-  : PreparedPlanRow<Plan> extends DatabaseSourceLink
+  : PreparedPlanRow<Plan> extends DatabaseSourceLinkCandidate
     ? Plan
     : never;
+
+type DatabaseSourceLinkCandidate = {
+  readonly linkId: string;
+  /** Runtime discovery rejects and diagnoses candidates whose source provenance is absent. */
+  readonly originSourceId: string | undefined;
+  readonly targetSourceId: string;
+  readonly targetAttachmentId?: string | undefined;
+  readonly expectation?: DatabaseSourceLink['expectation'] | undefined;
+};
 
 export type FollowDatabaseSourceLinksOptions<
   LinkPlan extends PreparedPlan<QueryNode> = PreparedPlan<QueryNode>

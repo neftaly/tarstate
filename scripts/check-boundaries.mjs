@@ -166,6 +166,7 @@ assignArchitectureGroup('transaction-runtime', [
 assignArchitectureGroup('attachment-runtime', [
   'attachment/embedded-artifacts.ts',
   'attachment/mapped-database-projection.ts',
+  'attachment/mapped-relation-rows.ts',
   'attachment/logical-constraint-query.ts',
   'attachment/preparation.ts',
   'attachment/projection-selection.ts',
@@ -279,6 +280,7 @@ const publicRuntimePolicies = new Map(Object.entries({
 }));
 
 const publicDeclarationPolicyAdditions = new Map(Object.entries({
+  'attachment/mapped-adapter/index.ts': ['capability'],
   'database/index.ts': ['artifact-resolution', 'semantic-artifact'],
   'database/observer/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact'],
   'database/session/index.ts': ['capability', 'artifact-resolution', 'semantic-artifact'],
