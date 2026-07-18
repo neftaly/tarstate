@@ -9,7 +9,8 @@ import {
 } from '../src/database.js';
 import { prepareManualReadOnlyAttachment } from '../src/attachment/preparation.js';
 import {
-  DatabaseView,
+  createDatabaseView,
+  type DatabaseView,
   type MaintainedDatabaseQueryResult,
   type DatabaseQueryMaintenanceInput,
   type CreateDatabaseQueryMaintenance,
@@ -154,7 +155,7 @@ const createMaintenance = (evaluation: typeof evaluate): import('../src/observer
   };
 };
 
-const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[], authorityScope = 'public', authorityFingerprint = 'authority:public', evaluation = evaluate, onDiagnostic?: import('../src/observer-diagnostics.js').ObserverDiagnosticReporter) => new DatabaseView<Query, Row, readonly Row[]>({
+const view = (catalog: AttachmentCatalog, datasets: readonly DatasetMembership[], authorityScope = 'public', authorityFingerprint = 'authority:public', evaluation = evaluate, onDiagnostic?: import('../src/observer-diagnostics.js').ObserverDiagnosticReporter) => createDatabaseView<Query, Row, readonly Row[]>({
   authorityScope,
   authorityFingerprint,
   registryFingerprint: 'registry:one',
@@ -217,6 +218,18 @@ const relationalPlan = (): PreparedPlan<QueryNode> => sealPreparedPlan({
 });
 
 describe('database membership and observation', () => {
+  it('keeps database view methods safe when passed or destructured', () => {
+    const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled' });
+    const database = view(new AttachmentCatalog(), [dataset]);
+    const { observe, getActiveMaintenanceCount, close } = database;
+    const observer = observe({ plan: plan() });
+
+    expect(getActiveMaintenanceCount()).toBe(1);
+    observer.close();
+    close();
+    expect(() => observe({ plan: plan() })).toThrow('Database view is closed');
+  });
+
   it('keeps maintenance factory calls source-compatible without a runtime identity', () => {
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled' });
     const initialInput: DatabaseQueryMaintenanceInput<Query, readonly Row[]> = {
@@ -255,7 +268,7 @@ describe('database membership and observation', () => {
     });
     const working = createMaintenance(evaluate);
     let factoryCalls = 0;
-    const database = new DatabaseView<Query, Row, readonly Row[]>({
+    const database = createDatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: (input) => {
@@ -380,7 +393,7 @@ describe('database membership and observation', () => {
     const attachmentLease = catalog.attach(attachment('attachment:construction-failure', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:construction-failure', source.sourceId)] });
     const close = vi.fn();
-    const database = new DatabaseView<Query, Row, readonly Row[]>({
+    const database = createDatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: () => ({ getCurrentResult: () => { throw new Error('current failed'); }, updateInput: evaluate, close })
@@ -515,7 +528,7 @@ describe('database membership and observation', () => {
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(relationalAttachment('attachment:incremental', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:incremental', source.sourceId)] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public',
       authorityFingerprint: 'authority:public',
       registryFingerprint: 'registry:one',
@@ -568,7 +581,7 @@ describe('database membership and observation', () => {
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(relationalAttachment('attachment:shared-evidence', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:shared-evidence', source.sourceId)] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public',
       authorityFingerprint: 'authority:public',
       registryFingerprint: 'registry:one',
@@ -638,7 +651,7 @@ describe('database membership and observation', () => {
       predicate: { kind: 'compare', op: 'gte', left: { kind: 'field', alias: 'row', name: 'id' }, right: threshold }
     };
     const reusedIdentityPlan = sealPreparedPlan({ ...relationalPlan(), query: mutableQuery });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
@@ -685,7 +698,7 @@ describe('database membership and observation', () => {
     const ids: QueryNode = { kind: 'select', input: commonPrefix(), alias: 'result', fields: { id: { kind: 'field', alias: 'row', name: 'id' } } };
     const values: QueryNode = { kind: 'select', input: commonPrefix(), alias: 'result', fields: { value: { kind: 'field', alias: 'row', name: 'value' } } };
     const factory = createIncrementalDatabaseQueryMaintenance();
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
     });
@@ -730,7 +743,7 @@ describe('database membership and observation', () => {
     });
     const callable = { id: 'urn:test:observe-during-update', version: '1', contractHash: `sha256:${'d'.repeat(64)}` } as const;
     const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
-    let database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>;
+    let database: DatabaseView<QueryNode, QueryRecord>;
     let late: QueryObserver<QueryRecord> | undefined;
     let openLate = false;
     const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
@@ -742,7 +755,7 @@ describe('database membership and observation', () => {
       }
       return args[0] ?? null;
     }]]);
-    database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
@@ -784,7 +797,7 @@ describe('database membership and observation', () => {
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:reentrant-first-attach', source.sourceId)] });
     const callable = { id: 'urn:test:observe-during-first-attach', version: '1', contractHash: `sha256:${'9'.repeat(64)}` } as const;
     const functionKey = callable.id + '\u0000' + callable.version + '\u0000' + callable.contractHash;
-    let database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>;
+    let database: DatabaseView<QueryNode, QueryRecord>;
     let late: QueryObserver<QueryRecord> | undefined;
     let openLate = true;
     const functions = new Map([[functionKey, (args: readonly JsonValue[]) => {
@@ -794,7 +807,7 @@ describe('database membership and observation', () => {
       }
       return args[0] ?? null;
     }]]);
-    database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
@@ -830,7 +843,7 @@ describe('database membership and observation', () => {
     const primaryMember = member('attachment:parameter-frames', source.sourceId);
     const secondaryMember = member('attachment:parameter-frames-secondary', secondary.sourceId);
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [primaryMember, secondaryMember] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -876,7 +889,7 @@ describe('database membership and observation', () => {
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(relationalAttachment('attachment:parameter-lru', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-lru', source.sourceId)] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -932,7 +945,7 @@ describe('database membership and observation', () => {
         fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
       }
     });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
@@ -994,7 +1007,7 @@ describe('database membership and observation', () => {
     const dataset = new DatasetMembership({
       datasetId: 'dataset:one', state: 'settled', members: [member('attachment:parameter-rejected-delta', source.sourceId)]
     });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -1049,7 +1062,7 @@ describe('database membership and observation', () => {
       })
     });
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member(attachmentId, source.sourceId)] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
     });
@@ -1090,7 +1103,7 @@ describe('database membership and observation', () => {
       alias: 'result',
       fields: { value: { kind: 'call', capability: callable, args: [{ kind: 'field', alias: 'row', name: 'value' }] } }
     };
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance(functions)
@@ -1117,7 +1130,7 @@ describe('database membership and observation', () => {
       kind: 'select', input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' }, alias: 'result',
       fields: { value: { kind: 'field', alias: 'row', name: 'value' } }
     };
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -1165,7 +1178,7 @@ describe('database membership and observation', () => {
     const attachmentLease = catalog.attach(relationalAttachment('attachment:isolated', source));
     const firstDataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:isolated', source.sourceId)] });
     const secondDataset = new DatasetMembership({ datasetId: 'dataset:two', state: 'settled', members: [member('attachment:isolated', source.sourceId)] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [firstDataset, secondDataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -1199,7 +1212,7 @@ describe('database membership and observation', () => {
       input: { kind: 'from', relation: { schemaView: querySchemaView, relationId: 'test.rows' }, alias: 'row' },
       predicate: { kind: 'subquery', mode: 'exists', query: { kind: 'values', alias: 'constant', rows: [{ value: true }] } }
     };
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -1240,7 +1253,7 @@ describe('database membership and observation', () => {
     };
     const attachmentLease = catalog.attach(partialAttachment);
     const dataset = new DatasetMembership({ state: 'open', datasetId: 'dataset:one', members: [member('attachment:partial', source.sourceId)] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -1347,7 +1360,7 @@ describe('database membership and observation', () => {
     const catalog = new AttachmentCatalog();
     const attachmentLease = catalog.attach(relationalAttachment('attachment:late-rejected', source));
     const dataset = new DatasetMembership({ datasetId: 'dataset:one', state: 'settled', members: [member('attachment:late-rejected', source.sourceId)] });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -1379,7 +1392,7 @@ describe('database membership and observation', () => {
     const dataset = new DatasetMembership({
       datasetId: 'dataset:one', state: 'settled', members: [member('attachment:initially-malformed', source.sourceId)]
     });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true,
       createQueryMaintenance: createIncrementalDatabaseQueryMaintenance()
@@ -1418,7 +1431,7 @@ describe('database membership and observation', () => {
         source: { kind: 'source-of', alias: 'row' }
       }
     };
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public',
       authorityFingerprint: 'authority:public',
       registryFingerprint: 'registry:one',
@@ -1693,7 +1706,7 @@ describe('database membership and observation', () => {
       datasetId: 'dataset:one', state: 'settled', members: [member('attachment:topology-authority', source.sourceId)]
     });
     let authorityFails = false;
-    const database = new DatabaseView<Query, Row, readonly Row[]>({
+    const database = createDatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset],
       canRead: () => {
@@ -1744,7 +1757,7 @@ describe('database membership and observation', () => {
         close: () => undefined
       };
     };
-    const database = new DatabaseView<Query, Row, readonly Row[]>({
+    const database = createDatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
     });
@@ -1808,7 +1821,7 @@ describe('database membership and observation', () => {
     const replayFactory: CreateDatabaseQueryMaintenance<QueryNode, QueryRecord, readonly RelationInput[]> = () => ({
       getCurrentResult: () => replayed, updateInput: () => replayed, close: () => undefined
     });
-    const database = new DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
+    const database = createDatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: replayFactory
     });
@@ -1997,7 +2010,7 @@ describe('database membership and observation', () => {
         close: () => undefined
       };
     };
-    const database = new DatabaseView<Query, Row, readonly Row[]>({
+    const database = createDatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory
     });
@@ -2020,7 +2033,7 @@ describe('database membership and observation', () => {
       let current = evaluate(initialInput);
       return { getCurrentResult: () => current, updateInput: (input) => { current = evaluate(input); return current; }, close };
     };
-    const database = new DatabaseView<Query, Row, readonly Row[]>({
+    const database = createDatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public', authorityFingerprint: 'authority:public', registryFingerprint: 'registry:one',
       attachments: catalog, datasets: [dataset], canRead: () => true, createQueryMaintenance: factory,
       onDiagnostic: diagnostics

@@ -6,7 +6,8 @@ import type {
 import { createIncrementalDatabaseQueryMaintenance } from '../internal-observer-query-maintenance.js';
 import { runObserverCleanups, type ObserverDiagnosticReporter } from '../observer-diagnostics.js';
 import {
-  DatabaseView,
+  createDatabaseView,
+  type DatabaseView,
   type ObservedQueryResult,
   type ObserverChange,
   type ObserverSnapshot,
@@ -14,7 +15,7 @@ import {
 } from '../observer.js';
 import type { PreparedPlanParameters, PreparedPlanRow } from '../query/authoring.js';
 import type { PreparedPlan } from '../query/plan-contract.js';
-import type { QueryNode, QueryRecord, RelationInput } from '../query/model.js';
+import type { QueryNode, QueryRecord } from '../query/model.js';
 import type { JsonValue } from '../value.js';
 import type { DatabaseDiscoveryBudget, DatabaseSourceLink } from './source-link-graph.js';
 import { parseObservationParameters } from '../internal-observer-values.js';
@@ -164,10 +165,10 @@ export const openDatabaseQuery = async <
     options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }
   );
   const leases: DatabaseSourceMountLease[] = [];
-  let database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
+  let database: DatabaseView<QueryNode, QueryRecord> | undefined;
   let observer: QueryObserver<SessionRow<Plan>> | undefined;
   let membership: DatasetMembership | undefined;
-  let sourceLinkDatabase: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> | undefined;
+  let sourceLinkDatabase: DatabaseView<QueryNode, QueryRecord> | undefined;
   let sourceLinkObserver: QueryObserver<QueryRecord> | undefined;
   let sourceLinkFollower: DatabaseSourceLinkFollower | undefined;
 
@@ -205,10 +206,10 @@ export const openDatabaseQuery = async <
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic })
     });
     membership = openedDatasetMembership;
-    const createDatabase = (datasetMembership = openedDatasetMembership): DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]> => {
+    const createDatabase = (datasetMembership = openedDatasetMembership): DatabaseView<QueryNode, QueryRecord> => {
       const createQueryMaintenance = createIncrementalDatabaseQueryMaintenance();
       registerProjectionDemand(createQueryMaintenance, deriveProjectionDemand);
-      return new DatabaseView({
+      return createDatabaseView({
         authorityScope: options.queryAuthorityScope,
         authorityFingerprint: options.plan.authorityFingerprint,
         registryFingerprint: options.plan.registryFingerprint,

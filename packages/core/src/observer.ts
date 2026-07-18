@@ -161,68 +161,73 @@ export const queryObservationKey = <Query>(
 ] as JsonValue);
 
 /** Authority-filtered database shell with one shared maintenance session per observation identity. */
-export class DatabaseView<Query, Row, Projection = unknown> {
+export type DatabaseView<Query, Row> = {
   readonly authorityScope: string;
   readonly authorityFingerprint: string;
   readonly registryFingerprint: string;
-  readonly #attachments: AttachmentCatalog;
-  readonly #datasets: ReadonlyMap<string, DatasetMembership>;
-  readonly #canRead: DatabaseViewOptions<Query, Row, Projection>['canRead'];
-  readonly #createQueryMaintenance: DatabaseViewOptions<Query, Row, Projection>['createQueryMaintenance'];
-  readonly #getDatabaseDescriptionSnapshot: (() => JsonValue) | undefined;
-  readonly #onDiagnostic: ObserverDiagnosticReporter | undefined;
-  readonly #cache = new Map<string, SharedObservation<Query, Row, Projection>>();
-  readonly #datasetRuntimes = new Map<string, DatasetCaptureRuntime<Projection>>();
-  #closed = false;
-
-  constructor(options: DatabaseViewOptions<Query, Row, Projection>) {
-    this.authorityScope = options.authorityScope;
-    this.authorityFingerprint = options.authorityFingerprint;
-    this.registryFingerprint = options.registryFingerprint;
-    this.#attachments = options.attachments;
-    const datasets = new Map<string, DatasetMembership>();
-    for (const dataset of options.datasets) {
-      const existing = datasets.get(dataset.datasetId);
-      if (existing !== undefined && existing !== dataset) throw new Error('A different dataset membership is registered for ' + dataset.datasetId);
-      datasets.set(dataset.datasetId, dataset);
-    }
-    this.#datasets = datasets;
-    this.#canRead = options.canRead;
-    this.#createQueryMaintenance = options.createQueryMaintenance;
-    this.#onDiagnostic = options.onDiagnostic;
-    this.#getDatabaseDescriptionSnapshot = options.getDatabaseDescriptionSnapshot;
-  }
-
-  observe<Plan extends PreparedPlan<Query>>(
+  readonly observe: <Plan extends PreparedPlan<Query>>(
     request: ObserveRequest<Query, Plan>
-  ): QueryObserver<ObservationRowForPlan<Plan, Row>> {
-    if (this.#closed) throw new Error('Database view is closed');
+  ) => QueryObserver<ObservationRowForPlan<Plan, Row>>;
+  readonly getActiveMaintenanceCount: () => number;
+  readonly getQueryMaintenanceDiagnostics: () => readonly QueryMaintenanceDiagnostics[];
+  readonly getQueryMaintenanceReuseDiagnostics: () => QueryMaintenanceReuseDiagnostics;
+  readonly getDatabaseDescriptionSnapshot: () => JsonValue | undefined;
+  readonly close: () => void;
+};
+
+export const createDatabaseView = <Query, Row, Projection = unknown>(
+  options: DatabaseViewOptions<Query, Row, Projection>
+): DatabaseView<Query, Row> => {
+  const {
+    attachments,
+    authorityScope,
+    authorityFingerprint,
+    registryFingerprint,
+    canRead,
+    createQueryMaintenance,
+    onDiagnostic,
+    getDatabaseDescriptionSnapshot: readDatabaseDescription
+  } = options;
+  const datasets = new Map<string, DatasetMembership>();
+  for (const dataset of options.datasets) {
+    const existing = datasets.get(dataset.datasetId);
+    if (existing !== undefined && existing !== dataset) throw new Error('A different dataset membership is registered for ' + dataset.datasetId);
+    datasets.set(dataset.datasetId, dataset);
+  }
+  const cache = new Map<string, SharedObservation<Query, Row, Projection>>();
+  const datasetRuntimes = new Map<string, DatasetCaptureRuntime<Projection>>();
+  let closed = false;
+
+  const observe = <Plan extends PreparedPlan<Query>>(
+    request: ObserveRequest<Query, Plan>
+  ): QueryObserver<ObservationRowForPlan<Plan, Row>> => {
+    if (closed) throw new Error('Database view is closed');
     assertPreparedPlan(request.plan);
-    if (request.plan.registryFingerprint !== this.registryFingerprint) throw new Error('Prepared plan registry fingerprint does not match database view');
-    if (request.plan.authorityFingerprint !== this.authorityFingerprint) throw new Error('Prepared plan authority fingerprint does not match database view');
-    const dataset = this.#datasets.get(request.plan.datasetId);
+    if (request.plan.registryFingerprint !== registryFingerprint) throw new Error('Prepared plan registry fingerprint does not match database view');
+    if (request.plan.authorityFingerprint !== authorityFingerprint) throw new Error('Prepared plan authority fingerprint does not match database view');
+    const dataset = datasets.get(request.plan.datasetId);
     if (dataset === undefined) throw new Error('Dataset is not part of this database view: ' + request.plan.datasetId);
     const plan = detachPreparedPlan(request.plan);
-    const projectionDemand = projectionDemandFor(this.#createQueryMaintenance)?.(plan.query);
+    const projectionDemand = projectionDemandFor(createQueryMaintenance)?.(plan.query);
     const parameters = parseObservationParameters(request.parameters ?? {});
-    const key = queryObservationKey(this, { ...request, plan, parameters });
-    let shared = this.#cache.get(key);
+    const key = queryObservationKey({ authorityScope, authorityFingerprint, registryFingerprint }, { ...request, plan, parameters });
+    let shared = cache.get(key);
     if (shared === undefined) {
       const runtimeKey = stringTupleKey(dataset.datasetId, projectionDemandKey(projectionDemand));
-      let runtime = this.#datasetRuntimes.get(runtimeKey);
+      let runtime = datasetRuntimes.get(runtimeKey);
       if (runtime === undefined) {
         runtime = new DatasetCaptureRuntime({
           dataset,
-          attachments: this.#attachments,
-          authorityScope: this.authorityScope,
-          canRead: this.#canRead,
+          attachments,
+          authorityScope,
+          canRead,
           ...(projectionDemand === undefined ? {} : { projectionDemand }),
-          ...(this.#onDiagnostic === undefined ? {} : { onDiagnostic: this.#onDiagnostic }),
+          ...(onDiagnostic === undefined ? {} : { onDiagnostic }),
           collect: () => {
-            if (this.#datasetRuntimes.get(runtimeKey) === runtime) this.#datasetRuntimes.delete(runtimeKey);
+            if (datasetRuntimes.get(runtimeKey) === runtime) datasetRuntimes.delete(runtimeKey);
           }
         });
-        this.#datasetRuntimes.set(runtimeKey, runtime);
+        datasetRuntimes.set(runtimeKey, runtime);
       }
       try {
         shared = new SharedObservation({
@@ -230,65 +235,76 @@ export class DatabaseView<Query, Row, Projection = unknown> {
           parameters,
           allowPartial: request.allowPartial === true,
           runtime,
-          createQueryMaintenance: this.#createQueryMaintenance,
-          ...(this.#onDiagnostic === undefined ? {} : { onDiagnostic: this.#onDiagnostic }),
+          createQueryMaintenance,
+          ...(onDiagnostic === undefined ? {} : { onDiagnostic }),
           collect: () => {
-            if (this.#cache.get(key) === shared) this.#cache.delete(key);
+            if (cache.get(key) === shared) cache.delete(key);
           }
         });
       } catch (error) {
         runtime.closeIfUnused();
         throw error;
       }
-      this.#cache.set(key, shared);
+      cache.set(key, shared);
     }
     return shared.acquire() as QueryObserver<ObservationRowForPlan<Plan, Row>>;
-  }
+  };
 
-  getActiveMaintenanceCount(): number { return this.#cache.size; }
+  const getActiveMaintenanceCount = (): number => cache.size;
 
   /** Optional physical IVM counters; custom maintenance factories return no entries. */
-  getQueryMaintenanceDiagnostics(): readonly QueryMaintenanceDiagnostics[] {
-    const extensions = queryMaintenanceExtensionsFor(this.#createQueryMaintenance);
+  const getQueryMaintenanceDiagnostics = (): readonly QueryMaintenanceDiagnostics[] => {
+    const extensions = queryMaintenanceExtensionsFor(createQueryMaintenance);
     return extensions === undefined
       ? []
-      : Object.freeze([...this.#datasetRuntimes.values()].flatMap(({ identity }) => extensions.diagnostics(identity)));
-  }
+      : Object.freeze([...datasetRuntimes.values()].flatMap(({ identity }) => extensions.diagnostics(identity)));
+  };
 
-  getQueryMaintenanceReuseDiagnostics(): QueryMaintenanceReuseDiagnostics {
-    const extensions = queryMaintenanceExtensionsFor(this.#createQueryMaintenance);
+  const getQueryMaintenanceReuseDiagnostics = (): QueryMaintenanceReuseDiagnostics => {
+    const extensions = queryMaintenanceExtensionsFor(createQueryMaintenance);
     if (extensions === undefined) return Object.freeze({ computedFrameDeltaCount: 0, reusedFrameDeltaCount: 0 });
     let computedFrameDeltaCount = 0;
     let reusedFrameDeltaCount = 0;
-    for (const { identity } of this.#datasetRuntimes.values()) {
+    for (const { identity } of datasetRuntimes.values()) {
       const diagnostics = extensions.reuseDiagnostics(identity);
       computedFrameDeltaCount += diagnostics.computedFrameDeltaCount;
       reusedFrameDeltaCount += diagnostics.reusedFrameDeltaCount;
     }
     return Object.freeze({ computedFrameDeltaCount, reusedFrameDeltaCount });
-  }
+  };
 
-  getDatabaseDescriptionSnapshot(): JsonValue | undefined {
-    return this.#getDatabaseDescriptionSnapshot?.();
-  }
+  const getDatabaseDescriptionSnapshot = (): JsonValue | undefined =>
+    readDatabaseDescription?.();
 
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
     runObserverCleanups(
-      Array.from(this.#cache.values(), (shared) => () => shared.close()),
+      Array.from(cache.values(), (shared) => () => shared.close()),
       { component: 'database-view', operation: 'close-observations' },
-      this.#onDiagnostic
+      onDiagnostic
     );
-    this.#cache.clear();
+    cache.clear();
     runObserverCleanups(
-      Array.from(this.#datasetRuntimes.values(), (runtime) => () => runtime.close()),
+      Array.from(datasetRuntimes.values(), (runtime) => () => runtime.close()),
       { component: 'database-view', operation: 'close-dataset-runtimes' },
-      this.#onDiagnostic
+      onDiagnostic
     );
-    this.#datasetRuntimes.clear();
-  }
-}
+    datasetRuntimes.clear();
+  };
+
+  return {
+    authorityScope,
+    authorityFingerprint,
+    registryFingerprint,
+    observe,
+    getActiveMaintenanceCount,
+    getQueryMaintenanceDiagnostics,
+    getQueryMaintenanceReuseDiagnostics,
+    getDatabaseDescriptionSnapshot,
+    close
+  };
+};
 
 type SharedOptions<Query, Row, Projection> = {
   readonly plan: PreparedPlan<Query>;

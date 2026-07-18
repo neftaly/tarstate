@@ -2,7 +2,7 @@ import inspector from 'node:inspector';
 import { performance } from 'node:perf_hooks';
 import {
   AttachmentCatalog,
-  DatabaseView,
+  createDatabaseView,
   DatasetMembership
 } from '../packages/core/dist/database/index.js';
 import { createIncrementalDatabaseQueryMaintenance } from '../packages/core/dist/database/incremental/index.js';
@@ -83,7 +83,7 @@ const openObserver = async (count) => {
     authorityFingerprint: 'authority:observer-benchmark',
     datasetId: dataset.datasetId
   });
-  const database = new DatabaseView({
+  const database = createDatabaseView({
     authorityScope: 'public',
     authorityFingerprint: 'authority:observer-benchmark',
     registryFingerprint: 'registry:observer-benchmark',

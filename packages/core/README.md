@@ -24,7 +24,7 @@ Most applications should make one choice based on where their data lives:
 - For pure in-memory query evaluation, import the typed builders and
   `evaluateQuery` from `@tarstate/core/query`.
 - For live observation over host-owned sources, prepare a typed query and use
-  `DatabaseView` from `@tarstate/core/database`.
+  `createDatabaseView` from `@tarstate/core/database`.
 
 The `source`, `attachment/adapter`, query-incremental, and transaction-authoring
 entries are extension seams for adapter implementors. Application code using an
@@ -309,8 +309,9 @@ from `@tarstate/core/database/adapter`; this is not an alternative application
 transaction API. A database returned by `openAutomergeDatabase`
 already conforms, and its live database projection and replayable write
 projection are the same conflict-aware mapping. `AttachmentCatalog`,
-`DatasetMembership`, and `DatabaseView` remain available as lower-level host
-primitives for dynamic dataset runtimes rather than ordinary application setup.
+`DatasetMembership`, and `createDatabaseView` remain available as lower-level
+host primitives for dynamic dataset runtimes rather than ordinary application
+setup.
 
 ## Shared maintenance
 
@@ -320,7 +321,7 @@ conservatively isolated by authority, registry, and the complete bound parameter
 set; parameter values are never exposed through diagnostics. One dataset capture
 updates the shared work before observer callbacks run.
 
-`DatabaseView.getQueryMaintenanceDiagnostics()` exposes frozen physical reuse
+`database.getQueryMaintenanceDiagnostics()` exposes frozen physical reuse
 and lifecycle counters when the built-in maintenance factory is active. An empty
 list can also mean there are no active shared cohorts. Seek, recursion,
 expression subqueries, divergent input streams, custom factories, and

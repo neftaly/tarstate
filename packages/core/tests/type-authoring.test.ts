@@ -7,7 +7,7 @@ import {
   type DatabaseSourceLink,
   type OpenDatabaseQueryOptions
 } from '../src/database/query-session.js';
-import type { QueryNode, QueryRecord, RelationInput } from '../src/query/model.js';
+import type { QueryNode, QueryRecord } from '../src/query/model.js';
 import type { PreparedPlan } from '../src/query/plan-contract.js';
 import { pipe } from '../src/query/builder.js';
 import { sealSchema } from '../src/schema.js';
@@ -159,7 +159,7 @@ describe('literal-schema and query type authoring', () => {
     >>();
 
     const assertObservationTypes = (
-      database: DatabaseView<QueryNode, QueryRecord, readonly RelationInput[]>,
+      database: DatabaseView<QueryNode, QueryRecord>,
       typedPlan: typeof prepared,
       untypedPlan: PreparedPlan<QueryNode>
     ): void => {

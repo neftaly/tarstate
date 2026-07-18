@@ -8,7 +8,7 @@ import {
   type SourceSnapshot
 } from '../src/database.js';
 import {
-  DatabaseView,
+  createDatabaseView,
   type DatabaseQueryMaintenanceInput,
   type MaintainedDatabaseQueryResult,
   type ObserverSnapshot,
@@ -126,7 +126,7 @@ propertyTest('observer lifecycle commands preserve coherent snapshots and releas
       const rows = attachments.flatMap(({ projection }) => projection);
       return { rows, resultKeys: rows.map(({ id }) => `row:${id}`), completeness: 'exact', issues: [] };
     };
-    const database = new DatabaseView<Query, Row, readonly Row[]>({
+    const database = createDatabaseView<Query, Row, readonly Row[]>({
       authorityScope: 'public',
       authorityFingerprint: 'authority:model',
       registryFingerprint: 'registry:model',

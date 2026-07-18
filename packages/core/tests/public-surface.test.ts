@@ -31,7 +31,7 @@ describe('topic-focused core surface', () => {
   it('keeps the package root limited to portable foundation values', () => {
     expect(root.safeParseArtifactText).toBeTypeOf('function');
     expect('evaluateQuery' in root).toBe(false);
-    expect('DatabaseView' in root).toBe(false);
+    expect('createDatabaseView' in root).toBe(false);
     expect('executePreparedTransaction' in root).toBe(false);
     expect('safeMaterializePortableBytes' in root).toBe(false);
   });
@@ -50,7 +50,8 @@ describe('topic-focused core surface', () => {
     ]);
     expect(capabilities.CapabilityRegistry).toBeTypeOf('function');
     expect(constraintSetArtifact.sealConstraintSet).toBeTypeOf('function');
-    expect(database.DatabaseView).toBeTypeOf('function');
+    expect(database.createDatabaseView).toBeTypeOf('function');
+    expect('DatabaseView' in database).toBe(false);
     expect(Object.keys(databaseAdapter)).toEqual(['createLiveAttachmentDatabase']);
     expect(Object.keys(databaseExternalStore).sort()).toEqual([
       'ExternalStoreRuntime',

@@ -8,7 +8,7 @@ There should be one obvious safe path for each ordinary task:
 | --- | --- |
 | Query pure in-memory relations | typed builders from `@tarstate/core/query/authoring`; `evaluateQuery` from `@tarstate/core/query/evaluate` |
 | Query one or more opened database sources | `openDatabaseQuery` from `@tarstate/core/database/session` |
-| Build a custom host observation runtime | `DatabaseView` from `@tarstate/core/database/observer` with injected maintenance |
+| Build a custom host observation runtime | `createDatabaseView` from `@tarstate/core/database/observer` with injected maintenance |
 | Open writable Automerge state | `openAutomergeDatabase` from `@tarstate/automerge` |
 | Open an immutable atomic external store | `openExternalStoreDatabase` from `@tarstate/core/database/external-store` |
 | Use React | `TarstateProvider`, `useQuery`, `useRow`, `useCommit` from `@tarstate/react` |
@@ -20,7 +20,7 @@ fast variants. Those concepts may exist privately where they represent actual
 ownership or lifecycle states. Public performance machinery is a DX defect.
 
 Official source openers return a database. Ordinary consumers should not call
-attachment preparation or adapter constructors. `DatabaseView` and adapter
+attachment preparation or adapter constructors. `createDatabaseView` and adapter
 topic entries are host/adapter extension seams, not alternate application
 recipes.
 
