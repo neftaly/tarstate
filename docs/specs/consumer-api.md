@@ -25,6 +25,10 @@ attachment preparation or adapter constructors. `createDatabaseView` and adapter
 topic entries are host/adapter extension seams, not alternate application
 recipes.
 
+The memory atomic store is its own default source identity. External-store
+wrappers only provide `storeIdentity` when their stable underlying store differs
+from the wrapper object.
+
 ## Public composition shape
 
 Application code should provide:

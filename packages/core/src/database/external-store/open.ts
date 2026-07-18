@@ -29,7 +29,8 @@ import type { ExternalStoreDatabase } from './model.js';
 export type OpenExternalStoreDatabaseOptions<State extends object> = {
   readonly sourceId: string;
   readonly store: AtomicExternalStore<State>;
-  readonly storeIdentity: object;
+  /** Stable underlying identity for wrapper adapters; defaults to `store`. */
+  readonly storeIdentity?: object;
   readonly declaration: unknown;
   readonly embeddedArtifacts: unknown;
   readonly authorityScope: string;
@@ -91,7 +92,7 @@ export const openExternalStoreDatabase = async <State extends object>(
     registry: input.hostRegistry ?? defaultHostRegistry,
     sourceId: input.sourceId,
     store: input.store,
-    storeIdentity: input.storeIdentity
+    storeIdentity: input.storeIdentity ?? input.store
   });
   const source = createExternalStoreAtomicSource(lease);
   try {
@@ -200,7 +201,8 @@ const assertIdentity = <State extends object>(
     && (typeof input.attachmentId !== 'string' || input.attachmentId.length === 0)) {
     throw new TypeError('attachmentId must be a non-empty string');
   }
-  if (input.storeIdentity === null || typeof input.storeIdentity !== 'object') {
+  if (input.storeIdentity !== undefined
+    && (input.storeIdentity === null || typeof input.storeIdentity !== 'object')) {
     throw new TypeError('storeIdentity must be an object');
   }
 };

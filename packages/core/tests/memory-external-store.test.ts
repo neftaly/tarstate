@@ -67,14 +67,12 @@ describe('memory atomic external store', () => {
     expect(peer).toHaveBeenCalledOnce();
   });
 
-  it('is its own valid external-store identity', () => {
+  it('needs no separate identity at the standard database opener', () => {
     const store = createMemoryAtomicExternalStore<State>({ count: 0 });
     const input = {
-      store,
-      storeIdentity: store
-    } satisfies Pick<OpenExternalStoreDatabaseOptions<State>, 'store' | 'storeIdentity'>;
+      store
+    } satisfies Pick<OpenExternalStoreDatabaseOptions<State>, 'store'>;
 
     expectTypeOf(input.store).toEqualTypeOf<typeof store>();
-    expect(input.storeIdentity).toBe(store);
   });
 });
