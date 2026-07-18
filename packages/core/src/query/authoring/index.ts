@@ -16,6 +16,7 @@ export {
   typedQueryBody,
   typedSelect,
   typedSourceOf,
+  typedUnionAll,
   typedWhere
 } from '../authoring.js';
 export type {

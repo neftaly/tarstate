@@ -211,7 +211,17 @@ export function typedOrderBy(
 }
 
 type FieldExpressionRecord = Readonly<Record<string, TypedExpression<unknown, Readonly<Record<string, ValueDeclaration>>>>>;
-type ResultOfFields<Fields extends FieldExpressionRecord> = { readonly [Name in keyof Fields]: ExpressionValue<Fields[Name]> };
+type RequiredResultFields<Fields extends FieldExpressionRecord> = {
+  readonly [Name in keyof Fields as undefined extends ExpressionValue<Fields[Name]> ? never : Name]:
+    ExpressionValue<Fields[Name]>;
+};
+type OptionalResultFields<Fields extends FieldExpressionRecord> = {
+  readonly [Name in keyof Fields as undefined extends ExpressionValue<Fields[Name]> ? Name : never]?:
+    Exclude<ExpressionValue<Fields[Name]>, undefined>;
+};
+type ResultOfFields<Fields extends FieldExpressionRecord> = Simplify<
+  RequiredResultFields<Fields> & OptionalResultFields<Fields>
+>;
 type ParametersOfFields<Fields extends FieldExpressionRecord> = Simplify<UnionToIntersection<ExpressionParameters<Fields[keyof Fields]>>>;
 
 const applyTypedSelect = <Aliases extends TypedAliases, QueryParameters extends Readonly<Record<string, ValueDeclaration>>, const Alias extends string, const Fields extends FieldExpressionRecord>(
@@ -285,6 +295,83 @@ export const typedJoin = <LeftAliases extends TypedAliases, LeftParameters exten
       right.parameterDeclarations,
       predicate.parameterDeclarations
     ) as Simplify<LeftParameters & RightParameters & PredicateParameters>,
+    schemaViews: uniqueSchemaViews([...left.schemaViews, ...right.schemaViews])
+  };
+};
+
+type AliasRow<Alias> = Alias extends TypedAlias<string, infer Row> ? Row : never;
+type SameKeys<Left, Right> = [Exclude<keyof Left, keyof Right> | Exclude<keyof Right, keyof Left>] extends [never]
+  ? true
+  : false;
+type SetFieldCompatible<Left, Right> =
+  [Exclude<Left, undefined>] extends [string]
+    ? [Exclude<Right, undefined>] extends [string] ? true : false
+    : [Exclude<Left, undefined>] extends [number]
+      ? [Exclude<Right, undefined>] extends [number] ? true : false
+      : [Exclude<Left, undefined>] extends [boolean]
+        ? [Exclude<Right, undefined>] extends [boolean] ? true : false
+        : [Exclude<Left, undefined>] extends [Exclude<Right, undefined>]
+          ? [Exclude<Right, undefined>] extends [Exclude<Left, undefined>] ? true : false
+          : false;
+type IncompatibleSetFields<Left, Right> = {
+  [Field in keyof Left]: Field extends keyof Right
+    ? SetFieldCompatible<Left[Field], Right[Field]> extends true ? never : Field
+    : Field;
+}[keyof Left];
+type CompatibleSetRows<Left, Right> = SameKeys<Left, Right> extends true
+  ? IncompatibleSetFields<Left, Right> extends never ? unknown : never
+  : never;
+type IncompatibleSetAliases<Left extends TypedAliases, Right extends TypedAliases> = {
+  [Alias in keyof Left]: Alias extends keyof Right
+    ? Left[Alias] extends TypedAlias<infer LeftName, unknown>
+      ? Right[Alias] extends TypedAlias<infer RightName, unknown>
+        ? LeftName extends RightName
+          ? RightName extends LeftName
+            ? CompatibleSetRows<AliasRow<Left[Alias]>, AliasRow<Right[Alias]>> extends never ? Alias : never
+            : Alias
+          : Alias
+        : Alias
+      : Alias
+    : Alias;
+}[keyof Left];
+type CompatibleSetAliases<Left extends TypedAliases, Right extends TypedAliases> = SameKeys<Left, Right> extends true
+  ? IncompatibleSetAliases<Left, Right> extends never ? unknown : never
+  : never;
+type CombinedSetAliases<Left extends TypedAliases, Right extends TypedAliases> = {
+  readonly [Alias in keyof Left]: Left[Alias] extends TypedAlias<infer Name, infer LeftRow>
+    ? Alias extends keyof Right
+      ? TypedAlias<Name, LeftRow | AliasRow<Right[Alias]>>
+      : never
+    : never;
+};
+
+/** Concatenates compatible typed branches without introducing a second query representation. */
+export const typedUnionAll = <
+  LeftAliases extends TypedAliases,
+  LeftParameters extends Readonly<Record<string, ValueDeclaration>>,
+  LeftRow,
+  RightAliases extends TypedAliases,
+  RightParameters extends Readonly<Record<string, ValueDeclaration>>,
+  RightRow
+>(
+  left: TypedQuery<LeftAliases, LeftParameters, LeftRow>,
+  right: TypedQuery<RightAliases, RightParameters, RightRow>
+    & CompatibleSetAliases<LeftAliases, RightAliases>
+    & CompatibleSetRows<LeftRow, RightRow>
+): TypedQuery<
+  CombinedSetAliases<LeftAliases, RightAliases>,
+  Simplify<LeftParameters & RightParameters>,
+  LeftRow | RightRow
+> => {
+  assertTypedQueryInput(left);
+  assertTypedQueryInput(right);
+  return {
+    root: { kind: 'set', op: 'union-all', left: left.root, right: right.root },
+    aliases: left.aliases as unknown as CombinedSetAliases<LeftAliases, RightAliases>,
+    parameterDeclarations: mergeParameterDeclarations(
+      left.parameterDeclarations,
+      right.parameterDeclarations
+    ) as Simplify<LeftParameters & RightParameters>,
     schemaViews: uniqueSchemaViews([...left.schemaViews, ...right.schemaViews])
   };
 };

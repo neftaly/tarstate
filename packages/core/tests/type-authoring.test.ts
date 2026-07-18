@@ -8,6 +8,7 @@ import {
   type OpenDatabaseQueryOptions
 } from '../src/database/query-session.js';
 import type { QueryNode, QueryRecord } from '../src/query/model.js';
+import { evaluateQuery } from '../src/query.js';
 import type { PreparedPlan } from '../src/query/plan-contract.js';
 import { pipe } from '../src/query/builder.js';
 import { sealSchema } from '../src/schema.js';
@@ -24,6 +25,7 @@ import {
   typedFrom,
   typedJoin,
   typedIsNull,
+  typedLiteral,
   typedOrderBy,
   typedMove,
   typedParameter,
@@ -32,6 +34,7 @@ import {
   typedReturning,
   typedSelect,
   typedSourceOf,
+  typedUnionAll,
   typedWhere,
   type PreparedPlanParameters,
   type QueryParametersOf,
@@ -125,8 +128,66 @@ describe('literal-schema and query type authoring', () => {
       nickname: aliases.author.row.nickname
     }));
     expectTypeOf<QueryResultRowOf<typeof optionalResult>>().toEqualTypeOf<{
-      readonly nickname: string | undefined;
+      readonly nickname?: string;
     }>();
+  });
+
+  it('types union-all branches by their common runtime shape', () => {
+    const folder = typedSelect(author, 'resource', (aliases) => ({
+      kind: typedLiteral('folder'),
+      resourceRef: aliases.author.row.id,
+      title: aliases.author.row.name
+    }));
+    const file = typedSelect(manager, 'resource', (aliases) => ({
+      kind: typedLiteral('file'),
+      resourceRef: aliases.manager.row.id,
+      title: aliases.manager.row.name
+    }));
+    const resources = typedUnionAll(folder, file);
+
+    expect(typedQueryBody(resources).root).toMatchObject({ kind: 'set', op: 'union-all' });
+    expect(evaluateQuery({
+      root: resources.root,
+      relations: [{
+        relation: {
+          schemaView: people.schemaView,
+          relationId: people.relationId
+        },
+        rows: [{ id: 'resource:one', name: 'One' }],
+        completeness: 'exact'
+      }]
+    }).rows).toEqual([
+      { kind: 'folder', resourceRef: 'resource:one', title: 'One' },
+      { kind: 'file', resourceRef: 'resource:one', title: 'One' }
+    ]);
+    expectTypeOf<QueryResultRowOf<typeof resources>>().toEqualTypeOf<
+      | { readonly kind: 'folder'; readonly resourceRef: string; readonly title: string }
+      | { readonly kind: 'file'; readonly resourceRef: string; readonly title: string }
+    >();
+
+    const wrongFields = typedSelect(manager, 'resource', (aliases) => ({
+      kind: typedLiteral('file'),
+      id: aliases.manager.row.id,
+      title: aliases.manager.row.name
+    }));
+    // @ts-expect-error set branches must expose the same field names
+    typedUnionAll(folder, wrongFields);
+
+    const wrongValue = typedSelect(manager, 'resource', (aliases) => ({
+      kind: typedLiteral('file'),
+      resourceRef: aliases.manager.row.score,
+      title: aliases.manager.row.name
+    }));
+    // @ts-expect-error set branches must expose compatible logical value types
+    typedUnionAll(folder, wrongValue);
+
+    const wrongAlias = typedSelect(manager, 'otherResource', (aliases) => ({
+      kind: typedLiteral('file'),
+      resourceRef: aliases.manager.row.id,
+      title: aliases.manager.row.name
+    }));
+    // @ts-expect-error later operators require one common alias scope
+    typedUnionAll(folder, wrongAlias);
   });
 
   it('prepares a detached query plan without losing inferred rows or parameters', async () => {
@@ -295,7 +356,7 @@ describe('literal-schema and query type authoring', () => {
 
     expect(result.root).toMatchObject({ kind: 'select', input: { kind: 'order', input: { kind: 'where' } } });
     expectTypeOf<QueryParametersOf<typeof result>>().toEqualTypeOf<{ readonly minimum: number }>();
-    expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly source: string | undefined }>();
+    expectTypeOf<QueryResultRowOf<typeof result>>().toEqualTypeOf<{ readonly name: string; readonly source?: string }>();
   });
 
   it('rejects conflicting declarations for a composed parameter name', () => {

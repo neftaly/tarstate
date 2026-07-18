@@ -94,7 +94,7 @@ type SourceLinkPlan<Plan extends PreparedPlan<QueryNode>> = [PreparedPlanRow<Pla
 type DatabaseSourceLinkCandidate = {
   readonly linkId: string;
   /** Runtime discovery rejects and diagnoses candidates whose source provenance is absent. */
-  readonly originSourceId: string | undefined;
+  readonly originSourceId?: string;
   readonly targetSourceId: string;
   readonly targetAttachmentId?: string | undefined;
   readonly expectation?: DatabaseSourceLink['expectation'] | undefined;
