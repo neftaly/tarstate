@@ -438,7 +438,10 @@ const ready = <Storage, Projection, State>(
   if ((origin !== 'bootstrap' && origin !== 'out-of-band' && origin !== 'manual-read-only') || typeof writable !== 'boolean' || typeof project !== 'function') {
     throw new TypeError('Ready attachment preparation has invalid scalar or callback fields');
   }
-  const schemaViewIds = ownStringArray(requiredDataValue(descriptors, 'schemaViewIds', 'Ready attachment preparation'), 'Ready attachment preparation schemaViewIds');
+  const schemaViewIds = ownSortedUniqueStrings(
+    requiredDataValue(descriptors, 'schemaViewIds', 'Ready attachment preparation'),
+    'Ready attachment preparation schemaViewIds'
+  );
   const relations = ownPreparedAttachmentRelations(requiredDataValue(descriptors, 'relations', 'Ready attachment preparation'));
   const constraints = ownArrayValues<SourceConstraint<State>>(requiredDataValue(descriptors, 'constraints', 'Ready attachment preparation'), 'Ready attachment preparation constraints');
   const artifactResolutions = ownArrayValues<ExactArtifactResolution>(requiredDataValue(descriptors, 'artifactResolutions', 'Ready attachment preparation'), 'Ready attachment preparation artifact resolutions');
@@ -463,8 +466,14 @@ const ownPreparedAttachmentRelations = (input: unknown): ReadonlyMap<string, Pre
     if (typeof relationId !== 'string' || relationId.length === 0 || !isRecord(relation) || relation.relationId !== relationId) {
       throw new TypeError('Ready attachment preparation relation identity is invalid');
     }
-    const keyFields = ownStringArray(relation.keyFields, 'Ready attachment preparation relation key fields');
-    const sourceGeneratedFields = ownStringArray(relation.sourceGeneratedFields, 'Ready attachment preparation relation source-generated fields');
+    const keyFields = ownOrderedUniqueStrings(
+      relation.keyFields,
+      'Ready attachment preparation relation key fields'
+    );
+    const sourceGeneratedFields = ownSortedUniqueStrings(
+      relation.sourceGeneratedFields,
+      'Ready attachment preparation relation source-generated fields'
+    );
     if (keyFields.length === 0) throw new TypeError('Ready attachment preparation relation keys must not be empty');
     entries.push([relationId, Object.freeze({
       relationId,
@@ -499,10 +508,21 @@ const ownArrayValues = <Value>(input: unknown, label: string): readonly Value[] 
   }
 };
 
-const ownStringArray = (input: unknown, label: string): readonly string[] => {
+const ownSortedUniqueStrings = (input: unknown, label: string): readonly string[] => {
   const values = ownArrayValues<unknown>(input, label);
   if (values.some((value) => typeof value !== 'string')) throw new TypeError(label + ' must contain only strings');
-  return Object.freeze([...new Set(values as readonly string[])].sort());
+  const strings = values as readonly string[];
+  return Object.freeze([...new Set(strings)].sort());
+};
+
+const ownOrderedUniqueStrings = (input: unknown, label: string): readonly string[] => {
+  const values = ownArrayValues<unknown>(input, label);
+  if (values.some((value) => typeof value !== 'string')) {
+    throw new TypeError(label + ' must contain only strings');
+  }
+  const strings = values as readonly string[];
+  if (new Set(strings).size !== strings.length) throw new TypeError(label + ' must not contain duplicates');
+  return Object.freeze([...strings]);
 };
 
 const ownIssues = (input: unknown, label: string): readonly Issue[] => {

@@ -1,4 +1,5 @@
 import { sealSchema } from '../src/schema.js';
+import type { DatabaseTransactionSnapshot } from '../src/database/transaction.js';
 import type { TaggedValue } from '../src/value.js';
 import { pipe } from '../src/query/builder.js';
 import {
@@ -50,6 +51,21 @@ export const budgetSchema = await sealSchema({
 });
 
 const people = relationLiteral(budgetSchema, 'people');
+const teams = relationLiteral(budgetSchema, 'teams');
+declare const transactionSnapshot: DatabaseTransactionSnapshot;
+transactionSnapshot.spliceText(
+  teams,
+  ['north', 'team-one'],
+  'name',
+  { index: 0, deleteCount: 0, insert: 'New ' }
+);
+transactionSnapshot.spliceText(
+  teams,
+  // @ts-expect-error composite keys retain declared tuple order and literal unions
+  ['team-one', 'north'],
+  'name',
+  { index: 0, deleteCount: 0, insert: 'New ' }
+);
 const left = typedFrom(people, 'leftPerson');
 const right = typedFrom(people, 'rightPerson');
 const joined = typedJoin(left, right, (aliases) => typedCompare('ne', aliases.leftPerson.row.id, aliases.rightPerson.row.id));

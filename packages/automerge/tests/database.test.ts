@@ -14,7 +14,12 @@ import {
 } from '@tarstate/core/database/session';
 import type { QueryNode } from '@tarstate/core/query/model';
 import { prepareQuery } from '@tarstate/core/query/prepare';
-import { relationLiteral, sealSchema, sealStorageMapping } from '@tarstate/core/schema';
+import {
+  relationLiteral,
+  sealSchema,
+  sealStorageMapping,
+  type RelationStorageMapping
+} from '@tarstate/core/schema';
 import { describe, expect, it, vi } from 'vitest';
 import {
   openAutomergeDatabase,
@@ -40,6 +45,13 @@ type OrderedTaskDocument = {
 type SourceIdentityTaskDocument = {
   tasks?: { title: string }[];
 };
+
+type CompositeFileDocument =
+  | { id: 'file'; textContent: string }
+  | { files: { contentKind: 'text'; id: 'file'; textContent: string }[] }
+  | { files: Record<string, { contentKind: 'text'; textContent: string }> };
+
+type CompositeFileMappingKind = 'singleton-literal-field' | 'array-fields' | 'object-map-field';
 
 describe('standard Automerge database', () => {
   it('does not build a full logical snapshot until a snapshot consumer asks for one', () => {
@@ -195,6 +207,46 @@ describe('standard Automerge database', () => {
     expect(receipt.outcome === 'committed' && receipt.integrationBasis).not.toEqual(observedBasis);
     expect(fixture.handle.doc()?.tasks.first?.title).toBe('New First!');
     expect(fixture.handle.doc()?.tasks.first?.unknownPhysicalField).toBe('preserved');
+    fixture.database.close();
+    await fixture.repo.shutdown();
+  });
+
+  it.each([
+    ['literal and stored keys', 'singleton-literal-field'],
+    ['two stored keys', 'array-fields'],
+    ['map-key and stored keys', 'object-map-field']
+  ] as const)('preserves declared composite-key order for %s', async (_label, mappingKind) => {
+    const fixture = await openCompositeFileDatabase(mappingKind);
+    const observed = fixture.database.getSnapshot();
+    if (observed.state !== 'open' || observed.current.readiness !== 'ready') throw new Error('Expected ready database');
+    expect(fixture.schema.body.relations.files.key).toEqual(['id', 'contentKind']);
+    expect(fixture.database.capabilities(fixture.files).keyFields).toEqual(['id', 'contentKind']);
+    const transform = (snapshot: DatabaseTransactionSnapshot) => snapshot.spliceText(
+      fixture.files,
+      ['file', 'text'],
+      'textContent',
+      { index: 0, deleteCount: 0, insert: 'New ' }
+    );
+
+    const simulation = await fixture.database.simulate(
+      { kind: 'prefix-file-content' },
+      transform,
+      { observedBasis: observed.current.basis }
+    );
+    expect(simulation.issues).toEqual([]);
+    expect(simulation).toMatchObject({
+      outcome: 'would-commit',
+      stagedState: { rows: [expect.objectContaining({
+        fields: { contentKind: 'text', id: 'file', textContent: 'New First' }
+      })] }
+    });
+    await expect(fixture.database.transact(
+      { kind: 'prefix-file-content' },
+      transform,
+      { observedBasis: observed.current.basis }
+    )).resolves.toMatchObject({ outcome: 'committed' });
+    expect(fixture.readText()).toBe('New First');
+
     fixture.database.close();
     await fixture.repo.shutdown();
   });
@@ -1193,6 +1245,84 @@ const openSourceIdentityTaskDatabase = async (
     repo,
     tasks: relationLiteral(schema, 'tasks')
   };
+};
+
+const openCompositeFileDatabase = async (mappingKind: CompositeFileMappingKind) => {
+  const schema = await sealSchema({ id: 'urn:test:composite-file:schema', body: {
+    relations: { files: {
+      relationId: 'composite-files',
+      key: ['id', 'contentKind'],
+      fields: {
+        contentKind: { type: { kind: 'string', values: ['text'] } },
+        id: { type: { kind: 'string', values: ['file'] } },
+        textContent: { type: { kind: 'string' } }
+      }
+    } }
+  } });
+  const textContent = { path: ['textContent'], write: {
+    replace: builtInCapabilityRefs.fieldReplace,
+    textSplice: builtInCapabilityRefs.textSplice
+  } } as const;
+  const relationMapping: RelationStorageMapping = mappingKind === 'singleton-literal-field'
+    ? {
+        collection: { kind: 'singleton', path: [], absent: 'invalid' },
+        keys: {
+          contentKind: { kind: 'literal', value: 'text' },
+          id: { kind: 'field', path: ['id'] }
+        },
+        fields: { textContent }
+      }
+    : mappingKind === 'array-fields'
+      ? {
+          collection: { kind: 'array', path: ['files'], absent: 'creatable' },
+          keys: {
+            contentKind: { kind: 'field', path: ['contentKind'] },
+            id: { kind: 'field', path: ['id'] }
+          },
+          fields: { textContent }
+        }
+      : {
+          collection: { kind: 'object-map', path: ['files'], absent: 'creatable' },
+          keys: {
+            contentKind: { kind: 'field', path: ['contentKind'] },
+            id: { kind: 'map-key', onMismatch: 'reject' }
+          },
+          fields: { textContent }
+        };
+  const mapping = await sealStorageMapping({ id: `urn:test:composite-file:mapping:${mappingKind}`, body: {
+    schema: reference(schema),
+    model: 'json-tree-v1',
+    relations: { 'composite-files': relationMapping }
+  } });
+  const repo = new Repo();
+  const document: CompositeFileDocument = mappingKind === 'singleton-literal-field'
+    ? { id: 'file', textContent: 'First' }
+    : mappingKind === 'array-fields'
+      ? { files: [{ contentKind: 'text', id: 'file', textContent: 'First' }] }
+      : { files: { file: { contentKind: 'text', textContent: 'First' } } };
+  const handle = repo.create<CompositeFileDocument>(document);
+  const opened = await openAutomergeDatabase({
+    handle,
+    declaration: {
+      formatVersion: 1,
+      storageSchema: reference(schema),
+      projection: { kind: 'storage-mapping', storageMapping: reference(mapping) }
+    },
+    embeddedArtifacts: [schema, mapping],
+    authorityScope: 'scope:test'
+  });
+  if (!opened.success) {
+    await repo.shutdown();
+    throw new Error(JSON.stringify(opened.issues));
+  }
+  const readText = (): string | undefined => {
+    const current = handle.doc();
+    if (current === undefined) return undefined;
+    if ('textContent' in current) return current.textContent;
+    if (Array.isArray(current.files)) return current.files[0]?.textContent;
+    return current.files.file?.textContent;
+  };
+  return { database: opened.value, handle, repo, schema, files: relationLiteral(schema, 'files'), readText };
 };
 
 const mountTaskDatabase = async (

@@ -33,6 +33,35 @@ const itemRelation: LiteralRelation<typeof itemSchemaBody, 'items'> = {
   }
 };
 
+declare const compositeSchemaBody: {
+  readonly relations: {
+    readonly files: {
+      readonly relationId: 'files';
+      readonly key: readonly ['contentKind', 'id'];
+      readonly fields: {
+        readonly contentKind: { readonly type: { readonly kind: 'string'; readonly values: readonly ['text'] } };
+        readonly id: { readonly type: { readonly kind: 'string'; readonly values: readonly ['file'] } };
+        readonly textContent: { readonly type: { readonly kind: 'string' } };
+      };
+    };
+  };
+};
+
+export const compositeRelation: LiteralRelation<typeof compositeSchemaBody, 'files'> = {
+  schemaView: itemSchemaArtifactRef,
+  relationId: 'files',
+  name: 'files',
+  declaration: {
+    relationId: 'files',
+    key: ['contentKind', 'id'],
+    fields: {
+      contentKind: { type: { kind: 'string', values: ['text'] } },
+      id: { type: { kind: 'string', values: ['file'] } },
+      textContent: { type: { kind: 'string' } }
+    }
+  }
+};
+
 type ItemRow = SchemaRow<typeof itemSchemaBody, 'items'>;
 type ItemKey = SchemaKey<typeof itemSchemaBody, 'items'>;
 
@@ -50,6 +79,20 @@ const rowInferenceIsExact: Equal<(typeof rows)[number], ItemRow> = true;
 
 snapshot.withRows(itemRelation, [{ id: 'a', count: 1 }]);
 snapshot.insertWithGeneratedKey(itemRelation, 'new-item', { count: 1 });
+snapshot.spliceText(
+  compositeRelation,
+  ['text', 'file'],
+  'textContent',
+  { index: 0, deleteCount: 0, insert: 'New ' }
+);
+
+snapshot.spliceText(
+  compositeRelation,
+  // @ts-expect-error generated composite keys retain exact tuple order
+  ['file', 'text'],
+  'textContent',
+  { index: 0, deleteCount: 0, insert: 'New ' }
+);
 
 void [itemRelation, row, key, rows, rowInferenceIsExact];
 

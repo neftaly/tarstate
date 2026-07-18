@@ -106,6 +106,52 @@ describe('database attachment preparation', () => {
     expect(Object.isFrozen(prepared.issues[0]?.details)).toBe(true);
   });
 
+  it('preserves declared composite-key order while adopting ready relation facts', async () => {
+    const schema = await sealArtifact({
+      kind: 'schema',
+      id: 'urn:test:ordered-key:schema',
+      body: { relations: { entries: {
+        relationId: 'ordered.entries',
+        key: ['zKey', 'aKey'],
+        fields: {
+          zKey: { type: { kind: 'string' } },
+          aKey: { type: { kind: 'string' } }
+        }
+      } } }
+    });
+    const mapping = await sealArtifact({
+      kind: 'storage-mapping',
+      id: 'urn:test:ordered-key:mapping',
+      body: {
+        schema: ref(schema),
+        model: 'json-tree-v1',
+        relations: { 'ordered.entries': {
+          collection: { kind: 'singleton', path: [], absent: 'invalid' },
+          keys: {
+            zKey: { kind: 'literal', value: 'z' },
+            aKey: { kind: 'literal', value: 'a' }
+          },
+          fields: {}
+        } }
+      }
+    });
+    const artifacts = new Map([schema, mapping].map((artifact) => [key(ref(artifact)), artifact]));
+    const prepared = await prepareDatabaseAttachment({
+      sourceId: 'source:ordered-key',
+      bootstrap: { status: 'ready', declaration: {
+        formatVersion: 1,
+        storageSchema: ref(schema),
+        projection: { kind: 'storage-mapping', storageMapping: ref(mapping) }
+      } },
+      resolveArtifact: (reference) => artifacts.get(key(reference)),
+      registry: new CapabilityRegistry('trust:ordered-key')
+    });
+
+    expect(prepared).toMatchObject({ state: 'ready' });
+    if (prepared.state !== 'ready') throw new Error('ordered-key attachment did not prepare');
+    expect(prepared.relations.get('ordered.entries')?.keyFields).toEqual(['zKey', 'aKey']);
+  });
+
   it('rebinds an owned preparation to one authoritative adapter projection', () => {
     const prepared = prepareManualReadOnlyAttachment({
       schemaViewIds: ['schema:one'],
