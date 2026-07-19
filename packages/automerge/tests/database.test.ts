@@ -121,8 +121,13 @@ describe('standard Automerge database', () => {
   it('opens embedded artifacts and exposes only logical transactions and lifecycle', async () => {
     const fixture = await openTaskDatabase();
     expect(Object.keys(fixture.database).sort()).toEqual([
-      'capabilities', 'close', 'getSnapshot', 'mount', 'openTextIntent', 'simulate', 'subscribe', 'transact'
+      'attachmentId', 'capabilities', 'close', 'getSnapshot', 'mount', 'openTextIntent',
+      'simulate', 'sourceId', 'subscribe', 'transact'
     ]);
+    expect(fixture.database).toMatchObject({
+      attachmentId: fixture.handle.url,
+      sourceId: fixture.handle.url
+    });
     expect(fixture.database.capabilities(fixture.tasks)).toMatchObject({
       relationId: 'tasks',
       keyFields: ['id'],
@@ -979,7 +984,7 @@ describe('standard Automerge database', () => {
   it('finishes closing after a mounted lease reports a cleanup failure', async () => {
     const fixture = await openTaskDatabase();
     const catalog = new ThrowingLeaseCatalog();
-    await fixture.database.mount(catalog);
+    fixture.database.mount(catalog);
     const closeListener = vi.fn();
     fixture.database.subscribe(closeListener);
 

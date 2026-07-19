@@ -11,6 +11,8 @@ import type {
 export type LiveAttachmentDatabase<Service extends object, Snapshot> = Service
   & Omit<OwnedDatabaseSource, 'mount'>
   & {
+  readonly attachmentId: string;
+  readonly sourceId: string;
   readonly getSnapshot: () => Snapshot;
   readonly subscribe: (listener: () => void) => () => void;
   readonly mount: (
@@ -42,6 +44,8 @@ export type LiveAttachmentDatabaseInput<Storage, Projection, Service extends obj
 export const createLiveAttachmentDatabase = <Storage, Projection, Service extends object, Snapshot>(
   input: LiveAttachmentDatabaseInput<Storage, Projection, Service, Snapshot>
 ): LiveAttachmentDatabase<Service, Snapshot> => {
+  const attachmentId = input.attachmentId;
+  const sourceId = input.source.sourceId;
   const listeners = new Set<() => void>();
   const leases = new Set<AttachmentLease<Storage, Projection>>();
   let closed = false;
@@ -74,6 +78,8 @@ export const createLiveAttachmentDatabase = <Storage, Projection, Service extend
 
   return Object.freeze({
     ...input.service,
+    attachmentId,
+    sourceId,
     getSnapshot: () => {
       if (closed) return input.closedSnapshot;
       if (unsubscribeSource === undefined) dirty = true;
@@ -96,9 +102,9 @@ export const createLiveAttachmentDatabase = <Storage, Projection, Service extend
       if (closed) throw new Error('Attached database is closed');
       const discoveryEdges = Object.freeze([...new Set(options.discoveryEdges ?? [])].sort());
       const lease = catalog.attach<Storage, Projection>({
-        attachmentId: input.attachmentId,
+        attachmentId,
         incarnation: input.incarnation,
-        sourceId: input.source.sourceId,
+        sourceId,
         source: input.source,
         authorityScope: input.authorityScope,
         discoveryEdges,
@@ -107,8 +113,8 @@ export const createLiveAttachmentDatabase = <Storage, Projection, Service extend
       leases.add(lease);
       let leaseClosed = false;
       return Object.freeze({
-        attachmentId: input.attachmentId,
-        sourceId: input.source.sourceId,
+        attachmentId,
+        sourceId,
         discoveryEdges,
         close: () => {
           if (leaseClosed) return;

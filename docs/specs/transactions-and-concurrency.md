@@ -170,6 +170,10 @@ step and aggregate outcomes for both paths. Exact nested receipts are retained,
 identity disagreement fails closed as unknown, and cancellation prevents only
 callbacks that have not started.
 
+Official live databases expose the authoritative `sourceId` and `attachmentId`
+needed by each database batch step. Consumers must not repeat adapter-specific
+default attachment-ID derivation.
+
 The batch receipt exposes partial completion. It does not claim rollback,
 durable workflow identity, source discovery, or automatic product retries.
 

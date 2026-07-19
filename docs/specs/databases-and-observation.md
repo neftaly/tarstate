@@ -7,6 +7,12 @@ and logical projection. It presents a synchronous external-store API:
 `getSnapshot()` reads the current immutable snapshot and `subscribe(listener)`
 observes later transitions.
 
+Official live databases also expose immutable `sourceId` and `attachmentId`
+fields. They are the exact detached identities used by mounts and commit
+receipts, so host orchestration can name a database without retaining or
+reconstructing opener inputs. Identity does not grant authority or expose a
+source handle.
+
 The subscription callback is only a notification. Consumers must call
 `getSnapshot()` to read authoritative state. A source or database must not
 publish a new snapshot object when no observable state changed.

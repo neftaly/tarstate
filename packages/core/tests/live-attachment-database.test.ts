@@ -55,6 +55,10 @@ describe('live attachment database lifecycle', () => {
     });
 
     expect(database.ping()).toBe('pong');
+    expect(database).toMatchObject({
+      attachmentId: 'attachment:live-shell',
+      sourceId: 'source:live-shell'
+    });
     const initial = database.getSnapshot();
     expect(initial).toEqual({ state: 'open', value: 1 });
     expect(database.getSnapshot()).toBe(initial);
@@ -74,8 +78,16 @@ describe('live attachment database lifecycle', () => {
 
     const catalog = new AttachmentCatalog();
     const mount = database.mount(catalog);
+    expect(mount).toMatchObject({
+      attachmentId: database.attachmentId,
+      sourceId: database.sourceId
+    });
     expect(catalog.sourceCount()).toBe(1);
     database.close();
+    expect(database).toMatchObject({
+      attachmentId: 'attachment:live-shell',
+      sourceId: 'source:live-shell'
+    });
     expect(database.getSnapshot()).toEqual({ state: 'closed' });
     expect(catalog.sourceCount()).toBe(0);
     expect(close).toHaveBeenCalledOnce();

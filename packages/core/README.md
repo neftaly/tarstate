@@ -6,7 +6,7 @@ database observations, and incremental maintenance for Tarstate v1.
 Install the downloaded release tarball directly:
 
 ```sh
-npm install ./tarstate-core-0.6.7.tgz
+npm install ./tarstate-core-0.6.8.tgz
 ```
 
 ## Choose the application path
@@ -156,6 +156,8 @@ sequence and retains each exact nested receipt. Its `stop | continue` policy
 controls only future callbacks: it promises no rollback, workflow persistence,
 or cross-source retry. Portable transaction attempts continue to use
 `executeNonAtomicBatch`; both paths share the same outcome semantics.
+Official live databases expose immutable `sourceId` and `attachmentId` fields
+for these step declarations; applications do not reproduce adapter defaults.
 
 ## Atomic external-store database
 

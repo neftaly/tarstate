@@ -17,8 +17,8 @@ code:
 
 ```sh
 npm install \
-  ./tarstate-core-0.6.7.tgz \
-  ./tarstate-automerge-0.6.7.tgz \
+  ./tarstate-core-0.6.8.tgz \
+  ./tarstate-automerge-0.6.8.tgz \
   @automerge/automerge
 ```
 
@@ -69,6 +69,9 @@ const opened = await openAutomergeDatabase({
   authorityScope: 'workspace'
 });
 if (!opened.success) throw new Error(opened.issues.map(({ code }) => code).join(', '));
+
+// These immutable identities exactly match later mount leases and receipts.
+const { sourceId, attachmentId } = opened.value;
 
 // Prepared mapping facts let the UI distinguish writable fields without
 // reading or duplicating the storage-mapping artifact.

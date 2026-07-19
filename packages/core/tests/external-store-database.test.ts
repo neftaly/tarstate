@@ -10,6 +10,7 @@ import {
 import { relationLiteral } from '../src/schema-authoring.js';
 import { sealSchema } from '../src/schema.js';
 import { sealStorageMapping } from '../src/mapping.js';
+import { executeDatabaseNonAtomicBatch } from '../src/transactions/index.js';
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 type TaskState = {
@@ -68,8 +69,13 @@ describe('external-store relational database', () => {
   it('opens the ordinary database surface and performs immutable mapped writes', async () => {
     const fixture = await createTaskFixture();
     expect(Object.keys(fixture.database).sort()).toEqual([
-      'capabilities', 'close', 'getSnapshot', 'mount', 'simulate', 'subscribe', 'transact'
+      'attachmentId', 'capabilities', 'close', 'getSnapshot', 'mount', 'simulate',
+      'sourceId', 'subscribe', 'transact'
     ]);
+    expect(fixture.database).toMatchObject({
+      attachmentId: 'source:external-tasks',
+      sourceId: 'source:external-tasks'
+    });
     expect(fixture.database.getSnapshot()).toMatchObject({
       state: 'open',
       current: {
@@ -131,6 +137,52 @@ describe('external-store relational database', () => {
       relationLiteral(otherSchema, 'tasks')
     )).toThrow('Mapped relation belongs to a different schema view');
     fixture.database.close();
+  });
+
+  it('supplies authoritative identities directly to non-atomic batch steps', async () => {
+    const artifacts = await taskArtifacts();
+    const tasks = relationLiteral(artifacts.schema, 'tasks');
+    const firstAtomic = createAtomicStore<TaskState>({
+      tasks: { first: { id: 'first', title: 'First' } }
+    });
+    const secondAtomic = createAtomicStore<TaskState>({
+      tasks: { second: { id: 'second', title: 'Second' } }
+    });
+    const first = await openTaskDatabase(firstAtomic, artifacts, {
+      sourceId: 'source:first',
+      attachmentId: 'attachment:first'
+    });
+    const second = await openTaskDatabase(secondAtomic, artifacts, {
+      sourceId: 'source:second',
+      attachmentId: 'attachment:second'
+    });
+
+    const receipt = await executeDatabaseNonAtomicBatch({
+      batchId: 'batch:official-databases',
+      failurePolicy: 'stop',
+      steps: [first, second].map((database, index) => ({
+        stepId: String(index),
+        attachmentId: database.attachmentId,
+        sourceId: database.sourceId,
+        transact: () => database.transact(
+          { kind: 'rename', index },
+          (snapshot) => snapshot.withRows(
+            tasks,
+            snapshot.rows(tasks).map((row) => ({ ...row, title: row.title + '!' }))
+          )
+        )
+      }))
+    });
+
+    expect(receipt).toMatchObject({
+      outcome: 'complete',
+      steps: [
+        { attachmentId: 'attachment:first', sourceId: 'source:first', outcome: 'applied' },
+        { attachmentId: 'attachment:second', sourceId: 'source:second', outcome: 'applied' }
+      ]
+    });
+    first.close();
+    second.close();
   });
 
   it('replays after an external exact-basis change without losing either update', async () => {
@@ -355,10 +407,16 @@ const createTaskFixture = async (options: { readonly constrained?: boolean } = {
 
 const openTaskDatabase = async (
   atomic: ReturnType<typeof createAtomicStore<TaskState>>,
-  artifacts: Awaited<ReturnType<typeof taskArtifacts>>
+  artifacts: Awaited<ReturnType<typeof taskArtifacts>>,
+  identity: {
+    readonly sourceId?: string;
+    readonly attachmentId?: string;
+  } = {}
 ) => {
+  const sourceId = identity.sourceId ?? 'source:external-tasks';
   const opened = await openExternalStoreDatabase({
-    sourceId: 'source:external-tasks',
+    sourceId,
+    ...(identity.attachmentId === undefined ? {} : { attachmentId: identity.attachmentId }),
     store: atomic.store,
     storeIdentity: atomic.identity,
     declaration: {
